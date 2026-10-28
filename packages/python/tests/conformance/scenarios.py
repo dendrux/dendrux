@@ -972,10 +972,37 @@ async def _cancel_terminal(ctx: Ctx) -> None:
 
 @cell("cancellation__cancel_run_cascades_to_child", "cancellation", "run", "cancel_run")
 async def _cancel_cascade(ctx: Ctx) -> None:
-    script = [calls(("read_range", {"sheet": "S1"}, "t1"))]
-    agent = ctx.agent(ctx.provider(*script), tools=[read_range])
-    paused = await ctx.run(agent, "read")
-    await ctx.cancel_run(agent, paused.run_id, cascade=True)
+    """A real parent waiting on a client tool whose delegated child also waits."""
+    child = ctx.agent(
+        ctx.provider(calls(("read_range", {"sheet": "child"}, "c1"))),
+        tools=[read_range],
+        name="Child",
+        prompt="You are a helper.",
+    )
+
+    @tool()
+    async def delegate(task: str) -> str:
+        """Delegate a task to the helper agent."""
+        result = await child.run(task)
+        return f"helper is {result.status.value}"
+
+    parent = ctx.agent(
+        ctx.provider(
+            calls(("delegate", {"task": "look"}, "t1"), ("read_range", {"sheet": "S1"}, "t2")),
+            text("never reached"),
+        ),
+        tools=[delegate, read_range],
+        name="Parent",
+    )
+    paused = await ctx.run(parent, "read both")
+    records = {r.id: r for r in await ctx.store.list_runs(limit=10)}
+    assert len(records) == 2, "a parent and its delegated child must both exist"
+    (child_record,) = [r for r in records.values() if r.parent_run_id == paused.run_id]
+    assert paused.status.value == "waiting_client_tool"
+    assert child_record.status == "waiting_client_tool" and child_record.delegation_level == 1
+    await ctx.cancel_run(parent, paused.run_id, cascade=True)
+    after = {r.id: r.status for r in await ctx.store.list_runs(limit=10)}
+    assert set(after.values()) == {"cancelled"}, after
 
 
 @cell("cancellation__request_pause_then_resume", "cancellation", "run", "resume")
@@ -987,6 +1014,91 @@ async def _pause_requested(ctx: Ctx) -> None:
     provider = ctx.provider(calls(("add", {"a": 1, "b": 1}, "t1")), text("never"), hook=hook)
     paused = await ctx.run(ctx.agent(provider, tools=[add]), "work")
     await ctx.resume(ctx.agent(ctx.provider(text("Resumed and done.")), tools=[add]), paused.run_id)
+
+
+# ---------------------------------------------------------------------------
+# Inbox notes and submit_resume
+# ---------------------------------------------------------------------------
+
+
+def _pause_after_first_call(ctx: Ctx) -> Any:
+    async def hook(index: int, kwargs: dict[str, Any]) -> None:
+        if index == 0:
+            await ctx.store.request_pause(kwargs["run_id"])
+
+    return hook
+
+
+@cell(
+    "run_control__pause_notes_submit_resume",
+    "run_control",
+    "run",
+    "submit_note",
+    "submit_resume",
+)
+async def _notes_submit_resume(ctx: Ctx) -> None:
+    provider = ctx.provider(
+        calls(("add", {"a": 1, "b": 1}, "t1")), text("never"), hook=_pause_after_first_call(ctx)
+    )
+    paused = await ctx.run(ctx.agent(provider, tools=[add]), "work")
+    await ctx.submit_note(
+        ctx.agent(ctx.provider(text("unused"))),
+        paused.run_id,
+        "Please double check the total.",
+        "first",
+    )
+    await ctx.submit_note(
+        ctx.agent(ctx.provider(text("unused"))),
+        paused.run_id,
+        "Use metric units.",
+        "second, with metadata",
+        metadata={"ticket": 7},
+    )
+    resumer = ctx.agent(ctx.provider(text("Checked, in metric.")), tools=[add])
+    await ctx.submit_resume(resumer, paused.run_id, expected_pause_id=paused.pause_id)
+    await ctx.submit_note(resumer, paused.run_id, "Too late.", "note on a finished run")
+    await ctx.submit_resume(resumer, paused.run_id, "resume a finished run")
+
+
+@cell(
+    "run_control__stream_pause_note_resume_stream",
+    "run_control",
+    "stream",
+    "submit_note",
+    "resume_stream",
+)
+async def _notes_resume_stream(ctx: Ctx) -> None:
+    provider = ctx.provider(
+        calls(("add", {"a": 2, "b": 2}, "t1")), text("never"), hook=_pause_after_first_call(ctx)
+    )
+    paused = await ctx.stream(ctx.agent(provider, tools=[add]), "work")
+    await ctx.submit_note(
+        ctx.agent(ctx.provider(text("unused"))), paused.run_id, "Note while paused."
+    )
+    resumer = ctx.agent(ctx.provider(text("Saw the note.")), tools=[add])
+    await ctx.resume_stream(resumer, paused.run_id, expected_pause_id=paused.pause_id)
+
+
+@cell(
+    "run_control__note_on_client_pause",
+    "run_control",
+    "run",
+    "submit_note",
+    "submit_tool_results",
+    "submit_resume",
+)
+async def _note_on_client_pause(ctx: Ctx) -> None:
+    agent, paused = await _paused_client(ctx, "run")
+    await ctx.submit_note(agent, paused.run_id, "Remember the header row.")
+    await ctx.submit_resume(
+        agent, paused.run_id, "not a plain pause", expected_pause_id=paused.pause_id
+    )
+    await ctx.submit_tool_results(
+        agent,
+        paused.run_id,
+        [client_result("read_range", call_ids(paused)[0], '"3 rows"')],
+        expected_pause_id=paused.pause_id,
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -777,7 +777,11 @@ _PARTIAL_EXTRAS: dict[str, tuple[str, ...]] = {
     "add_note": ("claim_epoch",),
     "mark_notes_delivered": ("claim_epoch",),
     "touch_progress": ("claim_epoch",),
+    "update_run_meta": ("claim_epoch",),
 }
+
+#: Methods outside the 0.5 protocol list that a declared capability requires on the store.
+_PARTIAL_OPTIONAL_METHODS: tuple[str, ...] = ("update_run_meta",)
 
 
 class PartialFencedRetryStore(_Forwarding):
@@ -814,8 +818,78 @@ def _partial_method(name: str) -> Any:
     return method
 
 
-for _name in PROTOCOL_0_5:
+for _name in (*PROTOCOL_0_5, *_PARTIAL_OPTIONAL_METHODS):
     setattr(PartialFencedRetryStore, _name, _partial_method(_name))
+
+#: contracts.md section 2 table: capability -> method -> keyword-only parameters it must accept.
+#: (``ClaimResult`` returns and the ``notify`` constructor option cannot be read from a
+#: signature; phase 1 checks them separately.)
+CAPABILITY_REQUIREMENTS: dict[str, dict[str, tuple[str, ...]]] = {
+    "fenced_writes": {
+        "save_trace": ("claim_epoch",),
+        "save_tool_call": ("claim_epoch",),
+        "save_usage": ("claim_epoch",),
+        "save_llm_interaction": ("claim_epoch",),
+        "save_run_event": ("claim_epoch",),
+        "add_note": ("claim_epoch",),
+        "mark_notes_delivered": ("claim_epoch",),
+        "update_run_meta": ("claim_epoch",),
+        "touch_progress": ("claim_epoch",),
+    },
+    "retry_ids": {
+        "save_trace": ("trace_id",),
+        "save_tool_call": ("row_id",),
+        "save_run_event": ("event_id",),
+        "save_usage": ("usage_id",),
+        "save_llm_interaction": ("interaction_id",),
+    },
+    "checkpointing": {
+        "checkpoint_step": (),
+        "get_traces_after": (),
+        "conversation_traces": (),
+        "save_trace": ("trace_kind",),
+        "claim_paused_run": (),
+        "submit_and_claim": (),
+    },
+    "atomic_completion": {
+        "start_tool_call": (),
+        "complete_tool_call": (),
+        "finalize_with_event": ("trace",),
+    },
+    "recovery": {"mark_lease_expired": (), "get_lease_expired": (), "reclaim_run": ()},
+    "notify": {"_after_event_insert": ()},
+}
+
+
+def capability_gaps(store: Any) -> list[tuple[str, str, tuple[str, ...]]]:
+    """``(capability, method, missing keywords)`` for every declared capability not honoured.
+
+    A missing method reports all its required keywords (or ``("<method>",)`` when it needs
+    none). A keyword counts only if present as a keyword-only parameter, as the 0.6
+    validator will read it. A store without ``capabilities`` has nothing to check.
+    """
+    declared = getattr(store, "capabilities", None)
+    gaps: list[tuple[str, str, tuple[str, ...]]] = []
+    if declared is None:
+        return gaps
+    for capability, methods in CAPABILITY_REQUIREMENTS.items():
+        if not getattr(declared, capability, False):
+            continue
+        for method, keywords in methods.items():
+            target = getattr(store, method, None)
+            if target is None:
+                gaps.append((capability, method, keywords or (method,)))
+                continue
+            params = inspect.signature(target).parameters
+            missing = tuple(
+                k
+                for k in keywords
+                if k not in params or params[k].kind is not inspect.Parameter.KEYWORD_ONLY
+            )
+            if missing:
+                gaps.append((capability, method, missing))
+    return gaps
+
 
 #: Fixture id -> class, in the order the brief lists them.
 STORE_FIXTURES: dict[str, type[_Forwarding]] = {

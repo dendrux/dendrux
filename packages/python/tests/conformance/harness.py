@@ -81,32 +81,65 @@ REGEN_ENV = "DENDRUX_REGEN_CONFORMANCE_050"
 # ---------------------------------------------------------------------------
 
 
-def package_version() -> str:
-    with open(PACKAGE_DIR / "pyproject.toml", "rb") as fh:
+def package_version(package_dir: Path = PACKAGE_DIR) -> str:
+    with open(package_dir / "pyproject.toml", "rb") as fh:
         return str(tomllib.load(fh)["project"]["version"])
 
 
-def regen_refusal() -> str | None:
+_IMPORTABLE_SUFFIXES = (".py", ".so", ".pyd", ".pth")
+
+
+def untracked_importable(package_dir: Path = PACKAGE_DIR) -> list[str]:
+    """Untracked (also git-ignored) files under ``src/dendrux`` that Python could import.
+
+    ``git diff`` against the tag cannot see them: an untracked module can shadow a tracked
+    one or add a plugin, so the tree would not be the 0.5.0 sources. Bytecode in
+    ``__pycache__`` is not importable on its own; sourceless ``.pyc`` elsewhere is.
+    """
+    proc = subprocess.run(  # noqa: S603
+        ["git", "ls-files", "--others", "--", "src/dendrux"],  # noqa: S607
+        cwd=package_dir,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=60,
+    )
+    found = []
+    for line in proc.stdout.splitlines():
+        parts = Path(line).parts
+        if "__pycache__" in parts:
+            continue
+        if line.endswith(_IMPORTABLE_SUFFIXES) or line.endswith(".pyc"):
+            found.append(line)
+    return found
+
+
+def regen_refusal(package_dir: Path = PACKAGE_DIR, tag: str | None = None) -> str | None:
     """Why regeneration is not allowed here, or None when it is.
 
-    Allowed only when the package version is 0.5.0 *and* ``src/dendrux`` has no difference
-    against tag ``v0.5.0`` (the oracle is 0.5.0 behaviour, never the candidate's own output).
+    Allowed only when the package version is 0.5.0, ``src/dendrux`` has no difference
+    against tag ``v0.5.0`` *and* there is no untracked importable source beside it (the
+    oracle is 0.5.0 behaviour, never the candidate's own output).
     """
-    version = package_version()
+    tag = tag or RECORDED_TAG
+    version = package_version(package_dir)
     if version != RECORDED_VERSION:
         return f"this checkout is Dendrux {version}; goldens are 0.5.0 behaviour"
     try:
         proc = subprocess.run(  # noqa: S603
-            ["git", "diff", "--quiet", RECORDED_TAG, "--", "src/dendrux"],  # noqa: S607
-            cwd=PACKAGE_DIR,
+            ["git", "diff", "--quiet", tag, "--", "src/dendrux"],  # noqa: S607
+            cwd=package_dir,
             capture_output=True,
             check=False,
             timeout=60,
         )
+        if proc.returncode != 0:
+            return f"src/dendrux differs from {tag} (or the tag is missing)"
+        extra = untracked_importable(package_dir)
     except (OSError, subprocess.SubprocessError) as exc:
-        return f"cannot compare src/dendrux with {RECORDED_TAG} ({type(exc).__name__})"
-    if proc.returncode != 0:
-        return f"src/dendrux differs from {RECORDED_TAG} (or the tag is missing)"
+        return f"cannot compare src/dendrux with {tag} ({type(exc).__name__})"
+    if extra:
+        return f"untracked importable source under src/dendrux: {', '.join(extra[:5])}"
     return None
 
 
@@ -188,6 +221,8 @@ def tool_call_view(tc: Any) -> dict[str, Any]:
         "params": raw(tc.params),
         "provider_tool_call_id": tc.provider_tool_call_id,
         "parse_error": getattr(tc, "parse_error", None),
+        # in-memory only, never persisted, but the provider receives it: part of the snapshot
+        "raw_arguments": getattr(tc, "raw_arguments", None),
     }
 
 
@@ -481,6 +516,18 @@ class Ctx:
     async def cancel_run(self, agent: Agent, run_id: str, label: str = "", **kwargs: Any) -> Any:
         return await self._record("cancel_run", label, lambda: agent.cancel_run(run_id, **kwargs))
 
+    async def submit_resume(self, agent: Agent, run_id: str, label: str = "", **kwargs: Any) -> Any:
+        return await self._record(
+            "submit_resume", label, lambda: agent.submit_resume(run_id, **kwargs)
+        )
+
+    async def submit_note(
+        self, agent: Agent, run_id: str, body: str, label: str = "", **kwargs: Any
+    ) -> Any:
+        return await self._record(
+            "submit_note", label, lambda: agent.submit_note(run_id, body, **kwargs)
+        )
+
     async def sweep(self, label: str = "", **kwargs: Any) -> Any:
         from dendrux import sweep
 
@@ -606,6 +653,10 @@ async def read_runs(store: Any) -> list[dict[str, Any]]:
             [raw(e) for e in await store.get_run_events(run_id)], provider_ids
         )
         pause = await store.get_pause_state(run_id)
+        notes = sorted(
+            [raw(n) for n in await store.get_notes(run_id)],
+            key=lambda n: (n["delivered_iteration"] is None, n["delivered_iteration"], n["text"]),
+        )
         runs.append(
             {
                 "run_id": run_id,
@@ -614,6 +665,7 @@ async def read_runs(store: Any) -> list[dict[str, Any]]:
                 "traces": [raw(t) for t in traces],
                 "tool_calls": [raw(t) for t in tool_rows],
                 "pause_state": raw(pause),
+                "notes": notes,
             }
         )
     return runs
@@ -797,6 +849,15 @@ def _run_golden(run: dict[str, Any]) -> dict[str, Any]:
         "events": [[e["event_type"], e["iteration_index"]] for e in run["events"]],
         "trace_roles": [t["role"] for t in run["traces"]],
         "tool_calls": [{k: t.get(k) for k in tool_keys} for t in run["tool_calls"]],
+        "notes": [
+            {
+                "text": n["text"],
+                "metadata": n["metadata"],
+                "delivered": n["delivered_at"] is not None,
+                "delivered_iteration": n["delivered_iteration"],
+            }
+            for n in run["notes"]
+        ],
         "paused_with_state": run["pause_state"] is not None,
         "pause_state_keys": sorted(run["pause_state"]) if run["pause_state"] else None,
     }

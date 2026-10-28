@@ -126,8 +126,54 @@ def test_traces_explain_provider_messages_exactly_for_unseeded_runs() -> None:
 
 
 def test_regeneration_is_refused_off_a_pristine_050_tree(monkeypatch) -> None:
-    monkeypatch.setattr(h, "package_version", lambda: "0.6.0")
+    monkeypatch.setattr(h, "package_version", lambda *a: "0.6.0")
     assert "0.6.0" in (h.regen_refusal() or "")
-    monkeypatch.setattr(h, "package_version", lambda: h.RECORDED_VERSION)
+    monkeypatch.setattr(h, "package_version", lambda *a: h.RECORDED_VERSION)
     monkeypatch.setattr(h, "RECORDED_TAG", "v0.0.0-missing-tag")
     assert h.regen_refusal() is not None
+
+
+def _git(cwd, *args) -> None:
+    import subprocess
+
+    subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@example.com", *args],  # noqa: S607
+        cwd=cwd,
+        check=True,
+        capture_output=True,
+    )
+
+
+def _pristine_repo(tmp_path):
+    pkg = tmp_path / "packages" / "python"
+    (pkg / "src" / "dendrux").mkdir(parents=True)
+    (pkg / "pyproject.toml").write_text('[project]\nname = "dendrux"\nversion = "0.5.0"\n')
+    (pkg / "src" / "dendrux" / "__init__.py").write_text("X = 1\n")
+    _git(tmp_path, "init", "-q")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-q", "-m", "0.5.0")
+    _git(tmp_path, "tag", h.RECORDED_TAG)
+    return pkg
+
+
+def test_regeneration_guard_accepts_a_pristine_tree_and_rejects_every_drift(tmp_path) -> None:
+    pkg = _pristine_repo(tmp_path)
+    assert h.regen_refusal(pkg) is None
+    # bytecode alone is not importable source
+    cache = pkg / "src" / "dendrux" / "__pycache__"
+    cache.mkdir()
+    (cache / "__init__.cpython-311.pyc").write_bytes(b"\0")
+    assert h.regen_refusal(pkg) is None
+    # an untracked module beside the tracked ones (it could shadow or extend them)
+    (pkg / "src" / "dendrux" / "shadow.py").write_text("Y = 2\n")
+    refusal = h.regen_refusal(pkg) or ""
+    assert "untracked importable source" in refusal and "shadow.py" in refusal
+    (pkg / "src" / "dendrux" / "shadow.py").unlink()
+    # a whole untracked sub-package
+    (pkg / "src" / "dendrux" / "llm").mkdir()
+    (pkg / "src" / "dendrux" / "llm" / "__init__.py").write_text("")
+    assert "untracked importable source" in (h.regen_refusal(pkg) or "")
+    (pkg / "src" / "dendrux" / "llm" / "__init__.py").unlink()
+    # a tracked edit
+    (pkg / "src" / "dendrux" / "__init__.py").write_text("X = 2\n")
+    assert "differs" in (h.regen_refusal(pkg) or "")

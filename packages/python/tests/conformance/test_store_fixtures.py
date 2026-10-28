@@ -87,6 +87,8 @@ async def test_partial_fixture_declares_fenced_writes_and_retry_ids_only(sqlite_
     ):
         params = inspect.signature(getattr(store, method)).parameters
         assert "claim_epoch" in params and extra in params, method
+    # every method and keyword contracts.md section 2 requires for both declared capabilities
+    assert stores.capability_gaps(store) == []
     # claim_epoch is only accepted on the inserts that fence; the 0.5 finalize/pause keep theirs
     assert "claim_epoch" in inspect.signature(store.finalize_run).parameters
 
@@ -123,3 +125,34 @@ async def test_claims_win_with_the_declared_shape_and_lose_with_false(name, sqli
         assert type(won) is int and won >= 1
     else:
         assert won is not False
+
+
+async def test_the_method_table_accepts_the_partial_store_and_rejects_the_fenced_one(
+    sqlite_engine,
+) -> None:
+    """What phase 1's construction-time validator must conclude about the declared fixtures."""
+    partial = build("e_partial_fenced_retry", sqlite_engine)
+    assert stores.capability_gaps(partial) == []
+    assert "claim_epoch" in inspect.signature(partial.update_run_meta).parameters
+    fenced = build("c_fenced_rejects_epoch", sqlite_engine)
+    gaps = stores.capability_gaps(fenced)
+    assert {m for _, m, _ in gaps} == set(stores.CAPABILITY_REQUIREMENTS["fenced_writes"])
+    assert all(cap == "fenced_writes" and kw == ("claim_epoch",) for cap, _, kw in gaps)
+    for name in UNDECLARED:
+        assert stores.capability_gaps(build(name, sqlite_engine)) == []
+
+
+async def test_capability_gaps_notices_a_positional_or_missing_keyword(sqlite_engine) -> None:
+    """The checker itself: a keyword that is not keyword-only does not count."""
+    partial = build("e_partial_fenced_retry", sqlite_engine)
+
+    async def update_run_meta(run_id, patch, claim_epoch=None):  # positional-or-keyword
+        return None
+
+    partial.update_run_meta = update_run_meta
+    assert stores.capability_gaps(partial) == [
+        ("fenced_writes", "update_run_meta", ("claim_epoch",))
+    ]
+    del partial.update_run_meta
+    partial.__class__ = type("NoMeta", (type(partial),), {"update_run_meta": None})
+    assert stores.capability_gaps(partial)[0][1] == "update_run_meta"

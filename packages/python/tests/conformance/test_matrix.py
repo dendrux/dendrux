@@ -15,6 +15,8 @@ ENTRY_PATHS = {
     "cancel_run",
     "retry",
     "sweep",
+    "submit_resume",
+    "submit_note",
 }
 SCENARIOS = {
     "plain_answer",
@@ -39,6 +41,7 @@ SCENARIOS = {
     "retry",
     "sweep",
     "governance",
+    "run_control",
 }
 
 
