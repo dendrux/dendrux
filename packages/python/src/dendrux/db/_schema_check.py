@@ -1,4 +1,4 @@
-"""Read-only check that a non-SQLite database has the tables and columns we need.
+"""Read-only, state-aware schema checks for PostgreSQL and SQLite.
 
 Postgres users run Alembic after upgrading Dendrux. If they forget, the first
 query fails deep inside a run with a raw ``UndefinedColumnError``. This check
@@ -14,8 +14,8 @@ the models declare (for example the tenant-scoped idempotency index added in
 running without the constraint. It does not compare column types,
 nullability or defaults. It deliberately ignores Alembic's
 version table (apps may create the schema themselves) and extra tables,
-columns and indexes. It never writes or issues DDL. SQLite is skipped: it
-upgrades itself in place (:mod:`dendrux.db._sqlite_sync`).
+columns and indexes. It never writes or issues DDL. SQLite startup first
+upgrades itself in place (:mod:`dendrux.db._sqlite_sync`), then checks currency.
 ``DENDRUX_SKIP_SCHEMA_CHECK=1`` disables it. If the database refuses the
 catalog read (for example for lack of privileges) the check logs a warning and
 lets startup continue; connection failures propagate.
@@ -28,9 +28,10 @@ import os
 import weakref
 from typing import TYPE_CHECKING
 
-from sqlalchemy import UniqueConstraint, inspect
+from sqlalchemy import UniqueConstraint, inspect, text
 from sqlalchemy.exc import DBAPIError
 
+from dendrux.db._storage_schema import ACTIVATION_INDEXES
 from dendrux.db.models import Base
 from dendrux.errors import SchemaNotInitializedError, SchemaOutOfDateError
 
@@ -87,6 +88,21 @@ def compare_schema(actual: Mapping[str, Collection[str]]) -> tuple[list[str], li
 
 def read_actual_schema(sync_conn: Connection) -> dict[str, list[str]]:
     """Table name -> column names for every model table present in the database."""
+    if sync_conn.dialect.name == "postgresql":
+        rows = sync_conn.execute(
+            text(
+                "SELECT t.relname, a.attname FROM pg_class t "
+                "JOIN pg_namespace n ON n.oid=t.relnamespace "
+                "JOIN pg_attribute a ON a.attrelid=t.oid "
+                "WHERE n.nspname=current_schema() AND t.relkind IN ('r', 'p') "
+                "AND a.attnum > 0 AND NOT a.attisdropped AND t.relname=ANY(:tables)"
+            ),
+            {"tables": sorted(Base.metadata.tables)},
+        )
+        actual: dict[str, list[str]] = {}
+        for table_name, column_name in rows:
+            actual.setdefault(table_name, []).append(column_name)
+        return actual
     inspector = inspect(sync_conn)
     wanted = {t.name for t in Base.metadata.tables.values()}
     present = [name for name in inspector.get_table_names() if name in wanted]
@@ -96,7 +112,7 @@ def read_actual_schema(sync_conn: Connection) -> dict[str, list[str]]:
     return {table: [c["name"] for c in cols] for (_schema, table), cols in columns.items()}
 
 
-def required_indexes() -> dict[str, str]:
+def required_indexes(state: str = "pre-activation") -> dict[str, str]:
     """Named index or unique constraint -> its table, for every model table."""
     wanted: dict[str, str] = {}
     for table in Base.metadata.sorted_tables:
@@ -106,41 +122,137 @@ def required_indexes() -> dict[str, str]:
         for constraint in table.constraints:
             if isinstance(constraint, UniqueConstraint) and constraint.name:
                 wanted[str(constraint.name)] = table.name
+    if state != "active":
+        for name, (owner, _, old) in ACTIVATION_INDEXES.items():
+            wanted.pop(name, None)
+            if old:
+                wanted[old] = owner
     return wanted
 
 
-def compare_indexes(actual: Collection[str], tables: Collection[str]) -> list[str]:
-    """Required indexes missing from ``actual`` (index names), as ``"table.index (index)"``.
+def read_schema_phase(conn: Connection, *, known_tables: Collection[str] | None = None) -> str:
+    """Read the frozen state table, refusing inconsistent settings."""
+    has_settings = (
+        "dendrux_settings" in known_tables
+        if known_tables is not None
+        else inspect(conn).has_table("dendrux_settings")
+    )
+    if not has_settings:
+        return "pre-activation"
+    settings = dict(
+        conn.execute(
+            text(
+                "SELECT key, value FROM dendrux_settings "
+                "WHERE key IN ('storage_format', 'activate_step')"
+            )
+        )
+        .tuples()
+        .all()
+    )
+    storage_format = settings.get("storage_format", "1")
+    step = settings.get("activate_step")
+    if storage_format not in {"1", "2"}:
+        raise RuntimeError("Invalid dendrux_settings storage format; repair the settings first.")
+    if step is not None and step != "done":
+        return "activating"
+    if storage_format == "2" and step == "done":
+        return "active"
+    if storage_format == "1" and step is None:
+        return "pre-activation"
+    raise RuntimeError("Inconsistent dendrux_settings activation state; repair the settings first.")
 
-    Only indexes of tables in ``tables`` (the ones that exist) are reported.
-    """
+
+def compare_indexes(
+    actual: Collection[str], tables: Collection[str], *, state: str = "pre-activation"
+) -> list[str]:
+    """State-derived missing indexes; active schemas must also lack replaced names."""
     present = set(actual)
-    return [
+    wanted = required_indexes(state)
+    if state == "activating":
+        for name, (_, _, old) in ACTIVATION_INDEXES.items():
+            if old and name in present:
+                wanted.pop(old, None)
+    missing = [
         f"{table}.{name} (index)"
-        for name, table in sorted(required_indexes().items())
+        for name, table in sorted(wanted.items())
         if table in tables and name not in present
     ]
+    if state == "active":
+        existing = actual.existing if isinstance(actual, _IndexNames) else present
+        missing.extend(
+            f"{table}.{old} (replaced index must be absent)"
+            for table, _, old in ACTIVATION_INDEXES.values()
+            if old and old in existing
+        )
+    return missing
+
+
+class _IndexNames(set[str]):
+    def __init__(self, valid: set[str], existing: set[str]) -> None:
+        super().__init__(valid)
+        self.existing = existing
 
 
 def read_actual_indexes(sync_conn: Connection) -> set[str]:
-    """Index names (``pg_indexes``) on the model tables in the current schema. Postgres only."""
+    """Valid, ready indexes whose definitions match, on PostgreSQL or SQLite."""
     from sqlalchemy.schema import CreateIndex
 
     from dendrux.db._index_check import _canonical, read_pg_indexes
 
-    entries = read_pg_indexes(sync_conn, tables=sorted(Base.metadata.tables))
+    if sync_conn.dialect.name == "postgresql":
+        entries = read_pg_indexes(sync_conn, tables=sorted(Base.metadata.tables))
+    else:
+        entries = {
+            row[0]: (row[1], row[2], True)
+            for row in sync_conn.execute(
+                text(
+                    "SELECT name, tbl_name, sql FROM sqlite_master "
+                    "WHERE type='index' AND sql IS NOT NULL"
+                )
+            )
+        }
     names = {name for name, entry in entries.items() if entry[2]}
-    for table in Base.metadata.sorted_tables:
-        for index in table.indexes:
-            name = str(index.name)
-            entry = entries.get(name)
-            if entry is not None and (
-                entry[0] != table.name
-                or _canonical(entry[1])
-                != _canonical(str(CreateIndex(index).compile(dialect=sync_conn.dialect)))
-            ):
-                names.discard(name)
-    return names
+    if sync_conn.dialect.name == "sqlite":
+        inspector = inspect(sync_conn)
+        for model_table in Base.metadata.sorted_tables:
+            declared = [
+                c for c in model_table.constraints if isinstance(c, UniqueConstraint) and c.name
+            ]
+            if not declared or not inspector.has_table(model_table.name):
+                continue
+            constraints = {
+                item["name"]: item["column_names"]
+                for item in inspector.get_unique_constraints(model_table.name)
+            }
+            for constraint in declared:
+                if constraints.get(str(constraint.name)) == [c.name for c in constraint.columns]:
+                    names.add(str(constraint.name))
+    expected = {
+        str(index.name): (table.name, str(CreateIndex(index).compile(dialect=sync_conn.dialect)))
+        for table in Base.metadata.sorted_tables
+        for index in table.indexes
+    }
+    for _, (owner, column, old) in ACTIVATION_INDEXES.items():
+        if old:
+            expected[old] = (owner, f"CREATE INDEX {old} ON {owner} (agent_run_id, {column})")
+    for name, (owner, ddl) in expected.items():
+        entry = entries.get(name)
+        if entry is not None and (entry[0] != owner or _canonical(entry[1]) != _canonical(ddl)):
+            names.discard(name)
+    return _IndexNames(names, set(entries))
+
+
+def schema_problems(conn: Connection) -> list[str]:
+    """Read-only structural check shared by the CLI, activation and runtime startup."""
+    actual = read_actual_schema(conn)
+    tables, columns = compare_schema(actual)
+    missing = columns + [f"table {name}" for name in tables]
+    if actual and conn.dialect.name in {"postgresql", "sqlite"}:
+        phase = read_schema_phase(conn, known_tables=actual)
+        names = read_actual_indexes(conn)
+        missing.extend(compare_indexes(names, actual.keys(), state=phase))
+
+    return missing
 
 
 def was_verified(engine: AsyncEngine) -> bool:
@@ -151,7 +263,7 @@ def was_verified(engine: AsyncEngine) -> bool:
 async def ensure_schema_current(engine: AsyncEngine) -> None:
     """Raise if the database lacks tables, columns or (Postgres) indexes the models define.
 
-    A no-op on SQLite and when ``DENDRUX_SKIP_SCHEMA_CHECK=1``. Read-only: one
+    A no-op when ``DENDRUX_SKIP_SCHEMA_CHECK=1``. Read-only: one
     connection, a table listing, one batched column listing and, on Postgres,
     index catalog reads. Named model indexes must match their definitions and
     be valid and ready; column types and defaults are not compared. Missing indexes are
@@ -166,13 +278,15 @@ async def ensure_schema_current(engine: AsyncEngine) -> None:
         SchemaOutOfDateError: Some tables or columns are missing; run
             ``dendrux db migrate``.
     """
-    if engine.dialect.name == "sqlite" or _skipped():
+    if _skipped():
         return
     indexes: set[str] | None = None
     async with engine.connect() as conn:
         try:
             actual = await conn.run_sync(read_actual_schema)
-            if actual and engine.dialect.name == "postgresql":
+            phase = "pre-activation"
+            if actual and engine.dialect.name in {"postgresql", "sqlite"}:
+                phase = await conn.run_sync(lambda c: read_schema_phase(c, known_tables=actual))
                 indexes = await conn.run_sync(read_actual_indexes)
         except DBAPIError as exc:
             if exc.connection_invalidated:
@@ -182,7 +296,9 @@ async def ensure_schema_current(engine: AsyncEngine) -> None:
     if not actual:
         raise SchemaNotInitializedError()
     missing_tables, missing_columns = compare_schema(actual)
-    missing_indexes = compare_indexes(indexes, actual.keys()) if indexes is not None else []
+    missing_indexes = (
+        compare_indexes(indexes, actual.keys(), state=phase) if indexes is not None else []
+    )
     if missing_tables or missing_columns or missing_indexes:
         raise SchemaOutOfDateError(missing_tables, missing_columns, missing_indexes)
     _VERIFIED.add(engine.sync_engine)

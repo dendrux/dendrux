@@ -35,13 +35,16 @@ from sqlalchemy import (
     Integer,
     LargeBinary,
     Numeric,
+    SmallInteger,
     String,
     Text,
     UniqueConstraint,
+    event,
     func,
     literal_column,
     text,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -62,6 +65,19 @@ class Base(DeclarativeBase):
     type_annotation_map = {
         dict[str, Any]: JSON,
     }
+
+
+@event.listens_for(Base.metadata, "before_create")
+def _storage_creation_mode(target: Any, connection: Any, **kw: Any) -> None:
+    connection.info["dendrux_fresh_schema"] = any(
+        table.name == "agent_runs" for table in kw.get("tables", ())
+    )
+
+
+def _create_activation_index(
+    ddl: Any, target: Any, bind: Any, tables: Any = None, state: Any = None, **kw: Any
+) -> bool:
+    return bind is None or bool(bind.info.get("dendrux_fresh_schema", True))
 
 
 class AgentRun(Base):
@@ -147,6 +163,15 @@ class AgentRun(Base):
     claim_epoch: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default=text("0")
     )
+    storage_format: Mapped[int] = mapped_column(SmallInteger, default=1, server_default=text("1"))
+    reclaim_attempts: Mapped[int] = mapped_column(SmallInteger, default=0, server_default=text("0"))
+    reclaim_limit: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    lease_expired_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True))
+    last_reclaimed_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True))
+    loop_state: Mapped[dict[str, Any] | None] = mapped_column(
+        JSON().with_variant(JSONB(), "postgresql"), nullable=True
+    )
+    trace_link: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_utc_now)
     updated_at: Mapped[datetime.datetime] = mapped_column(
@@ -230,6 +255,8 @@ class ReactTrace(Base):
     )
     role: Mapped[str] = mapped_column(String(20))  # user/assistant/tool
     content: Mapped[str] = mapped_column(Text)
+    trace_kind: Mapped[str] = mapped_column(String(16), default="turn", server_default="turn")
+    content_digest: Mapped[str | None] = mapped_column(CHAR(64), nullable=True)
     order_index: Mapped[int] = mapped_column(Integer)
     meta: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
 
@@ -241,7 +268,11 @@ class ReactTrace(Base):
     # Relationships
     agent_run: Mapped[AgentRun] = relationship(back_populates="traces")
 
-    __table_args__ = (Index("ix_react_traces_agent_run_id_order", "agent_run_id", "order_index"),)
+    __table_args__ = (
+        Index("uq_react_traces_run_order", "agent_run_id", "order_index", unique=True).ddl_if(
+            callable_=_create_activation_index
+        ),
+    )
 
 
 class ToolCallRecord(Base):
@@ -268,6 +299,12 @@ class ToolCallRecord(Base):
     iteration_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     meta: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    outcome: Mapped[str] = mapped_column(
+        String(16), default="completed", server_default="completed"
+    )
+    idempotent: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
+    replayed_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True))
+    content_digest: Mapped[str | None] = mapped_column(CHAR(64), nullable=True)
 
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_utc_now)
     updated_at: Mapped[datetime.datetime] = mapped_column(
@@ -277,7 +314,12 @@ class ToolCallRecord(Base):
     # Relationships
     agent_run: Mapped[AgentRun] = relationship(back_populates="tool_call_records")
 
-    __table_args__ = (Index("ix_tool_calls_agent_run_id", "agent_run_id"),)
+    __table_args__ = (
+        Index("ix_tool_calls_agent_run_id", "agent_run_id"),
+        Index("uq_tool_calls_run_call", "agent_run_id", "tool_call_id", unique=True).ddl_if(
+            callable_=_create_activation_index
+        ),
+    )
 
 
 class TokenUsage(Base):
@@ -400,6 +442,7 @@ class RunEvent(Base):
     iteration_index: Mapped[int] = mapped_column(Integer, default=0)
     correlation_id: Mapped[str | None] = mapped_column(String(26), nullable=True)
     data: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    content_digest: Mapped[str | None] = mapped_column(CHAR(64), nullable=True)
 
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_utc_now)
 
@@ -407,7 +450,9 @@ class RunEvent(Base):
     agent_run: Mapped[AgentRun] = relationship(back_populates="run_events")
 
     __table_args__ = (
-        Index("ix_run_events_agent_run_id_seq", "agent_run_id", "sequence_index"),
+        Index("uq_run_events_run_seq", "agent_run_id", "sequence_index", unique=True).ddl_if(
+            callable_=_create_activation_index
+        ),
         Index("ix_run_events_event_type", "event_type"),
         Index(
             "ix_run_events_started",
@@ -526,3 +571,27 @@ class BlobRef(Base):
         Index("ix_dendrux_blob_refs_blob", "tenant_scope", "sha256"),
         Index("ix_dendrux_blob_refs_run", "run_id", "tenant_scope"),
     )
+
+
+class DendruxSetting(Base):
+    """Database-wide storage format and resumable activation progress."""
+
+    __tablename__ = "dendrux_settings"
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    value: Mapped[str] = mapped_column(String(255), nullable=False)
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utc_now, onupdate=_utc_now
+    )
+
+
+@event.listens_for(Base.metadata, "after_create")
+def _seed_storage_settings(target: Any, connection: Any, **kw: Any) -> None:
+    from sqlalchemy import inspect
+
+    from dendrux.db._settings import seed_settings
+
+    if inspect(connection).has_table("dendrux_settings"):
+        created = {table.name for table in kw.get("tables", ())}
+        seed_settings(connection, active="agent_runs" in created)
+    connection.info.pop("dendrux_fresh_schema", None)

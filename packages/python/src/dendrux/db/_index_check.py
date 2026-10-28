@@ -59,6 +59,18 @@ def read_pg_indexes(conn: Connection, *, tables: list[str]) -> dict[str, tuple[s
     }
 
 
+def index_exists(conn: Connection, name: str) -> bool:
+    """Whether an index name exists in the current schema, regardless of its owner."""
+    if conn.dialect.name == "postgresql":
+        statement = (
+            "SELECT 1 FROM pg_class i JOIN pg_namespace n ON n.oid=i.relnamespace "
+            "WHERE n.nspname=current_schema() AND i.relkind IN ('i', 'I') AND i.relname=:name"
+        )
+    else:
+        statement = "SELECT 1 FROM sqlite_master WHERE type='index' AND name=:name"
+    return conn.execute(text(statement), {"name": name}).scalar_one_or_none() is not None
+
+
 def index_matches(conn: Connection, name: str, table: str, expected: str) -> bool:
     """Require a valid, ready index of the exact intended definition and table."""
     if conn.dialect.name == "postgresql":

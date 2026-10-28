@@ -58,6 +58,9 @@ def bounded_step(
     statement stays in the enclosing transaction: a savepoint scopes ``SET LOCAL`` and
     restores it on timeout.
     """
+    if conn.dialect.name != "postgresql":
+        conn.execute(text(statement))
+        return
     previous: str = str(conn.execute(text("SHOW lock_timeout")).scalar_one())
     try:
         if transactional:
