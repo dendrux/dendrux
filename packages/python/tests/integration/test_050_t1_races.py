@@ -138,8 +138,27 @@ async def test_note_cap_race_with_finalize(store: SQLAlchemyStateStore) -> None:
 async def test_hot_queries_can_use_their_indexes(engine: Any) -> None:
     if engine.dialect.name != "postgresql":
         pytest.skip("EXPLAIN plans are checked on Postgres")
+    import datetime as dt
+
+    from dendrux.db.models import AgentRun
+
+    now = dt.datetime.now(dt.UTC)
     async with engine.begin() as conn:
-        # This is index capability, independent of cost estimates or stale statistics.
+        # TRUNCATE retains pg_stats from earlier tests; give competing listing
+        # indexes representative tenant selectivity and fresh statistics.
+        await conn.execute(
+            AgentRun.__table__.insert(),
+            [
+                {
+                    "id": f"plan-{i:04}",
+                    "agent_name": "plan",
+                    "tenant_id": "A" if i % 100 == 0 else f"tenant-{i % 100}",
+                    "created_at": now - dt.timedelta(seconds=i),
+                }
+                for i in range(2000)
+            ],
+        )
+        await conn.execute(text("ANALYZE agent_runs"))
         await conn.execute(text("SET LOCAL enable_seqscan = off"))
         await conn.execute(text("SET LOCAL enable_indexscan = on"))
         await conn.execute(text("SET LOCAL enable_bitmapscan = off"))
