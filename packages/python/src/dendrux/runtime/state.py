@@ -1500,8 +1500,8 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
     """
 
     capabilities: ClassVar[StoreCapabilities] = StoreCapabilities(
-        fenced_writes=False,
-        retry_ids=False,
+        fenced_writes=True,
+        retry_ids=True,
         checkpointing=False,
         atomic_completion=False,
         notify=False,

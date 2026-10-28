@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from contextlib import AbstractAsyncContextManager, nullcontext
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
@@ -587,3 +588,9 @@ async def notify_governance(
         logger.warning("Notifier.on_governance_event failed", exc_info=safe_exception_info())
         if warnings is not None:
             warnings.append(f"on_governance_event failed at iteration {iteration}")
+
+
+def lease_scope(recorder: LoopRecorder | None) -> AbstractAsyncContextManager[None]:
+    """Ask the recorder for a call-scoped renewal without depending on the runtime layer."""
+    scope = getattr(recorder, "lease_scope", None)
+    return scope() if scope is not None else nullcontext()

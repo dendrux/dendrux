@@ -46,6 +46,7 @@ from dendrux.loops._helpers import (
     final_stop_reason,
     guardrail_meta,
     interruptible,
+    lease_scope,
     notify_governance,
     notify_llm,
     notify_llm_failed,
@@ -1653,14 +1654,15 @@ class ReActLoop(Loop):
                         recorder=recorder,
                         notifier=notifier,
                     ):
-                        response = await complete_call(
-                            provider,
-                            prepared.wire,
-                            tools=tools,
-                            run_id=resolved_run_id,
-                            cache_key_prefix=cache_key_prefix,
-                            **_pkw,
-                        )
+                        async with lease_scope(recorder):
+                            response = await complete_call(
+                                provider,
+                                prepared.wire,
+                                tools=tools,
+                                run_id=resolved_run_id,
+                                cache_key_prefix=cache_key_prefix,
+                                **_pkw,
+                            )
                 except Exception as _llm_exc:
                     _llm_fail_ms = int((time.monotonic() - t0) * 1000)
                     await _record_llm_failed(
@@ -2246,145 +2248,146 @@ class ReActLoop(Loop):
             interrupted = False
             retried = False
             stop_control: Any = None
-            try:
-                while True:
-                    failure: Exception | None = None
-                    # Externally visible deltas of this provider call (§5.7 guard).
-                    visible_deltas = 0
-                    try:
-                        async for event in interruptible(provider_stream, interrupt):
-                            if event.type == StreamEventType.TEXT_DELTA:
-                                partial_text.append(event.text or "")
-                                visible_deltas += 1
-                                yield RunEvent(
-                                    type=RunEventType.TEXT_DELTA,
-                                    text=event.text,
-                                    iteration=iteration,
-                                    phase=event.phase or ("commentary" if saw_tool_use else None),
+            async with lease_scope(recorder):
+                try:
+                    while True:
+                        failure: Exception | None = None
+                        # Externally visible deltas of this provider call (§5.7 guard).
+                        visible_deltas = 0
+                        try:
+                            async for event in interruptible(provider_stream, interrupt):
+                                if event.type == StreamEventType.TEXT_DELTA:
+                                    partial_text.append(event.text or "")
+                                    visible_deltas += 1
+                                    yield RunEvent(
+                                        type=RunEventType.TEXT_DELTA,
+                                        text=event.text,
+                                        iteration=iteration,
+                                        phase=event.phase
+                                        or ("commentary" if saw_tool_use else None),
+                                    )
+                                elif event.type == StreamEventType.REASONING_DELTA:
+                                    visible_deltas += 1
+                                    yield RunEvent(
+                                        type=RunEventType.REASONING_DELTA,
+                                        text=event.text,
+                                        iteration=iteration,
+                                    )
+                                elif event.type == StreamEventType.TOOL_USE_START:
+                                    saw_tool_use = True
+                                    visible_deltas += 1
+                                    yield RunEvent(
+                                        type=RunEventType.TOOL_USE_START,
+                                        tool_name=event.tool_name,
+                                        tool_call_id=event.tool_call_id,
+                                        iteration=iteration,
+                                        phase="commentary",
+                                    )
+                                elif event.type == StreamEventType.TOOL_USE_END:
+                                    saw_tool_use = True
+                                    visible_deltas += 1
+                                    yield RunEvent(
+                                        type=RunEventType.TOOL_USE_END,
+                                        tool_call=persistable_call(event.tool_call),
+                                        tool_name=event.tool_name,
+                                        tool_call_id=event.tool_call_id,
+                                        iteration=iteration,
+                                        phase="commentary",
+                                    )
+                                elif event.type == StreamEventType.DONE:
+                                    llm_response = event.raw
+                            # Validate inside the same try so a contract-violating
+                            # provider stream still pairs with on_llm_call_failed.
+                            if llm_response is None:
+                                raise RuntimeError(
+                                    f"Provider stream ended without DONE event at iteration "
+                                    f"{iteration}. complete_stream() must yield "
+                                    f"StreamEvent(type=DONE, raw=LLMResponse)."
                                 )
-                            elif event.type == StreamEventType.REASONING_DELTA:
-                                visible_deltas += 1
-                                yield RunEvent(
-                                    type=RunEventType.REASONING_DELTA,
-                                    text=event.text,
-                                    iteration=iteration,
-                                )
-                            elif event.type == StreamEventType.TOOL_USE_START:
-                                saw_tool_use = True
-                                visible_deltas += 1
-                                yield RunEvent(
-                                    type=RunEventType.TOOL_USE_START,
-                                    tool_name=event.tool_name,
-                                    tool_call_id=event.tool_call_id,
-                                    iteration=iteration,
-                                    phase="commentary",
-                                )
-                            elif event.type == StreamEventType.TOOL_USE_END:
-                                saw_tool_use = True
-                                visible_deltas += 1
-                                yield RunEvent(
-                                    type=RunEventType.TOOL_USE_END,
-                                    tool_call=persistable_call(event.tool_call),
-                                    tool_name=event.tool_name,
-                                    tool_call_id=event.tool_call_id,
-                                    iteration=iteration,
-                                    phase="commentary",
-                                )
-                            elif event.type == StreamEventType.DONE:
-                                llm_response = event.raw
-                        # Validate inside the same try so a contract-violating
-                        # provider stream still pairs with on_llm_call_failed.
-                        if llm_response is None:
-                            raise RuntimeError(
-                                f"Provider stream ended without DONE event at iteration "
-                                f"{iteration}. complete_stream() must yield "
-                                f"StreamEvent(type=DONE, raw=LLMResponse)."
+                        except Exception as _stream_exc:
+                            _stream_fail_ms = int((time.monotonic() - t0) * 1000)
+                            await _record_llm_failed(
+                                recorder,
+                                resolved_run_id,
+                                iteration,
+                                _stream_exc,
+                                duration_ms=_stream_fail_ms,
                             )
-                    except Exception as _stream_exc:
-                        _stream_fail_ms = int((time.monotonic() - t0) * 1000)
-                        await _record_llm_failed(
+                            await _notify_llm_failed(
+                                notifier,
+                                resolved_run_id,
+                                iteration,
+                                _stream_exc,
+                                notifier_warnings,
+                                duration_ms=_stream_fail_ms,
+                            )
+                            if isinstance(_stream_exc, StreamInterruptedError):
+                                interrupted = True
+                            elif not prepared.slots:
+                                raise
+                            else:
+                                failure = _stream_exc
+                                prepared = release_wire(prepared)
+                        if failure is None:
+                            break
+                        decision = await images.on_failure(
+                            failure,
+                            prepared,
+                            iteration=iteration,
+                            retried=retried,
+                            visible_deltas=visible_deltas,
+                            control_reader=_control_reader,
+                        )
+                        stop_control = control_stop(decision)
+                        if stop_control is not None:
+                            break
+                        if decision.action == "propagate":
+                            _drop_frame_locals(failure)
+                            raise failure
+                        if decision.action == "raise":
+                            assert decision.error is not None
+                            del failure
+                            raise decision.error
+                        del failure
+                        # Retry in place (N-15.2): close the first stream, keep the
+                        # telemetry context, open a new stream for the new view.
+                        retried = True
+                        await provider_stream.aclose()
+                        prepared = await images.prepare(
+                            messages, iteration=iteration, force_tombstones=decision.tombstones
+                        )
+                        await _record_llm_started(
                             recorder,
                             resolved_run_id,
                             iteration,
-                            _stream_exc,
-                            duration_ms=_stream_fail_ms,
+                            semantic_messages=prepared.semantic,
+                            semantic_tools=tools,
                         )
-                        await _notify_llm_failed(
+                        await _notify_llm_started(
                             notifier,
                             resolved_run_id,
                             iteration,
-                            _stream_exc,
                             notifier_warnings,
-                            duration_ms=_stream_fail_ms,
+                            semantic_messages=prepared.semantic,
+                            semantic_tools=tools,
                         )
-                        if isinstance(_stream_exc, StreamInterruptedError):
-                            interrupted = True
-                        elif not prepared.slots:
-                            raise
-                        else:
-                            failure = _stream_exc
-                            prepared = release_wire(prepared)
-                    if failure is None:
-                        break
-                    decision = await images.on_failure(
-                        failure,
-                        prepared,
-                        iteration=iteration,
-                        retried=retried,
-                        visible_deltas=visible_deltas,
-                        control_reader=_control_reader,
-                    )
-                    stop_control = control_stop(decision)
-                    if stop_control is not None:
-                        break
-                    if decision.action == "propagate":
-                        _drop_frame_locals(failure)
-                        raise failure
-                    if decision.action == "raise":
-                        assert decision.error is not None
-                        del failure
-                        raise decision.error
-                    del failure
-                    # Retry in place (N-15.2): close the first stream, keep the
-                    # telemetry context, open a new stream for the new view.
-                    retried = True
-                    await provider_stream.aclose()
-                    prepared = await images.prepare(
-                        messages, iteration=iteration, force_tombstones=decision.tombstones
-                    )
-                    await _record_llm_started(
-                        recorder,
-                        resolved_run_id,
-                        iteration,
-                        semantic_messages=prepared.semantic,
-                        semantic_tools=tools,
-                    )
-                    await _notify_llm_started(
-                        notifier,
-                        resolved_run_id,
-                        iteration,
-                        notifier_warnings,
-                        semantic_messages=prepared.semantic,
-                        semantic_tools=tools,
-                    )
-                    t0 = time.monotonic()
-                    provider_stream = telemetry_stream(
-                        stream_call(
-                            provider,
-                            prepared.wire,
-                            tools=tools,
+                        t0 = time.monotonic()
+                        provider_stream = telemetry_stream(
+                            stream_call(
+                                provider,
+                                prepared.wire,
+                                tools=tools,
+                                run_id=resolved_run_id,
+                                cache_key_prefix=cache_key_prefix,
+                                **_pkw,
+                            ),
                             run_id=resolved_run_id,
-                            cache_key_prefix=cache_key_prefix,
-                            **_pkw,
-                        ),
-                        run_id=resolved_run_id,
-                        iteration=iteration,
-                        recorder=recorder,
-                        notifier=notifier,
-                    )
-            finally:
-                await provider_stream.aclose()
-
+                            iteration=iteration,
+                            recorder=recorder,
+                            notifier=notifier,
+                        )
+                finally:
+                    await provider_stream.aclose()
             if stop_control is not None:
                 stop_result = _control_stop_result(
                     stop_control,
@@ -2727,14 +2730,15 @@ async def _execute_record_notify(
     """
     await _record_tool_started(recorder, run_id, tool_call, iteration)
     await _notify_tool_started(notifier, run_id, tool_call, iteration, notifier_warnings)
-    result = await _execute_tool(
-        tool_call,
-        lookups,
-        transform,
-        image_runtime=image_runtime,
-        tracker=tracker,
-        run_id=run_id,
-    )
+    async with lease_scope(recorder):
+        result = await _execute_tool(
+            tool_call,
+            lookups,
+            transform,
+            image_runtime=image_runtime,
+            tracker=tracker,
+            run_id=run_id,
+        )
     if tracker is not None:
         tracker.result = result
     await _record_tool(recorder, run_id, tool_call, result, iteration)
