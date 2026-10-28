@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased (0.6.0)
+
+"Production", part 1: a run survives a dead worker (`agent.reclaim()`,
+`sweep(on_stale="reclaim")`, `@tool(idempotent=True)`), a Postgres event
+notifier for live reads, published scale numbers with a rerunnable load script,
+one trace per run and a log-codes page, and the 0.5 FutureWarning flips.
+Entries are added as each track merges.
+
 ## 0.5.0 - 2026-10-28
 
 "Trust". Pending and live reads require a tenant scope and hide payloads by default; provider
