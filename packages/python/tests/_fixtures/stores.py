@@ -46,24 +46,9 @@ from __future__ import annotations
 
 import functools
 import inspect
-from dataclasses import dataclass
 from typing import Any
 
-from dendrux.runtime.state import UNSCOPED, SQLAlchemyStateStore
-
-
-@dataclass(frozen=True)
-class StoreCapabilities:
-    """Fixture-side copy of the 0.6 declaration (contracts.md section 2)."""
-
-    version: int = 1
-    fenced_writes: bool = False
-    retry_ids: bool = False
-    checkpointing: bool = False
-    atomic_completion: bool = False
-    recovery: bool = False
-    notify: bool = False
-
+from dendrux.runtime.state import UNSCOPED, SQLAlchemyStateStore, StoreCapabilities
 
 #: Every method of the 0.5.0 ``StateStore`` protocol, in definition order.
 PROTOCOL_0_5: tuple[str, ...] = (
@@ -106,6 +91,26 @@ PROTOCOL_0_5: tuple[str, ...] = (
     "subtree_usage",
     "run_usage",
 )
+
+
+#: contracts §3, §12.4 and §12.15: the exact additions to the legacy protocol.
+PROTOCOL_0_6_ADDITIONS = {
+    "checkpoint_step",
+    "conversation_traces",
+    "get_traces_after",
+    "get_trace",
+    "get_loop_state",
+    "start_tool_call",
+    "complete_tool_call",
+    "consume_submission",
+    "mark_lease_expired",
+    "get_lease_expired",
+    "reclaim_run",
+    "set_trace_link",
+    "get_replayed_tool_calls",
+    "mark_cancel_requested",
+    "get_children_page",
+}
 
 
 #: Claim methods whose win used to return the epoch ``int`` (0.6 returns ``ClaimResult``).

@@ -218,7 +218,9 @@ class TestClaimPausedRunDurability:
         await store.pause_run("run1", status="waiting_client_tool", pause_data={"tool": "greet"})
 
         with _FailOnceCommit():
-            ok = await store.claim_paused_run("run1", expected_status="waiting_client_tool")
+            ok = (
+                await store.claim_paused_run("run1", expected_status="waiting_client_tool")
+            ).claim_epoch
 
         assert ok == 1
         run = await store.get_run("run1")
@@ -249,11 +251,13 @@ class TestSubmitAndClaimDurability:
         await store.pause_run("run1", status="waiting_client_tool", pause_data={"pending": True})
 
         with _FailOnceCommit():
-            ok = await store.submit_and_claim(
-                "run1",
-                expected_status="waiting_client_tool",
-                submitted_data={"result": "done"},
-            )
+            ok = (
+                await store.submit_and_claim(
+                    "run1",
+                    expected_status="waiting_client_tool",
+                    submitted_data={"result": "done"},
+                )
+            ).claim_epoch
 
         assert ok == 1
         run = await store.get_run("run1")
@@ -264,11 +268,13 @@ class TestSubmitAndClaimDurability:
         await store.pause_run("run1", status="waiting_client_tool", pause_data={"pending": True})
 
         with _FailOnceExecute():
-            ok = await store.submit_and_claim(
-                "run1",
-                expected_status="waiting_client_tool",
-                submitted_data={"result": "done"},
-            )
+            ok = (
+                await store.submit_and_claim(
+                    "run1",
+                    expected_status="waiting_client_tool",
+                    submitted_data={"result": "done"},
+                )
+            ).claim_epoch
 
         assert ok == 1
 

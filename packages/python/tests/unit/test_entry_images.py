@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import functools
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -116,6 +117,7 @@ class ImageStore(SQLAlchemyStateStore):
             self._add("create_run", run_id, refs)
         return result
 
+    @functools.wraps(SQLAlchemyStateStore.save_trace)
     async def save_trace(self, run_id: str, *args: Any, **kwargs: Any) -> Any:
         refs = kwargs.pop("blob_refs", None)
         scope = kwargs.pop("blob_refs_scope", None)
@@ -126,6 +128,7 @@ class ImageStore(SQLAlchemyStateStore):
             self._add("save_trace", run_id, refs)
         return result
 
+    @functools.wraps(SQLAlchemyStateStore.save_tool_call)
     async def save_tool_call(self, run_id: str, *args: Any, **kwargs: Any) -> Any:
         refs = kwargs.pop("blob_refs", None)
         scope = kwargs.pop("blob_refs_scope", None)

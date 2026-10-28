@@ -9,6 +9,7 @@ sibling kept running, applied its side effect and wrote its row after
 from __future__ import annotations
 
 import asyncio
+from functools import wraps
 
 import pytest
 
@@ -37,6 +38,7 @@ async def test_failed_row_write_stops_the_running_sibling(store):
     LOG.clear()
     original = store.save_tool_call
 
+    @wraps(original)
     async def failing(run_id, *, tool_name, **kwargs):
         if tool_name == "fast":
             raise RuntimeError("constraint violation")

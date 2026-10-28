@@ -48,7 +48,7 @@ async def test_runner_finalize_cannot_overwrite_running_newer_claim(store, entry
             rid = (await store.list_runs())[0].id
         epoch = await epoch_of(store, rid)
         assert await store.release_run_claim(rid, status="paused", claim_epoch=epoch)
-        newer = await store.claim_paused_run(rid, expected_status="paused")
+        newer = (await store.claim_paused_run(rid, expected_status="paused")).claim_epoch
         assert newer == epoch + 1
     finally:
         llm.gate.set()
@@ -414,15 +414,19 @@ async def test_raw_claimed_entry_can_keep_original_epoch(store):
 
     a = agent(store, [tool_call("client_read", pid="a"), LLMResponse(text="must not call")])
     paused = await a.run("go")
-    old = await store.submit_and_claim(
-        paused.run_id,
-        expected_status="waiting_client_tool",
-        submitted_data={"submitted_tool_results": serialize_tool_results([result_for(paused)])},
-    )
+    old = (
+        await store.submit_and_claim(
+            paused.run_id,
+            expected_status="waiting_client_tool",
+            submitted_data={"submitted_tool_results": serialize_tool_results([result_for(paused)])},
+        )
+    ).claim_epoch
     assert await store.release_run_claim(
         paused.run_id, status="waiting_client_tool", claim_epoch=old
     )
-    newer = await store.claim_paused_run(paused.run_id, expected_status="waiting_client_tool")
+    newer = (
+        await store.claim_paused_run(paused.run_id, expected_status="waiting_client_tool")
+    ).claim_epoch
     result = await resume_claimed(
         paused.run_id,
         state_store=store,

@@ -2,6 +2,7 @@
 
 import asyncio
 import datetime as dt
+import functools
 import json
 import time
 
@@ -21,6 +22,7 @@ async def test_two_hundred_budget_runs_with_lost_forensics(
     async def work() -> str:
         return "ok"
 
+    @functools.wraps(store.save_llm_interaction)
     async def lost(*args, **kwargs):
         raise RuntimeError("fixture evidence outage")
 

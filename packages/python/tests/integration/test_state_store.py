@@ -693,7 +693,9 @@ class TestPauseResume:
         await store.create_run("run_cl", "Agent")
         await store.pause_run("run_cl", status="waiting_client_tool", pause_data={"x": 1})
 
-        claimed = await store.claim_paused_run("run_cl", expected_status="waiting_client_tool")
+        claimed = (
+            await store.claim_paused_run("run_cl", expected_status="waiting_client_tool")
+        ).claim_epoch
         assert claimed == 1
 
         record = await store.get_run("run_cl")
@@ -719,7 +721,9 @@ class TestPauseResume:
         await store.create_run("run_dc", "Agent")
         await store.pause_run("run_dc", status="waiting_client_tool", pause_data={"x": 1})
 
-        claimed1 = await store.claim_paused_run("run_dc", expected_status="waiting_client_tool")
+        claimed1 = (
+            await store.claim_paused_run("run_dc", expected_status="waiting_client_tool")
+        ).claim_epoch
         assert claimed1 == 1
 
         # Second claim fails — status is now 'running', not 'waiting_client_tool'
@@ -777,15 +781,17 @@ class TestSubmitAndClaim:
             "run_sac1", status="waiting_client_tool", pause_data=dict(self._PAUSE_DATA)
         )
 
-        won = await store.submit_and_claim(
-            "run_sac1",
-            expected_status="waiting_client_tool",
-            submitted_data={
-                "submitted_tool_results": [
-                    {"name": "read", "call_id": "tc1", "payload": '"data"', "success": True}
-                ]
-            },
-        )
+        won = (
+            await store.submit_and_claim(
+                "run_sac1",
+                expected_status="waiting_client_tool",
+                submitted_data={
+                    "submitted_tool_results": [
+                        {"name": "read", "call_id": "tc1", "payload": '"data"', "success": True}
+                    ]
+                },
+            )
+        ).claim_epoch
         assert won == 1
 
         # Status transitioned to running
@@ -808,11 +814,13 @@ class TestSubmitAndClaim:
             "run_sac2", status="waiting_client_tool", pause_data=dict(self._PAUSE_DATA)
         )
 
-        won1 = await store.submit_and_claim(
-            "run_sac2",
-            expected_status="waiting_client_tool",
-            submitted_data={"submitted_tool_results": [{"call_id": "tc1"}]},
-        )
+        won1 = (
+            await store.submit_and_claim(
+                "run_sac2",
+                expected_status="waiting_client_tool",
+                submitted_data={"submitted_tool_results": [{"call_id": "tc1"}]},
+            )
+        ).claim_epoch
         assert won1 == 1
 
         won2 = await store.submit_and_claim(
@@ -868,11 +876,13 @@ class TestSubmitAndClaim:
             "run_sac6", status="waiting_human_input", pause_data=dict(self._PAUSE_DATA)
         )
 
-        won = await store.submit_and_claim(
-            "run_sac6",
-            expected_status="waiting_human_input",
-            submitted_data={"submitted_user_input": "yes, proceed"},
-        )
+        won = (
+            await store.submit_and_claim(
+                "run_sac6",
+                expected_status="waiting_human_input",
+                submitted_data={"submitted_user_input": "yes, proceed"},
+            )
+        ).claim_epoch
         assert won == 1
 
         pause = await store.get_pause_state("run_sac6")
@@ -1125,9 +1135,22 @@ class TestDelegationInfo:
         await store.create_run(
             run_id,
             agent_name,
-            parent_run_id=parent_run_id,
+            parent_run_id=None,
             delegation_level=delegation_level,
         )
+        if parent_run_id is not None:
+            # Historical read fixtures construct stored links after admission.
+            from sqlalchemy import update
+
+            from dendrux.db.models import AgentRun
+
+            async with store._session_factory() as session:
+                await session.execute(
+                    update(AgentRun)
+                    .where(AgentRun.id == run_id)
+                    .values(parent_run_id=parent_run_id)
+                )
+                await session.commit()
         usage = UsageStats(
             input_tokens=input_tokens,
             output_tokens=output_tokens,
@@ -1370,8 +1393,8 @@ class TestDelegationInfo:
         """A→B→A cycle: ancestry is incomplete, BFS doesn't hang."""
         # Create A and B normally, then corrupt B's parent to point at A
         await store.create_run("a", "A")
-        await store.finalize_run("a", status="success")
         await store.create_run("b", "B", parent_run_id="a", delegation_level=1)
+        await store.finalize_run("a", status="success")
         await store.finalize_run("b", status="success")
 
         # Corrupt: set A's parent_run_id to B (creating a cycle)

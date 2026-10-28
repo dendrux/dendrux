@@ -27,11 +27,13 @@ from __future__ import annotations
 
 import inspect
 import logging
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from dendrux.errors import ImagePersistenceUnsupportedError, safe_exception_info
+from dendrux.errors import ImagePersistenceUnsupportedError, RunFencedError, safe_exception_info
 from dendrux.loops.base import BaseRecorder
 from dendrux.runtime._blob_catalog import edges_for_parts, scrub_inline_images
+from dendrux.runtime._capabilities import capabilities
 from dendrux.runtime.durability import retry_critical, retry_transient_db
 from dendrux.types import (
     ImagePart,
@@ -43,6 +45,7 @@ from dendrux.types import (
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+    from contextlib import AbstractAsyncContextManager
 
     from dendrux.media import BlobEdge
     from dendrux.runtime.state import StateStore
@@ -194,6 +197,12 @@ class PersistenceRecorder(BaseRecorder):
         self._target_lookup = target_lookup or {}
         self._order_index = initial_order_index
 
+    def lease_scope(self) -> AbstractAsyncContextManager[None]:
+        """Provide the loop's optional renewal seam from the runtime layer."""
+        from dendrux.runtime.context import lease_scope
+
+        return lease_scope()
+
     def _edge_kwargs(self, edges: list[BlobEdge]) -> dict[str, Any]:
         """``blob_refs`` kwargs for a store write, only when there are edges."""
         if not edges:
@@ -221,6 +230,10 @@ class PersistenceRecorder(BaseRecorder):
         The store allocates the sequence index in the insert.
         """
 
+        identity: dict[str, Any] = (
+            {"event_id": generate_ulid()} if capabilities(self._store).retry_ids else {}
+        )
+
         async def _write() -> None:
             from dendrux.runtime.state import validate_event_index, validate_event_writer
 
@@ -231,6 +244,7 @@ class PersistenceRecorder(BaseRecorder):
                 iteration_index=iteration,
                 correlation_id=correlation_id,
                 data=data,
+                **identity,
             )
             validate_event_index(index)
 
@@ -261,6 +275,10 @@ class PersistenceRecorder(BaseRecorder):
             self._edges("trace", str(order_idx), meta.get(PARTS_META_KEY) or [])
         )
 
+        identity: dict[str, Any] = (
+            {"trace_id": generate_ulid()} if capabilities(self._store).retry_ids else {}
+        )
+
         # FAIL-CLOSED with retry
         async def _write() -> None:
             await self._store.save_trace(
@@ -270,6 +288,7 @@ class PersistenceRecorder(BaseRecorder):
                 order_index=order_idx,
                 meta=meta,
                 **edge_kwargs,
+                **identity,
             )
 
         await retry_critical(_write, label="save_trace", run_id=self._run_id)
@@ -374,6 +393,8 @@ class PersistenceRecorder(BaseRecorder):
             await retry_transient_db(
                 _write_interaction, label="save_llm_interaction", run_id=self._run_id
             )
+        except RunFencedError:
+            raise
         except Exception:
             logger.warning(
                 "Failed to save llm_interaction for run %s iteration %d",
@@ -412,6 +433,8 @@ class PersistenceRecorder(BaseRecorder):
             else:
                 # A legacy store cannot safely replay an ambiguous commit.
                 await _write_usage()
+        except RunFencedError:
+            raise
         except Exception:
             logger.warning(
                 "Failed to save usage for run %s iteration %d",
@@ -444,6 +467,8 @@ class PersistenceRecorder(BaseRecorder):
         # BEST-EFFORT: touch progress for sweep
         try:
             await self._store.touch_progress(self._run_id)
+        except RunFencedError:
+            raise
         except Exception:
             logger.warning(
                 "Failed to touch progress for run %s", self._run_id, exc_info=safe_exception_info()
@@ -453,6 +478,8 @@ class PersistenceRecorder(BaseRecorder):
         """Touch ``last_progress_at`` at dispatch so a long tool starts fresh. BEST-EFFORT."""
         try:
             await self._store.touch_progress(self._run_id)
+        except RunFencedError:
+            raise
         except Exception:
             logger.warning(
                 "Failed to touch progress for run %s", self._run_id, exc_info=safe_exception_info()
@@ -483,6 +510,8 @@ class PersistenceRecorder(BaseRecorder):
                     "duration_ms": duration_ms,
                 },
             )
+        except RunFencedError:
+            raise
         except Exception:
             logger.warning(
                 "Failed-call evidence unavailable: run_id=%s code=llm_failed_write", self._run_id
@@ -506,6 +535,9 @@ class PersistenceRecorder(BaseRecorder):
             meta[IMAGE_NOTES_META_KEY] = list(tool_result.notes)
         extra: dict[str, Any] = {"meta": meta} if meta else {}
         extra.update(self._edge_kwargs(self._edges("tool_call", tool_call.id, images)))
+
+        if capabilities(self._store).retry_ids:
+            extra["row_id"] = generate_ulid()
 
         # FAIL-CLOSED with retry: save_tool_call (proof of side effects)
         async def _write_tool() -> None:
@@ -549,6 +581,8 @@ class PersistenceRecorder(BaseRecorder):
         # BEST-EFFORT: touch progress for sweep
         try:
             await self._store.touch_progress(self._run_id)
+        except RunFencedError:
+            raise
         except Exception:
             logger.warning(
                 "Failed to touch progress for run %s", self._run_id, exc_info=safe_exception_info()
@@ -570,3 +604,53 @@ class PersistenceRecorder(BaseRecorder):
             data=data,
             correlation_id=correlation_id,
         )
+
+
+@dataclass(frozen=True)
+class ResolutionAction:
+    """A recovery decision for an unresolved reserved observation.
+
+    Only pending calls are considered: atomic completion removes a call from
+    pending in the same transaction as its observation. Dispatch actions must
+    still go through ordinary validation and governance in the reclaim runner.
+    """
+
+    kind: str
+    call_id: str | None = None
+    order_index: int | None = None
+
+
+def resolve_pending(loop_state: dict[str, Any], tool_rows: Sequence[Any]) -> list[ResolutionAction]:
+    """Decide the next recovery actions without executing or mutating anything."""
+    if loop_state.get("submission") is not None:
+        return [ResolutionAction("consume_submission")]
+
+    def read(row: Any, name: str, default: Any = None) -> Any:
+        return row.get(name, default) if isinstance(row, dict) else getattr(row, name, default)
+
+    rows = {read(row, "tool_call_id"): row for row in tool_rows}
+    actions = []
+    for pending in loop_state.get("pending", []):
+        call_id, phase = pending["call_id"], pending["phase"]
+        row = rows.get(call_id)
+        kind: str | None
+        if phase == "client":
+            kind = "wait_client"
+        elif row is None:
+            kind = {
+                "gated": "approval",
+                "rejected": "resolve",
+                "invalid": "resolve",
+                "approved": "dispatch",
+                "dispatchable": "dispatch",
+            }.get(phase)
+            if kind is None:
+                raise ValueError("Unsupported pending-call phase")
+        elif read(row, "outcome") == "started":
+            kind = "replay" if read(row, "idempotent", False) else "approval_replay"
+        elif read(row, "outcome") in ("completed", "failed", "unknown"):
+            kind = "observe"
+        else:
+            raise ValueError("Unsupported tool-call outcome")
+        actions.append(ResolutionAction(kind, call_id, pending["order_index"]))
+    return actions

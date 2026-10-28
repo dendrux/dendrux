@@ -386,7 +386,12 @@ async def _emit_event(
     if state_store is None:
         return
 
+    from dendrux.runtime._capabilities import capabilities
     from dendrux.runtime.durability import retry_critical
+
+    identity: dict[str, Any] = (
+        {"event_id": generate_ulid()} if capabilities(state_store).retry_ids else {}
+    )
 
     async def _write() -> None:
         from dendrux.runtime.state import validate_event_index, validate_event_writer
@@ -397,6 +402,7 @@ async def _emit_event(
             event_type=event_type,
             correlation_id=correlation_id,
             data=data,
+            **identity,
         )
         validate_event_index(index)
 
@@ -420,16 +426,9 @@ async def _emit_event_safe(
     if state_store is None:
         return
     try:
-        from dendrux.runtime.state import validate_event_index, validate_event_writer
-
-        validate_event_writer(state_store)
-        index = await state_store.save_run_event(
-            run_id,
-            event_type=event_type,
-            correlation_id=correlation_id,
-            data=data,
-        )
-        validate_event_index(index)
+        await _emit_event(state_store, run_id, event_type, data, correlation_id)
+    except RunFencedError:
+        raise
     except Exception:
         logger.warning(
             "Failed to record %s for run %s (in error handler)",
@@ -1753,6 +1752,7 @@ async def run(
                     max_delegation_depth=effective_max_depth,
                     tenant_id=tenant_id,
                     state_store=state_store,
+                    lease_interval_s=agent.lease_interval.total_seconds(),
                     loop=asyncio.get_running_loop(),
                 )
                 ctx_token = set_delegation_context(this_ctx)
@@ -2576,6 +2576,7 @@ async def retry(
             max_delegation_depth=effective_max_depth,
             tenant_id=tenant_id,
             state_store=state_store,
+            lease_interval_s=agent.lease_interval.total_seconds(),
             loop=asyncio.get_running_loop(),
         )
         ctx_token = set_delegation_context(this_ctx)
@@ -3104,6 +3105,7 @@ def run_stream(
                 max_delegation_depth=eff_max_depth,
                 tenant_id=eff_tenant,
                 state_store=store,
+                lease_interval_s=agent.lease_interval.total_seconds(),
                 loop=asyncio.get_running_loop(),
             )
             stream_context.set_delegation(this_ctx)
@@ -4668,6 +4670,7 @@ async def _resume_core(
                 max_delegation_depth=resume_max_depth,
                 tenant_id=run_record.tenant_id if run_record else None,
                 state_store=state_store,
+                lease_interval_s=agent.lease_interval.total_seconds(),
                 loop=asyncio.get_running_loop(),
             )
             ctx_token = set_delegation_context(resume_ctx)
@@ -5081,6 +5084,7 @@ def resume_stream(
                 max_delegation_depth=resume_max_depth,
                 tenant_id=run_record.tenant_id if run_record else None,
                 state_store=store,
+                lease_interval_s=agent.lease_interval.total_seconds(),
                 loop=asyncio.get_running_loop(),
             )
             stream_context.set_delegation(resume_ctx)

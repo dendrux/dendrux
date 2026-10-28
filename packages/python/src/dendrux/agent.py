@@ -410,6 +410,7 @@ class Agent:
         limits: Limits | None = ...,
         tool_threads: int = ...,
         on_governance_change: Literal["warn", "raise"] = ...,
+        lease_interval: timedelta = ...,
     ) -> None: ...
 
     @overload
@@ -445,6 +446,7 @@ class Agent:
         limits: Limits | None = ...,
         tool_threads: int = ...,
         on_governance_change: Literal["warn", "raise"] = ...,
+        lease_interval: timedelta = ...,
     ) -> None: ...
 
     def __init__(
@@ -479,6 +481,7 @@ class Agent:
         limits: Limits | None = None,
         tool_threads: int = 8,
         on_governance_change: Literal["warn", "raise"] | _UnsetType = _UNSET,
+        lease_interval: timedelta = timedelta(seconds=30),
     ) -> None:
         # --- Subclass guard: block class-level provider ---
         from dendrux.llm.base import LLMProvider as _LLMBase
@@ -489,6 +492,13 @@ class Agent:
                 "provider must be passed to __init__(), not set as a class attribute. "
                 "Class-level provider creates a live HTTP client at class definition time."
             )
+
+        if not isinstance(lease_interval, timedelta) or lease_interval < timedelta(seconds=5):
+            logging.getLogger(__name__).warning(
+                "Lease interval below floor", extra={"run_id": None, "code": "lease_interval"}
+            )
+            raise ValueError("lease_interval must be a timedelta of at least 5 seconds")
+        self.lease_interval = lease_interval
 
         # --- Identity ---
         if not isinstance(name, _UnsetType):
@@ -606,7 +616,13 @@ class Agent:
             raise ValueError("database_options requires database_url.")
 
         self._database_url = database_url
-        self._database_options = database_options or {}
+        from dendrux.db._engine_options import split_database_options
+
+        self._database_options, self._store_options = split_database_options(database_options)
+        if state_store is not None:
+            from dendrux.runtime._capabilities import validate_capabilities
+
+            validate_capabilities(state_store)
         self._state_store = state_store
 
     def _configure_trust(
@@ -1198,7 +1214,7 @@ class Agent:
                     closed = False  # a concurrent first use published first
                 else:
                     self._private_engine = engine
-                    self._lazy_store = SQLAlchemyStateStore(engine)
+                    self._lazy_store = SQLAlchemyStateStore(engine, **self._store_options)
                     return self._lazy_store
             await release(engine)
             if closed:
@@ -1212,7 +1228,7 @@ class Agent:
             engine = await _get_env_engine(env_url, self._database_options)
             if not was_verified(engine):
                 await _verify_schema_initialized(engine, env_url)
-            self._lazy_store = SQLAlchemyStateStore(engine)
+            self._lazy_store = SQLAlchemyStateStore(engine, **self._store_options)
             return self._lazy_store
 
         return None

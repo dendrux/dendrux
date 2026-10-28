@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 from contextvars import ContextVar
@@ -168,6 +169,7 @@ async def test_repeated_cancellation_waits_for_durable_cleanup(store, monkeypatc
             await release_cleanup.wait()
         return await finalize(run_id, **kwargs)
 
+    @functools.wraps(store.save_run_event)
     async def gated_event(run_id, **kwargs):
         if kwargs["event_type"] == "run.cancelled" and blocked_write == "event":
             cleanup_entered.set()

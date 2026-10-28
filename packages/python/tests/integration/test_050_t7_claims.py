@@ -18,19 +18,19 @@ async def test_claim_race_returns_one_epoch(store):
         ]
     )
     assert sum(bool(c) for c in claims) == 1
-    assert [c for c in claims if c] == [1]
+    assert [c.claim_epoch for c in claims if c] == [1]
     assert (await store.get_run_control("claims")).claim_epoch == 1
 
 
 async def test_stale_epoch_cannot_finalize_pause_or_release_new_claim(store):
     await store.create_run("epochs", "integrity")
     await store.pause_run("epochs", status="paused", pause_data={"pause_id": "one"})
-    old = await store.claim_paused_run("epochs", expected_status="paused")
+    old = (await store.claim_paused_run("epochs", expected_status="paused")).claim_epoch
     assert type(old) is int
     assert await store.try_pause_run(
         "epochs", status="paused", pause_data={"pause_id": "two"}, claim_epoch=old
     )
-    new = await store.claim_paused_run("epochs", expected_status="paused")
+    new = (await store.claim_paused_run("epochs", expected_status="paused")).claim_epoch
     assert new == old + 1
     writes = await asyncio.gather(
         store.finalize_run(

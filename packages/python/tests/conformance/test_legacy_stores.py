@@ -82,6 +82,16 @@ async def test_every_fixture_runs_a_flow_on_050_which_ignores_declarations(
 ) -> None:
     """0.5 reads no declaration: all five behave as 0.5 legacy stores (statuses agree)."""
     cell = next(c for c in CELLS if c.id == cell_id)
+    if name == "c_fenced_rejects_epoch":
+        from dendrux.errors import StoreCapabilityError
+
+        with pytest.raises(StoreCapabilityError):
+            await h.run_cell(
+                cell,
+                sqlite_engine,
+                stores.STORE_FIXTURES[name](SQLAlchemyStateStore(sqlite_engine)),
+            )
+        return
     recording = await h.run_cell(
         cell, sqlite_engine, stores.STORE_FIXTURES[name](SQLAlchemyStateStore(sqlite_engine))
     )

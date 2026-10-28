@@ -27,7 +27,8 @@ def test_protocol_list_matches_the_050_state_store() -> None:
     declared = {
         n for n, _ in inspect.getmembers(StateStore, inspect.isfunction) if not n.startswith("_")
     }
-    assert set(stores.PROTOCOL_0_5) == declared
+    assert set(stores.PROTOCOL_0_5) < declared
+    assert declared - set(stores.PROTOCOL_0_5) == stores.PROTOCOL_0_6_ADDITIONS
     assert len(set(stores.PROTOCOL_0_5)) == len(stores.PROTOCOL_0_5)
 
 
@@ -108,6 +109,12 @@ async def test_claims_win_with_the_declared_shape_and_lose_with_false(name, sqli
 
     store = build(name, sqlite_engine)
     call = ToolCall(name="read_range", params={"sheet": "S1"}, provider_tool_call_id="t1")
+    if name == "c_fenced_rejects_epoch":
+        from dendrux.errors import StoreCapabilityError
+
+        with pytest.raises(StoreCapabilityError):
+            Agent(provider=MockLLM([]), prompt="p", state_store=store)
+        return
     agent = Agent(
         provider=MockLLM([LLMResponse(tool_calls=[call])]),
         prompt="p",

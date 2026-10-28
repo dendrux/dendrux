@@ -90,6 +90,8 @@ async def retry_transient_db(
             return await attempt()
         except (SQLAlchemyError, PersistenceError) as exc:
             if not is_transient_db_error(exc):
+                if isinstance(exc, PersistenceError):
+                    raise
                 raise PersistenceError() from None
             if attempt_num < _MAX_RETRIES:
                 await _backoff(attempt_num, label, run_id, exc)

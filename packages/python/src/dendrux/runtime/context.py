@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, TypeVar
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Awaitable
+    from collections.abc import AsyncGenerator, AsyncIterator, Awaitable
 
     from dendrux.skills._session import SkillSession
 
@@ -103,6 +103,14 @@ class DelegationContext:
     state_store: Any = field(default=None, compare=False, repr=False)
     loop: asyncio.AbstractEventLoop | None = field(default=None, compare=False, repr=False)
     _heartbeat_at: list[float] = field(default_factory=lambda: [0.0], compare=False, repr=False)
+    lease_interval_s: float = 30.0
+    _lease_lock: asyncio.Lock = field(default_factory=asyncio.Lock, compare=False, repr=False)
+    _lease_failures: list[int] = field(default_factory=lambda: [0], compare=False, repr=False)
+    _lease_errors: list[BaseException | None] = field(
+        default_factory=lambda: [None], compare=False, repr=False
+    )
+    trace_link: str | None = None
+    tool_span_link: str | None = None
 
     def __hash__(self) -> int:
         return hash(self.run_id)
@@ -191,8 +199,12 @@ _heartbeat_tasks: set[asyncio.Task[None]] = set()
 
 
 async def _touch(store: Any, run_id: str) -> None:
+    from dendrux.errors import RunFencedError
+
     try:
         await store.touch_progress(run_id)
+    except RunFencedError:
+        raise
     except Exception:
         logger.warning("Heartbeat failed for run %s", run_id, exc_info=True)
 
@@ -359,3 +371,81 @@ class StreamContext:
                 yield event
         finally:
             await self._step(generator.aclose())
+
+
+async def _renew_claim(ctx: DelegationContext) -> None:
+    from dendrux.errors import PersistenceError, RunFencedError
+
+    if ctx._lease_lock.locked():
+        return
+    async with ctx._lease_lock:
+        try:
+            async with asyncio.timeout(min(ctx.lease_interval_s / 2, 10.0)):
+                await ctx.state_store.touch_progress(ctx.run_id)
+            ctx._lease_failures[0] = 0
+        except RunFencedError as error:
+            ctx._lease_errors[0] = error
+            raise
+        except Exception:
+            ctx._lease_failures[0] += 1
+            logger.warning(
+                "Lease renewal failed",
+                extra={
+                    "run_id": ctx.run_id,
+                    "code": "lease_renew_failed",
+                    "attempt": ctx._lease_failures[0],
+                },
+            )
+            if ctx._lease_failures[0] >= 2:
+                ctx._lease_errors[0] = PersistenceError(code="lease_lost")
+                logger.warning("Lease lost", extra={"run_id": ctx.run_id, "code": "lease_lost"})
+
+
+@contextlib.asynccontextmanager
+async def lease_scope() -> AsyncIterator[None]:
+    """Renew only while a model/tool call is in flight, in the caller's task context."""
+    from dendrux.errors import RunFencedError
+    from dendrux.runtime._capabilities import capabilities
+
+    ctx = get_delegation_context()
+    if ctx is None or not ctx.persisted or not capabilities(ctx.state_store).fenced_writes:
+        yield
+        return
+    if ctx._lease_errors[0] is not None:
+        raise ctx._lease_errors[0]
+    await _renew_claim(ctx)
+    parent = asyncio.current_task()
+    fenced_cancel = False
+
+    async def tick() -> None:
+        nonlocal fenced_cancel
+        while True:
+            await asyncio.sleep(ctx.lease_interval_s)
+            try:
+                if ctx._lease_errors[0] is None:
+                    await _renew_claim(ctx)
+                if isinstance(ctx._lease_errors[0], RunFencedError):
+                    raise ctx._lease_errors[0]
+            except RunFencedError:
+                if parent is not None:
+                    fenced_cancel = True
+                    parent.cancel()
+                return
+
+    ticker = asyncio.create_task(tick())
+    try:
+        yield
+    except asyncio.CancelledError:
+        if fenced_cancel and parent is not None:
+            parent.uncancel()
+            if parent.cancelling() == 0 and ctx._lease_errors[0] is not None:
+                raise ctx._lease_errors[0] from None
+        raise
+    finally:
+        ticker.cancel()
+        # Cancellation of the write precedes waiting for cleanup.
+        done, _ = await asyncio.wait({ticker}, timeout=1.0)
+        if ticker in done and not ticker.cancelled():
+            ticker.exception()
+    if ctx._lease_errors[0] is not None:
+        raise ctx._lease_errors[0]

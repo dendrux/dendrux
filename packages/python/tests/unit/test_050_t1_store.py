@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import logging
+from functools import wraps
 from typing import Any
 
 import pytest
@@ -262,6 +263,7 @@ class TestEventAllocation:
         original = state.save_run_event
         failed = {"done": False}
 
+        @wraps(original)
         async def flaky(run_id: str, **kwargs: Any) -> int:
             if kwargs.get("event_type") == "tool.completed" and not failed["done"]:
                 failed["done"] = True

@@ -637,8 +637,7 @@ async def test_injected_deadlock_retries_whole_transaction(engine, store, monkey
             blob_refs=sub,
             blob_refs_scope="-",
         )
-        == 1
-    )
+    ).claim_epoch == 1
     async with engine.connect() as conn:
         runs = (await conn.execute(text("SELECT count(*) FROM agent_runs"))).scalar_one()
         edges = (await conn.execute(text("SELECT count(*) FROM dendrux_blob_refs"))).scalar_one()

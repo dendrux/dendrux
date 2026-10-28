@@ -528,6 +528,7 @@ class ToolDef:
     # PII restore allowlist (``PII(restore="allowlisted")``): False, True (every
     # entity) or a frozenset of entity names. Ignored under ``restore="all"``.
     receives_pii: bool | frozenset[str] = False
+    idempotent: bool = False
 
 
 @dataclass(frozen=True)
@@ -2051,6 +2052,7 @@ class CreateRunResult:
     run_id: str
     outcome: Literal["created", "existing_active", "existing_terminal"]
     status: RunStatus
+    storage_format: int = 1
 
 
 class RunAlreadyActiveError(RuntimeError):

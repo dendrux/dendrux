@@ -29,6 +29,7 @@ from dendrux.errors import (
     RunNotFoundError,
     RunNotPausedError,
 )
+from dendrux.runtime.state import ClaimResult
 from dendrux.types import (
     ApprovalDecision,
     ImagePart,
@@ -272,7 +273,7 @@ async def claim_paused_validated(
     *,
     expected_status: str,
     validate: Callable[[dict[str, Any]], None],
-) -> int:
+) -> ClaimResult | int | bool:
     """Use atomic validation when supported; preserve legacy claims best effort.
 
     The cached key is the unbound implementation, not a store instance. Legacy
@@ -310,11 +311,19 @@ async def claim_paused_validated(
             validate(current)
         except BaseException:
             release = getattr(store, "release_run_claim", None)
-            if release is not None and type(epoch) is int:
+            if (
+                release is not None
+                and isinstance(epoch, (int, ClaimResult))
+                and not isinstance(epoch, bool)
+            ):
                 import anyio
 
                 with anyio.CancelScope(shield=True):
-                    await release(run_id, status=expected_status, claim_epoch=epoch)
+                    await release(
+                        run_id,
+                        status=expected_status,
+                        claim_epoch=epoch.claim_epoch if isinstance(epoch, ClaimResult) else epoch,
+                    )
             raise
     return epoch
 
@@ -332,7 +341,7 @@ async def claim_or_raise(
     validate: Callable[[dict[str, Any]], None] | None = None,
     blob_refs: Sequence[BlobEdge] | None = None,
     blob_refs_scope: str | None = None,
-) -> int:
+) -> ClaimResult | int:
     """Perform a status preflight, then persist-first handoff + CAS claim.
 
     The preflight reads the current status before attempting the CAS so
@@ -377,6 +386,7 @@ async def claim_or_raise(
     )
 
     # --- Claim: run was expected_status at preflight, attempt CAS. ---
+    won: ClaimResult | int | bool
     if submitted_data is not None:
         claim_kwargs: dict[str, Any] = {} if validate is None else {"validate": validate}
         if blob_refs:
@@ -402,11 +412,19 @@ async def claim_or_raise(
                 await report_governance_change(agent, store, run_id, raw)
             except BaseException:
                 release = getattr(store, "release_run_claim", None)
-                if release is not None and type(won) is int:
+                if (
+                    release is not None
+                    and isinstance(won, (int, ClaimResult))
+                    and not isinstance(won, bool)
+                ):
                     import anyio
 
                     with anyio.CancelScope(shield=True):
-                        await release(run_id, status=expected_status.value, claim_epoch=won)
+                        await release(
+                            run_id,
+                            status=expected_status.value,
+                            claim_epoch=won.claim_epoch if isinstance(won, ClaimResult) else won,
+                        )
                 raise
         return won
 

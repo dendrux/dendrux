@@ -180,6 +180,28 @@ def calls(
 # ---------------------------------------------------------------------------
 
 
+# contracts §12.4 / §12.15: additive read-model fields, never message/payload fields.
+ADDITIVE_060_RECORD_FIELDS = {
+    "TraceRecord": {"trace_kind"},
+    "ToolCallReadRecord": {"outcome", "idempotent", "replayed_at"},
+    "RunRecord": {
+        "storage_format",
+        "claim_epoch",
+        "status_changed_at",
+        "reclaim_attempts",
+        "reclaim_limit",
+        "lease_expired_at",
+        "last_reclaimed_at",
+        "loop_state",
+        "trace_link",
+    },
+}
+# contracts §7 / §12.15: additive sweep result shape only.
+ADDITIVE_060_RESULT_FIELDS = {"SweepResult": {"reclaimable", "cursor"}}
+# contracts §12.7 / §12.15: preserve every other base and its order.
+ADDITIVE_060_EXCEPTION_BASES = {"RunControlError"}
+
+
 def raw(obj: Any) -> Any:
     """Plain-JSON snapshot keeping real values (ids, ISO timestamps); bytes as base64."""
     if obj is None or isinstance(obj, bool | int | str):
@@ -200,7 +222,14 @@ def raw(obj: Any) -> Any:
         items = sorted(obj, key=repr) if isinstance(obj, set | frozenset) else obj
         return [raw(v) for v in items]
     if hasattr(obj, "__dataclass_fields__") and not isinstance(obj, type):
-        return {name: raw(getattr(obj, name)) for name in obj.__dataclass_fields__}
+        excluded = ADDITIVE_060_RECORD_FIELDS.get(
+            type(obj).__name__, set()
+        ) | ADDITIVE_060_RESULT_FIELDS.get(type(obj).__name__, set())
+        return {
+            name: raw(getattr(obj, name))
+            for name in obj.__dataclass_fields__
+            if name not in excluded
+        }
     return f"<{type(obj).__name__}>"
 
 
@@ -258,7 +287,8 @@ def exception_chain(exc: BaseException) -> list[str]:
     """Class names of ``type(exc)`` and its bases up to ``Exception`` (never the message)."""
     names = []
     for cls in type(exc).__mro__:
-        names.append(cls.__name__)
+        if cls.__name__ not in ADDITIVE_060_EXCEPTION_BASES:
+            names.append(cls.__name__)
         if cls is Exception:
             break
     return names

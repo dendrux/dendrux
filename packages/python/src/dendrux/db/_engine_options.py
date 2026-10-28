@@ -36,7 +36,7 @@ def engine_options(url: str | URL, supplied: dict[str, Any] | None = None) -> di
         options["connect_args"] = {"check_same_thread": False}
     else:
         options.update(pool_pre_ping=True, pool_recycle=1800)
-    incoming = dict(supplied or {})
+    incoming, _store = split_database_options(supplied)
     connect = dict(options.get("connect_args", {}))
     connect.update(incoming.pop("connect_args", {}))
     options.update(incoming)
@@ -59,3 +59,14 @@ def frozen_options(value: Any) -> Any:
     except TypeError:
         raise ValueError("database_options values must be hashable or containers") from None
     return (type(value), value)
+
+
+def split_database_options(
+    supplied: dict[str, Any] | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Keep store-only configuration away from SQLAlchemy engine construction."""
+    engine = dict(supplied or {})
+    store = {}
+    if "notify_channel" in engine:
+        store["notify_channel"] = engine.pop("notify_channel")
+    return engine, store

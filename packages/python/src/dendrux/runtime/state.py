@@ -19,11 +19,12 @@ import math
 import re
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Protocol, cast, overload
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, NoReturn, Protocol, cast, overload
 
 from dendrux.runtime._blob_catalog import SQLBlobCatalog, write_blob_refs
 from dendrux.runtime.durability import (
     _safe_database_call,
+    _sqlstate,
     retry_transient_db,
     safe_database_operations,
 )
@@ -37,7 +38,7 @@ from dendrux.types import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Callable, Iterable, Sequence
+    from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
     from datetime import datetime, timedelta
 
     from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
@@ -66,6 +67,34 @@ _NOTE_LOCK_NAMESPACE = 0x44584E54
 which scopes to untenanted runs only."""
 
 TenantScope = str | None | _Unscoped
+
+
+@dataclass(frozen=True)
+class StoreCapabilities:
+    """Explicit, versioned promises made by a state-store implementation.
+
+    Usage retry equality covers persisted token_usage columns (cost at six
+    decimals); non-persisted UsageStats fields such as cost_source are excluded.
+    """
+
+    version: int = 1
+    fenced_writes: bool = False
+    retry_ids: bool = False
+    checkpointing: bool = False
+    atomic_completion: bool = False
+    recovery: bool = False
+    notify: bool = False
+
+
+@dataclass(frozen=True)
+class ClaimResult:
+    """The immutable execution token returned by a successful claim."""
+
+    claim_epoch: int
+    storage_format: int
+    loop_state: dict[str, Any] | None
+    submission: dict[str, Any] | None
+
 
 PAUSE_REQUEST_META_KEY = "dendrux.pause_request"
 """``agent_runs.meta`` key holding the latest ``request_pause`` reason."""
@@ -140,6 +169,83 @@ def _is_aware_datetime(value: Any) -> bool:
     return isinstance(value, _dt.datetime) and value.tzinfo is not None
 
 
+@dataclass(frozen=True)
+class LoopStatePatch:
+    """Changes applied to the current checkpoint under the run-row lock."""
+
+    remove_pending: tuple[str, ...] = ()
+    set_phase: str | None = None
+    set_fields: Mapping[str, Any] = field(default_factory=dict)
+    set_call_phase: Mapping[str, str] = field(default_factory=dict)
+
+
+def _apply_loop_patch(current: dict[str, Any], patch: LoopStatePatch) -> dict[str, Any]:
+    if "pending" in patch.set_fields:
+        raise ValueError("A patch cannot replace pending; remove calls by identity")
+    changed = {**current, **patch.set_fields}
+    if patch.remove_pending:
+        changed["pending"] = [
+            p for p in current.get("pending", []) if p["call_id"] not in patch.remove_pending
+        ]
+    if patch.set_call_phase:
+        changed["pending"] = [
+            {**p, "phase": patch.set_call_phase[p["call_id"]]}
+            if p["call_id"] in patch.set_call_phase
+            else p
+            for p in changed.get("pending", [])
+        ]
+    if patch.set_phase is not None:
+        changed["phase"] = patch.set_phase
+    return changed
+
+
+@dataclass(frozen=True)
+class TraceWrite:
+    """Caller-owned trace identity for a transactional write."""
+
+    trace_id: str
+    role: str
+    content: str
+    order_index: int
+    trace_kind: str = "turn"
+    meta: dict[str, Any] | None = None
+    blob_refs: Sequence[BlobEdge] | None = None
+    blob_refs_scope: str | None = None
+    content_digest: str | None = None
+
+
+@dataclass(frozen=True)
+class EventWrite:
+    """Caller-owned event identity, independent of its allocated sequence."""
+
+    event_id: str
+    event_type: str
+    iteration_index: int
+    data: dict[str, Any] | None
+    correlation_id: str | None
+    content_digest: str | None
+
+
+@dataclass(frozen=True)
+class ConversationEntry:
+    """One expanded conversation entry, at a monotonic virtual position."""
+
+    position: int
+    role: str
+    content: str
+    meta: dict[str, Any]
+    source: str
+    trace_id: str
+
+
+@dataclass(frozen=True)
+class ConversationPage:
+    """Bounded projection page; next_position is absent only at the end."""
+
+    entries: list[ConversationEntry]
+    next_position: int | None
+
+
 @dataclass
 class RunRecord:
     """Lightweight read model for a persisted run. Used by CLI and queries."""
@@ -171,6 +277,14 @@ class RunRecord:
     updated_at: datetime | None = None
     tenant_id: str | None = None
     pause_requested: bool = False
+    storage_format: int = 1
+    claim_epoch: int = 0
+    status_changed_at: datetime | None = None
+    reclaim_attempts: int = 0
+    reclaim_limit: int | None = None
+    lease_expired_at: datetime | None = None
+    last_reclaimed_at: datetime | None = None
+    trace_link: str | None = None
 
 
 @dataclass(frozen=True)
@@ -314,6 +428,7 @@ class TraceRecord:
     order_index: int
     meta: dict[str, Any] | None = None
     created_at: datetime | None = None
+    trace_kind: str = "turn"
 
 
 @dataclass
@@ -332,6 +447,9 @@ class ToolCallReadRecord:
     iteration_index: int | None
     error_message: str | None
     created_at: datetime | None = None
+    outcome: str = "completed"
+    idempotent: bool = False
+    replayed_at: datetime | None = None
 
 
 @dataclass
@@ -419,11 +537,51 @@ class SweptRun:
 
 
 @dataclass(frozen=True)
+class ReclaimableRun:
+    """A durable lease-expiry mark and the epoch a caller observed."""
+
+    run_id: str
+    tenant_id: str | None
+    agent_name: str
+    last_progress_at: datetime | None
+    lease_expired_at: datetime
+    reclaim_attempts: int
+    reclaim_limit: int
+    claim_epoch: int
+
+
+@dataclass(frozen=True)
+class MarkResult:
+    """A bounded recovery scan, including rows finalised instead of marked."""
+
+    reclaimable: list[ReclaimableRun]
+    finalised: list[SweptRun]
+    legacy: list[SweptRun]
+    inspected: int
+    cursor: str | None
+
+
+def _reclaimable(row: Any) -> ReclaimableRun:
+    return ReclaimableRun(
+        row.id,
+        row.tenant_id,
+        row.agent_name,
+        _to_aware_utc(row.last_progress_at),
+        _to_aware_utc(row.lease_expired_at),
+        row.reclaim_attempts,
+        row.reclaim_limit,
+        row.claim_epoch,
+    )
+
+
+@dataclass(frozen=True)
 class SweepResult:
     """Result of a sweep operation."""
 
     stale_running: list[SweptRun]
     abandoned_waiting: list[SweptRun] = field(default_factory=list)
+    reclaimable: list[ReclaimableRun] = field(default_factory=list)
+    cursor: str | None = None
 
 
 @dataclass
@@ -459,6 +617,8 @@ class StateStore(Protocol):
     Images need the blob catalog, which only the built-in store implements.
     """
 
+    capabilities: ClassVar[StoreCapabilities]
+
     async def create_run(
         self,
         run_id: str,
@@ -474,6 +634,7 @@ class StateStore(Protocol):
         idempotency_key: str | None = None,
         idempotency_fingerprint: str | None = None,
         retry_of_run_id: str | None = None,
+        seed_traces: Sequence[TraceWrite] | None = None,
         blob_refs: Sequence[BlobEdge] | None = None,
         blob_refs_scope: str | None = None,
     ) -> CreateRunResult: ...
@@ -488,7 +649,11 @@ class StateStore(Protocol):
         meta: dict[str, Any] | None = None,
         blob_refs: Sequence[BlobEdge] | None = None,
         blob_refs_scope: str | None = None,
-    ) -> None: ...
+        claim_epoch: int | None = None,
+        trace_id: str | None = None,
+        trace_kind: str = "turn",
+        content_digest: str | None = None,
+    ) -> str: ...
 
     async def save_tool_call(
         self,
@@ -507,7 +672,10 @@ class StateStore(Protocol):
         meta: dict[str, Any] | None = None,
         blob_refs: Sequence[BlobEdge] | None = None,
         blob_refs_scope: str | None = None,
-    ) -> None: ...
+        claim_epoch: int | None = None,
+        row_id: str | None = None,
+        content_digest: str | None = None,
+    ) -> str: ...
 
     async def save_usage(
         self,
@@ -520,6 +688,7 @@ class StateStore(Protocol):
         duration_ms: int | None = None,
         meta: dict[str, Any] | None = None,
         usage_id: str | None = None,
+        claim_epoch: int | None = None,
     ) -> None: ...
 
     async def save_llm_interaction(
@@ -537,6 +706,7 @@ class StateStore(Protocol):
         provider_response: dict[str, Any] | None = None,
         guardrail_findings: dict[str, Any] | None = None,
         interaction_id: str | None = None,
+        claim_epoch: int | None = None,
     ) -> None: ...
 
     async def get_llm_interactions(
@@ -682,6 +852,8 @@ class StateStore(Protocol):
         pii_mapping: dict[str, str] | None = None,
         failure_reason: str | None = None,
         claim_epoch: int | None = None,
+        trace: TraceWrite | None = None,
+        event: EventWrite | None = None,
     ) -> int | None:
         """``finalize_run_if_status_in`` and its event in one transaction.
 
@@ -698,6 +870,7 @@ class StateStore(Protocol):
         metadata: Any = None,
         tenant_id: TenantScope = UNSCOPED,
         max_notes: int | None = None,
+        claim_epoch: int | None = None,
     ) -> bool:
         """Insert an inbox note only if the run exists, is non-terminal and in scope.
 
@@ -728,7 +901,7 @@ class StateStore(Protocol):
         ...
 
     async def mark_notes_delivered(
-        self, run_id: str, note_ids: list[str], *, iteration: int
+        self, run_id: str, note_ids: list[str], *, iteration: int, claim_epoch: int | None = None
     ) -> int:
         """Stamp ``delivered_at`` / ``delivered_iteration`` on undelivered notes."""
         ...
@@ -767,7 +940,7 @@ class StateStore(Protocol):
         expected_status: str,
         expected_pause_id: str | None = None,
         validate: Callable[[dict[str, Any]], None] | None = None,
-    ) -> int: ...
+    ) -> ClaimResult | Literal[False]: ...
 
     async def submit_and_claim(
         self,
@@ -775,10 +948,11 @@ class StateStore(Protocol):
         *,
         expected_status: str,
         submitted_data: dict[str, Any],
+        submission: dict[str, Any] | None = None,
         validate: Callable[[dict[str, Any]], None] | None = None,
         blob_refs: Sequence[BlobEdge] | None = None,
         blob_refs_scope: str | None = None,
-    ) -> int:
+    ) -> ClaimResult | Literal[False]:
         """Atomically save submitted data to pause_data and claim the run.
 
         Merges *submitted_data* into the existing pause_data blob and
@@ -834,6 +1008,9 @@ class StateStore(Protocol):
         iteration_index: int = 0,
         correlation_id: str | None = None,
         data: dict[str, Any] | None = None,
+        claim_epoch: int | None = None,
+        event_id: str | None = None,
+        content_digest: str | None = None,
     ) -> int:
         """Append an event and return the ``sequence_index`` it was given.
 
@@ -884,7 +1061,7 @@ class StateStore(Protocol):
         metadata_filter: dict[str, Any] | None = None,
     ) -> int: ...
 
-    async def touch_progress(self, run_id: str) -> None:
+    async def touch_progress(self, run_id: str, *, claim_epoch: int | None = None) -> bool:
         """Update last_progress_at to now. Called on forward progress."""
         ...
 
@@ -956,6 +1133,133 @@ class StateStore(Protocol):
         """Live usage of one run only (no descendants)."""
         ...
 
+    async def checkpoint_step(
+        self,
+        run_id: str,
+        *,
+        claim_epoch: int,
+        loop_state: dict[str, Any],
+        pii_mapping: dict[str, str] | None,
+        trace: TraceWrite | None,
+    ) -> None: ...
+
+    async def conversation_traces(
+        self,
+        run_id: str,
+        *,
+        after_position: int | None,
+        limit: int = 500,
+        include_superseded: bool = False,
+        tenant_id: TenantScope = UNSCOPED,
+    ) -> ConversationPage: ...
+
+    async def get_traces_after(
+        self,
+        run_id: str,
+        *,
+        after_order_index: int | None,
+        limit: int = 500,
+        kinds: tuple[str, ...] = ("seed", "turn", "rewrite", "state"),
+        tenant_id: TenantScope = UNSCOPED,
+    ) -> list[TraceRecord]: ...
+
+    async def get_trace(
+        self, run_id: str, trace_id: str, *, tenant_id: TenantScope = UNSCOPED
+    ) -> TraceRecord | None: ...
+
+    async def get_loop_state(self, run_id: str) -> dict[str, Any] | None: ...
+
+    async def start_tool_call(
+        self,
+        run_id: str,
+        *,
+        claim_epoch: int,
+        row_id: str,
+        tool_call_id: str,
+        provider_tool_call_id: str | None,
+        tool_name: str,
+        target: str,
+        params: dict[str, Any] | None,
+        iteration_index: int,
+        idempotent: bool,
+        event: EventWrite,
+        meta: dict[str, Any] | None = None,
+        blob_refs: Sequence[BlobEdge] | None = None,
+        blob_refs_scope: str | None = None,
+    ) -> None: ...
+
+    async def complete_tool_call(
+        self,
+        run_id: str,
+        *,
+        claim_epoch: int,
+        tool_call_id: str,
+        outcome: str,
+        result_payload: str,
+        success: bool,
+        duration_ms: int,
+        error_message: str | None,
+        replayed: bool,
+        observation: TraceWrite,
+        event: EventWrite,
+        loop_state_patch: LoopStatePatch,
+        meta: dict[str, Any] | None = None,
+        blob_refs: Sequence[BlobEdge] | None = None,
+        blob_refs_scope: str | None = None,
+    ) -> None: ...
+
+    async def consume_submission(
+        self,
+        run_id: str,
+        *,
+        claim_epoch: int,
+        submission_id: str,
+        traces: Sequence[TraceWrite],
+        patch: LoopStatePatch,
+    ) -> bool: ...
+
+    async def mark_lease_expired(
+        self,
+        *,
+        cutoff: datetime,
+        batch_size: int,
+        max_runs: int,
+        max_returned: int,
+        reclaim_limit: int,
+        cursor: str | None,
+    ) -> MarkResult: ...
+
+    async def get_lease_expired(
+        self, *, limit: int, cursor: str | None
+    ) -> list[ReclaimableRun]: ...
+
+    async def reclaim_run(
+        self,
+        run_id: str,
+        *,
+        tenant_id: TenantScope,
+        agent_name: str,
+        expected_claim_epoch: int | None,
+        governance: dict[str, Any],
+        governance_policy: Literal["warn", "raise"],
+        skill_pins: dict[str, str],
+        loop_type: str,
+    ) -> ClaimResult | Literal[False]: ...
+
+    async def set_trace_link(self, run_id: str, *, claim_epoch: int, trace_link: str) -> None: ...
+
+    async def get_replayed_tool_calls(
+        self, run_id: str, *, limit: int = 100, tenant_id: TenantScope = UNSCOPED
+    ) -> tuple[list[str], bool]: ...
+
+    async def mark_cancel_requested(
+        self, run_ids: Sequence[str], *, tenant_id: TenantScope
+    ) -> int: ...
+
+    async def get_children_page(
+        self, parent_ids: Sequence[str], *, after: str | None, limit: int, tenant_id: TenantScope
+    ) -> list[str]: ...
+
 
 class _SerializedSessionFactory:
     """Session factory that holds the pool's session lock for each session's life.
@@ -1023,6 +1327,7 @@ _PERSISTED_VALUE_FIELDS = frozenset(
         "error_message",
         "meta",
         "patch",
+        "loop_state_patch",
         "pause_data",
         "submitted_data",
         "event_data",
@@ -1044,6 +1349,81 @@ _PERSISTED_VALUE_FIELDS = frozenset(
 )
 
 
+def _checkpoint_error(run_id: str) -> NoReturn:
+    from dendrux.errors import PersistenceError
+
+    logger.warning(
+        "Checkpoint byte bound exceeded", extra={"run_id": run_id, "code": "checkpoint_too_large"}
+    )
+    raise PersistenceError(code="checkpoint_too_large")
+
+
+def _json_bytes(value: Any) -> int:
+    return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+
+def _validate_checkpoint(run_id: str, value: dict[str, Any]) -> None:
+    from dendrux.types import _validate_persistable
+
+    _validate_persistable(value, "loop_state")
+    if _json_bytes(value) > 8192 or _json_bytes(value.get("provider_kwargs", {})) > 2048:
+        _checkpoint_error(run_id)
+
+
+def _validate_trace_write(run_id: str, trace: TraceWrite) -> None:
+    from dendrux.types import _validate_persistable
+
+    _validate_persistable(trace.content, "content")
+    _validate_persistable(trace.meta, "meta")
+    if trace.trace_kind not in ("seed", "turn", "rewrite", "state"):
+        raise ValueError("Unsupported trace kind")
+    if trace.trace_kind in ("rewrite", "state"):
+        if len(trace.content.encode("utf-8")) > 1024 * 1024:
+            _checkpoint_error(run_id)
+        value = json.loads(trace.content)
+        if trace.trace_kind == "rewrite":
+            if not isinstance(value, list) or len(value) > 999:
+                _checkpoint_error(run_id)
+            if any(
+                not isinstance(m, dict)
+                or not isinstance(m.get("role"), str)
+                or not isinstance(m.get("content"), str)
+                for m in value
+            ):
+                raise ValueError("Rewrite entries require role and content")
+        elif not isinstance(value, dict) or value.get("kind") not in (
+            "image_view",
+            "skills_session",
+            "clarification",
+        ):
+            raise ValueError("State traces require a versioned state payload")
+
+
+def _positive_page(limit: int) -> None:
+    if type(limit) is not int or limit < 1:
+        raise ValueError("limit must be a positive integer")
+
+
+def _trace_record(row: Any) -> TraceRecord:
+    return TraceRecord(
+        id=row.id,
+        role=row.role,
+        content=row.content,
+        order_index=row.order_index,
+        meta=row.meta,
+        created_at=_to_aware_utc(row.created_at),
+        trace_kind=row.trace_kind,
+    )
+
+
+def _is_unique_violation(error: BaseException) -> bool:
+    import sqlite3
+
+    return _sqlstate(error) == "23505" or getattr(
+        getattr(error, "orig", error), "sqlite_errorcode", None
+    ) in (sqlite3.SQLITE_CONSTRAINT_UNIQUE, sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY)
+
+
 def _validated_store_write(method: Any) -> Any:
     from functools import wraps
     from inspect import signature
@@ -1056,7 +1436,15 @@ def _validated_store_write(method: Any) -> Any:
 
         values = sig.bind(*args, **kwargs).arguments
         for name in _PERSISTED_VALUE_FIELDS.intersection(values):
-            _validate_persistable(values[name], name)
+            value = values[name]
+            if isinstance(value, LoopStatePatch):
+                value = {
+                    "remove_pending": list(value.remove_pending),
+                    "set_phase": value.set_phase,
+                    "set_fields": dict(value.set_fields),
+                    "set_call_phase": dict(value.set_call_phase),
+                }
+            _validate_persistable(value, name)
         return await method(*args, **kwargs)
 
     return write
@@ -1075,6 +1463,11 @@ def _validated_store_writes(cls: Any) -> Any:
                 "add_note",
                 "update_run_meta",
                 "request_pause",
+                "checkpoint_step",
+                "start_tool_call",
+                "complete_tool_call",
+                "consume_submission",
+                "set_trace_link",
             )
         ):
             setattr(cls, name, _validated_store_write(method))
@@ -1106,7 +1499,19 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
     claiming each blob row (``write_blob_refs``). Passed only when non-empty.
     """
 
-    def __init__(self, engine: AsyncEngine) -> None:
+    capabilities: ClassVar[StoreCapabilities] = StoreCapabilities(
+        fenced_writes=False,
+        retry_ids=False,
+        checkpointing=False,
+        atomic_completion=False,
+        notify=False,
+        recovery=False,
+    )
+
+    def __init__(
+        self, engine: AsyncEngine, *, notify_channel: str | None = "dendrux_events"
+    ) -> None:
+        self.notify_channel = notify_channel
         from sqlalchemy.ext.asyncio import AsyncSession
         from sqlalchemy.orm import sessionmaker
 
@@ -1114,7 +1519,14 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
 
         self._engine = engine
         self._session_factory = sessionmaker(  # type: ignore[call-overload]
-            engine, class_=AsyncSession, expire_on_commit=False
+            engine,
+            class_=AsyncSession,
+            expire_on_commit=False,
+            info={
+                "dendrux.event_hook": lambda session, run_id: self._after_event_insert(
+                    session, run_id
+                )
+            },
         )
         if shares_one_connection(engine):
             # One shared connection = one shared transaction: overlapping sessions
@@ -1148,6 +1560,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         idempotency_key: str | None = None,
         idempotency_fingerprint: str | None = None,
         retry_of_run_id: str | None = None,
+        seed_traces: Sequence[TraceWrite] | None = None,
         blob_refs: Sequence[BlobEdge] | None = None,
         blob_refs_scope: str | None = None,
     ) -> CreateRunResult:
@@ -1158,10 +1571,11 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         _validate_persistable(input_data, "input")
         import datetime as _dt
 
+        from sqlalchemy import select
         from sqlalchemy.exc import IntegrityError
 
         from dendrux.db.enums import AgentRunStatus
-        from dendrux.db.models import AgentRun
+        from dendrux.db.models import AgentRun, DendruxSetting
 
         if tenant_id == "":
             raise ValueError("tenant_id must be a non-empty string or None, not ''.")
@@ -1176,7 +1590,23 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
 
         async def _attempt() -> CreateRunResult:
             async with self._session_factory() as session:
+                storage_format = int(
+                    await session.scalar(
+                        select(DendruxSetting.value).where(DendruxSetting.key == "storage_format")
+                    )
+                    or "1"
+                )
+                if not all(
+                    (
+                        self.capabilities.fenced_writes,
+                        self.capabilities.retry_ids,
+                        self.capabilities.checkpointing,
+                        self.capabilities.atomic_completion,
+                    )
+                ):
+                    storage_format = 1
                 run = AgentRun(
+                    storage_format=storage_format,
                     id=run_id,
                     agent_name=agent_name,
                     **_status_values(AgentRunStatus.RUNNING, initial=True),
@@ -1194,6 +1624,10 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                 )
                 session.add(run)
                 try:
+                    if seed_traces and storage_format == 2:
+                        await session.flush()
+                        for trace in seed_traces:
+                            await self._insert_trace(session, run_id, trace)
                     if blob_refs:
                         await session.flush()
                         await write_blob_refs(
@@ -1234,6 +1668,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                 run_id=run_id,
                 outcome="created",
                 status=RunStatus.RUNNING,
+                storage_format=storage_format,
             )
 
         return await retry_transient_db(_attempt, label="create_run", run_id=run_id)
@@ -1293,12 +1728,92 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                     run_id=row.id,
                     outcome="existing_terminal",
                     status=status,
+                    storage_format=row.storage_format,
                 )
             return CreateRunResult(
                 run_id=row.id,
                 outcome="existing_active",
                 status=status,
+                storage_format=row.storage_format,
             )
+
+    async def _fence(
+        self, session: AsyncSession, run_id: str, claim_epoch: int | None, **values: Any
+    ) -> None:
+        from sqlalchemy import update
+
+        from dendrux.db.models import AgentRun
+        from dendrux.errors import RunFencedError
+
+        stmt = update(AgentRun).where(AgentRun.id == run_id)
+        if claim_epoch is not None:
+            stmt = stmt.where(AgentRun.claim_epoch == claim_epoch)
+        result = await session.execute(stmt.values(updated_at=_dt.datetime.now(_dt.UTC), **values))
+        if claim_epoch is not None and not getattr(result, "rowcount", 0):
+            logger.warning("Run fenced", extra={"run_id": run_id, "code": "run_fenced"})
+            raise RunFencedError(run_id, claim_epoch=claim_epoch)
+
+    async def _insert_retry(
+        self,
+        session: AsyncSession,
+        model: Any,
+        values: dict[str, Any],
+        *,
+        digest: str | None = None,
+        equality: tuple[str, ...] = (),
+    ) -> str:
+        from sqlalchemy import select
+        from sqlalchemy.exc import IntegrityError
+
+        from dendrux.runtime._digest import content_digest
+
+        if self._engine.dialect.name == "postgresql":
+            from sqlalchemy.dialects.postgresql import insert as dialect_insert
+        else:
+            from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+            dialect_insert = sqlite_insert  # type: ignore[assignment]
+        stmt = dialect_insert(model).values(**values).on_conflict_do_nothing(index_elements=["id"])
+        try:
+            inserted = (await session.execute(stmt.returning(model.id))).scalar_one_or_none()
+        except IntegrityError as error:
+            if _is_unique_violation(error):
+                self._write_conflict(values["agent_run_id"])
+            raise
+        if inserted is not None:
+            return str(inserted)
+        row = (await session.execute(select(model).where(model.id == values["id"]))).scalar_one()
+        equal = row.agent_run_id == values["agent_run_id"]
+        if digest is not None:
+            equal = equal and row.content_digest == digest
+        else:
+
+            def normalize(value: Any) -> Any:
+                from decimal import Decimal
+
+                return float(value) if isinstance(value, Decimal) else value
+
+            def field_value(key: str, value: Any) -> Any:
+                if key == "cost_usd" and value is not None:
+                    from decimal import ROUND_HALF_UP, Decimal
+
+                    return str(
+                        Decimal(str(value)).quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
+                    )
+                return normalize(value)
+
+            equal = equal and content_digest(
+                {k: field_value(k, getattr(row, k)) for k in equality}
+            ) == content_digest({k: field_value(k, values[k]) for k in equality})
+        if not equal:
+            self._write_conflict(values["agent_run_id"])
+        return str(row.id)
+
+    def _write_conflict(self, run_id: str) -> NoReturn:
+        from dendrux.errors import PersistenceError
+
+        logger.warning("Retry content conflict", extra={"run_id": run_id, "code": "write_conflict"})
+        raise PersistenceError(code="write_conflict")
 
     async def save_trace(
         self,
@@ -1310,25 +1825,28 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         meta: dict[str, Any] | None = None,
         blob_refs: Sequence[BlobEdge] | None = None,
         blob_refs_scope: str | None = None,
-    ) -> None:
-        from dendrux.db.models import ReactTrace
-
+        claim_epoch: int | None = None,
+        trace_id: str | None = None,
+        trace_kind: str = "turn",
+        content_digest: str | None = None,
+    ) -> str:
+        trace = TraceWrite(
+            trace_id or generate_ulid(),
+            role,
+            content,
+            order_index,
+            trace_kind,
+            meta,
+            blob_refs,
+            blob_refs_scope,
+            content_digest,
+        )
         async with self._session_factory() as session:
-            trace = ReactTrace(
-                id=generate_ulid(),
-                agent_run_id=run_id,
-                role=role,
-                content=content,
-                order_index=order_index,
-                meta=meta,
-            )
-            session.add(trace)
-            if blob_refs:
-                await session.flush()
-                await write_blob_refs(
-                    session, run_id=run_id, blob_refs=blob_refs, blob_refs_scope=blob_refs_scope
-                )
+            if claim_epoch is not None:
+                await self._fence(session, run_id, claim_epoch)
+            row_id = await self._insert_trace(session, run_id, trace)
             await session.commit()
+            return row_id
 
     async def save_tool_call(
         self,
@@ -1347,48 +1865,63 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         meta: dict[str, Any] | None = None,
         blob_refs: Sequence[BlobEdge] | None = None,
         blob_refs_scope: str | None = None,
-    ) -> None:
+        claim_epoch: int | None = None,
+        row_id: str | None = None,
+        content_digest: str | None = None,
+    ) -> str:
         from dendrux.db.models import ToolCallRecord
+        from dendrux.runtime._digest import content_digest as digest_of
 
-        # Non-JSON text is stored as {"raw": original_payload}, as in 0.4.1.
-        # Any NaN/Infinity or overflowing float anywhere in a result takes
-        # that fallback for the entire payload; quoted strings remain JSON.
+        digest = digest_of(
+            dict(
+                tool_call_id=tool_call_id,
+                tool_name=tool_name,
+                target=target,
+                params=params,
+                result_payload=result_payload,
+                success=success,
+                outcome="completed",
+            )
+        )
+        if content_digest is not None and content_digest != digest:
+            self._write_conflict(run_id)
         try:
             result_dict = json.loads(
                 result_payload, parse_constant=_finite_json_float, parse_float=_finite_json_float
             )
         except (ValueError, TypeError):
-            logger.warning(
-                "Tool call result JSON decode failed — run=%s tool=%s payload_len=%d",
-                run_id,
-                tool_name,
-                len(result_payload) if result_payload else 0,
-            )
+            logger.warning("Tool call result JSON decode failed", extra={"run_id": run_id})
             result_dict = {"raw": result_payload}
-
         async with self._session_factory() as session:
-            record = ToolCallRecord(
-                id=generate_ulid(),
-                agent_run_id=run_id,
-                tool_call_id=tool_call_id,
-                provider_tool_call_id=provider_tool_call_id,
-                tool_name=tool_name,
-                target=target,
-                params=params,
-                result=result_dict,
-                success=success,
-                duration_ms=duration_ms,
-                iteration_index=iteration_index,
-                error_message=error_message,
-                meta=meta,
+            if claim_epoch is not None:
+                await self._fence(session, run_id, claim_epoch)
+            saved = await self._insert_retry(
+                session,
+                ToolCallRecord,
+                dict(
+                    id=row_id or generate_ulid(),
+                    agent_run_id=run_id,
+                    tool_call_id=tool_call_id,
+                    provider_tool_call_id=provider_tool_call_id,
+                    tool_name=tool_name,
+                    target=target,
+                    params=params,
+                    result=result_dict,
+                    success=success,
+                    duration_ms=duration_ms,
+                    iteration_index=iteration_index,
+                    error_message=error_message,
+                    meta=meta,
+                    content_digest=digest,
+                ),
+                digest=digest,
             )
-            session.add(record)
             if blob_refs:
-                await session.flush()
                 await write_blob_refs(
                     session, run_id=run_id, blob_refs=blob_refs, blob_refs_scope=blob_refs_scope
                 )
             await session.commit()
+            return saved
 
     async def save_usage(
         self,
@@ -1401,46 +1934,52 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         duration_ms: int | None = None,
         meta: dict[str, Any] | None = None,
         usage_id: str | None = None,
+        claim_epoch: int | None = None,
     ) -> None:
+        from decimal import ROUND_HALF_UP, Decimal
+
         from dendrux.db.models import TokenUsage
 
+        values = dict(
+            id=usage_id or generate_ulid(),
+            agent_run_id=run_id,
+            iteration_index=iteration_index,
+            model=model,
+            provider=provider,
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+            cost_usd=(
+                Decimal(str(usage.cost_usd)).quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
+                if usage.cost_usd is not None
+                else None
+            ),
+            duration_ms=duration_ms,
+            cache_read_input_tokens=usage.cache_read_input_tokens,
+            cache_creation_input_tokens=usage.cache_creation_input_tokens,
+            reasoning_tokens=usage.reasoning_tokens,
+            meta=meta,
+        )
         async with self._session_factory() as session:
-            values = dict(
-                id=usage_id or generate_ulid(),
-                agent_run_id=run_id,
-                iteration_index=iteration_index,
-                model=model,
-                provider=provider,
-                input_tokens=usage.input_tokens,
-                output_tokens=usage.output_tokens,
-                cost_usd=usage.cost_usd,
-                duration_ms=duration_ms,
-                cache_read_input_tokens=usage.cache_read_input_tokens,
-                cache_creation_input_tokens=usage.cache_creation_input_tokens,
-                reasoning_tokens=usage.reasoning_tokens,
-                meta=meta,
+            if claim_epoch is not None:
+                await self._fence(session, run_id, claim_epoch)
+            # §12.18: equality covers persisted columns, excluding non-persisted UsageStats fields.
+            await self._insert_retry(
+                session,
+                TokenUsage,
+                values,
+                equality=(
+                    "iteration_index",
+                    "model",
+                    "provider",
+                    "duration_ms",
+                    "input_tokens",
+                    "output_tokens",
+                    "cost_usd",
+                    "cache_read_input_tokens",
+                    "cache_creation_input_tokens",
+                    "reasoning_tokens",
+                ),
             )
-            if usage_id is not None and self._engine.dialect.name in {"sqlite", "postgresql"}:
-                stmt: Any
-                if self._engine.dialect.name == "postgresql":
-                    from sqlalchemy.dialects.postgresql import insert as pg_insert
-
-                    stmt = (
-                        pg_insert(TokenUsage)
-                        .values(**values)
-                        .on_conflict_do_nothing(index_elements=["id"])
-                    )
-                else:
-                    from sqlalchemy.dialects.sqlite import insert as sqlite_insert
-
-                    stmt = (
-                        sqlite_insert(TokenUsage)
-                        .values(**values)
-                        .on_conflict_do_nothing(index_elements=["id"])
-                    )
-                await session.execute(stmt)
-            else:
-                session.add(TokenUsage(**values))
             await session.commit()
 
     async def save_llm_interaction(
@@ -1458,31 +1997,201 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         provider_response: dict[str, Any] | None = None,
         guardrail_findings: dict[str, Any] | None = None,
         interaction_id: str | None = None,
+        claim_epoch: int | None = None,
     ) -> None:
         from dendrux.db.models import LLMInteraction
 
+        values = dict(
+            id=interaction_id or generate_ulid(),
+            agent_run_id=run_id,
+            iteration_index=iteration_index,
+            model=model,
+            provider=provider,
+            semantic_request=semantic_request,
+            semantic_response=semantic_response,
+            provider_request=provider_request,
+            provider_response=provider_response,
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+            cost_usd=usage.cost_usd,
+            duration_ms=duration_ms,
+            cache_read_input_tokens=usage.cache_read_input_tokens,
+            cache_creation_input_tokens=usage.cache_creation_input_tokens,
+            reasoning_tokens=usage.reasoning_tokens,
+            guardrail_findings=guardrail_findings,
+        )
         async with self._session_factory() as session:
-            record = LLMInteraction(
-                id=interaction_id or generate_ulid(),
-                agent_run_id=run_id,
-                iteration_index=iteration_index,
-                model=model,
-                provider=provider,
-                semantic_request=semantic_request,
-                semantic_response=semantic_response,
-                provider_request=provider_request,
-                provider_response=provider_response,
-                input_tokens=usage.input_tokens,
-                output_tokens=usage.output_tokens,
-                cost_usd=usage.cost_usd,
-                duration_ms=duration_ms,
-                cache_read_input_tokens=usage.cache_read_input_tokens,
-                cache_creation_input_tokens=usage.cache_creation_input_tokens,
-                reasoning_tokens=usage.reasoning_tokens,
-                guardrail_findings=guardrail_findings,
+            if claim_epoch is not None:
+                await self._fence(session, run_id, claim_epoch)
+            await self._insert_retry(
+                session,
+                LLMInteraction,
+                values,
+                equality=(
+                    "iteration_index",
+                    "model",
+                    "provider",
+                    "semantic_request",
+                    "semantic_response",
+                    "provider_request",
+                    "provider_response",
+                ),
             )
-            session.add(record)
             await session.commit()
+
+    async def _insert_trace(self, session: AsyncSession, run_id: str, trace: TraceWrite) -> str:
+        from dendrux.db.models import ReactTrace
+        from dendrux.runtime._digest import trace_digest
+
+        _validate_trace_write(run_id, trace)
+        digest = trace_digest(
+            trace.role, trace.content, trace.order_index, trace.trace_kind, trace.meta
+        )
+        if trace.content_digest is not None and trace.content_digest != digest:
+            self._write_conflict(run_id)
+        row_id = await self._insert_retry(
+            session,
+            ReactTrace,
+            dict(
+                id=trace.trace_id,
+                agent_run_id=run_id,
+                role=trace.role,
+                content=trace.content,
+                order_index=trace.order_index,
+                trace_kind=trace.trace_kind,
+                meta=trace.meta,
+                content_digest=digest,
+            ),
+            digest=digest,
+        )
+        if trace.blob_refs:
+            await write_blob_refs(
+                session,
+                run_id=run_id,
+                blob_refs=trace.blob_refs,
+                blob_refs_scope=trace.blob_refs_scope,
+            )
+        return row_id
+
+    async def checkpoint_step(
+        self,
+        run_id: str,
+        *,
+        claim_epoch: int,
+        loop_state: dict[str, Any],
+        pii_mapping: dict[str, str] | None,
+        trace: TraceWrite | None,
+    ) -> None:
+        """Commit a bounded execution projection and optional trace under one fence."""
+        raise NotImplementedError("Store capability is not enabled yet")
+
+    async def _patch_fence(
+        self, session: AsyncSession, run_id: str, claim_epoch: int, patch: LoopStatePatch
+    ) -> None:
+        raise NotImplementedError("Store capability is not enabled yet")
+
+    async def start_tool_call(
+        self,
+        run_id: str,
+        *,
+        claim_epoch: int,
+        row_id: str,
+        tool_call_id: str,
+        provider_tool_call_id: str | None,
+        tool_name: str,
+        target: str,
+        params: dict[str, Any] | None,
+        iteration_index: int,
+        idempotent: bool,
+        event: EventWrite,
+        meta: dict[str, Any] | None = None,
+        blob_refs: Sequence[BlobEdge] | None = None,
+        blob_refs_scope: str | None = None,
+    ) -> None:
+        """Commit server-side intent and its event before invoking a tool."""
+        raise NotImplementedError("Store capability is not enabled yet")
+
+    async def complete_tool_call(
+        self,
+        run_id: str,
+        *,
+        claim_epoch: int,
+        tool_call_id: str,
+        outcome: str,
+        result_payload: str,
+        success: bool,
+        duration_ms: int,
+        error_message: str | None,
+        replayed: bool,
+        observation: TraceWrite,
+        event: EventWrite,
+        loop_state_patch: LoopStatePatch,
+        meta: dict[str, Any] | None = None,
+        blob_refs: Sequence[BlobEdge] | None = None,
+        blob_refs_scope: str | None = None,
+    ) -> None:
+        """Atomically resolve one intent, its reserved observation and pending entry."""
+        raise NotImplementedError("Store capability is not enabled yet")
+
+    async def consume_submission(
+        self,
+        run_id: str,
+        *,
+        claim_epoch: int,
+        submission_id: str,
+        traces: Sequence[TraceWrite],
+        patch: LoopStatePatch,
+    ) -> bool:
+        """Consume a durable submission once, even after an acknowledgement is lost."""
+        raise NotImplementedError("Store capability is not enabled yet")
+
+    async def set_trace_link(self, run_id: str, *, claim_epoch: int, trace_link: str) -> None:
+        """Persist a validated traceparent under the execution fence."""
+        raise NotImplementedError("Store capability is not enabled yet")
+
+    async def mark_cancel_requested(self, run_ids: Sequence[str], *, tenant_id: TenantScope) -> int:
+        """Mark a bounded frontier before a cancellation caller scans its children."""
+        raise NotImplementedError("Store capability is not enabled yet")
+
+    async def get_children_page(
+        self, parent_ids: Sequence[str], *, after: str | None, limit: int, tenant_id: TenantScope
+    ) -> list[str]:
+        """List the tenant-scoped children of a frontier by immutable run id."""
+        raise NotImplementedError("Store capability is not enabled yet")
+
+    async def get_loop_state(self, run_id: str) -> dict[str, Any] | None:
+        """Read the authoritative execution projection."""
+        raise NotImplementedError("Store capability is not enabled yet")
+
+    async def get_trace(
+        self, run_id: str, trace_id: str, *, tenant_id: TenantScope = UNSCOPED
+    ) -> TraceRecord | None:
+        """Read a referenced state trace by id, including superseded prefixes."""
+        raise NotImplementedError("Store capability is not enabled yet")
+
+    async def get_traces_after(
+        self,
+        run_id: str,
+        *,
+        after_order_index: int | None,
+        limit: int = 500,
+        kinds: tuple[str, ...] = ("seed", "turn", "rewrite", "state"),
+        tenant_id: TenantScope = UNSCOPED,
+    ) -> list[TraceRecord]:
+        """Read a bounded keyset page of physical trace rows."""
+        raise NotImplementedError("Store capability is not enabled yet")
+
+    async def conversation_traces(
+        self,
+        run_id: str,
+        *,
+        after_position: int | None,
+        limit: int = 500,
+        include_superseded: bool = False,
+        tenant_id: TenantScope = UNSCOPED,
+    ) -> ConversationPage:
+        """Project the latest replacement prefix followed by its conversation suffix."""
+        raise NotImplementedError("Store capability is not enabled yet")
 
     async def get_llm_interactions(
         self,
@@ -1685,6 +2394,8 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         pii_mapping: dict[str, str] | None = None,
         failure_reason: str | None = None,
         claim_epoch: int | None = None,
+        trace: TraceWrite | None = None,
+        event: EventWrite | None = None,
     ) -> int | None:
         """:meth:`finalize_run_if_status_in` plus its lifecycle event, in one transaction.
 
@@ -1712,7 +2423,13 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                 if not won:
                     await session.rollback()
                     return None
-                seq = await _insert_event_locked(session, run_id, event_type, event_data)
+                if trace is not None:
+                    await self._insert_trace(session, run_id, trace)
+                seq = (
+                    await _write_event(session, run_id, event)
+                    if event is not None
+                    else await _insert_event_locked(session, run_id, event_type, event_data)
+                )
                 await session.commit()
                 return seq
 
@@ -1794,7 +2511,9 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
 
         return await retry_transient_db(_attempt, label="request_cancel", run_id=run_id)
 
-    async def update_run_meta(self, run_id: str, patch: dict[str, Any]) -> None:
+    async def update_run_meta(
+        self, run_id: str, patch: dict[str, Any], *, claim_epoch: int | None = None
+    ) -> None:
         """Shallow-merge ``patch`` into ``agent_runs.meta`` for ``run_id``.
 
         Read-modify-write in one transaction; only Dendrux-owned keys
@@ -1806,6 +2525,8 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
 
         async def _attempt() -> None:
             async with self._session_factory() as session:
+                if claim_epoch is not None:
+                    await self._fence(session, run_id, claim_epoch)
                 row = (
                     await session.execute(
                         select(AgentRun).where(AgentRun.id == run_id).with_for_update()
@@ -2013,6 +2734,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         metadata: Any = None,
         tenant_id: TenantScope = UNSCOPED,
         max_notes: int | None = None,
+        claim_epoch: int | None = None,
     ) -> bool:
         """Conditional ``INSERT ... SELECT`` guarded by status and tenant, row share-locked.
 
@@ -2048,6 +2770,8 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
 
         async def _attempt() -> bool:
             async with self._session_factory() as session:
+                if claim_epoch is not None:
+                    await self._fence(session, run_id, claim_epoch)
                 if max_notes is not None and self._engine.dialect.name == "postgresql":
                     await session.execute(
                         select(
@@ -2146,7 +2870,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
             ]
 
     async def mark_notes_delivered(
-        self, run_id: str, note_ids: list[str], *, iteration: int
+        self, run_id: str, note_ids: list[str], *, iteration: int, claim_epoch: int | None = None
     ) -> int:
         import datetime as _dt
 
@@ -2154,11 +2878,10 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
 
         from dendrux.db.models import RunInbox
 
-        if not note_ids:
-            return 0
-
         async def _attempt() -> int:
             async with self._session_factory() as session:
+                if claim_epoch is not None:
+                    await self._fence(session, run_id, claim_epoch)
                 result = await session.execute(
                     update(RunInbox)
                     .where(
@@ -2443,7 +3166,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         expected_status: str,
         expected_pause_id: str | None = None,
         validate: Callable[[dict[str, Any]], None] | None = None,
-    ) -> int:
+    ) -> ClaimResult | Literal[False]:
         """Atomically transition a paused run to RUNNING.
 
         Returns the new claim epoch if the claim succeeded.
@@ -2456,7 +3179,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
 
         from dendrux.db.models import AgentRun
 
-        async def _attempt() -> int:
+        async def _attempt() -> ClaimResult | Literal[False]:
             async with self._session_factory() as session:
                 # updated_at is filled by the model's onupdate hook (Python aware-UTC).
                 stmt = (
@@ -2471,11 +3194,19 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                 )
                 result = await session.execute(stmt)
                 if result.rowcount:
-                    epoch = (
+                    row = (
                         await session.execute(
-                            select(AgentRun.claim_epoch).where(AgentRun.id == run_id)
+                            select(
+                                AgentRun.claim_epoch, AgentRun.storage_format, AgentRun.loop_state
+                            ).where(AgentRun.id == run_id)
                         )
-                    ).scalar_one()
+                    ).one()
+                    token = ClaimResult(
+                        row.claim_epoch,
+                        row.storage_format,
+                        row.loop_state,
+                        (row.loop_state or {}).get("submission"),
+                    )
                 if result.rowcount and (validate is not None or expected_pause_id is not None):
                     pause = (
                         await session.execute(
@@ -2507,7 +3238,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                         await session.rollback()
                         raise
                 await session.commit()
-                return epoch if result.rowcount else False
+                return token if result.rowcount else False
 
         return await retry_transient_db(_attempt, label="claim_paused_run", run_id=run_id)
 
@@ -2517,10 +3248,11 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         *,
         expected_status: str,
         submitted_data: dict[str, Any],
+        submission: dict[str, Any] | None = None,
         validate: Callable[[dict[str, Any]], None] | None = None,
         blob_refs: Sequence[BlobEdge] | None = None,
         blob_refs_scope: str | None = None,
-    ) -> int:
+    ) -> ClaimResult | Literal[False]:
         """Atomically save submitted data and claim the run.
 
         Implementation (one transaction):
@@ -2539,7 +3271,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
 
         from dendrux.db.models import AgentRun
 
-        async def _attempt() -> int:
+        async def _attempt() -> ClaimResult | Literal[False]:
             async with self._session_factory() as session:
                 # 1. Claim first — the CAS on status is the concurrency
                 # boundary. updated_at is filled by the model's onupdate hook.
@@ -2573,9 +3305,30 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
 
                 # 3. Merge submitted_data into pause_data.
                 merged = dict(current_pause_data)
-                merged.update(submitted_data)
+                run = (
+                    await session.execute(
+                        select(AgentRun.storage_format, AgentRun.loop_state).where(
+                            AgentRun.id == run_id
+                        )
+                    )
+                ).one()
+                values: dict[str, Any] = {}
+                if run.storage_format == 2 and submission is not None:
+                    merged["submission"] = {
+                        k: v for k, v in submission.items() if k != "reserved_order_index"
+                    }
+                    loop_state = dict(run.loop_state or {})
+                    loop_state["submission"] = {
+                        k: v for k, v in submission.items() if k != "payload"
+                    }
+                    _validate_checkpoint(run_id, loop_state)
+                    values["loop_state"] = loop_state
+                else:
+                    merged.update(submitted_data)
                 await session.execute(
-                    update(AgentRun).where(AgentRun.id == run_id).values(pause_data=merged)
+                    update(AgentRun)
+                    .where(AgentRun.id == run_id)
+                    .values(pause_data=merged, **values)
                 )
                 if blob_refs:
                     await write_blob_refs(
@@ -2584,11 +3337,21 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                         blob_refs=blob_refs,
                         blob_refs_scope=blob_refs_scope,
                     )
-                epoch = (
-                    await session.execute(select(AgentRun.claim_epoch).where(AgentRun.id == run_id))
-                ).scalar_one()
+                row = (
+                    await session.execute(
+                        select(
+                            AgentRun.claim_epoch, AgentRun.storage_format, AgentRun.loop_state
+                        ).where(AgentRun.id == run_id)
+                    )
+                ).one()
+                token = ClaimResult(
+                    row.claim_epoch,
+                    row.storage_format,
+                    row.loop_state,
+                    (row.loop_state or {}).get("submission"),
+                )
                 await session.commit()
-                return int(epoch)
+                return token
 
         return await retry_transient_db(_attempt, label="submit_and_claim", run_id=run_id)
 
@@ -2628,6 +3391,15 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         stop_key = "dendrux.stop_reason"
 
         fields = (
+            AgentRun.strategy,
+            AgentRun.storage_format,
+            AgentRun.claim_epoch,
+            AgentRun.status_changed_at,
+            AgentRun.reclaim_attempts,
+            AgentRun.reclaim_limit,
+            AgentRun.lease_expired_at,
+            AgentRun.last_reclaimed_at,
+            AgentRun.trace_link,
             AgentRun.id,
             AgentRun.agent_name,
             AgentRun.status,
@@ -2651,6 +3423,8 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         if row is None:
             return None
         values = dict(row)
+        for name in ("status_changed_at", "lease_expired_at", "last_reclaimed_at"):
+            values[name] = _to_aware_utc(values[name])
         info, stop_reason = values.pop("error_info"), values.pop("stop_reason")
         values["total_cost_usd"] = (
             float(values["total_cost_usd"]) if values["total_cost_usd"] is not None else None
@@ -2721,6 +3495,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
             return [
                 TraceRecord(
                     id=r.id,
+                    trace_kind=r.trace_kind,
                     role=r.role,
                     content=r.content,
                     order_index=r.order_index,
@@ -2766,6 +3541,9 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
             return [
                 ToolCallReadRecord(
                     id=r.id,
+                    outcome=r.outcome,
+                    idempotent=r.idempotent,
+                    replayed_at=_to_aware_utc(r.replayed_at),
                     tool_call_id=r.tool_call_id,
                     provider_tool_call_id=r.provider_tool_call_id,
                     tool_name=r.tool_name,
@@ -2781,6 +3559,9 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                 for r in rows
             ]
 
+    async def _after_event_insert(self, session: AsyncSession, run_id: str) -> None:
+        """Transactional notifier seam; the notifier track supplies its implementation."""
+
     async def save_run_event(
         self,
         run_id: str,
@@ -2789,28 +3570,13 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         iteration_index: int = 0,
         correlation_id: str | None = None,
         data: dict[str, Any] | None = None,
+        claim_epoch: int | None = None,
+        event_id: str | None = None,
+        content_digest: str | None = None,
     ) -> int:
-        """Append an event with the next sequence index of its run; return the index.
-
-        One ``INSERT ... SELECT COALESCE(MAX(sequence_index), -1) + 1``. On
-        Postgres the run row is first locked ``FOR NO KEY UPDATE`` in the same
-        transaction, so concurrent writers of one run (and the CAS paths in
-        :func:`_insert_event_locked`, which hold the same row lock) allocate
-        one at a time, in commit order; the next writer's statement sees the
-        previous commit. SQLite serializes writers already. Cost: one indexed
-        ``MAX`` lookup on ``(agent_run_id, sequence_index)``. There is no way to
-        pass an index (0.4.1 callers that do get a ``TypeError``, not a silently
-        wrong order).
-        """
-        from sqlalchemy import select
-
-        from dendrux.db.models import AgentRun
-
+        """Append under the leading run-row fence; retries reuse the event identity."""
         async with self._session_factory() as session:
-            if self._engine.dialect.name == "postgresql":
-                await session.execute(
-                    select(AgentRun.id).where(AgentRun.id == run_id).with_for_update(key_share=True)
-                )
+            await self._fence(session, run_id, claim_epoch)
             seq = await _insert_event(
                 session,
                 run_id,
@@ -2818,6 +3584,8 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                 data,
                 iteration_index=iteration_index,
                 correlation_id=correlation_id,
+                event_id=event_id,
+                content_digest=content_digest,
             )
             await session.commit()
             return seq
@@ -2884,22 +3652,57 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
     # Progress tracking & stale-run sweep
     # ------------------------------------------------------------------
 
-    async def touch_progress(self, run_id: str) -> None:
-        """Update progress only while running; paused/terminal rows are untouched."""
-        import datetime as _dt
-
+    async def touch_progress(self, run_id: str, *, claim_epoch: int | None = None) -> bool:
+        """Renew only a running run with the supplied epoch, in one statement."""
         from sqlalchemy import update
 
         from dendrux.db.models import AgentRun
 
         async with self._session_factory() as session:
-            stmt = (
-                update(AgentRun)
-                .where(AgentRun.id == run_id, AgentRun.status == "running")
-                .values(last_progress_at=_dt.datetime.now(_dt.UTC))
-            )
-            await session.execute(stmt)
+            stmt = update(AgentRun).where(AgentRun.id == run_id, AgentRun.status == "running")
+            if claim_epoch is not None:
+                stmt = stmt.where(AgentRun.claim_epoch == claim_epoch)
+            result = await session.execute(stmt.values(last_progress_at=_dt.datetime.now(_dt.UTC)))
             await session.commit()
+            return bool(result.rowcount)
+
+    async def mark_lease_expired(
+        self,
+        *,
+        cutoff: datetime,
+        batch_size: int,
+        max_runs: int,
+        max_returned: int,
+        reclaim_limit: int,
+        cursor: str | None,
+    ) -> MarkResult:
+        """Scan running rows once by id, atomically fencing each expired lease."""
+        raise NotImplementedError("Store capability is not enabled yet")
+
+    async def get_lease_expired(self, *, limit: int, cursor: str | None) -> list[ReclaimableRun]:
+        """Rediscover marks without changing epochs or emitting duplicate events."""
+        raise NotImplementedError("Store capability is not enabled yet")
+
+    async def reclaim_run(
+        self,
+        run_id: str,
+        *,
+        tenant_id: TenantScope,
+        agent_name: str,
+        expected_claim_epoch: int | None,
+        governance: dict[str, Any],
+        governance_policy: Literal["warn", "raise"],
+        skill_pins: dict[str, str],
+        loop_type: str,
+    ) -> ClaimResult | Literal[False]:
+        """Validate a marked run under its row lock, then atomically claim and audit it."""
+        raise NotImplementedError("Store capability is not enabled yet")
+
+    async def get_replayed_tool_calls(
+        self, run_id: str, *, limit: int = 100, tenant_id: TenantScope = UNSCOPED
+    ) -> tuple[list[str], bool]:
+        """Read replayed call ids with one bounded lookahead for truncation."""
+        raise NotImplementedError("Store capability is not enabled yet")
 
     async def sweep_stale_runs(
         self,
@@ -3759,6 +4562,22 @@ def require_store_method(store: Any, name: str) -> Any:
     return method
 
 
+async def _write_event(session: AsyncSession, run_id: str, event: EventWrite) -> int:
+    from dendrux.types import _validate_persistable
+
+    _validate_persistable(event.data, "data")
+    return await _insert_event(
+        session,
+        run_id,
+        event.event_type,
+        event.data,
+        iteration_index=event.iteration_index,
+        correlation_id=event.correlation_id,
+        event_id=event.event_id,
+        content_digest=event.content_digest,
+    )
+
+
 async def _insert_event_locked(
     session: AsyncSession,
     run_id: str,
@@ -3785,25 +4604,39 @@ async def _insert_event(
     *,
     iteration_index: int = 0,
     correlation_id: str | None = None,
+    event_id: str | None = None,
+    content_digest: str | None = None,
 ) -> int:
-    """``INSERT ... SELECT COALESCE(MAX(sequence_index), -1) + 1`` for one run; the index.
-
-    The caller provides the serialization (the run row lock on Postgres).
-    The ``MAX`` reads ``ix_run_events_agent_run_id_seq`` backwards.
-    """
-    import datetime as _dt
-
-    from sqlalchemy import JSON, DateTime, Integer, String, func, insert, literal, select
+    """Allocate sequence inside the insert; only a lost acknowledgement reads back."""
+    from sqlalchemy import JSON, DateTime, Integer, String, func, literal, select
+    from sqlalchemy.exc import IntegrityError
 
     from dendrux.db.models import RunEvent
+    from dendrux.errors import PersistenceError
+    from dendrux.runtime._digest import event_digest
 
+    digest = event_digest(event_type, iteration_index, correlation_id, data)
+
+    def conflict() -> NoReturn:
+        logger.warning("Retry content conflict", extra={"run_id": run_id, "code": "write_conflict"})
+        raise PersistenceError(code="write_conflict")
+
+    if content_digest is not None and content_digest != digest:
+        conflict()
+    if session.bind is not None and session.bind.dialect.name == "postgresql":
+        from sqlalchemy.dialects.postgresql import insert as dialect_insert
+    else:
+        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+        dialect_insert = sqlite_insert  # type: ignore[assignment]
+    row_id = event_id or generate_ulid()
     next_index = (
         select(func.coalesce(func.max(RunEvent.sequence_index), -1) + 1)
         .where(RunEvent.agent_run_id == run_id)
         .scalar_subquery()
     )
     source = select(
-        literal(generate_ulid(), String(26)),
+        literal(row_id, String(26)),
         literal(run_id, String(26)),
         literal(event_type, String(50)),
         next_index,
@@ -3811,9 +4644,10 @@ async def _insert_event(
         literal(correlation_id, String(26)),
         literal(data, JSON()),
         literal(_dt.datetime.now(_dt.UTC), DateTime(timezone=True)),
+        literal(digest, String(64)),
     )
     stmt = (
-        insert(RunEvent)
+        dialect_insert(RunEvent)
         .from_select(
             [
                 RunEvent.id,
@@ -3824,12 +4658,27 @@ async def _insert_event(
                 RunEvent.correlation_id,
                 RunEvent.data,
                 RunEvent.created_at,
+                RunEvent.content_digest,
             ],
             source,
         )
-        .returning(RunEvent.sequence_index)
+        .on_conflict_do_nothing(index_elements=["id"])
     )
-    return int((await session.execute(stmt)).scalar_one())
+    try:
+        seq = (await session.execute(stmt.returning(RunEvent.sequence_index))).scalar_one_or_none()
+    except IntegrityError as error:
+        if _is_unique_violation(error):
+            conflict()
+        raise
+    if seq is None:
+        row = (await session.execute(select(RunEvent).where(RunEvent.id == row_id))).scalar_one()
+        if row.agent_run_id != run_id or row.content_digest != digest:
+            conflict()
+        return int(row.sequence_index)
+    hook = session.info.get("dendrux.event_hook")
+    if hook is not None:
+        await hook(session, run_id)
+    return int(seq)
 
 
 # Unique indexes that enforce idempotency keys: the 0.5 tenant-scoped one, and
@@ -3956,6 +4805,14 @@ def _run_to_record(row: AgentRun) -> RunRecord:
         updated_at=_to_aware_utc(row.updated_at),
         tenant_id=row.tenant_id,
         pause_requested=bool(row.pause_requested),
+        storage_format=row.storage_format,
+        claim_epoch=row.claim_epoch,
+        status_changed_at=_to_aware_utc(row.status_changed_at),
+        reclaim_attempts=row.reclaim_attempts,
+        reclaim_limit=row.reclaim_limit,
+        lease_expired_at=_to_aware_utc(row.lease_expired_at),
+        last_reclaimed_at=_to_aware_utc(row.last_reclaimed_at),
+        trace_link=row.trace_link,
     )
 
 
@@ -4003,16 +4860,18 @@ def validate_event_index(index: Any) -> None:
 
 
 class _ClaimedStateStore:
-    """Execution-local store view; only status writes and checkpoints are fenced.
-
-    Inserts remain compatible with 0.4 workers during rolling upgrades. Their
-    per-insert fencing is deferred to 0.6.
-    """
+    """Execution-local epoch binding, preserving undeclared stores' legacy signatures."""
 
     def __init__(self, store: StateStore, run_id: str, epoch: int) -> None:
         self._store = store
         self._run_id = run_id
         self.claim_epoch = epoch
+
+    @property
+    def capabilities(self) -> StoreCapabilities:
+        from dendrux.runtime._capabilities import capabilities
+
+        return capabilities(self._store)
 
     @property
     def store_identity(self) -> str | None:
@@ -4023,29 +4882,51 @@ class _ClaimedStateStore:
     def __getattr__(self, name: str) -> Any:
         import inspect
 
-        method = getattr(self._store, name)
-        if (
-            name
-            in {
-                "finalize_run",
-                "finalize_run_if_status_in",
-                "finalize_with_event",
-                "try_pause_run",
-                "pause_with_event",
-                "pause_run",
-            }
-            and method is not None
-            and "claim_epoch" in inspect.signature(method).parameters
-        ):
+        from dendrux.errors import RunFencedError
+        from dendrux.runtime._capabilities import capabilities
 
-            async def fenced(run_id: str, **kwargs: Any) -> Any:
-                result = await method(run_id, claim_epoch=self.claim_epoch, **kwargs)
-                if result is False or result is None:
+        method = getattr(self._store, name)
+        status_writes = {
+            "finalize_run",
+            "finalize_run_if_status_in",
+            "finalize_with_event",
+            "try_pause_run",
+            "pause_with_event",
+            "pause_run",
+            "release_run_claim",
+        }
+        claimed_writes = {
+            "save_trace",
+            "save_tool_call",
+            "save_usage",
+            "save_llm_interaction",
+            "save_run_event",
+            "touch_progress",
+            "add_note",
+            "mark_notes_delivered",
+            "update_run_meta",
+            "checkpoint_step",
+            "set_trace_link",
+            "start_tool_call",
+            "complete_tool_call",
+            "consume_submission",
+        }
+        enabled = name in status_writes or (
+            capabilities(self._store).fenced_writes and name in claimed_writes
+        )
+        if enabled and callable(method) and "claim_epoch" in inspect.signature(method).parameters:
+
+            async def fenced(run_id: str, *args: Any, **kwargs: Any) -> Any:
+                kwargs["claim_epoch"] = self.claim_epoch
+                result = await method(run_id, *args, **kwargs)
+                if name == "touch_progress" and result is False:
+                    logger.warning("Run fenced", extra={"run_id": run_id, "code": "run_fenced"})
+                    raise RunFencedError(run_id, claim_epoch=self.claim_epoch)
+                if name in status_writes and (result is False or result is None):
                     control = await read_run_control(self._store, run_id)
                     if control.claim_epoch is not None and control.claim_epoch != self.claim_epoch:
                         logger.warning(
-                            "Run fenced at status transition: run_id=%s code=run_fenced",
-                            run_id,
+                            "Run fenced at status transition",
                             extra={"run_id": run_id, "code": "run_fenced"},
                         )
                 return result
@@ -4078,10 +4959,12 @@ class _ClaimedStateStore:
         return control
 
 
-def claimed_store(store: StateStore, run_id: str, epoch: int | bool) -> StateStore:
+def claimed_store(store: StateStore, run_id: str, epoch: int | bool | ClaimResult) -> StateStore:
     """Bind a returned epoch; bool is the pre-0.5 custom-store claim contract."""
     if type(epoch) is bool:
         return store
+    if isinstance(epoch, ClaimResult):
+        epoch = epoch.claim_epoch
     if isinstance(store, _ClaimedStateStore):
         store = store._store
     return cast("StateStore", _ClaimedStateStore(store, run_id, epoch))

@@ -111,8 +111,9 @@ async def test_declaration_write_has_constant_database_cost(store, engine):
     finally:
         event.remove(engine.sync_engine, "before_cursor_execute", capture)
         await agent.close()
-    expected = 2 if engine.dialect.name == "postgresql" else 1
+    expected = 2  # leading fence UPDATE plus event INSERT on both backends
     assert len(statements) == expected, statements
+    assert statements[0].startswith("UPDATE agent_runs")
     assert sum("INSERT INTO run_events" in sql for sql in statements) == 1
     assert all("react_traces" not in sql and "llm_interactions" not in sql for sql in statements)
 

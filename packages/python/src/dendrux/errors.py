@@ -55,6 +55,7 @@ paths/queries/credentials, and are raised with no ``__cause__`` and no
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, TypeAlias, get_args
@@ -102,7 +103,64 @@ class RunNotFoundError(_KwargsReduceMixin, LookupError):
         super().__init__(f"Run '{run_id}' not found.")
 
 
-class RunNotPausedError(RuntimeError):
+class StoreCapabilityError(TypeError):
+    """A declared store capability does not match the implementation."""
+
+    def __init__(self, store: str, capability: str, method: str, missing: tuple[str, ...]) -> None:
+        self.store = store
+        self.capability = capability
+        self.method = method
+        self.missing = missing
+        super().__init__(
+            f"StateStore {store} capability '{capability}': {method} lacks {missing!r}."
+        )
+
+
+class RunControlError(RuntimeError):
+    """Base for conflicts while controlling a persisted run."""
+
+
+class RunNotReclaimableError(_KwargsReduceMixin, RunControlError):
+    """A run does not satisfy the ordered recovery preconditions."""
+
+    _init_fields = ("run_id", "reason")
+
+    def __init__(self, run_id: str, reason: str) -> None:
+        self.run_id = run_id
+        self.reason = reason
+        logging.getLogger(__name__).warning(
+            "Run cannot be reclaimed",
+            extra={"run_id": run_id, "code": "run_not_reclaimable", "reason": reason},
+        )
+        super().__init__(f"Run '{run_id}' cannot be reclaimed ({reason}).")
+
+
+class RunCancelledError(_KwargsReduceMixin, RunControlError):
+    """A delegated run was refused by a cancelled or terminal parent."""
+
+    _init_fields = ("run_id", "parent_run_id")
+
+    def __init__(self, run_id: str, parent_run_id: str) -> None:
+        self.run_id = run_id
+        self.parent_run_id = parent_run_id
+        logging.getLogger(__name__).warning(
+            "Child admission refused", extra={"run_id": run_id, "code": "run_cancelled"}
+        )
+        super().__init__(f"Run '{run_id}' cannot start under parent '{parent_run_id}'.")
+
+
+class NotifierUnavailableError(RuntimeError):
+    """The configured notifier could not become ready."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        logging.getLogger(__name__).warning(
+            "Notifier unavailable", extra={"run_id": None, "code": "notifier_unavailable"}
+        )
+        super().__init__(f"Notifier unavailable ({reason}).")
+
+
+class RunNotPausedError(RunControlError):
     """Raised when a submit method is called on a run that is not paused.
 
     The run is either still executing, already terminal, or in a status
@@ -116,7 +174,7 @@ class RunNotPausedError(RuntimeError):
         super().__init__(f"Run '{run_id}' is not paused (current status: {current_status.value}).")
 
 
-class PauseStatusMismatchError(_KwargsReduceMixin, RuntimeError):
+class PauseStatusMismatchError(_KwargsReduceMixin, RunControlError):
     """Raised when a submit targets the wrong pause.
 
     ``reason="status"``: the run is paused, but not for the kind of signal
@@ -164,7 +222,7 @@ class PauseStatusMismatchError(_KwargsReduceMixin, RuntimeError):
             )
 
 
-class RunAlreadyClaimedError(RuntimeError):
+class RunAlreadyClaimedError(RunControlError):
     """Raised when a concurrent submit has already claimed this pause.
 
     Two submits raced; one won the CAS transition from paused to
@@ -180,7 +238,7 @@ class RunAlreadyClaimedError(RuntimeError):
         )
 
 
-class RunAlreadyTerminalError(RuntimeError):
+class RunAlreadyTerminalError(RunControlError):
     """Raised by submit methods when the run has already reached a terminal state.
 
     :meth:`Agent.cancel_run` does **not** raise this — cancellation on
@@ -215,8 +273,10 @@ class PersistenceError(RuntimeError):
     code = "persistence_error"
     safe_message = "Database operation failed (persistence_error)."
 
-    def __init__(self, *, retryable: bool = False) -> None:
+    def __init__(self, *, retryable: bool = False, code: str = "persistence_error") -> None:
         self.retryable = retryable
+        self.code = code
+        self.safe_message = f"Database operation failed ({code})."
         super().__init__(self.safe_message)
 
 
@@ -633,6 +693,10 @@ def _safe_identity(value: str | None) -> str | None:
     return value if re.fullmatch(r"[A-Za-z0-9_.:/@+\-]+", value) else None
 
 
+def _provider_code_mapper(provider: str | None, raw: str | None) -> str | None:
+    return raw
+
+
 class ProviderError(_KwargsReduceMixin, RuntimeError):
     """A provider request failed.
 
@@ -707,18 +771,31 @@ class ProviderError(_KwargsReduceMixin, RuntimeError):
         self.provider = _safe_identity(provider)
         self.model = _safe_identity(model)
         self.status_code = _safe_status_code(status_code)
-        self.provider_code = provider_code
+        self.provider_code_raw = (
+            provider_code
+            if isinstance(provider_code, str) and _SAFE_PROVIDER_CODE.fullmatch(provider_code)
+            else None
+        )
         self.error_type = _safe_identity(error_type)
         self.message = message
         self.category: ProviderErrorCategory = resolved
         self.retryable: bool = self.default_retryable if retryable is None else bool(retryable)
         self.timeout_reason: TimeoutReason | None = timeout_reason
 
+    def __reduce__(self) -> tuple[object, tuple[object, ...]]:
+        fields = {name: getattr(self, name) for name in self._init_fields}
+        fields["provider_code"] = self.provider_code_raw
+        return _rebuild_error, (type(self), fields)
+
+    @property
+    def provider_code(self) -> str | None:
+        """The safe mapped code; the regex-validated vendor code remains private."""
+        return _provider_code_mapper(self.provider, self.provider_code_raw)
+
     @property
     def safe_provider_code(self) -> str | None:
-        """``provider_code`` when it looks like a code (``[A-Za-z0-9_.:-]{1,64}``), else None."""
-        code = self.provider_code
-        return code if isinstance(code, str) and _SAFE_PROVIDER_CODE.fullmatch(code) else None
+        """The same mapped code used by safe result projections."""
+        return self.provider_code
 
     @property
     def safe_message(self) -> str:
@@ -1071,6 +1148,11 @@ class RunFencedError(_KwargsReduceMixin, RuntimeError):
 
 
 __all__ = [
+    "NotifierUnavailableError",
+    "StoreCapabilityError",
+    "RunCancelledError",
+    "RunNotReclaimableError",
+    "RunControlError",
     "BlobContentionError",
     "BlobIntegrityError",
     "BlobNotFoundError",

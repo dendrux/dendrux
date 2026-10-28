@@ -2,6 +2,7 @@
 
 import asyncio
 import datetime as dt
+import functools
 import json
 
 import pytest
@@ -210,6 +211,7 @@ async def test_budget_enforcement_survives_lost_forensics_and_retries_usage(stor
     usage_attempts = 0
     original = store.save_usage
 
+    @functools.wraps(store.save_usage)
     async def flaky(*args, **kwargs):
         nonlocal usage_attempts
         usage_attempts += 1
@@ -219,6 +221,7 @@ async def test_budget_enforcement_survives_lost_forensics_and_retries_usage(stor
             raise OperationalError("fixture", {}, Exception("database is locked"))
         return await original(*args, **kwargs)
 
+    @functools.wraps(store.save_llm_interaction)
     async def lost(*args, **kwargs):
         raise RuntimeError("forensics unavailable")
 
@@ -251,6 +254,7 @@ async def test_retry_removes_unpaired_calls(store, monkeypatch):
 
     original = store.save_tool_call
 
+    @functools.wraps(store.save_tool_call)
     async def lost(*args, **kwargs):
         raise RuntimeError("fixture disk failure")
 
@@ -323,6 +327,7 @@ async def test_failed_usage_write_is_retried(store, monkeypatch):
     attempts = 0
     original = store.save_usage
 
+    @functools.wraps(store.save_usage)
     async def flaky(*args, **kwargs):
         nonlocal attempts
         attempts += 1
@@ -341,6 +346,7 @@ async def test_failed_interaction_write_is_retried(store, monkeypatch):
     attempts = 0
     original = store.save_llm_interaction
 
+    @functools.wraps(store.save_llm_interaction)
     async def flaky(*args, **kwargs):
         nonlocal attempts
         attempts += 1
@@ -496,7 +502,7 @@ async def test_postgres_concurrent_sweeps_cannot_revoke_refreshed_run(
     try:
         await asyncio.wait_for(selected.wait(), 10)
         if waiting:
-            epoch = await store.claim_paused_run("live", expected_status="paused")
+            epoch = (await store.claim_paused_run("live", expected_status="paused")).claim_epoch
             assert await store.release_run_claim("live", status="paused", claim_epoch=epoch)
         else:
             await store.touch_progress("live")
