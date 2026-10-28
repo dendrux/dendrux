@@ -13,9 +13,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.selectable import Select
 
 from dendrux import sweep
-from dendrux.db.models import AgentRun, Base, RunEvent
+from dendrux.db.models import AgentRun, RunEvent
 from dendrux.runtime.state import SQLAlchemyStateStore
-from tests.integration._migration_schema import migration_schema
+from tests.integration._migration_schema import create_pre_activation_schema, migration_schema
 from tests.integration._migration_schema import test_database_url as _pg_url
 from tests.integration.test_migration_run_control import _alembic
 
@@ -175,7 +175,7 @@ async def test_ten_thousand_running_inspections_are_bounded(
 
 async def _prior_schema(engine, count):
     async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(create_pre_activation_schema)
         for name in (
             "ix_agent_runs_sweep_running",
             "ix_agent_runs_sweep_waiting",
@@ -462,4 +462,4 @@ except RuntimeError as error:
         async with target.connect() as conn:
             assert (
                 await conn.execute(text("SELECT version_num FROM alembic_version"))
-            ).scalar_one() == "e8f9a0b1c2d3"
+            ).scalar_one() == "f9a0b1c2d3e4"

@@ -136,7 +136,8 @@ class TestMigration:
         cfg = Config()
         cfg.set_main_option("script_location", str(_MIGRATIONS.parent))
         script = ScriptDirectory.from_config(cfg)
-        assert script.get_heads() == ["e8f9a0b1c2d3"]
+        assert script.get_heads() == ["f9a0b1c2d3e4"]
+        assert script.get_revision("f9a0b1c2d3e4").down_revision == "e8f9a0b1c2d3"
         assert script.get_revision("e8f9a0b1c2d3").down_revision == "d7e8f9a0b1c2"
         r1 = script.get_revision("d7e8f9a0b1c2")
         assert r1 is not None

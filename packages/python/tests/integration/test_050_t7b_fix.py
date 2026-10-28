@@ -194,8 +194,11 @@ async def test_sweep_index_migration_roundtrip(engine, tmp_path):
     from sqlalchemy import inspect, text
     from sqlalchemy.ext.asyncio import create_async_engine
 
-    from dendrux.db.models import Base
-    from tests.integration._migration_schema import migration_schema, test_database_url
+    from tests.integration._migration_schema import (
+        create_pre_activation_schema,
+        migration_schema,
+        test_database_url,
+    )
     from tests.integration.test_migration_run_control import _alembic
 
     names = {
@@ -218,7 +221,7 @@ async def test_sweep_index_migration_roundtrip(engine, tmp_path):
 
     async with target() as migrated:
         async with migrated.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
+            await conn.run_sync(create_pre_activation_schema)
             for name in names:
                 await conn.execute(text(f'DROP INDEX IF EXISTS "{name}"'))
             await conn.execute(

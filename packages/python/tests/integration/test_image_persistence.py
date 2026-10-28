@@ -216,13 +216,13 @@ async def test_retried_edge_write_is_idempotent(engine, store) -> None:
     edge = BlobEdge("-", part.ref.sha256, "seed", "seed", 0)
     await services.catalog.add_blob_refs("R1", "-", [edge])  # type: ignore[union-attr]
     await services.catalog.add_blob_refs("R1", "-", [edge])  # type: ignore[union-attr]
-    # A re-run of the same trace write (lost commit ack) adds no duplicate edge.
-    for _ in range(2):
+    # Distinct trace rows may repeat an edge owner without duplicating that edge.
+    for order in range(2):
         await store.save_trace(
             "R1",
             "user",
             "x",
-            order_index=0,
+            order_index=order,
             blob_refs=[BlobEdge("-", part.ref.sha256, "trace", "0", 0)],
             blob_refs_scope="-",
         )

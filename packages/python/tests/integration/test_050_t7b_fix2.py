@@ -109,8 +109,11 @@ async def test_status_migration_backfills_and_repairs_interrupted_index(engine, 
     from sqlalchemy.exc import IntegrityError
     from sqlalchemy.ext.asyncio import create_async_engine
 
-    from dendrux.db.models import Base
-    from tests.integration._migration_schema import migration_schema, test_database_url
+    from tests.integration._migration_schema import (
+        create_pre_activation_schema,
+        migration_schema,
+        test_database_url,
+    )
     from tests.integration.test_migration_run_control import _alembic
 
     @asynccontextmanager
@@ -128,7 +131,7 @@ async def test_status_migration_backfills_and_repairs_interrupted_index(engine, 
     async with target() as migrated:
         old = dt.datetime(2025, 1, 1, tzinfo=dt.UTC)
         async with migrated.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
+            await conn.run_sync(create_pre_activation_schema)
             await conn.execute(
                 AgentRun.__table__.insert(),
                 [

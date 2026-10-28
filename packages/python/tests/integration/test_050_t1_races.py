@@ -154,7 +154,7 @@ async def test_hot_queries_can_use_their_indexes(engine: Any) -> None:
         assert {
             "uq_agent_runs_tenant_idempotency_key",
             "ix_agent_runs_tenant_id_created_at",
-            "ix_run_events_agent_run_id_seq",
+            "uq_run_events_run_seq",
             "ix_run_inbox_run_pending",
         } <= indexes
 
@@ -179,6 +179,6 @@ async def test_hot_queries_can_use_their_indexes(engine: Any) -> None:
             "SELECT coalesce(max(sequence_index), -1) + 1 FROM run_events WHERE agent_run_id = :r",
             r="r1",
         )
-        assert "ix_run_events_agent_run_id_seq" in alloc
+        assert "uq_run_events_run_seq" in alloc
         notes = await plan("SELECT count(*) FROM run_inbox WHERE run_id = :r", r="r1")
         assert "ix_run_inbox_run_pending" in notes

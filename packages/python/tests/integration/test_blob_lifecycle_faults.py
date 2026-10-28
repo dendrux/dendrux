@@ -580,13 +580,18 @@ async def test_owner_key_collision_raises_and_rolls_back(engine, store) -> None:
     a = (await store_png(services, "-", make_png(212))).ref.sha256
     b = (await store_png(services, "-", make_png(213))).ref.sha256
     await store.create_run("R1", "a")
-    kwargs: dict[str, Any] = {"order_index": 0, "blob_refs_scope": "-"}
+    kwargs: dict[str, Any] = {"blob_refs_scope": "-"}
     await store.save_trace(
-        "R1", "user", "x", blob_refs=[BlobEdge("-", a, "trace", "0", 0)], **kwargs
+        "R1", "user", "x", order_index=0, blob_refs=[BlobEdge("-", a, "trace", "0", 0)], **kwargs
     )
     with pytest.raises(BlobNotFoundError) as info:
         await store.save_trace(
-            "R1", "user", "y", blob_refs=[BlobEdge("-", b, "trace", "0", 0)], **kwargs
+            "R1",
+            "user",
+            "y",
+            order_index=1,
+            blob_refs=[BlobEdge("-", b, "trace", "0", 0)],
+            **kwargs,
         )
     assert info.value.__cause__ is None and info.value.__context__ is None
     async with engine.connect() as conn:

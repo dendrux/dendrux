@@ -20,6 +20,7 @@ from sqlalchemy.pool import NullPool
 
 from dendrux import Agent
 from dendrux.db import session as db_session
+from dendrux.db._storage_schema import ADDITIONS
 from dendrux.db.models import Base
 from dendrux.errors import PersistenceError, SchemaNotInitializedError, SchemaOutOfDateError
 from dendrux.llm.mock import MockLLM
@@ -52,11 +53,14 @@ _SWEEP_INDEXES = {
     "agent_runs.ix_agent_runs_sweep_waiting (index)",
     "run_events.ix_run_events_started (index)",
 }
+_RECOVERY_COLUMNS = {f"{table}.{column}" for table, cols in ADDITIONS.items() for column in cols}
 _MISSING_AT_PRIOR = (
     _MISSING
     | {"agent_runs.claim_epoch", "agent_runs.status_changed_at"}
     | _R1_INDEXES
     | _SWEEP_INDEXES
+    | _RECOVERY_COLUMNS
+    | {"dendrux_settings"}
 )
 RUN_CONTROL = "b5c6d7e8f9a0"  # 0.3.0 head: everything but the 0.4.0 image blob tables
 
@@ -392,8 +396,11 @@ async def test_v030_schema_names_both_blob_tables(pg_url: str) -> None:
         with pytest.raises(SchemaOutOfDateError) as info:
             await agent.run("hi")
         err = info.value
-        assert set(err.missing_tables) == {"dendrux_blobs", "dendrux_blob_refs"}
-        assert err.missing_columns == ("agent_runs.claim_epoch", "agent_runs.status_changed_at")
+        assert set(err.missing_tables) == {"dendrux_blobs", "dendrux_blob_refs", "dendrux_settings"}
+        assert set(err.missing_columns) == _RECOVERY_COLUMNS | {
+            "agent_runs.claim_epoch",
+            "agent_runs.status_changed_at",
+        }
         assert set(err.missing_indexes) == _R1_INDEXES | _SWEEP_INDEXES
         assert "dendrux_blobs" in str(err) and "dendrux_blob_refs" in str(err)
         assert "dendrux db migrate" in str(err)

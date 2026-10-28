@@ -208,7 +208,7 @@ async def test_exclusive_migration_lock_timeout_is_retryable(engine, phase, reco
             ).scalar_one() == 0
             assert (
                 await conn.execute(text("SELECT version_num FROM alembic_version"))
-            ).scalar_one() == "e8f9a0b1c2d3"
+            ).scalar_one() == "f9a0b1c2d3e4"
             assert (
                 await conn.execute(
                     text("""

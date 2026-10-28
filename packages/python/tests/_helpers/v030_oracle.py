@@ -1610,9 +1610,9 @@ async def dump_rows(engine: AsyncEngine) -> tuple[dict[str, list[dict[str, Any]]
             out[name] = rows
         provider_ids = {r["tool_call_id"]: r["provider_tool_call_id"] for r in out["tool_calls"]}
         out["run_events"] = canonical_concurrent_tool_events(out["run_events"], provider_ids)
-        # Tables that did not exist in v0.3.0 must stay empty for text-only runs.
+        # New run-owned tables stay empty; dendrux_settings is global schema metadata.
         for name, table in tables.items():
-            if name not in ROW_TABLES:
+            if name not in ROW_TABLES and name != "dendrux_settings":
                 extra[name] = len((await conn.execute(select(table))).all())
     return out, extra
 
@@ -1749,13 +1749,30 @@ def _strip_041_additions(table: str, row: dict[str, Any]) -> tuple[dict[str, Any
     return row, None
 
 
+_ADDITIVE_060_COLUMNS = {
+    "agent_runs": {
+        "storage_format",
+        "reclaim_attempts",
+        "reclaim_limit",
+        "lease_expired_at",
+        "last_reclaimed_at",
+        "loop_state",
+        "trace_link",
+    },
+    "tool_calls": {"outcome", "idempotent", "replayed_at", "content_digest"},
+    "react_traces": {"trace_kind", "content_digest"},
+    "run_events": {"content_digest"},
+}
+
+
 def _strip_050_additions(table: str, row: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
     """Validate new integrity fields before comparing the older text wire shape.
 
     Strip ULIDs before Normalizer allocates identities, so an added pause ID
-    cannot renumber the pre-existing run and call IDs. Goldens stay unchanged.
+    cannot renumber the pre-existing run and call IDs. The closed set of 0.6
+    additive columns is projected away by name. Goldens stay unchanged.
     """
-    row = dict(row)
+    row = {k: v for k, v in row.items() if k not in _ADDITIVE_060_COLUMNS.get(table, set())}
     if table == "agent_runs":
         if "status_changed_at" in row and row.pop("status_changed_at") != "<ts>":
             return row, "agent_runs.status_changed_at: expected a non-null timestamp"
@@ -1878,7 +1895,7 @@ async def create_sqlite_engine() -> AsyncEngine:
 
 
 async def reset_database(engine: AsyncEngine) -> None:
-    """Empty every table (TRUNCATE on Postgres, ordered DELETE on SQLite)."""
+    """Empty run data and restore active settings after TRUNCATE/DELETE."""
     from sqlalchemy import text
 
     from dendrux.db.models import Base
@@ -1890,6 +1907,10 @@ async def reset_database(engine: AsyncEngine) -> None:
         else:
             for table in reversed(Base.metadata.sorted_tables):
                 await conn.execute(table.delete())
+        if "dendrux_settings" in Base.metadata.tables:
+            from dendrux.db._settings import seed_settings
+
+            await conn.run_sync(lambda c: seed_settings(c, active=True))
 
 
 # ---------------------------------------------------------------------------

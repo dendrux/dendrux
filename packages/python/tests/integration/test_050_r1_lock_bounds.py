@@ -26,7 +26,8 @@ from tests.integration.test_050_t1_r1_migration import PRIOR, _alembic, _indexes
 pytestmark = pytest.mark.asyncio
 
 R1 = "d7e8f9a0b1c2"
-HEAD = "e8f9a0b1c2d3"
+HEAD = "f9a0b1c2d3e4"
+CLOCK = "e8f9a0b1c2d3"
 _TIMEOUT = "Timed out acquiring the Dendrux migration lock after 5 seconds"
 _R1_INDEXES = ("uq_agent_runs_tenant_idempotency_key", "ix_agent_runs_tenant_id_created_at")
 
@@ -482,7 +483,7 @@ async def test_second_revision_logs_the_same_lock_timeout_line(pg: Any, caplog: 
                 await asyncio.wait_for(asyncio.to_thread(_alembic, url, "upgrade", "head"), 15)
         finally:
             await transaction.rollback()
-    _assert_lock_timeout_logged(caplog, HEAD, "add_status_changed_at")
+    _assert_lock_timeout_logged(caplog, CLOCK, "add_status_changed_at")
     assert await _version(engine) == R1
     await asyncio.to_thread(_alembic, url, "upgrade", "head")
     assert await _version(engine) == HEAD

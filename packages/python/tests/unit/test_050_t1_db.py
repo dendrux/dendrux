@@ -184,7 +184,7 @@ class TestDbCheckCli:
 
     def test_head_is_current(self, db: Path) -> None:
         self._create(db)
-        self._stamp(db, "e8f9a0b1c2d3")
+        self._stamp(db, "f9a0b1c2d3e4")
         result = self._invoke()
         assert result.exit_code == 0, result.output
 
