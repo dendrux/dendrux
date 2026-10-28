@@ -1504,7 +1504,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         retry_ids=True,
         checkpointing=True,
         atomic_completion=True,
-        notify=False,
+        notify=True,
         recovery=True,
     )
 
@@ -1605,6 +1605,20 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                     )
                 ):
                     storage_format = 1
+                if parent_run_id is not None:
+                    from dendrux.errors import RunCancelledError, RunNotFoundError
+
+                    parent = (
+                        await session.execute(
+                            select(AgentRun.cancel_requested, AgentRun.status, AgentRun.tenant_id)
+                            .where(AgentRun.id == parent_run_id)
+                            .with_for_update(read=True)
+                        )
+                    ).first()
+                    if parent is None:
+                        raise RunNotFoundError(parent_run_id)
+                    if parent.cancel_requested or parent.status in _TERMINAL_STATUS_VALUES:
+                        raise RunCancelledError(run_id, parent_run_id)
                 run = AgentRun(
                     storage_format=storage_format,
                     id=run_id,
@@ -2349,17 +2363,57 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
 
     async def set_trace_link(self, run_id: str, *, claim_epoch: int, trace_link: str) -> None:
         """Persist a validated traceparent under the execution fence."""
-        raise NotImplementedError("Store capability is not enabled yet")
+        from dendrux.runtime._tracelink import validate_trace_link
+
+        if validate_trace_link(trace_link) is None:
+            logger.warning(
+                "Invalid trace link", extra={"run_id": run_id, "code": "trace_link_invalid"}
+            )
+            raise ValueError("Invalid trace link")
+        async with self._session_factory() as session:
+            await self._fence(session, run_id, claim_epoch, trace_link=trace_link)
+            await session.commit()
 
     async def mark_cancel_requested(self, run_ids: Sequence[str], *, tenant_id: TenantScope) -> int:
         """Mark a bounded frontier before a cancellation caller scans its children."""
-        raise NotImplementedError("Store capability is not enabled yet")
+        from sqlalchemy import update
+
+        from dendrux.db.models import AgentRun
+
+        count = 0
+        async with self._session_factory() as session:
+            ids = sorted(set(run_ids))
+            for start in range(0, len(ids), _IN_CHUNK):
+                result = await session.execute(
+                    _apply_tenant_scope(
+                        update(AgentRun)
+                        .where(AgentRun.id.in_(ids[start : start + _IN_CHUNK]))
+                        .values(cancel_requested=True),
+                        tenant_id,
+                    )
+                )
+                count += int(getattr(result, "rowcount", 0))
+            await session.commit()
+        return count
 
     async def get_children_page(
         self, parent_ids: Sequence[str], *, after: str | None, limit: int, tenant_id: TenantScope
     ) -> list[str]:
         """List the tenant-scoped children of a frontier by immutable run id."""
-        raise NotImplementedError("Store capability is not enabled yet")
+        from sqlalchemy import select
+
+        from dendrux.db.models import AgentRun
+
+        _positive_page(limit)
+        stmt = _apply_tenant_scope(
+            select(AgentRun.id).where(AgentRun.parent_run_id.in_(parent_ids)), tenant_id
+        )
+        if after is not None:
+            stmt = stmt.where(AgentRun.id > after)
+        async with self._session_factory() as session:
+            return list(
+                (await session.scalars(stmt.order_by(AgentRun.id).limit(min(limit, 1000)))).all()
+            )
 
     async def get_loop_state(self, run_id: str) -> dict[str, Any] | None:
         """Read the authoritative execution projection."""
