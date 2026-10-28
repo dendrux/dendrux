@@ -371,6 +371,13 @@ _SCHEMAS: dict[str, dict[str, Check]] = {
         "exceeded": _list(_EXCEEDED),
         "failure_reason": _enum(_FAILURE_REASONS),
     },
+    "run.lease_expired": {"gap_s": _num},
+    "run.reclaimed": {
+        "attempt": _num,
+        "previous_epoch": _num,
+        "gap_s": _num,
+        "governance_changed": _bool,
+    },
     "run.interrupted": {"failure_reason": _enum(_FAILURE_REASONS)},
     "run.abandoned": {"failure_reason": _enum(_FAILURE_REASONS)},
     # loops/react.py: gated calls are declared tools; params in _special

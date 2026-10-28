@@ -68,6 +68,8 @@ def test_status_writer_inventory():
         "submit_and_claim": 1,
         "release_run_claim": 1,
         "_sweep_runs": 1,
+        "mark_lease_expired": 1,
+        "reclaim_run": 1,
     }, f"audit every status writer: {writers}"
     # Heartbeats must not change any indexed columns, including predicates/expressions.
     indexed = {col.name for index in AgentRun.__table__.indexes for col in index.columns}

@@ -1505,7 +1505,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         checkpointing=True,
         atomic_completion=True,
         notify=False,
-        recovery=False,
+        recovery=True,
     )
 
     def __init__(
@@ -3977,11 +3977,218 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         cursor: str | None,
     ) -> MarkResult:
         """Scan running rows once by id, atomically fencing each expired lease."""
-        raise NotImplementedError("Store capability is not enabled yet")
+        from sqlalchemy import func, or_, select, update
+
+        from dendrux.db.models import AgentRun
+
+        _require_aware_utc("cutoff", cutoff)
+        for bound in (batch_size, max_runs, max_returned, reclaim_limit):
+            _positive_page(bound)
+        if reclaim_limit > 32767:
+            raise ValueError("reclaim_limit exceeds SMALLINT")
+        result = MarkResult([], [], [], 0, None)
+        inspected, after = 0, cursor
+        fields = (
+            AgentRun.id,
+            AgentRun.agent_name,
+            AgentRun.tenant_id,
+            AgentRun.status,
+            AgentRun.last_progress_at,
+            AgentRun.created_at,
+            AgentRun.storage_format,
+            AgentRun.reclaim_attempts,
+            AgentRun.reclaim_limit,
+            AgentRun.claim_epoch,
+            AgentRun.lease_expired_at,
+            AgentRun.strategy,
+            AgentRun.cancel_requested,
+        )
+        while inspected < max_runs and len(result.reclaimable) < max_returned:
+            statement = select(*fields).where(AgentRun.status.between("running", "running"))
+            if after is not None:
+                statement = statement.where(AgentRun.id > after)
+            async with self._session_factory() as session:
+                ids = (
+                    await session.execute(
+                        statement.order_by(AgentRun.status, AgentRun.id).limit(
+                            min(batch_size, max_runs - inspected)
+                        )
+                    )
+                ).all()
+            if not ids:
+                return MarkResult(
+                    result.reclaimable, result.finalised, result.legacy, inspected, None
+                )
+            for candidate in ids:
+                run_id = candidate.id
+
+                async def attempt(
+                    row: Any = candidate, run_id: str = run_id
+                ) -> ReclaimableRun | SweptRun | None:
+                    async with self._session_factory() as session:
+                        age = _to_aware_utc(row.last_progress_at or row.created_at)
+                        if row.lease_expired_at is None and age >= cutoff:
+                            return None
+                        limit = (
+                            row.reclaim_limit
+                            if row.lease_expired_at is not None and row.reclaim_limit is not None
+                            else reclaim_limit
+                        )
+                        reason = (
+                            "stale_running_legacy"
+                            if row.storage_format != 2
+                            else "reclaim_limit"
+                            if row.reclaim_attempts >= limit
+                            else "stale_running"
+                            if row.strategy == "single_call"
+                            else None
+                        )
+                        if reason is not None or row.cancel_requested:
+                            status = "cancelled" if row.cancel_requested else "error"
+                            changed = (
+                                await session.execute(
+                                    update(AgentRun)
+                                    .where(
+                                        AgentRun.id == run_id,
+                                        AgentRun.status == "running",
+                                        AgentRun.claim_epoch == row.claim_epoch,
+                                        or_(
+                                            AgentRun.lease_expired_at.is_not(None),
+                                            func.coalesce(
+                                                AgentRun.last_progress_at, AgentRun.created_at
+                                            )
+                                            < cutoff,
+                                        ),
+                                    )
+                                    .values(
+                                        **_status_values(status),
+                                        claim_epoch=AgentRun.claim_epoch + 1,
+                                        failure_reason=reason,
+                                        pause_data=None,
+                                        pause_requested=False,
+                                        cancel_requested=False,
+                                    )
+                                    .returning(AgentRun.id)
+                                )
+                            ).scalar_one_or_none()
+                            if changed is None:
+                                return None
+                            await _insert_event_locked(
+                                session,
+                                run_id,
+                                "run.cancelled" if status == "cancelled" else "run.interrupted",
+                                {"reason": "cancel_requested"}
+                                if status == "cancelled"
+                                else {"failure_reason": reason},
+                            )
+                            await session.commit()
+                            logger.warning(
+                                "Expired run finalised",
+                                extra={
+                                    "run_id": run_id,
+                                    "code": "legacy_run_swept"
+                                    if reason == "stale_running_legacy"
+                                    else "reclaim_limit",
+                                },
+                            )
+                            return SweptRun(
+                                run_id,
+                                row.agent_name,
+                                "running",
+                                reason or "cancel_requested",
+                                _to_aware_utc(row.last_progress_at),
+                                _dt.datetime.now(_dt.UTC),
+                                status,
+                            )
+                        if row.lease_expired_at is not None:
+                            return _reclaimable(row)
+                        now = _dt.datetime.now(_dt.UTC)
+                        marked = (
+                            await session.execute(
+                                update(AgentRun)
+                                .where(
+                                    AgentRun.id == run_id,
+                                    AgentRun.status == "running",
+                                    AgentRun.storage_format == 2,
+                                    AgentRun.lease_expired_at.is_(None),
+                                    AgentRun.claim_epoch == row.claim_epoch,
+                                    func.coalesce(AgentRun.last_progress_at, AgentRun.created_at)
+                                    < cutoff,
+                                )
+                                .values(
+                                    claim_epoch=AgentRun.claim_epoch + 1,
+                                    lease_expired_at=now,
+                                    reclaim_limit=limit,
+                                )
+                                .returning(*fields)
+                            )
+                        ).first()
+                        if marked is None:
+                            current = (
+                                await session.execute(
+                                    select(*fields).where(
+                                        AgentRun.id == run_id,
+                                        AgentRun.status == "running",
+                                        AgentRun.lease_expired_at.is_not(None),
+                                    )
+                                )
+                            ).first()
+                            return _reclaimable(current) if current is not None else None
+                        await _insert_event_locked(
+                            session,
+                            run_id,
+                            "run.lease_expired",
+                            {"gap_s": max(0.0, (now - age).total_seconds())},
+                        )
+                        item = _reclaimable(marked)
+                        await session.commit()
+                        return item
+
+                item = await retry_transient_db(attempt, label="mark_lease_expired", run_id=run_id)
+                inspected += 1
+                after = run_id
+                if isinstance(item, ReclaimableRun):
+                    result.reclaimable.append(item)
+                elif isinstance(item, SweptRun):
+                    result.finalised.append(item)
+                    if item.failure_reason == "stale_running_legacy":
+                        result.legacy.append(item)
+                if inspected >= max_runs or len(result.reclaimable) >= max_returned:
+                    return MarkResult(
+                        result.reclaimable, result.finalised, result.legacy, inspected, after
+                    )
+        return MarkResult(result.reclaimable, result.finalised, result.legacy, inspected, after)
 
     async def get_lease_expired(self, *, limit: int, cursor: str | None) -> list[ReclaimableRun]:
         """Rediscover marks without changing epochs or emitting duplicate events."""
-        raise NotImplementedError("Store capability is not enabled yet")
+        from sqlalchemy import select
+
+        from dendrux.db.models import AgentRun
+
+        _positive_page(limit)
+        stmt = select(
+            AgentRun.id,
+            AgentRun.tenant_id,
+            AgentRun.agent_name,
+            AgentRun.last_progress_at,
+            AgentRun.lease_expired_at,
+            AgentRun.reclaim_attempts,
+            AgentRun.reclaim_limit,
+            AgentRun.claim_epoch,
+        ).where(
+            AgentRun.status == "running",
+            AgentRun.storage_format == 2,
+            AgentRun.lease_expired_at.is_not(None),
+        )
+        if cursor is not None:
+            stmt = stmt.where(AgentRun.id > cursor)
+        async with self._session_factory() as session:
+            return [
+                _reclaimable(row)
+                for row in (
+                    await session.execute(stmt.order_by(AgentRun.id).limit(min(limit, 1000)))
+                ).all()
+            ]
 
     async def reclaim_run(
         self,
@@ -3996,13 +4203,174 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         loop_type: str,
     ) -> ClaimResult | Literal[False]:
         """Validate a marked run under its row lock, then atomically claim and audit it."""
-        raise NotImplementedError("Store capability is not enabled yet")
+        from sqlalchemy import select, update
+
+        from dendrux.db.models import AgentRun
+        from dendrux.errors import RunNotFoundError, RunNotReclaimableError
+
+        if governance_policy not in ("warn", "raise"):
+            logger.warning(
+                "Invalid governance policy", extra={"run_id": run_id, "code": "governance_mismatch"}
+            )
+            raise ValueError("governance_policy must be warn or raise")
+
+        async def attempt() -> ClaimResult | Literal[False]:
+            async with self._session_factory() as session:
+                row = (
+                    await session.execute(
+                        _apply_tenant_scope(
+                            select(
+                                AgentRun.id,
+                                AgentRun.tenant_id,
+                                AgentRun.storage_format,
+                                AgentRun.status,
+                                AgentRun.lease_expired_at,
+                                AgentRun.claim_epoch,
+                                AgentRun.reclaim_attempts,
+                                AgentRun.reclaim_limit,
+                                AgentRun.cancel_requested,
+                                AgentRun.agent_name,
+                                AgentRun.meta,
+                                AgentRun.loop_state,
+                                AgentRun.strategy,
+                                AgentRun.last_progress_at,
+                                AgentRun.created_at,
+                            ).where(AgentRun.id == run_id),
+                            tenant_id,
+                        ).with_for_update()
+                    )
+                ).first()
+                if row is None:
+                    raise RunNotFoundError(run_id)
+                checks = [
+                    (row.storage_format == 2, "legacy_run"),
+                    (self.capabilities.recovery, "store_capability"),
+                    (row.status == "running", "not_running"),
+                    (row.lease_expired_at is not None, "lease_fresh"),
+                    (
+                        expected_claim_epoch is None or row.claim_epoch == expected_claim_epoch,
+                        "already_reclaimed",
+                    ),
+                    (
+                        row.reclaim_limit is not None and row.reclaim_attempts < row.reclaim_limit,
+                        "reclaim_limit",
+                    ),
+                ]
+                for ok, reason in checks:
+                    if not ok:
+                        raise RunNotReclaimableError(run_id, reason)
+                previous_epoch = row.claim_epoch
+                if row.cancel_requested:
+                    await session.execute(
+                        update(AgentRun)
+                        .where(AgentRun.id == run_id, AgentRun.claim_epoch == previous_epoch)
+                        .values(
+                            **_status_values("cancelled"),
+                            claim_epoch=AgentRun.claim_epoch + 1,
+                            pause_data=None,
+                            cancel_requested=False,
+                        )
+                    )
+                    await _insert_event_locked(
+                        session, run_id, "run.cancelled", {"reason": "cancel_requested"}
+                    )
+                    await session.commit()
+                    return False
+                if row.agent_name != agent_name:
+                    raise RunNotReclaimableError(run_id, "agent_mismatch")
+                saved = (row.meta or {}).get("dendrux.governance")
+                governance_changed = saved is not None and saved.get("digest") != governance.get(
+                    "digest"
+                )
+                if governance_changed:
+                    logger.warning(
+                        "Recovery governance mismatch",
+                        extra={"run_id": run_id, "code": "governance_mismatch"},
+                    )
+                    if governance_policy == "raise":
+                        raise RunNotReclaimableError(run_id, "governance_changed")
+                pins = ((row.loop_state or {}).get("skills") or {}).get("pins", {})
+                if pins != skill_pins:
+                    raise RunNotReclaimableError(run_id, "skill_mismatch")
+                if loop_type != "react" or row.strategy == "single_call":
+                    raise RunNotReclaimableError(run_id, "loop_unsupported")
+                now = _dt.datetime.now(_dt.UTC)
+                gap = max(
+                    0.0,
+                    (now - _to_aware_utc(row.last_progress_at or row.created_at)).total_seconds(),
+                )
+                changed = (
+                    await session.execute(
+                        update(AgentRun)
+                        .where(
+                            AgentRun.id == run_id,
+                            AgentRun.claim_epoch == previous_epoch,
+                            AgentRun.lease_expired_at.is_not(None),
+                            AgentRun.status == "running",
+                        )
+                        .values(
+                            claim_epoch=AgentRun.claim_epoch + 1,
+                            reclaim_attempts=AgentRun.reclaim_attempts + 1,
+                            lease_expired_at=None,
+                            last_progress_at=now,
+                            last_reclaimed_at=now,
+                        )
+                        .returning(
+                            AgentRun.claim_epoch,
+                            AgentRun.storage_format,
+                            AgentRun.loop_state,
+                            AgentRun.reclaim_attempts,
+                        )
+                    )
+                ).first()
+                if changed is None:
+                    return False
+                await _insert_event_locked(
+                    session,
+                    run_id,
+                    "run.reclaimed",
+                    dict(
+                        attempt=changed.reclaim_attempts,
+                        previous_epoch=previous_epoch,
+                        gap_s=gap,
+                        **({"governance_changed": True} if governance_changed else {}),
+                    ),
+                )
+                token = ClaimResult(
+                    changed.claim_epoch,
+                    changed.storage_format,
+                    changed.loop_state,
+                    (changed.loop_state or {}).get("submission"),
+                )
+                await session.commit()
+                return token
+
+        return await retry_transient_db(attempt, label="reclaim_run", run_id=run_id)
 
     async def get_replayed_tool_calls(
         self, run_id: str, *, limit: int = 100, tenant_id: TenantScope = UNSCOPED
     ) -> tuple[list[str], bool]:
         """Read replayed call ids with one bounded lookahead for truncation."""
-        raise NotImplementedError("Store capability is not enabled yet")
+        from sqlalchemy import select
+
+        from dendrux.db.models import ToolCallRecord
+
+        _positive_page(limit)
+        limit = min(limit, 1000)
+        async with self._session_factory() as session:
+            rows = (
+                await session.scalars(
+                    select(ToolCallRecord.tool_call_id)
+                    .where(
+                        ToolCallRecord.agent_run_id == run_id,
+                        ToolCallRecord.replayed_at.is_not(None),
+                        _run_in_scope(run_id, tenant_id),
+                    )
+                    .order_by(ToolCallRecord.replayed_at, ToolCallRecord.id)
+                    .limit(limit + 1)
+                )
+            ).all()
+            return list(rows[:limit]), len(rows) > limit
 
     async def sweep_stale_runs(
         self,
