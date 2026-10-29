@@ -452,3 +452,103 @@ async def test_reclaim_reuses_durable_trace_through_phase1_start_seam(store, eng
     assert returned == saved
     assert continued.context.trace_id == original.context.trace_id
     assert continued.parent.span_id == original.context.span_id
+
+
+@pytest.mark.parametrize("engine", ["sqlite_file", "postgres"], indirect=True)
+async def test_public_reclaim_after_process_crash_keeps_durable_parent(store, engine, tracing):
+    import signal
+    from datetime import UTC, datetime, timedelta
+
+    from sqlalchemy import update
+
+    from dendrux import sweep
+    from dendrux.db.models import AgentRun
+
+    code = """
+import asyncio, json, os, signal, sys
+from sqlalchemy.ext.asyncio import create_async_engine
+from opentelemetry.sdk.trace import TracerProvider
+from dendrux import Agent
+from dendrux.llm.mock import MockLLM
+from dendrux.notifiers.otel import OpenTelemetryNotifier
+from dendrux.runtime.state import SQLAlchemyStateStore
+async def main():
+    engine = create_async_engine(sys.argv[1])
+    store = SQLAlchemyStateStore(engine)
+    notifier = OpenTelemetryNotifier(TracerProvider().get_tracer("crashed-worker"))
+    class CrashBeforeCompletion(MockLLM):
+        async def complete(self, *args, **kwargs):
+            run_id, = notifier._run_spans
+            row = await store.get_run(run_id)
+            assert row.trace_link
+            print(json.dumps({"run_id": run_id, "link": row.trace_link}), flush=True)
+            os.kill(os.getpid(), signal.SIGKILL)
+    await Agent(name="crash-trace", prompt="p", state_store=store,
+                provider=CrashBeforeCompletion([]), strict_tenancy=False).run(
+                    "go", notifier=notifier)
+asyncio.run(main())
+"""
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        code,
+        engine.url.render_as_string(hide_password=False),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env={**os.environ, "PYTHONPATH": os.path.abspath("src")},
+    )
+    try:
+        output, error = await asyncio.wait_for(process.communicate(), 30)
+    finally:
+        if process.returncode is None:
+            process.kill()
+            await process.wait()
+    assert process.returncode == -signal.SIGKILL, error.decode()
+    crashed = json.loads(output)
+    run_id, saved = crashed["run_id"], crashed["link"]
+    row = await store.get_run(run_id)
+    assert row.status == "running" and row.trace_link == saved
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(AgentRun)
+            .where(AgentRun.id == run_id)
+            .values(last_progress_at=datetime.now(UTC) - timedelta(minutes=10))
+        )
+    page = await sweep(state_store=store, stale_running=timedelta(minutes=1), on_stale="reclaim")
+    (item,) = page.reclaimable
+    assert item.run_id == run_id
+    provider, exporter = tracing
+    seen = []
+
+    class RecordingOTel(OpenTelemetryNotifier):
+        async def on_run_started(
+            self, run_id, *, agent_name=None, agent_model=None, trace_link=None
+        ):
+            seen.append(trace_link)
+            await super().on_run_started(
+                run_id, agent_name=agent_name, agent_model=agent_model, trace_link=trace_link
+            )
+
+    agent = Agent(
+        name="crash-trace",
+        prompt="p",
+        state_store=store,
+        provider=MockLLM([LLMResponse(text="done")]),
+        strict_tenancy=False,
+    )
+    result = await agent.reclaim(
+        run_id,
+        tenant_id=None,
+        item=item,
+        notifier=RecordingOTel(provider.get_tracer("reclaimed-worker")),
+    )
+    assert result.status == RunStatus.SUCCESS
+    assert seen == [saved]
+    (continued,) = spans(exporter, "invoke_agent")
+    assert continued.context.trace_id == int(saved.split("-")[1], 16)
+    assert continued.parent.span_id == int(saved.split("-")[2], 16)
+    assert all(
+        s.context.trace_id == continued.context.trace_id for s in exporter.get_finished_spans()
+    )
+    row = await store.get_run(run_id)
+    assert row.trace_link == saved and row.reclaim_attempts == 1

@@ -35,7 +35,7 @@ def test_reference_has_every_code_kind_and_operator_guidance():
         assert f"| `{code.name}` |" in generated
         assert code.fires_when in generated and code.do in generated
     for kind in {code.kind for code in REGISTRY.values()}:
-        assert f"## {kind.replace('_', ' ').title()}" in generated
+        assert f"## {'MCP' if kind == 'mcp' else kind.replace('_', ' ').title()}" in generated
 
 
 def test_generator_cli_writes_requested_file(tmp_path):
@@ -49,3 +49,11 @@ def test_generator_cli_writes_requested_file(tmp_path):
     )
     assert result.returncode == 0, result.stderr
     assert output.read_text() == module.render()
+
+
+def test_reference_is_explicit_about_future_call_site_migration_and_strict_opt_in():
+    generated = generator().render()
+    assert "Call sites move to `log_code` in a later release" in generated
+    assert "DENDRUX_STRICT_LOG_FIELDS=1" in generated
+    assert "Unregistered code objects always raise" in generated
+    assert "## MCP" in generated and "## Mcp" not in generated

@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import re
-import sys
+import unicodedata
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any
@@ -24,9 +25,10 @@ class Code:
 
 
 _BASE_FIELDS = frozenset({"code", "kind", "run_id", "tenant_id"})
-_STRICT_FIELDS = "pytest" in sys.modules
 _ULID = re.compile(r"[0-7][0-9A-HJKMNP-TV-Z]{25}")
-_TENANT = re.compile(r"[A-Za-z0-9_-]{1,64}")
+_PROVIDER_ID = re.compile(r"[A-Za-z0-9_.:\-]{1,128}")
+_TRACE_ID = re.compile(r"[0-9a-f]{32}")
+_SPAN_ID = re.compile(r"[0-9a-f]{16}")
 _NUMBERS = frozenset(
     {
         "attempt",
@@ -64,7 +66,7 @@ _ENUMS = {
             "unknown",
         ]
     ),
-    "provider": frozenset(["anthropic", "openai", "openai_responses", "openrouter"]),
+    "provider": frozenset(["anthropic", "openai", "openai_responses", "openrouter", "custom"]),
     "timeout_reason": frozenset(
         ["call_deadline", "connect", "deadline_during_backoff", "stream_idle", "stream_total"]
     ),
@@ -82,6 +84,9 @@ _ENUMS = {
             "loop_unsupported",
             "not_running",
             "reclaim_limit",
+            "recovery_call_missing",
+            "recovery_state_missing",
+            "recovery_state_invalid",
             "sibling_failed",
             "skill_mismatch",
             "store_capability",
@@ -1411,10 +1416,147 @@ RESPONSE_ENCODING_UNSUPPORTED = Code(
     "Use gzip or deflate responses; inspect the provider or gateway encoding configuration.",
 )
 
+TIMEOUT_ERROR = Code(
+    "timeout_error",
+    logging.WARNING,
+    "provider",
+    _BASE_FIELDS | frozenset({"provider", "category", "status", "timeout_reason", "retryable"}),
+    "Anthropic reports that the request timed out.",
+    "Inspect provider availability and the request deadline before retrying.",
+)
+
+LEGACY_RUN = Code(
+    "legacy_run",
+    logging.WARNING,
+    "recovery",
+    _BASE_FIELDS,
+    "The run uses a storage format that cannot be reclaimed.",
+    "Allow the legacy run to finish or start a new run.",
+)
+NOT_RUNNING = Code(
+    "not_running",
+    logging.WARNING,
+    "recovery",
+    _BASE_FIELDS,
+    "Reclaim targets a run that is no longer running.",
+    "Read the current result before retrying recovery.",
+)
+LEASE_FRESH = Code(
+    "lease_fresh",
+    logging.WARNING,
+    "recovery",
+    _BASE_FIELDS,
+    "Reclaim targets a run whose lease has not expired.",
+    "Sweep stale leases before attempting reclaim.",
+)
+ALREADY_RECLAIMED = Code(
+    "already_reclaimed",
+    logging.WARNING,
+    "recovery",
+    _BASE_FIELDS,
+    "Another caller already claimed the recovery generation.",
+    "Use the winning worker and avoid duplicate recovery.",
+)
+AGENT_MISMATCH = Code(
+    "agent_mismatch",
+    logging.WARNING,
+    "recovery",
+    _BASE_FIELDS,
+    "The recovery agent differs from the saved agent.",
+    "Recreate the original agent configuration.",
+)
+SKILL_MISMATCH = Code(
+    "skill_mismatch",
+    logging.WARNING,
+    "recovery",
+    _BASE_FIELDS,
+    "Recovery skill pins differ from the saved pins.",
+    "Restore the pinned skill versions before retrying.",
+)
+LOOP_UNSUPPORTED = Code(
+    "loop_unsupported",
+    logging.WARNING,
+    "recovery",
+    _BASE_FIELDS,
+    "The saved loop does not support recovery.",
+    "Use a supported loop for new recoverable runs.",
+)
+RECOVERY_CALL_MISSING = Code(
+    "recovery_call_missing",
+    logging.WARNING,
+    "recovery",
+    _BASE_FIELDS,
+    "Recovery cannot locate a checkpointed tool call.",
+    "Inspect durable tool rows before restarting the run.",
+)
+RECOVERY_STATE_MISSING = Code(
+    "recovery_state_missing",
+    logging.WARNING,
+    "recovery",
+    _BASE_FIELDS,
+    "Recovery cannot locate required checkpoint state.",
+    "Inspect checkpoint persistence before restarting the run.",
+)
+RECOVERY_STATE_INVALID = Code(
+    "recovery_state_invalid",
+    logging.WARNING,
+    "recovery",
+    _BASE_FIELDS,
+    "Recovery cannot rebuild the saved checkpoint.",
+    "Inspect checkpoint compatibility and start a new run if necessary.",
+)
+NEVER_STARTED = Code(
+    "never_started",
+    logging.WARNING,
+    "recovery",
+    _BASE_FIELDS,
+    "Sweep finalizes a stale run that never started.",
+    "Inspect worker startup and retry with a new run.",
+)
+RUN_FINALIZED = Code(
+    "run_finalized",
+    logging.WARNING,
+    "recovery",
+    _BASE_FIELDS,
+    "Recovery finalizes a run instead of continuing it.",
+    "Read the final status and its recovery reason.",
+)
+RUN_NOT_FOUND = Code(
+    "run_not_found",
+    logging.WARNING,
+    "recovery",
+    _BASE_FIELDS,
+    "Recovery cannot find a run in the tenant scope.",
+    "Verify the run identifier and tenant scope.",
+)
+TOOL_REPLAYED = Code(
+    "tool_replayed",
+    logging.WARNING,
+    "recovery",
+    _BASE_FIELDS,
+    "Recovery replays an interrupted idempotent tool.",
+    "Monitor repeated worker crashes and tool idempotence.",
+)
+
 REGISTRY = MappingProxyType(
     {
         code.name: code
         for code in (
+            LEGACY_RUN,
+            NOT_RUNNING,
+            LEASE_FRESH,
+            ALREADY_RECLAIMED,
+            AGENT_MISMATCH,
+            SKILL_MISMATCH,
+            LOOP_UNSUPPORTED,
+            RECOVERY_CALL_MISSING,
+            RECOVERY_STATE_MISSING,
+            RECOVERY_STATE_INVALID,
+            NEVER_STARTED,
+            RUN_FINALIZED,
+            RUN_NOT_FOUND,
+            TOOL_REPLAYED,
+            TIMEOUT_ERROR,
             RESPONSE_ENCODING_UNSUPPORTED,
             AUTH,
             CREDITS,
@@ -1556,10 +1698,19 @@ REGISTRY = MappingProxyType(
 
 
 def _valid_field(name: str, value: Any) -> bool:
-    if name == "run_id" or name in {"call_id", "tool_call_id", "pause_id", "trace_id", "event_id"}:
+    if name in {"run_id", "pause_id", "event_id", "row_id"}:
         return isinstance(value, str) and _ULID.fullmatch(value) is not None
+    if name in {"call_id", "tool_call_id"}:
+        return isinstance(value, str) and _PROVIDER_ID.fullmatch(value) is not None
+    if name in {"trace_id", "span_id"}:
+        shape = _TRACE_ID if name == "trace_id" else _SPAN_ID
+        return isinstance(value, str) and shape.fullmatch(value) is not None and int(value, 16) != 0
     if name == "tenant_id":
-        return isinstance(value, str) and _TENANT.fullmatch(value) is not None
+        return (
+            isinstance(value, str)
+            and 1 <= len(value) <= 256
+            and all(unicodedata.category(char) != "Cc" for char in value)
+        )
     if name in _NUMBERS:
         return type(value) in (int, float) and (type(value) is int or math.isfinite(value))
     if name in {"retryable", "truncated"}:
@@ -1577,17 +1728,20 @@ def log_code(
 ) -> None:
     """Emit a registered code, refusing undeclared or unsafe field values.
 
-    Tests raise on invalid fields. Production drops them and emits one bounded
-    diagnostic containing only the number dropped, never names or values.
-    Tenant identifiers are opaque tokens; other text fields use closed enums.
+    DENDRUX_STRICT_LOG_FIELDS=1 raises on invalid fields. Otherwise they are
+    dropped with one bounded diagnostic containing only a count, never values.
+    Provider names outside the built-ins become custom. Other text uses closed
+    enums, except tenant identifiers. An unregistered Code always raises.
     """
-    if REGISTRY.get(code.name) != code:
+    if REGISTRY.get(code.name) is not code:
         raise ValueError("Unregistered log code")
     supplied = dict(fields)
     if run_id is not None:
         supplied["run_id"] = run_id
     if tenant_id is not None:
         supplied["tenant_id"] = tenant_id
+    if isinstance(supplied.get("provider"), str) and supplied["provider"] not in _ENUMS["provider"]:
+        supplied["provider"] = "custom"
     safe = {
         name: value
         for name, value in supplied.items()
@@ -1595,7 +1749,7 @@ def log_code(
     }
     dropped = len(supplied) - len(safe)
     if dropped:
-        if _STRICT_FIELDS:
+        if os.environ.get("DENDRUX_STRICT_LOG_FIELDS") == "1":
             raise ValueError("Invalid structured log fields")
         diagnostic = {
             "code": LOG_FIELD_DROPPED.name,

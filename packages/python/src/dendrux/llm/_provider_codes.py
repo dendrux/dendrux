@@ -34,6 +34,7 @@ _ANTHROPIC = {
         "rate_limit_error",
         "api_error",
         "overloaded_error",
+        "timeout_error",
     )
 }
 _OPENAI = {

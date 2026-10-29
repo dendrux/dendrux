@@ -222,3 +222,85 @@ async def test_composite_link_hooks_skip_invalid_and_failed_children(tracing, ca
     assert "PRIVATE_COMPOSITE_SENTINEL" not in caplog.text
     assert "PRIVATE_INVALID_LINK_SENTINEL" not in caplog.text
     await notifier.on_run_finished("run", RunResult("run", RunStatus.SUCCESS))
+
+
+async def test_non_provider_failure_keeps_only_own_frame_diagnostics(tracing):
+    notifier, exporter = tracing
+    try:
+        raise RuntimeError("PRIVATE_FRAME_SENTINEL")
+    except RuntimeError as error:
+        await notifier.on_run_started("run")
+        await notifier.on_run_failed("run", error)
+    (span,) = exporter.get_finished_spans()
+    (event,) = span.events
+    assert event.attributes["exception.type"] == "RuntimeError"
+    stack = event.attributes["exception.stacktrace"]
+    assert "test_non_provider_failure_keeps_only_own_frame_diagnostics" in stack
+    assert __file__ in stack and "line " in stack
+    assert "raise RuntimeError" not in stack
+    assert "PRIVATE_FRAME_SENTINEL" not in repr(span.events)
+    assert span.status.description is None
+
+
+async def test_failed_tool_keeps_safe_completion_frames(tracing):
+    notifier, exporter = tracing
+    await notifier.on_run_started("run")
+    tool = ToolCall("work", params={"private": "PRIVATE_TOOL_FRAME_SENTINEL"})
+    await notifier.on_tool_started("run", tool, 1)
+    await notifier.on_tool_completed(
+        "run",
+        tool,
+        ToolResult(
+            "work",
+            tool.id,
+            "PRIVATE_TOOL_FRAME_SENTINEL",
+            success=False,
+            error="PRIVATE_TOOL_FRAME_SENTINEL",
+        ),
+        1,
+    )
+    (span,) = exporter.get_finished_spans()
+    (event,) = span.events
+    # ToolResult carries no original exception/traceback. Diagnose the completion site.
+    assert event.attributes["exception.type"] == "ToolResult"
+    assert "on_tool_completed" in event.attributes["exception.stacktrace"]
+    assert "PRIVATE_TOOL_FRAME_SENTINEL" not in repr(span.events) + repr(span.attributes)
+
+
+@pytest.mark.parametrize("stored", [False, True])
+async def test_stored_raw_provider_code_is_mapped_at_span_boundary(tracing, stored):
+    from dendrux.types import ErrorInfo
+
+    notifier, exporter = tracing
+    raw = "PRIVATE_STORED_CODE_SENTINEL"
+    data = dict(
+        category="timeout",
+        retryable=True,
+        provider="anthropic",
+        provider_code=raw,
+        safe_message=f"anthropic timeout (HTTP 504, code {raw})",
+    )
+    info = ErrorInfo.from_dict(data) if stored else ErrorInfo(**data)
+    await notifier.on_run_started("run")
+    await notifier.on_run_finished("run", RunResult("run", RunStatus.ERROR, error_info=info))
+    (span,) = exporter.get_finished_spans()
+    assert span.attributes["dendrux.error.provider_code"] == "provider_unknown"
+    assert span.events[0].attributes["dendrux.error.provider_code"] == "provider_unknown"
+    assert raw not in repr(span.attributes) + repr(span.events) + repr(span.status.description)
+    assert info.provider_code == raw  # Export projection must not rewrite stored input.
+
+
+async def test_composite_start_failure_retains_safe_exception_diagnostics(caplog):
+    from dendrux.loops.base import BaseNotifier
+    from dendrux.notifiers.composite import CompositeNotifier
+
+    class Broken(BaseNotifier):
+        async def on_run_started(self, run_id, **kwargs):
+            raise RuntimeError("PRIVATE_NOTIFIER_SENTINEL")
+
+    await CompositeNotifier([Broken()]).on_run_started("run")
+    (record,) = caplog.records
+    assert record.exc_info is not None
+    assert "RuntimeError" in caplog.text and "on_run_started" in caplog.text
+    assert "line " in caplog.text  # frame diagnostics, without source or locals
+    assert "PRIVATE_NOTIFIER_SENTINEL" not in caplog.text

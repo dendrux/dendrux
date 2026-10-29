@@ -208,7 +208,7 @@ def test_log_code_emits_base_and_declared_fields(caplog):
         {"attempt": True},
         {"attempt": float("inf")},
         {"run_id": "SECRET_SENTINEL"},
-        {"tenant_id": "not an identifier"},
+        {"tenant_id": "PRIVATE_TENANT_SENTINEL\n"},
         {"category": "SECRET_SENTINEL"},
         {"call_id": "SECRET_SENTINEL"},
     ],
@@ -224,7 +224,7 @@ def test_invalid_fields_raise_without_echoing_values(fields):
 
 def test_production_drops_bad_fields_with_one_safe_diagnostic(monkeypatch, caplog):
     module = registry_module()
-    monkeypatch.setattr(module, "_STRICT_FIELDS", False)
+    monkeypatch.delenv("DENDRUX_STRICT_LOG_FIELDS", raising=False)
     module.log_code(
         logging.getLogger("dendrux.test"),
         module.REGISTRY["lease_renew_failed"],
@@ -299,3 +299,152 @@ def test_field_enums_cover_existing_public_closed_types():
     assert set(get_args(TimeoutReason)) == module._ENUMS["timeout_reason"]
     assert set(get_args(EntryPoint)) <= module._ENUMS["entry"]
     assert module._valid_field("reason", "governance_changed")
+
+
+@pytest.mark.parametrize("strict", [None, "0", "1"])
+def test_strict_fields_are_explicit_and_not_inferred_from_pytest(monkeypatch, caplog, strict):
+    module = registry_module()
+    if strict is None:
+        monkeypatch.delenv("DENDRUX_STRICT_LOG_FIELDS", raising=False)
+    else:
+        monkeypatch.setenv("DENDRUX_STRICT_LOG_FIELDS", strict)
+    logger = logging.getLogger("dendrux.test")
+    if strict == "1":
+        with pytest.raises(ValueError):
+            module.log_code(logger, module.LEASE_RENEW_FAILED, attempt="PRIVATE_SENTINEL")
+        assert not caplog.records
+    else:
+        module.log_code(logger, module.LEASE_RENEW_FAILED, attempt="PRIVATE_SENTINEL")
+        assert [r.code for r in caplog.records] == ["log_field_dropped", "lease_renew_failed"]
+        assert "PRIVATE_SENTINEL" not in repr([r.__dict__ for r in caplog.records])
+
+
+def test_custom_provider_is_a_fixed_token_in_strict_mode(monkeypatch, caplog):
+    module = registry_module()
+    monkeypatch.setenv("DENDRUX_STRICT_LOG_FIELDS", "1")
+    module.log_code(
+        logging.getLogger("dendrux.test"),
+        module.PROVIDER_UNKNOWN,
+        provider="PRIVATE_PROVIDER_SENTINEL",
+    )
+    (record,) = caplog.records
+    assert record.provider == "custom"
+    assert "PRIVATE_PROVIDER_SENTINEL" not in repr(record.__dict__)
+
+
+@pytest.mark.parametrize("tenant", ["acme.com", "org:7", "ops@example.test", "équipe", "x" * 256])
+def test_runtime_tenant_identifiers_are_preserved(tenant, caplog):
+    module = registry_module()
+    module.log_code(
+        logging.getLogger("dendrux.test"),
+        module.LEASE_RENEW_FAILED,
+        run_id=RUN_ID,
+        tenant_id=tenant,
+        attempt=3,
+    )
+    (record,) = caplog.records
+    assert record.tenant_id == tenant
+
+
+@pytest.mark.parametrize("tenant", ["", "x" * 257, "tenant\n", "tenant\x7f", "tenant\x85", 7])
+def test_invalid_tenant_drops_only_that_field(monkeypatch, caplog, tenant):
+    module = registry_module()
+    monkeypatch.delenv("DENDRUX_STRICT_LOG_FIELDS", raising=False)
+    module.log_code(
+        logging.getLogger("dendrux.test"),
+        module.LEASE_RENEW_FAILED,
+        run_id=RUN_ID,
+        tenant_id=tenant,
+        attempt=3,
+    )
+    diagnostic, record = caplog.records
+    assert diagnostic.code == "log_field_dropped" and diagnostic.count == 1
+    assert "tenant_id" not in record.__dict__
+    assert record.attempt == 3 and record.run_id == diagnostic.run_id == RUN_ID
+
+
+@pytest.mark.parametrize(
+    "name,value",
+    [
+        ("call_id", "toolu_01.A:b-c"),
+        ("tool_call_id", "call_abc"),
+        ("call_id", "a" * 128),
+        ("trace_id", "a" * 32),
+        ("span_id", "b" * 16),
+        ("run_id", RUN_ID),
+        ("event_id", RUN_ID),
+        ("row_id", RUN_ID),
+        ("pause_id", RUN_ID),
+    ],
+)
+def test_identifiers_validate_their_issuer_shape(name, value):
+    assert registry_module()._valid_field(name, value)
+
+
+@pytest.mark.parametrize(
+    "name,value",
+    [
+        ("call_id", "a" * 129),
+        ("tool_call_id", "has space"),
+        ("call_id", "private\n"),
+        ("trace_id", RUN_ID),
+        ("trace_id", "g" * 32),
+        ("trace_id", "a" * 31),
+        ("span_id", "a" * 32),
+        ("row_id", "call_abc"),
+        ("event_id", "a" * 32),
+    ],
+)
+def test_identifiers_reject_other_issuer_shapes(name, value):
+    assert not registry_module()._valid_field(name, value)
+
+
+@pytest.mark.parametrize("strict", [True, False])
+@pytest.mark.parametrize("name,value", [("limit", 5), ("status", 429)])
+def test_valid_but_undeclared_fields_are_rejected(monkeypatch, caplog, strict, name, value):
+    module = registry_module()
+    assert module._valid_field(name, value)
+    assert any(name in code.fields for code in module.REGISTRY.values())
+    assert name not in module.LEASE_RENEW_FAILED.fields
+    monkeypatch.setenv("DENDRUX_STRICT_LOG_FIELDS", "1" if strict else "0")
+    logger = logging.getLogger("dendrux.test")
+    if strict:
+        with pytest.raises(ValueError):
+            module.log_code(logger, module.LEASE_RENEW_FAILED, attempt=3, **{name: value})
+        assert not caplog.records
+    else:
+        module.log_code(logger, module.LEASE_RENEW_FAILED, attempt=3, **{name: value})
+        diagnostic, record = caplog.records
+        assert diagnostic.code == "log_field_dropped" and diagnostic.count == 1
+        assert name not in record.__dict__ and record.attempt == 3
+
+
+def test_registry_membership_uses_constant_time_identity(monkeypatch, caplog):
+    module = registry_module()
+
+    def no_equality(self, other):
+        raise AssertionError("registry membership must not compare metadata")
+
+    monkeypatch.setattr(module.Code, "__eq__", no_equality)
+    module.log_code(logging.getLogger("dendrux.test"), module.LEASE_RENEW_FAILED, attempt=3)
+    assert caplog.records[-1].attempt == 3
+
+
+def test_post_rebase_recovery_dynamic_codes_are_registered():
+    names = {
+        "legacy_run",
+        "not_running",
+        "lease_fresh",
+        "already_reclaimed",
+        "agent_mismatch",
+        "skill_mismatch",
+        "loop_unsupported",
+        "recovery_call_missing",
+        "recovery_state_missing",
+        "recovery_state_invalid",
+        "never_started",
+        "run_finalized",
+        "run_not_found",
+        "tool_replayed",
+    }
+    assert names <= registry_module().REGISTRY.keys()

@@ -29,9 +29,13 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
+import traceback
+from itertools import islice
 from typing import TYPE_CHECKING, Any
 
 from dendrux.errors import provider_error_in
+from dendrux.llm._provider_codes import map_provider_code
 from dendrux.loops.base import BaseNotifier
 from dendrux.runtime._tracelink import validate_trace_link
 from dendrux.types import ErrorInfo
@@ -186,12 +190,10 @@ class OpenTelemetryNotifier(BaseNotifier):
             return
         try:
             span.set_attribute("dendrux.run.status", result.status.value)
+            description = None
             if result.error_info is not None:
-                _set_error_info(span, result.error_info)
+                description = _set_error_info(span, result.error_info)
             if result.status.value in {"error", "max_iterations", "cancelled"}:
-                description = (
-                    result.error_info.safe_message if result.error_info is not None else None
-                )
                 span.set_status(Status(StatusCode.ERROR, description))
             else:
                 span.set_status(Status(StatusCode.OK))
@@ -375,6 +377,13 @@ class OpenTelemetryNotifier(BaseNotifier):
                 span.set_status(Status(StatusCode.OK))
             else:
                 span.set_status(Status(StatusCode.ERROR))
+                span.add_event(
+                    "exception",
+                    attributes={
+                        "exception.type": type(tool_result).__name__,
+                        "exception.stacktrace": _frame_stack(traceback.walk_stack(sys._getframe())),
+                    },
+                )
             span.end()
         except Exception as exc:  # noqa: BLE001 - fail open
             _LOG.warning("OpenTelemetryNotifier.on_tool_completed failed: %s", type(exc).__name__)
@@ -516,20 +525,43 @@ def _image_family(model: str | None) -> str | None:
     return None
 
 
-def _set_error_info(span: Any, info: ErrorInfo) -> None:
+def _set_error_info(span: Any, info: ErrorInfo) -> str:
+    projected = info.to_dict()
+    mapped = map_provider_code(info.provider, info.provider_code)
+    projected["provider_code"] = mapped
+    if mapped != info.provider_code:
+        status = info.status_code if info.status_code is not None else "n/a"
+        projected["safe_message"] = (
+            f"{info.provider or 'provider'} {info.category} (HTTP {status}, code {mapped or 'n/a'})"
+        )
     fields = {
-        f"dendrux.error.{key}": value for key, value in info.to_dict().items() if value is not None
+        f"dendrux.error.{key}": value for key, value in projected.items() if value is not None
     }
     for key, value in fields.items():
         span.set_attribute(key, value)
     span.add_event("provider.error", attributes=fields)
-    span.set_status(Status(StatusCode.ERROR, info.safe_message))
+    span.set_status(Status(StatusCode.ERROR, projected["safe_message"]))
+    return str(projected["safe_message"])
 
 
 def _set_span_error(span: Any, error: BaseException) -> None:
     provider_error = provider_error_in(error)
     if provider_error is not None:
         _set_error_info(span, ErrorInfo.from_error(provider_error))
-    else:
-        span.add_event("exception", attributes={"exception.type": type(error).__name__})
+    if provider_error is not error:
+        span.add_event(
+            "exception",
+            attributes={
+                "exception.type": type(error).__name__,
+                "exception.stacktrace": _frame_stack(traceback.walk_tb(error.__traceback__)),
+            },
+        )
+    if provider_error is None:
         span.set_status(Status(StatusCode.ERROR))
+
+
+def _frame_stack(frames: Any) -> str:
+    return "".join(
+        f"  File {frame.f_code.co_filename!r}, line {line}, in {frame.f_code.co_name}\n"
+        for frame, line in islice(frames, 32)
+    )

@@ -1000,6 +1000,7 @@ class ContextLengthExceededError(ProviderError):
 
     def __reduce__(self) -> tuple[object, tuple[object, ...]]:
         kwargs = {name: getattr(self, name) for name in self._init_fields if name != "message"}
+        kwargs["provider_code"] = self.provider_code_raw
         return (_rebuild_context_length_error, (type(self), self.message, kwargs))
 
 

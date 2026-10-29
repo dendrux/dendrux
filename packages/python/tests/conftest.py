@@ -14,6 +14,8 @@ from tests._helpers.xdist_pg import worker_scoped_pg_url
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
+os.environ["DENDRUX_STRICT_LOG_FIELDS"] = "1"
+
 _PG_URL_ENV = "DENDRUX_TEST_PG_URL"
 
 

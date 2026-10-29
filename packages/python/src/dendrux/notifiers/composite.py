@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import inspect
 import logging
+import traceback
+from itertools import islice
 from typing import TYPE_CHECKING, Any
 
 from dendrux.errors import safe_exception_info
@@ -75,7 +77,16 @@ class CompositeNotifier(BaseNotifier):
                     kwargs["trace_link"] = trace_link
                 await notifier.on_run_started(run_id, **kwargs)
             except Exception as exc:
-                logger.warning("CompositeNotifier.on_run_started failed: %s", type(exc).__name__)
+                frames = "".join(
+                    f"  File {frame.f_code.co_filename!r}, line {line}, in {frame.f_code.co_name}\n"
+                    for frame, line in islice(traceback.walk_tb(exc.__traceback__), 32)
+                )
+                diagnostic = RuntimeError(f"{type(exc).__name__}\n{frames}")
+                logger.warning(
+                    "CompositeNotifier.on_run_started failed: %s",
+                    type(exc).__name__,
+                    exc_info=(RuntimeError, diagnostic, None),
+                )
 
     async def on_run_finished(self, run_id: str, result: RunResult) -> None:
         for notifier in self._notifiers:

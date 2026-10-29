@@ -161,7 +161,12 @@ async def test_wrapped_provider_error_span_has_only_own_stack():
     assert event.attributes["dendrux.error.safe_message"] == error.safe_message
     assert span.status.description == error.safe_message
     assert "dendrux.error.provider_code" not in event.attributes
-    assert "exception.stacktrace" not in event.attributes
+    diagnostic = next(e for e in span.events if e.name == "exception")
+    assert diagnostic.attributes["exception.type"] == "TypeError"
+    stack = diagnostic.attributes["exception.stacktrace"]
+    assert "test_wrapped_provider_error_span_has_only_own_stack" in stack
+    assert __file__ in stack and "line " in stack
+    assert "raise TypeError" not in stack and "raise error" not in stack
     assert "secondary span bug" not in serialized
     provider.shutdown()
 

@@ -234,31 +234,67 @@ def test_transport_self_raised_codes_are_stable_and_registered(provider, code):
     assert code in registry
 
 
+def self_raised_literals(source):
+    tree = ast.parse(source)
+    parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+    found = set()
+
+    def literals(value, bindings, seen=frozenset()):
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            return {value.value}
+        if isinstance(value, ast.Name) and value.id not in seen:
+            return set().union(
+                *(literals(v, bindings, seen | {value.id}) for v in bindings.get(value.id, []))
+            )
+        if isinstance(value, ast.IfExp):
+            return literals(value.body, bindings, seen) | literals(value.orelse, bindings, seen)
+        if isinstance(value, ast.BoolOp):
+            return set().union(*(literals(v, bindings, seen) for v in value.values))
+        return set()
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        values = [kw.value for kw in node.keywords if kw.arg == "provider_code"]
+        if isinstance(node.func, ast.Attribute) and node.func.attr == "_reject":
+            values += node.args[:1]
+        if isinstance(node.func, ast.Name) and node.func.id in {
+            "content_filter_error",
+            "refusal_error",
+        }:
+            values += [kw.value for kw in node.keywords if kw.arg == "code"]
+        scope = node
+        while scope in parents and not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            scope = parents[scope]
+        bindings = {}
+        for statement in ast.walk(scope):
+            if isinstance(statement, ast.Assign):
+                for target in statement.targets:
+                    if isinstance(target, ast.Name):
+                        bindings.setdefault(target.id, []).append(statement.value)
+        for value in values:
+            found.update(literals(value, bindings))
+    return found
+
+
 def test_new_self_raised_provider_codes_require_registration():
     module = mapper_module()
     root = Path(__file__).parents[2] / "src/dendrux/llm"
-    found = set()
-    for path in root.rglob("*.py"):
-        tree = ast.parse(path.read_text())
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            values = [kw.value for kw in node.keywords if kw.arg == "provider_code"]
-            if isinstance(node.func, ast.Attribute) and node.func.attr == "_reject":
-                values += node.args[:1]
-            if isinstance(node.func, ast.Name) and node.func.id in {
-                "content_filter_error",
-                "refusal_error",
-            }:
-                values += [kw.value for kw in node.keywords if kw.arg == "code"]
-            for value in values:
-                found.update(
-                    n.value
-                    for n in ast.walk(value)
-                    if isinstance(n, ast.Constant) and isinstance(n.value, str)
-                )
+    found = set().union(*(self_raised_literals(p.read_text()) for p in root.rglob("*.py")))
     assert {"empty_completion", "stream_size_limit", "stream_tool_call_limit"} <= found
+    assert {"response_size_limit", "response_encoding_unsupported"} <= found
     assert found <= module.SELF_RAISED_CODES, sorted(found - module.SELF_RAISED_CODES)
+
+
+def test_self_raised_scan_follows_local_variable_codes():
+    source = (
+        "def fail(streaming):\n"
+        '    code = "new_unknown_code" if streaming else "response_size_limit"\n'
+        "    raise ProviderResponseError(provider_code=code)\n"
+    )
+    found = self_raised_literals(source)
+    assert found == {"new_unknown_code", "response_size_limit"}
+    assert found - mapper_module().SELF_RAISED_CODES == {"new_unknown_code"}
 
 
 def test_classification_still_reads_raw_vendor_fields():
@@ -306,3 +342,29 @@ def test_vendor_message_is_absent_from_mcp_transport_detail_and_debug_log(caplog
     with caplog.at_level(logging.DEBUG):
         error = adapter._safe_error("connect", RuntimeError(SENTINEL))
     assert SENTINEL not in error.transport_detail + caplog.text
+
+
+def test_anthropic_timeout_code_keeps_resolution_and_is_registered():
+    module = mapper_module()
+    assert module.map_provider_code("anthropic", "timeout_error") == "timeout_error"
+    from dendrux._codes import REGISTRY
+
+    assert REGISTRY["timeout_error"].kind == "provider"
+
+
+@pytest.mark.parametrize("clone", ["copy", "deepcopy", "pickle"])
+def test_context_length_copy_keeps_private_raw_code(clone):
+    import copy
+    import pickle
+
+    from dendrux.errors import ContextLengthExceededError
+
+    error = ContextLengthExceededError(
+        "request exceeds context", provider="openai", provider_code=SENTINEL
+    )
+    restored = (
+        pickle.loads(pickle.dumps(error)) if clone == "pickle" else getattr(copy, clone)(error)
+    )
+    assert restored.provider_code_raw == SENTINEL
+    assert restored.provider_code == restored.safe_provider_code == "provider_unknown"
+    assert SENTINEL not in restored.safe_message
