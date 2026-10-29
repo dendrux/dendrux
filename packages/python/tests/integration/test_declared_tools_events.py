@@ -90,12 +90,15 @@ async def test_declared_tools_event_once_per_segment_excludes_mcp_and_model_name
         await agent.close()
 
 
-async def test_declaration_write_has_constant_database_cost(store, engine):
+@pytest.mark.parametrize("notify_enabled", [True, False])
+async def test_declaration_write_has_constant_database_cost(store, engine, notify_enabled):
     from sqlalchemy import event
 
     from dendrux.runtime.persistence import PersistenceRecorder
     from dendrux.runtime.runner import _emit_declared_tools
 
+    if not notify_enabled:
+        store.notify_channel = None
     await store.create_run("declaration-cost", "declared")
     agent = Agent(prompt="p", tools=[z_server, a_client])
     statements = []
@@ -111,8 +114,12 @@ async def test_declaration_write_has_constant_database_cost(store, engine):
     finally:
         event.remove(engine.sync_engine, "before_cursor_execute", capture)
         await agent.close()
-    expected = 2  # leading fence UPDATE plus event INSERT on both backends
+    notify_count = (
+        1 if engine.dialect.name == "postgresql" and store.notify_channel is not None else 0
+    )
+    expected = 2 + notify_count  # fence UPDATE, event INSERT, optional transactional NOTIFY
     assert len(statements) == expected, statements
+    assert sum("pg_notify" in sql for sql in statements) == notify_count
     assert statements[0].startswith("UPDATE agent_runs")
     assert sum("INSERT INTO run_events" in sql for sql in statements) == 1
     assert all("react_traces" not in sql and "llm_interactions" not in sql for sql in statements)

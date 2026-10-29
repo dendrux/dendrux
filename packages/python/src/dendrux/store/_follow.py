@@ -14,7 +14,8 @@ the last one leaves. Slow cancellation remains tracked until the task finishes.
 Budget about one
 query per second per watched run, and give a busy feed its own small engine
 (``RunStore.from_database_url(...)``) so viewers cannot starve the agents'
-pool. Push (Postgres LISTEN/NOTIFY) is planned for 0.6.
+pool. An optional notifier reduces idle polling to reconciliation every
+30 seconds while healthy, falling back to ``poll_interval_s`` on loss.
 
 Never tie a run's lifetime to a client connection: follow the database log
 (this module) rather than piping ``agent.stream()`` to a browser, where a
@@ -26,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import math
 from collections import deque
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, TypeAlias, Union
@@ -71,6 +73,7 @@ from dendrux.store._redact import (
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
+    from dendrux.db._notify import EventNotifier, NotifierState
     from dendrux.runtime.state import TenantScope
     from dendrux.store import RunStore, StoredEvent
 
@@ -314,6 +317,24 @@ class _RunFeed:
         )
 
     async def _poll(self) -> None:
+        notifier = self.owner.notifier
+        context = notifier.subscribe(self.run_id) if notifier else contextlib.nullcontext(None)
+        try:
+            async with context as subscription:
+                if subscription is not None:
+                    pending = self._poll_wake.is_set()
+                    self._poll_wake = subscription.event
+                    if pending:
+                        self._poll_wake.set()
+                await self._poll_loop(subscription.state if subscription else None)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _codes.log_code(logger, _codes.FOLLOW_FEED_ERROR, run_id=self.run_id)
+            for follower in list(self.followers):
+                follower.end("error")
+
+    async def _poll_loop(self, state: NotifierState | None) -> None:
         owner = self.owner
         delay = owner.poll_interval_s
         idle_polls = 0
@@ -352,6 +373,8 @@ class _RunFeed:
                             if follower.until_terminal:
                                 follower.end("terminal")
                         continue
+                if state is not None:
+                    delay = owner.poll_healthy_s if state.healthy else owner.poll_interval_s
                 with contextlib.suppress(TimeoutError):
                     async with asyncio.timeout(delay):
                         await self._poll_wake.wait()
@@ -387,6 +410,10 @@ class EventFeed:
             a larger number) to its own ``EventFeed(store, ...)``.
         poll_interval_s / poll_max_s: idle polling starts at the first and
             doubles up to the second; a new event resets it.
+        notifier: Borrowed wake-up hints, defaulting to the store's notifier.
+            The caller owns its lifecycle.
+        poll_healthy_s: Reconciliation interval while the notifier is healthy.
+            Degraded notifiers use ``poll_interval_s`` without backoff.
         heartbeat_s: idle time before a :class:`FollowHeartbeat` is yielded.
         buffer: events buffered per follower before it ends as ``"lagging"``.
     """
@@ -404,6 +431,8 @@ class EventFeed:
         status_every: int = 4,
         batch: int = 100,
         stop_timeout_s: float = 5.0,
+        notifier: EventNotifier | None = None,
+        poll_healthy_s: float = 30.0,
     ) -> None:
         if isinstance(max_followers, bool) or not isinstance(max_followers, int):
             raise ValueError("max_followers must be a positive int.")
@@ -412,7 +441,11 @@ class EventFeed:
         tenant_cap = _tenant_cap(max_followers, max_followers_per_tenant)
         if not 0 < poll_interval_s <= poll_max_s or heartbeat_s <= 0:
             raise ValueError("poll intervals and heartbeat_s must be positive (interval <= max).")
+        if not math.isfinite(poll_healthy_s) or poll_healthy_s <= 0:
+            raise ValueError("poll_healthy_s must be finite and positive.")
         self.store = store
+        self.notifier = notifier if notifier is not None else getattr(store, "_notifier", None)
+        self.poll_healthy_s = poll_healthy_s
         self.max_followers = max_followers
         self.max_followers_per_tenant = tenant_cap
         self.poll_interval_s = poll_interval_s
@@ -617,6 +650,9 @@ class Follow:
             if self._started:
                 return
             self._raise_if_closed()
+            start_notifier = getattr(self._owner.store, "_start_owned_notifier", None)
+            if start_notifier is not None:
+                await start_notifier()
             await self._check_run()
             self._raise_if_closed()  # closed while waiting on the store: take no slot
             # No await from here to the slot: aclose() cannot interleave.

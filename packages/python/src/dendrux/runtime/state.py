@@ -4194,6 +4194,17 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
 
     async def _after_event_insert(self, session: AsyncSession, run_id: str) -> None:
         """Transactional notifier seam; the notifier track supplies its implementation."""
+        if (
+            self.notify_channel is not None
+            and session.bind is not None
+            and session.bind.dialect.name == "postgresql"
+        ):
+            from sqlalchemy import text
+
+            await session.execute(
+                text("SELECT pg_notify(:channel, :run_id)"),
+                {"channel": self.notify_channel, "run_id": run_id},
+            )
 
     async def save_run_event(
         self,

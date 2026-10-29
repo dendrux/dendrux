@@ -38,6 +38,7 @@ Example
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import functools
 import inspect
@@ -104,6 +105,7 @@ from dendrux.store._follow import (
 from dendrux.store._follow import (
     approval_calls as approval_calls,
 )
+from dendrux.store._notifier_pg import PostgresEventNotifier
 from dendrux.store._redact import (
     PAUSE_VIEW_EVENTS,
     PastParams,
@@ -126,6 +128,7 @@ if TYPE_CHECKING:
 
     from sqlalchemy.ext.asyncio import AsyncEngine
 
+    from dendrux.db._notify import EventNotifier
     from dendrux.media import BlobStore
 
 
@@ -452,11 +455,22 @@ class RunStore:
         self._owned_engine: AsyncEngine | None = None
         self._blob_services = BlobServices.for_state_store(state_store, blob_store=blob_store)
         self._event_feed: EventFeed | None = None
+        self._notifier: EventNotifier | None = None
+        self._owned_notifier: EventNotifier | None = None
+        self._notifier_started = False
 
     @classmethod
-    def from_engine(cls, engine: AsyncEngine, *, blob_store: BlobStore | None = None) -> RunStore:
-        """Build a RunStore over an engine the caller owns and disposes."""
-        return cls(SQLAlchemyStateStore(engine), blob_store=blob_store)
+    def from_engine(
+        cls,
+        engine: AsyncEngine,
+        *,
+        blob_store: BlobStore | None = None,
+        notifier: EventNotifier | None = None,
+    ) -> RunStore:
+        """Borrow the engine and optional notifier; the caller owns both lifecycles."""
+        instance = cls(SQLAlchemyStateStore(engine), blob_store=blob_store)
+        instance._notifier = notifier
+        return instance
 
     @classmethod
     def from_database_url(
@@ -465,6 +479,8 @@ class RunStore:
         *,
         blob_store: BlobStore | None = None,
         database_options: dict[str, Any] | None = None,
+        notifier: EventNotifier | None = None,
+        listen_url: str | None = None,
     ) -> RunStore:
         """Build a RunStore from a SQLAlchemy async URL.
 
@@ -474,20 +490,36 @@ class RunStore:
         query (see the class docstring); an older file that cannot be
         upgraded raises :class:`~dendrux.errors.SqliteSchemaSyncError` from
         that first call.
+
+        ``notifier`` is borrowed; the caller starts and stops it. Alternatively,
+        ``listen_url`` creates an owned PostgreSQL notifier, started on async
+        context entry or first follow/stream and stopped by ``close``. It must be a
+        direct or session-pooled endpoint, even when ``database_url`` uses
+        PgBouncer transaction pooling. The two options are mutually exclusive.
         """
         from sqlalchemy.ext.asyncio import create_async_engine
 
-        from dendrux.db._engine_options import engine_options, normalized_url
+        from dendrux.db._engine_options import (
+            engine_options,
+            normalized_url,
+            split_database_options,
+        )
 
+        if notifier is not None and listen_url is not None:
+            raise ValueError("Pass either notifier or listen_url, not both.")
+        owned_notifier = PostgresEventNotifier(listen_url) if listen_url is not None else None
         parsed = normalized_url(database_url)
-        engine = create_async_engine(parsed, **engine_options(parsed, database_options))
-        store: Any = SQLAlchemyStateStore(engine)
+        options, store_options = split_database_options(database_options)
+        engine = create_async_engine(parsed, **engine_options(parsed, options))
+        store: Any = SQLAlchemyStateStore(engine, **store_options)
         if database_url.startswith("sqlite"):
             store = _InitOnFirstUse(
                 store, functools.partial(create_sqlite_schema, engine), engine.dispose
             )
         instance = cls(store, blob_store=blob_store)
         instance._owned_engine = engine
+        instance._notifier = notifier if notifier is not None else owned_notifier
+        instance._owned_notifier = owned_notifier
         return instance
 
     @property
@@ -537,9 +569,12 @@ class RunStore:
         return await accessor.read(sha256, tenant_id=record.tenant_id)
 
     async def close(self) -> None:
-        """Stop owned event feeds, then dispose only engines this store owns."""
+        """Stop owned feeds/listener, then dispose only engines this store owns."""
         if self._event_feed is not None:
             await self._event_feed.aclose()
+        if self._owned_notifier is not None:
+            await self._owned_notifier.stop()
+            self._owned_notifier = None
         if isinstance(self._state, _InitOnFirstUse):
             self._state.closed = True
         if self._owned_engine is not None:
@@ -547,7 +582,17 @@ class RunStore:
             self._owned_engine = None
 
     async def __aenter__(self) -> RunStore:
+        try:
+            await self._start_owned_notifier()
+        except BaseException:
+            await self.close()
+            raise
         return self
+
+    async def _start_owned_notifier(self) -> None:
+        if self._owned_notifier is not None and not self._notifier_started:
+            await self._owned_notifier.start()
+            self._notifier_started = True
 
     async def __aexit__(self, *exc: Any) -> None:
         await self.close()
@@ -739,6 +784,11 @@ class RunStore:
         decides when to stop — typically by breaking out of ``async for`` on
         a terminal ``event_type`` or by calling ``aclose()`` on the returned
         generator. A run's tenant never changes, so the scope is checked once.
+
+        With a notifier, one subscription is held until close or cancellation,
+        and hints wake the next read immediately. ``poll_interval_s`` still
+        bounds the wait in both healthy and degraded states. The notifier's
+        subscription cap raises ``FollowCapacityError`` before the first yield.
         """
         if isinstance(tenant_id, _OmittedType):
             _warn_stream_events_unscoped()
@@ -749,23 +799,37 @@ class RunStore:
         if run is None:
             raise RunNotFoundError(run_id)
 
-        cursor = after_sequence_index
-        while True:
-            rows = await self._state.get_run_events(
-                run_id,
-                after_sequence_index=cursor,
-                limit=100,
-            )
-            if rows:
-                for row in rows:
-                    event = _event_to_stored(row)
-                    yield event
-                    cursor = event.sequence_index
-                # If the batch was full, there may be more buffered — keep
-                # draining before we sleep.
-                if len(rows) == 100:
-                    continue
-            await asyncio.sleep(poll_interval_s)
+        await self._start_owned_notifier()
+        context = (
+            self._notifier.subscribe(run_id)
+            if self._notifier is not None
+            else contextlib.nullcontext(None)
+        )
+        async with context as subscription:
+            cursor = after_sequence_index
+            while True:
+                if subscription is not None:
+                    subscription.event.clear()
+                rows = await self._state.get_run_events(
+                    run_id,
+                    after_sequence_index=cursor,
+                    limit=100,
+                )
+                if rows:
+                    for row in rows:
+                        event = _event_to_stored(row)
+                        yield event
+                        cursor = event.sequence_index
+                    # If the batch was full, there may be more buffered — keep
+                    # draining before we sleep.
+                    if len(rows) == 100:
+                        continue
+                if subscription is None:
+                    await asyncio.sleep(poll_interval_s)
+                else:
+                    with contextlib.suppress(TimeoutError):
+                        async with asyncio.timeout(poll_interval_s):
+                            await subscription.event.wait()
 
     async def get_llm_calls(
         self,
@@ -1417,6 +1481,7 @@ __all__ = [
     "PausePair",
     "PendingPause",
     "PendingToolCall",
+    "PostgresEventNotifier",
     "RunDetail",
     "RunNote",
     "RunNotFoundError",

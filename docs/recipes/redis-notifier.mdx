@@ -1,0 +1,133 @@
+# Redis wake-up hints
+
+`EventNotifier` is an optional seam. A developer can implement it over Redis
+pub/sub and pass it to `RunStore.from_engine(engine, notifier=notifier)` or
+`RunStore.from_database_url(database_url, notifier=notifier)`. The database
+remains the durable event log; a hint contains only a run id. Publish the run id
+from your application's event writer after its database transaction commits.
+
+> **Example only.** This developer-owned adapter requires `redis` and is not
+> tested in Dendrux CI. Choose authentication, channel isolation and deployment
+> limits for your application. Missed hints are repaired by reconciliation polls.
+
+[//]: # "docs-test: skip - developer-owned Redis adapter; requires Redis and is not tested in CI"
+
+```python
+import asyncio
+from contextlib import asynccontextmanager, suppress
+
+from redis.asyncio import Redis
+
+from dendrux.db._notify import NotifierState, Subscription
+from dendrux.store import FollowCapacityError, RunStore
+
+
+class RedisNotifier:
+    def __init__(self, redis: Redis, channel="run_events", max_subscriptions=10_000):
+        self.redis = redis  # Borrowed; the application closes it.
+        self.channel = channel
+        self.limit = max_subscriptions
+        self.state = NotifierState(healthy=False, generation=0)
+        self.subscriptions = {}
+        self.count = 0
+        self.task = None
+        self.pubsub = None
+
+    def health(self, healthy):
+        if self.state.healthy != healthy:
+            self.state.healthy = healthy
+            self.state.generation += 1
+            for events in self.subscriptions.values():
+                for event in events:
+                    event.set()
+
+    async def start(self):
+        if self.task is not None:
+            return
+        self.pubsub = self.redis.pubsub()
+        try:
+            async with asyncio.timeout(5):
+                await self.pubsub.subscribe(self.channel)
+                # Wait for Redis's subscription acknowledgement.
+                while True:
+                    message = await self.pubsub.get_message(timeout=1)
+                    if message and message["type"] == "subscribe":
+                        break
+        except BaseException:
+            await self.pubsub.aclose()
+            self.pubsub = None
+            raise
+        self.health(True)
+        self.task = asyncio.create_task(self.read())
+
+    async def read(self):
+        try:
+            async for message in self.pubsub.listen():
+                if message["type"] == "message":
+                    run_id = message["data"]
+                    if isinstance(run_id, bytes):
+                        run_id = run_id.decode("utf-8")
+                    for event in self.subscriptions.get(run_id, ()):
+                        event.set()
+        except Exception:
+            # Keep vendor exception text out of logs. The application can
+            # stop/start this adapter under its own reconnect policy.
+            pass
+        finally:
+            self.health(False)
+
+    async def stop(self):
+        self.health(False)
+        for events in self.subscriptions.values():
+            for event in events:
+                event.set()  # Also wake waiters when already degraded.
+        if self.task is not None:
+            self.task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self.task
+            self.task = None
+        if self.pubsub is not None:
+            await self.pubsub.aclose()
+            self.pubsub = None
+
+    @asynccontextmanager
+    async def subscribe(self, run_id):
+        if self.count >= self.limit:
+            raise FollowCapacityError(self.limit)
+        event = asyncio.Event()
+        self.subscriptions.setdefault(run_id, set()).add(event)
+        self.count += 1
+        try:
+            yield Subscription(event, self.state)
+        finally:
+            events = self.subscriptions[run_id]
+            events.remove(event)
+            if not events:
+                del self.subscriptions[run_id]
+            self.count -= 1
+
+
+# The application owns both lifecycles and uses one event loop.
+async def serve(engine, redis, run_id):
+    notifier = RedisNotifier(redis)
+    await notifier.start()
+    try:
+        async with RunStore.from_engine(engine, notifier=notifier) as store:
+            async with store.follow(run_id, tenant_id=None) as follow:
+                async for item in follow:
+                    print(item)
+    finally:
+        await notifier.stop()
+```
+
+Publish with `await redis.publish("run_events", run_id)` after commit. Do not
+publish tool arguments, credentials, event payloads or tenant secrets. A shared
+channel is a trusted infrastructure boundary; `follow` still checks tenant scope
+before delivering database events. Use this adapter from one event loop and let
+your application call `stop()` and `start()` when replacing a failed connection.
+
+For the built-in PostgreSQL adapter, writers can use a transaction-pooled
+`database_url`, while `PostgresEventNotifier(listen_url)` requires a direct or
+session-pooled `listen_url`. PgBouncer transaction mode cannot preserve LISTEN
+session state. Its startup self-test is best effort, so passing it does not
+prove that subsequent notifications will arrive.
