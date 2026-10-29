@@ -48,6 +48,7 @@ from dendrux.errors import (
 )
 from dendrux.llm._helpers import GatewayErrorKind, classify_gateway_error
 from dendrux.llm._retry_telemetry import telemetry_event_hooks
+from dendrux.llm._transport import configure_request, deferred_client_type, guard_response
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine
@@ -114,6 +115,7 @@ class Deadlines:
     stream_total_timeout: float | None
     max_stream_bytes: int = 16 * 1024 * 1024
     max_stream_tool_calls: int = 1000
+    max_response_bytes: int = 16 * 1024 * 1024
 
     @property
     def read_timeout(self) -> float:
@@ -131,6 +133,7 @@ def resolve_deadlines(
     stream_total_timeout: float | None,
     max_stream_bytes: int = 16 * 1024 * 1024,
     max_stream_tool_calls: int = 1000,
+    max_response_bytes: int = 16 * 1024 * 1024,
     stacklevel: int = 3,
 ) -> Deadlines:
     """Validate the deadline kwargs and fold in the deprecated ``timeout=``.
@@ -140,6 +143,7 @@ def resolve_deadlines(
     non-default value (the new kwarg wins), and warns.
     """
     for name, value in (
+        ("max_response_bytes", max_response_bytes),
         ("max_stream_bytes", max_stream_bytes),
         ("max_stream_tool_calls", max_stream_tool_calls),
     ):
@@ -164,6 +168,7 @@ def resolve_deadlines(
         call_timeout=call,
         stream_idle_timeout=idle,
         stream_total_timeout=total,
+        max_response_bytes=max_response_bytes,
         max_stream_bytes=max_stream_bytes,
         max_stream_tool_calls=max_stream_tool_calls,
     )
@@ -205,13 +210,23 @@ def parse_retry_after(headers: Any) -> float | None:
     return None
 
 
-async def _on_request(request: httpx.Request) -> None:
+async def _on_request(
+    request: httpx.Request, *, deadlines: Deadlines | None = None, provider: str = "unknown"
+) -> None:
+    if deadlines is not None:
+        configure_request(
+            request,
+            response_bytes=deadlines.max_response_bytes,
+            event_bytes=deadlines.max_stream_bytes,
+            provider=provider,
+        )
     state = _call_state.get()
     if state is not None:
         state.in_flight = True
 
 
 async def _on_response(response: httpx.Response) -> None:
+    guard_response(response)
     try:
         state = _call_state.get()
         if state is not None:
@@ -222,17 +237,24 @@ async def _on_response(response: httpx.Response) -> None:
         logger.debug("provider call-state hook failed", exc_info=True)
 
 
-def make_http_client(sdk: ModuleType, deadlines: Deadlines) -> httpx.AsyncClient:
+def make_http_client(
+    sdk: ModuleType, deadlines: Deadlines, *, provider: str | None = None
+) -> httpx.AsyncClient:
     """The SDK's default async client, with Dendrux's hooks and deadlines.
 
     ``sdk.DefaultAsyncHttpxClient`` keeps the SDK's connection limits
     (1000 / 100 keep-alive) and TCP keep-alive. Redirects stay off, as before.
     """
-    client: httpx.AsyncClient = sdk.DefaultAsyncHttpxClient(
+    client_type = deferred_client_type(sdk.DefaultAsyncHttpxClient)
+    client = client_type(
         timeout=httpx.Timeout(deadlines.read_timeout, connect=CONNECT_TIMEOUT),
         follow_redirects=False,
         event_hooks={
-            "request": [_on_request],
+            "request": [
+                functools.partial(
+                    _on_request, deadlines=deadlines, provider=provider or sdk.__name__
+                )
+            ],
             "response": [_on_response, *telemetry_event_hooks()["response"]],
         },
     )

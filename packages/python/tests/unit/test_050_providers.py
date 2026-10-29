@@ -1241,7 +1241,9 @@ class TestTransport:
 
         hooks = chat_provider()._client._client.event_hooks
         assert _retry_telemetry._on_response in hooks["response"]
-        assert _resilience._on_request in hooks["request"]
+        assert any(
+            getattr(hook, "func", hook) is _resilience._on_request for hook in hooks["request"]
+        )
 
     def test_sdk_stream_exposes_sse_iterator(self) -> None:
         # The Chat [DONE] detection relies on this SDK seam; fail loudly if it moves.
