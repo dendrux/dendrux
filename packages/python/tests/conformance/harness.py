@@ -35,6 +35,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import re
 import subprocess
 import tomllib
 from collections.abc import Awaitable, Callable
@@ -46,6 +47,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from dendrux.agent import Agent
+from dendrux.errors import PROVIDER_ERROR_CATEGORIES
+from dendrux.llm._provider_codes import map_provider_code
 from dendrux.llm.mock import MockLLM
 from dendrux.types import LLMResponse, ToolCall, UsageStats
 from tests._helpers import v030_oracle as o
@@ -901,22 +904,26 @@ def messages_digest(messages: list[dict[str, Any]]) -> str:
 def golden_view(recording: dict[str, Any]) -> dict[str, Any]:
     """The normalised conformance projection: results, events, trace roles, tool-call rows."""
     return _norm(
-        {
-            "id": recording["id"],
-            "scenario": recording["scenario"],
-            "steps": [{k: v for k, v in s.items() if k != "at_pause"} for s in recording["steps"]],
-            "runs": [_run_golden(r) for r in recording["runs"]],
-            "provider_calls": [
-                {
-                    "provider": c["provider"],
-                    "step": c["step"],
-                    "n_messages": len(c["messages"]),
-                    "tools": [t["name"] for t in c["tools"]],
-                    "messages_sha256": messages_digest(c["messages"]),
-                }
-                for c in recording["calls"]
-            ],
-        }
+        _project_mapped_provider_codes(
+            {
+                "id": recording["id"],
+                "scenario": recording["scenario"],
+                "steps": [
+                    {k: v for k, v in s.items() if k != "at_pause"} for s in recording["steps"]
+                ],
+                "runs": [_run_golden(r) for r in recording["runs"]],
+                "provider_calls": [
+                    {
+                        "provider": c["provider"],
+                        "step": c["step"],
+                        "n_messages": len(c["messages"]),
+                        "tools": [t["name"] for t in c["tools"]],
+                        "messages_sha256": messages_digest(c["messages"]),
+                    }
+                    for c in recording["calls"]
+                ],
+            }
+        )
     )
 
 
@@ -992,7 +999,7 @@ def normalised_corpus(view: dict[str, Any]) -> dict[str, Any]:
     """Normalise a corpus view; its rows are compared without the additive 0.6 columns."""
     if "rows" in view:
         view = {**view, "rows": project_additive_columns(view["rows"])}
-    return _norm(view)
+    return _norm(_project_mapped_provider_codes(view))
 
 
 # ---------------------------------------------------------------------------
@@ -1028,8 +1035,83 @@ def read_json(path: Path) -> Any:
             f"Missing {path}. Goldens and the corpus are recorded once from the 0.5.0 sources "
             f"with {REGEN_ENV}=1 (see tests/conformance/regen.py); tests never create them."
         )
-    return json.loads(path.read_text(encoding="utf-8"))
+    return _project_mapped_provider_codes(json.loads(path.read_text(encoding="utf-8")))
+
+
+# contracts §12.39: project only the changed provider-code channels on both sides.
+MAPPED_060_PROVIDER_CODES = frozenset({"provider_code", "safe_message", "error"})
+_MAPPED_PROVIDER_MESSAGE = re.compile(
+    r"([A-Za-z0-9_.:/@+\-]{1,255}) (?:"
+    + "|".join(PROVIDER_ERROR_CATEGORIES)
+    + r") \(HTTP (?:n/a|[1-5][0-9]{2}), code ([A-Za-z0-9_.:\-]{1,64}|n/a)\)"
+)
+_PROVIDER_PAYLOAD_FIELDS = frozenset(
+    {
+        "answer",
+        "output",
+        "content",
+        "params",
+        "payload",
+        "messages",
+        "calls",
+        "provider_calls",
+        "provider_request",
+        "provider_response",
+        "semantic_request",
+        "semantic_response",
+        "tool_calls",
+        "react_traces",
+        "run_inbox",
+    }
+)
+
+
+def _map_provider_message(value: Any) -> Any:
+    match = _MAPPED_PROVIDER_MESSAGE.fullmatch(value) if isinstance(value, str) else None
+    if match is None:
+        return value
+    code = map_provider_code(match[1], match[2]) or "n/a"
+    return value[: match.start(2)] + code + value[match.end(2) :]
+
+
+def _project_mapped_provider_codes(value: Any, provider: str | None = None) -> Any:
+    if isinstance(value, list):
+        return [_project_mapped_provider_codes(item, provider) for item in value]
+    if not isinstance(value, dict):
+        return value
+    candidate = value.get("provider", provider)
+    provider = candidate if isinstance(candidate, str) else None
+    # Normalisation masks provider identities; the fixed message retains the original.
+    for key in ("safe_message", "error"):
+        message = value.get(key)
+        match = _MAPPED_PROVIDER_MESSAGE.fullmatch(message) if isinstance(message, str) else None
+        if match is not None:
+            provider = match[1]
+            break
+    projected = {}
+    for key, item in value.items():
+        if key in _PROVIDER_PAYLOAD_FIELDS:
+            projected[key] = item
+        elif key == "stream_events" and isinstance(item, list):
+            projected[key] = [
+                [
+                    (_map_provider_message(part) if index == 6 else part)
+                    for index, part in enumerate(event)
+                ]
+                if isinstance(event, list) and len(event) == 10
+                else event
+                for event in item
+            ]
+        elif key == "provider_code":
+            projected[key] = map_provider_code(provider, item)
+        elif key in MAPPED_060_PROVIDER_CODES and isinstance(item, str):
+            projected[key] = _map_provider_message(item)
+        else:
+            projected[key] = _project_mapped_provider_codes(item, provider)
+    return projected
 
 
 def diff(expected: Any, actual: Any) -> str | None:
-    return o.first_diff(expected, actual)
+    return o.first_diff(
+        _project_mapped_provider_codes(expected), _project_mapped_provider_codes(actual)
+    )

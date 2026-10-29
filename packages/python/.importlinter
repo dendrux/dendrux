@@ -28,6 +28,7 @@ layers =
     pricing | context_blocks | strategies | media | db
     types : _wire
     errors | _sentinel | _redact
+    _codes
 ignore_imports =
     # KNOWN VIOLATION: the retry telemetry helper in the provider layer reports
     # governance events through the loop helpers, so llm reaches up into loops

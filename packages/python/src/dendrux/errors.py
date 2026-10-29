@@ -627,7 +627,7 @@ class UnsupportedModalityError(_KwargsReduceMixin, RuntimeError):
         self.origin = origin
         self.source = source
         self.status_code = status_code
-        self.provider_code = provider_code
+        self.provider_code = _provider_code_mapper(provider, provider_code)
         super().__init__(
             f"Model {model!r} on provider {provider!r} does not accept {modality} input "
             f"({image_count} {modality}(s), source={source})."
@@ -669,7 +669,7 @@ class ImageRejectedError(_KwargsReduceMixin, RuntimeError):
         self.located = located
         self.retried = retried
         self.status_code = status_code
-        self.provider_code = provider_code
+        self.provider_code = _provider_code_mapper(provider, provider_code)
         ids = ", ".join(self.image_ids) if self.image_ids else "unlocated"
         super().__init__(
             f"Provider {provider!r} rejected image(s) for model {model!r}: {ids}"

@@ -190,7 +190,8 @@ class TestContextLengthExceeded:
         assert exc.args == ("Request exceeds the model's context window.",)
         assert exc.message == "Request exceeds the model's context window."
         assert exc.status_code == 400
-        assert exc.provider_code == "context_length_exceeded"
+        assert exc.provider_code == "provider_unknown"
+        assert exc.provider_code_raw == "context_length_exceeded"
         assert exc.model == "gpt-x"
         assert exc.provider is None
 
@@ -214,10 +215,11 @@ class TestContextLengthExceeded:
         assert clone.args == ("too big",)
         assert (clone.status_code, clone.provider_code, clone.model, clone.provider) == (  # type: ignore[attr-defined]
             413,
-            "ctx",
+            "provider_unknown",
             "m",
             "openai",
         )
+        assert exc.provider_code_raw == "ctx"
         assert copy.deepcopy(exc).message == "too big"
 
 
@@ -317,7 +319,11 @@ class TestFixRoundErrors:
 
     def test_safe_provider_code(self) -> None:
         assert ProviderError(provider_code="rate_limit_error").safe_provider_code == (
-            "rate_limit_error"
+            "provider_unknown"
+        )
+        assert (
+            ProviderError(provider="anthropic", provider_code="rate_limit_error").safe_provider_code
+            == "rate_limit_error"
         )
         assert ProviderError(provider_code="free text leak here").safe_provider_code is None
         assert ProviderError().safe_provider_code is None
