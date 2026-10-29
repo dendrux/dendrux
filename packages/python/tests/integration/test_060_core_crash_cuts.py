@@ -8,6 +8,7 @@ worker only resolves actions and consumes submissions, then is killed again.
 import asyncio
 import multiprocessing
 import signal
+from functools import wraps
 
 import pytest
 
@@ -59,6 +60,7 @@ def _worker(url, cut, connection, effect_path, recovery_run=None):
     class Store(SQLAlchemyStateStore):
         finalizing = False
 
+        @wraps(SQLAlchemyStateStore.create_run)
         async def create_run(self, *args, **kwargs):
             result = await super().create_run(*args, **kwargs)
             if cut == "startup":
@@ -85,6 +87,7 @@ def _worker(url, cut, connection, effect_path, recovery_run=None):
             if cut == "intent":
                 halt(run, cut)
 
+        @wraps(SQLAlchemyStateStore.complete_tool_call)
         async def complete_tool_call(
             self, run, *, claim_epoch, observation, event, loop_state_patch, **kwargs
         ):
@@ -112,6 +115,7 @@ def _worker(url, cut, connection, effect_path, recovery_run=None):
                 halt(run, cut)
             return result
 
+        @wraps(SQLAlchemyStateStore.consume_submission)
         async def consume_submission(self, run, *, claim_epoch, traces, patch, **kwargs):
             result = await super().consume_submission(
                 run, claim_epoch=claim_epoch, traces=traces, patch=patch, **kwargs

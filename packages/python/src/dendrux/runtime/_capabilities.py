@@ -33,6 +33,10 @@ _REQUIREMENTS: dict[str, dict[str, tuple[str, ...]]] = {
         "save_llm_interaction": ("interaction_id",),
     },
     "checkpointing": {
+        "create_run": ("seed_traces", "pii_mapping"),
+        "save_tool_call": ("outcome",),
+        "complete_tool_call": ("pii_mapping",),
+        "consume_submission": ("pii_mapping",),
         "checkpoint_step": (),
         "get_traces_after": (),
         "conversation_traces": (),

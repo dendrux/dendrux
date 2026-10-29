@@ -1564,6 +1564,33 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         """
         return str(self._engine.url)
 
+    @_safe_database_call
+    async def _creation_storage_format(self, session: AsyncSession | None = None) -> int:
+        """Read the same settings pin for entry validation and creation."""
+        from sqlalchemy import select
+
+        from dendrux.db.models import DendruxSetting
+
+        if session is None:
+            async with self._session_factory() as entry_session:
+                return cast("int", await self._creation_storage_format(entry_session))
+        storage_format = int(
+            await session.scalar(
+                select(DendruxSetting.value).where(DendruxSetting.key == "storage_format")
+            )
+            or "1"
+        )
+        if not all(
+            (
+                self.capabilities.fenced_writes,
+                self.capabilities.retry_ids,
+                self.capabilities.checkpointing,
+                self.capabilities.atomic_completion,
+            )
+        ):
+            storage_format = 1
+        return storage_format
+
     async def create_run(
         self,
         run_id: str,
@@ -1601,7 +1628,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         from sqlalchemy.exc import IntegrityError
 
         from dendrux.db.enums import AgentRunStatus
-        from dendrux.db.models import AgentRun, DendruxSetting
+        from dendrux.db.models import AgentRun
 
         if tenant_id == "":
             raise ValueError("tenant_id must be a non-empty string or None, not ''.")
@@ -1616,21 +1643,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
 
         async def _attempt() -> CreateRunResult:
             async with self._session_factory() as session:
-                storage_format = int(
-                    await session.scalar(
-                        select(DendruxSetting.value).where(DendruxSetting.key == "storage_format")
-                    )
-                    or "1"
-                )
-                if not all(
-                    (
-                        self.capabilities.fenced_writes,
-                        self.capabilities.retry_ids,
-                        self.capabilities.checkpointing,
-                        self.capabilities.atomic_completion,
-                    )
-                ):
-                    storage_format = 1
+                storage_format = await self._creation_storage_format(session)
                 if parent_run_id is not None:
                     from dendrux.errors import RunCancelledError, RunNotFoundError
 

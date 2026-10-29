@@ -55,7 +55,9 @@ from dendrux.loops._helpers import (
     notify_message,
     notify_tool,
     notify_tool_started,
+    order_observations,
     price_response,
+    project_message,
     record_governance,
     record_llm,
     record_llm_failed,
@@ -293,7 +295,8 @@ async def _append_assistant(
         reasoning_blocks=response.reasoning_blocks,
     )
     history.append(msg)
-    await _record_message(recorder, run_id, msg, iteration)
+    msg = await _record_message(recorder, run_id, msg, iteration)
+    history[-1] = msg
     await _notify_message(notifier, run_id, msg, iteration, warnings)
     return msg
 
@@ -602,7 +605,8 @@ async def _deliver_inbox(
             meta={"note_id": note.id},
         )
         history.append(msg)
-        await _record_message(recorder, run_id, msg, iteration)
+        msg = await _record_message(recorder, run_id, msg, iteration)
+        history[-1] = msg
         await _notify_message(notifier, run_id, msg, iteration, warnings)
     await state_store.mark_notes_delivered(run_id, [n.id for n in notes], iteration=iteration)
     for note in notes:
@@ -697,13 +701,14 @@ async def _init_loop_state(
 ) -> _LoopState:
     """Initialize mutable loop state — shared between run() and run_stream()."""
     if initial_history is not None:
-        history = list(initial_history)
+        history = [await project_message(recorder, m) for m in initial_history]
     else:
         from dendrux.context_blocks import wire_user_input
 
         user_msg = Message(role=Role.USER, content=wire_user_input(user_input, [], None))
         history = [user_msg]
-        await _record_message(recorder, run_id, user_msg, 0)
+        user_msg = await _record_message(recorder, run_id, user_msg, 0)
+        history[-1] = user_msg
         await _notify_message(notifier, run_id, user_msg, 0)
 
     call_counts: dict[str, int] = {}
@@ -836,7 +841,8 @@ async def _process_tool_calls(
         await _notify_tool(notifier, run_id, tc, json_result, iteration, warnings)
         result_msg = _format_result(strategy, json_result)
         history.append(result_msg)
-        await _record_message(recorder, run_id, result_msg, iteration)
+        result_msg = await _record_message(recorder, run_id, result_msg, iteration)
+        history[-1] = result_msg
         await _notify_message(notifier, run_id, result_msg, iteration, warnings)
         all_results.append((tc, json_result))
 
@@ -873,7 +879,8 @@ async def _process_tool_calls(
             )
             result_msg = _format_result(strategy, deny_result)
             history.append(result_msg)
-            await _record_message(recorder, run_id, result_msg, iteration)
+            result_msg = await _record_message(recorder, run_id, result_msg, iteration)
+            history[-1] = result_msg
             await _notify_message(notifier, run_id, result_msg, iteration, warnings)
             all_results.append((tc, deny_result))
         else:
@@ -885,7 +892,8 @@ async def _process_tool_calls(
         await _notify_tool(notifier, run_id, tc, result, iteration, warnings)
         result_msg = _format_result(strategy, result)
         history.append(result_msg)
-        await _record_message(recorder, run_id, result_msg, iteration)
+        result_msg = await _record_message(recorder, run_id, result_msg, iteration)
+        history[-1] = result_msg
         await _notify_message(notifier, run_id, result_msg, iteration, warnings)
         all_results.append((tc, result))
 
@@ -970,7 +978,8 @@ async def _process_tool_calls(
             history.append(result_msg)
             await _record_tool(recorder, run_id, tc, failure, iteration)
             await _notify_tool(notifier, run_id, tc, failure, iteration, warnings)
-            await _record_message(recorder, run_id, result_msg, iteration)
+            result_msg = await _record_message(recorder, run_id, result_msg, iteration)
+            history[-1] = result_msg
             await _notify_message(notifier, run_id, result_msg, iteration, warnings)
             all_results.append((tc, failure))
         non_denied = ready
@@ -1093,7 +1102,8 @@ async def _process_tool_calls(
         call_counts[tc.name] = call_counts.get(tc.name, 0) + 1
         result_msg = _format_result(strategy, tool_result)
         history.append(result_msg)
-        await _record_message(recorder, run_id, result_msg, iteration)
+        result_msg = await _record_message(recorder, run_id, result_msg, iteration)
+        history[-1] = result_msg
         await _notify_message(notifier, run_id, result_msg, iteration, warnings)
         all_results.append((tc, tool_result))
 
@@ -1209,7 +1219,8 @@ async def _apply_before_tool(
             await _notify_tool(notifier, run_id, tc, result, iteration, warnings)
         result_msg = _format_result(strategy, result)
         history.append(result_msg)
-        await _record_message(recorder, run_id, result_msg, iteration)
+        result_msg = await _record_message(recorder, run_id, result_msg, iteration)
+        history[-1] = result_msg
         await _notify_message(notifier, run_id, result_msg, iteration, warnings)
         all_results.append((tc, result))
 
@@ -1610,9 +1621,12 @@ class ReActLoop(Loop):
                 for msg_idx, msg in enumerate(messages):
                     if not msg.content:
                         continue
-                    cleaned_msg, findings, block_err = await g_engine.scan_incoming_message(
-                        msg, index=msg_idx
+                    project = (
+                        g_engine.project_incoming_message
+                        if getattr(recorder, "guardrail_engine", None) is g_engine
+                        else g_engine.scan_incoming_message
                     )
+                    cleaned_msg, findings, block_err = await project(msg, index=msg_idx)
                     if findings:
                         all_in_findings.extend(findings)
                     if block_err is not None:
@@ -2079,9 +2093,7 @@ class ReActLoop(Loop):
                     image_runtime=image_runtime,
                 )
                 _mark_call_rejections(history, tool_history_start, outcome.all_results)
-                order_observations = getattr(recorder, "order_observations", None)
-                if order_observations is not None:
-                    order_observations(history)
+                order_observations(recorder, history)
                 if outcome.pending_calls:
                     pause_status = (
                         RunStatus.WAITING_APPROVAL
@@ -2718,9 +2730,7 @@ class ReActLoop(Loop):
                         phase="commentary",
                     )
                 _mark_call_rejections(history, tool_history_start, outcome.all_results)
-                order_observations = getattr(recorder, "order_observations", None)
-                if order_observations is not None:
-                    order_observations(history)
+                order_observations(recorder, history)
                 if outcome.pending_calls:
                     pause_status = (
                         RunStatus.WAITING_APPROVAL

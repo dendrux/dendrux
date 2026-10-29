@@ -83,3 +83,37 @@ async def test_a3_best_effort_recorder_never_swallows_fence(store, monkeypatch, 
         await PersistenceRecorder(store, run_id).on_llm_call_completed(
             run_id, LLMResponse(text="ok"), 0
         )
+
+
+async def test_format1_tool_start_cancels_the_progress_write(store, monkeypatch):
+    import asyncio
+
+    entered = asyncio.Event()
+    released = asyncio.Event()
+    cancelled = asyncio.Event()
+    completed = []
+
+    async def stalled_write(run_id):
+        entered.set()
+        try:
+            await released.wait()
+            completed.append(run_id)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    monkeypatch.setattr(store, "touch_progress", stalled_write)
+    recorder = PersistenceRecorder(store, generate_ulid())
+    assert not recorder._format2
+    task = asyncio.create_task(recorder.on_tool_started("run", ToolCall("effect"), 1))
+    await entered.wait()
+    task.cancel()
+    try:
+        # The write must observe cancellation without waiting for release.
+        await asyncio.wait_for(cancelled.wait(), timeout=1)
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert not completed
+    finally:
+        released.set()
+        await asyncio.gather(task, return_exceptions=True)

@@ -50,10 +50,13 @@ from dendrux.loops._helpers import (
     notify_run_failed,
     notify_run_finished,
     notify_run_started,
+    order_observations,
+    project_message,
     record_message,
     record_run_failed,
     record_run_finished,
     record_run_started,
+    record_tool,
 )
 from dendrux.loops.react import ReActLoop
 from dendrux.runtime._entry_checks import resolve_runner_tenant, runner_entry_checks
@@ -918,6 +921,9 @@ async def _persist_loop_outcome(
         record = await state_store.get_run(run_id)
         checkpoint = getattr(recorder, "checkpoint_outcome", None)
         if checkpoint is not None:
+            pause_state.history[:] = [
+                await project_message(recorder, m) for m in pause_state.history
+            ]
             await checkpoint(result, provider_kwargs)
         pause_data = {**pause_state.to_dict(), "status": result.status.value}
         if record is not None and GOVERNANCE_KEY in (getattr(record, "meta", None) or {}):
@@ -1807,6 +1813,7 @@ async def run(
                         seeded_history,
                         user_input=user_input,
                         run_id=run_id,
+                        run_meta=run_meta,
                         tenant_id=tenant_id,
                         replay_req=replay_req,
                         replay_runs=replay_runs,
@@ -1846,7 +1853,7 @@ async def run(
                         ClaimResult(
                             0,
                             create_result.storage_format,
-                            _initial_loop_state(type(resolved_loop).__name__)
+                            _initial_loop_state(_recovery_loop_name(resolved_loop))
                             if create_result.storage_format == 2
                             else None,
                             None,
@@ -2131,6 +2138,17 @@ async def run(
                 reset_delegation_context(ctx_token)
 
 
+def _recovery_loop_name(loop: Loop) -> str | None:
+    from dendrux.loops.react import ReActLoop
+    from dendrux.loops.single import SingleCall
+
+    if isinstance(loop, ReActLoop):
+        return "ReActLoop"
+    if isinstance(loop, SingleCall):
+        return "SingleCall"
+    return None
+
+
 async def _runtime_seeds(
     store: StateStore,
     agent: Agent,
@@ -2142,6 +2160,7 @@ async def _runtime_seeds(
     *,
     user_input: str,
     run_id: str,
+    run_meta: dict[str, Any],
     tenant_id: str | None = None,
     replay_req: ReplayRequest | None = None,
     replay_runs: list[Any] | None = None,
@@ -2154,6 +2173,16 @@ async def _runtime_seeds(
 
     if not capabilities(store).checkpointing:
         return {}, None
+    from dendrux.runtime.state import SQLAlchemyStateStore
+    from dendrux.types import _validate_provider_kwargs
+
+    native_store = unclaimed_store(store)
+    if (
+        isinstance(native_store, SQLAlchemyStateStore)
+        and await native_store._creation_storage_format() == 2
+    ):
+        _validate_provider_kwargs(provider_kwargs, run_id=run_id)
+        run_meta["dendrux.loop"] = _recovery_loop_name(loop)
     if replay_req is not None:
         plan = expand_replay(
             replay_runs or [],
@@ -2196,10 +2225,10 @@ async def _runtime_seeds(
     engine = GuardrailEngine(agent.guardrails, run_id=run_id) if agent.guardrails else None
     if engine is not None:
         messages = [
-            (await engine.scan_incoming_message(m, index=i))[0] for i, m in enumerate(messages)
+            (await engine.project_incoming_message(m, index=i))[0] for i, m in enumerate(messages)
         ]
     if engine is not None and own_input is not None:
-        own_input = (await engine.scan_incoming_message(own_input))[0]
+        own_input = (await engine.project_incoming_message(own_input))[0]
         if "wire_content" in own_input.meta:
             own_index = max(i for i, m in enumerate(messages) if m.role == Role.USER)
             own_input = replace(
@@ -2777,6 +2806,7 @@ async def retry(
             initial_history,
             user_input=user_input,
             run_id=run_id,
+            run_meta=run_meta,
             tenant_id=tenant_id,
         )
         create_result = await state_store.create_run(
@@ -2800,7 +2830,7 @@ async def retry(
             ClaimResult(
                 0,
                 create_result.storage_format,
-                _initial_loop_state(type(resolved_loop).__name__)
+                _initial_loop_state(_recovery_loop_name(resolved_loop))
                 if create_result.storage_format == 2
                 else None,
                 None,
@@ -3330,6 +3360,7 @@ def run_stream(
                         seeded_history,
                         user_input=user_input,
                         run_id=run_id,
+                        run_meta=run_meta,
                         tenant_id=eff_tenant,
                         replay_req=replay_req,
                         replay_runs=replay_runs,
@@ -3383,7 +3414,7 @@ def run_stream(
                     ClaimResult(
                         0,
                         create_result.storage_format,
-                        _initial_loop_state(type(resolved_loop).__name__)
+                        _initial_loop_state(_recovery_loop_name(resolved_loop))
                         if create_result.storage_format == 2
                         else None,
                         None,
@@ -4066,6 +4097,8 @@ async def _replay_resume_injected_history(
     extra_notifier = ctx.notifier
     consume = getattr(recorder, "consume_resume", None)
     if consume is not None:
+        for i in range(len(pause_state.history), len(history)):
+            history[i] = await project_message(recorder, history[i])
         await consume(history[len(pause_state.history) :])
 
     if tool_results is not None:
@@ -4082,13 +4115,15 @@ async def _replay_resume_injected_history(
                 await recorder.on_tool_started(run_id, tc, pause_state.iteration)
             await _notify_tool_started(extra_notifier, run_id, tc, pause_state.iteration)
             await recorder.on_message_appended(run_id, msg, pause_state.iteration)
-            await recorder.on_tool_completed(run_id, tc, tr, pause_state.iteration)
+            await record_tool(recorder, run_id, tc, tr, pause_state.iteration)
             await _notify_msg(extra_notifier, run_id, msg, pause_state.iteration)
             await _notify_tool(extra_notifier, run_id, tc, tr, pause_state.iteration)
     elif user_input is not None:
         msg = history[-1]
         await recorder.on_message_appended(run_id, msg, pause_state.iteration)
         await _notify_msg(extra_notifier, run_id, msg, pause_state.iteration)
+
+    order_observations(recorder, history)
 
 
 class _ApprovalResume(NamedTuple):
@@ -4294,13 +4329,14 @@ async def _execute_approved_tools(
 
     async def _append(tc: ToolCall, tr: ToolResult, *, executed: bool = True) -> None:
         if executed:
-            await recorder.on_tool_completed(run_id, tc, tr, iteration)
+            await record_tool(recorder, run_id, tc, tr, iteration)
             await _ntfy_tool(notifier, run_id, tc, tr, iteration)
         result_msg = tool_result_message(tr)
         if not executed or tr.meta.get("code") == "max_calls":
             result_msg.meta["dendrux.not_executed"] = True
         target_history.append(result_msg)
-        await recorder.on_message_appended(run_id, result_msg, iteration)
+        result_msg = await record_message(recorder, run_id, result_msg, iteration)
+        target_history[-1] = result_msg
         await _ntfy_msg(notifier, run_id, result_msg, iteration)
         results.append((tc, tr))
 
@@ -4351,6 +4387,7 @@ async def _execute_approved_tools(
         barrier = await _resume_barrier(state_store, run_id)
         if barrier is not None:
             remaining = tuple(o for o in outcomes[index:] if o[1] != "client_pending")
+            order_observations(recorder, target_history)
             return _ApprovalResume(results, client_pending, decided, barrier, remaining)
 
         if isinstance(lookups.fn.get(tc.name), SkillTool):
@@ -4419,6 +4456,7 @@ async def _execute_approved_tools(
             tr = invalid_result
         await _append(tc, tr)
 
+    order_observations(recorder, target_history)
     return _ApprovalResume(results, client_pending, decided, None)
 
 

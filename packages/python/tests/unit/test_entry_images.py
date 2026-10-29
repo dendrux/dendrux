@@ -115,6 +115,7 @@ class ImageStore(SQLAlchemyStateStore):
             if (run_id, edge.owner_kind, edge.owner_id, edge.ordinal) not in keys:
                 self.edges.append((run_id, edge))
 
+    @functools.wraps(SQLAlchemyStateStore.create_run)
     async def create_run(self, run_id: str, agent_name: str, **kwargs: Any) -> Any:
         refs = kwargs.pop("blob_refs", None)
         scope = kwargs.pop("blob_refs_scope", None)

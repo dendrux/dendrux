@@ -1,6 +1,7 @@
 """Format-2 intent and completion protocol through actual Agent entry paths."""
 
 import asyncio
+from functools import wraps
 
 import pytest
 
@@ -161,6 +162,7 @@ async def test_a19_approval_consumes_matching_generation_before_execution(
         submissions.append(kwargs.get("submission"))
         return await submit(*args, **kwargs)
 
+    @wraps(consume)
     async def consuming(run_id, *, claim_epoch, **kwargs):
         result = await consume(run_id, claim_epoch=claim_epoch, **kwargs)
         consumed.append(await store.get_loop_state(run_id))

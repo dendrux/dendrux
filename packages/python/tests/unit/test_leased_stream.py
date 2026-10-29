@@ -43,7 +43,7 @@ async def test_stream_owns_exactly_one_scope_and_closes_provider(end):
     assert calls == ["enter", "close", "exit"]
 
 
-async def test_legacy_progress_write_finishes_before_tool_cancellation_propagates():
+async def test_legacy_progress_write_is_cancelled_before_tool_dispatch():
     import asyncio
 
     from dendrux.runtime.persistence import PersistenceRecorder
@@ -65,4 +65,4 @@ async def test_legacy_progress_write_finishes_before_tool_cancellation_propagate
     release.set()
     with pytest.raises(asyncio.CancelledError):
         await pending
-    assert completed.is_set()
+    assert not completed.is_set()

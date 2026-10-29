@@ -304,3 +304,138 @@ async def test_submission_commits_new_placeholder_mapping(store, monkeypatch):
     )
     assert result.status.value == "success"
     assert checked == [True]
+
+
+async def test_digit_detector_keeps_provider_and_durable_views_identical(store):
+    @tool()
+    async def observe() -> str:
+        """Return a fresh real value."""
+        return "pin 8"
+
+    views = []
+
+    class Provider(MockLLM):
+        async def complete(self, messages, tools=None, **kwargs):
+            rebuilt = await rebuild_history(store, kwargs["run_id"])
+            expected = [m.content for m in messages]
+            assert [m.content for m in rebuilt.messages] == expected
+            views.append(expected)
+            return await super().complete(messages, tools, **kwargs)
+
+    result = await Agent(
+        prompt="p",
+        tools=[observe],
+        provider=Provider(
+            [LLMResponse(tool_calls=[ToolCall("observe")]), LLMResponse(text="done")]
+        ),
+        guardrails=[PII(extra_patterns=[Pattern("NUM", r"\d")], restore="all")],
+        state_store=store,
+        strict_tenancy=False,
+    ).run("pin 7")
+    assert result.status.value == "success"
+    assert len(views) == 2
+    mapping = await store.get_pii_mapping(result.run_id)
+    assert {k: v for k, v in mapping.items() if k.startswith("<<")} == {
+        "<<NUM_1>>": "7",
+        "<<NUM_2>>": "8",
+    }
+    assert not await store.get_traces_after(
+        result.run_id, after_order_index=None, kinds=("rewrite",)
+    )
+
+
+async def test_format2_scan_count_does_not_exceed_format1(engine, store, monkeypatch):
+    from dendrux.guardrails import GuardrailEngine
+    from tests._fixtures.storage import pin_storage_format
+
+    scan = GuardrailEngine.scan_incoming_message
+    scans = []
+
+    async def count(self, *args, **kwargs):
+        scans.append(1)
+        return await scan(self, *args, **kwargs)
+
+    monkeypatch.setattr(GuardrailEngine, "scan_incoming_message", count)
+
+    @tool()
+    async def observe() -> str:
+        """Return a private observation."""
+        return "mail a@b.com"
+
+    counts = []
+    for fmt in (1, 2):
+        await pin_storage_format(engine, fmt)
+        scans.clear()
+        result = await Agent(
+            prompt="p",
+            tools=[observe],
+            provider=MockLLM(
+                [
+                    *[LLMResponse(tool_calls=[ToolCall("observe")]) for _ in range(5)],
+                    LLMResponse(text="done"),
+                ]
+            ),
+            guardrails=[PII(restore="all")],
+            state_store=store,
+            strict_tenancy=False,
+        ).run("hi x@y.com")
+        assert result.status.value == "success"
+        counts.append(len(scans))
+    assert counts[1] <= counts[0], counts
+
+
+async def test_parallel_tool_projection_serializes_the_shared_engine(store, monkeypatch):
+    from dendrux.guardrails import GuardrailEngine
+    from dendrux.types import Role
+
+    scan = GuardrailEngine.scan_incoming_message
+    active = 0
+    peak = 0
+    tools_entered = 0
+    all_tools = asyncio.Event()
+
+    async def yielding_scan(self, message, **kwargs):
+        nonlocal active, peak
+        if message.role != Role.TOOL:
+            return await scan(self, message, **kwargs)
+        active += 1
+        peak = max(peak, active)
+        try:
+            # Large-text detectors/redaction yield to worker threads. The
+            # engine's mapping/counters must not be mutated by sibling scans.
+            await asyncio.wait_for(all_tools.wait(), timeout=5)
+            await asyncio.sleep(0)
+            return await scan(self, message, **kwargs)
+        finally:
+            active -= 1
+
+    monkeypatch.setattr(GuardrailEngine, "scan_incoming_message", yielding_scan)
+
+    @tool(parallel=True)
+    async def observe(code: str) -> str:
+        """Return an independent private observation."""
+        nonlocal tools_entered
+        tools_entered += 1
+        if tools_entered == 4:
+            all_tools.set()
+        return code
+
+    result = await Agent(
+        prompt="p",
+        tools=[observe],
+        state_store=store,
+        strict_tenancy=False,
+        guardrails=[PII(extra_patterns=[Pattern("CODE", r"CODE[A-Z]")], restore="all")],
+        provider=MockLLM(
+            [
+                LLMResponse(
+                    tool_calls=[ToolCall("observe", params={"code": "CODE" + c}) for c in "ABCD"]
+                ),
+                LLMResponse(text="done"),
+            ]
+        ),
+    ).run("go")
+    assert result.status.value == "success"
+    assert peak == 1
+    mapping = await store.get_pii_mapping(result.run_id)
+    assert set(mapping.values()) == {"CODE" + c for c in "ABCD"}

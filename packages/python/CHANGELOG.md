@@ -8,6 +8,9 @@ notifier for live reads, published scale numbers with a rerunnable load script,
 one trace per run and a log-codes page, and the 0.5 FutureWarning flips.
 Entries are added as each track merges.
 
+- For format-2 runs, `RunStore.get_traces` and `dendrux traces` return the
+  provider form (PII placeholders); the reverse mapping is available as before.
+
 - State-store subclass upgrade: overrides of `SQLAlchemyStateStore` write methods
   must accept and forward the new keyword-only parameters (a `**kwargs` passthrough
   is supported), or explicitly declare only the capabilities they implement.

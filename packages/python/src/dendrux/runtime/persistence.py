@@ -289,6 +289,7 @@ class PersistenceRecorder(BaseRecorder):
             len(seed_traces) if self._format2 and seed_traces else initial_order_index
         )
         self.guardrail_engine = guardrail_engine if self._format2 else None
+        self._projected_observations: dict[str, Message] = {}
         self._observation_lock = asyncio.Lock()
         self._loop_source: Any = None
         self._loop_state: dict[str, Any] = deepcopy(getattr(state_store, "loop_state", None) or {})
@@ -329,12 +330,6 @@ class PersistenceRecorder(BaseRecorder):
         )
         if trace.role == "system":
             self._system_messages.append(Message(role=Role.SYSTEM, content=trace.content))
-
-    async def _provider_message(self, message: Message) -> Message:
-        if self.guardrail_engine is None:
-            return message
-        cleaned, _, _ = await self.guardrail_engine.scan_incoming_message(message)
-        return cleaned
 
     def _mapping(self) -> dict[str, str] | None:
         if self.guardrail_engine is not None:
@@ -565,7 +560,6 @@ class PersistenceRecorder(BaseRecorder):
         traces = []
         removed = []
         for i, message in enumerate(messages):
-            message = await self._provider_message(message)
             call = pending.get(message.call_id or "")
             order = call["order_index"] if call else descriptor["reserved_order_index"] + i
             traces.append(message_trace(message, order, tenant_scope=self._tenant_scope))
@@ -622,7 +616,6 @@ class PersistenceRecorder(BaseRecorder):
         from dendrux.runtime.state import TraceWrite
 
         await self._snapshot(iteration - 1)
-        messages = [await self._provider_message(m) for m in messages]
         view = [
             {"role": t.role, "content": t.content, "meta": t.meta}
             for t in (message_trace(m, 0) for m in messages)
@@ -804,7 +797,6 @@ class PersistenceRecorder(BaseRecorder):
             if self._seed_input_pending and message.role.value == "user":
                 self._seed_input_pending = False
                 return
-            message = await self._provider_message(message)
             await self._snapshot(iteration)
             pending = self._loop_state.setdefault("pending", [])
             reserved = next((p for p in pending if p["call_id"] == message.call_id), None)
@@ -1150,25 +1142,12 @@ class PersistenceRecorder(BaseRecorder):
             await retry_critical(write_intent, label="start_tool_call", run_id=run_id)
             self._started_calls.add(tool_call.id)
             return
-        from dendrux.db._pool_guard import close_fully
-
-        async def progress() -> None:
-            import asyncio
-
-            async with asyncio.timeout(10):
-                await self._store.touch_progress(self._run_id)
-
         try:
-            # Cancelling a SQLite execute invalidates its connection. Finish
-            # this bounded write before cancellation prevents tool dispatch.
-            await close_fully(progress)
+            # Legacy progress writes remain cancellable; format-2 intent
+            # durability is handled by the fenced branch above.
+            await self._store.touch_progress(self._run_id)
         except RunFencedError:
             raise
-        except TimeoutError:
-            logger.warning(
-                "Tool-start progress renewal timed out",
-                extra={"run_id": self._run_id, "code": "lease_renew_failed"},
-            )
         except Exception:
             logger.warning(
                 "Failed to touch progress for run %s", self._run_id, exc_info=safe_exception_info()
@@ -1206,6 +1185,33 @@ class PersistenceRecorder(BaseRecorder):
                 "Failed-call evidence unavailable: run_id=%s code=llm_failed_write", self._run_id
             )
 
+    def format_observation(self, result: ToolResult) -> Message:
+        from dendrux.types import tool_result_message
+
+        return (self._result_formatter or tool_result_message)(result)
+
+    def take_observation(self, call_id: str | None) -> Message | None:
+        return self._projected_observations.pop(call_id, None) if call_id else None
+
+    def observation_scope(self) -> AbstractAsyncContextManager[None]:
+        """Serialize loop projection and its atomic observation/mapping write."""
+        return self._observation_lock
+
+    async def on_projected_tool_completed(
+        self,
+        run_id: str,
+        tool_call: ToolCall,
+        tool_result: ToolResult,
+        iteration: int,
+        observation: Message,
+    ) -> None:
+        # The loop supplies provider form. Serialize full mapping snapshots
+        # with their writes; the recorder never invokes the guardrail engine.
+        await self._complete_observation(
+            run_id, tool_call, tool_result, iteration, observation=observation
+        )
+        self._projected_observations[tool_call.id] = observation
+
     async def on_tool_completed(
         self, run_id: str, tool_call: ToolCall, tool_result: ToolResult, iteration: int
     ) -> None:
@@ -1222,6 +1228,8 @@ class PersistenceRecorder(BaseRecorder):
         tool_call: ToolCall,
         tool_result: ToolResult,
         iteration: int,
+        *,
+        observation: Message | None = None,
     ) -> None:
         """Persist tool call record + event."""
         params = tool_call.params if tool_call.params else None
@@ -1237,13 +1245,12 @@ class PersistenceRecorder(BaseRecorder):
 
         if self._format2 and tool_call.id in self._started_calls:
             from dendrux.runtime.state import EventWrite, LoopStatePatch
-            from dendrux.types import tool_result_message
 
             pending = next(p for p in self._loop_state["pending"] if p["call_id"] == tool_call.id)
-            message = await self._provider_message(
-                (self._result_formatter or tool_result_message)(tool_result)
+            message = (
+                observation if observation is not None else self.format_observation(tool_result)
             )
-            observation = message_trace(
+            observation_trace = message_trace(
                 message, pending["order_index"], tenant_scope=self._tenant_scope
             )
             event = EventWrite(
@@ -1289,7 +1296,7 @@ class PersistenceRecorder(BaseRecorder):
                     duration_ms=tool_result.duration_ms,
                     error_message=tool_result.error,
                     replayed=False,
-                    observation=observation,
+                    observation=observation_trace,
                     event=event,
                     loop_state_patch=patch,
                     **extra,
@@ -1304,7 +1311,7 @@ class PersistenceRecorder(BaseRecorder):
             counts = self._loop_state.setdefault("tool_counts", {})
             counts[tool_call.name] = counts.get(tool_call.name, 0) + 1
             self._completed_observations.add(tool_call.id)
-            self._remember(observation)
+            self._remember(observation_trace)
             return
 
         if capabilities(self._store).retry_ids:

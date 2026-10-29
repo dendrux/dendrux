@@ -147,3 +147,63 @@ async def test_successful_hook_substitution_is_not_an_executed_effect(store, str
     rows = await store.get_tool_calls(result.run_id)
     assert len(rows) == 1 and rows[0].success
     assert rows[0].outcome == "failed"
+
+
+@pytest.mark.parametrize("entry", ["run", "stream", "retry"])
+@pytest.mark.parametrize("option", ["large", "object"])
+async def test_format2_refuses_options_before_creation(store, engine, monkeypatch, entry, option):
+    from functools import wraps
+
+    from sqlalchemy import func, select
+
+    from dendrux.db.models import AgentRun
+
+    agent = Agent(
+        prompt="p",
+        provider=MockLLM([LLMResponse(text="done")]),
+        state_store=store,
+        strict_tenancy=False,
+    )
+    original_run = await agent.run("original") if entry == "retry" else None
+    created = []
+    create = store.create_run
+
+    @wraps(create)
+    async def capture(*args, **kwargs):
+        created.append(args[0])
+        return await create(*args, **kwargs)
+
+    monkeypatch.setattr(store, "create_run", capture)
+    value = "x" * 3000 if option == "large" else object()
+    if entry == "stream":
+        async with agent.stream("go", extra_body=value) as stream:
+            events = [event async for event in stream]
+        assert events[-1].run_result.status == RunStatus.ERROR
+    else:
+        with pytest.raises(ValueError):
+            if entry == "retry":
+                await agent.retry(original_run.run_id, extra_body=value)
+            else:
+                await agent.run("go", extra_body=value)
+    assert not created, "refusal must precede create_run, not merely roll it back"
+    async with engine.connect() as connection:
+        assert await connection.scalar(select(func.count()).select_from(AgentRun)) == (
+            1 if original_run else 0
+        )
+
+
+async def test_entry_settings_failure_is_a_safe_persistence_error(store, monkeypatch):
+    from contextlib import asynccontextmanager
+
+    from sqlalchemy.exc import OperationalError
+
+    @asynccontextmanager
+    async def unavailable():
+        raise OperationalError("settings", {}, Exception("PRIVATE_DATABASE_DETAIL"))
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(store, "_session_factory", unavailable)
+    agent = Agent(prompt="p", provider=MockLLM([]), state_store=store, strict_tenancy=False)
+    with pytest.raises(PersistenceError) as caught:
+        await agent.run("go")
+    assert "PRIVATE_DATABASE_DETAIL" not in str(caught.value)

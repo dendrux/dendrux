@@ -5,6 +5,7 @@ import json
 import os
 import sys
 from datetime import UTC, datetime
+from functools import wraps
 
 import pytest
 from sqlalchemy import update
@@ -21,6 +22,7 @@ async def test_d5_direct_cached_and_fresh_process_recovery_agree(store, engine, 
     stamp = datetime(2026, 10, 29, tzinfo=UTC)
     complete = store.complete_tool_call
 
+    @wraps(complete)
     async def replayed(run_id, *, claim_epoch, observation, event, loop_state_patch, **kwargs):
         kwargs["replayed"] = True
         await complete(

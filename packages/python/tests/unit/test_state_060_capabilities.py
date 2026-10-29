@@ -135,3 +135,42 @@ async def test_partial_sql_store_pins_format_one_even_on_active_database(sqlite_
     result = await store.create_run(generate_ulid(), "partial")
     assert result.storage_format == 1
     assert (await store.get_run(result.run_id)).storage_format == 1
+
+
+@pytest.mark.parametrize(
+    "method,keyword",
+    [
+        ("create_run", "seed_traces"),
+        ("create_run", "pii_mapping"),
+        ("save_tool_call", "outcome"),
+        ("complete_tool_call", "pii_mapping"),
+        ("consume_submission", "pii_mapping"),
+    ],
+)
+@pytest.mark.parametrize("shape", ["absent", "positional", "kwargs"])
+async def test_checkpoint_keywords_refused_before_run(sqlite_engine, method, keyword, shape):
+    import inspect
+
+    from dendrux.errors import StoreCapabilityError
+
+    original = getattr(state.SQLAlchemyStateStore, method)
+    signature = inspect.signature(original)
+    params = [p for p in signature.parameters.values() if p.name != keyword]
+    if shape == "positional":
+        params.insert(1, inspect.Parameter(keyword, inspect.Parameter.POSITIONAL_ONLY))
+        params[0] = params[0].replace(kind=inspect.Parameter.POSITIONAL_ONLY)
+    elif shape == "kwargs":
+        params.append(inspect.Parameter("extra", inspect.Parameter.VAR_KEYWORD))
+
+    async def incompatible(*args, **kwargs):
+        raise AssertionError("constructor must reject before invoking store")
+
+    incompatible.__signature__ = signature.replace(parameters=params)
+    store_type = type(
+        "IncompleteCheckpointStore", (state.SQLAlchemyStateStore,), {method: incompatible}
+    )
+    with pytest.raises(StoreCapabilityError) as caught:
+        Agent(prompt="p", provider=MockLLM([]), state_store=store_type(sqlite_engine))
+    assert caught.value.capability == "checkpointing"
+    assert caught.value.method == method
+    assert keyword in caught.value.missing

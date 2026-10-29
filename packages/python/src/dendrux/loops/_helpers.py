@@ -20,7 +20,7 @@ import inspect
 import logging
 from contextlib import AbstractAsyncContextManager, nullcontext
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from dendrux.errors import safe_exception_info
 from dendrux.pricing import price_usage
@@ -44,6 +44,13 @@ if TYPE_CHECKING:
     )
 
 logger = logging.getLogger(__name__)
+
+
+def order_observations(recorder: LoopRecorder | None, history: list[Message]) -> None:
+    """Restore format-2 observations to their assistant's original call order."""
+    order = getattr(recorder, "order_observations", None)
+    if order is not None:
+        order(history)
 
 
 class StreamInterruptedError(Exception):
@@ -264,16 +271,29 @@ async def record_run_failed(
     await recorder.on_run_failed(run_id, error, iteration=iteration)
 
 
+async def project_message(recorder: LoopRecorder | None, message: Message) -> Message:
+    """Prepare provider form in the loop, before any persistence transaction."""
+    engine = getattr(recorder, "guardrail_engine", None)
+    if engine is None:
+        return message
+    take = getattr(recorder, "take_observation", None)
+    observation = take(message.call_id) if take is not None else None
+    if observation is not None:
+        return replace(cast("Message", observation), meta={**observation.meta, **message.meta})
+    return cast("Message", (await engine.project_incoming_message(message))[0])
+
+
 async def record_message(
     recorder: LoopRecorder | None,
     run_id: str,
     message: Message,
     iteration: int,
-) -> None:
-    """Record message to authoritative persistence. Exceptions propagate."""
-    if recorder is None:
-        return
-    await recorder.on_message_appended(run_id, message, iteration)
+) -> Message:
+    """Project then record a message; callers retain the returned provider form."""
+    message = await project_message(recorder, message)
+    if recorder is not None:
+        await recorder.on_message_appended(run_id, message, iteration)
+    return message
 
 
 async def record_llm_started(
@@ -407,7 +427,17 @@ async def record_tool(
     """Record tool completion to authoritative persistence. Exceptions propagate."""
     if recorder is None:
         return
-    await recorder.on_tool_completed(run_id, tool_call, tool_result, iteration)
+    projected = getattr(recorder, "on_projected_tool_completed", None)
+    if projected is not None and getattr(recorder, "guardrail_engine", None) is not None:
+        formatter = getattr(recorder, "format_observation", None)
+        assert formatter is not None
+        scope = getattr(recorder, "observation_scope", None)
+        assert scope is not None
+        async with scope():
+            message = await project_message(recorder, formatter(tool_result))
+            await projected(run_id, tool_call, tool_result, iteration, message)
+    else:
+        await recorder.on_tool_completed(run_id, tool_call, tool_result, iteration)
 
 
 async def record_governance(

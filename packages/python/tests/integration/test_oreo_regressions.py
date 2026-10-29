@@ -84,6 +84,7 @@ async def test_cancellation_during_startup_preserves_existing_outcomes(store, ex
 
 
 async def test_cancellation_before_row_exists_is_quiet(store, monkeypatch, caplog):
+    @functools.wraps(store.create_run)
     async def cancelled_create(*args, **kwargs):
         raise asyncio.CancelledError
 

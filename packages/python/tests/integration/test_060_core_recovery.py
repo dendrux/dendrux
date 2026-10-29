@@ -339,3 +339,59 @@ async def test_builtin_loop_marker_is_present_at_create_and_every_checkpoint(
     assert initial == [{"v": 1, "loop": loop_type}]
     assert boundaries and set(boundaries) == {loop_type}
     assert (await store.get_run(result.run_id)).strategy == "NativeToolCalling"
+
+
+@pytest.mark.parametrize("kind", ["react", "single_call", "custom", "named_like_builtin"])
+@pytest.mark.parametrize("entry", ["run", "stream", "retry"])
+async def test_creation_marker_uses_loop_type(store, monkeypatch, kind, entry):
+    from functools import wraps
+
+    from dendrux import Agent, SingleCall
+    from dendrux.llm.mock import MockLLM
+    from dendrux.loops.base import Loop
+    from dendrux.loops.react import ReActLoop
+    from dendrux.types import LLMResponse, RunResult, RunStatus
+
+    class Custom(Loop):
+        async def run(self, agent, user_input, *, run_id=None, **kwargs):
+            return RunResult(run_id=run_id, status=RunStatus.SUCCESS, answer="done")
+
+    loop = {
+        "react": type("DerivedReact", (ReActLoop,), {}),
+        "single_call": type("DerivedSingle", (SingleCall,), {}),
+        "custom": Custom,
+        "named_like_builtin": type("ReActLoop", (Custom,), {}),
+    }[kind]()
+    expected = {"v": 1, "loop": kind} if kind in {"react", "single_call"} else None
+    inspected = []
+    create = store.create_run
+
+    @wraps(create)
+    async def inspect(*args, **kwargs):
+        result = await create(*args, **kwargs)
+        # Creation committed; the loop has not executed or checkpointed yet.
+        assert await store.get_loop_state(result.run_id) == expected
+        inspected.append(result.run_id)
+        return result
+
+    monkeypatch.setattr(store, "create_run", inspect)
+    agent = Agent(
+        prompt="p",
+        provider=MockLLM([LLMResponse(text="done"), LLMResponse(text="again")]),
+        loop=loop,
+        state_store=store,
+        strict_tenancy=False,
+    )
+    if entry == "stream":
+        async with agent.stream("go") as stream:
+            events = [event async for event in stream]
+        result = events[-1].run_result
+    else:
+        result = await agent.run("go")
+        if entry == "retry" and kind == "single_call":
+            with pytest.raises(ValueError, match="SingleCall runs cannot be retried"):
+                await agent.retry(result.run_id)
+        elif entry == "retry":
+            result = await agent.retry(result.run_id)
+    assert result.status == RunStatus.SUCCESS
+    assert len(inspected) == (2 if entry == "retry" and kind != "single_call" else 1)

@@ -34,7 +34,10 @@ async def slow_side_effect(x: int) -> int:
     return x
 
 
+@pytest.mark.parametrize("engine", ["sqlite_file", "postgres"], indirect=True)
 async def test_failed_row_write_stops_the_running_sibling(store):
+    # A cancelled SQLite write can invalidate its connection. Use a durable
+    # database so connection replacement does not erase the test schema.
     # This fault injection / pause blob exercises the format-1 write path.
     from tests._fixtures.storage import pin_storage_format
 
