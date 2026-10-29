@@ -9,6 +9,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 
+import pytest
+
 from dendrux.runtime.tasks import RunTaskManager
 
 
@@ -166,4 +168,54 @@ async def test_owned_task_interrupt_records_all_nested_runs_once():
     assert manager.cancel(root)
     assert await asyncio.wait_for(task, 5) == 1
     assert observed == [(True, True), (True, False)]
+    assert not manager._pending and not manager._owned
+
+
+@pytest.mark.parametrize("target_index", [0, 1, 2])
+async def test_owned_task_interrupt_follows_registration_order(target_index):
+    manager = RunTaskManager()
+    runs = ("parent", "child", "grandchild")
+    ready, other_ready = asyncio.Event(), asyncio.Event()
+    observed = {}
+
+    async def work():
+        for rid in runs:
+            manager.register_current(rid)
+        ready.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            for rid in reversed(runs):
+                observed[rid] = manager.take_interrupt(rid)
+            return asyncio.current_task().cancelling()
+        finally:
+            for rid in reversed(runs):
+                manager.release_current(rid)
+
+    async def unrelated():
+        manager.register_current("other")
+        other_ready.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            manager.release_current("other")
+
+    other = manager.spawn("other", unrelated())
+    task = manager.spawn(runs[0], work())
+    try:
+        await asyncio.wait_for(other_ready.wait(), 5)
+        await asyncio.wait_for(ready.wait(), 5)
+        assert manager.cancel(runs[target_index])
+        assert manager.cancel(runs[target_index]), "repeated signal must remain idempotent"
+        assert await asyncio.wait_for(task, 5) == 1
+        assert observed == {
+            rid: (index >= target_index, index > target_index) for index, rid in enumerate(runs)
+        }
+        assert not other.done()
+        assert manager.take_interrupt("other") == (False, False)
+        assert not manager._pending
+    finally:
+        task.cancel()
+        other.cancel()
+        await asyncio.gather(task, other, return_exceptions=True)
     assert not manager._pending and not manager._owned

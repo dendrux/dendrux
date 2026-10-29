@@ -129,7 +129,8 @@ class RunTaskManager:
             if run_id not in pending:
                 if not pending:
                     owned.cancel()
-                pending.update(rid for rid, task in self._owned.items() if task is owned)
+                sharing = [rid for rid, t in self._owned.items() if t is owned]
+                pending.update(sharing[sharing.index(run_id) :])
             delivered = True
         return delivered
 
