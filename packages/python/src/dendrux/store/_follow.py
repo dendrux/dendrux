@@ -187,6 +187,7 @@ class _RunFeed:
         self.terminal = False
         self.closing = False
         self.task: asyncio.Task[None] | None = None
+        self._poll_wake = asyncio.Event()
         self._view: PauseView | None = None
         self._view_generation = 0
         self._view_lock = asyncio.Lock()
@@ -275,6 +276,8 @@ class _RunFeed:
                 self._poll(), name=f"dendrux-run-feed:{self.run_id}"
             )
             self.task.add_done_callback(self._done)
+        else:
+            self._poll_wake.set()
         return self.head
 
     def remove(self, follower: _Follower) -> asyncio.Task[None] | None:
@@ -318,6 +321,9 @@ class _RunFeed:
             while self.followers:
                 if self.terminal and all(f.until_terminal for f in self.followers):
                     return
+                # Clear before fetching so joins during the read stay pending.
+                # Event.set coalesces a burst into one immediate poll.
+                self._poll_wake.clear()
                 events = await self._fetch()
                 self._publish(events)
                 if len(events) == owner.batch:
@@ -345,7 +351,9 @@ class _RunFeed:
                             if follower.until_terminal:
                                 follower.end("terminal")
                         continue
-                await asyncio.sleep(delay)
+                with contextlib.suppress(TimeoutError):
+                    async with asyncio.timeout(delay):
+                        await self._poll_wake.wait()
                 if not events:
                     delay = min(delay * 2, owner.poll_max_s)
         except asyncio.CancelledError:
