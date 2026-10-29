@@ -476,7 +476,7 @@ class TestAnthropicTaxonomy:
         wire(provider, boom)
         with pytest.raises(ProviderTimeoutError) as info:
             await provider.complete(USER)
-        assert info.value.timeout_reason == "call_deadline"
+        assert info.value.timeout_reason is None
         assert info.value.retryable is False
         assert "socket read timeout" in info.value.message
 

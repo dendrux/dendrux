@@ -21,6 +21,7 @@ from dendrux.llm.anthropic import AnthropicProvider
 from dendrux.llm.openai import OpenAIProvider
 from dendrux.llm.openai_responses import OpenAIResponsesProvider
 from dendrux.llm.openrouter import OpenRouterProvider
+from dendrux.types import Message, Role
 
 SENTINEL = "VENDOR-PRIVATE-SENTINEL"
 MIB = 1024 * 1024
@@ -134,7 +135,7 @@ async def test_total_decoded_limit_closes_without_sdk_retry(
     install(p, respond)
     try:
         with caplog.at_level(logging.WARNING), pytest.raises(ProviderResponseError) as caught:
-            await call(p, family)
+            await p.complete([Message(role=Role.USER, content="hi")], run_id="run-bound")
         assert caught.value.provider_code == "response_size_limit"
         assert caught.value.retryable is False
         assert requests == 1

@@ -226,7 +226,7 @@ async def _on_request(
 
 
 async def _on_response(response: httpx.Response) -> None:
-    guard_response(response)
+    await guard_response(response)
     try:
         state = _call_state.get()
         if state is not None:
@@ -551,13 +551,13 @@ def _error_facts(exc: BaseException) -> dict[str, Any]:
     }
 
 
-def _timeout_reason_for(exc: BaseException, *, streaming: bool) -> TimeoutReason:
+def _timeout_reason_for(exc: BaseException, *, streaming: bool) -> TimeoutReason | None:
     cause: BaseException | None = exc
     while cause is not None:
         if isinstance(cause, (httpx.ConnectTimeout, httpx.PoolTimeout)):
             return "connect"
         cause = cause.__cause__
-    return "stream_idle" if streaming else "call_deadline"
+    return "stream_idle" if streaming else None
 
 
 def timeout_message(reason: TimeoutReason, limit: float | None = None) -> str:
