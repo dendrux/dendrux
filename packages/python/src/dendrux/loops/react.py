@@ -2370,10 +2370,11 @@ class ReActLoop(Loop):
                     failure: Exception | None = None
                     # Externally visible deltas of this provider call (§5.7 guard).
                     visible_deltas = 0
+                    active_stream = leased_stream(
+                        interruptible(provider_stream, interrupt), recorder
+                    )
                     try:
-                        async for event in leased_stream(
-                            interruptible(provider_stream, interrupt), recorder
-                        ):
+                        async for event in active_stream:
                             if event.type == StreamEventType.TEXT_DELTA:
                                 partial_text.append(event.text or "")
                                 visible_deltas += 1
@@ -2504,6 +2505,7 @@ class ReActLoop(Loop):
                         notifier=notifier,
                     )
             finally:
+                await active_stream.aclose()
                 await provider_stream.aclose()
             if stop_control is not None:
                 stop_result = _control_stop_result(

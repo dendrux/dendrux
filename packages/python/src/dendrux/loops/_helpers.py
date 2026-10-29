@@ -117,6 +117,9 @@ class _InterruptibleStream:
             armed = False
             watcher.cancel()
 
+    async def aclose(self) -> None:
+        await self._stream.aclose()
+
 
 def interruptible(
     stream: AsyncGenerator[StreamEvent, None],
@@ -140,19 +143,46 @@ class _LeasedStream:
     def __init__(self, stream: AsyncIterator[StreamEvent], recorder: LoopRecorder | None) -> None:
         self.stream = stream
         self.recorder = recorder
+        self.scope: AbstractAsyncContextManager[None] | None = None
+        self.closed = False
 
     def __aiter__(self) -> _LeasedStream:
         return self
 
     async def __anext__(self) -> StreamEvent:
-        async with lease_scope(self.recorder):
+        if self.closed:
+            raise StopAsyncIteration
+        try:
+            if self.scope is None:
+                scope = lease_scope(self.recorder)
+                await scope.__aenter__()
+                self.scope = scope
+            check = getattr(self.recorder, "check_lease", None)
+            if check is not None:
+                check()
             return await anext(self.stream)
+        except BaseException:
+            await self.aclose()
+            raise
+
+    async def aclose(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        try:
+            close = getattr(self.stream, "aclose", None)
+            if close is not None:
+                await close()
+        finally:
+            if self.scope is not None:
+                scope, self.scope = self.scope, None
+                await scope.__aexit__(None, None, None)
 
 
 def leased_stream(
     stream: AsyncIterator[StreamEvent], recorder: LoopRecorder | None
-) -> AsyncIterator[StreamEvent]:
-    """Renew only during each provider pull, in the caller's task and context."""
+) -> _LeasedStream:
+    """Hold one lease until the provider stream ends, fails, or is explicitly closed."""
     return _LeasedStream(stream, recorder)
 
 

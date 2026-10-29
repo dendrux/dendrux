@@ -446,7 +446,6 @@ async def lease_scope() -> AsyncIterator[None]:
 
     ctx._lease_users[0] += 1
     if ctx._lease_users[0] == 1:
-        ctx._lease_at[0] = 0.0
         ctx._lease_ticker[0] = asyncio.create_task(tick())
     try:
         await _renew_claim(ctx)

@@ -894,10 +894,9 @@ class SingleCall(Loop):
             while True:
                 failure: Exception | None = None
                 visible_deltas = 0
+                active_stream = leased_stream(interruptible(provider_stream, interrupt), recorder)
                 try:
-                    async for event in leased_stream(
-                        interruptible(provider_stream, interrupt), recorder
-                    ):
+                    async for event in active_stream:
                         if event.type == StreamEventType.TEXT_DELTA:
                             partial_text.append(event.text or "")
                             visible_deltas += 1
@@ -1017,6 +1016,7 @@ class SingleCall(Loop):
                     notifier=notifier,
                 )
         finally:
+            await active_stream.aclose()
             await provider_stream.aclose()
 
         if cancelled:

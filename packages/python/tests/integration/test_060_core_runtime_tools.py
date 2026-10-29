@@ -97,7 +97,7 @@ async def test_a20_completion_commits_while_sibling_is_running(store):
     assert state["tool_counts"] == {"slow": 1, "fast": 1}
 
 
-async def test_stream_lease_stops_at_consumer_yield(store, monkeypatch):
+async def test_stream_lease_survives_consumer_yield_without_cancellation(store, monkeypatch):
     from datetime import timedelta
 
     from dendrux.types import RunEventType
@@ -122,7 +122,7 @@ async def test_stream_lease_stops_at_consumer_yield(store, monkeypatch):
             if event.type == RunEventType.TEXT_DELTA:
                 count = len(touches)
                 await asyncio.sleep(0.06)
-                assert len(touches) == count
+                assert len(touches) > count
                 assert asyncio.current_task().cancelling() == 0
                 break
 
@@ -362,7 +362,7 @@ async def test_single_call_renews_only_during_provider_steps(store, monkeypatch,
                 if event.type == RunEventType.TEXT_DELTA:
                     before = len(touches)
                     await asyncio.sleep(0.06)
-                    assert len(touches) == before
+                    assert len(touches) > before
             assert event.type == RunEventType.RUN_COMPLETED
     else:
         await a.run("go")

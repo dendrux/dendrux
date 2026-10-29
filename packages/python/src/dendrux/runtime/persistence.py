@@ -650,6 +650,13 @@ class PersistenceRecorder(BaseRecorder):
             self._loop_state["phase"] = "finalizing"
         await self._checkpoint()
 
+    def check_lease(self) -> None:
+        from dendrux.runtime.context import get_delegation_context
+
+        ctx = get_delegation_context()
+        if ctx is not None and ctx._lease_errors[0] is not None:
+            raise ctx._lease_errors[0]
+
     def lease_scope(self) -> AbstractAsyncContextManager[None]:
         """Provide the loop's optional renewal seam from the runtime layer."""
         from dendrux.runtime.context import lease_scope
@@ -1065,10 +1072,25 @@ class PersistenceRecorder(BaseRecorder):
             await retry_critical(write_intent, label="start_tool_call", run_id=run_id)
             self._started_calls.add(tool_call.id)
             return
+        from dendrux.db._pool_guard import close_fully
+
+        async def progress() -> None:
+            import asyncio
+
+            async with asyncio.timeout(10):
+                await self._store.touch_progress(self._run_id)
+
         try:
-            await self._store.touch_progress(self._run_id)
+            # Cancelling a SQLite execute invalidates its connection. Finish
+            # this bounded write before cancellation prevents tool dispatch.
+            await close_fully(progress)
         except RunFencedError:
             raise
+        except TimeoutError:
+            logger.warning(
+                "Tool-start progress renewal timed out",
+                extra={"run_id": self._run_id, "code": "lease_renew_failed"},
+            )
         except Exception:
             logger.warning(
                 "Failed to touch progress for run %s", self._run_id, exc_info=safe_exception_info()
