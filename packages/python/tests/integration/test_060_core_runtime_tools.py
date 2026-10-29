@@ -324,20 +324,30 @@ async def test_single_call_renews_only_during_provider_steps(store, monkeypatch,
     from datetime import timedelta
 
     from dendrux.loops import SingleCall
-    from dendrux.types import RunEventType
+    from dendrux.types import RunEventType, RunStatus
 
     touches = []
+    renewed = asyncio.Event()
+    contexts = []
     original = store.touch_progress
 
     async def touch(run_id, *, claim_epoch=None):
+        result = await original(run_id, claim_epoch=claim_epoch)
         touches.append(1)
-        return await original(run_id, claim_epoch=claim_epoch)
+        renewed.set()
+        return result
+
+    async def wait_for_renewals(count):
+        target = len(touches) + count
+        async with asyncio.timeout(60):
+            while len(touches) < target:
+                await renewed.wait()
+                renewed.clear()
 
     class SlowModel(MockLLM):
         async def complete(self, *args, **kwargs):
-            before = len(touches)
-            await asyncio.sleep(0.08)
-            assert len(touches) >= before + 2
+            contexts.append(get_delegation_context())
+            await wait_for_renewals(2)
             return await super().complete(*args, **kwargs)
 
         async def complete_stream(self, *args, **kwargs):
@@ -355,17 +365,18 @@ async def test_single_call_renews_only_during_provider_steps(store, monkeypatch,
         state_store=store,
         strict_tenancy=False,
     )
-    a.lease_interval = timedelta(seconds=0.02)
+    a.lease_interval = timedelta(seconds=5)
     if streaming:
         async with a.stream("go") as events:
             async for event in events:
                 if event.type == RunEventType.TEXT_DELTA:
-                    before = len(touches)
-                    await asyncio.sleep(0.06)
-                    assert len(touches) > before
+                    # The whole provider stream owns the ticker while yielded.
+                    await wait_for_renewals(1)
             assert event.type == RunEventType.RUN_COMPLETED
     else:
-        await a.run("go")
+        assert (await a.run("go")).status == RunStatus.SUCCESS
+    assert contexts and all(ctx._lease_ticker[0] is None for ctx in contexts)
+    assert get_delegation_context() is None
 
 
 async def test_dynamic_gate_is_durable_before_approval_notification(store):

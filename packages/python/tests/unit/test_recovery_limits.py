@@ -1,4 +1,4 @@
-"""Recovery entry bounds reject before I/O without echoing provider options."""
+"""Recovery bounds apply only to durable format-2 checkpoints."""
 
 import logging
 
@@ -25,31 +25,33 @@ def test_recovery_limit_rejects_invalid_values(name, value):
 
 
 @pytest.mark.parametrize("entry", ["run", "stream", "runner_run", "runner_stream"])
-async def test_provider_options_reject_oversized_before_provider(entry, caplog):
+async def test_ephemeral_provider_options_remain_unbounded(entry, caplog):
     from dendrux.runtime import runner
 
-    provider = MockLLM([LLMResponse(text="unused")])
+    provider = MockLLM([LLMResponse(text="done")])
     agent = Agent(prompt="test", provider=provider)
-    # UTF-8 bytes, not code points, determine the bound.
     value = "SENTINEL_OPTION" + "é" * 1100
-    with caplog.at_level(logging.WARNING), pytest.raises(ValueError):
+    with caplog.at_level(logging.WARNING):
         if entry == "run":
-            await agent.run("hello", thinking={"value": value})
-        elif entry == "stream":
-            agent.stream("hello", thinking={"value": value})
+            result = await agent.run("hello", thinking={"value": value})
         elif entry == "runner_run":
-            await runner.run(
+            result = await runner.run(
                 agent, provider=provider, user_input="hello", thinking={"value": value}
             )
         else:
-            runner.run_stream(
-                agent, provider=provider, user_input="hello", thinking={"value": value}
+            stream = (
+                agent.stream("hello", thinking={"value": value})
+                if entry == "stream"
+                else runner.run_stream(
+                    agent, provider=provider, user_input="hello", thinking={"value": value}
+                )
             )
+            async for _ in stream:
+                pass
+            result = stream.result
+    assert result.answer == "done"
     assert "SENTINEL_OPTION" not in caplog.text
-    assert any(
-        getattr(r, "code", None) == "provider_kwargs_too_large" and hasattr(r, "run_id")
-        for r in caplog.records
-    )
+    assert not any(getattr(r, "code", None) == "provider_kwargs_too_large" for r in caplog.records)
 
 
 @pytest.mark.parametrize("streaming", [False, True])
@@ -75,6 +77,7 @@ def test_saved_provider_options_checked_before_claim(caplog):
     from dendrux.runtime.submit import submission_validator
 
     raw = {
+        "schema_version": 2,
         "agent_name": "bounded",
         "pause_id": "generation",
         "provider_kwargs": {"thinking": {"value": "x" * 2100}},
@@ -93,6 +96,7 @@ def test_saved_provider_options_checked_again_under_claim_lock():
     from dendrux.runtime.submit import submission_validator
 
     raw = {
+        "schema_version": 2,
         "agent_name": "bounded",
         "pause_id": "generation",
         "provider_kwargs": {"max_tokens": 4096},

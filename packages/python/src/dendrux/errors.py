@@ -129,7 +129,14 @@ def _restore_logged_control_error(cls: Any, args: tuple[Any, ...], state: dict[s
 
 
 class RunNotReclaimableError(_KwargsReduceMixin, RunControlError):
-    """A run does not satisfy the ordered recovery preconditions."""
+    """A run does not satisfy the ordered recovery preconditions.
+
+    ``reason`` is one of ``legacy_run``, ``store_capability``, ``not_running``,
+    ``lease_fresh``, ``already_reclaimed``, ``reclaim_limit``, ``agent_mismatch``,
+    ``skill_mismatch``, ``loop_unsupported``, ``history_too_large``, ``cancelled``
+    (cancellation won), ``loop_unknown`` (missing or unrecognized checkpoint loop),
+    or ``governance_changed`` (the recovery governance fingerprint differs).
+    """
 
     _init_fields = ("run_id", "reason")
 

@@ -353,15 +353,36 @@ def submission_descriptor(
         "submission_id": generate_ulid(),
         "kind": kind,
         "pause_id": raw.get("pause_id"),
-        "payload_ref": {"pause_data_key": "submitted"},
+        "payload_ref": {"pause_data_key": "submission"},
         "call_ids": ids,
         "reserved_order_index": checkpoint.get("trace_order_offset", 0),
     }
 
 
+def _submission_payload(raw: dict[str, Any]) -> dict[str, Any]:
+    """Accept only the closed format-2 submission envelope (§12.1)."""
+    if "submitted" in raw:
+        raise ValueError("Invalid format-2 submission envelope")
+    envelope = raw.get("submission")
+    if envelope is None:
+        return {}
+    keys = {"submission_id", "kind", "pause_id", "call_ids", "payload"}
+    if not isinstance(envelope, dict) or set(envelope) != keys:
+        raise ValueError("Invalid format-2 submission envelope")
+    if (
+        not all(isinstance(envelope[k], str) and envelope[k] for k in ("submission_id", "pause_id"))
+        or envelope["kind"] not in ("approval", "input", "tool_results")
+        or not isinstance(envelope["payload"], dict)
+        or not isinstance(envelope["call_ids"], list)
+        or not all(isinstance(call_id, str) for call_id in envelope["call_ids"])
+    ):
+        raise ValueError("Invalid format-2 submission envelope")
+    return envelope["payload"]
+
+
 def submitted_view(raw: dict[str, Any]) -> dict[str, Any]:
-    """Read a submission through legacy parsing helpers without changing stored pause data."""
-    return {**raw, **raw.get("submitted", {})} if raw.get("schema_version") == 2 else raw
+    """Project a validated v2 envelope for legacy parsers without mutating storage."""
+    return {**raw, **_submission_payload(raw)} if raw.get("schema_version") == 2 else raw
 
 
 async def claim_or_raise(
@@ -1054,7 +1075,8 @@ def submission_validator(
     def validate(current: dict[str, Any]) -> None:
         from dendrux.types import _validate_provider_kwargs
 
-        _validate_provider_kwargs(current.get("provider_kwargs") or {}, run_id=run_id)
+        if current.get("schema_version") == 2:
+            _validate_provider_kwargs(current.get("provider_kwargs") or {}, run_id=run_id)
         base(current)
         if agent is not None and agent._on_governance_change == "raise":
             change = _governance_change(agent, current)

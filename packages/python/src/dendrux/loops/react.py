@@ -330,7 +330,7 @@ def _pending_limit_result(
     usage: UsageStats,
     meta: dict[str, Any],
 ) -> RunResult | None:
-    if state_store is not None and getattr(state_store, "storage_format", 1) != 2:
+    if state_store is None or getattr(state_store, "storage_format", 1) != 2:
         return None
     if len(response.tool_calls or ()) <= agent._limits.max_pending_calls:
         return None
@@ -1519,7 +1519,7 @@ class ReActLoop(Loop):
         )
         before_tool: BeforeToolHook | None = getattr(agent, "before_tool", None)
         hook_tenant_id = await _hook_tenant_id(before_tool, state_store, resolved_run_id)
-        g_engine = (
+        g_engine = getattr(recorder, "guardrail_engine", None) or (
             GuardrailEngine(
                 agent.guardrails, pii_mapping=initial_pii_mapping, run_id=resolved_run_id
             )
@@ -1602,8 +1602,6 @@ class ReActLoop(Loop):
                 history=history,
                 tool_defs=tool_defs,
             )
-            await _checkpoint_view(recorder, messages, iteration)
-
             # Incoming guardrail — scan ALL messages before LLM call
             _all_guardrail_findings: dict[str, Any] = {}
             if g_engine is not None:
@@ -1700,6 +1698,8 @@ class ReActLoop(Loop):
                         {"direction": "incoming", "entities": _red_entities},
                         warnings=notifier_warnings,
                     )
+
+            await _checkpoint_view(recorder, messages, iteration)
 
             # Image request view (§5.1): placeholders, caps, verified bytes.
             prepared = await images.prepare(

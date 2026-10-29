@@ -266,3 +266,76 @@ async def test_reclaim_returning_preserves_distinct_epoch_and_format(store, engi
     assert claimed.storage_format == row.storage_format == 2
     assert claimed.loop_state == await store.get_loop_state(ids[0]) == {"loop": "react"}
     assert claimed.submission is None and row.reclaim_attempts == 2
+
+
+@pytest.mark.parametrize("poison", [None, {}, {"v": 1, "loop": "unknown"}])
+async def test_mark_skips_poisoned_loop_and_advances_cursor(store, engine, caplog, poison):
+    ids = await stale(store, engine, count=2)
+    async with engine.begin() as conn:
+        await conn.execute(update(AgentRun).where(AgentRun.id == ids[0]).values(loop_state=poison))
+    result = await mark(store)
+    assert result.inspected == 2
+    assert [item.run_id for item in result.reclaimable] == [ids[1]]
+    assert not result.finalised and not result.legacy
+    row = await store.get_run(ids[0])
+    assert row.status == "running" and row.claim_epoch == 0
+    assert row.lease_expired_at is None
+    assert not await store.get_run_events(ids[0])
+    assert any(
+        getattr(r, "code", None) == "loop_unknown" and getattr(r, "run_id", None) == ids[0]
+        for r in caplog.records
+    )
+    page = await mark(store, max_runs=1)
+    assert page.inspected == 1 and page.cursor == ids[0]
+    assert not page.reclaimable
+    next_page = await mark(store, cursor=page.cursor)
+    assert [item.run_id for item in next_page.reclaimable] == [ids[1]]
+
+
+@pytest.mark.parametrize("loop_type", ["react", "single_call"])
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_builtin_loop_marker_is_present_at_create_and_every_checkpoint(
+    store, monkeypatch, loop_type, streaming
+):
+    from functools import wraps
+
+    from dendrux import Agent, SingleCall
+    from dendrux.llm.mock import MockLLM
+    from dendrux.types import LLMResponse
+
+    create = store.create_run
+    checkpoint = store.checkpoint_step
+    initial = []
+    boundaries = []
+
+    @wraps(create)
+    async def inspect_create(*args, **kwargs):
+        result = await create(*args, **kwargs)
+        initial.append(await store.get_loop_state(result.run_id))
+        return result
+
+    @wraps(checkpoint)
+    async def inspect_checkpoint(*args, **kwargs):
+        boundaries.append(kwargs["loop_state"].get("loop"))
+        return await checkpoint(*args, **kwargs)
+
+    monkeypatch.setattr(store, "create_run", inspect_create)
+    monkeypatch.setattr(store, "checkpoint_step", inspect_checkpoint)
+    agent = Agent(
+        prompt="p",
+        provider=MockLLM([LLMResponse(text="done")]),
+        state_store=store,
+        strict_tenancy=False,
+        loop=SingleCall() if loop_type == "single_call" else None,
+    )
+    if streaming:
+        stream = agent.stream("go")
+        async for _ in stream:
+            pass
+        result = stream.result
+    else:
+        result = await agent.run("go")
+    assert result.status.value == "success"
+    assert initial == [{"v": 1, "loop": loop_type}]
+    assert boundaries and set(boundaries) == {loop_type}
+    assert (await store.get_run(result.run_id)).strategy == "NativeToolCalling"

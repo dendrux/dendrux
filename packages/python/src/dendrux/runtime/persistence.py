@@ -25,9 +25,12 @@ LoopRecorder protocol so third-party recorders can subscribe.
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import inspect
 import json
 import logging
+from bisect import insort
 from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
 from typing import TYPE_CHECKING, Any
@@ -49,6 +52,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
     from contextlib import AbstractAsyncContextManager
 
+    from dendrux.guardrails import GuardrailEngine
     from dendrux.media import BlobEdge
     from dendrux.runtime.state import StateStore
     from dendrux.types import LLMResponse, Message, ToolCall, ToolDef, ToolResult, ToolTarget
@@ -223,7 +227,7 @@ def seed_trace_kwargs(
 
 def _view_identity(entry: dict[str, Any]) -> str:
     meta = entry.get("meta") or {}
-    return json.dumps(
+    value = json.dumps(
         {
             "role": entry["role"],
             "content": meta.get("wire_content", entry["content"]),
@@ -231,6 +235,7 @@ def _view_identity(entry: dict[str, Any]) -> str:
         },
         sort_keys=True,
     )
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 class PersistenceRecorder(BaseRecorder):
@@ -267,6 +272,7 @@ class PersistenceRecorder(BaseRecorder):
         tenant_scope: str | None = None,
         provider: Any | None = None,
         seed_traces: Any = None,
+        guardrail_engine: GuardrailEngine | None = None,
     ) -> None:
         self._store = state_store
         self._tenant_scope = tenant_scope
@@ -282,13 +288,14 @@ class PersistenceRecorder(BaseRecorder):
         self._order_index = (
             len(seed_traces) if self._format2 and seed_traces else initial_order_index
         )
+        self.guardrail_engine = guardrail_engine if self._format2 else None
+        self._observation_lock = asyncio.Lock()
         self._loop_source: Any = None
         self._loop_state: dict[str, Any] = deepcopy(getattr(state_store, "loop_state", None) or {})
-        self._known_history = (
-            [{"role": t.role, "content": t.content, "meta": t.meta} for t in seed_traces or []]
-            if self._format2
-            else []
-        )
+        self._known_history: list[tuple[int, str]] = []
+        self._system_messages: list[Message] = []
+        for trace in seed_traces or [] if self._format2 else []:
+            self._remember(trace)
         self._state_payloads: dict[str, str] = {}
         self._seed_input_pending = any(t.role == "user" for t in seed_traces or [])
         self._durable_state = deepcopy(self._loop_state)
@@ -305,9 +312,44 @@ class PersistenceRecorder(BaseRecorder):
         from dendrux.runtime.replay import conversation_records
 
         records = await conversation_records(self._store, self._run_id, limits=limits)
-        self._known_history = [
-            {"role": t.role, "content": t.content, "meta": t.meta} for t in records
-        ]
+        self._known_history.clear()
+        self._system_messages.clear()
+        for trace in records:
+            self._remember(trace, position=trace.order_index)
+
+    def _remember(self, trace: Any, *, position: int | None = None) -> None:
+        from dendrux.types import Message, Role
+
+        insort(
+            self._known_history,
+            (
+                trace.order_index * 1000 if position is None else position,
+                _view_identity({"role": trace.role, "content": trace.content, "meta": trace.meta}),
+            ),
+        )
+        if trace.role == "system":
+            self._system_messages.append(Message(role=Role.SYSTEM, content=trace.content))
+
+    async def _provider_message(self, message: Message) -> Message:
+        if self.guardrail_engine is None:
+            return message
+        cleaned, _, _ = await self.guardrail_engine.scan_incoming_message(message)
+        return cleaned
+
+    def _mapping(self) -> dict[str, str] | None:
+        if self.guardrail_engine is not None:
+            return self.guardrail_engine.get_pii_mapping()
+        return self._loop_source()["pii_mapping"] if self._loop_source else None
+
+    def _pii_patch(self) -> dict[str, Any]:
+        if self.guardrail_engine is None:
+            return {}
+        return {
+            "pii": {
+                "mapping_version": len(self._mapping() or {}),
+                "counters": dict(self.guardrail_engine._counters),
+            }
+        }
 
     def bind_loop(self, source: Any, budget: Any) -> None:
         """Bind live loop data without making loops depend on runtime internals."""
@@ -315,6 +357,9 @@ class PersistenceRecorder(BaseRecorder):
             return
         self._loop_source = source
         live = source()
+        from dendrux.types import _validate_provider_kwargs
+
+        _validate_provider_kwargs(live.get("provider_kwargs", {}), run_id=self._run_id)
         self._tool_idempotent = live.get("idempotent", {})
         self._result_formatter = live.get("format_result")
         for target, saved_value in (
@@ -322,8 +367,12 @@ class PersistenceRecorder(BaseRecorder):
             (live["pii_counters"], self._loop_state.get("pii", {}).get("counters")),
         ):
             if saved_value is not None:
-                target.clear()
-                target.update(saved_value)
+                if target is live["pii_counters"]:
+                    for key, value in saved_value.items():
+                        target[key] = max(target.get(key, 0), value)
+                else:
+                    target.clear()
+                    target.update(saved_value)
         saved = self._loop_state.get("budget")
         if saved:
             from dendrux.loops._budget import BudgetState
@@ -345,7 +394,10 @@ class PersistenceRecorder(BaseRecorder):
         from dendrux.runtime.state import TraceWrite
 
         content = json.dumps(
-            {"kind": kind, "v": 1, **payload}, ensure_ascii=False, separators=(",", ":")
+            {"kind": kind, "v": 1, **payload},
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
         )
         field = "session_ref" if kind == "skills_session" else kind + "_ref"
         refs = (
@@ -353,6 +405,26 @@ class PersistenceRecorder(BaseRecorder):
             if kind == "skills_session"
             else self._loop_state
         )
+        if kind not in self._state_payloads and refs.get(field):
+            from dendrux.errors import PersistenceError
+
+            saved = await self._store.get_trace(self._run_id, refs[field])
+            try:
+                if saved is None or saved.trace_kind != "state" or saved.role != "state":
+                    raise ValueError("Missing state evidence")
+                value = json.loads(saved.content)
+                if (
+                    not isinstance(value, dict)
+                    or value.get("kind") != kind
+                    or type(value.get("v")) is not int
+                    or value["v"] != 1
+                ):
+                    raise ValueError("Unsupported state evidence")
+                self._state_payloads[kind] = json.dumps(
+                    value, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+                )
+            except (TypeError, ValueError):
+                raise PersistenceError(code="pause_format_unsupported") from None
         if self._state_payloads.get(kind) == content:
             return refs.get(field)
         trace = TraceWrite(
@@ -430,7 +502,7 @@ class PersistenceRecorder(BaseRecorder):
 
     async def _checkpoint(self, trace: Any = None) -> None:
         self._loop_state["trace_order_offset"] = self._order_index
-        mapping = self._loop_source()["pii_mapping"] if self._loop_source else None
+        mapping = self._mapping()
         snapshot = deepcopy(self._loop_state)
 
         async def write() -> None:
@@ -466,7 +538,9 @@ class PersistenceRecorder(BaseRecorder):
         if not self._format2 or descriptor is None:
             return
         raw = await self._store.get_pause_state(self._run_id) or {}
-        payload = raw.get("submitted", {})
+        from dendrux.runtime.submit import _submission_payload
+
+        payload = _submission_payload(raw)
         pending = {p["call_id"]: p for p in self._loop_state.get("pending", [])}
         phases = {}
         if descriptor["kind"] == "approval":
@@ -491,6 +565,7 @@ class PersistenceRecorder(BaseRecorder):
         traces = []
         removed = []
         for i, message in enumerate(messages):
+            message = await self._provider_message(message)
             call = pending.get(message.call_id or "")
             order = call["order_index"] if call else descriptor["reserved_order_index"] + i
             traces.append(message_trace(message, order, tenant_scope=self._tenant_scope))
@@ -503,7 +578,7 @@ class PersistenceRecorder(BaseRecorder):
             remove_pending=tuple(removed),
             set_call_phase=phases,
             set_phase="dispatch" if len(pending) > len(removed) else "model_next",
-            set_fields={"trace_order_offset": self._order_index},
+            set_fields={"trace_order_offset": self._order_index, **self._pii_patch()},
         )
 
         async def consume() -> None:
@@ -513,15 +588,15 @@ class PersistenceRecorder(BaseRecorder):
                 submission_id=descriptor["submission_id"],
                 traces=traces,
                 patch=patch,
+                **({"pii_mapping": self._mapping()} if self.guardrail_engine else {}),
             )
 
         await retry_critical(consume, label="consume_submission", run_id=self._run_id)
         self._loop_state = _apply_loop_patch(self._loop_state, patch)
         self._loop_state["submission"] = None
         self._completed_observations.update(removed)
-        self._known_history.extend(
-            {"role": t.role, "content": t.content, "meta": t.meta} for t in traces
-        )
+        for trace in traces:
+            self._remember(trace)
         self._durable_state = deepcopy(self._loop_state)
 
     def order_observations(self, history: list[Message]) -> None:
@@ -547,17 +622,24 @@ class PersistenceRecorder(BaseRecorder):
         from dendrux.runtime.state import TraceWrite
 
         await self._snapshot(iteration - 1)
+        messages = [await self._provider_message(m) for m in messages]
         view = [
             {"role": t.role, "content": t.content, "meta": t.meta}
             for t in (message_trace(m, 0) for m in messages)
         ]
         self._loop_state["phase"] = "model_next"
-        previous = {_view_identity(entry): entry for entry in self._known_history}
-        for entry in view:
-            old = previous.get(_view_identity(entry))
-            if old is not None:
-                entry["meta"] = {**(old.get("meta") or {}), **entry["meta"]}
-        if [_view_identity(e) for e in view] != [_view_identity(e) for e in self._known_history]:
+        digests = [_view_identity(entry) for entry in view]
+        if digests != [digest for _, digest in self._known_history]:
+            from dendrux.runtime.replay import conversation_records
+
+            # Only a genuine edit needs the old evidence metadata. The normal
+            # boundary compares compact digests without reading history again.
+            previous = {
+                _view_identity({"role": t.role, "content": t.content, "meta": t.meta}): t.meta
+                for t in await conversation_records(self._store, self._run_id)
+            }
+            for entry, digest in zip(view, digests, strict=True):
+                entry["meta"] = {**(previous.get(digest) or {}), **entry["meta"]}
             trace = TraceWrite(
                 generate_ulid(),
                 "rewrite",
@@ -567,7 +649,10 @@ class PersistenceRecorder(BaseRecorder):
             )
             self._order_index += 1
             await self._checkpoint(trace)
-            self._known_history = view
+            self._known_history = [
+                (trace.order_index * 1000 + i, digest) for i, digest in enumerate(digests)
+            ]
+            self._system_messages = [m for m in messages if m.role.value == "system"]
         elif self._loop_state != self._durable_state:
             await self._checkpoint()
 
@@ -591,18 +676,13 @@ class PersistenceRecorder(BaseRecorder):
         await self._snapshot(result.iteration_count)
         pause = result.meta.get("pause_state")
         if pause is not None:
-            from dendrux.types import Message, Role
-
             if self._final_trace is not None:
                 await self._checkpoint(self._final_trace)
                 self._final_trace = None
 
-            prefix = [
-                Message(role=Role.SYSTEM, content=e["content"])
-                for e in self._known_history
-                if e["role"] == "system"
-            ]
-            await self.checkpoint_view([*prefix, *pause.history], result.iteration_count + 1)
+            await self.checkpoint_view(
+                [*self._system_messages, *pause.history], result.iteration_count + 1
+            )
             pause.schema_version = 2
             pause.loop_state_ref = True
             pause.provider_kwargs = dict(provider_kwargs or pause.provider_kwargs)
@@ -724,6 +804,7 @@ class PersistenceRecorder(BaseRecorder):
             if self._seed_input_pending and message.role.value == "user":
                 self._seed_input_pending = False
                 return
+            message = await self._provider_message(message)
             await self._snapshot(iteration)
             pending = self._loop_state.setdefault("pending", [])
             reserved = next((p for p in pending if p["call_id"] == message.call_id), None)
@@ -790,13 +871,7 @@ class PersistenceRecorder(BaseRecorder):
                 else:
                     self._loop_state["phase"] = "finalizing"
             await self._checkpoint(trace)
-            self._known_history.append(
-                {
-                    "role": trace.role,
-                    "content": trace.content,
-                    "meta": {k: v for k, v in trace.meta.items() if k != "dendrux.step"},
-                }
-            )
+            self._remember(trace)
             return
         meta = dict(message.meta) if message.meta else {}
         meta["iteration"] = iteration
@@ -1010,6 +1085,9 @@ class PersistenceRecorder(BaseRecorder):
             correlation_id=interaction_id,
         )
 
+        if self._format2:
+            return  # The preceding fenced event already renewed progress.
+
         # BEST-EFFORT: touch progress for sweep
         try:
             await self._store.touch_progress(self._run_id)
@@ -1129,6 +1207,16 @@ class PersistenceRecorder(BaseRecorder):
             )
 
     async def on_tool_completed(
+        self, run_id: str, tool_call: ToolCall, tool_result: ToolResult, iteration: int
+    ) -> None:
+        """Commit an observation with the mapping that produced its placeholders."""
+        if self.guardrail_engine is not None:
+            async with self._observation_lock:
+                await self._complete_observation(run_id, tool_call, tool_result, iteration)
+        else:
+            await self._complete_observation(run_id, tool_call, tool_result, iteration)
+
+    async def _complete_observation(
         self,
         run_id: str,
         tool_call: ToolCall,
@@ -1152,7 +1240,9 @@ class PersistenceRecorder(BaseRecorder):
             from dendrux.types import tool_result_message
 
             pending = next(p for p in self._loop_state["pending"] if p["call_id"] == tool_call.id)
-            message = (self._result_formatter or tool_result_message)(tool_result)
+            message = await self._provider_message(
+                (self._result_formatter or tool_result_message)(tool_result)
+            )
             observation = message_trace(
                 message, pending["order_index"], tenant_scope=self._tenant_scope
             )
@@ -1175,7 +1265,11 @@ class PersistenceRecorder(BaseRecorder):
                 tool_call.id,
                 None,
             )
-            patch = LoopStatePatch(remove_pending=(tool_call.id,), set_phase="model_next")
+            patch = LoopStatePatch(
+                remove_pending=(tool_call.id,), set_phase="model_next", set_fields=self._pii_patch()
+            )
+            if self.guardrail_engine is not None:
+                extra["pii_mapping"] = self._mapping()
 
             async def complete() -> None:
                 await self._store.complete_tool_call(
@@ -1202,6 +1296,7 @@ class PersistenceRecorder(BaseRecorder):
                 )
 
             await retry_critical(complete, label="complete_tool_call", run_id=run_id)
+            self._loop_state.update(patch.set_fields)
             self._loop_state["pending"] = [
                 p for p in self._loop_state["pending"] if p["call_id"] != tool_call.id
             ]
@@ -1209,13 +1304,15 @@ class PersistenceRecorder(BaseRecorder):
             counts = self._loop_state.setdefault("tool_counts", {})
             counts[tool_call.name] = counts.get(tool_call.name, 0) + 1
             self._completed_observations.add(tool_call.id)
-            self._known_history.append(
-                {"role": observation.role, "content": observation.content, "meta": observation.meta}
-            )
+            self._remember(observation)
             return
 
         if capabilities(self._store).retry_ids:
             extra["row_id"] = generate_ulid()
+
+        if self._format2:
+            # No committed intent: this call was rejected before its effect ran.
+            extra["outcome"] = "failed"
 
         # FAIL-CLOSED with retry: save_tool_call (proof of side effects)
         async def _write_tool() -> None:
@@ -1255,6 +1352,9 @@ class PersistenceRecorder(BaseRecorder):
             },
             correlation_id=tool_call.id,
         )
+
+        if self._format2:
+            return  # The preceding fenced event already renewed progress.
 
         # BEST-EFFORT: touch progress for sweep
         try:

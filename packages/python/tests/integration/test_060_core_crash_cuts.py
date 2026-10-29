@@ -1,4 +1,9 @@
-"""SIGKILL at real format-2 Agent/store boundaries on the private Postgres DB."""
+"""SIGKILL at real format-2 Agent/store boundaries on the private Postgres DB.
+
+Phase 1 verifies durable cuts and resolution, including approval_replay refusal.
+Phase-2a dispatch, replay and observe execution are out of scope; the recovery
+worker only resolves actions and consumes submissions, then is killed again.
+"""
 
 import asyncio
 import multiprocessing
@@ -11,6 +16,7 @@ from dendrux.runtime.persistence import resolve_pending
 CUTS = (
     "assistant",
     "intent",
+    "approval_replay",
     "returned",
     "parallel",
     "gate",
@@ -52,6 +58,12 @@ def _worker(url, cut, connection, effect_path, recovery_run=None):
 
     class Store(SQLAlchemyStateStore):
         finalizing = False
+
+        async def create_run(self, *args, **kwargs):
+            result = await super().create_run(*args, **kwargs)
+            if cut == "startup":
+                halt(result.run_id, cut)
+            return result
 
         async def checkpoint_step(self, run, *, claim_epoch, loop_state, pii_mapping, trace):
             await super().checkpoint_step(
@@ -131,7 +143,7 @@ def _worker(url, cut, connection, effect_path, recovery_run=None):
             actions = resolve_pending(state, rows)
             if actions and actions[0].kind == "consume_submission":
                 raw = await store.get_pause_state(recovery_run)
-                payload = raw["submitted"]
+                payload = raw["submission"]["payload"]
                 messages = []
                 if "submitted_tool_results" in payload:
                     messages = [
@@ -153,11 +165,15 @@ def _worker(url, cut, connection, effect_path, recovery_run=None):
         all_entered = asyncio.Event()
         never = asyncio.Event()
 
-        @tool(idempotent=True)
+        @tool(idempotent=cut != "approval_replay")
         async def change() -> str:
             """Record a visible side effect."""
             with open(effect_path, "a") as output:
                 output.write("effect\n")
+            if cut == "approval_replay":
+                from dendrux.runtime.context import get_delegation_context
+
+                halt(get_delegation_context().run_id, cut)
             return "ok"
 
         @tool(target="client")
@@ -213,8 +229,13 @@ def _worker(url, cut, connection, effect_path, recovery_run=None):
             if cut == "final"
             else LLMResponse(tool_calls=calls)
         )
+        from dendrux.guardrails import PII, Pattern
+
         agent = Agent(
-            prompt="system",
+            prompt="code AB12; product AB12X" if cut == "startup" else "system",
+            guardrails=[PII(extra_patterns=[Pattern("CODE", r"\bAB12\b")], restore="all")]
+            if cut == "startup"
+            else [],
             provider=MockLLM([first, LLMResponse(text="final answer")]),
             tools=tools,
             state_store=store,
@@ -271,7 +292,6 @@ async def _kill_at_cut(url, cut, effect_path, recovery_run=None):
 async def test_a5_sigkill_committed_boundaries(engine, store, tmp_path, cut):
     if engine.dialect.name != "postgresql":
         pytest.skip("SIGKILL crash cuts require Postgres")
-    assert engine.url.database == "dendrux_060_p1_test"
     effect_path = tmp_path / "effects"
     result = await _kill_at_cut(engine.url.render_as_string(hide_password=False), cut, effect_path)
     run = result["run"]
@@ -282,6 +302,7 @@ async def test_a5_sigkill_committed_boundaries(engine, store, tmp_path, cut):
     expected = {
         "assistant": ["dispatch"],
         "intent": ["replay"],
+        "approval_replay": ["approval_replay"],
         "returned": ["replay"],
         "parallel": ["replay", "replay"],
         "gate": ["approval"],
@@ -295,7 +316,7 @@ async def test_a5_sigkill_committed_boundaries(engine, store, tmp_path, cut):
         "final": [],
     }
     assert kinds == expected[cut]
-    if cut == "returned":
+    if cut in ("returned", "approval_replay"):
         assert effect_path.read_text() == "effect\n"
     elif cut != "parallel":
         assert not effect_path.exists()
@@ -316,6 +337,11 @@ async def test_a5_sigkill_committed_boundaries(engine, store, tmp_path, cut):
     # is executed by this phase-1 recovery harness; phase 2 owns the dispatcher.
     await _kill_at_cut(engine.url.render_as_string(hide_password=False), cut, effect_path, run)
     after = await store.get_loop_state(run)
+    if cut == "approval_replay":
+        assert effect_path.read_text() == "effect\n"
+        assert [a.kind for a in resolve_pending(after, await store.get_tool_calls(run))] == [
+            "approval_replay"
+        ]
     if state.get("submission"):
         assert after["submission"] is None
         after_traces = await store.get_traces(run)
@@ -323,3 +349,21 @@ async def test_a5_sigkill_committed_boundaries(engine, store, tmp_path, cut):
         assert await store.get_traces(run) == after_traces
     else:
         assert after == state
+
+
+@pytest.mark.parametrize("engine", ["sqlite_file", "postgres"], indirect=True)
+async def test_startup_sigkill_keeps_provider_seeds_mapping_and_marker(engine, store, tmp_path):
+    from dendrux.runtime.replay import rebuild_history
+
+    effect_path = tmp_path / "effects"
+    result = await _kill_at_cut(
+        engine.url.render_as_string(hide_password=False), "startup", effect_path
+    )
+    run_id = result["run"]
+    assert await store.get_loop_state(run_id) == {"v": 1, "loop": "react"}
+    mapping = await store.get_pii_mapping(run_id)
+    assert mapping["<<CODE_1>>"] == "AB12"
+    rebuilt = await rebuild_history(store, run_id)
+    assert [m.content for m in rebuilt.messages] == ["code <<CODE_1>>; product AB12X", "go"]
+    assert not await store.get_run_events(run_id)
+    assert not effect_path.exists()

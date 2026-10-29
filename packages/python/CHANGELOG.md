@@ -18,6 +18,11 @@ Entries are added as each track merges.
   `agent_runs.strategy` retains its strategy name; recovery classifies the loop
   using `loop_state.loop`.
 
+- Format-2 persisted runs require JSON-only provider options of at most 2 KiB
+  and at most 64 pending calls per assistant batch (configurable through
+  `Limits.max_pending_calls`). Checkpoints use a 32 KiB compact UTF-8 JSON bound
+  on both databases. Storeless and format-1 runs retain their previous limits.
+
 ## 0.5.0 - 2026-10-28
 
 "Trust". Pending and live reads require a tenant scope and hide payloads by default; provider

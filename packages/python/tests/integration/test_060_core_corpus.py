@@ -31,11 +31,15 @@ async def test_a7_format2_provider_corpus(cell, store, engine, monkeypatch):
 
     original = h.RecordingProvider.complete
     comparisons = []
+    rewrites = []
 
     async def checked(provider, messages, tools=None, **kwargs):
         run_id = kwargs.get("run_id")
         record = await store.get_run(run_id) if run_id else None
         if record is not None and record.storage_format == 2:
+            rewrites.extend(
+                await store.get_traces_after(run_id, after_order_index=None, kinds=("rewrite",))
+            )
             rebuilt = await rebuild_history(store, run_id, reasoning_for=provider.model)
             comparisons.append(
                 h.diff(
@@ -52,3 +56,6 @@ async def test_a7_format2_provider_corpus(cell, store, engine, monkeypatch):
     # unchanged format-1 corpus/goldens remain checked by conformance.
     assert len(comparisons) == sum(call["run_id"] is not None for call in recording["calls"])
     assert len(recording["calls"]) == len(h.read_json(h.corpus_path(cell.id))["calls"])
+
+    if "compaction" not in cell.id and "history_edit" not in cell.id:
+        assert not rewrites, [r.order_index for r in rewrites]

@@ -143,9 +143,9 @@ async def test_unknown_loop_never_marks_or_finalizes(store, engine):
     async with engine.begin() as conn:
         await conn.execute(update(AgentRun).where(AgentRun.id == ids[0]).values(loop_state={}))
     before = await store.get_run(ids[0])
-    with pytest.raises(RunNotReclaimableError) as caught:
-        await mark(store)
-    assert caught.value.reason == "loop_unknown"
+    result = await mark(store)
+    assert result.inspected == 1
+    assert not result.reclaimable and not result.finalised and not result.legacy
     assert await store.get_run(ids[0]) == before
     async with engine.begin() as conn:
         await conn.execute(

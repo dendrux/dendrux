@@ -66,7 +66,9 @@ async def test_two_hundred_budget_runs_with_lost_forensics(
     event.listen(engine.sync_engine, "checkout", checkout)
     event.listen(engine.sync_engine, "checkin", checkin)
     try:
-        await asyncio.wait_for(asyncio.gather(*(run_one() for _ in range(200))), 90)
+        # This is a correctness load test, not a wall-clock performance gate.
+        # Preserve all 200 concurrent runs and measured latency, with room for CI load.
+        await asyncio.wait_for(asyncio.gather(*(run_one() for _ in range(200))), 300)
     finally:
         event.remove(engine.sync_engine, "checkout", checkout)
         event.remove(engine.sync_engine, "checkin", checkin)

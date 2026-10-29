@@ -17,6 +17,7 @@ import json
 import logging
 import math
 import re
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, NoReturn, Protocol, cast, overload
@@ -94,6 +95,11 @@ class ClaimResult:
     storage_format: int
     loop_state: dict[str, Any] | None
     submission: dict[str, Any] | None
+
+
+def _initial_loop_state(loop_name: str | None) -> dict[str, Any] | None:
+    kind = {"ReActLoop": "react", "SingleCall": "single_call"}.get(loop_name or "")
+    return {"v": 1, "loop": kind} if kind is not None else None
 
 
 PAUSE_REQUEST_META_KEY = "dendrux.pause_request"
@@ -639,6 +645,7 @@ class StateStore(Protocol):
         idempotency_fingerprint: str | None = None,
         retry_of_run_id: str | None = None,
         seed_traces: Sequence[TraceWrite] | None = None,
+        pii_mapping: dict[str, str] | None = None,
         blob_refs: Sequence[BlobEdge] | None = None,
         blob_refs_scope: str | None = None,
     ) -> CreateRunResult: ...
@@ -679,6 +686,7 @@ class StateStore(Protocol):
         claim_epoch: int | None = None,
         row_id: str | None = None,
         content_digest: str | None = None,
+        outcome: str = "completed",
     ) -> str: ...
 
     async def save_usage(
@@ -1210,6 +1218,7 @@ class StateStore(Protocol):
         meta: dict[str, Any] | None = None,
         blob_refs: Sequence[BlobEdge] | None = None,
         blob_refs_scope: str | None = None,
+        pii_mapping: dict[str, str] | None = None,
     ) -> None: ...
 
     async def consume_submission(
@@ -1220,6 +1229,7 @@ class StateStore(Protocol):
         submission_id: str,
         traces: Sequence[TraceWrite],
         patch: LoopStatePatch,
+        pii_mapping: dict[str, str] | None = None,
     ) -> bool: ...
 
     async def mark_lease_expired(
@@ -1570,6 +1580,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         idempotency_fingerprint: str | None = None,
         retry_of_run_id: str | None = None,
         seed_traces: Sequence[TraceWrite] | None = None,
+        pii_mapping: dict[str, str] | None = None,
         blob_refs: Sequence[BlobEdge] | None = None,
         blob_refs_scope: str | None = None,
     ) -> CreateRunResult:
@@ -1636,6 +1647,10 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                         raise RunCancelledError(run_id, parent_run_id)
                 run = AgentRun(
                     storage_format=storage_format,
+                    pii_mapping=pii_mapping if storage_format == 2 else None,
+                    loop_state=_initial_loop_state((meta or {}).get("dendrux.loop"))
+                    if storage_format == 2
+                    else None,
                     id=run_id,
                     agent_name=agent_name,
                     **_status_values(AgentRunStatus.RUNNING, initial=True),
@@ -1905,6 +1920,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         claim_epoch: int | None = None,
         row_id: str | None = None,
         content_digest: str | None = None,
+        outcome: str = "completed",
     ) -> str:
         from dendrux.db.models import ToolCallRecord
         from dendrux.runtime._digest import content_digest as digest_of
@@ -1917,7 +1933,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                 params=params,
                 result_payload=result_payload,
                 success=success,
-                outcome="completed",
+                outcome=outcome,
             )
         )
         if content_digest is not None and content_digest != digest:
@@ -1945,6 +1961,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                     params=params,
                     result=result_dict,
                     success=success,
+                    outcome=outcome,
                     duration_ms=duration_ms,
                     iteration_index=iteration_index,
                     error_message=error_message,
@@ -2172,6 +2189,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         patch: LoopStatePatch,
         *,
         count_tool: str | None = None,
+        pii_mapping: dict[str, str] | None = None,
     ) -> None:
         from sqlalchemy import case, func, literal, select, update
         from sqlalchemy import cast as sql_cast
@@ -2246,15 +2264,21 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                 .where(
                     AgentRun.id == run_id,
                     AgentRun.claim_epoch == claim_epoch,
-                    func.octet_length(sql_cast(changed, Text)) <= 32768,
                 )
                 .values(
                     updated_at=_dt.datetime.now(_dt.UTC),
                     last_progress_at=_dt.datetime.now(_dt.UTC),
                     loop_state=changed,
+                    **({"pii_mapping": pii_mapping} if pii_mapping is not None else {}),
                 )
+                .returning(AgentRun.loop_state)
             )
-            if not getattr(result, "rowcount", 0):
+            merged = result.scalar_one_or_none()
+            if merged is not None:
+                # Same compact UTF-8 measure as checkpoint_step and SQLite.
+                # A failed bound rolls back the patch and the whole completion.
+                _validate_checkpoint(run_id, merged)
+            else:
                 epoch = await session.scalar(
                     select(AgentRun.claim_epoch).where(AgentRun.id == run_id)
                 )
@@ -2263,7 +2287,12 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                 logger.warning("Run fenced", extra={"run_id": run_id, "code": "run_fenced"})
                 raise RunFencedError(run_id, claim_epoch=claim_epoch)
         else:
-            await self._fence(session, run_id, claim_epoch)
+            await self._fence(
+                session,
+                run_id,
+                claim_epoch,
+                **({"pii_mapping": pii_mapping} if pii_mapping is not None else {}),
+            )
             current = await session.scalar(select(AgentRun.loop_state).where(AgentRun.id == run_id))
             changed = _apply_loop_patch(current or {}, patch)
             if count_tool is not None:
@@ -2351,6 +2380,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         meta: dict[str, Any] | None = None,
         blob_refs: Sequence[BlobEdge] | None = None,
         blob_refs_scope: str | None = None,
+        pii_mapping: dict[str, str] | None = None,
     ) -> None:
         """Atomically resolve one intent, its reserved observation and pending entry."""
         from sqlalchemy import select, update
@@ -2394,6 +2424,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                 claim_epoch,
                 loop_state_patch,
                 count_tool=(observation.meta or {}).get("tool_name"),
+                pii_mapping=pii_mapping,
             )
             row_id = (
                 await session.execute(
@@ -2434,6 +2465,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         submission_id: str,
         traces: Sequence[TraceWrite],
         patch: LoopStatePatch,
+        pii_mapping: dict[str, str] | None = None,
     ) -> bool:
         """Consume a durable submission once, even after an acknowledgement is lost."""
         from sqlalchemy import select, update
@@ -2441,7 +2473,12 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         from dendrux.db.models import AgentRun
 
         async with self._session_factory() as session:
-            await self._fence(session, run_id, claim_epoch)
+            await self._fence(
+                session,
+                run_id,
+                claim_epoch,
+                **({"pii_mapping": pii_mapping} if pii_mapping is not None else {}),
+            )
             row = (
                 await session.execute(
                     select(AgentRun.loop_state, AgentRun.pause_data).where(AgentRun.id == run_id)
@@ -2456,7 +2493,6 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
             _validate_checkpoint(run_id, changed)
             pause = dict(row.pause_data or {})
             pause.pop("submission", None)
-            pause.pop("submitted", None)
             for trace in traces:
                 await self._insert_trace(session, run_id, trace)
             await session.execute(
@@ -3814,7 +3850,13 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                             extra={"run_id": run_id, "code": "submission_missing"},
                         )
                         raise PersistenceError(code="submission_missing")
-                    merged["submitted"] = dict(submitted_data)
+                    merged["submission"] = {
+                        **{
+                            k: submission[k]
+                            for k in ("submission_id", "kind", "pause_id", "call_ids")
+                        },
+                        "payload": dict(submitted_data),
+                    }
                     loop_state = dict(run.loop_state or {})
                     loop_state["submission"] = {
                         k: v for k, v in submission.items() if k != "payload"
@@ -4178,7 +4220,6 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         from sqlalchemy import func, or_, select, update
 
         from dendrux.db.models import AgentRun
-        from dendrux.errors import RunNotReclaimableError
 
         _require_aware_utc("cutoff", cutoff)
         for bound in (batch_size, max_runs, max_returned, reclaim_limit):
@@ -4235,7 +4276,11 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                         if row.lease_expired_at is None and age >= cutoff:
                             return None
                         if row.storage_format == 2 and row.loop not in ("react", "single_call"):
-                            raise RunNotReclaimableError(run_id, "loop_unknown")
+                            logger.warning(
+                                "Skipping run with unknown loop",
+                                extra={"code": "loop_unknown", "run_id": run_id},
+                            )
+                            return None
                         limit = (
                             row.reclaim_limit
                             if row.lease_expired_at is not None and row.reclaim_limit is not None
@@ -5784,6 +5829,21 @@ class _ClaimedStateStore:
         }
     )
 
+    # These methods commit a fence on every successful return. Completion and
+    # submission retries can roll back/no-op, so do not infer renewal from them.
+    progress_writes = frozenset(
+        {
+            "checkpoint_step",
+            "start_tool_call",
+            "save_trace",
+            "save_tool_call",
+            "save_run_event",
+            "save_usage",
+            "save_llm_interaction",
+            "touch_progress",
+        }
+    )
+
     def __init__(self, store: StateStore, run_id: str, epoch: int | ClaimResult) -> None:
         self._store = store
         self._run_id = run_id
@@ -5828,10 +5888,25 @@ class _ClaimedStateStore:
 
             async def fenced(run_id: str, *args: Any, **kwargs: Any) -> Any:
                 kwargs["claim_epoch"] = self.claim_epoch
+                started = time.monotonic()
                 result = await method(run_id, *args, **kwargs)
                 if name == "touch_progress" and result is False:
                     logger.warning("Run fenced", extra={"run_id": run_id, "code": "run_fenced"})
                     raise RunFencedError(run_id, claim_epoch=self.claim_epoch)
+                if self.storage_format == 2 and name in self.progress_writes:
+                    from dendrux.runtime.context import get_delegation_context
+
+                    ctx = get_delegation_context()
+                    if (
+                        ctx is not None
+                        and ctx.persisted
+                        and ctx.run_id == run_id
+                        and ctx.state_store is self
+                    ):
+                        # Use request start, not return time: a slow commit must
+                        # not make an old database timestamp appear fresh.
+                        ctx._lease_at[0] = max(ctx._lease_at[0], started)
+                        ctx._lease_failures[0] = 0
                 if name in status_writes and (result is False or result is None):
                     control = await read_run_control(self._store, run_id)
                     if control.claim_epoch is not None and control.claim_epoch != self.claim_epoch:

@@ -327,7 +327,11 @@ class SingleCall(Loop):
         control_reader = _cancel_reader(state_store, resolved_run_id)
 
         # Incoming guardrail — scan all messages
-        g_engine = GuardrailEngine(agent.guardrails) if agent.guardrails else None
+        g_engine = getattr(recorder, "guardrail_engine", None) or (
+            GuardrailEngine(agent.guardrails, pii_mapping=initial_pii_mapping)
+            if agent.guardrails
+            else None
+        )
         checkpoint_state, checkpoint_budget = _single_checkpoint(
             recorder,
             agent,

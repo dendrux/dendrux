@@ -50,8 +50,6 @@ from dendrux.loops._helpers import (
     notify_run_failed,
     notify_run_finished,
     notify_run_started,
-    notify_tool,
-    notify_tool_started,
     record_message,
     record_run_failed,
     record_run_finished,
@@ -91,7 +89,7 @@ from dendrux.runtime.replay import (
     user_trace_message,
     validate_replay_args,
 )
-from dendrux.runtime.state import ClaimResult, claimed_store, unclaimed_store
+from dendrux.runtime.state import ClaimResult, _initial_loop_state, claimed_store, unclaimed_store
 from dendrux.runtime.submit import (
     GOVERNANCE_KEY,
     claim_paused_validated,
@@ -165,7 +163,7 @@ class _TraceNotifier:
         return getattr(self.inner, name)
 
     async def on_tool_started(self, run_id: str, call: ToolCall, iteration: int) -> None:
-        await notify_tool_started(self.inner, run_id, call, iteration)
+        await self.inner.on_tool_started(run_id, call, iteration)
         ctx = get_delegation_context()
         link = validate_trace_link(notifier_span_link(self.inner, run_id, call.id))
         if ctx is not None and ctx.run_id == run_id and link is not None:
@@ -175,7 +173,7 @@ class _TraceNotifier:
         self, run_id: str, call: ToolCall, result: ToolResult, iteration: int
     ) -> None:
         try:
-            await notify_tool(self.inner, run_id, call, result, iteration)
+            await self.inner.on_tool_completed(run_id, call, result, iteration)
         finally:
             token = self.tokens.pop(call.id, None)
             if token is not None:
@@ -1626,9 +1624,6 @@ async def run(
         result = await run(agent, provider=provider, user_input="What is 15 + 27?")
         print(result.answer)
     """
-    from dendrux.types import _validate_provider_kwargs
-
-    _validate_provider_kwargs(kwargs)
     tenant_id = resolve_runner_tenant(agent, "run", tenant_id)
     skill_session = SkillSession.prepare(
         agent, loop=loop or agent.loop or ReActLoop(), explicit=activate_skills
@@ -1802,7 +1797,7 @@ async def run(
                             user_input_parts=user_parts,
                         )
 
-                    seed_kwargs = _runtime_seeds(
+                    seed_kwargs, run_guardrails = await _runtime_seeds(
                         state_store,
                         agent,
                         provider,
@@ -1811,6 +1806,7 @@ async def run(
                         provider_kwargs,
                         seeded_history,
                         user_input=user_input,
+                        run_id=run_id,
                         tenant_id=tenant_id,
                         replay_req=replay_req,
                         replay_runs=replay_runs,
@@ -1847,7 +1843,14 @@ async def run(
                     state_store = claimed_store(
                         state_store,
                         run_id,
-                        ClaimResult(0, create_result.storage_format, None, None),
+                        ClaimResult(
+                            0,
+                            create_result.storage_format,
+                            _initial_loop_state(type(resolved_loop).__name__)
+                            if create_result.storage_format == 2
+                            else None,
+                            None,
+                        ),
                     )
                     owned = True
 
@@ -1872,6 +1875,7 @@ async def run(
                         provider_name=type(provider).__name__,
                         target_lookup=target_lookup,
                         seed_traces=seed_kwargs.get("seed_traces"),
+                        guardrail_engine=run_guardrails,
                         **_recorder_image_kwargs(tenant_id, provider),
                     )
 
@@ -2127,7 +2131,7 @@ async def run(
                 reset_delegation_context(ctx_token)
 
 
-def _runtime_seeds(
+async def _runtime_seeds(
     store: StateStore,
     agent: Agent,
     provider: LLMProvider,
@@ -2137,18 +2141,19 @@ def _runtime_seeds(
     history: list[Message] | None,
     *,
     user_input: str,
+    run_id: str,
     tenant_id: str | None = None,
     replay_req: ReplayRequest | None = None,
     replay_runs: list[Any] | None = None,
     normalized_history: list[Message] | None = None,
     context: list[ContextBlock] | None = None,
     user_parts: tuple[ContentPart, ...] | None = None,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], Any]:
     from dendrux.runtime._capabilities import capabilities
     from dendrux.runtime.persistence import seed_trace_kwargs
 
     if not capabilities(store).checkpointing:
-        return {}
+        return {}, None
     if replay_req is not None:
         plan = expand_replay(
             replay_runs or [],
@@ -2163,10 +2168,12 @@ def _runtime_seeds(
             session=current_skill_session(agent),
             user_parts=user_parts,
         )
-    if history is None:
+    if not history:
         history = fold_context(
             [], context, user_input, session=current_skill_session(agent), user_parts=user_parts
         )
+    if history is None:
+        history = [Message(role=Role.USER, content=user_input)]
     from dendrux.media._runtime import tenant_scope_for
 
     messages = [
@@ -2184,9 +2191,26 @@ def _runtime_seeds(
         if history and any(m.role == Role.USER for m in history)
         else None
     )
-    return seed_trace_kwargs(
-        store, messages, tenant_scope=tenant_scope_for(tenant_id), own_input=own_input
-    )
+    from dendrux.guardrails import GuardrailEngine
+
+    engine = GuardrailEngine(agent.guardrails, run_id=run_id) if agent.guardrails else None
+    if engine is not None:
+        messages = [
+            (await engine.scan_incoming_message(m, index=i))[0] for i, m in enumerate(messages)
+        ]
+    if engine is not None and own_input is not None:
+        own_input = (await engine.scan_incoming_message(own_input))[0]
+        if "wire_content" in own_input.meta:
+            own_index = max(i for i, m in enumerate(messages) if m.role == Role.USER)
+            own_input = replace(
+                own_input, meta={**own_input.meta, "wire_content": messages[own_index].content}
+            )
+    return {
+        **seed_trace_kwargs(
+            store, messages, tenant_scope=tenant_scope_for(tenant_id), own_input=own_input
+        ),
+        "pii_mapping": engine.get_pii_mapping() if engine else None,
+    }, engine
 
 
 async def _apply_replay(
@@ -2598,9 +2622,6 @@ async def retry(
     """
     # 1. Validate source run is terminal. A missing run and another tenant's
     # run raise the same RunNotFoundError (B13), so retry is no existence oracle.
-    from dendrux.types import _validate_provider_kwargs
-
-    _validate_provider_kwargs(kwargs)
     tenant_id = resolve_runner_tenant(agent, "retry", tenant_id)
     from dendrux.errors import RunNotFoundError
 
@@ -2746,7 +2767,7 @@ async def retry(
             if live:
                 input_edges = {"blob_refs": live, "blob_refs_scope": image_runtime.tenant_scope}
 
-        seed_kwargs = _runtime_seeds(
+        seed_kwargs, run_guardrails = await _runtime_seeds(
             state_store,
             agent,
             provider,
@@ -2755,6 +2776,7 @@ async def retry(
             provider_kwargs,
             initial_history,
             user_input=user_input,
+            run_id=run_id,
             tenant_id=tenant_id,
         )
         create_result = await state_store.create_run(
@@ -2773,7 +2795,16 @@ async def retry(
         )
         run_id = create_result.run_id
         state_store = claimed_store(
-            state_store, run_id, ClaimResult(0, create_result.storage_format, None, None)
+            state_store,
+            run_id,
+            ClaimResult(
+                0,
+                create_result.storage_format,
+                _initial_loop_state(type(resolved_loop).__name__)
+                if create_result.storage_format == 2
+                else None,
+                None,
+            ),
         )
 
         # Create persistence recorder
@@ -2791,6 +2822,7 @@ async def retry(
             provider_name=type(provider).__name__,
             target_lookup=target_lookup,
             seed_traces=seed_kwargs.get("seed_traces"),
+            guardrail_engine=run_guardrails,
             **_recorder_image_kwargs(tenant_id, provider),
         )
 
@@ -3059,9 +3091,6 @@ def run_stream(
     # Full resolution (parent context, clamping) happens inside _generate()
     # because parent_ctx requires async state_store resolution first.
     # But validation of the raw input can fail fast here.
-    from dendrux.types import _validate_provider_kwargs
-
-    _validate_provider_kwargs(kwargs)
     tenant_id = resolve_runner_tenant(agent, "stream", tenant_id)
     if (
         not isinstance(max_delegation_depth, _UnsetType)
@@ -3291,7 +3320,7 @@ def run_stream(
                         user_input_parts=user_parts,
                     )
                 try:
-                    seed_kwargs = _runtime_seeds(
+                    seed_kwargs, run_guardrails = await _runtime_seeds(
                         store,
                         agent,
                         provider,
@@ -3300,6 +3329,7 @@ def run_stream(
                         provider_kwargs,
                         seeded_history,
                         user_input=user_input,
+                        run_id=run_id,
                         tenant_id=eff_tenant,
                         replay_req=replay_req,
                         replay_runs=replay_runs,
@@ -3348,7 +3378,16 @@ def run_stream(
                 if create_result.outcome == "existing_active":
                     raise RunAlreadyActiveError(run_id, create_result.status)
                 store = claimed_store(
-                    store, run_id, ClaimResult(0, create_result.storage_format, None, None)
+                    store,
+                    run_id,
+                    ClaimResult(
+                        0,
+                        create_result.storage_format,
+                        _initial_loop_state(type(resolved_loop).__name__)
+                        if create_result.storage_format == 2
+                        else None,
+                        None,
+                    ),
                 )
                 _shared["state_store"] = store
                 _shared["claimed"] = True
@@ -3367,6 +3406,7 @@ def run_stream(
                     provider_name=type(provider).__name__,
                     target_lookup=target_lookup,
                     seed_traces=seed_kwargs.get("seed_traces"),
+                    guardrail_engine=run_guardrails,
                     **_recorder_image_kwargs(eff_tenant, provider),
                 )
 
@@ -3898,6 +3938,7 @@ async def _prepare_resume(
     extra_notifier: LoopNotifier | None = None,
     user_parts: tuple[ContentPart, ...] | None = None,
     tenant_id: str | None = None,
+    pii_mapping: dict[str, str] | None = None,
 ) -> _ResumeContext:
     """Build everything needed to re-enter the loop after a resume.
 
@@ -3962,6 +4003,13 @@ async def _prepare_resume(
     for fn in agent.tools:
         td = get_tool_def(fn)
         target_lookup[td.name] = td.target
+    from dendrux.guardrails import GuardrailEngine
+
+    run_guardrails = (
+        GuardrailEngine(agent.guardrails, pii_mapping=pii_mapping, run_id=run_id)
+        if pause_state.schema_version == 2 and agent.guardrails
+        else None
+    )
     recorder = PersistenceRecorder(
         state_store,
         run_id,
@@ -3969,6 +4017,7 @@ async def _prepare_resume(
         provider_name=type(provider).__name__,
         target_lookup=target_lookup,
         initial_order_index=trace_order_offset,
+        guardrail_engine=run_guardrails,
         **_recorder_image_kwargs(tenant_id, provider),
     )
 
@@ -5041,6 +5090,7 @@ async def _resume_core(
                 extra_notifier=extra_notifier,
                 user_parts=user_parts,
                 tenant_id=run_tenant,
+                pii_mapping=_saved_pii_mapping,
             )
             image_runtime = _image_runtime(agent, state_store, run_tenant, run_id)
 

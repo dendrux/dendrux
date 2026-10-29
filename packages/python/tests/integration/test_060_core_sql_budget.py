@@ -102,8 +102,9 @@ async def test_transaction_statement_costs(store, engine, monkeypatch, record_pr
     assert sum(count for name, count in counts.items() if name != "creation") <= 25
 
 
+@pytest.mark.parametrize("streaming", [False, True])
 async def test_agent_iteration_statement_budget(
-    store, engine, monkeypatch, record_property, tmp_path
+    store, engine, monkeypatch, record_property, tmp_path, streaming
 ):
     """Count every SQL statement in two consecutive actual nonterminal Agent iterations."""
     if engine.dialect.name != "postgresql":
@@ -198,7 +199,17 @@ async def test_agent_iteration_statement_budget(
     usage = UsageStats(
         input_tokens=10, output_tokens=5, total_tokens=15, cost_usd=0.001, cost_source="provider"
     )
-    model = MockLLM(
+
+    class Model(MockLLM):
+        async def complete_stream(self, *args, **kwargs):
+            from dendrux.types import StreamEvent, StreamEventType
+
+            response = await self.complete(*args, **kwargs)
+            for _ in range(50):
+                yield StreamEvent(type=StreamEventType.TEXT_DELTA, text="x")
+            yield StreamEvent(type=StreamEventType.DONE, raw=response)
+
+    model = Model(
         [
             LLMResponse(tool_calls=[ToolCall("work")], usage=usage),
             LLMResponse(tool_calls=[ToolCall("work")], usage=usage),
@@ -208,9 +219,15 @@ async def test_agent_iteration_statement_budget(
     event.listen(engine.sync_engine, "begin", begin)
     event.listen(engine.sync_engine, "before_cursor_execute", capture)
     try:
-        result = await Agent(
+        agent = Agent(
             prompt="p", tools=[work], provider=model, state_store=store, strict_tenancy=False
-        ).run("go", notifier=Observer())
+        )
+        if streaming:
+            async with agent.stream("go", notifier=Observer()) as stream:
+                events = [event async for event in stream]
+            result = events[-1].run_result
+        else:
+            result = await agent.run("go", notifier=Observer())
     finally:
         event.remove(engine.sync_engine, "begin", begin)
         event.remove(engine.sync_engine, "before_cursor_execute", capture)
@@ -238,6 +255,10 @@ async def test_agent_iteration_statement_budget(
             == 1
         )
         assert len(statements) <= 25, counts[name]
+        assert len(statements) <= 22, counts[name]
+        assert not any(
+            t["operation"] == "touch_progress" for t in transactions if t["phase"] == name
+        ), counts[name]
 
 
 @pytest.mark.parametrize("operation", ["checkpoint", "intent", "completion", "event"])
@@ -334,3 +355,45 @@ async def test_non_execution_writes_keep_explicit_progress_policy(
         )
     await store.save_run_event(run_id, claim_epoch=epoch, event_type="llm.completed")
     assert (await store.get_run(run_id)).last_progress_at == old
+
+
+@pytest.mark.parametrize("fmt", [1, 2])
+@pytest.mark.parametrize("same_run", [False, True])
+@pytest.mark.parametrize("same_store", [False, True])
+@pytest.mark.parametrize("failed", [False, True])
+async def test_only_committed_owner_fences_refresh_local_lease(
+    store, engine, monkeypatch, fmt, same_run, same_store, failed
+):
+    from dendrux.runtime.context import (
+        DelegationContext,
+        reset_delegation_context,
+        set_delegation_context,
+    )
+    from dendrux.runtime.state import ClaimResult, claimed_store
+    from tests._fixtures.storage import pin_storage_format
+
+    await pin_storage_format(engine, fmt)
+    run = generate_ulid()
+    await store.create_run(run, "lease")
+    view = claimed_store(store, run, ClaimResult(0, fmt, None, None))
+    ctx = DelegationContext(
+        run_id=run if same_run else "other",
+        persisted=True,
+        state_store=view if same_store else object(),
+    )
+    if failed:
+
+        async def reject(*args, **kwargs):
+            raise RuntimeError("failed fence")
+
+        monkeypatch.setattr(store, "checkpoint_step", reject)
+    token = set_delegation_context(ctx)
+    try:
+        if failed:
+            with pytest.raises(RuntimeError, match="failed fence"):
+                await view.checkpoint_step(run, loop_state={}, pii_mapping=None, trace=None)
+        else:
+            await view.checkpoint_step(run, loop_state={}, pii_mapping=None, trace=None)
+        assert (ctx._lease_at[0] > 0) == (fmt == 2 and same_run and same_store and not failed)
+    finally:
+        reset_delegation_context(token)

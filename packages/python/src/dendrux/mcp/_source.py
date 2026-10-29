@@ -220,6 +220,10 @@ class MCPSource:
     launches, inside the developer's trust boundary; an HTTP server is the
     untrusted case. Setting ``max_discovery_bytes`` on a stdio source raises
     ``ValueError``.
+
+    Replay-safety hints are ignored on every transport by default. Set
+    ``trust_replay_hints=True`` only when the source is trusted to label effects
+    correctly; then literal read-only or idempotent hints permit automatic replay.
     """
 
     name: str
@@ -244,8 +248,11 @@ class MCPSource:
     discovery_timeout: float = 60.0
     max_discovery_tools: int = 2000
     max_discovery_bytes: int = DEFAULT_MAX_DISCOVERY_BYTES
+    trust_replay_hints: bool = False
 
     def __post_init__(self) -> None:
+        if not isinstance(self.trust_replay_hints, bool):
+            raise ValueError("MCPSource trust_replay_hints must be a bool.")
         self._validate_name()
         self._validate_transport()
         self._validate_http_settings()
@@ -366,10 +373,12 @@ class MCPSource:
         discovery_timeout: float = 60.0,
         max_discovery_tools: int = 2000,
         max_discovery_bytes: int = DEFAULT_MAX_DISCOVERY_BYTES,
+        trust_replay_hints: bool = False,
     ) -> MCPSource:
         """Configure a production Streamable HTTP MCP source."""
         return cls(
             name=name,
+            trust_replay_hints=trust_replay_hints,
             url=url,
             headers=dict(headers or {}),
             auth=auth,
@@ -402,12 +411,14 @@ class MCPSource:
         max_discovery_pages: int = 100,
         discovery_timeout: float = 60.0,
         max_discovery_tools: int = 2000,
+        trust_replay_hints: bool = False,
     ) -> MCPSource:
         """Configure a trusted local subprocess MCP source."""
         if isinstance(command, str):
             raise ValueError("MCPSource command must be a non-empty sequence of strings.")
         return cls(
             name=name,
+            trust_replay_hints=trust_replay_hints,
             command=tuple(command),
             env=dict(env or {}),
             cwd=Path(cwd) if cwd is not None else None,

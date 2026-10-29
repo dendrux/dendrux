@@ -169,9 +169,8 @@ def _build_tool_def(
         parameters=tool.input_schema,
         target=ToolTarget.SERVER,
         parallel=_tool_is_parallel_safe(tool.annotations) and not serial,
-        # Stdio is an explicitly trusted local process. Remote annotations are
-        # untrusted metadata and cannot authorize replay of server effects.
-        idempotent=source.transport == "stdio"
+        # Transport selection does not authorize replay of server effects.
+        idempotent=getattr(source, "trust_replay_hints", False) is True
         and (
             getattr(tool.annotations, "idempotent_hint", False) is True
             or getattr(tool.annotations, "read_only_hint", False) is True

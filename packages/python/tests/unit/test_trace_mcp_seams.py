@@ -27,11 +27,13 @@ async def test_run_started_signature_gate(modern):
 
 @pytest.mark.parametrize("transport", ["stdio", "http"])
 @pytest.mark.parametrize("hint", ["idempotent_hint", "read_only_hint", "neither", "missing"])
-def test_idempotency_requires_trusted_source(transport, hint):
+@pytest.mark.parametrize("trust", [None, False, True])
+def test_idempotency_requires_trusted_source(transport, hint, trust):
+    kwargs = {} if trust is None else {"trust_replay_hints": trust}
     source = (
-        MCPSource.stdio("local", ["unused"])
+        MCPSource.stdio("local", ["unused"], **kwargs)
         if transport == "stdio"
-        else MCPSource.http("remote", "https://example.com/mcp")
+        else MCPSource.http("remote", "https://example.com/mcp", **kwargs)
     )
     annotations = (
         None
@@ -52,7 +54,7 @@ def test_idempotency_requires_trusted_source(transport, hint):
     )
     assert skipped == []
     assert definitions[0].idempotent == (
-        transport == "stdio" and hint in ("idempotent_hint", "read_only_hint")
+        trust is True and hint in ("idempotent_hint", "read_only_hint")
     )
 
 
@@ -82,3 +84,22 @@ def test_replay_event_inventory_hides_provider_chosen_call_ids():
         {"tool_name": "work", "call_id": "arbitrary-provider-text", "idempotent": True},
     ) == {"tool_name": "work", "idempotent": True}
     assert _apply(_SCHEMAS["tool.replayed"], {"call_id": "arbitrary-provider-text"}) == {}
+
+
+@pytest.mark.parametrize("trust", [1, "true", None])
+def test_replay_trust_requires_boolean(trust):
+    with pytest.raises(ValueError):
+        MCPSource(name="local", command=("unused",), trust_replay_hints=trust)
+
+
+@pytest.mark.parametrize("hint", [1, "true", False, None])
+def test_replay_hints_require_literal_true(hint):
+    source = MCPSource.stdio("local", ["unused"], trust_replay_hints=True)
+    annotations = ToolAnnotations.model_construct(idempotent_hint=hint, read_only_hint=False)
+    definitions, _ = build_mcp_tool_defs(
+        source=source,
+        namespace="n",
+        tools=[Tool(name="work", input_schema={"type": "object"}, annotations=annotations)],
+        connection_info=None,
+    )
+    assert definitions[0].idempotent is False

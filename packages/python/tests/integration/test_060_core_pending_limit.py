@@ -37,7 +37,7 @@ def test_rebinding_epoch_keeps_token_only_for_same_run():
 
 @pytest.mark.parametrize("streaming", [False, True])
 @pytest.mark.parametrize(
-    "storage_format,count,cap", [(2, 65, 64), (2, 32, 64), (2, 5, 4), (1, 5, 4)]
+    "storage_format,count,cap", [(2, 65, 64), (2, 32, 64), (2, 5, 4), (1, 5, 4), (0, 5, 4)]
 )
 async def test_pending_limit_before_execution(
     store, engine, streaming, storage_format, count, cap, caplog
@@ -46,7 +46,7 @@ async def test_pending_limit_before_execution(
         await conn.execute(
             update(DendruxSetting)
             .where(DendruxSetting.key == "storage_format")
-            .values(value=str(storage_format))
+            .values(value=str(storage_format or 1))
         )
     executed = []
 
@@ -68,7 +68,7 @@ async def test_pending_limit_before_execution(
         name="bounded",
         prompt="test",
         provider=provider,
-        state_store=store,
+        state_store=store if storage_format else None,
         tools=[echo],
         limits=Limits(max_pending_calls=cap),
         strict_tenancy=False,

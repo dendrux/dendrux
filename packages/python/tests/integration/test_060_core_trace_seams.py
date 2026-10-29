@@ -234,3 +234,57 @@ async def test_retry_starts_its_own_trace(store, single):
     assert retried.status == RunStatus.SUCCESS
     assert observer.starts == [(retried.run_id, None)]
     assert (await store.get_run(retried.run_id)).trace_link == OTHER
+
+
+@pytest.mark.parametrize("fmt", [1, 2])
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("fail_start", [False, True])
+async def test_tool_notifier_failures_reach_result_warnings(
+    store, engine, fmt, streaming, fail_start
+):
+    from tests._fixtures.storage import pin_storage_format
+
+    await pin_storage_format(engine, fmt)
+    executed = []
+
+    class FailingObserver(Observer):
+        async def on_tool_started(self, run_id, call, iteration):
+            if fail_start:
+                raise RuntimeError("private notifier details")
+
+        async def on_tool_completed(self, run_id, call, result, iteration):
+            raise RuntimeError("private notifier details")
+
+    @tool()
+    async def work() -> str:
+        """Run despite an observer failure."""
+        executed.append(get_delegation_context().tool_span_link)
+        return "ok"
+
+    class Model(MockLLM):
+        async def complete(self, *args, **kwargs):
+            assert get_delegation_context().tool_span_link is None
+            return await super().complete(*args, **kwargs)
+
+    agent = Agent(
+        prompt="p",
+        provider=Model([LLMResponse(tool_calls=[ToolCall("work")]), LLMResponse(text="done")]),
+        tools=[work],
+        state_store=store,
+        strict_tenancy=False,
+    )
+    notifier = FailingObserver()
+    if streaming:
+        stream = agent.stream("go", notifier=notifier)
+        async for _ in stream:
+            pass
+        result = stream.result
+    else:
+        result = await agent.run("go", notifier=notifier)
+    assert result.status == RunStatus.SUCCESS
+    assert executed == [None if fail_start else SPAN]
+    expected = ["on_tool_started failed at iteration 1"] if fail_start else []
+    expected.append("on_tool_completed failed at iteration 1")
+    assert result.meta.get("notifier_warnings") == expected
+    assert "private notifier details" not in str(result.meta)
+    assert get_delegation_context() is None

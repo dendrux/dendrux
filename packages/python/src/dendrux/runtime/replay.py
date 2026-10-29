@@ -395,31 +395,6 @@ async def rebuild_history(
     messages = rebuild_messages(
         await conversation_records(store, run_id, limits=limits), reasoning_for=reasoning_for
     )
-    mapping = await store.get_pii_mapping(run_id) or {}
-    reverse = {value: key for key, value in mapping.items() if isinstance(value, str) and value}
-    if reverse:
-        import re
-
-        from dendrux.types import TextPart
-
-        pattern = re.compile("|".join(re.escape(v) for v in sorted(reverse, key=len, reverse=True)))
-
-        def redact(text: str) -> str:
-            return pattern.sub(lambda match: reverse[match.group()], text)
-
-        messages = [
-            replace(
-                m,
-                content=redact(m.content),
-                parts=tuple(
-                    replace(p, text=redact(p.text)) if isinstance(p, TextPart) else p
-                    for p in m.parts
-                )
-                if m.parts is not None
-                else None,
-            )
-            for m in messages
-        ]
     from dendrux.errors import RunNotReclaimableError
     from dendrux.types import Limits, _step_from_dict
 
