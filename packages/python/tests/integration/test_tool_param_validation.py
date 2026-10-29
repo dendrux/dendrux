@@ -170,7 +170,11 @@ async def test_parse_error_survives_client_tool_pause_and_resume(store):
     raw_pause = await store.get_pause_state(paused.run_id)
     assert BAD_REFUND_ARGS not in json.dumps(raw_pause)
     state = PauseState.from_dict(raw_pause)
-    assistant = next(m for m in state.history if m.tool_calls)
+    from dendrux.runtime.replay import rebuild_history
+
+    assistant = next(
+        m for m in (await rebuild_history(store, paused.run_id)).messages if m.tool_calls
+    )
     assert assistant.tool_calls[0].parse_error == BAD_REFUND_ERROR
     assert [tc.name for tc in state.pending_tool_calls] == ["read_range"]
 

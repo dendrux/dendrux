@@ -1912,6 +1912,10 @@ async def reset_database(engine: AsyncEngine) -> None:
 
             await conn.run_sync(lambda c: seed_settings(c, active=True))
 
+    from tests._fixtures.storage import pin_storage_format
+
+    await pin_storage_format(engine, 1)
+
 
 # ---------------------------------------------------------------------------
 # Cell runner

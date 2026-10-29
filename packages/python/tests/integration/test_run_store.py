@@ -543,7 +543,7 @@ class TestGetTraces:
         assert len(traces) == 3
         assert all(isinstance(t, TraceEntry) for t in traces)
         assert [t.role for t in traces] == ["user", "assistant", "tool"]
-        assert [t.order_index for t in traces] == [0, 1, 2]
+        assert [t.order_index for t in traces] == [0, 1000, 2000]
         assert traces[2].meta == {"call_id": "c1"}
 
     async def test_unknown_run_returns_empty(self, store) -> None:
@@ -558,7 +558,7 @@ class TestGetTraces:
             )
 
         page = await store.get_traces("r1", limit=2, offset=1)
-        assert [t.order_index for t in page] == [1, 2]
+        assert [t.order_index for t in page] == [1000, 2000]
 
 
 # ------------------------------------------------------------------

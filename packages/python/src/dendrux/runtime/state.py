@@ -1366,7 +1366,7 @@ def _validate_checkpoint(run_id: str, value: dict[str, Any]) -> None:
     from dendrux.types import _validate_persistable
 
     _validate_persistable(value, "loop_state")
-    if _json_bytes(value) > 8192 or _json_bytes(value.get("provider_kwargs", {})) > 2048:
+    if _json_bytes(value) > 32768 or _json_bytes(value.get("provider_kwargs", {})) > 2048:
         _checkpoint_error(run_id)
 
 
@@ -2078,6 +2078,40 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
             ),
             digest=digest,
         )
+        if trace.trace_kind == "rewrite":
+            # A run-owned pointer avoids scanning every conversation row to
+            # discover whether a rewrite exists. It commits with the trace.
+            from sqlalchemy import JSON, func, literal, update
+            from sqlalchemy import cast as sql_cast
+            from sqlalchemy.dialects.postgresql import JSONB
+
+            from dendrux.db.models import AgentRun
+
+            metadata: Any
+            pointer = {"trace_id": trace.trace_id, "order_index": trace.order_index}
+            current_order = AgentRun.meta["dendrux.latest_rewrite"]["order_index"].as_integer()
+            if session.bind is not None and session.bind.dialect.name == "postgresql":
+                metadata = sql_cast(
+                    func.coalesce(
+                        func.nullif(sql_cast(AgentRun.meta, JSONB), literal(None, JSONB)),
+                        literal({}, JSONB),
+                    ).op("||")(literal({"dendrux.latest_rewrite": pointer}, JSONB)),
+                    JSON,
+                )
+            else:
+                metadata = func.json_set(
+                    func.coalesce(func.nullif(AgentRun.meta, "null"), "{}"),
+                    '$."dendrux.latest_rewrite"',
+                    func.json(json.dumps(pointer)),
+                )
+            await session.execute(
+                update(AgentRun)
+                .where(
+                    AgentRun.id == run_id,
+                    (current_order.is_(None)) | (current_order <= trace.order_index),
+                )
+                .values(meta=metadata)
+            )
         if trace.blob_refs:
             await write_blob_refs(
                 session,
@@ -2483,7 +2517,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         """Project the latest replacement prefix followed by its conversation suffix."""
         from sqlalchemy import select
 
-        from dendrux.db.models import ReactTrace
+        from dendrux.db.models import AgentRun, ReactTrace
 
         _positive_page(limit)
         limit = min(limit, 1000)
@@ -2494,12 +2528,20 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                 ReactTrace.agent_run_id == run_id, _run_in_scope(run_id, tenant_id)
             )
             rewrite = None
+            rewrite_order = None
             if not include_superseded:
-                rewrite = await session.scalar(
-                    base.where(ReactTrace.trace_kind == "rewrite")
-                    .order_by(ReactTrace.order_index.desc())
-                    .limit(1)
+                pointer = await session.scalar(
+                    select(AgentRun.meta["dendrux.latest_rewrite"]).where(
+                        AgentRun.id == run_id,
+                        _run_in_scope(run_id, tenant_id),
+                    )
                 )
+                if isinstance(pointer, dict):
+                    rewrite_order = pointer["order_index"]
+                    if after < rewrite_order * 1000 + 999:
+                        rewrite = await session.scalar(
+                            base.where(ReactTrace.id == pointer["trace_id"])
+                        )
             if rewrite is not None:
                 for index, message in enumerate(json.loads(rewrite.content), 1):
                     position = rewrite.order_index * 1000 + index
@@ -2523,10 +2565,10 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
             if len(entries) <= limit:
                 kinds = ("seed", "turn", "rewrite") if include_superseded else ("seed", "turn")
                 stmt = base.where(
-                    ReactTrace.trace_kind.in_(kinds), ReactTrace.order_index * 1000 > after
+                    ReactTrace.trace_kind.in_(kinds), ReactTrace.order_index > after // 1000
                 )
-                if rewrite is not None:
-                    stmt = stmt.where(ReactTrace.order_index > rewrite.order_index)
+                if rewrite_order is not None:
+                    stmt = stmt.where(ReactTrace.order_index > rewrite_order)
                 rows = (
                     await session.scalars(
                         stmt.order_by(ReactTrace.order_index).limit(limit + 1 - len(entries))

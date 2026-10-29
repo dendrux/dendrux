@@ -831,6 +831,21 @@ class RunStore:
         for a run, ordered by ``order_index``. ``limit``/``offset`` push
         pagination into SQL. Empty when the run is outside ``tenant_id``."""
         _check_page(None, limit, offset)
+        from dendrux.runtime._capabilities import capabilities
+        from dendrux.runtime.replay import conversation_records
+
+        if capabilities(self._state).checkpointing:
+            record = await self._scoped_read(self._state.get_run, run_id, tenant_id)
+            if record is not None and record.storage_format == 2:
+                rows = await conversation_records(
+                    self._state,
+                    run_id,
+                    tenant_id=tenant_id,
+                    scoped=True,
+                    limit=limit,
+                    offset=offset,
+                )
+                return [_trace_to_public(r) for r in rows]
         rows = await self._scoped_read(
             self._state.get_traces, run_id, tenant_id, limit=limit, offset=offset
         )

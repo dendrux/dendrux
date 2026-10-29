@@ -89,6 +89,15 @@ class ImageStore(SQLAlchemyStateStore):
         self.edge_calls: list[tuple[str, str]] = []  # (method, run_id)
         self.tenants: dict[str, str | None] = {}
 
+    async def _insert_trace(self, session, run_id, trace):
+        from dataclasses import replace
+
+        if trace.blob_refs:
+            self._check(run_id, trace.blob_refs_scope, trace.blob_refs)
+            self._add("trace_write", run_id, trace.blob_refs)
+            trace = replace(trace, blob_refs=None, blob_refs_scope=None)
+        return await super()._insert_trace(session, run_id, trace)
+
     # --- edge-writing record methods (B's kwargs) ---
     def _check(self, run_id: str, scope: str | None, edges: Any) -> None:
         run_scope = _scope(self.tenants.get(run_id))
@@ -537,12 +546,11 @@ class TestRunWithImages:
         # recorder's save_trace (B), never from a separate runner write
         assert ("create_run", result.run_id) in store.edge_calls
         edges = [(e.owner_kind, e.owner_id, e.ordinal) for e in store.edges_of(result.run_id)]
-        assert edges[0] == ("input", "input", 1)
-        assert set(edges[1:]) <= {("trace", "0", 1)}
+        assert set(edges) == {("input", "input", 1), ("trace", "1", 1)}
         assert ("add_blob_refs", result.run_id) not in store.edge_calls
         assert all(e.tenant_scope == "t:acme" for e in store.edges_of(result.run_id))
         # the user trace keeps the projection and the wire parts in meta
-        traces = await store.get_traces(result.run_id)
+        traces = [t for t in await store.get_traces(result.run_id) if t.role == "user"]
         assert traces[0].content == "What does this say?"
         assert traces[0].meta["dendrux.parts"] == parts
         # provider saw the parts message
@@ -573,7 +581,7 @@ class TestRunWithImages:
         assert sent.parts[0].text.startswith("STABLE CONTEXT:\nrules")
         assert isinstance(sent.parts[1], ImagePart)
         assert sent.parts[2] == TextPart("caption")
-        traces = await store.get_traces(result.run_id)
+        traces = [t for t in await store.get_traces(result.run_id) if t.role == "user"]
         assert traces[0].content == "caption"
         assert traces[0].meta["dendrux.parts"][0]["text"].startswith("STABLE CONTEXT:")
         record = await store.get_run(result.run_id)
@@ -770,7 +778,7 @@ class TestStreamWithImages:
         run_id = events[-1].run_result.run_id
         record = await store.get_run(run_id)
         assert record.input_data["dendrux.parts"][1]["sha256"] == _sha(PNG)
-        assert [e.owner_kind for e in store.edges_of(run_id)][0] == "input"
+        assert {e.owner_kind for e in store.edges_of(run_id)} == {"input", "trace"}
         assert ("add_blob_refs", run_id) not in store.edge_calls
         assert agent.loop.seen[-1]["runtime"].tenant_scope == "t:t1"  # type: ignore[union-attr]
 
@@ -1146,6 +1154,10 @@ class TestApprovalCarry:
         self, store: ImageStore
     ) -> None:
         """approval pause (with a view) -> approve -> client pause -> submit in a new Agent."""
+        from tests._fixtures.storage import pin_storage_format
+
+        await pin_storage_format(store._engine, 1)
+
         from dendrux.types import ToolTarget  # noqa: F401
 
         responses = [
@@ -1365,7 +1377,11 @@ class TestRetryAndReplay:
         assert result.status == RunStatus.SUCCESS
         record = await store.get_run(result.run_id)
         assert record.input_data["dendrux.parts"][1]["sha256"] == sha
-        assert [e.owner_kind for e in store.edges_of(result.run_id)] == ["input", "seed"]
+        assert sorted(e.owner_kind for e in store.edges_of(result.run_id)) == [
+            "input",
+            "seed",
+            "trace",
+        ]
         state = retry_agent.loop.seen[-1]["state"]  # type: ignore[union-attr]
         assert state.sent_through == 1
         assert state.rejected == [("t:acme", sha)]
@@ -1386,7 +1402,7 @@ class TestRetryAndReplay:
         assert sent[0].content.startswith("see")
         state = follow.loop.seen[-1]["state"]  # type: ignore[union-attr]
         assert state.sent_through == 1
-        assert [e.owner_kind for e in store.edges_of(result.run_id)] == ["seed"]
+        assert sorted(e.owner_kind for e in store.edges_of(result.run_id)) == ["seed", "trace"]
 
     async def test_text_mode_replay_uses_input_parts(self, store: ImageStore) -> None:
         agent = _agent(store, [LLMResponse(text="one")])

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 
@@ -72,7 +73,9 @@ async def test_explicit_wire_and_raw_trace(store, streaming, contextual):
     record = await store.get_run(result.run_id)
     assert record.meta["dendrux.skills"]["explicit"] == ["demo"]
     traces = await store.get_traces(result.run_id)
-    user = next(t for t in traces if t.role == "user")
+    user = next(
+        t for t in traces if t.role == "user" and not (t.meta or {}).get("dendrux.seed_prefix")
+    )
     assert user.content == "raw input"
     wire = user.meta["wire_content"]
     assert wire.count('<skill_content name="demo"') == 1
@@ -371,13 +374,19 @@ async def test_approved_script_rechecks_activation(store):
         require_approval=["run_skill_script"],
     )
     paused = await a.run("input")
-    state = await store.get_pause_state(paused.run_id)
-    # Simulate a failed activation in authoritative durable history. Approval
-    # cannot replace the preflight activation check on the reconstructed session.
-    for message in state["history"]:
-        if message["role"] == "tool" and message.get("name") == "use_skill":
-            message.setdefault("meta", {})["is_error"] = True
-    await store.pause_run(paused.run_id, status="waiting_approval", pause_data=state)
+    # Activation is authoritative in the versioned session state row in format 2.
+    from sqlalchemy import update
+
+    from dendrux.db.models import ReactTrace
+
+    checkpoint = await store.get_loop_state(paused.run_id)
+    async with store._session_factory() as session:
+        await session.execute(
+            update(ReactTrace)
+            .where(ReactTrace.id == checkpoint["skills"]["session_ref"])
+            .values(content=json.dumps({"kind": "skills_session", "v": 1, "activated": []}))
+        )
+        await session.commit()
     new = agent(store, [LLMResponse(text="done")])
     await new.submit_approval(paused.run_id, approved=True, expected_pause_id=paused.pause_id)
     calls = await store.get_tool_calls(paused.run_id)

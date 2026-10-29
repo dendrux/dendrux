@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import logging
 from contextlib import asynccontextmanager
 from copy import deepcopy
@@ -704,6 +705,7 @@ async def _persist_loop_outcome(
     run_id: str,
     result: RunResult,
     provider_kwargs: dict[str, Any] | None = None,
+    recorder: LoopRecorder | None = None,
 ) -> RunResult:
     """Persist a loop's terminal/pause result and emit the lifecycle event.
 
@@ -828,6 +830,9 @@ async def _persist_loop_outcome(
             result.meta["pause_state"] = pause_state
         paused_data = _pause_event_data(result, pause_state)
         record = await state_store.get_run(run_id)
+        checkpoint = getattr(recorder, "checkpoint_outcome", None)
+        if checkpoint is not None:
+            await checkpoint(result, provider_kwargs)
         pause_data = {**pause_state.to_dict(), "status": result.status.value}
         if record is not None and GOVERNANCE_KEY in (getattr(record, "meta", None) or {}):
             pause_data[GOVERNANCE_KEY] = (record.meta or {})[GOVERNANCE_KEY]
@@ -1680,6 +1685,22 @@ async def run(
                             user_input_parts=user_parts,
                         )
 
+                    seed_kwargs = _runtime_seeds(
+                        state_store,
+                        agent,
+                        provider,
+                        resolved_loop,
+                        resolved_strategy,
+                        provider_kwargs,
+                        seeded_history,
+                        user_input=user_input,
+                        tenant_id=tenant_id,
+                        replay_req=replay_req,
+                        replay_runs=replay_runs,
+                        normalized_history=normalized_history,
+                        context=context,
+                        user_parts=user_parts,
+                    )
                     create_result = await state_store.create_run(
                         run_id,
                         agent.name,
@@ -1693,6 +1714,7 @@ async def run(
                         idempotency_key=idempotency_key,
                         idempotency_fingerprint=idem_fingerprint,
                         **_input_edge_kwargs(image_runtime, user_parts),
+                        **seed_kwargs,
                     )
 
                     # Handle idempotency outcomes
@@ -1732,6 +1754,7 @@ async def run(
                         model=provider.model,
                         provider_name=type(provider).__name__,
                         target_lookup=target_lookup,
+                        seed_traces=seed_kwargs.get("seed_traces"),
                         **_recorder_image_kwargs(tenant_id, provider),
                     )
 
@@ -1854,6 +1877,7 @@ async def run(
                 _ensure_pause_generation(result, provider_kwargs)
                 if state_store is not None:
                     result = await _persist_loop_outcome(
+                        recorder=recorder,
                         provider_kwargs=provider_kwargs,
                         state_store=state_store,
                         run_id=run_id,
@@ -1978,6 +2002,68 @@ async def run(
                 task_manager.release_current(run_id)
             if ctx_token is not None:
                 reset_delegation_context(ctx_token)
+
+
+def _runtime_seeds(
+    store: StateStore,
+    agent: Agent,
+    provider: LLMProvider,
+    loop: Loop,
+    strategy: Strategy,
+    provider_kwargs: dict[str, Any],
+    history: list[Message] | None,
+    *,
+    user_input: str,
+    tenant_id: str | None = None,
+    replay_req: ReplayRequest | None = None,
+    replay_runs: list[Any] | None = None,
+    normalized_history: list[Message] | None = None,
+    context: list[ContextBlock] | None = None,
+    user_parts: tuple[ContentPart, ...] | None = None,
+) -> dict[str, Any]:
+    from dendrux.runtime._capabilities import capabilities
+    from dendrux.runtime.persistence import seed_trace_kwargs
+
+    if not capabilities(store).checkpointing:
+        return {}
+    if replay_req is not None:
+        plan = expand_replay(
+            replay_runs or [],
+            replay_req,
+            current=current_prefix(agent, provider, loop, provider_kwargs),
+            guardrails=bool(agent.guardrails),
+        )
+        history = fold_context(
+            [*plan.messages, *(normalized_history or [])],
+            context,
+            user_input,
+            session=current_skill_session(agent),
+            user_parts=user_parts,
+        )
+    if history is None:
+        history = fold_context(
+            [], context, user_input, session=current_skill_session(agent), user_parts=user_parts
+        )
+    from dendrux.media._runtime import tenant_scope_for
+
+    messages = [
+        Message(role=Role.SYSTEM, content=agent.get_system_prompt(loop=loop)),
+        *(history or []),
+    ]
+    own_input = (
+        user_trace_message(
+            user_input,
+            history[: max(i for i, m in enumerate(history) if m.role == Role.USER) + 1],
+            render_band(context, "stable"),
+            context,
+            session=current_skill_session(agent),
+        )
+        if history and any(m.role == Role.USER for m in history)
+        else None
+    )
+    return seed_trace_kwargs(
+        store, messages, tenant_scope=tenant_scope_for(tenant_id), own_input=own_input
+    )
 
 
 async def _apply_replay(
@@ -2437,9 +2523,18 @@ async def retry(
 
         # 3. Read traces and reconstruct approximate history. Reasoning replay
         #    blocks only seed a retry on the model that made them.
-        traces = await state_store.get_traces(original_run_id)
+        from dendrux.runtime._capabilities import capabilities
+        from dendrux.runtime.replay import conversation_records
+
+        traces = (
+            await conversation_records(state_store, original_run_id, limits=agent._limits)
+            if source_run.storage_format == 2 and capabilities(state_store).checkpointing
+            else await state_store.get_traces(original_run_id)
+        )
         retry_model = (kwargs or {}).get("model") or provider.model
         initial_history = _pair_tool_calls(rebuild_messages(traces, reasoning_for=retry_model))
+        if source_run.storage_format == 2:
+            initial_history = [m for m in initial_history if m.role != Role.SYSTEM]
 
         if not initial_history:
             raise ValueError(
@@ -2447,19 +2542,19 @@ async def retry(
                 "Cannot retry without prior context."
             )
 
-        # 4. Extract the original user input from the first USER trace
-        user_input = next(
-            (t.content for t in sorted(traces, key=lambda t: t.order_index) if t.role == "user"),
-            "Continue from previous attempt.",
+        # The source's own input follows its persisted seed prefix.
+        users = [t for t in traces if t.role == "user"]
+        raw_user = next(
+            (t for t in users if not (t.meta or {}).get("dendrux.seed_prefix")), users[0]
         )
-        # Raw parts of a multimodal source input (refs; canonicalised per request).
+        user_input = (source_run.input_data or {}).get("input", raw_user.content)
         source_parts = _stored_parts((source_run.input_data or {}).get(PARTS_KEY))
 
         if explicit:
-            first_user = next(i for i, m in enumerate(initial_history) if m.role == Role.USER)
-            raw_user = next(
-                t for t in sorted(traces, key=lambda t: t.order_index) if t.role == "user"
-            )
+            own_ordinal = users.index(raw_user)
+            first_user = [i for i, m in enumerate(initial_history) if m.role == Role.USER][
+                own_ordinal
+            ]
             retry_context = [
                 ContextBlock(**b) for b in (raw_user.meta or {}).get("dendrux.skills.context", [])
             ]
@@ -2528,6 +2623,17 @@ async def retry(
             if live:
                 input_edges = {"blob_refs": live, "blob_refs_scope": image_runtime.tenant_scope}
 
+        seed_kwargs = _runtime_seeds(
+            state_store,
+            agent,
+            provider,
+            resolved_loop,
+            resolved_strategy,
+            provider_kwargs,
+            initial_history,
+            user_input=user_input,
+            tenant_id=tenant_id,
+        )
         create_result = await state_store.create_run(
             run_id,
             agent.name,
@@ -2539,6 +2645,7 @@ async def retry(
             tenant_id=tenant_id,
             meta=run_meta,
             retry_of_run_id=original_run_id,
+            **seed_kwargs,
             **input_edges,
         )
         run_id = create_result.run_id
@@ -2560,6 +2667,7 @@ async def retry(
             model=provider.model,
             provider_name=type(provider).__name__,
             target_lookup=target_lookup,
+            seed_traces=seed_kwargs.get("seed_traces"),
             **_recorder_image_kwargs(tenant_id, provider),
         )
 
@@ -2623,7 +2731,8 @@ async def retry(
                 replay_plan = expand_replay(
                     replay_runs, replay_req, current=current, guardrails=bool(agent.guardrails)
                 )
-                initial_history = [*replay_plan.messages, *initial_history]
+                if source_run.storage_format != 2 or not capabilities(state_store).checkpointing:
+                    initial_history = [*replay_plan.messages, *initial_history]
             seeded_slots = image_slot_count(initial_history)
             await record_run_prefix(
                 state_store,
@@ -2677,6 +2786,7 @@ async def retry(
                 result.replay = replay_plan.summary
             _attach_mcp_meta(result, mcp_meta)
             result = await _persist_loop_outcome(
+                recorder=recorder,
                 provider_kwargs=provider_kwargs,
                 state_store=state_store,
                 run_id=run_id,
@@ -3052,6 +3162,22 @@ def run_stream(
                         user_input_parts=user_parts,
                     )
                 try:
+                    seed_kwargs = _runtime_seeds(
+                        store,
+                        agent,
+                        provider,
+                        resolved_loop,
+                        resolved_strategy,
+                        provider_kwargs,
+                        seeded_history,
+                        user_input=user_input,
+                        tenant_id=eff_tenant,
+                        replay_req=replay_req,
+                        replay_runs=replay_runs,
+                        normalized_history=history_messages,
+                        context=context,
+                        user_parts=user_parts,
+                    )
                     create_result = await store.create_run(
                         run_id,
                         agent.name,
@@ -3065,6 +3191,7 @@ def run_stream(
                         idempotency_key=idempotency_key,
                         idempotency_fingerprint=fingerprint,
                         **_input_edge_kwargs(image_runtime, user_parts),
+                        **seed_kwargs,
                     )
                 except IdempotencyConflictError:
                     # No row was created and no lifecycle opened; the error
@@ -3110,6 +3237,7 @@ def run_stream(
                     model=provider.model,
                     provider_name=type(provider).__name__,
                     target_lookup=target_lookup,
+                    seed_traces=seed_kwargs.get("seed_traces"),
                     **_recorder_image_kwargs(eff_tenant, provider),
                 )
 
@@ -3247,6 +3375,7 @@ def run_stream(
                         _attach_mcp_meta(terminal_result, mcp_meta)
                         if store is not None:
                             persisted = await _persist_loop_outcome(
+                                recorder=recorder,
                                 provider_kwargs=provider_kwargs,
                                 state_store=store,
                                 run_id=run_id,
@@ -3552,6 +3681,72 @@ class _ResumeContext:
         self.resolved_strategy = resolved_strategy
 
 
+async def _load_pause_state(
+    store: StateStore,
+    run_id: str,
+    raw: dict[str, Any],
+    agent: Agent,
+    provider: LLMProvider,
+) -> PauseState:
+    from dendrux.errors import PersistenceError, RunNotReclaimableError
+    from dendrux.runtime.replay import rebuild_history
+    from dendrux.types import InputValidationError, _usage_from_dict
+
+    pause = PauseState.from_dict(raw)
+    if pause.schema_version != 2:
+        return pause
+    record = await store.get_run(run_id)
+    if record is None or record.storage_format != 2:
+        logger.warning(
+            "Format-2 pause on a legacy run",
+            extra={"run_id": run_id, "code": "pause_format_unsupported"},
+        )
+        raise PersistenceError(code="pause_format_unsupported")
+    checkpoint = await store.get_loop_state(run_id)
+    if not checkpoint:
+        logger.warning(
+            "Missing authoritative pause checkpoint",
+            extra={"run_id": run_id, "code": "pause_format_unsupported"},
+        )
+        raise PersistenceError(code="pause_format_unsupported")
+    try:
+        messages = await rebuild_history(
+            store,
+            run_id,
+            limits=agent._limits,
+            reasoning_for=pause.provider_kwargs.get("model") or provider.model,
+        )
+    except RunNotReclaimableError as exc:
+        raise InputValidationError("history", "history_too_large") from exc
+    # Strategy owns the system prompt; seeds retain it for audit/reconstruction.
+    pause.history = [m for m in messages.messages if m.role != Role.SYSTEM]
+    pause.steps = messages.steps
+    pause.usage = _usage_from_dict(checkpoint["usage"])
+    pause.iteration = checkpoint["iteration"]
+    pause.trace_order_offset = checkpoint["trace_order_offset"]
+    pause.provider_kwargs = dict(checkpoint["provider_kwargs"])
+    for kind, ref in (
+        ("image_view", checkpoint.get("image_view_ref")),
+        ("skills_session", checkpoint.get("skills", {}).get("session_ref")),
+        ("clarification", checkpoint.get("clarification_ref")),
+    ):
+        if ref is None:
+            continue
+        state_trace = await store.get_trace(run_id, ref)
+        if state_trace is None:
+            raise PersistenceError(code="pause_format_unsupported")
+        payload = json.loads(state_trace.content)
+        if kind == "image_view":
+            pause.image_view = ImageViewState.from_dict(payload)
+        elif kind == "skills_session":
+            session = current_skill_session(agent)
+            if session is not None:
+                session.restore_snapshot(payload)
+        else:
+            pause.pause_message = payload.get("pause_message")
+    return pause
+
+
 async def _prepare_resume(
     run_id: str,
     pause_state: PauseState,
@@ -3624,6 +3819,9 @@ async def _prepare_resume(
         traces = await state_store.get_traces(run_id)
         trace_order_offset = max((t.order_index for t in traces), default=-1) + 1
 
+    if pause_state.schema_version == 2:
+        trace_order_offset = max(trace_order_offset, pause_state.trace_order_offset)
+
     target_lookup = {}
     for fn in agent.tools:
         td = get_tool_def(fn)
@@ -3637,6 +3835,8 @@ async def _prepare_resume(
         initial_order_index=trace_order_offset,
         **_recorder_image_kwargs(tenant_id, provider),
     )
+
+    await recorder.restore_history(limits=agent._limits)
 
     # NOTE: lifecycle hooks (record_run_started/notify_run_started) and
     # injected-history replay are intentionally NOT done here. The caller
@@ -4577,7 +4777,7 @@ async def _resume_core(
         raw_pause = await state_store.get_pause_state(run_id)
         if raw_pause is None:
             raise ValueError(f"Run '{run_id}' has no pause state — cannot resume.")
-        pause_state = PauseState.from_dict(raw_pause)
+        pause_state = await _load_pause_state(state_store, run_id, raw_pause, agent, provider)
 
         # 1a. Load pii_mapping for guardrail continuity across pause/resume
         _saved_pii_mapping = await state_store.get_pii_mapping(run_id)
@@ -4751,6 +4951,7 @@ async def _resume_core(
                 if stop is not None:
                     _attach_mcp_meta(stop, mcp_meta)
                     stopped = await _persist_loop_outcome(
+                        recorder=ctx.recorder,
                         provider_kwargs=ctx.pause_state.provider_kwargs,
                         state_store=state_store,
                         run_id=run_id,
@@ -4811,6 +5012,7 @@ async def _resume_core(
 
             _attach_mcp_meta(result, mcp_meta)
             result = await _persist_loop_outcome(
+                recorder=ctx.recorder,
                 provider_kwargs=ctx.pause_state.provider_kwargs,
                 state_store=state_store,
                 run_id=run_id,
@@ -5000,7 +5202,7 @@ def resume_stream(
             raw_pause = await store.get_pause_state(run_id)
             if raw_pause is None:
                 raise ValueError(f"Run '{run_id}' has no pause state — cannot resume.")
-            pause_state = PauseState.from_dict(raw_pause)
+            pause_state = await _load_pause_state(store, run_id, raw_pause, agent, provider)
 
             # 2b. Verify agent identity
             if pause_state.agent_name and pause_state.agent_name != agent.name:
@@ -5168,6 +5370,7 @@ def resume_stream(
                 if stop is not None:
                     _attach_mcp_meta(stop, mcp_meta)
                     stopped = await _persist_loop_outcome(
+                        recorder=ctx.recorder,
                         provider_kwargs=ctx.pause_state.provider_kwargs,
                         state_store=store,
                         run_id=run_id,
@@ -5247,6 +5450,7 @@ def resume_stream(
                     ):
                         _attach_mcp_meta(event.run_result, mcp_meta)
                         persisted = await _persist_loop_outcome(
+                            recorder=ctx.recorder,
                             provider_kwargs=ctx.pause_state.provider_kwargs,
                             state_store=store,
                             run_id=run_id,

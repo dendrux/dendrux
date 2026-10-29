@@ -57,7 +57,7 @@ async def test_a7_seeds_rewrite_prefix_and_keyset_pages(store):
     assert await store.get_pii_mapping(run_id) == {"x": "y"}
 
 
-@pytest.mark.parametrize("payload", [{"provider_kwargs": {"x": "a" * 2048}}, {"x": "a" * 8192}])
+@pytest.mark.parametrize("payload", [{"provider_kwargs": {"x": "a" * 2048}}, {"x": "a" * 32768}])
 async def test_a8_checkpoint_bounds_are_atomic(store, engine, payload):
     run_id = generate_ulid()
     await store.create_run(run_id, "bound")
@@ -130,3 +130,36 @@ async def test_checkpoint_rejects_unpersistable_pii_before_any_write(store):
         )
     assert await store.get_loop_state(run_id) is None
     assert await store.get_pii_mapping(run_id) is None
+
+
+async def test_rewrite_cursor_does_not_rescan_prefix(store, engine):
+    """A continuation page reads its suffix through the physical order index."""
+    from sqlalchemy import event
+
+    run_id = generate_ulid()
+    await store.create_run(run_id, "rewrite")
+    for order in (10, 4):
+        await store.save_trace(
+            run_id,
+            "rewrite",
+            json.dumps([{"role": "user", "content": str(order), "meta": {}}]),
+            order_index=order,
+            trace_kind="rewrite",
+        )
+    await store.save_trace(run_id, "assistant", "suffix", order_index=11)
+    page = await store.conversation_traces(run_id, after_position=None, limit=1)
+    assert page.entries[0].content == "10"
+    queries = []
+
+    def capture(conn, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().upper().startswith("SELECT"):
+            queries.append(statement)
+
+    event.listen(engine.sync_engine, "before_cursor_execute", capture)
+    try:
+        page = await store.conversation_traces(run_id, after_position=10999, limit=1)
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", capture)
+    assert [e.content for e in page.entries] == ["suffix"]
+    assert all("order_index *" not in q for q in queries)
+    assert not any("DESC" in q and "react_traces" in q for q in queries)

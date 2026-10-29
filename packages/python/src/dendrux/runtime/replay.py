@@ -32,6 +32,7 @@ from dendrux.context_blocks import _fold_first, fold_first_parts
 from dendrux.types import (
     REASONING_MODEL_META_KEY,
     REPLAYED_META_KEY,
+    AgentStep,
     ContentPart,
     GuardrailVerdict,
     GuardrailVerdictKey,
@@ -163,6 +164,7 @@ async def load_replay_runs(
 ) -> list[LoadedRun]:
     """Load and validate every run in ``request.runs``. Raises ``ReplayRunError``."""
     from dendrux.errors import ReplayRunError
+    from dendrux.runtime._capabilities import capabilities
 
     loaded: list[LoadedRun] = []
     for run_id in request.runs:
@@ -175,7 +177,12 @@ async def load_replay_runs(
                 "not_terminal",
                 f"it is still '{record.status}'; only terminal runs can be replayed",
             )
-        traces = await store.get_traces(run_id)
+        traces = (
+            await conversation_records(store, run_id)
+            if record.storage_format == 2 and capabilities(store).checkpointing
+            else await store.get_traces(run_id)
+        )
+        traces = [t for t in traces if not (t.meta or {}).get("dendrux.seed_prefix")]
         loaded.append(LoadedRun(record=record, traces=sorted(traces, key=lambda t: t.order_index)))
     return loaded
 
@@ -304,6 +311,146 @@ def _differing_fields(
 # ---------------------------------------------------------------------------
 
 
+async def conversation_records(
+    store: StateStore,
+    run_id: str,
+    *,
+    limits: Any = None,
+    tenant_id: Any = None,
+    scoped: bool = False,
+    offset: int = 0,
+    limit: int | None = None,
+) -> list[TraceRecord]:
+    """Read effective conversation entries with bounded keyset pagination.
+
+    Count expanded messages and their UTF-8 JSON bytes before retaining them.
+    State rows and superseded prefixes never enter the reconstruction buffer.
+    """
+    from dendrux.errors import RunNotReclaimableError
+    from dendrux.runtime.state import TraceRecord
+    from dendrux.types import Limits
+
+    bounds = limits or Limits()
+    records: list[TraceRecord] = []
+    position = None
+    count = size = 0
+    scope = {"tenant_id": tenant_id} if scoped else {}
+    while limit is None or len(records) < limit:
+        page = await store.conversation_traces(
+            run_id, after_position=position, limit=min(500, bounds.max_rebuild_rows + 1), **scope
+        )
+        for entry in page.entries:
+            count += 1
+            size += len(
+                json.dumps(
+                    {"role": entry.role, "content": entry.content, "meta": entry.meta},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            )
+            if count > bounds.max_rebuild_rows or size > bounds.max_rebuild_bytes:
+                logger.warning(
+                    "Conversation rebuild bound exceeded",
+                    extra={
+                        "run_id": run_id,
+                        "code": "history_too_large",
+                    },
+                )
+                raise RunNotReclaimableError(run_id, "history_too_large")
+            if count > offset:
+                records.append(
+                    TraceRecord(
+                        id=entry.trace_id,
+                        role=entry.role,
+                        content=entry.content,
+                        order_index=entry.position,
+                        meta=entry.meta,
+                        trace_kind=entry.source,
+                    )
+                )
+                if limit is not None and len(records) == limit:
+                    break
+        if page.next_position is None:
+            break
+        position = page.next_position
+    return records
+
+
+@dataclass(frozen=True)
+class RebuiltHistory:
+    """Bounded conversation and execution steps reconstructed from durable evidence."""
+
+    messages: list[Message]
+    steps: list[AgentStep]
+
+
+async def rebuild_history(
+    store: StateStore,
+    run_id: str,
+    *,
+    limits: Any = None,
+    reasoning_for: str | None = None,
+) -> RebuiltHistory:
+    """Rebuild format-2 history from the effective conversation projection."""
+    messages = rebuild_messages(
+        await conversation_records(store, run_id, limits=limits), reasoning_for=reasoning_for
+    )
+    mapping = await store.get_pii_mapping(run_id) or {}
+    reverse = {value: key for key, value in mapping.items() if isinstance(value, str) and value}
+    if reverse:
+        import re
+
+        from dendrux.types import TextPart
+
+        pattern = re.compile("|".join(re.escape(v) for v in sorted(reverse, key=len, reverse=True)))
+
+        def redact(text: str) -> str:
+            return pattern.sub(lambda match: reverse[match.group()], text)
+
+        messages = [
+            replace(
+                m,
+                content=redact(m.content),
+                parts=tuple(
+                    replace(p, text=redact(p.text)) if isinstance(p, TextPart) else p
+                    for p in m.parts
+                )
+                if m.parts is not None
+                else None,
+            )
+            for m in messages
+        ]
+    from dendrux.errors import RunNotReclaimableError
+    from dendrux.types import Limits, _step_from_dict
+
+    bounds = limits or Limits()
+    steps = []
+    after = None
+    rows = size = 0
+    while True:
+        page = await store.get_traces_after(run_id, after_order_index=after, kinds=("turn",))
+        for trace in page:
+            rows += 1
+            size += len(
+                json.dumps(
+                    {"content": trace.content, "meta": trace.meta}, ensure_ascii=False
+                ).encode("utf-8")
+            )
+            if rows > bounds.max_rebuild_rows or size > bounds.max_rebuild_bytes:
+                logger.warning(
+                    "Step rebuild bound exceeded",
+                    extra={"run_id": run_id, "code": "history_too_large"},
+                )
+                raise RunNotReclaimableError(run_id, "history_too_large")
+            step = (trace.meta or {}).get("dendrux.step")
+            if step is not None:
+                steps.append(_step_from_dict(step))
+        if len(page) < 500:
+            break
+        after = page[-1].order_index
+    return RebuiltHistory(messages, steps)
+
+
 def rebuild_messages(traces: list[TraceRecord], *, reasoning_for: str | None) -> list[Message]:
     """Rebuild ``Message`` objects from persisted traces.
 
@@ -322,6 +469,18 @@ def rebuild_messages(traces: list[TraceRecord], *, reasoning_for: str | None) ->
             continue
 
         meta = trace.meta or {}
+        envelope = meta.get("dendrux.message")
+        if isinstance(envelope, dict):
+            from dendrux.types import _message_from_dict
+
+            message = _message_from_dict(
+                {**envelope, "content": meta.get(WIRE_CONTENT_KEY, trace.content)}
+            )
+            producer = message.meta.get(REASONING_MODEL_META_KEY)
+            if reasoning_for is None or producer not in (None, reasoning_for):
+                message = replace(message, reasoning_blocks=None)
+            messages.append(message)
+            continue
         msg_meta: dict[str, Any] = {}
         msg_kwargs: dict[str, Any] = {"role": role, "content": trace.content}
 
@@ -453,6 +612,8 @@ def _text_turn(run: LoadedRun) -> list[Message]:
 
 def _full_turn(run: LoadedRun, *, reasoning_for: str | None) -> list[Message]:
     messages = _pair_tool_calls(rebuild_messages(run.traces, reasoning_for=reasoning_for))
+    if run.record.storage_format == 2:
+        messages = [m for m in messages if m.role != Role.SYSTEM]
     if not messages or messages[0].role != Role.USER:
         messages.insert(0, _raw_user_message(run))
     return messages

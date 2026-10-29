@@ -133,7 +133,12 @@ async def test_typed_output_survives_persisted_wrapper(store):
 
 
 @pytest.mark.parametrize("entry", ["resume", "resume_stream", "submit"])
-async def test_pause_only_retains_safe_provider_options_and_restores_them(store, entry):
+async def test_pause_only_retains_safe_provider_options_and_restores_them(store, engine, entry):
+    from tests._fixtures.storage import pin_storage_format
+
+    # Compatibility assertion for the format-1 provider-options allowlist.
+    await pin_storage_format(engine, 1)
+
     class Options(ScriptedLLM):
         async def complete(self, *args, **kwargs):
             self.options = getattr(self, "options", []) + [kwargs]

@@ -9,6 +9,7 @@ the persistence (B), provider (C) and loop (D1) tracks.
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 from typing import Any
 
@@ -179,7 +180,10 @@ async def _approval_scenario(engine: Any, approval: bool) -> tuple[list[Any], di
         ],
     )
     assert result.status == RunStatus.SUCCESS
-    return _sent(fresh_provider), client_pause["image_view"]
+    ref = client_pause["image_view_ref"]
+    view = json.loads((await store.get_trace(paused.run_id, ref)).content)
+    view.pop("kind")
+    return _sent(fresh_provider), view
 
 
 async def test_approval_client_pause_resume_carries_view(engine: Any) -> None:

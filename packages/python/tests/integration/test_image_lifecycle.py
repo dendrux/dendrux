@@ -126,11 +126,12 @@ async def test_canonical_sample_end_to_end(engine: Any) -> None:
         "WHERE run_id = :r ORDER BY owner_kind",
         r=run_id,
     )
+    trace = next(t for t in await store2.get_traces(run_id) if t.role == "tool")
     assert sorted((r["owner_kind"], r["owner_id"], r["ordinal"]) for r in refs) == sorted(
         [
             ("submission", f"{iteration}:{call_id}", 0),
             ("tool_call", call_id, 0),
-            ("trace", "2", 1),
+            ("trace", str(trace.order_index), 1),
         ]
     )
     assert {r["tenant_scope"] for r in refs} == {"t:acme"}
@@ -217,6 +218,9 @@ async def test_external_blob_store_second_process(engine: Any) -> None:
 
 
 async def test_v030_text_pause_resumes_unchanged(engine: Any) -> None:
+    from tests._fixtures.storage import pin_storage_format
+
+    await pin_storage_format(engine, 1)
     """A text-only pause has no image keys and resumes exactly as in v0.3.0."""
     store = SQLAlchemyStateStore(engine)
     agent = Agent(

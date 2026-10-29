@@ -636,6 +636,48 @@ class _LoopState(NamedTuple):
     image_view: ImageViewState
 
 
+def _bind_checkpoint(
+    recorder: LoopRecorder | None,
+    *,
+    state: _LoopState,
+    budget: BudgetTracker,
+    provider_kwargs: dict[str, Any],
+    tool_defs: Any,
+    engine: GuardrailEngine | None,
+    agent: Agent,
+) -> None:
+    bind = getattr(recorder, "bind_loop", None)
+    if bind is not None:
+        bind(
+            lambda: {
+                "steps": state.steps,
+                "usage": state.usage,
+                "budget": budget,
+                "tool_counts": state.call_counts,
+                "declared_tools": {t.name for t in tool_defs},
+                "tool_targets": {t.name: t.target.value for t in tool_defs},
+                "approval_tools": agent.require_approval,
+                "denied_tools": agent._deny,
+                "provider_kwargs": provider_kwargs,
+                "image_view": state.image_view,
+                "has_images": any(m.parts for m in state.history),
+                "pii_mapping": engine.get_pii_mapping() if engine else None,
+                "pii_counters": engine._counters if engine else {},
+            },
+            budget,
+        )
+
+
+async def _checkpoint_view(
+    recorder: LoopRecorder | None,
+    messages: list[Message],
+    iteration: int,
+) -> None:
+    checkpoint = getattr(recorder, "checkpoint_view", None)
+    if checkpoint is not None:
+        await checkpoint(messages, iteration)
+
+
 async def _init_loop_state(
     *,
     user_input: str,
@@ -1479,6 +1521,15 @@ class ReActLoop(Loop):
             else None
         )
 
+        _bind_checkpoint(
+            recorder,
+            state=state,
+            budget=budget,
+            provider_kwargs=_pkw,
+            tool_defs=tool_defs,
+            engine=g_engine,
+            agent=agent,
+        )
         start_iteration = iteration_offset + 1
         end_iteration = agent.max_iterations + 1
         for iteration in range(start_iteration, end_iteration):
@@ -1544,6 +1595,7 @@ class ReActLoop(Loop):
                 history=history,
                 tool_defs=tool_defs,
             )
+            await _checkpoint_view(recorder, messages, iteration)
 
             # Incoming guardrail — scan ALL messages before LLM call
             _all_guardrail_findings: dict[str, Any] = {}
@@ -2020,6 +2072,9 @@ class ReActLoop(Loop):
                     image_runtime=image_runtime,
                 )
                 _mark_call_rejections(history, tool_history_start, outcome.all_results)
+                order_observations = getattr(recorder, "order_observations", None)
+                if order_observations is not None:
+                    order_observations(history)
                 if outcome.pending_calls:
                     pause_status = (
                         RunStatus.WAITING_APPROVAL
@@ -2165,6 +2220,15 @@ class ReActLoop(Loop):
         before_tool: BeforeToolHook | None = getattr(agent, "before_tool", None)
         hook_tenant_id = await _hook_tenant_id(before_tool, state_store, resolved_run_id)
 
+        _bind_checkpoint(
+            recorder,
+            state=state,
+            budget=budget,
+            provider_kwargs=_pkw,
+            tool_defs=tool_defs,
+            engine=None,
+            agent=agent,
+        )
         start_iteration = iteration_offset + 1
         end_iteration = agent.max_iterations + 1
         for iteration in range(start_iteration, end_iteration):
@@ -2249,6 +2313,7 @@ class ReActLoop(Loop):
                 history=history,
                 tool_defs=tool_defs,
             )
+            await _checkpoint_view(recorder, messages, iteration)
 
             # Image request view (§5.1). Image guardrails are batch-only:
             # stream() rejects guardrails at the Agent level.
@@ -2643,6 +2708,9 @@ class ReActLoop(Loop):
                         phase="commentary",
                     )
                 _mark_call_rejections(history, tool_history_start, outcome.all_results)
+                order_observations = getattr(recorder, "order_observations", None)
+                if order_observations is not None:
+                    order_observations(history)
                 if outcome.pending_calls:
                     pause_status = (
                         RunStatus.WAITING_APPROVAL

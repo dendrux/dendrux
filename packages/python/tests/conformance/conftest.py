@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
 from dendrux.db.models import Base
+from tests._fixtures.storage import pin_storage_format
 from tests._helpers import v030_oracle as o
 from tests.conformance import pg_guard
 from tests.integration.conftest import _PG_TRUNCATE_SQL, _ensure_test_db_exists
@@ -84,12 +85,14 @@ async def backend_engine(
         try:
             async with eng.begin() as conn:
                 await conn.execute(text(_PG_TRUNCATE_SQL))
+            await pin_storage_format(eng, 1)
             yield eng
         finally:
             await eng.dispose()
         return
     eng = await o.create_sqlite_engine()
     try:
+        await pin_storage_format(eng, 1)
         yield eng
     finally:
         await eng.dispose()
@@ -100,6 +103,7 @@ async def sqlite_engine() -> AsyncIterator[AsyncEngine]:
     """In-memory SQLite only (store-fixture variants run here)."""
     eng = await o.create_sqlite_engine()
     try:
+        await pin_storage_format(eng, 1)
         yield eng
     finally:
         await eng.dispose()

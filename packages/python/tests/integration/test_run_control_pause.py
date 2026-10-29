@@ -189,7 +189,11 @@ class TestRequestedPause:
         assert pause.pause_reason == "requested"
         assert pause.pause_message == "operator hold"
         assert pause.iteration == 1
-        assert [m.role.value for m in pause.history] == ["user", "assistant", "tool"]
+        from dendrux.runtime.replay import rebuild_history
+
+        assert pause.schema_version == 2 and pause.history == []
+        messages = await rebuild_history(store, result.run_id)
+        assert [m.role.value for m in messages.messages] == ["system", "user", "assistant", "tool"]
 
         paused = await _events(store, result.run_id, "run.paused")
         assert len(paused) == 1

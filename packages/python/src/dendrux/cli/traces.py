@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from typing import TYPE_CHECKING
 
 import typer
 from rich.console import Console
@@ -12,6 +13,9 @@ from rich.table import Table
 from rich.text import Text
 
 from dendrux._redact import mask_database_urls_in
+
+if TYPE_CHECKING:
+    from dendrux.runtime.state import TraceRecord
 
 MAX_ROWS = 1000
 
@@ -66,12 +70,17 @@ async def _show_traces(run_id: str, show_tool_calls: bool, limit: int = 200) -> 
         )
 
         # Fetch and display traces
-        traces = await store.get_traces(run_id, limit=limit)
+        from dendrux.runtime.replay import conversation_records
+
+        async def read_traces(limit: int, offset: int = 0) -> list[TraceRecord]:
+            if run.storage_format == 2:
+                return await conversation_records(store, run_id, limit=limit, offset=offset)
+            return await store.get_traces(run_id, limit=limit, offset=offset)
+
+        traces = await read_traces(limit)
         # Probe one row past the page in a separate read: the store clamps
         # ``limit`` to 1000, so asking for limit + 1 cannot detect overflow at the maximum.
-        more_traces = len(traces) == limit and bool(
-            await store.get_traces(run_id, limit=1, offset=limit)
-        )
+        more_traces = len(traces) == limit and bool(await read_traces(1, offset=limit))
         if not traces:
             console.print("[dim]No traces recorded.[/dim]")
         else:

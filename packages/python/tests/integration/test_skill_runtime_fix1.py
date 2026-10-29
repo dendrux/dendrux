@@ -47,7 +47,11 @@ async def test_retry_replay_records_own_wire_input(store):
     second = await a.run("second question", runs=[first.run_id], activate_skills=["demo"])
     b = agent(store, [LLMResponse(text="retry")])
     retried = await b.retry(second.run_id)
-    trace = next(t for t in await store.get_traces(retried.run_id) if t.role == "user")
+    trace = next(
+        t
+        for t in await store.get_traces(retried.run_id)
+        if t.role == "user" and not (t.meta or {}).get("dendrux.seed_prefix")
+    )
     assert trace.content == "second question"
     assert "second question" in trace.meta["wire_content"]
     assert "first question" not in trace.meta["wire_content"]

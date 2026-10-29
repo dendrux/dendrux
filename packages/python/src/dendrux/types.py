@@ -78,6 +78,7 @@ class ToolCall:
     provider_tool_call_id: str | None = None
     raw_arguments: str | None = field(default=None, repr=False)
     parse_error: str | None = None
+    raw_length: int | None = None
 
 
 class _MetaUnset:
@@ -1535,6 +1536,8 @@ class PauseState:
     # Current pause format; stored snapshots without a version read as 1.
     schema_version: int | None = 1
 
+    image_view_ref: str | None = None
+    loop_state_ref: bool = False
     provider_kwargs: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -1584,6 +1587,12 @@ class PauseState:
             for k, v in self.provider_kwargs.items()
             if k in {"model", "max_tokens", "temperature", "thinking", "effort"}
         }
+        if self.schema_version == 2:
+            for key in ("history", "steps", "image_view"):
+                d.pop(key, None)
+            d["image_view_ref"] = self.image_view_ref
+            d["loop_state_ref"] = True
+            d["provider_kwargs"] = dict(self.provider_kwargs)
         # Validate JSON safety — catch non-serializable meta values early
         try:
             json.dumps(d)
@@ -1597,6 +1606,14 @@ class PauseState:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> PauseState:
         """Deserialize from a dict (loaded from DB)."""
+        if data.get("schema_version", 1) not in (None, 1, 2):
+            from dendrux.errors import PersistenceError
+
+            logging.getLogger(__name__).warning(
+                "Unsupported pause format",
+                extra={"run_id": data.get("run_id"), "code": "pause_format_unsupported"},
+            )
+            raise PersistenceError(code="pause_format_unsupported")
         return cls(
             agent_name=data["agent_name"],
             pending_tool_calls=[
@@ -1624,10 +1641,13 @@ class PauseState:
             ),
             pause_id=data.get("pause_id"),
             schema_version=data.get("schema_version") or 1,
+            image_view_ref=data.get("image_view_ref"),
+            loop_state_ref=bool(data.get("loop_state_ref", False)),
             provider_kwargs={
                 k: v
                 for k, v in (data.get("provider_kwargs") or {}).items()
-                if k in {"model", "max_tokens", "temperature", "thinking", "effort"}
+                if data.get("schema_version") == 2
+                or k in {"model", "max_tokens", "temperature", "thinking", "effort"}
             },
         )
 
@@ -1646,7 +1666,7 @@ def tool_call_parse_meta(tc: ToolCall) -> dict[str, Any]:
         return {}
     return {
         "parse_error": tc.parse_error,
-        "raw_length": len(tc.raw_arguments) if tc.raw_arguments is not None else None,
+        "raw_length": len(tc.raw_arguments) if tc.raw_arguments is not None else tc.raw_length,
     }
 
 
@@ -1667,6 +1687,7 @@ def _tool_call_from_dict(d: dict[str, Any]) -> ToolCall:
         id=d["id"],
         provider_tool_call_id=d.get("provider_tool_call_id"),
         parse_error=d.get("parse_error"),
+        raw_length=d.get("raw_length"),
     )
 
 

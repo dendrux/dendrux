@@ -26,8 +26,10 @@ LoopRecorder protocol so third-party recorders can subscribe.
 from __future__ import annotations
 
 import inspect
+import json
 import logging
-from dataclasses import dataclass
+from copy import deepcopy
+from dataclasses import asdict, dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 from dendrux.errors import ImagePersistenceUnsupportedError, RunFencedError, safe_exception_info
@@ -154,6 +156,83 @@ def image_stats(
     }
 
 
+def message_trace(
+    message: Message,
+    order: int,
+    *,
+    kind: str = "turn",
+    tenant_scope: str | None = None,
+) -> Any:
+    """A lossless conversation envelope, with content stored only once."""
+    from dendrux.runtime.state import TraceWrite
+    from dendrux.types import _message_to_dict
+
+    envelope = _message_to_dict(message)
+    envelope.pop("content", None)
+    meta = dict(message.meta)
+    meta["dendrux.message"] = envelope
+    if message.tool_calls:
+        meta["tool_calls"] = [_tool_call_evidence(tc) for tc in message.tool_calls]
+    if message.reasoning_blocks:
+        meta["reasoning_blocks"] = message.reasoning_blocks
+    if message.call_id:
+        meta["call_id"] = message.call_id
+    if message.name:
+        meta["tool_name"] = message.name
+    if message.parts is not None:
+        meta[PARTS_META_KEY] = [content_part_to_dict(p) for p in message.parts]
+    edges = (
+        edges_for_parts(tenant_scope, "trace", str(order), meta.get(PARTS_META_KEY) or [])
+        if tenant_scope
+        else []
+    )
+    return TraceWrite(
+        generate_ulid(),
+        message.role.value,
+        message.content,
+        order,
+        trace_kind=kind,
+        meta=meta,
+        blob_refs=edges or None,
+        blob_refs_scope=tenant_scope if edges else None,
+    )
+
+
+def seed_trace_kwargs(
+    store: StateStore,
+    messages: list[Message],
+    *,
+    tenant_scope: str | None = None,
+    own_input: Message | None = None,
+) -> dict[str, Any]:
+    """Only declared checkpoint stores receive the additive create argument."""
+    if not capabilities(store).checkpointing:
+        return {}
+    traces = [
+        message_trace(m, i, kind="seed", tenant_scope=tenant_scope) for i, m in enumerate(messages)
+    ]
+    own_index = max((i for i, m in enumerate(messages) if m.role.value == "user"), default=-1)
+    for i, trace in enumerate(traces):
+        trace.meta["dendrux.seed_prefix"] = i < own_index
+        if i == own_index and own_input is not None:
+            traces[i] = replace(
+                trace, content=own_input.content, meta={**trace.meta, **own_input.meta}
+            )
+    return {"seed_traces": traces}
+
+
+def _view_identity(entry: dict[str, Any]) -> str:
+    meta = entry.get("meta") or {}
+    return json.dumps(
+        {
+            "role": entry["role"],
+            "content": meta.get("wire_content", entry["content"]),
+            "message": meta.get("dendrux.message", meta),
+        },
+        sort_keys=True,
+    )
+
+
 class PersistenceRecorder(BaseRecorder):
     """Authoritative evidence recorder — writes loop events to StateStore.
 
@@ -187,6 +266,7 @@ class PersistenceRecorder(BaseRecorder):
         initial_order_index: int = 0,
         tenant_scope: str | None = None,
         provider: Any | None = None,
+        seed_traces: Any = None,
     ) -> None:
         self._store = state_store
         self._tenant_scope = tenant_scope
@@ -195,7 +275,279 @@ class PersistenceRecorder(BaseRecorder):
         self._model = model
         self._provider_name = provider_name
         self._target_lookup = target_lookup or {}
-        self._order_index = initial_order_index
+        self._format2 = (
+            getattr(state_store, "storage_format", 1) == 2
+            and capabilities(state_store).checkpointing
+        )
+        self._order_index = (
+            len(seed_traces) if self._format2 and seed_traces else initial_order_index
+        )
+        self._loop_source: Any = None
+        self._loop_state: dict[str, Any] = deepcopy(getattr(state_store, "loop_state", None) or {})
+        self._known_history = (
+            [{"role": t.role, "content": t.content, "meta": t.meta} for t in seed_traces or []]
+            if self._format2
+            else []
+        )
+        self._state_payloads: dict[str, str] = {}
+        self._seed_input_pending = any(t.role == "user" for t in seed_traces or [])
+        self._durable_state = deepcopy(self._loop_state)
+
+    async def restore_history(self, *, limits: Any) -> None:
+        if not self._format2:
+            return
+        from dendrux.runtime.replay import conversation_records
+
+        records = await conversation_records(self._store, self._run_id, limits=limits)
+        self._known_history = [
+            {"role": t.role, "content": t.content, "meta": t.meta} for t in records
+        ]
+
+    def bind_loop(self, source: Any, budget: Any) -> None:
+        """Bind live loop data without making loops depend on runtime internals."""
+        if not self._format2:
+            return
+        self._loop_source = source
+        live = source()
+        for target, saved_value in (
+            (live["tool_counts"], self._loop_state.get("tool_counts")),
+            (live["pii_counters"], self._loop_state.get("pii", {}).get("counters")),
+        ):
+            if saved_value is not None:
+                target.clear()
+                target.update(saved_value)
+        saved = self._loop_state.get("budget")
+        if saved:
+            from dendrux.loops._budget import BudgetState
+
+            resumed = budget.snapshot()
+            restored = BudgetState(**saved)
+            if resumed.gate:
+                restored = replace(
+                    restored,
+                    gate=resumed.gate,
+                    accepted_unpriced_baseline=max(
+                        restored.accepted_unpriced_baseline,
+                        resumed.accepted_unpriced_baseline,
+                    ),
+                )
+            budget.restore(restored)
+
+    async def _state_ref(self, kind: str, payload: dict[str, Any]) -> str | None:
+        from dendrux.runtime.state import TraceWrite
+
+        content = json.dumps(
+            {"kind": kind, "v": 1, **payload}, ensure_ascii=False, separators=(",", ":")
+        )
+        field = "session_ref" if kind == "skills_session" else kind + "_ref"
+        refs = (
+            self._loop_state.setdefault("skills", {})
+            if kind == "skills_session"
+            else self._loop_state
+        )
+        if self._state_payloads.get(kind) == content:
+            return refs.get(field)
+        trace = TraceWrite(
+            generate_ulid(),
+            "state",
+            content,
+            self._order_index,
+            trace_kind="state",
+            meta={"state_kind": kind},
+        )
+        self._order_index += 1
+        refs[field] = trace.trace_id
+        self._state_payloads[kind] = content
+
+        async def write_state() -> None:
+            await self._store.save_trace(
+                self._run_id,
+                "state",
+                content,
+                order_index=trace.order_index,
+                meta=trace.meta,
+                trace_id=trace.trace_id,
+                trace_kind="state",
+            )
+
+        await retry_critical(write_state, label="state_trace", run_id=self._run_id)
+        return trace.trace_id
+
+    async def _snapshot(self, iteration: int) -> None:
+        from dendrux.skills._session import current
+        from dendrux.types import _usage_to_dict
+
+        if self._loop_source is None:
+            return
+        data = self._loop_source()
+        budget = asdict(data["budget"].snapshot())
+        usage = _usage_to_dict(data["usage"])
+        usage.update(
+            priced_subtotal_usd=budget["known_cost_usd"], unpriced_calls=budget["unpriced_calls"]
+        )
+        self._loop_state.update(
+            v=1,
+            loop="react",
+            iteration=iteration,
+            steps_count=len(data["steps"]),
+            usage=usage,
+            budget=budget,
+            tool_counts={
+                k: v for k, v in data["tool_counts"].items() if k in data["declared_tools"]
+            },
+            pii={
+                "mapping_version": len(data["pii_mapping"] or {}),
+                "counters": dict(data["pii_counters"]),
+            },
+            provider_kwargs=dict(data["provider_kwargs"]),
+        )
+        for key, default in (
+            ("pending", []),
+            ("submission", None),
+            ("image_view_ref", None),
+            ("clarification_ref", None),
+            ("phase", "model_next"),
+        ):
+            self._loop_state.setdefault(key, default)
+        self._loop_state.setdefault("skills", {"session_ref": None, "pins": {}})
+        session = current()
+        if session is not None and session.configured:
+            self._loop_state["skills"]["pins"] = {
+                s.name: s.digest for s in session.available.values()
+            }
+            await self._state_ref("skills_session", session.snapshot())
+        image_view = data["image_view"].to_dict()
+        if data["has_images"] or self._loop_state.get("image_view_ref"):
+            await self._state_ref("image_view", image_view)
+
+    async def _checkpoint(self, trace: Any = None) -> None:
+        self._loop_state["trace_order_offset"] = self._order_index
+        mapping = self._loop_source()["pii_mapping"] if self._loop_source else None
+        snapshot = deepcopy(self._loop_state)
+
+        async def write() -> None:
+            await self._store.checkpoint_step(
+                self._run_id,
+                claim_epoch=getattr(self._store, "claim_epoch", 0),
+                loop_state=snapshot,
+                pii_mapping=mapping,
+                trace=trace,
+            )
+
+        await retry_critical(write, label="checkpoint_step", run_id=self._run_id)
+        self._durable_state = snapshot
+
+    def order_observations(self, history: list[Message]) -> None:
+        """Use reserved call order for each format-2 batch, including resumed batches."""
+        if not self._format2:
+            return
+        order: dict[str, int] = {}
+        start = 0
+        for i, message in enumerate([*history, None]):
+            if message is not None and message.role.value == "tool":
+                continue
+            history[start:i] = sorted(
+                history[start:i], key=lambda m: order.get(m.call_id or "", len(order))
+            )
+            if message is not None and message.tool_calls:
+                order = {tc.id: n for n, tc in enumerate(message.tool_calls)}
+            start = i + 1
+
+    async def checkpoint_view(self, messages: list[Message], iteration: int) -> None:
+        """Persist a changed prefix before its next model call, including edits."""
+        if not self._format2:
+            return
+        from dendrux.runtime.state import TraceWrite
+
+        await self._snapshot(iteration - 1)
+        view = [
+            {"role": t.role, "content": t.content, "meta": t.meta}
+            for t in (message_trace(m, 0) for m in messages)
+        ]
+        self._loop_state["phase"] = "model_next"
+        previous = {_view_identity(entry): entry for entry in self._known_history}
+        for entry in view:
+            old = previous.get(_view_identity(entry))
+            if old is not None:
+                entry["meta"] = {**(old.get("meta") or {}), **entry["meta"]}
+        if [_view_identity(e) for e in view] != [_view_identity(e) for e in self._known_history]:
+            trace = TraceWrite(
+                generate_ulid(),
+                "rewrite",
+                json.dumps(view, ensure_ascii=False),
+                self._order_index,
+                trace_kind="rewrite",
+            )
+            self._order_index += 1
+            await self._checkpoint(trace)
+            self._known_history = view
+        elif self._loop_state != self._durable_state:
+            await self._checkpoint()
+
+    async def on_llm_call_started(
+        self,
+        run_id: str,
+        iteration: int,
+        *,
+        semantic_messages: list[Message] | None = None,
+        semantic_tools: list[ToolDef] | None = None,
+    ) -> None:
+        if self._format2 and self._loop_source is not None:
+            await self._snapshot(iteration - 1)
+            if self._loop_state != self._durable_state:
+                await self._checkpoint()
+
+    async def checkpoint_outcome(self, result: Any, provider_kwargs: Any) -> None:
+        """Store pause references and the last execution boundary before releasing ownership."""
+        if not self._format2:
+            return
+        await self._snapshot(result.iteration_count)
+        pause = result.meta.get("pause_state")
+        if pause is not None:
+            from dendrux.types import Message, Role
+
+            prefix = [
+                Message(role=Role.SYSTEM, content=e["content"])
+                for e in self._known_history
+                if e["role"] == "system"
+            ]
+            await self.checkpoint_view([*prefix, *pause.history], result.iteration_count + 1)
+            pause.schema_version = 2
+            pause.loop_state_ref = True
+            pause.provider_kwargs = dict(provider_kwargs or pause.provider_kwargs)
+            if pause.image_view is not None:
+                await self._state_ref("image_view", pause.image_view.to_dict())
+            pause.image_view_ref = self._loop_state.get("image_view_ref")
+            self._loop_state["phase"] = {
+                "waiting_approval": "awaiting_approval",
+                "waiting_client_tool": "awaiting_client",
+                "waiting_human_input": "awaiting_input",
+            }.get(result.status.value, "model_next")
+            gates = pause.approval_gates or {}
+            remaining = {tc.id for tc in pause.pending_tool_calls}
+            self._loop_state["pending"] = [
+                {
+                    **p,
+                    "phase": "gated" if p["call_id"] in gates else p["phase"],
+                    "decision_id": f"{pause.pause_id}:{p['call_id']}"
+                    if p["call_id"] in gates
+                    else p.get("decision_id"),
+                }
+                for p in self._loop_state.get("pending", [])
+                if p["call_id"] in remaining
+            ]
+            if result.status.value == "waiting_human_input":
+                await self._state_ref(
+                    "clarification",
+                    {
+                        "v": 1,
+                        "question": result.answer or "",
+                        "pause_message": pause.pause_message,
+                    },
+                )
+        else:
+            self._loop_state["phase"] = "finalizing"
+        await self._checkpoint()
 
     def lease_scope(self) -> AbstractAsyncContextManager[None]:
         """Provide the loop's optional renewal seam from the runtime layer."""
@@ -252,6 +604,69 @@ class PersistenceRecorder(BaseRecorder):
 
     async def on_message_appended(self, run_id: str, message: Message, iteration: int) -> None:
         """Persist a message to react_traces. FAIL-CLOSED."""
+        if self._format2:
+            # The runner's seed already includes its input. Resume injections
+            # occur before bind_loop and still need their own trace.
+            if self._seed_input_pending and message.role.value == "user":
+                self._seed_input_pending = False
+                return
+            await self._snapshot(iteration)
+            pending = self._loop_state.setdefault("pending", [])
+            reserved = next((p for p in pending if p["call_id"] == message.call_id), None)
+            order = reserved["order_index"] if reserved is not None else self._order_index
+            trace = message_trace(message, order, tenant_scope=self._tenant_scope)
+            if message.role.value == "assistant" and self._loop_source:
+                from dendrux.types import _step_to_dict
+
+                steps = self._loop_source()["steps"]
+                if steps:
+                    trace.meta["dendrux.step"] = _step_to_dict(steps[-1])
+            if reserved is None:
+                self._order_index += 1
+            else:
+                self._loop_state["pending"] = [
+                    p for p in pending if p["call_id"] != message.call_id
+                ]
+                self._loop_state["phase"] = (
+                    "dispatch" if self._loop_state["pending"] else "model_next"
+                )
+            if message.tool_calls:
+                data = self._loop_source() if self._loop_source else {}
+                targets = data.get("tool_targets", {})
+                gates = data.get("approval_tools", ())
+                denied = data.get("denied_tools", ())
+                self._loop_state["pending"] = [
+                    {
+                        "call_id": tc.id,
+                        "tool": tc.name,
+                        "phase": (
+                            "invalid"
+                            if tc.parse_error or tc.name not in targets or tc.name in denied
+                            else "gated"
+                            if tc.name in gates
+                            else "client"
+                            if targets.get(tc.name) == "client"
+                            else "dispatchable"
+                        ),
+                        "decision_id": None,
+                        "order_index": self._order_index + i,
+                        "target": targets.get(tc.name, "server"),
+                    }
+                    for i, tc in enumerate(message.tool_calls)
+                ]
+                self._order_index += len(message.tool_calls)
+                self._loop_state["phase"] = "dispatch"
+            elif message.role.value == "assistant":
+                self._loop_state["phase"] = "finalizing"
+            await self._checkpoint(trace)
+            self._known_history.append(
+                {
+                    "role": trace.role,
+                    "content": trace.content,
+                    "meta": {k: v for k, v in trace.meta.items() if k != "dendrux.step"},
+                }
+            )
+            return
         meta = dict(message.meta) if message.meta else {}
         meta["iteration"] = iteration
 

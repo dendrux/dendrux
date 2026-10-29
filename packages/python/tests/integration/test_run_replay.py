@@ -78,7 +78,11 @@ class TestFullReplay:
             '"result for q2"',
         ]
         for rid, tm in zip(run_ids, tool_msgs, strict=True):
-            stored = [t for t in await store.get_traces(rid) if t.role == "tool"][0]
+            stored = [
+                t
+                for t in await store.get_traces(rid)
+                if t.role == "tool" and t.trace_kind == "turn"
+            ][0]
             assert tm.call_id == stored.meta["call_id"]
             assert tm.name == stored.meta["tool_name"]
 
@@ -91,9 +95,10 @@ class TestFullReplay:
         record = await store.get_run(result.run_id)
         assert record.meta[REPLAY_META_KEY]["runs"] == run_ids
         assert record.meta[PREFIX_META_KEY]["seed"]["expansion"][-1]["mode"] == "full"
-        # Replayed turns are not re-persisted.
+        # Format 2 retains the replay prefix as seeds and appends its own turn.
         traces = await store.get_traces(result.run_id)
-        assert [t.role for t in traces] == ["user", "assistant"]
+        assert any(t.trace_kind == "seed" and t.role == "tool" for t in traces)
+        assert [t.role for t in traces if t.trace_kind == "turn"] == ["assistant"]
 
     async def test_every_run_records_prefix(self, store):
         mock = MockLLM([LLMResponse(text="hi")])
@@ -133,7 +138,7 @@ class TestFullReplay:
         mock = MockLLM([LLMResponse(text="a0")])
         r0 = await _agent(store, mock).run("q0", context=[ContextBlock("DOCS")])
         traces = await store.get_traces(r0.run_id)
-        assert traces[0].content == "q0"
+        assert next(t for t in traces if t.role == "user").content == "q0"
 
         mock2 = MockLLM([LLMResponse(text="a1")])
         await _agent(store, mock2).run("q1", runs=[r0.run_id], replay_last="all")
