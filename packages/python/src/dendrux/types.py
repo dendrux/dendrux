@@ -19,6 +19,7 @@ import logging
 import re
 from collections.abc import Awaitable, Callable, Iterator, Sequence
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Literal, TypeAlias
 
@@ -1234,6 +1235,27 @@ class ErrorInfo:
         )
 
 
+@dataclass(frozen=True)
+class RecoveryInfo:
+    """Durable recovery summary, absent for runs that were never reclaimed."""
+
+    reclaim_attempts: int
+    last_reclaimed_at: datetime | None
+    replayed_tool_calls: list[str]
+    replayed_truncated: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        stamp = self.last_reclaimed_at
+        return {
+            "reclaim_attempts": self.reclaim_attempts,
+            "last_reclaimed_at": stamp.astimezone(UTC).isoformat().replace("+00:00", "Z")
+            if stamp
+            else None,
+            "replayed_tool_calls": list(self.replayed_tool_calls),
+            "replayed_truncated": self.replayed_truncated,
+        }
+
+
 @dataclass
 class RunResult:
     """The outcome of an agent run.
@@ -1266,6 +1288,8 @@ class RunResult:
 
     ``error_info`` describes a provider failure that ended the run (ERROR
     only). ``pause_id`` identifies the current pause of a paused run.
+    ``recovery`` summarizes durable reclaims and replayed calls. It is None
+    for unreclaimed runs, whose wire DTO omits the additive recovery key.
     """
 
     run_id: str
@@ -1284,6 +1308,7 @@ class RunResult:
     pause_id: str | None = None
 
     pending: PendingPause | None = None
+    recovery: RecoveryInfo | None = None
     _wire_pii_mapping: dict[str, Any] = field(
         default_factory=dict, init=False, repr=False, compare=False
     )
@@ -1299,7 +1324,10 @@ class RunResult:
         """
         from dendrux._wire import result_to_dict
 
-        return result_to_dict(self)
+        result = result_to_dict(self)
+        if self.recovery is not None:
+            result["recovery"] = self.recovery.to_dict()
+        return result
 
     @property
     def truncated(self) -> bool:

@@ -395,7 +395,7 @@ class PersistenceRecorder(BaseRecorder):
         )
         self._loop_state.update(
             v=1,
-            loop="react",
+            loop=data.get("loop", "react"),
             iteration=iteration,
             steps_count=len(data["steps"]),
             usage=usage,

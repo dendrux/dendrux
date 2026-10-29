@@ -120,10 +120,21 @@ class RunControlError(RuntimeError):
     """Base for conflicts while controlling a persisted run."""
 
 
+def _restore_logged_control_error(cls: Any, args: tuple[Any, ...], state: dict[str, Any]) -> Any:
+    """Deserialize an existing failure without firing its construction log again."""
+    error = cls.__new__(cls)
+    RuntimeError.__init__(error, *args)
+    error.__dict__.update(state)
+    return error
+
+
 class RunNotReclaimableError(_KwargsReduceMixin, RunControlError):
     """A run does not satisfy the ordered recovery preconditions."""
 
     _init_fields = ("run_id", "reason")
+
+    def __reduce__(self) -> Any:
+        return _restore_logged_control_error, (type(self), self.args, self.__dict__)
 
     def __init__(self, run_id: str, reason: str) -> None:
         self.run_id = run_id
@@ -139,6 +150,9 @@ class RunCancelledError(_KwargsReduceMixin, RunControlError):
     """A delegated run was refused by a cancelled or terminal parent."""
 
     _init_fields = ("run_id", "parent_run_id")
+
+    def __reduce__(self) -> Any:
+        return _restore_logged_control_error, (type(self), self.args, self.__dict__)
 
     def __init__(self, run_id: str, parent_run_id: str) -> None:
         self.run_id = run_id

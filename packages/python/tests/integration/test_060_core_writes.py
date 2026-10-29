@@ -183,7 +183,17 @@ async def test_every_claimed_write_is_fenced(store, engine):
             dict(submission_id=generate_ulid(), traces=[], patch=LoopStatePatch()),
         ),
     ]
-    for name, args, kwargs in calls:
+    calls.extend(
+        (name, args, {**kwargs, id_key: generate_ulid()})
+        for name, args, kwargs, id_key, _, _ in writes()
+    )
+    calls.append(("touch_progress", (), {}))
+    from dendrux.runtime.state import _ClaimedStateStore
+
+    inventory = {name: (args, kwargs) for name, args, kwargs in calls}
+    assert set(inventory) == _ClaimedStateStore.claimed_writes
+    for name in _ClaimedStateStore.claimed_writes:
+        args, kwargs = inventory[name]
         with pytest.raises(RunFencedError):
             await getattr(old, name)(run_id, *args, **kwargs)
 

@@ -167,7 +167,17 @@ _CANCEL_REASONS = frozenset(
     {"cancel_requested", "task_cancelled", "stream_closed", BUDGET_EXCEEDED}
 )
 _FAILURE_REASONS = frozenset(
-    {"stale_running", "never_started", "abandoned_waiting", "guardrail_blocked", BUDGET_EXCEEDED}
+    {
+        "stale_running",
+        "never_started",
+        "abandoned_waiting",
+        "guardrail_blocked",
+        BUDGET_EXCEEDED,
+        "reclaim_limit",
+        "stale_running_legacy",
+        "pending_limit",
+        "lease_lost",
+    }
 )
 _BUDGET_METRICS = frozenset({TOKENS, COST_USD})
 _BUDGET_REASONS = frozenset({"threshold_crossed", BUDGET_EXCEEDED, UNPRICED_CALL})

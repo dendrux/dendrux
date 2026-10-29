@@ -633,7 +633,20 @@ def _in_memory_pending(result: RunResult) -> Any:
     return _pending_from(result.run_id, result.status.value, kind, pause, last)
 
 
+async def _recovery_info(store: StateStore, record: Any) -> Any:
+    """Use the same bounded durable projection for direct and read results."""
+    from dendrux.types import RecoveryInfo
+
+    if record is None or not getattr(record, "reclaim_attempts", 0):
+        return None
+    ids, truncated = await store.get_replayed_tool_calls(
+        record.id, limit=100, tenant_id=record.tenant_id
+    )
+    return RecoveryInfo(record.reclaim_attempts, record.last_reclaimed_at, ids, truncated)
+
+
 async def _attach_persisted_pending(store: StateStore, result: RunResult, record: Any) -> RunResult:
+    result.recovery = await _recovery_info(store, record)
     if result.status in _PAUSE_STATUSES and record is not None:
         from dendrux.runtime._pending import _PendingReader
 
@@ -727,8 +740,14 @@ async def _persist_loop_outcome(
     the raw LLM output so the dashboard's audit view stays placeholder-faithful.
     """
     from dendrux.guardrails._engine import deanonymize_text
+    from dendrux.runtime._capabilities import capabilities
     from dendrux.types import RunResult
 
+    recovery = (
+        await _recovery_info(state_store, await state_store.get_run(run_id))
+        if capabilities(state_store).recovery
+        else None
+    )
     pii_mapping = result.meta.get("pii_mapping") or {}
     user_answer, unmapped_placeholders = deanonymize_text(result.answer, pii_mapping)
 
@@ -752,6 +771,7 @@ async def _persist_loop_outcome(
             stop_reason=result.stop_reason if status == RunStatus.SUCCESS else None,
             pause_id=pause_id,
             pending=pending,
+            recovery=recovery,
         )
 
     async def _persisted(status_if_missing: RunStatus) -> RunResult:

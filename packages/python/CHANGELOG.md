@@ -8,6 +8,16 @@ notifier for live reads, published scale numbers with a rerunnable load script,
 one trace per run and a log-codes page, and the 0.5 FutureWarning flips.
 Entries are added as each track merges.
 
+- State-store subclass upgrade: overrides of `SQLAlchemyStateStore` write methods
+  must accept and forward the new keyword-only parameters (a `**kwargs` passthrough
+  is supported), or explicitly declare only the capabilities they implement.
+  Validation now runs when constructing an `Agent`; incompatible inherited
+  capability declarations raise `StoreCapabilityError` before execution.
+- Results from reclaimed runs include `RecoveryInfo` and an additive `recovery`
+  wire field with the reclaim count, last reclaim time and bounded replayed-call ids.
+  `agent_runs.strategy` retains its strategy name; recovery classifies the loop
+  using `loop_state.loop`.
+
 ## 0.5.0 - 2026-10-28
 
 "Trust". Pending and live reads require a tenant scope and hide payloads by default; provider

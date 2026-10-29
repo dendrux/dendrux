@@ -21,7 +21,10 @@ async def stale(store, engine, *, tenant="tenant", count=1):
         await conn.execute(
             update(AgentRun)
             .where(AgentRun.id.in_(ids))
-            .values(last_progress_at=datetime.now(UTC) - timedelta(minutes=10))
+            .values(
+                last_progress_at=datetime.now(UTC) - timedelta(minutes=10),
+                loop_state={"loop": "react"},
+            )
         )
     return ids
 
@@ -50,12 +53,51 @@ async def reclaim(store, item, tenant="tenant"):
     )
 
 
+async def race(store, engine, operations):
+    """Prewarm every connection, then release checked-out actors together."""
+    if engine.dialect.name != "postgresql":
+        return await asyncio.gather(*(op(store) for op in operations), return_exceptions=True)
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+
+    from dendrux.runtime.state import SQLAlchemyStateStore
+
+    pooled = create_async_engine(engine.url, pool_size=len(operations), max_overflow=0)
+    warm = await asyncio.gather(*(pooled.connect() for _ in operations))
+    await asyncio.gather(*(conn.close() for conn in warm))
+    barrier = asyncio.Barrier(len(operations))
+    entered = set()
+
+    class RacingSession(AsyncSession):
+        async def execute(self, statement, *args, **kwargs):
+            actor = asyncio.current_task()
+            first = actor not in entered
+            if first:
+                entered.add(actor)
+                await self.connection()
+                await asyncio.wait_for(barrier.wait(), 10)
+            result = await super().execute(statement, *args, **kwargs)
+            if first:
+                # Give all unlocked readers a chance to observe the old epoch.
+                # Correct FOR UPDATE readers remain blocked until the winner commits.
+                await asyncio.sleep(0.03)
+            return result
+
+    contender = SQLAlchemyStateStore(pooled)
+    contender._session_factory = async_sessionmaker(
+        pooled, class_=RacingSession, expire_on_commit=False
+    )
+    try:
+        return await asyncio.wait_for(
+            asyncio.gather(*(op(contender) for op in operations), return_exceptions=True), 20
+        )
+    finally:
+        await pooled.dispose()
+
+
 async def test_a2_twenty_reclaimers_one_winner(store, engine):
     await stale(store, engine)
     item = (await mark(store)).reclaimable[0]
-    results = await asyncio.gather(
-        *(reclaim(store, item) for _ in range(20)), return_exceptions=True
-    )
+    results = await race(store, engine, [lambda s: reclaim(s, item) for _ in range(20)])
     winners = [r for r in results if not isinstance(r, BaseException) and r is not False]
     assert len(winners) == 1
     losers = [r for r in results if isinstance(r, BaseException)]
@@ -71,7 +113,7 @@ async def test_a2_twenty_reclaimers_one_winner(store, engine):
 
 async def test_a13_a14_two_markers_rediscover_without_duplicate_events(store, engine):
     ids = await stale(store, engine)
-    first, second = await asyncio.gather(mark(store), mark(store))
+    first, second = await race(store, engine, [mark, mark])
     assert first.reclaimable[0].claim_epoch == second.reclaimable[0].claim_epoch == 1
     again = await store.get_lease_expired(limit=10, cursor=None)
     assert [r.run_id for r in again] == ids
@@ -113,7 +155,10 @@ async def test_a6_limit_mark_finalizes_exhausted_run(store, engine):
         await conn.execute(
             update(AgentRun)
             .where(AgentRun.id == item.run_id)
-            .values(last_progress_at=datetime.now(UTC) - timedelta(minutes=10))
+            .values(
+                last_progress_at=datetime.now(UTC) - timedelta(minutes=10),
+                loop_state={"loop": "react"},
+            )
         )
     result = await mark(store, reclaim_limit=1)
     assert not result.reclaimable
@@ -172,7 +217,10 @@ async def test_new_mark_persists_the_current_reclaim_limit(store, engine):
         await conn.execute(
             update(AgentRun)
             .where(AgentRun.id == first.run_id)
-            .values(last_progress_at=datetime.now(UTC) - timedelta(minutes=10))
+            .values(
+                last_progress_at=datetime.now(UTC) - timedelta(minutes=10),
+                loop_state={"loop": "react"},
+            )
         )
     second = await mark(store, reclaim_limit=2)
     assert len(second.reclaimable) == 1 and not second.finalised

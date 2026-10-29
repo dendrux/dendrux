@@ -647,11 +647,13 @@ def _bind_checkpoint(
     engine: GuardrailEngine | None,
     agent: Agent,
     strategy: Strategy,
+    loop_type: str = "react",
 ) -> None:
     bind = getattr(recorder, "bind_loop", None)
     if bind is not None:
         bind(
             lambda: {
+                "loop": loop_type,
                 "format_result": lambda result: _format_result(strategy, result),
                 "idempotent": {t.name: t.idempotent for t in tool_defs},
                 "steps": state.steps,

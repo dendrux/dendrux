@@ -345,7 +345,7 @@ async def test_single_call_renews_only_during_provider_steps(store, monkeypatch,
 
             response = await self.complete(*args, **kwargs)
             yield StreamEvent(type=StreamEventType.TEXT_DELTA, text=response.text)
-            yield StreamEvent(type=StreamEventType.DONE, response=response)
+            yield StreamEvent(type=StreamEventType.DONE, raw=response)
 
     monkeypatch.setattr(store, "touch_progress", touch)
     a = Agent(
@@ -363,6 +363,7 @@ async def test_single_call_renews_only_during_provider_steps(store, monkeypatch,
                     before = len(touches)
                     await asyncio.sleep(0.06)
                     assert len(touches) == before
+            assert event.type == RunEventType.RUN_COMPLETED
     else:
         await a.run("go")
 

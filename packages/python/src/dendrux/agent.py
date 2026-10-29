@@ -2094,7 +2094,7 @@ class Agent:
         from dendrux.errors import PersistenceNotConfiguredError, RunNotFoundError
         from dendrux.guardrails._engine import deanonymize_text
         from dendrux.runtime._pending import _PendingReader
-        from dendrux.runtime.runner import _cached_output, _public_meta
+        from dendrux.runtime.runner import _cached_output, _public_meta, _recovery_info
 
         _check_result_read_arguments(run_id, tenant_id)
         require_boolean(include_pii, "include_pii")
@@ -2111,6 +2111,7 @@ class Agent:
         if record is None or record.agent_name != self.name:
             raise RunNotFoundError(run_id)
         result = _record_to_run_result(record)
+        result.recovery = await _recovery_info(store, record)
         mapping = await facade.get_pii_mapping(run_id, tenant_id=tenant_id) or {}
         result.answer = deanonymize_text(record.answer, mapping)[0]
         result._wire_pii_mapping = mapping
@@ -2290,6 +2291,9 @@ class Agent:
             if not root_signalled:
                 self._task_manager.cancel(run_id)
             result = _record_to_run_result(record)
+        from dendrux.runtime.runner import _recovery_info
+
+        result.recovery = await _recovery_info(store, record)
         if result.status.value in _TERMINAL_STATUS_VALUES:
             from dendrux.runtime.runner import _attach_undelivered_notes
 

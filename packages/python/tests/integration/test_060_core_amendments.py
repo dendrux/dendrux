@@ -77,7 +77,10 @@ async def test_reclaim_policy_is_checked_under_lock(store, engine, policy):
         await conn.execute(
             update(AgentRun)
             .where(AgentRun.id == run_id)
-            .values(last_progress_at=datetime.now(UTC) - timedelta(hours=1))
+            .values(
+                last_progress_at=datetime.now(UTC) - timedelta(hours=1),
+                loop_state={"loop": "react"},
+            )
         )
     result = await store.mark_lease_expired(
         cutoff=datetime.now(UTC) - timedelta(minutes=1),
@@ -87,7 +90,7 @@ async def test_reclaim_policy_is_checked_under_lock(store, engine, policy):
         reclaim_limit=3,
         cursor=None,
     )
-    assert result.reclaimable, "legacy strategy values are read as react"
+    assert result.reclaimable, "checkpoint loop type is independent of the strategy name"
     import inspect
 
     assert "governance_policy" in inspect.signature(store.reclaim_run).parameters

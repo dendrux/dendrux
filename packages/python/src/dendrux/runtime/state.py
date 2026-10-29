@@ -1395,6 +1395,11 @@ def _validate_trace_write(run_id: str, trace: TraceWrite) -> None:
                 for m in value
             ):
                 raise ValueError("Rewrite entries require role and content")
+            if any(not isinstance(m.get("meta", {}), dict) for m in value):
+                logger.warning(
+                    "Invalid rewrite metadata", extra={"run_id": run_id, "code": "rewrite_invalid"}
+                )
+                raise ValueError("Rewrite entry metadata must be an object")
         elif not isinstance(value, dict) or value.get("kind") not in (
             "image_view",
             "skills_session",
@@ -1568,6 +1573,12 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         blob_refs: Sequence[BlobEdge] | None = None,
         blob_refs_scope: str | None = None,
     ) -> CreateRunResult:
+        """Create a pinned run; materialize seed traces only for format 2.
+
+        Format-1 seeds are deliberately ignored: the legacy runtime retains its
+        original user/assistant trace writes and history behavior. Callers must
+        use the returned storage_format to choose their recorder protocol.
+        """
         from dendrux.types import _validate_persistable
 
         _check_create_identifiers(run_id, agent_name, tenant_id, idempotency_key, model)
@@ -2488,15 +2499,22 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         from dendrux.db.models import AgentRun
 
         _positive_page(limit)
-        stmt = _apply_tenant_scope(
-            select(AgentRun.id).where(AgentRun.parent_run_id.in_(parent_ids)), tenant_id
-        )
-        if after is not None:
-            stmt = stmt.where(AgentRun.id > after)
+        size = min(limit, 1000)
+        frontier = sorted(set(parent_ids))
+        children: list[str] = []
         async with self._session_factory() as session:
-            return list(
-                (await session.scalars(stmt.order_by(AgentRun.id).limit(min(limit, 1000)))).all()
-            )
+            for start in range(0, len(frontier), _IN_CHUNK):
+                stmt = _apply_tenant_scope(
+                    select(AgentRun.id).where(
+                        AgentRun.parent_run_id.in_(frontier[start : start + _IN_CHUNK])
+                    ),
+                    tenant_id,
+                )
+                if after is not None:
+                    stmt = stmt.where(AgentRun.id > after)
+                page = list((await session.scalars(stmt.order_by(AgentRun.id).limit(size))).all())
+                children = sorted(set(children).union(page))[:size]
+        return children
 
     async def get_loop_state(self, run_id: str) -> dict[str, Any] | None:
         """Read the authoritative execution projection."""
@@ -3232,8 +3250,6 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
 
         async def _attempt() -> bool:
             async with self._session_factory() as session:
-                if claim_epoch is not None:
-                    await self._fence(session, run_id, claim_epoch)
                 if max_notes is not None and self._engine.dialect.name == "postgresql":
                     await session.execute(
                         select(
@@ -3242,6 +3258,8 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                             )
                         )
                     )
+                if claim_epoch is not None:
+                    await self._fence(session, run_id, claim_epoch)
                 source = select(
                     literal(note_id, String(26)),
                     AgentRun.id,
@@ -4148,10 +4166,17 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         from sqlalchemy import func, or_, select, update
 
         from dendrux.db.models import AgentRun
+        from dendrux.errors import RunNotReclaimableError
 
         _require_aware_utc("cutoff", cutoff)
         for bound in (batch_size, max_runs, max_returned, reclaim_limit):
             _positive_page(bound)
+        if max(batch_size, max_runs, max_returned) > 100000:
+            logger.warning(
+                "Recovery scan limit exceeded",
+                extra={"run_id": None, "code": "recovery_scan_limit"},
+            )
+            raise ValueError("Recovery scan bounds must not exceed 100000")
         if reclaim_limit > 32767:
             raise ValueError("reclaim_limit exceeds SMALLINT")
         result = MarkResult([], [], [], 0, None)
@@ -4168,7 +4193,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
             AgentRun.reclaim_limit,
             AgentRun.claim_epoch,
             AgentRun.lease_expired_at,
-            AgentRun.strategy,
+            AgentRun.loop_state["loop"].as_string().label("loop"),
             AgentRun.cancel_requested,
         )
         while inspected < max_runs and len(result.reclaimable) < max_returned:
@@ -4197,6 +4222,8 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                         age = _to_aware_utc(row.last_progress_at or row.created_at)
                         if row.lease_expired_at is None and age >= cutoff:
                             return None
+                        if row.storage_format == 2 and row.loop not in ("react", "single_call"):
+                            raise RunNotReclaimableError(run_id, "loop_unknown")
                         limit = (
                             row.reclaim_limit
                             if row.lease_expired_at is not None and row.reclaim_limit is not None
@@ -4208,7 +4235,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                             else "reclaim_limit"
                             if row.reclaim_attempts >= limit
                             else "stale_running"
-                            if row.strategy == "single_call"
+                            if row.loop == "single_call"
                             else None
                         )
                         if reason is not None or row.cancel_requested:
@@ -4256,7 +4283,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                                     "run_id": run_id,
                                     "code": "legacy_run_swept"
                                     if reason == "stale_running_legacy"
-                                    else "reclaim_limit",
+                                    else reason or "cancel_requested",
                                 },
                             )
                             return SweptRun(
@@ -4382,7 +4409,11 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
             )
             raise ValueError("governance_policy must be warn or raise")
 
+        committed_token: ClaimResult | None = None
+        claimed_at: datetime | None = None
+
         async def attempt() -> ClaimResult | Literal[False]:
+            nonlocal committed_token, claimed_at
             async with self._session_factory() as session:
                 row = (
                     await session.execute(
@@ -4400,9 +4431,9 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                                 AgentRun.agent_name,
                                 AgentRun.meta,
                                 AgentRun.loop_state,
-                                AgentRun.strategy,
                                 AgentRun.last_progress_at,
                                 AgentRun.created_at,
+                                AgentRun.last_reclaimed_at,
                             ).where(AgentRun.id == run_id),
                             tenant_id,
                         ).with_for_update()
@@ -4410,6 +4441,14 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                 ).first()
                 if row is None:
                     raise RunNotFoundError(run_id)
+                if (
+                    committed_token is not None
+                    and row.claim_epoch == committed_token.claim_epoch
+                    and row.lease_expired_at is None
+                    and row.status == "running"
+                    and _to_aware_utc(row.last_reclaimed_at) == claimed_at
+                ):
+                    return committed_token
                 checks = [
                     (row.storage_format == 2, "legacy_run"),
                     (self.capabilities.recovery, "store_capability"),
@@ -4429,21 +4468,29 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                         raise RunNotReclaimableError(run_id, reason)
                 previous_epoch = row.claim_epoch
                 if row.cancel_requested:
-                    await session.execute(
+                    cancelled = await session.execute(
                         update(AgentRun)
-                        .where(AgentRun.id == run_id, AgentRun.claim_epoch == previous_epoch)
+                        .where(
+                            AgentRun.id == run_id,
+                            AgentRun.claim_epoch == previous_epoch,
+                            AgentRun.status == "running",
+                            AgentRun.cancel_requested.is_(True),
+                        )
                         .values(
                             **_status_values("cancelled"),
                             claim_epoch=AgentRun.claim_epoch + 1,
                             pause_data=None,
                             cancel_requested=False,
                         )
+                        .returning(AgentRun.id)
                     )
+                    if cancelled.scalar_one_or_none() is None:
+                        return False
                     await _insert_event_locked(
                         session, run_id, "run.cancelled", {"reason": "cancel_requested"}
                     )
                     await session.commit()
-                    return False
+                    raise RunNotReclaimableError(run_id, "cancelled")
                 if row.agent_name != agent_name:
                     raise RunNotReclaimableError(run_id, "agent_mismatch")
                 saved = (row.meta or {}).get("dendrux.governance")
@@ -4460,7 +4507,10 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                 pins = ((row.loop_state or {}).get("skills") or {}).get("pins", {})
                 if pins != skill_pins:
                     raise RunNotReclaimableError(run_id, "skill_mismatch")
-                if loop_type != "react" or row.strategy == "single_call":
+                saved_loop = (row.loop_state or {}).get("loop")
+                if saved_loop not in ("react", "single_call"):
+                    raise RunNotReclaimableError(run_id, "loop_unknown")
+                if loop_type != "react" or saved_loop != "react":
                     raise RunNotReclaimableError(run_id, "loop_unsupported")
                 now = _dt.datetime.now(_dt.UTC)
                 gap = max(
@@ -4492,7 +4542,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                     )
                 ).first()
                 if changed is None:
-                    return False
+                    raise RunNotReclaimableError(run_id, "already_reclaimed")
                 await _insert_event_locked(
                     session,
                     run_id,
@@ -4510,6 +4560,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                     changed.loop_state,
                     (changed.loop_state or {}).get("submission"),
                 )
+                committed_token, claimed_at = token, now
                 await session.commit()
                 return token
 
@@ -5698,6 +5749,25 @@ def validate_event_index(index: Any) -> None:
 class _ClaimedStateStore:
     """Execution-local epoch binding, preserving undeclared stores' legacy signatures."""
 
+    claimed_writes = frozenset(
+        {
+            "save_trace",
+            "save_tool_call",
+            "save_usage",
+            "save_llm_interaction",
+            "save_run_event",
+            "touch_progress",
+            "add_note",
+            "mark_notes_delivered",
+            "update_run_meta",
+            "checkpoint_step",
+            "set_trace_link",
+            "start_tool_call",
+            "complete_tool_call",
+            "consume_submission",
+        }
+    )
+
     def __init__(self, store: StateStore, run_id: str, epoch: int | ClaimResult) -> None:
         self._store = store
         self._run_id = run_id
@@ -5734,24 +5804,9 @@ class _ClaimedStateStore:
             "pause_run",
             "release_run_claim",
         }
-        claimed_writes = {
-            "save_trace",
-            "save_tool_call",
-            "save_usage",
-            "save_llm_interaction",
-            "save_run_event",
-            "touch_progress",
-            "add_note",
-            "mark_notes_delivered",
-            "update_run_meta",
-            "checkpoint_step",
-            "set_trace_link",
-            "start_tool_call",
-            "complete_tool_call",
-            "consume_submission",
-        }
+
         enabled = name in status_writes or (
-            capabilities(self._store).fenced_writes and name in claimed_writes
+            capabilities(self._store).fenced_writes and name in self.claimed_writes
         )
         if enabled and callable(method) and "claim_epoch" in inspect.signature(method).parameters:
 
