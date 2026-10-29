@@ -16,6 +16,7 @@ shared instance can disambiguate concurrent runs.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from contextlib import AbstractAsyncContextManager, nullcontext
 from dataclasses import replace
@@ -401,6 +402,26 @@ async def record_governance(
 # ------------------------------------------------------------------
 
 
+def notifier_trace_link(notifier: LoopNotifier | None, run_id: str) -> str | None:
+    """Read the optional synchronous run-link hook without requiring it in the protocol."""
+    return _notifier_link(notifier, "trace_link", run_id)
+
+
+def notifier_span_link(notifier: LoopNotifier | None, run_id: str, tool_call_id: str) -> str | None:
+    """Read an optional tool-span link after on_tool_started has created its span."""
+    return _notifier_link(notifier, "current_span_link", run_id, tool_call_id)
+
+
+def _notifier_link(notifier: LoopNotifier | None, name: str, *args: str) -> str | None:
+    try:
+        hook = getattr(notifier, name, None)
+        value = hook(*args) if callable(hook) else None
+        return value if isinstance(value, str) else None
+    except Exception:
+        logger.warning("Notifier.%s failed", name, exc_info=safe_exception_info())
+        return None
+
+
 async def notify_run_started(
     notifier: LoopNotifier | None,
     run_id: str,
@@ -408,12 +429,23 @@ async def notify_run_started(
     agent_name: str | None = None,
     agent_model: str | None = None,
     warnings: list[str] | None = None,
+    trace_link: str | None = None,
 ) -> None:
     """Notify of run start, swallowing exceptions."""
     if notifier is None:
         return
     try:
-        await notifier.on_run_started(run_id, agent_name=agent_name, agent_model=agent_model)
+        kwargs: dict[str, Any] = {"agent_name": agent_name, "agent_model": agent_model}
+        try:
+            params = dict(inspect.signature(notifier.on_run_started).parameters)
+        except (TypeError, ValueError):
+            params = {}
+        parameter = params.get("trace_link")
+        if (parameter is not None and parameter.kind != inspect.Parameter.POSITIONAL_ONLY) or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+        ):
+            kwargs["trace_link"] = trace_link
+        await notifier.on_run_started(run_id, **kwargs)
     except Exception:
         logger.warning("Notifier.on_run_started failed", exc_info=safe_exception_info())
         if warnings is not None:

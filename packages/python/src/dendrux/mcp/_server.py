@@ -169,6 +169,13 @@ def _build_tool_def(
         parameters=tool.input_schema,
         target=ToolTarget.SERVER,
         parallel=_tool_is_parallel_safe(tool.annotations) and not serial,
+        # Stdio is an explicitly trusted local process. Remote annotations are
+        # untrusted metadata and cannot authorize replay of server effects.
+        idempotent=source.transport == "stdio"
+        and (
+            getattr(tool.annotations, "idempotent_hint", False) is True
+            or getattr(tool.annotations, "read_only_hint", False) is True
+        ),
         timeout_seconds=source.call_timeout,
         has_explicit_timeout=True,
         meta=meta,

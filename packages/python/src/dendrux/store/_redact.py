@@ -441,7 +441,8 @@ _SCHEMAS: dict[str, dict[str, Check]] = {
     },
     # persistence: tool_name and code decided in _special; parse_error hidden
     # (a provider adapter may set it), raw_length kept
-    "tool.started": {"tool_name": _declared, "target": _enum(_TARGETS)},
+    "tool.started": {"tool_name": _declared, "call_id": lambda _: _HIDE, "idempotent": _bool},
+    "tool.replayed": {"call_id": lambda _: _HIDE},
     "tool.completed": {
         "tool_name": _declared,
         "target": _enum(_TARGETS),

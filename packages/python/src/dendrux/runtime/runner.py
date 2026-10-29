@@ -44,10 +44,14 @@ from dendrux.context_blocks import (
 from dendrux.errors import BlobNotFoundError, InvalidImageError, RunFencedError, safe_exception_info
 from dendrux.loops._budget import BUDGET_EXCEEDED, BudgetCarry
 from dendrux.loops._helpers import (
+    notifier_span_link,
+    notifier_trace_link,
     notify_message,
     notify_run_failed,
     notify_run_finished,
     notify_run_started,
+    notify_tool,
+    notify_tool_started,
     record_message,
     record_run_failed,
     record_run_finished,
@@ -55,6 +59,7 @@ from dendrux.loops._helpers import (
 )
 from dendrux.loops.react import ReActLoop
 from dendrux.runtime._entry_checks import resolve_runner_tenant, runner_entry_checks
+from dendrux.runtime._tracelink import validate_trace_link
 from dendrux.runtime.context import (
     DelegationContext,
     StreamContext,
@@ -147,6 +152,69 @@ STOP_REASON_META_KEY = "dendrux.stop_reason"
 """``agent_runs.meta`` key holding a SUCCESS run's final normalized stop reason."""
 
 _STOP_REASONS = frozenset(get_args(StopReason))
+
+
+class _TraceNotifier:
+    """Forward hooks while attaching a tool span only to its executing task."""
+
+    def __init__(self, inner: LoopNotifier) -> None:
+        self.inner = inner
+        self.tokens: dict[str, Any] = {}
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.inner, name)
+
+    async def on_tool_started(self, run_id: str, call: ToolCall, iteration: int) -> None:
+        await notify_tool_started(self.inner, run_id, call, iteration)
+        ctx = get_delegation_context()
+        link = validate_trace_link(notifier_span_link(self.inner, run_id, call.id))
+        if ctx is not None and ctx.run_id == run_id and link is not None:
+            self.tokens[call.id] = set_delegation_context(replace(ctx, tool_span_link=link))
+
+    async def on_tool_completed(
+        self, run_id: str, call: ToolCall, result: ToolResult, iteration: int
+    ) -> None:
+        try:
+            await notify_tool(self.inner, run_id, call, result, iteration)
+        finally:
+            token = self.tokens.pop(call.id, None)
+            if token is not None:
+                reset_delegation_context(token)
+
+
+async def _start_trace(
+    notifier: LoopNotifier | None,
+    store: StateStore | None,
+    run_id: str,
+    *,
+    agent_name: str | None,
+    agent_model: str | None,
+    parent: DelegationContext | None = None,
+    saved: str | None = None,
+) -> tuple[str | None, Any]:
+    """Start the notifier, persist its valid run link, and retain resume identity."""
+    from dendrux.runtime._capabilities import capabilities
+
+    saved = validate_trace_link(saved)
+    incoming = saved or (
+        validate_trace_link(parent.tool_span_link or parent.trace_link)
+        if parent is not None
+        else None
+    )
+    await notify_run_started(
+        notifier, run_id, agent_name=agent_name, agent_model=agent_model, trace_link=incoming
+    )
+    link = saved or validate_trace_link(notifier_trace_link(notifier, run_id))
+    if (
+        link is not None
+        and saved is None
+        and store is not None
+        and capabilities(store).fenced_writes
+    ):
+        await store.set_trace_link(
+            run_id, claim_epoch=getattr(store, "claim_epoch", 0), trace_link=link
+        )
+    return link, _TraceNotifier(notifier) if notifier is not None else None
 
 
 def _validate_loop_skill_compat(agent: Agent, resolved_loop: Loop) -> None:
@@ -1817,14 +1885,20 @@ async def run(
                 await record_run_started(
                     recorder, run_id, agent_name=agent.name, agent_model=provider.model
                 )
-                await notify_run_started(
-                    extra_notifier, run_id, agent_name=agent.name, agent_model=provider.model
+                trace_link, extra_notifier = await _start_trace(
+                    extra_notifier,
+                    state_store,
+                    run_id,
+                    agent_name=agent.name,
+                    agent_model=provider.model,
+                    parent=parent_ctx,
                 )
 
                 # Set delegation context for the duration of this run so nested
                 # agent.run() calls inside tools inherit the parent link.
                 this_ctx = DelegationContext(
                     run_id=run_id,
+                    trace_link=trace_link,
                     delegation_level=delegation_level,
                     persisted=state_store is not None,
                     store_identity=get_store_identity(state_store),
@@ -2733,12 +2807,18 @@ async def retry(
         await record_run_started(
             recorder, run_id, agent_name=agent.name, agent_model=provider.model
         )
-        await notify_run_started(
-            extra_notifier, run_id, agent_name=agent.name, agent_model=provider.model
+        trace_link, extra_notifier = await _start_trace(
+            extra_notifier,
+            state_store,
+            run_id,
+            agent_name=agent.name,
+            agent_model=provider.model,
+            parent=parent_ctx,
         )
 
         this_ctx = DelegationContext(
             run_id=run_id,
+            trace_link=trace_link,
             delegation_level=delegation_level,
             persisted=True,
             store_identity=get_store_identity(state_store),
@@ -3048,7 +3128,7 @@ def run_stream(
         """
         # store is captured in the closure for the error handler.
         # Starts as the pre-provided value (often None for the lazy path).
-        nonlocal run_id
+        nonlocal run_id, extra_notifier
         store = state_store
         recorder: LoopRecorder | None = None
         seeded_history = initial_seeded
@@ -3314,9 +3394,16 @@ def run_stream(
             await record_run_started(
                 recorder, run_id, agent_name=agent.name, agent_model=provider.model
             )
-            await notify_run_started(
-                extra_notifier, run_id, agent_name=agent.name, agent_model=provider.model
+            trace_link, extra_notifier = await _start_trace(
+                extra_notifier,
+                store,
+                run_id,
+                agent_name=agent.name,
+                agent_model=provider.model,
+                parent=parent_ctx,
             )
+            this_ctx = replace(this_ctx, trace_link=trace_link)
+            stream_context.set_delegation(this_ctx)
             # Lifecycle pair is now open. Stash recorder/notifier so the
             # cleanup callback can close it with a CANCELLED finish if the
             # consumer abandons the stream before a terminal event.
@@ -4962,8 +5049,13 @@ async def _resume_core(
             await record_run_started(
                 ctx.recorder, run_id, agent_name=agent.name, agent_model=provider.model
             )
-            await notify_run_started(
-                ctx.notifier, run_id, agent_name=agent.name, agent_model=provider.model
+            trace_link, ctx.notifier = await _start_trace(
+                ctx.notifier,
+                state_store,
+                run_id,
+                agent_name=agent.name,
+                agent_model=provider.model,
+                saved=getattr(run_record, "trace_link", None),
             )
 
             await agent.get_tool_lookups(loop=ctx.resolved_loop)
@@ -4987,6 +5079,7 @@ async def _resume_core(
                     resume_max_depth = raw
             resume_ctx = DelegationContext(
                 run_id=run_id,
+                trace_link=trace_link,
                 delegation_level=resume_delegation_level,
                 persisted=True,
                 store_identity=get_store_identity(state_store),
@@ -5375,8 +5468,13 @@ def resume_stream(
             await record_run_started(
                 ctx.recorder, run_id, agent_name=agent.name, agent_model=provider.model
             )
-            await notify_run_started(
-                ctx.notifier, run_id, agent_name=agent.name, agent_model=provider.model
+            trace_link, ctx.notifier = await _start_trace(
+                ctx.notifier,
+                store,
+                run_id,
+                agent_name=agent.name,
+                agent_model=provider.model,
+                saved=getattr(run_record, "trace_link", None),
             )
             # Lifecycle pair is now open. Stash recorder/notifier so the
             # cleanup callback can close it with a CANCELLED finish if the
@@ -5404,6 +5502,7 @@ def resume_stream(
                     resume_max_depth = raw
             resume_ctx = DelegationContext(
                 run_id=run_id,
+                trace_link=trace_link,
                 delegation_level=resume_level,
                 persisted=True,
                 store_identity=get_store_identity(store),
