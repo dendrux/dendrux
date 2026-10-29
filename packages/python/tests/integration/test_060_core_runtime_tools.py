@@ -177,7 +177,9 @@ async def test_a19_approval_consumes_matching_generation_before_execution(
         run = get_delegation_context().run_id
         state = await store.get_loop_state(run)
         assert state["submission"] is None
-        assert state["pending"][0]["phase"] == "approved"
+        assert consumed[0]["pending"][0]["phase"] == "approved"
+        assert state["pending"][0]["phase"] == "dispatchable"
+        assert state["pending"][0]["decision_id"] is None
         effects.append("changed")
         return "ok"
 

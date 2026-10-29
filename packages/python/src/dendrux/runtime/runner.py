@@ -5024,6 +5024,7 @@ async def _resume_core(
     decisions: list[tuple[str, ApprovalDecision]] | None = None,
     user_parts: tuple[ContentPart, ...] | None = None,
     expected_pause_id: str | None = None,
+    _reclaim_pause: PauseState | None = None,
 ) -> RunResult:
     """Shared resume logic for tool results and clarification input.
 
@@ -5077,9 +5078,17 @@ async def _resume_core(
     with skill_session.bind():
         # 1. Load pause state
         raw_pause = await state_store.get_pause_state(run_id)
-        if raw_pause is None:
-            raise ValueError(f"Run '{run_id}' has no pause state — cannot resume.")
-        pause_state = await _load_pause_state(state_store, run_id, raw_pause, agent, provider)
+        if _reclaim_pause is not None:
+            pause_state = _reclaim_pause
+        else:
+            if raw_pause is None:
+                raise ValueError(f"Run '{run_id}' has no pause state — cannot resume.")
+            pause_state = await _load_pause_state(state_store, run_id, raw_pause, agent, provider)
+        from dendrux.runtime._reclaim import recovery_approval
+
+        recovering = _reclaim_pause is not None or (
+            pause_state.schema_version == 2 and recovery_approval(pause_state)
+        )
 
         # 1a. Load pii_mapping for guardrail continuity across pause/resume
         _saved_pii_mapping = await state_store.get_pii_mapping(run_id)
@@ -5113,6 +5122,7 @@ async def _resume_core(
 
         # Claim validation is repeated inside the row-locking transaction.
         if not _skip_claim:
+            assert raw_pause is not None
             state_store, expected_status = await _claim_resume(
                 state_store,
                 run_id,
@@ -5148,8 +5158,8 @@ async def _resume_core(
                 strategy=strategy,
                 loop=loop,
                 expected_status=expected_status,
-                tool_results=tool_results,
-                user_input=user_input,
+                tool_results=None if recovering else tool_results,
+                user_input=None if recovering else user_input,
                 extra_notifier=extra_notifier,
                 user_parts=user_parts,
                 tenant_id=run_tenant,
@@ -5176,9 +5186,10 @@ async def _resume_core(
 
             # 8b. tool/user-input history. Inside the try so
             #     a recorder failure here fires on_run_failed.
-            await _replay_resume_injected_history(
-                ctx, run_id, tool_results=tool_results, user_input=user_input
-            )
+            if not recovering:
+                await _replay_resume_injected_history(
+                    ctx, run_id, tool_results=tool_results, user_input=user_input
+                )
 
             # 9. Set delegation context — resumed run is the active parent for any
             #    nested agent.run() calls spawned during this resume cycle.
@@ -5204,6 +5215,22 @@ async def _resume_core(
             )
             ctx_token = set_delegation_context(resume_ctx)
 
+            if recovering:
+                from dendrux.runtime._reclaim import resolve
+
+                stop = await resolve(agent, state_store, run_id, ctx, image_runtime=image_runtime)
+                if stop is not None:
+                    stopped = await _persist_loop_outcome(
+                        recorder=ctx.recorder,
+                        provider_kwargs=ctx.pause_state.provider_kwargs,
+                        state_store=state_store,
+                        run_id=run_id,
+                        result=stop,
+                    )
+                    await record_run_finished(ctx.recorder, run_id, stopped)
+                    await notify_run_finished(ctx.notifier, run_id, stopped)
+                    return stopped
+
             # 10. Re-enter loop (batch)
             # Approval-approve: execute pending tools before loop re-entry.
             # Runs inside try/except so failures properly finalize as ERROR.
@@ -5216,7 +5243,7 @@ async def _resume_core(
             _is_paused_batch = expected_status == RunStatus.PAUSED.value and bool(
                 pause_state.pending_tool_calls
             )
-            if _is_approval_approve or _is_paused_batch:
+            if not recovering and (_is_approval_approve or _is_paused_batch):
                 from dendrux.loops._helpers import (
                     notify_governance as _ntfy_gov,
                 )
@@ -5274,7 +5301,11 @@ async def _resume_core(
 
             # Approval-reject: tool results already in history from _prepare_resume.
             # Emit governance event only.
-            if tool_results is not None and expected_status == RunStatus.WAITING_APPROVAL.value:
+            if (
+                not recovering
+                and tool_results is not None
+                and expected_status == RunStatus.WAITING_APPROVAL.value
+            ):
                 from dendrux.loops._helpers import (
                     notify_governance as _ntfy_gov_r,
                 )
@@ -5514,6 +5545,9 @@ def resume_stream(
             if raw_pause is None:
                 raise ValueError(f"Run '{run_id}' has no pause state — cannot resume.")
             pause_state = await _load_pause_state(store, run_id, raw_pause, agent, provider)
+            from dendrux.runtime._reclaim import recovery_approval
+
+            recovering = pause_state.schema_version == 2 and recovery_approval(pause_state)
 
             # 2b. Verify agent identity
             if pause_state.agent_name and pause_state.agent_name != agent.name:
@@ -5567,8 +5601,8 @@ def resume_stream(
                 agent=agent,
                 provider=provider,
                 expected_status=expected,
-                tool_results=stream_results,
-                user_input=user_input,
+                tool_results=None if recovering else stream_results,
+                user_input=None if recovering else user_input,
                 extra_notifier=extra_notifier,
                 user_parts=user_parts,
                 tenant_id=run_tenant,
@@ -5600,9 +5634,10 @@ def resume_stream(
 
             # 5b. tool/user-input history. Inside the try
             #     so a recorder failure here fires on_run_failed.
-            await _replay_resume_injected_history(
-                ctx, run_id, tool_results=stream_results, user_input=user_input
-            )
+            if not recovering:
+                await _replay_resume_injected_history(
+                    ctx, run_id, tool_results=stream_results, user_input=user_input
+                )
 
             # 6. Set delegation context for the generator lifetime.
             #    Read max_delegation_depth from persisted metadata so the
@@ -5630,6 +5665,23 @@ def resume_stream(
             # 7. Emit RUN_RESUMED as first event (contract guarantee)
             yield RunEvent(type=RunEventType.RUN_RESUMED, run_id=run_id)
 
+            if recovering:
+                from dendrux.runtime._reclaim import resolve
+
+                stop = await resolve(agent, store, run_id, ctx, image_runtime=image_runtime)
+                if stop is not None:
+                    stopped = await _persist_loop_outcome(
+                        recorder=ctx.recorder,
+                        provider_kwargs=ctx.pause_state.provider_kwargs,
+                        state_store=store,
+                        run_id=run_id,
+                        result=stop,
+                    )
+                    await record_run_finished(ctx.recorder, run_id, stopped)
+                    await notify_run_finished(ctx.notifier, run_id, stopped)
+                    yield RunEvent(type=RunEventType.RUN_PAUSED, run_result=stopped)
+                    return
+
             # 8. Approval-execute (inside try/except for proper error handling)
             _is_approval_approve = (
                 stream_results is None
@@ -5639,7 +5691,7 @@ def resume_stream(
             _is_paused_batch = expected == RunStatus.PAUSED.value and bool(
                 pause_state.pending_tool_calls
             )
-            if _is_approval_approve or _is_paused_batch:
+            if not recovering and (_is_approval_approve or _is_paused_batch):
                 approval = await _execute_approved_tools(
                     agent,
                     pause_state,
@@ -5706,7 +5758,11 @@ def resume_stream(
                     )
                     return
 
-            if stream_results is not None and expected == RunStatus.WAITING_APPROVAL.value:
+            if (
+                not recovering
+                and stream_results is not None
+                and expected == RunStatus.WAITING_APPROVAL.value
+            ):
                 from dendrux.loops._helpers import (
                     notify_governance as _ntfy_gov_r,
                 )

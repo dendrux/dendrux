@@ -34,7 +34,7 @@ from typing import TYPE_CHECKING, Any, Literal, overload
 
 from dendrux._sentinel import _OMITTED, _OmittedType, _UnsetType
 from dendrux.runtime._entry_checks import entry_checks, require_boolean
-from dendrux.runtime.state import UNSCOPED, TenantScope, require_store_method
+from dendrux.runtime.state import UNSCOPED, ReclaimableRun, TenantScope, require_store_method
 from dendrux.skills._internal import is_script, validate_executor
 from dendrux.skills._session import NAMES, SkillSession, continuation, current
 from dendrux.tool import get_tool_def, is_tool
@@ -1537,6 +1537,38 @@ class Agent:
             extra_notifier=notifier,
             **kwargs,
         )
+
+    async def reclaim(
+        self,
+        run_id: str,
+        *,
+        tenant_id: TenantScope | _OmittedType = _OMITTED,
+        notifier: LoopNotifier | None = None,
+        item: ReclaimableRun | None = None,
+    ) -> RunResult:
+        """Continue a marked ReAct run from its last committed checkpoint.
+
+        Call ``sweep(on_stale="reclaim")`` first. Passing its ``item`` fences
+        this attempt to that exact mark. Tenant scope is required; a missing
+        or foreign tenant raises RunNotFoundError without changing the run.
+        Interrupted non-idempotent tools pause for approval before replay.
+        """
+        from dendrux.errors import PersistenceNotConfiguredError, RunNotFoundError
+        from dendrux.runtime._reclaim import reclaim
+
+        if item is not None and item.run_id != run_id:
+            raise ValueError("run_id must equal item.run_id")
+        if isinstance(tenant_id, _OmittedType):
+            _agent_logger.warning(
+                "Recovery tenant missing", extra={"run_id": run_id, "code": "run_not_found"}
+            )
+            raise RunNotFoundError(run_id)
+        tenant_id = entry_checks(self, "resume", tenant_id, default_tenant=UNSCOPED, run_id=run_id)
+        self._require_provider()
+        store = await self._resolve_state_store()
+        if store is None:
+            raise PersistenceNotConfiguredError()
+        return await reclaim(self, store, run_id, tenant_id=tenant_id, item=item, notifier=notifier)
 
     async def resume(
         self,

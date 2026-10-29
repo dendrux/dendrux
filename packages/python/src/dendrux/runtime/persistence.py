@@ -301,6 +301,8 @@ class PersistenceRecorder(BaseRecorder):
         self._seed_input_pending = any(t.role == "user" for t in seed_traces or [])
         self._durable_state = deepcopy(self._loop_state)
         self._started_calls: set[str] = set()
+        self._replay_calls: set[str] = set()
+        self._replayed_calls: set[str] = set()
         self._completed_observations: set[str] = set()
         self._tool_idempotent: dict[str, bool] = {}
         self._result_formatter: Any = None
@@ -1090,6 +1092,23 @@ class PersistenceRecorder(BaseRecorder):
                 "Failed to touch progress for run %s", self._run_id, exc_info=safe_exception_info()
             )
 
+    async def resolve_observation(self, call_id: str, message: Message | None) -> None:
+        """Resolve a stored result at its reserved position without another effect."""
+        pending = next(p for p in self._loop_state["pending"] if p["call_id"] == call_id)
+        trace = (
+            message_trace(message, pending["order_index"], tenant_scope=self._tenant_scope)
+            if message is not None
+            else None
+        )
+        self._loop_state["pending"] = [
+            p for p in self._loop_state["pending"] if p["call_id"] != call_id
+        ]
+        self._loop_state["phase"] = "dispatch" if self._loop_state["pending"] else "model_next"
+        await self._checkpoint(trace)
+        self._completed_observations.add(call_id)
+        if trace is not None:
+            self._remember(trace)
+
     async def on_tool_started(self, run_id: str, tool_call: ToolCall, iteration: int) -> None:
         """Persist an execution intent before an actual server dispatch."""
         if self._format2:
@@ -1112,6 +1131,32 @@ class PersistenceRecorder(BaseRecorder):
                 )
                 raise PersistenceError(code=code)
             if pending.get("target") == "client":
+                return
+            if pending["phase"] == "approved":
+                # One durable decision authorizes one attempt. A second crash
+                # after this boundary must ask again for a non-idempotent effect.
+                pending["phase"] = "dispatchable"
+                pending["decision_id"] = None
+                await self._checkpoint()
+            if tool_call.id in self._replay_calls:
+                event_id = generate_ulid()
+
+                async def replay_event() -> None:
+                    await self._store.save_run_event(
+                        run_id,
+                        event_type="tool.replayed",
+                        iteration_index=iteration,
+                        data={"call_id": tool_call.id},
+                        correlation_id=tool_call.id,
+                        event_id=event_id,
+                    )
+
+                await retry_critical(replay_event, label="tool_replayed", run_id=run_id)
+                logger.warning(
+                    "Replaying interrupted tool", extra={"run_id": run_id, "code": "tool_replayed"}
+                )
+                self._replayed_calls.add(tool_call.id)
+                self._started_calls.add(tool_call.id)
                 return
             identity = generate_ulid()
             idempotent = self._tool_idempotent.get(tool_call.name, False)
@@ -1295,7 +1340,7 @@ class PersistenceRecorder(BaseRecorder):
                     success=tool_result.success,
                     duration_ms=tool_result.duration_ms,
                     error_message=tool_result.error,
-                    replayed=False,
+                    replayed=tool_call.id in self._replayed_calls,
                     observation=observation_trace,
                     event=event,
                     loop_state_patch=patch,
@@ -1441,7 +1486,13 @@ def resolve_pending(loop_state: dict[str, Any], tool_rows: Sequence[Any]) -> lis
             if kind is None:
                 raise ValueError("Unsupported pending-call phase")
         elif read(row, "outcome") == "started":
-            kind = "replay" if read(row, "idempotent", False) else "approval_replay"
+            kind = (
+                "resolve"
+                if phase == "rejected"
+                else "replay"
+                if phase == "approved" or read(row, "idempotent", False)
+                else "approval_replay"
+            )
         elif read(row, "outcome") in ("completed", "failed", "unknown"):
             kind = "observe"
         else:
