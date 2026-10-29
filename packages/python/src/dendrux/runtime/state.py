@@ -4354,7 +4354,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                         if (on_stale == "error" or row.lease_expired_at is None) and age >= cutoff:
                             return None
                         if row.storage_format == 2 and row.loop not in ("react", "single_call"):
-                            if on_stale == "reclaim":
+                            if on_stale != "error":
                                 logger.warning(
                                     "Run has unknown recovery loop",
                                     extra={"code": "loop_unknown", "run_id": run_id},

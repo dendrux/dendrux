@@ -177,6 +177,10 @@ _FAILURE_REASONS = frozenset(
         "stale_running_legacy",
         "pending_limit",
         "lease_lost",
+        "history_too_large",
+        "recovery_call_missing",
+        "recovery_state_missing",
+        "recovery_state_invalid",
     }
 )
 _BUDGET_METRICS = frozenset({TOKENS, COST_USD})
@@ -369,6 +373,7 @@ _SCHEMAS: dict[str, dict[str, Check]] = {
         "truncated": _bool,
     },
     "run.error": {
+        "failure_reason": _enum(_FAILURE_REASONS),
         "status": _enum(_RUN_STATUSES),
         "stop_reason": _enum(_STOP_REASONS),
         "truncated": _bool,

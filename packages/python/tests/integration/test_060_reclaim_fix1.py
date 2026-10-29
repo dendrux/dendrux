@@ -236,6 +236,12 @@ async def test_p2_custom_store_finalises_unrecoverable(store, engine):
     class Custom:
         capabilities = StoreCapabilities(recovery=True)
 
+        async def get_lease_expired(self, **kwargs):
+            return await store.get_lease_expired(**kwargs)
+
+        async def reclaim_run(self, *args, **kwargs):
+            return await store.reclaim_run(*args, **kwargs)
+
         async def mark_lease_expired(self, *, finalise_unrecoverable=False, **kwargs):
             assert finalise_unrecoverable
             return await store.mark_lease_expired(

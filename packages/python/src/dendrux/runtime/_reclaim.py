@@ -233,7 +233,7 @@ async def needs_resolution(store: StateStore, run_id: str, pause: PauseState) ->
         return False
     calls = {tc.id for tc in pause.pending_tool_calls}
     return any(
-        row.tool_call_id in calls
+        row.tool_call_id in calls and row.outcome == "started"
         for row in await store.get_tool_calls(run_id, iteration_index=pause.iteration, limit=1000)
     )
 

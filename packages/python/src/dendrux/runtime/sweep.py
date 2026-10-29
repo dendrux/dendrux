@@ -98,7 +98,7 @@ async def sweep(
     """
     _validate_source(database_url, state_store, database_options)
     _validate_thresholds(stale_running, abandoned_waiting)
-    if stale_running is None and abandoned_waiting is None:
+    if stale_running is None and abandoned_waiting is None and on_stale != "reclaim":
         return SweepResult(stale_running=[])
 
     if on_stale not in (None, "error", "reclaim"):
@@ -132,9 +132,11 @@ async def sweep(
             limits["batch_size"] = batch_size
         if max_runs != 10000:
             limits["max_runs"] = max_runs
-        from dendrux.runtime._capabilities import capabilities
+        from dendrux.runtime._capabilities import capabilities, validate_capabilities
         from dendrux.runtime.state import SQLAlchemyStateStore
 
+        if on_stale == "reclaim":
+            validate_capabilities(store)
         if on_stale == "reclaim" and not capabilities(store).recovery:
             logging.getLogger(__name__).warning(
                 "Recovery capability required", extra={"run_id": None, "code": "store_capability"}

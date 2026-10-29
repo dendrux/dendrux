@@ -281,7 +281,7 @@ async def test_mark_skips_poisoned_loop_and_advances_cursor(store, engine, caplo
     assert row.status == "running" and row.claim_epoch == 0
     assert row.lease_expired_at is None
     assert not await store.get_run_events(ids[0])
-    assert not any(
+    assert any(
         getattr(r, "code", None) == "loop_unknown" and getattr(r, "run_id", None) == ids[0]
         for r in caplog.records
     )
