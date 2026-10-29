@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import exc, text
 
+from dendrux import _codes
 from dendrux.db._index_check import read_pg_indexes
 
 if TYPE_CHECKING:
@@ -83,15 +84,11 @@ def bounded_step(
     except exc.DBAPIError as error:
         if sqlstate(error) != _LOCK_NOT_AVAILABLE:
             raise
-        logger.warning(
-            "Dendrux migration step timed out waiting for a lock",
-            extra={
-                "code": LOCK_TIMEOUT_CODE,
-                "revision": revision,
-                "step": step,
-                "timeout_seconds": LOCK_TIMEOUT_SECONDS,
-            },
-        )
+        fields: dict[str, Any] = {"step": step, "timeout_seconds": LOCK_TIMEOUT_SECONDS}
+        # TODO: include older revisions when the closed registry permits them.
+        if revision in {"e8f9a0b1c2d3", "f9a0b1c2d3e4"}:
+            fields["revision"] = revision
+        _codes.log_code(logger, _codes.MIGRATION_LOCK_TIMEOUT, **fields)
         raise RuntimeError(
             f"Timed out acquiring the Dendrux migration lock after {LOCK_TIMEOUT_SECONDS} "
             "seconds. Retry the migration operation after the blocking transaction finishes."

@@ -42,7 +42,9 @@ async def test_lease_tick_is_call_scoped_and_only_one_write_outstanding():
                 self.active -= 1
 
     store = Store()
-    ctx = context.DelegationContext("run", persisted=True, state_store=store, lease_interval_s=0.02)
+    ctx = context.DelegationContext(
+        "00000000000000000000000199", persisted=True, state_store=store, lease_interval_s=0.02
+    )
     token = context.set_delegation_context(ctx)
 
     async def call():
@@ -72,7 +74,9 @@ async def test_fenced_tick_raises_at_step_exit_without_cancelling_the_caller():
                 raise RunFencedError(run_id, claim_epoch=0)
 
     token = context.set_delegation_context(
-        context.DelegationContext("run", persisted=True, state_store=Store(), lease_interval_s=0.01)
+        context.DelegationContext(
+            "00000000000000000000000199", persisted=True, state_store=Store(), lease_interval_s=0.01
+        )
     )
     finished_step = False
     try:
@@ -102,7 +106,9 @@ async def test_a23_stuck_renewal_has_deadline_and_cancellation_is_prompt():
 
     store = Store()
     token = context.set_delegation_context(
-        context.DelegationContext("run", persisted=True, state_store=store, lease_interval_s=0.02)
+        context.DelegationContext(
+            "00000000000000000000000199", persisted=True, state_store=store, lease_interval_s=0.02
+        )
     )
     try:
         with pytest.raises(PersistenceError) as caught:
@@ -135,7 +141,9 @@ async def test_a23_external_cancellation_cancels_outstanding_renewal():
 
     store = Store()
     token = context.set_delegation_context(
-        context.DelegationContext("run", persisted=True, state_store=store, lease_interval_s=0.02)
+        context.DelegationContext(
+            "00000000000000000000000199", persisted=True, state_store=store, lease_interval_s=0.02
+        )
     )
 
     async def call():
@@ -164,7 +172,9 @@ async def test_heartbeat_fence_is_retrieved_and_raised_on_next_step():
             raise RunFencedError(run_id, claim_epoch=0)
 
     loop = asyncio.get_running_loop()
-    ctx = context.DelegationContext("run", persisted=True, state_store=Store(), loop=loop)
+    ctx = context.DelegationContext(
+        "00000000000000000000000199", persisted=True, state_store=Store(), loop=loop
+    )
     token = context.set_delegation_context(ctx)
     errors = []
     previous = loop.get_exception_handler()
@@ -191,7 +201,9 @@ async def test_parallel_scopes_share_one_renewal_clock():
             self.count += 1
 
     store = Store()
-    ctx = context.DelegationContext("run", persisted=True, state_store=store, lease_interval_s=0.05)
+    ctx = context.DelegationContext(
+        "00000000000000000000000199", persisted=True, state_store=store, lease_interval_s=0.05
+    )
     token = context.set_delegation_context(ctx)
 
     async def call(delay):

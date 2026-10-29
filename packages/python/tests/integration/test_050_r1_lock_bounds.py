@@ -42,7 +42,13 @@ def _assert_lock_timeout_logged(caplog: Any, revision: str, step: str) -> None:
     assert len(records) == 1, [r.getMessage() for r in records]
     record = records[0]
     assert record.levelno == logging.WARNING
-    assert (record.revision, record.step, record.timeout_seconds) == (revision, step, 5)
+    # The closed registry currently omits the older revision identifier.
+    expected_revision = None if revision == R1 else revision
+    assert (getattr(record, "revision", None), record.step, record.timeout_seconds) == (
+        expected_revision,
+        step,
+        5,
+    )
     text_seen = (
         record.getMessage()
         + " "

@@ -34,6 +34,7 @@ from typing import TYPE_CHECKING, Any, Generic, ParamSpec, TypeVar
 
 import httpx
 
+from dendrux import _codes
 from dendrux.errors import (
     ContentFilteredError,
     ContextLengthExceededError,
@@ -727,18 +728,21 @@ def _deadline_error(
 
 def log_provider_error(error: ProviderError, run_id: str | None) -> None:
     """One structured log line per typed provider error (codes only, no vendor text)."""
-    logger.warning(
-        "provider.error run_id=%s provider=%s model=%s category=%s status=%s code=%s "
-        "timeout_reason=%s retryable=%s",
-        run_id,
-        error.provider,
-        error.model,
-        error.category,
-        error.status_code,
-        error.safe_provider_code,
-        error.timeout_reason,
-        error.retryable,
-        extra={"run_id": run_id, "code": error.safe_provider_code or error.category},
+    fields: dict[str, Any] = {
+        "category": error.category,
+        "retryable": error.retryable,
+    }
+    if error.provider is not None:
+        fields["provider"] = error.provider
+    if error.status_code is not None:
+        fields["status"] = error.status_code
+    if error.timeout_reason is not None:
+        fields["timeout_reason"] = error.timeout_reason
+    _codes.log_code(
+        logger,
+        _codes.REGISTRY[error.safe_provider_code or error.category],
+        run_id=run_id,
+        **fields,
     )
 
 

@@ -32,6 +32,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, overload
 
+from dendrux import _codes
 from dendrux._sentinel import _OMITTED, _OmittedType, _UnsetType
 from dendrux.runtime._entry_checks import entry_checks, require_boolean
 from dendrux.runtime.state import UNSCOPED, ReclaimableRun, TenantScope, require_store_method
@@ -88,9 +89,7 @@ def _check_result_read_arguments(run_id: Any, tenant_id: Any) -> None:
         if tenant_id is not None:
             _validate_identifier(tenant_id, "tenant_id")
     except ValueError:
-        _agent_logger.warning(
-            "Invalid result read argument", extra={"code": "read_argument_invalid"}
-        )
+        _codes.log_code(_agent_logger, _codes.READ_ARGUMENT_INVALID)
         raise ValueError(
             "Invalid run_id." if not _valid_read_id(run_id) else "Invalid tenant_id."
         ) from None
@@ -494,9 +493,7 @@ class Agent:
             )
 
         if not isinstance(lease_interval, timedelta) or lease_interval < timedelta(seconds=5):
-            logging.getLogger(__name__).warning(
-                "Lease interval below floor", extra={"run_id": None, "code": "lease_interval"}
-            )
+            _codes.log_code(logging.getLogger(__name__), _codes.LEASE_INTERVAL, run_id=None)
             raise ValueError("lease_interval must be a timedelta of at least 5 seconds")
         self.lease_interval = lease_interval
 
@@ -1560,9 +1557,7 @@ class Agent:
         if item is not None and item.run_id != run_id:
             raise ValueError("run_id must equal item.run_id")
         if isinstance(tenant_id, _OmittedType):
-            _agent_logger.warning(
-                "Recovery tenant missing", extra={"run_id": run_id, "code": "tenant_scope_required"}
-            )
+            _codes.log_code(_agent_logger, _codes.TENANT_SCOPE_REQUIRED, run_id=run_id)
             raise TenantScopeRequiredError("reclaim")
         tenant_id = entry_checks(self, "resume", tenant_id, default_tenant=UNSCOPED, run_id=run_id)
         self._require_provider()
@@ -2202,9 +2197,14 @@ class Agent:
           configured DB. Raises ``PersistenceNotConfiguredError``.
 
         ``cascade=True`` also cancels every non-terminal descendant run
-        (delegated child runs), deepest first and ``run_id`` last, over a
-        point-in-time snapshot of the subtree: a child created after the
-        snapshot is not included. Per-run outcomes are listed in
+        (delegated child runs), deepest first and ``run_id`` last. Each frontier
+        is durably marked before its children are scanned in pages of 500. A
+        child already being created commits before the mark and is included;
+        later child admission is refused. Traversal is bounded by
+        ``Budget.max_subtree_nodes`` (default 10,000); reaching the bound with
+        further descendants sets ``meta["cascade_truncated"]`` and logs
+        ``cascade_truncated``. Legacy custom stores without frontier methods
+        retain snapshot semantics. Per-run outcomes are listed in
         ``meta["cascade"]`` as ``{"run_id", "outcome"}`` with outcome
         ``cancelled`` (finalized now), ``cancel_requested`` (running;
         stops at its next checkpoint) or ``terminal``.
@@ -2250,74 +2250,37 @@ class Agent:
         outcomes: list[dict[str, str]] = []
         cascade_count = 0
         to_signal: list[str] = []
-        root_outcome = None
-        root_signalled = False
-        if cascade and record.status not in _TERMINAL_STATUS_VALUES:
-            # A child can share its task with the root. Persist the root's
-            # request before the first page can interrupt that shared task.
-            root_outcome = await self._cancel_one(store, run_id, signal=False)
+        traversal_truncated = False
         if cascade:
-            page_reader = getattr(store, "get_descendant_page", None)
-            if page_reader is not None:
-                after = None
-                while True:
-                    page = await page_reader(run_id, after=after, tenant_id=tenant_id)
-                    for rid in page:
-                        outcome = await self._cancel_one(store, rid, signal=False)
-                        cascade_count += 1
-                        if len(outcomes) < 999:
-                            outcomes.append({"run_id": rid, "outcome": outcome})
-                        if outcome != "terminal":
-                            to_signal.append(rid)
-                    # Register both root and child interrupts before the shared
-                    # task reaches its next checkpoint.
-                    if (
-                        root_outcome is not None
-                        and root_outcome != "terminal"
-                        and not root_signalled
-                    ):
-                        self._task_manager.cancel(run_id)
-                        root_signalled = True
-                    for rid in to_signal:
-                        self._task_manager.cancel(rid)
-                    to_signal.clear()
-                    if len(page) < 500:
-                        break
-                    after = page[-1]
-            else:
-                # Compatibility with stores predating paged descendant reads.
-                subtree = await require_store_method(store, "get_subtree")(
-                    run_id, tenant_id=tenant_id
-                )
-                if subtree is not None:
-                    for rid in _cascade_order(subtree)[:-1]:
-                        outcome = await self._cancel_one(store, rid, signal=False)
-                        cascade_count += 1
-                        if len(outcomes) < 999:
-                            outcomes.append({"run_id": rid, "outcome": outcome})
-                        if outcome != "terminal":
-                            to_signal.append(rid)
+            levels, traversal_truncated = await self._mark_cancel_subtree(
+                store, run_id, tenant_id=record.tenant_id
+            )
+            for level in reversed(levels):
+                for rid in level:
+                    if rid == run_id:
+                        continue
+                    outcome = await self._cancel_one(store, rid, signal=False)
+                    cascade_count += 1
+                    if len(outcomes) < 999:
+                        outcomes.append({"run_id": rid, "outcome": outcome})
+                    if outcome != "terminal":
+                        to_signal.append(rid)
 
         if record.status in _TERMINAL_STATUS_VALUES:
-            for rid in to_signal:
-                self._task_manager.cancel(rid)
+            if cascade:
+                record = await store.get_run(run_id)
+                if record is None:  # pragma: no cover — concurrent deletion
+                    raise RunNotFoundError(run_id)
             result = _record_to_run_result(record)
             outcomes.append({"run_id": run_id, "outcome": "terminal"})
         else:
-            outcome = root_outcome or await self._cancel_one(store, run_id, signal=False)
+            outcome = await self._cancel_one(store, run_id, signal=False)
             outcomes.append({"run_id": run_id, "outcome": outcome})
             record = await store.get_run(run_id)
             if record is None:  # pragma: no cover — we just preflight-checked
                 raise RunNotFoundError(run_id)
-            # In-process signals last, after the durable request is recorded
-            # and the returned snapshot is read: a locally owned run or task is
-            # preempted from here on, and the returned RunResult
-            # deterministically reflects "requested" (non-terminal status +
-            # meta.cancel_requested) rather than racing the loop's own finalize.
-            for rid in to_signal:
-                self._task_manager.cancel(rid)
-            if not root_signalled:
-                self._task_manager.cancel(run_id)
+            if outcome != "terminal":
+                to_signal.append(run_id)
             result = _record_to_run_result(record)
         from dendrux.runtime.runner import _recovery_info
 
@@ -2329,8 +2292,76 @@ class Agent:
         if cascade:
             result.meta["cascade"] = outcomes
             result.meta["cascade_count"] = cascade_count + 1
-            result.meta["cascade_truncated"] = cascade_count + 1 > len(outcomes)
+            result.meta["cascade_truncated"] = traversal_truncated or cascade_count + 1 > len(
+                outcomes
+            )
+        # Signal only after durable requests and the returned snapshot are complete.
+        for rid in to_signal:
+            self._task_manager.cancel(rid)
         return result
+
+    async def _mark_cancel_subtree(
+        self, store: StateStore, run_id: str, *, tenant_id: str | None
+    ) -> tuple[list[list[str]], bool]:
+        from dendrux.types import Budget
+
+        limit = self._budget.max_subtree_nodes if self._budget else Budget.max_subtree_nodes
+        mark = getattr(store, "mark_cancel_requested", None)
+        children = getattr(store, "get_children_page", None)
+        if not callable(mark) or not callable(children):
+            # Legacy custom stores retain their snapshot API and admission semantics.
+            subtree = await require_store_method(store, "get_subtree")(run_id, tenant_id=tenant_id)
+            levels: list[list[str]] = [[run_id]]
+            nodes = (
+                sorted(
+                    (node for node in subtree.nodes if node.run.id != run_id),
+                    key=lambda node: node.depth,
+                )
+                if subtree is not None
+                else []
+            )
+            by_depth = {0: [run_id]}
+            for node in nodes[: limit - 1]:
+                by_depth.setdefault(node.depth, []).append(node.run.id)
+            levels = [by_depth[depth] for depth in sorted(by_depth)]
+            truncated = len(nodes) + 1 > limit
+        else:
+            levels = [[run_id]]
+            visited = {run_id}
+            frontier = levels[0]
+            truncated = False
+            while frontier:
+                # Wait for creators holding parent FOR SHARE before scanning committed children.
+                await mark(frontier, tenant_id=tenant_id)
+                if truncated:
+                    break
+                following: list[str] = []
+                after = None
+                while True:
+                    page = await children(frontier, after=after, limit=500, tenant_id=tenant_id)
+                    for child in page:
+                        if child in visited:
+                            continue
+                        if len(visited) >= limit:
+                            truncated = True
+                            break
+                        visited.add(child)
+                        following.append(child)
+                    if truncated or len(page) < 500:
+                        break
+                    after = page[-1]
+                if following:
+                    levels.append(following)
+                frontier = following
+        if truncated:
+            _codes.log_code(
+                _agent_logger,
+                _codes.CASCADE_TRUNCATED,
+                run_id=run_id,
+                limit=limit,
+                count=sum(len(level) for level in levels),
+            )
+        return levels, truncated
 
     async def _cancel_one(self, store: StateStore, run_id: str, *, signal: bool = True) -> str:
         """Cancel one run: set the flag, CAS-finalize it if paused, signal in-process."""
@@ -2633,11 +2664,7 @@ class Agent:
         if _accepts_kwarg(add_note, "max_notes"):  # custom stores written before 0.5.0
             note_kwargs["max_notes"] = self._limits.max_notes_per_run
         else:
-            _agent_logger.warning(
-                "Custom store does not enforce the note cap: run_id=%s code=note_cap_unenforced",
-                run_id,
-                extra={"run_id": run_id, "code": "note_cap_unenforced"},
-            )
+            _codes.log_code(_agent_logger, _codes.NOTE_CAP_UNENFORCED, run_id=run_id)
         note_id = generate_ulid()
         if await add_note(
             run_id,

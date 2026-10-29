@@ -26,6 +26,7 @@ from copy import deepcopy
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, NamedTuple, get_args, overload
 
+from dendrux import _codes
 from dendrux._sentinel import _OMITTED, _OmittedType, _UnsetType
 from dendrux.chat import (
     history_has_images,
@@ -205,11 +206,15 @@ async def _start_trace(
     from dendrux.runtime._capabilities import capabilities
 
     saved = validate_trace_link(saved)
-    incoming = saved or (
-        validate_trace_link(parent.tool_span_link or parent.trace_link)
-        if parent is not None
-        else None
-    )
+    incoming = saved
+    if incoming is None and parent is not None:
+        try:
+            otel_child = getattr(notifier, "_dendrux_otel", False) is True
+        except Exception:
+            otel_child = False
+        incoming = (
+            validate_trace_link(parent.tool_span_link) if otel_child else None
+        ) or validate_trace_link(parent.trace_link)
     await notify_run_started(
         notifier, run_id, agent_name=agent_name, agent_model=agent_model, trace_link=incoming
     )
@@ -2494,11 +2499,7 @@ async def _persist_task_cancellation(
         # No row: cancelled before create_run committed, or while resolving an
         # idempotent hit under the provisional id. Nothing to finalize.
     except Exception:
-        logger.error(
-            "Cancellation persistence failed: run_id=%s code=cancel_persist_failed",
-            run_id,
-            exc_info=safe_exception_info(),
-        )
+        _codes.log_code(logger, _codes.CANCEL_PERSIST_FAILED, run_id=run_id)
     return result
 
 
@@ -3929,17 +3930,11 @@ async def _load_pause_state(
         return pause
     record = await store.get_run(run_id)
     if record is None or record.storage_format != 2:
-        logger.warning(
-            "Format-2 pause on a legacy run",
-            extra={"run_id": run_id, "code": "pause_format_unsupported"},
-        )
+        _codes.log_code(logger, _codes.PAUSE_FORMAT_UNSUPPORTED, run_id=run_id)
         raise PersistenceError(code="pause_format_unsupported")
     checkpoint = await store.get_loop_state(run_id)
     if not checkpoint:
-        logger.warning(
-            "Missing authoritative pause checkpoint",
-            extra={"run_id": run_id, "code": "pause_format_unsupported"},
-        )
+        _codes.log_code(logger, _codes.PAUSE_FORMAT_UNSUPPORTED, run_id=run_id)
         raise PersistenceError(code="pause_format_unsupported")
     try:
         messages = await rebuild_history(
@@ -4874,11 +4869,7 @@ async def _finish_fenced_lifecycle(
     try:
         await record_run_finished(recorder, run_id, result)
     except Exception:
-        logger.warning(
-            "Fenced lifecycle recorder failed: run_id=%s code=fenced_finish_failed",
-            run_id,
-            extra={"run_id": run_id, "code": "fenced_finish_failed"},
-        )
+        _codes.log_code(logger, _codes.FENCED_FINISH_FAILED, run_id=run_id)
     await notify_run_finished(notifier, run_id, result)
 
 

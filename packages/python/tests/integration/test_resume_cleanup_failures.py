@@ -61,7 +61,8 @@ async def test_cancel_preserves_exception_despite_store_failure(store, path, fai
     assert (await store.get_run(run_id)).status == (
         "running" if failure == "finalize_run" else "cancelled"
     )
-    assert str(secondary) in caplog.text
+    assert any(getattr(r, "code", None) == "cancel_persist_failed" for r in caplog.records)
+    assert str(secondary) not in caplog.text
 
 
 @pytest.mark.parametrize("failure", [None, "finalize_run", "save_run_event", "on_run_failed"])

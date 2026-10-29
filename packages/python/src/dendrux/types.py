@@ -23,6 +23,8 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Literal, TypeAlias
 
+from dendrux import _codes
+
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Coroutine
 
@@ -1106,9 +1108,7 @@ class Limits:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 if name in {"max_pending_calls", "max_rebuild_bytes", "max_rebuild_rows"}:
-                    logger.warning(
-                        "Invalid recovery limit", extra={"run_id": None, "code": "invalid_limit"}
-                    )
+                    _codes.log_code(logger, _codes.INVALID_LIMIT, run_id=None)
                 raise ValueError(f"Limits {name} must be a positive int, got {value!r}.")
 
 
@@ -1116,9 +1116,7 @@ def _validate_provider_kwargs(value: dict[str, Any], *, run_id: str | None = Non
     try:
         _validate_persistable(value, "provider_kwargs")
     except InputValidationError:
-        logger.warning(
-            "Invalid provider options", extra={"run_id": run_id, "code": "provider_kwargs_invalid"}
-        )
+        _codes.log_code(logger, _codes.PROVIDER_KWARGS_INVALID, run_id=run_id)
         raise
     size = 0
     try:
@@ -1127,15 +1125,10 @@ def _validate_provider_kwargs(value: dict[str, Any], *, run_id: str | None = Non
             if size > 2048:
                 break
     except (TypeError, ValueError):
-        logger.warning(
-            "Invalid provider options", extra={"run_id": run_id, "code": "provider_kwargs_invalid"}
-        )
+        _codes.log_code(logger, _codes.PROVIDER_KWARGS_INVALID, run_id=run_id)
         raise ValueError("provider_kwargs must be JSON serializable") from None
     if size > 2048:
-        logger.warning(
-            "Provider options exceed checkpoint bound",
-            extra={"run_id": run_id, "code": "provider_kwargs_too_large"},
-        )
+        _codes.log_code(logger, _codes.PROVIDER_KWARGS_TOO_LARGE, run_id=run_id)
         raise ValueError("provider_kwargs must encode to at most 2048 UTF-8 bytes")
 
 
@@ -1634,9 +1627,10 @@ class PauseState:
         if data.get("schema_version", 1) not in (None, 1, 2):
             from dendrux.errors import PersistenceError
 
-            logging.getLogger(__name__).warning(
-                "Unsupported pause format",
-                extra={"run_id": data.get("run_id"), "code": "pause_format_unsupported"},
+            _codes.log_code(
+                logging.getLogger(__name__),
+                _codes.PAUSE_FORMAT_UNSUPPORTED,
+                run_id=data.get("run_id"),
             )
             raise PersistenceError(code="pause_format_unsupported")
         return cls(

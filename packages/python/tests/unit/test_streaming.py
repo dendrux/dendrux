@@ -703,7 +703,7 @@ class TestResumeStream:
 
     async def test_first_event_is_run_resumed(self) -> None:
         """resume_stream() emits RUN_RESUMED as its first event."""
-        run_id = "test-resume-001"
+        run_id = "00000000000000000000000001"
         tc = ToolCall(
             name="read_range",
             params={"sheet": "S1"},
@@ -746,7 +746,7 @@ class TestResumeStream:
 
     async def test_resume_stream_completes_with_text(self) -> None:
         """Full round-trip: resume → TEXT_DELTA tokens → RUN_COMPLETED."""
-        run_id = "test-resume-002"
+        run_id = "00000000000000000000000002"
         tc = ToolCall(
             name="read_range",
             params={"sheet": "S1"},
@@ -795,7 +795,7 @@ class TestResumeStream:
 
     async def test_resume_stream_error_yields_run_error(self) -> None:
         """Error during resumed loop → RUN_ERROR event, no exception."""
-        run_id = "test-resume-003"
+        run_id = "00000000000000000000000003"
         tc = ToolCall(
             name="read_range",
             params={"sheet": "S1"},
@@ -886,7 +886,7 @@ class TestResumeStream:
 
     async def test_agent_resume_stream_returns_run_stream(self) -> None:
         """agent.resume_stream() returns RunStream with run_id."""
-        run_id = "test-resume-004"
+        run_id = "00000000000000000000000004"
         tc = ToolCall(
             name="read_range",
             params={"sheet": "S1"},

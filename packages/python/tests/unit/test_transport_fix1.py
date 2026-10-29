@@ -280,10 +280,10 @@ async def test_p2_limit_has_one_structured_run_scoped_log(
     install(p, lambda _: httpx.Response(200, stream=Body([document(family, 2048)])))
     try:
         with caplog.at_level(logging.WARNING), pytest.raises(ProviderResponseError):
-            await p.complete(MESSAGES, run_id="run-limit")
+            await p.complete(MESSAGES, run_id="01ARZ3NDEKTSV4RRFFQ69G5FAV")
         records = [r for r in caplog.records if getattr(r, "code", None) == "response_size_limit"]
         assert len(records) == 1
-        assert records[0].run_id == "run-limit"
+        assert records[0].run_id == "01ARZ3NDEKTSV4RRFFQ69G5FAV"
     finally:
         await p.close()
 

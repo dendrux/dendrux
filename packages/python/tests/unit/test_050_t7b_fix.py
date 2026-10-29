@@ -39,27 +39,29 @@ async def test_provider_error_is_safe_in_every_span_path(path):
     provider.add_span_processor(SimpleSpanProcessor(exporter))
     notifier = OpenTelemetryNotifier(tracer=provider.get_tracer("test"))
     error = provider_error()
-    await notifier.on_run_started("r")
+    await notifier.on_run_started("00000000000000000000000102")
     if path in {"llm", "orphan_llm"}:
-        await notifier.on_llm_call_started("r", 1)
+        await notifier.on_llm_call_started("00000000000000000000000102", 1)
     if path == "orphan_tool":
-        await notifier.on_tool_started("r", ToolCall(name="work", params={}), 1)
+        await notifier.on_tool_started(
+            "00000000000000000000000102", ToolCall(name="work", params={}), 1
+        )
     if path == "llm":
-        await notifier.on_llm_call_failed("r", 1, error)
+        await notifier.on_llm_call_failed("00000000000000000000000102", 1, error)
     elif path == "result":
         from dendrux.types import ErrorInfo
 
         await notifier.on_run_finished(
-            "r",
+            "00000000000000000000000102",
             RunResult(
-                run_id="r",
+                run_id="00000000000000000000000102",
                 status=RunStatus.ERROR,
                 error=error.safe_message,
                 error_info=ErrorInfo.from_error(error),
             ),
         )
     else:
-        await notifier.on_run_failed("r", error)
+        await notifier.on_run_failed("00000000000000000000000102", error)
     spans = exporter.get_finished_spans()
     for span in spans:
         serialized = json.dumps(
@@ -87,9 +89,9 @@ async def test_provider_error_console_is_safe(monkeypatch, path):
     error = provider_error()
     notifier = ConsoleNotifier()
     if path == "run":
-        await notifier.on_run_failed("r", error)
+        await notifier.on_run_failed("00000000000000000000000102", error)
     else:
-        await notifier.on_llm_call_failed("r", 1, error)
+        await notifier.on_llm_call_failed("00000000000000000000000102", 1, error)
     assert PRIVATE not in output.getvalue(), "console failures must use ErrorInfo.safe_message"
     assert error.safe_message in output.getvalue()
 
@@ -131,14 +133,15 @@ async def test_budget_tracker_unknown_numeric_cost_stops_as_unpriced():
     assert breaches[0].used == 0.0
 
 
-async def test_non_provider_task_failure_keeps_diagnostic_stack(caplog):
+async def test_non_provider_task_failure_logs_code_without_exception_text(caplog):
     async def fail():
         raise ValueError("ordinary internal bug")
 
     with pytest.raises(ValueError):
-        await RunTaskManager().spawn("ordinary", fail())
+        await RunTaskManager().spawn("00000000000000000000000115", fail())
     record = next(r for r in caplog.records if r.name == "dendrux.runtime.tasks")
-    assert record.exc_info is not None, "ordinary bugs must retain their diagnostic traceback"
+    assert record.code == "run_failed" and record.exc_info is None
+    assert "ordinary internal bug" not in caplog.text
 
 
 def test_migration_keeps_existing_dendrux_loggers_enabled(tmp_path):

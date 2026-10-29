@@ -21,6 +21,7 @@ from dataclasses import asdict, dataclass, replace
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, NoReturn, cast
 
+from dendrux import _codes
 from dendrux.errors import (
     InvalidToolResultError,
     PauseStatusMismatchError,
@@ -118,11 +119,7 @@ async def raise_for_non_paused_status(store: StateStore, run_id: str) -> NoRetur
 def _invalid_tool_result(run_id: str, reason: str) -> InvalidToolResultError:
     import logging
 
-    logging.getLogger(__name__).warning(
-        "Invalid client tool result: run_id=%s code=invalid_tool_result",
-        run_id,
-        extra={"run_id": run_id, "code": "invalid_tool_result"},
-    )
+    _codes.log_code(logging.getLogger(__name__), _codes.INVALID_TOOL_RESULT, run_id=run_id)
     return InvalidToolResultError(run_id, reason)
 
 
@@ -201,11 +198,7 @@ def pause_validator(
         if expected_pause_id is not None and expected_pause_id != current_id:
             import logging
 
-            logging.getLogger(__name__).warning(
-                "Pause generation mismatch: run_id=%s code=pause_id_mismatch",
-                run_id,
-                extra={"run_id": run_id, "code": "pause_id_mismatch"},
-            )
+            _codes.log_code(logging.getLogger(__name__), _codes.PAUSE_ID_MISMATCH, run_id=run_id)
             raise PauseStatusMismatchError(
                 run_id,
                 RunStatus(current.get("status", RunStatus.PAUSED.value)),
@@ -292,12 +285,7 @@ async def claim_paused_validated(
         return await method(run_id, expected_status=expected_status, validate=validate)
     if not support.logged:
         support.logged = True
-        logging.getLogger(__name__).warning(
-            "Custom store lacks atomic claim validation; using pre/post checks: "
-            "run_id=%s code=legacy_claim_validation",
-            run_id,
-            extra={"run_id": run_id, "code": "legacy_claim_validation"},
-        )
+        _codes.log_code(logging.getLogger(__name__), _codes.LEGACY_CLAIM_VALIDATION, run_id=run_id)
     current = await store.get_pause_state(run_id)
     if current is None:
         await raise_for_non_paused_status(store, run_id)
@@ -1083,10 +1071,8 @@ def submission_validator(
             if change is not None:
                 import logging
 
-                logging.getLogger(__name__).warning(
-                    "Governance mismatch: run_id=%s code=governance_mismatch",
-                    run_id,
-                    extra={"run_id": run_id, "code": "governance_mismatch"},
+                _codes.log_code(
+                    logging.getLogger(__name__), _codes.GOVERNANCE_MISMATCH, run_id=run_id
                 )
                 raise GovernanceMismatchError(run_id, **change)
         if extra is not None:
@@ -1161,20 +1147,12 @@ async def report_governance_change(
 
     log = logging.getLogger(__name__)
     if GOVERNANCE_KEY not in raw:
-        log.info(
-            "Skipping pre-0.5 governance check: run_id=%s code=governance_legacy",
-            run_id,
-            extra={"run_id": run_id, "code": "governance_legacy"},
-        )
+        _codes.log_code(log, _codes.GOVERNANCE_LEGACY, run_id=run_id)
         return
     change = _governance_change(agent, raw)
     if change is None:
         return
-    log.warning(
-        "Governance changed: run_id=%s code=governance_changed",
-        run_id,
-        extra={"run_id": run_id, "code": "governance_changed"},
-    )
+    _codes.log_code(log, _codes.GOVERNANCE_CHANGED, run_id=run_id)
     if not agent._on_governance_change_chosen:
         _warn_at_location(
             "Changed governance warns in 0.5; the default becomes 'raise' in 0.6. "
@@ -1251,11 +1229,7 @@ async def prepare_client_results(
         if result.meta.get("code") == "size_limit":
             import logging
 
-            logging.getLogger(__name__).warning(
-                "Client tool result capped: run_id=%s code=size_limit",
-                run_id,
-                extra={"run_id": run_id, "code": "size_limit"},
-            )
+            _codes.log_code(logging.getLogger(__name__), _codes.SIZE_LIMIT, run_id=run_id)
         if result.success and agent.tool_result_transform is not None:
             try:
                 normalized = _client_json_payload(result.payload)

@@ -331,7 +331,6 @@ def test_vendor_message_is_absent_from_exception_str_and_repr():
     assert SENTINEL not in str(error) + repr(error)
 
 
-@pytest.mark.xfail(strict=True, reason="Unowned MCP diagnostic keeps non-credential transport text")
 def test_vendor_message_is_absent_from_mcp_transport_detail_and_debug_log(caplog):
     import logging
 

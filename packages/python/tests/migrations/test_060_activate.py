@@ -99,7 +99,8 @@ def legacy(tmp_path, monkeypatch):
             INSERT INTO agent_runs (id, agent_name, status, iteration_count, delegation_level,
                 total_input_tokens, total_output_tokens, total_cache_read_tokens,
                 total_cache_creation_tokens, created_at, updated_at)
-            VALUES ('run-a', 'a', 'success', 0, 0, 0, 0, 0, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            VALUES ('00000000000000000000999999', 'a', 'success', 0, 0, 0, 0, 0, 0,
+                CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
         """)
         )
     url = f"sqlite+aiosqlite:///{path}"
@@ -108,7 +109,7 @@ def legacy(tmp_path, monkeypatch):
     engine.dispose()
 
 
-def add_trace(conn, id, content="same", digest=None, order=0, run_id="run-a"):
+def add_trace(conn, id, content="same", digest=None, order=0, run_id="00000000000000000000999999"):
     conn.execute(
         text("""
         INSERT INTO react_traces
@@ -120,7 +121,7 @@ def add_trace(conn, id, content="same", digest=None, order=0, run_id="run-a"):
     )
 
 
-def legacy_trace(conn, id, *, run_id="run-00000", order=0, content="same"):
+def legacy_trace(conn, id, *, run_id="00000000000000000000000000", order=0, content="same"):
     conn.execute(
         text("""
         INSERT INTO react_traces (id, agent_run_id, role, content, order_index,
@@ -196,7 +197,7 @@ def test_b1_conflicts_drop_nothing_then_dedupe_and_activate(legacy):
         add_trace(conn, "d", content="different-confidential", order=1)
     result = runner.invoke(app, ["db", "activate"])
     assert result.exit_code == 3, result.output
-    assert "react_traces" in result.output and "run-a" in result.output
+    assert "react_traces" in result.output and "00000000000000000000999999" in result.output
     assert "confidential" not in result.output
     with engine.begin() as conn:
         assert conn.execute(text("SELECT count(*) FROM react_traces")).scalar_one() == 4
@@ -328,7 +329,7 @@ def test_b1_digest_and_legacy_content_equality(legacy, table, digests):
     import datetime as dt
 
     engine = migrate_legacy(legacy)
-    base = {"agent_run_id": "run-a", "created_at": dt.datetime.now(dt.UTC)}
+    base = {"agent_run_id": "00000000000000000000999999", "created_at": dt.datetime.now(dt.UTC)}
     if table == "react_traces":
         base.update(role="assistant", content="same", order_index=0)
     elif table == "tool_calls":
@@ -360,7 +361,7 @@ def test_b1_bounded_diagnostic(legacy):
     engine = migrate_legacy(legacy)
     with engine.begin() as conn:
         for i in range(25):
-            run_id = f"run-{i:02}"
+            run_id = f"{i:026d}"
             conn.execute(
                 text("""
                 INSERT INTO agent_runs (id, agent_name, status, iteration_count, delegation_level,
@@ -369,7 +370,7 @@ def test_b1_bounded_diagnostic(legacy):
                 SELECT :id, agent_name, status, iteration_count, delegation_level,
                     total_input_tokens, total_output_tokens, total_cache_read_tokens,
                     total_cache_creation_tokens, created_at, updated_at
-                FROM agent_runs WHERE id='run-a'
+                FROM agent_runs WHERE id='00000000000000000000999999'
             """),
                 {"id": run_id},
             )
@@ -378,7 +379,10 @@ def test_b1_bounded_diagnostic(legacy):
     result = runner.invoke(app, ["db", "activate", "--batch-size", "3"])
     assert result.exit_code == 3, result.output
     assert "count=25" in result.output and "secret" not in result.output
-    assert "run-19" in result.output and "run-20" not in result.output
+    assert (
+        "00000000000000000000000019" in result.output
+        and "00000000000000000000000020" not in result.output
+    )
 
 
 def test_activation_refuses_incomplete_schema(legacy):
@@ -445,12 +449,12 @@ async def _seed_rehearsal(engine):
     """)
     async with engine.begin() as conn:
         for start in range(0, 5000, 500):
-            await conn.execute(run_sql, [{"id": f"run-{i:05}"} for i in range(start, start + 500)])
+            await conn.execute(run_sql, [{"id": f"{i:026d}"} for i in range(start, start + 500)])
         for start in range(0, 200000, 5000):
             await conn.execute(
                 event_sql,
                 [
-                    {"id": f"event-{i:06}", "run": f"run-{i // 40:05}", "seq": i % 40}
+                    {"id": f"event-{i:06}", "run": f"{i // 40:026d}", "seq": i % 40}
                     for i in range(start, start + 5000)
                 ],
             )
@@ -574,7 +578,9 @@ async def test_b2_matrix_resume_and_exclusive_batches(rollout_database, monkeypa
     async with engine.begin() as conn:
         for i in range(8):
             await conn.run_sync(
-                lambda c, i=i: add_trace(c, f"t{i}", order=i // 2, run_id="run-00000")
+                lambda c, i=i: add_trace(
+                    c, f"t{i}", order=i // 2, run_id="00000000000000000000000000"
+                )
             )
     original = _activate._checkpoint
     cursors = []
@@ -629,7 +635,7 @@ async def _seed_rehearsal_runs_only(engine):
             INSERT INTO agent_runs (id, agent_name, status, iteration_count, delegation_level,
                 total_input_tokens, total_output_tokens, total_cache_read_tokens,
                 total_cache_creation_tokens, created_at, updated_at)
-            VALUES ('run-00000', 'rehearsal', 'success', 0, 0, 0, 0, 0, 0,
+            VALUES ('00000000000000000000000000', 'rehearsal', 'success', 0, 0, 0, 0, 0, 0,
                 CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
         """)
         )
@@ -654,7 +660,7 @@ async def test_b1_typed_json_content_conflicts(
     table = Base.metadata.tables[table_name]
     async with engine.begin() as conn:
         for id, value in [("a", first), ("b", second)]:
-            row = {"id": id, "agent_run_id": "run-00000", "content_digest": digest}
+            row = {"id": id, "agent_run_id": "00000000000000000000000000", "content_digest": digest}
             payload = {"flag": value}
             if table_name == "react_traces":
                 row.update(role="assistant", content="same", order_index=0, meta=payload)
@@ -728,7 +734,7 @@ def test_b1_legacy_tool_error_content_is_not_discarded(legacy):
                 Base.metadata.tables["tool_calls"].insert(),
                 {
                     "id": id,
-                    "agent_run_id": "run-a",
+                    "agent_run_id": "00000000000000000000999999",
                     "tool_call_id": "call",
                     "tool_name": "t",
                     "target": "server",
@@ -759,7 +765,7 @@ async def test_activation_query_plans(rollout_database, record_property):
             for start in range(0, 5000, 500):
                 rows = []
                 for i in range(start, start + 500):
-                    row = {"id": f"row-{i:05}", "agent_run_id": f"run-{i:05}"}
+                    row = {"id": f"row-{i:05}", "agent_run_id": f"{i:026d}"}
                     if table_name == "react_traces":
                         row.update(role="assistant", content="same", order_index=0)
                     else:
@@ -827,8 +833,8 @@ async def test_b2_pg_repairs_interrupted_invalid_index(rollout_database):
     await _seed_rehearsal_runs_only(engine)
     await _migrate(engine)
     async with engine.begin() as conn:
-        await conn.run_sync(lambda c: add_trace(c, "a", run_id="run-00000"))
-        await conn.run_sync(lambda c: add_trace(c, "b", run_id="run-00000"))
+        await conn.run_sync(lambda c: add_trace(c, "a", run_id="00000000000000000000000000"))
+        await conn.run_sync(lambda c: add_trace(c, "b", run_id="00000000000000000000000000"))
     async with engine.connect() as conn:
         conn = await conn.execution_options(isolation_level="AUTOCOMMIT")
         with pytest.raises(IntegrityError):
@@ -974,7 +980,7 @@ def test_duplicate_content_reads_have_a_separate_memory_bound(legacy):
             [
                 {
                     "id": f"trace-{i:04}",
-                    "agent_run_id": "run-a",
+                    "agent_run_id": "00000000000000000000999999",
                     "role": "assistant",
                     "content": "same",
                     "order_index": 0,
@@ -1080,7 +1086,7 @@ async def test_dedupe_preserves_natural_key_blob_edges(rollout_database):
             [
                 {
                     "id": id,
-                    "agent_run_id": "run-00000",
+                    "agent_run_id": "00000000000000000000000000",
                     "role": "user",
                     "content": "same",
                     "order_index": order,
@@ -1093,7 +1099,7 @@ async def test_dedupe_preserves_natural_key_blob_edges(rollout_database):
             [
                 {
                     "id": id,
-                    "agent_run_id": "run-00000",
+                    "agent_run_id": "00000000000000000000000000",
                     "tool_call_id": call,
                     "tool_name": "t",
                 }
@@ -1107,7 +1113,7 @@ async def test_dedupe_preserves_natural_key_blob_edges(rollout_database):
                     "id": f"edge-{i}",
                     "tenant_scope": "-",
                     "sha256": part.ref.sha256,
-                    "run_id": "run-00000",
+                    "run_id": "00000000000000000000000000",
                     "owner_kind": kind,
                     "owner_id": owner,
                     "ordinal": 0,
@@ -1139,13 +1145,15 @@ async def test_preflight_conflict_in_later_table_deletes_nothing(rollout_databas
     await _migrate(engine)
     async with engine.begin() as conn:
         for id in ("a", "b"):
-            await conn.run_sync(lambda c, id=id: add_trace(c, id, run_id="run-00000"))
+            await conn.run_sync(
+                lambda c, id=id: add_trace(c, id, run_id="00000000000000000000000000")
+            )
         await conn.execute(
             Base.metadata.tables["run_events"].insert(),
             [
                 {
                     "id": id,
-                    "agent_run_id": "run-00000",
+                    "agent_run_id": "00000000000000000000000000",
                     "event_type": "run.started",
                     "sequence_index": 0,
                     "data": {"value": value},
@@ -1183,7 +1191,7 @@ async def test_resume_skips_completed_dedupe_tables(rollout_database, monkeypatc
             [
                 {
                     "id": id,
-                    "agent_run_id": "run-00000",
+                    "agent_run_id": "00000000000000000000000000",
                     "event_type": "run.started",
                     "sequence_index": seq,
                 }
@@ -1255,7 +1263,7 @@ async def test_index_build_late_duplicates_restart_that_table(
     await _migrate(engine)
     table_name = INDEXES[index_name][0]
     table = Base.metadata.tables[table_name]
-    row = {"agent_run_id": "run-00000"}
+    row = {"agent_run_id": "00000000000000000000000000"}
     if table_name == "react_traces":
         row.update(role="user", content="private-sentinel", order_index=0)
     elif table_name == "tool_calls":

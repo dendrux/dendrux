@@ -84,10 +84,10 @@ def test_saved_provider_options_checked_before_claim(caplog):
     }
     agent = Agent(name="bounded", prompt="test")
     with caplog.at_level(logging.WARNING), pytest.raises(ValueError):
-        submission_validator("run-resume", raw, agent=agent)
+        submission_validator("00000000000000000000000305", raw, agent=agent)
     assert any(
         getattr(r, "code", None) == "provider_kwargs_too_large"
-        and getattr(r, "run_id", None) == "run-resume"
+        and getattr(r, "run_id", None) == "00000000000000000000000305"
         for r in caplog.records
     )
 
@@ -101,7 +101,9 @@ def test_saved_provider_options_checked_again_under_claim_lock():
         "pause_id": "generation",
         "provider_kwargs": {"max_tokens": 4096},
     }
-    validate = submission_validator("run-resume", raw, agent=Agent(name="bounded", prompt="test"))
+    validate = submission_validator(
+        "00000000000000000000000305", raw, agent=Agent(name="bounded", prompt="test")
+    )
     with pytest.raises(ValueError):
         validate({**raw, "provider_kwargs": {"thinking": "x" * 2100}})
 
@@ -123,10 +125,10 @@ def test_provider_options_encoder_failure_is_safe_and_logged(caplog):
     if not digits:
         pytest.skip("Interpreter does not cap integer decimal conversion")
     with caplog.at_level(logging.WARNING), pytest.raises(ValueError):
-        _validate_provider_kwargs({"x": 10 ** (digits + 1)}, run_id="run-bounded")
+        _validate_provider_kwargs({"x": 10 ** (digits + 1)}, run_id="00000000000000000000000306")
     assert any(
         getattr(r, "code", None) == "provider_kwargs_invalid"
-        and getattr(r, "run_id", None) == "run-bounded"
+        and getattr(r, "run_id", None) == "00000000000000000000000306"
         for r in caplog.records
     )
 
@@ -136,7 +138,8 @@ def test_invalid_recovery_configuration_logs_stable_code(name, caplog):
     with caplog.at_level(logging.WARNING), pytest.raises(ValueError):
         Limits(**{name: 0})
     assert any(
-        getattr(r, "code", None) == "invalid_limit" and hasattr(r, "run_id") for r in caplog.records
+        getattr(r, "code", None) == "invalid_limit" and getattr(r, "run_id", None) is None
+        for r in caplog.records
     )
 
 

@@ -81,7 +81,7 @@ async def test_public_sweep_preserves_candidate_cap_warning(store, engine, caplo
         (r for r in caplog.records if getattr(r, "code", None) == "sweep_cap_reached"), None
     )
     assert warning is not None
-    assert warning.category == "running" and warning.cap == warning.inspected == 1
+    assert warning.category == "stale_running" and warning.cap == warning.inspected == 1
 
 
 async def test_poisoned_row_does_not_hide_good_row(store, engine):

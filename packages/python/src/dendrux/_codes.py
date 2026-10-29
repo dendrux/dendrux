@@ -1538,10 +1538,80 @@ TOOL_REPLAYED = Code(
     "Monitor repeated worker crashes and tool idempotence.",
 )
 
+CASCADE_TRUNCATED = Code(
+    "cascade_truncated",
+    logging.WARNING,
+    "runtime",
+    _BASE_FIELDS | frozenset({"limit", "count"}),
+    "Cancellation discovers more descendants than the subtree traversal bound.",
+    "Inspect the bounded subtree and cancel remaining subtrees or raise the bound.",
+)
+
+MCP_TRANSPORT_FAILED = Code(
+    "mcp_transport_failed",
+    logging.DEBUG,
+    "mcp",
+    _BASE_FIELDS | frozenset({"count"}),
+    "An MCP transport operation fails.",
+    "Inspect typed failure metadata and transport configuration.",
+)
+
+MCP_TRANSPORT_CLEANUP_FAILED = Code(
+    "mcp_transport_cleanup_failed",
+    logging.DEBUG,
+    "mcp",
+    _BASE_FIELDS | frozenset({"count"}),
+    "Cleanup after an MCP connect failure also fails.",
+    "Inspect transport cleanup and cancellation handling.",
+)
+
+MCP_CREDENTIAL_RESOLUTION_FAILED = Code(
+    "mcp_credential_resolution_failed",
+    logging.DEBUG,
+    "mcp",
+    _BASE_FIELDS | frozenset({"count"}),
+    "MCP credential resolution fails.",
+    "Check the credential provider configuration.",
+)
+
+MCP_OBSERVER_DISPOSE_FAILED = Code(
+    "mcp_observer_dispose_failed",
+    logging.DEBUG,
+    "mcp",
+    _BASE_FIELDS | frozenset({"count"}),
+    "Disposing an MCP observer awaitable fails.",
+    "Use synchronous observers that return no awaitable.",
+)
+
+MCP_OAUTH_CLOSE_FAILED = Code(
+    "mcp_oauth_close_failed",
+    logging.DEBUG,
+    "mcp",
+    _BASE_FIELDS | frozenset({"count"}),
+    "Closing an OAuth response or transport fails.",
+    "Inspect the OAuth transport lifecycle.",
+)
+
+MCP_CLEANUP_FAILED = Code(
+    "mcp_cleanup_failed",
+    logging.WARNING,
+    "mcp",
+    _BASE_FIELDS | frozenset({"count"}),
+    "An MCP connection cleanup operation fails.",
+    "Inspect transport cleanup and repeated failure counts.",
+)
+
 REGISTRY = MappingProxyType(
     {
         code.name: code
         for code in (
+            MCP_TRANSPORT_FAILED,
+            MCP_TRANSPORT_CLEANUP_FAILED,
+            MCP_CREDENTIAL_RESOLUTION_FAILED,
+            MCP_OBSERVER_DISPOSE_FAILED,
+            MCP_OAUTH_CLOSE_FAILED,
+            MCP_CLEANUP_FAILED,
+            CASCADE_TRUNCATED,
             LEGACY_RUN,
             NOT_RUNNING,
             LEASE_FRESH,

@@ -51,9 +51,10 @@ def test_generator_cli_writes_requested_file(tmp_path):
     assert output.read_text() == module.render()
 
 
-def test_reference_is_explicit_about_future_call_site_migration_and_strict_opt_in():
+def test_reference_describes_registry_emission_and_strict_opt_in():
     generated = generator().render()
-    assert "Call sites move to `log_code` in a later release" in generated
+    assert "Coded diagnostics use `log_code`" in generated
+    assert "`cascade_truncated`" in generated.split("## What to alert on", 1)[1]
     assert "DENDRUX_STRICT_LOG_FIELDS=1" in generated
     assert "Unregistered code objects always raise" in generated
     assert "## MCP" in generated and "## Mcp" not in generated

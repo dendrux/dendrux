@@ -187,9 +187,11 @@ async def test_resume_claim_refreshes_progress_before_provider_starts(store, cla
 
 
 async def test_public_sweep_zero_threshold(store):
-    await store.create_run("zero", agent_name="a", input_data={})
+    await store.create_run("00000000000000000000000101", agent_name="a", input_data={})
     result = await sweep(state_store=store, stale_running=dt.timedelta(0))
-    assert [r.run_id for r in result.stale_running] == ["zero"], "zero is a valid sweep threshold"
+    assert [r.run_id for r in result.stale_running] == ["00000000000000000000000101"], (
+        "zero is a valid sweep threshold"
+    )
 
 
 async def test_sweep_projects_and_bounds_candidates(store, engine):
@@ -421,7 +423,7 @@ async def test_sweep_update_rechecks_staleness(store, monkeypatch, waiting):
 
 async def test_public_sweep_has_overridable_page_and_work_limits(store):
     for n in range(5):
-        await store.create_run(f"limit-{n}", agent_name="a", input_data={})
+        await store.create_run(f"{n:026d}", agent_name="a", input_data={})
     result = await sweep(state_store=store, stale_running=dt.timedelta(0), batch_size=1, max_runs=2)
     assert len(result.stale_running) == 2
     assert len((await sweep(state_store=store, stale_running=dt.timedelta(0))).stale_running) == 3

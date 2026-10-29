@@ -135,7 +135,9 @@ async def test_total_decoded_limit_closes_without_sdk_retry(
     install(p, respond)
     try:
         with caplog.at_level(logging.WARNING), pytest.raises(ProviderResponseError) as caught:
-            await p.complete([Message(role=Role.USER, content="hi")], run_id="run-bound")
+            await p.complete(
+                [Message(role=Role.USER, content="hi")], run_id="01ARZ3NDEKTSV4RRFFQ69G5FAV"
+            )
         assert caught.value.provider_code == "response_size_limit"
         assert caught.value.retryable is False
         assert requests == 1

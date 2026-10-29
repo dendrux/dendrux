@@ -7,6 +7,7 @@ import logging
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
 
+from dendrux import _codes
 from dendrux.errors import PersistenceError, RunNotFoundError, RunNotReclaimableError
 from dendrux.loops._helpers import order_observations, project_message, record_message, record_tool
 from dendrux.runtime.persistence import PersistenceRecorder, resolve_pending
@@ -48,9 +49,7 @@ async def reclaim(
     from dendrux.skills._session import SkillSession
 
     if not capabilities(store).recovery:
-        logger.warning(
-            "Recovery capability required", extra={"run_id": run_id, "code": "store_capability"}
-        )
+        _codes.log_code(logger, _codes.STORE_CAPABILITY, run_id=run_id)
         raise NotImplementedError(
             f"StateStore {type(store).__name__} does not declare the 'recovery' capability"
         )
@@ -73,7 +72,7 @@ async def reclaim(
             raise RunNotReclaimableError(run_id, "already_reclaimed")
     except (RunNotFoundError, RunNotReclaimableError) as exc:
         code = exc.reason if isinstance(exc, RunNotReclaimableError) else "run_not_found"
-        logger.warning("Recovery refused", extra={"run_id": run_id, "code": code})
+        _codes.log_code(logger, _codes.REGISTRY[code], run_id=run_id)
         if code == "cancelled":
             from dendrux.runtime.runner import _build_cached_result
 
@@ -108,7 +107,7 @@ async def reclaim(
                 failure_reason=reason,
                 error=reason,
             )
-            logger.warning("Recovery rebuild refused", extra={"run_id": run_id, "code": reason})
+            _codes.log_code(logger, _codes.REGISTRY[reason], run_id=run_id)
             raise RunNotReclaimableError(run_id, reason) from exc
         result = await _resume_core(
             run_id,
@@ -127,9 +126,7 @@ async def reclaim(
             RunStatus.CANCELLED,
             RunStatus.MAX_ITERATIONS,
         ):
-            logger.warning(
-                "Recovery continuation finalised", extra={"run_id": run_id, "code": "run_finalized"}
-            )
+            _codes.log_code(logger, _codes.RUN_FINALIZED, run_id=run_id)
         return result
 
 

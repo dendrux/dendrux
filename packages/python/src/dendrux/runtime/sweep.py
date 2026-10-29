@@ -27,6 +27,7 @@ import warnings
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal
 
+from dendrux import _codes
 from dendrux.runtime.state import SweepResult, _validate_sweep_age
 
 if TYPE_CHECKING:
@@ -138,9 +139,7 @@ async def sweep(
         if on_stale == "reclaim":
             validate_capabilities(store)
         if on_stale == "reclaim" and not capabilities(store).recovery:
-            logging.getLogger(__name__).warning(
-                "Recovery capability required", extra={"run_id": None, "code": "store_capability"}
-            )
+            _codes.log_code(logging.getLogger(__name__), _codes.STORE_CAPABILITY, run_id=None)
             raise NotImplementedError(
                 f"StateStore {type(store).__name__} does not declare the 'recovery' capability"
             )

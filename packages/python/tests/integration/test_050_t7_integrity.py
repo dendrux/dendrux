@@ -402,7 +402,7 @@ async def test_governance_change_is_visible_or_preserves_pause(store, mode, entr
         ]
         assert len(events) == 1 and events[0].data["changed"] == ["guardrails"]
         assert "alice@example.com" not in json.dumps(events[0].data)
-        assert "code=governance_changed" in caplog.text
+        assert any(getattr(r, "code", None) == "governance_changed" for r in caplog.records)
 
 
 async def test_legacy_governance_is_skipped_and_logged(store, caplog):
@@ -417,7 +417,7 @@ async def test_legacy_governance_is_skipped_and_logged(store, caplog):
             paused.run_id, tool_results=[result_for(paused)], expected_pause_id=paused.pause_id
         )
     ).status == RunStatus.SUCCESS
-    assert "code=governance_legacy" in caplog.text
+    assert any(getattr(r, "code", None) == "governance_legacy" for r in caplog.records)
 
 
 async def test_budget_amount_changes_do_not_change_governance_digest(store):

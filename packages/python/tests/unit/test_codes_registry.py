@@ -48,6 +48,16 @@ def literal_codes(source):
     for call in ast.walk(tree):
         if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Attribute):
             continue
+        if call.func.attr == "log_code":
+            for part in ast.walk(call.args[1]):
+                if (
+                    isinstance(part, ast.Attribute)
+                    and isinstance(part.value, ast.Name)
+                    and part.value.id == "_codes"
+                    and part.attr != "REGISTRY"
+                ):
+                    found.add(part.attr.lower())
+            continue
         if call.func.attr not in {"warning", "error", "info", "debug", "exception", "critical"}:
             continue
         scope = call

@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from dendrux import _codes
+
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
@@ -63,12 +65,7 @@ async def _dispose_entry(entry: _Entry) -> None:
         # Public disposal replaces the pool without touching dead-loop drivers.
         # The orphaned pool's connections are released by garbage collection.
         await entry.engine.dispose(close=False)
-        logger.warning(
-            "Retired a shared engine after its event loop closed; orphaned connections "
-            "await garbage collection. Call await agent.close() or use async with "
-            "Agent(...) before closing the loop.",
-            extra={"code": "shared_engine_loop_closed"},
-        )
+        _codes.log_code(logger, _codes.SHARED_ENGINE_LOOP_CLOSED)
         return
     if not entry.ready.done():
         entry.ready.cancel()

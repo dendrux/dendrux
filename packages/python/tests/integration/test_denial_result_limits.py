@@ -75,7 +75,7 @@ async def test_denial_batch_bound_matches_client_submission(store):
     with pytest.raises(InvalidToolResultError):
         await prepare_client_results(
             agent,
-            "r",
+            "00000000000000000000000102",
             PauseState(
                 agent_name="a",
                 history=[],

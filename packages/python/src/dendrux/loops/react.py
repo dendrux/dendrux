@@ -29,6 +29,7 @@ import traceback
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
+from dendrux import _codes
 from dendrux.errors import ImageError, ImagePersistenceUnsupportedError
 from dendrux.guardrails._engine import GuardrailEngine
 from dendrux.llm._calls import complete_call, stream_call
@@ -337,10 +338,7 @@ def _pending_limit_result(
         return None
     if len(response.tool_calls or ()) <= agent._limits.max_pending_calls:
         return None
-    logger.warning(
-        "Assistant batch exceeds pending-call limit",
-        extra={"run_id": run_id, "code": "pending_limit"},
-    )
+    _codes.log_code(logger, _codes.PENDING_LIMIT, run_id=run_id)
     return RunResult(
         run_id=run_id,
         status=RunStatus.ERROR,
@@ -2962,12 +2960,7 @@ async def _execute_parallel_group(
             # The tool returned and its own row write had started (it may or
             # may not have landed). Never write a second row for the call.
             if not tracker.recorded:
-                logger.warning(
-                    "A finished tool call was stopped while being recorded "
-                    "(code=tool_row_may_be_missing, run_id=%s, tool=%s)",
-                    run_id,
-                    tc.name,
-                )
+                _codes.log_code(logger, _codes.TOOL_ROW_MAY_BE_MISSING, run_id=run_id)
             continue
         message = _SIBLING_UNKNOWN if tracker.abandoned else _SIBLING_CANCELLED
         code = "outcome_unknown" if tracker.abandoned else "cancelled"
@@ -2983,12 +2976,7 @@ async def _execute_parallel_group(
             await _record_tool(recorder, run_id, tc, result, iteration)
             await _notify_tool(notifier, run_id, tc, result, iteration, notifier_warnings)
         except Exception:
-            logger.warning(
-                "Could not record stopped tool call (code=%s, run_id=%s, tool=%s)",
-                code,
-                run_id,
-                tc.name,
-            )
+            _codes.log_code(logger, _codes.REGISTRY[code], run_id=run_id)
     raise error
 
 
@@ -3016,15 +3004,14 @@ def _log_stopped(
         for tc, task, tracker in zip(group, tasks, trackers, strict=True)
         if task.cancelled()
     ]
-    for tc, tracker in stopped:
+    for _tc, tracker in stopped:
         if tracker.result is not None:
             continue  # it finished; only its row or event was cut short
-        logger.warning(
-            "Stopped tool call in a parallel batch (code=%s, reason=%s, run_id=%s, tool=%s)",
-            "outcome_unknown" if tracker.abandoned else "cancelled",
-            reason,
-            run_id,
-            tc.name,
+        _codes.log_code(
+            logger,
+            _codes.REGISTRY["outcome_unknown" if tracker.abandoned else "cancelled"],
+            run_id=run_id,
+            reason=reason,
         )
     return stopped
 
@@ -3160,14 +3147,12 @@ def _timeout_result(
             "busy. It was not run and is safe to retry."
         )
         meta = {"code": code}
-    logger.warning(
-        "Tool '%s' timed out after %ss%s (code=%s, run_id=%s, zombie_threads=%s)",
-        name,
-        timeout_s,
-        "" if is_explicit else " (default). Set an explicit timeout: @tool(timeout_seconds=N)",
-        code,
-        run_id,
-        meta.get("zombie_threads", 0),
+    _codes.log_code(
+        logger,
+        _codes.REGISTRY[code],
+        run_id=run_id,
+        timeout_s=timeout_s,
+        zombie_threads=meta.get("zombie_threads", 0),
     )
     return ToolResult(
         name=name,
@@ -3291,15 +3276,13 @@ async def _execute_tool(
             ) from ser_err
         payload, cap_meta = cap_value_payload(result, payload, limits.max_tool_result_bytes)
         if cap_meta is not None:
-            logger.warning(
-                "Tool '%s' result over the size cap (code=%s, run_id=%s, bytes=%d, limit=%d, "
-                "truncated=%s)",
-                tool_call.name,
-                cap_meta["code"],
-                run_id,
-                cap_meta["bytes"],
-                limits.max_tool_result_bytes,
-                bool(cap_meta.get("truncated")),
+            _codes.log_code(
+                logger,
+                _codes.SIZE_LIMIT,
+                run_id=run_id,
+                bytes=cap_meta["bytes"],
+                limit=limits.max_tool_result_bytes,
+                truncated=bool(cap_meta.get("truncated")),
             )
             if not cap_meta.get("truncated"):
                 return ToolResult(
@@ -3353,13 +3336,12 @@ async def _execute_tool(
     except ToolResultTooLargeError as too_large:
         # The source stopped reading an oversized result (MCP read cap).
         payload, cap_meta = size_limit_payload(too_large.size)
-        logger.warning(
-            "Tool '%s' result over the size cap (code=%s, run_id=%s, bytes=%s, limit=%d)",
-            tool_call.name,
-            cap_meta["code"],
-            run_id,
-            too_large.size,
-            limits.max_tool_result_bytes,
+        _codes.log_code(
+            logger,
+            _codes.SIZE_LIMIT,
+            run_id=run_id,
+            bytes=too_large.size,
+            limit=limits.max_tool_result_bytes,
         )
         return ToolResult(
             name=tool_call.name,
@@ -3375,9 +3357,7 @@ async def _execute_tool(
             f"Tool '{tool_call.name}' could not be queued because the tool pool is full. "
             "It was not run and is safe to retry."
         )
-        logger.warning(
-            "Tool '%s' rejected (code=tool_pool_saturated, run_id=%s)", tool_call.name, run_id
-        )
+        _codes.log_code(logger, _codes.TOOL_POOL_SATURATED, run_id=run_id)
         return ToolResult(
             name=tool_call.name,
             call_id=tool_call.id,

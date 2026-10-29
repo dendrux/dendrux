@@ -18,10 +18,12 @@ def test_skills_snapshot_roundtrip_and_unknown_name_count(caplog):
     assert hasattr(session, "snapshot"), "skills need their versioned activation serializer"
     assert session.snapshot() == {"v": 1, "activated": ["a", "b"]}
     restored = SkillSession.prepare(agent)
-    restored.run_id = "run"
+    restored.run_id = "00000000000000000000000401"
     restored.restore_snapshot({"v": 1, "activated": ["a", "unknown"]})
     assert restored.snapshot() == {"v": 1, "activated": ["a"]}
     assert any(
-        getattr(r, "code", None) == "skills_session_unknown" and r.run_id == "run" and r.count == 1
+        getattr(r, "code", None) == "skills_session_unknown"
+        and r.run_id == "00000000000000000000000401"
+        and r.count == 1
         for r in caplog.records
     )

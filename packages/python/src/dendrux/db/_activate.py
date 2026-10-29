@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 from sqlalchemy import delete, func, inspect, select, text
 from sqlalchemy.exc import IntegrityError, OperationalError
 
+from dendrux import _codes
 from dendrux.db._index_check import index_exists, require_index
 from dendrux.db._migration_ddl import build_index_concurrently, drop_index_concurrently, sqlstate
 from dendrux.db._schema_check import read_schema_phase, schema_problems
@@ -217,14 +218,8 @@ def _preflight(conn: Connection, batch_size: int) -> None:
             first_runs = sorted(set(first_runs).union(conflicts))[:20]
             after = page[-1].id
         if count:
-            logger.warning(
-                "Dendrux activation stopped on conflicting duplicates",
-                extra={
-                    "code": "write_conflict",
-                    "run_id": first_runs[0],
-                    "table": table_name,
-                    "count": count,
-                },
+            _codes.log_code(
+                logger, _codes.WRITE_CONFLICT, run_id=first_runs[0], table=table_name, count=count
             )
             raise ActivationConflictError(table_name, count, first_runs)
 
@@ -307,10 +302,7 @@ def _activate(conn: Connection, batch_size: int, dedupe_only: bool) -> None:
                 )
                 put_setting(conn, "activate_step", f"dedupe:{table}")
                 conn.commit()
-                logger.warning(
-                    "Dendrux activation stopped on duplicates after dedupe",
-                    extra={"code": "activation_conflict", "table": table, "index": name},
-                )
+                _codes.log_code(logger, _codes.ACTIVATION_CONFLICT, table=table, index=name)
                 raise ActivationIndexConflictError(
                     "duplicates appeared after dedupe; rerun dendrux db dedupe"
                 ) from None

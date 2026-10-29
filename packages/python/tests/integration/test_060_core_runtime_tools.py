@@ -297,7 +297,7 @@ async def test_unconsumed_approval_cannot_begin_an_execution(store):
     from dendrux.runtime.state import ClaimResult, claimed_store
 
     call = ToolCall("change")
-    await store.create_run("unconsumed", "a")
+    await store.create_run("00000000000000000000000110", "a")
     state = {
         "v": 1,
         "phase": "awaiting_approval",
@@ -313,14 +313,14 @@ async def test_unconsumed_approval_cannot_begin_an_execution(store):
         ],
     }
     await store.checkpoint_step(
-        "unconsumed", claim_epoch=0, loop_state=state, pii_mapping=None, trace=None
+        "00000000000000000000000110", claim_epoch=0, loop_state=state, pii_mapping=None, trace=None
     )
-    owned = claimed_store(store, "unconsumed", ClaimResult(0, 2, state, None))
-    recorder = PersistenceRecorder(owned, "unconsumed")
+    owned = claimed_store(store, "00000000000000000000000110", ClaimResult(0, 2, state, None))
+    recorder = PersistenceRecorder(owned, "00000000000000000000000110")
     with pytest.raises(PersistenceError) as error:
-        await recorder.on_tool_started("unconsumed", call, 1)
+        await recorder.on_tool_started("00000000000000000000000110", call, 1)
     assert error.value.code == "submission_missing"
-    assert await store.get_tool_calls("unconsumed") == []
+    assert await store.get_tool_calls("00000000000000000000000110") == []
 
 
 @pytest.mark.parametrize("streaming", [False, True])

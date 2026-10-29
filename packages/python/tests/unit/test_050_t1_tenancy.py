@@ -57,19 +57,25 @@ def _agent(store: Any = None, **kw: Any) -> Agent:
 
 _ASYNC_ENTRIES: list[tuple[str, Any]] = [
     ("run", lambda a, **k: a.run("hi", **k)),
-    ("retry", lambda a, **k: a.retry("r1", **k)),
-    ("resume", lambda a, **k: a.resume("r1", **k)),
-    ("submit_tool_results", lambda a, **k: a.submit_tool_results("r1", [], **k)),
-    ("submit_input", lambda a, **k: a.submit_input("r1", "answer", **k)),
-    ("submit_approval", lambda a, **k: a.submit_approval("r1", approved=True, **k)),
-    ("submit_resume", lambda a, **k: a.submit_resume("r1", **k)),
-    ("cancel_run", lambda a, **k: a.cancel_run("r1", **k)),
-    ("request_pause", lambda a, **k: a.request_pause("r1", **k)),
-    ("submit_note", lambda a, **k: a.submit_note("r1", "note", **k)),
+    ("retry", lambda a, **k: a.retry("00000000000000000000000105", **k)),
+    ("resume", lambda a, **k: a.resume("00000000000000000000000105", **k)),
+    (
+        "submit_tool_results",
+        lambda a, **k: a.submit_tool_results("00000000000000000000000105", [], **k),
+    ),
+    ("submit_input", lambda a, **k: a.submit_input("00000000000000000000000105", "answer", **k)),
+    (
+        "submit_approval",
+        lambda a, **k: a.submit_approval("00000000000000000000000105", approved=True, **k),
+    ),
+    ("submit_resume", lambda a, **k: a.submit_resume("00000000000000000000000105", **k)),
+    ("cancel_run", lambda a, **k: a.cancel_run("00000000000000000000000105", **k)),
+    ("request_pause", lambda a, **k: a.request_pause("00000000000000000000000105", **k)),
+    ("submit_note", lambda a, **k: a.submit_note("00000000000000000000000105", "note", **k)),
 ]
 _SYNC_ENTRIES: list[tuple[str, Any]] = [
     ("stream", lambda a, **k: a.stream("hi", **k)),
-    ("resume_stream", lambda a, **k: a.resume_stream("r1", **k)),
+    ("resume_stream", lambda a, **k: a.resume_stream("00000000000000000000000105", **k)),
 ]
 
 
@@ -163,8 +169,8 @@ class TestStrictTenancy:
     ) -> None:
         agent = _agent(store, strict_tenancy=True)
         with pytest.raises(TenantScopeRequiredError):
-            await agent.cancel_run("r1")
-        assert "code=tenant_scope_required" in caplog.text
+            await agent.cancel_run("00000000000000000000000105")
+        assert any(getattr(r, "code", None) == "tenant_scope_required" for r in caplog.records)
 
 
 class TestStrictDefaultFutureWarning:
@@ -240,7 +246,7 @@ class TestEmptyTenant:
 
     async def test_non_string_tenant_rejected(self, store: Any) -> None:
         with pytest.raises(ValueError, match="tenant_id must be"):
-            await _agent(store).cancel_run("r1", tenant_id=42)  # type: ignore[arg-type]
+            await _agent(store).cancel_run("00000000000000000000000105", tenant_id=42)  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------
@@ -253,7 +259,7 @@ class TestRunMetadata:
         "call",
         [
             lambda a, m: a.run("hi", metadata=m),
-            lambda a, m: a.retry("r1", metadata=m),
+            lambda a, m: a.retry("00000000000000000000000105", metadata=m),
         ],
     )
     async def test_reserved_key_rejected(self, store: Any, call: Any) -> None:
@@ -287,7 +293,7 @@ class TestRunMetadata:
         with pytest.raises(ValueError, match="64-byte limit"):
             await agent.run("hi", metadata={"blob": "x" * 100})
         assert store.calls == []
-        assert "code=metadata_too_large" in caplog.text
+        assert any(getattr(r, "code", None) == "metadata_too_large" for r in caplog.records)
 
     async def test_metadata_at_the_cap_accepted(self, store: Any) -> None:
         # {"b":"xxx..."} -> 8 bytes of framing + the value.
@@ -306,7 +312,7 @@ class TestRunMetadata:
     async def test_note_metadata_capped(self, store: Any) -> None:
         agent = _agent(store, limits=Limits(max_metadata_bytes=32))
         with pytest.raises(ValueError, match="note metadata"):
-            await agent.submit_note("r1", "hi", metadata={"b": "x" * 64})
+            await agent.submit_note("00000000000000000000000105", "hi", metadata={"b": "x" * 64})
         assert store.calls == []
 
     async def test_non_dict_metadata_rejected(self, store: Any) -> None:

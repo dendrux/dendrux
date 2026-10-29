@@ -152,7 +152,7 @@ async def test_active_stream_byte_bound_closes_upstream(adapter, kind):
     wire(provider, stream_handler(parts, record=bodies))
     try:
         with pytest.raises(ProviderError) as caught:
-            await drain(provider.complete_stream(USER, run_id="bounded"))
+            await drain(provider.complete_stream(USER, run_id="01ARZ3NDEKTSV4RRFFQ69G5FAV"))
         assert caught.value.category == "rejected"
         assert caught.value.provider_code == "stream_size_limit"
         assert bodies and all(body.closed for body in bodies)

@@ -76,7 +76,9 @@ async def test_near_megabyte_validation_keeps_ticker_responsive(monkeypatch, fro
         result = (
             await asyncio.to_thread(ToolResult.from_dict, data) if from_wire else ToolResult(**data)
         )
-        prepared = await prepare_client_results(agent, "r", pause, [result])
+        prepared = await prepare_client_results(
+            agent, "00000000000000000000000102", pause, [result]
+        )
         assert prepared[0].payload == payload
     finally:
         stop.set()
@@ -120,7 +122,9 @@ async def test_small_validation_stays_inline(monkeypatch):
     call = ToolCall("read_range")
     pause = SimpleNamespace(pending_tool_calls=[call])
     async with Agent(prompt="p", tools=[read_range]) as agent:
-        await prepare_client_results(agent, "r", pause, [ToolResult(call.name, call.id, "[1,2]")])
+        await prepare_client_results(
+            agent, "00000000000000000000000102", pause, [ToolResult(call.name, call.id, "[1,2]")]
+        )
     assert threads == [threading.get_ident()]
 
 
@@ -141,12 +145,14 @@ async def test_payload_attestation_does_not_bypass_new_data_or_limits(change):
     limits = Limits(max_tool_result_bytes=4) if change == "limit" else Limits()
     async with Agent(prompt="p", tools=[read_range], limits=limits) as agent:
         if change == "limit":
-            prepared = await prepare_client_results(agent, "r", pause, [result])
+            prepared = await prepare_client_results(
+                agent, "00000000000000000000000102", pause, [result]
+            )
             assert prepared[0].success is False
             assert prepared[0].meta["code"] == "size_limit"
         else:
             with pytest.raises(InvalidToolResultError):
-                await prepare_client_results(agent, "r", pause, [result])
+                await prepare_client_results(agent, "00000000000000000000000102", pause, [result])
 
 
 def test_client_cannot_supply_a_payload_attestation():
@@ -185,7 +191,10 @@ async def test_concurrent_large_submissions_apply_backpressure_before_executor(m
     result = ToolResult(call.name, call.id, "[" + "0," * 262140 + "0]")
     async with Agent(prompt="p", tools=[read_range]) as agent:
         await asyncio.gather(
-            *(prepare_client_results(agent, "r", pause, [result]) for _ in range(4))
+            *(
+                prepare_client_results(agent, "00000000000000000000000102", pause, [result])
+                for _ in range(4)
+            )
         )
     assert peak == 1, "large requests must wait before occupying the default executor"
 
@@ -213,7 +222,9 @@ async def test_cancelled_validation_waits_for_cpu_job_before_releasing_slot(
     monkeypatch.setattr(submit, "_validated_client_results", work)
     result = ToolResult("read_range", "c", "x" * 65536)
     async with Agent(prompt="p", tools=[read_range]) as agent:
-        caller = asyncio.create_task(submit._validate_client_results(agent, "r", [result]))
+        caller = asyncio.create_task(
+            submit._validate_client_results(agent, "00000000000000000000000102", [result])
+        )
         try:
             await asyncio.wait_for(entered.wait(), timeout=10)
             caller.cancel()

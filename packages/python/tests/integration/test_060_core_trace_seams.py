@@ -34,7 +34,7 @@ class Observer(BaseNotifier):
 
 @pytest.mark.parametrize("streaming", [False, True])
 @pytest.mark.parametrize("persisted", [False, True])
-async def test_trace_propagates_into_parallel_children(store, streaming, persisted):
+async def test_parallel_tool_slots_and_custom_child_run_links(store, streaming, persisted):
     child_observer = Observer(OTHER)
     calls = [ToolCall("child"), ToolCall("child")]
     links = {calls[0].id: SPAN, calls[1].id: OTHER}
@@ -90,7 +90,7 @@ async def test_trace_propagates_into_parallel_children(store, streaming, persist
     assert result.status == RunStatus.SUCCESS
     assert sorted(contexts) == sorted([(LINK, SPAN), (LINK, OTHER)])
     assert len(observer.tools) == 2
-    assert sorted(link for _, link in child_observer.starts) == sorted([SPAN, OTHER])
+    assert [link for _, link in child_observer.starts] == [LINK, LINK]
     if persisted:
         assert (await store.get_run(result.run_id)).trace_link == LINK
     assert get_delegation_context() is None

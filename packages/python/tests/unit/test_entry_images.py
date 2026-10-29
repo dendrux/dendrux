@@ -1036,7 +1036,7 @@ def _clarify_responses() -> list[LLMResponse]:
 
 async def _human_pause(store: ImageStore, agent: Agent) -> str:
     """Persist a WAITING_HUMAN_INPUT pause directly (loop-independent)."""
-    run_id = "01JHUMANPAUSE000000000000"
+    run_id = "00000000000000000000000109"
     await store.create_run(run_id, agent.name, input_data={"input": "q"}, tenant_id="acme")
     pause = PauseState(
         agent_name=agent.name,
@@ -1275,12 +1275,16 @@ class TestInitialImageView:
         s1 = ImageSource(
             "t:a",
             [
-                _event("image.rejected", {"sha256": "r1", "tenant_scope": "t:a"}, 1),
+                _event(
+                    "image.rejected",
+                    {"sha256": "00000000000000000000000105", "tenant_scope": "t:a"},
+                    1,
+                ),
                 _event("image.rejected", {"sha256": "x", "tenant_scope": "t:b"}, 2),
                 _event(
                     "image.state",
                     {
-                        "described": [{"sha256": "d", "text": "first"}],
+                        "described": [{"sha256": "d", "text": "00000000000000000000000111"}],
                         "guardrail_verdicts": [
                             {
                                 "sha256": "g",
@@ -1301,9 +1305,21 @@ class TestInitialImageView:
         s2 = ImageSource(
             "t:a",
             [
-                _event("image.rejected", {"sha256": "r1", "tenant_scope": "t:a"}, 1),
-                _event("image.rejected", {"sha256": "r2", "tenant_scope": "t:a"}, 2),
-                _event("image.state", {"described": [{"sha256": "d", "text": "second"}]}, 3),
+                _event(
+                    "image.rejected",
+                    {"sha256": "00000000000000000000000105", "tenant_scope": "t:a"},
+                    1,
+                ),
+                _event(
+                    "image.rejected",
+                    {"sha256": "00000000000000000000000117", "tenant_scope": "t:a"},
+                    2,
+                ),
+                _event(
+                    "image.state",
+                    {"described": [{"sha256": "d", "text": "00000000000000000000000112"}]},
+                    3,
+                ),
                 _event("image.view_changed", {"epoch": 2, "dropped_through": 5, "visible": 3}, 4),
             ],
         )
@@ -1311,8 +1327,13 @@ class TestInitialImageView:
             sent_through=7, sources=[s1, s2], tenant_scope="t:a", single_full=False
         )
         assert state.sent_through == 7
-        assert state.rejected == [("t:a", "r1"), ("t:a", "r2")]
-        assert state.described == {("t:a", "d"): "first"}  # earlier source wins
+        assert state.rejected == [
+            ("t:a", "00000000000000000000000105"),
+            ("t:a", "00000000000000000000000117"),
+        ]
+        assert state.described == {
+            ("t:a", "d"): "00000000000000000000000111"
+        }  # earlier source wins
         assert ("t:a", "g", "G", "1", "tool", "shot") in state.guardrail_verdicts
         # several sources -> fresh drop view, no placeholders
         assert (state.epoch, state.dropped_through, state.placeholders) == (0, 0, {})
@@ -1343,7 +1364,9 @@ class TestInitialImageView:
         assert state.placeholders == {0: "drop", 1: "purged"}
 
     def test_other_tenant_source_ignored(self) -> None:
-        src = ImageSource("t:b", [_event("image.rejected", {"sha256": "r"}, 1)])
+        src = ImageSource(
+            "t:b", [_event("image.rejected", {"sha256": "00000000000000000000000102"}, 1)]
+        )
         state = initial_image_view(
             sent_through=0, sources=[src], tenant_scope="t:a", single_full=True
         )
@@ -1383,7 +1406,7 @@ class TestRebuildParts:
 
 class TestRetryAndReplay:
     async def test_retry_carries_parts_seeds_and_rejections(self, store: ImageStore) -> None:
-        agent = _agent(store, [LLMResponse(text="first")])
+        agent = _agent(store, [LLMResponse(text="00000000000000000000000111")])
         source = await agent.run(["what", Image.from_bytes(PNG)], tenant_id="acme")
         sha = _sha(PNG)
         await store.save_run_event(
@@ -1392,7 +1415,7 @@ class TestRetryAndReplay:
             iteration_index=1,
             data={"image_id": "img_x", "sha256": sha, "tenant_scope": "t:acme"},
         )
-        retry_agent = _agent(store, [LLMResponse(text="second")])
+        retry_agent = _agent(store, [LLMResponse(text="00000000000000000000000112")])
         result = await retry_agent.retry(source.run_id, tenant_id="acme")
         assert result.status == RunStatus.SUCCESS
         record = await store.get_run(result.run_id)
@@ -1422,7 +1445,10 @@ class TestRetryAndReplay:
         assert sent[0].content.startswith("see")
         state = follow.loop.seen[-1]["state"]  # type: ignore[union-attr]
         assert state.sent_through == 1
-        assert sorted(e.owner_kind for e in store.edges_of(result.run_id)) == ["seed", "trace"]
+        assert sorted(e.owner_kind for e in store.edges_of(result.run_id)) == [
+            "seed",
+            "trace",
+        ]
 
     async def test_text_mode_replay_uses_input_parts(self, store: ImageStore) -> None:
         agent = _agent(store, [LLMResponse(text="one")])
@@ -1467,10 +1493,12 @@ class TestOtelImages:
         ref = ImageRef(
             sha256="d" * 64, media_type="image/png", byte_length=10, width=400, height=200
         )
-        await notifier.on_run_started("r", agent_name="a", agent_model="claude-sonnet-4-6")
-        await notifier.on_llm_call_started("r", 1)
+        await notifier.on_run_started(
+            "00000000000000000000000102", agent_name="a", agent_model="claude-sonnet-4-6"
+        )
+        await notifier.on_llm_call_started("00000000000000000000000102", 1)
         await notifier.on_llm_call_completed(
-            "r",
+            "00000000000000000000000102",
             LLMResponse(text="x"),
             1,
             semantic_messages=[Message.with_parts(Role.USER, [TextPart("q"), ImagePart(ref)])],
@@ -1491,10 +1519,15 @@ class TestOtelImages:
         provider = TracerProvider()
         provider.add_span_processor(SimpleSpanProcessor(exporter))
         notifier = OpenTelemetryNotifier(tracer=provider.get_tracer("t"))
-        await notifier.on_run_started("r", agent_name="a", agent_model="gpt-5-mini")
-        await notifier.on_llm_call_started("r", 1)
+        await notifier.on_run_started(
+            "00000000000000000000000102", agent_name="a", agent_model="gpt-5-mini"
+        )
+        await notifier.on_llm_call_started("00000000000000000000000102", 1)
         await notifier.on_llm_call_completed(
-            "r", LLMResponse(text="x"), 1, semantic_messages=[Message(role=Role.USER, content="q")]
+            "00000000000000000000000102",
+            LLMResponse(text="x"),
+            1,
+            semantic_messages=[Message(role=Role.USER, content="q")],
         )
         span = next(s for s in exporter.get_finished_spans() if "chat" in s.name)
         assert "dendrux.images.count" not in (span.attributes or {})
@@ -1753,7 +1786,7 @@ class TestSeededSourceCarry:
             "-",
             [
                 _event("image.view_changed", {"epoch": 3, "dropped_through": 6}, 1),
-                _event("image.rejected", {"sha256": "r"}, 2),
+                _event("image.rejected", {"sha256": "00000000000000000000000102"}, 2),
                 _event("image.state", {"placeholders": [{"slot": 0, "reason": "drop"}]}, 3),
             ],
             slot_offset=None,
@@ -1762,7 +1795,9 @@ class TestSeededSourceCarry:
             sent_through=1, sources=[src], tenant_scope="-", single_full=True
         )
         assert (state.epoch, state.dropped_through, state.placeholders) == (0, 0, {})
-        assert state.rejected == [("-", "r")]  # key-based state still carries
+        assert state.rejected == [
+            ("-", "00000000000000000000000102")
+        ]  # key-based state still carries
 
     def test_source_offset_from_meta(self) -> None:
         from dendrux.runtime.replay import IMAGE_SEEDED_KEY, PREFIX_META_KEY, source_slot_offset

@@ -115,7 +115,7 @@ async def test_wrong_bearer_token_is_a_typed_rejection(status: int) -> None:
             f"Failed to connect to MCP source 'demo': "
             f"the server rejected its credentials (HTTP {status})."
         )
-        assert error.transport_detail == "MCPError: Server returned an error response"
+        assert error.transport_detail == "mcp_transport_failed count=1"
         assert WRONG_TOKEN not in _rendered_chain(error)
         assert WRONG_TOKEN not in (error.transport_detail or "")
         await adapter.close()

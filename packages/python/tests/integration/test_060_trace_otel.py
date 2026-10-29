@@ -224,9 +224,6 @@ async def test_d3_custom_parent_without_tool_link_gives_otel_child_run_link(trac
     assert child_span.parent.span_id == int("2" * 16, 16)
 
 
-@pytest.mark.xfail(
-    strict=True, reason="Unowned runtime _start_trace prefers tool link for custom children"
-)
 async def test_d3_custom_child_receives_only_parent_run_link(tracing):
     provider, _ = tracing
     notifier = OpenTelemetryNotifier(provider.get_tracer("parent"))
@@ -357,7 +354,7 @@ async def test_d6_unknown_provider_code_is_safe_in_logs_result_event_span_and_wi
         result = await agent.get_result(run_id, tenant_id=None)
         event_projection = ""
     assert result.error_info.provider_code == "provider_unknown"
-    log = [r for r in caplog.records if r.getMessage().startswith("provider.error")]
+    log = [r for r in caplog.records if getattr(r, "kind", None) == "provider"]
     assert log and all(r.code == "provider_unknown" for r in log)
     span_events = [
         event
@@ -552,3 +549,59 @@ asyncio.run(main())
     )
     row = await store.get_run(run_id)
     assert row.trace_link == saved and row.reclaim_attempts == 1
+
+
+@pytest.mark.parametrize(
+    "container", ["custom", "custom_composite", "otel_composite", "nested_otel"]
+)
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_child_link_selection_matches_notifier_kind(tracing, container, streaming):
+    provider, exporter = tracing
+    custom = CustomNotifier()
+    child_otel = OpenTelemetryNotifier(provider.get_tracer("child"))
+    child_notifier = {
+        "custom": custom,
+        "custom_composite": CompositeNotifier([custom]),
+        "otel_composite": CompositeNotifier([child_otel, custom]),
+        "nested_otel": CompositeNotifier([CompositeNotifier([child_otel]), custom]),
+    }[container]
+    expected = []
+    otel_child = container in {"otel_composite", "nested_otel"}
+
+    @tool()
+    async def child() -> str:
+        """Delegate under an active parent tool span."""
+        from dendrux.runtime.context import get_delegation_context
+
+        context = get_delegation_context()
+        assert context.tool_span_link is not None
+        expected.append(context.tool_span_link if otel_child else context.trace_link)
+        agent = Agent(
+            name="child",
+            prompt="p",
+            provider=MockLLM([LLMResponse(text="done")]),
+            strict_tenancy=False,
+        )
+        if streaming:
+            async with agent.stream("go", notifier=child_notifier) as stream:
+                events = [event async for event in stream]
+            assert events[-1].run_result.status == RunStatus.SUCCESS
+        else:
+            assert (await agent.run("go", notifier=child_notifier)).status == RunStatus.SUCCESS
+        return "ok"
+
+    await Agent(
+        name="parent",
+        prompt="p",
+        tools=[child],
+        strict_tenancy=False,
+        provider=MockLLM([LLMResponse(tool_calls=[ToolCall("child")]), LLMResponse(text="done")]),
+    ).run("go", notifier=OpenTelemetryNotifier(provider.get_tracer("parent")))
+    assert custom.starts == expected
+    children = [
+        s for s in spans(exporter, "invoke_agent") if s.attributes["gen_ai.agent.name"] == "child"
+    ]
+    assert len(children) == int(otel_child)
+    if otel_child:
+        (tool_span,) = spans(exporter, "execute_tool")
+        assert children[0].parent.span_id == tool_span.context.span_id

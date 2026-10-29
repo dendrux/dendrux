@@ -9,6 +9,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from typing import TYPE_CHECKING, Any
 
+from dendrux import _codes
 from dendrux.errors import SkillDigestMismatch
 from dendrux.skills import Skill, SkillExecutionRequest, SkillExecutionResult
 from dendrux.skills._internal import (
@@ -120,9 +121,11 @@ class SkillSession:
         self.activated = names.intersection(self.available)
         unknown = len(names - self.available.keys())
         if unknown:
-            logging.getLogger(__name__).warning(
-                "Unknown snapshot skills ignored",
-                extra={"run_id": self.run_id, "code": "skills_session_unknown", "count": unknown},
+            _codes.log_code(
+                logging.getLogger(__name__),
+                _codes.SKILLS_SESSION_UNKNOWN,
+                run_id=self.run_id,
+                count=unknown,
             )
 
     def fingerprint(self) -> dict[str, Any] | None:

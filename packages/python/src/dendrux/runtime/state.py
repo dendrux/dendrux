@@ -23,6 +23,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, NoReturn, Protocol, cast, overload
 
+from dendrux import _codes
 from dendrux.runtime._blob_catalog import SQLBlobCatalog, write_blob_refs
 from dendrux.runtime.durability import (
     _safe_database_call,
@@ -1392,9 +1393,7 @@ _PERSISTED_VALUE_FIELDS = frozenset(
 def _checkpoint_error(run_id: str) -> NoReturn:
     from dendrux.errors import PersistenceError
 
-    logger.warning(
-        "Checkpoint byte bound exceeded", extra={"run_id": run_id, "code": "checkpoint_too_large"}
-    )
+    _codes.log_code(logger, _codes.CHECKPOINT_TOO_LARGE, run_id=run_id)
     raise PersistenceError(code="checkpoint_too_large")
 
 
@@ -1432,9 +1431,7 @@ def _validate_trace_write(run_id: str, trace: TraceWrite) -> None:
             ):
                 raise ValueError("Rewrite entries require role and content")
             if any(not isinstance(m.get("meta", {}), dict) for m in value):
-                logger.warning(
-                    "Invalid rewrite metadata", extra={"run_id": run_id, "code": "rewrite_invalid"}
-                )
+                _codes.log_code(logger, _codes.REWRITE_INVALID, run_id=run_id)
                 raise ValueError("Rewrite entry metadata must be an object")
         elif not isinstance(value, dict) or value.get("kind") not in (
             "image_view",
@@ -1737,12 +1734,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                     # The key is held by another tenant's run under a pre-0.5
                     # global unique index (legacy SQLite file). Fail closed
                     # without disclosing that run.
-                    logger.warning(
-                        "idempotency key held by another tenant under a pre-0.5 global "
-                        "unique index: run_id=%s code=idempotency_conflict_legacy",
-                        run_id,
-                        extra={"run_id": run_id, "code": "idempotency_conflict_legacy"},
-                    )
+                    _codes.log_code(logger, _codes.IDEMPOTENCY_CONFLICT_LEGACY, run_id=run_id)
                     raise IdempotencyConflictError(
                         run_id=None, idempotency_key=idempotency_key
                     ) from None
@@ -1841,7 +1833,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
             )
         result = await session.execute(stmt.values(updated_at=now, **values))
         if claim_epoch is not None and not getattr(result, "rowcount", 0):
-            logger.warning("Run fenced", extra={"run_id": run_id, "code": "run_fenced"})
+            _codes.log_code(logger, _codes.RUN_FENCED, run_id=run_id)
             raise RunFencedError(run_id, claim_epoch=claim_epoch)
 
     async def _insert_retry(
@@ -1903,7 +1895,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
     def _write_conflict(self, run_id: str) -> NoReturn:
         from dendrux.errors import PersistenceError
 
-        logger.warning("Retry content conflict", extra={"run_id": run_id, "code": "write_conflict"})
+        _codes.log_code(logger, _codes.WRITE_CONFLICT, run_id=run_id)
         raise PersistenceError(code="write_conflict")
 
     async def save_trace(
@@ -2323,7 +2315,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                 )
                 if epoch == claim_epoch:
                     _checkpoint_error(run_id)
-                logger.warning("Run fenced", extra={"run_id": run_id, "code": "run_fenced"})
+                _codes.log_code(logger, _codes.RUN_FENCED, run_id=run_id)
                 raise RunFencedError(run_id, claim_epoch=claim_epoch)
         else:
             await self._fence(
@@ -2547,61 +2539,76 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         from dendrux.runtime._tracelink import validate_trace_link
 
         if validate_trace_link(trace_link) is None:
-            logger.warning(
-                "Invalid trace link", extra={"run_id": run_id, "code": "trace_link_invalid"}
-            )
+            _codes.log_code(logger, _codes.TRACE_LINK_INVALID, run_id=run_id)
             raise ValueError("Invalid trace link")
         async with self._session_factory() as session:
             await self._fence(session, run_id, claim_epoch, trace_link=trace_link)
             await session.commit()
 
+    def _frontier_predicate(self, column: Any, run_ids: Sequence[str]) -> Any:
+        from sqlalchemy import String, any_, bindparam, func, select
+
+        ids = sorted(set(run_ids))
+        if self._engine.dialect.name == "postgresql":
+            from sqlalchemy.dialects.postgresql import ARRAY
+
+            return column == any_(bindparam("frontier", ids, type_=ARRAY(String())))
+        # One JSON bind avoids SQLite's variable limit without a query per chunk.
+        values = func.json_each(json.dumps(ids)).table_valued("value")
+        return column.in_(select(values.c.value))
+
+    def _frontier_scope(self, statement: Any, tenant_id: TenantScope) -> Any:
+        from dendrux.db.models import AgentRun
+
+        if isinstance(tenant_id, _Unscoped):
+            return statement
+        _check_scope(tenant_id)
+        return statement.where(AgentRun.tenant_id.is_not_distinct_from(tenant_id))
+
     async def mark_cancel_requested(self, run_ids: Sequence[str], *, tenant_id: TenantScope) -> int:
-        """Mark a bounded frontier before a cancellation caller scans its children."""
+        """Mark a frontier in one statement before scanning its children."""
         from sqlalchemy import update
 
         from dendrux.db.models import AgentRun
 
-        count = 0
+        if not run_ids:
+            return 0
         async with self._session_factory() as session:
-            ids = sorted(set(run_ids))
-            for start in range(0, len(ids), _IN_CHUNK):
-                result = await session.execute(
-                    _apply_tenant_scope(
-                        update(AgentRun)
-                        .where(AgentRun.id.in_(ids[start : start + _IN_CHUNK]))
-                        .values(cancel_requested=True),
-                        tenant_id,
-                    )
+            result = await session.execute(
+                self._frontier_scope(
+                    update(AgentRun)
+                    .where(self._frontier_predicate(AgentRun.id, run_ids))
+                    .values(cancel_requested=True)
+                    .execution_options(synchronize_session=False),
+                    tenant_id,
                 )
-                count += int(getattr(result, "rowcount", 0))
+            )
             await session.commit()
-        return count
+            return int(getattr(result, "rowcount", 0))
 
     async def get_children_page(
         self, parent_ids: Sequence[str], *, after: str | None, limit: int, tenant_id: TenantScope
     ) -> list[str]:
-        """List the tenant-scoped children of a frontier by immutable run id."""
+        """Read one tenant-scoped keyset page of a marked frontier's children."""
         from sqlalchemy import select
 
         from dendrux.db.models import AgentRun
 
         _positive_page(limit)
-        size = min(limit, 1000)
-        frontier = sorted(set(parent_ids))
-        children: list[str] = []
+        if not parent_ids:
+            return []
+        statement = self._frontier_scope(
+            select(AgentRun.id).where(self._frontier_predicate(AgentRun.parent_run_id, parent_ids)),
+            tenant_id,
+        )
+        if after is not None:
+            statement = statement.where(AgentRun.id > after)
         async with self._session_factory() as session:
-            for start in range(0, len(frontier), _IN_CHUNK):
-                stmt = _apply_tenant_scope(
-                    select(AgentRun.id).where(
-                        AgentRun.parent_run_id.in_(frontier[start : start + _IN_CHUNK])
-                    ),
-                    tenant_id,
-                )
-                if after is not None:
-                    stmt = stmt.where(AgentRun.id > after)
-                page = list((await session.scalars(stmt.order_by(AgentRun.id).limit(size))).all())
-                children = sorted(set(children).union(page))[:size]
-        return children
+            return list(
+                (
+                    await session.scalars(statement.order_by(AgentRun.id).limit(min(limit, 500)))
+                ).all()
+            )
 
     async def get_loop_state(self, run_id: str) -> dict[str, Any] | None:
         """Read the authoritative execution projection."""
@@ -3386,12 +3393,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                     full = (await session.scalar(_note_count()) or 0) >= max_notes
                     if status is not None and status not in _TERMINAL_STATUS_VALUES and full:
                         await session.rollback()
-                        logger.warning(
-                            "note limit reached: run_id=%s code=note_limit limit=%d",
-                            run_id,
-                            max_notes,
-                            extra={"run_id": run_id, "code": "note_limit"},
-                        )
+                        _codes.log_code(logger, _codes.NOTE_LIMIT, run_id=run_id, limit=max_notes)
                         raise NoteLimitExceededError(run_id, limit=max_notes)
                 await session.commit()
                 return inserted
@@ -3786,11 +3788,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
 
                             current_id = (pause or {}).get("pause_id")
                             if current_id != expected_pause_id:
-                                logger.warning(
-                                    "Pause generation mismatch: run_id=%s code=pause_id_mismatch",
-                                    run_id,
-                                    extra={"run_id": run_id, "code": "pause_id_mismatch"},
-                                )
+                                _codes.log_code(logger, _codes.PAUSE_ID_MISMATCH, run_id=run_id)
                                 raise PauseStatusMismatchError(
                                     run_id,
                                     RunStatus(expected_status),
@@ -3884,10 +3882,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                     if submission is None:
                         from dendrux.errors import PersistenceError
 
-                        logger.warning(
-                            "Missing submission descriptor",
-                            extra={"run_id": run_id, "code": "submission_missing"},
-                        )
+                        _codes.log_code(logger, _codes.SUBMISSION_MISSING, run_id=run_id)
                         raise PersistenceError(code="submission_missing")
                     merged["submission"] = {
                         **{
@@ -4291,10 +4286,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         for bound in (batch_size, max_runs, max_returned, reclaim_limit):
             _positive_page(bound)
         if max(batch_size, max_runs, max_returned) > 100000:
-            logger.warning(
-                "Recovery scan limit exceeded",
-                extra={"run_id": None, "code": "recovery_scan_limit"},
-            )
+            _codes.log_code(logger, _codes.RECOVERY_SCAN_LIMIT, run_id=None)
             raise ValueError("Recovery scan bounds must not exceed 100000")
         if reclaim_limit > 32767:
             raise ValueError("reclaim_limit exceeds SMALLINT")
@@ -4355,10 +4347,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                             return None
                         if row.storage_format == 2 and row.loop not in ("react", "single_call"):
                             if on_stale != "error":
-                                logger.warning(
-                                    "Run has unknown recovery loop",
-                                    extra={"code": "loop_unknown", "run_id": run_id},
-                                )
+                                _codes.log_code(logger, _codes.LOOP_UNKNOWN, run_id=run_id)
                             if on_stale is None:
                                 return None
                         limit = (
@@ -4431,14 +4420,14 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                                 iteration_index=row.iteration_count or 0,
                             )
                             await session.commit()
-                            logger.warning(
-                                "Expired run finalised",
-                                extra={
-                                    "run_id": run_id,
-                                    "code": "legacy_run_swept"
+                            _codes.log_code(
+                                logger,
+                                _codes.REGISTRY[
+                                    "legacy_run_swept"
                                     if reason == "stale_running_legacy"
-                                    else reason or "cancel_requested",
-                                },
+                                    else reason or "cancel_requested"
+                                ],
+                                run_id=run_id,
                             )
                             return SweptRun(
                                 run_id,
@@ -4507,15 +4496,12 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                         result.legacy.append(item)
                 if inspected >= max_runs or len(result.reclaimable) >= max_returned:
                     if inspected >= max_runs:
-                        logger.warning(
-                            "Sweep candidate cap reached",
-                            extra={
-                                "run_id": None,
-                                "code": "sweep_cap_reached",
-                                "category": "running",
-                                "cap": max_runs,
-                                "inspected": inspected,
-                            },
+                        _codes.log_code(
+                            logger,
+                            _codes.SWEEP_CAP_REACHED,
+                            category="stale_running",
+                            cap=max_runs,
+                            inspected=inspected,
                         )
                     return MarkResult(
                         result.reclaimable, result.finalised, result.legacy, inspected, after
@@ -4572,9 +4558,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         from dendrux.errors import RunNotFoundError, RunNotReclaimableError
 
         if governance_policy not in ("warn", "raise"):
-            logger.warning(
-                "Invalid governance policy", extra={"run_id": run_id, "code": "governance_mismatch"}
-            )
+            _codes.log_code(logger, _codes.GOVERNANCE_MISMATCH, run_id=run_id)
             raise ValueError("governance_policy must be warn or raise")
 
         committed_token: ClaimResult | None = None
@@ -4666,10 +4650,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                     "digest"
                 )
                 if governance_changed:
-                    logger.warning(
-                        "Recovery governance mismatch",
-                        extra={"run_id": run_id, "code": "governance_mismatch"},
-                    )
+                    _codes.log_code(logger, _codes.GOVERNANCE_MISMATCH, run_id=run_id)
                     if governance_policy == "raise":
                         raise RunNotReclaimableError(run_id, "governance_changed")
                 pins = ((row.loop_state or {}).get("skills") or {}).get("pins", {})
@@ -4939,14 +4920,12 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                         )
                     )
         if visited == max_runs:
-            logger.warning(
-                "Sweep candidate cap reached",
-                extra={
-                    "code": "sweep_cap_reached",
-                    "category": "waiting" if waiting else "running",
-                    "cap": max_runs,
-                    "inspected": visited,
-                },
+            _codes.log_code(
+                logger,
+                _codes.SWEEP_CAP_REACHED,
+                category="abandoned_waiting" if waiting else "stale_running",
+                cap=max_runs,
+                inspected=visited,
             )
         return swept
 
@@ -5180,10 +5159,8 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
 
                     from dendrux.errors import BudgetConfigurationError
 
-                    logging.getLogger(__name__).warning(
-                        "Budget subtree bound reached: run_id=%s code=subtree_limit",
-                        root_id,
-                        extra={"run_id": root_id, "code": "subtree_limit"},
+                    _codes.log_code(
+                        logging.getLogger(__name__), _codes.SUBTREE_LIMIT, run_id=root_id
                     )
                     raise BudgetConfigurationError(reason="subtree_limit")
 
@@ -5675,7 +5652,7 @@ async def _insert_event(
     digest = event_digest(event_type, iteration_index, correlation_id, data)
 
     def conflict() -> NoReturn:
-        logger.warning("Retry content conflict", extra={"run_id": run_id, "code": "write_conflict"})
+        _codes.log_code(logger, _codes.WRITE_CONFLICT, run_id=run_id)
         raise PersistenceError(code="write_conflict")
 
     if content_digest is not None and content_digest != digest:
@@ -6000,7 +5977,7 @@ class _ClaimedStateStore:
                 started = time.monotonic()
                 result = await method(run_id, *args, **kwargs)
                 if name == "touch_progress" and result is False:
-                    logger.warning("Run fenced", extra={"run_id": run_id, "code": "run_fenced"})
+                    _codes.log_code(logger, _codes.RUN_FENCED, run_id=run_id)
                     raise RunFencedError(run_id, claim_epoch=self.claim_epoch)
                 if self.storage_format == 2 and name in self.progress_writes:
                     from dendrux.runtime.context import get_delegation_context
@@ -6019,10 +5996,7 @@ class _ClaimedStateStore:
                 if name in status_writes and (result is False or result is None):
                     control = await read_run_control(self._store, run_id)
                     if control.claim_epoch is not None and control.claim_epoch != self.claim_epoch:
-                        logger.warning(
-                            "Run fenced at status transition",
-                            extra={"run_id": run_id, "code": "run_fenced"},
-                        )
+                        _codes.log_code(logger, _codes.RUN_FENCED, run_id=run_id)
                 return result
 
             return fenced
@@ -6044,11 +6018,7 @@ class _ClaimedStateStore:
         ):
             from dendrux.errors import RunFencedError
 
-            logger.warning(
-                "Run fenced: run_id=%s code=run_fenced",
-                run_id,
-                extra={"run_id": run_id, "code": "run_fenced"},
-            )
+            _codes.log_code(logger, _codes.RUN_FENCED, run_id=run_id)
             raise RunFencedError(run_id, claim_epoch=self.claim_epoch)
         return control
 

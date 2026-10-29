@@ -32,6 +32,16 @@ class CompositeNotifier(BaseNotifier):
     def __init__(self, notifiers: list[LoopNotifier]) -> None:
         self._notifiers = list(notifiers)
 
+    @property
+    def _dendrux_otel(self) -> bool:
+        for notifier in self._notifiers:
+            try:
+                if getattr(notifier, "_dendrux_otel", False) is True:
+                    return True
+            except Exception:
+                continue
+        return False
+
     def trace_link(self, run_id: str) -> str | None:
         """Return the first valid run link exposed by a child notifier."""
         for notifier in self._notifiers:

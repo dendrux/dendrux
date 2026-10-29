@@ -162,11 +162,19 @@ async def test_database_stamped_early_is_detected_and_recovers(pg: Any) -> None:
     # Even un-migrated, a cross-tenant key reuse fails closed instead of leaking.
     store = SQLAlchemyStateStore(engine)
     await store.create_run(
-        "a1", "a", tenant_id="A", idempotency_key="k", idempotency_fingerprint="f"
+        "00000000000000000000000501",
+        "a",
+        tenant_id="A",
+        idempotency_key="k",
+        idempotency_fingerprint="f",
     )
     with pytest.raises(IdempotencyConflictError) as conflict:
         await store.create_run(
-            "b1", "a", tenant_id="B", idempotency_key="k", idempotency_fingerprint="f"
+            "00000000000000000000000502",
+            "a",
+            tenant_id="B",
+            idempotency_key="k",
+            idempotency_fingerprint="f",
         )
     assert conflict.value.run_id is None
 

@@ -151,16 +151,16 @@ class TestApprovalPlaceholders:
 class TestScope:
     async def test_tenant_is_required(self, store: RunStore) -> None:
         with pytest.raises(TypeError):
-            store.follow("r1")  # type: ignore[call-arg]
+            store.follow("00000000000000000000000301")  # type: ignore[call-arg]
         with pytest.raises(TypeError):
-            await store.get_pending("r1")  # type: ignore[call-arg]
+            await store.get_pending("00000000000000000000000301")  # type: ignore[call-arg]
 
     @pytest.mark.parametrize("bad", ["", 7, ["A"]])
     async def test_invalid_scope_fails_closed(self, store: RunStore, bad: Any) -> None:
         with pytest.raises(ValueError, match="tenant_id"):
-            store.follow("r1", tenant_id=bad)
+            store.follow("00000000000000000000000301", tenant_id=bad)
         with pytest.raises(ValueError, match="tenant_id"):
-            await store.get_pending("r1", tenant_id=bad)
+            await store.get_pending("00000000000000000000000301", tenant_id=bad)
 
     async def test_foreign_and_missing_runs_raise_not_found(
         self, state: Any, store: RunStore
@@ -186,70 +186,81 @@ class TestScope:
 
 class TestFollowLifecycle:
     async def test_terminal_run_drains_then_ends(self, state: Any, store: RunStore) -> None:
-        await state.create_run("r1", "a", tenant_id="T")
+        await state.create_run("00000000000000000000000301", "a", tenant_id="T")
         for i in range(3):
-            await state.save_run_event("r1", event_type=f"e{i}")
+            await state.save_run_event("00000000000000000000000301", event_type=f"e{i}")
         await state.finalize_with_event(
-            "r1", status="success", allowed_current_statuses=["running"], event_type="run.completed"
+            "00000000000000000000000301",
+            status="success",
+            allowed_current_statuses=["running"],
+            event_type="run.completed",
         )
-        items = await _collect(_feed(store).follow("r1", tenant_id="T"))
+        items = await _collect(_feed(store).follow("00000000000000000000000301", tenant_id="T"))
         assert _seqs(items) == [0, 1, 2, 3]
         assert items[-1] == FollowEnd("terminal", 3)
 
     async def test_drained_terminal_is_reported_at_start(self, state: Any, store: RunStore) -> None:
-        await state.create_run("r1", "a")
-        await state.save_run_event("r1", event_type="run.completed")
-        await state.finalize_run("r1", status="success")
+        await state.create_run("00000000000000000000000301", "a")
+        await state.save_run_event("00000000000000000000000301", event_type="run.completed")
+        await state.finalize_run("00000000000000000000000301", status="success")
         feed = _feed(store)
-        follow = feed.follow("r1", tenant_id=None, after_sequence_index=0)
+        follow = feed.follow("00000000000000000000000301", tenant_id=None, after_sequence_index=0)
         await follow.start()
         assert follow.drained_terminal
         assert [i async for i in follow] == [FollowEnd("terminal", 0)]
         assert feed.followers == 0
 
     async def test_live_run_ends_when_it_finishes(self, state: Any, store: RunStore) -> None:
-        await state.create_run("r1", "a")
+        await state.create_run("00000000000000000000000301", "a")
 
         async def finish() -> None:
             await asyncio.sleep(0.05)
-            await state.save_run_event("r1", event_type="tick")
-            await state.finalize_run("r1", status="error")  # no terminal event
+            await state.save_run_event("00000000000000000000000301", event_type="tick")
+            await state.finalize_run(
+                "00000000000000000000000301", status="error"
+            )  # no terminal event
 
         writer = asyncio.create_task(finish())
-        items = await _collect(_feed(store).follow("r1", tenant_id=None))
+        items = await _collect(_feed(store).follow("00000000000000000000000301", tenant_id=None))
         await writer
         assert _seqs(items) == [0]
         assert items[-1] == FollowEnd("terminal", 0)
 
     async def test_until_terminal_false_keeps_following(self, state: Any, store: RunStore) -> None:
-        await state.create_run("r1", "a")
-        await state.save_run_event("r1", event_type="x")
-        await state.finalize_run("r1", status="success")
-        follow = _feed(store).follow("r1", tenant_id=None, until_terminal=False)
+        await state.create_run("00000000000000000000000301", "a")
+        await state.save_run_event("00000000000000000000000301", event_type="x")
+        await state.finalize_run("00000000000000000000000301", status="success")
+        follow = _feed(store).follow(
+            "00000000000000000000000301", tenant_id=None, until_terminal=False
+        )
         async with follow as f:
             first = await asyncio.wait_for(anext(f), 5)
-            await state.save_run_event("r1", event_type="late")
+            await state.save_run_event("00000000000000000000000301", event_type="late")
             second = await asyncio.wait_for(anext(f), 5)
         assert (first.event_type, second.event_type) == ("x", "late")
 
     async def test_max_duration_ends_with_cursor(self, state: Any, store: RunStore) -> None:
-        await state.create_run("r1", "a")
-        await state.save_run_event("r1", event_type="tick")
-        items = await _collect(_feed(store).follow("r1", tenant_id=None, max_duration_s=0.1))
+        await state.create_run("00000000000000000000000301", "a")
+        await state.save_run_event("00000000000000000000000301", event_type="tick")
+        items = await _collect(
+            _feed(store).follow("00000000000000000000000301", tenant_id=None, max_duration_s=0.1)
+        )
         assert items[-1] == FollowEnd("max_duration", 0)
 
     async def test_heartbeat_when_idle(self, state: Any, store: RunStore) -> None:
-        await state.create_run("r1", "a")
-        async with _feed(store, heartbeat_s=0.02).follow("r1", tenant_id=None) as f:
+        await state.create_run("00000000000000000000000301", "a")
+        async with _feed(store, heartbeat_s=0.02).follow(
+            "00000000000000000000000301", tenant_id=None
+        ) as f:
             assert isinstance(await asyncio.wait_for(anext(f), 5), FollowHeartbeat)
 
     async def test_lagging_follower_ends_with_its_cursor(self, state: Any, store: RunStore) -> None:
-        await state.create_run("r1", "a")
-        async with _feed(store, buffer=2).follow("r1", tenant_id=None) as f:
+        await state.create_run("00000000000000000000000301", "a")
+        async with _feed(store, buffer=2).follow("00000000000000000000000301", tenant_id=None) as f:
             first = asyncio.ensure_future(anext(f))
             await asyncio.sleep(0.03)
             for i in range(6):
-                await state.save_run_event("r1", event_type=f"e{i}")
+                await state.save_run_event("00000000000000000000000301", event_type=f"e{i}")
             await asyncio.wait_for(first, 5)
             rest = [i async for i in f]
         assert isinstance(rest[-1], FollowEnd) and rest[-1].reason == "lagging"
@@ -258,7 +269,7 @@ class TestFollowLifecycle:
 
 class TestSharing:
     async def test_many_followers_share_one_poller(self, state: Any, store: RunStore) -> None:
-        await state.create_run("r1", "a")
+        await state.create_run("00000000000000000000000301", "a")
         feed = _feed(store)
         polls = {"n": 0}
         original = store.get_events
@@ -268,14 +279,14 @@ class TestSharing:
             return await original(run_id, **kw)
 
         store.get_events = counting  # type: ignore[method-assign]
-        follows = [feed.follow("r1", tenant_id=None) for _ in range(20)]
+        follows = [feed.follow("00000000000000000000000301", tenant_id=None) for _ in range(20)]
         for f in follows:
             await f.start()
         waiting = [asyncio.ensure_future(anext(f)) for f in follows]
         await asyncio.sleep(0.15)
         assert feed.watched_runs == 1 and feed.followers == 20
         assert polls["n"] < 30  # one poller, not twenty
-        await state.save_run_event("r1", event_type="hello")
+        await state.save_run_event("00000000000000000000000301", event_type="hello")
         items = await asyncio.wait_for(asyncio.gather(*waiting), 5)
         assert all(i.event_type == "hello" for i in items)
         for f in follows:
@@ -283,31 +294,33 @@ class TestSharing:
         assert feed.watched_runs == 0 and feed.followers == 0
 
     async def test_late_joiner_catches_up(self, state: Any, store: RunStore) -> None:
-        await state.create_run("r1", "a")
+        await state.create_run("00000000000000000000000301", "a")
         feed = _feed(store)
-        async with feed.follow("r1", tenant_id=None) as first:
+        async with feed.follow("00000000000000000000000301", tenant_id=None) as first:
             pending = asyncio.ensure_future(anext(first))
             await asyncio.sleep(0.03)
             for i in range(5):
-                await state.save_run_event("r1", event_type=f"e{i}")
+                await state.save_run_event("00000000000000000000000301", event_type=f"e{i}")
             await asyncio.wait_for(pending, 5)
             await asyncio.sleep(0.05)
-            async with feed.follow("r1", tenant_id=None) as late:
+            async with feed.follow("00000000000000000000000301", tenant_id=None) as late:
                 got = [(await anext(late)).sequence_index for _ in range(5)]
         assert got == [0, 1, 2, 3, 4]
 
     async def test_bogus_cursor_does_not_hide_events_from_others(
         self, state: Any, store: RunStore
     ) -> None:
-        await state.create_run("r1", "a")
+        await state.create_run("00000000000000000000000301", "a")
         feed = _feed(store)
-        liar = feed.follow("r1", tenant_id=None, after_sequence_index=10_000)
-        honest = feed.follow("r1", tenant_id=None)
+        liar = feed.follow(
+            "00000000000000000000000301", tenant_id=None, after_sequence_index=10_000
+        )
+        honest = feed.follow("00000000000000000000000301", tenant_id=None)
         liar_next = asyncio.ensure_future(anext(liar))
         await asyncio.sleep(0.03)
         honest_next = asyncio.ensure_future(anext(honest))
         await asyncio.sleep(0.03)
-        await state.save_run_event("r1", event_type="real")
+        await state.save_run_event("00000000000000000000000301", event_type="real")
         assert (await asyncio.wait_for(honest_next, 5)).event_type == "real"
         liar_next.cancel()
         with contextlib.suppress(asyncio.CancelledError):
@@ -316,12 +329,15 @@ class TestSharing:
         await honest.aclose()
 
     async def test_capacity_is_enforced_and_released(self, state: Any, store: RunStore) -> None:
-        await state.create_run("r1", "a")
+        await state.create_run("00000000000000000000000301", "a")
         feed = _feed(store, max_followers=2, max_followers_per_tenant=None)  # global cap only
-        a, b = feed.follow("r1", tenant_id=None), feed.follow("r1", tenant_id=None)
+        a, b = (
+            feed.follow("00000000000000000000000301", tenant_id=None),
+            feed.follow("00000000000000000000000301", tenant_id=None),
+        )
         await a.start()
         await b.start()
-        c = feed.follow("r1", tenant_id=None)
+        c = feed.follow("00000000000000000000000301", tenant_id=None)
         with pytest.raises(FollowCapacityError) as caught:
             await c.start()
         assert caught.value.limit == 2
@@ -336,16 +352,28 @@ class TestSharing:
 
 class TestFollowRedaction:
     async def test_active_pause_args_visible_past_hidden(self, state: Any, store: RunStore) -> None:
-        await state.create_run("r1", "a", tenant_id="T")
-        await state.save_run_event("r1", event_type="run.started", data={"system_prompt": "S"})
-        await state.save_run_event("r1", event_type="run.paused", data=_PAUSED)  # past
-        await state.save_run_event("r1", event_type="run.resumed", data={})
-        await state.save_run_event("r1", event_type="run.paused", data=_PAUSED)  # active
-        await state.pause_run("r1", status="waiting_client_tool", pause_data={"x": 1})
-        async with _feed(store).follow("r1", tenant_id="T") as f:
+        await state.create_run("00000000000000000000000301", "a", tenant_id="T")
+        await state.save_run_event(
+            "00000000000000000000000301", event_type="run.started", data={"system_prompt": "S"}
+        )
+        await state.save_run_event(
+            "00000000000000000000000301", event_type="run.paused", data=_PAUSED
+        )  # past
+        await state.save_run_event("00000000000000000000000301", event_type="run.resumed", data={})
+        await state.save_run_event(
+            "00000000000000000000000301", event_type="run.paused", data=_PAUSED
+        )  # active
+        await state.pause_run(
+            "00000000000000000000000301", status="waiting_client_tool", pause_data={"x": 1}
+        )
+        async with _feed(store).follow("00000000000000000000000301", tenant_id="T") as f:
             items = [await asyncio.wait_for(anext(f), 5) for _ in range(4)]
-            await state.save_run_event("r1", event_type="run.resumed", data={})
-            await state.save_run_event("r1", event_type="run.paused", data=_PAUSED)  # live
+            await state.save_run_event(
+                "00000000000000000000000301", event_type="run.resumed", data={}
+            )
+            await state.save_run_event(
+                "00000000000000000000000301", event_type="run.paused", data=_PAUSED
+            )  # live
             live = [await asyncio.wait_for(anext(f), 5) for _ in range(2)]
         assert "system_prompt" not in items[0].data
         assert "params" not in items[1].data["pending_tool_calls"][0]
@@ -353,10 +381,14 @@ class TestFollowRedaction:
         assert live[1].data["pending_tool_calls"][0]["params"] == {"s": 1}
 
     async def test_include_payloads_shows_everything(self, state: Any, store: RunStore) -> None:
-        await state.create_run("r1", "a")
-        await state.save_run_event("r1", event_type="run.started", data={"system_prompt": "S"})
-        await state.finalize_run("r1", status="success")
-        items = await _collect(_feed(store).follow("r1", tenant_id=None, include_payloads=True))
+        await state.create_run("00000000000000000000000301", "a")
+        await state.save_run_event(
+            "00000000000000000000000301", event_type="run.started", data={"system_prompt": "S"}
+        )
+        await state.finalize_run("00000000000000000000000301", status="success")
+        items = await _collect(
+            _feed(store).follow("00000000000000000000000301", tenant_id=None, include_payloads=True)
+        )
         assert items[0].data == {"system_prompt": "S"}
 
 
@@ -389,10 +421,10 @@ class TestFixRound:
     async def test_overflow_never_accepts_6_10_15_after_a_gap(
         self, state: Any, store: RunStore
     ) -> None:
-        await state.create_run("r1", "a")
-        await state.save_run_event("r1", event_type="tick")
+        await state.create_run("00000000000000000000000301", "a")
+        await state.save_run_event("00000000000000000000000301", event_type="tick")
         feed = _feed(store, buffer=5)
-        async with feed.follow("r1", tenant_id=None) as follow:
+        async with feed.follow("00000000000000000000000301", tenant_id=None) as follow:
             assert (await anext(follow)).sequence_index == 0
             follower = follow._follower
             assert follower is not None
@@ -410,10 +442,12 @@ class TestFixRound:
     async def test_duration_bounds_slow_delivery(
         self, state: Any, store: RunStore, live: bool
     ) -> None:
-        await state.create_run("r1", "a")
+        await state.create_run("00000000000000000000000301", "a")
         for _ in range(3):
-            await state.save_run_event("r1", event_type="tick")
-        async with _feed(store).follow("r1", tenant_id=None, max_duration_s=0.04) as follow:
+            await state.save_run_event("00000000000000000000000301", event_type="tick")
+        async with _feed(store).follow(
+            "00000000000000000000000301", tenant_id=None, max_duration_s=0.04
+        ) as follow:
             first = await anext(follow)
             if live:
                 # Skip catch-up for this variant and replenish the live queue.
@@ -428,14 +462,16 @@ class TestFixRound:
     async def test_blocked_read_obeys_duration(
         self, state: Any, store: RunStore, monkeypatch: Any
     ) -> None:
-        await state.create_run("r1", "a")
-        await state.save_run_event("r1", event_type="tick")
+        await state.create_run("00000000000000000000000301", "a")
+        await state.save_run_event("00000000000000000000000301", event_type="tick")
 
         async def blocked(*a: Any, **kw: Any) -> Any:
             await asyncio.Event().wait()
 
         monkeypatch.setattr(store, "get_events", blocked)
-        async with _feed(store).follow("r1", tenant_id=None, max_duration_s=0.03) as follow:
+        async with _feed(store).follow(
+            "00000000000000000000000301", tenant_id=None, max_duration_s=0.03
+        ) as follow:
             assert await anext(follow) == FollowEnd("max_duration", None)
 
     @pytest.mark.parametrize("mode", ["break", "exception", "gc", "cancel", "start_only"])
@@ -444,11 +480,11 @@ class TestFixRound:
     ) -> None:
         import gc
 
-        await state.create_run("r1", "a")
-        await state.save_run_event("r1", event_type="tick")
+        await state.create_run("00000000000000000000000301", "a")
+        await state.save_run_event("00000000000000000000000301", event_type="tick")
         feed = _feed(store)
         for _ in range(600 if mode == "break" else 3):
-            follow = feed.follow("r1", tenant_id=None)
+            follow = feed.follow("00000000000000000000000301", tenant_id=None)
             if mode == "start_only":
                 await follow.start()
             elif mode == "cancel":
@@ -480,8 +516,8 @@ class TestFixRound:
     async def test_slow_cancellation_stays_tracked(
         self, state: Any, store: RunStore, monkeypatch: Any
     ) -> None:
-        await state.create_run("r1", "a")
-        await state.save_run_event("r1", event_type="tick")
+        await state.create_run("00000000000000000000000301", "a")
+        await state.save_run_event("00000000000000000000000301", event_type="tick")
         entered, cancelled, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
         original = store.get_events
 
@@ -498,15 +534,15 @@ class TestFixRound:
 
         monkeypatch.setattr(store, "get_events", slow)
         feed = _feed(store, max_followers=1, stop_timeout_s=0.001)
-        follow = feed.follow("r1", tenant_id=None)
+        follow = feed.follow("00000000000000000000000301", tenant_id=None)
         await anext(follow)
         await entered.wait()
-        poller = feed._feeds["r1"].task
+        poller = feed._feeds["00000000000000000000000301"].task
         await follow.aclose()
         assert cancelled.is_set() and not poller.done()
         assert feed.followers == 0 and feed.watched_runs == 1
         with pytest.raises(FollowCapacityError):
-            await feed.follow("r1", tenant_id=None).start()
+            await feed.follow("00000000000000000000000301", tenant_id=None).start()
         shutdown = asyncio.create_task(feed.aclose())
         await asyncio.sleep(0)
         shutdown.cancel()
@@ -523,21 +559,29 @@ class TestFixRound:
     async def test_active_pause_is_refreshed_before_delivery(
         self, state: Any, store: RunStore, transition: str
     ) -> None:
-        await state.create_run("r1", "a")
-        await state.save_run_event("r1", event_type="run.paused", data=_PAUSED)
-        await state.pause_run("r1", status="waiting_client_tool", pause_data={})
-        follow = _feed(store).follow("r1", tenant_id=None)
+        await state.create_run("00000000000000000000000301", "a")
+        await state.save_run_event(
+            "00000000000000000000000301", event_type="run.paused", data=_PAUSED
+        )
+        await state.pause_run(
+            "00000000000000000000000301", status="waiting_client_tool", pause_data={}
+        )
+        follow = _feed(store).follow("00000000000000000000000301", tenant_id=None)
         await follow.start()
         if transition == "terminal":
-            await state.finalize_run("r1", status="success")
+            await state.finalize_run("00000000000000000000000301", status="success")
         elif transition == "resume_event_only":
-            await state.save_run_event("r1", event_type="run.resumed")
+            await state.save_run_event("00000000000000000000000301", event_type="run.resumed")
         elif transition == "resume":
-            await state.claim_paused_run("r1", expected_status="waiting_client_tool")
-            await state.save_run_event("r1", event_type="run.resumed")
+            await state.claim_paused_run(
+                "00000000000000000000000301", expected_status="waiting_client_tool"
+            )
+            await state.save_run_event("00000000000000000000000301", event_type="run.resumed")
         else:
-            await state.save_run_event("r1", event_type="run.resumed")
-            await state.save_run_event("r1", event_type="run.paused", data=_PAUSED)
+            await state.save_run_event("00000000000000000000000301", event_type="run.resumed")
+            await state.save_run_event(
+                "00000000000000000000000301", event_type="run.paused", data=_PAUSED
+            )
         async with follow:
             old = await anext(follow)
         assert "params" not in old.data["pending_tool_calls"][0]
@@ -547,9 +591,11 @@ class TestFixRound:
     ) -> None:
         from sqlalchemy import event
 
-        await state.create_run("r1", "a")
+        await state.create_run("00000000000000000000000301", "a")
         await state.pause_run(
-            "r1", status="waiting_client_tool", pause_data={"history": ["x" * 10000]}
+            "00000000000000000000000301",
+            status="waiting_client_tool",
+            pause_data={"history": ["x" * 10000]},
         )
         queries = []
 
@@ -558,7 +604,9 @@ class TestFixRound:
 
         event.listen(engine.sync_engine, "before_cursor_execute", capture)
         try:
-            async with _feed(store, heartbeat_s=0.04).follow("r1", tenant_id=None) as follow:
+            async with _feed(store, heartbeat_s=0.04).follow(
+                "00000000000000000000000301", tenant_id=None
+            ) as follow:
                 await anext(follow)
         finally:
             event.remove(engine.sync_engine, "before_cursor_execute", capture)
@@ -567,9 +615,9 @@ class TestFixRound:
 
 
 async def test_closed_feed_cannot_start_a_preacquired_follower(state: Any, store: RunStore) -> None:
-    await state.create_run("r1", "a")
+    await state.create_run("00000000000000000000000301", "a")
     feed = _feed(store)
-    follow = feed.follow("r1", tenant_id=None)
+    follow = feed.follow("00000000000000000000000301", tenant_id=None)
     await follow.start()
     await feed.aclose()
     with pytest.raises(RuntimeError, match="closed"):

@@ -7,6 +7,7 @@ import logging
 import weakref
 from typing import Any, NoReturn
 
+from dendrux import _codes
 from dendrux.errors import StoreCapabilityError
 from dendrux.runtime.state import StoreCapabilities
 
@@ -99,7 +100,7 @@ def validate_capabilities(store: Any) -> StoreCapabilities:
 
 
 def _refuse(store: Any, capability: str, method: str, missing: tuple[str, ...]) -> NoReturn:
-    logger.warning("Store capability mismatch", extra={"run_id": None, "code": "store_capability"})
+    _codes.log_code(logger, _codes.STORE_CAPABILITY, run_id=None)
     raise StoreCapabilityError(type(store).__name__, capability, method, missing)
 
 

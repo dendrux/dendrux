@@ -20,6 +20,7 @@ import logging
 import warnings
 from typing import TYPE_CHECKING, Any, TypeVar, cast
 
+from dendrux import _codes
 from dendrux._sentinel import _OmittedType
 from dendrux.errors import TenantScopeRequiredError
 from dendrux.runtime.context import get_delegation_context
@@ -58,11 +59,7 @@ def resolve_tenant(
     if getattr(agent, "_strict_tenancy", False):
         parent = get_delegation_context()
         if parent is None:
-            logger.warning(
-                "tenant_id omitted under strict tenancy: entry=%s code=tenant_scope_required",
-                entry,
-                extra={"code": "tenant_scope_required", "entry": entry},
-            )
+            _codes.log_code(logger, _codes.TENANT_SCOPE_REQUIRED, entry=entry)
             raise TenantScopeRequiredError(entry)
         if entry in _NEW_RUN_ENTRIES:
             return default  # resolve_child_tenant inherits the parent's tenant
@@ -150,11 +147,7 @@ def check_run_metadata(metadata: Any, *, limit: int, entry: str = "run") -> None
         k for k in metadata if isinstance(k, str) and k.startswith(RESERVED_METADATA_PREFIX)
     )
     if reserved:
-        logger.warning(
-            "reserved metadata key rejected: entry=%s code=reserved_metadata_key",
-            entry,
-            extra={"code": "reserved_metadata_key", "entry": entry},
-        )
+        _codes.log_code(logger, _codes.RESERVED_METADATA_KEY, entry=entry)
         raise ValueError(
             f"metadata keys starting with {RESERVED_METADATA_PREFIX!r} are reserved for "
             f"dendrux (count={len(reserved)}). Rename them."
@@ -194,14 +187,7 @@ def _check_size(value: Any, *, limit: int, entry: str, what: str) -> None:
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{what} must be JSON-serializable.") from exc
     if size > limit:
-        logger.warning(
-            "%s over the size cap: entry=%s code=metadata_too_large bytes=%d limit=%d",
-            what,
-            entry,
-            size,
-            limit,
-            extra={"code": "metadata_too_large", "entry": entry},
-        )
+        _codes.log_code(logger, _codes.METADATA_TOO_LARGE, entry=entry, bytes=size, limit=limit)
         raise ValueError(
             f"{what} is {size} bytes of JSON, over the {limit}-byte limit "
             "(Limits.max_metadata_bytes)."

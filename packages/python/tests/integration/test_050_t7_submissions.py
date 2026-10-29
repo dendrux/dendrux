@@ -42,7 +42,7 @@ async def test_every_submit_validates_pause_generation(store, entry):
         action = a.submit_approval(paused.run_id, expected_pause_id="stale", **kwargs)
     else:
         a = agent(store, [LLMResponse(text="done")])
-        await store.create_run("seed", "integrity")
+        await store.create_run("00000000000000000000000106", "integrity")
         pause = PauseState(
             agent_name="integrity",
             pending_tool_calls=[],
@@ -54,16 +54,24 @@ async def test_every_submit_validates_pause_generation(store, entry):
             pause_id="current",
         )
         status = "waiting_human_input" if entry == "input" else "paused"
-        await store.pause_run("seed", status=status, pause_data=pause.to_dict())
-        paused = type("Paused", (), {"run_id": "seed", "status": RunStatus(status)})()
+        await store.pause_run(
+            "00000000000000000000000106", status=status, pause_data=pause.to_dict()
+        )
+        paused = type(
+            "Paused", (), {"run_id": "00000000000000000000000106", "status": RunStatus(status)}
+        )()
         if entry == "input":
-            action = a.submit_input("seed", "answer", expected_pause_id="stale")
+            action = a.submit_input(
+                "00000000000000000000000106", "answer", expected_pause_id="stale"
+            )
         elif entry == "paused":
-            action = a.submit_resume("seed", expected_pause_id="stale")
+            action = a.submit_resume("00000000000000000000000106", expected_pause_id="stale")
         elif entry == "resume":
-            action = a.resume("seed", expected_pause_id="stale")
+            action = a.resume("00000000000000000000000106", expected_pause_id="stale")
         else:
-            action = consume(a.resume_stream("seed", expected_pause_id="stale"))
+            action = consume(
+                a.resume_stream("00000000000000000000000106", expected_pause_id="stale")
+            )
     if entry == "resume_stream":
         result, _ = await action
         assert result.status == RunStatus.ERROR
@@ -75,12 +83,16 @@ async def test_every_submit_validates_pause_generation(store, entry):
 
 
 async def test_plain_store_claim_checks_token_in_transaction(store):
-    await store.create_run("seed", "integrity")
-    await store.pause_run("seed", status="paused", pause_data={"pause_id": "current"})
+    await store.create_run("00000000000000000000000106", "integrity")
+    await store.pause_run(
+        "00000000000000000000000106", status="paused", pause_data={"pause_id": "current"}
+    )
     with pytest.raises(PauseStatusMismatchError):
-        await store.claim_paused_run("seed", expected_status="paused", expected_pause_id="stale")
-    assert (await store.get_run("seed")).status == "paused"
-    assert (await store.get_run_control("seed")).claim_epoch == 0
+        await store.claim_paused_run(
+            "00000000000000000000000106", expected_status="paused", expected_pause_id="stale"
+        )
+    assert (await store.get_run("00000000000000000000000106")).status == "paused"
+    assert (await store.get_run_control("00000000000000000000000106")).claim_epoch == 0
 
 
 async def test_strict_tenancy_warns_without_pause_token(store):

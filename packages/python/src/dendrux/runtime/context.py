@@ -29,6 +29,8 @@ from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, TypeVar
 
+from dendrux import _codes
+
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, AsyncIterator, Awaitable
 
@@ -408,17 +410,12 @@ async def _renew_claim(ctx: DelegationContext) -> None:
             raise
         except Exception:
             ctx._lease_failures[0] += 1
-            logger.warning(
-                "Lease renewal failed",
-                extra={
-                    "run_id": ctx.run_id,
-                    "code": "lease_renew_failed",
-                    "attempt": ctx._lease_failures[0],
-                },
+            _codes.log_code(
+                logger, _codes.LEASE_RENEW_FAILED, run_id=ctx.run_id, attempt=ctx._lease_failures[0]
             )
             if ctx._lease_failures[0] >= 2:
                 ctx._lease_errors[0] = PersistenceError(code="lease_lost")
-                logger.warning("Lease lost", extra={"run_id": ctx.run_id, "code": "lease_lost"})
+                _codes.log_code(logger, _codes.LEASE_LOST, run_id=ctx.run_id)
 
 
 @contextlib.asynccontextmanager

@@ -18,8 +18,8 @@ def test_unpickling_recovery_errors_does_not_repeat_failure_logs(caplog):
     from dendrux.errors import RunCancelledError, RunNotReclaimableError
 
     for error in (
-        RunNotReclaimableError("run", "loop_unknown"),
-        RunCancelledError("run", "parent"),
+        RunNotReclaimableError("00000000000000000000000401", "loop_unknown"),
+        RunCancelledError("00000000000000000000000401", "00000000000000000000000402"),
     ):
         before = len(caplog.records)
         restored = pickle.loads(pickle.dumps(error))

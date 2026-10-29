@@ -222,7 +222,9 @@ class TestResultCap:
         limiter.limits = limits
         lookups = build_tool_lookups([big_text], call_limiter=limiter)
         result = await _execute_tool(
-            ToolCall(name="big_text", params={"n": 5000}), lookups, run_id="r"
+            ToolCall(name="big_text", params={"n": 5000}),
+            lookups,
+            run_id="00000000000000000000000102",
         )
         assert result.success is True
         assert len(result.payload.encode()) <= 1000
@@ -334,15 +336,19 @@ class TestInputCap:
         agent = _capped_agent()
         big = "x" * 17
         with pytest.raises(ValueError, match="user_input"):
-            await agent.resume("run-1", user_input=big)
+            await agent.resume("00000000000000000000000107", user_input=big)
         with pytest.raises(ValueError, match="user_input"):
-            await agent.submit_input("run-1", big)
+            await agent.submit_input("00000000000000000000000107", big)
         with pytest.raises(ValueError, match="rejection_reason"):
-            await agent.submit_approval("run-1", approved=False, rejection_reason=big)
+            await agent.submit_approval(
+                "00000000000000000000000107", approved=False, rejection_reason=big
+            )
         with pytest.raises(ValueError, match="decision reasons"):
-            await agent.submit_approval("run-1", decisions={"c1": ApprovalDecision.deny(big)})
+            await agent.submit_approval(
+                "00000000000000000000000107", decisions={"c1": ApprovalDecision.deny(big)}
+            )
         with pytest.raises(ValueError, match="user_input"):
-            agent.resume_stream("run-1", user_input=big)
+            agent.resume_stream("00000000000000000000000107", user_input=big)
 
     async def test_direct_runner_callers_are_capped(self) -> None:
         llm = MockLLM([LLMResponse(text="ok")])
@@ -363,8 +369,8 @@ class TestInputCap:
     ) -> None:
         agent = _capped_agent()
         with caplog.at_level("WARNING"), pytest.raises(ValueError):
-            await agent.submit_input("run-9", "x" * 40)
+            await agent.submit_input("00000000000000000000000108", "x" * 40)
         [record] = [r for r in caplog.records if "input_size_limit" in r.getMessage()]
         message = record.getMessage()
-        assert "run_id=run-9" in message and "bytes=40" in message
+        assert record.run_id == "00000000000000000000000108" and record.bytes == 40
         assert "xxxx" not in message

@@ -307,7 +307,7 @@ async def test_p2_missing_tenant_always_requires_scope(store, strict, monkeypatc
     io = AsyncMock(side_effect=AssertionError("tenant validation must precede I/O"))
     monkeypatch.setattr(agent, "_resolve_state_store", io)
     with pytest.raises(TenantScopeRequiredError):
-        await agent.reclaim("run")
+        await agent.reclaim("00000000000000000000000403")
     io.assert_not_called()
 
 

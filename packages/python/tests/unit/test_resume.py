@@ -489,7 +489,7 @@ class TestResumeWithInput:
             trace_order_offset=2,
             usage=UsageStats(input_tokens=50, output_tokens=20, total_tokens=70),
         )
-        run_id = "test_clarification_run"
+        run_id = "00000000000000000000000118"
         store._pause_data[run_id] = pause_state.to_dict()
         store._run_status[run_id] = "waiting_human_input"
 

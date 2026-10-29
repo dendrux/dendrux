@@ -10,6 +10,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Literal, cast
 
+from dendrux import _codes
+
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
@@ -219,11 +221,7 @@ _METADATA_KEY = re.compile(r"[A-Za-z0-9_\-]{1,128}")
 
 
 def _invalid(argument: str, problem: str) -> ValueError:
-    logger.warning(
-        "invalid read argument: argument=%s code=read_argument_invalid",
-        argument,
-        extra={"code": "read_argument_invalid", "argument": argument},
-    )
+    _codes.log_code(logger, _codes.READ_ARGUMENT_INVALID, argument=argument)
     return ValueError(f"{argument} {problem}")
 
 
@@ -507,12 +505,7 @@ async def _pg_pause_summary(state: Any, run_id: str, tenant_id: TenantScope) -> 
     except DBAPIError as exc:
         if not _unconvertible_json(exc):
             raise
-        logger.warning(
-            "pause state is not convertible to jsonb; read whole: "
-            "run_id=%s code=pause_data_not_jsonb",
-            run_id,
-            extra={"run_id": run_id, "code": "pause_data_not_jsonb"},
-        )
+        _codes.log_code(logger, _codes.PAUSE_DATA_NOT_JSONB, run_id=run_id)
         return await _whole_pause_summary(state, run_id, tenant_id)
     if row is None:
         return None

@@ -589,12 +589,14 @@ class TestObservability:
         wire(provider, json_handler(429, body))
         with caplog.at_level(logging.WARNING, logger="dendrux.llm._resilience"):
             with pytest.raises(ProviderRateLimitError):
-                await provider.complete(USER, run_id="run_42")
+                await provider.complete(USER, run_id="01ARZ3NDEKTSV4RRFFQ69G5FAV")
             with pytest.raises(ProviderRateLimitError):
-                await drain(provider.complete_stream(USER, run_id="run_42"))
-        lines = [r.getMessage() for r in caplog.records if "provider.error" in r.getMessage()]
+                await drain(provider.complete_stream(USER, run_id="01ARZ3NDEKTSV4RRFFQ69G5FAV"))
+        lines = [r for r in caplog.records if getattr(r, "kind", None) == "provider"]
         assert len(lines) == 2
-        assert all("run_id=run_42" in line and "category=rate_limit" in line for line in lines)
+        assert all(
+            r.run_id == "01ARZ3NDEKTSV4RRFFQ69G5FAV" and r.category == "rate_limit" for r in lines
+        )
         assert SECRET not in caplog.text
 
 

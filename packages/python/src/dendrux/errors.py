@@ -60,6 +60,8 @@ import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, TypeAlias, get_args
 
+from dendrux import _codes
+
 if TYPE_CHECKING:
     from collections.abc import Iterable
     from types import TracebackType
@@ -147,9 +149,8 @@ class RunNotReclaimableError(_KwargsReduceMixin, RunControlError):
     def __init__(self, run_id: str, reason: str) -> None:
         self.run_id = run_id
         self.reason = reason
-        logging.getLogger(__name__).warning(
-            "Run cannot be reclaimed",
-            extra={"run_id": run_id, "code": "run_not_reclaimable", "reason": reason},
+        _codes.log_code(
+            logging.getLogger(__name__), _codes.RUN_NOT_RECLAIMABLE, run_id=run_id, reason=reason
         )
         super().__init__(f"Run '{run_id}' cannot be reclaimed ({reason}).")
 
@@ -165,9 +166,7 @@ class RunCancelledError(_KwargsReduceMixin, RunControlError):
     def __init__(self, run_id: str, parent_run_id: str) -> None:
         self.run_id = run_id
         self.parent_run_id = parent_run_id
-        logging.getLogger(__name__).warning(
-            "Child admission refused", extra={"run_id": run_id, "code": "run_cancelled"}
-        )
+        _codes.log_code(logging.getLogger(__name__), _codes.RUN_CANCELLED, run_id=run_id)
         super().__init__(f"Run '{run_id}' cannot start under parent '{parent_run_id}'.")
 
 
@@ -176,9 +175,7 @@ class NotifierUnavailableError(RuntimeError):
 
     def __init__(self, reason: str) -> None:
         self.reason = reason
-        logging.getLogger(__name__).warning(
-            "Notifier unavailable", extra={"run_id": None, "code": "notifier_unavailable"}
-        )
+        _codes.log_code(logging.getLogger(__name__), _codes.NOTIFIER_UNAVAILABLE, run_id=None)
         super().__init__(f"Notifier unavailable ({reason}).")
 
 

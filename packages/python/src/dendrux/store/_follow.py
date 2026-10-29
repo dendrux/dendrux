@@ -30,6 +30,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, TypeAlias, Union
 
+from dendrux import _codes
 from dendrux._sentinel import _UnsetType
 from dendrux.errors import RunNotFoundError
 from dendrux.runtime._pending import approval_calls as approval_calls
@@ -359,12 +360,7 @@ class _RunFeed:
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.warning(
-                "run feed failed: run_id=%s code=follow_feed_error",
-                self.run_id,
-                exc_info=True,
-                extra={"run_id": self.run_id, "code": "follow_feed_error"},
-            )
+            _codes.log_code(logger, _codes.FOLLOW_FEED_ERROR, run_id=self.run_id)
             for follower in list(self.followers):
                 follower.end("error")
 
@@ -491,11 +487,7 @@ class EventFeed:
             raise RuntimeError("This event feed is closed.")
         closing = sum(f.closing for f in self._feeds.values())
         if self._open + closing >= self.max_followers:
-            logger.warning(
-                "follower limit reached: code=follow_capacity limit=%d",
-                self.max_followers,
-                extra={"code": "follow_capacity"},
-            )
+            _codes.log_code(logger, _codes.FOLLOW_CAPACITY, limit=self.max_followers)
             raise FollowCapacityError(self.max_followers)
         self._take_tenant_slot(tenant_id)
         self._open += 1
@@ -509,11 +501,7 @@ class EventFeed:
         held = self._by_scope.get(key, 0)
         if held >= cap:
             # The tenant id is caller data: never logged.
-            logger.warning(
-                "per-tenant follower limit reached: code=follow_tenant_capacity limit=%d",
-                cap,
-                extra={"code": "follow_tenant_capacity"},
-            )
+            _codes.log_code(logger, _codes.FOLLOW_TENANT_CAPACITY, limit=cap)
             raise FollowCapacityError(cap, per_tenant=True)
         self._by_scope[key] = held + 1
 
@@ -794,11 +782,7 @@ class Follow:
                     # Timeout/caller cancellation leaves the task tracked in EventFeed.
                     _, pending = await asyncio.wait({poller}, timeout=owner.stop_timeout_s)
                     if pending:
-                        logger.warning(
-                            "poller shutdown pending: run_id=%s code=follow_shutdown_pending",
-                            self.run_id,
-                            extra={"run_id": self.run_id, "code": "follow_shutdown_pending"},
-                        )
+                        _codes.log_code(logger, _codes.FOLLOW_SHUTDOWN_PENDING, run_id=self.run_id)
 
 
 async def _feed_view(

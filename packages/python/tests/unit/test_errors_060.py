@@ -16,8 +16,8 @@ def test_run_control_hierarchy_and_copy():
     ]:
         assert issubclass(cls, base) and issubclass(cls, RuntimeError)
     for original in [
-        errors.RunNotReclaimableError("run", "lease_fresh"),
-        errors.RunCancelledError("run", "parent"),
+        errors.RunNotReclaimableError("00000000000000000000000401", "lease_fresh"),
+        errors.RunCancelledError("00000000000000000000000401", "00000000000000000000000402"),
     ]:
         restored = pickle.loads(pickle.dumps(original))
         assert type(restored) is type(original) and vars(restored) == vars(original)

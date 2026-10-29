@@ -91,6 +91,8 @@ class OpenTelemetryNotifier(BaseNotifier):
         )
     """
 
+    _dendrux_otel = True
+
     def __init__(
         self,
         tracer: Tracer | None = None,

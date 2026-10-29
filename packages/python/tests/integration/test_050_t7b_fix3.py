@@ -29,7 +29,7 @@ async def test_default_running_bound_reaches_orphan_after_target_concurrency(sto
                 AgentRun.__table__.insert(),
                 [
                     {
-                        "id": f"live-{i:05}",
+                        "id": f"{i:026d}",
                         "agent_name": "live",
                         "status": "running",
                         "last_progress_at": now,
@@ -40,14 +40,14 @@ async def test_default_running_bound_reaches_orphan_after_target_concurrency(sto
         await conn.execute(
             AgentRun.__table__.insert(),
             {
-                "id": "orphan-newer",
+                "id": "00000000000000000000002000",
                 "agent_name": "lost",
                 "status": "running",
                 "last_progress_at": old,
             },
         )
     result = await sweep(state_store=store, stale_running=dt.timedelta(days=1))
-    assert [r.run_id for r in result.stale_running] == ["orphan-newer"], (
+    assert [r.run_id for r in result.stale_running] == ["00000000000000000000002000"], (
         "default running bound must reach newer orphans behind >1000 live runs"
     )
 
@@ -74,7 +74,7 @@ async def test_sweep_candidate_cap_warns_with_safe_structured_fields(
     records = [r for r in caplog.records if getattr(r, "code", None) == "sweep_cap_reached"]
     assert len(records) == 1, "candidate saturation must never be silent"
     record = records[0]
-    assert record.category == ("waiting" if waiting else "running")
+    assert record.category == ("abandoned_waiting" if waiting else "stale_running")
     assert record.cap == record.inspected == 2
     assert record.levelname == "WARNING"
     assert "cap-" not in record.getMessage()

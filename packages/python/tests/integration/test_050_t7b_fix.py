@@ -114,14 +114,14 @@ async def test_ambiguous_usage_commit_has_one_row(store, monkeypatch):
 
 
 async def test_cancel_result_discloses_failed_persistence(store, monkeypatch):
-    await store.create_run("cancel-write", agent_name="a", input_data={})
+    await store.create_run("00000000000000000000000103", agent_name="a", input_data={})
 
     async def fail(*args, **kwargs):
         raise RuntimeError("database unavailable")
 
     monkeypatch.setattr(store, "finalize_run", fail)
-    result = await _persist_task_cancellation(store, "cancel-write", interrupted=True)
-    assert (await store.get_run("cancel-write")).status == "running"
+    result = await _persist_task_cancellation(store, "00000000000000000000000103", interrupted=True)
+    assert (await store.get_run("00000000000000000000000103")).status == "running"
     assert result.meta.get("dendrux.cancel_persisted") is False, (
         "CANCELLED must disclose a failed durable transition"
     )

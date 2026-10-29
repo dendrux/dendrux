@@ -28,6 +28,7 @@ import logging
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Literal
 
+from dendrux import _codes
 from dendrux.context_blocks import _fold_first, fold_first_parts
 from dendrux.types import (
     REASONING_MODEL_META_KEY,
@@ -349,13 +350,7 @@ async def conversation_records(
                 ).encode("utf-8")
             )
             if count > bounds.max_rebuild_rows or size > bounds.max_rebuild_bytes:
-                logger.warning(
-                    "Conversation rebuild bound exceeded",
-                    extra={
-                        "run_id": run_id,
-                        "code": "history_too_large",
-                    },
-                )
+                _codes.log_code(logger, _codes.HISTORY_TOO_LARGE, run_id=run_id)
                 raise RunNotReclaimableError(run_id, "history_too_large")
             if count > offset:
                 records.append(
@@ -412,10 +407,7 @@ async def rebuild_history(
                 ).encode("utf-8")
             )
             if rows > bounds.max_rebuild_rows or size > bounds.max_rebuild_bytes:
-                logger.warning(
-                    "Step rebuild bound exceeded",
-                    extra={"run_id": run_id, "code": "history_too_large"},
-                )
+                _codes.log_code(logger, _codes.HISTORY_TOO_LARGE, run_id=run_id)
                 raise RunNotReclaimableError(run_id, "history_too_large")
             step = (trace.meta or {}).get("dendrux.step")
             if step is not None:

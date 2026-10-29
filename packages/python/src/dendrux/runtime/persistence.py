@@ -35,6 +35,7 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
 from typing import TYPE_CHECKING, Any
 
+from dendrux import _codes
 from dendrux.errors import ImagePersistenceUnsupportedError, RunFencedError, safe_exception_info
 from dendrux.loops.base import BaseRecorder
 from dendrux.runtime._blob_catalog import edges_for_parts, scrub_inline_images
@@ -550,10 +551,7 @@ class PersistenceRecorder(BaseRecorder):
                 if call is None or call["phase"] != "gated":
                     continue
                 if call.get("decision_id") != f"{descriptor['pause_id']}:{call_id}":
-                    logger.warning(
-                        "Approval generation mismatch",
-                        extra={"run_id": self._run_id, "code": "submission_generation"},
-                    )
+                    _codes.log_code(logger, _codes.SUBMISSION_GENERATION, run_id=self._run_id)
                     raise PersistenceError(code="submission_generation")
                 phases[call_id] = (
                     "approved"
@@ -1140,9 +1138,7 @@ class PersistenceRecorder(BaseRecorder):
                     if pending and pending["phase"] == "gated"
                     else "persistence_error"
                 )
-                logger.warning(
-                    "Execution has no dispatchable intent", extra={"run_id": run_id, "code": code}
-                )
+                _codes.log_code(logger, _codes.REGISTRY[code], run_id=run_id)
                 raise PersistenceError(code=code)
             if pending.get("target") == "client":
                 return
@@ -1166,9 +1162,7 @@ class PersistenceRecorder(BaseRecorder):
                     )
 
                 await retry_critical(replay_event, label="tool_replayed", run_id=run_id)
-                logger.warning(
-                    "Replaying interrupted tool", extra={"run_id": run_id, "code": "tool_replayed"}
-                )
+                _codes.log_code(logger, _codes.TOOL_REPLAYED, run_id=run_id)
                 self._replayed_calls.add(tool_call.id)
                 self._started_calls.add(tool_call.id)
                 return
@@ -1240,9 +1234,7 @@ class PersistenceRecorder(BaseRecorder):
         except RunFencedError:
             raise
         except Exception:
-            logger.warning(
-                "Failed-call evidence unavailable: run_id=%s code=llm_failed_write", self._run_id
-            )
+            _codes.log_code(logger, _codes.LLM_FAILED_WRITE, run_id=self._run_id)
 
     def format_observation(self, result: ToolResult) -> Message:
         from dendrux.types import tool_result_message

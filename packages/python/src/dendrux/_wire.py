@@ -8,6 +8,8 @@ import math
 import re
 from typing import TYPE_CHECKING, Any
 
+from dendrux import _codes
+
 if TYPE_CHECKING:
     from dendrux.types import Limits, RunResult, ToolResult
 
@@ -162,10 +164,8 @@ def result_to_dict(result: RunResult) -> dict[str, Any]:
     if omitted:
         import logging
 
-        logging.getLogger(__name__).warning(
-            "Wire answer omitted: run_id=%s code=wire_answer_omitted",
-            result.run_id,
-            extra={"run_id": result.run_id, "code": "wire_answer_omitted"},
+        _codes.log_code(
+            logging.getLogger(__name__), _codes.WIRE_ANSWER_OMITTED, run_id=result.run_id
         )
     return {
         **({"recovery": result.recovery.to_dict()} if result.recovery is not None else {}),
