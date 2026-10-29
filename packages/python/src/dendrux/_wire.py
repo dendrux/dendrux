@@ -168,6 +168,7 @@ def result_to_dict(result: RunResult) -> dict[str, Any]:
             extra={"run_id": result.run_id, "code": "wire_answer_omitted"},
         )
     return {
+        **({"recovery": result.recovery.to_dict()} if result.recovery is not None else {}),
         "wire_version": WIRE_VERSION,
         "run_id": result.run_id,
         "status": result.status.value,

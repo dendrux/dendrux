@@ -1324,10 +1324,7 @@ class RunResult:
         """
         from dendrux._wire import result_to_dict
 
-        result = result_to_dict(self)
-        if self.recovery is not None:
-            result["recovery"] = self.recovery.to_dict()
-        return result
+        return result_to_dict(self)
 
     @property
     def truncated(self) -> bool:

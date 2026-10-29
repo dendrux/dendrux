@@ -74,7 +74,7 @@ _PLACEHOLDER_PAUSES = frozenset({"waiting_approval", "waiting_human_input", "pau
 _CONSTANT_DENIAL_REASONS = frozenset(
     {"denied_by_policy", DEFAULT_DENIAL_REASON, _HOOK_ERROR_REASON, _CLIENT_APPROVAL_REASON}
 )
-_CONSTANT_APPROVAL_REASONS = frozenset({"requires_approval"})
+_CONSTANT_APPROVAL_REASONS = frozenset({"requires_approval", "replay_after_crash"})
 TOOL_RESULT_CODES = frozenset(
     {
         # tools/_validate.py
@@ -182,7 +182,7 @@ _FAILURE_REASONS = frozenset(
 _BUDGET_METRICS = frozenset({TOKENS, COST_USD})
 _BUDGET_REASONS = frozenset({"threshold_crossed", BUDGET_EXCEEDED, UNPRICED_CALL})
 _BUDGET_ACTIONS = frozenset(get_args(BudgetAction))
-_APPROVAL_SOURCES = frozenset({"static", "hook"})
+_APPROVAL_SOURCES = frozenset({"static", "hook", "recovery"})
 _DECISIONS = frozenset({"approved", "rejected", "mixed"})
 _CALL_DECISIONS = frozenset({"approved", "denied"})
 _COST_SOURCES = frozenset(get_args(CostSource))
