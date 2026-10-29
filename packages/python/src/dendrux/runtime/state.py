@@ -4254,9 +4254,33 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         cursor: str | None,
     ) -> MarkResult:
         """Scan running rows once by id, atomically fencing each expired lease."""
-        from sqlalchemy import func, or_, select, update
+        return cast(
+            "MarkResult",
+            await self._scan_expired_runs(
+                cutoff=cutoff,
+                batch_size=batch_size,
+                max_runs=max_runs,
+                max_returned=max_returned,
+                reclaim_limit=reclaim_limit,
+                cursor=cursor,
+            ),
+        )
 
-        from dendrux.db.models import AgentRun
+    @_safe_database_call
+    async def _scan_expired_runs(
+        self,
+        *,
+        cutoff: datetime,
+        batch_size: int,
+        max_runs: int,
+        max_returned: int,
+        reclaim_limit: int,
+        cursor: str | None,
+        on_stale: Literal["error", "reclaim"] | None = None,
+    ) -> MarkResult:
+        from sqlalchemy import case, func, literal_column, or_, select, update
+
+        from dendrux.db.models import AgentRun, RunEvent
 
         _require_aware_utc("cutoff", cutoff)
         for bound in (batch_size, max_runs, max_returned, reclaim_limit):
@@ -4271,6 +4295,16 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
             raise ValueError("reclaim_limit exceeds SMALLINT")
         result = MarkResult([], [], [], 0, None)
         inspected, after = 0, cursor
+        started = (
+            select(RunEvent.id)
+            .where(
+                RunEvent.agent_run_id == AgentRun.id,
+                RunEvent.event_type == literal_column("'run.started'"),
+            )
+            .limit(1)
+            .correlate(AgentRun)
+            .scalar_subquery()
+        )
         fields = (
             AgentRun.id,
             AgentRun.agent_name,
@@ -4285,6 +4319,8 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
             AgentRun.lease_expired_at,
             AgentRun.loop_state["loop"].as_string().label("loop"),
             AgentRun.cancel_requested,
+            AgentRun.iteration_count,
+            started.label("started"),
         )
         while inspected < max_runs and len(result.reclaimable) < max_returned:
             statement = select(*fields).where(AgentRun.status.between("running", "running"))
@@ -4310,30 +4346,37 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                 ) -> ReclaimableRun | SweptRun | None:
                     async with self._session_factory() as session:
                         age = _to_aware_utc(row.last_progress_at or row.created_at)
-                        if row.lease_expired_at is None and age >= cutoff:
+                        if (on_stale == "error" or row.lease_expired_at is None) and age >= cutoff:
                             return None
                         if row.storage_format == 2 and row.loop not in ("react", "single_call"):
                             logger.warning(
-                                "Skipping run with unknown loop",
+                                "Run has unknown recovery loop",
                                 extra={"code": "loop_unknown", "run_id": run_id},
                             )
-                            return None
+                            if on_stale is None:
+                                return None
                         limit = (
                             row.reclaim_limit
                             if row.lease_expired_at is not None and row.reclaim_limit is not None
                             else reclaim_limit
                         )
+                        legacy_reason = (
+                            "stale_running" if row.started or on_stale is None else "never_started"
+                        )
                         reason = (
-                            "stale_running_legacy"
+                            legacy_reason
+                            if on_stale == "error"
+                            else "stale_running_legacy"
                             if row.storage_format != 2
                             else "reclaim_limit"
                             if row.reclaim_attempts >= limit
-                            else "stale_running"
-                            if row.loop == "single_call"
+                            else legacy_reason
+                            if row.loop != "react"
                             else None
                         )
                         if reason is not None or row.cancel_requested:
-                            status = "cancelled" if row.cancel_requested else "error"
+                            flagged = AgentRun.cancel_requested.is_(True)
+                            status_expr = case((flagged, "cancelled"), else_="error")
                             changed = (
                                 await session.execute(
                                     update(AgentRun)
@@ -4343,7 +4386,9 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                                         AgentRun.status == "running",
                                         AgentRun.claim_epoch == row.claim_epoch,
                                         or_(
-                                            AgentRun.lease_expired_at.is_not(None),
+                                            AgentRun.lease_expired_at.is_not(None)
+                                            if on_stale != "error"
+                                            else False,
                                             func.coalesce(
                                                 AgentRun.last_progress_at, AgentRun.created_at
                                             )
@@ -4351,18 +4396,20 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                                         ),
                                     )
                                     .values(
-                                        **_status_values(status),
+                                        **_status_values(status_expr),
                                         claim_epoch=AgentRun.claim_epoch + 1,
                                         failure_reason=reason,
+                                        error=case((flagged, None), else_=f"Run swept as {reason}"),
                                         pause_data=None,
                                         pause_requested=False,
                                         cancel_requested=False,
                                     )
-                                    .returning(AgentRun.id)
+                                    .returning(AgentRun.status)
                                 )
                             ).scalar_one_or_none()
                             if changed is None:
                                 return None
+                            status = changed
                             await _insert_event_locked(
                                 session,
                                 run_id,
@@ -4370,6 +4417,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                                 {"reason": "cancel_requested"}
                                 if status == "cancelled"
                                 else {"failure_reason": reason},
+                                iteration_index=row.iteration_count or 0,
                             )
                             await session.commit()
                             logger.warning(
@@ -4447,6 +4495,17 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                     if item.failure_reason == "stale_running_legacy":
                         result.legacy.append(item)
                 if inspected >= max_runs or len(result.reclaimable) >= max_returned:
+                    if inspected >= max_runs:
+                        logger.warning(
+                            "Sweep candidate cap reached",
+                            extra={
+                                "run_id": None,
+                                "code": "sweep_cap_reached",
+                                "category": "running",
+                                "cap": max_runs,
+                                "inspected": inspected,
+                            },
+                        )
                     return MarkResult(
                         result.reclaimable, result.finalised, result.legacy, inspected, after
                     )
@@ -4775,6 +4834,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                     AgentRun.status,
                     AgentRun.last_progress_at,
                     AgentRun.iteration_count,
+                    AgentRun.claim_epoch,
                     started.label("started"),
                     age.label("sweep_age"),
                 ).limit(min(batch_size, max_runs - visited))
@@ -4821,6 +4881,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                             .where(
                                 AgentRun.id == row.id,
                                 AgentRun.status == row.status,
+                                AgentRun.claim_epoch == row.claim_epoch,
                                 age < cutoff,
                                 # Legacy workers update updated_at on pause but
                                 # do not know the new status-transition clock.
