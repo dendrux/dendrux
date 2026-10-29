@@ -225,3 +225,44 @@ async def test_new_mark_persists_the_current_reclaim_limit(store, engine):
     second = await mark(store, reclaim_limit=2)
     assert len(second.reclaimable) == 1 and not second.finalised
     assert second.reclaimable[0].reclaim_limit == 2
+
+
+async def test_marker_rediscovery_preserves_every_projected_field(store, engine):
+    """Repeated CAS losers and marked-row scans must use the same named projection."""
+    cursor = None
+    for _ in range(10):
+        ids = await stale(store, engine)
+        outcomes = await race(
+            store,
+            engine,
+            [
+                lambda s, cursor=cursor: mark(s, cursor=cursor),
+                lambda s, cursor=cursor: mark(s, cursor=cursor),
+            ],
+        )
+        expected = next(
+            r for r in await store.get_lease_expired(limit=100, cursor=cursor) if r.run_id == ids[0]
+        )
+        assert all(not isinstance(result, BaseException) for result in outcomes)
+        for outcome in outcomes:
+            assert outcome.reclaimable == [expected]
+        assert expected.tenant_id == "tenant" and expected.agent_name == "recovery"
+        assert expected.claim_epoch == 1 and expected.reclaim_attempts == 0
+        assert expected.reclaim_limit == 3
+        cursor = ids[0]
+
+
+async def test_reclaim_returning_preserves_distinct_epoch_and_format(store, engine):
+    ids = await stale(store, engine)
+    async with engine.begin() as conn:
+        await conn.execute(
+            update(AgentRun).where(AgentRun.id == ids[0]).values(claim_epoch=7, reclaim_attempts=1)
+        )
+    item = (await mark(store)).reclaimable[0]
+    assert item.claim_epoch == 8
+    claimed = await reclaim(store, item)
+    row = await store.get_run(ids[0])
+    assert claimed.claim_epoch == row.claim_epoch == 9
+    assert claimed.storage_format == row.storage_format == 2
+    assert claimed.loop_state == await store.get_loop_state(ids[0]) == {"loop": "react"}
+    assert claimed.submission is None and row.reclaim_attempts == 2

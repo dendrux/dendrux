@@ -1,6 +1,5 @@
 """Tool intent, completion and submission transaction boundaries."""
 
-import asyncio
 import inspect
 
 import pytest
@@ -37,7 +36,7 @@ async def intent(store, run_id, call_id):
     )
 
 
-async def test_a20_parallel_completions_patch_current_pending(store):
+async def test_a20_parallel_completions_patch_current_pending(store, engine):
     run_id = generate_ulid()
     await store.create_run(run_id, "complete")
     assert hasattr(store, "checkpoint_step")
@@ -53,8 +52,8 @@ async def test_a20_parallel_completions_patch_current_pending(store):
     patch_type = getattr(state, "LoopStatePatch", None)
     assert patch_type is not None, "parallel completions must patch under the run lock"
 
-    async def finish(call_id, order):
-        await store.complete_tool_call(
+    async def finish(call_id, order, *, active_store=store):
+        await active_store.complete_tool_call(
             run_id,
             claim_epoch=0,
             tool_call_id=call_id,
@@ -69,7 +68,17 @@ async def test_a20_parallel_completions_patch_current_pending(store):
             loop_state_patch=patch_type(remove_pending=(call_id,)),
         )
 
-    await asyncio.gather(finish("b", 2), finish("a", 1))
+    from tests.integration.test_060_core_recovery import race
+
+    outcomes = await race(
+        store,
+        engine,
+        [
+            lambda s: finish("b", 2, active_store=s),
+            lambda s: finish("a", 1, active_store=s),
+        ],
+    )
+    assert outcomes == [None, None]
     assert (await store.get_loop_state(run_id))["pending"] == []
     assert [r.meta["call_id"] for r in await store.get_traces(run_id)] == ["a", "b"]
     assert len(await store.get_run_events(run_id)) == 4

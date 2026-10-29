@@ -1769,7 +1769,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
     async def _fence(
         self, session: AsyncSession, run_id: str, claim_epoch: int | None, **values: Any
     ) -> None:
-        from sqlalchemy import update
+        from sqlalchemy import case, update
 
         from dendrux.db.models import AgentRun
         from dendrux.errors import RunFencedError
@@ -1777,7 +1777,15 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         stmt = update(AgentRun).where(AgentRun.id == run_id)
         if claim_epoch is not None:
             stmt = stmt.where(AgentRun.claim_epoch == claim_epoch)
-        result = await session.execute(stmt.values(updated_at=_dt.datetime.now(_dt.UTC), **values))
+        now = _dt.datetime.now(_dt.UTC)
+        # Only the executing owner can renew via a fenced write. Administrative
+        # events without a claim must not keep a crashed worker alive.
+        if claim_epoch is not None:
+            values.setdefault(
+                "last_progress_at",
+                case((AgentRun.storage_format == 2, now), else_=AgentRun.last_progress_at),
+            )
+        result = await session.execute(stmt.values(updated_at=now, **values))
         if claim_epoch is not None and not getattr(result, "rowcount", 0):
             logger.warning("Run fenced", extra={"run_id": run_id, "code": "run_fenced"})
             raise RunFencedError(run_id, claim_epoch=claim_epoch)
@@ -2240,7 +2248,11 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                     AgentRun.claim_epoch == claim_epoch,
                     func.octet_length(sql_cast(changed, Text)) <= 32768,
                 )
-                .values(updated_at=_dt.datetime.now(_dt.UTC), loop_state=changed)
+                .values(
+                    updated_at=_dt.datetime.now(_dt.UTC),
+                    last_progress_at=_dt.datetime.now(_dt.UTC),
+                    loop_state=changed,
+                )
             )
             if not getattr(result, "rowcount", 0):
                 epoch = await session.scalar(
@@ -4243,6 +4255,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                             changed = (
                                 await session.execute(
                                     update(AgentRun)
+                                    .execution_options(synchronize_session=False)
                                     .where(
                                         AgentRun.id == run_id,
                                         AgentRun.status == "running",
@@ -4298,9 +4311,12 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                         if row.lease_expired_at is not None:
                             return _reclaimable(row)
                         now = _dt.datetime.now(_dt.UTC)
+                        # This session holds scalar projections, not ORM entities.
+                        # Avoid identity synchronization of the CAS's RETURNING row.
                         marked = (
                             await session.execute(
                                 update(AgentRun)
+                                .execution_options(synchronize_session=False)
                                 .where(
                                     AgentRun.id == run_id,
                                     AgentRun.status == "running",
