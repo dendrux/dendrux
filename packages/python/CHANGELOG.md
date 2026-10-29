@@ -8,6 +8,8 @@ notifier for live reads, published scale numbers with a rerunnable load script,
 one trace per run and a log-codes page, and the 0.5 FutureWarning flips.
 Entries are added as each track merges.
 
+- guardrails redact values inside placeholder-shaped text the run did not issue
+
 - For format-2 runs, `RunStore.get_traces` and `dendrux traces` return the
   provider form (PII placeholders); the reverse mapping is available as before.
 

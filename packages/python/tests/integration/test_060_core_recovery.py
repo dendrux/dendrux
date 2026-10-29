@@ -370,6 +370,7 @@ async def test_creation_marker_uses_loop_type(store, monkeypatch, kind, entry):
     async def inspect(*args, **kwargs):
         result = await create(*args, **kwargs)
         # Creation committed; the loop has not executed or checkpointed yet.
+        assert (await store.get_run(result.run_id)).meta["dendrux.loop"] == type(loop).__name__
         assert await store.get_loop_state(result.run_id) == expected
         inspected.append(result.run_id)
         return result
@@ -395,3 +396,91 @@ async def test_creation_marker_uses_loop_type(store, monkeypatch, kind, entry):
             result = await agent.retry(result.run_id)
     assert result.status == RunStatus.SUCCESS
     assert len(inspected) == (2 if entry == "retry" and kind != "single_call" else 1)
+
+
+@pytest.mark.parametrize("fmt", [1, 2])
+async def test_parallel_creation_retains_loop_class_metadata(store, engine, fmt):
+    from functools import wraps
+
+    from dendrux import Agent, SingleCall
+    from dendrux.llm.mock import MockLLM
+    from dendrux.loops.react import ReActLoop
+    from dendrux.types import LLMResponse
+    from tests._fixtures.storage import pin_storage_format
+
+    await pin_storage_format(engine, fmt)
+    create = store.create_run
+    entrants = 0
+    ready = asyncio.Event()
+    initial = {}
+
+    @wraps(create)
+    async def together(*args, **kwargs):
+        nonlocal entrants
+        entrants += 1
+        if entrants == 8:
+            ready.set()
+        await asyncio.wait_for(ready.wait(), 10)
+        result = await create(*args, **kwargs)
+        initial[result.run_id] = await store.get_loop_state(result.run_id)
+        return result
+
+    store.create_run = together
+
+    async def execute(index):
+        base = SingleCall if index % 2 else ReActLoop
+        loop = type(f"DistinctLoop{index}", (base,), {})()
+        agent = Agent(
+            prompt="p",
+            loop=loop,
+            state_store=store,
+            strict_tenancy=False,
+            provider=MockLLM([LLMResponse(text="done")]),
+        )
+        if index % 3:
+            result = await agent.run("go")
+        else:
+            async with agent.stream("go") as stream:
+                events = [event async for event in stream]
+            result = events[-1].run_result
+        assert result.status.value == "success"
+        assert (await store.get_run(result.run_id)).meta["dendrux.loop"] == type(loop).__name__
+        assert initial[result.run_id] == (
+            {"v": 1, "loop": "single_call" if index % 2 else "react"} if fmt == 2 else None
+        )
+
+    await asyncio.gather(*(execute(i) for i in range(8)))
+
+
+@pytest.mark.parametrize("failure", ["cancel", "error"])
+async def test_creation_scope_does_not_outlive_a_failed_call(store, monkeypatch, failure):
+    from functools import wraps
+
+    from dendrux import Agent
+    from dendrux.llm.mock import MockLLM
+    from dendrux.loops.react import ReActLoop
+
+    create = store.create_run
+    attempted = []
+
+    @wraps(create)
+    async def failed(run_id, *args, **kwargs):
+        attempted.append(run_id)
+        if failure == "cancel":
+            raise asyncio.CancelledError
+        raise RuntimeError("creation failed")
+
+    monkeypatch.setattr(store, "create_run", failed)
+    agent = Agent(
+        prompt="p",
+        provider=MockLLM([]),
+        state_store=store,
+        strict_tenancy=False,
+        loop=type("DerivedReact", (ReActLoop,), {})(),
+    )
+    error = asyncio.CancelledError if failure == "cancel" else RuntimeError
+    with pytest.raises(error):
+        await agent.run("go")
+    assert len(attempted) == 1
+    await create(attempted[0], "direct", meta={"dendrux.loop": "SingleCall"})
+    assert await store.get_loop_state(attempted[0]) == {"v": 1, "loop": "single_call"}

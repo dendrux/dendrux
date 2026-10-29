@@ -379,7 +379,9 @@ class GuardrailEngine:
                 if block is not None:
                     return segments, all_findings, block
                 continue
-            placeholders = [m.span() for m in _PLACEHOLDER_RE.finditer(joined)]
+            placeholders = [
+                m.span() for m in _PLACEHOLDER_RE.finditer(joined) if m.group() in self._pii_mapping
+            ]
             starts = [start for start, _ in placeholders]
             findings = _deoverlap(
                 [

@@ -145,7 +145,15 @@ if TYPE_CHECKING:
     from dendrux.runtime.state import StateStore
     from dendrux.runtime.submit import _WarningLocation
     from dendrux.strategies.base import Strategy
-    from dendrux.types import ContentPart, RunEvent, RunResult, RunStream, ToolCall, ToolResult
+    from dendrux.types import (
+        ContentPart,
+        CreateRunResult,
+        RunEvent,
+        RunResult,
+        RunStream,
+        ToolCall,
+        ToolResult,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -1813,7 +1821,6 @@ async def run(
                         seeded_history,
                         user_input=user_input,
                         run_id=run_id,
-                        run_meta=run_meta,
                         tenant_id=tenant_id,
                         replay_req=replay_req,
                         replay_runs=replay_runs,
@@ -1821,7 +1828,9 @@ async def run(
                         context=context,
                         user_parts=user_parts,
                     )
-                    create_result = await state_store.create_run(
+                    create_result = await _create_runtime_run(
+                        state_store,
+                        resolved_loop,
                         run_id,
                         agent.name,
                         input_data=_input_data(user_input, user_parts),
@@ -2149,6 +2158,18 @@ def _recovery_loop_name(loop: Loop) -> str | None:
     return None
 
 
+async def _create_runtime_run(
+    store: StateStore, loop: Loop, run_id: str, agent_name: str, **kwargs: Any
+) -> CreateRunResult:
+    from dendrux.runtime.state import SQLAlchemyStateStore, _creation_loop_scope
+
+    native_store = unclaimed_store(store)
+    if isinstance(native_store, SQLAlchemyStateStore):
+        with _creation_loop_scope(native_store, run_id, _recovery_loop_name(loop)):
+            return await store.create_run(run_id, agent_name, **kwargs)
+    return await store.create_run(run_id, agent_name, **kwargs)
+
+
 async def _runtime_seeds(
     store: StateStore,
     agent: Agent,
@@ -2160,7 +2181,6 @@ async def _runtime_seeds(
     *,
     user_input: str,
     run_id: str,
-    run_meta: dict[str, Any],
     tenant_id: str | None = None,
     replay_req: ReplayRequest | None = None,
     replay_runs: list[Any] | None = None,
@@ -2182,7 +2202,6 @@ async def _runtime_seeds(
         and await native_store._creation_storage_format() == 2
     ):
         _validate_provider_kwargs(provider_kwargs, run_id=run_id)
-        run_meta["dendrux.loop"] = _recovery_loop_name(loop)
     if replay_req is not None:
         plan = expand_replay(
             replay_runs or [],
@@ -2684,8 +2703,13 @@ async def retry(
             )
 
         # 2. Validate source run was not SingleCall (no iterative history to seed)
+        from dendrux.runtime._capabilities import capabilities
+
         source_loop = (source_run.meta or {}).get("dendrux.loop", "")
-        if source_loop == "SingleCall":
+        if source_run.storage_format == 2 and capabilities(state_store).checkpointing:
+            source_state = await state_store.get_loop_state(original_run_id)
+            source_loop = (source_state or {}).get("loop")
+        if source_loop in ("SingleCall", "single_call"):
             raise ValueError(
                 "SingleCall runs cannot be retried with context — "
                 "they have no iterative history to seed. Call agent.run() instead."
@@ -2696,7 +2720,6 @@ async def retry(
 
         # 3. Read traces and reconstruct approximate history. Reasoning replay
         #    blocks only seed a retry on the model that made them.
-        from dendrux.runtime._capabilities import capabilities
         from dendrux.runtime.replay import conversation_records
 
         traces = (
@@ -2806,10 +2829,11 @@ async def retry(
             initial_history,
             user_input=user_input,
             run_id=run_id,
-            run_meta=run_meta,
             tenant_id=tenant_id,
         )
-        create_result = await state_store.create_run(
+        create_result = await _create_runtime_run(
+            state_store,
+            resolved_loop,
             run_id,
             agent.name,
             input_data=_input_data(user_input, source_parts),
@@ -3360,7 +3384,6 @@ def run_stream(
                         seeded_history,
                         user_input=user_input,
                         run_id=run_id,
-                        run_meta=run_meta,
                         tenant_id=eff_tenant,
                         replay_req=replay_req,
                         replay_runs=replay_runs,
@@ -3368,7 +3391,9 @@ def run_stream(
                         context=context,
                         user_parts=user_parts,
                     )
-                    create_result = await store.create_run(
+                    create_result = await _create_runtime_run(
+                        store,
+                        resolved_loop,
                         run_id,
                         agent.name,
                         input_data=_input_data(user_input, user_parts),

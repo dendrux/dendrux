@@ -18,7 +18,8 @@ import logging
 import math
 import re
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, NoReturn, Protocol, cast, overload
 
@@ -39,7 +40,7 @@ from dendrux.types import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
+    from collections.abc import AsyncIterator, Callable, Iterable, Iterator, Mapping, Sequence
     from datetime import datetime, timedelta
 
     from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
@@ -100,6 +101,29 @@ class ClaimResult:
 def _initial_loop_state(loop_name: str | None) -> dict[str, Any] | None:
     kind = {"ReActLoop": "react", "SingleCall": "single_call"}.get(loop_name or "")
     return {"v": 1, "loop": kind} if kind is not None else None
+
+
+_creation_loop: ContextVar[tuple[object, str, str | None] | None] = ContextVar(
+    "dendrux_creation_loop", default=None
+)
+
+
+@contextmanager
+def _creation_loop_scope(store: object, run_id: str, loop_name: str | None) -> Iterator[None]:
+    token = _creation_loop.set((store, run_id, loop_name))
+    try:
+        yield
+    finally:
+        _creation_loop.reset(token)
+
+
+def _loop_state_at_creation(
+    store: object, run_id: str, meta: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    current = _creation_loop.get()
+    if current is not None and current[0] is store and current[1] == run_id:
+        return _initial_loop_state(current[2])
+    return _initial_loop_state((meta or {}).get("dendrux.loop"))
 
 
 PAUSE_REQUEST_META_KEY = "dendrux.pause_request"
@@ -1661,7 +1685,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                 run = AgentRun(
                     storage_format=storage_format,
                     pii_mapping=pii_mapping if storage_format == 2 else None,
-                    loop_state=_initial_loop_state((meta or {}).get("dendrux.loop"))
+                    loop_state=_loop_state_at_creation(self, run_id, meta)
                     if storage_format == 2
                     else None,
                     id=run_id,
