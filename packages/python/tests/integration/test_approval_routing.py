@@ -572,8 +572,14 @@ class TestHookPersistence:
                 .all()
             )
         [row] = rows
-        assert row.meta == {"substituted": True}
+        meta = dict(row.meta)
+        observation = meta.pop("dendrux.observation", None)
+        assert meta == {"substituted": True}
         assert row.result == {"status": "held_for_review"}
+        if (await store.get_run(result.run_id)).storage_format == 2:
+            assert json.loads(observation["content"]) == row.result
+        else:
+            assert observation is None
         assert await _events(store, result.run_id, "policy.substituted")
 
     async def test_hook_error_event_persisted(self, store) -> None:

@@ -81,7 +81,35 @@ async def reclaim(
         raise
     owned = claimed_store(store, run_id, claim)
     with session.bind():
-        pause = await rebuild_pause(agent, owned, run_id, claim.loop_state or {})
+        history_records: list[Any] = []
+        try:
+            pause = await rebuild_pause(
+                agent, owned, run_id, claim.loop_state or {}, history_records=history_records
+            )
+        except (RunNotReclaimableError, PersistenceError, ValueError, KeyError, TypeError) as exc:
+            if isinstance(exc, PersistenceError) and exc.code not in (
+                "recovery_call_missing",
+                "recovery_state_missing",
+            ):
+                raise
+            reason = (
+                exc.reason
+                if isinstance(exc, RunNotReclaimableError)
+                else exc.code
+                if isinstance(exc, PersistenceError)
+                else "recovery_state_invalid"
+            )
+            await owned.finalize_with_event(
+                run_id,
+                status="error",
+                allowed_current_statuses=["running"],
+                event_type="run.error",
+                event_data={"failure_reason": reason},
+                failure_reason=reason,
+                error=reason,
+            )
+            logger.warning("Recovery rebuild refused", extra={"run_id": run_id, "code": reason})
+            raise RunNotReclaimableError(run_id, reason) from exc
         result = await _resume_core(
             run_id,
             state_store=owned,
@@ -91,6 +119,7 @@ async def reclaim(
             extra_notifier=notifier,
             _skip_claim=True,
             _reclaim_pause=pause,
+            _reclaim_history=history_records,
         )
         if result.status in (
             RunStatus.SUCCESS,
@@ -105,14 +134,40 @@ async def reclaim(
 
 
 async def rebuild_pause(
-    agent: Agent, store: StateStore, run_id: str, state: dict[str, Any]
+    agent: Agent,
+    store: StateStore,
+    run_id: str,
+    state: dict[str, Any],
+    *,
+    history_records: list[Any] | None = None,
 ) -> PauseState:
     from dendrux.runtime.replay import rebuild_history
+    from dendrux.runtime.state import TraceRecord
     from dendrux.skills._session import current
     from dendrux.types import ImageViewState
 
+    class HistoryReader:
+        def __getattr__(self, name: str) -> Any:
+            return getattr(store, name)
+
+        async def conversation_traces(self, *args: Any, **kwargs: Any) -> Any:
+            page = await store.conversation_traces(*args, **kwargs)
+            if history_records is not None:
+                history_records.extend(
+                    TraceRecord(
+                        id=e.trace_id,
+                        role=e.role,
+                        content=e.content,
+                        order_index=e.position,
+                        meta=e.meta,
+                        trace_kind=e.source,
+                    )
+                    for e in page.entries
+                )
+            return page
+
     rebuilt = await rebuild_history(
-        store,
+        cast("StateStore", HistoryReader()),
         run_id,
         limits=agent._limits,
         reasoning_for=state.get("provider_kwargs", {}).get("model")
@@ -169,8 +224,22 @@ async def rebuild_pause(
     return pause
 
 
-def recovery_approval(pause: PauseState) -> bool:
-    return any(g.get("source") == "recovery" for g in (pause.approval_gates or {}).values())
+async def needs_resolution(store: StateStore, run_id: str, pause: PauseState) -> bool:
+    if pause.schema_version != 2:
+        return False
+    if any(g.get("source") == "recovery" for g in (pause.approval_gates or {}).values()):
+        return True
+    if not pause.pending_tool_calls:
+        return False
+    calls = {tc.id for tc in pause.pending_tool_calls}
+    return any(
+        row.tool_call_id in calls
+        for row in await store.get_tool_calls(run_id, iteration_index=pause.iteration, limit=1000)
+    )
+
+
+def recovery_gate() -> dict[str, str | None]:
+    return {"source": "recovery", "reason": "replay_after_crash"}
 
 
 async def resolve(
@@ -189,6 +258,7 @@ async def resolve(
     pause = ctx.pause_state
     state = recorder._loop_state
     descriptor = state.get("submission")
+    lookups = await agent.get_tool_lookups(loop=ctx.resolved_loop)
     if descriptor:
         raw = await store.get_pause_state(run_id) or {}
         payload = _submission_payload(raw)
@@ -207,6 +277,51 @@ async def resolve(
                 if parts
                 else Message(Role.USER, payload["submitted_user_input"])
             ]
+        if descriptor["kind"] == "approval":
+            from dendrux.runtime.runner import (
+                _approval_outcomes,
+                _decided_payload,
+                _record_approval_decided,
+            )
+            from dendrux.runtime.submit import deserialize_decisions
+            from dendrux.types import ApprovalDecision
+
+            decisions = (
+                dict(deserialize_decisions(payload["submitted_decisions"]))
+                if "submitted_decisions" in payload
+                else None
+            )
+            denials = deserialize_tool_results(payload.get("submitted_tool_results", []))
+            if decisions is None and payload.get("approved") is False:
+                decisions = {
+                    tr.call_id: ApprovalDecision(approved=False, reason=tr.error) for tr in denials
+                }
+            outcomes = _approval_outcomes(pause, lookups.target, decisions)
+            await _record_approval_decided(
+                recorder,
+                ctx.notifier,
+                run_id,
+                pause.iteration,
+                _decided_payload(run_id, outcomes),
+                event_id=descriptor["submission_id"],
+            )
+            # Non-started denials can be consumed with their observation. Started
+            # effects must instead resolve unknown through atomic completion.
+            rows = await store.get_tool_calls(run_id, iteration_index=pause.iteration, limit=1000)
+            started = {r.tool_call_id for r in rows if r.outcome == "started"}
+            injected = [
+                tool_result_message(
+                    ToolResult(
+                        name=tc.name,
+                        call_id=tc.id,
+                        payload=json.dumps(reason),
+                        success=False,
+                        error=reason,
+                    )
+                )
+                for tc, outcome, reason in outcomes
+                if outcome == "denied" and tc.id not in started
+            ]
         injected = [await project_message(recorder, m) for m in injected]
         await recorder.consume_resume(injected)
         ctx.history.extend(injected)
@@ -219,8 +334,9 @@ async def resolve(
     )
     by_id = {r.tool_call_id: r for r in rows}
     calls = {tc.id: tc for tc in pause.pending_tool_calls}
-    actions = resolve_pending(state, rows)
-    lookups = await agent.get_tool_lookups(loop=ctx.resolved_loop)
+    actions = resolve_pending(
+        state, rows, current_idempotent={name: td.idempotent for name, td in lookups.defs.items()}
+    )
     recorder.configure_tools(list(lookups.defs.values()))
     counts = recorder.execution_counts() or {}
     held: list[ToolCall] = []
@@ -232,6 +348,10 @@ async def resolve(
         barrier = await _resume_barrier(store, run_id)
         if barrier is not None:
             remaining = held + [calls[a.call_id] for a in actions[index:] if a.call_id is not None]
+            for tc in remaining:
+                row = by_id.get(tc.id)
+                if row is not None and row.outcome == "started":
+                    gates[tc.id] = recovery_gate()
             paused = replace(
                 pause,
                 history=ctx.history,
@@ -255,12 +375,7 @@ async def resolve(
         if action.kind in ("approval_replay", "wait_client"):
             held.append(tc)
             if action.kind != "wait_client":
-                gates[tc.id] = {
-                    "source": "recovery" if action.kind == "approval_replay" else "static",
-                    "reason": "replay_after_crash"
-                    if action.kind == "approval_replay"
-                    else "requires_approval",
-                }
+                gates[tc.id] = recovery_gate()
                 await recorder.on_governance_event(
                     run_id,
                     "approval.requested",
@@ -278,10 +393,23 @@ async def resolve(
             continue
         if action.kind in ("observe", "resolve"):
             unknown = row is not None and row.outcome == "started"
+            if action.kind == "observe" and row is not None and row.observation is not None:
+                from dendrux.types import _message_from_dict
+
+                message = _message_from_dict(row.observation)
+                await recorder.resolve_observation(tc.id, message)
+                ctx.history.append(message)
+                continue
             tr = ToolResult(
                 name=tc.name,
                 call_id=tc.id,
-                payload=json.dumps(row.result)
+                payload=(
+                    row.result["raw"]
+                    if isinstance(row.result, dict)
+                    and set(row.result) == {"raw"}
+                    and isinstance(row.result["raw"], str)
+                    else json.dumps(row.result, ensure_ascii=False, separators=(",", ":"))
+                )
                 if action.kind == "observe" and row is not None
                 else '{"code":"outcome_unknown"}'
                 if unknown
@@ -335,6 +463,9 @@ async def resolve(
         )
         held.extend(outcome.pending_calls)
         gates.update(outcome.approval_gates or {})
+        if row is not None and row.outcome == "started":
+            for held_call in outcome.pending_calls:
+                gates[held_call.id] = recovery_gate()
     order_observations(recorder, ctx.history)
     if held or state.get("phase") == "awaiting_input" and not descriptor:
         pause = replace(

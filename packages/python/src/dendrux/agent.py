@@ -1549,20 +1549,21 @@ class Agent:
         """Continue a marked ReAct run from its last committed checkpoint.
 
         Call ``sweep(on_stale="reclaim")`` first. Passing its ``item`` fences
-        this attempt to that exact mark. Tenant scope is required; a missing
-        or foreign tenant raises RunNotFoundError without changing the run.
+        this attempt to that exact mark. Omitting tenant scope raises
+        TenantScopeRequiredError. A missing or foreign run raises
+        RunNotFoundError without changing the run.
         Interrupted non-idempotent tools pause for approval before replay.
         """
-        from dendrux.errors import PersistenceNotConfiguredError, RunNotFoundError
+        from dendrux.errors import PersistenceNotConfiguredError, TenantScopeRequiredError
         from dendrux.runtime._reclaim import reclaim
 
         if item is not None and item.run_id != run_id:
             raise ValueError("run_id must equal item.run_id")
         if isinstance(tenant_id, _OmittedType):
             _agent_logger.warning(
-                "Recovery tenant missing", extra={"run_id": run_id, "code": "run_not_found"}
+                "Recovery tenant missing", extra={"run_id": run_id, "code": "tenant_scope_required"}
             )
-            raise RunNotFoundError(run_id)
+            raise TenantScopeRequiredError("reclaim")
         tenant_id = entry_checks(self, "resume", tenant_id, default_tenant=UNSCOPED, run_id=run_id)
         self._require_provider()
         store = await self._resolve_state_store()

@@ -131,7 +131,7 @@ async def test_continue_seed_and_projection(store, engine):
     assert loaded.recovery == result.recovery
 
 
-@pytest.mark.parametrize("tenant", [None, "foreign", "omitted"])
+@pytest.mark.parametrize("tenant", [None, "foreign"])
 async def test_tenant_refusal_has_no_write(store, engine, tenant):
     agent = make_agent(store)
     item = await checkpoint(agent, store, engine)

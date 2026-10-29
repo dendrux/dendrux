@@ -49,7 +49,11 @@ _REQUIREMENTS: dict[str, dict[str, tuple[str, ...]]] = {
         "complete_tool_call": (),
         "finalize_with_event": ("trace",),
     },
-    "recovery": {"mark_lease_expired": (), "get_lease_expired": (), "reclaim_run": ()},
+    "recovery": {
+        "mark_lease_expired": ("finalise_unrecoverable",),
+        "get_lease_expired": (),
+        "reclaim_run": (),
+    },
     "notify": {"_after_event_insert": ()},
 }
 _CACHE: dict[int, tuple[weakref.ReferenceType[Any], StoreCapabilities]] = {}

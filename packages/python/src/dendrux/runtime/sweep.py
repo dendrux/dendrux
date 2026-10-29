@@ -84,7 +84,8 @@ async def sweep(
         on_stale: ``"error"`` finalises stale runs; ``"reclaim"`` marks recoverable
             ReAct runs for explicit ``Agent.reclaim()``. Omission warns when stale
             rows are found and retains ``"error"`` behavior through 0.6.
-        max_reclaims: Durable attempt limit assigned at the first mark (default 3).
+        max_reclaims: Attempt limit stored by each new mark (default 3).
+            Rediscovering an existing mark preserves its stored limit.
         max_returned: Maximum reclaimable runs returned (default 1,000).
         cursor: Continue after the previous page's opaque cursor. A call never
             wraps; None in the result means the scan reached its end.
@@ -145,7 +146,11 @@ async def sweep(
         next_cursor = None
         stale = []
         if stale_running is not None:
-            if isinstance(store, SQLAlchemyStateStore):
+            if (
+                isinstance(store, SQLAlchemyStateStore)
+                and type(store).sweep_stale_runs is SQLAlchemyStateStore.sweep_stale_runs
+                and type(store).mark_lease_expired is SQLAlchemyStateStore.mark_lease_expired
+            ):
                 page = await store._scan_expired_runs(
                     cutoff=datetime.now(UTC) - stale_running,
                     batch_size=batch_size,
@@ -164,6 +169,7 @@ async def sweep(
                     max_returned=max_returned,
                     reclaim_limit=max_reclaims,
                     cursor=cursor,
+                    finalise_unrecoverable=True,
                 )
                 stale, reclaimable, next_cursor = page.finalised, page.reclaimable, page.cursor
             else:

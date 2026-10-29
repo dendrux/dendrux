@@ -309,12 +309,13 @@ class PersistenceRecorder(BaseRecorder):
         self._consumed_user_count = 0
         self._final_trace: Any = None
 
-    async def restore_history(self, *, limits: Any) -> None:
+    async def restore_history(self, *, limits: Any, records: Any = None) -> None:
         if not self._format2:
             return
         from dendrux.runtime.replay import conversation_records
 
-        records = await conversation_records(self._store, self._run_id, limits=limits)
+        if records is None:
+            records = await conversation_records(self._store, self._run_id, limits=limits)
         self._known_history.clear()
         self._system_messages.clear()
         for trace in records:
@@ -759,6 +760,8 @@ class PersistenceRecorder(BaseRecorder):
         iteration: int,
         data: dict[str, Any] | None = None,
         correlation_id: str | None = None,
+        *,
+        event_id: str | None = None,
     ) -> None:
         """Record a durable run event. FAIL-CLOSED with retry.
 
@@ -766,7 +769,7 @@ class PersistenceRecorder(BaseRecorder):
         """
 
         identity: dict[str, Any] = (
-            {"event_id": generate_ulid()} if capabilities(self._store).retry_ids else {}
+            {"event_id": event_id or generate_ulid()} if capabilities(self._store).retry_ids else {}
         )
 
         async def _write() -> None:
@@ -1118,6 +1121,17 @@ class PersistenceRecorder(BaseRecorder):
                 (p for p in self._loop_state.get("pending", []) if p["call_id"] == tool_call.id),
                 None,
             )
+            if (
+                pending is not None
+                and pending["phase"] == "gated"
+                and tool_call.id in self._replay_calls
+                and self._tool_idempotent.get(tool_call.name, False)
+            ):
+                # A requested pause carries recovery identity even when replay
+                # itself needs no approval. Ordinary gates run before this hook.
+                pending["phase"] = "dispatchable"
+                pending["decision_id"] = None
+                await self._checkpoint()
             if pending is None or pending["phase"] not in ("dispatchable", "approved"):
                 from dendrux.errors import PersistenceError
 
@@ -1365,6 +1379,12 @@ class PersistenceRecorder(BaseRecorder):
         if self._format2:
             # No committed intent: this call was rejected before its effect ran.
             extra["outcome"] = "failed"
+            from dendrux.types import _message_to_dict
+
+            message = (
+                observation if observation is not None else self.format_observation(tool_result)
+            )
+            extra["meta"] = {**meta, "dendrux.observation": _message_to_dict(message)}
 
         # FAIL-CLOSED with retry: save_tool_call (proof of side effects)
         async def _write_tool() -> None:
@@ -1459,7 +1479,12 @@ class ResolutionAction:
     order_index: int | None = None
 
 
-def resolve_pending(loop_state: dict[str, Any], tool_rows: Sequence[Any]) -> list[ResolutionAction]:
+def resolve_pending(
+    loop_state: dict[str, Any],
+    tool_rows: Sequence[Any],
+    *,
+    current_idempotent: dict[str, bool] | None = None,
+) -> list[ResolutionAction]:
     """Decide the next recovery actions without executing or mutating anything."""
     if loop_state.get("submission") is not None:
         return [ResolutionAction("consume_submission")]
@@ -1490,7 +1515,13 @@ def resolve_pending(loop_state: dict[str, Any], tool_rows: Sequence[Any]) -> lis
                 "resolve"
                 if phase == "rejected"
                 else "replay"
-                if phase == "approved" or read(row, "idempotent", False)
+                if phase == "approved"
+                or (
+                    read(row, "idempotent", False)
+                    and (
+                        current_idempotent is None or current_idempotent.get(pending["tool"], False)
+                    )
+                )
                 else "approval_replay"
             )
         elif read(row, "outcome") in ("completed", "failed", "unknown"):

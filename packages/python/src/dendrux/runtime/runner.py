@@ -3995,6 +3995,7 @@ async def _prepare_resume(
     user_parts: tuple[ContentPart, ...] | None = None,
     tenant_id: str | None = None,
     pii_mapping: dict[str, str] | None = None,
+    history_records: Any = None,
 ) -> _ResumeContext:
     """Build everything needed to re-enter the loop after a resume.
 
@@ -4077,7 +4078,7 @@ async def _prepare_resume(
         **_recorder_image_kwargs(tenant_id, provider),
     )
 
-    await recorder.restore_history(limits=agent._limits)
+    await recorder.restore_history(limits=agent._limits, records=history_records)
 
     # NOTE: lifecycle hooks (record_run_started/notify_run_started) and
     # injected-history replay are intentionally NOT done here. The caller
@@ -4244,6 +4245,25 @@ def _decided_payload(
             for tc, outcome, reason in outcomes
         ],
     }
+
+
+async def _record_approval_decided(
+    recorder: LoopRecorder,
+    notifier: LoopNotifier | None,
+    run_id: str,
+    iteration: int,
+    data: dict[str, Any],
+    *,
+    event_id: str | None = None,
+) -> None:
+    from dendrux.loops._helpers import notify_governance, record_governance
+    from dendrux.runtime.persistence import PersistenceRecorder
+
+    if event_id is not None and isinstance(recorder, PersistenceRecorder):
+        await recorder._emit_event("approval.decided", iteration, data, event_id=event_id)
+    else:
+        await record_governance(recorder, run_id, "approval.decided", iteration, data)
+    await notify_governance(notifier, run_id, "approval.decided", iteration, data)
 
 
 def _rejection_decided_payload(
@@ -5025,6 +5045,7 @@ async def _resume_core(
     user_parts: tuple[ContentPart, ...] | None = None,
     expected_pause_id: str | None = None,
     _reclaim_pause: PauseState | None = None,
+    _reclaim_history: Any = None,
 ) -> RunResult:
     """Shared resume logic for tool results and clarification input.
 
@@ -5077,17 +5098,19 @@ async def _resume_core(
             raise
     with skill_session.bind():
         # 1. Load pause state
-        raw_pause = await state_store.get_pause_state(run_id)
+        raw_pause = (
+            None if _reclaim_pause is not None else await state_store.get_pause_state(run_id)
+        )
         if _reclaim_pause is not None:
             pause_state = _reclaim_pause
         else:
             if raw_pause is None:
                 raise ValueError(f"Run '{run_id}' has no pause state — cannot resume.")
             pause_state = await _load_pause_state(state_store, run_id, raw_pause, agent, provider)
-        from dendrux.runtime._reclaim import recovery_approval
+        from dendrux.runtime._reclaim import needs_resolution
 
-        recovering = _reclaim_pause is not None or (
-            pause_state.schema_version == 2 and recovery_approval(pause_state)
+        recovering = _reclaim_pause is not None or await needs_resolution(
+            state_store, run_id, pause_state
         )
 
         # 1a. Load pii_mapping for guardrail continuity across pause/resume
@@ -5164,6 +5187,7 @@ async def _resume_core(
                 user_parts=user_parts,
                 tenant_id=run_tenant,
                 pii_mapping=_saved_pii_mapping,
+                history_records=_reclaim_history,
             )
             image_runtime = _image_runtime(agent, state_store, run_tenant, run_id)
 
@@ -5244,13 +5268,6 @@ async def _resume_core(
                 pause_state.pending_tool_calls
             )
             if not recovering and (_is_approval_approve or _is_paused_batch):
-                from dendrux.loops._helpers import (
-                    notify_governance as _ntfy_gov,
-                )
-                from dendrux.loops._helpers import (
-                    record_governance as _rec_gov,
-                )
-
                 decision_map = (
                     await _validated_decisions(agent, ctx, run_id, pause_state, decisions)
                     if _is_approval_approve
@@ -5270,19 +5287,8 @@ async def _resume_core(
                 )
 
                 if _is_approval_approve:
-                    await _rec_gov(
-                        ctx.recorder,
-                        run_id,
-                        "approval.decided",
-                        pause_state.iteration,
-                        approval.decided,
-                    )
-                    await _ntfy_gov(
-                        ctx.notifier,
-                        run_id,
-                        "approval.decided",
-                        pause_state.iteration,
-                        approval.decided,
+                    await _record_approval_decided(
+                        ctx.recorder, ctx.notifier, run_id, pause_state.iteration, approval.decided
                     )
 
                 stop = _approval_stop_result(run_id, pause_state, ctx.history, approval)
@@ -5306,27 +5312,9 @@ async def _resume_core(
                 and tool_results is not None
                 and expected_status == RunStatus.WAITING_APPROVAL.value
             ):
-                from dendrux.loops._helpers import (
-                    notify_governance as _ntfy_gov_r,
-                )
-                from dendrux.loops._helpers import (
-                    record_governance as _rec_gov_r,
-                )
-
                 _rejected_data = _rejection_decided_payload(run_id, pause_state, tool_results)
-                await _rec_gov_r(
-                    ctx.recorder,
-                    run_id,
-                    "approval.decided",
-                    pause_state.iteration,
-                    _rejected_data,
-                )
-                await _ntfy_gov_r(
-                    ctx.notifier,
-                    run_id,
-                    "approval.decided",
-                    pause_state.iteration,
-                    _rejected_data,
+                await _record_approval_decided(
+                    ctx.recorder, ctx.notifier, run_id, pause_state.iteration, _rejected_data
                 )
 
             result = await ctx.resolved_loop.run(
@@ -5545,9 +5533,9 @@ def resume_stream(
             if raw_pause is None:
                 raise ValueError(f"Run '{run_id}' has no pause state — cannot resume.")
             pause_state = await _load_pause_state(store, run_id, raw_pause, agent, provider)
-            from dendrux.runtime._reclaim import recovery_approval
+            from dendrux.runtime._reclaim import needs_resolution
 
-            recovering = pause_state.schema_version == 2 and recovery_approval(pause_state)
+            recovering = await needs_resolution(store, run_id, pause_state)
 
             # 2b. Verify agent identity
             if pause_state.agent_name and pause_state.agent_name != agent.name:
@@ -5679,7 +5667,12 @@ def resume_stream(
                     )
                     await record_run_finished(ctx.recorder, run_id, stopped)
                     await notify_run_finished(ctx.notifier, run_id, stopped)
-                    yield RunEvent(type=RunEventType.RUN_PAUSED, run_result=stopped)
+                    yield RunEvent(
+                        type=RunEventType.RUN_CANCELLED
+                        if stopped.status == RunStatus.CANCELLED
+                        else RunEventType.RUN_PAUSED,
+                        run_result=stopped,
+                    )
                     return
 
             # 8. Approval-execute (inside try/except for proper error handling)
@@ -5713,27 +5706,9 @@ def resume_stream(
                         phase="commentary",
                     )
 
-                from dendrux.loops._helpers import (
-                    notify_governance as _ntfy_gov_s,
-                )
-                from dendrux.loops._helpers import (
-                    record_governance as _rec_gov_s,
-                )
-
                 if _is_approval_approve:
-                    await _rec_gov_s(
-                        ctx.recorder,
-                        run_id,
-                        "approval.decided",
-                        pause_state.iteration,
-                        approval.decided,
-                    )
-                    await _ntfy_gov_s(
-                        ctx.notifier,
-                        run_id,
-                        "approval.decided",
-                        pause_state.iteration,
-                        approval.decided,
+                    await _record_approval_decided(
+                        ctx.recorder, ctx.notifier, run_id, pause_state.iteration, approval.decided
                     )
 
                 stop = _approval_stop_result(run_id, pause_state, ctx.history, approval)
@@ -5763,27 +5738,9 @@ def resume_stream(
                 and stream_results is not None
                 and expected == RunStatus.WAITING_APPROVAL.value
             ):
-                from dendrux.loops._helpers import (
-                    notify_governance as _ntfy_gov_r,
-                )
-                from dendrux.loops._helpers import (
-                    record_governance as _rec_gov_r,
-                )
-
                 _rejected_data_s = _rejection_decided_payload(run_id, pause_state, stream_results)
-                await _rec_gov_r(
-                    ctx.recorder,
-                    run_id,
-                    "approval.decided",
-                    pause_state.iteration,
-                    _rejected_data_s,
-                )
-                await _ntfy_gov_r(
-                    ctx.notifier,
-                    run_id,
-                    "approval.decided",
-                    pause_state.iteration,
-                    _rejected_data_s,
+                await _record_approval_decided(
+                    ctx.recorder, ctx.notifier, run_id, pause_state.iteration, _rejected_data_s
                 )
 
             # 9. Stream the loop (see run_stream for interrupt + closing notes)

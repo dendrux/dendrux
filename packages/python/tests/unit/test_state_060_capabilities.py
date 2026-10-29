@@ -174,3 +174,24 @@ async def test_checkpoint_keywords_refused_before_run(sqlite_engine, method, key
     assert caught.value.capability == "checkpointing"
     assert caught.value.method == method
     assert keyword in caught.value.missing
+
+
+def test_recovery_requires_finalise_unrecoverable_keyword():
+    from dendrux.errors import StoreCapabilityError
+    from dendrux.runtime._capabilities import validate_capabilities
+
+    class OldRecovery:
+        capabilities = state.StoreCapabilities(recovery=True)
+
+        async def mark_lease_expired(self, **kwargs):
+            pass
+
+        async def get_lease_expired(self):
+            pass
+
+        async def reclaim_run(self):
+            pass
+
+    with pytest.raises(StoreCapabilityError) as exc:
+        validate_capabilities(OldRecovery())
+    assert exc.value.missing == ("finalise_unrecoverable",)

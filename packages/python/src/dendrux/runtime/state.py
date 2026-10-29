@@ -484,6 +484,7 @@ class ToolCallReadRecord:
     outcome: str = "completed"
     idempotent: bool = False
     replayed_at: datetime | None = None
+    observation: dict[str, Any] | None = None
 
 
 @dataclass
@@ -1265,6 +1266,7 @@ class StateStore(Protocol):
         max_returned: int,
         reclaim_limit: int,
         cursor: str | None,
+        finalise_unrecoverable: bool = False,
     ) -> MarkResult: ...
 
     async def get_lease_expired(
@@ -4119,6 +4121,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                 ToolCallReadRecord(
                     id=r.id,
                     outcome=r.outcome,
+                    observation=(r.meta or {}).get("dendrux.observation"),
                     idempotent=r.idempotent,
                     replayed_at=_to_aware_utc(r.replayed_at),
                     tool_call_id=r.tool_call_id,
@@ -4252,6 +4255,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         max_returned: int,
         reclaim_limit: int,
         cursor: str | None,
+        finalise_unrecoverable: bool = False,
     ) -> MarkResult:
         """Scan running rows once by id, atomically fencing each expired lease."""
         return cast(
@@ -4263,6 +4267,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                 max_returned=max_returned,
                 reclaim_limit=reclaim_limit,
                 cursor=cursor,
+                on_stale="reclaim" if finalise_unrecoverable else None,
             ),
         )
 
@@ -4349,10 +4354,11 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                         if (on_stale == "error" or row.lease_expired_at is None) and age >= cutoff:
                             return None
                         if row.storage_format == 2 and row.loop not in ("react", "single_call"):
-                            logger.warning(
-                                "Run has unknown recovery loop",
-                                extra={"code": "loop_unknown", "run_id": run_id},
-                            )
+                            if on_stale == "reclaim":
+                                logger.warning(
+                                    "Run has unknown recovery loop",
+                                    extra={"code": "loop_unknown", "run_id": run_id},
+                                )
                             if on_stale is None:
                                 return None
                         limit = (
@@ -4414,9 +4420,14 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                                 session,
                                 run_id,
                                 "run.cancelled" if status == "cancelled" else "run.interrupted",
-                                {"reason": "cancel_requested"}
-                                if status == "cancelled"
-                                else {"failure_reason": reason},
+                                {
+                                    "failure_reason": reason,
+                                    **(
+                                        {"reason": "cancel_requested"}
+                                        if status == "cancelled"
+                                        else {}
+                                    ),
+                                },
                                 iteration_index=row.iteration_count or 0,
                             )
                             await session.commit()
