@@ -1647,7 +1647,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         _validate_persistable(input_data, "input")
         import datetime as _dt
 
-        from sqlalchemy import select
+        from sqlalchemy import select, text
         from sqlalchemy.exc import IntegrityError
 
         from dendrux.db.enums import AgentRunStatus
@@ -1666,6 +1666,15 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
 
         async def _attempt() -> CreateRunResult:
             async with self._session_factory() as session:
+                if parent_run_id is not None and self._engine.dialect.name == "sqlite":
+                    # Reserve the writer before any read snapshot, without ORM onupdate hooks.
+                    await session.execute(
+                        text(
+                            "UPDATE agent_runs SET cancel_requested = cancel_requested "
+                            "WHERE id = :parent"
+                        ),
+                        {"parent": parent_run_id},
+                    )
                 storage_format = await self._creation_storage_format(session)
                 if parent_run_id is not None:
                     from dendrux.errors import RunCancelledError, RunNotFoundError
@@ -2563,6 +2572,15 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         if isinstance(tenant_id, _Unscoped):
             return statement
         _check_scope(tenant_id)
+        if self._engine.dialect.name == "sqlite":
+            from sqlalchemy import String, bindparam, literal_column
+
+            # Keep SQLite on the frontier's key index rather than scanning the tenant.
+            return statement.where(
+                literal_column("+agent_runs.tenant_id").is_not_distinct_from(
+                    bindparam("frontier_tenant", tenant_id, type_=String())
+                )
+            )
         return statement.where(AgentRun.tenant_id.is_not_distinct_from(tenant_id))
 
     async def mark_cancel_requested(self, run_ids: Sequence[str], *, tenant_id: TenantScope) -> int:
@@ -2573,42 +2591,82 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
 
         if not run_ids:
             return 0
-        async with self._session_factory() as session:
-            result = await session.execute(
-                self._frontier_scope(
-                    update(AgentRun)
-                    .where(self._frontier_predicate(AgentRun.id, run_ids))
-                    .values(cancel_requested=True)
-                    .execution_options(synchronize_session=False),
-                    tenant_id,
+
+        async def _attempt() -> int:
+            async with self._session_factory() as session:
+                result = await session.execute(
+                    self._frontier_scope(
+                        update(AgentRun)
+                        .where(
+                            self._frontier_predicate(AgentRun.id, run_ids),
+                            AgentRun.status.notin_(_TERMINAL_STATUS_VALUES),
+                        )
+                        .values(cancel_requested=True)
+                        .execution_options(synchronize_session=False),
+                        tenant_id,
+                    )
                 )
-            )
-            await session.commit()
-            return int(getattr(result, "rowcount", 0))
+                await session.commit()
+                return int(getattr(result, "rowcount", 0))
+
+        return await retry_transient_db(_attempt, label="mark_cancel_requested", run_id=run_ids[0])
 
     async def get_children_page(
         self, parent_ids: Sequence[str], *, after: str | None, limit: int, tenant_id: TenantScope
     ) -> list[str]:
-        """Read one tenant-scoped keyset page of a marked frontier's children."""
-        from sqlalchemy import select
+        """Read a tenant-scoped keyset page, capped at 500 children of a marked frontier."""
+        from sqlalchemy import String, bindparam, func, select, true
 
         from dendrux.db.models import AgentRun
 
         _positive_page(limit)
         if not parent_ids:
             return []
-        statement = self._frontier_scope(
-            select(AgentRun.id).where(self._frontier_predicate(AgentRun.parent_run_id, parent_ids)),
-            tenant_id,
-        )
-        if after is not None:
-            statement = statement.where(AgentRun.id > after)
-        async with self._session_factory() as session:
-            return list(
-                (
-                    await session.scalars(statement.order_by(AgentRun.id).limit(min(limit, 500)))
-                ).all()
+        size = min(limit, 500)
+        if self._engine.dialect.name == "postgresql":
+            from sqlalchemy.dialects.postgresql import ARRAY
+
+            parents = (
+                func.unnest(bindparam("frontier", sorted(set(parent_ids)), type_=ARRAY(String())))
+                .table_valued("id")
+                .render_derived(name="parents")
             )
+            # Fence parent selection before the cursor/sort: otherwise even LATERAL
+            # can choose a history-wide primary-key range scan for every parent.
+            scoped = (
+                self._frontier_scope(
+                    select(AgentRun.id).where(AgentRun.parent_run_id == parents.c.id), tenant_id
+                )
+                .correlate(parents)
+                .offset(0)
+                .subquery("scoped_children")
+            )
+            per_parent = select(scoped.c.id)
+            if after is not None:
+                per_parent = per_parent.where(scoped.c.id > after)
+            children = per_parent.order_by(scoped.c.id).limit(size).lateral("children")
+            statement = (
+                select(children.c.id)
+                .select_from(parents.join(children, true()))
+                .order_by(children.c.id)
+                .limit(size)
+            )
+        else:
+            statement = self._frontier_scope(
+                select(AgentRun.id).where(
+                    self._frontier_predicate(AgentRun.parent_run_id, parent_ids)
+                ),
+                tenant_id,
+            )
+            if after is not None:
+                statement = statement.where(AgentRun.id > after)
+            statement = statement.order_by(AgentRun.id).limit(size)
+
+        async def _attempt() -> list[str]:
+            async with self._session_factory() as session:
+                return list((await session.scalars(statement)).all())
+
+        return await retry_transient_db(_attempt, label="get_children_page", run_id=parent_ids[0])
 
     async def get_loop_state(self, run_id: str) -> dict[str, Any] | None:
         """Read the authoritative execution projection."""

@@ -38,10 +38,9 @@ class MCPError(RuntimeError):
 class MCPConnectionError(MCPError):
     """An MCP source could not be connected to or discovered.
 
-    ``transport_detail`` carries the underlying failure with the source's
-    configured credentials removed. It is deliberately kept out of ``str()``:
-    that rendering becomes ``last_error``, which is emitted as a governance
-    event and persisted.
+    ``transport_detail`` is a code-and-count summary or ``None``, never
+    exception text. It is kept out of ``str()``: that rendering becomes
+    ``last_error``, which is emitted as a governance event and persisted.
     """
 
     transport_detail: str | None = None

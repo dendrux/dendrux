@@ -85,9 +85,7 @@ def bounded_step(
         if sqlstate(error) != _LOCK_NOT_AVAILABLE:
             raise
         fields: dict[str, Any] = {"step": step, "timeout_seconds": LOCK_TIMEOUT_SECONDS}
-        # TODO: include older revisions when the closed registry permits them.
-        if revision in {"e8f9a0b1c2d3", "f9a0b1c2d3e4"}:
-            fields["revision"] = revision
+        fields["revision"] = revision
         _codes.log_code(logger, _codes.MIGRATION_LOCK_TIMEOUT, **fields)
         raise RuntimeError(
             f"Timed out acquiring the Dendrux migration lock after {LOCK_TIMEOUT_SECONDS} "

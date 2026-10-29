@@ -2200,8 +2200,8 @@ class Agent:
         (delegated child runs), deepest first and ``run_id`` last. Each frontier
         is durably marked before its children are scanned in pages of 500. A
         child already being created commits before the mark and is included;
-        later child admission is refused. Traversal is bounded by
-        ``Budget.max_subtree_nodes`` (default 10,000); reaching the bound with
+        later child admission is refused. Traversal uses the shared subtree accounting
+        bound, ``Budget.max_subtree_nodes`` (default 10,000); reaching the bound with
         further descendants sets ``meta["cascade_truncated"]`` and logs
         ``cascade_truncated``. Legacy custom stores without frontier methods
         retain snapshot semantics. Per-run outcomes are listed in
@@ -2212,7 +2212,8 @@ class Agent:
         ``tenant_id``: when given, ``run_id`` must belong to exactly that
         tenant (``None`` = untenanted) or ``RunNotFoundError`` is raised,
         and the cascade only reaches descendants of the same tenant.
-        Omitted means unscoped (trusted single-tenant use).
+        Omitted means an unscoped root lookup; the cascade still stays inside
+        the root's tenant (including an untenanted root).
 
         Returning is *not* confirmation that the run stopped. A result
         with a non-terminal ``status`` and ``meta["cancel_requested"]``
@@ -2250,6 +2251,11 @@ class Agent:
         outcomes: list[dict[str, str]] = []
         cascade_count = 0
         to_signal: list[str] = []
+        frontier_signals = (
+            cascade
+            and callable(getattr(store, "mark_cancel_requested", None))
+            and callable(getattr(store, "get_children_page", None))
+        )
         traversal_truncated = False
         if cascade:
             levels, traversal_truncated = await self._mark_cancel_subtree(
@@ -2263,7 +2269,7 @@ class Agent:
                     cascade_count += 1
                     if len(outcomes) < 999:
                         outcomes.append({"run_id": rid, "outcome": outcome})
-                    if outcome != "terminal":
+                    if outcome != "terminal" and not frontier_signals:
                         to_signal.append(rid)
 
         if record.status in _TERMINAL_STATUS_VALUES:
@@ -2279,7 +2285,7 @@ class Agent:
             record = await store.get_run(run_id)
             if record is None:  # pragma: no cover — we just preflight-checked
                 raise RunNotFoundError(run_id)
-            if outcome != "terminal":
+            if outcome != "terminal" and not frontier_signals:
                 to_signal.append(run_id)
             result = _record_to_run_result(record)
         from dendrux.runtime.runner import _recovery_info
@@ -2295,7 +2301,7 @@ class Agent:
             result.meta["cascade_truncated"] = traversal_truncated or cascade_count + 1 > len(
                 outcomes
             )
-        # Signal only after durable requests and the returned snapshot are complete.
+        # Non-cascade and legacy stores signal after the durable request and snapshot.
         for rid in to_signal:
             self._task_manager.cancel(rid)
         return result
@@ -2332,7 +2338,10 @@ class Agent:
             truncated = False
             while frontier:
                 # Wait for creators holding parent FOR SHARE before scanning committed children.
-                await mark(frontier, tenant_id=tenant_id)
+                marked = await mark(frontier, tenant_id=tenant_id)
+                if marked:
+                    for rid in frontier:
+                        self._task_manager.cancel(rid)
                 if truncated:
                     break
                 following: list[str] = []

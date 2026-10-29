@@ -87,7 +87,10 @@ def exception_class_name(exc: BaseException) -> str:
 
 
 def safe_source_exception_detail(source: MCPSource, exc: BaseException) -> str:
-    """Return credential-safe diagnostic text for a source exception.
+    """Return legacy credential-scrubbed text for a source exception.
+
+    This helper does not populate ``MCPConnectionError.transport_detail``;
+    that field is a code-and-count summary or ``None`` and never exception text.
 
     Known credential shapes are scrubbed by exact value. When authentication
     is opaque, no exception text that may have touched it can be proven safe,

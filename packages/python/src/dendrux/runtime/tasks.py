@@ -129,7 +129,7 @@ class RunTaskManager:
             if run_id not in pending:
                 if not pending:
                     owned.cancel()
-                pending.add(run_id)
+                pending.update(rid for rid, task in self._owned.items() if task is owned)
             delivered = True
         return delivered
 

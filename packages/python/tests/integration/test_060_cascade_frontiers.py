@@ -15,6 +15,8 @@ from dendrux.errors import RunCancelledError
 from dendrux.runtime.state import SQLAlchemyStateStore
 from dendrux.types import Budget, generate_ulid
 
+pytestmark = pytest.mark.parametrize("engine", ["sqlite", "sqlite_file", "postgres"], indirect=True)
+
 
 async def seed(store, links, *, tenant="t", status="paused"):
     ids = {name: generate_ulid() for name, _ in links}
@@ -52,7 +54,13 @@ def observe_frontiers(store, monkeypatch):
     async def scanning(ids, **kwargs):
         assert tuple(ids) in marks, "frontier scanned before durable mark"
         for rid in ids:
-            assert (await store.get_run(rid)).cancel_requested
+            row = await store.get_run(rid)
+            assert row.cancel_requested or row.status in {
+                "success",
+                "error",
+                "cancelled",
+                "max_iterations",
+            }
         assert not finalized, "finalization began before marking finished"
         result = await scan(ids, **kwargs)
         scans.append((tuple(ids), kwargs["after"], len(result)))
@@ -120,11 +128,14 @@ async def test_frontiers_mark_before_scan_and_finalize_deepest(store, monkeypatc
     if shape == "terminal_root":
         assert root not in finalized
         assert result.status.value == "success"
+        assert result.meta["cancel_requested"] is False
     else:
         assert finalized[-1] == root
     if shape == "terminal":
         assert ids["c"] not in finalized
-        assert (await store.get_run(ids["c"])).status == "success"
+        terminal = await store.get_run(ids["c"])
+        assert terminal.status == "success"
+        assert terminal.cancel_requested is False
         assert finalized.index(ids["g"]) < finalized.index(root)
     elif "g" in ids and shape != "star":
         assert finalized.index(ids["g"]) < finalized.index(ids["c"])
@@ -210,7 +221,8 @@ async def test_frontier_store_statement_budget(store, engine, size, record_prope
     print(f"{engine.dialect.name} frontier={size}: mark+scan statements={len(statements)}")
     assert len(statements) == 2
     if engine.dialect.name == "postgresql":
-        assert all("ANY" in sql for sql in statements)
+        assert "ANY" in statements[0]
+        assert "unnest" in statements[1] and "LATERAL" in statements[1]
         assert all("IS NOT DISTINCT FROM" in sql for sql in statements)
 
 

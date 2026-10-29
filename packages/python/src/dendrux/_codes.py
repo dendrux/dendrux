@@ -201,7 +201,7 @@ _ENUMS = {
             "uq_tool_calls_run_call",
         ]
     ),
-    "revision": frozenset(["e8f9a0b1c2d3", "f9a0b1c2d3e4"]),
+    "revision": frozenset(["d7e8f9a0b1c2", "e8f9a0b1c2d3", "f9a0b1c2d3e4"]),
     "step": frozenset(
         [
             "add.agent_runs.last_reclaimed_at",

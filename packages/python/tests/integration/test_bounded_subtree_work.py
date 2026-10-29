@@ -85,9 +85,7 @@ async def test_budget_rollup_fails_closed_at_traversal_bound(store, engine, capl
         event.remove(engine.sync_engine, "before_cursor_execute", capture)
 
 
-async def test_cascade_marks_frontiers_before_pages_and_signals_after_marking(
-    store, engine, monkeypatch
-):
+async def test_cascade_signals_pages_before_reading_next_page(store, engine, monkeypatch):
     await seed_tree(store)
     agent = Agent(prompt="p", state_store=store)
     pages = []
@@ -112,7 +110,7 @@ async def test_cascade_marks_frontiers_before_pages_and_signals_after_marking(
         return result
 
     async def page(frontier, **kwargs):
-        assert not signals
+        assert set(frontier) <= set(signals), "frontier tasks must be signalled before scanning"
         assert set(frontier) <= marked
         rows = await original(frontier, **kwargs)
         assert len(rows) <= 500
@@ -125,7 +123,13 @@ async def test_cascade_marks_frontiers_before_pages_and_signals_after_marking(
         store, "get_descendant_page", lambda *a, **kw: pytest.fail("snapshot traversal used")
     )
     monkeypatch.setattr(store, "get_subtree", lambda *a, **kw: pytest.fail("full tree loaded"))
-    monkeypatch.setattr(agent._task_manager, "cancel", lambda rid: signals.append(rid))
+
+    def signal(rid):
+        assert rid in marked, "signal preceded durable frontier mark"
+        assert rid not in signals, "duplicate cascade signal"
+        signals.append(rid)
+
+    monkeypatch.setattr(agent._task_manager, "cancel", signal)
     try:
         result = await agent.cancel_run("00000000000000000000000104", cascade=True)
         assert len(signals) == 2500

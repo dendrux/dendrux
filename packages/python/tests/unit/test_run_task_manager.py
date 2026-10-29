@@ -139,3 +139,31 @@ class TestInterruptSignals:
         with contextlib.suppress(asyncio.CancelledError):
             await task
         assert task.cancelled()
+
+
+async def test_owned_task_interrupt_records_all_nested_runs_once():
+    """A root interrupt reaches its awaited child before the next frontier exists."""
+    manager = RunTaskManager()
+    ready = asyncio.Event()
+    observed = []
+    root, child = "00000000000000000000000105", "00000000000000000000000106"
+
+    async def work():
+        manager.register_current(root)
+        manager.register_current(child)
+        ready.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            observed.extend([manager.take_interrupt(child), manager.take_interrupt(root)])
+            return asyncio.current_task().cancelling()
+        finally:
+            manager.release_current(child)
+            manager.release_current(root)
+
+    task = manager.spawn(root, work())
+    await ready.wait()
+    assert manager.cancel(root)
+    assert await asyncio.wait_for(task, 5) == 1
+    assert observed == [(True, True), (True, False)]
+    assert not manager._pending and not manager._owned
