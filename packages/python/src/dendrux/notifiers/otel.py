@@ -31,8 +31,9 @@ import json
 import logging
 from typing import TYPE_CHECKING, Any
 
-from dendrux.errors import ProviderError, safe_exception_info
+from dendrux.errors import provider_error_in
 from dendrux.loops.base import BaseNotifier
+from dendrux.runtime._tracelink import validate_trace_link
 from dendrux.types import ErrorInfo
 
 if TYPE_CHECKING:
@@ -42,6 +43,7 @@ try:
     from opentelemetry import trace
     from opentelemetry.context import Context
     from opentelemetry.trace import Span, Status, StatusCode, Tracer
+    from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 
     _OTEL_AVAILABLE = True
 except ImportError:  # pragma: no cover - import guard
@@ -116,12 +118,35 @@ class OpenTelemetryNotifier(BaseNotifier):
     # Run-level (root span)
     # ------------------------------------------------------------------
 
+    def trace_link(self, run_id: str) -> str | None:
+        """Return the active run span as a persistable W3C traceparent."""
+        return self._span_link(self._run_spans.get(run_id))
+
+    def current_span_link(self, run_id: str, tool_call_id: str) -> str | None:
+        """Return only the active span for this run and tool call."""
+        return self._span_link(self._tool_spans.get((run_id, tool_call_id)))
+
+    @staticmethod
+    def _span_link(span: Span | None) -> str | None:
+        if span is None:
+            return None
+        try:
+            carrier: dict[str, str] = {}
+            TraceContextTextMapPropagator().inject(
+                carrier, context=trace.set_span_in_context(span, Context())
+            )
+            return validate_trace_link(carrier.get("traceparent"))
+        except Exception as exc:  # noqa: BLE001 - fail open
+            _LOG.warning("OpenTelemetryNotifier span link failed: %s", type(exc).__name__)
+            return None
+
     async def on_run_started(
         self,
         run_id: str,
         *,
         agent_name: str | None = None,
         agent_model: str | None = None,
+        trace_link: str | None = None,
     ) -> None:
         try:
             span_name = f"{_OP_INVOKE} {agent_name}" if agent_name else _OP_INVOKE
@@ -137,7 +162,13 @@ class OpenTelemetryNotifier(BaseNotifier):
                 # on the LLM call span, not the agent operation span.
                 self._run_models[run_id] = agent_model
 
-            span = self._tracer.start_span(span_name, attributes=attributes)
+            link = validate_trace_link(trace_link)
+            parent = (
+                TraceContextTextMapPropagator().extract({"traceparent": link}, context=Context())
+                if link is not None
+                else None
+            )
+            span = self._tracer.start_span(span_name, context=parent, attributes=attributes)
             self._run_spans[run_id] = span
         except Exception as exc:  # noqa: BLE001 - fail open
             _LOG.warning("OpenTelemetryNotifier.on_run_started failed: %s", type(exc).__name__)
@@ -157,6 +188,11 @@ class OpenTelemetryNotifier(BaseNotifier):
             span.set_attribute("dendrux.run.status", result.status.value)
             if result.error_info is not None:
                 _set_error_info(span, result.error_info)
+            if result.status.value in {"error", "max_iterations", "cancelled"}:
+                description = (
+                    result.error_info.safe_message if result.error_info is not None else None
+                )
+                span.set_status(Status(StatusCode.ERROR, description))
             else:
                 span.set_status(Status(StatusCode.OK))
             span.end()
@@ -338,8 +374,7 @@ class OpenTelemetryNotifier(BaseNotifier):
             if tool_result.success:
                 span.set_status(Status(StatusCode.OK))
             else:
-                err_msg = tool_result.error or "tool returned success=false"
-                span.set_status(Status(StatusCode.ERROR, err_msg))
+                span.set_status(Status(StatusCode.ERROR))
             span.end()
         except Exception as exc:  # noqa: BLE001 - fail open
             _LOG.warning("OpenTelemetryNotifier.on_tool_completed failed: %s", type(exc).__name__)
@@ -407,11 +442,9 @@ class OpenTelemetryNotifier(BaseNotifier):
                 continue
             try:
                 span.set_attribute("dendrux.span.orphan_close_reason", reason)
-                if isinstance(error, ProviderError):
+                if error is not None:
                     _set_span_error(span, error)
                 else:
-                    if error is not None:
-                        span.record_exception(error)
                     span.set_status(Status(StatusCode.ERROR, reason))
                 span.end()
             except Exception as exc:  # noqa: BLE001 - fail open
@@ -424,7 +457,7 @@ class OpenTelemetryNotifier(BaseNotifier):
             try:
                 span.set_attribute("dendrux.span.orphan_close_reason", reason)
                 span.set_attribute("dendrux.tool.success", False)
-                if isinstance(error, ProviderError):
+                if error is not None:
                     _set_span_error(span, error)
                 else:
                     span.set_status(Status(StatusCode.ERROR, reason))
@@ -494,12 +527,9 @@ def _set_error_info(span: Any, info: ErrorInfo) -> None:
 
 
 def _set_span_error(span: Any, error: BaseException) -> None:
-    if isinstance(error, ProviderError):
-        _set_error_info(span, ErrorInfo.from_error(error))
+    provider_error = provider_error_in(error)
+    if provider_error is not None:
+        _set_error_info(span, ErrorInfo.from_error(provider_error))
     else:
-        diagnostic = safe_exception_info(error)
-        if diagnostic is True:
-            span.record_exception(error)
-        elif diagnostic is not False:
-            span.record_exception(diagnostic[1])
-        span.set_status(Status(StatusCode.ERROR, str(error)))
+        span.add_event("exception", attributes={"exception.type": type(error).__name__})
+        span.set_status(Status(StatusCode.ERROR))

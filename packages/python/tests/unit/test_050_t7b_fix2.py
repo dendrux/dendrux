@@ -4,7 +4,6 @@ import ast
 import inspect
 import json
 import logging
-import traceback
 from dataclasses import dataclass
 
 import pytest
@@ -150,13 +149,20 @@ async def test_wrapped_provider_error_span_has_only_own_stack():
         try:
             raise TypeError("secondary span bug")
         except TypeError as secondary:
-            own_stack = "".join(traceback.format_exception(secondary, chain=False))
             await notifier.on_run_started("run")
             await notifier.on_run_failed("run", secondary)
     span = exporter.get_finished_spans()[0]
     serialized = json.dumps([dict(e.attributes) for e in span.events])
     assert PRIVATE not in serialized, "span exception stack must omit provider chain"
-    assert span.events[0].attributes["exception.stacktrace"] == own_stack
+    event = span.events[0]
+    assert event.name == "provider.error"
+    assert event.attributes["dendrux.error.category"] == "timeout"
+    assert event.attributes["dendrux.error.timeout_reason"] == "call_deadline"
+    assert event.attributes["dendrux.error.safe_message"] == error.safe_message
+    assert span.status.description == error.safe_message
+    assert "dendrux.error.provider_code" not in event.attributes
+    assert "exception.stacktrace" not in event.attributes
+    assert "secondary span bug" not in serialized
     provider.shutdown()
 
 
