@@ -195,7 +195,11 @@ def _apply_loop_patch(current: dict[str, Any], patch: LoopStatePatch) -> dict[st
             for p in changed.get("pending", [])
         ]
     if patch.set_phase is not None:
-        changed["phase"] = patch.set_phase
+        changed["phase"] = (
+            current.get("phase", "dispatch")
+            if patch.set_phase == "model_next" and patch.remove_pending and changed.get("pending")
+            else patch.set_phase
+        )
     return changed
 
 
@@ -2142,7 +2146,13 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
             await session.commit()
 
     async def _patch_fence(
-        self, session: AsyncSession, run_id: str, claim_epoch: int, patch: LoopStatePatch
+        self,
+        session: AsyncSession,
+        run_id: str,
+        claim_epoch: int,
+        patch: LoopStatePatch,
+        *,
+        count_tool: str | None = None,
     ) -> None:
         from sqlalchemy import case, func, literal, select, update
         from sqlalchemy import cast as sql_cast
@@ -2152,6 +2162,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
 
         if "pending" in patch.set_fields:
             raise ValueError("A patch cannot replace pending; remove calls by identity")
+        _validate_checkpoint(run_id, dict(patch.set_fields))
         if self._engine.dialect.name == "postgresql":
             from sqlalchemy import Text
             from sqlalchemy.dialects.postgresql import JSONB, aggregate_order_by, array
@@ -2191,21 +2202,52 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                 changed = func.jsonb_set(changed, array(["pending"], type_=Text), kept, True)
             fields = dict(patch.set_fields)
             if patch.set_phase is not None:
-                fields["phase"] = patch.set_phase
+                if patch.set_phase == "model_next" and patch.remove_pending:
+                    phase = case(
+                        (func.jsonb_array_length(kept) == 0, literal("model_next")),
+                        else_=base["phase"].as_string(),
+                    )
+                    changed = func.jsonb_set(
+                        changed,
+                        array(["phase"], type_=Text),
+                        func.to_jsonb(sql_cast(phase, Text)),
+                        True,
+                    )
+                else:
+                    fields["phase"] = patch.set_phase
             if fields:
                 changed = changed.op("||")(literal(fields, JSONB))
+            if count_tool is not None:
+                counts: Any = func.coalesce(base["tool_counts"], literal({}, JSONB))
+                count = func.coalesce(base["tool_counts"][count_tool].as_integer(), 0) + 1
+                counts = counts.op("||")(func.jsonb_build_object(literal(count_tool, Text), count))
+                changed = func.jsonb_set(changed, array(["tool_counts"], type_=Text), counts, True)
             result = await session.execute(
                 update(AgentRun)
-                .where(AgentRun.id == run_id, AgentRun.claim_epoch == claim_epoch)
+                .where(
+                    AgentRun.id == run_id,
+                    AgentRun.claim_epoch == claim_epoch,
+                    func.octet_length(sql_cast(changed, Text)) <= 32768,
+                )
                 .values(updated_at=_dt.datetime.now(_dt.UTC), loop_state=changed)
             )
             if not getattr(result, "rowcount", 0):
+                epoch = await session.scalar(
+                    select(AgentRun.claim_epoch).where(AgentRun.id == run_id)
+                )
+                if epoch == claim_epoch:
+                    _checkpoint_error(run_id)
                 logger.warning("Run fenced", extra={"run_id": run_id, "code": "run_fenced"})
                 raise RunFencedError(run_id, claim_epoch=claim_epoch)
         else:
             await self._fence(session, run_id, claim_epoch)
             current = await session.scalar(select(AgentRun.loop_state).where(AgentRun.id == run_id))
             changed = _apply_loop_patch(current or {}, patch)
+            if count_tool is not None:
+                counts = dict(changed.get("tool_counts", {}))
+                counts[count_tool] = counts.get(count_tool, 0) + 1
+                changed["tool_counts"] = counts
+            _validate_checkpoint(run_id, changed)
             await session.execute(
                 update(AgentRun).where(AgentRun.id == run_id).values(loop_state=changed)
             )
@@ -2323,7 +2365,13 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         if meta is not None:
             values["meta"] = meta
         async with self._session_factory() as session:
-            await self._patch_fence(session, run_id, claim_epoch, loop_state_patch)
+            await self._patch_fence(
+                session,
+                run_id,
+                claim_epoch,
+                loop_state_patch,
+                count_tool=(observation.meta or {}).get("tool_name"),
+            )
             row_id = (
                 await session.execute(
                     update(ToolCallRecord)
@@ -2385,6 +2433,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
             _validate_checkpoint(run_id, changed)
             pause = dict(row.pause_data or {})
             pause.pop("submission", None)
+            pause.pop("submitted", None)
             for trace in traces:
                 await self._insert_trace(session, run_id, trace)
             await session.execute(
@@ -2846,7 +2895,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         failure_reason: str | None = None,
         claim_epoch: int | None = None,
     ) -> bool:
-        from sqlalchemy import update
+        from sqlalchemy import case, cast, func, literal, update
 
         from dendrux.db.models import AgentRun
 
@@ -2857,6 +2906,23 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
             "cancel_requested": False,
             "pause_requested": False,
         }
+        if self._engine.dialect.name == "postgresql":
+            from sqlalchemy.dialects.postgresql import JSONB
+
+            base = func.coalesce(
+                func.nullif(cast(AgentRun.loop_state, JSONB), literal(None, JSONB)),
+                literal({}, JSONB),
+            )
+            finalized_state: Any = base.op("||")(literal({"phase": "finalizing"}, JSONB))
+        else:
+            finalized_state = func.json_set(
+                func.coalesce(func.nullif(AgentRun.loop_state, "null"), "{}"),
+                "$.phase",
+                "finalizing",
+            )
+        values["loop_state"] = case(
+            (AgentRun.storage_format == 2, finalized_state), else_=AgentRun.loop_state
+        )
         if iteration_count is not None:
             values["iteration_count"] = iteration_count
         if answer is not None or total_usage is not None:
@@ -3709,10 +3775,16 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                     )
                 ).one()
                 values: dict[str, Any] = {}
-                if run.storage_format == 2 and submission is not None:
-                    merged["submission"] = {
-                        k: v for k, v in submission.items() if k != "reserved_order_index"
-                    }
+                if run.storage_format == 2:
+                    if submission is None:
+                        from dendrux.errors import PersistenceError
+
+                        logger.warning(
+                            "Missing submission descriptor",
+                            extra={"run_id": run_id, "code": "submission_missing"},
+                        )
+                        raise PersistenceError(code="submission_missing")
+                    merged["submitted"] = dict(submitted_data)
                     loop_state = dict(run.loop_state or {})
                     loop_state["submission"] = {
                         k: v for k, v in submission.items() if k != "payload"

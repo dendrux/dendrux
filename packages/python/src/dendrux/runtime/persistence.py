@@ -292,6 +292,12 @@ class PersistenceRecorder(BaseRecorder):
         self._state_payloads: dict[str, str] = {}
         self._seed_input_pending = any(t.role == "user" for t in seed_traces or [])
         self._durable_state = deepcopy(self._loop_state)
+        self._started_calls: set[str] = set()
+        self._completed_observations: set[str] = set()
+        self._tool_idempotent: dict[str, bool] = {}
+        self._result_formatter: Any = None
+        self._consumed_user_count = 0
+        self._final_trace: Any = None
 
     async def restore_history(self, *, limits: Any) -> None:
         if not self._format2:
@@ -309,6 +315,8 @@ class PersistenceRecorder(BaseRecorder):
             return
         self._loop_source = source
         live = source()
+        self._tool_idempotent = live.get("idempotent", {})
+        self._result_formatter = live.get("format_result")
         for target, saved_value in (
             (live["tool_counts"], self._loop_state.get("tool_counts")),
             (live["pii_counters"], self._loop_state.get("pii", {}).get("counters")),
@@ -437,6 +445,85 @@ class PersistenceRecorder(BaseRecorder):
         await retry_critical(write, label="checkpoint_step", run_id=self._run_id)
         self._durable_state = snapshot
 
+    def finalization_trace(self) -> Any:
+        """Return the caller-owned final trace for the atomic terminal transaction."""
+        return self._final_trace
+
+    def execution_counts(self) -> dict[str, int] | None:
+        """Return checkpoint counters even when history has been compacted."""
+        return dict(self._loop_state.get("tool_counts", {})) if self._format2 else None
+
+    def configure_tools(self, definitions: list[ToolDef]) -> None:
+        """Load trusted execution hints before a direct approval-resume dispatch."""
+        self._tool_idempotent = {d.name: d.idempotent for d in definitions}
+
+    async def consume_resume(self, messages: list[Message]) -> None:
+        """Commit submitted observations or an approval decision exactly once."""
+        from dendrux.errors import PersistenceError
+        from dendrux.runtime.state import LoopStatePatch, _apply_loop_patch
+
+        descriptor = self._loop_state.get("submission")
+        if not self._format2 or descriptor is None:
+            return
+        raw = await self._store.get_pause_state(self._run_id) or {}
+        payload = raw.get("submitted", {})
+        pending = {p["call_id"]: p for p in self._loop_state.get("pending", [])}
+        phases = {}
+        if descriptor["kind"] == "approval":
+            decisions = {
+                d["call_id"]: d["approved"] for d in payload.get("submitted_decisions", [])
+            }
+            for call_id in descriptor["call_ids"]:
+                call = pending.get(call_id)
+                if call is None or call["phase"] != "gated":
+                    continue
+                if call.get("decision_id") != f"{descriptor['pause_id']}:{call_id}":
+                    logger.warning(
+                        "Approval generation mismatch",
+                        extra={"run_id": self._run_id, "code": "submission_generation"},
+                    )
+                    raise PersistenceError(code="submission_generation")
+                phases[call_id] = (
+                    "approved"
+                    if decisions.get(call_id, payload.get("approved")) is True
+                    else "rejected"
+                )
+        traces = []
+        removed = []
+        for i, message in enumerate(messages):
+            call = pending.get(message.call_id or "")
+            order = call["order_index"] if call else descriptor["reserved_order_index"] + i
+            traces.append(message_trace(message, order, tenant_scope=self._tenant_scope))
+            self._order_index = max(self._order_index, order + 1)
+            if message.call_id is not None:
+                removed.append(message.call_id)
+            else:
+                self._consumed_user_count += 1
+        patch = LoopStatePatch(
+            remove_pending=tuple(removed),
+            set_call_phase=phases,
+            set_phase="dispatch" if len(pending) > len(removed) else "model_next",
+            set_fields={"trace_order_offset": self._order_index},
+        )
+
+        async def consume() -> None:
+            await self._store.consume_submission(
+                self._run_id,
+                claim_epoch=getattr(self._store, "claim_epoch", 0),
+                submission_id=descriptor["submission_id"],
+                traces=traces,
+                patch=patch,
+            )
+
+        await retry_critical(consume, label="consume_submission", run_id=self._run_id)
+        self._loop_state = _apply_loop_patch(self._loop_state, patch)
+        self._loop_state["submission"] = None
+        self._completed_observations.update(removed)
+        self._known_history.extend(
+            {"role": t.role, "content": t.content, "meta": t.meta} for t in traces
+        )
+        self._durable_state = deepcopy(self._loop_state)
+
     def order_observations(self, history: list[Message]) -> None:
         """Use reserved call order for each format-2 batch, including resumed batches."""
         if not self._format2:
@@ -506,6 +593,10 @@ class PersistenceRecorder(BaseRecorder):
         if pause is not None:
             from dendrux.types import Message, Role
 
+            if self._final_trace is not None:
+                await self._checkpoint(self._final_trace)
+                self._final_trace = None
+
             prefix = [
                 Message(role=Role.SYSTEM, content=e["content"])
                 for e in self._known_history
@@ -528,8 +619,18 @@ class PersistenceRecorder(BaseRecorder):
             self._loop_state["pending"] = [
                 {
                     **p,
-                    "phase": "gated" if p["call_id"] in gates else p["phase"],
-                    "decision_id": f"{pause.pause_id}:{p['call_id']}"
+                    "phase": p["phase"]
+                    if p["phase"] in ("approved", "rejected")
+                    and p["call_id"] in (pause.pending_decisions or {})
+                    else "gated"
+                    if p["call_id"] in gates
+                    else "client"
+                    if p.get("target") == "client"
+                    else p["phase"],
+                    "decision_id": p.get("decision_id")
+                    if p["phase"] in ("approved", "rejected")
+                    and p["call_id"] in (pause.pending_decisions or {})
+                    else f"{pause.pause_id}:{p['call_id']}"
                     if p["call_id"] in gates
                     else p.get("decision_id"),
                 }
@@ -605,6 +706,12 @@ class PersistenceRecorder(BaseRecorder):
     async def on_message_appended(self, run_id: str, message: Message, iteration: int) -> None:
         """Persist a message to react_traces. FAIL-CLOSED."""
         if self._format2:
+            if message.role.value == "user" and self._consumed_user_count:
+                self._consumed_user_count -= 1
+                return
+            if message.call_id in self._completed_observations:
+                self._completed_observations.remove(message.call_id)
+                return
             # The runner's seed already includes its input. Resume injections
             # occur before bind_loop and still need their own trace.
             if self._seed_input_pending and message.role.value == "user":
@@ -657,7 +764,24 @@ class PersistenceRecorder(BaseRecorder):
                 self._order_index += len(message.tool_calls)
                 self._loop_state["phase"] = "dispatch"
             elif message.role.value == "assistant":
-                self._loop_state["phase"] = "finalizing"
+                from dendrux.types import Clarification
+
+                steps = self._loop_source()["steps"] if self._loop_source else []
+                if steps and isinstance(steps[-1].action, Clarification):
+                    await self._state_ref(
+                        "clarification",
+                        {"v": 1, "question": steps[-1].action.question, "pause_message": None},
+                    )
+                    self._loop_state["phase"] = "awaiting_input"
+                elif capabilities(self._store).atomic_completion:
+                    # A kill before the final transaction leaves model_next:
+                    # no committed final answer exists to finalize from yet.
+                    self._loop_state["phase"] = "model_next"
+                    self._final_trace = trace
+                    await self._checkpoint()
+                    return
+                else:
+                    self._loop_state["phase"] = "finalizing"
             await self._checkpoint(trace)
             self._known_history.append(
                 {
@@ -890,7 +1014,57 @@ class PersistenceRecorder(BaseRecorder):
             )
 
     async def on_tool_started(self, run_id: str, tool_call: ToolCall, iteration: int) -> None:
-        """Touch ``last_progress_at`` at dispatch so a long tool starts fresh. BEST-EFFORT."""
+        """Persist an execution intent before an actual server dispatch."""
+        if self._format2:
+            from dendrux.runtime.state import EventWrite
+
+            pending = next(
+                (p for p in self._loop_state.get("pending", []) if p["call_id"] == tool_call.id),
+                None,
+            )
+            if pending is None or pending["phase"] not in ("dispatchable", "approved"):
+                from dendrux.errors import PersistenceError
+
+                code = (
+                    "submission_missing"
+                    if pending and pending["phase"] == "gated"
+                    else "persistence_error"
+                )
+                logger.warning(
+                    "Execution has no dispatchable intent", extra={"run_id": run_id, "code": code}
+                )
+                raise PersistenceError(code=code)
+            if pending.get("target") == "client":
+                return
+            identity = generate_ulid()
+            idempotent = self._tool_idempotent.get(tool_call.name, False)
+            event = EventWrite(
+                generate_ulid(),
+                "tool.started",
+                iteration,
+                {"tool_name": tool_call.name, "call_id": tool_call.id, "idempotent": idempotent},
+                tool_call.id,
+                None,
+            )
+
+            async def write_intent() -> None:
+                await self._store.start_tool_call(
+                    run_id,
+                    claim_epoch=getattr(self._store, "claim_epoch", 0),
+                    row_id=identity,
+                    tool_call_id=tool_call.id,
+                    provider_tool_call_id=tool_call.provider_tool_call_id,
+                    tool_name=tool_call.name,
+                    target="server",
+                    params=tool_call.params or None,
+                    iteration_index=iteration,
+                    idempotent=idempotent,
+                    event=event,
+                )
+
+            await retry_critical(write_intent, label="start_tool_call", run_id=run_id)
+            self._started_calls.add(tool_call.id)
+            return
         try:
             await self._store.touch_progress(self._run_id)
         except RunFencedError:
@@ -950,6 +1124,73 @@ class PersistenceRecorder(BaseRecorder):
             meta[IMAGE_NOTES_META_KEY] = list(tool_result.notes)
         extra: dict[str, Any] = {"meta": meta} if meta else {}
         extra.update(self._edge_kwargs(self._edges("tool_call", tool_call.id, images)))
+
+        if self._format2 and tool_call.id in self._started_calls:
+            from dendrux.runtime.state import EventWrite, LoopStatePatch
+            from dendrux.types import tool_result_message
+
+            pending = next(p for p in self._loop_state["pending"] if p["call_id"] == tool_call.id)
+            message = (self._result_formatter or tool_result_message)(tool_result)
+            observation = message_trace(
+                message, pending["order_index"], tenant_scope=self._tenant_scope
+            )
+            event = EventWrite(
+                generate_ulid(),
+                "tool.completed",
+                iteration,
+                {
+                    "tool_name": tool_call.name,
+                    "target": target,
+                    "success": tool_result.success,
+                    "duration_ms": tool_result.duration_ms,
+                    **{
+                        k: tool_result.meta[k]
+                        for k in ("code", "zombie_threads")
+                        if k in tool_result.meta
+                    },
+                    **({"image_count": len(images)} if images else {}),
+                },
+                tool_call.id,
+                None,
+            )
+            patch = LoopStatePatch(remove_pending=(tool_call.id,), set_phase="model_next")
+
+            async def complete() -> None:
+                await self._store.complete_tool_call(
+                    run_id,
+                    claim_epoch=getattr(self._store, "claim_epoch", 0),
+                    tool_call_id=tool_call.id,
+                    outcome=(
+                        "unknown"
+                        if tool_result.meta.get("code")
+                        in ("outcome_unknown", "timeout_outcome_unknown")
+                        else "completed"
+                        if tool_result.success
+                        else "failed"
+                    ),
+                    result_payload=tool_result.payload,
+                    success=tool_result.success,
+                    duration_ms=tool_result.duration_ms,
+                    error_message=tool_result.error,
+                    replayed=False,
+                    observation=observation,
+                    event=event,
+                    loop_state_patch=patch,
+                    **extra,
+                )
+
+            await retry_critical(complete, label="complete_tool_call", run_id=run_id)
+            self._loop_state["pending"] = [
+                p for p in self._loop_state["pending"] if p["call_id"] != tool_call.id
+            ]
+            self._loop_state["phase"] = "dispatch" if self._loop_state["pending"] else "model_next"
+            counts = self._loop_state.setdefault("tool_counts", {})
+            counts[tool_call.name] = counts.get(tool_call.name, 0) + 1
+            self._completed_observations.add(tool_call.id)
+            self._known_history.append(
+                {"role": observation.role, "content": observation.content, "meta": observation.meta}
+            )
+            return
 
         if capabilities(self._store).retry_ids:
             extra["row_id"] = generate_ulid()
@@ -1013,6 +1254,15 @@ class PersistenceRecorder(BaseRecorder):
         correlation_id: str | None = None,
     ) -> None:
         """Record a governance event. FAIL-CLOSED with retry."""
+        if self._format2 and event_type == "approval.requested":
+            for pending in self._loop_state.get("pending", []):
+                if pending["call_id"] == correlation_id:
+                    pending["phase"] = "gated"
+                    self._loop_state["phase"] = "awaiting_approval"
+                    # Governance runs before server dispatch; no completion is
+                    # outstanding while this checkpoint replaces loop_state.
+                    await self._checkpoint()
+                    break
         await self._emit_event(
             event_type,
             iteration,

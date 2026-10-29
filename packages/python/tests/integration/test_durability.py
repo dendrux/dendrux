@@ -247,6 +247,10 @@ class TestSubmitAndClaimDurability:
     """submit_and_claim retries on transient failures."""
 
     async def test_submit_and_claim_retries_on_commit_failure(self, store):
+        # This fault injection / pause blob exercises the format-1 write path.
+        from tests._fixtures.storage import pin_storage_format
+
+        await pin_storage_format(store._engine, 1)
         await store.create_run("run1", "TestAgent")
         await store.pause_run("run1", status="waiting_client_tool", pause_data={"pending": True})
 
@@ -264,6 +268,10 @@ class TestSubmitAndClaimDurability:
         assert run.status == "running"
 
     async def test_submit_and_claim_retries_on_execute_failure(self, store):
+        # This fault injection / pause blob exercises the format-1 write path.
+        from tests._fixtures.storage import pin_storage_format
+
+        await pin_storage_format(store._engine, 1)
         await store.create_run("run1", "TestAgent")
         await store.pause_run("run1", status="waiting_client_tool", pause_data={"pending": True})
 

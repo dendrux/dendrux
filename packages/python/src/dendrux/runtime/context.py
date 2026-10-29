@@ -109,6 +109,11 @@ class DelegationContext:
     _lease_errors: list[BaseException | None] = field(
         default_factory=lambda: [None], compare=False, repr=False
     )
+    _lease_users: list[int] = field(default_factory=lambda: [0], compare=False, repr=False)
+    _lease_ticker: list[asyncio.Task[None] | None] = field(
+        default_factory=lambda: [None], compare=False, repr=False
+    )
+    _lease_at: list[float] = field(default_factory=lambda: [0.0], compare=False, repr=False)
     trace_link: str | None = None
     tool_span_link: str | None = None
 
@@ -214,6 +219,8 @@ def _heartbeat_target() -> DelegationContext | None:
     ctx = get_delegation_context()
     if ctx is None or not ctx.persisted or ctx.state_store is None:
         return None
+    if ctx._lease_errors[0] is not None:
+        raise ctx._lease_errors[0]
     now = time.monotonic()
     if now - ctx._heartbeat_at[0] < _HEARTBEAT_MIN_INTERVAL_S:
         return None
@@ -229,7 +236,8 @@ def heartbeat() -> None:
     update on the run's event loop and returns immediately, so a long wait
     inside a tool is not swept as ``stale_running``. Calls closer than one
     second apart for the same run are coalesced. No-op outside a persisted
-    run.
+    run. A known fence is re-raised immediately; a newly observed fence is
+    retained and raised by the next heartbeat or enclosing step boundary.
     """
     ctx = _heartbeat_target()
     if ctx is None or ctx.loop is None:
@@ -239,7 +247,15 @@ def heartbeat() -> None:
     def _schedule() -> None:
         task = loop.create_task(_touch(store, run_id))
         _heartbeat_tasks.add(task)
-        task.add_done_callback(_heartbeat_tasks.discard)
+
+        def finished(done: asyncio.Task[None]) -> None:
+            _heartbeat_tasks.discard(done)
+            if not done.cancelled():
+                error = done.exception()
+                if error is not None:
+                    ctx._lease_errors[0] = error
+
+        task.add_done_callback(finished)
 
     try:
         running = asyncio.get_running_loop()
@@ -257,7 +273,7 @@ async def aheartbeat() -> None:
     """Awaitable :func:`heartbeat`: writes ``last_progress_at`` before returning.
 
     Must be awaited on the run's event loop (inside an async tool). Failures
-    are logged, never raised. No-op outside a persisted run.
+    are logged; RunFencedError is re-raised. No-op outside a persisted run.
     """
     ctx = _heartbeat_target()
     if ctx is not None:
@@ -379,6 +395,10 @@ async def _renew_claim(ctx: DelegationContext) -> None:
     if ctx._lease_lock.locked():
         return
     async with ctx._lease_lock:
+        now = time.monotonic()
+        if now - ctx._lease_at[0] < ctx.lease_interval_s:
+            return
+        ctx._lease_at[0] = now
         try:
             async with asyncio.timeout(min(ctx.lease_interval_s / 2, 10.0)):
                 await ctx.state_store.touch_progress(ctx.run_id)
@@ -413,39 +433,34 @@ async def lease_scope() -> AsyncIterator[None]:
         return
     if ctx._lease_errors[0] is not None:
         raise ctx._lease_errors[0]
-    await _renew_claim(ctx)
-    parent = asyncio.current_task()
-    fenced_cancel = False
 
     async def tick() -> None:
-        nonlocal fenced_cancel
-        while True:
+        while ctx._lease_errors[0] is None:
             await asyncio.sleep(ctx.lease_interval_s)
             try:
-                if ctx._lease_errors[0] is None:
-                    await _renew_claim(ctx)
-                if isinstance(ctx._lease_errors[0], RunFencedError):
-                    raise ctx._lease_errors[0]
+                await _renew_claim(ctx)
             except RunFencedError:
-                if parent is not None:
-                    fenced_cancel = True
-                    parent.cancel()
+                # The loop's next boundary raises the stored error in its own
+                # task. Never cancel a consumer while its generator is yielded.
                 return
 
-    ticker = asyncio.create_task(tick())
+    ctx._lease_users[0] += 1
+    if ctx._lease_users[0] == 1:
+        ctx._lease_at[0] = 0.0
+        ctx._lease_ticker[0] = asyncio.create_task(tick())
     try:
+        await _renew_claim(ctx)
         yield
-    except asyncio.CancelledError:
-        if fenced_cancel and parent is not None:
-            parent.uncancel()
-            if parent.cancelling() == 0 and ctx._lease_errors[0] is not None:
-                raise ctx._lease_errors[0] from None
-        raise
     finally:
-        ticker.cancel()
-        # Cancellation of the write precedes waiting for cleanup.
-        done, _ = await asyncio.wait({ticker}, timeout=1.0)
-        if ticker in done and not ticker.cancelled():
-            ticker.exception()
+        ctx._lease_users[0] -= 1
+        if ctx._lease_users[0] == 0:
+            ticker = ctx._lease_ticker[0]
+            ctx._lease_ticker[0] = None
+            if ticker is not None:
+                ticker.cancel()
+                # Cancellation of the write precedes waiting for cleanup.
+                done, _ = await asyncio.wait({ticker}, timeout=1.0)
+                if ticker in done and not ticker.cancelled():
+                    ticker.exception()
     if ctx._lease_errors[0] is not None:
         raise ctx._lease_errors[0]

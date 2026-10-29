@@ -166,6 +166,10 @@ async def test_pause_only_retains_safe_provider_options_and_restores_them(store,
 
 @pytest.mark.parametrize("claim", ["plain", "submit"])
 async def test_resume_claim_refreshes_progress_before_provider_starts(store, claim):
+    # This fault injection / pause blob exercises the format-1 write path.
+    from tests._fixtures.storage import pin_storage_format
+
+    await pin_storage_format(store._engine, 1)
     pause = await agent(store, [tool_call("client_read", pid="a")]).run("go")
     old = dt.datetime.now(dt.UTC) - dt.timedelta(days=1)
     async with store._session_factory() as session:
@@ -253,6 +257,11 @@ async def test_budget_enforcement_survives_lost_forensics_and_retries_usage(stor
 
 
 async def test_retry_removes_unpaired_calls(store, monkeypatch):
+    # This fault injection / pause blob exercises the format-1 write path.
+    from tests._fixtures.storage import pin_storage_format
+
+    await pin_storage_format(store._engine, 1)
+
     @tool()
     async def work() -> str:
         return "ok"

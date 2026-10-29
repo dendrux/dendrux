@@ -66,6 +66,10 @@ async def test_cancel_preserves_exception_despite_store_failure(store, path, fai
 
 @pytest.mark.parametrize("failure", [None, "finalize_run", "save_run_event", "on_run_failed"])
 async def test_claimed_resume_preserves_error_and_notifies(store, failure, caplog):
+    # This fault injection / pause blob exercises the format-1 write path.
+    from tests._fixtures.storage import pin_storage_format
+
+    await pin_storage_format(store._engine, 1)
     a, run_id, results = await paused_client_run(store)
     await store.submit_and_claim(
         run_id,

@@ -328,6 +328,42 @@ async def claim_paused_validated(
     return epoch
 
 
+def submission_descriptor(
+    raw: dict[str, Any], checkpoint: dict[str, Any], payload: dict[str, Any], status: str
+) -> dict[str, Any]:
+    """Describe a validated format-2 submission without embedding its payload."""
+    from dendrux.types import generate_ulid
+
+    kind = (
+        "approval"
+        if status == "waiting_approval"
+        else "input"
+        if "submitted_user_input" in payload
+        else "tool_results"
+    )
+    pending = checkpoint.get("pending", [])
+    ids = (
+        [r["call_id"] for r in payload["submitted_tool_results"]]
+        if "submitted_tool_results" in payload
+        else [r["call_id"] for r in payload["submitted_decisions"]]
+        if "submitted_decisions" in payload
+        else [p["call_id"] for p in pending]
+    )
+    return {
+        "submission_id": generate_ulid(),
+        "kind": kind,
+        "pause_id": raw.get("pause_id"),
+        "payload_ref": {"pause_data_key": "submitted"},
+        "call_ids": ids,
+        "reserved_order_index": checkpoint.get("trace_order_offset", 0),
+    }
+
+
+def submitted_view(raw: dict[str, Any]) -> dict[str, Any]:
+    """Read a submission through legacy parsing helpers without changing stored pause data."""
+    return {**raw, **raw.get("submitted", {})} if raw.get("schema_version") == 2 else raw
+
+
 async def claim_or_raise(
     store: StateStore,
     run_id: str,
@@ -386,9 +422,24 @@ async def claim_or_raise(
     )
 
     # --- Claim: run was expected_status at preflight, attempt CAS. ---
+    from dendrux.runtime._capabilities import capabilities
+
+    descriptor = None
+    if (
+        raw.get("schema_version") == 2
+        and capabilities(store).checkpointing
+        and (submitted_data is not None or approval)
+    ):
+        submitted_data = dict(submitted_data or {})
+        if expected_status == RunStatus.WAITING_APPROVAL:
+            submitted_data["approved"] = approval
+        checkpoint = await store.get_loop_state(run_id) or {}
+        descriptor = submission_descriptor(raw, checkpoint, submitted_data, expected_status.value)
     won: ClaimResult | int | bool
     if submitted_data is not None:
         claim_kwargs: dict[str, Any] = {} if validate is None else {"validate": validate}
+        if descriptor is not None:
+            claim_kwargs["submission"] = descriptor
         if blob_refs:
             claim_kwargs["blob_refs"] = list(blob_refs)
             claim_kwargs["blob_refs_scope"] = blob_refs_scope

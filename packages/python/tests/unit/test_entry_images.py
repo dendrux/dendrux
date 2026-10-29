@@ -148,6 +148,17 @@ class ImageStore(SQLAlchemyStateStore):
             self._add("save_tool_call", run_id, refs)
         return result
 
+    @functools.wraps(SQLAlchemyStateStore.complete_tool_call)
+    async def complete_tool_call(self, run_id: str, **kwargs: Any) -> Any:
+        refs = kwargs.pop("blob_refs", None)
+        scope = kwargs.pop("blob_refs_scope", None)
+        if refs:
+            self._check(run_id, scope, refs)
+        result = await super().complete_tool_call(run_id, **kwargs)
+        if refs:
+            self._add("complete_tool_call", run_id, refs)
+        return result
+
     async def submit_and_claim(self, run_id: str, **kwargs: Any) -> bool:
         refs = kwargs.pop("blob_refs", None)
         scope = kwargs.pop("blob_refs_scope", None)
@@ -1046,6 +1057,10 @@ async def _human_pause(store: ImageStore, agent: Agent) -> str:
 
 class TestUserInputImages:
     async def test_submit_input_with_image(self, store: ImageStore) -> None:
+        # This fault injection / pause blob exercises the format-1 write path.
+        from tests._fixtures.storage import pin_storage_format
+
+        await pin_storage_format(store._engine, 1)
         agent = _agent(store, [LLMResponse(text="thanks")])
         run_id = await _human_pause(store, agent)
         result = await agent.submit_input(run_id, ["here it is", Image.from_bytes(PNG)])
@@ -1060,6 +1075,10 @@ class TestUserInputImages:
         assert resumed.data["user_input"] == "here it is"
 
     async def test_submit_input_text_sequence_stays_text(self, store: ImageStore) -> None:
+        # This fault injection / pause blob exercises the format-1 write path.
+        from tests._fixtures.storage import pin_storage_format
+
+        await pin_storage_format(store._engine, 1)
         agent = _agent(store, [LLMResponse(text="thanks")])
         run_id = await _human_pause(store, agent)
         await agent.submit_input(run_id, ["a", "b"])

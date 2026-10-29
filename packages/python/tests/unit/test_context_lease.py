@@ -59,7 +59,7 @@ async def test_lease_tick_is_call_scoped_and_only_one_write_outstanding():
         context.reset_delegation_context(token)
 
 
-async def test_fenced_tick_cancels_the_inflight_call():
+async def test_fenced_tick_raises_at_step_exit_without_cancelling_the_caller():
     assert hasattr(context, "lease_scope"), "a lost epoch must stop the in-flight call"
 
     class Store:
@@ -74,10 +74,14 @@ async def test_fenced_tick_cancels_the_inflight_call():
     token = context.set_delegation_context(
         context.DelegationContext("run", persisted=True, state_store=Store(), lease_interval_s=0.01)
     )
+    finished_step = False
     try:
         with pytest.raises(RunFencedError):
             async with context.lease_scope():
-                await asyncio.sleep(10)
+                await asyncio.sleep(0.04)
+                assert asyncio.current_task().cancelling() == 0
+                finished_step = True
+        assert finished_step
     finally:
         context.reset_delegation_context(token)
 
@@ -149,4 +153,57 @@ async def test_a23_external_cancellation_cancels_outstanding_renewal():
         assert store.active == 0
     finally:
         task.cancel()
+        context.reset_delegation_context(token)
+
+
+async def test_heartbeat_fence_is_retrieved_and_raised_on_next_step():
+    class Store:
+        capabilities = StoreCapabilities(fenced_writes=True)
+
+        async def touch_progress(self, run_id):
+            raise RunFencedError(run_id, claim_epoch=0)
+
+    loop = asyncio.get_running_loop()
+    ctx = context.DelegationContext("run", persisted=True, state_store=Store(), loop=loop)
+    token = context.set_delegation_context(ctx)
+    errors = []
+    previous = loop.get_exception_handler()
+    loop.set_exception_handler(lambda loop, data: errors.append(data))
+    try:
+        context.heartbeat()
+        await asyncio.sleep(0.03)
+        assert isinstance(ctx._lease_errors[0], RunFencedError)
+        with pytest.raises(RunFencedError):
+            async with context.lease_scope():
+                raise AssertionError("fenced step entered")
+        assert not errors
+    finally:
+        loop.set_exception_handler(previous)
+        context.reset_delegation_context(token)
+
+
+async def test_parallel_scopes_share_one_renewal_clock():
+    class Store:
+        capabilities = StoreCapabilities(fenced_writes=True)
+        count = 0
+
+        async def touch_progress(self, run_id):
+            self.count += 1
+
+    store = Store()
+    ctx = context.DelegationContext("run", persisted=True, state_store=store, lease_interval_s=0.05)
+    token = context.set_delegation_context(ctx)
+
+    async def call(delay):
+        await asyncio.sleep(delay)
+        async with context.lease_scope():
+            await asyncio.sleep(0.12)
+
+    try:
+        await asyncio.gather(*(call(i * 0.002) for i in range(20)))
+        assert 3 <= store.count <= 5
+        before = store.count
+        await asyncio.sleep(0.06)
+        assert store.count == before
+    finally:
         context.reset_delegation_context(token)

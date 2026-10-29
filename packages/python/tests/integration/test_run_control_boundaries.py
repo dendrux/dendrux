@@ -409,6 +409,10 @@ async def test_legacy_control_override_keeps_fencing_without_false_stop(engine):
 
 
 async def test_raw_claimed_entry_can_keep_original_epoch(store):
+    # This fault injection / pause blob exercises the format-1 write path.
+    from tests._fixtures.storage import pin_storage_format
+
+    await pin_storage_format(store._engine, 1)
     from dendrux.runtime.runner import resume_claimed
     from dendrux.runtime.submit import serialize_tool_results
 

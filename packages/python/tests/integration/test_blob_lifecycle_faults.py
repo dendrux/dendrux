@@ -602,6 +602,10 @@ async def test_owner_key_collision_raises_and_rolls_back(engine, store) -> None:
 
 async def test_injected_deadlock_retries_whole_transaction(engine, store, monkeypatch) -> None:
     """A retried attempt re-runs the record and its edges; nothing is duplicated."""
+    # This fault injection / pause blob exercises the format-1 write path.
+    from tests._fixtures.storage import pin_storage_format
+
+    await pin_storage_format(store._engine, 1)
     from sqlalchemy.exc import DBAPIError
 
     import dendrux.runtime.durability as durability

@@ -776,6 +776,10 @@ class TestSubmitAndClaim:
 
     async def test_submit_and_claim_succeeds(self, store) -> None:
         """First caller wins: saves submitted data + transitions to running."""
+        # This fault injection / pause blob exercises the format-1 write path.
+        from tests._fixtures.storage import pin_storage_format
+
+        await pin_storage_format(store._engine, 1)
         await store.create_run("run_sac1", "Agent")
         await store.pause_run(
             "run_sac1", status="waiting_client_tool", pause_data=dict(self._PAUSE_DATA)
@@ -809,6 +813,10 @@ class TestSubmitAndClaim:
 
     async def test_second_caller_loses(self, store) -> None:
         """Second submit_and_claim returns False — first writer wins."""
+        # This fault injection / pause blob exercises the format-1 write path.
+        from tests._fixtures.storage import pin_storage_format
+
+        await pin_storage_format(store._engine, 1)
         await store.create_run("run_sac2", "Agent")
         await store.pause_run(
             "run_sac2", status="waiting_client_tool", pause_data=dict(self._PAUSE_DATA)
@@ -871,6 +879,10 @@ class TestSubmitAndClaim:
 
     async def test_submit_input(self, store) -> None:
         """submit_and_claim works for clarification input too."""
+        # This fault injection / pause blob exercises the format-1 write path.
+        from tests._fixtures.storage import pin_storage_format
+
+        await pin_storage_format(store._engine, 1)
         await store.create_run("run_sac6", "Agent")
         await store.pause_run(
             "run_sac6", status="waiting_human_input", pause_data=dict(self._PAUSE_DATA)

@@ -140,6 +140,10 @@ async def test_interleaved_resume_streams_own_session(store, different_agents):
 
 @pytest.mark.parametrize("claimed", [False, True])
 async def test_malformed_manifest_fails_without_stuck_claim(store, claimed):
+    # This fault injection / pause blob exercises the format-1 write path.
+    from tests._fixtures.storage import pin_storage_format
+
+    await pin_storage_format(store._engine, 1)
     from dendrux.runtime.runner import resume_claimed
 
     a = agent(store, [LLMResponse(tool_calls=[ToolCall(name="client", params={})])], tools=[client])

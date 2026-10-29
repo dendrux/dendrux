@@ -220,6 +220,10 @@ async def test_fresh_pause_id_wins_over_stale_submissions(store):
 
 @pytest.mark.parametrize("plain", [False, True])
 async def test_pause_validation_repeats_inside_claim_transaction(store, plain):
+    # This fault injection / pause blob exercises the format-1 write path.
+    from tests._fixtures.storage import pin_storage_format
+
+    await pin_storage_format(store._engine, 1)
     a = agent(store, [tool_call("client_read", pid="a"), LLMResponse(text="done")])
     paused = await a.run("go")
     name = "claim_paused_run" if plain else "submit_and_claim"
@@ -251,6 +255,10 @@ async def test_pause_validation_repeats_inside_claim_transaction(store, plain):
 
 
 async def test_failed_post_claim_validation_releases_owned_claim(store):
+    # This fault injection / pause blob exercises the format-1 write path.
+    from tests._fixtures.storage import pin_storage_format
+
+    await pin_storage_format(store._engine, 1)
     a = agent(store, [tool_call("client_read", pid="a")])
     paused = await a.run("go")
     claim = await store.submit_and_claim(

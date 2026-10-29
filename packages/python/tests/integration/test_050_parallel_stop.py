@@ -35,6 +35,10 @@ async def slow_side_effect(x: int) -> int:
 
 
 async def test_failed_row_write_stops_the_running_sibling(store):
+    # This fault injection / pause blob exercises the format-1 write path.
+    from tests._fixtures.storage import pin_storage_format
+
+    await pin_storage_format(store._engine, 1)
     LOG.clear()
     original = store.save_tool_call
 

@@ -28,6 +28,8 @@ from dendrux.loops._helpers import (
     final_stop_reason,
     guardrail_meta,
     interruptible,
+    lease_scope,
+    leased_stream,
     notify_governance,
     notify_llm,
     notify_llm_failed,
@@ -428,26 +430,27 @@ class SingleCall(Loop):
                     recorder=recorder,
                     notifier=notifier,
                 ):
-                    if output_type is not None:
-                        from dendrux.llm.structured import structured_complete
+                    async with lease_scope(recorder):
+                        if output_type is not None:
+                            from dendrux.llm.structured import structured_complete
 
-                        response, validated_output = await structured_complete(
-                            provider,
-                            prepared.wire,
-                            output_type,
-                            run_id=resolved_run_id,
-                            cache_key_prefix=cache_key_prefix,
-                            **_pkw,
-                        )
-                    else:
-                        response = await complete_call(
-                            provider,
-                            prepared.wire,
-                            tools=None,
-                            run_id=resolved_run_id,
-                            cache_key_prefix=cache_key_prefix,
-                            **_pkw,
-                        )
+                            response, validated_output = await structured_complete(
+                                provider,
+                                prepared.wire,
+                                output_type,
+                                run_id=resolved_run_id,
+                                cache_key_prefix=cache_key_prefix,
+                                **_pkw,
+                            )
+                        else:
+                            response = await complete_call(
+                                provider,
+                                prepared.wire,
+                                tools=None,
+                                run_id=resolved_run_id,
+                                cache_key_prefix=cache_key_prefix,
+                                **_pkw,
+                            )
 
                     if response.tool_calls:
                         raise RuntimeError(
@@ -830,7 +833,9 @@ class SingleCall(Loop):
                 failure: Exception | None = None
                 visible_deltas = 0
                 try:
-                    async for event in interruptible(provider_stream, interrupt):
+                    async for event in leased_stream(
+                        interruptible(provider_stream, interrupt), recorder
+                    ):
                         if event.type == StreamEventType.TEXT_DELTA:
                             partial_text.append(event.text or "")
                             visible_deltas += 1

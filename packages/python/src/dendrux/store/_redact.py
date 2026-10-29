@@ -431,6 +431,7 @@ _SCHEMAS: dict[str, dict[str, Check]] = {
     },
     # persistence: tool_name and code decided in _special; parse_error hidden
     # (a provider adapter may set it), raw_length kept
+    "tool.started": {"tool_name": _declared, "target": _enum(_TARGETS)},
     "tool.completed": {
         "tool_name": _declared,
         "target": _enum(_TARGETS),
@@ -691,6 +692,7 @@ def _special(event: StoredEvent, raw: dict[str, Any], shown: dict[str, Any], ctx
 # it, and "<unknown_tool>" otherwise (missing or partial records, custom
 # stores, older runs, standalone ``redact_event``).
 _TOOL_NAME_PATHS: dict[str, tuple[str | None, str]] = {
+    "tool.started": (None, "tool_name"),
     "tool.completed": (None, "tool_name"),
     "approval.requested": (None, "tool_name"),
     "policy.denied": (None, "tool_name"),

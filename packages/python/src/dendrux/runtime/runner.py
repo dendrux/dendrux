@@ -870,17 +870,56 @@ async def _persist_loop_outcome(
     # that finished — its work and side effects happened.
     _run_pii = result.meta.get("pii_mapping")
     failure_kwargs = _terminal_failure_kwargs(state_store, result)
-    finalize_won = await state_store.finalize_run(
-        run_id,
-        status=result.status.value,
-        answer=result.answer,
-        iteration_count=result.iteration_count,
-        total_usage=result.usage,
-        expected_current_status="running",
-        pii_mapping=_run_pii,
-        error=result.error,
-        **failure_kwargs,
+    from dendrux.runtime._capabilities import capabilities
+    from dendrux.runtime.state import EventWrite
+
+    stop_reason = result.stop_reason if result.status == RunStatus.SUCCESS else None
+    event_type = "run.error" if result.status == RunStatus.ERROR else "run.completed"
+    event_data = {
+        **({"error": result.error} if result.status == RunStatus.ERROR else {}),
+        "status": result.status.value,
+        "stop_reason": stop_reason,
+        "truncated": stop_reason == "max_tokens",
+    }
+    atomic_final = (
+        getattr(state_store, "storage_format", 1) == 2
+        and capabilities(state_store).atomic_completion
     )
+    if atomic_final:
+        event = EventWrite(
+            generate_ulid(), event_type, result.iteration_count, event_data, None, None
+        )
+        final_trace = getattr(recorder, "finalization_trace", lambda: None)()
+        finalize_won = (
+            await state_store.finalize_with_event(
+                run_id,
+                status=result.status.value,
+                allowed_current_statuses=["running"],
+                answer=result.answer,
+                iteration_count=result.iteration_count,
+                total_usage=result.usage,
+                pii_mapping=_run_pii,
+                error=result.error,
+                event_type=event_type,
+                event_data=event_data,
+                trace=final_trace,
+                event=event,
+                **failure_kwargs,
+            )
+            is not None
+        )
+    else:
+        finalize_won = await state_store.finalize_run(
+            run_id,
+            status=result.status.value,
+            answer=result.answer,
+            iteration_count=result.iteration_count,
+            total_usage=result.usage,
+            expected_current_status="running",
+            pii_mapping=_run_pii,
+            error=result.error,
+            **failure_kwargs,
+        )
     if not finalize_won:
         return await _persisted(result.status)
     if unmapped_placeholders:
@@ -890,20 +929,10 @@ async def _persist_loop_outcome(
             "guardrail.unmapped_placeholder",
             {"placeholders": unmapped_placeholders},
         )
-    stop_reason = result.stop_reason if result.status == RunStatus.SUCCESS else None
     if stop_reason is not None:
         await _record_stop_reason(state_store, run_id, stop_reason)
-    await _emit_event(
-        state_store,
-        run_id,
-        "run.error" if result.status == RunStatus.ERROR else "run.completed",
-        {
-            **({"error": result.error} if result.status == RunStatus.ERROR else {}),
-            "status": result.status.value,
-            "stop_reason": stop_reason,
-            "truncated": stop_reason == "max_tokens",
-        },
-    )
+    if not atomic_final:
+        await _emit_event(state_store, run_id, event_type, event_data)
     finished = _wrap(status=result.status, won=True)
     await _attach_undelivered_notes(state_store, run_id, finished)
     return finished
@@ -3879,6 +3908,9 @@ async def _replay_resume_injected_history(
     history = ctx.history
     recorder = ctx.recorder
     extra_notifier = ctx.notifier
+    consume = getattr(recorder, "consume_resume", None)
+    if consume is not None:
+        await consume(history[len(pause_state.history) :])
 
     if tool_results is not None:
         pending_by_id = {tc.id: tc for tc in pause_state.pending_tool_calls}
@@ -3890,7 +3922,8 @@ async def _replay_resume_injected_history(
             # The tool actually started when the loop dispatched it before pause;
             # the start event is replayed here on resume because that's the only
             # point at which an external observer receives the call_id.
-            await recorder.on_tool_started(run_id, tc, pause_state.iteration)
+            if pause_state.schema_version != 2:
+                await recorder.on_tool_started(run_id, tc, pause_state.iteration)
             await _notify_tool_started(extra_notifier, run_id, tc, pause_state.iteration)
             await recorder.on_message_appended(run_id, msg, pause_state.iteration)
             await recorder.on_tool_completed(run_id, tc, tr, pause_state.iteration)
@@ -4055,10 +4088,14 @@ async def _execute_approved_tools(
 
     target_history = history if history is not None else pause_state.history
     lookups = await agent.get_tool_lookups(loop=resolved_loop)
+    configure = getattr(recorder, "configure_tools", None)
+    if configure is not None:
+        configure(list(lookups.defs.values()))
     outcomes = _approval_outcomes(pause_state, lookups.target, decisions)
     results: list[tuple[ToolCall, ToolResult]] = []
-    counts: dict[str, int] = {}
-    for message in pause_state.history:
+    restored_counts = getattr(recorder, "execution_counts", lambda: None)()
+    counts: dict[str, int] = restored_counts if restored_counts is not None else {}
+    for message in [] if restored_counts is not None else pause_state.history:
         if (
             message.role == Role.TOOL
             and message.name
@@ -4149,7 +4186,8 @@ async def _execute_approved_tools(
                 success=False,
                 error=reason,
             )
-            await _rec_tool_started(recorder, run_id, tc, iteration)
+            if getattr(state_store, "storage_format", 1) != 2:
+                await _rec_tool_started(recorder, run_id, tc, iteration)
             await _ntfy_tool_started(notifier, run_id, tc, iteration)
             await _append(tc, denied)
             continue
@@ -4211,13 +4249,16 @@ async def _execute_approved_tools(
         if invalid_result is None:
             await _rec_tool_started(recorder, run_id, tc, iteration)
             await _ntfy_tool_started(notifier, run_id, tc, iteration)
-            tr = await _execute_tool(
-                tc,
-                lookups,
-                agent.tool_result_transform,
-                run_id=run_id,
-                **_tool_image_kwargs(_execute_tool, image_runtime),
-            )
+            from dendrux.loops._helpers import lease_scope
+
+            async with lease_scope(recorder):
+                tr = await _execute_tool(
+                    tc,
+                    lookups,
+                    agent.tool_result_transform,
+                    run_id=run_id,
+                    **_tool_image_kwargs(_execute_tool, image_runtime),
+                )
         else:
             tr = invalid_result
         await _append(tc, tr)
@@ -4625,6 +4666,8 @@ async def _claim_resume(
     expected_pause_id: str | None,
     results: list[ToolResult] | None,
     user_input: Any = None,
+    user_parts: tuple[ContentPart, ...] | None = None,
+    decisions: list[tuple[str, ApprovalDecision]] | None = None,
     warning_location: _WarningLocation | None = None,
 ) -> tuple[StateStore, str]:
     allowed = [expected]
@@ -4648,14 +4691,54 @@ async def _claim_resume(
             and record.status == RunStatus.WAITING_APPROVAL.value
         ),
     )
+    epoch: ClaimResult | int | bool
     for status in allowed:
         _canonicalize_legacy_denials(status, run_id, raw, results)
-        epoch = await claim_paused_validated(
-            store,
-            run_id,
-            expected_status=status,
-            validate=validate,
-        )
+        if raw.get("schema_version") == 2 and (
+            results is not None or user_input is not None or status == "waiting_approval"
+        ):
+            from dendrux.runtime.submit import (
+                serialize_decisions,
+                serialize_tool_results,
+                submission_descriptor,
+            )
+
+            payload: dict[str, Any] = (
+                {
+                    "submitted_decisions": serialize_decisions(
+                        PauseState.from_dict(raw), dict(decisions)
+                    )
+                }
+                if decisions is not None
+                else {"submitted_tool_results": serialize_tool_results(results)}
+                if results is not None
+                else {"submitted_user_input": user_input}
+                if user_input is not None
+                else {"approved": True}
+            )
+            if user_parts is not None:
+                from dendrux.types import content_part_to_dict
+
+                payload["submitted_user_parts"] = [content_part_to_dict(p) for p in user_parts]
+            if status == "waiting_approval" and results is not None:
+                payload["approved"] = False
+            descriptor = submission_descriptor(
+                raw, await store.get_loop_state(run_id) or {}, payload, status
+            )
+            epoch = await store.submit_and_claim(
+                run_id,
+                expected_status=status,
+                submitted_data=payload,
+                submission=descriptor,
+                validate=validate,
+            )
+        else:
+            epoch = await claim_paused_validated(
+                store,
+                run_id,
+                expected_status=status,
+                validate=validate,
+            )
         if epoch:
             view = claimed_store(store, run_id, epoch)
             try:
@@ -4820,6 +4903,8 @@ async def _resume_core(
                 expected_pause_id=expected_pause_id,
                 results=tool_results,
                 user_input=user_input,
+                user_parts=user_parts,
+                decisions=decisions,
             )
 
         # 4-10. Everything that runs after on_run_started fires must live
@@ -5237,6 +5322,7 @@ def resume_stream(
                 expected_pause_id=expected_pause_id,
                 results=stream_results,
                 user_input=user_input,
+                user_parts=user_parts,
                 warning_location=warning_location,
             )
             _shared["state_store"] = store
@@ -5649,6 +5735,9 @@ async def _validate_owned_pause(
         if raw is None:
             raise ValueError("Claimed run has no pause state")
         submission_validator(run_id, raw, agent=agent)
+        from dendrux.runtime.submit import submitted_view
+
+        raw = submitted_view(raw)
         submitted = raw.get("submitted_tool_results")
         if submitted is not None:
             validate_result_names(

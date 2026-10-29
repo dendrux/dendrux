@@ -330,6 +330,10 @@ class TestPerCallDecisions:
         assert record.status == RunStatus.WAITING_APPROVAL.value
 
     async def test_duplicate_ids_in_claimed_blob_release_claim(self, store) -> None:
+        # This fault injection / pause blob exercises the format-1 write path.
+        from tests._fixtures.storage import pin_storage_format
+
+        await pin_storage_format(store._engine, 1)
         agent, _, paused, _ = await self._pause_three(store)
         pause = await store.get_pause_state(paused.run_id)
         gated = list(pause["approval_gates"])
@@ -626,7 +630,10 @@ class TestRejectionViaResumeStream:
 
 class TestStalePauseGeneration:
     async def test_decisions_for_replaced_pause_fail_before_claim(self, store) -> None:
-        """ABA: the pause is replaced between validation and claim."""
+        """ABA: the legacy physical pause is replaced between validation and claim."""
+        from tests._fixtures.storage import pin_storage_format
+
+        await pin_storage_format(store._engine, 1)
         import copy
 
         llm = MockLLM(

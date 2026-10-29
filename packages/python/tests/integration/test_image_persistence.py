@@ -148,6 +148,10 @@ async def _paused_run(store: SQLAlchemyStateStore, run_id: str, tenant: str | No
 
 
 async def test_edges_on_every_write_method(engine, store) -> None:
+    # This fault injection / pause blob exercises the format-1 write path.
+    from tests._fixtures.storage import pin_storage_format
+
+    await pin_storage_format(store._engine, 1)
     services = BlobServices.for_state_store(store)
     part = await store_png(services, "t:acme", make_png(3))
     s = part.ref.sha256
@@ -234,6 +238,10 @@ async def _count(engine: Any, table: str) -> int:
 
 
 async def test_cross_tenant_edge_writes_rejected_and_rolled_back(engine, store) -> None:
+    # This fault injection / pause blob exercises the format-1 write path.
+    from tests._fixtures.storage import pin_storage_format
+
+    await pin_storage_format(store._engine, 1)
     services = BlobServices.for_state_store(store)
     sha_b = (await store_png(services, "t:b", make_png(5))).ref.sha256
     sha_a = (await store_png(services, "t:a", make_png(6))).ref.sha256
@@ -495,6 +503,10 @@ async def test_read_image_authorisation(engine, store) -> None:
 
 
 async def test_canonical_sample_rows(engine, store) -> None:
+    # This fault injection / pause blob exercises the format-1 write path.
+    from tests._fixtures.storage import pin_storage_format
+
+    await pin_storage_format(store._engine, 1)
     from tests.unit.test_blob_catalog import make_png as _mk
 
     png = _mk(42, width=400, height=200)

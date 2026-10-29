@@ -135,6 +135,26 @@ def interruptible(
     return _InterruptibleStream(stream, interrupt)
 
 
+class _LeasedStream:
+    def __init__(self, stream: AsyncIterator[StreamEvent], recorder: LoopRecorder | None) -> None:
+        self.stream = stream
+        self.recorder = recorder
+
+    def __aiter__(self) -> _LeasedStream:
+        return self
+
+    async def __anext__(self) -> StreamEvent:
+        async with lease_scope(self.recorder):
+            return await anext(self.stream)
+
+
+def leased_stream(
+    stream: AsyncIterator[StreamEvent], recorder: LoopRecorder | None
+) -> AsyncIterator[StreamEvent]:
+    """Renew only during each provider pull, in the caller's task and context."""
+    return _LeasedStream(stream, recorder)
+
+
 def guardrail_meta(
     g_engine: GuardrailEngine | None,
     notifier_warnings: list[str] | None = None,

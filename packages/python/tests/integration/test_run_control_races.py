@@ -179,6 +179,10 @@ class TestTerminalPrecedence:
         assert record.cancel_requested is False
 
     async def test_lost_terminal_cas_returns_persisted_state(self, store) -> None:
+        # This fault injection / pause blob exercises the format-1 write path.
+        from tests._fixtures.storage import pin_storage_format
+
+        await pin_storage_format(store._engine, 1)
         agent = Agent(
             provider=ScriptedLLM([LLMResponse(text="done")]), prompt="P.", state_store=store
         )
@@ -395,6 +399,10 @@ class Pre03Store:
 
 class TestPre03Store:
     async def test_existing_flows_work(self, store) -> None:
+        # This fault injection / pause blob exercises the format-1 write path.
+        from tests._fixtures.storage import pin_storage_format
+
+        await pin_storage_format(store._engine, 1)
         legacy = Pre03Store(store)
 
         @tool()
