@@ -158,6 +158,7 @@ async def test_real_notifier_iteration_statement_budget(
         )
         assert len(statements) <= 25, counts[name]
         assert len(statements) <= 22, counts[name]
+        assert len(statements) == (21 if notify_enabled else 18), counts[name]
         assert not any(
             t["operation"] == "touch_progress" for t in transactions if t["phase"] == name
         ), counts[name]

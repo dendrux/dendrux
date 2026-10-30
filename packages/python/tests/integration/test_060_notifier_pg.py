@@ -27,6 +27,7 @@ async def test_n1_commit_wakes_under_50ms_and_1000_subscriptions_one_connection(
 ):
     if engine.dialect.name != "postgresql":
         pytest.skip("Postgres listener")
+    store.notify_channel = "dendrux_events"
     run = generate_ulid()
     await store.create_run(run, "notifier")
     notifier = PostgresEventNotifier(pg_test_url)
@@ -199,7 +200,8 @@ async def test_concurrent_two_writer_instances_durable_order_and_wakeup(pg_test_
         pytest.skip("Postgres concurrency")
     from dendrux.runtime.state import SQLAlchemyStateStore
 
-    other = SQLAlchemyStateStore(engine)
+    store.notify_channel = "dendrux_events"
+    other = SQLAlchemyStateStore(engine, notify_channel="dendrux_events")
     run = generate_ulid()
     await store.create_run(run, "notifier-race")
     notifier = PostgresEventNotifier(pg_test_url)
@@ -231,6 +233,7 @@ async def test_stream_events_notify_wake_under_50ms_and_release(
 ):
     if engine.dialect.name != "postgresql":
         pytest.skip("Postgres listener")
+    store.notify_channel = "dendrux_events"
     run = generate_ulid()
     await store.create_run(run, "stream-notifier")
     notifier = PostgresEventNotifier(pg_test_url)

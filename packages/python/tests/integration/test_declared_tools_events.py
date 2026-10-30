@@ -97,8 +97,7 @@ async def test_declaration_write_has_constant_database_cost(store, engine, notif
     from dendrux.runtime.persistence import PersistenceRecorder
     from dendrux.runtime.runner import _emit_declared_tools
 
-    if not notify_enabled:
-        store.notify_channel = None
+    store.notify_channel = "dendrux_events" if notify_enabled else None
     await store.create_run("declaration-cost", "declared")
     agent = Agent(prompt="p", tools=[z_server, a_client])
     statements = []

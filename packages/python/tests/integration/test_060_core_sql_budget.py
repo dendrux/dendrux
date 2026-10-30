@@ -109,6 +109,7 @@ async def test_agent_iteration_statement_budget(
     """Count every SQL statement in two consecutive actual nonterminal Agent iterations."""
     if engine.dialect.name != "postgresql":
         pytest.skip("The frozen 25-statement boundary is PostgreSQL with NOTIFY")
+    store.notify_channel = "dendrux_events"
     from contextvars import ContextVar
     from functools import wraps
 

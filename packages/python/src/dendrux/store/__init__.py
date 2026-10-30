@@ -48,6 +48,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from dendrux._sentinel import _OmittedType
+from dendrux.db._notify import EventNotifier, NotifierState, Subscription
 from dendrux.db._sqlite_sync import create_sqlite_schema
 from dendrux.errors import BlobNotFoundError, NotifierUnavailableError, RunNotFoundError
 from dendrux.media._ids import image_id
@@ -128,7 +129,6 @@ if TYPE_CHECKING:
 
     from sqlalchemy.ext.asyncio import AsyncEngine
 
-    from dendrux.db._notify import EventNotifier
     from dendrux.media import BlobStore
 
 
@@ -1503,12 +1503,14 @@ def _build_pause_pair(paused: Any, resumed: Any | None) -> PausePair:
 
 __all__ = [
     "EventFeed",
+    "EventNotifier",
     "Follow",
     "FollowCapacityError",
     "FollowEnd",
     "FollowHeartbeat",
     "FollowItem",
     "LLMCall",
+    "NotifierState",
     "PausePair",
     "PendingPause",
     "PendingToolCall",
@@ -1522,6 +1524,7 @@ __all__ = [
     "RunUsage",
     "StoredEvent",
     "SubtreeNode",
+    "Subscription",
     "TenantScope",
     "ToolInvocation",
     "TraceEntry",

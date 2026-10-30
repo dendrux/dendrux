@@ -1550,9 +1550,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         recovery=True,
     )
 
-    def __init__(
-        self, engine: AsyncEngine, *, notify_channel: str | None = "dendrux_events"
-    ) -> None:
+    def __init__(self, engine: AsyncEngine, *, notify_channel: str | None = None) -> None:
         from dendrux.db._notify import validate_channel
 
         if notify_channel is not None:

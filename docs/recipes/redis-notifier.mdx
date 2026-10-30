@@ -3,8 +3,14 @@
 `EventNotifier` is an optional seam. A developer can implement it over Redis
 pub/sub and pass it to `RunStore.from_engine(engine, notifier=notifier)` or
 `RunStore.from_database_url(database_url, notifier=notifier)`. The database
-remains the durable event log; a hint contains only a run id. Publish the run id
-from your application's event writer after its database transaction commits.
+remains the durable event log; a hint contains only a run id. Connecting the
+reader adapter alone does not publish hints. The Redis writer integration
+requires a store subclass overriding the private `_after_event_insert` hook,
+which may change between releases. That hook executes inside the database
+transaction, before commit. Arrange publishing after successful commit, for
+example by recording an outbox row in the hook and having your application
+publish committed outbox rows. The writer subclass and publishing lifecycle are
+application-owned; Dendrux does not supply a Redis writer adapter.
 
 > **Example only.** This developer-owned adapter requires `redis` and is not
 > tested in Dendrux CI. Choose authentication, channel isolation and deployment
@@ -18,8 +24,7 @@ from contextlib import asynccontextmanager, suppress
 
 from redis.asyncio import Redis
 
-from dendrux.db._notify import NotifierState, Subscription
-from dendrux.store import FollowCapacityError, RunStore
+from dendrux.store import EventNotifier, FollowCapacityError, NotifierState, RunStore, Subscription
 
 
 class RedisNotifier:
@@ -109,7 +114,7 @@ class RedisNotifier:
 
 # The application owns both lifecycles and uses one event loop.
 async def serve(engine, redis, run_id):
-    notifier = RedisNotifier(redis)
+    notifier: EventNotifier = RedisNotifier(redis)
     await notifier.start()
     try:
         async with RunStore.from_engine(engine, notifier=notifier) as store:
@@ -120,7 +125,9 @@ async def serve(engine, redis, run_id):
         await notifier.stop()
 ```
 
-Publish with `await redis.publish("run_events", run_id)` after commit. Do not
+Publish with `await redis.publish("run_events", run_id)` after commit, using the
+application-owned writer integration described above. Do not call Redis directly
+from `_after_event_insert`: a later database rollback would leave a false hint. Do not
 publish tool arguments, credentials, event payloads or tenant secrets. A shared
 channel is a trusted infrastructure boundary; `follow` still checks tenant scope
 before delivering database events. Use this adapter from one event loop and let
@@ -131,6 +138,14 @@ For the built-in PostgreSQL adapter, writers can use a transaction-pooled
 session-pooled `listen_url`. PgBouncer transaction mode cannot preserve LISTEN
 session state. Its startup self-test is best effort, so passing it does not
 prove that subsequent notifications will arrive.
+
+PostgreSQL NOTIFY is off by default. Enable it on every writer with
+`Agent(database_options={"notify_channel": "dendrux_events"})` or
+`SQLAlchemyStateStore(engine, notify_channel="dendrux_events")`. Readers opt in
+separately with `listen_url=` or a started `notifier=`. A reader's `listen_url=`
+uses `database_options["notify_channel"]` when supplied, otherwise
+`"dendrux_events"`; an explicit `None` with `listen_url=` raises `ValueError`.
+Reader configuration does not enable notifications on other writer instances.
 
 The PostgreSQL listener must connect to the primary. If event reads use a read
 replica, a hint can arrive before replication makes the row visible. A healthy

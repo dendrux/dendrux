@@ -8,6 +8,22 @@ import pytest
 from dendrux.runtime.state import SQLAlchemyStateStore
 
 
+async def test_writer_defaults_to_no_notify_statement():
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    engine = create_async_engine("sqlite+aiosqlite://")
+    session = SimpleNamespace(
+        bind=SimpleNamespace(dialect=SimpleNamespace(name="postgresql")), execute=AsyncMock()
+    )
+    try:
+        store = SQLAlchemyStateStore(engine)
+        await store._after_event_insert(session, "run")
+        session.execute.assert_not_awaited()
+        assert store.notify_channel is None
+    finally:
+        await engine.dispose()
+
+
 @pytest.mark.parametrize(
     "dialect,channel",
     [("postgresql", "dendrux_events"), ("postgresql", None), ("sqlite", "dendrux_events")],

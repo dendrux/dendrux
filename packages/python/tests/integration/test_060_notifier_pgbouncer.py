@@ -48,6 +48,7 @@ async def test_n4_controlled_delivery_with_backend_reassignment(
     reader = RunStore.from_engine(engine, notifier=notifier)
     owner = EventFeed(reader, poll_healthy_s=0.2)
     run = generate_ulid()
+    store.notify_channel = "dendrux_events"
     await store.create_run(run, "pgbouncer")
     feed = _RunFeed(owner, run, None)
     owner._feeds[run] = feed

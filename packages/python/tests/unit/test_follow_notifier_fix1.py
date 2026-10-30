@@ -101,6 +101,15 @@ async def test_p2_4_owned_listener_uses_configured_writer_channel():
         await reader.close()
 
 
+async def test_owner_default_listener_channel_does_not_enable_writer():
+    reader = RunStore.from_database_url("sqlite+aiosqlite://", listen_url=URL)
+    try:
+        assert reader._owned_notifier.channel == "dendrux_events"
+        assert reader._state.notify_channel is None
+    finally:
+        await reader.close()
+
+
 async def test_p2_4_owned_listener_rejects_explicit_disabled_writer():
     with pytest.raises(ValueError):
         reader = RunStore.from_database_url(
