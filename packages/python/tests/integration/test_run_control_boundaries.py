@@ -189,9 +189,11 @@ async def server() -> str:
 
 @pytest.mark.parametrize("entry", ["batch", "decisions", "resume", "resume_stream"])
 @pytest.mark.parametrize("legacy", [False, True])
-async def test_approval_without_token_is_rejected_for_current_and_legacy_pauses(
-    store, entry, legacy
-):
+async def test_approval_tokens_are_required_only_for_pauses_with_generations(store, entry, legacy):
+    if legacy:
+        from tests._fixtures.storage import pin_storage_format
+
+        await pin_storage_format(store._engine, 1)
     a = Agent(
         name="warning",
         prompt="p",
@@ -209,25 +211,34 @@ async def test_approval_without_token_is_rejected_for_current_and_legacy_pauses(
         await store.pause_run(paused.run_id, status="waiting_approval", pause_data=raw)
     from dendrux.types import InputValidationError
 
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always", FutureWarning)
+    async def submit():
         if entry == "resume_stream":
             result, _ = await consume(a.resume_stream(paused.run_id))
+            return result
+        if entry == "batch":
+            return await a.submit_approval(paused.run_id, approved=True)
+        if entry == "decisions":
+            call = paused.pending.tool_calls[0]
+            return await a.submit_approval(
+                paused.run_id, decisions={call.id: ApprovalDecision.approve()}
+            )
+        return await a.resume(paused.run_id)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", FutureWarning)
+        if legacy:
+            assert (await submit()).status == RunStatus.SUCCESS
+        elif entry == "resume_stream":
+            result = await submit()
             assert result.status == RunStatus.ERROR
             assert "pause_id_required" in result.error
         else:
             with pytest.raises(InputValidationError):
-                if entry == "batch":
-                    await a.submit_approval(paused.run_id, approved=True)
-                elif entry == "decisions":
-                    call = paused.pending.tool_calls[0]
-                    await a.submit_approval(
-                        paused.run_id, decisions={call.id: ApprovalDecision.approve()}
-                    )
-                else:
-                    await a.resume(paused.run_id)
+                await submit()
     assert not [w for w in caught if "expected_pause_id" in str(w.message)]
-    assert (await store.get_run(paused.run_id)).status == "waiting_approval"
+    assert (await store.get_run(paused.run_id)).status == (
+        "success" if legacy else "waiting_approval"
+    )
 
 
 @pytest.mark.parametrize("entry", ["submit", "resume", "resume_stream"])

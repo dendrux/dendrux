@@ -156,6 +156,7 @@ class TestStrictTenancy:
     ) -> None:
         class _Ctx:
             tenant_id = "acme"
+            tenant_explicit = True
 
         monkeypatch.setattr(_tenant_checks, "get_delegation_context", lambda: _Ctx())
         agent = _agent(AsyncMock(), strict_tenancy=True)

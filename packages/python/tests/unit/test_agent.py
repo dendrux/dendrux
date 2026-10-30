@@ -346,14 +346,13 @@ class TestAgentPrivateEngine:
 
             await agent.close()
 
-    async def test_env_var_fallback_requires_explicit_persistence(self):
+    async def test_env_var_is_ignored_without_creating_engine(self):
         with (
             patch("dendrux.agent.os.environ.get", return_value="sqlite+aiosqlite:///env.db"),
             patch("dendrux.db.session.get_engine", new_callable=AsyncMock) as mock_get,
         ):
             agent = Agent(provider=_mock_provider(), prompt="Hello.")
-            with pytest.raises(ValueError, match="state_store=.*database_url="):
-                await agent._resolve_state_store()
+            assert await agent._resolve_state_store() is None
             mock_get.assert_not_awaited()
             assert agent._private_engine is None
 

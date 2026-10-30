@@ -40,15 +40,28 @@ RESERVED_METADATA_PREFIX = "dendrux."
 _NEW_RUN_ENTRIES = frozenset({"run", "stream", "retry"})
 
 
-def _strict_tenancy_applies(agent: Agent) -> bool:
-    return getattr(agent, "_strict_tenancy", False) and any(
-        getattr(agent, name, None) is not None
-        for name in ("_state_store", "_database_url", "_lazy_store")
+def _strict_tenancy_applies(agent: Agent, store: object | None = None) -> bool:
+    return getattr(agent, "_strict_tenancy", True) and (
+        store is not None
+        or any(
+            getattr(agent, name, None) is not None
+            for name in ("_state_store", "_database_url", "_lazy_store")
+        )
     )
 
 
+def _tenant_scope_chosen(tenant_id: object) -> bool:
+    parent = get_delegation_context()
+    return parent.tenant_explicit if parent is not None else not isinstance(tenant_id, _OmittedType)
+
+
 def resolve_tenant(
-    agent: Agent, entry: EntryPoint, tenant_id: _T | _OmittedType, *, default: _T
+    agent: Agent,
+    entry: EntryPoint,
+    tenant_id: _T | _OmittedType,
+    *,
+    default: _T,
+    store: object | None = None,
 ) -> _T:
     """The ``tenant_id`` an entry point runs with.
 
@@ -61,10 +74,14 @@ def resolve_tenant(
     run then inherits the parent's tenant, and any other entry point is
     scoped to the parent's tenant.
     """
+    parent = get_delegation_context()
+    strict = _strict_tenancy_applies(agent, store)
+    if strict and parent is not None and not parent.tenant_explicit:
+        _codes.log_code(logger, _codes.TENANT_SCOPE_REQUIRED, entry=entry)
+        raise TenantScopeRequiredError(entry)
     if not isinstance(tenant_id, _OmittedType):
         return tenant_id
-    if _strict_tenancy_applies(agent):
-        parent = get_delegation_context()
+    if strict:
         if parent is None:
             _codes.log_code(logger, _codes.TENANT_SCOPE_REQUIRED, entry=entry)
             raise TenantScopeRequiredError(entry)

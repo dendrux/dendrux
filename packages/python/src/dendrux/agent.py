@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING, Any, Literal, overload
 from dendrux import _codes
 from dendrux._sentinel import _OMITTED, _OmittedType, _UnsetType
 from dendrux.runtime._entry_checks import entry_checks, require_boolean
+from dendrux.runtime._tenant_checks import _tenant_scope_chosen
 from dendrux.runtime.state import UNSCOPED, ReclaimableRun, TenantScope, require_store_method
 from dendrux.skills._internal import is_script, validate_executor
 from dendrux.skills._session import NAMES, SkillSession, continuation, current
@@ -79,6 +80,18 @@ if TYPE_CHECKING:
     )
 
 _agent_logger = logging.getLogger(__name__)
+
+
+_env_url_ignored = False
+_env_url_lock = threading.Lock()
+
+
+def _log_env_url_ignored() -> None:
+    global _env_url_ignored
+    with _env_url_lock:
+        if not _env_url_ignored:
+            _codes.log_code(_agent_logger, _codes.DATABASE_URL_ENV_IGNORED)
+            _env_url_ignored = True
 
 
 def _check_result_read_arguments(run_id: Any, tenant_id: Any) -> None:
@@ -1144,7 +1157,7 @@ class Agent:
         Resolution order:
           1. Explicit state_store from constructor → returned as-is
           2. database_url from constructor → reference-counted shared engine
-          3. None (ephemeral mode), unless DENDRUX_DATABASE_URL requires migration
+          3. None (ephemeral mode); DENDRUX_DATABASE_URL is ignored
 
         Explicit database_url acquires a shared reference released by close().
         """
@@ -1184,10 +1197,7 @@ class Agent:
             return self._lazy_store
 
         if os.environ.get("DENDRUX_DATABASE_URL") is not None:
-            raise ValueError(
-                "Implicit DENDRUX_DATABASE_URL persistence was removed in dendrux 0.6. "
-                "Pass state_store= or database_url= explicitly."
-            )
+            _log_env_url_ignored()
 
         return None
 
@@ -1356,6 +1366,7 @@ class Agent:
             DelegationDepthExceededError: If this run would exceed the inherited
                 max_delegation_depth from a parent run.
         """
+        requested_tenant_id = tenant_id
         tenant_id = entry_checks(
             self,
             "run",
@@ -1419,7 +1430,7 @@ class Agent:
             replay_last=replay_last,
             replay_reasoning=replay_reasoning,
             state_store=store,
-            tenant_id=tenant_id,
+            tenant_id=requested_tenant_id,
             metadata=metadata,
             extra_notifier=notifier,
             idempotency_key=idempotency_key,
@@ -1463,6 +1474,7 @@ class Agent:
                 source run is not terminal, or if the source run was
                 SingleCall.
         """
+        requested_tenant_id = tenant_id
         tenant_id = entry_checks(
             self,
             "retry",
@@ -1490,7 +1502,7 @@ class Agent:
             agent=self,
             provider=provider,
             state_store=store,
-            tenant_id=tenant_id,
+            tenant_id=requested_tenant_id,
             metadata=metadata,
             extra_notifier=notifier,
             **kwargs,
@@ -1567,6 +1579,7 @@ class Agent:
                 both args provided, or neither provided.
             RunNotFoundError: ``run_id`` is outside ``tenant_id``.
         """
+        tenant_explicit = _tenant_scope_chosen(tenant_id)
         tenant_id = entry_checks(
             self,
             "resume",
@@ -1602,6 +1615,7 @@ class Agent:
                 provider=provider,
                 extra_notifier=notifier,
                 expected_pause_id=expected_pause_id,
+                _tenant_explicit=tenant_explicit,
             )
         if user_input is not None:
             return await resume_with_input(
@@ -1612,6 +1626,7 @@ class Agent:
                 provider=provider,
                 extra_notifier=notifier,
                 expected_pause_id=expected_pause_id,
+                _tenant_explicit=tenant_explicit,
             )
         # No-arg resume — approve path. Runner validates status is
         # WAITING_APPROVAL and executes pending tools.
@@ -1623,6 +1638,7 @@ class Agent:
             provider=provider,
             extra_notifier=notifier,
             expected_pause_id=expected_pause_id,
+            _tenant_explicit=tenant_explicit,
         )
 
     async def _await_claimed_task(
@@ -1668,9 +1684,9 @@ class Agent:
                 ``ToolResult.images`` are validated and stored before the claim; an image error
                 (``ImageError``, ``UnsupportedModalityError``) raises with the
                 run still waiting.
-            expected_pause_id: Current pause generation; required under strict
-                tenancy and for approval. Missing or stale tokens are rejected
-                before claiming.
+            expected_pause_id: Current pause generation, required when one is stored
+                and either strict tenancy or approval applies. Generation-less
+                legacy pauses may omit it; stale tokens are rejected before claiming.
             notifier: Optional additional notifier composed during resume.
             tenant_id: Required for agents with persistence under strict tenancy
                 (the default). The run must
@@ -1690,6 +1706,7 @@ class Agent:
             RunAlreadyTerminalError: run already reached a terminal state.
             InvalidToolResultError: results don't match pending calls.
         """
+        tenant_explicit = _tenant_scope_chosen(tenant_id)
         tenant_id = entry_checks(
             self,
             "submit_tool_results",
@@ -1717,9 +1734,9 @@ class Agent:
         skill_session = await continuation(self, store, run_id)
         with skill_session.bind():
             pause = await validate_tool_results(store, run_id, results)
-            from dendrux.runtime.submit import warn_missing_pause_id
+            from dendrux.runtime.submit import require_pause_id
 
-            warn_missing_pause_id(self, expected_pause_id, pause_id=pause.pause_id)
+            require_pause_id(self, expected_pause_id, pause_id=pause.pause_id, run_id=run_id)
             results = await prepare_client_results(self, run_id, pause, results)
             claim_kwargs: dict[str, Any] = {}
             if any(r.images for r in results):
@@ -1753,6 +1770,7 @@ class Agent:
                     provider=provider,
                     extra_notifier=notifier,
                     pre_claim_status=RunStatus.WAITING_CLIENT_TOOL.value,
+                    _tenant_explicit=tenant_explicit,
                 ),
             )
             return await self._await_claimed_task(task, store, run_id)
@@ -1775,9 +1793,9 @@ class Agent:
             run_id: A run in status ``WAITING_HUMAN_INPUT``.
             text: The user's clarification answer: a string, or strings and
                 images (ingested before the claim).
-            expected_pause_id: Current pause generation; required under strict
-                tenancy and for approval. Missing or stale tokens are rejected
-                before claiming.
+            expected_pause_id: Current pause generation, required when one is stored
+                and either strict tenancy or approval applies. Generation-less
+                legacy pauses may omit it; stale tokens are rejected before claiming.
             notifier: Optional additional notifier composed during resume.
             tenant_id: Required for agents with persistence under strict tenancy
                 (the default). The run must
@@ -1790,6 +1808,7 @@ class Agent:
             PauseStatusMismatchError, RunAlreadyClaimedError,
             RunAlreadyTerminalError.
         """
+        tenant_explicit = _tenant_scope_chosen(tenant_id)
         tenant_id = entry_checks(
             self,
             "submit_input",
@@ -1814,6 +1833,17 @@ class Agent:
         await _require_run_in_scope(store, run_id, tenant_id)
         skill_session = await continuation(self, store, run_id)
         with skill_session.bind():
+            from dendrux.runtime.submit import require_pause_id
+
+            raw = await store.get_pause_state(run_id)
+            if raw is not None:
+                require_pause_id(
+                    self,
+                    expected_pause_id,
+                    pause_id=raw.get("pause_id"),
+                    store=store,
+                    run_id=run_id,
+                )
             submitted: dict[str, Any] = {"submitted_user_input": projection}
             claim_kwargs: dict[str, Any] = {}
             if items:
@@ -1844,6 +1874,7 @@ class Agent:
                     provider=provider,
                     extra_notifier=notifier,
                     pre_claim_status=RunStatus.WAITING_HUMAN_INPUT.value,
+                    _tenant_explicit=tenant_explicit,
                 ),
             )
             return await self._await_claimed_task(task, store, run_id)
@@ -1893,9 +1924,9 @@ class Agent:
             approved: Whole-batch decision.
             decisions: Per-call decisions keyed by tool call id.
             rejection_reason: Reason used with ``approved=False``.
-            expected_pause_id: Current pause generation; required under strict
-                tenancy and for approval. Missing or stale tokens are rejected
-                before claiming.
+            expected_pause_id: Current pause generation, required when one is stored
+                and either strict tenancy or approval applies. Generation-less
+                legacy pauses may omit it; stale tokens are rejected before claiming.
             notifier: Optional additional notifier composed during resume.
             tenant_id: Required for agents with persistence under strict tenancy
                 (the default). The run must
@@ -1910,6 +1941,7 @@ class Agent:
             RunAlreadyTerminalError.
         """
         require_boolean(approved, "approved", optional=True)
+        tenant_explicit = _tenant_scope_chosen(tenant_id)
         tenant_id = entry_checks(
             self,
             "submit_approval",
@@ -1928,11 +1960,11 @@ class Agent:
             normalize_decisions,
             preflight_status,
             raise_for_non_paused_status,
+            require_pause_id,
             serialize_decisions,
             serialize_tool_results,
             validate_approval_decisions,
             validate_denial_results,
-            warn_missing_pause_id,
         )
         from dendrux.types import PauseState, RunStatus
 
@@ -1969,11 +2001,12 @@ class Agent:
                 validate_denial_results(
                     self, run_id, decision_denial_results(pause_state, decision_map)
                 )
-                warn_missing_pause_id(
+                require_pause_id(
                     self,
                     expected_pause_id,
                     pause_id=pause_state.pause_id,
                     approval=any(decision.approved for decision in decision_map.values()),
+                    run_id=run_id,
                 )
 
                 def same_pause_generation(current: dict[str, Any]) -> None:
@@ -2009,6 +2042,7 @@ class Agent:
                         provider=provider,
                         extra_notifier=notifier,
                         pre_claim_status=RunStatus.WAITING_APPROVAL.value,
+                        _tenant_explicit=tenant_explicit,
                     ),
                 )
                 return await self._await_claimed_task(task, store, run_id)
@@ -2033,6 +2067,7 @@ class Agent:
                         agent=self,
                         provider=provider,
                         extra_notifier=notifier,
+                        _tenant_explicit=tenant_explicit,
                     ),
                 )
                 return await self._await_claimed_task(task, store, run_id)
@@ -2044,7 +2079,7 @@ class Agent:
             if raw_pause is None:
                 await raise_for_non_paused_status(store, run_id)
             pause_state = PauseState.from_dict(raw_pause)
-            warn_missing_pause_id(self, expected_pause_id, pause_id=pause_state.pause_id)
+            require_pause_id(self, expected_pause_id, pause_id=pause_state.pause_id, run_id=run_id)
             synthetic = build_rejection_results(pause_state, rejection_reason)
             validate_denial_results(self, run_id, synthetic)
             epoch = await claim_or_raise(
@@ -2070,6 +2105,7 @@ class Agent:
                     provider=provider,
                     extra_notifier=notifier,
                     pre_claim_status=RunStatus.WAITING_APPROVAL.value,
+                    _tenant_explicit=tenant_explicit,
                 ),
             )
             return await self._await_claimed_task(task, store, run_id)
@@ -2502,9 +2538,9 @@ class Agent:
 
         Args:
             run_id: A run in status ``PAUSED``.
-            expected_pause_id: Current pause generation; required under strict
-                tenancy and for approval. Missing or stale tokens are rejected
-                before claiming.
+            expected_pause_id: Current pause generation, required when one is stored
+                and either strict tenancy or approval applies. Generation-less
+                legacy pauses may omit it; stale tokens are rejected before claiming.
             notifier: Optional additional notifier composed during resume.
             tenant_id: Required for agents with persistence under strict tenancy
                 (the default). The run must
@@ -2518,6 +2554,7 @@ class Agent:
             WAITING_APPROVAL), RunAlreadyClaimedError,
             RunAlreadyTerminalError.
         """
+        tenant_explicit = _tenant_scope_chosen(tenant_id)
         tenant_id = entry_checks(
             self, "submit_resume", tenant_id, default_tenant=UNSCOPED, run_id=run_id
         )
@@ -2552,6 +2589,7 @@ class Agent:
                     agent=self,
                     provider=provider,
                     extra_notifier=notifier,
+                    _tenant_explicit=tenant_explicit,
                 ),
             )
             return await self._await_claimed_task(task, store, run_id)
@@ -2796,6 +2834,7 @@ class Agent:
         Raises:
             ValueError: If no provider is configured, or if ``history`` is invalid.
         """
+        requested_tenant_id = tenant_id
         tenant_id = entry_checks(
             self,
             "stream",
@@ -2843,7 +2882,7 @@ class Agent:
             replay_last=replay_last,
             replay_reasoning=replay_reasoning,
             state_store_resolver=self._resolve_state_store,
-            tenant_id=tenant_id,
+            tenant_id=requested_tenant_id,
             metadata=metadata,
             extra_notifier=notifier,
             idempotency_key=idempotency_key,
@@ -2898,6 +2937,7 @@ class Agent:
                 event, when ``run_id`` is outside ``tenant_id``. The run is
                 left untouched (the stream's close-time cleanup is a no-op).
         """
+        tenant_explicit = _tenant_scope_chosen(tenant_id)
         tenant_id = entry_checks(
             self,
             "resume_stream",
@@ -2917,7 +2957,6 @@ class Agent:
             raise ValueError("Cannot provide both tool_results and user_input to resume_stream().")
 
         from dendrux.runtime.runner import resume_stream as runner_resume_stream
-        from dendrux.runtime.submit import capture_warning_location
 
         stream = runner_resume_stream(
             run_id,
@@ -2928,7 +2967,7 @@ class Agent:
             user_input=user_input,
             extra_notifier=notifier,
             expected_pause_id=expected_pause_id,
-            warning_location=capture_warning_location(),
+            _tenant_explicit=tenant_explicit,
         )
         return self._tenant_checked_stream(stream, run_id, tenant_id)
 

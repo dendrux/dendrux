@@ -49,6 +49,7 @@ class TestRetryBasic:
             provider=mock,
             user_input="say hello",
             state_store=store,
+            tenant_id=None,
         )
         assert result1.status == RunStatus.SUCCESS
 
@@ -59,6 +60,7 @@ class TestRetryBasic:
             agent=agent,
             provider=mock2,
             state_store=store,
+            tenant_id=None,
         )
 
         assert result2.status == RunStatus.SUCCESS
@@ -81,6 +83,7 @@ class TestRetryBasic:
             provider=mock,
             user_input="what is 2+2?",
             state_store=store,
+            tenant_id=None,
         )
 
         # Verify traces exist
@@ -94,6 +97,7 @@ class TestRetryBasic:
             agent=agent,
             provider=mock2,
             state_store=store,
+            tenant_id=None,
         )
 
         assert result2.status == RunStatus.SUCCESS
@@ -111,7 +115,13 @@ class TestRetryBasic:
         await store.create_run("run1", "TestAgent")
 
         with pytest.raises(ValueError, match="only terminal runs"):
-            await retry("run1", agent=agent, provider=mock, state_store=store)
+            await retry(
+                "run1",
+                agent=agent,
+                provider=mock,
+                state_store=store,
+                tenant_id=None,
+            )
 
     async def test_retry_rejects_single_call_source(self, store):
         """retry() raises ValueError when source run used SingleCall."""
@@ -135,7 +145,13 @@ class TestRetryBasic:
         )
 
         with pytest.raises(ValueError, match="SingleCall"):
-            await retry("run1", agent=agent, provider=mock, state_store=store)
+            await retry(
+                "run1",
+                agent=agent,
+                provider=mock,
+                state_store=store,
+                tenant_id=None,
+            )
 
     async def test_retry_rejects_nonexistent_run(self, store):
         """retry() raises RunNotFoundError (a LookupError) for an unknown run_id (B13)."""
@@ -146,7 +162,13 @@ class TestRetryBasic:
         agent = Agent(provider=mock, prompt="test")
 
         with pytest.raises(RunNotFoundError, match="not found"):
-            await retry("nonexistent", agent=agent, provider=mock, state_store=store)
+            await retry(
+                "nonexistent",
+                agent=agent,
+                provider=mock,
+                state_store=store,
+                tenant_id=None,
+            )
 
     async def test_retry_rejects_no_traces(self, store):
         """retry() raises ValueError if the source run has no traces."""
@@ -166,7 +188,13 @@ class TestRetryBasic:
         )
 
         with pytest.raises(ValueError, match="no persisted traces"):
-            await retry("run1", agent=agent, provider=mock, state_store=store)
+            await retry(
+                "run1",
+                agent=agent,
+                provider=mock,
+                state_store=store,
+                tenant_id=None,
+            )
 
     async def test_retry_emits_started_event_with_retry_of(self, store):
         """The retry run's run.started event includes retry_of."""
@@ -181,6 +209,7 @@ class TestRetryBasic:
             provider=mock,
             user_input="hello",
             state_store=store,
+            tenant_id=None,
         )
 
         mock2 = MockLLM([LLMResponse(text="retried")])
@@ -189,6 +218,7 @@ class TestRetryBasic:
             agent=agent,
             provider=mock2,
             state_store=store,
+            tenant_id=None,
         )
 
         events = await store.get_run_events(result2.run_id)
@@ -209,6 +239,7 @@ class TestRetryBasic:
             provider=mock,
             user_input="hello",
             state_store=store,
+            tenant_id=None,
         )
 
         mock2 = MockLLM([LLMResponse(text="retried")])
@@ -217,6 +248,7 @@ class TestRetryBasic:
             agent=agent,
             provider=mock2,
             state_store=store,
+            tenant_id=None,
         )
 
         retry_run = await store.get_run(result2.run_id)
@@ -251,6 +283,7 @@ class TestAgentRetryMethod:
             provider=mock,
             user_input="hello",
             state_store=store,
+            tenant_id=None,
         )
 
         mock2 = MockLLM([LLMResponse(text="retried")])
@@ -292,7 +325,13 @@ class TestRetryReasoningBlocks:
             model=model,
         )
         agent = Agent(provider=mock, prompt="test", tools=[greet])
-        result = await run(agent, provider=mock, user_input="hi", state_store=store)
+        result = await run(
+            agent,
+            provider=mock,
+            user_input="hi",
+            state_store=store,
+            tenant_id=None,
+        )
         assert result.status == RunStatus.SUCCESS
         return agent, result
 
@@ -313,7 +352,13 @@ class TestRetryReasoningBlocks:
 
         agent, result = await self._source_run(store)
         mock2 = MockLLM([LLMResponse(text="again")], model="model-a")
-        await retry(result.run_id, agent=agent, provider=mock2, state_store=store)
+        await retry(
+            result.run_id,
+            agent=agent,
+            provider=mock2,
+            state_store=store,
+            tenant_id=None,
+        )
 
         seen = mock2.call_history[0]["messages"]
         tool_turn = next(m for m in seen if m.role == Role.ASSISTANT and m.tool_calls)
@@ -326,7 +371,13 @@ class TestRetryReasoningBlocks:
 
         agent, result = await self._source_run(store)
         mock2 = MockLLM([LLMResponse(text="again")], model="model-b")
-        await retry(result.run_id, agent=agent, provider=mock2, state_store=store)
+        await retry(
+            result.run_id,
+            agent=agent,
+            provider=mock2,
+            state_store=store,
+            tenant_id=None,
+        )
 
         seen = mock2.call_history[0]["messages"]
         tool_turn = next(m for m in seen if m.role == Role.ASSISTANT and m.tool_calls)
@@ -338,7 +389,14 @@ class TestRetryReasoningBlocks:
 
         agent, result = await self._source_run(store)
         mock2 = MockLLM([LLMResponse(text="again")], model="model-b")
-        await retry(result.run_id, agent=agent, provider=mock2, state_store=store, model="model-a")
+        await retry(
+            result.run_id,
+            agent=agent,
+            provider=mock2,
+            state_store=store,
+            model="model-a",
+            tenant_id=None,
+        )
 
         seen = mock2.call_history[0]["messages"]
         tool_turn = next(m for m in seen if m.role == Role.ASSISTANT and m.tool_calls)

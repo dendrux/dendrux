@@ -14,7 +14,7 @@ from dendrux.errors import TenantScopeRequiredError
 from dendrux.llm.mock import MockLLM
 from dendrux.loops._budget import BudgetTracker
 from dendrux.runtime._tenant_checks import resolve_tenant
-from dendrux.runtime.submit import GOVERNANCE_KEY, submission_validator, warn_missing_pause_id
+from dendrux.runtime.submit import GOVERNANCE_KEY, require_pause_id, submission_validator
 from dendrux.runtime.sweep import sweep
 from dendrux.types import InputValidationError, UsageStats
 
@@ -69,18 +69,21 @@ def test_explicit_old_tenancy_is_silent():
 
 
 @pytest.mark.parametrize("pause_id", ["generation", None])
-def test_strict_missing_pause_token_rejected(pause_id):
-    with pytest.raises(InputValidationError) as caught:
-        warn_missing_pause_id(agent(state_store=AsyncMock()), None, pause_id=pause_id)
-    assert caught.value.field == "expected_pause_id"
-    assert caught.value.code == "pause_id_required"
+def test_pause_token_is_required_only_when_stored(pause_id):
+    if pause_id is None:
+        require_pause_id(agent(state_store=AsyncMock()), None, pause_id=None)
+    else:
+        with pytest.raises(InputValidationError) as caught:
+            require_pause_id(agent(state_store=AsyncMock()), None, pause_id=pause_id)
+        assert caught.value.field == "expected_pause_id"
+        assert caught.value.code == "pause_id_required"
 
 
 def test_old_nonstrict_submission_and_explicit_token_are_silent():
     with warnings.catch_warnings():
         warnings.simplefilter("error")
-        warn_missing_pause_id(agent(strict_tenancy=False), None, pause_id="generation")
-        warn_missing_pause_id(agent(), "generation", pause_id="generation")
+        require_pause_id(agent(strict_tenancy=False), None, pause_id="generation")
+        require_pause_id(agent(), "generation", pause_id="generation")
 
 
 def test_governance_default_raises_and_old_warn_value_works():
@@ -121,13 +124,12 @@ async def test_budget_default_counts_cache_and_old_false_works(kwargs, tokens):
         assert (await tracker._measure()).tokens == tokens
 
 
-async def test_implicit_database_url_is_refused_without_leaking(monkeypatch):
+async def test_implicit_database_url_is_ignored_without_engine(monkeypatch):
     monkeypatch.setenv("DENDRUX_DATABASE_URL", "sqlite+aiosqlite:///SECRET")
     implicit_engine = AsyncMock(side_effect=AssertionError("implicit engine requested"))
     monkeypatch.setattr("dendrux.db.session.get_engine", implicit_engine)
-    with pytest.raises(ValueError, match="state_store=.*database_url=") as caught:
-        await agent()._resolve_state_store()
-    assert "SECRET" not in str(caught.value)
+    assert await agent()._resolve_state_store() is None
+    implicit_engine.assert_not_awaited()
 
 
 async def test_explicit_store_overrides_env_without_warning(monkeypatch):
@@ -283,7 +285,7 @@ async def test_persistent_default_refuses_scope_before_io(persistence, streaming
 def test_no_store_missing_nonapproval_pause_token_is_silent():
     with warnings.catch_warnings():
         warnings.simplefilter("error")
-        warn_missing_pause_id(agent(), None, pause_id="generation")
+        require_pause_id(agent(), None, pause_id="generation")
 
 
 def test_budget_explicit_none_keeps_legacy_formula_without_warning():

@@ -1,38 +1,17 @@
 {
-  "_comment": "Allowed v0.5.0 \u2192 0.6 changes, contracts \u00a712.11. Behavioral and additive entries document changes griffe does not report; every detected break must match an exact path, kind and parameter.",
+  "_comment": "v0.5.0 → 0.6 active exceptions only; documentary inventory is excluded from matching and stale reporting. IDs refer to 0.6 upgrade rows or contract sections.",
   "known_b_items": [
-    "B1",
-    "B2",
-    "B3",
-    "B4",
-    "B5",
-    "B6",
-    "B7",
-    "B8",
-    "B9",
-    "B10",
-    "B11",
-    "B12",
-    "B13",
-    "B14",
-    "B15",
-    "B16",
-    "B17",
-    "B18",
-    "B19",
-    "B20",
-    "B21",
-    "B22",
-    "B23",
-    "B24",
-    "B25",
-    "B26",
-    "B27",
-    "B28",
-    "B29",
-    "B30",
-    "B31",
-    "B32"
+    "0.6:cache-tokens",
+    "0.6:env-url",
+    "0.6:governance",
+    "0.6:pause-generation",
+    "0.6:retired-warning-location",
+    "0.6:strict-tenancy",
+    "0.6:sweep",
+    "contracts:12.11",
+    "contracts:12.2",
+    "contracts:12.51",
+    "contracts:12.7"
   ],
   "entries": [
     {
@@ -40,10 +19,39 @@
       "paths": [
         "dendrux.agent.Agent.__init__"
       ],
-      "b_item": "B19",
+      "b_item": "0.6:strict-tenancy",
       "note": "Strict tenancy on agents with persistence requires explicit tenant scope by default.",
       "param": "strict_tenancy"
     },
+    {
+      "kind": "parameter-changed-default",
+      "paths": [
+        "dendrux.agent.Agent.__init__"
+      ],
+      "b_item": "0.6:governance",
+      "note": "Changed governance is rejected by default; explicit warn keeps prior behavior.",
+      "param": "on_governance_change"
+    },
+    {
+      "kind": "parameter-changed-default",
+      "paths": [
+        "dendrux.types.Budget.__init__"
+      ],
+      "b_item": "0.6:cache-tokens",
+      "note": "Token budgets include cache read and write tokens by default.",
+      "param": "count_cache_tokens"
+    },
+    {
+      "kind": "parameter-removed",
+      "paths": [
+        "dendrux.runtime.runner.resume_stream"
+      ],
+      "param": "warning_location",
+      "b_item": "0.6:retired-warning-location",
+      "note": "Remove retired internal FutureWarning location plumbing (contracts §12.51)."
+    }
+  ],
+  "documentary": [
     {
       "kind": "behavior-changed",
       "paths": [
@@ -53,35 +61,17 @@
         "dendrux.agent.Agent.resume",
         "dendrux.agent.Agent.resume_stream"
       ],
-      "b_item": "B7",
-      "note": "Strict non-approval submissions on persisted agents require expected_pause_id, including legacy pauses.",
+      "b_item": "0.6:pause-generation",
+      "note": "Strict persisted submissions require a generation token only when the pause stores a generation.",
       "param": "expected_pause_id"
-    },
-    {
-      "kind": "parameter-changed-default",
-      "paths": [
-        "dendrux.agent.Agent.__init__"
-      ],
-      "b_item": "B7",
-      "note": "Changed governance is rejected by default; explicit warn keeps prior behavior.",
-      "param": "on_governance_change"
-    },
-    {
-      "kind": "parameter-changed-default",
-      "paths": [
-        "dendrux.types.Budget.__init__"
-      ],
-      "b_item": "B17",
-      "note": "Token budgets include cache read and write tokens by default.",
-      "param": "count_cache_tokens"
     },
     {
       "kind": "behavior-changed",
       "paths": [
         "dendrux.agent.Agent.__init__"
       ],
-      "b_item": "B6",
-      "note": "Implicit DENDRUX_DATABASE_URL persistence is removed; pass state_store or database_url.",
+      "b_item": "0.6:env-url",
+      "note": "Agent ignores DENDRUX_DATABASE_URL and logs once per process; use explicit persistence.",
       "param": "database_url"
     },
     {
@@ -89,7 +79,7 @@
       "paths": [
         "dendrux.runtime.sweep.sweep"
       ],
-      "b_item": "B7",
+      "b_item": "0.6:sweep",
       "note": "Omission retains error policy and warns only when stale rows exist; reclaim becomes default in 0.7.",
       "param": "on_stale"
     },
@@ -101,7 +91,7 @@
         "dendrux.errors.RunAlreadyClaimedError",
         "dendrux.errors.RunAlreadyTerminalError"
       ],
-      "b_item": "B7",
+      "b_item": "contracts:12.11",
       "note": "RunControlError groups the existing four control errors while retaining RuntimeError compatibility."
     },
     {
@@ -110,8 +100,8 @@
         "dendrux.runtime.state.StateStore.save_trace",
         "dendrux.runtime.state.SQLAlchemyStateStore.save_trace"
       ],
-      "b_item": "B15",
-      "note": "Trace persistence returns the durable row id instead of None (\u00a712.2)."
+      "b_item": "contracts:12.2",
+      "note": "Trace persistence returns the durable row id instead of None (§12.2)."
     },
     {
       "kind": "return-changed-type",
@@ -119,8 +109,8 @@
         "dendrux.runtime.state.StateStore.save_tool_call",
         "dendrux.runtime.state.SQLAlchemyStateStore.save_tool_call"
       ],
-      "b_item": "B15",
-      "note": "Tool persistence returns the durable row id instead of None (\u00a712.2)."
+      "b_item": "contracts:12.2",
+      "note": "Tool persistence returns the durable row id instead of None (§12.2)."
     },
     {
       "kind": "return-changed-type",
@@ -128,8 +118,8 @@
         "dendrux.runtime.state.StateStore.touch_progress",
         "dendrux.runtime.state.SQLAlchemyStateStore.touch_progress"
       ],
-      "b_item": "B15",
-      "note": "Progress writes return whether the fenced update succeeded (\u00a712.2)."
+      "b_item": "contracts:12.2",
+      "note": "Progress writes return whether the fenced update succeeded (§12.2)."
     },
     {
       "kind": "return-changed-type",
@@ -139,16 +129,16 @@
         "dendrux.runtime.state.SQLAlchemyStateStore.claim_paused_run",
         "dendrux.runtime.state.SQLAlchemyStateStore.submit_and_claim"
       ],
-      "b_item": "B15",
-      "note": "Claims return ClaimResult or False; ClaimResult carries epoch, storage format and checkpoint (\u00a712.7)."
+      "b_item": "contracts:12.7",
+      "note": "Claims return ClaimResult or False; ClaimResult carries epoch, storage format and checkpoint (§12.7)."
     },
     {
       "kind": "object-added",
       "paths": [
         "dendrux.runtime.state.ClaimResult"
       ],
-      "b_item": "B15",
-      "note": "ClaimResult exposes claim epoch, storage format, loop state and submission without int coercion (\u00a712.7)."
+      "b_item": "contracts:12.11",
+      "note": "ClaimResult exposes claim epoch, storage format, loop state and submission without int coercion (§12.7)."
     },
     {
       "kind": "parameter-added-optional",
@@ -156,7 +146,7 @@
         "dendrux.runtime.state.StateStore.create_run",
         "dendrux.runtime.state.SQLAlchemyStateStore.create_run"
       ],
-      "b_item": "B15",
+      "b_item": "contracts:12.11",
       "note": "Optional seed_traces supports atomic recovery persistence without changing existing callers.",
       "param": "seed_traces"
     },
@@ -166,7 +156,7 @@
         "dendrux.runtime.state.StateStore.create_run",
         "dendrux.runtime.state.SQLAlchemyStateStore.create_run"
       ],
-      "b_item": "B15",
+      "b_item": "contracts:12.11",
       "note": "Optional pii_mapping supports atomic recovery persistence without changing existing callers.",
       "param": "pii_mapping"
     },
@@ -176,7 +166,7 @@
         "dendrux.runtime.state.StateStore.save_trace",
         "dendrux.runtime.state.SQLAlchemyStateStore.save_trace"
       ],
-      "b_item": "B15",
+      "b_item": "contracts:12.11",
       "note": "Optional claim_epoch supports atomic recovery persistence without changing existing callers.",
       "param": "claim_epoch"
     },
@@ -186,7 +176,7 @@
         "dendrux.runtime.state.StateStore.save_trace",
         "dendrux.runtime.state.SQLAlchemyStateStore.save_trace"
       ],
-      "b_item": "B15",
+      "b_item": "contracts:12.11",
       "note": "Optional trace_id supports atomic recovery persistence without changing existing callers.",
       "param": "trace_id"
     },
@@ -196,7 +186,7 @@
         "dendrux.runtime.state.StateStore.save_trace",
         "dendrux.runtime.state.SQLAlchemyStateStore.save_trace"
       ],
-      "b_item": "B15",
+      "b_item": "contracts:12.11",
       "note": "Optional trace_kind supports atomic recovery persistence without changing existing callers.",
       "param": "trace_kind"
     },
@@ -206,7 +196,7 @@
         "dendrux.runtime.state.StateStore.save_trace",
         "dendrux.runtime.state.SQLAlchemyStateStore.save_trace"
       ],
-      "b_item": "B15",
+      "b_item": "contracts:12.11",
       "note": "Optional content_digest supports atomic recovery persistence without changing existing callers.",
       "param": "content_digest"
     },
@@ -216,7 +206,7 @@
         "dendrux.runtime.state.StateStore.save_tool_call",
         "dendrux.runtime.state.SQLAlchemyStateStore.save_tool_call"
       ],
-      "b_item": "B15",
+      "b_item": "contracts:12.11",
       "note": "Optional claim_epoch supports atomic recovery persistence without changing existing callers.",
       "param": "claim_epoch"
     },
@@ -226,7 +216,7 @@
         "dendrux.runtime.state.StateStore.save_tool_call",
         "dendrux.runtime.state.SQLAlchemyStateStore.save_tool_call"
       ],
-      "b_item": "B15",
+      "b_item": "contracts:12.11",
       "note": "Optional row_id supports atomic recovery persistence without changing existing callers.",
       "param": "row_id"
     },
@@ -236,7 +226,7 @@
         "dendrux.runtime.state.StateStore.save_tool_call",
         "dendrux.runtime.state.SQLAlchemyStateStore.save_tool_call"
       ],
-      "b_item": "B15",
+      "b_item": "contracts:12.11",
       "note": "Optional content_digest supports atomic recovery persistence without changing existing callers.",
       "param": "content_digest"
     },
@@ -246,7 +236,7 @@
         "dendrux.runtime.state.StateStore.save_tool_call",
         "dendrux.runtime.state.SQLAlchemyStateStore.save_tool_call"
       ],
-      "b_item": "B15",
+      "b_item": "contracts:12.11",
       "note": "Optional outcome supports atomic recovery persistence without changing existing callers.",
       "param": "outcome"
     },
@@ -256,7 +246,7 @@
         "dendrux.runtime.state.StateStore.save_usage",
         "dendrux.runtime.state.SQLAlchemyStateStore.save_usage"
       ],
-      "b_item": "B15",
+      "b_item": "contracts:12.11",
       "note": "Optional claim_epoch supports atomic recovery persistence without changing existing callers.",
       "param": "claim_epoch"
     },
@@ -266,7 +256,7 @@
         "dendrux.runtime.state.StateStore.save_llm_interaction",
         "dendrux.runtime.state.SQLAlchemyStateStore.save_llm_interaction"
       ],
-      "b_item": "B15",
+      "b_item": "contracts:12.11",
       "note": "Optional claim_epoch supports atomic recovery persistence without changing existing callers.",
       "param": "claim_epoch"
     },
@@ -276,7 +266,7 @@
         "dendrux.runtime.state.StateStore.finalize_with_event",
         "dendrux.runtime.state.SQLAlchemyStateStore.finalize_with_event"
       ],
-      "b_item": "B15",
+      "b_item": "contracts:12.11",
       "note": "Optional trace supports atomic recovery persistence without changing existing callers.",
       "param": "trace"
     },
@@ -286,7 +276,7 @@
         "dendrux.runtime.state.StateStore.finalize_with_event",
         "dendrux.runtime.state.SQLAlchemyStateStore.finalize_with_event"
       ],
-      "b_item": "B15",
+      "b_item": "contracts:12.11",
       "note": "Optional event supports atomic recovery persistence without changing existing callers.",
       "param": "event"
     },
@@ -296,7 +286,7 @@
         "dendrux.runtime.state.StateStore.add_note",
         "dendrux.runtime.state.SQLAlchemyStateStore.add_note"
       ],
-      "b_item": "B15",
+      "b_item": "contracts:12.11",
       "note": "Optional claim_epoch supports atomic recovery persistence without changing existing callers.",
       "param": "claim_epoch"
     },
@@ -306,7 +296,7 @@
         "dendrux.runtime.state.StateStore.mark_notes_delivered",
         "dendrux.runtime.state.SQLAlchemyStateStore.mark_notes_delivered"
       ],
-      "b_item": "B15",
+      "b_item": "contracts:12.11",
       "note": "Optional claim_epoch supports atomic recovery persistence without changing existing callers.",
       "param": "claim_epoch"
     },
@@ -316,7 +306,7 @@
         "dendrux.runtime.state.StateStore.submit_and_claim",
         "dendrux.runtime.state.SQLAlchemyStateStore.submit_and_claim"
       ],
-      "b_item": "B15",
+      "b_item": "contracts:12.11",
       "note": "Optional submission supports atomic recovery persistence without changing existing callers.",
       "param": "submission"
     },
@@ -326,7 +316,7 @@
         "dendrux.runtime.state.StateStore.save_run_event",
         "dendrux.runtime.state.SQLAlchemyStateStore.save_run_event"
       ],
-      "b_item": "B15",
+      "b_item": "contracts:12.11",
       "note": "Optional claim_epoch supports atomic recovery persistence without changing existing callers.",
       "param": "claim_epoch"
     },
@@ -336,7 +326,7 @@
         "dendrux.runtime.state.StateStore.save_run_event",
         "dendrux.runtime.state.SQLAlchemyStateStore.save_run_event"
       ],
-      "b_item": "B15",
+      "b_item": "contracts:12.11",
       "note": "Optional event_id supports atomic recovery persistence without changing existing callers.",
       "param": "event_id"
     },
@@ -346,7 +336,7 @@
         "dendrux.runtime.state.StateStore.save_run_event",
         "dendrux.runtime.state.SQLAlchemyStateStore.save_run_event"
       ],
-      "b_item": "B15",
+      "b_item": "contracts:12.11",
       "note": "Optional content_digest supports atomic recovery persistence without changing existing callers.",
       "param": "content_digest"
     },
@@ -356,7 +346,7 @@
         "dendrux.runtime.state.StateStore.touch_progress",
         "dendrux.runtime.state.SQLAlchemyStateStore.touch_progress"
       ],
-      "b_item": "B15",
+      "b_item": "contracts:12.11",
       "note": "Optional claim_epoch supports atomic recovery persistence without changing existing callers.",
       "param": "claim_epoch"
     },
@@ -365,7 +355,7 @@
       "paths": [
         "dendrux.runtime.state.SQLAlchemyStateStore.update_run_meta"
       ],
-      "b_item": "B15",
+      "b_item": "contracts:12.11",
       "note": "Optional epoch fences metadata writes against a superseded claim.",
       "param": "claim_epoch"
     },
@@ -374,7 +364,7 @@
       "paths": [
         "dendrux.runtime.sweep.sweep"
       ],
-      "b_item": "B7",
+      "b_item": "contracts:12.11",
       "note": "Optional max_reclaims bounds developer-called recovery sweeps.",
       "param": "max_reclaims"
     },
@@ -383,7 +373,7 @@
       "paths": [
         "dendrux.runtime.sweep.sweep"
       ],
-      "b_item": "B7",
+      "b_item": "contracts:12.11",
       "note": "Optional max_returned bounds developer-called recovery sweeps.",
       "param": "max_returned"
     },
@@ -392,7 +382,7 @@
       "paths": [
         "dendrux.runtime.sweep.sweep"
       ],
-      "b_item": "B7",
+      "b_item": "contracts:12.11",
       "note": "Optional cursor bounds developer-called recovery sweeps.",
       "param": "cursor"
     },
@@ -401,7 +391,7 @@
       "paths": [
         "dendrux.tool.tool"
       ],
-      "b_item": "B7",
+      "b_item": "contracts:12.11",
       "note": "Idempotent tools may be replayed during explicit recovery.",
       "param": "idempotent"
     },
@@ -411,7 +401,7 @@
         "dendrux.store.RunStore.from_engine",
         "dendrux.store.RunStore.from_database_url"
       ],
-      "b_item": "B15",
+      "b_item": "contracts:12.11",
       "note": "Optional notifier provides event wakeups while polling remains the fallback.",
       "param": "notifier"
     },
@@ -420,7 +410,7 @@
       "paths": [
         "dendrux.store.RunStore.from_database_url"
       ],
-      "b_item": "B15",
+      "b_item": "contracts:12.11",
       "note": "Optional direct listen URL supports Postgres notification connections.",
       "param": "listen_url"
     },
@@ -429,7 +419,7 @@
       "paths": [
         "dendrux.runtime.state.SQLAlchemyStateStore.__init__"
       ],
-      "b_item": "B15",
+      "b_item": "contracts:12.11",
       "note": "Optional notification channel emits transaction-bound wakeups.",
       "param": "notify_channel"
     },
@@ -439,7 +429,7 @@
         "dendrux.agent.Agent.__init__"
       ],
       "param": "lease_interval",
-      "b_item": "B7",
+      "b_item": "contracts:12.11",
       "note": "Optional lease interval bounds the developer-called recovery heartbeat cadence."
     },
     {
@@ -449,7 +439,7 @@
         "dendrux.notifiers.otel.OpenTelemetryNotifier.on_run_started"
       ],
       "param": "trace_link",
-      "b_item": "B15",
+      "b_item": "contracts:12.11",
       "note": "Optional trace link connects resumed and reclaimed execution to the original run trace."
     },
     {
@@ -458,7 +448,7 @@
         "dendrux.types.ToolCall.__init__"
       ],
       "param": "raw_length",
-      "b_item": "B15",
+      "b_item": "contracts:12.11",
       "note": "Optional raw argument length preserves bounded provider parsing diagnostics."
     },
     {
@@ -468,7 +458,7 @@
         "dendrux.types.ToolDef.__init__"
       ],
       "param": "idempotent",
-      "b_item": "B15",
+      "b_item": "contracts:12.11",
       "note": "Optional replay declaration allows safe recovery of explicitly idempotent tools."
     },
     {
@@ -477,7 +467,7 @@
         "dendrux.types.Limits.__init__"
       ],
       "param": "max_pending_calls",
-      "b_item": "B15",
+      "b_item": "contracts:12.11",
       "note": "Optional batch bound refuses excessive pending tool calls before writing intents."
     },
     {
@@ -486,7 +476,7 @@
         "dendrux.types.Limits.__init__"
       ],
       "param": "max_rebuild_bytes",
-      "b_item": "B15",
+      "b_item": "contracts:12.11",
       "note": "Optional byte bound limits recovery conversation rebuilding."
     },
     {
@@ -495,7 +485,7 @@
         "dendrux.types.Limits.__init__"
       ],
       "param": "max_rebuild_rows",
-      "b_item": "B15",
+      "b_item": "contracts:12.11",
       "note": "Optional row bound limits recovery conversation rebuilding."
     },
     {
@@ -504,7 +494,7 @@
         "dendrux.types.RunResult.__init__"
       ],
       "param": "recovery",
-      "b_item": "B15",
+      "b_item": "contracts:12.11",
       "note": "Optional recovery metadata reports lease and reclaim state on results."
     },
     {
@@ -513,7 +503,7 @@
         "dendrux.types.PauseState.__init__"
       ],
       "param": "image_view_ref",
-      "b_item": "B15",
+      "b_item": "contracts:12.11",
       "note": "Optional image-state reference restores durable image views from state traces."
     },
     {
@@ -522,7 +512,7 @@
         "dendrux.types.PauseState.__init__"
       ],
       "param": "loop_state_ref",
-      "b_item": "B15",
+      "b_item": "contracts:12.11",
       "note": "Optional checkpoint reference distinguishes format-2 pause state."
     },
     {
@@ -533,7 +523,7 @@
         "dendrux.types.CreateRunResult.__init__"
       ],
       "param": "storage_format",
-      "b_item": "B15",
+      "b_item": "contracts:12.11",
       "note": "Optional storage-format value identifies the durable run layout."
     },
     {
@@ -542,7 +532,7 @@
         "dendrux.errors.PersistenceError.__init__"
       ],
       "param": "code",
-      "b_item": "B15",
+      "b_item": "contracts:12.11",
       "note": "Optional stable persistence error code identifies refusal and conflict categories."
     },
     {
@@ -554,7 +544,7 @@
         "dendrux.llm.openrouter.OpenRouterProvider.__init__"
       ],
       "param": "max_response_bytes",
-      "b_item": "B15",
+      "b_item": "contracts:12.11",
       "note": "Optional response bound limits buffered provider payload bytes."
     },
     {
@@ -563,7 +553,7 @@
         "dendrux.runtime.persistence.PersistenceRecorder.__init__"
       ],
       "param": "seed_traces",
-      "b_item": "B15",
+      "b_item": "contracts:12.11",
       "note": "Optional seed traces are persisted atomically at run creation."
     },
     {
@@ -572,7 +562,7 @@
         "dendrux.runtime.persistence.PersistenceRecorder.__init__"
       ],
       "param": "guardrail_engine",
-      "b_item": "B15",
+      "b_item": "contracts:12.11",
       "note": "Optional existing guardrail engine preserves one mapping across resumed execution."
     },
     {
@@ -581,7 +571,7 @@
         "dendrux.runtime.context.DelegationContext.__init__"
       ],
       "param": "lease_interval_s",
-      "b_item": "B15",
+      "b_item": "contracts:12.11",
       "note": "Optional lease cadence carries the Agent recovery setting into delegated runs."
     },
     {
@@ -591,7 +581,7 @@
         "dendrux.runtime.state.RunRecord.__init__"
       ],
       "param": "trace_link",
-      "b_item": "B15",
+      "b_item": "contracts:12.11",
       "note": "Optional trace link connects later execution to the original run trace."
     },
     {
@@ -600,7 +590,7 @@
         "dendrux.runtime.context.DelegationContext.__init__"
       ],
       "param": "tool_span_link",
-      "b_item": "B15",
+      "b_item": "contracts:12.11",
       "note": "Optional tool-span link connects delegated runs to their parent tool."
     },
     {
@@ -609,7 +599,7 @@
         "dendrux.runtime.state.RunRecord.__init__"
       ],
       "param": "claim_epoch",
-      "b_item": "B15",
+      "b_item": "contracts:12.11",
       "note": "Optional claim epoch fences writes against superseded execution."
     },
     {
@@ -618,7 +608,7 @@
         "dendrux.runtime.state.RunRecord.__init__"
       ],
       "param": "status_changed_at",
-      "b_item": "B15",
+      "b_item": "contracts:12.11",
       "note": "Optional transition timestamp exposes recovery eligibility state."
     },
     {
@@ -627,7 +617,7 @@
         "dendrux.runtime.state.RunRecord.__init__"
       ],
       "param": "reclaim_attempts",
-      "b_item": "B15",
+      "b_item": "contracts:12.11",
       "note": "Optional reclaim count reports bounded recovery attempts."
     },
     {
@@ -636,7 +626,7 @@
         "dendrux.runtime.state.RunRecord.__init__"
       ],
       "param": "reclaim_limit",
-      "b_item": "B15",
+      "b_item": "contracts:12.11",
       "note": "Optional reclaim limit records the policy used when marking a stale run."
     },
     {
@@ -645,7 +635,7 @@
         "dendrux.runtime.state.RunRecord.__init__"
       ],
       "param": "lease_expired_at",
-      "b_item": "B15",
+      "b_item": "contracts:12.11",
       "note": "Optional lease-expiry marker exposes developer-called sweep results."
     },
     {
@@ -654,7 +644,7 @@
         "dendrux.runtime.state.RunRecord.__init__"
       ],
       "param": "last_reclaimed_at",
-      "b_item": "B15",
+      "b_item": "contracts:12.11",
       "note": "Optional last-reclaimed timestamp reports recovery history."
     },
     {
@@ -663,7 +653,7 @@
         "dendrux.runtime.state.TraceRecord.__init__"
       ],
       "param": "trace_kind",
-      "b_item": "B15",
+      "b_item": "contracts:12.11",
       "note": "Optional trace kind distinguishes turns from seeds, rewrites and state references."
     },
     {
@@ -672,7 +662,7 @@
         "dendrux.runtime.state.ToolCallReadRecord.__init__"
       ],
       "param": "outcome",
-      "b_item": "B15",
+      "b_item": "contracts:12.11",
       "note": "Optional tool outcome distinguishes started, completed and failed intent rows."
     },
     {
@@ -681,7 +671,7 @@
         "dendrux.runtime.state.ToolCallReadRecord.__init__"
       ],
       "param": "replayed_at",
-      "b_item": "B15",
+      "b_item": "contracts:12.11",
       "note": "Optional replay timestamp identifies tool calls retried during recovery."
     },
     {
@@ -690,7 +680,7 @@
         "dendrux.runtime.state.ToolCallReadRecord.__init__"
       ],
       "param": "observation",
-      "b_item": "B15",
+      "b_item": "contracts:12.11",
       "note": "Optional observation returns the durable tool-result trace during recovery."
     },
     {
@@ -699,7 +689,7 @@
         "dendrux.runtime.state.SweepResult.__init__"
       ],
       "param": "reclaimable",
-      "b_item": "B15",
+      "b_item": "contracts:12.11",
       "note": "Optional reclaimable result lists bounded recovery candidates found by sweep."
     },
     {
@@ -708,8 +698,31 @@
         "dendrux.runtime.state.SweepResult.__init__"
       ],
       "param": "cursor",
-      "b_item": "B15",
+      "b_item": "contracts:12.11",
       "note": "Optional opaque cursor continues a bounded sweep page."
+    },
+    {
+      "kind": "parameter-added-optional",
+      "paths": [
+        "dendrux.runtime.context.DelegationContext.__init__"
+      ],
+      "param": "tenant_explicit",
+      "b_item": "contracts:12.51",
+      "note": "Carry trusted outer tenant selection across delegation, including explicit None."
+    },
+    {
+      "kind": "parameter-added-optional",
+      "paths": [
+        "dendrux.runtime.runner.resume",
+        "dendrux.runtime.runner.resume_with_input",
+        "dendrux.runtime.runner.resume_stream",
+        "dendrux.runtime.runner.resume_claimed",
+        "dendrux.runtime.runner.resume_approval_approved_claim",
+        "dendrux.runtime.runner.resume_paused_claim"
+      ],
+      "param": "_tenant_explicit",
+      "b_item": "contracts:12.51",
+      "note": "Carry verified scope selection through existing resume and claim continuations."
     }
   ]
 }

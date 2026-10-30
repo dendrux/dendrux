@@ -370,6 +370,14 @@ USAGE_INVALID = Code(
     "Provider usage cannot be trusted.",
     "Treat accounting as unknown and inspect the adapter.",
 )
+DATABASE_URL_ENV_IGNORED = Code(
+    "database_url_env_ignored",
+    logging.WARNING,
+    "runtime",
+    _BASE_FIELDS | frozenset([]),
+    "An Agent without persistence ignores DENDRUX_DATABASE_URL.",
+    "Pass state_store or database_url explicitly to persist Agent runs.",
+)
 TENANT_SCOPE_REQUIRED = Code(
     "tenant_scope_required",
     logging.WARNING,
@@ -1696,6 +1704,7 @@ REGISTRY = MappingProxyType(
             FOLLOW_TENANT_CAPACITY,
             FOLLOW_SHUTDOWN_PENDING,
             USAGE_INVALID,
+            DATABASE_URL_ENV_IGNORED,
             TENANT_SCOPE_REQUIRED,
             RESERVED_METADATA_KEY,
             METADATA_TOO_LARGE,

@@ -1,7 +1,7 @@
 """Public API break check: compare ``dendrux`` against a released git tag with griffe.
 
 Every break griffe finds must be listed in ``tools/api_break_allowlist.json`` with the
-migration-note B-item (spec section 2) that documents it. A break with no B-item can be
+release migration-note identifier that documents it. A break with no migration-note id can be
 listed as a *gap* (``"b_item": null`` plus a ``"gap"`` reason) so it is visible, but the
 check fails on it: CI and ``make api-check`` accept no unmapped break. ``--allow-gaps`` is
 an informational mode that lists gaps without failing on them; do not use it in CI.
@@ -32,7 +32,7 @@ DEFAULT_ALLOWLIST = HERE / "api_break_allowlist.json"
 DEFAULT_REPO = HERE.parents[2]
 DEFAULT_SEARCH_PATH = "packages/python/src"
 DEFAULT_AGAINST = "v0.5.0"
-_B_ITEM = re.compile(r"^B\d+$")
+_B_ITEM = re.compile(r"^(?:B\d+|0\.6:[a-z0-9-]+|contracts:12\.\d+)$")
 
 
 @dataclass(frozen=True)
@@ -90,7 +90,7 @@ def _parse_entry(index: int, raw: dict[str, Any], known: set[str]) -> AllowEntry
     if not isinstance(paths, list) or not paths or not all(isinstance(p, str) for p in paths):
         raise ValueError(f"{where}: 'paths' must be a non-empty list of strings")
     if "b_item" not in raw:
-        raise ValueError(f"{where}: 'b_item' is required (a B-item id, or null for a gap)")
+        raise ValueError(f"{where}: 'b_item' is required (a migration-note id, or null for a gap)")
     b_item = raw["b_item"]
     if b_item is None:
         note = raw.get("gap")
@@ -98,10 +98,12 @@ def _parse_entry(index: int, raw: dict[str, Any], known: set[str]) -> AllowEntry
             raise ValueError(f"{where}: a gap entry (b_item null) needs a 'gap' reason")
     else:
         if not isinstance(b_item, str) or not _B_ITEM.match(b_item) or b_item not in known:
-            raise ValueError(f"{where}: unknown B-item {b_item!r}")
+            raise ValueError(f"{where}: unknown migration-note identifier {b_item!r}")
         note = raw.get("note")
         if not isinstance(note, str) or not note.strip():
-            raise ValueError(f"{where}: 'note' (why this B-item covers the break) is required")
+            raise ValueError(
+                f"{where}: 'note' (why this migration note covers the break) is required"
+            )
     return AllowEntry(
         kind=kind,
         paths=tuple(paths),
@@ -153,7 +155,7 @@ def format_report(result: Classification, against: str) -> str:
         lines.append(f"\nDocumented ({len(result.mapped)}):")
         lines.extend(f"  {e.b_item}  {_line(b)}" for b, e in result.mapped)
     if result.gaps:
-        lines.append(f"\nGAP: not documented by any B-item ({len(result.gaps)}):")
+        lines.append(f"\nGAP: not documented by any migration-note id ({len(result.gaps)}):")
         lines.extend(f"  {_line(b)}  -- {e.note}" for b, e in result.gaps)
     if result.unlisted:
         lines.append(f"\nUNLISTED: new breaks, not in the allowlist ({len(result.unlisted)}):")
@@ -176,7 +178,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--allow-gaps",
         action="store_true",
-        help="informational: list breaks that have no B-item without failing on them",
+        help="informational: list breaks that have no migration-note id without failing on them",
     )
     parser.add_argument("--report", type=Path, help="write the report to this file too")
     return parser
@@ -197,11 +199,13 @@ def main(argv: list[str] | None = None) -> int:
         args.report.write_text(report + "\n")
     if result.unlisted:
         print(f"\nFAIL: {len(result.unlisted)} break(s) are not in {args.allowlist.name}.")
-        print("Document each in the migration notes, then add it with its B-item.")
+        print(
+            "Document each in the migration notes, then add it with its migration-note identifier."
+        )
         return 1
     if result.gaps and not args.allow_gaps:
-        print(f"\nFAIL: {len(result.gaps)} break(s) have no migration-note B-item.")
-        print("Add the B-item to the spec's migration notes and the allowlist.")
+        print(f"\nFAIL: {len(result.gaps)} break(s) have no migration-note identifier.")
+        print("Add the migration-note id to the spec's migration notes and the allowlist.")
         return 1
     print("\nAPI break check ok")
     return 0

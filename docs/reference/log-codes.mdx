@@ -178,6 +178,7 @@ Missing or invalid codes remain unset. Category and HTTP status remain independe
 | `cancel_persist_failed` | ERROR | `code`, `kind`, `run_id`, `tenant_id` | Cancellation cannot be persisted. | Retry cancellation after restoring the store. |
 | `cancel_requested` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | A stale run has a durable cancellation request. | No action unless cancellation is unexpected. |
 | `cascade_truncated` | WARNING | `code`, `count`, `kind`, `limit`, `run_id`, `tenant_id` | Cancellation discovers more descendants than the subtree traversal bound. | Inspect the bounded subtree and cancel remaining subtrees or raise the bound. |
+| `database_url_env_ignored` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | An Agent without persistence ignores DENDRUX_DATABASE_URL. | Pass state_store or database_url explicitly to persist Agent runs. |
 | `input_size_limit` | WARNING | `bytes`, `code`, `entry`, `field`, `kind`, `limit`, `run_id`, `tenant_id` | An input exceeds its configured bound. | Reduce the input or raise the bound deliberately. |
 | `invalid_limit` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | A recovery limit is invalid. | Use a positive limit within the documented bound. |
 | `legacy_claim_validation` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | A legacy store needs claim-time validation. | Implement the current store capabilities when upgrading. |

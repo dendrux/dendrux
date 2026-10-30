@@ -419,8 +419,13 @@ async def claim_or_raise(
     if raw is None:
         await raise_for_non_paused_status(store, run_id)
     if agent is not None:
-        warn_missing_pause_id(
-            agent, expected_pause_id, pause_id=raw.get("pause_id"), approval=approval
+        require_pause_id(
+            agent,
+            expected_pause_id,
+            pause_id=raw.get("pause_id"),
+            approval=approval,
+            store=store,
+            run_id=run_id,
         )
     validate = submission_validator(
         run_id,
@@ -1016,7 +1021,9 @@ def governance_snapshot(agent: Agent) -> dict[str, Any]:
             {
                 "on_exceed": budget.on_exceed,
                 "include_children": budget.include_children,
-                "count_cache_tokens": bool(budget.count_cache_tokens),
+                "count_cache_tokens": bool(budget.count_cache_tokens)
+                if budget.max_tokens is not None
+                else False,
             }
             if budget
             else None
@@ -1083,38 +1090,11 @@ def submission_validator(
     return validate
 
 
-@dataclass(frozen=True)
-class _WarningLocation:
-    filename: str
-    lineno: int
-    module: str
-    registry: dict[str | tuple[str, type[Warning], int], int]
-
-
-def capture_warning_location() -> _WarningLocation | None:
-    """Keep a lazy stream's creation site without retaining the caller frame."""
-    import inspect
-
-    frame = inspect.currentframe()
-    while frame is not None and frame.f_globals.get("__name__", "").startswith("dendrux."):
-        frame = frame.f_back
-    if frame is None:
-        return None
-    return _WarningLocation(
-        frame.f_code.co_filename,
-        frame.f_lineno,
-        frame.f_globals.get("__name__", ""),
-        frame.f_globals.setdefault("__warningregistry__", {}),
-    )
-
-
 async def report_governance_change(
     agent: Agent,
     store: StateStore,
     run_id: str,
     raw: dict[str, Any],
-    *,
-    warning_location: _WarningLocation | None = None,
 ) -> None:
     import logging
 
@@ -1138,19 +1118,23 @@ def _require_approval_token(approval: bool, expected: str | None) -> None:
         raise InputValidationError("expected_pause_id", "pause_id_required")
 
 
-def warn_missing_pause_id(
+def require_pause_id(
     agent: Agent,
     expected: str | None,
     *,
     pause_id: str | None,
     approval: bool = False,
-    warning_location: _WarningLocation | None = None,
+    store: StateStore | None = None,
+    run_id: str | None = None,
 ) -> None:
-    _require_approval_token(approval, expected)
-    if expected is None and _strict_tenancy_applies(agent):
+    """Require a token only when the stored pause has a durable generation."""
+    _require_approval_token(approval and pause_id is not None, expected)
+    if pause_id is not None and expected is None and _strict_tenancy_applies(agent, store):
         from dendrux.types import InputValidationError
 
         raise InputValidationError("expected_pause_id", "pause_id_required")
+    if run_id is not None:
+        pause_validator(run_id, expected)({"pause_id": pause_id})
 
 
 def _client_json_payload(payload: str) -> str:

@@ -296,7 +296,13 @@ class TestDelegationRunnerIntegration:
         llm = MockLLM([LLMResponse(text="done")])
         agent = Agent(prompt="Test.", tools=[add])
 
-        await run(agent, provider=llm, user_input="go", state_store=store)
+        await run(
+            agent,
+            provider=llm,
+            user_input="go",
+            state_store=store,
+            tenant_id=None,
+        )
 
         created = store.created_runs[0]
         assert created.get("parent_run_id") is None
@@ -319,6 +325,7 @@ class TestDelegationRunnerIntegration:
                 provider=MockLLM([LLMResponse(text="helped")]),
                 user_input=task,
                 state_store=store,
+                tenant_id=None,
             )
             return result.answer or ""
 
@@ -339,6 +346,7 @@ class TestDelegationRunnerIntegration:
             provider=parent_llm,
             user_input="go",
             state_store=store,
+            tenant_id=None,
         )
 
         assert len(store.created_runs) == 2
@@ -376,6 +384,7 @@ class TestDelegationRunnerIntegration:
                 provider=MockLLM([LLMResponse(text="helped")]),
                 user_input=task,
                 state_store=child_store,
+                tenant_id=None,
             )
             return result.answer or ""
 
@@ -396,6 +405,7 @@ class TestDelegationRunnerIntegration:
             provider=parent_llm,
             user_input="go",
             state_store=parent_store,
+            tenant_id=None,
         )
 
         # Parent on parent_store, child on child_store
@@ -415,7 +425,13 @@ class TestDelegationRunnerIntegration:
         llm = MockLLM([LLMResponse(text="done")])
         agent = Agent(prompt="Test.", tools=[add])
 
-        await run(agent, provider=llm, user_input="go", state_store=store)
+        await run(
+            agent,
+            provider=llm,
+            user_input="go",
+            state_store=store,
+            tenant_id=None,
+        )
 
         assert get_delegation_context() is None
 
@@ -436,6 +452,7 @@ class TestDelegationRunnerIntegration:
                 provider=MockLLM([LLMResponse(text="helped")]),
                 user_input=task,
                 state_store=store,
+                tenant_id=None,
             )
             return result.answer or ""
 
@@ -455,6 +472,7 @@ class TestDelegationRunnerIntegration:
             parent_agent,
             provider=parent_llm,
             user_input="go",
+            tenant_id=None,
         )
 
         assert len(store.created_runs) == 1
@@ -560,6 +578,7 @@ class TestMaxDelegationDepth:
                 provider=MockLLM([LLMResponse(text="helped")]),
                 user_input=task,
                 state_store=child_store,
+                tenant_id=None,
             )
             return result.answer or ""
 
@@ -582,6 +601,7 @@ class TestMaxDelegationDepth:
             user_input="go",
             state_store=parent_store,
             max_delegation_depth=0,
+            tenant_id=None,
         )
 
         # Parent completed (tool error was handled gracefully by ReAct loop)
@@ -618,6 +638,7 @@ class TestMaxDelegationDepth:
             provider=llm,
             user_input="go",
             max_delegation_depth=5,
+            tenant_id=None,
         )
 
         assert len(captured_contexts) == 1
@@ -647,7 +668,12 @@ class TestMaxDelegationDepth:
             ]
         )
 
-        await run(agent, provider=llm, user_input="go")
+        await run(
+            agent,
+            provider=llm,
+            user_input="go",
+            tenant_id=None,
+        )
 
         ctx = captured_contexts[0]
         assert ctx is not None
@@ -675,7 +701,13 @@ class TestMaxDelegationDepth:
             ]
         )
 
-        await run(agent, provider=llm, user_input="go", max_delegation_depth=None)
+        await run(
+            agent,
+            provider=llm,
+            user_input="go",
+            max_delegation_depth=None,
+            tenant_id=None,
+        )
 
         ctx = captured_contexts[0]
         assert ctx is not None
@@ -693,6 +725,7 @@ class TestMaxDelegationDepth:
             user_input="go",
             state_store=store,
             max_delegation_depth=7,
+            tenant_id=None,
         )
 
         assert len(store.created_runs) == 1
@@ -711,6 +744,7 @@ class TestMaxDelegationDepth:
             user_input="go",
             state_store=store,
             max_delegation_depth=None,
+            tenant_id=None,
         )
 
         meta = store.created_runs[0].get("meta", {})
@@ -729,7 +763,13 @@ class TestMaxDelegationDepth:
         llm = MockLLM([LLMResponse(text="done")])
 
         with pytest.raises(ValueError, match="non-negative integer"):
-            await run(agent, provider=llm, user_input="go", max_delegation_depth=-1)
+            await run(
+                agent,
+                provider=llm,
+                user_input="go",
+                max_delegation_depth=-1,
+                tenant_id=None,
+            )
 
     def test_negative_depth_raises_on_runner_run_stream(self) -> None:
         """Negative max_delegation_depth raises ValueError on run_stream() too."""
@@ -739,7 +779,13 @@ class TestMaxDelegationDepth:
         llm = MockLLM([LLMResponse(text="done")])
 
         with pytest.raises(ValueError, match="non-negative integer"):
-            run_stream(agent, provider=llm, user_input="go", max_delegation_depth=-1)
+            run_stream(
+                agent,
+                provider=llm,
+                user_input="go",
+                max_delegation_depth=-1,
+                tenant_id=None,
+            )
 
     async def test_child_cannot_loosen_parent_depth(self) -> None:
         """A child run that sets a higher depth gets clamped with a warning."""
@@ -764,6 +810,7 @@ class TestMaxDelegationDepth:
                 provider=child_llm,
                 user_input="go",
                 max_delegation_depth=100,
+                tenant_id=None,
             )
             return "spawned"
 
@@ -789,6 +836,7 @@ class TestMaxDelegationDepth:
             provider=parent_llm,
             user_input="go",
             max_delegation_depth=3,
+            tenant_id=None,
         )
 
         # Child's context should have depth clamped to 3, not 100
@@ -810,6 +858,7 @@ class TestMaxDelegationDepth:
                 provider=child_llm,
                 user_input="go",
                 max_delegation_depth=100,
+                tenant_id=None,
             )
             return "ok"
 
@@ -835,6 +884,7 @@ class TestMaxDelegationDepth:
                 provider=parent_llm,
                 user_input="go",
                 max_delegation_depth=3,
+                tenant_id=None,
             )
 
         assert any("100 clamped to 3" in msg for msg in caplog.messages)
@@ -862,6 +912,7 @@ class TestMaxDelegationDepth:
                 provider=child_llm,
                 user_input="go",
                 max_delegation_depth=2,
+                tenant_id=None,
             )
             return "spawned"
 
@@ -882,7 +933,13 @@ class TestMaxDelegationDepth:
             ]
         )
 
-        await run(parent_agent, provider=parent_llm, user_input="go", max_delegation_depth=10)
+        await run(
+            parent_agent,
+            provider=parent_llm,
+            user_input="go",
+            max_delegation_depth=10,
+            tenant_id=None,
+        )
 
         # Child's context should have depth=2 (tighter than parent's 10)
         assert len(captured_contexts) == 1
@@ -913,6 +970,7 @@ class TestMaxDelegationDepth:
                 provider=child_llm,
                 user_input="go",
                 max_delegation_depth=None,
+                tenant_id=None,
             )
             return "spawned"
 
@@ -939,6 +997,7 @@ class TestMaxDelegationDepth:
                 provider=parent_llm,
                 user_input="go",
                 max_delegation_depth=5,
+                tenant_id=None,
             )
 
         # Child's context should be clamped to 5, not None
@@ -967,7 +1026,12 @@ class TestMaxDelegationDepth:
                 ]
             )
             # No max_delegation_depth — should inherit silently
-            await run(child_agent, provider=child_llm, user_input="go")
+            await run(
+                child_agent,
+                provider=child_llm,
+                user_input="go",
+                tenant_id=None,
+            )
             return "spawned"
 
         @tool()
@@ -993,6 +1057,7 @@ class TestMaxDelegationDepth:
                 provider=parent_llm,
                 user_input="go",
                 max_delegation_depth=3,
+                tenant_id=None,
             )
 
         # Inherited parent's limit
@@ -1110,7 +1175,13 @@ class TestMaxDelegationDepth:
             ]
         )
 
-        await run(parent_agent, provider=parent_llm, user_input="go", max_delegation_depth=3)
+        await run(
+            parent_agent,
+            provider=parent_llm,
+            user_input="go",
+            max_delegation_depth=3,
+            tenant_id=None,
+        )
 
         assert len(captured_contexts) == 1
         assert captured_contexts[0].max_delegation_depth == 3
@@ -1157,7 +1228,13 @@ class TestMaxDelegationDepth:
             ]
         )
 
-        await run(parent_agent, provider=parent_llm, user_input="go", max_delegation_depth=10)
+        await run(
+            parent_agent,
+            provider=parent_llm,
+            user_input="go",
+            max_delegation_depth=10,
+            tenant_id=None,
+        )
 
         assert len(captured_contexts) == 1
         assert captured_contexts[0].max_delegation_depth == 2
@@ -1196,6 +1273,7 @@ class TestMaxDelegationDepth:
                     provider=child_llm,
                     user_input="go",
                     max_delegation_depth=100,
+                    tenant_id=None,
                 )
             return "spawned"
 
@@ -1216,6 +1294,7 @@ class TestMaxDelegationDepth:
                 provider=parent_llm,
                 user_input="go",
                 max_delegation_depth=3,
+                tenant_id=None,
             )
 
         # Only one warning, not two

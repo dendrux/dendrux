@@ -1532,7 +1532,7 @@ def _readable_json_document(column: Any) -> Any:
 class SQLAlchemyStateStore(SQLBlobCatalog):
     """Default StateStore implementation using SQLAlchemy async.
 
-    Works with SQLite (zero-config) and Postgres (via DENDRUX_DATABASE_URL).
+    Works with SQLite (zero-config) and Postgres (via an explicit engine).
     Also the blob catalog (``dendrux.media.BlobCatalog``) for image blobs.
 
     ``create_run``, ``save_trace``, ``save_tool_call`` and ``submit_and_claim``

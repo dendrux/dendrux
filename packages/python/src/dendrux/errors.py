@@ -1109,7 +1109,7 @@ class TenantScopeRequiredError(_KwargsReduceMixin, ValueError):
         self.operation = operation
         super().__init__(
             f"{operation}() requires an explicit tenant_id= because the agent has "
-            "strict_tenancy=True."
+            "strict_tenancy=True. For delegated runs, pass tenant_id on the outer run."
         )
 
 

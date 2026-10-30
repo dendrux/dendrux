@@ -141,9 +141,9 @@ class TestAllowlist:
     def test_committed_allowlist_is_valid(self) -> None:
         assert ab.load_allowlist(COMMITTED_ALLOWLIST)
 
-    def test_every_spec_b_item_can_be_referenced(self) -> None:
+    def test_060_migration_rows_can_be_referenced(self) -> None:
         known = set(json.loads(COMMITTED_ALLOWLIST.read_text())["known_b_items"])
-        assert {f"B{i}" for i in range(1, 28)} <= known
+        assert {"0.6:strict-tenancy", "0.6:governance", "0.6:cache-tokens"} <= known
 
     def test_committed_allowlist_has_no_gaps(self) -> None:
         assert [e for e in ab.load_allowlist(COMMITTED_ALLOWLIST) if e.b_item is None] == []
@@ -256,3 +256,19 @@ def test_060_gate_rejects_unlisted_parameter_on_allowlisted_method() -> None:
     entries = ab.load_allowlist(COMMITTED_ALLOWLIST)
     unexpected = _brk("parameter-changed-default", "dendrux.agent.Agent.__init__", "tool_threads")
     assert ab.classify([unexpected], entries).unlisted == [unexpected]
+
+
+def test_documentary_returns_never_preapprove_future_return_changes() -> None:
+    entries = ab.load_allowlist(COMMITTED_ALLOWLIST)
+    unexpected = _brk("return-changed-type", "dendrux.runtime.state.StateStore.save_trace")
+    assert ab.classify([unexpected], entries).unlisted == [unexpected]
+
+
+def test_documentary_inventory_does_not_hide_stale_active_entries() -> None:
+    entries = ab.load_allowlist(COMMITTED_ALLOWLIST)
+    assert len(ab.classify([], entries).stale) == 4
+
+
+def test_060_changes_reference_060_migration_rows() -> None:
+    entries = ab.load_allowlist(COMMITTED_ALLOWLIST)
+    assert all(e.b_item.startswith("0.6:") for e in entries)

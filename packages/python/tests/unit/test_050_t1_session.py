@@ -28,15 +28,14 @@ async def test_reinitialize_error_masks_passwords(monkeypatch: pytest.MonkeyPatc
     assert "***" in message
 
 
-async def test_env_store_requires_explicit_configuration(
+async def test_env_store_is_ignored_without_engine_acquisition(
     tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("DENDRUX_DATABASE_URL", f"sqlite+aiosqlite:///{tmp_path / 'env.db'}")
-    agent = Agent(provider=MockLLM([]), prompt="p")
+    agent = Agent(provider=MockLLM([LLMResponse(text="ok")]), prompt="p")
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        with pytest.raises(ValueError, match="state_store=.*database_url="):
-            await agent.run("hi", tenant_id=None)
+        assert (await agent.run("hi", tenant_id=None)).answer == "ok"
     assert not caught
     assert session._engine is None
 

@@ -226,14 +226,13 @@ async def test_empty_database_still_says_not_initialized(pg_url: str) -> None:
         await agent.close()
 
 
-async def test_env_var_path_is_refused_before_engine_acquisition(
+async def test_env_var_path_is_ignored_without_engine_acquisition(
     pg_url: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("DENDRUX_DATABASE_URL", pg_url)
     agent = _agent()
     try:
-        with pytest.raises(ValueError, match="state_store=.*database_url="):
-            await agent.run("hi")
+        assert (await agent.run("hi")).answer == "ok"
         assert agent._lazy_store is None
         assert agent._private_engine is None
     finally:

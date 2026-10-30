@@ -33,9 +33,9 @@ def calls(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[Any]]:
     record: dict[str, list[Any]] = {"resolve": [], "tenant": [], "limit": []}
     resolve = _tenant_checks.resolve_tenant
 
-    def _resolve(agent: Any, entry: Any, tenant_id: Any, *, default: Any) -> Any:
+    def _resolve(agent: Any, entry: Any, tenant_id: Any, *, default: Any, store: Any = None) -> Any:
         record["resolve"].append((entry, tenant_id, default))
-        return resolve(agent, entry, tenant_id, default=default)
+        return resolve(agent, entry, tenant_id, default=default, store=store)
 
     def _tenant(agent: Any, entry: Any, *, tenant_id: Any, **fields: Any) -> None:
         record["tenant"].append((entry, tenant_id, fields))
@@ -298,10 +298,20 @@ class TestRunnerEntrySeam:
         store = _SpyStore()
         with pytest.raises(_StopError):
             if entry == "run":
-                await runner_run(agent, provider=agent.provider, user_input="hi", state_store=store)  # type: ignore[arg-type]
+                await runner_run(
+                    agent,
+                    provider=agent.provider,
+                    user_input="hi",
+                    state_store=store,
+                    tenant_id=None,
+                )  # type: ignore[arg-type]
             else:
                 stream = run_stream(
-                    agent, provider=agent.provider, user_input="hi", state_store=store
+                    agent,
+                    provider=agent.provider,
+                    user_input="hi",
+                    state_store=store,
+                    tenant_id=None,
                 )  # type: ignore[arg-type]
                 async for _ in stream:
                     pass

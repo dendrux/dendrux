@@ -89,6 +89,7 @@ class DelegationContext:
             fans out to many child runs. Mutable set on a frozen dataclass —
             frozen prevents field reassignment, not mutation of the set.
         tenant_id: This run's tenant. Delegated runs inherit it.
+        tenant_explicit: The outer caller chose scope, including explicit None.
         state_store: The store this run persists to (None if ephemeral);
             used by :func:`heartbeat`.
         loop: The event loop the run executes on; lets :func:`heartbeat`
@@ -118,6 +119,7 @@ class DelegationContext:
     _lease_at: list[float] = field(default_factory=lambda: [0.0], compare=False, repr=False)
     trace_link: str | None = None
     tool_span_link: str | None = None
+    tenant_explicit: bool = False
 
     def __hash__(self) -> int:
         return hash(self.run_id)

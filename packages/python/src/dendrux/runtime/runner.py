@@ -61,6 +61,7 @@ from dendrux.loops._helpers import (
 )
 from dendrux.loops.react import ReActLoop
 from dendrux.runtime._entry_checks import resolve_runner_tenant, runner_entry_checks
+from dendrux.runtime._tenant_checks import _tenant_scope_chosen
 from dendrux.runtime._tracelink import validate_trace_link
 from dendrux.runtime.context import (
     DelegationContext,
@@ -101,9 +102,9 @@ from dendrux.runtime.submit import (
     legacy_approval_denial,
     prepare_resume_results,
     report_governance_change,
+    require_pause_id,
     submission_validator,
     validate_result_names,
-    warn_missing_pause_id,
 )
 from dendrux.skills._session import META_KEY, SkillSession, continuation, current
 from dendrux.skills._session import current as current_skill_session
@@ -144,7 +145,6 @@ if TYPE_CHECKING:
     from dendrux.media._image import UserContent
     from dendrux.media._runtime import ImageRuntime
     from dendrux.runtime.state import StateStore
-    from dendrux.runtime.submit import _WarningLocation
     from dendrux.strategies.base import Strategy
     from dendrux.types import (
         ContentPart,
@@ -1542,7 +1542,7 @@ async def run(
     strategy: Strategy | None = ...,
     loop: Loop | None = ...,
     state_store: StateStore | None = ...,
-    tenant_id: str | None = ...,
+    tenant_id: str | None | _OmittedType = ...,
     metadata: dict[str, Any] | None = ...,
     extra_notifier: LoopNotifier | None = ...,
     max_delegation_depth: int | None,
@@ -1567,7 +1567,7 @@ async def run(
     strategy: Strategy | None = ...,
     loop: Loop | None = ...,
     state_store: StateStore | None = ...,
-    tenant_id: str | None = ...,
+    tenant_id: str | None | _OmittedType = ...,
     metadata: dict[str, Any] | None = ...,
     extra_notifier: LoopNotifier | None = ...,
     idempotency_key: str | None = ...,
@@ -1643,7 +1643,8 @@ async def run(
         result = await run(agent, provider=provider, user_input="What is 15 + 27?")
         print(result.answer)
     """
-    tenant_id = resolve_runner_tenant(agent, "run", tenant_id)
+    tenant_explicit = _tenant_scope_chosen(tenant_id)
+    tenant_id = resolve_runner_tenant(agent, "run", tenant_id, state_store=state_store)
     skill_session = SkillSession.prepare(
         agent, loop=loop or agent.loop or ReActLoop(), explicit=activate_skills
     )
@@ -1686,8 +1687,8 @@ async def run(
             validate_context(context)
             if state_store is None:
                 raise ValueError(
-                    "runs= requires persistence (database_url, state_store, or "
-                    "DENDRUX_DATABASE_URL): replay reads the earlier runs' traces."
+                    "runs= requires persistence (database_url or state_store): "
+                    "replay reads the earlier runs' traces."
                 )
         else:
             validate_context(context)
@@ -1929,6 +1930,7 @@ async def run(
                     store_identity=get_store_identity(state_store),
                     max_delegation_depth=effective_max_depth,
                     tenant_id=tenant_id,
+                    tenant_explicit=tenant_explicit,
                     state_store=state_store,
                     lease_interval_s=agent.lease_interval.total_seconds(),
                     loop=asyncio.get_running_loop(),
@@ -2671,7 +2673,8 @@ async def retry(
     """
     # 1. Validate source run is terminal. A missing run and another tenant's
     # run raise the same RunNotFoundError (B13), so retry is no existence oracle.
-    tenant_id = resolve_runner_tenant(agent, "retry", tenant_id)
+    tenant_explicit = _tenant_scope_chosen(tenant_id)
+    tenant_id = resolve_runner_tenant(agent, "retry", tenant_id, state_store=state_store)
     from dendrux.errors import RunNotFoundError
 
     tenant_id = resolve_child_tenant(get_delegation_context(), tenant_id)
@@ -2911,6 +2914,7 @@ async def retry(
             store_identity=get_store_identity(state_store),
             max_delegation_depth=effective_max_depth,
             tenant_id=tenant_id,
+            tenant_explicit=tenant_explicit,
             state_store=state_store,
             lease_interval_s=agent.lease_interval.total_seconds(),
             loop=asyncio.get_running_loop(),
@@ -3063,7 +3067,7 @@ def run_stream(
     loop: Loop | None = ...,
     state_store: StateStore | None = ...,
     state_store_resolver: Callable[[], Any] | None = ...,
-    tenant_id: str | None = ...,
+    tenant_id: str | None | _OmittedType = ...,
     metadata: dict[str, Any] | None = ...,
     extra_notifier: LoopNotifier | None = ...,
     max_delegation_depth: int | None,
@@ -3089,7 +3093,7 @@ def run_stream(
     loop: Loop | None = ...,
     state_store: StateStore | None = ...,
     state_store_resolver: Callable[[], Any] | None = ...,
-    tenant_id: str | None = ...,
+    tenant_id: str | None | _OmittedType = ...,
     metadata: dict[str, Any] | None = ...,
     extra_notifier: LoopNotifier | None = ...,
     idempotency_key: str | None = ...,
@@ -3146,7 +3150,9 @@ def run_stream(
     # Full resolution (parent context, clamping) happens inside _generate()
     # because parent_ctx requires async state_store resolution first.
     # But validation of the raw input can fail fast here.
-    tenant_id = resolve_runner_tenant(agent, "stream", tenant_id)
+    requested_tenant_id = tenant_id
+    tenant_explicit = _tenant_scope_chosen(tenant_id)
+    tenant_id = resolve_runner_tenant(agent, "stream", tenant_id, state_store=state_store)
     if (
         not isinstance(max_delegation_depth, _UnsetType)
         and max_delegation_depth is not None
@@ -3250,6 +3256,7 @@ def run_stream(
             _shared["existing_run"] = True
             if store is None and state_store_resolver is not None:
                 store = await state_store_resolver()
+                resolve_runner_tenant(agent, "stream", requested_tenant_id, state_store=store)
             _shared["state_store"] = store
             try:
                 entry = await _ingest_entry_images(
@@ -3312,6 +3319,7 @@ def run_stream(
             # 1. Resolve state store lazily (may create DB engine)
             if store is None and state_store_resolver is not None:
                 store = await state_store_resolver()
+                resolve_runner_tenant(agent, "stream", requested_tenant_id, state_store=store)
             _shared["state_store"] = store
 
             # --- Delegation context ---
@@ -3328,8 +3336,8 @@ def run_stream(
 
             if idempotency_key is not None and store is None:
                 raise ValueError(
-                    "idempotency_key requires persistence (database_url, state_store, "
-                    "or DENDRUX_DATABASE_URL). Idempotency cannot work without durable state."
+                    "idempotency_key requires persistence (database_url or state_store"
+                    "). Idempotency cannot work without durable state."
                 )
 
             replay_runs: list[Any] = []
@@ -3338,8 +3346,8 @@ def run_stream(
                 _shared["existing_run"] = True
                 if store is None:
                     raise ValueError(
-                        "runs= requires persistence (database_url, state_store, or "
-                        "DENDRUX_DATABASE_URL): replay reads the earlier runs' traces."
+                        "runs= requires persistence (database_url or state_store): "
+                        "replay reads the earlier runs' traces."
                     )
                 replay_runs = await load_replay_runs(store, replay_req, tenant_id=eff_tenant)
                 if _replay_has_images(replay_runs):
@@ -3475,6 +3483,7 @@ def run_stream(
                 store_identity=get_store_identity(store),
                 max_delegation_depth=eff_max_depth,
                 tenant_id=eff_tenant,
+                tenant_explicit=tenant_explicit,
                 state_store=store,
                 lease_interval_s=agent.lease_interval.total_seconds(),
                 loop=asyncio.get_running_loop(),
@@ -3795,6 +3804,7 @@ async def resume(
     loop: Loop | None = None,
     extra_notifier: LoopNotifier | None = None,
     expected_pause_id: str | None = None,
+    _tenant_explicit: bool | None = None,
 ) -> RunResult:
     """Resume a paused run.
 
@@ -3835,6 +3845,7 @@ async def resume(
         tool_results=tool_results,
         extra_notifier=extra_notifier,
         expected_pause_id=expected_pause_id,
+        _tenant_explicit=_tenant_explicit,
     )
 
 
@@ -3849,6 +3860,7 @@ async def resume_with_input(
     loop: Loop | None = None,
     extra_notifier: LoopNotifier | None = None,
     expected_pause_id: str | None = None,
+    _tenant_explicit: bool | None = None,
 ) -> RunResult:
     """Resume a paused run by providing clarification input.
 
@@ -3876,6 +3888,7 @@ async def resume_with_input(
         user_input=user_input,
         extra_notifier=extra_notifier,
         expected_pause_id=expected_pause_id,
+        _tenant_explicit=_tenant_explicit,
     )
 
 
@@ -4898,7 +4911,6 @@ async def _claim_resume(
     user_input: Any = None,
     user_parts: tuple[ContentPart, ...] | None = None,
     decisions: list[tuple[str, ApprovalDecision]] | None = None,
-    warning_location: _WarningLocation | None = None,
 ) -> tuple[StateStore, str]:
     allowed = [expected]
     if results is not None and expected != RunStatus.WAITING_APPROVAL.value:
@@ -4909,17 +4921,18 @@ async def _claim_resume(
         run_id, raw, agent=agent, expected_pause_id=expected_pause_id, call_results=results
     )
     record = await store.get_run(run_id)
-    warn_missing_pause_id(
+    require_pause_id(
         agent,
         expected_pause_id,
         pause_id=raw.get("pause_id"),
-        warning_location=warning_location,
+        store=store,
         approval=(
             results is None
             and user_input is None
             and record is not None
             and record.status == RunStatus.WAITING_APPROVAL.value
         ),
+        run_id=run_id,
     )
     epoch: ClaimResult | int | bool
     for status in allowed:
@@ -4972,9 +4985,7 @@ async def _claim_resume(
         if epoch:
             view = claimed_store(store, run_id, epoch)
             try:
-                await report_governance_change(
-                    agent, view, run_id, raw, warning_location=warning_location
-                )
+                await report_governance_change(agent, view, run_id, raw)
             except BaseException:
                 await _release_claim(view, run_id, status)
                 raise
@@ -5037,6 +5048,7 @@ async def _resume_core(
     expected_pause_id: str | None = None,
     _reclaim_pause: PauseState | None = None,
     _reclaim_history: Any = None,
+    _tenant_explicit: bool | None = None,
 ) -> RunResult:
     """Shared resume logic for tool results and clarification input.
 
@@ -5097,6 +5109,14 @@ async def _resume_core(
         else:
             if raw_pause is None:
                 raise ValueError(f"Run '{run_id}' has no pause state — cannot resume.")
+            if not _skip_claim:
+                require_pause_id(
+                    agent,
+                    expected_pause_id,
+                    pause_id=raw_pause.get("pause_id"),
+                    store=state_store,
+                    run_id=run_id,
+                )
             pause_state = await _load_pause_state(state_store, run_id, raw_pause, agent, provider)
         from dendrux.runtime._reclaim import needs_resolution
 
@@ -5224,6 +5244,7 @@ async def _resume_core(
                 store_identity=get_store_identity(state_store),
                 max_delegation_depth=resume_max_depth,
                 tenant_id=run_record.tenant_id if run_record else None,
+                tenant_explicit=True if _tenant_explicit is None else _tenant_explicit,
                 state_store=state_store,
                 lease_interval_s=agent.lease_interval.total_seconds(),
                 loop=asyncio.get_running_loop(),
@@ -5437,7 +5458,7 @@ def resume_stream(
     user_input: UserContent | None = None,
     extra_notifier: LoopNotifier | None = None,
     expected_pause_id: str | None = None,
-    warning_location: _WarningLocation | None = None,
+    _tenant_explicit: bool | None = None,
 ) -> RunStream:
     """Stream a resumed run as RunEvents, returning a RunStream.
 
@@ -5484,6 +5505,9 @@ def resume_stream(
             raw = await store.get_pause_state(run_id)
             if raw is None:
                 raise ValueError("Run has no pause state")
+            require_pause_id(
+                agent, expected_pause_id, pause_id=raw.get("pause_id"), store=store, run_id=run_id
+            )
             media_pause = PauseState.from_dict(raw)
             if media_pause.agent_name and media_pause.agent_name != agent.name:
                 raise ValueError("Agent name mismatch on resume")
@@ -5523,6 +5547,13 @@ def resume_stream(
             raw_pause = await store.get_pause_state(run_id)
             if raw_pause is None:
                 raise ValueError(f"Run '{run_id}' has no pause state — cannot resume.")
+            require_pause_id(
+                agent,
+                expected_pause_id,
+                pause_id=raw_pause.get("pause_id"),
+                store=store,
+                run_id=run_id,
+            )
             pause_state = await _load_pause_state(store, run_id, raw_pause, agent, provider)
             from dendrux.runtime._reclaim import needs_resolution
 
@@ -5562,7 +5593,6 @@ def resume_stream(
                 results=stream_results,
                 user_input=user_input,
                 user_parts=user_parts,
-                warning_location=warning_location,
             )
             _shared["state_store"] = store
             _shared["claimed"] = True
@@ -5635,6 +5665,7 @@ def resume_stream(
                 store_identity=get_store_identity(store),
                 max_delegation_depth=resume_max_depth,
                 tenant_id=run_record.tenant_id if run_record else None,
+                tenant_explicit=True if _tenant_explicit is None else _tenant_explicit,
                 state_store=store,
                 lease_interval_s=agent.lease_interval.total_seconds(),
                 loop=asyncio.get_running_loop(),
@@ -6004,6 +6035,7 @@ async def resume_claimed(
     extra_notifier: LoopNotifier | None = None,
     pre_claim_status: str | None = None,
     claim_epoch: int | None = None,
+    _tenant_explicit: bool | None = None,
 ) -> RunResult:
     """Resume a run that was already claimed via submit_and_claim().
 
@@ -6083,6 +6115,7 @@ async def resume_claimed(
             tool_results=tool_results,
             extra_notifier=extra_notifier,
             _skip_claim=True,
+            _tenant_explicit=_tenant_explicit,
         )
 
     submitted_decisions = raw_pause.get("submitted_decisions")
@@ -6100,6 +6133,7 @@ async def resume_claimed(
             extra_notifier=extra_notifier,
             _skip_claim=True,
             decisions=deserialize_decisions(submitted_decisions),
+            _tenant_explicit=_tenant_explicit,
         )
 
     if submitted_input is not None:
@@ -6113,6 +6147,7 @@ async def resume_claimed(
             extra_notifier=extra_notifier,
             _skip_claim=True,
             user_parts=_stored_parts(raw_pause.get("submitted_user_parts")),
+            _tenant_explicit=_tenant_explicit,
         )
 
     # No submitted data found. Approval-approve flows do not go through
@@ -6133,6 +6168,7 @@ async def resume_approval_approved_claim(
     provider: LLMProvider,
     extra_notifier: LoopNotifier | None = None,
     claim_epoch: int | None = None,
+    _tenant_explicit: bool | None = None,
 ) -> RunResult:
     """Resume an approval-approved run that was already claimed.
 
@@ -6166,6 +6202,7 @@ async def resume_approval_approved_claim(
         user_input=None,
         extra_notifier=extra_notifier,
         _skip_claim=True,
+        _tenant_explicit=_tenant_explicit,
     )
 
 
@@ -6177,6 +6214,7 @@ async def resume_paused_claim(
     provider: LLMProvider,
     extra_notifier: LoopNotifier | None = None,
     claim_epoch: int | None = None,
+    _tenant_explicit: bool | None = None,
 ) -> RunResult:
     """Continue a PAUSED run that :meth:`Agent.submit_resume` already claimed.
 
@@ -6202,4 +6240,5 @@ async def resume_paused_claim(
         expected_status=RunStatus.PAUSED.value,
         extra_notifier=extra_notifier,
         _skip_claim=True,
+        _tenant_explicit=_tenant_explicit,
     )

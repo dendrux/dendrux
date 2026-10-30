@@ -99,7 +99,13 @@ class TestRunnerPersistence:
         llm = MockLLM([LLMResponse(text="hi")])
         agent = Agent(prompt="Test.", tools=[add])
 
-        await run(agent, provider=llm, user_input="hello", state_store=store)
+        await run(
+            agent,
+            provider=llm,
+            user_input="hello",
+            state_store=store,
+            tenant_id=None,
+        )
 
         assert len(store.created_runs) == 1
         created = store.created_runs[0]
@@ -112,7 +118,13 @@ class TestRunnerPersistence:
         llm = MockLLM([LLMResponse(text="done")])
         agent = Agent(prompt="Test.", tools=[add])
 
-        await run(agent, provider=llm, user_input="go", state_store=store)
+        await run(
+            agent,
+            provider=llm,
+            user_input="go",
+            state_store=store,
+            tenant_id=None,
+        )
 
         assert len(store.finalized_runs) == 1
         finalized = store.finalized_runs[0]
@@ -126,7 +138,13 @@ class TestRunnerPersistence:
         llm = MockLLM([LLMResponse(tool_calls=[tc])])
         agent = Agent(prompt="Test.", tools=[add], max_iterations=1)
 
-        await run(agent, provider=llm, user_input="go", state_store=store)
+        await run(
+            agent,
+            provider=llm,
+            user_input="go",
+            state_store=store,
+            tenant_id=None,
+        )
 
         finalized = store.finalized_runs[0]
         assert finalized["status"] == "max_iterations"
@@ -142,7 +160,13 @@ class TestRunnerPersistence:
         agent = Agent(prompt="Test.", tools=[add])
 
         with pytest.raises(RuntimeError, match="LLM exploded"):
-            await run(agent, provider=llm, user_input="go", state_store=store)
+            await run(
+                agent,
+                provider=llm,
+                user_input="go",
+                state_store=store,
+                tenant_id=None,
+            )
 
         assert len(store.finalized_runs) == 1
         finalized = store.finalized_runs[0]
@@ -158,7 +182,13 @@ class TestRunnerPersistence:
         llm = MockLLM([LLMResponse(text="ok")])
         agent = Agent(prompt="Test.", tools=[add])
 
-        await run(agent, provider=llm, user_input="go", state_store=store)
+        await run(
+            agent,
+            provider=llm,
+            user_input="go",
+            state_store=store,
+            tenant_id=None,
+        )
 
         assert store.created_runs[0]["run_id"] == store.finalized_runs[0]["run_id"]
 
@@ -177,7 +207,14 @@ class TestRunnerPersistence:
         agent = Agent(prompt="Test.", tools=[add])
 
         meta = {"thread_id": "th_1", "user_id": "u_42"}
-        await run(agent, provider=llm, user_input="go", state_store=store, metadata=meta)
+        await run(
+            agent,
+            provider=llm,
+            user_input="go",
+            state_store=store,
+            metadata=meta,
+            tenant_id=None,
+        )
 
         persisted_meta = store.created_runs[0]["meta"]
         assert persisted_meta["thread_id"] == "th_1"
@@ -189,7 +226,13 @@ class TestRunnerPersistence:
         llm = MockLLM([LLMResponse(text="ok")])
         agent = Agent(prompt="Test.", tools=[add])
 
-        await run(agent, provider=llm, user_input="go", state_store=store)
+        await run(
+            agent,
+            provider=llm,
+            user_input="go",
+            state_store=store,
+            tenant_id=None,
+        )
 
         assert store.created_runs[0]["strategy"] == "NativeToolCalling"
 
@@ -198,7 +241,12 @@ class TestRunnerPersistence:
         llm = MockLLM([LLMResponse(text="hi")])
         agent = Agent(prompt="Test.", tools=[add])
 
-        result = await run(agent, provider=llm, user_input="hello")
+        result = await run(
+            agent,
+            provider=llm,
+            user_input="hello",
+            tenant_id=None,
+        )
 
         assert result.status == RunStatus.SUCCESS
         assert result.answer == "hi"
@@ -215,7 +263,13 @@ class TestRunnerRecorderWiring:
         llm = MockLLM([LLMResponse(text="42")])
         agent = Agent(prompt="Test.", tools=[add])
 
-        await run(agent, provider=llm, user_input="what?", state_store=store)
+        await run(
+            agent,
+            provider=llm,
+            user_input="what?",
+            state_store=store,
+            tenant_id=None,
+        )
 
         # Should have at least user message trace
         roles = [t["role"] for t in store.traces]
@@ -227,7 +281,13 @@ class TestRunnerRecorderWiring:
         llm = MockLLM([LLMResponse(tool_calls=[tc]), LLMResponse(text="3")])
         agent = Agent(prompt="Test.", tools=[add])
 
-        await run(agent, provider=llm, user_input="1+2?", state_store=store)
+        await run(
+            agent,
+            provider=llm,
+            user_input="1+2?",
+            state_store=store,
+            tenant_id=None,
+        )
 
         # Should have: user, assistant (with tool_call), tool (result)
         roles = [t["role"] for t in store.traces]
@@ -241,7 +301,13 @@ class TestRunnerRecorderWiring:
         llm = MockLLM([LLMResponse(tool_calls=[tc]), LLMResponse(text="8")])
         agent = Agent(prompt="Test.", tools=[add])
 
-        await run(agent, provider=llm, user_input="5+3?", state_store=store)
+        await run(
+            agent,
+            provider=llm,
+            user_input="5+3?",
+            state_store=store,
+            tenant_id=None,
+        )
 
         assert len(store.tool_calls_saved) == 1
         assert store.tool_calls_saved[0]["tool_name"] == "add"
@@ -258,7 +324,13 @@ class TestRunnerRecorderWiring:
         )
         agent = Agent(prompt="Test.", tools=[add])
 
-        await run(agent, provider=llm, user_input="go", state_store=store)
+        await run(
+            agent,
+            provider=llm,
+            user_input="go",
+            state_store=store,
+            tenant_id=None,
+        )
 
         assert len(store.usages) == 1
         assert store.usages[0]["usage"].input_tokens == 100
@@ -280,7 +352,13 @@ class TestRunnerRecorderWiring:
         )
         agent = Agent(prompt="Test.", tools=[add])
 
-        await run(agent, provider=llm, user_input="1+2?", state_store=store)
+        await run(
+            agent,
+            provider=llm,
+            user_input="1+2?",
+            state_store=store,
+            tenant_id=None,
+        )
 
         finalized = store.finalized_runs[0]
         assert finalized["total_usage"].input_tokens == 300
