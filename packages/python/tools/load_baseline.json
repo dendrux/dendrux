@@ -1,0 +1,123 @@
+{
+  "_comment": "Baseline for bench.yml. Gated metrics are statement counts (hardware independent); a regression of more than 20% fails the weekly run. Change this file only in a release commit, from a local `make load-quick` on a quiet machine.",
+  "scale": "quick",
+  "workers": 2,
+  "recorded": {
+    "date": "2026-10-30 09:18:02 +0530",
+    "machine": "Darwin 25.6.0 arm64",
+    "cpu": "Apple M3 Pro",
+    "cores": 11,
+    "memory_gb": 18.0,
+    "python": "3.12.12",
+    "sqlalchemy": "2.0.48",
+    "asyncpg": "0.31.0",
+    "git_commit": "eed452c5"
+  },
+  "postgres": {
+    "version": "PostgreSQL 17.0 on x86_64-apple-darwin23.6.0, compiled by Apple clang version 16.0.0 (clang-1600.0.26.3), 64-bit",
+    "shared_buffers": "128MB",
+    "max_connections": "100",
+    "synchronous_commit": "on",
+    "fsync": "on"
+  },
+  "gates": {
+    "a_notify_off.statements_per_run": 85.0,
+    "a_shared_agent.statements_per_run": 85.0,
+    "a_notify_on.statements_per_run": 94.0,
+    "iteration.notify_on_batch": 21,
+    "iteration.notify_on_stream": 21,
+    "iteration.notify_off_batch": 18,
+    "runs.statements_per_run": 44.0,
+    "kill_checkpoint.statements_per_run_including_recovery": 43.87,
+    "kill_inflight.statements_per_run_including_recovery": 44.37,
+    "followers_on.attach_statements_per_follower": 3.7,
+    "followers_off.attach_statements_per_follower": 3.75,
+    "cancel.statements_per_node": 3.026,
+    "history.resume_statements": 53
+  },
+  "v050_reference": {
+    "scenario_a_statements_per_run": 59.0,
+    "source": "owner-docs/build-0.5.0/load-test-results.md, commit dca4f05e"
+  },
+  "informational": {
+    "a_notify_off": {
+      "runs_per_s": 32.74,
+      "statements_per_s": 2783.1,
+      "latency_ms": {
+        "n": 200,
+        "p50_ms": 5036.2,
+        "p95_ms": 5406.5,
+        "max_ms": 5436.4,
+        "mean_ms": 4912.8
+      },
+      "wal_bytes_per_run": 58684
+    },
+    "a_shared_agent": {
+      "runs_per_s": 32.7,
+      "statements_per_s": 2779.3,
+      "latency_ms": {
+        "n": 200,
+        "p50_ms": 5022.0,
+        "p95_ms": 5406.2,
+        "max_ms": 5447.8,
+        "mean_ms": 4908.8
+      },
+      "wal_bytes_per_run": 58620
+    },
+    "a_notify_on": {
+      "runs_per_s": 31.63,
+      "statements_per_s": 2973.5,
+      "latency_ms": {
+        "n": 200,
+        "p50_ms": 5139.5,
+        "p95_ms": 5563.8,
+        "max_ms": 5599.2,
+        "mean_ms": 5041.8
+      },
+      "wal_bytes_per_run": 58759
+    },
+    "iteration": {},
+    "runs": {
+      "runs_per_s": 54.45,
+      "statements_per_s": 2395.6,
+      "latency_ms": {
+        "n": 200,
+        "p50_ms": 2778.9,
+        "p95_ms": 2970.4,
+        "max_ms": 3006.9,
+        "mean_ms": 2703.3
+      },
+      "wal_bytes_per_run": 40745
+    },
+    "kill_checkpoint": {
+      "runs_per_s": 42.32,
+      "statements_per_s": 1769.0,
+      "latency_ms": {
+        "n": 190,
+        "p50_ms": 2786.6,
+        "p95_ms": 2970.9,
+        "max_ms": 2997.6,
+        "mean_ms": 2727.0
+      },
+      "wal_bytes_per_run": 49020
+    },
+    "kill_inflight": {
+      "runs_per_s": 41.73,
+      "statements_per_s": 1744.4,
+      "latency_ms": {
+        "n": 190,
+        "p50_ms": 2848.4,
+        "p95_ms": 3012.2,
+        "max_ms": 3044.8,
+        "mean_ms": 2744.9
+      },
+      "wal_bytes_per_run": 41057
+    },
+    "followers_on": {},
+    "followers_off": {},
+    "cancel": {},
+    "pool": {},
+    "history": {},
+    "memory": {}
+  }
+}
