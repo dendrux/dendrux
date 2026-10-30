@@ -1553,6 +1553,10 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
     def __init__(
         self, engine: AsyncEngine, *, notify_channel: str | None = "dendrux_events"
     ) -> None:
+        from dendrux.db._notify import validate_channel
+
+        if notify_channel is not None:
+            validate_channel(notify_channel)
         self.notify_channel = notify_channel
         from sqlalchemy.ext.asyncio import AsyncSession
         from sqlalchemy.orm import sessionmaker

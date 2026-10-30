@@ -43,6 +43,9 @@ class Notifier:
 
 @pytest.fixture
 async def clock(monkeypatch):
+    import random
+
+    monkeypatch.setattr(random, "uniform", lambda low, high: 0)
     loop = asyncio.get_running_loop()
     value = Clock(loop.time())
     monkeypatch.setattr(loop, "time", lambda: value.now)
@@ -84,7 +87,7 @@ async def test_notification_during_fetch_is_pending_and_coalesces(clock):
     assert notifier.subscribers == 0 and notifier.stopped == 0
 
 
-async def test_health_changes_switch_intervals_immediately_both_ways(clock):
+async def test_health_changes_switch_intervals_then_back_off_both_ways(clock):
     store, notifier, owner, run, follower = setup()
     try:
         await ticks(3)
@@ -102,16 +105,22 @@ async def test_health_changes_switch_intervals_immediately_both_ways(clock):
         assert store.polls == 4
         clock.advance(0.501)
         await ticks(4)
-        assert store.polls == 5  # Degraded polling never waits on healthy backoff.
+        assert store.polls == 4  # Idle degraded feeds back off after the first wait.
+        clock.advance(0.501)
+        await ticks(4)
+        assert store.polls == 5
         notifier.health(True)
         await ticks(4)
         assert store.polls == 6
+        clock.advance(0.501)
+        await ticks(4)
+        assert store.polls == 7  # One short retry after the empty recovery wake.
         clock.advance(29)
         await ticks(4)
-        assert store.polls == 6
+        assert store.polls == 7
         clock.advance(1.001)
         await ticks(4)
-        assert store.polls == 7
+        assert store.polls == 8
     finally:
         await owner.aclose()
 

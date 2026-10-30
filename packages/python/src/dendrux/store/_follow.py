@@ -28,6 +28,7 @@ import asyncio
 import contextlib
 import logging
 import math
+import random
 from collections import deque
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, TypeAlias, Union
@@ -191,6 +192,7 @@ class _RunFeed:
         self.terminal = False
         self.closing = False
         self.task: asyncio.Task[None] | None = None
+        self.ready: asyncio.Future[None] | None = None
         self._poll_wake = asyncio.Event()
         self._view: PauseView | None = None
         self._view_generation = 0
@@ -276,6 +278,10 @@ class _RunFeed:
         if self.terminal and follower.until_terminal:
             follower.end("terminal")
         if self.task is None or self.task.done():
+            self.ready = asyncio.get_running_loop().create_future()
+            self.ready.add_done_callback(
+                lambda done: None if done.cancelled() else done.exception()
+            )
             self.task = asyncio.get_running_loop().create_task(
                 self._poll(), name=f"dendrux-run-feed:{self.run_id}"
             )
@@ -299,6 +305,8 @@ class _RunFeed:
         return None
 
     def _done(self, task: asyncio.Task[None]) -> None:
+        if self.ready is not None and not self.ready.done():
+            self.ready.set_exception(RuntimeError("The run feed closed during startup."))
         if not task.cancelled():
             task.exception()  # observe failures, including shutdown failures
         if self.closing or not self.followers:
@@ -318,18 +326,25 @@ class _RunFeed:
 
     async def _poll(self) -> None:
         notifier = self.owner.notifier
-        context = notifier.subscribe(self.run_id) if notifier else contextlib.nullcontext(None)
+        context = (
+            notifier.subscribe(self.run_id)
+            if notifier is not None
+            else contextlib.nullcontext(None)
+        )
         try:
             async with context as subscription:
                 if subscription is not None:
-                    pending = self._poll_wake.is_set()
                     self._poll_wake = subscription.event
-                    if pending:
-                        self._poll_wake.set()
+                if self.ready is not None and not self.ready.done():
+                    self.ready.set_result(None)
                 await self._poll_loop(subscription.state if subscription else None)
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
+            if self.ready is not None and not self.ready.done():
+                self.ready.set_exception(exc)
+            if isinstance(exc, FollowCapacityError):
+                return
             _codes.log_code(logger, _codes.FOLLOW_FEED_ERROR, run_id=self.run_id)
             for follower in list(self.followers):
                 follower.end("error")
@@ -339,10 +354,18 @@ class _RunFeed:
         delay = owner.poll_interval_s
         idle_polls = 0
         check_status = True
+        generation = state.generation if state is not None else None
+        woken = False
         try:
             while self.followers:
                 if self.terminal and all(f.until_terminal for f in self.followers):
                     return
+                if state is not None and state.generation != generation:
+                    delay = owner.poll_interval_s
+                    jitter = random.uniform(0, owner.poll_interval_s)
+                    if jitter:
+                        await asyncio.sleep(jitter)
+                    generation = state.generation
                 # Clear before fetching so joins during the read stay pending.
                 # Event.set coalesces a burst into one immediate poll.
                 self._poll_wake.clear()
@@ -373,11 +396,13 @@ class _RunFeed:
                             if follower.until_terminal:
                                 follower.end("terminal")
                         continue
-                if state is not None:
-                    delay = owner.poll_healthy_s if state.healthy else owner.poll_interval_s
+                if state is not None and state.healthy:
+                    delay = owner.poll_interval_s if woken and not events else owner.poll_healthy_s
+                woken = False
                 with contextlib.suppress(TimeoutError):
                     async with asyncio.timeout(delay):
                         await self._poll_wake.wait()
+                        woken = True
                 if not events:
                     delay = min(delay * 2, owner.poll_max_s)
         except asyncio.CancelledError:
@@ -413,7 +438,7 @@ class EventFeed:
         notifier: Borrowed wake-up hints, defaulting to the store's notifier.
             The caller owns its lifecycle.
         poll_healthy_s: Reconciliation interval while the notifier is healthy.
-            Degraded notifiers use ``poll_interval_s`` without backoff.
+            Degraded notifiers start at ``poll_interval_s`` and back off while idle.
         heartbeat_s: idle time before a :class:`FollowHeartbeat` is yielded.
         buffer: events buffered per follower before it ends as ``"lagging"``.
     """
@@ -627,6 +652,7 @@ class Follow:
         self._start_lock = asyncio.Lock()
         self._feed: _RunFeed | None = None
         self._follower: _Follower | None = None
+        self._head_at_start: int | None = None
         self._deadline: float | None = None
         self._gen: AsyncIterator[FollowItem] | None = None
         self.drained_terminal = False
@@ -658,6 +684,22 @@ class Follow:
             # No await from here to the slot: aclose() cannot interleave.
             self._owner._acquire(self._tenant_id)
             self._holds_slot = True
+            try:
+                if self._owner.notifier is not None:
+                    feed = await self._owner._feed_for(self.run_id)
+                    self._raise_if_closed()
+                    follower = _Follower(
+                        until_terminal=self._until_terminal, limit=self._owner.buffer
+                    )
+                    self._feed, self._follower = feed, follower
+                    self._head_at_start = feed.add(follower)
+                    assert feed.ready is not None
+                    await asyncio.shield(feed.ready)
+                    self._raise_if_closed()
+            except BaseException:
+                self._release()
+                await self._detach()
+                raise
             self._started = True
             if self._max_duration_s is not None:
                 self._deadline = asyncio.get_running_loop().time() + self._max_duration_s
@@ -721,6 +763,16 @@ class Follow:
                 await self._gen.aclose()  # type: ignore[attr-defined]
         finally:
             self._release()
+            await self._detach()
+
+    async def _detach(self) -> None:
+        if self._feed is not None and self._follower is not None:
+            poller = self._feed.remove(self._follower)
+            self._feed = self._follower = None
+            if poller is not None:
+                _, pending = await asyncio.wait({poller}, timeout=self._owner.stop_timeout_s)
+                if pending:
+                    _codes.log_code(logger, _codes.FOLLOW_SHUTDOWN_PENDING, run_id=self.run_id)
 
     async def __aenter__(self) -> Follow:
         await self.start()
@@ -751,11 +803,16 @@ class Follow:
             if self.drained_terminal:
                 yield FollowEnd("terminal", cursor)
                 return
-            async with asyncio.timeout_at(self._deadline):
-                feed = await owner._feed_for(self.run_id)
-            follower = _Follower(until_terminal=self._until_terminal, limit=owner.buffer)
-            self._feed, self._follower = feed, follower
-            head = feed.add(follower)
+            if self._feed is None:
+                async with asyncio.timeout_at(self._deadline):
+                    feed = await owner._feed_for(self.run_id)
+                follower = _Follower(until_terminal=self._until_terminal, limit=owner.buffer)
+                self._feed, self._follower = feed, follower
+                head = feed.add(follower)
+            else:
+                assert self._follower is not None
+                feed, follower = self._feed, self._follower
+                head = self._head_at_start
             if head is not None and (cursor is None or cursor < head):
                 while cursor is None or cursor < head:
                     if self._expired():
@@ -811,14 +868,7 @@ class Follow:
             yield FollowEnd("max_duration", cursor)
         finally:
             self._release()
-            if self._feed is not None and self._follower is not None:
-                poller = self._feed.remove(self._follower)
-                self._feed = self._follower = None
-                if poller is not None:
-                    # Timeout/caller cancellation leaves the task tracked in EventFeed.
-                    _, pending = await asyncio.wait({poller}, timeout=owner.stop_timeout_s)
-                    if pending:
-                        _codes.log_code(logger, _codes.FOLLOW_SHUTDOWN_PENDING, run_id=self.run_id)
+            await self._detach()
 
 
 async def _feed_view(

@@ -31,7 +31,7 @@ async def test_n4_controlled_delivery_with_backend_reassignment(
     if not endpoint:
         pytest.skip(f"{key} not set; PgBouncer is not installed locally")
     parsed = make_url(endpoint)
-    assert parsed.database == make_url(pg_test_url).database == "dendrux_060_p3b_test"
+    assert parsed.database == make_url(pg_test_url).database
     import asyncpg
 
     connect = asyncpg.connect

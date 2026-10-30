@@ -38,3 +38,15 @@ async def test_writer_notify_error_propagates():
     store.notify_channel = "dendrux_events"
     with pytest.raises(RuntimeError):
         await store._after_event_insert(session, "run")
+
+
+@pytest.mark.parametrize("channel", ["", "x" * 64, "é" * 32, "a\x00b", 1, b"bytes", True])
+async def test_p2_3_writer_rejects_invalid_channel_at_construction(channel):
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    engine = create_async_engine("sqlite+aiosqlite://")
+    try:
+        with pytest.raises(ValueError):
+            SQLAlchemyStateStore(engine, notify_channel=channel)
+    finally:
+        await engine.dispose()

@@ -36,7 +36,13 @@ class Connection:
     def add_termination_listener(self, callback):
         self.termination = callback
 
-    async def execute(self, sql, channel, payload):
+    async def execute(self, sql, *args):
+        if sql == "SELECT 1":
+            self.calls.append("ping")
+            if self.hang == "ping":
+                await asyncio.Event().wait()
+            return
+        channel, payload = args
         self.calls.append("notify")
         if self.hang == "notify":
             await asyncio.Event().wait()
@@ -294,8 +300,9 @@ async def test_stop_during_start_leaves_no_backend_or_task(monkeypatch):
     starting = asyncio.create_task(notifier.start())
     await settle(lambda: connection.calls)
     await asyncio.wait_for(notifier.stop(), 0.5)
-    with pytest.raises(asyncio.CancelledError):
+    with pytest.raises(NotifierUnavailableError) as error:
         await starting
+    assert error.value.reason == "stopped"
     assert connection.closed
     assert notifier._connection is None and notifier._task is None
 
@@ -349,8 +356,9 @@ async def test_stop_deadline_is_not_extended_by_queued_start(monkeypatch):
     try:
         await asyncio.wait_for(notifier.stop(), 0.2)
         for task in (first, second):
-            with pytest.raises(asyncio.CancelledError):
+            with pytest.raises(NotifierUnavailableError) as error:
                 await task
+            assert error.value.reason == "stopped"
         assert len(connections) == 1 and connections[0].closed
         assert notifier._connection is None and notifier._task is None
     finally:
@@ -375,3 +383,39 @@ async def test_close_failure_forces_release_without_driver_text(connections, cap
         assert "SECRET_SENTINEL" not in caplog.text
     finally:
         connections[0].terminate()
+
+
+async def test_p1_2_silent_connection_loss_is_detected_by_bounded_ping(connections, caplog):
+    caplog.set_level(logging.INFO)
+    notifier = PostgresEventNotifier(
+        URL,
+        health_check_interval_s=0.01,
+        health_check_timeout_s=0.01,
+        reconnect_backoff=(0.1, 0.1),
+    )
+    await notifier.start()
+    original_task = notifier._task
+    connections[0].hang = "ping"
+    try:
+        async with asyncio.timeout(0.3):
+            while notifier.state.healthy:
+                await asyncio.sleep(0.001)
+        assert connections[0].closed
+        await settle(lambda: notifier.state.healthy)
+        assert connections[1].listening
+        assert notifier._task is original_task
+        assert [r.code for r in caplog.records] == ["notifier_degraded", "notifier_recovered"]
+    finally:
+        await notifier.stop()
+
+
+async def test_p2_10_subscribe_binds_loop_before_start():
+    notifier = PostgresEventNotifier(URL)
+
+    async def other():
+        with pytest.raises(RuntimeError):
+            async with notifier.subscribe("other"):
+                pass
+
+    async with notifier.subscribe("first"):
+        await asyncio.to_thread(lambda: asyncio.run(other()))

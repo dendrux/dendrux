@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager, suppress
 from typing import TYPE_CHECKING, Any
 
 from dendrux import _codes
-from dendrux.db._notify import NotifierState, Subscription
+from dendrux.db._notify import NotifierState, Subscription, validate_channel
 from dendrux.errors import NotifierUnavailableError
 from dendrux.store._follow import FollowCapacityError
 
@@ -40,14 +40,15 @@ class PostgresEventNotifier:
         reconnect_attempt_timeout_s: float = 5.0,
         stop_timeout_s: float = 5.0,
         self_test_timeout_s: float = 2.0,
+        health_check_interval_s: float = 15.0,
+        health_check_timeout_s: float = 5.0,
     ) -> None:
         from sqlalchemy.engine import make_url
 
         parsed = make_url(listen_url)
         if parsed.get_backend_name() not in ("postgres", "postgresql"):
             raise ValueError("listen_url must be a PostgreSQL URL.")
-        if not channel or "\x00" in channel or len(channel.encode()) > 63:
-            raise ValueError("channel must contain 1–63 UTF-8 bytes and no NUL.")
+        validate_channel(channel)
         if (
             isinstance(max_subscriptions, bool)
             or not isinstance(max_subscriptions, int)
@@ -60,6 +61,8 @@ class PostgresEventNotifier:
             reconnect_attempt_timeout_s,
             stop_timeout_s,
             self_test_timeout_s,
+            health_check_interval_s,
+            health_check_timeout_s,
         ):
             if isinstance(value, bool) or not math.isfinite(value) or value <= 0:
                 raise ValueError("Notifier deadlines and backoff must be finite and positive.")
@@ -73,11 +76,14 @@ class PostgresEventNotifier:
         self.reconnect_attempt_timeout_s = reconnect_attempt_timeout_s
         self.stop_timeout_s = stop_timeout_s
         self.self_test_timeout_s = self_test_timeout_s
+        self.health_check_interval_s = health_check_interval_s
+        self.health_check_timeout_s = health_check_timeout_s
         self.state = NotifierState(False, 0)
         self._loop: asyncio.AbstractEventLoop | None = None
         self._connection: Any = None
         self._task: asyncio.Task[None] | None = None
         self._connecting: asyncio.Task[None] | None = None
+        self._start_result: asyncio.Future[None] | None = None
         self._lock = asyncio.Lock()
         self._active = False
         self._lifecycle_generation = 0
@@ -157,11 +163,32 @@ class PostgresEventNotifier:
     async def start(self) -> None:
         """Connect and self-test; failure leaves no connection or reconnect task."""
         self._check_loop()
+        if self._start_result is not None:
+            await asyncio.shield(self._start_result)
+            return
+        result = asyncio.get_running_loop().create_future()
+        self._start_result = result
+        result.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+        try:
+            await self._start()
+        except BaseException as exc:
+            result.set_exception(
+                NotifierUnavailableError("stopped")
+                if isinstance(exc, asyncio.CancelledError)
+                else exc
+            )
+            raise
+        else:
+            result.set_result(None)
+        finally:
+            self._start_result = None
+
+    async def _start(self) -> None:
         self._loop = asyncio.get_running_loop()
         generation = self._lifecycle_generation
         async with self._lock:
             if generation != self._lifecycle_generation:
-                raise asyncio.CancelledError
+                raise NotifierUnavailableError("stopped")
             if self._active:
                 return
             self._active = True
@@ -170,7 +197,7 @@ class PostgresEventNotifier:
             try:
                 await self._connecting
                 if not self._active:
-                    raise asyncio.CancelledError
+                    raise NotifierUnavailableError("stopped")
                 self._health(True)
                 self._task = self._loop.create_task(
                     self._reconnect(), name="dendrux-event-notifier"
@@ -179,6 +206,11 @@ class PostgresEventNotifier:
                 self._active = False
                 self._health(False)
                 if isinstance(exc, asyncio.CancelledError):
+                    task = asyncio.current_task()
+                    if task is not None and task.cancelling():
+                        raise
+                    raise NotifierUnavailableError("stopped") from None
+                if isinstance(exc, NotifierUnavailableError):
                     raise
                 raise NotifierUnavailableError("start_failed") from exc
             finally:
@@ -186,7 +218,12 @@ class PostgresEventNotifier:
 
     async def _reconnect(self) -> None:
         while self._active:
-            await self._lost.wait()
+            try:
+                async with asyncio.timeout(self.health_check_interval_s):
+                    await self._lost.wait()
+            except TimeoutError:
+                await self._check_health()
+                continue
             self._lost.clear()
             delay, maximum = self.reconnect_backoff
             while self._active and not self.state.healthy:
@@ -198,6 +235,16 @@ class PostgresEventNotifier:
                     delay = min(delay * 2, maximum)
                     continue
                 self._health(True, _codes.NOTIFIER_RECOVERED)
+
+    async def _check_health(self) -> None:
+        connection = self._connection
+        try:
+            async with asyncio.timeout(self.health_check_timeout_s):
+                await connection.execute("SELECT 1")
+        except Exception:
+            self._on_termination(connection)
+            if connection is not None:
+                connection.terminate()
 
     async def stop(self) -> None:
         """Wake all waiters and close, forcibly after ``stop_timeout_s``."""
@@ -244,6 +291,8 @@ class PostgresEventNotifier:
     async def subscribe(self, run_id: str) -> AsyncIterator[Subscription]:
         """Subscribe until context exit; refuse beyond ``max_subscriptions``."""
         self._check_loop()
+        if self._loop is None:
+            self._loop = asyncio.get_running_loop()
         if self._count >= self.max_subscriptions:
             raise FollowCapacityError(self.max_subscriptions)
         event = asyncio.Event()

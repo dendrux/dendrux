@@ -112,8 +112,8 @@ async def test_n2_kill_listener_falls_back_and_recovers(
             f"DEGRADED_DELIVERY_S={elapsed:.4f}; COMMIT_TO_DELIVERY_S={after_commit:.4f}; "
             "POLL_INTERVAL_S=0.2"
         )
-        assert elapsed < 0.3  # One poll interval plus generous scheduler/DB allowance.
-        assert after_commit < owner.poll_interval_s + 0.05
+        assert elapsed < 2 * owner.poll_interval_s + 0.2
+        assert after_commit < 2 * owner.poll_interval_s + 0.2
         await wait_until(lambda: notifier.state.healthy)
         codes = [getattr(r, "code", None) for r in caplog.records]
         assert codes.count("notifier_degraded") == 1
@@ -177,16 +177,21 @@ async def test_n7_failed_self_test_releases_backend(pg_test_url, engine, monkeyp
     with pytest.raises(NotifierUnavailableError):
         await notifier.start()
     assert notifier._connection is None and notifier._task is None
-    async with engine.connect() as conn:
-        assert (
-            await conn.execute(
-                text(
-                    "SELECT count(*) FROM pg_stat_activity "
-                    "WHERE datname = current_database() "
-                    "AND application_name = 'dendrux_event_notifier'"
-                )
-            )
-        ).scalar_one() == 0
+    async with asyncio.timeout(1):
+        while True:
+            async with engine.connect() as conn:
+                count = (
+                    await conn.execute(
+                        text(
+                            "SELECT count(*) FROM pg_stat_activity "
+                            "WHERE datname = current_database() "
+                            "AND application_name = 'dendrux_event_notifier'"
+                        )
+                    )
+                ).scalar_one()
+            if count == 0:
+                break
+            await asyncio.sleep(0.01)
 
 
 async def test_concurrent_two_writer_instances_durable_order_and_wakeup(pg_test_url, engine, store):

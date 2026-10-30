@@ -49,7 +49,7 @@ from typing import TYPE_CHECKING, Any
 
 from dendrux._sentinel import _OmittedType
 from dendrux.db._sqlite_sync import create_sqlite_schema
-from dendrux.errors import BlobNotFoundError, RunNotFoundError
+from dendrux.errors import BlobNotFoundError, NotifierUnavailableError, RunNotFoundError
 from dendrux.media._ids import image_id
 from dendrux.media._runtime import tenant_scope_for
 from dendrux.runtime._blob_catalog import BlobServices, CatalogBlobAccessor
@@ -458,6 +458,8 @@ class RunStore:
         self._notifier: EventNotifier | None = None
         self._owned_notifier: EventNotifier | None = None
         self._notifier_started = False
+        self._notifier_start_task: asyncio.Task[None] | None = None
+        self._notifier_retry_at = 0.0
 
     @classmethod
     def from_engine(
@@ -507,9 +509,14 @@ class RunStore:
 
         if notifier is not None and listen_url is not None:
             raise ValueError("Pass either notifier or listen_url, not both.")
-        owned_notifier = PostgresEventNotifier(listen_url) if listen_url is not None else None
         parsed = normalized_url(database_url)
         options, store_options = split_database_options(database_options)
+        channel = store_options.get("notify_channel", "dendrux_events")
+        if listen_url is not None and channel is None:
+            raise ValueError("listen_url requires an enabled notify_channel.")
+        owned_notifier = (
+            PostgresEventNotifier(listen_url, channel=channel) if listen_url is not None else None
+        )
         engine = create_async_engine(parsed, **engine_options(parsed, options))
         store: Any = SQLAlchemyStateStore(engine, **store_options)
         if database_url.startswith("sqlite"):
@@ -570,16 +577,23 @@ class RunStore:
 
     async def close(self) -> None:
         """Stop owned feeds/listener, then dispose only engines this store owns."""
-        if self._event_feed is not None:
-            await self._event_feed.aclose()
-        if self._owned_notifier is not None:
-            await self._owned_notifier.stop()
-            self._owned_notifier = None
-        if isinstance(self._state, _InitOnFirstUse):
-            self._state.closed = True
-        if self._owned_engine is not None:
-            await self._owned_engine.dispose()
-            self._owned_engine = None
+        try:
+            if self._event_feed is not None:
+                await self._event_feed.aclose()
+        finally:
+            try:
+                if self._notifier_start_task is not None:
+                    self._notifier_start_task.cancel()
+                    await asyncio.gather(self._notifier_start_task, return_exceptions=True)
+                if self._owned_notifier is not None:
+                    await self._owned_notifier.stop()
+                    self._owned_notifier = None
+            finally:
+                if isinstance(self._state, _InitOnFirstUse):
+                    self._state.closed = True
+                if self._owned_engine is not None:
+                    await self._owned_engine.dispose()
+                    self._owned_engine = None
 
     async def __aenter__(self) -> RunStore:
         try:
@@ -590,9 +604,26 @@ class RunStore:
         return self
 
     async def _start_owned_notifier(self) -> None:
-        if self._owned_notifier is not None and not self._notifier_started:
-            await self._owned_notifier.start()
+        if self._owned_notifier is None or self._notifier_started:
+            return
+        loop = asyncio.get_running_loop()
+        if loop.time() < self._notifier_retry_at:
+            return
+        if self._notifier_start_task is None:
+            self._notifier_start_task = loop.create_task(self._try_start_owned_notifier())
+        await asyncio.shield(self._notifier_start_task)
+
+    async def _try_start_owned_notifier(self) -> None:
+        notifier = self._owned_notifier
+        assert notifier is not None
+        try:
+            await notifier.start()
             self._notifier_started = True
+        except NotifierUnavailableError:
+            backoff = getattr(notifier, "reconnect_backoff", (1.0, 30.0))[0]
+            self._notifier_retry_at = asyncio.get_running_loop().time() + backoff
+        finally:
+            self._notifier_start_task = None
 
     async def __aexit__(self, *exc: Any) -> None:
         await self.close()

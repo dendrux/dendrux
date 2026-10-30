@@ -131,3 +131,14 @@ For the built-in PostgreSQL adapter, writers can use a transaction-pooled
 session-pooled `listen_url`. PgBouncer transaction mode cannot preserve LISTEN
 session state. Its startup self-test is best effort, so passing it does not
 prove that subsequent notifications will arrive.
+
+The PostgreSQL listener must connect to the primary. If event reads use a read
+replica, a hint can arrive before replication makes the row visible. A healthy
+follow feed makes one retry at `poll_interval_s` after an empty wake, then
+returns to its normal reconciliation interval. Polling remains the delivery
+fallback.
+
+Every listener process receives every notification on its channel, including
+run ids that process does not watch. Budget callback work against the database's
+total event rate per listener process. For custom channels, caps or deadlines,
+construct and start an explicit notifier and pass the borrowed `notifier=` form.
