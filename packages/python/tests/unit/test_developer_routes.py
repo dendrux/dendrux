@@ -44,6 +44,7 @@ async def test_client_routes_enforce_auth_scope_and_resume(name, tmp_path, monke
 
     def build(url):
         agent = Agent(
+            strict_tenancy=False,
             provider=MockLLM(
                 [
                     LLMResponse(tool_calls=[ToolCall("local_read", {"sheet": "private"})]),
@@ -111,6 +112,7 @@ async def test_approval_route_stops_on_hidden_args_and_requires_auth(tmp_path, m
     def build(url):
         return {
             "anthropic": Agent(
+                strict_tenancy=False,
                 provider=MockLLM(
                     [
                         LLMResponse(tool_calls=[ToolCall("refund", {"order": 7})]),

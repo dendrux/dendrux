@@ -211,17 +211,25 @@ class TestAgentProvider:
 
 class TestAgentPersistence:
     def test_database_url_stored(self):
-        agent = Agent(provider=_mock_provider(), prompt="Hello.", database_url="sqlite:///test.db")
+        agent = Agent(
+            strict_tenancy=False,
+            provider=_mock_provider(),
+            prompt="Hello.",
+            database_url="sqlite:///test.db",
+        )
         assert agent._database_url == "sqlite:///test.db"
 
     def test_state_store_stored(self):
         mock_store = AsyncMock()
-        agent = Agent(provider=_mock_provider(), prompt="Hello.", state_store=mock_store)
+        agent = Agent(
+            strict_tenancy=False, provider=_mock_provider(), prompt="Hello.", state_store=mock_store
+        )
         assert agent._state_store is mock_store
 
     def test_database_url_and_state_store_mutually_exclusive(self):
         with pytest.raises(ValueError, match="mutually exclusive"):
             Agent(
+                strict_tenancy=False,
                 provider=_mock_provider(),
                 prompt="Hello.",
                 database_url="sqlite:///test.db",
@@ -238,6 +246,7 @@ class TestAgentPersistence:
 
     def test_database_options_with_url_is_valid(self):
         agent = Agent(
+            strict_tenancy=False,
             provider=_mock_provider(),
             prompt="Hello.",
             database_url="sqlite:///test.db",
@@ -260,8 +269,12 @@ class TestAgentPrivateEngine:
             url_a = f"sqlite+aiosqlite:///{Path(tmp) / 'a.db'}"
             url_b = f"sqlite+aiosqlite:///{Path(tmp) / 'b.db'}"
 
-            agent_a = Agent(provider=_mock_provider(), prompt="A.", database_url=url_a)
-            agent_b = Agent(provider=_mock_provider(), prompt="B.", database_url=url_b)
+            agent_a = Agent(
+                strict_tenancy=False, provider=_mock_provider(), prompt="A.", database_url=url_a
+            )
+            agent_b = Agent(
+                strict_tenancy=False, provider=_mock_provider(), prompt="B.", database_url=url_b
+            )
 
             store_a = await agent_a._resolve_state_store()
             store_b = await agent_b._resolve_state_store()
@@ -279,6 +292,7 @@ class TestAgentPrivateEngine:
         with tempfile.TemporaryDirectory() as tmp:
             url = f"sqlite+aiosqlite:///{Path(tmp) / 'opts.db'}"
             agent = Agent(
+                strict_tenancy=False,
                 provider=_mock_provider(),
                 prompt="Hello.",
                 database_url=url,
@@ -297,7 +311,9 @@ class TestAgentPrivateEngine:
         """agent.close() disposes the agent-owned engine."""
         with tempfile.TemporaryDirectory() as tmp:
             url = f"sqlite+aiosqlite:///{Path(tmp) / 'close.db'}"
-            agent = Agent(provider=_mock_provider(), prompt="Hello.", database_url=url)
+            agent = Agent(
+                strict_tenancy=False, provider=_mock_provider(), prompt="Hello.", database_url=url
+            )
 
             await agent._resolve_state_store()
             engine = agent._private_engine
@@ -311,7 +327,9 @@ class TestAgentPrivateEngine:
         """After close(), re-resolving creates a fresh engine and store."""
         with tempfile.TemporaryDirectory() as tmp:
             url = f"sqlite+aiosqlite:///{Path(tmp) / 'reuse.db'}"
-            agent = Agent(provider=_mock_provider(), prompt="Hello.", database_url=url)
+            agent = Agent(
+                strict_tenancy=False, provider=_mock_provider(), prompt="Hello.", database_url=url
+            )
 
             store_before = await agent._resolve_state_store()
             engine_before = agent._private_engine
@@ -328,27 +346,16 @@ class TestAgentPrivateEngine:
 
             await agent.close()
 
-    async def test_env_var_fallback_uses_shared_engine(self):
-        """DENDRUX_DATABASE_URL env var path uses the global get_engine(), not private."""
+    async def test_env_var_fallback_requires_explicit_persistence(self):
         with (
             patch("dendrux.agent.os.environ.get", return_value="sqlite+aiosqlite:///env.db"),
             patch("dendrux.db.session.get_engine", new_callable=AsyncMock) as mock_get,
         ):
-            from sqlalchemy.ext.asyncio import create_async_engine
-
-            # Create a real in-memory engine for the mock to return
-            mock_engine = create_async_engine("sqlite+aiosqlite://", echo=False)
-            mock_get.return_value = mock_engine
-
             agent = Agent(provider=_mock_provider(), prompt="Hello.")
-            store = await agent._resolve_state_store()
-
-            assert store is not None
-            # Used the global singleton, not a private engine
-            mock_get.assert_awaited_once_with("sqlite+aiosqlite:///env.db")
+            with pytest.raises(ValueError, match="state_store=.*database_url="):
+                await agent._resolve_state_store()
+            mock_get.assert_not_awaited()
             assert agent._private_engine is None
-
-            await mock_engine.dispose()
 
 
 # ------------------------------------------------------------------
@@ -494,7 +501,7 @@ class TestAgentRun:
 
 class TestAgentResume:
     async def test_resume_without_provider_raises(self):
-        agent = Agent(prompt="Hello.", database_url="sqlite:///test.db")
+        agent = Agent(strict_tenancy=False, prompt="Hello.", database_url="sqlite:///test.db")
         with pytest.raises(ValueError, match="requires a provider"):
             await agent.resume("run-123", tool_results=[])
 
@@ -505,6 +512,7 @@ class TestAgentResume:
 
     async def test_resume_with_both_args_raises(self):
         agent = Agent(
+            strict_tenancy=False,
             provider=_mock_provider(),
             prompt="Hello.",
             database_url="sqlite:///test.db",
@@ -514,10 +522,7 @@ class TestAgentResume:
 
     async def test_resume_no_arg_requires_persistence(self):
         """No-arg resume (approval approve) still requires persistence."""
-        agent = Agent(
-            provider=_mock_provider(),
-            prompt="Hello.",
-        )
+        agent = Agent(provider=_mock_provider(), prompt="Hello.")
         with pytest.raises(ValueError, match="requires persistence"):
             await agent.resume("run-123")
 

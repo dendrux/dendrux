@@ -61,7 +61,7 @@ async def test_retry_replay_records_own_wire_input(store):
 @pytest.mark.parametrize("path", ["resume", "submit"])
 async def test_non_skill_cancel_during_resume_preparation_sequences_event(store, path):
     p = MockLLM([LLMResponse(tool_calls=[ToolCall(name="client", params={})])])
-    a = Agent(prompt="test", provider=p, tools=[client], state_store=store)
+    a = Agent(strict_tenancy=False, prompt="test", provider=p, tools=[client], state_store=store)
     paused = await a.run("input")
     state = await store.get_pause_state(paused.run_id)
     results = [

@@ -39,7 +39,9 @@ async def test_cancel_child_leaves_same_task_parent_running(store, cascade):
         ],
         gate_at=1,
     )
-    agent = Agent(provider=llm, prompt="T.", tools=[delegate], state_store=store)
+    agent = Agent(
+        strict_tenancy=False, provider=llm, prompt="T.", tools=[delegate], state_store=store
+    )
     holder["agent"] = agent
     task = asyncio.create_task(agent.run("go"))
     await asyncio.wait_for(llm.entered.wait(), 5)

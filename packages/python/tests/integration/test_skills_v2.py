@@ -30,6 +30,8 @@ def skill(body="secret body"):
 
 
 def agent(store, responses, **kwargs):
+    kwargs.setdefault("strict_tenancy", False)
+    kwargs.setdefault("on_governance_change", "warn")
     return Agent(
         prompt="Test.",
         name="skills",

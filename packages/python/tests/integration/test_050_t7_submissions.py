@@ -95,7 +95,7 @@ async def test_plain_store_claim_checks_token_in_transaction(store):
     assert (await store.get_run_control("00000000000000000000000106")).claim_epoch == 0
 
 
-async def test_strict_tenancy_warns_without_pause_token(store):
+async def test_strict_tenancy_requires_pause_token(store):
     a = Agent(
         name="integrity",
         prompt="p",
@@ -106,8 +106,15 @@ async def test_strict_tenancy_warns_without_pause_token(store):
         on_governance_change="warn",
     )
     paused = await a.run("go", tenant_id=None)
-    with pytest.warns(FutureWarning, match="expected_pause_id"):
-        result = await a.submit_tool_results(paused.run_id, [result_for(paused)], tenant_id=None)
+    from dendrux.types import InputValidationError
+
+    with pytest.raises(InputValidationError) as caught:
+        await a.submit_tool_results(paused.run_id, [result_for(paused)], tenant_id=None)
+    assert caught.value.code == "pause_id_required"
+    assert (await store.get_run(paused.run_id)).status == "waiting_client_tool"
+    result = await a.submit_tool_results(
+        paused.run_id, [result_for(paused)], tenant_id=None, expected_pause_id=paused.pause_id
+    )
     assert result.status == RunStatus.SUCCESS
 
 
@@ -139,7 +146,7 @@ async def test_failed_transform_does_not_claim_or_expose_payload(store):
     assert (await store.get_run(paused.run_id)).status == "waiting_client_tool"
 
 
-async def test_default_governance_change_emits_future_warning(store):
+async def test_default_governance_change_raises(store):
     a = agent(store, [tool_call("client_read", pid="a")], limits=Limits(max_tool_result_bytes=100))
     paused = await a.run("go")
     b = Agent(
@@ -150,9 +157,11 @@ async def test_default_governance_change_emits_future_warning(store):
         provider=ScriptedLLM([LLMResponse(text="done")]),
         strict_tenancy=False,
     )
-    with pytest.warns(FutureWarning, match="0.6"):
-        result = await b.submit_tool_results(paused.run_id, [result_for(paused)])
-    assert result.status == RunStatus.SUCCESS
+    from dendrux.errors import GovernanceMismatchError
+
+    with pytest.raises(GovernanceMismatchError):
+        await b.submit_tool_results(paused.run_id, [result_for(paused)])
+    assert (await store.get_run(paused.run_id)).status == "waiting_client_tool"
     assert GOVERNANCE_KEY in (await store.get_run(paused.run_id)).meta
 
 

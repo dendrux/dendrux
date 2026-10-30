@@ -77,6 +77,7 @@ def _pausing_agent(store: Any) -> Agent:
         return "ok"
 
     agent = Agent(
+        strict_tenancy=False,
         provider=ScriptedLLM([tool_call("step", pid="t1"), LLMResponse(text="done")]),
         prompt="P.",
         tools=[step],
@@ -87,7 +88,7 @@ def _pausing_agent(store: Any) -> Agent:
 
 
 def _other(store: Any) -> Agent:
-    return Agent(provider=ScriptedLLM([]), prompt="Other.", state_store=store)
+    return Agent(strict_tenancy=False, provider=ScriptedLLM([]), prompt="Other.", state_store=store)
 
 
 async def _paused_run(store: Any) -> str:
@@ -145,6 +146,7 @@ class TestPausePublication:
             return ""
 
         agent = Agent(
+            strict_tenancy=False,
             provider=ScriptedLLM([tool_call("client_read", pid="t1")]),
             prompt="P.",
             tools=[client_read],
@@ -163,7 +165,10 @@ class TestTerminalPrecedence:
     async def test_cancel_after_last_checkpoint_completes_normally(self, store) -> None:
         """Documented: cooperative cancel does not undo a finished run."""
         agent = Agent(
-            provider=ScriptedLLM([LLMResponse(text="done")]), prompt="P.", state_store=store
+            strict_tenancy=False,
+            provider=ScriptedLLM([LLMResponse(text="done")]),
+            prompt="P.",
+            state_store=store,
         )
         original = store.finalize_run
 
@@ -184,7 +189,10 @@ class TestTerminalPrecedence:
 
         await pin_storage_format(store._engine, 1)
         agent = Agent(
-            provider=ScriptedLLM([LLMResponse(text="done")]), prompt="P.", state_store=store
+            strict_tenancy=False,
+            provider=ScriptedLLM([LLMResponse(text="done")]),
+            prompt="P.",
+            state_store=store,
         )
         original = store.finalize_run
 
@@ -263,14 +271,17 @@ class TestFinalizerContention:
             ScriptedLLM([LLMResponse(text="done")]),
             ScriptedLLM([LLMResponse(text="done")]),
         ]
-        first = Agent(provider=llms[0], prompt="P.", tools=[step], state_store=store)
+        first = Agent(
+            strict_tenancy=False, provider=llms[0], prompt="P.", tools=[step], state_store=store
+        )
         holder["agent"] = first
         paused = await first.run("go")
         await first.submit_note(paused.run_id, "one")
         await first.submit_note(paused.run_id, "two")
 
         owners = [
-            Agent(provider=llm, prompt="P.", tools=[step], state_store=store) for llm in llms[1:]
+            Agent(strict_tenancy=False, provider=llm, prompt="P.", tools=[step], state_store=store)
+            for llm in llms[1:]
         ]
         outcomes = await asyncio.gather(
             *(o.submit_resume(paused.run_id) for o in owners), return_exceptions=True
@@ -429,6 +440,7 @@ class TestPre03Store:
             ]
         )
         agent = Agent(
+            strict_tenancy=False,
             provider=llm,
             prompt="P.",
             tools=[add, client_read, refund],
@@ -470,6 +482,7 @@ class TestPre03Store:
             return ""
 
         agent = Agent(
+            strict_tenancy=False,
             provider=ScriptedLLM([tool_call("client_read", pid="t1")]),
             prompt="P.",
             tools=[client_read],
@@ -495,7 +508,9 @@ class TestPre03Store:
 
     async def test_run_control_apis_name_the_missing_method(self, store) -> None:
         legacy = Pre03Store(store)
-        agent = Agent(provider=ScriptedLLM([]), prompt="P.", state_store=legacy)  # type: ignore[arg-type]
+        agent = Agent(
+            strict_tenancy=False, provider=ScriptedLLM([]), prompt="P.", state_store=legacy
+        )  # type: ignore[arg-type]
         await store.create_run("r1", "a")
         with pytest.raises(NotImplementedError, match="request_pause"):
             await agent.request_pause("r1", cascade=False)

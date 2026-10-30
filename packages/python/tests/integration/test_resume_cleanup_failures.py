@@ -18,6 +18,7 @@ from tests.integration.test_skills_v2 import client
 
 async def paused_client_run(store):
     a = Agent(
+        strict_tenancy=False,
         prompt="test",
         provider=MockLLM([LLMResponse(tool_calls=[ToolCall(name="client", params={})])]),
         tools=[client],

@@ -868,7 +868,8 @@ class Budget:
         max_subtree_nodes: Root-inclusive accounting cap (default 10,000).
             Larger trees raise BudgetConfigurationError instead of using partial usage.
         count_cache_tokens: Count cache read and write tokens toward
-            ``max_tokens``. ``None`` (default) means not chosen.
+            ``max_tokens``. Defaults to ``True``; explicit ``False`` or ``None``
+            retains input-plus-output accounting.
 
     Raises:
         ValueError: If neither limit is set, a limit is not positive, a
@@ -880,7 +881,7 @@ class Budget:
     max_cost_usd: float | None = None
     on_exceed: BudgetAction = "warn"
     include_children: bool = True
-    count_cache_tokens: bool | None = None
+    count_cache_tokens: bool | None = True
     max_subtree_nodes: int = 10000
 
     def __post_init__(self) -> None:
@@ -1554,9 +1555,9 @@ class PauseState:
     # Current pause format; stored snapshots without a version read as 1.
     schema_version: int | None = 1
 
+    provider_kwargs: dict[str, Any] = field(default_factory=dict)
     image_view_ref: str | None = None
     loop_state_ref: bool = False
-    provider_kwargs: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to JSON-compatible dict for DB storage.

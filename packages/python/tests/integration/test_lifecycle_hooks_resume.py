@@ -85,6 +85,7 @@ class CapturingNotifier(BaseNotifier):
 
 def _client_tool_agent(llm: MockLLM, store: SQLAlchemyStateStore) -> Agent:
     return Agent(
+        strict_tenancy=False,
         provider=llm,
         prompt="Test agent.",
         tools=[read_range],
@@ -94,6 +95,7 @@ def _client_tool_agent(llm: MockLLM, store: SQLAlchemyStateStore) -> Agent:
 
 def _approval_agent(llm: MockLLM, store: SQLAlchemyStateStore) -> Agent:
     return Agent(
+        strict_tenancy=False,
         provider=llm,
         prompt="Support agent.",
         tools=[refund],
@@ -425,7 +427,9 @@ class TestStreamCleanupCancellationLifecycle:
         from dendrux.types import RunEventType
 
         provider = _BlockingLLM()
-        agent = Agent(provider=provider, prompt="Test agent.", state_store=db_store)
+        agent = Agent(
+            strict_tenancy=False, provider=provider, prompt="Test agent.", state_store=db_store
+        )
 
         n = CapturingNotifier()
         run_id: str | None = None
@@ -471,6 +475,7 @@ class TestStreamCleanupCancellationLifecycle:
         # while the run is still RUNNING.
         provider = _BlockingLLM()
         resume_agent = Agent(
+            strict_tenancy=False,
             provider=provider,
             prompt="Test agent.",
             tools=[read_range],
@@ -537,7 +542,9 @@ class TestStreamCleanupCancellationLifecycle:
         from dendrux.types import RunEventType
 
         provider = _BlockingLLM()
-        agent = Agent(provider=provider, prompt="Test agent.", state_store=db_store)
+        agent = Agent(
+            strict_tenancy=False, provider=provider, prompt="Test agent.", state_store=db_store
+        )
 
         n = CapturingNotifier()
         run_id: str | None = None
@@ -579,6 +586,7 @@ class TestStreamCleanupCancellationLifecycle:
 
         provider = _BlockingLLM()
         resume_agent = Agent(
+            strict_tenancy=False,
             provider=provider,
             prompt="Test agent.",
             tools=[read_range],

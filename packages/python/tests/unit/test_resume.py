@@ -47,6 +47,7 @@ def _make_agent(**overrides) -> Agent:
         "max_iterations": 10,
     }
     defaults.update(overrides)
+    defaults.setdefault("strict_tenancy", False)
     return Agent(**defaults)
 
 

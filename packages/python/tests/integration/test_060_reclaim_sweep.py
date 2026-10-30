@@ -66,11 +66,11 @@ async def test_warning_only_with_stale_rows_and_no_once_flag(store, engine):
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         await scan(store)
-        assert not caught
+        assert not [w for w in caught if w.category is FutureWarning]
         for _ in range(2):
             await candidate(store, engine)
             await scan(store)
-        assert len(caught) == 2
+        assert len([w for w in caught if w.category is FutureWarning]) == 2
 
 
 @pytest.mark.parametrize("policy", ["error", "reclaim"])

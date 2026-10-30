@@ -298,6 +298,7 @@ class _NoIOStore:
 
 def _capped_agent(**kw: Any) -> Agent:
     llm = MockLLM([LLMResponse(text="ok")])
+    kw.setdefault("strict_tenancy", False)
     agent = Agent(prompt="p", provider=llm, limits=Limits(max_input_bytes=16), **kw)
     agent._state_store = _NoIOStore()  # type: ignore[assignment]
     return agent

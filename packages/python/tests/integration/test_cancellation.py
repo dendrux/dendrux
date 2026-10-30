@@ -51,6 +51,7 @@ def db_store(engine):
 
 def _client_agent(llm: MockLLM, store: SQLAlchemyStateStore) -> Agent:
     return Agent(
+        strict_tenancy=False,
         provider=llm,
         prompt="Test agent.",
         tools=[server_echo, client_read],
@@ -60,6 +61,7 @@ def _client_agent(llm: MockLLM, store: SQLAlchemyStateStore) -> Agent:
 
 def _approval_agent(llm: MockLLM, store: SQLAlchemyStateStore) -> Agent:
     return Agent(
+        strict_tenancy=False,
         provider=llm,
         prompt="Test agent.",
         tools=[refund_tool],
@@ -244,6 +246,7 @@ class TestPrePauseCheckpoint:
 
         provider = _CancellingProvider(db_store)
         agent = Agent(
+            strict_tenancy=False,
             provider=provider,
             prompt="Test agent.",
             tools=[client_read],
@@ -388,6 +391,7 @@ class TestCancelPreservesPIIMapping:
 
         provider = _CancellingProvider(db_store)
         agent = Agent(
+            strict_tenancy=False,
             provider=provider,
             prompt="Test agent.",
             tools=[server_echo],
@@ -410,6 +414,7 @@ class TestCancelPreservesPIIMapping:
         )
         llm = MockLLM([LLMResponse(tool_calls=[tc])])
         agent = Agent(
+            strict_tenancy=False,
             provider=llm,
             prompt="Test agent.",
             tools=[client_read],

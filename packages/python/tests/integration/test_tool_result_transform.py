@@ -53,6 +53,7 @@ async def test_persisted_payload_matches_model_input(db_store, run_store) -> Non
     tc = ToolCall(name="get_rows", params={"limit": 2}, provider_tool_call_id="p1")
     llm = MockLLM([LLMResponse(tool_calls=[tc]), LLMResponse(text="done")])
     agent = Agent(
+        strict_tenancy=False,
         provider=llm,
         prompt="t",
         tools=[get_rows],
@@ -83,7 +84,12 @@ async def test_transform_failure_is_persisted_as_failed_call(db_store, run_store
     tc = ToolCall(name="get_rows", params={"limit": 1}, provider_tool_call_id="p1")
     llm = MockLLM([LLMResponse(tool_calls=[tc]), LLMResponse(text="done")])
     agent = Agent(
-        provider=llm, prompt="t", tools=[get_rows], state_store=db_store, tool_result_transform=bad
+        strict_tenancy=False,
+        provider=llm,
+        prompt="t",
+        tools=[get_rows],
+        state_store=db_store,
+        tool_result_transform=bad,
     )
     result = await agent.run("go")
 
@@ -103,6 +109,7 @@ async def test_not_applied_when_tool_raises(db_store, run_store) -> None:
     tc = ToolCall(name="explode", params={}, provider_tool_call_id="p1")
     llm = MockLLM([LLMResponse(tool_calls=[tc]), LLMResponse(text="done")])
     agent = Agent(
+        strict_tenancy=False,
         provider=llm,
         prompt="t",
         tools=[explode],
@@ -121,6 +128,7 @@ async def test_applied_on_approval_resume_path(db_store, run_store) -> None:
     tc = ToolCall(name="get_rows", params={"limit": 1}, provider_tool_call_id="p1")
     llm = MockLLM([LLMResponse(tool_calls=[tc]), LLMResponse(text="done")])
     agent = Agent(
+        strict_tenancy=False,
         provider=llm,
         prompt="t",
         tools=[get_rows],

@@ -170,7 +170,9 @@ def _pausing_agent(
         return "stepped"
 
     llm = ScriptedLLM([tool_call("step", pid="t1"), *(extra or [LLMResponse(text="done")])])
-    agent = Agent(provider=llm, prompt="Test.", tools=[step], state_store=store)
+    agent = Agent(
+        strict_tenancy=False, provider=llm, prompt="Test.", tools=[step], state_store=store
+    )
     holder["agent"] = agent
     return agent, llm, calls
 
@@ -244,7 +246,9 @@ class TestRequestedPause:
             return "stepped"
 
         llm = ScriptedLLM([tool_call("step", pid="t1"), LLMResponse(text="done")], gate_at=0)
-        agent = Agent(provider=llm, prompt="Test.", tools=[step], state_store=store)
+        agent = Agent(
+            strict_tenancy=False, provider=llm, prompt="Test.", tools=[step], state_store=store
+        )
         task = asyncio.create_task(agent.run("go"))
         await asyncio.wait_for(llm.entered.wait(), 5)
         run_id = (await store.list_runs())[0].id
@@ -268,7 +272,13 @@ class TestRequestedPause:
             return ""
 
         llm = ScriptedLLM([tool_call("client_read", pid="t1")])
-        agent = Agent(provider=llm, prompt="Test.", tools=[client_read], state_store=store)
+        agent = Agent(
+            strict_tenancy=False,
+            provider=llm,
+            prompt="Test.",
+            tools=[client_read],
+            state_store=store,
+        )
         waiting = await agent.run("go")
         with pytest.raises(PauseStatusMismatchError):
             await agent.submit_resume(waiting.run_id)
@@ -297,7 +307,9 @@ class TestRequestedPause:
             return "stepped"
 
         llm = ScriptedLLM([tool_call("step", pid="t1"), LLMResponse(text="unreached")])
-        agent = Agent(provider=llm, prompt="Test.", tools=[step], state_store=store)
+        agent = Agent(
+            strict_tenancy=False, provider=llm, prompt="Test.", tools=[step], state_store=store
+        )
         holder["agent"] = agent
         result = await agent.run("go")
 
@@ -344,7 +356,13 @@ class TestRequestedPause:
                 LLMResponse(text="done"),
             ]
         )
-        agent = Agent(provider=llm, prompt="Test.", tools=[step, client_read], state_store=store)
+        agent = Agent(
+            strict_tenancy=False,
+            provider=llm,
+            prompt="Test.",
+            tools=[step, client_read],
+            state_store=store,
+        )
         holder["agent"] = agent
         waiting = await agent.run("go")
         assert waiting.status == RunStatus.WAITING_CLIENT_TOOL
@@ -362,7 +380,13 @@ class TestRequestedPause:
             return ""
 
         llm = ScriptedLLM([tool_call("client_read", pid="t1"), LLMResponse(text="done")])
-        agent = Agent(provider=llm, prompt="Test.", tools=[client_read], state_store=store)
+        agent = Agent(
+            strict_tenancy=False,
+            provider=llm,
+            prompt="Test.",
+            tools=[client_read],
+            state_store=store,
+        )
         waiting = await agent.run("go")
 
         outcome = await agent.request_pause(waiting.run_id)
@@ -443,6 +467,7 @@ def _approval_agent(
 
     llm = ScriptedLLM([tool_calls(("a", {}, "t1"), ("b", {}, "t2")), LLMResponse(text="done")])
     agent = Agent(
+        strict_tenancy=False,
         provider=llm,
         prompt="Test.",
         tools=[a, b],
@@ -450,7 +475,9 @@ def _approval_agent(
         state_store=store,
     )
     holder["agent"] = agent
-    holder["other"] = Agent(provider=ScriptedLLM([]), prompt="Other.", state_store=store)
+    holder["other"] = Agent(
+        strict_tenancy=False, provider=ScriptedLLM([]), prompt="Other.", state_store=store
+    )
     return agent, llm, counts
 
 

@@ -116,6 +116,7 @@ class TestSqliteSyncFrom041:
         db = tmp_path / "v041.db"
         _build_041_file(db)
         agent = Agent(
+            strict_tenancy=False,
             provider=MockLLM([LLMResponse(text="done")]),
             prompt="p",
             database_url=f"sqlite+aiosqlite:///{db}",

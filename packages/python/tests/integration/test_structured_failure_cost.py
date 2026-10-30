@@ -35,6 +35,7 @@ def _structured_llm(text: str) -> MockLLM:
 
 async def test_failed_structured_call_is_recorded_and_priced(store) -> None:
     agent = Agent(
+        strict_tenancy=False,
         provider=_structured_llm('{"lab'),
         prompt="test",
         loop=SingleCall(),
@@ -77,6 +78,7 @@ async def test_failed_structured_call_is_recorded_and_priced(store) -> None:
 
 async def test_failed_structured_call_counts_toward_budget(store) -> None:
     agent = Agent(
+        strict_tenancy=False,
         provider=_structured_llm("not json"),
         prompt="test",
         loop=SingleCall(),

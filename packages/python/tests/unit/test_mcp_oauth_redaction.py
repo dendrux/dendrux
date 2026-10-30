@@ -443,6 +443,7 @@ async def test_tool_error_and_run_store_stay_value_free(tmp_path: Any) -> None:
                 oauth=oauth,
             )
             agent = Agent(
+                strict_tenancy=False,
                 provider=MockLLM(
                     [
                         LLMResponse(

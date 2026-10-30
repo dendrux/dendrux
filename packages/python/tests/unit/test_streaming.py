@@ -901,6 +901,7 @@ class TestResumeStream:
 
         llm = StreamingMockLLM([LLMResponse(text="Done")])
         agent = Agent(
+            strict_tenancy=False,
             prompt="You are a test agent.",
             tools=[add, read_range],
             provider=llm,

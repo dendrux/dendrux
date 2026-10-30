@@ -74,6 +74,8 @@ def _agent(llm: MockLLM, store: StateStore, **kw: Any) -> Agent:
         "state_store": store,
     }
     defaults.update(kw)
+    defaults.setdefault("strict_tenancy", False)
+    defaults.setdefault("on_governance_change", "warn")
     return Agent(**defaults)
 
 

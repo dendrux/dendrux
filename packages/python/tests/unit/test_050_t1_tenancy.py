@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import warnings
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -50,6 +51,7 @@ async def store(tmp_path: Any) -> Any:
 
 
 def _agent(store: Any = None, **kw: Any) -> Agent:
+    kw.setdefault("strict_tenancy", False)
     return Agent(
         provider=MockLLM([LLMResponse(text="ok")] * 5), prompt="p", state_store=store, **kw
     )
@@ -156,7 +158,7 @@ class TestStrictTenancy:
             tenant_id = "acme"
 
         monkeypatch.setattr(_tenant_checks, "get_delegation_context", lambda: _Ctx())
-        agent = _agent(strict_tenancy=True)
+        agent = _agent(AsyncMock(), strict_tenancy=True)
         from dendrux._sentinel import _OMITTED
 
         resolved = _tenant_checks.resolve_tenant(agent, "submit_input", _OMITTED, default=UNSCOPED)
@@ -173,33 +175,35 @@ class TestStrictTenancy:
         assert any(getattr(r, "code", None) == "tenant_scope_required" for r in caplog.records)
 
 
-class TestStrictDefaultFutureWarning:
-    async def test_future_warning_points_at_the_caller_and_dedups(self, store: Any) -> None:
-        agent = _agent(store)
+class TestStrictDefault:
+    async def test_default_requires_scope_without_warning(self, store: Any) -> None:
+        agent = Agent(provider=MockLLM([]), prompt="p", state_store=store)
         with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("default")
-            for _ in range(3):
-                await agent.run("hi")  # one location: shown once
-            await agent.run("hi")  # another location: shown again
-        future = [w for w in caught if issubclass(w.category, FutureWarning)]
-        assert len(future) == 2
-        assert all(w.filename == __file__ for w in future)
-        assert "strict_tenancy" in str(future[0].message)
+            warnings.simplefilter("always")
+            with pytest.raises(TenantScopeRequiredError):
+                await agent.run("hi")
+        assert not caught
+        assert store.calls == []
 
-    def test_visible_under_default_filters(self) -> None:
+    def test_default_refuses_omitted_scope(self) -> None:
         from dendrux._sentinel import _OMITTED
 
         with warnings.catch_warnings(record=True) as caught:
-            warnings.resetwarnings()  # Python's defaults: FutureWarning is shown
-            warnings.simplefilter("default", FutureWarning)
-            _tenant_checks.resolve_tenant(_agent(), "run", _OMITTED, default=None)
-        assert [w.category for w in caught] == [FutureWarning]
+            warnings.simplefilter("always")
+            with pytest.raises(TenantScopeRequiredError):
+                _tenant_checks.resolve_tenant(
+                    Agent(provider=MockLLM([]), prompt="p", state_store=AsyncMock()),
+                    "run",
+                    _OMITTED,
+                    default=None,
+                )
+        assert not caught
 
     @pytest.mark.parametrize("chosen", [True, False])
     def test_no_warning_when_chosen(self, chosen: bool) -> None:
         from dendrux._sentinel import _OMITTED
 
-        agent = _agent(strict_tenancy=chosen)
+        agent = _agent(AsyncMock(), strict_tenancy=chosen)
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             if chosen:

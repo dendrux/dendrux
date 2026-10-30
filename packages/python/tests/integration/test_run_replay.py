@@ -45,6 +45,7 @@ def _tool_turn(q: str, answer: str, *, reasoning: bool = True) -> list[LLMRespon
 
 def _agent(store: Any, mock: MockLLM, **kw: Any) -> Agent:
     kw.setdefault("tools", [lookup])
+    kw.setdefault("strict_tenancy", False)
     return Agent(provider=mock, prompt="You are helpful.", state_store=store, **kw)
 
 
@@ -189,8 +190,11 @@ class TestValidation:
 
     async def test_singlecall(self, store):
         mock = MockLLM([LLMResponse(text="a")])
-        r0 = await Agent(provider=mock, prompt="p", state_store=store, loop=SingleCall()).run("q")
+        r0 = await Agent(
+            strict_tenancy=False, provider=mock, prompt="p", state_store=store, loop=SingleCall()
+        ).run("q")
         single = Agent(
+            strict_tenancy=False,
             provider=MockLLM([LLMResponse(text="b")]),
             prompt="p",
             state_store=store,

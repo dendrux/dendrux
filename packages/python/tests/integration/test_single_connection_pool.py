@@ -105,7 +105,7 @@ async def test_three_parallel_tools_persist_every_row(memory_engine, hops) -> No
     store = SQLAlchemyStateStore(memory_engine)
     calls = [ToolCall("hop", {"n": n}, provider_tool_call_id=f"p{i}") for i, n in enumerate(hops)]
     llm = MockLLM([LLMResponse(text="Checking", tool_calls=calls), LLMResponse(text="done")])
-    agent = Agent(provider=llm, prompt="p", tools=[hop], state_store=store)
+    agent = Agent(strict_tenancy=False, provider=llm, prompt="p", tools=[hop], state_store=store)
     result = await agent.run("Do three things")
     assert result.status.value == "success"
     assert await _evidence_counts(memory_engine, result.run_id) == (3, 3)
@@ -120,7 +120,9 @@ async def test_jittered_parallel_tools_lose_no_rows(memory_engine) -> None:
             ToolCall("jittered", {"n": i}, provider_tool_call_id=f"p{i}") for i in range(width)
         ]
         llm = MockLLM([LLMResponse(text="go", tool_calls=calls), LLMResponse(text="done")])
-        agent = Agent(provider=llm, prompt="p", tools=[jittered], state_store=store)
+        agent = Agent(
+            strict_tenancy=False, provider=llm, prompt="p", tools=[jittered], state_store=store
+        )
         result = await agent.run("go")
         assert await _evidence_counts(memory_engine, result.run_id) == (width, width)
 

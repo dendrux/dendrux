@@ -57,6 +57,7 @@ def db_store(engine):
 
 def _client_tool_agent(llm: MockLLM, store: SQLAlchemyStateStore) -> Agent:
     return Agent(
+        strict_tenancy=False,
         provider=llm,
         prompt="Test agent.",
         tools=[server_add, read_range],
@@ -66,6 +67,7 @@ def _client_tool_agent(llm: MockLLM, store: SQLAlchemyStateStore) -> Agent:
 
 def _approval_agent(llm: MockLLM, store: SQLAlchemyStateStore) -> Agent:
     return Agent(
+        strict_tenancy=False,
         provider=llm,
         prompt="Support agent.",
         tools=[refund],

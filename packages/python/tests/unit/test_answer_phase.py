@@ -148,7 +148,11 @@ async def test_single_call_stream_tags_final_answer():
 
 async def test_commentary_persists_and_answer_is_final_with_store(state_store):
     agent = Agent(
-        provider=MockLLM(_two_step()), prompt="p", tools=[lookup], state_store=state_store
+        strict_tenancy=False,
+        provider=MockLLM(_two_step()),
+        prompt="p",
+        tools=[lookup],
+        state_store=state_store,
     )
     result = await agent.run("hi")
     assert result.commentary == ["Let me look that up.", "Checking one more source."]
@@ -186,7 +190,9 @@ async def test_mid_stream_interrupt_keeps_partial_in_answer_and_completed_steps_
         second="never sent",
         before=[LLMResponse(text="Narration.", tool_calls=[ToolCall("lookup", {"q": "a"})])],
     )
-    agent = Agent(provider=provider, prompt="p", tools=[lookup], state_store=state_store)
+    agent = Agent(
+        strict_tenancy=False, provider=provider, prompt="p", tools=[lookup], state_store=state_store
+    )
     stream = agent.stream("hi")
     terminal = None
     async with stream:
@@ -204,7 +210,11 @@ async def test_mid_stream_interrupt_keeps_partial_in_answer_and_completed_steps_
 
 async def test_cooperative_cancel_before_next_iteration_keeps_commentary(state_store):
     agent = Agent(
-        provider=MockLLM(_two_step()), prompt="p", tools=[lookup], state_store=state_store
+        strict_tenancy=False,
+        provider=MockLLM(_two_step()),
+        prompt="p",
+        tools=[lookup],
+        state_store=state_store,
     )
     stream = agent.stream("hi")
     terminal = None
@@ -226,7 +236,11 @@ async def test_cooperative_cancel_before_next_iteration_keeps_commentary(state_s
 
 async def test_assistant_traces_carry_phase(engine, state_store):
     agent = Agent(
-        provider=MockLLM(_two_step()), prompt="p", tools=[lookup], state_store=state_store
+        strict_tenancy=False,
+        provider=MockLLM(_two_step()),
+        prompt="p",
+        tools=[lookup],
+        state_store=state_store,
     )
     result = await agent.run("hi")
     traces = await RunStore.from_engine(engine).get_traces(result.run_id)
@@ -243,6 +257,7 @@ async def test_assistant_traces_carry_phase(engine, state_store):
 
 async def test_single_call_trace_is_final_answer(engine, state_store):
     agent = Agent(
+        strict_tenancy=False,
         provider=MockLLM([LLMResponse(text="hello")]),
         prompt="p",
         loop=SingleCall(),
@@ -260,7 +275,11 @@ def test_trace_entry_phase_defaults_none_for_old_rows():
 
 async def test_sse_event_log_carries_iteration_and_phase(engine, state_store):
     agent = Agent(
-        provider=MockLLM(_two_step()), prompt="p", tools=[lookup], state_store=state_store
+        strict_tenancy=False,
+        provider=MockLLM(_two_step()),
+        prompt="p",
+        tools=[lookup],
+        state_store=state_store,
     )
     result = await agent.run("hi")
     store = RunStore.from_engine(engine)
@@ -396,6 +415,7 @@ async def test_reasoning_delta_carries_iteration():
 
 async def test_approval_resume_stream_tags_tool_results_and_keeps_commentary(state_store):
     agent = Agent(
+        strict_tenancy=False,
         provider=MockLLM(
             [
                 LLMResponse(text="Needs sign-off.", tool_calls=[ToolCall("lookup", {"q": "a"})]),

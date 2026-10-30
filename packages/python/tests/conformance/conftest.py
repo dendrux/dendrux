@@ -8,6 +8,7 @@ Each test sees a clean schema.
 from __future__ import annotations
 
 import os
+from functools import partial
 from typing import TYPE_CHECKING
 
 import pytest
@@ -17,15 +18,22 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
 from dendrux.db.models import Base
+from dendrux.types import Budget
 from tests._fixtures.storage import pin_storage_format
 from tests._helpers import v030_oracle as o
-from tests.conformance import pg_guard
+from tests.conformance import pg_guard, scenarios
 from tests.integration.conftest import _PG_TRUNCATE_SQL, _ensure_test_db_exists
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
     from sqlalchemy.ext.asyncio import AsyncEngine
+
+
+@pytest.fixture(autouse=True)
+def legacy_budget_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    # 0.6 default flip: construct the 0.5 cells with their explicit old cache policy.
+    monkeypatch.setattr(scenarios, "Budget", partial(Budget, count_cache_tokens=False))
 
 
 @pytest.fixture(scope="session")

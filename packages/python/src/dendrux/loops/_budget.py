@@ -20,14 +20,12 @@ Usage source:
 
 Token formula (``max_tokens``)::
 
-    input + output                                  count_cache_tokens False / None (0.4.1)
-    input + output + cache_read + cache_write       count_cache_tokens True
+    input + output                                  count_cache_tokens False / None
+    input + output + cache_read + cache_write       count_cache_tokens True (default)
 
-``input`` is fresh input only (providers report cached tokens separately), so
-the default undercounts what a cache-heavy run really sends. Choosing
-``count_cache_tokens`` explicitly is recommended in 0.5.0; ``True`` becomes the
-default in 0.6, and a token budget without a choice emits a one-time
-``DeprecationWarning``.
+``input`` is fresh input only (providers report cached tokens separately).
+Cache read and write tokens count toward token budgets by default. Explicit
+``count_cache_tokens=False`` or ``None`` retains input-plus-output accounting.
 
 Unpriced calls (no provider cost, no ``PriceTable`` entry) under
 ``max_cost_usd``: with ``on_exceed`` ``"pause"`` or ``"cancel"`` they count as

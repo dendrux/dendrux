@@ -1126,6 +1126,14 @@ class Ctx:
         leg = self.recorder.begin_leg(label)
         install_fake_sdk(provider, self.rig, turns, leg)
         instrument_provider(provider, leg)
+        # The v0.3 baseline predates these kwargs; candidates select its policies explicitly.
+        from inspect import signature
+
+        parameters = signature(Agent).parameters
+        if "strict_tenancy" in parameters:
+            kw.setdefault("strict_tenancy", False)
+        if "on_governance_change" in parameters:
+            kw.setdefault("on_governance_change", "warn")
         return Agent(
             provider=provider,
             prompt=prompt,

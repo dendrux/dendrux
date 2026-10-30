@@ -244,7 +244,7 @@ class TestAgentRetryMethod:
         from dendrux.runtime.runner import run
 
         mock = MockLLM([LLMResponse(text="original")])
-        agent = Agent(provider=mock, prompt="test", state_store=store)
+        agent = Agent(strict_tenancy=False, provider=mock, prompt="test", state_store=store)
 
         result1 = await run(
             agent,
@@ -254,7 +254,7 @@ class TestAgentRetryMethod:
         )
 
         mock2 = MockLLM([LLMResponse(text="retried")])
-        agent2 = Agent(provider=mock2, prompt="test", state_store=store)
+        agent2 = Agent(strict_tenancy=False, provider=mock2, prompt="test", state_store=store)
         result2 = await agent2.retry(result1.run_id)
 
         assert result2.status == RunStatus.SUCCESS

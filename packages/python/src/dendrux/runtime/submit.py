@@ -30,6 +30,7 @@ from dendrux.errors import (
     RunNotFoundError,
     RunNotPausedError,
 )
+from dendrux.runtime._tenant_checks import _strict_tenancy_applies
 from dendrux.runtime.state import ClaimResult
 from dendrux.types import (
     ApprovalDecision,
@@ -1107,34 +1108,6 @@ def capture_warning_location() -> _WarningLocation | None:
     )
 
 
-def _warn_at_location(message: str, location: _WarningLocation | None) -> None:
-    import warnings
-
-    if location is not None:
-        warnings.warn_explicit(
-            message,
-            FutureWarning,
-            location.filename,
-            location.lineno,
-            module=location.module,
-            registry=location.registry,
-        )
-    else:
-        warnings.warn(message, FutureWarning, stacklevel=_user_warning_stacklevel())
-
-
-def _user_warning_stacklevel() -> int:
-    import inspect
-
-    frame = inspect.currentframe()
-    frame = frame.f_back if frame is not None else None
-    level = 1
-    while frame is not None and frame.f_globals.get("__name__", "").startswith("dendrux."):
-        level += 1
-        frame = frame.f_back
-    return level
-
-
 async def report_governance_change(
     agent: Agent,
     store: StateStore,
@@ -1153,12 +1126,6 @@ async def report_governance_change(
     if change is None:
         return
     _codes.log_code(log, _codes.GOVERNANCE_CHANGED, run_id=run_id)
-    if not agent._on_governance_change_chosen:
-        _warn_at_location(
-            "Changed governance warns in 0.5; the default becomes 'raise' in 0.6. "
-            "Choose on_governance_change explicitly.",
-            warning_location,
-        )
     await store.save_run_event(run_id, event_type="governance.changed", data=change)
 
 
@@ -1180,11 +1147,10 @@ def warn_missing_pause_id(
     warning_location: _WarningLocation | None = None,
 ) -> None:
     _require_approval_token(approval, expected)
-    if pause_id is not None and expected is None and agent._strict_tenancy:
-        _warn_at_location(
-            "Pass expected_pause_id to bind this submission to its pause.",
-            warning_location,
-        )
+    if expected is None and _strict_tenancy_applies(agent):
+        from dendrux.types import InputValidationError
+
+        raise InputValidationError("expected_pause_id", "pause_id_required")
 
 
 def _client_json_payload(payload: str) -> str:

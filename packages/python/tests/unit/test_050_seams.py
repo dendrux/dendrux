@@ -203,6 +203,7 @@ class TestRunnerEntrySeam:
         self, tmp_path: Path, runner_calls: list[tuple[str, str, Any, Any, dict[str, Any]]]
     ) -> None:
         agent = Agent(
+            strict_tenancy=False,
             provider=MockLLM([LLMResponse(text="a"), LLMResponse(text="b"), LLMResponse(text="c")]),
             prompt="p",
             database_url=f"sqlite+aiosqlite:///{tmp_path / 'seams.db'}",
@@ -392,7 +393,7 @@ class TestNoteCapPlumbing:
                 return True
 
         agent._state_store = _Store()  # type: ignore[assignment]
-        await agent.submit_note("00000000000000000000000304", "note")
+        await agent.submit_note("00000000000000000000000304", "note", tenant_id=None)
         assert seen["max_notes"] == 7
 
     async def test_store_without_max_notes_keeps_working(self) -> None:
@@ -407,7 +408,7 @@ class TestNoteCapPlumbing:
                 return True
 
         agent._state_store = _LegacyStore()  # type: ignore[assignment]
-        await agent.submit_note("00000000000000000000000304", "note")
+        await agent.submit_note("00000000000000000000000304", "note", tenant_id=None)
         assert seen == {"called": True}
 
     async def test_default_cap_is_1000(self) -> None:
@@ -420,19 +421,17 @@ class TestNoteCapPlumbing:
                 return True
 
         agent._state_store = _Store()  # type: ignore[assignment]
-        await agent.submit_note("00000000000000000000000304", "note")
+        await agent.submit_note("00000000000000000000000304", "note", tenant_id=None)
         assert seen["max_notes"] == 1000
 
 
 class TestAgentKwargs:
     def test_defaults(self) -> None:
-        agent = _agent()
-        assert agent._strict_tenancy is False
-        assert agent._strict_tenancy_chosen is False
+        agent = Agent(provider=MockLLM([]), prompt="p")
+        assert agent._strict_tenancy is True
         assert agent._limits == Limits()
         assert agent._tool_threads == 8
-        assert agent._on_governance_change == "warn"
-        assert agent._on_governance_change_chosen is False
+        assert agent._on_governance_change == "raise"
         from dendrux.tools._pool import ToolCallLimiter
 
         assert isinstance(agent._tool_call_limiter, ToolCallLimiter)
@@ -442,8 +441,8 @@ class TestAgentKwargs:
         agent = Agent(
             provider=MockLLM([]), prompt="p", strict_tenancy=False, on_governance_change="warn"
         )
-        assert (agent._strict_tenancy, agent._strict_tenancy_chosen) == (False, True)
-        assert (agent._on_governance_change, agent._on_governance_change_chosen) == ("warn", True)
+        assert agent._strict_tenancy is False
+        assert agent._on_governance_change == "warn"
 
     def test_stored(self) -> None:
         limits = Limits(max_input_bytes=10)

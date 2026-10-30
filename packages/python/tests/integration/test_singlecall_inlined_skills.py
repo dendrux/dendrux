@@ -41,6 +41,7 @@ class TestSingleCallInlinedSkillsE2E:
         skill = Skill.from_dir(FIXTURES_DIR / "pdf-processing")
         llm = MockLLM([_resp("ack")])
         agent = Agent(
+            strict_tenancy=False,
             provider=llm,
             prompt="You are a chat participant.",
             loop=SingleCall(),
@@ -67,6 +68,7 @@ class TestSingleCallInlinedSkillsE2E:
         skill = Skill.from_dir(FIXTURES_DIR / "pdf-processing")
         llm = MockLLM([_resp("ack")])
         agent = Agent(
+            strict_tenancy=False,
             provider=llm,
             prompt="P.",
             loop=SingleCall(),

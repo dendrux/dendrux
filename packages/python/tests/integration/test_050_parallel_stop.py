@@ -57,7 +57,13 @@ async def test_failed_row_write_stops_the_running_sibling(store):
         ToolCall(name="slow_side_effect", params={"x": 2}, provider_tool_call_id="b"),
     ]
     llm = MockLLM([LLMResponse(tool_calls=calls), LLMResponse(text="ok")])
-    agent = Agent(prompt="p", tools=[fast, slow_side_effect], provider=llm, state_store=store)
+    agent = Agent(
+        strict_tenancy=False,
+        prompt="p",
+        tools=[fast, slow_side_effect],
+        provider=llm,
+        state_store=store,
+    )
 
     with pytest.raises(RuntimeError, match="constraint violation"):
         await agent.run("go")

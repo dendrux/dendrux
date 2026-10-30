@@ -31,6 +31,7 @@ class Executor(SkillExecutor):
 
 
 def session(*, executor=None, explicit=(), **kwargs):
+    kwargs.setdefault("strict_tenancy", False)
     agent = Agent(
         prompt="Test.",
         skills=[skill(files={"ref.txt": "x" * 50001, "asset": b"bin", "scripts/a.py": "secret"})],
@@ -271,7 +272,8 @@ def test_lazy_directory_warning_and_singlecall(tmp_path):
         SkillSession.prepare(a)
     with pytest.raises(ValueError, match="SingleCall"):
         SkillSession.prepare(
-            Agent(prompt="Test.", skills=[s], skill_executor=Executor()), loop=SingleCall()
+            Agent(prompt="Test.", skills=[s], skill_executor=Executor()),
+            loop=SingleCall(),
         )
 
 

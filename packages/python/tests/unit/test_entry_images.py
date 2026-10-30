@@ -458,6 +458,8 @@ async def server_add(a: int, b: int) -> int:
 
 def _agent(store: Any, responses: list[LLMResponse], **kw: Any) -> Agent:
     policy = kw.pop("images", ImagePolicy(capability_overrides={"mock": "yes"}))
+    kw.setdefault("strict_tenancy", False)
+    kw.setdefault("on_governance_change", "warn")
     return Agent(
         name=kw.pop("name", "screen_agent"),
         prompt="You look at screenshots.",

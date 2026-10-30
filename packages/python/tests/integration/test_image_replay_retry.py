@@ -47,6 +47,8 @@ def _mock(responses: list[LLMResponse], support: str = "yes") -> MockLLM:
 
 
 def _agent(store: Any, provider: MockLLM, **kw: Any) -> Agent:
+    kw.setdefault("strict_tenancy", False)
+    kw.setdefault("on_governance_change", "warn")
     return Agent(
         name="img_agent",
         prompt="p",

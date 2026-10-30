@@ -685,7 +685,7 @@ class TestBudgetTrackerSources:
 
         usage = UsageStats(total_tokens=700, cost_usd=0.2)
         tracker = BudgetTracker(
-            Budget(max_tokens=500, max_cost_usd=1.0, on_exceed="pause"),
+            Budget(max_tokens=500, max_cost_usd=1.0, on_exceed="pause", count_cache_tokens=False),
             run_id="r",
             usage=usage,
             recorder=BaseRecorder(),
@@ -704,7 +704,7 @@ class TestBudgetTrackerSources:
                 raise RuntimeError("db down")
 
         tracker = BudgetTracker(
-            Budget(max_tokens=500, on_exceed="pause"),
+            Budget(max_tokens=500, on_exceed="pause", count_cache_tokens=False),
             run_id="r",
             usage=UsageStats(total_tokens=700),
             recorder=BaseRecorder(),

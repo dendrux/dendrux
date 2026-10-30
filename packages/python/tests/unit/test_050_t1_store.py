@@ -67,7 +67,9 @@ class TestTenantIdempotency:
     async def test_same_key_in_two_tenants_creates_two_runs(self, state: Any) -> None:
         """Tenant isolation: tenant B must not get tenant A's run or answer."""
         llm = _answers("A secret balance", "B balance", "unused")
-        agent = Agent(name="bank", prompt="p", provider=llm, state_store=state)
+        agent = Agent(
+            strict_tenancy=False, name="bank", prompt="p", provider=llm, state_store=state
+        )
         a = await agent.run("What is my balance?", tenant_id="tenantA", idempotency_key="req-42")
         b = await agent.run("What is my balance?", tenant_id="tenantB", idempotency_key="req-42")
         assert a.run_id != b.run_id
@@ -75,14 +77,22 @@ class TestTenantIdempotency:
         assert llm.calls_made == 2
 
     async def test_different_input_in_another_tenant_is_not_a_conflict(self, state: Any) -> None:
-        agent = Agent(name="bank", prompt="p", provider=_answers("a", "b"), state_store=state)
+        agent = Agent(
+            strict_tenancy=False,
+            name="bank",
+            prompt="p",
+            provider=_answers("a", "b"),
+            state_store=state,
+        )
         await agent.run("q1", tenant_id="tenantA", idempotency_key="k")
         result = await agent.run("something else", tenant_id="tenantB", idempotency_key="k")
         assert result.answer == "b"
 
     async def test_same_tenant_replay_returns_the_cached_run(self, state: Any) -> None:
         llm = _answers("00000000000000000000000111", "never")
-        agent = Agent(name="bank", prompt="p", provider=llm, state_store=state)
+        agent = Agent(
+            strict_tenancy=False, name="bank", prompt="p", provider=llm, state_store=state
+        )
         first = await agent.run("q", tenant_id="t1", idempotency_key="k")
         again = await agent.run("q", tenant_id="t1", idempotency_key="k")
         assert again.run_id == first.run_id
@@ -90,7 +100,13 @@ class TestTenantIdempotency:
         assert llm.calls_made == 1
 
     async def test_same_tenant_conflict_names_the_run(self, state: Any) -> None:
-        agent = Agent(name="bank", prompt="p", provider=_answers("x", "y"), state_store=state)
+        agent = Agent(
+            strict_tenancy=False,
+            name="bank",
+            prompt="p",
+            provider=_answers("x", "y"),
+            state_store=state,
+        )
         first = await agent.run("q", tenant_id="t1", idempotency_key="k")
         with pytest.raises(IdempotencyConflictError) as caught:
             await agent.run("other", tenant_id="t1", idempotency_key="k")
@@ -316,7 +332,14 @@ class TestEventAllocation:
         llm = ScriptedLLM(
             [tool_calls(("a", {"x": 1}, "p1"), ("b", {"x": 2}, "p2")), LLMResponse(text="ok")]
         )
-        agent = Agent(name="o", prompt="p", tools=[a, b], provider=llm, state_store=state)
+        agent = Agent(
+            strict_tenancy=False,
+            name="o",
+            prompt="p",
+            tools=[a, b],
+            provider=llm,
+            state_store=state,
+        )
         seen: list[int] = []
         stop = asyncio.Event()
 
@@ -427,7 +450,11 @@ class TestNoteCap:
 
         paused = await _pause("client", state, "t1")
         agent = Agent(
-            provider=MockLLM([]), prompt="p", state_store=state, limits=Limits(max_notes_per_run=2)
+            strict_tenancy=False,
+            provider=MockLLM([]),
+            prompt="p",
+            state_store=state,
+            limits=Limits(max_notes_per_run=2),
         )
         await agent.submit_note(paused.run_id, "one", tenant_id="t1")
         await agent.submit_note(paused.run_id, "two", tenant_id="t1")
@@ -601,7 +628,13 @@ class TestRunStoreScoping:
 
 class TestRetryNotFound:
     async def test_missing_and_foreign_raise_the_same_error(self, state: Any) -> None:
-        agent = Agent(name="a", prompt="p", provider=_answers("x", "y", "z"), state_store=state)
+        agent = Agent(
+            strict_tenancy=False,
+            name="a",
+            prompt="p",
+            provider=_answers("x", "y", "z"),
+            state_store=state,
+        )
         done = await agent.run("q", tenant_id="A")
         assert done.status == RunStatus.SUCCESS
         with pytest.raises(RunNotFoundError) as missing:

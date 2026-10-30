@@ -120,6 +120,7 @@ async def _count_runs(url: str) -> int:
 
 def _agent(url: str | None = None) -> Agent:
     kwargs: dict[str, Any] = {"database_url": url} if url else {}
+    kwargs.setdefault("strict_tenancy", False)
     return Agent(
         name="schema-check",
         prompt="Test.",
@@ -225,27 +226,18 @@ async def test_empty_database_still_says_not_initialized(pg_url: str) -> None:
         await agent.close()
 
 
-async def test_env_var_path_does_not_cache_a_failed_engine(
+async def test_env_var_path_is_refused_before_engine_acquisition(
     pg_url: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    await _build_previous_schema(pg_url)
     monkeypatch.setenv("DENDRUX_DATABASE_URL", pg_url)
-    await db_session.reset_engine()
     agent = _agent()
     try:
-        with pytest.raises(SchemaOutOfDateError):
+        with pytest.raises(ValueError, match="state_store=.*database_url="):
             await agent.run("hi")
-        assert db_session._engine is None
-
-        engine = _admin(pg_url)
-        async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.drop_all)
-        await engine.dispose()
-        await _build_current_schema(pg_url)
-        assert (await agent.run("hi")).answer == "ok"
+        assert agent._lazy_store is None
+        assert agent._private_engine is None
     finally:
         await agent.close()
-        await db_session.reset_engine()
 
 
 async def test_run_store_is_not_checked_and_reads_view_backed_tables(pg_url: str) -> None:

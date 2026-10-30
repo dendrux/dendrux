@@ -37,6 +37,7 @@ def _make_agent(**overrides) -> Agent:
         "loop": SingleCall(),
     }
     defaults.update(overrides)
+    defaults.setdefault("strict_tenancy", False)
     return Agent(**defaults)
 
 
@@ -490,6 +491,7 @@ class TestSingleCallRunnerIntegration:
         store = RecordingStore()
         llm = MockLLM([_response("neutral")])
         agent = Agent(
+            strict_tenancy=False,
             provider=llm,
             loop=SingleCall(),
             prompt="Classify.",

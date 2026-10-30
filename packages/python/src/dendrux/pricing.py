@@ -23,8 +23,6 @@ missing entry never masquerades as a free call.
 
 from __future__ import annotations
 
-import warnings
-import weakref
 from dataclasses import dataclass, replace
 from fnmatch import fnmatchcase
 from typing import TYPE_CHECKING, Literal
@@ -240,8 +238,6 @@ def check_budget_config(agent: Agent, *, model: str | None = None) -> None:
     budget = agent.budget
     if budget is None:
         return
-    if budget.max_tokens is not None and budget.count_cache_tokens is None:
-        _warn_cache_tokens_not_chosen(agent)
     if budget.max_cost_usd is None:
         return
     provider = agent.provider
@@ -255,32 +251,6 @@ def check_budget_config(agent: Agent, *, model: str | None = None) -> None:
     from dendrux.errors import BudgetConfigurationError
 
     raise BudgetConfigurationError(model=requested or None, reason="unpriced_model")
-
-
-_checked_agents: weakref.WeakSet[Agent] = weakref.WeakSet()
-
-
-def _warn_cache_tokens_not_chosen(agent: Agent) -> None:
-    """Warn when an Agent is built with a token budget that did not choose (B17).
-
-    ``FutureWarning`` so it shows by default; the warnings module dedups per
-    call site. Only the first check of an Agent (its construction) warns, and
-    ``stacklevel=4`` (helper, ``check_budget_config``, ``Agent.__init__``) points at
-    the ``Agent(...)`` line.
-    """
-    try:
-        if agent in _checked_agents:
-            return
-        _checked_agents.add(agent)
-    except TypeError:  # unhashable Agent subclass
-        return
-    warnings.warn(
-        "Budget(max_tokens=...) did not choose count_cache_tokens. Cache read and write "
-        "tokens do not count toward max_tokens today; from 0.6 they will. Choose explicitly "
-        "with Budget(count_cache_tokens=True) (and raise max_tokens) or count_cache_tokens=False.",
-        FutureWarning,
-        stacklevel=4,
-    )
 
 
 def _is_glob(key: str) -> bool:

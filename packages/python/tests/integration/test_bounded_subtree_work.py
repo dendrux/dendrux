@@ -87,7 +87,7 @@ async def test_budget_rollup_fails_closed_at_traversal_bound(store, engine, capl
 
 async def test_cascade_signals_pages_before_reading_next_page(store, engine, monkeypatch):
     await seed_tree(store)
-    agent = Agent(prompt="p", state_store=store)
+    agent = Agent(strict_tenancy=False, prompt="p", state_store=store)
     pages = []
     signals = []
     from collections import Counter

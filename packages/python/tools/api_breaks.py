@@ -31,7 +31,7 @@ HERE = Path(__file__).resolve().parent
 DEFAULT_ALLOWLIST = HERE / "api_break_allowlist.json"
 DEFAULT_REPO = HERE.parents[2]
 DEFAULT_SEARCH_PATH = "packages/python/src"
-DEFAULT_AGAINST = "v0.4.1"
+DEFAULT_AGAINST = "v0.5.0"
 _B_ITEM = re.compile(r"^B\d+$")
 
 

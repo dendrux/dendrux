@@ -49,6 +49,7 @@ def _mock(responses: list[LLMResponse]) -> MockLLM:
 
 
 def _agent(store: Any, responses: list[LLMResponse], **kw: Any) -> Agent:
+    kw.setdefault("strict_tenancy", False)
     return Agent(
         name="screen_agent",
         prompt="You read screenshots.",
@@ -224,6 +225,7 @@ async def test_v030_text_pause_resumes_unchanged(engine: Any) -> None:
     """A text-only pause has no image keys and resumes exactly as in v0.3.0."""
     store = SQLAlchemyStateStore(engine)
     agent = Agent(
+        strict_tenancy=False,
         name="screen_agent",
         prompt="p",
         provider=MockLLM(
@@ -238,6 +240,7 @@ async def test_v030_text_pause_resumes_unchanged(engine: Any) -> None:
     assert all("parts" not in m for m in pause["history"])
     call_id = pause["pending_tool_calls"][0]["id"]
     agent2 = Agent(
+        strict_tenancy=False,
         name="screen_agent",
         prompt="p",
         provider=MockLLM([LLMResponse(text="done")]),
@@ -270,7 +273,7 @@ async def test_recorder_gets_provider_for_token_estimates(engine: Any) -> None:
         model="claude-sonnet-4-6",
         image_support="yes",  # type: ignore[call-arg]
     )
-    agent = Agent(name="a", prompt="p", provider=provider, state_store=store)
+    agent = Agent(strict_tenancy=False, name="a", prompt="p", provider=provider, state_store=store)
     result = await agent.run(["What does this say?", Image.from_bytes(PNG)])
     llm = await store.get_llm_interactions(result.run_id)  # type: ignore[attr-defined]
     assert llm[0].semantic_request["image_stats"] == {

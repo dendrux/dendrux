@@ -496,7 +496,7 @@ async def test_client_dispatch_rechecks_lowered_cap(store):
 
 
 @pytest.mark.parametrize("streaming", [False, True])
-async def test_governance_warning_points_to_public_call_site(store, streaming):
+async def test_explicit_governance_warn_has_no_future_warning(store, streaming):
     from dendrux import Limits
 
     a = agent(store, [tool_call("client_read", pid="a")], limits=Limits(max_tool_result_bytes=100))
@@ -508,6 +508,7 @@ async def test_governance_warning_points_to_public_call_site(store, streaming):
         state_store=store,
         provider=ScriptedLLM([LLMResponse(text="done")]),
         strict_tenancy=False,
+        on_governance_change="warn",
     )
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always", FutureWarning)
@@ -522,4 +523,4 @@ async def test_governance_warning_points_to_public_call_site(store, streaming):
         else:
             await b.submit_tool_results(paused.run_id, [result_for(paused)])
     changed = [w for w in caught if "Changed governance" in str(w.message)]
-    assert len(changed) == 1 and changed[0].filename == __file__
+    assert not changed

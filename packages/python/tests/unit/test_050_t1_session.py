@@ -28,29 +28,24 @@ async def test_reinitialize_error_masks_passwords(monkeypatch: pytest.MonkeyPatc
     assert "***" in message
 
 
-async def test_env_store_warning_points_at_the_caller(
+async def test_env_store_requires_explicit_configuration(
     tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("DENDRUX_DATABASE_URL", f"sqlite+aiosqlite:///{tmp_path / 'env.db'}")
-    await session.reset_engine()
-    try:
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("default")
-            for _ in range(2):
-                agent = Agent(provider=MockLLM([LLMResponse(text="ok")]), prompt="p")
-                assert (await agent.run("hi", tenant_id=None)).answer == "ok"
-        deprecations = [w for w in caught if issubclass(w.category, DeprecationWarning)]
-        assert len(deprecations) == 1  # deduplicated per location by `warnings`
-        assert deprecations[0].filename == __file__
-        assert "state_store=" in str(deprecations[0].message)
-    finally:
-        await session.reset_engine()
+    agent = Agent(provider=MockLLM([]), prompt="p")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with pytest.raises(ValueError, match="state_store=.*database_url="):
+            await agent.run("hi", tenant_id=None)
+    assert not caught
+    assert session._engine is None
 
 
 async def test_explicit_store_does_not_warn(tmp_path: Any) -> None:
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         agent = Agent(
+            strict_tenancy=False,
             provider=MockLLM([LLMResponse(text="ok")]),
             prompt="p",
             database_url=f"sqlite+aiosqlite:///{tmp_path / 'own.db'}",

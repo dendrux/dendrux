@@ -207,26 +207,6 @@ def _record_to_run_result(record: Any) -> RunResult:
     )
 
 
-def _warn_env_store_deprecated() -> None:
-    """B6 ``DeprecationWarning`` for the implicit DENDRUX_DATABASE_URL store.
-
-    Deduplicated by ``warnings`` per caller location; ``stacklevel`` points at
-    the code that called the Agent method (this function,
-    ``_resolve_state_store``, the Agent method).
-    """
-    import warnings
-
-    warnings.warn(
-        "Agent found no state_store or database_url and fell back to DENDRUX_DATABASE_URL. "
-        "This implicit store is deprecated and is removed in dendrux 0.6. Create one state "
-        "store per process (for example at app startup: "
-        "SQLAlchemyStateStore(create_async_engine(url))) and pass state_store= to every "
-        "Agent. Explicit database_url Agents share a reference-counted pool per URL and options.",
-        DeprecationWarning,
-        stacklevel=4,
-    )
-
-
 async def _verify_schema_initialized(engine: AsyncEngine, url: str) -> None:
     """Fail fast with setup guidance if a non-SQLite database has no tables.
 
@@ -476,10 +456,10 @@ class Agent:
         before_tool: BeforeToolHook | None = None,
         images: ImagePolicy | None = None,
         blob_store: BlobStore | None = None,
-        strict_tenancy: bool | _UnsetType = _UNSET,
+        strict_tenancy: bool = True,
         limits: Limits | None = None,
         tool_threads: int = 8,
-        on_governance_change: Literal["warn", "raise"] | _UnsetType = _UNSET,
+        on_governance_change: Literal["warn", "raise"] = "raise",
         lease_interval: timedelta = timedelta(seconds=30),
     ) -> None:
         # --- Subclass guard: block class-level provider ---
@@ -605,11 +585,7 @@ class Agent:
             raise ValueError(
                 "database_url and state_store are mutually exclusive. Pass one or the other."
             )
-        if (
-            database_options is not None
-            and database_url is None
-            and not os.environ.get("DENDRUX_DATABASE_URL")
-        ):
+        if database_options is not None and database_url is None:
             raise ValueError("database_options requires database_url.")
 
         self._database_url = database_url
@@ -624,24 +600,16 @@ class Agent:
 
     def _configure_trust(
         self,
-        strict_tenancy: bool | _UnsetType,
+        strict_tenancy: bool,
         limits: Limits | None,
         tool_threads: int,
-        on_governance_change: Literal["warn", "raise"] | _UnsetType,
+        on_governance_change: Literal["warn", "raise"],
     ) -> None:
         """Validate and retain the per-Agent governance policy."""
         # --- Trust (0.5.0): stored here, enforced by the runtime checks ---
         from dendrux.tools._lookups import make_call_limiter
         from dendrux.types import Limits as _Limits
 
-        # "Not chosen" is kept apart from an explicit False / "warn": the 0.6
-        # default flips warn only developers who did not choose.
-        self._strict_tenancy_chosen: bool = not isinstance(strict_tenancy, _UnsetType)
-        self._on_governance_change_chosen: bool = not isinstance(on_governance_change, _UnsetType)
-        if isinstance(strict_tenancy, _UnsetType):
-            strict_tenancy = False
-        if isinstance(on_governance_change, _UnsetType):
-            on_governance_change = "warn"
         if not isinstance(strict_tenancy, bool):
             raise ValueError(f"Agent '{self.name}' strict_tenancy must be a bool.")
         if limits is not None and not isinstance(limits, _Limits):
@@ -1176,13 +1144,9 @@ class Agent:
         Resolution order:
           1. Explicit state_store from constructor → returned as-is
           2. database_url from constructor → reference-counted shared engine
-          3. DENDRUX_DATABASE_URL env var → shared global engine
-          4. None (ephemeral mode)
+          3. None (ephemeral mode), unless DENDRUX_DATABASE_URL requires migration
 
-        Ownership rule:
-          - Explicit database_url acquires a shared reference released by close().
-          - Env-var path uses the shared singleton from get_engine() — NOT
-            owned by this agent, NOT disposed by close().
+        Explicit database_url acquires a shared reference released by close().
         """
         if self._state_store is not None:
             return self._state_store
@@ -1219,14 +1183,11 @@ class Agent:
             assert self._lazy_store is not None
             return self._lazy_store
 
-        env_url = os.environ.get("DENDRUX_DATABASE_URL")
-        if env_url is not None:
-            _warn_env_store_deprecated()
-            engine = await _get_env_engine(env_url, self._database_options)
-            if not was_verified(engine):
-                await _verify_schema_initialized(engine, env_url)
-            self._lazy_store = SQLAlchemyStateStore(engine, **self._store_options)
-            return self._lazy_store
+        if os.environ.get("DENDRUX_DATABASE_URL") is not None:
+            raise ValueError(
+                "Implicit DENDRUX_DATABASE_URL persistence was removed in dendrux 0.6. "
+                "Pass state_store= or database_url= explicitly."
+            )
 
         return None
 
@@ -1359,8 +1320,8 @@ class Agent:
                 with this key already exists and completed, the cached result is
                 returned. If still active, RunAlreadyActiveError is raised. If the
                 same key is reused with different input, IdempotencyConflictError
-                is raised. Requires persistence (database_url, state_store, or
-                DENDRUX_DATABASE_URL). The hash includes ``history``, ``context``
+                is raised. Requires persistence (database_url or state_store).
+                The hash includes ``history``, ``context``
                 and the ``runs`` / ``replay_last`` / ``replay_reasoning`` knobs —
                 same input with a different prefix is a different request.
             **kwargs: Forwarded to the LLM provider. Pass ``model=`` to override
@@ -1436,8 +1397,8 @@ class Agent:
 
         if idempotency_key is not None and store is None:
             raise ValueError(
-                "idempotency_key requires persistence (database_url, state_store, "
-                "or DENDRUX_DATABASE_URL). Idempotency cannot work without durable state."
+                "idempotency_key requires persistence (database_url or state_store). "
+                "Idempotency cannot work without durable state."
             )
 
         from dendrux.runtime.runner import run as runner_run
@@ -1518,8 +1479,8 @@ class Agent:
 
         if store is None:
             raise ValueError(
-                "retry() requires persistence (database_url, state_store, "
-                "or DENDRUX_DATABASE_URL). Retry reads traces from the original run."
+                "retry() requires persistence (database_url or state_store). "
+                "Retry reads traces from the original run."
             )
 
         from dendrux.runtime.runner import retry as runner_retry
@@ -1593,9 +1554,10 @@ class Agent:
             expected_pause_id: Current pause generation; stale submissions are rejected.
             notifier: Optional additional loop notifier. Composed with
                 PersistenceRecorder internally.
-            tenant_id: Omitted = no tenant check. Otherwise the run must belong
-                to this tenant (``None`` = untenanted) or ``RunNotFoundError``
-                is raised before anything is written.
+            tenant_id: Required for agents with persistence under strict tenancy
+                (the default). The run must
+                belong to this tenant (``None`` = untenanted), otherwise
+                ``RunNotFoundError`` is raised before anything is written.
 
         Returns:
             RunResult with updated status.
@@ -1706,12 +1668,14 @@ class Agent:
                 ``ToolResult.images`` are validated and stored before the claim; an image error
                 (``ImageError``, ``UnsupportedModalityError``) raises with the
                 run still waiting.
-            expected_pause_id: Current pause generation; required when approving.
-                Stale or missing approval generations are rejected before claiming.
+            expected_pause_id: Current pause generation; required under strict
+                tenancy and for approval. Missing or stale tokens are rejected
+                before claiming.
             notifier: Optional additional notifier composed during resume.
-            tenant_id: Omitted = no tenant check. Otherwise the run must belong
-                to this tenant (``None`` = untenanted) or ``RunNotFoundError``
-                is raised before anything is written.
+            tenant_id: Required for agents with persistence under strict tenancy
+                (the default). The run must
+                belong to this tenant (``None`` = untenanted), otherwise
+                ``RunNotFoundError`` is raised before anything is written.
 
         Returns:
             :class:`RunResult` from the resumed loop.
@@ -1811,12 +1775,14 @@ class Agent:
             run_id: A run in status ``WAITING_HUMAN_INPUT``.
             text: The user's clarification answer: a string, or strings and
                 images (ingested before the claim).
-            expected_pause_id: Current pause generation; required when approving.
-                Stale or missing approval generations are rejected before claiming.
+            expected_pause_id: Current pause generation; required under strict
+                tenancy and for approval. Missing or stale tokens are rejected
+                before claiming.
             notifier: Optional additional notifier composed during resume.
-            tenant_id: Omitted = no tenant check. Otherwise the run must belong
-                to this tenant (``None`` = untenanted) or ``RunNotFoundError``
-                is raised before anything is written.
+            tenant_id: Required for agents with persistence under strict tenancy
+                (the default). The run must
+                belong to this tenant (``None`` = untenanted), otherwise
+                ``RunNotFoundError`` is raised before anything is written.
 
         Raises:
             PersistenceNotConfiguredError, RunNotFoundError (also when
@@ -1927,12 +1893,14 @@ class Agent:
             approved: Whole-batch decision.
             decisions: Per-call decisions keyed by tool call id.
             rejection_reason: Reason used with ``approved=False``.
-            expected_pause_id: Current pause generation; required when approving.
-                Stale or missing approval generations are rejected before claiming.
+            expected_pause_id: Current pause generation; required under strict
+                tenancy and for approval. Missing or stale tokens are rejected
+                before claiming.
             notifier: Optional additional notifier composed during resume.
-            tenant_id: Omitted = no tenant check. Otherwise the run must belong
-                to this tenant (``None`` = untenanted) or ``RunNotFoundError``
-                is raised before anything is written.
+            tenant_id: Required for agents with persistence under strict tenancy
+                (the default). The run must
+                belong to this tenant (``None`` = untenanted), otherwise
+                ``RunNotFoundError`` is raised before anything is written.
 
         Raises:
             ValueError: invalid argument combination or decision ids.
@@ -2534,12 +2502,14 @@ class Agent:
 
         Args:
             run_id: A run in status ``PAUSED``.
-            expected_pause_id: Current pause generation; required when approving.
-                Stale or missing approval generations are rejected before claiming.
+            expected_pause_id: Current pause generation; required under strict
+                tenancy and for approval. Missing or stale tokens are rejected
+                before claiming.
             notifier: Optional additional notifier composed during resume.
-            tenant_id: Omitted = no tenant check. Otherwise the run must belong
-                to this tenant (``None`` = untenanted) or ``RunNotFoundError``
-                is raised before anything is written.
+            tenant_id: Required for agents with persistence under strict tenancy
+                (the default). The run must
+                belong to this tenant (``None`` = untenanted), otherwise
+                ``RunNotFoundError`` is raised before anything is written.
 
         Raises:
             PersistenceNotConfiguredError, RunNotFoundError (also when
@@ -2914,9 +2884,10 @@ class Agent:
             user_input: Clarification answer (human-in-the-loop runs).
             expected_pause_id: Current pause generation; stale submissions are rejected.
             notifier: Optional additional loop notifier.
-            tenant_id: Omitted = no tenant check. Otherwise the run must belong
-                to this tenant (``None`` = untenanted) or ``RunNotFoundError``
-                is raised before anything is written.
+            tenant_id: Required for agents with persistence under strict tenancy
+                (the default). The run must
+                belong to this tenant (``None`` = untenanted), otherwise
+                ``RunNotFoundError`` is raised before anything is written.
 
         Returns:
             RunStream — async iterable of RunEvent objects.
@@ -3352,9 +3323,6 @@ class Agent:
         """Close MCP sources, provider, and agent-owned engine.
 
         Releases this Agent's shared engine reference for an explicit database_url.
-        The shared global engine (from DENDRUX_DATABASE_URL env var) is NOT
-        owned by this agent and is left untouched.
-
         Use ``MCPHost`` when sharing MCP sources across agents; its leases are
         safe to close per agent and the host remains application-owned. A
         directly shared ``MCPServer`` is not safe to close per request.
@@ -3419,12 +3387,3 @@ class Agent:
             f"Agent(name={self.name!r}, model={self.model!r}, "
             f"tools={len(self.tools)}, max_iterations={self.max_iterations})"
         )
-
-
-async def _get_env_engine(url: str, options: dict[str, Any]) -> AsyncEngine:
-    """Retain the legacy singleton call shape when no options were configured."""
-    from dendrux.db.session import get_engine
-
-    if options:
-        return await get_engine(url, database_options=options)
-    return await get_engine(url)
