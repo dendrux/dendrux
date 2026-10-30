@@ -19,7 +19,7 @@ concurrency:
 jobs:
   load-quick:
     name: load-quick (ubuntu-24.04, postgres 16)
-    # Pinned runner image; the public-repo standard runner is a 4 vCPU / 16 GB machine.
+    # OS label fixed to Ubuntu 24.04, 4 vCPU / 16 GB class; GitHub rotates the image.
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     defaults:
@@ -28,8 +28,7 @@ jobs:
 
     services:
       postgres:
-        # Pin the digest at release time: image: postgres:16-alpine@sha256:<digest>
-        image: postgres:16-alpine
+        image: postgres:16-alpine@sha256:0cefaabd882e42bcb2a2f3dc56d3ce4770560ba62fd7f197f1a2e008fd5731ab
         env:
           POSTGRES_USER: dendrux
           POSTGRES_PASSWORD: dendrux
@@ -51,6 +50,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Record runner and service image
+        run: |
+          echo "Runner image: $ImageOS $ImageVersion"
+          uname -a
+          lscpu
+          free -b
+          docker image inspect postgres:16-alpine@sha256:0cefaabd882e42bcb2a2f3dc56d3ce4770560ba62fd7f197f1a2e008fd5731ab --format '{{json .RepoDigests}}'
 
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:

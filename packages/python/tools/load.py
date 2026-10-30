@@ -19,8 +19,8 @@ one-tool iteration), ``runs`` (concurrent runs), ``kill_checkpoint`` and ``kill_
 ``pool`` (pool exhaustion), ``history`` (a near-16 MiB history resumed in a new process)
 and ``memory`` (repeated cycles in one process).
 
-The script also runs against a v0.5.0 checkout (scenario ``a`` only): point PYTHONPATH at
-that checkout's ``src``.
+The script also runs against a v0.5.0 checkout (``a``, ``runs``, ``pool``, ``history``):
+point PYTHONPATH at that checkout's ``src``.
 """
 
 from __future__ import annotations
@@ -59,7 +59,7 @@ POOL = {"pool_size": 10, "max_overflow": 5, "pool_timeout": 120, "pool_pre_ping"
 POOL_CEILING = POOL["pool_size"] + POOL["max_overflow"]
 CHANNEL = "dendrux_events"
 SAMPLE_INTERVAL_S = 0.01
-BIG_CHARS = 900_000  # one tool result, under the 1 MiB default cap
+BIG_CHARS = 985_000  # 17 results put the full history just below the 16 MiB rebuild bound
 V050_REFERENCE_A = 59.0  # recorded 2026-10-27, commit dca4f05e (owner-docs load-test-results.md)
 
 LABEL: ContextVar[str] = ContextVar("load_label", default="other")
@@ -125,7 +125,7 @@ ALL_SCENARIOS = [
     "history",
     "memory",
 ]
-QUICK_SCENARIOS = ALL_SCENARIOS  # the quick preset shrinks sizes, not the list
+LEGACY_SCENARIOS = ["a", "runs", "pool", "history"]  # runnable on a v0.5.0 checkout
 
 
 # ---------------------------------------------------------------------------
@@ -316,6 +316,29 @@ def rss_kb() -> int:
     statm = Path("/proc/self/statm")
     if statm.exists():
         return int(statm.read_text().split()[1]) * (os.sysconf("SC_PAGE_SIZE") // 1024)
+    if sys.platform == "darwin":
+        import ctypes
+
+        class TaskInfo(ctypes.Structure):
+            _fields_ = [
+                ("virtual_size", ctypes.c_uint64),
+                ("resident_size", ctypes.c_uint64),
+                ("resident_size_max", ctypes.c_uint64),
+                ("user_time", ctypes.c_int * 2),
+                ("system_time", ctypes.c_int * 2),
+                ("policy", ctypes.c_int),
+                ("suspend_count", ctypes.c_int),
+            ]
+
+        lib = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+        lib.mach_task_self.restype = ctypes.c_uint
+        info = TaskInfo()
+        count = ctypes.c_uint(ctypes.sizeof(info) // ctypes.sizeof(ctypes.c_int))
+        # MACH_TASK_BASIC_INFO reports current RSS; ru_maxrss is a lifetime peak.
+        result = lib.task_info(lib.mach_task_self(), 20, ctypes.byref(info), ctypes.byref(count))
+        if result:
+            raise OSError(f"task_info failed with Mach status {result}")
+        return info.resident_size // 1024
     out = subprocess.run(
         ["ps", "-o", "rss=", "-p", str(os.getpid())], capture_output=True, text=True
     )
@@ -418,26 +441,26 @@ def make_tools(state: dict[str, Any]) -> dict[str, Any]:
         """Read on the client."""
         raise AssertionError("client tool executed on the server")
 
-    out: dict[str, Any] = {"client_read": client_read}
-    if "idempotent" in inspect.signature(tool).parameters:
+    # `idempotent=` arrived in 0.6; the same tools run on a 0.5 checkout without it.
+    kwargs: dict[str, Any] = (
+        {"idempotent": True} if "idempotent" in inspect.signature(tool).parameters else {}
+    )
 
-        @tool(idempotent=True)
-        async def work() -> str:
-            """Perform one bounded server operation."""
-            state["effects"] = state.get("effects", 0) + 1
-            gate = state.get("work_gate")
-            if gate is not None:
-                await gate()
-            return "ok"
+    @tool(**kwargs)
+    async def work() -> str:
+        """Perform one bounded server operation."""
+        state["effects"] = state.get("effects", 0) + 1
+        gate = state.get("work_gate")
+        if gate is not None:
+            await gate()
+        return "ok"
 
-        @tool(idempotent=True)
-        async def big_work() -> str:
-            """Return one large payload."""
-            return big
+    @tool(**kwargs)
+    async def big_work() -> str:
+        """Return one large payload."""
+        return big
 
-        out["work"] = work
-        out["big_work"] = big_work
-    return out
+    return {"client_read": client_read, "work": work, "big_work": big_work}
 
 
 _BIG: str | None = None
@@ -628,7 +651,7 @@ async def w_runs(ctx: Ctx) -> dict[str, Any]:
         nonlocal parked
         parked += 1
         if parked == len(keys):
-            ctx.send("parked", len(keys))
+            ctx.send("parked", {"runs": len(keys), "meter": meter.snapshot()})
         await forever.wait()
 
     async def hook(key: str, n_tool: int) -> None:
@@ -828,6 +851,7 @@ async def w_iteration(ctx: Ctx) -> dict[str, Any]:
                 agent = Agent(
                     **agent_kwargs(tools=[tools["work"]], provider=llm, state_store=store)
                 )
+                t0 = time.perf_counter()
                 if streaming:
                     async with agent.stream(f"go {name}-{r}", notifier=Observer(phase)) as stream:
                         events = [e async for e in stream]
@@ -845,6 +869,7 @@ async def w_iteration(ctx: Ctx) -> dict[str, Any]:
                             k: v - before_op.get(k, 0) for k, v in meter.by_label_op.items()
                         },
                         "model_calls": llm.calls,
+                        "wall_ms": (time.perf_counter() - t0) * 1000,
                     }
                 )
                 await agent.close()
@@ -928,6 +953,8 @@ async def followers_round(
     mark = meter.n
     got: dict[tuple[str, int], list[int]] = collections.defaultdict(list)
     lags: list[float] = []
+    lags_trickle: list[float] = []
+    trickle_set: set[str] = set()
     progress_start = [float("inf")]
     ends: collections.Counter[str] = collections.Counter()
     caught_up = asyncio.Event()
@@ -954,7 +981,8 @@ async def followers_round(
                     seqs.append(item.sequence_index)
                     created = _ts(getattr(item, "created_at", None))
                     if created >= progress_start[0]:
-                        lags.append((time.time() - created) * 1000)
+                        bucket = lags_trickle if key in trickle_set else lags
+                        bucket.append((time.time() - created) * 1000)
                     if not done_attach and item.sequence_index >= target:
                         done_attach = True
                         remaining[0] -= 1
@@ -994,12 +1022,8 @@ async def followers_round(
         "kinds": (meter.kinds - kinds_before).most_common(5),
     }
 
-    # 4. progression: resume every run while followers watch
-    meter.override = "progress"
-    mark = meter.n
-    progress_start[0] = time.time()
-    t0 = time.perf_counter()
-
+    # 4a. trickle: a few runs resume one at a time with every follower attached and the pool
+    # otherwise idle. This isolates the wake latency from queueing behind the burst below.
     async def finish(key: str) -> None:
         paused = pause[key]
         call = paused.pending.tool_calls[0]
@@ -1009,7 +1033,22 @@ async def followers_round(
             expected_pause_id=paused.pause_id,
         )
 
-    await asyncio.gather(*(finish(k) for k in keys))
+    trickle = keys[: min(10, len(keys) // 10)]
+    burst = keys[len(trickle) :]
+    trickle_set.update(trickle)
+    progress_start[0] = time.time()
+    meter.override = "trickle"
+    mark = meter.n
+    for key in trickle:
+        await finish(key)
+        await asyncio.sleep(0.3)
+    result["trickle"] = {"statements": meter.n - mark, "runs": len(trickle)}
+
+    # 4b. burst: resume every other run at once while followers watch
+    meter.override = "progress"
+    mark = meter.n
+    t0 = time.perf_counter()
+    await asyncio.gather(*(finish(k) for k in burst))
     submit_wall = time.perf_counter() - t0
     try:
         await asyncio.wait_for(asyncio.gather(*tasks), timeout=300)
@@ -1021,6 +1060,7 @@ async def followers_round(
         await asyncio.gather(*tasks, return_exceptions=True)
     result["progress"] = {
         "statements": meter.n - mark,
+        "runs": len(burst),
         "submit_wall_s": submit_wall,
         "drain_wall_s": time.perf_counter() - t0,
         "all_followers_ended": drained,
@@ -1044,6 +1084,7 @@ async def followers_round(
     }
     result["lag_ms"] = lat_summary(lags)
     result["lag_raw"] = lags
+    result["lag_trickle_raw"] = lags_trickle
     await book.close()
     await agent.close()
     await feed.aclose()
@@ -1169,12 +1210,23 @@ async def w_cancel(ctx: Ctx) -> dict[str, Any]:
                 .where(AgentRun.id.in_(ids), AgentRun.status != "cancelled")
             )
         ).scalar_one()
+        unmarked = (
+            await conn.execute(
+                select(func.count())
+                .select_from(AgentRun)
+                .where(
+                    AgentRun.cancel_requested.is_(False),
+                    AgentRun.status.not_in(("success", "error", "cancelled", "max_iterations")),
+                )
+            )
+        ).scalar_one()
     meta = getattr(result, "meta", None) or {}
     out = {
         "nodes": len(ids),
         "wall_s": wall,
         "cancel_statements": meter.by_label["cancel"],
         "seeded_not_cancelled": seeded_open,
+        "nodes_without_cancel_request": unmarked,
         "status_counts": status_counts,
         "cascade_truncated": bool(meta.get("cascade_truncated")),
         "cascade_entries": len(meta.get("cascade", [])),
@@ -1377,6 +1429,7 @@ async def w_memory(ctx: Ctx) -> dict[str, Any]:
     ctx.send("ready")
     ctx.pipe.recv()
     for c in range(ctx.p["cycles"]):
+        t0 = time.perf_counter()
         async with admin.connect() as conn:
             await conn.execute(text(f"TRUNCATE TABLE {tables} RESTART IDENTITY CASCADE"))
         keys = [key_of(i) for i in range(ctx.p["runs"])]
@@ -1389,6 +1442,7 @@ async def w_memory(ctx: Ctx) -> dict[str, Any]:
         cycles.append(
             {
                 "cycle": c + 1,
+                "wall_ms": (time.perf_counter() - t0) * 1000,
                 "rss_kb": rss_kb(),
                 "fds": fd_count(),
                 "gc_objects": len(gc.get_objects()),
@@ -1613,7 +1667,12 @@ async def db_counters(url: str) -> dict[str, Any]:
             " where c.relkind = 'r' and n.nspname = 'public') size "
             "from pg_stat_database where datname = current_database()"
         )
-        return dict(row)
+        sizes = await conn.fetch(
+            "select c.relname, pg_total_relation_size(c.oid)::bigint size from pg_class c "
+            "join pg_namespace n on n.oid = c.relnamespace "
+            "where c.relkind = 'r' and n.nspname = 'public'"
+        )
+        return {**dict(row), "sizes": {r["relname"]: r["size"] for r in sizes}}
     finally:
         await conn.close()
 
@@ -1781,6 +1840,16 @@ class Measured:
             "tuples_inserted": self.after["ins"] - self.before["ins"],
             "tuples_updated": self.after["upd"] - self.before["upd"],
             "deadlocks": self.after["deadlocks"] - self.before["deadlocks"],
+            "growth_by_table": dict(
+                sorted(
+                    (
+                        (t, v - self.before["sizes"].get(t, 0))
+                        for t, v in self.after["sizes"].items()
+                        if v - self.before["sizes"].get(t, 0) > 0
+                    ),
+                    key=lambda kv: -kv[1],
+                )[:6]
+            ),
             **self.samples,
         }
 
@@ -1931,11 +2000,18 @@ async def ctl_iteration(url: str, cfg: dict[str, Any], workers: int) -> Outcome:
                 max(phases.get("iteration_1", [0])), max(phases.get("iteration_2", [0]))
             ),
             "model_calls": last["model_calls"],
+            "latency_ms": lat_summary([r["wall_ms"] for r in runs]),
             "by_operation_iteration_2": dict(per_op_last.get("iteration_2", {})),
             "by_operation_startup": dict(per_op_last.get("startup", {})),
             "by_operation_terminal": dict(per_op_last.get("terminal", {})),
         }
-    out.metrics = {"variants": variants, "server": m.server(), "wall_s": round(m.wall_s, 2)}
+    out.metrics = {
+        "variants": variants,
+        "server": m.server(),
+        "wall_s": round(m.wall_s, 2),
+        "statements": merged["statements"],
+        "app_bytes_sent": merged["bytes_sent"],
+    }
     on_batch = variants["notify_on_batch"]["max_non_terminal"]
     on_stream = variants["notify_on_stream"]["max_non_terminal"]
     out.check(
@@ -1998,7 +2074,7 @@ async def ctl_kill(url: str, cfg: dict[str, Any], workers: int, kill: str) -> Ou
     await reset_db(url)
     doomed_keys = list(range(n - k, n))
     normal_keys = list(range(n - k))
-    parked = {"seen": False, "killed_at": None}
+    parked: dict[str, Any] = {"seen": False, "killed_at": None, "meter": None}
     doomed = spawn(
         url,
         "runs",
@@ -2011,6 +2087,7 @@ async def ctl_kill(url: str, cfg: dict[str, Any], workers: int, kill: str) -> Ou
         if kind == "parked" and not parked["seen"]:
             parked["seen"] = True
             parked["killed_at"] = time.perf_counter()
+            parked["meter"] = payload["meter"]
             os.kill(h.proc.pid, signal.SIGKILL)
             h.killed = True
 
@@ -2044,7 +2121,7 @@ async def ctl_kill(url: str, cfg: dict[str, Any], workers: int, kill: str) -> Ou
         recovery_wall = time.perf_counter() - t_rec
     normal_results = [h.result for h in normal]
     rec_results = [h.result for h in rec]
-    merged = merge_meters([r["meter"] for r in normal_results])
+    merged = merge_meters([r["meter"] for r in normal_results] + [parked["meter"]])
     merged_rec = merge_meters([r["meter"] for r in rec_results])
     out.samples = {**merged["samples"], **merged_rec["samples"]}
     final = await integrity(url)
@@ -2053,6 +2130,7 @@ async def ctl_kill(url: str, cfg: dict[str, Any], workers: int, kill: str) -> Ou
     metrics = base_metrics(m, n, merged, normal)
     metrics.update(
         killed_processes=1,
+        killed_worker_statements=parked["meter"]["statements"],
         runs_in_killed_process=k,
         kill_fraction_of_runs=round(k / n, 3),
         killed_at_boundary=kill,
@@ -2064,6 +2142,7 @@ async def ctl_kill(url: str, cfg: dict[str, Any], workers: int, kill: str) -> Ou
         reclaimed=sum(r["reclaimed"] for r in rec_results),
         reclaim_ok=sum(r["ok"] for r in rec_results),
         recovery_statements=merged_rec["statements"],
+        statements_including_recovery=merged["statements"] + merged_rec["statements"],
         recovery_statements_per_reclaim=round(merged_rec["statements"] / max(1, k), 2),
         recovery_by_label=dict(merged_rec["by_label"]),
         recovery_latency_ms=lat_summary(lats(rec, "reclaim")),
@@ -2129,8 +2208,11 @@ async def ctl_followers(url: str, cfg: dict[str, Any], workers: int, notify: boo
     progress_stmts = sum(r["progress"]["statements"] for r in rounds)
     create_stmts = sum(r["create"]["statements"] for r in rounds)
     lag_raw: list[float] = []
+    lag_trickle: list[float] = []
     for r in rounds:
         lag_raw.extend(r["lag_raw"])
+        lag_trickle.extend(r["lag_trickle_raw"])
+    burst_runs = sum(r["progress"]["runs"] for r in rounds)
     bad = sum(r["check"]["streams_not_matching_db"] for r in rounds)
     metrics = {
         "runs": n,
@@ -2149,9 +2231,11 @@ async def ctl_followers(url: str, cfg: dict[str, Any], workers: int, notify: boo
         "idle_statements_per_s": round(idle_stmts / idle_s, 1),
         "idle_statements_per_s_per_watched_run": round(idle_stmts / idle_s / n, 3),
         "progress_statements": progress_stmts,
-        "progress_statements_per_run": round(progress_stmts / n, 2),
+        "progress_statements_per_run": round(progress_stmts / max(1, burst_runs), 2),
+        "trickle_runs": sum(r["trickle"]["runs"] for r in rounds),
+        "trickle_delivery_lag_ms": lat_summary(lag_trickle),
         "progress_wall_s": round(max(r["progress"]["drain_wall_s"] for r in rounds), 2),
-        "delivery_lag_ms": lat_summary(lag_raw),
+        "burst_delivery_lag_ms": lat_summary(lag_raw),
         "streams_not_matching_db": bad,
         "all_followers_ended": all(r["progress"]["all_followers_ended"] for r in rounds),
         "all_caught_up": all(r["attach"]["all_caught_up"] for r in rounds),
@@ -2211,6 +2295,8 @@ async def ctl_cancel(url: str, cfg: dict[str, Any], workers: int) -> Outcome:
             "cancel_wall_s": round(r["wall_s"], 3),
             "cancel_statements": r["cancel_statements"],
             "cancel_statements_per_node": round(r["cancel_statements"] / r["nodes"], 3),
+            "latency_ms": lat_summary([r["wall_s"] * 1000]),
+            "app_bytes_sent": merged["bytes_sent"],
             "seeded_nodes_not_cancelled": r["seeded_not_cancelled"],
             "cascade_truncated": r["cascade_truncated"],
             "cascade_entries": r["cascade_entries"],
@@ -2218,6 +2304,8 @@ async def ctl_cancel(url: str, cfg: dict[str, Any], workers: int) -> Outcome:
             "creator_statements": r["creator_statements"],
             "server": m.server(),
             "errors": r["errors"],
+            "status_counts": r["status_counts"],
+            "nodes_without_cancel_request": r["nodes_without_cancel_request"],
         }
         out.check(
             f"{name}: every seeded node cancelled",
@@ -2226,8 +2314,17 @@ async def ctl_cancel(url: str, cfg: dict[str, Any], workers: int) -> Outcome:
             0,
         )
         out.check(
-            f"{name}: cascade not truncated",
-            not r["cascade_truncated"],
+            f"{name}: every nonterminal node including concurrent children marked for cancellation",
+            r["nodes_without_cancel_request"] == 0,
+            r["nodes_without_cancel_request"],
+            0,
+        )
+        # The flag also turns on when the 999-entry outcome list is full, not only when the
+        # traversal stopped (agent.py: cascade_count + 1 > len(outcomes)); every node being
+        # cancelled is the real test, so the flag only fails a tree small enough to fit the list.
+        out.check(
+            f"{name}: cascade not truncated (flag counted only for trees under 1,000 nodes)",
+            (not r["cascade_truncated"]) or r["nodes"] > 999,
             r["cascade_truncated"],
             False,
         )
@@ -2236,6 +2333,11 @@ async def ctl_cancel(url: str, cfg: dict[str, Any], workers: int) -> Outcome:
             r["creators"]["other"] == 0,
             r["creators"]["other"],
             0,
+        )
+    if any(d["cascade_truncated"] and d["nodes"] > 999 for d in phases.values()):
+        out.notes.append(
+            "meta cascade_truncated was True although every node was cancelled: the flag also "
+            "counts the 999-entry outcome list (agent.py cancel_run)"
         )
     out.samples = all_samples
     out.metrics = {
@@ -2281,6 +2383,8 @@ async def ctl_pool(url: str, cfg: dict[str, Any], workers: int) -> Outcome:
         "server": m.server(),
         "wall_s": round(m.wall_s, 2),
         "statements_per_run": round(v["queued"]["meter"]["statements"] / n, 2),
+        "statements": merged["statements"],
+        "app_bytes_sent": merged["bytes_sent"],
         "top_statements": merged["top"].most_common(6),
     }
     out.check(
@@ -2344,6 +2448,7 @@ async def ctl_history(url: str, cfg: dict[str, Any], workers: int) -> Outcome:
         "resume_status": resume["status"],
         "resume_error": resume["error"],
         "resume_wall_s": round(resume["wall_s"], 2),
+        "resume_latency_ms": lat_summary([resume["wall_s"] * 1000]),
         "resume_statements": resume["meter"]["statements"],
         "resume_rss_before_mb": round(resume["rss_before_kb"] / 1024, 1),
         "resume_rss_peak_mb": round(resume["rss_peak_kb"] / 1024, 1),
@@ -2353,6 +2458,8 @@ async def ctl_history(url: str, cfg: dict[str, Any], workers: int) -> Outcome:
         "server": m.server(),
         "wall_s": round(m.wall_s, 2),
         "errors": {},
+        "statements": merged["statements"],
+        "app_bytes_sent": merged["bytes_sent"],
         "top_statements": merged["top"].most_common(8),
     }
     out.check("history resume finished", resume["status"] == "success", resume["status"], "success")
@@ -2393,6 +2500,10 @@ async def ctl_memory(url: str, cfg: dict[str, Any], workers: int) -> Outcome:
     out.metrics = {
         "cycles": len(cycles),
         "runs_per_cycle": cfg["memory_runs"],
+        "cycle_latency_ms": lat_summary([c["wall_ms"] for c in cycles]),
+        "statements": h.result["meter"]["statements"],
+        "statements_per_cycle": round(h.result["meter"]["statements"] / len(cycles), 2),
+        "app_bytes_sent": h.result["meter"]["bytes_sent"],
         "followers_per_cycle": 50,
         "rss_mb_series": [round(x, 1) for x in series],
         "warmup_cycles": warm,
@@ -2664,6 +2775,8 @@ def render(name: str, o: Outcome) -> list[str]:
         best = m["variants"]["notify_on_batch"]["by_operation_iteration_2"]
         lines.append("statements by store operation, iteration 2, notifier on:")
         lines += ["  " + f"{k}: {v}" for k, v in sorted(best.items())]
+        for variant, d in m["variants"].items():
+            lines.append(f"{variant} whole-run latency ms: {d['latency_ms']}")
     elif name.startswith("followers"):
         lines += fmt_table(
             ["metric", "value"],
@@ -2678,12 +2791,18 @@ def render(name: str, o: Outcome) -> list[str]:
                     f"{m['idle_statements_per_s']} ({m['idle_statements_per_s_per_watched_run']})",
                 ],
                 [
-                    "progress statements (per run)",
+                    "burst statements (per run)",
                     f"{m['progress_statements']} ({m['progress_statements_per_run']})",
                 ],
                 [
-                    "delivery lag ms p50 / p95",
-                    f"{m['delivery_lag_ms'].get('p50_ms')} / {m['delivery_lag_ms'].get('p95_ms')}",
+                    f"trickle delivery lag ms p50 / p95 ({m['trickle_runs']} runs)",
+                    f"{m['trickle_delivery_lag_ms'].get('p50_ms')} / "
+                    f"{m['trickle_delivery_lag_ms'].get('p95_ms')}",
+                ],
+                [
+                    "burst delivery lag ms p50 / p95",
+                    f"{m['burst_delivery_lag_ms'].get('p50_ms')} / "
+                    f"{m['burst_delivery_lag_ms'].get('p95_ms')}",
                 ],
                 ["streams not matching the stored events", m["streams_not_matching_db"]],
                 ["wall s", m["wall_s"]],
@@ -2718,6 +2837,11 @@ def render(name: str, o: Outcome) -> list[str]:
             ],
             rows,
         )
+        for ph, d in m["phases"].items():
+            lines.append(
+                f"{ph}: latency ms {d['latency_ms']} (one sample); "
+                f"app bytes {d['app_bytes_sent']}; server {json.dumps(d['server'])}"
+            )
     elif name == "pool":
         q, s = m["queued"], m["short_timeout"]
         lines += fmt_table(
@@ -2778,6 +2902,8 @@ def render(name: str, o: Outcome) -> list[str]:
             ],
         )
         lines.append("RSS MB per cycle: " + ", ".join(str(x) for x in m["rss_mb_series"]))
+        lines.append(f"cycle latency ms: {m['cycle_latency_ms']}")
+        lines.append(f"statements per cycle: {m['statements_per_cycle']}")
     else:
         rows = [
             ["runs", m.get("runs")],
@@ -2808,7 +2934,9 @@ def render(name: str, o: Outcome) -> list[str]:
         if m.get("statements_per_operation"):
             lines.append("statements per operation: " + json.dumps(m["statements_per_operation"]))
     srv = m.get("server")
-    if srv and name not in ("iteration",):
+    if "app_bytes_sent" in m:
+        lines.append(f"application write parameter bytes: {m['app_bytes_sent']}")
+    if srv:
         lines.append(
             f"server: peak connections {srv['peak_connections']} "
             f"{srv['peak_connections_by_role']}; run-row lock wait "
@@ -2816,11 +2944,17 @@ def render(name: str, o: Outcome) -> list[str]:
             f"(max {srv['max_concurrent_run_row_waiters']} waiters, {srv['interval_ms']:.0f} ms "
             f"sampling); WAL {srv['wal_bytes']} B; transactions {srv['transactions']}"
         )
+    if srv and srv.get("growth_by_table"):
+        grown = ", ".join(f"{t} {v / 2**20:.1f} MiB" for t, v in srv["growth_by_table"].items())
+        lines.append(f"table growth (data + indexes + toast): {grown}")
     for n in o.notes:
         lines.append("note: " + n)
     for c in o.checks:
         verdict = "PASS" if c["ok"] else "FAIL"
         lines.append(f"[{verdict}] {c['name']} (value {c['value']}, limit {c['limit']})")
+    for plan in m.get("explain", []):
+        lines.append(f"EXPLAIN [{plan['scenario_phase']}]: {plan['statement']}")
+        lines.append(plan.get("plan", plan.get("error", "no plan")))
     return lines
 
 
@@ -2861,8 +2995,8 @@ async def run_all(args: argparse.Namespace) -> int:
 
     legacy = not hasattr(SQLAlchemyStateStore, "checkpoint_step")
     wanted = args.scenarios.split(",") if args.scenarios else list(ALL_SCENARIOS)
-    if legacy:
-        wanted = ["a"]
+    if legacy:  # a 0.5 checkout can run the scenarios that need no 0.6 surface
+        wanted = [w for w in wanted if w in LEGACY_SCENARIOS] or list(LEGACY_SCENARIOS)
     baseline = load_baseline(Path(args.baseline) if args.baseline else None)
     await reset_db(url)  # creates the private database when it is missing
     results: dict[str, Any] = {
@@ -2897,11 +3031,15 @@ async def run_all(args: argparse.Namespace) -> int:
     }
     explain_for = {
         "a_notify_off",
+        "iteration",
         "runs",
         "kill_checkpoint",
+        "kill_inflight",
         "cancel",
         "followers_on",
         "followers_off",
+        "pool",
+        "history",
     }
     jobs: list[tuple[str, Any]] = []
     for name in wanted:

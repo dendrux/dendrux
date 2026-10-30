@@ -66,6 +66,15 @@ def test_tree_has_the_requested_number_of_nodes_and_one_root():
     assert all(parent < n for n, parent in links if parent is not None)
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS sandbox RSS measurement")
+def test_rss_measurement_does_not_require_permission_to_spawn_ps(monkeypatch):
+    def denied(*args, **kwargs):
+        raise PermissionError("process inspection denied")
+
+    monkeypatch.setattr(load.subprocess, "run", denied)
+    assert load.rss_kb() > 0
+
+
 def test_baseline_comparison_fails_only_on_a_regression_over_twenty_percent():
     baseline = {"gates": {"a.statements_per_run": 100, "iteration.notify_on_batch": 20}}
     rows, failed = load.compare_gates(
@@ -102,7 +111,7 @@ def test_the_bench_workflow_is_weekly_pinned_and_runs_load_quick():
     job = next(iter(doc["jobs"].values()))
     assert job["runs-on"] == "ubuntu-24.04"
     service = next(iter(job["services"].values()))
-    assert service["image"].startswith("postgres:16-alpine")
+    assert service["image"].startswith("postgres:16-alpine@sha256:")
     text = WORKFLOW.read_text()
     assert "shared_buffers = '256MB'" in text
     assert "make load-quick" in text
@@ -161,5 +170,9 @@ def test_a_tiny_load_run_passes_its_checks_on_postgres(tmp_path):
     assert gates["iteration.notify_on_batch"] <= 25
     kill = results["scenarios"]["kill_checkpoint"]["metrics"]
     assert kill["extra_billed_calls"] == 0 and kill["runs_in_killed_process"] >= 1
+    assert kill["killed_worker_statements"] > 0
+    assert kill["statements_including_recovery"] == (
+        kill["statements"] + kill["recovery_statements"]
+    )
     assert results["scenarios"]["a_notify_off"]["metrics"]["statements_per_run"] > 0
-    assert proc.returncode in (0, 1)
+    assert proc.returncode == int(any(not c["ok"] for c in results["checks"]))
