@@ -67,16 +67,16 @@ See [Build your own read routes](/docs/recipes/build-your-own-read-routes).
 | `run`, `stream`, `retry` | `None`: the new run is untenanted |
 | every other entry point | `UNSCOPED`: no tenant check |
 
-The 0.6 default is `strict_tenancy=True`: omission raises `TenantScopeRequiredError`. `reclaim` always requires explicit scope, including on a lenient Agent. An explicit `tenant_id` on a run-control write must match the run's tenant exactly, otherwise `RunNotFoundError` is raised before anything is written, the same error as a missing run.
+The 0.6 default is `strict_tenancy=True`. For an Agent with a state store, passed directly or built from `database_url`, omitting `tenant_id` raises `TenantScopeRequiredError`. An Agent without a store can still run or stream without `tenant_id`, silently. `reclaim` always requires explicit scope, including on a lenient Agent. An explicit `tenant_id` on a run-control write must match the run's tenant exactly, otherwise `RunNotFoundError` is raised before anything is written, the same error as a missing run.
 
 ### Strict tenancy
 
-In a multi-tenant service the dangerous mistake is forgetting `tenant_id=` once. `strict_tenancy=True` turns that into an error:
+For an Agent with a state store, `strict_tenancy=True` makes an omitted `tenant_id` an error:
 
 [//]: # "docs-test: skip - fragment: relies on `Agent`, defined by setup shown elsewhere"
 
 ```python
-agent = Agent(provider=provider, prompt="...", strict_tenancy=True)
+agent = Agent(provider=provider, prompt="...", state_store=state, strict_tenancy=True)
 
 await agent.run("hi")                       # TenantScopeRequiredError
 await agent.run("hi", tenant_id="acme")     # ok
@@ -86,7 +86,7 @@ await agent.cancel_run(run_id, tenant_id=UNSCOPED)   # ok, explicitly an operato
 
 - `TenantScopeRequiredError` is a `ValueError`. It names the operation, not the data.
 - Delegated child runs inherit their parent's tenant and never raise.
-- Strict tenancy defaults to `True` in 0.6. Single-tenant scripts can explicitly choose `strict_tenancy=False`. Under strict tenancy, non-approval continuations also require `expected_pause_id`; omission raises `InputValidationError` with code `pause_id_required`.
+- Strict tenancy defaults to `True` in 0.6 and applies only to agents with a state store. Such agents can explicitly choose `strict_tenancy=False` to keep the earlier behavior. With a state store and strict tenancy, non-approval continuations also require `expected_pause_id`; omission raises `InputValidationError` with code `pause_id_required`.
 - It applies to `Agent` methods. Code that calls the lower-level `dendrux.run(agent, ...)` function directly is not covered.
 
 ### Metadata
@@ -107,10 +107,10 @@ See [Runs](/docs/architecture/runs) for what a key does.
 | Situation | Error |
 | --- | --- |
 | Run missing, or in another tenant, on any `Agent` or `RunStore` path | `RunNotFoundError(run_id)` (a `LookupError`) |
-| `strict_tenancy=True` and `tenant_id` omitted | `TenantScopeRequiredError` |
+| Agent with a state store, `strict_tenancy=True` and `tenant_id` omitted | `TenantScopeRequiredError` |
 | `tenant_id=""`, or an id or tenant that is too long or holds NUL on a read | `ValueError` (a fixed message, no echo) |
 | `get_pending` or `follow` without `tenant_id` | `TypeError` |
-| Strict tenancy and the module-level `dendrux.run` with no tenant | `TenantScopeRequiredError` (`tenant_id=None` passed explicitly is fine) |
+| Agent with a state store, strict tenancy and the module-level `dendrux.run` with no tenant | `TenantScopeRequiredError` (`tenant_id=None` passed explicitly is fine) |
 | Delegating to a child with a different explicit tenant | `ValueError` |
 
 Map `RunNotFoundError` to 404 for both missing and foreign runs. That is what stops callers learning which run ids exist in other tenants.

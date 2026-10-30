@@ -74,6 +74,7 @@ async def chat(req):
     ) as agent:
         result = await agent.run(
             req.text,
+            tenant_id=req.user_id,
             history=req.transcript,                           # your app owns this
             metadata={"thread_id": req.thread_id},
         )
@@ -82,7 +83,7 @@ async def chat(req):
 
 Build the store once at startup and pass it everywhere. An `Agent` built with `database_url=` reuses one reference-counted engine per normalised URL and `database_options` (close every Agent so the pool is released), but you cannot size that pool yourself. An `Agent` with neither `state_store=` nor `database_url=` falls back to a process-global engine built from `DENDRUX_DATABASE_URL`; that fallback warns in 0.5.0 and goes away in 0.6. The global engine is also bound to one event loop: using it from a second loop raises a clear `RuntimeError` instead of asyncpg's "another operation is in progress". Pass `state_store=STORE` and none of this applies. Pool sizing, PgBouncer and the migration job are on [Scaling workers](/docs/guides/scaling).
 
-In a multi-tenant service, pass the authenticated caller's `tenant_id=` on every call (`run`, `stream`, `submit_*`, `cancel_run`), or build the Agent with `strict_tenancy=True` so that forgetting it is an error. See [Multi-tenancy](/docs/architecture/multi-tenancy).
+In a multi-tenant service, pass the authenticated caller's `tenant_id=` on every call (`run`, `stream`, `submit_*`, `cancel_run`). With a state store, `strict_tenancy=True` (the 0.6 default) makes omission an error. Agents without a store can omit `tenant_id` without a warning. See [Multi-tenancy](/docs/architecture/multi-tenancy).
 
 ### Ownership at request shutdown
 

@@ -58,14 +58,18 @@
   creation briefly reserves the writer before checking its parent. Cancelling a nested
   run on a shared task preserves its ancestors' ability to continue.
 - Change defaults announced in 0.5: `strict_tenancy=True`,
-  `on_governance_change="raise"` and cache-token budget counting enabled. Non-approval
-  continuations under strict tenancy now require `expected_pause_id`. Explicit
+  `on_governance_change="raise"` and cache-token budget counting enabled. For an Agent
+  with a state store, omitted `tenant_id` now raises under strict tenancy and
+  non-approval continuations require `expected_pause_id`. Agents without a store
+  can omit `tenant_id` silently. The strict requirements apply only to agents with
+  a store, passed directly or built from `database_url`. Explicit
   `strict_tenancy=False`, `on_governance_change="warn"` and `count_cache_tokens=False`
   retain the previous choices. Remove the implicit Agent `DENDRUX_DATABASE_URL` engine;
   pass persistence explicitly. The CLI keeps reading the variable. Omitted `sweep(on_stale=)`
   still finalizes stale rows in 0.6 and now warns; pass `"error"` explicitly to retain it
   when the default becomes `"reclaim"` in 0.7.
-- Guardrails redact values inside placeholder-shaped text the run did not issue.
+- Guardrails now also redact PII inside text that looks like a Dendrux placeholder
+  but was not issued by the run.
 - Add upgrade, recovery, capability and database CLI guides; expand scaling,
   observability and tracing guidance. See `docs/upgrading-to-0.6.0.mdx` for the rollout.
 

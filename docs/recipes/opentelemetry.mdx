@@ -159,7 +159,7 @@ This means a single click in your tracing UI shows the full audit story for a ru
 | Provider raises          | `chat` closes with `Status.ERROR` and safe mapped error fields; no vendor message or traceback |
 | Run errors out           | `invoke_agent` closes with `Status.ERROR`; non-provider errors include exception type and a frame-only stack |
 | Run finishes with `RunResult.error_info` | `invoke_agent` closes with `Status.ERROR` (it was `OK` before 0.5.0), the safe `dendrux.error.*` attributes (category, retryable, status code and so on) and a `provider.error` span event. No vendor text is recorded. Update dashboards that counted these runs as successful |
-| Stream consumer abandons | `invoke_agent` closes as `cancelled`; any in-flight `chat` / `execute_tool` spans get swept and marked ERROR with `dendrux.span.orphan_close_reason` |
+| Stream consumer abandons | `invoke_agent` closes with `dendrux.run.status=cancelled` and span status `ERROR`; any in-flight `chat` / `execute_tool` spans get swept and marked ERROR with `dendrux.span.orphan_close_reason` |
 
 That last row is the subtle one. Stream cancellation (`asyncio.CancelledError`, `GeneratorExit`) is a `BaseException` and bypasses the loop's `except Exception` paths, so `on_llm_call_completed` / `on_llm_call_failed` may not fire. The notifier sweeps any open child spans on the run-level terminal hook so they never leak as never-ending operations in your backend.
 
@@ -172,13 +172,13 @@ Two opt-in flags exist for power users / debugging:
 ```python
 OpenTelemetryNotifier(
     include_tool_params=True,    # adds dendrux.tool.params (JSON) to tool spans
-    include_messages=True,        # adds gen_ai.completion to chat spans (V1: completion text only)
+    include_messages=True,        # adds gen_ai.completion to chat spans (completion text only)
 )
 ```
 
 Both capture content beyond the default telemetry fields. Enable them only in trusted environments with application-owned data controls. Prompt capture is not implemented.
 
-Provider codes are mapped to a closed set; unknown codes become `provider_unknown`. Non-provider exception stacks contain file, line and function only, without messages or locals. A failed tool result records the stack of the completion callback, not the tool's original crash site.
+Dendrux reports a fixed list of provider error codes; unknown codes become `provider_unknown`. Non-provider exception stacks contain file, line and function only, without messages or locals. A failed tool's stack shows where Dendrux reported the failure, rather than where the tool itself crashed.
 
 ## Concurrent runs
 
@@ -206,13 +206,13 @@ orphan-closed spans are ERROR                    0  ✓
 
 Re-run this after any change to the notifier, the runtime lifecycle, or your loop implementation. If the invariants table flips red, OTel output regressed.
 
-## What V1 leaves out
+## What is not covered
 
 This integration ships a small surface that covers the most common need. The remaining items are **deferred, not forgotten**. They will be reconsidered when real usage surfaces a need.
 
 - **Native metrics signal.** OTel metrics for token usage, tool call counts, run duration, etc. are not emitted natively. Most backends derive these from spans for free. Native counters / histograms may land later for cardinality control.
 - **Native log signal.** `LoopRecorder` is Dendrux's audit source of truth. Routing the same events out as OTel logs is possible but creates two sources of truth; if you want log/trace correlation, the recommended path today is a downstream exporter that reads sanitized recorder events.
-- **Prompt capture.** `include_messages=True` only captures completion text in V1. Capturing prompts requires JSON-serializing multimodal and tool-call content correctly, with size guards.
+- **Prompt capture.** `include_messages=True` captures completion text only. Capturing prompts requires JSON-serializing multimodal and tool-call content correctly, with size guards.
 - **`auto_instrument()` helper.** There is no one-call hook that installs the notifier globally. Pass it explicitly per `agent.run()` call. A helper may follow if usage demands.
 
 The application continues to own exporters, sampling, metrics and log correlation. Durable trace continuity does not install an exporter or keep a worker alive across a pause.

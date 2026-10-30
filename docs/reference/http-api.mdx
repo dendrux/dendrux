@@ -177,7 +177,7 @@ Behavior by current state:
 - **Terminal**: no-op. Returns current persisted state. Does not raise.
 - **Non-persisted**: unsupported. Raises `PersistenceNotConfiguredError`.
 
-A cancel that arrives after the run's last checkpoint does not stop a run that then completes successfully. `cascade=True` marks descendant frontiers before scanning and finalizes paused descendants deepest first. Traversal stays inside the root tenant even for `UNSCOPED`, with a `Budget.max_subtree_nodes` bound (default 10,000). Per-run outcomes are in `meta["cascade"]`; `cascade_truncated` signals a traversal cut. See [Cancellation](/docs/architecture/cancellation#cascade).
+A cancel that arrives after the run's last checkpoint does not stop a run that then completes successfully. `cascade=True` marks cancellation requests on each level of the run tree before reading the next level, then finalizes paused descendants deepest first. Traversal stays inside the root tenant even for `UNSCOPED`, with a `Budget.max_subtree_nodes` bound (default 10,000). Per-run outcomes are in `meta["cascade"]`; `cascade_truncated` signals a traversal cut. See [Cancellation](/docs/architecture/cancellation#cascade).
 
 Raises: `PersistenceNotConfiguredError`, `RunNotFoundError`.
 
@@ -195,7 +195,7 @@ From `dendrux.errors`. Suggested HTTP mappings in the docstring there; use whate
 | `InvalidToolResultError` | `ValueError` | 400 | Submitted results don't match pending calls (unknown / duplicate / missing ids, wrong name, bad payload). No partial claim. |
 | `InputValidationError` | `ValueError` | 400 | A value cannot be accepted or stored (NUL, lone surrogate, non-finite JSON, bad identifier), or an approval has no `expected_pause_id`. Carries a fixed `field` and `code`, never the value. |
 | `PersistenceNotConfiguredError` | `RuntimeError` | 500 | Agent has no DB. Configuration bug, not runtime condition. |
-| `TenantScopeRequiredError` | `ValueError` | 500 | `strict_tenancy=True` and the call omitted `tenant_id`. A bug in your route, not a client error. |
+| `TenantScopeRequiredError` | `ValueError` | 500 | The Agent has a state store, `strict_tenancy=True`, and the call omitted `tenant_id`; `reclaim` always requires explicit scope. A bug in your route, not a client error. |
 | `NoteLimitExceededError` | `ValueError` | 409 or 429 | `submit_note` on a run that already has `max_notes_per_run` notes. |
 | `ProviderError` and subclasses | `RuntimeError` | 502 | A provider failure. Normally reported on the run result as `error_info`; see [Handling provider errors](/docs/recipes/handling-provider-errors). |
 | `ContextLengthExceededError` | `RuntimeError` | 413 or 400 | An OpenAI-compatible endpoint rejected the request as larger than the model's context window. Raised by `run()` / `stream()`, not by a submit method. |

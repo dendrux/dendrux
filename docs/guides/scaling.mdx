@@ -114,7 +114,7 @@ See [Recovery](/docs/guides/recovery) for attempt limits, recovery approval and 
 
 ## Event notifications
 
-Postgres notifications are optional wake hints. Durable event rows remain the source of truth. Writers default to `notify_channel=None`, so ordinary writes issue no NOTIFY. Enable the channel on every writer:
+Postgres notifications are optional wake hints. Durable event rows remain the source of truth. Writers default to `notify_channel=None`, so ordinary writes issue no NOTIFY. With a healthy listener, events from a writer that leaves the channel off may wait until the next `poll_healthy_s` check (30 seconds by default); `notifier_missed_hint` flags this. Enable the channel on every writer:
 
 [//]: # "docs-test: skip - application supplies its shared engine and Postgres deployment"
 

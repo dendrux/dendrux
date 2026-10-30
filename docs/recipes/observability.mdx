@@ -93,6 +93,7 @@ Structured log lines carry a stable `code`. Group alerts by that field and corre
 | `notifier_unavailable` | Listener startup cannot complete: check reachability and channel configuration; reads use polling |
 | `notifier_missed_hint` | A healthy reconciliation poll found rows without a hint, once per feed: verify every writer enables the matching channel |
 | `write_conflict` | Any occurrence: inspect conflicting writer identities or content before retrying |
+| `activation_conflict` | Activation found conflicting duplicates: resolve the reported table/index conflict before retrying |
 | `checkpoint_too_large`, `history_too_large`, `pending_limit` | Inspect the run's configured bounds and reduce state or fanout; do not continue with truncated history |
 | `recovery_call_missing`, `recovery_state_missing`, `recovery_state_invalid`, `loop_unknown` | Inspect stored recovery state and the deployed Agent/store versions |
 | `cascade_truncated` | Inspect the remaining subtree and cancel branches explicitly, or raise `Budget.max_subtree_nodes` |

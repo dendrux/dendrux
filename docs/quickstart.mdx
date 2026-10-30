@@ -101,7 +101,7 @@ Four things worth noticing:
    - **Omit it** → in-memory only. Fine for one-shot scripts and tests; the run dies with the process.
    - **SQLite** → `sqlite+aiosqlite:///./quickstart.db` writes to a single file. Zero setup — dendrux auto-creates tables on first connect. Ideal for local dev and small single-node apps. The `.db` file is what you back up.
    - **Postgres** → `postgresql+asyncpg://user:pass@host/db` for multi-process or production. Same code path. Run `dendrux db migrate` once to apply the schema (Alembic) before first use.
-4. `strict_tenancy=False` says this is a single-tenant app, so calls need no `tenant_id`. Without a choice, Dendrux 0.5 prints a `FutureWarning`, because strict tenancy becomes the default in 0.6. A multi-user app passes `tenant_id=` on every call instead; see [Multi-tenancy](/docs/architecture/multi-tenancy).
+4. `strict_tenancy=False` says this is a single-tenant app, so calls need no `tenant_id`. In 0.6 strict tenancy defaults to `True` for agents with a database, including this example. An Agent without a state store can omit `tenant_id` without a warning. A multi-user app passes `tenant_id=` on every call instead; see [Multi-tenancy](/docs/architecture/multi-tenancy).
 
 ## 4. Start a run
 

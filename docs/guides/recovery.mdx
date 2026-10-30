@@ -29,6 +29,7 @@ Call `sweep` from your own startup or maintenance job. Select `on_stale` explici
 from datetime import timedelta
 
 from dendrux import sweep
+from dendrux.errors import RunNotReclaimableError
 
 async def recover_page(state, agent, cursor=None):
     page = await sweep(
@@ -40,15 +41,19 @@ async def recover_page(state, agent, cursor=None):
         cursor=cursor,
     )
     for item in page.reclaimable:
-        result = await agent.reclaim(
-            item.run_id, tenant_id=item.tenant_id, item=item,
-        )
+        try:
+            result = await agent.reclaim(
+                item.run_id, tenant_id=item.tenant_id, item=item,
+            )
+        except RunNotReclaimableError as error:
+            print(item.run_id, "skipped:", error.reason)
+            continue
         # Route pauses to the same approval/client/input flow as a fresh run.
         print(item.run_id, result.status.value)
     return page.cursor
 ```
 
-This example dispatches serially. A service can enqueue items to its existing worker system with a finite concurrency bound. Use the Agent with the same name, tools, skills and governance as the original run. Handle `RunNotReclaimableError` per item so one stale dispatch does not block the page. Supplying `item=` checks the exact observed claim epoch; a competing claim is refused. Do not blindly retry a stale item.
+This example dispatches serially and handles `RunNotReclaimableError` per item so one stale dispatch does not block the page. A service can enqueue items to its existing worker system with a finite concurrency bound. Use the Agent with the same name, tools, skills and governance as the original run. Supplying `item=` checks the exact observed claim epoch; a competing claim is refused. Do not blindly retry a stale item.
 
 `tenant_id` is mandatory for `reclaim`, even on a lenient Agent. Use the item's tenant; `None` explicitly selects untenanted runs. A foreign or missing run raises `RunNotFoundError` before changes.
 

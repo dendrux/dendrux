@@ -34,6 +34,8 @@ An active database reports `storage_format=2 activate_step=done`. A database wit
 
 Use a direct Postgres connection for activation; concurrent index builds and the maintenance lock require it. For SQLite, stop every other process using the file first. The exclusive lock refuses a live competing transaction, but cannot establish that every idle process has stopped.
 
+Activation reads the whole `react_traces`, `tool_calls` and `run_events` tables, builds three unique indexes concurrently on Postgres and then drops the old indexes. Run it in a quiet period and check free disk for the builds first.
+
 > **No downgrade command.** Once activation starts, rollback requires the pre-activation backup. Even an incomplete activation prevents Alembic downgrade of the 0.6 storage migration.
 
 `db dedupe` records the same activation-progress marker even though it does not enable format 2. Take the backup before dedupe too; its marker also prevents downgrade of the storage migration.

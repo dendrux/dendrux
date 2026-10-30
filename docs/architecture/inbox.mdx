@@ -86,7 +86,7 @@ A delivered note is an ordinary user message in the history, so incoming [guardr
 
 ## Tenants
 
-Pass `tenant_id=` to require that the run belongs to exactly that tenant (`None` means untenanted); a mismatch raises `RunNotFoundError`, the same as an unknown run. Omit it for trusted, single-tenant use (or pass `UNSCOPED`); with `Agent(strict_tenancy=True)` omitting it raises `TenantScopeRequiredError`. `RunStore.get_notes(run_id, tenant_id=...)` applies the same rule and raises `RunNotFoundError` (since 0.5.0 the store and `dendrux.errors` use one class). Delegated child runs inherit their parent's tenant (see [Access control](/docs/architecture/access-control#tenants-and-delegated-runs)), so one tenant value covers a run and its children.
+Pass `tenant_id=` to require that the run belongs to exactly that tenant (`None` means untenanted); a mismatch raises `RunNotFoundError`, the same as an unknown run. Omit it for trusted, single-tenant use (or pass `UNSCOPED`); with `Agent(strict_tenancy=True)` and a state store, omitting it raises `TenantScopeRequiredError`. `RunStore.get_notes(run_id, tenant_id=...)` applies the same rule and raises `RunNotFoundError` (since 0.5.0 the store and `dendrux.errors` use one class). Delegated child runs inherit their parent's tenant (see [Access control](/docs/architecture/access-control#tenants-and-delegated-runs)), so one tenant value covers a run and its children.
 
 ## Limits to know
 
