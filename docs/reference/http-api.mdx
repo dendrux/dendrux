@@ -177,7 +177,7 @@ Behavior by current state:
 - **Terminal**: no-op. Returns current persisted state. Does not raise.
 - **Non-persisted**: unsupported. Raises `PersistenceNotConfiguredError`.
 
-A cancel that arrives after the run's last checkpoint does not stop a run that then completes successfully. `cascade=True` also cancels non-terminal descendants (deepest first, per-run outcomes in `meta["cascade"]`); `tenant_id` scopes the call.
+A cancel that arrives after the run's last checkpoint does not stop a run that then completes successfully. `cascade=True` marks descendant frontiers before scanning and finalizes paused descendants deepest first. Traversal stays inside the root tenant even for `UNSCOPED`, with a `Budget.max_subtree_nodes` bound (default 10,000). Per-run outcomes are in `meta["cascade"]`; `cascade_truncated` signals a traversal cut. See [Cancellation](/docs/architecture/cancellation#cascade).
 
 Raises: `PersistenceNotConfiguredError`, `RunNotFoundError`.
 

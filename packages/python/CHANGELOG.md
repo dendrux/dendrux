@@ -1,32 +1,73 @@
 # Changelog
 
-## Unreleased (0.6.0)
+## 0.6.0
 
-"Production", part 1: a run survives a dead worker (`agent.reclaim()`,
-`sweep(on_stale="reclaim")`, `@tool(idempotent=True)`), a Postgres event
-notifier for live reads, published scale numbers with a rerunnable load script,
-one trace per run and a log-codes page, and the 0.5 FutureWarning flips.
-Entries are added as each track merges.
-
-- guardrails redact values inside placeholder-shaped text the run did not issue
-
-- For format-2 runs, `RunStore.get_traces` and `dendrux traces` return the
-  provider form (PII placeholders); the reverse mapping is available as before.
-
-- State-store subclass upgrade: overrides of `SQLAlchemyStateStore` write methods
-  must accept and forward the new keyword-only parameters (a `**kwargs` passthrough
-  is supported), or explicitly declare only the capabilities they implement.
-  Validation now runs when constructing an `Agent`; incompatible inherited
-  capability declarations raise `StoreCapabilityError` before execution.
-- Results from reclaimed runs include `RecoveryInfo` and an additive `recovery`
-  wire field with the reclaim count, last reclaim time and bounded replayed-call ids.
-  `agent_runs.strategy` retains its strategy name; recovery classifies the loop
-  using `loop_state.loop`.
-
-- Format-2 persisted runs require JSON-only provider options of at most 2 KiB
-  and at most 64 pending calls per assistant batch (configurable through
-  `Limits.max_pending_calls`). Checkpoints use a 32 KiB compact UTF-8 JSON bound
-  on both databases. Storeless and format-1 runs retain their previous limits.
+- Add developer-called recovery for format-2 ReAct runs. `sweep(on_stale="reclaim")`
+  marks bounded candidates; `agent.reclaim(..., tenant_id=..., item=...)` continues
+  from committed state. Reclaim always requires explicit tenant scope. Interrupted
+  tools replay without approval only when both saved and current definitions declare
+  idempotency. Otherwise they pause for approval; denial records an unknown outcome.
+  Each approved format-2 tool attempt adds one checkpoint before dispatch.
+- Add the additive storage migration `f9a0b1c2d3e4`, resumable `dendrux db activate`
+  and `db dedupe`, and storage-format/activation output in `db status`. Migrate,
+  roll every worker and reader, back up, then activate before enabling reclaim or
+  notifications. Activation is one-way; rollback requires the pre-activation backup.
+  Runs keep their creation format; stale format-1 runs cannot be reclaimed.
+- Declare and validate `StateStore` capabilities at Agent construction. Undeclared
+  custom stores retain legacy signatures and format 1. Subclass overrides must
+  accept and forward the named keyword-only parameters or narrow their capabilities.
+  Add fenced evidence writes, retry identities, atomic tool completion and submission
+  consumption. Incompatible declarations raise `StoreCapabilityError` before execution.
+- Add `Agent(lease_interval=timedelta(seconds=30))`, with a five-second minimum.
+  Size `stale_running` to at least three times the lease interval. Results from
+  reclaimed runs expose `RecoveryInfo` and an additive `recovery` wire field with
+  the reclaim count, last reclaim time and bounded replayed-call ids.
+- Format-2 pauses use schema version 2 and rebuild conversation from seed, turn
+  and rewrite traces; state traces are excluded from conversation reads. `RunStore.get_traces`
+  and `dendrux traces` return the provider form, including PII placeholders, with
+  the latest replacement prefix after compaction. The reverse mapping remains separate.
+  Format-2 options must be JSON-only and fit 2 KiB; pending assistant calls default
+  to 64 (`Limits.max_pending_calls`). Checkpoints fit 32 KiB. History rebuild defaults
+  to 16 MiB and 20,000 rows and refuses excess rather than truncating context.
+- Add opt-in `PostgresEventNotifier` hints for `follow` and `stream_events`. Writers
+  enable `notify_channel="dendrux_events"`; default-off writers issue no NOTIFY.
+  Readers use `listen_url=` on a primary direct or session-pool endpoint, or borrow
+  a started `notifier=`. LISTEN cannot use PgBouncer transaction pooling. Each notifying
+  transaction takes a database-wide commit lock; a 50-writer local probe saw about
+  45% lower write throughput. Monitor `pg_notification_queue_usage()` because a full
+  queue fails notifying writes. Every listener receives every hint on its channel.
+  Export `EventNotifier`, `NotifierState` and `Subscription` from `dendrux.store`.
+- Add coded diagnostics and the generated log-code reference. Strict field checks
+  require `DENDRUX_STRICT_LOG_FIELDS=1`. Alert on `notifier_degraded`,
+  `notifier_unavailable` and `notifier_missed_hint`; polling remains the fallback.
+  Provider-code projections use a closed set; unknown vendor or unmapped custom-provider
+  codes become `provider_unknown`, with raw values only on `provider_code_raw`.
+- Persist trace links across pause, resume, submissions and reclaim. Delegated OTel
+  spans use the active parent tool context where available. Error, cancelled and
+  max-iteration runs export ERROR status. Non-provider stacks contain frames only;
+  tool failures record the completion-callback stack rather than the original crash site.
+- Bound decoded non-streaming responses before SDK parsing (`max_response_bytes`,
+  default 16 MiB). `max_stream_bytes` also limits each SSE event's wire size, so low
+  custom limits may reject repeated final response envelopes. Compressed responses
+  accept gzip/deflate; unsupported or stacked encodings raise `response_encoding_unsupported`.
+  Non-streaming socket read timeouts have `timeout_reason=None`; `call_deadline`
+  is reserved for Dendrux's own deadline.
+- Cascade cancellation stays in the root tenant even for unscoped calls. Traversal
+  is bounded by `Budget.max_subtree_nodes` (default 10,000); `cascade_truncated`
+  identifies a cut. Finished runs retain their cancellation flags. SQLite delegated
+  creation briefly reserves the writer before checking its parent. Cancelling a nested
+  run on a shared task preserves its ancestors' ability to continue.
+- Change defaults announced in 0.5: `strict_tenancy=True`,
+  `on_governance_change="raise"` and cache-token budget counting enabled. Non-approval
+  continuations under strict tenancy now require `expected_pause_id`. Explicit
+  `strict_tenancy=False`, `on_governance_change="warn"` and `count_cache_tokens=False`
+  retain the previous choices. Remove the implicit Agent `DENDRUX_DATABASE_URL` engine;
+  pass persistence explicitly. The CLI keeps reading the variable. Omitted `sweep(on_stale=)`
+  still finalizes stale rows in 0.6 and now warns; pass `"error"` explicitly to retain it
+  when the default becomes `"reclaim"` in 0.7.
+- Guardrails redact values inside placeholder-shaped text the run did not issue.
+- Add upgrade, recovery, capability and database CLI guides; expand scaling,
+  observability and tracing guidance. See `docs/upgrading-to-0.6.0.mdx` for the rollout.
 
 ## 0.5.0 - 2026-10-28
 

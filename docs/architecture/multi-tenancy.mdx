@@ -62,12 +62,12 @@ See [Build your own read routes](/docs/recipes/build-your-own-read-routes).
 
 `run`, `stream`, `retry`, `resume`, `resume_stream`, `submit_tool_results`, `submit_input`, `submit_approval`, `submit_resume`, `cancel_run`, `request_pause` and `submit_note` all take `tenant_id=`.
 
-| Entry point | Omitted `tenant_id` means (default mode) |
+| Entry point | Omitted `tenant_id` with `strict_tenancy=False` |
 | --- | --- |
 | `run`, `stream`, `retry` | `None`: the new run is untenanted |
 | every other entry point | `UNSCOPED`: no tenant check |
 
-An explicit `tenant_id` on a run-control write must match the run's tenant exactly, otherwise `RunNotFoundError` is raised before anything is written, the same error as a missing run.
+The 0.6 default is `strict_tenancy=True`: omission raises `TenantScopeRequiredError`. `reclaim` always requires explicit scope, including on a lenient Agent. An explicit `tenant_id` on a run-control write must match the run's tenant exactly, otherwise `RunNotFoundError` is raised before anything is written, the same error as a missing run.
 
 ### Strict tenancy
 
@@ -86,7 +86,7 @@ await agent.cancel_run(run_id, tenant_id=UNSCOPED)   # ok, explicitly an operato
 
 - `TenantScopeRequiredError` is a `ValueError`. It names the operation, not the data.
 - Delegated child runs inherit their parent's tenant and never raise.
-- Strict tenancy is opt-in in 0.5.0. It becomes the default in 0.6, and 0.5 prints a `FutureWarning` when you have not chosen. Choose with `strict_tenancy=True` or `strict_tenancy=False`.
+- Strict tenancy defaults to `True` in 0.6. Single-tenant scripts can explicitly choose `strict_tenancy=False`. Under strict tenancy, non-approval continuations also require `expected_pause_id`; omission raises `InputValidationError` with code `pause_id_required`.
 - It applies to `Agent` methods. Code that calls the lower-level `dendrux.run(agent, ...)` function directly is not covered.
 
 ### Metadata
@@ -121,7 +121,7 @@ Treat `UNSCOPED` as "no filter" and `None` as `tenant_id IS NULL` in `list_runs`
 
 ## Erasing a tenant
 
-Dendrux 0.5 does not ship a tenant erasure API; it is the first priority for 0.6. Until then, use the manual recipe in [Erasing a tenant's data](/docs/recipes/erasing-tenant-data).
+Dendrux 0.6 does not ship a tenant erasure API. Use the manual recipe in [Erasing a tenant's data](/docs/recipes/erasing-tenant-data).
 
 ## Where this fits
 

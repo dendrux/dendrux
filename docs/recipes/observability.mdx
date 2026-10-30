@@ -79,3 +79,28 @@ For optional live inspection use [Build your own read routes](/docs/recipes/buil
 `follow` shares polling and bounds iteration, while your transport bounds sends and
 closes every follower in `finally`. Keep raw provider payloads and PII mappings
 behind operator authorization; never copy an entire RunResult into a browser DTO.
+
+## What to alert on
+
+Structured log lines carry a stable `code`. Group alerts by that field and correlate with `run_id`; do not parse message text or export tool payloads. The generated [Log codes](/docs/reference/log-codes) reference lists levels, fields and suggested actions.
+
+| Code | Alert policy and action |
+| --- | --- |
+| `reclaim_limit` | Any occurrence: inspect repeated worker loss and the run's recovery history |
+| `lease_renew_failed`, `lease_lost` | Sustained renew failures or any lost lease: inspect database latency, availability and event-loop stalls |
+| `run_fenced` | A small burst after reclaim is expected; a sustained rate calls for checking worker turnover and lease sizing |
+| `notifier_degraded` | Lasting over one minute: inspect the primary LISTEN connection and its direct or session-pool endpoint |
+| `notifier_unavailable` | Listener startup cannot complete: check reachability and channel configuration; reads use polling |
+| `notifier_missed_hint` | A healthy reconciliation poll found rows without a hint, once per feed: verify every writer enables the matching channel |
+| `write_conflict` | Any occurrence: inspect conflicting writer identities or content before retrying |
+| `checkpoint_too_large`, `history_too_large`, `pending_limit` | Inspect the run's configured bounds and reduce state or fanout; do not continue with truncated history |
+| `recovery_call_missing`, `recovery_state_missing`, `recovery_state_invalid`, `loop_unknown` | Inspect stored recovery state and the deployed Agent/store versions |
+| `cascade_truncated` | Inspect the remaining subtree and cancel branches explicitly, or raise `Budget.max_subtree_nodes` |
+| `sweep_cap_reached`, `tool_pool_saturated` | Sustained rate: inspect backlog and worker capacity; keep dispatch bounded |
+| `provider_unknown` | Inspect the safe provider category and HTTP status; unknown vendor codes have no public mapping |
+
+On Postgres, also alert on sustained growth in `pg_notification_queue_usage()` when NOTIFY is enabled. A stuck listener can fill the queue and fail notifying writes at commit. A `notifier_recovered` log signals reconnection; confirm reader latency recovers too.
+
+Strict log-field validation is enabled only with `DENDRUX_STRICT_LOG_FIELDS=1`. In normal operation invalid fields are dropped and reported by `log_field_dropped`. Keep production diagnostics to codes, ids, counts and kinds.
+
+For recovered runs, inspect `RunResult.recovery` or the `recovery` envelope field from `agent.get_result`, plus the `run.lease_expired`, `run.reclaimed` and `tool.replayed` events. The replayed-call list is bounded; check `replayed_truncated`. With `OpenTelemetryNotifier`, persisted trace links keep resume and reclaim in the original trace across processes. See [Recovery](/docs/guides/recovery) and [OpenTelemetry](/docs/recipes/opentelemetry#one-trace-per-run).

@@ -1,0 +1,78 @@
+---
+title: Upgrading to 0.6.0
+description: Migrate, roll every worker and reader, activate format 2, then enable recovery and event notifications. Includes every changed default and rollback rules.
+---
+
+# Upgrading to 0.6.0
+
+0.6.0 adds explicit recovery after a worker stops, durable execution checkpoints, optional Postgres event notifications and trace continuity across processes. Applications own their workers, maintenance jobs and read routes.
+
+> **Activation is one-way.** Take a database backup before activation. Once activation starts, rollback means restoring that backup. There is no deactivation or CLI downgrade command. Do not let a 0.5 worker or reader access an activated database.
+
+## Upgrade in order
+
+1. **Migrate.** Install `dendrux[postgres]==0.6.0` in the migration job environment. Back up the database, then run `dendrux db migrate` once over a direct Postgres connection, before starting 0.6 workers. From the 0.5 head `e8f9a0b1c2d3`, revision `f9a0b1c2d3e4` adds recovery columns and `dendrux_settings`. It leaves the global storage format at `1` and does not build the new unique indexes. Older workers can keep working during this additive step. If upgrading from an earlier release, complete the [0.5 upgrade](/docs/upgrading-to-0.5.0) first.
+2. **Roll every worker and reader to 0.6.** Include read-only services, scripts, scheduled jobs and dashboards built on `RunStore`. Keep recovery and notifications off during the roll. Apply the default changes below in your application. Check the schema with `dendrux db check` and inspect `dendrux db status`; migration alone does not activate format 2.
+3. **Back up again, then activate.** Confirm that no old worker or reader remains. Take the pre-activation backup, then run `dendrux db activate` once over a direct Postgres connection. The command checks the schema, removes identical duplicate rows, builds three unique indexes and sets the global format to `2`. It refuses conflicting duplicates rather than choosing between different contents. Progress is durable; fix the reported condition and rerun the command after a failure. `dendrux db status` should show `storage_format=2 activate_step=done`.
+4. **Enable recovery and notifications explicitly.** Call `sweep(on_stale="reclaim", ...)` from your own maintenance job and dispatch the returned items to `agent.reclaim(..., tenant_id=..., item=...)`. Use a `stale_running` threshold at least three times `Agent.lease_interval`. For Postgres notifications, set `database_options={"notify_channel": "dendrux_events"}` on every writer, and `listen_url=` or a started `notifier=` on readers. The listener must connect to the primary through a direct or session-pooled endpoint. See [Recovery](/docs/guides/recovery) and [Scaling workers](/docs/guides/scaling#event-notifications).
+
+The CLI reads the database URL from `DENDRUX_DATABASE_URL`; keep using your deployment's credential injection for that variable.
+
+```bash
+dendrux db migrate
+dendrux db check
+dendrux db status
+# Roll every worker and reader, then take the pre-activation backup.
+dendrux db activate
+dendrux db status
+```
+
+An unstamped database with the complete expected schema can activate too. Use `dendrux db check --allow-unstamped` to check its structure; a stamped database must be at the current migration head. Do not stamp an incomplete schema to make the check pass.
+
+### SQLite files
+
+SQLite adds the new columns on first use, but an existing file stays at format 1 until explicit activation. **Stop every other process using the file before `dendrux db activate`.** The command takes an exclusive lock and refuses a live competing transaction. That lock cannot prove that no idle process will write later. Back up the file before activation and restart only 0.6 processes afterwards.
+
+A fresh database created by Dendrux's `create_all` path starts active at format 2. A migrated production database starts at format 1 until activation.
+
+## A run keeps its storage format
+
+`agent_runs.storage_format` is chosen when the run is created. Activation changes new runs only. A format-1 run stays format 1 across every pause and resume; there is no conversion job.
+
+Format-2 runs store conversation history in traces and execution state in a bounded checkpoint. Pause data uses `schema_version=2` and omits the growing history and step list. Readers must understand seed, turn, rewrite and state traces. `RunStore.get_traces` and `dendrux traces` expose the current conversation, including the latest replacement prefix after compaction, and omit state rows. They return the provider form, including PII placeholders; the reverse mapping remains a separate trusted read.
+
+`reclaim()` refuses format-1 runs with `RunNotReclaimableError(reason="legacy_run")`. Under `sweep(on_stale="reclaim")`, stale legacy runs end as `error` with `failure_reason="stale_running_legacy"`. They appear in `SweepResult.stale_running`, not `reclaimable`.
+
+## Every default change
+
+| Setting or call | 0.5 behavior | 0.6 behavior | Application action |
+| --- | --- | --- | --- |
+| `Agent(strict_tenancy=)` | Defaults to `False`, with a `FutureWarning` when not chosen | Defaults to `True` | Pass `tenant_id` at every entry point. A single-tenant script can explicitly keep `strict_tenancy=False`. |
+| Non-approval continuation without `expected_pause_id`, under strict tenancy | `FutureWarning` | `InputValidationError`, field `expected_pause_id`, code `pause_id_required` | Send the pause id the actor reviewed with tool results, input, resume and plain continue calls. `strict_tenancy=False` retains optional tokens for these calls. Approval that allows execution still requires a token in either mode. |
+| `Agent(on_governance_change=)` | Defaults to `"warn"` | Defaults to `"raise"` | Resume with the original governance configuration, or explicitly select `"warn"` when intentionally changing it. The only values remain `"warn"` and `"raise"`. |
+| `Budget(count_cache_tokens=)` | Counts fresh input and output by default; warns if a token budget leaves the choice unset | Counts cache reads and writes too by default | Review token caps. Explicit `count_cache_tokens=False` preserves the old count. |
+| Implicit `DENDRUX_DATABASE_URL` engine on `Agent` | Uses the environment variable and emits `DeprecationWarning` | Removed; persistence must be configured explicitly | Pass `state_store=` or `database_url=`. The CLI still reads the variable. |
+| `sweep(on_stale=)` | Finalizes stale running rows as errors | Omission still finalizes them and now emits `FutureWarning` when stale rows are found; the default changes to `"reclaim"` in 0.7 | Pass `on_stale="error"` to retain finalization, or explicitly opt into `"reclaim"` after activation. |
+
+## Other changes to check
+
+- `agent.reclaim()` always requires an explicit `tenant_id`, including when `strict_tenancy=False`. Prefer the `tenant_id` on the returned sweep item. Explicit `None` selects untenanted runs; trusted cross-tenant code can pass `UNSCOPED`.
+- Custom state stores declare capabilities. An undeclared store keeps the old signatures and format 1. Subclass overrides must accept and forward the new keyword parameters or narrow their declaration. A mismatch raises `StoreCapabilityError` at Agent construction. See the [capability matrix](/docs/reference/state-store).
+- Format-2 provider options must be JSON-only and fit 2 KiB. An assistant batch has at most 64 pending calls by default (`Limits.max_pending_calls`). Checkpoints fit 32 KiB; history rebuild defaults to 16 MiB and 20,000 rows. Over-limit history is refused rather than truncated.
+- Every approved tool execution on a format-2 run adds one checkpoint before dispatch. A decision authorizes one attempt; a second crash may require approval again. Mark a tool `idempotent=True` only when repeating its external effect is safe.
+- Public provider codes come from a closed set. Unknown vendor codes and unmapped custom-provider codes become `provider_unknown`. Package-issued codes retain their meaning. The raw vendor value remains only on the exception's `provider_code_raw`; do not export it to clients or telemetry.
+- A non-streaming socket read timeout reports `timeout_reason=None`. `call_deadline` means Dendrux's own deadline, not a socket timeout.
+- `max_stream_bytes` also limits one SSE event's wire size. A low custom cap may now reject a final event that repeats a response. Compressed responses accept gzip or deflate; unsupported or stacked encodings raise `response_encoding_unsupported`.
+- Cascade cancellation stays inside the root run's tenant even when called unscoped. Traversal is capped by `Budget.max_subtree_nodes` (default 10,000); `cascade_truncated` means remaining branches need attention. Finished runs keep their `cancel_requested` value. On SQLite, delegated-child creation briefly acquires the write lock before checking the parent.
+- Postgres NOTIFY is off by default. Each notifying transaction takes a database-wide lock at commit. A 50-writer local probe saw about 45% lower write throughput with it enabled; this is a local measurement, not a capacity guarantee. A stuck listener can fill the notification queue and cause writes to fail. Monitor `pg_notification_queue_usage()` and the notifier [alert codes](/docs/recipes/observability#what-to-alert-on).
+- `EventNotifier`, `NotifierState`, `Subscription` and `PostgresEventNotifier` are public in `dendrux.store`.
+- Resumes, submissions and reclaim use the stored trace link to stay in one trace when an OpenTelemetry notifier is supplied. Tool-failure spans contain the completion-callback stack, not the tool's crash site.
+- Structured logs carry stable codes. Strict field checking is opt-in with `DENDRUX_STRICT_LOG_FIELDS=1`; normal operation drops invalid fields. See [Log codes](/docs/reference/log-codes).
+
+## Rollback
+
+Before activation starts, the migration is additive and old workers can still use format-1 data. Alembic can downgrade that revision only while activation has never started. The migration refuses downgrade as soon as `activate_step` exists, even if activation did not finish.
+
+The optional `dendrux db dedupe` command also writes that marker. Back up before using it and treat the same downgrade boundary as crossed.
+
+After that point, stop the application and restore the pre-activation backup before deploying an older version. Rehearse backup and restore on a copy of your data before the production upgrade.

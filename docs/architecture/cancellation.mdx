@@ -213,11 +213,14 @@ print(result.meta["cascade"])
 #  {'run_id': 'root',    'outcome': 'cancelled'}]
 ```
 
-- It works on a **point-in-time snapshot** of the descendants, deepest first with `run_id` last. A child created after the snapshot is not included.
+- The built-in store marks each frontier before paging its children, then finalizes paused descendants deepest first with `run_id` last. New child admission under a marked parent is refused. An in-flight creator already past its check commits before that parent is scanned. On SQLite, delegated creation briefly reserves the writer before its first read; Postgres uses a parent-row lock.
 - Each run's outcome is listed in `meta["cascade"]`: `cancelled` (finalized now), `cancel_requested` (it is running; it stops at its next checkpoint, or is interrupted at once if it is running in this process) or `terminal` (already finished).
 - Paused descendants (`waiting_*` or `paused`) are finalized in the same call.
 - `cascade=False` (the default) cancels only `run_id`; its children keep running.
-- `tenant_id=` scopes the call: the root must belong to exactly that tenant (or `RunNotFoundError`), and the cascade only reaches descendants of the same tenant.
+- `tenant_id=` scopes the call: the root must belong to that tenant or `RunNotFoundError` is raised. Even explicit `UNSCOPED` traversal stays inside the root's actual tenant, including NULL. Terminal rows retain their flags and timestamps; their active descendants are still visited.
+- Traversal is bounded by `Budget.max_subtree_nodes` (default 10,000, including the root). `cascade_truncated` logs the retained count and limit when traversal is cut. Cancel remaining subtrees explicitly or deliberately raise the bound. The outcome summary is capped at 1,000 entries; `meta["cascade_truncated"]` can also indicate summary truncation.
+- Cancelling a nested run that shares a task with its ancestors interrupts that run and its active nested descendants while allowing the ancestors to continue.
+- Custom stores without the frontier methods retain snapshot semantics and their existing admission guarantees.
 - Stores written for earlier releases that do not implement `get_subtree` raise `NotImplementedError` naming the missing method when `cascade=True` is used.
 
 External callers only set flags and finalize paused rows. The `run.cancelled` event of a running descendant is written by that run's own runner when it observes the flag.

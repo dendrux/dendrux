@@ -12,8 +12,10 @@ docs/
 ├── is-dendrux-for-you.mdx  → /docs/is-dendrux-for-you
 ├── quickstart.mdx          → /docs/quickstart
 ├── upgrading-to-0.5.0.mdx  → /docs/upgrading-to-0.5.0
+├── upgrading-to-0.6.0.mdx  → /docs/upgrading-to-0.6.0
 ├── guides/                 → /docs/guides/*
-│   └── scaling.mdx         (pools, PgBouncer, migrations, sweeps, every bound)
+│   ├── scaling.mdx         (pools, notifier URLs, migrations, leases, bounds)
+│   └── recovery.mdx        (sweep, reclaim, replay and crash approval)
 ├── architecture/           → /docs/architecture/*
 │   ├── runs.mdx, state-persistence.mdx, event-ordering.mdx
 │   ├── pause-resume.mdx, cancellation.mdx, inbox.mdx
@@ -26,6 +28,8 @@ docs/
 │   └── notifier.mdx, recorder.mdx
 ├── recipes/                → /docs/recipes/*
 └── reference/              → /docs/reference/*
+    ├── state-store.mdx     (capabilities and format requirements)
+    └── cli.mdx             (database checks, activation and status)
 ```
 
 Adding a page here does not add it to the site's sidebar. The navigation is hand-curated in the docs site repo (`lib/docs-nav.ts`); add the entry there in the same change.

@@ -1,6 +1,6 @@
 ---
 title: Agent
-description: The Agent constructor and every public runtime method (run, resume, the submit family, pause, notes, stream, cancel, retry, close) with exact signatures.
+description: The Agent constructor and public runtime methods, including reclaim, lease renewal, resume, submit, stream, cancel and retry.
 ---
 
 # Agent
@@ -56,10 +56,11 @@ Agent(
     before_tool: BeforeToolHook | None = None,
     images: ImagePolicy | None = None,
     blob_store: BlobStore | None = None,
-    strict_tenancy: bool = False,
+    strict_tenancy: bool = True,
     limits: Limits | None = None,
     tool_threads: int = 8,
-    on_governance_change: Literal["warn", "raise"] = "warn",
+    on_governance_change: Literal["warn", "raise"] = "raise",
+    lease_interval: timedelta = timedelta(seconds=30),
 )
 ```
 
@@ -74,9 +75,9 @@ Agent(
 | `max_delegation_depth` | Max sub-agent nesting depth. |
 | `loop` | `ReActLoop()` (default) or `SingleCall()`. See [Loops](/docs/architecture/loops). |
 | `output_type` | A pydantic model for structured output. SingleCall only. |
-| `database_url` | SQLAlchemy async URL. Enables persistence. Builds an engine owned by this Agent, so pass it for a script that creates one Agent, not on every request. With neither `database_url` nor `state_store`, the deprecated fallback to `DENDRUX_DATABASE_URL` still works but warns once and is removed in 0.6. |
-| `database_options` | Extra kwargs passed to `create_async_engine`. |
-| `state_store` | An explicit `StateStore` instead of `database_url` (mutually exclusive). Create one per process and share it. See [Web endpoints](/docs/recipes/web-endpoint). |
+| `database_url` | SQLAlchemy async URL. Enables persistence. Matching URLs and options share an engine within the process and event loop; close every Agent to release its reference. Configure persistence with `database_url` or `state_store`; the implicit `DENDRUX_DATABASE_URL` engine is removed. The CLI still reads the variable. |
+| `database_options` | Engine options plus the store option `notify_channel` (default `None`, notifications off). Only engine options reach `create_async_engine`. See [Scaling](/docs/guides/scaling#event-notifications). |
+| `state_store` | An explicit `StateStore` instead of `database_url` (mutually exclusive). Create one per worker event loop and share it. See [StateStore capabilities](/docs/reference/state-store). |
 | `deny` | Tool names that can never execute. See [Access control](/docs/architecture/access-control). |
 | `require_approval` | Server-tool names that pause for approval. See [Approval](/docs/architecture/approval). |
 | `budget` | A `Budget(max_tokens=..., max_cost_usd=..., warn_at=..., on_exceed=..., include_children=...)`. Token and dollar limits with an optional pause or cancel. See [Budget](/docs/architecture/budget). |
@@ -87,13 +88,16 @@ Agent(
 | `tool_result_transform` | Callable that rewrites a successful server tool's result, or a successful result your client submits, before it is persisted or sent to the model. See [Transforming tool results](#transforming-tool-results). |
 | `before_tool` | Sync or async policy hook, run once for each parsed tool call that passes static `deny=` and skill preflight, before approval; called with a `ToolCallContext`, returns a `ToolDecision` or `None`. Not supported with `SingleCall`. See [Tool policy hook](/docs/architecture/tool-policy). |
 | `images` | An `ImagePolicy`: size and count caps, non-vision handling, the drop-old-images window, URL fetching and the ingest hook. `None` uses the defaults (vendor limits). Readable as `agent.image_policy`. See [Images](/docs/recipes/images). |
-| `strict_tenancy` | `True` makes every entry point (`run`, `stream`, `retry`, `resume*`, `submit_*`, `cancel_run`, `request_pause`, `submit_note`) require an explicit `tenant_id` and raise `TenantScopeRequiredError` otherwise. Default `False` in 0.5; becomes the default in 0.6 (a `FutureWarning` fires if you have not chosen). See [Multi-tenancy](/docs/architecture/multi-tenancy). |
+| `strict_tenancy` | Defaults to `True` in 0.6. Every entry point (`run`, `stream`, `retry`, `resume*`, `submit_*`, `cancel_run`, `request_pause`, `submit_note`) requires explicit `tenant_id` or raises `TenantScopeRequiredError`. A single-tenant script can select `False`. `reclaim` always requires explicit scope. See [Multi-tenancy](/docs/architecture/multi-tenancy). |
 | `limits` | A `Limits(...)` with the size caps below. `None` uses the defaults. See [Limits](#limits). |
 | `tool_threads` | How many threads of the shared sync-tool pool this Agent may occupy at once. Default 8. See [Tools](/docs/reference/tools#timeouts-and-the-thread-pool). |
-| `on_governance_change` | What a resume does when governance differs from the run's start: `"warn"` (default; emits `governance.changed`) or `"raise"` (`GovernanceMismatchError`). Becomes `"raise"` by default in 0.6. See [Governance](/docs/architecture/governance#detecting-changed-governance-on-resume). |
+| `on_governance_change` | What a resume does when governance differs from the run's start: `"raise"` (default; `GovernanceMismatchError`) or explicit `"warn"` (emits `governance.changed` and proceeds). See [Governance](/docs/architecture/governance#detecting-changed-governance-on-resume). |
+| `lease_interval` | `timedelta`, default 30 seconds, minimum 5 seconds. Renews progress while a persisted model or tool call is in flight on a fenced store. Set the sweep's `stale_running` to at least three times this value. See [Recovery](/docs/guides/recovery). |
 | `blob_store` | A `BlobStore` that holds image bytes outside the Dendrux database (for example S3). `None` keeps bytes in the database. Pass the same store to every `Agent` and `RunStore` of the deployment. `agent.blobs` exposes `read`, `info`, `references`, `purge` and `collect_garbage`. See [S3 recipe](/docs/recipes/images-s3). |
 
 Construction validates its inputs: unknown names in `deny`/`require_approval`, `deny`/`require_approval` overlap, `output_type` without `SingleCall`, tools with `SingleCall`, and bad values for `strict_tenancy`, `limits`, `tool_threads` or `on_governance_change` all raise `ValueError`. A `Budget(max_cost_usd=...)` for a model with no price raises `BudgetConfigurationError` here and again at run start.
+
+An invalid `lease_interval` raises `ValueError`. Declared store capabilities are checked at construction; an incompatible method raises `StoreCapabilityError` before execution.
 
 ### Limits
 
@@ -105,6 +109,9 @@ Construction validates its inputs: unknown names in `deny`/`require_approval`, `
 | `max_input_bytes` | 1 MiB | UTF-8 text parts of a run's input (images have their own caps) | `ValueError` before the run is created |
 | `max_metadata_bytes` | 64 KiB | Run `metadata` | `ValueError` |
 | `max_notes_per_run` | 1000 | `submit_note` per run | `NoteLimitExceededError` (a `ValueError`) |
+| `max_pending_calls` | 64 | One format-2 assistant call batch, before dispatch | Run ends `error` with `failure_reason="pending_limit"` |
+| `max_rebuild_bytes` | 16 MiB | Format-2 conversation reconstruction | Reclaim refuses with `history_too_large`; resume refuses invalid input |
+| `max_rebuild_rows` | 20,000 | Expanded conversation entries during reconstruction | Same refusal; history is never truncated to continue |
 
 [//]: # "docs-test: skip - fragment: relies on `provider`, defined by setup shown elsewhere"
 
@@ -232,6 +239,7 @@ class RunResult:
     error_info: ErrorInfo | None
     pause_id: str | None
     pending: PendingPause | None
+    recovery: RecoveryInfo | None
 
     @property
     def truncated(self) -> bool
@@ -248,6 +256,7 @@ class RunResult:
 | `error_info` | An [`ErrorInfo`](/docs/reference/errors#provider-errors) when a provider or database failure ended the run: `category`, `retryable`, `safe_message`, `error_type`, `provider`, `model`, `status_code`, `provider_code` and `timeout_reason`. Every field is a code, number or name. A stale stream observing a live owner uses `category="run_fenced"` while preserving its current run status; otherwise `None` for other outcomes. |
 | `pause_id` | The id of the current pause of a paused run; pass it back as `expected_pause_id=`. |
 | `pending` | The active pause as a `PendingPause` (the same object `RunStore.get_pending` returns), or `None`. |
+| `recovery` | Reclaim count, last reclaim time and bounded replayed-call ids, or `None` for a run never reclaimed. See [Recovery](/docs/guides/recovery#inspect-a-recovered-run). |
 | `meta` | Run metadata such as `meta["undelivered_notes"]`, `meta["interrupted"]` and `meta["mcp_skipped_sources"]`. A fresh result from `run()` includes `meta["pii_mapping"]` (placeholder to real value) when guardrails redacted anything; treat it as sensitive and never return `meta` wholesale. It never contains the internal pause state. |
 
 ### `to_dict()`: the browser envelope
@@ -414,7 +423,7 @@ async def resume(
 
 Every method takes a keyword-only `tenant_id=`, like `cancel_run` and `submit_note`. Pass the tenant your request is authenticated for. The run must belong to exactly that tenant (`None` matches untenanted runs only), otherwise `RunNotFoundError` is raised, the same error as a missing run, so existence never leaks across tenants. The check runs before anything is written: no tool results, input, approval decisions, claim, status change or event. Omit it (or pass `UNSCOPED`) to skip the check; with `Agent(strict_tenancy=True)` omitting it raises `TenantScopeRequiredError`. See [Multi-tenancy](/docs/architecture/multi-tenancy).
 
-Each method also takes `expected_pause_id=`: the `pause_id` of the pause the caller was shown (`RunResult.pause_id`, `PendingPause.pause_id` or the `run.paused` event). If the run's current pause has a different id, the call raises `PauseStatusMismatchError` (`reason="pause_id"`) and writes nothing, which stops a stale client from answering a newer pause. **Approving requires it**: `approved=True`, a `decisions=` batch that approves any call, and `resume` of an approval pause raise `InputValidationError` (a `ValueError`, code `pause_id_required`) without it. For tool results, input and plain continues it is optional, and under `strict_tenancy=True` omitting it prints a `FutureWarning`. Control flags such as `approved` and `cascade` must be real `bool` values; `"false"` or `1` raises `ValueError`. See [Pause ids and stale submits](/docs/architecture/pause-resume#pause-ids-and-stale-submits).
+Each method also takes `expected_pause_id=`: the `pause_id` of the pause the caller was shown (`RunResult.pause_id`, `PendingPause.pause_id` or the `run.paused` event). A different current id raises `PauseStatusMismatchError` (`reason="pause_id"`) before writes. Under the default `strict_tenancy=True`, tool results, input and plain continues require it; omission raises `InputValidationError` (field `expected_pause_id`, code `pause_id_required`). With `strict_tenancy=False` those tokens stay optional. **Approval that allows execution requires it in either mode**: `approved=True`, any approving `decisions=` entry, or `resume` of an approval pause. Control flags such as `approved` and `cascade` must be real `bool` values; `"false"` or `1` raises `ValueError`. See [Pause ids and stale submits](/docs/architecture/pause-resume#pause-ids-and-stale-submits).
 
 [//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
 
@@ -458,6 +467,26 @@ Streaming variant of resume: returns a `RunStream` for the resumed run. Image er
 
 `tenant_id=` works as for the other methods, with one difference in how it fails. Without it, setup failures such as a missing run come back as a `RUN_ERROR` event. With it, a run outside the tenant raises `RunNotFoundError` from the first iteration, before any event, and a store error from the tenant check (a database outage, say) is raised the same way instead of becoming `RUN_ERROR`. The run is left untouched. Catch the exception around the `async for`. If the agent has no persistence, the check is skipped and the usual "requires persistence" `RUN_ERROR` follows.
 
+## `reclaim`
+
+[//]: # "docs-test: skip - API signature listing, not runnable code"
+
+```python
+async def reclaim(
+    run_id: str,
+    *,
+    tenant_id: TenantScope = ...,    # omission always raises TenantScopeRequiredError
+    notifier: LoopNotifier | None = None,
+    item: ReclaimableRun | None = None,
+) -> RunResult
+```
+
+Continue a marked format-2 ReAct run from its committed checkpoint. Call `sweep(on_stale="reclaim")` first. `item=` checks the epoch on that exact mark; `item.run_id` must match `run_id`. The Agent name, loop, skills and governance must match the stored run, subject to the explicit governance policy. A missing or foreign run raises `RunNotFoundError`; other precondition failures raise `RunNotReclaimableError` with a stable `reason` such as `legacy_run`, `lease_fresh` or `already_reclaimed`.
+
+Explicit tenant scope is mandatory even with `strict_tenancy=False`. `None` selects untenanted runs; `UNSCOPED` is for trusted cross-tenant use. A store without recovery capability raises `NotImplementedError`. An interrupted non-idempotent tool pauses for approval before another attempt. The result can be paused or terminal, just like `run`. See [Recovery](/docs/guides/recovery).
+
+`RunResult.recovery` is `None` until a run has been reclaimed. Otherwise it contains the reclaim count, last reclaim time and a bounded replayed-call list with a truncation flag. The additive `recovery` field is included in `to_dict()` and `get_result()` for reclaimed runs; unreclaimed envelopes omit it.
+
 ## `cancel_run`
 
 [//]: # "docs-test: skip - API signature listing, not runnable code"
@@ -473,7 +502,7 @@ async def cancel_run(
 
 Request cancellation. Works for paused runs (atomic CAS to `cancelled`, including `paused`), running runs (cooperative flag), batch `run()` calls and streamed runs this instance owns (in-process interrupt: the in-flight model call or tool is abandoned; `run()` returns `CANCELLED` with `meta["interrupted"]`, a stream ends with `RUN_CANCELLED` carrying the partial `answer`), and terminal runs (no-op, never raises). Since 0.5.0 the same in-process interrupt also applies to a run that a `submit_*` or `resume` call is executing: that call returns a `CANCELLED` `RunResult` instead of raising `CancelledError`. Cancelling the task that is awaiting the call still raises. When the durable `cancelled` status could not be confirmed, `meta["dendrux.cancel_persisted"]` is `False`; check it before treating the cancellation as saved. Returns the persisted state at the time of the request; a non-terminal `status` with `meta["cancel_requested"] == True` means "requested, not yet stopped".
 
-`cascade=True` also cancels every non-terminal descendant, deepest first and `run_id` last, over a point-in-time snapshot; per-run outcomes are in `meta["cascade"]`. `tenant_id=` requires the run to belong to exactly that tenant (`None` = untenanted) or `RunNotFoundError` is raised, and limits the cascade to the same tenant. A cancel that arrives after the run's last checkpoint does not stop a run that then completes successfully. Raises `RunNotFoundError` and `PersistenceNotConfiguredError`. See [Cancellation](/docs/architecture/cancellation).
+`cascade=True` marks frontiers before scanning children and finalizes paused descendants deepest first, with the root last. Traversal stays inside the root tenant even for `UNSCOPED`, and is bounded by `Budget.max_subtree_nodes` (default 10,000). Per-run outcomes are in `meta["cascade"]` (at most 1,000). A `cascade_truncated` warning signals a traversal cut; `meta["cascade_truncated"]` can also signal summary truncation. Terminal rows retain their flags. `tenant_id=` must match the root or `RunNotFoundError` is raised. A cancel after the last checkpoint does not stop a run that completes successfully. Raises `RunNotFoundError` and `PersistenceNotConfiguredError`. See [Cancellation](/docs/architecture/cancellation).
 
 ## `request_pause`
 
@@ -540,7 +569,7 @@ Start a fresh run that reuses an existing terminal run's input and approximate p
 async def close() -> None
 ```
 
-Close directly owned MCP sources, the provider, and any agent-owned engine. Called for you by `async with Agent(...)`. Leases on shared MCP connections (`MCPRuntime` views, `MCPHost`) are released, never closed; the application closes its runtime or host at worker shutdown. The shared global engine from the deprecated `DENDRUX_DATABASE_URL` fallback is not disposed because it is not agent-owned.
+Close directly owned MCP sources, the provider, and the Agent's shared engine reference. Called for you by `async with Agent(...)`. Leases on shared MCP connections (`MCPRuntime` views, `MCPHost`) are released; the application closes its runtime or host at worker shutdown. An engine supplied through `state_store=` remains application-owned.
 
 ### Wire answer display bound
 

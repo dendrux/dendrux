@@ -20,7 +20,8 @@ from dendrux.errors import (
     ProviderAuthError, ProviderRateLimitError, ProviderTimeoutError, ProviderUnavailableError,
     ProviderStreamIncompleteError, ModelRefusalError, ContentFilteredError,
     BudgetConfigurationError, TenantScopeRequiredError, GovernanceMismatchError,
-    NoteLimitExceededError, PersistenceError,
+    NoteLimitExceededError, PersistenceError, RunControlError, RunNotReclaimableError,
+    RunCancelledError, StoreCapabilityError, NotifierUnavailableError,
 )
 from dendrux.types import InputValidationError   # also a ValueError
 from dendrux.store import FollowCapacityError
@@ -30,24 +31,31 @@ The most common ones are also re-exported from the top-level `dendrux` package.
 
 ## The hierarchy
 
+`RunNotPausedError`, `PauseStatusMismatchError`, `RunAlreadyClaimedError` and `RunAlreadyTerminalError` now share `RunControlError`, which still subclasses `RuntimeError`. Existing catches continue to work.
+
 | Exception | Base | Raised when | Suggested HTTP |
 | --- | --- | --- | --- |
+| `RunControlError()` | `RuntimeError` | Shared base for run-control conflicts. Catch a more specific class when choosing a recovery action. | per subclass |
+| `RunNotReclaimableError(run_id, reason)` | `RunControlError` | Recovery preconditions fail, a mark was already claimed, or history reconstruction is refused. `reason` is a stable code. See [Recovery](/docs/guides/recovery). | 409 |
+| `RunCancelledError(run_id, parent_run_id)` | `RunControlError` | Delegated-child creation finds a terminal parent or a pending parent cancellation. | 409 |
+| `StoreCapabilityError(store, capability, method, missing)` | `TypeError` | A declared store capability has an incompatible method or keyword signature. Fix the store before accepting work. | 500 |
+| `NotifierUnavailableError(reason)` | `RuntimeError` | An explicitly managed event notifier cannot start. Owned RunStore listeners fall back to polling on unavailability. | 503 |
 | `RunNotFoundError(run_id)` | `LookupError` | `run_id` does not exist, or belongs to a tenant other than the one you passed. The same error for both, from `Agent`, `retry` and `RunStore` alike (`dendrux.store.RunNotFoundError` is an alias of this class). | 404 |
 | `RunNotPausedError(run_id, current_status)` | `RuntimeError` | A submit method is called on a run that is not paused. | 409 |
 | `PauseStatusMismatchError(run_id, current_status, expected_status, *, expected_pause_id=, current_pause_id=, reason=)` | `RuntimeError` | `reason="status"` (the default): a submit for the wrong pause type (e.g. `submit_tool_results` on `waiting_human_input`). `reason="pause_id"`: the call carried an `expected_pause_id=` that is no longer the run's current pause, so it is a stale submit; nothing was claimed or written. See [Pause ids and stale submits](/docs/architecture/pause-resume#pause-ids-and-stale-submits). | 409 |
 | `RunAlreadyClaimedError(run_id)` | `RuntimeError` | A concurrent submit already won the CAS claim on this pause. | 409 |
 | `RunAlreadyTerminalError(run_id, current_status)` | `RuntimeError` | A submit method, or `submit_note`, targets a run that is already terminal; also a submit on a run whose cancellation was requested but not yet observed. (`cancel_run` and `request_pause` do not raise this.) | 409 |
 | `InvalidToolResultError(run_id, detail)` | `ValueError` | Submitted tool results do not match the pending set: an unknown, duplicate or missing call id, a tool name that differs from the pending call, a payload that is not valid, finite JSON or text, or an approval-path result that is not a failed denial. `detail` is a fixed description and never echoes a client id or payload. The run stays paused and unclaimed. | 400 |
-| `InputValidationError(field, code)` | `ValueError` | A client value cannot be accepted or stored: `field` names a fixed API field (never an input key or value) and `code` is `invalid_identifier`, `invalid_text` (NUL or a lone surrogate), `invalid_json`, `nonfinite_json`, `structure_limit` or `pause_id_required` (approving without `expected_pause_id`). Raised before anything is written or claimed. Import it from `dendrux.types`. | 400 |
+| `InputValidationError(field, code)` | `ValueError` | A client value cannot be accepted or stored: `field` names a fixed API field (never an input key or value) and `code` is `invalid_identifier`, `invalid_text` (NUL or a lone surrogate), `invalid_json`, `nonfinite_json`, `structure_limit` or `pause_id_required` (an approving call or strict-tenancy continuation without `expected_pause_id`). Raised before anything is written or claimed. Import it from `dendrux.types`. | 400 |
 | `PersistenceError()` | `RuntimeError` | A database operation failed. SQL, bound parameters and driver text are omitted (`safe_message`, `retryable`). Inside a run it ends the run `error` with `error_info.category == "persistence_error"`. | 500 or 503 |
 | `FollowCapacityError(limit, per_tenant=False)` | `RuntimeError` | `RunStore.follow` has no free follower slot: the store cap, or (`per_tenant=True`) the cap for that tenant scope. Safe to retry shortly. See [Build your own read routes](/docs/recipes/build-your-own-read-routes). | 503 |
-| `PersistenceNotConfiguredError()` | `RuntimeError` | A method needs persistence but no `database_url` / `state_store` is configured (and the deprecated `DENDRUX_DATABASE_URL` fallback is unset). | 500 |
+| `PersistenceNotConfiguredError()` | `RuntimeError` | A method needs persistence but no `database_url` / `state_store` is configured (the Agent no longer reads `DENDRUX_DATABASE_URL`). | 500 |
 | `SchemaNotInitializedError()` | `RuntimeError` | The database has no Dendrux tables yet (non-SQLite needs `dendrux db migrate`). | 500 |
 | `SchemaOutOfDateError(missing_tables=(), missing_columns=(), missing_indexes=())` | `RuntimeError` | A non-SQLite database is missing tables, columns or required indexes this version needs, because `dendrux db migrate` was not run after upgrading. Raised once per engine, before the first run (`Agent`, `sweep`; `RunStore` is not checked). Table/column presence and required Postgres index definitions/readiness are verified; column types and defaults are not. Carries `err.missing_tables`, `err.missing_columns` (`"table.column"`), `err.missing_indexes` and `err.missing`. Set `DENDRUX_SKIP_SCHEMA_CHECK=1` to skip the check. See [Upgrading](/docs/architecture/state-persistence#upgrading). | 500 |
 | `ContextLengthExceededError(message, status_code=, provider_code=, model=)` | `ProviderError` | A provider rejected a batch or streaming request as larger than the model's context window. The SDK error is chained as `__cause__`; the message never contains prompt content. See [Models and providers](/docs/architecture/models#request-errors-on-openai-compatible-endpoints). | 413 or 400 |
 | `ProviderError(provider=, model=, status_code=, provider_code=, category=, retryable=, timeout_reason=)` | `RuntimeError` | The base of every failed LLM request in 0.5.0. Carries `.category`, `.retryable` and `.safe_message`; the SDK exception is on `__cause__`. See [Provider errors](#provider-errors). | 502 |
 | `BudgetConfigurationError(model=, reason=)` | `ValueError` | `Budget(max_cost_usd=...)` on an `Agent` whose model has no price (no `PriceTable` entry and a provider that does not report cost), at construction or at run start. See [Budget](/docs/architecture/budget#dollar-limits). | 500 |
-| `TenantScopeRequiredError(operation)` | `ValueError` | `Agent(strict_tenancy=True)` and the call omitted `tenant_id`. See [Multi-tenancy](/docs/architecture/multi-tenancy#strict-tenancy). | 500 |
+| `TenantScopeRequiredError(operation)` | `ValueError` | `Agent(strict_tenancy=True)` and the call omitted `tenant_id`, or any `reclaim` omitted it. See [Multi-tenancy](/docs/architecture/multi-tenancy#strict-tenancy). | 500 |
 | `GovernanceMismatchError(run_id, expected_digest=, actual_digest=, changed=)` | `RuntimeError` | A resume found different governance from the run's start and the Agent has `on_governance_change="raise"`. `changed` names the parts, never their contents. See [Governance](/docs/architecture/governance#detecting-changed-governance-on-resume). | 409 |
 | `NoteLimitExceededError(run_id, limit)` | `ValueError` | `submit_note` on a run that already holds `max_notes_per_run` notes. | 409 |
 | `ImageError(ValueError)` | `ValueError` | Base class of `InvalidImageError`, `ImageLimitError` and `ImageFetchError`; catch it for any bad image input. | 400 |
