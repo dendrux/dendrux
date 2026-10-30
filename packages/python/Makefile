@@ -1,4 +1,4 @@
-.PHONY: test test-model-check test-model-install bench lint typecheck arch crap api-check format package-smoke ci clean
+.PHONY: test test-model-check test-model-install bench load load-quick lint typecheck arch crap api-check format package-smoke ci clean
 
 # Benchmarks measure the server, not the code, so they are not part of the gates.
 test: test-model-check
@@ -28,6 +28,18 @@ crap:
 # in the load-test results doc. Needs DENDRUX_TEST_PG_URL.
 bench:
 	pytest tests/ -v -rs -n 0 -m benchmark -p no:randomly
+
+# Scale evidence. Needs a private Postgres database whose name ends in _test (the script drops
+# its tables), given as DENDRUX_LOAD_PG_URL. `load` is the full run (tens of minutes, run it on a
+# quiet machine); `load-quick` is the CI subset and fails on a >20% statement-count regression
+# against tools/load_baseline.json. Both write their full results to $(LOAD_JSON).
+LOAD_JSON ?= $(or $(TMPDIR),/tmp)/dendrux-load-results.json
+
+load:
+	python tools/load.py --scale full --workers 2 --json $(LOAD_JSON)
+
+load-quick:
+	python tools/load.py --scale quick --workers 2 --baseline tools/load_baseline.json --json $(LOAD_JSON)
 
 # Public API breaks against the last release tag (needs `git fetch --tags`).
 # Fails on any break without a migration-note B-item.
