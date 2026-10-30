@@ -890,6 +890,14 @@ NOTIFIER_UNAVAILABLE = Code(
     "The notification channel cannot start.",
     "Check its direct or session-pooled Postgres connection.",
 )
+NOTIFIER_MISSED_HINT = Code(
+    "notifier_missed_hint",
+    logging.WARNING,
+    "notifier",
+    _BASE_FIELDS | frozenset({"count"}),
+    "A healthy feed finds new rows on reconciliation without a wake hint, once per feed.",
+    "Enable the channel on every writer and verify matching writer/listener channels.",
+)
 PROVIDER_UNKNOWN = Code(
     "provider_unknown",
     logging.WARNING,
@@ -1753,6 +1761,7 @@ REGISTRY = MappingProxyType(
             NOTIFIER_DEGRADED,
             NOTIFIER_RECOVERED,
             NOTIFIER_UNAVAILABLE,
+            NOTIFIER_MISSED_HINT,
             PROVIDER_UNKNOWN,
             LOG_FIELD_DROPPED,
             PERSISTENCE_ERROR,

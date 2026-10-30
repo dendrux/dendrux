@@ -83,7 +83,8 @@ class PostgresEventNotifier:
         self._connection: Any = None
         self._task: asyncio.Task[None] | None = None
         self._connecting: asyncio.Task[None] | None = None
-        self._start_result: asyncio.Future[None] | None = None
+        self._start_result: asyncio.Task[None] | None = None
+        self._start_waiters = 0
         self._lock = asyncio.Lock()
         self._active = False
         self._lifecycle_generation = 0
@@ -161,31 +162,33 @@ class PostgresEventNotifier:
             self._self_test = None
 
     async def start(self) -> None:
-        """Connect and self-test; failure leaves no connection or reconnect task."""
-        self._check_loop()
-        if self._start_result is not None:
-            await asyncio.shield(self._start_result)
-            return
-        result = asyncio.get_running_loop().create_future()
-        self._start_result = result
-        result.add_done_callback(lambda done: None if done.cancelled() else done.exception())
-        try:
-            await self._start()
-        except BaseException as exc:
-            result.set_exception(
-                NotifierUnavailableError("stopped")
-                if isinstance(exc, asyncio.CancelledError)
-                else exc
-            )
-            raise
-        else:
-            result.set_result(None)
-        finally:
-            self._start_result = None
+        """Connect and self-test in one shared attempt.
 
-    async def _start(self) -> None:
-        self._loop = asyncio.get_running_loop()
-        generation = self._lifecycle_generation
+        Cancelling one caller leaves other callers waiting on that attempt.
+        If every caller cancels, clean it up. Failure leaves no connection
+        or reconnect task.
+        """
+        self._check_loop()
+        if self._start_result is None:
+            self._loop = asyncio.get_running_loop()
+            self._start_result = self._loop.create_task(self._start(self._lifecycle_generation))
+            self._start_result.add_done_callback(
+                lambda done: None if done.cancelled() else done.exception()
+            )
+        attempt = self._start_result
+        self._start_waiters += 1
+        try:
+            await asyncio.shield(attempt)
+        finally:
+            self._start_waiters -= 1
+            if self._start_waiters == 0:
+                self._start_result = None
+                if not attempt.done():
+                    attempt.cancel()
+                    await asyncio.gather(attempt, return_exceptions=True)
+
+    async def _start(self, generation: int) -> None:
+        assert self._loop is not None
         async with self._lock:
             if generation != self._lifecycle_generation:
                 raise NotifierUnavailableError("stopped")

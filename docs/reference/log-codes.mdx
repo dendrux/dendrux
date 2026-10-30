@@ -52,6 +52,12 @@ Missing or invalid codes remain unset. Category and HTTP status remain independe
 | `activation_conflict` | WARNING | `code`, `index`, `kind`, `run_id`, `table`, `tenant_id` | Activation detects conflicting duplicate rows. | Resolve the bounded diagnostic before retrying activation. |
 | `migration_lock_timeout` | WARNING | `code`, `kind`, `revision`, `run_id`, `step`, `tenant_id`, `timeout_seconds` | A migration cannot acquire its lock in time. | Retry when the table is quiet. |
 
+## Notifier
+
+| Code | Level | Fields | Fires when | Do |
+| --- | --- | --- | --- | --- |
+| `notifier_missed_hint` | WARNING | `code`, `count`, `kind`, `run_id`, `tenant_id` | A healthy feed finds new rows on reconciliation without a wake hint, once per feed. | Enable the channel on every writer and verify matching writer/listener channels. |
+
 ## Observability
 
 | Code | Level | Fields | Fires when | Do |

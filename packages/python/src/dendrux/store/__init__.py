@@ -460,6 +460,7 @@ class RunStore:
         self._notifier_started = False
         self._notifier_start_task: asyncio.Task[None] | None = None
         self._notifier_retry_at = 0.0
+        self._notifier_retry_delay: float | None = None
 
     @classmethod
     def from_engine(
@@ -619,9 +620,13 @@ class RunStore:
         try:
             await notifier.start()
             self._notifier_started = True
+            self._notifier_retry_at = 0.0
+            self._notifier_retry_delay = None
         except NotifierUnavailableError:
-            backoff = getattr(notifier, "reconnect_backoff", (1.0, 30.0))[0]
-            self._notifier_retry_at = asyncio.get_running_loop().time() + backoff
+            initial, maximum = getattr(notifier, "reconnect_backoff", (1.0, 30.0))
+            delay = self._notifier_retry_delay or initial
+            self._notifier_retry_at = asyncio.get_running_loop().time() + delay
+            self._notifier_retry_delay = min(delay * 2, maximum)
         finally:
             self._notifier_start_task = None
 

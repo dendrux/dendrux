@@ -419,3 +419,42 @@ async def test_p2_10_subscribe_binds_loop_before_start():
 
     async with notifier.subscribe("first"):
         await asyncio.to_thread(lambda: asyncio.run(other()))
+
+
+@pytest.mark.parametrize("cancelled", [0, 1], ids=["leader", "joiner"])
+async def test_n3_cancelled_start_caller_does_not_fail_shared_attempt(
+    monkeypatch, caplog, cancelled
+):
+    connection = Connection()
+    release = asyncio.Event()
+    attempts = 0
+
+    async def connect(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        await release.wait()
+        return connection
+
+    monkeypatch.setattr(asyncpg, "connect", connect)
+    notifier = PostgresEventNotifier(URL)
+    starting = [asyncio.create_task(notifier.start()) for _ in range(3)]
+    try:
+        await settle(lambda: attempts == 1)
+        starting[cancelled].cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await starting[cancelled]
+        release.set()
+        survivors = [task for i, task in enumerate(starting) if i != cancelled]
+        results = await asyncio.gather(*survivors, return_exceptions=True)
+        assert results == [None, None], results
+        assert attempts == 1
+        assert notifier.state.healthy and connection.listening
+        assert not any(
+            getattr(record, "code", None) == "notifier_unavailable" for record in caplog.records
+        )
+    finally:
+        release.set()
+        for task in starting:
+            task.cancel()
+        await asyncio.gather(*starting, return_exceptions=True)
+        await notifier.stop()

@@ -31,6 +31,7 @@ import math
 import random
 from collections import deque
 from dataclasses import dataclass, field
+from functools import partial
 from typing import TYPE_CHECKING, Any, Literal, TypeAlias, Union
 
 from dendrux import _codes
@@ -193,6 +194,7 @@ class _RunFeed:
         self.closing = False
         self.task: asyncio.Task[None] | None = None
         self.ready: asyncio.Future[None] | None = None
+        self._missed_hint_logged = False
         self._poll_wake = asyncio.Event()
         self._view: PauseView | None = None
         self._view_generation = 0
@@ -283,9 +285,9 @@ class _RunFeed:
                 lambda done: None if done.cancelled() else done.exception()
             )
             self.task = asyncio.get_running_loop().create_task(
-                self._poll(), name=f"dendrux-run-feed:{self.run_id}"
+                self._poll(self.ready), name=f"dendrux-run-feed:{self.run_id}"
             )
-            self.task.add_done_callback(self._done)
+            self.task.add_done_callback(partial(self._done, self.ready))
         else:
             self._poll_wake.set()
         return self.head
@@ -304,9 +306,9 @@ class _RunFeed:
         self.owner._drop(self)
         return None
 
-    def _done(self, task: asyncio.Task[None]) -> None:
-        if self.ready is not None and not self.ready.done():
-            self.ready.set_exception(RuntimeError("The run feed closed during startup."))
+    def _done(self, ready: asyncio.Future[None], task: asyncio.Task[None]) -> None:
+        if not ready.done():
+            ready.set_exception(RuntimeError("The run feed closed during startup."))
         if not task.cancelled():
             task.exception()  # observe failures, including shutdown failures
         if self.closing or not self.followers:
@@ -324,7 +326,7 @@ class _RunFeed:
             self.run_id, after_sequence_index=self.head, limit=self.owner.batch
         )
 
-    async def _poll(self) -> None:
+    async def _poll(self, ready: asyncio.Future[None]) -> None:
         notifier = self.owner.notifier
         context = (
             notifier.subscribe(self.run_id)
@@ -335,14 +337,14 @@ class _RunFeed:
             async with context as subscription:
                 if subscription is not None:
                     self._poll_wake = subscription.event
-                if self.ready is not None and not self.ready.done():
-                    self.ready.set_result(None)
+                if not ready.done():
+                    ready.set_result(None)
                 await self._poll_loop(subscription.state if subscription else None)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            if self.ready is not None and not self.ready.done():
-                self.ready.set_exception(exc)
+            if not ready.done():
+                ready.set_exception(exc)
             if isinstance(exc, FollowCapacityError):
                 return
             _codes.log_code(logger, _codes.FOLLOW_FEED_ERROR, run_id=self.run_id)
@@ -356,11 +358,13 @@ class _RunFeed:
         check_status = True
         generation = state.generation if state is not None else None
         woken = False
+        reconciling = False
         try:
             while self.followers:
                 if self.terminal and all(f.until_terminal for f in self.followers):
                     return
                 if state is not None and state.generation != generation:
+                    reconciling = False
                     delay = owner.poll_interval_s
                     jitter = random.uniform(0, owner.poll_interval_s)
                     if jitter:
@@ -370,6 +374,20 @@ class _RunFeed:
                 # Event.set coalesces a burst into one immediate poll.
                 self._poll_wake.clear()
                 events = await self._fetch()
+                if (
+                    events
+                    and reconciling
+                    and state is not None
+                    and state.healthy
+                    and state.generation == generation
+                    and not self._poll_wake.is_set()
+                    and not self._missed_hint_logged
+                ):
+                    _codes.log_code(
+                        logger, _codes.NOTIFIER_MISSED_HINT, run_id=self.run_id, count=len(events)
+                    )
+                    self._missed_hint_logged = True
+                reconciling = False
                 self._publish(events)
                 if len(events) == owner.batch:
                     continue  # more may be buffered; keep draining
@@ -396,13 +414,15 @@ class _RunFeed:
                             if follower.until_terminal:
                                 follower.end("terminal")
                         continue
+                healthy_wait = state is not None and state.healthy and not (woken and not events)
                 if state is not None and state.healthy:
-                    delay = owner.poll_interval_s if woken and not events else owner.poll_healthy_s
+                    delay = owner.poll_healthy_s if healthy_wait else owner.poll_interval_s
                 woken = False
                 with contextlib.suppress(TimeoutError):
                     async with asyncio.timeout(delay):
                         await self._poll_wake.wait()
                         woken = True
+                reconciling = healthy_wait and not woken
                 if not events:
                     delay = min(delay * 2, owner.poll_max_s)
         except asyncio.CancelledError:
