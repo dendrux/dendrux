@@ -564,3 +564,42 @@ def test_every_bootstrap_ddl_step_is_a_registered_log_step() -> None:
     assert all(_codes._valid_field("step", s) for s in ddl), [
         s for s in ddl if not _codes._valid_field("step", s)
     ]
+
+
+def test_a_disconnect_classified_fault_after_the_lock_still_closes_the_session(
+    mysql_url: str,
+) -> None:
+    """SQLAlchemy invalidates the detached connection itself before cleanup runs."""
+    from sqlalchemy import event
+
+    from dendrux.db._activate import activate_database
+
+    async def go() -> dict[str, bool]:
+        engine = create_async_engine(mysql_url, pool_size=1, max_overflow=0)
+        state = {"locked": False, "broken": False, "invalidated": False}
+
+        def before_execute(conn, cursor, statement, parameters, context, executemany):  # noqa: ANN001
+            if "GET_LOCK" in statement:
+                state["locked"] = True
+            elif state["locked"] and not state["broken"] and "RELEASE_LOCK" not in statement:
+                state["broken"] = True
+                return "SELECT * FROM dendrux_no_such_table_for_fault", parameters
+            return statement, parameters
+
+        def handle_error(context):  # noqa: ANN001
+            if state["broken"] and not state["invalidated"]:
+                state["invalidated"] = True
+                context.is_disconnect = True  # SQLAlchemy invalidates before our cleanup
+
+        event.listen(engine.sync_engine, "before_cursor_execute", before_execute, retval=True)
+        event.listen(engine.sync_engine, "handle_error", handle_error)
+        try:
+            with pytest.raises(Exception):  # noqa: B017 (the injected driver error)
+                await activate_database(engine)
+            return state
+        finally:
+            await engine.dispose()
+
+    state = run_sync(go())
+    assert state["locked"] and state["broken"] and state["invalidated"]
+    assert lock_is_free(mysql_url)  # the lock is free and no session is left attached

@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import datetime as dt
 import re
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -652,6 +652,9 @@ def maintenance_lock(conn: Connection) -> Iterator[None]:
     released with ``RELEASE_LOCK``; a failed release invalidates as well.
     """
     conn.detach()
+    # Held before any statement: SQLAlchemy may invalidate the connection on its own
+    # (a disconnect-classified error), after which it no longer exposes the driver handle.
+    raw = conn.connection.dbapi_connection
     error: BaseException | None = None
     name = ""
     try:
@@ -669,30 +672,32 @@ def maintenance_lock(conn: Connection) -> Iterator[None]:
         raise
     finally:
         if error is not None:
-            _drop_session(conn)
+            _drop_session(conn, raw)
         else:
             try:
                 conn.rollback()
                 conn.execute(text("SELECT RELEASE_LOCK(:name)"), {"name": name})
                 conn.commit()
             except BaseException:
-                _drop_session(conn)
+                _drop_session(conn, raw)
                 raise
 
 
-def _drop_session(conn: Connection) -> None:
+def _drop_session(conn: Connection, raw: Any) -> None:
     """Close the server session (and with it any lock it holds), then invalidate.
 
-    A detached connection has no pool record, so ``invalidate()`` alone would only
-    forget the driver connection, leaving the session (and its lock) open.
+    ``raw`` is the driver connection captured right after detaching. A detached
+    connection has no pool record, so ``invalidate()`` (ours, or one SQLAlchemy did
+    itself on a disconnect-classified error) only forgets the driver connection and
+    leaves the socket, the session and its lock alive. The driver connection is
+    terminated directly, whatever state SQLAlchemy left it in.
     """
-    try:
-        raw = conn.connection.dbapi_connection
-        if raw is not None:
-            raw.close()
-    except Exception:  # already closed or broken: the invalidation below still runs
-        pass
-    conn.invalidate()
+    if raw is not None:
+        close = getattr(raw, "terminate", None) or raw.close
+        with suppress(Exception):  # already closed or broken
+            close()
+    with suppress(Exception):  # already invalidated or closed by SQLAlchemy
+        conn.invalidate()
 
 
 def bounded_execute(
