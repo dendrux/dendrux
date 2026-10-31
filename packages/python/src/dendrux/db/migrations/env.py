@@ -110,10 +110,21 @@ def do_run_migrations(connection):  # noqa: ANN001
 
 async def run_async_migrations() -> None:
     """Run migrations using an async engine."""
+    from dendrux.db._engine_options import (
+        is_mysql_family_url,
+        mysql_engine_options,
+        normalized_url,
+    )
+
+    section = dict(config.get_section(config.config_ini_section, {}))
+    url = section.get("sqlalchemy.url", "")
+    options: dict = {}
+    if url and is_mysql_family_url(url):
+        # The same READ COMMITTED / UTC / driver policy as every other engine Dendrux creates.
+        section["sqlalchemy.url"] = normalized_url(url).render_as_string(hide_password=False)
+        options = mysql_engine_options({})
     connectable = async_engine_from_config(
-        config.get_section(config.config_ini_section, {}),
-        prefix="sqlalchemy.",
-        poolclass=pool.NullPool,
+        section, prefix="sqlalchemy.", poolclass=pool.NullPool, **options
     )
 
     try:

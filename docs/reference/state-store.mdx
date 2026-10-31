@@ -21,7 +21,7 @@ Construct a store once per worker event loop and pass it as `Agent(state_store=s
 | Class | Database | `deployment` | Notes |
 | --- | --- | --- | --- |
 | `PostgresStateStore(engine, notify_channel=None)` | PostgreSQL with `asyncpg` | `multi_server` | The only store that accepts `notify_channel=` (event notifications). |
-| `SQLiteStateStore(engine)` | SQLite with `aiosqlite` | `single_process` for an in-memory database, `single_host` for a file | Creates its own tables on first use. |
+| `SQLiteStateStore(engine)` | SQLite with `aiosqlite` | `single_process` for an in-memory database, `single_host` for a file | Does not create tables itself. `Agent(database_url=)`, `RunStore.from_database_url` and `dendrux.db.session.get_engine(url)` create them for you; with an engine you built yourself, get it from `get_engine(url)` instead, or the store raises `PersistenceError` on first use. |
 | `MySQLStateStore(engine)` | MySQL 8.4 or MariaDB 10.11 with `asyncmy` | `multi_server` | The engine must use `READ COMMITTED` and UTC. See [MySQL and MariaDB](/docs/guides/mysql). |
 
 `store_for_engine(engine, **options)` picks the class from the engine's dialect name (`postgresql`, `sqlite` or `mysql`) and raises `ValueError` for any other dialect. `Agent(database_url=)`, `RunStore.from_database_url`, `RunStore.from_engine`, the CLI and `sweep` all go through it, so no call site names a concrete class. To support another SQLAlchemy database, see [Build your own store](/docs/guides/build-your-own-store).

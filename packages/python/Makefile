@@ -62,10 +62,11 @@ load-quick:
 # load-pg needs DENDRUX_LOAD_PG_URL (a private Postgres database ending in _test). load-mysql and
 # load-mariadb use their own private databases on the test servers (make test-dbs-up first); the
 # harness refuses a MySQL-family name that lacks "_load_" or does not end in "_test". MySQL-family
-# runs have no stored baseline: declare the statement ceilings in a JSON file first and pass it as
-# LOAD_STATEMENT_BUDGETS=path (see docs/guides/scaling.mdx, "Load testing your own deployment").
+# runs have no stored baseline: the declared ceilings are in tools/load_budgets_mysql.json (set before
+# measuring); override with LOAD_STATEMENT_BUDGETS=path (see docs/guides/scaling.mdx, "Load testing").
 LOAD_MYSQL_URL ?= mysql+asyncmy://root:dendrux_test@127.0.0.1:53306/dendrux_load_mysql_test
 LOAD_MARIADB_URL ?= mysql+asyncmy://root:dendrux_test@127.0.0.1:53307/dendrux_load_mariadb_test
+LOAD_STATEMENT_BUDGETS ?= tools/load_budgets_mysql.json
 LOAD_RUNS = --scale full --scenarios runs --workers 2 --leak-cycles 4
 
 load-pg:

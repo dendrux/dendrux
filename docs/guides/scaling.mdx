@@ -200,13 +200,13 @@ The harness drops and recreates the tables of the database you give it, so it ac
 export DENDRUX_LOAD_PG_URL=postgresql+asyncpg://user:password@localhost:5432/dendrux_load_test
 make load-pg
 
-# MySQL and MariaDB: start the test servers first, and declare your statement ceilings
+# MySQL and MariaDB: start the test servers first; the ceilings are in tools/load_budgets_mysql.json
 make test-dbs-up
-make load-mysql LOAD_STATEMENT_BUDGETS=path/to/budgets.json
-make load-mariadb LOAD_STATEMENT_BUDGETS=path/to/budgets.json
+make load-mysql
+make load-mariadb
 ```
 
-`make load-quick` runs every scenario at small scale and fails on a statement-count regression against `tools/load_baseline.json` (Postgres only); `make load` is the full run. MySQL and MariaDB have no stored baseline, so you declare the ceilings before measuring: `LOAD_STATEMENT_BUDGETS` is a JSON file that maps each gate (for example `runs.statements_per_run`) to a number. A run refuses to start without it. Results are written as JSON to `LOAD_JSON` (default: `dendrux-load-results.json` in your temporary directory) with a compact Markdown table. Workloads that need Postgres NOTIFY are skipped on MySQL and MariaDB, with a note.
+`make load-quick` runs every scenario at small scale and fails on a statement-count regression against `tools/load_baseline.json` (Postgres only); `make load` is the full run. MySQL and MariaDB have no stored baseline, so the ceilings are declared before measuring: `tools/load_budgets_mysql.json` maps each gate to a number (`runs.statements_per_run` is 50; the 0.6 runs measured about 47). The targets use it by default; pass `LOAD_STATEMENT_BUDGETS=path` to use your own file. Results are written as JSON to `LOAD_JSON` (default: `dendrux-load-results.json` in your temporary directory) with a compact Markdown table. Workloads that need Postgres NOTIFY are skipped on MySQL and MariaDB, with a note.
 
 ## What we measured
 

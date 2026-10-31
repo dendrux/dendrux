@@ -1706,7 +1706,7 @@ async def reset_mysql_db(url: str) -> None:
     from dendrux.db.models import Base
 
     parsed = check_private_url(url)
-    admin = create_async_engine(parsed.set(database=None), poolclass=NullPool)
+    admin = create_async_engine(parsed._replace(database=None), poolclass=NullPool)
     try:
         async with admin.connect() as conn:
             await conn.execute(text(f"CREATE DATABASE IF NOT EXISTS `{parsed.database}`"))

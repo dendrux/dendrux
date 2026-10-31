@@ -212,3 +212,25 @@ async def test_limits_sized_to_the_server_are_accepted(migrated_url: str) -> Non
         limits=sized,
     ) as agent:
         assert (await agent.run("go", tenant_id="t")).status == RunStatus.SUCCESS
+
+
+def test_the_migration_engine_gets_the_same_settings(
+    mysql_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sqlalchemy.ext.asyncio as asyncio_ext
+
+    real = asyncio_ext.async_engine_from_config
+    seen: list[dict[str, Any]] = []
+
+    def recording(configuration: Any, prefix: str = "sqlalchemy.", **kwargs: Any) -> Any:
+        seen.append({"url": configuration[f"{prefix}url"], **kwargs})
+        return real(configuration, prefix, **kwargs)
+
+    monkeypatch.setattr(asyncio_ext, "async_engine_from_config", recording)
+    monkeypatch.setenv("DENDRUX_DATABASE_URL", with_driver(mysql_url, "mysql+aiomysql"))
+    result = CliRunner().invoke(app, ["db", "migrate"])
+    assert result.exit_code == 0, result.output
+    [engine] = seen
+    assert engine["url"].startswith("mysql+asyncmy://")
+    assert engine["isolation_level"] == "READ COMMITTED"
+    assert engine["connect_args"]["init_command"] == "SET time_zone='+00:00'"

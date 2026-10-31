@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import shutil
 import subprocess
@@ -56,7 +57,7 @@ def test_mysql_family_targets_use_a_private_load_database_on_the_test_server(
 @pytest.mark.parametrize("target", ["load-mysql", "load-mariadb"])
 def test_a_mysql_family_target_refuses_to_run_without_declared_budgets(target: str) -> None:
     result = subprocess.run(
-        ["make", "-C", str(PACKAGE), target],
+        ["make", "-C", str(PACKAGE), target, "LOAD_STATEMENT_BUDGETS="],
         capture_output=True,
         text=True,
         check=False,
@@ -65,3 +66,12 @@ def test_a_mysql_family_target_refuses_to_run_without_declared_budgets(target: s
     assert result.returncode != 0
     assert "LOAD_STATEMENT_BUDGETS" in result.stdout + result.stderr
     assert "tools/load.py" not in result.stdout.replace("LOAD_STATEMENT_BUDGETS", "")
+
+
+@pytest.mark.parametrize("target", ["load-mysql", "load-mariadb"])
+def test_budgets_default_to_the_committed_file(target: str) -> None:
+    result = dry_run(target)
+    assert result.returncode == 0, result.stderr
+    assert "--statement-budgets tools/load_budgets_mysql.json" in result.stdout
+    budgets = json.loads((PACKAGE / "tools" / "load_budgets_mysql.json").read_text())
+    assert budgets == {"runs.statements_per_run": 50}
