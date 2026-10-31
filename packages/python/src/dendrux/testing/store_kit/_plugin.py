@@ -39,6 +39,7 @@ PLUGIN_NAME = "dendrux.testing.store_kit"
 CATEGORIES = (
     "declaration",
     "basic",
+    "agent_flows",
     "fenced_writes",
     "retry_ids",
     "checkpointing",
