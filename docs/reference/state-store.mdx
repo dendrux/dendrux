@@ -55,7 +55,7 @@ The built-in SQL stores declare the first five capabilities. The Postgres notifi
 
 ## Optional: statement capacity
 
-A SQL store class may define `async statement_capacity(self) -> int | None`: the most bytes one SQL statement may carry. Before an Agent first uses a store, it compares a worst-case estimate of the largest statement its `Limits` can produce with this number and refuses with a `ValueError` that names both values (log code `store_statement_limit`). That is an early warning, not a guarantee: `MySQLStateStore` also measures every statement before sending it and raises `StatementTooLargeError` (a `PersistenceError`) rather than let the server drop the connection. `MySQLStateStore` reports the server's `max_allowed_packet`; the other built-in stores define no limit and are not checked. The method is looked up on the class.
+A SQL store class may define `async statement_capacity(self) -> int | None`: the most bytes one SQL statement may carry. Before an Agent first uses a store, it compares a worst-case estimate of the largest statement its `Limits` can produce with this number and refuses with a `ValueError` that names both values (log code `store_statement_limit`). The early check refuses configured limits that cannot fit; the server's own limit is the final guard, and when MySQL or MariaDB answers with its packet-too-large error (1153 or 1301) the store raises `StatementTooLargeError`, a non-retryable `PersistenceError`. `MySQLStateStore` reports the server's `max_allowed_packet`; the other built-in stores define no limit and are not checked. The method is looked up on the class.
 
 ## Lost commit acknowledgements
 

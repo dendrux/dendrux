@@ -12,7 +12,6 @@ from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.sql.functions import FunctionElement
 
 from dendrux.runtime.state import _TERMINAL_STATUS_VALUES
-from dendrux.runtime.stores.sql import _preflight
 from dendrux.runtime.stores.sql.base import SQLStateStore
 
 if TYPE_CHECKING:
@@ -54,7 +53,6 @@ class MySQLStateStore(SQLStateStore):
     def __init__(self, engine: AsyncEngine) -> None:
         super().__init__(engine)
         self.capabilities = replace(self.capabilities, deployment="multi_server", notify=False)
-        _preflight.install(engine)
 
     @classmethod
     def from_url(cls, url: str, **engine_options: Any) -> MySQLStateStore:
@@ -96,7 +94,6 @@ class MySQLStateStore(SQLStateStore):
         if facts[2]:
             raise ValueError("MySQLStateStore requires every Dendrux table to use InnoDB")
         packet = int(facts[0])
-        _preflight.set_capacity(conn.sync_engine, packet)
         return DialectFacts(
             "mariadb" if maria else "mysql", version, {"supports_insert_returning": maria}, packet
         )

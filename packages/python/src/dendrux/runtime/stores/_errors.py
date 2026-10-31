@@ -9,8 +9,16 @@ from dataclasses import dataclass
 from typing import Literal
 
 DbErrorKind = Literal[
-    "unique_violation", "deadlock_or_serialization", "lock_timeout", "connection_lost", "other"
+    "unique_violation",
+    "deadlock_or_serialization",
+    "lock_timeout",
+    "connection_lost",
+    "statement_too_large",
+    "other",
 ]
+
+#: MySQL/MariaDB: ER_NET_PACKET_TOO_LARGE and ER_WARN_ALLOWED_PACKET_OVERFLOWED.
+_PACKET_TOO_LARGE = frozenset({1153, 1301})
 
 
 @dataclass(frozen=True)
@@ -38,6 +46,10 @@ def error_chain(exc: BaseException) -> list[BaseException]:
 def classify_error(exc: BaseException) -> DbError:
     """Classify server/driver codes, retaining only safe identifiers."""
     chain = error_chain(exc)
+    for error in chain:
+        code = error.args[0] if error.args and isinstance(error.args[0], int) else None
+        if code in _PACKET_TOO_LARGE:
+            return DbError("statement_too_large", code=code)
     for error in chain:
         if error.args and isinstance(error.args[0], int):
             continue

@@ -91,18 +91,20 @@ Do not change these collations or convert the tables. `utf8mb4_bin` is not accep
 
 ## Payload limits and `max_allowed_packet`
 
-MySQL and MariaDB close the connection on a statement larger than `max_allowed_packet` (MySQL 8.4 defaults to 64 MiB, MariaDB 10.11 to 16 MiB). Dendrux guards against this in two layers.
+MySQL and MariaDB refuse a statement larger than `max_allowed_packet` (MySQL 8.4 defaults to 64 MiB, MariaDB 10.11 to 16 MiB). Dendrux guards against this in two ways.
 
-**The guarantee: a preflight on every statement.** Before a statement leaves the process, the store measures it: the SQL text plus every bound value, exactly as the driver escapes it (quotes, backslashes, newlines and NUL cost an extra byte, and a JSON column has already escaped non-ASCII text to six bytes per letter). If it is larger than the server's `max_allowed_packet`, the store raises `StatementTooLargeError`, a `PersistenceError` with `code == "statement_too_large"`, `size` and `limit` attributes and a message naming both sizes (never a value). Nothing is sent, the connection stays healthy, and a `store_statement_limit` line is logged. This covers everything, including model prompts and responses that no `Limits` field bounds. It adds no database round trip: it reads the server's value, found once with the first-use checks, and costs about one microsecond for a typical statement and about 2 ms per MiB when a single value is large enough to need an exact count.
-
-**An early warning: the Agent's limits.** Before the Agent first uses the store, it compares its `Limits` with the server's value and refuses with a `ValueError` that names both numbers, before any run starts. This catches a misconfiguration at startup instead of mid-run, but it is an estimate of the payloads `Limits` bounds, not a guarantee:
+**An early check of your limits.** Before the Agent first uses the store, it compares its configured `Limits` with the server's value and refuses with a `ValueError` that names both numbers, before any run starts. The size compared is a worst-case estimate of the largest statement the payloads that `Limits` bounds can produce:
 
 | Part | Reserved |
 | --- | --- |
 | The larger of `max_input_bytes` and `max_tool_result_bytes`, plus `max_metadata_bytes` | 12 times: up to 6 times for JSON escaping (a control character, or a non-ASCII letter, becomes six bytes), then 2 times for SQL escaping |
 | Column lists, identifiers and small values | 64 KiB |
 
-The default limits need about 12.8 MiB, so they fit both servers' defaults. The estimate is deliberately pessimistic; a payload that is smaller on the wire than its worst case still passes the preflight. To raise a limit, raise `max_allowed_packet` on the server (a global setting that applies to new connections) or lower the Dendrux limit.
+The default limits need about 12.8 MiB, so they fit both servers' defaults. The estimate is deliberately pessimistic, and it cannot see payloads that `Limits` does not bound, such as model prompts and responses. To raise a limit, raise `max_allowed_packet` on the server (a global setting that applies to new connections) or lower the Dendrux limit.
+
+**The server's own limit is the final guard.** If the server answers a statement with its packet-too-large error (1153, or 1301 for an oversized function result), the store raises `StatementTooLargeError`, a `PersistenceError` with `code == "statement_too_large"`. The write is not retried and nothing is persisted. The error carries the server's `limit`; its `size` is usually `None`, because the server does not report it. The message never contains a value, and a `store_statement_limit` line is logged.
+
+> **The server usually does not answer.** In tests against MySQL 8.4 and MariaDB 10.11 with the `asyncmy` driver, an oversized statement was never answered with 1153: the server closes the connection while the driver is still sending, and the driver reports a lost connection (2006 or 2013). The write then fails safe through the ordinary persistence path: a plain `PersistenceError`, or `StoreOutcomeUnknown` for a write with no retry identity (such as creating a run without an idempotency key). Nothing is persisted, there is no retry loop, and the next write works. If you see these errors on large payloads, check `max_allowed_packet` first.
 
 Images are not stored in the database, so `ImagePolicy` sizes are not part of either check. Large payloads can also go to a [blob store](/docs/recipes/images#storage).
 

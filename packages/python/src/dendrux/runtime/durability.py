@@ -25,7 +25,8 @@ from typing import TYPE_CHECKING, Any, TypeVar
 
 from sqlalchemy.exc import DBAPIError, OperationalError, SQLAlchemyError, TimeoutError
 
-from dendrux.errors import PersistenceError
+from dendrux import _codes
+from dendrux.errors import PersistenceError, StatementTooLargeError
 from dendrux.errors import StoreOutcomeUnknown as StoreOutcomeUnknown
 from dendrux.runtime.stores._errors import classify_error
 
@@ -51,11 +52,26 @@ class _CommitNotAppliedError(PersistenceError):
         super().__init__(retryable=True)
 
 
+def _log_too_large(error: StatementTooLargeError) -> None:
+    if error.limit is None:
+        _codes.log_code(logger, _codes.STORE_STATEMENT_LIMIT, run_id=None)
+    else:
+        _codes.log_code(logger, _codes.STORE_STATEMENT_LIMIT, run_id=None, limit=error.limit)
+
+
+def _statement_too_large(limit: int | None) -> StatementTooLargeError:
+    error = StatementTooLargeError(limit)
+    _log_too_large(error)
+    return error
+
+
 def is_transient_db_error(exc: BaseException, *, classify: Any = classify_error) -> bool:
     """True for failures a fresh attempt of the same transaction may not hit."""
     if isinstance(exc, PersistenceError):
         return exc.retryable
     classified = classify(exc)
+    if classified.kind == "statement_too_large":
+        return False  # the same statement is refused again, whatever the exception class
     return (
         isinstance(exc, (OperationalError, TimeoutError))
         or classified.kind in ("deadlock_or_serialization", "lock_timeout", "connection_lost")
@@ -93,6 +109,8 @@ async def retry_transient_db(
             if not is_transient_db_error(exc, classify=classify):
                 if isinstance(exc, PersistenceError):
                     raise
+                if classify(exc).kind == "statement_too_large":
+                    raise _statement_too_large(None) from None
                 raise PersistenceError() from None
             if attempt_num < _MAX_RETRIES:
                 await _backoff(attempt_num, label, run_id, exc)
@@ -140,10 +158,17 @@ def _safe_database_call(method: Any) -> Any:
             token = _database_operation.set((args[0], method.__name__, dict(bound.arguments)))
         try:
             return await method(*args, **kwargs)
+        except StatementTooLargeError as error:
+            facts = getattr(args[0], "_dialect_facts", None) if args else None
+            error.set_limit(getattr(facts, "max_allowed_packet", None))
+            raise
         except SQLAlchemyError as error:
             classifier = (
                 getattr(args[0], "classify_db_error", classify_error) if args else classify_error
             )
+            if classifier(error).kind == "statement_too_large":
+                facts = getattr(args[0], "_dialect_facts", None) if args else None
+                raise _statement_too_large(getattr(facts, "max_allowed_packet", None)) from None
             raise PersistenceError(
                 retryable=is_transient_db_error(error, classify=classifier)
             ) from None

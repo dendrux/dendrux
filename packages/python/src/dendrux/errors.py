@@ -309,22 +309,35 @@ class StoreOutcomeUnknown(PersistenceError):  # noqa: N818 - public compatibilit
 
 
 class StatementTooLargeError(PersistenceError):
-    """A database statement is larger than the server accepts, so nothing was sent.
+    """The database answered that a statement is larger than ``max_allowed_packet``.
 
-    Raised by the MySQL and MariaDB store before the statement leaves the process (the server
-    would otherwise close the connection). ``size`` is the measured statement in bytes and
-    ``limit`` the server's ``max_allowed_packet``. Values are never part of the message.
+    Raised when MySQL or MariaDB reports error 1153 or 1301. The write is not retried and
+    nothing was persisted. ``limit`` is the server's ``max_allowed_packet`` in bytes when the
+    store knows it, and ``size`` the statement's size when it is known (best effort: usually
+    ``None``, because the server does not report it). Values are never part of the message.
+    Servers often close the connection instead of answering; that surfaces as the ordinary
+    persistence error, not as this class.
     """
 
     code = "statement_too_large"
 
-    def __init__(self, size: int, limit: int) -> None:
+    def __init__(self, limit: int | None = None, size: int | None = None) -> None:
         super().__init__(code=self.code)
         self.size = size
         self.limit = limit
+        self._describe()
+
+    def set_limit(self, limit: int | None) -> None:
+        """Record the server's limit when the raising layer did not know it."""
+        if self.limit is None and limit is not None:
+            self.limit = limit
+            self._describe()
+
+    def _describe(self) -> None:
+        sized = f"A statement of {self.size} bytes" if self.size is not None else "A statement"
+        limit = f" of {self.limit} bytes" if self.limit is not None else ""
         self.safe_message = (
-            f"Database statement of {size} bytes exceeds the server's max_allowed_packet "
-            f"of {limit} bytes (statement_too_large)."
+            f"{sized} is larger than the server's max_allowed_packet{limit} (statement_too_large)."
         )
         self.args = (self.safe_message,)
 

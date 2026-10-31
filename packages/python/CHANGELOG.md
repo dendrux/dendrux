@@ -67,18 +67,19 @@
   server-wide named lock, is forward-only, may share a database with application tables
   and refuses a database where the application keeps its own Alembic version table.
   Event notifications stay PostgreSQL-only. See `docs/guides/mysql.mdx`.
-- Guard against statements larger than the database accepts. `MySQLStateStore` measures
-  every statement (text plus each bound value, as the driver escapes it) before sending it
-  and raises the new `StatementTooLargeError` (a `PersistenceError`, code
-  `statement_too_large`, with `size` and `limit`) instead of letting the server drop the
-  connection. It adds no round trip (about 1 microsecond for a typical statement). As an
-  early warning, a store class may define `async statement_capacity()` and the Agent
-  compares a worst-case estimate of its `Limits` with it before first use, in the Agent
-  methods and in the runner functions (`run`, `retry`, `run_stream`, `resume`,
-  `resume_with_input`, `resume_stream`). The estimate reserves 12 times the larger of
-  `max_input_bytes` and `max_tool_result_bytes` plus `max_metadata_bytes`, plus 64 KiB, and
-  refuses with a `ValueError` naming both numbers (log code `store_statement_limit`). The
-  default limits fit both servers' defaults.
+- Handle statements larger than the database accepts. When MySQL or MariaDB answers with
+  its packet-too-large error (1153, or 1301), the store raises the new
+  `StatementTooLargeError` (a `PersistenceError`, code `statement_too_large`, with the
+  server's `limit` and a best-effort `size`); the write is not retried and nothing is
+  persisted. Servers usually close the connection instead of answering; that fails safe
+  through the ordinary persistence path (a `PersistenceError`, or `StoreOutcomeUnknown` for a
+  write without a retry identity). As an early check, a store class may define
+  `async statement_capacity()` and the Agent compares a worst-case estimate of its `Limits`
+  with it before first use, in the Agent methods and in the runner functions (`run`, `retry`,
+  `run_stream`, `resume`, `resume_with_input`, `resume_stream`). The estimate reserves 12 times
+  the larger of `max_input_bytes` and `max_tool_result_bytes` plus `max_metadata_bytes`, plus
+  64 KiB, and refuses with a `ValueError` naming both numbers (log code
+  `store_statement_limit`). The default limits fit both servers' defaults.
 - Split SQL persistence into `SQLStateStore` and the concrete `PostgresStateStore`,
   `SQLiteStateStore` and `MySQLStateStore`, exported from `dendrux.store`.
   `store_for_engine(engine)` picks the class from the engine's dialect and is used by
@@ -97,8 +98,9 @@
   identities, checkpoints, atomic completion, recovery, two-instance concurrency and,
   with a fault injector, crash recovery. Install `dendrux[testkit]` and run
   `pytest -p dendrux.testing.store_kit`; SQLite fixtures ship as a worked example. The
-  plugin is registered with pytest when `dendrux` is installed but loads nothing until
-  switched on, and then needs `pytest-asyncio`. See
+  plugin is registered with pytest when `dendrux` is installed, through a tiny module that
+  neither imports `dendrux` nor loads the kit until switched on; the kit then needs
+  `pytest-asyncio`. See
   `docs/guides/build-your-own-store.mdx`.
 - Extend the developer load harness to private MySQL and MariaDB databases, with bounded
   resource sampling, repeated-cycle leak checks, cancellation-safe cleanup and a `_load_`
