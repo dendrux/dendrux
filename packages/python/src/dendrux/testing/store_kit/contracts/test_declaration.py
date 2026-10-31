@@ -37,3 +37,23 @@ async def test_declared_capabilities_have_their_fixtures(
 async def test_declared_methods_match_the_declaration(dendrux_kit: Kit) -> None:
     # Building the kit already refused a declaration whose methods lack the promised keywords.
     assert dendrux_kit.declaration.capabilities.version == 1
+
+
+@contract("declaration", needs=("notify",))
+async def test_declared_notify_is_implemented(dendrux_kit: Kit) -> None:
+    """The kit cannot test event hints, but it can refuse a notify promise nobody implemented.
+
+    ``SQLStateStore`` declares ``notify`` and ships a hook that does nothing. A subclass that
+    keeps both has promised hints it never sends. Delivery itself is not tested.
+    """
+    import inspect
+
+    from dendrux.runtime.stores.sql.base import SQLStateStore
+
+    hook = inspect.getattr_static(type(dendrux_kit.store), "_after_event_insert", None)
+    if hook is SQLStateStore.__dict__["_after_event_insert"]:
+        raise CertificationFailure(
+            f"{dendrux_kit.declaration.store_name} declares notify but inherits the base "
+            "_after_event_insert, which sends nothing: implement _after_event_insert or "
+            "declare notify=False (the kit does not test notification delivery)"
+        )

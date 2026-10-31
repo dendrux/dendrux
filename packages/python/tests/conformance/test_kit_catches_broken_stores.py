@@ -324,6 +324,36 @@ MUTANTS = {
         {"test_a_checkpoint_that_fails_leaves_the_previous_checkpoint"},
         PLAIN_INJECTOR,
     ),
+    "reclaim_run is faked and checkpoint_step writes nothing": (
+        mutant("""
+        async def reclaim_run(self, run_id, **kw):
+            return ClaimResult(1, 2, None, None)
+
+        async def checkpoint_step(self, run_id, *, claim_epoch, **kw):
+            return None
+        """),
+        "checkpoint or reclaim",
+        {
+            "test_a_checkpoint_and_its_trace_commit_together_or_not_at_all",
+            "test_a_checkpoint_that_fails_leaves_the_previous_checkpoint",
+            "test_a_claim_carries_the_checkpointed_state",
+            "test_a_fresh_run_cannot_be_reclaimed",
+            "test_a_reclaim_gives_a_new_epoch_once_and_fences_the_old_owner",
+            "test_a_reclaim_is_refused_for_the_wrong_tenant_agent_or_epoch",
+            "test_a_reopened_store_reclaims_what_the_old_one_marked",
+            "test_a_run_past_its_reclaim_limit_is_finalised",
+            "test_a_stale_epoch_cannot_checkpoint_or_link",
+            "test_a_stale_epoch_cannot_consume_a_submission",
+            "test_a_submission_is_consumed_exactly_once",
+            "test_a_trace_clash_after_reclaim_is_still_a_conflict",
+            "test_an_ambiguous_claim_commit_raises_outcome_unknown",
+            "test_an_oversized_checkpoint_is_refused_and_writes_nothing",
+            "test_an_unpersistable_checkpoint_is_refused_before_any_write",
+            "test_marking_is_repeatable_until_the_run_is_reclaimed",
+            "test_seeds_rewrites_and_conversation_pages",
+        },
+        PLAIN_INJECTOR,
+    ),
     "a classifier that knows connection loss only by the invalidated flag": (
         mutant("""
         def classify_db_error(self, exc):

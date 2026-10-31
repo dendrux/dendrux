@@ -6,7 +6,7 @@ import asyncio
 import inspect
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, NoReturn, cast
 
 import pytest
 
@@ -14,6 +14,7 @@ from dendrux.testing.store_kit._declaration import (
     CLOCK,
     FACTORY,
     FAULT_INJECTOR,
+    FORMAT_2_FLAGS,
     REOPEN,
     SECOND_INSTANCE,
     Declaration,
@@ -35,6 +36,18 @@ if TYPE_CHECKING:
 MARKER = "dendrux_kit"
 USER_PROPERTY_STORE = "dendrux_kit_store"
 USER_PROPERTY_CATEGORY = "dendrux_kit_category"
+USER_PROPERTY_NEEDS = "dendrux_kit_needs"
+#: Prefix of a skip the store caused (see ``store_skip``); the report parses it.
+STORE_SKIP = "store-controlled"
+
+
+def store_skip(reason: str, *capabilities: str) -> NoReturn:
+    """Skip because of something the store controls, which leaves a promise unchecked.
+
+    The report treats this differently from an ordinary skip: when the store declares one of
+    ``capabilities``, that capability is NOT CERTIFIED, and the reason is listed.
+    """
+    pytest.skip(f"{STORE_SKIP}[{','.join(capabilities)}]: {reason}")
 
 
 class CertificationFailure(pytest.fail.Exception):  # type: ignore[misc,name-defined]
@@ -87,11 +100,13 @@ class Kit:
         declaration: Declaration,
         *,
         needs_format_2: bool,
+        guards: tuple[str, ...] = (),
     ) -> None:
         self._provided = provided
         self.store = store
         self.declaration = declaration
         self._needs_format_2 = needs_format_2
+        self._guards = guards
         self.format: int | None = None
 
     # -- the author's fixtures -------------------------------------------------------------
@@ -196,6 +211,13 @@ class Kit:
         created = await target.create_run(run_id, kwargs.pop("agent_name", "KitAgent"), **kwargs)
         self.format = created.storage_format
         if self._needs_format_2 and created.storage_format != 2:
+            if self.declaration.creates_format_2:
+                store_skip(
+                    "it declares the four format-2 capabilities but creates storage-format-1 "
+                    "runs, so the format-2 contracts cannot run (start the factory's schema "
+                    "at format 2)",
+                    *(self._guards or FORMAT_2_FLAGS),
+                )
             pytest.skip("store creates storage format 1 here: format-2 contracts do not apply")
         return str(created.run_id)
 
@@ -244,4 +266,12 @@ def check_declaration(store: Any, declaration: Declaration) -> None:
         ) from None
 
 
-__all__ = ["FACTORY", "CertificationFailure", "Faulted", "Kit", "check_declaration", "maybe_await"]
+__all__ = [
+    "FACTORY",
+    "CertificationFailure",
+    "Faulted",
+    "Kit",
+    "check_declaration",
+    "maybe_await",
+    "store_skip",
+]

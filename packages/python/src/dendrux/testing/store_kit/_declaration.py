@@ -46,12 +46,25 @@ class Declaration:
 
     store_name: str
     capabilities: StoreCapabilities
+    module: str = ""
+    qualname: str = ""
 
     @classmethod
     def of(cls, store: Any) -> Declaration:
         from dendrux.runtime._capabilities import capabilities
 
-        return cls(type(store).__name__, capabilities(store))
+        kind = type(store)
+        return cls(kind.__name__, capabilities(store), kind.__module__, kind.__qualname__)
+
+    @property
+    def qualified_name(self) -> str:
+        """The class's import path: tells apart two implementations that share a class name."""
+        return f"{self.module}.{self.store_name}" if self.module else self.store_name
+
+    @property
+    def identity(self) -> str:
+        """Unique per implementation: two classes with one name in different places differ."""
+        return f"{self.module}.{self.qualname or self.store_name}"
 
     @property
     def deployment(self) -> str | None:
@@ -76,9 +89,10 @@ class Declaration:
         """Author fixtures this declaration obliges, each with the reason."""
         return required_fixtures_for(self.declared, self.deployment)
 
-    def label(self) -> str:
+    def label(self, *, qualified: bool = False) -> str:
         flags = ",".join(self.declared) or "none"
-        return f"{self.store_name} (deployment={self.deployment}, capabilities={flags})"
+        name = self.qualified_name if qualified else self.store_name
+        return f"{name} (deployment={self.deployment}, capabilities={flags})"
 
 
 def validate_declaration(store: Any) -> None:

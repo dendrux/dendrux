@@ -109,9 +109,9 @@ def test_multi_server_without_a_second_instance_fails(pytester: pytest.Pytester)
 
 def test_a_complete_declaration_passes_and_prints_a_summary(pytester: pytest.Pytester) -> None:
     result = kit(pytester, BASE, "", CLOCK, REOPEN, k="test_declared or test_deployment")
-    result.assert_outcomes(passed=3)
+    result.assert_outcomes(passed=3, skipped=1)  # the notify check: this store does not declare it
     result.stdout.fnmatch_lines(
-        ["*dendrux store kit: certification summary*", "*declaration*3 passed*"]
+        ["*dendrux store kit: certification summary*", "*declaration*3 passed, 1 skipped*"]
     )
 
 
@@ -235,4 +235,4 @@ def test_under_xdist_a_complete_run_is_certified(pytester: pytest.Pytester) -> N
     result = _xdist(pytester, None)
     text = result.stdout.str()
     assert result.parseoutcomes().get("failed", 0) == 0, text[-1500:]
-    assert "NOT CERTIFIED" not in text and "  CERTIFIED:" in text, text[-1500:]
+    assert "NOT CERTIFIED" not in text and "  CERTIFIED with caveats:" in text, text[-1500:]

@@ -24,6 +24,6 @@ def test_the_reference_fixtures_certify_sqlite_without_any_author_code(
     outcomes = result.parseoutcomes()
     assert outcomes.get("failed", 0) == 0 and outcomes.get("passed", 0) >= 100
     text = result.stdout.str()
-    assert "NOT CERTIFIED" not in text and "  CERTIFIED: declaration, basic" in text
+    assert "NOT CERTIFIED" not in text and "  CERTIFIED with caveats: declaration, basic" in text
     expected = "single_host" if mode == "file" else "single_process"
     result.stdout.fnmatch_lines([f"*deployment={expected}*"])

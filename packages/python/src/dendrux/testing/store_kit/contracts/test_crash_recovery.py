@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 from dendrux.errors import StoreOutcomeUnknown
+from dendrux.testing.store_kit._kit import store_skip
 from dendrux.testing.store_kit.contracts._marks import contract
 from dendrux.testing.store_kit.contracts._support import (
     EVENT,
@@ -179,7 +180,15 @@ async def test_an_ambiguous_claim_commit_raises_outcome_unknown(
     was its own. It must raise ``StoreOutcomeUnknown`` and never return a claim.
     """
     store = dendrux_kit.store
-    if form not in dendrux_kit.disconnect_forms():
+    forms = dendrux_kit.disconnect_forms()
+    if not forms:
+        store_skip(
+            "the fault injector's disconnect_forms() is empty, so a lost commit acknowledgement "
+            "cannot be injected and claims are not tested against it",
+            "checkpointing",
+            "recovery",
+        )
+    if form not in forms:
         pytest.skip(f"the {form} disconnect form does not exist for this dialect")
     committed = point == "after_commit"
     if operation == "reclaim_run":
@@ -207,7 +216,11 @@ async def test_an_ambiguous_claim_commit_raises_outcome_unknown(
 
     elif operation == "release_run_claim":
         if not hasattr(store, "release_run_claim"):
-            pytest.skip("the optional release_run_claim is not implemented")
+            store_skip(
+                "release_run_claim is not implemented, so releasing a claim after a lost "
+                "commit acknowledgement is not tested",
+                "recovery",
+            )
         run_id, claim = await dendrux_kit.claimed_run()
 
         async def call() -> Any:

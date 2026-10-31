@@ -15,8 +15,10 @@ from dendrux.testing.store_kit.contracts._marks import contract
 from dendrux.testing.store_kit.contracts._support import (
     EVENT,
     RECLAIM,
+    complete_call_kwargs,
     lease_cutoff,
     mark,
+    start_call_kwargs,
     started_run,
     trace_write,
     ulid,
@@ -245,3 +247,37 @@ async def test_a_trace_clash_after_reclaim_is_still_a_conflict(dendrux_kit: Kit)
         stale, "user", "one", order_index=0, trace_id=first.trace_id, claim_epoch=claim.claim_epoch
     )
     assert again == first.trace_id
+
+
+@contract("recovery", needs=("recovery", "atomic_completion"), format2=True)
+async def test_replayed_tool_calls_are_listed_bounded_and_scoped(dendrux_kit: Kit) -> None:
+    """A call completed as a replay is reported; ordinary completions and other tenants are not.
+
+    ``get_replayed_tool_calls`` feeds ``RunResult.recovery``. The list is in replay order, bounded
+    by ``limit`` with a truncation flag, and answers nothing for another tenant.
+    """
+    store = dendrux_kit.store
+    run_id = await dendrux_kit.new_run(tenant_id="t")
+    await dendrux_kit.store.checkpoint_step(
+        run_id,
+        claim_epoch=0,
+        loop_state={
+            "v": 1,
+            "phase": "dispatch",
+            "pending": [{"call_id": c} for c in ("plain", "r1", "r2")],
+        },
+        pii_mapping=None,
+        trace=None,
+    )
+    for order, (call_id, replayed) in enumerate((("plain", False), ("r1", True), ("r2", True))):
+        await store.start_tool_call(run_id, claim_epoch=0, **start_call_kwargs(call_id))
+        await store.complete_tool_call(
+            run_id, claim_epoch=0, **complete_call_kwargs(call_id, order + 1, replayed=replayed)
+        )
+    assert await store.get_replayed_tool_calls(run_id, tenant_id="t") == (["r1", "r2"], False)
+    assert await store.get_replayed_tool_calls(run_id, limit=1, tenant_id="t") == (["r1"], True)
+    assert await store.get_replayed_tool_calls(run_id, limit=2, tenant_id="t") == (
+        ["r1", "r2"],
+        False,
+    )
+    assert await store.get_replayed_tool_calls(run_id, tenant_id="other") == ([], False)
