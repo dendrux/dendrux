@@ -50,9 +50,13 @@ class FaultInjector(Protocol):
     ``after_commit``: raise after the commit (the write persists, the caller sees a failure: a
     lost acknowledgement). ``mid_write``: raise after some, but not all, of the transaction's
     writes ran (they must not persist). One shot per ``arm``; ``kind="cancel"`` raises
-    ``asyncio.CancelledError`` instead of an exception.
+    ``asyncio.CancelledError`` instead of an exception. ``after=n`` lets the next ``n`` write
+    transactions through first, so an operation made of several transactions can be cut between
+    them (an atomic operation is one transaction and is unaffected).
     """
 
-    def arm(self, store: Any, point: FaultPoint, *, kind: FaultKind = "error") -> None: ...
+    def arm(
+        self, store: Any, point: FaultPoint, *, kind: FaultKind = "error", after: int = 0
+    ) -> None: ...
 
     def disarm(self, store: Any | None = None) -> None: ...

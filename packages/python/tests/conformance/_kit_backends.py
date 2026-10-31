@@ -16,32 +16,26 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 import pytest
-from sqlalchemy import event, select, text, update
+from sqlalchemy import event, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
 from dendrux.db._settings import put_setting, seed_settings
-from dendrux.db.models import AgentRun, Base
+from dendrux.db.models import Base
 from dendrux.runtime.stores._factory import store_for_engine
+from dendrux.testing.store_kit.sql import SqlClock
 from tests.conformance import pg_guard
 from tests.integration.conftest import _PG_TRUNCATE_SQL
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
     from sqlalchemy.ext.asyncio import AsyncEngine
 
 KINDS = ("sqlite-memory", "sqlite-file", "sqlite-format1", "postgres", "mysql", "mariadb")
 MYSQL_ENV = {"mysql": "DENDRUX_TEST_MYSQL_URL", "mariadb": "DENDRUX_TEST_MARIADB_URL"}
-_TIME_COLUMNS = (
-    "last_progress_at",
-    "status_changed_at",
-    "updated_at",
-    "created_at",
-    "lease_expired_at",
-    "last_reclaimed_at",
-)
 
 
 def skip_reason(kind: str) -> str | None:
@@ -72,8 +66,9 @@ def _sqlite_engine(url: str) -> AsyncEngine:
 class KitBackend:
     """One database the kit can build empty stores on, with the author-side fixtures' work."""
 
-    def __init__(self, kind: str, tmp_path: Path) -> None:
+    def __init__(self, kind: str, tmp_path: Path, wrap: Callable[[Any], Any] | None = None) -> None:
         self.kind = kind
+        self._wrap = wrap or (lambda store: store)
         self._tmp = tmp_path
         self._engines: list[AsyncEngine] = []
         self._url: str | None = None
@@ -141,12 +136,12 @@ class KitBackend:
         engine = await self._prepare()
         self._engines.append(engine)
         await self._truncate(engine)
-        return store_for_engine(engine)
+        return self._wrap(store_for_engine(engine))
 
     async def reopen(self, store: Any) -> Any:
         """A new store over the same data (same engine when the data lives in the engine)."""
         if self.kind in ("sqlite-memory", "sqlite-format1"):
-            return store_for_engine(store._engine)
+            return self._wrap(store_for_engine(store._engine))
         return await self.second(store)
 
     async def second(self, store: Any) -> Any:
@@ -161,34 +156,11 @@ class KitBackend:
         else:
             engine = create_async_engine(self._url, isolation_level="READ COMMITTED")
         self._engines.append(engine)
-        return store_for_engine(engine)
+        return self._wrap(store_for_engine(engine))
 
     async def advance(self, delta: timedelta) -> None:
-        """Make every stored run clock read ``delta`` older (the kit's controllable clock)."""
-        engine = self._engines[0]
-        async with engine.begin() as conn:
-            rows = (
-                (
-                    await conn.execute(
-                        select(AgentRun.id, *[getattr(AgentRun, c) for c in _TIME_COLUMNS])
-                    )
-                )
-                .mappings()
-                .all()
-            )
-            for row in rows:
-                values = {}
-                for column in _TIME_COLUMNS:
-                    stamp = row[column]
-                    if stamp is None:
-                        continue
-                    if stamp.tzinfo is None:
-                        stamp = stamp.replace(tzinfo=UTC)
-                    values[column] = stamp - delta
-                if values:
-                    await conn.execute(
-                        update(AgentRun).where(AgentRun.id == row["id"]).values(**values)
-                    )
+        """The kit's controllable clock: age every stored run clock by ``delta``."""
+        await SqlClock(self._engines[0]).advance(delta)
 
     async def close(self) -> None:
         for engine in self._engines:

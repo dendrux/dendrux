@@ -158,11 +158,14 @@ async def test_a_claim_that_fails_after_commit_never_leaves_two_owners(dendrux_k
 
 
 @atomic_crash
+@pytest.mark.parametrize("after", [0, 1])
 @pytest.mark.parametrize("point", ["before_commit", "after_commit", "mid_write"])
-async def test_finalize_with_event_is_all_or_nothing(dendrux_kit: Kit, point: str) -> None:
+async def test_finalize_with_event_is_all_or_nothing(
+    dendrux_kit: Kit, point: str, after: int
+) -> None:
     store = dendrux_kit.store
     run_id = await dendrux_kit.new_run()
-    dendrux_kit.arm(point)  # type: ignore[arg-type]
+    dendrux_kit.arm(point, after=after)  # type: ignore[arg-type]
     await attempt(
         lambda: store.finalize_with_event(
             run_id,
@@ -187,9 +190,10 @@ async def test_finalize_with_event_is_all_or_nothing(dendrux_kit: Kit, point: st
 
 
 @atomic_crash
+@pytest.mark.parametrize("after", [0, 1])
 @pytest.mark.parametrize("point", ["before_commit", "after_commit", "mid_write"])
 async def test_a_tool_completion_is_all_or_nothing_and_repeatable(
-    dendrux_kit: Kit, point: str
+    dendrux_kit: Kit, point: str, after: int
 ) -> None:
     store = dendrux_kit.store
     run_id = await dendrux_kit.new_run()
@@ -202,7 +206,7 @@ async def test_a_tool_completion_is_all_or_nothing_and_repeatable(
     )
     await store.start_tool_call(run_id, claim_epoch=0, **start_call_kwargs("a"))
     kwargs = complete_call_kwargs("a", 1)
-    dendrux_kit.arm(point)  # type: ignore[arg-type]
+    dendrux_kit.arm(point, after=after)  # type: ignore[arg-type]
     await attempt(lambda: store.complete_tool_call(run_id, claim_epoch=0, **kwargs))
     dendrux_kit.disarm()
     state = await store.get_loop_state(run_id)
@@ -217,16 +221,17 @@ async def test_a_tool_completion_is_all_or_nothing_and_repeatable(
 
 
 @contract("crash_recovery", needs=("checkpointing",), uses=("injector",), format2=True)
+@pytest.mark.parametrize("after", [0, 1])
 @pytest.mark.parametrize("point", ["before_commit", "mid_write"])
 async def test_a_checkpoint_that_fails_leaves_the_previous_checkpoint(
-    dendrux_kit: Kit, point: str
+    dendrux_kit: Kit, point: str, after: int
 ) -> None:
     store = dendrux_kit.store
     run_id = await dendrux_kit.new_run()
     await store.checkpoint_step(
         run_id, claim_epoch=0, loop_state={"v": 1, "phase": "one"}, pii_mapping=None, trace=None
     )
-    dendrux_kit.arm(point)  # type: ignore[arg-type]
+    dendrux_kit.arm(point, after=after)  # type: ignore[arg-type]
     await attempt(
         lambda: store.checkpoint_step(
             run_id,

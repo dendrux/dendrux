@@ -24,9 +24,9 @@ from dendrux.testing.store_kit._kit import (
     USER_PROPERTY_STORE,
     CertificationFailure,
     Kit,
+    check_declaration,
     fixture_or_none,
     maybe_await,
-    open_declaration,
 )
 
 if TYPE_CHECKING:
@@ -139,10 +139,11 @@ async def dendrux_kit(request: pytest.FixtureRequest, dendrux_kit_provided: dict
     if factory is None:
         raise CertificationFailure(f"{FACTORY} is required but not provided")
     store = await maybe_await(factory())
-    declaration = open_declaration(store)
+    declaration = Declaration.of(store)
     props = request.node.user_properties
     props.append((USER_PROPERTY_STORE, (declaration.label(), declaration.deployment)))
     props.append((USER_PROPERTY_CATEGORY, category))
+    check_declaration(store, declaration)
     for capability in needs:
         if not declaration.has(capability):
             pytest.skip(f"{capability} is not declared")
@@ -209,8 +210,8 @@ class _Reporter:
         entry.deployment = deployment
         outcome = "skipped" if report.skipped else ("passed" if report.passed else "failed")
         entry.results.setdefault(category, Counter())[outcome] += 1
-        if report.skipped and category == "crash_recovery":
-            entry.notes.append("crash recovery: not certified (no dendrux_fault_injector fixture)")
+        if report.skipped and FAULT_INJECTOR in str(report.longrepr):
+            entry.notes.append(f"crash recovery: not certified (no {FAULT_INJECTOR} fixture)")
 
     def pytest_terminal_summary(self, terminalreporter: Any) -> None:
         _write_summary(terminalreporter, self.report)

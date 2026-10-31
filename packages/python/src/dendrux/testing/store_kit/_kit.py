@@ -106,9 +106,15 @@ class Kit:
         return found
 
     def arm(
-        self, point: FaultPoint, *, kind: FaultKind = "error", store: Any | None = None
+        self,
+        point: FaultPoint,
+        *,
+        kind: FaultKind = "error",
+        after: int = 0,
+        store: Any | None = None,
     ) -> None:
-        self.injector.arm(store if store is not None else self.store, point, kind=kind)
+        target = store if store is not None else self.store
+        self.injector.arm(target, point, kind=kind, after=after)
 
     def disarm(self, store: Any | None = None) -> None:
         injector = self._provided.get(FAULT_INJECTOR)
@@ -170,11 +176,10 @@ class Kit:
         return int(record.claim_epoch)
 
 
-def open_declaration(store: Any) -> Declaration:
-    """Read and check the declaration; skip nothing here, fail what cannot be certified."""
+def check_declaration(store: Any, declaration: Declaration) -> None:
+    """Fail certification when a declared promise lacks the methods that keep it."""
     from dendrux.errors import StoreCapabilityError
 
-    declaration = Declaration.of(store)
     try:
         validate_declaration(store)
     except StoreCapabilityError as exc:
@@ -187,7 +192,6 @@ def open_declaration(store: Any) -> Declaration:
             f"{declaration.store_name} declares {exc.capability} but {exc.method} lacks "
             f"{exc.missing!r}"
         ) from None
-    return declaration
 
 
-__all__ = ["FACTORY", "CertificationFailure", "Kit", "maybe_await", "open_declaration"]
+__all__ = ["FACTORY", "CertificationFailure", "Kit", "check_declaration", "maybe_await"]

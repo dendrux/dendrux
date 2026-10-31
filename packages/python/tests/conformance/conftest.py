@@ -17,10 +17,10 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
 from dendrux.db.models import Base
+from dendrux.testing.store_kit.sql import SqlFaultInjector
 from tests._fixtures.storage import pin_storage_format
 from tests._helpers import v030_oracle as o
 from tests.conformance import _kit_backends, pg_guard
-from tests.conformance._kit_faults import SqlFaultInjector
 from tests.integration.conftest import _PG_TRUNCATE_SQL, _ensure_test_db_exists
 
 if TYPE_CHECKING:

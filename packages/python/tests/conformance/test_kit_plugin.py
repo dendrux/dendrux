@@ -11,10 +11,10 @@ from __future__ import annotations
 import textwrap
 from typing import TYPE_CHECKING
 
+import pytest
+
 if TYPE_CHECKING:
     from pathlib import Path
-
-    import pytest
 
 pytest_plugins = ["pytester"]
 
@@ -135,3 +135,46 @@ def test_without_activation_the_plugin_collects_nothing(pytester: pytest.Pyteste
     pytester.makepyfile(test_mine=textwrap.dedent("def test_mine(): pass"))
     result = pytester.runpytest("-p", "no:randomly", "-p", "no:cacheprovider", "--no-cov", "-q")
     result.assert_outcomes(passed=1)
+
+
+def test_an_undeclared_capability_skips_instead_of_failing(pytester: pytest.Pytester) -> None:
+    caps = {
+        "deployment": "single_process",
+        "recovery": False,
+        "checkpointing": False,
+        "atomic_completion": False,
+    }
+    result = kit(pytester, caps, k="reclaim_gives_a_new_epoch or seeds_rewrites_and_conversation")
+    result.assert_outcomes(skipped=2)
+    assert "failed" not in result.parseoutcomes()
+
+
+def test_a_declared_capability_with_a_missing_fixture_fails_its_contracts(
+    pytester: pytest.Pytester,
+) -> None:
+    caps = {"deployment": "multi_server", "recovery": False}
+    result = kit(pytester, caps, k="parallel_claims_have_exactly_one_winner")
+    result.assert_outcomes(failed=1)
+    result.stdout.fnmatch_lines(["*dendrux_store_second_instance is required*multi_server*"])
+
+
+def test_without_a_fault_injector_crash_recovery_is_reported_not_certified(
+    pytester: pytest.Pytester,
+) -> None:
+    result = kit(pytester, BASE, "", CLOCK, REOPEN, k="cancelled_write_is_not_half_applied")
+    result.assert_outcomes(skipped=1)
+    result.stdout.fnmatch_lines(["*crash recovery: not certified*"])
+
+
+@pytest.mark.parametrize("how", [["--dendrux-store-kit"], ["-o", "dendrux_store_kit=true"]])
+def test_the_flag_and_the_ini_option_activate_a_plugin_that_was_only_loaded(
+    pytester: pytest.Pytester, how: list[str]
+) -> None:
+    """A pytest11 entry point loads the plugin everywhere; only an opt-in collects contracts."""
+    pytester.makeconftest(
+        "pytest_plugins = ['dendrux.testing.store_kit']\n" + AUTHOR.format(caps=BASE, body="")
+    )
+    result = pytester.runpytest(
+        "-p", "no:randomly", "-p", "no:cacheprovider", "--no-cov", "--collect-only", "-q", *how
+    )  # fmt: skip
+    assert "test_deployment_is_declared" in result.stdout.str()
