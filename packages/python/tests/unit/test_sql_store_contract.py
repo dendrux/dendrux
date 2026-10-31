@@ -17,14 +17,62 @@ def test_sql_store_factory_and_base_are_available():
     assert find_spec("dendrux.runtime.stores.sql.base") is not None, "shared SQL base is required"
 
 
-@pytest.mark.parametrize(
-    "dialect,hint", [("mysql", "not available yet"), ("oracle", "subclass SQLStateStore")]
-)
+@pytest.mark.parametrize("dialect,hint", [("oracle", "subclass SQLStateStore")])
 def test_factory_rejects_reserved_and_unknown_dialects(dialect, hint):
     from dendrux.runtime.stores._factory import store_for_engine
 
     with pytest.raises(ValueError, match=hint):
         store_for_engine(SimpleNamespace(dialect=SimpleNamespace(name=dialect)))
+
+
+def test_factory_returns_mysql_store():
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from dendrux.runtime.stores._factory import store_for_engine
+    from dendrux.runtime.stores.sql.mysql import MySQLStateStore
+
+    engine = create_async_engine("mysql+asyncmy://root@127.0.0.1:53306/dendrux_p5_b_factory_test")
+    assert isinstance(store_for_engine(engine), MySQLStateStore)
+
+
+@pytest.mark.parametrize("generated", ["onupdate", "server_onupdate", "computed"])
+async def test_mysql_increment_reads_back_generated_returning_columns(generated):
+    from unittest.mock import AsyncMock, Mock
+
+    from sqlalchemy import Column, Computed, Integer, MetaData, String, Table, text
+
+    from dendrux.runtime.stores.sql.mysql import MySQLStateStore, _increment_site
+
+    options = {generated: text("2")} if generated != "computed" else {}
+    computed = [Computed("claim_epoch + 2")] if generated == "computed" else []
+    table = Table(
+        "agent_runs",
+        MetaData(),
+        Column("id", String, primary_key=True),
+        Column("claim_epoch", Integer),
+        Column("generated_value", Integer, *computed, **options),
+    )
+    locked = Mock()
+    locked.mappings.return_value.first.return_value = {"id": "r", "generated_value": 1}
+    readback = Mock()
+    readback.mappings.return_value.one.return_value = {"generated_value": 2}
+    session = Mock(info={})
+    session.execute = AsyncMock(side_effect=[locked, Mock(), readback])
+    store = object.__new__(MySQLStateStore)
+    token = _increment_site.set((store, "claim_paused_run"))
+    try:
+        row = await store.update_one(
+            session,
+            table=table,
+            pk=("r",),
+            predicate=table.c.claim_epoch == 0,
+            values=[(table.c.claim_epoch, table.c.claim_epoch + 1)],
+            returning=[table.c.generated_value],
+        )
+    finally:
+        _increment_site.reset(token)
+    assert row["generated_value"] == 2
+    assert session.execute.await_count == 3
 
 
 def test_deployment_is_explicit_and_legacy_declarations_warn():

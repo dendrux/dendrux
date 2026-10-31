@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import re
 import sqlite3
 from dataclasses import dataclass
@@ -35,9 +36,11 @@ def error_chain(exc: BaseException) -> list[BaseException]:
 
 
 def classify_error(exc: BaseException) -> DbError:
-    """Classify PostgreSQL and SQLite using structured server/driver codes."""
+    """Classify server/driver codes, retaining only safe identifiers."""
     chain = error_chain(exc)
     for error in chain:
+        if error.args and isinstance(error.args[0], int):
+            continue
         code = getattr(error, "sqlstate", None) or getattr(error, "pgcode", None)
         if not isinstance(code, str):
             continue
@@ -73,6 +76,40 @@ def classify_error(exc: BaseException) -> DbError:
                 constraint = match[1] if match else None
             return DbError("unique_violation", constraint, code)
         return DbError("other", code=code)
+    unknown_code: int | None = None
+    for error in chain:
+        args = error.args
+        code = args[0] if args and isinstance(args[0], int) else None
+        if isinstance(error, OSError) and (getattr(error, "errno", None) or code) in (
+            errno.ECONNRESET,
+            errno.ECONNABORTED,
+            errno.EPIPE,
+            errno.ENOTCONN,
+            errno.ETIMEDOUT,
+            104,
+        ):
+            return DbError("connection_lost", code=code)
+        if code is None:
+            continue
+        if code == 0 and type(error).__name__ == "InterfaceError":
+            return DbError("connection_lost", code=code)
+        if code == 1062:
+            # asyncmy only supplies the key in the message. Accept a terminal,
+            # identifier-only key; never retain the duplicate value or message.
+            match = (
+                re.search(r" for key ['`]((?:[A-Za-z0-9_]+\.)?[A-Za-z0-9_]+)['`]$", args[1])
+                if len(args) > 1 and isinstance(args[1], str)
+                else None
+            )
+            return DbError("unique_violation", match[1].rsplit(".", 1)[-1] if match else None, code)
+        if code == 1213:
+            return DbError("deadlock_or_serialization", code=code)
+        if code == 1205:
+            return DbError("lock_timeout", code=code)
+        if code in (1927, 2006, 2013, 2014, 2045, 2055, 4031):
+            return DbError("connection_lost", code=code)
+        if unknown_code is None:
+            unknown_code = code
     if any(getattr(error, "connection_invalidated", False) for error in chain):
-        return DbError("connection_lost")
-    return DbError("other")
+        return DbError("connection_lost", code=unknown_code)
+    return DbError("other", code=unknown_code)

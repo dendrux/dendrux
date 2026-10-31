@@ -22,5 +22,7 @@ def store_for_engine(engine: AsyncEngine, **opts: Any) -> SQLStateStore:
 
         return SQLiteStateStore(engine, **opts)
     if name == "mysql":
-        raise ValueError("MySQLStateStore is not available yet")
+        from dendrux.runtime.stores.sql.mysql import MySQLStateStore
+
+        return MySQLStateStore(engine, **opts)
     raise ValueError("Unsupported SQL dialect; subclass SQLStateStore to provide an adapter")

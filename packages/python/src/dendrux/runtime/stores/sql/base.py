@@ -1065,7 +1065,7 @@ class SQLStateStore(SQLBlobCatalog):
                         session,
                         AgentRun.__table__,
                         (AgentRun.idempotency_key == idempotency_key)
-                        & AgentRun.tenant_id.is_not_distinct_from(tenant_id),
+                        & self.idempotency_scope_predicate(tenant_id),
                         {"id": run_id, "idempotency_fingerprint": idempotency_fingerprint},
                     )
                 try:
@@ -1115,6 +1115,14 @@ class SQLStateStore(SQLBlobCatalog):
             _attempt, label="create_run", run_id=run_id, classify=self.classify_db_error
         )
 
+    def idempotency_scope_predicate(self, tenant_id: str | None) -> Any:
+        """Build the tenant portion shared by creation lookup and commit proof."""
+        from sqlalchemy import func, literal_column
+
+        from dendrux.db.models import AgentRun
+
+        return func.coalesce(AgentRun.tenant_id, literal_column("''")) == (tenant_id or "")
+
     async def _check_idempotency(
         self,
         idempotency_key: str,
@@ -1133,7 +1141,7 @@ class SQLStateStore(SQLBlobCatalog):
         Returns CreateRunResult if match found.
         Raises IdempotencyConflictError if key reused with different input.
         """
-        from sqlalchemy import func, literal_column, select
+        from sqlalchemy import select
 
         from dendrux.db.enums import AgentRunStatus
         from dendrux.db.models import AgentRun
@@ -1147,7 +1155,7 @@ class SQLStateStore(SQLBlobCatalog):
 
         async with self._session_factory() as session:
             stmt = select(AgentRun).where(
-                func.coalesce(AgentRun.tenant_id, literal_column("''")) == (tenant_id or ""),
+                self.idempotency_scope_predicate(tenant_id),
                 AgentRun.idempotency_key == idempotency_key,
             )
             result = await session.execute(stmt)
@@ -5019,6 +5027,14 @@ class SQLStateStore(SQLBlobCatalog):
 
         return and_(true(), *(self.json_contains(col, (k,), v) for k, v in metadata_filter.items()))
 
+    def event_sequence_expr(self, next_index: Any) -> Any:
+        """Build sequence allocation without changing the owning INSERT shape."""
+        return next_index
+
+    def inserted_event_sequence(self, result: Any) -> int | None:
+        """Return a dialect-certified inserted sequence, or request PK readback."""
+        return None
+
     async def _insert_event(
         self,
         session: AsyncSession,
@@ -5057,7 +5073,7 @@ class SQLStateStore(SQLBlobCatalog):
             literal(row_id, String(26)),
             literal(run_id, String(26)),
             literal(event_type, String(50)),
-            next_index,
+            self.event_sequence_expr(next_index),
             literal(iteration_index, Integer()),
             literal(correlation_id, String(26)),
             literal(data, JSON()),
@@ -5101,9 +5117,11 @@ class SQLStateStore(SQLBlobCatalog):
                 else None
             )
             if inserted and not self.supports_insert_returning:
-                seq = await session.scalar(
-                    select(RunEvent.sequence_index).where(RunEvent.id == row_id)
-                )
+                seq = self.inserted_event_sequence(result)
+                if seq is None:
+                    seq = await session.scalar(
+                        select(RunEvent.sequence_index).where(RunEvent.id == row_id)
+                    )
         except IntegrityError as error:
             if self.classify_db_error(error).kind == "unique_violation":
                 conflict()
