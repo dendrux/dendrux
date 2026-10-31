@@ -3963,10 +3963,10 @@ async def _load_pause_state(
         _codes.log_code(logger, _codes.PAUSE_FORMAT_UNSUPPORTED, run_id=run_id)
         raise PersistenceError(code="pause_format_unsupported")
     checkpoint = (
-        getattr(store, "loop_state", None)
-        if getattr(store, "storage_format", None) == 2
-        else await store.get_loop_state(run_id)
+        getattr(store, "loop_state", None) if getattr(store, "storage_format", None) == 2 else None
     )
+    if checkpoint is None:
+        checkpoint = await store.get_loop_state(run_id)
     if not checkpoint:
         _codes.log_code(logger, _codes.PAUSE_FORMAT_UNSUPPORTED, run_id=run_id)
         raise PersistenceError(code="pause_format_unsupported")
