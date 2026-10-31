@@ -32,6 +32,7 @@ if TYPE_CHECKING:
 def pytest_configure(config: pytest.Config) -> None:
     """The published store kit runs here as a plugin, like it does for a store author."""
     config.pluginmanager.import_plugin("dendrux.testing.store_kit")
+    config.pluginmanager.import_plugin("dendrux.testing.store_kit._plugin")
 
 
 @pytest.fixture(scope="session")

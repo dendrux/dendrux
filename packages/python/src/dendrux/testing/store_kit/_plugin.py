@@ -1,4 +1,6 @@
-"""The pytest plugin: option, collection of the contracts, the kit fixture and the report."""
+"""The pytest plugin: collection of the contracts, the kit fixture and the report.
+
+Loaded by ``dendrux.testing.store_kit`` only when the kit is switched on."""
 
 from __future__ import annotations
 
@@ -10,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 import pytest_asyncio
 
+from dendrux.testing.store_kit._activation import activated
 from dendrux.testing.store_kit._declaration import (
     CLOCK,
     FACTORY,
@@ -34,7 +37,6 @@ if TYPE_CHECKING:
     from collections.abc import Generator
 
 CONTRACTS_DIR = Path(__file__).resolve().parent / "contracts"
-PLUGIN_NAME = "dendrux.testing.store_kit"
 
 #: Categories in report order. ``crash_recovery`` needs the optional fault injector.
 CATEGORIES = (
@@ -100,31 +102,6 @@ def contract_inventory() -> dict[str, set[str]]:
 # ---------------------------------------------------------------------------
 
 
-def pytest_addoption(parser: pytest.Parser) -> None:
-    group = parser.getgroup("dendrux-store-kit", "Dendrux store test kit")
-    group.addoption(
-        "--dendrux-store-kit",
-        action="store_true",
-        dest="dendrux_store_kit",
-        default=False,
-        help="Collect and run the Dendrux store contracts against your dendrux_* fixtures.",
-    )
-    parser.addini(
-        "dendrux_store_kit",
-        type="bool",
-        default=False,
-        help="Collect the Dendrux store contracts (same as --dendrux-store-kit).",
-    )
-
-
-def _activated(config: pytest.Config) -> bool:
-    return bool(
-        config.getoption("dendrux_store_kit", default=False)
-        or config.getini("dendrux_store_kit")
-        or PLUGIN_NAME in (config.getoption("plugins", default=None) or [])
-    )
-
-
 def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line(
         "markers",
@@ -132,7 +109,7 @@ def pytest_configure(config: pytest.Config) -> None:
         "(set by dendrux.testing.store_kit)",
     )
     config.pluginmanager.register(_Reporter(), "dendrux-store-kit-report")
-    if _activated(config):
+    if activated(config):
         target = str(CONTRACTS_DIR)
         if target not in config.args:
             config.args.append(target)
