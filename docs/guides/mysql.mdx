@@ -76,11 +76,11 @@ On first use the store reads the server's settings once per store and refuses to
 
 The time zone is not checked. Dendrux writes UTC timestamps itself, and sets `SET time_zone='+00:00'` on engines it creates; set it on your own engine as shown above so that server-side defaults agree.
 
-Metadata filters and JSON reads behave the same on all four databases: a filter value matches only a value of the same JSON type (`1` does not match `true`, and a scalar does not match an array that contains it), and `None` does not match a missing key. A number outside the range of a 64-bit integer is refused by the MySQL store before it is written, because MySQL stores such a number as an approximate decimal; MariaDB and PostgreSQL keep it exactly.
+Metadata filters and JSON reads behave the same on all four databases: a filter value matches only a value of the same JSON type (`1` does not match `true`, and a scalar does not match an array that contains it), and `None` does not match a missing key. A number outside the range of a 64-bit integer is refused with a `PersistenceError` before anything is written, because MySQL stores such a number as an approximate decimal; MariaDB and PostgreSQL keep it exactly.
 
 ## Create the schema
 
-MySQL and MariaDB do not create tables on first use. Run the migration once, as a deployment job:
+MySQL and MariaDB do not create tables on first use. Run the migration once, as a deployment job. A store that finds its tables missing or out of date, including one built on an engine you own, raises `SchemaNotInitializedError` or `SchemaOutOfDateError` with the `dendrux db migrate` hint:
 
 ```bash
 export DENDRUX_DATABASE_URL="mysql+asyncmy://user:password@db.internal:3306/dendrux"

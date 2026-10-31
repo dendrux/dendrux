@@ -58,12 +58,16 @@
   creation briefly reserves the writer before checking its parent. Cancelling a nested
   run on a shared task preserves its ancestors' ability to continue.
 - Add MySQL 8.4 and MariaDB 10.11 state stores. `MySQLStateStore` is exported from
-  `dendrux.store`; install `dendrux[mysql]` (driver `asyncmy`, not part of `dendrux[all]`).
+  `dendrux.store`; install `dendrux[mysql]` (the `asyncmy` driver and `cryptography`, which
+  MySQL 8.4's default `caching_sha2_password` login needs; not part of `dendrux[all]`).
   `Agent(database_url="mysql+asyncmy://...")`, `RunStore.from_database_url`, `sweep` and the
   CLI create their engines with `READ COMMITTED`, UTC at connect and `utf8mb4`;
   `mysql`, `mariadb` and `aiomysql` URL spellings normalise to `asyncmy`. The store
-  checks InnoDB, isolation and server version on first use. Identifiers use NO PAD
-  binary collations. `dendrux db migrate` builds the schema in resumable steps under a
+  checks InnoDB, server version, `READ COMMITTED`, autocommit off, strict `sql_mode` and
+  `utf8mb4` on first use and refuses an `AUTOCOMMIT` engine; a `mariadb+asyncmy` engine is
+  accepted wherever `mysql+asyncmy` is; a missing `asyncmy` or `cryptography` names
+  `dendrux[mysql]`. Identifiers and long text use NO PAD binary collations, JSON
+  filters match by exact type, and integers beyond 64 bits are refused before writing. `dendrux db migrate` builds the schema in resumable steps under a
   server-wide named lock, is forward-only, may share a database with application tables
   and refuses a database where the application keeps its own Alembic version table.
   Event notifications stay PostgreSQL-only. See `docs/guides/mysql.mdx`.
@@ -71,9 +75,10 @@
   its packet-too-large error (1153, or 1301), the store raises the new
   `StatementTooLargeError` (a `PersistenceError`, code `statement_too_large`, with the
   server's `limit` and a best-effort `size`); the write is not retried and nothing is
-  persisted. Servers usually close the connection instead of answering; that fails safe
-  through the ordinary persistence path (a `PersistenceError`, or `StoreOutcomeUnknown` for a
-  write without a retry identity). As an early check, a store class may define
+  persisted. Servers usually close the connection instead of answering: when a MySQL-family
+  connection is lost and a value bound to the failed statement is larger than the store's
+  `max_allowed_packet`, the store raises the same error after one attempt (the check runs
+  on the failure path only). As an early check, a store class may define
   `async statement_capacity()` and the Agent compares a worst-case estimate of its `Limits`
   with it before first use, in the Agent methods and in the runner functions (`run`, `retry`,
   `run_stream`, `resume`, `resume_with_input`, `resume_stream`). The estimate reserves 12 times
@@ -85,12 +90,24 @@
   `store_for_engine(engine)` picks the class from the engine's dialect and is used by
   `Agent`, `RunStore`, the CLI and `sweep`. **Breaking:** `SQLAlchemyStateStore` is removed
   with no alias. Use the matching concrete store or `store_for_engine`; subclasses change
-  their base; `notify_channel` is accepted only by `PostgresStateStore`. See the migration
-  note in `docs/upgrading-to-0.6.0.mdx`.
+  their base; `notify_channel` is accepted only by `PostgresStateStore`. The types the
+  dialect hooks take and return (`ConflictSpec`, `InsertPlan`, `SelectSource`, `SetFields`,
+  `AppendArray`, `RunLockScope`, `DialectFacts`, `DbError` and the rest) are exported from
+  `dendrux.store`, so a store for another database needs no private import; pass such a
+  store to `Agent(state_store=...)` and `RunStore(store)`. `IdempotencyConflictError` is
+  imported from `dendrux`, no longer from `dendrux.runtime.state`. See the migration note
+  in `docs/upgrading-to-0.6.0.mdx`.
 - A connection that fails while committing a claim or reclaim now raises
   `StoreOutcomeUnknown` (a `PersistenceError`) instead of inferring ownership from a
-  later epoch; do not run the claimed work. Other writes retry only classified transient
-  conflicts, and retry-identity writes read their rows back to report the true outcome.
+  later epoch; do not run the claimed work, and know that a blind retry of the same submit
+  call gets `RunNotPausedError` once the first attempt landed. Other writes retry only
+  classified transient failures: up to three retries, waiting 0.1, 0.2 and 0.4 seconds, for
+  deadlocks, serialization failures, lock timeouts and connection or availability errors.
+  A PostgreSQL statement timeout (`57014`) is not retried, so a long `statement_timeout`
+  no longer multiplies the time to fail. Retry-identity writes read their rows back to
+  report the true outcome. A write that still fails makes `agent.run` raise
+  `PersistenceError` (a stream ends with `run_error`) and leaves the run at its last
+  committed state for `sweep` and `reclaim`.
   `StoreCapabilities` gains `deployment` (descriptive; a declaration without it warns) and
   the `StateStore` protocol gains `update_run_meta`.
 - Publish the store test kit, a pytest plugin that certifies a store against the
@@ -100,8 +117,19 @@
   `pytest -p dendrux.testing.store_kit`; SQLite fixtures ship as a worked example. The
   plugin is registered with pytest when `dendrux` is installed, through a tiny module that
   neither imports `dendrux` nor loads the kit until switched on; the kit then needs
-  `pytest-asyncio`. See
-  `docs/guides/build-your-own-store.mdx`.
+  `pytest-asyncio`. The kit never certifies a promise it did not test: a declared
+  capability whose contracts the store made skip (format-1 runs from a store that declares
+  the four format-2 flags, a fault injector with no disconnect forms, no
+  `release_run_claim`) is NOT CERTIFIED, and the summary lists those contracts per
+  capability. A session that prints NOT CERTIFIED, including an incomplete run, exits
+  non-zero; a pass with unverified checks prints `CERTIFIED with caveats` and exits zero.
+  A missing `dendrux_store_factory` fails one test with a setup message instead of every
+  contract. The kit also checks that a store declaring `notify` implements the hook (the
+  base class declares it with a hook that does nothing, so a subclass sets `notify=False`),
+  covers `get_replayed_tool_calls`, and keeps two store classes with one name apart in the
+  report. The guide now holds a complete public-import store that passes the kit, every
+  hook with its signature, and how to plug in and create the schema of a store of your own.
+  See `docs/guides/build-your-own-store.mdx`.
 - Extend the developer load harness to private MySQL and MariaDB databases, with bounded
   resource sampling, repeated-cycle leak checks, cancellation-safe cleanup and a `_load_`
   name rule for MySQL-family databases. Add `make load-pg`, `make load-mysql` and

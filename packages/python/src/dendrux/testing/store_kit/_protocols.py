@@ -66,7 +66,8 @@ class FaultInjector(Protocol):
     ``form`` picks how an error-kind fault looks like a lost connection, so the store's error
     classifier is exercised the way a real disconnect arrives: ``invalidated`` (flagged
     ``connection_invalidated``) always, and the dialect's native unflagged forms where one
-    exists (``native``, ``native_alt``). ``disconnect_forms(store)`` lists the valid ones.
+    exists (``native``, ``native_alt``). ``disconnect_forms(store)`` lists the valid ones; an
+    empty list leaves lost commit acknowledgements untested, which the report does not certify.
 
     ``fired(store)`` is how many times the fault fired since the last ``arm``. The kit asserts
     that every cut it asked for happened, so an injector that does nothing fails certification.
