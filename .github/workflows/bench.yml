@@ -1,7 +1,8 @@
 name: Bench
 
 # Weekly scale check: `make load-quick` against a pinned Postgres, compared with
-# packages/python/tools/load_baseline.json. A statement-count regression above 20% fails the run.
+# packages/python/tools/load_baseline.json. The fixed 0.6 Scenario A budgets and a
+# statement-count regression above 20% fail the run; v0.5 comparisons are informational.
 # The baseline file changes only in a release commit (recorded from a local `make load-quick`
 # on a quiet machine); never edit it to make a failing run pass.
 on:

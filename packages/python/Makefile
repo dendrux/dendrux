@@ -32,7 +32,8 @@ bench:
 # Scale evidence. Needs a private Postgres database whose name ends in _test (the script drops
 # its tables), given as DENDRUX_LOAD_PG_URL. `load` is the full run (tens of minutes, run it on a
 # quiet machine); `load-quick` is the CI subset and fails on a >20% statement-count regression
-# against tools/load_baseline.json. Both write their full results to $(LOAD_JSON).
+# against tools/load_baseline.json. Both also enforce fixed 0.6 Scenario A budgets;
+# the v0.5 reference is informational. Both write their full results to $(LOAD_JSON).
 LOAD_JSON ?= $(or $(TMPDIR),/tmp)/dendrux-load-results.json
 
 load:

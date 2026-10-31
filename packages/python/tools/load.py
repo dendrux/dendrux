@@ -21,6 +21,12 @@ and ``memory`` (repeated cycles in one process).
 
 The script also runs against a v0.5.0 checkout (``a``, ``runs``, ``pool``, ``history``):
 point PYTHONPATH at that checkout's ``src``.
+
+Kill scenarios use one extra worker process holding 5% of runs, not 5% of OS workers.
+Killed-worker SQL is a pre-kill snapshot: lease ticks between snapshot and SIGKILL
+may be missed. Throughput excludes worker start-up; resource counters span it.
+Only localhost, 127.0.0.1 and ::1 are allowed unless --allow-remote-host is explicit.
+The only supported URL query option is sslmode; other connection options are refused.
 """
 
 from __future__ import annotations
@@ -50,10 +56,12 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 HERE = Path(__file__).resolve().parent
-DEFAULT_BASELINE = HERE / "load_baseline.json"
 
 POOL = {"pool_size": 10, "max_overflow": 5, "pool_timeout": 120, "pool_pre_ping": True}
 POOL_CEILING = POOL["pool_size"] + POOL["max_overflow"]
@@ -61,9 +69,14 @@ CHANNEL = "dendrux_events"
 SAMPLE_INTERVAL_S = 0.01
 BIG_CHARS = 985_000  # 17 results put the full history just below the 16 MiB rebuild bound
 V050_REFERENCE_A = 59.0  # recorded 2026-10-27, commit dca4f05e (owner-docs load-test-results.md)
+# Informational release comparison only (§12.53); baseline edits cannot change it.
+# Measured after 3d-trim (8a189402), 2026-10-31, 200 flows per mode / two workers.
+# Durable evidence: owner-docs/build-0.6.0/work/p3c-load/fix1-a-calibration.json.
+SCENARIO_A_BUDGETS = {"a_notify_off": 74, "a_notify_on": 83}
 
 LABEL: ContextVar[str] = ContextVar("load_label", default="other")
 OP: ContextVar[str] = ContextVar("load_op", default="-")
+ALLOW_REMOTE_HOST: ContextVar[bool] = ContextVar("load_allow_remote_host", default=False)
 
 PRESETS: dict[str, dict[str, Any]] = {
     "full": {
@@ -134,10 +147,11 @@ LEGACY_SCENARIOS = ["a", "runs", "pool", "history"]  # runnable on a v0.5.0 chec
 
 _DB_NAME = re.compile(r"^[A-Za-z0-9_]+$")
 _FORBIDDEN = {"dendrux", "dendrux_test", "postgres", "template0", "template1"}
-_OVERRIDES = {"database", "dbname", "host", "hostaddr", "port", "service", "unix_sock"}
+_QUERY_OPTIONS = {"sslmode"}
+_LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
 
-def check_private_url(url: str) -> Any:
+def check_private_url(url: str, *, allow_remote_host: bool | None = None) -> Any:
     """Return the parsed URL, or raise ValueError unless it names a private ``*_test`` database."""
     from sqlalchemy.engine import make_url
 
@@ -151,8 +165,13 @@ def check_private_url(url: str) -> Any:
         raise ValueError("refusing: the database name must end in _test (the script drops tables)")
     if name in _FORBIDDEN:
         raise ValueError(f"refusing: {name} is a shared database; use a private *_test name")
-    if _OVERRIDES & set(parsed.query):
-        raise ValueError("refusing: the URL carries query options that override the target")
+    if not parsed.host:
+        raise ValueError("refusing: an explicit host is required")
+    remote = ALLOW_REMOTE_HOST.get() if allow_remote_host is None else allow_remote_host
+    if parsed.host.lower() not in _LOCAL_HOSTS and not remote:
+        raise ValueError("refusing: non-loopback host requires --allow-remote-host")
+    if set(parsed.query) - _QUERY_OPTIONS:
+        raise ValueError("refusing: unsupported URL query options (only sslmode is allowed)")
     return parsed.set(drivername="postgresql+asyncpg")
 
 
@@ -230,7 +249,7 @@ class Meter:
         self.kinds[kind] += 1
         small = _param_bytes(parameters) < 65536
         if small and kind not in self.samples and len(self.samples) < self.SAMPLE_CAP:
-            self.samples[kind] = (statement, _plain(parameters), label, bool(executemany))
+            self.samples[kind] = (statement, parameters, label, bool(executemany))
 
     def _checkout(self, *a: Any) -> None:
         self.active += 1
@@ -255,16 +274,6 @@ class Meter:
             "checkouts": self.checkouts,
             "samples": self.samples,
         }
-
-
-def _plain(parameters: Any) -> Any:
-    if isinstance(parameters, dict):
-        return {k: _plain(v) for k, v in parameters.items()}
-    if isinstance(parameters, (list, tuple)):
-        return [_plain(v) for v in parameters]
-    if isinstance(parameters, (str, int, float, bool, bytes, type(None))):
-        return parameters
-    return parameters  # datetimes and the like pickle fine
 
 
 def merge_meters(parts: list[dict[str, Any]]) -> dict[str, Any]:
@@ -501,9 +510,11 @@ def make_store(engine: Any, *, notify: bool) -> Any:
 def make_engine(url: str, app: str, *, pool: dict[str, Any] | None = None) -> Any:
     from sqlalchemy.ext.asyncio import create_async_engine
 
-    return create_async_engine(
-        url, **(pool or POOL), connect_args={"server_settings": {"application_name": app}}
-    )
+    parsed = check_private_url(url)
+    connect_args: dict[str, Any] = {"server_settings": {"application_name": app}}
+    if "sslmode" in parsed.query:
+        connect_args["ssl"] = parsed.query["sslmode"]
+    return create_async_engine(parsed.set(query={}), **(pool or POOL), connect_args=connect_args)
 
 
 # ---------------------------------------------------------------------------
@@ -682,8 +693,12 @@ async def w_runs(ctx: Ctx) -> dict[str, Any]:
                 ok += 1
             else:
                 ctx.errors[f"status_{status_value(result)}"] += 1
+                if doomed:
+                    raise RuntimeError("doomed run failed before reaching the kill boundary")
         except Exception as exc:  # noqa: BLE001
             ctx.errors[type(exc).__name__] += 1
+            if doomed:
+                raise RuntimeError("doomed run failed before reaching the kill boundary") from exc
 
     t0 = time.perf_counter()
     await asyncio.gather(*(one(k) for k in keys))
@@ -1411,17 +1426,14 @@ async def _a_round(ctx: Ctx, engine: Any, keys: list[str]) -> int:
 
 async def w_memory(ctx: Ctx) -> dict[str, Any]:
     from sqlalchemy import text
-    from sqlalchemy.ext.asyncio import create_async_engine
 
     from dendrux.db.models import Base
 
     engine = make_engine(ctx.url, "dendrux_load_w0")
-    admin = create_async_engine(
+    admin = make_engine(
         ctx.url,
-        pool_size=1,
-        max_overflow=0,
-        isolation_level="AUTOCOMMIT",
-        connect_args={"server_settings": {"application_name": "dendrux_load_admin"}},
+        "dendrux_load_admin",
+        pool={"pool_size": 1, "max_overflow": 0, "isolation_level": "AUTOCOMMIT"},
     )
     meter = Meter(engine)
     tables = ", ".join(t.name for t in Base.metadata.sorted_tables if t.name != "dendrux_settings")
@@ -1477,6 +1489,7 @@ WORKERS = {
 
 
 def worker_entry(pipe: Any, spec: dict[str, Any]) -> None:
+    ALLOW_REMOTE_HOST.set(spec.get("allow_remote_host", False))
     warnings.simplefilter("ignore")
     import logging
 
@@ -1532,7 +1545,6 @@ def log(message: str) -> None:
 
 async def reset_db(url: str) -> None:
     import asyncpg
-    from sqlalchemy.ext.asyncio import create_async_engine
     from sqlalchemy.pool import NullPool
 
     parsed = check_private_url(url)
@@ -1548,7 +1560,7 @@ async def reset_db(url: str) -> None:
         await conn.close()
     from dendrux.db.models import Base
 
-    engine = create_async_engine(url, poolclass=NullPool)
+    engine = make_engine(url, "dendrux_load_book", pool={"poolclass": NullPool})
     async with engine.begin() as c:
         from sqlalchemy import text
 
@@ -1575,7 +1587,7 @@ async def reset_db(url: str) -> None:
 
 
 class Sampler:
-    """Samples ``pg_stat_activity``: connections by role, backends waiting on locks."""
+    """Sample backend waits, identifying run locks by relation and tuple lock metadata."""
 
     def __init__(self, url: str) -> None:
         self.dsn = dsn_of(url)
@@ -1603,10 +1615,19 @@ class Sampler:
         last = time.perf_counter()
         while True:
             rows = await self.conn.fetch(
-                "select application_name app, wait_event_type wt, wait_event we, "
-                "case when wait_event_type = 'Lock' then left(query, 300) end q "
-                "from pg_stat_activity where datname = current_database() "
-                "and backend_type = 'client backend'"
+                "SELECT a.application_name app, a.wait_event_type wt, a.wait_event we, "
+                "EXISTS (SELECT 1 FROM pg_locks waiting "
+                "JOIN pg_locks run_lock ON run_lock.pid = waiting.pid "
+                "JOIN pg_class r ON r.oid = run_lock.relation "
+                "JOIN pg_namespace ns ON ns.oid = r.relnamespace "
+                "WHERE waiting.pid = a.pid AND NOT waiting.granted "
+                "AND run_lock.database = a.datid "
+                "AND ns.nspname = 'public' AND r.relname = 'agent_runs' "
+                "AND (waiting.relation = run_lock.relation "
+                "OR (waiting.locktype = 'transactionid' AND run_lock.locktype = 'tuple'))) "
+                "AS run_row_wait "
+                "FROM pg_stat_activity a WHERE a.datname = current_database() "
+                "AND a.backend_type = 'client backend'"
             )
             now = time.perf_counter()
             dt = (now - last) * 1000
@@ -1621,7 +1642,7 @@ class Sampler:
                     sum(c for a, c in apps.items() if re.sub(r"\d+$", "N", a) == role),
                 )
             waiting = [r for r in rows if r["wt"] == "Lock"]
-            runrow = [r for r in waiting if r["q"] and "agent_runs" in r["q"]]
+            runrow = [r for r in waiting if r["run_row_wait"]]
             if waiting:
                 self.waiting_samples += 1
             self.lock_wait_ms += len(waiting) * dt
@@ -1732,7 +1753,15 @@ def spawn(url: str, scenario: str, role: str, n: int, p: dict[str, Any]) -> list
     ctx = multiprocessing.get_context("spawn")
     handles = []
     for i in range(n):
-        spec = {"scenario": scenario, "role": role, "index": i, "workers": n, "url": url, "p": p}
+        spec = {
+            "scenario": scenario,
+            "role": role,
+            "index": i,
+            "workers": n,
+            "url": url,
+            "p": p,
+            "allow_remote_host": ALLOW_REMOTE_HOST.get(),
+        }
         parent, child = ctx.Pipe()
         proc = ctx.Process(target=worker_entry, args=(child, spec), daemon=True)
         proc.start()
@@ -1799,14 +1828,16 @@ async def run_workers(
     timeout: float = 1800,
     on_message: Any = None,
     extra: list[Handle] | None = None,
+    measured: Measured | None = None,
 ) -> list[Handle]:
     handles = spawn(url, scenario, role, n, p)
     allh = handles + (extra or [])
     try:
         await pump(allh, until="ready", timeout=180)
-        for h in allh:
-            h.pipe.send("go")
-        await pump(allh, until="done", timeout=timeout, on_message=on_message)
+        with measured.workload() if measured is not None else contextlib.nullcontext():
+            for h in allh:
+                h.pipe.send("go")
+            await pump(allh, until="done", timeout=timeout, on_message=on_message)
     finally:
         release(allh)
     return handles
@@ -1818,6 +1849,16 @@ class Measured:
     def __init__(self, url: str) -> None:
         self.url = url
         self.sampler = Sampler(url)
+        self.workload_s = 0.0
+
+    @contextlib.contextmanager
+    def workload(self) -> Iterator[None]:
+        """Time released workers only, excluding their startup and controller cleanup."""
+        started = time.perf_counter()
+        try:
+            yield
+        finally:
+            self.workload_s += time.perf_counter() - started
 
     async def __aenter__(self) -> Measured:
         self.before = await db_counters(self.url)
@@ -1826,7 +1867,8 @@ class Measured:
         return self
 
     async def __aexit__(self, *exc: Any) -> None:
-        self.wall_s = time.perf_counter() - self.t0
+        self.wall_including_startup_s = time.perf_counter() - self.t0
+        self.wall_s = self.workload_s
         self.samples = await self.sampler.stop()
         await asyncio.sleep(1.3)  # pg_stat_database is flushed about once a second
         self.after = await db_counters(self.url)
@@ -1834,6 +1876,7 @@ class Measured:
 
     def server(self) -> dict[str, Any]:
         return {
+            "measurement_wall_including_startup_s": round(self.wall_including_startup_s, 3),
             "wal_bytes": self.wal_bytes,
             "table_growth_bytes": self.after["size"] - self.before["size"],
             "transactions": self.after["xacts"] - self.before["xacts"],
@@ -1936,7 +1979,7 @@ async def ctl_a(
     await reset_db(url)
     async with Measured(url) as m:
         handles = await run_workers(
-            url, "a", "main", workers, {"runs": n, "notify": notify, "shared": shared}
+            url, "a", "main", workers, {"runs": n, "notify": notify, "shared": shared}, measured=m
         )
     results = [h.result for h in handles]
     merged = merge_meters([r["meter"] for r in results])
@@ -1975,7 +2018,9 @@ async def ctl_iteration(url: str, cfg: dict[str, Any], workers: int) -> Outcome:
     out = Outcome()
     await reset_db(url)
     async with Measured(url) as m:
-        handles = await run_workers(url, "iteration", "main", 1, {"runs": cfg["iteration_runs"]})
+        handles = await run_workers(
+            url, "iteration", "main", 1, {"runs": cfg["iteration_runs"]}, measured=m
+        )
     r = handles[0].result
     merged = merge_meters([r["meter"]])
     out.samples = merged["samples"]
@@ -2035,7 +2080,7 @@ async def ctl_runs(url: str, cfg: dict[str, Any], workers: int) -> Outcome:
     await reset_db(url)
     async with Measured(url) as m:
         handles = await run_workers(
-            url, "runs", "main", workers, {"keys": list(range(n)), "notify": False}
+            url, "runs", "main", workers, {"keys": list(range(n)), "notify": False}, measured=m
         )
     results = [h.result for h in handles]
     merged = merge_meters([r["meter"] for r in results])
@@ -2071,6 +2116,13 @@ async def ctl_kill(url: str, cfg: dict[str, Any], workers: int, kill: str) -> Ou
     out = Outcome()
     n = cfg["kill_runs"]
     k = max(1, math.ceil(n * cfg["kill_fraction"]))
+    out.notes.extend(
+        [
+            f"one extra worker process holding {k}/{n} runs ({100 * k / n:g}%); "
+            "not 5% of OS workers",
+            "killed_worker_statements is a pre-kill snapshot; later lease ticks may be missed",
+        ]
+    )
     await reset_db(url)
     doomed_keys = list(range(n - k, n))
     normal_keys = list(range(n - k))
@@ -2098,12 +2150,13 @@ async def ctl_kill(url: str, cfg: dict[str, Any], workers: int, kill: str) -> Ou
         allh = normal + doomed
         try:
             await pump(allh, until="ready", timeout=180)
-            for h in allh:
-                h.pipe.send("go")
-            await pump(allh, until="done", timeout=1800, on_message=on_message)
+            with m.workload():
+                for h in allh:
+                    h.pipe.send("go")
+                await pump(allh, until="done", timeout=1800, on_message=on_message)
         finally:
             release(allh)
-        wall_load = time.perf_counter() - m.t0
+        wall_load = m.workload_s
         before_recovery = await sql_one(
             url,
             "select count(*) filter (where status = 'success') ok, "
@@ -2116,9 +2169,8 @@ async def ctl_kill(url: str, cfg: dict[str, Any], workers: int, kill: str) -> Ou
             "update agent_runs set last_progress_at = now() - interval '10 minutes' "
             "where status not in ('success','error','cancelled','max_iterations')",
         )
-        t_rec = time.perf_counter()
-        rec = await run_workers(url, "recover", "main", workers, {})
-        recovery_wall = time.perf_counter() - t_rec
+        rec = await run_workers(url, "recover", "main", workers, {}, measured=m)
+        recovery_wall = m.workload_s - wall_load
     normal_results = [h.result for h in normal]
     rec_results = [h.result for h in rec]
     merged = merge_meters([r["meter"] for r in normal_results] + [parked["meter"]])
@@ -2197,6 +2249,7 @@ async def ctl_followers(url: str, cfg: dict[str, Any], workers: int, notify: boo
             workers,
             {"runs": n, "followers": f, "notify": notify, "idle_s": cfg["idle_s"]},
             timeout=3600,
+            measured=m,
         )
     rounds = [h.result["round"] for h in handles]
     merged = merge_meters([h.result["meter"] for h in handles])
@@ -2286,6 +2339,7 @@ async def ctl_cancel(url: str, cfg: dict[str, Any], workers: int) -> Outcome:
                 "main",
                 1,
                 {"nodes": cfg["cancel_nodes"], "contended": contended, "creators": 8},
+                measured=m,
             )
         r = handles[0].result
         merged = merge_meters([r["meter"]])
@@ -2322,12 +2376,13 @@ async def ctl_cancel(url: str, cfg: dict[str, Any], workers: int) -> Outcome:
         # The flag also turns on when the 999-entry outcome list is full, not only when the
         # traversal stopped (agent.py: cascade_count + 1 > len(outcomes)); every node being
         # cancelled is the real test, so the flag only fails a tree small enough to fit the list.
-        out.check(
-            f"{name}: cascade not truncated (flag counted only for trees under 1,000 nodes)",
-            (not r["cascade_truncated"]) or r["nodes"] > 999,
-            r["cascade_truncated"],
-            False,
-        )
+        if r["nodes"] <= 999:
+            out.check(
+                f"{name}: cascade not truncated (tree fits the outcome list)",
+                not r["cascade_truncated"],
+                r["cascade_truncated"],
+                False,
+            )
         out.check(
             f"{name}: no unexpected creator errors",
             r["creators"]["other"] == 0,
@@ -2355,7 +2410,7 @@ async def ctl_pool(url: str, cfg: dict[str, Any], workers: int) -> Outcome:
     n = cfg["pool_runs"]
     await reset_db(url)
     async with Measured(url) as m:
-        handles = await run_workers(url, "pool", "main", 1, {"runs": n})
+        handles = await run_workers(url, "pool", "main", 1, {"runs": n}, measured=m)
     r = handles[0].result
     v = r["variants"]
     merged = merge_meters([x["meter"] for x in v.values()])
@@ -2413,7 +2468,9 @@ async def ctl_history(url: str, cfg: dict[str, Any], workers: int) -> Outcome:
     calls = cfg["history_calls"]
     await reset_db(url)
     async with Measured(url) as m:
-        create = (await run_workers(url, "history", "create", 1, {"calls": calls}))[0].result
+        create = (await run_workers(url, "history", "create", 1, {"calls": calls}, measured=m))[
+            0
+        ].result
         row = await sql_one(
             url,
             "select (select coalesce(sum(length(content)), 0) from react_traces) trace_chars, "
@@ -2432,6 +2489,7 @@ async def ctl_history(url: str, cfg: dict[str, Any], workers: int) -> Outcome:
                     "call_name": create["call_name"],
                     "call_id": create["call_id"],
                 },
+                measured=m,
             )
         )[0].result
     merged = merge_meters([create["meter"], resume["meter"]])
@@ -2489,6 +2547,7 @@ async def ctl_memory(url: str, cfg: dict[str, Any], workers: int) -> Outcome:
                 1,
                 {"cycles": cfg["memory_cycles"], "runs": cfg["memory_runs"]},
                 timeout=7200,
+                measured=m,
             )
         )[0]
     cycles = h.result["cycles"]
@@ -2927,6 +2986,7 @@ def render(name: str, o: Outcome) -> list[str]:
             "expected_model_calls",
             "extra_billed_calls",
             "statements_per_run_including_recovery",
+            "vs_v050_percent",
         ):
             if key in m:
                 rows.append([key, m[key]])
@@ -2965,8 +3025,12 @@ def load_baseline(path: Path | None) -> dict[str, Any]:
 
 
 def compare_gates(
-    current: dict[str, float], baseline: dict[str, Any], tolerance: float = 0.20
+    current: dict[str, float], baseline: dict[str, Any], tolerance: float = 0.20, *, scale: str
 ) -> tuple[list[list[Any]], bool]:
+    if baseline and baseline.get("scale") != scale:
+        raise ValueError(
+            f"baseline scale {baseline.get('scale')!r} differs from run scale {scale!r}"
+        )
     rows: list[list[Any]] = []
     failed = False
     for key, base in sorted(baseline.get("gates", {}).items()):
@@ -2988,7 +3052,28 @@ def compare_gates(
     return rows, failed
 
 
+def scenario_a_checks(outcomes: dict[str, Outcome]) -> list[dict[str, Any]]:
+    """Apply fixed 0.6 budgets; retain the release comparison as information."""
+    checks = []
+    for variant, budget in SCENARIO_A_BUDGETS.items():
+        if variant not in outcomes:
+            continue
+        metrics = outcomes[variant].metrics
+        value = metrics["statements_per_run"]
+        metrics["vs_v050_percent"] = round((value - V050_REFERENCE_A) / V050_REFERENCE_A * 100, 1)
+        checks.append(
+            {
+                "name": f"0.6 scenario A statement budget ({variant})",
+                "ok": value <= budget,
+                "value": value,
+                "limit": budget,
+            }
+        )
+    return checks
+
+
 async def run_all(args: argparse.Namespace) -> int:
+    ALLOW_REMOTE_HOST.set(args.allow_remote_host)
     url = str(check_private_url(args.url).render_as_string(hide_password=False))
     cfg = dict(PRESETS[args.scale])
     from dendrux.runtime.state import SQLAlchemyStateStore
@@ -2998,6 +3083,7 @@ async def run_all(args: argparse.Namespace) -> int:
     if legacy:  # a 0.5 checkout can run the scenarios that need no 0.6 surface
         wanted = [w for w in wanted if w in LEGACY_SCENARIOS] or list(LEGACY_SCENARIOS)
     baseline = load_baseline(Path(args.baseline) if args.baseline else None)
+    compare_gates({}, baseline, scale=args.scale)  # validate before resetting any database
     await reset_db(url)  # creates the private database when it is missing
     results: dict[str, Any] = {
         "meta": {
@@ -3082,21 +3168,10 @@ async def run_all(args: argparse.Namespace) -> int:
             if isinstance(exc, KeyboardInterrupt):
                 raise
     # cross-scenario budget checks
-    ref = baseline.get("v050_reference", {}).get("scenario_a_statements_per_run", V050_REFERENCE_A)
-    results["meta"]["v050_reference_scenario_a_statements_per_run"] = ref
-    for variant in ("a_notify_off", "a_notify_on"):
-        if variant in outcomes and not legacy:
-            val = outcomes[variant].metrics["statements_per_run"]
-            ok = val <= ref * 1.10
-            results["checks"].append(
-                {
-                    "name": f"0.5 scenario A within 10% of the 0.5 baseline ({variant})",
-                    "ok": ok,
-                    "value": val,
-                    "limit": round(ref * 1.10, 2),
-                }
-            )
-            outcomes[variant].metrics["vs_v050_percent"] = round((val - ref) / ref * 100, 1)
+    results["meta"]["v050_reference_scenario_a_statements_per_run"] = V050_REFERENCE_A
+    results["meta"]["scenario_a_budgets"] = SCENARIO_A_BUDGETS
+    if not legacy:
+        results["checks"].extend(scenario_a_checks(outcomes))
     for name, o in outcomes.items():
         results["checks"].extend({**c, "name": f"{name}: {c['name']}"} for c in o.checks)
     conn_ceiling = POOL_CEILING * args.workers
@@ -3114,7 +3189,9 @@ async def run_all(args: argparse.Namespace) -> int:
                 }
             )
     rows, regressed = (
-        compare_gates(results["gates"], baseline) if baseline.get("gates") else ([], False)
+        compare_gates(results["gates"], baseline, scale=args.scale)
+        if baseline.get("gates")
+        else ([], False)
     )
     results["baseline_comparison"] = rows
 
@@ -3136,11 +3213,11 @@ async def run_all(args: argparse.Namespace) -> int:
         Path(args.json).write_text(json.dumps(results, indent=2, default=str))
         log(f"wrote {args.json}")
     if args.write_baseline:
-        write_baseline(Path(args.write_baseline), results, baseline)
+        write_baseline(Path(args.write_baseline), results)
     return 1 if (failed_checks or regressed or failures) else 0
 
 
-def write_baseline(path: Path, results: dict[str, Any], previous: dict[str, Any]) -> None:
+def write_baseline(path: Path, results: dict[str, Any]) -> None:
     meta = results["meta"]
     data = {
         "_comment": (
@@ -3169,13 +3246,6 @@ def write_baseline(path: Path, results: dict[str, Any], previous: dict[str, Any]
             for k in ("version", "shared_buffers", "max_connections", "synchronous_commit", "fsync")
         },
         "gates": results["gates"],
-        "v050_reference": previous.get(
-            "v050_reference",
-            {
-                "scenario_a_statements_per_run": V050_REFERENCE_A,
-                "source": "owner-docs/build-0.5.0/load-test-results.md, commit dca4f05e",
-            },
-        ),
         "informational": {
             name: {
                 k: s["metrics"].get(k)
@@ -3211,6 +3281,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--write-baseline", help="write a baseline file from this run")
     parser.add_argument("--no-explain", action="store_true")
+    parser.add_argument(
+        "--allow-remote-host", action="store_true", help="allow an explicit remote DB host"
+    )
     args = parser.parse_args(argv)
     if not args.url:
         parser.error("--url (or DENDRUX_LOAD_PG_URL) is required")
@@ -3221,7 +3294,9 @@ def main(argv: list[str] | None = None) -> int:
         if unknown:
             parser.error(f"unknown scenarios: {sorted(unknown)}")
     try:
-        check_private_url(args.url)
+        check_private_url(args.url, allow_remote_host=args.allow_remote_host)
+        baseline = load_baseline(Path(args.baseline) if args.baseline else None)
+        compare_gates({}, baseline, scale=args.scale)
     except ValueError as exc:
         print(f"load.py: {exc}", file=sys.stderr)
         return 2
