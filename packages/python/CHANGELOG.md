@@ -57,6 +57,45 @@
   identifies a cut. Finished runs retain their cancellation flags. SQLite delegated
   creation briefly reserves the writer before checking its parent. Cancelling a nested
   run on a shared task preserves its ancestors' ability to continue.
+- Add MySQL 8.4 and MariaDB 10.11 state stores. `MySQLStateStore` is exported from
+  `dendrux.store`; install `dendrux[mysql]` (driver `asyncmy`, not part of `dendrux[all]`).
+  `Agent(database_url="mysql+asyncmy://...")`, `RunStore.from_database_url`, `sweep` and the
+  CLI create their engines with `READ COMMITTED`, UTC at connect and `utf8mb4`;
+  `mysql`, `mariadb` and `aiomysql` URL spellings normalise to `asyncmy`. The store
+  checks InnoDB, isolation and server version on first use. Identifiers use NO PAD
+  binary collations. `dendrux db migrate` builds the schema in resumable steps under a
+  server-wide named lock, is forward-only, may share a database with application tables
+  and refuses a database where the application keeps its own Alembic version table.
+  Event notifications stay PostgreSQL-only. See `docs/guides/mysql.mdx`.
+- Compare the Agent's configured `Limits` with the database's per-statement capacity
+  before first use. A store class opts in with `async statement_capacity()`;
+  `MySQLStateStore` reports `max_allowed_packet`. The Agent reserves 12 times the larger
+  of `max_input_bytes` and `max_tool_result_bytes`, 2 times `max_metadata_bytes` and 64 KiB,
+  and refuses with a `ValueError` naming both numbers (log code `store_statement_limit`).
+  The default limits fit both servers' defaults.
+- Split SQL persistence into `SQLStateStore` and the concrete `PostgresStateStore`,
+  `SQLiteStateStore` and `MySQLStateStore`, exported from `dendrux.store`.
+  `store_for_engine(engine)` picks the class from the engine's dialect and is used by
+  `Agent`, `RunStore`, the CLI and `sweep`. **Breaking:** `SQLAlchemyStateStore` is removed
+  with no alias. Use the matching concrete store or `store_for_engine`; subclasses change
+  their base; `notify_channel` is accepted only by `PostgresStateStore`. See the migration
+  note in `docs/upgrading-to-0.6.0.mdx`.
+- A connection that fails while committing a claim or reclaim now raises
+  `StoreOutcomeUnknown` (a `PersistenceError`) instead of inferring ownership from a
+  later epoch; do not run the claimed work. Other writes retry only classified transient
+  conflicts, and retry-identity writes read their rows back to report the true outcome.
+  `StoreCapabilities` gains `deployment` (descriptive; a declaration without it warns) and
+  the `StateStore` protocol gains `update_run_meta`.
+- Publish the store test kit, a pytest plugin that certifies a store against the
+  capabilities and deployment it declares: basic operations, fenced writes, retry
+  identities, checkpoints, atomic completion, recovery, two-instance concurrency and,
+  with a fault injector, crash recovery. Install `dendrux[testkit]` and run
+  `pytest -p dendrux.testing.store_kit`; SQLite fixtures ship as a worked example. See
+  `docs/guides/build-your-own-store.mdx`.
+- Extend the developer load harness to private MySQL and MariaDB databases, with bounded
+  resource sampling, repeated-cycle leak checks, cancellation-safe cleanup and a `_load_`
+  name rule for MySQL-family databases. Add `make load-pg`, `make load-mysql` and
+  `make load-mariadb`; the MySQL-family targets need declared statement ceilings.
 - Change defaults announced in 0.5: `strict_tenancy=True`,
   `on_governance_change="raise"` and `Budget.count_cache_tokens=True`. Strict tenancy
   checks the effective store, including one supplied to a low-level runner call.
@@ -85,8 +124,9 @@
   `"reclaim"` in 0.7.
 - Guardrails now also redact PII inside text that looks like a Dendrux placeholder
   but was not issued by the run.
-- Add upgrade, recovery, capability and database CLI guides; expand scaling,
-  observability and tracing guidance. See `docs/upgrading-to-0.6.0.mdx` for the rollout.
+- Add upgrade, recovery, capability, database CLI, MySQL and MariaDB, and build-your-own-store
+  guides; expand scaling, observability and tracing guidance. See `docs/upgrading-to-0.6.0.mdx`
+  for the rollout.
 
 ## 0.5.0 - 2026-10-28
 
