@@ -114,7 +114,7 @@ async def test_a_completion_with_a_different_result_conflicts(dendrux_kit: Kit) 
         result_payload='"changed"',
         success=False,
         error_message="safe",
-        event=event_write("tool.failed", "a"),
+        event=event_write("tool.completed", "a"),
     )
     with pytest.raises(PersistenceError) as caught:
         await store.complete_tool_call(run_id, claim_epoch=0, **changed)
