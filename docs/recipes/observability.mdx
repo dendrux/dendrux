@@ -99,6 +99,7 @@ Structured log lines carry a stable `code`. Group alerts by that field and corre
 | `cascade_truncated` | Inspect the remaining subtree and cancel branches explicitly, or raise `Budget.max_subtree_nodes` |
 | `sweep_cap_reached`, `tool_pool_saturated` | Sustained rate: inspect backlog and worker capacity; keep dispatch bounded |
 | `provider_unknown` | Inspect the safe provider category and HTTP status; unknown vendor codes have no public mapping |
+| `database_url_env_ignored` | The Agent ignored an environment database URL and has no persistence: pass `state_store=` or `database_url=`; this warning is logged once per process |
 
 On Postgres, also alert on sustained growth in `pg_notification_queue_usage()` when NOTIFY is enabled. A stuck listener can fill the queue and fail notifying writes at commit. A `notifier_recovered` log signals reconnection; confirm reader latency recovers too.
 

@@ -58,16 +58,31 @@
   creation briefly reserves the writer before checking its parent. Cancelling a nested
   run on a shared task preserves its ancestors' ability to continue.
 - Change defaults announced in 0.5: `strict_tenancy=True`,
-  `on_governance_change="raise"` and cache-token budget counting enabled. For an Agent
-  with a state store, omitted `tenant_id` now raises under strict tenancy and
-  non-approval continuations require `expected_pause_id`. Agents without a store
-  can omit `tenant_id` silently. The strict requirements apply only to agents with
-  a store, passed directly or built from `database_url`. Explicit
-  `strict_tenancy=False`, `on_governance_change="warn"` and `count_cache_tokens=False`
-  retain the previous choices. Remove the implicit Agent `DENDRUX_DATABASE_URL` engine;
-  pass persistence explicitly. The CLI keeps reading the variable. Omitted `sweep(on_stale=)`
-  still finalizes stale rows in 0.6 and now warns; pass `"error"` explicitly to retain it
-  when the default becomes `"reclaim"` in 0.7.
+  `on_governance_change="raise"` and `Budget.count_cache_tokens=True`. Strict tenancy
+  checks the effective store, including one supplied to a low-level runner call.
+  Run/stream calls without a store may omit tenant scope silently. A stored delegated
+  child requires deliberately chosen outer scope, including explicit `tenant_id=None`.
+  Explicit `strict_tenancy=False`, `on_governance_change="warn"` and
+  `count_cache_tokens=False` retain the earlier choices; explicit cache-token `None`
+  also keeps fresh-input-plus-output accounting without a warning.
+- Continuations require `expected_pause_id` under strict tenancy only when the stored
+  pause has an id, including on denials. Approving such a pause requires it in either
+  tenancy mode. Legacy pauses without an id can continue or be approved without one;
+  every pause written by 0.6, including reclaim re-pauses, has an id.
+- The Agent ignores `DENDRUX_DATABASE_URL`; with no effective store its runs have no
+  persistence and a returned pause cannot be submitted later. The unused variable
+  logs `database_url_env_ignored` once per process and does not raise. Pass persistence
+  explicitly; the CLI continues to read the variable.
+- Review paused 0.5 budgets before rolling: a token budget using the old cache-token
+  count can raise `GovernanceMismatchError` under 0.6 defaults. Drain it first, retain
+  `count_cache_tokens=False` for the upgrade window, or intentionally use
+  `on_governance_change="warn"` while it drains. A 0.5 cost-only budget with explicit
+  `count_cache_tokens=True` can also mismatch its saved digest; use `"warn"` while
+  those runs drain, since the choice no longer changes a cost-only budget's digest.
+- Remove `warning_location=` from the low-level `runtime.runner.resume_stream`
+  function. Omitted `sweep(on_stale=)` still finalizes stale rows in 0.6 and warns;
+  pass `"error"` explicitly to retain that behavior when the default becomes
+  `"reclaim"` in 0.7.
 - Guardrails now also redact PII inside text that looks like a Dendrux placeholder
   but was not issued by the run.
 - Add upgrade, recovery, capability and database CLI guides; expand scaling,

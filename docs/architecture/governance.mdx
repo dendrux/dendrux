@@ -188,7 +188,7 @@ A paused run can wait for days. In that time someone may deploy a build with a d
 At run start it stores a short digest of the governance configuration. On resume it recomputes the digest and compares:
 
 - The digest covers: each guardrail (class name, action and entity set, plus `governance_fingerprint()` if your custom guardrail defines one), the `before_tool` hook's qualified name, the sorted `deny` and `require_approval` lists, and the limits. It never uses reprs or object ids, so it is the same in every process.
-- The digest does **not** cover budget numbers: raising a limit to resume a budget pause is a normal operation.
+- The digest includes the budget policy (`on_exceed`, `include_children`). It also tracks the effective `count_cache_tokens` choice when a token limit is set. For a cost-only budget that choice is treated as `False`. Budget amounts are excluded, so raising a limit to resume a budget pause is allowed.
 - Runs paused before 0.5 have no digest and are skipped, with a log line.
 
 What happens on a mismatch is your choice:
@@ -201,6 +201,10 @@ Agent(..., on_governance_change="raise")   # default in 0.6: raise GovernanceMis
 ```
 
 `governance.changed` carries `expected_digest`, `actual_digest` and `changed`, the names of the parts that differ (for example `guardrails`, `deny`), never their contents. `GovernanceMismatchError(run_id, expected_digest, actual_digest, changed)` carries the same names. In 0.6 the default is `"raise"`. To resume deliberately under new rules, build the Agent with `on_governance_change="warn"`.
+
+### Upgrading paused budgets from 0.5
+
+A 0.5 token budget using the old default count can mismatch the 0.6 cache-inclusive default. Drain those runs before upgrading, explicitly keep `count_cache_tokens=False` for the upgrade window, or intentionally use `on_governance_change="warn"` while they drain. A 0.5 cost-only budget with explicit `count_cache_tokens=True` can also mismatch because that ineffective choice no longer changes the digest; use `"warn"` while those runs drain. See [the upgrade advice](/docs/upgrading-to-0.6.0#paused-runs-with-a-token-budget).
 
 ## Why one pipeline instead of four subsystems
 

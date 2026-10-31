@@ -123,7 +123,7 @@ The guide is [Images](/docs/recipes/images).
 | `RunStream` | `from dendrux.types import RunStream` | Async iterable returned by `stream()`/`resume_stream()`. |
 | `RunEvent` / `RunEventType` | `from dendrux.types import RunEvent, RunEventType` | Streaming events (`text_delta`, `tool_use_*`, `run_*`). |
 | `ToolResult` | `from dendrux.types import ToolResult` | A tool result you submit via `submit_tool_results`. `ToolResult.from_dict` and `list_from_dict` validate results that arrive from a browser. |
-| `InputValidationError` | `from dendrux.types import InputValidationError` | A `ValueError` for a value Dendrux cannot accept or store, or an approval with no `expected_pause_id`; carries a fixed `field` and `code`. |
+| `InputValidationError` | `from dendrux.types import InputValidationError` | A `ValueError` for a value Dendrux cannot accept or store, or a pause with a stored id missing a required `expected_pause_id`; carries a fixed `field` and `code`. |
 | `ToolResultContext` / `ToolResultTransform` | `from dendrux import ToolResultContext, ToolResultTransform` | Input and type of `Agent(tool_result_transform=...)`. See [Transforming tool results](/docs/reference/agent#transforming-tool-results). |
 | `GovernanceEventType` | `from dendrux import GovernanceEventType` | The 33 governance event types. See [Governance](/docs/architecture/governance). |
 | `ApprovalDecision` | `from dendrux import ApprovalDecision` | One human decision for `submit_approval(decisions=...)`: `approve()` or `deny(reason)`. See [Approval](/docs/architecture/approval#per-call-decisions). |

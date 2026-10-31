@@ -189,7 +189,7 @@ await agent.submit_tool_results(run_id, results, tenant_id=current_tenant)
 
 Passing `tenant_id` is how your route handlers keep one customer from touching another's runs. Dendrux does not decide who the caller is; derive the tenant from the authenticated request and pass it in.
 
-Forgetting it once is the easy mistake. `Agent(strict_tenancy=True)` requires explicit `tenant_id` at entry points only when the Agent has a state store (passed directly or built from `database_url`), raising `TenantScopeRequiredError` otherwise. An Agent without a store can omit `tenant_id` without a warning; delegated children still inherit their parent's tenant. Strict tenancy is the default in 0.6; explicitly choose `strict_tenancy=False` for a lenient single-tenant script. Scopes, the application tenant resolution and idempotency keys are covered on [Multi-tenancy](/docs/architecture/multi-tenancy).
+Forgetting it once is the easy mistake. `Agent(strict_tenancy=True)` requires explicit `tenant_id` at entry points when the effective call has a state store (configured on the Agent, built from `database_url`, or passed to a low-level runner function), raising `TenantScopeRequiredError` otherwise. Without an effective store, run and stream can omit `tenant_id` without a warning. A stored delegated child inherits only deliberately chosen outer scope (including explicit `None`) or scope resolved under strict rules; otherwise pass `tenant_id` on the outer run. Strict tenancy is the default in 0.6; explicitly choose `strict_tenancy=False` for a lenient single-tenant script. Scopes, the application tenant resolution and idempotency keys are covered on [Multi-tenancy](/docs/architecture/multi-tenancy).
 
 ## Why a synthetic result instead of an exception
 

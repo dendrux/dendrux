@@ -331,7 +331,7 @@ dendrux db status                        # show the current migration revision
 
 `DENDRUX_DATABASE_URL` is the one knob the CLI reads. It never accepts the URL as a flag, so credentials stay out of your shell history and process list. Error output from the CLI masks the password in any URL it prints.
 
-> **Explicit persistence in 0.6.** The Agent no longer resolves an implicit engine from this variable. Create one `SQLAlchemyStateStore` at startup and pass `state_store=` to each Agent. The CLI keeps reading the variable.
+> **Explicit persistence in 0.6.** The Agent ignores `DENDRUX_DATABASE_URL`. If it is set and no effective store is supplied, run and stream have no persistence and log `database_url_env_ignored` once per process, without raising just because the variable is set. A returned pause cannot be submitted later without persistence. Pass `state_store=` or `database_url=` explicitly; the CLI still uses the variable. Create one `SQLAlchemyStateStore` at startup and share it within the worker event loop.
 
 Async engines belong to their worker event loop. See [Scaling workers](/docs/guides/scaling) for pool ownership and sharing.
 

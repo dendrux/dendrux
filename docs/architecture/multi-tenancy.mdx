@@ -67,7 +67,7 @@ See [Build your own read routes](/docs/recipes/build-your-own-read-routes).
 | `run`, `stream`, `retry` | `None`: the new run is untenanted |
 | every other entry point | `UNSCOPED`: no tenant check |
 
-The 0.6 default is `strict_tenancy=True`. For an Agent with a state store, passed directly or built from `database_url`, omitting `tenant_id` raises `TenantScopeRequiredError`. An Agent without a store can still run or stream without `tenant_id`, silently. `reclaim` always requires explicit scope, including on a lenient Agent. An explicit `tenant_id` on a run-control write must match the run's tenant exactly, otherwise `RunNotFoundError` is raised before anything is written, the same error as a missing run.
+The 0.6 default is `strict_tenancy=True`. When the effective call uses a state store, configured on the Agent, built from `database_url` or supplied to a low-level runner call, omitting `tenant_id` raises `TenantScopeRequiredError`. Without an effective store, run and stream accept an omitted `tenant_id` silently. `reclaim` always requires explicit scope, including on a lenient Agent. An explicit `tenant_id` on a run-control write must match the run's tenant exactly, otherwise `RunNotFoundError` is raised before anything is written, the same error as a missing run.
 
 ### Strict tenancy
 
@@ -85,9 +85,9 @@ await agent.cancel_run(run_id, tenant_id=UNSCOPED)   # ok, explicitly an operato
 ```
 
 - `TenantScopeRequiredError` is a `ValueError`. It names the operation, not the data.
-- Delegated child runs inherit their parent's tenant and never raise.
-- Strict tenancy defaults to `True` in 0.6 and applies only to agents with a state store. Such agents can explicitly choose `strict_tenancy=False` to keep the earlier behavior. With a state store and strict tenancy, non-approval continuations also require `expected_pause_id`; omission raises `InputValidationError` with code `pause_id_required`.
-- It applies to `Agent` methods. Code that calls the lower-level `dendrux.run(agent, ...)` function directly is not covered.
+- A delegated child inherits scope only when the outer caller deliberately chose a tenant (including explicit `None`) or its parent resolved scope under strict rules. A stored child under a parent whose tenant was merely omitted raises `TenantScopeRequiredError`; pass `tenant_id` on the outer run.
+- Strict tenancy defaults to `True` in 0.6 and applies to calls with an effective state store. Such agents can explicitly choose `strict_tenancy=False` to keep the earlier behavior. With a state store and strict tenancy, continuations require `expected_pause_id` when the stored pause has an id; omission raises `InputValidationError` with code `pause_id_required`. Legacy pauses with no id still resume without one, including on approval.
+- It applies to Agent methods and low-level runner functions. Passing `state_store=` to `dendrux.run` or to `run_stream` / `retry` in `dendrux.runtime.runner` activates strict tenancy even if the Agent has no configured store.
 
 ### Metadata
 

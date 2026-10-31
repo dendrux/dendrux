@@ -15,7 +15,7 @@ A minimal application uses these routes (names are your choice):
 | --- | --- |
 | `POST /chat` | `Agent.run(input, tenant_id=tenant)` |
 | `POST /runs/{id}/tool-results` | `Agent.submit_tool_results(id, results, tenant_id=tenant)` |
-| `POST /runs/{id}/approvals` | `Agent.submit_approval(id, approved=decision, expected_pause_id=pause_id, tenant_id=tenant)` (the pause id is required when approving) |
+| `POST /runs/{id}/approvals` | `Agent.submit_approval(id, approved=decision, expected_pause_id=pause_id, tenant_id=tenant)` (required when approving a pause with an id) |
 | `GET /runs/{id}/pending` | `RunStore.get_pending(id, tenant_id=tenant)` |
 | Optional `GET /runs/{id}/live` | `RunStore.follow(id, tenant_id=tenant)` |
 
@@ -141,7 +141,7 @@ Submit an approval decision for a run paused in `WAITING_APPROVAL`. Pass exactly
 
 Client-target calls in the batch never execute on the server in any form; the run pauses again as `waiting_client_tool` for them.
 
-`expected_pause_id` is **required when approving** (`approved=True`, or any approved entry in `decisions`) and optional otherwise. It is the `pause_id` the approver was shown. A different current pause raises `PauseStatusMismatchError` (`reason="pause_id"`); a missing token on an approval raises `InputValidationError`.
+`expected_pause_id` is **required when approving a pause with a stored id** (`approved=True`, or any approved entry in `decisions`). With strict tenancy it is required for denials too. Legacy pauses without an id can continue without a token, including on approval. It is the `pause_id` the approver was shown. A different current pause raises `PauseStatusMismatchError` (`reason="pause_id"`); a missing required token raises `InputValidationError`.
 
 Raises: the same set as the other submit methods, plus `ValueError` for an invalid argument combination, decision ids or a non-`bool` `approved`, and `InputValidationError` (a `ValueError`) for a missing pause id on an approval.
 
@@ -193,9 +193,9 @@ From `dendrux.errors`. Suggested HTTP mappings in the docstring there; use whate
 | `RunAlreadyClaimedError` | `RuntimeError` | 409 | Concurrent submit won the CAS. Poll for completion; do not retry the submit. |
 | `RunAlreadyTerminalError` | `RuntimeError` | 409 | Run is already terminal; cannot resume. `cancel_run` does **not** raise this; terminal cancel is a silent no-op. |
 | `InvalidToolResultError` | `ValueError` | 400 | Submitted results don't match pending calls (unknown / duplicate / missing ids, wrong name, bad payload). No partial claim. |
-| `InputValidationError` | `ValueError` | 400 | A value cannot be accepted or stored (NUL, lone surrogate, non-finite JSON, bad identifier), or an approval has no `expected_pause_id`. Carries a fixed `field` and `code`, never the value. |
+| `InputValidationError` | `ValueError` | 400 | A value cannot be accepted or stored (NUL, lone surrogate, non-finite JSON, bad identifier), or a pause with a stored id lacks a required `expected_pause_id`. Carries a fixed `field` and `code`, never the value. |
 | `PersistenceNotConfiguredError` | `RuntimeError` | 500 | Agent has no DB. Configuration bug, not runtime condition. |
-| `TenantScopeRequiredError` | `ValueError` | 500 | The Agent has a state store, `strict_tenancy=True`, and the call omitted `tenant_id`; `reclaim` always requires explicit scope. A bug in your route, not a client error. |
+| `TenantScopeRequiredError` | `ValueError` | 500 | The effective call has a state store under `strict_tenancy=True` and omitted `tenant_id`, or a stored child lacks deliberately chosen outer scope; `reclaim` always requires explicit scope. A bug in your route, not a client error. |
 | `NoteLimitExceededError` | `ValueError` | 409 or 429 | `submit_note` on a run that already has `max_notes_per_run` notes. |
 | `ProviderError` and subclasses | `RuntimeError` | 502 | A provider failure. Normally reported on the run result as `error_info`; see [Handling provider errors](/docs/recipes/handling-provider-errors). |
 | `ContextLengthExceededError` | `RuntimeError` | 413 or 400 | An OpenAI-compatible endpoint rejected the request as larger than the model's context window. Raised by `run()` / `stream()`, not by a submit method. |

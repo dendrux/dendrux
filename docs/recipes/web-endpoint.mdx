@@ -22,7 +22,7 @@ Building the `Agent` object is essentially free. The cost is in the resources it
 
 | Resource | Cost if rebuilt per request | What to do |
 | --- | --- | --- |
-| DB engine | A new connection pool every request | Build the store once at startup: create one `state_store` per process and pass it to every Agent. Since 0.5.0 an `Agent(database_url=...)` with the same URL and options shares one reference-counted pool, so per-request Agents no longer multiply pools, but you must close every Agent and you lose control of the pool size. Do not rely on `DENDRUX_DATABASE_URL` (deprecated in 0.5.0, removed in 0.6). See [Scaling workers](/docs/guides/scaling). |
+| DB engine | A new connection pool every request | Build the store once at startup: create one `state_store` per process and pass it to every Agent. Since 0.5.0 an `Agent(database_url=...)` with the same URL and options shares one reference-counted pool, so per-request Agents no longer multiply pools, but you must close every Agent and you lose control of the pool size. The Agent ignores `DENDRUX_DATABASE_URL` in 0.6 and logs `database_url_env_ignored` once per process when set without an effective store. See [Scaling workers](/docs/guides/scaling). |
 | MCP source | Re-spawns a subprocess / reconnects + re-lists tools | Share one process-wide `MCPRuntime`; `bind()` per request with the requester's `tenant_key`. |
 | Provider client | Loses connection keep-alive | Use a request-owned provider unless your application has an explicit non-Agent owner for a shared provider. |
 
@@ -81,7 +81,7 @@ async def chat(req):
         return {"answer": result.answer}
 ```
 
-Build the store once at startup and pass it everywhere. An `Agent` built with `database_url=` reuses one reference-counted engine per normalised URL and `database_options` (close every Agent so the pool is released), but you cannot size that pool yourself. An `Agent` with neither `state_store=` nor `database_url=` falls back to a process-global engine built from `DENDRUX_DATABASE_URL`; that fallback warns in 0.5.0 and goes away in 0.6. The global engine is also bound to one event loop: using it from a second loop raises a clear `RuntimeError` instead of asyncpg's "another operation is in progress". Pass `state_store=STORE` and none of this applies. Pool sizing, PgBouncer and the migration job are on [Scaling workers](/docs/guides/scaling).
+Build the store once at startup and pass it everywhere. An `Agent` built with `database_url=` reuses one reference-counted engine per normalised URL and `database_options`; close every Agent to release its reference. The Agent ignores `DENDRUX_DATABASE_URL`. If it is set and no effective store is supplied, run and stream have no persistence and log `database_url_env_ignored` once per process, without raising just because the variable is set. A returned pause cannot be submitted later without persistence. Pass `state_store=` or `database_url=` explicitly; the CLI still uses the variable. Pool sizing, PgBouncer and the migration job are on [Scaling workers](/docs/guides/scaling).
 
 In a multi-tenant service, pass the authenticated caller's `tenant_id=` on every call (`run`, `stream`, `submit_*`, `cancel_run`). With a state store, `strict_tenancy=True` (the 0.6 default) makes omission an error. Agents without a store can omit `tenant_id` without a warning. See [Multi-tenancy](/docs/architecture/multi-tenancy).
 

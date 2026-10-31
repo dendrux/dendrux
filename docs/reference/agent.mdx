@@ -75,7 +75,7 @@ Agent(
 | `max_delegation_depth` | Max sub-agent nesting depth. |
 | `loop` | `ReActLoop()` (default) or `SingleCall()`. See [Loops](/docs/architecture/loops). |
 | `output_type` | A pydantic model for structured output. SingleCall only. |
-| `database_url` | SQLAlchemy async URL. Enables persistence. Matching URLs and options share an engine within the process and event loop; close every Agent to release its reference. Configure persistence with `database_url` or `state_store`; the implicit `DENDRUX_DATABASE_URL` engine is removed. The CLI still reads the variable. |
+| `database_url` | SQLAlchemy async URL. Enables persistence. Matching URLs and options share an engine within the process and event loop; close every Agent to release its reference. Configure persistence with `database_url` or `state_store`; the Agent ignores `DENDRUX_DATABASE_URL`. If it is set with no effective store, the Agent stays without persistence and logs `database_url_env_ignored` once per process. The CLI still reads the variable. |
 | `database_options` | Engine options plus the store option `notify_channel` (default `None`, notifications off). Only engine options reach `create_async_engine`. See [Scaling](/docs/guides/scaling#event-notifications). |
 | `state_store` | An explicit `StateStore` instead of `database_url` (mutually exclusive). Create one per worker event loop and share it. See [StateStore capabilities](/docs/reference/state-store). |
 | `deny` | Tool names that can never execute. See [Access control](/docs/architecture/access-control). |
@@ -88,7 +88,7 @@ Agent(
 | `tool_result_transform` | Callable that rewrites a successful server tool's result, or a successful result your client submits, before it is persisted or sent to the model. See [Transforming tool results](#transforming-tool-results). |
 | `before_tool` | Sync or async policy hook, run once for each parsed tool call that passes static `deny=` and skill preflight, before approval; called with a `ToolCallContext`, returns a `ToolDecision` or `None`. Not supported with `SingleCall`. See [Tool policy hook](/docs/architecture/tool-policy). |
 | `images` | An `ImagePolicy`: size and count caps, non-vision handling, the drop-old-images window, URL fetching and the ingest hook. `None` uses the defaults (vendor limits). Readable as `agent.image_policy`. See [Images](/docs/recipes/images). |
-| `strict_tenancy` | Defaults to `True` in 0.6 and applies only when the Agent has a state store (passed directly or built from `database_url`). Every entry point on such an Agent (`run`, `stream`, `retry`, `resume*`, `submit_*`, `cancel_run`, `request_pause`, `submit_note`) requires explicit `tenant_id` or raises `TenantScopeRequiredError`. An Agent without a store can omit `tenant_id` without a warning. An Agent with a store can select `False` to keep the earlier behavior. `reclaim` always requires explicit scope. See [Multi-tenancy](/docs/architecture/multi-tenancy). |
+| `strict_tenancy` | Defaults to `True` in 0.6 and applies when the effective call has a state store, configured on the Agent, built from `database_url` or supplied to a low-level runner function. Every entry point on such an Agent (`run`, `stream`, `retry`, `resume*`, `submit_*`, `cancel_run`, `request_pause`, `submit_note`) requires explicit `tenant_id` or raises `TenantScopeRequiredError`. Run and stream without an effective store can omit `tenant_id` without a warning. A store supplied for a low-level runner call also activates the requirement. An Agent with a store can select `False` to keep the earlier behavior. `reclaim` always requires explicit scope. See [Multi-tenancy](/docs/architecture/multi-tenancy). |
 | `limits` | A `Limits(...)` with the size caps below. `None` uses the defaults. See [Limits](#limits). |
 | `tool_threads` | How many threads of the shared sync-tool pool this Agent may occupy at once. Default 8. See [Tools](/docs/reference/tools#timeouts-and-the-thread-pool). |
 | `on_governance_change` | What a resume does when governance differs from the run's start: `"raise"` (default; `GovernanceMismatchError`) or explicit `"warn"` (emits `governance.changed` and proceeds). See [Governance](/docs/architecture/governance#detecting-changed-governance-on-resume). |
@@ -407,7 +407,7 @@ async def submit_approval(
     rejection_reason: str | None = None,
     notifier=None,
     tenant_id: TenantScope = ...,    # omitted = UNSCOPED; required with a store and strict_tenancy
-    expected_pause_id: str | None = None,   # required when approving
+    expected_pause_id: str | None = None,   # required when approving a pause with an id
 ) -> RunResult
 async def submit_resume(
     run_id: str, *, notifier=None,
@@ -417,13 +417,13 @@ async def submit_resume(
 async def resume(
     run_id: str, *, tool_results=None, user_input=None, notifier=None,
     tenant_id: TenantScope = ...,    # omitted = UNSCOPED; required with a store and strict_tenancy
-    expected_pause_id: str | None = None,   # required when approving
+    expected_pause_id: str | None = None,   # required when approving a pause with an id
 ) -> RunResult
 ```
 
 Every method takes a keyword-only `tenant_id=`, like `cancel_run` and `submit_note`. Pass the tenant your request is authenticated for. The run must belong to exactly that tenant (`None` matches untenanted runs only), otherwise `RunNotFoundError` is raised, the same error as a missing run, so existence never leaks across tenants. The check runs before anything is written: no tool results, input, approval decisions, claim, status change or event. Omit it (or pass `UNSCOPED`) to skip the check; with `Agent(strict_tenancy=True)` and a state store, omitting it raises `TenantScopeRequiredError`. See [Multi-tenancy](/docs/architecture/multi-tenancy).
 
-Each method also takes `expected_pause_id=`: the `pause_id` of the pause the caller was shown (`RunResult.pause_id`, `PendingPause.pause_id` or the `run.paused` event). A different current id raises `PauseStatusMismatchError` (`reason="pause_id"`) before writes. With a state store and the default `strict_tenancy=True`, tool results, input and plain continues require it; omission raises `InputValidationError` (field `expected_pause_id`, code `pause_id_required`). With `strict_tenancy=False` those tokens stay optional. **Approval that allows execution requires it in either mode**: `approved=True`, any approving `decisions=` entry, or `resume` of an approval pause. Control flags such as `approved` and `cascade` must be real `bool` values; `"false"` or `1` raises `ValueError`. See [Pause ids and stale submits](/docs/architecture/pause-resume#pause-ids-and-stale-submits).
+Each method also takes `expected_pause_id=`: the `pause_id` of the pause the caller was shown (`RunResult.pause_id`, `PendingPause.pause_id` or the `run.paused` event). A different current id raises `PauseStatusMismatchError` (`reason="pause_id"`) before writes. When the stored pause has an id, a call with a state store and the default `strict_tenancy=True` requires the token for every continuation, including denials; omission raises `InputValidationError` (field `expected_pause_id`, code `pause_id_required`). With `strict_tenancy=False` tokens for non-approving continuations stay optional. **Approval of a pause with a stored id requires the token in either mode**: `approved=True`, any approving `decisions=` entry, or `resume` of an approval pause. Legacy pauses without a stored id need no token, including for approval. Every pause written by 0.6, including reclaim re-pauses, has an id. Token checks precede image ingestion on input/resume paths. Control flags such as `approved` and `cascade` must be real `bool` values; `"false"` or `1` raises `ValueError`. See [Pause ids and stale submits](/docs/architecture/pause-resume#pause-ids-and-stale-submits).
 
 [//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
 

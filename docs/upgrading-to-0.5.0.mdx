@@ -480,13 +480,15 @@ These need no change but are visible.
 
 ## Warnings that announce 0.6
 
+For the final 0.6 behavior, including effective-store tenancy, legacy pauses without ids and paused-budget migration advice, see [Upgrading to 0.6.0](/docs/upgrading-to-0.6.0). The descriptions here cover 0.5 warnings.
+
 0.5 prints a `FutureWarning` for each default that flips in 0.6, and a `DeprecationWarning` for each setting that is renamed or removed (the `DENDRUX_DATABASE_URL` fallback, the old `timeout=` argument and `stream_events` without a tenant). Python's warnings machinery shows each one once per call site; Dendrux keeps no flag of its own. Act on them now.
 
 | Warning | 0.5 | 0.6 |
 | --- | --- | --- |
-| Strict tenancy | off unless `Agent(strict_tenancy=True)`; `FutureWarning` when you have not chosen | on by default |
+| Strict tenancy | off unless `Agent(strict_tenancy=True)`; `FutureWarning` when you have not chosen | on by default for calls with an effective state store |
 | Token on non-approval submits | optional; `FutureWarning` when omitted under strict tenancy | required, subject to a later decision |
-| `DENDRUX_DATABASE_URL` implicit engine | works, `DeprecationWarning` | removed |
+| `DENDRUX_DATABASE_URL` implicit engine | works, `DeprecationWarning` | ignored by Agent; once-per-process `database_url_env_ignored` log when set with no store; CLI still uses it |
 | `on_governance_change` | `"warn"`; `FutureWarning` when a resume finds changed governance and you have not chosen | `"raise"` |
 | Token budgets and cache tokens | `Budget(count_cache_tokens=...)` unset gives a `FutureWarning` when a token budget is used | cache read and write tokens counted by default |
 

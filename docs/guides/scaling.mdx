@@ -56,7 +56,7 @@ An `Agent(database_url=...)` with the same normalised URL and the same `database
 - A pool whose owning event loop has closed is retired lazily on the next matching acquisition or release. Orphaned connections are released by garbage collection, so they can linger until then and briefly exceed the new pool's limits. Each retirement logs one WARNING with `code=shared_engine_loop_closed`, without a URL or credentials. No timer or background task is involved: await `agent.close()` before you close the loop for prompt cleanup.
 - At process exit pools are retired synchronously and the operating system closes the sockets.
 
-This stops a per-message Agent from opening a new pool each time, but an explicit `state_store=` stays the recommended path: you choose the pool size and you see the lifecycle. In 0.6, the implicit Agent `DENDRUX_DATABASE_URL` engine is removed. Pass `state_store=` or `database_url=` explicitly. The CLI still reads the variable. A store created by `RunStore.from_database_url` owns its engine and must also be closed.
+This stops a per-message Agent from opening a new pool each time, but an explicit `state_store=` stays the recommended path: you choose the pool size and you see the lifecycle. The Agent ignores `DENDRUX_DATABASE_URL`. If it is set and no effective store is supplied, run and stream have no persistence and log `database_url_env_ignored` once per process, without raising just because the variable is set. A returned pause cannot be submitted later without persistence. Pass `state_store=` or `database_url=` explicitly; the CLI still uses the variable. A store created by `RunStore.from_database_url` owns its engine and must also be closed.
 
 ## Pool sizing per worker
 

@@ -60,7 +60,7 @@ All the arguments:
 | `max_cost_usd` | Dollar cap. Positive number, or `None`. | `None` |
 | `warn_at` | Fractions of each limit at which `budget.threshold` fires, each in `(0, 1)` exclusive. | `(0.5, 0.75, 0.9)` |
 | `on_exceed` | `"warn"`, `"pause"` or `"cancel"`. | `"warn"` |
-| `count_cache_tokens` | `True` counts cache read and cache write tokens in the token total. `False` explicitly keeps the fresh-input-plus-output count. `None` selects the default, which is `True` in 0.6. | `True` |
+| `count_cache_tokens` | `True` counts cache read and cache write tokens in the token total. Explicit `False` or `None` keeps the fresh-input-plus-output count without a warning. | `True` |
 | `include_children` | Count delegated descendant runs' usage. | `True` |
 
 At least one of `max_tokens` and `max_cost_usd` is required; `Budget()` raises `ValueError`. So does a non-positive limit, a `warn_at` fraction outside `(0, 1)`, or an unknown `on_exceed`.
@@ -73,6 +73,8 @@ In 0.6 the default total is `input + output + cache_read + cache_write`, summed 
 Budget(max_tokens=200_000, count_cache_tokens=True)    # the 0.6 behaviour
 Budget(max_tokens=200_000, count_cache_tokens=False)   # keep the earlier fresh-input-plus-output count
 ```
+
+For a run paused under 0.5 with a token budget, changing the cache-token count changes its governance digest. Under the new default `on_governance_change="raise"`, resume can raise `GovernanceMismatchError`. Drain those runs first, keep `count_cache_tokens=False` during the upgrade window, or deliberately use `on_governance_change="warn"` while changing accounting. A 0.5 cost-only budget with explicit `count_cache_tokens=True` can also have a legacy digest mismatch; use `"warn"` while those runs drain. See [Upgrading to 0.6.0](/docs/upgrading-to-0.6.0#paused-runs-with-a-token-budget).
 
 The dollar limit is where caching always shows up: cost is what the provider reported, or what your [`PriceTable`](/docs/architecture/pricing) computes. A delegated child can still spend past a parent's limit within one of its own iterations.
 
