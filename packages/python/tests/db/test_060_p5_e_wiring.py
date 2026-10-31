@@ -125,3 +125,90 @@ async def test_store_from_url_shares_the_library_settings(migrated_url: str) -> 
         assert await session_settings(store._engine) == ("READ COMMITTED", "+00:00")
     finally:
         await store._engine.dispose()
+
+
+async def test_a_large_frontier_is_not_capped_by_the_class_default_budget(
+    migrated_url: str,
+) -> None:
+    """A frontier larger than ``Budget.max_subtree_nodes`` (default 10,000) is chunked, not refused.
+
+    The cascade that builds a frontier is bounded by the Agent's configured budget, so the
+    store must not apply the class default a second time.
+    """
+    from dendrux.db.models import AgentRun
+    from dendrux.store import MySQLStateStore
+    from dendrux.types import Budget
+
+    ids = [f"absent-{i}" for i in range(Budget.max_subtree_nodes + 5_000)]
+    store = MySQLStateStore.from_url(migrated_url)
+    try:
+        clause = store.id_in(AgentRun.id, ids)
+        assert len(clause.clauses) == 15  # chunks of 1,000 joined by OR
+        assert await store.mark_cancel_requested(ids, tenant_id=None) == 0
+        assert await store.get_children_page(ids, after=None, limit=10, tenant_id=None) == []
+    finally:
+        await store._engine.dispose()
+
+
+async def server_packet(url: str) -> int:
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from sqlalchemy.pool import NullPool
+
+    engine = create_async_engine(url, poolclass=NullPool)
+    try:
+        async with engine.connect() as conn:
+            return int(await conn.scalar(text("SELECT @@max_allowed_packet")))
+    finally:
+        await engine.dispose()
+
+
+async def test_the_store_reports_the_servers_statement_capacity(migrated_url: str) -> None:
+    from dendrux.store import MySQLStateStore
+
+    store = MySQLStateStore.from_url(migrated_url)
+    try:
+        assert await store.statement_capacity() == await server_packet(migrated_url)
+    finally:
+        await store._engine.dispose()
+
+
+async def test_default_limits_pass_and_an_oversized_configured_limit_is_refused(
+    migrated_url: str,
+) -> None:
+    from dendrux.runtime.stores._limits_fit import required_statement_bytes
+    from dendrux.types import Limits
+
+    packet = await server_packet(migrated_url)
+    provider = ScriptedLLM([LLMResponse(text="done")])
+    async with Agent(prompt="p", provider=provider, database_url=migrated_url) as agent:
+        assert (await agent.run("go", tenant_id="t")).status == RunStatus.SUCCESS
+
+    oversized = Limits(max_tool_result_bytes=packet)  # twelve times the packet once escaped
+    async with Agent(
+        prompt="p",
+        provider=ScriptedLLM([LLMResponse(text="never")]),
+        database_url=migrated_url,
+        limits=oversized,
+    ) as refused:
+        with pytest.raises(ValueError) as caught:
+            await refused.run("go", tenant_id="t")
+        message = str(caught.value)
+        assert str(required_statement_bytes(oversized)) in message
+        assert str(packet) in message
+        # Only the earlier successful run exists: the refused call created nothing.
+        assert len(await refused._lazy_store.list_runs()) == 1
+    assert provider.calls == 1
+
+
+async def test_limits_sized_to_the_server_are_accepted(migrated_url: str) -> None:
+    from dendrux.types import Limits
+
+    packet = await server_packet(migrated_url)
+    sized = Limits(max_input_bytes=packet // 24, max_tool_result_bytes=packet // 24)
+    async with Agent(
+        prompt="p",
+        provider=ScriptedLLM([LLMResponse(text="done")]),
+        database_url=migrated_url,
+        limits=sized,
+    ) as agent:
+        assert (await agent.run("go", tenant_id="t")).status == RunStatus.SUCCESS

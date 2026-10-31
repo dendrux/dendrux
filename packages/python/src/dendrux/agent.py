@@ -645,6 +645,7 @@ class Agent:
         self._tool_threads: int = tool_threads
         self._on_governance_change: Literal["warn", "raise"] = on_governance_change
         self._tool_call_limiter: Any = make_call_limiter(tool_threads)
+        self._limits_checked_for: StateStore | None = None
 
     def _configure_images(self, images: ImagePolicy | None, blob_store: BlobStore | None) -> None:
         """Validate image services and initialize their store lifecycle."""
@@ -1152,6 +1153,16 @@ class Agent:
     # ------------------------------------------------------------------
 
     async def _resolve_state_store(self) -> StateStore | None:
+        """The state store, after a one-time check that the configured limits fit it."""
+        store = await self._open_state_store()
+        if store is not None and self._limits_checked_for is not store:
+            from dendrux.runtime.stores._limits_fit import ensure_limits_fit
+
+            await ensure_limits_fit(store, self._limits)
+            self._limits_checked_for = store
+        return store
+
+    async def _open_state_store(self) -> StateStore | None:
         """Lazily resolve the state store from config.
 
         Resolution order:

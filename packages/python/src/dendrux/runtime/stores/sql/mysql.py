@@ -70,7 +70,6 @@ class MySQLStateStore(SQLStateStore):
         from dendrux.db._dialects._mysql_types import is_mariadb
         from dendrux.db.models import Base
         from dendrux.runtime.stores.sql._types import DialectFacts
-        from dendrux.types import Limits
 
         maria = is_mariadb(conn.dialect)
         version = tuple(conn.dialect.server_version_info or ())
@@ -94,19 +93,22 @@ class MySQLStateStore(SQLStateStore):
             )
         if facts[2]:
             raise ValueError("MySQLStateStore requires every Dendrux table to use InnoDB")
-        # TODO: pass Agent's configured Limits through the store construction seam.
-        limits = Limits()
-        maximum = max(
-            limits.max_input_bytes, limits.max_tool_result_bytes, limits.max_metadata_bytes
-        )
         packet = int(facts[0])
-        if maximum > packet:
-            raise ValueError(
-                f"Dendrux maximum payload {maximum} exceeds max_allowed_packet {packet}"
-            )
         return DialectFacts(
             "mariadb" if maria else "mysql", version, {"supports_insert_returning": maria}, packet
         )
+
+    async def statement_capacity(self) -> int | None:
+        """Most bytes one SQL statement may carry (the server's ``max_allowed_packet``).
+
+        The Agent compares its configured ``Limits`` with this before its first use of the
+        store; the value is read once, with the first-use connection checks.
+        """
+        if self._dialect_facts is None:
+            async with self._session_factory():
+                pass
+        facts = self._dialect_facts
+        return None if facts is None else facts.max_allowed_packet
 
     async def claim_paused_run(
         self,
@@ -244,15 +246,9 @@ class MySQLStateStore(SQLStateStore):
         return (await session.execute(select(*returning).where(key))).mappings().one()
 
     def id_in(self, col: Any, ids: Sequence[Any]) -> Any:
-        """Bind complete frontiers in chunks within the subtree accounting bound."""
+        """Bind a frontier in chunks of 1,000; the caller's traversal bounds its size."""
         from sqlalchemy import false, or_
 
-        from dendrux.types import Budget
-
-        if len(ids) > Budget.max_subtree_nodes:
-            raise ValueError(
-                f"MySQL frontier membership must not exceed {Budget.max_subtree_nodes} identifiers"
-            )
         if not ids:
             return false()
         return or_(*(col.in_(ids[start : start + 1000]) for start in range(0, len(ids), 1000)))

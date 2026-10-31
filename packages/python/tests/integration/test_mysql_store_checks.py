@@ -41,17 +41,6 @@ async def test_non_innodb_table_refused(mysql_engine):
         await MySQLStateStore(mysql_engine).get_run("absent")
 
 
-async def test_payload_exceeding_packet_refused(mysql_engine, monkeypatch):
-    from dendrux import types
-    from dendrux.types import Limits
-
-    monkeypatch.setattr(types, "Limits", lambda: Limits(max_input_bytes=1024**3))
-    with pytest.raises(
-        ValueError, match=r"maximum payload 1073741824 exceeds max_allowed_packet [0-9]+"
-    ):
-        await MySQLStateStore(mysql_engine).get_run("absent")
-
-
 @pytest.mark.parametrize("doc", [None, {}, {"steps": []}, {"steps": [1]}])
 async def test_json_negative_index_out_of_range(store, doc):
     await store.create_run("last", "agent", meta=doc)
@@ -166,16 +155,13 @@ async def test_json_identifier_built_before_first_connection(mysql_engine):
 
 
 @pytest.mark.parametrize("operation", ["children", "cancel"])
-async def test_frontier_membership_is_bounded(store, operation):
-    from dendrux.types import Budget
-
+async def test_frontier_membership_is_chunked(store, operation):
     ids = [f"absent-{i}" for i in range(1500)]
     if operation == "children":
         assert await store.get_children_page(ids, after=None, limit=10, tenant_id=None) == []
     else:
         assert await store.mark_cancel_requested(ids, tenant_id=None) == 0
-    with pytest.raises(ValueError, match=str(Budget.max_subtree_nodes)):
-        store.id_in(AgentRun.id, ["x"] * (Budget.max_subtree_nodes + 1))
+    assert len(store.id_in(AgentRun.id, ids).clauses) == 2
 
 
 async def test_unrelated_unique_constraint_is_not_absorbed(store):

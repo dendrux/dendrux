@@ -853,6 +853,14 @@ STORE_CAPABILITY = Code(
     "A declared store capability has an incompatible method.",
     "Implement the frozen store contract.",
 )
+STORE_STATEMENT_LIMIT = Code(
+    "store_statement_limit",
+    logging.WARNING,
+    "store",
+    _BASE_FIELDS | frozenset(["bytes", "limit"]),
+    "Configured payload limits can produce a statement larger than the database accepts.",
+    "Lower the Agent's Limits or raise the server's max_allowed_packet.",
+)
 SKILLS_SESSION_UNKNOWN = Code(
     "skills_session_unknown",
     logging.WARNING,
@@ -1782,6 +1790,7 @@ REGISTRY = MappingProxyType(
             HISTORY_TOO_LARGE,
             PAUSE_FORMAT_UNSUPPORTED,
             STORE_CAPABILITY,
+            STORE_STATEMENT_LIMIT,
             SKILLS_SESSION_UNKNOWN,
             ACTIVATION_CONFLICT,
             RECLAIM_LIMIT,
