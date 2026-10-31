@@ -197,7 +197,7 @@ pip install "dendrux[testkit]"
 pytest -p dendrux.testing.store_kit
 ```
 
-`-p dendrux.testing.store_kit` loads the plugin **and** collects the contracts; you do not copy any test files. Installing `dendrux` registers the kit with pytest, but it imports nothing and loads nothing until you switch it on, so other pytest sessions in the same environment are unaffected. Switching it on needs `pytest-asyncio` (`pip install "dendrux[testkit]"`); without it pytest stops with a message naming the extra. Two other ways to switch it on: `--dendrux-store-kit` on the command line, or `dendrux_store_kit = true` under `[tool.pytest.ini_options]`. Merely having the plugin installed or listed in `pytest_plugins` collects nothing.
+`-p dendrux.testing.store_kit` loads the plugin **and** collects the contracts; you do not copy any test files. Installing `dendrux` registers a tiny bootstrap module with pytest. It does not import `dendrux` or load the kit until you switch it on, so other pytest sessions in the same environment are unaffected and pay no import cost. Switching it on needs `pytest-asyncio` (`pip install "dendrux[testkit]"`); without it pytest stops with a message naming the extra. Two other ways to switch it on: `--dendrux-store-kit` on the command line, or `dendrux_store_kit = true` under `[tool.pytest.ini_options]`. Merely having the plugin installed or listed in `pytest_plugins` collects nothing.
 
 If you use `pytest-asyncio` in strict mode, add `asyncio_default_fixture_loop_scope = "function"` to your pytest settings. The kit marks its own async tests, so `asyncio_mode` can stay as it is.
 

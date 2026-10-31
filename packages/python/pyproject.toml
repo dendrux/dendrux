@@ -92,9 +92,10 @@ dendrux = "dendrux.cli.main:app"
 # The store test kit as a pytest plugin. It collects nothing until `-p dendrux.testing.store_kit`,
 # `--dendrux-store-kit` or `dendrux_store_kit = true` switches it on. The entry-point name is the
 # module path on purpose: pluggy refuses one module registered under two names, so any other name
-# would break `pytest -p dendrux.testing.store_kit`.
+# would break `pytest -p dendrux.testing.store_kit`. The target is a top-level module outside the
+# `dendrux` package so that an inactive kit never imports `dendrux` in other pytest sessions.
 [project.entry-points.pytest11]
-"dendrux.testing.store_kit" = "dendrux.testing.store_kit"
+"dendrux.testing.store_kit" = "_dendrux_store_kit_bootstrap"
 
 [project.urls]
 Homepage = "https://github.com/dendrux/dendrux"
@@ -108,6 +109,9 @@ build-backend = "hatchling.build"
 packages = ["src/dendrux"]
 # Keep upload tooling compatible while Core Metadata 2.5 adoption is incomplete.
 core-metadata-version = "2.4"
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/_dendrux_store_kit_bootstrap.py" = "_dendrux_store_kit_bootstrap.py"
 
 # Explicit allowlist so the sdist is deterministic: only these paths ship,
 # regardless of untracked working-tree files. Without it, hatchling's default

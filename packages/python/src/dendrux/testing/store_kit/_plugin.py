@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 import pytest_asyncio
 
-from dendrux.testing.store_kit._activation import activated
+from _dendrux_store_kit_bootstrap import activated
 from dendrux.testing.store_kit._declaration import (
     CLOCK,
     FACTORY,

@@ -4,20 +4,20 @@ Run it against your store with ``pytest -p dendrux.testing.store_kit`` (or ``--d
 after providing the ``dendrux_*`` fixtures documented in the guide; see ``FaultInjector``,
 ``Clock`` and ``StoreFactory`` for their shapes. ``pip install dendrux[testkit]`` brings pytest.
 
-This module is registered as a pytest plugin by every environment that has ``dendrux``
-installed, so it imports nothing optional. The real plugin (``_plugin``) is loaded only when the
-kit is switched on, and then needs ``pytest-asyncio`` (``dendrux[testkit]``).
+The pytest11 entry point registers the top-level ``_dendrux_store_kit_bootstrap`` module, not this
+one, so an inactive kit never imports ``dendrux``. This module re-exports its hooks so that
+``-p dendrux.testing.store_kit`` and ``pytest_plugins`` behave the same. The real plugin
+(``_plugin``) is loaded only when the kit is switched on, and then needs ``pytest-asyncio``
+(``dendrux[testkit]``).
 """
 
 from __future__ import annotations
 
 import importlib
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
-from dendrux.testing.store_kit._activation import LOADED_NAME, activated, add_options
-
-if TYPE_CHECKING:
-    import pytest
+# One implementation of the options and the switch, shared with the pytest11 entry point.
+from _dendrux_store_kit_bootstrap import pytest_addoption, pytest_configure
 
 _LAZY = {
     "CertificationFailure": "dendrux.testing.store_kit._kit",
@@ -51,24 +51,3 @@ def __getattr__(name: str) -> Any:
     if module is None:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
     return getattr(importlib.import_module(module), name)
-
-
-def pytest_addoption(parser: pytest.Parser) -> None:
-    add_options(parser)
-
-
-def pytest_configure(config: pytest.Config) -> None:
-    """Load the real plugin when the kit is switched on; do nothing otherwise."""
-    if not activated(config):
-        return
-    import pytest
-
-    try:
-        importlib.import_module("pytest_asyncio")
-    except ImportError:
-        raise pytest.UsageError(
-            "The Dendrux store kit needs pytest-asyncio: pip install 'dendrux[testkit]'"
-        ) from None
-    plugin = importlib.import_module(LOADED_NAME)
-    if not config.pluginmanager.has_plugin(LOADED_NAME):
-        config.pluginmanager.register(plugin, LOADED_NAME)
