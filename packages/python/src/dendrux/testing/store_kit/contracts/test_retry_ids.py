@@ -66,21 +66,22 @@ WRITERS = {
 }
 
 
-async def _stored(store: Any, run_id: str, writer: str) -> int | None:
-    """How many rows a writer left, read back; ``None`` where the protocol has no read."""
-    if writer == "save_trace":
-        return len(await store.get_traces(run_id))
-    if writer == "save_tool_call":
-        return len(await store.get_tool_calls(run_id))
-    if writer == "save_run_event":
-        return len(await store.get_run_events(run_id))
-    if writer == "save_llm_interaction":
-        return len(await store.get_llm_interactions(run_id))
-    return None
+COUNTABLE = ["save_trace", "save_tool_call", "save_run_event", "save_llm_interaction"]
+
+
+async def _stored(store: Any, run_id: str, writer: str) -> int:
+    """How many rows a countable writer left, read back through the protocol."""
+    reads = {
+        "save_trace": store.get_traces,
+        "save_tool_call": store.get_tool_calls,
+        "save_run_event": store.get_run_events,
+        "save_llm_interaction": store.get_llm_interactions,
+    }
+    return len(await reads[writer](run_id))
 
 
 @retry
-@pytest.mark.parametrize("writer", sorted(WRITERS))
+@pytest.mark.parametrize("writer", COUNTABLE)
 async def test_a_repeated_write_with_the_same_identity_stores_once(
     dendrux_kit: Kit, writer: str
 ) -> None:
@@ -90,12 +91,11 @@ async def test_a_repeated_write_with_the_same_identity_stores_once(
     first = await WRITERS[writer](store, run_id, ident, False)
     second = await WRITERS[writer](store, run_id, ident, False)
     assert first == second
-    stored = await _stored(store, run_id, writer)
-    assert stored in (1, None)
+    assert await _stored(store, run_id, writer) == 1
 
 
 @retry
-@pytest.mark.parametrize("writer", sorted(WRITERS))
+@pytest.mark.parametrize("writer", COUNTABLE)
 async def test_the_same_identity_with_different_content_conflicts(
     dendrux_kit: Kit, writer: str
 ) -> None:
@@ -106,8 +106,30 @@ async def test_the_same_identity_with_different_content_conflicts(
     with pytest.raises(PersistenceError) as caught:
         await WRITERS[writer](store, run_id, ident, True)
     assert caught.value.code == "write_conflict"
-    stored = await _stored(store, run_id, writer)
-    assert stored in (1, None), "the conflicting write must not add a row"
+    assert await _stored(store, run_id, writer) == 1, "the conflicting write must not add a row"
+
+
+@retry
+async def test_save_usage_repeats_without_error_and_conflicts_on_changed_content(
+    dendrux_kit: Kit,
+) -> None:
+    store = dendrux_kit.store
+    run_id = await dendrux_kit.new_run()
+    ident = ulid()
+    first = await _usage(store, run_id, ident, False)
+    assert await _usage(store, run_id, ident, False) == first
+    with pytest.raises(PersistenceError) as caught:
+        await _usage(store, run_id, ident, True)
+    assert caught.value.code == "write_conflict"
+
+
+@retry
+async def test_save_usage_stores_one_row_per_identity_is_unverified(dendrux_kit: Kit) -> None:
+    """Usage rows have no read in the protocol, so a duplicate row cannot be observed."""
+    pytest.skip(
+        "unverified: save_usage retry identity: usage rows cannot be read through the "
+        "protocol, so a duplicate row is not detected"
+    )
 
 
 @retry

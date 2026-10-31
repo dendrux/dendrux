@@ -262,7 +262,9 @@ class _Reporter:
             if FAULT_INJECTOR in reason:
                 entry.notes.append(f"crash recovery: not certified (no {FAULT_INJECTOR} fixture)")
             elif "unverified:" in reason:
-                entry.notes.append("unverified:" + reason.split("unverified:", 1)[1].strip(" ')\""))
+                entry.notes.append(
+                    "unverified: " + reason.split("unverified:", 1)[1].strip(" ')\"")
+                )
 
     def pytest_terminal_summary(self, terminalreporter: Any) -> None:
         _write_summary(terminalreporter, self.report)

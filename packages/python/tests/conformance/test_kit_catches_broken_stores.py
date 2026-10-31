@@ -253,3 +253,30 @@ def test_the_same_slice_passes_on_the_unbroken_store(pytester: pytest.Pytester, 
     intact = run_slice(pytester, NONE, k)
     outcomes = intact.parseoutcomes()
     assert outcomes.get("failed", 0) == 0 and outcomes.get("passed", 0) >= 1, intact.stdout.str()
+
+
+DUPLICATE_USAGE = mutant("""
+    async def save_usage(self, run_id, *, iteration_index, usage, usage_id=None,
+                         claim_epoch=None, **kw):
+        await super().save_usage(
+            run_id, iteration_index=iteration_index, usage=usage, usage_id=usage_id,
+            claim_epoch=claim_epoch, **kw,
+        )
+        await super().save_usage(
+            run_id, iteration_index=iteration_index, usage=usage, claim_epoch=claim_epoch, **kw
+        )  # a second row under a fresh identity
+""")
+
+
+def test_usage_rows_cannot_be_read_so_usage_retry_identity_is_reported_unverified(
+    pytester: pytest.Pytester,
+) -> None:
+    """The protocol has no read of usage rows, so duplicates cannot be seen: say so, never pass."""
+    broken = run_slice(pytester, DUPLICATE_USAGE, "save_usage")
+    text = broken.stdout.str()
+    assert failed_functions(broken) == set(), "no portable read can see the duplicate rows"
+    assert "unverified: save_usage" in text, text[-1500:]
+    assert "usage rows" in text
+    # the caveat travels with the verdict line when the rest of the group is certified
+    intact = run_slice(pytester, NONE, "save_usage")
+    assert "unverified: save_usage" in intact.stdout.str()
