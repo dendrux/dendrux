@@ -209,3 +209,30 @@ def test_without_a_clock_time_based_contracts_skip_as_unverified(
     result = kit(pytester, caps, k="sweeping_stale_running_runs_spares_fresh_ones")
     result.assert_outcomes(skipped=1)
     result.stdout.fnmatch_lines(["*unverified: time-based sweeps and leases*"])
+
+
+XDIST_CAPS = {"deployment": "single_process", "recovery": False}
+DROP_TWO_VARIANTS = "not (stale_epoch_is_refused and (save_trace or save_usage))"
+
+
+def _xdist(pytester: pytest.Pytester, k: str | None) -> pytest.RunResult:
+    pytester.makeconftest(AUTHOR.format(caps=XDIST_CAPS, body=""))
+    args = [*INNER, "-n", "2", "-q"]
+    return pytester.runpytest(*args, *(["-k", k] if k else []))
+
+
+def test_under_xdist_two_omitted_parameter_variants_are_an_incomplete_run(
+    pytester: pytest.Pytester,
+) -> None:
+    result = _xdist(pytester, DROP_TWO_VARIANTS)
+    text = result.stdout.str()
+    assert result.parseoutcomes().get("failed", 0) == 0, text[-1500:]
+    assert "NOT CERTIFIED" in text and "incomplete run" in text, text[-1500:]
+    assert "2 of " in text and "stale_epoch_is_refused" in text
+
+
+def test_under_xdist_a_complete_run_is_certified(pytester: pytest.Pytester) -> None:
+    result = _xdist(pytester, None)
+    text = result.stdout.str()
+    assert result.parseoutcomes().get("failed", 0) == 0, text[-1500:]
+    assert "NOT CERTIFIED" not in text and "  CERTIFIED:" in text, text[-1500:]

@@ -70,7 +70,8 @@ class _StoreReport:
 @dataclass
 class _Report:
     stores: dict[str, _StoreReport] = field(default_factory=dict)
-    deselected: set[str] = field(default_factory=set)  # categories with a deselected contract
+    expected: dict[str, str] = field(default_factory=dict)  # contract node id -> category
+    reported: set[str] = field(default_factory=set)  # node ids that produced a report
 
 
 def contract_inventory() -> dict[str, set[str]]:
@@ -238,13 +239,30 @@ class _Reporter:
     def __init__(self) -> None:
         self.report = _Report()
 
-    def pytest_deselected(self, items: list[pytest.Item]) -> None:
+    @pytest.hookimpl(tryfirst=True)
+    def pytest_collection_modifyitems(self, items: list[pytest.Item]) -> None:
+        """Every contract variant that exists, before any ``-k``/``--deselect`` removes some."""
         for item in items:
             marker = item.get_closest_marker(MARKER)
             if marker is not None:
-                self.report.deselected.add(str(marker.args[0]))
+                self.report.expected[item.nodeid] = str(marker.args[0])
+
+    @pytest.hookimpl(tryfirst=True)
+    def pytest_sessionfinish(self, session: pytest.Session) -> None:
+        """An xdist worker hands its expected contract variants to the controller."""
+        output = getattr(session.config, "workeroutput", None)
+        if output is not None:
+            output["dendrux_kit_expected"] = dict(self.report.expected)
+
+    @pytest.hookimpl(optionalhook=True)
+    def pytest_testnodedown(self, node: Any, error: Any) -> None:
+        expected = (getattr(node, "workeroutput", None) or {}).get("dendrux_kit_expected")
+        if expected:
+            self.report.expected.update(expected)
 
     def pytest_runtest_logreport(self, report: pytest.TestReport) -> None:
+        if report.when in ("setup", "call"):
+            self.report.reported.add(report.nodeid)
         props: dict[str, Any] = dict(report.user_properties)
         if USER_PROPERTY_STORE not in props or report.when not in ("setup", "call"):
             return
@@ -282,14 +300,22 @@ def _problems(entry: _StoreReport, report: _Report, inventory: dict[str, set[str
         problems.append("declared, but the fixture is missing: " + "; ".join(missing))
     if entry.deployment is None:
         problems.append("deployment is not declared")
-    incomplete = [
+    unrun = {n: c for n, c in report.expected.items() if n not in report.reported}
+    unseen = [
         category
         for category in CATEGORIES
-        if category in inventory
-        and (category in report.deselected or inventory[category] - entry.seen.get(category, set()))
+        if category in inventory and inventory[category] - entry.seen.get(category, set())
     ]
-    if incomplete:
-        problems.append("incomplete run, not every contract ran: " + ", ".join(incomplete))
+    if unrun or unseen:
+        categories = [c for c in CATEGORIES if c in set(unrun.values()) | set(unseen)]
+        detail = ""
+        if unrun:
+            names = sorted({_function_name(n) for n in unrun})[:3]
+            detail = (
+                f" ({len(unrun)} of {len(report.expected)} contract variants never ran: "
+                f"{', '.join(names)})"
+            )
+        problems.append("incomplete run, not every contract ran: " + ", ".join(categories) + detail)
     return problems
 
 
