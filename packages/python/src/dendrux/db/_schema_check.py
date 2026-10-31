@@ -1,4 +1,4 @@
-"""Read-only, state-aware schema checks for PostgreSQL and SQLite.
+"""Read-only, state-aware schema checks for PostgreSQL, SQLite and MySQL/MariaDB.
 
 Postgres users run Alembic after upgrading Dendrux. If they forget, the first
 query fails deep inside a run with a raw ``UndefinedColumnError``. This check
@@ -28,11 +28,12 @@ import os
 import weakref
 from typing import TYPE_CHECKING
 
-from sqlalchemy import UniqueConstraint, inspect, text
+from sqlalchemy import UniqueConstraint, inspect, select
 from sqlalchemy.exc import DBAPIError
 
+from dendrux.db._dialects import family, mysql, postgres, sqlite
 from dendrux.db._storage_schema import ACTIVATION_INDEXES
-from dendrux.db.models import Base
+from dendrux.db.models import Base, DendruxSetting
 from dendrux.errors import SchemaNotInitializedError, SchemaOutOfDateError
 
 if TYPE_CHECKING:
@@ -88,28 +89,13 @@ def compare_schema(actual: Mapping[str, Collection[str]]) -> tuple[list[str], li
 
 def read_actual_schema(sync_conn: Connection) -> dict[str, list[str]]:
     """Table name -> column names for every model table present in the database."""
-    if sync_conn.dialect.name == "postgresql":
-        rows = sync_conn.execute(
-            text(
-                "SELECT t.relname, a.attname FROM pg_class t "
-                "JOIN pg_namespace n ON n.oid=t.relnamespace "
-                "JOIN pg_attribute a ON a.attrelid=t.oid "
-                "WHERE n.nspname=current_schema() AND t.relkind IN ('r', 'p') "
-                "AND a.attnum > 0 AND NOT a.attisdropped AND t.relname=ANY(:tables)"
-            ),
-            {"tables": sorted(Base.metadata.tables)},
-        )
-        actual: dict[str, list[str]] = {}
-        for table_name, column_name in rows:
-            actual.setdefault(table_name, []).append(column_name)
-        return actual
-    inspector = inspect(sync_conn)
-    wanted = {t.name for t in Base.metadata.tables.values()}
-    present = [name for name in inspector.get_table_names() if name in wanted]
-    if not present:
-        return {}
-    columns = inspector.get_multi_columns(filter_names=present)
-    return {table: [c["name"] for c in cols] for (_schema, table), cols in columns.items()}
+    tables = sorted(Base.metadata.tables)
+    found = family(sync_conn.dialect)
+    if found == "postgresql":
+        return postgres.read_columns(sync_conn, tables)
+    if found == "mysql":
+        return mysql.read_columns(sync_conn, tables)
+    return sqlite.read_columns(sync_conn, tables)
 
 
 def required_indexes(state: str = "pre-activation") -> dict[str, str]:
@@ -141,9 +127,8 @@ def read_schema_phase(conn: Connection, *, known_tables: Collection[str] | None 
         return "pre-activation"
     settings = dict(
         conn.execute(
-            text(
-                "SELECT key, value FROM dendrux_settings "
-                "WHERE key IN ('storage_format', 'activate_step')"
+            select(DendruxSetting.key, DendruxSetting.value).where(
+                DendruxSetting.key.in_(("storage_format", "activate_step"))
             )
         )
         .tuples()
@@ -194,39 +179,22 @@ class _IndexNames(set[str]):
 
 
 def read_actual_indexes(sync_conn: Connection) -> set[str]:
-    """Valid, ready indexes whose definitions match, on PostgreSQL or SQLite."""
+    """Valid, ready indexes whose definitions match, on PostgreSQL, SQLite or MySQL."""
     from sqlalchemy.schema import CreateIndex
 
-    from dendrux.db._index_check import _canonical, read_pg_indexes
+    from dendrux.db._index_check import _canonical
 
-    if sync_conn.dialect.name == "postgresql":
-        entries = read_pg_indexes(sync_conn, tables=sorted(Base.metadata.tables))
+    found = family(sync_conn.dialect)
+    if found == "mysql":
+        valid, existing = mysql.index_names(sync_conn)
+        return _IndexNames(valid, existing)
+    if found == "postgresql":
+        entries = postgres.read_indexes(sync_conn, tables=sorted(Base.metadata.tables))
     else:
-        entries = {
-            row[0]: (row[1], row[2], True)
-            for row in sync_conn.execute(
-                text(
-                    "SELECT name, tbl_name, sql FROM sqlite_master "
-                    "WHERE type='index' AND sql IS NOT NULL"
-                )
-            )
-        }
+        entries = sqlite.read_index_entries(sync_conn)
     names = {name for name, entry in entries.items() if entry[2]}
-    if sync_conn.dialect.name == "sqlite":
-        inspector = inspect(sync_conn)
-        for model_table in Base.metadata.sorted_tables:
-            declared = [
-                c for c in model_table.constraints if isinstance(c, UniqueConstraint) and c.name
-            ]
-            if not declared or not inspector.has_table(model_table.name):
-                continue
-            constraints = {
-                item["name"]: item["column_names"]
-                for item in inspector.get_unique_constraints(model_table.name)
-            }
-            for constraint in declared:
-                if constraints.get(str(constraint.name)) == [c.name for c in constraint.columns]:
-                    names.add(str(constraint.name))
+    if found == "sqlite":
+        names |= sqlite.matching_unique_constraints(sync_conn, Base.metadata.sorted_tables)
     expected = {
         str(index.name): (table.name, str(CreateIndex(index).compile(dialect=sync_conn.dialect)))
         for table in Base.metadata.sorted_tables
@@ -243,7 +211,13 @@ def read_actual_indexes(sync_conn: Connection) -> set[str]:
 
 
 def schema_problems(conn: Connection) -> list[str]:
-    """Read-only structural check shared by the CLI, activation and runtime startup."""
+    """Read-only structural check shared by the CLI, activation and runtime startup.
+
+    On MySQL/MariaDB it compares the whole head definition (types, NO PAD collations,
+    keys and indexes) and the settings (active format, no unfinished bootstrap).
+    """
+    if family(conn.dialect) == "mysql":
+        return mysql.check(conn).problems()
     actual = read_actual_schema(conn)
     tables, columns = compare_schema(actual)
     missing = columns + [f"table {name}" for name in tables]
@@ -280,6 +254,9 @@ async def ensure_schema_current(engine: AsyncEngine) -> None:
     """
     if _skipped():
         return
+    if family(engine.dialect) == "mysql":
+        await _ensure_mysql_current(engine)
+        return
     indexes: set[str] | None = None
     async with engine.connect() as conn:
         try:
@@ -301,4 +278,20 @@ async def ensure_schema_current(engine: AsyncEngine) -> None:
     )
     if missing_tables or missing_columns or missing_indexes:
         raise SchemaOutOfDateError(missing_tables, missing_columns, missing_indexes)
+    _VERIFIED.add(engine.sync_engine)
+
+
+async def _ensure_mysql_current(engine: AsyncEngine) -> None:
+    async with engine.connect() as conn:
+        try:
+            report = await conn.run_sync(mysql.check)
+        except DBAPIError as exc:
+            if exc.connection_invalidated:
+                raise
+            logger.warning("schema check skipped: %s", type(exc.orig or exc).__name__)
+            return
+    if not report.present:
+        raise SchemaNotInitializedError()
+    if report.missing_tables or report.columns or report.indexes:
+        raise SchemaOutOfDateError(report.missing_tables, report.columns, report.indexes)
     _VERIFIED.add(engine.sync_engine)

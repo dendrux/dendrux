@@ -9,15 +9,16 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import delete, func, inspect, select, text
-from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy.exc import IntegrityError
 
 from dendrux import _codes
+from dendrux.db._dialects import is_mysql_family, mysql, postgres, require_family, sqlite
 from dendrux.db._index_check import index_exists, require_index
 from dendrux.db._migration_ddl import build_index_concurrently, drop_index_concurrently, sqlstate
 from dendrux.db._schema_check import read_schema_phase, schema_problems
 from dendrux.db._settings import put_setting
 from dendrux.db._storage_schema import ACTIVATION_INDEXES, index_ddl
-from dendrux.db.models import Base
+from dendrux.db.models import Base, DendruxSetting
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -27,7 +28,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 _REVISION = "f9a0b1c2d3e4"
-_MIGRATION_LOCK = 0x44454E44525558
 _FIELDS = {
     "react_traces": ("role", "content", "order_index", "trace_kind", "meta"),
     # The released schema stores result_payload in the JSON `result` column.
@@ -74,7 +74,9 @@ async def activate_database(
     Owns a dedicated direct connection. SQLite retains its exclusive file lock
     across committed cursor batches using locking_mode=EXCLUSIVE; other processes
     must be stopped by the operator. PostgreSQL uses the migration runner's
-    session advisory lock across batches and concurrent index builds.
+    session advisory lock across batches and concurrent index builds. MySQL/MariaDB
+    hold the maintenance ``GET_LOCK`` (their schemas are bootstrapped active, so
+    there is nothing to activate); on any error that connection is invalidated.
     """
     if isinstance(batch_size, bool) or not 1 <= batch_size <= 5000:
         raise ValueError("batch_size must be between 1 and 5000")
@@ -84,48 +86,23 @@ async def activate_database(
 
 @contextmanager
 def _maintenance_connection(conn: Connection) -> Iterator[None]:
-    pg = conn.dialect.name == "postgresql"
-    if pg:
-        conn.execution_options(isolation_level="AUTOCOMMIT")
-        acquired = bool(
-            conn.execute(text(f"SELECT pg_try_advisory_lock({_MIGRATION_LOCK})")).scalar_one()
-        )
-        conn.commit()
-        if not acquired:
-            raise RuntimeError(
-                "Another Dendrux database migration or activation is running; retry."
-            )
-        conn.execution_options(isolation_level="READ COMMITTED")
-        try:
-            yield
-        finally:
-            conn.rollback()
-            conn.execution_options(isolation_level="AUTOCOMMIT")
-            conn.execute(text(f"SELECT pg_advisory_unlock({_MIGRATION_LOCK})"))
-            conn.commit()
-    elif conn.dialect.name == "sqlite":
-        timeout = conn.exec_driver_sql("PRAGMA busy_timeout").scalar_one()
-        conn.exec_driver_sql("PRAGMA busy_timeout=0")
-        conn.exec_driver_sql("PRAGMA locking_mode=EXCLUSIVE")
-        try:
-            try:
-                conn.exec_driver_sql("BEGIN EXCLUSIVE")
-            except OperationalError:
-                raise RuntimeError(
-                    "Cannot activate SQLite while another connection holds a live transaction. "
-                    "Stop other processes, finish the transaction and retry."
-                ) from None
-            yield
-        finally:
-            conn.rollback()
-            conn.exec_driver_sql("PRAGMA locking_mode=NORMAL")
-            # A transaction releases the retained exclusive lock when switching back.
-            conn.exec_driver_sql("BEGIN")
-            conn.exec_driver_sql("COMMIT")
-            conn.exec_driver_sql(f"PRAGMA busy_timeout={int(timeout)}")
-            conn.commit()
+    found = require_family(conn.dialect, "Activation")
+    if found == "postgresql":
+        lock = postgres.maintenance_lock(conn)
+    elif found == "sqlite":
+        lock = sqlite.maintenance_lock(conn)
     else:
-        raise RuntimeError("Activation supports PostgreSQL and SQLite only.")
+        lock = mysql.maintenance_lock(conn)
+    with lock:
+        yield
+
+
+def _mysql_active(conn: Connection) -> bool:
+    """An absent settings table is left to the currency check (it reports what is missing)."""
+    if not inspect(conn).has_table("dendrux_settings"):
+        return True
+    values = mysql.read_settings(conn)
+    return values.get("storage_format") == "2" and values.get("activate_step") == "done"
 
 
 def _require_current(conn: Connection) -> None:
@@ -228,8 +205,7 @@ def _dedupe(conn: Connection, batch_size: int) -> None:
     for table_name, column, _ in ACTIVATION_INDEXES.values():
         table = Base.metadata.tables[table_name]
         after = conn.execute(
-            text("SELECT value FROM dendrux_settings WHERE key=:key"),
-            {"key": f"dedupe_cursor_{table_name}"},
+            select(DendruxSetting.value).where(DendruxSetting.key == f"dedupe_cursor_{table_name}")
         ).scalar_one_or_none()
         if after == "":
             continue
@@ -256,6 +232,11 @@ def _dedupe(conn: Connection, batch_size: int) -> None:
 
 def _activate(conn: Connection, batch_size: int, dedupe_only: bool) -> None:
     with _maintenance_connection(conn):
+        if is_mysql_family(conn.dialect) and not _mysql_active(conn):
+            raise RuntimeError(
+                "MySQL/MariaDB schemas are created active by `dendrux db migrate`; activation "
+                "does not apply to this one. Run `dendrux db check` and repair its settings."
+            )
         _require_current(conn)
         if read_schema_phase(conn) == "active":
             conn.commit()
@@ -265,7 +246,7 @@ def _activate(conn: Connection, batch_size: int, dedupe_only: bool) -> None:
         _preflight(conn, batch_size)
         conn.commit()
         step = conn.execute(
-            text("SELECT value FROM dendrux_settings WHERE key='activate_step'")
+            select(DendruxSetting.value).where(DendruxSetting.key == "activate_step")
         ).scalar_one()
         conn.commit()
         if dedupe_only or step.startswith("dedupe:"):
@@ -297,8 +278,7 @@ def _activate(conn: Connection, batch_size: int, dedupe_only: bool) -> None:
                 if pg:
                     conn.execution_options(isolation_level="READ COMMITTED")
                 conn.execute(
-                    text("DELETE FROM dendrux_settings WHERE key=:key"),
-                    {"key": f"dedupe_cursor_{table}"},
+                    delete(DendruxSetting).where(DendruxSetting.key == f"dedupe_cursor_{table}")
                 )
                 put_setting(conn, "activate_step", f"dedupe:{table}")
                 conn.commit()

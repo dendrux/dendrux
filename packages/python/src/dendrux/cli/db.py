@@ -58,6 +58,8 @@ def _database_url() -> str:
 def migrate() -> None:
     """Run database migrations (alembic upgrade head).
 
+    On MySQL/MariaDB an empty database is bootstrapped straight to the current schema
+    (an interrupted bootstrap resumes); a database holding anything else is refused.
     Set DENDRUX_DATABASE_URL to override the default SQLite path.
     """
     try:
@@ -80,19 +82,29 @@ def migrate() -> None:
 
 @app.command()
 def status() -> None:
-    """Show the Alembic revision, storage format and resumable activation step."""
+    """Show the Alembic revision, storage format and resumable activation step.
+
+    On MySQL/MariaDB an unfinished bootstrap is shown as ``bootstrap_in_progress=<rev>``.
+    """
     try:
-        revision, storage_format, step = asyncio.run(_read_activation_status(_database_url()))
+        revision, storage_format, step, bootstrap = asyncio.run(
+            _read_activation_status(_database_url())
+        )
     except Exception:
         console.print("[red]Could not read database status.[/red] Run `dendrux db check`.")
         raise typer.Exit(2) from None
-    console.print(f"revision={revision} storage_format={storage_format} activate_step={step}")
+    line = f"revision={revision} storage_format={storage_format} activate_step={step}"
+    if bootstrap is not None:
+        line += f" bootstrap_in_progress={bootstrap}"
+    console.print(line, markup=False)
 
 
-async def _read_activation_status(url: str) -> tuple[str, str, str]:
-    from sqlalchemy import inspect, text
+async def _read_activation_status(url: str) -> tuple[str, str, str, str | None]:
+    from sqlalchemy import inspect, select, text
     from sqlalchemy.ext.asyncio import create_async_engine
     from sqlalchemy.pool import NullPool
+
+    from dendrux.db.models import DendruxSetting
 
     engine = create_async_engine(url, poolclass=NullPool)
     try:
@@ -104,13 +116,13 @@ async def _read_activation_status(url: str) -> tuple[str, str, str]:
                 ).scalar_one_or_none()
             revision = revision or "unstamped"
             if not await conn.run_sync(lambda c: inspect(c).has_table("dendrux_settings")):
-                return revision, "1", "not-started"
+                return revision, "1", "not-started", None
+            keys = ("storage_format", "activate_step", "bootstrap_in_progress")
             settings = dict(
                 (
                     await conn.execute(
-                        text(
-                            "SELECT key, value FROM dendrux_settings "
-                            "WHERE key IN ('storage_format', 'activate_step')"
+                        select(DendruxSetting.key, DendruxSetting.value).where(
+                            DendruxSetting.key.in_(keys)
                         )
                     )
                 )
@@ -121,6 +133,7 @@ async def _read_activation_status(url: str) -> tuple[str, str, str]:
                 revision,
                 settings.get("storage_format", "1"),
                 settings.get("activate_step", "not-started"),
+                settings.get("bootstrap_in_progress"),
             )
     finally:
         await engine.dispose()

@@ -16,6 +16,12 @@ if TYPE_CHECKING:
     from sqlalchemy.engine import Dialect
 
 Family = Literal["postgresql", "sqlite", "mysql"]
+
+
+class LockWaitTimeout(Exception):  # noqa: N818 (a signal, not an error to report)
+    """A bounded DDL step gave up waiting for a lock (dialect-neutral signal)."""
+
+
 MYSQL_FAMILY = frozenset({"mysql", "mariadb"})
 
 
