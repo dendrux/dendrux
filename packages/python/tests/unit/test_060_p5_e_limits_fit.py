@@ -25,14 +25,24 @@ def test_default_limits_fit_the_smallest_shipped_server_default() -> None:
     assert required_statement_bytes(Limits()) < 16 * MIB
 
 
-def test_text_limits_reserve_json_and_sql_escaping_and_metadata_is_doubled() -> None:
+def test_every_limits_bounded_payload_reserves_json_and_sql_escaping() -> None:
     base = required_statement_bytes(Limits())
     assert required_statement_bytes(Limits(max_input_bytes=2 * MIB)) - base == 12 * MIB
     assert required_statement_bytes(Limits(max_tool_result_bytes=3 * MIB)) - base == 24 * MIB
-    assert required_statement_bytes(Limits(max_metadata_bytes=128 * 1024)) - base == 128 * 1024
-    # Only the largest payload shares a statement with the scaffolding.
+    # Metadata gets the same worst case: ASCII escaping of a Unicode value needs 3.5x, and
+    # a control character 6x.
+    assert required_statement_bytes(Limits(max_metadata_bytes=128 * 1024)) - base == 12 * 64 * 1024
+    # Only the largest text payload shares a statement with the scaffolding.
     both = required_statement_bytes(Limits(max_input_bytes=2 * MIB, max_tool_result_bytes=2 * MIB))
     assert both == required_statement_bytes(Limits(max_input_bytes=2 * MIB))
+
+
+def test_a_five_mib_unicode_metadata_limit_is_not_accepted_by_a_16_mib_server() -> None:
+    # Reviewer scenario: with 1-byte text limits an allowed value needs 17,500,015 bytes
+    # on the wire; the earlier 2x estimate (10,551,308) accepted a 16 MiB server.
+    limits = Limits(max_input_bytes=1, max_tool_result_bytes=1, max_metadata_bytes=5 * MIB)
+    assert required_statement_bytes(limits) >= 17_500_015
+    assert required_statement_bytes(limits) > 16 * MIB
 
 
 class _Reporting:

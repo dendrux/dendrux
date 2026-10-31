@@ -208,7 +208,7 @@ Missing or invalid codes remain unset. Category and HTTP status remain independe
 | `shared_engine_loop_closed` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | A pooled engine belongs to a closed event loop. | Use an engine owned by the current loop. |
 | `store_capability` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | A declared store capability has an incompatible method. | Implement the frozen store contract. |
 | `store_outcome_unknown` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | A commit acknowledgement is lost and the operation outcome cannot be proven. | Inspect persisted state before attempting the operation again. |
-| `store_statement_limit` | WARNING | `bytes`, `code`, `kind`, `limit`, `run_id`, `tenant_id` | Configured payload limits can produce a statement larger than the database accepts. | Lower the Agent's Limits or raise the server's max_allowed_packet. |
+| `store_statement_limit` | WARNING | `bytes`, `code`, `kind`, `limit`, `run_id`, `tenant_id` | A configured limit or a statement is larger than the database accepts. | Lower the Agent's Limits, shrink the payload or raise the server's max_allowed_packet. |
 | `write_conflict` | WARNING | `code`, `count`, `kind`, `run_id`, `table`, `tenant_id` | A retried identity has conflicting content. | Inspect writer consistency; do not retry blindly. |
 
 ## Tool

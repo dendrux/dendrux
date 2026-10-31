@@ -308,6 +308,27 @@ class StoreOutcomeUnknown(PersistenceError):  # noqa: N818 - public compatibilit
         super().__init__(code=self.code)
 
 
+class StatementTooLargeError(PersistenceError):
+    """A database statement is larger than the server accepts, so nothing was sent.
+
+    Raised by the MySQL and MariaDB store before the statement leaves the process (the server
+    would otherwise close the connection). ``size`` is the measured statement in bytes and
+    ``limit`` the server's ``max_allowed_packet``. Values are never part of the message.
+    """
+
+    code = "statement_too_large"
+
+    def __init__(self, size: int, limit: int) -> None:
+        super().__init__(code=self.code)
+        self.size = size
+        self.limit = limit
+        self.safe_message = (
+            f"Database statement of {size} bytes exceeds the server's max_allowed_packet "
+            f"of {limit} bytes (statement_too_large)."
+        )
+        self.args = (self.safe_message,)
+
+
 class PersistenceNotConfiguredError(RuntimeError):
     """Raised when an Agent method requires persistence but none is configured.
 
@@ -1178,6 +1199,7 @@ class RunFencedError(_KwargsReduceMixin, RuntimeError):
 
 __all__ = [
     "StoreOutcomeUnknown",
+    "StatementTooLargeError",
     "NotifierUnavailableError",
     "StoreCapabilityError",
     "RunCancelledError",

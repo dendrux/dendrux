@@ -69,7 +69,7 @@ The flags are independent. Set each one from what your database really does, and
 | `child_page_query` | One page of child runs for cancel cascades (the base has a portable version) |
 | `classify_db_error` | Turn a driver error into a kind (`unique_violation`, `deadlock_or_serialization`, `lock_timeout`, `connection_lost`, `other`), the violated constraint name when the driver gives it, and a stable code. Never keep driver text |
 | `connection_checks` | One-time checks on first use (server version, isolation level, packet limits) |
-| `statement_capacity` (optional) | `async def statement_capacity(self)`: returns the most bytes one SQL statement may carry, or `None` for no limit. Before an Agent first uses the store it compares the largest statement its `Limits` can produce with this number and refuses, naming both values. Define it on the class; a store without it is not checked. `MySQLStateStore` reports `max_allowed_packet` |
+| `statement_capacity` (optional) | `async def statement_capacity(self)`: returns the most bytes one SQL statement may carry, or `None` for no limit. Before an Agent first uses the store it compares the largest statement its `Limits` can produce with this number and refuses, naming both values. It is an early warning for the Agent's `Limits`, not a guarantee; define it on the class. A store without it is not checked. `MySQLStateStore` reports `max_allowed_packet` |
 
 Two rules hold for every method:
 
@@ -197,7 +197,7 @@ pip install "dendrux[testkit]"
 pytest -p dendrux.testing.store_kit
 ```
 
-`-p dendrux.testing.store_kit` loads the plugin **and** collects the contracts; you do not copy any test files. Two other ways to switch it on: `--dendrux-store-kit` on the command line, or `dendrux_store_kit = true` under `[tool.pytest.ini_options]`. Merely having the plugin installed or listed in `pytest_plugins` collects nothing.
+`-p dendrux.testing.store_kit` loads the plugin **and** collects the contracts; you do not copy any test files. Installing `dendrux` registers the kit with pytest, but it imports nothing and loads nothing until you switch it on, so other pytest sessions in the same environment are unaffected. Switching it on needs `pytest-asyncio` (`pip install "dendrux[testkit]"`); without it pytest stops with a message naming the extra. Two other ways to switch it on: `--dendrux-store-kit` on the command line, or `dendrux_store_kit = true` under `[tool.pytest.ini_options]`. Merely having the plugin installed or listed in `pytest_plugins` collects nothing.
 
 If you use `pytest-asyncio` in strict mode, add `asyncio_default_fixture_loop_scope = "function"` to your pytest settings. The kit marks its own async tests, so `asyncio_mode` can stay as it is.
 

@@ -858,8 +858,8 @@ STORE_STATEMENT_LIMIT = Code(
     logging.WARNING,
     "store",
     _BASE_FIELDS | frozenset(["bytes", "limit"]),
-    "Configured payload limits can produce a statement larger than the database accepts.",
-    "Lower the Agent's Limits or raise the server's max_allowed_packet.",
+    "A configured limit or a statement is larger than the database accepts.",
+    "Lower the Agent's Limits, shrink the payload or raise the server's max_allowed_packet.",
 )
 SKILLS_SESSION_UNKNOWN = Code(
     "skills_session_unknown",

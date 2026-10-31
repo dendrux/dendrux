@@ -20,7 +20,7 @@ from dendrux.errors import (
     ProviderAuthError, ProviderRateLimitError, ProviderTimeoutError, ProviderUnavailableError,
     ProviderStreamIncompleteError, ModelRefusalError, ContentFilteredError,
     BudgetConfigurationError, TenantScopeRequiredError, GovernanceMismatchError,
-    NoteLimitExceededError, PersistenceError, StoreOutcomeUnknown, RunControlError,
+    NoteLimitExceededError, PersistenceError, StoreOutcomeUnknown, StatementTooLargeError, RunControlError,
     RunNotReclaimableError, RunCancelledError, StoreCapabilityError, NotifierUnavailableError,
 )
 from dendrux.types import InputValidationError   # also a ValueError
@@ -49,6 +49,7 @@ The most common ones are also re-exported from the top-level `dendrux` package.
 | `InputValidationError(field, code)` | `ValueError` | A client value cannot be accepted or stored: `field` names a fixed API field (never an input key or value) and `code` is `invalid_identifier`, `invalid_text` (NUL or a lone surrogate), `invalid_json`, `nonfinite_json`, `structure_limit` or `pause_id_required` (a pause with a stored id continued without `expected_pause_id` when approving or under strict tenancy). Raised before anything is written or claimed. Import it from `dendrux.types`. | 400 |
 | `PersistenceError()` | `RuntimeError` | A database operation failed. SQL, bound parameters and driver text are omitted (`safe_message`, `retryable`). Inside a run it ends the run `error` with `error_info.category == "persistence_error"`. | 500 or 503 |
 | `StoreOutcomeUnknown()` | `PersistenceError` | A connection failed during `COMMIT` and the store cannot prove whether the write happened. `code` is `store_outcome_unknown`. Claims and reclaims always raise it after an ambiguous commit: do not run the claimed work, do not retry the claim, and do not read a later epoch as proof of ownership. The lease and `reclaim` recover the run. Writes that carry a retry identity are read back and report their true outcome instead. | 503 |
+| `StatementTooLargeError(size, limit)` | `PersistenceError` | The MySQL or MariaDB store measured a statement larger than the server's `max_allowed_packet` and refused to send it (the server would close the connection). `code` is `statement_too_large`; `size` and `limit` are bytes; no value is in the message. Not retryable: shrink the payload or raise the server limit. See [MySQL and MariaDB](/docs/guides/mysql#payload-limits-and-max_allowed_packet). | 413 or 500 |
 | `FollowCapacityError(limit, per_tenant=False)` | `RuntimeError` | `RunStore.follow` has no free follower slot: the store cap, or (`per_tenant=True`) the cap for that tenant scope. Safe to retry shortly. See [Build your own read routes](/docs/recipes/build-your-own-read-routes). | 503 |
 | `PersistenceNotConfiguredError()` | `RuntimeError` | A method needs persistence but no `database_url` / `state_store` is configured (the Agent ignores `DENDRUX_DATABASE_URL`; without a store its presence logs `database_url_env_ignored` once per process). | 500 |
 | `SchemaNotInitializedError()` | `RuntimeError` | The database has no Dendrux tables yet (non-SQLite needs `dendrux db migrate`). | 500 |

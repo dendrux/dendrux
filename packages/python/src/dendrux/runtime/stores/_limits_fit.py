@@ -12,9 +12,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# A text limit counts raw UTF-8 bytes. Stored as JSON, one control byte can become six
-# (backslash, "u", four hex digits); text-protocol SQL escaping can then double every
-# backslash and quote. A metadata limit already counts encoded JSON, so it only doubles.
+# A limit counts raw UTF-8 bytes. Stored as JSON, one control byte can become six (backslash, "u",
+# four hex digits) and a non-ASCII character can too; text-protocol SQL escaping can then double
+# every backslash and quote. So every Limits-bounded payload is reserved at 6 x 2 = 12 times.
 _JSON_EXPANSION = 6
 _SQL_ESCAPING = 2
 # Column lists, identifiers and the small binds that ride in the same statement.
@@ -22,13 +22,13 @@ _STATEMENT_SCAFFOLDING = 64 * 1024
 
 
 def required_statement_bytes(limits: Limits) -> int:
-    """The largest single SQL statement these limits can produce, with escaping headroom."""
-    text = max(limits.max_input_bytes, limits.max_tool_result_bytes)
-    return (
-        _STATEMENT_SCAFFOLDING
-        + text * _JSON_EXPANSION * _SQL_ESCAPING
-        + limits.max_metadata_bytes * _SQL_ESCAPING
-    )
+    """A worst-case estimate of the largest statement the Limits-bounded payloads can produce.
+
+    An early warning only. It cannot see payloads that Limits does not bound (model prompts and
+    responses, rewritten history); the MySQL store's statement preflight is the guarantee.
+    """
+    payload = max(limits.max_input_bytes, limits.max_tool_result_bytes) + limits.max_metadata_bytes
+    return _STATEMENT_SCAFFOLDING + payload * _JSON_EXPANSION * _SQL_ESCAPING
 
 
 async def ensure_limits_fit(store: object, limits: Limits) -> None:
