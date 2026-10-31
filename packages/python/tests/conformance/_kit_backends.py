@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 from sqlalchemy import event, text
-from sqlalchemy.engine import make_url
+from sqlalchemy.engine import URL, make_url
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
@@ -72,7 +72,7 @@ class KitBackend:
         self._tmp = tmp_path
         self._engines: list[AsyncEngine] = []
         self._url: str | None = None
-        self._private_db: tuple[str, str] | None = None
+        self._private_db: tuple[URL, str] | None = None
         self._count = 0
 
     # -- the database ----------------------------------------------------------------------
@@ -112,7 +112,7 @@ class KitBackend:
                 await conn.execute(text(f"CREATE DATABASE `{name}`"))
         finally:
             await admin.dispose()
-        self._private_db = (str(server), name)
+        self._private_db = (server, name)
         url = base.set(database=name)
         self._url = url.render_as_string(hide_password=False)
         engine = create_async_engine(
