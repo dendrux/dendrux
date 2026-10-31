@@ -91,7 +91,26 @@ from dendrux.runtime.state import (
     _to_aware_utc,
     _Unscoped,
 )
+from dendrux.runtime.stores._errors import DbError, DbErrorKind
 from dendrux.runtime.stores._factory import store_for_engine
+from dendrux.runtime.stores.sql._types import (
+    AppendArray,
+    ConflictSpec,
+    DialectFacts,
+    InsertPlan,
+    JsonPatch,
+    JsonPath,
+    JsonReadType,
+    JsonValue,
+    OrderedAssignments,
+    PatchLoopState,
+    RunLockScope,
+    RunParentCursor,
+    ScalarKey,
+    SelectSource,
+    SetFields,
+    ValuesSource,
+)
 from dendrux.runtime.stores.sql.base import SQLStateStore
 from dendrux.runtime.stores.sql.mysql import MySQLStateStore
 from dendrux.runtime.stores.sql.postgres import PostgresStateStore
@@ -1519,6 +1538,25 @@ __all__ = [
     "SQLiteStateStore",
     "MySQLStateStore",
     "store_for_engine",
+    # The types the SQLStateStore dialect hooks take and return (see "Build your own store").
+    "AppendArray",
+    "ConflictSpec",
+    "DbError",
+    "DbErrorKind",
+    "DialectFacts",
+    "InsertPlan",
+    "JsonPatch",
+    "JsonPath",
+    "JsonReadType",
+    "JsonValue",
+    "OrderedAssignments",
+    "PatchLoopState",
+    "RunLockScope",
+    "RunParentCursor",
+    "ScalarKey",
+    "SelectSource",
+    "SetFields",
+    "ValuesSource",
     "EventFeed",
     "EventNotifier",
     "Follow",
