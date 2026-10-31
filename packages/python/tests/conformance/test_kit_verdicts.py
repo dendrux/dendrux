@@ -122,7 +122,18 @@ def test_the_reviewers_broken_store_is_not_certified_at_format_1(pytester: Pytes
 
 NO_FORMS = """
 class Injector(SqlFaultInjector):
+    # what the kit is told (disconnect_forms) differs from what arm() can do
+
+    def arm(self, store, point, **kw):
+        self._arming = True
+        try:
+            super().arm(store, point, **kw)
+        finally:
+            self._arming = False
+
     def disconnect_forms(self, store):
+        if getattr(self, "_arming", False):
+            return SqlFaultInjector.disconnect_forms(self, store)
         return ()
 """
 NO_RELEASE = mutant("""
@@ -132,27 +143,83 @@ NO_RELEASE = mutant("""
 """)
 
 
+def _verdict_line(text: str) -> str:
+    return next(line for line in text.splitlines() if "NOT CERTIFIED:" in line)
+
+
 def test_an_injector_with_no_disconnect_forms_leaves_the_claims_uncertified(
     pytester: Pytester,
 ) -> None:
-    result = run_kit(pytester, injector=NO_FORMS, k="ambiguous_claim_commit")
+    """A complete run: the store-caused skip alone, not an incomplete run, vetoes the verdict."""
+    result = run_kit(pytester, injector=NO_FORMS)
     text = result.stdout.str()
     assert failed_functions(result) == set(), text[-2000:]
-    assert "skipped by the store" in text and "disconnect_forms" in text, text[-2000:]
-    assert re.search(r"checkpointing: \d+ contract", text) and "NOT CERTIFIED" in text
+    verdict = _verdict_line(text)
+    assert "skipped by the store" in verdict and "disconnect_forms" in verdict, verdict
+    assert "incomplete run" not in verdict, verdict
+    assert re.search(r"checkpointing: \d+ contract", text)
     assert result.ret != 0
 
 
 def test_a_store_without_release_run_claim_leaves_recovery_uncertified(
     pytester: Pytester,
 ) -> None:
-    result = run_kit(
-        pytester, mutation=NO_RELEASE, injector=NATIVE_FORMS, k="ambiguous_claim_commit"
-    )
+    result = run_kit(pytester, mutation=NO_RELEASE, injector=NATIVE_FORMS)
     text = result.stdout.str()
     assert failed_functions(result) == set(), text[-2000:]
-    assert "skipped by the store" in text and "release_run_claim" in text, text[-2000:]
-    assert re.search(r"recovery: \d+ contract", text) and "NOT CERTIFIED" in text
+    verdict = _verdict_line(text)
+    assert "skipped by the store" in verdict and "release_run_claim" in verdict, verdict
+    assert "incomplete run" not in verdict, verdict
+    assert re.search(r"recovery: \d+ contract", text)
+    assert result.ret != 0
+
+
+MISSPELLED_FORMS = """
+class Injector(SqlFaultInjector):
+    # what the kit is told (disconnect_forms) differs from what arm() can do
+
+    def arm(self, store, point, **kw):
+        self._arming = True
+        try:
+            super().arm(store, point, **kw)
+        finally:
+            self._arming = False
+
+    def disconnect_forms(self, store):
+        if getattr(self, "_arming", False):
+            return SqlFaultInjector.disconnect_forms(self, store)
+        return ("misspelled-native",)
+"""
+SWALLOWS_CLAIMS = mutant("""
+    async def claim_paused_run(self, run_id, **kw):
+        from dendrux.errors import PersistenceError
+        try:
+            return await super().claim_paused_run(run_id, **kw)
+        except PersistenceError:
+            record = await self.get_run(run_id)
+            if record is not None and record.status == "running":
+                return ClaimResult(record.claim_epoch, 2, None, None)
+            raise
+""")
+
+
+def test_an_unknown_disconnect_form_fails_the_claim_contracts_naming_it(
+    pytester: Pytester,
+) -> None:
+    """A misspelled form must not turn every claim fault into a skip that certifies."""
+    result = run_kit(pytester, mutation=SWALLOWS_CLAIMS, injector=MISSPELLED_FORMS)
+    text = result.stdout.str()
+    assert "test_an_ambiguous_claim_commit_raises_outcome_unknown" in failed_functions(result)
+    assert "misspelled-native" in text, text[-2500:]
+    assert "NOT CERTIFIED" in text and "CERTIFIED with caveats" not in text
+    assert result.ret != 0
+
+
+def test_an_unknown_disconnect_form_is_named_even_when_the_store_is_sound(
+    pytester: Pytester,
+) -> None:
+    result = run_kit(pytester, injector=MISSPELLED_FORMS, k="ambiguous_claim_commit")
+    assert "misspelled-native" in result.stdout.str()
     assert result.ret != 0
 
 
@@ -319,3 +386,32 @@ def test_under_xdist_a_missing_factory_still_ends_the_session_with_an_error(
     assert result.ret != 0
     assert result.parseoutcomes().get("failed", 0) <= 2  # at most one per worker
     assert "INTERNALERROR" not in result.stdout.str() + result.stderr.str()
+
+
+# -- a factory that skips ---------------------------------------------------------------------
+
+SKIPPING_FACTORY = """
+import pytest
+
+@pytest.fixture
+def dendrux_store_factory():
+    pytest.skip("no database here")
+"""
+
+
+def test_a_factory_that_skips_is_an_incomplete_run_that_exits_non_zero(
+    pytester: Pytester,
+) -> None:
+    pytester.makeconftest(SKIPPING_FACTORY)
+    result = pytester.runpytest(*INNER_ARGS)
+    text = result.stdout.str()
+    assert "passed" not in result.parseoutcomes() and result.parseoutcomes().get("skipped")
+    assert "NOT CERTIFIED" in text and "no store evaluated" in text, text[-1500:]
+    assert result.ret != 0
+
+
+def test_collect_only_still_exits_zero_and_prints_no_verdict(pytester: Pytester) -> None:
+    pytester.makeconftest(SKIPPING_FACTORY)
+    result = pytester.runpytest(*INNER_ARGS, "--collect-only")
+    assert "NOT CERTIFIED" not in result.stdout.str()
+    assert result.ret == 0

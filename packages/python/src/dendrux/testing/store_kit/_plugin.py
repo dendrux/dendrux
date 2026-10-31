@@ -274,9 +274,17 @@ class _Reporter:
         if (
             activated(session.config)
             and session.exitstatus == pytest.ExitCode.OK
-            and any(not v.certified for v in _verdicts(self.report).values())
+            and (self._no_store_evaluated(session.config) or self._not_certified())
         ):
             session.exitstatus = pytest.ExitCode.TESTS_FAILED
+
+    def _not_certified(self) -> bool:
+        return any(not v.certified for v in _verdicts(self.report).values())
+
+    def _no_store_evaluated(self, config: pytest.Config) -> bool:
+        """Contracts were collected and run, yet none got far enough to evaluate a store."""
+        collecting_only = bool(config.getoption("collectonly", default=False))
+        return not collecting_only and bool(self.report.expected) and not self.report.stores
 
     @pytest.hookimpl(optionalhook=True)
     def pytest_testnodedown(self, node: Any, error: Any) -> None:
@@ -321,6 +329,16 @@ class _Reporter:
             entry.notes.append("unverified: " + reason.split("unverified:", 1)[1].strip(" ')\""))
 
     def pytest_terminal_summary(self, terminalreporter: Any) -> None:
+        config = terminalreporter.config
+        if activated(config) and self._no_store_evaluated(config):
+            terminalreporter.section("dendrux store kit: certification summary")
+            terminalreporter.write_line(
+                "  NOT CERTIFIED: incomplete run, no store evaluated: the "
+                f"{FACTORY} fixture never produced a store (did it skip?)",
+                bold=True,
+                red=True,
+            )
+            return
         _write_summary(terminalreporter, self.report)
 
 

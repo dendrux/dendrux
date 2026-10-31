@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 from dendrux.errors import StoreOutcomeUnknown
-from dendrux.testing.store_kit._kit import store_skip
+from dendrux.testing.store_kit._kit import CertificationFailure, store_skip
 from dendrux.testing.store_kit.contracts._marks import contract
 from dendrux.testing.store_kit.contracts._support import (
     EVENT,
@@ -164,11 +164,13 @@ async def test_finalize_that_fails_around_commit_leaves_one_final_state(
     ), "the second finalize loses"
 
 
+#: The lost-connection forms an injector may offer (see ``FaultInjector``).
+DISCONNECT_FORMS = ("invalidated", "native", "native_alt")
 CLAIM_OPERATIONS = ["claim_paused_run", "submit_and_claim", "reclaim_run", "release_run_claim"]
 
 
 @crash
-@pytest.mark.parametrize("form", ["invalidated", "native", "native_alt"])
+@pytest.mark.parametrize("form", list(DISCONNECT_FORMS))
 @pytest.mark.parametrize("point", ["before_commit", "after_commit"])
 @pytest.mark.parametrize("operation", CLAIM_OPERATIONS)
 async def test_an_ambiguous_claim_commit_raises_outcome_unknown(
@@ -188,7 +190,14 @@ async def test_an_ambiguous_claim_commit_raises_outcome_unknown(
             "checkpointing",
             "recovery",
         )
+    unknown = sorted(set(forms) - set(DISCONNECT_FORMS))
+    if unknown:
+        raise CertificationFailure(
+            f"the fault injector offers unknown disconnect form(s) {', '.join(unknown)}; "
+            f"valid forms are {', '.join(DISCONNECT_FORMS)}"
+        )
     if form not in forms:
+        # Not a gap: every offered form is valid and at least one variant of this operation runs.
         pytest.skip(f"the {form} disconnect form does not exist for this dialect")
     committed = point == "after_commit"
     if operation == "reclaim_run":
