@@ -1,4 +1,4 @@
-.PHONY: test test-model-check test-model-install test-dbs-up test-dbs-down test-mysql bench load load-quick lint typecheck arch crap api-check format package-smoke ci clean
+.PHONY: test test-model-check test-model-install test-dbs-up test-dbs-down test-mysql bench load load-quick load-pg load-mysql load-mariadb lint typecheck arch crap api-check format package-smoke ci clean
 
 # Benchmarks measure the server, not the code, so they are not part of the gates.
 test: test-model-check
@@ -57,6 +57,27 @@ load:
 
 load-quick:
 	python tools/load.py --scale quick --workers 2 --baseline tools/load_baseline.json --json $(LOAD_JSON)
+
+# The 1,000-run scenario on each database family, with resource monitoring and four workload cycles.
+# load-pg needs DENDRUX_LOAD_PG_URL (a private Postgres database ending in _test). load-mysql and
+# load-mariadb use their own private databases on the test servers (make test-dbs-up first); the
+# harness refuses a MySQL-family name that lacks "_load_" or does not end in "_test". MySQL-family
+# runs have no stored baseline: declare the statement ceilings in a JSON file first and pass it as
+# LOAD_STATEMENT_BUDGETS=path (see docs/guides/scaling.mdx, "Load testing your own deployment").
+LOAD_MYSQL_URL ?= mysql+asyncmy://root:dendrux_test@127.0.0.1:53306/dendrux_load_mysql_test
+LOAD_MARIADB_URL ?= mysql+asyncmy://root:dendrux_test@127.0.0.1:53307/dendrux_load_mariadb_test
+LOAD_RUNS = --scale full --scenarios runs --workers 2 --leak-cycles 4
+
+load-pg:
+	python tools/load.py $(LOAD_RUNS) --json $(LOAD_JSON)
+
+load-mysql:
+	@test -n "$(LOAD_STATEMENT_BUDGETS)" || { echo "LOAD_STATEMENT_BUDGETS is required: a JSON file of declared statement ceilings"; exit 2; }
+	python tools/load.py --url $(LOAD_MYSQL_URL) $(LOAD_RUNS) --statement-budgets $(LOAD_STATEMENT_BUDGETS) --json $(LOAD_JSON)
+
+load-mariadb:
+	@test -n "$(LOAD_STATEMENT_BUDGETS)" || { echo "LOAD_STATEMENT_BUDGETS is required: a JSON file of declared statement ceilings"; exit 2; }
+	python tools/load.py --url $(LOAD_MARIADB_URL) $(LOAD_RUNS) --statement-budgets $(LOAD_STATEMENT_BUDGETS) --json $(LOAD_JSON)
 
 # Public API breaks against the last release tag (needs `git fetch --tags`).
 # Fails on any break without a migration-note B-item.

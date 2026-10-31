@@ -51,7 +51,8 @@ openrouter = ["dendrux[openai]"]
 # are now hard dependencies.
 db = []
 postgres = ["asyncpg>=0.29,<1.0"]
-# MySQL 8.4 / MariaDB 10.11 driver.
+# MySQL 8.4 / MariaDB 10.11 driver. Opt-in: deliberately not part of `all`, because the
+# driver is a compiled extension that only MySQL and MariaDB deployments need.
 mysql = ["asyncmy>=0.2.10"]
 # Dependencies of the store test kit (pytest plugin, dendrux.testing.store_kit).
 testkit = ["pytest>=8.0,<10.0", "pytest-asyncio>=0.23,<2.0"]
@@ -87,6 +88,13 @@ dev = [
 
 [project.scripts]
 dendrux = "dendrux.cli.main:app"
+
+# The store test kit as a pytest plugin. It collects nothing until `-p dendrux.testing.store_kit`,
+# `--dendrux-store-kit` or `dendrux_store_kit = true` switches it on. The entry-point name is the
+# module path on purpose: pluggy refuses one module registered under two names, so any other name
+# would break `pytest -p dendrux.testing.store_kit`.
+[project.entry-points.pytest11]
+"dendrux.testing.store_kit" = "dendrux.testing.store_kit"
 
 [project.urls]
 Homepage = "https://github.com/dendrux/dendrux"
