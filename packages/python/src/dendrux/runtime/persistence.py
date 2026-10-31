@@ -309,6 +309,7 @@ class PersistenceRecorder(BaseRecorder):
         self._result_formatter: Any = None
         self._consumed_user_count = 0
         self._final_trace: Any = None
+        self._resume_pause_data: dict[str, Any] | None = None
 
     async def restore_history(self, *, limits: Any, records: Any = None) -> None:
         if not self._format2:
@@ -536,7 +537,9 @@ class PersistenceRecorder(BaseRecorder):
         descriptor = self._loop_state.get("submission")
         if not self._format2 or descriptor is None:
             return
-        raw = await self._store.get_pause_state(self._run_id) or {}
+        raw = self._resume_pause_data
+        if raw is None:
+            raw = await self._store.get_pause_state(self._run_id) or {}
         from dendrux.runtime.submit import _submission_payload
 
         payload = _submission_payload(raw)
@@ -587,6 +590,7 @@ class PersistenceRecorder(BaseRecorder):
             )
 
         await retry_critical(consume, label="consume_submission", run_id=self._run_id)
+        self._resume_pause_data = None
         self._loop_state = _apply_loop_patch(self._loop_state, patch)
         self._loop_state["submission"] = None
         self._completed_observations.update(removed)

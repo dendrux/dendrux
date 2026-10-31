@@ -23,7 +23,7 @@ import json
 import logging
 from contextlib import asynccontextmanager
 from copy import deepcopy
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, NamedTuple, get_args, overload
 
 from dendrux import _codes
@@ -144,7 +144,7 @@ if TYPE_CHECKING:
     from dendrux.media._catalog import BlobEdge
     from dendrux.media._image import UserContent
     from dendrux.media._runtime import ImageRuntime
-    from dendrux.runtime.state import StateStore
+    from dendrux.runtime.state import RunRecord, StateStore, TraceRecord
     from dendrux.strategies.base import Strategy
     from dendrux.types import (
         ContentPart,
@@ -823,13 +823,17 @@ async def _persist_loop_outcome(
     """
     from dendrux.guardrails._engine import deanonymize_text
     from dendrux.runtime._capabilities import capabilities
+    from dendrux.runtime.state import _capture_finalized_run
     from dendrux.types import RunResult
 
-    recovery = (
-        await _recovery_info(state_store, await state_store.get_run(run_id))
-        if capabilities(state_store).recovery
-        else None
-    )
+    recovery = None
+
+    async def _final_recovery(records: Any) -> Any:
+        if not capabilities(state_store).recovery:
+            return None
+        record = records[-1] if records else await state_store.get_run(run_id)
+        return await _recovery_info(state_store, record)
+
     pii_mapping = result.meta.get("pii_mapping") or {}
     user_answer, unmapped_placeholders = deanonymize_text(result.answer, pii_mapping)
 
@@ -874,21 +878,24 @@ async def _persist_loop_outcome(
     async def _finalize_cancelled(
         allowed: list[str], payload: dict[str, Any], failure_reason: str | None = None
     ) -> RunResult:
-        won = await _transition_with_event(
-            state_store,
-            run_id,
-            status=RunStatus.CANCELLED.value,
-            allowed_current_statuses=allowed,
-            event_type="run.cancelled",
-            event_data=payload,
-            answer=user_answer,
-            iteration_count=result.iteration_count,
-            total_usage=result.usage,
-            pii_mapping=result.meta.get("pii_mapping"),
-            failure_reason=failure_reason,
-        )
+        nonlocal recovery
+        with _capture_finalized_run(unclaimed_store(state_store), run_id) as records:
+            won = await _transition_with_event(
+                state_store,
+                run_id,
+                status=RunStatus.CANCELLED.value,
+                allowed_current_statuses=allowed,
+                event_type="run.cancelled",
+                event_data=payload,
+                answer=user_answer,
+                iteration_count=result.iteration_count,
+                total_usage=result.usage,
+                pii_mapping=result.meta.get("pii_mapping"),
+                failure_reason=failure_reason,
+            )
         if not won:
             return await _persisted(RunStatus.CANCELLED)
+        recovery = await _final_recovery(records)
         cancelled = _wrap(status=RunStatus.CANCELLED, won=True)
         cancelled.meta.pop("pause_state", None)
         await _attach_undelivered_notes(state_store, run_id, cancelled)
@@ -975,7 +982,6 @@ async def _persist_loop_outcome(
     # that finished — its work and side effects happened.
     _run_pii = result.meta.get("pii_mapping")
     failure_kwargs = _terminal_failure_kwargs(state_store, result)
-    from dendrux.runtime._capabilities import capabilities
     from dendrux.runtime.state import EventWrite
 
     stop_reason = result.stop_reason if result.status == RunStatus.SUCCESS else None
@@ -990,43 +996,45 @@ async def _persist_loop_outcome(
         getattr(state_store, "storage_format", 1) == 2
         and capabilities(state_store).atomic_completion
     )
-    if atomic_final:
-        event = EventWrite(
-            generate_ulid(), event_type, result.iteration_count, event_data, None, None
-        )
-        final_trace = getattr(recorder, "finalization_trace", lambda: None)()
-        finalize_won = (
-            await state_store.finalize_with_event(
+    with _capture_finalized_run(unclaimed_store(state_store), run_id) as records:
+        if atomic_final:
+            event = EventWrite(
+                generate_ulid(), event_type, result.iteration_count, event_data, None, None
+            )
+            final_trace = getattr(recorder, "finalization_trace", lambda: None)()
+            finalize_won = (
+                await state_store.finalize_with_event(
+                    run_id,
+                    status=result.status.value,
+                    allowed_current_statuses=["running"],
+                    answer=result.answer,
+                    iteration_count=result.iteration_count,
+                    total_usage=result.usage,
+                    pii_mapping=_run_pii,
+                    error=result.error,
+                    event_type=event_type,
+                    event_data=event_data,
+                    trace=final_trace,
+                    event=event,
+                    **failure_kwargs,
+                )
+                is not None
+            )
+        else:
+            finalize_won = await state_store.finalize_run(
                 run_id,
                 status=result.status.value,
-                allowed_current_statuses=["running"],
                 answer=result.answer,
                 iteration_count=result.iteration_count,
                 total_usage=result.usage,
+                expected_current_status="running",
                 pii_mapping=_run_pii,
                 error=result.error,
-                event_type=event_type,
-                event_data=event_data,
-                trace=final_trace,
-                event=event,
                 **failure_kwargs,
             )
-            is not None
-        )
-    else:
-        finalize_won = await state_store.finalize_run(
-            run_id,
-            status=result.status.value,
-            answer=result.answer,
-            iteration_count=result.iteration_count,
-            total_usage=result.usage,
-            expected_current_status="running",
-            pii_mapping=_run_pii,
-            error=result.error,
-            **failure_kwargs,
-        )
     if not finalize_won:
         return await _persisted(result.status)
+    recovery = await _final_recovery(records)
     if unmapped_placeholders:
         await _emit_event(
             state_store,
@@ -3927,12 +3935,21 @@ class _ResumeContext:
         self.resolved_strategy = resolved_strategy
 
 
+@dataclass
+class _PauseReads:
+    record: RunRecord | None
+    checkpoint: dict[str, Any] | None = None
+    history_records: list[TraceRecord] | None = None
+
+
 async def _load_pause_state(
     store: StateStore,
     run_id: str,
     raw: dict[str, Any],
     agent: Agent,
     provider: LLMProvider,
+    *,
+    reads: _PauseReads | None = None,
 ) -> PauseState:
     from dendrux.errors import PersistenceError, RunNotReclaimableError
     from dendrux.runtime.replay import rebuild_history
@@ -3941,11 +3958,15 @@ async def _load_pause_state(
     pause = PauseState.from_dict(raw)
     if pause.schema_version != 2:
         return pause
-    record = await store.get_run(run_id)
+    record = reads.record if reads is not None else await store.get_run(run_id)
     if record is None or record.storage_format != 2:
         _codes.log_code(logger, _codes.PAUSE_FORMAT_UNSUPPORTED, run_id=run_id)
         raise PersistenceError(code="pause_format_unsupported")
-    checkpoint = await store.get_loop_state(run_id)
+    checkpoint = (
+        getattr(store, "loop_state", None)
+        if getattr(store, "storage_format", None) == 2
+        else await store.get_loop_state(run_id)
+    )
     if not checkpoint:
         _codes.log_code(logger, _codes.PAUSE_FORMAT_UNSUPPORTED, run_id=run_id)
         raise PersistenceError(code="pause_format_unsupported")
@@ -3960,6 +3981,9 @@ async def _load_pause_state(
         raise InputValidationError("history", "history_too_large") from exc
     # Strategy owns the system prompt; seeds retain it for audit/reconstruction.
     pause.history = [m for m in messages.messages if m.role != Role.SYSTEM]
+    if reads is not None:
+        reads.history_records = messages.records
+        reads.checkpoint = checkpoint
     pause.steps = messages.steps
     pause.usage = _usage_from_dict(checkpoint["usage"])
     pause.iteration = checkpoint["iteration"]
@@ -4004,6 +4028,7 @@ async def _prepare_resume(
     tenant_id: str | None = None,
     pii_mapping: dict[str, str] | None = None,
     history_records: Any = None,
+    pause_data: dict[str, Any] | None = None,
 ) -> _ResumeContext:
     """Build everything needed to re-enter the loop after a resume.
 
@@ -4087,6 +4112,7 @@ async def _prepare_resume(
     )
 
     await recorder.restore_history(limits=agent._limits, records=history_records)
+    recorder._resume_pause_data = pause_data
 
     # NOTE: lifecycle hooks (record_run_started/notify_run_started) and
     # injected-history replay are intentionally NOT done here. The caller
@@ -4911,7 +4937,8 @@ async def _claim_resume(
     user_input: Any = None,
     user_parts: tuple[ContentPart, ...] | None = None,
     decisions: list[tuple[str, ApprovalDecision]] | None = None,
-) -> tuple[StateStore, str]:
+    checkpoint: dict[str, Any] | None = None,
+) -> tuple[StateStore, str, dict[str, Any]]:
     allowed = [expected]
     if results is not None and expected != RunStatus.WAITING_APPROVAL.value:
         allowed.append(RunStatus.WAITING_APPROVAL.value)
@@ -4936,6 +4963,7 @@ async def _claim_resume(
     )
     epoch: ClaimResult | int | bool
     for status in allowed:
+        descriptor = None
         _canonicalize_legacy_denials(status, run_id, raw, results)
         if raw.get("schema_version") == 2 and (
             results is not None or user_input is not None or status == "waiting_approval"
@@ -4966,7 +4994,10 @@ async def _claim_resume(
             if status == "waiting_approval" and results is not None:
                 payload["approved"] = False
             descriptor = submission_descriptor(
-                raw, await store.get_loop_state(run_id) or {}, payload, status
+                raw,
+                checkpoint if checkpoint is not None else await store.get_loop_state(run_id) or {},
+                payload,
+                status,
             )
             epoch = await store.submit_and_claim(
                 run_id,
@@ -4989,7 +5020,18 @@ async def _claim_resume(
             except BaseException:
                 await _release_claim(view, run_id, status)
                 raise
-            return view, status
+            if descriptor is not None:
+                raw = {
+                    **raw,
+                    "submission": {
+                        **{
+                            k: descriptor[k]
+                            for k in ("submission_id", "kind", "pause_id", "call_ids")
+                        },
+                        "payload": payload,
+                    },
+                }
+            return view, status, raw
     await _raise_resume_claim_failure(store, run_id, expected)
     raise AssertionError("unreachable")
 
@@ -5049,6 +5091,7 @@ async def _resume_core(
     _reclaim_pause: PauseState | None = None,
     _reclaim_history: Any = None,
     _tenant_explicit: bool | None = None,
+    _raw_pause: dict[str, Any] | None = None,
 ) -> RunResult:
     """Shared resume logic for tool results and clarification input.
 
@@ -5100,9 +5143,15 @@ async def _resume_core(
                 await notify_run_failed(extra_notifier, run_id, exc)
             raise
     with skill_session.bind():
+        run_record = await state_store.get_run(run_id)
+        reads = _PauseReads(run_record)
         # 1. Load pause state
         raw_pause = (
-            None if _reclaim_pause is not None else await state_store.get_pause_state(run_id)
+            None
+            if _reclaim_pause is not None
+            else _raw_pause
+            if _raw_pause is not None
+            else await state_store.get_pause_state(run_id)
         )
         if _reclaim_pause is not None:
             pause_state = _reclaim_pause
@@ -5117,11 +5166,13 @@ async def _resume_core(
                     store=state_store,
                     run_id=run_id,
                 )
-            pause_state = await _load_pause_state(state_store, run_id, raw_pause, agent, provider)
+            pause_state = await _load_pause_state(
+                state_store, run_id, raw_pause, agent, provider, reads=reads
+            )
         from dendrux.runtime._reclaim import needs_resolution
 
         recovering = _reclaim_pause is not None or await needs_resolution(
-            state_store, run_id, pause_state
+            state_store, run_id, pause_state, checkpoint=reads.checkpoint
         )
 
         # 1a. Load pii_mapping for guardrail continuity across pause/resume
@@ -5157,7 +5208,7 @@ async def _resume_core(
         # Claim validation is repeated inside the row-locking transaction.
         if not _skip_claim:
             assert raw_pause is not None
-            state_store, expected_status = await _claim_resume(
+            state_store, expected_status, raw_pause = await _claim_resume(
                 state_store,
                 run_id,
                 raw_pause,
@@ -5168,6 +5219,7 @@ async def _resume_core(
                 user_input=user_input,
                 user_parts=user_parts,
                 decisions=decisions,
+                checkpoint=reads.checkpoint,
             )
 
         # 4-10. Everything that runs after on_run_started fires must live
@@ -5179,7 +5231,6 @@ async def _resume_core(
         agent._task_manager.register_current(run_id)
 
         try:
-            run_record = await state_store.get_run(run_id)
             run_tenant = run_record.tenant_id if run_record else None
             # 4-8. Prepare history and notifier (shared with resume_stream).
             #      Does NOT fire any lifecycle hooks — that's the caller's job.
@@ -5198,7 +5249,10 @@ async def _resume_core(
                 user_parts=user_parts,
                 tenant_id=run_tenant,
                 pii_mapping=_saved_pii_mapping,
-                history_records=_reclaim_history,
+                history_records=(
+                    _reclaim_history if _reclaim_history is not None else reads.history_records
+                ),
+                pause_data=raw_pause,
             )
             image_runtime = _image_runtime(agent, state_store, run_tenant, run_id)
 
@@ -5554,10 +5608,16 @@ def resume_stream(
                 store=store,
                 run_id=run_id,
             )
-            pause_state = await _load_pause_state(store, run_id, raw_pause, agent, provider)
+            run_record = await store.get_run(run_id)
+            reads = _PauseReads(run_record)
+            pause_state = await _load_pause_state(
+                store, run_id, raw_pause, agent, provider, reads=reads
+            )
             from dendrux.runtime._reclaim import needs_resolution
 
-            recovering = await needs_resolution(store, run_id, pause_state)
+            recovering = await needs_resolution(
+                store, run_id, pause_state, checkpoint=reads.checkpoint
+            )
 
             # 2b. Verify agent identity
             if pause_state.agent_name and pause_state.agent_name != agent.name:
@@ -5583,7 +5643,7 @@ def resume_stream(
                 # No-arg = approval-approve, or continue a PAUSED run
                 expected = RunStatus.WAITING_APPROVAL.value
 
-            store, expected = await _claim_resume(
+            store, expected, raw_pause = await _claim_resume(
                 store,
                 run_id,
                 raw_pause,
@@ -5593,6 +5653,7 @@ def resume_stream(
                 results=stream_results,
                 user_input=user_input,
                 user_parts=user_parts,
+                checkpoint=reads.checkpoint,
             )
             _shared["state_store"] = store
             _shared["claimed"] = True
@@ -5601,7 +5662,6 @@ def resume_stream(
             #    Does NOT fire any lifecycle hooks; that's done below inside
             #    the same try block so on_run_failed pairs with any failure
             #    after on_run_started fires.
-            run_record = await store.get_run(run_id)
             run_tenant = run_record.tenant_id if run_record else None
             ctx = await _prepare_resume(
                 run_id,
@@ -5615,6 +5675,8 @@ def resume_stream(
                 extra_notifier=extra_notifier,
                 user_parts=user_parts,
                 tenant_id=run_tenant,
+                history_records=reads.history_records,
+                pause_data=raw_pause,
             )
             image_runtime = _image_runtime(agent, store, run_tenant, run_id)
             _shared["ctx"] = ctx
@@ -6115,6 +6177,7 @@ async def resume_claimed(
             tool_results=tool_results,
             extra_notifier=extra_notifier,
             _skip_claim=True,
+            _raw_pause=raw_pause,
             _tenant_explicit=_tenant_explicit,
         )
 
@@ -6133,6 +6196,7 @@ async def resume_claimed(
             extra_notifier=extra_notifier,
             _skip_claim=True,
             decisions=deserialize_decisions(submitted_decisions),
+            _raw_pause=raw_pause,
             _tenant_explicit=_tenant_explicit,
         )
 
@@ -6147,6 +6211,7 @@ async def resume_claimed(
             extra_notifier=extra_notifier,
             _skip_claim=True,
             user_parts=_stored_parts(raw_pause.get("submitted_user_parts")),
+            _raw_pause=raw_pause,
             _tenant_explicit=_tenant_explicit,
         )
 
@@ -6189,7 +6254,9 @@ async def resume_approval_approved_claim(
     """
     try:
         state_store = await _owned_claim_view(state_store, run_id, claim_epoch)
-        await _validate_owned_pause(state_store, run_id, agent, RunStatus.WAITING_APPROVAL.value)
+        raw_pause = await _validate_owned_pause(
+            state_store, run_id, agent, RunStatus.WAITING_APPROVAL.value
+        )
     except RunFencedError:
         return await _build_cached_result(state_store, run_id)
     return await _resume_core(
@@ -6202,6 +6269,7 @@ async def resume_approval_approved_claim(
         user_input=None,
         extra_notifier=extra_notifier,
         _skip_claim=True,
+        _raw_pause=raw_pause,
         _tenant_explicit=_tenant_explicit,
     )
 
@@ -6229,7 +6297,7 @@ async def resume_paused_claim(
     """
     try:
         state_store = await _owned_claim_view(state_store, run_id, claim_epoch)
-        await _validate_owned_pause(state_store, run_id, agent, RunStatus.PAUSED.value)
+        raw_pause = await _validate_owned_pause(state_store, run_id, agent, RunStatus.PAUSED.value)
     except RunFencedError:
         return await _build_cached_result(state_store, run_id)
     return await _resume_core(
@@ -6240,5 +6308,6 @@ async def resume_paused_claim(
         expected_status=RunStatus.PAUSED.value,
         extra_notifier=extra_notifier,
         _skip_claim=True,
+        _raw_pause=raw_pause,
         _tenant_explicit=_tenant_explicit,
     )

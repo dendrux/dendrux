@@ -377,6 +377,7 @@ class RebuiltHistory:
 
     messages: list[Message]
     steps: list[AgentStep]
+    records: list[TraceRecord]
 
 
 async def rebuild_history(
@@ -387,9 +388,8 @@ async def rebuild_history(
     reasoning_for: str | None = None,
 ) -> RebuiltHistory:
     """Rebuild format-2 history from the effective conversation projection."""
-    messages = rebuild_messages(
-        await conversation_records(store, run_id, limits=limits), reasoning_for=reasoning_for
-    )
+    records = await conversation_records(store, run_id, limits=limits)
+    messages = rebuild_messages(records, reasoning_for=reasoning_for)
     from dendrux.errors import RunNotReclaimableError
     from dendrux.types import Limits, _step_from_dict
 
@@ -415,7 +415,7 @@ async def rebuild_history(
         if len(page) < 500:
             break
         after = page[-1].order_index
-    return RebuiltHistory(messages, steps)
+    return RebuiltHistory(messages, steps, records)
 
 
 def rebuild_messages(traces: list[TraceRecord], *, reasoning_for: str | None) -> list[Message]:

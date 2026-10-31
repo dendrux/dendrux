@@ -109,6 +109,29 @@ _creation_loop: ContextVar[tuple[object, str, str | None] | None] = ContextVar(
 )
 
 
+@dataclass(frozen=True)
+class _FinalizedRunRead:
+    id: str
+    tenant_id: str | None
+    reclaim_attempts: int
+    last_reclaimed_at: datetime | None
+
+
+_finalized_run_read: ContextVar[tuple[object, str, list[_FinalizedRunRead]] | None] = ContextVar(
+    "dendrux_finalized_run_read", default=None
+)
+
+
+@contextmanager
+def _capture_finalized_run(store: object, run_id: str) -> Iterator[list[_FinalizedRunRead]]:
+    records: list[_FinalizedRunRead] = []
+    token = _finalized_run_read.set((store, run_id, records))
+    try:
+        yield records
+    finally:
+        _finalized_run_read.reset(token)
+
+
 @contextmanager
 def _creation_loop_scope(store: object, run_id: str, loop_name: str | None) -> Iterator[None]:
     token = _creation_loop.set((store, run_id, loop_name))
@@ -1556,6 +1579,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         if notify_channel is not None:
             validate_channel(notify_channel)
         self.notify_channel = notify_channel
+        self._format2_active = False
         from sqlalchemy.ext.asyncio import AsyncSession
         from sqlalchemy.orm import sessionmaker
 
@@ -1596,6 +1620,18 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
 
         from dendrux.db.models import DendruxSetting
 
+        checkpoint_capable = all(
+            (
+                self.capabilities.fenced_writes,
+                self.capabilities.retry_ids,
+                self.capabilities.checkpointing,
+                self.capabilities.atomic_completion,
+            )
+        )
+        if not checkpoint_capable:
+            return 1
+        if self._format2_active:
+            return 2
         if session is None:
             async with self._session_factory() as entry_session:
                 return cast("int", await self._creation_storage_format(entry_session))
@@ -1605,15 +1641,9 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
             )
             or "1"
         )
-        if not all(
-            (
-                self.capabilities.fenced_writes,
-                self.capabilities.retry_ids,
-                self.capabilities.checkpointing,
-                self.capabilities.atomic_completion,
-            )
-        ):
-            storage_format = 1
+        # Activation is one-way; format 1 must still observe later activation.
+        if storage_format == 2:
+            self._format2_active = True
         return storage_format
 
     async def create_run(
@@ -3115,6 +3145,28 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         )
         if claim_epoch is not None:
             stmt = stmt.where(AgentRun.claim_epoch == claim_epoch)
+        capture = _finalized_run_read.get()
+        if capture is not None and capture[0] is self and capture[1] == run_id:
+            row = (
+                await session.execute(
+                    stmt.values(**values).returning(
+                        AgentRun.id,
+                        AgentRun.tenant_id,
+                        AgentRun.reclaim_attempts,
+                        AgentRun.last_reclaimed_at,
+                    )
+                )
+            ).first()
+            if row is not None:
+                capture[2][:] = [
+                    _FinalizedRunRead(
+                        row.id,
+                        row.tenant_id,
+                        row.reclaim_attempts,
+                        _to_aware_utc(row.last_reclaimed_at) if row.last_reclaimed_at else None,
+                    )
+                ]
+            return row is not None
         result: Any = await session.execute(stmt.values(**values))
         return bool(result.rowcount and result.rowcount > 0)
 
@@ -3915,9 +3967,14 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                     return False
 
                 # 2. Read the pause being claimed, under the claim's lock.
-                current_pause_data = (
-                    await session.execute(select(AgentRun.pause_data).where(AgentRun.id == run_id))
-                ).scalar_one_or_none()
+                run = (
+                    await session.execute(
+                        select(
+                            AgentRun.pause_data, AgentRun.storage_format, AgentRun.loop_state
+                        ).where(AgentRun.id == run_id)
+                    )
+                ).one()
+                current_pause_data = run.pause_data
                 if current_pause_data is None:
                     await session.rollback()
                     return False
@@ -3930,13 +3987,6 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
 
                 # 3. Merge submitted_data into pause_data.
                 merged = dict(current_pause_data)
-                run = (
-                    await session.execute(
-                        select(AgentRun.storage_format, AgentRun.loop_state).where(
-                            AgentRun.id == run_id
-                        )
-                    )
-                ).one()
                 values: dict[str, Any] = {}
                 if run.storage_format == 2:
                     if submission is None:

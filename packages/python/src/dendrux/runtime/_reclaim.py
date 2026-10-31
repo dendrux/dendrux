@@ -221,7 +221,9 @@ async def rebuild_pause(
     return pause
 
 
-async def needs_resolution(store: StateStore, run_id: str, pause: PauseState) -> bool:
+async def needs_resolution(
+    store: StateStore, run_id: str, pause: PauseState, *, checkpoint: dict[str, Any] | None = None
+) -> bool:
     if pause.schema_version != 2:
         return False
     if any(g.get("source") == "recovery" for g in (pause.approval_gates or {}).values()):
@@ -229,6 +231,12 @@ async def needs_resolution(store: StateStore, run_id: str, pause: PauseState) ->
     if not pause.pending_tool_calls:
         return False
     calls = {tc.id for tc in pause.pending_tool_calls}
+    if checkpoint is not None:
+        pending = {p["call_id"]: p for p in checkpoint.get("pending", [])}
+        # Client calls never write server intents. Missing/unknown entries
+        # retain the defensive evidence read, as do all server phases.
+        if all(pending.get(call_id, {}).get("target") == "client" for call_id in calls):
+            return False
     return any(
         row.tool_call_id in calls and row.outcome == "started"
         for row in await store.get_tool_calls(run_id, iteration_index=pause.iteration, limit=1000)
