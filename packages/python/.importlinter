@@ -18,7 +18,7 @@ type = layers
 containers = dendrux
 exhaustive = True
 layers =
-    cli | store | notifiers
+    cli | store | notifiers | testing
     agent
     runtime
     loops : skills

@@ -8,7 +8,7 @@ Each test sees a clean schema.
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pytest
 import pytest_asyncio
@@ -19,13 +19,19 @@ from sqlalchemy.pool import NullPool
 from dendrux.db.models import Base
 from tests._fixtures.storage import pin_storage_format
 from tests._helpers import v030_oracle as o
-from tests.conformance import pg_guard
+from tests.conformance import _kit_backends, pg_guard
+from tests.conformance._kit_faults import SqlFaultInjector
 from tests.integration.conftest import _PG_TRUNCATE_SQL, _ensure_test_db_exists
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncIterator, Iterator
 
     from sqlalchemy.ext.asyncio import AsyncEngine
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """The published store kit runs here as a plugin, like it does for a store author."""
+    config.pluginmanager.import_plugin("dendrux.testing.store_kit")
 
 
 @pytest.fixture(scope="session")
@@ -107,3 +113,59 @@ async def sqlite_engine() -> AsyncIterator[AsyncEngine]:
         yield eng
     finally:
         await eng.dispose()
+
+
+# ---------------------------------------------------------------------------
+# The fixtures a store author provides to the published test kit
+# (``dendrux.testing.store_kit``): see tests/conformance/_kit_backends.py.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(params=_kit_backends.backend_params())
+def kit_backend_kind(request: pytest.FixtureRequest) -> str:
+    return str(request.param)
+
+
+@pytest.fixture
+def kit_backend_schema(kit_backend_kind: str, request: pytest.FixtureRequest) -> None:
+    """Postgres: create the authorised database's schema once (resolved outside the loop)."""
+    if kit_backend_kind == "postgres":
+        request.getfixturevalue("_conformance_pg_schema")
+
+
+@pytest_asyncio.fixture(loop_scope="function")
+async def kit_backend(
+    kit_backend_kind: str, kit_backend_schema: None, tmp_path: Any
+) -> AsyncIterator[_kit_backends.KitBackend]:
+    backend = _kit_backends.KitBackend(kit_backend_kind, tmp_path)
+    try:
+        yield backend
+    finally:
+        await backend.close()
+
+
+@pytest.fixture
+def dendrux_store_factory(kit_backend: _kit_backends.KitBackend) -> Any:
+    return kit_backend.fresh_store
+
+
+@pytest.fixture
+def dendrux_store_reopen(kit_backend: _kit_backends.KitBackend) -> Any:
+    return kit_backend.reopen
+
+
+@pytest.fixture
+def dendrux_store_second_instance(kit_backend: _kit_backends.KitBackend) -> Any:
+    return kit_backend.second
+
+
+@pytest.fixture
+def dendrux_clock(kit_backend: _kit_backends.KitBackend) -> Any:
+    return kit_backend
+
+
+@pytest.fixture
+def dendrux_fault_injector() -> Iterator[SqlFaultInjector]:
+    injector = SqlFaultInjector()
+    yield injector
+    injector.close()
