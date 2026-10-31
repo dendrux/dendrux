@@ -20,14 +20,14 @@ from dendrux.errors import NoteLimitExceededError
 from dendrux.types import IdempotencyConflictError
 
 if TYPE_CHECKING:
-    from dendrux.runtime.state import SQLAlchemyStateStore
+    from dendrux.runtime.stores.sql.base import SQLStateStore
 
 pytestmark = pytest.mark.asyncio
 
 N = 24
 
 
-async def test_idempotency_race_has_one_winner_per_tenant(store: SQLAlchemyStateStore) -> None:
+async def test_idempotency_race_has_one_winner_per_tenant(store: SQLStateStore) -> None:
     async def create(i: int, tenant: str) -> Any:
         return await store.create_run(
             f"r{tenant}{i:02d}",
@@ -51,7 +51,7 @@ async def test_idempotency_race_has_one_winner_per_tenant(store: SQLAlchemyState
 
 
 async def test_idempotency_race_with_different_input_conflicts(
-    store: SQLAlchemyStateStore,
+    store: SQLStateStore,
 ) -> None:
     async def create(i: int) -> Any:
         return await store.create_run(
@@ -72,74 +72,111 @@ async def test_idempotency_race_with_different_input_conflicts(
     assert await store.count_runs() == 1
 
 
-async def test_event_allocation_race_is_contiguous(store: SQLAlchemyStateStore) -> None:
-    await store.create_run("r1", "agent")
+async def test_event_allocation_race_is_contiguous(store: SQLStateStore) -> None:
+    await store.create_run("00000000000000000000000105", "agent")
     seqs = await asyncio.gather(
-        *(store.save_run_event("r1", event_type=f"e{i}") for i in range(N * 2))
+        *(
+            store.save_run_event("00000000000000000000000105", event_type=f"e{i}")
+            for i in range(N * 2)
+        )
     )
     assert sorted(seqs) == list(range(N * 2))
-    stored = [e.sequence_index for e in await store.get_run_events("r1")]
+    stored = [e.sequence_index for e in await store.get_run_events("00000000000000000000000105")]
     assert stored == list(range(N * 2))
 
 
-async def test_event_allocation_race_with_cas_transitions(store: SQLAlchemyStateStore) -> None:
+async def test_event_allocation_race_with_cas_transitions(store: SQLStateStore) -> None:
     """Plain appends and a CAS transition event interleave without duplicate indexes."""
-    await store.create_run("r1", "agent")
+    await store.create_run("00000000000000000000000105", "agent")
 
     async def transition() -> Any:
         return await store.finalize_with_event(
-            "r1",
+            "00000000000000000000000105",
             status="success",
             allowed_current_statuses=["running"],
             event_type="run.completed",
         )
 
-    tasks = [store.save_run_event("r1", event_type=f"e{i}") for i in range(N)]
+    tasks = [
+        store.save_run_event("00000000000000000000000105", event_type=f"e{i}") for i in range(N)
+    ]
     tasks.insert(N // 2, transition())
     results = await asyncio.gather(*tasks)
     assert sorted(r for r in results if r is not None) == list(range(N + 1))
-    stored = [e.sequence_index for e in await store.get_run_events("r1")]
+    stored = [e.sequence_index for e in await store.get_run_events("00000000000000000000000105")]
     assert stored == list(range(N + 1))
 
 
-async def test_note_cap_race_never_exceeds_the_cap(store: SQLAlchemyStateStore) -> None:
-    await store.create_run("r1", "agent", tenant_id="A")
+async def test_note_cap_race_never_exceeds_the_cap(store: SQLStateStore) -> None:
+    await store.create_run("00000000000000000000000105", "agent", tenant_id="A")
     results = await asyncio.gather(
         *(
-            store.add_note("r1", note_id=f"n{i:03d}", text="t", tenant_id="A", max_notes=7)
+            store.add_note(
+                "00000000000000000000000105",
+                note_id=f"n{i:03d}",
+                text="t",
+                tenant_id="A",
+                max_notes=7,
+            )
             for i in range(N * 2)
         ),
         return_exceptions=True,
     )
     assert sum(r is True for r in results) == 7
     assert all(isinstance(r, NoteLimitExceededError) for r in results if r is not True)
-    assert len(await store.get_notes("r1")) == 7
+    assert len(await store.get_notes("00000000000000000000000105")) == 7
 
 
-async def test_note_cap_race_with_finalize(store: SQLAlchemyStateStore) -> None:
+async def test_note_cap_race_with_finalize(store: SQLStateStore) -> None:
     """A finalize racing note submitters: every accepted note is stored, none after."""
-    await store.create_run("r1", "agent")
+    await store.create_run("00000000000000000000000105", "agent")
     half = N // 2
     first = [
-        store.add_note("r1", note_id=f"a{i:03d}", text="t", max_notes=100) for i in range(half)
+        store.add_note("00000000000000000000000105", note_id=f"a{i:03d}", text="t", max_notes=100)
+        for i in range(half)
     ]
     second = [
-        store.add_note("r1", note_id=f"b{i:03d}", text="t", max_notes=100) for i in range(half)
+        store.add_note("00000000000000000000000105", note_id=f"b{i:03d}", text="t", max_notes=100)
+        for i in range(half)
     ]
     results = await asyncio.gather(
-        *first, store.finalize_run("r1", status="success"), *second, return_exceptions=True
+        *first,
+        store.finalize_run("00000000000000000000000105", status="success"),
+        *second,
+        return_exceptions=True,
     )
     assert not [r for r in results if isinstance(r, BaseException)]
     notes = results[:half] + results[half + 1 :]
-    assert len(await store.get_notes("r1")) == sum(r is True for r in notes)
-    assert not await store.add_note("r1", note_id="late", text="t", max_notes=100)
+    assert len(await store.get_notes("00000000000000000000000105")) == sum(r is True for r in notes)
+    assert not await store.add_note(
+        "00000000000000000000000105", note_id="late", text="t", max_notes=100
+    )
 
 
 async def test_hot_queries_can_use_their_indexes(engine: Any) -> None:
     if engine.dialect.name != "postgresql":
         pytest.skip("EXPLAIN plans are checked on Postgres")
+    import datetime as dt
+
+    from dendrux.db.models import AgentRun
+
+    now = dt.datetime.now(dt.UTC)
     async with engine.begin() as conn:
-        # This is index capability, independent of cost estimates or stale statistics.
+        # TRUNCATE retains pg_stats from earlier tests; give competing listing
+        # indexes representative tenant selectivity and fresh statistics.
+        await conn.execute(
+            AgentRun.__table__.insert(),
+            [
+                {
+                    "id": f"plan-{i:04}",
+                    "agent_name": "plan",
+                    "tenant_id": "A" if i % 100 == 0 else f"tenant-{i % 100}",
+                    "created_at": now - dt.timedelta(seconds=i),
+                }
+                for i in range(2000)
+            ],
+        )
+        await conn.execute(text("ANALYZE agent_runs"))
         await conn.execute(text("SET LOCAL enable_seqscan = off"))
         await conn.execute(text("SET LOCAL enable_indexscan = on"))
         await conn.execute(text("SET LOCAL enable_bitmapscan = off"))
@@ -154,7 +191,7 @@ async def test_hot_queries_can_use_their_indexes(engine: Any) -> None:
         assert {
             "uq_agent_runs_tenant_idempotency_key",
             "ix_agent_runs_tenant_id_created_at",
-            "ix_run_events_agent_run_id_seq",
+            "uq_run_events_run_seq",
             "ix_run_inbox_run_pending",
         } <= indexes
 
@@ -177,8 +214,10 @@ async def test_hot_queries_can_use_their_indexes(engine: Any) -> None:
         assert "ix_agent_runs_tenant_id_created_at" in listing
         alloc = await plan(
             "SELECT coalesce(max(sequence_index), -1) + 1 FROM run_events WHERE agent_run_id = :r",
-            r="r1",
+            r="00000000000000000000000105",
         )
-        assert "ix_run_events_agent_run_id_seq" in alloc
-        notes = await plan("SELECT count(*) FROM run_inbox WHERE run_id = :r", r="r1")
+        assert "uq_run_events_run_seq" in alloc
+        notes = await plan(
+            "SELECT count(*) FROM run_inbox WHERE run_id = :r", r="00000000000000000000000105"
+        )
         assert "ix_run_inbox_run_pending" in notes

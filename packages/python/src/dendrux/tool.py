@@ -75,6 +75,7 @@ def tool(
     parameters: dict[str, Any] | None = None,
     strict: bool = False,
     receives_pii: bool | Iterable[str] = False,
+    idempotent: bool = False,
 ) -> Callable[..., Any]:
     """Decorator that registers a function as a Dendrux tool.
 
@@ -149,6 +150,7 @@ def tool(
             parameters=schema,
             target=resolved_target,
             parallel=parallel,
+            idempotent=idempotent,
             max_calls_per_run=max_calls_per_run,
             timeout_seconds=resolved_timeout,
             has_explicit_timeout=explicit_timeout,

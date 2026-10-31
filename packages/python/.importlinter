@@ -6,6 +6,7 @@
 # The order below is the one the code follows today (checked against the real
 # import graph). A package on a lower line must not import one above it. Packages
 # joined by `:` may import each other; packages joined by `|` may not.
+# SQL implementations and the engine factory live in runtime.stores, below agent/store.
 [importlinter]
 root_package = dendrux
 include_external_packages = True
@@ -17,7 +18,7 @@ type = layers
 containers = dendrux
 exhaustive = True
 layers =
-    cli | store | notifiers
+    cli | store | notifiers | testing
     agent
     runtime
     loops : skills
@@ -28,6 +29,7 @@ layers =
     pricing | context_blocks | strategies | media | db
     types : _wire
     errors | _sentinel | _redact
+    _codes
 ignore_imports =
     # KNOWN VIOLATION: the retry telemetry helper in the provider layer reports
     # governance events through the loop helpers, so llm reaches up into loops

@@ -124,6 +124,63 @@ jobs:
       - name: Build and smoke-test distributions
         run: python scripts/mcp_distribution_smoke.py
 
+  # MySQL 8.4 and MariaDB 10.11: schema, maintenance and store suites. The servers come from
+  # the committed compose file (CI parity with `make test-dbs-up`); GitHub service containers
+  # cannot pass the NO PAD collation flags. The job fails if the server's tests were skipped.
+  mysql-family:
+    name: ${{ matrix.server }} suites
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        working-directory: packages/python
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - server: mysql
+            env_name: DENDRUX_TEST_MYSQL_URL
+            port: 53306
+          - server: mariadb
+            env_name: DENDRUX_TEST_MARIADB_URL
+            port: 53307
+
+    env:
+      PYTHON_DOTENV_DISABLED: "1"
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: packages/python/pyproject.toml
+
+      - name: Start ${{ matrix.server }}
+        run: docker compose -f docker/test-dbs.compose.yml up -d --wait ${{ matrix.server }}
+
+      - name: Install dependencies
+        run: pip install -e ".[dev,mysql]"
+
+      - name: Test on ${{ matrix.server }}
+        shell: bash
+        env:
+          SERVER_URL: mysql+asyncmy://root:dendrux_test@127.0.0.1:${{ matrix.port }}/dendrux_ci_test
+        run: |
+          export ${{ matrix.env_name }}="$SERVER_URL"
+          pytest tests/db -v -rs -n 4 -m "not benchmark" --no-cov | tee pytest.log
+          if grep -q '${{ matrix.env_name }} not set' pytest.log; then
+            echo "::error::${{ matrix.server }} tests were skipped (${{ matrix.env_name }} not set)."
+            exit 1
+          fi
+
+      - name: Remove ${{ matrix.server }}
+        if: always()
+        run: docker compose -f docker/test-dbs.compose.yml down -v
+
   api-compat:
     name: public API vs the last release
     runs-on: ubuntu-latest

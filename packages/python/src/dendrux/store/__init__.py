@@ -4,7 +4,7 @@
 monitoring, billing, and any other observation layer on top of Dendrux.
 
 It is read-only for run data. Write paths remain on
-``runtime.state.SQLAlchemyStateStore``; the one exception is image blob
+``runtime.stores.sql.base.SQLStateStore``; the one exception is image blob
 maintenance through ``RunStore.blobs`` (``purge()`` / ``collect_garbage()``).
 Response types are frozen dataclasses defined in this module; runtime read
 records stay internal and are converted at the facade boundary so runtime
@@ -38,6 +38,7 @@ Example
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import functools
 import inspect
@@ -47,8 +48,9 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from dendrux._sentinel import _OmittedType
+from dendrux.db._notify import EventNotifier, NotifierState, Subscription
 from dendrux.db._sqlite_sync import create_sqlite_schema
-from dendrux.errors import BlobNotFoundError, RunNotFoundError
+from dendrux.errors import BlobNotFoundError, NotifierUnavailableError, RunNotFoundError
 from dendrux.media._ids import image_id
 from dendrux.media._runtime import tenant_scope_for
 from dendrux.runtime._blob_catalog import BlobServices, CatalogBlobAccessor
@@ -83,12 +85,17 @@ from dendrux.runtime._pending import (
 from dendrux.runtime.state import (
     MAX_LIST_OFFSET,
     UNSCOPED,
-    SQLAlchemyStateStore,
     StateStore,
+    StoreCapabilities,
     TenantScope,
     _to_aware_utc,
     _Unscoped,
 )
+from dendrux.runtime.stores._factory import store_for_engine
+from dendrux.runtime.stores.sql.base import SQLStateStore
+from dendrux.runtime.stores.sql.mysql import MySQLStateStore
+from dendrux.runtime.stores.sql.postgres import PostgresStateStore
+from dendrux.runtime.stores.sql.sqlite import SQLiteStateStore
 from dendrux.store._follow import (
     PAUSE_STATUSES as PAUSE_STATUSES,
 )
@@ -104,6 +111,7 @@ from dendrux.store._follow import (
 from dendrux.store._follow import (
     approval_calls as approval_calls,
 )
+from dendrux.store._notifier_pg import PostgresEventNotifier
 from dendrux.store._redact import (
     PAUSE_VIEW_EVENTS,
     PastParams,
@@ -452,11 +460,25 @@ class RunStore:
         self._owned_engine: AsyncEngine | None = None
         self._blob_services = BlobServices.for_state_store(state_store, blob_store=blob_store)
         self._event_feed: EventFeed | None = None
+        self._notifier: EventNotifier | None = None
+        self._owned_notifier: EventNotifier | None = None
+        self._notifier_started = False
+        self._notifier_start_task: asyncio.Task[None] | None = None
+        self._notifier_retry_at = 0.0
+        self._notifier_retry_delay: float | None = None
 
     @classmethod
-    def from_engine(cls, engine: AsyncEngine, *, blob_store: BlobStore | None = None) -> RunStore:
-        """Build a RunStore over an engine the caller owns and disposes."""
-        return cls(SQLAlchemyStateStore(engine), blob_store=blob_store)
+    def from_engine(
+        cls,
+        engine: AsyncEngine,
+        *,
+        blob_store: BlobStore | None = None,
+        notifier: EventNotifier | None = None,
+    ) -> RunStore:
+        """Borrow the engine and optional notifier; the caller owns both lifecycles."""
+        instance = cls(store_for_engine(engine), blob_store=blob_store)
+        instance._notifier = notifier
+        return instance
 
     @classmethod
     def from_database_url(
@@ -465,6 +487,8 @@ class RunStore:
         *,
         blob_store: BlobStore | None = None,
         database_options: dict[str, Any] | None = None,
+        notifier: EventNotifier | None = None,
+        listen_url: str | None = None,
     ) -> RunStore:
         """Build a RunStore from a SQLAlchemy async URL.
 
@@ -474,20 +498,41 @@ class RunStore:
         query (see the class docstring); an older file that cannot be
         upgraded raises :class:`~dendrux.errors.SqliteSchemaSyncError` from
         that first call.
+
+        ``notifier`` is borrowed; the caller starts and stops it. Alternatively,
+        ``listen_url`` creates an owned PostgreSQL notifier, started on async
+        context entry or first follow/stream and stopped by ``close``. It must be a
+        direct or session-pooled endpoint, even when ``database_url`` uses
+        PgBouncer transaction pooling. The two options are mutually exclusive.
         """
         from sqlalchemy.ext.asyncio import create_async_engine
 
-        from dendrux.db._engine_options import engine_options, normalized_url
+        from dendrux.db._engine_options import (
+            engine_options,
+            normalized_url,
+            split_database_options,
+        )
 
+        if notifier is not None and listen_url is not None:
+            raise ValueError("Pass either notifier or listen_url, not both.")
         parsed = normalized_url(database_url)
-        engine = create_async_engine(parsed, **engine_options(parsed, database_options))
-        store: Any = SQLAlchemyStateStore(engine)
+        options, store_options = split_database_options(database_options)
+        channel = store_options.get("notify_channel", "dendrux_events")
+        if listen_url is not None and channel is None:
+            raise ValueError("listen_url requires an enabled notify_channel.")
+        owned_notifier = (
+            PostgresEventNotifier(listen_url, channel=channel) if listen_url is not None else None
+        )
+        engine = create_async_engine(parsed, **engine_options(parsed, options))
+        store: Any = store_for_engine(engine, **store_options)
         if database_url.startswith("sqlite"):
             store = _InitOnFirstUse(
                 store, functools.partial(create_sqlite_schema, engine), engine.dispose
             )
         instance = cls(store, blob_store=blob_store)
         instance._owned_engine = engine
+        instance._notifier = notifier if notifier is not None else owned_notifier
+        instance._owned_notifier = owned_notifier
         return instance
 
     @property
@@ -537,17 +582,58 @@ class RunStore:
         return await accessor.read(sha256, tenant_id=record.tenant_id)
 
     async def close(self) -> None:
-        """Stop owned event feeds, then dispose only engines this store owns."""
-        if self._event_feed is not None:
-            await self._event_feed.aclose()
-        if isinstance(self._state, _InitOnFirstUse):
-            self._state.closed = True
-        if self._owned_engine is not None:
-            await self._owned_engine.dispose()
-            self._owned_engine = None
+        """Stop owned feeds/listener, then dispose only engines this store owns."""
+        try:
+            if self._event_feed is not None:
+                await self._event_feed.aclose()
+        finally:
+            try:
+                if self._notifier_start_task is not None:
+                    self._notifier_start_task.cancel()
+                    await asyncio.gather(self._notifier_start_task, return_exceptions=True)
+                if self._owned_notifier is not None:
+                    await self._owned_notifier.stop()
+                    self._owned_notifier = None
+            finally:
+                if isinstance(self._state, _InitOnFirstUse):
+                    self._state.closed = True
+                if self._owned_engine is not None:
+                    await self._owned_engine.dispose()
+                    self._owned_engine = None
 
     async def __aenter__(self) -> RunStore:
+        try:
+            await self._start_owned_notifier()
+        except BaseException:
+            await self.close()
+            raise
         return self
+
+    async def _start_owned_notifier(self) -> None:
+        if self._owned_notifier is None or self._notifier_started:
+            return
+        loop = asyncio.get_running_loop()
+        if loop.time() < self._notifier_retry_at:
+            return
+        if self._notifier_start_task is None:
+            self._notifier_start_task = loop.create_task(self._try_start_owned_notifier())
+        await asyncio.shield(self._notifier_start_task)
+
+    async def _try_start_owned_notifier(self) -> None:
+        notifier = self._owned_notifier
+        assert notifier is not None
+        try:
+            await notifier.start()
+            self._notifier_started = True
+            self._notifier_retry_at = 0.0
+            self._notifier_retry_delay = None
+        except NotifierUnavailableError:
+            initial, maximum = getattr(notifier, "reconnect_backoff", (1.0, 30.0))
+            delay = self._notifier_retry_delay or initial
+            self._notifier_retry_at = asyncio.get_running_loop().time() + delay
+            self._notifier_retry_delay = min(delay * 2, maximum)
+        finally:
+            self._notifier_start_task = None
 
     async def __aexit__(self, *exc: Any) -> None:
         await self.close()
@@ -739,6 +825,11 @@ class RunStore:
         decides when to stop — typically by breaking out of ``async for`` on
         a terminal ``event_type`` or by calling ``aclose()`` on the returned
         generator. A run's tenant never changes, so the scope is checked once.
+
+        With a notifier, one subscription is held until close or cancellation,
+        and hints wake the next read immediately. ``poll_interval_s`` still
+        bounds the wait in both healthy and degraded states. The notifier's
+        subscription cap raises ``FollowCapacityError`` before the first yield.
         """
         if isinstance(tenant_id, _OmittedType):
             _warn_stream_events_unscoped()
@@ -749,23 +840,37 @@ class RunStore:
         if run is None:
             raise RunNotFoundError(run_id)
 
-        cursor = after_sequence_index
-        while True:
-            rows = await self._state.get_run_events(
-                run_id,
-                after_sequence_index=cursor,
-                limit=100,
-            )
-            if rows:
-                for row in rows:
-                    event = _event_to_stored(row)
-                    yield event
-                    cursor = event.sequence_index
-                # If the batch was full, there may be more buffered — keep
-                # draining before we sleep.
-                if len(rows) == 100:
-                    continue
-            await asyncio.sleep(poll_interval_s)
+        await self._start_owned_notifier()
+        context = (
+            self._notifier.subscribe(run_id)
+            if self._notifier is not None
+            else contextlib.nullcontext(None)
+        )
+        async with context as subscription:
+            cursor = after_sequence_index
+            while True:
+                if subscription is not None:
+                    subscription.event.clear()
+                rows = await self._state.get_run_events(
+                    run_id,
+                    after_sequence_index=cursor,
+                    limit=100,
+                )
+                if rows:
+                    for row in rows:
+                        event = _event_to_stored(row)
+                        yield event
+                        cursor = event.sequence_index
+                    # If the batch was full, there may be more buffered — keep
+                    # draining before we sleep.
+                    if len(rows) == 100:
+                        continue
+                if subscription is None:
+                    await asyncio.sleep(poll_interval_s)
+                else:
+                    with contextlib.suppress(TimeoutError):
+                        async with asyncio.timeout(poll_interval_s):
+                            await subscription.event.wait()
 
     async def get_llm_calls(
         self,
@@ -831,6 +936,21 @@ class RunStore:
         for a run, ordered by ``order_index``. ``limit``/``offset`` push
         pagination into SQL. Empty when the run is outside ``tenant_id``."""
         _check_page(None, limit, offset)
+        from dendrux.runtime._capabilities import capabilities
+        from dendrux.runtime.replay import conversation_records
+
+        if capabilities(self._state).checkpointing:
+            record = await self._scoped_read(self._state.get_run, run_id, tenant_id)
+            if record is not None and record.storage_format == 2:
+                rows = await conversation_records(
+                    self._state,
+                    run_id,
+                    tenant_id=tenant_id,
+                    scoped=True,
+                    limit=limit,
+                    offset=offset,
+                )
+                return [_trace_to_public(r) for r in rows]
         rows = await self._scoped_read(
             self._state.get_traces, run_id, tenant_id, limit=limit, offset=offset
         )
@@ -1392,16 +1512,26 @@ def _build_pause_pair(paused: Any, resumed: Any | None) -> PausePair:
 
 
 __all__ = [
+    "StateStore",
+    "StoreCapabilities",
+    "SQLStateStore",
+    "PostgresStateStore",
+    "SQLiteStateStore",
+    "MySQLStateStore",
+    "store_for_engine",
     "EventFeed",
+    "EventNotifier",
     "Follow",
     "FollowCapacityError",
     "FollowEnd",
     "FollowHeartbeat",
     "FollowItem",
     "LLMCall",
+    "NotifierState",
     "PausePair",
     "PendingPause",
     "PendingToolCall",
+    "PostgresEventNotifier",
     "RunDetail",
     "RunNote",
     "RunNotFoundError",
@@ -1411,6 +1541,7 @@ __all__ = [
     "RunUsage",
     "StoredEvent",
     "SubtreeNode",
+    "Subscription",
     "TenantScope",
     "ToolInvocation",
     "TraceEntry",

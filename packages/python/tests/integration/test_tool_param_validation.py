@@ -24,6 +24,7 @@ async def refund(order_id: int) -> str:
 
 def _approval_agent(llm: MockLLM, store) -> Agent:
     return Agent(
+        strict_tenancy=False,
         provider=llm,
         prompt="Support agent.",
         tools=[refund],
@@ -36,7 +37,7 @@ async def test_invalid_call_persisted_as_failed_invocation(store):
     REFUNDS.clear()
     tc = ToolCall(name="refund", params={"order_id": "seven"}, provider_tool_call_id="t1")
     llm = MockLLM([LLMResponse(tool_calls=[tc]), LLMResponse(text="ok")])
-    agent = Agent(provider=llm, prompt="p", tools=[refund], state_store=store)
+    agent = Agent(strict_tenancy=False, provider=llm, prompt="p", tools=[refund], state_store=store)
 
     result = await agent.run("refund")
 
@@ -162,7 +163,13 @@ async def test_parse_error_survives_client_tool_pause_and_resume(store):
     REFUNDS.clear()
     client_call = ToolCall(name="read_range", params={"sheet": "S1"}, provider_tool_call_id="t2")
     llm = MockLLM([LLMResponse(tool_calls=[_bad_refund(), client_call]), LLMResponse(text="done")])
-    agent = Agent(provider=llm, prompt="p", tools=[refund, read_range], state_store=store)
+    agent = Agent(
+        strict_tenancy=False,
+        provider=llm,
+        prompt="p",
+        tools=[refund, read_range],
+        state_store=store,
+    )
 
     paused = await agent.run("go")
 
@@ -170,7 +177,11 @@ async def test_parse_error_survives_client_tool_pause_and_resume(store):
     raw_pause = await store.get_pause_state(paused.run_id)
     assert BAD_REFUND_ARGS not in json.dumps(raw_pause)
     state = PauseState.from_dict(raw_pause)
-    assistant = next(m for m in state.history if m.tool_calls)
+    from dendrux.runtime.replay import rebuild_history
+
+    assistant = next(
+        m for m in (await rebuild_history(store, paused.run_id)).messages if m.tool_calls
+    )
     assert assistant.tool_calls[0].parse_error == BAD_REFUND_ERROR
     assert [tc.name for tc in state.pending_tool_calls] == ["read_range"]
 
@@ -204,6 +215,7 @@ async def refund_order(order: Order) -> str:
 
 def _order_agent(llm: MockLLM, store) -> Agent:
     return Agent(
+        strict_tenancy=False,
         provider=llm,
         prompt="Support agent.",
         tools=[refund_order],

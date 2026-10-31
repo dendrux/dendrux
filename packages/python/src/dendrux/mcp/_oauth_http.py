@@ -21,6 +21,7 @@ from urllib.parse import urlsplit
 
 import httpx2
 
+from dendrux import _codes
 from dendrux.mcp._destination import MCPDestination, MCPDestinationPolicy
 from dendrux.mcp._errors import MCPDestinationDeniedError
 from dendrux.mcp._http import _PolicyTransport
@@ -314,7 +315,7 @@ class OAuthHTTP:
             try:
                 await response.aclose()
             except Exception:
-                logger.debug("OAuth response close failed")
+                _codes.log_code(logger, _codes.MCP_OAUTH_CLOSE_FAILED, count=1)
 
         task = asyncio.get_running_loop().create_task(close())
         self._closing.add(task)
@@ -332,4 +333,4 @@ class OAuthHTTP:
         try:
             await self._transport.aclose()
         except Exception:
-            logger.debug("OAuth transport close failed")
+            _codes.log_code(logger, _codes.MCP_OAUTH_CLOSE_FAILED, count=1)

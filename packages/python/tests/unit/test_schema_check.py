@@ -86,10 +86,11 @@ def _engine(dialect: str) -> MagicMock:
 
 
 @pytest.mark.asyncio
-async def test_sqlite_is_never_inspected() -> None:
+async def test_sqlite_is_inspected_after_additive_sync() -> None:
     engine = _engine("sqlite")
-    await ensure_schema_current(engine)
-    engine.connect.assert_not_called()
+    engine.connect.side_effect = RuntimeError("reached the database")
+    with pytest.raises(RuntimeError, match="reached the database"):
+        await ensure_schema_current(engine)
 
 
 @pytest.mark.asyncio

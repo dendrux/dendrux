@@ -2,6 +2,7 @@
 
 import asyncio
 import datetime as dt
+import functools
 import json
 
 import pytest
@@ -17,6 +18,7 @@ from dendrux.runtime.persistence import PersistenceRecorder
 from dendrux.runtime.runner import _build_cached_result
 from dendrux.store import RunStore
 from dendrux.types import Budget, LLMResponse, RunStatus, ToolCall, ToolResult, UsageStats
+from tests._helpers.db_errors import locked_error
 from tests._helpers.scripted_provider import ScriptedLLM, tool_call
 from tests.integration.test_050_t7_integrity import agent, consume, result_for
 
@@ -132,7 +134,12 @@ async def test_typed_output_survives_persisted_wrapper(store):
 
 
 @pytest.mark.parametrize("entry", ["resume", "resume_stream", "submit"])
-async def test_pause_only_retains_safe_provider_options_and_restores_them(store, entry):
+async def test_pause_only_retains_safe_provider_options_and_restores_them(store, engine, entry):
+    from tests._fixtures.storage import pin_storage_format
+
+    # Compatibility assertion for the format-1 provider-options allowlist.
+    await pin_storage_format(engine, 1)
+
     class Options(ScriptedLLM):
         async def complete(self, *args, **kwargs):
             self.options = getattr(self, "options", []) + [kwargs]
@@ -160,6 +167,10 @@ async def test_pause_only_retains_safe_provider_options_and_restores_them(store,
 
 @pytest.mark.parametrize("claim", ["plain", "submit"])
 async def test_resume_claim_refreshes_progress_before_provider_starts(store, claim):
+    # This fault injection / pause blob exercises the format-1 write path.
+    from tests._fixtures.storage import pin_storage_format
+
+    await pin_storage_format(store._engine, 1)
     pause = await agent(store, [tool_call("client_read", pid="a")]).run("go")
     old = dt.datetime.now(dt.UTC) - dt.timedelta(days=1)
     async with store._session_factory() as session:
@@ -177,9 +188,11 @@ async def test_resume_claim_refreshes_progress_before_provider_starts(store, cla
 
 
 async def test_public_sweep_zero_threshold(store):
-    await store.create_run("zero", agent_name="a", input_data={})
+    await store.create_run("00000000000000000000000101", agent_name="a", input_data={})
     result = await sweep(state_store=store, stale_running=dt.timedelta(0))
-    assert [r.run_id for r in result.stale_running] == ["zero"], "zero is a valid sweep threshold"
+    assert [r.run_id for r in result.stale_running] == ["00000000000000000000000101"], (
+        "zero is a valid sweep threshold"
+    )
 
 
 async def test_sweep_projects_and_bounds_candidates(store, engine):
@@ -210,15 +223,17 @@ async def test_budget_enforcement_survives_lost_forensics_and_retries_usage(stor
     usage_attempts = 0
     original = store.save_usage
 
+    @functools.wraps(store.save_usage)
     async def flaky(*args, **kwargs):
         nonlocal usage_attempts
         usage_attempts += 1
         if usage_attempts == 1:
             from sqlalchemy.exc import OperationalError
 
-            raise OperationalError("fixture", {}, Exception("database is locked"))
+            raise OperationalError("fixture", {}, locked_error())
         return await original(*args, **kwargs)
 
+    @functools.wraps(store.save_llm_interaction)
     async def lost(*args, **kwargs):
         raise RuntimeError("forensics unavailable")
 
@@ -245,12 +260,18 @@ async def test_budget_enforcement_survives_lost_forensics_and_retries_usage(stor
 
 
 async def test_retry_removes_unpaired_calls(store, monkeypatch):
+    # This fault injection / pause blob exercises the format-1 write path.
+    from tests._fixtures.storage import pin_storage_format
+
+    await pin_storage_format(store._engine, 1)
+
     @tool()
     async def work() -> str:
         return "ok"
 
     original = store.save_tool_call
 
+    @functools.wraps(store.save_tool_call)
     async def lost(*args, **kwargs):
         raise RuntimeError("fixture disk failure")
 
@@ -323,13 +344,14 @@ async def test_failed_usage_write_is_retried(store, monkeypatch):
     attempts = 0
     original = store.save_usage
 
+    @functools.wraps(store.save_usage)
     async def flaky(*args, **kwargs):
         nonlocal attempts
         attempts += 1
         if attempts == 1:
             from sqlalchemy.exc import OperationalError
 
-            raise OperationalError("fixture", {}, Exception("database is locked"))
+            raise OperationalError("fixture", {}, locked_error())
         return await original(*args, **kwargs)
 
     monkeypatch.setattr(store, "save_usage", flaky)
@@ -341,13 +363,14 @@ async def test_failed_interaction_write_is_retried(store, monkeypatch):
     attempts = 0
     original = store.save_llm_interaction
 
+    @functools.wraps(store.save_llm_interaction)
     async def flaky(*args, **kwargs):
         nonlocal attempts
         attempts += 1
         if attempts == 1:
             from sqlalchemy.exc import OperationalError
 
-            raise OperationalError("fixture", {}, Exception("database is locked"))
+            raise OperationalError("fixture", {}, locked_error())
         return await original(*args, **kwargs)
 
     monkeypatch.setattr(store, "save_llm_interaction", flaky)
@@ -401,7 +424,7 @@ async def test_sweep_update_rechecks_staleness(store, monkeypatch, waiting):
 
 async def test_public_sweep_has_overridable_page_and_work_limits(store):
     for n in range(5):
-        await store.create_run(f"limit-{n}", agent_name="a", input_data={})
+        await store.create_run(f"{n:026d}", agent_name="a", input_data={})
     result = await sweep(state_store=store, stale_running=dt.timedelta(0), batch_size=1, max_runs=2)
     assert len(result.stale_running) == 2
     assert len((await sweep(state_store=store, stale_running=dt.timedelta(0))).stale_running) == 3
@@ -496,7 +519,7 @@ async def test_postgres_concurrent_sweeps_cannot_revoke_refreshed_run(
     try:
         await asyncio.wait_for(selected.wait(), 10)
         if waiting:
-            epoch = await store.claim_paused_run("live", expected_status="paused")
+            epoch = (await store.claim_paused_run("live", expected_status="paused")).claim_epoch
             assert await store.release_run_claim("live", status="paused", claim_epoch=epoch)
         else:
             await store.touch_progress("live")

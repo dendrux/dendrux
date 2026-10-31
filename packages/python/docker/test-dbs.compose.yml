@@ -1,0 +1,47 @@
+# Test databases for the MySQL 8.4 and MariaDB 10.11 suites (CI uses this same file).
+#
+#   make test-dbs-up      # start both, wait until healthy
+#   DENDRUX_TEST_MYSQL_URL=mysql+asyncmy://root:dendrux_test@127.0.0.1:53306/dendrux_test \
+#   DENDRUX_TEST_MARIADB_URL=mysql+asyncmy://root:dendrux_test@127.0.0.1:53307/dendrux_test \
+#     make test-mysql
+#   make test-dbs-down    # stop and remove both (and their data)
+#
+# Only these two containers are ever touched. They listen on 127.0.0.1 only, are capped
+# at 1 GB each, and use the NO PAD binary collations Dendrux requires as server defaults
+# (the schema sets them per column too). Data is disposable: no named volumes.
+name: dendrux-test-dbs
+
+services:
+  mysql:
+    image: mysql:8.4@sha256:a0225d1ea6631c8bc2385dc4c2faba17bbf1834ecf369e1659a9a382bd8d5dd7
+    container_name: dendrux-test-mysql
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_bin
+    environment:
+      MYSQL_ROOT_PASSWORD: dendrux_test
+    ports:
+      - "127.0.0.1:53306:3306"
+    mem_limit: 1g
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-pdendrux_test"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+
+  mariadb:
+    image: mariadb:10.11@sha256:d769e37960821dfdcf096954f6e7ac89f747e116c1bba98e48edd265dfc7deae
+    container_name: dendrux-test-mariadb
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_nopad_bin
+    environment:
+      MARIADB_ROOT_PASSWORD: dendrux_test
+    ports:
+      - "127.0.0.1:53307:3306"
+    mem_limit: 1g
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 3s
+      timeout: 3s
+      retries: 40

@@ -16,7 +16,7 @@ Build the store when a worker starts and pass it to every `Agent` that worker se
 ```python
 from sqlalchemy.ext.asyncio import create_async_engine
 from dendrux import Agent
-from dendrux.runtime.state import SQLAlchemyStateStore
+from dendrux.store import PostgresStateStore
 from dendrux.store import RunStore
 
 engine = create_async_engine(
@@ -27,7 +27,7 @@ engine = create_async_engine(
     pool_pre_ping=True,
     pool_recycle=1800,
 )
-state = SQLAlchemyStateStore(engine)
+state = PostgresStateStore(engine)
 reads = RunStore.from_engine(engine)
 agent = Agent(
     name="worker",
@@ -41,7 +41,7 @@ await reads.close()
 await engine.dispose()
 ```
 
-`SQLAlchemyStateStore` runs the agents; `RunStore.from_engine` supplies the read facade over the same engine. You keep ownership of the engine and dispose it after all work and readers have stopped. Avoid holding a database session while you await an agent run, a tool or a browser.
+The store runs the agents (`PostgresStateStore` here; `MySQLStateStore` or `SQLiteStateStore` the same way, or `store_for_engine(engine)` to pick one from the engine); `RunStore.from_engine` supplies the read facade over the same engine. You keep ownership of the engine and dispose it after all work and readers have stopped. Avoid holding a database session while you await an agent run, a tool or a browser.
 
 Build the engine in the worker process, after any fork, on the event loop that will use it. Async Postgres pools belong to their creating loop; using one from another loop is refused with a clear error. Build one store per worker loop instead of calling `asyncio.run` per request. See also [Web endpoints](/docs/recipes/web-endpoint).
 
@@ -56,7 +56,7 @@ An `Agent(database_url=...)` with the same normalised URL and the same `database
 - A pool whose owning event loop has closed is retired lazily on the next matching acquisition or release. Orphaned connections are released by garbage collection, so they can linger until then and briefly exceed the new pool's limits. Each retirement logs one WARNING with `code=shared_engine_loop_closed`, without a URL or credentials. No timer or background task is involved: await `agent.close()` before you close the loop for prompt cleanup.
 - At process exit pools are retired synchronously and the operating system closes the sockets.
 
-This stops a per-message Agent from opening a new pool each time, but an explicit `state_store=` stays the recommended path: you choose the pool size and you see the lifecycle. The `DENDRUX_DATABASE_URL` environment fallback (an `Agent` with neither `state_store=` nor `database_url=`) still works in 0.5 and warns; it owns one shared reference until `reset_engine()` or process exit, and it is removed in 0.6. A store created by `RunStore.from_database_url` owns its engine and must also be closed.
+This stops a per-message Agent from opening a new pool each time, but an explicit `state_store=` stays the recommended path: you choose the pool size and you see the lifecycle. The Agent ignores `DENDRUX_DATABASE_URL`. If it is set and no effective store is supplied, run and stream have no persistence and log `database_url_env_ignored` once per process, without raising just because the variable is set. A returned pause cannot be submitted later without persistence. Pass `state_store=` or `database_url=` explicitly; the CLI still uses the variable. A store created by `RunStore.from_database_url` owns its engine and must also be closed.
 
 ## Pool sizing per worker
 
@@ -64,7 +64,7 @@ Each worker process has its own pools. Add `pool_size + max_overflow` across eve
 
 ## Managed database idle timeouts
 
-For non-SQLite URLs Dendrux defaults `pool_pre_ping` to `True` and `pool_recycle` to 1800 seconds. Pre-ping checks a connection at checkout and replaces a disconnected idle one; recycling replaces old connections at checkout. Pick a recycle interval shorter than your managed database's or proxy's idle cutoff. `database_options=` overrides either setting on `Agent`, `RunStore.from_database_url`, `sweep` and the environment engine.
+For non-SQLite URLs Dendrux defaults `pool_pre_ping` to `True` and `pool_recycle` to 1800 seconds. Pre-ping checks a connection at checkout and replaces a disconnected idle one; recycling replaces old connections at checkout. Pick a recycle interval shorter than your managed database's or proxy's idle cutoff. `database_options=` overrides either setting on `Agent`, `RunStore.from_database_url` and `sweep`.
 
 Pre-ping cannot recover a transaction killed while it is executing. Dendrux retries persistence writes where that is safe; tools with external side effects still need their own idempotency. Apply database timeouts and monitor failures instead of retrying a whole run blindly. A failed database operation inside a run ends it with `error_info.category == "persistence_error"` and a fixed message that carries no SQL, parameters or driver text; engines Dendrux creates hide bound parameters.
 
@@ -85,11 +85,11 @@ options = dict(
 )
 ```
 
-Pass these as `database_options=` (or as keyword arguments to `create_async_engine`). Migrations are the exception; see the next section.
+Pass these as `database_options=` (or as keyword arguments to `create_async_engine`). Migrations, activation and LISTEN need separate connections. Never send `listen_url` through a transaction pool, even if the notifier's startup self-test passes.
 
 ## Migrations: one job, direct connection
 
-Run `dendrux db migrate` **once per deploy, as a single job**, over a **direct** Postgres connection (not through PgBouncer, and not from every pod at startup). Run it before you start 0.5 workers. A second concurrent runner refuses with a retry message instead of racing.
+Run `dendrux db migrate` **once per deploy, as a single job**, over a **direct** Postgres connection (not through PgBouncer, and not from every pod at startup). Run it before starting the new workers. A second concurrent runner refuses with a retry message instead of racing.
 
 - The migration uses session-level locks and `lock_timeout` settings, which is why it needs a direct session connection.
 - Short exclusive steps wait at most 5 seconds for each lock and then fail with a retry message. Finish the long-running transaction that blocked it and run the job again. The index builds run concurrently and a timed-out build is repaired on the retry. The 5 second budget is fixed; schedule the job in a quiet window.
@@ -97,17 +97,67 @@ Run `dendrux db migrate` **once per deploy, as a single job**, over a **direct**
 - `dendrux db check` compares the database with this version's head without changing anything (exit 0 current, 1 behind, 2 unknown). A non-SQLite database that was not migrated fails at startup with `SchemaOutOfDateError`.
 - Do not start abandoned-waiting sweeps until the migration has finished.
 
-The revision list and rollback notes are on [Upgrading to 0.5.0](/docs/upgrading-to-0.5.0).
+For 0.6, migration is additive and leaves format 1 enabled. Roll every worker and read-only consumer, take a pre-activation backup, then run `dendrux db activate` over a direct connection. Only then enable reclaim and notifications. Activation is one-way. See [Upgrading to 0.6.0](/docs/upgrading-to-0.6.0) and the [Database CLI](/docs/reference/cli).
+
+## MySQL and MariaDB
+
+The same rules apply: one store per worker, bounded pools and one migration job. The differences are in [MySQL and MariaDB](/docs/guides/mysql): engines need `READ COMMITTED` and a UTC connection (engines Dendrux creates set both), `dendrux db migrate` is forward-only and holds a server-wide named lock, the Agent's `Limits` are compared with the server's `max_allowed_packet` before first use, and event notifications are Postgres-only, so `follow` polls.
 
 ## Sweep cadence
 
 `sweep()` finds stale `running` rows and abandoned waiting rows. Call it from your own maintenance job, at startup and at an interval that suits the application; Dendrux never schedules it.
 
-- Set `stale_running` beyond the longest legitimate gap between progress updates (model calls and tools). A long-running tool can call `heartbeat()` to report progress; progress writes only touch `running` rows, so a stuck tool thread cannot keep a paused or finished run alive.
-- `max_runs` (default 10,000, ceiling 100,000) bounds how many candidates one call inspects **per category**, and `batch_size` (default 100, ceiling 1,000) sets the page size. Fresh `running` rows and compare-and-swap attempts that lose a race count against the bound. When a category hits its bound, Dendrux logs a structured `sweep_cap_reached` warning with the category, the cap and the number inspected. The return value has no "more results" flag and there is no cursor, so a short result does not prove the backlog is empty: repeat the call, or raise `max_runs`.
+- Set `stale_running` at least three times `Agent.lease_interval` (default 30 seconds, minimum 5 seconds), with room for database latency and event-loop stalls. Lease renewals run while a model or tool call is in flight; they stop when that call scope closes. A tool can also call `heartbeat()` to report progress. Progress writes only touch `running` rows under the current epoch.
+- Choose `on_stale="error"` to finalize stale runs, or `"reclaim"` to mark eligible format-2 ReAct runs for your own dispatcher. Omission retains error finalization in 0.6 and warns when stale rows are found. Dendrux never dispatches marked runs itself.
+- `max_runs` (default 10,000, ceiling 100,000) bounds how many candidates one call inspects **per category**, and `batch_size` (default 100, ceiling 1,000) sets the page size. Fresh `running` rows and compare-and-swap attempts that lose a race count against the bound. `max_returned` (default 1,000, ceiling 100,000) bounds returned reclaimable items. Continue the running scan with `SweepResult.cursor` until it is `None`; a scan never wraps. Repeat from the beginning on a later sweep. Waiting scans have no cursor; repeat calls to drain them. A short result does not prove the backlog is empty.
 - A waiting run is abandoned only when **both** its last status change (`status_changed_at`) and `updated_at` are older than `abandoned_waiting`. The second check protects pauses written by 0.4.1 workers during a rolling deploy; a recent metadata edit delays abandonment by one window.
 - Swept waiting rows get the safe error `Run swept as abandoned_waiting` together with `failure_reason`.
 - Candidate scans use indexes on status and transition time. Heartbeat timestamps are not indexed, so progress writes stay eligible for Postgres HOT updates.
+
+See [Recovery](/docs/guides/recovery) for attempt limits, recovery approval and bounded dispatch.
+
+## Event notifications
+
+Postgres notifications are optional wake hints. Durable event rows remain the source of truth. Writers default to `notify_channel=None`, so ordinary writes issue no NOTIFY. With a healthy listener, events from a writer that leaves the channel off may wait until the next `poll_healthy_s` check (30 seconds by default); `notifier_missed_hint` flags this. Enable the channel on every writer:
+
+[//]: # "docs-test: skip - application supplies its shared engine and Postgres deployment"
+
+```python
+from dendrux.store import PostgresStateStore
+
+state = PostgresStateStore(engine, notify_channel="dendrux_events")
+# The Agent(database_url=...) form uses:
+# database_options={"notify_channel": "dendrux_events"}
+```
+
+Readers opt in separately. The database URL used for event reads may use transaction pooling. `listen_url` must connect to the **primary**, through a direct or session-pooled endpoint:
+
+[//]: # "docs-test: skip - requires configured Postgres reader and primary listener endpoints"
+
+```python
+from dendrux.store import RunStore
+
+async with RunStore.from_database_url(
+    reader_url,
+    database_options={"notify_channel": "dendrux_events"},
+    listen_url=primary_listen_url,
+) as reads:
+    async with reads.follow(run_id, tenant_id=tenant) as follow:
+        async for event in follow:
+            await send(event)
+```
+
+`RunStore` owns this listener and closes it with the store. `listen_url=` uses the configured channel or defaults to `dendrux_events`; explicitly setting the channel to `None` with `listen_url` raises `ValueError`. To share a listener or change its limits, start a `PostgresEventNotifier` yourself and pass `notifier=` to `RunStore.from_engine` or `from_database_url`. That notifier is borrowed: the application starts and stops it on the same event loop. `listen_url=` and `notifier=` are mutually exclusive. Reader settings do not enable writer notifications.
+
+Healthy `follow` feeds reconcile every `poll_healthy_s` (default 30 seconds) and wake sooner on hints. On listener loss, they start at `poll_interval_s` (default 0.5 seconds) and back off while idle up to `poll_max_s`. Health-generation changes jitter the first fetch by up to `poll_interval_s`. An empty wake gets one retry at `poll_interval_s`, which helps when event reads use a replica. `stream_events` also uses hints, but keeps its own `poll_interval_s` rather than stretching to the healthy interval.
+
+The built-in listener defaults to 10,000 subscriptions. It checks connection health every 15 seconds with a 5-second deadline, reconnects with bounded backoff and wakes feeds on health changes. If an owned listener cannot start, reads fall back to polling. See [alert codes](/docs/recipes/observability#what-to-alert-on).
+
+### Cost of NOTIFY
+
+Each transaction that sends a NOTIFY takes one database-wide lock at commit. A local 50-writer probe measured about 45% lower write throughput with notifications enabled. Measure your own event rate and write workload before enabling them; this probe is not a capacity guarantee.
+
+A stuck listener can fill Postgres's notification queue, after which notifying writes fail at commit. Monitor `pg_notification_queue_usage()` and investigate sustained growth before the queue fills. Every listener process receives **every notification on its channel**, including run ids it does not watch. Its callback work therefore follows the database's channel event rate, not just its local subscriptions. Payloads contain run ids only.
 
 ## Live readers and bounded work
 
@@ -138,3 +188,36 @@ Read replicas are your deployment choice. Keep claims, tool submissions, cancell
 ## Browser results
 
 `RunResult.to_dict()`, `Agent.get_result()` and `ToolResult.from_dict()` are the allowlisted shapes that cross to a browser. They are described on the [Agent reference](/docs/reference/agent#runresult), and the redaction rules for readers are on the [RunStore reference](/docs/reference/run-store#redacted-views).
+
+## Load testing your deployment
+
+The repository includes a monitored load harness, `tools/load.py`. It builds a private database, runs fake-provider agents across several processes, and records statements per run, timings and resource samples (process memory, descriptors, tasks, pool use and, where the platform allows, database and container counters). It repeats each workload for four cycles and fails if memory, descriptors, tasks or connections keep growing between cycles. Run it on a quiet machine from `packages/python`, with the development dependencies installed.
+
+The harness drops and recreates the tables of the database you give it, so it accepts only private databases whose name ends in `_test`. For MySQL and MariaDB the name must also contain `_load_`, the host must be loopback and the port 53306 or 53307 (the repository's test servers), unless you opt in to another port with `--allow-port`.
+
+```bash
+# Postgres: the 1,000-run scenario on a private database ending in _test
+export DENDRUX_LOAD_PG_URL=postgresql+asyncpg://user:password@localhost:5432/dendrux_load_test
+make load-pg
+
+# MySQL and MariaDB: start the test servers first; the ceilings are in tools/load_budgets_mysql.json
+make test-dbs-up
+make load-mysql
+make load-mariadb
+```
+
+`make load-quick` runs every scenario at small scale and fails on a statement-count regression against `tools/load_baseline.json` (Postgres only); `make load` is the full run. MySQL and MariaDB have no stored baseline, so the ceilings are declared before measuring: `tools/load_budgets_mysql.json` maps each gate to a number (`runs.statements_per_run` is 50; the 0.6 runs measured about 47). The targets use it by default; pass `LOAD_STATEMENT_BUDGETS=path` to use your own file. Results are written as JSON to `LOAD_JSON` (default: `dendrux-load-results.json` in your temporary directory) with a compact Markdown table. Workloads that need Postgres NOTIFY are skipped on MySQL and MariaDB, with a note.
+
+## What we measured
+
+> **Coordinator to fill before release.** Add results from the 0.6 load run under these headings. No capacity claim is made here yet.
+
+### Environment and workload
+
+### Write throughput and statement counts
+
+### Follow latency and notifier cost
+
+### Recovery and reclaim
+
+### Reproducing the run

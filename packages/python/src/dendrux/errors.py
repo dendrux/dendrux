@@ -55,9 +55,12 @@ paths/queries/credentials, and are raised with no ``__cause__`` and no
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, TypeAlias, get_args
+
+from dendrux import _codes
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -102,7 +105,81 @@ class RunNotFoundError(_KwargsReduceMixin, LookupError):
         super().__init__(f"Run '{run_id}' not found.")
 
 
-class RunNotPausedError(RuntimeError):
+class StoreCapabilityError(TypeError):
+    """A declared store capability does not match the implementation."""
+
+    def __init__(self, store: str, capability: str, method: str, missing: tuple[str, ...]) -> None:
+        self.store = store
+        self.capability = capability
+        self.method = method
+        self.missing = missing
+        super().__init__(
+            f"StateStore {store} capability '{capability}': {method} lacks {missing!r}."
+        )
+
+
+class RunControlError(RuntimeError):
+    """Base for conflicts while controlling a persisted run."""
+
+
+def _restore_logged_control_error(cls: Any, args: tuple[Any, ...], state: dict[str, Any]) -> Any:
+    """Deserialize an existing failure without firing its construction log again."""
+    error = cls.__new__(cls)
+    RuntimeError.__init__(error, *args)
+    error.__dict__.update(state)
+    return error
+
+
+class RunNotReclaimableError(_KwargsReduceMixin, RunControlError):
+    """A run does not satisfy the ordered recovery preconditions.
+
+    ``reason`` is one of ``legacy_run``, ``store_capability``, ``not_running``,
+    ``lease_fresh``, ``already_reclaimed``, ``reclaim_limit``, ``agent_mismatch``,
+    ``skill_mismatch``, ``loop_unsupported``, ``history_too_large``, ``cancelled``
+    (cancellation won), ``loop_unknown`` (missing or unrecognized checkpoint loop),
+    ``recovery_call_missing``, ``recovery_state_missing``, ``recovery_state_invalid``,
+    or ``governance_changed`` (the recovery governance fingerprint differs).
+    """
+
+    _init_fields = ("run_id", "reason")
+
+    def __reduce__(self) -> Any:
+        return _restore_logged_control_error, (type(self), self.args, self.__dict__)
+
+    def __init__(self, run_id: str, reason: str) -> None:
+        self.run_id = run_id
+        self.reason = reason
+        _codes.log_code(
+            logging.getLogger(__name__), _codes.RUN_NOT_RECLAIMABLE, run_id=run_id, reason=reason
+        )
+        super().__init__(f"Run '{run_id}' cannot be reclaimed ({reason}).")
+
+
+class RunCancelledError(_KwargsReduceMixin, RunControlError):
+    """A delegated run was refused by a cancelled or terminal parent."""
+
+    _init_fields = ("run_id", "parent_run_id")
+
+    def __reduce__(self) -> Any:
+        return _restore_logged_control_error, (type(self), self.args, self.__dict__)
+
+    def __init__(self, run_id: str, parent_run_id: str) -> None:
+        self.run_id = run_id
+        self.parent_run_id = parent_run_id
+        _codes.log_code(logging.getLogger(__name__), _codes.RUN_CANCELLED, run_id=run_id)
+        super().__init__(f"Run '{run_id}' cannot start under parent '{parent_run_id}'.")
+
+
+class NotifierUnavailableError(RuntimeError):
+    """The configured notifier could not become ready."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        _codes.log_code(logging.getLogger(__name__), _codes.NOTIFIER_UNAVAILABLE, run_id=None)
+        super().__init__(f"Notifier unavailable ({reason}).")
+
+
+class RunNotPausedError(RunControlError):
     """Raised when a submit method is called on a run that is not paused.
 
     The run is either still executing, already terminal, or in a status
@@ -116,7 +193,7 @@ class RunNotPausedError(RuntimeError):
         super().__init__(f"Run '{run_id}' is not paused (current status: {current_status.value}).")
 
 
-class PauseStatusMismatchError(_KwargsReduceMixin, RuntimeError):
+class PauseStatusMismatchError(_KwargsReduceMixin, RunControlError):
     """Raised when a submit targets the wrong pause.
 
     ``reason="status"``: the run is paused, but not for the kind of signal
@@ -164,7 +241,7 @@ class PauseStatusMismatchError(_KwargsReduceMixin, RuntimeError):
             )
 
 
-class RunAlreadyClaimedError(RuntimeError):
+class RunAlreadyClaimedError(RunControlError):
     """Raised when a concurrent submit has already claimed this pause.
 
     Two submits raced; one won the CAS transition from paused to
@@ -180,7 +257,7 @@ class RunAlreadyClaimedError(RuntimeError):
         )
 
 
-class RunAlreadyTerminalError(RuntimeError):
+class RunAlreadyTerminalError(RunControlError):
     """Raised by submit methods when the run has already reached a terminal state.
 
     :meth:`Agent.cancel_run` does **not** raise this — cancellation on
@@ -215,9 +292,54 @@ class PersistenceError(RuntimeError):
     code = "persistence_error"
     safe_message = "Database operation failed (persistence_error)."
 
-    def __init__(self, *, retryable: bool = False) -> None:
+    def __init__(self, *, retryable: bool = False, code: str = "persistence_error") -> None:
         self.retryable = retryable
+        self.code = code
+        self.safe_message = f"Database operation failed ({code})."
         super().__init__(self.safe_message)
+
+
+class StoreOutcomeUnknown(PersistenceError):  # noqa: N818 - public compatibility name
+    """A commit acknowledgement was lost and the write outcome cannot be proven."""
+
+    code = "store_outcome_unknown"
+
+    def __init__(self) -> None:
+        super().__init__(code=self.code)
+
+
+class StatementTooLargeError(PersistenceError):
+    """The database answered that a statement is larger than ``max_allowed_packet``.
+
+    Raised when MySQL or MariaDB reports error 1153 or 1301. The write is not retried and
+    nothing was persisted. ``limit`` is the server's ``max_allowed_packet`` in bytes when the
+    store knows it, and ``size`` the statement's size when it is known (best effort: usually
+    ``None``, because the server does not report it). Values are never part of the message.
+    Servers often close the connection instead of answering; that surfaces as the ordinary
+    persistence error, not as this class.
+    """
+
+    code = "statement_too_large"
+
+    def __init__(self, limit: int | None = None, size: int | None = None) -> None:
+        super().__init__(code=self.code)
+        self.size = size
+        self.limit = limit
+        self._describe()
+
+    def set_limit(self, limit: int | None) -> None:
+        """Record the server's limit when the raising layer did not know it."""
+        if self.limit is None and limit is not None:
+            self.limit = limit
+            self._describe()
+
+    def _describe(self) -> None:
+        sized = f"A statement of {self.size} bytes" if self.size is not None else "A statement"
+        limit = f" of {self.limit} bytes" if self.limit is not None else ""
+        self.safe_message = (
+            f"{sized} is larger than the server's max_allowed_packet{limit} (statement_too_large)."
+        )
+        self.args = (self.safe_message,)
 
 
 class PersistenceNotConfiguredError(RuntimeError):
@@ -545,7 +667,7 @@ class UnsupportedModalityError(_KwargsReduceMixin, RuntimeError):
         self.origin = origin
         self.source = source
         self.status_code = status_code
-        self.provider_code = provider_code
+        self.provider_code = _provider_code_mapper(provider, provider_code)
         super().__init__(
             f"Model {model!r} on provider {provider!r} does not accept {modality} input "
             f"({image_count} {modality}(s), source={source})."
@@ -587,7 +709,7 @@ class ImageRejectedError(_KwargsReduceMixin, RuntimeError):
         self.located = located
         self.retried = retried
         self.status_code = status_code
-        self.provider_code = provider_code
+        self.provider_code = _provider_code_mapper(provider, provider_code)
         ids = ", ".join(self.image_ids) if self.image_ids else "unlocated"
         super().__init__(
             f"Provider {provider!r} rejected image(s) for model {model!r}: {ids}"
@@ -631,6 +753,10 @@ def _safe_identity(value: str | None) -> str | None:
     if not isinstance(value, str) or not 1 <= len(value) <= 255:
         return None
     return value if re.fullmatch(r"[A-Za-z0-9_.:/@+\-]+", value) else None
+
+
+def _provider_code_mapper(provider: str | None, raw: str | None) -> str | None:
+    return raw
 
 
 class ProviderError(_KwargsReduceMixin, RuntimeError):
@@ -707,18 +833,31 @@ class ProviderError(_KwargsReduceMixin, RuntimeError):
         self.provider = _safe_identity(provider)
         self.model = _safe_identity(model)
         self.status_code = _safe_status_code(status_code)
-        self.provider_code = provider_code
+        self.provider_code_raw = (
+            provider_code
+            if isinstance(provider_code, str) and _SAFE_PROVIDER_CODE.fullmatch(provider_code)
+            else None
+        )
         self.error_type = _safe_identity(error_type)
         self.message = message
         self.category: ProviderErrorCategory = resolved
         self.retryable: bool = self.default_retryable if retryable is None else bool(retryable)
         self.timeout_reason: TimeoutReason | None = timeout_reason
 
+    def __reduce__(self) -> tuple[object, tuple[object, ...]]:
+        fields = {name: getattr(self, name) for name in self._init_fields}
+        fields["provider_code"] = self.provider_code_raw
+        return _rebuild_error, (type(self), fields)
+
+    @property
+    def provider_code(self) -> str | None:
+        """The safe mapped code; the regex-validated vendor code remains private."""
+        return _provider_code_mapper(self.provider, self.provider_code_raw)
+
     @property
     def safe_provider_code(self) -> str | None:
-        """``provider_code`` when it looks like a code (``[A-Za-z0-9_.:-]{1,64}``), else None."""
-        code = self.provider_code
-        return code if isinstance(code, str) and _SAFE_PROVIDER_CODE.fullmatch(code) else None
+        """The same mapped code used by safe result projections."""
+        return self.provider_code
 
     @property
     def safe_message(self) -> str:
@@ -901,6 +1040,7 @@ class ContextLengthExceededError(ProviderError):
 
     def __reduce__(self) -> tuple[object, tuple[object, ...]]:
         kwargs = {name: getattr(self, name) for name in self._init_fields if name != "message"}
+        kwargs["provider_code"] = self.provider_code_raw
         return (_rebuild_context_length_error, (type(self), self.message, kwargs))
 
 
@@ -1012,7 +1152,7 @@ class TenantScopeRequiredError(_KwargsReduceMixin, ValueError):
         self.operation = operation
         super().__init__(
             f"{operation}() requires an explicit tenant_id= because the agent has "
-            "strict_tenancy=True."
+            "strict_tenancy=True. For delegated runs, pass tenant_id on the outer run."
         )
 
 
@@ -1071,6 +1211,13 @@ class RunFencedError(_KwargsReduceMixin, RuntimeError):
 
 
 __all__ = [
+    "StoreOutcomeUnknown",
+    "StatementTooLargeError",
+    "NotifierUnavailableError",
+    "StoreCapabilityError",
+    "RunCancelledError",
+    "RunNotReclaimableError",
+    "RunControlError",
     "BlobContentionError",
     "BlobIntegrityError",
     "BlobNotFoundError",

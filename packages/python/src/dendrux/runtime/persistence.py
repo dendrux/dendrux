@@ -25,13 +25,21 @@ LoopRecorder protocol so third-party recorders can subscribe.
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import inspect
+import json
 import logging
+from bisect import insort
+from copy import deepcopy
+from dataclasses import asdict, dataclass, replace
 from typing import TYPE_CHECKING, Any
 
-from dendrux.errors import ImagePersistenceUnsupportedError, safe_exception_info
+from dendrux import _codes
+from dendrux.errors import ImagePersistenceUnsupportedError, RunFencedError, safe_exception_info
 from dendrux.loops.base import BaseRecorder
 from dendrux.runtime._blob_catalog import edges_for_parts, scrub_inline_images
+from dendrux.runtime._capabilities import capabilities
 from dendrux.runtime.durability import retry_critical, retry_transient_db
 from dendrux.types import (
     ImagePart,
@@ -43,7 +51,9 @@ from dendrux.types import (
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+    from contextlib import AbstractAsyncContextManager
 
+    from dendrux.guardrails import GuardrailEngine
     from dendrux.media import BlobEdge
     from dendrux.runtime.state import StateStore
     from dendrux.types import LLMResponse, Message, ToolCall, ToolDef, ToolResult, ToolTarget
@@ -151,6 +161,84 @@ def image_stats(
     }
 
 
+def message_trace(
+    message: Message,
+    order: int,
+    *,
+    kind: str = "turn",
+    tenant_scope: str | None = None,
+) -> Any:
+    """A lossless conversation envelope, with content stored only once."""
+    from dendrux.runtime.state import TraceWrite
+    from dendrux.types import _message_to_dict
+
+    envelope = _message_to_dict(message)
+    envelope.pop("content", None)
+    meta = dict(message.meta)
+    meta["dendrux.message"] = envelope
+    if message.tool_calls:
+        meta["tool_calls"] = [_tool_call_evidence(tc) for tc in message.tool_calls]
+    if message.reasoning_blocks:
+        meta["reasoning_blocks"] = message.reasoning_blocks
+    if message.call_id:
+        meta["call_id"] = message.call_id
+    if message.name:
+        meta["tool_name"] = message.name
+    if message.parts is not None:
+        meta[PARTS_META_KEY] = [content_part_to_dict(p) for p in message.parts]
+    edges = (
+        edges_for_parts(tenant_scope, "trace", str(order), meta.get(PARTS_META_KEY) or [])
+        if tenant_scope
+        else []
+    )
+    return TraceWrite(
+        generate_ulid(),
+        message.role.value,
+        message.content,
+        order,
+        trace_kind=kind,
+        meta=meta,
+        blob_refs=edges or None,
+        blob_refs_scope=tenant_scope if edges else None,
+    )
+
+
+def seed_trace_kwargs(
+    store: StateStore,
+    messages: list[Message],
+    *,
+    tenant_scope: str | None = None,
+    own_input: Message | None = None,
+) -> dict[str, Any]:
+    """Only declared checkpoint stores receive the additive create argument."""
+    if not capabilities(store).checkpointing:
+        return {}
+    traces = [
+        message_trace(m, i, kind="seed", tenant_scope=tenant_scope) for i, m in enumerate(messages)
+    ]
+    own_index = max((i for i, m in enumerate(messages) if m.role.value == "user"), default=-1)
+    for i, trace in enumerate(traces):
+        trace.meta["dendrux.seed_prefix"] = i < own_index
+        if i == own_index and own_input is not None:
+            traces[i] = replace(
+                trace, content=own_input.content, meta={**trace.meta, **own_input.meta}
+            )
+    return {"seed_traces": traces}
+
+
+def _view_identity(entry: dict[str, Any]) -> str:
+    meta = entry.get("meta") or {}
+    value = json.dumps(
+        {
+            "role": entry["role"],
+            "content": meta.get("wire_content", entry["content"]),
+            "message": meta.get("dendrux.message", meta),
+        },
+        sort_keys=True,
+    )
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
 class PersistenceRecorder(BaseRecorder):
     """Authoritative evidence recorder — writes loop events to StateStore.
 
@@ -184,6 +272,8 @@ class PersistenceRecorder(BaseRecorder):
         initial_order_index: int = 0,
         tenant_scope: str | None = None,
         provider: Any | None = None,
+        seed_traces: Any = None,
+        guardrail_engine: GuardrailEngine | None = None,
     ) -> None:
         self._store = state_store
         self._tenant_scope = tenant_scope
@@ -192,7 +282,464 @@ class PersistenceRecorder(BaseRecorder):
         self._model = model
         self._provider_name = provider_name
         self._target_lookup = target_lookup or {}
-        self._order_index = initial_order_index
+        self._format2 = (
+            getattr(state_store, "storage_format", 1) == 2
+            and capabilities(state_store).checkpointing
+        )
+        self._order_index = (
+            len(seed_traces) if self._format2 and seed_traces else initial_order_index
+        )
+        self.guardrail_engine = guardrail_engine if self._format2 else None
+        self._projected_observations: dict[str, Message] = {}
+        self._observation_lock = asyncio.Lock()
+        self._loop_source: Any = None
+        self._loop_state: dict[str, Any] = deepcopy(getattr(state_store, "loop_state", None) or {})
+        self._known_history: list[tuple[int, str]] = []
+        self._system_messages: list[Message] = []
+        for trace in seed_traces or [] if self._format2 else []:
+            self._remember(trace)
+        self._state_payloads: dict[str, str] = {}
+        self._seed_input_pending = any(t.role == "user" for t in seed_traces or [])
+        self._durable_state = deepcopy(self._loop_state)
+        self._started_calls: set[str] = set()
+        self._replay_calls: set[str] = set()
+        self._replayed_calls: set[str] = set()
+        self._completed_observations: set[str] = set()
+        self._tool_idempotent: dict[str, bool] = {}
+        self._result_formatter: Any = None
+        self._consumed_user_count = 0
+        self._final_trace: Any = None
+        self._resume_pause_data: dict[str, Any] | None = None
+
+    async def restore_history(self, *, limits: Any, records: Any = None) -> None:
+        if not self._format2:
+            return
+        from dendrux.runtime.replay import conversation_records
+
+        if records is None:
+            records = await conversation_records(self._store, self._run_id, limits=limits)
+        self._known_history.clear()
+        self._system_messages.clear()
+        for trace in records:
+            self._remember(trace, position=trace.order_index)
+
+    def _remember(self, trace: Any, *, position: int | None = None) -> None:
+        from dendrux.types import Message, Role
+
+        insort(
+            self._known_history,
+            (
+                trace.order_index * 1000 if position is None else position,
+                _view_identity({"role": trace.role, "content": trace.content, "meta": trace.meta}),
+            ),
+        )
+        if trace.role == "system":
+            self._system_messages.append(Message(role=Role.SYSTEM, content=trace.content))
+
+    def _mapping(self) -> dict[str, str] | None:
+        if self.guardrail_engine is not None:
+            return self.guardrail_engine.get_pii_mapping()
+        return self._loop_source()["pii_mapping"] if self._loop_source else None
+
+    def _pii_patch(self) -> dict[str, Any]:
+        if self.guardrail_engine is None:
+            return {}
+        return {
+            "pii": {
+                "mapping_version": len(self._mapping() or {}),
+                "counters": dict(self.guardrail_engine._counters),
+            }
+        }
+
+    def bind_loop(self, source: Any, budget: Any) -> None:
+        """Bind live loop data without making loops depend on runtime internals."""
+        if not self._format2:
+            return
+        self._loop_source = source
+        live = source()
+        from dendrux.types import _validate_provider_kwargs
+
+        _validate_provider_kwargs(live.get("provider_kwargs", {}), run_id=self._run_id)
+        self._tool_idempotent = live.get("idempotent", {})
+        self._result_formatter = live.get("format_result")
+        for target, saved_value in (
+            (live["tool_counts"], self._loop_state.get("tool_counts")),
+            (live["pii_counters"], self._loop_state.get("pii", {}).get("counters")),
+        ):
+            if saved_value is not None:
+                if target is live["pii_counters"]:
+                    for key, value in saved_value.items():
+                        target[key] = max(target.get(key, 0), value)
+                else:
+                    target.clear()
+                    target.update(saved_value)
+        saved = self._loop_state.get("budget")
+        if saved:
+            from dendrux.loops._budget import BudgetState
+
+            resumed = budget.snapshot()
+            restored = BudgetState(**saved)
+            if resumed.gate:
+                restored = replace(
+                    restored,
+                    gate=resumed.gate,
+                    accepted_unpriced_baseline=max(
+                        restored.accepted_unpriced_baseline,
+                        resumed.accepted_unpriced_baseline,
+                    ),
+                )
+            budget.restore(restored)
+
+    async def _state_ref(self, kind: str, payload: dict[str, Any]) -> str | None:
+        from dendrux.runtime.state import TraceWrite
+
+        content = json.dumps(
+            {"kind": kind, "v": 1, **payload},
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        field = "session_ref" if kind == "skills_session" else kind + "_ref"
+        refs = (
+            self._loop_state.setdefault("skills", {})
+            if kind == "skills_session"
+            else self._loop_state
+        )
+        if kind not in self._state_payloads and refs.get(field):
+            from dendrux.errors import PersistenceError
+
+            saved = await self._store.get_trace(self._run_id, refs[field])
+            try:
+                if saved is None or saved.trace_kind != "state" or saved.role != "state":
+                    raise ValueError("Missing state evidence")
+                value = json.loads(saved.content)
+                if (
+                    not isinstance(value, dict)
+                    or value.get("kind") != kind
+                    or type(value.get("v")) is not int
+                    or value["v"] != 1
+                ):
+                    raise ValueError("Unsupported state evidence")
+                self._state_payloads[kind] = json.dumps(
+                    value, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+                )
+            except (TypeError, ValueError):
+                raise PersistenceError(code="pause_format_unsupported") from None
+        if self._state_payloads.get(kind) == content:
+            return refs.get(field)
+        trace = TraceWrite(
+            generate_ulid(),
+            "state",
+            content,
+            self._order_index,
+            trace_kind="state",
+            meta={"state_kind": kind},
+        )
+        self._order_index += 1
+        refs[field] = trace.trace_id
+        self._state_payloads[kind] = content
+
+        async def write_state() -> None:
+            await self._store.save_trace(
+                self._run_id,
+                "state",
+                content,
+                order_index=trace.order_index,
+                meta=trace.meta,
+                trace_id=trace.trace_id,
+                trace_kind="state",
+            )
+
+        await retry_critical(write_state, label="state_trace", run_id=self._run_id)
+        return trace.trace_id
+
+    async def _snapshot(self, iteration: int) -> None:
+        from dendrux.skills._session import current
+        from dendrux.types import _usage_to_dict
+
+        if self._loop_source is None:
+            return
+        data = self._loop_source()
+        budget = asdict(data["budget"].snapshot())
+        usage = _usage_to_dict(data["usage"])
+        usage.update(
+            priced_subtotal_usd=budget["known_cost_usd"], unpriced_calls=budget["unpriced_calls"]
+        )
+        self._loop_state.update(
+            v=1,
+            loop=data.get("loop", "react"),
+            iteration=iteration,
+            steps_count=len(data["steps"]),
+            usage=usage,
+            budget=budget,
+            tool_counts={
+                k: v for k, v in data["tool_counts"].items() if k in data["declared_tools"]
+            },
+            pii={
+                "mapping_version": len(data["pii_mapping"] or {}),
+                "counters": dict(data["pii_counters"]),
+            },
+            provider_kwargs=dict(data["provider_kwargs"]),
+        )
+        for key, default in (
+            ("pending", []),
+            ("submission", None),
+            ("image_view_ref", None),
+            ("clarification_ref", None),
+            ("phase", "model_next"),
+        ):
+            self._loop_state.setdefault(key, default)
+        self._loop_state.setdefault("skills", {"session_ref": None, "pins": {}})
+        session = current()
+        if session is not None and session.configured:
+            self._loop_state["skills"]["pins"] = {
+                s.name: s.digest for s in session.available.values()
+            }
+            await self._state_ref("skills_session", session.snapshot())
+        image_view = data["image_view"].to_dict()
+        if data["has_images"] or self._loop_state.get("image_view_ref"):
+            await self._state_ref("image_view", image_view)
+
+    async def _checkpoint(self, trace: Any = None) -> None:
+        self._loop_state["trace_order_offset"] = self._order_index
+        mapping = self._mapping()
+        snapshot = deepcopy(self._loop_state)
+
+        async def write() -> None:
+            await self._store.checkpoint_step(
+                self._run_id,
+                claim_epoch=getattr(self._store, "claim_epoch", 0),
+                loop_state=snapshot,
+                pii_mapping=mapping,
+                trace=trace,
+            )
+
+        await retry_critical(write, label="checkpoint_step", run_id=self._run_id)
+        self._durable_state = snapshot
+
+    def finalization_trace(self) -> Any:
+        """Return the caller-owned final trace for the atomic terminal transaction."""
+        return self._final_trace
+
+    def execution_counts(self) -> dict[str, int] | None:
+        """Return checkpoint counters even when history has been compacted."""
+        return dict(self._loop_state.get("tool_counts", {})) if self._format2 else None
+
+    def configure_tools(self, definitions: list[ToolDef]) -> None:
+        """Load trusted execution hints before a direct approval-resume dispatch."""
+        self._tool_idempotent = {d.name: d.idempotent for d in definitions}
+
+    async def consume_resume(self, messages: list[Message]) -> None:
+        """Commit submitted observations or an approval decision exactly once."""
+        from dendrux.errors import PersistenceError
+        from dendrux.runtime.state import LoopStatePatch, _apply_loop_patch
+
+        descriptor = self._loop_state.get("submission")
+        if not self._format2 or descriptor is None:
+            return
+        raw = self._resume_pause_data
+        if raw is None:
+            raw = await self._store.get_pause_state(self._run_id) or {}
+        from dendrux.runtime.submit import _submission_payload
+
+        payload = _submission_payload(raw)
+        pending = {p["call_id"]: p for p in self._loop_state.get("pending", [])}
+        phases = {}
+        if descriptor["kind"] == "approval":
+            decisions = {
+                d["call_id"]: d["approved"] for d in payload.get("submitted_decisions", [])
+            }
+            for call_id in descriptor["call_ids"]:
+                call = pending.get(call_id)
+                if call is None or call["phase"] != "gated":
+                    continue
+                if call.get("decision_id") != f"{descriptor['pause_id']}:{call_id}":
+                    _codes.log_code(logger, _codes.SUBMISSION_GENERATION, run_id=self._run_id)
+                    raise PersistenceError(code="submission_generation")
+                phases[call_id] = (
+                    "approved"
+                    if decisions.get(call_id, payload.get("approved")) is True
+                    else "rejected"
+                )
+        traces = []
+        removed = []
+        for i, message in enumerate(messages):
+            call = pending.get(message.call_id or "")
+            order = call["order_index"] if call else descriptor["reserved_order_index"] + i
+            traces.append(message_trace(message, order, tenant_scope=self._tenant_scope))
+            self._order_index = max(self._order_index, order + 1)
+            if message.call_id is not None:
+                removed.append(message.call_id)
+            else:
+                self._consumed_user_count += 1
+        patch = LoopStatePatch(
+            remove_pending=tuple(removed),
+            set_call_phase=phases,
+            set_phase="dispatch" if len(pending) > len(removed) else "model_next",
+            set_fields={"trace_order_offset": self._order_index, **self._pii_patch()},
+        )
+
+        async def consume() -> None:
+            await self._store.consume_submission(
+                self._run_id,
+                claim_epoch=getattr(self._store, "claim_epoch", 0),
+                submission_id=descriptor["submission_id"],
+                traces=traces,
+                patch=patch,
+                **({"pii_mapping": self._mapping()} if self.guardrail_engine else {}),
+            )
+
+        await retry_critical(consume, label="consume_submission", run_id=self._run_id)
+        self._resume_pause_data = None
+        self._loop_state = _apply_loop_patch(self._loop_state, patch)
+        self._loop_state["submission"] = None
+        self._completed_observations.update(removed)
+        for trace in traces:
+            self._remember(trace)
+        self._durable_state = deepcopy(self._loop_state)
+
+    def order_observations(self, history: list[Message]) -> None:
+        """Use reserved call order for each format-2 batch, including resumed batches."""
+        if not self._format2:
+            return
+        order: dict[str, int] = {}
+        start = 0
+        for i, message in enumerate([*history, None]):
+            if message is not None and message.role.value == "tool":
+                continue
+            history[start:i] = sorted(
+                history[start:i], key=lambda m: order.get(m.call_id or "", len(order))
+            )
+            if message is not None and message.tool_calls:
+                order = {tc.id: n for n, tc in enumerate(message.tool_calls)}
+            start = i + 1
+
+    async def checkpoint_view(self, messages: list[Message], iteration: int) -> None:
+        """Persist a changed prefix before its next model call, including edits."""
+        if not self._format2:
+            return
+        from dendrux.runtime.state import TraceWrite
+
+        await self._snapshot(iteration - 1)
+        view = [
+            {"role": t.role, "content": t.content, "meta": t.meta}
+            for t in (message_trace(m, 0) for m in messages)
+        ]
+        self._loop_state["phase"] = "model_next"
+        digests = [_view_identity(entry) for entry in view]
+        if digests != [digest for _, digest in self._known_history]:
+            from dendrux.runtime.replay import conversation_records
+
+            # Only a genuine edit needs the old evidence metadata. The normal
+            # boundary compares compact digests without reading history again.
+            previous = {
+                _view_identity({"role": t.role, "content": t.content, "meta": t.meta}): t.meta
+                for t in await conversation_records(self._store, self._run_id)
+            }
+            for entry, digest in zip(view, digests, strict=True):
+                entry["meta"] = {**(previous.get(digest) or {}), **entry["meta"]}
+            trace = TraceWrite(
+                generate_ulid(),
+                "rewrite",
+                json.dumps(view, ensure_ascii=False),
+                self._order_index,
+                trace_kind="rewrite",
+            )
+            self._order_index += 1
+            await self._checkpoint(trace)
+            self._known_history = [
+                (trace.order_index * 1000 + i, digest) for i, digest in enumerate(digests)
+            ]
+            self._system_messages = [m for m in messages if m.role.value == "system"]
+        elif self._loop_state != self._durable_state:
+            await self._checkpoint()
+
+    async def on_llm_call_started(
+        self,
+        run_id: str,
+        iteration: int,
+        *,
+        semantic_messages: list[Message] | None = None,
+        semantic_tools: list[ToolDef] | None = None,
+    ) -> None:
+        if self._format2 and self._loop_source is not None:
+            await self._snapshot(iteration - 1)
+            if self._loop_state != self._durable_state:
+                await self._checkpoint()
+
+    async def checkpoint_outcome(self, result: Any, provider_kwargs: Any) -> None:
+        """Store pause references and the last execution boundary before releasing ownership."""
+        if not self._format2:
+            return
+        await self._snapshot(result.iteration_count)
+        pause = result.meta.get("pause_state")
+        if pause is not None:
+            if self._final_trace is not None:
+                await self._checkpoint(self._final_trace)
+                self._final_trace = None
+
+            await self.checkpoint_view(
+                [*self._system_messages, *pause.history], result.iteration_count + 1
+            )
+            pause.schema_version = 2
+            pause.loop_state_ref = True
+            pause.provider_kwargs = dict(provider_kwargs or pause.provider_kwargs)
+            if pause.image_view is not None:
+                await self._state_ref("image_view", pause.image_view.to_dict())
+            pause.image_view_ref = self._loop_state.get("image_view_ref")
+            self._loop_state["phase"] = {
+                "waiting_approval": "awaiting_approval",
+                "waiting_client_tool": "awaiting_client",
+                "waiting_human_input": "awaiting_input",
+            }.get(result.status.value, "model_next")
+            gates = pause.approval_gates or {}
+            remaining = {tc.id for tc in pause.pending_tool_calls}
+            self._loop_state["pending"] = [
+                {
+                    **p,
+                    "phase": p["phase"]
+                    if p["phase"] in ("approved", "rejected")
+                    and p["call_id"] in (pause.pending_decisions or {})
+                    else "gated"
+                    if p["call_id"] in gates
+                    else "client"
+                    if p.get("target") == "client"
+                    else p["phase"],
+                    "decision_id": p.get("decision_id")
+                    if p["phase"] in ("approved", "rejected")
+                    and p["call_id"] in (pause.pending_decisions or {})
+                    else f"{pause.pause_id}:{p['call_id']}"
+                    if p["call_id"] in gates
+                    else p.get("decision_id"),
+                }
+                for p in self._loop_state.get("pending", [])
+                if p["call_id"] in remaining
+            ]
+            if result.status.value == "waiting_human_input":
+                await self._state_ref(
+                    "clarification",
+                    {
+                        "v": 1,
+                        "question": result.answer or "",
+                        "pause_message": pause.pause_message,
+                    },
+                )
+        else:
+            self._loop_state["phase"] = "finalizing"
+        await self._checkpoint()
+
+    def check_lease(self) -> None:
+        from dendrux.runtime.context import get_delegation_context
+
+        ctx = get_delegation_context()
+        if ctx is not None and ctx._lease_errors[0] is not None:
+            raise ctx._lease_errors[0]
+
+    def lease_scope(self) -> AbstractAsyncContextManager[None]:
+        """Provide the loop's optional renewal seam from the runtime layer."""
+        from dendrux.runtime.context import lease_scope
+
+        return lease_scope()
 
     def _edge_kwargs(self, edges: list[BlobEdge]) -> dict[str, Any]:
         """``blob_refs`` kwargs for a store write, only when there are edges."""
@@ -215,11 +762,17 @@ class PersistenceRecorder(BaseRecorder):
         iteration: int,
         data: dict[str, Any] | None = None,
         correlation_id: str | None = None,
+        *,
+        event_id: str | None = None,
     ) -> None:
         """Record a durable run event. FAIL-CLOSED with retry.
 
         The store allocates the sequence index in the insert.
         """
+
+        identity: dict[str, Any] = (
+            {"event_id": event_id or generate_ulid()} if capabilities(self._store).retry_ids else {}
+        )
 
         async def _write() -> None:
             from dendrux.runtime.state import validate_event_index, validate_event_writer
@@ -231,6 +784,7 @@ class PersistenceRecorder(BaseRecorder):
                 iteration_index=iteration,
                 correlation_id=correlation_id,
                 data=data,
+                **identity,
             )
             validate_event_index(index)
 
@@ -238,6 +792,86 @@ class PersistenceRecorder(BaseRecorder):
 
     async def on_message_appended(self, run_id: str, message: Message, iteration: int) -> None:
         """Persist a message to react_traces. FAIL-CLOSED."""
+        if self._format2:
+            if message.role.value == "user" and self._consumed_user_count:
+                self._consumed_user_count -= 1
+                return
+            if message.call_id in self._completed_observations:
+                self._completed_observations.remove(message.call_id)
+                return
+            # The runner's seed already includes its input. Resume injections
+            # occur before bind_loop and still need their own trace.
+            if self._seed_input_pending and message.role.value == "user":
+                self._seed_input_pending = False
+                return
+            await self._snapshot(iteration)
+            pending = self._loop_state.setdefault("pending", [])
+            reserved = next((p for p in pending if p["call_id"] == message.call_id), None)
+            order = reserved["order_index"] if reserved is not None else self._order_index
+            trace = message_trace(message, order, tenant_scope=self._tenant_scope)
+            if message.role.value == "assistant" and self._loop_source:
+                from dendrux.types import _step_to_dict
+
+                steps = self._loop_source()["steps"]
+                if steps:
+                    trace.meta["dendrux.step"] = _step_to_dict(steps[-1])
+            if reserved is None:
+                self._order_index += 1
+            else:
+                self._loop_state["pending"] = [
+                    p for p in pending if p["call_id"] != message.call_id
+                ]
+                self._loop_state["phase"] = (
+                    "dispatch" if self._loop_state["pending"] else "model_next"
+                )
+            if message.tool_calls:
+                data = self._loop_source() if self._loop_source else {}
+                targets = data.get("tool_targets", {})
+                gates = data.get("approval_tools", ())
+                denied = data.get("denied_tools", ())
+                self._loop_state["pending"] = [
+                    {
+                        "call_id": tc.id,
+                        "tool": tc.name,
+                        "phase": (
+                            "invalid"
+                            if tc.parse_error or tc.name not in targets or tc.name in denied
+                            else "gated"
+                            if tc.name in gates
+                            else "client"
+                            if targets.get(tc.name) == "client"
+                            else "dispatchable"
+                        ),
+                        "decision_id": None,
+                        "order_index": self._order_index + i,
+                        "target": targets.get(tc.name, "server"),
+                    }
+                    for i, tc in enumerate(message.tool_calls)
+                ]
+                self._order_index += len(message.tool_calls)
+                self._loop_state["phase"] = "dispatch"
+            elif message.role.value == "assistant":
+                from dendrux.types import Clarification
+
+                steps = self._loop_source()["steps"] if self._loop_source else []
+                if steps and isinstance(steps[-1].action, Clarification):
+                    await self._state_ref(
+                        "clarification",
+                        {"v": 1, "question": steps[-1].action.question, "pause_message": None},
+                    )
+                    self._loop_state["phase"] = "awaiting_input"
+                elif capabilities(self._store).atomic_completion:
+                    # A kill before the final transaction leaves model_next:
+                    # no committed final answer exists to finalize from yet.
+                    self._loop_state["phase"] = "model_next"
+                    self._final_trace = trace
+                    await self._checkpoint()
+                    return
+                else:
+                    self._loop_state["phase"] = "finalizing"
+            await self._checkpoint(trace)
+            self._remember(trace)
+            return
         meta = dict(message.meta) if message.meta else {}
         meta["iteration"] = iteration
 
@@ -261,6 +895,10 @@ class PersistenceRecorder(BaseRecorder):
             self._edges("trace", str(order_idx), meta.get(PARTS_META_KEY) or [])
         )
 
+        identity: dict[str, Any] = (
+            {"trace_id": generate_ulid()} if capabilities(self._store).retry_ids else {}
+        )
+
         # FAIL-CLOSED with retry
         async def _write() -> None:
             await self._store.save_trace(
@@ -270,6 +908,7 @@ class PersistenceRecorder(BaseRecorder):
                 order_index=order_idx,
                 meta=meta,
                 **edge_kwargs,
+                **identity,
             )
 
         await retry_critical(_write, label="save_trace", run_id=self._run_id)
@@ -374,6 +1013,8 @@ class PersistenceRecorder(BaseRecorder):
             await retry_transient_db(
                 _write_interaction, label="save_llm_interaction", run_id=self._run_id
             )
+        except RunFencedError:
+            raise
         except Exception:
             logger.warning(
                 "Failed to save llm_interaction for run %s iteration %d",
@@ -412,6 +1053,8 @@ class PersistenceRecorder(BaseRecorder):
             else:
                 # A legacy store cannot safely replay an ambiguous commit.
                 await _write_usage()
+        except RunFencedError:
+            raise
         except Exception:
             logger.warning(
                 "Failed to save usage for run %s iteration %d",
@@ -441,18 +1084,127 @@ class PersistenceRecorder(BaseRecorder):
             correlation_id=interaction_id,
         )
 
+        if self._format2:
+            return  # The preceding fenced event already renewed progress.
+
         # BEST-EFFORT: touch progress for sweep
         try:
             await self._store.touch_progress(self._run_id)
+        except RunFencedError:
+            raise
         except Exception:
             logger.warning(
                 "Failed to touch progress for run %s", self._run_id, exc_info=safe_exception_info()
             )
 
+    async def resolve_observation(self, call_id: str, message: Message | None) -> None:
+        """Resolve a stored result at its reserved position without another effect."""
+        pending = next(p for p in self._loop_state["pending"] if p["call_id"] == call_id)
+        trace = (
+            message_trace(message, pending["order_index"], tenant_scope=self._tenant_scope)
+            if message is not None
+            else None
+        )
+        self._loop_state["pending"] = [
+            p for p in self._loop_state["pending"] if p["call_id"] != call_id
+        ]
+        self._loop_state["phase"] = "dispatch" if self._loop_state["pending"] else "model_next"
+        await self._checkpoint(trace)
+        self._completed_observations.add(call_id)
+        if trace is not None:
+            self._remember(trace)
+
     async def on_tool_started(self, run_id: str, tool_call: ToolCall, iteration: int) -> None:
-        """Touch ``last_progress_at`` at dispatch so a long tool starts fresh. BEST-EFFORT."""
+        """Persist an execution intent before an actual server dispatch."""
+        if self._format2:
+            from dendrux.runtime.state import EventWrite
+
+            pending = next(
+                (p for p in self._loop_state.get("pending", []) if p["call_id"] == tool_call.id),
+                None,
+            )
+            if (
+                pending is not None
+                and pending["phase"] == "gated"
+                and tool_call.id in self._replay_calls
+                and self._tool_idempotent.get(tool_call.name, False)
+            ):
+                # A requested pause carries recovery identity even when replay
+                # itself needs no approval. Ordinary gates run before this hook.
+                pending["phase"] = "dispatchable"
+                pending["decision_id"] = None
+                await self._checkpoint()
+            if pending is None or pending["phase"] not in ("dispatchable", "approved"):
+                from dendrux.errors import PersistenceError
+
+                code = (
+                    "submission_missing"
+                    if pending and pending["phase"] == "gated"
+                    else "persistence_error"
+                )
+                _codes.log_code(logger, _codes.REGISTRY[code], run_id=run_id)
+                raise PersistenceError(code=code)
+            if pending.get("target") == "client":
+                return
+            if pending["phase"] == "approved":
+                # One durable decision authorizes one attempt. A second crash
+                # after this boundary must ask again for a non-idempotent effect.
+                pending["phase"] = "dispatchable"
+                pending["decision_id"] = None
+                await self._checkpoint()
+            if tool_call.id in self._replay_calls:
+                event_id = generate_ulid()
+
+                async def replay_event() -> None:
+                    await self._store.save_run_event(
+                        run_id,
+                        event_type="tool.replayed",
+                        iteration_index=iteration,
+                        data={"call_id": tool_call.id},
+                        correlation_id=tool_call.id,
+                        event_id=event_id,
+                    )
+
+                await retry_critical(replay_event, label="tool_replayed", run_id=run_id)
+                _codes.log_code(logger, _codes.TOOL_REPLAYED, run_id=run_id)
+                self._replayed_calls.add(tool_call.id)
+                self._started_calls.add(tool_call.id)
+                return
+            identity = generate_ulid()
+            idempotent = self._tool_idempotent.get(tool_call.name, False)
+            event = EventWrite(
+                generate_ulid(),
+                "tool.started",
+                iteration,
+                {"tool_name": tool_call.name, "call_id": tool_call.id, "idempotent": idempotent},
+                tool_call.id,
+                None,
+            )
+
+            async def write_intent() -> None:
+                await self._store.start_tool_call(
+                    run_id,
+                    claim_epoch=getattr(self._store, "claim_epoch", 0),
+                    row_id=identity,
+                    tool_call_id=tool_call.id,
+                    provider_tool_call_id=tool_call.provider_tool_call_id,
+                    tool_name=tool_call.name,
+                    target="server",
+                    params=tool_call.params or None,
+                    iteration_index=iteration,
+                    idempotent=idempotent,
+                    event=event,
+                )
+
+            await retry_critical(write_intent, label="start_tool_call", run_id=run_id)
+            self._started_calls.add(tool_call.id)
+            return
         try:
+            # Legacy progress writes remain cancellable; format-2 intent
+            # durability is handled by the fenced branch above.
             await self._store.touch_progress(self._run_id)
+        except RunFencedError:
+            raise
         except Exception:
             logger.warning(
                 "Failed to touch progress for run %s", self._run_id, exc_info=safe_exception_info()
@@ -483,17 +1235,56 @@ class PersistenceRecorder(BaseRecorder):
                     "duration_ms": duration_ms,
                 },
             )
+        except RunFencedError:
+            raise
         except Exception:
-            logger.warning(
-                "Failed-call evidence unavailable: run_id=%s code=llm_failed_write", self._run_id
-            )
+            _codes.log_code(logger, _codes.LLM_FAILED_WRITE, run_id=self._run_id)
 
-    async def on_tool_completed(
+    def format_observation(self, result: ToolResult) -> Message:
+        from dendrux.types import tool_result_message
+
+        return (self._result_formatter or tool_result_message)(result)
+
+    def take_observation(self, call_id: str | None) -> Message | None:
+        return self._projected_observations.pop(call_id, None) if call_id else None
+
+    def observation_scope(self) -> AbstractAsyncContextManager[None]:
+        """Serialize loop projection and its atomic observation/mapping write."""
+        return self._observation_lock
+
+    async def on_projected_tool_completed(
         self,
         run_id: str,
         tool_call: ToolCall,
         tool_result: ToolResult,
         iteration: int,
+        observation: Message,
+    ) -> None:
+        # The loop supplies provider form. Serialize full mapping snapshots
+        # with their writes; the recorder never invokes the guardrail engine.
+        await self._complete_observation(
+            run_id, tool_call, tool_result, iteration, observation=observation
+        )
+        self._projected_observations[tool_call.id] = observation
+
+    async def on_tool_completed(
+        self, run_id: str, tool_call: ToolCall, tool_result: ToolResult, iteration: int
+    ) -> None:
+        """Commit an observation with the mapping that produced its placeholders."""
+        if self.guardrail_engine is not None:
+            async with self._observation_lock:
+                await self._complete_observation(run_id, tool_call, tool_result, iteration)
+        else:
+            await self._complete_observation(run_id, tool_call, tool_result, iteration)
+
+    async def _complete_observation(
+        self,
+        run_id: str,
+        tool_call: ToolCall,
+        tool_result: ToolResult,
+        iteration: int,
+        *,
+        observation: Message | None = None,
     ) -> None:
         """Persist tool call record + event."""
         params = tool_call.params if tool_call.params else None
@@ -506,6 +1297,90 @@ class PersistenceRecorder(BaseRecorder):
             meta[IMAGE_NOTES_META_KEY] = list(tool_result.notes)
         extra: dict[str, Any] = {"meta": meta} if meta else {}
         extra.update(self._edge_kwargs(self._edges("tool_call", tool_call.id, images)))
+
+        if self._format2 and tool_call.id in self._started_calls:
+            from dendrux.runtime.state import EventWrite, LoopStatePatch
+
+            pending = next(p for p in self._loop_state["pending"] if p["call_id"] == tool_call.id)
+            message = (
+                observation if observation is not None else self.format_observation(tool_result)
+            )
+            observation_trace = message_trace(
+                message, pending["order_index"], tenant_scope=self._tenant_scope
+            )
+            event = EventWrite(
+                generate_ulid(),
+                "tool.completed",
+                iteration,
+                {
+                    "tool_name": tool_call.name,
+                    "target": target,
+                    "success": tool_result.success,
+                    "duration_ms": tool_result.duration_ms,
+                    **{
+                        k: tool_result.meta[k]
+                        for k in ("code", "zombie_threads")
+                        if k in tool_result.meta
+                    },
+                    **({"image_count": len(images)} if images else {}),
+                },
+                tool_call.id,
+                None,
+            )
+            patch = LoopStatePatch(
+                remove_pending=(tool_call.id,), set_phase="model_next", set_fields=self._pii_patch()
+            )
+            if self.guardrail_engine is not None:
+                extra["pii_mapping"] = self._mapping()
+
+            async def complete() -> None:
+                await self._store.complete_tool_call(
+                    run_id,
+                    claim_epoch=getattr(self._store, "claim_epoch", 0),
+                    tool_call_id=tool_call.id,
+                    outcome=(
+                        "unknown"
+                        if tool_result.meta.get("code")
+                        in ("outcome_unknown", "timeout_outcome_unknown")
+                        else "completed"
+                        if tool_result.success
+                        else "failed"
+                    ),
+                    result_payload=tool_result.payload,
+                    success=tool_result.success,
+                    duration_ms=tool_result.duration_ms,
+                    error_message=tool_result.error,
+                    replayed=tool_call.id in self._replayed_calls,
+                    observation=observation_trace,
+                    event=event,
+                    loop_state_patch=patch,
+                    **extra,
+                )
+
+            await retry_critical(complete, label="complete_tool_call", run_id=run_id)
+            self._loop_state.update(patch.set_fields)
+            self._loop_state["pending"] = [
+                p for p in self._loop_state["pending"] if p["call_id"] != tool_call.id
+            ]
+            self._loop_state["phase"] = "dispatch" if self._loop_state["pending"] else "model_next"
+            counts = self._loop_state.setdefault("tool_counts", {})
+            counts[tool_call.name] = counts.get(tool_call.name, 0) + 1
+            self._completed_observations.add(tool_call.id)
+            self._remember(observation_trace)
+            return
+
+        if capabilities(self._store).retry_ids:
+            extra["row_id"] = generate_ulid()
+
+        if self._format2:
+            # No committed intent: this call was rejected before its effect ran.
+            extra["outcome"] = "failed"
+            from dendrux.types import _message_to_dict
+
+            message = (
+                observation if observation is not None else self.format_observation(tool_result)
+            )
+            extra["meta"] = {**meta, "dendrux.observation": _message_to_dict(message)}
 
         # FAIL-CLOSED with retry: save_tool_call (proof of side effects)
         async def _write_tool() -> None:
@@ -546,9 +1421,14 @@ class PersistenceRecorder(BaseRecorder):
             correlation_id=tool_call.id,
         )
 
+        if self._format2:
+            return  # The preceding fenced event already renewed progress.
+
         # BEST-EFFORT: touch progress for sweep
         try:
             await self._store.touch_progress(self._run_id)
+        except RunFencedError:
+            raise
         except Exception:
             logger.warning(
                 "Failed to touch progress for run %s", self._run_id, exc_info=safe_exception_info()
@@ -564,9 +1444,85 @@ class PersistenceRecorder(BaseRecorder):
         correlation_id: str | None = None,
     ) -> None:
         """Record a governance event. FAIL-CLOSED with retry."""
+        if self._format2 and event_type == "approval.requested":
+            for pending in self._loop_state.get("pending", []):
+                if pending["call_id"] == correlation_id:
+                    pending["phase"] = "gated"
+                    self._loop_state["phase"] = "awaiting_approval"
+                    # Governance runs before server dispatch; no completion is
+                    # outstanding while this checkpoint replaces loop_state.
+                    await self._checkpoint()
+                    break
         await self._emit_event(
             event_type,
             iteration,
             data=data,
             correlation_id=correlation_id,
         )
+
+
+@dataclass(frozen=True)
+class ResolutionAction:
+    """A recovery decision for an unresolved reserved observation.
+
+    Only pending calls are considered: atomic completion removes a call from
+    pending in the same transaction as its observation. Dispatch actions must
+    still go through ordinary validation and governance in the reclaim runner.
+    """
+
+    kind: str
+    call_id: str | None = None
+    order_index: int | None = None
+
+
+def resolve_pending(
+    loop_state: dict[str, Any],
+    tool_rows: Sequence[Any],
+    *,
+    current_idempotent: dict[str, bool] | None = None,
+) -> list[ResolutionAction]:
+    """Decide the next recovery actions without executing or mutating anything."""
+    if loop_state.get("submission") is not None:
+        return [ResolutionAction("consume_submission")]
+
+    def read(row: Any, name: str, default: Any = None) -> Any:
+        return row.get(name, default) if isinstance(row, dict) else getattr(row, name, default)
+
+    rows = {read(row, "tool_call_id"): row for row in tool_rows}
+    actions = []
+    for pending in loop_state.get("pending", []):
+        call_id, phase = pending["call_id"], pending["phase"]
+        row = rows.get(call_id)
+        kind: str | None
+        if phase == "client":
+            kind = "wait_client"
+        elif row is None:
+            kind = {
+                "gated": "approval",
+                "rejected": "resolve",
+                "invalid": "resolve",
+                "approved": "dispatch",
+                "dispatchable": "dispatch",
+            }.get(phase)
+            if kind is None:
+                raise ValueError("Unsupported pending-call phase")
+        elif read(row, "outcome") == "started":
+            kind = (
+                "resolve"
+                if phase == "rejected"
+                else "replay"
+                if phase == "approved"
+                or (
+                    read(row, "idempotent", False)
+                    and (
+                        current_idempotent is None or current_idempotent.get(pending["tool"], False)
+                    )
+                )
+                else "approval_replay"
+            )
+        elif read(row, "outcome") in ("completed", "failed", "unknown"):
+            kind = "observe"
+        else:
+            raise ValueError("Unsupported tool-call outcome")
+        actions.append(ResolutionAction(kind, call_id, pending["order_index"]))
+    return actions

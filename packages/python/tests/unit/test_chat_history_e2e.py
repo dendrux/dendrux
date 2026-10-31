@@ -35,6 +35,7 @@ def _agent(**overrides) -> Agent:
         "tools": [],
     }
     defaults.update(overrides)
+    defaults.setdefault("strict_tenancy", False)
     return Agent(**defaults)
 
 

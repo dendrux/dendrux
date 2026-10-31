@@ -69,6 +69,7 @@ async def _pause(kind: str, store: Any, tenant: str | None) -> Paused:
         tools = [read_range]
     llm = ScriptedLLM([first, LLMResponse(text="done")])
     agent = Agent(
+        strict_tenancy=False,
         provider=llm,
         prompt="Test.",
         tools=tools,
@@ -293,7 +294,13 @@ async def test_none_matches_untenanted_run_only(store, case) -> None:
 
 
 async def test_missing_run_with_scope_is_not_found(store) -> None:
-    agent = Agent(provider=ScriptedLLM([]), prompt="Test.", tools=[read_range], state_store=store)
+    agent = Agent(
+        strict_tenancy=False,
+        provider=ScriptedLLM([]),
+        prompt="Test.",
+        tools=[read_range],
+        state_store=store,
+    )
     result = ToolResult(name="read_range", call_id="x", payload='""')
     calls = [
         agent.submit_tool_results("nope", [result], tenant_id="t1"),

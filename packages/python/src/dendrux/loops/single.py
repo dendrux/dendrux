@@ -28,6 +28,8 @@ from dendrux.loops._helpers import (
     final_stop_reason,
     guardrail_meta,
     interruptible,
+    lease_scope,
+    leased_stream,
     notify_governance,
     notify_llm,
     notify_llm_failed,
@@ -43,12 +45,14 @@ from dendrux.loops._helpers import (
 from dendrux.loops._images import ImageCallSite, control_stop, release_wire
 from dendrux.loops.base import Loop
 from dendrux.loops.react import (
+    _bind_checkpoint,
     _blocked_data,
     _drop_frame_locals,
     _image_block_data,
     _image_policy,
     _incoming_location,
     _interrupted_result,
+    _LoopState,
     _read_control,
 )
 from dendrux.types import (
@@ -188,6 +192,42 @@ async def _record_rejected_call(
     )
 
 
+def _single_checkpoint(
+    recorder: LoopRecorder | None,
+    agent: Agent,
+    strategy: Strategy,
+    run_id: str,
+    history: list[Message],
+    images: ImageCallSite,
+    provider_kwargs: dict[str, Any],
+    engine: GuardrailEngine | None,
+    notifier: LoopNotifier | None,
+    warnings: list[str],
+) -> tuple[_LoopState, BudgetTracker]:
+    state = _LoopState(history, {}, [], UsageStats(), warnings, images.state)
+    budget = BudgetTracker(
+        agent.budget,
+        run_id=run_id,
+        usage=state.usage,
+        recorder=recorder,
+        notifier=notifier,
+        warnings=warnings,
+        enforce=False,
+    )
+    _bind_checkpoint(
+        recorder,
+        state=state,
+        budget=budget,
+        provider_kwargs=provider_kwargs,
+        tool_defs=[],
+        engine=engine,
+        agent=agent,
+        strategy=strategy,
+        loop_type="single_call",
+    )
+    return state, budget
+
+
 class SingleCall(Loop):
     """One LLM call, no tools, no iteration.
 
@@ -287,7 +327,23 @@ class SingleCall(Loop):
         control_reader = _cancel_reader(state_store, resolved_run_id)
 
         # Incoming guardrail — scan all messages
-        g_engine = GuardrailEngine(agent.guardrails) if agent.guardrails else None
+        g_engine = getattr(recorder, "guardrail_engine", None) or (
+            GuardrailEngine(agent.guardrails, pii_mapping=initial_pii_mapping)
+            if agent.guardrails
+            else None
+        )
+        checkpoint_state, checkpoint_budget = _single_checkpoint(
+            recorder,
+            agent,
+            strategy,
+            resolved_run_id,
+            history,
+            images,
+            _pkw,
+            g_engine,
+            notifier,
+            notifier_warnings,
+        )
         if g_engine is not None:
             all_in_findings: list[Any] = []
             _in_was_redacted = False
@@ -428,26 +484,27 @@ class SingleCall(Loop):
                     recorder=recorder,
                     notifier=notifier,
                 ):
-                    if output_type is not None:
-                        from dendrux.llm.structured import structured_complete
+                    async with lease_scope(recorder):
+                        if output_type is not None:
+                            from dendrux.llm.structured import structured_complete
 
-                        response, validated_output = await structured_complete(
-                            provider,
-                            prepared.wire,
-                            output_type,
-                            run_id=resolved_run_id,
-                            cache_key_prefix=cache_key_prefix,
-                            **_pkw,
-                        )
-                    else:
-                        response = await complete_call(
-                            provider,
-                            prepared.wire,
-                            tools=None,
-                            run_id=resolved_run_id,
-                            cache_key_prefix=cache_key_prefix,
-                            **_pkw,
-                        )
+                            response, validated_output = await structured_complete(
+                                provider,
+                                prepared.wire,
+                                output_type,
+                                run_id=resolved_run_id,
+                                cache_key_prefix=cache_key_prefix,
+                                **_pkw,
+                            )
+                        else:
+                            response = await complete_call(
+                                provider,
+                                prepared.wire,
+                                tools=None,
+                                run_id=resolved_run_id,
+                                cache_key_prefix=cache_key_prefix,
+                                **_pkw,
+                            )
 
                     if response.tool_calls:
                         raise RuntimeError(
@@ -663,6 +720,10 @@ class SingleCall(Loop):
             guardrail_findings=images.findings(prepared, _sc_findings),
         )
 
+        usage = _call_usage(response.usage)
+        vars(checkpoint_state.usage).update(vars(usage))
+        checkpoint_budget.add_response(response.usage)
+
         assistant_msg = Message(
             role=Role.ASSISTANT, content=response.text or "", meta={"phase": "final_answer"}
         )
@@ -670,11 +731,7 @@ class SingleCall(Loop):
         await record_message(recorder, resolved_run_id, assistant_msg, 1)
         await notify_message(notifier, resolved_run_id, assistant_msg, 1, notifier_warnings)
 
-        usage = _call_usage(response.usage)
-
-        await _single_call_budget(
-            agent.budget, usage, resolved_run_id, recorder, notifier, notifier_warnings
-        )
+        await checkpoint_budget.evaluate(1)
 
         sc_meta = guardrail_meta(g_engine, notifier_warnings)
         if response.reasoning is not None:
@@ -771,6 +828,18 @@ class SingleCall(Loop):
             resolved_run_id,
             notifier_warnings,
         )
+        checkpoint_state, checkpoint_budget = _single_checkpoint(
+            recorder,
+            agent,
+            strategy,
+            resolved_run_id,
+            history,
+            images,
+            _pkw,
+            None,
+            notifier,
+            notifier_warnings,
+        )
         control_reader = _cancel_reader(state_store, resolved_run_id, interrupt)
 
         if interrupt is not None and interrupt.is_set():
@@ -829,8 +898,9 @@ class SingleCall(Loop):
             while True:
                 failure: Exception | None = None
                 visible_deltas = 0
+                active_stream = leased_stream(interruptible(provider_stream, interrupt), recorder)
                 try:
-                    async for event in interruptible(provider_stream, interrupt):
+                    async for event in active_stream:
                         if event.type == StreamEventType.TEXT_DELTA:
                             partial_text.append(event.text or "")
                             visible_deltas += 1
@@ -950,6 +1020,7 @@ class SingleCall(Loop):
                     notifier=notifier,
                 )
         finally:
+            await active_stream.aclose()
             await provider_stream.aclose()
 
         if cancelled:
@@ -1012,6 +1083,10 @@ class SingleCall(Loop):
             duration_ms=llm_duration_ms,
         )
 
+        usage = _call_usage(llm_response.usage)
+        vars(checkpoint_state.usage).update(vars(usage))
+        checkpoint_budget.add_response(llm_response.usage)
+
         assistant_msg = Message(
             role=Role.ASSISTANT,
             content=llm_response.text or "",
@@ -1021,11 +1096,7 @@ class SingleCall(Loop):
         await record_message(recorder, resolved_run_id, assistant_msg, 1)
         await notify_message(notifier, resolved_run_id, assistant_msg, 1, notifier_warnings)
 
-        usage = _call_usage(llm_response.usage)
-
-        await _single_call_budget(
-            agent.budget, usage, resolved_run_id, recorder, notifier, notifier_warnings
-        )
+        await checkpoint_budget.evaluate(1)
 
         sc_stream_meta: dict[str, Any] = {}
         if llm_response.reasoning is not None:

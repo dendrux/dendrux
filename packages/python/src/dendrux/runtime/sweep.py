@@ -1,7 +1,7 @@
 """Run sweep — public maintenance API.
 
-Detects stale RUNNING and abandoned WAITING runs, marks them ERROR
-with structured failure reasons. Developer calls this at app startup.
+Detects stale RUNNING and abandoned WAITING runs. Stale runs can be
+marked for explicit recovery or finalised with structured failure reasons.
 
 Usage::
 
@@ -22,8 +22,12 @@ Usage::
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+import logging
+import warnings
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any, Literal
 
+from dendrux import _codes
 from dendrux.runtime.state import SweepResult, _validate_sweep_age
 
 if TYPE_CHECKING:
@@ -41,12 +45,15 @@ async def sweep(
     batch_size: int = 100,
     max_runs: int = 10000,
     database_options: dict[str, Any] | None = None,
+    on_stale: Literal["error", "reclaim"] | None = None,
+    max_reclaims: int = 3,
+    max_returned: int = 1000,
+    cursor: str | None = None,
 ) -> SweepResult:
     """Sweep stale and abandoned runs. Developer calls this at app startup.
 
-    Detects stale RUNNING rows and abandoned WAITING rows, marks them
-    ERROR with structured failure reasons, emits lifecycle events, and
-    returns a report of what changed.
+    Detects stale RUNNING rows and abandoned WAITING rows, emits lifecycle
+    events, and reports finalisations and runs marked for explicit recovery.
 
     Args:
         database_url: Database URL. Creates a temporary engine, disposed
@@ -57,8 +64,8 @@ async def sweep(
             no forward progress beyond this duration are swept. If None,
             no stale-running sweep is performed. It must exceed the longest
             gap between progress updates (LLM calls, tool starts/ends,
-            ``heartbeat()``), otherwise event sequence indexes of a run that
-            is still executing may collide with the sweep's event.
+            ``heartbeat()``). Use at least three times the lease interval;
+            a shorter threshold can fence a worker that is still executing.
         abandoned_waiting: Threshold for abandoned WAITING detection.
             WAITING_CLIENT_TOOL, WAITING_HUMAN_INPUT, WAITING_APPROVAL and
             PAUSED runs are swept only when both status_changed_at and updated_at
@@ -72,9 +79,17 @@ async def sweep(
             All waiting statuses share the waiting category's cap. Fresh running
             rows and losing CAS attempts count toward it. A structured
             ``sweep_cap_reached`` warning signals saturation. Increase the cap
-            to reach later running IDs; repeat to drain waiting work. Running
-            population is bounded operationally by live concurrency plus orphan
-            backlog. No continuation cursor is returned.
+            or continue with the returned cursor to reach later running IDs;
+            repeat to drain waiting work. Running
+            population is bounded operationally by live concurrency plus orphan backlog.
+        on_stale: ``"error"`` finalises stale runs; ``"reclaim"`` marks recoverable
+            ReAct runs for explicit ``Agent.reclaim()``. Omission warns when stale
+            rows are found and retains ``"error"`` behavior through 0.6.
+        max_reclaims: Attempt limit stored by each new mark (default 3).
+            Rediscovering an existing mark preserves its stored limit.
+        max_returned: Maximum reclaimable runs returned (default 1,000).
+        cursor: Continue after the previous page's opaque cursor. A call never
+            wraps; None in the result means the scan reached its end.
 
     Returns:
         SweepResult with lists of swept runs by category.
@@ -84,10 +99,19 @@ async def sweep(
     """
     _validate_source(database_url, state_store, database_options)
     _validate_thresholds(stale_running, abandoned_waiting)
-    if stale_running is None and abandoned_waiting is None:
+    if stale_running is None and abandoned_waiting is None and on_stale != "reclaim":
         return SweepResult(stale_running=[])
 
-    for name, value, ceiling in (("batch_size", batch_size, 1000), ("max_runs", max_runs, 100000)):
+    if on_stale not in (None, "error", "reclaim"):
+        raise ValueError("on_stale must be error or reclaim")
+    if cursor is not None and not isinstance(cursor, str):
+        raise ValueError("cursor must be a string or None")
+    for name, value, ceiling in (
+        ("batch_size", batch_size, 1000),
+        ("max_runs", max_runs, 100000),
+        ("max_returned", max_returned, 100000),
+        ("max_reclaims", max_reclaims, 32767),
+    ):
         if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= ceiling:
             raise ValueError(f"{name} must be between 1 and {ceiling}")
     store: StateStore
@@ -109,17 +133,62 @@ async def sweep(
             limits["batch_size"] = batch_size
         if max_runs != 10000:
             limits["max_runs"] = max_runs
-        stale = (
-            await store.sweep_stale_runs(older_than=stale_running, **limits)
-            if stale_running is not None
-            else []
-        )
+        from dendrux.runtime._capabilities import capabilities, validate_capabilities
+
+        if on_stale == "reclaim":
+            validate_capabilities(store)
+        if on_stale == "reclaim" and not capabilities(store).recovery:
+            _codes.log_code(logging.getLogger(__name__), _codes.STORE_CAPABILITY, run_id=None)
+            raise NotImplementedError(
+                f"StateStore {type(store).__name__} does not declare the 'recovery' capability"
+            )
+        reclaimable = []
+        next_cursor = None
+        stale = []
+        if stale_running is not None:
+            combined_scan = getattr(store, "_scan_expired_runs", None)
+            if getattr(store, "_uses_combined_sweep", False) is True and callable(combined_scan):
+                page = await combined_scan(
+                    cutoff=datetime.now(UTC) - stale_running,
+                    batch_size=batch_size,
+                    max_runs=max_runs,
+                    max_returned=max_returned,
+                    reclaim_limit=max_reclaims,
+                    cursor=cursor,
+                    on_stale=on_stale or "error",
+                )
+                stale, reclaimable, next_cursor = page.finalised, page.reclaimable, page.cursor
+            elif on_stale == "reclaim":
+                page = await store.mark_lease_expired(
+                    cutoff=datetime.now(UTC) - stale_running,
+                    batch_size=batch_size,
+                    max_runs=max_runs,
+                    max_returned=max_returned,
+                    reclaim_limit=max_reclaims,
+                    cursor=cursor,
+                    finalise_unrecoverable=True,
+                )
+                stale, reclaimable, next_cursor = page.finalised, page.reclaimable, page.cursor
+            else:
+                stale = await store.sweep_stale_runs(older_than=stale_running, **limits)
+            if on_stale is None and stale:
+                warnings.warn(
+                    'sweep() will default to on_stale="reclaim" in 0.7; '
+                    'pass on_stale="error" to keep finalising stale runs.',
+                    FutureWarning,
+                    stacklevel=2,
+                )
         abandoned = (
             await store.sweep_abandoned_runs(older_than=abandoned_waiting, **limits)
             if abandoned_waiting is not None
             else []
         )
-        return SweepResult(stale_running=stale, abandoned_waiting=abandoned)
+        return SweepResult(
+            stale_running=stale,
+            abandoned_waiting=abandoned,
+            reclaimable=reclaimable,
+            cursor=next_cursor,
+        )
     finally:
         if engine is not None:
             await engine.dispose()
@@ -166,7 +235,7 @@ async def _create_temp_store(
     from dendrux.db._engine_options import engine_options, normalized_url
     from dendrux.db._schema_check import ensure_schema_current
     from dendrux.db._sqlite_sync import create_sqlite_schema
-    from dendrux.runtime.state import SQLAlchemyStateStore
+    from dendrux.runtime.stores._factory import store_for_engine
 
     parsed = normalized_url(database_url)
     engine = create_async_engine(parsed, **engine_options(parsed, database_options))
@@ -186,5 +255,5 @@ async def _create_temp_store(
         await engine.dispose()
         raise
 
-    store = SQLAlchemyStateStore(engine)
+    store = store_for_engine(engine)
     return store, engine

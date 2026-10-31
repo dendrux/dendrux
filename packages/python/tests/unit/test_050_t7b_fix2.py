@@ -4,7 +4,6 @@ import ast
 import inspect
 import json
 import logging
-import traceback
 from dataclasses import dataclass
 
 import pytest
@@ -20,19 +19,20 @@ from dendrux.notifiers.composite import CompositeNotifier
 from dendrux.notifiers.otel import OpenTelemetryNotifier
 from dendrux.runtime import state
 from dendrux.runtime.context import safe_exception_info
+from dendrux.runtime.stores.sql import base as sql_base
 
 PRIVATE = "CHAIN-PRIVATE-SENTINEL-765"
 
 
 def test_status_writer_inventory():
-    tree = ast.parse(inspect.getsource(state))
+    tree = ast.parse(inspect.getsource(sql_base))
     writers = {}
     direct = []
     for function in ast.walk(tree):
         if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
         # Nested retry closures belong to the surrounding public operation.
-        if function.name.startswith("_attempt") or function.name == "attempt":
+        if function.name.startswith("_attempt") or function.name in ("attempt", "validate"):
             continue
         for node in ast.walk(function):
             if isinstance(node, ast.Call):
@@ -64,10 +64,12 @@ def test_status_writer_inventory():
         "try_pause_run": 1,
         "pause_with_event": 1,
         "pause_run": 1,
-        "claim_paused_run": 1,
+        "claim_paused_run": 2,
         "submit_and_claim": 1,
         "release_run_claim": 1,
         "_sweep_runs": 1,
+        "_scan_expired_runs": 1,
+        "reclaim_run": 1,
     }, f"audit every status writer: {writers}"
     # Heartbeats must not change any indexed columns, including predicates/expressions.
     indexed = {col.name for index in AgentRun.__table__.indexes for col in index.columns}
@@ -148,13 +150,25 @@ async def test_wrapped_provider_error_span_has_only_own_stack():
         try:
             raise TypeError("secondary span bug")
         except TypeError as secondary:
-            own_stack = "".join(traceback.format_exception(secondary, chain=False))
             await notifier.on_run_started("run")
             await notifier.on_run_failed("run", secondary)
     span = exporter.get_finished_spans()[0]
     serialized = json.dumps([dict(e.attributes) for e in span.events])
     assert PRIVATE not in serialized, "span exception stack must omit provider chain"
-    assert span.events[0].attributes["exception.stacktrace"] == own_stack
+    event = span.events[0]
+    assert event.name == "provider.error"
+    assert event.attributes["dendrux.error.category"] == "timeout"
+    assert event.attributes["dendrux.error.timeout_reason"] == "call_deadline"
+    assert event.attributes["dendrux.error.safe_message"] == error.safe_message
+    assert span.status.description == error.safe_message
+    assert "dendrux.error.provider_code" not in event.attributes
+    diagnostic = next(e for e in span.events if e.name == "exception")
+    assert diagnostic.attributes["exception.type"] == "TypeError"
+    stack = diagnostic.attributes["exception.stacktrace"]
+    assert "test_wrapped_provider_error_span_has_only_own_stack" in stack
+    assert __file__ in stack and "line " in stack
+    assert "raise TypeError" not in stack and "raise error" not in stack
+    assert "secondary span bug" not in serialized
     provider.shutdown()
 
 

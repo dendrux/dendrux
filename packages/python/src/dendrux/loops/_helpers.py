@@ -16,9 +16,11 @@ shared instance can disambiguate concurrent runs.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
+from contextlib import AbstractAsyncContextManager, nullcontext
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from dendrux.errors import safe_exception_info
 from dendrux.pricing import price_usage
@@ -42,6 +44,13 @@ if TYPE_CHECKING:
     )
 
 logger = logging.getLogger(__name__)
+
+
+def order_observations(recorder: LoopRecorder | None, history: list[Message]) -> None:
+    """Restore format-2 observations to their assistant's original call order."""
+    order = getattr(recorder, "order_observations", None)
+    if order is not None:
+        order(history)
 
 
 class StreamInterruptedError(Exception):
@@ -115,6 +124,9 @@ class _InterruptibleStream:
             armed = False
             watcher.cancel()
 
+    async def aclose(self) -> None:
+        await self._stream.aclose()
+
 
 def interruptible(
     stream: AsyncGenerator[StreamEvent, None],
@@ -132,6 +144,53 @@ def interruptible(
     if interrupt is None:
         return stream
     return _InterruptibleStream(stream, interrupt)
+
+
+class _LeasedStream:
+    def __init__(self, stream: AsyncIterator[StreamEvent], recorder: LoopRecorder | None) -> None:
+        self.stream = stream
+        self.recorder = recorder
+        self.scope: AbstractAsyncContextManager[None] | None = None
+        self.closed = False
+
+    def __aiter__(self) -> _LeasedStream:
+        return self
+
+    async def __anext__(self) -> StreamEvent:
+        if self.closed:
+            raise StopAsyncIteration
+        try:
+            if self.scope is None:
+                scope = lease_scope(self.recorder)
+                await scope.__aenter__()
+                self.scope = scope
+            check = getattr(self.recorder, "check_lease", None)
+            if check is not None:
+                check()
+            return await anext(self.stream)
+        except BaseException:
+            await self.aclose()
+            raise
+
+    async def aclose(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        try:
+            close = getattr(self.stream, "aclose", None)
+            if close is not None:
+                await close()
+        finally:
+            if self.scope is not None:
+                scope, self.scope = self.scope, None
+                await scope.__aexit__(None, None, None)
+
+
+def leased_stream(
+    stream: AsyncIterator[StreamEvent], recorder: LoopRecorder | None
+) -> _LeasedStream:
+    """Hold one lease until the provider stream ends, fails, or is explicitly closed."""
+    return _LeasedStream(stream, recorder)
 
 
 def guardrail_meta(
@@ -212,16 +271,29 @@ async def record_run_failed(
     await recorder.on_run_failed(run_id, error, iteration=iteration)
 
 
+async def project_message(recorder: LoopRecorder | None, message: Message) -> Message:
+    """Prepare provider form in the loop, before any persistence transaction."""
+    engine = getattr(recorder, "guardrail_engine", None)
+    if engine is None:
+        return message
+    take = getattr(recorder, "take_observation", None)
+    observation = take(message.call_id) if take is not None else None
+    if observation is not None:
+        return replace(cast("Message", observation), meta={**observation.meta, **message.meta})
+    return cast("Message", (await engine.project_incoming_message(message))[0])
+
+
 async def record_message(
     recorder: LoopRecorder | None,
     run_id: str,
     message: Message,
     iteration: int,
-) -> None:
-    """Record message to authoritative persistence. Exceptions propagate."""
-    if recorder is None:
-        return
-    await recorder.on_message_appended(run_id, message, iteration)
+) -> Message:
+    """Project then record a message; callers retain the returned provider form."""
+    message = await project_message(recorder, message)
+    if recorder is not None:
+        await recorder.on_message_appended(run_id, message, iteration)
+    return message
 
 
 async def record_llm_started(
@@ -355,7 +427,17 @@ async def record_tool(
     """Record tool completion to authoritative persistence. Exceptions propagate."""
     if recorder is None:
         return
-    await recorder.on_tool_completed(run_id, tool_call, tool_result, iteration)
+    projected = getattr(recorder, "on_projected_tool_completed", None)
+    if projected is not None and getattr(recorder, "guardrail_engine", None) is not None:
+        formatter = getattr(recorder, "format_observation", None)
+        assert formatter is not None
+        scope = getattr(recorder, "observation_scope", None)
+        assert scope is not None
+        async with scope():
+            message = await project_message(recorder, formatter(tool_result))
+            await projected(run_id, tool_call, tool_result, iteration, message)
+    else:
+        await recorder.on_tool_completed(run_id, tool_call, tool_result, iteration)
 
 
 async def record_governance(
@@ -380,6 +462,26 @@ async def record_governance(
 # ------------------------------------------------------------------
 
 
+def notifier_trace_link(notifier: LoopNotifier | None, run_id: str) -> str | None:
+    """Read the optional synchronous run-link hook without requiring it in the protocol."""
+    return _notifier_link(notifier, "trace_link", run_id)
+
+
+def notifier_span_link(notifier: LoopNotifier | None, run_id: str, tool_call_id: str) -> str | None:
+    """Read an optional tool-span link after on_tool_started has created its span."""
+    return _notifier_link(notifier, "current_span_link", run_id, tool_call_id)
+
+
+def _notifier_link(notifier: LoopNotifier | None, name: str, *args: str) -> str | None:
+    try:
+        hook = getattr(notifier, name, None)
+        value = hook(*args) if callable(hook) else None
+        return value if isinstance(value, str) else None
+    except Exception:
+        logger.warning("Notifier.%s failed", name, exc_info=safe_exception_info())
+        return None
+
+
 async def notify_run_started(
     notifier: LoopNotifier | None,
     run_id: str,
@@ -387,12 +489,23 @@ async def notify_run_started(
     agent_name: str | None = None,
     agent_model: str | None = None,
     warnings: list[str] | None = None,
+    trace_link: str | None = None,
 ) -> None:
     """Notify of run start, swallowing exceptions."""
     if notifier is None:
         return
     try:
-        await notifier.on_run_started(run_id, agent_name=agent_name, agent_model=agent_model)
+        kwargs: dict[str, Any] = {"agent_name": agent_name, "agent_model": agent_model}
+        try:
+            params = dict(inspect.signature(notifier.on_run_started).parameters)
+        except (TypeError, ValueError):
+            params = {}
+        parameter = params.get("trace_link")
+        if (parameter is not None and parameter.kind != inspect.Parameter.POSITIONAL_ONLY) or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+        ):
+            kwargs["trace_link"] = trace_link
+        await notifier.on_run_started(run_id, **kwargs)
     except Exception:
         logger.warning("Notifier.on_run_started failed", exc_info=safe_exception_info())
         if warnings is not None:
@@ -587,3 +700,9 @@ async def notify_governance(
         logger.warning("Notifier.on_governance_event failed", exc_info=safe_exception_info())
         if warnings is not None:
             warnings.append(f"on_governance_event failed at iteration {iteration}")
+
+
+def lease_scope(recorder: LoopRecorder | None) -> AbstractAsyncContextManager[None]:
+    """Ask the recorder for a call-scoped renewal without depending on the runtime layer."""
+    scope = getattr(recorder, "lease_scope", None)
+    return scope() if scope is not None else nullcontext()

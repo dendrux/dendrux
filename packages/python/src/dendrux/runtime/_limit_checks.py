@@ -19,6 +19,7 @@ import logging
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
+from dendrux import _codes
 from dendrux.tools._pool import ToolCallLimiter
 
 if TYPE_CHECKING:
@@ -83,14 +84,14 @@ def _check_text(
     size = _text_bytes(value)
     if size <= limit:
         return
-    logger.warning(
-        "Rejected oversized input (code=%s, entry=%s, field=%s, run_id=%s, bytes=%d, limit=%d)",
-        INPUT_SIZE_LIMIT_CODE,
-        entry,
-        field,
-        run_id if isinstance(run_id, str) else None,
-        size,
-        limit,
+    _codes.log_code(
+        logger,
+        _codes.INPUT_SIZE_LIMIT,
+        entry=entry,
+        field=field,
+        run_id=run_id if isinstance(run_id, str) else None,
+        bytes=size,
+        limit=limit,
     )
     raise ValueError(
         f"Agent '{agent.name}' {field} is {size} bytes of text; the limit is {limit} "
@@ -118,11 +119,7 @@ def _check_model_text(agent: Agent, entry: str, fields: dict[str, Any], run_id: 
     for block in fields.get("context") or ():
         add(getattr(block, "content", None))
     if total > _limits(agent).max_input_bytes:
-        logger.warning(
-            "Rejected oversized model input: run_id=%s code=input_size_limit",
-            run_id,
-            extra={"run_id": run_id, "code": INPUT_SIZE_LIMIT_CODE},
-        )
+        _codes.log_code(logger, _codes.INPUT_SIZE_LIMIT, run_id=run_id)
         raise ValueError("Model input exceeds Limits.max_input_bytes.")
 
 

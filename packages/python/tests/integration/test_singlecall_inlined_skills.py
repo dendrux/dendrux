@@ -15,7 +15,7 @@ import pytest
 from dendrux.agent import Agent
 from dendrux.llm.mock import MockLLM
 from dendrux.loops.single import SingleCall
-from dendrux.runtime.state import SQLAlchemyStateStore
+from dendrux.runtime.stores._factory import store_for_engine
 from dendrux.skills import Skill
 from dendrux.types import LLMResponse, RunStatus, UsageStats
 
@@ -31,7 +31,7 @@ def _resp(text: str) -> LLMResponse:
 
 @pytest.fixture
 def db_store(engine):
-    return SQLAlchemyStateStore(engine)
+    return store_for_engine(engine)
 
 
 class TestSingleCallInlinedSkillsE2E:
@@ -41,6 +41,7 @@ class TestSingleCallInlinedSkillsE2E:
         skill = Skill.from_dir(FIXTURES_DIR / "pdf-processing")
         llm = MockLLM([_resp("ack")])
         agent = Agent(
+            strict_tenancy=False,
             provider=llm,
             prompt="You are a chat participant.",
             loop=SingleCall(),
@@ -67,6 +68,7 @@ class TestSingleCallInlinedSkillsE2E:
         skill = Skill.from_dir(FIXTURES_DIR / "pdf-processing")
         llm = MockLLM([_resp("ack")])
         agent = Agent(
+            strict_tenancy=False,
             provider=llm,
             prompt="P.",
             loop=SingleCall(),

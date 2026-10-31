@@ -21,6 +21,7 @@ from dataclasses import asdict, dataclass, replace
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, NoReturn, cast
 
+from dendrux import _codes
 from dendrux.errors import (
     InvalidToolResultError,
     PauseStatusMismatchError,
@@ -29,6 +30,8 @@ from dendrux.errors import (
     RunNotFoundError,
     RunNotPausedError,
 )
+from dendrux.runtime._tenant_checks import _strict_tenancy_applies
+from dendrux.runtime.state import ClaimResult
 from dendrux.types import (
     ApprovalDecision,
     ImagePart,
@@ -117,11 +120,7 @@ async def raise_for_non_paused_status(store: StateStore, run_id: str) -> NoRetur
 def _invalid_tool_result(run_id: str, reason: str) -> InvalidToolResultError:
     import logging
 
-    logging.getLogger(__name__).warning(
-        "Invalid client tool result: run_id=%s code=invalid_tool_result",
-        run_id,
-        extra={"run_id": run_id, "code": "invalid_tool_result"},
-    )
+    _codes.log_code(logging.getLogger(__name__), _codes.INVALID_TOOL_RESULT, run_id=run_id)
     return InvalidToolResultError(run_id, reason)
 
 
@@ -200,11 +199,7 @@ def pause_validator(
         if expected_pause_id is not None and expected_pause_id != current_id:
             import logging
 
-            logging.getLogger(__name__).warning(
-                "Pause generation mismatch: run_id=%s code=pause_id_mismatch",
-                run_id,
-                extra={"run_id": run_id, "code": "pause_id_mismatch"},
-            )
+            _codes.log_code(logging.getLogger(__name__), _codes.PAUSE_ID_MISMATCH, run_id=run_id)
             raise PauseStatusMismatchError(
                 run_id,
                 RunStatus(current.get("status", RunStatus.PAUSED.value)),
@@ -272,7 +267,7 @@ async def claim_paused_validated(
     *,
     expected_status: str,
     validate: Callable[[dict[str, Any]], None],
-) -> int:
+) -> ClaimResult | int | bool:
     """Use atomic validation when supported; preserve legacy claims best effort.
 
     The cached key is the unbound implementation, not a store instance. Legacy
@@ -291,12 +286,7 @@ async def claim_paused_validated(
         return await method(run_id, expected_status=expected_status, validate=validate)
     if not support.logged:
         support.logged = True
-        logging.getLogger(__name__).warning(
-            "Custom store lacks atomic claim validation; using pre/post checks: "
-            "run_id=%s code=legacy_claim_validation",
-            run_id,
-            extra={"run_id": run_id, "code": "legacy_claim_validation"},
-        )
+        _codes.log_code(logging.getLogger(__name__), _codes.LEGACY_CLAIM_VALIDATION, run_id=run_id)
     current = await store.get_pause_state(run_id)
     if current is None:
         await raise_for_non_paused_status(store, run_id)
@@ -310,13 +300,78 @@ async def claim_paused_validated(
             validate(current)
         except BaseException:
             release = getattr(store, "release_run_claim", None)
-            if release is not None and type(epoch) is int:
+            if (
+                release is not None
+                and isinstance(epoch, (int, ClaimResult))
+                and not isinstance(epoch, bool)
+            ):
                 import anyio
 
                 with anyio.CancelScope(shield=True):
-                    await release(run_id, status=expected_status, claim_epoch=epoch)
+                    await release(
+                        run_id,
+                        status=expected_status,
+                        claim_epoch=epoch.claim_epoch if isinstance(epoch, ClaimResult) else epoch,
+                    )
             raise
     return epoch
+
+
+def submission_descriptor(
+    raw: dict[str, Any], checkpoint: dict[str, Any], payload: dict[str, Any], status: str
+) -> dict[str, Any]:
+    """Describe a validated format-2 submission without embedding its payload."""
+    from dendrux.types import generate_ulid
+
+    kind = (
+        "approval"
+        if status == "waiting_approval"
+        else "input"
+        if "submitted_user_input" in payload
+        else "tool_results"
+    )
+    pending = checkpoint.get("pending", [])
+    ids = (
+        [r["call_id"] for r in payload["submitted_tool_results"]]
+        if "submitted_tool_results" in payload
+        else [r["call_id"] for r in payload["submitted_decisions"]]
+        if "submitted_decisions" in payload
+        else [p["call_id"] for p in pending]
+    )
+    return {
+        "submission_id": generate_ulid(),
+        "kind": kind,
+        "pause_id": raw.get("pause_id"),
+        "payload_ref": {"pause_data_key": "submission"},
+        "call_ids": ids,
+        "reserved_order_index": checkpoint.get("trace_order_offset", 0),
+    }
+
+
+def _submission_payload(raw: dict[str, Any]) -> dict[str, Any]:
+    """Accept only the closed format-2 submission envelope (§12.1)."""
+    if "submitted" in raw:
+        raise ValueError("Invalid format-2 submission envelope")
+    envelope = raw.get("submission")
+    if envelope is None:
+        return {}
+    keys = {"submission_id", "kind", "pause_id", "call_ids", "payload"}
+    if not isinstance(envelope, dict) or set(envelope) != keys:
+        raise ValueError("Invalid format-2 submission envelope")
+    if (
+        not all(isinstance(envelope[k], str) and envelope[k] for k in ("submission_id", "pause_id"))
+        or envelope["kind"] not in ("approval", "input", "tool_results")
+        or not isinstance(envelope["payload"], dict)
+        or not isinstance(envelope["call_ids"], list)
+        or not all(isinstance(call_id, str) for call_id in envelope["call_ids"])
+    ):
+        raise ValueError("Invalid format-2 submission envelope")
+    return envelope["payload"]
+
+
+def submitted_view(raw: dict[str, Any]) -> dict[str, Any]:
+    """Project a validated v2 envelope for legacy parsers without mutating storage."""
+    return {**raw, **_submission_payload(raw)} if raw.get("schema_version") == 2 else raw
 
 
 async def claim_or_raise(
@@ -332,7 +387,7 @@ async def claim_or_raise(
     validate: Callable[[dict[str, Any]], None] | None = None,
     blob_refs: Sequence[BlobEdge] | None = None,
     blob_refs_scope: str | None = None,
-) -> int:
+) -> ClaimResult | int:
     """Perform a status preflight, then persist-first handoff + CAS claim.
 
     The preflight reads the current status before attempting the CAS so
@@ -364,8 +419,13 @@ async def claim_or_raise(
     if raw is None:
         await raise_for_non_paused_status(store, run_id)
     if agent is not None:
-        warn_missing_pause_id(
-            agent, expected_pause_id, pause_id=raw.get("pause_id"), approval=approval
+        require_pause_id(
+            agent,
+            expected_pause_id,
+            pause_id=raw.get("pause_id"),
+            approval=approval,
+            store=store,
+            run_id=run_id,
         )
     validate = submission_validator(
         run_id,
@@ -377,8 +437,24 @@ async def claim_or_raise(
     )
 
     # --- Claim: run was expected_status at preflight, attempt CAS. ---
+    from dendrux.runtime._capabilities import capabilities
+
+    descriptor = None
+    if (
+        raw.get("schema_version") == 2
+        and capabilities(store).checkpointing
+        and (submitted_data is not None or approval)
+    ):
+        submitted_data = dict(submitted_data or {})
+        if expected_status == RunStatus.WAITING_APPROVAL:
+            submitted_data["approved"] = approval
+        checkpoint = await store.get_loop_state(run_id) or {}
+        descriptor = submission_descriptor(raw, checkpoint, submitted_data, expected_status.value)
+    won: ClaimResult | int | bool
     if submitted_data is not None:
         claim_kwargs: dict[str, Any] = {} if validate is None else {"validate": validate}
+        if descriptor is not None:
+            claim_kwargs["submission"] = descriptor
         if blob_refs:
             claim_kwargs["blob_refs"] = list(blob_refs)
             claim_kwargs["blob_refs_scope"] = blob_refs_scope
@@ -402,11 +478,19 @@ async def claim_or_raise(
                 await report_governance_change(agent, store, run_id, raw)
             except BaseException:
                 release = getattr(store, "release_run_claim", None)
-                if release is not None and type(won) is int:
+                if (
+                    release is not None
+                    and isinstance(won, (int, ClaimResult))
+                    and not isinstance(won, bool)
+                ):
                     import anyio
 
                     with anyio.CancelScope(shield=True):
-                        await release(run_id, status=expected_status.value, claim_epoch=won)
+                        await release(
+                            run_id,
+                            status=expected_status.value,
+                            claim_epoch=won.claim_epoch if isinstance(won, ClaimResult) else won,
+                        )
                 raise
         return won
 
@@ -916,17 +1000,30 @@ def governance_snapshot(agent: Agent) -> dict[str, Any]:
             }
         )
     budget = agent.budget
+    from dendrux.types import Limits
+
+    defaults = Limits()
+    recovery_bounds = {"max_pending_calls", "max_rebuild_bytes", "max_rebuild_rows"}
+    # Default recovery bounds must not invalidate pre-0.6 governance snapshots.
+    # Explicit overrides remain governed, so changing one still requires policy.
+    limits = {
+        key: value
+        for key, value in asdict(agent._limits).items()
+        if key not in recovery_bounds or value != getattr(defaults, key)
+    }
     parts = {
         "guardrails": guards,
         "before_tool": qualified(agent.before_tool) if agent.before_tool else None,
         "deny": sorted(agent.deny),
         "require_approval": sorted(agent.require_approval),
-        "limits": asdict(agent._limits),
+        "limits": limits,
         "budget": (
             {
                 "on_exceed": budget.on_exceed,
                 "include_children": budget.include_children,
-                "count_cache_tokens": bool(budget.count_cache_tokens),
+                "count_cache_tokens": bool(budget.count_cache_tokens)
+                if budget.max_tokens is not None
+                else False,
             }
             if budget
             else None
@@ -972,16 +1069,18 @@ def submission_validator(
     )
 
     def validate(current: dict[str, Any]) -> None:
+        from dendrux.types import _validate_provider_kwargs
+
+        if current.get("schema_version") == 2:
+            _validate_provider_kwargs(current.get("provider_kwargs") or {}, run_id=run_id)
         base(current)
         if agent is not None and agent._on_governance_change == "raise":
             change = _governance_change(agent, current)
             if change is not None:
                 import logging
 
-                logging.getLogger(__name__).warning(
-                    "Governance mismatch: run_id=%s code=governance_mismatch",
-                    run_id,
-                    extra={"run_id": run_id, "code": "governance_mismatch"},
+                _codes.log_code(
+                    logging.getLogger(__name__), _codes.GOVERNANCE_MISMATCH, run_id=run_id
                 )
                 raise GovernanceMismatchError(run_id, **change)
         if extra is not None:
@@ -991,91 +1090,22 @@ def submission_validator(
     return validate
 
 
-@dataclass(frozen=True)
-class _WarningLocation:
-    filename: str
-    lineno: int
-    module: str
-    registry: dict[str | tuple[str, type[Warning], int], int]
-
-
-def capture_warning_location() -> _WarningLocation | None:
-    """Keep a lazy stream's creation site without retaining the caller frame."""
-    import inspect
-
-    frame = inspect.currentframe()
-    while frame is not None and frame.f_globals.get("__name__", "").startswith("dendrux."):
-        frame = frame.f_back
-    if frame is None:
-        return None
-    return _WarningLocation(
-        frame.f_code.co_filename,
-        frame.f_lineno,
-        frame.f_globals.get("__name__", ""),
-        frame.f_globals.setdefault("__warningregistry__", {}),
-    )
-
-
-def _warn_at_location(message: str, location: _WarningLocation | None) -> None:
-    import warnings
-
-    if location is not None:
-        warnings.warn_explicit(
-            message,
-            FutureWarning,
-            location.filename,
-            location.lineno,
-            module=location.module,
-            registry=location.registry,
-        )
-    else:
-        warnings.warn(message, FutureWarning, stacklevel=_user_warning_stacklevel())
-
-
-def _user_warning_stacklevel() -> int:
-    import inspect
-
-    frame = inspect.currentframe()
-    frame = frame.f_back if frame is not None else None
-    level = 1
-    while frame is not None and frame.f_globals.get("__name__", "").startswith("dendrux."):
-        level += 1
-        frame = frame.f_back
-    return level
-
-
 async def report_governance_change(
     agent: Agent,
     store: StateStore,
     run_id: str,
     raw: dict[str, Any],
-    *,
-    warning_location: _WarningLocation | None = None,
 ) -> None:
     import logging
 
     log = logging.getLogger(__name__)
     if GOVERNANCE_KEY not in raw:
-        log.info(
-            "Skipping pre-0.5 governance check: run_id=%s code=governance_legacy",
-            run_id,
-            extra={"run_id": run_id, "code": "governance_legacy"},
-        )
+        _codes.log_code(log, _codes.GOVERNANCE_LEGACY, run_id=run_id)
         return
     change = _governance_change(agent, raw)
     if change is None:
         return
-    log.warning(
-        "Governance changed: run_id=%s code=governance_changed",
-        run_id,
-        extra={"run_id": run_id, "code": "governance_changed"},
-    )
-    if not agent._on_governance_change_chosen:
-        _warn_at_location(
-            "Changed governance warns in 0.5; the default becomes 'raise' in 0.6. "
-            "Choose on_governance_change explicitly.",
-            warning_location,
-        )
+    _codes.log_code(log, _codes.GOVERNANCE_CHANGED, run_id=run_id)
     await store.save_run_event(run_id, event_type="governance.changed", data=change)
 
 
@@ -1088,20 +1118,23 @@ def _require_approval_token(approval: bool, expected: str | None) -> None:
         raise InputValidationError("expected_pause_id", "pause_id_required")
 
 
-def warn_missing_pause_id(
+def require_pause_id(
     agent: Agent,
     expected: str | None,
     *,
     pause_id: str | None,
     approval: bool = False,
-    warning_location: _WarningLocation | None = None,
+    store: StateStore | None = None,
+    run_id: str | None = None,
 ) -> None:
-    _require_approval_token(approval, expected)
-    if pause_id is not None and expected is None and agent._strict_tenancy:
-        _warn_at_location(
-            "Pass expected_pause_id to bind this submission to its pause.",
-            warning_location,
-        )
+    """Require a token only when the stored pause has a durable generation."""
+    _require_approval_token(approval and pause_id is not None, expected)
+    if pause_id is not None and expected is None and _strict_tenancy_applies(agent, store):
+        from dendrux.types import InputValidationError
+
+        raise InputValidationError("expected_pause_id", "pause_id_required")
+    if run_id is not None:
+        pause_validator(run_id, expected)({"pause_id": pause_id})
 
 
 def _client_json_payload(payload: str) -> str:
@@ -1146,11 +1179,7 @@ async def prepare_client_results(
         if result.meta.get("code") == "size_limit":
             import logging
 
-            logging.getLogger(__name__).warning(
-                "Client tool result capped: run_id=%s code=size_limit",
-                run_id,
-                extra={"run_id": run_id, "code": "size_limit"},
-            )
+            _codes.log_code(logging.getLogger(__name__), _codes.SIZE_LIMIT, run_id=run_id)
         if result.success and agent.tool_result_transform is not None:
             try:
                 normalized = _client_json_payload(result.payload)

@@ -109,8 +109,11 @@ async def test_status_migration_backfills_and_repairs_interrupted_index(engine, 
     from sqlalchemy.exc import IntegrityError
     from sqlalchemy.ext.asyncio import create_async_engine
 
-    from dendrux.db.models import Base
-    from tests.integration._migration_schema import migration_schema, test_database_url
+    from tests.integration._migration_schema import (
+        create_pre_activation_schema,
+        migration_schema,
+        test_database_url,
+    )
     from tests.integration.test_migration_run_control import _alembic
 
     @asynccontextmanager
@@ -128,7 +131,7 @@ async def test_status_migration_backfills_and_repairs_interrupted_index(engine, 
     async with target() as migrated:
         old = dt.datetime(2025, 1, 1, tzinfo=dt.UTC)
         async with migrated.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
+            await conn.run_sync(create_pre_activation_schema)
             await conn.execute(
                 AgentRun.__table__.insert(),
                 [
@@ -226,7 +229,7 @@ async def test_hot_updates_recover_with_four_tools_per_run(store, engine, record
     from sqlalchemy.ext.asyncio import create_async_engine
 
     from dendrux import Agent, tool
-    from dendrux.runtime.state import SQLAlchemyStateStore
+    from dendrux.runtime.stores._factory import store_for_engine
     from dendrux.types import LLMResponse, RunStatus
     from tests._helpers.scripted_provider import ScriptedLLM, tool_call
 
@@ -235,7 +238,7 @@ async def test_hot_updates_recover_with_four_tools_per_run(store, engine, record
 
     # Match the reviewer's shared pool (10 + 5), 200 runs and unique call IDs.
     engine = create_async_engine(engine.url, pool_size=10, max_overflow=5)
-    store = SQLAlchemyStateStore(engine)
+    store = store_for_engine(engine)
 
     @tool()
     async def work() -> str:

@@ -26,14 +26,14 @@ def _plain(text: str) -> str:
 def seeded_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> str:
     """A throwaway SQLite database with two runs, pointed at by the env var."""
     from dendrux.db.session import get_engine, reset_engine
-    from dendrux.runtime.state import SQLAlchemyStateStore
+    from dendrux.runtime.stores._factory import store_for_engine
 
     url = f"sqlite+aiosqlite:///{tmp_path / 'cli.db'}"
     monkeypatch.setenv("DENDRUX_DATABASE_URL", url)
 
     async def seed() -> None:
         engine = await get_engine(url)
-        store = SQLAlchemyStateStore(engine)
+        store = store_for_engine(engine)
         await store.create_run("run-alpha", "AgentA", tenant_id="acme", model="m1")
         await store.create_run("run-beta", "AgentB", model="m2")
         await store.save_trace("run-alpha", "user", "hello [red]markup[/red]", order_index=0)
@@ -201,11 +201,11 @@ class TestTraceLimitNotices:
     @staticmethod
     def _seed(url: str, traces: int, tool_calls: int) -> None:
         from dendrux.db.session import get_engine, reset_engine
-        from dendrux.runtime.state import SQLAlchemyStateStore
+        from dendrux.runtime.stores._factory import store_for_engine
 
         async def seed() -> None:
             engine = await get_engine(url)
-            store = SQLAlchemyStateStore(engine)
+            store = store_for_engine(engine)
             await store.create_run("big", "A")
             for i in range(traces):
                 await store.save_trace("big", "assistant", f"t{i}", order_index=i)

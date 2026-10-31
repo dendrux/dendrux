@@ -109,6 +109,7 @@ def _make_agent(**overrides) -> Agent:
         "max_iterations": 10,
     }
     defaults.update(overrides)
+    defaults.setdefault("strict_tenancy", False)
     return Agent(**defaults)
 
 
@@ -1177,8 +1178,8 @@ class TestMaxCallsPerRun:
 class TestTimeoutWarning:
     """Tests for timeout warning messages."""
 
-    async def test_default_timeout_warning_includes_hint(self) -> None:
-        """Timeout on default-timeout tool includes '(default)' and hint."""
+    async def test_default_timeout_warning_is_structured(self) -> None:
+        """A default timeout emits a code and numeric deadline."""
 
         @tool()
         async def slow_tool(x: str) -> str:
@@ -1202,13 +1203,15 @@ class TestTimeoutWarning:
         with caplog_context(logging.WARNING) as logs:
             await agent.run("test")
 
-        timeout_warnings = [r for r in logs if "timed out" in r.message]
+        timeout_warnings = [
+            r for r in logs if getattr(r, "code", None) == "timeout_outcome_unknown"
+        ]
         assert len(timeout_warnings) == 1
-        assert "(default)" in timeout_warnings[0].message
-        assert "@tool(timeout_seconds=N)" in timeout_warnings[0].message
+        assert timeout_warnings[0].timeout_s == 0.01
+        assert timeout_warnings[0].zombie_threads == 0
 
-    async def test_explicit_timeout_warning_no_hint(self) -> None:
-        """Timeout on explicit-timeout tool does NOT include '(default)' hint."""
+    async def test_explicit_timeout_warning_is_structured(self) -> None:
+        """An explicit timeout emits the same closed fields."""
 
         @tool(timeout_seconds=0.01)
         async def slow_explicit(x: str) -> str:
@@ -1227,9 +1230,12 @@ class TestTimeoutWarning:
         with caplog_context(logging.WARNING) as logs:
             await agent.run("test")
 
-        timeout_warnings = [r for r in logs if "timed out" in r.message]
+        timeout_warnings = [
+            r for r in logs if getattr(r, "code", None) == "timeout_outcome_unknown"
+        ]
         assert len(timeout_warnings) == 1
-        assert "(default)" not in timeout_warnings[0].message
+        assert timeout_warnings[0].timeout_s == 0.01
+        assert timeout_warnings[0].zombie_threads == 0
 
 
 class TestToolSentinel:

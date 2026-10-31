@@ -4,7 +4,7 @@ from dendrux import Agent
 
 
 async def test_legacy_note_store_logs_missing_cap(store, caplog):
-    await store.create_run("r", "a")
+    await store.create_run("00000000000000000000000303", "a")
 
     class LegacyNotes:
         async def add_note(self, run_id, note_id, text, *, metadata=None, tenant_id=None):
@@ -15,9 +15,9 @@ async def test_legacy_note_store_logs_missing_cap(store, caplog):
 
     agent = Agent(prompt="p", state_store=LegacyNotes(), strict_tenancy=False)
     try:
-        assert await agent.submit_note("r", "hello")
+        assert await agent.submit_note("00000000000000000000000303", "hello")
         assert any(
-            getattr(record, "run_id", None) == "r"
+            getattr(record, "run_id", None) == "00000000000000000000000303"
             and getattr(record, "code", None) == "note_cap_unenforced"
             for record in caplog.records
         )

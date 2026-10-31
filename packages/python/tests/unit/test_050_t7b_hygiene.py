@@ -48,9 +48,14 @@ async def test_stream_telemetry_never_leaks_or_resets_foreign_tokens(loop):
         async def complete_stream(self, *args, **kwargs):
             try:
                 observed.append(telemetry._run_id.get())
-                yield StreamEvent(type=StreamEventType.TEXT_DELTA, text="first")
+                yield StreamEvent(
+                    type=StreamEventType.TEXT_DELTA, text="00000000000000000000000111"
+                )
                 observed.append(telemetry._run_id.get())
-                yield StreamEvent(type=StreamEventType.DONE, response=LLMResponse(text="first"))
+                yield StreamEvent(
+                    type=StreamEventType.DONE,
+                    response=LLMResponse(text="00000000000000000000000111"),
+                )
             finally:
                 observed.append(telemetry._run_id.get())
 
@@ -97,7 +102,7 @@ async def test_run_task_logging_does_not_format_vendor_cause(caplog):
 
     manager = RunTaskManager()
     with pytest.raises(ProviderTimeoutError):
-        await manager.spawn("safe-log", fail())
+        await manager.spawn("00000000000000000000000113", fail())
     assert "vendor-private-request-body" not in caplog.text, (
         "task logs must not format provider causes"
     )

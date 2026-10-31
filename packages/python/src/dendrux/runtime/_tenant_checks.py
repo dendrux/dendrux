@@ -2,7 +2,8 @@
 
 Called through :mod:`dendrux.runtime._entry_checks`, before any I/O:
 
-- strict tenancy (``Agent(strict_tenancy=True)``): an omitted ``tenant_id``
+- strict tenancy on agents with persistence (``Agent(strict_tenancy=True)``):
+  an omitted ``tenant_id``
   raises :class:`~dendrux.errors.TenantScopeRequiredError`, except in a
   delegated child, which runs in its parent's tenant;
 - ``tenant_id=""`` is rejected (it would share the untenanted scope);
@@ -17,9 +18,9 @@ from __future__ import annotations
 
 import json
 import logging
-import warnings
 from typing import TYPE_CHECKING, Any, TypeVar, cast
 
+from dendrux import _codes
 from dendrux._sentinel import _OmittedType
 from dendrux.errors import TenantScopeRequiredError
 from dendrux.runtime.context import get_delegation_context
@@ -39,53 +40,55 @@ RESERVED_METADATA_PREFIX = "dendrux."
 _NEW_RUN_ENTRIES = frozenset({"run", "stream", "retry"})
 
 
+def _strict_tenancy_applies(agent: Agent, store: object | None = None) -> bool:
+    return getattr(agent, "_strict_tenancy", True) and (
+        store is not None
+        or any(
+            getattr(agent, name, None) is not None
+            for name in ("_state_store", "_database_url", "_lazy_store")
+        )
+    )
+
+
+def _tenant_scope_chosen(tenant_id: object) -> bool:
+    parent = get_delegation_context()
+    return parent.tenant_explicit if parent is not None else not isinstance(tenant_id, _OmittedType)
+
+
 def resolve_tenant(
-    agent: Agent, entry: EntryPoint, tenant_id: _T | _OmittedType, *, default: _T
+    agent: Agent,
+    entry: EntryPoint,
+    tenant_id: _T | _OmittedType,
+    *,
+    default: _T,
+    store: object | None = None,
 ) -> _T:
     """The ``tenant_id`` an entry point runs with.
 
     ``tenant_id`` is what the caller passed, or ``_OMITTED``. An omitted
     tenant resolves to ``default`` (``None`` for ``run``/``stream``/``retry``,
-    ``UNSCOPED`` for the rest). Under ``strict_tenancy`` it raises
+    ``UNSCOPED`` for the rest). Under ``strict_tenancy`` with a configured
+    or resolved state store it raises
     :class:`TenantScopeRequiredError` instead, unless the call runs inside a
     delegated run (``runtime.context.get_delegation_context``): a new child
     run then inherits the parent's tenant, and any other entry point is
-    scoped to the parent's tenant. An omitted tenant on an Agent that did not
-    choose ``strict_tenancy`` emits a ``FutureWarning`` (the 0.6 default flip).
+    scoped to the parent's tenant.
     """
+    parent = get_delegation_context()
+    strict = _strict_tenancy_applies(agent, store)
+    if strict and parent is not None and not parent.tenant_explicit:
+        _codes.log_code(logger, _codes.TENANT_SCOPE_REQUIRED, entry=entry)
+        raise TenantScopeRequiredError(entry)
     if not isinstance(tenant_id, _OmittedType):
         return tenant_id
-    if getattr(agent, "_strict_tenancy", False):
-        parent = get_delegation_context()
+    if strict:
         if parent is None:
-            logger.warning(
-                "tenant_id omitted under strict tenancy: entry=%s code=tenant_scope_required",
-                entry,
-                extra={"code": "tenant_scope_required", "entry": entry},
-            )
+            _codes.log_code(logger, _codes.TENANT_SCOPE_REQUIRED, entry=entry)
             raise TenantScopeRequiredError(entry)
         if entry in _NEW_RUN_ENTRIES:
             return default  # resolve_child_tenant inherits the parent's tenant
         return cast("_T", parent.tenant_id)
-    if not getattr(agent, "_strict_tenancy_chosen", True):
-        _warn_strict_default()
     return default
-
-
-def _warn_strict_default() -> None:
-    """B19: a ``FutureWarning`` (shown by default), deduplicated per caller location.
-
-    ``stacklevel`` points at the code that called the Agent method:
-    this function, ``resolve_tenant``, ``entry_checks``, the Agent method.
-    """
-    warnings.warn(
-        "An Agent method was called without tenant_id on an Agent that did not choose "
-        "strict_tenancy. In dendrux 0.6 strict_tenancy defaults to True and this call "
-        "raises TenantScopeRequiredError. Pass tenant_id= (None for untenanted runs), or "
-        "choose Agent(strict_tenancy=...) explicitly.",
-        FutureWarning,
-        stacklevel=5,
-    )
 
 
 def check_entry(agent: Agent, entry: EntryPoint, *, tenant_id: TenantScope, **fields: Any) -> None:
@@ -150,11 +153,7 @@ def check_run_metadata(metadata: Any, *, limit: int, entry: str = "run") -> None
         k for k in metadata if isinstance(k, str) and k.startswith(RESERVED_METADATA_PREFIX)
     )
     if reserved:
-        logger.warning(
-            "reserved metadata key rejected: entry=%s code=reserved_metadata_key",
-            entry,
-            extra={"code": "reserved_metadata_key", "entry": entry},
-        )
+        _codes.log_code(logger, _codes.RESERVED_METADATA_KEY, entry=entry)
         raise ValueError(
             f"metadata keys starting with {RESERVED_METADATA_PREFIX!r} are reserved for "
             f"dendrux (count={len(reserved)}). Rename them."
@@ -194,14 +193,7 @@ def _check_size(value: Any, *, limit: int, entry: str, what: str) -> None:
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{what} must be JSON-serializable.") from exc
     if size > limit:
-        logger.warning(
-            "%s over the size cap: entry=%s code=metadata_too_large bytes=%d limit=%d",
-            what,
-            entry,
-            size,
-            limit,
-            extra={"code": "metadata_too_large", "entry": entry},
-        )
+        _codes.log_code(logger, _codes.METADATA_TOO_LARGE, entry=entry, bytes=size, limit=limit)
         raise ValueError(
             f"{what} is {size} bytes of JSON, over the {limit}-byte limit "
             "(Limits.max_metadata_bytes)."

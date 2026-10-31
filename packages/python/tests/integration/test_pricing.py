@@ -44,6 +44,7 @@ async def test_cached_usage_preserves_final_summary(store, source, cas):
 async def test_idempotent_retry_preserves_table_source(store):
     llm = MockLLM([LLMResponse(text="done", usage=UsageStats(input_tokens=100, output_tokens=10))])
     agent = Agent(
+        strict_tenancy=False,
         provider=llm,
         prompt="test",
         state_store=store,
@@ -69,7 +70,9 @@ async def test_unpriced_call_stays_unknown_after_pause_resume(store, stream, cac
             ),
         ]
     )
-    agent = Agent(provider=llm, prompt="test", tools=[lookup], state_store=store)
+    agent = Agent(
+        strict_tenancy=False, provider=llm, prompt="test", tools=[lookup], state_store=store
+    )
     if stream:
         async with agent.stream("hello") as running:
             async for _ in running:

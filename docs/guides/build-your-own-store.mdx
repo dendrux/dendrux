@@ -1,0 +1,267 @@
+---
+title: Build your own store
+description: Add a state store for another SQLAlchemy database by subclassing SQLStateStore, then certify it with the published pytest test kit.
+---
+
+# Build your own store
+
+Dendrux keeps every run in a **state store**. We ship stores for PostgreSQL, SQLite and MySQL/MariaDB. If your database is one SQLAlchemy supports, you can add it by subclassing one base class and filling in a small set of dialect methods, then prove it with the test kit we publish.
+
+> **Scope.** Stores for relational databases through SQLAlchemy are supported. Stores for other kinds of database (document stores, key-value stores, files) are not part of 0.6.0. The `StateStore` protocol and the test kit are public, so you can still write one, but we ship and support SQL stores only.
+
+## What the base class does for you
+
+`SQLStateStore` owns every operation: transaction shape, validation, rollback, lock order, retries, sequence numbers, fencing, and the checks that make a run resumable. Your subclass supplies two things:
+
+1. **Feature flags** that choose between generic code paths in the base.
+2. **Quirk methods** that build the SQL expressions or statements the base cannot write portably.
+
+A quirk method never commits, retries or validates. It only returns SQL.
+
+[//]: # "docs-test: skip - fragment: shows a subclass skeleton, not a runnable store"
+
+```python
+from dendrux.store import SQLStateStore
+
+
+class CockroachStateStore(SQLStateStore):
+    dialect_names = ("cockroachdb",)
+
+    supports_update_returning = True
+    supports_insert_returning = True
+    supports_row_locks = True
+    ddl_transactional = True
+
+    # the quirk methods below; everything else is inherited
+```
+
+Build the store from an engine you create once and own:
+
+[//]: # "docs-test: skip - fragment: relies on `engine`, defined by setup shown elsewhere"
+
+```python
+store = CockroachStateStore(engine)
+agent = Agent(provider=..., prompt=..., state_store=store)
+```
+
+## Feature flags
+
+| Flag | Say `True` when | Effect in the base |
+|---|---|---|
+| `supports_update_returning` | The database has `UPDATE ... RETURNING` | Conditional updates use one statement. Otherwise the base locks the row, updates it by primary key, and reads the result back |
+| `supports_insert_returning` | The database has `INSERT ... RETURNING` | An event insert returns its sequence number from the same statement |
+| `supports_row_locks` | The database has `SELECT ... FOR UPDATE` row locks | The base locks rows in a fixed order (run, child runs by id, blobs by id, settings). A database with a single writer, such as SQLite, says `False` |
+| `ddl_transactional` | Schema changes roll back with a transaction | Maintenance steps need not be restartable |
+
+The flags are independent. Set each one from what your database really does, and let the kit tell you if you were wrong.
+
+## Quirk methods
+
+| Method | What it must do |
+|---|---|
+| `insert_if_absent_stmt` | Build the insert used for idempotent create, blobs and events. Return a plan that says whether the database ignores a clash itself (`targeted_ignore`) or raises a unique violation for the base to classify (`raise_unique`) |
+| `upsert_setting` | Overwrite one settings row |
+| `json_get`, `json_contains`, `json_is_null` | Read and filter JSON columns. All three must agree on one truth table: JSON null is not SQL NULL, a missing path is not null, a JSON boolean is not a string |
+| `json_patch_expr` | Return an expression that applies a checkpoint patch inside the database, or `None` to let the base do a locked read, modify and write |
+| `lock_clause` | Add the row lock for an intent (`share`, `update`, `update_no_key`) |
+| `serialize_in_tx` | Mutual exclusion for one run's note counting, released at commit or rollback |
+| `id_in` | Membership in a bounded list of ids |
+| `child_page_query` | One page of child runs for cancel cascades (the base has a portable version) |
+| `classify_db_error` | Turn a driver error into a kind (`unique_violation`, `deadlock_or_serialization`, `lock_timeout`, `connection_lost`, `other`), the violated constraint name when the driver gives it, and a stable code. Never keep driver text |
+| `connection_checks` | One-time checks on first use (server version, isolation level, packet limits) |
+| `statement_capacity` (optional) | `async def statement_capacity(self)`: returns the most bytes one SQL statement may carry, or `None` for no limit. Before an Agent first uses the store it compares the largest statement its `Limits` can produce with this number and refuses, naming both values. It is an early warning for the Agent's `Limits`, not a guarantee; define it on the class. A store without it is not checked. `MySQLStateStore` reports `max_allowed_packet` |
+
+Two rules hold for every method:
+
+- **Tenant and identifier equality must be exact.** `"t"` and `"t "` are different tenants, and so are `"T"` and `"t"`. If your database pads or folds case when it compares text, choose a binary, no-pad collation for every identifier, tenant, key and idempotency column. The kit checks this.
+- **Fail closed.** If a method cannot decide, it refuses.
+
+## Declare what you promise
+
+A store states what it supports in `capabilities`:
+
+[//]: # "docs-test: skip - fragment: shows a store class to complete with your dialect's methods"
+
+```python
+from dataclasses import replace
+
+class CockroachStateStore(SQLStateStore):
+    def __init__(self, engine):
+        super().__init__(engine)
+        self.capabilities = replace(self.capabilities, deployment="multi_server")
+```
+
+| Field | Meaning |
+|---|---|
+| `fenced_writes` | Every writer checks the run's claim epoch, so an old owner cannot change a run it lost |
+| `retry_ids` | A write carries a caller-owned identity, so repeating it after a lost acknowledgement stores it once |
+| `checkpointing` | Executable state and conversation reconstruction (format-2 runs) |
+| `atomic_completion` | A tool's intent, its result, and a run's end publish all-or-nothing |
+| `recovery` | Leases, marking, reclaim, paged cancel |
+| `deployment` | `single_process` (one process), `single_host` (several processes sharing one file) or `multi_server` (any number of processes and hosts) |
+
+The base class declares everything it implements. You set `deployment`. A store without a `deployment` cannot be certified.
+
+## Provide the fixtures
+
+The kit runs against fixtures you write in your own `conftest.py`. They return plain callables, so they work with any async test setup.
+
+| Fixture | Returns | Required when |
+|---|---|---|
+| `dendrux_store_factory` | A function that makes a new store over **empty** data | Always |
+| `dendrux_store_reopen` | A function that takes a store and returns a **new instance over the same data** (a restarted process) | `recovery` is declared |
+| `dendrux_store_second_instance` | A function that takes a store and returns a **second, independent instance** (its own connections) over the same data, live next to the first | `deployment` is `single_host` or `multi_server` |
+| `dendrux_clock` | An object with `advance(delta)`: afterwards everything written earlier reads as `delta` older to sweeps and leases (optionally `now()`, see below). Without it the time-based contracts skip and are reported as unverified | `recovery` is declared |
+| `dendrux_fault_injector` | An object that fails the next write transaction at a named point | Optional. Without it the report says "crash recovery: not certified" |
+
+A complete example for SQLite ships in the package, as `dendrux.testing.store_kit.sqlite_fixtures`. For a SQL store you change how the engine and store are made. One small object keeps every engine the fixtures create, so they are all disposed at the end, and reopened engines reuse the engine's URL object (a URL turned into a string hides the password):
+
+[//]: # "docs-test: skip - fragment: your own conftest.py for a database this repository does not ship"
+
+```python
+import pytest
+import pytest_asyncio
+from sqlalchemy.ext.asyncio import create_async_engine
+
+from dendrux.db._settings import seed_settings
+from dendrux.db.models import Base
+from dendrux.testing.store_kit.sql import SqlClock, SqlFaultInjector
+
+
+class World:
+    def __init__(self):
+        self.engines = []
+
+    def engine(self, url):
+        engine = create_async_engine(url)
+        self.engines.append(engine)
+        return engine
+
+    async def fresh(self):
+        engine = self.engine(NEW_EMPTY_DATABASE_URL)
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+            await conn.run_sync(lambda c: seed_settings(c, active=True))
+        return CockroachStateStore(engine)
+
+    async def reopen(self, store):
+        # store._engine.url is a URL object: it keeps the password. Do not use str(url).
+        return CockroachStateStore(self.engine(store._engine.url))
+
+
+@pytest_asyncio.fixture
+async def world():
+    world = World()
+    yield world
+    for engine in world.engines:
+        await engine.dispose()
+
+
+@pytest.fixture
+def dendrux_store_factory(world):
+    return world.fresh
+
+
+@pytest.fixture
+def dendrux_store_reopen(world):
+    return world.reopen
+
+
+@pytest.fixture
+def dendrux_store_second_instance(world):
+    return world.reopen  # a second instance is a new engine over the same data
+
+
+@pytest.fixture
+def dendrux_clock(world):
+    return SqlClock(lambda: world.engines[0])  # ages every stored run clock
+
+
+@pytest.fixture
+def dendrux_fault_injector():
+    injector = SqlFaultInjector()
+    yield injector
+    injector.close()
+```
+
+`SqlClock` and `SqlFaultInjector` work on any SQLAlchemy engine, so a `SQLStateStore` subclass gets both without writing them. If your clock instead moves the store's time source forward (so stored timestamps stay as they are), give it a `now()` method returning the store's current time: the kit computes lease cutoffs from it. A clock that ages stored timestamps needs no `now()`.
+
+A fault injector has `arm(store, point, kind=, after=, sticky=)`, `fired(store)` and `disarm(store)`. `fired` must count the cuts that really happened: the kit asserts that every cut it asked for fired, so an injector that does nothing fails certification.
+
+The tests create their schema from the models, so your factory must too. Schema migrations are tested separately.
+
+## Run the kit
+
+```bash
+pip install "dendrux[testkit]"
+pytest -p dendrux.testing.store_kit
+```
+
+`-p dendrux.testing.store_kit` loads the plugin **and** collects the contracts; you do not copy any test files. Installing `dendrux` registers a tiny bootstrap module with pytest. It does not import `dendrux` or load the kit until you switch it on, so other pytest sessions in the same environment are unaffected and pay no import cost. Switching it on needs `pytest-asyncio` (`pip install "dendrux[testkit]"`); without it pytest stops with a message naming the extra. Two other ways to switch it on: `--dendrux-store-kit` on the command line, or `dendrux_store_kit = true` under `[tool.pytest.ini_options]`. Merely having the plugin installed or listed in `pytest_plugins` collects nothing.
+
+If you use `pytest-asyncio` in strict mode, add `asyncio_default_fixture_loop_scope = "function"` to your pytest settings. The kit marks its own async tests, so `asyncio_mode` can stay as it is.
+
+To certify several databases, run pytest once per database (one CI job each) and let your fixtures read the database URL from the environment.
+
+## How certification works
+
+The kit reads the capabilities and the `deployment` your store declares:
+
+| You declared | The kit does |
+|---|---|
+| A capability, with its fixtures | Runs that capability's contracts. Any failure means the store is broken for what it declared |
+| A capability, **without** a fixture it needs | **Fails**. A declared promise cannot be checked without it. It does not skip |
+| No capability | Skips that capability's contracts |
+| No `deployment` | Refuses to certify |
+| No `dendrux_fault_injector` | Runs everything else; the report says "crash recovery: not certified" |
+| Only part of the contracts ran (`-k`, one file) | **NOT CERTIFIED (incomplete run)**. Certification needs a complete run, and the fixtures a declaration obliges are checked even when the contracts that use them were not selected |
+| A check the protocol cannot observe | Reported as `unverified`, never as a pass. Today: `save_usage` rows (the protocol has no read of them), and time-based contracts without a `dendrux_clock` |
+
+The basic contracts run on whatever storage format your store creates: format 1 when the four format-2 flags (`fenced_writes`, `retry_ids`, `checkpointing`, `atomic_completion`) are not all declared, format 2 otherwise.
+
+At the end of the session the kit prints a summary per store:
+
+```text
+=================== dendrux store kit: certification summary ===================
+CockroachStateStore (deployment=multi_server, capabilities=fenced_writes,retry_ids,checkpointing,atomic_completion,recovery)
+  declaration        3 passed
+  basic              34 passed
+  agent_flows        9 passed
+  fenced_writes      20 passed
+  retry_ids          14 passed
+  checkpointing      12 passed
+  atomic_completion  11 passed
+  recovery           12 passed
+  concurrency        16 passed
+  crash_recovery     35 passed
+  CERTIFIED: declaration, basic, agent_flows, fenced_writes, retry_ids, checkpointing, atomic_completion, recovery, concurrency, crash_recovery
+```
+
+## What each group checks
+
+| Group | Checks |
+|---|---|
+| declaration | `deployment` is declared and valid; each declared capability has the methods it needs; each declared capability has its fixtures |
+| basic | Create, read, finalize, cancel, pause, claim, notes and the note cap, tenant scoping, listing and filters, delegation reads, sweeps, exact round trips of Unicode and large values. Protocol calls only: the kit never reads your tables |
+| agent_flows | A real `Agent` against your store: a run, a server tool, a client-tool pause and resume, approval, cancel, stream, and resume after a restart |
+| fenced_writes | Every writer refuses a stale claim epoch and leaves no trace |
+| retry_ids | The same identity twice stores once; different content or another identity at the same position is a `write_conflict` |
+| checkpointing | Seeds, rewrites, conversation pages, size bounds, trace links, a submission consumed exactly once |
+| atomic_completion | A tool's intent, result, observation and event publish together; a run's end and its evidence publish together; a stale or lost write publishes nothing |
+| recovery | Lease marking, reclaim under a new epoch, the old owner fenced, partial sweeps by cursor, everything surviving a reopen |
+| concurrency | Two live instances, many callers: exactly one winner for claims, finalizes and idempotent creates; gapless event sequences; the note cap never exceeded; blob races |
+| crash_recovery | With the fault injector: a failed or cancelled write at each point is repeated safely by its identity; atomic operations are all-or-nothing; an interrupted sweep is finished by the next one |
+
+## When a contract fails
+
+- **A fenced writer accepted a stale epoch.** Your update does not include the epoch in its `WHERE` clause, or it is written outside the base's fenced helpers.
+- **Retry stored twice.** The identity is not part of the unique constraint, or `insert_if_absent_stmt` ignores clashes on the wrong key.
+- **Two winners for a claim.** The conditional update is not atomic on your database, or `supports_update_returning` is `True` when it should be `False`.
+- **Gaps or duplicates in event sequences.** `insert_if_absent_stmt` or `serialize_in_tx` does not serialize writers of one run.
+- **The note cap is exceeded.** `serialize_in_tx` does not hold across the count and the insert.
+- **Tenants "t" and "t " collide.** Your column collation pads or folds case.
+- **An atomic operation left half its writes.** A write happened outside the single transaction the base opens. Do not commit inside a quirk method.
+
+## Ask for help
+
+Open an issue with the kit's summary and the failing contract names. The summary contains no run data or driver text.

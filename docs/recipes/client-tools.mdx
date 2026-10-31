@@ -191,7 +191,7 @@ async def tool_results(body: ResultsIn, run_id: str = Depends(owned_run),
 
 Add a `DELETE /runs/{run_id}` route over `agent.cancel_run(run_id, tenant_id=tenant)` the same way.
 
-Send `pause_id` down with the pending calls and back with the results. `expected_pause_id=` makes a delayed or replayed submit fail with `PauseStatusMismatchError` (409) instead of answering a newer pause; it is optional for tool results, but you should always pass it. See [Pause ids and stale submits](/docs/architecture/pause-resume#pause-ids-and-stale-submits).
+Send `pause_id` down with the pending calls and back with the results. `expected_pause_id=` makes a delayed or replayed submit fail with `PauseStatusMismatchError` (409) instead of answering a newer pause; with a state store and default strict tenancy it is required when the stored pause has an id. A lenient Agent keeps it optional for tool results. Legacy pauses without an id can continue without a token. See [Pause ids and stale submits](/docs/architecture/pause-resume#pause-ids-and-stale-submits).
 
 A submission is checked before the run is claimed: every pending call must be answered once by id and tool name, payloads must be finite JSON or plain text within `Limits.max_tool_result_bytes`, and text may not contain NUL or lone surrogates. A bad submission raises `InvalidToolResultError` (or another `ValueError`, such as `InputValidationError`) and leaves the run paused, so the client can correct it and send it again.
 

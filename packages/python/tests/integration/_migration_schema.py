@@ -59,3 +59,24 @@ async def migration_schema(url: str, schema: str) -> Any:
                 await conn.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
         finally:
             await admin.dispose()
+
+
+def create_pre_activation_schema(connection: Any) -> None:
+    """Build an additive model schema with the migration's pre-activation invariants.
+
+    Only synthetic empty migration fixtures use this. Production activation is
+    irreversible; these tests must not start from an active create_all database.
+    """
+    from dendrux.db._settings import put_setting
+    from dendrux.db._storage_schema import ACTIVATION_INDEXES
+    from dendrux.db.models import Base
+
+    Base.metadata.create_all(connection)
+    connection.execute(text("DELETE FROM dendrux_settings WHERE key='activate_step'"))
+    put_setting(connection, "storage_format", "1")
+    for name, (table, column, old) in ACTIVATION_INDEXES.items():
+        connection.execute(text(f"DROP INDEX IF EXISTS {name}"))
+        if old:
+            connection.execute(
+                text(f"CREATE INDEX IF NOT EXISTS {old} ON {table} (agent_run_id, {column})")
+            )

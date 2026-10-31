@@ -62,21 +62,21 @@ See [Build your own read routes](/docs/recipes/build-your-own-read-routes).
 
 `run`, `stream`, `retry`, `resume`, `resume_stream`, `submit_tool_results`, `submit_input`, `submit_approval`, `submit_resume`, `cancel_run`, `request_pause` and `submit_note` all take `tenant_id=`.
 
-| Entry point | Omitted `tenant_id` means (default mode) |
+| Entry point | Omitted `tenant_id` with `strict_tenancy=False` |
 | --- | --- |
 | `run`, `stream`, `retry` | `None`: the new run is untenanted |
 | every other entry point | `UNSCOPED`: no tenant check |
 
-An explicit `tenant_id` on a run-control write must match the run's tenant exactly, otherwise `RunNotFoundError` is raised before anything is written, the same error as a missing run.
+The 0.6 default is `strict_tenancy=True`. When the effective call uses a state store, configured on the Agent, built from `database_url` or supplied to a low-level runner call, omitting `tenant_id` raises `TenantScopeRequiredError`. Without an effective store, run and stream accept an omitted `tenant_id` silently. `reclaim` always requires explicit scope, including on a lenient Agent. An explicit `tenant_id` on a run-control write must match the run's tenant exactly, otherwise `RunNotFoundError` is raised before anything is written, the same error as a missing run.
 
 ### Strict tenancy
 
-In a multi-tenant service the dangerous mistake is forgetting `tenant_id=` once. `strict_tenancy=True` turns that into an error:
+For an Agent with a state store, `strict_tenancy=True` makes an omitted `tenant_id` an error:
 
 [//]: # "docs-test: skip - fragment: relies on `Agent`, defined by setup shown elsewhere"
 
 ```python
-agent = Agent(provider=provider, prompt="...", strict_tenancy=True)
+agent = Agent(provider=provider, prompt="...", state_store=state, strict_tenancy=True)
 
 await agent.run("hi")                       # TenantScopeRequiredError
 await agent.run("hi", tenant_id="acme")     # ok
@@ -85,9 +85,9 @@ await agent.cancel_run(run_id, tenant_id=UNSCOPED)   # ok, explicitly an operato
 ```
 
 - `TenantScopeRequiredError` is a `ValueError`. It names the operation, not the data.
-- Delegated child runs inherit their parent's tenant and never raise.
-- Strict tenancy is opt-in in 0.5.0. It becomes the default in 0.6, and 0.5 prints a `FutureWarning` when you have not chosen. Choose with `strict_tenancy=True` or `strict_tenancy=False`.
-- It applies to `Agent` methods. Code that calls the lower-level `dendrux.run(agent, ...)` function directly is not covered.
+- A delegated child inherits scope only when the outer caller deliberately chose a tenant (including explicit `None`) or its parent resolved scope under strict rules. A stored child under a parent whose tenant was merely omitted raises `TenantScopeRequiredError`; pass `tenant_id` on the outer run.
+- Strict tenancy defaults to `True` in 0.6 and applies to calls with an effective state store. Such agents can explicitly choose `strict_tenancy=False` to keep the earlier behavior. With a state store and strict tenancy, continuations require `expected_pause_id` when the stored pause has an id; omission raises `InputValidationError` with code `pause_id_required`. Legacy pauses with no id still resume without one, including on approval.
+- It applies to Agent methods and low-level runner functions. Passing `state_store=` to `dendrux.run` or to `run_stream` / `retry` in `dendrux.runtime.runner` activates strict tenancy even if the Agent has no configured store.
 
 ### Metadata
 
@@ -107,10 +107,10 @@ See [Runs](/docs/architecture/runs) for what a key does.
 | Situation | Error |
 | --- | --- |
 | Run missing, or in another tenant, on any `Agent` or `RunStore` path | `RunNotFoundError(run_id)` (a `LookupError`) |
-| `strict_tenancy=True` and `tenant_id` omitted | `TenantScopeRequiredError` |
+| Agent with a state store, `strict_tenancy=True` and `tenant_id` omitted | `TenantScopeRequiredError` |
 | `tenant_id=""`, or an id or tenant that is too long or holds NUL on a read | `ValueError` (a fixed message, no echo) |
 | `get_pending` or `follow` without `tenant_id` | `TypeError` |
-| Strict tenancy and the module-level `dendrux.run` with no tenant | `TenantScopeRequiredError` (`tenant_id=None` passed explicitly is fine) |
+| Agent with a state store, strict tenancy and the module-level `dendrux.run` with no tenant | `TenantScopeRequiredError` (`tenant_id=None` passed explicitly is fine) |
 | Delegating to a child with a different explicit tenant | `ValueError` |
 
 Map `RunNotFoundError` to 404 for both missing and foreign runs. That is what stops callers learning which run ids exist in other tenants.
@@ -121,7 +121,7 @@ Treat `UNSCOPED` as "no filter" and `None` as `tenant_id IS NULL` in `list_runs`
 
 ## Erasing a tenant
 
-Dendrux 0.5 does not ship a tenant erasure API; it is the first priority for 0.6. Until then, use the manual recipe in [Erasing a tenant's data](/docs/recipes/erasing-tenant-data).
+Dendrux 0.6 does not ship a tenant erasure API. Use the manual recipe in [Erasing a tenant's data](/docs/recipes/erasing-tenant-data).
 
 ## Where this fits
 

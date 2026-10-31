@@ -74,6 +74,8 @@ def _agent(llm: MockLLM, store: StateStore, **kw: Any) -> Agent:
         "state_store": store,
     }
     defaults.update(kw)
+    defaults.setdefault("strict_tenancy", False)
+    defaults.setdefault("on_governance_change", "warn")
     return Agent(**defaults)
 
 
@@ -206,7 +208,11 @@ class TestPerCallDecisions:
         assert paused.status == RunStatus.WAITING_APPROVAL
         return agent, llm, paused, calls
 
-    async def test_mixed_server_client(self, store) -> None:
+    @pytest.mark.parametrize("fmt", [1, 2])
+    async def test_mixed_server_client(self, store, engine, fmt) -> None:
+        from tests._fixtures.storage import pin_storage_format
+
+        await pin_storage_format(engine, fmt)
         agent, llm, paused, calls = await self._pause_three(store)
         pause = await store.get_pause_state(paused.run_id)
         ids = [tc["id"] for tc in pause["pending_tool_calls"]]
@@ -247,8 +253,9 @@ class TestPerCallDecisions:
         final = await _finish_client(agent, store, paused.run_id)
         assert final.status == RunStatus.SUCCESS
         contents = _tool_contents(llm, 1)
-        # One TOOL message per call id; server results in pending order, client after.
-        assert list(contents) == [ids[0], ids[1], ids[3], ids[2]]
+        # Format 2 follows assistant call order; format 1 preserves the
+        # legacy server-then-client order.
+        assert list(contents) == (ids if fmt == 2 else [ids[0], ids[1], ids[3], ids[2]])
         assert json.loads(contents[ids[0]]) == {"denied": "Too large"}
         assert json.loads(contents[ids[3]]) == "Refunded 2"
 
@@ -330,6 +337,10 @@ class TestPerCallDecisions:
         assert record.status == RunStatus.WAITING_APPROVAL.value
 
     async def test_duplicate_ids_in_claimed_blob_release_claim(self, store) -> None:
+        # This fault injection / pause blob exercises the format-1 write path.
+        from tests._fixtures.storage import pin_storage_format
+
+        await pin_storage_format(store._engine, 1)
         agent, _, paused, _ = await self._pause_three(store)
         pause = await store.get_pause_state(paused.run_id)
         gated = list(pause["approval_gates"])
@@ -563,8 +574,14 @@ class TestHookPersistence:
                 .all()
             )
         [row] = rows
-        assert row.meta == {"substituted": True}
+        meta = dict(row.meta)
+        observation = meta.pop("dendrux.observation", None)
+        assert meta == {"substituted": True}
         assert row.result == {"status": "held_for_review"}
+        if (await store.get_run(result.run_id)).storage_format == 2:
+            assert json.loads(observation["content"]) == row.result
+        else:
+            assert observation is None
         assert await _events(store, result.run_id, "policy.substituted")
 
     async def test_hook_error_event_persisted(self, store) -> None:
@@ -626,7 +643,10 @@ class TestRejectionViaResumeStream:
 
 class TestStalePauseGeneration:
     async def test_decisions_for_replaced_pause_fail_before_claim(self, store) -> None:
-        """ABA: the pause is replaced between validation and claim."""
+        """ABA: the legacy physical pause is replaced between validation and claim."""
+        from tests._fixtures.storage import pin_storage_format
+
+        await pin_storage_format(store._engine, 1)
         import copy
 
         llm = MockLLM(

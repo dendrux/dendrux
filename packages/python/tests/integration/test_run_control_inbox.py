@@ -42,7 +42,9 @@ async def client_read() -> str:
 class TestDelivery:
     async def test_note_delivered_at_next_iteration(self, store) -> None:
         llm = ScriptedLLM([tool_call("step", pid="t1"), LLMResponse(text="done")], gate_at=0)
-        agent = Agent(provider=llm, prompt="Test.", tools=[step], state_store=store)
+        agent = Agent(
+            strict_tenancy=False, provider=llm, prompt="Test.", tools=[step], state_store=store
+        )
         task = asyncio.create_task(agent.run("go"))
         await asyncio.wait_for(llm.entered.wait(), 5)
         run_id = (await store.list_runs())[0].id
@@ -105,6 +107,7 @@ class TestDelivery:
         }[status]
         llm = ScriptedLLM([first, LLMResponse(text="done")])
         agent = Agent(
+            strict_tenancy=False,
             provider=llm,
             prompt="Test.",
             tools=[client_read, guarded, pauser],
@@ -158,7 +161,7 @@ class TestDelivery:
 
     async def test_note_during_final_call_is_reported_undelivered(self, store) -> None:
         llm = ScriptedLLM([LLMResponse(text="done")], gate_at=0)
-        agent = Agent(provider=llm, prompt="Test.", state_store=store)
+        agent = Agent(strict_tenancy=False, provider=llm, prompt="Test.", state_store=store)
         task = asyncio.create_task(agent.run("go"))
         await asyncio.wait_for(llm.entered.wait(), 5)
         run_id = (await store.list_runs())[0].id
@@ -178,6 +181,7 @@ class TestDelivery:
 
         llm = ScriptedLLM([tool_call("step", pid="t1"), LLMResponse(text="done")], gate_at=0)
         agent = Agent(
+            strict_tenancy=False,
             provider=llm,
             prompt="Test.",
             tools=[step],
@@ -197,7 +201,9 @@ class TestDelivery:
 
 class TestValidation:
     async def test_rejections(self, store) -> None:
-        agent = Agent(provider=ScriptedLLM([]), prompt="Test.", state_store=store)
+        agent = Agent(
+            strict_tenancy=False, provider=ScriptedLLM([]), prompt="Test.", state_store=store
+        )
         await store.create_run("r1", "a", tenant_id="t1")
         with pytest.raises(ValueError):
             await agent.submit_note("r1", "")
@@ -225,8 +231,16 @@ class TestValidation:
 class TestConcurrency:
     async def test_concurrent_submitters_each_delivered_once_in_order(self, store) -> None:
         llm = ScriptedLLM([tool_call("client_read", pid="t1"), LLMResponse(text="done")])
-        agent = Agent(provider=llm, prompt="Test.", tools=[client_read], state_store=store)
-        other = Agent(provider=ScriptedLLM([]), prompt="Other.", state_store=store)
+        agent = Agent(
+            strict_tenancy=False,
+            provider=llm,
+            prompt="Test.",
+            tools=[client_read],
+            state_store=store,
+        )
+        other = Agent(
+            strict_tenancy=False, provider=ScriptedLLM([]), prompt="Other.", state_store=store
+        )
         waiting = await agent.run("go")
 
         ids = await asyncio.gather(
@@ -256,7 +270,9 @@ class TestConcurrency:
         assert sorted(e.data["note_id"] for e in events) == sorted(ids)
 
     async def test_note_vs_terminal_race_never_loses_an_accepted_note(self, store) -> None:
-        agent = Agent(provider=ScriptedLLM([]), prompt="Test.", state_store=store)
+        agent = Agent(
+            strict_tenancy=False, provider=ScriptedLLM([]), prompt="Test.", state_store=store
+        )
         for i in range(15):
             run_id = f"race-{i:02d}"
             await store.create_run(run_id, "a")

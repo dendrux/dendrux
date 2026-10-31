@@ -19,8 +19,11 @@ import logging
 import re
 from collections.abc import Awaitable, Callable, Iterator, Sequence
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Literal, TypeAlias
+
+from dendrux import _codes
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Coroutine
@@ -78,6 +81,7 @@ class ToolCall:
     provider_tool_call_id: str | None = None
     raw_arguments: str | None = field(default=None, repr=False)
     parse_error: str | None = None
+    raw_length: int | None = None
 
 
 class _MetaUnset:
@@ -528,6 +532,7 @@ class ToolDef:
     # PII restore allowlist (``PII(restore="allowlisted")``): False, True (every
     # entity) or a frozenset of entity names. Ignored under ``restore="all"``.
     receives_pii: bool | frozenset[str] = False
+    idempotent: bool = False
 
 
 @dataclass(frozen=True)
@@ -863,7 +868,8 @@ class Budget:
         max_subtree_nodes: Root-inclusive accounting cap (default 10,000).
             Larger trees raise BudgetConfigurationError instead of using partial usage.
         count_cache_tokens: Count cache read and write tokens toward
-            ``max_tokens``. ``None`` (default) means not chosen.
+            ``max_tokens``. Defaults to ``True``; explicit ``False`` or ``None``
+            retains input-plus-output accounting.
 
     Raises:
         ValueError: If neither limit is set, a limit is not positive, a
@@ -875,7 +881,7 @@ class Budget:
     max_cost_usd: float | None = None
     on_exceed: BudgetAction = "warn"
     include_children: bool = True
-    count_cache_tokens: bool | None = None
+    count_cache_tokens: bool | None = True
     max_subtree_nodes: int = 10000
 
     def __post_init__(self) -> None:
@@ -1072,6 +1078,11 @@ class Limits:
             bytes. Default 64 KiB.
         max_notes_per_run: Most notes ``submit_note`` accepts for one run.
             Default 1000.
+        max_pending_calls: Most calls in one format-2 assistant batch. Default 64.
+        max_rebuild_bytes: Largest recovered conversation, in UTF-8 JSON bytes.
+            Default 16 MiB.
+        max_rebuild_rows: Most expanded entries in a recovered conversation.
+            Default 20,000.
 
     Raises:
         ValueError: If a cap is not a positive integer.
@@ -1081,6 +1092,9 @@ class Limits:
     max_input_bytes: int = _MIB
     max_metadata_bytes: int = 64 * 1024
     max_notes_per_run: int = 1000
+    max_pending_calls: int = 64
+    max_rebuild_bytes: int = 16 * _MIB
+    max_rebuild_rows: int = 20_000
 
     def __post_init__(self) -> None:
         for name in (
@@ -1088,10 +1102,35 @@ class Limits:
             "max_input_bytes",
             "max_metadata_bytes",
             "max_notes_per_run",
+            "max_pending_calls",
+            "max_rebuild_bytes",
+            "max_rebuild_rows",
         ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                if name in {"max_pending_calls", "max_rebuild_bytes", "max_rebuild_rows"}:
+                    _codes.log_code(logger, _codes.INVALID_LIMIT, run_id=None)
                 raise ValueError(f"Limits {name} must be a positive int, got {value!r}.")
+
+
+def _validate_provider_kwargs(value: dict[str, Any], *, run_id: str | None = None) -> None:
+    try:
+        _validate_persistable(value, "provider_kwargs")
+    except InputValidationError:
+        _codes.log_code(logger, _codes.PROVIDER_KWARGS_INVALID, run_id=run_id)
+        raise
+    size = 0
+    try:
+        for chunk in json.JSONEncoder(ensure_ascii=False, separators=(",", ":")).iterencode(value):
+            size += len(chunk.encode("utf-8"))
+            if size > 2048:
+                break
+    except (TypeError, ValueError):
+        _codes.log_code(logger, _codes.PROVIDER_KWARGS_INVALID, run_id=run_id)
+        raise ValueError("provider_kwargs must be JSON serializable") from None
+    if size > 2048:
+        _codes.log_code(logger, _codes.PROVIDER_KWARGS_TOO_LARGE, run_id=run_id)
+        raise ValueError("provider_kwargs must encode to at most 2048 UTF-8 bytes")
 
 
 @dataclass(frozen=True)
@@ -1190,6 +1229,27 @@ class ErrorInfo:
         )
 
 
+@dataclass(frozen=True)
+class RecoveryInfo:
+    """Durable recovery summary, absent for runs that were never reclaimed."""
+
+    reclaim_attempts: int
+    last_reclaimed_at: datetime | None
+    replayed_tool_calls: list[str]
+    replayed_truncated: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        stamp = self.last_reclaimed_at
+        return {
+            "reclaim_attempts": self.reclaim_attempts,
+            "last_reclaimed_at": stamp.astimezone(UTC).isoformat().replace("+00:00", "Z")
+            if stamp
+            else None,
+            "replayed_tool_calls": list(self.replayed_tool_calls),
+            "replayed_truncated": self.replayed_truncated,
+        }
+
+
 @dataclass
 class RunResult:
     """The outcome of an agent run.
@@ -1222,6 +1282,8 @@ class RunResult:
 
     ``error_info`` describes a provider failure that ended the run (ERROR
     only). ``pause_id`` identifies the current pause of a paused run.
+    ``recovery`` summarizes durable reclaims and replayed calls. It is None
+    for unreclaimed runs, whose wire DTO omits the additive recovery key.
     """
 
     run_id: str
@@ -1240,6 +1302,7 @@ class RunResult:
     pause_id: str | None = None
 
     pending: PendingPause | None = None
+    recovery: RecoveryInfo | None = None
     _wire_pii_mapping: dict[str, Any] = field(
         default_factory=dict, init=False, repr=False, compare=False
     )
@@ -1493,6 +1556,8 @@ class PauseState:
     schema_version: int | None = 1
 
     provider_kwargs: dict[str, Any] = field(default_factory=dict)
+    image_view_ref: str | None = None
+    loop_state_ref: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to JSON-compatible dict for DB storage.
@@ -1541,6 +1606,12 @@ class PauseState:
             for k, v in self.provider_kwargs.items()
             if k in {"model", "max_tokens", "temperature", "thinking", "effort"}
         }
+        if self.schema_version == 2:
+            for key in ("history", "steps", "image_view"):
+                d.pop(key, None)
+            d["image_view_ref"] = self.image_view_ref
+            d["loop_state_ref"] = True
+            d["provider_kwargs"] = dict(self.provider_kwargs)
         # Validate JSON safety — catch non-serializable meta values early
         try:
             json.dumps(d)
@@ -1554,6 +1625,15 @@ class PauseState:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> PauseState:
         """Deserialize from a dict (loaded from DB)."""
+        if data.get("schema_version", 1) not in (None, 1, 2):
+            from dendrux.errors import PersistenceError
+
+            _codes.log_code(
+                logging.getLogger(__name__),
+                _codes.PAUSE_FORMAT_UNSUPPORTED,
+                run_id=data.get("run_id"),
+            )
+            raise PersistenceError(code="pause_format_unsupported")
         return cls(
             agent_name=data["agent_name"],
             pending_tool_calls=[
@@ -1581,10 +1661,13 @@ class PauseState:
             ),
             pause_id=data.get("pause_id"),
             schema_version=data.get("schema_version") or 1,
+            image_view_ref=data.get("image_view_ref"),
+            loop_state_ref=bool(data.get("loop_state_ref", False)),
             provider_kwargs={
                 k: v
                 for k, v in (data.get("provider_kwargs") or {}).items()
-                if k in {"model", "max_tokens", "temperature", "thinking", "effort"}
+                if data.get("schema_version") == 2
+                or k in {"model", "max_tokens", "temperature", "thinking", "effort"}
             },
         )
 
@@ -1603,7 +1686,7 @@ def tool_call_parse_meta(tc: ToolCall) -> dict[str, Any]:
         return {}
     return {
         "parse_error": tc.parse_error,
-        "raw_length": len(tc.raw_arguments) if tc.raw_arguments is not None else None,
+        "raw_length": len(tc.raw_arguments) if tc.raw_arguments is not None else tc.raw_length,
     }
 
 
@@ -1624,6 +1707,7 @@ def _tool_call_from_dict(d: dict[str, Any]) -> ToolCall:
         id=d["id"],
         provider_tool_call_id=d.get("provider_tool_call_id"),
         parse_error=d.get("parse_error"),
+        raw_length=d.get("raw_length"),
     )
 
 
@@ -2051,6 +2135,7 @@ class CreateRunResult:
     run_id: str
     outcome: Literal["created", "existing_active", "existing_terminal"]
     status: RunStatus
+    storage_format: int = 1
 
 
 class RunAlreadyActiveError(RuntimeError):

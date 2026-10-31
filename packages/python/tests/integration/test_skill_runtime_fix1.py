@@ -47,7 +47,11 @@ async def test_retry_replay_records_own_wire_input(store):
     second = await a.run("second question", runs=[first.run_id], activate_skills=["demo"])
     b = agent(store, [LLMResponse(text="retry")])
     retried = await b.retry(second.run_id)
-    trace = next(t for t in await store.get_traces(retried.run_id) if t.role == "user")
+    trace = next(
+        t
+        for t in await store.get_traces(retried.run_id)
+        if t.role == "user" and not (t.meta or {}).get("dendrux.seed_prefix")
+    )
     assert trace.content == "second question"
     assert "second question" in trace.meta["wire_content"]
     assert "first question" not in trace.meta["wire_content"]
@@ -57,7 +61,7 @@ async def test_retry_replay_records_own_wire_input(store):
 @pytest.mark.parametrize("path", ["resume", "submit"])
 async def test_non_skill_cancel_during_resume_preparation_sequences_event(store, path):
     p = MockLLM([LLMResponse(tool_calls=[ToolCall(name="client", params={})])])
-    a = Agent(prompt="test", provider=p, tools=[client], state_store=store)
+    a = Agent(strict_tenancy=False, prompt="test", provider=p, tools=[client], state_store=store)
     paused = await a.run("input")
     state = await store.get_pause_state(paused.run_id)
     results = [
@@ -136,6 +140,10 @@ async def test_interleaved_resume_streams_own_session(store, different_agents):
 
 @pytest.mark.parametrize("claimed", [False, True])
 async def test_malformed_manifest_fails_without_stuck_claim(store, claimed):
+    # This fault injection / pause blob exercises the format-1 write path.
+    from tests._fixtures.storage import pin_storage_format
+
+    await pin_storage_format(store._engine, 1)
     from dendrux.runtime.runner import resume_claimed
 
     a = agent(store, [LLMResponse(tool_calls=[ToolCall(name="client", params={})])], tools=[client])

@@ -157,7 +157,7 @@ async def test_normal_connect_guard_does_not_rely_on_connection_init_using_raw_c
 
 
 async def test_loop_shutdown_drains_cancelled_run_before_retiring_pool(engine, tmp_path, caplog):
-    from dendrux.runtime.state import SQLAlchemyStateStore
+    from dendrux.runtime.stores._factory import store_for_engine
     from tests._helpers.scripted_provider import ScriptedLLM
 
     pg = engine.dialect.name == "postgresql"
@@ -188,14 +188,14 @@ async def test_loop_shutdown_drains_cancelled_run_before_retiring_pool(engine, t
     a = holder[0]
     # Inspect via the fixture for PG; the explicit file engine for SQLite.
     if pg:
-        state = SQLAlchemyStateStore(engine)
+        state = store_for_engine(engine)
         records = await state.list_runs(agent_name="shutdown")
     else:
         from sqlalchemy.ext.asyncio import create_async_engine
 
         check = create_async_engine(url)
         try:
-            records = await SQLAlchemyStateStore(check).list_runs(agent_name="shutdown")
+            records = await store_for_engine(check).list_runs(agent_name="shutdown")
         finally:
             await check.dispose()
     assert len(records) == 1 and records[0].status == "cancelled"

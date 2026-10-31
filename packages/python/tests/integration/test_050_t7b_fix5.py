@@ -208,7 +208,7 @@ async def test_exclusive_migration_lock_timeout_is_retryable(engine, phase, reco
             ).scalar_one() == 0
             assert (
                 await conn.execute(text("SELECT version_num FROM alembic_version"))
-            ).scalar_one() == "e8f9a0b1c2d3"
+            ).scalar_one() == "f9a0b1c2d3e4"
             assert (
                 await conn.execute(
                     text("""
@@ -227,7 +227,7 @@ async def test_later_downgrade_refusal_rolls_back_clock_removal(engine):
 
     from sqlalchemy import inspect
 
-    from dendrux.runtime.state import SQLAlchemyStateStore
+    from dendrux.runtime.stores._factory import store_for_engine
     from tests.integration._migration_schema import migration_schema
     from tests.integration._migration_schema import test_database_url as pg_url
     from tests.integration.test_050_t1_r1_migration import PRIOR, _alembic, _seed
@@ -239,7 +239,7 @@ async def test_later_downgrade_refusal_rolls_back_clock_removal(engine):
         await asyncio.to_thread(_alembic, url, "upgrade", PRIOR)
         await _seed(target)
         await asyncio.to_thread(_alembic, url, "upgrade", "head")
-        store = SQLAlchemyStateStore(target)
+        store = store_for_engine(target)
         await store.create_run(
             "duplicate", "a", tenant_id="B", idempotency_key="k1", idempotency_fingerprint="fp"
         )

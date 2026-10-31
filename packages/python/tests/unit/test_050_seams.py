@@ -33,9 +33,9 @@ def calls(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[Any]]:
     record: dict[str, list[Any]] = {"resolve": [], "tenant": [], "limit": []}
     resolve = _tenant_checks.resolve_tenant
 
-    def _resolve(agent: Any, entry: Any, tenant_id: Any, *, default: Any) -> Any:
+    def _resolve(agent: Any, entry: Any, tenant_id: Any, *, default: Any, store: Any = None) -> Any:
         record["resolve"].append((entry, tenant_id, default))
-        return resolve(agent, entry, tenant_id, default=default)
+        return resolve(agent, entry, tenant_id, default=default, store=store)
 
     def _tenant(agent: Any, entry: Any, *, tenant_id: Any, **fields: Any) -> None:
         record["tenant"].append((entry, tenant_id, fields))
@@ -57,19 +57,31 @@ def _agent() -> Agent:
 
 _ASYNC_ENTRIES: list[tuple[str, Any, Any]] = [
     ("run", lambda a: a.run("hi", metadata={"k": 1}), None),
-    ("retry", lambda a: a.retry("r1", metadata={"k": 1}), None),
-    ("resume", lambda a: a.resume("r1"), UNSCOPED),
-    ("submit_tool_results", lambda a: a.submit_tool_results("r1", []), UNSCOPED),
-    ("submit_input", lambda a: a.submit_input("r1", "answer"), UNSCOPED),
-    ("submit_approval", lambda a: a.submit_approval("r1", approved=True), UNSCOPED),
-    ("submit_resume", lambda a: a.submit_resume("r1"), UNSCOPED),
-    ("cancel_run", lambda a: a.cancel_run("r1"), UNSCOPED),
-    ("request_pause", lambda a: a.request_pause("r1"), UNSCOPED),
-    ("submit_note", lambda a: a.submit_note("r1", "note", metadata={"m": 1}), UNSCOPED),
+    ("retry", lambda a: a.retry("00000000000000000000000304", metadata={"k": 1}), None),
+    ("resume", lambda a: a.resume("00000000000000000000000304"), UNSCOPED),
+    (
+        "submit_tool_results",
+        lambda a: a.submit_tool_results("00000000000000000000000304", []),
+        UNSCOPED,
+    ),
+    ("submit_input", lambda a: a.submit_input("00000000000000000000000304", "answer"), UNSCOPED),
+    (
+        "submit_approval",
+        lambda a: a.submit_approval("00000000000000000000000304", approved=True),
+        UNSCOPED,
+    ),
+    ("submit_resume", lambda a: a.submit_resume("00000000000000000000000304"), UNSCOPED),
+    ("cancel_run", lambda a: a.cancel_run("00000000000000000000000304"), UNSCOPED),
+    ("request_pause", lambda a: a.request_pause("00000000000000000000000304"), UNSCOPED),
+    (
+        "submit_note",
+        lambda a: a.submit_note("00000000000000000000000304", "note", metadata={"m": 1}),
+        UNSCOPED,
+    ),
 ]
 _SYNC_ENTRIES: list[tuple[str, Any, Any]] = [
     ("stream", lambda a: a.stream("hi", metadata={"k": 1}), None),
-    ("resume_stream", lambda a: a.resume_stream("r1"), UNSCOPED),
+    ("resume_stream", lambda a: a.resume_stream("00000000000000000000000304"), UNSCOPED),
 ]
 
 
@@ -102,8 +114,14 @@ class TestEntryChecksFireOncePerEntryPoint:
 
     async def test_fields_passed_to_both_modules(self, calls: dict[str, list[Any]]) -> None:
         with pytest.raises(_StopError):
-            await _agent().submit_note("r1", "note", metadata={"m": 1}, tenant_id="t")
-        fields = {"run_id": "r1", "note_text": "note", "note_metadata": {"m": 1}}
+            await _agent().submit_note(
+                "00000000000000000000000304", "note", metadata={"m": 1}, tenant_id="t"
+            )
+        fields = {
+            "run_id": "00000000000000000000000304",
+            "note_text": "note",
+            "note_metadata": {"m": 1},
+        }
         assert calls["tenant"] == [("submit_note", "t", fields)]
         assert calls["limit"] == [("submit_note", "t", fields)]
 
@@ -122,9 +140,15 @@ class TestEntryChecksFireOncePerEntryPoint:
 
     async def test_submit_approval_fields(self, calls: dict[str, list[Any]]) -> None:
         with pytest.raises(_StopError):
-            await _agent().submit_approval("r1", approved=False, rejection_reason="no")
+            await _agent().submit_approval(
+                "00000000000000000000000304", approved=False, rejection_reason="no"
+            )
         _, _, fields = calls["tenant"][0]
-        assert fields == {"run_id": "r1", "rejection_reason": "no", "decisions": None}
+        assert fields == {
+            "run_id": "00000000000000000000000304",
+            "rejection_reason": "no",
+            "decisions": None,
+        }
 
 
 class TestTenantResolution:
@@ -133,7 +157,7 @@ class TestTenantResolution:
         self, calls: dict[str, list[Any]], explicit: Any
     ) -> None:
         with pytest.raises(_StopError):
-            await _agent().cancel_run("r1", tenant_id=explicit)
+            await _agent().cancel_run("00000000000000000000000304", tenant_id=explicit)
         assert calls["tenant"][0][1] is explicit
 
     def test_resolve_tenant_defaults(self) -> None:
@@ -179,6 +203,7 @@ class TestRunnerEntrySeam:
         self, tmp_path: Path, runner_calls: list[tuple[str, str, Any, Any, dict[str, Any]]]
     ) -> None:
         agent = Agent(
+            strict_tenancy=False,
             provider=MockLLM([LLMResponse(text="a"), LLMResponse(text="b"), LLMResponse(text="c")]),
             prompt="p",
             database_url=f"sqlite+aiosqlite:///{tmp_path / 'seams.db'}",
@@ -273,10 +298,20 @@ class TestRunnerEntrySeam:
         store = _SpyStore()
         with pytest.raises(_StopError):
             if entry == "run":
-                await runner_run(agent, provider=agent.provider, user_input="hi", state_store=store)  # type: ignore[arg-type]
+                await runner_run(
+                    agent,
+                    provider=agent.provider,
+                    user_input="hi",
+                    state_store=store,
+                    tenant_id=None,
+                )  # type: ignore[arg-type]
             else:
                 stream = run_stream(
-                    agent, provider=agent.provider, user_input="hi", state_store=store
+                    agent,
+                    provider=agent.provider,
+                    user_input="hi",
+                    state_store=store,
+                    tenant_id=None,
                 )  # type: ignore[arg-type]
                 async for _ in stream:
                     pass
@@ -309,7 +344,7 @@ class TestBudgetConfigSeam:
         ("entry", "call"),
         [
             ("run", lambda a: a.run("hi", model="m-2")),
-            ("retry", lambda a: a.retry("r1", model="m-2")),
+            ("retry", lambda a: a.retry("00000000000000000000000304", model="m-2")),
         ],
     )
     async def test_called_at_new_run_entries_with_requested_model(
@@ -353,7 +388,7 @@ class TestBudgetConfigSeam:
             pricing, "check_budget_config", lambda agent, *, model=None: seen.append(model)
         )
         with pytest.raises(Exception):  # noqa: B017 - no persistence configured
-            await getattr(agent, entry)("r1")
+            await getattr(agent, entry)("00000000000000000000000304")
         assert seen == []
 
 
@@ -368,7 +403,7 @@ class TestNoteCapPlumbing:
                 return True
 
         agent._state_store = _Store()  # type: ignore[assignment]
-        await agent.submit_note("r1", "note")
+        await agent.submit_note("00000000000000000000000304", "note", tenant_id=None)
         assert seen["max_notes"] == 7
 
     async def test_store_without_max_notes_keeps_working(self) -> None:
@@ -383,7 +418,7 @@ class TestNoteCapPlumbing:
                 return True
 
         agent._state_store = _LegacyStore()  # type: ignore[assignment]
-        await agent.submit_note("r1", "note")
+        await agent.submit_note("00000000000000000000000304", "note", tenant_id=None)
         assert seen == {"called": True}
 
     async def test_default_cap_is_1000(self) -> None:
@@ -396,19 +431,17 @@ class TestNoteCapPlumbing:
                 return True
 
         agent._state_store = _Store()  # type: ignore[assignment]
-        await agent.submit_note("r1", "note")
+        await agent.submit_note("00000000000000000000000304", "note", tenant_id=None)
         assert seen["max_notes"] == 1000
 
 
 class TestAgentKwargs:
     def test_defaults(self) -> None:
-        agent = _agent()
-        assert agent._strict_tenancy is False
-        assert agent._strict_tenancy_chosen is False
+        agent = Agent(provider=MockLLM([]), prompt="p")
+        assert agent._strict_tenancy is True
         assert agent._limits == Limits()
         assert agent._tool_threads == 8
-        assert agent._on_governance_change == "warn"
-        assert agent._on_governance_change_chosen is False
+        assert agent._on_governance_change == "raise"
         from dendrux.tools._pool import ToolCallLimiter
 
         assert isinstance(agent._tool_call_limiter, ToolCallLimiter)
@@ -418,8 +451,8 @@ class TestAgentKwargs:
         agent = Agent(
             provider=MockLLM([]), prompt="p", strict_tenancy=False, on_governance_change="warn"
         )
-        assert (agent._strict_tenancy, agent._strict_tenancy_chosen) == (False, True)
-        assert (agent._on_governance_change, agent._on_governance_change_chosen) == ("warn", True)
+        assert agent._strict_tenancy is False
+        assert agent._on_governance_change == "warn"
 
     def test_stored(self) -> None:
         limits = Limits(max_input_bytes=10)

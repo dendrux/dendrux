@@ -426,7 +426,7 @@ async def test_tool_error_and_run_store_stay_value_free(tmp_path: Any) -> None:
     from dendrux import Agent
     from dendrux.db.models import Base
     from dendrux.llm.mock import MockLLM
-    from dendrux.runtime.state import SQLAlchemyStateStore
+    from dendrux.runtime.stores._factory import store_for_engine
     from dendrux.types import LLMResponse, ToolCall
 
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'oauth.db'}")
@@ -443,6 +443,7 @@ async def test_tool_error_and_run_store_stay_value_free(tmp_path: Any) -> None:
                 oauth=oauth,
             )
             agent = Agent(
+                strict_tenancy=False,
                 provider=MockLLM(
                     [
                         LLMResponse(
@@ -456,7 +457,7 @@ async def test_tool_error_and_run_store_stay_value_free(tmp_path: Any) -> None:
                 ),
                 prompt="p",
                 tool_sources=[connection.tools()],
-                state_store=SQLAlchemyStateStore(engine),
+                state_store=store_for_engine(engine),
             )
             try:
                 result = await agent.run("hi")

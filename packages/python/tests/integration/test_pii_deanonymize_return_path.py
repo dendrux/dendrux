@@ -14,7 +14,7 @@ from dendrux import tool
 from dendrux.agent import Agent
 from dendrux.guardrails import PII
 from dendrux.llm.mock import MockLLM
-from dendrux.runtime.state import SQLAlchemyStateStore
+from dendrux.runtime.stores._factory import store_for_engine
 from dendrux.types import LLMResponse, RunStatus, ToolCall, UsageStats
 
 
@@ -27,7 +27,7 @@ def _resp(text: str) -> LLMResponse:
 
 @pytest.fixture
 def db_store(engine):
-    return SQLAlchemyStateStore(engine)
+    return store_for_engine(engine)
 
 
 class TestReturnPathDeanonymize:
@@ -35,6 +35,7 @@ class TestReturnPathDeanonymize:
         """LLM sees placeholder, replies with placeholder; dev gets the original back."""
         llm = MockLLM([_resp("Nice to meet you, <<PERSON_1>>!")])
         agent = Agent(
+            strict_tenancy=False,
             provider=llm,
             prompt="Friendly chatbot.",
             state_store=db_store,
@@ -66,6 +67,7 @@ class TestReturnPathDeanonymize:
             ]
         )
         agent = Agent(
+            strict_tenancy=False,
             provider=llm,
             prompt="Greeter.",
             tools=[greet_lookup],
@@ -83,6 +85,7 @@ class TestReturnPathDeanonymize:
         is deanonymized. The persisted audit view stays placeholder-faithful."""
         llm = MockLLM([_resp("Hello <<PERSON_1>>!")])
         agent = Agent(
+            strict_tenancy=False,
             provider=llm,
             prompt="Greeter.",
             state_store=db_store,
@@ -102,6 +105,7 @@ class TestReturnPathDeanonymize:
         """LLM hallucinates <<PERSON_99>> (no entry in mapping) → event + passthrough."""
         llm = MockLLM([_resp("Nice to meet you, <<PERSON_99>>!")])
         agent = Agent(
+            strict_tenancy=False,
             provider=llm,
             prompt="Friendly chatbot.",
             state_store=db_store,
@@ -124,6 +128,7 @@ class TestReturnPathDeanonymize:
         """Without PII configured, mapping is empty; answer flows through verbatim."""
         llm = MockLLM([_resp("Hello, world!")])
         agent = Agent(
+            strict_tenancy=False,
             provider=llm,
             prompt="Greeter.",
             state_store=db_store,
@@ -141,6 +146,7 @@ class TestReturnPathDeanonymize:
         """Mapping with multiple entries — each one substituted."""
         llm = MockLLM([_resp("I'll email <<EMAIL_ADDRESS_1>> about <<PERSON_1>>'s account.")])
         agent = Agent(
+            strict_tenancy=False,
             provider=llm,
             prompt="Helper.",
             state_store=db_store,

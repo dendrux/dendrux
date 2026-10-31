@@ -18,6 +18,7 @@ from threading import Lock
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal
 
+from dendrux import _codes
 from dendrux.mcp._client import MCPClientAdapter
 from dendrux.mcp._credentials import (
     MCPAuthKey,
@@ -88,7 +89,6 @@ from dendrux.mcp._server import (
 from dendrux.mcp._source import (
     MCPSource,
     redact_source_text,
-    safe_source_exception_detail,
     source_has_opaque_credentials,
 )
 
@@ -282,11 +282,7 @@ async def _resolve_source_credentials(
     # may embed the very secret being refreshed, and this error's rendering
     # reaches last_error, governance events, and monitoring SDKs that walk
     # __context__. Only the class name is safe to keep.
-    logger.debug(
-        "MCP source '%s' credential resolution failed (%s)",
-        source.name,
-        type(failure).__name__,
-    )
+    _codes.log_code(logger, _codes.MCP_CREDENTIAL_RESOLUTION_FAILED, count=1)
     raise MCPCredentialError(
         f"Failed to resolve credentials for MCP source '{source.name}' ({type(failure).__name__})."
     ) from None
@@ -810,11 +806,7 @@ class _ViewToolSource(MCPServer):
                 )
             self._entry = replacement
             connection.runtime._release(connection.identity, broken)
-            logger.info(
-                "MCP tool view '%s' moved to a new connection after a connection loss "
-                "(code=mcp_view_relinked)",
-                self.name,
-            )
+            _codes.log_code(logger, _codes.MCP_VIEW_RELINKED)
             return replacement
 
     async def close(self) -> None:
@@ -1242,11 +1234,8 @@ class MCPRuntime:
                         close = getattr(result, "close", None)
                         if callable(close):
                             close()
-                except Exception as close_exc:
-                    logger.debug(
-                        "Disposing an MCP runtime observer's awaitable failed (%s).",
-                        type(close_exc).__name__,
-                    )
+                except Exception:
+                    _codes.log_code(logger, _codes.MCP_OBSERVER_DISPOSE_FAILED, count=1)
                 logger.warning(
                     "MCP runtime observer returned an awaitable handling %s; event dropped.",
                     type(event).__name__,
@@ -1721,13 +1710,8 @@ class MCPRuntime:
         clean = False
         try:
             await adapter.close()
-        except Exception as exc:
-            logger.warning(
-                "MCP source '%s' connection cleanup failed: %s (%s)",
-                entry.source.name,
-                safe_source_exception_detail(adapter.source, exc),
-                type(exc).__name__,
-            )
+        except Exception:
+            _codes.log_code(logger, _codes.MCP_CLEANUP_FAILED, count=1)
         else:
             clean = True
         finally:
@@ -2259,12 +2243,7 @@ class MCPRuntime:
                 try:
                     await adapter.close()
                 except Exception as exc:
-                    logger.warning(
-                        "MCP source '%s' cleanup failed after a connect error: %s (%s)",
-                        entry.source.name,
-                        safe_source_exception_detail(adapter.source, exc),
-                        type(exc).__name__,
-                    )
+                    _codes.log_code(logger, _codes.MCP_CLEANUP_FAILED, count=1)
             raise
         with self._lock:
             circuit_closed = self._record_circuit_connection_success(identity, entry)
@@ -2348,14 +2327,8 @@ class MCPRuntime:
         async def close() -> None:
             try:
                 await adapter.close()
-            except Exception as exc:
-                logger.warning(
-                    "MCP source '%s' cleanup failed after %s: %s (%s)",
-                    entry.source.name,
-                    after,
-                    safe_source_exception_detail(adapter.source, exc),
-                    type(exc).__name__,
-                )
+            except Exception:
+                _codes.log_code(logger, _codes.MCP_CLEANUP_FAILED, count=1)
 
         task = asyncio.create_task(close())
         try:

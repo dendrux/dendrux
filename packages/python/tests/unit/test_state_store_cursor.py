@@ -15,7 +15,7 @@ async def store_with_events():
     from sqlalchemy.ext.asyncio import create_async_engine
 
     from dendrux.db.models import Base
-    from dendrux.runtime.state import SQLAlchemyStateStore
+    from dendrux.runtime.stores._factory import store_for_engine
 
     engine = create_async_engine(
         "sqlite+aiosqlite:///:memory:",
@@ -24,7 +24,7 @@ async def store_with_events():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
-    store = SQLAlchemyStateStore(engine)
+    store = store_for_engine(engine)
 
     run_id = "test-run-cursor"
     await store.create_run(

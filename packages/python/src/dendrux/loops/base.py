@@ -161,6 +161,11 @@ class LoopNotifier(Protocol):
     loop emits everything else. Every hook carries ``run_id`` as its first
     positional argument so shared notifier instances can disambiguate
     concurrent runs without contextvars.
+
+    Optional synchronous ``trace_link(run_id)`` and
+    ``current_span_link(run_id, tool_call_id)`` hooks are duck-typed, so legacy
+    implementations still satisfy this protocol. ``on_run_started`` may accept
+    a signature-gated ``trace_link`` keyword for an existing/parent span.
     """
 
     async def on_run_started(
@@ -422,6 +427,14 @@ class BaseNotifier:
     in future protocol revisions land as no-op defaults so existing
     implementations keep working without changes.
     """
+
+    def trace_link(self, run_id: str) -> str | None:
+        """Optionally expose the run's W3C traceparent after its start hook."""
+        return None
+
+    def current_span_link(self, run_id: str, tool_call_id: str) -> str | None:
+        """Optionally expose the active tool span for delegated agents."""
+        return None
 
     async def on_run_started(
         self,

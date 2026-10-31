@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import functools
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -39,7 +40,10 @@ from dendrux.runtime.replay import (
     rebuild_messages,
 )
 from dendrux.runtime.runner import _carry_image_view, _resume_image_view
-from dendrux.runtime.state import RunEventRecord, SQLAlchemyStateStore, TraceRecord
+from dendrux.runtime.state import RunEventRecord, TraceRecord
+from dendrux.runtime.stores._factory import store_for_engine
+from dendrux.runtime.stores.sql.base import SQLStateStore
+from dendrux.runtime.stores.sql.sqlite import SQLiteStateStore
 from dendrux.tool import tool
 from dendrux.types import (
     IdempotencyConflictError,
@@ -78,7 +82,7 @@ def _scope(tenant_id: str | None) -> str:
     return "-" if tenant_id is None else "t:" + tenant_id
 
 
-class ImageStore(SQLAlchemyStateStore):
+class ImageStore(SQLiteStateStore):
     """Real store + in-memory ``BlobCatalog``; records every edge write."""
 
     def __init__(self, engine: Any) -> None:
@@ -87,6 +91,15 @@ class ImageStore(SQLAlchemyStateStore):
         self.edges: list[tuple[str, BlobEdge]] = []  # (run_id, edge)
         self.edge_calls: list[tuple[str, str]] = []  # (method, run_id)
         self.tenants: dict[str, str | None] = {}
+
+    async def _insert_trace(self, session, run_id, trace):
+        from dataclasses import replace
+
+        if trace.blob_refs:
+            self._check(run_id, trace.blob_refs_scope, trace.blob_refs)
+            self._add("trace_write", run_id, trace.blob_refs)
+            trace = replace(trace, blob_refs=None, blob_refs_scope=None)
+        return await super()._insert_trace(session, run_id, trace)
 
     # --- edge-writing record methods (B's kwargs) ---
     def _check(self, run_id: str, scope: str | None, edges: Any) -> None:
@@ -105,6 +118,7 @@ class ImageStore(SQLAlchemyStateStore):
             if (run_id, edge.owner_kind, edge.owner_id, edge.ordinal) not in keys:
                 self.edges.append((run_id, edge))
 
+    @functools.wraps(SQLStateStore.create_run)
     async def create_run(self, run_id: str, agent_name: str, **kwargs: Any) -> Any:
         refs = kwargs.pop("blob_refs", None)
         scope = kwargs.pop("blob_refs_scope", None)
@@ -116,6 +130,7 @@ class ImageStore(SQLAlchemyStateStore):
             self._add("create_run", run_id, refs)
         return result
 
+    @functools.wraps(SQLStateStore.save_trace)
     async def save_trace(self, run_id: str, *args: Any, **kwargs: Any) -> Any:
         refs = kwargs.pop("blob_refs", None)
         scope = kwargs.pop("blob_refs_scope", None)
@@ -126,6 +141,7 @@ class ImageStore(SQLAlchemyStateStore):
             self._add("save_trace", run_id, refs)
         return result
 
+    @functools.wraps(SQLStateStore.save_tool_call)
     async def save_tool_call(self, run_id: str, *args: Any, **kwargs: Any) -> Any:
         refs = kwargs.pop("blob_refs", None)
         scope = kwargs.pop("blob_refs_scope", None)
@@ -134,6 +150,17 @@ class ImageStore(SQLAlchemyStateStore):
         result = await super().save_tool_call(run_id, *args, **kwargs)
         if refs:
             self._add("save_tool_call", run_id, refs)
+        return result
+
+    @functools.wraps(SQLStateStore.complete_tool_call)
+    async def complete_tool_call(self, run_id: str, **kwargs: Any) -> Any:
+        refs = kwargs.pop("blob_refs", None)
+        scope = kwargs.pop("blob_refs_scope", None)
+        if refs:
+            self._check(run_id, scope, refs)
+        result = await super().complete_tool_call(run_id, **kwargs)
+        if refs:
+            self._add("complete_tool_call", run_id, refs)
         return result
 
     async def submit_and_claim(self, run_id: str, **kwargs: Any) -> bool:
@@ -434,6 +461,8 @@ async def server_add(a: int, b: int) -> int:
 
 def _agent(store: Any, responses: list[LLMResponse], **kw: Any) -> Agent:
     policy = kw.pop("images", ImagePolicy(capability_overrides={"mock": "yes"}))
+    kw.setdefault("strict_tenancy", False)
+    kw.setdefault("on_governance_change", "warn")
     return Agent(
         name=kw.pop("name", "screen_agent"),
         prompt="You look at screenshots.",
@@ -534,12 +563,11 @@ class TestRunWithImages:
         # recorder's save_trace (B), never from a separate runner write
         assert ("create_run", result.run_id) in store.edge_calls
         edges = [(e.owner_kind, e.owner_id, e.ordinal) for e in store.edges_of(result.run_id)]
-        assert edges[0] == ("input", "input", 1)
-        assert set(edges[1:]) <= {("trace", "0", 1)}
+        assert set(edges) == {("input", "input", 1), ("trace", "1", 1)}
         assert ("add_blob_refs", result.run_id) not in store.edge_calls
         assert all(e.tenant_scope == "t:acme" for e in store.edges_of(result.run_id))
         # the user trace keeps the projection and the wire parts in meta
-        traces = await store.get_traces(result.run_id)
+        traces = [t for t in await store.get_traces(result.run_id) if t.role == "user"]
         assert traces[0].content == "What does this say?"
         assert traces[0].meta["dendrux.parts"] == parts
         # provider saw the parts message
@@ -570,7 +598,7 @@ class TestRunWithImages:
         assert sent.parts[0].text.startswith("STABLE CONTEXT:\nrules")
         assert isinstance(sent.parts[1], ImagePart)
         assert sent.parts[2] == TextPart("caption")
-        traces = await store.get_traces(result.run_id)
+        traces = [t for t in await store.get_traces(result.run_id) if t.role == "user"]
         assert traces[0].content == "caption"
         assert traces[0].meta["dendrux.parts"][0]["text"].startswith("STABLE CONTEXT:")
         record = await store.get_run(result.run_id)
@@ -678,7 +706,7 @@ class TestRunWithImages:
     async def test_store_without_catalog_raises_persistence_unsupported(self, engine) -> None:
         from dendrux.errors import ImagePersistenceUnsupportedError
 
-        agent = _agent(SQLAlchemyStateStore(engine), [LLMResponse(text="x")])
+        agent = _agent(store_for_engine(engine), [LLMResponse(text="x")])
         if agent._blob_services(agent._state_store).catalog is not None:
             pytest.skip("built-in store implements the catalog (B merged)")
         with pytest.raises(ImagePersistenceUnsupportedError):
@@ -767,7 +795,7 @@ class TestStreamWithImages:
         run_id = events[-1].run_result.run_id
         record = await store.get_run(run_id)
         assert record.input_data["dendrux.parts"][1]["sha256"] == _sha(PNG)
-        assert [e.owner_kind for e in store.edges_of(run_id)][0] == "input"
+        assert {e.owner_kind for e in store.edges_of(run_id)} == {"input", "trace"}
         assert ("add_blob_refs", run_id) not in store.edge_calls
         assert agent.loop.seen[-1]["runtime"].tenant_scope == "t:t1"  # type: ignore[union-attr]
 
@@ -1013,7 +1041,7 @@ def _clarify_responses() -> list[LLMResponse]:
 
 async def _human_pause(store: ImageStore, agent: Agent) -> str:
     """Persist a WAITING_HUMAN_INPUT pause directly (loop-independent)."""
-    run_id = "01JHUMANPAUSE000000000000"
+    run_id = "00000000000000000000000109"
     await store.create_run(run_id, agent.name, input_data={"input": "q"}, tenant_id="acme")
     pause = PauseState(
         agent_name=agent.name,
@@ -1035,6 +1063,10 @@ async def _human_pause(store: ImageStore, agent: Agent) -> str:
 
 class TestUserInputImages:
     async def test_submit_input_with_image(self, store: ImageStore) -> None:
+        # This fault injection / pause blob exercises the format-1 write path.
+        from tests._fixtures.storage import pin_storage_format
+
+        await pin_storage_format(store._engine, 1)
         agent = _agent(store, [LLMResponse(text="thanks")])
         run_id = await _human_pause(store, agent)
         result = await agent.submit_input(run_id, ["here it is", Image.from_bytes(PNG)])
@@ -1049,6 +1081,10 @@ class TestUserInputImages:
         assert resumed.data["user_input"] == "here it is"
 
     async def test_submit_input_text_sequence_stays_text(self, store: ImageStore) -> None:
+        # This fault injection / pause blob exercises the format-1 write path.
+        from tests._fixtures.storage import pin_storage_format
+
+        await pin_storage_format(store._engine, 1)
         agent = _agent(store, [LLMResponse(text="thanks")])
         run_id = await _human_pause(store, agent)
         await agent.submit_input(run_id, ["a", "b"])
@@ -1143,6 +1179,10 @@ class TestApprovalCarry:
         self, store: ImageStore
     ) -> None:
         """approval pause (with a view) -> approve -> client pause -> submit in a new Agent."""
+        from tests._fixtures.storage import pin_storage_format
+
+        await pin_storage_format(store._engine, 1)
+
         from dendrux.types import ToolTarget  # noqa: F401
 
         responses = [
@@ -1240,12 +1280,16 @@ class TestInitialImageView:
         s1 = ImageSource(
             "t:a",
             [
-                _event("image.rejected", {"sha256": "r1", "tenant_scope": "t:a"}, 1),
+                _event(
+                    "image.rejected",
+                    {"sha256": "00000000000000000000000105", "tenant_scope": "t:a"},
+                    1,
+                ),
                 _event("image.rejected", {"sha256": "x", "tenant_scope": "t:b"}, 2),
                 _event(
                     "image.state",
                     {
-                        "described": [{"sha256": "d", "text": "first"}],
+                        "described": [{"sha256": "d", "text": "00000000000000000000000111"}],
                         "guardrail_verdicts": [
                             {
                                 "sha256": "g",
@@ -1266,9 +1310,21 @@ class TestInitialImageView:
         s2 = ImageSource(
             "t:a",
             [
-                _event("image.rejected", {"sha256": "r1", "tenant_scope": "t:a"}, 1),
-                _event("image.rejected", {"sha256": "r2", "tenant_scope": "t:a"}, 2),
-                _event("image.state", {"described": [{"sha256": "d", "text": "second"}]}, 3),
+                _event(
+                    "image.rejected",
+                    {"sha256": "00000000000000000000000105", "tenant_scope": "t:a"},
+                    1,
+                ),
+                _event(
+                    "image.rejected",
+                    {"sha256": "00000000000000000000000117", "tenant_scope": "t:a"},
+                    2,
+                ),
+                _event(
+                    "image.state",
+                    {"described": [{"sha256": "d", "text": "00000000000000000000000112"}]},
+                    3,
+                ),
                 _event("image.view_changed", {"epoch": 2, "dropped_through": 5, "visible": 3}, 4),
             ],
         )
@@ -1276,8 +1332,13 @@ class TestInitialImageView:
             sent_through=7, sources=[s1, s2], tenant_scope="t:a", single_full=False
         )
         assert state.sent_through == 7
-        assert state.rejected == [("t:a", "r1"), ("t:a", "r2")]
-        assert state.described == {("t:a", "d"): "first"}  # earlier source wins
+        assert state.rejected == [
+            ("t:a", "00000000000000000000000105"),
+            ("t:a", "00000000000000000000000117"),
+        ]
+        assert state.described == {
+            ("t:a", "d"): "00000000000000000000000111"
+        }  # earlier source wins
         assert ("t:a", "g", "G", "1", "tool", "shot") in state.guardrail_verdicts
         # several sources -> fresh drop view, no placeholders
         assert (state.epoch, state.dropped_through, state.placeholders) == (0, 0, {})
@@ -1308,7 +1369,9 @@ class TestInitialImageView:
         assert state.placeholders == {0: "drop", 1: "purged"}
 
     def test_other_tenant_source_ignored(self) -> None:
-        src = ImageSource("t:b", [_event("image.rejected", {"sha256": "r"}, 1)])
+        src = ImageSource(
+            "t:b", [_event("image.rejected", {"sha256": "00000000000000000000000102"}, 1)]
+        )
         state = initial_image_view(
             sent_through=0, sources=[src], tenant_scope="t:a", single_full=True
         )
@@ -1348,7 +1411,7 @@ class TestRebuildParts:
 
 class TestRetryAndReplay:
     async def test_retry_carries_parts_seeds_and_rejections(self, store: ImageStore) -> None:
-        agent = _agent(store, [LLMResponse(text="first")])
+        agent = _agent(store, [LLMResponse(text="00000000000000000000000111")])
         source = await agent.run(["what", Image.from_bytes(PNG)], tenant_id="acme")
         sha = _sha(PNG)
         await store.save_run_event(
@@ -1357,12 +1420,16 @@ class TestRetryAndReplay:
             iteration_index=1,
             data={"image_id": "img_x", "sha256": sha, "tenant_scope": "t:acme"},
         )
-        retry_agent = _agent(store, [LLMResponse(text="second")])
+        retry_agent = _agent(store, [LLMResponse(text="00000000000000000000000112")])
         result = await retry_agent.retry(source.run_id, tenant_id="acme")
         assert result.status == RunStatus.SUCCESS
         record = await store.get_run(result.run_id)
         assert record.input_data["dendrux.parts"][1]["sha256"] == sha
-        assert [e.owner_kind for e in store.edges_of(result.run_id)] == ["input", "seed"]
+        assert sorted(e.owner_kind for e in store.edges_of(result.run_id)) == [
+            "input",
+            "seed",
+            "trace",
+        ]
         state = retry_agent.loop.seen[-1]["state"]  # type: ignore[union-attr]
         assert state.sent_through == 1
         assert state.rejected == [("t:acme", sha)]
@@ -1383,7 +1450,10 @@ class TestRetryAndReplay:
         assert sent[0].content.startswith("see")
         state = follow.loop.seen[-1]["state"]  # type: ignore[union-attr]
         assert state.sent_through == 1
-        assert [e.owner_kind for e in store.edges_of(result.run_id)] == ["seed"]
+        assert sorted(e.owner_kind for e in store.edges_of(result.run_id)) == [
+            "seed",
+            "trace",
+        ]
 
     async def test_text_mode_replay_uses_input_parts(self, store: ImageStore) -> None:
         agent = _agent(store, [LLMResponse(text="one")])
@@ -1428,10 +1498,12 @@ class TestOtelImages:
         ref = ImageRef(
             sha256="d" * 64, media_type="image/png", byte_length=10, width=400, height=200
         )
-        await notifier.on_run_started("r", agent_name="a", agent_model="claude-sonnet-4-6")
-        await notifier.on_llm_call_started("r", 1)
+        await notifier.on_run_started(
+            "00000000000000000000000102", agent_name="a", agent_model="claude-sonnet-4-6"
+        )
+        await notifier.on_llm_call_started("00000000000000000000000102", 1)
         await notifier.on_llm_call_completed(
-            "r",
+            "00000000000000000000000102",
             LLMResponse(text="x"),
             1,
             semantic_messages=[Message.with_parts(Role.USER, [TextPart("q"), ImagePart(ref)])],
@@ -1452,10 +1524,15 @@ class TestOtelImages:
         provider = TracerProvider()
         provider.add_span_processor(SimpleSpanProcessor(exporter))
         notifier = OpenTelemetryNotifier(tracer=provider.get_tracer("t"))
-        await notifier.on_run_started("r", agent_name="a", agent_model="gpt-5-mini")
-        await notifier.on_llm_call_started("r", 1)
+        await notifier.on_run_started(
+            "00000000000000000000000102", agent_name="a", agent_model="gpt-5-mini"
+        )
+        await notifier.on_llm_call_started("00000000000000000000000102", 1)
         await notifier.on_llm_call_completed(
-            "r", LLMResponse(text="x"), 1, semantic_messages=[Message(role=Role.USER, content="q")]
+            "00000000000000000000000102",
+            LLMResponse(text="x"),
+            1,
+            semantic_messages=[Message(role=Role.USER, content="q")],
         )
         span = next(s for s in exporter.get_finished_spans() if "chat" in s.name)
         assert "dendrux.images.count" not in (span.attributes or {})
@@ -1714,7 +1791,7 @@ class TestSeededSourceCarry:
             "-",
             [
                 _event("image.view_changed", {"epoch": 3, "dropped_through": 6}, 1),
-                _event("image.rejected", {"sha256": "r"}, 2),
+                _event("image.rejected", {"sha256": "00000000000000000000000102"}, 2),
                 _event("image.state", {"placeholders": [{"slot": 0, "reason": "drop"}]}, 3),
             ],
             slot_offset=None,
@@ -1723,7 +1800,9 @@ class TestSeededSourceCarry:
             sent_through=1, sources=[src], tenant_scope="-", single_full=True
         )
         assert (state.epoch, state.dropped_through, state.placeholders) == (0, 0, {})
-        assert state.rejected == [("-", "r")]  # key-based state still carries
+        assert state.rejected == [
+            ("-", "00000000000000000000000102")
+        ]  # key-based state still carries
 
     def test_source_offset_from_meta(self) -> None:
         from dendrux.runtime.replay import IMAGE_SEEDED_KEY, PREFIX_META_KEY, source_slot_offset
@@ -2011,7 +2090,7 @@ class TestStoreFullSinglePass:
         from dendrux.media import InMemoryBlobStore
 
         self._real_services(monkeypatch)
-        store = SQLAlchemyStateStore(engine)
+        store = store_for_engine(engine)
         agent = _agent(
             store,
             [LLMResponse(text="a"), LLMResponse(text="b")],

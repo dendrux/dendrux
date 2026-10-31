@@ -25,24 +25,33 @@ import datetime  # noqa: TC003 — needed at runtime for SQLAlchemy Mapped[] res
 from typing import Any
 
 from sqlalchemy import (
-    CHAR,
     JSON,
     Boolean,
-    DateTime,
     ForeignKey,
     ForeignKeyConstraint,
     Index,
     Integer,
-    LargeBinary,
     Numeric,
-    String,
-    Text,
+    SmallInteger,
     UniqueConstraint,
+    event,
     func,
     literal_column,
     text,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+from dendrux.db._dialects import is_mysql_family
+from dendrux.db._dialects._mysql_types import (
+    MYSQL_TABLE_OPTIONS,
+    long_binary,
+    long_text,
+    nopad_char,
+    nopad_string,
+    utc_datetime,
+    utc_now_default,
+)
 
 
 def _utc_now() -> datetime.datetime:
@@ -64,6 +73,27 @@ class Base(DeclarativeBase):
     }
 
 
+@event.listens_for(Base.metadata, "before_create")
+def _storage_creation_mode(target: Any, connection: Any, **kw: Any) -> None:
+    connection.info["dendrux_fresh_schema"] = any(
+        table.name == "agent_runs" for table in kw.get("tables", ())
+    )
+
+
+def _create_activation_index(
+    ddl: Any, target: Any, bind: Any, tables: Any = None, state: Any = None, **kw: Any
+) -> bool:
+    return bind is None or bool(bind.info.get("dendrux_fresh_schema", True))
+
+
+def _not_mysql_family(
+    ddl: Any, target: Any, bind: Any, tables: Any = None, state: Any = None, **kw: Any
+) -> bool:
+    """Expression and partial indexes: MySQL-family servers get replacements instead."""
+    dialect = kw.get("dialect") or getattr(bind, "dialect", None)
+    return dialect is None or not is_mysql_family(dialect)
+
+
 class AgentRun(Base):
     """Individual agent execution. The heartbeat of Dendrux.
 
@@ -74,26 +104,26 @@ class AgentRun(Base):
 
     __tablename__ = "agent_runs"
 
-    id: Mapped[str] = mapped_column(String(26), primary_key=True)
-    tenant_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
-    agent_name: Mapped[str] = mapped_column(String(255))
-    status: Mapped[str] = mapped_column(String(50), default="pending")
+    id: Mapped[str] = mapped_column(nopad_string(26), primary_key=True)
+    tenant_id: Mapped[str | None] = mapped_column(nopad_string(255), nullable=True, index=True)
+    agent_name: Mapped[str] = mapped_column(nopad_string(255))
+    status: Mapped[str] = mapped_column(nopad_string(50), default="pending")
     input_data: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     output_data: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     iteration_count: Mapped[int] = mapped_column(Integer, default=0)
 
-    model: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    strategy: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    model: Mapped[str | None] = mapped_column(nopad_string(255), nullable=True)
+    strategy: Mapped[str | None] = mapped_column(nopad_string(100), nullable=True)
 
     # Sub-agent tree structure
     parent_run_id: Mapped[str | None] = mapped_column(
-        String(26), ForeignKey("agent_runs.id", ondelete="SET NULL"), nullable=True
+        nopad_string(26), ForeignKey("agent_runs.id", ondelete="SET NULL"), nullable=True
     )
     delegation_level: Mapped[int] = mapped_column(Integer, default=0)
 
     # Retry lineage — separate from delegation tree
     retry_of_run_id: Mapped[str | None] = mapped_column(
-        String(26), ForeignKey("agent_runs.id", ondelete="SET NULL"), nullable=True
+        nopad_string(26), ForeignKey("agent_runs.id", ondelete="SET NULL"), nullable=True
     )
 
     # Aggregate token usage (rolled up from token_usage table)
@@ -117,18 +147,18 @@ class AgentRun(Base):
     pii_mapping: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
 
     # Error details (populated on ERROR status)
-    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error: Mapped[str | None] = mapped_column(long_text(), nullable=True)
 
     # Sweep / recovery columns
     last_progress_at: Mapped[datetime.datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
+        utc_datetime(), nullable=True
     )
-    failure_reason: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    failure_reason: Mapped[str | None] = mapped_column(nopad_string(100), nullable=True)
 
     # Idempotency columns — duplicate run prevention. Unique per tenant through
     # ``uq_agent_runs_tenant_idempotency_key`` (below the class), not globally.
-    idempotency_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    idempotency_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    idempotency_key: Mapped[str | None] = mapped_column(nopad_string(255), nullable=True)
+    idempotency_fingerprint: Mapped[str | None] = mapped_column(nopad_string(64), nullable=True)
 
     # Cooperative cancellation flag — runner observes at checkpoints,
     # cleared on terminal finalize so a stale True never lingers.
@@ -147,14 +177,23 @@ class AgentRun(Base):
     claim_epoch: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default=text("0")
     )
+    storage_format: Mapped[int] = mapped_column(SmallInteger, default=1, server_default=text("1"))
+    reclaim_attempts: Mapped[int] = mapped_column(SmallInteger, default=0, server_default=text("0"))
+    reclaim_limit: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    lease_expired_at: Mapped[datetime.datetime | None] = mapped_column(utc_datetime())
+    last_reclaimed_at: Mapped[datetime.datetime | None] = mapped_column(utc_datetime())
+    loop_state: Mapped[dict[str, Any] | None] = mapped_column(
+        JSON().with_variant(JSONB(), "postgresql"), nullable=True
+    )
+    trace_link: Mapped[str | None] = mapped_column(nopad_string(64), nullable=True)
 
-    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_utc_now)
+    created_at: Mapped[datetime.datetime] = mapped_column(utc_datetime(), default=_utc_now)
     updated_at: Mapped[datetime.datetime] = mapped_column(
-        DateTime(timezone=True), default=_utc_now, onupdate=_utc_now
+        utc_datetime(), default=_utc_now, onupdate=_utc_now
     )
 
     status_changed_at: Mapped[datetime.datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=_utc_now, server_default=func.now()
+        utc_datetime(), nullable=False, default=_utc_now, server_default=utc_now_default()
     )
 
     # Relationships
@@ -189,6 +228,7 @@ class AgentRun(Base):
         Index("ix_agent_runs_status", "status"),
         Index("ix_agent_runs_created_at", "created_at"),
         Index("ix_agent_runs_retry_of_run_id", "retry_of_run_id"),
+        MYSQL_TABLE_OPTIONS,
     )
 
 
@@ -197,7 +237,9 @@ TENANT_IDEMPOTENCY_INDEX = "uq_agent_runs_tenant_idempotency_key"
 
 # An idempotency key is unique within a tenant (untenanted runs share the ''
 # scope). Queries must spell the same expression, ``coalesce(tenant_id, '')``
-# with a literal, for the planner to use the index.
+# with a literal, for the planner to use the index. MySQL/MariaDB get the same
+# name on a generated ``tenant_scope`` column instead (MariaDB 10.11 cannot index
+# the expression); lookups there compare that column (``dendrux.db._dialects.mysql``).
 Index(
     TENANT_IDEMPOTENCY_INDEX,
     func.coalesce(AgentRun.tenant_id, literal_column("''")),
@@ -205,7 +247,7 @@ Index(
     unique=True,
     postgresql_where=AgentRun.idempotency_key.isnot(None),
     sqlite_where=AgentRun.idempotency_key.isnot(None),
-)
+).ddl_if(callable_=_not_mysql_family)
 # Tenant-scoped run listings, newest first.
 Index("ix_agent_runs_tenant_id_created_at", AgentRun.tenant_id, AgentRun.created_at.desc())
 Index("ix_agent_runs_sweep_running", AgentRun.status, AgentRun.id)
@@ -224,24 +266,31 @@ class ReactTrace(Base):
 
     __tablename__ = "react_traces"
 
-    id: Mapped[str] = mapped_column(String(26), primary_key=True)
+    id: Mapped[str] = mapped_column(nopad_string(26), primary_key=True)
     agent_run_id: Mapped[str] = mapped_column(
-        String(26), ForeignKey("agent_runs.id", ondelete="CASCADE")
+        nopad_string(26), ForeignKey("agent_runs.id", ondelete="CASCADE")
     )
-    role: Mapped[str] = mapped_column(String(20))  # user/assistant/tool
-    content: Mapped[str] = mapped_column(Text)
+    role: Mapped[str] = mapped_column(nopad_string(20))  # user/assistant/tool
+    content: Mapped[str] = mapped_column(long_text())
+    trace_kind: Mapped[str] = mapped_column(nopad_string(16), default="turn", server_default="turn")
+    content_digest: Mapped[str | None] = mapped_column(nopad_char(64), nullable=True)
     order_index: Mapped[int] = mapped_column(Integer)
     meta: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
 
-    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_utc_now)
+    created_at: Mapped[datetime.datetime] = mapped_column(utc_datetime(), default=_utc_now)
     updated_at: Mapped[datetime.datetime] = mapped_column(
-        DateTime(timezone=True), default=_utc_now, onupdate=_utc_now
+        utc_datetime(), default=_utc_now, onupdate=_utc_now
     )
 
     # Relationships
     agent_run: Mapped[AgentRun] = relationship(back_populates="traces")
 
-    __table_args__ = (Index("ix_react_traces_agent_run_id_order", "agent_run_id", "order_index"),)
+    __table_args__ = (
+        Index("uq_react_traces_run_order", "agent_run_id", "order_index", unique=True).ddl_if(
+            callable_=_create_activation_index
+        ),
+        MYSQL_TABLE_OPTIONS,
+    )
 
 
 class ToolCallRecord(Base):
@@ -253,31 +302,43 @@ class ToolCallRecord(Base):
 
     __tablename__ = "tool_calls"
 
-    id: Mapped[str] = mapped_column(String(26), primary_key=True)
+    id: Mapped[str] = mapped_column(nopad_string(26), primary_key=True)
     agent_run_id: Mapped[str] = mapped_column(
-        String(26), ForeignKey("agent_runs.id", ondelete="CASCADE")
+        nopad_string(26), ForeignKey("agent_runs.id", ondelete="CASCADE")
     )
-    tool_call_id: Mapped[str] = mapped_column(String(26))  # Dendrux ULID
-    provider_tool_call_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    tool_name: Mapped[str] = mapped_column(String(255))
-    target: Mapped[str] = mapped_column(String(50), default="server")
+    tool_call_id: Mapped[str] = mapped_column(nopad_string(26))  # Dendrux ULID
+    provider_tool_call_id: Mapped[str | None] = mapped_column(nopad_string(255), nullable=True)
+    tool_name: Mapped[str] = mapped_column(nopad_string(255))
+    target: Mapped[str] = mapped_column(nopad_string(50), default="server")
     params: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     result: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     success: Mapped[bool] = mapped_column(Boolean, default=True)
     duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     iteration_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_message: Mapped[str | None] = mapped_column(long_text(), nullable=True)
     meta: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    outcome: Mapped[str] = mapped_column(
+        nopad_string(16), default="completed", server_default="completed"
+    )
+    idempotent: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
+    replayed_at: Mapped[datetime.datetime | None] = mapped_column(utc_datetime())
+    content_digest: Mapped[str | None] = mapped_column(nopad_char(64), nullable=True)
 
-    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_utc_now)
+    created_at: Mapped[datetime.datetime] = mapped_column(utc_datetime(), default=_utc_now)
     updated_at: Mapped[datetime.datetime] = mapped_column(
-        DateTime(timezone=True), default=_utc_now, onupdate=_utc_now
+        utc_datetime(), default=_utc_now, onupdate=_utc_now
     )
 
     # Relationships
     agent_run: Mapped[AgentRun] = relationship(back_populates="tool_call_records")
 
-    __table_args__ = (Index("ix_tool_calls_agent_run_id", "agent_run_id"),)
+    __table_args__ = (
+        Index("ix_tool_calls_agent_run_id", "agent_run_id"),
+        Index("uq_tool_calls_run_call", "agent_run_id", "tool_call_id", unique=True).ddl_if(
+            callable_=_create_activation_index
+        ),
+        MYSQL_TABLE_OPTIONS,
+    )
 
 
 class TokenUsage(Base):
@@ -289,13 +350,13 @@ class TokenUsage(Base):
 
     __tablename__ = "token_usage"
 
-    id: Mapped[str] = mapped_column(String(26), primary_key=True)
+    id: Mapped[str] = mapped_column(nopad_string(26), primary_key=True)
     agent_run_id: Mapped[str] = mapped_column(
-        String(26), ForeignKey("agent_runs.id", ondelete="CASCADE")
+        nopad_string(26), ForeignKey("agent_runs.id", ondelete="CASCADE")
     )
     iteration_index: Mapped[int] = mapped_column(Integer)
-    model: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    provider: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    model: Mapped[str | None] = mapped_column(nopad_string(255), nullable=True)
+    provider: Mapped[str | None] = mapped_column(nopad_string(100), nullable=True)
     input_tokens: Mapped[int] = mapped_column(Integer, default=0)
     output_tokens: Mapped[int] = mapped_column(Integer, default=0)
     cost_usd: Mapped[float | None] = mapped_column(Numeric(10, 6), nullable=True)
@@ -305,12 +366,12 @@ class TokenUsage(Base):
     reasoning_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     meta: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
 
-    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_utc_now)
+    created_at: Mapped[datetime.datetime] = mapped_column(utc_datetime(), default=_utc_now)
 
     # Relationships
     agent_run: Mapped[AgentRun] = relationship(back_populates="token_usages")
 
-    __table_args__ = (Index("ix_token_usage_agent_run_id", "agent_run_id"),)
+    __table_args__ = (Index("ix_token_usage_agent_run_id", "agent_run_id"), MYSQL_TABLE_OPTIONS)
 
 
 class LLMInteraction(Base):
@@ -326,13 +387,13 @@ class LLMInteraction(Base):
 
     __tablename__ = "llm_interactions"
 
-    id: Mapped[str] = mapped_column(String(26), primary_key=True)
+    id: Mapped[str] = mapped_column(nopad_string(26), primary_key=True)
     agent_run_id: Mapped[str] = mapped_column(
-        String(26), ForeignKey("agent_runs.id", ondelete="CASCADE")
+        nopad_string(26), ForeignKey("agent_runs.id", ondelete="CASCADE")
     )
     iteration_index: Mapped[int] = mapped_column(Integer)
-    model: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    provider: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    model: Mapped[str | None] = mapped_column(nopad_string(255), nullable=True)
+    provider: Mapped[str | None] = mapped_column(nopad_string(100), nullable=True)
 
     # Dendrux-normalized payloads
     semantic_request: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
@@ -354,12 +415,15 @@ class LLMInteraction(Base):
     # Guardrail findings — best-effort enrichment (not authoritative audit)
     guardrail_findings: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
 
-    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_utc_now)
+    created_at: Mapped[datetime.datetime] = mapped_column(utc_datetime(), default=_utc_now)
 
     # Relationships
     agent_run: Mapped[AgentRun] = relationship(back_populates="llm_interactions")
 
-    __table_args__ = (Index("ix_llm_interactions_agent_run_id", "agent_run_id"),)
+    __table_args__ = (
+        Index("ix_llm_interactions_agent_run_id", "agent_run_id"),
+        MYSQL_TABLE_OPTIONS,
+    )
 
 
 class RunEvent(Base):
@@ -391,30 +455,35 @@ class RunEvent(Base):
 
     __tablename__ = "run_events"
 
-    id: Mapped[str] = mapped_column(String(26), primary_key=True)
+    id: Mapped[str] = mapped_column(nopad_string(26), primary_key=True)
     agent_run_id: Mapped[str] = mapped_column(
-        String(26), ForeignKey("agent_runs.id", ondelete="CASCADE")
+        nopad_string(26), ForeignKey("agent_runs.id", ondelete="CASCADE")
     )
-    event_type: Mapped[str] = mapped_column(String(50))
+    event_type: Mapped[str] = mapped_column(nopad_string(50))
     sequence_index: Mapped[int] = mapped_column(Integer, default=0)
     iteration_index: Mapped[int] = mapped_column(Integer, default=0)
-    correlation_id: Mapped[str | None] = mapped_column(String(26), nullable=True)
+    correlation_id: Mapped[str | None] = mapped_column(nopad_string(26), nullable=True)
     data: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    content_digest: Mapped[str | None] = mapped_column(nopad_char(64), nullable=True)
 
-    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_utc_now)
+    created_at: Mapped[datetime.datetime] = mapped_column(utc_datetime(), default=_utc_now)
 
     # Relationships
     agent_run: Mapped[AgentRun] = relationship(back_populates="run_events")
 
     __table_args__ = (
-        Index("ix_run_events_agent_run_id_seq", "agent_run_id", "sequence_index"),
+        Index("uq_run_events_run_seq", "agent_run_id", "sequence_index", unique=True).ddl_if(
+            callable_=_create_activation_index
+        ),
         Index("ix_run_events_event_type", "event_type"),
+        # MySQL/MariaDB ignore the predicate; they get (agent_run_id, event_type) instead.
         Index(
             "ix_run_events_started",
             "agent_run_id",
             postgresql_where=text("((event_type)::text = 'run.started'::text)"),
             sqlite_where=text("event_type = 'run.started'"),
-        ),
+        ).ddl_if(callable_=_not_mysql_family),
+        MYSQL_TABLE_OPTIONS,
     )
 
 
@@ -430,23 +499,22 @@ class RunInbox(Base):
 
     __tablename__ = "run_inbox"
 
-    id: Mapped[str] = mapped_column(String(26), primary_key=True)
+    id: Mapped[str] = mapped_column(nopad_string(26), primary_key=True)
     run_id: Mapped[str] = mapped_column(
-        String(26), ForeignKey("agent_runs.id", ondelete="CASCADE"), nullable=False
+        nopad_string(26), ForeignKey("agent_runs.id", ondelete="CASCADE"), nullable=False
     )
-    text: Mapped[str] = mapped_column(Text)
+    text: Mapped[str] = mapped_column(long_text())
     # ``metadata`` is reserved on declarative models; the SQL column keeps the name.
     metadata_: Mapped[dict[str, Any] | None] = mapped_column("metadata", JSON, nullable=True)
-    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_utc_now)
-    delivered_at: Mapped[datetime.datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    created_at: Mapped[datetime.datetime] = mapped_column(utc_datetime(), default=_utc_now)
+    delivered_at: Mapped[datetime.datetime | None] = mapped_column(utc_datetime(), nullable=True)
     delivered_iteration: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     agent_run: Mapped[AgentRun] = relationship(back_populates="inbox_notes")
 
     __table_args__ = (
         Index("ix_run_inbox_run_pending", "run_id", "delivered_at", "created_at", "id"),
+        MYSQL_TABLE_OPTIONS,
     )
 
 
@@ -464,33 +532,28 @@ class Blob(Base):
 
     __tablename__ = "dendrux_blobs"
 
-    tenant_scope: Mapped[str] = mapped_column(String(260), primary_key=True)
-    sha256: Mapped[str] = mapped_column(CHAR(64), primary_key=True)
-    generation: Mapped[str] = mapped_column(String(26))
-    state: Mapped[str] = mapped_column(String(16))
-    media_type: Mapped[str] = mapped_column(String(32))
+    tenant_scope: Mapped[str] = mapped_column(nopad_string(260), primary_key=True)
+    sha256: Mapped[str] = mapped_column(nopad_char(64), primary_key=True)
+    generation: Mapped[str] = mapped_column(nopad_string(26))
+    state: Mapped[str] = mapped_column(nopad_string(16))
+    media_type: Mapped[str] = mapped_column(nopad_string(32))
     byte_length: Mapped[int] = mapped_column(Integer)
     width: Mapped[int] = mapped_column(Integer)
     height: Mapped[int] = mapped_column(Integer)
     frame_count: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
-    storage: Mapped[str] = mapped_column(String(16))
-    data: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
-    ingest_transform: Mapped[str | None] = mapped_column(String(100), nullable=True)
-    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_utc_now)
-    last_used_at: Mapped[datetime.datetime] = mapped_column(
-        DateTime(timezone=True), default=_utc_now
-    )
-    state_changed_at: Mapped[datetime.datetime] = mapped_column(
-        DateTime(timezone=True), default=_utc_now
-    )
-    purged_at: Mapped[datetime.datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
-    purge_reason: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    storage: Mapped[str] = mapped_column(nopad_string(16))
+    data: Mapped[bytes | None] = mapped_column(long_binary(), nullable=True)
+    ingest_transform: Mapped[str | None] = mapped_column(nopad_string(100), nullable=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(utc_datetime(), default=_utc_now)
+    last_used_at: Mapped[datetime.datetime] = mapped_column(utc_datetime(), default=_utc_now)
+    state_changed_at: Mapped[datetime.datetime] = mapped_column(utc_datetime(), default=_utc_now)
+    purged_at: Mapped[datetime.datetime | None] = mapped_column(utc_datetime(), nullable=True)
+    purge_reason: Mapped[str | None] = mapped_column(nopad_string(200), nullable=True)
 
     __table_args__ = (
         Index("ix_dendrux_blobs_gc", "state", "last_used_at"),
         Index("ix_dendrux_blobs_work", "state", "state_changed_at"),
+        MYSQL_TABLE_OPTIONS,
     )
 
 
@@ -505,14 +568,16 @@ class BlobRef(Base):
 
     __tablename__ = "dendrux_blob_refs"
 
-    id: Mapped[str] = mapped_column(String(26), primary_key=True)
-    tenant_scope: Mapped[str] = mapped_column(String(260))
-    sha256: Mapped[str] = mapped_column(CHAR(64))
-    run_id: Mapped[str] = mapped_column(String(26), ForeignKey("agent_runs.id", ondelete="CASCADE"))
-    owner_kind: Mapped[str] = mapped_column(String(32))
-    owner_id: Mapped[str] = mapped_column(String(64))
+    id: Mapped[str] = mapped_column(nopad_string(26), primary_key=True)
+    tenant_scope: Mapped[str] = mapped_column(nopad_string(260))
+    sha256: Mapped[str] = mapped_column(nopad_char(64))
+    run_id: Mapped[str] = mapped_column(
+        nopad_string(26), ForeignKey("agent_runs.id", ondelete="CASCADE")
+    )
+    owner_kind: Mapped[str] = mapped_column(nopad_string(32))
+    owner_id: Mapped[str] = mapped_column(nopad_string(64))
     ordinal: Mapped[int] = mapped_column(Integer)
-    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_utc_now)
+    created_at: Mapped[datetime.datetime] = mapped_column(utc_datetime(), default=_utc_now)
 
     __table_args__ = (
         ForeignKeyConstraint(
@@ -525,4 +590,40 @@ class BlobRef(Base):
         ),
         Index("ix_dendrux_blob_refs_blob", "tenant_scope", "sha256"),
         Index("ix_dendrux_blob_refs_run", "run_id", "tenant_scope"),
+        MYSQL_TABLE_OPTIONS,
     )
+
+
+class DendruxSetting(Base):
+    """Database-wide storage format and resumable activation progress."""
+
+    __tablename__ = "dendrux_settings"
+    __table_args__ = (MYSQL_TABLE_OPTIONS,)
+
+    key: Mapped[str] = mapped_column(nopad_string(64), primary_key=True)
+    value: Mapped[str] = mapped_column(nopad_string(255), nullable=False)
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        utc_datetime(), nullable=False, default=_utc_now, onupdate=_utc_now
+    )
+
+
+@event.listens_for(AgentRun.__table__, "after_create")
+@event.listens_for(RunEvent.__table__, "after_create")
+def _create_mysql_extras(target: Any, connection: Any, **kw: Any) -> None:
+    """MySQL/MariaDB replacements for the expression and partial indexes."""
+    if is_mysql_family(connection.dialect):
+        from dendrux.db._dialects.mysql import create_extras
+
+        create_extras(connection, target.name)
+
+
+@event.listens_for(Base.metadata, "after_create")
+def _seed_storage_settings(target: Any, connection: Any, **kw: Any) -> None:
+    from sqlalchemy import inspect
+
+    from dendrux.db._settings import seed_settings
+
+    if inspect(connection).has_table("dendrux_settings"):
+        created = {table.name for table in kw.get("tables", ())}
+        seed_settings(connection, active="agent_runs" in created)
+    connection.info.pop("dendrux_fresh_schema", None)

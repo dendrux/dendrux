@@ -102,7 +102,7 @@ class TestPauseStatePrimitives:
         await store.create_run("r1", "a")
         await store.try_pause_run("r1", status="paused", pause_data={"p": 1})
         await _set_row(store, "r1", pause_requested=True)  # stale flag
-        assert await store.claim_paused_run("r1", expected_status="paused") == 1
+        assert (await store.claim_paused_run("r1", expected_status="paused")).claim_epoch == 1
         assert (await store.get_run("r1")).pause_requested is False
 
         await store.request_pause("r1")
@@ -113,6 +113,10 @@ class TestPauseStatePrimitives:
         assert record.cancel_requested is False
 
     async def test_submit_and_claim_clears_pause_flag(self, store) -> None:
+        # This fault injection / pause blob exercises the format-1 write path.
+        from tests._fixtures.storage import pin_storage_format
+
+        await pin_storage_format(store._engine, 1)
         await store.create_run("r1", "a")
         await store.try_pause_run("r1", status="paused", pause_data={"p": 1})
         await _set_row(store, "r1", pause_requested=True)
@@ -166,7 +170,9 @@ def _pausing_agent(
         return "stepped"
 
     llm = ScriptedLLM([tool_call("step", pid="t1"), *(extra or [LLMResponse(text="done")])])
-    agent = Agent(provider=llm, prompt="Test.", tools=[step], state_store=store)
+    agent = Agent(
+        strict_tenancy=False, provider=llm, prompt="Test.", tools=[step], state_store=store
+    )
     holder["agent"] = agent
     return agent, llm, calls
 
@@ -189,7 +195,11 @@ class TestRequestedPause:
         assert pause.pause_reason == "requested"
         assert pause.pause_message == "operator hold"
         assert pause.iteration == 1
-        assert [m.role.value for m in pause.history] == ["user", "assistant", "tool"]
+        from dendrux.runtime.replay import rebuild_history
+
+        assert pause.schema_version == 2 and pause.history == []
+        messages = await rebuild_history(store, result.run_id)
+        assert [m.role.value for m in messages.messages] == ["system", "user", "assistant", "tool"]
 
         paused = await _events(store, result.run_id, "run.paused")
         assert len(paused) == 1
@@ -236,7 +246,9 @@ class TestRequestedPause:
             return "stepped"
 
         llm = ScriptedLLM([tool_call("step", pid="t1"), LLMResponse(text="done")], gate_at=0)
-        agent = Agent(provider=llm, prompt="Test.", tools=[step], state_store=store)
+        agent = Agent(
+            strict_tenancy=False, provider=llm, prompt="Test.", tools=[step], state_store=store
+        )
         task = asyncio.create_task(agent.run("go"))
         await asyncio.wait_for(llm.entered.wait(), 5)
         run_id = (await store.list_runs())[0].id
@@ -260,7 +272,13 @@ class TestRequestedPause:
             return ""
 
         llm = ScriptedLLM([tool_call("client_read", pid="t1")])
-        agent = Agent(provider=llm, prompt="Test.", tools=[client_read], state_store=store)
+        agent = Agent(
+            strict_tenancy=False,
+            provider=llm,
+            prompt="Test.",
+            tools=[client_read],
+            state_store=store,
+        )
         waiting = await agent.run("go")
         with pytest.raises(PauseStatusMismatchError):
             await agent.submit_resume(waiting.run_id)
@@ -289,7 +307,9 @@ class TestRequestedPause:
             return "stepped"
 
         llm = ScriptedLLM([tool_call("step", pid="t1"), LLMResponse(text="unreached")])
-        agent = Agent(provider=llm, prompt="Test.", tools=[step], state_store=store)
+        agent = Agent(
+            strict_tenancy=False, provider=llm, prompt="Test.", tools=[step], state_store=store
+        )
         holder["agent"] = agent
         result = await agent.run("go")
 
@@ -336,7 +356,13 @@ class TestRequestedPause:
                 LLMResponse(text="done"),
             ]
         )
-        agent = Agent(provider=llm, prompt="Test.", tools=[step, client_read], state_store=store)
+        agent = Agent(
+            strict_tenancy=False,
+            provider=llm,
+            prompt="Test.",
+            tools=[step, client_read],
+            state_store=store,
+        )
         holder["agent"] = agent
         waiting = await agent.run("go")
         assert waiting.status == RunStatus.WAITING_CLIENT_TOOL
@@ -354,7 +380,13 @@ class TestRequestedPause:
             return ""
 
         llm = ScriptedLLM([tool_call("client_read", pid="t1"), LLMResponse(text="done")])
-        agent = Agent(provider=llm, prompt="Test.", tools=[client_read], state_store=store)
+        agent = Agent(
+            strict_tenancy=False,
+            provider=llm,
+            prompt="Test.",
+            tools=[client_read],
+            state_store=store,
+        )
         waiting = await agent.run("go")
 
         outcome = await agent.request_pause(waiting.run_id)
@@ -435,6 +467,7 @@ def _approval_agent(
 
     llm = ScriptedLLM([tool_calls(("a", {}, "t1"), ("b", {}, "t2")), LLMResponse(text="done")])
     agent = Agent(
+        strict_tenancy=False,
         provider=llm,
         prompt="Test.",
         tools=[a, b],
@@ -442,7 +475,9 @@ def _approval_agent(
         state_store=store,
     )
     holder["agent"] = agent
-    holder["other"] = Agent(provider=ScriptedLLM([]), prompt="Other.", state_store=store)
+    holder["other"] = Agent(
+        strict_tenancy=False, provider=ScriptedLLM([]), prompt="Other.", state_store=store
+    )
     return agent, llm, counts
 
 
@@ -504,6 +539,10 @@ class TestApprovalBarrier:
         assert (await store.get_run(waiting.run_id)).status == "cancelled"
 
     async def test_pause_landing_right_after_claim_runs_nothing(self, store) -> None:
+        # This fault injection / pause blob exercises the format-1 write path.
+        from tests._fixtures.storage import pin_storage_format
+
+        await pin_storage_format(store._engine, 1)
         agent, _, counts = _approval_agent(store)
         waiting = await agent.run("go")
         original = store.claim_paused_run
@@ -530,6 +569,10 @@ class TestApprovalBarrier:
         assert counts == {"a": 1, "b": 1}
 
     async def test_cancel_landing_right_after_claim_runs_nothing(self, store) -> None:
+        # This fault injection / pause blob exercises the format-1 write path.
+        from tests._fixtures.storage import pin_storage_format
+
+        await pin_storage_format(store._engine, 1)
         agent, _, counts = _approval_agent(store)
         waiting = await agent.run("go")
         original = store.claim_paused_run

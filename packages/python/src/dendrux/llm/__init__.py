@@ -1,5 +1,6 @@
 """LLM provider abstraction layer."""
 
+from dendrux.llm import _provider_codes as _provider_codes
 from dendrux.llm.base import LLMProvider
 from dendrux.llm.mock import MockLLM
 

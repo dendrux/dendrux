@@ -12,7 +12,7 @@ from __future__ import annotations
 import base64
 import json
 from datetime import timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
 from sqlalchemy import text
@@ -24,7 +24,7 @@ from dendrux.errors import BlobNotFoundError, InvalidImageError
 from dendrux.media import BlobEdge, Image, InMemoryBlobStore, ingest
 from dendrux.runtime._blob_catalog import BlobServices
 from dendrux.runtime.persistence import PersistenceRecorder
-from dendrux.runtime.state import SQLAlchemyStateStore
+from dendrux.runtime.stores._factory import store_for_engine
 from dendrux.store import RunStore
 from dendrux.types import (
     ImagePart,
@@ -37,6 +37,9 @@ from dendrux.types import (
     UsageStats,
 )
 from tests.unit.test_blob_catalog import _SurfaceProvider, make_png, runtime_for, store_png
+
+if TYPE_CHECKING:
+    from dendrux.runtime.stores.sql.base import SQLStateStore
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -140,7 +143,7 @@ async def test_external_storage_rows_hold_no_bytes(engine, store) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def _paused_run(store: SQLAlchemyStateStore, run_id: str, tenant: str | None) -> None:
+async def _paused_run(store: SQLStateStore, run_id: str, tenant: str | None) -> None:
     await store.create_run(run_id, "a", tenant_id=tenant)
     await store.pause_run(
         run_id, status="waiting_client_tool", pause_data={"agent_name": "a", "iteration": 1}
@@ -148,6 +151,10 @@ async def _paused_run(store: SQLAlchemyStateStore, run_id: str, tenant: str | No
 
 
 async def test_edges_on_every_write_method(engine, store) -> None:
+    # This fault injection / pause blob exercises the format-1 write path.
+    from tests._fixtures.storage import pin_storage_format
+
+    await pin_storage_format(store._engine, 1)
     services = BlobServices.for_state_store(store)
     part = await store_png(services, "t:acme", make_png(3))
     s = part.ref.sha256
@@ -216,13 +223,13 @@ async def test_retried_edge_write_is_idempotent(engine, store) -> None:
     edge = BlobEdge("-", part.ref.sha256, "seed", "seed", 0)
     await services.catalog.add_blob_refs("R1", "-", [edge])  # type: ignore[union-attr]
     await services.catalog.add_blob_refs("R1", "-", [edge])  # type: ignore[union-attr]
-    # A re-run of the same trace write (lost commit ack) adds no duplicate edge.
-    for _ in range(2):
+    # Distinct trace rows may repeat an edge owner without duplicating that edge.
+    for order in range(2):
         await store.save_trace(
             "R1",
             "user",
             "x",
-            order_index=0,
+            order_index=order,
             blob_refs=[BlobEdge("-", part.ref.sha256, "trace", "0", 0)],
             blob_refs_scope="-",
         )
@@ -234,6 +241,10 @@ async def _count(engine: Any, table: str) -> int:
 
 
 async def test_cross_tenant_edge_writes_rejected_and_rolled_back(engine, store) -> None:
+    # This fault injection / pause blob exercises the format-1 write path.
+    from tests._fixtures.storage import pin_storage_format
+
+    await pin_storage_format(store._engine, 1)
     services = BlobServices.for_state_store(store)
     sha_b = (await store_png(services, "t:b", make_png(5))).ref.sha256
     sha_a = (await store_png(services, "t:a", make_png(6))).ref.sha256
@@ -495,6 +506,10 @@ async def test_read_image_authorisation(engine, store) -> None:
 
 
 async def test_canonical_sample_rows(engine, store) -> None:
+    # This fault injection / pause blob exercises the format-1 write path.
+    from tests._fixtures.storage import pin_storage_format
+
+    await pin_storage_format(store._engine, 1)
     from tests.unit.test_blob_catalog import make_png as _mk
 
     png = _mk(42, width=400, height=200)
@@ -671,7 +686,7 @@ async def test_orphan_edges_collected_on_sqlite_without_fk(tmp_path) -> None:
     try:
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
-        store = SQLAlchemyStateStore(engine)
+        store = store_for_engine(engine)
         services = BlobServices.for_state_store(store)
         s = (await store_png(services, "-", make_png(12))).ref.sha256
         await store.create_run(

@@ -1,6 +1,6 @@
 """Integration tests for RunStore — the public read facade across the backend matrix.
 
-Exercises the public contract. RunStore sits over SQLAlchemyStateStore;
+Exercises the public contract. RunStore sits over SQLStateStore;
 these tests verify that the public dataclasses, filters, cursors, and
 stream semantics are correct and that ``get_pauses`` derives from
 ``run_events`` only (never ``pause_data``).
@@ -8,7 +8,7 @@ stream semantics are correct and that ``get_pauses`` derives from
 The ``engine`` fixture lives in ``tests/integration/conftest.py`` and
 parametrizes across SQLite and Postgres. The local ``store`` fixture
 overrides the conftest one because RunStore is the surface-under-test
-here, not SQLAlchemyStateStore.
+here, not SQLStateStore.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ import contextlib
 
 import pytest
 
-from dendrux.runtime.state import SQLAlchemyStateStore
+from dendrux.runtime.stores._factory import store_for_engine
 from dendrux.store import (
     LLMCall,
     PausePair,
@@ -39,7 +39,7 @@ from dendrux.types import UsageStats
 
 @pytest.fixture
 def internal_store(engine):
-    return SQLAlchemyStateStore(engine)
+    return store_for_engine(engine)
 
 
 @pytest.fixture
@@ -543,7 +543,7 @@ class TestGetTraces:
         assert len(traces) == 3
         assert all(isinstance(t, TraceEntry) for t in traces)
         assert [t.role for t in traces] == ["user", "assistant", "tool"]
-        assert [t.order_index for t in traces] == [0, 1, 2]
+        assert [t.order_index for t in traces] == [0, 1000, 2000]
         assert traces[2].meta == {"call_id": "c1"}
 
     async def test_unknown_run_returns_empty(self, store) -> None:
@@ -558,7 +558,7 @@ class TestGetTraces:
             )
 
         page = await store.get_traces("r1", limit=2, offset=1)
-        assert [t.order_index for t in page] == [1, 2]
+        assert [t.order_index for t in page] == [1000, 2000]
 
 
 # ------------------------------------------------------------------
@@ -781,8 +781,8 @@ class TestOwnedEngineLifecycle:
         await s.close()
 
         # Engine must still be usable after store close.
-        from dendrux.runtime.state import SQLAlchemyStateStore
+        from dendrux.runtime.stores._factory import store_for_engine
 
-        check = SQLAlchemyStateStore(engine)
+        check = store_for_engine(engine)
         await check.create_run("after_close", "Agent")
         assert (await check.get_run("after_close")) is not None

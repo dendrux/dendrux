@@ -466,31 +466,28 @@ class TestCountCacheTokens:
             assert result.status == expected, choice
 
 
-class TestCountCacheTokensNotChosen:
-    """B17 warns with ``FutureWarning`` (visible by default) at ``Agent(...)``."""
-
+class TestCountCacheTokensDefaults:
     @staticmethod
     def _construct(budget: Budget) -> None:
         _agent(budget=budget)
 
-    def test_warns_at_the_agent_line_when_a_token_budget_did_not_choose(self) -> None:
-        with pytest.warns(FutureWarning, match="count_cache_tokens") as seen:
-            self._construct(Budget(max_tokens=100))
-        assert seen[0].filename == __file__
+    def test_default_counts_cache_silently(self) -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            budget = Budget(max_tokens=100)
+            self._construct(budget)
+        assert budget.count_cache_tokens is True
 
-    def test_dedup_is_left_to_the_warnings_module_per_call_site(self) -> None:
-        with warnings.catch_warnings(record=True) as seen:
-            warnings.simplefilter("default")
+    def test_repeated_construction_is_silent(self) -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
             for _ in range(3):
                 self._construct(Budget(max_tokens=100))
-        assert len([w for w in seen if issubclass(w.category, FutureWarning)]) == 1
 
-    def test_a_filtered_warning_does_not_use_up_the_notice(self) -> None:
+    def test_explicit_none_remains_silent(self) -> None:
         with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            self._construct(Budget(max_tokens=100))
-        with pytest.warns(FutureWarning):
-            self._construct(Budget(max_tokens=100))
+            warnings.simplefilter("error")
+            self._construct(Budget(max_tokens=100, count_cache_tokens=None))
 
     @pytest.mark.parametrize("choice", [True, False])
     def test_silent_when_chosen(self, choice: bool) -> None:

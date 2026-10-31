@@ -178,7 +178,10 @@ class TestMCPExecutorExecution:
         """The executor from get_tool_lookups should be an async callable."""
         source = _make_mock_source("fs", [{"name": "read_file", "result": "file contents"}])
 
-        agent = Agent(prompt="test", tool_sources=[source])
+        agent = Agent(
+            prompt="test",
+            tool_sources=[source],
+        )
         lookups = await agent.get_tool_lookups()
 
         executor = lookups.fn["fs__read_file"]
@@ -208,7 +211,10 @@ class TestDiscoveryCaching:
 
         source._discover = counting_discover
 
-        agent = Agent(prompt="test", tool_sources=[source])
+        agent = Agent(
+            prompt="test",
+            tool_sources=[source],
+        )
         await agent.get_tool_lookups()
         await agent.get_tool_lookups()
 
@@ -228,7 +234,10 @@ class TestDiscoveryCaching:
 
         source._discover = counting_discover
 
-        agent = Agent(prompt="test", tool_sources=[source])
+        agent = Agent(
+            prompt="test",
+            tool_sources=[source],
+        )
         await agent.get_tool_lookups()
         assert call_count == 1
 
@@ -646,6 +655,7 @@ async def test_resumed_terminal_metadata_and_lifecycle(mode: str) -> None:
     provider = MockLLM([LLMResponse(tool_calls=[ToolCall(name="read_data", params={})])])
     store = RecordingStateStore()
     agent = Agent(
+        strict_tenancy=False,
         provider=provider,
         prompt="test",
         tools=[read_data],

@@ -22,14 +22,13 @@ from sqlalchemy import inspect, text
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
-from dendrux.db.models import Base
-from dendrux.runtime.state import SQLAlchemyStateStore
-from tests.integration._migration_schema import migration_schema
+from dendrux.runtime.stores._factory import store_for_engine
+from tests.integration._migration_schema import create_pre_activation_schema, migration_schema
 
 pytestmark = pytest.mark.asyncio
 
 PRIOR = "a4b5c6d7e8f9"
-HEAD = "e8f9a0b1c2d3"  # image blobs, R1 and bounded sweep indexes sit above run control
+HEAD = "f9a0b1c2d3e4"  # additive recovery schema sits above run control
 _MIGRATIONS = Path(__file__).resolve().parents[2] / "src" / "dendrux" / "db" / "migrations"
 
 
@@ -111,7 +110,7 @@ async def _check_head(engine: Any) -> None:
         ]
 
     # The migrated schema serves the new write paths.
-    store = SQLAlchemyStateStore(engine)
+    store = store_for_engine(engine)
     assert await store.request_pause("r-run", reason="m") is True
     assert await store.add_note("r-run", note_id="n1", text="hi", metadata={"k": 1}) is True
     assert await store.add_note("r-done", note_id="n2", text="hi") is False
@@ -168,7 +167,7 @@ async def test_sqlite_revision_on_populated_db(tmp_path: Path) -> None:
 
     try:
         async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
+            await conn.run_sync(create_pre_activation_schema)
             # Back to the prior revision's shape (no run control, no image blobs).
             await conn.execute(text("DROP TABLE dendrux_blob_refs"))
             await conn.execute(text("DROP TABLE dendrux_blobs"))

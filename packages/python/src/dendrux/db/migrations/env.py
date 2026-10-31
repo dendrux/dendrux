@@ -1,17 +1,16 @@
 """Alembic env.py — async migration runner for Dendrux.
 
-Supports both SQLite (default) and Postgres (via DENDRUX_DATABASE_URL).
+Supports SQLite (default), Postgres and MySQL/MariaDB (via DENDRUX_DATABASE_URL).
 Runs migrations using SQLAlchemy's async engine.
 """
 
 from __future__ import annotations
 
 import asyncio
-from contextlib import contextmanager
 from logging.config import fileConfig
 
 from alembic import context
-from sqlalchemy import pool, text
+from sqlalchemy import pool
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from dendrux.db.models import Base
@@ -39,6 +38,8 @@ if not existing_url or existing_url == "sqlite+aiosqlite:///./dendrux.db":
 def run_migrations_offline() -> None:
     """Run migrations in 'offline' mode — emit SQL without a live connection."""
     url = config.get_main_option("sqlalchemy.url")
+    if url and url.split(":", 1)[0].split("+", 1)[0] in {"mysql", "mariadb"}:
+        raise RuntimeError("MySQL/MariaDB migrations need a live connection (no --sql).")
     context.configure(
         url=url,
         target_metadata=target_metadata,
@@ -50,58 +51,80 @@ def run_migrations_offline() -> None:
         context.run_migrations()
 
 
-# Stable, database-wide namespace on the dedicated direct migration connection.
-# Session ownership spans autocommit batches and concurrent index builds.
-_MIGRATION_LOCK = 0x44454E44525558
+def _configure_and_run(connection):  # noqa: ANN001
+    context.configure(
+        connection=connection,
+        target_metadata=target_metadata,
+        render_as_batch=True,  # Required for SQLite ALTER TABLE support
+    )
+    with context.begin_transaction():
+        context.run_migrations()
 
 
-@contextmanager
-def _migration_lock(connection):  # noqa: ANN001
-    if connection.dialect.name != "postgresql":
-        yield
-        return
-    isolation = connection.get_isolation_level()
-    connection.execution_options(isolation_level="AUTOCOMMIT")
-    acquired = False
+def _run_mysql(connection):  # noqa: ANN001
+    """MySQL/MariaDB: fresh-baseline bootstrap or upgrade, under the maintenance GET_LOCK.
+
+    Upgrading to head bootstraps an empty database (or resumes one), upgrades a stamped
+    Dendrux schema, and refuses anything else. Read-only commands (``current``) run
+    normally under the lock; other targets (downgrades, stamps) are refused because the
+    pre-baseline revisions do not apply to these servers.
+    """
+    from dendrux.db._dialects import mysql
+
+    script = context.script
+    head = script.get_current_head()
     try:
-        # A blocking SELECT retains a query snapshot while waiting and can
-        # deadlock the holder's CREATE INDEX CONCURRENTLY. Refuse promptly;
-        # callers can retry after the active migration runner finishes.
-        acquired = connection.execute(
-            text(f"SELECT pg_try_advisory_lock({_MIGRATION_LOCK})")
-        ).scalar_one()
-        connection.commit()
-        if not acquired:
-            raise RuntimeError("Another Dendrux database migration is running; retry when it finishes.")
-        connection.execution_options(isolation_level=isolation)
-        yield
-    finally:
-        connection.rollback()
-        connection.execution_options(isolation_level="AUTOCOMMIT")
-        if acquired:
-            connection.execute(text(f"SELECT pg_advisory_unlock({_MIGRATION_LOCK})"))
-            connection.commit()
-        connection.execution_options(isolation_level=isolation)
+        destination = context.get_revision_argument()
+    except KeyError:  # no destination: a read-only command such as `alembic current`
+        with mysql.maintenance_lock(connection):
+            _configure_and_run(connection)
+        return
+    if destination != head:
+        raise RuntimeError(
+            "On MySQL/MariaDB Dendrux migrates only up to head (`dendrux db migrate`); "
+            "restore a backup to go back."
+        )
+    upgradeable = mysql.upgradeable_revisions(script, head)
+    mysql.migrate(
+        connection,
+        head=head,
+        upgradeable=upgradeable,
+        upgrade=lambda: _configure_and_run(connection),
+    )
 
 
 def do_run_migrations(connection):  # noqa: ANN001
     """Lock before Alembic reads the revision; retain it through all commits."""
-    with _migration_lock(connection):
-        context.configure(
-            connection=connection,
-            target_metadata=target_metadata,
-            render_as_batch=True,  # Required for SQLite ALTER TABLE support
-        )
-        with context.begin_transaction():
-            context.run_migrations()
+    from dendrux.db._dialects import is_mysql_family
+    from dendrux.db._dialects.postgres import migration_lock
+
+    if is_mysql_family(connection.dialect):
+        _run_mysql(connection)
+        return
+    if connection.dialect.name == "postgresql":
+        with migration_lock(connection):
+            _configure_and_run(connection)
+        return
+    _configure_and_run(connection)
 
 
 async def run_async_migrations() -> None:
     """Run migrations using an async engine."""
+    from dendrux.db._engine_options import (
+        is_mysql_family_url,
+        mysql_engine_options,
+        normalized_url,
+    )
+
+    section = dict(config.get_section(config.config_ini_section, {}))
+    url = section.get("sqlalchemy.url", "")
+    options: dict = {}
+    if url and is_mysql_family_url(url):
+        # The same READ COMMITTED / UTC / driver policy as every other engine Dendrux creates.
+        section["sqlalchemy.url"] = normalized_url(url).render_as_string(hide_password=False)
+        options = mysql_engine_options({})
     connectable = async_engine_from_config(
-        config.get_section(config.config_ini_section, {}),
-        prefix="sqlalchemy.",
-        poolclass=pool.NullPool,
+        section, prefix="sqlalchemy.", poolclass=pool.NullPool, **options
     )
 
     try:

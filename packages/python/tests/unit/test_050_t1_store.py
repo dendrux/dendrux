@@ -11,7 +11,8 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import logging
-from typing import Any
+from functools import wraps
+from typing import TYPE_CHECKING, Any
 
 import pytest
 from sqlalchemy import event
@@ -23,10 +24,15 @@ from dendrux.db._sqlite_sync import create_sqlite_schema
 from dendrux.db.models import Base
 from dendrux.errors import NoteLimitExceededError, PersistenceError, RunNotFoundError
 from dendrux.llm.mock import MockLLM
-from dendrux.runtime.state import UNSCOPED, SQLAlchemyStateStore
+from dendrux.runtime.state import UNSCOPED
+from dendrux.runtime.stores._factory import store_for_engine
 from dendrux.store import RunStore
 from dendrux.types import IdempotencyConflictError, Limits, LLMResponse, RunStatus, UsageStats
+from tests._helpers.db_errors import locked_error
 from tests._helpers.scripted_provider import ScriptedLLM, tool_calls
+
+if TYPE_CHECKING:
+    from dendrux.runtime.stores.sql.base import SQLStateStore
 
 
 @pytest.fixture
@@ -44,8 +50,8 @@ async def engine(tmp_path: Any) -> Any:
 
 
 @pytest.fixture
-def state(engine: Any) -> SQLAlchemyStateStore:
-    return SQLAlchemyStateStore(engine)
+def state(engine: Any) -> SQLStateStore:
+    return store_for_engine(engine)
 
 
 @pytest.fixture
@@ -66,7 +72,9 @@ class TestTenantIdempotency:
     async def test_same_key_in_two_tenants_creates_two_runs(self, state: Any) -> None:
         """Tenant isolation: tenant B must not get tenant A's run or answer."""
         llm = _answers("A secret balance", "B balance", "unused")
-        agent = Agent(name="bank", prompt="p", provider=llm, state_store=state)
+        agent = Agent(
+            strict_tenancy=False, name="bank", prompt="p", provider=llm, state_store=state
+        )
         a = await agent.run("What is my balance?", tenant_id="tenantA", idempotency_key="req-42")
         b = await agent.run("What is my balance?", tenant_id="tenantB", idempotency_key="req-42")
         assert a.run_id != b.run_id
@@ -74,41 +82,67 @@ class TestTenantIdempotency:
         assert llm.calls_made == 2
 
     async def test_different_input_in_another_tenant_is_not_a_conflict(self, state: Any) -> None:
-        agent = Agent(name="bank", prompt="p", provider=_answers("a", "b"), state_store=state)
+        agent = Agent(
+            strict_tenancy=False,
+            name="bank",
+            prompt="p",
+            provider=_answers("a", "b"),
+            state_store=state,
+        )
         await agent.run("q1", tenant_id="tenantA", idempotency_key="k")
         result = await agent.run("something else", tenant_id="tenantB", idempotency_key="k")
         assert result.answer == "b"
 
     async def test_same_tenant_replay_returns_the_cached_run(self, state: Any) -> None:
-        llm = _answers("first", "never")
-        agent = Agent(name="bank", prompt="p", provider=llm, state_store=state)
+        llm = _answers("00000000000000000000000111", "never")
+        agent = Agent(
+            strict_tenancy=False, name="bank", prompt="p", provider=llm, state_store=state
+        )
         first = await agent.run("q", tenant_id="t1", idempotency_key="k")
         again = await agent.run("q", tenant_id="t1", idempotency_key="k")
         assert again.run_id == first.run_id
-        assert again.answer == "first"
+        assert again.answer == "00000000000000000000000111"
         assert llm.calls_made == 1
 
     async def test_same_tenant_conflict_names_the_run(self, state: Any) -> None:
-        agent = Agent(name="bank", prompt="p", provider=_answers("x", "y"), state_store=state)
+        agent = Agent(
+            strict_tenancy=False,
+            name="bank",
+            prompt="p",
+            provider=_answers("x", "y"),
+            state_store=state,
+        )
         first = await agent.run("q", tenant_id="t1", idempotency_key="k")
         with pytest.raises(IdempotencyConflictError) as caught:
             await agent.run("other", tenant_id="t1", idempotency_key="k")
         assert caught.value.run_id == first.run_id
 
     async def test_untenanted_and_tenanted_scopes_are_separate(self, state: Any) -> None:
-        await state.create_run("r1", "a", idempotency_key="k", idempotency_fingerprint="f")
+        await state.create_run(
+            "00000000000000000000000105", "a", idempotency_key="k", idempotency_fingerprint="f"
+        )
         created = await state.create_run(
-            "r2", "a", tenant_id="t", idempotency_key="k", idempotency_fingerprint="f"
+            "00000000000000000000000117",
+            "a",
+            tenant_id="t",
+            idempotency_key="k",
+            idempotency_fingerprint="f",
         )
         assert created.outcome == "created"
-        assert (await state._check_idempotency("k", "f")).run_id == "r1"
-        assert (await state._check_idempotency("k", "f", tenant_id="t")).run_id == "r2"
+        assert (await state._check_idempotency("k", "f")).run_id == "00000000000000000000000105"
+        assert (
+            await state._check_idempotency("k", "f", tenant_id="t")
+        ).run_id == "00000000000000000000000117"
         assert await state._check_idempotency("k", "f", tenant_id="other") is None
 
     async def test_unique_violation_in_the_same_tenant_resolves(self, state: Any) -> None:
         """A racing insert that loses on the unique index reads the winner back."""
         await state.create_run(
-            "r1", "a", tenant_id="t", idempotency_key="k", idempotency_fingerprint="f"
+            "00000000000000000000000105",
+            "a",
+            tenant_id="t",
+            idempotency_key="k",
+            idempotency_fingerprint="f",
         )
         original = state._check_idempotency
         calls = {"n": 0}
@@ -119,9 +153,13 @@ class TestTenantIdempotency:
 
         state._check_idempotency = miss_first
         result = await state.create_run(
-            "r2", "a", tenant_id="t", idempotency_key="k", idempotency_fingerprint="f"
+            "00000000000000000000000117",
+            "a",
+            tenant_id="t",
+            idempotency_key="k",
+            idempotency_fingerprint="f",
         )
-        assert (result.run_id, result.outcome) == ("r1", "existing_active")
+        assert (result.run_id, result.outcome) == ("00000000000000000000000105", "existing_active")
 
     async def test_legacy_global_unique_fails_closed_without_run_id(
         self, engine: Any, state: Any
@@ -132,15 +170,23 @@ class TestTenantIdempotency:
                 "CREATE UNIQUE INDEX ix_agent_runs_idempotency_key ON agent_runs (idempotency_key)"
             )
         await state.create_run(
-            "r1", "a", tenant_id="A", idempotency_key="k", idempotency_fingerprint="f"
+            "00000000000000000000000105",
+            "a",
+            tenant_id="A",
+            idempotency_key="k",
+            idempotency_fingerprint="f",
         )
         with pytest.raises(IdempotencyConflictError) as caught:
             await state.create_run(
-                "r2", "a", tenant_id="B", idempotency_key="k", idempotency_fingerprint="f"
+                "00000000000000000000000117",
+                "a",
+                tenant_id="B",
+                idempotency_key="k",
+                idempotency_fingerprint="f",
             )
         assert caught.value.run_id is None
-        assert "r1" not in str(caught.value)
-        assert await state.get_run("r2") is None
+        assert "00000000000000000000000105" not in str(caught.value)
+        assert await state.get_run("00000000000000000000000117") is None
 
     async def test_legacy_inline_unique_file_after_sync(self, tmp_path: Any) -> None:
         from tests.unit.test_sqlite_schema_sync import _build_old_db
@@ -150,7 +196,7 @@ class TestTenantIdempotency:
         eng = create_async_engine(f"sqlite+aiosqlite:///{db}")
         try:
             await create_sqlite_schema(eng)
-            legacy = SQLAlchemyStateStore(eng)
+            legacy = store_for_engine(eng)
             await legacy.create_run(
                 "n1", "a", tenant_id="A", idempotency_key="k", idempotency_fingerprint="f"
             )
@@ -160,7 +206,11 @@ class TestTenantIdempotency:
             assert same.run_id == "n1"
             with pytest.raises(IdempotencyConflictError) as caught:
                 await legacy.create_run(
-                    "n3", "a", tenant_id="B", idempotency_key="k", idempotency_fingerprint="f"
+                    "00000000000000000000000116",
+                    "a",
+                    tenant_id="B",
+                    idempotency_key="k",
+                    idempotency_fingerprint="f",
                 )
             assert caught.value.run_id is None
         finally:
@@ -174,24 +224,34 @@ class TestTenantIdempotency:
 
     async def test_store_rejects_empty_tenant(self, state: Any) -> None:
         with pytest.raises(ValueError, match="invalid_identifier"):
-            await state.create_run("r1", "a", tenant_id="")
+            await state.create_run("00000000000000000000000105", "a", tenant_id="")
 
     def test_violation_classifier(self) -> None:
-        from dendrux.runtime.state import _is_idempotency_violation
+        import sqlite3
 
-        assert _is_idempotency_violation(
-            Exception("UNIQUE constraint failed: index 'uq_agent_runs_tenant_idempotency_key'")
+        from dendrux.runtime.stores.sql.postgres import PostgresStateStore
+        from dendrux.runtime.stores.sql.sqlite import SQLiteStateStore
+
+        def unique(message):
+            error = sqlite3.IntegrityError(message)
+            error.sqlite_errorcode = sqlite3.SQLITE_CONSTRAINT_UNIQUE
+            return error
+
+        sqlite = object.__new__(SQLiteStateStore)
+        assert sqlite._idempotency_violation(
+            unique("UNIQUE constraint failed: index 'uq_agent_runs_tenant_idempotency_key'")
         )
-        assert _is_idempotency_violation(
-            Exception("UNIQUE constraint failed: agent_runs.idempotency_key")
+        assert sqlite._idempotency_violation(
+            unique("UNIQUE constraint failed: agent_runs.idempotency_key")
         )
-        assert _is_idempotency_violation(
-            Exception(
-                'duplicate key value violates unique constraint "ix_agent_runs_idempotency_key"'
-            )
-        )
-        assert not _is_idempotency_violation(Exception("UNIQUE constraint failed: agent_runs.id"))
-        assert not _is_idempotency_violation(Exception("the idempotency_key column is odd"))
+
+        class UniqueError(Exception):
+            sqlstate = "23505"
+            constraint_name = "ix_agent_runs_idempotency_key"
+
+        assert object.__new__(PostgresStateStore)._idempotency_violation(UniqueError())
+        assert not sqlite._idempotency_violation(unique("UNIQUE constraint failed: agent_runs.id"))
+        assert not sqlite._idempotency_violation(Exception("the idempotency_key column is odd"))
 
 
 # ---------------------------------------------------------------------------
@@ -201,51 +261,65 @@ class TestTenantIdempotency:
 
 class TestEventAllocation:
     async def test_indexes_start_at_zero_and_are_returned(self, state: Any) -> None:
-        await state.create_run("r1", "a")
-        seqs = [await state.save_run_event("r1", event_type=f"e{i}") for i in range(3)]
+        await state.create_run("00000000000000000000000105", "a")
+        seqs = [
+            await state.save_run_event("00000000000000000000000105", event_type=f"e{i}")
+            for i in range(3)
+        ]
         assert seqs == [0, 1, 2]
-        assert [e.sequence_index for e in await state.get_run_events("r1")] == [0, 1, 2]
+        assert [
+            e.sequence_index for e in await state.get_run_events("00000000000000000000000105")
+        ] == [0, 1, 2]
 
     async def test_runs_are_numbered_independently(self, state: Any) -> None:
-        await state.create_run("r1", "a")
-        await state.create_run("r2", "a")
-        assert await state.save_run_event("r1", event_type="x") == 0
-        assert await state.save_run_event("r2", event_type="x") == 0
-        assert await state.save_run_event("r1", event_type="y") == 1
+        await state.create_run("00000000000000000000000105", "a")
+        await state.create_run("00000000000000000000000117", "a")
+        assert await state.save_run_event("00000000000000000000000105", event_type="x") == 0
+        assert await state.save_run_event("00000000000000000000000117", event_type="x") == 0
+        assert await state.save_run_event("00000000000000000000000105", event_type="y") == 1
 
     async def test_fields_are_stored(self, state: Any) -> None:
-        await state.create_run("r1", "a")
+        await state.create_run("00000000000000000000000105", "a")
         await state.save_run_event(
-            "r1", event_type="t", iteration_index=3, correlation_id="c1", data={"k": [1]}
+            "00000000000000000000000105",
+            event_type="t",
+            iteration_index=3,
+            correlation_id="c1",
+            data={"k": [1]},
         )
-        (ev,) = await state.get_run_events("r1")
+        (ev,) = await state.get_run_events("00000000000000000000000105")
         assert (ev.iteration_index, ev.correlation_id, ev.data) == (3, "c1", {"k": [1]})
         assert ev.created_at is not None and ev.created_at.tzinfo is not None
 
     async def test_cas_paths_continue_the_same_sequence(self, state: Any) -> None:
-        await state.create_run("r1", "a")
-        await state.save_run_event("r1", event_type="run.started")
+        await state.create_run("00000000000000000000000105", "a")
+        await state.save_run_event("00000000000000000000000105", event_type="run.started")
         seq = await state.finalize_with_event(
-            "r1",
+            "00000000000000000000000105",
             status="success",
             allowed_current_statuses=["running"],
             event_type="run.completed",
         )
         assert seq == 1
-        assert await state.save_run_event("r1", event_type="late") == 2
+        assert await state.save_run_event("00000000000000000000000105", event_type="late") == 2
 
     async def test_concurrent_writers_get_distinct_contiguous_indexes(self, state: Any) -> None:
-        await state.create_run("r1", "a")
+        await state.create_run("00000000000000000000000105", "a")
         seqs = await asyncio.gather(
-            *(state.save_run_event("r1", event_type=f"e{i}") for i in range(25))
+            *(
+                state.save_run_event("00000000000000000000000105", event_type=f"e{i}")
+                for i in range(25)
+            )
         )
         assert sorted(seqs) == list(range(25))
 
     async def test_an_explicit_index_is_refused(self, state: Any) -> None:
         """0.4.1-style callers fail loudly instead of writing a caller-chosen index."""
-        await state.create_run("r1", "a")
+        await state.create_run("00000000000000000000000105", "a")
         with pytest.raises(TypeError):
-            await state.save_run_event("r1", event_type="x", sequence_index=7)  # type: ignore[call-arg]
+            await state.save_run_event(
+                "00000000000000000000000105", event_type="x", sequence_index=7
+            )  # type: ignore[call-arg]
 
     async def test_retried_write_never_hides_events_from_a_cursor(self, state: Any) -> None:
         """A transient failure: a transient failure used to commit an earlier index late."""
@@ -262,17 +336,25 @@ class TestEventAllocation:
         original = state.save_run_event
         failed = {"done": False}
 
+        @wraps(original)
         async def flaky(run_id: str, **kwargs: Any) -> int:
             if kwargs.get("event_type") == "tool.completed" and not failed["done"]:
                 failed["done"] = True
-                raise OperationalError("x", {}, Exception("database is locked"))
+                raise OperationalError("x", {}, locked_error())
             return await original(run_id, **kwargs)
 
         state.save_run_event = flaky
         llm = ScriptedLLM(
             [tool_calls(("a", {"x": 1}, "p1"), ("b", {"x": 2}, "p2")), LLMResponse(text="ok")]
         )
-        agent = Agent(name="o", prompt="p", tools=[a, b], provider=llm, state_store=state)
+        agent = Agent(
+            strict_tenancy=False,
+            name="o",
+            prompt="p",
+            tools=[a, b],
+            provider=llm,
+            state_store=state,
+        )
         seen: list[int] = []
         stop = asyncio.Event()
 
@@ -325,15 +407,22 @@ class TestEventAllocation:
 
 class TestNoteCap:
     async def test_cap_raises_once_full(self, state: Any, caplog: Any) -> None:
-        await state.create_run("r1", "a")
+        await state.create_run("00000000000000000000000105", "a")
         for i in range(3):
-            assert await state.add_note("r1", note_id=f"n{i}", text="t", max_notes=3)
+            assert await state.add_note(
+                "00000000000000000000000105", note_id=f"n{i}", text="t", max_notes=3
+            )
         with caplog.at_level(logging.WARNING), pytest.raises(NoteLimitExceededError) as caught:
-            await state.add_note("r1", note_id="n3", text="t", max_notes=3)
-        assert (caught.value.run_id, caught.value.limit) == ("r1", 3)
+            await state.add_note(
+                "00000000000000000000000105",
+                note_id="00000000000000000000000116",
+                text="t",
+                max_notes=3,
+            )
+        assert (caught.value.run_id, caught.value.limit) == ("00000000000000000000000105", 3)
         assert isinstance(caught.value, ValueError)
-        assert "code=note_limit" in caplog.text
-        assert len(await state.get_notes("r1")) == 3
+        assert any(getattr(r, "code", None) == "note_limit" for r in caplog.records)
+        assert len(await state.get_notes("00000000000000000000000105")) == 3
 
     async def test_terminal_missing_or_foreign_run_is_false_not_full(self, state: Any) -> None:
         await state.create_run("done", "a", tenant_id="t")
@@ -342,36 +431,45 @@ class TestNoteCap:
         assert not await state.add_note("done", note_id="n1", text="t", max_notes=1)
         assert not await state.add_note("missing", note_id="n2", text="t", max_notes=1)
         await state.create_run("live", "a", tenant_id="t")
-        await state.add_note("live", note_id="n3", text="t", max_notes=1)
+        await state.add_note("live", note_id="00000000000000000000000116", text="t", max_notes=1)
         assert not await state.add_note(
             "live", note_id="n4", text="t", tenant_id="other", max_notes=1
         )
 
     async def test_no_cap_without_max_notes(self, state: Any) -> None:
-        await state.create_run("r1", "a")
+        await state.create_run("00000000000000000000000105", "a")
         for i in range(5):
-            assert await state.add_note("r1", note_id=f"n{i}", text="t")
+            assert await state.add_note("00000000000000000000000105", note_id=f"n{i}", text="t")
 
     async def test_invalid_cap_rejected(self, state: Any) -> None:
         with pytest.raises(ValueError, match="max_notes"):
-            await state.add_note("r1", note_id="n", text="t", max_notes=0)
+            await state.add_note("00000000000000000000000105", note_id="n", text="t", max_notes=0)
 
     async def test_concurrent_submitters_never_exceed_the_cap(self, state: Any) -> None:
-        await state.create_run("r1", "a")
+        await state.create_run("00000000000000000000000105", "a")
         results = await asyncio.gather(
-            *(state.add_note("r1", note_id=f"n{i:02d}", text="t", max_notes=5) for i in range(20)),
+            *(
+                state.add_note(
+                    "00000000000000000000000105", note_id=f"n{i:02d}", text="t", max_notes=5
+                )
+                for i in range(20)
+            ),
             return_exceptions=True,
         )
         assert sum(r is True for r in results) == 5
         assert all(isinstance(r, NoteLimitExceededError) for r in results if r is not True)
-        assert len(await state.get_notes("r1")) == 5
+        assert len(await state.get_notes("00000000000000000000000105")) == 5
 
     async def test_agent_submit_note_enforces_limits(self, state: Any) -> None:
         from tests.integration.test_tenant_run_control import _pause
 
         paused = await _pause("client", state, "t1")
         agent = Agent(
-            provider=MockLLM([]), prompt="p", state_store=state, limits=Limits(max_notes_per_run=2)
+            strict_tenancy=False,
+            provider=MockLLM([]),
+            prompt="p",
+            state_store=state,
+            limits=Limits(max_notes_per_run=2),
         )
         await agent.submit_note(paused.run_id, "one", tenant_id="t1")
         await agent.submit_note(paused.run_id, "two", tenant_id="t1")
@@ -396,7 +494,7 @@ async def _seed_two_tenants(state: Any) -> None:
             tool_name="t",
             target="server",
             params={"p": 1},
-            result_payload='"r"',
+            result_payload='"00000000000000000000000102"',
             success=True,
             duration_ms=1,
             iteration_index=0,
@@ -498,8 +596,10 @@ class TestRunStoreScoping:
         assert (await store.get_pauses("rp"))[0].pause_id == "P1"
 
     async def test_list_runs_never_loads_pause_data(self, state: Any, engine: Any) -> None:
-        await state.create_run("r1", "a")
-        await state.pause_run("r1", status="waiting_client_tool", pause_data={"big": "x"})
+        await state.create_run("00000000000000000000000105", "a")
+        await state.pause_run(
+            "00000000000000000000000105", status="waiting_client_tool", pause_data={"big": "x"}
+        )
         statements: list[str] = []
 
         @event.listens_for(engine.sync_engine, "before_cursor_execute")
@@ -507,7 +607,7 @@ class TestRunStoreScoping:
             statements.append(statement)
 
         (record,) = await state.list_runs()
-        assert record.id == "r1"
+        assert record.id == "00000000000000000000000105"
         select_sql = next(s for s in statements if s.lstrip().upper().startswith("SELECT"))
         assert "pause_data" not in select_sql
         assert "pii_mapping" not in select_sql
@@ -521,14 +621,18 @@ class TestRunStoreScoping:
 
     async def test_started_filters_use_utc_instants(self, state: Any, store: RunStore) -> None:
         """a non-UTC offset compares the same instant on SQLite."""
-        await state.create_run("r1", "a")
-        created = (await state.get_run("r1")).created_at
+        await state.create_run("00000000000000000000000105", "a")
+        created = (await state.get_run("00000000000000000000000105")).created_at
         plus5 = dt.timezone(dt.timedelta(hours=5))
         just_before = (created - dt.timedelta(seconds=1)).astimezone(plus5)
         just_after = (created + dt.timedelta(seconds=1)).astimezone(plus5)
-        assert [r.run_id for r in await store.list_runs(started_after=just_before)] == ["r1"]
+        assert [r.run_id for r in await store.list_runs(started_after=just_before)] == [
+            "00000000000000000000000105"
+        ]
         assert await store.list_runs(started_after=just_after) == []
-        assert [r.id for r in await state.list_runs(started_before=just_after)] == ["r1"]
+        assert [r.id for r in await state.list_runs(started_before=just_after)] == [
+            "00000000000000000000000105"
+        ]
         assert await store.count_runs(started_before=just_before) == 0
 
 
@@ -539,7 +643,13 @@ class TestRunStoreScoping:
 
 class TestRetryNotFound:
     async def test_missing_and_foreign_raise_the_same_error(self, state: Any) -> None:
-        agent = Agent(name="a", prompt="p", provider=_answers("x", "y", "z"), state_store=state)
+        agent = Agent(
+            strict_tenancy=False,
+            name="a",
+            prompt="p",
+            provider=_answers("x", "y", "z"),
+            state_store=state,
+        )
         done = await agent.run("q", tenant_id="A")
         assert done.status == RunStatus.SUCCESS
         with pytest.raises(RunNotFoundError) as missing:
@@ -564,7 +674,7 @@ class TestLegacyEventWriter:
 
         legacy = Legacy()
         with pytest.raises(TypeError, match="sequence_index"):
-            await _emit_event(legacy, "r", "tick")
+            await _emit_event(legacy, "00000000000000000000000102", "tick")
         assert not legacy.written
 
     @pytest.mark.parametrize("value", [None, True, "0", -1])

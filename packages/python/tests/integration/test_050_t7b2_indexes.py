@@ -89,7 +89,7 @@ async def test_concurrent_index_wait_is_bounded_and_retry_repairs(engine, action
         async with target.connect() as conn:
             assert (
                 await conn.execute(text("SELECT version_num FROM alembic_version"))
-            ).scalar_one() == "e8f9a0b1c2d3"
+            ).scalar_one() == "f9a0b1c2d3e4"
             assert (
                 await conn.execute(
                     text(

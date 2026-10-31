@@ -9,6 +9,7 @@ sibling kept running, applied its side effect and wrote its row after
 from __future__ import annotations
 
 import asyncio
+from functools import wraps
 
 import pytest
 
@@ -33,10 +34,18 @@ async def slow_side_effect(x: int) -> int:
     return x
 
 
+@pytest.mark.parametrize("engine", ["sqlite_file", "postgres"], indirect=True)
 async def test_failed_row_write_stops_the_running_sibling(store):
+    # A cancelled SQLite write can invalidate its connection. Use a durable
+    # database so connection replacement does not erase the test schema.
+    # This fault injection / pause blob exercises the format-1 write path.
+    from tests._fixtures.storage import pin_storage_format
+
+    await pin_storage_format(store._engine, 1)
     LOG.clear()
     original = store.save_tool_call
 
+    @wraps(original)
     async def failing(run_id, *, tool_name, **kwargs):
         if tool_name == "fast":
             raise RuntimeError("constraint violation")
@@ -48,7 +57,13 @@ async def test_failed_row_write_stops_the_running_sibling(store):
         ToolCall(name="slow_side_effect", params={"x": 2}, provider_tool_call_id="b"),
     ]
     llm = MockLLM([LLMResponse(tool_calls=calls), LLMResponse(text="ok")])
-    agent = Agent(prompt="p", tools=[fast, slow_side_effect], provider=llm, state_store=store)
+    agent = Agent(
+        strict_tenancy=False,
+        prompt="p",
+        tools=[fast, slow_side_effect],
+        provider=llm,
+        state_store=store,
+    )
 
     with pytest.raises(RuntimeError, match="constraint violation"):
         await agent.run("go")

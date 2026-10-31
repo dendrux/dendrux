@@ -29,8 +29,10 @@ from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, TypeVar
 
+from dendrux import _codes
+
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Awaitable
+    from collections.abc import AsyncGenerator, AsyncIterator, Awaitable
 
     from dendrux.skills._session import SkillSession
 
@@ -87,6 +89,7 @@ class DelegationContext:
             fans out to many child runs. Mutable set on a frozen dataclass —
             frozen prevents field reassignment, not mutation of the set.
         tenant_id: This run's tenant. Delegated runs inherit it.
+        tenant_explicit: The outer caller chose scope, including explicit None.
         state_store: The store this run persists to (None if ephemeral);
             used by :func:`heartbeat`.
         loop: The event loop the run executes on; lets :func:`heartbeat`
@@ -103,6 +106,20 @@ class DelegationContext:
     state_store: Any = field(default=None, compare=False, repr=False)
     loop: asyncio.AbstractEventLoop | None = field(default=None, compare=False, repr=False)
     _heartbeat_at: list[float] = field(default_factory=lambda: [0.0], compare=False, repr=False)
+    lease_interval_s: float = 30.0
+    _lease_lock: asyncio.Lock = field(default_factory=asyncio.Lock, compare=False, repr=False)
+    _lease_failures: list[int] = field(default_factory=lambda: [0], compare=False, repr=False)
+    _lease_errors: list[BaseException | None] = field(
+        default_factory=lambda: [None], compare=False, repr=False
+    )
+    _lease_users: list[int] = field(default_factory=lambda: [0], compare=False, repr=False)
+    _lease_ticker: list[asyncio.Task[None] | None] = field(
+        default_factory=lambda: [None], compare=False, repr=False
+    )
+    _lease_at: list[float] = field(default_factory=lambda: [0.0], compare=False, repr=False)
+    trace_link: str | None = None
+    tool_span_link: str | None = None
+    tenant_explicit: bool = False
 
     def __hash__(self) -> int:
         return hash(self.run_id)
@@ -144,7 +161,7 @@ def get_store_identity(store: object | None) -> str | None:
     """Extract a comparable identity from a state store.
 
     Resolution order:
-      1. store.store_identity property (SQLAlchemyStateStore returns DB URL)
+      1. store.store_identity property (SQLStateStore returns DB URL)
       2. Fallback: str(id(store)) for custom stores without the property
 
     Returns None if store is None.
@@ -191,8 +208,12 @@ _heartbeat_tasks: set[asyncio.Task[None]] = set()
 
 
 async def _touch(store: Any, run_id: str) -> None:
+    from dendrux.errors import RunFencedError
+
     try:
         await store.touch_progress(run_id)
+    except RunFencedError:
+        raise
     except Exception:
         logger.warning("Heartbeat failed for run %s", run_id, exc_info=True)
 
@@ -202,6 +223,8 @@ def _heartbeat_target() -> DelegationContext | None:
     ctx = get_delegation_context()
     if ctx is None or not ctx.persisted or ctx.state_store is None:
         return None
+    if ctx._lease_errors[0] is not None:
+        raise ctx._lease_errors[0]
     now = time.monotonic()
     if now - ctx._heartbeat_at[0] < _HEARTBEAT_MIN_INTERVAL_S:
         return None
@@ -217,7 +240,8 @@ def heartbeat() -> None:
     update on the run's event loop and returns immediately, so a long wait
     inside a tool is not swept as ``stale_running``. Calls closer than one
     second apart for the same run are coalesced. No-op outside a persisted
-    run.
+    run. A known fence is re-raised immediately; a newly observed fence is
+    retained and raised by the next heartbeat or enclosing step boundary.
     """
     ctx = _heartbeat_target()
     if ctx is None or ctx.loop is None:
@@ -227,7 +251,15 @@ def heartbeat() -> None:
     def _schedule() -> None:
         task = loop.create_task(_touch(store, run_id))
         _heartbeat_tasks.add(task)
-        task.add_done_callback(_heartbeat_tasks.discard)
+
+        def finished(done: asyncio.Task[None]) -> None:
+            _heartbeat_tasks.discard(done)
+            if not done.cancelled():
+                error = done.exception()
+                if error is not None:
+                    ctx._lease_errors[0] = error
+
+        task.add_done_callback(finished)
 
     try:
         running = asyncio.get_running_loop()
@@ -245,7 +277,7 @@ async def aheartbeat() -> None:
     """Awaitable :func:`heartbeat`: writes ``last_progress_at`` before returning.
 
     Must be awaited on the run's event loop (inside an async tool). Failures
-    are logged, never raised. No-op outside a persisted run.
+    are logged; RunFencedError is re-raised. No-op outside a persisted run.
     """
     ctx = _heartbeat_target()
     if ctx is not None:
@@ -359,3 +391,74 @@ class StreamContext:
                 yield event
         finally:
             await self._step(generator.aclose())
+
+
+async def _renew_claim(ctx: DelegationContext) -> None:
+    from dendrux.errors import PersistenceError, RunFencedError
+
+    if ctx._lease_lock.locked():
+        return
+    async with ctx._lease_lock:
+        now = time.monotonic()
+        if now - ctx._lease_at[0] < ctx.lease_interval_s:
+            return
+        ctx._lease_at[0] = now
+        try:
+            async with asyncio.timeout(min(ctx.lease_interval_s / 2, 10.0)):
+                await ctx.state_store.touch_progress(ctx.run_id)
+            ctx._lease_failures[0] = 0
+        except RunFencedError as error:
+            ctx._lease_errors[0] = error
+            raise
+        except Exception:
+            ctx._lease_failures[0] += 1
+            _codes.log_code(
+                logger, _codes.LEASE_RENEW_FAILED, run_id=ctx.run_id, attempt=ctx._lease_failures[0]
+            )
+            if ctx._lease_failures[0] >= 2:
+                ctx._lease_errors[0] = PersistenceError(code="lease_lost")
+                _codes.log_code(logger, _codes.LEASE_LOST, run_id=ctx.run_id)
+
+
+@contextlib.asynccontextmanager
+async def lease_scope() -> AsyncIterator[None]:
+    """Renew only while a model/tool call is in flight, in the caller's task context."""
+    from dendrux.errors import RunFencedError
+    from dendrux.runtime._capabilities import capabilities
+
+    ctx = get_delegation_context()
+    if ctx is None or not ctx.persisted or not capabilities(ctx.state_store).fenced_writes:
+        yield
+        return
+    if ctx._lease_errors[0] is not None:
+        raise ctx._lease_errors[0]
+
+    async def tick() -> None:
+        while ctx._lease_errors[0] is None:
+            await asyncio.sleep(ctx.lease_interval_s)
+            try:
+                await _renew_claim(ctx)
+            except RunFencedError:
+                # The loop's next boundary raises the stored error in its own
+                # task. Never cancel a consumer while its generator is yielded.
+                return
+
+    ctx._lease_users[0] += 1
+    if ctx._lease_users[0] == 1:
+        ctx._lease_ticker[0] = asyncio.create_task(tick())
+    try:
+        await _renew_claim(ctx)
+        yield
+    finally:
+        ctx._lease_users[0] -= 1
+        if ctx._lease_users[0] == 0:
+            ticker = ctx._lease_ticker[0]
+            ctx._lease_ticker[0] = None
+            if ticker is not None:
+                ticker.cancel()
+                # Cancellation of the write precedes waiting for cleanup.
+                done, _ = await asyncio.wait({ticker}, timeout=1.0)
+                if ticker in done and not ticker.cancelled():
+                    ticker.exception()
+    if ctx._lease_errors[0] is not None:
+        raise ctx._lease_errors[0]

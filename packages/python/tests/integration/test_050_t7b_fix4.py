@@ -11,7 +11,8 @@ from sqlalchemy.sql.selectable import Select
 
 from dendrux import sweep
 from dendrux.db.models import AgentRun
-from dendrux.runtime.state import SQLAlchemyStateStore, StateStore
+from dendrux.runtime.state import StateStore
+from dendrux.runtime.stores.sql.base import SQLStateStore
 
 
 @pytest.mark.parametrize(
@@ -20,8 +21,8 @@ from dendrux.runtime.state import SQLAlchemyStateStore, StateStore
         sweep,
         StateStore.sweep_stale_runs,
         StateStore.sweep_abandoned_runs,
-        SQLAlchemyStateStore.sweep_stale_runs,
-        SQLAlchemyStateStore.sweep_abandoned_runs,
+        SQLStateStore.sweep_stale_runs,
+        SQLStateStore.sweep_abandoned_runs,
     ],
     ids=["public", "protocol-running", "protocol-waiting", "sql-running", "sql-waiting"],
 )
@@ -68,7 +69,7 @@ async def test_default_waiting_scan_reaches_beyond_the_old_thousand_row_cap(
         if isinstance(statement, Update) and "failure_reason" in str(statement):
             # All CAS attempts lose, so the bound must count candidates rather
             # than successful status transitions. Keep real indexed page reads.
-            return SimpleNamespace(scalar_one_or_none=lambda: None)
+            return SimpleNamespace(mappings=lambda: SimpleNamespace(first=lambda: None))
         result = await execute(session, statement, *args, **kwargs)
         if isinstance(statement, Select) and "started" in statement.selected_columns:
             rows = result.all()

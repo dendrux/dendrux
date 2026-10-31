@@ -20,6 +20,7 @@ from sqlalchemy.pool import NullPool
 
 from dendrux import Agent
 from dendrux.db import session as db_session
+from dendrux.db._storage_schema import ADDITIONS
 from dendrux.db.models import Base
 from dendrux.errors import PersistenceError, SchemaNotInitializedError, SchemaOutOfDateError
 from dendrux.llm.mock import MockLLM
@@ -52,11 +53,14 @@ _SWEEP_INDEXES = {
     "agent_runs.ix_agent_runs_sweep_waiting (index)",
     "run_events.ix_run_events_started (index)",
 }
+_RECOVERY_COLUMNS = {f"{table}.{column}" for table, cols in ADDITIONS.items() for column in cols}
 _MISSING_AT_PRIOR = (
     _MISSING
     | {"agent_runs.claim_epoch", "agent_runs.status_changed_at"}
     | _R1_INDEXES
     | _SWEEP_INDEXES
+    | _RECOVERY_COLUMNS
+    | {"dendrux_settings"}
 )
 RUN_CONTROL = "b5c6d7e8f9a0"  # 0.3.0 head: everything but the 0.4.0 image blob tables
 
@@ -116,6 +120,7 @@ async def _count_runs(url: str) -> int:
 
 def _agent(url: str | None = None) -> Agent:
     kwargs: dict[str, Any] = {"database_url": url} if url else {}
+    kwargs.setdefault("strict_tenancy", False)
     return Agent(
         name="schema-check",
         prompt="Test.",
@@ -221,27 +226,17 @@ async def test_empty_database_still_says_not_initialized(pg_url: str) -> None:
         await agent.close()
 
 
-async def test_env_var_path_does_not_cache_a_failed_engine(
+async def test_env_var_path_is_ignored_without_engine_acquisition(
     pg_url: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    await _build_previous_schema(pg_url)
     monkeypatch.setenv("DENDRUX_DATABASE_URL", pg_url)
-    await db_session.reset_engine()
     agent = _agent()
     try:
-        with pytest.raises(SchemaOutOfDateError):
-            await agent.run("hi")
-        assert db_session._engine is None
-
-        engine = _admin(pg_url)
-        async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.drop_all)
-        await engine.dispose()
-        await _build_current_schema(pg_url)
         assert (await agent.run("hi")).answer == "ok"
+        assert agent._lazy_store is None
+        assert agent._private_engine is None
     finally:
         await agent.close()
-        await db_session.reset_engine()
 
 
 async def test_run_store_is_not_checked_and_reads_view_backed_tables(pg_url: str) -> None:
@@ -392,8 +387,11 @@ async def test_v030_schema_names_both_blob_tables(pg_url: str) -> None:
         with pytest.raises(SchemaOutOfDateError) as info:
             await agent.run("hi")
         err = info.value
-        assert set(err.missing_tables) == {"dendrux_blobs", "dendrux_blob_refs"}
-        assert err.missing_columns == ("agent_runs.claim_epoch", "agent_runs.status_changed_at")
+        assert set(err.missing_tables) == {"dendrux_blobs", "dendrux_blob_refs", "dendrux_settings"}
+        assert set(err.missing_columns) == _RECOVERY_COLUMNS | {
+            "agent_runs.claim_epoch",
+            "agent_runs.status_changed_at",
+        }
         assert set(err.missing_indexes) == _R1_INDEXES | _SWEEP_INDEXES
         assert "dendrux_blobs" in str(err) and "dendrux_blob_refs" in str(err)
         assert "dendrux db migrate" in str(err)

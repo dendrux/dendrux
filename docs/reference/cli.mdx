@@ -1,0 +1,41 @@
+---
+title: Database CLI
+description: Migrate, check, inspect and activate a Dendrux database with deployment-owned jobs.
+---
+
+# Database CLI
+
+The CLI reads `DENDRUX_DATABASE_URL`. It defaults to `sqlite+aiosqlite:///./dendrux.db` when the variable is absent. Supply the intended database through your deployment's credential configuration before running a command. There is no database URL flag.
+
+| Command | Purpose |
+| --- | --- |
+| `dendrux db migrate` | Apply Alembic migrations through this package's head |
+| `dendrux db check` | Read-only revision and structure check: exit 0 current, 1 behind, 2 unknown or unstamped |
+| `dendrux db check --allow-unstamped` | Check the expected structure when no revision is stamped |
+| `dendrux db status` | Print `revision`, `storage_format` and `activate_step` |
+| `dendrux db activate` | Check, deduplicate, build uniqueness and enable format 2 for new runs |
+| `dendrux db dedupe` | Remove identical duplicates without enabling format 2 |
+
+## Migrate and activate are separate
+
+Run migration once per deployment, over a direct Postgres connection. The 0.6 migration adds storage but leaves a migrated database at format 1. Roll every worker and reader to 0.6 before activation. Take a pre-activation backup. Follow the full [upgrade procedure](/docs/upgrading-to-0.6.0).
+
+```bash
+dendrux db check
+dendrux db status
+# Only after all workers and readers are upgraded and the backup is complete:
+dendrux db activate --batch-size 5000
+dendrux db status
+```
+
+An active database reports `storage_format=2 activate_step=done`. A database with no activation progress reports `activate_step=not-started`. `db status` exits 2 if it cannot read status; it does not repair or migrate anything.
+
+`activate` and `dedupe` accept `--batch-size` from 1 to 5,000 (default 5,000). Progress is recorded so a failed command can resume. Conflicting duplicate contents or an index conflict exit 3; other activation failures exit 1. Resolve the reported condition and rerun. Do not choose or delete conflicting payloads blindly.
+
+Use a direct Postgres connection for activation; concurrent index builds and the maintenance lock require it. For SQLite, stop every other process using the file first. The exclusive lock refuses a live competing transaction, but cannot establish that every idle process has stopped.
+
+Activation reads the whole `react_traces`, `tool_calls` and `run_events` tables, builds three unique indexes concurrently on Postgres and then drops the old indexes. Run it in a quiet period and check free disk for the builds first.
+
+> **No downgrade command.** Once activation starts, rollback requires the pre-activation backup. Even an incomplete activation prevents Alembic downgrade of the 0.6 storage migration.
+
+`db dedupe` records the same activation-progress marker even though it does not enable format 2. Take the backup before dedupe too; its marker also prevents downgrade of the storage migration.

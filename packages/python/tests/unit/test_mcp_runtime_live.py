@@ -2144,7 +2144,10 @@ class TestTransportMisbehaviour:
             await runtime.close()
 
         assert secret not in caplog.text
-        assert "[redacted]" in caplog.text
+        assert any(
+            getattr(record, "code", None) == "mcp_cleanup_failed" and record.count == 1
+            for record in caplog.records
+        )
 
     @pytest.mark.asyncio
     async def test_close_failure_does_not_break_eviction(self) -> None:

@@ -672,7 +672,7 @@ class TestHashing:
 
 
 def test_types_does_not_import_media() -> None:
-    """``dendrux.types`` never imports ``dendrux.media`` (or anything else in dendrux).
+    """``dendrux.types`` never imports ``dendrux.media`` (except the lowest-layer code registry).
 
     ``import dendrux.types`` runs ``dendrux/__init__.py`` first, which exports
     ``Image`` (and imports the agent stack), so the package is stubbed to load
@@ -686,7 +686,7 @@ def test_types_does_not_import_media() -> None:
         "sys.modules['dendrux'] = pkg\n"
         "import dendrux.types\n"
         "loaded = sorted(m for m in sys.modules if m.startswith('dendrux.'))\n"
-        "assert loaded == ['dendrux.types'], loaded\n"
+        "assert loaded == ['dendrux._codes', 'dendrux.types'], loaded\n"
     )
     proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
     assert proc.returncode == 0, proc.stderr

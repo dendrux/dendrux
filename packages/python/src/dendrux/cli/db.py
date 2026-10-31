@@ -51,13 +51,38 @@ def _build_alembic_config() -> Any:
 
 
 def _database_url() -> str:
-    return os.environ.get("DENDRUX_DATABASE_URL", "sqlite+aiosqlite:///./dendrux.db")
+    url = os.environ.get("DENDRUX_DATABASE_URL", "sqlite+aiosqlite:///./dendrux.db")
+    from dendrux.db._engine_options import is_mysql_family_url, normalized_url
+
+    if is_mysql_family_url(url):
+        return normalized_url(url).render_as_string(hide_password=False)
+    return url
+
+
+def _maintenance_engine(url: str) -> Any:
+    """A short-lived engine; MySQL-family ones get the settings the store requires."""
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from sqlalchemy.pool import NullPool
+
+    from dendrux.db._engine_options import (
+        is_mysql_family_url,
+        mysql_engine_options,
+        normalized_url,
+    )
+
+    if is_mysql_family_url(url):
+        return create_async_engine(
+            normalized_url(url), poolclass=NullPool, **mysql_engine_options({})
+        )
+    return create_async_engine(url, poolclass=NullPool)
 
 
 @app.command()
 def migrate() -> None:
     """Run database migrations (alembic upgrade head).
 
+    On MySQL/MariaDB an empty database is bootstrapped straight to the current schema
+    (an interrupted bootstrap resumes); a database holding anything else is refused.
     Set DENDRUX_DATABASE_URL to override the default SQLite path.
     """
     try:
@@ -80,18 +105,110 @@ def migrate() -> None:
 
 @app.command()
 def status() -> None:
-    """Show current migration revision.
+    """Show the Alembic revision, storage format and resumable activation step.
 
-    Set DENDRUX_DATABASE_URL to override the default SQLite path.
+    On MySQL/MariaDB an unfinished bootstrap is shown as ``bootstrap_in_progress=<rev>``.
     """
     try:
-        from alembic import command
-    except ImportError:
-        console.print("[red]Alembic not installed.[/red] Run: pip install dendrux[db]")
-        raise typer.Exit(1) from None
+        revision, storage_format, step, bootstrap = asyncio.run(
+            _read_activation_status(_database_url())
+        )
+    except Exception:
+        console.print("[red]Could not read database status.[/red] Run `dendrux db check`.")
+        raise typer.Exit(2) from None
+    line = f"revision={revision} storage_format={storage_format} activate_step={step}"
+    if bootstrap is not None:
+        line += f" bootstrap_in_progress={bootstrap}"
+    console.print(line, markup=False)
 
-    alembic_cfg = _build_alembic_config()
-    command.current(alembic_cfg, verbose=True)
+
+async def _read_activation_status(url: str) -> tuple[str, str, str, str | None]:
+    from sqlalchemy import inspect, select, text
+
+    from dendrux.db.models import DendruxSetting
+
+    engine = _maintenance_engine(url)
+    try:
+        async with engine.connect() as conn:
+            revision = None
+            if await conn.run_sync(lambda c: inspect(c).has_table("alembic_version")):
+                revision = (
+                    await conn.execute(text("SELECT version_num FROM alembic_version"))
+                ).scalar_one_or_none()
+            revision = revision or "unstamped"
+            if not await conn.run_sync(lambda c: inspect(c).has_table("dendrux_settings")):
+                return revision, "1", "not-started", None
+            keys = ("storage_format", "activate_step", "bootstrap_in_progress")
+            settings = dict(
+                (
+                    await conn.execute(
+                        select(DendruxSetting.key, DendruxSetting.value).where(
+                            DendruxSetting.key.in_(keys)
+                        )
+                    )
+                )
+                .tuples()
+                .all()
+            )
+            return (
+                revision,
+                settings.get("storage_format", "1"),
+                settings.get("activate_step", "not-started"),
+                settings.get("bootstrap_in_progress"),
+            )
+    finally:
+        await engine.dispose()
+
+
+@app.command()
+def activate(
+    batch_size: int = typer.Option(5000, "--batch-size", min=1, max=5000),
+) -> None:
+    """Dedupe and activate format 2 after every writer and reader has been upgraded.
+
+    Stop every other process first when using SQLite. Take a pre-activation backup:
+    activation is one-way. Use a direct PostgreSQL connection for concurrent DDL.
+    """
+    _run_activation(batch_size, dedupe_only=False)
+
+
+@app.command()
+def dedupe(
+    batch_size: int = typer.Option(5000, "--batch-size", min=1, max=5000),
+) -> None:
+    """Only dedupe identical rows, with the same resumable cursors as activate."""
+    _run_activation(batch_size, dedupe_only=True)
+
+
+def _run_activation(batch_size: int, *, dedupe_only: bool) -> None:
+    from dendrux.db._activate import ActivationConflictError, ActivationIndexConflictError
+
+    try:
+        asyncio.run(_activate_database(_database_url(), batch_size, dedupe_only))
+    except (ActivationConflictError, ActivationIndexConflictError) as error:
+        console.print(str(error), markup=False)
+        raise typer.Exit(3) from None
+    except RuntimeError as error:
+        console.print(str(error), markup=False)
+        raise typer.Exit(1) from None
+    except Exception:
+        # Driver exceptions can contain tool/trace content in SQL parameters.
+        console.print("[red]Activation failed.[/red] Check database availability and retry.")
+        raise typer.Exit(1) from None
+    console.print(
+        "[green]Dedupe complete.[/green]" if dedupe_only else "[green]Activation complete.[/green]"
+    )
+
+
+async def _activate_database(url: str, batch_size: int, dedupe_only: bool) -> None:
+
+    from dendrux.db._activate import activate_database
+
+    engine = _maintenance_engine(url)
+    try:
+        await activate_database(engine, batch_size=batch_size, dedupe_only=dedupe_only)
+    finally:
+        await engine.dispose()
 
 
 EXIT_CURRENT = 0
@@ -180,17 +297,12 @@ def check(
 async def _read_schema_state(url: str) -> tuple[str | None, list[str]]:
     """``(alembic revision or None, missing schema objects)`` for ``url``. Read-only."""
     from sqlalchemy import inspect, text
-    from sqlalchemy.ext.asyncio import create_async_engine
-    from sqlalchemy.pool import NullPool
 
     from dendrux.db._schema_check import (
-        compare_indexes,
-        compare_schema,
-        read_actual_indexes,
-        read_actual_schema,
+        schema_problems,
     )
 
-    engine = create_async_engine(url, poolclass=NullPool)
+    engine = _maintenance_engine(url)
     try:
         async with engine.connect() as conn:
             stamped = await conn.run_sync(lambda c: inspect(c).has_table("alembic_version"))
@@ -198,12 +310,7 @@ async def _read_schema_state(url: str) -> tuple[str | None, list[str]]:
             if stamped:
                 row = (await conn.execute(text("SELECT version_num FROM alembic_version"))).first()
                 revision = row[0] if row is not None else None
-            actual = await conn.run_sync(read_actual_schema)
-            missing_tables, missing = compare_schema(actual)
-            missing.extend(f"table {t}" for t in missing_tables)
-            if engine.dialect.name == "postgresql" and actual:
-                indexes = await conn.run_sync(read_actual_indexes)
-                missing.extend(compare_indexes(indexes, actual.keys()))
+            missing = await conn.run_sync(schema_problems)
             return revision, missing
     finally:
         await engine.dispose()
