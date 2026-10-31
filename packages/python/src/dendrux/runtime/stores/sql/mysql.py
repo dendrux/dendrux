@@ -59,19 +59,9 @@ class MySQLStateStore(SQLStateStore):
         """Create a shared engine with connection-time UTC and READ COMMITTED."""
         from sqlalchemy.ext.asyncio import create_async_engine
 
-        from dendrux.db._engine_options import normalized_url
+        from dendrux.db._engine_options import mysql_engine_options, normalized_url
 
-        options = dict(engine_options)
-        if options.get("isolation_level", "READ COMMITTED") != "READ COMMITTED":
-            raise ValueError('MySQLStateStore requires isolation_level="READ COMMITTED"')
-        options["isolation_level"] = "READ COMMITTED"
-        connect = dict(options.get("connect_args", {}))
-        if "init_command" in connect and connect["init_command"] != "SET time_zone='+00:00'":
-            raise ValueError("MySQLStateStore requires the UTC connection init_command")
-        connect["init_command"] = "SET time_zone='+00:00'"
-        connect.setdefault("charset", "utf8mb4")
-        options["connect_args"] = connect
-        options["hide_parameters"] = True
+        options = mysql_engine_options(engine_options)
         return cls(create_async_engine(normalized_url(url), **options))
 
     async def connection_checks(self, conn: Any) -> Any:

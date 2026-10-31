@@ -51,7 +51,30 @@ def _build_alembic_config() -> Any:
 
 
 def _database_url() -> str:
-    return os.environ.get("DENDRUX_DATABASE_URL", "sqlite+aiosqlite:///./dendrux.db")
+    url = os.environ.get("DENDRUX_DATABASE_URL", "sqlite+aiosqlite:///./dendrux.db")
+    from dendrux.db._engine_options import is_mysql_family_url, normalized_url
+
+    if is_mysql_family_url(url):
+        return normalized_url(url).render_as_string(hide_password=False)
+    return url
+
+
+def _maintenance_engine(url: str) -> Any:
+    """A short-lived engine; MySQL-family ones get the settings the store requires."""
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from sqlalchemy.pool import NullPool
+
+    from dendrux.db._engine_options import (
+        is_mysql_family_url,
+        mysql_engine_options,
+        normalized_url,
+    )
+
+    if is_mysql_family_url(url):
+        return create_async_engine(
+            normalized_url(url), poolclass=NullPool, **mysql_engine_options({})
+        )
+    return create_async_engine(url, poolclass=NullPool)
 
 
 @app.command()
@@ -101,12 +124,10 @@ def status() -> None:
 
 async def _read_activation_status(url: str) -> tuple[str, str, str, str | None]:
     from sqlalchemy import inspect, select, text
-    from sqlalchemy.ext.asyncio import create_async_engine
-    from sqlalchemy.pool import NullPool
 
     from dendrux.db.models import DendruxSetting
 
-    engine = create_async_engine(url, poolclass=NullPool)
+    engine = _maintenance_engine(url)
     try:
         async with engine.connect() as conn:
             revision = None
@@ -180,12 +201,10 @@ def _run_activation(batch_size: int, *, dedupe_only: bool) -> None:
 
 
 async def _activate_database(url: str, batch_size: int, dedupe_only: bool) -> None:
-    from sqlalchemy.ext.asyncio import create_async_engine
-    from sqlalchemy.pool import NullPool
 
     from dendrux.db._activate import activate_database
 
-    engine = create_async_engine(url, poolclass=NullPool)
+    engine = _maintenance_engine(url)
     try:
         await activate_database(engine, batch_size=batch_size, dedupe_only=dedupe_only)
     finally:
@@ -278,14 +297,12 @@ def check(
 async def _read_schema_state(url: str) -> tuple[str | None, list[str]]:
     """``(alembic revision or None, missing schema objects)`` for ``url``. Read-only."""
     from sqlalchemy import inspect, text
-    from sqlalchemy.ext.asyncio import create_async_engine
-    from sqlalchemy.pool import NullPool
 
     from dendrux.db._schema_check import (
         schema_problems,
     )
 
-    engine = create_async_engine(url, poolclass=NullPool)
+    engine = _maintenance_engine(url)
     try:
         async with engine.connect() as conn:
             stamped = await conn.run_sync(lambda c: inspect(c).has_table("alembic_version"))
