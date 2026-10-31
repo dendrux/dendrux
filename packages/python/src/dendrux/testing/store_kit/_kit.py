@@ -129,6 +129,12 @@ class Kit:
         """The rest of this test needs format-2 runs (skips at the first run created otherwise)."""
         self._needs_format_2 = True
 
+    def disconnect_forms(self, store: Any | None = None) -> tuple[str, ...]:
+        """The lost-connection forms the injector can produce for this store."""
+        target = store if store is not None else self.store
+        lister = getattr(self.injector, "disconnect_forms", None)
+        return tuple(lister(target)) if lister is not None else ("invalidated",)
+
     async def age(self) -> timedelta:
         """Make what exists so far old; return a sweep threshold that spares what comes next.
 
@@ -156,12 +162,13 @@ class Kit:
         kind: FaultKind = "error",
         after: int = 0,
         sticky: bool = False,
+        form: str = "invalidated",
         store: Any | None = None,
     ) -> Faulted:
         """Run ``call`` with a fault armed on the store, then disarm and report what happened."""
         target = store if store is not None else self.store
         injector = self.injector
-        injector.arm(target, point, kind=kind, after=after, sticky=sticky)
+        injector.arm(target, point, kind=kind, after=after, sticky=sticky, form=form)
         raised: BaseException | None = None
         result: Any = None
         try:

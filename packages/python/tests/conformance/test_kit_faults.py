@@ -131,3 +131,12 @@ async def test_fired_counts_cuts_and_a_sticky_fault_keeps_firing(
     assert injector.fired(store) >= 2, "disarm keeps the count readable"
     injector.arm(store, "before_commit")
     assert injector.fired(store) == 0, "arming starts a new count"
+
+
+async def test_sqlite_offers_only_the_flagged_disconnect(
+    world: tuple[Any, SqlFaultInjector],
+) -> None:
+    store, injector = world
+    assert injector.disconnect_forms(store) == ("invalidated",)
+    with pytest.raises(ValueError):
+        injector.arm(store, "before_commit", form="native")

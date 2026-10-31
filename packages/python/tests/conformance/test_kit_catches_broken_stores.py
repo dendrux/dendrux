@@ -24,6 +24,7 @@ import pytest_asyncio
 from datetime import timedelta
 from dendrux.runtime.state import ClaimResult
 from dendrux.errors import PersistenceError
+from dendrux.runtime.stores._errors import DbError
 from tests.conformance import _kit_backends as kb
 from dendrux.testing.store_kit.sql import SqlFaultInjector
 
@@ -53,6 +54,13 @@ def dendrux_fault_injector():
 """
 NONE = "def mutate(store):\n    return store\n"
 PLAIN_INJECTOR = "Injector = SqlFaultInjector"
+# SQLite has no network disconnect; this injector also offers the native (unflagged) form that
+# Postgres would produce, so the classifier is exercised the way a real lost connection arrives.
+NATIVE_FORMS = """
+class Injector(SqlFaultInjector):
+    def disconnect_forms(self, store):
+        return ("invalidated", "native")
+"""
 
 
 def mutant(methods: str) -> str:
@@ -316,6 +324,18 @@ MUTANTS = {
         {"test_a_checkpoint_that_fails_leaves_the_previous_checkpoint"},
         PLAIN_INJECTOR,
     ),
+    "a classifier that knows connection loss only by the invalidated flag": (
+        mutant("""
+        def classify_db_error(self, exc):
+            got = super().classify_db_error(exc)
+            if got.kind == "connection_lost" and not getattr(exc, "connection_invalidated", False):
+                return DbError("other", None, got.code)
+            return got
+        """),
+        "ambiguous_claim",
+        {"test_an_ambiguous_claim_commit_raises_outcome_unknown"},
+        NATIVE_FORMS,
+    ),
 }
 
 
@@ -350,8 +370,8 @@ def test_the_kit_fails_a_broken_store_on_exactly_the_contracts_that_guard_the_pr
 
 @pytest.mark.parametrize("name", sorted(MUTANTS))
 def test_the_same_slice_passes_on_the_unbroken_store(pytester: pytest.Pytester, name: str) -> None:
-    _, k, _, _ = MUTANTS[name]
-    intact = run_slice(pytester, NONE, k)
+    _, k, _, injector = MUTANTS[name]
+    intact = run_slice(pytester, NONE, k, injector)
     outcomes = intact.parseoutcomes()
     assert outcomes.get("failed", 0) == 0 and outcomes.get("passed", 0) >= 1, intact.stdout.str()
 

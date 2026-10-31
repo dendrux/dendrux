@@ -167,10 +167,11 @@ CLAIM_OPERATIONS = ["claim_paused_run", "submit_and_claim", "reclaim_run", "rele
 
 
 @crash
+@pytest.mark.parametrize("form", ["invalidated", "native", "native_alt"])
 @pytest.mark.parametrize("point", ["before_commit", "after_commit"])
 @pytest.mark.parametrize("operation", CLAIM_OPERATIONS)
 async def test_an_ambiguous_claim_commit_raises_outcome_unknown(
-    dendrux_kit: Kit, operation: str, point: FaultPoint
+    dendrux_kit: Kit, operation: str, point: FaultPoint, form: str
 ) -> None:
     """After a commit that may or may not have landed, ownership is never reported.
 
@@ -178,6 +179,8 @@ async def test_an_ambiguous_claim_commit_raises_outcome_unknown(
     was its own. It must raise ``StoreOutcomeUnknown`` and never return a claim.
     """
     store = dendrux_kit.store
+    if form not in dendrux_kit.disconnect_forms():
+        pytest.skip(f"the {form} disconnect form does not exist for this dialect")
     committed = point == "after_commit"
     if operation == "reclaim_run":
         if not dendrux_kit.declaration.has("recovery"):
@@ -241,10 +244,10 @@ async def test_an_ambiguous_claim_commit_raises_outcome_unknown(
             assert record is not None
             return bool(record.status == ("running" if committed else "waiting_client_tool"))
 
-    outcome = await dendrux_kit.faulted(point, call, sticky=True)
+    outcome = await dendrux_kit.faulted(point, call, sticky=True, form=form)
     outcome.expect_fired(point)
     assert isinstance(outcome.raised, StoreOutcomeUnknown), (
-        f"{operation} after an ambiguous {point} must raise StoreOutcomeUnknown, "
+        f"{operation} after an ambiguous {point} ({form}) must raise StoreOutcomeUnknown, "
         f"got {type(outcome.raised).__name__ if outcome.raised else repr(outcome.result)[:60]}"
     )
     assert outcome.result is None, "no ownership may be reported"

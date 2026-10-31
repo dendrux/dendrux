@@ -40,7 +40,11 @@ _WRITES = ("INSERT", "UPDATE", "DELETE")
 
 
 class _Arm:
-    def __init__(self, point: str, kind: str, after: int, sticky: bool) -> None:
+    def __init__(
+        self, point: str, kind: str, after: int, sticky: bool, form: str, dialect: str
+    ) -> None:
+        self.form = form
+        self.dialect = dialect
         self.point = point
         self.kind = kind
         self.after = after
@@ -51,9 +55,31 @@ class _Arm:
     def failure(self) -> BaseException:
         if self.kind == "cancel":
             return asyncio.CancelledError()
-        return OperationalError(
-            "kit fault", None, ConnectionResetError("kit fault"), connection_invalidated=True
-        )
+        if self.form == "invalidated":
+            return OperationalError(
+                "kit fault", None, ConnectionResetError("kit fault"), connection_invalidated=True
+            )
+        # the native, unflagged disconnect of the dialect: only its driver error code says so
+        if self.dialect in ("mysql", "mariadb"):
+            errno = 2006 if self.form == "native_alt" else 2013
+            return OperationalError("kit fault", None, _MySQLDisconnectError(errno))
+        return OperationalError("kit fault", None, _PostgresDisconnectError())
+
+
+class _PostgresDisconnectError(Exception):
+    """A DBAPI error carrying SQLSTATE 08006 (connection failure), as asyncpg raises."""
+
+    sqlstate = "08006"
+
+    def __init__(self) -> None:
+        super().__init__("connection failure")
+
+
+class _MySQLDisconnectError(Exception):
+    """A DBAPI error with errno 2013 (lost connection) or 2006 (server has gone away)."""
+
+    def __init__(self, errno: int) -> None:
+        super().__init__(errno, "connection lost")
 
 
 class SqlFaultInjector:
@@ -73,8 +99,11 @@ class SqlFaultInjector:
         kind: str = "error",
         after: int = 0,
         sticky: bool = False,
+        form: str = "invalidated",
     ) -> None:
         engine = store._engine.sync_engine
+        if form not in self.disconnect_forms(store):
+            raise ValueError(f"disconnect form {form!r} is not available for this dialect")
         self._fired[engine] = 0
         if engine not in self._installed:
             self._installed.add(engine)
@@ -84,7 +113,21 @@ class SqlFaultInjector:
             event.listen(Session, "before_commit", self._before_commit)
             event.listen(Session, "after_commit", self._after_commit)
             event.listen(Session, "after_rollback", self._after_rollback)
-        self._armed[engine] = _Arm(point, kind, after, sticky)
+        self._armed[engine] = _Arm(point, kind, after, sticky, form, engine.url.get_backend_name())
+
+    def disconnect_forms(self, store: Any) -> tuple[str, ...]:
+        """The ways a lost connection can reach the store on this dialect.
+
+        ``invalidated``: the error is flagged ``connection_invalidated`` (SQLAlchemy's own
+        verdict). ``native``: no flag, only the driver's code (Postgres SQLSTATE 08006; MySQL
+        errno 2013). ``native_alt``: MySQL errno 2006. SQLite has no network disconnect.
+        """
+        dialect = store._engine.url.get_backend_name()
+        if dialect == "postgresql":
+            return ("invalidated", "native")
+        if dialect in ("mysql", "mariadb"):
+            return ("invalidated", "native", "native_alt")
+        return ("invalidated",)
 
     def fired(self, store: Any) -> int:
         return self._fired.get(store._engine.sync_engine, 0)

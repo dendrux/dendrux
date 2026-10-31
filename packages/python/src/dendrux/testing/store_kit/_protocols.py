@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable
+    from collections.abc import Awaitable, Sequence
     from datetime import datetime, timedelta
 
 #: Where an armed fault fires inside the next write transaction of a store.
@@ -63,6 +63,11 @@ class FaultInjector(Protocol):
     unaffected). Without ``sticky`` the fault fires once; with it, on every write transaction
     until ``disarm``, so a store that retries internally still cannot succeed.
 
+    ``form`` picks how an error-kind fault looks like a lost connection, so the store's error
+    classifier is exercised the way a real disconnect arrives: ``invalidated`` (flagged
+    ``connection_invalidated``) always, and the dialect's native unflagged forms where one
+    exists (``native``, ``native_alt``). ``disconnect_forms(store)`` lists the valid ones.
+
     ``fired(store)`` is how many times the fault fired since the last ``arm``. The kit asserts
     that every cut it asked for happened, so an injector that does nothing fails certification.
     """
@@ -75,7 +80,10 @@ class FaultInjector(Protocol):
         kind: FaultKind = "error",
         after: int = 0,
         sticky: bool = False,
+        form: str = "invalidated",
     ) -> None: ...
+
+    def disconnect_forms(self, store: Any) -> Sequence[str]: ...
 
     def fired(self, store: Any) -> int: ...
 
