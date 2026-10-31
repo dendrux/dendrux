@@ -14,7 +14,9 @@ OVERFLOW = (1301, "Result of json_set() was larger than max_allowed_packet (1677
 
 
 class DriverError(Exception):
-    pass
+    """Stands in for a genuine MySQL driver diagnostic (asyncmy is optional in this suite)."""
+
+    __module__ = "asyncmy.errors"
 
 
 def wrapped(code: tuple[int, str]) -> OperationalError:
@@ -61,3 +63,23 @@ def test_the_limit_may_be_unknown_and_the_size_best_effort() -> None:
     sized = StatementTooLargeError(limit=100, size=250)
     assert sized.size == 250
     assert "250" in str(sized)
+
+
+def test_a_real_asyncmy_diagnostic_is_recognised() -> None:
+    errors = pytest.importorskip("asyncmy.errors")
+    assert classify_error(errors.OperationalError(*TOO_LARGE)).kind == "statement_too_large"
+    assert (
+        classify_error(OperationalError("x", (), errors.OperationalError(*OVERFLOW))).kind
+        == "statement_too_large"
+    )
+
+
+@pytest.mark.parametrize(
+    "impostor",
+    [OSError(1153, "not a diagnostic"), Exception(1153, "arbitrary"), ValueError(1301)],
+)
+def test_only_a_driver_diagnostic_counts_not_any_exception_with_that_number(
+    impostor: BaseException,
+) -> None:
+    assert classify_error(impostor).kind != "statement_too_large"
+    assert classify_error(OperationalError("x", (), impostor)).kind != "statement_too_large"

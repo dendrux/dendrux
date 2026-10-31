@@ -25,7 +25,8 @@ def required_statement_bytes(limits: Limits) -> int:
     """A worst-case estimate of the largest statement the Limits-bounded payloads can produce.
 
     An early warning only. It cannot see payloads that Limits does not bound (model prompts and
-    responses, rewritten history); the MySQL store's statement preflight is the guarantee.
+    responses, rewritten history); the server's own limit is the final guard and surfaces as
+    StatementTooLargeError when the server answers.
     """
     payload = max(limits.max_input_bytes, limits.max_tool_result_bytes) + limits.max_metadata_bytes
     return _STATEMENT_SCAFFOLDING + payload * _JSON_EXPANSION * _SQL_ESCAPING

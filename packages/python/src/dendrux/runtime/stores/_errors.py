@@ -19,6 +19,15 @@ DbErrorKind = Literal[
 
 #: MySQL/MariaDB: ER_NET_PACKET_TOO_LARGE and ER_WARN_ALLOWED_PACKET_OVERFLOWED.
 _PACKET_TOO_LARGE = frozenset({1153, 1301})
+#: Packages whose exception classes carry MySQL server diagnostics as their first argument.
+_MYSQL_DRIVERS = frozenset({"asyncmy", "aiomysql", "pymysql", "MySQLdb", "mysql"})
+
+
+def _is_mysql_driver_error(error: BaseException) -> bool:
+    """True for a MySQL driver's own exception, not a socket error or any other class."""
+    if isinstance(error, OSError):
+        return False
+    return any(cls.__module__.split(".", 1)[0] in _MYSQL_DRIVERS for cls in type(error).__mro__)
 
 
 @dataclass(frozen=True)
@@ -48,7 +57,7 @@ def classify_error(exc: BaseException) -> DbError:
     chain = error_chain(exc)
     for error in chain:
         code = error.args[0] if error.args and isinstance(error.args[0], int) else None
-        if code in _PACKET_TOO_LARGE:
+        if code in _PACKET_TOO_LARGE and _is_mysql_driver_error(error):
             return DbError("statement_too_large", code=code)
     for error in chain:
         if error.args and isinstance(error.args[0], int):

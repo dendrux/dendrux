@@ -28,7 +28,9 @@ MIB = 1024 * 1024
 
 
 class DriverError(Exception):
-    pass
+    """The driver's error class under another name; classification is by its module."""
+
+    __module__ = "asyncmy.errors"
 
 
 async def run_ids(store: MySQLStateStore) -> set[str]:
@@ -132,5 +134,34 @@ async def test_an_oversized_executemany_fails_safe_and_the_store_survives(
         run_id = generate_ulid()
         await store.create_run(run_id, "agent")
         assert await run_ids(store) == {run_id}
+    finally:
+        await store._engine.dispose()
+
+
+async def test_a_lost_commit_with_an_os_error_numbered_1153_stays_ambiguous(
+    migrated_url: str,  # noqa: F811
+) -> None:
+    """Only a MySQL driver diagnostic may mean 'packet too large', never a socket error."""
+    from sqlalchemy.exc import DBAPIError
+    from sqlalchemy.orm import Session
+
+    store = MySQLStateStore.from_url(migrated_url)
+    armed = [True]
+
+    def lose_the_commit(session: Any) -> None:
+        if armed and session.info.get("dendrux.store") is store:
+            armed.clear()
+            lost = DriverError(2013, "Lost connection")
+            lost.__cause__ = OSError(1153, "socket noise that merely carries the number")
+            raise DBAPIError("COMMIT", (), lost, connection_invalidated=True)
+
+    try:
+        await store.get_run("warm")
+        event.listen(Session, "before_commit", lose_the_commit)
+        try:
+            with pytest.raises(StoreOutcomeUnknown):
+                await store.create_run(generate_ulid(), "agent")
+        finally:
+            event.remove(Session, "before_commit", lose_the_commit)
     finally:
         await store._engine.dispose()
