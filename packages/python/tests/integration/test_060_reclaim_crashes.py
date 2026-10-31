@@ -84,7 +84,7 @@ async def expire(store, engine, run):
 def second_worker(url, run, cut, effects, pipe):
     from sqlalchemy.ext.asyncio import create_async_engine
 
-    from dendrux.runtime.state import SQLAlchemyStateStore
+    from dendrux.runtime.stores._factory import store_for_engine
 
     class StopBeforeModel(MockLLM):
         async def complete(self, *args, **kwargs):
@@ -94,9 +94,7 @@ def second_worker(url, run, cut, effects, pipe):
 
     async def main():
         engine = create_async_engine(url)
-        agent = recovery_agent(
-            SQLAlchemyStateStore(engine), cut, effects, provider=StopBeforeModel([])
-        )
+        agent = recovery_agent(store_for_engine(engine), cut, effects, provider=StopBeforeModel([]))
         await agent.reclaim(run, tenant_id=None)
 
     try:
@@ -132,12 +130,12 @@ async def kill_process(target, args):
 def sweep_worker(url, pipe):
     from sqlalchemy.ext.asyncio import create_async_engine
 
-    from dendrux.runtime.state import SQLAlchemyStateStore
+    from dendrux.runtime.stores._factory import store_for_engine
 
     async def main():
         engine = create_async_engine(url)
         page = await sweep(
-            state_store=SQLAlchemyStateStore(engine),
+            state_store=store_for_engine(engine),
             stale_running=timedelta(minutes=1),
             on_stale="reclaim",
         )
@@ -227,15 +225,16 @@ def billed_worker(url, cut, bills, pipe):
     from sqlalchemy.ext.asyncio import create_async_engine
 
     from dendrux.runtime.context import get_delegation_context
-    from dendrux.runtime.state import SQLAlchemyStateStore
+    from dendrux.runtime.stores._factory import store_for_engine
+    from dendrux.runtime.stores.sql.base import SQLStateStore
 
     def halt(run):
         pipe.send(run)
         pipe.recv()
         raise AssertionError("kill handshake returned")
 
-    class Store(SQLAlchemyStateStore):
-        @wraps(SQLAlchemyStateStore.checkpoint_step)
+    class Store(type(store_for_engine(create_async_engine(url)))):
+        @wraps(SQLStateStore.checkpoint_step)
         async def checkpoint_step(self, run, **kwargs):
             await super().checkpoint_step(run, **kwargs)
             trace = kwargs.get("trace")

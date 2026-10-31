@@ -316,9 +316,9 @@ async def engine(request, _pg_schema_setup, tmp_path) -> AsyncIterator[AsyncEngi
 @pytest.fixture
 def store(engine):
     """StateStore backed by the matrix engine."""
-    from dendrux.runtime.state import SQLAlchemyStateStore
+    from dendrux.runtime.stores._factory import store_for_engine
 
-    return SQLAlchemyStateStore(engine)
+    return store_for_engine(engine)
 
 
 @pytest.fixture

@@ -14,6 +14,7 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+from typing import TYPE_CHECKING
 
 import pytest
 from sqlalchemy import select
@@ -23,9 +24,12 @@ from dendrux.db.models import AgentRun, RunEvent
 from dendrux.errors import RunAlreadyTerminalError
 from dendrux.guardrails import PII
 from dendrux.llm.mock import MockLLM
-from dendrux.runtime.state import SQLAlchemyStateStore
+from dendrux.runtime.stores._factory import store_for_engine
 from dendrux.tool import tool
 from dendrux.types import LLMResponse, RunStatus, ToolCall, ToolResult, UsageStats
+
+if TYPE_CHECKING:
+    from dendrux.runtime.stores.sql.base import SQLStateStore
 
 
 @tool()
@@ -46,10 +50,10 @@ async def refund_tool(order_id: int) -> str:
 @pytest.fixture
 def db_store(engine):
     """StateStore over the matrix engine — alias for the conftest `store` fixture."""
-    return SQLAlchemyStateStore(engine)
+    return store_for_engine(engine)
 
 
-def _client_agent(llm: MockLLM, store: SQLAlchemyStateStore) -> Agent:
+def _client_agent(llm: MockLLM, store: SQLStateStore) -> Agent:
     return Agent(
         strict_tenancy=False,
         provider=llm,
@@ -59,7 +63,7 @@ def _client_agent(llm: MockLLM, store: SQLAlchemyStateStore) -> Agent:
     )
 
 
-def _approval_agent(llm: MockLLM, store: SQLAlchemyStateStore) -> Agent:
+def _approval_agent(llm: MockLLM, store: SQLStateStore) -> Agent:
     return Agent(
         strict_tenancy=False,
         provider=llm,
@@ -218,7 +222,7 @@ class TestPrePauseCheckpoint:
         class _CancellingProvider:
             model = "mock"
 
-            def __init__(self, store: SQLAlchemyStateStore) -> None:
+            def __init__(self, store: SQLStateStore) -> None:
                 self.store = store
                 self.run_id_holder: dict[str, str] = {}
                 self._call_count = 0
@@ -359,7 +363,7 @@ class TestCancelPreservesPIIMapping:
         class _CancellingProvider:
             model = "mock"
 
-            def __init__(self, store: SQLAlchemyStateStore) -> None:
+            def __init__(self, store: SQLStateStore) -> None:
                 self.store = store
                 self._call_count = 0
 

@@ -220,7 +220,10 @@ async def test_stream_starts_owned_convenience_notifier_once():
 @pytest.mark.parametrize("channel", [None, "custom_events"])
 async def test_from_database_url_forwards_store_options_without_mutating_input(channel):
     options = {"notify_channel": channel, "echo": False}
-    reader = RunStore.from_database_url("sqlite+aiosqlite://", database_options=options)
+    reader = RunStore.from_database_url(
+        "postgresql+asyncpg://postgres:root@localhost:5432/dendrux_060_p5_a_test",
+        database_options=options,
+    )
     try:
         assert reader._state.notify_channel == channel
         assert options == {"notify_channel": channel, "echo": False}

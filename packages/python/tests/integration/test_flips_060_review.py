@@ -16,7 +16,7 @@ from dendrux.errors import PauseStatusMismatchError, TenantScopeRequiredError
 from dendrux.llm.mock import MockLLM
 from dendrux.runtime import runner
 from dendrux.runtime._tenant_checks import resolve_tenant
-from dendrux.runtime.state import SQLAlchemyStateStore
+from dendrux.runtime.stores._factory import store_for_engine
 from dendrux.types import InputValidationError, LLMResponse, RunStatus, ToolCall, ToolResult
 
 
@@ -25,7 +25,7 @@ async def store(engine):
     from tests._fixtures.storage import pin_storage_format
 
     await pin_storage_format(engine, 1)
-    return SQLAlchemyStateStore(engine)
+    return store_for_engine(engine)
 
 
 @pytest.mark.parametrize("policy", [{}, {"strict_tenancy": True}])

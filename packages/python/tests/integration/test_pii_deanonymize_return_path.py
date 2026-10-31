@@ -14,7 +14,7 @@ from dendrux import tool
 from dendrux.agent import Agent
 from dendrux.guardrails import PII
 from dendrux.llm.mock import MockLLM
-from dendrux.runtime.state import SQLAlchemyStateStore
+from dendrux.runtime.stores._factory import store_for_engine
 from dendrux.types import LLMResponse, RunStatus, ToolCall, UsageStats
 
 
@@ -27,7 +27,7 @@ def _resp(text: str) -> LLMResponse:
 
 @pytest.fixture
 def db_store(engine):
-    return SQLAlchemyStateStore(engine)
+    return store_for_engine(engine)
 
 
 class TestReturnPathDeanonymize:

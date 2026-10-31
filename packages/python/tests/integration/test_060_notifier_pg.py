@@ -198,10 +198,10 @@ async def test_n7_failed_self_test_releases_backend(pg_test_url, engine, monkeyp
 async def test_concurrent_two_writer_instances_durable_order_and_wakeup(pg_test_url, engine, store):
     if engine.dialect.name != "postgresql":
         pytest.skip("Postgres concurrency")
-    from dendrux.runtime.state import SQLAlchemyStateStore
+    from dendrux.runtime.stores._factory import store_for_engine
 
     store.notify_channel = "dendrux_events"
-    other = SQLAlchemyStateStore(engine, notify_channel="dendrux_events")
+    other = store_for_engine(engine, notify_channel="dendrux_events")
     run = generate_ulid()
     await store.create_run(run, "notifier-race")
     notifier = PostgresEventNotifier(pg_test_url)

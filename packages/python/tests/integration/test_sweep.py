@@ -8,13 +8,17 @@ from __future__ import annotations
 
 import datetime as dt
 from datetime import timedelta
+from typing import TYPE_CHECKING
 
 import pytest
 from sqlalchemy import update
 
 from dendrux.db.models import AgentRun
-from dendrux.runtime.state import SQLAlchemyStateStore
+from dendrux.runtime.stores._factory import store_for_engine
 from dendrux.types import generate_ulid
+
+if TYPE_CHECKING:
+    from dendrux.runtime.stores.sql.base import SQLStateStore
 
 # ------------------------------------------------------------------
 # Helpers
@@ -22,7 +26,7 @@ from dendrux.types import generate_ulid
 
 
 async def _create_run(
-    store: SQLAlchemyStateStore,
+    store: SQLStateStore,
     *,
     run_id: str | None = None,
     agent_name: str = "TestAgent",
@@ -347,7 +351,7 @@ class TestSweepPublicAPI:
         def _fk(conn, _):
             conn.execute("PRAGMA foreign_keys = ON")
 
-        temp_store = SQLAlchemyStateStore(eng)
+        temp_store = store_for_engine(eng)
         old_time = dt.datetime.now(dt.UTC) - timedelta(minutes=30)
         await _create_run(temp_store, last_progress_at=old_time)
         await eng.dispose()

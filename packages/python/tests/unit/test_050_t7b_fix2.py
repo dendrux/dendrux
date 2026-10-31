@@ -19,19 +19,20 @@ from dendrux.notifiers.composite import CompositeNotifier
 from dendrux.notifiers.otel import OpenTelemetryNotifier
 from dendrux.runtime import state
 from dendrux.runtime.context import safe_exception_info
+from dendrux.runtime.stores.sql import base as sql_base
 
 PRIVATE = "CHAIN-PRIVATE-SENTINEL-765"
 
 
 def test_status_writer_inventory():
-    tree = ast.parse(inspect.getsource(state))
+    tree = ast.parse(inspect.getsource(sql_base))
     writers = {}
     direct = []
     for function in ast.walk(tree):
         if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
         # Nested retry closures belong to the surrounding public operation.
-        if function.name.startswith("_attempt") or function.name == "attempt":
+        if function.name.startswith("_attempt") or function.name in ("attempt", "validate"):
             continue
         for node in ast.walk(function):
             if isinstance(node, ast.Call):
@@ -63,7 +64,7 @@ def test_status_writer_inventory():
         "try_pause_run": 1,
         "pause_with_event": 1,
         "pause_run": 1,
-        "claim_paused_run": 1,
+        "claim_paused_run": 2,
         "submit_and_claim": 1,
         "release_run_claim": 1,
         "_sweep_runs": 1,

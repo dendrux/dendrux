@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import warnings
 import weakref
 from typing import Any, NoReturn
 
@@ -72,6 +73,20 @@ def validate_capabilities(store: Any) -> StoreCapabilities:
         return StoreCapabilities()
     if not isinstance(caps, StoreCapabilities) or caps.version != 1:
         _refuse(store, "version", "capabilities", ("version=1",))
+    if caps.deployment is None:
+        frame = inspect.currentframe()
+        stacklevel = 1
+        while frame is not None and frame.f_globals.get("__name__", "").startswith("dendrux."):
+            stacklevel += 1
+            frame = frame.f_back
+        del frame
+        warnings.warn(
+            "StateStore capabilities should declare deployment; legacy declaration is undeclared.",
+            DeprecationWarning,
+            stacklevel=stacklevel,
+        )
+    elif caps.deployment not in ("single_process", "single_host", "multi_server"):
+        _refuse(store, "deployment", "capabilities", ("deployment",))
     for capability, methods in _REQUIREMENTS.items():
         if not getattr(caps, capability):
             continue

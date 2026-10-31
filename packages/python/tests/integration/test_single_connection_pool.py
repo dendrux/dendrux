@@ -28,13 +28,15 @@ from dendrux.db._pool_guard import serialized, shares_one_connection
 from dendrux.db._sqlite_sync import create_sqlite_schema
 from dendrux.db.models import AgentRun, RunEvent, ToolCallRecord
 from dendrux.llm.mock import MockLLM
-from dendrux.runtime.state import SQLAlchemyStateStore
+from dendrux.runtime.stores._factory import store_for_engine
 from dendrux.types import LLMResponse, ToolCall
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable
 
     from sqlalchemy.ext.asyncio import AsyncEngine
+
+    from dendrux.runtime.stores.sql.base import SQLStateStore
 
 _GUARD_LOGGER = "dendrux.db._pool_guard"
 
@@ -102,7 +104,7 @@ async def _evidence_counts(engine: AsyncEngine, run_id: str) -> tuple[int, int]:
 # guard); the staggered ones lose a row on SQLAlchemy 2.0 without it.
 @pytest.mark.parametrize("hops", [(0, 0, 0), (0, 1, 5), (0, 4, 4), (3, 0, 5)])
 async def test_three_parallel_tools_persist_every_row(memory_engine, hops) -> None:
-    store = SQLAlchemyStateStore(memory_engine)
+    store = store_for_engine(memory_engine)
     calls = [ToolCall("hop", {"n": n}, provider_tool_call_id=f"p{i}") for i, n in enumerate(hops)]
     llm = MockLLM([LLMResponse(text="Checking", tool_calls=calls), LLMResponse(text="done")])
     agent = Agent(strict_tenancy=False, provider=llm, prompt="p", tools=[hop], state_store=store)
@@ -113,7 +115,7 @@ async def test_three_parallel_tools_persist_every_row(memory_engine, hops) -> No
 
 async def test_jittered_parallel_tools_lose_no_rows(memory_engine) -> None:
     random.seed(1234)
-    store = SQLAlchemyStateStore(memory_engine)
+    store = store_for_engine(memory_engine)
     width = 5
     for _ in range(20):
         calls = [
@@ -138,7 +140,7 @@ async def _give_way_to(reader: Callable[[], Awaitable[object]]) -> None:
 
 
 async def test_reader_session_does_not_undo_pending_writes(memory_engine) -> None:
-    store = SQLAlchemyStateStore(memory_engine)
+    store = store_for_engine(memory_engine)
     await store.create_run("run-1", "A")
 
     async def write(i: int) -> None:
@@ -163,7 +165,7 @@ async def test_reader_session_does_not_undo_pending_writes(memory_engine) -> Non
 
 async def test_nested_session_in_same_task_does_not_deadlock(memory_engine) -> None:
     """A store call made while the same task holds a session (cf. test_cancellation)."""
-    store = SQLAlchemyStateStore(memory_engine)
+    store = store_for_engine(memory_engine)
     await store.create_run("run-1", "A")
 
     async def nested() -> None:
@@ -177,7 +179,7 @@ async def test_nested_session_in_same_task_does_not_deadlock(memory_engine) -> N
 
 
 async def test_sessions_from_different_tasks_do_not_overlap(memory_engine) -> None:
-    store = SQLAlchemyStateStore(memory_engine)
+    store = store_for_engine(memory_engine)
     inside = 0
     peak = 0
 
@@ -195,9 +197,9 @@ async def test_sessions_from_different_tasks_do_not_overlap(memory_engine) -> No
 
 async def test_single_connection_store_warns_once_per_pool(memory_engine, caplog) -> None:
     with caplog.at_level(logging.WARNING, logger=_GUARD_LOGGER):
-        SQLAlchemyStateStore(memory_engine)
-        SQLAlchemyStateStore(memory_engine)
-        SQLAlchemyStateStore(memory_engine.execution_options(isolation_level="SERIALIZABLE"))
+        store_for_engine(memory_engine)
+        store_for_engine(memory_engine)
+        store_for_engine(memory_engine.execution_options(isolation_level="SERIALIZABLE"))
     warnings = [r for r in caplog.records if r.name == _GUARD_LOGGER]
     assert len(warnings) == 1
     message = warnings[0].getMessage()
@@ -212,9 +214,9 @@ async def test_single_connection_store_warns_once_per_pool(memory_engine, caplog
 async def test_independent_connection_pools_take_no_lock(engine, caplog) -> None:
     assert not shares_one_connection(engine)
     with caplog.at_level(logging.WARNING, logger=_GUARD_LOGGER):
-        store = SQLAlchemyStateStore(engine)
+        store = store_for_engine(engine)
     assert not [r for r in caplog.records if r.name == _GUARD_LOGGER]
-    assert isinstance(store._session_factory, sessionmaker)
+    assert isinstance(store._session_factory._factory, sessionmaker)
 
     async with serialized(engine):
         assert not _guards_for(engine)
@@ -226,7 +228,7 @@ async def test_independent_connection_pools_take_no_lock(engine, caplog) -> None
 async def test_get_session_writes_survive_concurrent_store_reads(memory_engine) -> None:
     from dendrux.db.session import get_session
 
-    store = SQLAlchemyStateStore(memory_engine)
+    store = store_for_engine(memory_engine)
 
     async def write(i: int) -> None:
         async with get_session(memory_engine) as session:
@@ -243,11 +245,11 @@ async def test_get_session_writes_survive_concurrent_store_reads(memory_engine) 
 
 async def test_execution_options_engine_shares_the_lock(memory_engine) -> None:
     """Engines sharing one pool (execution_options views) must share one lock."""
-    base = SQLAlchemyStateStore(memory_engine)
-    view = SQLAlchemyStateStore(memory_engine.execution_options(isolation_level="SERIALIZABLE"))
+    base = store_for_engine(memory_engine)
+    view = store_for_engine(memory_engine.execution_options(isolation_level="SERIALIZABLE"))
     await base.create_run("run-1", "A")
 
-    async def write(store: SQLAlchemyStateStore, i: int) -> None:
+    async def write(store: SQLStateStore, i: int) -> None:
         async with store._session_factory() as session:
             session.add(
                 RunEvent(
@@ -263,7 +265,7 @@ async def test_execution_options_engine_shares_the_lock(memory_engine) -> None:
                 await asyncio.sleep(0)
             await session.commit()
 
-    async def read(store: SQLAlchemyStateStore) -> None:
+    async def read(store: SQLStateStore) -> None:
         await store.get_run_events("run-1")
 
     jobs = []
@@ -275,7 +277,7 @@ async def test_execution_options_engine_shares_the_lock(memory_engine) -> None:
 
 
 async def test_lock_state_is_dropped_when_idle(memory_engine) -> None:
-    store = SQLAlchemyStateStore(memory_engine)
+    store = store_for_engine(memory_engine)
     await store.create_run("run-1", "A")
     await asyncio.gather(*[store.get_run("run-1") for _ in range(5)])
     assert not _guards_for(memory_engine)
@@ -289,7 +291,7 @@ def test_closed_event_loop_is_not_kept_alive() -> None:
         loops.append(weakref.ref(asyncio.get_running_loop()))
         engine = create_async_engine("sqlite+aiosqlite:///:memory:")
         await create_sqlite_schema(engine)
-        store = SQLAlchemyStateStore(engine)
+        store = store_for_engine(engine)
         await store.create_run("run-1", "A")
 
         async def hold() -> None:
@@ -307,7 +309,7 @@ def test_closed_event_loop_is_not_kept_alive() -> None:
 
 
 async def test_exception_in_session_releases_the_lock(memory_engine) -> None:
-    store = SQLAlchemyStateStore(memory_engine)
+    store = store_for_engine(memory_engine)
     with pytest.raises(ValueError, match="boom"):
         async with store._session_factory():
             raise ValueError("boom")
@@ -318,7 +320,7 @@ async def test_exception_in_session_releases_the_lock(memory_engine) -> None:
 async def test_cancelling_the_holder_and_waiters_keeps_the_lock_consistent(
     memory_engine,
 ) -> None:
-    store = SQLAlchemyStateStore(memory_engine)
+    store = store_for_engine(memory_engine)
     await store.create_run("run-1", "A")
     entered = asyncio.Event()
 
@@ -361,7 +363,7 @@ async def test_cancelling_the_holder_and_waiters_keeps_the_lock_consistent(
 
 async def test_lock_is_released_only_after_close_finishes(memory_engine, monkeypatch) -> None:
     """Cancelled during close: ROLLBACK and pool reset still run under the lock."""
-    store = SQLAlchemyStateStore(memory_engine)
+    store = store_for_engine(memory_engine)
     await store.create_run("run-1", "A")
     original_close = AsyncSession.close
     in_close = asyncio.Event()
@@ -394,7 +396,7 @@ async def test_long_wait_logs_a_warning_naming_the_holder(
     memory_engine, monkeypatch, caplog
 ) -> None:
     monkeypatch.setattr(_pool_guard, "WAIT_WARNING_S", 0.02)
-    store = SQLAlchemyStateStore(memory_engine)
+    store = store_for_engine(memory_engine)
     await store.create_run("run-1", "A")
 
     async def holder() -> None:

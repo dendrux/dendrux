@@ -384,7 +384,7 @@ async def test_twenty_public_reclaimers_one_continuation(store, engine):
 
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-    from dendrux.runtime.state import SQLAlchemyStateStore
+    from dendrux.runtime.stores._factory import store_for_engine
 
     if engine.dialect.name != "postgresql":
         pytest.skip("Fleet contention requires independent PostgreSQL connections")
@@ -407,7 +407,7 @@ async def test_twenty_public_reclaimers_one_continuation(store, engine):
 
     contenders = []
     for _ in range(20):
-        contender_store = SQLAlchemyStateStore(pool)
+        contender_store = store_for_engine(pool)
         contender_store._session_factory = async_sessionmaker(
             pool, class_=Session, expire_on_commit=False
         )

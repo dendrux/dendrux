@@ -15,8 +15,9 @@ from dendrux import Agent
 from dendrux.db._settings import seed_settings
 from dendrux.db.models import Base
 from dendrux.runtime import durability
-from dendrux.runtime.state import SQLAlchemyStateStore
+from dendrux.runtime.stores._factory import store_for_engine
 from dendrux.types import generate_ulid
+from tests._helpers.db_errors import locked_error
 
 
 @asynccontextmanager
@@ -54,7 +55,7 @@ async def test_sqlite_file_creator_lock_closes_admission(
     tmp_path, monkeypatch, mode, record_property
 ):
     async with sqlite_file(tmp_path, mode) as engine:
-        store, creator = SQLAlchemyStateStore(engine), SQLAlchemyStateStore(engine)
+        store, creator = store_for_engine(engine), store_for_engine(engine)
         root, child = generate_ulid(), generate_ulid()
         await store.create_run(root, "parent", tenant_id="t")
         checked, release, retried = asyncio.Event(), asyncio.Event(), asyncio.Event()
@@ -116,7 +117,7 @@ async def test_sqlite_file_creator_lock_closes_admission(
 @pytest.mark.parametrize("mode", ["legacy", "explicit_begin", "autocommit_false"])
 async def test_sqlite_parent_reservation_is_first_and_does_not_touch_timestamp(tmp_path, mode):
     async with sqlite_file(tmp_path, mode) as engine:
-        store = SQLAlchemyStateStore(engine)
+        store = store_for_engine(engine)
         parent = generate_ulid()
         await store.create_run(parent, "parent")
         before = await store.get_run(parent)
@@ -149,7 +150,7 @@ async def test_frontier_operations_retry_fresh_transactions(store, monkeypatch, 
     async def execute(session, statement, *args, **kwargs):
         attempts.append(session)
         if len(attempts) == 1:
-            raise OperationalError("frontier", {}, sqlite3.OperationalError("database is locked"))
+            raise OperationalError("frontier", {}, locked_error())
         return await original(session, statement, *args, **kwargs)
 
     async def backoff(number, label, run_id, error):
@@ -176,7 +177,7 @@ async def test_sqlite_frontier_plans_ignore_unrelated_tenant_history(
     from dendrux.db.models import AgentRun
 
     async with sqlite_file(tmp_path, "legacy") as engine:
-        store = SQLAlchemyStateStore(engine)
+        store = store_for_engine(engine)
         parent, child = "7R" + "0" * 24, "7Z" + "0" * 24
         async with engine.begin() as connection:
             await connection.execute(

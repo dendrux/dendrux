@@ -12,16 +12,19 @@ pairing contract documented on LoopNotifier.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
 from dendrux.agent import Agent
 from dendrux.llm.mock import MockLLM
 from dendrux.loops.base import BaseNotifier
-from dendrux.runtime.state import SQLAlchemyStateStore
+from dendrux.runtime.stores._factory import store_for_engine
 from dendrux.tool import tool
 from dendrux.types import LLMResponse, RunStatus, ToolCall, ToolResult
+
+if TYPE_CHECKING:
+    from dendrux.runtime.stores.sql.base import SQLStateStore
 
 
 @tool(target="client")
@@ -36,7 +39,7 @@ async def refund(order_id: int) -> str:
 
 @pytest.fixture
 def db_store(engine):
-    return SQLAlchemyStateStore(engine)
+    return store_for_engine(engine)
 
 
 class CapturingNotifier(BaseNotifier):
@@ -83,7 +86,7 @@ class CapturingNotifier(BaseNotifier):
         return [c[0] for c in self.calls]
 
 
-def _client_tool_agent(llm: MockLLM, store: SQLAlchemyStateStore) -> Agent:
+def _client_tool_agent(llm: MockLLM, store: SQLStateStore) -> Agent:
     return Agent(
         strict_tenancy=False,
         provider=llm,
@@ -93,7 +96,7 @@ def _client_tool_agent(llm: MockLLM, store: SQLAlchemyStateStore) -> Agent:
     )
 
 
-def _approval_agent(llm: MockLLM, store: SQLAlchemyStateStore) -> Agent:
+def _approval_agent(llm: MockLLM, store: SQLStateStore) -> Agent:
     return Agent(
         strict_tenancy=False,
         provider=llm,

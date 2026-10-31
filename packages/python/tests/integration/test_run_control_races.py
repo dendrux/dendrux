@@ -42,7 +42,7 @@ from dendrux.types import LLMResponse, RunStatus, ToolResult
 from tests._helpers.scripted_provider import ScriptedLLM, tool_call
 
 if TYPE_CHECKING:
-    from dendrux.runtime.state import SQLAlchemyStateStore
+    from dendrux.runtime.stores.sql.base import SQLStateStore
 
 pytestmark = [
     pytest.mark.asyncio,
@@ -399,7 +399,7 @@ _PRE_03_METHODS = frozenset(
 class Pre03Store:
     """A custom store exposing exactly the 0.2 StateStore protocol."""
 
-    def __init__(self, inner: SQLAlchemyStateStore) -> None:
+    def __init__(self, inner: SQLStateStore) -> None:
         self._inner = inner
 
     def __getattr__(self, name: str) -> Any:

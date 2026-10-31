@@ -15,7 +15,9 @@ from typing import Any
 import pytest
 from sqlalchemy.exc import DBAPIError
 
-from dendrux.runtime._pending import _PendingReader, _pg_pause_summary, _unconvertible_json
+from dendrux.errors import PersistenceError
+from dendrux.runtime._pending import _PendingReader
+from dendrux.runtime.stores.sql.postgres import PostgresStateStore
 
 
 class _LegacyStore:
@@ -64,7 +66,12 @@ def _dbapi_error(sqlstate: str | None) -> DBAPIError:
     ("code", "expected"), [("22P05", True), ("22P02", True), ("40001", False), (None, False)]
 )
 def test_only_json_conversion_errors_fall_back(code: str | None, expected: bool) -> None:
-    assert _unconvertible_json(_dbapi_error(code)) is expected
+    assert (
+        PostgresStateStore.json_conversion_error(
+            object.__new__(PostgresStateStore), _dbapi_error(code)
+        )
+        is expected
+    )
 
 
 async def test_other_database_errors_propagate() -> None:
@@ -78,6 +85,7 @@ async def test_other_database_errors_propagate() -> None:
         async def execute(self, stmt: Any) -> Any:
             raise _dbapi_error("40001")
 
-    state = SimpleNamespace(_session_factory=_Session)
-    with pytest.raises(DBAPIError):
-        await _pg_pause_summary(state, "r", None)
+    state = object.__new__(PostgresStateStore)
+    state._session_factory = _Session
+    with pytest.raises(PersistenceError):
+        await state.get_pause_summary("r", tenant_id=None)

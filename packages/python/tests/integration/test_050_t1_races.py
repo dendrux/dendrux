@@ -20,14 +20,14 @@ from dendrux.errors import NoteLimitExceededError
 from dendrux.types import IdempotencyConflictError
 
 if TYPE_CHECKING:
-    from dendrux.runtime.state import SQLAlchemyStateStore
+    from dendrux.runtime.stores.sql.base import SQLStateStore
 
 pytestmark = pytest.mark.asyncio
 
 N = 24
 
 
-async def test_idempotency_race_has_one_winner_per_tenant(store: SQLAlchemyStateStore) -> None:
+async def test_idempotency_race_has_one_winner_per_tenant(store: SQLStateStore) -> None:
     async def create(i: int, tenant: str) -> Any:
         return await store.create_run(
             f"r{tenant}{i:02d}",
@@ -51,7 +51,7 @@ async def test_idempotency_race_has_one_winner_per_tenant(store: SQLAlchemyState
 
 
 async def test_idempotency_race_with_different_input_conflicts(
-    store: SQLAlchemyStateStore,
+    store: SQLStateStore,
 ) -> None:
     async def create(i: int) -> Any:
         return await store.create_run(
@@ -72,7 +72,7 @@ async def test_idempotency_race_with_different_input_conflicts(
     assert await store.count_runs() == 1
 
 
-async def test_event_allocation_race_is_contiguous(store: SQLAlchemyStateStore) -> None:
+async def test_event_allocation_race_is_contiguous(store: SQLStateStore) -> None:
     await store.create_run("00000000000000000000000105", "agent")
     seqs = await asyncio.gather(
         *(
@@ -85,7 +85,7 @@ async def test_event_allocation_race_is_contiguous(store: SQLAlchemyStateStore) 
     assert stored == list(range(N * 2))
 
 
-async def test_event_allocation_race_with_cas_transitions(store: SQLAlchemyStateStore) -> None:
+async def test_event_allocation_race_with_cas_transitions(store: SQLStateStore) -> None:
     """Plain appends and a CAS transition event interleave without duplicate indexes."""
     await store.create_run("00000000000000000000000105", "agent")
 
@@ -107,7 +107,7 @@ async def test_event_allocation_race_with_cas_transitions(store: SQLAlchemyState
     assert stored == list(range(N + 1))
 
 
-async def test_note_cap_race_never_exceeds_the_cap(store: SQLAlchemyStateStore) -> None:
+async def test_note_cap_race_never_exceeds_the_cap(store: SQLStateStore) -> None:
     await store.create_run("00000000000000000000000105", "agent", tenant_id="A")
     results = await asyncio.gather(
         *(
@@ -127,7 +127,7 @@ async def test_note_cap_race_never_exceeds_the_cap(store: SQLAlchemyStateStore) 
     assert len(await store.get_notes("00000000000000000000000105")) == 7
 
 
-async def test_note_cap_race_with_finalize(store: SQLAlchemyStateStore) -> None:
+async def test_note_cap_race_with_finalize(store: SQLStateStore) -> None:
     """A finalize racing note submitters: every accepted note is stored, none after."""
     await store.create_run("00000000000000000000000105", "agent")
     half = N // 2

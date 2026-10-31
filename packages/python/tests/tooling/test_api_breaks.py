@@ -266,7 +266,7 @@ def test_documentary_returns_never_preapprove_future_return_changes() -> None:
 
 def test_documentary_inventory_does_not_hide_stale_active_entries() -> None:
     entries = ab.load_allowlist(COMMITTED_ALLOWLIST)
-    assert len(ab.classify([], entries).stale) == 4
+    assert len(ab.classify([], entries).stale) == 5
 
 
 def test_060_changes_reference_060_migration_rows() -> None:

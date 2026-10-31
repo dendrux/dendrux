@@ -207,6 +207,7 @@ Missing or invalid codes remain unset. Category and HTTP status remain independe
 | `persistence_error` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | A durable operation fails. | Restore store connectivity and inspect the run result. |
 | `shared_engine_loop_closed` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | A pooled engine belongs to a closed event loop. | Use an engine owned by the current loop. |
 | `store_capability` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | A declared store capability has an incompatible method. | Implement the frozen store contract. |
+| `store_outcome_unknown` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | A commit acknowledgement is lost and the operation outcome cannot be proven. | Inspect persisted state before attempting the operation again. |
 | `write_conflict` | WARNING | `code`, `count`, `kind`, `run_id`, `table`, `tenant_id` | A retried identity has conflicting content. | Inspect writer consistency; do not retry blindly. |
 
 ## Tool

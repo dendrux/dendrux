@@ -7,7 +7,7 @@ the fixtures to the real type by replacing the dataclass below with
 ``from dendrux.runtime.state import StoreCapabilities`` (one import line); nothing else in
 this module reads its fields by anything but name.
 
-Every fixture wraps a real ``SQLAlchemyStateStore`` (usually over in-memory SQLite) and
+Every fixture wraps a real ``SQLStateStore`` (usually over in-memory SQLite) and
 forwards each call, so the whole conformance matrix can run through it; it records every
 call as ``(method, keyword names)`` in ``calls`` so phase 1 can assert that a legacy store
 never receives a keyword argument that did not exist in 0.5.
@@ -20,7 +20,7 @@ id    class                                       what it is
                                                    attribute, no optional methods; a
                                                    custom store written against 0.4/0.5
 (b)   ``UndeclaredSameMethodsStore``               the same method names and the *current*
-                                                   signatures of ``SQLAlchemyStateStore``
+                                                   signatures of ``SQLStateStore``
                                                    (they follow it into 0.6), no
                                                    declaration: must be treated as legacy
 (c)   ``FencedButRejectsEpochStore``               declares ``fenced_writes=True`` but its
@@ -48,7 +48,8 @@ import functools
 import inspect
 from typing import Any
 
-from dendrux.runtime.state import UNSCOPED, SQLAlchemyStateStore, StoreCapabilities
+from dendrux.runtime.state import UNSCOPED, StoreCapabilities
+from dendrux.runtime.stores.sql.base import SQLStateStore
 
 #: Every method of the 0.5.0 ``StateStore`` protocol, in definition order.
 PROTOCOL_0_5: tuple[str, ...] = (
@@ -95,6 +96,7 @@ PROTOCOL_0_5: tuple[str, ...] = (
 
 #: contracts §3, §12.4 and §12.15: the exact additions to the legacy protocol.
 PROTOCOL_0_6_ADDITIONS = {
+    "update_run_meta",
     "checkpoint_step",
     "conversation_traces",
     "get_traces_after",
@@ -138,12 +140,12 @@ class _Forwarding:
 
     claim_shape = "real"
 
-    def __init__(self, inner: SQLAlchemyStateStore) -> None:
+    def __init__(self, inner: SQLStateStore) -> None:
         self._inner = inner
         self.calls: list[tuple[str, tuple[str, ...]]] = []
 
     @property
-    def wrapped(self) -> SQLAlchemyStateStore:
+    def wrapped(self) -> SQLStateStore:
         return self._inner
 
     def kwarg_names(self, method: str) -> set[str]:
@@ -755,11 +757,11 @@ for _name in PROTOCOL_0_5:
 
 
 class UndeclaredSameMethodsStore(_Forwarding):
-    """(b) Same method names *and* current signatures as ``SQLAlchemyStateStore``, undeclared."""
+    """(b) Same method names *and* current signatures as ``SQLStateStore``, undeclared."""
 
 
 def _wrapped_method(name: str) -> Any:
-    target = getattr(SQLAlchemyStateStore, name)
+    target = getattr(SQLStateStore, name)
 
     @functools.wraps(target)
     async def method(self: _Forwarding, *args: Any, **kwargs: Any) -> Any:
@@ -804,7 +806,7 @@ class PartialFencedRetryStore(_Forwarding):
 
 
 def _partial_method(name: str) -> Any:
-    target = getattr(SQLAlchemyStateStore, name)
+    target = getattr(SQLStateStore, name)
     extras = _PARTIAL_EXTRAS.get(name, ())
     base = inspect.signature(target)
     params = list(base.parameters.values())

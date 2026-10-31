@@ -75,9 +75,9 @@ def test_bounded_migration_revisions_are_in_log_enum():
 
 
 def test_children_page_docs_state_cap():
-    from dendrux.runtime.state import SQLAlchemyStateStore
+    from dendrux.runtime.stores.sql.base import SQLStateStore
 
-    assert "500" in inspect.getdoc(SQLAlchemyStateStore.get_children_page)
+    assert "500" in inspect.getdoc(SQLStateStore.get_children_page)
 
 
 def test_mcp_transport_detail_docs_state_code_summary():

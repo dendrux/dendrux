@@ -3,7 +3,7 @@
 import pytest
 from sqlalchemy import event
 
-from dendrux.runtime.state import SQLAlchemyStateStore
+from dendrux.runtime.stores._factory import store_for_engine
 from dendrux.types import generate_ulid
 
 
@@ -17,8 +17,12 @@ async def test_agent_forwards_writer_opt_in(engine, options):
         database_options=options,
     )
     try:
-        writer = await agent._resolve_state_store()
-        assert writer.notify_channel == options.get("notify_channel")
+        if engine.dialect.name == "sqlite" and "notify_channel" in options:
+            with pytest.raises(TypeError, match="notify_channel"):
+                await agent._resolve_state_store()
+        else:
+            writer = await agent._resolve_state_store()
+            assert getattr(writer, "notify_channel", None) == options.get("notify_channel")
     finally:
         await agent.close()
 
@@ -27,7 +31,11 @@ async def test_agent_forwards_writer_opt_in(engine, options):
     "options", [{}, {"notify_channel": None}, {"notify_channel": "custom_events"}]
 )
 async def test_writer_notify_is_opt_in(engine, options):
-    writer = SQLAlchemyStateStore(engine, **options)
+    if engine.dialect.name == "sqlite" and "notify_channel" in options:
+        with pytest.raises(TypeError, match="notify_channel"):
+            store_for_engine(engine, **options)
+        return
+    writer = store_for_engine(engine, **options)
     run = generate_ulid()
     await writer.create_run(run, "notification-opt-in")
     statements = []

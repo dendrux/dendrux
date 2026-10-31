@@ -176,7 +176,7 @@ async def test_public_strict_submissions_refuse_missing_token_before_claim(entry
 
     from dendrux import tool
     from dendrux.db.models import Base
-    from dendrux.runtime.state import SQLAlchemyStateStore
+    from dendrux.runtime.stores._factory import store_for_engine
     from dendrux.types import LLMResponse, RunStatus, ToolCall, ToolResult
 
     @tool(target="client")
@@ -187,7 +187,7 @@ async def test_public_strict_submissions_refuse_missing_token_before_claim(entry
     try:
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
-        store = SQLAlchemyStateStore(engine)
+        store = store_for_engine(engine)
         a = Agent(
             provider=MockLLM(
                 [

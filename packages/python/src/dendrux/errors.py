@@ -299,6 +299,15 @@ class PersistenceError(RuntimeError):
         super().__init__(self.safe_message)
 
 
+class StoreOutcomeUnknown(PersistenceError):  # noqa: N818 - public compatibility name
+    """A commit acknowledgement was lost and the write outcome cannot be proven."""
+
+    code = "store_outcome_unknown"
+
+    def __init__(self) -> None:
+        super().__init__(code=self.code)
+
+
 class PersistenceNotConfiguredError(RuntimeError):
     """Raised when an Agent method requires persistence but none is configured.
 
@@ -1168,6 +1177,7 @@ class RunFencedError(_KwargsReduceMixin, RuntimeError):
 
 
 __all__ = [
+    "StoreOutcomeUnknown",
     "NotifierUnavailableError",
     "StoreCapabilityError",
     "RunCancelledError",

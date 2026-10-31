@@ -227,7 +227,7 @@ async def test_later_downgrade_refusal_rolls_back_clock_removal(engine):
 
     from sqlalchemy import inspect
 
-    from dendrux.runtime.state import SQLAlchemyStateStore
+    from dendrux.runtime.stores._factory import store_for_engine
     from tests.integration._migration_schema import migration_schema
     from tests.integration._migration_schema import test_database_url as pg_url
     from tests.integration.test_050_t1_r1_migration import PRIOR, _alembic, _seed
@@ -239,7 +239,7 @@ async def test_later_downgrade_refusal_rolls_back_clock_removal(engine):
         await asyncio.to_thread(_alembic, url, "upgrade", PRIOR)
         await _seed(target)
         await asyncio.to_thread(_alembic, url, "upgrade", "head")
-        store = SQLAlchemyStateStore(target)
+        store = store_for_engine(target)
         await store.create_run(
             "duplicate", "a", tenant_id="B", idempotency_key="k1", idempotency_fingerprint="fp"
         )

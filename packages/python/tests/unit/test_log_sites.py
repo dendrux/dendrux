@@ -160,7 +160,7 @@ def dynamic_registry_vocabularies():
     assert sites == {
         "llm/_resilience.py",
         "runtime/_reclaim.py",
-        "runtime/state.py",
+        "runtime/stores/sql/base.py",
         "runtime/persistence.py",
         "loops/react.py",
         "mcp/_client.py",
@@ -199,7 +199,7 @@ def dynamic_registry_vocabularies():
         "loops/react.py",
         "runtime/persistence.py",
         "runtime/_reclaim.py",
-        "runtime/state.py",
+        "runtime/stores/sql/base.py",
     ):
         for function in ast.walk(trees[path]):
             if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):

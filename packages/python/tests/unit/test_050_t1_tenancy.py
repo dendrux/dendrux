@@ -22,11 +22,12 @@ from dendrux.errors import TenantScopeRequiredError
 from dendrux.llm.mock import MockLLM
 from dendrux.runtime import _tenant_checks
 from dendrux.runtime.context import get_delegation_context
-from dendrux.runtime.state import UNSCOPED, SQLAlchemyStateStore
+from dendrux.runtime.state import UNSCOPED
+from dendrux.runtime.stores.sql.sqlite import SQLiteStateStore
 from dendrux.types import Limits, LLMResponse, ToolCall
 
 
-class _SpyStore(SQLAlchemyStateStore):
+class _SpyStore(SQLiteStateStore):
     """Records every store call so a test can assert "nothing was read or written"."""
 
     def __init__(self, engine: Any) -> None:

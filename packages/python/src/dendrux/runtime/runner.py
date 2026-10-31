@@ -2176,13 +2176,11 @@ def _recovery_loop_name(loop: Loop) -> str | None:
 async def _create_runtime_run(
     store: StateStore, loop: Loop, run_id: str, agent_name: str, **kwargs: Any
 ) -> CreateRunResult:
-    from dendrux.runtime.state import SQLAlchemyStateStore, _creation_loop_scope
+    from dendrux.runtime.state import _creation_loop_scope
 
     native_store = unclaimed_store(store)
-    if isinstance(native_store, SQLAlchemyStateStore):
-        with _creation_loop_scope(native_store, run_id, _recovery_loop_name(loop)):
-            return await store.create_run(run_id, agent_name, **kwargs)
-    return await store.create_run(run_id, agent_name, **kwargs)
+    with _creation_loop_scope(native_store, run_id, _recovery_loop_name(loop)):
+        return await store.create_run(run_id, agent_name, **kwargs)
 
 
 async def _runtime_seeds(
@@ -2208,14 +2206,11 @@ async def _runtime_seeds(
 
     if not capabilities(store).checkpointing:
         return {}, None
-    from dendrux.runtime.state import SQLAlchemyStateStore
     from dendrux.types import _validate_provider_kwargs
 
     native_store = unclaimed_store(store)
-    if (
-        isinstance(native_store, SQLAlchemyStateStore)
-        and await native_store._creation_storage_format() == 2
-    ):
+    format_reader = getattr(native_store, "_creation_storage_format", None)
+    if callable(format_reader) and await format_reader() == 2:
         _validate_provider_kwargs(provider_kwargs, run_id=run_id)
     if replay_req is not None:
         plan = expand_replay(

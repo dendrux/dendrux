@@ -18,6 +18,7 @@ from dendrux.runtime.persistence import PersistenceRecorder
 from dendrux.runtime.runner import _build_cached_result
 from dendrux.store import RunStore
 from dendrux.types import Budget, LLMResponse, RunStatus, ToolCall, ToolResult, UsageStats
+from tests._helpers.db_errors import locked_error
 from tests._helpers.scripted_provider import ScriptedLLM, tool_call
 from tests.integration.test_050_t7_integrity import agent, consume, result_for
 
@@ -229,7 +230,7 @@ async def test_budget_enforcement_survives_lost_forensics_and_retries_usage(stor
         if usage_attempts == 1:
             from sqlalchemy.exc import OperationalError
 
-            raise OperationalError("fixture", {}, Exception("database is locked"))
+            raise OperationalError("fixture", {}, locked_error())
         return await original(*args, **kwargs)
 
     @functools.wraps(store.save_llm_interaction)
@@ -350,7 +351,7 @@ async def test_failed_usage_write_is_retried(store, monkeypatch):
         if attempts == 1:
             from sqlalchemy.exc import OperationalError
 
-            raise OperationalError("fixture", {}, Exception("database is locked"))
+            raise OperationalError("fixture", {}, locked_error())
         return await original(*args, **kwargs)
 
     monkeypatch.setattr(store, "save_usage", flaky)
@@ -369,7 +370,7 @@ async def test_failed_interaction_write_is_retried(store, monkeypatch):
         if attempts == 1:
             from sqlalchemy.exc import OperationalError
 
-            raise OperationalError("fixture", {}, Exception("database is locked"))
+            raise OperationalError("fixture", {}, locked_error())
         return await original(*args, **kwargs)
 
     monkeypatch.setattr(store, "save_llm_interaction", flaky)

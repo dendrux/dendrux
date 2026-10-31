@@ -93,7 +93,9 @@ async def test_p1_3_direct_concurrent_start_shares_one_result(monkeypatch):
 
 async def test_p2_4_owned_listener_uses_configured_writer_channel():
     reader = RunStore.from_database_url(
-        "sqlite+aiosqlite://", database_options={"notify_channel": "custom_events"}, listen_url=URL
+        "postgresql+asyncpg://postgres:root@localhost:5432/dendrux_060_p5_a_test",
+        database_options={"notify_channel": "custom_events"},
+        listen_url=URL,
     )
     try:
         assert reader._owned_notifier.channel == "custom_events"
@@ -105,7 +107,7 @@ async def test_owner_default_listener_channel_does_not_enable_writer():
     reader = RunStore.from_database_url("sqlite+aiosqlite://", listen_url=URL)
     try:
         assert reader._owned_notifier.channel == "dendrux_events"
-        assert reader._state.notify_channel is None
+        assert not hasattr(reader._state, "notify_channel")
     finally:
         await reader.close()
 

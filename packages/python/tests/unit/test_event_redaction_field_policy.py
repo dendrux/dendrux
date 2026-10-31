@@ -20,7 +20,7 @@ import pytest
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from dendrux.db.models import Base
-from dendrux.runtime.state import SQLAlchemyStateStore
+from dendrux.runtime.stores._factory import store_for_engine
 from dendrux.store import EventFeed, FollowEnd, FollowHeartbeat, RunStore, StoredEvent, redact_event
 
 SECRET = "probe-secret-5831"
@@ -136,7 +136,7 @@ async def store(tmp_path: Any) -> Any:
     eng = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'r2.db'}")
     async with eng.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-    state = SQLAlchemyStateStore(eng)
+    state = store_for_engine(eng)
     await state.create_run("r1", "a", tenant_id="T")
     for event_type in ("run.paused", "approval.requested", "run.resumed", "tool.completed"):
         await state.save_run_event("r1", event_type=event_type, data=["bad"])  # type: ignore[arg-type]

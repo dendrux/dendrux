@@ -18,7 +18,7 @@ from sqlalchemy import text
 
 from dendrux.db._schema_check import ensure_schema_current
 from dendrux.errors import SchemaOutOfDateError
-from dendrux.runtime.state import SQLAlchemyStateStore
+from dendrux.runtime.stores._factory import store_for_engine
 from dendrux.types import IdempotencyConflictError
 from tests._helpers.pg_url import validate_test_pg_url
 from tests.integration._migration_schema import migration_schema
@@ -95,7 +95,7 @@ async def test_upgrade_downgrade_on_a_populated_database(pg: Any) -> None:
     assert "created_at DESC" in after["ix_agent_runs_tenant_id_created_at"]
     await ensure_schema_current(engine)  # the migrated schema passes the startup check
 
-    store = SQLAlchemyStateStore(engine)
+    store = store_for_engine(engine)
     other = await store.create_run(
         "n1", "a", tenant_id="B", idempotency_key="k1", idempotency_fingerprint="fp"
     )
@@ -160,7 +160,7 @@ async def test_database_stamped_early_is_detected_and_recovers(pg: Any) -> None:
     assert "root" not in result.output  # the password is masked
 
     # Even un-migrated, a cross-tenant key reuse fails closed instead of leaking.
-    store = SQLAlchemyStateStore(engine)
+    store = store_for_engine(engine)
     await store.create_run(
         "00000000000000000000000501",
         "a",

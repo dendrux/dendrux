@@ -8,7 +8,7 @@ description: Explicit capability declarations for custom state stores, format-2 
 `StateStore` is the runtime persistence protocol. `SQLAlchemyStateStore` is the built-in implementation; `RunStore` is the public read facade. Import the protocol, implementation and capability declaration from `dendrux.runtime.state`.
 
 ```python
-from dendrux.runtime.state import SQLAlchemyStateStore, StateStore, StoreCapabilities
+from dendrux.store import SQLStateStore, StateStore, StoreCapabilities
 ```
 
 Construct a store once per worker event loop and pass it as `Agent(state_store=state)`. The application owns the engine. See [Scaling workers](/docs/guides/scaling).

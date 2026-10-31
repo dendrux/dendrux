@@ -1,4 +1,4 @@
-"""Integration tests for SQLAlchemyStateStore — full CRUD across the backend matrix.
+"""Integration tests for SQLStateStore — full CRUD across the backend matrix.
 
 The ``engine`` / ``store`` / ``session_factory`` fixtures live in
 ``tests/integration/conftest.py`` and parametrize across SQLite and Postgres.

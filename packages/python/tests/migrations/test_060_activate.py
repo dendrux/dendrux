@@ -1071,14 +1071,14 @@ async def test_dedupe_preserves_natural_key_blob_edges(rollout_database):
     from dendrux.db._activate import activate_database
     from dendrux.db.models import BlobRef, ReactTrace, ToolCallRecord
     from dendrux.runtime._blob_catalog import BlobServices
-    from dendrux.runtime.state import SQLAlchemyStateStore
+    from dendrux.runtime.stores._factory import store_for_engine
     from tests.unit.test_blob_catalog import make_png, store_png
 
     engine = rollout_database
     await _rollout_prior(engine)
     await _seed_rehearsal_runs_only(engine)
     await _migrate(engine)
-    services = BlobServices.for_state_store(SQLAlchemyStateStore(engine))
+    services = BlobServices.for_state_store(store_for_engine(engine))
     part = await store_png(services, "-", make_png(42))
     async with engine.begin() as conn:
         await conn.execute(

@@ -922,6 +922,14 @@ LOG_FIELD_DROPPED = Code(
     "A structured log field fails closed validation.",
     "Fix the emitting call; values are deliberately omitted.",
 )
+STORE_OUTCOME_UNKNOWN = Code(
+    "store_outcome_unknown",
+    logging.WARNING,
+    "store",
+    _BASE_FIELDS,
+    "A commit acknowledgement is lost and the operation outcome cannot be proven.",
+    "Inspect persisted state before attempting the operation again.",
+)
 PERSISTENCE_ERROR = Code(
     "persistence_error",
     logging.WARNING,
@@ -1774,6 +1782,7 @@ REGISTRY = MappingProxyType(
             PROVIDER_UNKNOWN,
             LOG_FIELD_DROPPED,
             PERSISTENCE_ERROR,
+            STORE_OUTCOME_UNKNOWN,
             MCP_DISCOVERY_REPEATED_CURSOR,
             MCP_DISCOVERY_PAGE_CAP,
             MCP_DISCOVERY_DEADLINE,

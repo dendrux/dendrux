@@ -15,7 +15,7 @@ import pytest
 from dendrux.agent import Agent
 from dendrux.llm.mock import MockLLM
 from dendrux.loops.single import SingleCall
-from dendrux.runtime.state import SQLAlchemyStateStore
+from dendrux.runtime.stores._factory import store_for_engine
 from dendrux.skills import Skill
 from dendrux.types import LLMResponse, RunStatus, UsageStats
 
@@ -31,7 +31,7 @@ def _resp(text: str) -> LLMResponse:
 
 @pytest.fixture
 def db_store(engine):
-    return SQLAlchemyStateStore(engine)
+    return store_for_engine(engine)
 
 
 class TestSingleCallInlinedSkillsE2E:

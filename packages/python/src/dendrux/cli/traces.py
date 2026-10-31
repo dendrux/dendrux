@@ -37,7 +37,7 @@ async def _show_traces(run_id: str, show_tool_calls: bool, limit: int = 200) -> 
     limit = max(1, min(limit, MAX_ROWS))
     try:
         from dendrux.db.session import get_engine, reset_engine
-        from dendrux.runtime.state import SQLAlchemyStateStore
+        from dendrux.runtime.stores._factory import store_for_engine
     except ImportError:
         console.print("[red]Database support not installed.[/red] Run: pip install dendrux[db]")
         raise typer.Exit(1) from None
@@ -50,7 +50,7 @@ async def _show_traces(run_id: str, show_tool_calls: bool, limit: int = 200) -> 
         )
         raise typer.Exit(1) from None
 
-    store = SQLAlchemyStateStore(engine)
+    store = store_for_engine(engine)
 
     try:
         # Fetch run info

@@ -12,7 +12,7 @@ from sqlalchemy import event, insert, text, update
 from dendrux import Agent
 from dendrux.db.models import AgentRun
 from dendrux.errors import RunCancelledError
-from dendrux.runtime.state import SQLAlchemyStateStore
+from dendrux.runtime.stores._factory import store_for_engine
 from dendrux.types import Budget, generate_ulid
 
 pytestmark = pytest.mark.parametrize("engine", ["sqlite", "sqlite_file", "postgres"], indirect=True)
@@ -233,7 +233,7 @@ async def test_creator_checked_parent_before_mark_is_seen_after_commit(
         pytest.skip("Postgres FOR SHARE and UPDATE row-lock serialization")
     root, child = generate_ulid(), generate_ulid()
     await store.create_run(root, "parent", tenant_id="t")
-    creator = SQLAlchemyStateStore(engine)
+    creator = store_for_engine(engine)
     checked, release, marking = asyncio.Event(), asyncio.Event(), asyncio.Event()
     original_factory = creator._session_factory
     original_mark = store.mark_cancel_requested
@@ -303,7 +303,7 @@ async def test_parallel_cascades_finalize_each_run_once(store, engine):
         pytest.skip("Real independent Postgres transactions")
     ids = await seed(store, [("r", None), ("c", "r"), ("g", "c")])
     agents = [
-        Agent(prompt="p", state_store=SQLAlchemyStateStore(engine), strict_tenancy=False)
+        Agent(prompt="p", state_store=store_for_engine(engine), strict_tenancy=False)
         for _ in range(8)
     ]
     marks = []
@@ -337,7 +337,7 @@ async def test_sqlite_creator_checked_parent_is_seen_after_serialized_commit(
         pytest.skip("Postgres parent-row locking is exercised separately")
     root, child = generate_ulid(), generate_ulid()
     await store.create_run(root, "parent", tenant_id="t")
-    creator = SQLAlchemyStateStore(engine)
+    creator = store_for_engine(engine)
     original_factory = creator._session_factory
     original_mark = store.mark_cancel_requested
     checked, release, cancel_started = asyncio.Event(), asyncio.Event(), asyncio.Event()

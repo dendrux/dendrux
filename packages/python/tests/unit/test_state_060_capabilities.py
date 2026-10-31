@@ -9,6 +9,9 @@ from sqlalchemy import text
 from dendrux import Agent
 from dendrux.llm.mock import MockLLM
 from dendrux.runtime import state
+from dendrux.runtime.stores._factory import store_for_engine
+from dendrux.runtime.stores.sql.base import SQLStateStore
+from dendrux.runtime.stores.sql.sqlite import SQLiteStateStore
 from dendrux.types import generate_ulid
 from tests._fixtures.stores import (
     FencedButRejectsEpochStore,
@@ -57,12 +60,12 @@ async def test_a0_legacy_and_partial_stores_construct(wrapper, sqlite_engine):
     Agent(
         prompt="p",
         provider=MockLLM([]),
-        state_store=wrapper(state.SQLAlchemyStateStore(sqlite_engine)),
+        state_store=wrapper(store_for_engine(sqlite_engine)),
     )
 
 
 async def test_a0_misdeclared_store_refused_at_construction(sqlite_engine):
-    store = FencedButRejectsEpochStore(state.SQLAlchemyStateStore(sqlite_engine))
+    store = FencedButRejectsEpochStore(store_for_engine(sqlite_engine))
     with pytest.raises(TypeError) as caught:
         Agent(prompt="p", provider=MockLLM([]), state_store=store)
     assert type(caught.value).__name__ == "StoreCapabilityError"
@@ -72,7 +75,7 @@ async def test_a0_misdeclared_store_refused_at_construction(sqlite_engine):
 
 
 async def test_a17_run_format_pinned_across_activation_and_both_claims(sqlite_engine):
-    store = state.SQLAlchemyStateStore(sqlite_engine)
+    store = store_for_engine(sqlite_engine)
     async with sqlite_engine.begin() as conn:
         await conn.execute(text("UPDATE dendrux_settings SET value='1' WHERE key='storage_format'"))
     run_id = generate_ulid()
@@ -128,7 +131,7 @@ def test_protocol_contains_transactional_store_methods():
 
 
 async def test_partial_sql_store_pins_format_one_even_on_active_database(sqlite_engine):
-    class Partial(state.SQLAlchemyStateStore):
+    class Partial(SQLiteStateStore):
         capabilities = state.StoreCapabilities(fenced_writes=True, retry_ids=True)
 
     store = Partial(sqlite_engine)
@@ -153,7 +156,7 @@ async def test_checkpoint_keywords_refused_before_run(sqlite_engine, method, key
 
     from dendrux.errors import StoreCapabilityError
 
-    original = getattr(state.SQLAlchemyStateStore, method)
+    original = getattr(SQLStateStore, method)
     signature = inspect.signature(original)
     params = [p for p in signature.parameters.values() if p.name != keyword]
     if shape == "positional":
@@ -167,7 +170,9 @@ async def test_checkpoint_keywords_refused_before_run(sqlite_engine, method, key
 
     incompatible.__signature__ = signature.replace(parameters=params)
     store_type = type(
-        "IncompleteCheckpointStore", (state.SQLAlchemyStateStore,), {method: incompatible}
+        "IncompleteCheckpointStore",
+        (SQLStateStore,),
+        {method: incompatible, "dialect_names": ("sqlite",)},
     )
     with pytest.raises(StoreCapabilityError) as caught:
         Agent(prompt="p", provider=MockLLM([]), state_store=store_type(sqlite_engine))

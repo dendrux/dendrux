@@ -212,10 +212,10 @@ Build the store once at startup. The implicit engine built from `DENDRUX_DATABAS
 ```python
 # once, at app startup
 from dendrux.db.session import get_engine
-from dendrux.runtime.state import SQLAlchemyStateStore
+from dendrux.store import store_for_engine
 
 engine = await get_engine(DATABASE_URL)
-STORE = SQLAlchemyStateStore(engine)
+STORE = store_for_engine(engine)
 
 # every request
 async with Agent(provider=..., prompt=..., state_store=STORE) as agent:

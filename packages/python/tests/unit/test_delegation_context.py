@@ -39,7 +39,7 @@ async def add(a: int, b: int) -> int:
 
 
 class FakeStoreWithIdentity:
-    """Fake store that exposes store_identity (like SQLAlchemyStateStore)."""
+    """Fake store that exposes store_identity (like SQLStateStore)."""
 
     def __init__(self, identity: str) -> None:
         self._identity = identity

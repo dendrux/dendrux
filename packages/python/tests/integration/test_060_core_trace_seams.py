@@ -170,7 +170,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from dendrux import Agent, tool
 from dendrux.llm.mock import MockLLM
 from dendrux.loops.base import BaseNotifier
-from dendrux.runtime.state import SQLAlchemyStateStore
+from dendrux.runtime.stores._factory import store_for_engine
 from dendrux.runtime.context import get_delegation_context
 from dendrux.types import LLMResponse
 seen = {}
@@ -185,7 +185,7 @@ async def work() -> str:
     return 'ok'
 async def main():
     engine = create_async_engine(sys.argv[1])
-    store = SQLAlchemyStateStore(engine)
+    store = store_for_engine(engine)
     a = Agent(prompt='p', provider=MockLLM([LLMResponse(text='done')]), tools=[work],
               require_approval=['work'], state_store=store, strict_tenancy=False)
     result = await a.submit_approval(sys.argv[2], approved=True,

@@ -21,7 +21,7 @@ from dendrux.db._storage_schema import ADDITIONS
 from dendrux.db.models import Base
 from dendrux.media import BlobEdge
 from dendrux.runtime._blob_catalog import BlobServices
-from dendrux.runtime.state import SQLAlchemyStateStore
+from dendrux.runtime.stores._factory import store_for_engine
 from dendrux.store import RunStore
 from tests.integration._migration_schema import (
     create_pre_activation_schema,
@@ -127,7 +127,7 @@ async def _check_head(engine: Any, url: str) -> None:
     ]
 
     # The migrated schema serves the catalog, edges and run-scoped reads.
-    store = SQLAlchemyStateStore(engine)
+    store = store_for_engine(engine)
     services = BlobServices.for_state_store(store)
     data = make_png(1)
     part = await store_png(services, "-", data)

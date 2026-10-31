@@ -1939,7 +1939,7 @@ class CellResult:
 
 async def run_cell(rig: Rig, mode: Mode, engine: AsyncEngine) -> CellResult:
     """Run every scenario for one (rig, mode) cell on ``engine``; return both sections."""
-    from dendrux.runtime.state import SQLAlchemyStateStore
+    from dendrux.runtime.stores._factory import store_for_engine
 
     assert_imports_this_checkout()
     result = CellResult()
@@ -1947,7 +1947,7 @@ async def run_cell(rig: Rig, mode: Mode, engine: AsyncEngine) -> CellResult:
     with openrouter_catalog(rig):
         for name, scenario in SCENARIOS:
             await reset_database(engine)
-            ctx = Ctx(rig, mode, SQLAlchemyStateStore(engine))
+            ctx = Ctx(rig, mode, store_for_engine(engine))
             await scenario(ctx)
             wire[name] = {"legs": ctx.recorder.legs, "outcomes": ctx.outcomes}
             raw_rows, extra = await dump_rows(engine)

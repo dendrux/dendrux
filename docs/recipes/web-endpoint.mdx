@@ -32,10 +32,10 @@ Building the `Agent` object is essentially free. The cost is in the resources it
 # ---- once per worker (startup) ----
 from dendrux.db.session import get_engine
 from dendrux.mcp import MCPRuntime, MCPSource
-from dendrux.runtime.state import SQLAlchemyStateStore
+from dendrux.store import store_for_engine
 
 engine = await get_engine(os.environ["DATABASE_URL"])  # shared singleton
-STORE  = SQLAlchemyStateStore(engine)
+STORE  = store_for_engine(engine)
 MCP_RUNTIME = MCPRuntime()                                     # one per worker process
 MCP_SOURCES = {
     "github": MCPSource.http(

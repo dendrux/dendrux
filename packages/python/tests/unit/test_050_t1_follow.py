@@ -12,14 +12,15 @@ import asyncio
 import contextlib
 import dataclasses
 import warnings
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from dendrux.db.models import Base
 from dendrux.errors import RunNotFoundError
-from dendrux.runtime.state import UNSCOPED, SQLAlchemyStateStore
+from dendrux.runtime.state import UNSCOPED
+from dendrux.runtime.stores._factory import store_for_engine
 from dendrux.store import (
     EventFeed,
     FollowCapacityError,
@@ -29,6 +30,9 @@ from dendrux.store import (
     StoredEvent,
     redact_event,
 )
+
+if TYPE_CHECKING:
+    from dendrux.runtime.stores.sql.base import SQLStateStore
 
 
 @pytest.fixture
@@ -41,8 +45,8 @@ async def engine(tmp_path: Any) -> Any:
 
 
 @pytest.fixture
-def state(engine: Any) -> SQLAlchemyStateStore:
-    return SQLAlchemyStateStore(engine)
+def state(engine: Any) -> SQLStateStore:
+    return store_for_engine(engine)
 
 
 @pytest.fixture

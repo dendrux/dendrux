@@ -5,7 +5,9 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from dendrux.runtime.state import SQLAlchemyStateStore
+from dendrux.runtime.stores._factory import store_for_engine
+from dendrux.runtime.stores.sql.postgres import PostgresStateStore
+from dendrux.runtime.stores.sql.sqlite import SQLiteStateStore
 
 
 async def test_writer_defaults_to_no_notify_statement():
@@ -16,10 +18,10 @@ async def test_writer_defaults_to_no_notify_statement():
         bind=SimpleNamespace(dialect=SimpleNamespace(name="postgresql")), execute=AsyncMock()
     )
     try:
-        store = SQLAlchemyStateStore(engine)
+        store = store_for_engine(engine)
         await store._after_event_insert(session, "run")
         session.execute.assert_not_awaited()
-        assert store.notify_channel is None
+        assert not hasattr(store, "notify_channel")
     finally:
         await engine.dispose()
 
@@ -32,7 +34,7 @@ async def test_writer_sql_only_for_enabled_postgres(dialect, channel):
     session = SimpleNamespace(
         bind=SimpleNamespace(dialect=SimpleNamespace(name=dialect)), info={}, execute=AsyncMock()
     )
-    store = object.__new__(SQLAlchemyStateStore)
+    store = object.__new__(PostgresStateStore if dialect == "postgresql" else SQLiteStateStore)
     store.notify_channel = channel
     await store._after_event_insert(session, "run")
     if dialect == "postgresql" and channel:
@@ -50,7 +52,7 @@ async def test_writer_notify_error_propagates():
         info={},
         execute=AsyncMock(side_effect=RuntimeError("sentinel")),
     )
-    store = object.__new__(SQLAlchemyStateStore)
+    store = object.__new__(PostgresStateStore)
     store.notify_channel = "dendrux_events"
     with pytest.raises(RuntimeError):
         await store._after_event_insert(session, "run")
@@ -60,9 +62,11 @@ async def test_writer_notify_error_propagates():
 async def test_p2_3_writer_rejects_invalid_channel_at_construction(channel):
     from sqlalchemy.ext.asyncio import create_async_engine
 
-    engine = create_async_engine("sqlite+aiosqlite://")
+    engine = create_async_engine(
+        "postgresql+asyncpg://postgres:root@localhost:5432/dendrux_060_p5_a_test"
+    )
     try:
         with pytest.raises(ValueError):
-            SQLAlchemyStateStore(engine, notify_channel=channel)
+            store_for_engine(engine, notify_channel=channel)
     finally:
         await engine.dispose()

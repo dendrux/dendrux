@@ -40,7 +40,10 @@ from dendrux.runtime.replay import (
     rebuild_messages,
 )
 from dendrux.runtime.runner import _carry_image_view, _resume_image_view
-from dendrux.runtime.state import RunEventRecord, SQLAlchemyStateStore, TraceRecord
+from dendrux.runtime.state import RunEventRecord, TraceRecord
+from dendrux.runtime.stores._factory import store_for_engine
+from dendrux.runtime.stores.sql.base import SQLStateStore
+from dendrux.runtime.stores.sql.sqlite import SQLiteStateStore
 from dendrux.tool import tool
 from dendrux.types import (
     IdempotencyConflictError,
@@ -79,7 +82,7 @@ def _scope(tenant_id: str | None) -> str:
     return "-" if tenant_id is None else "t:" + tenant_id
 
 
-class ImageStore(SQLAlchemyStateStore):
+class ImageStore(SQLiteStateStore):
     """Real store + in-memory ``BlobCatalog``; records every edge write."""
 
     def __init__(self, engine: Any) -> None:
@@ -115,7 +118,7 @@ class ImageStore(SQLAlchemyStateStore):
             if (run_id, edge.owner_kind, edge.owner_id, edge.ordinal) not in keys:
                 self.edges.append((run_id, edge))
 
-    @functools.wraps(SQLAlchemyStateStore.create_run)
+    @functools.wraps(SQLStateStore.create_run)
     async def create_run(self, run_id: str, agent_name: str, **kwargs: Any) -> Any:
         refs = kwargs.pop("blob_refs", None)
         scope = kwargs.pop("blob_refs_scope", None)
@@ -127,7 +130,7 @@ class ImageStore(SQLAlchemyStateStore):
             self._add("create_run", run_id, refs)
         return result
 
-    @functools.wraps(SQLAlchemyStateStore.save_trace)
+    @functools.wraps(SQLStateStore.save_trace)
     async def save_trace(self, run_id: str, *args: Any, **kwargs: Any) -> Any:
         refs = kwargs.pop("blob_refs", None)
         scope = kwargs.pop("blob_refs_scope", None)
@@ -138,7 +141,7 @@ class ImageStore(SQLAlchemyStateStore):
             self._add("save_trace", run_id, refs)
         return result
 
-    @functools.wraps(SQLAlchemyStateStore.save_tool_call)
+    @functools.wraps(SQLStateStore.save_tool_call)
     async def save_tool_call(self, run_id: str, *args: Any, **kwargs: Any) -> Any:
         refs = kwargs.pop("blob_refs", None)
         scope = kwargs.pop("blob_refs_scope", None)
@@ -149,7 +152,7 @@ class ImageStore(SQLAlchemyStateStore):
             self._add("save_tool_call", run_id, refs)
         return result
 
-    @functools.wraps(SQLAlchemyStateStore.complete_tool_call)
+    @functools.wraps(SQLStateStore.complete_tool_call)
     async def complete_tool_call(self, run_id: str, **kwargs: Any) -> Any:
         refs = kwargs.pop("blob_refs", None)
         scope = kwargs.pop("blob_refs_scope", None)
@@ -703,7 +706,7 @@ class TestRunWithImages:
     async def test_store_without_catalog_raises_persistence_unsupported(self, engine) -> None:
         from dendrux.errors import ImagePersistenceUnsupportedError
 
-        agent = _agent(SQLAlchemyStateStore(engine), [LLMResponse(text="x")])
+        agent = _agent(store_for_engine(engine), [LLMResponse(text="x")])
         if agent._blob_services(agent._state_store).catalog is not None:
             pytest.skip("built-in store implements the catalog (B merged)")
         with pytest.raises(ImagePersistenceUnsupportedError):
@@ -2087,7 +2090,7 @@ class TestStoreFullSinglePass:
         from dendrux.media import InMemoryBlobStore
 
         self._real_services(monkeypatch)
-        store = SQLAlchemyStateStore(engine)
+        store = store_for_engine(engine)
         agent = _agent(
             store,
             [LLMResponse(text="a"), LLMResponse(text="b")],

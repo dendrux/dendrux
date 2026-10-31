@@ -20,7 +20,7 @@ from sqlalchemy import text
 from dendrux.errors import BlobNotFoundError, InvalidImageError
 from dendrux.media import BlobEdge, BlobKey, InMemoryBlobStore
 from dendrux.runtime._blob_catalog import BlobServices, write_blob_refs
-from dendrux.runtime.state import SQLAlchemyStateStore
+from dendrux.runtime.stores._factory import store_for_engine
 from tests.unit.test_blob_catalog import make_png, store_png
 
 HOUR = timedelta(hours=1)
@@ -37,7 +37,7 @@ class Crash(BaseException):
 
 
 def services_for(engine: Any, blob_store: InMemoryBlobStore) -> BlobServices:
-    return BlobServices.for_state_store(SQLAlchemyStateStore(engine), blob_store=blob_store)
+    return BlobServices.for_state_store(store_for_engine(engine), blob_store=blob_store)
 
 
 def catalog(services: BlobServices) -> Any:
@@ -398,7 +398,7 @@ async def test_db_storage_revive_and_gc(engine, store) -> None:
     crash_after(catalog(services), "mark_deleting_row")
     with pytest.raises(Crash):
         await services.accessor.collect_garbage(older_than=HOUR)
-    fresh = BlobServices.for_state_store(SQLAlchemyStateStore(engine))
+    fresh = BlobServices.for_state_store(store_for_engine(engine))
     assert await store_png(fresh, "-", data) == part  # revived straight to live with data
     assert await fresh.accessor.read(part.ref) == data
 
@@ -411,7 +411,7 @@ async def test_db_storage_revive_and_gc(engine, store) -> None:
 @CONCURRENT
 async def test_edge_claim_blocks_concurrent_gc_mark(engine) -> None:
     blob_store, services, s, _ = await live_external(engine, 16)
-    store = SQLAlchemyStateStore(engine)
+    store = store_for_engine(engine)
     await store.create_run("R1", "a")
     await age(engine, "-", s, 7200)
     gc_cat = catalog(services_for(engine, blob_store))
@@ -494,7 +494,7 @@ async def test_lost_race_at_recheck_db_storage_reverts_to_live(engine, store) ->
 
 async def test_lost_race_at_delete_row_leaves_row_for_revive(engine, caplog) -> None:
     blob_store, services, s, data = await live_external(engine, 19)
-    store = SQLAlchemyStateStore(engine)
+    store = store_for_engine(engine)
     await store.create_run("R1", "a")
     await age(engine, "-", s, 7200)
 
@@ -533,7 +533,7 @@ async def test_recovery_not_starved_by_referenced_deleting_rows(engine) -> None:
     """P2-7: rows recovery always skips never fill the recovery page."""
     blob_store = InMemoryBlobStore()
     services = services_for(engine, blob_store)
-    store = SQLAlchemyStateStore(engine)
+    store = store_for_engine(engine)
     await store.create_run("R1", "a")
     stuck = []
     for i in range(3):
@@ -567,7 +567,7 @@ async def test_recovery_not_starved_by_referenced_deleting_rows(engine) -> None:
 async def test_external_rows_skipped_by_gc_without_store(engine) -> None:
     blob_store, services, s, _ = await live_external(engine, 211)
     await age(engine, "-", s, 7200)
-    bare = BlobServices.for_state_store(SQLAlchemyStateStore(engine))
+    bare = BlobServices.for_state_store(store_for_engine(engine))
     result = await bare.accessor.collect_garbage(older_than=HOUR)
     assert result.deleted_blobs == 0
     assert (await row_of(engine, s))[3] == "live"  # type: ignore[index]
@@ -609,7 +609,7 @@ async def test_injected_deadlock_retries_whole_transaction(engine, store, monkey
     from sqlalchemy.exc import DBAPIError
 
     import dendrux.runtime.durability as durability
-    import dendrux.runtime.state as state_mod
+    import dendrux.runtime.stores.sql.base as state_mod
 
     monkeypatch.setattr(durability, "_BASE_BACKOFF_S", 0.0)
 
@@ -655,7 +655,7 @@ async def test_concurrent_shared_image_edge_writes_never_deadlock(engine) -> Non
 
     import dendrux.runtime.durability as durability
 
-    store = SQLAlchemyStateStore(engine)
+    store = store_for_engine(engine)
     services = BlobServices.for_state_store(store)
     shas = [(await store_png(services, "t:acme", make_png(300 + i))).ref.sha256 for i in range(20)]
     retries: list[str] = []

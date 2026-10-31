@@ -408,9 +408,10 @@ async def test_omitted_scope_missing_run_is_not_found(store, entry):
 
 
 async def test_legacy_control_override_keeps_fencing_without_false_stop(engine):
-    from dendrux.runtime.state import RunControl, SQLAlchemyStateStore
+    from dendrux.runtime.state import RunControl
+    from dendrux.runtime.stores._factory import store_for_engine
 
-    class OlderControlStore(SQLAlchemyStateStore):
+    class OlderControlStore(type(store_for_engine(engine))):
         async def get_run_control(self, run_id):
             return RunControl(cancel_requested=await self.is_cancel_requested(run_id))
 

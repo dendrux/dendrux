@@ -102,11 +102,11 @@ async def test_client_pause_read_budget(
 
 
 async def test_format_cache_observes_activation_and_keeps_store_isolation(engine):
-    from dendrux.runtime.state import SQLAlchemyStateStore
+    from dendrux.runtime.stores._factory import store_for_engine
     from tests._fixtures.storage import pin_storage_format
 
     await pin_storage_format(engine, 1)
-    first = SQLAlchemyStateStore(engine)
+    first = store_for_engine(engine)
     assert await first._creation_storage_format() == 1
     await pin_storage_format(engine, 2)
     assert await first._creation_storage_format() == 2
@@ -120,14 +120,14 @@ async def test_format_cache_observes_activation_and_keeps_store_isolation(engine
         assert await first._creation_storage_format() == 2
         assert statements == []
         # A second store must discover its database's pin independently.
-        assert await SQLAlchemyStateStore(engine)._creation_storage_format() == 2
+        assert await store_for_engine(engine)._creation_storage_format() == 2
         assert len(statements) == 1
     finally:
         event.remove(engine.sync_engine, "before_cursor_execute", capture)
 
 
 async def test_submissions_rebuild_fresh_history_on_independent_stores(engine):
-    from dendrux.runtime.state import SQLAlchemyStateStore
+    from dendrux.runtime.stores._factory import store_for_engine
 
     @tool(target="client")
     def client_read() -> str:
@@ -145,7 +145,7 @@ async def test_submissions_rebuild_fresh_history_on_independent_stores(engine):
         Agent(
             name="trim",
             prompt="p",
-            state_store=SQLAlchemyStateStore(engine),
+            state_store=store_for_engine(engine),
             tools=[client_read],
             provider=provider,
         )

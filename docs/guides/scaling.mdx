@@ -16,7 +16,7 @@ Build the store when a worker starts and pass it to every `Agent` that worker se
 ```python
 from sqlalchemy.ext.asyncio import create_async_engine
 from dendrux import Agent
-from dendrux.runtime.state import SQLAlchemyStateStore
+from dendrux.store import PostgresStateStore
 from dendrux.store import RunStore
 
 engine = create_async_engine(
@@ -27,7 +27,7 @@ engine = create_async_engine(
     pool_pre_ping=True,
     pool_recycle=1800,
 )
-state = SQLAlchemyStateStore(engine)
+state = PostgresStateStore(engine)
 reads = RunStore.from_engine(engine)
 agent = Agent(
     name="worker",
@@ -119,9 +119,9 @@ Postgres notifications are optional wake hints. Durable event rows remain the so
 [//]: # "docs-test: skip - application supplies its shared engine and Postgres deployment"
 
 ```python
-from dendrux.runtime.state import SQLAlchemyStateStore
+from dendrux.store import PostgresStateStore
 
-state = SQLAlchemyStateStore(engine, notify_channel="dendrux_events")
+state = PostgresStateStore(engine, notify_channel="dendrux_events")
 # The Agent(database_url=...) form uses:
 # database_options={"notify_channel": "dendrux_events"}
 ```

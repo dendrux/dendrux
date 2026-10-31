@@ -134,7 +134,6 @@ async def sweep(
         if max_runs != 10000:
             limits["max_runs"] = max_runs
         from dendrux.runtime._capabilities import capabilities, validate_capabilities
-        from dendrux.runtime.state import SQLAlchemyStateStore
 
         if on_stale == "reclaim":
             validate_capabilities(store)
@@ -147,12 +146,9 @@ async def sweep(
         next_cursor = None
         stale = []
         if stale_running is not None:
-            if (
-                isinstance(store, SQLAlchemyStateStore)
-                and type(store).sweep_stale_runs is SQLAlchemyStateStore.sweep_stale_runs
-                and type(store).mark_lease_expired is SQLAlchemyStateStore.mark_lease_expired
-            ):
-                page = await store._scan_expired_runs(
+            combined_scan = getattr(store, "_scan_expired_runs", None)
+            if getattr(store, "_uses_combined_sweep", False) is True and callable(combined_scan):
+                page = await combined_scan(
                     cutoff=datetime.now(UTC) - stale_running,
                     batch_size=batch_size,
                     max_runs=max_runs,
@@ -239,7 +235,7 @@ async def _create_temp_store(
     from dendrux.db._engine_options import engine_options, normalized_url
     from dendrux.db._schema_check import ensure_schema_current
     from dendrux.db._sqlite_sync import create_sqlite_schema
-    from dendrux.runtime.state import SQLAlchemyStateStore
+    from dendrux.runtime.stores._factory import store_for_engine
 
     parsed = normalized_url(database_url)
     engine = create_async_engine(parsed, **engine_options(parsed, database_options))
@@ -259,5 +255,5 @@ async def _create_temp_store(
         await engine.dispose()
         raise
 
-    store = SQLAlchemyStateStore(engine)
+    store = store_for_engine(engine)
     return store, engine

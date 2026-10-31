@@ -10,7 +10,8 @@ from sqlalchemy import update
 from dendrux import sweep, tool
 from dendrux.db.models import AgentRun
 from dendrux.errors import RunNotReclaimableError, TenantScopeRequiredError
-from dendrux.runtime.state import EventWrite, SQLAlchemyStateStore, StoreCapabilities
+from dendrux.runtime.state import EventWrite, StoreCapabilities
+from dendrux.runtime.stores._factory import store_for_engine
 from dendrux.types import Limits, PauseState, ToolCall, generate_ulid
 from tests.integration.test_060_reclaim_agent import checkpoint, make_agent
 from tests.integration.test_060_reclaim_sweep import candidate
@@ -215,7 +216,7 @@ async def test_p2_sweep_cancel_payload_and_unknown_log(store, engine, caplog, po
 async def test_p2_sweep_respects_subclass_public_hooks(engine, policy):
     called = []
 
-    class Custom(SQLAlchemyStateStore):
+    class Custom(type(store_for_engine(engine))):
         async def sweep_stale_runs(self, **kwargs):
             called.append("error")
             return []

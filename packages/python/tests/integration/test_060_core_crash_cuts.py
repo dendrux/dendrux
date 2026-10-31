@@ -38,7 +38,9 @@ def _worker(url, cut, connection, effect_path, recovery_run=None):
     from dendrux import Agent, tool
     from dendrux.llm.mock import MockLLM
     from dendrux.runtime.persistence import PersistenceRecorder
-    from dendrux.runtime.state import ClaimResult, SQLAlchemyStateStore, claimed_store
+    from dendrux.runtime.state import ClaimResult, claimed_store
+    from dendrux.runtime.stores._factory import store_for_engine
+    from dendrux.runtime.stores.sql.base import SQLStateStore
     from dendrux.runtime.submit import deserialize_tool_results
     from dendrux.strategies.native import NativeToolCalling
     from dendrux.types import (
@@ -57,10 +59,10 @@ def _worker(url, cut, connection, effect_path, recovery_run=None):
         connection.recv()  # parent sends SIGKILL; no child-side graceful cleanup
         raise AssertionError("kill handshake unexpectedly returned")
 
-    class Store(SQLAlchemyStateStore):
+    class Store(type(store_for_engine(create_async_engine(url)))):
         finalizing = False
 
-        @wraps(SQLAlchemyStateStore.create_run)
+        @wraps(SQLStateStore.create_run)
         async def create_run(self, *args, **kwargs):
             result = await super().create_run(*args, **kwargs)
             if cut == "startup":
@@ -87,7 +89,7 @@ def _worker(url, cut, connection, effect_path, recovery_run=None):
             if cut == "intent":
                 halt(run, cut)
 
-        @wraps(SQLAlchemyStateStore.complete_tool_call)
+        @wraps(SQLStateStore.complete_tool_call)
         async def complete_tool_call(
             self, run, *, claim_epoch, observation, event, loop_state_patch, **kwargs
         ):
@@ -115,7 +117,7 @@ def _worker(url, cut, connection, effect_path, recovery_run=None):
                 halt(run, cut)
             return result
 
-        @wraps(SQLAlchemyStateStore.consume_submission)
+        @wraps(SQLStateStore.consume_submission)
         async def consume_submission(self, run, *, claim_epoch, traces, patch, **kwargs):
             result = await super().consume_submission(
                 run, claim_epoch=claim_epoch, traces=traces, patch=patch, **kwargs
@@ -140,7 +142,7 @@ def _worker(url, cut, connection, effect_path, recovery_run=None):
     async def main():
         engine = create_async_engine(url)
         if recovery_run is not None:
-            store = SQLAlchemyStateStore(engine)
+            store = store_for_engine(engine)
             run = await store.get_run(recovery_run)
             state = await store.get_loop_state(recovery_run)
             rows = await store.get_tool_calls(recovery_run)

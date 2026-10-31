@@ -193,9 +193,9 @@ async def _tool_run(store: Any, run_id: str, name: str, *, connected: bool) -> N
 
 
 async def test_custom_store_that_omits_mcp_records_shows_no_name(engine: Any) -> None:
-    from dendrux.runtime.state import SQLAlchemyStateStore
+    from dendrux.runtime.stores._factory import store_for_engine
 
-    class OmittingStore(SQLAlchemyStateStore):
+    class OmittingStore(type(store_for_engine(engine))):
         async def get_run_events(self, run_id: str, **kw: Any) -> Any:
             rows = await super().get_run_events(run_id, **kw)
             return [r for r in rows if r.event_type != "mcp.connected"]

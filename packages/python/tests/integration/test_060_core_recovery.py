@@ -59,7 +59,7 @@ async def race(store, engine, operations):
         return await asyncio.gather(*(op(store) for op in operations), return_exceptions=True)
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-    from dendrux.runtime.state import SQLAlchemyStateStore
+    from dendrux.runtime.stores._factory import store_for_engine
 
     pooled = create_async_engine(engine.url, pool_size=len(operations), max_overflow=0)
     warm = await asyncio.gather(*(pooled.connect() for _ in operations))
@@ -82,7 +82,7 @@ async def race(store, engine, operations):
                 await asyncio.sleep(0.03)
             return result
 
-    contender = SQLAlchemyStateStore(pooled)
+    contender = store_for_engine(pooled)
     contender._session_factory = async_sessionmaker(
         pooled, class_=RacingSession, expire_on_commit=False
     )

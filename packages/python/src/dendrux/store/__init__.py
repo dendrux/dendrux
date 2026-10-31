@@ -4,7 +4,7 @@
 monitoring, billing, and any other observation layer on top of Dendrux.
 
 It is read-only for run data. Write paths remain on
-``runtime.state.SQLAlchemyStateStore``; the one exception is image blob
+``runtime.stores.sql.base.SQLStateStore``; the one exception is image blob
 maintenance through ``RunStore.blobs`` (``purge()`` / ``collect_garbage()``).
 Response types are frozen dataclasses defined in this module; runtime read
 records stay internal and are converted at the facade boundary so runtime
@@ -85,12 +85,16 @@ from dendrux.runtime._pending import (
 from dendrux.runtime.state import (
     MAX_LIST_OFFSET,
     UNSCOPED,
-    SQLAlchemyStateStore,
     StateStore,
+    StoreCapabilities,
     TenantScope,
     _to_aware_utc,
     _Unscoped,
 )
+from dendrux.runtime.stores._factory import store_for_engine
+from dendrux.runtime.stores.sql.base import SQLStateStore
+from dendrux.runtime.stores.sql.postgres import PostgresStateStore
+from dendrux.runtime.stores.sql.sqlite import SQLiteStateStore
 from dendrux.store._follow import (
     PAUSE_STATUSES as PAUSE_STATUSES,
 )
@@ -471,7 +475,7 @@ class RunStore:
         notifier: EventNotifier | None = None,
     ) -> RunStore:
         """Borrow the engine and optional notifier; the caller owns both lifecycles."""
-        instance = cls(SQLAlchemyStateStore(engine), blob_store=blob_store)
+        instance = cls(store_for_engine(engine), blob_store=blob_store)
         instance._notifier = notifier
         return instance
 
@@ -519,7 +523,7 @@ class RunStore:
             PostgresEventNotifier(listen_url, channel=channel) if listen_url is not None else None
         )
         engine = create_async_engine(parsed, **engine_options(parsed, options))
-        store: Any = SQLAlchemyStateStore(engine, **store_options)
+        store: Any = store_for_engine(engine, **store_options)
         if database_url.startswith("sqlite"):
             store = _InitOnFirstUse(
                 store, functools.partial(create_sqlite_schema, engine), engine.dispose
@@ -1507,6 +1511,12 @@ def _build_pause_pair(paused: Any, resumed: Any | None) -> PausePair:
 
 
 __all__ = [
+    "StateStore",
+    "StoreCapabilities",
+    "SQLStateStore",
+    "PostgresStateStore",
+    "SQLiteStateStore",
+    "store_for_engine",
     "EventFeed",
     "EventNotifier",
     "Follow",

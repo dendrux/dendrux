@@ -1169,7 +1169,7 @@ class Agent:
 
         from dendrux.db._schema_check import was_verified
         from dendrux.db._shared_pool import release
-        from dendrux.runtime.state import SQLAlchemyStateStore
+        from dendrux.runtime.stores._factory import store_for_engine
 
         if self._database_url is not None:
             with self._store_lock:
@@ -1188,7 +1188,7 @@ class Agent:
                     closed = False  # a concurrent first use published first
                 else:
                     self._private_engine = engine
-                    self._lazy_store = SQLAlchemyStateStore(engine, **self._store_options)
+                    self._lazy_store = store_for_engine(engine, **self._store_options)
                     return self._lazy_store
             await release(engine)
             if closed:

@@ -22,7 +22,7 @@ from sqlalchemy import inspect, text
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
-from dendrux.runtime.state import SQLAlchemyStateStore
+from dendrux.runtime.stores._factory import store_for_engine
 from tests.integration._migration_schema import create_pre_activation_schema, migration_schema
 
 pytestmark = pytest.mark.asyncio
@@ -110,7 +110,7 @@ async def _check_head(engine: Any) -> None:
         ]
 
     # The migrated schema serves the new write paths.
-    store = SQLAlchemyStateStore(engine)
+    store = store_for_engine(engine)
     assert await store.request_pause("r-run", reason="m") is True
     assert await store.add_note("r-run", note_id="n1", text="hi", metadata={"k": 1}) is True
     assert await store.add_note("r-done", note_id="n2", text="hi") is False

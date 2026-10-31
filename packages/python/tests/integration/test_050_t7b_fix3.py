@@ -14,7 +14,7 @@ from sqlalchemy.sql.selectable import Select
 
 from dendrux import sweep
 from dendrux.db.models import AgentRun, RunEvent
-from dendrux.runtime.state import SQLAlchemyStateStore
+from dendrux.runtime.stores._factory import store_for_engine
 from tests.integration._migration_schema import create_pre_activation_schema, migration_schema
 from tests.integration._migration_schema import test_database_url as _pg_url
 from tests.integration.test_migration_run_control import _alembic
@@ -335,7 +335,7 @@ async def test_online_backfill_commits_batches_and_preserves_concurrent_runtime_
                     )
                 ).scalar_one()
                 assert count == 5000, "each bounded backfill must commit independently"
-            runtime = SQLAlchemyStateStore(target)
+            runtime = store_for_engine(target)
             # An insert and a transition ahead of the cursor both set the clock.
             await runtime.create_run("run-new", "new")
             # A raw writer omitting the clock also works behind the cursor:

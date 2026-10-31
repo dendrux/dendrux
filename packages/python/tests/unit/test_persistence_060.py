@@ -9,7 +9,7 @@ from sqlalchemy import select
 from dendrux.db.models import LLMInteraction, ReactTrace, RunEvent, ToolCallRecord
 from dendrux.errors import PersistenceError, RunFencedError
 from dendrux.runtime.persistence import PersistenceRecorder
-from dendrux.runtime.state import SQLAlchemyStateStore
+from dendrux.runtime.stores._factory import store_for_engine
 from dendrux.types import LLMResponse, Message, Role, ToolCall, ToolResult, generate_ulid
 from tests._helpers.v030_oracle import create_sqlite_engine
 
@@ -18,7 +18,7 @@ from tests._helpers.v030_oracle import create_sqlite_engine
 async def store():
     engine = await create_sqlite_engine()
     try:
-        yield SQLAlchemyStateStore(engine)
+        yield store_for_engine(engine)
     finally:
         await engine.dispose()
 

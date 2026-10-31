@@ -12,7 +12,7 @@ from __future__ import annotations
 import base64
 import json
 from datetime import timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
 from sqlalchemy import text
@@ -24,7 +24,7 @@ from dendrux.errors import BlobNotFoundError, InvalidImageError
 from dendrux.media import BlobEdge, Image, InMemoryBlobStore, ingest
 from dendrux.runtime._blob_catalog import BlobServices
 from dendrux.runtime.persistence import PersistenceRecorder
-from dendrux.runtime.state import SQLAlchemyStateStore
+from dendrux.runtime.stores._factory import store_for_engine
 from dendrux.store import RunStore
 from dendrux.types import (
     ImagePart,
@@ -37,6 +37,9 @@ from dendrux.types import (
     UsageStats,
 )
 from tests.unit.test_blob_catalog import _SurfaceProvider, make_png, runtime_for, store_png
+
+if TYPE_CHECKING:
+    from dendrux.runtime.stores.sql.base import SQLStateStore
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -140,7 +143,7 @@ async def test_external_storage_rows_hold_no_bytes(engine, store) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def _paused_run(store: SQLAlchemyStateStore, run_id: str, tenant: str | None) -> None:
+async def _paused_run(store: SQLStateStore, run_id: str, tenant: str | None) -> None:
     await store.create_run(run_id, "a", tenant_id=tenant)
     await store.pause_run(
         run_id, status="waiting_client_tool", pause_data={"agent_name": "a", "iteration": 1}
@@ -683,7 +686,7 @@ async def test_orphan_edges_collected_on_sqlite_without_fk(tmp_path) -> None:
     try:
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
-        store = SQLAlchemyStateStore(engine)
+        store = store_for_engine(engine)
         services = BlobServices.for_state_store(store)
         s = (await store_png(services, "-", make_png(12))).ref.sha256
         await store.create_run(

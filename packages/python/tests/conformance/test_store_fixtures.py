@@ -11,14 +11,14 @@ import inspect
 
 import pytest
 
-from dendrux.runtime.state import SQLAlchemyStateStore
+from dendrux.runtime.stores._factory import store_for_engine
 from tests._fixtures import stores
 
 UNDECLARED = ["a_legacy_in_memory", "b_undeclared_same_methods", "d_kwargs_legacy"]
 
 
 def build(name: str, engine):
-    return stores.STORE_FIXTURES[name](SQLAlchemyStateStore(engine))
+    return stores.STORE_FIXTURES[name](store_for_engine(engine))
 
 
 def test_protocol_list_matches_the_050_state_store() -> None:
@@ -54,7 +54,7 @@ async def test_same_methods_fixture_follows_the_real_store_signatures(sqlite_eng
     store = build("b_undeclared_same_methods", sqlite_engine)
     for method in stores.PROTOCOL_0_5:
         assert str(inspect.signature(getattr(store, method))) == str(
-            inspect.signature(getattr(SQLAlchemyStateStore(sqlite_engine), method))
+            inspect.signature(getattr(store_for_engine(sqlite_engine), method))
         ), method
 
 

@@ -146,7 +146,7 @@ async def test_sweep_projection_uses_status_index(store, engine, monkeypatch, re
         if isinstance(statement, Update) and "failure_reason" in str(statement):
             # Observe candidate traversal without destroying the seed. A losing
             # CAS has no event insert, exactly as in the real contention path.
-            return SimpleNamespace(scalar_one_or_none=lambda: None)
+            return SimpleNamespace(mappings=lambda: SimpleNamespace(first=lambda: None))
         if isinstance(statement, Select) and "started" in statement.selected_columns:
             params = statement.compile().params
             value = params["status_1"]

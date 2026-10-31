@@ -67,11 +67,11 @@ import asyncio, json, sys
 from sqlalchemy.ext.asyncio import create_async_engine
 from dendrux import Agent
 from dendrux.llm.mock import MockLLM
-from dendrux.runtime.state import SQLAlchemyStateStore
+from dendrux.runtime.stores._factory import store_for_engine
 async def main():
     engine = create_async_engine(sys.argv[1])
     agent = Agent(name="shape", prompt="p", provider=MockLLM([]),
-                  state_store=SQLAlchemyStateStore(engine), strict_tenancy=False)
+                  state_store=store_for_engine(engine), strict_tenancy=False)
     result = await agent.get_result(sys.argv[2], tenant_id=None)
     print(json.dumps(result.to_dict()["recovery"]))
     await engine.dispose()
@@ -184,9 +184,12 @@ async def test_cancelled_reclaim_is_distinct_and_audited_once(store, engine):
     ) == 1
 
 
-async def test_reclaim_lost_commit_ack_returns_its_own_claim(store, engine, monkeypatch):
+async def test_reclaim_lost_commit_ack_refuses_unproven_ownership(store, engine, monkeypatch):
     from sqlalchemy.exc import OperationalError
     from sqlalchemy.ext.asyncio import AsyncSession
+
+    from dendrux.runtime.durability import StoreOutcomeUnknown
+    from tests._helpers.db_errors import LostConnectionError
 
     await stale(store, engine)
     item = (await mark(store)).reclaimable[0]
@@ -198,12 +201,14 @@ async def test_reclaim_lost_commit_ack_returns_its_own_claim(store, engine, monk
         await commit(session)
         calls += 1
         if calls == 1:
-            raise OperationalError("connection reset", {}, None)
+            raise OperationalError("connection reset", {}, LostConnectionError())
 
     monkeypatch.setattr(AsyncSession, "commit", lost_ack)
-    token = await reclaim(store, item)
+    with pytest.raises(StoreOutcomeUnknown):
+        await reclaim(store, item)
+    assert calls == 1
     row = await store.get_run(item.run_id)
-    assert token.claim_epoch == row.claim_epoch == 2
+    assert row.claim_epoch == 2
     assert row.reclaim_attempts == 1
     assert [e.event_type for e in await store.get_run_events(item.run_id)].count(
         "run.reclaimed"

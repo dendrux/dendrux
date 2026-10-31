@@ -3,7 +3,7 @@
 Internal module. Implements the ``media`` interfaces against storage:
 
 - :class:`SQLBlobCatalog` — the :class:`~dendrux.media.BlobCatalog` over the
-  ``dendrux_blobs`` / ``dendrux_blob_refs`` tables. ``SQLAlchemyStateStore``
+  ``dendrux_blobs`` / ``dendrux_blob_refs`` tables. ``SQLStateStore``
   inherits it. Every lifecycle transition is one conditional statement keyed
   by ``(tenant_scope, sha256)`` (and ``generation`` where it matters).
 - :func:`write_blob_refs` — the edge-write protocol run inside a record's
@@ -33,6 +33,8 @@ from collections import OrderedDict
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Literal
+
+from sqlalchemy import and_
 
 from dendrux.errors import (
     BlobNotFoundError,
@@ -188,48 +190,20 @@ def _row_to_info(row: Any) -> BlobInfo:
     )
 
 
-def _db_now(dialect_name: str) -> Any:
-    """Timestamp value for a write: ``now()`` on Postgres, Python UTC elsewhere."""
-    if dialect_name == "postgresql":
-        from sqlalchemy import func
-
-        return func.now()
-    return _py_now()
-
-
-def _dialect_insert(dialect_name: str, table: Any) -> Any:
-    if dialect_name == "postgresql":
-        from sqlalchemy.dialects.postgresql import insert as pg_insert
-
-        return pg_insert(table)
-    from sqlalchemy.dialects.sqlite import insert as sqlite_insert
-
-    return sqlite_insert(table)
-
-
-async def _lock_in_sha_order(
-    session: Any, dialect_name: str, scope: str, shas: Sequence[str]
-) -> None:
-    """Postgres: lock the blob rows in ``sha256`` order before a multi-row UPDATE.
-
-    A multi-row ``UPDATE ... WHERE sha256 IN (...)`` locks rows in plan order,
-    so two transactions claiming overlapping sets can deadlock. Taking
-    ``FOR NO KEY UPDATE`` row locks in one global order first makes the
-    following UPDATE wait instead. ``NO KEY UPDATE`` does not conflict with
-    the ``KEY SHARE`` locks foreign-key checks take. SQLite serialises writers
-    on the database lock and needs nothing.
-    """
-    if dialect_name != "postgresql" or not shas:
+async def _lock_in_sha_order(session: Any, store: Any, scope: str, shas: Sequence[str]) -> None:
+    if not store.supports_row_locks or not shas:
         return
     from sqlalchemy import select
 
     from dendrux.db.models import Blob
 
     await session.execute(
-        select(Blob.sha256)
-        .where(Blob.tenant_scope == scope, Blob.sha256.in_(list(shas)))
-        .order_by(Blob.sha256)
-        .with_for_update(key_share=True)
+        store.lock_clause(
+            select(Blob.sha256)
+            .where(Blob.tenant_scope == scope, Blob.sha256.in_(list(shas)))
+            .order_by(Blob.sha256),
+            "update_no_key",
+        )
     )
 
 
@@ -247,26 +221,35 @@ def _tenant_matches(column: Any, scope: str) -> Any:
 class SQLBlobCatalog:
     """Blob catalog over ``dendrux_blobs`` / ``dendrux_blob_refs``.
 
-    Mixin for ``SQLAlchemyStateStore``: needs ``self._engine`` and
+    Mixin for ``SQLStateStore``: needs ``self._engine`` and
     ``self._session_factory``.
     """
 
     _engine: Any
     _session_factory: Any
 
-    @property
-    def _dialect(self) -> str:
-        return str(self._engine.dialect.name)
+    blob_now: Any
+    lock_clause: Any
+    insert_if_absent_stmt: Any
+    update_one: Any
+    update_many: Any
+    _execute_insert_plan: Any
+    _conflict: Any
+    _write_tx: Any
+    classify_db_error: Any
+    _ordered: Any
+    supports_row_locks: bool
+    supports_update_returning: bool
 
     async def current_time(self) -> datetime:
-        """The catalog clock: the database's ``now()`` on Postgres, Python UTC on SQLite."""
-        if self._dialect != "postgresql":
-            return _py_now()
-        from sqlalchemy import func, select
+        from sqlalchemy import select
 
+        value = self.blob_now()
+        if isinstance(value, datetime):
+            return value
         async with self._session_factory() as session:
-            value = (await session.execute(select(func.now()))).scalar_one()
-        return _require_aware(value)
+            result = await session.scalar(select(value))
+        return _require_aware(result)
 
     # --- lookup / reuse ---------------------------------------------------
 
@@ -301,46 +284,48 @@ class SQLBlobCatalog:
             out: dict[str, BlobInfo] = {}
             async with self._session_factory() as session:
                 await self._touch_live_in(session, scope, shas, out)
-                await session.commit()
+                await self._write_tx(session)
             return out
 
-        return await retry_transient_db(_attempt, label="touch_live", run_id="-")
+        return await retry_transient_db(
+            _attempt, label="touch_live", run_id="-", classify=self.classify_db_error
+        )
 
     async def _touch_live_in(
         self, session: Any, scope: str, shas: list[str], out: dict[str, BlobInfo]
     ) -> None:
-        from sqlalchemy import select, update
+        from sqlalchemy import update
 
         from dendrux.db.models import Blob
 
-        now = _db_now(self._dialect)
+        now = self.blob_now()
         for chunk in _chunks(shas):
-            await _lock_in_sha_order(session, self._dialect, scope, chunk)
-            stmt = (
-                update(Blob)
-                .where(
-                    Blob.tenant_scope == scope,
-                    Blob.sha256.in_(chunk),
-                    Blob.state == "live",
-                )
-                .values(last_used_at=now)
-                .execution_options(synchronize_session=False)
-            )
-            if self._engine.dialect.update_returning:
-                rows = await session.execute(stmt.returning(*_blob_info_columns()))
-                for row in rows:
-                    out[row.sha256] = _row_to_info(row)
-            else:  # pragma: no cover - every supported backend has RETURNING
-                await session.execute(stmt)
+            if self.supports_update_returning:
+                await _lock_in_sha_order(session, self, scope, chunk)
                 rows = await session.execute(
-                    select(*_blob_info_columns()).where(
-                        Blob.tenant_scope == scope,
-                        Blob.sha256.in_(chunk),
-                        Blob.state == "live",
-                    )
+                    update(Blob)
+                    .where(Blob.tenant_scope == scope, Blob.sha256.in_(chunk), Blob.state == "live")
+                    .values(last_used_at=now)
+                    .returning(*_blob_info_columns())
+                    .execution_options(synchronize_session=False)
                 )
                 for row in rows:
                     out[row.sha256] = _row_to_info(row)
+            else:
+                from types import SimpleNamespace
+
+                rows = await self.update_many(
+                    session,
+                    table=Blob.__table__,
+                    predicate=(Blob.tenant_scope == scope)
+                    & Blob.sha256.in_(chunk)
+                    & (Blob.state == "live"),
+                    values=[(Blob.__table__.c.last_used_at, now)],
+                    returning=_blob_info_columns(),
+                    page_size=len(chunk),
+                )
+                for row in rows:
+                    out[row["sha256"]] = _row_to_info(SimpleNamespace(**row))
 
     # --- lifecycle --------------------------------------------------------
 
@@ -371,32 +356,30 @@ class SQLBlobCatalog:
     ) -> bool:
         from dendrux.db.models import Blob
 
-        now = _db_now(self._dialect)
-        stmt = (
-            _dialect_insert(self._dialect, Blob)
-            .values(
-                tenant_scope=scope,
-                sha256=sha256,
-                generation=generation,
-                state=state,
-                media_type=info.media_type,
-                byte_length=info.byte_length,
-                width=info.width,
-                height=info.height,
-                frame_count=info.frame_count,
-                storage=info.storage,
-                data=data if info.storage == "db" else None,
-                ingest_transform=info.ingest_transform,
-                created_at=now,
-                last_used_at=now,
-                state_changed_at=now,
-            )
-            .on_conflict_do_nothing(index_elements=["tenant_scope", "sha256"])
+        now = self.blob_now()
+        values = dict(
+            tenant_scope=scope,
+            sha256=sha256,
+            generation=generation,
+            state=state,
+            media_type=info.media_type,
+            byte_length=info.byte_length,
+            width=info.width,
+            height=info.height,
+            frame_count=info.frame_count,
+            storage=info.storage,
+            data=data if info.storage == "db" else None,
+            ingest_transform=info.ingest_transform,
+            created_at=now,
+            last_used_at=now,
+            state_changed_at=now,
         )
+        conflict = self._conflict(Blob.__table__, ["tenant_scope", "sha256"])
+        plan = self.insert_if_absent_stmt(Blob.__table__, values, conflict=conflict)
         async with self._session_factory() as session:
-            result = await session.execute(stmt)
-            await session.commit()
-        return bool(result.rowcount == 1)
+            result = await self._execute_insert_plan(session, plan, conflict)
+            await self._write_tx(session)
+        return result is not None and result.rowcount == 1
 
     async def _conditional_update(self, where: list[Any], values: dict[str, Any]) -> bool:
         from sqlalchemy import update
@@ -410,13 +393,13 @@ class SQLBlobCatalog:
                 .values(**values)
                 .execution_options(synchronize_session=False)
             )
-            await session.commit()
+            await self._write_tx(session)
         return bool(result.rowcount == 1)
 
     async def promote(self, scope: str, sha256: str, generation: str) -> bool:
         from dendrux.db.models import Blob
 
-        now = _db_now(self._dialect)
+        now = self.blob_now()
         return await self._conditional_update(
             [
                 Blob.tenant_scope == scope,
@@ -432,7 +415,7 @@ class SQLBlobCatalog:
     ) -> bool:
         from dendrux.db.models import Blob
 
-        now = _db_now(self._dialect)
+        now = self.blob_now()
         return await self._conditional_update(
             [
                 Blob.tenant_scope == scope,
@@ -455,7 +438,7 @@ class SQLBlobCatalog:
     ) -> bool:
         from dendrux.db.models import Blob
 
-        now = _db_now(self._dialect)
+        now = self.blob_now()
         return await self._conditional_update(
             [
                 Blob.tenant_scope == scope,
@@ -504,35 +487,37 @@ class SQLBlobCatalog:
         edge transaction; never lower it. The edge re-check and ``delete_row``'s
         ``NOT EXISTS`` (and the FK RESTRICT) are the backstops.
         """
-        from sqlalchemy import and_, or_, update
+        from sqlalchemy import and_, or_
 
         from dendrux.db.models import Blob
 
-        stmt = (
-            update(Blob)
-            .where(
-                Blob.tenant_scope == scope,
-                Blob.sha256 == sha256,
-                or_(
-                    and_(Blob.state == "live", Blob.last_used_at < cutoff),
-                    and_(Blob.state == "pending", Blob.state_changed_at < stale_pending_cutoff),
-                ),
-                self._no_edge(scope, sha256),
-            )
-            .values(state="deleting", state_changed_at=_db_now(self._dialect))
-            .returning(Blob.generation, Blob.storage)
-            .execution_options(synchronize_session=False)
-        )
         async with self._session_factory() as session:
-            row = (await session.execute(stmt)).first()
-            await session.commit()
-        return None if row is None else (str(row.generation), str(row.storage))
+            row = await self.update_one(
+                session,
+                table=Blob.__table__,
+                pk=(scope, sha256),
+                predicate=and_(
+                    Blob.tenant_scope == scope,
+                    Blob.sha256 == sha256,
+                    or_(
+                        and_(Blob.state == "live", Blob.last_used_at < cutoff),
+                        and_(Blob.state == "pending", Blob.state_changed_at < stale_pending_cutoff),
+                    ),
+                    self._no_edge(scope, sha256),
+                ),
+                values=self._ordered(
+                    Blob.__table__, dict(state="deleting", state_changed_at=self.blob_now())
+                ),
+                returning=[Blob.generation, Blob.storage],
+            )
+            await self._write_tx(session)
+        return None if row is None else (str(row["generation"]), str(row["storage"]))
 
     async def revert_deleting(self, scope: str, sha256: str, generation: str) -> bool:
         """``deleting → live`` for this generation (GC lost a race at the edge re-check)."""
         from dendrux.db.models import Blob
 
-        now = _db_now(self._dialect)
+        now = self.blob_now()
         return await self._conditional_update(
             [
                 Blob.tenant_scope == scope,
@@ -560,7 +545,7 @@ class SQLBlobCatalog:
                 )
                 .execution_options(synchronize_session=False)
             )
-            await session.commit()
+            await self._write_tx(session)
         return bool(result.rowcount == 1)
 
     async def mark_purging(self, scope: str, sha256: str, reason: str | None) -> str | None:
@@ -571,32 +556,34 @@ class SQLBlobCatalog:
         self, scope: str, sha256: str, reason: str | None
     ) -> tuple[str, str] | None:
         """:meth:`mark_purging` returning ``(generation, storage)`` of the row it updated."""
-        from sqlalchemy import update
 
         from dendrux.db.models import Blob
 
-        now = _db_now(self._dialect)
-        stmt = (
-            update(Blob)
-            .where(
-                Blob.tenant_scope == scope,
-                Blob.sha256 == sha256,
-                Blob.state.in_(("pending", "live", "deleting")),
-            )
-            .values(
-                state="purging",
-                data=None,
-                purged_at=now,
-                purge_reason=reason,
-                state_changed_at=now,
-            )
-            .returning(Blob.generation, Blob.storage)
-            .execution_options(synchronize_session=False)
-        )
+        now = self.blob_now()
         async with self._session_factory() as session:
-            row = (await session.execute(stmt)).first()
-            await session.commit()
-        return None if row is None else (str(row.generation), str(row.storage))
+            row = await self.update_one(
+                session,
+                table=Blob.__table__,
+                pk=(scope, sha256),
+                predicate=and_(
+                    Blob.tenant_scope == scope,
+                    Blob.sha256 == sha256,
+                    Blob.state.in_(("pending", "live", "deleting")),
+                ),
+                values=self._ordered(
+                    Blob.__table__,
+                    dict(
+                        state="purging",
+                        data=None,
+                        purged_at=now,
+                        purge_reason=reason,
+                        state_changed_at=now,
+                    ),
+                ),
+                returning=[Blob.generation, Blob.storage],
+            )
+            await self._write_tx(session)
+        return None if row is None else (str(row["generation"]), str(row["storage"]))
 
     async def finish_purge(self, scope: str, sha256: str, generation: str) -> None:
         from dendrux.db.models import Blob
@@ -608,7 +595,7 @@ class SQLBlobCatalog:
                 Blob.state == "purging",
                 Blob.generation == generation,
             ],
-            {"state": "purged", "state_changed_at": _db_now(self._dialect)},
+            {"state": "purged", "state_changed_at": self.blob_now()},
         )
 
     async def stuck_rows(
@@ -725,9 +712,11 @@ class SQLBlobCatalog:
                 await write_blob_refs(
                     session, run_id=run_id, blob_refs=edges, blob_refs_scope=run_scope
                 )
-                await session.commit()
+                await self._write_tx(session)
 
-        await retry_transient_db(_attempt, label="add_blob_refs", run_id=run_id)
+        await retry_transient_db(
+            _attempt, label="add_blob_refs", run_id=run_id, classify=self.classify_db_error
+        )
 
     async def run_references(self, run_scope: str, run_id: str, sha256: str) -> bool:
         from sqlalchemy import select
@@ -803,7 +792,7 @@ class SQLBlobCatalog:
                     .execution_options(synchronize_session=False)
                 )
                 deleted += int(result.rowcount or 0)
-            await session.commit()
+            await self._write_tx(session)
         return deleted
 
 
@@ -887,32 +876,33 @@ async def write_blob_refs(
     _check_batch_owner_keys(blob_refs)
 
     # 2. Claim the blob rows with a write (rows locked in sha order first on PG).
-    dialect = session.get_bind().dialect
+    store = session.info["dendrux.store"]
     shas = sorted({e.sha256 for e in blob_refs})
-    now = _db_now(dialect.name)
+    now = store.blob_now()
     claimed: set[str] = set()
     for chunk in _chunks(shas):
-        await _lock_in_sha_order(session, dialect.name, run_scope, chunk)
-        stmt = (
-            update(Blob)
-            .where(Blob.tenant_scope == run_scope, Blob.sha256.in_(chunk), Blob.state == "live")
-            .values(last_used_at=now)
-            .execution_options(synchronize_session=False)
-        )
-        if dialect.update_returning:
-            claimed.update(r[0] for r in (await session.execute(stmt.returning(Blob.sha256))))
-        else:  # pragma: no cover - the write lock is held after the UPDATE
-            await session.execute(stmt)
-            claimed.update(
-                r[0]
-                for r in await session.execute(
-                    select(Blob.sha256).where(
-                        Blob.tenant_scope == run_scope,
-                        Blob.sha256.in_(chunk),
-                        Blob.state == "live",
-                    )
-                )
+        if store.supports_update_returning:
+            await _lock_in_sha_order(session, store, run_scope, chunk)
+            result = await session.execute(
+                update(Blob)
+                .where(Blob.tenant_scope == run_scope, Blob.sha256.in_(chunk), Blob.state == "live")
+                .values(last_used_at=now)
+                .returning(Blob.sha256)
+                .execution_options(synchronize_session=False)
             )
+            claimed.update(row[0] for row in result)
+        else:
+            rows = await store.update_many(
+                session,
+                table=Blob.__table__,
+                predicate=(Blob.tenant_scope == run_scope)
+                & Blob.sha256.in_(chunk)
+                & (Blob.state == "live"),
+                values=[(Blob.__table__.c.last_used_at, now)],
+                returning=[Blob.sha256],
+                page_size=len(chunk),
+            )
+            claimed.update(row["sha256"] for row in rows)
     missing = [s for s in shas if s not in claimed]
     # Trace edges skip a blob that is no longer live (a purged image in a
     # retried/replayed trace): its input/submission/seed edge already holds
@@ -944,7 +934,7 @@ async def write_blob_refs(
         raise BlobNotFoundError(image_id(missing[0]))
 
     # 3. Idempotent edge inserts.
-    created = _db_now(dialect.name)
+    created = store.blob_now()
     rows = [
         {
             "id": generate_ulid(),
@@ -958,12 +948,25 @@ async def write_blob_refs(
         }
         for e in blob_refs
     ]
-    stmt_ins = (
-        _dialect_insert(dialect.name, BlobRef)
-        .values(rows)
-        .on_conflict_do_nothing(index_elements=["run_id", "owner_kind", "owner_id", "ordinal"])
+    conflict = store._conflict(
+        BlobRef.__table__,
+        ["run_id", "owner_kind", "owner_id", "ordinal"],
+        "uq_dendrux_blob_refs_owner",
     )
-    await session.execute(stmt_ins)
+    # Targeted backends preserve the existing single batch INSERT. A raising
+    # backend uses one savepoint per row so an expected duplicate cannot discard
+    # its non-conflicting siblings.
+    plan = store.insert_if_absent_stmt(BlobRef.__table__, {}, conflict=conflict)
+    if plan.conflict_mode == "targeted_ignore":
+        plan = replace(plan, statement=plan.statement.values(rows))
+        await store._execute_insert_plan(session, plan, conflict)
+    else:
+        for row in rows:
+            await store._execute_insert_plan(
+                session,
+                store.insert_if_absent_stmt(BlobRef.__table__, row, conflict=conflict),
+                conflict,
+            )
 
     # An owner key that already names a different blob is a collision, never a
     # silent no-op (the new record's image would otherwise have no edge).

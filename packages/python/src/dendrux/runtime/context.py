@@ -161,7 +161,7 @@ def get_store_identity(store: object | None) -> str | None:
     """Extract a comparable identity from a state store.
 
     Resolution order:
-      1. store.store_identity property (SQLAlchemyStateStore returns DB URL)
+      1. store.store_identity property (SQLStateStore returns DB URL)
       2. Fallback: str(id(store)) for custom stores without the property
 
     Returns None if store is None.

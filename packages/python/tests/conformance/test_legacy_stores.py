@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import pytest
 
-from dendrux.runtime.state import SQLAlchemyStateStore
+from dendrux.runtime.stores._factory import store_for_engine
 from tests._fixtures import stores
 from tests._fixtures.stores import KwargsLegacyStore, LegacyInMemoryStore
 from tests.conformance import harness as h
@@ -36,7 +36,7 @@ def expected_golden(cell_id: str):
 @pytest.mark.parametrize("fixture", sorted(STORES))
 @pytest.mark.parametrize("cell", LEGACY_CELLS, ids=CELL_IDS)
 async def test_legacy_store_matches_golden(cell, fixture, sqlite_engine) -> None:
-    store = STORES[fixture](SQLAlchemyStateStore(sqlite_engine))
+    store = STORES[fixture](store_for_engine(sqlite_engine))
     assert not hasattr(store, "capabilities")
     recording = await h.run_cell(cell, sqlite_engine, store)
     golden = expected_golden(cell.id)
@@ -64,7 +64,7 @@ async def test_legacy_store_only_ever_receives_zero_five_keywords(
 ) -> None:
     """Across multi-path flows no keyword that is new in 0.6 reaches a legacy store."""
     cell = next(c for c in CELLS if c.id == cell_id)
-    store = STORES[fixture](SQLAlchemyStateStore(sqlite_engine))
+    store = STORES[fixture](store_for_engine(sqlite_engine))
     await h.run_cell(cell, sqlite_engine, store)
     assert store.calls, "the fixture recorded no calls"
     for name, keys in store.calls:
@@ -89,11 +89,11 @@ async def test_every_fixture_runs_a_flow_on_050_which_ignores_declarations(
             await h.run_cell(
                 cell,
                 sqlite_engine,
-                stores.STORE_FIXTURES[name](SQLAlchemyStateStore(sqlite_engine)),
+                stores.STORE_FIXTURES[name](store_for_engine(sqlite_engine)),
             )
         return
     recording = await h.run_cell(
-        cell, sqlite_engine, stores.STORE_FIXTURES[name](SQLAlchemyStateStore(sqlite_engine))
+        cell, sqlite_engine, stores.STORE_FIXTURES[name](store_for_engine(sqlite_engine))
     )
     expected = h.read_json(h.golden_path(cell_id))
     got = [s.get("result", {}).get("status") for s in recording["steps"]]

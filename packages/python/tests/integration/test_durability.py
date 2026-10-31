@@ -1,6 +1,6 @@
 """Integration tests for lifecycle write durability across the backend matrix.
 
-Verifies that the 5 wrapped lifecycle methods in SQLAlchemyStateStore
+Verifies that the 5 wrapped lifecycle methods in SQLStateStore
 retry on transient OperationalError and propagate logical failures
 (IntegrityError, CAS misses) immediately.
 
@@ -20,6 +20,7 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 
 from dendrux.errors import PersistenceError
 from dendrux.types import RunStatus
+from tests._helpers.db_errors import locked_error
 
 # ------------------------------------------------------------------
 # Failure injection helpers
@@ -44,7 +45,7 @@ class _FailOnceCommit:
         async def _replacement(session_self):
             if ctx.fail_count == 0:
                 ctx.fail_count += 1
-                raise OperationalError("database is locked", {}, None)
+                raise OperationalError("database is locked", {}, locked_error())
             return await original(session_self)
 
         self._patcher = patch.object(AsyncSession, "commit", new=_replacement)
@@ -316,7 +317,7 @@ class TestRetryTransientDb:
             nonlocal call_count
             call_count += 1
             if call_count <= 2:
-                raise OperationalError("database is locked", {}, None)
+                raise OperationalError("database is locked", {}, locked_error())
             return "ok"
 
         result = await retry_transient_db(_attempt, label="test", run_id="r1")
@@ -327,7 +328,7 @@ class TestRetryTransientDb:
         from dendrux.runtime.durability import retry_transient_db
 
         async def _always_fail():
-            raise OperationalError("persistent failure", {}, None)
+            raise OperationalError("persistent failure", {}, locked_error())
 
         with pytest.raises(PersistenceError, match="persistence_error"):
             await retry_transient_db(_always_fail, label="test", run_id="r1")

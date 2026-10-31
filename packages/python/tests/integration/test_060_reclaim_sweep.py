@@ -9,7 +9,7 @@ from sqlalchemy import update
 
 from dendrux import sweep
 from dendrux.db.models import AgentRun
-from dendrux.runtime.state import SQLAlchemyStateStore
+from dendrux.runtime.stores._factory import store_for_engine
 from dendrux.types import generate_ulid
 
 
@@ -135,7 +135,7 @@ async def test_two_public_sweepers_mark_once(engine, store):
 
     async def actor():
         await barrier.wait()
-        return await scan(SQLAlchemyStateStore(engine), on_stale="reclaim")
+        return await scan(store_for_engine(engine), on_stale="reclaim")
 
     results = await asyncio.gather(actor(), actor())
     assert all(r.reclaimable[0].run_id == run_id for r in results)

@@ -16,7 +16,7 @@ import hashlib
 import os
 import sys
 
-from dendrux.runtime.state import SQLAlchemyStateStore
+from dendrux.runtime.stores._factory import store_for_engine
 from tests._fixtures.stores import KwargsLegacyStore, LegacyInMemoryStore
 from tests._helpers import v030_oracle as o
 from tests.conformance import harness as h
@@ -40,7 +40,7 @@ async def record_legacy(base: dict[str, dict]) -> None:
         for name, store_cls in LEGACY_VARIANTS.items():
             engine = await o.create_sqlite_engine()
             try:
-                store = store_cls(SQLAlchemyStateStore(engine))
+                store = store_cls(store_for_engine(engine))
                 views[name] = h.golden_view(await h.run_cell(cell, engine, store))
             finally:
                 await engine.dispose()
@@ -58,7 +58,7 @@ async def record() -> None:
     for cell in CELLS:
         engine = await o.create_sqlite_engine()
         try:
-            recording = await h.run_cell(cell, engine, SQLAlchemyStateStore(engine))
+            recording = await h.run_cell(cell, engine, store_for_engine(engine))
         finally:
             await engine.dispose()
         base[cell.id] = h.golden_view(recording)

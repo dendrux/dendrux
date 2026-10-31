@@ -11,7 +11,9 @@ from dendrux import sweep, tool
 from dendrux.db.models import AgentRun
 from dendrux.errors import RunNotReclaimableError, StoreCapabilityError
 from dendrux.runtime._reclaim import needs_resolution
-from dendrux.runtime.state import SQLAlchemyStateStore, StoreCapabilities
+from dendrux.runtime.state import StoreCapabilities
+from dendrux.runtime.stores._factory import store_for_engine
+from dendrux.runtime.stores.sql.base import SQLStateStore
 from dendrux.store import RunStore
 from dendrux.types import Limits, PauseState, ToolCall, UsageStats
 from tests.integration.test_060_reclaim_agent import checkpoint, make_agent
@@ -26,10 +28,8 @@ async def test_n1_sweep_validates_recovery_before_calling_store(
 ):
     calls = []
 
-    class OldMarker(SQLAlchemyStateStore if native else object):
-        capabilities = (
-            SQLAlchemyStateStore.capabilities if native else StoreCapabilities(recovery=True)
-        )
+    class OldMarker(type(store_for_engine(engine)) if native else object):
+        capabilities = SQLStateStore.capabilities if native else StoreCapabilities(recovery=True)
 
         async def mark_lease_expired(
             self, *, cutoff, batch_size, max_runs, max_returned, reclaim_limit, cursor

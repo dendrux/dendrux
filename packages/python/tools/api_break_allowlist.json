@@ -1,5 +1,5 @@
 {
-  "_comment": "v0.5.0 → 0.6 active exceptions only; documentary inventory is excluded from matching and stale reporting. IDs refer to 0.6 upgrade rows or contract sections.",
+  "_comment": "v0.5.0 \u2192 0.6 active exceptions only; documentary inventory is excluded from matching and stale reporting. IDs refer to 0.6 upgrade rows or contract sections.",
   "known_b_items": [
     "0.6:cache-tokens",
     "0.6:env-url",
@@ -11,7 +11,8 @@
     "contracts:12.11",
     "contracts:12.2",
     "contracts:12.51",
-    "contracts:12.7"
+    "contracts:12.7",
+    "0.6:sql-store-removal"
   ],
   "entries": [
     {
@@ -48,7 +49,15 @@
       ],
       "param": "warning_location",
       "b_item": "0.6:retired-warning-location",
-      "note": "Remove retired internal FutureWarning location plumbing (contracts §12.51)."
+      "note": "Remove retired internal FutureWarning location plumbing (contracts \u00a712.51)."
+    },
+    {
+      "kind": "object-removed",
+      "paths": [
+        "dendrux.runtime.state.SQLAlchemyStateStore"
+      ],
+      "b_item": "0.6:sql-store-removal",
+      "note": "Use PostgresStateStore, SQLiteStateStore, or the dialect factory; subclasses choose the matching concrete base."
     }
   ],
   "documentary": [
@@ -101,7 +110,7 @@
         "dendrux.runtime.state.SQLAlchemyStateStore.save_trace"
       ],
       "b_item": "contracts:12.2",
-      "note": "Trace persistence returns the durable row id instead of None (§12.2)."
+      "note": "Trace persistence returns the durable row id instead of None (\u00a712.2)."
     },
     {
       "kind": "return-changed-type",
@@ -110,7 +119,7 @@
         "dendrux.runtime.state.SQLAlchemyStateStore.save_tool_call"
       ],
       "b_item": "contracts:12.2",
-      "note": "Tool persistence returns the durable row id instead of None (§12.2)."
+      "note": "Tool persistence returns the durable row id instead of None (\u00a712.2)."
     },
     {
       "kind": "return-changed-type",
@@ -119,7 +128,7 @@
         "dendrux.runtime.state.SQLAlchemyStateStore.touch_progress"
       ],
       "b_item": "contracts:12.2",
-      "note": "Progress writes return whether the fenced update succeeded (§12.2)."
+      "note": "Progress writes return whether the fenced update succeeded (\u00a712.2)."
     },
     {
       "kind": "return-changed-type",
@@ -130,7 +139,7 @@
         "dendrux.runtime.state.SQLAlchemyStateStore.submit_and_claim"
       ],
       "b_item": "contracts:12.7",
-      "note": "Claims return ClaimResult or False; ClaimResult carries epoch, storage format and checkpoint (§12.7)."
+      "note": "Claims return ClaimResult or False; ClaimResult carries epoch, storage format and checkpoint (\u00a712.7)."
     },
     {
       "kind": "object-added",
@@ -138,7 +147,7 @@
         "dendrux.runtime.state.ClaimResult"
       ],
       "b_item": "contracts:12.11",
-      "note": "ClaimResult exposes claim epoch, storage format, loop state and submission without int coercion (§12.7)."
+      "note": "ClaimResult exposes claim epoch, storage format, loop state and submission without int coercion (\u00a712.7)."
     },
     {
       "kind": "parameter-added-optional",

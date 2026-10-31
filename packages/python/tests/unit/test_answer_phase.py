@@ -12,7 +12,7 @@ from dendrux.db.models import Base
 from dendrux.llm.base import LLMProvider
 from dendrux.llm.mock import MockLLM
 from dendrux.loops.single import SingleCall
-from dendrux.runtime.state import SQLAlchemyStateStore
+from dendrux.runtime.stores._factory import store_for_engine
 from dendrux.store import RunStore, StoredEvent, TraceEntry
 from dendrux.types import (
     LLMResponse,
@@ -100,7 +100,7 @@ async def engine(tmp_path):
 
 @pytest.fixture
 def state_store(engine):
-    return SQLAlchemyStateStore(engine)
+    return store_for_engine(engine)
 
 
 # ------------------------------------------------------------------

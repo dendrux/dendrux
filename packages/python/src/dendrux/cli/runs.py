@@ -60,7 +60,7 @@ async def _list_runs(
 ) -> None:
     try:
         from dendrux.db.session import get_engine, reset_engine
-        from dendrux.runtime.state import SQLAlchemyStateStore
+        from dendrux.runtime.stores._factory import store_for_engine
     except ImportError:
         console.print("[red]Database support not installed.[/red] Run: pip install dendrux[db]")
         raise typer.Exit(1) from None
@@ -74,7 +74,7 @@ async def _list_runs(
         raise typer.Exit(1) from None
 
     try:
-        store = SQLAlchemyStateStore(engine)
+        store = store_for_engine(engine)
         # No --tenant means every tenant: omit the argument (the store's default
         # scope) instead of passing None, which means "untenanted runs only".
         scope: dict[str, Any] = {} if tenant_id is None else {"tenant_id": tenant_id}

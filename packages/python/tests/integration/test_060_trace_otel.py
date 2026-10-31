@@ -77,7 +77,7 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 from dendrux import Agent, tool
 from dendrux.llm.mock import MockLLM
 from dendrux.notifiers.otel import OpenTelemetryNotifier
-from dendrux.runtime.state import SQLAlchemyStateStore
+from dendrux.runtime.stores._factory import store_for_engine
 from dendrux.types import LLMResponse
 @tool()
 async def work() -> str:
@@ -88,7 +88,7 @@ async def main():
     provider = TracerProvider()
     provider.add_span_processor(SimpleSpanProcessor(exporter))
     try:
-        store = SQLAlchemyStateStore(engine)
+        store = store_for_engine(engine)
         agent = Agent(prompt="p", provider=MockLLM([LLMResponse(text="done")]),
                       tools=[work], require_approval=["work"], state_store=store,
                       strict_tenancy=False)
@@ -468,10 +468,10 @@ from opentelemetry.sdk.trace import TracerProvider
 from dendrux import Agent
 from dendrux.llm.mock import MockLLM
 from dendrux.notifiers.otel import OpenTelemetryNotifier
-from dendrux.runtime.state import SQLAlchemyStateStore
+from dendrux.runtime.stores._factory import store_for_engine
 async def main():
     engine = create_async_engine(sys.argv[1])
-    store = SQLAlchemyStateStore(engine)
+    store = store_for_engine(engine)
     notifier = OpenTelemetryNotifier(TracerProvider().get_tracer("crashed-worker"))
     class CrashBeforeCompletion(MockLLM):
         async def complete(self, *args, **kwargs):

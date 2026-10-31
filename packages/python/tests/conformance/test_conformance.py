@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import pytest
 
-from dendrux.runtime.state import SQLAlchemyStateStore
+from dendrux.runtime.stores._factory import store_for_engine
 from tests.conformance import harness as h
 from tests.conformance.scenarios import CELLS
 
@@ -37,7 +37,7 @@ def test_cell_ids_are_unique_and_named_scenario_flow() -> None:
 
 @pytest.mark.parametrize("cell", CELLS, ids=CELL_IDS)
 async def test_cell_matches_golden_and_corpus(cell, backend_engine) -> None:
-    recording = await h.run_cell(cell, backend_engine, SQLAlchemyStateStore(backend_engine))
+    recording = await h.run_cell(cell, backend_engine, store_for_engine(backend_engine))
     golden = h.read_json(h.golden_path(cell.id))
     actual = h.golden_view(recording)
     assert h.diff(golden, actual) is None, f"{cell.id} golden: {h.diff(golden, actual)}"

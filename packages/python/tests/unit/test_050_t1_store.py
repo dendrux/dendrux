@@ -12,7 +12,7 @@ import asyncio
 import datetime as dt
 import logging
 from functools import wraps
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
 from sqlalchemy import event
@@ -24,10 +24,15 @@ from dendrux.db._sqlite_sync import create_sqlite_schema
 from dendrux.db.models import Base
 from dendrux.errors import NoteLimitExceededError, PersistenceError, RunNotFoundError
 from dendrux.llm.mock import MockLLM
-from dendrux.runtime.state import UNSCOPED, SQLAlchemyStateStore
+from dendrux.runtime.state import UNSCOPED
+from dendrux.runtime.stores._factory import store_for_engine
 from dendrux.store import RunStore
 from dendrux.types import IdempotencyConflictError, Limits, LLMResponse, RunStatus, UsageStats
+from tests._helpers.db_errors import locked_error
 from tests._helpers.scripted_provider import ScriptedLLM, tool_calls
+
+if TYPE_CHECKING:
+    from dendrux.runtime.stores.sql.base import SQLStateStore
 
 
 @pytest.fixture
@@ -45,8 +50,8 @@ async def engine(tmp_path: Any) -> Any:
 
 
 @pytest.fixture
-def state(engine: Any) -> SQLAlchemyStateStore:
-    return SQLAlchemyStateStore(engine)
+def state(engine: Any) -> SQLStateStore:
+    return store_for_engine(engine)
 
 
 @pytest.fixture
@@ -191,7 +196,7 @@ class TestTenantIdempotency:
         eng = create_async_engine(f"sqlite+aiosqlite:///{db}")
         try:
             await create_sqlite_schema(eng)
-            legacy = SQLAlchemyStateStore(eng)
+            legacy = store_for_engine(eng)
             await legacy.create_run(
                 "n1", "a", tenant_id="A", idempotency_key="k", idempotency_fingerprint="f"
             )
@@ -222,21 +227,31 @@ class TestTenantIdempotency:
             await state.create_run("00000000000000000000000105", "a", tenant_id="")
 
     def test_violation_classifier(self) -> None:
-        from dendrux.runtime.state import _is_idempotency_violation
+        import sqlite3
 
-        assert _is_idempotency_violation(
-            Exception("UNIQUE constraint failed: index 'uq_agent_runs_tenant_idempotency_key'")
+        from dendrux.runtime.stores.sql.postgres import PostgresStateStore
+        from dendrux.runtime.stores.sql.sqlite import SQLiteStateStore
+
+        def unique(message):
+            error = sqlite3.IntegrityError(message)
+            error.sqlite_errorcode = sqlite3.SQLITE_CONSTRAINT_UNIQUE
+            return error
+
+        sqlite = object.__new__(SQLiteStateStore)
+        assert sqlite._idempotency_violation(
+            unique("UNIQUE constraint failed: index 'uq_agent_runs_tenant_idempotency_key'")
         )
-        assert _is_idempotency_violation(
-            Exception("UNIQUE constraint failed: agent_runs.idempotency_key")
+        assert sqlite._idempotency_violation(
+            unique("UNIQUE constraint failed: agent_runs.idempotency_key")
         )
-        assert _is_idempotency_violation(
-            Exception(
-                'duplicate key value violates unique constraint "ix_agent_runs_idempotency_key"'
-            )
-        )
-        assert not _is_idempotency_violation(Exception("UNIQUE constraint failed: agent_runs.id"))
-        assert not _is_idempotency_violation(Exception("the idempotency_key column is odd"))
+
+        class UniqueError(Exception):
+            sqlstate = "23505"
+            constraint_name = "ix_agent_runs_idempotency_key"
+
+        assert object.__new__(PostgresStateStore)._idempotency_violation(UniqueError())
+        assert not sqlite._idempotency_violation(unique("UNIQUE constraint failed: agent_runs.id"))
+        assert not sqlite._idempotency_violation(Exception("the idempotency_key column is odd"))
 
 
 # ---------------------------------------------------------------------------
@@ -325,7 +340,7 @@ class TestEventAllocation:
         async def flaky(run_id: str, **kwargs: Any) -> int:
             if kwargs.get("event_type") == "tool.completed" and not failed["done"]:
                 failed["done"] = True
-                raise OperationalError("x", {}, Exception("database is locked"))
+                raise OperationalError("x", {}, locked_error())
             return await original(run_id, **kwargs)
 
         state.save_run_event = flaky
