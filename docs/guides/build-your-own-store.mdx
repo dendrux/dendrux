@@ -16,7 +16,7 @@ Dendrux keeps every run in a **state store**. We ship stores for PostgreSQL, SQL
 1. **Feature flags** that choose between generic code paths in the base.
 2. **Hook methods** that build the SQL expressions or statements the base cannot write portably.
 
-A hook never commits, retries or validates. It only returns SQL (or, for three of them, runs one statement inside the transaction the base already opened).
+The base also refuses, on first use and before any claim, an engine or connection in `AUTOCOMMIT` mode (a `ValueError`): every write must be one real transaction. A hook never commits, retries or validates. It only returns SQL (or, for three of them, runs one statement inside the transaction the base already opened).
 
 Everything a hook takes or returns is importable from `dendrux.store`: `SQLStateStore`, `ConflictSpec`, `InsertPlan`, `SelectSource`, `ValuesSource`, `SetFields`, `AppendArray`, `PatchLoopState`, `JsonPatch`, `JsonPath`, `JsonReadType`, `JsonValue`, `ScalarKey`, `OrderedAssignments`, `RunLockScope`, `RunParentCursor`, `DialectFacts`, `DbError`, `DbErrorKind` and `TenantScope`. Names that start with an underscore are not part of the contract; the one exception is `_after_event_insert`, described under [Declare what you promise](#declare-what-you-promise).
 
@@ -233,7 +233,7 @@ Every hook below is a method of `SQLStateStore` that you may override. A hook ne
 | `json_get(self, col: ColumnElement, path: JsonPath, as_type: JsonReadType) -> ColumnElement` | Read one value from a JSON column. `path` holds literal object keys (`str`) and array indexes (`int`, negative counts from the end). `as_type` is `"json"`, `"str"`, `"int"` or `"bool"`; a value of another JSON type reads as SQL NULL, and strings compare with a binary collation |
 | `json_contains(self, col: ColumnElement, path: JsonPath, value: JsonValue) -> ColumnElement[bool]` | True when the path holds `value`: a scalar by exact value and JSON type (`1` is not `true`, `"1"` is not `1`), an object or array by containment. A missing path is false |
 | `json_is_null(self, col: ColumnElement, path: JsonPath) -> ColumnElement[bool]` | True only for an explicit JSON `null`; a missing path and SQL NULL are false |
-| `json_patch_expr(self, col: ColumnElement, patch: JsonPatch) -> ColumnElement or None` | An expression that applies `SetFields` (set literal object members) or `AppendArray` (append one value at a path) inside the database. Return `None` for `PatchLoopState`, and for any patch you do not support: the base then reads, modifies and writes under a lock. Implement `SetFields` and `AppendArray`: finalising a run needs the expression form |
+| `json_patch_expr(self, col: ColumnElement, patch: JsonPatch) -> ColumnElement or None` | An expression that applies `SetFields` (set literal object members) or `AppendArray` (append one value at a path) inside the database. Return `None` for `PatchLoopState`, and for any patch you do not support: the base then reads, modifies and writes under a lock (on a database without row locks it reserves the writer first), including when it finalises a run. The expression form is optional; it saves the extra read and the lock |
 | `pause_projection(self, col: ColumnElement) -> list[ColumnElement]` | The pause-summary columns to select from the pause document: the values of its summary keys, then its last step. The default builds them with `json_get`; override to read them natively |
 | `metadata_filter_predicate(self, col: ColumnElement, metadata_filter: dict[str, Any]) -> ColumnElement[bool]` | Filter runs by metadata. The default ANDs `json_contains` for each key; override for a native containment operator |
 | `idempotency_scope_predicate(self, tenant_id: str or None) -> ColumnElement[bool]` | Compare a run's tenant with the tenant of an idempotency lookup. The default treats an absent tenant and the empty string as the same scope. It must compare exactly (see the rules below) |
@@ -293,7 +293,7 @@ class MyStore(SQLStateStore):
 | `retry_ids` | A write carries a caller-owned identity, so repeating it after a lost acknowledgement stores it once |
 | `checkpointing` | Executable state and conversation reconstruction (format-2 runs) |
 | `atomic_completion` | A tool's intent, its result, and a run's end publish all-or-nothing |
-| `recovery` | Leases, marking, reclaim, paged cancel |
+| `recovery` | Leases, marking, reclaim, paged cancel, and `get_replayed_tool_calls` (the recovery declaration is refused at Agent construction without it) |
 | `notify` | After an event insert the store sends a wake hint, from `async def _after_event_insert(self, session, run_id) -> None` |
 | `deployment` | `single_process` (one process), `single_host` (several processes sharing one file) or `multi_server` (any number of processes and hosts) |
 
@@ -480,7 +480,6 @@ The numbers change as contracts are added; the shape does not. The one skipped `
 - **The note cap is exceeded.** `serialize_in_tx` does not hold across the count and the insert.
 - **Tenants "t" and "t " collide.** Your column collation pads or folds case.
 - **An atomic operation left half its writes.** A write happened outside the single transaction the base opens. Do not commit inside a hook.
-- **A run cannot be finalised.** `json_patch_expr` returns `None` for `SetFields`.
 
 ## Ask for help
 

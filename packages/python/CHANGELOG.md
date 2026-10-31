@@ -17,7 +17,7 @@
   custom stores retain legacy signatures and format 1. Subclass overrides must
   accept and forward the named keyword-only parameters or narrow their capabilities.
   Add fenced evidence writes, retry identities, atomic tool completion and submission
-  consumption. Incompatible declarations raise `StoreCapabilityError` before execution.
+  consumption. Declaring `recovery` requires `get_replayed_tool_calls` too. Incompatible declarations raise `StoreCapabilityError` before execution.
 - Add `Agent(lease_interval=timedelta(seconds=30))`, with a five-second minimum.
   Size `stale_running` to at least three times the lease interval. Results from
   reclaimed runs expose `RecoveryInfo` and an additive `recovery` wire field with
@@ -64,10 +64,17 @@
   CLI create their engines with `READ COMMITTED`, UTC at connect and `utf8mb4`;
   `mysql`, `mariadb` and `aiomysql` URL spellings normalise to `asyncmy`. The store
   checks InnoDB, server version, `READ COMMITTED`, autocommit off, strict `sql_mode` and
-  `utf8mb4` on first use and refuses an `AUTOCOMMIT` engine; a `mariadb+asyncmy` engine is
-  accepted wherever `mysql+asyncmy` is; a missing `asyncmy` or `cryptography` names
-  `dendrux[mysql]`. Identifiers and long text use NO PAD binary collations, JSON
-  filters match by exact type, and integers beyond 64 bits are refused before writing. `dendrux db migrate` builds the schema in resumable steps under a
+  `utf8mb4` on first use (a `ValueError` before any write). Every SQL store refuses an
+  `AUTOCOMMIT` engine before any claim. A `mariadb+asyncmy` engine is accepted wherever
+  `mysql+asyncmy` is. A missing `asyncmy`, or `cryptography` at a `caching_sha2_password`
+  login, raises an `ImportError` naming `dendrux[mysql]`. Identifiers and long text use NO
+  PAD binary collations. Scalar metadata filters match by exact JSON type with one truth
+  table on all four databases (including integers up to the unsigned 64-bit maximum and
+  non-ASCII text). The MySQL store refuses a JSON integer outside signed int64 / unsigned
+  uint64 with the new `dendrux.errors.JSONIntegerOutOfRangeError` (code
+  `json_integer_out_of_range`, not retryable). A missing table or column raises
+  `SchemaNotInitializedError` or `SchemaOutOfDateError` on every store path, owned engines
+  included. `dendrux db migrate` builds the schema in resumable steps under a
   server-wide named lock, is forward-only, may share a database with application tables
   and refuses a database where the application keeps its own Alembic version table.
   Event notifications stay PostgreSQL-only. See `docs/guides/mysql.mdx`.
@@ -106,10 +113,14 @@
   deadlocks, serialization failures, lock timeouts and connection or availability errors.
   A PostgreSQL statement timeout (`57014`) is not retried, so a long `statement_timeout`
   no longer multiplies the time to fail. Retry-identity writes read their rows back to
-  report the true outcome. A write that still fails makes `agent.run` raise
-  `PersistenceError` (a stream ends with `run_error`); a failed model-call record does not
-  fail the run. The run is saved as `error` if the database answers again in time, and
-  otherwise stays `running` at its last committed state for `sweep` and `reclaim`.
+  report the true outcome, and so does a create without an idempotency key (the supplied
+  run id, agent, tenant and input prove it); on PostgreSQL the read-back waits at most
+  about five seconds for a concurrent writer, then answers `StoreOutcomeUnknown`. A
+  write that still fails makes `agent.run` raise `PersistenceError` (a stream ends with
+  `run_error`). Three writes are best effort and never fail the run: the model-call
+  record, the usage row and a legacy run's progress heartbeat. After a fatal failure the
+  run is saved as `error` if the database answers again in time, and otherwise stays
+  `running` at its last committed state for `sweep` and `reclaim`.
   `StoreCapabilities` gains `deployment` (descriptive; a declaration without it warns) and
   the `StateStore` protocol gains `update_run_meta`.
 - Publish the store test kit, a pytest plugin that certifies a store against the

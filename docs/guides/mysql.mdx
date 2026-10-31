@@ -19,7 +19,7 @@ The extra installs the `asyncmy` driver and `cryptography`. MySQL 8.4 logs users
 
 The URL form is `mysql+asyncmy://user:password@host:3306/database`. `mysql://`, `mysql+aiomysql://` and the `mariadb` spellings (`mariadb://`, `mariadb+asyncmy://`) are accepted and use `asyncmy`. The connected server decides whether it is MySQL or MariaDB. An engine you create yourself with a `mariadb+asyncmy://` URL works with `MySQLStateStore(engine)`, `store_for_engine(engine)` and `RunStore.from_engine(engine)` as well as one with a `mysql+asyncmy://` URL.
 
-If `asyncmy` or `cryptography` is missing, the store stops with an error that names `dendrux[mysql]`.
+If `asyncmy` is missing, or `cryptography` is missing when the server asks for a `caching_sha2_password` login, building the store raises an `ImportError` that names `dendrux[mysql]`.
 
 For a database URL, Dendrux creates the engine and sets what it needs. You pass no extra options. The examples use the OpenAI provider, so they also need `pip install "dendrux[openai]"` and an `OPENAI_API_KEY`; any provider works the same way.
 
@@ -63,24 +63,28 @@ agent = Agent(name="worker", prompt="Help the user.", provider="openai:gpt-4o-mi
 
 ### What the store requires and checks
 
-On first use the store reads the server's settings once per store and refuses to run, with an error that names the setting but never a value, unless all of these hold:
+On first use the store reads the server's settings once per store (one query, no `SET` on checkout) and refuses to run, with a `ValueError` that names the setting but never a value, unless all of these hold. The first use is before any claim or write. A pool is assumed to be configured uniformly, so the facts are cached per store:
 
 | Requirement | Why |
 | --- | --- |
 | The server is MySQL 8.4 or newer, or MariaDB 10.11 or newer | Older servers lack features the store relies on |
 | Isolation is `READ COMMITTED` | Claims and fencing are written for it. Another level can let two workers win the same claim |
-| Autocommit is off | Each write must be one transaction. An `AUTOCOMMIT` engine (`isolation_level="AUTOCOMMIT"` in the engine or in `execution_options`) commits every statement on its own, which breaks the one-winner rule for claims. It is refused before any claim, and so is any `execution_options` isolation level other than `READ COMMITTED` |
+| Autocommit is off | Each write must be one transaction. An `AUTOCOMMIT` engine (`isolation_level="AUTOCOMMIT"` in the engine, or session autocommit switched on) commits every statement on its own, which breaks the one-winner rule for claims. It is refused before any claim, and so is any `execution_options` isolation level other than `READ COMMITTED`. PostgreSQL and SQLite stores refuse a physically autocommitting connection the same way; a SQLite setup that issues its own `BEGIN` and holds a real transaction is accepted |
 | `sql_mode` is strict (`STRICT_TRANS_TABLES` or `STRICT_ALL_TABLES`) | In a non-strict mode the server silently truncates a value that is too long instead of refusing it |
-| The client, connection and result character sets are `utf8mb4` | Another character set cannot store every text Dendrux persists. A driver that fails to encode a value is reported as a `PersistenceError` without the value |
+| `character_set_client`, `character_set_connection` and `character_set_results` are `utf8mb4` | Another character set cannot store every text Dendrux persists |
 | Every Dendrux table uses InnoDB | Row locks and transactions |
+
+A driver exception that is not a SQLAlchemy error (a character-encoding failure, an error raised inside `asyncmy`) becomes a `PersistenceError` with no value text and no driver context; an `AttributeError` or `UnicodeError` raised by your own code propagates unchanged.
 
 The time zone is not checked. Dendrux writes UTC timestamps itself, and sets `SET time_zone='+00:00'` on engines it creates; set it on your own engine as shown above so that server-side defaults agree.
 
-Metadata filters and JSON reads behave the same on all four databases: a filter value matches only a value of the same JSON type (`1` does not match `true`, and a scalar does not match an array that contains it), and `None` does not match a missing key. A number outside the range of a 64-bit integer is refused with a `PersistenceError` before anything is written, because MySQL stores such a number as an approximate decimal; MariaDB and PostgreSQL keep it exactly.
+**Metadata filters** (`list_runs`, `count_runs`) behave the same on PostgreSQL, SQLite, MySQL and MariaDB. A scalar filter value matches only a value of the same JSON type: `true` is not `1`, an explicit JSON `null` is not an absent key, and a string does not match an array that contains it. `1` and `1.0` are equal. Strings are case- and whitespace-sensitive, including non-ASCII text. Integers up to the unsigned 64-bit maximum match exactly, including values above the signed 64-bit range. Collection-valued filters keep their earlier behaviour.
+
+**JSON integers.** MySQL stores a JSON integer beyond 64 bits as an approximate decimal, so the MySQL store refuses it: the range is -9223372036854775808 through 18446744073709551615. A nested integer outside it, in input, metadata, a tool result or a patch, raises `JSONIntegerOutOfRangeError` (a non-retryable `PersistenceError` with code `json_integer_out_of_range`) before anything is written. The range applies to each JSON field on its own, and reads never check it. Send larger numbers as strings. MariaDB, PostgreSQL and SQLite keep large integers exactly and never raise it.
 
 ## Create the schema
 
-MySQL and MariaDB do not create tables on first use. Run the migration once, as a deployment job. A store that finds its tables missing or out of date, including one built on an engine you own, raises `SchemaNotInitializedError` or `SchemaOutOfDateError` with the `dendrux db migrate` hint:
+MySQL and MariaDB do not create tables on first use. Run the migration once, as a deployment job. A statement that finds a table missing raises `SchemaNotInitializedError`, and one that finds a column missing raises `SchemaOutOfDateError`, both with the `dendrux db migrate` hint and no driver text, on every store path including an engine you own. `DENDRUX_SKIP_SCHEMA_CHECK` skips only the startup catalog check, not this:
 
 ```bash
 export DENDRUX_DATABASE_URL="mysql+asyncmy://user:password@db.internal:3306/dendrux"
@@ -129,7 +133,7 @@ Images are not stored in the database, so `ImagePolicy` sizes are not part of ei
 
 - **Connections.** Use a bounded pool per process, as in the [scaling guide](/docs/guides/scaling). Dendrux sets isolation and the time zone per connection, so a proxy must not reset them.
 - **Deployment.** The store declares `deployment="multi_server"`: any number of processes and hosts can share one database.
-- **Lost acknowledgements.** If a connection dies after `COMMIT` and Dendrux cannot prove whether a claim took effect, it raises `StoreOutcomeUnknown`. Do not run the claimed work and do not retry the claim; the lease and `reclaim` recover the run. A blind retry of a submit call raises `RunNotPausedError` once the run is no longer paused; that does not prove your first attempt was the one that claimed it, so never assume ownership. See [Errors](/docs/reference/errors#when-a-commit-acknowledgement-is-lost).
+- **Lost acknowledgements.** If a connection dies after `COMMIT`, a write with a retry identity is read back and reports its real outcome, and so is `create_run` (the run id, agent, tenant and input prove it). If Dendrux cannot prove whether a claim took effect, it raises `StoreOutcomeUnknown`. Do not run the claimed work and do not retry the claim; the lease and `reclaim` recover the run. A blind retry of a submit call raises `RunNotPausedError` once the run is no longer paused; that does not prove your first attempt was the one that claimed it, so never assume ownership. See [Errors](/docs/reference/errors#when-a-commit-acknowledgement-is-lost).
 - **When a write fails.** A write that still fails after the retries makes `agent.run` raise `PersistenceError` (a stream ends with `run_error`); see [Errors](/docs/reference/errors#when-a-write-fails-inside-a-run).
 
 ## Test servers for contributors
