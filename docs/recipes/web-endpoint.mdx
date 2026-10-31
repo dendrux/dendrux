@@ -83,6 +83,8 @@ async def chat(req):
 
 Build the store once at startup and pass it everywhere. An `Agent` built with `database_url=` reuses one reference-counted engine per normalised URL and `database_options`; close every Agent to release its reference. The Agent ignores `DENDRUX_DATABASE_URL`. If it is set and no effective store is supplied, run and stream have no persistence and log `database_url_env_ignored` once per process, without raising just because the variable is set. A returned pause cannot be submitted later without persistence. Pass `state_store=` or `database_url=` explicitly; the CLI still uses the variable. Pool sizing, PgBouncer and the migration job are on [Scaling workers](/docs/guides/scaling).
 
+`get_engine` builds the engine for a Postgres, SQLite or MySQL/MariaDB URL, and `store_for_engine` picks the matching store from the engine's dialect, so this code does not change when the database does. If you create the engine yourself on MySQL or MariaDB, set `isolation_level="READ COMMITTED"` and the UTC `init_command`; see [MySQL and MariaDB](/docs/guides/mysql).
+
 In a multi-tenant service, pass the authenticated caller's `tenant_id=` on every call (`run`, `stream`, `submit_*`, `cancel_run`). With a state store, `strict_tenancy=True` (the 0.6 default) makes omission an error. Agents without a store can omit `tenant_id` without a warning. See [Multi-tenancy](/docs/architecture/multi-tenancy).
 
 ### Ownership at request shutdown

@@ -307,9 +307,10 @@ Dendrux uses **SQLAlchemy 2.x async**. Anything async-SQLAlchemy supports works:
 
 - **SQLite + aiosqlite**: bundled, zero-setup, perfect for local dev and small deployments.
 - **PostgreSQL + asyncpg**: recommended for production. `pip install "dendrux[postgres]"`. Schema is identical; migrations are managed by Alembic.
-- Other backends (MySQL, etc.) work in principle but aren't routinely tested.
+- **MySQL 8.4 and MariaDB 10.11**: supported on InnoDB. `pip install "dendrux[mysql]"`. See [MySQL and MariaDB](/docs/guides/mysql).
+- Another SQLAlchemy database can be added by subclassing `SQLStateStore` and proving it with the published test kit. See [Build your own store](/docs/guides/build-your-own-store).
 
-The schema doesn't use any SQLite-specific or Postgres-specific features. Switching backends is a connection string change.
+The tables are the same on every backend; each adds the column types and indexes it needs. Switching databases means creating the schema in the new one: Dendrux does not copy data between databases.
 
 **In-memory SQLite** (`sqlite+aiosqlite:///:memory:`) is for tests and demos only. SQLAlchemy gives it one shared connection, so Dendrux serialises its own database sessions on it (parallel tool calls and readers wait their turn) and logs a warning when a store is created on it. The data is gone when the engine is disposed. Two rules apply:
 
@@ -331,7 +332,7 @@ dendrux db status                        # show the current migration revision
 
 `DENDRUX_DATABASE_URL` is the one knob the CLI reads. It never accepts the URL as a flag, so credentials stay out of your shell history and process list. Error output from the CLI masks the password in any URL it prints.
 
-> **Explicit persistence in 0.6.** The Agent ignores `DENDRUX_DATABASE_URL`. If it is set and no effective store is supplied, run and stream have no persistence and log `database_url_env_ignored` once per process, without raising just because the variable is set. A returned pause cannot be submitted later without persistence. Pass `state_store=` or `database_url=` explicitly; the CLI still uses the variable. Create one `SQLAlchemyStateStore` at startup and share it within the worker event loop.
+> **Explicit persistence in 0.6.** The Agent ignores `DENDRUX_DATABASE_URL`. If it is set and no effective store is supplied, run and stream have no persistence and log `database_url_env_ignored` once per process, without raising just because the variable is set. A returned pause cannot be submitted later without persistence. Pass `state_store=` or `database_url=` explicitly; the CLI still uses the variable. Create one store (`PostgresStateStore`, `SQLiteStateStore`, `MySQLStateStore`, or `store_for_engine(engine)`) at startup and share it within the worker event loop.
 
 Async engines belong to their worker event loop. See [Scaling workers](/docs/guides/scaling) for pool ownership and sharing.
 

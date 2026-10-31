@@ -84,7 +84,7 @@ The guide is [Images](/docs/recipes/images).
 | Symbol | Import | What it is |
 | --- | --- | --- |
 | `RunStore` | `from dendrux.store import RunStore` | Read-only facade over the six tables. See [RunStore](/docs/reference/run-store). |
-| `StateStore` / `SQLAlchemyStateStore` / `StoreCapabilities` | `from dendrux.runtime.state import StateStore, SQLAlchemyStateStore, StoreCapabilities` | Runtime persistence protocol, built-in store and explicit capability declaration. See [StateStore](/docs/reference/state-store). |
+| `StateStore` / `SQLStateStore` / `PostgresStateStore` / `SQLiteStateStore` / `MySQLStateStore` / `StoreCapabilities` / `store_for_engine` | `from dendrux.store import StateStore, SQLStateStore, PostgresStateStore, SQLiteStateStore, MySQLStateStore, StoreCapabilities, store_for_engine` | Runtime persistence protocol, the SQL base class, the three built-in stores, the explicit capability declaration and the dialect-based factory. See [StateStore](/docs/reference/state-store). |
 | `ClaimResult` / `ReclaimableRun` / `SweepResult` | `from dendrux.runtime.state import ClaimResult, ReclaimableRun, SweepResult` | Claim epoch and pinned format, a marked recovery item, and the bounded sweep result. See [Recovery](/docs/guides/recovery). |
 | `RecoveryInfo` | `from dendrux.types import RecoveryInfo` | Reclaim count, last reclaim time and a bounded replayed-call summary on `RunResult.recovery`. |
 | `EventNotifier` / `NotifierState` / `Subscription` / `PostgresEventNotifier` | `from dendrux.store import EventNotifier, NotifierState, Subscription, PostgresEventNotifier` | Reader wake hints, shared health, a per-run signal and the optional Postgres listener. See [Scaling](/docs/guides/scaling#event-notifications). |

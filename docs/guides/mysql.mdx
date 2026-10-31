@@ -1,0 +1,126 @@
+---
+title: MySQL and MariaDB
+description: Run Dendrux on MySQL 8.4 or MariaDB 10.11 and newer: install the driver, create the store, migrate, size payload limits against max_allowed_packet, and know the collation and isolation rules.
+---
+
+# MySQL and MariaDB
+
+Dendrux stores every run in your database. MySQL 8.4 and MariaDB 10.11 (and newer) are supported next to PostgreSQL and SQLite, on the InnoDB engine. Use the same agents, the same pause and resume calls and the same `RunStore` reads; only the connection string and a few server rules differ.
+
+> **One notification difference.** Event notifications (`notify_channel`) are PostgreSQL-only. On MySQL and MariaDB, `follow` and `stream_events` poll the database. Everything else, including recovery with `sweep` and `reclaim`, works as on PostgreSQL.
+
+## Install and connect
+
+```bash
+pip install "dendrux[mysql]"
+```
+
+The extra installs the `asyncmy` driver. It is opt-in and is not part of `dendrux[all]`.
+
+The URL form is `mysql+asyncmy://user:password@host:3306/database`. `mysql://`, `mysql+aiomysql://` and the `mariadb` spellings are accepted and use `asyncmy`. The connected server decides whether it is MySQL or MariaDB.
+
+For a database URL, Dendrux creates the engine and sets what it needs. You pass no extra options:
+
+[//]: # "docs-test: skip - needs a running MySQL or MariaDB server"
+
+```python
+from dendrux import Agent
+
+agent = Agent(
+    name="worker",
+    prompt="Help the user.",
+    provider="openai:gpt-4o-mini",
+    database_url="mysql+asyncmy://user:password@db.internal:3306/dendrux",
+)
+```
+
+Every engine Dendrux creates for a MySQL or MariaDB URL (`Agent(database_url=)`, `RunStore.from_database_url`, `MySQLStateStore.from_url` and the CLI) uses `READ COMMITTED` isolation, sets the connection time zone to UTC and uses `utf8mb4`. Passing options that contradict this (a different `isolation_level`, another `init_command`) raises `ValueError`.
+
+To own the engine yourself, as the [scaling guide](/docs/guides/scaling) recommends for production, set the same two options:
+
+[//]: # "docs-test: skip - needs a running MySQL or MariaDB server"
+
+```python
+from sqlalchemy.ext.asyncio import create_async_engine
+from dendrux import Agent
+from dendrux.store import MySQLStateStore, RunStore
+
+engine = create_async_engine(
+    "mysql+asyncmy://user:password@db.internal:3306/dendrux",
+    isolation_level="READ COMMITTED",
+    connect_args={"init_command": "SET time_zone='+00:00'", "charset": "utf8mb4"},
+    pool_size=5,
+    max_overflow=0,
+    pool_pre_ping=True,
+    pool_recycle=1800,
+)
+state = MySQLStateStore(engine)
+reads = RunStore.from_engine(engine)
+agent = Agent(name="worker", prompt="Help the user.", provider="openai:gpt-4o-mini", state_store=state)
+```
+
+On first use the store checks the server and refuses to run if the engine is not `READ COMMITTED`, if any Dendrux table is not InnoDB, or if the server is older than MySQL 8.4 / MariaDB 10.11. It does this once per store.
+
+## Create the schema
+
+MySQL and MariaDB do not create tables on first use. Run the migration once, as a deployment job:
+
+```bash
+export DENDRUX_DATABASE_URL="mysql+asyncmy://user:password@db.internal:3306/dendrux"
+dendrux db migrate
+dendrux db check
+```
+
+`dendrux db migrate` builds the schema in 37 resumable steps. If a step fails or the process stops, run it again: it continues where it stopped and refuses anything it does not recognise. Then `dendrux db status` and `dendrux db activate` work as described in [Database CLI](/docs/reference/cli).
+
+- **Forward-only.** MySQL cannot roll DDL back with a transaction, so there is no downgrade. Take a backup before every migration or activation.
+- **One at a time.** Maintenance commands (`migrate`, `activate`, `dedupe`) hold a named server lock (`GET_LOCK`) for the whole database, on a dedicated connection. A second one waits, then gives up. Individual DDL statements wait at most five seconds for a table lock.
+- **`--sql` is not available.** Offline SQL output needs a live connection on these servers, so it is refused.
+
+## A dedicated or a shared database
+
+Dendrux tables can live in a database of their own, or beside your application's tables. Only the Dendrux table names and `alembic_version` are ever considered; nothing else is touched.
+
+> **Do not share the Alembic version table.** If your application keeps its own Alembic history in the same database, `alembic_version` already exists and `dendrux db migrate` refuses to run. Give Dendrux a separate database (the simplest fix), or keep the two histories in different databases. A Dendrux-owned version-table name is on the backlog.
+
+## Collations
+
+Tenant ids, run ids, idempotency keys and other identifiers must compare exactly: `"t"` and `"t "` are different tenants, and so are `"T"` and `"t"`. Dendrux therefore creates these columns with a binary, no-pad collation: `utf8mb4_0900_bin` on MySQL and `utf8mb4_nopad_bin` on MariaDB. It also keeps a generated `tenant_scope` column so that untenanted runs are unique per key.
+
+Do not change these collations or convert the tables. `utf8mb4_bin` is not acceptable: it ignores trailing spaces. `dendrux db check` reports drift.
+
+## Payload limits and `max_allowed_packet`
+
+MySQL and MariaDB refuse a statement larger than `max_allowed_packet` (MySQL 8.4 defaults to 64 MiB, MariaDB 10.11 to 16 MiB). Dendrux compares your Agent's `Limits` with the server's value once, before the Agent first uses the store, and refuses with a `ValueError` that names both numbers. Nothing is written first, and a `code=store_statement_limit` line is logged.
+
+The size compared is the largest single statement the limits can produce, not the plain byte counts:
+
+| Part | Reserved |
+| --- | --- |
+| The larger of `max_input_bytes` and `max_tool_result_bytes` | 12 times: up to 6 times for JSON escaping of control bytes, then 2 times for SQL escaping |
+| `max_metadata_bytes` (already encoded JSON) | 2 times |
+| Column lists, identifiers and small values | 64 KiB |
+
+The default limits need about 12.2 MiB, so they fit both servers' defaults. To raise a limit, raise `max_allowed_packet` on the server (a global setting that applies to new connections) or lower the Dendrux limit. Do not rely on a disconnect to find out: an oversized statement drops the connection.
+
+Images are not stored in the database, so `ImagePolicy` sizes are not part of this check. Large payloads can also go to a [blob store](/docs/recipes/images#storage).
+
+## Operating notes
+
+- **Connections.** Use a bounded pool per process, as in the [scaling guide](/docs/guides/scaling). Dendrux sets isolation and the time zone per connection, so a proxy must not reset them.
+- **Deployment.** The store declares `deployment="multi_server"`: any number of processes and hosts can share one database.
+- **Lost acknowledgements.** If a connection dies after `COMMIT` and Dendrux cannot prove whether a claim took effect, it raises `StoreOutcomeUnknown`. Do not run the claimed work and do not retry the claim; the lease and `reclaim` recover the run. See [Errors](/docs/reference/errors).
+
+## Test servers for contributors
+
+The repository ships a Docker Compose file with MySQL 8.4 and MariaDB 10.11 for the test suites. They listen on `127.0.0.1:53306` and `127.0.0.1:53307` only.
+
+```bash
+make test-dbs-up
+export DENDRUX_TEST_MYSQL_URL=mysql+asyncmy://root:dendrux_test@127.0.0.1:53306/dendrux_ci_test
+export DENDRUX_TEST_MARIADB_URL=mysql+asyncmy://root:dendrux_test@127.0.0.1:53307/dendrux_ci_test
+make test-mysql
+make test-dbs-down
+```
+
+The database name must end in `_test`; each test makes and drops its own copy. Unset variables skip those tests. See [Load testing](/docs/guides/scaling#load-testing-your-deployment) for `make load-mysql` and `make load-mariadb`.

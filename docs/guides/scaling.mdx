@@ -41,7 +41,7 @@ await reads.close()
 await engine.dispose()
 ```
 
-`SQLAlchemyStateStore` runs the agents; `RunStore.from_engine` supplies the read facade over the same engine. You keep ownership of the engine and dispose it after all work and readers have stopped. Avoid holding a database session while you await an agent run, a tool or a browser.
+The store runs the agents (`PostgresStateStore` here; `MySQLStateStore` or `SQLiteStateStore` the same way, or `store_for_engine(engine)` to pick one from the engine); `RunStore.from_engine` supplies the read facade over the same engine. You keep ownership of the engine and dispose it after all work and readers have stopped. Avoid holding a database session while you await an agent run, a tool or a browser.
 
 Build the engine in the worker process, after any fork, on the event loop that will use it. Async Postgres pools belong to their creating loop; using one from another loop is refused with a clear error. Build one store per worker loop instead of calling `asyncio.run` per request. See also [Web endpoints](/docs/recipes/web-endpoint).
 
@@ -98,6 +98,10 @@ Run `dendrux db migrate` **once per deploy, as a single job**, over a **direct**
 - Do not start abandoned-waiting sweeps until the migration has finished.
 
 For 0.6, migration is additive and leaves format 1 enabled. Roll every worker and read-only consumer, take a pre-activation backup, then run `dendrux db activate` over a direct connection. Only then enable reclaim and notifications. Activation is one-way. See [Upgrading to 0.6.0](/docs/upgrading-to-0.6.0) and the [Database CLI](/docs/reference/cli).
+
+## MySQL and MariaDB
+
+The same rules apply: one store per worker, bounded pools and one migration job. The differences are in [MySQL and MariaDB](/docs/guides/mysql): engines need `READ COMMITTED` and a UTC connection (engines Dendrux creates set both), `dendrux db migrate` is forward-only and holds a server-wide named lock, the Agent's `Limits` are compared with the server's `max_allowed_packet` before first use, and event notifications are Postgres-only, so `follow` polls.
 
 ## Sweep cadence
 
@@ -184,6 +188,25 @@ Read replicas are your deployment choice. Keep claims, tool submissions, cancell
 ## Browser results
 
 `RunResult.to_dict()`, `Agent.get_result()` and `ToolResult.from_dict()` are the allowlisted shapes that cross to a browser. They are described on the [Agent reference](/docs/reference/agent#runresult), and the redaction rules for readers are on the [RunStore reference](/docs/reference/run-store#redacted-views).
+
+## Load testing your deployment
+
+The repository includes a monitored load harness, `tools/load.py`. It builds a private database, runs fake-provider agents across several processes, and records statements per run, timings and resource samples (process memory, descriptors, tasks, pool use and, where the platform allows, database and container counters). It repeats each workload for four cycles and fails if memory, descriptors, tasks or connections keep growing between cycles. Run it on a quiet machine from `packages/python`, with the development dependencies installed.
+
+The harness drops and recreates the tables of the database you give it, so it accepts only private databases whose name ends in `_test`. For MySQL and MariaDB the name must also contain `_load_`, the host must be loopback and the port 53306 or 53307 (the repository's test servers), unless you opt in to another port with `--allow-port`.
+
+```bash
+# Postgres: the 1,000-run scenario on a private database ending in _test
+export DENDRUX_LOAD_PG_URL=postgresql+asyncpg://user:password@localhost:5432/dendrux_load_test
+make load-pg
+
+# MySQL and MariaDB: start the test servers first, and declare your statement ceilings
+make test-dbs-up
+make load-mysql LOAD_STATEMENT_BUDGETS=path/to/budgets.json
+make load-mariadb LOAD_STATEMENT_BUDGETS=path/to/budgets.json
+```
+
+`make load-quick` runs every scenario at small scale and fails on a statement-count regression against `tools/load_baseline.json` (Postgres only); `make load` is the full run. MySQL and MariaDB have no stored baseline, so you declare the ceilings before measuring: `LOAD_STATEMENT_BUDGETS` is a JSON file that maps each gate (for example `runs.statements_per_run`) to a number. A run refuses to start without it. Results are written as JSON to `LOAD_JSON` (default: `dendrux-load-results.json` in your temporary directory) with a compact Markdown table. Workloads that need Postgres NOTIFY are skipped on MySQL and MariaDB, with a note.
 
 ## What we measured
 

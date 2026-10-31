@@ -65,6 +65,22 @@ The store used for the call decides whether strict tenancy applies, even if the 
 | Agent relying only on `DENDRUX_DATABASE_URL` for persistence | Resolved a store from the environment | Runs without persistence; a resulting pause cannot be submitted later; logs `database_url_env_ignored` once per process | Configure `state_store=` or `database_url=` explicitly before starting runs. Merely setting the variable raises no error; the CLI continues to use it. |
 | Resuming a 0.5 run with a cost-only `Budget` and explicit `count_cache_tokens=True` | The stored governance digest included that choice even without a token limit | The choice has no effect on cost-only accounting and no longer changes the digest; the old saved digest mismatches and default `on_governance_change="raise"` raises `GovernanceMismatchError` | Drain these runs before upgrading, or use `on_governance_change="warn"` while they drain. Setting `count_cache_tokens=False` on the new cost-only budget does not restore the old digest. |
 
+## Store classes: `SQLAlchemyStateStore` is removed
+
+SQL persistence is now one base class and three concrete stores, all importable from `dendrux.store`. `SQLAlchemyStateStore` is removed in 0.6.0 with no alias: importing it raises `ImportError` and names the replacements. Applications that only use `Agent(database_url=)`, `RunStore` or the CLI need no change.
+
+| You wrote | Write instead |
+| --- | --- |
+| `from dendrux.runtime.state import SQLAlchemyStateStore` | `from dendrux.store import PostgresStateStore` for PostgreSQL, `SQLiteStateStore` for SQLite or `MySQLStateStore` for MySQL and MariaDB |
+| `SQLAlchemyStateStore(engine)` where the database is not fixed in your code | `store_for_engine(engine)`. It picks the class from the engine's dialect and raises `ValueError` for an unsupported one |
+| `SQLAlchemyStateStore(engine, notify_channel="dendrux_events")` | `PostgresStateStore(engine, notify_channel="dendrux_events")`. Only `PostgresStateStore` accepts `notify_channel` |
+| `class MyStore(SQLAlchemyStateStore)` | Subclass the matching concrete store, or `SQLStateStore` for a new SQLAlchemy dialect ([Build your own store](/docs/guides/build-your-own-store)). Audit every overridden write method against the [capability matrix](/docs/reference/state-store) |
+| `except PersistenceError` | Keep it. `StoreOutcomeUnknown` is a new subclass, raised when a lost commit acknowledgement leaves a claim or reclaim unprovable. Do not run the claimed work and do not treat a later epoch as ownership; the lease and `reclaim` recover the run |
+
+`StoreCapabilities` gains a `deployment` field and the `StateStore` protocol gains `update_run_meta`. A store that declares its capabilities without `deployment` still runs, with a warning: add `"single_process"` for in-memory SQLite, `"single_host"` for a SQLite file shared by processes, or `"multi_server"` for a database server. The field is descriptive and changes no runtime behaviour.
+
+MySQL 8.4 and MariaDB 10.11 are new in 0.6.0 and need no migration from 0.5, since 0.5 never ran on them. See [MySQL and MariaDB](/docs/guides/mysql).
+
 ### Paused runs with a token budget
 
 `count_cache_tokens` affects the governance digest when a budget has `max_tokens`. A run paused under 0.5's default count can raise `GovernanceMismatchError` when resumed under 0.6's cache-inclusive default and default `on_governance_change="raise"`.

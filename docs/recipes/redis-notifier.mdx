@@ -141,7 +141,7 @@ prove that subsequent notifications will arrive.
 
 PostgreSQL NOTIFY is off by default. Enable it on every writer with
 `Agent(database_options={"notify_channel": "dendrux_events"})` or
-`SQLAlchemyStateStore(engine, notify_channel="dendrux_events")`. Readers opt in
+`PostgresStateStore(engine, notify_channel="dendrux_events")`. Readers opt in
 separately with `listen_url=` or a started `notifier=`. A reader's `listen_url=`
 uses `database_options["notify_channel"]` when supplied, otherwise
 `"dendrux_events"`; an explicit `None` with `listen_url=` raises `ValueError`.

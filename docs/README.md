@@ -14,7 +14,9 @@ docs/
 ├── upgrading-to-0.5.0.mdx  → /docs/upgrading-to-0.5.0
 ├── upgrading-to-0.6.0.mdx  → /docs/upgrading-to-0.6.0
 ├── guides/                 → /docs/guides/*
-│   ├── scaling.mdx         (pools, notifier URLs, migrations, leases, bounds)
+│   ├── scaling.mdx         (pools, notifier URLs, migrations, leases, bounds, load testing)
+│   ├── mysql.mdx           (MySQL and MariaDB: driver, URL, schema, collations, packet size)
+│   ├── build-your-own-store.mdx (subclass SQLStateStore and certify it with the test kit)
 │   └── recovery.mdx        (sweep, reclaim, replay and crash approval)
 ├── architecture/           → /docs/architecture/*
 │   ├── runs.mdx, state-persistence.mdx, event-ordering.mdx
