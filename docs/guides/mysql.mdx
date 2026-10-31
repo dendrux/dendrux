@@ -129,7 +129,7 @@ Images are not stored in the database, so `ImagePolicy` sizes are not part of ei
 
 - **Connections.** Use a bounded pool per process, as in the [scaling guide](/docs/guides/scaling). Dendrux sets isolation and the time zone per connection, so a proxy must not reset them.
 - **Deployment.** The store declares `deployment="multi_server"`: any number of processes and hosts can share one database.
-- **Lost acknowledgements.** If a connection dies after `COMMIT` and Dendrux cannot prove whether a claim took effect, it raises `StoreOutcomeUnknown`. Do not run the claimed work and do not retry the claim; the lease and `reclaim` recover the run. A blind retry of a submit call raises `RunNotPausedError` when the first attempt did land, because the run is no longer paused. See [Errors](/docs/reference/errors#when-a-commit-acknowledgement-is-lost).
+- **Lost acknowledgements.** If a connection dies after `COMMIT` and Dendrux cannot prove whether a claim took effect, it raises `StoreOutcomeUnknown`. Do not run the claimed work and do not retry the claim; the lease and `reclaim` recover the run. A blind retry of a submit call raises `RunNotPausedError` once the run is no longer paused; that does not prove your first attempt was the one that claimed it, so never assume ownership. See [Errors](/docs/reference/errors#when-a-commit-acknowledgement-is-lost).
 - **When a write fails.** A write that still fails after the retries makes `agent.run` raise `PersistenceError` (a stream ends with `run_error`); see [Errors](/docs/reference/errors#when-a-write-fails-inside-a-run).
 
 ## Test servers for contributors

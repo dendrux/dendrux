@@ -100,14 +100,16 @@
 - A connection that fails while committing a claim or reclaim now raises
   `StoreOutcomeUnknown` (a `PersistenceError`) instead of inferring ownership from a
   later epoch; do not run the claimed work, and know that a blind retry of the same submit
-  call gets `RunNotPausedError` once the first attempt landed. Other writes retry only
+  call gets `RunNotPausedError` once the run is no longer paused, which does not prove the
+  first attempt claimed it. Other writes retry only
   classified transient failures: up to three retries, waiting 0.1, 0.2 and 0.4 seconds, for
   deadlocks, serialization failures, lock timeouts and connection or availability errors.
   A PostgreSQL statement timeout (`57014`) is not retried, so a long `statement_timeout`
   no longer multiplies the time to fail. Retry-identity writes read their rows back to
   report the true outcome. A write that still fails makes `agent.run` raise
-  `PersistenceError` (a stream ends with `run_error`) and leaves the run at its last
-  committed state for `sweep` and `reclaim`.
+  `PersistenceError` (a stream ends with `run_error`); a failed model-call record does not
+  fail the run. The run is saved as `error` if the database answers again in time, and
+  otherwise stays `running` at its last committed state for `sweep` and `reclaim`.
   `StoreCapabilities` gains `deployment` (descriptive; a declaration without it warns) and
   the `StateStore` protocol gains `update_run_meta`.
 - Publish the store test kit, a pytest plugin that certifies a store against the

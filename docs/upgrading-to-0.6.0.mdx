@@ -95,7 +95,7 @@ Every store write that is safe to repeat is retried when the database fails in a
 | A statement too large for MySQL or MariaDB (`max_allowed_packet`) | **Not retried.** `StatementTooLargeError` after one attempt |
 | A unique violation, a bad value or any other database error | **Not retried.** It fails at once with `PersistenceError` or the more specific error |
 
-A retried transaction is attempted at most three more times after the first try, waiting 0.1, 0.2 and 0.4 seconds between tries. When the last try fails, `agent.run` raises `PersistenceError` with `retryable=True` and a stream ends with `run_error`; the run keeps its last committed state. There is no retry loop around a whole run: your application decides whether to start it again, and `sweep` and `reclaim` recover a run left `running`. Each retry logs `Transient DB failure n/3` with the operation and run id, and no SQL or driver text.
+A retried transaction is attempted at most three more times after the first try, waiting 0.1, 0.2 and 0.4 seconds between tries. When the last try fails, `agent.run` raises `PersistenceError` with `retryable=True` and a stream ends with `run_error`; the run is saved as `error` if the database answers again in time, and otherwise keeps its last committed state. There is no retry loop around a whole run: your application decides whether to start it again, and `sweep` and `reclaim` recover a run left `running`. Each retry logs `Transient DB failure n/3` with the operation and run id, and no SQL or driver text.
 
 ### Paused runs with a token budget
 
