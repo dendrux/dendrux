@@ -47,8 +47,8 @@ The most common ones are also re-exported from the top-level `dendrux` package.
 | `RunAlreadyTerminalError(run_id, current_status)` | `RuntimeError` | A submit method, or `submit_note`, targets a run that is already terminal; also a submit on a run whose cancellation was requested but not yet observed. (`cancel_run` and `request_pause` do not raise this.) | 409 |
 | `InvalidToolResultError(run_id, detail)` | `ValueError` | Submitted tool results do not match the pending set: an unknown, duplicate or missing call id, a tool name that differs from the pending call, a payload that is not valid, finite JSON or text, or an approval-path result that is not a failed denial. `detail` is a fixed description and never echoes a client id or payload. The run stays paused and unclaimed. | 400 |
 | `InputValidationError(field, code)` | `ValueError` | A client value cannot be accepted or stored: `field` names a fixed API field (never an input key or value) and `code` is `invalid_identifier`, `invalid_text` (NUL or a lone surrogate), `invalid_json`, `nonfinite_json`, `structure_limit` or `pause_id_required` (a pause with a stored id continued without `expected_pause_id` when approving or under strict tenancy). Raised before anything is written or claimed. Import it from `dendrux.types`. | 400 |
-| `PersistenceError()` | `RuntimeError` | A database operation failed. SQL, bound parameters and driver text are omitted (`safe_message`, `retryable`). Inside a run it ends the run `error` with `error_info.category == "persistence_error"`. | 500 or 503 |
-| `StoreOutcomeUnknown()` | `PersistenceError` | A connection failed during `COMMIT` and the store cannot prove whether the write happened. `code` is `store_outcome_unknown`. Claims and reclaims always raise it after an ambiguous commit: do not run the claimed work, do not retry the claim, and do not read a later epoch as proof of ownership. The lease and `reclaim` recover the run. Writes that carry a retry identity are read back and report their true outcome instead. | 503 |
+| `PersistenceError()` | `RuntimeError` | A database operation failed. SQL, bound parameters and driver text are omitted (`safe_message`, `retryable`). A write that fails after the retries makes `agent.run` raise it and `agent.stream` end with `run_error`; see [When a write fails inside a run](#when-a-write-fails-inside-a-run). | 500 or 503 |
+| `StoreOutcomeUnknown()` | `PersistenceError` | A connection failed during `COMMIT` and the store cannot prove whether the write happened. `code` is `store_outcome_unknown`. Claims and reclaims always raise it after an ambiguous commit: do not run the claimed work, do not retry the claim, and do not read a later epoch as proof of ownership. The lease and `reclaim` recover the run. Writes that carry a retry identity are read back and report their true outcome instead. A blind retry of the same submit call gets `RunNotPausedError` when the first attempt did land. See [When a commit acknowledgement is lost](#when-a-commit-acknowledgement-is-lost). | 503 |
 | `StatementTooLargeError(limit=None, size=None)` | `PersistenceError` | MySQL or MariaDB answered a statement with its packet-too-large error (1153, or 1301 for an oversized function result). `code` is `statement_too_large`; `limit` is the server's `max_allowed_packet` in bytes when known; `size` is best effort and usually `None`; no value is in the message. Not retried, nothing persisted. Servers often close the connection instead of answering, and that surfaces as a plain `PersistenceError` (or `StoreOutcomeUnknown`). Shrink the payload or raise the server limit. See [MySQL and MariaDB](/docs/guides/mysql#payload-limits-and-max_allowed_packet). | 413 or 500 |
 | `FollowCapacityError(limit, per_tenant=False)` | `RuntimeError` | `RunStore.follow` has no free follower slot: the store cap, or (`per_tenant=True`) the cap for that tenant scope. Safe to retry shortly. See [Build your own read routes](/docs/recipes/build-your-own-read-routes). | 503 |
 | `PersistenceNotConfiguredError()` | `RuntimeError` | A method needs persistence but no `database_url` / `state_store` is configured (the Agent ignores `DENDRUX_DATABASE_URL`; without a store its presence logs `database_url_env_ignored` once per process). | 500 |
@@ -83,7 +83,7 @@ A few related exceptions live on the package root rather than `dendrux.errors`:
 | Exception | Raised when |
 | --- | --- |
 | `RunAlreadyActiveError` | An idempotent create finds an already-active run. |
-| `IdempotencyConflictError(run_id, idempotency_key)` | An `idempotency_key` collides with a different request fingerprint within the same tenant. On a SQLite file created before 0.5.0 it can also be raised when another tenant already uses the key; `run_id` is then `None`, so nothing about the other tenant leaks. |
+| `IdempotencyConflictError(run_id, idempotency_key)` | Import it with `from dendrux import IdempotencyConflictError` (it is not in `dendrux.errors` and no longer in `dendrux.runtime.state`). An `idempotency_key` collides with a different request fingerprint within the same tenant. On a SQLite file created before 0.5.0 it can also be raised when another tenant already uses the key; `run_id` is then `None`, so nothing about the other tenant leaks. |
 | `StructuredOutputValidationError(raw_response, output_type_name, validation_error, *, usage=None, model=None, stop_reason=None)` | A SingleCall `output_type` fails validation. Carries `err.raw_response`, `err.output_type_name`, `err.validation_error` and, for the call that produced the invalid output, `err.usage` (`UsageStats`, priced when you set a `PriceTable`), `err.model` and `err.stop_reason`; each is `None` when unknown. `stop_reason == "max_tokens"` means the JSON was cut off. That call is recorded and priced even though the run fails. See [Structured output](/docs/architecture/loops#when-validation-fails). |
 | `DelegationDepthExceededError` | A sub-agent exceeds `max_delegation_depth`. |
 
@@ -108,6 +108,27 @@ The 0.3.0 methods reuse the hierarchy above. These are the cases worth knowing:
 | `Agent(before_tool=...)` with `SingleCall` | `ValueError` at construction. |
 | `run`, `stream` or any entry point with `tenant_id=""`, metadata keys starting with `dendrux.`, or input or metadata over the `Limits` caps | `ValueError` before anything is written. |
 | A delegated run with a `tenant_id` different from its parent's | `ValueError` before the child run is created. |
+
+## When a write fails inside a run
+
+Dendrux writes a run's state as it goes: the run row, its events, traces, tool calls and usage. If one of those writes fails, it is retried where that is safe (see [Database retries](/docs/upgrading-to-0.6.0#database-retries)). A write that still fails after the retries ends the call like this:
+
+- `agent.run` **raises `PersistenceError`**. It does not return a `RunResult` with `error_info`. Catch it in your route and answer 503; `retryable` says whether trying again may help.
+- `agent.stream` does not raise. It ends with a `run_error` event whose `error` is the fixed message `Database operation failed (persistence_error).`
+
+What the failed call leaves behind depends on when it failed. If the run could not be created, no run exists. If it was already created, it stays `running` at its last committed state: every event and row written before the failure is still there, and nothing marks it `error`. Find it with `sweep` and move it on with `reclaim` (or finish it with `on_stale="error"`); see [Recovery](/docs/guides/recovery).
+
+## When a commit acknowledgement is lost
+
+`StoreOutcomeUnknown` means the connection broke during `COMMIT`, so the write may or may not have landed. Treat it by operation:
+
+| Call | What to do |
+| --- | --- |
+| `submit_tool_results`, `submit_input`, `submit_approval`, `resume` and other calls that claim a paused run | Do not run the claimed work and do not repeat the call straight away. The run is either still paused (the claim did not land) or claimed by this attempt (it landed). A repeat gets `RunNotPausedError` when the claim landed, because the run is no longer paused. That error means the first attempt won; it is not a new failure. Let the lease expire and let `sweep` and `reclaim` continue the run |
+| `reclaim` | Do not retry the claim. The lease and the next `sweep` recover the run |
+| Writes with a retry identity (traces, tool calls, events, usage, completions) | You do not see this error for them: they read their rows back and report the real outcome |
+
+The message of `StoreOutcomeUnknown` is short and carries no database text. Use `err.code == "store_outcome_unknown"` in code and the `store_outcome_unknown` log line, which has the run id, for diagnosis.
 
 ## Provider errors
 

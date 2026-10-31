@@ -17,9 +17,11 @@ pip install "dendrux[mysql]"
 
 The extra installs the `asyncmy` driver and `cryptography`. MySQL 8.4 logs users in with `caching_sha2_password` by default, and `asyncmy` needs `cryptography` for that login on a first connection and after a server restart. Without it, a correct password can fail with a message that `cryptography` is required. The extra is opt-in and is not part of `dendrux[all]`.
 
-The URL form is `mysql+asyncmy://user:password@host:3306/database`. `mysql://`, `mysql+aiomysql://` and the `mariadb` spellings are accepted and use `asyncmy`. The connected server decides whether it is MySQL or MariaDB.
+The URL form is `mysql+asyncmy://user:password@host:3306/database`. `mysql://`, `mysql+aiomysql://` and the `mariadb` spellings (`mariadb://`, `mariadb+asyncmy://`) are accepted and use `asyncmy`. The connected server decides whether it is MySQL or MariaDB. An engine you create yourself with a `mariadb+asyncmy://` URL works with `MySQLStateStore(engine)`, `store_for_engine(engine)` and `RunStore.from_engine(engine)` as well as one with a `mysql+asyncmy://` URL.
 
-For a database URL, Dendrux creates the engine and sets what it needs. You pass no extra options:
+If `asyncmy` or `cryptography` is missing, the store stops with an error that names `dendrux[mysql]`.
+
+For a database URL, Dendrux creates the engine and sets what it needs. You pass no extra options. The examples use the OpenAI provider, so they also need `pip install "dendrux[openai]"` and an `OPENAI_API_KEY`; any provider works the same way.
 
 [//]: # "docs-test: skip - needs a running MySQL or MariaDB server"
 
@@ -59,7 +61,22 @@ reads = RunStore.from_engine(engine)
 agent = Agent(name="worker", prompt="Help the user.", provider="openai:gpt-4o-mini", state_store=state)
 ```
 
-On first use the store checks the server and refuses to run if the engine is not `READ COMMITTED`, if any Dendrux table is not InnoDB, or if the server is older than MySQL 8.4 / MariaDB 10.11. It does this once per store.
+### What the store requires and checks
+
+On first use the store reads the server's settings once per store and refuses to run, with an error that names the setting but never a value, unless all of these hold:
+
+| Requirement | Why |
+| --- | --- |
+| The server is MySQL 8.4 or newer, or MariaDB 10.11 or newer | Older servers lack features the store relies on |
+| Isolation is `READ COMMITTED` | Claims and fencing are written for it. Another level can let two workers win the same claim |
+| Autocommit is off | Each write must be one transaction. An `AUTOCOMMIT` engine (`isolation_level="AUTOCOMMIT"` in the engine or in `execution_options`) commits every statement on its own, which breaks the one-winner rule for claims. It is refused before any claim, and so is any `execution_options` isolation level other than `READ COMMITTED` |
+| `sql_mode` is strict (`STRICT_TRANS_TABLES` or `STRICT_ALL_TABLES`) | In a non-strict mode the server silently truncates a value that is too long instead of refusing it |
+| The client, connection and result character sets are `utf8mb4` | Another character set cannot store every text Dendrux persists. A driver that fails to encode a value is reported as a `PersistenceError` without the value |
+| Every Dendrux table uses InnoDB | Row locks and transactions |
+
+The time zone is not checked. Dendrux writes UTC timestamps itself, and sets `SET time_zone='+00:00'` on engines it creates; set it on your own engine as shown above so that server-side defaults agree.
+
+Metadata filters and JSON reads behave the same on all four databases: a filter value matches only a value of the same JSON type (`1` does not match `true`, and a scalar does not match an array that contains it), and `None` does not match a missing key. A number outside the range of a 64-bit integer is refused by the MySQL store before it is written, because MySQL stores such a number as an approximate decimal; MariaDB and PostgreSQL keep it exactly.
 
 ## Create the schema
 
@@ -71,11 +88,11 @@ dendrux db migrate
 dendrux db check
 ```
 
-`dendrux db migrate` builds the schema in 37 resumable steps. If a step fails or the process stops, run it again: it continues where it stopped and refuses anything it does not recognise. Then `dendrux db status` and `dendrux db activate` work as described in [Database CLI](/docs/reference/cli).
+`dendrux db migrate` builds the schema in 37 resumable steps. If a step fails or the process stops, run it again: it continues where it stopped and refuses anything it does not recognise. **A fresh MySQL or MariaDB database is already at storage format 2**: after `migrate`, `dendrux db status` shows `storage_format=2 activate_step=done`, and there is no activation step. Then `dendrux db status` works as described in [Database CLI](/docs/reference/cli).
 
 - **Forward-only.** MySQL cannot roll DDL back with a transaction, so there is no downgrade. Take a backup before every migration or activation.
 - **One at a time.** Maintenance commands (`migrate`, `activate`, `dedupe`) hold a named server lock (`GET_LOCK`) for the whole database, on a dedicated connection. A second one waits, then gives up. Individual DDL statements wait at most five seconds for a table lock.
-- **`--sql` is not available.** Offline SQL output needs a live connection on these servers, so it is refused.
+- **No offline SQL.** The CLI always works against the live database named by `DENDRUX_DATABASE_URL`; it cannot print a migration script for you to run elsewhere.
 
 ## A dedicated or a shared database
 
@@ -104,7 +121,7 @@ The default limits need about 12.8 MiB, so they fit both servers' defaults. The 
 
 **The server's own limit is the final guard.** If the server answers a statement with its packet-too-large error (1153, or 1301 for an oversized function result), the store raises `StatementTooLargeError`, a `PersistenceError` with `code == "statement_too_large"`. The write is not retried and nothing is persisted. The error carries the server's `limit`; its `size` is usually `None`, because the server does not report it. The message never contains a value, and a `store_statement_limit` line is logged.
 
-> **The server usually does not answer.** In tests against MySQL 8.4 and MariaDB 10.11 with the `asyncmy` driver, an oversized statement was never answered with 1153: the server closes the connection while the driver is still sending, and the driver reports a lost connection (2006 or 2013). The write then fails safe through the ordinary persistence path: a plain `PersistenceError`, or `StoreOutcomeUnknown` for a write with no retry identity (such as creating a run without an idempotency key). Nothing is persisted, there is no retry loop, and the next write works. If you see these errors on large payloads, check `max_allowed_packet` first.
+> **The server usually closes the connection instead of answering.** In tests against MySQL 8.4 and MariaDB 10.11 with the `asyncmy` driver, an oversized statement was never answered with 1153: the server closes the connection while the driver is still sending, and the driver reports a lost connection (2006 or 2013). Dendrux therefore decides on the failure path only, at no cost to a write that succeeds: when a MySQL-family connection is lost and any value bound to the failed statement is larger than the store's `max_allowed_packet`, the store raises `StatementTooLargeError` (`code == "statement_too_large"`) after **one** attempt. It is not retried, nothing is persisted, and the next write works. A lost connection with no oversized value is an ordinary transient failure and follows the [retry rules](/docs/upgrading-to-0.6.0#database-retries). If you see these errors on large payloads, check `max_allowed_packet` first.
 
 Images are not stored in the database, so `ImagePolicy` sizes are not part of either check. Large payloads can also go to a [blob store](/docs/recipes/images#storage).
 
@@ -112,13 +129,17 @@ Images are not stored in the database, so `ImagePolicy` sizes are not part of ei
 
 - **Connections.** Use a bounded pool per process, as in the [scaling guide](/docs/guides/scaling). Dendrux sets isolation and the time zone per connection, so a proxy must not reset them.
 - **Deployment.** The store declares `deployment="multi_server"`: any number of processes and hosts can share one database.
-- **Lost acknowledgements.** If a connection dies after `COMMIT` and Dendrux cannot prove whether a claim took effect, it raises `StoreOutcomeUnknown`. Do not run the claimed work and do not retry the claim; the lease and `reclaim` recover the run. See [Errors](/docs/reference/errors).
+- **Lost acknowledgements.** If a connection dies after `COMMIT` and Dendrux cannot prove whether a claim took effect, it raises `StoreOutcomeUnknown`. Do not run the claimed work and do not retry the claim; the lease and `reclaim` recover the run. A blind retry of a submit call raises `RunNotPausedError` when the first attempt did land, because the run is no longer paused. See [Errors](/docs/reference/errors#when-a-commit-acknowledgement-is-lost).
+- **When a write fails.** A write that still fails after the retries makes `agent.run` raise `PersistenceError` (a stream ends with `run_error`); see [Errors](/docs/reference/errors#when-a-write-fails-inside-a-run).
 
 ## Test servers for contributors
 
 The repository ships a Docker Compose file with MySQL 8.4 and MariaDB 10.11 for the test suites. They listen on `127.0.0.1:53306` and `127.0.0.1:53307` only.
 
+Run these from `packages/python` in a repository checkout (the Makefile that has the targets lives there):
+
 ```bash
+cd packages/python
 make test-dbs-up
 export DENDRUX_TEST_MYSQL_URL=mysql+asyncmy://root:dendrux_test@127.0.0.1:53306/dendrux_ci_test
 export DENDRUX_TEST_MARIADB_URL=mysql+asyncmy://root:dendrux_test@127.0.0.1:53307/dendrux_ci_test

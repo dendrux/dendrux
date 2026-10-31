@@ -14,6 +14,8 @@ from dendrux.store import (
 )
 ```
 
+The types the `SQLStateStore` dialect hooks take and return are public too, so a store for another database needs no private import: `ConflictSpec`, `InsertPlan`, `SelectSource`, `ValuesSource`, `SetFields`, `AppendArray`, `PatchLoopState`, `JsonPatch`, `JsonPath`, `JsonReadType`, `JsonValue`, `ScalarKey`, `OrderedAssignments`, `RunLockScope`, `RunParentCursor`, `DialectFacts`, `DbError` and `DbErrorKind`. See [Build your own store](/docs/guides/build-your-own-store).
+
 Construct a store once per worker event loop and pass it as `Agent(state_store=state)`. The application owns the engine. See [Scaling workers](/docs/guides/scaling).
 
 ## Built-in stores
@@ -24,7 +26,7 @@ Construct a store once per worker event loop and pass it as `Agent(state_store=s
 | `SQLiteStateStore(engine)` | SQLite with `aiosqlite` | `single_process` for an in-memory database, `single_host` for a file | Does not create tables itself. `Agent(database_url=)`, `RunStore.from_database_url` and `dendrux.db.session.get_engine(url)` create them for you; with an engine you built yourself, get it from `get_engine(url)` instead, or the store raises `PersistenceError` on first use. |
 | `MySQLStateStore(engine)` | MySQL 8.4 or MariaDB 10.11 with `asyncmy` | `multi_server` | The engine must use `READ COMMITTED` and UTC. See [MySQL and MariaDB](/docs/guides/mysql). |
 
-`store_for_engine(engine, **options)` picks the class from the engine's dialect name (`postgresql`, `sqlite` or `mysql`) and raises `ValueError` for any other dialect. `Agent(database_url=)`, `RunStore.from_database_url`, `RunStore.from_engine`, the CLI and `sweep` all go through it, so no call site names a concrete class. To support another SQLAlchemy database, see [Build your own store](/docs/guides/build-your-own-store).
+`store_for_engine(engine, **options)` picks the class from the engine's dialect name (`postgresql`, `sqlite`, `mysql`, or `mariadb` for a `mariadb+asyncmy` engine) and raises `ValueError`, naming the dialect it was given, for any other. It always returns one of the built-in classes; to use a store of your own, pass it to `Agent(state_store=...)` and `RunStore(store)` directly. `Agent(database_url=)`, `RunStore.from_database_url`, `RunStore.from_engine`, the CLI and `sweep` all go through it, so no call site names a concrete class. To support another SQLAlchemy database, see [Build your own store](/docs/guides/build-your-own-store).
 
 ## Capability matrix
 
@@ -51,7 +53,7 @@ A store with an explicit capability declaration but no `deployment` still runs, 
 
 The table lists the added requirements, not full method signatures. Implement the protocol in `dendrux.runtime.state`; do not copy a shortened table entry as a method definition. Signature validation requires the named keyword-only parameters. A forwarding subclass override should preserve those named parameters and pass them through; do not rely on a bare `**kwargs` declaration satisfying validation.
 
-The built-in SQL stores declare the first five capabilities. The Postgres notification hook is enabled separately with `notify_channel=` and defaults to off; advertising `notify=True` does not turn on Postgres NOTIFY, and the MySQL store declares `notify=False`.
+The built-in SQL stores declare the first five capabilities. The Postgres notification hook is enabled separately with `notify_channel=` and defaults to off; advertising `notify=True` does not turn on Postgres NOTIFY, and the MySQL and SQLite stores declare `notify=False`. The base class `SQLStateStore` declares `notify=True` with a hook that does nothing, so a subclass must set `notify=False` unless it implements `_after_event_insert`; the [test kit](/docs/guides/build-your-own-store#declare-what-you-promise) refuses a store that declares it without the hook.
 
 ## Optional: statement capacity
 
