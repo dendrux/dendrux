@@ -17,6 +17,7 @@ from dendrux.testing.store_kit._declaration import (
     REOPEN,
     SECOND_INSTANCE,
     Declaration,
+    required_fixtures_for,
 )
 from dendrux.testing.store_kit._kit import (
     MARKER,
@@ -59,13 +60,38 @@ _FIXTURE_FOR = {
 @dataclass
 class _StoreReport:
     deployment: str | None = None
+    declared: tuple[str, ...] = ()
+    provided: frozenset[str] = frozenset()
     results: dict[str, Counter[str]] = field(default_factory=dict)
+    seen: dict[str, set[str]] = field(default_factory=dict)  # category -> contract functions run
     notes: list[str] = field(default_factory=list)
 
 
 @dataclass
 class _Report:
     stores: dict[str, _StoreReport] = field(default_factory=dict)
+    deselected: set[str] = field(default_factory=set)  # categories with a deselected contract
+
+
+def contract_inventory() -> dict[str, set[str]]:
+    """Every contract function the package ships, by report category."""
+    import importlib
+    import pkgutil
+
+    from dendrux.testing.store_kit import contracts
+
+    found: dict[str, set[str]] = {}
+    for info in pkgutil.iter_modules(contracts.__path__):
+        if not info.name.startswith("test_"):
+            continue
+        module = importlib.import_module(f"{contracts.__name__}.{info.name}")
+        for name, function in vars(module).items():
+            if not name.startswith("test_"):
+                continue
+            for mark in getattr(function, "pytestmark", []):
+                if mark.name == MARKER:
+                    found.setdefault(str(mark.args[0]), set()).add(name)
+    return found
 
 
 # ---------------------------------------------------------------------------
@@ -141,7 +167,17 @@ async def dendrux_kit(request: pytest.FixtureRequest, dendrux_kit_provided: dict
     store = await maybe_await(factory())
     declaration = Declaration.of(store)
     props = request.node.user_properties
-    props.append((USER_PROPERTY_STORE, (declaration.label(), declaration.deployment)))
+    props.append(
+        (
+            USER_PROPERTY_STORE,
+            (
+                declaration.label(),
+                declaration.deployment,
+                declaration.declared,
+                tuple(sorted(dendrux_kit_provided)),
+            ),
+        )
+    )
     props.append((USER_PROPERTY_CATEGORY, category))
     check_declaration(store, declaration)
     for capability in needs:
@@ -192,11 +228,21 @@ def pytest_runtest_makereport(
     return report
 
 
+def _function_name(nodeid: str) -> str:
+    return nodeid.split("::")[-1].split("[")[0]
+
+
 class _Reporter:
     """Tallies kit results per store; one instance per pytest session (and per xdist side)."""
 
     def __init__(self) -> None:
         self.report = _Report()
+
+    def pytest_deselected(self, items: list[pytest.Item]) -> None:
+        for item in items:
+            marker = item.get_closest_marker(MARKER)
+            if marker is not None:
+                self.report.deselected.add(str(marker.args[0]))
 
     def pytest_runtest_logreport(self, report: pytest.TestReport) -> None:
         props: dict[str, Any] = dict(report.user_properties)
@@ -204,27 +250,55 @@ class _Reporter:
             return
         if report.when == "setup" and report.passed:
             return  # the call phase reports the outcome
-        label, deployment = props[USER_PROPERTY_STORE]
+        label, deployment, declared, provided = props[USER_PROPERTY_STORE]
         category: str = props[USER_PROPERTY_CATEGORY]
         entry = self.report.stores.setdefault(label, _StoreReport())
-        entry.deployment = deployment
+        entry.deployment, entry.declared, entry.provided = deployment, declared, frozenset(provided)
         outcome = "skipped" if report.skipped else ("passed" if report.passed else "failed")
         entry.results.setdefault(category, Counter())[outcome] += 1
-        if report.skipped and FAULT_INJECTOR in str(report.longrepr):
-            entry.notes.append(f"crash recovery: not certified (no {FAULT_INJECTOR} fixture)")
+        entry.seen.setdefault(category, set()).add(_function_name(report.nodeid))
+        if report.skipped:
+            reason = str(report.longrepr)
+            if FAULT_INJECTOR in reason:
+                entry.notes.append(f"crash recovery: not certified (no {FAULT_INJECTOR} fixture)")
+            elif "unverified:" in reason:
+                entry.notes.append("unverified:" + reason.split("unverified:", 1)[1].strip(" ')\""))
 
     def pytest_terminal_summary(self, terminalreporter: Any) -> None:
         _write_summary(terminalreporter, self.report)
 
 
+def _problems(entry: _StoreReport, report: _Report, inventory: dict[str, set[str]]) -> list[str]:
+    """Reasons this store is not certified, beyond failing contracts."""
+    problems = []
+    missing = [
+        f"{name} ({why})"
+        for name, why in required_fixtures_for(entry.declared, entry.deployment).items()
+        if name not in entry.provided
+    ]
+    if missing:
+        problems.append("declared, but the fixture is missing: " + "; ".join(missing))
+    if entry.deployment is None:
+        problems.append("deployment is not declared")
+    incomplete = [
+        category
+        for category in CATEGORIES
+        if category in inventory
+        and (category in report.deselected or inventory[category] - entry.seen.get(category, set()))
+    ]
+    if incomplete:
+        problems.append("incomplete run, not every contract ran: " + ", ".join(incomplete))
+    return problems
+
+
 def _write_summary(terminalreporter: Any, report: _Report) -> None:
     if not report.stores:
         return
+    inventory = contract_inventory()
     terminalreporter.section("dendrux store kit: certification summary")
     for label, entry in sorted(report.stores.items()):
         terminalreporter.write_line(label)
         failed = 0
-        certified = []
         for category in CATEGORIES:
             counts = entry.results.get(category)
             if not counts:
@@ -234,15 +308,16 @@ def _write_summary(terminalreporter: Any, report: _Report) -> None:
                 f"{counts[k]} {k}" for k in ("passed", "failed", "skipped") if counts[k]
             )
             terminalreporter.write_line(f"  {category:<18} {line}")
-            if counts["passed"] and not counts["failed"]:
-                certified.append(category)
-        for note in dict.fromkeys(entry.notes):
+        problems = _problems(entry, report, inventory)
+        notes = list(dict.fromkeys(entry.notes))
+        for note in notes:
             terminalreporter.write_line(f"  {note}")
-        if entry.deployment is None:
-            failed += 1
+        if failed or problems:
+            reasons = ([f"{failed} failing contract(s)"] if failed else []) + problems
             terminalreporter.write_line(
-                "  deployment is not declared: this store cannot be certified"
+                "  NOT CERTIFIED: " + " | ".join(reasons), bold=True, red=True
             )
-        verdict = "NOT CERTIFIED" if failed else "CERTIFIED"
-        detail = f"{failed} failing contract(s)" if failed else ", ".join(certified)
-        terminalreporter.write_line(f"  {verdict}: {detail}", bold=True, red=bool(failed))
+        else:
+            caveat = f" ({'; '.join(notes)})" if notes else ""
+            ran = [c for c in CATEGORIES if entry.results.get(c, Counter())["passed"]]
+            terminalreporter.write_line(f"  CERTIFIED: {', '.join(ran)}{caveat}", bold=True)

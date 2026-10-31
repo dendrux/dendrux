@@ -111,7 +111,7 @@ def test_a_complete_declaration_passes_and_prints_a_summary(pytester: pytest.Pyt
     result = kit(pytester, BASE, "", CLOCK, REOPEN, k="test_declared or test_deployment")
     result.assert_outcomes(passed=3)
     result.stdout.fnmatch_lines(
-        ["*dendrux store kit: certification summary*", "*declaration*3 passed*", "*CERTIFIED*"]
+        ["*dendrux store kit: certification summary*", "*declaration*3 passed*"]
     )
 
 
@@ -178,3 +178,25 @@ def test_the_flag_and_the_ini_option_activate_a_plugin_that_was_only_loaded(
         "-p", "no:randomly", "-p", "no:cacheprovider", "--no-cov", "--collect-only", "-q", *how
     )  # fmt: skip
     assert "test_deployment_is_declared" in result.stdout.str()
+
+
+def test_a_partial_run_is_never_certified(pytester: pytest.Pytester) -> None:
+    """One selected basic test passes, but declared recovery has no reopen/clock fixture."""
+    result = kit(pytester, BASE, k="test_create_run_round_trips_what_it_was_given")
+    result.assert_outcomes(passed=1)
+    text = result.stdout.str()
+    assert "NOT CERTIFIED" in text, text[-800:]
+    assert "incomplete run" in text
+    assert "dendrux_store_reopen" in text and "dendrux_clock" in text
+    assert "CERTIFIED: basic" not in text
+
+
+def test_a_complete_enough_selection_still_names_what_was_not_run(
+    pytester: pytest.Pytester,
+) -> None:
+    result = kit(
+        pytester, BASE, "", CLOCK, REOPEN, k="test_create_run_round_trips_what_it_was_given"
+    )
+    text = result.stdout.str()
+    assert "NOT CERTIFIED" in text and "incomplete run" in text
+    assert "dendrux_store_reopen" not in text.split("NOT CERTIFIED")[1]

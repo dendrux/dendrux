@@ -20,10 +20,10 @@ def test_the_reference_fixtures_certify_sqlite_without_any_author_code(
         "-p", "dendrux.testing.store_kit", "-p", "dendrux.testing.store_kit.sqlite_fixtures",
         "-p", "no:randomly", "-p", "no:cacheprovider", "--no-cov",
         "-o", "asyncio_mode=auto", "-o", "asyncio_default_fixture_loop_scope=function",
-        "-k", "declared or create_run_round_trips or claims_have_exactly_one_winner",
     )  # fmt: skip
     outcomes = result.parseoutcomes()
-    assert outcomes.get("failed", 0) == 0 and outcomes.get("passed", 0) >= 4
-    result.stdout.fnmatch_lines(["*dendrux store kit: certification summary*", "*CERTIFIED*"])
+    assert outcomes.get("failed", 0) == 0 and outcomes.get("passed", 0) >= 100
+    text = result.stdout.str()
+    assert "NOT CERTIFIED" not in text and "  CERTIFIED: declaration, basic" in text
     expected = "single_host" if mode == "file" else "single_process"
     result.stdout.fnmatch_lines([f"*deployment={expected}*"])

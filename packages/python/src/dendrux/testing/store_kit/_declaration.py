@@ -29,6 +29,17 @@ CLOCK = "dendrux_clock"
 FAULT_INJECTOR = "dendrux_fault_injector"
 
 
+def required_fixtures_for(declared: tuple[str, ...], deployment: str | None) -> dict[str, str]:
+    """Author fixtures obliged by declared capabilities and a deployment, with the reason."""
+    needed = {FACTORY: "every store"}
+    if "recovery" in declared:
+        needed[REOPEN] = "recovery is declared"
+        needed[CLOCK] = "recovery (leases) is declared"
+    if deployment in ("single_host", "multi_server"):
+        needed[SECOND_INSTANCE] = f"deployment is {deployment}"
+    return needed
+
+
 @dataclass(frozen=True)
 class Declaration:
     """A store's declared capabilities and deployment, read once."""
@@ -63,13 +74,7 @@ class Declaration:
 
     def required_fixtures(self) -> dict[str, str]:
         """Author fixtures this declaration obliges, each with the reason."""
-        needed = {FACTORY: "every store"}
-        if self.has("recovery"):
-            needed[REOPEN] = "recovery is declared"
-            needed[CLOCK] = "recovery (leases) is declared"
-        if self.needs_second_instance:
-            needed[SECOND_INSTANCE] = f"deployment is {self.deployment}"
-        return needed
+        return required_fixtures_for(self.declared, self.deployment)
 
     def label(self) -> str:
         flags = ",".join(self.declared) or "none"
