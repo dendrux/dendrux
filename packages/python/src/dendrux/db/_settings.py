@@ -6,12 +6,19 @@ from typing import TYPE_CHECKING
 
 from sqlalchemy import text
 
+from dendrux.db._dialects import is_mysql_family
+
 if TYPE_CHECKING:
     from sqlalchemy import Connection
 
 
 def put_setting(conn: Connection, key: str, value: str, *, overwrite: bool = True) -> None:
     """Write a setting without committing the caller's transaction."""
+    if is_mysql_family(conn.dialect):
+        from dendrux.db._dialects.mysql import put_setting as put_mysql_setting
+
+        put_mysql_setting(conn, key, value, overwrite=overwrite)
+        return
     action = (
         "DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at"
         if overwrite
