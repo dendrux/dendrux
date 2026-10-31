@@ -26,3 +26,10 @@ def test_httpx_is_a_base_dependency() -> None:
     assert any(dep.replace(" ", "").lower().startswith("httpx") for dep in base_deps), (
         f"httpx must be a base dependency; found base deps: {base_deps}"
     )
+
+
+def test_mysql_extra_installs_the_driver_and_the_package_mysql_8_logins_need() -> None:
+    """MySQL 8.4's default login (caching_sha2_password) needs `cryptography` in asyncmy."""
+    extra = _pyproject()["project"]["optional-dependencies"]["mysql"]
+    names = {dep.replace(" ", "").lower().split(">")[0].split("=")[0] for dep in extra}
+    assert {"asyncmy", "cryptography"} <= names, extra

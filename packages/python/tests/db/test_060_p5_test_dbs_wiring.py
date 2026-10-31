@@ -66,6 +66,6 @@ def test_extras_publish_the_driver_and_the_test_kit_dependencies() -> None:
     extras = tomllib.loads((PACKAGE / "pyproject.toml").read_text())["project"][
         "optional-dependencies"
     ]
-    assert extras["mysql"] == ["asyncmy>=0.2.10"]
+    assert extras["mysql"] == ["asyncmy>=0.2.10", "cryptography>=42"]
     names = sorted(requirement.split(">")[0].split("=")[0] for requirement in extras["testkit"])
     assert names == ["pytest", "pytest-asyncio"]

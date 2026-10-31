@@ -15,7 +15,7 @@ Dendrux stores every run in your database. MySQL 8.4 and MariaDB 10.11 (and newe
 pip install "dendrux[mysql]"
 ```
 
-The extra installs the `asyncmy` driver. It is opt-in and is not part of `dendrux[all]`.
+The extra installs the `asyncmy` driver and `cryptography`. MySQL 8.4 logs users in with `caching_sha2_password` by default, and `asyncmy` needs `cryptography` for that login on a first connection and after a server restart. Without it, a correct password can fail with a message that `cryptography` is required. The extra is opt-in and is not part of `dendrux[all]`.
 
 The URL form is `mysql+asyncmy://user:password@host:3306/database`. `mysql://`, `mysql+aiomysql://` and the `mariadb` spellings are accepted and use `asyncmy`. The connected server decides whether it is MySQL or MariaDB.
 
