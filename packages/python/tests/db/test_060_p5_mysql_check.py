@@ -192,3 +192,32 @@ async def test_settings_upsert_and_insert_if_absent(mysql_url: str) -> None:
         assert rows["storage_format"] == "2"
     finally:
         await engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("index", "table", "column"),
+    [
+        # Sorted before the real owner: the real index would overwrite it in a name-keyed map.
+        ("uq_run_events_run_seq", "react_traces", "role"),
+        # Sorted after the real owner.
+        ("ix_run_events_event_type", "run_inbox", "run_id"),
+    ],
+)
+async def test_same_named_unique_index_on_another_table_is_reported(
+    mysql_url: str, index: str, table: str, column: str
+) -> None:
+    """MySQL index names are per table: one table's index cannot stand in for another's."""
+    from dendrux.db._dialects import mysql
+
+    engine = await _create_all(mysql_url)
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(text(f"CREATE UNIQUE INDEX {index} ON {table} ({column}, id)"))
+        problems = await _problems(engine)
+        assert f"{table}.{index} (unexpected unique index)" in problems, problems
+        assert not any(p.startswith(f"run_events.{index}") for p in problems), problems
+        async with engine.connect() as conn:
+            valid, existing = await conn.run_sync(mysql.index_names)
+        assert index in valid  # the real run_events index still matches
+    finally:
+        await engine.dispose()

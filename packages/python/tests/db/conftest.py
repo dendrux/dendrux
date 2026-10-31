@@ -72,9 +72,47 @@ async def _admin(url: URL, statement: str) -> None:
     engine = create_async_engine(url._replace(database=None), poolclass=NullPool)
     try:
         async with engine.connect() as conn:
+            await conn.execute(text("SET SESSION lock_wait_timeout = 10"))
+            if statement.startswith("DROP DATABASE"):
+                # Never hang teardown on a session a failing test leaked: end the sessions
+                # still attached to this private test database first.
+                leaked = (
+                    await conn.execute(
+                        text(
+                            "SELECT id FROM information_schema.processlist "
+                            "WHERE db = :name AND id <> CONNECTION_ID()"
+                        ),
+                        {"name": url.database},
+                    )
+                ).scalars()
+                for session in list(leaked):
+                    await conn.execute(text(f"KILL {int(session)}"))
             await conn.execute(text(statement))
     finally:
         await engine.dispose()
+
+
+def sessions_left(url: str) -> int:
+    """Other sessions still attached to this test database (leaked connections)."""
+
+    async def go() -> int:
+        engine = create_async_engine(url, poolclass=NullPool)
+        try:
+            async with engine.connect() as conn:
+                return int(
+                    (
+                        await conn.execute(
+                            text(
+                                "SELECT COUNT(*) FROM information_schema.processlist "
+                                "WHERE db = DATABASE() AND id <> CONNECTION_ID()"
+                            )
+                        )
+                    ).scalar_one()
+                )
+        finally:
+            await engine.dispose()
+
+    return int(run_sync(go()))
 
 
 def fresh_database_url(base: URL) -> URL:

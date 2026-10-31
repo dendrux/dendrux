@@ -84,9 +84,7 @@ def _run_mysql(connection):  # noqa: ANN001
             "On MySQL/MariaDB Dendrux migrates only up to head (`dendrux db migrate`); "
             "restore a backup to go back."
         )
-    upgradeable = {
-        rev.revision for rev in script.iterate_revisions(head, mysql.MYSQL_BASELINE_REVISION)
-    } - {head}
+    upgradeable = mysql.upgradeable_revisions(script, head)
     mysql.migrate(
         connection,
         head=head,

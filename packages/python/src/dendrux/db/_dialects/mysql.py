@@ -197,7 +197,8 @@ class TableShape:
 @dataclass
 class Catalog:
     tables: dict[str, TableShape]
-    indexes: dict[str, IndexShape]
+    indexes: dict[tuple[str, str], IndexShape]
+    """Keyed by (table, index name): MySQL index names are only unique per table."""
 
 
 _TYPES = {
@@ -402,7 +403,7 @@ def read_catalog(conn: Connection, tables: Collection[str]) -> Catalog:
         if index == "PRIMARY":
             catalog.tables[table].primary_key = tuple(c for c, _ in columns)
         else:
-            catalog.indexes[index] = IndexShape(table, unique, tuple(columns))
+            catalog.indexes[(table, index)] = IndexShape(table, unique, tuple(columns))
     foreign: dict[tuple[str, str], tuple[list[str], str, list[str], str]] = {}
     for table, name, column, referenced, referenced_column, rule in conn.execute(
         text(
@@ -434,13 +435,20 @@ def _expanding(name: str) -> Any:
     return bindparam(name, expanding=True)
 
 
-def base_tables(conn: Connection) -> set[str]:
-    """Every base table in the current database."""
+def owned_tables() -> set[str]:
+    """The table names Dendrux owns in a database it may share with the app."""
+    return set(Base.metadata.tables) | {VERSION_TABLE}
+
+
+def base_tables(conn: Connection, names: Collection[str]) -> set[str]:
+    """Which of ``names`` exist as base tables (never lists the app's own tables)."""
     rows = conn.execute(
         text(
             "SELECT TABLE_NAME FROM information_schema.tables "
-            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_TYPE = 'BASE TABLE'"
-        )
+            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_TYPE = 'BASE TABLE' "
+            "AND TABLE_NAME IN :names"
+        ).bindparams(_expanding("names")),
+        {"names": sorted(names)},
     )
     return {str(row[0]) for row in rows}
 
@@ -524,16 +532,17 @@ def check(conn: Connection, *, exact: bool = False, settings: bool = True) -> Sc
     for name, want in expected.items():
         if want.table not in catalog.tables:
             continue
-        have = catalog.indexes.get(name)
+        have = catalog.indexes.get((want.table, name))
         if have is None:
             report.indexes.append(f"{want.table}.{name} (index)")
         elif have != want:
             report.indexes.append(f"{want.table}.{name} (index definition differs)")
-    for name, have in sorted(catalog.indexes.items()):
-        if name not in expected and have.unique:
-            report.indexes.append(f"{have.table}.{name} (unexpected unique index)")
+    for (table, name), found in sorted(catalog.indexes.items()):
+        owner_shape = expected.get(name)
+        if found.unique and (owner_shape is None or owner_shape.table != table):
+            report.indexes.append(f"{table}.{name} (unexpected unique index)")
     for owner, _, old in ACTIVATION_INDEXES.values():
-        if old and old in catalog.indexes:
+        if old and (owner, old) in catalog.indexes:
             report.indexes.append(f"{owner}.{old} (replaced index must be absent)")
     if settings and SETTINGS_TABLE in catalog.tables and not report.missing_tables:
         values = read_settings(conn)
@@ -562,8 +571,10 @@ def index_names(conn: Connection) -> tuple[set[str], set[str]]:
     wanted = expected_tables(conn.dialect)
     catalog = read_catalog(conn, wanted)
     expected = _all_index_shapes(wanted)
-    valid = {name for name, have in catalog.indexes.items() if expected.get(name) == have}
-    return valid, set(catalog.indexes)
+    valid = {
+        name for name, want in expected.items() if catalog.indexes.get((want.table, name)) == want
+    }
+    return valid, {name for _, name in catalog.indexes}
 
 
 def read_columns(conn: Connection, tables: list[str]) -> dict[str, list[str]]:
@@ -612,7 +623,7 @@ def index_matches(conn: Connection, name: str, table: str, expected: str) -> boo
         words = part.replace("`", "").split()
         direction = "D" if len(words) > 1 and words[1].upper() == "DESC" else "A"
         columns.append((words[0], direction))
-    have = read_catalog(conn, [table]).indexes.get(name)
+    have = read_catalog(conn, [table]).indexes.get((table, name))
     return have == IndexShape(table, bool(match[1]), tuple(columns))
 
 
@@ -631,38 +642,57 @@ def lock_name(conn: Connection) -> str:
 
 @contextmanager
 def maintenance_lock(conn: Connection) -> Iterator[None]:
-    """Hold the database's maintenance ``GET_LOCK`` on this dedicated connection.
+    """Hold the database's maintenance ``GET_LOCK`` on this connection, made dedicated.
 
-    The lock is session-scoped (commit and rollback do not release it). It is released
-    with ``RELEASE_LOCK`` in ``finally``; on any error the connection is invalidated
-    so a pool can never hand out a session that still holds it.
+    The connection is detached from its pool first, so it is never handed to another
+    caller, and closed when the caller closes it. The lock is session-scoped (commit and
+    rollback do not release it). Acquisition is inside the protected region: on any
+    error, including one right after ``GET_LOCK`` succeeded, the connection is
+    invalidated, so the server drops the session and any lock it holds. On success it is
+    released with ``RELEASE_LOCK``; a failed release invalidates as well.
     """
-    name = lock_name(conn)
-    acquired = conn.execute(text("SELECT GET_LOCK(:name, 0)"), {"name": name}).scalar()
-    conn.commit()
-    if acquired != 1:
-        raise RuntimeError(
-            "Another Dendrux database migration or activation is running; retry when it finishes."
-        )
+    conn.detach()
     error: BaseException | None = None
+    name = ""
     try:
+        name = lock_name(conn)
+        acquired = conn.execute(text("SELECT GET_LOCK(:name, 0)"), {"name": name}).scalar()
+        conn.commit()
+        if acquired != 1:
+            raise RuntimeError(
+                "Another Dendrux database migration or activation is running; retry when it "
+                "finishes."
+            )
         yield
     except BaseException as exc:
         error = exc
         raise
     finally:
-        released = False
-        try:
-            conn.rollback()
-            conn.execute(text("SELECT RELEASE_LOCK(:name)"), {"name": name})
-            conn.commit()
-            released = True
-        except Exception:
-            if error is None:
+        if error is not None:
+            _drop_session(conn)
+        else:
+            try:
+                conn.rollback()
+                conn.execute(text("SELECT RELEASE_LOCK(:name)"), {"name": name})
+                conn.commit()
+            except BaseException:
+                _drop_session(conn)
                 raise
-        finally:
-            if error is not None or not released:
-                conn.invalidate()
+
+
+def _drop_session(conn: Connection) -> None:
+    """Close the server session (and with it any lock it holds), then invalidate.
+
+    A detached connection has no pool record, so ``invalidate()`` alone would only
+    forget the driver connection, leaving the session (and its lock) open.
+    """
+    try:
+        raw = conn.connection.dbapi_connection
+        if raw is not None:
+            raw.close()
+    except Exception:  # already closed or broken: the invalidation below still runs
+        pass
+    conn.invalidate()
 
 
 def bounded_execute(
@@ -713,13 +743,37 @@ def bootstrap_steps(dialect: Dialect) -> list[str]:
     return steps
 
 
+def log_step(step: str) -> str | None:
+    """The registered ``migration_lock_timeout`` step of a bootstrap step (None: no DDL)."""
+    kind, _, target = step.partition(":")
+    if kind == "create":
+        return f"create.{target}"
+    if kind == "column":
+        return f"add.{target}"
+    if kind == "index":
+        return f"build_index.{target}"
+    return "stamp" if step == "stamp" else None
+
+
+def upgradeable_revisions(script: Any, head: str) -> set[str]:
+    """Revisions a stamped MySQL database may upgrade from: the baseline and its
+    descendants, except head (``iterate_revisions`` leaves the lower bound out)."""
+    between = {rev.revision for rev in script.iterate_revisions(head, MYSQL_BASELINE_REVISION)}
+    return (between | {MYSQL_BASELINE_REVISION}) - {head}
+
+
 def _refuse(reason: str) -> RuntimeError:
     return RuntimeError(f"Cannot migrate this MySQL/MariaDB database: {reason}")
 
 
 def classify(conn: Connection, *, head: str, upgradeable: Collection[str]) -> str:
-    """``bootstrap`` | ``current`` | ``upgrade``, or a refusal."""
-    present = base_tables(conn)
+    """``bootstrap`` | ``current`` | ``upgrade``, or a refusal.
+
+    Only Dendrux-owned objects decide (its table names, the Alembic version table and the
+    settings marker): the database may also hold the app's tables, which are never read
+    or touched.
+    """
+    present = base_tables(conn, owned_tables())
     if not present:
         return "bootstrap"
     if SETTINGS_TABLE in present:
@@ -752,8 +806,9 @@ def classify(conn: Connection, *, head: str, upgradeable: Collection[str]) -> st
             f"(MySQL history starts at {MYSQL_BASELINE_REVISION})."
         )
     raise _refuse(
-        f"it is not empty ({len(present)} tables) and holds no Dendrux schema. "
-        "Use an empty database for Dendrux."
+        f"it holds Dendrux tables in an unrecognised state ({', '.join(sorted(present))}) "
+        "with no bootstrap marker and no Dendrux revision. Drop them, or point Dendrux at "
+        "another database."
     )
 
 
@@ -797,20 +852,20 @@ def _bootstrap(conn: Connection, head: str) -> None:
     conn.commit()
 
     def ddl(statement: str, step: str) -> None:
-        bounded_step(conn, statement, revision=head, step=step)
+        bounded_step(conn, statement, revision=head, step=log_step(step) or step)
 
     def table(name: str) -> None:
         _step(f"create:{name}")
         actual = catalog.tables.get(name)
         if actual is None:
             model = Base.metadata.tables[name]
-            ddl(str(CreateTable(model).compile(dialect=dialect)).strip(), f"create.{name}")
+            ddl(str(CreateTable(model).compile(dialect=dialect)).strip(), f"create:{name}")
             return
         problems = table_problems(name, wanted[name], actual, exact=True, scope_optional=True)
         problems += [
             f"{name}.{unique} (unique constraint)"
             for unique, shape in wanted[name].uniques.items()
-            if catalog.indexes.get(unique) != shape
+            if catalog.indexes.get((name, unique)) != shape
         ]
         if problems:
             raise _refuse(
@@ -836,21 +891,21 @@ def _bootstrap(conn: Connection, head: str) -> None:
         TENANT_SCOPE_COLUMN
     )
     if scope is None:
-        ddl(tenant_scope_ddl(dialect), "add.agent_runs.tenant_scope")
+        ddl(tenant_scope_ddl(dialect), f"column:agent_runs.{TENANT_SCOPE_COLUMN}")
     elif scope != tenant_scope_shape(dialect):
         raise _refuse("the existing agent_runs.tenant_scope column differs from its definition.")
 
     models = {str(index.name): index for index in _model_indexes()}
     for name, want in expected_indexes().items():
         _step(f"index:{name}")
-        have = catalog.indexes.get(name)
+        have = catalog.indexes.get((want.table, name))
         if have is None:
             statement = (
                 str(CreateIndex(models[name]).compile(dialect=dialect))
                 if name in models
                 else extra_index_ddl(name)
             )
-            ddl(statement, f"build_index.{name}")
+            ddl(statement, f"index:{name}")
         elif have != want:
             raise _refuse(
                 f"the existing index {want.table}.{name} differs from this version's "
@@ -870,7 +925,7 @@ def _bootstrap(conn: Connection, head: str) -> None:
     problems = check(conn, exact=True, settings=False).problems()
     if problems:
         raise _refuse(f"the schema differs after bootstrap: {'; '.join(problems[:10])}")
-    if VERSION_TABLE not in base_tables(conn):
+    if not base_tables(conn, [VERSION_TABLE]):
         ddl(
             f"CREATE TABLE {VERSION_TABLE} (version_num VARCHAR(32) NOT NULL, "
             "CONSTRAINT alembic_version_pkc PRIMARY KEY (version_num)) ENGINE=InnoDB",

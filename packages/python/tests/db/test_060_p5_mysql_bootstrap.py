@@ -22,9 +22,14 @@ from dendrux.cli.main import app
 from dendrux.db._dialects import mysql
 from dendrux.db.models import Base
 
-from .conftest import run_sync
+from .conftest import run_sync, sessions_left
 
 HEAD = "f9a0b1c2d3e4"
+
+
+APP_TABLE = (
+    "CREATE TABLE customers (id INT PRIMARY KEY, name VARCHAR(20), UNIQUE KEY uq_name (name))"
+)
 
 
 class CrashError(Exception):
@@ -80,8 +85,10 @@ def problems(url: str) -> list[str]:
 
 
 def lock_is_free(url: str) -> bool:
+    """The maintenance lock is free and no maintenance session was left behind."""
     name = sql(url, "SELECT CONCAT('dendrux_maint_', SHA1(DATABASE()))")[0][0]
-    return sql(url, f"SELECT IS_FREE_LOCK('{name}')")[0][0] == 1
+    free = sql(url, f"SELECT IS_FREE_LOCK('{name}')")[0][0] == 1
+    return free and sessions_left(url) == 0
 
 
 def assert_at_head(url: str) -> None:
@@ -180,14 +187,19 @@ def _crash_at(name: str):  # noqa: ANN202
 @pytest.mark.parametrize(
     ("setup", "message"),
     [
-        (["CREATE TABLE customers (id INT PRIMARY KEY)"], "not empty"),
+        # A Dendrux-named table in a shape this version did not create, no marker.
+        (
+            [APP_TABLE, "CREATE TABLE agent_runs (id INT PRIMARY KEY)"],
+            "unrecognised",
+        ),
         (
             [
+                APP_TABLE,
                 "CREATE TABLE dendrux_settings (`key` VARCHAR(64) PRIMARY KEY, "
                 "value VARCHAR(255) NOT NULL, updated_at DATETIME(6) NOT NULL)",
                 "INSERT INTO dendrux_settings VALUES ('storage_format', '2', UTC_TIMESTAMP(6))",
             ],
-            "not empty",
+            "unrecognised",
         ),
         (
             [
@@ -384,3 +396,171 @@ def test_read_only_alembic_runs_and_other_targets_are_refused(
     with pytest.raises(RuntimeError, match="live connection"):
         command.upgrade(config, "head", sql=True)
     assert_at_head(mysql_url)
+
+
+# --- Shared database: the app's own tables live next to Dendrux's (owner, 2026-10-31) ---
+
+
+def app_snapshot(url: str) -> tuple[Any, ...]:
+    create = sql(url, "SHOW CREATE TABLE customers")[0][1]
+    rows = sql(url, "SELECT id, name FROM customers ORDER BY id")
+    return create, tuple(tuple(r) for r in rows)
+
+
+def with_app_table(url: str) -> tuple[Any, ...]:
+    sql(url, APP_TABLE, "INSERT INTO customers VALUES (1, 'ada'), (2, 'grace')")
+    return app_snapshot(url)
+
+
+def test_shared_database_bootstraps_and_leaves_app_tables_untouched(
+    mysql_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    before = with_app_table(mysql_url)
+    result = migrate(mysql_url, monkeypatch)
+    assert result.exit_code == 0, result.output
+    assert_at_head(mysql_url)
+    assert tables(mysql_url) == set(Base.metadata.tables) | {"alembic_version", "customers"}
+    assert app_snapshot(mysql_url) == before
+    assert migrate(mysql_url, monkeypatch, "check").exit_code == 0
+    assert migrate(mysql_url, monkeypatch).exit_code == 0  # rerun: still a no-op
+    assert app_snapshot(mysql_url) == before
+
+
+@pytest.mark.parametrize("cut", ["marker", "create:run_events", "stamp", "clear_marker"])
+def test_shared_database_crash_recovery(
+    mysql_url: str, monkeypatch: pytest.MonkeyPatch, cut: str
+) -> None:
+    before = with_app_table(mysql_url)
+    monkeypatch.setattr(mysql, "_before_step", _crash_at(cut))
+    assert migrate(mysql_url, monkeypatch).exit_code == 1
+    if cut == "marker":  # only the empty settings table exists next to the app's table
+        assert tables(mysql_url) == {"dendrux_settings", "customers"}
+    monkeypatch.setattr(mysql, "_before_step", None)
+    result = migrate(mysql_url, monkeypatch)
+    assert result.exit_code == 0, result.output
+    assert_at_head(mysql_url)
+    assert app_snapshot(mysql_url) == before
+
+
+def test_an_unrecognised_dendrux_table_is_refused_and_nothing_is_touched(
+    mysql_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    before = with_app_table(mysql_url)
+    sql(mysql_url, "CREATE TABLE run_events (id INT PRIMARY KEY)")
+    result = migrate(mysql_url, monkeypatch)
+    assert result.exit_code == 1
+    assert "run_events" in result.output
+    assert tables(mysql_url) == {"customers", "run_events"}
+    assert app_snapshot(mysql_url) == before
+    assert lock_is_free(mysql_url)
+
+
+# --- Maintenance lock: a fault right after GET_LOCK succeeds ---
+
+
+def test_a_fault_after_acquiring_the_lock_releases_it(mysql_url: str) -> None:
+    from sqlalchemy import event
+
+    from dendrux.db._activate import activate_database
+
+    async def go() -> tuple[set[int], set[int]]:
+        engine = create_async_engine(mysql_url, pool_size=1, max_overflow=0)
+        state = {"locked": False, "fired": False}
+
+        def after_execute(conn, cursor, statement, *args):  # noqa: ANN001, ANN002
+            if "GET_LOCK" in statement:
+                state["locked"] = True
+
+        def on_commit(conn) -> None:  # noqa: ANN001
+            if state["locked"] and not state["fired"]:
+                state["fired"] = True
+                raise RuntimeError("injected commit fault after GET_LOCK")
+
+        event.listen(engine.sync_engine, "after_cursor_execute", after_execute)
+        event.listen(engine.sync_engine, "commit", on_commit)
+        try:
+            async with engine.connect() as conn:
+                before = {(await conn.execute(text("SELECT CONNECTION_ID()"))).scalar_one()}
+            with pytest.raises(RuntimeError, match="injected commit fault"):
+                await activate_database(engine)
+            assert state["fired"]
+            async with engine.connect() as conn:
+                after = {(await conn.execute(text("SELECT CONNECTION_ID()"))).scalar_one()}
+            return before, after
+        finally:
+            await engine.dispose()
+
+    before, after = run_sync(go())
+    assert lock_is_free(mysql_url)
+    assert before.isdisjoint(after)
+
+
+# --- Upgrades after the baseline: a throwaway later revision ---
+
+
+LATER = "aa0000000001"
+LATER_REVISION = f'''"""Throwaway revision after the MySQL baseline (test only)."""
+from alembic import op
+
+revision = "{LATER}"
+down_revision = "{HEAD}"
+branch_labels = None
+depends_on = None
+
+
+def upgrade():
+    op.execute("CREATE TABLE dendrux_probe_later (id INT PRIMARY KEY)")
+
+
+def downgrade():
+    op.execute("DROP TABLE dendrux_probe_later")
+'''
+
+
+def test_a_database_at_the_baseline_upgrades_to_a_later_revision(
+    mysql_url: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    import io
+    import shutil
+    from pathlib import Path
+
+    from alembic import command
+
+    from dendrux.cli.db import _build_alembic_config
+    from dendrux.db import migrations
+
+    assert migrate(mysql_url, monkeypatch).exit_code == 0  # bootstrapped at the baseline
+    scripts = tmp_path / "migrations"
+    shutil.copytree(Path(migrations.__file__).parent, scripts)
+    (scripts / "versions" / "zz_later.py").write_text(LATER_REVISION)
+    config = _build_alembic_config()
+    config.set_main_option("script_location", str(scripts))
+    config.stdout = io.StringIO()
+    command.upgrade(config, "head")
+    assert sql(mysql_url, "SELECT version_num FROM alembic_version") == [(LATER,)]
+    assert "dendrux_probe_later" in tables(mysql_url)
+    assert lock_is_free(mysql_url)
+
+
+def test_upgradeable_revisions_include_the_baseline() -> None:
+    from alembic.script import ScriptDirectory
+
+    from dendrux.cli.db import _build_alembic_config
+
+    script = ScriptDirectory.from_config(_build_alembic_config())
+    head = script.get_current_head()
+    assert head == mysql.MYSQL_BASELINE_REVISION
+    assert mysql.upgradeable_revisions(script, head) == set()
+
+
+def test_every_bootstrap_ddl_step_is_a_registered_log_step() -> None:
+    from sqlalchemy.dialects import mysql as mysql_dialect
+
+    from dendrux import _codes
+
+    steps = [mysql.log_step(s) for s in mysql.bootstrap_steps(mysql_dialect.dialect())]
+    ddl = [s for s in steps if s is not None]
+    assert len(ddl) == 34  # 10 tables, the generated column, 22 indexes, the stamp table
+    assert all(_codes._valid_field("step", s) for s in ddl), [
+        s for s in ddl if not _codes._valid_field("step", s)
+    ]
