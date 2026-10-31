@@ -52,6 +52,7 @@ import sys
 import time
 import traceback
 import warnings
+import weakref
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -62,6 +63,14 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
 HERE = Path(__file__).resolve().parent
+# Direct script execution and namespace-package import both use this same module.
+if str(HERE.parent) not in sys.path:
+    sys.path.insert(0, str(HERE.parent))
+from tools import load_monitor  # noqa: E402
+
+ENGINES: weakref.WeakSet = weakref.WeakSet()
+ACTIVE_MONITOR: ContextVar[Any] = ContextVar("load_resource_monitor", default=None)
+MONITOR_INTERVAL: ContextVar[float] = ContextVar("load_monitor_interval", default=1.0)
 
 POOL = {"pool_size": 10, "max_overflow": 5, "pool_timeout": 120, "pool_pre_ping": True}
 POOL_CEILING = POOL["pool_size"] + POOL["max_overflow"]
@@ -76,6 +85,7 @@ SCENARIO_A_BUDGETS = {"a_notify_off": 74, "a_notify_on": 83}
 
 LABEL: ContextVar[str] = ContextVar("load_label", default="other")
 OP: ContextVar[str] = ContextVar("load_op", default="-")
+ALLOW_PORT: ContextVar[bool] = ContextVar("load_allow_port", default=False)
 ALLOW_REMOTE_HOST: ContextVar[bool] = ContextVar("load_allow_remote_host", default=False)
 
 PRESETS: dict[str, dict[str, Any]] = {
@@ -151,32 +161,47 @@ _QUERY_OPTIONS = {"sslmode"}
 _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
 
-def check_private_url(url: str, *, allow_remote_host: bool | None = None) -> Any:
+def check_private_url(
+    url: str, *, allow_remote_host: bool | None = None, allow_port: bool | None = None
+) -> Any:
     """Return the parsed URL, or raise ValueError unless it names a private ``*_test`` database."""
     from sqlalchemy.engine import make_url
 
     parsed = make_url(url)
-    if parsed.get_backend_name() != "postgresql":
-        raise ValueError("load.py runs on PostgreSQL only")
+    backend = parsed.get_backend_name()
+    if backend not in {"postgresql", "mysql", "mariadb"}:
+        raise ValueError("load.py requires PostgreSQL, MySQL or MariaDB")
     name = parsed.database or ""
     if not _DB_NAME.match(name) or len(name) > 63:
         raise ValueError("the database name must be 1-63 characters of [A-Za-z0-9_]")
     if not name.endswith("_test"):
         raise ValueError("refusing: the database name must end in _test (the script drops tables)")
-    if name in _FORBIDDEN:
+    if name.lower() in _FORBIDDEN:
         raise ValueError(f"refusing: {name} is a shared database; use a private *_test name")
+    if backend != "postgresql" and "_load_" not in name:
+        raise ValueError(
+            "refusing: MySQL/MariaDB database name must contain _load_ (the script drops tables)"
+        )
     if not parsed.host:
         raise ValueError("refusing: an explicit host is required")
     remote = ALLOW_REMOTE_HOST.get() if allow_remote_host is None else allow_remote_host
-    if parsed.host.lower() not in _LOCAL_HOSTS and not remote:
+    if parsed.host.lower() not in _LOCAL_HOSTS and (not remote or backend != "postgresql"):
         raise ValueError("refusing: non-loopback host requires --allow-remote-host")
-    if set(parsed.query) - _QUERY_OPTIONS:
+    port_override = ALLOW_PORT.get() if allow_port is None else allow_port
+    if backend != "postgresql" and parsed.port not in {53306, 53307} and not port_override:
+        raise ValueError("refusing: MySQL/MariaDB require test port 53306/53307 or --allow-port")
+    if set(parsed.query) - (_QUERY_OPTIONS if backend == "postgresql" else set()):
         raise ValueError("refusing: unsupported URL query options (only sslmode is allowed)")
-    return parsed.set(drivername="postgresql+asyncpg")
+    return parsed.set(
+        drivername="postgresql+asyncpg" if backend == "postgresql" else "mysql+asyncmy"
+    )
 
 
 def dsn_of(url: str) -> str:
-    return check_private_url(url).set(drivername="postgresql").render_as_string(hide_password=False)
+    parsed = check_private_url(url)
+    if parsed.get_backend_name() != "postgresql":
+        raise ValueError("the asyncpg DSN adapter is Postgres-only")
+    return parsed.set(drivername="postgresql").render_as_string(hide_password=False)
 
 
 # ---------------------------------------------------------------------------
@@ -264,6 +289,14 @@ class Meter:
 
     def snapshot(self) -> dict[str, Any]:
         return {
+            "pool_acquisition": {
+                "latency_ms": lat_summary(
+                    list(getattr(self.engine.pool, "checkout_latencies_ms", ()))
+                ),
+                "peak_ms": getattr(self.engine.pool, "checkout_peak_ms", None),
+                "attempts": getattr(self.engine.pool, "checkout_attempts", None),
+                "waits": getattr(self.engine.pool, "checkout_waits", None),
+            },
             "statements": self.n,
             "by_label": dict(self.by_label),
             "by_label_op": dict(self.by_label_op),
@@ -287,6 +320,7 @@ def merge_meters(parts: list[dict[str, Any]]) -> dict[str, Any]:
         "peak_checked_out_sum": 0,
         "checkouts": 0,
         "samples": {},
+        "pool_acquisition": [],
     }
     for p in parts:
         out["statements"] += p["statements"]
@@ -297,6 +331,8 @@ def merge_meters(parts: list[dict[str, Any]]) -> dict[str, Any]:
         out["bytes_sent"] += p["bytes_sent"]
         out["peak_checked_out_sum"] += p["peak_checked_out"]
         out["checkouts"] += p["checkouts"]
+        if "pool_acquisition" in p:
+            out["pool_acquisition"].append(p["pool_acquisition"])
         for k, v in p["samples"].items():
             out["samples"].setdefault(k, v)
     return out
@@ -500,21 +536,62 @@ def agent_kwargs(**extra: Any) -> dict[str, Any]:
 
 
 def make_store(engine: Any, *, notify: bool) -> Any:
-    from dendrux.runtime.state import SQLAlchemyStateStore
+    try:
+        from dendrux.runtime.stores._factory import store_for_engine
+    except ImportError:  # historical 0.5 checkout only
+        from dendrux.runtime.state import SQLAlchemyStateStore
 
-    if notify and "notify_channel" in inspect.signature(SQLAlchemyStateStore.__init__).parameters:
-        return SQLAlchemyStateStore(engine, notify_channel=CHANNEL)
-    return SQLAlchemyStateStore(engine)
+        return SQLAlchemyStateStore(engine)
+
+    options = {"notify_channel": CHANNEL} if notify and engine.dialect.name == "postgresql" else {}
+    return store_for_engine(engine, **options)
+
+
+from sqlalchemy.pool import AsyncAdaptedQueuePool  # noqa: E402
+
+
+class LoadPool(AsyncAdaptedQueuePool):
+    """Time real pool acquisitions, including waits, without changing application SQL."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.checkout_latencies_ms: collections.deque[float] = collections.deque(maxlen=4096)
+        self.checkout_waits = 0
+        self.checkout_attempts = 0
+        self.checkout_peak_ms = 0.0
+
+    def _do_get(self) -> Any:
+        started = time.perf_counter()
+        if self._pool.empty() and self._overflow >= self._max_overflow >= 0:
+            self.checkout_waits += 1
+        self.checkout_attempts += 1
+        try:
+            return super()._do_get()
+        finally:
+            elapsed = (time.perf_counter() - started) * 1000
+            self.checkout_peak_ms = max(self.checkout_peak_ms, elapsed)
+            self.checkout_latencies_ms.append(elapsed)
 
 
 def make_engine(url: str, app: str, *, pool: dict[str, Any] | None = None) -> Any:
     from sqlalchemy.ext.asyncio import create_async_engine
 
     parsed = check_private_url(url)
-    connect_args: dict[str, Any] = {"server_settings": {"application_name": app}}
+    connect_args: dict[str, Any] = (
+        {"server_settings": {"application_name": app}}
+        if parsed.get_backend_name() == "postgresql"
+        else {}
+    )
     if "sslmode" in parsed.query:
         connect_args["ssl"] = parsed.query["sslmode"]
-    return create_async_engine(parsed.set(query={}), **(pool or POOL), connect_args=connect_args)
+    options = dict(pool or POOL)
+    options.setdefault("poolclass", LoadPool)
+    if parsed.get_backend_name() == "mysql":
+        options.setdefault("isolation_level", "READ COMMITTED")
+    engine = create_async_engine(parsed.set(query={}), **options, connect_args=connect_args)
+    if engine is not None:
+        ENGINES.add(engine)
+    return engine
 
 
 # ---------------------------------------------------------------------------
@@ -805,7 +882,7 @@ async def w_iteration(ctx: Ctx) -> dict[str, Any]:
     ]
     ctx.send("ready")
     ctx.pipe.recv()
-    for notify in (True, False):
+    for notify in (True, False) if engine.dialect.name == "postgresql" else (False,):
         for streaming in (False, True):
             name = f"notify_{'on' if notify else 'off'}_{'stream' if streaming else 'batch'}"
             store = make_store(engine, notify=notify)
@@ -1443,11 +1520,20 @@ async def w_memory(ctx: Ctx) -> dict[str, Any]:
     for c in range(ctx.p["cycles"]):
         t0 = time.perf_counter()
         async with admin.connect() as conn:
-            await conn.execute(text(f"TRUNCATE TABLE {tables} RESTART IDENTITY CASCADE"))
+            if engine.dialect.name == "postgresql":
+                await conn.execute(text(f"TRUNCATE TABLE {tables} RESTART IDENTITY CASCADE"))
+            else:
+                for table in reversed(Base.metadata.sorted_tables):
+                    if table.name != "dendrux_settings":
+                        await conn.execute(table.delete())
         keys = [key_of(i) for i in range(ctx.p["runs"])]
         a_ok = await _a_round(ctx, engine, keys)
         f_keys = [key_of(1000 + i) for i in range(10)]
-        round_ = await followers_round(ctx, engine, meter, ctx.url, f_keys, 5, True, 0.5)
+        round_ = (
+            await followers_round(ctx, engine, meter, ctx.url, f_keys, 5, True, 0.5)
+            if engine.dialect.name == "postgresql"
+            else {"check": {"streams_not_matching_db": 0}, "followers_open_after_close": 0}
+        )
         gc.collect()
         gc.collect()
         pool = engine.pool
@@ -1462,6 +1548,7 @@ async def w_memory(ctx: Ctx) -> dict[str, Any]:
                 "checked_out": pool.checkedout(),
                 "checked_in": pool.checkedin(),
                 "overflow": pool.overflow(),
+                "connections": pool.checkedin() + pool.checkedout(),
                 "runs_ok": a_ok,
                 "followers_mismatch": round_["check"]["streams_not_matching_db"],
                 "followers_open_after_close": round_["followers_open_after_close"],
@@ -1488,8 +1575,28 @@ WORKERS = {
 }
 
 
+async def monitored_worker(ctx: Ctx, spec: dict[str, Any]) -> dict[str, Any]:
+    async def telemetry() -> None:
+        while True:
+            values = load_monitor.local_sample(ENGINES)
+            values["rss_kb"] = rss_kb()
+            ctx.send("resources", {"pid": os.getpid(), "values": values})
+            await asyncio.sleep(spec.get("monitor_interval", 1.0))
+
+    task = asyncio.create_task(telemetry())
+    try:
+        return await WORKERS[(ctx.scenario, ctx.role)](ctx)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        values = load_monitor.local_sample(ENGINES)
+        values["rss_kb"] = rss_kb()
+        ctx.send("resources", {"pid": os.getpid(), "values": values})
+
+
 def worker_entry(pipe: Any, spec: dict[str, Any]) -> None:
     ALLOW_REMOTE_HOST.set(spec.get("allow_remote_host", False))
+    ALLOW_PORT.set(spec.get("allow_port", False))
     warnings.simplefilter("ignore")
     import logging
 
@@ -1498,7 +1605,7 @@ def worker_entry(pipe: Any, spec: dict[str, Any]) -> None:
         spec["scenario"], spec["role"], spec["index"], spec["workers"], spec["url"], spec["p"], pipe
     )
     try:
-        result = asyncio.run(WORKERS[(ctx.scenario, ctx.role)](ctx))
+        result = asyncio.run(monitored_worker(ctx, spec))
         result["rss_kb_end"] = rss_kb()
         result["maxrss_kb"] = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // (
             1 if sys.platform != "darwin" else 1024
@@ -1544,10 +1651,14 @@ def log(message: str) -> None:
 
 
 async def reset_db(url: str) -> None:
-    import asyncpg
     from sqlalchemy.pool import NullPool
 
     parsed = check_private_url(url)
+    if parsed.get_backend_name() == "mysql":
+        await reset_mysql_db(url)
+        return
+    import asyncpg
+
     name = parsed.database
     maint = parsed.set(drivername="postgresql", database="postgres").render_as_string(
         hide_password=False
@@ -1586,11 +1697,45 @@ async def reset_db(url: str) -> None:
         await conn.close()
 
 
+async def reset_mysql_db(url: str) -> None:
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from sqlalchemy.pool import NullPool
+
+    from dendrux.db._settings import seed_settings
+    from dendrux.db.models import Base
+
+    parsed = check_private_url(url)
+    admin = create_async_engine(parsed.set(database=None), poolclass=NullPool)
+    try:
+        async with admin.connect() as conn:
+            await conn.execute(text(f"CREATE DATABASE IF NOT EXISTS `{parsed.database}`"))
+    finally:
+        await admin.dispose()
+    engine = make_engine(url, "dendrux_load_book", pool={"poolclass": NullPool})
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(text("DROP TABLE IF EXISTS load_billed"))
+            await conn.run_sync(Base.metadata.drop_all)
+            await conn.run_sync(Base.metadata.create_all)
+            await conn.run_sync(lambda sc: seed_settings(sc, active=True))
+            await conn.execute(
+                text(
+                    "CREATE TABLE load_billed (id BIGINT AUTO_INCREMENT PRIMARY KEY, "
+                    "run_key VARCHAR(64) NOT NULL, n_tool INT NOT NULL)"
+                )
+            )
+    finally:
+        await engine.dispose()
+
+
 class Sampler:
     """Sample backend waits, identifying run locks by relation and tuple lock metadata."""
 
     def __init__(self, url: str) -> None:
-        self.dsn = dsn_of(url)
+        self.url = url
+        self.mysql = check_private_url(url).get_backend_name() == "mysql"
+        self.dsn = None if self.mysql else dsn_of(url)
         self.task: asyncio.Task | None = None
         self.samples = 0
         self.peak_total = 0
@@ -1603,6 +1748,15 @@ class Sampler:
         self.waiting_samples = 0
 
     async def start(self) -> None:
+        if self.mysql:
+            self.engine = make_engine(
+                self.url,
+                "sampler",
+                pool={"pool_size": 1, "max_overflow": 0, "isolation_level": "AUTOCOMMIT"},
+            )
+            self.conn = await self.engine.connect()
+            self.task = asyncio.create_task(self._mysql_loop())
+            return
         import asyncpg
 
         conn = await asyncpg.connect(
@@ -1610,6 +1764,27 @@ class Sampler:
         )
         self.conn = conn
         self.task = asyncio.create_task(self._loop())
+
+    async def _mysql_loop(self) -> None:
+        from sqlalchemy import text
+
+        while True:
+            rows = (
+                (
+                    await self.conn.execute(
+                        text(
+                            "SELECT COMMAND app FROM information_schema.PROCESSLIST "
+                            "WHERE DB = DATABASE()"
+                        )
+                    )
+                )
+                .mappings()
+                .all()
+            )
+            self.samples += 1
+            self.peak_total = max(self.peak_total, len(rows))
+            self.peak_by_app["mysql_database_connections"] = self.peak_total
+            await asyncio.sleep(1)
 
     async def _loop(self) -> None:
         last = time.perf_counter()
@@ -1659,9 +1834,11 @@ class Sampler:
             self.task.cancel()
             await asyncio.gather(self.task, return_exceptions=True)
         await self.conn.close()
+        if self.mysql:
+            await self.engine.dispose()
         return {
             "samples": self.samples,
-            "interval_ms": SAMPLE_INTERVAL_S * 1000,
+            "interval_ms": (1 if self.mysql else SAMPLE_INTERVAL_S) * 1000,
             "peak_connections": self.peak_total,
             "peak_connections_by_role": dict(sorted(self.peak_by_app.items())),
             "lock_wait_ms_total": round(self.lock_wait_ms, 1),
@@ -1674,6 +1851,8 @@ class Sampler:
 
 
 async def db_counters(url: str) -> dict[str, Any]:
+    if check_private_url(url).get_backend_name() == "mysql":
+        return await mysql_counters(url)
     import asyncpg
 
     conn = await asyncpg.connect(
@@ -1699,6 +1878,8 @@ async def db_counters(url: str) -> dict[str, Any]:
 
 
 async def wal_delta(url: str, a: str, b: str) -> int:
+    if check_private_url(url).get_backend_name() == "mysql":
+        return 0  # MySQL has no WAL; InnoDB bytes are separate monitor counters.
     import asyncpg
 
     conn = await asyncpg.connect(dsn_of(url))
@@ -1713,6 +1894,8 @@ async def wal_delta(url: str, a: str, b: str) -> int:
 
 
 async def sql_one(url: str, query: str, *args: Any) -> Any:
+    if check_private_url(url).get_backend_name() == "mysql":
+        return await mysql_query(url, query, args)
     import asyncpg
 
     conn = await asyncpg.connect(
@@ -1725,6 +1908,9 @@ async def sql_one(url: str, query: str, *args: Any) -> Any:
 
 
 async def sql_exec(url: str, query: str) -> None:
+    if check_private_url(url).get_backend_name() == "mysql":
+        await mysql_query(url, query, (), write=True)
+        return
     import asyncpg
 
     conn = await asyncpg.connect(
@@ -1734,6 +1920,68 @@ async def sql_exec(url: str, query: str) -> None:
         await conn.execute(query)
     finally:
         await conn.close()
+
+
+def mysql_control_sql(query: str, args: tuple[Any, ...]) -> tuple[str, dict[str, Any]]:
+    """Translate only the harness's fixed controller SQL, never arbitrary application SQL."""
+    params = {}
+    if args:
+        params = {f"terminal{i}": v for i, v in enumerate(args[0])}
+        binds = ", ".join(f":{key}" for key in params)
+        query = query.replace("status <> all($1::text[])", f"status NOT IN ({binds})")
+    query = query.replace("count(*) filter (where status = 'success')", "sum(status = 'success')")
+    query = re.sub(r"count\(\*\) filter \(where (status NOT IN \([^)]*\))\)", r"sum(\1)", query)
+    query = query.replace("interval '10 minutes'", "INTERVAL 10 MINUTE")
+    query = re.sub(r"\b(open|rows)\b", r"`\1`", query)
+    return query, params
+
+
+async def mysql_query(url: str, query: str, args: tuple[Any, ...], *, write: bool = False) -> Any:
+    from sqlalchemy import text
+    from sqlalchemy.pool import NullPool
+
+    query, params = mysql_control_sql(query, args)
+    engine = make_engine(url, "book", pool={"poolclass": NullPool})
+    try:
+        async with engine.begin() as conn:
+            result = await conn.execute(text(query), params)
+            return None if write else dict(result.mappings().one())
+    finally:
+        await engine.dispose()
+
+
+async def mysql_counters(url: str) -> dict[str, Any]:
+    from sqlalchemy import text
+    from sqlalchemy.pool import NullPool
+
+    engine = make_engine(url, "book", pool={"poolclass": NullPool})
+    try:
+        async with engine.connect() as conn:
+            rows = (
+                (
+                    await conn.execute(
+                        text(
+                            "SELECT TABLE_NAME name, "
+                            "coalesce(DATA_LENGTH, 0) + coalesce(INDEX_LENGTH, 0) size "
+                            "FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE()"
+                        )
+                    )
+                )
+                .mappings()
+                .all()
+            )
+            status = dict((await conn.execute(text("SHOW GLOBAL STATUS"))).all())
+            return {
+                "lsn": "0",
+                "xacts": int(status.get("Com_commit", 0)) + int(status.get("Com_rollback", 0)),
+                "ins": int(status.get("Innodb_rows_inserted", 0)),
+                "upd": int(status.get("Innodb_rows_updated", 0)),
+                "deadlocks": int(status.get("Innodb_deadlocks", 0)),
+                "size": sum(r["size"] for r in rows),
+                "sizes": {r["name"]: r["size"] for r in rows},
+            }
+    finally:
+        await engine.dispose()
 
 
 class Handle:
@@ -1761,6 +2009,8 @@ def spawn(url: str, scenario: str, role: str, n: int, p: dict[str, Any]) -> list
             "url": url,
             "p": p,
             "allow_remote_host": ALLOW_REMOTE_HOST.get(),
+            "allow_port": ALLOW_PORT.get(),
+            "monitor_interval": MONITOR_INTERVAL.get(),
         }
         parent, child = ctx.Pipe()
         proc = ctx.Process(target=worker_entry, args=(child, spec), daemon=True)
@@ -1788,6 +2038,10 @@ async def pump(
                     h.result = payload
                 elif kind == "error":
                     h.error = payload
+                elif kind == "resources":
+                    monitor = ACTIVE_MONITOR.get()
+                    if monitor is not None:
+                        monitor.workers[payload["pid"]] = (time.monotonic(), payload["values"])
                 elif on_message is not None:
                     on_message(h, kind, payload)
             if h.error:
@@ -1809,6 +2063,9 @@ async def pump(
 
 def release(handles: list[Handle]) -> None:
     for h in handles:
+        monitor = ACTIVE_MONITOR.get()
+        if monitor is not None:
+            monitor.workers.pop(h.proc.pid, None)
         with contextlib.suppress(Exception):
             if h.proc.is_alive():
                 h.proc.join(timeout=10)
@@ -1877,7 +2134,8 @@ class Measured:
     def server(self) -> dict[str, Any]:
         return {
             "measurement_wall_including_startup_s": round(self.wall_including_startup_s, 3),
-            "wal_bytes": self.wal_bytes,
+            "wal_bytes": None if self.sampler.mysql else self.wal_bytes,
+            "wal_applicable": not self.sampler.mysql,
             "table_growth_bytes": self.after["size"] - self.before["size"],
             "transactions": self.after["xacts"] - self.before["xacts"],
             "tuples_inserted": self.after["ins"] - self.before["ins"],
@@ -1959,9 +2217,12 @@ def base_metrics(
         "latency_ms": lat_summary(total_lat),
         "app_bytes_sent": merged["bytes_sent"],
         "app_bytes_sent_per_run": round(merged["bytes_sent"] / runs) if runs else None,
-        "wal_bytes_per_run": round(server["wal_bytes"] / runs) if runs else None,
+        "wal_bytes_per_run": round(server["wal_bytes"] / runs)
+        if runs and server["wal_bytes"] is not None
+        else None,
         "pool_ceiling_per_worker": POOL_CEILING,
         "peak_pool_checkouts_sum": merged["peak_checked_out_sum"],
+        "pool_acquisition": merged["pool_acquisition"],
         "server": server,
         "top_statements": merged["top"].most_common(40),
     }
@@ -2052,26 +2313,38 @@ async def ctl_iteration(url: str, cfg: dict[str, Any], workers: int) -> Outcome:
         }
     out.metrics = {
         "variants": variants,
+        "pool_acquisition": merged["pool_acquisition"],
         "server": m.server(),
         "wall_s": round(m.wall_s, 2),
         "statements": merged["statements"],
         "app_bytes_sent": merged["bytes_sent"],
     }
-    on_batch = variants["notify_on_batch"]["max_non_terminal"]
-    on_stream = variants["notify_on_stream"]["max_non_terminal"]
-    out.check(
-        "one-tool iteration statements, notifier on (budget 25)", on_batch <= 25, on_batch, 25
-    )
-    out.check(
-        "streaming iteration (50 chunks) statements, notifier on (budget 25)",
-        on_stream <= 25,
-        on_stream,
-        25,
-    )
-    out.gates["iteration.notify_on_batch"] = on_batch
-    out.gates["iteration.notify_on_stream"] = on_stream
-    out.gates["iteration.notify_off_batch"] = variants["notify_off_batch"]["max_non_terminal"]
+    if check_private_url(url).get_backend_name() == "mysql":
+        out.notes.append("NOTIFY iteration variants skipped on MySQL/MariaDB")
+        for key, variant in variants.items():
+            out.gates[f"iteration.{key}"] = variant["max_non_terminal"]
+        return out
+    out.checks.extend(iteration_budget_checks(variants))
+    for key, variant in variants.items():
+        out.gates[f"iteration.{key}"] = variant["max_non_terminal"]
     return out
+
+
+def iteration_budget_checks(variants: dict[str, Any]) -> list[dict[str, Any]]:
+    """Keep the spec's 21-notify-on/18-off PostgreSQL iteration ceilings fixed."""
+    checks = []
+    for name, variant in variants.items():
+        budget = 21 if name.startswith("notify_on") else 18
+        value = variant["max_non_terminal"]
+        checks.append(
+            {
+                "name": f"iteration {name} statement budget",
+                "ok": value <= budget,
+                "value": value,
+                "limit": budget,
+            }
+        )
+    return checks
 
 
 async def ctl_runs(url: str, cfg: dict[str, Any], workers: int) -> Outcome:
@@ -2551,6 +2824,8 @@ async def ctl_memory(url: str, cfg: dict[str, Any], workers: int) -> Outcome:
             )
         )[0]
     cycles = h.result["cycles"]
+    if m.sampler.mysql:
+        out.notes.append("Postgres NOTIFY followers skipped in MySQL/MariaDB memory cycles")
     out.samples = {}
     warm = min(5, max(1, len(cycles) // 3))
     series = [c["rss_kb"] / 1024 for c in cycles]
@@ -2558,12 +2833,14 @@ async def ctl_memory(url: str, cfg: dict[str, Any], workers: int) -> Outcome:
     s = slope(tail)
     out.metrics = {
         "cycles": len(cycles),
+        "memory_cycle_resources": cycles,
+        "resource_runs": (cfg["memory_runs"] + (10 if not m.sampler.mysql else 0)) * len(cycles),
         "runs_per_cycle": cfg["memory_runs"],
         "cycle_latency_ms": lat_summary([c["wall_ms"] for c in cycles]),
         "statements": h.result["meter"]["statements"],
         "statements_per_cycle": round(h.result["meter"]["statements"] / len(cycles), 2),
         "app_bytes_sent": h.result["meter"]["bytes_sent"],
-        "followers_per_cycle": 50,
+        "followers_per_cycle": 0 if m.sampler.mysql else 50,
         "rss_mb_series": [round(x, 1) for x in series],
         "warmup_cycles": warm,
         "rss_slope_mb_per_cycle": round(s, 3),
@@ -2785,6 +3062,12 @@ def machine_meta() -> dict[str, Any]:
 
 
 async def server_meta(url: str) -> dict[str, Any]:
+    if check_private_url(url).get_backend_name() == "mysql":
+        return await sql_one(
+            url,
+            "SELECT version() version, @@max_connections max_connections, "
+            "@@innodb_buffer_pool_size buffer_pool_bytes",
+        )
     import asyncpg
 
     conn = await asyncpg.connect(
@@ -2831,8 +3114,9 @@ def render(name: str, o: Outcome) -> list[str]:
         lines += fmt_table(
             ["variant", "startup", "iter 1", "iter 2", "terminal", "max non-terminal"], rows
         )
-        best = m["variants"]["notify_on_batch"]["by_operation_iteration_2"]
-        lines.append("statements by store operation, iteration 2, notifier on:")
+        selected = "notify_on_batch" if "notify_on_batch" in m["variants"] else "notify_off_batch"
+        best = m["variants"][selected]["by_operation_iteration_2"]
+        lines.append(f"statements by store operation, iteration 2, {selected}:")
         lines += ["  " + f"{k}: {v}" for k, v in sorted(best.items())]
         for variant, d in m["variants"].items():
             lines.append(f"{variant} whole-run latency ms: {d['latency_ms']}")
@@ -3072,18 +3356,197 @@ def scenario_a_checks(outcomes: dict[str, Outcome]) -> list[dict[str, Any]]:
     return checks
 
 
+def scenario_jobs(
+    url: str, cfg: dict[str, Any], workers: int, wanted: list[str], legacy: bool
+) -> tuple[list[tuple[str, Any]], list[str]]:
+    """Build supported workloads and explicit dialect skip notes before any writes."""
+    drivers = {
+        "iteration": lambda: ctl_iteration(url, cfg, workers),
+        "runs": lambda: ctl_runs(url, cfg, workers),
+        "kill_checkpoint": lambda: ctl_kill(url, cfg, workers, "checkpoint"),
+        "kill_inflight": lambda: ctl_kill(url, cfg, workers, "inflight"),
+        "followers_on": lambda: ctl_followers(url, cfg, workers, True),
+        "followers_off": lambda: ctl_followers(url, cfg, workers, False),
+        "cancel": lambda: ctl_cancel(url, cfg, workers),
+        "pool": lambda: ctl_pool(url, cfg, workers),
+        "history": lambda: ctl_history(url, cfg, workers),
+        "memory": lambda: ctl_memory(url, cfg, workers),
+    }
+    mysql = check_private_url(url).get_backend_name() == "mysql"
+    notes = []
+    jobs: list[tuple[str, Any]] = []
+    for name in wanted:
+        if mysql and name in {"followers_on", "followers_off"}:
+            notes.append(
+                f"{name} skipped: Postgres NOTIFY/follower bookkeeping "
+                "is unavailable on MySQL/MariaDB"
+            )
+            continue
+        if name == "a":
+            jobs.append(("a_notify_off", lambda: ctl_a(url, cfg, workers, False)))
+            jobs.append(("a_shared_agent", lambda: ctl_a(url, cfg, workers, False, True)))
+            if not legacy and not mysql:
+                jobs.append(("a_notify_on", lambda: ctl_a(url, cfg, workers, True)))
+        else:
+            jobs.append((name, drivers[name]))
+    if mysql and "a" in wanted:
+        notes.append("a_notify_on skipped: MySQL/MariaDB has no Postgres NOTIFY")
+    return jobs, notes
+
+
+def workload_runs(metrics: dict[str, Any]) -> int:
+    """Count completed logical runs, including memory cycles and cancel tree nodes."""
+    if "resource_runs" in metrics:
+        return int(metrics["resource_runs"])
+    if "runs_per_variant" in metrics:
+        return int(metrics["runs_per_variant"]) * 2
+    if "runs" in metrics:
+        return int(metrics["runs"])
+    if "runs_per_cycle" in metrics:
+        return int(metrics["runs_per_cycle"] * metrics["cycles"])
+    if "nodes" in metrics:
+        return int(metrics["nodes"]) * len(metrics.get("phases", {"alone": {}}))
+    if "variants" in metrics:
+        return int(sum(v["latency_ms"]["n"] for v in metrics["variants"].values()))
+    if "resume_status" in metrics and "big_results" in metrics:
+        return 1
+    raise ValueError("unknown workload metric shape; declare its logical run count")
+
+
+def cycle_gates(cycles: list[dict[str, Any]]) -> dict[str, float]:
+    """Gate the worst measured cycle so a later improvement cannot hide a regression."""
+    result = {}
+    for cycle in cycles:
+        for key, value in cycle["gates"].items():
+            result[key] = max(result.get(key, value), value)
+    return result
+
+
+def mysql_budget_keys(scenarios: list[str]) -> set[str]:
+    """List the statement gates emitted by supported MySQL workload variants."""
+    keys: set[str] = set()
+    mapping = {
+        "a": {"a_notify_off.statements_per_run", "a_shared_agent.statements_per_run"},
+        "iteration": {"iteration.notify_off_batch", "iteration.notify_off_stream"},
+        "runs": {"runs.statements_per_run"},
+        "kill_checkpoint": {"kill_checkpoint.statements_per_run_including_recovery"},
+        "kill_inflight": {"kill_inflight.statements_per_run_including_recovery"},
+        "cancel": {"cancel.statements_per_node"},
+        "history": {"history.resume_statements"},
+    }
+    for name in scenarios:
+        keys.update(mapping.get(name, set()))
+    return keys
+
+
+def statement_budget_checks(
+    gates: dict[str, float], budgets: dict[str, float]
+) -> list[dict[str, Any]]:
+    """Require a predeclared MySQL ceiling for every emitted statement gate."""
+    return [
+        {
+            "name": f"statement budget {key}",
+            "value": value,
+            "limit": budgets.get(key),
+            "ok": key in budgets and value <= budgets[key],
+        }
+        for key, value in gates.items()
+    ]
+
+
+async def monitored_job(
+    url: str, make: Any, args: argparse.Namespace
+) -> tuple[Outcome, dict[str, Any], dict[str, float]]:
+    from sqlalchemy.pool import NullPool
+
+    engine = make_engine(
+        url, "dendrux_load_resources", pool={"poolclass": NullPool, "isolation_level": "AUTOCOMMIT"}
+    )
+    monitor = load_monitor.ResourceMonitor(
+        engine, interval=args.monitor_interval, capacity=args.monitor_capacity
+    )
+    monitor.rss_reader = rss_kb
+    token = ACTIVE_MONITOR.set(monitor)
+    outcome = None
+    failure = None
+    runs = 0
+    try:
+        await monitor.start()
+        try:
+            outcome = await make()
+            runs = workload_runs(outcome.metrics)
+        except BaseException as exc:
+            failure = exc
+            raise
+        finally:
+            report = await monitor.stop(runs)
+            if failure is not None:
+                failure.resource_report = report
+        gc.collect()
+        endpoints = {"rss_kb": rss_kb(), **load_monitor.local_sample()}
+        connections = report.get("endpoint", {}).get("db.connections")
+        if connections is not None:
+            endpoints["connections"] = connections
+        if "memory_cycle_resources" in outcome.metrics:
+            outcome.checks.extend(
+                load_monitor.leak_checks(
+                    outcome.metrics["memory_cycle_resources"],
+                    args.leak_thresholds,
+                    warmup=outcome.metrics.get("warmup_cycles", 1),
+                )
+            )
+        return outcome, report, endpoints
+    finally:
+        ACTIVE_MONITOR.reset(token)
+        if monitor.task is not None and not monitor.task.done():
+            await monitor.stop(0)
+        await engine.dispose()
+
+
+def retain_cycle(outcome: Outcome, monitoring: dict[str, Any], path: Path | None) -> dict[str, Any]:
+    """Spool full cycle evidence; keep compact summaries between measurements."""
+    cycle = {
+        "metrics": dict(outcome.metrics),
+        "checks": list(outcome.checks),
+        "gates": dict(outcome.gates),
+        "monitoring": monitoring,
+    }
+    if path is not None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(cycle, indent=2, default=str))
+    cycle["monitoring"] = {key: value for key, value in monitoring.items() if key != "samples"}
+    cycle["sample_artifact"] = str(path) if path is not None else None
+    return cycle
+
+
 async def run_all(args: argparse.Namespace) -> int:
     ALLOW_REMOTE_HOST.set(args.allow_remote_host)
+    ALLOW_PORT.set(args.allow_port)
+    MONITOR_INTERVAL.set(args.monitor_interval)
     url = str(check_private_url(args.url).render_as_string(hide_password=False))
     cfg = dict(PRESETS[args.scale])
-    from dendrux.runtime.state import SQLAlchemyStateStore
+    try:
+        from dendrux.runtime.stores.sql.base import SQLStateStore
+    except ImportError:
+        from dendrux.runtime.state import SQLAlchemyStateStore as SQLStateStore
 
-    legacy = not hasattr(SQLAlchemyStateStore, "checkpoint_step")
+    legacy = not hasattr(SQLStateStore, "checkpoint_step")
     wanted = args.scenarios.split(",") if args.scenarios else list(ALL_SCENARIOS)
     if legacy:  # a 0.5 checkout can run the scenarios that need no 0.6 surface
         wanted = [w for w in wanted if w in LEGACY_SCENARIOS] or list(LEGACY_SCENARIOS)
     baseline = load_baseline(Path(args.baseline) if args.baseline else None)
+    if (
+        baseline
+        and check_private_url(url).get_backend_name() == "mysql"
+        and baseline.get("backend", "postgresql") != "mysql"
+    ):
+        raise ValueError("Postgres statement baselines cannot be used on MySQL/MariaDB")
     compare_gates({}, baseline, scale=args.scale)  # validate before resetting any database
+    preflight = make_engine(url, "preflight")
+    try:
+        make_store(preflight, notify=False)  # track B absence refuses before schema writes
+    finally:
+        await preflight.dispose()
     await reset_db(url)  # creates the private database when it is missing
     results: dict[str, Any] = {
         "meta": {
@@ -3094,6 +3557,16 @@ async def run_all(args: argparse.Namespace) -> int:
             "pool_per_worker": POOL,
             "aggregate_pool_ceiling": POOL_CEILING * args.workers,
             "config": cfg,
+            "backend": check_private_url(url).get_backend_name(),
+            "monitor_interval_s": args.monitor_interval,
+            "leak_cycles": args.leak_cycles,
+            "leak_thresholds": args.leak_thresholds,
+            "statement_budgets": args.statement_budgets,
+            "monitor_window": "includes workload reset/setup; excludes EXPLAIN",
+            "leak_scope": (
+                "controller only; memory scenario also checks its persistent worker after "
+                "its own warm-up. Other workers are replaced between workloads"
+            ),
             "legacy_0_5_checkout": legacy,
         },
         "scenarios": {},
@@ -3101,20 +3574,8 @@ async def run_all(args: argparse.Namespace) -> int:
         "gates": {},
     }
     log(f"dendrux at {results['meta']['dendrux_file']} (legacy 0.5 checkout: {legacy})")
-    log(f"postgres: {results['meta']['server']['version'][:60]}")
+    log(f"database: {results['meta']['server']['version'][:60]}")
     outcomes: dict[str, Outcome] = {}
-    drivers = {
-        "iteration": lambda: ctl_iteration(url, cfg, args.workers),
-        "runs": lambda: ctl_runs(url, cfg, args.workers),
-        "kill_checkpoint": lambda: ctl_kill(url, cfg, args.workers, "checkpoint"),
-        "kill_inflight": lambda: ctl_kill(url, cfg, args.workers, "inflight"),
-        "followers_on": lambda: ctl_followers(url, cfg, args.workers, True),
-        "followers_off": lambda: ctl_followers(url, cfg, args.workers, False),
-        "cancel": lambda: ctl_cancel(url, cfg, args.workers),
-        "pool": lambda: ctl_pool(url, cfg, args.workers),
-        "history": lambda: ctl_history(url, cfg, args.workers),
-        "memory": lambda: ctl_memory(url, cfg, args.workers),
-    }
     explain_for = {
         "a_notify_off",
         "iteration",
@@ -3127,22 +3588,57 @@ async def run_all(args: argparse.Namespace) -> int:
         "pool",
         "history",
     }
-    jobs: list[tuple[str, Any]] = []
-    for name in wanted:
-        if name == "a":
-            jobs.append(("a_notify_off", lambda: ctl_a(url, cfg, args.workers, False)))
-            jobs.append(("a_shared_agent", lambda: ctl_a(url, cfg, args.workers, False, True)))
-            if not legacy:
-                jobs.append(("a_notify_on", lambda: ctl_a(url, cfg, args.workers, True)))
-        else:
-            jobs.append((name, drivers[name]))
+    jobs, results["notes"] = scenario_jobs(url, cfg, args.workers, wanted, legacy)
+    for note in results["notes"]:
+        log(note)
     failures = 0
     for name, make in jobs:
         log(f"scenario {name} ...")
         t0 = time.perf_counter()
         try:
-            o = await make()
-            if name in explain_for and o.samples and not args.no_explain:
+            cycle_results = []
+            endpoints = []
+            o = monitoring = None
+            for cycle in range(args.leak_cycles):
+                o = monitoring = None  # release the preceding raw ring before the next endpoint
+                log(f"scenario {name} cycle {cycle + 1}/{args.leak_cycles}")
+                o, monitoring, endpoint = await monitored_job(url, make, args)
+                sample_path = (
+                    Path(args.json).with_suffix(".cycles") / f"{name}-{cycle + 1}.json"
+                    if args.json
+                    else None
+                )
+                cycle_results.append(retain_cycle(o, monitoring, sample_path))
+                endpoints.append(endpoint)
+            o.gates = cycle_gates(cycle_results)
+            if results["meta"]["backend"] == "postgresql":
+                for cycle_result in cycle_results:
+                    if name in SCENARIO_A_BUDGETS:
+                        budget = SCENARIO_A_BUDGETS[name]
+                        value = cycle_result["metrics"]["statements_per_run"]
+                        o.check(
+                            f"cycle Scenario A {name} statement budget",
+                            value <= budget,
+                            value,
+                            budget,
+                        )
+            else:
+                o.checks.extend(statement_budget_checks(o.gates, args.statement_budgets))
+            for index, cycle_result in enumerate(cycle_results[:-1]):
+                o.checks.extend(
+                    {**c, "name": f"cycle {index + 1}: {c['name']}"} for c in cycle_result["checks"]
+                )
+            if args.leak_cycles >= 2:
+                o.checks.extend(load_monitor.leak_checks(endpoints, args.leak_thresholds))
+            o.metrics["monitoring"] = monitoring
+            o.metrics["resource_cycles"] = cycle_results
+            o.metrics["leak_endpoints"] = endpoints
+            if (
+                name in explain_for
+                and o.samples
+                and not args.no_explain
+                and check_private_url(url).get_backend_name() == "postgresql"
+            ):
                 o.metrics["explain"] = await explain_samples(url, o.samples)
             outcomes[name] = o
             results["scenarios"][name] = {
@@ -3153,9 +3649,14 @@ async def run_all(args: argparse.Namespace) -> int:
             results["gates"].update(o.gates)
             log(f"scenario {name} done in {time.perf_counter() - t0:.1f}s")
         except BaseException as exc:  # noqa: BLE001
+            if isinstance(exc, (KeyboardInterrupt, asyncio.CancelledError)):
+                raise
             tb = traceback.format_exc()
             log(f"scenario {name} FAILED: {exc!r}")
-            results["scenarios"][name] = {"error": tb}
+            results["scenarios"][name] = {
+                "error": tb,
+                "monitoring": getattr(exc, "resource_report", None),
+            }
             results["checks"].append(
                 {
                     "name": f"{name} ran to completion",
@@ -3165,12 +3666,10 @@ async def run_all(args: argparse.Namespace) -> int:
                 }
             )
             failures += 1
-            if isinstance(exc, KeyboardInterrupt):
-                raise
     # cross-scenario budget checks
     results["meta"]["v050_reference_scenario_a_statements_per_run"] = V050_REFERENCE_A
     results["meta"]["scenario_a_budgets"] = SCENARIO_A_BUDGETS
-    if not legacy:
+    if not legacy and check_private_url(url).get_backend_name() == "postgresql":
         results["checks"].extend(scenario_a_checks(outcomes))
     for name, o in outcomes.items():
         results["checks"].extend({**c, "name": f"{name}: {c['name']}"} for c in o.checks)
@@ -3180,10 +3679,15 @@ async def run_all(args: argparse.Namespace) -> int:
             srv = outcomes[name].metrics["server"]
             by_role = srv["peak_connections_by_role"]
             worker_conns = sum(v for k, v in by_role.items() if k.startswith("dendrux_load_w"))
+            if check_private_url(url).get_backend_name() == "mysql":
+                observed = (
+                    outcomes[name].metrics["monitoring"]["summary"].get("workers.pool.connections")
+                )
+                worker_conns = observed["peak"] if observed else None
             results["checks"].append(
                 {
                     "name": f"{name}: worker connections within the aggregate pool ceiling",
-                    "ok": worker_conns <= conn_ceiling,
+                    "ok": worker_conns is not None and worker_conns <= conn_ceiling,
                     "value": worker_conns,
                     "limit": conn_ceiling,
                 }
@@ -3198,6 +3702,7 @@ async def run_all(args: argparse.Namespace) -> int:
     lines: list[str] = []
     for name, o in outcomes.items():
         lines += render(name, o) + [""]
+        lines += load_monitor.markdown(o.metrics["monitoring"]) + [""]
     if rows:
         lines.append("== baseline comparison (20% tolerance, statement counts only) ==")
         lines += fmt_table(["gate", "baseline", "now", "change", ""], rows) + [""]
@@ -3211,6 +3716,20 @@ async def run_all(args: argparse.Namespace) -> int:
     print(text)
     if args.json:
         Path(args.json).write_text(json.dumps(results, indent=2, default=str))
+        Path(args.json).with_suffix(".md").write_text(
+            "\n".join(
+                [
+                    line
+                    for name, outcome in outcomes.items()
+                    for line in [
+                        f"### {name}",
+                        "",
+                        *load_monitor.markdown(outcome.metrics["monitoring"]),
+                        "",
+                    ]
+                ]
+            )
+        )
         log(f"wrote {args.json}")
     if args.write_baseline:
         write_baseline(Path(args.write_baseline), results)
@@ -3241,9 +3760,11 @@ def write_baseline(path: Path, results: dict[str, Any]) -> None:
                 "git_commit",
             )
         },
-        "postgres": {
+        "backend": meta.get("backend", "postgresql"),
+        "postgres" if meta.get("backend", "postgresql") == "postgresql" else "mysql": {
             k: meta["server"][k]
             for k in ("version", "shared_buffers", "max_connections", "synchronous_commit", "fsync")
+            if k in meta["server"]
         },
         "gates": results["gates"],
         "informational": {
@@ -3282,11 +3803,61 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--write-baseline", help="write a baseline file from this run")
     parser.add_argument("--no-explain", action="store_true")
     parser.add_argument(
+        "--statement-budgets",
+        help="JSON file of predeclared statement ceilings; required for MySQL/MariaDB",
+    )
+    parser.add_argument(
+        "--monitor-interval",
+        type=float,
+        default=1.0,
+        help="seconds between hardware samples (default 1)",
+    )
+    parser.add_argument(
+        "--monitor-capacity",
+        type=int,
+        default=3600,
+        help="maximum retained samples per workload cycle",
+    )
+    parser.add_argument(
+        "--leak-cycles",
+        type=int,
+        default=4,
+        help="repeat each workload (default 4; first is warm-up; 1 disables cross-cycle checks)",
+    )
+    parser.add_argument(
+        "--leak-thresholds",
+        default=json.dumps(load_monitor.DEFAULT_THRESHOLDS),
+        help="JSON absolute growth per cycle: rss_kb, fds, tasks, connections",
+    )
+    parser.add_argument(
         "--allow-remote-host", action="store_true", help="allow an explicit remote DB host"
+    )
+    parser.add_argument(
+        "--allow-port",
+        action="store_true",
+        help="explicitly allow a MySQL/MariaDB port other than 53306/53307",
     )
     args = parser.parse_args(argv)
     if not args.url:
         parser.error("--url (or DENDRUX_LOAD_PG_URL) is required")
+    try:
+        args.leak_thresholds = json.loads(args.leak_thresholds)
+        if set(args.leak_thresholds) != set(load_monitor.DEFAULT_THRESHOLDS) or any(
+            isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0
+            for v in args.leak_thresholds.values()
+        ):
+            raise ValueError("invalid thresholds")
+    except (ValueError, TypeError):
+        parser.error(
+            "--leak-thresholds must give finite nonnegative rss_kb, fds, tasks, connections"
+        )
+    if (
+        not math.isfinite(args.monitor_interval)
+        or args.monitor_interval <= 0
+        or args.monitor_capacity < 2
+        or args.leak_cycles < 1
+    ):
+        parser.error("monitor interval must be positive, capacity >= 2 and leak cycles >= 1")
     if args.workers < 1:
         parser.error("--workers must be at least 1")
     if args.scenarios:
@@ -3294,13 +3865,41 @@ def main(argv: list[str] | None = None) -> int:
         if unknown:
             parser.error(f"unknown scenarios: {sorted(unknown)}")
     try:
-        check_private_url(args.url, allow_remote_host=args.allow_remote_host)
+        parsed = check_private_url(
+            args.url, allow_remote_host=args.allow_remote_host, allow_port=args.allow_port
+        )
+        budget_path = args.statement_budgets
+        args.statement_budgets = json.loads(Path(budget_path).read_text()) if budget_path else {}
+        if not isinstance(args.statement_budgets, dict) or any(
+            not isinstance(k, str)
+            or isinstance(v, bool)
+            or not isinstance(v, (int, float))
+            or not math.isfinite(v)
+            or v < 0
+            for k, v in args.statement_budgets.items()
+        ):
+            raise ValueError("statement budgets must map gate names to finite nonnegative numbers")
+        if parsed.get_backend_name() == "mysql" and not budget_path:
+            raise ValueError(
+                "MySQL/MariaDB require --statement-budgets before measurement (T-BUDGET)"
+            )
+        if parsed.get_backend_name() == "mysql":
+            required = mysql_budget_keys(
+                args.scenarios.split(",") if args.scenarios else ALL_SCENARIOS
+            )
+            missing = required - args.statement_budgets.keys()
+            if missing:
+                raise ValueError(f"missing predeclared MySQL statement budgets: {sorted(missing)}")
         baseline = load_baseline(Path(args.baseline) if args.baseline else None)
         compare_gates({}, baseline, scale=args.scale)
+    except (ValueError, OSError) as exc:
+        print(f"load.py: {exc}", file=sys.stderr)
+        return 2
+    try:
+        return asyncio.run(run_all(args))
     except ValueError as exc:
         print(f"load.py: {exc}", file=sys.stderr)
         return 2
-    return asyncio.run(run_all(args))
 
 
 if __name__ == "__main__":
