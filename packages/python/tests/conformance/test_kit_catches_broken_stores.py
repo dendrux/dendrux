@@ -7,6 +7,7 @@ failure is the mutation's, and the failing contract must be the one that guards 
 
 from __future__ import annotations
 
+import re
 import textwrap
 from typing import TYPE_CHECKING
 
@@ -28,6 +29,8 @@ from dendrux.testing.store_kit.sql import SqlFaultInjector
 
 {mutation}
 
+{injector}
+
 @pytest_asyncio.fixture
 async def kit_backend(tmp_path):
     backend = kb.KitBackend("sqlite-file", tmp_path, wrap=mutate)
@@ -44,11 +47,12 @@ def dendrux_store_second_instance(kit_backend): return kit_backend.second
 def dendrux_clock(kit_backend): return kit_backend
 @pytest.fixture
 def dendrux_fault_injector():
-    injector = SqlFaultInjector()
+    injector = Injector()
     yield injector
     injector.close()
 """
 NONE = "def mutate(store):\n    return store\n"
+PLAIN_INJECTOR = "Injector = SqlFaultInjector"
 
 
 def mutant(methods: str) -> str:
@@ -66,7 +70,8 @@ MUTANTS = {
             return await super().save_run_event(run_id, event_id=event_id, **kw)
         """),
         "stale_epoch_is_refused and save_run_event",
-        "test_a_stale_epoch_is_refused_by_every_fenced_writer[save_run_event]",
+        {"test_a_stale_epoch_is_refused_by_every_fenced_writer"},
+        PLAIN_INJECTOR,
     ),
     "a stale finalize is accepted": (
         mutant("""
@@ -74,7 +79,8 @@ MUTANTS = {
             return await super().finalize_run(run_id, **kw)
         """),
         "stale_finalize_changes_nothing",
-        "test_a_stale_finalize_changes_nothing",
+        {"test_a_stale_finalize_changes_nothing"},
+        PLAIN_INJECTOR,
     ),
     "a trace retry is not recognised by its identity": (
         mutant("""
@@ -86,7 +92,8 @@ MUTANTS = {
             )
         """),
         "same_identity_stores_once and save_trace",
-        "test_a_repeated_write_with_the_same_identity_stores_once[save_trace]",
+        {"test_a_repeated_write_with_the_same_identity_stores_once"},
+        PLAIN_INJECTOR,
     ),
     "a changed trace under the same identity is swallowed": (
         mutant("""
@@ -101,7 +108,8 @@ MUTANTS = {
                 return trace_id
         """),
         "different_content_conflicts and save_trace",
-        "test_the_same_identity_with_different_content_conflicts[save_trace]",
+        {"test_the_same_identity_with_different_content_conflicts"},
+        PLAIN_INJECTOR,
     ),
     "the note cap is ignored": (
         mutant("""
@@ -111,7 +119,8 @@ MUTANTS = {
             )
         """),
         "note_cap",
-        "test_the_note_cap_counts_exactly",
+        {"test_the_note_cap_counts_exactly"},
+        PLAIN_INJECTOR,
     ),
     "every claim wins": (
         mutant("""
@@ -120,7 +129,11 @@ MUTANTS = {
             return ClaimResult(1, 2, None, None) if got is False else got
         """),
         "claim_has_one_winner or parallel_claims_have",
-        "test_pause_state_is_stored_and_a_claim_has_one_winner",
+        {
+            "test_pause_state_is_stored_and_a_claim_has_one_winner",
+            "test_parallel_claims_have_exactly_one_winner",
+        },
+        PLAIN_INJECTOR,
     ),
     "tenants are trimmed and case-folded": (
         mutant("""
@@ -130,7 +143,8 @@ MUTANTS = {
             return await super().list_runs(tenant_id=tenant_id, **kw)
         """),
         "tenant_scope_is_exact",
-        "test_tenant_scope_is_exact_not_padded_or_case_folded",
+        {"test_tenant_scope_is_exact_not_padded_or_case_folded"},
+        PLAIN_INJECTOR,
     ),
     "sweeps ignore their age threshold": (
         mutant("""
@@ -138,7 +152,8 @@ MUTANTS = {
             return await super().sweep_stale_runs(timedelta(0), **kw)
         """),
         "sweeping_stale_running",
-        "test_sweeping_stale_running_runs_spares_fresh_ones",
+        {"test_sweeping_stale_running_runs_spares_fresh_ones"},
+        PLAIN_INJECTOR,
     ),
     "finalize_with_event is two transactions": (
         mutant("""
@@ -161,7 +176,8 @@ MUTANTS = {
             )
         """),
         "finalize_with_event_is_all_or_nothing and before_commit and 1",
-        "test_finalize_with_event_is_all_or_nothing[before_commit-1]",
+        {"test_finalize_with_event_is_all_or_nothing"},
+        PLAIN_INJECTOR,
     ),
     "a lost acknowledgement duplicates an event": (
         mutant("""
@@ -169,13 +185,43 @@ MUTANTS = {
             return await super().save_run_event(run_id, claim_epoch=claim_epoch, **kw)
         """),
         "failed_write_is_repeated_safely and save_run_event and after_commit",
-        "test_a_failed_write_is_repeated_safely_with_the_same_identity[save_run_event-after_commit]",
+        {"test_a_failed_write_is_repeated_safely_with_the_same_identity"},
+        PLAIN_INJECTOR,
+    ),
+    "pause_run is not fenced": (
+        mutant("""
+        async def pause_run(self, run_id, *, claim_epoch=None, **kw):
+            return await super().pause_run(run_id, **kw)
+        """),
+        "stale_pause",
+        {"test_a_stale_pause_run_changes_nothing"},
+        PLAIN_INJECTOR,
+    ),
+    "pause_with_event is not fenced": (
+        mutant("""
+        async def pause_with_event(self, run_id, *, claim_epoch=None, **kw):
+            return await super().pause_with_event(run_id, **kw)
+        """),
+        "stale_pause",
+        {"test_a_stale_pause_with_event_changes_nothing"},
+        PLAIN_INJECTOR,
+    ),
+    "mark_notes_delivered is not fenced": (
+        mutant("""
+        async def mark_notes_delivered(self, run_id, note_ids, *, iteration, claim_epoch=None):
+            return await super().mark_notes_delivered(run_id, note_ids, iteration=iteration)
+        """),
+        "stale_epoch_is_refused and mark_notes_delivered",
+        {"test_a_stale_epoch_is_refused_by_every_fenced_writer"},
+        PLAIN_INJECTOR,
     ),
 }
 
 
-def run_slice(pytester: pytest.Pytester, mutation: str, k: str) -> pytest.RunResult:
-    pytester.makeconftest(CONFTEST.format(mutation=mutation))
+def run_slice(
+    pytester: pytest.Pytester, mutation: str, k: str, injector: str = PLAIN_INJECTOR
+) -> pytest.RunResult:
+    pytester.makeconftest(CONFTEST.format(mutation=mutation, injector=injector))
     return pytester.runpytest(
         "-p", "dendrux.testing.store_kit", "-p", "no:randomly", "-p", "no:cacheprovider",
         "-o", "asyncio_mode=auto", "-o", "asyncio_default_fixture_loop_scope=function",
@@ -183,21 +229,27 @@ def run_slice(pytester: pytest.Pytester, mutation: str, k: str) -> pytest.RunRes
     )  # fmt: skip
 
 
+def failed_functions(result: pytest.RunResult) -> set[str]:
+    """Names (without parameters) of the contracts that failed."""
+    found = re.findall(r"^FAILED \S+::(\w+)", result.stdout.str(), flags=re.MULTILINE)
+    return set(found)
+
+
 @pytest.mark.parametrize("name", sorted(MUTANTS))
-def test_the_kit_fails_a_broken_store_on_the_contract_that_guards_the_promise(
+def test_the_kit_fails_a_broken_store_on_exactly_the_contracts_that_guard_the_promise(
     pytester: pytest.Pytester, name: str
 ) -> None:
-    mutation, k, failing = MUTANTS[name]
-    broken = run_slice(pytester, mutation, k)
-    assert broken.parseoutcomes().get("failed", 0) >= 1, f"the kit missed: {name}"
+    mutation, k, expected, injector = MUTANTS[name]
+    broken = run_slice(pytester, mutation, k, injector)
     text = broken.stdout.str()
-    assert "FAILED test_" in text and f"::{failing}" in text, text[-1500:]
-    assert "NOT CERTIFIED" in text
+    assert failed_functions(broken) == expected, text[-2500:]
+    if expected:
+        assert "NOT CERTIFIED" in text
 
 
 @pytest.mark.parametrize("name", sorted(MUTANTS))
 def test_the_same_slice_passes_on_the_unbroken_store(pytester: pytest.Pytester, name: str) -> None:
-    _, k, _ = MUTANTS[name]
+    _, k, _, _ = MUTANTS[name]
     intact = run_slice(pytester, NONE, k)
     outcomes = intact.parseoutcomes()
     assert outcomes.get("failed", 0) == 0 and outcomes.get("passed", 0) >= 1, intact.stdout.str()

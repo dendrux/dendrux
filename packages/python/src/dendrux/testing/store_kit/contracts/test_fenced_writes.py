@@ -62,8 +62,23 @@ async def test_a_stale_epoch_is_refused_by_every_fenced_writer(
 ) -> None:
     run_id, claim = await dendrux_kit.claimed_run()
     stale = claim.claim_epoch - 1
+    seeded = ulid()
+    if writer == "mark_notes_delivered":
+        # a real, undelivered note: a refusal must come from the fence, not from a missing note
+        await dendrux_kit.store.add_note(
+            run_id, note_id=seeded, text="n", claim_epoch=claim.claim_epoch
+        )
     with pytest.raises(RunFencedError):
-        await _raising_writers()[writer](dendrux_kit.store, run_id, stale)
+        if writer == "mark_notes_delivered":
+            await dendrux_kit.store.mark_notes_delivered(
+                run_id, [seeded], iteration=0, claim_epoch=stale
+            )
+        else:
+            await _raising_writers()[writer](dendrux_kit.store, run_id, stale)
+    if writer == "mark_notes_delivered":
+        [note] = await dendrux_kit.store.get_notes(run_id)
+        assert note.delivered_at is None, "a stale owner must not mark a note delivered"
+        return
     await _nothing_was_written(dendrux_kit, run_id)
 
 
@@ -141,3 +156,89 @@ async def test_a_second_claim_fences_the_first_executor(dendrux_kit: Kit) -> Non
     with pytest.raises(RunFencedError):
         await store.save_run_event(run_id, event_type=EVENT, claim_epoch=first.claim_epoch)
     assert await store.save_run_event(run_id, event_type=EVENT, claim_epoch=second.claim_epoch) == 0
+
+
+async def _refused_or_ignored(call: Awaitable[Any]) -> Any:
+    """A stale status write is refused (``RunFencedError``) or ignored; either way it is a loss."""
+    try:
+        return await call
+    except RunFencedError:
+        return None
+
+
+@fenced
+async def test_a_stale_pause_run_changes_nothing(dendrux_kit: Kit) -> None:
+    run_id, claim = await dendrux_kit.claimed_run()
+    store = dendrux_kit.store
+    await _refused_or_ignored(
+        store.pause_run(
+            run_id,
+            status="waiting_client_tool",
+            pause_data={"pause_id": "stale-owner"},
+            claim_epoch=claim.claim_epoch - 1,
+        )
+    )
+    record = await store.get_run(run_id)
+    assert record is not None and record.status == "running", "a stale owner cannot pause the run"
+    assert (await store.get_pause_state(run_id) or {}).get("pause_id") != "stale-owner"
+    await store.pause_run(
+        run_id,
+        status="waiting_client_tool",
+        pause_data={"pause_id": "current-owner"},
+        claim_epoch=claim.claim_epoch,
+    )
+    assert (await store.get_run(run_id)).status == "waiting_client_tool"
+    assert (await store.get_pause_state(run_id))["pause_id"] == "current-owner"
+
+
+@fenced
+async def test_a_stale_pause_with_event_changes_nothing(dendrux_kit: Kit) -> None:
+    run_id, claim = await dendrux_kit.claimed_run()
+    store = dendrux_kit.store
+    stale = await _refused_or_ignored(
+        store.pause_with_event(
+            run_id,
+            status="waiting_client_tool",
+            pause_data={"pause_id": "stale-owner"},
+            claim_epoch=claim.claim_epoch - 1,
+        )
+    )
+    assert stale is None, "a stale pause reports the loss"
+    record = await store.get_run(run_id)
+    assert record is not None and record.status == "running"
+    assert await store.get_run_events(run_id) == [], "a lost pause publishes no event"
+    sequence = await store.pause_with_event(
+        run_id,
+        status="waiting_client_tool",
+        pause_data={"pause_id": "current-owner"},
+        claim_epoch=claim.claim_epoch,
+    )
+    assert sequence == 0
+    assert (await store.get_run(run_id)).status == "waiting_client_tool"
+    assert [e.event_type for e in await store.get_run_events(run_id)] == ["run.paused"]
+
+
+#: Every ``StateStore`` method that takes ``claim_epoch``, and the contract that refuses a stale
+#: epoch for it. tests/conformance/test_kit_coverage.py keeps this equal to the protocol.
+FENCED_WRITER_CONTRACTS: dict[str, str] = {
+    "add_note": "test_a_stale_epoch_is_refused_by_every_fenced_writer",
+    "mark_notes_delivered": "test_a_stale_epoch_is_refused_by_every_fenced_writer",
+    "save_trace": "test_a_stale_epoch_is_refused_by_every_fenced_writer",
+    "save_tool_call": "test_a_stale_epoch_is_refused_by_every_fenced_writer",
+    "save_usage": "test_a_stale_epoch_is_refused_by_every_fenced_writer",
+    "save_llm_interaction": "test_a_stale_epoch_is_refused_by_every_fenced_writer",
+    "save_run_event": "test_a_stale_epoch_is_refused_by_every_fenced_writer",
+    "update_run_meta": "test_a_stale_epoch_is_refused_by_every_fenced_writer",
+    "touch_progress": "test_touch_progress_reports_a_stale_epoch_as_false",
+    "finalize_run": "test_a_stale_finalize_changes_nothing",
+    "finalize_run_if_status_in": "test_a_stale_finalize_changes_nothing",
+    "try_pause_run": "test_a_stale_pause_changes_nothing",
+    "pause_run": "test_a_stale_pause_run_changes_nothing",
+    "pause_with_event": "test_a_stale_pause_with_event_changes_nothing",
+    "checkpoint_step": "test_a_stale_epoch_cannot_checkpoint_or_link",
+    "set_trace_link": "test_a_stale_epoch_cannot_checkpoint_or_link",
+    "consume_submission": "test_a_stale_epoch_cannot_consume_a_submission",
+    "start_tool_call": "test_a_stale_epoch_cannot_start_or_complete_a_tool_call",
+    "complete_tool_call": "test_a_stale_epoch_cannot_start_or_complete_a_tool_call",
+    "finalize_with_event": "test_a_stale_finalize_with_event_publishes_nothing",
+}
