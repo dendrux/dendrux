@@ -200,3 +200,12 @@ def test_a_complete_enough_selection_still_names_what_was_not_run(
     text = result.stdout.str()
     assert "NOT CERTIFIED" in text and "incomplete run" in text
     assert "dendrux_store_reopen" not in text.split("NOT CERTIFIED")[1]
+
+
+def test_without_a_clock_time_based_contracts_skip_as_unverified(
+    pytester: pytest.Pytester,
+) -> None:
+    caps = {"deployment": "single_process", "recovery": False}
+    result = kit(pytester, caps, k="sweeping_stale_running_runs_spares_fresh_ones")
+    result.assert_outcomes(skipped=1)
+    result.stdout.fnmatch_lines(["*unverified: time-based sweeps and leases*"])

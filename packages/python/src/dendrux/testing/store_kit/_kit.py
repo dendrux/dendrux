@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from datetime import timedelta
-from typing import TYPE_CHECKING, Any
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
@@ -20,6 +21,8 @@ from dendrux.testing.store_kit._declaration import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
     from dendrux.runtime.state import ClaimResult
     from dendrux.testing.store_kit._protocols import (
         Clock,
@@ -55,6 +58,23 @@ def fixture_or_none(request: pytest.FixtureRequest, name: str) -> Any | None:
         return request.getfixturevalue(name)
     except pytest.FixtureLookupError:
         return None
+
+
+@dataclass
+class Faulted:
+    """What happened to a call made with a fault armed."""
+
+    raised: BaseException | None
+    result: Any
+    fired: int
+
+    def expect_fired(self, point: str) -> None:
+        """Fail certification when the requested cut never happened (a no-op injector)."""
+        if self.fired < 1:
+            raise CertificationFailure(
+                f"the fault injector did not fire the requested {point} cut: "
+                "dendrux_fault_injector must make the next write transaction fail"
+            )
 
 
 class Kit:
@@ -105,33 +125,52 @@ class Kit:
             pytest.skip(f"{FAULT_INJECTOR} not provided: crash recovery is not certified")
         return found
 
-    def arm(
-        self,
-        point: FaultPoint,
-        *,
-        kind: FaultKind = "error",
-        after: int = 0,
-        store: Any | None = None,
-    ) -> None:
-        target = store if store is not None else self.store
-        self.injector.arm(target, point, kind=kind, after=after)
-
-    def disarm(self, store: Any | None = None) -> None:
-        injector = self._provided.get(FAULT_INJECTOR)
-        if injector is not None:
-            injector.disarm(store if store is not None else self.store)
-
     async def age(self) -> timedelta:
         """Make what exists so far old; return a sweep threshold that spares what comes next.
 
-        With ``dendrux_clock`` the world moves two hours forward and the threshold is one hour.
-        Without it the kit waits a fraction of a second of real time.
+        The world moves two hours forward through ``dendrux_clock`` and the threshold is one
+        hour. Without the clock, time-based contracts cannot be run, so they skip as unverified.
         """
-        if self.has_clock:
-            await self.advance(timedelta(hours=2))
-            return timedelta(hours=1)
-        await asyncio.sleep(0.4)
-        return timedelta(seconds=0.2)
+        if not self.has_clock:
+            pytest.skip("unverified: time-based sweeps and leases: dendrux_clock not provided")
+        await self.advance(timedelta(hours=2))
+        return timedelta(hours=1)
+
+    async def now(self) -> datetime:
+        """The store's present, as the clock sees it (wall clock when the clock has no ``now``)."""
+        clock = self._provided.get(CLOCK)
+        reader = getattr(clock, "now", None)
+        if reader is None:
+            return datetime.now(UTC)
+        return cast("datetime", await maybe_await(reader()))
+
+    async def faulted(
+        self,
+        point: FaultPoint,
+        call: Callable[[], Awaitable[Any]],
+        *,
+        kind: FaultKind = "error",
+        after: int = 0,
+        sticky: bool = False,
+        store: Any | None = None,
+    ) -> Faulted:
+        """Run ``call`` with a fault armed on the store, then disarm and report what happened."""
+        target = store if store is not None else self.store
+        injector = self.injector
+        injector.arm(target, point, kind=kind, after=after, sticky=sticky)
+        raised: BaseException | None = None
+        result: Any = None
+        try:
+            result = await call()
+        except asyncio.CancelledError as exc:
+            if kind != "cancel":
+                raise
+            raised = exc
+        except Exception as exc:
+            raised = exc
+        finally:
+            injector.disarm(target)
+        return Faulted(raised, result, int(injector.fired(target)))
 
     # -- runs ------------------------------------------------------------------------------
 
@@ -194,4 +233,4 @@ def check_declaration(store: Any, declaration: Declaration) -> None:
         ) from None
 
 
-__all__ = ["FACTORY", "CertificationFailure", "Kit", "check_declaration", "maybe_await"]
+__all__ = ["FACTORY", "CertificationFailure", "Faulted", "Kit", "check_declaration", "maybe_await"]

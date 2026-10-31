@@ -280,3 +280,98 @@ def test_usage_rows_cannot_be_read_so_usage_retry_identity_is_reported_unverifie
     # the caveat travels with the verdict line when the rest of the group is certified
     intact = run_slice(pytester, NONE, "save_usage")
     assert "unverified: save_usage" in intact.stdout.str()
+
+
+NOOP_ERRORS = """
+class Injector(SqlFaultInjector):
+    \"\"\"An injector whose error faults silently never fire.\"\"\"
+
+    def arm(self, store, point, *, kind="error", **kw):
+        if kind == "error":
+            return
+        super().arm(store, point, kind=kind, **kw)
+"""
+CRASH_FUNCTIONS = {
+    "test_a_failed_write_is_repeated_safely_with_the_same_identity",
+    "test_a_one_shot_failure_is_absorbed_or_retried_into_exactly_one_write",
+    "test_finalize_that_fails_around_commit_leaves_one_final_state",
+    "test_a_claim_that_fails_never_leaves_two_owners",
+    "test_finalize_with_event_is_all_or_nothing",
+    "test_a_tool_completion_is_all_or_nothing_and_repeatable",
+    "test_a_checkpoint_that_fails_leaves_the_previous_checkpoint",
+    "test_a_sweep_that_fails_midway_is_finished_by_the_next_sweep",
+}
+
+
+def test_an_injector_that_never_fires_fails_every_crash_contract(
+    pytester: pytest.Pytester,
+) -> None:
+    broken = run_slice(
+        pytester, NONE, "crash_recovery or failed or fails or all_or_nothing", NOOP_ERRORS
+    )
+    text = broken.stdout.str()
+    assert failed_functions(broken) == CRASH_FUNCTIONS, text[-2500:]
+    assert "NOT CERTIFIED" in text
+
+
+TIME_SOURCE_CLOCK = """
+import datetime as _real_datetime_module
+_Real = _real_datetime_module.datetime
+OFFSET = {"value": timedelta(0)}
+
+
+class _Same(type(_Real)):
+    def __instancecheck__(cls, obj):
+        return isinstance(obj, _Real)
+
+
+class _Shifted(_Real, metaclass=_Same):
+    @classmethod
+    def now(cls, tz=None):
+        return _Real.now(tz) + OFFSET["value"]
+
+
+class _SourceClock:
+    \"\"\"A clock that moves the store's time source and leaves stored timestamps alone.\"\"\"
+
+    def advance(self, delta):
+        OFFSET["value"] += delta
+
+    def now(self):
+        return _Real.now(_real_datetime_module.UTC) + OFFSET["value"]
+
+
+@pytest.fixture(autouse=True)
+def _patched_time_source():
+    OFFSET["value"] = timedelta(0)
+    _real_datetime_module.datetime = _Shifted
+    yield
+    _real_datetime_module.datetime = _Real
+
+
+@pytest.fixture
+def dendrux_clock():
+    return _SourceClock()
+"""
+
+
+def test_a_clock_that_moves_the_store_time_source_is_supported(
+    pytester: pytest.Pytester,
+) -> None:
+    """Lease cutoffs come from the supplied clock, not from the wall clock."""
+    pytester.makeconftest(
+        CONFTEST.format(mutation=NONE, injector=PLAIN_INJECTOR).replace(
+            "@pytest.fixture\ndef dendrux_clock(kit_backend): return kit_backend\n", ""
+        )
+        + TIME_SOURCE_CLOCK
+    )
+    result = pytester.runpytest(
+        "-p", "dendrux.testing.store_kit", "-p", "no:randomly", "-p", "no:cacheprovider",
+        "-o", "asyncio_mode=auto", "-o", "asyncio_default_fixture_loop_scope=function",
+        "--no-cov", "-q", "-rf",
+        "-k", "lease_expired or reclaim_gives or sweeping_ or partial_sweep",
+    )  # fmt: skip
+    outcomes = result.parseoutcomes()
+    assert outcomes.get("failed", 0) == 0 and outcomes.get("passed", 0) >= 5, result.stdout.str()[
+        -2500:
+    ]

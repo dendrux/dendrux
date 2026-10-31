@@ -338,7 +338,7 @@ async def test_two_markers_find_each_stale_run_once(dendrux_kit: Kit) -> None:
         )
         runs.append(run_id)
     threshold = await dendrux_kit.age()
-    cutoff = datetime.now(UTC) - threshold
+    cutoff = await dendrux_kit.now() - threshold
     options = {
         "cutoff": cutoff,
         "batch_size": 10,

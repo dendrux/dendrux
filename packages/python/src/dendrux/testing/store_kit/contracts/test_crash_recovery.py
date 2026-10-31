@@ -1,15 +1,21 @@
 """Crash recovery, through the optional ``dendrux_fault_injector``.
 
-A fault fails the next write transaction at a named point. After any of them the store must be
-in one of the two states the operation allows (done, or not done), never half done, and the
-caller must be able to retry safely. Without the fault injector these contracts skip and the
-report says "crash recovery: not certified".
+A fault fails write transactions of a store at a named point. Each contract first asserts that
+the cut it asked for really fired (an injector that does nothing fails certification), then
+asserts the exact outcome:
+
+- ``before_commit`` / ``mid_write`` with a fault that keeps firing: the call fails and nothing
+  persisted, not even part of an operation;
+- ``after_commit``: the write persisted although the caller saw a failure, and repeating it by its
+  identity stores it exactly once.
+
+Without the fault injector these contracts skip and the report says "crash recovery: not
+certified".
 """
 
 from __future__ import annotations
 
 import asyncio
-import contextlib
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -30,20 +36,15 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
     from dendrux.testing.store_kit._kit import Kit
+    from dendrux.testing.store_kit._protocols import FaultPoint
 
 crash = contract("crash_recovery", uses=("injector",))
 retry_crash = contract("crash_recovery", needs=("retry_ids",), uses=("injector",))
 atomic_crash = contract(
     "crash_recovery", needs=("atomic_completion",), uses=("injector",), format2=True
 )
-
-
-async def attempt(call: Callable[[], Awaitable[Any]]) -> tuple[bool, Any]:
-    """Run a faulted call: (it returned, its result or the exception it raised)."""
-    try:
-        return True, await call()
-    except Exception as exc:
-        return False, exc
+POINTS: list[FaultPoint] = ["before_commit", "after_commit", "mid_write"]
+ROLLED_BACK: list[FaultPoint] = ["before_commit", "mid_write"]
 
 
 def writers(store: Any, run_id: str, ident: str) -> dict[str, Callable[[], Awaitable[Any]]]:
@@ -73,30 +74,44 @@ async def count(store: Any, run_id: str, writer: str) -> int:
     return len(await reads[writer](run_id))
 
 
+WRITER_NAMES = ["save_trace", "save_tool_call", "save_run_event", "save_llm_interaction"]
+
+
 @retry_crash
-@pytest.mark.parametrize("point", ["before_commit", "after_commit", "mid_write"])
-@pytest.mark.parametrize(
-    "writer", ["save_trace", "save_tool_call", "save_run_event", "save_llm_interaction"]
-)
+@pytest.mark.parametrize("point", POINTS)
+@pytest.mark.parametrize("writer", WRITER_NAMES)
 async def test_a_failed_write_is_repeated_safely_with_the_same_identity(
-    dendrux_kit: Kit, writer: str, point: str
+    dendrux_kit: Kit, writer: str, point: FaultPoint
 ) -> None:
     store = dendrux_kit.store
     run_id = await dendrux_kit.new_run()
-    ident = ulid()
-    call = writers(store, run_id, ident)[writer]
-    dendrux_kit.arm(point)  # type: ignore[arg-type]
-    returned, first = await attempt(call)
-    dendrux_kit.disarm()
-    stored_after_failure = await count(store, run_id, writer)
-    assert stored_after_failure in (0, 1), "never a duplicate"
-    if not returned:
-        # a lost acknowledgement may have stored it; a rolled-back write must have stored nothing
-        assert point != "before_commit" or stored_after_failure in (0, 1)
-    second = await call()
-    assert await count(store, run_id, writer) == 1, "retrying exactly once-stores the write"
-    if returned:
-        assert second == first
+    call = writers(store, run_id, ulid())[writer]
+    outcome = await dendrux_kit.faulted(point, call, sticky=True)
+    outcome.expect_fired(point)
+    stored = await count(store, run_id, writer)
+    if point in ROLLED_BACK:
+        assert outcome.raised is not None, "a write that cannot commit must fail"
+        assert stored == 0, f"{point}: nothing may persist"
+    else:
+        assert stored == 1, "after_commit: the write persisted although the caller saw a failure"
+    first = await call()
+    assert await count(store, run_id, writer) == 1, "repeating by identity stores it exactly once"
+    assert await call() == first
+
+
+@retry_crash
+@pytest.mark.parametrize("point", POINTS)
+@pytest.mark.parametrize("writer", WRITER_NAMES)
+async def test_a_one_shot_failure_is_absorbed_or_retried_into_exactly_one_write(
+    dendrux_kit: Kit, writer: str, point: FaultPoint
+) -> None:
+    store = dendrux_kit.store
+    run_id = await dendrux_kit.new_run()
+    call = writers(store, run_id, ulid())[writer]
+    outcome = await dendrux_kit.faulted(point, call)
+    outcome.expect_fired(point)
+    await call()
+    assert await count(store, run_id, writer) == 1
 
 
 @crash
@@ -105,10 +120,11 @@ async def test_a_cancelled_write_is_not_half_applied_and_the_store_stays_usable(
 ) -> None:
     store = dendrux_kit.store
     run_id = await dendrux_kit.new_run()
-    dendrux_kit.arm("before_commit", kind="cancel")
-    with pytest.raises(asyncio.CancelledError):
-        await store.save_run_event(run_id, event_type=EVENT)
-    dendrux_kit.disarm()
+    outcome = await dendrux_kit.faulted(
+        "before_commit", lambda: store.save_run_event(run_id, event_type=EVENT), kind="cancel"
+    )
+    outcome.expect_fired("before_commit")
+    assert isinstance(outcome.raised, asyncio.CancelledError)
     assert await store.get_run_events(run_id) == []
     assert await store.save_run_event(run_id, event_type=EVENT) == 0
 
@@ -116,24 +132,25 @@ async def test_a_cancelled_write_is_not_half_applied_and_the_store_stays_usable(
 @crash
 @pytest.mark.parametrize("point", ["before_commit", "after_commit"])
 async def test_finalize_that_fails_around_commit_leaves_one_final_state(
-    dendrux_kit: Kit, point: str
+    dendrux_kit: Kit, point: FaultPoint
 ) -> None:
     store = dendrux_kit.store
     run_id = await dendrux_kit.new_run()
-    dendrux_kit.arm(point)  # type: ignore[arg-type]
-    await attempt(
-        lambda: store.finalize_run(
+
+    async def finalize() -> Any:
+        return await store.finalize_run(
             run_id, status="success", answer="done", expected_current_status="running"
         )
-    )
-    dendrux_kit.disarm()
+
+    outcome = await dendrux_kit.faulted(point, finalize, sticky=True)
+    outcome.expect_fired(point)
     record = await store.get_run(run_id)
     assert record is not None
-    if record.status == "running":
-        assert point == "before_commit", "a committed finalize must be visible"
-        assert await store.finalize_run(
-            run_id, status="success", answer="done", expected_current_status="running"
-        )
+    if point == "before_commit":
+        assert outcome.raised is not None and record.status == "running"
+        assert await finalize() is True
+    else:
+        assert (record.status, record.answer) == ("success", "done"), "the commit is visible"
     final = await store.get_run(run_id)
     assert final is not None and (final.status, final.answer) == ("success", "done")
     assert not await store.finalize_run(
@@ -142,31 +159,59 @@ async def test_finalize_that_fails_around_commit_leaves_one_final_state(
 
 
 @crash
-async def test_a_claim_that_fails_after_commit_never_leaves_two_owners(dendrux_kit: Kit) -> None:
+@pytest.mark.parametrize("point", ["before_commit", "after_commit"])
+async def test_a_claim_that_fails_never_leaves_two_owners(
+    dendrux_kit: Kit, point: FaultPoint
+) -> None:
     store = dendrux_kit.store
     run_id = await dendrux_kit.paused_run()
-    dendrux_kit.arm("after_commit")
-    returned, first = await attempt(
-        lambda: store.claim_paused_run(run_id, expected_status="waiting_client_tool")
-    )
-    dendrux_kit.disarm()
+
+    async def claim() -> Any:
+        return await store.claim_paused_run(run_id, expected_status="waiting_client_tool")
+
+    outcome = await dendrux_kit.faulted(point, claim, sticky=True)
+    outcome.expect_fired(point)
     record = await store.get_run(run_id)
-    assert record is not None and record.status == "running", "the committed claim is visible"
-    if returned:
-        assert first is not False
-    assert await store.claim_paused_run(run_id, expected_status="waiting_client_tool") is False
+    assert record is not None
+    if point == "before_commit":
+        assert outcome.raised is not None
+        assert record.status == "waiting_client_tool", "an uncommitted claim changes nothing"
+        assert await claim() is not False
+    else:
+        assert record.status == "running", "the committed claim is visible"
+        assert await claim() is False, "nobody can claim it twice"
+
+
+async def _all_or_nothing(
+    kit: Kit,
+    run_id: str,
+    point: FaultPoint,
+    after: int,
+    outcome_fired: int,
+    done: Callable[[], Awaitable[bool]],
+    nothing: Callable[[], Awaitable[bool]],
+) -> None:
+    """Exactly done, or exactly nothing: never half. A cut that fired early leaves nothing."""
+    if after == 0 and point in ROLLED_BACK:
+        assert await nothing(), f"{point}: the failed operation left something behind"
+    elif after == 0:
+        assert await done(), "after_commit: the committed operation must be fully visible"
+    else:
+        assert await done() or await nothing(), "an operation cut between transactions is half done"
+        if outcome_fired == 0:
+            assert await done(), "a single-transaction operation the cut missed must be complete"
 
 
 @atomic_crash
 @pytest.mark.parametrize("after", [0, 1])
-@pytest.mark.parametrize("point", ["before_commit", "after_commit", "mid_write"])
+@pytest.mark.parametrize("point", POINTS)
 async def test_finalize_with_event_is_all_or_nothing(
-    dendrux_kit: Kit, point: str, after: int
+    dendrux_kit: Kit, point: FaultPoint, after: int
 ) -> None:
     store = dendrux_kit.store
     run_id = await dendrux_kit.new_run()
-    dendrux_kit.arm(point, after=after)  # type: ignore[arg-type]
-    await attempt(
+    outcome = await dendrux_kit.faulted(
+        point,
         lambda: store.finalize_with_event(
             run_id,
             status="success",
@@ -176,24 +221,40 @@ async def test_finalize_with_event_is_all_or_nothing(
             claim_epoch=0,
             trace=trace_write("assistant", "done", 0),
             event=event_write("run.completed", run_id),
-        )
+        ),
+        after=after,
+        sticky=True,
     )
-    dendrux_kit.disarm()
-    record = await store.get_run(run_id)
-    assert record is not None
-    traces = await store.get_traces(run_id)
-    events = await store.get_run_events(run_id)
-    if record.status == "success":
-        assert len(traces) == 1 and [e.event_type for e in events] == ["run.completed"]
-    else:
-        assert record.status == "running" and traces == [] and events == []
+    if after == 0:
+        outcome.expect_fired(point)
+
+    async def done() -> bool:
+        record = await store.get_run(run_id)
+        events = [e.event_type for e in await store.get_run_events(run_id)]
+        return (
+            record is not None
+            and record.status == "success"
+            and len(await store.get_traces(run_id)) == 1
+            and events == ["run.completed"]
+        )
+
+    async def nothing() -> bool:
+        record = await store.get_run(run_id)
+        return (
+            record is not None
+            and record.status == "running"
+            and await store.get_traces(run_id) == []
+            and await store.get_run_events(run_id) == []
+        )
+
+    await _all_or_nothing(dendrux_kit, run_id, point, after, outcome.fired, done, nothing)
 
 
 @atomic_crash
 @pytest.mark.parametrize("after", [0, 1])
-@pytest.mark.parametrize("point", ["before_commit", "after_commit", "mid_write"])
+@pytest.mark.parametrize("point", POINTS)
 async def test_a_tool_completion_is_all_or_nothing_and_repeatable(
-    dendrux_kit: Kit, point: str, after: int
+    dendrux_kit: Kit, point: FaultPoint, after: int
 ) -> None:
     store = dendrux_kit.store
     run_id = await dendrux_kit.new_run()
@@ -206,67 +267,108 @@ async def test_a_tool_completion_is_all_or_nothing_and_repeatable(
     )
     await store.start_tool_call(run_id, claim_epoch=0, **start_call_kwargs("a"))
     kwargs = complete_call_kwargs("a", 1)
-    dendrux_kit.arm(point, after=after)  # type: ignore[arg-type]
-    await attempt(lambda: store.complete_tool_call(run_id, claim_epoch=0, **kwargs))
-    dendrux_kit.disarm()
-    state = await store.get_loop_state(run_id)
-    assert state is not None
-    done = state["pending"] == []
-    assert len(await store.get_traces(run_id)) == (1 if done else 0)
-    types = [e.event_type for e in await store.get_run_events(run_id)]
-    assert types == (["tool.started", "tool.completed"] if done else ["tool.started"])
+    outcome = await dendrux_kit.faulted(
+        point,
+        lambda: store.complete_tool_call(run_id, claim_epoch=0, **kwargs),
+        after=after,
+        sticky=True,
+    )
+    if after == 0:
+        outcome.expect_fired(point)
+
+    async def done() -> bool:
+        state = await store.get_loop_state(run_id)
+        types = [e.event_type for e in await store.get_run_events(run_id)]
+        return (
+            state is not None
+            and state["pending"] == []
+            and len(await store.get_traces(run_id)) == 1
+            and types == ["tool.started", "tool.completed"]
+        )
+
+    async def nothing() -> bool:
+        state = await store.get_loop_state(run_id)
+        types = [e.event_type for e in await store.get_run_events(run_id)]
+        return (
+            state is not None
+            and [p["call_id"] for p in state["pending"]] == ["a"]
+            and await store.get_traces(run_id) == []
+            and types == ["tool.started"]
+        )
+
+    await _all_or_nothing(dendrux_kit, run_id, point, after, outcome.fired, done, nothing)
     await store.complete_tool_call(run_id, claim_epoch=0, **kwargs)
-    assert len(await store.get_traces(run_id)) == 1
-    assert (await store.get_loop_state(run_id))["pending"] == []
+    assert await done(), "repeating the completion finishes it exactly once"
 
 
 @contract("crash_recovery", needs=("checkpointing",), uses=("injector",), format2=True)
 @pytest.mark.parametrize("after", [0, 1])
-@pytest.mark.parametrize("point", ["before_commit", "mid_write"])
+@pytest.mark.parametrize("point", ROLLED_BACK)
 async def test_a_checkpoint_that_fails_leaves_the_previous_checkpoint(
-    dendrux_kit: Kit, point: str, after: int
+    dendrux_kit: Kit, point: FaultPoint, after: int
 ) -> None:
     store = dendrux_kit.store
     run_id = await dendrux_kit.new_run()
     await store.checkpoint_step(
         run_id, claim_epoch=0, loop_state={"v": 1, "phase": "one"}, pii_mapping=None, trace=None
     )
-    dendrux_kit.arm(point, after=after)  # type: ignore[arg-type]
-    await attempt(
+    outcome = await dendrux_kit.faulted(
+        point,
         lambda: store.checkpoint_step(
             run_id,
             claim_epoch=0,
             loop_state={"v": 1, "phase": "two"},
             pii_mapping={"a": "b"},
             trace=trace_write("user", "t", 0),
-        )
+        ),
+        after=after,
+        sticky=True,
     )
-    dendrux_kit.disarm()
-    state = await store.get_loop_state(run_id)
-    traces = await store.get_traces(run_id)
-    if (state or {}).get("phase") == "two":
-        assert len(traces) == 1 and await store.get_pii_mapping(run_id) == {"a": "b"}
-    else:
-        assert state == {"v": 1, "phase": "one"} and traces == []
-        assert await store.get_pii_mapping(run_id) is None
+    if after == 0:
+        outcome.expect_fired(point)
+
+    async def done() -> bool:
+        return (
+            await store.get_loop_state(run_id) == {"v": 1, "phase": "two"}
+            and len(await store.get_traces(run_id)) == 1
+            and await store.get_pii_mapping(run_id) == {"a": "b"}
+        )
+
+    async def nothing() -> bool:
+        return (
+            await store.get_loop_state(run_id) == {"v": 1, "phase": "one"}
+            and await store.get_traces(run_id) == []
+            and await store.get_pii_mapping(run_id) is None
+        )
+
+    await _all_or_nothing(dendrux_kit, run_id, point, after, outcome.fired, done, nothing)
 
 
 @crash
-@pytest.mark.parametrize("point", ["before_commit", "after_commit", "mid_write"])
+@pytest.mark.parametrize("point", POINTS)
 async def test_a_sweep_that_fails_midway_is_finished_by_the_next_sweep(
-    dendrux_kit: Kit, point: str
+    dendrux_kit: Kit, point: FaultPoint
 ) -> None:
     store = dendrux_kit.store
     runs = [await dendrux_kit.new_run() for _ in range(4)]
     threshold = await dendrux_kit.age()
-    dendrux_kit.arm(point)  # type: ignore[arg-type]
     swept: list[str] = []
-    with contextlib.suppress(Exception):
-        swept += [s.run_id for s in await store.sweep_stale_runs(threshold, batch_size=2)]
-    dendrux_kit.disarm()
+
+    async def sweep() -> list[str]:
+        return [s.run_id for s in await store.sweep_stale_runs(threshold, batch_size=2)]
+
+    outcome = await dendrux_kit.faulted(point, sweep, sticky=True)
+    outcome.expect_fired(point)
+    if point in ROLLED_BACK:
+        assert outcome.raised is not None, "a sweep that cannot commit must fail"
+        for run_id in runs:
+            record = await store.get_run(run_id)
+            assert record is not None and record.status == "running", "nothing was swept"
+    else:
+        swept += [s for s in (outcome.result or [])]
     for _ in range(5):
-        swept += [s.run_id for s in await store.sweep_stale_runs(threshold, batch_size=2)]
-    assert len(swept) == len(set(swept)), "no run is reported swept twice"
+        swept += await sweep()
+    assert len(swept) == len(set(swept)), "no run is swept twice"
     for run_id in runs:
         record = await store.get_run(run_id)
         assert record is not None and record.status == "error", "no stale run is left behind"

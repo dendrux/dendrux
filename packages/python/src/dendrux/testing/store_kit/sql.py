@@ -5,8 +5,10 @@
 database gets them for free.
 
 The fault injector
-``arm(store, point, kind=..., after=n)`` makes a write transaction on that store's engine fail,
-once. The ``after`` first write transactions are let through.
+``arm(store, point, kind=..., after=n, sticky=...)`` makes a write transaction on that store's
+engine fail. The ``after`` first write transactions are let through; then the fault fires once,
+or on every write transaction until ``disarm`` when ``sticky``. ``fired(store)`` says how many
+times it fired since the last ``arm``, so a contract can assert the cut really happened.
 
 ``before_commit``  raise just before COMMIT (nothing persists);
 ``after_commit``   raise just after COMMIT (the write persists: a lost acknowledgement);
@@ -38,10 +40,11 @@ _WRITES = ("INSERT", "UPDATE", "DELETE")
 
 
 class _Arm:
-    def __init__(self, point: str, kind: str, after: int) -> None:
+    def __init__(self, point: str, kind: str, after: int, sticky: bool) -> None:
         self.point = point
         self.kind = kind
         self.after = after
+        self.sticky = sticky
         self.writes = 0  # write statements in the transaction being built
         self.passed = False  # the transaction that just committed was let through
 
@@ -54,13 +57,23 @@ class _Arm:
 class SqlFaultInjector:
     def __init__(self) -> None:
         self._armed: dict[Any, _Arm] = {}  # sync Engine -> armed fault
+        self._fired: dict[Any, int] = {}  # sync Engine -> times the last armed fault fired
         self._installed: set[Any] = set()
         self._session_hooks = False
 
     # -- the kit's interface -----------------------------------------------------------------
 
-    def arm(self, store: Any, point: str, *, kind: str = "error", after: int = 0) -> None:
+    def arm(
+        self,
+        store: Any,
+        point: str,
+        *,
+        kind: str = "error",
+        after: int = 0,
+        sticky: bool = False,
+    ) -> None:
         engine = store._engine.sync_engine
+        self._fired[engine] = 0
         if engine not in self._installed:
             self._installed.add(engine)
             event.listen(engine, "before_cursor_execute", self._on_execute)
@@ -69,7 +82,17 @@ class SqlFaultInjector:
             event.listen(Session, "before_commit", self._before_commit)
             event.listen(Session, "after_commit", self._after_commit)
             event.listen(Session, "after_rollback", self._after_rollback)
-        self._armed[engine] = _Arm(point, kind, after)
+        self._armed[engine] = _Arm(point, kind, after, sticky)
+
+    def fired(self, store: Any) -> int:
+        return self._fired.get(store._engine.sync_engine, 0)
+
+    def _fire(self, engine: Any, armed: _Arm) -> BaseException:
+        self._fired[engine] = self._fired.get(engine, 0) + 1
+        if not armed.sticky:
+            del self._armed[engine]
+        armed.writes = 0
+        return armed.failure()
 
     def disarm(self, store: Any | None = None) -> None:
         if store is None:
@@ -96,8 +119,7 @@ class SqlFaultInjector:
             return
         armed.writes += 1
         if armed.point == "mid_write" and armed.after == 0 and armed.writes >= 2:
-            del self._armed[conn.engine]
-            raise armed.failure()
+            raise self._fire(conn.engine, armed)
 
     def _armed_for(self, session: Session) -> tuple[Any, _Arm] | None:
         try:
@@ -119,8 +141,7 @@ class SqlFaultInjector:
             return
         armed.passed = False
         if armed.point in ("before_commit", "mid_write"):
-            del self._armed[engine]
-            raise armed.failure()
+            raise self._fire(engine, armed)
 
     def _after_commit(self, session: Session) -> None:
         try:
@@ -133,9 +154,8 @@ class SqlFaultInjector:
         if armed.passed:
             armed.passed = False
             return
-        if armed.point == "after_commit" and armed.writes:
-            del self._armed[engine]
-            raise armed.failure()
+        if armed.point == "after_commit" and armed.writes and armed.after == 0:
+            raise self._fire(engine, armed)
         armed.writes = 0
 
     def _after_rollback(self, session: Session) -> None:

@@ -6,7 +6,6 @@ under a higher epoch; the old owner is fenced out. Marking is bounded and pages 
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -16,6 +15,8 @@ from dendrux.testing.store_kit.contracts._marks import contract
 from dendrux.testing.store_kit.contracts._support import EVENT, trace_write, ulid
 
 if TYPE_CHECKING:
+    from datetime import datetime
+
     from dendrux.testing.store_kit._kit import Kit
 
 recovery = contract("recovery", needs=("recovery",), uses=("clock", "reopen"), format2=True)
@@ -44,7 +45,7 @@ async def _started_run(kit: Kit, tenant: str | None = "t") -> str:
 async def _age(kit: Kit) -> datetime:
     """Make what exists old; return the lease cutoff that spares anything created afterwards."""
     threshold = await kit.age()
-    return datetime.now(UTC) - threshold
+    return await kit.now() - threshold
 
 
 async def _mark(kit: Kit, cutoff: datetime, **overrides: Any) -> Any:

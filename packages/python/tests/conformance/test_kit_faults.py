@@ -113,3 +113,21 @@ async def test_disarm_removes_the_fault(world: tuple[Any, SqlFaultInjector]) -> 
     injector.disarm(store)
     await store.save_run_event(run_id, event_type="x")
     assert len(await store.get_run_events(run_id)) == 1
+
+
+async def test_fired_counts_cuts_and_a_sticky_fault_keeps_firing(
+    world: tuple[Any, SqlFaultInjector],
+) -> None:
+    store, injector = world
+    run_id = await _run(store)
+    assert injector.fired(store) == 0
+    injector.arm(store, "before_commit", sticky=True)
+    for _ in range(2):
+        with pytest.raises(Exception):  # noqa: B017
+            await store.save_run_event(run_id, event_type="x", event_id=generate_ulid())
+    injector.disarm(store)
+    assert injector.fired(store) >= 2
+    await store.save_run_event(run_id, event_type="y")
+    assert injector.fired(store) >= 2, "disarm keeps the count readable"
+    injector.arm(store, "before_commit")
+    assert injector.fired(store) == 0, "arming starts a new count"
