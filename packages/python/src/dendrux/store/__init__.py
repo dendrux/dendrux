@@ -93,6 +93,7 @@ from dendrux.runtime.state import (
 )
 from dendrux.runtime.stores._factory import store_for_engine
 from dendrux.runtime.stores.sql.base import SQLStateStore
+from dendrux.runtime.stores.sql.mysql import MySQLStateStore
 from dendrux.runtime.stores.sql.postgres import PostgresStateStore
 from dendrux.runtime.stores.sql.sqlite import SQLiteStateStore
 from dendrux.store._follow import (
@@ -1516,6 +1517,7 @@ __all__ = [
     "SQLStateStore",
     "PostgresStateStore",
     "SQLiteStateStore",
+    "MySQLStateStore",
     "store_for_engine",
     "EventFeed",
     "EventNotifier",

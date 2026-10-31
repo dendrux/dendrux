@@ -86,7 +86,6 @@ def classify_error(exc: BaseException) -> DbError:
             errno.EPIPE,
             errno.ENOTCONN,
             errno.ETIMEDOUT,
-            104,
         ):
             return DbError("connection_lost", code=code)
         if code is None:

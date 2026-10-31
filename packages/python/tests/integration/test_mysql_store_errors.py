@@ -1,5 +1,7 @@
 """Driver metadata classification never retains vendor values."""
 
+import errno
+
 import pytest
 from sqlalchemy.ext.asyncio import create_async_engine
 
@@ -83,7 +85,7 @@ def test_unknown_driver_codes_reach_connection_loss_fallback(shape):
         wrapped = DBAPIError(None, None, original)
     elif shape == "os_chain":
         original = Exception(9999, "PRIVATE_SENTINEL")
-        original.__cause__ = OSError(104)
+        original.__cause__ = OSError(errno.ECONNRESET)
         wrapped = DBAPIError(None, None, original)
     else:
         wrapped = DBAPIError(
