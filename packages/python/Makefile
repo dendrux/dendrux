@@ -1,4 +1,4 @@
-.PHONY: test test-model-check test-model-install bench load load-quick lint typecheck arch crap api-check format package-smoke ci clean
+.PHONY: test test-model-check test-model-install test-dbs-up test-dbs-down test-mysql bench load load-quick lint typecheck arch crap api-check format package-smoke ci clean
 
 # Benchmarks measure the server, not the code, so they are not part of the gates.
 test: test-model-check
@@ -23,6 +23,22 @@ typecheck:
 # Report only: the hotspot list feeds refactor work; it never fails CI.
 crap:
 	python tools/crap_ratchet.py check --report-only --coverage coverage.json
+
+# MySQL 8.4 and MariaDB 10.11 test servers (docker/test-dbs.compose.yml): only the
+# dendrux-test-mysql and dendrux-test-mariadb containers, on 127.0.0.1:53306 / 53307.
+# Start them for a test run and remove them (with their data) afterwards.
+TEST_DBS = docker compose -f docker/test-dbs.compose.yml
+
+test-dbs-up:
+	$(TEST_DBS) up -d --wait
+
+test-dbs-down:
+	$(TEST_DBS) down -v
+
+# Schema and maintenance suites on MySQL/MariaDB. Needs DENDRUX_TEST_MYSQL_URL and/or
+# DENDRUX_TEST_MARIADB_URL (a database name ending in _test; each test makes its own copy).
+test-mysql:
+	pytest tests/db -v -rs -n auto -m "not benchmark" --no-cov
 
 # Release step: run on a quiet machine (nothing else using Postgres) and record the numbers
 # in the load-test results doc. Needs DENDRUX_TEST_PG_URL.

@@ -51,6 +51,10 @@ openrouter = ["dendrux[openai]"]
 # are now hard dependencies.
 db = []
 postgres = ["asyncpg>=0.29,<1.0"]
+# MySQL 8.4 / MariaDB 10.11 driver.
+mysql = ["asyncmy>=0.2.10"]
+# Dependencies of the store test kit (pytest plugin, dendrux.testing.store_kit).
+testkit = ["pytest>=8.0,<10.0", "pytest-asyncio>=0.23,<2.0"]
 mcp = ["mcp>=2.2,<3.0", "httpx2>=2.9.1,<3.0", "httpcore2>=2.9.1,<3.0"]
 # NLP-backed PII detection. Requires spaCy model:
 #   python -m spacy download en_core_web_lg
