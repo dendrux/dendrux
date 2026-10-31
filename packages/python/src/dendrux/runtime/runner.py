@@ -95,6 +95,7 @@ from dendrux.runtime.replay import (
     validate_replay_args,
 )
 from dendrux.runtime.state import ClaimResult, _initial_loop_state, claimed_store, unclaimed_store
+from dendrux.runtime.stores._limits_fit import ensure_agent_limits_fit
 from dendrux.runtime.submit import (
     GOVERNANCE_KEY,
     claim_paused_validated,
@@ -1653,6 +1654,7 @@ async def run(
     """
     tenant_explicit = _tenant_scope_chosen(tenant_id)
     tenant_id = resolve_runner_tenant(agent, "run", tenant_id, state_store=state_store)
+    await ensure_agent_limits_fit(agent, state_store)
     skill_session = SkillSession.prepare(
         agent, loop=loop or agent.loop or ReActLoop(), explicit=activate_skills
     )
@@ -2678,6 +2680,7 @@ async def retry(
     # run raise the same RunNotFoundError (B13), so retry is no existence oracle.
     tenant_explicit = _tenant_scope_chosen(tenant_id)
     tenant_id = resolve_runner_tenant(agent, "retry", tenant_id, state_store=state_store)
+    await ensure_agent_limits_fit(agent, state_store)
     from dendrux.errors import RunNotFoundError
 
     tenant_id = resolve_child_tenant(get_delegation_context(), tenant_id)
@@ -3260,6 +3263,7 @@ def run_stream(
             if store is None and state_store_resolver is not None:
                 store = await state_store_resolver()
                 resolve_runner_tenant(agent, "stream", requested_tenant_id, state_store=store)
+            await ensure_agent_limits_fit(agent, store)
             _shared["state_store"] = store
             try:
                 entry = await _ingest_entry_images(
@@ -3323,6 +3327,7 @@ def run_stream(
             if store is None and state_store_resolver is not None:
                 store = await state_store_resolver()
                 resolve_runner_tenant(agent, "stream", requested_tenant_id, state_store=store)
+            await ensure_agent_limits_fit(agent, store)
             _shared["state_store"] = store
 
             # --- Delegation context ---
@@ -5102,6 +5107,7 @@ async def _resume_core(
         user_parts: Already-ingested parts of a multimodal user input (the
             claimed path); ``user_input`` is then their text projection.
     """
+    await ensure_agent_limits_fit(agent, state_store)
     input_items: tuple[Any, ...] = ()
     if user_input is not None:
         user_input, input_items = split_user_content(user_input)
@@ -5551,6 +5557,7 @@ def resume_stream(
                 from dendrux.errors import PersistenceNotConfiguredError
 
                 raise PersistenceNotConfiguredError()
+            await ensure_agent_limits_fit(agent, store)
             raw = await store.get_pause_state(run_id)
             if raw is None:
                 raise ValueError("Run has no pause state")
@@ -5588,6 +5595,7 @@ def resume_stream(
                     "resume_stream() requires persistence. "
                     "Pass database_url or state_store to the agent."
                 )
+            await ensure_agent_limits_fit(agent, store)
 
             skill_session = await continuation(agent, store, run_id)
             stream_context.set_session(skill_session)

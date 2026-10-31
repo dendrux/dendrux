@@ -54,3 +54,17 @@ async def ensure_limits_fit(store: object, limits: Limits) -> None:
         "Limits.max_tool_result_bytes or Limits.max_metadata_bytes, or raise the server's "
         "max_allowed_packet."
     )
+
+
+async def ensure_agent_limits_fit(agent: object, store: object | None) -> None:
+    """Check ``agent``'s configured limits against ``store`` once per (agent, store).
+
+    Every path that persists for an Agent calls this with the store it is about to use, so the
+    check does not depend on which entry point (Agent method or runner function) was taken.
+    A refusal is not remembered: the next call checks again.
+    """
+    limits = getattr(agent, "_limits", None)
+    if store is None or limits is None or getattr(agent, "_limits_checked_for", None) is store:
+        return
+    await ensure_limits_fit(store, limits)
+    agent._limits_checked_for = store  # type: ignore[attr-defined]

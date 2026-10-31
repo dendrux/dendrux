@@ -1154,12 +1154,10 @@ class Agent:
 
     async def _resolve_state_store(self) -> StateStore | None:
         """The state store, after a one-time check that the configured limits fit it."""
-        store = await self._open_state_store()
-        if store is not None and self._limits_checked_for is not store:
-            from dendrux.runtime.stores._limits_fit import ensure_limits_fit
+        from dendrux.runtime.stores._limits_fit import ensure_agent_limits_fit
 
-            await ensure_limits_fit(store, self._limits)
-            self._limits_checked_for = store
+        store = await self._open_state_store()
+        await ensure_agent_limits_fit(self, store)
         return store
 
     async def _open_state_store(self) -> StateStore | None:
