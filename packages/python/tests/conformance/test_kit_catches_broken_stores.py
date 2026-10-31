@@ -215,6 +215,107 @@ MUTANTS = {
         {"test_a_stale_epoch_is_refused_by_every_fenced_writer"},
         PLAIN_INJECTOR,
     ),
+    "claim_paused_run fabricates ownership after an ambiguous commit": (
+        mutant("""
+        async def claim_paused_run(self, run_id, **kw):
+            try:
+                return await super().claim_paused_run(run_id, **kw)
+            except PersistenceError:
+                record = await self.get_run(run_id)
+                if record is not None and record.status == "running":
+                    return ClaimResult(record.claim_epoch, 2, None, None)
+                raise
+        """),
+        "ambiguous_claim and claim_paused_run",
+        {"test_an_ambiguous_claim_commit_raises_outcome_unknown"},
+        PLAIN_INJECTOR,
+    ),
+    "submit_and_claim fabricates ownership after an ambiguous commit": (
+        mutant("""
+        async def submit_and_claim(self, run_id, **kw):
+            try:
+                return await super().submit_and_claim(run_id, **kw)
+            except PersistenceError:
+                record = await self.get_run(run_id)
+                if record is not None and record.status == "running":
+                    return ClaimResult(record.claim_epoch, 2, None, None)
+                raise
+        """),
+        "ambiguous_claim and submit_and_claim",
+        {"test_an_ambiguous_claim_commit_raises_outcome_unknown"},
+        PLAIN_INJECTOR,
+    ),
+    "reclaim_run fabricates ownership after an ambiguous commit": (
+        mutant("""
+        async def reclaim_run(self, run_id, **kw):
+            try:
+                return await super().reclaim_run(run_id, **kw)
+            except PersistenceError:
+                record = await self.get_run(run_id)
+                if record is not None and record.reclaim_attempts > 0:
+                    return ClaimResult(record.claim_epoch, 2, None, None)
+                raise
+        """),
+        "ambiguous_claim and reclaim_run",
+        {"test_an_ambiguous_claim_commit_raises_outcome_unknown"},
+        PLAIN_INJECTOR,
+    ),
+    "release_run_claim reports success after an ambiguous commit": (
+        mutant("""
+        async def release_run_claim(self, run_id, *, status, claim_epoch):
+            try:
+                return await super().release_run_claim(
+                    run_id, status=status, claim_epoch=claim_epoch
+                )
+            except PersistenceError:
+                return True
+        """),
+        "ambiguous_claim and release_run_claim",
+        {"test_an_ambiguous_claim_commit_raises_outcome_unknown"},
+        PLAIN_INJECTOR,
+    ),
+    "a tool completion swallows a retryable failure": (
+        mutant("""
+        async def complete_tool_call(self, run_id, *, claim_epoch, pii_mapping=None, **kw):
+            try:
+                return await super().complete_tool_call(
+                    run_id, claim_epoch=claim_epoch, pii_mapping=pii_mapping, **kw
+                )
+            except Exception:
+                return None
+        """),
+        "tool_completion_is_all_or_nothing",
+        {"test_a_tool_completion_is_all_or_nothing_and_repeatable"},
+        PLAIN_INJECTOR,
+    ),
+    "finalize_with_event swallows a retryable failure": (
+        mutant("""
+        async def finalize_with_event(self, run_id, *, status, allowed_current_statuses,
+                                      event_type, claim_epoch=None, trace=None, **kw):
+            try:
+                return await super().finalize_with_event(
+                    run_id, status=status, allowed_current_statuses=allowed_current_statuses,
+                    event_type=event_type, claim_epoch=claim_epoch, trace=trace, **kw,
+                )
+            except Exception:
+                return None
+        """),
+        "finalize_with_event_is_all_or_nothing",
+        {"test_finalize_with_event_is_all_or_nothing"},
+        PLAIN_INJECTOR,
+    ),
+    "checkpoint_step swallows a retryable failure": (
+        mutant("""
+        async def checkpoint_step(self, run_id, *, claim_epoch, **kw):
+            try:
+                return await super().checkpoint_step(run_id, claim_epoch=claim_epoch, **kw)
+            except Exception:
+                return None
+        """),
+        "checkpoint_that_fails",
+        {"test_a_checkpoint_that_fails_leaves_the_previous_checkpoint"},
+        PLAIN_INJECTOR,
+    ),
 }
 
 
@@ -295,7 +396,7 @@ CRASH_FUNCTIONS = {
     "test_a_failed_write_is_repeated_safely_with_the_same_identity",
     "test_a_one_shot_failure_is_absorbed_or_retried_into_exactly_one_write",
     "test_finalize_that_fails_around_commit_leaves_one_final_state",
-    "test_a_claim_that_fails_never_leaves_two_owners",
+    "test_an_ambiguous_claim_commit_raises_outcome_unknown",
     "test_finalize_with_event_is_all_or_nothing",
     "test_a_tool_completion_is_all_or_nothing_and_repeatable",
     "test_a_checkpoint_that_fails_leaves_the_previous_checkpoint",

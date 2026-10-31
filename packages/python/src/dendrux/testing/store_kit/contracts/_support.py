@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from dendrux.runtime.state import EventWrite, LoopStatePatch, TraceWrite
 from dendrux.types import UsageStats, generate_ulid
+
+if TYPE_CHECKING:
+    from datetime import datetime
+
+    from dendrux.testing.store_kit._kit import Kit
 
 #: Events appended by hand never use these names, which the runtime emits itself.
 EVENT = "kit.event"
@@ -90,3 +95,44 @@ def complete_call_kwargs(call_id: str, order: int, **overrides: Any) -> dict[str
     }
     values.update(overrides)
     return values
+
+
+RECLAIM: dict[str, Any] = {
+    "governance": {},
+    "governance_policy": "warn",
+    "skill_pins": {},
+    "loop_type": "react",
+}
+
+
+async def started_run(kit: Kit, tenant: str | None = "t") -> str:
+    """A running format-2 run that has started and checkpointed, so it can be reclaimed."""
+    run_id = await kit.new_run(tenant_id=tenant)
+    await kit.store.save_run_event(run_id, event_type="run.started")
+    await kit.store.checkpoint_step(
+        run_id,
+        claim_epoch=0,
+        loop_state={"v": 1, "loop": "react", "phase": "dispatch"},
+        pii_mapping=None,
+        trace=None,
+    )
+    return run_id
+
+
+async def lease_cutoff(kit: Kit) -> datetime:
+    """Make what exists old; return the lease cutoff that spares anything created afterwards."""
+    threshold = await kit.age()
+    return await kit.now() - threshold
+
+
+async def mark(kit: Kit, cutoff: datetime, **overrides: Any) -> Any:
+    options: dict[str, Any] = {
+        "cutoff": cutoff,
+        "batch_size": 10,
+        "max_runs": 100,
+        "max_returned": 10,
+        "reclaim_limit": 3,
+        "cursor": None,
+    }
+    options.update(overrides)
+    return await kit.store.mark_lease_expired(**options)

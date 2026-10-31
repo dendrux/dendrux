@@ -51,7 +51,9 @@ class _Arm:
     def failure(self) -> BaseException:
         if self.kind == "cancel":
             return asyncio.CancelledError()
-        return OperationalError("kit fault", None, ConnectionResetError("kit fault"))
+        return OperationalError(
+            "kit fault", None, ConnectionResetError("kit fault"), connection_invalidated=True
+        )
 
 
 class SqlFaultInjector:

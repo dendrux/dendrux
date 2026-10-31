@@ -20,12 +20,17 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
+from dendrux.errors import StoreOutcomeUnknown
 from dendrux.testing.store_kit.contracts._marks import contract
 from dendrux.testing.store_kit.contracts._support import (
     EVENT,
+    RECLAIM,
     complete_call_kwargs,
     event_write,
+    lease_cutoff,
+    mark,
     start_call_kwargs,
+    started_run,
     tool_call_kwargs,
     trace_write,
     ulid,
@@ -35,7 +40,7 @@ from dendrux.testing.store_kit.contracts._support import (
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
-    from dendrux.testing.store_kit._kit import Kit
+    from dendrux.testing.store_kit._kit import Faulted, Kit
     from dendrux.testing.store_kit._protocols import FaultPoint
 
 crash = contract("crash_recovery", uses=("injector",))
@@ -158,47 +163,118 @@ async def test_finalize_that_fails_around_commit_leaves_one_final_state(
     ), "the second finalize loses"
 
 
+CLAIM_OPERATIONS = ["claim_paused_run", "submit_and_claim", "reclaim_run", "release_run_claim"]
+
+
 @crash
 @pytest.mark.parametrize("point", ["before_commit", "after_commit"])
-async def test_a_claim_that_fails_never_leaves_two_owners(
-    dendrux_kit: Kit, point: FaultPoint
+@pytest.mark.parametrize("operation", CLAIM_OPERATIONS)
+async def test_an_ambiguous_claim_commit_raises_outcome_unknown(
+    dendrux_kit: Kit, operation: str, point: FaultPoint
 ) -> None:
+    """After a commit that may or may not have landed, ownership is never reported.
+
+    Two contenders expecting epoch ``e`` both see ``e + 1``, so a store cannot prove the claim
+    was its own. It must raise ``StoreOutcomeUnknown`` and never return a claim.
+    """
     store = dendrux_kit.store
-    run_id = await dendrux_kit.paused_run()
+    committed = point == "after_commit"
+    if operation == "reclaim_run":
+        if not dendrux_kit.declaration.has("recovery"):
+            pytest.skip("recovery is not declared")
+        dendrux_kit.require_format_2()
+        run_id = await started_run(dendrux_kit)
+        [marked] = (await mark(dendrux_kit, await lease_cutoff(dendrux_kit))).reclaimable
 
-    async def claim() -> Any:
-        return await store.claim_paused_run(run_id, expected_status="waiting_client_tool")
+        async def call() -> Any:
+            return await store.reclaim_run(
+                run_id,
+                tenant_id="t",
+                agent_name="KitAgent",
+                expected_claim_epoch=marked.claim_epoch,
+                **RECLAIM,
+            )
 
-    outcome = await dendrux_kit.faulted(point, claim, sticky=True)
-    outcome.expect_fired(point)
-    record = await store.get_run(run_id)
-    assert record is not None
-    if point == "before_commit":
-        assert outcome.raised is not None
-        assert record.status == "waiting_client_tool", "an uncommitted claim changes nothing"
-        assert await claim() is not False
+        async def landed() -> bool:
+            record = await store.get_run(run_id)
+            assert record is not None
+            if committed:
+                return bool(record.status == "running" and record.reclaim_attempts == 1)
+            return bool(record.reclaim_attempts == 0 and record.lease_expired_at is not None)
+
+    elif operation == "release_run_claim":
+        if not hasattr(store, "release_run_claim"):
+            pytest.skip("the optional release_run_claim is not implemented")
+        run_id, claim = await dendrux_kit.claimed_run()
+
+        async def call() -> Any:
+            return await store.release_run_claim(
+                run_id, status="waiting_client_tool", claim_epoch=claim.claim_epoch
+            )
+
+        async def landed() -> bool:
+            record = await store.get_run(run_id)
+            assert record is not None
+            return bool(record.status == ("waiting_client_tool" if committed else "running"))
+
     else:
-        assert record.status == "running", "the committed claim is visible"
-        assert await claim() is False, "nobody can claim it twice"
+        run_id = await dendrux_kit.paused_run()
+        envelope = {
+            "submission_id": ulid(),
+            "kind": "tool_results",
+            "pause_id": "kit-pause",
+            "call_ids": ["c1"],
+        }
+
+        async def call() -> Any:
+            if operation == "claim_paused_run":
+                return await store.claim_paused_run(run_id, expected_status="waiting_client_tool")
+            return await store.submit_and_claim(
+                run_id,
+                expected_status="waiting_client_tool",
+                submitted_data={"submitted_tool_results": []},
+                submission=envelope,
+            )
+
+        async def landed() -> bool:
+            record = await store.get_run(run_id)
+            assert record is not None
+            return bool(record.status == ("running" if committed else "waiting_client_tool"))
+
+    outcome = await dendrux_kit.faulted(point, call, sticky=True)
+    outcome.expect_fired(point)
+    assert isinstance(outcome.raised, StoreOutcomeUnknown), (
+        f"{operation} after an ambiguous {point} must raise StoreOutcomeUnknown, "
+        f"got {type(outcome.raised).__name__ if outcome.raised else repr(outcome.result)[:60]}"
+    )
+    assert outcome.result is None, "no ownership may be reported"
+    assert await landed(), f"{point}: the stored state must be exactly what the commit decided"
+    if committed and operation in ("claim_paused_run", "submit_and_claim"):
+        assert not await store.claim_paused_run(run_id, expected_status="waiting_client_tool"), (
+            "nobody can claim a claimed run again"
+        )
 
 
 async def _all_or_nothing(
-    kit: Kit,
-    run_id: str,
     point: FaultPoint,
     after: int,
-    outcome_fired: int,
+    outcome: Faulted,
     done: Callable[[], Awaitable[bool]],
     nothing: Callable[[], Awaitable[bool]],
 ) -> None:
-    """Exactly done, or exactly nothing: never half. A cut that fired early leaves nothing."""
+    """Exactly done, or exactly nothing: never half, and never a success that did not happen."""
     if after == 0 and point in ROLLED_BACK:
+        assert outcome.raised is not None, (
+            f"{point}: a rolled-back operation must fail, not succeed"
+        )
         assert await nothing(), f"{point}: the failed operation left something behind"
     elif after == 0:
         assert await done(), "after_commit: the committed operation must be fully visible"
     else:
         assert await done() or await nothing(), "an operation cut between transactions is half done"
-        if outcome_fired == 0:
+        if outcome.raised is None:
+            assert await done(), "an operation that reported success must be complete"
+        if outcome.fired == 0:
             assert await done(), "a single-transaction operation the cut missed must be complete"
 
 
@@ -247,7 +323,7 @@ async def test_finalize_with_event_is_all_or_nothing(
             and await store.get_run_events(run_id) == []
         )
 
-    await _all_or_nothing(dendrux_kit, run_id, point, after, outcome.fired, done, nothing)
+    await _all_or_nothing(point, after, outcome, done, nothing)
 
 
 @atomic_crash
@@ -296,7 +372,7 @@ async def test_a_tool_completion_is_all_or_nothing_and_repeatable(
             and types == ["tool.started"]
         )
 
-    await _all_or_nothing(dendrux_kit, run_id, point, after, outcome.fired, done, nothing)
+    await _all_or_nothing(point, after, outcome, done, nothing)
     await store.complete_tool_call(run_id, claim_epoch=0, **kwargs)
     assert await done(), "repeating the completion finishes it exactly once"
 
@@ -341,7 +417,7 @@ async def test_a_checkpoint_that_fails_leaves_the_previous_checkpoint(
             and await store.get_pii_mapping(run_id) is None
         )
 
-    await _all_or_nothing(dendrux_kit, run_id, point, after, outcome.fired, done, nothing)
+    await _all_or_nothing(point, after, outcome, done, nothing)
 
 
 @crash

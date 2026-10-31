@@ -125,6 +125,10 @@ class Kit:
             pytest.skip(f"{FAULT_INJECTOR} not provided: crash recovery is not certified")
         return found
 
+    def require_format_2(self) -> None:
+        """The rest of this test needs format-2 runs (skips at the first run created otherwise)."""
+        self._needs_format_2 = True
+
     async def age(self) -> timedelta:
         """Make what exists so far old; return a sweep threshold that spares what comes next.
 
