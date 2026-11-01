@@ -59,6 +59,63 @@ worse entry. If one is truly unavoidable, the coordinator approves it, and the c
 `stamp --allow-regress --reason "..."` (the CRAP ratchet records it as a waiver in its
 baseline) and says why in the commit message.
 
+## Test tiers
+
+Four tiers, from the loop you run while building to the gate the coordinator runs before a merge.
+Local runs use SQLite and Postgres only (MySQL and MariaDB run in GitHub CI), one heavy suite at a
+time, and at most 6 xdist workers (`DENDRUX_TEST_WORKERS` can lower it, never raise it).
+
+| Tier | Command | What runs | Measured (11 cores, idle machine) |
+|---|---|---|---|
+| 1. Fast | `make test-fast` | Only the tests your change can affect (pytest-testmon), SQLite, no coverage, without the tests marked `slow`, plus ruff on the changed files | first run on a fresh checkout 182 s; nothing changed 4 s; a leaf function 5 s; `tools/_coerce.py` 48 s (951 tests); `runtime/runner.py` 89 s (2,098 tests) |
+| 2. Area | `make test-area AREA=<name>` | One area, SQLite, no coverage, without `slow` | `runtime` 69 s (3,378 tests), `mcp` 32 s, `stores` 29 s |
+| 3. Full | `make ci` (with `DENDRUX_TEST_PG_URL` set) | Lint, types, architecture, the whole suite on SQLite and the Postgres matrix with coverage, CRAP, the quality gates, the API check | 584 s (the test step 560 s); SQLite only, no Postgres: 253 s |
+| 4. Merge gate | `make test-merge` | `make ci`, then the store kit on SQLite and Postgres (serial), then the benchmarks (serial) | `make ci` + kit + 55 s of benchmarks |
+
+Other targets: `make test-pg` (the Postgres integration matrix on its own, 6 workers, 225 s; 248 s
+with 4; 951 s in one process), `make test-kit`, `make bench` (benchmarks, always one process),
+`make test-lists`, `make test-shard-proof`. Numbers are from the 2026-11-01 run on the shared
+Mac; the raw logs, with the load average of every run, are in
+`owner-docs/build-0.6.0/work/t1-fasttests/`.
+
+**How `test-fast` decides.** testmon records which source blocks each test executes. After a
+change it re-runs only the tests that touched a changed block, so a leaf edit runs one test and an
+edit to the runner runs a couple of thousand. The data lives in `.pytest_cache/testmondata`
+(per checkout; delete it to start over). It does not see non-Python files (fixtures, JSON, the
+slow list), so run `make test-area` before you hand work back. Plain `-m` makes testmon select
+nothing, which is why the target passes `--testmon-forceselect`. `SLOW=1 make test-fast` includes
+the slow tests.
+
+**Markers** (applied centrally by `tests/conftest.py`, no per-file edits):
+
+- `area_<name>` from the test's directory, then its file name (`tests/_helpers/tiers.py`):
+  runtime, stores, store, loops, llm, mcp, db, skills, testing, tools, guardrails, media,
+  notifiers, cli, strategies, docs, tooling, live. A file that matches no name rule is `runtime`.
+  `python tools/test_tiers.py areas` lists them.
+- `slow` for the tests that took 2 s or more in one measured run, listed in
+  `tests/_helpers/tier_lists/slow.txt` (65 tests). Regenerate after a big change:
+  `pytest tests/ -n 6 --durations=0 > log; python tools/test_tiers.py slow-list log --write`.
+  `slow` only keeps a test out of tiers 1 and 2; tiers 3 and 4 and CI run it.
+- `flaky` for the tests listed in `tests/_helpers/tier_lists/flaky.txt`, each with a reason.
+  A flaky test is rerun once when it fails (pytest-rerunfailures) and still runs everywhere; it is
+  never skipped. A flake gets a root-cause fix, not a list entry, unless the cause is the machine
+  (the list holds the one benchmark-only timing test today).
+- `benchmark` (existing): measures the server, so it is excluded from every parallel run and
+  always runs in one process (`-m benchmark` forces `-n 0`).
+
+**Postgres.** With `DENDRUX_TEST_PG_URL` set and no `-n` given, pytest runs in parallel (6
+workers at most), one database per worker. A run that names single tests (`path::test`) or the
+conformance suite stays in one process (its Postgres cells need that). A template database for
+the workers was measured and dropped: building the schema takes 0.05 s per worker.
+
+**CI shards.** The GitHub test job runs four shards per Python/SQLAlchemy leg. A shard is a set of
+test files from `python tools/test_tiers.py shard --count 4 --index N`: a deterministic split
+balanced by the per-file seconds in `tests/_helpers/tier_lists/file_weights.json` (regenerate with
+`python tools/test_tiers.py weights log --write`). Each shard writes its own coverage data; the
+`python-coverage` job combines the four files of a leg, applies the 80 percent floor and runs the
+CRAP ratchet on the whole. Lint, types and architecture run once per leg, on shard 1.
+`make test-shard-proof` checks the shards are a disjoint cover of the test files.
+
 ## Notes
 
 - CRAP scores depend on coverage. Run `make test` with `DENDRUX_TEST_PG_URL` set (a private
