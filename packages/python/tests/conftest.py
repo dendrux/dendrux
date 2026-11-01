@@ -76,12 +76,12 @@ def pytest_cmdline_main(config: pytest.Config) -> None:
 
     * A benchmark selection (``-m benchmark``) always runs in one process: benchmarks measure
       the server and fail under parallel load.
-    * With ``DENDRUX_TEST_PG_URL`` set, no ``-n`` given and a ``-m`` expression that excludes
-      benchmarks, run in parallel (a serial Postgres run is the slow path) with the core count
-      at most 6 workers. Without ``-m "not benchmark"`` the selection can include benchmarks,
-      so it stays serial. ``-n 0`` still means serial; a run that names individual tests
-      (``path::test``) or the conformance suite (whose Postgres cells run only in one process)
-      stays serial.
+    * With ``DENDRUX_TEST_PG_URL`` set, no ``-n`` given and a ``-m`` expression from the
+      allowlist ``_PARALLEL_SAFE_MARKEXPRS``, run in parallel (a serial Postgres run is the slow
+      path) with the core count at most 6 workers. Any other expression, or none, could select
+      a benchmark, so it stays serial. ``-n 0`` still means serial; a run that names
+      individual tests (``path::test``) or the conformance suite (whose Postgres cells run only
+      in one process) stays serial.
     """
     option = config.option
     if hasattr(option, "numprocesses") and _selects_benchmarks(option):
@@ -89,15 +89,24 @@ def pytest_cmdline_main(config: pytest.Config) -> None:
         return
     if not os.environ.get(_PG_URL_ENV) or getattr(option, "numprocesses", 1) is not None:
         return
-    if getattr(option, "collectonly", False) or "not benchmark" not in (
-        getattr(option, "markexpr", "") or ""
-    ):
+    if getattr(option, "collectonly", False) or not _excludes_benchmarks(option):
         return
     if any("::" in arg or "conformance" in arg for arg in config.args):
         return
     if getattr(option, "dist", "no") != "no" or "PYTEST_XDIST_WORKER" in os.environ:
         return
     option.numprocesses = tiers.default_workers()
+
+
+# The only -m expressions that may switch on automatic parallelism: the ones the Makefile and
+# CI emit. Anything else (for example "not benchmark or flaky") could still select a benchmark.
+_PARALLEL_SAFE_MARKEXPRS = frozenset(
+    {"not benchmark", "not benchmark and not slow", "not slow and not benchmark"}
+)
+
+
+def _excludes_benchmarks(option: object) -> bool:
+    return " ".join((getattr(option, "markexpr", "") or "").split()) in _PARALLEL_SAFE_MARKEXPRS
 
 
 def _selects_benchmarks(option: object) -> bool:

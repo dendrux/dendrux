@@ -107,9 +107,11 @@ the slow tests.
 - `benchmark` (existing): measures the server, so it is excluded from every parallel run and
   always runs in one process (`-m benchmark` forces `-n 0`).
 
-**Postgres.** With `DENDRUX_TEST_PG_URL` set, no `-n` given and `-m "not benchmark"`, pytest
-runs in parallel (6 workers at most), one database per worker. Without `-m "not benchmark"` the
-selection can include benchmarks, so it stays in one process. A run that names single tests
+**Postgres.** With `DENDRUX_TEST_PG_URL` set and no `-n` given, pytest
+runs in parallel (6 workers at most), one database per worker. Only `-m "not benchmark"`,
+`"not benchmark and not slow"` and `"not slow and not benchmark"` switch that on; any other
+expression (for example `"not benchmark or flaky"`) or none could select a benchmark, so it
+stays in one process. A run that names single tests
 (`path::test`) or the conformance suite also stays in one process (its Postgres cells need that). A template database for
 the workers was measured and dropped: building the schema takes 0.05 s per worker.
 

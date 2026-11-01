@@ -343,6 +343,12 @@ def _hook_option(markexpr: str, numprocesses: int | None = None) -> object:
         ("benchmark", 4, 0),
         ("not benchmark", None, 6),
         ("not benchmark and not slow", None, 6),
+        ("not slow and not benchmark", None, 6),
+        ("  not benchmark  ", None, 6),
+        ("not benchmark or flaky", None, None),  # the flaky 300k benchmark would run in parallel
+        ("flaky or not benchmark", None, None),
+        ("not benchmark and area_runtime", None, None),
+        ("not (benchmark)", None, 0),  # not recognised as "not benchmark": forced serial
         ("not benchmark", 3, 3),  # an explicit -n is respected
         ("not benchmark", 0, 0),
     ],
