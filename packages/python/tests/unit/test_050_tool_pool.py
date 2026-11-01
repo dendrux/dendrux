@@ -121,8 +121,10 @@ class TestCapsUnderLoad:
         assert gauges["b"].peak <= 3
         assert gauges["c"].peak <= 6
         assert total.peak <= 6
-        stats = tool_pool_stats()
-        assert stats.threads <= 6 and stats.busy == 0 and stats.queued == 0
+        # The pool sets a result before it decrements `busy`, so the gauges settle just after
+        # the last result arrives: wait for them, bounded, instead of reading them at once.
+        await _until(lambda: tool_pool_stats().busy == 0 and tool_pool_stats().queued == 0, 2.0)
+        assert tool_pool_stats().threads <= 6
         for agent in agents.values():
             assert agent._tool_call_limiter.in_use == 0
 

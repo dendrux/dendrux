@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -114,7 +115,9 @@ async def test_sampler_starts_stops_and_still_records_final_sample(monkeypatch):
 
     monkeypatch.setattr(sampler, "sample", sample)
     await sampler.start()
-    await asyncio.sleep(0.035)
+    deadline = time.monotonic() + 10  # bounded: wait for the samples, not for a fixed time
+    while count < 3 and time.monotonic() < deadline:
+        await asyncio.sleep(0.005)
     out = await sampler.stop(10)
     assert out["total_samples"] >= 3 and len(out["samples"]) == 3
     assert sampler.task.done()
