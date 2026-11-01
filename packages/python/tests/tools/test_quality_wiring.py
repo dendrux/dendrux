@@ -83,7 +83,7 @@ def test_ci_has_a_quality_job_and_an_enforcing_crap_step() -> None:
         "semgrep-requirements.txt",
     ):
         assert script in quality_runs, script
-    crap = next(s for s in jobs["python"]["steps"] if s.get("name") == "CRAP ratchet")
+    crap = next(s for s in jobs["python-coverage"]["steps"] if s.get("name") == "CRAP ratchet")
     assert "--report-only" not in crap["run"]
 
 

@@ -31,7 +31,8 @@ if str(PACKAGE_ROOT) not in sys.path:
 
 from tests._helpers import tiers  # noqa: E402
 
-DEFAULT_SLOW_THRESHOLD = 5.0
+DEFAULT_SLOW_THRESHOLD = 2.0
+UNKNOWN_FILE_SECONDS = 1.0
 WEIGHTS = tiers.LISTS_DIR / "file_weights.json"
 _DURATION = re.compile(r"^\s*(\d+(?:\.\d+)?)s\s+(?:setup|call|teardown)\s+(\S.*?)\s*$")
 _SLOW_HEADER = (
@@ -84,11 +85,11 @@ def load_weights() -> dict[str, float]:
 def make_shards(files: list[str], count: int, weights: dict[str, float]) -> list[list[str]]:
     """Longest-processing-time-first split of ``files`` into ``count`` shards.
 
-    Deterministic: files sort by (weight desc, name); a file with no recorded weight counts as
-    the median weight, so a new test file lands somewhere sensible without a regenerate.
+    Deterministic: files sort by (weight desc, name). A file with no recorded weight counts as
+    ``UNKNOWN_FILE_SECONDS``: the weights file leaves out files whose tests all run in under
+    5 ms, and a new test file lands somewhere sensible without a regenerate.
     """
-    known = sorted(weights[f] for f in files if f in weights)
-    default = known[len(known) // 2] if known else 1.0
+    default = UNKNOWN_FILE_SECONDS
     ordered = sorted(files, key=lambda f: (-weights.get(f, default), f))
     shards: list[list[str]] = [[] for _ in range(count)]
     loads = [0.0] * count
