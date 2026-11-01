@@ -7,6 +7,7 @@ problem or an existing one getting worse. Baselines are small, sorted JSON keyed
 
 from __future__ import annotations
 
+import ast
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -72,8 +73,8 @@ def module_name(path: str | Path) -> str:
     knowledge of where the tree lives.
     """
     parts = list(Path(path).with_suffix("").parts)
-    anchor = max(i for i, part in enumerate(parts) if part == "src")
-    parts = parts[anchor + 1 :]
+    anchors = [i for i, part in enumerate(parts) if part == "src"]
+    parts = parts[anchors[-1] + 1 :] if anchors else parts
     if parts[-1] == "__init__":
         parts.pop()
     return ".".join(parts)
@@ -141,3 +142,31 @@ def baseline_or_none(path: Path) -> dict[str, Any] | None:
         return read_baseline(path)
     except BaselineMissingError:
         return None
+
+
+def function_spans(source: str) -> list[tuple[int, int, str]]:
+    """(first line, last line, qualified name) for every function, outermost first."""
+    spans: list[tuple[int, int, str]] = []
+
+    def walk(node: ast.AST, prefix: str) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.ClassDef):
+                walk(child, f"{prefix}{child.name}.")
+            elif isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef):
+                qual = f"{prefix}{child.name}"
+                spans.append((child.lineno, child.end_lineno or child.lineno, qual))
+                walk(child, f"{qual}.<locals>.")
+            else:
+                walk(child, prefix)
+
+    walk(ast.parse(source), "")
+    return spans
+
+
+def enclosing(spans: list[tuple[int, int, str]], line: int) -> str:
+    best = "<module>"
+    best_size = None
+    for first, last, qual in spans:
+        if first <= line <= last and (best_size is None or last - first < best_size):
+            best, best_size = qual, last - first
+    return best
