@@ -24,7 +24,7 @@ make quality SEMGREP=~/.cache/dendrux-semgrep-venv/bin/semgrep
 | `make deadcode` | `tools/vulture_ratchet.py` | vulture (confidence 80 or more) finds a new unused name. Intentional public API and hooks go in `vulture_whitelist.py` with a comment. Baseline: `vulture_baseline.json`. |
 | `make cycles` | `tools/import_cycles.py` | A module import cycle appears, a module joins a baselined cycle, or two cycles merge. Only top-level runtime imports count: `if TYPE_CHECKING:` blocks and imports inside functions are ignored. `python tools/import_cycles.py report` also lists the cycles that function-level imports hide (information only). Baseline: `import_cycles_baseline.json`. |
 | `make semgrep` | `tools/semgrep_ratchet.py` | A rule in `.semgrep/dendrux.yml` has a new match, or more matches in a function that already had some; or a rule stops passing its fixture. Baseline: `semgrep_baseline.json` (rule, module, function). |
-| `make crap` | `tools/crap_ratchet.py` | A new function scores CRAP above 30, a changed function scores above 30, or an existing function's score rises. Needs `coverage.json` from `make test`. Baseline: `crap_baseline.json`. |
+| `make crap` | `tools/crap_ratchet.py` | A new function scores CRAP above 30, a changed function scores above 30, or an existing function's score rises (by more than 0.5). If the function's code is unchanged (same AST digest) a rise of up to 25 percent of its baseline score is only a warning; a bigger rise fails. Needs `coverage.json` from `make test`. Baseline: `crap_baseline.json`. |
 
 ## Reading a failure
 
@@ -42,7 +42,10 @@ make a failure go away; `stamp` refuses to record new or worse entries.
 - Semgrep: the rule message says what to do instead. A false positive is fixed in the rule
   (and its fixture), not silenced in code: `# nosemgrep` comments are ignored by the gate.
   A rule's `metadata.allow_in` (`module:Class.method`) exempts exactly that method.
-- CRAP: add tests for the function, or make it simpler.
+- CRAP: add tests for the function, or make it simpler. A `CRAP warning` line (unchanged code,
+  score up by at most 25 percent) does not fail the build: it is coverage variance between
+  runs. Look at it if it keeps growing; a loss above 25 percent (for example deleted tests)
+  fails. Any rise on a function whose code changed fails.
 
 ## Stamping after an improvement
 

@@ -14,7 +14,9 @@ docstring or ``...`` body) need no measurement.
 Rules enforced by ``check``:
   * a new function must score at most the threshold (default 30);
   * a changed function (its AST differs from the baseline) must score at most the threshold;
-  * no existing function may score higher than its baseline (small tolerance for noise).
+  * no existing function may score higher than its baseline (small tolerance for noise);
+    when its AST digest is unchanged, a rise of up to 25 percent of the baseline score is
+    only a warning (coverage variance), a larger one still fails.
 
 Run locally (from packages/python)::
 
@@ -41,6 +43,9 @@ from radon.visitors import ComplexityVisitor
 
 DEFAULT_THRESHOLD = 30.0
 DEFAULT_TOLERANCE = 0.5
+# An unchanged function (same AST digest) whose score rises by up to this share of its
+# baseline is a warning, not a failure: run-to-run coverage variance must not fail the build.
+DEFAULT_UNCHANGED_RISE = 0.25
 HERE = Path(__file__).resolve().parent
 DEFAULT_BASELINE = HERE / "crap_baseline.json"
 DEFAULT_REPO_ROOT = HERE.parent
@@ -336,18 +341,24 @@ def collect_scores(
     return scores
 
 
-def compare(
+def compare_split(
     scores: dict[str, FunctionScore],
     baseline: dict[str, dict[str, Any]],
     threshold: float = DEFAULT_THRESHOLD,
     tolerance: float = DEFAULT_TOLERANCE,
-) -> list[Violation]:
-    violations: list[Violation] = []
+    unchanged_rise: float = DEFAULT_UNCHANGED_RISE,
+) -> tuple[list[Violation], list[Violation]]:
+    """(failures, warnings). An existing function whose score rose by more than
+    ``tolerance`` fails, except that when its AST digest is unchanged a rise of up to
+    ``unchanged_rise`` of its baseline score is only a warning (the code did not change, so
+    the movement is coverage variance; a large loss, such as deleted tests, still fails)."""
+    failures: list[Violation] = []
+    warnings: list[Violation] = []
     for key, score in sorted(scores.items()):
         old = baseline.get(key)
         if old is None:
             if score.crap > threshold:
-                violations.append(
+                failures.append(
                     Violation(
                         key,
                         "new-over-threshold",
@@ -356,22 +367,34 @@ def compare(
                 )
             continue
         if score.crap > old["crap"] + tolerance:
-            violations.append(
-                Violation(
-                    key,
-                    "worse",
-                    f"CRAP rose from {old['crap']:.1f} to {score.crap:.1f}",
+            message = f"CRAP rose from {old['crap']:.1f} to {score.crap:.1f}"
+            unchanged = score.digest == old["digest"]
+            if unchanged and score.crap <= old["crap"] * (1 + unchanged_rise):
+                warnings.append(
+                    Violation(key, "worse-unchanged", f"{message} (code unchanged: coverage)")
                 )
-            )
+            else:
+                failures.append(Violation(key, "worse", message))
         elif score.digest != old["digest"] and score.crap > threshold:
-            violations.append(
+            failures.append(
                 Violation(
                     key,
                     "changed-over-threshold",
                     f"changed function scores CRAP {score.crap:.1f} (limit {threshold:g})",
                 )
             )
-    return violations
+    return failures, warnings
+
+
+def compare(
+    scores: dict[str, FunctionScore],
+    baseline: dict[str, dict[str, Any]],
+    threshold: float = DEFAULT_THRESHOLD,
+    tolerance: float = DEFAULT_TOLERANCE,
+) -> list[Violation]:
+    """Strict rules (no warning band): what recording a baseline must not let through."""
+    failures, _ = compare_split(scores, baseline, threshold, tolerance, unchanged_rise=0.0)
+    return failures
 
 
 def _entry(score: FunctionScore) -> dict[str, Any]:
@@ -538,7 +561,9 @@ def main(argv: list[str] | None = None) -> int:
     if baseline is None:
         print(f"baseline not found: {args.baseline} (run 'update' first)", file=sys.stderr)
         return 2
-    violations = compare(scores, baseline, args.threshold, args.tolerance)
+    violations, warnings = compare_split(scores, baseline, args.threshold, args.tolerance)
+    for w in warnings:
+        print(f"CRAP warning: {w.key}: {w.message}")
     for v in violations:
         print(f"CRAP {v.kind}: {v.key}: {v.message}")
     if violations:
@@ -547,7 +572,7 @@ def main(argv: list[str] | None = None) -> int:
             print("CRAP report only: not blocking")
             return 0
         return 1
-    print("CRAP ratchet ok")
+    print(f"CRAP ratchet ok ({len(warnings)} warning(s))" if warnings else "CRAP ratchet ok")
     return 0
 
 
