@@ -1,10 +1,12 @@
 """Import-cycle gate: runtime import cycles in ``dendrux``, ratcheted.
 
-The module graph uses **top-level, runtime** imports only: imports under
-``if TYPE_CHECKING:`` and imports inside functions are ignored (a function-level import is
-a deliberate way to break a cycle, but it is also hidden coupling, so ``report`` lists the
-cycles that include them too, for information only). A cycle is a strongly connected
-component of two or more modules.
+The module graph uses **top-level, runtime** imports only. Importing ``a.b.c`` first runs
+the ``__init__`` of ``a`` and ``a.b``, so those are edges too (not for a module that sits
+inside that package, which is already running). Imports under ``if TYPE_CHECKING:`` (also
+through ``from typing import TYPE_CHECKING as TC``) and imports inside functions are
+ignored. A function-level import is a deliberate way to break a cycle, but it is also hidden
+coupling, so ``report`` lists the cycles that include them too, for information only. A
+cycle is a strongly connected component of two or more modules.
 
 Baseline ``tools/import_cycles_baseline.json``: ``{"cycles": [[module, ...], ...]}``.
 A cycle that is not inside a baseline cycle fails, so does a module that joins one and so
@@ -33,19 +35,34 @@ BASELINE = Path(__file__).resolve().parent / "import_cycles_baseline.json"
 Graph = dict[str, set[str]]
 
 
-def _is_type_checking(test: ast.expr) -> bool:
+_TYPING_MODULES = frozenset({"typing", "typing_extensions"})
+
+
+def _type_checking_names(tree: ast.Module) -> set[str]:
+    """Names this module binds to ``typing.TYPE_CHECKING``, including ``as`` aliases."""
+    names = {"TYPE_CHECKING"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module in _TYPING_MODULES:
+            names.update(
+                alias.asname or alias.name for alias in node.names if alias.name == "TYPE_CHECKING"
+            )
+    return names
+
+
+def _is_type_checking(test: ast.expr, names: set[str]) -> bool:
     if isinstance(test, ast.Name):
-        return test.id == "TYPE_CHECKING"
+        return test.id in names
     return isinstance(test, ast.Attribute) and test.attr == "TYPE_CHECKING"
 
 
 class _Imports(ast.NodeVisitor):
     """Import statements split into module-level ones and ones nested in functions."""
 
-    def __init__(self) -> None:
+    def __init__(self, type_checking_names: set[str]) -> None:
         self.top: list[ast.Import | ast.ImportFrom] = []
         self.lazy: list[ast.Import | ast.ImportFrom] = []
         self._depth = 0
+        self._names = type_checking_names
 
     def _add(self, node: ast.Import | ast.ImportFrom) -> None:
         (self.lazy if self._depth else self.top).append(node)
@@ -63,7 +80,7 @@ class _Imports(ast.NodeVisitor):
     visit_Lambda = _function  # noqa: N815
 
     def visit_If(self, node: ast.If) -> None:  # noqa: N802
-        if _is_type_checking(node.test):
+        if _is_type_checking(node.test, self._names):
             for stmt in node.orelse:
                 self.visit(stmt)
             return
@@ -93,6 +110,24 @@ def _targets(
     return found
 
 
+def _ancestors(name: str) -> list[str]:
+    parts = name.split(".")
+    return [".".join(parts[:i]) for i in range(1, len(parts))]
+
+
+def _package_initializers(targets: set[str], module: str, known: set[str]) -> set[str]:
+    """Importing ``a.b.c`` runs ``a`` and ``a.b`` first. The packages ``module`` itself sits
+    in are already executing, so they are not a new dependency (that would also add the
+    root package, which every module sits in)."""
+    running = {module, *_ancestors(module)}
+    return {
+        pkg
+        for target in targets
+        for pkg in _ancestors(target)
+        if pkg in known and pkg not in running
+    }
+
+
 def build_graph(src: Path = r.SRC, include_function_level: bool = False) -> Graph:
     files = {}
     for path in r.iter_sources(src):
@@ -100,12 +135,14 @@ def build_graph(src: Path = r.SRC, include_function_level: bool = False) -> Grap
     known = set(files)
     graph: Graph = {}
     for module, path in files.items():
-        visitor = _Imports()
-        visitor.visit(ast.parse(path.read_text(encoding="utf-8")))
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        visitor = _Imports(_type_checking_names(tree))
+        visitor.visit(tree)
         nodes = visitor.top + (visitor.lazy if include_function_level else [])
         edges: set[str] = set()
         for node in nodes:
             edges |= _targets(node, module, path.name == "__init__.py", known)
+        edges |= _package_initializers(edges, module, known)
         edges.discard(module)
         graph[module] = edges
     return graph

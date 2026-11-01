@@ -5,6 +5,8 @@ from __future__ import annotations
 import textwrap
 from typing import TYPE_CHECKING
 
+import pytest
+
 from tools import import_cycles as ic
 
 if TYPE_CHECKING:
@@ -125,3 +127,82 @@ def test_end_to_end(tmp_path: Path) -> None:
     (src / "a.py").write_text("from dendrux import b, c\n")
     assert ic.main(["check", "--src", str(src), "--baseline", str(baseline)]) == 1
     assert ic.main(["report", "--src", str(src)]) == 0
+
+
+def _pkg_cycle_tree(tmp_path: Path, a_import: str, init_import: str) -> Path:
+    return make_pkg(
+        tmp_path,
+        {
+            "a.py": f"{a_import}\na = 1\n",
+            "pkg/__init__.py": f"{init_import}\n",
+            "pkg/b.py": "b = 1\n",
+        },
+    )
+
+
+def test_importing_a_submodule_runs_the_package_initializer(tmp_path: Path) -> None:
+    src = _pkg_cycle_tree(tmp_path, "from dendrux.pkg.b import b", "from dendrux.a import a")
+    g = graph(src)
+    assert g["dendrux.a"] == {"dendrux.pkg", "dendrux.pkg.b"}
+    assert ic.find_cycles(g) == [["dendrux.a", "dendrux.pkg"]]
+
+
+def test_the_same_holds_for_relative_imports(tmp_path: Path) -> None:
+    src = _pkg_cycle_tree(tmp_path, "from .pkg.b import b", "from ..a import a")
+    assert ic.find_cycles(graph(src)) == [["dendrux.a", "dendrux.pkg"]]
+
+
+def test_from_package_import_submodule_runs_the_package_initializer(tmp_path: Path) -> None:
+    src = _pkg_cycle_tree(tmp_path, "from dendrux.pkg import b", "from dendrux.a import a")
+    assert ic.find_cycles(graph(src)) == [["dendrux.a", "dendrux.pkg"]]
+    src2 = _pkg_cycle_tree(tmp_path / "rel", "from .pkg import b", "from .. import a")
+    assert ic.find_cycles(graph(src2)) == [["dendrux.a", "dendrux.pkg"]]
+
+
+def test_import_pkg_dot_b_runs_the_package_initializer(tmp_path: Path) -> None:
+    src = _pkg_cycle_tree(tmp_path, "import dendrux.pkg.b", "from dendrux.a import a")
+    assert ic.find_cycles(graph(src)) == [["dendrux.a", "dendrux.pkg"]]
+
+
+def test_a_module_inside_the_package_does_not_depend_on_its_own_initializer(
+    tmp_path: Path,
+) -> None:
+    src = make_pkg(
+        tmp_path,
+        {
+            "pkg/__init__.py": "from dendrux.pkg.x import x\n",
+            "pkg/x.py": "from dendrux.pkg.y import y\nx = 1\n",
+            "pkg/y.py": "y = 1\n",
+        },
+    )
+    g = graph(src)
+    assert g["dendrux.pkg.x"] == {"dendrux.pkg.y"}
+    assert ic.find_cycles(g) == []
+
+
+def test_the_root_package_initializer_is_not_an_edge(tmp_path: Path) -> None:
+    src = make_pkg(tmp_path, {"__init__.py": "from dendrux.a import a\n", "a.py": "a = 1\n"})
+    assert "dendrux" not in graph(src)["dendrux.a"]
+    assert ic.find_cycles(graph(src)) == []
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        "from typing import TYPE_CHECKING as TC\nif TC:\n    from . import b",
+        "import typing as t\nif t.TYPE_CHECKING:\n    from . import b",
+        "import typing\nif typing.TYPE_CHECKING:\n    from . import b",
+        "from typing_extensions import TYPE_CHECKING as TC\nif TC:\n    from . import b",
+    ],
+)
+def test_type_checking_aliases_are_not_runtime_edges(tmp_path: Path, header: str) -> None:
+    src = make_pkg(tmp_path, {"a.py": header + "\n", "b.py": "from . import a\n"})
+    assert graph(src)["dendrux.a"] == set()
+    assert ic.find_cycles(graph(src)) == []
+
+
+def test_an_unrelated_name_called_tc_is_a_runtime_condition(tmp_path: Path) -> None:
+    src = make_pkg(
+        tmp_path, {"a.py": "TC = True\nif TC:\n    from . import b\n", "b.py": "from . import a\n"}
+    )
+    assert ic.find_cycles(graph(src)) == [["dendrux.a", "dendrux.b"]]
