@@ -13,6 +13,12 @@ from pathlib import Path
 
 import pytest
 
+# Imported before the in-process kit run so pytester's sys.modules restore keeps them: a
+# re-imported sqlalchemy.orm fails ("Type <class 'object'> is already registered") and
+# breaks every later test in the session.
+import dendrux.db.models  # noqa: F401
+import dendrux.store  # noqa: F401
+import dendrux.testing.store_kit.sql  # noqa: F401
 from dendrux.runtime.stores.sql.base import SQLStateStore
 from tests.docs._snippets import extract_snippets
 
