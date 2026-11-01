@@ -215,6 +215,68 @@ jobs:
         if: matrix.python-version == '3.12' && matrix.sqlalchemy-version == '2.1.*'
         run: python tools/crap_ratchet.py check --coverage coverage.json
 
+  # Benchmarks: tests that assert how fast something is (marked benchmark, or listed in
+  # tests/_helpers/tier_lists/benchmark.txt). They fail under the parallel load of the shard jobs,
+  # so they run here on their own, in one process, on a single leg. Blocking, like the shards.
+  # Not part of the combined coverage.
+  benchmarks:
+    name: benchmarks (python 3.12 / SQLAlchemy 2.1)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: packages/python
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: dendrux
+          POSTGRES_PASSWORD: dendrux
+          POSTGRES_DB: dendrux_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U dendrux"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      PYTHON_DOTENV_DISABLED: "1"
+      DENDRUX_TEST_PG_URL: postgresql+asyncpg://dendrux:dendrux@localhost:5432/dendrux_test
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: packages/python/pyproject.toml
+
+      - name: Install dependencies
+        run: pip install -e ".[dev,all]"
+
+      - name: Install pinned NLP test model
+        run: make test-model-install
+
+      - name: Pin SQLAlchemy 2.1.*
+        run: |
+          pip install "sqlalchemy[asyncio]==2.1.*"
+          python -c "import sqlalchemy; print('SQLAlchemy', sqlalchemy.__version__)"
+
+      - name: Benchmarks
+        shell: bash
+        run: |
+          pytest tests/ -v -rs -n 0 -m benchmark --no-cov | tee pytest.log
+          if grep -q 'DENDRUX_TEST_PG_URL not set' pytest.log; then
+            echo "::error::Postgres benchmarks were skipped (DENDRUX_TEST_PG_URL not set)."
+            exit 1
+          fi
+
   # Quality ratchets (packages/python/tools/QUALITY.md): cognitive complexity, duplicate code,
   # dead code, import cycles and the custom Semgrep rules. Each compares with a committed
   # baseline and fails only on a new problem or an existing one getting worse. The CRAP ratchet

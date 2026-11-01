@@ -126,3 +126,19 @@ def test_environment_dependent_benchmarks_stay_out_of_the_default_gates() -> Non
     ci_test = _steps("python")["Test"]["run"]
     assert '-m "not benchmark"' in ci_test
     assert "-m benchmark" not in ci_test
+
+
+def test_a_blocking_benchmark_job_runs_the_speed_tests_serially_on_postgres() -> None:
+    """Speed tests are marked benchmark so the parallel shards skip them; CI must still run them."""
+    job = _jobs()["benchmarks"]
+    assert "continue-on-error" not in job and "continue-on-error" not in str(job["steps"])
+    assert "postgres" in job["services"]
+    assert "DENDRUX_TEST_PG_URL" in job["env"]
+    run = _steps("benchmarks")["Benchmarks"]["run"]
+    assert "-m benchmark" in run and "-n 0" in run
+    assert "not benchmark" not in run
+    assert "--cov" not in run.replace("--no-cov", "")
+    for step in job["steps"]:
+        if "uses" in step:
+            assert len(step["uses"].split("@")[1].split()[0]) == 40, "pin actions by SHA"
+    assert "benchmarks" not in _jobs()["python-coverage"].get("needs", [])

@@ -112,8 +112,11 @@ the slow tests.
   times the expected time, or a window the test computed itself) goes in
   `wallclock_reviewed.txt` instead. `tests/tooling/test_test_tiers.py` scans every test for such
   comparisons and fails on an unlisted one (`python tools/test_tiers.py audit-wallclock`).
-  GitHub CI does not run benchmarks today (its test step uses `-m "not benchmark"`); they run in
-  `make bench` and `make test-merge`.
+  GitHub CI runs them in their own blocking `benchmarks` job (Python 3.12, SQLAlchemy 2.1, the
+  Postgres service, `pytest -m benchmark -n 0`, no coverage), so a test that moved out of the
+  parallel shards is still checked on every pull request. Locally they run in `make bench` and
+  `make test-merge`. The shards skip them (`-m "not benchmark"`) and the combined coverage and
+  CRAP gate do not include them.
 
 **Postgres.** With `DENDRUX_TEST_PG_URL` set and no `-n` given, pytest
 runs in parallel (6 workers at most), one database per worker. Only `-m "not benchmark"`,
