@@ -1,0 +1,15 @@
+# Tests that compare a measured time with a number but are not speed tests: the bound is a hang
+# tripwire several times larger than the expected time, or the comparison brackets values the
+# test itself computed. Reviewed 2026-11-01. Format: `path::name | why it is safe to run in parallel`.
+tests/integration/test_050_r1_lock_bounds.py::test_upgrade_from_041_refuses_behind_an_open_transaction | waits out a 5 s lock timeout; window 4.5-10 s
+tests/integration/test_050_r1_lock_bounds.py::test_every_exclusive_step_is_bounded_and_retry_completes | tripwire at 10 s against a 5 s lock timeout
+tests/integration/test_050_t7b2_indexes.py::test_concurrent_index_wait_is_bounded_and_retry_repairs | tripwire at 10 s
+tests/integration/test_050_t7b_fix5.py::test_exclusive_migration_lock_timeout_is_retryable | tripwire at 10 s
+tests/migrations/test_060_activate.py::test_b4_pg_blocked_upgrade_retries | waits out a 5 s lock timeout; window 4.8-8 s
+tests/migrations/test_060_activate.py::test_pg_resume_after_interrupted_replaced_index_drop | waits out a 5 s lock timeout; window 4.5-10 s
+tests/migrations/test_060_lock_bounds.py::test_060_each_step_is_lock_bounded | waits out a 5 s lock timeout; window 4.5-10 s
+tests/unit/test_mcp_oauth_http.py::test_trickling_body_hits_the_overall_deadline | tripwire at 2 s for a 0.4 s deadline against a 5 s trickle
+tests/unit/test_mcp_oauth_http.py::test_a_stalled_response_close_never_holds_send_past_its_bound | tripwires at 1.5 s and 1 s against a close that would never return
+tests/unit/test_050_providers.py::TestDeadlines::test_stream_idle_fires_after_first_delta | brackets a deadline between two readings taken around the call
+tests/unit/test_050_providers.py::TestDeadlines::test_steady_events_keep_the_stream_alive | brackets a deadline between two readings taken around the call
+tests/unit/test_050_providers.py::TestDeadlines::test_consumer_time_is_not_counted | brackets a deadline between two readings taken around the call

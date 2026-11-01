@@ -118,6 +118,7 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     """Tag every test with its area, and the slow and flaky ones from the committed lists."""
     slow = tiers.listed(tiers.load_list("slow.txt"))
     flaky = tiers.listed(tiers.load_list("flaky.txt"))
+    benchmark = tiers.listed(tiers.load_list("benchmark.txt"))
     root = tiers.TESTS_ROOT
     for item in items:
         path = getattr(item, "path", None)
@@ -129,5 +130,7 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
         nodeid = item.nodeid
         if tiers.in_list(*slow, nodeid):
             item.add_marker(pytest.mark.slow)
+        if tiers.in_list(*benchmark, nodeid):
+            item.add_marker(pytest.mark.benchmark)
         if tiers.in_list(*flaky, nodeid):
             item.add_marker(pytest.mark.flaky(reruns=1))

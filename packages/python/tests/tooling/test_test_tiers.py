@@ -410,3 +410,78 @@ def test_quality_guide_says_the_fast_loop_excludes_slow_tests() -> None:
     text = (PKG / "tools" / "QUALITY.md").read_text()
     assert "never runs the tests marked `slow`" in text
     assert "`make ci` at hand-back" in text
+
+
+# ---- wall-clock assertions are benchmarks, not parallel-suite tests ---------------------------
+
+SPEED_TEST = """
+import time
+
+async def test_fast(loop):
+    started = loop.time()
+    await work()
+    assert loop.time() - started < 0.25
+
+def test_tripwire():
+    start = time.monotonic()
+    work()
+    elapsed = time.monotonic() - start
+    assert elapsed < 10
+
+class TestK:
+    def test_derived(self):
+        t0 = time.perf_counter()
+        work()
+        took = time.perf_counter() - t0
+        pause = took * 2
+        assert pause <= 1.5
+
+def test_not_time():
+    value = len("abc")
+    assert value < 0.25
+"""
+
+
+def test_the_scanner_finds_tight_wall_clock_bounds_and_names_the_test(tmp_path: Path) -> None:
+    (tmp_path / "test_x.py").write_text(SPEED_TEST)
+    found = tool.wallclock_asserts(tmp_path)
+    assert [(f.test, f.bound) for f in found] == [
+        ("test_x.py::test_fast", 0.25),
+        ("test_x.py::TestK::test_derived", 1.5),
+    ]
+
+
+def test_every_tight_wall_clock_assertion_is_a_benchmark_or_reviewed() -> None:
+    """The class of flake: a latency bound in a test that runs in the parallel suite."""
+    covered = {
+        e.nodeid
+        for name in ("benchmark.txt", "wallclock_reviewed.txt")
+        for e in tiers.load_list(name)
+    }
+    unlisted = [
+        f"{f.test}: {f.text}"
+        for f in tool.wallclock_asserts(PKG / "tests")
+        if f"tests/{f.test}" not in covered and not f.marked
+    ]
+    assert not unlisted, (
+        "a measured time is compared with a small number in a test that runs in parallel; mark it "
+        "benchmark (tests/_helpers/tier_lists/benchmark.txt) or, if the bound is a generous hang "
+        "tripwire, review it into wallclock_reviewed.txt:\n" + "\n".join(unlisted)
+    )
+
+
+def test_the_notifier_latency_test_is_selected_as_a_benchmark() -> None:
+    target = "tests/integration/test_060_notifier_pg.py"
+    benchmarks = _collect(target, "-m", "benchmark")
+    assert any("test_n1_commit_wakes_under_50ms" in line for line in benchmarks)
+    assert not any(
+        "test_n1_commit_wakes_under_50ms" in line
+        for line in _collect(target, "-m", "not benchmark")
+    )
+
+
+def test_all_four_tier_lists_are_checked_for_real_tests_and_reasons() -> None:
+    assert tool.check_lists() == []
+    for name in ("benchmark.txt", "wallclock_reviewed.txt"):
+        entries = tiers.load_list(name)
+        assert entries and all(e.note for e in entries), name

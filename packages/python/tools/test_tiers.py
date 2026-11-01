@@ -5,7 +5,8 @@
     python tools/test_tiers.py prepare-testmon            # create the testmon data directory
     python tools/test_tiers.py check-area NAME            # exit 2 for an unknown area
     python tools/test_tiers.py ruff-changed               # ruff on the .py files changed vs HEAD
-    python tools/test_tiers.py check-lists                # the slow/flaky lists name real tests
+    python tools/test_tiers.py check-lists                # the tier lists name real tests
+    python tools/test_tiers.py audit-wallclock            # speed bounds not marked benchmark
     python tools/test_tiers.py slow-list LOG [--threshold S] [--write]
     python tools/test_tiers.py weights LOG [--write]      # per-file seconds, for shard balance
     python tools/test_tiers.py shard --count N --index I  # the test files of shard I (1-based)
@@ -26,6 +27,7 @@ import subprocess
 import sys
 from collections import defaultdict
 from pathlib import Path
+from typing import NamedTuple
 
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 if str(PACKAGE_ROOT) not in sys.path:
@@ -123,7 +125,7 @@ def check_lists() -> list[str]:
     """Problems in the committed lists: a missing test, or a flaky entry with no reason."""
     problems = []
     cache: dict[str, set[str]] = {}
-    for name in ("slow.txt", "flaky.txt"):
+    for name in ("slow.txt", "flaky.txt", "benchmark.txt", "wallclock_reviewed.txt"):
         for entry in tiers.load_list(name):
             path_part, _, rest = entry.nodeid.partition("::")
             test_name = rest.partition("[")[0]
@@ -134,9 +136,151 @@ def check_lists() -> list[str]:
             names = cache.setdefault(path_part, _function_names(path))
             if test_name not in names:
                 problems.append(f"{name}: {entry.nodeid}: no such test in {path_part}")
-            if name == "flaky.txt" and not entry.note:
+            if name != "slow.txt" and not entry.note:
                 problems.append(f"{name}: {entry.nodeid}: a reason is required (`id | reason`)")
     return problems
+
+
+_TIME_CALLS = frozenset({"perf_counter", "monotonic", "time", "time_ns", "perf_counter_ns"})
+TIGHT_BOUND_SECONDS = 2.5
+
+
+class WallclockAssert(NamedTuple):
+    test: str  # path relative to tests/, then Class::name or name
+    bound: float
+    text: str
+    marked: bool  # the test (or its class or module) already carries a benchmark mark
+
+
+def _is_time_call(node: ast.AST) -> bool:
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    return (isinstance(func, ast.Attribute) and func.attr in _TIME_CALLS) or (
+        isinstance(func, ast.Name) and func.id in _TIME_CALLS
+    )
+
+
+def _time_names(function: ast.AST) -> set[str]:
+    """Names assigned (directly or through other time names) from a clock reading."""
+    names: set[str] = set()
+    changed = True
+    while changed:
+        changed = False
+        for node in ast.walk(function):
+            if not isinstance(node, ast.Assign | ast.AugAssign | ast.AnnAssign) or not node.value:
+                continue
+            reads = list(ast.walk(node.value))
+            if not any(
+                _is_time_call(x) or (isinstance(x, ast.Name) and x.id in names) for x in reads
+            ):
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                for x in ast.walk(target):
+                    if isinstance(x, ast.Name) and x.id not in names:
+                        names.add(x.id)
+                        changed = True
+        # loop.time() style clocks: <anything>.time() on a loop
+    return names
+
+
+def _clock_reading(node: ast.AST) -> bool:
+    return _is_time_call(node) or (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "time"
+        and not node.args
+    )
+
+
+def _small_constants(compare: ast.Compare) -> list[float]:
+    return [
+        float(c.value)
+        for c in ast.walk(compare)
+        if isinstance(c, ast.Constant)
+        and isinstance(c.value, int | float)
+        and not isinstance(c.value, bool)
+        and 0 < c.value < TIGHT_BOUND_SECONDS
+    ]
+
+
+def _marks_benchmark(node: ast.AST) -> bool:
+    decorators = getattr(node, "decorator_list", [])
+    return any("benchmark" in ast.unparse(d) for d in decorators)
+
+
+def wallclock_asserts(tests_dir: Path) -> list[WallclockAssert]:
+    """Tests that compare a measured clock difference with a number under 2.5 seconds.
+
+    Such a bound is a speed claim: it fails when the machine is busy, so the test belongs in the
+    serial benchmark step. Found by tracing names assigned from ``time.monotonic()`` and
+    friends, or ``loop.time()``, into ``assert``/``if`` comparisons with a small number.
+    """
+    found: list[WallclockAssert] = []
+    for path in sorted(tests_dir.rglob("*.py")):
+        if "live" in path.parts or "__pycache__" in path.parts:
+            continue
+        rel = path.relative_to(tests_dir).as_posix()
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except SyntaxError:
+            continue
+        module_marked = any(
+            isinstance(n, ast.Assign)
+            and any(getattr(t, "id", "") == "pytestmark" for t in n.targets)
+            and "benchmark" in ast.unparse(n.value)
+            for n in tree.body
+        )
+        for owner, function in _test_functions(tree):
+            names = _time_names(function)
+            marked = module_marked or _marks_benchmark(function) or _marks_benchmark(owner)
+            label = (
+                f"{rel}::{function.name}"
+                if owner is tree
+                else f"{rel}::{owner.name}::{function.name}"
+            )  # type: ignore[attr-defined]
+            for node in ast.walk(function):
+                tests_ = [node.test] if isinstance(node, ast.Assert | ast.If) else []
+                for test in tests_:
+                    for compare in (c for c in ast.walk(test) if isinstance(c, ast.Compare)):
+                        if not all(
+                            isinstance(o, ast.Lt | ast.LtE | ast.Gt | ast.GtE) for o in compare.ops
+                        ):
+                            continue
+                        measured = any(
+                            _clock_reading(x) or (isinstance(x, ast.Name) and x.id in names)
+                            for x in ast.walk(compare)
+                        )
+                        bounds = _small_constants(compare)
+                        if measured and bounds:
+                            found.append(
+                                WallclockAssert(label, min(bounds), ast.unparse(compare), marked)
+                            )
+    seen: set[str] = set()
+    unique = []
+    for item in found:  # one finding per test: the tightest bound
+        if item.test not in seen:
+            seen.add(item.test)
+            unique.append(item)
+    return unique
+
+
+def _test_functions(tree: ast.Module) -> list[tuple[ast.AST, ast.AST]]:
+    functions: list[tuple[ast.AST, ast.AST]] = []
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and node.name.startswith(
+            "test"
+        ):
+            functions.append((tree, node))
+        elif isinstance(node, ast.ClassDef):
+            functions.extend(
+                (node, sub)
+                for sub in node.body
+                if isinstance(sub, ast.FunctionDef | ast.AsyncFunctionDef)
+                and sub.name.startswith("test")
+            )
+    return functions
 
 
 def changed_python_files() -> list[str]:
@@ -225,6 +369,7 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("check-area").add_argument("name")
     sub.add_parser("ruff-changed")
     sub.add_parser("check-lists")
+    sub.add_parser("audit-wallclock")
     for name in ("slow-list", "weights"):
         p = sub.add_parser(name)
         p.add_argument("log")
@@ -263,6 +408,21 @@ def main(argv: list[str] | None = None) -> int:
         problems = check_lists()
         print("\n".join(problems) if problems else "tier lists ok")
         return 1 if problems else 0
+    elif args.command == "audit-wallclock":
+        listed = {
+            e.nodeid
+            for name in ("benchmark.txt", "wallclock_reviewed.txt")
+            for e in tiers.load_list(name)
+        }
+        bad = [
+            f
+            for f in wallclock_asserts(PACKAGE_ROOT / "tests")
+            if f"tests/{f.test}" not in listed and not f.marked
+        ]
+        for f in bad:
+            print(f"tests/{f.test}: {f.text}")
+        print(f"{len(bad)} unlisted wall-clock assertion(s)")
+        return 1 if bad else 0
     elif args.command == "slow-list":
         return _cmd_slow_list(args)
     elif args.command == "weights":

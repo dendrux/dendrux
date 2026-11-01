@@ -104,8 +104,16 @@ the slow tests.
   A flaky test is rerun once when it fails (pytest-rerunfailures) and still runs everywhere; it is
   never skipped. A flake gets a root-cause fix, not a list entry, unless the cause is the machine
   (the list holds the one benchmark-only timing test today).
-- `benchmark` (existing): measures the server, so it is excluded from every parallel run and
-  always runs in one process (`-m benchmark` forces `-n 0`).
+- `benchmark`: a test that asserts how fast something is, or measures the server. It is excluded
+  from every parallel run and always runs in one process (`-m benchmark` forces `-n 0`). A test
+  with its own `@pytest.mark.benchmark` needs nothing more; others are listed with a reason in
+  `tests/_helpers/tier_lists/benchmark.txt`. **Rule:** a test that compares a measured time with a
+  number under 2.5 s is a benchmark. A bound that is only a generous hang tripwire (several
+  times the expected time, or a window the test computed itself) goes in
+  `wallclock_reviewed.txt` instead. `tests/tooling/test_test_tiers.py` scans every test for such
+  comparisons and fails on an unlisted one (`python tools/test_tiers.py audit-wallclock`).
+  GitHub CI does not run benchmarks today (its test step uses `-m "not benchmark"`); they run in
+  `make bench` and `make test-merge`.
 
 **Postgres.** With `DENDRUX_TEST_PG_URL` set and no `-n` given, pytest
 runs in parallel (6 workers at most), one database per worker. Only `-m "not benchmark"`,
