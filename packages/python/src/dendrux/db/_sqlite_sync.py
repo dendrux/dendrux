@@ -36,6 +36,9 @@ from sqlalchemy.schema import CreateColumn, CreateIndex, DefaultClause
 from sqlalchemy.sql.elements import False_, Null, TextClause, True_
 
 from dendrux.db._pool_guard import close_fully, serialized, shares_one_connection
+from dendrux.db._schema_check import ensure_schema_current
+from dendrux.db._settings import seed_settings
+from dendrux.db._storage_schema import ACTIVATION_INDEXES
 from dendrux.db.models import Base
 from dendrux.errors import SqliteSchemaSyncError
 
@@ -69,6 +72,7 @@ async def create_sqlite_schema(engine: AsyncEngine) -> None:
     if not shares_one_connection(engine):
         async with engine.connect() as conn:
             await conn.run_sync(create_sqlite_schema_sync)
+        await ensure_schema_current(engine)
         return
     async with serialized(engine):
         conn = await engine.connect()
@@ -76,6 +80,7 @@ async def create_sqlite_schema(engine: AsyncEngine) -> None:
             await conn.run_sync(create_sqlite_schema_sync)
         finally:
             await close_fully(conn.close)
+        await ensure_schema_current(engine)
 
 
 def create_sqlite_schema_sync(sync_conn: Connection) -> list[str]:
@@ -146,35 +151,44 @@ def _has_work(conn: Connection, create_tables: bool) -> bool:
     """Read-only plan: does the database still differ from the models?"""
     _raise_if_unsafe(conn)
     tables = _existing_model_tables(conn)
+    if "agent_runs" in _table_names(conn) and (
+        "dendrux_settings" not in _table_names(conn)
+        or conn.exec_driver_sql("SELECT 1 FROM dendrux_settings WHERE key='storage_format'").first()
+        is None
+    ):
+        return True
     if create_tables and len(tables) != len(Base.metadata.tables):
         return True
     return bool(_unmet(conn, tables))
 
 
 def _begin_immediate(conn: Connection) -> None:
-    for attempt in range(_LOCK_ATTEMPTS):
+    for _ in range(_LOCK_ATTEMPTS):
         try:
             conn.exec_driver_sql("BEGIN IMMEDIATE")
             return
-        except OperationalError as exc:
-            if attempt == _LOCK_ATTEMPTS - 1:
-                raise SqliteSchemaSyncError(
-                    f"Could not take the SQLite write lock to upgrade this database's "
-                    f"schema after {_LOCK_ATTEMPTS} attempts: another connection is "
-                    f"holding it ({exc.orig}). Each attempt waits for the connection's "
-                    f"busy timeout (5 seconds by default; raise it with "
-                    f"connect_args={{'timeout': N}}). Retry once the other writer finishes."
-                ) from exc
+        except OperationalError:
+            pass
+    raise SqliteSchemaSyncError(
+        f"Could not take the SQLite write lock to upgrade this database's "
+        f"schema after {_LOCK_ATTEMPTS} attempts: another connection is "
+        f"holding it. Each attempt waits for the connection's "
+        f"busy timeout (5 seconds by default; raise it with "
+        f"connect_args={{'timeout': N}}). Retry once the other writer finishes."
+    ) from None
 
 
 def _rollback(conn: Connection) -> None:
     try:
         conn.exec_driver_sql("ROLLBACK")
     except OperationalError:
-        logger.warning("SQLite schema sync: ROLLBACK failed", exc_info=True)
+        logger.warning("SQLite schema sync: ROLLBACK failed")
 
 
 def _apply(conn: Connection, changes: list[str]) -> None:
+    if "agent_runs" in _table_names(conn):
+        Base.metadata.tables["dendrux_settings"].create(conn, checkfirst=True)
+        seed_settings(conn, active=False)
     tables = _existing_model_tables(conn)
     for table in tables:
         db_columns = _column_names(conn, table)
@@ -356,11 +370,14 @@ def _add_column(conn: Connection, table: Table, column: Column[Any]) -> None:
                 "UPDATE agent_runs SET status_changed_at = "
                 f"COALESCE(updated_at, created_at, {clock_default})"
             )
-    except OperationalError as exc:
-        raise SqliteSchemaSyncError(
-            f"Could not add column {table.name}.{column.name} to the existing SQLite "
-            f"database ({exc.orig}). {_MIGRATE_HINT}"
-        ) from exc
+    except OperationalError:
+        pass
+    else:
+        return
+    raise SqliteSchemaSyncError(
+        f"Could not add column {table.name}.{column.name} to the existing SQLite "
+        f"database. {_MIGRATE_HINT}"
+    ) from None
 
 
 # ---------------------------------------------------------------------------
@@ -381,12 +398,19 @@ def _is_plain(index: Index) -> bool:
     return where is None and all(isinstance(e, _Column) for e in index.expressions)
 
 
-def _wanted_indexes(table: Table) -> list[_Want]:
+def _wanted_indexes(table: Table, conn: Connection) -> list[_Want]:
     wants = [
         _Want(str(i.name), tuple(c.name.lower() for c in i.columns), bool(i.unique))
         for i in table.indexes
-        if i.name and _is_plain(i)
+        if i.name and _is_plain(i) and str(i.name) not in ACTIVATION_INDEXES
     ]
+    from dendrux.db._schema_check import read_schema_phase
+
+    phase = read_schema_phase(conn)
+    present = _table_indexes(conn, table)
+    for name, (owner, column, old) in ACTIVATION_INDEXES.items():
+        if owner == table.name and old and phase != "active" and name not in present:
+            wants.append(_Want(old, ("agent_run_id", column), False))
     for constraint in table.constraints:
         if not isinstance(constraint, UniqueConstraint):
             continue
@@ -470,13 +494,16 @@ def _reconcile_exact(conn: Connection, table: Table, changes: list[str]) -> None
             continue
         if state != "missing":
             raise SqliteSchemaSyncError(f"Cannot reconcile {table.name}: {state}. {_MIGRATE_HINT}")
+        failure = None
         try:
             conn.exec_driver_sql(want.ddl)
-        except (OperationalError, IntegrityError) as exc:
-            raise SqliteSchemaSyncError(
-                f"Could not create index '{want.name}' on {table.name} ({exc.orig}). If "
+        except (OperationalError, IntegrityError):
+            failure = SqliteSchemaSyncError(
+                f"Could not create index '{want.name}' on {table.name}. If "
                 f"existing rows violate uniqueness, fix them first. {_MIGRATE_HINT}"
-            ) from exc
+            )
+        if failure is not None:
+            raise failure from None
         changes.append(f"created index {want.name}")
 
 
@@ -484,7 +511,7 @@ def _reconcile_indexes(conn: Connection, table: Table, changes: list[str]) -> No
     _reconcile_exact(conn, table, changes)
     indexes = _table_indexes(conn, table)
     owners = _index_owners(conn)
-    for want in _wanted_indexes(table):
+    for want in _wanted_indexes(table, conn):
         state = _state(table, want, indexes, owners)
         if state is None:
             continue
@@ -492,17 +519,20 @@ def _reconcile_indexes(conn: Connection, table: Table, changes: list[str]) -> No
             raise SqliteSchemaSyncError(f"Cannot reconcile {table.name}: {state}. {_MIGRATE_HINT}")
         cols = ", ".join(_quote(conn, c) for c in want.columns)
         unique = "UNIQUE " if want.unique else ""
+        failure = None
         try:
             conn.exec_driver_sql(
                 f"CREATE {unique}INDEX {_quote(conn, want.name)} "
                 f"ON {_quote(conn, table.name)} ({cols})"
             )
-        except (OperationalError, IntegrityError) as exc:
-            raise SqliteSchemaSyncError(
+        except (OperationalError, IntegrityError):
+            failure = SqliteSchemaSyncError(
                 f"Could not create {unique.lower()}index '{want.name}' on "
-                f"{table.name}({', '.join(want.columns)}) ({exc.orig}). If existing rows "
+                f"{table.name}({', '.join(want.columns)}). If existing rows "
                 f"violate uniqueness, fix them first. {_MIGRATE_HINT}"
-            ) from exc
+            )
+        if failure is not None:
+            raise failure from None
         changes.append(f"created {unique.lower()}index {want.name}")
         indexes = _table_indexes(conn, table)
         owners = _index_owners(conn)
@@ -520,7 +550,7 @@ def _unmet(conn: Connection, tables: list[Table]) -> list[str]:
             if c.name.lower() not in db_columns
         )
         indexes = _table_indexes(conn, table)
-        for want in _wanted_indexes(table):
+        for want in _wanted_indexes(table, conn):
             state = _state(table, want, indexes, owners)
             if state is not None:
                 problems.append(

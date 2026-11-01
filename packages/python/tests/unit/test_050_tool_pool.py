@@ -208,7 +208,9 @@ class TestTimeouts:
         limiter = make_call_limiter(4)
         lookups = build_tool_lookups([slow_refund], call_limiter=limiter)
         result = await _execute_tool(
-            ToolCall(name="slow_refund", params={"order_id": 7}), lookups, run_id="run-1"
+            ToolCall(name="slow_refund", params={"order_id": 7}),
+            lookups,
+            run_id="00000000000000000000000302",
         )
 
         payload = json.loads(result.payload)

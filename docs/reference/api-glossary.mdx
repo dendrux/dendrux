@@ -84,6 +84,10 @@ The guide is [Images](/docs/recipes/images).
 | Symbol | Import | What it is |
 | --- | --- | --- |
 | `RunStore` | `from dendrux.store import RunStore` | Read-only facade over the six tables. See [RunStore](/docs/reference/run-store). |
+| `StateStore` / `SQLStateStore` / `PostgresStateStore` / `SQLiteStateStore` / `MySQLStateStore` / `StoreCapabilities` / `store_for_engine` | `from dendrux.store import StateStore, SQLStateStore, PostgresStateStore, SQLiteStateStore, MySQLStateStore, StoreCapabilities, store_for_engine` | Runtime persistence protocol, the SQL base class, the three built-in stores, the explicit capability declaration and the dialect-based factory. See [StateStore](/docs/reference/state-store). |
+| `ClaimResult` / `ReclaimableRun` / `SweepResult` | `from dendrux.runtime.state import ClaimResult, ReclaimableRun, SweepResult` | Claim epoch and pinned format, a marked recovery item, and the bounded sweep result. See [Recovery](/docs/guides/recovery). |
+| `RecoveryInfo` | `from dendrux.types import RecoveryInfo` | Reclaim count, last reclaim time and a bounded replayed-call summary on `RunResult.recovery`. |
+| `EventNotifier` / `NotifierState` / `Subscription` / `PostgresEventNotifier` | `from dendrux.store import EventNotifier, NotifierState, Subscription, PostgresEventNotifier` | Reader wake hints, shared health, a per-run signal and the optional Postgres listener. See [Scaling](/docs/guides/scaling#event-notifications). |
 | `PendingPause` / `PendingToolCall` | `from dendrux.store import PendingPause, PendingToolCall` | What a paused run waits on, from `RunStore.get_pending`. See [Build your own read routes](/docs/recipes/build-your-own-read-routes). |
 | `Follow` / `FollowEnd` / `FollowHeartbeat` / `FollowCapacityError` / `EventFeed` | `from dendrux.store import ...` | The hardened live feed behind `RunStore.follow`. |
 | `redact_event` | `from dendrux.store import redact_event` | Conservative standalone event projection; use `RunStore.get_event_view` for verified active approval arguments. See [redacted views](/docs/reference/run-store#redacted-views). |
@@ -119,7 +123,7 @@ The guide is [Images](/docs/recipes/images).
 | `RunStream` | `from dendrux.types import RunStream` | Async iterable returned by `stream()`/`resume_stream()`. |
 | `RunEvent` / `RunEventType` | `from dendrux.types import RunEvent, RunEventType` | Streaming events (`text_delta`, `tool_use_*`, `run_*`). |
 | `ToolResult` | `from dendrux.types import ToolResult` | A tool result you submit via `submit_tool_results`. `ToolResult.from_dict` and `list_from_dict` validate results that arrive from a browser. |
-| `InputValidationError` | `from dendrux.types import InputValidationError` | A `ValueError` for a value Dendrux cannot accept or store, or an approval with no `expected_pause_id`; carries a fixed `field` and `code`. |
+| `InputValidationError` | `from dendrux.types import InputValidationError` | A `ValueError` for a value Dendrux cannot accept or store, or a pause with a stored id missing a required `expected_pause_id`; carries a fixed `field` and `code`. |
 | `ToolResultContext` / `ToolResultTransform` | `from dendrux import ToolResultContext, ToolResultTransform` | Input and type of `Agent(tool_result_transform=...)`. See [Transforming tool results](/docs/reference/agent#transforming-tool-results). |
 | `GovernanceEventType` | `from dendrux import GovernanceEventType` | The 33 governance event types. See [Governance](/docs/architecture/governance). |
 | `ApprovalDecision` | `from dendrux import ApprovalDecision` | One human decision for `submit_approval(decisions=...)`: `approve()` or `deny(reason)`. See [Approval](/docs/architecture/approval#per-call-decisions). |
@@ -128,6 +132,8 @@ The guide is [Images](/docs/recipes/images).
 | `CreateRunResult` | `from dendrux import CreateRunResult` | Idempotent-create outcome. |
 
 ## Errors
+
+Recovery adds `RunNotReclaimableError` and `RunCancelledError` under `RunControlError`, plus `StoreCapabilityError` and `NotifierUnavailableError`, all from `dendrux.errors`. See [Errors](/docs/reference/errors).
 
 Run-control, skill-continuity, schema, and context-length exceptions live in `dendrux.errors`; common ones are re-exported from `dendrux`. MCP exceptions live in `dendrux.mcp`, RunStore read errors in `dendrux.store`, and several validation/idempotency exceptions are exported from `dendrux`. Full table with when-raised and suggested HTTP mappings on the [Errors](/docs/reference/errors) page: `RunNotFoundError`, `RunNotPausedError`, `PauseStatusMismatchError`, `RunAlreadyClaimedError`, `RunAlreadyTerminalError`, `InvalidToolResultError`, `PersistenceNotConfiguredError`, `SchemaNotInitializedError`, `SchemaOutOfDateError`, `ContextLengthExceededError`. Plus `RunAlreadyActiveError`, `IdempotencyConflictError`, `StructuredOutputValidationError`, `DelegationDepthExceededError` from `dendrux`. New in 0.5.0, also from `dendrux`: `ProviderError` and its subclasses (`ProviderAuthError`, `ProviderRateLimitError`, `ProviderTimeoutError`, `ProviderUnavailableError`, `ProviderStreamIncompleteError`, `ModelRefusalError`, `ContentFilteredError`), `BudgetConfigurationError`, `TenantScopeRequiredError`, `GovernanceMismatchError` and `NoteLimitExceededError`.
 
@@ -139,3 +145,5 @@ Run-control, skill-continuity, schema, and context-length exceptions live in `de
 - [Errors](/docs/reference/errors): the exception hierarchy and HTTP mappings.
 - [HTTP integration](/docs/reference/http-api): the Python methods and application-owned HTTP boundary.
 - [Upgrading to 0.5.0](/docs/upgrading-to-0.5.0): every change from 0.4.1, with an action for each.
+- [Upgrading to 0.6.0](/docs/upgrading-to-0.6.0): activation, recovery and changed defaults.
+- [Database CLI](/docs/reference/cli): migration checks, format status and activation commands.

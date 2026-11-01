@@ -314,6 +314,7 @@ async def test_pii_approval_pause_never_shows_real_values(store: Any, run_store:
         ]
     )
     agent = Agent(
+        strict_tenancy=False,
         provider=llm,
         prompt="p",
         tools=[send_mail],

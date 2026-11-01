@@ -52,7 +52,7 @@ async def _events(store: Any, run_id: str, event_type: str) -> list[Any]:
 class TestRunInterrupt:
     async def test_cancel_before_registration_uses_durable_flag(self, store) -> None:
         llm = ScriptedLLM([LLMResponse(text="unreached")])
-        agent = Agent(provider=llm, prompt="Test.", state_store=store)
+        agent = Agent(strict_tenancy=False, provider=llm, prompt="Test.", state_store=store)
         original = store.create_run
 
         async def create_then_cancel(run_id: str, *args: Any, **kwargs: Any) -> Any:
@@ -71,7 +71,7 @@ class TestRunInterrupt:
 
     async def test_cancel_during_complete_returns_interrupted_result(self, store) -> None:
         llm = ScriptedLLM([LLMResponse(text="unreached")], gate_at=0)
-        agent = Agent(provider=llm, prompt="Test.", state_store=store)
+        agent = Agent(strict_tenancy=False, provider=llm, prompt="Test.", state_store=store)
         task = asyncio.create_task(agent.run("go"))
         await asyncio.wait_for(llm.entered.wait(), 5)
         run_id = await _only_run_id(store)
@@ -113,7 +113,9 @@ class TestRunInterrupt:
             return "unreached"
 
         llm = ScriptedLLM([tool_call("slow", pid="t1"), LLMResponse(text="unreached")])
-        agent = Agent(provider=llm, prompt="Test.", tools=[slow], state_store=store)
+        agent = Agent(
+            strict_tenancy=False, provider=llm, prompt="Test.", tools=[slow], state_store=store
+        )
         task = asyncio.create_task(agent.run("go"))
         await asyncio.wait_for(entered.wait(), 5)
         run_id = await _only_run_id(store)
@@ -138,7 +140,7 @@ class TestRunInterrupt:
                 await gate.wait()
 
         llm = ScriptedLLM([LLMResponse(text="final")])
-        agent = Agent(provider=llm, prompt="Test.", state_store=store)
+        agent = Agent(strict_tenancy=False, provider=llm, prompt="Test.", state_store=store)
         task = asyncio.create_task(agent.run("go", notifier=Blocking()))
         await asyncio.wait_for(entered.wait(), 5)
         run_id = await _only_run_id(store)
@@ -151,7 +153,7 @@ class TestRunInterrupt:
 
     async def test_cancel_after_completion_is_terminal_noop(self, store) -> None:
         llm = ScriptedLLM([LLMResponse(text="final")])
-        agent = Agent(provider=llm, prompt="Test.", state_store=store)
+        agent = Agent(strict_tenancy=False, provider=llm, prompt="Test.", state_store=store)
         result = await agent.run("go")
         assert result.status == RunStatus.SUCCESS
         again = await agent.cancel_run(result.run_id)
@@ -160,7 +162,7 @@ class TestRunInterrupt:
 
     async def test_caller_task_cancel_still_raises(self, store) -> None:
         llm = ScriptedLLM([LLMResponse(text="unreached")], gate_at=0)
-        agent = Agent(provider=llm, prompt="Test.", state_store=store)
+        agent = Agent(strict_tenancy=False, provider=llm, prompt="Test.", state_store=store)
         task = asyncio.create_task(agent.run("go"))
         await asyncio.wait_for(llm.entered.wait(), 5)
         run_id = await _only_run_id(store)
@@ -175,8 +177,10 @@ class TestRunInterrupt:
 
     async def test_other_agent_instance_does_not_interrupt(self, store) -> None:
         llm = ScriptedLLM([LLMResponse(text="final")], gate_at=0)
-        owner = Agent(provider=llm, prompt="Test.", state_store=store)
-        other = Agent(provider=ScriptedLLM([]), prompt="Test.", state_store=store)
+        owner = Agent(strict_tenancy=False, provider=llm, prompt="Test.", state_store=store)
+        other = Agent(
+            strict_tenancy=False, provider=ScriptedLLM([]), prompt="Test.", state_store=store
+        )
         task = asyncio.create_task(owner.run("go"))
         await asyncio.wait_for(llm.entered.wait(), 5)
         run_id = await _only_run_id(store)
@@ -210,7 +214,12 @@ def _delegation(store: Any, *, child_gate: bool = True) -> dict[str, Any]:
         gate_at=0 if child_gate else None,
     )
     child = Agent(
-        name="Child", provider=child_llm, prompt="Child.", tools=[child_step], state_store=store
+        strict_tenancy=False,
+        name="Child",
+        provider=child_llm,
+        prompt="Child.",
+        tools=[child_step],
+        state_store=store,
     )
 
     @tool()
@@ -220,7 +229,12 @@ def _delegation(store: Any, *, child_gate: bool = True) -> dict[str, Any]:
 
     parent_llm = ScriptedLLM([tool_call("delegate", pid="p1"), LLMResponse(text="parent done")])
     parent = Agent(
-        name="Parent", provider=parent_llm, prompt="Parent.", tools=[delegate], state_store=store
+        strict_tenancy=False,
+        name="Parent",
+        provider=parent_llm,
+        prompt="Parent.",
+        tools=[delegate],
+        state_store=store,
     )
     return {
         "parent": parent,
@@ -270,7 +284,12 @@ class TestCascade:
 
         child_llm = ScriptedLLM([tool_call("client_read", pid="c1")])
         child = Agent(
-            name="Child", provider=child_llm, prompt="C.", tools=[client_read], state_store=store
+            strict_tenancy=False,
+            name="Child",
+            provider=child_llm,
+            prompt="C.",
+            tools=[client_read],
+            state_store=store,
         )
 
         @tool()
@@ -282,6 +301,7 @@ class TestCascade:
             [tool_call("delegate", pid="p1"), tool_call("client_read", pid="p2")]
         )
         parent = Agent(
+            strict_tenancy=False,
             name="Parent",
             provider=parent_llm,
             prompt="P.",
@@ -306,7 +326,9 @@ class TestCascade:
     async def test_cancel_without_cascade_leaves_children(self, store) -> None:
         await store.create_run("p", "a")
         await store.create_run("c", "a", parent_run_id="p", delegation_level=1)
-        agent = Agent(provider=ScriptedLLM([]), prompt="T.", state_store=store)
+        agent = Agent(
+            strict_tenancy=False, provider=ScriptedLLM([]), prompt="T.", state_store=store
+        )
         result = await agent.cancel_run("p")
         assert "cascade" not in result.meta
         assert (await store.get_run("c")).cancel_requested is False
@@ -343,7 +365,9 @@ class TestCascade:
             return (await holder["agent"].run("sub")).status.value
 
         llm = ScriptedLLM([tool_call("delegate", pid="p1"), LLMResponse(text="child")], gate_at=1)
-        agent = Agent(provider=llm, prompt="T.", tools=[delegate], state_store=store)
+        agent = Agent(
+            strict_tenancy=False, provider=llm, prompt="T.", tools=[delegate], state_store=store
+        )
         holder["agent"] = agent
         task = asyncio.create_task(agent.run("go"))
         await asyncio.wait_for(llm.entered.wait(), 5)
@@ -372,7 +396,9 @@ class TestCascade:
             return (await holder["agent"].run("sub")).status.value
 
         llm = ScriptedLLM([tool_call("delegate", pid="p1"), LLMResponse(text="child")], gate_at=1)
-        agent = Agent(provider=llm, prompt="T.", tools=[delegate], state_store=store)
+        agent = Agent(
+            strict_tenancy=False, provider=llm, prompt="T.", tools=[delegate], state_store=store
+        )
         holder["agent"] = agent
         task = asyncio.create_task(agent.run("go"))
         await asyncio.wait_for(llm.entered.wait(), 5)
@@ -399,7 +425,9 @@ class TestCascade:
         await store.create_run("p", "a", tenant_id="t1")
         await store.create_run("c1", "a", parent_run_id="p", delegation_level=1, tenant_id="t1")
         await store.create_run("cx", "a", parent_run_id="p", delegation_level=1, tenant_id="t2")
-        agent = Agent(provider=ScriptedLLM([]), prompt="T.", state_store=store)
+        agent = Agent(
+            strict_tenancy=False, provider=ScriptedLLM([]), prompt="T.", state_store=store
+        )
 
         with pytest.raises(RunNotFoundError):
             await agent.request_pause("p", tenant_id="t2")
@@ -424,6 +452,7 @@ class TestCascade:
 class TestTenantInheritance:
     async def _parent(self, store: Any, child_tenant: str | None) -> tuple[Agent, ScriptedLLM]:
         child = Agent(
+            strict_tenancy=False,
             name="Child",
             provider=ScriptedLLM([LLMResponse(text="c")]),
             prompt="C.",
@@ -438,7 +467,12 @@ class TestTenantInheritance:
 
         llm = ScriptedLLM([tool_call("delegate", pid="p1"), LLMResponse(text="done")])
         return Agent(
-            name="Parent", provider=llm, prompt="P.", tools=[delegate], state_store=store
+            strict_tenancy=False,
+            name="Parent",
+            provider=llm,
+            prompt="P.",
+            tools=[delegate],
+            state_store=store,
         ), llm
 
     async def test_child_inherits_parent_tenant(self, store) -> None:
@@ -500,7 +534,9 @@ class TestHeartbeat:
             return "ok"
 
         llm = ScriptedLLM([tool_call("slow_sync", pid="t1"), LLMResponse(text="done")])
-        agent = Agent(provider=llm, prompt="T.", tools=[slow_sync], state_store=store)
+        agent = Agent(
+            strict_tenancy=False, provider=llm, prompt="T.", tools=[slow_sync], state_store=store
+        )
         task = asyncio.create_task(agent.run("go"))
         await asyncio.to_thread(entered.wait, 5)
         run_id = await _only_run_id(store)
@@ -524,7 +560,9 @@ class TestHeartbeat:
             return "ok"
 
         llm = ScriptedLLM([tool_call("waiter", pid="t1"), LLMResponse(text="done")])
-        agent = Agent(provider=llm, prompt="T.", tools=[waiter], state_store=store)
+        agent = Agent(
+            strict_tenancy=False, provider=llm, prompt="T.", tools=[waiter], state_store=store
+        )
         await agent.run("go")
         assert seen["after"] > seen["old"]
 
@@ -548,7 +586,9 @@ class TestHeartbeat:
                     await _backdate(store, run_id)
 
         llm = ScriptedLLM([tool_call("slow", pid="t1"), LLMResponse(text="done")])
-        agent = Agent(provider=llm, prompt="T.", tools=[slow], state_store=store)
+        agent = Agent(
+            strict_tenancy=False, provider=llm, prompt="T.", tools=[slow], state_store=store
+        )
         task = asyncio.create_task(agent.run("go", notifier=BackdateBeforeTool()))
         await asyncio.wait_for(entered.wait(), 5)
         run_id = await _only_run_id(store)

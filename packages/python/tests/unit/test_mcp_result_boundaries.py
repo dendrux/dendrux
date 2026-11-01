@@ -86,7 +86,11 @@ class TestRepeatedCursor:
         with caplog.at_level(logging.WARNING), pytest.raises(MCPDiscoveryLimitError):
             await _adapter(_source(), client).list_tools()
         assert "mcp_discovery_repeated_cursor" in caplog.text
-        assert "remote" in caplog.text
+        (record,) = [
+            r for r in caplog.records if getattr(r, "code", None) == "mcp_discovery_repeated_cursor"
+        ]
+        assert record.pages == 2
+        assert "remote" not in caplog.text
         assert CURSOR_SECRET not in caplog.text
 
     async def test_distinct_cursors_still_page_through(self) -> None:

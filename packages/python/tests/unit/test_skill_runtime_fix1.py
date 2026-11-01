@@ -184,7 +184,8 @@ async def test_request_event_once_per_call_id():
             return SkillExecutionResult()
 
     s = SkillSession.prepare(
-        Agent(prompt="test", skills=[package()], skill_executor=Executor()), explicit=["demo"]
+        Agent(prompt="test", skills=[package()], skill_executor=Executor()),
+        explicit=["demo"],
     )
     s.sink = AsyncMock()
     call = ToolCall(
@@ -243,6 +244,7 @@ async def test_singlecall_run_override_rejects_before_row():
 
     store = AsyncMock()
     a = Agent(
+        strict_tenancy=False,
         prompt="test",
         provider=MockLLM([]),
         state_store=store,

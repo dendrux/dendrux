@@ -17,7 +17,7 @@ from dendrux.db.models import AgentRun, LLMInteraction, TokenUsage
 from dendrux.types import UsageStats
 
 if TYPE_CHECKING:
-    from dendrux.runtime.state import SQLAlchemyStateStore
+    from dendrux.runtime.stores.sql.base import SQLStateStore
 
 # ---------------------------------------------------------------------------
 # Per-call persistence
@@ -28,7 +28,7 @@ class TestPerCallCachePersistence:
     """save_usage and save_llm_interaction round-trip cache fields."""
 
     async def test_save_usage_persists_cache_fields(
-        self, store: SQLAlchemyStateStore, session_factory
+        self, store: SQLStateStore, session_factory
     ) -> None:
         await store.create_run("r1", "Agent", input_data={"x": 1})
         usage = UsageStats(
@@ -49,7 +49,7 @@ class TestPerCallCachePersistence:
             assert row.input_tokens == 500
 
     async def test_save_usage_preserves_none_distinction(
-        self, store: SQLAlchemyStateStore, session_factory
+        self, store: SQLStateStore, session_factory
     ) -> None:
         """None means provider didn't report. Persists as SQL NULL, not 0."""
         await store.create_run("r2", "Agent", input_data={"x": 1})
@@ -64,7 +64,7 @@ class TestPerCallCachePersistence:
             assert row.cache_creation_input_tokens is None
 
     async def test_save_llm_interaction_persists_cache_fields(
-        self, store: SQLAlchemyStateStore, session_factory
+        self, store: SQLStateStore, session_factory
     ) -> None:
         await store.create_run("r3", "Agent", input_data={"x": 1})
         usage = UsageStats(
@@ -94,7 +94,7 @@ class TestRunRollup:
     """finalize_run sums cache tokens into agent_runs.total_cache_*."""
 
     async def test_finalize_rolls_up_cache_tokens(
-        self, store: SQLAlchemyStateStore, session_factory
+        self, store: SQLStateStore, session_factory
     ) -> None:
         await store.create_run("r4", "Agent", input_data={"x": 1})
         total = UsageStats(
@@ -119,7 +119,7 @@ class TestRunRollup:
             assert row.total_input_tokens == 1500
 
     async def test_finalize_with_none_cache_writes_zero(
-        self, store: SQLAlchemyStateStore, session_factory
+        self, store: SQLStateStore, session_factory
     ) -> None:
         """Provider that doesn't report cache fields → rollup writes 0,
         not NULL. Aggregate is non-null per the column definition."""
@@ -200,7 +200,7 @@ class TestUsageAccumulation:
 
 class TestSemanticResponseUsageCacheFields:
     async def test_semantic_response_usage_includes_cache_fields(
-        self, store: SQLAlchemyStateStore, session_factory
+        self, store: SQLStateStore, session_factory
     ) -> None:
         from dendrux.runtime.persistence import PersistenceRecorder
         from dendrux.types import LLMResponse

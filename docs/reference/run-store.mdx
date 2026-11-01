@@ -25,9 +25,12 @@ async with store:
 ```python
 @classmethod
 def from_database_url(database_url: str, *, blob_store: BlobStore | None = None,
-                      database_options: dict[str, Any] | None = None) -> RunStore   # store owns the engine
+                      database_options: dict[str, Any] | None = None,
+                      notifier: EventNotifier | None = None,
+                      listen_url: str | None = None) -> RunStore   # store owns the engine
 @classmethod
-def from_engine(engine: AsyncEngine, *, blob_store: BlobStore | None = None) -> RunStore   # caller owns the engine
+def from_engine(engine: AsyncEngine, *, blob_store: BlobStore | None = None,
+                notifier: EventNotifier | None = None) -> RunStore   # caller owns the engine
 async def close() -> None
 ```
 
@@ -42,7 +45,9 @@ async def read_image(run_id: str, sha256: str, *, tenant_id=...) -> bytes
 
 `read_image` returns verified image bytes only if the run exists (and matches `tenant_id` when given) and references that blob; otherwise `BlobNotFoundError`, the same error for a missing blob, another tenant's blob and an unreferenced one. It is the call to put behind your own authorization when you serve images from a route. `store.blobs.purge(...)` and `store.blobs.collect_garbage(...)` are the only writes `RunStore` has. See [Images](/docs/recipes/images#storage).
 
-`from_database_url` creates and owns an engine; `close()` (or exiting the `async with`) disposes it. `from_engine` reuses an engine you already have; `close()` is then a no-op and you dispose the engine yourself. `RunStore` is an async context manager.
+`from_database_url` creates and owns an engine; `close()` (or exiting the `async with`) disposes it. `from_engine` leaves engine ownership with you. Closing either store also closes its live feed. `RunStore` is an async context manager.
+
+Both constructors can borrow an `EventNotifier`; the application starts and stops it. Alternatively, `from_database_url(listen_url=...)` creates an owned `PostgresEventNotifier`, started on context entry or first live read and stopped at close. Do not supply both forms. `listen_url` must point to the primary through a direct or session pool, never PgBouncer transaction pooling. Its channel comes from `database_options["notify_channel"]`, defaulting to `dendrux_events`; explicit `None` with `listen_url` is refused. Writers must enable the matching channel separately. See [Scaling](/docs/guides/scaling#event-notifications).
 
 ## Tenant scope
 
@@ -277,6 +282,8 @@ total = await store.count_runs(metadata_filter={"user_id": "u_123"}, status="err
 See [Chatbot threads](/docs/recipes/chatbot-threads) for the full pattern.
 
 ## Record types
+
+For format-2 runs, `get_traces` returns the effective provider conversation: the expanded latest rewrite prefix followed by its suffix, with state rows and superseded prefixes excluded before counting `offset` or `limit`. PII placeholders remain in this view. The separate `get_pii_mapping` read is for trusted restoration. An expanded prefix entry can share its underlying rewrite row identity with other entries; use the returned conversation position for ordering.
 
 All returned from `dendrux.store`. Fields, exact as persisted:
 

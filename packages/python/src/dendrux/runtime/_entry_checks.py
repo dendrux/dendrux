@@ -100,9 +100,13 @@ def require_boolean(value: Any, field: str, *, optional: bool = False) -> None:
 
 
 def resolve_runner_tenant(
-    agent: Agent, entry: RunnerEntryPoint, tenant_id: str | None | _OmittedType
+    agent: Agent,
+    entry: RunnerEntryPoint,
+    tenant_id: str | None | _OmittedType,
+    *,
+    state_store: object | None = None,
 ) -> str | None:
-    return _tenant_checks.resolve_tenant(agent, entry, tenant_id, default=None)
+    return _tenant_checks.resolve_tenant(agent, entry, tenant_id, default=None, store=state_store)
 
 
 class _BudgetView:

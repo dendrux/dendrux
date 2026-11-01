@@ -44,6 +44,7 @@ def _assert_artifact_contents(wheel: Path, sdist: Path) -> None:
         "dendrux/mcp/_server.py",
         "dendrux/mcp/_source.py",
         "dendrux/py.typed",
+        "_dendrux_store_kit_bootstrap.py",
     }
     with zipfile.ZipFile(wheel) as archive:
         names = set(archive.namelist())

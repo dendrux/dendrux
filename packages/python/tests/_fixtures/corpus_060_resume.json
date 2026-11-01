@@ -1,0 +1,4 @@
+[
+  {"id": "client_plus_rejected", "target": "client", "rejected": {"name": "change", "params": {"value": "bad"}}},
+  {"id": "approval_plus_rejected", "target": "server", "rejected": {"name": "missing", "params": {}}}
+]

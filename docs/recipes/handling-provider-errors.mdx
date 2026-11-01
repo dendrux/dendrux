@@ -34,13 +34,15 @@ Every error carries:
 | --- | --- |
 | `provider`, `model` | which provider and model were called |
 | `status_code` | the HTTP status, if there was a response |
-| `provider_code` | the vendor error code or a stable local response code |
+| `provider_code` | a code from the closed provider mapping or a stable package-issued code; unknown vendor codes map to `provider_unknown` |
 | `category` | one of the categories above |
 | `retryable` | whether trying the same request again can succeed |
-| `timeout_reason` | for timeouts: `connect`, `call_deadline`, `stream_idle`, `stream_total` or `deadline_during_backoff` |
+| `timeout_reason` | for timeouts: `connect`, `call_deadline`, `stream_idle`, `stream_total` or `deadline_during_backoff`; a non-streaming socket read timeout has `None` |
 | `safe_message` | a fixed-format summary that is safe to log, show and store |
 
 `safe_message` is built from a template, `"{provider} {category} (HTTP {status}, code {provider_code})"`, with `n/a` where a part is unknown. It never contains the vendor's message text, your prompt, or anything the model said.
+
+Unknown vendor codes and unmapped custom-provider codes become `provider_unknown` in safe projections. Package-issued codes retain their meaning. The raw value is only on the exception's `provider_code_raw`; do not log or return it.
 
 The original SDK exception is on `__cause__`, and the vendor's own message text goes only into the debug trace and the stored provider evidence, which your app must keep behind operator authorization. A refusal's text is available in process as `ModelRefusalError.refusal_text`; it is never persisted or put on an event.
 
@@ -127,10 +129,16 @@ The same provider constructors accept local response bounds:
 
 | Argument | Default | Meaning |
 | --- | --- | --- |
-| `max_stream_bytes` | 16 MiB | Retained UTF-8 text, reasoning, refusal and tool arguments, with small event/data charges. Cumulative SDK snapshots are not charged again. |
+| `max_stream_bytes` | 16 MiB | Retained UTF-8 text, reasoning, refusal and tool arguments, with small event/data charges. Cumulative SDK snapshots are not charged again. Also caps one decoded SSE event before SDK parsing. |
 | `max_stream_tool_calls` | 1,000 | Maximum retained tool-call slots and completed calls. |
 
 Exceeding either closes upstream and raises `ProviderResponseError` with category `rejected` and code `stream_size_limit` or `stream_tool_call_limit`. An empty normal completion uses the same class with code `empty_completion`. These failures are not retried. Token-limited empty output keeps `truncated=True`, and tool-only output remains valid.
+
+A final event may repeat instructions, tools and the full response, so a low custom `max_stream_bytes` can reject it even when generated text is short. This per-event cap does not limit total framing volume over the entire stream.
+
+Non-streaming responses are bounded before SDK parsing by `max_response_bytes` (16 MiB by default). Requests advertise gzip and deflate. Identity responses are accepted; unsupported or stacked content encodings close the response and raise non-retryable `ProviderResponseError` with `provider_code="response_encoding_unsupported"`.
+
+`call_deadline` identifies Dendrux's own non-streaming deadline. A socket read timeout alone has `timeout_reason=None`; do not count it as a call-deadline expiration.
 
 ## Mapping to HTTP
 

@@ -20,7 +20,14 @@ async def _close_fully(close):
 
 def _load_subject():
     options = types.ModuleType("dendrux.db._engine_options")
-    for name in ("engine_options", "frozen_options", "normalized_url"):
+    for name in (
+        "engine_options",
+        "frozen_options",
+        "normalized_url",
+        "create_engine_with_hint",
+        "is_mysql_family_url",
+        "mysql_dependency_error",
+    ):
         setattr(options, name, Mock())
     guard = types.ModuleType("dendrux.db._pool_guard")
     guard.close_fully = _close_fully
@@ -60,8 +67,10 @@ class PoolRetirementTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(captured.records), 1)
         record = captured.records[0]
         self.assertEqual(record.code, "shared_engine_loop_closed")
-        self.assertIn("agent.close()", record.getMessage())
-        self.assertIn("async with Agent", record.getMessage())
+        from dendrux._codes import SHARED_ENGINE_LOOP_CLOSED
+
+        self.assertEqual(record.getMessage(), SHARED_ENGINE_LOOP_CLOSED.name)
+        self.assertIn("engine", SHARED_ENGINE_LOOP_CLOSED.do)
         for secret in ("USER_SECRET", "PASSWORD_SECRET", "HOST_SECRET", "DB_SECRET"):
             self.assertNotIn(secret, str(record.__dict__))
         entry.ready.done.assert_not_called()

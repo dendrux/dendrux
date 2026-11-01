@@ -46,6 +46,8 @@ DEFAULT_BASELINE = HERE / "crap_baseline.json"
 DEFAULT_REPO_ROOT = HERE.parent
 DEFAULT_SRC = DEFAULT_REPO_ROOT / "src" / "dendrux"
 EXCLUDED_DIRS = frozenset({"migrations", "__pycache__"})
+# The published store test kit (dendrux/testing) is test code shipped for store authors.
+EXCLUDED_TOP_LEVEL = frozenset({"testing"})
 
 
 @dataclass(frozen=True)
@@ -221,7 +223,12 @@ def _body_coverage(
 
 
 def _iter_sources(src_root: Path) -> list[Path]:
-    return sorted(p for p in src_root.rglob("*.py") if not EXCLUDED_DIRS & set(p.parts))
+    return sorted(
+        p
+        for p in src_root.rglob("*.py")
+        if not EXCLUDED_DIRS & set(p.parts)
+        and p.relative_to(src_root).parts[0] not in EXCLUDED_TOP_LEVEL
+    )
 
 
 def _check_report_matches_source(rel: str, line_count: int, lines: set[int]) -> str | None:

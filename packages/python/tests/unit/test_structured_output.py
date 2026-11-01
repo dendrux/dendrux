@@ -63,6 +63,7 @@ def _make_agent(provider: MockLLM, **overrides) -> Agent:
         "loop": SingleCall(),
     }
     defaults.update(overrides)
+    defaults.setdefault("strict_tenancy", False)
     return Agent(**defaults)
 
 

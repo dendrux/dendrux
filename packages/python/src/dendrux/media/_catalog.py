@@ -1,7 +1,7 @@
 """Blob catalog and resolver interfaces (implemented by the persistence layer).
 
 Defined here, below ``runtime``, so the media pipeline can depend on them
-without importing the state store. ``SQLAlchemyStateStore`` implements
+without importing the state store. ``SQLStateStore`` implements
 :class:`BlobCatalog`; ``runtime/_blob_catalog.py`` implements
 :class:`BlobResolver`.
 """

@@ -6,20 +6,25 @@ Runs across the backend matrix (SQLite always, Postgres when configured).
 from __future__ import annotations
 
 import datetime as dt
+from typing import TYPE_CHECKING
 
 import pytest
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from dendrux.db.models import LLMInteraction, RunEvent, ToolCallRecord
-from dendrux.runtime.state import SQLAlchemyStateStore, UsageRollup
+from dendrux.runtime.state import UsageRollup
+from dendrux.runtime.stores._factory import store_for_engine
 from dendrux.store import RunNotFoundError, RunStore, RunSubtree, RunUsage, SubtreeNode
 from dendrux.types import UsageStats
+
+if TYPE_CHECKING:
+    from dendrux.runtime.stores.sql.base import SQLStateStore
 
 
 @pytest.fixture
 def internal_store(engine):
-    return SQLAlchemyStateStore(engine)
+    return store_for_engine(engine)
 
 
 @pytest.fixture
@@ -28,7 +33,7 @@ def store(engine):
 
 
 async def _call(
-    s: SQLAlchemyStateStore,
+    s: SQLStateStore,
     run_id: str,
     *,
     i: int = 0,
@@ -53,7 +58,7 @@ async def _call(
     )
 
 
-async def _tree(s: SQLAlchemyStateStore) -> None:
+async def _tree(s: SQLStateStore) -> None:
     """root -> (a -> (a1 -> a11), b)"""
     await s.create_run("root", "Root", tenant_id="t1")
     await s.create_run("a", "A", parent_run_id="root", delegation_level=1, tenant_id="t1")

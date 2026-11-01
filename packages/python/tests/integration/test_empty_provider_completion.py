@@ -38,7 +38,11 @@ async def test_empty_completion_is_persisted_error(store, adapter, single, strea
     await provider.close()
     mock = MockLLM([response])
     agent = Agent(
-        prompt="p", provider=mock, state_store=store, loop=SingleCall() if single else None
+        strict_tenancy=False,
+        prompt="p",
+        provider=mock,
+        state_store=store,
+        loop=SingleCall() if single else None,
     )
     paused_agent = None
     try:
@@ -81,6 +85,7 @@ async def test_empty_completion_is_persisted_error(store, adapter, single, strea
 @pytest.mark.parametrize("single", [False, True])
 async def test_empty_token_limited_completion_remains_truncated(store, single, stream):
     agent = Agent(
+        strict_tenancy=False,
         prompt="p",
         provider=MockLLM([LLMResponse(text="", stop_reason="max_tokens")]),
         state_store=store,
@@ -113,7 +118,12 @@ async def test_empty_structured_object_is_valid(store):
     mock = MockLLM([LLMResponse(text="{}")])
     mock.capabilities = replace(mock.capabilities, supports_structured_output=True)
     agent = Agent(
-        prompt="p", loop=SingleCall(), output_type=Empty, state_store=store, provider=mock
+        strict_tenancy=False,
+        prompt="p",
+        loop=SingleCall(),
+        output_type=Empty,
+        state_store=store,
+        provider=mock,
     )
     try:
         result = await agent.run("go")

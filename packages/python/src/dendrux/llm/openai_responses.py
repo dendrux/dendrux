@@ -235,6 +235,7 @@ class OpenAIResponsesProvider(LLMProvider):
         call_timeout: float | None = DEFAULT_CALL_TIMEOUT,
         stream_idle_timeout: float | None = DEFAULT_STREAM_IDLE_TIMEOUT,
         stream_total_timeout: float | None = None,
+        max_response_bytes: int = 16 * 1024 * 1024,
         max_stream_bytes: int = 16 * 1024 * 1024,
         max_stream_tool_calls: int = 1000,
     ) -> None:
@@ -288,7 +289,9 @@ class OpenAIResponsesProvider(LLMProvider):
             stream_idle_timeout: Maximum gap in seconds between meaningful
                 stream events (``response.in_progress`` does not count), and
                 before the first one. ``None`` turns it off.
-            max_stream_bytes: Cumulative UTF-8 and structural stream budget.
+            max_response_bytes: Maximum decoded non-streaming body bytes (default 16 MiB).
+            max_stream_bytes: Per-SSE-event decoded wire bound and cumulative
+                UTF-8 and structural stream budget.
                 Default 16 MiB. Exceeding it closes the upstream response.
             max_stream_tool_calls: Maximum retained tool-call slots (default 1,000).
             stream_total_timeout: Wall-clock limit in seconds for a whole
@@ -317,13 +320,14 @@ class OpenAIResponsesProvider(LLMProvider):
             call_timeout=call_timeout,
             stream_idle_timeout=stream_idle_timeout,
             stream_total_timeout=stream_total_timeout,
+            max_response_bytes=max_response_bytes,
             max_stream_bytes=max_stream_bytes,
             max_stream_tool_calls=max_stream_tool_calls,
         )
         deadlines = self._deadlines
 
         def new_http() -> httpx.AsyncClient:
-            return make_http_client(openai, deadlines)
+            return make_http_client(openai, deadlines, provider="openai_responses")
 
         self._client = openai.AsyncOpenAI(
             api_key=api_key,

@@ -11,14 +11,16 @@ from dendrux.types import RunResult, RunStatus
     ids=["oversized", "text", "empty"],
 )
 def test_wire_answer_has_omission_marker(answer, omitted, caplog):
-    wire = RunResult(run_id="r", status=RunStatus.SUCCESS, answer=answer).to_dict()
+    wire = RunResult(
+        run_id="00000000000000000000000404", status=RunStatus.SUCCESS, answer=answer
+    ).to_dict()
     assert wire["answer_omitted"] is omitted
     assert wire["answer"] == (None if omitted else answer)
     assert wire["wire_version"] == 1
     if omitted:
         assert any(
             getattr(record, "code", None) == "wire_answer_omitted"
-            and getattr(record, "run_id", None) == "r"
+            and getattr(record, "run_id", None) == "00000000000000000000000404"
             for record in caplog.records
         )
 
@@ -31,7 +33,7 @@ def test_paused_wire_masks_raw_server_and_gated_arguments(target, approval, hidd
     from dendrux.store import PendingPause, PendingToolCall
 
     pending = PendingPause(
-        run_id="r",
+        run_id="00000000000000000000000404",
         status="paused",
         kind="paused",
         pause_id="p",
@@ -45,7 +47,9 @@ def test_paused_wire_masks_raw_server_and_gated_arguments(target, approval, hidd
             )
         ],
     )
-    result = RunResult(run_id="r", status=RunStatus.PAUSED, pending=pending)
+    result = RunResult(
+        run_id="00000000000000000000000404", status=RunStatus.PAUSED, pending=pending
+    )
     projected = result.to_dict()["pending"]["pending_tool_calls"][0]
     assert projected["params"] == (None if hidden else {"secret": "PRIVATE_ARGUMENT"})
     assert projected.get("args_hidden", False) is hidden

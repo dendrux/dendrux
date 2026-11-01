@@ -387,7 +387,7 @@ class TestAgentIdempotencyValidation:
         from dendrux.types import LLMResponse
 
         mock = MockLLM([LLMResponse(text="done")])
-        agent = Agent(provider=mock, prompt="test", state_store=store)
+        agent = Agent(strict_tenancy=False, provider=mock, prompt="test", state_store=store)
 
         result = await agent.run("hello", idempotency_key="state-store-key-1")
         assert result.status == RunStatus.SUCCESS

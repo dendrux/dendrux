@@ -103,6 +103,8 @@ def _agent(
     **kwargs: Any,
 ) -> tuple[Agent, ScriptedLLM]:
     llm = _CostReportingLLM(responses)
+    kwargs.setdefault("strict_tenancy", False)
+    kwargs.setdefault("on_governance_change", "warn")
     agent = Agent(
         name=NAME,
         provider=llm,
@@ -357,7 +359,9 @@ def _delegating_parent(
     store: Any, child_response: LLMResponse, budget: Budget
 ) -> tuple[Agent, ScriptedLLM, ScriptedLLM]:
     child_llm = _CostReportingLLM([child_response])
-    child = Agent(name="Child", provider=child_llm, prompt="C.", state_store=store)
+    child = Agent(
+        strict_tenancy=False, name="Child", provider=child_llm, prompt="C.", state_store=store
+    )
 
     @tool()
     async def delegate() -> str:
@@ -698,6 +702,7 @@ class TestBudgetStreamingAndDegrade:
     async def test_single_call_degrades_to_warn(self, store, on_exceed) -> None:
         llm = _CostReportingLLM([_text("classified", tokens=900, cost=0.2)])
         agent = Agent(
+            strict_tenancy=False,
             provider=llm,
             prompt="Classify.",
             loop=SingleCall(),

@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, cast
 
+from dendrux import _codes
 from dendrux.mcp._client import MCPClientAdapter, is_connection_loss
 from dendrux.mcp._destination import MCPDestinationPolicy  # noqa: TC001
 from dendrux.mcp._errors import (
@@ -28,7 +29,6 @@ from dendrux.mcp._source import (
     redact_source_text,
     redact_source_value,
     redact_transport_text,
-    safe_source_exception_detail,
     source_has_opaque_credentials,
 )
 from dendrux.tools._validate import schema_problem
@@ -129,9 +129,7 @@ def _schema_unusable(source: MCPSource, tool: Any, *, strict: bool) -> bool:
             f"MCP source '{source.name}' tool '{tool.name}' has a malformed "
             f"argument schema ({issue})."
         )
-    logger.warning(
-        "MCP tool skipped: code=invalid_schema source=%s tool=%s", source.name, tool.name
-    )
+    _codes.log_code(logger, _codes.INVALID_SCHEMA)
     return True
 
 
@@ -169,6 +167,12 @@ def _build_tool_def(
         parameters=tool.input_schema,
         target=ToolTarget.SERVER,
         parallel=_tool_is_parallel_safe(tool.annotations) and not serial,
+        # Transport selection does not authorize replay of server effects.
+        idempotent=getattr(source, "trust_replay_hints", False) is True
+        and (
+            getattr(tool.annotations, "idempotent_hint", False) is True
+            or getattr(tool.annotations, "read_only_hint", False) is True
+        ),
         timeout_seconds=source.call_timeout,
         has_explicit_timeout=True,
         meta=meta,
@@ -499,11 +503,5 @@ class MCPServer:
                 await client.close()
             elif legacy_stack is not None:
                 await legacy_stack.aclose()
-        except Exception as exc:
-            source = client.source if client is not None else self.source
-            logger.warning(
-                "MCPServer '%s' cleanup failed: %s (%s)",
-                self.name,
-                safe_source_exception_detail(source, exc),
-                type(exc).__name__,
-            )
+        except Exception:
+            _codes.log_code(logger, _codes.MCP_CLEANUP_FAILED, count=1)

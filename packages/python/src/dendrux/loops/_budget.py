@@ -20,14 +20,12 @@ Usage source:
 
 Token formula (``max_tokens``)::
 
-    input + output                                  count_cache_tokens False / None (0.4.1)
-    input + output + cache_read + cache_write       count_cache_tokens True
+    input + output                                  count_cache_tokens False / None
+    input + output + cache_read + cache_write       count_cache_tokens True (default)
 
-``input`` is fresh input only (providers report cached tokens separately), so
-the default undercounts what a cache-heavy run really sends. Choosing
-``count_cache_tokens`` explicitly is recommended in 0.5.0; ``True`` becomes the
-default in 0.6, and a token budget without a choice emits a one-time
-``DeprecationWarning``.
+``input`` is fresh input only (providers report cached tokens separately).
+Cache read and write tokens count toward token budgets by default. Explicit
+``count_cache_tokens=False`` or ``None`` retains input-plus-output accounting.
 
 Unpriced calls (no provider cost, no ``PriceTable`` entry) under
 ``max_cost_usd``: with ``on_exceed`` ``"pause"`` or ``"cancel"`` they count as
@@ -110,6 +108,51 @@ class BudgetCarry:
 
 
 @dataclass(frozen=True)
+class BudgetState:
+    """Lossless budget projection for a format-2 checkpoint.
+
+    Persisted field                 Tracker state / derivation
+    -----------------------------  ---------------------------------------
+    fired                          fired (ordered metric/threshold pairs)
+    unpriced_reported              unpriced_reported (durable event flag)
+    known_cost_usd                  _known_cost (own priced subtotal)
+    unpriced_calls                 _unpriced (own unpriced calls)
+    accepted_unpriced_baseline      _ack_unpriced (accepted own/child count)
+    unpriced_warned                 _unpriced_warned (warning state)
+    gate                           _gate while the resume gate is outstanding
+    enforcement_floor              _floor (own + descendant lower bounds)
+    previous_local                 _last_local (growth already in the floor)
+    price_source                   _price_source (table/provider/none)
+
+    _seen_unpriced is derived from the enforcement floor. _invalid_usage
+    is derived from the separately restored UsageStats. _last is a cached
+    evaluation, recomputed on restore against the current policy; readers,
+    policy and notification sinks come from the new execution. Restoring
+    is never fresh. Only a nonempty gate requires first-checkpoint handling.
+    Mixed attribution lives in UsageStats.cost_source; its budget source is
+    ``none`` because neither single source describes the accumulated spend.
+    """
+
+    fired: tuple[tuple[str, float], ...]
+    unpriced_reported: bool
+    known_cost_usd: float | None
+    unpriced_calls: int
+    accepted_unpriced_baseline: int
+    unpriced_warned: bool
+    gate: tuple[str, ...]
+    enforcement_floor: dict[str, int | float]
+    previous_local: dict[str, int | float]
+    price_source: str
+
+    def __post_init__(self) -> None:
+        # JSON arrays must round-trip to the canonical immutable pair shape.
+        object.__setattr__(self, "fired", tuple((m, t) for m, t in self.fired))
+        object.__setattr__(self, "gate", tuple(self.gate))
+        object.__setattr__(self, "enforcement_floor", dict(self.enforcement_floor))
+        object.__setattr__(self, "previous_local", dict(self.previous_local))
+
+
+@dataclass(frozen=True)
 class _Usage:
     tokens: int
     known_cost_usd: float
@@ -170,6 +213,10 @@ class BudgetTracker:
         self._enforce = enforce
         self.fired: list[tuple[str, float]] = list(carry.fired) if carry else []
         self.unpriced_reported = carry.unpriced_reported if carry else False
+        self._unpriced_warned = self.unpriced_reported
+        self._price_source = (
+            usage.cost_source if usage.cost_source in ("table", "provider") else "none"
+        )
         self._gate = carry.gate if carry else ()
         # Unpriced calls a budget pause already stopped for: resuming accepts
         # them (the spend is unknown and stays so); a new unpriced call stops again.
@@ -186,6 +233,7 @@ class BudgetTracker:
         # In-memory priced spend: the carried subtotal when a pause persisted
         # one; else seeded from the restored total when it is fully priced
         # (an unknown restored total counts as one unpriced call).
+        self._known_cost: float | None
         if carry is not None and carry.known_cost_usd is not None:
             self._known_cost = carry.known_cost_usd
             self._unpriced = carry.unpriced_calls
@@ -231,10 +279,57 @@ class BudgetTracker:
     def add_response(self, usage: UsageStats) -> None:
         """Account one LLM response in the in-memory spend."""
         self._invalid_usage |= _invalid_accounting(usage)
+        if self._usage.cost_source == "mixed":
+            self._price_source = "none"
+        elif usage.cost_source in ("table", "provider"):
+            self._price_source = usage.cost_source
         if usage.cost_unknown or usage.cost_usd is None:
             self._unpriced += 1
         else:
-            self._known_cost = round(self._known_cost + usage.cost_usd, _COST_DECIMALS)
+            self._known_cost = round((self._known_cost or 0.0) + usage.cost_usd, _COST_DECIMALS)
+
+    def snapshot(self) -> BudgetState:
+        """Copy all budget state needed to continue without telemetry reads."""
+        from dataclasses import asdict
+
+        return BudgetState(
+            fired=tuple(self.fired),
+            unpriced_reported=self.unpriced_reported,
+            known_cost_usd=self._known_cost,
+            unpriced_calls=self._unpriced,
+            accepted_unpriced_baseline=self._ack_unpriced,
+            unpriced_warned=self._unpriced_warned,
+            gate=self._gate if self._first_checkpoint else (),
+            enforcement_floor=asdict(self._floor),
+            previous_local=asdict(self._last_local),
+            price_source=self._price_source,
+        )
+
+    def restore(self, state: BudgetState) -> None:
+        """Restore a checkpoint after constructing the tracker with its usage."""
+        self.fired = list(state.fired)
+        self.unpriced_reported = state.unpriced_reported
+        self._known_cost = state.known_cost_usd
+        self._unpriced = state.unpriced_calls
+        self._ack_unpriced = state.accepted_unpriced_baseline
+        self._unpriced_warned = state.unpriced_warned
+        self._gate = state.gate
+        self._floor = _Usage(
+            int(state.enforcement_floor["tokens"]),
+            float(state.enforcement_floor["known_cost_usd"]),
+            int(state.enforcement_floor["unpriced_calls"]),
+        )
+        self._last_local = _Usage(
+            int(state.previous_local["tokens"]),
+            float(state.previous_local["known_cost_usd"]),
+            int(state.previous_local["unpriced_calls"]),
+        )
+        self._seen_unpriced = self._floor.unpriced_calls
+        self._price_source = state.price_source
+        self._invalid_usage = _invalid_accounting(self._usage)
+        self._first_checkpoint = True
+        self._fresh = False
+        self._last = None
 
     def pause_fields(self) -> dict[str, Any]:
         """``PauseState`` fields that carry budget bookkeeping across a pause.
@@ -274,7 +369,7 @@ class BudgetTracker:
     async def _measure(self) -> _Usage:
         # Persisted own usage is a lower bound, never a replacement for spend
         # already observed in this execution. Descendants remain DB-coordinated.
-        local = _Usage(self._tokens(self._usage), self._known_cost, self._unpriced)
+        local = _Usage(self._tokens(self._usage), self._known_cost or 0.0, self._unpriced)
         measured = local
         if self._store_reader is not None:
             try:
@@ -329,6 +424,7 @@ class BudgetTracker:
                 continue
             if metric == COST_USD and usage.unpriced_calls and not self.unpriced_reported:
                 self.unpriced_reported = True
+                self._unpriced_warned = True
                 await self._emit(
                     GovernanceEventType.BUDGET_UNPRICED,
                     iteration,

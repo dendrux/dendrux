@@ -27,10 +27,11 @@ import asyncio
 import logging
 from typing import TYPE_CHECKING, Any, TypeVar
 
+from dendrux import _codes
+
 if TYPE_CHECKING:
     from collections.abc import Coroutine
 
-from dendrux.errors import safe_exception_info
 
 logger = logging.getLogger(__name__)
 
@@ -85,13 +86,19 @@ class RunTaskManager:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.error(
-                "Run %s failed: code=run_failed error_type=%s",
-                run_id,
-                type(exc).__name__,
-                extra={"run_id": run_id, "code": "run_failed"},
-                exc_info=safe_exception_info(),
+            error_type = next(
+                (
+                    name
+                    for kind, name in (
+                        (ValueError, "ValueError"),
+                        (TypeError, "TypeError"),
+                        (TimeoutError, "TimeoutError"),
+                    )
+                    if isinstance(exc, kind)
+                ),
+                "RuntimeError",
             )
+            _codes.log_code(logger, _codes.RUN_FAILED, run_id=run_id, error_type=error_type)
             raise
         finally:
             self._tasks.pop(run_id, None)
@@ -122,7 +129,8 @@ class RunTaskManager:
             if run_id not in pending:
                 if not pending:
                     owned.cancel()
-                pending.add(run_id)
+                sharing = [rid for rid, t in self._owned.items() if t is owned]
+                pending.update(sharing[sharing.index(run_id) :])
             delivered = True
         return delivered
 

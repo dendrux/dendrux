@@ -1,0 +1,129 @@
+name: Bench
+
+# Weekly scale check: `make load-quick` against a pinned Postgres, compared with
+# packages/python/tools/load_baseline.json. The fixed 0.6 Scenario A budgets and a
+# statement-count regression above 20% fail the run; v0.5 comparisons are informational.
+# The baseline file changes only in a release commit (recorded from a local `make load-quick`
+# on a quiet machine); never edit it to make a failing run pass.
+on:
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench
+  cancel-in-progress: false
+
+jobs:
+  load-quick:
+    name: load-quick (ubuntu-24.04, postgres 16)
+    # OS label fixed to Ubuntu 24.04, 4 vCPU / 16 GB class; GitHub rotates the image.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: packages/python
+
+    services:
+      postgres:
+        image: postgres:16-alpine@sha256:0cefaabd882e42bcb2a2f3dc56d3ce4770560ba62fd7f197f1a2e008fd5731ab
+        env:
+          POSTGRES_USER: dendrux
+          POSTGRES_PASSWORD: dendrux
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U dendrux"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      PYTHON_DOTENV_DISABLED: "1"
+      # A private database the script creates itself; it drops and recreates its tables.
+      DENDRUX_LOAD_PG_URL: postgresql+asyncpg://dendrux:dendrux@localhost:5432/dendrux_bench_load_test
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Record runner and service image
+        run: |
+          echo "Runner image: $ImageOS $ImageVersion"
+          uname -a
+          lscpu
+          free -b
+          docker image inspect postgres:16-alpine@sha256:0cefaabd882e42bcb2a2f3dc56d3ce4770560ba62fd7f197f1a2e008fd5731ab --format '{{json .RepoDigests}}'
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: packages/python/pyproject.toml
+
+      - name: Install the package
+        run: pip install -e ".[postgres]"
+
+      # A service container cannot take server flags, so set them with ALTER SYSTEM and restart.
+      - name: Configure Postgres (shared_buffers=256MB)
+        run: |
+          python - <<'PY'
+          import asyncio
+
+          import asyncpg
+
+          URL = "postgresql://dendrux:dendrux@localhost:5432/postgres"
+
+
+          async def main():
+              conn = await asyncpg.connect(URL)
+              await conn.execute("ALTER SYSTEM SET shared_buffers = '256MB'")
+              await conn.execute("ALTER SYSTEM SET max_connections = 200")
+              await conn.close()
+
+
+          asyncio.run(main())
+          PY
+          docker restart "$(docker ps --filter publish=5432 --format '{{.ID}}')"
+          python - <<'PY'
+          import asyncio
+          import sys
+
+          import asyncpg
+
+          URL = "postgresql://dendrux:dendrux@localhost:5432/postgres"
+
+
+          async def main():
+              for _ in range(40):
+                  try:
+                      conn = await asyncpg.connect(URL)
+                  except Exception:
+                      await asyncio.sleep(2)
+                      continue
+                  value = await conn.fetchval("show shared_buffers")
+                  await conn.close()
+                  if value == "256MB":
+                      return
+                  await asyncio.sleep(2)
+              sys.exit("shared_buffers is not 256MB after the restart")
+
+
+          asyncio.run(main())
+          PY
+
+      - name: Load quick
+        run: make load-quick LOAD_JSON=${{ runner.temp }}/dendrux-load-results.json
+
+      - name: Upload the full results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: load-results
+          path: ${{ runner.temp }}/dendrux-load-results.json
+          if-no-files-found: ignore

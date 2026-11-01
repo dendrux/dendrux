@@ -102,7 +102,7 @@ try:
     for record in records:
         assert record.levelno == logging.WARNING
         assert getattr(record, "code", None) == "shared_engine_loop_closed"
-        assert "agent.close()" in record.getMessage() and "async with Agent" in record.getMessage()
+        assert record.getMessage() == "shared_engine_loop_closed"
         assert url not in str(record.__dict__) and tag not in str(record.__dict__)
         assert not record.exc_info
     del agents[:], engines[:]

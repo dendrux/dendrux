@@ -18,6 +18,7 @@ from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.exceptions import MCPError as SDKMCPError
 from mcp.types import CONNECTION_CLOSED, INVALID_REQUEST
 
+from dendrux import _codes
 from dendrux.mcp._challenge import parse_auth_challenge
 from dendrux.mcp._errors import (
     DiscoveryLimitReason,
@@ -33,7 +34,6 @@ from dendrux.mcp._errors import (
 from dendrux.mcp._http import CappedResponseStream, create_http_client, wire_cap
 from dendrux.mcp._source import (
     exception_class_name,
-    safe_source_exception_detail,
     source_has_opaque_credentials,
 )
 
@@ -406,12 +406,7 @@ class MCPClientAdapter:
         if cleanup_failure is not None and not isinstance(cleanup_failure, Exception):
             return cleanup_failure
         if cleanup_failure is not None:
-            logger.debug(
-                "MCP source '%s' cleanup after connect failure also failed: %s (%s)",
-                self.source.name,
-                safe_source_exception_detail(self.source, cleanup_failure),
-                type(cleanup_failure).__name__,
-            )
+            _codes.log_code(logger, _codes.MCP_TRANSPORT_CLEANUP_FAILED, count=1)
         # Raised after the handler has exited. Inside it, Python attaches the
         # original exception as __context__ even with `from None`, and
         # error-monitoring SDKs walk __context__ regardless of
@@ -506,7 +501,7 @@ class MCPClientAdapter:
     def _discovery_limit_error(
         self, reason: DiscoveryLimitReason, pages: int
     ) -> MCPDiscoveryLimitError:
-        logger.warning("mcp_discovery_%s source=%s pages=%d", reason, self.source.name, pages)
+        _codes.log_code(logger, _codes.REGISTRY["mcp_discovery_" + reason], pages=pages)
         error = MCPDiscoveryLimitError(
             f"Failed to list tools from MCP source '{self.source.name}': "
             f"discovery stopped ({reason})."
@@ -516,30 +511,19 @@ class MCPClientAdapter:
         return error
 
     def _safe_error(self, action: str, exc: BaseException) -> MCPConnectionError:
-        """Build a transport error that cannot carry configured credentials.
+        """Build a typed failure with code/count diagnostics and no transport text.
 
-        Only the exception class is rendered, because ``str()`` of this error
-        becomes ``last_error`` and is persisted. The redacted detail stays
-        reachable on the error and through debug logging so operators are not
-        left with an undiagnosable failure — except when the source carries an
-        opaque auth object, whose secrets cannot be enumerated, so its
-        transport text cannot be proven clean and is suppressed outright.
-        A recognisable 401/403 becomes a typed authentication failure, whether
-        it is carried by the exception tree or was the last response seen.
+        Existing exception-chain handling is unchanged. Diagnostics never copy
+        exception text; opaque credentials and destination denials suppress the
+        detail entirely. Recognizable authentication statuses stay typed.
         """
         detail: str | None
         if source_has_opaque_credentials(self.source):
             detail = None
         else:
-            detail = safe_source_exception_detail(self.source, exc)
+            detail = f"{_codes.MCP_TRANSPORT_FAILED.name} count=1"
         failure_class = exception_class_name(exc)
-        logger.debug(
-            "MCP source '%s' failed to %s: %s (%s)",
-            self.source.name,
-            action,
-            detail if detail is not None else "[detail suppressed: opaque auth]",
-            failure_class,
-        )
+        _codes.log_code(logger, _codes.MCP_TRANSPORT_FAILED, count=1)
         status: int | None = None
         rejection: _Rejection | None = None
         found = _authentication_status(exc)

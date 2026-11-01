@@ -29,6 +29,7 @@ import traceback
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
+from dendrux import _codes
 from dendrux.errors import ImageError, ImagePersistenceUnsupportedError
 from dendrux.guardrails._engine import GuardrailEngine
 from dendrux.llm._calls import complete_call, stream_call
@@ -46,6 +47,8 @@ from dendrux.loops._helpers import (
     final_stop_reason,
     guardrail_meta,
     interruptible,
+    lease_scope,
+    leased_stream,
     notify_governance,
     notify_llm,
     notify_llm_failed,
@@ -53,7 +56,9 @@ from dendrux.loops._helpers import (
     notify_message,
     notify_tool,
     notify_tool_started,
+    order_observations,
     price_response,
+    project_message,
     record_governance,
     record_llm,
     record_llm_failed,
@@ -291,7 +296,8 @@ async def _append_assistant(
         reasoning_blocks=response.reasoning_blocks,
     )
     history.append(msg)
-    await _record_message(recorder, run_id, msg, iteration)
+    msg = await _record_message(recorder, run_id, msg, iteration)
+    history[-1] = msg
     await _notify_message(notifier, run_id, msg, iteration, warnings)
     return msg
 
@@ -315,6 +321,34 @@ def _commentary(steps: list[AgentStep]) -> list[str]:
         for s in steps
         if isinstance(s.action, ToolCall) and s.raw_response and s.raw_response.strip()
     ]
+
+
+def _pending_limit_result(
+    *,
+    agent: Agent,
+    state_store: StateStore | None,
+    response: LLMResponse,
+    run_id: str,
+    iteration: int,
+    steps: list[AgentStep],
+    usage: UsageStats,
+    meta: dict[str, Any],
+) -> RunResult | None:
+    if state_store is None or getattr(state_store, "storage_format", 1) != 2:
+        return None
+    if len(response.tool_calls or ()) <= agent._limits.max_pending_calls:
+        return None
+    _codes.log_code(logger, _codes.PENDING_LIMIT, run_id=run_id)
+    return RunResult(
+        run_id=run_id,
+        status=RunStatus.ERROR,
+        error="Assistant batch exceeds the pending-call limit.",
+        steps=steps,
+        commentary=_commentary(steps),
+        iteration_count=iteration,
+        usage=usage,
+        meta={**meta, "failure_reason": "pending_limit"},
+    )
 
 
 def _snapshot_usage(usage: UsageStats) -> UsageStats:
@@ -569,7 +603,8 @@ async def _deliver_inbox(
             meta={"note_id": note.id},
         )
         history.append(msg)
-        await _record_message(recorder, run_id, msg, iteration)
+        msg = await _record_message(recorder, run_id, msg, iteration)
+        history[-1] = msg
         await _notify_message(notifier, run_id, msg, iteration, warnings)
     await state_store.mark_notes_delivered(run_id, [n.id for n in notes], iteration=iteration)
     for note in notes:
@@ -604,6 +639,53 @@ class _LoopState(NamedTuple):
     image_view: ImageViewState
 
 
+def _bind_checkpoint(
+    recorder: LoopRecorder | None,
+    *,
+    state: _LoopState,
+    budget: BudgetTracker,
+    provider_kwargs: dict[str, Any],
+    tool_defs: Any,
+    engine: GuardrailEngine | None,
+    agent: Agent,
+    strategy: Strategy,
+    loop_type: str = "react",
+) -> None:
+    bind = getattr(recorder, "bind_loop", None)
+    if bind is not None:
+        bind(
+            lambda: {
+                "loop": loop_type,
+                "format_result": lambda result: _format_result(strategy, result),
+                "idempotent": {t.name: t.idempotent for t in tool_defs},
+                "steps": state.steps,
+                "usage": state.usage,
+                "budget": budget,
+                "tool_counts": state.call_counts,
+                "declared_tools": {t.name for t in tool_defs},
+                "tool_targets": {t.name: t.target.value for t in tool_defs},
+                "approval_tools": agent.require_approval,
+                "denied_tools": agent._deny,
+                "provider_kwargs": provider_kwargs,
+                "image_view": state.image_view,
+                "has_images": any(m.parts for m in state.history),
+                "pii_mapping": engine.get_pii_mapping() if engine else None,
+                "pii_counters": engine._counters if engine else {},
+            },
+            budget,
+        )
+
+
+async def _checkpoint_view(
+    recorder: LoopRecorder | None,
+    messages: list[Message],
+    iteration: int,
+) -> None:
+    checkpoint = getattr(recorder, "checkpoint_view", None)
+    if checkpoint is not None:
+        await checkpoint(messages, iteration)
+
+
 async def _init_loop_state(
     *,
     user_input: str,
@@ -617,13 +699,14 @@ async def _init_loop_state(
 ) -> _LoopState:
     """Initialize mutable loop state — shared between run() and run_stream()."""
     if initial_history is not None:
-        history = list(initial_history)
+        history = [await project_message(recorder, m) for m in initial_history]
     else:
         from dendrux.context_blocks import wire_user_input
 
         user_msg = Message(role=Role.USER, content=wire_user_input(user_input, [], None))
         history = [user_msg]
-        await _record_message(recorder, run_id, user_msg, 0)
+        user_msg = await _record_message(recorder, run_id, user_msg, 0)
+        history[-1] = user_msg
         await _notify_message(notifier, run_id, user_msg, 0)
 
     call_counts: dict[str, int] = {}
@@ -756,7 +839,8 @@ async def _process_tool_calls(
         await _notify_tool(notifier, run_id, tc, json_result, iteration, warnings)
         result_msg = _format_result(strategy, json_result)
         history.append(result_msg)
-        await _record_message(recorder, run_id, result_msg, iteration)
+        result_msg = await _record_message(recorder, run_id, result_msg, iteration)
+        history[-1] = result_msg
         await _notify_message(notifier, run_id, result_msg, iteration, warnings)
         all_results.append((tc, json_result))
 
@@ -793,7 +877,8 @@ async def _process_tool_calls(
             )
             result_msg = _format_result(strategy, deny_result)
             history.append(result_msg)
-            await _record_message(recorder, run_id, result_msg, iteration)
+            result_msg = await _record_message(recorder, run_id, result_msg, iteration)
+            history[-1] = result_msg
             await _notify_message(notifier, run_id, result_msg, iteration, warnings)
             all_results.append((tc, deny_result))
         else:
@@ -805,7 +890,8 @@ async def _process_tool_calls(
         await _notify_tool(notifier, run_id, tc, result, iteration, warnings)
         result_msg = _format_result(strategy, result)
         history.append(result_msg)
-        await _record_message(recorder, run_id, result_msg, iteration)
+        result_msg = await _record_message(recorder, run_id, result_msg, iteration)
+        history[-1] = result_msg
         await _notify_message(notifier, run_id, result_msg, iteration, warnings)
         all_results.append((tc, result))
 
@@ -890,7 +976,8 @@ async def _process_tool_calls(
             history.append(result_msg)
             await _record_tool(recorder, run_id, tc, failure, iteration)
             await _notify_tool(notifier, run_id, tc, failure, iteration, warnings)
-            await _record_message(recorder, run_id, result_msg, iteration)
+            result_msg = await _record_message(recorder, run_id, result_msg, iteration)
+            history[-1] = result_msg
             await _notify_message(notifier, run_id, result_msg, iteration, warnings)
             all_results.append((tc, failure))
         non_denied = ready
@@ -1013,7 +1100,8 @@ async def _process_tool_calls(
         call_counts[tc.name] = call_counts.get(tc.name, 0) + 1
         result_msg = _format_result(strategy, tool_result)
         history.append(result_msg)
-        await _record_message(recorder, run_id, result_msg, iteration)
+        result_msg = await _record_message(recorder, run_id, result_msg, iteration)
+        history[-1] = result_msg
         await _notify_message(notifier, run_id, result_msg, iteration, warnings)
         all_results.append((tc, tool_result))
 
@@ -1129,7 +1217,8 @@ async def _apply_before_tool(
             await _notify_tool(notifier, run_id, tc, result, iteration, warnings)
         result_msg = _format_result(strategy, result)
         history.append(result_msg)
-        await _record_message(recorder, run_id, result_msg, iteration)
+        result_msg = await _record_message(recorder, run_id, result_msg, iteration)
+        history[-1] = result_msg
         await _notify_message(notifier, run_id, result_msg, iteration, warnings)
         all_results.append((tc, result))
 
@@ -1439,7 +1528,7 @@ class ReActLoop(Loop):
         )
         before_tool: BeforeToolHook | None = getattr(agent, "before_tool", None)
         hook_tenant_id = await _hook_tenant_id(before_tool, state_store, resolved_run_id)
-        g_engine = (
+        g_engine = getattr(recorder, "guardrail_engine", None) or (
             GuardrailEngine(
                 agent.guardrails, pii_mapping=initial_pii_mapping, run_id=resolved_run_id
             )
@@ -1447,6 +1536,16 @@ class ReActLoop(Loop):
             else None
         )
 
+        _bind_checkpoint(
+            recorder,
+            state=state,
+            budget=budget,
+            provider_kwargs=_pkw,
+            tool_defs=tool_defs,
+            strategy=strategy,
+            engine=g_engine,
+            agent=agent,
+        )
         start_iteration = iteration_offset + 1
         end_iteration = agent.max_iterations + 1
         for iteration in range(start_iteration, end_iteration):
@@ -1512,7 +1611,6 @@ class ReActLoop(Loop):
                 history=history,
                 tool_defs=tool_defs,
             )
-
             # Incoming guardrail — scan ALL messages before LLM call
             _all_guardrail_findings: dict[str, Any] = {}
             if g_engine is not None:
@@ -1521,9 +1619,12 @@ class ReActLoop(Loop):
                 for msg_idx, msg in enumerate(messages):
                     if not msg.content:
                         continue
-                    cleaned_msg, findings, block_err = await g_engine.scan_incoming_message(
-                        msg, index=msg_idx
+                    project = (
+                        g_engine.project_incoming_message
+                        if getattr(recorder, "guardrail_engine", None) is g_engine
+                        else g_engine.scan_incoming_message
                     )
+                    cleaned_msg, findings, block_err = await project(msg, index=msg_idx)
                     if findings:
                         all_in_findings.extend(findings)
                     if block_err is not None:
@@ -1610,6 +1711,8 @@ class ReActLoop(Loop):
                         warnings=notifier_warnings,
                     )
 
+            await _checkpoint_view(recorder, messages, iteration)
+
             # Image request view (§5.1): placeholders, caps, verified bytes.
             prepared = await images.prepare(
                 messages, iteration=iteration, guardrails=agent.guardrails or ()
@@ -1653,14 +1756,15 @@ class ReActLoop(Loop):
                         recorder=recorder,
                         notifier=notifier,
                     ):
-                        response = await complete_call(
-                            provider,
-                            prepared.wire,
-                            tools=tools,
-                            run_id=resolved_run_id,
-                            cache_key_prefix=cache_key_prefix,
-                            **_pkw,
-                        )
+                        async with lease_scope(recorder):
+                            response = await complete_call(
+                                provider,
+                                prepared.wire,
+                                tools=tools,
+                                run_id=resolved_run_id,
+                                cache_key_prefix=cache_key_prefix,
+                                **_pkw,
+                            )
                 except Exception as _llm_exc:
                     _llm_fail_ms = int((time.monotonic() - t0) * 1000)
                     await _record_llm_failed(
@@ -1877,6 +1981,19 @@ class ReActLoop(Loop):
                 step = replace(step, meta={**step.meta, "reasoning": response.reasoning})
             steps.append(step)
 
+            limited = _pending_limit_result(
+                agent=agent,
+                state_store=state_store,
+                response=response,
+                run_id=resolved_run_id,
+                iteration=iteration,
+                steps=steps,
+                usage=total_usage,
+                meta=guardrail_meta(g_engine, notifier_warnings),
+            )
+            if limited is not None:
+                return limited
+
             if isinstance(step.action, Finish):
                 await _append_assistant(
                     response,
@@ -1974,6 +2091,7 @@ class ReActLoop(Loop):
                     image_runtime=image_runtime,
                 )
                 _mark_call_rejections(history, tool_history_start, outcome.all_results)
+                order_observations(recorder, history)
                 if outcome.pending_calls:
                     pause_status = (
                         RunStatus.WAITING_APPROVAL
@@ -2119,6 +2237,16 @@ class ReActLoop(Loop):
         before_tool: BeforeToolHook | None = getattr(agent, "before_tool", None)
         hook_tenant_id = await _hook_tenant_id(before_tool, state_store, resolved_run_id)
 
+        _bind_checkpoint(
+            recorder,
+            state=state,
+            budget=budget,
+            provider_kwargs=_pkw,
+            tool_defs=tool_defs,
+            strategy=strategy,
+            engine=None,
+            agent=agent,
+        )
         start_iteration = iteration_offset + 1
         end_iteration = agent.max_iterations + 1
         for iteration in range(start_iteration, end_iteration):
@@ -2203,6 +2331,7 @@ class ReActLoop(Loop):
                 history=history,
                 tool_defs=tool_defs,
             )
+            await _checkpoint_view(recorder, messages, iteration)
 
             # Image request view (§5.1). Image guardrails are batch-only:
             # stream() rejects guardrails at the Agent level.
@@ -2251,8 +2380,11 @@ class ReActLoop(Loop):
                     failure: Exception | None = None
                     # Externally visible deltas of this provider call (§5.7 guard).
                     visible_deltas = 0
+                    active_stream = leased_stream(
+                        interruptible(provider_stream, interrupt), recorder
+                    )
                     try:
-                        async for event in interruptible(provider_stream, interrupt):
+                        async for event in active_stream:
                             if event.type == StreamEventType.TEXT_DELTA:
                                 partial_text.append(event.text or "")
                                 visible_deltas += 1
@@ -2383,8 +2515,8 @@ class ReActLoop(Loop):
                         notifier=notifier,
                     )
             finally:
+                await active_stream.aclose()
                 await provider_stream.aclose()
-
             if stop_control is not None:
                 stop_result = _control_stop_result(
                     stop_control,
@@ -2465,6 +2597,20 @@ class ReActLoop(Loop):
             if llm_response.reasoning is not None:
                 step = replace(step, meta={**step.meta, "reasoning": llm_response.reasoning})
             steps.append(step)
+
+            limited = _pending_limit_result(
+                agent=agent,
+                state_store=state_store,
+                response=llm_response,
+                run_id=resolved_run_id,
+                iteration=iteration,
+                steps=steps,
+                usage=total_usage,
+                meta={"notifier_warnings": notifier_warnings} if notifier_warnings else {},
+            )
+            if limited is not None:
+                yield RunEvent(type=RunEventType.RUN_ERROR, run_result=limited)
+                return
 
             if isinstance(step.action, Finish):
                 await _append_assistant(
@@ -2582,6 +2728,7 @@ class ReActLoop(Loop):
                         phase="commentary",
                     )
                 _mark_call_rejections(history, tool_history_start, outcome.all_results)
+                order_observations(recorder, history)
                 if outcome.pending_calls:
                     pause_status = (
                         RunStatus.WAITING_APPROVAL
@@ -2727,14 +2874,15 @@ async def _execute_record_notify(
     """
     await _record_tool_started(recorder, run_id, tool_call, iteration)
     await _notify_tool_started(notifier, run_id, tool_call, iteration, notifier_warnings)
-    result = await _execute_tool(
-        tool_call,
-        lookups,
-        transform,
-        image_runtime=image_runtime,
-        tracker=tracker,
-        run_id=run_id,
-    )
+    async with lease_scope(recorder):
+        result = await _execute_tool(
+            tool_call,
+            lookups,
+            transform,
+            image_runtime=image_runtime,
+            tracker=tracker,
+            run_id=run_id,
+        )
     if tracker is not None:
         tracker.result = result
     await _record_tool(recorder, run_id, tool_call, result, iteration)
@@ -2812,12 +2960,7 @@ async def _execute_parallel_group(
             # The tool returned and its own row write had started (it may or
             # may not have landed). Never write a second row for the call.
             if not tracker.recorded:
-                logger.warning(
-                    "A finished tool call was stopped while being recorded "
-                    "(code=tool_row_may_be_missing, run_id=%s, tool=%s)",
-                    run_id,
-                    tc.name,
-                )
+                _codes.log_code(logger, _codes.TOOL_ROW_MAY_BE_MISSING, run_id=run_id)
             continue
         message = _SIBLING_UNKNOWN if tracker.abandoned else _SIBLING_CANCELLED
         code = "outcome_unknown" if tracker.abandoned else "cancelled"
@@ -2833,12 +2976,7 @@ async def _execute_parallel_group(
             await _record_tool(recorder, run_id, tc, result, iteration)
             await _notify_tool(notifier, run_id, tc, result, iteration, notifier_warnings)
         except Exception:
-            logger.warning(
-                "Could not record stopped tool call (code=%s, run_id=%s, tool=%s)",
-                code,
-                run_id,
-                tc.name,
-            )
+            _codes.log_code(logger, _codes.REGISTRY[code], run_id=run_id)
     raise error
 
 
@@ -2866,15 +3004,14 @@ def _log_stopped(
         for tc, task, tracker in zip(group, tasks, trackers, strict=True)
         if task.cancelled()
     ]
-    for tc, tracker in stopped:
+    for _tc, tracker in stopped:
         if tracker.result is not None:
             continue  # it finished; only its row or event was cut short
-        logger.warning(
-            "Stopped tool call in a parallel batch (code=%s, reason=%s, run_id=%s, tool=%s)",
-            "outcome_unknown" if tracker.abandoned else "cancelled",
-            reason,
-            run_id,
-            tc.name,
+        _codes.log_code(
+            logger,
+            _codes.REGISTRY["outcome_unknown" if tracker.abandoned else "cancelled"],
+            run_id=run_id,
+            reason=reason,
         )
     return stopped
 
@@ -3010,14 +3147,12 @@ def _timeout_result(
             "busy. It was not run and is safe to retry."
         )
         meta = {"code": code}
-    logger.warning(
-        "Tool '%s' timed out after %ss%s (code=%s, run_id=%s, zombie_threads=%s)",
-        name,
-        timeout_s,
-        "" if is_explicit else " (default). Set an explicit timeout: @tool(timeout_seconds=N)",
-        code,
-        run_id,
-        meta.get("zombie_threads", 0),
+    _codes.log_code(
+        logger,
+        _codes.REGISTRY[code],
+        run_id=run_id,
+        timeout_s=timeout_s,
+        zombie_threads=meta.get("zombie_threads", 0),
     )
     return ToolResult(
         name=name,
@@ -3141,15 +3276,13 @@ async def _execute_tool(
             ) from ser_err
         payload, cap_meta = cap_value_payload(result, payload, limits.max_tool_result_bytes)
         if cap_meta is not None:
-            logger.warning(
-                "Tool '%s' result over the size cap (code=%s, run_id=%s, bytes=%d, limit=%d, "
-                "truncated=%s)",
-                tool_call.name,
-                cap_meta["code"],
-                run_id,
-                cap_meta["bytes"],
-                limits.max_tool_result_bytes,
-                bool(cap_meta.get("truncated")),
+            _codes.log_code(
+                logger,
+                _codes.SIZE_LIMIT,
+                run_id=run_id,
+                bytes=cap_meta["bytes"],
+                limit=limits.max_tool_result_bytes,
+                truncated=bool(cap_meta.get("truncated")),
             )
             if not cap_meta.get("truncated"):
                 return ToolResult(
@@ -3203,13 +3336,12 @@ async def _execute_tool(
     except ToolResultTooLargeError as too_large:
         # The source stopped reading an oversized result (MCP read cap).
         payload, cap_meta = size_limit_payload(too_large.size)
-        logger.warning(
-            "Tool '%s' result over the size cap (code=%s, run_id=%s, bytes=%s, limit=%d)",
-            tool_call.name,
-            cap_meta["code"],
-            run_id,
-            too_large.size,
-            limits.max_tool_result_bytes,
+        _codes.log_code(
+            logger,
+            _codes.SIZE_LIMIT,
+            run_id=run_id,
+            bytes=too_large.size,
+            limit=limits.max_tool_result_bytes,
         )
         return ToolResult(
             name=tool_call.name,
@@ -3225,9 +3357,7 @@ async def _execute_tool(
             f"Tool '{tool_call.name}' could not be queued because the tool pool is full. "
             "It was not run and is safe to retry."
         )
-        logger.warning(
-            "Tool '%s' rejected (code=tool_pool_saturated, run_id=%s)", tool_call.name, run_id
-        )
+        _codes.log_code(logger, _codes.TOOL_POOL_SATURATED, run_id=run_id)
         return ToolResult(
             name=tool_call.name,
             call_id=tool_call.id,

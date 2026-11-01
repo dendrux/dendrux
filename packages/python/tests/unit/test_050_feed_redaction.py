@@ -15,14 +15,17 @@ Codes, counts, ids and Dendrux's own constant reasons stay visible.
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from dendrux.db.models import Base
-from dendrux.runtime.state import SQLAlchemyStateStore
+from dendrux.runtime.stores._factory import store_for_engine
 from dendrux.store import EventFeed, FollowEnd, FollowHeartbeat, RunStore, StoredEvent, redact_event
+
+if TYPE_CHECKING:
+    from dendrux.runtime.stores.sql.base import SQLStateStore
 
 SECRET = "SECRET-TEXT-4242"
 
@@ -144,11 +147,11 @@ async def engine(tmp_path: Any) -> Any:
 
 
 @pytest.fixture
-def state(engine: Any) -> SQLAlchemyStateStore:
-    return SQLAlchemyStateStore(engine)
+def state(engine: Any) -> SQLStateStore:
+    return store_for_engine(engine)
 
 
-async def _write_history(state: SQLAlchemyStateStore, *, active: bool) -> None:
+async def _write_history(state: SQLStateStore, *, active: bool) -> None:
     """A run with a past approval pause; optionally a second, active one."""
     await state.create_run("r1", "a", tenant_id="T")
     approval_pause = {

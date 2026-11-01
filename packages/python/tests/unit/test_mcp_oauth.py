@@ -1066,7 +1066,10 @@ async def test_rejected_adapter_close_failure_does_not_stop_recovery(adapters, m
         assert len(adapters.instances) == 2
         assert runtime._entries[connection.identity].adapter is adapters.instances[1]
         assert _opening_events(recorder) == (1, ["MCPConnectionOpened"])
-    assert "cleanup failed after a credential rejection" in caplog.text
+    assert any(
+        getattr(record, "code", None) == "mcp_cleanup_failed" and record.count == 1
+        for record in caplog.records
+    )
     # The provider-resolved token is a redaction needle in cleanup diagnostics.
     assert "Bearer one" not in caplog.text
 

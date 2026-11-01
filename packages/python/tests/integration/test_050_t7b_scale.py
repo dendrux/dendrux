@@ -2,6 +2,7 @@
 
 import asyncio
 import datetime as dt
+import functools
 import json
 import time
 
@@ -21,6 +22,7 @@ async def test_two_hundred_budget_runs_with_lost_forensics(
     async def work() -> str:
         return "ok"
 
+    @functools.wraps(store.save_llm_interaction)
     async def lost(*args, **kwargs):
         raise RuntimeError("fixture evidence outage")
 
@@ -64,7 +66,9 @@ async def test_two_hundred_budget_runs_with_lost_forensics(
     event.listen(engine.sync_engine, "checkout", checkout)
     event.listen(engine.sync_engine, "checkin", checkin)
     try:
-        await asyncio.wait_for(asyncio.gather(*(run_one() for _ in range(200))), 90)
+        # This is a correctness load test, not a wall-clock performance gate.
+        # Preserve all 200 concurrent runs and measured latency, with room for CI load.
+        await asyncio.wait_for(asyncio.gather(*(run_one() for _ in range(200))), 300)
     finally:
         event.remove(engine.sync_engine, "checkout", checkout)
         event.remove(engine.sync_engine, "checkin", checkin)
@@ -142,7 +146,7 @@ async def test_sweep_projection_uses_status_index(store, engine, monkeypatch, re
         if isinstance(statement, Update) and "failure_reason" in str(statement):
             # Observe candidate traversal without destroying the seed. A losing
             # CAS has no event insert, exactly as in the real contention path.
-            return SimpleNamespace(scalar_one_or_none=lambda: None)
+            return SimpleNamespace(mappings=lambda: SimpleNamespace(first=lambda: None))
         if isinstance(statement, Select) and "started" in statement.selected_columns:
             params = statement.compile().params
             value = params["status_1"]

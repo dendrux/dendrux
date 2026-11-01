@@ -18,42 +18,58 @@ async def test_claim_race_returns_one_epoch(store):
         ]
     )
     assert sum(bool(c) for c in claims) == 1
-    assert [c for c in claims if c] == [1]
+    assert [c.claim_epoch for c in claims if c] == [1]
     assert (await store.get_run_control("claims")).claim_epoch == 1
 
 
 async def test_stale_epoch_cannot_finalize_pause_or_release_new_claim(store):
-    await store.create_run("epochs", "integrity")
-    await store.pause_run("epochs", status="paused", pause_data={"pause_id": "one"})
-    old = await store.claim_paused_run("epochs", expected_status="paused")
+    await store.create_run("00000000000000000000000100", "integrity")
+    await store.pause_run(
+        "00000000000000000000000100", status="paused", pause_data={"pause_id": "one"}
+    )
+    old = (
+        await store.claim_paused_run("00000000000000000000000100", expected_status="paused")
+    ).claim_epoch
     assert type(old) is int
     assert await store.try_pause_run(
-        "epochs", status="paused", pause_data={"pause_id": "two"}, claim_epoch=old
+        "00000000000000000000000100",
+        status="paused",
+        pause_data={"pause_id": "two"},
+        claim_epoch=old,
     )
-    new = await store.claim_paused_run("epochs", expected_status="paused")
+    new = (
+        await store.claim_paused_run("00000000000000000000000100", expected_status="paused")
+    ).claim_epoch
     assert new == old + 1
     writes = await asyncio.gather(
         store.finalize_run(
-            "epochs", status="error", expected_current_status="running", claim_epoch=old
+            "00000000000000000000000100",
+            status="error",
+            expected_current_status="running",
+            claim_epoch=old,
         ),
         store.finalize_with_event(
-            "epochs",
+            "00000000000000000000000100",
             status="error",
             allowed_current_statuses=["running"],
             event_type="run.error",
             claim_epoch=old,
         ),
-        store.pause_with_event("epochs", status="paused", pause_data={}, claim_epoch=old),
-        store.release_run_claim("epochs", status="paused", claim_epoch=old),
+        store.pause_with_event(
+            "00000000000000000000000100", status="paused", pause_data={}, claim_epoch=old
+        ),
+        store.release_run_claim("00000000000000000000000100", status="paused", claim_epoch=old),
     )
     assert writes == [False, None, None, False]
     with pytest.raises(RunFencedError):
-        await claimed_store(store, "epochs", old).get_run_control("epochs")
-    assert (await store.get_run("epochs")).status == "running"
-    assert await store.get_run_events("epochs") == []
+        await claimed_store(store, "00000000000000000000000100", old).get_run_control(
+            "00000000000000000000000100"
+        )
+    assert (await store.get_run("00000000000000000000000100")).status == "running"
+    assert await store.get_run_events("00000000000000000000000100") == []
     assert (
         await store.finalize_with_event(
-            "epochs",
+            "00000000000000000000000100",
             status="success",
             allowed_current_statuses=["running"],
             event_type="run.completed",

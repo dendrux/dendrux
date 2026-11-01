@@ -84,14 +84,11 @@ def warn_if_shared_connection(engine: AsyncEngine) -> None:
     if not shares_one_connection(engine) or pool in _WARNED:
         return
     _WARNED.add(pool)
-    url = engine.sync_engine.url
     logger.warning(
-        "Dendrux store on a single-connection pool (%s, %s database %r, e.g. in-memory "
+        "Dendrux store on a single-connection pool (%s, e.g. in-memory "
         "SQLite): Dendrux's database sessions are serialised and the data is not "
         "durable. Use a SQLite file or Postgres for anything beyond tests and demos.",
         type(pool).__name__,
-        url.drivername,
-        url.database,
     )
 
 

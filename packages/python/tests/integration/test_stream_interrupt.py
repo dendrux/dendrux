@@ -50,7 +50,7 @@ async def _wait_first_sent(provider: GatedStreamLLM) -> None:
 class TestCancelRunInterruptsStream:
     async def test_cancel_run_mid_stream_persists_partial_answer(self, store) -> None:
         provider = GatedStreamLLM()
-        agent = Agent(provider=provider, prompt="Test.", state_store=store)
+        agent = Agent(strict_tenancy=False, provider=provider, prompt="Test.", state_store=store)
         stream = agent.stream("go")
         consumer = asyncio.create_task(_consume(stream))
         await _wait_first_sent(provider)
@@ -86,7 +86,13 @@ class TestCancelRunInterruptsStream:
 
     async def test_cancel_run_mid_stream_single_call(self, store) -> None:
         provider = GatedStreamLLM()
-        agent = Agent(provider=provider, prompt="Test.", state_store=store, loop=SingleCall())
+        agent = Agent(
+            strict_tenancy=False,
+            provider=provider,
+            prompt="Test.",
+            state_store=store,
+            loop=SingleCall(),
+        )
         stream = agent.stream("go")
         consumer = asyncio.create_task(_consume(stream))
         await _wait_first_sent(provider)
@@ -103,7 +109,7 @@ class TestCancelRunInterruptsStream:
     async def test_cancel_after_completion_is_terminal_noop(self, store) -> None:
         provider = GatedStreamLLM()
         provider.gate.set()
-        agent = Agent(provider=provider, prompt="Test.", state_store=store)
+        agent = Agent(strict_tenancy=False, provider=provider, prompt="Test.", state_store=store)
         stream = agent.stream("go")
         events = await _consume(stream)
         assert events[-1].type == RunEventType.RUN_COMPLETED
@@ -117,8 +123,8 @@ class TestCancelRunInterruptsStream:
         A different Agent instance only sets the durable flag; the run
         still finishes its current call and completes."""
         provider = GatedStreamLLM()
-        owner = Agent(provider=provider, prompt="Test.", state_store=store)
-        other = Agent(provider=provider, prompt="Test.", state_store=store)
+        owner = Agent(strict_tenancy=False, provider=provider, prompt="Test.", state_store=store)
+        other = Agent(strict_tenancy=False, provider=provider, prompt="Test.", state_store=store)
         stream = owner.stream("go")
         consumer = asyncio.create_task(_consume(stream))
         await _wait_first_sent(provider)
@@ -136,7 +142,7 @@ class TestCancelRunInterruptsStream:
 class TestAcloseMidStream:
     async def test_aclose_persists_partial_answer_and_closes_provider(self, store) -> None:
         provider = GatedStreamLLM()
-        agent = Agent(provider=provider, prompt="Test.", state_store=store)
+        agent = Agent(strict_tenancy=False, provider=provider, prompt="Test.", state_store=store)
         stream = agent.stream("go")
 
         async with stream as s:
@@ -156,7 +162,7 @@ class TestAcloseMidStream:
 
     async def test_aclose_before_any_text_persists_no_answer(self, store) -> None:
         provider = GatedStreamLLM()
-        agent = Agent(provider=provider, prompt="Test.", state_store=store)
+        agent = Agent(strict_tenancy=False, provider=provider, prompt="Test.", state_store=store)
         stream = agent.stream("go")
 
         async with stream as s:
@@ -173,7 +179,13 @@ class TestResumeStreamInterrupt:
     async def test_cancel_run_during_resume_stream(self, store) -> None:
         tc = ToolCall(name="client_read", params={"sheet": "S1"}, provider_tool_call_id="ptc_1")
         provider = GatedStreamLLM(before=[LLMResponse(text="Reading.", tool_calls=[tc])])
-        agent = Agent(provider=provider, prompt="Test.", tools=[client_read], state_store=store)
+        agent = Agent(
+            strict_tenancy=False,
+            provider=provider,
+            prompt="Test.",
+            tools=[client_read],
+            state_store=store,
+        )
 
         paused = await agent.run("go")
         assert paused.status == RunStatus.WAITING_CLIENT_TOOL

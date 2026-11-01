@@ -283,6 +283,51 @@ class TestNestedClasses:
         assert cr.main(["check", *common, "--baseline", str(base)]) == 1
 
 
+class TestPublishedTestKitIsNotScored:
+    """``dendrux/testing`` is test code shipped for store authors; it has its own certification."""
+
+    CONTRACT = "def contract(x):\n    if x:\n        return 1\n    return 2\n"
+
+    def test_functions_under_the_top_level_testing_package_are_left_out(
+        self, tmp_path: Path
+    ) -> None:
+        pkg, root = _write_pkg(tmp_path)
+        kit = pkg / "testing" / "contracts"
+        kit.mkdir(parents=True)
+        (kit / "basic.py").write_text(self.CONTRACT)
+        coverage = _all_executed(SRC)
+        coverage["files"]["src/pkg/testing/contracts/basic.py"] = {
+            "executed_lines": [],
+            "missing_lines": [2, 3, 4],
+            "excluded_lines": [],
+        }
+        scores = cr.collect_scores(pkg, root, coverage)
+        assert "src/pkg/mod.py::simple" in scores
+        assert not [key for key in scores if "/testing/" in key]
+
+    def test_the_kit_need_not_appear_in_the_coverage_report_at_all(self, tmp_path: Path) -> None:
+        pkg, root = _write_pkg(tmp_path)
+        (pkg / "testing").mkdir()
+        (pkg / "testing" / "kit.py").write_text(self.CONTRACT)
+        assert cr.collect_scores(pkg, root, _all_executed(SRC))
+
+    def test_a_nested_directory_that_is_merely_named_testing_is_still_scored(
+        self, tmp_path: Path
+    ) -> None:
+        pkg, root = _write_pkg(tmp_path)
+        (pkg / "runtime" / "testing").mkdir(parents=True)
+        (pkg / "runtime" / "testing" / "helper.py").write_text(self.CONTRACT)
+        coverage = _all_executed(SRC)
+        coverage["files"]["src/pkg/runtime/testing/helper.py"] = {
+            "executed_lines": [2, 3, 4],
+            "missing_lines": [],
+            "excluded_lines": [],
+        }
+        assert "src/pkg/runtime/testing/helper.py::contract" in cr.collect_scores(
+            pkg, root, coverage
+        )
+
+
 class TestMissingCoverageEvidence:
     def test_a_report_without_the_file_fails(self, tmp_path: Path) -> None:
         pkg, root = _write_pkg(tmp_path)

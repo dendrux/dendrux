@@ -12,6 +12,7 @@ import math
 from dataclasses import replace
 from typing import Any
 
+from dendrux import _codes
 from dendrux.types import UsageStats
 
 logger = logging.getLogger(__name__)
@@ -36,9 +37,7 @@ _INT32_MAX = 2**31 - 1
 
 
 def invalid_usage() -> UsageStats:
-    logger.warning(
-        "Provider usage is invalid; accounting is unknown", extra={"code": "usage_invalid"}
-    )
+    _codes.log_code(logger, _codes.USAGE_INVALID)
     return UsageStats(usage_reported=False, cost_unknown=True)
 
 

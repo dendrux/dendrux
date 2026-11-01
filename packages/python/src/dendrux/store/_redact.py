@@ -74,7 +74,7 @@ _PLACEHOLDER_PAUSES = frozenset({"waiting_approval", "waiting_human_input", "pau
 _CONSTANT_DENIAL_REASONS = frozenset(
     {"denied_by_policy", DEFAULT_DENIAL_REASON, _HOOK_ERROR_REASON, _CLIENT_APPROVAL_REASON}
 )
-_CONSTANT_APPROVAL_REASONS = frozenset({"requires_approval"})
+_CONSTANT_APPROVAL_REASONS = frozenset({"requires_approval", "replay_after_crash"})
 TOOL_RESULT_CODES = frozenset(
     {
         # tools/_validate.py
@@ -167,12 +167,26 @@ _CANCEL_REASONS = frozenset(
     {"cancel_requested", "task_cancelled", "stream_closed", BUDGET_EXCEEDED}
 )
 _FAILURE_REASONS = frozenset(
-    {"stale_running", "never_started", "abandoned_waiting", "guardrail_blocked", BUDGET_EXCEEDED}
+    {
+        "stale_running",
+        "never_started",
+        "abandoned_waiting",
+        "guardrail_blocked",
+        BUDGET_EXCEEDED,
+        "reclaim_limit",
+        "stale_running_legacy",
+        "pending_limit",
+        "lease_lost",
+        "history_too_large",
+        "recovery_call_missing",
+        "recovery_state_missing",
+        "recovery_state_invalid",
+    }
 )
 _BUDGET_METRICS = frozenset({TOKENS, COST_USD})
 _BUDGET_REASONS = frozenset({"threshold_crossed", BUDGET_EXCEEDED, UNPRICED_CALL})
 _BUDGET_ACTIONS = frozenset(get_args(BudgetAction))
-_APPROVAL_SOURCES = frozenset({"static", "hook"})
+_APPROVAL_SOURCES = frozenset({"static", "hook", "recovery"})
 _DECISIONS = frozenset({"approved", "rejected", "mixed"})
 _CALL_DECISIONS = frozenset({"approved", "denied"})
 _COST_SOURCES = frozenset(get_args(CostSource))
@@ -359,6 +373,7 @@ _SCHEMAS: dict[str, dict[str, Check]] = {
         "truncated": _bool,
     },
     "run.error": {
+        "failure_reason": _enum(_FAILURE_REASONS),
         "status": _enum(_RUN_STATUSES),
         "stop_reason": _enum(_STOP_REASONS),
         "truncated": _bool,
@@ -370,6 +385,13 @@ _SCHEMAS: dict[str, dict[str, Check]] = {
         "partial_output": _bool,
         "exceeded": _list(_EXCEEDED),
         "failure_reason": _enum(_FAILURE_REASONS),
+    },
+    "run.lease_expired": {"gap_s": _num},
+    "run.reclaimed": {
+        "attempt": _num,
+        "previous_epoch": _num,
+        "gap_s": _num,
+        "governance_changed": _bool,
     },
     "run.interrupted": {"failure_reason": _enum(_FAILURE_REASONS)},
     "run.abandoned": {"failure_reason": _enum(_FAILURE_REASONS)},
@@ -424,6 +446,8 @@ _SCHEMAS: dict[str, dict[str, Check]] = {
     },
     # persistence: tool_name and code decided in _special; parse_error hidden
     # (a provider adapter may set it), raw_length kept
+    "tool.started": {"tool_name": _declared, "call_id": lambda _: _HIDE, "idempotent": _bool},
+    "tool.replayed": {"call_id": lambda _: _HIDE},
     "tool.completed": {
         "tool_name": _declared,
         "target": _enum(_TARGETS),
@@ -684,6 +708,7 @@ def _special(event: StoredEvent, raw: dict[str, Any], shown: dict[str, Any], ctx
 # it, and "<unknown_tool>" otherwise (missing or partial records, custom
 # stores, older runs, standalone ``redact_event``).
 _TOOL_NAME_PATHS: dict[str, tuple[str | None, str]] = {
+    "tool.started": (None, "tool_name"),
     "tool.completed": (None, "tool_name"),
     "approval.requested": (None, "tool_name"),
     "policy.denied": (None, "tool_name"),

@@ -19,7 +19,7 @@ from dendrux.agent import Agent
 from dendrux.errors import ImageLimitError, UnsupportedModalityError
 from dendrux.llm.mock import MockLLM
 from dendrux.media import Image, ImagePolicy, InMemoryBlobStore
-from dendrux.runtime.state import SQLAlchemyStateStore
+from dendrux.runtime.stores._factory import store_for_engine
 from dendrux.tool import tool
 from dendrux.types import LLMResponse, RunStatus, ToolCall, ToolResult
 
@@ -49,6 +49,7 @@ def _mock(responses: list[LLMResponse]) -> MockLLM:
 
 
 def _agent(store: Any, responses: list[LLMResponse], **kw: Any) -> Agent:
+    kw.setdefault("strict_tenancy", False)
     return Agent(
         name="screen_agent",
         prompt="You read screenshots.",
@@ -69,7 +70,7 @@ def _json(value: Any) -> Any:
 
 
 async def test_canonical_sample_end_to_end(engine: Any) -> None:
-    store = SQLAlchemyStateStore(engine)
+    store = store_for_engine(engine)
     agent = _agent(
         store,
         [LLMResponse(text=None, tool_calls=[ToolCall(name="take_screenshot", params={})])],
@@ -92,7 +93,7 @@ async def test_canonical_sample_end_to_end(engine: Any) -> None:
         url = engine.url.render_as_string(hide_password=False)
         await engine.dispose()
         engine = create_async_engine(url)
-    store2 = SQLAlchemyStateStore(engine)
+    store2 = store_for_engine(engine)
     agent2 = _agent(store2, [LLMResponse(text="The code word is ZEBRA42.")])
     result = await agent2.submit_tool_results(
         run_id,
@@ -126,11 +127,12 @@ async def test_canonical_sample_end_to_end(engine: Any) -> None:
         "WHERE run_id = :r ORDER BY owner_kind",
         r=run_id,
     )
+    trace = next(t for t in await store2.get_traces(run_id) if t.role == "tool")
     assert sorted((r["owner_kind"], r["owner_id"], r["ordinal"]) for r in refs) == sorted(
         [
             ("submission", f"{iteration}:{call_id}", 0),
             ("tool_call", call_id, 0),
-            ("trace", "2", 1),
+            ("trace", str(trace.order_index), 1),
         ]
     )
     assert {r["tenant_scope"] for r in refs} == {"t:acme"}
@@ -175,7 +177,7 @@ async def test_canonical_sample_end_to_end(engine: Any) -> None:
 
 
 async def test_stream_errors_create_no_run_and_no_blob(engine: Any) -> None:
-    store = SQLAlchemyStateStore(engine)
+    store = store_for_engine(engine)
     agent = _agent(
         store, [LLMResponse(text="x")], images=ImagePolicy(capability_overrides={"mock": "no"})
     )
@@ -194,7 +196,7 @@ async def test_external_blob_store_second_process(engine: Any) -> None:
     from dendrux.store import RunStore
 
     blob_store = InMemoryBlobStore()
-    store = SQLAlchemyStateStore(engine)
+    store = store_for_engine(engine)
     agent = _agent(
         store,
         [LLMResponse(text=None, tool_calls=[ToolCall(name="take_screenshot", params={})])],
@@ -205,11 +207,11 @@ async def test_external_blob_store_second_process(engine: Any) -> None:
     blob = (await _rows(engine, "SELECT storage, data FROM dendrux_blobs"))[0]
     assert blob["storage"] == "external" and blob["data"] is None
 
-    reader = RunStore(SQLAlchemyStateStore(engine), blob_store=blob_store)  # type: ignore[call-arg]
+    reader = RunStore(store_for_engine(engine), blob_store=blob_store)  # type: ignore[call-arg]
     assert await reader.read_image(paused.run_id, SHA, tenant_id="acme") == PNG
 
     call_id = (await store.get_pause_state(paused.run_id))["pending_tool_calls"][0]["id"]
-    agent2 = _agent(SQLAlchemyStateStore(engine), [LLMResponse(text="done")], blob_store=blob_store)
+    agent2 = _agent(store_for_engine(engine), [LLMResponse(text="done")], blob_store=blob_store)
     result = await agent2.submit_tool_results(
         paused.run_id, [ToolResult(name="take_screenshot", call_id=call_id, payload='"ok"')]
     )
@@ -217,9 +219,13 @@ async def test_external_blob_store_second_process(engine: Any) -> None:
 
 
 async def test_v030_text_pause_resumes_unchanged(engine: Any) -> None:
+    from tests._fixtures.storage import pin_storage_format
+
+    await pin_storage_format(engine, 1)
     """A text-only pause has no image keys and resumes exactly as in v0.3.0."""
-    store = SQLAlchemyStateStore(engine)
+    store = store_for_engine(engine)
     agent = Agent(
+        strict_tenancy=False,
         name="screen_agent",
         prompt="p",
         provider=MockLLM(
@@ -234,11 +240,12 @@ async def test_v030_text_pause_resumes_unchanged(engine: Any) -> None:
     assert all("parts" not in m for m in pause["history"])
     call_id = pause["pending_tool_calls"][0]["id"]
     agent2 = Agent(
+        strict_tenancy=False,
         name="screen_agent",
         prompt="p",
         provider=MockLLM([LLMResponse(text="done")]),
         tools=[take_screenshot],
-        state_store=SQLAlchemyStateStore(engine),
+        state_store=store_for_engine(engine),
     )
     result = await agent2.submit_tool_results(
         paused.run_id, [ToolResult(name="take_screenshot", call_id=call_id, payload='"ok"')]
@@ -260,13 +267,13 @@ async def test_recorder_gets_provider_for_token_estimates(engine: Any) -> None:
         def image_capability_key(self, model: str) -> tuple[str, str, str]:
             return ("anthropic", "", model)
 
-    store = SQLAlchemyStateStore(engine)
+    store = store_for_engine(engine)
     provider = ClaudeLikeMock(
         [LLMResponse(text="ZEBRA42")],
         model="claude-sonnet-4-6",
         image_support="yes",  # type: ignore[call-arg]
     )
-    agent = Agent(name="a", prompt="p", provider=provider, state_store=store)
+    agent = Agent(strict_tenancy=False, name="a", prompt="p", provider=provider, state_store=store)
     result = await agent.run(["What does this say?", Image.from_bytes(PNG)])
     llm = await store.get_llm_interactions(result.run_id)  # type: ignore[attr-defined]
     assert llm[0].semantic_request["image_stats"] == {

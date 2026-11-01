@@ -34,6 +34,7 @@ from typing import TYPE_CHECKING, Any, Generic, ParamSpec, TypeVar
 
 import httpx
 
+from dendrux import _codes
 from dendrux.errors import (
     ContentFilteredError,
     ContextLengthExceededError,
@@ -48,6 +49,7 @@ from dendrux.errors import (
 )
 from dendrux.llm._helpers import GatewayErrorKind, classify_gateway_error
 from dendrux.llm._retry_telemetry import telemetry_event_hooks
+from dendrux.llm._transport import configure_request, deferred_client_type, guard_response
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine
@@ -114,6 +116,7 @@ class Deadlines:
     stream_total_timeout: float | None
     max_stream_bytes: int = 16 * 1024 * 1024
     max_stream_tool_calls: int = 1000
+    max_response_bytes: int = 16 * 1024 * 1024
 
     @property
     def read_timeout(self) -> float:
@@ -131,6 +134,7 @@ def resolve_deadlines(
     stream_total_timeout: float | None,
     max_stream_bytes: int = 16 * 1024 * 1024,
     max_stream_tool_calls: int = 1000,
+    max_response_bytes: int = 16 * 1024 * 1024,
     stacklevel: int = 3,
 ) -> Deadlines:
     """Validate the deadline kwargs and fold in the deprecated ``timeout=``.
@@ -140,6 +144,7 @@ def resolve_deadlines(
     non-default value (the new kwarg wins), and warns.
     """
     for name, value in (
+        ("max_response_bytes", max_response_bytes),
         ("max_stream_bytes", max_stream_bytes),
         ("max_stream_tool_calls", max_stream_tool_calls),
     ):
@@ -164,6 +169,7 @@ def resolve_deadlines(
         call_timeout=call,
         stream_idle_timeout=idle,
         stream_total_timeout=total,
+        max_response_bytes=max_response_bytes,
         max_stream_bytes=max_stream_bytes,
         max_stream_tool_calls=max_stream_tool_calls,
     )
@@ -205,13 +211,23 @@ def parse_retry_after(headers: Any) -> float | None:
     return None
 
 
-async def _on_request(request: httpx.Request) -> None:
+async def _on_request(
+    request: httpx.Request, *, deadlines: Deadlines | None = None, provider: str = "unknown"
+) -> None:
+    if deadlines is not None:
+        configure_request(
+            request,
+            response_bytes=deadlines.max_response_bytes,
+            event_bytes=deadlines.max_stream_bytes,
+            provider=provider,
+        )
     state = _call_state.get()
     if state is not None:
         state.in_flight = True
 
 
 async def _on_response(response: httpx.Response) -> None:
+    await guard_response(response)
     try:
         state = _call_state.get()
         if state is not None:
@@ -222,17 +238,24 @@ async def _on_response(response: httpx.Response) -> None:
         logger.debug("provider call-state hook failed", exc_info=True)
 
 
-def make_http_client(sdk: ModuleType, deadlines: Deadlines) -> httpx.AsyncClient:
+def make_http_client(
+    sdk: ModuleType, deadlines: Deadlines, *, provider: str | None = None
+) -> httpx.AsyncClient:
     """The SDK's default async client, with Dendrux's hooks and deadlines.
 
     ``sdk.DefaultAsyncHttpxClient`` keeps the SDK's connection limits
     (1000 / 100 keep-alive) and TCP keep-alive. Redirects stay off, as before.
     """
-    client: httpx.AsyncClient = sdk.DefaultAsyncHttpxClient(
+    client_type = deferred_client_type(sdk.DefaultAsyncHttpxClient)
+    client = client_type(
         timeout=httpx.Timeout(deadlines.read_timeout, connect=CONNECT_TIMEOUT),
         follow_redirects=False,
         event_hooks={
-            "request": [_on_request],
+            "request": [
+                functools.partial(
+                    _on_request, deadlines=deadlines, provider=provider or sdk.__name__
+                )
+            ],
             "response": [_on_response, *telemetry_event_hooks()["response"]],
         },
     )
@@ -529,13 +552,13 @@ def _error_facts(exc: BaseException) -> dict[str, Any]:
     }
 
 
-def _timeout_reason_for(exc: BaseException, *, streaming: bool) -> TimeoutReason:
+def _timeout_reason_for(exc: BaseException, *, streaming: bool) -> TimeoutReason | None:
     cause: BaseException | None = exc
     while cause is not None:
         if isinstance(cause, (httpx.ConnectTimeout, httpx.PoolTimeout)):
             return "connect"
         cause = cause.__cause__
-    return "stream_idle" if streaming else "call_deadline"
+    return "stream_idle" if streaming else None
 
 
 def timeout_message(reason: TimeoutReason, limit: float | None = None) -> str:
@@ -705,18 +728,21 @@ def _deadline_error(
 
 def log_provider_error(error: ProviderError, run_id: str | None) -> None:
     """One structured log line per typed provider error (codes only, no vendor text)."""
-    logger.warning(
-        "provider.error run_id=%s provider=%s model=%s category=%s status=%s code=%s "
-        "timeout_reason=%s retryable=%s",
-        run_id,
-        error.provider,
-        error.model,
-        error.category,
-        error.status_code,
-        error.safe_provider_code,
-        error.timeout_reason,
-        error.retryable,
-        extra={"run_id": run_id, "code": error.safe_provider_code or error.category},
+    fields: dict[str, Any] = {
+        "category": error.category,
+        "retryable": error.retryable,
+    }
+    if error.provider is not None:
+        fields["provider"] = error.provider
+    if error.status_code is not None:
+        fields["status"] = error.status_code
+    if error.timeout_reason is not None:
+        fields["timeout_reason"] = error.timeout_reason
+    _codes.log_code(
+        logger,
+        _codes.REGISTRY[error.safe_provider_code or error.category],
+        run_id=run_id,
+        **fields,
     )
 
 

@@ -141,25 +141,16 @@ class TestAllowlist:
     def test_committed_allowlist_is_valid(self) -> None:
         assert ab.load_allowlist(COMMITTED_ALLOWLIST)
 
-    def test_every_spec_b_item_can_be_referenced(self) -> None:
+    def test_060_migration_rows_can_be_referenced(self) -> None:
         known = set(json.loads(COMMITTED_ALLOWLIST.read_text())["known_b_items"])
-        assert {f"B{i}" for i in range(1, 28)} <= known
+        assert {"0.6:strict-tenancy", "0.6:governance", "0.6:cache-tokens"} <= known
 
     def test_committed_allowlist_has_no_gaps(self) -> None:
         assert [e for e in ab.load_allowlist(COMMITTED_ALLOWLIST) if e.b_item is None] == []
 
-    def test_the_removals_are_documented_by_b20(self) -> None:
-        by_path = {p: e for e in ab.load_allowlist(COMMITTED_ALLOWLIST) for p in e.paths}
-        for removed in (
-            "dendrux.http",
-            "dendrux.dashboard",
-            "dendrux.cli.main.dashboard",
-            "dendrux.cli.traces.app",
-        ):
-            assert by_path[removed].b_item == "B20", removed
-        data = json.loads(COMMITTED_ALLOWLIST.read_text())
-        assert "B20" in data["known_b_items"]
-        assert "suggest B20" not in COMMITTED_ALLOWLIST.read_text()
+    def test_050_removals_are_not_carried_into_060_allowlist(self) -> None:
+        paths = {p for e in ab.load_allowlist(COMMITTED_ALLOWLIST) for p in e.paths}
+        assert not {"dendrux.http", "dendrux.dashboard", "dendrux.cli.main.dashboard"} & paths
 
 
 class TestClassify:
@@ -255,3 +246,29 @@ class TestMain:
         assert "demo.drop" in out
         assert "B7" in out
         assert "gap" in out.lower()
+
+
+def test_060_baseline_is_last_release() -> None:
+    assert ab.DEFAULT_AGAINST == "v0.5.0"
+
+
+def test_060_gate_rejects_unlisted_parameter_on_allowlisted_method() -> None:
+    entries = ab.load_allowlist(COMMITTED_ALLOWLIST)
+    unexpected = _brk("parameter-changed-default", "dendrux.agent.Agent.__init__", "tool_threads")
+    assert ab.classify([unexpected], entries).unlisted == [unexpected]
+
+
+def test_documentary_returns_never_preapprove_future_return_changes() -> None:
+    entries = ab.load_allowlist(COMMITTED_ALLOWLIST)
+    unexpected = _brk("return-changed-type", "dendrux.runtime.state.StateStore.save_trace")
+    assert ab.classify([unexpected], entries).unlisted == [unexpected]
+
+
+def test_documentary_inventory_does_not_hide_stale_active_entries() -> None:
+    entries = ab.load_allowlist(COMMITTED_ALLOWLIST)
+    assert len(ab.classify([], entries).stale) == 5
+
+
+def test_060_changes_reference_060_migration_rows() -> None:
+    entries = ab.load_allowlist(COMMITTED_ALLOWLIST)
+    assert all(e.b_item.startswith("0.6:") for e in entries)

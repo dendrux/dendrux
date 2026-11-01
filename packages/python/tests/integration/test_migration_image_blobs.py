@@ -17,18 +17,20 @@ from sqlalchemy import inspect, text
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
+from dendrux.db._storage_schema import ADDITIONS
 from dendrux.db.models import Base
 from dendrux.media import BlobEdge
 from dendrux.runtime._blob_catalog import BlobServices
-from dendrux.runtime.state import SQLAlchemyStateStore
+from dendrux.runtime.stores._factory import store_for_engine
 from dendrux.store import RunStore
 from tests.integration._migration_schema import (
+    create_pre_activation_schema,
     migration_schema,
 )
 from tests.unit.test_blob_catalog import make_png, store_png
 
 PRIOR = "b5c6d7e8f9a0"
-HEAD = "e8f9a0b1c2d3"  # R1 and sweep indexes sit above the image blobs
+HEAD = "f9a0b1c2d3e4"  # additive recovery schema sits above image blobs
 _MIGRATIONS = Path(__file__).resolve().parents[2] / "src" / "dendrux" / "db" / "migrations"
 
 
@@ -83,7 +85,7 @@ async def _snapshot(conn: Any) -> list[Any]:
                 tuple(
                     v
                     for k, v in r._mapping.items()
-                    if k not in {"claim_epoch", "status_changed_at"}
+                    if k not in {"claim_epoch", "status_changed_at", *ADDITIONS[table]}
                 )
                 for r in result.all()
             ]
@@ -125,7 +127,7 @@ async def _check_head(engine: Any, url: str) -> None:
     ]
 
     # The migrated schema serves the catalog, edges and run-scoped reads.
-    store = SQLAlchemyStateStore(engine)
+    store = store_for_engine(engine)
     services = BlobServices.for_state_store(store)
     data = make_png(1)
     part = await store_png(services, "-", data)
@@ -178,7 +180,7 @@ async def test_sqlite_revision_on_populated_db(tmp_path: Path) -> None:
     engine = create_async_engine(url, poolclass=NullPool)
     try:
         async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
+            await conn.run_sync(create_pre_activation_schema)
             await conn.execute(text("DROP TABLE dendrux_blob_refs"))
             await conn.execute(text("DROP TABLE dendrux_blobs"))
             # 0.5.0 R1 sits above the image blobs.

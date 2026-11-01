@@ -10,13 +10,22 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from dendrux import _codes
+
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
     from sqlalchemy.ext.asyncio import AsyncEngine
 
 
-from dendrux.db._engine_options import engine_options, frozen_options, normalized_url
+from dendrux.db._engine_options import (
+    create_engine_with_hint,
+    engine_options,
+    frozen_options,
+    is_mysql_family_url,
+    mysql_dependency_error,
+    normalized_url,
+)
 from dendrux.db._pool_guard import close_fully
 
 
@@ -63,12 +72,7 @@ async def _dispose_entry(entry: _Entry) -> None:
         # Public disposal replaces the pool without touching dead-loop drivers.
         # The orphaned pool's connections are released by garbage collection.
         await entry.engine.dispose(close=False)
-        logger.warning(
-            "Retired a shared engine after its event loop closed; orphaned connections "
-            "await garbage collection. Call await agent.close() or use async with "
-            "Agent(...) before closing the loop.",
-            extra={"code": "shared_engine_loop_closed"},
-        )
+        _codes.log_code(logger, _codes.SHARED_ENGINE_LOOP_CLOSED)
         return
     if not entry.ready.done():
         entry.ready.cancel()
@@ -83,7 +87,15 @@ async def _prepare(
 ) -> None:
     if previous is not None:
         await _dispose_entry(previous)
-    await initialize(engine)
+    failure = None
+    try:
+        await initialize(engine)
+    except (ImportError, RuntimeError) as error:
+        failure = mysql_dependency_error(error) if is_mysql_family_url(engine.url) else None
+        if failure is None:
+            raise
+    if failure is not None:
+        raise failure from None
 
 
 async def acquire(
@@ -113,7 +125,7 @@ async def acquire(
         ):
             raise RuntimeError("The shared database engine belongs to a different event loop")
         if entry is None:
-            engine = (factory or create_async_engine)(parsed, **effective)
+            engine = create_engine_with_hint(factory or create_async_engine, parsed, **effective)
             ready = asyncio.ensure_future(_prepare(engine, initialize or _initialize, previous))
             ready.add_done_callback(_retrieved)
             entry = _entries[key] = _Entry(engine, ready, loop)

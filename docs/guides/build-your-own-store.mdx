@@ -1,0 +1,486 @@
+---
+title: Build your own store
+description: Add a state store for another SQLAlchemy database by subclassing SQLStateStore, plug it in, create its schema, then certify it with the published pytest test kit.
+---
+
+# Build your own store
+
+Dendrux keeps every run in a **state store**. We ship stores for PostgreSQL, SQLite and MySQL/MariaDB. If your database is one SQLAlchemy supports, you can add it by subclassing one base class and filling in a small set of dialect hooks, then prove it with the test kit we publish.
+
+> **Scope.** Stores for relational databases through SQLAlchemy are supported. Stores for other kinds of database (document stores, key-value stores, files) are not part of 0.6.0. The `StateStore` protocol and the test kit are public, so you can still write one, but we ship and support SQL stores only.
+
+## What the base class does for you
+
+`SQLStateStore` owns every operation: transaction shape, validation, rollback, lock order, retries, sequence numbers, fencing, and the checks that make a run resumable. Your subclass supplies two things:
+
+1. **Feature flags** that choose between generic code paths in the base.
+2. **Hook methods** that build the SQL expressions or statements the base cannot write portably.
+
+The base also refuses, on first use and before any claim, an engine or connection in `AUTOCOMMIT` mode (a `ValueError`): every write must be one real transaction. A hook never commits, retries or validates. It only returns SQL (or, for three of them, runs one statement inside the transaction the base already opened).
+
+Everything a hook takes or returns is importable from `dendrux.store`: `SQLStateStore`, `ConflictSpec`, `InsertPlan`, `SelectSource`, `ValuesSource`, `SetFields`, `AppendArray`, `PatchLoopState`, `JsonPatch`, `JsonPath`, `JsonReadType`, `JsonValue`, `ScalarKey`, `OrderedAssignments`, `RunLockScope`, `RunParentCursor`, `DialectFacts`, `DbError`, `DbErrorKind` and `TenantScope`. Names that start with an underscore are not part of the contract; the one exception is `_after_event_insert`, described under [Declare what you promise](#declare-what-you-promise).
+
+## A complete store
+
+The skeleton below is a working store. It targets SQLite so that you can run it today and watch the kit pass; for your database, keep the shape and replace each hook with your database's equivalent. Save it as `my_store.py`.
+
+[//]: # "docs-test: skip - needs the sqlalchemy dialect of a database; run by tests/docs/test_build_your_own_store.py"
+
+```python
+import json
+from dataclasses import replace
+
+from sqlalchemy import JSON, Boolean, and_, case, false, func, literal, select, text, type_coerce
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+from dendrux.store import AppendArray, InsertPlan, SelectSource, SetFields, SQLStateStore
+
+
+class MiniStore(SQLStateStore):
+    dialect_names = ("sqlite",)  # engine.dialect.name values this store accepts
+
+    supports_update_returning = True
+    supports_insert_returning = True
+    supports_row_locks = False  # SQLite has one writer and no SELECT ... FOR UPDATE
+    ddl_transactional = True
+
+    def __init__(self, engine):
+        super().__init__(engine)
+        # Say how many processes may share the data, and turn notify off: this store
+        # sends no event hints (see "Declare what you promise").
+        self.capabilities = replace(self.capabilities, deployment="single_host", notify=False)
+
+    # -- writes -----------------------------------------------------------------------------
+
+    def insert_if_absent_stmt(self, table, source, *, conflict, returning=()):
+        stmt = sqlite_insert(table)
+        if isinstance(source, SelectSource):
+            stmt = stmt.from_select(source.columns, source.select)
+        elif source:  # an empty source means the base supplies the values when it runs this
+            stmt = stmt.values(source)
+        stmt = stmt.on_conflict_do_nothing(
+            index_elements=conflict.target, index_where=conflict.predicate
+        )
+        if returning:
+            stmt = stmt.returning(*returning)
+        return InsertPlan(stmt, "targeted_ignore")
+
+    def upsert_setting(self, table, *, key, value, updated_at):
+        return (
+            sqlite_insert(table)
+            .values(key=key, value=value, updated_at=updated_at)
+            .on_conflict_do_update(
+                index_elements=[table.c.key], set_={"value": value, "updated_at": updated_at}
+            )
+        )
+
+    # -- JSON ------------------------------------------------------------------------------
+
+    def _path(self, path):
+        result = "$"
+        for part in path:
+            if isinstance(part, int):
+                result += f"[{part}]" if part >= 0 else f"[#{part}]"
+            else:
+                result += "." + json.dumps(part, ensure_ascii=False)
+        return result
+
+    def json_get(self, col, path, as_type):
+        target = self._path(path)
+        kind = func.json_type(col, target)
+        value = func.json_extract(col, target)
+        if as_type == "json":
+            encoded = case(
+                (kind == "true", "true"), (kind == "false", "false"), else_=func.json_quote(value)
+            )
+            return type_coerce(encoded, JSON)
+        if as_type == "str":
+            return case((kind == "text", value)).collate("BINARY")
+        if as_type == "int":
+            return case((kind == "integer", value))
+        if as_type == "bool":
+            return type_coerce(case((kind == "true", True), (kind == "false", False)), Boolean)
+        raise ValueError("unsupported JSON read type")
+
+    def json_contains(self, col, path, value):
+        target = self._path(path)
+        if isinstance(value, (dict, list)):
+            # Structural containment: every member of `value` appears, with the same JSON type.
+            wanted = func.json_tree(json.dumps(value)).table_valued("fullkey", "value", "type")
+            actual = func.json_tree(func.json_extract(col, target)).table_valued(
+                "fullkey", "value", "type"
+            )
+            missing = (
+                select(literal(1))
+                .select_from(wanted)
+                .where(
+                    ~select(literal(1))
+                    .select_from(actual)
+                    .where(
+                        actual.c.fullkey == wanted.c.fullkey,
+                        actual.c.type == wanted.c.type,
+                        actual.c.value.is_not_distinct_from(wanted.c.value),
+                    )
+                    .exists()
+                )
+                .exists()
+            )
+            return func.coalesce(and_(func.json_type(col, target).is_not(None), ~missing), false())
+        kind = (
+            "null" if value is None
+            else "true" if value is True
+            else "false" if value is False
+            else "text" if isinstance(value, str)
+            else "integer" if isinstance(value, int)
+            else "real"
+        )
+        return func.coalesce(
+            and_(
+                func.json_type(col, target) == kind,
+                func.json_extract(col, target).is_not_distinct_from(value),
+            ),
+            false(),
+        )
+
+    def json_is_null(self, col, path):
+        return func.coalesce(func.json_type(col, self._path(path)) == "null", false())
+
+    def json_patch_expr(self, col, patch):
+        base = func.coalesce(func.nullif(col, "null"), "{}")
+        if isinstance(patch, SetFields):
+            args = [
+                item
+                for key, value in patch.fields.items()
+                for item in (self._path((key,)), func.json(json.dumps(value)))
+            ]
+            return func.json_set(base, *args) if args else base
+        if isinstance(patch, AppendArray):
+            return func.json_insert(
+                base, self._path(patch.path) + "[#]", func.json(json.dumps(patch.value))
+            )
+        return None  # PatchLoopState: the base reads, modifies and writes under a lock
+
+    # -- locks ------------------------------------------------------------------------------
+
+    async def serialize_in_tx(self, session, *, owner):
+        # One writer at a time already serialises note counting here. A database with row
+        # locks can leave this to the default, which locks the run row.
+        return None
+
+    async def reserve_parent_writer(self, session, run_id):
+        # Without row locks, take the write lock on the run's row before checking it.
+        await session.execute(
+            text("UPDATE agent_runs SET cancel_requested = cancel_requested WHERE id = :run"),
+            {"run": run_id},
+        )
+```
+
+Every hook not shown keeps the base's default, which works for most databases: `lock_clause`, `id_in`, `child_page_query`, `classify_db_error`, `connection_checks`, `blob_now`, `metadata_filter_predicate`, `pause_projection`, `json_conversion_error`, `event_sequence_expr`, `inserted_event_sequence` and `idempotency_scope_predicate`. The [hook reference](#hook-reference) says what each does and when to override it.
+
+## Plug it in
+
+Build the store from an engine you create once and own, then pass it wherever a store goes. There is no registry and no other call:
+
+[//]: # "docs-test: skip - fragment: relies on `engine`, defined by setup shown elsewhere"
+
+```python
+from dendrux import Agent
+from dendrux.store import RunStore
+
+store = MiniStore(engine)
+agent = Agent(provider=..., prompt=..., state_store=store)
+reads = RunStore(store)  # read primitives: get_pending, follow, get_event_view, and the rest
+```
+
+`Agent(state_store=...)` and `RunStore(store)` accept any store. `store_for_engine(engine)`, `RunStore.from_engine(engine)` and `Agent(database_url=...)` pick one of the three built-in classes from the engine's dialect and know nothing about yours, so use the two lines above and keep the store object around. The application owns the engine and disposes it.
+
+## Create the schema
+
+Create the tables once, at deploy time, from the models. A fresh schema made this way starts at storage format 2 (the full 0.6 behaviour), so no activation step is needed:
+
+[//]: # "docs-test: skip - fragment: relies on `engine`, defined by setup shown elsewhere"
+
+```python
+from dendrux.db.models import Base
+
+async with engine.begin() as conn:
+    await conn.run_sync(Base.metadata.create_all)
+```
+
+`dendrux db migrate`, `check`, `status` and `activate` run Alembic migrations that Dendrux writes and tests for PostgreSQL, SQLite and MySQL/MariaDB only. For your own dialect you own the schema: create it with the snippet above, and when a later Dendrux release changes the models, apply the matching change to your database yourself. The kit builds its test schema the same way (see [Provide the fixtures](#provide-the-fixtures)); migrations are not part of certification.
+
+## Feature flags
+
+| Flag | Say `True` when | Effect in the base |
+|---|---|---|
+| `supports_update_returning` | The database has `UPDATE ... RETURNING` | Conditional updates use one statement. Otherwise the base locks the row, updates it by primary key, and reads the result back |
+| `supports_insert_returning` | The database has `INSERT ... RETURNING` | An event insert returns its sequence number from the same statement |
+| `supports_row_locks` | The database has `SELECT ... FOR UPDATE` row locks | The base locks rows in a fixed order (run, child runs by id, blobs by id, settings). A database with a single writer, such as SQLite, says `False` |
+| `ddl_transactional` | Schema changes roll back with a transaction | Maintenance steps need not be restartable |
+
+The flags are independent. Set each one from what your database really does, and let the kit tell you if you were wrong. `connection_checks` may override a flag at first use (the MySQL store resolves `supports_insert_returning` that way, because MariaDB has it and MySQL does not).
+
+## Hook reference
+
+Every hook below is a method of `SQLStateStore` that you may override. A hook never commits, retries or validates: the base owns the transaction. Types are the names from `dendrux.store`; `Table`, `ColumnElement`, `Select`, `Executable` and `Result` come from SQLAlchemy.
+
+### Statements and expressions
+
+| Hook and signature | What it must do |
+|---|---|
+| `insert_if_absent_stmt(self, table: Table, source: ValuesSource or SelectSource, *, conflict: ConflictSpec, returning: Sequence[ColumnElement] = ()) -> InsertPlan` | Build the insert used for idempotent create, blobs, blob references and events. `source` is a mapping of values, an `INSERT ... SELECT` (`SelectSource`), or empty (the base then runs the statement with parameters of its own, so do not call `.values()` for an empty source). Return `InsertPlan(statement, "targeted_ignore")` when the database absorbs only the conflict named by `conflict.target` and `conflict.predicate` itself, or `"raise_unique"` when it raises a unique violation for the base to classify. Add `returning` only when `supports_insert_returning` |
+| `upsert_setting(self, table: Table, *, key: str, value: str, updated_at: datetime) -> Executable` | Insert or overwrite one settings row |
+| `json_get(self, col: ColumnElement, path: JsonPath, as_type: JsonReadType) -> ColumnElement` | Read one value from a JSON column. `path` holds literal object keys (`str`) and array indexes (`int`, negative counts from the end). `as_type` is `"json"`, `"str"`, `"int"` or `"bool"`; a value of another JSON type reads as SQL NULL, and strings compare with a binary collation |
+| `json_contains(self, col: ColumnElement, path: JsonPath, value: JsonValue) -> ColumnElement[bool]` | True when the path holds `value`: a scalar by exact value and JSON type (`1` is not `true`, `"1"` is not `1`), an object or array by containment. A missing path is false |
+| `json_is_null(self, col: ColumnElement, path: JsonPath) -> ColumnElement[bool]` | True only for an explicit JSON `null`; a missing path and SQL NULL are false |
+| `json_patch_expr(self, col: ColumnElement, patch: JsonPatch) -> ColumnElement or None` | An expression that applies `SetFields` (set literal object members) or `AppendArray` (append one value at a path) inside the database. Return `None` for `PatchLoopState`, and for any patch you do not support: the base then reads, modifies and writes under a lock (on a database without row locks it reserves the writer first), including when it finalises a run. The expression form is optional; it saves the extra read and the lock |
+| `pause_projection(self, col: ColumnElement) -> list[ColumnElement]` | The pause-summary columns to select from the pause document: the values of its summary keys, then its last step. The default builds them with `json_get`; override to read them natively |
+| `metadata_filter_predicate(self, col: ColumnElement, metadata_filter: dict[str, Any]) -> ColumnElement[bool]` | Filter runs by metadata. The default ANDs `json_contains` for each key; override for a native containment operator |
+| `idempotency_scope_predicate(self, tenant_id: str or None) -> ColumnElement[bool]` | Compare a run's tenant with the tenant of an idempotency lookup. The default treats an absent tenant and the empty string as the same scope. It must compare exactly (see the rules below) |
+| `event_sequence_expr(self, next_index: ColumnElement) -> ColumnElement` | Wrap the expression that allocates an event's sequence number inside the insert. The default returns it unchanged; MySQL wraps it in `LAST_INSERT_ID` so the value is readable without `RETURNING` |
+| `inserted_event_sequence(self, result: Result) -> int or None` | Read the allocated sequence number from the insert's result. Return `None` (the default) and the base reads it back by key |
+| `lock_clause(self, stmt: Select, intent: Literal["share", "update", "update_no_key"]) -> Select` | Add the row lock for an intent. The default adds `FOR UPDATE` or `FOR SHARE` when `supports_row_locks` is true and returns the statement unchanged otherwise |
+| `id_in(self, col: ColumnElement, ids: Sequence[ScalarKey]) -> ColumnElement[bool]` | Membership in a bounded list of ids. The default is `col.in_(ids)` |
+| `child_page_query(self, *, runs: Table, parents: Sequence[RunParentCursor], tenant_scope: TenantScope, page_size: int) -> Select` | One page of child runs for cancel cascades. The base has a portable version |
+| `blob_now(self) -> datetime or ColumnElement` | The timestamp written on image-blob rows. The default is the Python UTC clock; PostgreSQL returns the database's `now()` so every process agrees |
+
+### Hooks that run a statement
+
+These are `async` and receive the session of the transaction the base opened. They must not commit.
+
+| Hook and signature | What it must do |
+|---|---|
+| `serialize_in_tx(self, session: AsyncSession, *, owner: RunLockScope) -> None` | Mutual exclusion for one run's note counting, released at commit or rollback. It runs before the count. The default locks the run row through `lock_clause`; a single-writer database may do nothing |
+| `reserve_parent_writer(self, session: AsyncSession, run_id: str) -> None` | On a database without row locks (`supports_row_locks = False`), take the write lock on a run's row before checking it. The default does nothing |
+| `connection_checks(self, conn: AsyncConnection) -> DialectFacts` | Run once per store, on first use: check the server (version, isolation level, limits) and raise `ValueError` for one you do not support. Return `DialectFacts(server_family, server_version, features, max_allowed_packet)`, where `features` may override the four feature flags |
+
+### Reading errors
+
+| Hook and signature | What it must do |
+|---|---|
+| `classify_db_error(self, exc: BaseException) -> DbError` | Turn a driver error into `DbError(kind, constraint, code)`. `kind` is `unique_violation`, `deadlock_or_serialization`, `lock_timeout`, `connection_lost`, `statement_too_large` or `other`; `constraint` is the violated constraint name when the driver gives it; `code` is a stable code. Never keep driver text. An unknown constraint must not be taken for the one the base is looking for |
+| `json_conversion_error(self, exc: BaseException) -> bool` | True when `exc` is the database refusing to convert stored JSON text while reading a pause summary (PostgreSQL answers `22P02` or `22P05`). The default is `False` |
+
+### Optional
+
+| Hook and signature | What it must do |
+|---|---|
+| `statement_capacity(self) -> int or None` (`async`, define it on the class) | The most bytes one SQL statement may carry, or `None` for no limit. Before an Agent first uses the store it compares the largest statement its `Limits` can produce with this number and refuses, naming both values. It is an early warning for the Agent's `Limits`, not a guarantee. A store without it is not checked. `MySQLStateStore` reports `max_allowed_packet` |
+
+Two rules hold for every hook:
+
+- **Tenant and identifier equality must be exact.** `"t"` and `"t "` are different tenants, and so are `"T"` and `"t"`. If your database pads or folds case when it compares text, choose a binary, no-pad collation for every identifier, tenant, key and idempotency column. The kit checks this.
+- **Fail closed.** If a hook cannot decide, it refuses. A hook the base requires and you did not implement raises `NotImplementedError` naming the hook.
+
+## Declare what you promise
+
+A store states what it supports in `capabilities`:
+
+[//]: # "docs-test: skip - fragment: shows a constructor to complete with your dialect's hooks"
+
+```python
+from dataclasses import replace
+
+class MyStore(SQLStateStore):
+    def __init__(self, engine):
+        super().__init__(engine)
+        self.capabilities = replace(self.capabilities, deployment="multi_server", notify=False)
+```
+
+| Field | Meaning |
+|---|---|
+| `fenced_writes` | Every writer checks the run's claim epoch, so an old owner cannot change a run it lost |
+| `retry_ids` | A write carries a caller-owned identity, so repeating it after a lost acknowledgement stores it once |
+| `checkpointing` | Executable state and conversation reconstruction (format-2 runs) |
+| `atomic_completion` | A tool's intent, its result, and a run's end publish all-or-nothing |
+| `recovery` | Leases, marking, reclaim, paged cancel, and `get_replayed_tool_calls` (the recovery declaration is refused at Agent construction without it) |
+| `notify` | After an event insert the store sends a wake hint, from `async def _after_event_insert(self, session, run_id) -> None` |
+| `deployment` | `single_process` (one process), `single_host` (several processes sharing one file) or `multi_server` (any number of processes and hosts) |
+
+The base class declares everything it implements, **including `notify=True`**. Its `_after_event_insert` does nothing, so a subclass that keeps `notify=True` without writing that hook has promised hints it never sends. **Set `notify=False` unless you implement the hook.** The kit refuses a store that declares `notify` and still inherits the do-nothing hook; it cannot test that hints are delivered, so for a store that does implement `_after_event_insert` notification delivery is untested.
+
+You set `deployment`. A store without a `deployment` cannot be certified.
+
+## Provide the fixtures
+
+The kit runs against fixtures you write in your own `conftest.py`. They return plain callables, so they work with any async test setup.
+
+| Fixture | Returns | Required when |
+|---|---|---|
+| `dendrux_store_factory` | A function that makes a new store over **empty** data | Always. Without it the kit stops after one failure with a setup message |
+| `dendrux_store_reopen` | A function that takes a store and returns a **new instance over the same data** (a restarted process) | `recovery` is declared |
+| `dendrux_store_second_instance` | A function that takes a store and returns a **second, independent instance** (its own connections) over the same data, live next to the first | `deployment` is `single_host` or `multi_server` |
+| `dendrux_clock` | An object with `advance(delta)`: afterwards everything written earlier reads as `delta` older to sweeps and leases (optionally `now()`, see below) | `recovery` is declared. Missing then, the recovery contracts fail and the store is NOT CERTIFIED. When `recovery` is not declared the fixture is optional, and the few time-based contracts that remain (sweeps of stale runs) skip and are reported as unverified |
+| `dendrux_fault_injector` | An object that fails the next write transaction at a named point | Optional. Without it the report says "crash recovery: not certified" |
+
+Here is the `conftest.py` that goes with the store above. One small object keeps every engine the fixtures create, so they are all disposed at the end, and a second instance reuses the engine's URL object (a URL turned into a string hides the password). `Base.metadata.create_all` is all the schema setup the kit needs:
+
+[//]: # "docs-test: skip - needs the my_store module above; run by tests/docs/test_build_your_own_store.py"
+
+```python
+import pytest
+import pytest_asyncio
+from sqlalchemy.ext.asyncio import create_async_engine
+
+from dendrux.db.models import Base
+from dendrux.testing.store_kit.sql import SqlClock, SqlFaultInjector
+
+from my_store import MiniStore
+
+
+class World:
+    def __init__(self, directory):
+        self.directory = directory
+        self.engines = []
+
+    def engine(self, url):
+        engine = create_async_engine(url, connect_args={"check_same_thread": False})
+        self.engines.append(engine)
+        return engine
+
+    async def fresh(self):
+        url = f"sqlite+aiosqlite:///{self.directory / f'kit{len(self.engines)}.db'}"
+        engine = self.engine(url)
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)  # tables, and a schema at format 2
+        return MiniStore(engine)
+
+    async def another(self, store):
+        # store._engine.url is a URL object: it keeps the password. Do not use str(url).
+        return MiniStore(self.engine(store._engine.url))
+
+
+@pytest_asyncio.fixture
+async def world(tmp_path):
+    world = World(tmp_path)
+    yield world
+    for engine in world.engines:
+        await engine.dispose()
+
+
+@pytest.fixture
+def dendrux_store_factory(world):
+    return world.fresh
+
+
+@pytest.fixture
+def dendrux_store_reopen(world):
+    return world.another  # a restarted process: a new instance over the same data
+
+
+@pytest.fixture
+def dendrux_store_second_instance(world):
+    return world.another  # a second live instance has its own engine over the same data
+
+
+@pytest.fixture
+def dendrux_clock(world):
+    return SqlClock(lambda: world.engines[0])  # ages every stored run clock
+
+
+@pytest.fixture
+def dendrux_fault_injector():
+    injector = SqlFaultInjector()
+    yield injector
+    injector.close()
+```
+
+`SqlClock` and `SqlFaultInjector` work on any SQLAlchemy engine, so a `SQLStateStore` subclass gets both without writing them. If your clock instead moves the store's time source forward (so stored timestamps stay as they are), give it a `now()` method returning the store's current time: the kit computes lease cutoffs from it. A clock that ages stored timestamps needs no `now()`.
+
+A fault injector has `arm(store, point, kind=, after=, sticky=)`, `fired(store)` and `disarm(store)`. `fired` must count the cuts that really happened: the kit asserts that every cut it asked for fired, so an injector that does nothing fails certification. To inject lost connections the kit asks the injector which forms of disconnect exist for your store, through an optional `disconnect_forms(store)` method (the default is `("invalidated",)`). An injector that returns an empty list leaves the claim contracts untested, and the store is NOT CERTIFIED for what they guard.
+
+The tests create their schema from the models, so your factory must too. Make sure the schema starts at format 2 (a fresh `create_all` does). A factory whose runs come out at format 1 while the store declares the four format-2 capabilities cannot be certified: every format-2 contract would skip, and the kit says so rather than passing. Schema migrations are tested separately.
+
+## Run the kit
+
+```bash
+pip install "dendrux[testkit]"
+pytest -p dendrux.testing.store_kit
+```
+
+`-p dendrux.testing.store_kit` loads the plugin **and** collects the contracts; you do not copy any test files. Installing `dendrux` registers a tiny bootstrap module with pytest. It does not import `dendrux` or load the kit until you switch it on, so other pytest sessions in the same environment are unaffected and pay no import cost. Switching it on needs `pytest-asyncio` (`pip install "dendrux[testkit]"`); without it pytest stops with a message naming the extra. Two other ways to switch it on: `--dendrux-store-kit` on the command line, or `dendrux_store_kit = true` under `[tool.pytest.ini_options]`. Merely having the plugin installed or listed in `pytest_plugins` collects nothing.
+
+If you use `pytest-asyncio` in strict mode, add `asyncio_default_fixture_loop_scope = "function"` to your pytest settings. The kit marks its own async tests, so `asyncio_mode` can stay as it is.
+
+To certify several databases, run pytest once per database (one CI job each) and let your fixtures read the database URL from the environment.
+
+**The exit code is the verdict.** A session that prints `NOT CERTIFIED`, including an incomplete run, exits non-zero, so CI can gate on it. A session that prints `CERTIFIED with caveats` or `CERTIFIED` exits zero (unless a test failed, which exits non-zero as usual). If no `dendrux_store_factory` fixture exists the kit fails one test with a message that says what to define, then stops, instead of failing every contract the same way.
+
+## How certification works
+
+The kit reads the capabilities and the `deployment` your store declares:
+
+| You declared | The kit does |
+|---|---|
+| A capability, with its fixtures | Runs that capability's contracts. Any failure means the store is broken for what it declared |
+| A capability, **without** a fixture it needs | **Fails**. A declared promise cannot be checked without it. It does not skip |
+| A capability whose contracts the store itself made skip | **NOT CERTIFIED** for that capability, with the reason. See below |
+| A capability whose contracts all skipped for any reason | **NOT CERTIFIED**. A promise nothing exercised is not certified |
+| No capability | Skips that capability's contracts |
+| No `deployment` | Refuses to certify |
+| No `dendrux_fault_injector` | Runs everything else; the report says "crash recovery: not certified" and the verdict carries the caveat |
+| Only part of the contracts ran (`-k`, one file) | **NOT CERTIFIED (incomplete run)**. Certification needs a complete run, and the fixtures a declaration obliges are checked even when the contracts that use them were not selected |
+| A check the protocol cannot observe | Reported as `unverified`, never as a pass, and the verdict becomes `CERTIFIED with caveats`. Today: `save_usage` rows (the protocol has no read of them), and the time-based contracts when there is no `dendrux_clock` |
+| `notify` | Checks only that you wrote the hook (see above). Notification delivery is not tested |
+
+**Skips the store causes.** Some contracts skip because of something the store controls. The kit lists them in the summary, per capability, under "skipped by the store", and any declared capability they guard is NOT CERTIFIED:
+
+- The store declares `fenced_writes`, `retry_ids`, `checkpointing` and `atomic_completion` but creates storage-format-1 runs, so every format-2 contract skips. Fix the factory's schema (use `create_all`) or declare less.
+- The fault injector offers no disconnect form (`disconnect_forms` returns an empty list), so lost commit acknowledgements cannot be injected into claims.
+- The store has no `release_run_claim`, so releasing a claim after a lost acknowledgement is not tested.
+
+Skips that are legitimate stay ordinary: a capability you did not declare, a disconnect form that does not exist for your dialect (as long as another form ran), and a second instance on a `single_process` store.
+
+The basic contracts run on whatever storage format your store creates: format 1 when the four format-2 flags (`fenced_writes`, `retry_ids`, `checkpointing`, `atomic_completion`) are not all declared, format 2 otherwise.
+
+If two different store classes share a class name (two packages each with a `PostgresStore`), the summary keeps them apart and prints the module path.
+
+At the end of the session the kit prints a summary per store. This is what a store that passes everything the protocol can observe looks like (the unverified `save_usage` line is expected, and it makes the verdict a caveated one):
+
+```text
+=================== dendrux store kit: certification summary ===================
+MiniStore (deployment=single_host, capabilities=fenced_writes,retry_ids,checkpointing,atomic_completion,recovery)
+  declaration        3 passed, 1 skipped
+  basic              34 passed
+  agent_flows        9 passed
+  fenced_writes      22 passed
+  retry_ids          13 passed, 1 skipped
+  checkpointing      12 passed
+  atomic_completion  11 passed
+  recovery           13 passed
+  concurrency        16 passed
+  crash_recovery     54 passed, 16 skipped
+  unverified: save_usage retry identity: usage rows cannot be read through the protocol, so a duplicate row is not detected
+  CERTIFIED with caveats: declaration, basic, agent_flows, fenced_writes, retry_ids, checkpointing, atomic_completion, recovery, concurrency, crash_recovery (caveats: unverified: save_usage retry identity: usage rows cannot be read through the protocol, so a duplicate row is not detected)
+```
+
+The numbers change as contracts are added; the shape does not. The one skipped `declaration` contract is the `notify` check (not declared), and the skipped `crash_recovery` contracts are the disconnect forms SQLite does not have.
+
+## What each group checks
+
+| Group | Checks |
+|---|---|
+| declaration | `deployment` is declared and valid; each declared capability has the methods it needs and its fixtures; a declared `notify` is backed by a real `_after_event_insert` |
+| basic | Create, read, finalize, cancel, pause, claim, notes and the note cap, tenant scoping, listing and filters, delegation reads, sweeps, exact round trips of Unicode and large values. Protocol calls only: the kit never reads your tables |
+| agent_flows | A real `Agent` against your store: a run, a server tool, a client-tool pause and resume, approval, cancel, stream, and resume after a restart |
+| fenced_writes | Every writer refuses a stale claim epoch and leaves no trace |
+| retry_ids | The same identity twice stores once; different content or another identity at the same position is a `write_conflict` |
+| checkpointing | Seeds, rewrites, conversation pages, size bounds, trace links, a submission consumed exactly once |
+| atomic_completion | A tool's intent, result, observation and event publish together; a run's end and its evidence publish together; a stale or lost write publishes nothing |
+| recovery | Lease marking, reclaim under a new epoch, the old owner fenced, partial sweeps by cursor, replayed tool calls listed (`get_replayed_tool_calls`: in order, bounded with a truncation flag, scoped to the tenant), everything surviving a reopen |
+| concurrency | Two live instances, many callers: exactly one winner for claims, finalizes and idempotent creates; gapless event sequences; the note cap never exceeded; blob races |
+| crash_recovery | With the fault injector: a failed or cancelled write at each point is repeated safely by its identity; atomic operations are all-or-nothing; claims after a lost commit acknowledgement raise `StoreOutcomeUnknown`; an interrupted sweep is finished by the next one |
+
+## When a contract fails
+
+- **A fenced writer accepted a stale epoch.** Your update does not include the epoch in its `WHERE` clause, or it is written outside the base's fenced helpers.
+- **Retry stored twice.** The identity is not part of the unique constraint, or `insert_if_absent_stmt` ignores clashes on the wrong key.
+- **Two winners for a claim.** The conditional update is not atomic on your database, or `supports_update_returning` is `True` when it should be `False`.
+- **Gaps or duplicates in event sequences.** `insert_if_absent_stmt` or `serialize_in_tx` does not serialize writers of one run.
+- **The note cap is exceeded.** `serialize_in_tx` does not hold across the count and the insert.
+- **Tenants "t" and "t " collide.** Your column collation pads or folds case.
+- **An atomic operation left half its writes.** A write happened outside the single transaction the base opens. Do not commit inside a hook.
+
+## Ask for help
+
+Open an issue with the kit's summary and the failing contract names. The summary contains no run data or driver text.

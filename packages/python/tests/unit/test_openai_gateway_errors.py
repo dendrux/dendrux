@@ -373,7 +373,8 @@ class TestClassifier:
 
         assert "ContextLengthExceededError" in errors.__all__
         err = ContextLengthExceededError("x", status_code=400, provider_code="c", model="m")
-        assert (err.status_code, err.provider_code, err.model) == (400, "c", "m")
+        assert (err.status_code, err.provider_code, err.model) == (400, "provider_unknown", "m")
+        assert err.provider_code_raw == "c"
 
 
 # ---------------------------------------------------------------------------

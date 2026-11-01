@@ -9,6 +9,7 @@ the persistence (B), provider (C) and loop (D1) tracks.
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 from typing import Any
 
@@ -19,7 +20,7 @@ from dendrux.chat import ChatMessage
 from dendrux.errors import UnsupportedModalityError
 from dendrux.llm.mock import MockLLM
 from dendrux.media import Image, ImageDropPolicy, ImagePolicy, ToolOutput
-from dendrux.runtime.state import SQLAlchemyStateStore
+from dendrux.runtime.stores._factory import store_for_engine
 from dendrux.tool import tool
 from dendrux.types import LLMResponse, Role, RunStatus, ToolCall, ToolResult
 
@@ -46,6 +47,8 @@ def _mock(responses: list[LLMResponse], support: str = "yes") -> MockLLM:
 
 
 def _agent(store: Any, provider: MockLLM, **kw: Any) -> Agent:
+    kw.setdefault("strict_tenancy", False)
+    kw.setdefault("on_governance_change", "warn")
     return Agent(
         name="img_agent",
         prompt="p",
@@ -61,7 +64,7 @@ def _sent(provider: MockLLM, call: int = 0) -> list[Any]:
 
 
 async def test_replay_into_text_only_model_degrades_history(engine: Any) -> None:
-    store = SQLAlchemyStateStore(engine)
+    store = store_for_engine(engine)
     source = await _agent(store, _mock([LLMResponse(text="one")])).run(
         ["see", Image.from_bytes(PNG), Image.from_bytes(PNG2)]
     )
@@ -78,7 +81,7 @@ async def test_replay_into_text_only_model_degrades_history(engine: Any) -> None
 
 
 async def test_retry_never_resends_rejected_tool_image(engine: Any) -> None:
-    store = SQLAlchemyStateStore(engine)
+    store = store_for_engine(engine)
     provider = _mock(
         [
             LLMResponse(text=None, tool_calls=[ToolCall(name="screenshot", params={"n": 1})]),
@@ -108,7 +111,7 @@ def _view(msgs: list[Any]) -> list[tuple[str, str, list[str]]]:
 
 
 async def _drop_source_then_follow(engine: Any, history: list[ChatMessage]) -> tuple[Any, Any]:
-    store = SQLAlchemyStateStore(engine)
+    store = store_for_engine(engine)
     policy = ImagePolicy(drop=ImageDropPolicy(keep_recent=2, interval=2))
     calls = [
         LLMResponse(text=None, tool_calls=[ToolCall(name="screenshot", params={"n": i})])
@@ -139,7 +142,7 @@ async def test_single_source_full_replay_keeps_drop_view(engine: Any) -> None:
 
 
 async def _approval_scenario(engine: Any, approval: bool) -> tuple[list[Any], dict[str, Any]]:
-    store = SQLAlchemyStateStore(engine)
+    store = store_for_engine(engine)
     policy = ImagePolicy(drop=ImageDropPolicy(keep_recent=1, interval=1))
     provider = _mock(
         [
@@ -166,7 +169,7 @@ async def _approval_scenario(engine: Any, approval: bool) -> tuple[list[Any], di
     call_id = client_pause["pending_tool_calls"][0]["id"]
     # Resume from a fresh store object and Agent ("new process").
     fresh_provider = _mock([LLMResponse(text="done")])
-    fresh = _agent(SQLAlchemyStateStore(engine), fresh_provider, images=policy)
+    fresh = _agent(store_for_engine(engine), fresh_provider, images=policy)
     result = await fresh.submit_tool_results(
         paused.run_id,
         [
@@ -179,7 +182,10 @@ async def _approval_scenario(engine: Any, approval: bool) -> tuple[list[Any], di
         ],
     )
     assert result.status == RunStatus.SUCCESS
-    return _sent(fresh_provider), client_pause["image_view"]
+    ref = client_pause["image_view_ref"]
+    view = json.loads((await store.get_trace(paused.run_id, ref)).content)
+    view.pop("kind")
+    return _sent(fresh_provider), view
 
 
 async def test_approval_client_pause_resume_carries_view(engine: Any) -> None:
@@ -195,7 +201,7 @@ async def test_explicit_skill_retry_after_purge_shows_placeholder(engine: Any) -
     from dendrux import Skill
 
     skill = Skill(name="demo", description="Demo", body="skill body")
-    store = SQLAlchemyStateStore(engine)
+    store = store_for_engine(engine)
     source = await _agent(store, _mock([LLMResponse(text="one")]), skills=[skill]).run(
         ["see", Image.from_bytes(PNG)], activate_skills=["demo"], tenant_id="acme"
     )

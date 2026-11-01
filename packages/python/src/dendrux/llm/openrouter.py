@@ -328,6 +328,7 @@ class OpenRouterProvider(OpenAIProvider):
         effort: str | None = None,
         anthropic_cache: bool = True,
         extra_body: dict[str, Any] | None = None,
+        max_response_bytes: int = 16 * 1024 * 1024,
         **kwargs: Any,
     ) -> None:
         """Create an OpenRouter provider.
@@ -373,6 +374,7 @@ class OpenRouterProvider(OpenAIProvider):
                 (``plugins=[{"id": "context-compression", "enabled": False}]``)
                 so OpenRouter never drops mid-prompt messages; a ``plugins``
                 entry of your own replaces that default entirely.
+            max_response_bytes: Maximum decoded non-streaming body bytes (default 16 MiB).
             **kwargs: Passed through to :class:`OpenAIProvider` (max_tokens,
                 temperature, timeout, max_retries, ...).
         """
@@ -409,6 +411,7 @@ class OpenRouterProvider(OpenAIProvider):
             base_url=base_url,
             default_headers=headers or None,
             extra_body=merged_extra_body,
+            max_response_bytes=max_response_bytes,
             **kwargs,
         )
         self._require_native_tools = require_native_tools

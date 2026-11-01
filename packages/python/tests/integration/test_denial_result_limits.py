@@ -30,6 +30,7 @@ async def test_denial_limit_leaves_pause_unclaimed(
 ):
     calls = [ToolCall(name="gated", params={}) for _ in range(count)]
     agent = Agent(
+        strict_tenancy=False,
         prompt="p",
         tools=[gated],
         require_approval=["gated"],
@@ -75,7 +76,7 @@ async def test_denial_batch_bound_matches_client_submission(store):
     with pytest.raises(InvalidToolResultError):
         await prepare_client_results(
             agent,
-            "r",
+            "00000000000000000000000102",
             PauseState(
                 agent_name="a",
                 history=[],
@@ -93,6 +94,7 @@ async def test_parallel_denials_claim_once(store):
     from dendrux.errors import RunAlreadyTerminalError, RunNotPausedError
 
     agent = Agent(
+        strict_tenancy=False,
         prompt="p",
         tools=[gated],
         require_approval=["gated"],

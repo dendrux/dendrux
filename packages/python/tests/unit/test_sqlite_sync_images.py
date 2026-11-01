@@ -18,7 +18,7 @@ from sqlalchemy.pool import NullPool
 from dendrux.db._sqlite_sync import create_sqlite_schema_sync, sync_sqlite_schema
 from dendrux.db.models import Base
 from dendrux.runtime._blob_catalog import BlobServices
-from dendrux.runtime.state import SQLAlchemyStateStore
+from dendrux.runtime.stores._factory import store_for_engine
 from dendrux.store import RunStore
 from tests.unit.test_blob_catalog import make_png, store_png
 
@@ -87,7 +87,7 @@ async def test_v030_file_gains_blob_tables_and_nothing_else(tmp_path: Path) -> N
             assert await conn.run_sync(sync_sqlite_schema) == []
 
         # The upgraded file serves the blob catalog.
-        store = SQLAlchemyStateStore(engine)
+        store = store_for_engine(engine)
         services = BlobServices.for_state_store(store)
         data = make_png(1)
         part = await store_png(services, "-", data)

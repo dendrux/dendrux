@@ -86,23 +86,24 @@ status_changed_at:    2026-10-27 08:29:28.624966
 
 A few columns deserve a closer look:
 
-- **`status`** is the *only* mutable field that changes during a run's life. Everything else is either set once at creation (`agent_name`, `input_data`, `model`) or filled in at terminal time (`output_data`, `error`).
-- **`pause_data`** is a JSON blob holding everything needed to resume: pending tool calls, conversation history, step list, current iteration. It's `null` here because the run completed; it's populated when the run is in a `waiting_*` status. Cleared on terminal finalize.
+- **`status`** records the lifecycle state. Progress, control flags, usage totals and format-2 checkpoints can also change during execution.
+- **`pause_data`** holds continuation metadata. Format 1 includes history and steps. Format 2 uses `schema_version=2` and rebuilds history from traces with execution state in `loop_state`. Pause data is cleared on terminal finalize.
+- **`storage_format`** is pinned at creation. Format-1 runs stay format 1 after activation. Format 2 adds `loop_state`, lease-expiry and reclaim fields, plus a validated `trace_link`. See [Upgrading to 0.6.0](/docs/upgrading-to-0.6.0).
 - **`pii_mapping`** is also JSON, but unlike `pause_data` it is **not** cleared on finalize. It's part of the audit trail. See [PII redaction](/docs/architecture/pii-redaction).
 - **`cancel_requested`** is the cooperative cancellation flag. The runner reads it at safe checkpoints. See [Cancellation](/docs/architecture/cancellation).
 - **`pause_requested`** is its twin for `request_pause` (added in 0.3.0, default false). It is cleared when the run pauses, is claimed for resume, or finishes. See [Pause and resume](/docs/architecture/pause-resume#requesting-a-pause).
-- **`claim_epoch`** (new in 0.5.0, `INTEGER NOT NULL`, default 0) is a fencing counter. Each time a worker claims a run, the counter goes up, and status changes (finish, pause, release) are conditional on the worker's own value. A worker whose claim was taken over, for example after a sweep, stops instead of overwriting the new owner. It protects only runs claimed by 0.5 workers.
-- **`status_changed_at`** (new in 0.5.0, `NOT NULL`, defaults to now) is the time of the last status transition. `sweep()` ages waiting runs by it, so a metadata edit does not keep an abandoned pause alive; unlike `updated_at` it changes only when `status` does.
+- **`claim_epoch`** is a fencing counter. Claims and lease-expiry marks advance it. On a fenced store, claimed writes carry the worker's epoch and refuse stale owners.
+- **`status_changed_at`** is the time of the last status transition. Waiting sweeps require both this and `updated_at` to be old, so a recent metadata edit delays abandonment by one window.
 - **`status`** also takes the value `paused` for a requested or budget pause. It is a plain string column, so no enum migration was needed.
 - **`last_progress_at`** is the liveness timestamp the stale sweep reads; see [below](#long-running-tools-and-the-stale-sweep).
-- **`meta`** is opaque JSON for *your* application. Dendrux stores it and ships it back; it never reads it. Use it to link a run to your user IDs, request IDs, ticket numbers, anything.
+- **`meta`** holds application JSON and reserved `dendrux.` bookkeeping. Application writes cannot use the reserved prefix. Use other keys for request or ticket ids.
 - **`parent_run_id`** + **`delegation_level`** form the sub-agent tree. When an agent spawns a sub-agent, the child gets its own `agent_runs` row with `parent_run_id` pointing back.
 
 Four indexes exist on this table: `parent_run_id` (for the delegation tree), `status` (for "find all running runs"), `created_at` (for "most recent first") and, since 0.5.0, `(tenant_id, created_at DESC)` for tenant-scoped listings. The `idempotency_key` uniqueness is per tenant: a partial unique index on `(COALESCE(tenant_id, ''), idempotency_key)` where the key is set. See [Multi-tenancy](/docs/architecture/multi-tenancy#idempotency-keys).
 
 ## `react_traces`: the conversation
 
-The chronological message history shipped to the LLM on every iteration. One row per message.
+Conversation evidence. Format-1 turns use one row per message. Format 2 also has `seed`, `rewrite` and `state` kinds: seed rows preserve the initial prefix, rewrite rows replace a conversation prefix, and state rows hold referenced execution data.
 
 For the quickstart's two-iteration run, this table has 4 rows: the user's question, the assistant's tool call, the tool result, and the assistant's final answer. Here's the first row:
 
@@ -118,13 +119,15 @@ created_at:   2026-10-27 08:29:16.427239
 
 The `order_index` is what guarantees stable ordering. SQL timestamps aren't precise enough (two messages in the same millisecond would tie); `order_index` is monotonic per run.
 
-`role` is one of `user`, `assistant`, `tool`. There's a composite index on `(agent_run_id, order_index)` so loading a run's history is one indexed range scan.
+Format-2 seeds may also have role `system`. After activation a unique index on `(agent_run_id, order_index)` keeps positions distinct. Use `RunStore.get_traces` for effective conversation: it expands the latest rewrite prefix once, includes its suffix and excludes state rows before pagination. It returns the provider form with PII placeholders. Keep reverse mappings behind trusted access.
 
 Sub-agent isolation is **structural**: a sub-agent has its own `agent_run_id`, so its traces are naturally a separate set. No `instance_id` or delegation columns are needed inside this table.
 
 ## `tool_calls`: what tools ran
 
 One row per tool invocation. Captures the call identity, parameters, result, success/failure, and timing.
+
+Format-2 server calls write `outcome="started"` before dispatch. Completion updates that row and writes the observation and event in one transaction. `outcome`, `idempotent` and `replayed_at` support [recovery](/docs/guides/recovery#what-happens-to-an-interrupted-tool). Client calls have no execution intent; they wait for a submitted result.
 
 ```text
 id:                     01M5Y7N250SBXNAM4CVVE8S11B
@@ -268,9 +271,9 @@ You can add your own indexes if your queries need them. These are the structural
 
 ## Long-running tools and the stale sweep
 
-`sweep()` is the maintenance call you schedule yourself (at startup, from a cron). With `stale_running=timedelta(...)` it finds `running` rows whose `last_progress_at` is older than the threshold, assumes the process died, and marks them `error` (`failure_reason` `stale_running`, or `never_started` if no `run.started` event exists) with a `run.interrupted` event. A stale row with a cancel pending is finalized `cancelled` instead. With `abandoned_waiting=timedelta(...)` it reaps `waiting_*` and `paused` rows nobody resumed.
+`sweep()` is the maintenance call you schedule yourself. Choose `on_stale="error"` to finalize stale running rows, or `"reclaim"` to mark eligible format-2 ReAct runs for explicit `agent.reclaim()`. Omission retains error finalization in 0.6 and warns when stale rows are found. A pending cancel wins. `abandoned_waiting=` independently reaps old `waiting_*` and `paused` rows. See [Recovery](/docs/guides/recovery) for bounded scans, attempt limits and dispatch.
 
-`last_progress_at` moves forward on every LLM call, every tool start and every tool completion. A tool that blocks longer than the sweep threshold with no other progress (waiting on a human, a long export) looks dead. Call the heartbeat from inside the tool to say it is alive:
+`last_progress_at` advances at model and tool boundaries and through call-scoped lease renewal on fenced stores. `Agent.lease_interval` defaults to 30 seconds with a five-second minimum. Tools can also report progress explicitly:
 
 ```python
 from dendrux import aheartbeat, heartbeat, tool
@@ -294,9 +297,9 @@ def slow_sync_tool() -> str:
     return "done"
 ```
 
-`heartbeat()` is safe from async code and from threads, returns immediately and coalesces calls less than a second apart. `aheartbeat()` must be awaited on the run's event loop and never raises. Both do nothing outside a persisted run.
+`heartbeat()` is safe from async code and from threads, returns immediately and coalesces calls less than a second apart. `aheartbeat()` must be awaited on the run's event loop. Ordinary write failures are logged; a stale claim raises `RunFencedError`. Both do nothing outside a persisted run.
 
-> **Choose the sweep threshold above the longest gap between progress updates.** If `stale_running` is shorter than the longest stretch a live run can go without an LLM call, a tool start or end, or a heartbeat, the sweep will finalize a run that is still executing. Known limitation: the still-running process keeps writing events with the sequence indexes it already allocated, so those indexes can collide with the sweep's `run.interrupted` event. Size the threshold for your slowest tool, and heartbeat from long ones, so the sweep never touches a live run.
+> **Leave room for renewal delays.** Set `stale_running` to at least three times `lease_interval`, with headroom for database latency and event-loop stalls. A threshold that is too short can fence a live worker. Fencing protects database writes; it cannot undo external tool effects.
 
 ## Database choice
 
@@ -304,9 +307,10 @@ Dendrux uses **SQLAlchemy 2.x async**. Anything async-SQLAlchemy supports works:
 
 - **SQLite + aiosqlite**: bundled, zero-setup, perfect for local dev and small deployments.
 - **PostgreSQL + asyncpg**: recommended for production. `pip install "dendrux[postgres]"`. Schema is identical; migrations are managed by Alembic.
-- Other backends (MySQL, etc.) work in principle but aren't routinely tested.
+- **MySQL 8.4 and MariaDB 10.11**: supported on InnoDB. `pip install "dendrux[mysql]"`. See [MySQL and MariaDB](/docs/guides/mysql).
+- Another SQLAlchemy database can be added by subclassing `SQLStateStore` and proving it with the published test kit. See [Build your own store](/docs/guides/build-your-own-store).
 
-The schema doesn't use any SQLite-specific or Postgres-specific features. Switching backends is a connection string change.
+The tables are the same on every backend; each adds the column types and indexes it needs. Switching databases means creating the schema in the new one: Dendrux does not copy data between databases.
 
 **In-memory SQLite** (`sqlite+aiosqlite:///:memory:`) is for tests and demos only. SQLAlchemy gives it one shared connection, so Dendrux serialises its own database sessions on it (parallel tool calls and readers wait their turn) and logs a warning when a store is created on it. The data is gone when the engine is disposed. Two rules apply:
 
@@ -328,13 +332,15 @@ dendrux db status                        # show the current migration revision
 
 `DENDRUX_DATABASE_URL` is the one knob the CLI reads. It never accepts the URL as a flag, so credentials stay out of your shell history and process list. Error output from the CLI masks the password in any URL it prints.
 
-> **Deprecated in 0.5.0.** An `Agent` built with neither `state_store=` nor `database_url=` still falls back to this variable, but it now warns once, and the fallback is removed in 0.6. Create one `SQLAlchemyStateStore` at startup and pass `state_store=` to every Agent (see [Web endpoints](/docs/recipes/web-endpoint)). The CLI keeps reading the variable.
+> **Explicit persistence in 0.6.** The Agent ignores `DENDRUX_DATABASE_URL`. If it is set and no effective store is supplied, run and stream have no persistence and log `database_url_env_ignored` once per process, without raising just because the variable is set. A returned pause cannot be submitted later without persistence. Pass `state_store=` or `database_url=` explicitly; the CLI still uses the variable. Create one store (`PostgresStateStore`, `SQLiteStateStore`, `MySQLStateStore`, or `store_for_engine(engine)`) at startup and share it within the worker event loop.
 
-The shared engine behind that fallback is tied to one event loop. Using it from a second loop (a second `asyncio.run`, a test client on another loop) raises a clear `RuntimeError` instead of asyncpg's "another operation is in progress".
+Async engines belong to their worker event loop. See [Scaling workers](/docs/guides/scaling) for pool ownership and sharing.
 
 If the tables are missing when a run starts, dendrux raises `SchemaNotInitializedError` carrying these exact commands, rather than letting a raw "relation does not exist" error surface mid-run.
 
 ### Upgrading
+
+For 0.6, run the additive migration, roll every worker and reader, take a pre-activation backup, then run `dendrux db activate`. Migration alone leaves existing databases at format 1. Activation enables format 2 for new runs and is one-way. SQLite adds columns at startup but still requires explicit activation of an existing file after stopping other processes. Follow [Upgrading to 0.6.0](/docs/upgrading-to-0.6.0); [Database CLI](/docs/reference/cli) describes `activate`, `dedupe` and storage-format status.
 
 Upgrading to 0.5.0 applies two revisions. `d7e8f9a0b1c2` adds `agent_runs.claim_epoch`, the tenant-scoped idempotency index and the `(tenant_id, created_at)` index. `e8f9a0b1c2d3` adds `agent_runs.status_changed_at` (backfilled online from `updated_at`) and the three `sweep()` indexes. Run `dendrux db migrate` once, as a single deploy job over a direct Postgres connection (not PgBouncer, not from every pod), before you start 0.5 workers; short exclusive steps give up after 5 seconds and can be retried. A Postgres database that has not been migrated raises `SchemaOutOfDateError` on first use, and the schema check now also verifies the named indexes. `dendrux db check` compares the database with this version's migration head (exit 0 current, 1 behind, 2 unknown; `--allow-unstamped` for schemas built with `create_all`). The full procedure, including mixed-fleet rules, is in [Upgrading to 0.5.0](/docs/upgrading-to-0.5.0).
 

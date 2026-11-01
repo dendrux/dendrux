@@ -65,7 +65,7 @@ _AGENT_RUNS_COLUMNS = {
 }
 _LEGACY_ROWS = [
     ("01OLDRUN0000000000000000A1", "success", 2, 10, 5, "2026-09-01 10:00:00.000000"),
-    ("01OLDRUN0000000000000000A2", "running", 0, 0, 0, "2026-09-02 10:00:00.000000"),
+    ("00000000000000000000000114", "running", 0, 0, 0, "2026-09-02 10:00:00.000000"),
 ]
 
 
@@ -172,6 +172,7 @@ class TestUpgradeEndToEnd:
         assert "run_inbox" not in _tables(db)
 
         agent = Agent(
+            strict_tenancy=False,
             provider=MockLLM([LLMResponse(text="done")]),
             prompt="Be brief.",
             database_url=f"sqlite+aiosqlite:///{db}",
@@ -191,6 +192,7 @@ class TestUpgradeEndToEnd:
         db = tmp_path / "old.db"
         _build_old_db(db)
         agent = Agent(
+            strict_tenancy=False,
             provider=MockLLM([LLMResponse(text="ok")]),
             prompt="Be brief.",
             database_url=f"sqlite+aiosqlite:///{db}",
@@ -352,6 +354,7 @@ class TestSyncBehaviour:
         db = tmp_path / "bad.db"
         _build_old_db(db, without={"agent_name"})
         agent = Agent(
+            strict_tenancy=False,
             provider=MockLLM([LLMResponse(text="x")]),
             prompt="p",
             database_url=f"sqlite+aiosqlite:///{db}",
@@ -588,6 +591,7 @@ class TestGlobalEngineInit:
         db = tmp_path / "bad.db"
         _build_old_db(db, without={"agent_name"})
         agent = Agent(
+            strict_tenancy=False,
             provider=MockLLM([LLMResponse(text="x")]),
             prompt="p",
             database_url=f"sqlite+aiosqlite:///{db}",
@@ -613,6 +617,7 @@ class TestGlobalEngineInit:
         db = tmp_path / "old.db"
         _build_old_db(db)
         agent = Agent(
+            strict_tenancy=False,
             provider=MockLLM([LLMResponse(text="x")]),
             prompt="p",
             database_url=f"sqlite+aiosqlite:///{db}",
@@ -984,6 +989,7 @@ class TestLifecycleFences:
         db = tmp_path / "old.db"
         _build_old_db(db)
         agent = Agent(
+            strict_tenancy=False,
             provider=MockLLM([LLMResponse(text="x")]),
             prompt="p",
             database_url=f"sqlite+aiosqlite:///{db}",

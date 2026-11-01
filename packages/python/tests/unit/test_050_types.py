@@ -132,8 +132,8 @@ class TestPauseStateFields:
 
 
 class TestBudgetCountCacheTokens:
-    def test_default_is_not_chosen(self) -> None:
-        assert Budget(max_tokens=10).count_cache_tokens is None
+    def test_default_counts_cache_tokens(self) -> None:
+        assert Budget(max_tokens=10).count_cache_tokens is True
 
     @pytest.mark.parametrize("value", [True, False])
     def test_explicit_choice(self, value: bool) -> None:

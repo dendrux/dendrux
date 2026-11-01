@@ -32,6 +32,7 @@ The tool's `description` is the full docstring. The arguments schema is generate
 | --- | --- | --- |
 | `target` | `"server"` | `"server"` runs the function in your process; `"client"` pauses the run and hands the call to your client. |
 | `parallel` | `True` | Whether calls to this tool may run concurrently with others. |
+| `idempotent` | `False` | Promise that repeating an interrupted server call is safe. Automatic recovery replay requires both the stored call and current definition to declare it. Otherwise replay asks for approval. See [Recovery](/docs/guides/recovery). |
 | `max_calls_per_run` | `None` | Limit on calls per run. `None` = unlimited. |
 | `timeout_seconds` | `120.0` | Execution timeout for server tools. |
 | `parameters` | `None` | Explicit JSON Schema for the arguments. Skips generation from type hints. |

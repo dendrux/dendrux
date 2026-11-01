@@ -17,6 +17,10 @@ async def approved_effect() -> str:
 
 @pytest.mark.parametrize("entry", ["client", "approval", "paused"])
 async def test_sweep_between_claim_and_task_handoff_returns_persisted_result(store, entry):
+    # This fault injection / pause blob exercises the format-1 write path.
+    from tests._fixtures.storage import pin_storage_format
+
+    await pin_storage_format(store._engine, 1)
     provider = ScriptedLLM(
         [
             tool_call("client_read" if entry == "client" else "approved_effect", pid="a"),
@@ -34,7 +38,7 @@ async def test_sweep_between_claim_and_task_handoff_returns_persisted_result(sto
         on_governance_change="warn",
     )
     if entry == "paused":
-        await store.create_run("paused", "handoff")
+        await store.create_run("00000000000000000000000200", "handoff")
         pause = PauseState(
             agent_name="handoff",
             pending_tool_calls=[],
@@ -45,8 +49,10 @@ async def test_sweep_between_claim_and_task_handoff_returns_persisted_result(sto
             usage=UsageStats(),
             pause_id="generation",
         )
-        await store.pause_run("paused", status="paused", pause_data=pause.to_dict())
-        run_id, pause_id = "paused", "generation"
+        await store.pause_run(
+            "00000000000000000000000200", status="paused", pause_data=pause.to_dict()
+        )
+        run_id, pause_id = "00000000000000000000000200", "generation"
     else:
         paused = await a.run("go")
         run_id, pause_id = paused.run_id, paused.pause_id

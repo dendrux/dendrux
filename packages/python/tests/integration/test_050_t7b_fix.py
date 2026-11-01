@@ -114,14 +114,14 @@ async def test_ambiguous_usage_commit_has_one_row(store, monkeypatch):
 
 
 async def test_cancel_result_discloses_failed_persistence(store, monkeypatch):
-    await store.create_run("cancel-write", agent_name="a", input_data={})
+    await store.create_run("00000000000000000000000103", agent_name="a", input_data={})
 
     async def fail(*args, **kwargs):
         raise RuntimeError("database unavailable")
 
     monkeypatch.setattr(store, "finalize_run", fail)
-    result = await _persist_task_cancellation(store, "cancel-write", interrupted=True)
-    assert (await store.get_run("cancel-write")).status == "running"
+    result = await _persist_task_cancellation(store, "00000000000000000000000103", interrupted=True)
+    assert (await store.get_run("00000000000000000000000103")).status == "running"
     assert result.meta.get("dendrux.cancel_persisted") is False, (
         "CANCELLED must disclose a failed durable transition"
     )
@@ -194,8 +194,11 @@ async def test_sweep_index_migration_roundtrip(engine, tmp_path):
     from sqlalchemy import inspect, text
     from sqlalchemy.ext.asyncio import create_async_engine
 
-    from dendrux.db.models import Base
-    from tests.integration._migration_schema import migration_schema, test_database_url
+    from tests.integration._migration_schema import (
+        create_pre_activation_schema,
+        migration_schema,
+        test_database_url,
+    )
     from tests.integration.test_migration_run_control import _alembic
 
     names = {
@@ -218,7 +221,7 @@ async def test_sweep_index_migration_roundtrip(engine, tmp_path):
 
     async with target() as migrated:
         async with migrated.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
+            await conn.run_sync(create_pre_activation_schema)
             for name in names:
                 await conn.execute(text(f'DROP INDEX IF EXISTS "{name}"'))
             await conn.execute(

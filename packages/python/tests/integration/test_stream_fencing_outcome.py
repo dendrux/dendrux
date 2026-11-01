@@ -100,7 +100,7 @@ async def test_fenced_stream_preserves_live_winner_status(
         assert await store.try_pause_run(
             run_id, status="paused", pause_data={"pause_id": "new"}, claim_epoch=old
         )
-        new = await store.claim_paused_run(run_id, expected_status="paused")
+        new = (await store.claim_paused_run(run_id, expected_status="paused")).claim_epoch
         assert new == old + 1
         if winner_status == "paused":
             assert await store.try_pause_run(

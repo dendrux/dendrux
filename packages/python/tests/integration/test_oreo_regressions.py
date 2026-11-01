@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 from contextvars import ContextVar
@@ -36,7 +37,7 @@ async def test_run_timeout_finalizes_and_reraises(store, monkeypatch):
 
     monkeypatch.setattr(provider, "complete", blocked)
     notifier = AsyncMock(on_run_started=AsyncMock(), on_run_finished=AsyncMock())
-    agent = Agent(provider=provider, prompt="test", state_store=store)
+    agent = Agent(strict_tenancy=False, provider=provider, prompt="test", state_store=store)
     task = asyncio.create_task(agent.run("hello", notifier=notifier))
     await asyncio.wait_for(entered.wait(), 5)
     run_id = notifier.on_run_started.call_args.args[0]
@@ -65,7 +66,7 @@ async def test_cancellation_during_startup_preserves_existing_outcomes(store, ex
 
     notifier = AsyncMock(on_run_started=started, on_run_finished=AsyncMock())
     provider = MockLLM([])
-    agent = Agent(provider=provider, prompt="test", state_store=store)
+    agent = Agent(strict_tenancy=False, provider=provider, prompt="test", state_store=store)
     task = asyncio.create_task(agent.run("hello", notifier=notifier))
     await asyncio.wait_for(entered.wait(), 5)
     run_id = run_ids[0]
@@ -83,11 +84,12 @@ async def test_cancellation_during_startup_preserves_existing_outcomes(store, ex
 
 
 async def test_cancellation_before_row_exists_is_quiet(store, monkeypatch, caplog):
+    @functools.wraps(store.create_run)
     async def cancelled_create(*args, **kwargs):
         raise asyncio.CancelledError
 
     monkeypatch.setattr(store, "create_run", cancelled_create)
-    agent = Agent(provider=MockLLM([]), prompt="test", state_store=store)
+    agent = Agent(strict_tenancy=False, provider=MockLLM([]), prompt="test", state_store=store)
     with caplog.at_level(logging.ERROR, logger="dendrux"), pytest.raises(asyncio.CancelledError):
         await agent.run("hello")
     assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
@@ -100,7 +102,7 @@ async def test_cancellation_cleanup_failure_does_not_mask_cancellation(store, mo
     provider = MockLLM([])
     monkeypatch.setattr(provider, "complete", cancelled)
     monkeypatch.setattr(store, "finalize_run", AsyncMock(side_effect=RuntimeError("db down")))
-    agent = Agent(provider=provider, prompt="test", state_store=store)
+    agent = Agent(strict_tenancy=False, provider=provider, prompt="test", state_store=store)
     with pytest.raises(asyncio.CancelledError):
         await agent.run("hello")
 
@@ -133,7 +135,7 @@ async def test_timeout_during_error_finalization_cancels_run(store, monkeypatch)
 
     monkeypatch.setattr(store, "finalize_run", blocked_error)
     notifier = AsyncMock()
-    agent = Agent(provider=MockLLM([]), prompt="test", state_store=store)
+    agent = Agent(strict_tenancy=False, provider=MockLLM([]), prompt="test", state_store=store)
     task = asyncio.create_task(agent.run("hello", notifier=notifier))
     await asyncio.wait_for(entered.wait(), 5)
     with pytest.raises(TimeoutError):
@@ -168,6 +170,7 @@ async def test_repeated_cancellation_waits_for_durable_cleanup(store, monkeypatc
             await release_cleanup.wait()
         return await finalize(run_id, **kwargs)
 
+    @functools.wraps(store.save_run_event)
     async def gated_event(run_id, **kwargs):
         if kwargs["event_type"] == "run.cancelled" and blocked_write == "event":
             cleanup_entered.set()
@@ -178,7 +181,7 @@ async def test_repeated_cancellation_waits_for_durable_cleanup(store, monkeypatc
     monkeypatch.setattr(store, "finalize_run", gated_finalize)
     monkeypatch.setattr(store, "save_run_event", gated_event)
     notifier = AsyncMock()
-    agent = Agent(provider=provider, prompt="test", state_store=store)
+    agent = Agent(strict_tenancy=False, provider=provider, prompt="test", state_store=store)
     task = asyncio.create_task(agent.run("hello", notifier=notifier))
     await asyncio.wait_for(model_entered.wait(), 5)
     task.cancel("initial cancellation")
@@ -218,7 +221,12 @@ async def test_cancel_during_finish_hook_does_not_repeat_it(store, monkeypatch, 
 
     monkeypatch.setattr(PersistenceRecorder, "on_run_finished", recorded)
     notifier = AsyncMock(on_run_finished=notified)
-    agent = Agent(provider=MockLLM([LLMResponse(text="done")]), prompt="test", state_store=store)
+    agent = Agent(
+        strict_tenancy=False,
+        provider=MockLLM([LLMResponse(text="done")]),
+        prompt="test",
+        state_store=store,
+    )
     task = asyncio.create_task(agent.run("hello", notifier=notifier))
     await asyncio.wait_for(entered.wait(), 5)
     task.cancel()
@@ -243,7 +251,7 @@ async def test_cancel_during_failure_hook_does_not_finish_lifecycle_again(store)
         await asyncio.Event().wait()
 
     notifier = AsyncMock(on_run_failed=failed)
-    agent = Agent(provider=MockLLM([]), prompt="test", state_store=store)
+    agent = Agent(strict_tenancy=False, provider=MockLLM([]), prompt="test", state_store=store)
     task = asyncio.create_task(agent.run("hello", notifier=notifier))
     await asyncio.wait_for(entered.wait(), 5)
     task.cancel()
@@ -278,7 +286,7 @@ async def test_cancellation_keeps_lifecycle_hooks_in_run_task(store, monkeypatch
 
     monkeypatch.setattr(provider, "complete", blocked)
     notifier = AsyncMock(on_run_started=started, on_run_finished=finish)
-    agent = Agent(provider=provider, prompt="test", state_store=store)
+    agent = Agent(strict_tenancy=False, provider=provider, prompt="test", state_store=store)
     task = asyncio.create_task(agent.run("hello", notifier=notifier))
     await asyncio.wait_for(entered.wait(), 5)
     task.cancel()
@@ -291,7 +299,7 @@ async def test_cancellation_keeps_lifecycle_hooks_in_run_task(store, monkeypatch
 @pytest.mark.parametrize("first_stream", [False, True])
 async def test_stream_idempotency_reuses_run_result(store, first_stream):
     provider = MockLLM([LLMResponse(text="done")])
-    agent = Agent(provider=provider, prompt="test", state_store=store)
+    agent = Agent(strict_tenancy=False, provider=provider, prompt="test", state_store=store)
     if first_stream:
         original = agent.stream("hello", idempotency_key="request")
         async with original:
@@ -326,7 +334,7 @@ async def test_cached_stream_preserves_terminal_status(store, status, event_type
     from dendrux.types import compute_idempotency_fingerprint
 
     provider = MockLLM([])
-    agent = Agent(provider=provider, prompt="test", state_store=store)
+    agent = Agent(strict_tenancy=False, provider=provider, prompt="test", state_store=store)
     await store.create_run(
         "cached",
         agent.name,
@@ -347,7 +355,7 @@ async def test_cached_stream_preserves_terminal_status(store, status, event_type
 @pytest.mark.parametrize("change", ["input", "history", "context"])
 async def test_stream_idempotency_conflicts(store, change):
     provider = MockLLM([LLMResponse(text="done")])
-    agent = Agent(provider=provider, prompt="test", state_store=store)
+    agent = Agent(strict_tenancy=False, provider=provider, prompt="test", state_store=store)
     result = await agent.run("hello", idempotency_key="request")
     kwargs = {}
     if change == "history":
@@ -373,7 +381,7 @@ async def test_stream_idempotency_conflicts(store, change):
 
 async def test_active_duplicate_stream_cannot_cancel_owner(store):
     provider = MockLLM([LLMResponse(text="done")])
-    agent = Agent(provider=provider, prompt="test", state_store=store)
+    agent = Agent(strict_tenancy=False, provider=provider, prompt="test", state_store=store)
     notifier = AsyncMock()
     owner = agent.stream("hello", idempotency_key="request", notifier=notifier)
     async with owner:
@@ -407,7 +415,7 @@ async def test_stream_idempotency_requires_persistence(monkeypatch):
 
 async def test_duplicate_stream_preserves_owners_interrupt(store):
     provider = GatedStreamLLM()
-    agent = Agent(provider=provider, prompt="test", state_store=store)
+    agent = Agent(strict_tenancy=False, provider=provider, prompt="test", state_store=store)
     owner = agent.stream("hello", idempotency_key="request")
 
     async def consume():
@@ -435,7 +443,12 @@ async def test_duplicate_stream_preserves_owners_interrupt(store):
 async def test_cancelled_cached_lookup_never_finalizes_existing_run(store, monkeypatch):
     from dendrux.runtime import runner
 
-    agent = Agent(provider=MockLLM([LLMResponse(text="done")]), prompt="test", state_store=store)
+    agent = Agent(
+        strict_tenancy=False,
+        provider=MockLLM([LLMResponse(text="done")]),
+        prompt="test",
+        state_store=store,
+    )
     result = await agent.run("hello", idempotency_key="request")
     entered = asyncio.Event()
 
@@ -464,7 +477,7 @@ async def test_cancelled_cached_lookup_never_finalizes_existing_run(store, monke
 
 async def test_unstarted_idempotent_stream_has_no_side_effects(store):
     provider = MockLLM([])
-    agent = Agent(provider=provider, prompt="test", state_store=store)
+    agent = Agent(strict_tenancy=False, provider=provider, prompt="test", state_store=store)
     stream = agent.stream("hello", idempotency_key="request")
     await stream.aclose()
     assert await store.get_run(stream.run_id) is None
@@ -478,7 +491,9 @@ async def test_run_answer_contains_only_final_turn(store):
             LLMResponse(text="final turn"),
         ]
     )
-    agent = Agent(provider=provider, prompt="test", tools=[echo], state_store=store)
+    agent = Agent(
+        strict_tenancy=False, provider=provider, prompt="test", tools=[echo], state_store=store
+    )
     result = await agent.run("hello")
     assert result.answer == "final turn"
     assert (await store.get_run(result.run_id)).answer == "final turn"
@@ -491,7 +506,9 @@ async def test_stream_separates_commentary_from_answer(store):
             LLMResponse(text="final turn"),
         ]
     )
-    agent = Agent(provider=provider, prompt="test", tools=[echo], state_store=store)
+    agent = Agent(
+        strict_tenancy=False, provider=provider, prompt="test", tools=[echo], state_store=store
+    )
     buckets: dict[int, list[str]] = {}
     commentary_iterations: set[int] = set()
     terminal = None
@@ -526,7 +543,9 @@ async def test_answer_is_final_turn_and_cancel_buffer_resets(store, stop_at):
             LLMResponse(text="final turn"),
         ]
     )
-    agent = Agent(provider=provider, prompt="test", tools=[echo], state_store=store)
+    agent = Agent(
+        strict_tenancy=False, provider=provider, prompt="test", tools=[echo], state_store=store
+    )
     stream = agent.stream("hello")
     text = []
     tool_finished = False
@@ -558,7 +577,9 @@ async def test_leaked_tool_syntax_argument_is_rejected_before_tool_runs(store):
 
     leaked = ToolCall(name="show", params={"kind": "table", 'r4<|"|>,split': "x"})
     provider = MockLLM([LLMResponse(tool_calls=[leaked]), LLMResponse(text="retried")])
-    agent = Agent(provider=provider, prompt="test", tools=[show], state_store=store)
+    agent = Agent(
+        strict_tenancy=False, provider=provider, prompt="test", tools=[show], state_store=store
+    )
 
     result = await agent.run("hello")
 
@@ -637,7 +658,13 @@ async def test_malformed_tool_json_is_a_failed_tool_call_not_a_failed_run(store)
             _chat_completion(text="Wrote build_deck.py."),
         ]
     )
-    agent = Agent(provider=provider, prompt="test", tools=[write_file], state_store=store)
+    agent = Agent(
+        strict_tenancy=False,
+        provider=provider,
+        prompt="test",
+        tools=[write_file],
+        state_store=store,
+    )
 
     result = await agent.run("write the deck builder")
 
@@ -719,7 +746,13 @@ async def test_malformed_tool_json_stream_completes(store):
             LLMResponse(text="done"),
         ]
     )
-    agent = Agent(provider=provider, prompt="test", tools=[write_file], state_store=store)
+    agent = Agent(
+        strict_tenancy=False,
+        provider=provider,
+        prompt="test",
+        tools=[write_file],
+        state_store=store,
+    )
 
     stream = agent.stream("write it")
     events = [e async for e in stream]

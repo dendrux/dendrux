@@ -51,8 +51,10 @@ dev with no Postgres still gets a green suite).
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import sys
+from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING
 
 import pytest
@@ -64,6 +66,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import NullPool
 
+from dendrux.db._settings import seed_settings
 from dendrux.db.models import Base
 from tests._helpers.pg_url import (
     TEST_SUFFIX,
@@ -82,6 +85,26 @@ if TYPE_CHECKING:
 _PG_URL_ENV = "DENDRUX_TEST_PG_URL"
 _TEST_DB_SUFFIX = TEST_SUFFIX
 _REWRITE_WARNED = False
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Keep optional NLP disk caches inside this test process's writable scratch space.
+
+    Both full-suite commands collect integration tests before running any test;
+    this historic hook also configures the docs/unit cases in those sessions.
+    Each xdist worker gets its own cache and restores the extractor at shutdown.
+    """
+    if importlib.util.find_spec("tldextract") is None:
+        return
+    from tldextract.cache import DiskCache
+    from tldextract.tldextract import TLD_EXTRACTOR
+
+    cache = TemporaryDirectory(prefix="dendrux-test-tldextract-")
+    config.add_cleanup(cache.cleanup)
+    patch = pytest.MonkeyPatch()
+    patch.setenv("TLDEXTRACT_CACHE", cache.name)
+    patch.setattr(TLD_EXTRACTOR, "_cache", DiskCache(cache.name))
+    config.add_cleanup(patch.undo)
 
 
 def _rewrite_to_test_db(url: str) -> tuple[str, str, bool]:
@@ -257,6 +280,7 @@ async def engine(request, _pg_schema_setup, tmp_path) -> AsyncIterator[AsyncEngi
         try:
             async with eng.begin() as conn:
                 await conn.execute(text(_PG_TRUNCATE_SQL))
+                await conn.run_sync(lambda c: seed_settings(c, active=True))
             yield eng
         finally:
             await eng.dispose()
@@ -292,9 +316,9 @@ async def engine(request, _pg_schema_setup, tmp_path) -> AsyncIterator[AsyncEngi
 @pytest.fixture
 def store(engine):
     """StateStore backed by the matrix engine."""
-    from dendrux.runtime.state import SQLAlchemyStateStore
+    from dendrux.runtime.stores._factory import store_for_engine
 
-    return SQLAlchemyStateStore(engine)
+    return store_for_engine(engine)
 
 
 @pytest.fixture

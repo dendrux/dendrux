@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import warnings
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -21,11 +22,12 @@ from dendrux.errors import TenantScopeRequiredError
 from dendrux.llm.mock import MockLLM
 from dendrux.runtime import _tenant_checks
 from dendrux.runtime.context import get_delegation_context
-from dendrux.runtime.state import UNSCOPED, SQLAlchemyStateStore
+from dendrux.runtime.state import UNSCOPED
+from dendrux.runtime.stores.sql.sqlite import SQLiteStateStore
 from dendrux.types import Limits, LLMResponse, ToolCall
 
 
-class _SpyStore(SQLAlchemyStateStore):
+class _SpyStore(SQLiteStateStore):
     """Records every store call so a test can assert "nothing was read or written"."""
 
     def __init__(self, engine: Any) -> None:
@@ -50,6 +52,7 @@ async def store(tmp_path: Any) -> Any:
 
 
 def _agent(store: Any = None, **kw: Any) -> Agent:
+    kw.setdefault("strict_tenancy", False)
     return Agent(
         provider=MockLLM([LLMResponse(text="ok")] * 5), prompt="p", state_store=store, **kw
     )
@@ -57,19 +60,25 @@ def _agent(store: Any = None, **kw: Any) -> Agent:
 
 _ASYNC_ENTRIES: list[tuple[str, Any]] = [
     ("run", lambda a, **k: a.run("hi", **k)),
-    ("retry", lambda a, **k: a.retry("r1", **k)),
-    ("resume", lambda a, **k: a.resume("r1", **k)),
-    ("submit_tool_results", lambda a, **k: a.submit_tool_results("r1", [], **k)),
-    ("submit_input", lambda a, **k: a.submit_input("r1", "answer", **k)),
-    ("submit_approval", lambda a, **k: a.submit_approval("r1", approved=True, **k)),
-    ("submit_resume", lambda a, **k: a.submit_resume("r1", **k)),
-    ("cancel_run", lambda a, **k: a.cancel_run("r1", **k)),
-    ("request_pause", lambda a, **k: a.request_pause("r1", **k)),
-    ("submit_note", lambda a, **k: a.submit_note("r1", "note", **k)),
+    ("retry", lambda a, **k: a.retry("00000000000000000000000105", **k)),
+    ("resume", lambda a, **k: a.resume("00000000000000000000000105", **k)),
+    (
+        "submit_tool_results",
+        lambda a, **k: a.submit_tool_results("00000000000000000000000105", [], **k),
+    ),
+    ("submit_input", lambda a, **k: a.submit_input("00000000000000000000000105", "answer", **k)),
+    (
+        "submit_approval",
+        lambda a, **k: a.submit_approval("00000000000000000000000105", approved=True, **k),
+    ),
+    ("submit_resume", lambda a, **k: a.submit_resume("00000000000000000000000105", **k)),
+    ("cancel_run", lambda a, **k: a.cancel_run("00000000000000000000000105", **k)),
+    ("request_pause", lambda a, **k: a.request_pause("00000000000000000000000105", **k)),
+    ("submit_note", lambda a, **k: a.submit_note("00000000000000000000000105", "note", **k)),
 ]
 _SYNC_ENTRIES: list[tuple[str, Any]] = [
     ("stream", lambda a, **k: a.stream("hi", **k)),
-    ("resume_stream", lambda a, **k: a.resume_stream("r1", **k)),
+    ("resume_stream", lambda a, **k: a.resume_stream("00000000000000000000000105", **k)),
 ]
 
 
@@ -148,9 +157,10 @@ class TestStrictTenancy:
     ) -> None:
         class _Ctx:
             tenant_id = "acme"
+            tenant_explicit = True
 
         monkeypatch.setattr(_tenant_checks, "get_delegation_context", lambda: _Ctx())
-        agent = _agent(strict_tenancy=True)
+        agent = _agent(AsyncMock(), strict_tenancy=True)
         from dendrux._sentinel import _OMITTED
 
         resolved = _tenant_checks.resolve_tenant(agent, "submit_input", _OMITTED, default=UNSCOPED)
@@ -163,37 +173,39 @@ class TestStrictTenancy:
     ) -> None:
         agent = _agent(store, strict_tenancy=True)
         with pytest.raises(TenantScopeRequiredError):
-            await agent.cancel_run("r1")
-        assert "code=tenant_scope_required" in caplog.text
+            await agent.cancel_run("00000000000000000000000105")
+        assert any(getattr(r, "code", None) == "tenant_scope_required" for r in caplog.records)
 
 
-class TestStrictDefaultFutureWarning:
-    async def test_future_warning_points_at_the_caller_and_dedups(self, store: Any) -> None:
-        agent = _agent(store)
+class TestStrictDefault:
+    async def test_default_requires_scope_without_warning(self, store: Any) -> None:
+        agent = Agent(provider=MockLLM([]), prompt="p", state_store=store)
         with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("default")
-            for _ in range(3):
-                await agent.run("hi")  # one location: shown once
-            await agent.run("hi")  # another location: shown again
-        future = [w for w in caught if issubclass(w.category, FutureWarning)]
-        assert len(future) == 2
-        assert all(w.filename == __file__ for w in future)
-        assert "strict_tenancy" in str(future[0].message)
+            warnings.simplefilter("always")
+            with pytest.raises(TenantScopeRequiredError):
+                await agent.run("hi")
+        assert not caught
+        assert store.calls == []
 
-    def test_visible_under_default_filters(self) -> None:
+    def test_default_refuses_omitted_scope(self) -> None:
         from dendrux._sentinel import _OMITTED
 
         with warnings.catch_warnings(record=True) as caught:
-            warnings.resetwarnings()  # Python's defaults: FutureWarning is shown
-            warnings.simplefilter("default", FutureWarning)
-            _tenant_checks.resolve_tenant(_agent(), "run", _OMITTED, default=None)
-        assert [w.category for w in caught] == [FutureWarning]
+            warnings.simplefilter("always")
+            with pytest.raises(TenantScopeRequiredError):
+                _tenant_checks.resolve_tenant(
+                    Agent(provider=MockLLM([]), prompt="p", state_store=AsyncMock()),
+                    "run",
+                    _OMITTED,
+                    default=None,
+                )
+        assert not caught
 
     @pytest.mark.parametrize("chosen", [True, False])
     def test_no_warning_when_chosen(self, chosen: bool) -> None:
         from dendrux._sentinel import _OMITTED
 
-        agent = _agent(strict_tenancy=chosen)
+        agent = _agent(AsyncMock(), strict_tenancy=chosen)
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             if chosen:
@@ -240,7 +252,7 @@ class TestEmptyTenant:
 
     async def test_non_string_tenant_rejected(self, store: Any) -> None:
         with pytest.raises(ValueError, match="tenant_id must be"):
-            await _agent(store).cancel_run("r1", tenant_id=42)  # type: ignore[arg-type]
+            await _agent(store).cancel_run("00000000000000000000000105", tenant_id=42)  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------
@@ -253,7 +265,7 @@ class TestRunMetadata:
         "call",
         [
             lambda a, m: a.run("hi", metadata=m),
-            lambda a, m: a.retry("r1", metadata=m),
+            lambda a, m: a.retry("00000000000000000000000105", metadata=m),
         ],
     )
     async def test_reserved_key_rejected(self, store: Any, call: Any) -> None:
@@ -287,7 +299,7 @@ class TestRunMetadata:
         with pytest.raises(ValueError, match="64-byte limit"):
             await agent.run("hi", metadata={"blob": "x" * 100})
         assert store.calls == []
-        assert "code=metadata_too_large" in caplog.text
+        assert any(getattr(r, "code", None) == "metadata_too_large" for r in caplog.records)
 
     async def test_metadata_at_the_cap_accepted(self, store: Any) -> None:
         # {"b":"xxx..."} -> 8 bytes of framing + the value.
@@ -306,7 +318,7 @@ class TestRunMetadata:
     async def test_note_metadata_capped(self, store: Any) -> None:
         agent = _agent(store, limits=Limits(max_metadata_bytes=32))
         with pytest.raises(ValueError, match="note metadata"):
-            await agent.submit_note("r1", "hi", metadata={"b": "x" * 64})
+            await agent.submit_note("00000000000000000000000105", "hi", metadata={"b": "x" * 64})
         assert store.calls == []
 
     async def test_non_dict_metadata_rejected(self, store: Any) -> None:

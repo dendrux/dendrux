@@ -36,6 +36,7 @@ from concurrent.futures import Future
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, NamedTuple
 
+from dendrux import _codes
 from dendrux.types import Limits
 
 if TYPE_CHECKING:
@@ -181,11 +182,7 @@ class _ToolPool:
                     zombies = self._zombies
                 del item
             if finished_zombie:
-                logger.info(
-                    "A timed-out sync tool call finished in the background "
-                    "(code=tool_zombie_finished, zombies=%d)",
-                    zombies,
-                )
+                _codes.log_code(logger, _codes.TOOL_ZOMBIE_FINISHED, zombies=zombies)
 
 
 _pool: _ToolPool | None = None

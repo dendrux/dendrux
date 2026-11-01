@@ -9,12 +9,13 @@ and testable in isolation.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
 import threading
 from bisect import bisect_right
-from collections import Counter
+from collections import Counter, OrderedDict
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -256,6 +257,7 @@ class GuardrailEngine:
         # restored into a tool only when it is trusted or that tool produced it;
         # a placeholder with no record (legacy or corrupt state, or minted from
         # model output) is restored nowhere until its origin is seen again.
+        self._projected: OrderedDict[bytes, tuple[list[Finding], str | None]] = OrderedDict()
         self._trusted: set[str] = set()
         self._tool_origins: dict[str, set[str]] = {}
         if self._allowlisted:
@@ -377,7 +379,17 @@ class GuardrailEngine:
                 if block is not None:
                     return segments, all_findings, block
                 continue
-            findings = _deoverlap(raw_findings)
+            placeholders = [
+                m.span() for m in _PLACEHOLDER_RE.finditer(joined) if m.group() in self._pii_mapping
+            ]
+            starts = [start for start, _ in placeholders]
+            findings = _deoverlap(
+                [
+                    f
+                    for f in raw_findings
+                    if (at := bisect_right(starts, f.start) - 1) < 0 or f.end > placeholders[at][1]
+                ]
+            )
             if not findings:
                 continue
             all_findings.extend(findings)
@@ -411,6 +423,37 @@ class GuardrailEngine:
             # warn: findings collected but text unchanged
 
         return segments, all_findings, None
+
+    async def project_incoming_message(
+        self, msg: Message, *, index: int | None = None
+    ) -> tuple[Message, list[Finding], str | None]:
+        """Project a format-2 boundary once; retain bounded digests, never history."""
+        from dendrux.types import TextPart
+
+        def digest(message: Message) -> bytes:
+            value = (
+                message.role.value,
+                message.name,
+                message.content,
+                [p.text if isinstance(p, TextPart) else None for p in message.parts]
+                if message.parts is not None
+                else None,
+            )
+            return hashlib.sha256(json.dumps(value, ensure_ascii=False).encode()).digest()
+
+        key = digest(msg)
+        previous = self._projected.get(key)
+        if previous is not None:
+            self._projected.move_to_end(key)
+            return msg, previous[0], previous[1]
+        cleaned, findings, blocked = await self.scan_incoming_message(msg, index=index)
+        # Keep block evidence so projection at persistence cannot bypass the
+        # loop's governance handling at the subsequent provider boundary.
+        if len(findings) <= 128:
+            self._projected[digest(cleaned)] = (findings, blocked)
+        if len(self._projected) > 256:
+            self._projected.popitem(last=False)
+        return cleaned, findings, blocked
 
     async def scan_incoming_message(
         self, msg: Message, *, index: int | None = None

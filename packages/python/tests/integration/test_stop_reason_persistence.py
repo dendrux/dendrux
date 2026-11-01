@@ -28,6 +28,7 @@ def _cut() -> LLMResponse:
 
 
 def _agent(store, llm: MockLLM, **kwargs) -> Agent:
+    kwargs.setdefault("strict_tenancy", False)
     return Agent(provider=llm, prompt="test", state_store=store, **kwargs)
 
 

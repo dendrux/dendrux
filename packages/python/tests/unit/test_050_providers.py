@@ -476,7 +476,7 @@ class TestAnthropicTaxonomy:
         wire(provider, boom)
         with pytest.raises(ProviderTimeoutError) as info:
             await provider.complete(USER)
-        assert info.value.timeout_reason == "call_deadline"
+        assert info.value.timeout_reason is None
         assert info.value.retryable is False
         assert "socket read timeout" in info.value.message
 
@@ -589,12 +589,14 @@ class TestObservability:
         wire(provider, json_handler(429, body))
         with caplog.at_level(logging.WARNING, logger="dendrux.llm._resilience"):
             with pytest.raises(ProviderRateLimitError):
-                await provider.complete(USER, run_id="run_42")
+                await provider.complete(USER, run_id="01ARZ3NDEKTSV4RRFFQ69G5FAV")
             with pytest.raises(ProviderRateLimitError):
-                await drain(provider.complete_stream(USER, run_id="run_42"))
-        lines = [r.getMessage() for r in caplog.records if "provider.error" in r.getMessage()]
+                await drain(provider.complete_stream(USER, run_id="01ARZ3NDEKTSV4RRFFQ69G5FAV"))
+        lines = [r for r in caplog.records if getattr(r, "kind", None) == "provider"]
         assert len(lines) == 2
-        assert all("run_id=run_42" in line and "category=rate_limit" in line for line in lines)
+        assert all(
+            r.run_id == "01ARZ3NDEKTSV4RRFFQ69G5FAV" and r.category == "rate_limit" for r in lines
+        )
         assert SECRET not in caplog.text
 
 
@@ -1241,7 +1243,9 @@ class TestTransport:
 
         hooks = chat_provider()._client._client.event_hooks
         assert _retry_telemetry._on_response in hooks["response"]
-        assert _resilience._on_request in hooks["request"]
+        assert any(
+            getattr(hook, "func", hook) is _resilience._on_request for hook in hooks["request"]
+        )
 
     def test_sdk_stream_exposes_sse_iterator(self) -> None:
         # The Chat [DONE] detection relies on this SDK seam; fail loudly if it moves.

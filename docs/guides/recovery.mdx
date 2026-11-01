@@ -1,0 +1,110 @@
+---
+title: Recovering a run
+description: Use your own maintenance job to mark expired leases, reclaim a format-2 ReAct run, and decide when an interrupted tool may run again.
+---
+
+# Recovering a run
+
+A worker can stop between a model response, a tool call and a database commit. Format-2 ReAct runs keep a durable checkpoint so another worker can continue. Dendrux supplies `sweep()` and `agent.reclaim()`; your application calls them and owns dispatch, concurrency limits and scheduling. There is no recovery daemon.
+
+Complete the [0.6 upgrade and activation](/docs/upgrading-to-0.6.0) first. Format-1 runs and `SingleCall` runs cannot be reclaimed.
+
+## Size the lease window
+
+`Agent(lease_interval=timedelta(seconds=30))` renews progress while a model or tool call is in flight. The minimum is five seconds. Choose `stale_running` at least three times that interval, with room for database latency and event-loop stalls. At the default interval, use at least 90 seconds.
+
+Renewals are bounded to one outstanding write per run. A renewal has a deadline of `min(lease_interval / 2, 10 seconds)`. Two consecutive failures record `lease_lost`; the run stops at a checkpoint. A replaced worker's writes are fenced by its claim epoch. Fencing database writes does not undo an external effect already performed by a tool.
+
+## Mark, then dispatch
+
+Call `sweep` from your own startup or maintenance job. Select `on_stale` explicitly:
+
+- `"error"` finalizes stale running rows, retaining the previous behavior.
+- `"reclaim"` marks eligible rows and returns them for your application to dispatch. Marking fences the old claim; it does not execute the run.
+- Omission retains `"error"` in 0.6 and warns when stale rows are found. The default changes in 0.7.
+
+[//]: # "docs-test: skip - application supplies an active format-2 state store and matching Agent"
+
+```python
+from datetime import timedelta
+
+from dendrux import sweep
+from dendrux.errors import RunNotReclaimableError
+
+async def recover_page(state, agent, cursor=None):
+    page = await sweep(
+        state_store=state,
+        stale_running=timedelta(minutes=2),
+        on_stale="reclaim",
+        max_reclaims=3,
+        max_returned=100,
+        cursor=cursor,
+    )
+    for item in page.reclaimable:
+        try:
+            result = await agent.reclaim(
+                item.run_id, tenant_id=item.tenant_id, item=item,
+            )
+        except RunNotReclaimableError as error:
+            print(item.run_id, "skipped:", error.reason)
+            continue
+        # Route pauses to the same approval/client/input flow as a fresh run.
+        print(item.run_id, result.status.value)
+    return page.cursor
+```
+
+This example dispatches serially and handles `RunNotReclaimableError` per item so one stale dispatch does not block the page. A service can enqueue items to its existing worker system with a finite concurrency bound. Use the Agent with the same name, tools, skills and governance as the original run. Supplying `item=` checks the exact observed claim epoch; a competing claim is refused. Do not blindly retry a stale item.
+
+`tenant_id` is mandatory for `reclaim`, even on a lenient Agent. Use the item's tenant; `None` explicitly selects untenanted runs. A foreign or missing run raises `RunNotFoundError` before changes.
+
+## Bounded scans and attempt limits
+
+`SweepResult` has `stale_running`, `abandoned_waiting`, `reclaimable` and `cursor`. Finalized rows are separate from marked rows. Advance with the returned opaque cursor until it is `None`; the running scan never wraps within one call. Start a later sweep from `None` to revisit earlier ids. A short reclaimable list alone does not prove that the backlog is empty.
+
+| Option | Default | Maximum | Meaning |
+| --- | --- | --- | --- |
+| `batch_size` | 100 | 1,000 | Candidate rows per page |
+| `max_runs` | 10,000 | 100,000 | Candidates inspected per category; fresh rows and lost races count |
+| `max_returned` | 1,000 | 100,000 | Reclaimable items returned |
+| `max_reclaims` | 3 | 32,767 | Attempt limit written by each new mark |
+
+Rediscovering an existing mark preserves its stored limit. A successful reclaim increments the attempt count. Once the limit is exhausted, a later sweep finalizes the stale run as `error` with `failure_reason="reclaim_limit"`.
+
+In reclaim mode, stale format-1 runs are finalized with `stale_running_legacy`. Stale `SingleCall` runs or format-2 runs without a supported loop marker are finalized through the stale error path. They are not returned for reclaim. A pending cancellation wins and finalizes the run as cancelled. `abandoned_waiting=` independently reaps waiting or paused runs only when both `status_changed_at` and `updated_at` exceed the window; repeat sweeps to drain that category.
+
+## What happens to an interrupted tool
+
+Format-2 server calls record an intent before dispatch and commit completion, the observation and the completion event together. Recovery follows the recorded state:
+
+| Durable state | Recovery action |
+| --- | --- |
+| No intent | Run normal validation and approval gates; dispatch only if allowed |
+| Intent is `started`, no completion | Replay automatically only when both the stored call and the current definition declare the tool idempotent; otherwise ask for approval |
+| Completion is stored | Reuse the stored observation; do not run the tool again |
+| Client-tool result is missing | Keep or recreate the client pause; wait for a validated submission |
+| A submission was committed but not consumed | Consume it once, then continue from its durable phase |
+
+For a tool whose external operation is safe to repeat:
+
+```python
+from dendrux import tool
+
+@tool(idempotent=True)
+async def get_order_status(order_id: str) -> str:
+    """Read an order's status without changing it."""
+    return "pending"
+```
+
+The flag is your promise about external effects. Dendrux cannot make a payment or outbound request exactly once. Use an application idempotency key with the external service when it offers one.
+
+### Approval after a crash
+
+An uncertain non-idempotent call pauses with an approval gate whose source is `recovery` and reason is `replay_after_crash`. Show that reason to the operator: the first attempt may have performed the effect even though its result was never committed.
+
+Use the normal `submit_approval` method and the current `pause_id`. Approval permits one further attempt. Denial records `outcome="unknown"` and a failed observation with code `outcome_unknown`; it does not claim the original effect failed. A second crash during the approved attempt can require a new decision. Ordinary validation, deny rules and tool limits still apply.
+
+## Inspect a recovered run
+
+`RunResult.recovery` contains `reclaim_attempts`, `last_reclaimed_at`, `replayed_tool_calls` and `replayed_truncated`. `agent.get_result(run_id, tenant_id=...)` includes the same recovery summary in its wire envelope for a reclaimed run. The replay list is bounded to 100 ids; check its truncation flag. Recovery emits `run.lease_expired`, `run.reclaimed` and, when applicable, `tool.replayed` events. See [Observability](/docs/recipes/observability#what-to-alert-on).
+
+History rebuild refuses incomplete context. The defaults are `Limits.max_rebuild_bytes=16 MiB` and `Limits.max_rebuild_rows=20,000`. A rebuild failure after a claim ends the run as `error` and raises `RunNotReclaimableError`, including reasons such as `history_too_large` or `recovery_state_missing`. Inspect the durable state before trying again.

@@ -50,7 +50,7 @@ async def store():
     from sqlalchemy.ext.asyncio import create_async_engine
 
     from dendrux.db.models import Base
-    from dendrux.runtime.state import SQLAlchemyStateStore
+    from dendrux.runtime.stores._factory import store_for_engine
 
     engine = create_async_engine(
         "sqlite+aiosqlite:///:memory:",
@@ -58,7 +58,7 @@ async def store():
     )
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-    return SQLAlchemyStateStore(engine)
+    return store_for_engine(engine)
 
 
 class TestStoreReadsAreAwareUtc:

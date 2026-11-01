@@ -7,7 +7,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import StatementError
 
 from dendrux import Agent
-from dendrux.errors import PersistenceError
+from dendrux.errors import PersistenceError, SchemaOutOfDateError
 from dendrux.llm.mock import MockLLM
 from dendrux.runtime.runner import _nonprovider_error
 from dendrux.types import LLMResponse, RunStatus
@@ -27,9 +27,9 @@ async def test_result_projection_database_fault_is_wrapped(store, engine):
             text("ALTER TABLE agent_runs RENAME COLUMN output_data TO unavailable_output")
         )
     try:
-        with pytest.raises(PersistenceError) as caught:
+        with pytest.raises(SchemaOutOfDateError, match="dendrux db migrate") as caught:
             await agent.get_result("r", tenant_id=None)
-        assert str(caught.value) == PersistenceError.safe_message
+        assert caught.value.__context__ is None
         assert "SELECT" not in str(caught.value) and "unavailable_output" not in str(caught.value)
     finally:
         async with engine.begin() as conn:

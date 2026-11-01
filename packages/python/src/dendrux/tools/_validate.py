@@ -22,6 +22,7 @@ import json
 import logging
 from typing import TYPE_CHECKING, Any, NamedTuple
 
+from dendrux import _codes
 from dendrux.tools._coerce import (
     ArgumentCoercionError,
     contains_placeholder,
@@ -345,11 +346,7 @@ def invalid_params_result(
 
 def malformed_schema_result(tool_call: ToolCall) -> ToolResult:
     """The ``invalid_tool_schema`` failure: the tool's own schema cannot be validated against."""
-    logger.warning(
-        "tool call refused: code=%s tool=%s",
-        INVALID_TOOL_SCHEMA_CODE,
-        tool_call.name,
-    )
+    _codes.log_code(logger, _codes.INVALID_TOOL_SCHEMA)
     message = (
         f"`{tool_call.name}` cannot be called: its argument schema is malformed. "
         "The call was not made; do not retry it."

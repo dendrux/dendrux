@@ -48,7 +48,7 @@ async def test_runner_finalize_cannot_overwrite_running_newer_claim(store, entry
             rid = (await store.list_runs())[0].id
         epoch = await epoch_of(store, rid)
         assert await store.release_run_claim(rid, status="paused", claim_epoch=epoch)
-        newer = await store.claim_paused_run(rid, expected_status="paused")
+        newer = (await store.claim_paused_run(rid, expected_status="paused")).claim_epoch
         assert newer == epoch + 1
     finally:
         llm.gate.set()
@@ -189,9 +189,11 @@ async def server() -> str:
 
 @pytest.mark.parametrize("entry", ["batch", "decisions", "resume", "resume_stream"])
 @pytest.mark.parametrize("legacy", [False, True])
-async def test_approval_without_token_is_rejected_for_current_and_legacy_pauses(
-    store, entry, legacy
-):
+async def test_approval_tokens_are_required_only_for_pauses_with_generations(store, entry, legacy):
+    if legacy:
+        from tests._fixtures.storage import pin_storage_format
+
+        await pin_storage_format(store._engine, 1)
     a = Agent(
         name="warning",
         prompt="p",
@@ -209,25 +211,34 @@ async def test_approval_without_token_is_rejected_for_current_and_legacy_pauses(
         await store.pause_run(paused.run_id, status="waiting_approval", pause_data=raw)
     from dendrux.types import InputValidationError
 
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always", FutureWarning)
+    async def submit():
         if entry == "resume_stream":
             result, _ = await consume(a.resume_stream(paused.run_id))
+            return result
+        if entry == "batch":
+            return await a.submit_approval(paused.run_id, approved=True)
+        if entry == "decisions":
+            call = paused.pending.tool_calls[0]
+            return await a.submit_approval(
+                paused.run_id, decisions={call.id: ApprovalDecision.approve()}
+            )
+        return await a.resume(paused.run_id)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", FutureWarning)
+        if legacy:
+            assert (await submit()).status == RunStatus.SUCCESS
+        elif entry == "resume_stream":
+            result = await submit()
             assert result.status == RunStatus.ERROR
             assert "pause_id_required" in result.error
         else:
             with pytest.raises(InputValidationError):
-                if entry == "batch":
-                    await a.submit_approval(paused.run_id, approved=True)
-                elif entry == "decisions":
-                    call = paused.pending.tool_calls[0]
-                    await a.submit_approval(
-                        paused.run_id, decisions={call.id: ApprovalDecision.approve()}
-                    )
-                else:
-                    await a.resume(paused.run_id)
+                await submit()
     assert not [w for w in caught if "expected_pause_id" in str(w.message)]
-    assert (await store.get_run(paused.run_id)).status == "waiting_approval"
+    assert (await store.get_run(paused.run_id)).status == (
+        "success" if legacy else "waiting_approval"
+    )
 
 
 @pytest.mark.parametrize("entry", ["submit", "resume", "resume_stream"])
@@ -397,9 +408,10 @@ async def test_omitted_scope_missing_run_is_not_found(store, entry):
 
 
 async def test_legacy_control_override_keeps_fencing_without_false_stop(engine):
-    from dendrux.runtime.state import RunControl, SQLAlchemyStateStore
+    from dendrux.runtime.state import RunControl
+    from dendrux.runtime.stores._factory import store_for_engine
 
-    class OlderControlStore(SQLAlchemyStateStore):
+    class OlderControlStore(type(store_for_engine(engine))):
         async def get_run_control(self, run_id):
             return RunControl(cancel_requested=await self.is_cancel_requested(run_id))
 
@@ -409,20 +421,28 @@ async def test_legacy_control_override_keeps_fencing_without_false_stop(engine):
 
 
 async def test_raw_claimed_entry_can_keep_original_epoch(store):
+    # This fault injection / pause blob exercises the format-1 write path.
+    from tests._fixtures.storage import pin_storage_format
+
+    await pin_storage_format(store._engine, 1)
     from dendrux.runtime.runner import resume_claimed
     from dendrux.runtime.submit import serialize_tool_results
 
     a = agent(store, [tool_call("client_read", pid="a"), LLMResponse(text="must not call")])
     paused = await a.run("go")
-    old = await store.submit_and_claim(
-        paused.run_id,
-        expected_status="waiting_client_tool",
-        submitted_data={"submitted_tool_results": serialize_tool_results([result_for(paused)])},
-    )
+    old = (
+        await store.submit_and_claim(
+            paused.run_id,
+            expected_status="waiting_client_tool",
+            submitted_data={"submitted_tool_results": serialize_tool_results([result_for(paused)])},
+        )
+    ).claim_epoch
     assert await store.release_run_claim(
         paused.run_id, status="waiting_client_tool", claim_epoch=old
     )
-    newer = await store.claim_paused_run(paused.run_id, expected_status="waiting_client_tool")
+    newer = (
+        await store.claim_paused_run(paused.run_id, expected_status="waiting_client_tool")
+    ).claim_epoch
     result = await resume_claimed(
         paused.run_id,
         state_store=store,
@@ -488,7 +508,7 @@ async def test_client_dispatch_rechecks_lowered_cap(store):
 
 
 @pytest.mark.parametrize("streaming", [False, True])
-async def test_governance_warning_points_to_public_call_site(store, streaming):
+async def test_explicit_governance_warn_has_no_future_warning(store, streaming):
     from dendrux import Limits
 
     a = agent(store, [tool_call("client_read", pid="a")], limits=Limits(max_tool_result_bytes=100))
@@ -500,6 +520,7 @@ async def test_governance_warning_points_to_public_call_site(store, streaming):
         state_store=store,
         provider=ScriptedLLM([LLMResponse(text="done")]),
         strict_tenancy=False,
+        on_governance_change="warn",
     )
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always", FutureWarning)
@@ -514,4 +535,4 @@ async def test_governance_warning_points_to_public_call_site(store, streaming):
         else:
             await b.submit_tool_results(paused.run_id, [result_for(paused)])
     changed = [w for w in caught if "Changed governance" in str(w.message)]
-    assert len(changed) == 1 and changed[0].filename == __file__
+    assert not changed

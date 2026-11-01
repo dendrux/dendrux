@@ -13,9 +13,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.selectable import Select
 
 from dendrux import sweep
-from dendrux.db.models import AgentRun, Base, RunEvent
-from dendrux.runtime.state import SQLAlchemyStateStore
-from tests.integration._migration_schema import migration_schema
+from dendrux.db.models import AgentRun, RunEvent
+from dendrux.runtime.stores._factory import store_for_engine
+from tests.integration._migration_schema import create_pre_activation_schema, migration_schema
 from tests.integration._migration_schema import test_database_url as _pg_url
 from tests.integration.test_migration_run_control import _alembic
 
@@ -29,7 +29,7 @@ async def test_default_running_bound_reaches_orphan_after_target_concurrency(sto
                 AgentRun.__table__.insert(),
                 [
                     {
-                        "id": f"live-{i:05}",
+                        "id": f"{i:026d}",
                         "agent_name": "live",
                         "status": "running",
                         "last_progress_at": now,
@@ -40,14 +40,14 @@ async def test_default_running_bound_reaches_orphan_after_target_concurrency(sto
         await conn.execute(
             AgentRun.__table__.insert(),
             {
-                "id": "orphan-newer",
+                "id": "00000000000000000000002000",
                 "agent_name": "lost",
                 "status": "running",
                 "last_progress_at": old,
             },
         )
     result = await sweep(state_store=store, stale_running=dt.timedelta(days=1))
-    assert [r.run_id for r in result.stale_running] == ["orphan-newer"], (
+    assert [r.run_id for r in result.stale_running] == ["00000000000000000000002000"], (
         "default running bound must reach newer orphans behind >1000 live runs"
     )
 
@@ -74,7 +74,7 @@ async def test_sweep_candidate_cap_warns_with_safe_structured_fields(
     records = [r for r in caplog.records if getattr(r, "code", None) == "sweep_cap_reached"]
     assert len(records) == 1, "candidate saturation must never be silent"
     record = records[0]
-    assert record.category == ("waiting" if waiting else "running")
+    assert record.category == ("abandoned_waiting" if waiting else "stale_running")
     assert record.cap == record.inspected == 2
     assert record.levelname == "WARNING"
     assert "cap-" not in record.getMessage()
@@ -175,7 +175,7 @@ async def test_ten_thousand_running_inspections_are_bounded(
 
 async def _prior_schema(engine, count):
     async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(create_pre_activation_schema)
         for name in (
             "ix_agent_runs_sweep_running",
             "ix_agent_runs_sweep_waiting",
@@ -335,7 +335,7 @@ async def test_online_backfill_commits_batches_and_preserves_concurrent_runtime_
                     )
                 ).scalar_one()
                 assert count == 5000, "each bounded backfill must commit independently"
-            runtime = SQLAlchemyStateStore(target)
+            runtime = store_for_engine(target)
             # An insert and a transition ahead of the cursor both set the clock.
             await runtime.create_run("run-new", "new")
             # A raw writer omitting the clock also works behind the cursor:
@@ -462,4 +462,4 @@ except RuntimeError as error:
         async with target.connect() as conn:
             assert (
                 await conn.execute(text("SELECT version_num FROM alembic_version"))
-            ).scalar_one() == "e8f9a0b1c2d3"
+            ).scalar_one() == "f9a0b1c2d3e4"

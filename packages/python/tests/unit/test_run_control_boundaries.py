@@ -35,7 +35,7 @@ async def test_legacy_claim_signature_supports_submit_and_resume(entry):
         on_governance_change="warn",
     )
     if entry == "paused":
-        await store.create_run("seed", "legacy")
+        await store.create_run("00000000000000000000000106", "legacy")
         pause = PauseState(
             agent_name="legacy",
             pending_tool_calls=[],
@@ -45,9 +45,11 @@ async def test_legacy_claim_signature_supports_submit_and_resume(entry):
             trace_order_offset=0,
             usage=UsageStats(),
         )
-        await store.pause_run("seed", status="paused", pause_data=pause.to_dict())
+        await store.pause_run(
+            "00000000000000000000000106", status="paused", pause_data=pause.to_dict()
+        )
         provider._responses = [LLMResponse(text="done")]
-        result = await a.submit_resume("seed")
+        result = await a.submit_resume("00000000000000000000000106")
     else:
         paused = await a.run("go")
         result = await (
@@ -127,7 +129,7 @@ async def test_legacy_claim_signature_is_cached_and_warning_logged_once(monkeypa
 
     monkeypatch.setattr(inspect, "signature", tracked)
     store = RecordingStateStore()
-    for rid in ["first", "second"]:
+    for rid in ["00000000000000000000000111", "00000000000000000000000112"]:
         await store.create_run(rid, "legacy")
         await store.pause_run(rid, status="paused", pause_data={"agent_name": "legacy"})
         await submit.claim_or_raise(store, rid, expected_status=RunStatus.PAUSED)
@@ -148,12 +150,14 @@ async def test_legacy_claim_validation_rechecks_after_claim():
             return epoch
 
     store = InterleavedStore()
-    await store.create_run("r", "legacy")
-    await store.pause_run("r", status="paused", pause_data={"pause_id": "observed"})
+    await store.create_run("00000000000000000000000102", "legacy")
+    await store.pause_run(
+        "00000000000000000000000102", status="paused", pause_data={"pause_id": "observed"}
+    )
     from dendrux.errors import PauseStatusMismatchError
 
     with pytest.raises(PauseStatusMismatchError):
-        await claim_or_raise(store, "r", expected_status=RunStatus.PAUSED)
+        await claim_or_raise(store, "00000000000000000000000102", expected_status=RunStatus.PAUSED)
 
 
 async def test_fenced_recorder_finish_failure_does_not_leave_notifier_open():
@@ -169,9 +173,9 @@ async def test_fenced_recorder_finish_failure_does_not_leave_notifier_open():
 
     notifier = BaseNotifier()
     notifier.on_run_finished = AsyncMock()
-    result = RunResult(run_id="r", status=RunStatus.ERROR)
-    await _finish_fenced_lifecycle("r", result, FailedRecorder(), notifier)
-    notifier.on_run_finished.assert_awaited_once_with("r", result)
+    result = RunResult(run_id="00000000000000000000000102", status=RunStatus.ERROR)
+    await _finish_fenced_lifecycle("00000000000000000000000102", result, FailedRecorder(), notifier)
+    notifier.on_run_finished.assert_awaited_once_with("00000000000000000000000102", result)
 
 
 async def test_cleanup_propagates_pending_anyio_cancellation_after_shield():

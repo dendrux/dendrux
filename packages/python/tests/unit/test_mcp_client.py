@@ -218,7 +218,11 @@ async def test_opaque_auth_suppresses_connect_cleanup_diagnostics(
         await MCPClientAdapter(source).connect()
 
     assert "OPAQUE-CLEANUP-SECRET" not in caplog.text
-    assert "detail suppressed" in caplog.text
+    assert [r.code for r in caplog.records] == [
+        "mcp_transport_cleanup_failed",
+        "mcp_transport_failed",
+    ]
+    assert all(r.count == 1 for r in caplog.records)
 
 
 @pytest.mark.asyncio
@@ -243,7 +247,7 @@ async def test_resolved_credentials_are_redacted_from_connect_failures() -> None
     error = excinfo.value
     assert "RESOLVED-SECRET" not in _rendered_chain(error)
     assert "RESOLVED-SECRET" not in (error.transport_detail or "")
-    assert "[redacted]" in (error.transport_detail or "")
+    assert error.transport_detail == "mcp_transport_failed count=1"
     assert "RESOLVED-SECRET" not in (managed.last_error or "")
     await runtime.close()
 
@@ -286,7 +290,7 @@ async def test_discovery_failure_is_sanitised_like_connect() -> None:
     assert str(error) == "Failed to list tools from MCP source 'remote' (RuntimeError)."
     assert secret not in _rendered_chain(error)
     assert error.__context__ is None
-    assert error.transport_detail == "401 Unauthorized for url '[redacted URL]'"
+    assert error.transport_detail == "mcp_transport_failed count=1"
 
 
 @pytest.mark.asyncio
@@ -420,7 +424,7 @@ async def test_tuple_configured_auth_is_redacted() -> None:
 
     detail = excinfo.value.transport_detail or ""
     assert "svc-password-123" not in detail
-    assert detail == "401 for [redacted]:[redacted]"
+    assert detail == "mcp_transport_failed count=1"
 
 
 @pytest.mark.asyncio
@@ -702,7 +706,7 @@ async def test_rejection_seen_on_the_wire_types_an_sdk_wrapped_failure(status: i
         f"Failed to connect to MCP source 'remote': "
         f"the server rejected its credentials (HTTP {status})."
     )
-    assert error.transport_detail == "MCPError: Server returned an error response"
+    assert error.transport_detail == "mcp_transport_failed count=1"
     assert "HEADER-SECRET" not in _rendered_chain(error)
     assert "TaskGroup" not in _rendered_chain(error)
 
@@ -722,7 +726,7 @@ async def test_only_the_latest_response_status_counts() -> None:
     error = excinfo.value
     assert not isinstance(error, MCPAuthenticationError)
     assert str(error) == "Failed to connect to MCP source 'remote' (ConnectionError)."
-    assert error.transport_detail == "ConnectionError: reset"
+    assert error.transport_detail == "mcp_transport_failed count=1"
 
 
 @pytest.mark.asyncio
@@ -735,7 +739,7 @@ async def test_discovery_does_not_inherit_a_status_recorded_at_connect() -> None
         await adapter.list_tools()
 
     assert not isinstance(excinfo.value, MCPAuthenticationError)
-    assert excinfo.value.transport_detail == "tools/list exploded"
+    assert excinfo.value.transport_detail == "mcp_transport_failed count=1"
 
 
 def test_exception_group_detail_names_the_wrapped_failure() -> None:

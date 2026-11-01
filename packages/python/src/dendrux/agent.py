@@ -32,9 +32,11 @@ from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, overload
 
+from dendrux import _codes
 from dendrux._sentinel import _OMITTED, _OmittedType, _UnsetType
 from dendrux.runtime._entry_checks import entry_checks, require_boolean
-from dendrux.runtime.state import UNSCOPED, TenantScope, require_store_method
+from dendrux.runtime._tenant_checks import _tenant_scope_chosen
+from dendrux.runtime.state import UNSCOPED, ReclaimableRun, TenantScope, require_store_method
 from dendrux.skills._internal import is_script, validate_executor
 from dendrux.skills._session import NAMES, SkillSession, continuation, current
 from dendrux.tool import get_tool_def, is_tool
@@ -80,6 +82,18 @@ if TYPE_CHECKING:
 _agent_logger = logging.getLogger(__name__)
 
 
+_env_url_ignored = False
+_env_url_lock = threading.Lock()
+
+
+def _log_env_url_ignored() -> None:
+    global _env_url_ignored
+    with _env_url_lock:
+        if not _env_url_ignored:
+            _codes.log_code(_agent_logger, _codes.DATABASE_URL_ENV_IGNORED)
+            _env_url_ignored = True
+
+
 def _check_result_read_arguments(run_id: Any, tenant_id: Any) -> None:
     from dendrux.types import _validate_identifier
 
@@ -88,9 +102,7 @@ def _check_result_read_arguments(run_id: Any, tenant_id: Any) -> None:
         if tenant_id is not None:
             _validate_identifier(tenant_id, "tenant_id")
     except ValueError:
-        _agent_logger.warning(
-            "Invalid result read argument", extra={"code": "read_argument_invalid"}
-        )
+        _codes.log_code(_agent_logger, _codes.READ_ARGUMENT_INVALID)
         raise ValueError(
             "Invalid run_id." if not _valid_read_id(run_id) else "Invalid tenant_id."
         ) from None
@@ -205,26 +217,6 @@ def _record_to_run_result(record: Any) -> RunResult:
             if status == RunStatus.SUCCESS
             else None
         ),
-    )
-
-
-def _warn_env_store_deprecated() -> None:
-    """B6 ``DeprecationWarning`` for the implicit DENDRUX_DATABASE_URL store.
-
-    Deduplicated by ``warnings`` per caller location; ``stacklevel`` points at
-    the code that called the Agent method (this function,
-    ``_resolve_state_store``, the Agent method).
-    """
-    import warnings
-
-    warnings.warn(
-        "Agent found no state_store or database_url and fell back to DENDRUX_DATABASE_URL. "
-        "This implicit store is deprecated and is removed in dendrux 0.6. Create one state "
-        "store per process (for example at app startup: "
-        "SQLAlchemyStateStore(create_async_engine(url))) and pass state_store= to every "
-        "Agent. Explicit database_url Agents share a reference-counted pool per URL and options.",
-        DeprecationWarning,
-        stacklevel=4,
     )
 
 
@@ -410,6 +402,7 @@ class Agent:
         limits: Limits | None = ...,
         tool_threads: int = ...,
         on_governance_change: Literal["warn", "raise"] = ...,
+        lease_interval: timedelta = ...,
     ) -> None: ...
 
     @overload
@@ -445,6 +438,7 @@ class Agent:
         limits: Limits | None = ...,
         tool_threads: int = ...,
         on_governance_change: Literal["warn", "raise"] = ...,
+        lease_interval: timedelta = ...,
     ) -> None: ...
 
     def __init__(
@@ -475,10 +469,11 @@ class Agent:
         before_tool: BeforeToolHook | None = None,
         images: ImagePolicy | None = None,
         blob_store: BlobStore | None = None,
-        strict_tenancy: bool | _UnsetType = _UNSET,
+        strict_tenancy: bool = True,
         limits: Limits | None = None,
         tool_threads: int = 8,
-        on_governance_change: Literal["warn", "raise"] | _UnsetType = _UNSET,
+        on_governance_change: Literal["warn", "raise"] = "raise",
+        lease_interval: timedelta = timedelta(seconds=30),
     ) -> None:
         # --- Subclass guard: block class-level provider ---
         from dendrux.llm.base import LLMProvider as _LLMBase
@@ -489,6 +484,11 @@ class Agent:
                 "provider must be passed to __init__(), not set as a class attribute. "
                 "Class-level provider creates a live HTTP client at class definition time."
             )
+
+        if not isinstance(lease_interval, timedelta) or lease_interval < timedelta(seconds=5):
+            _codes.log_code(logging.getLogger(__name__), _codes.LEASE_INTERVAL, run_id=None)
+            raise ValueError("lease_interval must be a timedelta of at least 5 seconds")
+        self.lease_interval = lease_interval
 
         # --- Identity ---
         if not isinstance(name, _UnsetType):
@@ -598,37 +598,31 @@ class Agent:
             raise ValueError(
                 "database_url and state_store are mutually exclusive. Pass one or the other."
             )
-        if (
-            database_options is not None
-            and database_url is None
-            and not os.environ.get("DENDRUX_DATABASE_URL")
-        ):
+        if database_options is not None and database_url is None:
             raise ValueError("database_options requires database_url.")
 
         self._database_url = database_url
-        self._database_options = database_options or {}
+        from dendrux.db._engine_options import split_database_options
+
+        self._database_options, self._store_options = split_database_options(database_options)
+        if state_store is not None:
+            from dendrux.runtime._capabilities import validate_capabilities
+
+            validate_capabilities(state_store)
         self._state_store = state_store
 
     def _configure_trust(
         self,
-        strict_tenancy: bool | _UnsetType,
+        strict_tenancy: bool,
         limits: Limits | None,
         tool_threads: int,
-        on_governance_change: Literal["warn", "raise"] | _UnsetType,
+        on_governance_change: Literal["warn", "raise"],
     ) -> None:
         """Validate and retain the per-Agent governance policy."""
         # --- Trust (0.5.0): stored here, enforced by the runtime checks ---
         from dendrux.tools._lookups import make_call_limiter
         from dendrux.types import Limits as _Limits
 
-        # "Not chosen" is kept apart from an explicit False / "warn": the 0.6
-        # default flips warn only developers who did not choose.
-        self._strict_tenancy_chosen: bool = not isinstance(strict_tenancy, _UnsetType)
-        self._on_governance_change_chosen: bool = not isinstance(on_governance_change, _UnsetType)
-        if isinstance(strict_tenancy, _UnsetType):
-            strict_tenancy = False
-        if isinstance(on_governance_change, _UnsetType):
-            on_governance_change = "warn"
         if not isinstance(strict_tenancy, bool):
             raise ValueError(f"Agent '{self.name}' strict_tenancy must be a bool.")
         if limits is not None and not isinstance(limits, _Limits):
@@ -651,6 +645,7 @@ class Agent:
         self._tool_threads: int = tool_threads
         self._on_governance_change: Literal["warn", "raise"] = on_governance_change
         self._tool_call_limiter: Any = make_call_limiter(tool_threads)
+        self._limits_checked_for: StateStore | None = None
 
     def _configure_images(self, images: ImagePolicy | None, blob_store: BlobStore | None) -> None:
         """Validate image services and initialize their store lifecycle."""
@@ -1158,18 +1153,22 @@ class Agent:
     # ------------------------------------------------------------------
 
     async def _resolve_state_store(self) -> StateStore | None:
+        """The state store, after a one-time check that the configured limits fit it."""
+        from dendrux.runtime.stores._limits_fit import ensure_agent_limits_fit
+
+        store = await self._open_state_store()
+        await ensure_agent_limits_fit(self, store)
+        return store
+
+    async def _open_state_store(self) -> StateStore | None:
         """Lazily resolve the state store from config.
 
         Resolution order:
           1. Explicit state_store from constructor → returned as-is
           2. database_url from constructor → reference-counted shared engine
-          3. DENDRUX_DATABASE_URL env var → shared global engine
-          4. None (ephemeral mode)
+          3. None (ephemeral mode); DENDRUX_DATABASE_URL is ignored
 
-        Ownership rule:
-          - Explicit database_url acquires a shared reference released by close().
-          - Env-var path uses the shared singleton from get_engine() — NOT
-            owned by this agent, NOT disposed by close().
+        Explicit database_url acquires a shared reference released by close().
         """
         if self._state_store is not None:
             return self._state_store
@@ -1179,7 +1178,7 @@ class Agent:
 
         from dendrux.db._schema_check import was_verified
         from dendrux.db._shared_pool import release
-        from dendrux.runtime.state import SQLAlchemyStateStore
+        from dendrux.runtime.stores._factory import store_for_engine
 
         if self._database_url is not None:
             with self._store_lock:
@@ -1198,7 +1197,7 @@ class Agent:
                     closed = False  # a concurrent first use published first
                 else:
                     self._private_engine = engine
-                    self._lazy_store = SQLAlchemyStateStore(engine)
+                    self._lazy_store = store_for_engine(engine, **self._store_options)
                     return self._lazy_store
             await release(engine)
             if closed:
@@ -1206,14 +1205,8 @@ class Agent:
             assert self._lazy_store is not None
             return self._lazy_store
 
-        env_url = os.environ.get("DENDRUX_DATABASE_URL")
-        if env_url is not None:
-            _warn_env_store_deprecated()
-            engine = await _get_env_engine(env_url, self._database_options)
-            if not was_verified(engine):
-                await _verify_schema_initialized(engine, env_url)
-            self._lazy_store = SQLAlchemyStateStore(engine)
-            return self._lazy_store
+        if os.environ.get("DENDRUX_DATABASE_URL") is not None:
+            _log_env_url_ignored()
 
         return None
 
@@ -1346,8 +1339,8 @@ class Agent:
                 with this key already exists and completed, the cached result is
                 returned. If still active, RunAlreadyActiveError is raised. If the
                 same key is reused with different input, IdempotencyConflictError
-                is raised. Requires persistence (database_url, state_store, or
-                DENDRUX_DATABASE_URL). The hash includes ``history``, ``context``
+                is raised. Requires persistence (database_url or state_store).
+                The hash includes ``history``, ``context``
                 and the ``runs`` / ``replay_last`` / ``replay_reasoning`` knobs —
                 same input with a different prefix is a different request.
             **kwargs: Forwarded to the LLM provider. Pass ``model=`` to override
@@ -1382,6 +1375,7 @@ class Agent:
             DelegationDepthExceededError: If this run would exceed the inherited
                 max_delegation_depth from a parent run.
         """
+        requested_tenant_id = tenant_id
         tenant_id = entry_checks(
             self,
             "run",
@@ -1423,8 +1417,8 @@ class Agent:
 
         if idempotency_key is not None and store is None:
             raise ValueError(
-                "idempotency_key requires persistence (database_url, state_store, "
-                "or DENDRUX_DATABASE_URL). Idempotency cannot work without durable state."
+                "idempotency_key requires persistence (database_url or state_store). "
+                "Idempotency cannot work without durable state."
             )
 
         from dendrux.runtime.runner import run as runner_run
@@ -1445,7 +1439,7 @@ class Agent:
             replay_last=replay_last,
             replay_reasoning=replay_reasoning,
             state_store=store,
-            tenant_id=tenant_id,
+            tenant_id=requested_tenant_id,
             metadata=metadata,
             extra_notifier=notifier,
             idempotency_key=idempotency_key,
@@ -1489,6 +1483,7 @@ class Agent:
                 source run is not terminal, or if the source run was
                 SingleCall.
         """
+        requested_tenant_id = tenant_id
         tenant_id = entry_checks(
             self,
             "retry",
@@ -1505,8 +1500,8 @@ class Agent:
 
         if store is None:
             raise ValueError(
-                "retry() requires persistence (database_url, state_store, "
-                "or DENDRUX_DATABASE_URL). Retry reads traces from the original run."
+                "retry() requires persistence (database_url or state_store). "
+                "Retry reads traces from the original run."
             )
 
         from dendrux.runtime.runner import retry as runner_retry
@@ -1516,11 +1511,42 @@ class Agent:
             agent=self,
             provider=provider,
             state_store=store,
-            tenant_id=tenant_id,
+            tenant_id=requested_tenant_id,
             metadata=metadata,
             extra_notifier=notifier,
             **kwargs,
         )
+
+    async def reclaim(
+        self,
+        run_id: str,
+        *,
+        tenant_id: TenantScope | _OmittedType = _OMITTED,
+        notifier: LoopNotifier | None = None,
+        item: ReclaimableRun | None = None,
+    ) -> RunResult:
+        """Continue a marked ReAct run from its last committed checkpoint.
+
+        Call ``sweep(on_stale="reclaim")`` first. Passing its ``item`` fences
+        this attempt to that exact mark. Omitting tenant scope raises
+        TenantScopeRequiredError. A missing or foreign run raises
+        RunNotFoundError without changing the run.
+        Interrupted non-idempotent tools pause for approval before replay.
+        """
+        from dendrux.errors import PersistenceNotConfiguredError, TenantScopeRequiredError
+        from dendrux.runtime._reclaim import reclaim
+
+        if item is not None and item.run_id != run_id:
+            raise ValueError("run_id must equal item.run_id")
+        if isinstance(tenant_id, _OmittedType):
+            _codes.log_code(_agent_logger, _codes.TENANT_SCOPE_REQUIRED, run_id=run_id)
+            raise TenantScopeRequiredError("reclaim")
+        tenant_id = entry_checks(self, "resume", tenant_id, default_tenant=UNSCOPED, run_id=run_id)
+        self._require_provider()
+        store = await self._resolve_state_store()
+        if store is None:
+            raise PersistenceNotConfiguredError()
+        return await reclaim(self, store, run_id, tenant_id=tenant_id, item=item, notifier=notifier)
 
     async def resume(
         self,
@@ -1549,9 +1575,10 @@ class Agent:
             expected_pause_id: Current pause generation; stale submissions are rejected.
             notifier: Optional additional loop notifier. Composed with
                 PersistenceRecorder internally.
-            tenant_id: Omitted = no tenant check. Otherwise the run must belong
-                to this tenant (``None`` = untenanted) or ``RunNotFoundError``
-                is raised before anything is written.
+            tenant_id: Required for agents with persistence under strict tenancy
+                (the default). The run must
+                belong to this tenant (``None`` = untenanted), otherwise
+                ``RunNotFoundError`` is raised before anything is written.
 
         Returns:
             RunResult with updated status.
@@ -1561,6 +1588,7 @@ class Agent:
                 both args provided, or neither provided.
             RunNotFoundError: ``run_id`` is outside ``tenant_id``.
         """
+        tenant_explicit = _tenant_scope_chosen(tenant_id)
         tenant_id = entry_checks(
             self,
             "resume",
@@ -1596,6 +1624,7 @@ class Agent:
                 provider=provider,
                 extra_notifier=notifier,
                 expected_pause_id=expected_pause_id,
+                _tenant_explicit=tenant_explicit,
             )
         if user_input is not None:
             return await resume_with_input(
@@ -1606,6 +1635,7 @@ class Agent:
                 provider=provider,
                 extra_notifier=notifier,
                 expected_pause_id=expected_pause_id,
+                _tenant_explicit=tenant_explicit,
             )
         # No-arg resume — approve path. Runner validates status is
         # WAITING_APPROVAL and executes pending tools.
@@ -1617,6 +1647,7 @@ class Agent:
             provider=provider,
             extra_notifier=notifier,
             expected_pause_id=expected_pause_id,
+            _tenant_explicit=tenant_explicit,
         )
 
     async def _await_claimed_task(
@@ -1662,12 +1693,14 @@ class Agent:
                 ``ToolResult.images`` are validated and stored before the claim; an image error
                 (``ImageError``, ``UnsupportedModalityError``) raises with the
                 run still waiting.
-            expected_pause_id: Current pause generation; required when approving.
-                Stale or missing approval generations are rejected before claiming.
+            expected_pause_id: Current pause generation, required when one is stored
+                and either strict tenancy or approval applies. Generation-less
+                legacy pauses may omit it; stale tokens are rejected before claiming.
             notifier: Optional additional notifier composed during resume.
-            tenant_id: Omitted = no tenant check. Otherwise the run must belong
-                to this tenant (``None`` = untenanted) or ``RunNotFoundError``
-                is raised before anything is written.
+            tenant_id: Required for agents with persistence under strict tenancy
+                (the default). The run must
+                belong to this tenant (``None`` = untenanted), otherwise
+                ``RunNotFoundError`` is raised before anything is written.
 
         Returns:
             :class:`RunResult` from the resumed loop.
@@ -1682,6 +1715,7 @@ class Agent:
             RunAlreadyTerminalError: run already reached a terminal state.
             InvalidToolResultError: results don't match pending calls.
         """
+        tenant_explicit = _tenant_scope_chosen(tenant_id)
         tenant_id = entry_checks(
             self,
             "submit_tool_results",
@@ -1709,9 +1743,9 @@ class Agent:
         skill_session = await continuation(self, store, run_id)
         with skill_session.bind():
             pause = await validate_tool_results(store, run_id, results)
-            from dendrux.runtime.submit import warn_missing_pause_id
+            from dendrux.runtime.submit import require_pause_id
 
-            warn_missing_pause_id(self, expected_pause_id, pause_id=pause.pause_id)
+            require_pause_id(self, expected_pause_id, pause_id=pause.pause_id, run_id=run_id)
             results = await prepare_client_results(self, run_id, pause, results)
             claim_kwargs: dict[str, Any] = {}
             if any(r.images for r in results):
@@ -1745,6 +1779,7 @@ class Agent:
                     provider=provider,
                     extra_notifier=notifier,
                     pre_claim_status=RunStatus.WAITING_CLIENT_TOOL.value,
+                    _tenant_explicit=tenant_explicit,
                 ),
             )
             return await self._await_claimed_task(task, store, run_id)
@@ -1767,12 +1802,14 @@ class Agent:
             run_id: A run in status ``WAITING_HUMAN_INPUT``.
             text: The user's clarification answer: a string, or strings and
                 images (ingested before the claim).
-            expected_pause_id: Current pause generation; required when approving.
-                Stale or missing approval generations are rejected before claiming.
+            expected_pause_id: Current pause generation, required when one is stored
+                and either strict tenancy or approval applies. Generation-less
+                legacy pauses may omit it; stale tokens are rejected before claiming.
             notifier: Optional additional notifier composed during resume.
-            tenant_id: Omitted = no tenant check. Otherwise the run must belong
-                to this tenant (``None`` = untenanted) or ``RunNotFoundError``
-                is raised before anything is written.
+            tenant_id: Required for agents with persistence under strict tenancy
+                (the default). The run must
+                belong to this tenant (``None`` = untenanted), otherwise
+                ``RunNotFoundError`` is raised before anything is written.
 
         Raises:
             PersistenceNotConfiguredError, RunNotFoundError (also when
@@ -1780,6 +1817,7 @@ class Agent:
             PauseStatusMismatchError, RunAlreadyClaimedError,
             RunAlreadyTerminalError.
         """
+        tenant_explicit = _tenant_scope_chosen(tenant_id)
         tenant_id = entry_checks(
             self,
             "submit_input",
@@ -1804,6 +1842,17 @@ class Agent:
         await _require_run_in_scope(store, run_id, tenant_id)
         skill_session = await continuation(self, store, run_id)
         with skill_session.bind():
+            from dendrux.runtime.submit import require_pause_id
+
+            raw = await store.get_pause_state(run_id)
+            if raw is not None:
+                require_pause_id(
+                    self,
+                    expected_pause_id,
+                    pause_id=raw.get("pause_id"),
+                    store=store,
+                    run_id=run_id,
+                )
             submitted: dict[str, Any] = {"submitted_user_input": projection}
             claim_kwargs: dict[str, Any] = {}
             if items:
@@ -1834,6 +1883,7 @@ class Agent:
                     provider=provider,
                     extra_notifier=notifier,
                     pre_claim_status=RunStatus.WAITING_HUMAN_INPUT.value,
+                    _tenant_explicit=tenant_explicit,
                 ),
             )
             return await self._await_claimed_task(task, store, run_id)
@@ -1883,12 +1933,14 @@ class Agent:
             approved: Whole-batch decision.
             decisions: Per-call decisions keyed by tool call id.
             rejection_reason: Reason used with ``approved=False``.
-            expected_pause_id: Current pause generation; required when approving.
-                Stale or missing approval generations are rejected before claiming.
+            expected_pause_id: Current pause generation, required when one is stored
+                and either strict tenancy or approval applies. Generation-less
+                legacy pauses may omit it; stale tokens are rejected before claiming.
             notifier: Optional additional notifier composed during resume.
-            tenant_id: Omitted = no tenant check. Otherwise the run must belong
-                to this tenant (``None`` = untenanted) or ``RunNotFoundError``
-                is raised before anything is written.
+            tenant_id: Required for agents with persistence under strict tenancy
+                (the default). The run must
+                belong to this tenant (``None`` = untenanted), otherwise
+                ``RunNotFoundError`` is raised before anything is written.
 
         Raises:
             ValueError: invalid argument combination or decision ids.
@@ -1898,6 +1950,7 @@ class Agent:
             RunAlreadyTerminalError.
         """
         require_boolean(approved, "approved", optional=True)
+        tenant_explicit = _tenant_scope_chosen(tenant_id)
         tenant_id = entry_checks(
             self,
             "submit_approval",
@@ -1916,11 +1969,11 @@ class Agent:
             normalize_decisions,
             preflight_status,
             raise_for_non_paused_status,
+            require_pause_id,
             serialize_decisions,
             serialize_tool_results,
             validate_approval_decisions,
             validate_denial_results,
-            warn_missing_pause_id,
         )
         from dendrux.types import PauseState, RunStatus
 
@@ -1957,11 +2010,12 @@ class Agent:
                 validate_denial_results(
                     self, run_id, decision_denial_results(pause_state, decision_map)
                 )
-                warn_missing_pause_id(
+                require_pause_id(
                     self,
                     expected_pause_id,
                     pause_id=pause_state.pause_id,
                     approval=any(decision.approved for decision in decision_map.values()),
+                    run_id=run_id,
                 )
 
                 def same_pause_generation(current: dict[str, Any]) -> None:
@@ -1997,6 +2051,7 @@ class Agent:
                         provider=provider,
                         extra_notifier=notifier,
                         pre_claim_status=RunStatus.WAITING_APPROVAL.value,
+                        _tenant_explicit=tenant_explicit,
                     ),
                 )
                 return await self._await_claimed_task(task, store, run_id)
@@ -2021,6 +2076,7 @@ class Agent:
                         agent=self,
                         provider=provider,
                         extra_notifier=notifier,
+                        _tenant_explicit=tenant_explicit,
                     ),
                 )
                 return await self._await_claimed_task(task, store, run_id)
@@ -2032,7 +2088,7 @@ class Agent:
             if raw_pause is None:
                 await raise_for_non_paused_status(store, run_id)
             pause_state = PauseState.from_dict(raw_pause)
-            warn_missing_pause_id(self, expected_pause_id, pause_id=pause_state.pause_id)
+            require_pause_id(self, expected_pause_id, pause_id=pause_state.pause_id, run_id=run_id)
             synthetic = build_rejection_results(pause_state, rejection_reason)
             validate_denial_results(self, run_id, synthetic)
             epoch = await claim_or_raise(
@@ -2058,6 +2114,7 @@ class Agent:
                     provider=provider,
                     extra_notifier=notifier,
                     pre_claim_status=RunStatus.WAITING_APPROVAL.value,
+                    _tenant_explicit=tenant_explicit,
                 ),
             )
             return await self._await_claimed_task(task, store, run_id)
@@ -2073,7 +2130,7 @@ class Agent:
         from dendrux.errors import PersistenceNotConfiguredError, RunNotFoundError
         from dendrux.guardrails._engine import deanonymize_text
         from dendrux.runtime._pending import _PendingReader
-        from dendrux.runtime.runner import _cached_output, _public_meta
+        from dendrux.runtime.runner import _cached_output, _public_meta, _recovery_info
 
         _check_result_read_arguments(run_id, tenant_id)
         require_boolean(include_pii, "include_pii")
@@ -2090,6 +2147,7 @@ class Agent:
         if record is None or record.agent_name != self.name:
             raise RunNotFoundError(run_id)
         result = _record_to_run_result(record)
+        result.recovery = await _recovery_info(store, record)
         mapping = await facade.get_pii_mapping(run_id, tenant_id=tenant_id) or {}
         result.answer = deanonymize_text(record.answer, mapping)[0]
         result._wire_pii_mapping = mapping
@@ -2152,9 +2210,14 @@ class Agent:
           configured DB. Raises ``PersistenceNotConfiguredError``.
 
         ``cascade=True`` also cancels every non-terminal descendant run
-        (delegated child runs), deepest first and ``run_id`` last, over a
-        point-in-time snapshot of the subtree: a child created after the
-        snapshot is not included. Per-run outcomes are listed in
+        (delegated child runs), deepest first and ``run_id`` last. Each frontier
+        is durably marked before its children are scanned in pages of 500. A
+        child already being created commits before the mark and is included;
+        later child admission is refused. Traversal uses the shared subtree accounting
+        bound, ``Budget.max_subtree_nodes`` (default 10,000); reaching the bound with
+        further descendants sets ``meta["cascade_truncated"]`` and logs
+        ``cascade_truncated``. Legacy custom stores without frontier methods
+        retain snapshot semantics. Per-run outcomes are listed in
         ``meta["cascade"]`` as ``{"run_id", "outcome"}`` with outcome
         ``cancelled`` (finalized now), ``cancel_requested`` (running;
         stops at its next checkpoint) or ``terminal``.
@@ -2162,7 +2225,8 @@ class Agent:
         ``tenant_id``: when given, ``run_id`` must belong to exactly that
         tenant (``None`` = untenanted) or ``RunNotFoundError`` is raised,
         and the cascade only reaches descendants of the same tenant.
-        Omitted means unscoped (trusted single-tenant use).
+        Omitted means an unscoped root lookup; the cascade still stays inside
+        the root's tenant (including an untenanted root).
 
         Returning is *not* confirmation that the run stopped. A result
         with a non-terminal ``status`` and ``meta["cancel_requested"]``
@@ -2200,75 +2264,46 @@ class Agent:
         outcomes: list[dict[str, str]] = []
         cascade_count = 0
         to_signal: list[str] = []
-        root_outcome = None
-        root_signalled = False
-        if cascade and record.status not in _TERMINAL_STATUS_VALUES:
-            # A child can share its task with the root. Persist the root's
-            # request before the first page can interrupt that shared task.
-            root_outcome = await self._cancel_one(store, run_id, signal=False)
+        frontier_signals = (
+            cascade
+            and callable(getattr(store, "mark_cancel_requested", None))
+            and callable(getattr(store, "get_children_page", None))
+        )
+        traversal_truncated = False
         if cascade:
-            page_reader = getattr(store, "get_descendant_page", None)
-            if page_reader is not None:
-                after = None
-                while True:
-                    page = await page_reader(run_id, after=after, tenant_id=tenant_id)
-                    for rid in page:
-                        outcome = await self._cancel_one(store, rid, signal=False)
-                        cascade_count += 1
-                        if len(outcomes) < 999:
-                            outcomes.append({"run_id": rid, "outcome": outcome})
-                        if outcome != "terminal":
-                            to_signal.append(rid)
-                    # Register both root and child interrupts before the shared
-                    # task reaches its next checkpoint.
-                    if (
-                        root_outcome is not None
-                        and root_outcome != "terminal"
-                        and not root_signalled
-                    ):
-                        self._task_manager.cancel(run_id)
-                        root_signalled = True
-                    for rid in to_signal:
-                        self._task_manager.cancel(rid)
-                    to_signal.clear()
-                    if len(page) < 500:
-                        break
-                    after = page[-1]
-            else:
-                # Compatibility with stores predating paged descendant reads.
-                subtree = await require_store_method(store, "get_subtree")(
-                    run_id, tenant_id=tenant_id
-                )
-                if subtree is not None:
-                    for rid in _cascade_order(subtree)[:-1]:
-                        outcome = await self._cancel_one(store, rid, signal=False)
-                        cascade_count += 1
-                        if len(outcomes) < 999:
-                            outcomes.append({"run_id": rid, "outcome": outcome})
-                        if outcome != "terminal":
-                            to_signal.append(rid)
+            levels, traversal_truncated = await self._mark_cancel_subtree(
+                store, run_id, tenant_id=record.tenant_id
+            )
+            for level in reversed(levels):
+                for rid in level:
+                    if rid == run_id:
+                        continue
+                    outcome = await self._cancel_one(store, rid, signal=False)
+                    cascade_count += 1
+                    if len(outcomes) < 999:
+                        outcomes.append({"run_id": rid, "outcome": outcome})
+                    if outcome != "terminal" and not frontier_signals:
+                        to_signal.append(rid)
 
         if record.status in _TERMINAL_STATUS_VALUES:
-            for rid in to_signal:
-                self._task_manager.cancel(rid)
+            if cascade:
+                record = await store.get_run(run_id)
+                if record is None:  # pragma: no cover — concurrent deletion
+                    raise RunNotFoundError(run_id)
             result = _record_to_run_result(record)
             outcomes.append({"run_id": run_id, "outcome": "terminal"})
         else:
-            outcome = root_outcome or await self._cancel_one(store, run_id, signal=False)
+            outcome = await self._cancel_one(store, run_id, signal=False)
             outcomes.append({"run_id": run_id, "outcome": outcome})
             record = await store.get_run(run_id)
             if record is None:  # pragma: no cover — we just preflight-checked
                 raise RunNotFoundError(run_id)
-            # In-process signals last, after the durable request is recorded
-            # and the returned snapshot is read: a locally owned run or task is
-            # preempted from here on, and the returned RunResult
-            # deterministically reflects "requested" (non-terminal status +
-            # meta.cancel_requested) rather than racing the loop's own finalize.
-            for rid in to_signal:
-                self._task_manager.cancel(rid)
-            if not root_signalled:
-                self._task_manager.cancel(run_id)
+            if outcome != "terminal" and not frontier_signals:
+                to_signal.append(run_id)
             result = _record_to_run_result(record)
+        from dendrux.runtime.runner import _recovery_info
+
+        result.recovery = await _recovery_info(store, record)
         if result.status.value in _TERMINAL_STATUS_VALUES:
             from dendrux.runtime.runner import _attach_undelivered_notes
 
@@ -2276,8 +2311,79 @@ class Agent:
         if cascade:
             result.meta["cascade"] = outcomes
             result.meta["cascade_count"] = cascade_count + 1
-            result.meta["cascade_truncated"] = cascade_count + 1 > len(outcomes)
+            result.meta["cascade_truncated"] = traversal_truncated or cascade_count + 1 > len(
+                outcomes
+            )
+        # Non-cascade and legacy stores signal after the durable request and snapshot.
+        for rid in to_signal:
+            self._task_manager.cancel(rid)
         return result
+
+    async def _mark_cancel_subtree(
+        self, store: StateStore, run_id: str, *, tenant_id: str | None
+    ) -> tuple[list[list[str]], bool]:
+        from dendrux.types import Budget
+
+        limit = self._budget.max_subtree_nodes if self._budget else Budget.max_subtree_nodes
+        mark = getattr(store, "mark_cancel_requested", None)
+        children = getattr(store, "get_children_page", None)
+        if not callable(mark) or not callable(children):
+            # Legacy custom stores retain their snapshot API and admission semantics.
+            subtree = await require_store_method(store, "get_subtree")(run_id, tenant_id=tenant_id)
+            levels: list[list[str]] = [[run_id]]
+            nodes = (
+                sorted(
+                    (node for node in subtree.nodes if node.run.id != run_id),
+                    key=lambda node: node.depth,
+                )
+                if subtree is not None
+                else []
+            )
+            by_depth = {0: [run_id]}
+            for node in nodes[: limit - 1]:
+                by_depth.setdefault(node.depth, []).append(node.run.id)
+            levels = [by_depth[depth] for depth in sorted(by_depth)]
+            truncated = len(nodes) + 1 > limit
+        else:
+            levels = [[run_id]]
+            visited = {run_id}
+            frontier = levels[0]
+            truncated = False
+            while frontier:
+                # Wait for creators holding parent FOR SHARE before scanning committed children.
+                marked = await mark(frontier, tenant_id=tenant_id)
+                if marked:
+                    for rid in frontier:
+                        self._task_manager.cancel(rid)
+                if truncated:
+                    break
+                following: list[str] = []
+                after = None
+                while True:
+                    page = await children(frontier, after=after, limit=500, tenant_id=tenant_id)
+                    for child in page:
+                        if child in visited:
+                            continue
+                        if len(visited) >= limit:
+                            truncated = True
+                            break
+                        visited.add(child)
+                        following.append(child)
+                    if truncated or len(page) < 500:
+                        break
+                    after = page[-1]
+                if following:
+                    levels.append(following)
+                frontier = following
+        if truncated:
+            _codes.log_code(
+                _agent_logger,
+                _codes.CASCADE_TRUNCATED,
+                run_id=run_id,
+                limit=limit,
+                count=sum(len(level) for level in levels),
+            )
+        return levels, truncated
 
     async def _cancel_one(self, store: StateStore, run_id: str, *, signal: bool = True) -> str:
         """Cancel one run: set the flag, CAS-finalize it if paused, signal in-process."""
@@ -2441,12 +2547,14 @@ class Agent:
 
         Args:
             run_id: A run in status ``PAUSED``.
-            expected_pause_id: Current pause generation; required when approving.
-                Stale or missing approval generations are rejected before claiming.
+            expected_pause_id: Current pause generation, required when one is stored
+                and either strict tenancy or approval applies. Generation-less
+                legacy pauses may omit it; stale tokens are rejected before claiming.
             notifier: Optional additional notifier composed during resume.
-            tenant_id: Omitted = no tenant check. Otherwise the run must belong
-                to this tenant (``None`` = untenanted) or ``RunNotFoundError``
-                is raised before anything is written.
+            tenant_id: Required for agents with persistence under strict tenancy
+                (the default). The run must
+                belong to this tenant (``None`` = untenanted), otherwise
+                ``RunNotFoundError`` is raised before anything is written.
 
         Raises:
             PersistenceNotConfiguredError, RunNotFoundError (also when
@@ -2455,6 +2563,7 @@ class Agent:
             WAITING_APPROVAL), RunAlreadyClaimedError,
             RunAlreadyTerminalError.
         """
+        tenant_explicit = _tenant_scope_chosen(tenant_id)
         tenant_id = entry_checks(
             self, "submit_resume", tenant_id, default_tenant=UNSCOPED, run_id=run_id
         )
@@ -2489,6 +2598,7 @@ class Agent:
                     agent=self,
                     provider=provider,
                     extra_notifier=notifier,
+                    _tenant_explicit=tenant_explicit,
                 ),
             )
             return await self._await_claimed_task(task, store, run_id)
@@ -2580,11 +2690,7 @@ class Agent:
         if _accepts_kwarg(add_note, "max_notes"):  # custom stores written before 0.5.0
             note_kwargs["max_notes"] = self._limits.max_notes_per_run
         else:
-            _agent_logger.warning(
-                "Custom store does not enforce the note cap: run_id=%s code=note_cap_unenforced",
-                run_id,
-                extra={"run_id": run_id, "code": "note_cap_unenforced"},
-            )
+            _codes.log_code(_agent_logger, _codes.NOTE_CAP_UNENFORCED, run_id=run_id)
         note_id = generate_ulid()
         if await add_note(
             run_id,
@@ -2737,6 +2843,7 @@ class Agent:
         Raises:
             ValueError: If no provider is configured, or if ``history`` is invalid.
         """
+        requested_tenant_id = tenant_id
         tenant_id = entry_checks(
             self,
             "stream",
@@ -2784,7 +2891,7 @@ class Agent:
             replay_last=replay_last,
             replay_reasoning=replay_reasoning,
             state_store_resolver=self._resolve_state_store,
-            tenant_id=tenant_id,
+            tenant_id=requested_tenant_id,
             metadata=metadata,
             extra_notifier=notifier,
             idempotency_key=idempotency_key,
@@ -2825,9 +2932,10 @@ class Agent:
             user_input: Clarification answer (human-in-the-loop runs).
             expected_pause_id: Current pause generation; stale submissions are rejected.
             notifier: Optional additional loop notifier.
-            tenant_id: Omitted = no tenant check. Otherwise the run must belong
-                to this tenant (``None`` = untenanted) or ``RunNotFoundError``
-                is raised before anything is written.
+            tenant_id: Required for agents with persistence under strict tenancy
+                (the default). The run must
+                belong to this tenant (``None`` = untenanted), otherwise
+                ``RunNotFoundError`` is raised before anything is written.
 
         Returns:
             RunStream — async iterable of RunEvent objects.
@@ -2838,6 +2946,7 @@ class Agent:
                 event, when ``run_id`` is outside ``tenant_id``. The run is
                 left untouched (the stream's close-time cleanup is a no-op).
         """
+        tenant_explicit = _tenant_scope_chosen(tenant_id)
         tenant_id = entry_checks(
             self,
             "resume_stream",
@@ -2857,7 +2966,6 @@ class Agent:
             raise ValueError("Cannot provide both tool_results and user_input to resume_stream().")
 
         from dendrux.runtime.runner import resume_stream as runner_resume_stream
-        from dendrux.runtime.submit import capture_warning_location
 
         stream = runner_resume_stream(
             run_id,
@@ -2868,7 +2976,7 @@ class Agent:
             user_input=user_input,
             extra_notifier=notifier,
             expected_pause_id=expected_pause_id,
-            warning_location=capture_warning_location(),
+            _tenant_explicit=tenant_explicit,
         )
         return self._tenant_checked_stream(stream, run_id, tenant_id)
 
@@ -3263,9 +3371,6 @@ class Agent:
         """Close MCP sources, provider, and agent-owned engine.
 
         Releases this Agent's shared engine reference for an explicit database_url.
-        The shared global engine (from DENDRUX_DATABASE_URL env var) is NOT
-        owned by this agent and is left untouched.
-
         Use ``MCPHost`` when sharing MCP sources across agents; its leases are
         safe to close per agent and the host remains application-owned. A
         directly shared ``MCPServer`` is not safe to close per request.
@@ -3330,12 +3435,3 @@ class Agent:
             f"Agent(name={self.name!r}, model={self.model!r}, "
             f"tools={len(self.tools)}, max_iterations={self.max_iterations})"
         )
-
-
-async def _get_env_engine(url: str, options: dict[str, Any]) -> AsyncEngine:
-    """Retain the legacy singleton call shape when no options were configured."""
-    from dendrux.db.session import get_engine
-
-    if options:
-        return await get_engine(url, database_options=options)
-    return await get_engine(url)

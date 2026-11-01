@@ -9,6 +9,9 @@ from tests.integration.test_tenant_run_control import _pause
 
 @pytest.mark.parametrize("stream", [False, True])
 async def test_resume_does_not_fetch_trace_payloads(store, engine, monkeypatch, stream):
+    from tests._fixtures.storage import pin_storage_format
+
+    await pin_storage_format(engine, 1)
     paused = await _pause("input", store, "A")
     async with store._session_factory() as session:
         await session.execute(
