@@ -1,7 +1,8 @@
 """Test tiers: areas, the slow and flaky lists, changed-file linting and CI shards.
 
     python tools/test_tiers.py areas                      # the area names
-    python tools/test_tiers.py workers                    # local worker count (at most 6)
+    python tools/test_tiers.py workers [REQUEST]          # local worker count (at most 6)
+    python tools/test_tiers.py prepare-testmon            # create the testmon data directory
     python tools/test_tiers.py check-area NAME            # exit 2 for an unknown area
     python tools/test_tiers.py ruff-changed               # ruff on the .py files changed vs HEAD
     python tools/test_tiers.py check-lists                # the slow/flaky lists name real tests
@@ -19,6 +20,7 @@ from __future__ import annotations
 import argparse
 import ast
 import json
+import os
 import re
 import subprocess
 import sys
@@ -33,6 +35,7 @@ from tests._helpers import tiers  # noqa: E402
 
 DEFAULT_SLOW_THRESHOLD = 2.0
 UNKNOWN_FILE_SECONDS = 1.0
+TESTMON_DEFAULT = ".pytest_cache/testmondata"
 WEIGHTS = tiers.LISTS_DIR / "file_weights.json"
 _DURATION = re.compile(r"^\s*(\d+(?:\.\d+)?)s\s+(?:setup|call|teardown)\s+(\S.*?)\s*$")
 _SLOW_HEADER = (
@@ -217,7 +220,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("areas")
-    sub.add_parser("workers")
+    sub.add_parser("workers").add_argument("request", nargs="?", default=None)
+    sub.add_parser("prepare-testmon")
     sub.add_parser("check-area").add_argument("name")
     sub.add_parser("ruff-changed")
     sub.add_parser("check-lists")
@@ -238,7 +242,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "areas":
         print(" ".join(tiers.AREAS))
     elif args.command == "workers":
-        print(tiers.default_workers())
+        print(tiers.clamp_workers(args.request))
+    elif args.command == "prepare-testmon":
+        datafile = Path(os.environ.get("TESTMON_DATAFILE", TESTMON_DEFAULT))
+        if not datafile.is_absolute():
+            datafile = PACKAGE_ROOT / datafile
+        datafile.parent.mkdir(parents=True, exist_ok=True)
     elif args.command == "check-area":
         if args.name not in tiers.AREAS:
             print(f"unknown AREA {args.name!r}; one of: {' '.join(tiers.AREAS)}", file=sys.stderr)

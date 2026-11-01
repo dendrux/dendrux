@@ -1,9 +1,10 @@
 .PHONY: test test-fast test-area test-pg test-kit test-merge test-lists test-shard-proof test-model-check test-model-install test-dbs-up test-dbs-down test-mysql bench load load-quick load-pg load-mysql load-mariadb lint typecheck arch crap cognitive duplicates deadcode cycles semgrep quality quality-stamp api-check format package-smoke ci clean
 
 # Parallel workers for local runs: the core count, never more than 6 (owner decision 2026-11-01;
-# the machine also runs Docker and other builders). DENDRUX_TEST_WORKERS=<n> lowers it.
+# the machine also runs Docker and other builders). TEST_WORKERS=<n> (command line or environment)
+# and DENDRUX_TEST_WORKERS=<n> can lower it; a larger number or `auto` ends at the cap.
 # GitHub CI runs pytest itself with `-n auto`.
-TEST_WORKERS ?= $(shell python tools/test_tiers.py workers)
+override TEST_WORKERS := $(shell python tools/test_tiers.py workers "$(TEST_WORKERS)")
 
 # Benchmarks measure the server, not the code, so they are not part of the gates.
 #
@@ -24,7 +25,8 @@ test-model-install:
 # ---- Fast loop (tools/QUALITY.md, "Test tiers"). The merge gate below is the full check. ----
 # test-fast: only the tests affected by your change (pytest-testmon), SQLite, no coverage, ruff on
 # the changed files. The first run (no testmon data yet) runs every non-slow test and records
-# what each one touches; later runs are small. SLOW=1 includes the tests marked slow.
+# what each one touches; later runs are small. The fast loop never runs the tests marked slow
+# (a deliberate choice: `make ci` at hand-back runs them); SLOW=1 includes them.
 SLOW ?=
 FAST_MARKS = not benchmark$(if $(SLOW),, and not slow)
 TESTMON_DATAFILE ?= .pytest_cache/testmondata
@@ -32,6 +34,7 @@ export TESTMON_DATAFILE
 
 test-fast: test-model-check
 	python tools/test_tiers.py ruff-changed
+	python tools/test_tiers.py prepare-testmon
 	env -u DENDRUX_TEST_PG_URL pytest tests/ --testmon --testmon-forceselect -n $(TEST_WORKERS) -m "$(FAST_MARKS)" --no-cov -q
 
 # test-area: one area (python tools/test_tiers.py areas), SQLite, no coverage.

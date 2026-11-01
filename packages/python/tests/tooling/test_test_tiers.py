@@ -269,3 +269,138 @@ def test_the_coverage_job_covers_the_same_legs_as_the_test_job() -> None:
             jobs["python"]["strategy"]["matrix"][key]
             == jobs["python-coverage"]["strategy"]["matrix"][key]
         )
+
+
+# ---- fix round: fresh checkout, benchmark-safe default, hard worker cap -----------------------
+
+
+def _run_make_n(*args: str) -> str:
+    out = subprocess.run(
+        ["make", "-n", *args],
+        cwd=PKG,
+        capture_output=True,
+        text=True,
+        check=False,
+        env={k: v for k, v in os.environ.items() if not k.startswith("DENDRUX_TEST_")},
+    )
+    assert out.returncode == 0, out.stderr
+    return out.stdout
+
+
+def test_test_fast_creates_the_testmon_data_directory_before_pytest(tmp_path: Path) -> None:
+    datafile = tmp_path / "absent" / "cache" / "testmondata"
+    recipe = _run_make_n("test-fast", f"TESTMON_DATAFILE={datafile}")
+    assert recipe.index("prepare-testmon") < recipe.index("--testmon")
+
+    env = {**os.environ, "TESTMON_DATAFILE": str(datafile), "PYTHONPATH": "src"}
+    env.pop("DENDRUX_TEST_PG_URL", None)
+    selection = ["tests/unit/test_version.py", "--testmon", "--no-cov", "-q", "-p", "no:randomly"]
+    cold = subprocess.run(
+        [sys.executable, "-m", "pytest", *selection],
+        cwd=PKG,
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    assert cold.returncode != 0, "without the directory testmon cannot open its data file"
+
+    prepare = subprocess.run(
+        [sys.executable, "tools/test_tiers.py", "prepare-testmon"],
+        cwd=PKG,
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    assert prepare.returncode == 0 and datafile.parent.is_dir()
+    warm = subprocess.run(
+        [sys.executable, "-m", "pytest", *selection],
+        cwd=PKG,
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    assert warm.returncode == 0, warm.stdout + warm.stderr
+
+
+def _hook_option(markexpr: str, numprocesses: int | None = None) -> object:
+    from types import SimpleNamespace
+
+    option = SimpleNamespace(
+        numprocesses=numprocesses, markexpr=markexpr, collectonly=False, dist="no"
+    )
+    return SimpleNamespace(option=option, args=["tests/integration"])
+
+
+@pytest.mark.parametrize(
+    ("markexpr", "numprocesses", "expected"),
+    [
+        ("", None, None),  # no -m: the selection can include benchmarks, so it stays serial
+        ("slow", None, None),
+        ("benchmark", None, 0),
+        ("benchmark", 4, 0),
+        ("not benchmark", None, 6),
+        ("not benchmark and not slow", None, 6),
+        ("not benchmark", 3, 3),  # an explicit -n is respected
+        ("not benchmark", 0, 0),
+    ],
+)
+def test_default_parallelism_only_applies_to_selections_that_exclude_benchmarks(
+    monkeypatch: pytest.MonkeyPatch,
+    markexpr: str,
+    numprocesses: int | None,
+    expected: int | None,
+) -> None:
+    from tests import conftest as root_conftest
+
+    monkeypatch.setenv("DENDRUX_TEST_PG_URL", "postgresql+asyncpg://u:p@localhost/x_test")
+    monkeypatch.delenv("PYTEST_XDIST_WORKER", raising=False)
+    monkeypatch.delenv("DENDRUX_TEST_WORKERS", raising=False)
+    monkeypatch.setattr("os.cpu_count", lambda: 11)
+    config = _hook_option(markexpr, numprocesses)
+    root_conftest.pytest_cmdline_main(config)  # type: ignore[arg-type]
+    assert config.option.numprocesses == expected  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize(
+    "target", ["test", "test-fast", "test-area AREA=mcp", "test-pg", "test-mysql"]
+)
+@pytest.mark.parametrize("override", ["TEST_WORKERS=12", "TEST_WORKERS=auto", "TEST_WORKERS=100"])
+def test_the_makefile_never_asks_for_more_than_six_workers(target: str, override: str) -> None:
+    env_extra = {"DENDRUX_TEST_PG_URL": "postgresql+asyncpg://u:p@localhost/x_test"}
+    out = subprocess.run(
+        ["make", "-n", *target.split(), override],
+        cwd=PKG,
+        capture_output=True,
+        text=True,
+        check=False,
+        env={**os.environ, **env_extra},
+    ).stdout
+    import re
+
+    counts = re.findall(r"(?<!test )-n (\S+)", out)
+    assert counts, out
+    assert all(c.isdigit() and 1 <= int(c) <= 6 for c in counts), counts
+
+
+def test_the_makefile_cap_also_holds_for_the_environment_and_a_lower_request() -> None:
+    env = {k: v for k, v in os.environ.items() if not k.startswith("DENDRUX_TEST_")}
+    out = subprocess.run(
+        ["make", "-n", "test-fast"],
+        cwd=PKG,
+        capture_output=True,
+        text=True,
+        check=False,
+        env={**env, "TEST_WORKERS": "64"},
+    ).stdout
+    assert "-n 64" not in out and "-n 6 " in out
+    out = _run_make_n("test-fast", "TEST_WORKERS=2")
+    assert "-n 2 " in out
+
+
+def test_quality_guide_says_the_fast_loop_excludes_slow_tests() -> None:
+    text = (PKG / "tools" / "QUALITY.md").read_text()
+    assert "never runs the tests marked `slow`" in text
+    assert "`make ci` at hand-back" in text

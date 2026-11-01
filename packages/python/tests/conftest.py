@@ -76,10 +76,12 @@ def pytest_cmdline_main(config: pytest.Config) -> None:
 
     * A benchmark selection (``-m benchmark``) always runs in one process: benchmarks measure
       the server and fail under parallel load.
-    * With ``DENDRUX_TEST_PG_URL`` set and no ``-n`` given, run in parallel (a serial Postgres
-      run is the slow path) with ``DENDRUX_TEST_WORKERS`` workers, the core count at most 6.
-      ``-n 0`` still means serial; a run that names individual tests (``path::test``) or the
-      conformance suite (whose Postgres cells run only in one process) stays serial.
+    * With ``DENDRUX_TEST_PG_URL`` set, no ``-n`` given and a ``-m`` expression that excludes
+      benchmarks, run in parallel (a serial Postgres run is the slow path) with the core count
+      at most 6 workers. Without ``-m "not benchmark"`` the selection can include benchmarks,
+      so it stays serial. ``-n 0`` still means serial; a run that names individual tests
+      (``path::test``) or the conformance suite (whose Postgres cells run only in one process)
+      stays serial.
     """
     option = config.option
     if hasattr(option, "numprocesses") and _selects_benchmarks(option):
@@ -87,7 +89,9 @@ def pytest_cmdline_main(config: pytest.Config) -> None:
         return
     if not os.environ.get(_PG_URL_ENV) or getattr(option, "numprocesses", 1) is not None:
         return
-    if getattr(option, "collectonly", False):
+    if getattr(option, "collectonly", False) or "not benchmark" not in (
+        getattr(option, "markexpr", "") or ""
+    ):
         return
     if any("::" in arg or "conformance" in arg for arg in config.args):
         return

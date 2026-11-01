@@ -139,14 +139,20 @@ def in_list(exact: set[str], prefixes: tuple[str, ...], nodeid: str) -> bool:
 MAX_LOCAL_WORKERS = 6
 
 
-def default_workers() -> int:
-    """Worker count for a local parallel run: the core count, never more than 6.
+def clamp_workers(requested: str | None = None) -> int:
+    """The local worker count: the core count, never more than 6.
 
-    ``DENDRUX_TEST_WORKERS`` can lower it; it cannot raise it above the cap (owner decision
+    ``requested`` (a Make ``TEST_WORKERS`` value) and ``DENDRUX_TEST_WORKERS`` can lower it;
+    neither can raise it, and ``auto`` or any non-number means the cap (owner decision
     2026-11-01: one suite at a time, at most 6 xdist workers on the shared machine).
     """
     limit = min(MAX_LOCAL_WORKERS, os.cpu_count() or 1)
-    raw = os.environ.get("DENDRUX_TEST_WORKERS", "")
-    if raw.isdigit() and int(raw) > 0:
-        return min(int(raw), limit)
-    return max(1, limit)
+    counts = [limit]
+    for raw in (requested, os.environ.get("DENDRUX_TEST_WORKERS")):
+        if raw and raw.isdigit() and int(raw) > 0:
+            counts.append(int(raw))
+    return max(1, min(counts))
+
+
+def default_workers() -> int:
+    return clamp_workers(None)

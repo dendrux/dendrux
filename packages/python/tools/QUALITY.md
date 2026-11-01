@@ -63,7 +63,8 @@ baseline) and says why in the commit message.
 
 Four tiers, from the loop you run while building to the gate the coordinator runs before a merge.
 Local runs use SQLite and Postgres only (MySQL and MariaDB run in GitHub CI), one heavy suite at a
-time, and at most 6 xdist workers (`DENDRUX_TEST_WORKERS` can lower it, never raise it).
+time, and at most 6 xdist workers (`DENDRUX_TEST_WORKERS` or `TEST_WORKERS=<n>` can lower it;
+a larger number or `auto` ends at 6).
 
 | Tier | Command | What runs | Measured (11 cores, idle machine) |
 |---|---|---|---|
@@ -95,7 +96,10 @@ the slow tests.
 - `slow` for the tests that took 2 s or more in one measured run, listed in
   `tests/_helpers/tier_lists/slow.txt` (65 tests). Regenerate after a big change:
   `pytest tests/ -n 6 --durations=0 > log; python tools/test_tiers.py slow-list log --write`.
-  `slow` only keeps a test out of tiers 1 and 2; tiers 3 and 4 and CI run it.
+  `slow` only keeps a test out of tiers 1 and 2; tiers 3 and 4 and CI run it. The fast loop
+  never runs the tests marked `slow`, not even on its first run with no testmon data: that is
+  deliberate, and the full `make ci` at hand-back is what covers them (`SLOW=1 make test-fast`
+  includes them).
 - `flaky` for the tests listed in `tests/_helpers/tier_lists/flaky.txt`, each with a reason.
   A flaky test is rerun once when it fails (pytest-rerunfailures) and still runs everywhere; it is
   never skipped. A flake gets a root-cause fix, not a list entry, unless the cause is the machine
@@ -103,9 +107,10 @@ the slow tests.
 - `benchmark` (existing): measures the server, so it is excluded from every parallel run and
   always runs in one process (`-m benchmark` forces `-n 0`).
 
-**Postgres.** With `DENDRUX_TEST_PG_URL` set and no `-n` given, pytest runs in parallel (6
-workers at most), one database per worker. A run that names single tests (`path::test`) or the
-conformance suite stays in one process (its Postgres cells need that). A template database for
+**Postgres.** With `DENDRUX_TEST_PG_URL` set, no `-n` given and `-m "not benchmark"`, pytest
+runs in parallel (6 workers at most), one database per worker. Without `-m "not benchmark"` the
+selection can include benchmarks, so it stays in one process. A run that names single tests
+(`path::test`) or the conformance suite also stays in one process (its Postgres cells need that). A template database for
 the workers was measured and dropped: building the schema takes 0.05 s per worker.
 
 **CI shards.** The GitHub test job runs four shards per Python/SQLAlchemy leg. A shard is a set of
