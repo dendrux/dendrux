@@ -1,0 +1,6 @@
+{
+ "dendrux.runtime.submit:variable:json_payload": 1,
+ "dendrux.skills._fs:variable:exc_type": 1,
+ "dendrux.skills._fs:variable:tb": 1,
+ "dendrux.testing.store_kit.contracts.test_agent_flows:variable:sheet": 1
+}
