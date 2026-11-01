@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from contextvars import ContextVar
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Literal
@@ -11,8 +12,11 @@ from sqlalchemy import String
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.sql.functions import FunctionElement
 
+from dendrux.runtime.durability import _safe_database_call
 from dendrux.runtime.state import _TERMINAL_STATUS_VALUES
 from dendrux.runtime.stores.sql.base import SQLStateStore
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -44,7 +48,7 @@ def _compile_json_text(element: Any, compiler: Any, **kwargs: Any) -> str:
 class MySQLStateStore(SQLStateStore):
     """InnoDB store requiring READ COMMITTED and NO PAD identifier collations."""
 
-    dialect_names = ("mysql",)
+    dialect_names = ("mysql", "mariadb")
     supports_update_returning = False
     supports_insert_returning = False
     supports_row_locks = True
@@ -54,16 +58,64 @@ class MySQLStateStore(SQLStateStore):
         super().__init__(engine)
         self.capabilities = replace(self.capabilities, deployment="multi_server", notify=False)
 
+    def classify_db_error(self, exc: BaseException) -> Any:
+        from dendrux.runtime.stores._errors import DbError
+
+        classified = super().classify_db_error(exc)
+        facts = self._dialect_facts
+        limit = None if facts is None else facts.max_allowed_packet
+        if classified.kind == "connection_lost" and limit is not None:
+            errors = [exc]
+            seen: set[int] = set()
+            while errors and len(seen) < 64:
+                error = errors.pop()
+                if id(error) in seen:
+                    continue
+                seen.add(id(error))
+                errors.extend(
+                    nested
+                    for nested in (getattr(error, "orig", None), error.__cause__, error.__context__)
+                    if isinstance(nested, BaseException)
+                )
+                pending = [iter((getattr(error, "params", None),))]
+                inspected = 0
+                while pending and inspected < 524288:
+                    try:
+                        value = next(pending[-1])
+                    except StopIteration:
+                        pending.pop()
+                        continue
+                    inspected += 1
+                    if isinstance(value, str):
+                        if (
+                            len(value) > limit
+                            or len(value.encode("utf-8", "surrogatepass")) > limit
+                        ):
+                            return DbError("statement_too_large", code=classified.code)
+                    elif isinstance(value, (bytes, bytearray, memoryview)):
+                        if (value.nbytes if isinstance(value, memoryview) else len(value)) > limit:
+                            return DbError("statement_too_large", code=classified.code)
+                    elif isinstance(value, dict):
+                        pending.append(iter(value.values()))
+                    elif isinstance(value, (list, tuple)):
+                        pending.append(iter(value))
+        return classified
+
     @classmethod
     def from_url(cls, url: str, **engine_options: Any) -> MySQLStateStore:
         """Create a shared engine with connection-time UTC and READ COMMITTED."""
         from sqlalchemy.ext.asyncio import create_async_engine
 
-        from dendrux.db._engine_options import mysql_engine_options, normalized_url
+        from dendrux.db._engine_options import (
+            create_engine_with_hint,
+            mysql_engine_options,
+            normalized_url,
+        )
 
         options = mysql_engine_options(engine_options)
-        return cls(create_async_engine(normalized_url(url), **options))
+        return cls(create_engine_with_hint(create_async_engine, normalized_url(url), **options))
 
+    @_safe_database_call
     async def connection_checks(self, conn: Any) -> Any:
         from sqlalchemy import bindparam, text
 
@@ -82,22 +134,39 @@ class MySQLStateStore(SQLStateStore):
                     f"SELECT @@max_allowed_packet, @@session.{isolation_variable}, "
                     "(SELECT count(*) FROM information_schema.TABLES "
                     "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN :tables "
-                    "AND (ENGINE IS NULL OR ENGINE <> 'InnoDB'))"
+                    "AND (ENGINE IS NULL OR ENGINE <> 'InnoDB')), "
+                    "@@session.autocommit, @@session.sql_mode, "
+                    "@@session.character_set_client, @@session.character_set_connection, "
+                    "@@session.character_set_results"
                 ).bindparams(bindparam("tables", expanding=True)),
                 {"tables": sorted(Base.metadata.tables)},
             )
         ).one()
+        if facts[3]:
+            raise ValueError("MySQLStateStore requires transactions; AUTOCOMMIT is not supported")
         if str(facts[1]).replace("-", " ").upper() != "READ COMMITTED":
             raise ValueError(
                 'MySQLStateStore requires an engine with isolation_level="READ COMMITTED"'
             )
         if facts[2]:
             raise ValueError("MySQLStateStore requires every Dendrux table to use InnoDB")
+        if not {"STRICT_TRANS_TABLES", "STRICT_ALL_TABLES"}.intersection(
+            str(facts[4]).upper().split(",")
+        ):
+            raise ValueError(
+                "MySQLStateStore requires strict sql_mode "
+                "(STRICT_TRANS_TABLES or STRICT_ALL_TABLES)"
+            )
+        if any(str(charset).lower() != "utf8mb4" for charset in facts[5:8]):
+            raise ValueError(
+                "MySQLStateStore requires utf8mb4 character_set_client/connection/results"
+            )
         packet = int(facts[0])
         return DialectFacts(
             "mariadb" if maria else "mysql", version, {"supports_insert_returning": maria}, packet
         )
 
+    @_safe_database_call
     async def statement_capacity(self) -> int | None:
         """Most bytes one SQL statement may carry (the server's ``max_allowed_packet``).
 
@@ -158,6 +227,7 @@ class MySQLStateStore(SQLStateStore):
         finally:
             _increment_site.reset(token)
 
+    @_safe_database_call
     async def update_one(
         self,
         session: Any,
@@ -338,14 +408,33 @@ class MySQLStateStore(SQLStateStore):
         raise ValueError("unsupported JSON read type")
 
     def json_contains(self, col: Any, path: Any, value: Any) -> Any:
-        from sqlalchemy import Boolean, false, func, type_coerce
+        from sqlalchemy import Boolean, and_, false, func, type_coerce
+
+        node = func.json_extract(col, self._json_path(col, path))
+        kind = func.json_type(node)
+        matches_type = (
+            kind == "NULL"
+            if value is None
+            else kind == "BOOLEAN"
+            if isinstance(value, bool)
+            else kind == "STRING"
+            if isinstance(value, str)
+            else kind.in_(("INTEGER", "UNSIGNED INTEGER", "DOUBLE", "DECIMAL"))
+            if isinstance(value, (int, float))
+            else kind.in_(("OBJECT", "ARRAY"))
+        )
 
         return type_coerce(
             func.coalesce(
-                func.json_contains(
-                    col,
-                    json.dumps(value, ensure_ascii=False, allow_nan=False),
-                    self._json_path(col, path),
+                and_(
+                    matches_type,
+                    _NoPadJSONText(func.json_unquote(node)) == value
+                    if isinstance(value, str)
+                    else func.json_contains(
+                        col,
+                        json.dumps(value, ensure_ascii=False, allow_nan=False),
+                        self._json_path(col, path),
+                    ),
                 ),
                 false(),
             ),
@@ -364,8 +453,9 @@ class MySQLStateStore(SQLStateStore):
         )
 
     def json_patch_expr(self, col: Any, patch: Any) -> Any:
-        from sqlalchemy import case, func
+        from sqlalchemy import case, func, literal
 
+        from dendrux.db._dialects._mysql_types import json_document
         from dendrux.runtime.stores.sql._types import AppendArray, SetFields
 
         base = case((func.json_type(col) == "NULL", "{}"), else_=func.coalesce(col, "{}"))
@@ -375,7 +465,7 @@ class MySQLStateStore(SQLStateStore):
                 for key, value in patch.fields.items()
                 for item in (
                     self._json_path(col, (key,)),
-                    func.json_extract(json.dumps(value, ensure_ascii=False, allow_nan=False), "$"),
+                    func.json_extract(literal(value, json_document(col.key)), "$"),
                 )
             ]
             return func.json_set(base, *args) if args else base
@@ -383,9 +473,7 @@ class MySQLStateStore(SQLStateStore):
             return func.json_array_append(
                 base,
                 self._json_path(col, patch.path),
-                func.json_extract(
-                    json.dumps(patch.value, ensure_ascii=False, allow_nan=False), "$"
-                ),
+                func.json_extract(literal(patch.value, json_document(col.key)), "$"),
             )
         return None
 
@@ -408,7 +496,7 @@ class MySQLStateStore(SQLStateStore):
             ).scalar_one_or_none()
             if row is None:
                 return None
-            if row.idempotency_fingerprint != fingerprint:
+            if (row.idempotency_fingerprint or "") != fingerprint:
                 raise IdempotencyConflictError(run_id=row.id, idempotency_key=idempotency_key)
             return CreateRunResult(
                 run_id=row.id,

@@ -55,6 +55,7 @@ _REQUIREMENTS: dict[str, dict[str, tuple[str, ...]]] = {
         "mark_lease_expired": ("finalise_unrecoverable",),
         "get_lease_expired": (),
         "reclaim_run": (),
+        "get_replayed_tool_calls": (),
     },
     "notify": {"_after_event_insert": ()},
 }

@@ -11,9 +11,7 @@ from dendrux.runtime import durability
 from dendrux.runtime.stores.sql.base import SQLStateStore
 
 
-@pytest.mark.parametrize(
-    "code", [None, "08006", "08003", "53300", "57014", "57P01", "57P02", "57P03"]
-)
+@pytest.mark.parametrize("code", [None, "08006", "08003", "53300", "57P01", "57P02", "57P03"])
 def test_before_commit_transient_failures_keep_retryability(code):
     class DriverError(Exception):
         sqlstate = code

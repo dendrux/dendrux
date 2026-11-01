@@ -1748,6 +1748,7 @@ async def _insert_event(
 def __getattr__(name: str) -> Any:
     if name == "SQLAlchemyStateStore":
         raise ImportError(
-            "Removed in 0.6.0; use PostgresStateStore / SQLiteStateStore / store_for_engine."
+            "Removed in 0.6.0; use PostgresStateStore / SQLiteStateStore / "
+            "MySQLStateStore / store_for_engine from dendrux.store."
         )
     raise AttributeError(name)

@@ -206,7 +206,7 @@ async def test_single_connection_store_warns_once_per_pool(memory_engine, caplog
     assert "StaticPool" in message
     assert "serialised" in message
     assert "not durable" in message
-    assert "':memory:'" in message
+    assert "in-memory SQLite" in message
     assert "%3A" not in message
 
 

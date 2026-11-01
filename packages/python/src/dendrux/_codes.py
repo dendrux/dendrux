@@ -49,6 +49,61 @@ _NUMBERS = frozenset(
     }
 )
 _ENUMS = {
+    "db_kind": frozenset(
+        [
+            "unique_violation",
+            "deadlock_or_serialization",
+            "lock_timeout",
+            "connection_lost",
+            "statement_too_large",
+            "missing_table",
+            "missing_column",
+            "other",
+        ]
+    ),
+    "db_code": frozenset(
+        [
+            "other",
+            "23505",
+            "40P01",
+            "40001",
+            "55P03",
+            "42P01",
+            "42703",
+            "53300",
+            "57014",
+            "57P01",
+            "57P02",
+            "57P03",
+            "08000",
+            "08001",
+            "08003",
+            "08004",
+            "08006",
+            "08007",
+            "08P01",
+            "0",
+            "1",
+            "5",
+            "6",
+            "1555",
+            "2067",
+            "1054",
+            "1062",
+            "1146",
+            "1153",
+            "1205",
+            "1213",
+            "1301",
+            "1927",
+            "2006",
+            "2013",
+            "2014",
+            "2045",
+            "2055",
+            "4031",
+        ]
+    ),
     "category": frozenset(
         [
             "abandoned_waiting",

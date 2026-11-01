@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
 
+from dendrux.runtime.durability import _safe_database_call
 from dendrux.runtime.stores.sql.base import SQLStateStore
 
 if TYPE_CHECKING:
@@ -14,11 +15,23 @@ if TYPE_CHECKING:
 class PostgresStateStore(SQLStateStore):
     """Durable, multi-server state store for PostgreSQL."""
 
+    _note_lock_requires_scope_precheck = True
+
     dialect_names = ("postgresql",)
     supports_update_returning = True
     supports_insert_returning = True
     supports_row_locks = True
     ddl_transactional = True
+
+    async def _prepare_commit_readback(self, session: Any) -> None:
+        from sqlalchemy import text
+
+        from dendrux.runtime.stores.sql.base import _COMMIT_READBACK_LOCK_TIMEOUT_MS
+
+        await session.execute(
+            text("SELECT set_config('lock_timeout', :timeout, true)"),
+            {"timeout": f"{_COMMIT_READBACK_LOCK_TIMEOUT_MS}ms"},
+        )
 
     def __init__(self, engine: AsyncEngine, *, notify_channel: str | None = None) -> None:
         from dendrux.db._notify import validate_channel
@@ -148,6 +161,7 @@ class PostgresStateStore(SQLStateStore):
     def lock_clause(self, stmt: Any, intent: Any) -> Any:
         return stmt.with_for_update(read=intent == "share", key_share=intent == "update_no_key")
 
+    @_safe_database_call
     async def serialize_in_tx(self, session: Any, *, owner: Any) -> None:
         from sqlalchemy import Integer, func, literal, select
 

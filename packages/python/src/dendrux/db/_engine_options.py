@@ -3,12 +3,40 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from sqlalchemy.engine import URL, make_url
 
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
 _MYSQL_DRIVER = "mysql+asyncmy"
 _MYSQL_UTC_INIT = "SET time_zone='+00:00'"
+_T = TypeVar("_T")
+
+
+def mysql_dependency_error(error: BaseException) -> ImportError | None:
+    """Recognize missing optional drivers/auth dependencies without echoing their text."""
+    if (
+        isinstance(error, ImportError)
+        and (getattr(error, "name", "") or "").split(".")[0] in {"asyncmy", "cryptography"}
+    ) or (isinstance(error, RuntimeError) and "'cryptography' package is required" in str(error)):
+        return ImportError(
+            "MySQL persistence requires its optional drivers; install 'dendrux[mysql]'."
+        )
+    return None
+
+
+def create_engine_with_hint(factory: Callable[..., _T], url: str | URL, **options: Any) -> _T:
+    """Construct an engine with an actionable optional MySQL dependency error."""
+    failure = None
+    try:
+        return factory(url, **options)
+    except (ImportError, RuntimeError) as error:
+        failure = mysql_dependency_error(error) if is_mysql_family_url(url) else None
+        if failure is None:
+            raise
+    raise failure from None
 
 
 def is_mysql_family_url(url: str | URL) -> bool:
@@ -21,6 +49,13 @@ def mysql_engine_options(supplied: dict[str, Any]) -> dict[str, Any]:
     options = dict(supplied)
     if options.get("isolation_level", "READ COMMITTED") != "READ COMMITTED":
         raise ValueError('MySQLStateStore requires isolation_level="READ COMMITTED"')
+    if (
+        options.get("execution_options", {}).get("isolation_level", "READ COMMITTED")
+        != "READ COMMITTED"
+    ):
+        raise ValueError(
+            'MySQLStateStore requires isolation_level="READ COMMITTED" in execution_options'
+        )
     options["isolation_level"] = "READ COMMITTED"
     connect = dict(options.get("connect_args", {}))
     if connect.get("init_command", _MYSQL_UTC_INIT) != _MYSQL_UTC_INIT:

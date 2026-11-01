@@ -157,10 +157,13 @@ async def test_a_lost_commit_with_an_os_error_numbered_1153_stays_ambiguous(
 
     try:
         await store.get_run("warm")
+        run_id = generate_ulid()
+        await store.create_run(run_id, "agent")
+        await store.pause_run(run_id, status="paused", pause_data={"pause_id": "p"})
         event.listen(Session, "before_commit", lose_the_commit)
         try:
             with pytest.raises(StoreOutcomeUnknown):
-                await store.create_run(generate_ulid(), "agent")
+                await store.claim_paused_run(run_id, expected_status="paused")
         finally:
             event.remove(Session, "before_commit", lose_the_commit)
     finally:

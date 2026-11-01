@@ -31,7 +31,8 @@ async def mysql_engine(request):
         or not re.fullmatch(r"dendrux_p5_b_[A-Za-z0-9_]+_test", url.database or "")
     ):
         raise pytest.UsageError("track B requires its private local MySQL-family URL")
-    name = f"dendrux_p5_b_{uuid.uuid4().hex[:12]}_test"
+    prefix = (url.database or "").removesuffix("_test")[:45]
+    name = f"{prefix}_{uuid.uuid4().hex[:12]}_test"
     admin = create_async_engine(
         url._replace(database=None), poolclass=NullPool, hide_parameters=True
     )

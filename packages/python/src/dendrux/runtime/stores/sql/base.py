@@ -10,10 +10,12 @@ from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, Literal, NoReturn, cast
 
 from sqlalchemy import and_, select, true
+from sqlalchemy.exc import SQLAlchemyError
 
 from dendrux import _codes
 from dendrux.runtime._blob_catalog import SQLBlobCatalog, write_blob_refs
 from dendrux.runtime.durability import (
+    _CommitNotAppliedError,
     _safe_database_call,
     retry_transient_db,
     safe_database_operations,
@@ -104,6 +106,8 @@ from dendrux.runtime.stores.sql._types import (
 
 logger = logging.getLogger(__name__)
 
+_COMMIT_READBACK_LOCK_TIMEOUT_MS = 5000
+
 
 class _UpdatedRows:
     def __init__(self, rows: Sequence[Any]) -> None:
@@ -155,6 +159,7 @@ class _CheckedSessionFactory:
     async def __call__(self) -> AsyncIterator[AsyncSession]:
         async with self._factory() as session:
             await self._store._check_connection(session)
+
             yield session
 
 
@@ -326,6 +331,8 @@ class SQLStateStore(SQLBlobCatalog):
     claiming each blob row (``write_blob_refs``). Passed only when non-empty.
     """
 
+    _note_lock_requires_scope_precheck = False
+
     dialect_names: tuple[str, ...] = ()
     supports_update_returning = False
     supports_insert_returning = False
@@ -410,6 +417,9 @@ class SQLStateStore(SQLBlobCatalog):
 
         return classify_error(exc)
 
+    async def _prepare_commit_readback(self, session: AsyncSession) -> None:
+        pass
+
     async def connection_checks(self, conn: Any) -> DialectFacts:
         from dendrux.runtime.stores.sql._types import DialectFacts
 
@@ -422,13 +432,13 @@ class SQLStateStore(SQLBlobCatalog):
         return _dt.datetime.now(_dt.UTC)
 
     def json_get(self, col: Any, path: Any, as_type: Any) -> Any:
-        raise NotImplementedError("SQL adapters must implement JSON projection")
+        raise NotImplementedError("SQL adapters must implement json_get")
 
     def json_contains(self, col: Any, path: Any, value: Any) -> Any:
-        raise NotImplementedError("SQL adapters must implement JSON containment")
+        raise NotImplementedError("SQL adapters must implement json_contains")
 
     def json_is_null(self, col: Any, path: Any) -> Any:
-        raise NotImplementedError("SQL adapters must implement JSON null predicates")
+        raise NotImplementedError("SQL adapters must implement json_is_null")
 
     def json_patch_expr(self, col: Any, patch: Any) -> Any:
         return None
@@ -442,7 +452,7 @@ class SQLStateStore(SQLBlobCatalog):
         return False
 
     def upsert_setting(self, table: Any, *, key: str, value: str, updated_at: datetime) -> Any:
-        raise NotImplementedError("SQL adapters must implement settings upsert")
+        raise NotImplementedError("SQL adapters must implement upsert_setting")
 
     def child_page_query(
         self, *, runs: Any, parents: Any, tenant_scope: Any, page_size: int
@@ -520,6 +530,7 @@ class SQLStateStore(SQLBlobCatalog):
         from sqlalchemy import select
         from sqlalchemy.exc import SQLAlchemyError
 
+        from dendrux.errors import PersistenceError
         from dendrux.runtime.durability import (
             StoreOutcomeUnknown,
             _CommitNotAppliedError,
@@ -540,6 +551,9 @@ class SQLStateStore(SQLBlobCatalog):
             _codes.log_code(logger, _codes.STORE_OUTCOME_UNKNOWN, run_id=run_id)
             raise StoreOutcomeUnknown() from None
 
+        # ORM flush is pre-COMMIT: any failure here is safe to roll back and
+        # retry through the operation's whole-transaction boundary.
+        await session.flush()
         try:
             await session.commit()
             session.info.pop("dendrux.commit_proofs", None)
@@ -553,8 +567,6 @@ class SQLStateStore(SQLBlobCatalog):
                 _codes.log_code(logger, _codes.PERSISTENCE_ERROR, run_id=run_id)
                 if classified.kind == "connection_lost":
                     unknown()
-                from dendrux.errors import PersistenceError
-
                 raise PersistenceError() from None
             if classified.kind in ("deadlock_or_serialization", "lock_timeout") or not (
                 is_transient_db_error(exc, classify=self.classify_db_error)
@@ -563,9 +575,7 @@ class SQLStateStore(SQLBlobCatalog):
 
         # Claim identity cannot be reconstructed from a later epoch. This also
         # covers submission claims and every other CAS without a retry identity.
-        if name in ("claim_paused_run", "submit_and_claim", "reclaim_run", "release_run_claim") or (
-            name == "create_run" and arguments.get("idempotency_key") is None
-        ):
+        if name in ("claim_paused_run", "submit_and_claim", "reclaim_run", "release_run_claim"):
             unknown()
         proofs = session.info.pop("dendrux.commit_proofs", [])
         fresh_evidence = session.info.pop("dendrux.fresh_evidence", False)
@@ -598,9 +608,22 @@ class SQLStateStore(SQLBlobCatalog):
         if not proofs:
             unknown()
 
-        async def lost() -> NoReturn:
+        async def lost(*, absent: bool = False) -> NoReturn:
             from dendrux.db.models import AgentRun
 
+            retry_id = {
+                "save_trace": "trace_id",
+                "save_tool_call": "row_id",
+                "save_usage": "usage_id",
+                "save_llm_interaction": "interaction_id",
+                "save_run_event": "event_id",
+                "start_tool_call": "row_id",
+            }.get(name)
+            if absent and (
+                name == "create_run"
+                or (retry_id is not None and arguments.get(retry_id) is not None)
+            ):
+                raise _CommitNotAppliedError() from None
             if name not in transitions or run_id is None:
                 unknown()
             predicate = AgentRun.id == run_id
@@ -630,6 +653,18 @@ class SQLStateStore(SQLBlobCatalog):
         try:
             from decimal import ROUND_HALF_UP, Decimal
 
+            from dendrux.db.models import AgentRun
+
+            await self._prepare_commit_readback(session)
+            # Wait for an in-flight transaction before reading its evidence or
+            # precondition. Plain MVCC reads could observe the old row and cause
+            # a retry whose CAS loses against our original successful write.
+            for touched_run in sorted(touched):
+                if not self.supports_row_locks:
+                    await self.reserve_parent_writer(session, touched_run)
+                await session.execute(
+                    self.lock_clause(select(AgentRun.id).where(AgentRun.id == touched_run), "share")
+                )
             fenced_run_proven = False
             for table, predicate, expected in proofs:
                 check_epoch = prove_fence and table.name == "agent_runs"
@@ -640,14 +675,17 @@ class SQLStateStore(SQLBlobCatalog):
                 stored = (
                     (
                         await session.execute(
-                            select(*[table.c[key] for key in expected]).where(predicate)
+                            self.lock_clause(
+                                select(*[table.c[key] for key in expected]).where(predicate),
+                                "share",
+                            )
                         )
                     )
                     .mappings()
                     .one_or_none()
                 )
                 if stored is None:
-                    await lost()
+                    await lost(absent=True)
                 for key, value in expected.items():
                     actual = stored[key]
                     if isinstance(actual, Decimal) and value is not None:
@@ -665,7 +703,9 @@ class SQLStateStore(SQLBlobCatalog):
                 fenced_run_proven |= check_epoch
             if name in transitions and not fresh_evidence and not fenced_run_proven:
                 unknown()
-        except SQLAlchemyError:
+        except _CommitNotAppliedError:
+            raise
+        except (SQLAlchemyError, PersistenceError):
             unknown()
 
     async def update_one(
@@ -910,7 +950,22 @@ class SQLStateStore(SQLBlobCatalog):
         async with self._connection_check_lock:
             if self._dialect_facts is not None:
                 return
-            facts = await self.connection_checks(await session.connection())
+            conn = await session.connection()
+            if conn.dialect.name in {"postgresql", "sqlite"}:
+
+                def autocommit(sync: Any) -> bool:
+                    dbapi = sync.connection.dbapi_connection
+                    return getattr(dbapi, "autocommit", False) is True or (
+                        sync.dialect.name == "sqlite"
+                        and dbapi.isolation_level is None
+                        and not dbapi.driver_connection.in_transaction
+                    )
+
+                if await conn.run_sync(autocommit):
+                    raise ValueError(
+                        "SQLStateStore requires transactions; AUTOCOMMIT is not supported"
+                    )
+            facts = await self.connection_checks(conn)
             for name in (
                 "supports_update_returning",
                 "supports_insert_returning",
@@ -1006,6 +1061,8 @@ class SQLStateStore(SQLBlobCatalog):
 
         if tenant_id == "":
             raise ValueError("tenant_id must be a non-empty string or None, not ''.")
+        if idempotency_key is not None:
+            idempotency_fingerprint = idempotency_fingerprint or ""
         # Fast path: if an idempotency key is provided, check for an existing
         # run of this tenant (keys are unique per tenant, not globally).
         if idempotency_key is not None:
@@ -1015,7 +1072,40 @@ class SQLStateStore(SQLBlobCatalog):
             if existing is not None:
                 return existing
 
+        absent_retry = False
+
+        async def _prove_creation(session: AsyncSession) -> CreateRunResult:
+            from dendrux.errors import StoreOutcomeUnknown
+            from dendrux.runtime._digest import content_digest
+
+            try:
+                await self._prepare_commit_readback(session)
+                row = (
+                    await session.execute(
+                        self.lock_clause(select(AgentRun).where(AgentRun.id == run_id), "share")
+                    )
+                ).scalar_one_or_none()
+                if (
+                    row is not None
+                    and row.agent_name == agent_name
+                    and row.tenant_id == tenant_id
+                    and content_digest(row.input_data) == content_digest(input_data)
+                    and row.idempotency_fingerprint == idempotency_fingerprint
+                    and row.idempotency_key == idempotency_key
+                ):
+                    return CreateRunResult(
+                        run_id=run_id,
+                        outcome="created",
+                        status=RunStatus(row.status),
+                        storage_format=row.storage_format,
+                    )
+            except SQLAlchemyError:
+                pass
+            _codes.log_code(logger, _codes.STORE_OUTCOME_UNKNOWN, run_id=run_id)
+            raise StoreOutcomeUnknown() from None
+
         async def _attempt() -> CreateRunResult:
+            nonlocal absent_retry
             async with self._session_factory() as session:
                 session.info["dendrux.store"] = self
                 if parent_run_id is not None:
@@ -1060,14 +1150,21 @@ class SQLStateStore(SQLBlobCatalog):
                     retry_of_run_id=retry_of_run_id,
                 )
                 session.add(run)
-                if idempotency_key is not None:
-                    self._remember_write(
-                        session,
-                        AgentRun.__table__,
-                        (AgentRun.idempotency_key == idempotency_key)
-                        & self.idempotency_scope_predicate(tenant_id),
-                        {"id": run_id, "idempotency_fingerprint": idempotency_fingerprint},
-                    )
+                self._remember_write(
+                    session,
+                    AgentRun.__table__,
+                    (AgentRun.idempotency_key == idempotency_key)
+                    & self.idempotency_scope_predicate(tenant_id)
+                    if idempotency_key is not None
+                    else AgentRun.id == run_id,
+                    {
+                        "id": run_id,
+                        "agent_name": agent_name,
+                        "tenant_id": tenant_id,
+                        "input_data": input_data,
+                        "idempotency_fingerprint": idempotency_fingerprint,
+                    },
+                )
                 try:
                     if seed_traces and storage_format == 2:
                         await session.flush()
@@ -1083,19 +1180,36 @@ class SQLStateStore(SQLBlobCatalog):
                             run_tenant_id=tenant_id,
                         )
                     await self._write_tx(session)
+                except _CommitNotAppliedError:
+                    absent_retry = True
+                    raise
                 except IntegrityError as exc:
                     await session.rollback()
-                    # Only resolve via idempotency when the violated constraint is
-                    # an idempotency-key unique index, not an arbitrary integrity
-                    # error. IntegrityError is NOT transient — don't let
-                    # retry_transient_db see it.
-                    if idempotency_key is None or not self._idempotency_violation(exc):
-                        raise
-                    existing = await self._check_idempotency(
-                        idempotency_key, idempotency_fingerprint or "", tenant_id=tenant_id
+                    error = self.classify_db_error(exc)
+                    identity_conflict = self._idempotency_violation(exc) or (
+                        error.kind == "unique_violation"
+                        and error.constraint
+                        in self._conflict(AgentRun.__table__, ["id"]).constraints
                     )
+                    if not identity_conflict:
+                        raise
+                    existing = None
+                    if idempotency_key is not None:
+                        try:
+                            existing = await self._check_idempotency(
+                                idempotency_key, idempotency_fingerprint or "", tenant_id=tenant_id
+                            )
+                        except IdempotencyConflictError:
+                            if not absent_retry:
+                                raise
+                    if absent_retry:
+                        # An invisible in-flight INSERT can win the unique check
+                        # after an absent readback. Re-prove our full identity.
+                        return await _prove_creation(session)
                     if existing is not None:
                         return existing
+                    if idempotency_key is None or not self._idempotency_violation(exc):
+                        raise
                     # The key is held by another tenant's run under a pre-0.5
                     # global unique index (legacy SQLite file). Fail closed
                     # without disclosing that run.
@@ -1165,7 +1279,7 @@ class SQLStateStore(SQLBlobCatalog):
                 return None
 
             # Conflict check: same key, different request
-            if row.idempotency_fingerprint != fingerprint:
+            if (row.idempotency_fingerprint or "") != fingerprint:
                 raise IdempotencyConflictError(
                     run_id=row.id,
                     idempotency_key=idempotency_key,
@@ -2371,7 +2485,7 @@ class SQLStateStore(SQLBlobCatalog):
         failure_reason: str | None = None,
         claim_epoch: int | None = None,
     ) -> bool:
-        from sqlalchemy import case, update
+        from sqlalchemy import case, literal, update
 
         from dendrux.db.models import AgentRun
 
@@ -2386,10 +2500,18 @@ class SQLStateStore(SQLBlobCatalog):
             AgentRun.loop_state, SetFields({"phase": "finalizing"})
         )
         if finalized_state is None:
+            if not self.supports_row_locks:
+                await session.execute(
+                    update(AgentRun)
+                    .where(AgentRun.id == run_id)
+                    .ordered_values(*self._reservation_values(AgentRun.__table__))
+                )
             current_state = await session.scalar(
                 self.lock_clause(select(AgentRun.loop_state).where(AgentRun.id == run_id), "update")
             )
-            finalized_state = {**(current_state or {}), "phase": "finalizing"}
+            finalized_state = literal(
+                {**(current_state or {}), "phase": "finalizing"}, type_=AgentRun.loop_state.type
+            )
         values["loop_state"] = case(
             (AgentRun.storage_format == 2, finalized_state), else_=AgentRun.loop_state
         )
@@ -2730,7 +2852,6 @@ class SQLStateStore(SQLBlobCatalog):
         import datetime as _dt
 
         from sqlalchemy import (
-            JSON,
             DateTime,
             String,
             Text,
@@ -2753,6 +2874,15 @@ class SQLStateStore(SQLBlobCatalog):
         async def _attempt() -> bool:
             async with self._session_factory() as session:
                 if max_notes is not None:
+                    if self._note_lock_requires_scope_precheck and (
+                        await session.scalar(
+                            _apply_tenant_scope(
+                                select(AgentRun.id).where(AgentRun.id == run_id), tenant_id
+                            )
+                        )
+                        is None
+                    ):
+                        return False
                     await self.serialize_in_tx(session, owner=RunLockScope(run_id, tenant_id))
                 if claim_epoch is not None:
                     await self._fence(session, run_id, claim_epoch)
@@ -2760,7 +2890,7 @@ class SQLStateStore(SQLBlobCatalog):
                     literal(note_id, String(26)),
                     AgentRun.id,
                     literal(text, Text()),
-                    null() if metadata is None else literal(metadata, JSON()),
+                    null() if metadata is None else literal(metadata, RunInbox.metadata_.type),
                     literal(_dt.datetime.now(_dt.UTC), DateTime(timezone=True)),
                 ).where(
                     AgentRun.id == run_id,
@@ -3725,13 +3855,20 @@ class SQLStateStore(SQLBlobCatalog):
 
         from dendrux.db.models import AgentRun
 
-        async with self._session_factory() as session:
-            stmt = update(AgentRun).where(AgentRun.id == run_id, AgentRun.status == "running")
-            if claim_epoch is not None:
-                stmt = stmt.where(AgentRun.claim_epoch == claim_epoch)
-            result = await session.execute(stmt.values(last_progress_at=_dt.datetime.now(_dt.UTC)))
-            await self._write_tx(session)
-            return bool(result.rowcount)
+        async def _attempt() -> bool:
+            async with self._session_factory() as session:
+                stmt = update(AgentRun).where(AgentRun.id == run_id, AgentRun.status == "running")
+                if claim_epoch is not None:
+                    stmt = stmt.where(AgentRun.claim_epoch == claim_epoch)
+                result = await session.execute(
+                    stmt.values(last_progress_at=_dt.datetime.now(_dt.UTC))
+                )
+                await self._write_tx(session)
+                return bool(result.rowcount)
+
+        return await retry_transient_db(
+            _attempt, label="touch_progress", run_id=run_id, classify=self.classify_db_error
+        )
 
     async def mark_lease_expired(
         self,
@@ -4907,14 +5044,18 @@ class SQLStateStore(SQLBlobCatalog):
         from dendrux.db.models import RunEvent
 
         async with self._session_factory() as session:
-            stmt = (
-                select(RunEvent.agent_run_id, func.count())
-                .where(RunEvent.agent_run_id.in_(run_ids))
-                .where(RunEvent.event_type == "run.paused")
-                .group_by(RunEvent.agent_run_id)
-            )
-            result = await session.execute(stmt)
-            return {row[0]: int(row[1]) for row in result.all()}
+            counts: dict[str, int] = {}
+            ids = sorted(set(run_ids))
+            for start in range(0, len(ids), _IN_CHUNK):
+                stmt = (
+                    select(RunEvent.agent_run_id, func.count())
+                    .where(RunEvent.agent_run_id.in_(ids[start : start + _IN_CHUNK]))
+                    .where(RunEvent.event_type == "run.paused")
+                    .group_by(RunEvent.agent_run_id)
+                )
+                result = await session.execute(stmt)
+                counts.update((row[0], int(row[1])) for row in result.all())
+            return counts
 
     async def count_runs(
         self,
@@ -5048,7 +5189,7 @@ class SQLStateStore(SQLBlobCatalog):
         content_digest: str | None = None,
     ) -> int:
         """Allocate sequence inside the insert; only a lost acknowledgement reads back."""
-        from sqlalchemy import JSON, DateTime, Integer, String, func, literal, select
+        from sqlalchemy import DateTime, Integer, String, func, literal, select
         from sqlalchemy.exc import IntegrityError
 
         from dendrux.db.models import RunEvent
@@ -5076,7 +5217,7 @@ class SQLStateStore(SQLBlobCatalog):
             self.event_sequence_expr(next_index),
             literal(iteration_index, Integer()),
             literal(correlation_id, String(26)),
-            literal(data, JSON()),
+            literal(data, RunEvent.data.type),
             literal(_dt.datetime.now(_dt.UTC), DateTime(timezone=True)),
             literal(digest, String(64)),
         )

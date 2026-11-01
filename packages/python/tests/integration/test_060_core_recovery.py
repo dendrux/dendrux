@@ -120,8 +120,10 @@ async def test_a13_a14_two_markers_rediscover_without_duplicate_events(store, en
     assert len(await store.get_run_events(ids[0])) == 1
 
 
-async def test_a15_cursor_covers_backlog_never_wraps(store, engine):
-    ids = await stale(store, engine, count=7)
+async def test_a15_cursor_covers_backlog_never_wraps(store, engine, monkeypatch):
+    identities = iter("0" * 25 + str(n) for n in (4, 1, 7, 2, 5, 3, 6))
+    monkeypatch.setattr(f"{__name__}.generate_ulid", lambda: next(identities))
+    ids = sorted(await stale(store, engine, count=7))
     seen, cursor = [], None
     for _ in range(5):
         page = await mark(store, max_runs=3, max_returned=2, cursor=cursor)

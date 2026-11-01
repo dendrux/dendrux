@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
 
+from dendrux.runtime.durability import _safe_database_call
 from dendrux.runtime.stores.sql.base import SQLStateStore
 
 if TYPE_CHECKING:
@@ -89,13 +90,6 @@ class SQLiteStateStore(SQLStateStore):
             return type_coerce(case((kind == "true", True), (kind == "false", False)), Boolean)
         raise ValueError("unsupported JSON read type")
 
-    def metadata_filter_predicate(self, col: Any, metadata_filter: dict[str, Any]) -> Any:
-        from sqlalchemy import and_, func, true
-
-        return and_(
-            true(), *(func.json_extract(col, f"$.{k}") == v for k, v in metadata_filter.items())
-        )
-
     def json_contains(self, col: Any, path: Any, value: Any) -> Any:
         import json
 
@@ -140,10 +134,27 @@ class SQLiteStateStore(SQLStateStore):
         )
         return func.coalesce(
             and_(
-                func.json_type(col, target) == kind,
-                func.json_extract(col, target).is_not_distinct_from(value),
+                func.json_type(col, target).in_(("integer", "real"))
+                if isinstance(value, (int, float)) and not isinstance(value, bool)
+                else func.json_type(col, target) == kind,
+                col.op("->")(target) == json.dumps(value)
+                if isinstance(value, int) and not isinstance(value, bool) and value > 2**63 - 1
+                else func.json_extract(col, target).is_not_distinct_from(value),
             ),
             false(),
+        )
+
+    def metadata_filter_predicate(self, col: Any, metadata_filter: dict[str, Any]) -> Any:
+        from sqlalchemy import and_, func, true
+
+        return and_(
+            true(),
+            *(
+                func.json_extract(col, self._json_path((key,))) == value
+                if isinstance(value, (dict, list))
+                else self.json_contains(col, (key,), value)
+                for key, value in metadata_filter.items()
+            ),
         )
 
     def json_is_null(self, col: Any, path: Any) -> Any:
@@ -176,6 +187,7 @@ class SQLiteStateStore(SQLStateStore):
         # The conditional note INSERT reserves the writer before its count subquery.
         return None
 
+    @_safe_database_call
     async def reserve_parent_writer(self, session: Any, run_id: str) -> None:
         from sqlalchemy import text
 
@@ -193,15 +205,10 @@ class SQLiteStateStore(SQLStateStore):
         return col.in_(select(values.c.value))
 
     def _frontier_scope(self, statement: Any, tenant_id: Any) -> Any:
-        from sqlalchemy import String, bindparam, literal_column
+        from sqlalchemy import literal_column
 
-        from dendrux.runtime.state import _check_scope, _Unscoped
+        from dendrux.runtime.stores.sql import tenant_scope_predicate
 
-        if isinstance(tenant_id, _Unscoped):
-            return statement
-        _check_scope(tenant_id)
         return statement.where(
-            literal_column("+agent_runs.tenant_id").is_not_distinct_from(
-                bindparam("frontier_tenant", tenant_id, type_=String())
-            )
+            tenant_scope_predicate(literal_column("+agent_runs.tenant_id"), tenant_id)
         )

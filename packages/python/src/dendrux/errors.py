@@ -308,6 +308,19 @@ class StoreOutcomeUnknown(PersistenceError):  # noqa: N818 - public compatibilit
         super().__init__(code=self.code)
 
 
+class JSONIntegerOutOfRangeError(PersistenceError):
+    """MySQL cannot preserve a JSON integer outside int64/uint64 exactly."""
+
+    code = "json_integer_out_of_range"
+
+    def __init__(self) -> None:
+        super().__init__(code=self.code)
+        self.safe_message = (
+            "MySQL JSON integers must fit int64 or uint64 (json_integer_out_of_range)."
+        )
+        self.args = (self.safe_message,)
+
+
 class StatementTooLargeError(PersistenceError):
     """The database answered that a statement is larger than ``max_allowed_packet``.
 
@@ -315,8 +328,8 @@ class StatementTooLargeError(PersistenceError):
     nothing was persisted. ``limit`` is the server's ``max_allowed_packet`` in bytes when the
     store knows it, and ``size`` the statement's size when it is known (best effort: usually
     ``None``, because the server does not report it). Values are never part of the message.
-    Servers often close the connection instead of answering; that surfaces as the ordinary
-    persistence error, not as this class.
+    A connection loss is also classified here when a failed statement's bound value
+    exceeds the store's discovered limit. Values are inspected only on failure.
     """
 
     code = "statement_too_large"
@@ -1213,6 +1226,7 @@ class RunFencedError(_KwargsReduceMixin, RuntimeError):
 __all__ = [
     "StoreOutcomeUnknown",
     "StatementTooLargeError",
+    "JSONIntegerOutOfRangeError",
     "NotifierUnavailableError",
     "StoreCapabilityError",
     "RunCancelledError",

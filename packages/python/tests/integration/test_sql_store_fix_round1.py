@@ -150,9 +150,10 @@ async def test_ownership_ack_refused_even_with_fresh_matching_evidence(
 
 
 @pytest.mark.parametrize(
-    "actual,query", [([1, 2], [1]), ([1, 2], 1), (1, True), (2, 2.0), (True, 1)]
+    "actual,query,expected",
+    [([1, 2], [1], True), ([1, 2], 1, False), (1, True, False), (2, 2.0, True), (True, 1, False)],
 )
-async def test_metadata_filter_preserves_backend_matching(store, engine, actual, query):
+async def test_metadata_filter_preserves_backend_matching(store, engine, actual, query, expected):
     from dendrux.errors import PersistenceError
 
     run_id = generate_ulid()
@@ -162,13 +163,6 @@ async def test_metadata_filter_preserves_backend_matching(store, engine, actual,
         with pytest.raises(PersistenceError):
             await store.count_runs(metadata_filter={"key": query})
         return
-    expected = (
-        (actual == query)
-        if engine.dialect.name == "sqlite"
-        else not isinstance(actual, bool) and not isinstance(query, bool)
-    )
-    if engine.dialect.name == "postgresql" and isinstance(actual, list):
-        expected = isinstance(query, list)
     assert await store.count_runs(metadata_filter={"key": query}) == int(expected)
 
 

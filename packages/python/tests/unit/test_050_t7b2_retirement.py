@@ -20,7 +20,14 @@ async def _close_fully(close):
 
 def _load_subject():
     options = types.ModuleType("dendrux.db._engine_options")
-    for name in ("engine_options", "frozen_options", "normalized_url"):
+    for name in (
+        "engine_options",
+        "frozen_options",
+        "normalized_url",
+        "create_engine_with_hint",
+        "is_mysql_family_url",
+        "mysql_dependency_error",
+    ):
         setattr(options, name, Mock())
     guard = types.ModuleType("dendrux.db._pool_guard")
     guard.close_fully = _close_fully

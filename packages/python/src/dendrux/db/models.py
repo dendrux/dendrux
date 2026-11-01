@@ -25,7 +25,6 @@ import datetime  # noqa: TC003 — needed at runtime for SQLAlchemy Mapped[] res
 from typing import Any
 
 from sqlalchemy import (
-    JSON,
     Boolean,
     ForeignKey,
     ForeignKeyConstraint,
@@ -45,6 +44,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from dendrux.db._dialects import is_mysql_family
 from dendrux.db._dialects._mysql_types import (
     MYSQL_TABLE_OPTIONS,
+    json_document,
     long_binary,
     long_text,
     nopad_char,
@@ -69,7 +69,7 @@ class Base(DeclarativeBase):
     """Base class for all Dendrux models."""
 
     type_annotation_map = {
-        dict[str, Any]: JSON,
+        dict[str, Any]: json_document("json"),
     }
 
 
@@ -108,8 +108,12 @@ class AgentRun(Base):
     tenant_id: Mapped[str | None] = mapped_column(nopad_string(255), nullable=True, index=True)
     agent_name: Mapped[str] = mapped_column(nopad_string(255))
     status: Mapped[str] = mapped_column(nopad_string(50), default="pending")
-    input_data: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
-    output_data: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    input_data: Mapped[dict[str, Any] | None] = mapped_column(
+        json_document("input_data"), nullable=True
+    )
+    output_data: Mapped[dict[str, Any] | None] = mapped_column(
+        json_document("output_data"), nullable=True
+    )
     iteration_count: Mapped[int] = mapped_column(Integer, default=0)
 
     model: Mapped[str | None] = mapped_column(nopad_string(255), nullable=True)
@@ -137,14 +141,18 @@ class AgentRun(Base):
     total_reasoning_tokens: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
 
     # Developer's linking data — Dendrux stores it, never reads it
-    meta: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    meta: Mapped[dict[str, Any] | None] = mapped_column(json_document("meta"), nullable=True)
 
     # Pause state — execution state for resume (D1: not observable, not redacted)
     # Cleared on finalize. Contains unredacted history for correct LLM resume.
-    pause_data: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    pause_data: Mapped[dict[str, Any] | None] = mapped_column(
+        json_document("pause_data"), nullable=True
+    )
 
     # Guardrail PII mapping — audit-first, NOT cleared on finalize
-    pii_mapping: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    pii_mapping: Mapped[dict[str, Any] | None] = mapped_column(
+        json_document("pii_mapping"), nullable=True
+    )
 
     # Error details (populated on ERROR status)
     error: Mapped[str | None] = mapped_column(long_text(), nullable=True)
@@ -183,7 +191,7 @@ class AgentRun(Base):
     lease_expired_at: Mapped[datetime.datetime | None] = mapped_column(utc_datetime())
     last_reclaimed_at: Mapped[datetime.datetime | None] = mapped_column(utc_datetime())
     loop_state: Mapped[dict[str, Any] | None] = mapped_column(
-        JSON().with_variant(JSONB(), "postgresql"), nullable=True
+        json_document("loop_state").with_variant(JSONB(), "postgresql"), nullable=True
     )
     trace_link: Mapped[str | None] = mapped_column(nopad_string(64), nullable=True)
 
@@ -275,7 +283,7 @@ class ReactTrace(Base):
     trace_kind: Mapped[str] = mapped_column(nopad_string(16), default="turn", server_default="turn")
     content_digest: Mapped[str | None] = mapped_column(nopad_char(64), nullable=True)
     order_index: Mapped[int] = mapped_column(Integer)
-    meta: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    meta: Mapped[dict[str, Any] | None] = mapped_column(json_document("meta"), nullable=True)
 
     created_at: Mapped[datetime.datetime] = mapped_column(utc_datetime(), default=_utc_now)
     updated_at: Mapped[datetime.datetime] = mapped_column(
@@ -310,13 +318,13 @@ class ToolCallRecord(Base):
     provider_tool_call_id: Mapped[str | None] = mapped_column(nopad_string(255), nullable=True)
     tool_name: Mapped[str] = mapped_column(nopad_string(255))
     target: Mapped[str] = mapped_column(nopad_string(50), default="server")
-    params: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
-    result: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    params: Mapped[dict[str, Any] | None] = mapped_column(json_document("params"), nullable=True)
+    result: Mapped[dict[str, Any] | None] = mapped_column(json_document("result"), nullable=True)
     success: Mapped[bool] = mapped_column(Boolean, default=True)
     duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     iteration_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
     error_message: Mapped[str | None] = mapped_column(long_text(), nullable=True)
-    meta: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    meta: Mapped[dict[str, Any] | None] = mapped_column(json_document("meta"), nullable=True)
     outcome: Mapped[str] = mapped_column(
         nopad_string(16), default="completed", server_default="completed"
     )
@@ -364,7 +372,7 @@ class TokenUsage(Base):
     cache_read_input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     cache_creation_input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     reasoning_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    meta: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    meta: Mapped[dict[str, Any] | None] = mapped_column(json_document("meta"), nullable=True)
 
     created_at: Mapped[datetime.datetime] = mapped_column(utc_datetime(), default=_utc_now)
 
@@ -396,12 +404,20 @@ class LLMInteraction(Base):
     provider: Mapped[str | None] = mapped_column(nopad_string(100), nullable=True)
 
     # Dendrux-normalized payloads
-    semantic_request: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
-    semantic_response: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    semantic_request: Mapped[dict[str, Any] | None] = mapped_column(
+        json_document("semantic_request"), nullable=True
+    )
+    semantic_response: Mapped[dict[str, Any] | None] = mapped_column(
+        json_document("semantic_response"), nullable=True
+    )
 
     # Exact vendor API payloads (opaque JSON)
-    provider_request: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
-    provider_response: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    provider_request: Mapped[dict[str, Any] | None] = mapped_column(
+        json_document("provider_request"), nullable=True
+    )
+    provider_response: Mapped[dict[str, Any] | None] = mapped_column(
+        json_document("provider_response"), nullable=True
+    )
 
     # Token usage
     input_tokens: Mapped[int] = mapped_column(Integer, default=0)
@@ -413,7 +429,9 @@ class LLMInteraction(Base):
     reasoning_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     # Guardrail findings — best-effort enrichment (not authoritative audit)
-    guardrail_findings: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    guardrail_findings: Mapped[dict[str, Any] | None] = mapped_column(
+        json_document("guardrail_findings"), nullable=True
+    )
 
     created_at: Mapped[datetime.datetime] = mapped_column(utc_datetime(), default=_utc_now)
 
@@ -463,7 +481,7 @@ class RunEvent(Base):
     sequence_index: Mapped[int] = mapped_column(Integer, default=0)
     iteration_index: Mapped[int] = mapped_column(Integer, default=0)
     correlation_id: Mapped[str | None] = mapped_column(nopad_string(26), nullable=True)
-    data: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    data: Mapped[dict[str, Any] | None] = mapped_column(json_document("data"), nullable=True)
     content_digest: Mapped[str | None] = mapped_column(nopad_char(64), nullable=True)
 
     created_at: Mapped[datetime.datetime] = mapped_column(utc_datetime(), default=_utc_now)
@@ -505,7 +523,9 @@ class RunInbox(Base):
     )
     text: Mapped[str] = mapped_column(long_text())
     # ``metadata`` is reserved on declarative models; the SQL column keeps the name.
-    metadata_: Mapped[dict[str, Any] | None] = mapped_column("metadata", JSON, nullable=True)
+    metadata_: Mapped[dict[str, Any] | None] = mapped_column(
+        "metadata", json_document("metadata"), nullable=True
+    )
     created_at: Mapped[datetime.datetime] = mapped_column(utc_datetime(), default=_utc_now)
     delivered_at: Mapped[datetime.datetime | None] = mapped_column(utc_datetime(), nullable=True)
     delivered_iteration: Mapped[int | None] = mapped_column(Integer, nullable=True)

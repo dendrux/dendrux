@@ -14,6 +14,8 @@ DbErrorKind = Literal[
     "lock_timeout",
     "connection_lost",
     "statement_too_large",
+    "missing_table",
+    "missing_column",
     "other",
 ]
 
@@ -74,6 +76,8 @@ def classify_error(exc: BaseException) -> DbError:
                 break
         if code == "23505":
             return DbError("unique_violation", constraint, code)
+        if code in ("42P01", "42703"):
+            return DbError("missing_table" if code == "42P01" else "missing_column", code=code)
         if code in ("40P01", "40001"):
             return DbError("deadlock_or_serialization", code=code)
         if code == "55P03":
@@ -85,6 +89,12 @@ def classify_error(exc: BaseException) -> DbError:
         code = getattr(error, "sqlite_errorcode", None)
         if not isinstance(code, int):
             continue
+        if isinstance(error, sqlite3.Error):
+            message = str(error)
+            if message.startswith("no such table:"):
+                return DbError("missing_table", code=code)
+            if message.startswith("no such column:") or " has no column named " in message:
+                return DbError("missing_column", code=code)
         if code & 0xFF in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
             return DbError("lock_timeout", code=code)
         if code in (sqlite3.SQLITE_CONSTRAINT_UNIQUE, sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY):
@@ -122,6 +132,8 @@ def classify_error(exc: BaseException) -> DbError:
                 else None
             )
             return DbError("unique_violation", match[1].rsplit(".", 1)[-1] if match else None, code)
+        if code in (1146, 1054):
+            return DbError("missing_table" if code == 1146 else "missing_column", code=code)
         if code == 1213:
             return DbError("deadlock_or_serialization", code=code)
         if code == 1205:

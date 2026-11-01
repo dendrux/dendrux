@@ -163,26 +163,26 @@ def _has_work(conn: Connection, create_tables: bool) -> bool:
 
 
 def _begin_immediate(conn: Connection) -> None:
-    for attempt in range(_LOCK_ATTEMPTS):
+    for _ in range(_LOCK_ATTEMPTS):
         try:
             conn.exec_driver_sql("BEGIN IMMEDIATE")
             return
-        except OperationalError as exc:
-            if attempt == _LOCK_ATTEMPTS - 1:
-                raise SqliteSchemaSyncError(
-                    f"Could not take the SQLite write lock to upgrade this database's "
-                    f"schema after {_LOCK_ATTEMPTS} attempts: another connection is "
-                    f"holding it ({exc.orig}). Each attempt waits for the connection's "
-                    f"busy timeout (5 seconds by default; raise it with "
-                    f"connect_args={{'timeout': N}}). Retry once the other writer finishes."
-                ) from exc
+        except OperationalError:
+            pass
+    raise SqliteSchemaSyncError(
+        f"Could not take the SQLite write lock to upgrade this database's "
+        f"schema after {_LOCK_ATTEMPTS} attempts: another connection is "
+        f"holding it. Each attempt waits for the connection's "
+        f"busy timeout (5 seconds by default; raise it with "
+        f"connect_args={{'timeout': N}}). Retry once the other writer finishes."
+    ) from None
 
 
 def _rollback(conn: Connection) -> None:
     try:
         conn.exec_driver_sql("ROLLBACK")
     except OperationalError:
-        logger.warning("SQLite schema sync: ROLLBACK failed", exc_info=True)
+        logger.warning("SQLite schema sync: ROLLBACK failed")
 
 
 def _apply(conn: Connection, changes: list[str]) -> None:
@@ -370,11 +370,14 @@ def _add_column(conn: Connection, table: Table, column: Column[Any]) -> None:
                 "UPDATE agent_runs SET status_changed_at = "
                 f"COALESCE(updated_at, created_at, {clock_default})"
             )
-    except OperationalError as exc:
-        raise SqliteSchemaSyncError(
-            f"Could not add column {table.name}.{column.name} to the existing SQLite "
-            f"database ({exc.orig}). {_MIGRATE_HINT}"
-        ) from exc
+    except OperationalError:
+        pass
+    else:
+        return
+    raise SqliteSchemaSyncError(
+        f"Could not add column {table.name}.{column.name} to the existing SQLite "
+        f"database. {_MIGRATE_HINT}"
+    ) from None
 
 
 # ---------------------------------------------------------------------------
@@ -491,13 +494,16 @@ def _reconcile_exact(conn: Connection, table: Table, changes: list[str]) -> None
             continue
         if state != "missing":
             raise SqliteSchemaSyncError(f"Cannot reconcile {table.name}: {state}. {_MIGRATE_HINT}")
+        failure = None
         try:
             conn.exec_driver_sql(want.ddl)
-        except (OperationalError, IntegrityError) as exc:
-            raise SqliteSchemaSyncError(
-                f"Could not create index '{want.name}' on {table.name} ({exc.orig}). If "
+        except (OperationalError, IntegrityError):
+            failure = SqliteSchemaSyncError(
+                f"Could not create index '{want.name}' on {table.name}. If "
                 f"existing rows violate uniqueness, fix them first. {_MIGRATE_HINT}"
-            ) from exc
+            )
+        if failure is not None:
+            raise failure from None
         changes.append(f"created index {want.name}")
 
 
@@ -513,17 +519,20 @@ def _reconcile_indexes(conn: Connection, table: Table, changes: list[str]) -> No
             raise SqliteSchemaSyncError(f"Cannot reconcile {table.name}: {state}. {_MIGRATE_HINT}")
         cols = ", ".join(_quote(conn, c) for c in want.columns)
         unique = "UNIQUE " if want.unique else ""
+        failure = None
         try:
             conn.exec_driver_sql(
                 f"CREATE {unique}INDEX {_quote(conn, want.name)} "
                 f"ON {_quote(conn, table.name)} ({cols})"
             )
-        except (OperationalError, IntegrityError) as exc:
-            raise SqliteSchemaSyncError(
+        except (OperationalError, IntegrityError):
+            failure = SqliteSchemaSyncError(
                 f"Could not create {unique.lower()}index '{want.name}' on "
-                f"{table.name}({', '.join(want.columns)}) ({exc.orig}). If existing rows "
+                f"{table.name}({', '.join(want.columns)}). If existing rows "
                 f"violate uniqueness, fix them first. {_MIGRATE_HINT}"
-            ) from exc
+            )
+        if failure is not None:
+            raise failure from None
         changes.append(f"created {unique.lower()}index {want.name}")
         indexes = _table_indexes(conn, table)
         owners = _index_owners(conn)

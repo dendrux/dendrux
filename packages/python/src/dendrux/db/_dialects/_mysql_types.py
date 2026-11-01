@@ -12,7 +12,7 @@ from __future__ import annotations
 import datetime as dt
 from typing import Any
 
-from sqlalchemy import CHAR, DateTime, LargeBinary, String, Text, func
+from sqlalchemy import CHAR, JSON, DateTime, LargeBinary, String, Text, func
 from sqlalchemy.dialects.mysql import DATETIME, LONGBLOB, LONGTEXT
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.sql.functions import FunctionElement
@@ -42,6 +42,16 @@ class NoPadString(String):
 
 class NoPadChar(CHAR):
     """``CHAR(n)`` in utf8mb4 with the server's NO PAD binary collation."""
+
+
+class NoPadLongText(LONGTEXT):
+    """``LONGTEXT`` with the server's NO PAD binary collation."""
+
+
+@compiles(NoPadLongText, "mysql")
+@compiles(NoPadLongText, "mariadb")
+def _compile_longtext_mysql(type_: NoPadLongText, compiler: Any, **kw: Any) -> str:
+    return f"LONGTEXT CHARACTER SET utf8mb4 COLLATE {nopad_collation(compiler.dialect)}"
 
 
 @compiles(NoPadString)
@@ -125,7 +135,7 @@ def nopad_char(length: int) -> TypeEngine[str]:
 
 def long_text() -> TypeEngine[str]:
     """``Text``; ``LONGTEXT`` on MySQL/MariaDB (plain TEXT stops at 64 KiB)."""
-    return Text().with_variant(LONGTEXT(), *_FAMILY)
+    return Text().with_variant(NoPadLongText(), *_FAMILY)
 
 
 def long_binary() -> TypeEngine[bytes]:
@@ -144,3 +154,39 @@ MYSQL_TABLE_OPTIONS: dict[str, Any] = {
     for option, value in (("engine", "InnoDB"), ("default_charset", "utf8mb4"))
 }
 """Table keyword arguments: InnoDB, utf8mb4 (ignored by every other dialect)."""
+
+
+class CheckedMySQLJSON(TypeDecorator[Any]):
+    """Validate each JSON bind independently before MySQL can round integers."""
+
+    impl = JSON
+    cache_ok = True
+
+    def __init__(self, field: str) -> None:
+        super().__init__()
+        self.field = field
+
+    def process_bind_param(self, value: Any, dialect: Any) -> Any:
+        if not is_mariadb(dialect):
+            from dendrux import _codes
+            from dendrux.errors import JSONIntegerOutOfRangeError
+            from dendrux.types import _persistable_nodes
+
+            for item, _ in _persistable_nodes(value, self.field):
+                if (
+                    isinstance(item, int)
+                    and not isinstance(item, bool)
+                    and not -(2**63) <= item < 2**64
+                ):
+                    import logging
+
+                    _codes.log_code(
+                        logging.getLogger(__name__), _codes.PERSISTENCE_ERROR, run_id=None
+                    )
+                    raise JSONIntegerOutOfRangeError()
+        return value
+
+
+def json_document(field: str) -> Any:
+    """Generic JSON with a per-field MySQL bind validator; DDL is unchanged."""
+    return JSON().with_variant(CheckedMySQLJSON(field), *_FAMILY)

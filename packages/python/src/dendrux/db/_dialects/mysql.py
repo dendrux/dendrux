@@ -255,7 +255,11 @@ def _expected_column(column: Column[Any], dialect: Dialect, ddl: Any) -> ColumnS
         precision=args if data_type in {"decimal", "datetime"} else None,
         nullable=bool(column.nullable),
         default=_normal_default(ddl.get_column_default_string(column)),
-        collation=collation[1] if collation and data_type in {"varchar", "char"} else None,
+        collation="utf8mb4_bin"
+        if kind == "JSON" and _is_mariadb(dialect)
+        else collation[1]
+        if collation and data_type in {"varchar", "char", "longtext"}
+        else None,
     )
 
 
@@ -379,7 +383,7 @@ def read_catalog(conn: Connection, tables: Collection[str]) -> Catalog:
             precision=precision,
             nullable=row[7] == "YES",
             default=None if expression else _normal_default(row[8]),
-            collation=row[9] if data_type in {"varchar", "char"} else None,
+            collation=row[9] if data_type in {"varchar", "char", "longtext"} else None,
             generated=f"{stored}:{expression}" if expression else None,
         )
     grouped: dict[tuple[str, str], tuple[bool, list[tuple[str, str]]]] = {}
@@ -492,9 +496,8 @@ def table_problems(
         problems.append(
             f"{name} (foreign key {', '.join(key[0])} -> {key[1]} missing or different)"
         )
-    if exact:
-        for key in sorted(actual.foreign_keys - expected.foreign_keys):
-            problems.append(f"{name} (unexpected foreign key {', '.join(key[0])} -> {key[1]})")
+    for key in sorted(actual.foreign_keys - expected.foreign_keys):
+        problems.append(f"{name} (unexpected foreign key {', '.join(key[0])} -> {key[1]})")
     return problems
 
 
@@ -512,8 +515,8 @@ class SchemaReport:
 def check(conn: Connection, *, exact: bool = False, settings: bool = True) -> SchemaReport:
     """Compare the live schema with the head definition (read-only, five queries).
 
-    ``exact`` also reports extra columns and foreign keys (the bootstrap's rule); the
-    runtime check ignores extras, as on Postgres. Extra unique indexes are always
+    ``exact`` also reports extra columns (the bootstrap's rule). Unexpected
+    foreign keys and extra unique indexes are always
     reported: they can reject writes the store expects to succeed.
     """
     dialect = conn.dialect

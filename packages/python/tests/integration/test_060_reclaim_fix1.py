@@ -243,6 +243,9 @@ async def test_p2_custom_store_finalises_unrecoverable(store, engine):
         async def reclaim_run(self, *args, **kwargs):
             return await store.reclaim_run(*args, **kwargs)
 
+        async def get_replayed_tool_calls(self, *args, **kwargs):
+            return await store.get_replayed_tool_calls(*args, **kwargs)
+
         async def mark_lease_expired(self, *, finalise_unrecoverable=False, **kwargs):
             assert finalise_unrecoverable
             return await store.mark_lease_expired(

@@ -22,7 +22,7 @@ from dendrux import Agent
 from dendrux.db import session as db_session
 from dendrux.db._storage_schema import ADDITIONS
 from dendrux.db.models import Base
-from dendrux.errors import PersistenceError, SchemaNotInitializedError, SchemaOutOfDateError
+from dendrux.errors import SchemaNotInitializedError, SchemaOutOfDateError
 from dendrux.llm.mock import MockLLM
 from dendrux.runtime.sweep import sweep
 from dendrux.store import RunStore
@@ -208,13 +208,19 @@ async def test_skip_env_var_bypasses_the_check(
 ) -> None:
     await _build_previous_schema(pg_url)
     monkeypatch.setenv("DENDRUX_SKIP_SCHEMA_CHECK", "1")
+    from dendrux.db import _schema_check
+
+    def no_catalog_read(*args):
+        raise AssertionError("the startup catalog check was not skipped")
+
+    monkeypatch.setattr(_schema_check, "read_actual_schema", no_catalog_read)
     agent = _agent(pg_url)
     try:
-        with pytest.raises(PersistenceError) as info:
+        with pytest.raises(SchemaOutOfDateError, match="dendrux db migrate") as info:
             await agent.run("hi")
     finally:
         await agent.close()
-    assert not isinstance(info.value, SchemaOutOfDateError)
+    assert info.value.missing == ()
 
 
 async def test_empty_database_still_says_not_initialized(pg_url: str) -> None:
