@@ -11,6 +11,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+import pytest
+
 from dendrux.runtime.persistence import PersistenceRecorder
 from dendrux.types import (
     LLMResponse,
@@ -263,19 +265,30 @@ class TestResumeCoreCAsBugFix:
     """Verifies that _resume_core now checks finalize_run result
     before emitting run.error, matching the pattern in run()."""
 
-    async def test_resume_core_error_event_requires_cas_win(self) -> None:
-        """After fix, error event is only emitted if CAS wins."""
-        # This is a structural test — we verify the code pattern.
-        # Reading the source to confirm the fix is in place.
-        import inspect
+    @pytest.mark.parametrize("won", [False, True])
+    async def test_resume_core_error_event_requires_cas_win(self, won) -> None:
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
 
         from dendrux.runtime import runner
 
-        source = inspect.getsource(runner._resume_core)
-
-        # The fix: error_won check before _emit_event in the except block
-        assert "error_won" in source, "_resume_core should use error_won CAS check"
-        assert "if error_won:" in source, "_resume_core should guard emit with 'if error_won:'"
+        store = SimpleNamespace(
+            finalize_run=AsyncMock(return_value=won), save_run_event=AsyncMock(return_value=0)
+        )
+        await runner._handle_resume_failure(
+            store,
+            "run_1",
+            "waiting_client_tool",
+            None,
+            RuntimeError("resume failure"),
+            runner._ResumeProgress(started=True),
+            True,
+            {},
+        )
+        store.finalize_run.assert_awaited_once()
+        assert store.save_run_event.await_count == int(won)
+        if won:
+            assert store.save_run_event.call_args.kwargs["event_type"] == "run.error"
 
 
 # ------------------------------------------------------------------

@@ -1079,14 +1079,14 @@ class RunStore:
             method,
             run_id,
             tenant_id,
-            event_types=["run.paused", "run.resumed"],
+            event_types=["run.paused", "run.resumed", "run.resume_aborted"],
             limit=row_limit,
             **kwargs,
         )
         rows = rows or []
         pairs = _derive_pauses(rows)
         truncated = len(rows) == row_limit or len(pairs) > limit
-        if len(rows) == row_limit and pairs and pairs[-1].resume_sequence_index is None:
+        if _unresolved_pause_tail(pairs, rows, row_limit):
             pairs.pop()  # unresolved lookahead is not represented as an active pause
         items = []
         past = PastParams()
@@ -1487,8 +1487,29 @@ def _tool_to_public(record: Any) -> ToolInvocation:
     )
 
 
+def _unresolved_pause_tail(pairs: list[PausePair], rows: list[Any], row_limit: int) -> bool:
+    if len(rows) != row_limit or not pairs:
+        return False
+    resume = pairs[-1].resume_sequence_index
+    return resume is None or resume == rows[-1].sequence_index
+
+
+def _effective_pause_events(events: list[Any]) -> list[Any]:
+    aborted: set[int] = set()
+    resume = None
+    for event in events:
+        if event.event_type == "run.resumed":
+            resume = event.sequence_index
+        elif event.event_type == "run.resume_aborted" and resume is not None:
+            aborted.add(resume)
+            resume = None
+        elif event.event_type == "run.paused":
+            resume = None
+    return [event for event in events if event.sequence_index not in aborted]
+
+
 def _derive_pauses(events: list[Any]) -> list[PausePair]:
-    """Pair ``run.paused`` with the nearest following ``run.resumed``.
+    """Pair ``run.paused`` with the nearest following non-aborted ``run.resumed``.
 
     Pairing limitation: pairing is order-based, not
     correlation-id-based. An id-based fix will upgrade this function once
@@ -1496,7 +1517,7 @@ def _derive_pauses(events: list[Any]) -> list[PausePair]:
     """
     pauses: list[PausePair] = []
     pending: Any | None = None
-    for ev in events:
+    for ev in _effective_pause_events(events):
         if ev.event_type == "run.paused":
             if pending is not None:
                 pauses.append(_build_pause_pair(pending, None))

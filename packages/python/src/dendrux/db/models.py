@@ -467,7 +467,7 @@ class RunEvent(Base):
 
     Event types:
         run.started, run.completed, run.error, run.cancelled,
-        run.paused, run.resumed,
+        run.paused, run.resumed, run.resume_aborted,
         llm.completed, tool.completed
     """
 

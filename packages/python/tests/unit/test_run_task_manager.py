@@ -219,3 +219,56 @@ async def test_owned_task_interrupt_follows_registration_order(target_index):
         other.cancel()
         await asyncio.gather(task, other, return_exceptions=True)
     assert not manager._pending and not manager._owned
+
+
+@pytest.mark.parametrize("observe", [True, False])
+async def test_replaced_owner_cleans_only_its_own_pending_interrupt(observe):
+    manager = RunTaskManager()
+    run_id = "00000000000000000000000105"
+    old_ready, old_cancelled, new_ready = (asyncio.Event() for _ in range(3))
+    finish_old, finish_new = asyncio.Event(), asyncio.Event()
+
+    async def work(ready, finish, *, old):
+        manager.register_current(run_id)
+        ready.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            if old:
+                old_cancelled.set()
+            await finish.wait()
+            task = asyncio.current_task()
+            if observe or not old:
+                assert manager.take_interrupt(run_id) == (True, False)
+                assert task.uncancel() == 0
+            manager.release_current(run_id)
+            assert task.cancelling() == 0
+
+    old = manager.spawn(run_id, work(old_ready, finish_old, old=True))
+    new = None
+    try:
+        await asyncio.wait_for(old_ready.wait(), 5)
+        assert manager.cancel(run_id)
+        await asyncio.wait_for(old_cancelled.wait(), 5)
+        new = manager.spawn(run_id, work(new_ready, finish_new, old=False))
+        await asyncio.wait_for(new_ready.wait(), 5)
+        assert manager.cancel(run_id)
+        await asyncio.sleep(0)
+        finish_old.set()
+        await asyncio.wait_for(old, 5)
+        assert old not in manager._pending
+        assert manager._pending[new] == {run_id}
+        assert manager._owned[run_id] is new
+        assert manager._tasks[run_id] is new
+        finish_new.set()
+        await asyncio.wait_for(new, 5)
+        assert not manager._pending and not manager._owned and not manager._tasks
+    finally:
+        finish_old.set()
+        finish_new.set()
+        for task in (old, new):
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(
+            *(task for task in (old, new) if task is not None), return_exceptions=True
+        )

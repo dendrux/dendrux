@@ -171,6 +171,6 @@ async def test_malformed_manifest_fails_without_stuck_claim(store, claimed):
         action = b.submit_tool_results(paused.run_id, [result])
     with pytest.raises(ValueError, match="skill manifest"):
         await action
-    assert (await store.get_run(paused.run_id)).status == (
-        "error" if claimed else "waiting_client_tool"
-    )
+    row = await store.get_run(paused.run_id)
+    assert row.status == "waiting_client_tool"
+    assert row.claim_epoch == int(claimed)

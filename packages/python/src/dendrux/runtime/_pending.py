@@ -495,6 +495,21 @@ def _accepts_tenant(method: Any) -> bool:
         return False
 
 
+def _active_pause_from_events(rows: list[Any]) -> int | None:
+    if (
+        not rows
+        or len(rows) == 1000
+        or rows[-1].event_type not in {"run.paused", "run.resume_aborted"}
+    ):
+        return None
+    for row in reversed(rows):
+        if row.event_type in {"run.completed", "run.error", "run.cancelled"}:
+            return None
+        if row.event_type == "run.paused":
+            return int(row.sequence_index)
+    return None
+
+
 class _PendingReader:
     """The same read/scoping policy for Agent, runtime and RunStore."""
 
@@ -585,12 +600,17 @@ class _PendingReader:
             self._state.get_run_events,
             run_id,
             tenant_id,
-            event_types=["run.paused", "run.resumed"],
+            event_types=[
+                "run.paused",
+                "run.resumed",
+                "run.resume_aborted",
+                "run.completed",
+                "run.error",
+                "run.cancelled",
+            ],
             limit=1000,
         )
-        if not rows or len(rows) == 1000 or rows[-1].event_type != "run.paused":
-            return None
-        return int(rows[-1].sequence_index)
+        return _active_pause_from_events(rows)
 
     async def _approval_params(
         self, run_id: str, seq: int | None, tenant_id: TenantScope = UNSCOPED

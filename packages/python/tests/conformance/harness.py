@@ -998,7 +998,15 @@ def project_additive_columns(
 def normalised_corpus(view: dict[str, Any]) -> dict[str, Any]:
     """Normalise a corpus view; its rows are compared without the additive 0.6 columns."""
     if "rows" in view:
-        view = {**view, "rows": project_additive_columns(view["rows"])}
+        rows = project_additive_columns(view["rows"])
+        for row in rows.get("agent_runs", []):
+            if row.get("retry_of_run_id") is not None and isinstance(row.get("meta"), dict):
+                row["meta"] = {
+                    key: value
+                    for key, value in row["meta"].items()
+                    if key != "dendrux.max_delegation_depth"
+                }
+        view = {**view, "rows": rows}
     return _norm(_project_mapped_provider_codes(view))
 
 

@@ -54,7 +54,7 @@ if TYPE_CHECKING:
     from dendrux.media._catalog import BlobEdge
     from dendrux.media._policy import ImagePolicy, Origin
     from dendrux.media._runtime import ImageRuntime
-    from dendrux.runtime.state import StateStore
+    from dendrux.runtime.state import EventWrite, StateStore
     from dendrux.types import ContentPart
 
 __all__ = [
@@ -85,6 +85,9 @@ __all__ = [
 ]
 
 DEFAULT_DENIAL_REASON = "User declined to run this tool."
+RESUME_FAILURE_KINDS = frozenset(
+    {"setup_error", "validation_error", "persistence_error", "cancelled"}
+)
 
 
 _TERMINAL_STATUSES = frozenset(
@@ -298,21 +301,8 @@ async def claim_paused_validated(
             if current is None:
                 raise ValueError("Claimed run has no pause state")
             validate(current)
-        except BaseException:
-            release = getattr(store, "release_run_claim", None)
-            if (
-                release is not None
-                and isinstance(epoch, (int, ClaimResult))
-                and not isinstance(epoch, bool)
-            ):
-                import anyio
-
-                with anyio.CancelScope(shield=True):
-                    await release(
-                        run_id,
-                        status=expected_status,
-                        claim_epoch=epoch.claim_epoch if isinstance(epoch, ClaimResult) else epoch,
-                    )
+        except BaseException as exc:
+            await _release_claim_result(store, run_id, expected_status, epoch, exc)
             raise
     return epoch
 
@@ -476,21 +466,8 @@ async def claim_or_raise(
         if agent is not None:
             try:
                 await report_governance_change(agent, store, run_id, raw)
-            except BaseException:
-                release = getattr(store, "release_run_claim", None)
-                if (
-                    release is not None
-                    and isinstance(won, (int, ClaimResult))
-                    and not isinstance(won, bool)
-                ):
-                    import anyio
-
-                    with anyio.CancelScope(shield=True):
-                        await release(
-                            run_id,
-                            status=expected_status.value,
-                            claim_epoch=won.claim_epoch if isinstance(won, ClaimResult) else won,
-                        )
+            except BaseException as exc:
+                await _release_claim_result(store, run_id, expected_status.value, won, exc)
                 raise
         return won
 
@@ -512,6 +489,102 @@ async def claim_or_raise(
         # Unusual — paused status changed between preflight and CAS.
         raise PauseStatusMismatchError(run_id, current, expected_status)
     raise RunNotPausedError(run_id, current)
+
+
+async def _release_claim_result(
+    store: StateStore,
+    run_id: str,
+    status: str,
+    result: ClaimResult | int | bool,
+    failure: BaseException,
+) -> None:
+    epoch = result.claim_epoch if isinstance(result, ClaimResult) else result
+    token = epoch if isinstance(epoch, int) and not isinstance(epoch, bool) else None
+    await release_claim(store, run_id, status, claim_epoch=token, failure=failure)
+
+
+def _resume_failure_kind(failure: BaseException | None) -> str:
+    from dendrux.errors import PersistenceError
+
+    if isinstance(failure, asyncio.CancelledError):
+        return "cancelled"
+    if isinstance(failure, PersistenceError):
+        return "persistence_error"
+    if isinstance(failure, (ValueError, KeyError, TypeError)):
+        return "validation_error"
+    return "setup_error"
+
+
+def _resume_aborted_event(status: str, failure: BaseException | None) -> EventWrite | None:
+    from dendrux.runtime.state import EventWrite
+    from dendrux.types import generate_ulid
+
+    if RunStatus(status) not in _PAUSE_STATUSES:
+        return None
+    return EventWrite(
+        generate_ulid(),
+        "run.resume_aborted",
+        0,
+        {"failure_kind": _resume_failure_kind(failure)},
+        None,
+        None,
+    )
+
+
+async def _release_with_event(
+    store: StateStore, release: Any, run_id: str, status: str, epoch: int, event: EventWrite | None
+) -> bool:
+    import inspect
+
+    from dendrux.runtime.state import unclaimed_store
+
+    implementation = getattr(unclaimed_store(store), "release_run_claim", release)
+    params = inspect.signature(implementation).parameters
+    atomic = "event" in params
+    kwargs = {"event": event} if event is not None and atomic else {}
+    won = await release(run_id, status=status, claim_epoch=epoch, **kwargs)
+    if won and event is not None and not atomic:
+        await store.save_run_event(
+            run_id,
+            event_type=event.event_type,
+            data=event.data,
+            event_id=event.event_id,
+            claim_epoch=epoch,
+        )
+    return bool(won)
+
+
+async def release_claim(
+    store: StateStore,
+    run_id: str,
+    status: str,
+    *,
+    claim_epoch: int | None = None,
+    failure: BaseException | None = None,
+) -> None:
+    """Drain claim release, preserving failures unless the caller cancels."""
+    import logging
+
+    from dendrux.runtime.tasks import _drain_cleanup
+
+    epoch = claim_epoch if claim_epoch is not None else getattr(store, "claim_epoch", None)
+    release = getattr(store, "release_run_claim", None)
+    if epoch is None or release is None:
+        _codes.log_code(logging.getLogger(__name__), _codes.PERSISTENCE_ERROR, run_id=run_id)
+        return
+    event = _resume_aborted_event(status, failure)
+
+    async def cleanup() -> None:
+        try:
+            if await _release_with_event(store, release, run_id, status, epoch, event):
+                return
+        except (Exception, asyncio.CancelledError):
+            pass
+        _codes.log_code(logging.getLogger(__name__), _codes.PERSISTENCE_ERROR, run_id=run_id)
+
+    _, cancelled = await _drain_cleanup(cleanup(), name=f"release-claim:{run_id}")
+    if cancelled is not None:
+        raise cancelled
 
 
 def build_rejection_results(

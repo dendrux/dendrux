@@ -38,6 +38,36 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T")
 
 
+async def _drain_cleanup(
+    coro: Coroutine[Any, Any, T], *, name: str | None = None
+) -> tuple[T, asyncio.CancelledError | None]:
+    import anyio
+
+    cancellation = None
+    with anyio.CancelScope(shield=True):
+        task = asyncio.create_task(coro, name=name)
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError as exc:
+                if cancellation is None:
+                    cancellation = exc
+        try:
+            result = task.result()
+        except BaseException:
+            if cancellation is not None:
+                raise cancellation from None
+            raise
+    return result, cancellation
+
+
+def _forget_current(tasks: dict[str, asyncio.Task[Any]], run_id: str) -> asyncio.Task[Any] | None:
+    task = asyncio.current_task()
+    if tasks.get(run_id) is task:
+        tasks.pop(run_id, None)
+    return task
+
+
 class RunTaskManager:
     """Tracks background asyncio.Tasks for agent runs in the current process.
 
@@ -101,7 +131,7 @@ class RunTaskManager:
             _codes.log_code(logger, _codes.RUN_FAILED, run_id=run_id, error_type=error_type)
             raise
         finally:
-            self._tasks.pop(run_id, None)
+            _forget_current(self._tasks, run_id)
 
     def cancel(self, run_id: str) -> bool:
         """Cancel the tracked task and/or set the interrupt signal for ``run_id``.
@@ -149,7 +179,7 @@ class RunTaskManager:
         cancellation to another run (an ancestor sharing the task), in which
         case the runner must keep propagating it.
         """
-        task = self._owned.get(run_id)
+        task = asyncio.current_task()
         if task is None:
             return False, False
         pending = self._pending.get(task)
@@ -161,15 +191,17 @@ class RunTaskManager:
         return True, bool(pending)
 
     def release_current(self, run_id: str) -> None:
-        """Forget ``run_id``'s task. No-op if unknown.
+        """Forget ``run_id``'s task only if the current task still owns it.
 
         An interrupt still pending here was never observed (the tool that
         received the ``CancelledError`` swallowed it); its cancel request is
         withdrawn so it cannot leak into the caller's later awaits.
         """
-        task = self._owned.pop(run_id, None)
+        task = _forget_current(self._owned, run_id)
         if task is None:
             return
+        # A newer claim may already own this run. Pending cancellation still
+        # belongs to the old task and must be withdrawn from that task only.
         pending = self._pending.get(task)
         if pending and run_id in pending:
             pending.discard(run_id)

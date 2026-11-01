@@ -39,7 +39,7 @@ from dendrux.runtime._pending import (
     pause_window_start,
     unknown_tool_calls,
 )
-from dendrux.runtime.submit import DEFAULT_DENIAL_REASON
+from dendrux.runtime.submit import DEFAULT_DENIAL_REASON, RESUME_FAILURE_KINDS
 from dendrux.skills._session import NAMES as SKILL_TOOL_NAMES
 from dendrux.tools._limits import MAX_CALLS_CODE, SIZE_LIMIT_CODE
 from dendrux.tools._validate import (
@@ -342,6 +342,7 @@ _PENDING_CALL: dict[str, Check] = {
     "args_hidden": _bool,
 }
 _SCHEMAS: dict[str, dict[str, Check]] = {
+    "run.resume_aborted": {"failure_kind": _enum(RESUME_FAILURE_KINDS)},
     # runtime/runner.py: Agent(name=...) and the retried run's id
     "run.started": {"agent_name": _declared, "retry_of": _generated_id},
     # runner._pause_event_data; params only for the active pause (in _special);
@@ -901,6 +902,7 @@ def _with_recorded_args(
 PAUSE_VIEW_EVENTS = frozenset({"run.paused", "approval.requested"})
 # Event types after which a cached view of the active pause may be out of date.
 PAUSE_CHANGING_EVENTS = PAUSE_VIEW_EVENTS | {
+    "run.resume_aborted",
     "run.resumed",
     "run.completed",
     "run.error",

@@ -109,6 +109,13 @@ logger = logging.getLogger(__name__)
 _COMMIT_READBACK_LOCK_TIMEOUT_MS = 5000
 
 
+async def _write_release_event(
+    session: AsyncSession, run_id: str, won: Any, event: EventWrite | None
+) -> None:
+    if won and event is not None:
+        await _write_event(session, run_id, event)
+
+
 class _UpdatedRows:
     def __init__(self, rows: Sequence[Any]) -> None:
         self._rows = list(rows)
@@ -3119,6 +3126,11 @@ class SQLStateStore(SQLBlobCatalog):
             .where(RunEvent.agent_run_id == run_id, RunEvent.event_type == "run.paused")
             .scalar_subquery()
         )
+        aborted = (
+            select(func.coalesce(func.max(RunEvent.sequence_index), -1))
+            .where(RunEvent.agent_run_id == run_id, RunEvent.event_type == "run.resume_aborted")
+            .scalar_subquery()
+        )
         invalidated = (
             select(func.coalesce(func.max(RunEvent.sequence_index), -1))
             .where(
@@ -3126,6 +3138,7 @@ class SQLStateStore(SQLBlobCatalog):
                 RunEvent.event_type.in_(
                     ["run.resumed", "run.completed", "run.error", "run.cancelled"]
                 ),
+                (RunEvent.event_type != "run.resumed") | (RunEvent.sequence_index > aborted),
             )
             .scalar_subquery()
         )
@@ -3547,7 +3560,58 @@ class SQLStateStore(SQLBlobCatalog):
             _attempt, label="submit_and_claim", run_id=run_id, classify=self.classify_db_error
         )
 
-    async def release_run_claim(self, run_id: str, *, status: str, claim_epoch: int) -> bool:
+    async def _finish_claim_release(
+        self,
+        session: AsyncSession,
+        run_id: str,
+        claim_epoch: int,
+        won: bool,
+        event: EventWrite | None,
+    ) -> bool:
+        if won:
+            await _write_release_event(session, run_id, won, event)
+            return True
+        return await self._cancel_claim_release(session, run_id, claim_epoch)
+
+    async def _cancel_claim_release(
+        self, session: AsyncSession, run_id: str, claim_epoch: int
+    ) -> bool:
+        from dendrux.db.models import AgentRun
+
+        requested = await session.scalar(
+            self.lock_clause(
+                select(AgentRun.cancel_requested).where(
+                    AgentRun.id == run_id,
+                    AgentRun.status == "running",
+                    AgentRun.claim_epoch == claim_epoch,
+                    AgentRun.cancel_requested.is_(True),
+                ),
+                "update",
+            )
+        )
+        if not requested:
+            return False
+        won = await self._cas_finalize(
+            session,
+            run_id,
+            status="cancelled",
+            allowed_current_statuses=["running"],
+            claim_epoch=claim_epoch,
+            answer=None,
+            error=None,
+            iteration_count=None,
+            total_usage=None,
+            pii_mapping=None,
+        )
+        if won:
+            await _insert_event_locked(
+                session, run_id, "run.cancelled", {"reason": "cancel_requested"}
+            )
+        return won
+
+    async def release_run_claim(
+        self, run_id: str, *, status: str, claim_epoch: int, event: EventWrite | None = None
+    ) -> bool:
         """Return an owned claim to its pause after post-claim validation fails."""
         from sqlalchemy import update
 
@@ -3561,13 +3625,17 @@ class SQLStateStore(SQLBlobCatalog):
                         AgentRun.id == run_id,
                         AgentRun.status == "running",
                         AgentRun.claim_epoch == claim_epoch,
+                        AgentRun.cancel_requested.is_(False),
                     )
                     .ordered_values(
                         *self._ordered(AgentRun.__table__, dict(**_status_values(status)))
                     )
                 )
+                won = await self._finish_claim_release(
+                    session, run_id, claim_epoch, bool(result.rowcount), event
+                )
                 await self._write_tx(session)
-                return bool(result.rowcount)
+                return won
 
         return await retry_transient_db(
             attempt, label="release_run_claim", run_id=run_id, classify=self.classify_db_error
