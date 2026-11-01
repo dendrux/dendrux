@@ -1,4 +1,4 @@
-.PHONY: test test-model-check test-model-install test-dbs-up test-dbs-down test-mysql bench load load-quick load-pg load-mysql load-mariadb lint typecheck arch crap api-check format package-smoke ci clean
+.PHONY: test test-model-check test-model-install test-dbs-up test-dbs-down test-mysql bench load load-quick load-pg load-mysql load-mariadb lint typecheck arch crap cognitive duplicates deadcode cycles semgrep quality quality-stamp api-check format package-smoke ci clean
 
 # Benchmarks measure the server, not the code, so they are not part of the gates.
 test: test-model-check
@@ -19,10 +19,43 @@ lint:
 typecheck:
 	mypy src/dendrux/
 
-# CRAP ratchet. Needs coverage.json, which `make test` writes.
-# Report only: the hotspot list feeds refactor work; it never fails CI.
+# CRAP ratchet. Needs coverage.json, which `make test` writes. Enforcing: a new function over
+# the threshold, or an existing one whose score rises, fails (tools/QUALITY.md).
+# Scores are only comparable with CI-grade coverage: set DENDRUX_TEST_PG_URL for `make test`,
+# or the skipped Postgres tests lower coverage and the ratchet reports false regressions.
 crap:
-	python tools/crap_ratchet.py check --report-only --coverage coverage.json
+	python tools/crap_ratchet.py check --coverage coverage.json
+
+# Quality gates (tools/QUALITY.md). Each one is a ratchet against a committed baseline:
+# a new problem, or an existing one getting worse, fails. `make quality-stamp` rewrites the
+# baselines after an improvement; it refuses to record a new problem.
+cognitive:
+	python tools/cognitive_ratchet.py check
+
+duplicates:
+	python tools/duplicate_ratchet.py check
+
+deadcode:
+	python tools/vulture_ratchet.py check
+
+cycles:
+	python tools/import_cycles.py check
+
+# Needs semgrep (tools/semgrep-requirements.txt) in its own environment; point to it with
+# `make semgrep SEMGREP=/path/to/semgrep` when it is not on PATH.
+semgrep:
+	python tools/semgrep_ratchet.py test
+	python tools/semgrep_ratchet.py check
+
+quality: cognitive duplicates deadcode cycles semgrep crap
+
+quality-stamp:
+	python tools/cognitive_ratchet.py stamp
+	python tools/duplicate_ratchet.py stamp
+	python tools/vulture_ratchet.py stamp
+	python tools/import_cycles.py stamp
+	python tools/semgrep_ratchet.py stamp
+	python tools/crap_ratchet.py update --coverage coverage.json
 
 # MySQL 8.4 and MariaDB 10.11 test servers (docker/test-dbs.compose.yml): only the
 # dendrux-test-mysql and dendrux-test-mariadb containers, on 127.0.0.1:53306 / 53307.
@@ -96,7 +129,7 @@ format:
 package-smoke:
 	python scripts/mcp_distribution_smoke.py
 
-ci: lint typecheck arch test crap api-check
+ci: lint typecheck arch test crap quality api-check
 
 clean:
 	rm -rf dist/ build/ *.egg-info .pytest_cache .mypy_cache .ruff_cache htmlcov .coverage coverage.json coverage.json.sources.json
