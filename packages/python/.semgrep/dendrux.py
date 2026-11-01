@@ -5,9 +5,11 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-class Store:
+class SQLStateStore(Base):
     async def _write_tx(self, session):
-        # ok: session-commit-outside-write-tx
+        # The rule matches this commit too: the ratchet exempts exactly SQLStateStore._write_tx
+        # (and helpers nested in it) through allow_in, which tests/tools covers.
+        # ruleid: session-commit-outside-write-tx
         await session.commit()
 
     async def append(self, session):
@@ -22,16 +24,40 @@ class Store:
         # ok: session-commit-outside-write-tx
         await self._write_tx(session)
 
+    async def other_method(self, session):
+        async def _write_tx(session):
+            # ruleid: session-commit-outside-write-tx
+            await session.commit()
 
-async def callers(extra):
+        await _write_tx(session)
+
+
+class OtherStore:
+    async def _write_tx(self, session):
+        # ruleid: session-commit-outside-write-tx
+        await session.commit()
+
+
+async def _write_tx(session):
+    # ruleid: session-commit-outside-write-tx
+    await session.commit()
+
+
+async def callers(extra, image_kwargs):
     # ruleid: process-tool-calls-without-tenant
     await _process_tool_calls(step=1, run_id="r")
+    # ruleid: process-tool-calls-without-tenant
+    await _process_tool_calls(step=1, **{})
+    # ruleid: process-tool-calls-without-tenant
+    await _process_tool_calls(step=1, **extra)
+    # ruleid: process-tool-calls-without-tenant
+    await _process_tool_calls(step=1, **image_kwargs(extra))
     # ok: process-tool-calls-without-tenant
     await _process_tool_calls(step=1, run_id="r", tenant_id=None)
     # ok: process-tool-calls-without-tenant
     await _process_tool_calls(step=1, tenant_id=tenant, run_id="r")
     # ok: process-tool-calls-without-tenant
-    await _process_tool_calls(step=1, **extra)
+    await _process_tool_calls(step=1, tenant_id=tenant, **image_kwargs(extra))
 
 
 async def _process_tool_calls(*, step, run_id, tenant_id=None):
@@ -65,13 +91,35 @@ def handler(run_id, record):
         # ruleid: str-exc-in-log
         logger.info(f"failed: {str(exc)}")
         # ruleid: str-exc-in-log
+        logger.error("failed", extra={"error_info": str(exc)})
+        # ruleid: str-exc-in-log
+        logger.error("failed", extra={"detail": [f"{exc}"]})
+        # ruleid: str-exc-in-log
         record(error_info=str(exc))
+        # ruleid: str-exc-in-log
+        record(error_info={"text": str(exc)})
+        # ruleid: str-exc-in-log
+        error_info = str(exc)
+        # ruleid: str-exc-in-log
+        payload = {"error_info": f"bad {exc}", "run_id": run_id}
         # ok: str-exc-in-log
         logger.warning("failed", extra={"run_id": run_id, "kind": type(exc).__name__})
         # ok: str-exc-in-log
+        logger.error("failed", extra={"error_info": "provider_error", "code": "E_X"})
+        # ok: str-exc-in-log
         record(error_info=type(exc).__name__)
+        # ok: str-exc-in-log
+        error_info = type(exc).__name__
+        # ok: str-exc-in-log
+        payload = {"error_info": "provider_error", "run_id": run_id}
+        # ok: str-exc-in-log
+        logger.warning("failed", exc_info=safe_exception_info())
+        # ok: str-exc-in-log
+        text = str(exc)
     # ok: str-exc-in-log
     logger.info("fine %s", str(run_id))
+    # ok: str-exc-in-log
+    logger.info("fine", extra={"error_info": str(run_id)})
 
 
 # ruleid: dotenv-in-src

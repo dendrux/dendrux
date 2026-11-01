@@ -40,7 +40,8 @@ make a failure go away; `stamp` refuses to record new or worse entries.
 - Import cycles: move the shared piece down a layer, or import it inside the function
   (and say why). The `report` view shows which function-level imports hold a cycle together.
 - Semgrep: the rule message says what to do instead. A false positive is fixed in the rule
-  (and its fixture), not silenced in code.
+  (and its fixture), not silenced in code: `# nosemgrep` comments are ignored by the gate.
+  A rule's `metadata.allow_in` (`module:Class.method`) exempts exactly that method.
 - CRAP: add tests for the function, or make it simpler.
 
 ## Stamping after an improvement
@@ -64,5 +65,7 @@ baseline) and says why in the commit message.
   commit that re-stamps the baselines and shows the difference.
 - The ratchets look at `src/dendrux` only and skip `db/migrations`.
 - Limits: the cognitive gate allows an existing function at or under 15 to grow up to 15;
-  the cycles gate cannot see a new edge that stays inside an existing cycle; the Semgrep
-  `str-exc-in-log` rule looks for `str(exc)` and f-strings, not for `%s` with the exception.
+  the cycles gate cannot see a new edge that stays inside an existing cycle (it models
+  package `__init__` execution, but not conditional or `importlib` imports); the Semgrep
+  `str-exc-in-log` rule looks for `str(exc)` and f-strings inside log calls and `error_info`,
+  not for `%s` with the exception.

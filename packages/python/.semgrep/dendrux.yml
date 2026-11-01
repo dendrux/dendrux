@@ -14,13 +14,15 @@ rules:
     languages: [python]
     metadata:
       include: ["runtime/stores/sql/"]
+      # The one place allowed to commit, as module:qualified name. Semgrep cannot say "this
+      # method of this class" for a nested node, so tools/semgrep_ratchet.py applies it
+      # exactly; a same-named method elsewhere, a module function or a nested helper of
+      # another method is still a match.
+      allow_in: ["dendrux.runtime.stores.sql.base:SQLStateStore._write_tx"]
     patterns:
       - pattern-either:
           - pattern: $S.commit()
           - pattern: await $S.commit()
-      - pattern-not-inside: |
-          async def _write_tx(...):
-              ...
 
   - id: process-tool-calls-without-tenant
     message: >-
@@ -31,7 +33,6 @@ rules:
     patterns:
       - pattern: _process_tool_calls(...)
       - pattern-not: _process_tool_calls(..., tenant_id=$T, ...)
-      - pattern-not: _process_tool_calls(..., **$KW)
       - pattern-not-inside: |
           def _process_tool_calls(...):
               ...
@@ -71,22 +72,27 @@ rules:
               ...
           except $T as $E:
               ...
+      # the exception rendered as text ...
+      - pattern-either:
+          - pattern: str($E)
+          - pattern: f"...{$E}..."
+          - pattern: f"...{str($E)}..."
+          - pattern: f"...{$E!s}..."
+      # ... anywhere inside a log call (also in extra={...} or a nested container), or in an
+      # error_info keyword, assignment or dict entry
       - pattern-either:
           - patterns:
-              - pattern-either:
-                  - pattern: $L.$M(..., str($E), ...)
-                  - pattern: $L.$M(..., f"...{$E}...", ...)
-                  - pattern: $L.$M(..., f"...{str($E)}...", ...)
-                  - pattern: $L.$M(..., f"...{$E!s}...", ...)
+              - pattern-inside: $L.$M(...)
               - metavariable-regex:
                   metavariable: $L
                   regex: ^(self\.)?_?(logger|log|LOG|LOGGER)$
               - metavariable-regex:
                   metavariable: $M
                   regex: ^(debug|info|warning|warn|error|exception|critical|log)$
-          - pattern: $F(..., error_info=str($E), ...)
-          - pattern: $F(..., error_info=f"...{$E}...", ...)
-          - pattern: $F(..., error_info=f"...{str($E)}...", ...)
+          - pattern-inside: $F(..., error_info=..., ...)
+          - pattern-inside: error_info = ...
+          - pattern-inside: $X["error_info"] = ...
+          - pattern-inside: '{..., "error_info": ..., ...}'
 
   - id: dotenv-in-src
     message: >-

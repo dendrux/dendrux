@@ -20,5 +20,6 @@
  "hardcoded-terminal-status-set|dendrux.store._redact|<module>": 2,
  "hardcoded-terminal-status-set|dendrux.testing.store_kit.contracts.test_basic|test_finalize_run_if_status_in_is_a_compare_and_swap": 1,
  "hardcoded-terminal-status-set|dendrux.testing.store_kit.contracts.test_basic|test_list_runs_orders_newest_first_and_filters": 1,
- "process-tool-calls-without-tenant|dendrux.runtime._reclaim|resolve": 1
+ "process-tool-calls-without-tenant|dendrux.runtime._reclaim|resolve": 1,
+ "process-tool-calls-without-tenant|dendrux.runtime.runner|_execute_approved_tools": 1
 }

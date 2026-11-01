@@ -2,10 +2,13 @@
 
 ``check`` fails on a new match, or more matches in a function that already had some.
 Matches are keyed ``rule|module|enclosing function`` (no line numbers) in
-``tools/semgrep_baseline.json``. ``test`` runs the rules against their fixture
-(``.semgrep/dendrux.py``). A rule limits itself to part of the tree with
+``tools/semgrep_baseline.json``. Suppression comments (``# nosemgrep``) are ignored
+(``--disable-nosem``): a false positive is fixed in the rule. ``test`` runs the rules
+against their fixture (``.semgrep/dendrux.py``). A rule limits itself to part of the tree with
 ``metadata.include`` / ``metadata.exclude`` (path prefixes under ``src/dendrux``); they are
-applied here rather than as Semgrep ``paths:`` so one fixture can exercise every rule.
+applied here rather than as Semgrep ``paths:`` so one fixture can exercise every rule;
+``metadata.allow_in`` (``module:Class.method``) exempts exactly that method and helpers
+nested in it.
 
 Semgrep is a dev/CI tool, not a dependency of the package. Its pinned version is in
 ``tools/semgrep-requirements.txt``. It pins ``mcp`` and OpenTelemetry versions that clash
@@ -88,6 +91,18 @@ def in_scope(path: str, metadata: Mapping[str, Any]) -> bool:
     return not any(rel.startswith(prefix) for prefix in exclude)
 
 
+def _allowed(module: str, function: str, allow_in: Iterable[str]) -> bool:
+    """True inside one of the ``module:qualified.name`` places a rule allows (and helpers
+    nested in it). Nothing else with the same method name qualifies."""
+    for entry in allow_in:
+        allowed_module, _, name = entry.partition(":")
+        if module == allowed_module and (
+            function == name or function.startswith(f"{name}.<locals>.")
+        ):
+            return True
+    return False
+
+
 def keys_from_results(results: Iterable[Mapping[str, Any]]) -> dict[str, int]:
     counts: Counter[str] = Counter()
     spans_cache: dict[str, list[tuple[int, int, str]]] = {}
@@ -100,7 +115,10 @@ def keys_from_results(results: Iterable[Mapping[str, Any]]) -> dict[str, int]:
             spans_cache[path] = function_spans(Path(path).read_text(encoding="utf-8"))
         rule = item["check_id"].rsplit(".", 1)[-1]
         func = enclosing(spans_cache[path], item["start"]["line"])
-        counts[f"{rule}|{r.module_name(path)}|{func}"] += 1
+        module = r.module_name(path)
+        if _allowed(module, func, metadata.get("allow_in") or []):
+            continue
+        counts[f"{rule}|{module}|{func}"] += 1
     return dict(sorted(counts.items()))
 
 
@@ -113,7 +131,9 @@ def collect_keys(src: Path = r.SRC, rules: Path = RULES) -> dict[str, int]:
     with tempfile.TemporaryDirectory() as tmp:
         out = Path(tmp) / "semgrep.json"
         cmd = [exe, "--config", str(rules), "--json", "--quiet", "--metrics=off"]
-        cmd += ["--disable-version-check", "--no-git-ignore", "--output", str(out), str(src)]
+        # --disable-nosem: a `# nosemgrep` comment must not hide a match from the gate.
+        cmd += ["--disable-version-check", "--no-git-ignore", "--disable-nosem"]
+        cmd += ["--output", str(out), str(src)]
         proc = subprocess.run(cmd, capture_output=True, text=True)
         if proc.returncode not in (0, 1) or not out.is_file():
             raise RuntimeError(f"semgrep failed ({proc.returncode}): {proc.stderr.strip()[-500:]}")
