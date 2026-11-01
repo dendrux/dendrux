@@ -33,27 +33,36 @@ def test_dev_dependencies_include_the_gate_tools_with_upper_bounds() -> None:
         assert "<" in spec, f"{tool} needs an upper bound: {spec}"
 
 
-def test_the_python_job_runs_tests_in_parallel_and_writes_coverage_json() -> None:
+def test_the_python_job_runs_tests_in_parallel_and_measures_coverage() -> None:
     run = _steps("python")["Test"]["run"]
     assert "-n auto" in run
-    assert "--cov-report=json:coverage.json" in run
+    assert "--cov=src/dendrux" in run
 
 
-def test_the_python_job_checks_architecture_and_crap() -> None:
-    steps = _steps("python")
-    assert "lint-imports" in steps["Architecture rules"]["run"]
-    crap = steps["CRAP ratchet"]
+def test_the_coverage_job_combines_the_shards_and_writes_coverage_json() -> None:
+    run = _steps("python-coverage")["Combine coverage and apply the floor"]["run"]
+    assert "coverage combine" in run
+    assert "--fail-under=80" in run
+    assert "coverage json -o coverage.json" in run
+    assert _jobs()["python-coverage"]["needs"] == "python"
+
+
+def test_the_python_job_checks_architecture_and_the_coverage_job_runs_crap() -> None:
+    assert "lint-imports" in _steps("python")["Architecture rules"]["run"]
+    crap = _steps("python-coverage")["CRAP ratchet"]
     assert "tools/crap_ratchet.py check" in crap["run"]
     assert "coverage.json" in crap["run"]
     assert "if" in crap, "run the ratchet on one matrix leg only"
 
 
 def test_coverage_is_stamped_with_source_digests_before_the_ratchet_runs() -> None:
-    names = list(_steps("python"))
-    stamp = _steps("python")["Record coverage source digests"]
+    names = list(_steps("python-coverage"))
+    stamp = _steps("python-coverage")["Record coverage source digests"]
     assert "tools/crap_ratchet.py stamp" in stamp["run"]
     assert names.index("Record coverage source digests") < names.index("CRAP ratchet")
-    assert names.index("Test") < names.index("Record coverage source digests")
+    assert names.index("Combine coverage and apply the floor") < names.index(
+        "Record coverage source digests"
+    )
     makefile = (PKG / "Makefile").read_text()
     test_recipe = makefile.split("\ntest:", 1)[1].split("\n\n", 1)[0]
     assert "tools/crap_ratchet.py stamp" in test_recipe

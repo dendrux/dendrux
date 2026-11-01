@@ -28,6 +28,13 @@ def pytest_configure(config: pytest.Config) -> None:
     reads the variable.
     """
     configure_models(config)
+    # Keeps the NLP/tldextract disk caches inside the test process. That hook lives in the
+    # integration conftest, which pytest only loads when a collected path is under
+    # tests/integration; a CI shard (or a single file) without one would otherwise skip it.
+    # Running it twice, when both conftests load, only stacks two harmless patches.
+    from tests.integration.conftest import pytest_configure as _scratch_caches
+
+    _scratch_caches(config)
     for area in tiers.AREAS:
         config.addinivalue_line("markers", f"area_{area}: tests of the {area} area (by path)")
     config.addinivalue_line(

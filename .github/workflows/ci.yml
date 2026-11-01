@@ -15,8 +15,13 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # The test suite is split into four shards by test file (tools/test_tiers.py shard: a
+  # deterministic, time-balanced split; `make test-shard-proof` checks it is a disjoint cover).
+  # Each shard measures coverage into its own data file; the python-coverage job below combines
+  # the four files of a leg and applies the coverage floor and the CRAP ratchet to the whole.
+  # Lint, types, architecture and the distribution smoke test run once per leg, on shard 1.
   python:
-    name: python ${{ matrix.python-version }} / SQLAlchemy ${{ matrix.sqlalchemy-version }}
+    name: python ${{ matrix.python-version }} / SQLAlchemy ${{ matrix.sqlalchemy-version }} / shard ${{ matrix.shard }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     defaults:
@@ -29,6 +34,7 @@ jobs:
         # pyproject allows sqlalchemy>=2.0,<3.0: test both minors. 2.1 on every
         # Python, 2.0 on the oldest and newest only (5 jobs).
         sqlalchemy-version: ["2.0.*", "2.1.*"]
+        shard: [1, 2, 3, 4]
         exclude:
           - python-version: "3.12"
             sqlalchemy-version: "2.0.*"
@@ -82,15 +88,19 @@ jobs:
           python -c "import sqlalchemy; print('SQLAlchemy', sqlalchemy.__version__)"
 
       - name: Lint
+        if: matrix.shard == 1
         run: ruff check .
 
       - name: Format check
+        if: matrix.shard == 1
         run: ruff format --check .
 
       - name: Type check
+        if: matrix.shard == 1
         run: mypy src/dendrux/
 
       - name: Architecture rules
+        if: matrix.shard == 1
         run: lint-imports
 
       - name: Require the Postgres backend
@@ -103,13 +113,96 @@ jobs:
 
       - name: Test
         shell: bash
+        env:
+          COVERAGE_FILE: cov-${{ matrix.shard }}.data
         run: |
+          # This shard's test files; every file is in exactly one of the four shards.
+          files=$(python tools/test_tiers.py shard --count 4 --index ${{ matrix.shard }})
           # Benchmarks (marked benchmark) depend on the machine; `make bench` runs them.
-          pytest tests/ -v -rs -n auto -m "not benchmark" --cov=src/dendrux --cov-report=term-missing --cov-report=json:coverage.json --cov-fail-under=80 | tee pytest.log
+          pytest $files -v -rs -n auto -m "not benchmark" --cov=src/dendrux --cov-report= | tee pytest.log
           if grep -q 'DENDRUX_TEST_PG_URL not set' pytest.log; then
             echo "::error::Postgres integration tests were skipped (DENDRUX_TEST_PG_URL not set)."
             exit 1
           fi
+
+      - name: Coverage leg name
+        id: leg
+        shell: bash
+        run: |
+          sqlalchemy="${{ matrix.sqlalchemy-version }}"
+          echo "name=py${{ matrix.python-version }}-sa${sqlalchemy%.*}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload coverage data
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage-${{ steps.leg.outputs.name }}-${{ matrix.shard }}
+          path: packages/python/cov-${{ matrix.shard }}.data
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Build and smoke-test distributions
+        if: matrix.shard == 1
+        run: python scripts/mcp_distribution_smoke.py
+
+  # Combines the four shards of each leg, then judges the whole: the coverage floor on every
+  # leg, and the CRAP ratchet (which needs complete coverage) on one leg.
+  python-coverage:
+    name: coverage py${{ matrix.python-version }} / SQLAlchemy ${{ matrix.sqlalchemy-version }}
+    needs: python
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: packages/python
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+        sqlalchemy-version: ["2.0.*", "2.1.*"]
+        exclude:
+          - python-version: "3.12"
+            sqlalchemy-version: "2.0.*"
+
+    env:
+      PYTHON_DOTENV_DISABLED: "1"
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: packages/python/pyproject.toml
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Coverage leg name
+        id: leg
+        shell: bash
+        run: |
+          sqlalchemy="${{ matrix.sqlalchemy-version }}"
+          echo "name=py${{ matrix.python-version }}-sa${sqlalchemy%.*}" >> "$GITHUB_OUTPUT"
+
+      - name: Download coverage data
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: coverage-${{ steps.leg.outputs.name }}-*
+          path: packages/python
+          merge-multiple: true
+
+      # All four shard files must be present: a missing shard would silently lower coverage.
+      - name: Combine coverage and apply the floor
+        shell: bash
+        run: |
+          test "$(ls cov-*.data | wc -l)" -eq 4
+          coverage combine cov-*.data
+          coverage report --show-missing --fail-under=80
+          coverage json -o coverage.json
 
       # Tie coverage.json to the source it measured; the ratchet rejects a stale report.
       - name: Record coverage source digests
@@ -121,9 +214,6 @@ jobs:
       - name: CRAP ratchet
         if: matrix.python-version == '3.12' && matrix.sqlalchemy-version == '2.1.*'
         run: python tools/crap_ratchet.py check --coverage coverage.json
-
-      - name: Build and smoke-test distributions
-        run: python scripts/mcp_distribution_smoke.py
 
   # Quality ratchets (packages/python/tools/QUALITY.md): cognitive complexity, duplicate code,
   # dead code, import cycles and the custom Semgrep rules. Each compares with a committed

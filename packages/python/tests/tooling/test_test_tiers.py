@@ -209,3 +209,38 @@ def test_the_dev_extra_pins_the_fast_loop_and_rerun_plugins() -> None:
     ]
     assert "pytest-testmon==2.2.0" in dev
     assert "pytest-rerunfailures==16.7" in dev
+
+
+def _workflow() -> dict:
+    import yaml
+
+    path = PKG.parents[1] / ".github" / "workflows" / "ci.yml"
+    if not path.is_file():
+        pytest.skip("repository checkout only")
+    return yaml.safe_load(path.read_text())["jobs"]
+
+
+def test_the_ci_test_job_runs_every_shard_and_only_once_the_per_leg_checks() -> None:
+    import re
+
+    job = _workflow()["python"]
+    shards = job["strategy"]["matrix"]["shard"]
+    steps = {s.get("name", ""): s for s in job["steps"]}
+    count = int(re.search(r"--count (\d+)", steps["Test"]["run"]).group(1))  # type: ignore[union-attr]
+    assert shards == list(range(1, count + 1))
+    assert "--index ${{ matrix.shard }}" in steps["Test"]["run"]
+    assert '-m "not benchmark"' in steps["Test"]["run"]
+    for once in ("Lint", "Format check", "Type check", "Architecture rules"):
+        assert steps[once]["if"] == "matrix.shard == 1", once
+    assert steps["Build and smoke-test distributions"]["if"] == "matrix.shard == 1"
+    combine = {s.get("name", ""): s for s in _workflow()["python-coverage"]["steps"]}
+    assert f"-eq {count}" in combine["Combine coverage and apply the floor"]["run"]
+
+
+def test_the_coverage_job_covers_the_same_legs_as_the_test_job() -> None:
+    jobs = _workflow()
+    for key in ("python-version", "sqlalchemy-version", "exclude"):
+        assert (
+            jobs["python"]["strategy"]["matrix"][key]
+            == jobs["python-coverage"]["strategy"]["matrix"][key]
+        )

@@ -221,6 +221,9 @@ markers = [
 ]
 
 [tool.coverage.run]
+# Also read when the shards' coverage data is combined in CI (coverage report), where it makes
+# modules that no test imported count as uncovered, exactly like `pytest --cov=src/dendrux`.
+source = ["src/dendrux"]
 omit = [
     "src/dendrux/db/migrations/*",
 ]
