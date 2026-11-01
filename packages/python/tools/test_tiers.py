@@ -1,6 +1,7 @@
 """Test tiers: areas, the slow and flaky lists, changed-file linting and CI shards.
 
     python tools/test_tiers.py areas                      # the area names
+    python tools/test_tiers.py workers                    # local worker count (at most 6)
     python tools/test_tiers.py check-area NAME            # exit 2 for an unknown area
     python tools/test_tiers.py ruff-changed               # ruff on the .py files changed vs HEAD
     python tools/test_tiers.py check-lists                # the slow/flaky lists name real tests
@@ -215,6 +216,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("areas")
+    sub.add_parser("workers")
     sub.add_parser("check-area").add_argument("name")
     sub.add_parser("ruff-changed")
     sub.add_parser("check-lists")
@@ -234,6 +236,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "areas":
         print(" ".join(tiers.AREAS))
+    elif args.command == "workers":
+        print(tiers.default_workers())
     elif args.command == "check-area":
         if args.name not in tiers.AREAS:
             print(f"unknown AREA {args.name!r}; one of: {' '.join(tiers.AREAS)}", file=sys.stderr)

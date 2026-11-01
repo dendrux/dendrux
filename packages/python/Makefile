@@ -1,11 +1,15 @@
 .PHONY: test test-fast test-area test-pg test-kit test-merge test-lists test-shard-proof test-model-check test-model-install test-dbs-up test-dbs-down test-mysql bench load load-quick load-pg load-mysql load-mariadb lint typecheck arch crap cognitive duplicates deadcode cycles semgrep quality quality-stamp api-check format package-smoke ci clean
 
-# Parallel workers for local runs: the core count, at most 6 (the machine also runs Docker and
-# other builders). Override with DENDRUX_TEST_WORKERS=<n> or `make test TEST_WORKERS=auto`.
-# CI runs pytest itself with `-n auto`.
-TEST_WORKERS ?= $(or $(DENDRUX_TEST_WORKERS),$(shell python -c "import os; print(max(1, min(6, os.cpu_count() or 1)))"))
+# Parallel workers for local runs: the core count, never more than 6 (owner decision 2026-11-01;
+# the machine also runs Docker and other builders). DENDRUX_TEST_WORKERS=<n> lowers it.
+# GitHub CI runs pytest itself with `-n auto`.
+TEST_WORKERS ?= $(shell python tools/test_tiers.py workers)
 
 # Benchmarks measure the server, not the code, so they are not part of the gates.
+#
+# The last line is not a baseline stamp: it records the digests of the source this coverage.json
+# measured (coverage.json.sources.json), which `make crap` requires. Baselines are changed only
+# by `make quality-stamp`, run by the coordinator.
 test: test-model-check
 	pytest tests/ -v -n $(TEST_WORKERS) -m "not benchmark" --cov=src/dendrux --cov-report=term-missing --cov-report=json:coverage.json --cov-fail-under=80
 	python tools/crap_ratchet.py stamp --coverage coverage.json
@@ -42,29 +46,26 @@ test-pg: test-model-check
 	@test -n "$$DENDRUX_TEST_PG_URL" || { echo "DENDRUX_TEST_PG_URL is required"; exit 2; }
 	pytest tests/integration -n $(TEST_WORKERS) -m "not benchmark" --no-cov -q -rs
 
-# test-kit: the store test kit and conformance suite on the real databases. Postgres cells run
-# serial (-n 0) on exactly one authorised database (tests/conformance/pg_guard.py); this target
-# authorises the database named by DENDRUX_TEST_PG_URL.
+# test-kit: the store kit and conformance suite on SQLite and Postgres. Postgres cells run serial
+# (-n 0) on exactly one authorised database (tests/conformance/pg_guard.py); this target authorises
+# the database named by DENDRUX_TEST_PG_URL. MySQL and MariaDB cells skip unless their URLs are set.
 test-kit: test-model-check
 	@test -n "$$DENDRUX_TEST_PG_URL" || { echo "DENDRUX_TEST_PG_URL is required"; exit 2; }
 	DENDRUX_CONFORMANCE_PG_DB="$$(python tools/test_tiers.py dbname "$$DENDRUX_TEST_PG_URL")" \
 		pytest tests/conformance -n 0 -m "not benchmark" --no-cov -q -rs
 
-# test-merge: the whole merge gate, run by the coordinator. Needs the three database URLs:
-#   DENDRUX_TEST_PG_URL       a private Postgres database ending in _test
-#   DENDRUX_TEST_MYSQL_URL    MySQL 8.4 (make test-dbs-up), database name ending in _test
-#   DENDRUX_TEST_MARIADB_URL  MariaDB 10.11 (make test-dbs-up), database name ending in _test
-# It runs: make ci (lint, types, architecture, the full suite on SQLite and the Postgres matrix,
-# CRAP and the quality gates, API check), then tests/db on MySQL and MariaDB, then the kit
-# serially on Postgres, MySQL and MariaDB. Nothing here is skipped silently: the skipped-test
-# summary of each step is printed.
+# test-merge: the merge gate, run by the coordinator. Local scope is SQLite and Postgres only
+# (owner decision 2026-11-01); MySQL and MariaDB run in GitHub CI. Needs DENDRUX_TEST_PG_URL, a
+# private Postgres database ending in _test. It runs: make ci (lint, types, architecture, the full
+# suite on SQLite and the Postgres matrix in parallel, CRAP and the quality gates, API check), then
+# the store kit serially on SQLite and Postgres, then the benchmarks serially (they measure the
+# server and fail under parallel load). The live provider smoke is separate (coordinator, .env).
 test-merge:
 	@test -n "$$DENDRUX_TEST_PG_URL" || { echo "DENDRUX_TEST_PG_URL is required"; exit 2; }
-	@test -n "$$DENDRUX_TEST_MYSQL_URL" || { echo "DENDRUX_TEST_MYSQL_URL is required"; exit 2; }
-	@test -n "$$DENDRUX_TEST_MARIADB_URL" || { echo "DENDRUX_TEST_MARIADB_URL is required"; exit 2; }
+	@test -z "$$DENDRUX_TEST_MYSQL_URL$$DENDRUX_TEST_MARIADB_URL" || { echo "unset DENDRUX_TEST_MYSQL_URL and DENDRUX_TEST_MARIADB_URL: local gates use SQLite and Postgres only"; exit 2; }
 	$(MAKE) ci
-	$(MAKE) test-mysql
 	$(MAKE) test-kit
+	$(MAKE) bench
 
 # Check the slow/flaky lists name real tests; print the CI shard split and prove it is a cover.
 test-lists:
@@ -129,13 +130,15 @@ test-dbs-up:
 test-dbs-down:
 	$(TEST_DBS) down -v
 
+# GitHub CI only (owner decision 2026-11-01: local runs use SQLite and Postgres only).
 # Schema and maintenance suites on MySQL/MariaDB. Needs DENDRUX_TEST_MYSQL_URL and/or
 # DENDRUX_TEST_MARIADB_URL (a database name ending in _test; each test makes its own copy).
 test-mysql:
 	pytest tests/db -v -rs -n $(TEST_WORKERS) -m "not benchmark" --no-cov
 
-# Release step: run on a quiet machine (nothing else using Postgres) and record the numbers
-# in the load-test results doc. Needs DENDRUX_TEST_PG_URL.
+# Always serial (-n 0): benchmarks measure the server and fail under parallel load. Release step:
+# run on a quiet machine (nothing else using Postgres) and record the numbers in the load-test
+# results doc. Needs DENDRUX_TEST_PG_URL.
 bench:
 	pytest tests/ -v -rs -n 0 -m benchmark -p no:randomly
 

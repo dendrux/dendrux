@@ -72,25 +72,33 @@ def _no_test_disables_a_dendrux_logger() -> Iterator[None]:
 
 @pytest.hookimpl(tryfirst=True)
 def pytest_cmdline_main(config: pytest.Config) -> None:
-    """Run in parallel by default once a Postgres URL is set.
+    """Choose the worker count before xdist reads it.
 
-    A serial Postgres run is the slow path (and the one where test order can matter), so with
-    ``DENDRUX_TEST_PG_URL`` set and no ``-n`` given, use ``DENDRUX_TEST_WORKERS`` workers
-    (default: the core count, at most 6). ``-n 0`` still means serial; a run that names
-    individual tests (``path::test``) or the conformance suite (whose Postgres cells run only
-    in one process) stays serial.
+    * A benchmark selection (``-m benchmark``) always runs in one process: benchmarks measure
+      the server and fail under parallel load.
+    * With ``DENDRUX_TEST_PG_URL`` set and no ``-n`` given, run in parallel (a serial Postgres
+      run is the slow path) with ``DENDRUX_TEST_WORKERS`` workers, the core count at most 6.
+      ``-n 0`` still means serial; a run that names individual tests (``path::test``) or the
+      conformance suite (whose Postgres cells run only in one process) stays serial.
     """
     option = config.option
+    if hasattr(option, "numprocesses") and _selects_benchmarks(option):
+        option.numprocesses = 0  # even with an explicit -n
+        return
     if not os.environ.get(_PG_URL_ENV) or getattr(option, "numprocesses", 1) is not None:
         return
     if getattr(option, "collectonly", False):
         return
-    # Single tests stay in one process; the conformance suite runs its Postgres cells serially.
     if any("::" in arg or "conformance" in arg for arg in config.args):
         return
     if getattr(option, "dist", "no") != "no" or "PYTEST_XDIST_WORKER" in os.environ:
         return
     option.numprocesses = tiers.default_workers()
+
+
+def _selects_benchmarks(option: object) -> bool:
+    expression = getattr(option, "markexpr", "") or ""
+    return "benchmark" in expression and "not benchmark" not in expression
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -152,10 +153,13 @@ def test_default_workers_is_capped_and_overridable(monkeypatch: pytest.MonkeyPat
     assert tiers.default_workers() == 6
     monkeypatch.setattr("os.cpu_count", lambda: 2)
     assert tiers.default_workers() == 2
+    monkeypatch.setattr("os.cpu_count", lambda: 64)
     monkeypatch.setenv("DENDRUX_TEST_WORKERS", "9")
-    assert tiers.default_workers() == 9
+    assert tiers.default_workers() == 6  # the env var can lower the cap, never raise it
+    monkeypatch.setenv("DENDRUX_TEST_WORKERS", "3")
+    assert tiers.default_workers() == 3
     monkeypatch.setenv("DENDRUX_TEST_WORKERS", "junk")
-    assert tiers.default_workers() == 2
+    assert tiers.default_workers() == 6
 
 
 def _collect(*args: str) -> list[str]:
@@ -165,17 +169,36 @@ def _collect(*args: str) -> list[str]:
         capture_output=True,
         text=True,
         check=False,
-        env={k: v for k, v in __import__("os").environ.items() if k != "DENDRUX_TEST_PG_URL"},
+        env={k: v for k, v in os.environ.items() if k != "DENDRUX_TEST_PG_URL"},
     ).stdout
     return [line for line in out.splitlines() if "::" in line]
 
 
 def test_conftest_marks_the_area_and_the_flaky_test_by_path_and_list() -> None:
-    target = "tests/tooling/test_load_monitor.py"
-    assert _collect(target, "-m", "area_tooling")
-    assert not _collect(target, "-m", "area_runtime")
+    target = "tests/integration/test_050_t7b_fix3.py"
+    assert _collect(target, "-m", "area_runtime")  # no file-name rule matches: the default area
+    assert not _collect(target, "-m", "area_stores")
     flaky = _collect(target, "-m", "flaky")
-    assert flaky == [f"{target}::test_sampler_starts_stops_and_still_records_final_sample"]
+    assert flaky == [f"{target}::test_online_clock_migration_writer_block[postgres-300k]"]
+
+
+def _run_verbose(*args: str) -> str:
+    env = {k: v for k, v in os.environ.items() if k != "DENDRUX_TEST_PG_URL"}
+    out = subprocess.run(
+        [sys.executable, "-m", "pytest", "-v", "--no-cov", "-p", "no:randomly", *args],
+        cwd=PKG,
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    return out.stdout
+
+
+def test_a_benchmark_selection_runs_in_one_process_even_with_n_given() -> None:
+    target = "tests/integration/test_050_t7b_fix2.py"
+    assert "[gw" not in _run_verbose("-m", "benchmark", "-n", "3", target)
+    assert "[gw" in _run_verbose("-m", "not benchmark", "-n", "3", target)  # control
 
 
 def test_the_makefile_exposes_the_fast_loop_and_the_merge_gate() -> None:
@@ -186,8 +209,10 @@ def test_the_makefile_exposes_the_fast_loop_and_the_merge_gate() -> None:
     assert "--testmon" in fast and "--testmon-forceselect" in fast
     assert "--no-cov" in fast and "ruff-changed" in fast
     merge = makefile.split("\ntest-merge:", 1)[1].split("\n\n", 1)[0]
-    for step in ("$(MAKE) ci", "$(MAKE) test-mysql", "$(MAKE) test-kit"):
+    for step in ("$(MAKE) ci", "$(MAKE) test-kit", "$(MAKE) bench"):
         assert step in merge
+    assert "test-mysql" not in merge, "the local merge gate is SQLite and Postgres only"
+    assert "-n 0" in makefile.split("\nbench:", 1)[1].split("\n\n", 1)[0]
     ci_line = next(line for line in makefile.splitlines() if line.startswith("ci:"))
     assert ci_line.split() == [
         "ci:",
