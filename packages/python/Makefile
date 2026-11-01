@@ -1,8 +1,13 @@
-.PHONY: test test-model-check test-model-install test-dbs-up test-dbs-down test-mysql bench load load-quick load-pg load-mysql load-mariadb lint typecheck arch crap cognitive duplicates deadcode cycles semgrep quality quality-stamp api-check format package-smoke ci clean
+.PHONY: test test-fast test-area test-pg test-kit test-merge test-lists test-shard-proof test-model-check test-model-install test-dbs-up test-dbs-down test-mysql bench load load-quick load-pg load-mysql load-mariadb lint typecheck arch crap cognitive duplicates deadcode cycles semgrep quality quality-stamp api-check format package-smoke ci clean
+
+# Parallel workers for local runs: the core count, at most 6 (the machine also runs Docker and
+# other builders). Override with DENDRUX_TEST_WORKERS=<n> or `make test TEST_WORKERS=auto`.
+# CI runs pytest itself with `-n auto`.
+TEST_WORKERS ?= $(or $(DENDRUX_TEST_WORKERS),$(shell python -c "import os; print(max(1, min(6, os.cpu_count() or 1)))"))
 
 # Benchmarks measure the server, not the code, so they are not part of the gates.
 test: test-model-check
-	pytest tests/ -v -n auto -m "not benchmark" --cov=src/dendrux --cov-report=term-missing --cov-report=json:coverage.json --cov-fail-under=80
+	pytest tests/ -v -n $(TEST_WORKERS) -m "not benchmark" --cov=src/dendrux --cov-report=term-missing --cov-report=json:coverage.json --cov-fail-under=80
 	python tools/crap_ratchet.py stamp --coverage coverage.json
 
 # Installed explicitly before xdist workers start; tests never fetch model data.
@@ -11,6 +16,62 @@ test-model-check:
 
 test-model-install:
 	python -m tests._helpers.nlp_models --install
+
+# ---- Fast loop (tools/QUALITY.md, "Test tiers"). The merge gate below is the full check. ----
+# test-fast: only the tests affected by your change (pytest-testmon), SQLite, no coverage, ruff on
+# the changed files. The first run (no testmon data yet) runs every non-slow test and records
+# what each one touches; later runs are small. SLOW=1 includes the tests marked slow.
+SLOW ?=
+FAST_MARKS = not benchmark$(if $(SLOW),, and not slow)
+TESTMON_DATAFILE ?= .pytest_cache/testmondata
+export TESTMON_DATAFILE
+
+test-fast: test-model-check
+	python tools/test_tiers.py ruff-changed
+	env -u DENDRUX_TEST_PG_URL pytest tests/ --testmon --testmon-forceselect -n $(TEST_WORKERS) -m "$(FAST_MARKS)" --no-cov -q
+
+# test-area: one area (python tools/test_tiers.py areas), SQLite, no coverage.
+# Example: make test-area AREA=runtime
+test-area: test-model-check
+	@python tools/test_tiers.py check-area "$(AREA)"
+	env -u DENDRUX_TEST_PG_URL pytest tests/ -m "area_$(AREA) and $(FAST_MARKS)" -n $(TEST_WORKERS) --no-cov -q
+
+# test-pg: the Postgres integration matrix in parallel, one database per worker (needs
+# DENDRUX_TEST_PG_URL naming a private database that ends in _test). No coverage.
+test-pg: test-model-check
+	@test -n "$$DENDRUX_TEST_PG_URL" || { echo "DENDRUX_TEST_PG_URL is required"; exit 2; }
+	pytest tests/integration -n $(TEST_WORKERS) -m "not benchmark" --no-cov -q -rs
+
+# test-kit: the store test kit and conformance suite on the real databases. Postgres cells run
+# serial (-n 0) on exactly one authorised database (tests/conformance/pg_guard.py); this target
+# authorises the database named by DENDRUX_TEST_PG_URL.
+test-kit: test-model-check
+	@test -n "$$DENDRUX_TEST_PG_URL" || { echo "DENDRUX_TEST_PG_URL is required"; exit 2; }
+	DENDRUX_CONFORMANCE_PG_DB="$$(python tools/test_tiers.py dbname "$$DENDRUX_TEST_PG_URL")" \
+		pytest tests/conformance -n 0 -m "not benchmark" --no-cov -q -rs
+
+# test-merge: the whole merge gate, run by the coordinator. Needs the three database URLs:
+#   DENDRUX_TEST_PG_URL       a private Postgres database ending in _test
+#   DENDRUX_TEST_MYSQL_URL    MySQL 8.4 (make test-dbs-up), database name ending in _test
+#   DENDRUX_TEST_MARIADB_URL  MariaDB 10.11 (make test-dbs-up), database name ending in _test
+# It runs: make ci (lint, types, architecture, the full suite on SQLite and the Postgres matrix,
+# CRAP and the quality gates, API check), then tests/db on MySQL and MariaDB, then the kit
+# serially on Postgres, MySQL and MariaDB. Nothing here is skipped silently: the skipped-test
+# summary of each step is printed.
+test-merge:
+	@test -n "$$DENDRUX_TEST_PG_URL" || { echo "DENDRUX_TEST_PG_URL is required"; exit 2; }
+	@test -n "$$DENDRUX_TEST_MYSQL_URL" || { echo "DENDRUX_TEST_MYSQL_URL is required"; exit 2; }
+	@test -n "$$DENDRUX_TEST_MARIADB_URL" || { echo "DENDRUX_TEST_MARIADB_URL is required"; exit 2; }
+	$(MAKE) ci
+	$(MAKE) test-mysql
+	$(MAKE) test-kit
+
+# Check the slow/flaky lists name real tests; print the CI shard split and prove it is a cover.
+test-lists:
+	python tools/test_tiers.py check-lists
+
+test-shard-proof:
+	python tools/test_tiers.py shard-proof --count $(or $(SHARDS),4)
 
 lint:
 	ruff check .
@@ -71,7 +132,7 @@ test-dbs-down:
 # Schema and maintenance suites on MySQL/MariaDB. Needs DENDRUX_TEST_MYSQL_URL and/or
 # DENDRUX_TEST_MARIADB_URL (a database name ending in _test; each test makes its own copy).
 test-mysql:
-	pytest tests/db -v -rs -n auto -m "not benchmark" --no-cov
+	pytest tests/db -v -rs -n $(TEST_WORKERS) -m "not benchmark" --no-cov
 
 # Release step: run on a quiet machine (nothing else using Postgres) and record the numbers
 # in the load-test results doc. Needs DENDRUX_TEST_PG_URL.

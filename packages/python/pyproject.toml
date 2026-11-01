@@ -73,6 +73,10 @@ dev = [
     # Random order and parallel runs: both are on for every test run.
     "pytest-randomly>=3.15,<6.0",
     "pytest-xdist>=3.5,<4.0",
+    # Fast loop (make test-fast) and the flaky quarantine: exact pins, like the other tools whose
+    # behaviour the workflow depends on. See tools/QUALITY.md, "Test tiers".
+    "pytest-testmon==2.2.0",
+    "pytest-rerunfailures==16.7",
     # Quality gates (see tools/ and .importlinter).
     "radon>=6.0,<7.0",
     # Exact pins: the quality ratchets compare against committed baselines, so a tool

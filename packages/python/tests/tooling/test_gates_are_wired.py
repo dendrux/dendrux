@@ -82,7 +82,7 @@ def test_make_ci_runs_every_gate() -> None:
     ci_line = next(line for line in makefile.splitlines() if line.startswith("ci:"))
     for target in ("lint", "typecheck", "arch", "test", "crap", "api-check"):
         assert target in ci_line.split(), f"make ci does not run {target}"
-    assert "-n auto" in makefile
+    assert "-n $(TEST_WORKERS)" in makefile  # local runs: cores capped at 6 (CI uses -n auto)
 
 
 def test_environment_dependent_benchmarks_stay_out_of_the_default_gates() -> None:
