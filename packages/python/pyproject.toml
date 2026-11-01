@@ -75,6 +75,12 @@ dev = [
     "pytest-xdist>=3.5,<4.0",
     # Quality gates (see tools/ and .importlinter).
     "radon>=6.0,<7.0",
+    # Exact pins: the quality ratchets compare against committed baselines, so a tool
+    # upgrade that changes its scoring is a deliberate commit (restamp the baselines).
+    # Semgrep is pinned in tools/semgrep-requirements.txt (it clashes with the mcp extra).
+    "complexipy==8.3.0",
+    "pylint==4.1.3",
+    "vulture==2.16",
     "griffe>=1.5,<3.0",
     "import-linter>=2.0,<3.0",
     # Keep in step with .pre-commit-config.yaml (rev: v0.15.17).
@@ -138,7 +144,8 @@ exclude = [
 [tool.ruff]
 line-length = 100
 target-version = "py311"
-extend-exclude = ["src/dendrux/db/migrations"]
+# .semgrep/dendrux.py is a Semgrep rule fixture (undefined names on purpose).
+extend-exclude = ["src/dendrux/db/migrations", ".semgrep"]
 
 [tool.ruff.lint]
 select = [
