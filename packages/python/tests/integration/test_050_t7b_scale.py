@@ -8,16 +8,28 @@ import time
 
 import pytest
 from sqlalchemy import event, text
+from sqlalchemy.ext.asyncio import create_async_engine
 
 from dendrux import Agent, tool
 from dendrux.db.models import AgentRun, RunEvent
+from dendrux.runtime.stores._factory import store_for_engine
 from dendrux.types import Budget, RunStatus, UsageStats
 from tests._helpers.scripted_provider import ScriptedLLM, tool_call
 
+# The test's own wall-clock budget; the pool must not give up on a queued checkout earlier.
+_LOAD_BUDGET_SECONDS = 300
 
-async def test_two_hundred_budget_runs_with_lost_forensics(
-    store, engine, monkeypatch, record_property
-):
+
+async def test_two_hundred_budget_runs_with_lost_forensics(engine, monkeypatch, record_property):
+    # 200 runs share one default-size pool, so a run can queue for a connection far longer
+    # than SQLAlchemy's 30 s default on a busy CI box. Same pool sizes, test-sized timeout.
+    load_engine = engine
+    if engine.dialect.name == "postgresql":
+        load_engine = create_async_engine(
+            engine.url.render_as_string(hide_password=False), pool_timeout=_LOAD_BUDGET_SECONDS
+        )
+    store = store_for_engine(load_engine)
+
     @tool()
     async def work() -> str:
         return "ok"
@@ -63,15 +75,24 @@ async def test_two_hundred_budget_runs_with_lost_forensics(
         assert len({e.sequence_index for e in events}) == len(events)
         assert sum(e.event_type == "run.cancelled" for e in events) == 1
 
-    event.listen(engine.sync_engine, "checkout", checkout)
-    event.listen(engine.sync_engine, "checkin", checkin)
+    async def run_all():
+        # A TaskGroup cancels and awaits the other runs when one fails, while the loop is
+        # still running. gather() would leave them mid-transaction until loop shutdown.
+        async with asyncio.TaskGroup() as group:
+            for _ in range(200):
+                group.create_task(run_one())
+
+    event.listen(load_engine.sync_engine, "checkout", checkout)
+    event.listen(load_engine.sync_engine, "checkin", checkin)
     try:
         # This is a correctness load test, not a wall-clock performance gate.
         # Preserve all 200 concurrent runs and measured latency, with room for CI load.
-        await asyncio.wait_for(asyncio.gather(*(run_one() for _ in range(200))), 300)
+        await asyncio.wait_for(run_all(), _LOAD_BUDGET_SECONDS)
     finally:
-        event.remove(engine.sync_engine, "checkout", checkout)
-        event.remove(engine.sync_engine, "checkin", checkin)
+        event.remove(load_engine.sync_engine, "checkout", checkout)
+        event.remove(load_engine.sync_engine, "checkin", checkin)
+        if load_engine is not engine:
+            await load_engine.dispose()
     durations.sort()
     metrics = {
         "p50_ms": round(durations[99], 2),
@@ -79,7 +100,7 @@ async def test_two_hundred_budget_runs_with_lost_forensics(
         "peak_connections": peak,
     }
     record_property("budget_load", json.dumps(metrics))
-    print("budget_load", engine.dialect.name, json.dumps(metrics))
+    print("budget_load", load_engine.dialect.name, json.dumps(metrics))
 
 
 async def test_sweep_projection_uses_status_index(store, engine, monkeypatch, record_property):
