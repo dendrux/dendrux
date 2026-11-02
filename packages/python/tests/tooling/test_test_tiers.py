@@ -547,3 +547,85 @@ def test_all_four_tier_lists_are_checked_for_real_tests_and_reasons() -> None:
     for name in ("benchmark.txt", "wallclock_reviewed.txt"):
         entries = tiers.load_list(name)
         assert entries and all(e.note for e in entries), name
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ("await asyncio.sleep(0.05)\nassert seen", True),
+        ("await asyncio.sleep(3)\nassert store.count >= 2", True),
+        ("if ready:\n    await asyncio.sleep(0.1)\n    assert finished", True),
+        ("await asyncio.sleep(0.05)\nassert not finished", False),
+        ("await asyncio.sleep(0.05)\nassert finished is False", False),
+        ("await asyncio.sleep(0.05)\nassert calls == []", False),
+        ("await asyncio.sleep(0.05)\nassert count == 0", False),
+        ("await asyncio.sleep(0)\nassert seen", False),
+        ("await asyncio.sleep(delay)\nassert seen", False),
+        ("await sleep(0.05)\nassert seen", False),
+        ("await asyncio.sleep(0.05)\nawait done.wait()\nassert seen", False),
+    ],
+)
+def test_scanner_flags_sleep_immediately_before_positive_state_assertion(
+    tmp_path: Path, body: str, expected: bool
+) -> None:
+    import textwrap
+
+    (tmp_path / "test_sleep.py").write_text(
+        "async def test_state():\n" + textwrap.indent(body, "    ") + "\n"
+    )
+    found = tool.wallclock_asserts(tmp_path)
+    assert bool(found) is expected
+    if expected:
+        assert found[0].test == "test_sleep.py::test_state"
+        assert "sleep" in found[0].text
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ("await asyncio.wait_for(store.read(), 0.5)", True),
+        ("await asyncio.wait_for(store.read(), timeout=0.5)", True),
+        ("async with asyncio.timeout(0.1):\n    await store.read()", True),
+        ("await store.read(timeout=0.2)", True),
+        ("feed = Feed(store, max_duration_s=0.3)", True),
+        ("await store.read(timeout=1)", False),
+        ("await store.read(timeout=0)", False),
+        ("await store.read(timeout=-1)", False),
+        ("await store.read(timeout=True)", False),
+        ("await store.read(timeout=delay)", False),
+        ("await asyncio.wait_for(store.read(), 10)", False),
+        ("feed = Feed(store, batch_size=0.2)", False),
+    ],
+)
+def test_scanner_flags_small_deadlines_only_for_integration_io(
+    tmp_path: Path, body: str, expected: bool
+) -> None:
+    import textwrap
+
+    for area, fixture in (("integration", "store"), ("unit", "store"), ("integration", "fake")):
+        folder = tmp_path / area / fixture
+        folder.mkdir(parents=True)
+        (folder / "test_deadline.py").write_text(
+            f"async def test_read({fixture}):\n" + textwrap.indent(body, "    ") + "\n"
+        )
+    found = tool.wallclock_asserts(tmp_path)
+    assert [f.test for f in found] == (
+        ["integration/store/test_deadline.py::test_read"] if expected else []
+    )
+
+
+def test_scanner_recognizes_integration_server_setup_and_preserves_benchmark_marks(
+    tmp_path: Path,
+) -> None:
+    folder = tmp_path / "integration"
+    folder.mkdir()
+    (folder / "test_server.py").write_text(
+        "@pytest.mark.benchmark\n"
+        "async def test_delivery():\n"
+        "    server = await asyncio.start_server(handler, '127.0.0.1', 0)\n"
+        "    await asyncio.wait_for(delivered.wait(), 0.1)\n"
+    )
+    found = tool.wallclock_asserts(tmp_path)
+    assert [(f.test, f.bound, f.marked) for f in found] == [
+        ("integration/test_server.py::test_delivery", 0.1, True)
+    ]
