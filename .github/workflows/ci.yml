@@ -243,7 +243,8 @@ jobs:
   # Benchmarks: tests that assert how fast something is (marked benchmark, or listed in
   # tests/_helpers/tier_lists/benchmark.txt). They fail under the parallel load of the shard jobs,
   # so they run here on their own, in one process, on a single leg. Blocking, like the shards.
-  # Not part of the combined coverage.
+  # Not part of the combined coverage. A failed timing retries once (shared runners vary); a real
+  # slowdown fails both tries.
   benchmarks:
     name: benchmarks (python 3.12 / SQLAlchemy 2.1)
     runs-on: ubuntu-latest
@@ -296,7 +297,7 @@ jobs:
       - name: Benchmarks
         shell: bash
         run: |
-          pytest tests/ -v -rs -n 0 -m benchmark --no-cov | tee pytest.log
+          pytest tests/ -v -rs -n 0 -m benchmark --no-cov --reruns 1 | tee pytest.log
           if grep -q 'DENDRUX_TEST_PG_URL not set' pytest.log; then
             echo "::error::Postgres benchmarks were skipped (DENDRUX_TEST_PG_URL not set)."
             exit 1
