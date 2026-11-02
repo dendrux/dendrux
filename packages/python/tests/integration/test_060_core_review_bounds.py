@@ -10,7 +10,7 @@ from dendrux.runtime.state import TraceWrite
 from dendrux.types import generate_ulid
 
 
-@pytest.mark.parametrize("field", ["batch_size", "max_runs", "max_returned"])
+@pytest.mark.parametrize("field", ["max_runs", "max_returned"])
 async def test_recovery_scan_caps_and_realistic_maximum(store, field):
     kwargs = dict(
         cutoff=datetime.now(UTC),

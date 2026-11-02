@@ -54,6 +54,10 @@ def error_chain(exc: BaseException) -> list[BaseException]:
     return chain
 
 
+def _is_connection_loss_code(code: str) -> bool:
+    return code.startswith("08") or code in ("57P01", "57P02", "57P03")
+
+
 def classify_error(exc: BaseException) -> DbError:
     """Classify server/driver codes, retaining only safe identifiers."""
     chain = error_chain(exc)
@@ -82,7 +86,7 @@ def classify_error(exc: BaseException) -> DbError:
             return DbError("deadlock_or_serialization", code=code)
         if code == "55P03":
             return DbError("lock_timeout", code=code)
-        if code.startswith("08") or code in ("57P01", "57P02", "57P03"):
+        if _is_connection_loss_code(code):
             return DbError("connection_lost", code=code)
         return DbError("other", code=code)
     for error in chain:

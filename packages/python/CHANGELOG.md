@@ -7,6 +7,19 @@
   `RunFencedError` outcome instead of making a model call whose result would be
   discarded. A database read failure at that point now fails the run before the call.
   Format-1 runs are unchanged.
+- Default local database resolution now uses `./dendrux.db` for runtime helpers,
+  every CLI command and migrations when `DENDRUX_DATABASE_URL` is unset.
+  If only `~/.dendrux/dendrux.db` exists, log `local_database_default_changed`;
+  set `DENDRUX_DATABASE_URL` explicitly to keep using that file.
+- `mark_lease_expired` refuses a batch above 1,000 (the sweep batch cap) with
+  `ValueError` before any SQL; it previously accepted up to 100,000.
+- Retry and error classification share one connection-loss rule: SQLSTATE class
+  `08` or `57P01`–`57P03`. PostgreSQL `57P04`/`57P05` behind a generic DBAPI error
+  are no longer retried; behind an `OperationalError` they still are.
+- The MCP transport result cap (1,000,000 bytes) and `Limits.max_tool_result_bytes`
+  (1,048,576 bytes) are documented as separate knobs; values unchanged. The MCP HTTP
+  read bound is four times the smaller of the two plus any image allowance.
+
 - Add developer-called recovery for format-2 ReAct runs. `sweep(on_stale="reclaim")`
   marks bounded candidates; `agent.reclaim(..., tenant_id=..., item=...)` continues
   from committed state. Reclaim always requires explicit tenant scope. Interrupted

@@ -4023,6 +4023,10 @@ class SQLStateStore(SQLBlobCatalog):
         finalise_unrecoverable: bool = False,
     ) -> MarkResult:
         """Scan running rows once by id, atomically fencing each expired lease."""
+        _validate_lease_batch_size(
+            batch_size=batch_size,
+            cap=SWEEP_BATCH_MAX,
+        )
         return cast(
             "MarkResult",
             await self._scan_expired_runs(
@@ -5444,3 +5448,10 @@ class SQLStateStore(SQLBlobCatalog):
         if hook is not None:
             await hook(session, run_id)
         return int(seq)
+
+
+def _validate_lease_batch_size(*, batch_size: int, cap: int) -> None:
+    _positive_page(batch_size)
+    if batch_size > cap:
+        _codes.log_code(logger, _codes.RECOVERY_SCAN_LIMIT, run_id=None)
+        raise ValueError(f"batch_size must not exceed {cap}")

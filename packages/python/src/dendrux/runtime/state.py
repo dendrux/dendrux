@@ -1301,7 +1301,9 @@ class StateStore(Protocol):
         reclaim_limit: int,
         cursor: str | None,
         finalise_unrecoverable: bool = False,
-    ) -> MarkResult: ...
+    ) -> MarkResult:
+        """Mark expired leases with batch_size at most the sweep cap (1,000)."""
+        ...
 
     async def get_lease_expired(
         self, *, limit: int, cursor: str | None

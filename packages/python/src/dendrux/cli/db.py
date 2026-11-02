@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -55,7 +54,9 @@ def _build_alembic_config() -> Any:
 
 
 def _database_url() -> str:
-    url = os.environ.get("DENDRUX_DATABASE_URL", "sqlite+aiosqlite:///./dendrux.db")
+    from dendrux.db.session import get_database_url
+
+    url = get_database_url()
     from dendrux.db._engine_options import is_mysql_family_url, normalized_url
 
     if is_mysql_family_url(url):
