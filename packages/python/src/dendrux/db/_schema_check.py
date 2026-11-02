@@ -26,7 +26,7 @@ from __future__ import annotations
 import logging
 import os
 import weakref
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from sqlalchemy import UniqueConstraint, inspect, select
 from sqlalchemy.exc import DBAPIError
@@ -38,7 +38,7 @@ from dendrux.db.models import Base, DendruxSetting
 from dendrux.errors import SchemaNotInitializedError, SchemaOutOfDateError
 
 if TYPE_CHECKING:
-    from collections.abc import Collection, Mapping
+    from collections.abc import Collection, Iterable, Mapping
 
     from sqlalchemy import Connection, Engine
     from sqlalchemy.ext.asyncio import AsyncEngine
@@ -127,13 +127,14 @@ def read_schema_phase(conn: Connection, *, known_tables: Collection[str] | None 
     if not has_settings:
         return "pre-activation"
     settings = dict(
-        conn.execute(
-            select(DendruxSetting.key, DendruxSetting.value).where(
-                DendruxSetting.key.in_(("storage_format", "activate_step"))
-            )
+        cast(
+            "Iterable[tuple[str, str]]",
+            conn.execute(
+                select(DendruxSetting.key, DendruxSetting.value).where(
+                    DendruxSetting.key.in_(("storage_format", "activate_step"))
+                )
+            ).all(),
         )
-        .tuples()
-        .all()
     )
     storage_format = settings.get("storage_format", "1")
     step = settings.get("activate_step")

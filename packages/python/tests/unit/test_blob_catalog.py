@@ -722,6 +722,22 @@ async def test_mark_purging_row_reports_storage() -> None:
     assert await memory.mark_purging_row("-", part.ref.sha256, None) is None
 
 
+async def test_mark_purging_returns_generation_and_refuses_missing_or_already_purging() -> None:
+    services = BlobServices.in_memory()
+    part = await store_png(services, "t:a", make_png(35))
+    memory = services.memory
+    assert memory is not None
+    before = await memory.get_row("t:a", part.ref.sha256)
+    assert before is not None and before.state == "live"
+    assert await memory.mark_purging("t:b", part.ref.sha256, "erase") is None
+    assert await memory.mark_purging("t:a", "f" * 64, "erase") is None
+    assert await memory.mark_purging("t:a", part.ref.sha256, "erase") == before.generation
+    after = await memory.get_row("t:a", part.ref.sha256)
+    assert after is not None and after.state == "purging"
+    assert after.generation == before.generation
+    assert await memory.mark_purging("t:a", part.ref.sha256, "erase") is None
+
+
 async def test_in_memory_owner_key_collision_is_typed() -> None:
     services = BlobServices.in_memory()
     memory = services.memory

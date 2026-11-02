@@ -5,12 +5,15 @@ from __future__ import annotations
 import asyncio
 import os
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 import typer
 from rich.console import Console
 
 from dendrux._redact import mask_database_url, mask_database_urls_in
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
 
 app = typer.Typer(name="db", help="Database management commands.", no_args_is_help=True)
 console = Console()
@@ -140,15 +143,16 @@ async def _read_activation_status(url: str) -> tuple[str, str, str, str | None]:
                 return revision, "1", "not-started", None
             keys = ("storage_format", "activate_step", "bootstrap_in_progress")
             settings = dict(
-                (
-                    await conn.execute(
-                        select(DendruxSetting.key, DendruxSetting.value).where(
-                            DendruxSetting.key.in_(keys)
+                cast(
+                    "Iterable[tuple[str, str]]",
+                    (
+                        await conn.execute(
+                            select(DendruxSetting.key, DendruxSetting.value).where(
+                                DendruxSetting.key.in_(keys)
+                            )
                         )
-                    )
+                    ).all(),
                 )
-                .tuples()
-                .all()
             )
             return (
                 revision,

@@ -228,6 +228,63 @@ def test_b5_sqlite_live_writer_refuses(legacy):
     assert runner.invoke(app, ["db", "activate"]).exit_code == 0
 
 
+@pytest.mark.parametrize("failure", ["live_writer", "late_duplicates"])
+def test_failed_activation_releases_sqlite_while_exception_is_held(legacy, failure):
+    """A caught activation error must not keep the file locked through its traceback."""
+    import asyncio
+
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from sqlalchemy.pool import NullPool
+
+    from dendrux.db import _activate
+
+    sync_engine = migrate_legacy(legacy)
+    url = legacy[1]
+    engine = create_async_engine(url, poolclass=NullPool)
+    held: BaseException | None = None
+    try:
+        if failure == "live_writer":
+            with sync_engine.connect() as writer:
+                writer.exec_driver_sql("BEGIN IMMEDIATE")
+                writer.exec_driver_sql("UPDATE agent_runs SET iteration_count=1")
+                with pytest.raises(RuntimeError, match="transaction") as caught:
+                    asyncio.run(_activate.activate_database(engine))
+                held = caught.value  # kept on purpose: its traceback references the frames
+                writer.rollback()
+        else:
+            original = _activate._dedupe
+
+            def duplicate_after_dedupe(conn, size):
+                original(conn, size)
+                conn.execute(
+                    text(
+                        "INSERT INTO react_traces (id, agent_run_id, role, content, order_index,"
+                        " created_at, updated_at) VALUES (:id, '00000000000000000000999999',"
+                        " 'user', 'a', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+                    ),
+                    [{"id": "x"}, {"id": "y"}],
+                )
+                conn.commit()
+
+            _activate._dedupe, restore = duplicate_after_dedupe, original
+            try:
+                with pytest.raises(_activate.ActivationIndexConflictError) as caught:
+                    asyncio.run(_activate.activate_database(engine))
+                held = caught.value
+            finally:
+                _activate._dedupe = restore
+        assert held is not None  # still referenced: nothing may rely on dropping it
+        with sync_engine.connect() as probe:
+            probe.exec_driver_sql("PRAGMA busy_timeout=0")
+            settings = dict(probe.execute(text("SELECT key, value FROM dendrux_settings")).all())
+        if failure == "live_writer":
+            asyncio.run(_activate.activate_database(engine))
+        else:
+            assert settings["activate_step"] == "dedupe:react_traces"
+    finally:
+        asyncio.run(engine.dispose())
+
+
 def test_cli_status_and_dedupe_only(legacy):
     engine = migrate_legacy(legacy)
     result = runner.invoke(app, ["db", "status"])
@@ -1371,3 +1428,11 @@ async def test_pg_resume_after_interrupted_replaced_index_drop(rollout_database,
         assert (
             await conn.execute(text("SELECT to_regclass(:name)"), {"name": old})
         ).scalar_one() is None
+
+
+@pytest.mark.parametrize("batch_size", [True, 0, 5001])
+async def test_activate_refuses_out_of_range_batch_size_before_connecting(batch_size):
+    from dendrux.db import _activate
+
+    with pytest.raises(ValueError, match="batch_size"):
+        await _activate.activate_database(object(), batch_size=batch_size)  # type: ignore[arg-type]
