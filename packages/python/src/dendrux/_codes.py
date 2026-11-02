@@ -612,6 +612,14 @@ SUBTREE_LIMIT = Code(
     "A descendant traversal reaches its bound.",
     "Inspect the subtree and raise its bound if appropriate.",
 )
+RUN_CANCEL_RECOVERED = Code(
+    "run_cancel_recovered",
+    logging.WARNING,
+    "runtime",
+    _BASE_FIELDS,
+    "A Python 3.11 persisted run recovers cancellation at a dispatch boundary.",
+    "Expected when a database wait loses cancellation; Python 3.12+ is unaffected.",
+)
 RUN_FENCED = Code(
     "run_fenced",
     logging.WARNING,
@@ -1809,6 +1817,7 @@ REGISTRY = MappingProxyType(
             NOTE_LIMIT,
             SUBTREE_LIMIT,
             RUN_FENCED,
+            RUN_CANCEL_RECOVERED,
             SWEEP_CAP_REACHED,
             MIGRATION_LOCK_TIMEOUT,
             SHARED_ENGINE_LOOP_CLOSED,
