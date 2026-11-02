@@ -13,6 +13,15 @@ from dendrux.db._notify import NotifierState, Subscription, validate_channel
 from dendrux.errors import NotifierUnavailableError
 from dendrux.store._follow import FollowCapacityError
 
+DEFAULT_RECONNECT_BACKOFF = (1.0, 30.0)
+
+DEFAULT_MAX_SUBSCRIPTIONS = 10_000
+DEFAULT_CONNECT_TIMEOUT_S = 5.0
+DEFAULT_RECONNECT_ATTEMPT_TIMEOUT_S = 5.0
+DEFAULT_STOP_TIMEOUT_S = 5.0
+DEFAULT_HEALTH_CHECK_INTERVAL_S = 15.0
+DEFAULT_HEALTH_CHECK_TIMEOUT_S = 5.0
+
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
@@ -34,14 +43,14 @@ class PostgresEventNotifier:
         listen_url: str,
         *,
         channel: str = "dendrux_events",
-        reconnect_backoff: tuple[float, float] = (1.0, 30.0),
-        max_subscriptions: int = 10_000,
-        connect_timeout_s: float = 5.0,
-        reconnect_attempt_timeout_s: float = 5.0,
-        stop_timeout_s: float = 5.0,
+        reconnect_backoff: tuple[float, float] = DEFAULT_RECONNECT_BACKOFF,
+        max_subscriptions: int = DEFAULT_MAX_SUBSCRIPTIONS,
+        connect_timeout_s: float = DEFAULT_CONNECT_TIMEOUT_S,
+        reconnect_attempt_timeout_s: float = DEFAULT_RECONNECT_ATTEMPT_TIMEOUT_S,
+        stop_timeout_s: float = DEFAULT_STOP_TIMEOUT_S,
         self_test_timeout_s: float = 2.0,
-        health_check_interval_s: float = 15.0,
-        health_check_timeout_s: float = 5.0,
+        health_check_interval_s: float = DEFAULT_HEALTH_CHECK_INTERVAL_S,
+        health_check_timeout_s: float = DEFAULT_HEALTH_CHECK_TIMEOUT_S,
     ) -> None:
         from sqlalchemy.engine import make_url
 

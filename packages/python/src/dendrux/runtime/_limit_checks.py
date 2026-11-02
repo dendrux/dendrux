@@ -22,6 +22,10 @@ from typing import TYPE_CHECKING, Any
 from dendrux import _codes
 from dendrux.tools._pool import ToolCallLimiter
 
+MAX_NOTE_TEXT_BYTES = 32 * 1024
+MAX_NOTE_METADATA_BYTES = 8 * 1024
+MAX_PAUSE_REASON_CHARS = 1000
+
 if TYPE_CHECKING:
     from dendrux.agent import Agent
     from dendrux.runtime._entry_checks import EntryPoint, RunnerEntryPoint

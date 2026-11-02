@@ -17,6 +17,7 @@ from dendrux._lifecycle import PendingKind as PendingKind
 from dendrux._meta_keys import (
     ERROR_INFO_META_KEY as ERROR_INFO_META_KEY,
 )
+from dendrux.runtime._bounds import MAX_PAGE
 from dendrux.types import RunStatus
 
 if TYPE_CHECKING:
@@ -31,6 +32,9 @@ from dendrux.runtime.state import (
     _apply_tenant_scope,
     _Unscoped,
 )
+
+_METADATA_FILTER_CHARS = 4096
+
 
 PAUSE_WINDOW_EVENT_TYPES = (
     StoredEventType.RUN_PAUSED.value,
@@ -376,7 +380,7 @@ def check_metadata_filter(metadata_filter: object) -> None:
         if not isinstance(key, str) or not _METADATA_KEY.fullmatch(key):
             raise _invalid("metadata_filter", "keys must match [A-Za-z0-9_-]{1,128}.")
         if isinstance(value, str):
-            check_read_text("metadata_filter", value, max_chars=4096)
+            check_read_text("metadata_filter", value, max_chars=_METADATA_FILTER_CHARS)
         elif isinstance(value, float):
             if not math.isfinite(value):
                 raise _invalid("metadata_filter", "values must be finite numbers.")
@@ -502,7 +506,7 @@ def _accepts_tenant(method: Any) -> bool:
 def _active_pause_from_events(rows: list[Any]) -> int | None:
     if (
         not rows
-        or len(rows) == 1000
+        or len(rows) == MAX_PAGE
         or rows[-1].event_type
         not in {StoredEventType.RUN_PAUSED.value, StoredEventType.RUN_RESUME_ABORTED.value}
     ):
@@ -617,7 +621,7 @@ class _PendingReader:
                 StoredEventType.RUN_ERROR.value,
                 StoredEventType.RUN_CANCELLED.value,
             ],
-            limit=1000,
+            limit=MAX_PAGE,
         )
         return _active_pause_from_events(rows)
 

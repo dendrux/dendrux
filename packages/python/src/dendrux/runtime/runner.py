@@ -167,6 +167,13 @@ from dendrux.types import (
     tool_result_message,
 )
 
+_CONTROL_EVENT_LIMIT = 100
+
+ERROR_TEXT_CHARS = 500
+_TOOL_NAME_SCAN_LIMIT = 1000
+_TOOL_NAME_CHARS = 64
+_DEFAULT_RECOVERY_ITERATIONS = 10
+
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, AsyncIterator, Callable, Sequence
 
@@ -548,7 +555,7 @@ def _mcp_error_payload(error: _MCPDiscoveryError) -> dict[str, Any]:
 
     cause = error.__cause__ or error
     payload: dict[str, Any] = {
-        "error": str(error)[:500],
+        "error": str(error)[:ERROR_TEXT_CHARS],
         "error_type": _cause_type(error),
         "code": error_code_for(cause),
     }
@@ -602,8 +609,8 @@ def _local_tool_names(agent: Agent) -> list[str]:
 
     from dendrux.tool import get_tool_def
 
-    names = (get_tool_def(fn).name for fn in islice(agent.tools, 1000))
-    return sorted({name for name in names if len(name) <= 64 and name.isidentifier()})
+    names = (get_tool_def(fn).name for fn in islice(agent.tools, _TOOL_NAME_SCAN_LIMIT))
+    return sorted({name for name in names if len(name) <= _TOOL_NAME_CHARS and name.isidentifier()})
 
 
 async def _emit_declared_tools(
@@ -919,7 +926,7 @@ def _nonprovider_error(exc: Exception) -> str:
 def _error_payload(exc: Exception) -> dict[str, Any]:
     info = _provider_error_info(exc)
     return {
-        "error": _safe_error(exc)[:500],
+        "error": _safe_error(exc)[:ERROR_TEXT_CHARS],
         **({"error_info": info.to_dict()} if info else {}),
         **_database_error_code(exc),
     }
@@ -995,7 +1002,7 @@ async def _recovery_info(store: StateStore, record: Any) -> Any:
     if record is None or not getattr(record, "reclaim_attempts", 0):
         return None
     ids, truncated = await store.get_replayed_tool_calls(
-        record.id, limit=100, tenant_id=record.tenant_id
+        record.id, limit=_CONTROL_EVENT_LIMIT, tenant_id=record.tenant_id
     )
     return RecoveryInfo(record.reclaim_attempts, record.last_reclaimed_at, ids, truncated)
 
@@ -1047,7 +1054,7 @@ def _pause_event_data(result: RunResult, pause_state: PauseState) -> dict[str, A
     if pause_state.pause_reason is not None:
         paused_data["reason"] = pause_state.pause_reason
     if pause_state.pause_message:
-        paused_data["message"] = pause_state.pause_message[:500]
+        paused_data["message"] = pause_state.pause_message[:ERROR_TEXT_CHARS]
     if pause_state.budget_exceeded:
         paused_data["exceeded"] = pause_state.budget_exceeded
     return paused_data
@@ -1792,7 +1799,7 @@ def _resolve_max_delegation_depth(
     elif parent_ctx is not None:
         effective = parent_ctx.max_delegation_depth
     else:
-        effective = 10
+        effective = _DEFAULT_RECOVERY_ITERATIONS
 
     # --- Tighten-only clamp ---
     if parent_ctx is not None and parent_ctx.max_delegation_depth is not None:

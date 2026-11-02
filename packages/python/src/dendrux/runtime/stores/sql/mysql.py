@@ -19,6 +19,10 @@ from dendrux.runtime.durability import _safe_database_call
 from dendrux.runtime.state import _TERMINAL_STATUS_VALUES
 from dendrux.runtime.stores.sql.base import SQLStateStore
 
+_ERROR_WALK_LIMIT = 64
+_JSON_WALK_LIMIT = 524288
+_IN_BATCH = 1000
+
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
@@ -70,7 +74,7 @@ class MySQLStateStore(SQLStateStore):
         if classified.kind == "connection_lost" and limit is not None:
             errors = [exc]
             seen: set[int] = set()
-            while errors and len(seen) < 64:
+            while errors and len(seen) < _ERROR_WALK_LIMIT:
                 error = errors.pop()
                 if id(error) in seen:
                     continue
@@ -82,7 +86,7 @@ class MySQLStateStore(SQLStateStore):
                 )
                 pending = [iter((getattr(error, "params", None),))]
                 inspected = 0
-                while pending and inspected < 524288:
+                while pending and inspected < _JSON_WALK_LIMIT:
                     try:
                         value = next(pending[-1])
                     except StopIteration:
@@ -324,7 +328,9 @@ class MySQLStateStore(SQLStateStore):
 
         if not ids:
             return false()
-        return or_(*(col.in_(ids[start : start + 1000]) for start in range(0, len(ids), 1000)))
+        return or_(
+            *(col.in_(ids[start : start + _IN_BATCH]) for start in range(0, len(ids), _IN_BATCH))
+        )
 
     def idempotency_scope_predicate(self, tenant_id: str | None) -> Any:
         """Use the generated NO PAD scope for lookups and lost-ack proofs."""

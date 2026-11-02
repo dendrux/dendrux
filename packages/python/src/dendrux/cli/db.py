@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -11,6 +10,7 @@ import typer
 from rich.console import Console
 
 from dendrux._redact import mask_database_url, mask_database_urls_in
+from dendrux.db._activate import ACTIVATION_BATCH_SIZE
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -54,7 +54,9 @@ def _build_alembic_config() -> Any:
 
 
 def _database_url() -> str:
-    url = os.environ.get("DENDRUX_DATABASE_URL", "sqlite+aiosqlite:///./dendrux.db")
+    from dendrux.db.session import get_database_url
+
+    url = get_database_url()
     from dendrux.db._engine_options import is_mysql_family_url, normalized_url
 
     if is_mysql_family_url(url):
@@ -166,7 +168,9 @@ async def _read_activation_status(url: str) -> tuple[str, str, str, str | None]:
 
 @app.command()
 def activate(
-    batch_size: int = typer.Option(5000, "--batch-size", min=1, max=5000),
+    batch_size: int = typer.Option(
+        ACTIVATION_BATCH_SIZE, "--batch-size", min=1, max=ACTIVATION_BATCH_SIZE
+    ),
 ) -> None:
     """Dedupe and activate format 2 after every writer and reader has been upgraded.
 
@@ -178,7 +182,9 @@ def activate(
 
 @app.command()
 def dedupe(
-    batch_size: int = typer.Option(5000, "--batch-size", min=1, max=5000),
+    batch_size: int = typer.Option(
+        ACTIVATION_BATCH_SIZE, "--batch-size", min=1, max=ACTIVATION_BATCH_SIZE
+    ),
 ) -> None:
     """Only dedupe identical rows, with the same resumable cursors as activate."""
     _run_activation(batch_size, dedupe_only=True)

@@ -13,7 +13,10 @@ from rich.table import Table
 
 from dendrux._lifecycle import STORAGE_FORMAT_CHECKPOINTED
 from dendrux._redact import mask_database_urls_in
+from dendrux.runtime._bounds import MAX_LIST_OFFSET, MAX_PAGE
 from dendrux.types import RunStatus
+
+DEFAULT_RUN_LIMIT = 20
 
 app = typer.Typer(
     name="runs",
@@ -33,7 +36,9 @@ class StorageFormat(StrEnum):
 
 @app.callback(invoke_without_command=True)
 def list_runs(
-    limit: int = typer.Option(20, "--limit", "-n", help="Maximum number of runs to show."),
+    limit: int = typer.Option(
+        DEFAULT_RUN_LIMIT, "--limit", "-n", help="Maximum number of runs to show."
+    ),
     offset: int = typer.Option(0, "--offset", help="Skip this many runs."),
     status: str = typer.Option("", "--status", "-s", help="Filter by status."),
     tenant: str = typer.Option("", "--tenant", "-t", help="Filter by tenant ID."),
@@ -83,7 +88,7 @@ async def _list_runs(
         runs: list[Any]
         if storage_format is None:
             runs = await store.list_runs(
-                limit=max(1, min(limit, 1000)),
+                limit=max(1, min(limit, MAX_PAGE)),
                 offset=max(0, offset),
                 status=status,
                 **scope,
@@ -110,8 +115,8 @@ async def _list_runs(
                 statement = statement.where(AgentRun.tenant_id == tenant_id)
             statement = (
                 statement.order_by(AgentRun.created_at.desc(), AgentRun.id.desc())
-                .limit(max(1, min(limit, 1000)))
-                .offset(max(0, min(offset, 10000)))
+                .limit(max(1, min(limit, MAX_PAGE)))
+                .offset(max(0, min(offset, MAX_LIST_OFFSET)))
             )
             async with engine.connect() as conn:
                 runs = list(await conn.execute(statement))

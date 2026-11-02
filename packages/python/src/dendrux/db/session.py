@@ -1,6 +1,6 @@
 """Session factory — engine creation and async session management.
 
-Zero-config promise: first run() call auto-creates ~/.dendrux/dendrux.db
+Zero-config promise: first run() call auto-creates ./dendrux.db
 with all tables. No 'dendrux db migrate' needed for SQLite.
 
 Postgres users set DENDRUX_DATABASE_URL and use Alembic migrations.
@@ -15,6 +15,7 @@ Agent. URLs in messages are always masked.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import threading
 from contextlib import asynccontextmanager
@@ -27,6 +28,7 @@ from sqlalchemy.orm import sessionmaker
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
+from dendrux import _codes
 from dendrux._redact import mask_database_url
 from dendrux.db._pool_guard import close_fully, serialized, shares_one_connection
 from dendrux.db._schema_check import ensure_schema_current
@@ -39,19 +41,22 @@ _session_factory: sessionmaker | None = None  # type: ignore[type-arg]
 _engine_lock = threading.Lock()
 _generation = 0
 
-# Default DB location: ~/.dendrux/dendrux.db
-# Single well-known path so all commands and examples share the same DB.
-_DENDRITE_DIR = Path.home() / ".dendrux"
-DEFAULT_SQLITE_URL = f"sqlite+aiosqlite:///{_DENDRITE_DIR / 'dendrux.db'}"
+logger = logging.getLogger(__name__)
+DEFAULT_SQLITE_URL = "sqlite+aiosqlite:///./dendrux.db"
 
 
 def get_database_url() -> str:
     """Resolve database URL from environment or default to SQLite.
 
-    Default: ~/.dendrux/dendrux.db (created automatically).
+    Default: ./dendrux.db (created automatically).
     Override: set DENDRUX_DATABASE_URL for Postgres or custom path.
+
+    The existing home database is never selected implicitly.
+    When only that legacy file exists, resolution logs a warning.
+    Explicit environment values take precedence over file checks.
+    Applications and commands should use the same working directory.
     """
-    return os.environ.get("DENDRUX_DATABASE_URL", DEFAULT_SQLITE_URL)
+    return _resolve_database_url(os.environ.get("DENDRUX_DATABASE_URL"))
 
 
 def _published(resolved_url: str) -> AsyncEngine | None:
@@ -233,3 +238,11 @@ async def get_session(engine: AsyncEngine | None = None) -> AsyncGenerator[Async
             raise
         finally:
             await close_fully(session.close)
+
+
+def _resolve_database_url(url: str | None) -> str:
+    if url is not None:
+        return url
+    if not Path("dendrux.db").exists() and (Path.home() / ".dendrux/dendrux.db").exists():
+        _codes.log_code(logger, _codes.LOCAL_DATABASE_DEFAULT_CHANGED)
+    return DEFAULT_SQLITE_URL

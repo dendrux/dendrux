@@ -611,7 +611,7 @@ async def test_injected_deadlock_retries_whole_transaction(engine, store, monkey
     import dendrux.runtime.durability as durability
     import dendrux.runtime.stores.sql.base as state_mod
 
-    monkeypatch.setattr(durability, "_BASE_BACKOFF_S", 0.0)
+    monkeypatch.setattr(durability, "BASE_BACKOFF_S", 0.0)
 
     class _DeadlockError(Exception):
         sqlstate = "40P01"

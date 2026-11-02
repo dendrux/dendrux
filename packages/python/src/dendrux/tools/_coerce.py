@@ -37,6 +37,9 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, create_model
 from dendrux.tool import _VARIADIC_KINDS, _is_optional, _strip_annotated
 from dendrux.tools._typing import normalize_tool_hints
 
+_PLACEHOLDER_MAX_DEPTH = 20
+_MODEL_NAMES_CACHE_SIZE = 512
+
 if TYPE_CHECKING:
     from collections.abc import Callable, Collection
 
@@ -284,7 +287,7 @@ def build_call(spec: ArgsSpec, normalized: dict[str, Any]) -> tuple[list[Any], d
     return args, kwargs
 
 
-@functools.lru_cache(maxsize=512)
+@functools.lru_cache(maxsize=_MODEL_NAMES_CACHE_SIZE)
 def _model_names(model: type[BaseModel]) -> frozenset[str]:
     names: set[str] = set()
     try:
@@ -366,7 +369,7 @@ _PLACEHOLDER_SHAPE = re.compile(r"<<[A-Z][A-Z_]*_\d+>>")
 
 def contains_placeholder(value: Any, placeholders: Collection[str], _depth: int = 0) -> bool:
     """Whether ``value`` holds one of ``placeholders`` anywhere (bounded walk)."""
-    if not placeholders or _depth > 20:
+    if not placeholders or _depth > _PLACEHOLDER_MAX_DEPTH:
         return False
     if isinstance(value, str):
         return any(match in placeholders for match in _PLACEHOLDER_SHAPE.findall(value))

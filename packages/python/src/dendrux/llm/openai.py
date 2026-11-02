@@ -41,6 +41,11 @@ from dendrux.llm._images import (
 )
 from dendrux.llm._resilience import (
     DEFAULT_CALL_TIMEOUT,
+    DEFAULT_MAX_RESPONSE_BYTES,
+    DEFAULT_MAX_RETRIES,
+    DEFAULT_MAX_STREAM_BYTES,
+    DEFAULT_MAX_STREAM_TOOL_CALLS,
+    DEFAULT_MAX_TOKENS,
     DEFAULT_STREAM_IDLE_TIMEOUT,
     TIMEOUT_UNSET,
     LoopClients,
@@ -266,12 +271,12 @@ class OpenAIProvider(LLMProvider):
         model: str,
         api_key: str | None = None,
         base_url: str | None = None,
-        max_tokens: int = 16_000,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
         temperature: float | None = None,
         reasoning_effort: str | None = None,
         effort: str | None = None,
         timeout: Any = TIMEOUT_UNSET,
-        max_retries: int = 3,
+        max_retries: int = DEFAULT_MAX_RETRIES,
         prompt_cache_retention: Literal["in-memory", "24h"] | None = None,
         default_headers: dict[str, str] | None = None,
         extra_body: dict[str, Any] | None = None,
@@ -279,9 +284,9 @@ class OpenAIProvider(LLMProvider):
         call_timeout: float | None = DEFAULT_CALL_TIMEOUT,
         stream_idle_timeout: float | None = DEFAULT_STREAM_IDLE_TIMEOUT,
         stream_total_timeout: float | None = None,
-        max_response_bytes: int = 16 * 1024 * 1024,
-        max_stream_bytes: int = 16 * 1024 * 1024,
-        max_stream_tool_calls: int = 1000,
+        max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
+        max_stream_bytes: int = DEFAULT_MAX_STREAM_BYTES,
+        max_stream_tool_calls: int = DEFAULT_MAX_STREAM_TOOL_CALLS,
     ) -> None:
         """Create an OpenAI Chat Completions provider.
 

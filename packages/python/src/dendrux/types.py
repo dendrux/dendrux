@@ -23,10 +23,28 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Literal, TypeAlias
 
+from ulid import ULID
+
 from dendrux import _codes
 from dendrux._meta_keys import (
     REPLAYED_META_KEY as REPLAYED_META_KEY,
 )
+
+ULID_CHARS = 26
+COST_DECIMALS = 6
+
+_PERSISTABLE_TEXT_CHUNK = 65536
+_ERROR_TEXT_CHARS = 500
+_IDENTIFIER_MAX_CHARS = 255
+_DEFAULT_MAX_RESULTS = 1000
+_DEFAULT_BUDGET_WARN_AT = (0.5, 0.75, 0.9)
+_DEFAULT_MAX_SUBTREE_NODES = 10_000
+
+JSON_MAX_DEPTH = 32
+JSON_MAX_NODES = 10_000
+JSON_MAX_TEXT = 1024 * 1024
+_PROVIDER_KWARGS_MAX_BYTES = 2048
+DEFAULT_TOOL_TIMEOUT = 120.0
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Coroutine
@@ -35,7 +53,6 @@ if TYPE_CHECKING:
     from dendrux.media import Image
     from dendrux.store import PendingPause
 
-from ulid import ULID
 
 logger = logging.getLogger(__name__)
 
@@ -523,7 +540,7 @@ class ToolDef:
     target: ToolTarget = ToolTarget.SERVER
     parallel: bool = True  # Governs concurrent execution scheduling
     max_calls_per_run: int | None = None  # Enforced by ReActLoop — graceful limit
-    timeout_seconds: float = 120.0  # Enforced by ReActLoop via asyncio.wait_for
+    timeout_seconds: float = DEFAULT_TOOL_TIMEOUT  # Enforced by ReActLoop via asyncio.timeout
     has_explicit_timeout: bool = False  # True when developer set timeout_seconds explicitly
     meta: dict[str, Any] = field(default_factory=dict)  # MCP source info, annotations, etc.
     strict: bool = False
@@ -583,7 +600,11 @@ class ToolResult:
 
     @classmethod
     def list_from_dict(
-        cls, data: list[dict[str, Any]], *, limits: Limits | None = None, max_results: int = 1000
+        cls,
+        data: list[dict[str, Any]],
+        *,
+        limits: Limits | None = None,
+        max_results: int = _DEFAULT_MAX_RESULTS,
     ) -> list[ToolResult]:
         """Validate unique results, bounded count and aggregate max_input_bytes."""
         from dendrux._wire import tool_results_from_dict
@@ -875,12 +896,12 @@ class Budget:
     """
 
     max_tokens: int | None = None
-    warn_at: tuple[float, ...] = (0.5, 0.75, 0.9)
+    warn_at: tuple[float, ...] = _DEFAULT_BUDGET_WARN_AT
     max_cost_usd: float | None = None
     on_exceed: BudgetAction = "warn"
     include_children: bool = True
     count_cache_tokens: bool | None = True
-    max_subtree_nodes: int = 10000
+    max_subtree_nodes: int = _DEFAULT_MAX_SUBTREE_NODES
 
     def __post_init__(self) -> None:
         if (
@@ -1061,6 +1082,7 @@ class GovernanceEventType(StrEnum):
 
 
 _MIB = 1024 * 1024
+_DEFAULT_MAX_TOOL_RESULT_BYTES = _MIB
 
 
 @dataclass(frozen=True)
@@ -1086,7 +1108,7 @@ class Limits:
         ValueError: If a cap is not a positive integer.
     """
 
-    max_tool_result_bytes: int = _MIB
+    max_tool_result_bytes: int = _DEFAULT_MAX_TOOL_RESULT_BYTES
     max_input_bytes: int = _MIB
     max_metadata_bytes: int = 64 * 1024
     max_notes_per_run: int = 1000
@@ -1121,12 +1143,12 @@ def _validate_provider_kwargs(value: dict[str, Any], *, run_id: str | None = Non
     try:
         for chunk in json.JSONEncoder(ensure_ascii=False, separators=(",", ":")).iterencode(value):
             size += len(chunk.encode("utf-8"))
-            if size > 2048:
+            if size > _PROVIDER_KWARGS_MAX_BYTES:
                 break
     except (TypeError, ValueError):
         _codes.log_code(logger, _codes.PROVIDER_KWARGS_INVALID, run_id=run_id)
         raise ValueError("provider_kwargs must be JSON serializable") from None
-    if size > 2048:
+    if size > _PROVIDER_KWARGS_MAX_BYTES:
         _codes.log_code(logger, _codes.PROVIDER_KWARGS_TOO_LARGE, run_id=run_id)
         raise ValueError("provider_kwargs must encode to at most 2048 UTF-8 bytes")
 
@@ -2207,7 +2229,7 @@ class StructuredOutputValidationError(RuntimeError):
         super().__init__(
             f"Structured output validation failed for {output_type_name}. "
             f"Validation error: {validation_error}\n"
-            f"Raw response: {raw_response[:500]}"
+            f"Raw response: {raw_response[:_ERROR_TEXT_CHARS]}"
         )
 
 
@@ -2325,14 +2347,14 @@ def _validate_persistable(value: Any, field: str = "input") -> None:
     import math
 
     for item, depth in _persistable_nodes(value, field):
-        if depth > 32:
+        if depth > JSON_MAX_DEPTH:
             raise InputValidationError(field, "structure_limit")
         if isinstance(item, str):
             if "\x00" in item:
                 raise InputValidationError(field, "invalid_text")
             try:
-                for start in range(0, len(item), 65536):
-                    item[start : start + 65536].encode("utf-8")
+                for start in range(0, len(item), _PERSISTABLE_TEXT_CHUNK):
+                    item[start : start + _PERSISTABLE_TEXT_CHUNK].encode("utf-8")
             except UnicodeError:
                 raise InputValidationError(field, "invalid_text") from None
         elif isinstance(item, dict):
@@ -2351,7 +2373,7 @@ def _validate_persistable(value: Any, field: str = "input") -> None:
             raise InputValidationError(field, "invalid_json")
 
 
-def _validate_identifier(value: Any, field: str, *, maximum: int = 255) -> None:
+def _validate_identifier(value: Any, field: str, *, maximum: int = _IDENTIFIER_MAX_CHARS) -> None:
     if not isinstance(value, str) or not value or len(value) > maximum:
         raise InputValidationError(field, "invalid_identifier")
     _validate_persistable(value, field)

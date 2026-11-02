@@ -51,6 +51,16 @@ from dendrux.llm._helpers import GatewayErrorKind, classify_gateway_error
 from dendrux.llm._retry_telemetry import telemetry_event_hooks
 from dendrux.llm._transport import configure_request, deferred_client_type, guard_response
 
+_BODY_TEXT_CHUNK = 65536
+_BODY_SCALAR_BYTES = 8
+
+DEFAULT_MAX_TOKENS = 16_000
+DEFAULT_MAX_RETRIES = 3
+DEFAULT_MAX_RESPONSE_BYTES = 16 * 1024 * 1024
+DEFAULT_MAX_STREAM_BYTES = 16 * 1024 * 1024
+DEFAULT_MAX_STREAM_TOOL_CALLS = 1000
+_PROVIDER_BODY_MAX_DEPTH = 64
+
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine
     from types import ModuleType
@@ -114,9 +124,9 @@ class Deadlines:
     call_timeout: float | None
     stream_idle_timeout: float | None
     stream_total_timeout: float | None
-    max_stream_bytes: int = 16 * 1024 * 1024
-    max_stream_tool_calls: int = 1000
-    max_response_bytes: int = 16 * 1024 * 1024
+    max_stream_bytes: int = DEFAULT_MAX_STREAM_BYTES
+    max_stream_tool_calls: int = DEFAULT_MAX_STREAM_TOOL_CALLS
+    max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES
 
     @property
     def read_timeout(self) -> float:
@@ -132,9 +142,9 @@ def resolve_deadlines(
     call_timeout: float | None,
     stream_idle_timeout: float | None,
     stream_total_timeout: float | None,
-    max_stream_bytes: int = 16 * 1024 * 1024,
-    max_stream_tool_calls: int = 1000,
-    max_response_bytes: int = 16 * 1024 * 1024,
+    max_stream_bytes: int = DEFAULT_MAX_STREAM_BYTES,
+    max_stream_tool_calls: int = DEFAULT_MAX_STREAM_TOOL_CALLS,
+    max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
     stacklevel: int = 3,
 ) -> Deadlines:
     """Validate the deadline kwargs and fold in the deprecated ``timeout=``.
@@ -180,7 +190,7 @@ def resolve_deadlines(
 # ------------------------------------------------------------------
 
 # Statuses the SDKs retry after a backoff sleep.
-_BACKOFF_STATUSES = frozenset({408, 409, 429, 500, 502, 503, 504, 529})
+RETRYABLE_HTTP_STATUSES = frozenset({408, 409, 429, 500, 502, 503, 504, 529})
 
 
 @dataclass
@@ -695,7 +705,7 @@ def _deadline_error(
     model: str | None,
 ) -> ProviderError:
     status = state.last_status
-    if status in _BACKOFF_STATUSES and not state.in_flight:
+    if status in RETRYABLE_HTTP_STATUSES and not state.in_flight:
         # The deadline fired while the SDK slept before a retry: keep the
         # category of the failure being retried.
         message = timeout_message("deadline_during_backoff", limit)
@@ -873,7 +883,7 @@ class StreamClock:
         Adapters supply only newly retained data, never an SDK event or its
         cumulative snapshot. A final argument value credits its prior deltas.
         """
-        self._remaining -= 8
+        self._remaining -= _BODY_SCALAR_BYTES
         if self._remaining < 0:
             self._reject("stream_size_limit")
         size = self._retained_size(value, self._remaining + credited_bytes)
@@ -883,26 +893,26 @@ class StreamClock:
         return size
 
     def _retained_size(self, value: Any, maximum: int, depth: int = 0) -> int:
-        if maximum < 0 or depth > 64:
+        if maximum < 0 or depth > _PROVIDER_BODY_MAX_DEPTH:
             self._reject("stream_size_limit")
         if isinstance(value, str):
             if len(value) > maximum:
                 self._reject("stream_size_limit")
             size = 0
-            for start in range(0, len(value), 65536):
-                size += len(value[start : start + 65536].encode("utf-8"))
+            for start in range(0, len(value), _BODY_TEXT_CHUNK):
+                size += len(value[start : start + _BODY_TEXT_CHUNK].encode("utf-8"))
                 if size > maximum:
                     self._reject("stream_size_limit")
             return size
         if isinstance(value, (dict, list, tuple)):
-            size = 8
+            size = _BODY_SCALAR_BYTES
             values = value.items() if isinstance(value, dict) else value
             for item in values:
                 size += self._retained_size(item, maximum - size, depth + 1)
             if size > maximum:
                 self._reject("stream_size_limit")
             return size
-        return 8 if value is not None else 0
+        return _BODY_SCALAR_BYTES if value is not None else 0
 
     def mark_semantic(self) -> None:
         if self._idle is not None:

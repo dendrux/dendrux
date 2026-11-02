@@ -23,7 +23,14 @@ from dendrux.mcp._errors import (
 )
 from dendrux.mcp._result import error_text, has_image_blocks, normalize_mcp_result
 from dendrux.mcp._source import (
+    DEFAULT_CALL_TIMEOUT,
+    DEFAULT_CONNECT_TIMEOUT,
+    DEFAULT_DISCOVERY_TIMEOUT,
     DEFAULT_MAX_DISCOVERY_BYTES,
+    DEFAULT_MAX_DISCOVERY_PAGES,
+    DEFAULT_MAX_DISCOVERY_TOOLS,
+    DEFAULT_MAX_REDIRECTS,
+    DEFAULT_MAX_RESULT_BYTES,
     MCPFailureMode,
     MCPSource,
     redact_source_text,
@@ -55,7 +62,7 @@ def _sanitize_tool_name(name: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_-]", "_", name)
 
 
-def _normalize_mcp_result(result: Any, *, max_result_bytes: int = 1_000_000) -> Any:
+def _normalize_mcp_result(result: Any, *, max_result_bytes: int = DEFAULT_MAX_RESULT_BYTES) -> Any:
     """Compatibility export for the result normalizer."""
     return normalize_mcp_result(result, max_result_bytes=max_result_bytes)
 
@@ -378,16 +385,16 @@ class MCPServer:
         auth: Any = None,
         env: Mapping[str, str] | None = None,
         cwd: str | Path | None = None,
-        connect_timeout: float = 30.0,
-        call_timeout: float = 120.0,
-        max_result_bytes: int = 1_000_000,
+        connect_timeout: float = DEFAULT_CONNECT_TIMEOUT,
+        call_timeout: float = DEFAULT_CALL_TIMEOUT,
+        max_result_bytes: int = DEFAULT_MAX_RESULT_BYTES,
         failure_mode: MCPFailureMode = "strict",
         follow_redirects: bool = True,
-        max_redirects: int = 20,
+        max_redirects: int = DEFAULT_MAX_REDIRECTS,
         destination_policy: MCPDestinationPolicy | None = None,
-        max_discovery_pages: int = 100,
-        discovery_timeout: float = 60.0,
-        max_discovery_tools: int = 2000,
+        max_discovery_pages: int = DEFAULT_MAX_DISCOVERY_PAGES,
+        discovery_timeout: float = DEFAULT_DISCOVERY_TIMEOUT,
+        max_discovery_tools: int = DEFAULT_MAX_DISCOVERY_TOOLS,
         max_discovery_bytes: int = DEFAULT_MAX_DISCOVERY_BYTES,
     ) -> None:
         # Keep the legacy error wording and private transport attributes while

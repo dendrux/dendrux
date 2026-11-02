@@ -23,6 +23,8 @@ import httpx
 
 from dendrux.errors import ImageFetchError
 
+_FETCH_MAX_CONNECTIONS = 4
+
 if TYPE_CHECKING:
     from dendrux.media._policy import UrlPolicy
 
@@ -198,7 +200,7 @@ class _PinnedTransport(httpx.AsyncBaseTransport):
             http1=True,
             http2=False,
             retries=0,
-            max_connections=4,
+            max_connections=_FETCH_MAX_CONNECTIONS,
         )
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:

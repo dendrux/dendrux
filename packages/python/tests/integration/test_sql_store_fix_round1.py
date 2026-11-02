@@ -45,7 +45,7 @@ async def test_dropped_transition_commit_retries_without_a_cas_miss(
         await commit(session)
 
     monkeypatch.setattr(AsyncSession, "commit", drop_once)
-    monkeypatch.setattr(durability, "_BASE_BACKOFF_S", 0)
+    monkeypatch.setattr(durability, "BASE_BACKOFF_S", 0)
 
     @tool(target="client")
     def client_read() -> str:
@@ -233,7 +233,7 @@ async def test_proven_noncommit_raises_for_an_outer_retry(store, monkeypatch, op
         await commit(session)
 
     monkeypatch.setattr(AsyncSession, "commit", drop_once)
-    monkeypatch.setattr(durability, "_BASE_BACKOFF_S", 0)
+    monkeypatch.setattr(durability, "BASE_BACKOFF_S", 0)
 
     async def attempt():
         if operation == "pause_run":

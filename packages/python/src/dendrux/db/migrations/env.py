@@ -14,7 +14,7 @@ from sqlalchemy import pool
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from dendrux.db.models import Base
-from dendrux.db.session import get_database_url
+from dendrux.db.session import DEFAULT_SQLITE_URL, get_database_url
 
 # Alembic Config object — access to alembic.ini values
 config = context.config
@@ -31,7 +31,7 @@ target_metadata = Base.metadata
 # TODO(post-alpha): use a dedicated sentinel value in alembic.ini instead of comparing
 # against the literal default URL — this breaks if someone changes alembic.ini's default.
 existing_url = config.get_main_option("sqlalchemy.url")
-if not existing_url or existing_url == "sqlite+aiosqlite:///./dendrux.db":
+if not existing_url or existing_url == DEFAULT_SQLITE_URL:
     config.set_main_option("sqlalchemy.url", get_database_url())
 
 

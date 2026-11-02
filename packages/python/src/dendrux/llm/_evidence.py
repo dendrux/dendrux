@@ -8,12 +8,20 @@ from typing import Any, overload
 
 from dendrux.llm._usage import normalize_usage
 from dendrux.types import (
+    JSON_MAX_DEPTH,
+    JSON_MAX_NODES,
+    JSON_MAX_TEXT,
+    ULID_CHARS,
     InputValidationError,
     LLMResponse,
     StreamEvent,
     ToolCall,
     _validate_persistable,
 )
+
+_MAX_MAPPING_ENTRIES = 5000
+_IDENTIFIER_CHARS = 255
+
 
 _BAD_TEXT = re.compile(r"[\x00\ud800-\udfff]")
 
@@ -37,16 +45,16 @@ def _evidence(value: Any) -> Any:
     def copy(item: Any, depth: int = 0) -> Any:
         nonlocal nodes, size
         nodes += 1
-        if depth > 32 or nodes > 10000:
+        if depth > JSON_MAX_DEPTH or nodes > JSON_MAX_NODES:
             raise ValueError("Model evidence exceeds its traversal bound")
         if isinstance(item, str):
-            if len(item) > 1048576:
+            if len(item) > JSON_MAX_TEXT:
                 raise ValueError("Model evidence exceeds its byte bound")
             # The length check bounds the UTF-8 allocation to at most 4 MiB.
             # Surrogate replacement happens before encoding, in bounded text.
             cleaned = _text(item)
             size += len(cleaned.encode("utf-8"))
-            if size > 1048576:
+            if size > JSON_MAX_TEXT:
                 raise ValueError("Model evidence exceeds its byte bound")
             return cleaned
         if item is None or isinstance(item, (bool, int)):
@@ -54,7 +62,7 @@ def _evidence(value: Any) -> Any:
         if isinstance(item, float):
             return item if math.isfinite(item) else None
         if isinstance(item, dict):
-            if len(item) > 5000:
+            if len(item) > _MAX_MAPPING_ENTRIES:
                 raise ValueError("Model evidence exceeds its mapping bound")
             return {
                 copy(k, depth + 1): copy(v, depth + 1)
@@ -96,7 +104,7 @@ def _tool_name(value: None) -> None: ...
 
 def _tool_name(value: str | None) -> str | None:
     cleaned = _text(value)
-    return "<unknown_tool>" if cleaned is not None and len(cleaned) > 255 else cleaned
+    return "<unknown_tool>" if cleaned is not None and len(cleaned) > _IDENTIFIER_CHARS else cleaned
 
 
 class RejectedToolName(ToolCall):
@@ -133,9 +141,9 @@ def persistable_call(call: ToolCall | None) -> ToolCall | None:
 
 def _call_identity(call: ToolCall) -> ToolCall:
     name = _tool_name(call.name)
-    call_id = _bounded_id(call.id, 26)
-    provider_id = _bounded_id(call.provider_tool_call_id, 255)
-    if isinstance(call, RejectedToolName) or len(call.name) > 255:
+    call_id = _bounded_id(call.id, ULID_CHARS)
+    provider_id = _bounded_id(call.provider_tool_call_id, _IDENTIFIER_CHARS)
+    if isinstance(call, RejectedToolName) or len(call.name) > _IDENTIFIER_CHARS:
         return RejectedToolName(name=name, id=call_id, provider_tool_call_id=provider_id, params={})
     return replace(call, name=name, id=call_id, provider_tool_call_id=provider_id)
 
@@ -156,7 +164,7 @@ def persistable_response(response: LLMResponse) -> LLMResponse:
         response,
         text=_text(response.text),
         usage=normalize_usage(response.usage),
-        model=_bounded_id(response.model, 255),
+        model=_bounded_id(response.model, _IDENTIFIER_CHARS),
         reasoning=_text(response.reasoning),
         tool_calls=calls if response.tool_calls is not None else None,
         raw_stop_reason=_text(response.raw_stop_reason),
@@ -169,7 +177,7 @@ def persistable_event(event: StreamEvent) -> StreamEvent:
         event,
         text=_text(event.text),
         tool_name=_tool_name(event.tool_name),
-        tool_call_id=_bounded_id(event.tool_call_id, 255),
+        tool_call_id=_bounded_id(event.tool_call_id, _IDENTIFIER_CHARS),
         tool_call=persistable_call(event.tool_call),
         raw=persistable_response(event.raw) if isinstance(event.raw, LLMResponse) else None,
     )

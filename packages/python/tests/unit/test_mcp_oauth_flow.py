@@ -147,6 +147,9 @@ async def test_unknown_and_expired_state() -> None:
         ("access_denied", "code", "access_denied"),
         (None, None, "invalid_callback"),
         (None, "bad\ncode", "invalid_callback"),
+        (None, "x" * 4097, "invalid_callback"),
+        (None, "", "invalid_callback"),
+        (None, "   ", "invalid_callback"),
     ],
 )
 async def test_error_callbacks(error: str | None, code: str | None, expected: str) -> None:

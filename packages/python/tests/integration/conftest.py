@@ -62,7 +62,7 @@ import pytest_asyncio
 from sqlalchemy import event, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import ProgrammingError
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import NullPool
 
@@ -199,6 +199,30 @@ _PG_TRUNCATE_SQL = "TRUNCATE TABLE {tables} RESTART IDENTITY CASCADE".format(
 )
 
 
+# A leaked lock (an earlier test's connection left idle in transaction) must fail the
+# next fixture loudly instead of hanging the worker: bound every cleanup statement's
+# lock wait. Tests that prove this shorten it through the module attribute.
+_PG_CLEANUP_LOCK_TIMEOUT = "30s"
+
+
+async def _pg_bound_lock_wait(conn: AsyncConnection) -> None:
+    """Make lock waits in the current transaction fail after ``_PG_CLEANUP_LOCK_TIMEOUT``."""
+    await conn.execute(
+        text("SELECT set_config('lock_timeout', :value, true)"),
+        {"value": _PG_CLEANUP_LOCK_TIMEOUT},
+    )
+
+
+async def _pg_truncate_all(conn: AsyncConnection) -> None:
+    await _pg_bound_lock_wait(conn)
+    await conn.execute(text(_PG_TRUNCATE_SQL))
+
+
+async def _pg_drop_all(conn: AsyncConnection) -> None:
+    await _pg_bound_lock_wait(conn)
+    await conn.run_sync(Base.metadata.drop_all)
+
+
 # ---------------------------------------------------------------------------
 # Postgres: session-scoped schema lifecycle
 #
@@ -251,12 +275,12 @@ async def _pg_schema_setup(pg_database: str | None) -> AsyncIterator[None]:
     try:
         async with eng.begin() as conn:
             # Drop any leftover schema from a prior run (e.g. older models).
-            await conn.run_sync(Base.metadata.drop_all)
+            await _pg_drop_all(conn)
             await conn.run_sync(Base.metadata.create_all)
         yield
     finally:
         async with eng.begin() as conn:
-            await conn.run_sync(Base.metadata.drop_all)
+            await _pg_drop_all(conn)
         await eng.dispose()
 
 
@@ -279,7 +303,7 @@ async def engine(request, _pg_schema_setup, tmp_path) -> AsyncIterator[AsyncEngi
         eng = create_async_engine(url)
         try:
             async with eng.begin() as conn:
-                await conn.execute(text(_PG_TRUNCATE_SQL))
+                await _pg_truncate_all(conn)
                 await conn.run_sync(lambda c: seed_settings(c, active=True))
             yield eng
         finally:

@@ -31,7 +31,18 @@ from dendrux._meta_keys import (
 from dendrux._meta_keys import (
     PAUSE_REQUEST_META_KEY as PAUSE_REQUEST_META_KEY,
 )
+from dendrux.runtime._bounds import (
+    DEFAULT_EVENT_LIMIT,
+    DEFAULT_LIST_LIMIT,
+    DEFAULT_READ_LIMIT,
+    DEFAULT_SUBTREE_DEPTH,
+    DEFAULT_SUBTREE_ROWS,
+    SWEEP_BATCH_DEFAULT,
+    SWEEP_MAX_RUNS_DEFAULT,
+)
+from dendrux.runtime._bounds import MAX_LIST_OFFSET as MAX_LIST_OFFSET
 from dendrux.types import (
+    COST_DECIMALS,
     CreateRunResult,
     RunStatus,
     UsageStats,
@@ -151,8 +162,7 @@ def _loop_state_at_creation(
     return _initial_loop_state((meta or {}).get(LOOP_META_KEY))
 
 
-_COST_DECIMALS = 6  # llm_interactions.cost_usd is Numeric(10, 6)
-_IN_CHUNK = 500  # keep IN (...) lists well under SQLite's variable limit
+_COST_DECIMALS = COST_DECIMALS
 
 
 @overload
@@ -1091,7 +1101,7 @@ class StateStore(Protocol):
     async def list_runs(
         self,
         *,
-        limit: int = 50,
+        limit: int = DEFAULT_LIST_LIMIT,
         offset: int = 0,
         tenant_id: TenantScope = UNSCOPED,
         status: str | list[str] | None = None,
@@ -1126,8 +1136,8 @@ class StateStore(Protocol):
         self,
         older_than: timedelta,
         *,
-        batch_size: int = 100,
-        max_runs: int = 10000,
+        batch_size: int = SWEEP_BATCH_DEFAULT,
+        max_runs: int = SWEEP_MAX_RUNS_DEFAULT,
     ) -> list[SweptRun]:
         """Find RUNNING rows older than threshold and mark them ERROR.
 
@@ -1141,8 +1151,8 @@ class StateStore(Protocol):
         self,
         older_than: timedelta,
         *,
-        batch_size: int = 100,
-        max_runs: int = 10000,
+        batch_size: int = SWEEP_BATCH_DEFAULT,
+        max_runs: int = SWEEP_MAX_RUNS_DEFAULT,
     ) -> list[SweptRun]:
         """Find WAITING_* and PAUSED rows older than threshold and mark them
         ERROR with failure_reason=abandoned_waiting.
@@ -1159,7 +1169,11 @@ class StateStore(Protocol):
         ...
 
     async def get_delegation_info(
-        self, run_id: str, *, max_rows: int = 1000, max_depth: int = 32
+        self,
+        run_id: str,
+        *,
+        max_rows: int = DEFAULT_SUBTREE_ROWS,
+        max_depth: int = DEFAULT_SUBTREE_DEPTH,
     ) -> DelegationInfo | None:
         """Get full delegation context for a run.
 
@@ -1205,7 +1219,7 @@ class StateStore(Protocol):
         run_id: str,
         *,
         after_position: int | None,
-        limit: int = 500,
+        limit: int = DEFAULT_READ_LIMIT,
         include_superseded: bool = False,
         tenant_id: TenantScope = UNSCOPED,
     ) -> ConversationPage: ...
@@ -1215,7 +1229,7 @@ class StateStore(Protocol):
         run_id: str,
         *,
         after_order_index: int | None,
-        limit: int = 500,
+        limit: int = DEFAULT_READ_LIMIT,
         kinds: tuple[str, ...] = ("seed", "turn", "rewrite", "state"),
         tenant_id: TenantScope = UNSCOPED,
     ) -> list[TraceRecord]: ...
@@ -1287,7 +1301,9 @@ class StateStore(Protocol):
         reclaim_limit: int,
         cursor: str | None,
         finalise_unrecoverable: bool = False,
-    ) -> MarkResult: ...
+    ) -> MarkResult:
+        """Mark expired leases with batch_size at most the sweep cap (1,000)."""
+        ...
 
     async def get_lease_expired(
         self, *, limit: int, cursor: str | None
@@ -1309,7 +1325,7 @@ class StateStore(Protocol):
     async def set_trace_link(self, run_id: str, *, claim_epoch: int, trace_link: str) -> None: ...
 
     async def get_replayed_tool_calls(
-        self, run_id: str, *, limit: int = 100, tenant_id: TenantScope = UNSCOPED
+        self, run_id: str, *, limit: int = DEFAULT_EVENT_LIMIT, tenant_id: TenantScope = UNSCOPED
     ) -> tuple[list[str], bool]: ...
 
     async def mark_cancel_requested(
@@ -1478,10 +1494,6 @@ def _run_in_scope(run_id: str, tenant_id: TenantScope) -> Any:
     if isinstance(tenant_id, _Unscoped):
         return true()
     return _apply_tenant_scope(select(AgentRun.id).where(AgentRun.id == run_id), tenant_id).exists()
-
-
-MAX_LIST_OFFSET = 10_000
-"""Largest ``offset`` ``list_runs`` accepts. Keyset pagination is planned for 0.6."""
 
 
 def _check_offset(offset: int) -> int:

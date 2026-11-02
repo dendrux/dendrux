@@ -50,12 +50,15 @@ from dendrux.media._ids import image_id
 from dendrux.media._runtime import tenant_scope_for
 from dendrux.media._sniff import verify_blob_bytes
 from dendrux.media._store import (
+    DEFAULT_GC_AGE,
+    DEFAULT_GC_LIMIT,
     BlobInfo,
     BlobKey,
     BlobReference,
     GcResult,
     InMemoryBlobStore,
 )
+from dendrux.runtime._bounds import IN_CHUNK as _IN_CHUNK
 from dendrux.runtime.durability import retry_transient_db
 from dendrux.types import ImagePart, ImageRef, generate_ulid
 
@@ -82,7 +85,7 @@ __all__ = [
 ]
 
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
-_IN_CHUNK = 500
+
 DEFAULT_CACHE_BYTES = 128 * 1024 * 1024
 MIN_GC_AGE = timedelta(hours=1)
 _PURGE_REASON_MAX = 200
@@ -1663,7 +1666,7 @@ class CatalogBlobAccessor:
         await catalog.finish_purge(scope, sha, generation)
 
     async def collect_garbage(
-        self, *, older_than: timedelta = timedelta(hours=24), limit: int = 1000
+        self, *, older_than: timedelta = DEFAULT_GC_AGE, limit: int = DEFAULT_GC_LIMIT
     ) -> GcResult:
         """Recover stuck rows, drop orphan edges, then delete unreferenced old blobs.
 

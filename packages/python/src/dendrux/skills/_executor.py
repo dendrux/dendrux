@@ -9,6 +9,8 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
 
+DEFAULT_TIMEOUT_SECONDS = 300.0
+
 
 @dataclass(frozen=True)
 class SkillExecutionRequest:
@@ -83,7 +85,7 @@ class SkillExecutor:
     around each call and propagates task cancellation into it.
     """
 
-    timeout_seconds: float = 300.0
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
 
     async def execute(self, request: SkillExecutionRequest) -> SkillExecutionResult:
         """Run ``request.script_path`` from the package with ``request.args``."""

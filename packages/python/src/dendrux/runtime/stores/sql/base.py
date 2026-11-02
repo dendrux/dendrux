@@ -35,6 +35,25 @@ from dendrux._meta_keys import (
     TOUCHED_RUNS_SESSION_KEY,
 )
 from dendrux.runtime._blob_catalog import SQLBlobCatalog, write_blob_refs
+from dendrux.runtime._bounds import (
+    DEFAULT_EVENT_LIMIT,
+    DEFAULT_LIST_LIMIT,
+    DEFAULT_READ_LIMIT,
+    DEFAULT_SUBTREE_DEPTH,
+    DEFAULT_SUBTREE_ROWS,
+    MAX_PAGE,
+    MAX_SMALL_PAGE,
+    MAX_SUBTREE_DEPTH,
+    MAX_SUBTREE_ROWS,
+    PAUSE_PAGE_MAX,
+    RECOVERY_SCAN_MAX,
+    SWEEP_BATCH_DEFAULT,
+    SWEEP_BATCH_MAX,
+    SWEEP_MAX_RECLAIMS_MAX,
+    SWEEP_MAX_RUNS_DEFAULT,
+    SWEEP_MAX_RUNS_MAX,
+)
+from dendrux.runtime._bounds import IN_CHUNK as _IN_CHUNK
 from dendrux.runtime.durability import (
     _CommitNotAppliedError,
     _safe_database_call,
@@ -42,6 +61,8 @@ from dendrux.runtime.durability import (
     safe_database_operations,
 )
 from dendrux.types import (
+    _PROVIDER_KWARGS_MAX_BYTES,
+    ULID_CHARS,
     CreateRunResult,
     IdempotencyConflictError,
     RunStatus,
@@ -62,7 +83,6 @@ if TYPE_CHECKING:
 
 from dendrux.runtime.state import (
     _COST_DECIMALS,
-    _IN_CHUNK,
     _PERSISTED_VALUE_FIELDS,
     _TERMINAL_STATUS_VALUES,
     PAUSE_REQUEST_META_KEY,
@@ -124,6 +144,12 @@ from dendrux.runtime.stores.sql._types import (
     SelectSource,
     SetFields,
 )
+
+_RECOVERY_DESCRIPTOR_BYTES = 32768
+_RECOVERY_TRACE_BYTES = 1024 * 1024
+_RECOVERY_MAX_MESSAGES = 999
+_TRACE_POSITION_STRIDE = 1000
+
 
 PAUSE_INVALIDATION_EVENT_TYPES = (
     StoredEventType.RUN_RESUMED.value,
@@ -221,7 +247,7 @@ def _check_create_identifiers(
 ) -> None:
     from dendrux.types import _validate_identifier
 
-    _validate_identifier(run_id, "run_id", maximum=26)
+    _validate_identifier(run_id, "run_id", maximum=ULID_CHARS)
     _validate_identifier(agent_name, "agent_name")
     for name, optional in (
         ("tenant_id", tenant_id),
@@ -247,7 +273,10 @@ def _validate_checkpoint(run_id: str, value: dict[str, Any]) -> None:
     from dendrux.types import _validate_persistable
 
     _validate_persistable(value, "loop_state")
-    if _json_bytes(value) > 32768 or _json_bytes(value.get("provider_kwargs", {})) > 2048:
+    if (
+        _json_bytes(value) > _RECOVERY_DESCRIPTOR_BYTES
+        or _json_bytes(value.get("provider_kwargs", {})) > _PROVIDER_KWARGS_MAX_BYTES
+    ):
         _checkpoint_error(run_id)
 
 
@@ -259,11 +288,11 @@ def _validate_trace_write(run_id: str, trace: TraceWrite) -> None:
     if trace.trace_kind not in ("seed", "turn", "rewrite", "state"):
         raise ValueError("Unsupported trace kind")
     if trace.trace_kind in ("rewrite", "state"):
-        if len(trace.content.encode("utf-8")) > 1024 * 1024:
+        if len(trace.content.encode("utf-8")) > _RECOVERY_TRACE_BYTES:
             _checkpoint_error(run_id)
         value = json.loads(trace.content)
         if trace.trace_kind == "rewrite":
-            if not isinstance(value, list) or len(value) > 999:
+            if not isinstance(value, list) or len(value) > _RECOVERY_MAX_MESSAGES:
                 _checkpoint_error(run_id)
             if any(
                 not isinstance(m, dict)
@@ -908,7 +937,7 @@ class SQLStateStore(SQLBlobCatalog):
         from sqlalchemy import false, select, tuple_, update
 
         _positive_page(page_size)
-        if page_size > 1000:
+        if page_size > MAX_PAGE:
             raise ValueError("page_size must not exceed 1000")
         session.info[STORE_SESSION_KEY] = self
         columns = tuple(table.primary_key.columns)
@@ -2093,7 +2122,7 @@ class SQLStateStore(SQLBlobCatalog):
         _positive_page(limit)
         if not parent_ids:
             return []
-        size = min(limit, 500)
+        size = min(limit, MAX_SMALL_PAGE)
         statement = self.child_page_query(
             runs=AgentRun.__table__,
             parents=[RunParentCursor(parent, after) for parent in sorted(set(parent_ids))],
@@ -2145,7 +2174,7 @@ class SQLStateStore(SQLBlobCatalog):
         run_id: str,
         *,
         after_order_index: int | None,
-        limit: int = 500,
+        limit: int = DEFAULT_READ_LIMIT,
         kinds: tuple[str, ...] = ("seed", "turn", "rewrite", "state"),
         tenant_id: TenantScope = UNSCOPED,
     ) -> list[TraceRecord]:
@@ -2164,7 +2193,9 @@ class SQLStateStore(SQLBlobCatalog):
             if after_order_index is not None:
                 stmt = stmt.where(ReactTrace.order_index > after_order_index)
             rows = (
-                await session.scalars(stmt.order_by(ReactTrace.order_index).limit(min(limit, 1000)))
+                await session.scalars(
+                    stmt.order_by(ReactTrace.order_index).limit(min(limit, MAX_PAGE))
+                )
             ).all()
             return [_trace_record(row) for row in rows]
 
@@ -2173,7 +2204,7 @@ class SQLStateStore(SQLBlobCatalog):
         run_id: str,
         *,
         after_position: int | None,
-        limit: int = 500,
+        limit: int = DEFAULT_READ_LIMIT,
         include_superseded: bool = False,
         tenant_id: TenantScope = UNSCOPED,
     ) -> ConversationPage:
@@ -2183,7 +2214,7 @@ class SQLStateStore(SQLBlobCatalog):
         from dendrux.db.models import AgentRun, ReactTrace
 
         _positive_page(limit)
-        limit = min(limit, 1000)
+        limit = min(limit, MAX_PAGE)
         after = -1 if after_position is None else after_position
         entries: list[ConversationEntry] = []
         async with self._session_factory() as session:
@@ -2201,13 +2232,15 @@ class SQLStateStore(SQLBlobCatalog):
                 )
                 if isinstance(pointer, dict):
                     rewrite_order = pointer["order_index"]
-                    if after < rewrite_order * 1000 + 999:
+                    if after < rewrite_order * _TRACE_POSITION_STRIDE + (
+                        _TRACE_POSITION_STRIDE - 1
+                    ):
                         rewrite = await session.scalar(
                             base.where(ReactTrace.id == pointer["trace_id"])
                         )
             if rewrite is not None:
                 for index, message in enumerate(json.loads(rewrite.content), 1):
-                    position = rewrite.order_index * 1000 + index
+                    position = rewrite.order_index * _TRACE_POSITION_STRIDE + index
                     if position > after:
                         entries.append(
                             ConversationEntry(
@@ -2228,7 +2261,8 @@ class SQLStateStore(SQLBlobCatalog):
             if len(entries) <= limit:
                 kinds = ("seed", "turn", "rewrite") if include_superseded else ("seed", "turn")
                 stmt = base.where(
-                    ReactTrace.trace_kind.in_(kinds), ReactTrace.order_index > after // 1000
+                    ReactTrace.trace_kind.in_(kinds),
+                    ReactTrace.order_index > after // _TRACE_POSITION_STRIDE,
                 )
                 if rewrite_order is not None:
                     stmt = stmt.where(ReactTrace.order_index > rewrite_order)
@@ -2239,7 +2273,7 @@ class SQLStateStore(SQLBlobCatalog):
                 ).all()
                 entries.extend(
                     ConversationEntry(
-                        row.order_index * 1000,
+                        row.order_index * _TRACE_POSITION_STRIDE,
                         row.role,
                         row.content,
                         row.meta or {},
@@ -2280,7 +2314,7 @@ class SQLStateStore(SQLBlobCatalog):
             if before is not None:
                 stmt = stmt.where(LLMInteraction.created_at < _to_aware_utc(before))
             if limit is not None:
-                stmt = stmt.limit(max(1, min(limit, 1000)))
+                stmt = stmt.limit(max(1, min(limit, MAX_PAGE)))
             if offset:
                 stmt = stmt.offset(max(0, offset))
             result = await session.execute(stmt)
@@ -3228,7 +3262,7 @@ class SQLStateStore(SQLBlobCatalog):
                 RunEvent.sequence_index < pause_sequence,
             )
             .order_by(RunEvent.sequence_index.desc())
-            .limit(1000)
+            .limit(MAX_PAGE)
         )
         async with self._session_factory() as session:
             rows = (await session.execute(stmt)).scalars().all()
@@ -3788,7 +3822,7 @@ class SQLStateStore(SQLBlobCatalog):
                 .order_by(ReactTrace.order_index)
             )
             if limit is not None:
-                stmt = stmt.limit(max(1, min(limit, 1000)))
+                stmt = stmt.limit(max(1, min(limit, MAX_PAGE)))
             if offset:
                 stmt = stmt.offset(max(0, offset))
             result = await session.execute(stmt)
@@ -3834,7 +3868,7 @@ class SQLStateStore(SQLBlobCatalog):
             if before is not None:
                 stmt = stmt.where(ToolCallRecord.created_at < _to_aware_utc(before))
             if limit is not None:
-                stmt = stmt.limit(max(1, min(limit, 1000)))
+                stmt = stmt.limit(max(1, min(limit, MAX_PAGE)))
             if offset:
                 stmt = stmt.offset(max(0, offset))
             result = await session.execute(stmt)
@@ -3932,7 +3966,7 @@ class SQLStateStore(SQLBlobCatalog):
 
             if limit is not None:
                 # Clamp to 1..1000
-                clamped = max(1, min(limit, 2002 if _pause_page else 1000))
+                clamped = max(1, min(limit, PAUSE_PAGE_MAX if _pause_page else MAX_PAGE))
                 stmt = stmt.limit(clamped)
 
             result = await session.execute(stmt)
@@ -3989,6 +4023,10 @@ class SQLStateStore(SQLBlobCatalog):
         finalise_unrecoverable: bool = False,
     ) -> MarkResult:
         """Scan running rows once by id, atomically fencing each expired lease."""
+        _validate_lease_batch_size(
+            batch_size=batch_size,
+            cap=SWEEP_BATCH_MAX,
+        )
         return cast(
             "MarkResult",
             await self._scan_expired_runs(
@@ -4021,10 +4059,10 @@ class SQLStateStore(SQLBlobCatalog):
         _require_aware_utc("cutoff", cutoff)
         for bound in (batch_size, max_runs, max_returned, reclaim_limit):
             _positive_page(bound)
-        if max(batch_size, max_runs, max_returned) > 100000:
+        if max(batch_size, max_runs, max_returned) > RECOVERY_SCAN_MAX:
             _codes.log_code(logger, _codes.RECOVERY_SCAN_LIMIT, run_id=None)
             raise ValueError("Recovery scan bounds must not exceed 100000")
-        if reclaim_limit > 32767:
+        if reclaim_limit > SWEEP_MAX_RECLAIMS_MAX:
             raise ValueError("reclaim_limit exceeds SMALLINT")
         result = MarkResult([], [], [], 0, None)
         inspected, after = 0, cursor
@@ -4289,7 +4327,7 @@ class SQLStateStore(SQLBlobCatalog):
             return [
                 _reclaimable(row)
                 for row in (
-                    await session.execute(stmt.order_by(AgentRun.id).limit(min(limit, 1000)))
+                    await session.execute(stmt.order_by(AgentRun.id).limit(min(limit, MAX_PAGE)))
                 ).all()
             ]
 
@@ -4377,7 +4415,7 @@ class SQLStateStore(SQLBlobCatalog):
                         self._ordered(
                             table,
                             {
-                                **_status_values("cancelled"),
+                                **_status_values(RunStatus.CANCELLED.value),
                                 "claim_epoch": table.c.claim_epoch + 1,
                                 "pause_data": None,
                                 "cancel_requested": False,
@@ -4473,7 +4511,7 @@ class SQLStateStore(SQLBlobCatalog):
         )
 
     async def get_replayed_tool_calls(
-        self, run_id: str, *, limit: int = 100, tenant_id: TenantScope = UNSCOPED
+        self, run_id: str, *, limit: int = DEFAULT_EVENT_LIMIT, tenant_id: TenantScope = UNSCOPED
     ) -> tuple[list[str], bool]:
         """Read replayed call ids with one bounded lookahead for truncation."""
         from sqlalchemy import select
@@ -4481,7 +4519,7 @@ class SQLStateStore(SQLBlobCatalog):
         from dendrux.db.models import ToolCallRecord
 
         _positive_page(limit)
-        limit = min(limit, 1000)
+        limit = min(limit, MAX_PAGE)
         async with self._session_factory() as session:
             rows = (
                 await session.scalars(
@@ -4501,8 +4539,8 @@ class SQLStateStore(SQLBlobCatalog):
         self,
         older_than: timedelta,
         *,
-        batch_size: int = 100,
-        max_runs: int = 10000,
+        batch_size: int = SWEEP_BATCH_DEFAULT,
+        max_runs: int = SWEEP_MAX_RUNS_DEFAULT,
     ) -> list[SweptRun]:
         """Inspect running candidates in projected pages; cap 10,000 by default.
 
@@ -4517,8 +4555,8 @@ class SQLStateStore(SQLBlobCatalog):
         self,
         older_than: timedelta,
         *,
-        batch_size: int = 100,
-        max_runs: int = 10000,
+        batch_size: int = SWEEP_BATCH_DEFAULT,
+        max_runs: int = SWEEP_MAX_RUNS_DEFAULT,
     ) -> list[SweptRun]:
         """Inspect waiting candidates in projected pages; cap 10,000 by default.
 
@@ -4543,8 +4581,8 @@ class SQLStateStore(SQLBlobCatalog):
         from dendrux.db.models import AgentRun, RunEvent
 
         for name, value, ceiling in (
-            ("batch_size", batch_size, 1000),
-            ("max_runs", max_runs, 100000),
+            ("batch_size", batch_size, SWEEP_BATCH_MAX),
+            ("max_runs", max_runs, SWEEP_MAX_RUNS_MAX),
         ):
             if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= ceiling:
                 raise ValueError(f"{name} must be between 1 and {ceiling}")
@@ -4697,7 +4735,11 @@ class SQLStateStore(SQLBlobCatalog):
     # ------------------------------------------------------------------
 
     async def get_delegation_info(
-        self, run_id: str, *, max_rows: int = 1000, max_depth: int = 32
+        self,
+        run_id: str,
+        *,
+        max_rows: int = DEFAULT_SUBTREE_ROWS,
+        max_depth: int = DEFAULT_SUBTREE_DEPTH,
     ) -> DelegationInfo | None:
         """Bounded delegation context; summaries cover only the visited subtree.
 
@@ -4713,13 +4755,13 @@ class SQLStateStore(SQLBlobCatalog):
         if (
             isinstance(max_rows, bool)
             or not isinstance(max_rows, int)
-            or not 1 <= max_rows <= 10000
+            or not 1 <= max_rows <= MAX_SUBTREE_ROWS
         ):
             raise ValueError("max_rows must be an int between 1 and 10000.")
         if (
             isinstance(max_depth, bool)
             or not isinstance(max_depth, int)
-            or not 0 <= max_depth <= 100
+            or not 0 <= max_depth <= MAX_SUBTREE_DEPTH
         ):
             raise ValueError("max_depth must be an int between 0 and 100.")
         projection = load_only(
@@ -5062,7 +5104,7 @@ class SQLStateStore(SQLBlobCatalog):
         run_id: str,
         *,
         after: str | None = None,
-        limit: int = 500,
+        limit: int = DEFAULT_READ_LIMIT,
         tenant_id: TenantScope = UNSCOPED,
     ) -> list[str]:
         """Read one page of descendant ids, without run payloads.
@@ -5084,7 +5126,7 @@ class SQLStateStore(SQLBlobCatalog):
         stmt = select(tree.c.id).where(tree.c.id != run_id)
         if after is not None:
             stmt = stmt.where(tree.c.id > after)
-        stmt = stmt.order_by(tree.c.id).limit(max(1, min(limit, 500)))
+        stmt = stmt.order_by(tree.c.id).limit(max(1, min(limit, MAX_SMALL_PAGE)))
         async with self._session_factory() as session:
             return list((await session.scalars(stmt)).all())
 
@@ -5102,12 +5144,12 @@ class SQLStateStore(SQLBlobCatalog):
         async with self._session_factory() as session:
             return (await self._usage_by_run(session, [run_id])).get(run_id, UsageRollup())
 
-    _MAX_LIST_LIMIT = 1000
+    _MAX_LIST_LIMIT = MAX_PAGE
 
     async def list_runs(
         self,
         *,
-        limit: int = 50,
+        limit: int = DEFAULT_LIST_LIMIT,
         offset: int = 0,
         tenant_id: TenantScope = UNSCOPED,
         status: str | list[str] | None = None,
@@ -5406,3 +5448,10 @@ class SQLStateStore(SQLBlobCatalog):
         if hook is not None:
             await hook(session, run_id)
         return int(seq)
+
+
+def _validate_lease_batch_size(*, batch_size: int, cap: int) -> None:
+    _positive_page(batch_size)
+    if batch_size > cap:
+        _codes.log_code(logger, _codes.RECOVERY_SCAN_LIMIT, run_id=None)
+        raise ValueError(f"batch_size must not exceed {cap}")

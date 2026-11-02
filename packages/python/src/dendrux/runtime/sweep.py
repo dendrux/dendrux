@@ -28,6 +28,16 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal
 
 from dendrux import _codes
+from dendrux.runtime._bounds import (
+    SWEEP_BATCH_DEFAULT,
+    SWEEP_BATCH_MAX,
+    SWEEP_MAX_RECLAIMS_DEFAULT,
+    SWEEP_MAX_RECLAIMS_MAX,
+    SWEEP_MAX_RETURNED_DEFAULT,
+    SWEEP_MAX_RETURNED_MAX,
+    SWEEP_MAX_RUNS_DEFAULT,
+    SWEEP_MAX_RUNS_MAX,
+)
 from dendrux.runtime.state import SweepResult, _validate_sweep_age
 
 if TYPE_CHECKING:
@@ -42,12 +52,12 @@ async def sweep(
     state_store: StateStore | None = None,
     stale_running: timedelta | None = None,
     abandoned_waiting: timedelta | None = None,
-    batch_size: int = 100,
-    max_runs: int = 10000,
+    batch_size: int = SWEEP_BATCH_DEFAULT,
+    max_runs: int = SWEEP_MAX_RUNS_DEFAULT,
     database_options: dict[str, Any] | None = None,
     on_stale: Literal["error", "reclaim"] | None = None,
-    max_reclaims: int = 3,
-    max_returned: int = 1000,
+    max_reclaims: int = SWEEP_MAX_RECLAIMS_DEFAULT,
+    max_returned: int = SWEEP_MAX_RETURNED_DEFAULT,
     cursor: str | None = None,
 ) -> SweepResult:
     """Sweep stale and abandoned runs. Developer calls this at app startup.
@@ -107,10 +117,10 @@ async def sweep(
     if cursor is not None and not isinstance(cursor, str):
         raise ValueError("cursor must be a string or None")
     for name, value, ceiling in (
-        ("batch_size", batch_size, 1000),
-        ("max_runs", max_runs, 100000),
-        ("max_returned", max_returned, 100000),
-        ("max_reclaims", max_reclaims, 32767),
+        ("batch_size", batch_size, SWEEP_BATCH_MAX),
+        ("max_runs", max_runs, SWEEP_MAX_RUNS_MAX),
+        ("max_returned", max_returned, SWEEP_MAX_RETURNED_MAX),
+        ("max_reclaims", max_reclaims, SWEEP_MAX_RECLAIMS_MAX),
     ):
         if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= ceiling:
             raise ValueError(f"{name} must be between 1 and {ceiling}")
@@ -129,9 +139,9 @@ async def sweep(
     try:
         # Preserve legacy custom-store signatures at the default settings.
         limits = {}
-        if batch_size != 100:
+        if batch_size != SWEEP_BATCH_DEFAULT:
             limits["batch_size"] = batch_size
-        if max_runs != 10000:
+        if max_runs != SWEEP_MAX_RUNS_DEFAULT:
             limits["max_runs"] = max_runs
         from dendrux.runtime._capabilities import capabilities, validate_capabilities
 

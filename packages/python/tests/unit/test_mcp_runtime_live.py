@@ -68,6 +68,7 @@ from dendrux.mcp._runtime import (
     _ViewToolSource,
 )
 from dendrux.mcp._source import MCPSource
+from tests._helpers.lost_cancel import simulate_lost_cancel
 
 
 def _tool(name: str, *, read_only: bool = False) -> Tool:
@@ -272,6 +273,103 @@ def _total_connects() -> int:
 
 def _total_calls() -> int:
     return sum(adapter.call_tool_calls for adapter in _InstrumentedAdapter.instances)
+
+
+class TestWaitCancellation:
+    @pytest.mark.parametrize("lose_cancel", [False, True])
+    async def test_drain_cancel_survives_simultaneous_wake(
+        self, monkeypatch: pytest.MonkeyPatch, lose_cancel: bool
+    ) -> None:
+        if lose_cancel:
+            simulate_lost_cancel(monkeypatch)
+        runtime = MCPRuntime()
+        quiet = False
+        task = asyncio.create_task(
+            runtime._wait_for_quiet(asyncio.get_running_loop().time() + 60, lambda: quiet)
+        )
+        try:
+            await _wait_until(lambda: bool(runtime._drain_waiters))
+            quiet = True
+            runtime._notify_drain()
+            task.cancel()
+            done, _ = await asyncio.wait({task}, timeout=1)
+            assert task in done, "drain waiter ignored cancellation"
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert runtime._drain_waiters == set()
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            await runtime.close()
+
+    @pytest.mark.parametrize("lose_cancel", [False, True])
+    async def test_connection_cancel_survives_simultaneous_wake(
+        self, monkeypatch: pytest.MonkeyPatch, lose_cancel: bool
+    ) -> None:
+        if lose_cancel:
+            simulate_lost_cancel(monkeypatch)
+        async with MCPRuntime(max_connections=1, shutdown_timeout=0.05) as runtime:
+            busy = Agent(prompt="busy", tool_sources=[_bind_key(runtime, "busy").tools()])
+            queued = Agent(prompt="queued", tool_sources=[_bind_key(runtime, "queued").tools()])
+            await busy.get_tool_lookups()
+            task = asyncio.create_task(queued.get_tool_lookups())
+            try:
+                await _wait_until(lambda: bool(runtime._admission_queue))
+                runtime._admission_queue[0].event.set()
+                task.cancel()
+                # Eviction frees capacity before the waiter resumes. A lost
+                # cancel would let it acquire a new physical connection.
+                await runtime.evict(connection_key="busy", mode="force")
+                done, _ = await asyncio.wait({task}, timeout=1)
+                assert task in done, "connection waiter ignored cancellation"
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+                assert _opened_keys() == ["busy"]
+                assert (None, "queued") not in runtime._entries
+                assert runtime._admission_queue == deque()
+                assert runtime._admissions == {}
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                await queued.close()
+                await busy.close()
+
+    @pytest.mark.parametrize("lose_cancel", [False, True])
+    async def test_call_cancel_survives_simultaneous_wake(
+        self, monkeypatch: pytest.MonkeyPatch, lose_cancel: bool
+    ) -> None:
+        if lose_cancel:
+            simulate_lost_cancel(monkeypatch)
+        gate = asyncio.Event()
+        _InstrumentedAdapter.call_gate = gate
+        async with MCPRuntime(max_in_flight_calls=1, shutdown_timeout=0.05) as runtime:
+            agent = Agent(prompt="test", tool_sources=[_bind(runtime).tools()])
+            lookups = await agent.get_tool_lookups()
+            call = lookups.fn["github__read"]
+            busy = asyncio.create_task(call(value="busy"))
+            await _wait_until(lambda: runtime._in_flight_calls == 1)
+            queued = asyncio.create_task(call(value="queued"))
+            try:
+                await _wait_until(lambda: bool(runtime._call_queue))
+                # Release the occupied permit before the cancelled task runs.
+                gate.set()
+                runtime._call_queue[0].event.set()
+                queued.cancel()
+                done, _ = await asyncio.wait({busy, queued}, timeout=1)
+                assert queued in done, "call waiter ignored cancellation"
+                with pytest.raises(asyncio.CancelledError):
+                    await queued
+                await busy
+                assert _InstrumentedAdapter.call_log == ["busy"]
+                assert runtime._call_queue == deque()
+                assert runtime._active_call_permits == set()
+                assert all(entry.active_calls == 0 for entry in runtime._entries.values())
+            finally:
+                gate.set()
+                busy.cancel()
+                queued.cancel()
+                await asyncio.gather(busy, queued, return_exceptions=True)
+                await agent.close()
 
 
 class TestAgentConsumesToolViews:

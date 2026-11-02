@@ -4,13 +4,15 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from dendrux.agent import Agent
 from dendrux.llm.mock import MockLLM
 from dendrux.loops.base import BaseNotifier
 from dendrux.notifiers.composite import CompositeNotifier
 from dendrux.notifiers.console import ConsoleNotifier
 from dendrux.tool import tool
-from dendrux.types import LLMResponse, Message, Role, ToolCall, ToolResult
+from dendrux.types import LLMResponse, Message, Role, RunStatus, ToolCall, ToolResult
 
 
 class RecordingNotifier(BaseNotifier):
@@ -210,3 +212,36 @@ class TestCompositeNotifier:
 
         # Recording notifier still received the event
         assert len(recording.messages) == 1
+
+
+@pytest.mark.parametrize("status", [RunStatus.SUCCESS, RunStatus.ERROR])
+@pytest.mark.parametrize("cached", [False, True])
+def test_summary_reports_usage_and_cache_without_exposing_payloads(monkeypatch, status, cached):
+    from io import StringIO
+
+    from rich.console import Console
+
+    from dendrux.notifiers import console
+    from dendrux.types import RunResult, UsageStats
+
+    output = StringIO()
+    monkeypatch.setattr(console, "_console", Console(file=output, width=80, color_system=None))
+    observer = ConsoleNotifier()
+    observer._run_start = 1.0
+    monkeypatch.setattr(console.time, "monotonic", lambda: 3.5)
+    usage = UsageStats(
+        input_tokens=100,
+        output_tokens=10,
+        total_tokens=110,
+        cache_read_input_tokens=100 if cached else None,
+        cache_creation_input_tokens=20 if cached else None,
+    )
+    observer.print_summary(
+        RunResult(run_id="summary-test", status=status, answer="private answer", usage=usage)
+    )
+    text = output.getvalue()
+    assert status.value in text
+    assert "110" in text and "2.5s" in text
+    assert ("50% hit ratio" in text) is cached
+    assert ("cache writes" in text) is cached
+    assert "private answer" not in text

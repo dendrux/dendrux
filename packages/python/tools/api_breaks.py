@@ -27,6 +27,11 @@ from typing import Any
 
 import griffe
 
+try:
+    from tools._api_defaults import normalize_defaults
+except ModuleNotFoundError:  # direct script invocation
+    from _api_defaults import normalize_defaults
+
 HERE = Path(__file__).resolve().parent
 DEFAULT_ALLOWLIST = HERE / "api_break_allowlist.json"
 DEFAULT_REPO = HERE.parents[2]
@@ -77,6 +82,8 @@ def compute_breaks(package: str, repo: Path, ref: str, search_path: str) -> list
     except Exception as exc:  # griffe raises GitError / OSError / ValueError
         raise ValueError(f"cannot load {package!r} at git ref {ref!r}: {exc}") from exc
     new = griffe.load(package, search_paths=[repo / search_path])
+    normalize_defaults(old)
+    normalize_defaults(new)
     found = {_to_break(b) for b in griffe.find_breaking_changes(old, new)}
     return sorted(found, key=lambda b: (b.path, b.kind, b.param or ""))
 

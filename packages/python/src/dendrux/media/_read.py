@@ -10,6 +10,10 @@ import stat
 
 from dendrux.errors import ImageLimitError, InvalidImageError
 
+_READ_CHUNK_BYTES = 1024 * 1024
+_BASE64_ALLOCATION_MARGIN = 1.05
+_DATA_URL_OVERHEAD_BYTES = 4096
+
 _DATA_URL_RE = re.compile(r"data:([A-Za-z0-9.+/-]+);base64,", re.ASCII)
 _CHUNK_CHARS = 64 * 1024  # multiple of 4 -> decodes on quantum boundaries
 
@@ -57,7 +61,7 @@ def _read_path_sync(path: str, max_source_bytes: int) -> tuple[bytes | None, str
         chunks: list[bytes] = []
         remaining = max_source_bytes + 1
         while remaining > 0:
-            chunk = os.read(fd, min(remaining, 1024 * 1024))
+            chunk = os.read(fd, min(remaining, _READ_CHUNK_BYTES))
             if not chunk:
                 break
             chunks.append(chunk)
@@ -98,7 +102,7 @@ _ASCII_WS = {ord(c): None for c in " \t\n\r\x0b\x0c"}
 
 def max_lenient_base64_chars(max_bytes: int) -> int:
     """Raw-length ceiling for whitespace-wrapped base64 (checked before stripping)."""
-    return int(1.05 * max_base64_chars(max_bytes)) + 4096
+    return int(_BASE64_ALLOCATION_MARGIN * max_base64_chars(max_bytes)) + _DATA_URL_OVERHEAD_BYTES
 
 
 def decode_base64_bounded(

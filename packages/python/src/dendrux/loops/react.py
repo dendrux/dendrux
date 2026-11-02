@@ -142,6 +142,10 @@ from dendrux.types import (
     generate_ulid,
 )
 
+_IMAGE_REFERENCE_MAX_DEPTH = 50
+_IMAGE_SEARCH_MAX_DEPTH = 20
+_IMAGE_WIRE_OVERHEAD_BYTES = 4096
+
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 
@@ -1364,7 +1368,7 @@ def _referenced_images(params: Any, run_images: dict[str, list[ImageRef]]) -> tu
     found: set[str] = set()
 
     def walk(value: Any, depth: int) -> None:
-        if depth > 50:
+        if depth > _IMAGE_REFERENCE_MAX_DEPTH:
             return
         if isinstance(value, str):
             if value in run_images and IMAGE_ID_RE.fullmatch(value):
@@ -1432,7 +1436,7 @@ async def _ingest_mcp_images(
 def _contains_image(value: Any, depth: int = 0) -> bool:
     if isinstance(value, (Image, ImageRef, ImagePart)):
         return True
-    if depth > 20:
+    if depth > _IMAGE_SEARCH_MAX_DEPTH:
         return False
     if isinstance(value, dict):
         return any(_contains_image(v, depth + 1) for v in value.values())
@@ -3114,7 +3118,7 @@ def _image_wire_bytes(image_runtime: ImageRuntime | None) -> int:
     """Read-cap room for one image block (base64 of the policy's largest source)."""
     if image_runtime is None:
         return 0
-    return -(-image_runtime.policy.max_source_bytes * 4 // 3) + 4096
+    return -(-image_runtime.policy.max_source_bytes * 4 // 3) + _IMAGE_WIRE_OVERHEAD_BYTES
 
 
 class _ToolTimedOutError(Exception):

@@ -32,6 +32,8 @@ from dendrux.llm._helpers import (
 from dendrux.llm._resilience import error_from_fields
 from dendrux.types import ImagePart, TextPart
 
+ANTHROPIC_MANY_IMAGE_RULE = (20, 2000)
+
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 

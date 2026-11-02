@@ -172,8 +172,19 @@ Every queue Dendrux keeps has a default and an override. Size these with your wo
 | Sync tool threads per Agent | 8 | calls queue | `Agent(tool_threads=...)` |
 | Tool calls waiting per Agent | 256 | retryable `tool_pool_saturated` result, the tool never starts | `DENDRUX_TOOL_QUEUE_LIMIT` |
 | MCP discovery | 100 pages, 2,000 tools, 60 s, 16 MiB (HTTP) | `MCPDiscoveryLimitError` | `MCPSource` options |
-| `sweep` candidates per category | 10,000 | `sweep_cap_reached` warning | `max_runs=` |
+| `sweep` candidates per category | 10,000 (ceiling 100,000) | `sweep_cap_reached` warning | `max_runs=` |
 | `list_runs` offset | 10,000 | `ValueError` | none |
+| Tool calls queued per process | 1,024 | retryable `tool_pool_saturated` result | none |
+| `sweep` page size | 100 (ceiling 1,000) | `ValueError` | `batch_size=` |
+| `sweep` returned reclaimable runs | 1,000 (ceiling 100,000) | result is capped | `max_returned=` |
+| `sweep` reclaim attempts | 3 (ceiling 32,767) | run stops being reclaimable | `max_reclaims=` |
+| Lease renewal interval | 30 s (minimum 5 s) | `ValueError` below minimum | `Agent(lease_interval=...)` |
+| Lease renewal deadline | half the interval, at most 10 s | renewal counts as failed | none |
+| Consecutive lease failures | 2 | owner stops after lease loss | none |
+| Agent iterations | 10 (ceiling 200) | run stops at configured limit | `Agent(max_iterations=...)` |
+| Provider response / stream bytes | 16 MiB / 16 MiB | `ProviderResponseError` | provider `max_response_bytes=` / `max_stream_bytes=` |
+| Provider stream tool calls | 1,000 | `ProviderResponseError` | provider `max_stream_tool_calls=` |
+| Provider output tokens / SDK retries | 16,000 / 3 | provider output / retry bound | provider `max_tokens=` or `max_output_tokens=` / `max_retries=` |
 
 The follower cap is per **scope**, not per user. A string `tenant_id` is one scope, all untenanted (`None`) followers are one scope, and all `UNSCOPED` followers are one scope. A single-tenant app with more than 100 live readers per process builds its own feed with `max_followers_per_tenant=None`; see [Build your own read routes](/docs/recipes/build-your-own-read-routes).
 
