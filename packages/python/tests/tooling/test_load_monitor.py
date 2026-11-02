@@ -586,3 +586,31 @@ def test_incomplete_mysql_budget_file_is_refused_before_starting_workload(
         load.main(["--url", MYSQL, "--scenarios", "runs", "--statement-budgets", str(budget)]) == 2
     )
     assert "runs.statements_per_run" in capsys.readouterr().err
+
+
+async def test_stop_finishes_even_if_a_cancel_is_lost(monkeypatch):
+    # Python 3.11's wait_for can drop a cancel when the inner await finishes at the same time.
+    m = monitor_module()
+
+    async def probe(*args):
+        return ""
+
+    monkeypatch.setattr(m, "command", probe)
+    sampler = m.ResourceMonitor(None, interval=0.0001)
+    safe_sample = sampler._safe_sample
+    lost = []
+
+    async def swallow_one_cancel(label):
+        try:
+            await safe_sample(label)
+            await asyncio.sleep(0.05)
+        except asyncio.CancelledError:
+            if lost:
+                raise
+            lost.append(label)
+
+    monkeypatch.setattr(sampler, "_safe_sample", swallow_one_cancel)
+    await asyncio.wait_for(sampler.start(), 10)
+    await asyncio.sleep(0.05)
+    await asyncio.wait_for(sampler.stop(1), 5)
+    assert lost
