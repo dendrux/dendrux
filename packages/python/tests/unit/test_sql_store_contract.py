@@ -26,6 +26,7 @@ def test_factory_rejects_reserved_and_unknown_dialects(dialect, hint):
 
 
 def test_factory_returns_mysql_store():
+    pytest.importorskip("asyncmy", reason="requires dendrux[mysql]")
     from sqlalchemy.ext.asyncio import create_async_engine
 
     from dendrux.runtime.stores._factory import store_for_engine

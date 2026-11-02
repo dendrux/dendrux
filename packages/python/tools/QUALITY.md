@@ -32,6 +32,11 @@ environment does. Then run `make test-model-install` if the pinned NLP model is 
 the same extras as the Python shard jobs. For a SQLAlchemy matrix run, apply the leg's
 `pip install "sqlalchemy[asyncio]==2.0.*"` or `2.1.*` after syncing.
 
+Tests that construct a MySQL-family engine or use a driver exception skip individually
+when `asyncmy` is absent; pure error-classification tests still run. The dedicated MySQL
+and MariaDB jobs install `[dev,mysql]`, require a successful driver import, and run those
+contract/error test files alongside `tests/db`, so the optional cases remain enforced.
+
 Published runtime requirements (including SQLAlchemy, provider SDKs and database drivers)
 remain ranges. CI continues to resolve their newest allowed versions and tests both
 SQLAlchemy minors. The direct tool pins are not a transitive dependency lockfile. A tool
@@ -187,6 +192,8 @@ the slow tests.
   times the expected time, or a window the test computed itself) goes in
   `wallclock_reviewed.txt` instead. `tests/tooling/test_test_tiers.py` scans every test for such
   comparisons and fails on an unlisted one (`python tools/test_tiers.py audit-wallclock`).
+  It follows clock samples through collection appends, iteration and comprehensions too,
+  including derived bounds such as `max(stalls) < 0.025`.
   GitHub CI runs them in their own blocking `benchmarks` job (Python 3.12, SQLAlchemy 2.1, the
   Postgres service, `pytest -m benchmark -n 0`, no coverage), so a test that moved out of the
   parallel shards is still checked on every pull request. Locally they run in `make bench` and

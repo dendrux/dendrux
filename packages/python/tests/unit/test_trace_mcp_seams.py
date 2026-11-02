@@ -25,6 +25,38 @@ async def test_run_started_signature_gate(modern):
     assert seen == ["link" if modern else "legacy"]
 
 
+async def test_trace_start_uses_parent_run_link_when_otel_marker_getter_raises():
+    from dendrux.runtime.context import DelegationContext
+    from dendrux.runtime.runner import _start_trace
+
+    parent_link = "00-" + "1" * 32 + "-" + "2" * 16 + "-01"
+    span_link = "00-" + "1" * 32 + "-" + "3" * 16 + "-01"
+    seen = []
+
+    class Observer(BaseNotifier):
+        @property
+        def _dendrux_otel(self):
+            raise RuntimeError("unavailable marker")
+
+        async def on_run_started(self, run_id, **kwargs):
+            seen.append(kwargs["trace_link"])
+
+        def trace_link(self, run_id):
+            return parent_link
+
+    observer = Observer()
+    link, notifier = await _start_trace(
+        observer,
+        None,
+        "run",
+        agent_name="child",
+        agent_model=None,
+        parent=DelegationContext("parent", trace_link=parent_link, tool_span_link=span_link),
+    )
+    assert seen == [parent_link]
+    assert link == parent_link and notifier.inner is observer
+
+
 @pytest.mark.parametrize("transport", ["stdio", "http"])
 @pytest.mark.parametrize("hint", ["idempotent_hint", "read_only_hint", "neither", "missing"])
 @pytest.mark.parametrize("trust", [None, False, True])

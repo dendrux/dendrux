@@ -98,6 +98,7 @@ async def test_postgres_statement_cancel_is_not_retried(wrapper):
 
 @pytest.mark.parametrize("route", ["factory", "reader", "constructor"])
 def test_explicit_mariadb_engine_is_supported(route):
+    pytest.importorskip("asyncmy", reason="requires dendrux[mysql]")
     from sqlalchemy.ext.asyncio import create_async_engine
 
     from dendrux.runtime.stores._factory import store_for_engine
