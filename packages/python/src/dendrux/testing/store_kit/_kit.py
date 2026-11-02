@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, NoReturn, cast
 
 import pytest
 
+from dendrux._lifecycle import STORAGE_FORMAT_CHECKPOINTED
 from dendrux.testing.store_kit._declaration import (
     CLOCK,
     FACTORY,
@@ -20,6 +21,7 @@ from dendrux.testing.store_kit._declaration import (
     Declaration,
     validate_declaration,
 )
+from dendrux.types import RunStatus
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -210,7 +212,7 @@ class Kit:
         kwargs.setdefault("model", "kit-model")
         created = await target.create_run(run_id, kwargs.pop("agent_name", "KitAgent"), **kwargs)
         self.format = created.storage_format
-        if self._needs_format_2 and created.storage_format != 2:
+        if self._needs_format_2 and created.storage_format != STORAGE_FORMAT_CHECKPOINTED:
             if self.declaration.creates_format_2:
                 store_skip(
                     "it declares the four format-2 capabilities but creates storage-format-1 "
@@ -222,7 +224,11 @@ class Kit:
         return str(created.run_id)
 
     async def paused_run(
-        self, store: Any | None = None, *, status: str = "waiting_client_tool", **kwargs: Any
+        self,
+        store: Any | None = None,
+        *,
+        status: str = RunStatus.WAITING_CLIENT_TOOL.value,
+        **kwargs: Any,
     ) -> str:
         """A run paused at ``status`` with minimal pause data."""
         target = store if store is not None else self.store
@@ -238,7 +244,9 @@ class Kit:
         """A run claimed once after a pause: its epoch is one past the creation epoch."""
         target = store if store is not None else self.store
         run_id = await self.paused_run(target, **kwargs)
-        claim = await target.claim_paused_run(run_id, expected_status="waiting_client_tool")
+        claim = await target.claim_paused_run(
+            run_id, expected_status=RunStatus.WAITING_CLIENT_TOOL.value
+        )
         assert claim is not False, "a fresh pause must be claimable"
         return run_id, claim
 

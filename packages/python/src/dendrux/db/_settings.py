@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 from sqlalchemy import text
 
+from dendrux._lifecycle import STORAGE_FORMAT_CHECKPOINTED
 from dendrux.db._dialects import is_mysql_family
 
 if TYPE_CHECKING:
@@ -35,6 +36,8 @@ def put_setting(conn: Connection, key: str, value: str, *, overwrite: bool = Tru
 
 def seed_settings(conn: Connection, *, active: bool) -> None:
     """Seed fresh schemas active and existing schemas pre-activation, without flipping either."""
-    put_setting(conn, "storage_format", "2" if active else "1", overwrite=False)
+    put_setting(
+        conn, "storage_format", str(STORAGE_FORMAT_CHECKPOINTED) if active else "1", overwrite=False
+    )
     if active:
         put_setting(conn, "activate_step", "done", overwrite=False)

@@ -30,6 +30,9 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, TypeVar
 
 from dendrux import _codes
+from dendrux._lifecycle import (
+    FailureReason,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, AsyncIterator, Awaitable
@@ -416,7 +419,7 @@ async def _renew_claim(ctx: DelegationContext) -> None:
                 logger, _codes.LEASE_RENEW_FAILED, run_id=ctx.run_id, attempt=ctx._lease_failures[0]
             )
             if ctx._lease_failures[0] >= 2:
-                ctx._lease_errors[0] = PersistenceError(code="lease_lost")
+                ctx._lease_errors[0] = PersistenceError(code=FailureReason.LEASE_LOST.value)
                 _codes.log_code(logger, _codes.LEASE_LOST, run_id=ctx.run_id)
 
 

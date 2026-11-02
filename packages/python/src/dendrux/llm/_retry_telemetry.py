@@ -26,6 +26,8 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 
+from dendrux._lifecycle import GovernanceEventType
+
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Iterator
 
@@ -170,12 +172,16 @@ async def _on_response(response: httpx.Response) -> None:
 
         if recorder is not None:
             try:
-                await record_governance(recorder, run_id, "provider.retry", iteration, data)
+                await record_governance(
+                    recorder, run_id, GovernanceEventType.PROVIDER_RETRY.value, iteration, data
+                )
             except Exception:
                 _logger.warning("provider.retry recorder write failed", exc_info=True)
         if notifier is not None:
             try:
-                await notify_governance(notifier, run_id, "provider.retry", iteration, data)
+                await notify_governance(
+                    notifier, run_id, GovernanceEventType.PROVIDER_RETRY.value, iteration, data
+                )
             except Exception:
                 _logger.warning("provider.retry notifier broadcast failed", exc_info=True)
     except Exception:

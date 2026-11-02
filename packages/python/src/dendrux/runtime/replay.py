@@ -29,6 +29,28 @@ from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Literal
 
 from dendrux import _codes
+from dendrux._lifecycle import (
+    STORAGE_FORMAT_CHECKPOINTED,
+    FailureReason,
+    GovernanceEventType,
+)
+from dendrux._lifecycle import TERMINAL_STATUSES as _TERMINAL_STATUSES
+from dendrux._meta_keys import (
+    IMAGE_SEEDED_KEY as IMAGE_SEEDED_KEY,
+)
+from dendrux._meta_keys import (
+    MESSAGE_META_KEY,
+    PARTS_META_KEY,
+    SEED_PREFIX_META_KEY,
+    SKILLS_CONTEXT_META_KEY,
+    STEP_META_KEY,
+)
+from dendrux._meta_keys import (
+    PREFIX_META_KEY as PREFIX_META_KEY,
+)
+from dendrux._meta_keys import (
+    REPLAY_META_KEY as REPLAY_META_KEY,
+)
 from dendrux.context_blocks import _fold_first, fold_first_parts
 from dendrux.types import (
     REASONING_MODEL_META_KEY,
@@ -62,22 +84,14 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-PREFIX_META_KEY = "dendrux.prefix"
-REPLAY_META_KEY = "dendrux.replay"
 
 # Trace-meta keys on a run's own user message, recorded only when what went on
 # the wire differs from the raw ``user_input`` (folded context blocks).
+PARTS_KEY = PARTS_META_KEY
 WIRE_CONTENT_KEY = "wire_content"
 STABLE_CONTEXT_KEY = "stable_context"
 PLACEMENT_KEY = "placement"
-# Multimodal parts on traces / input_data (absent for text-only data).
-PARTS_KEY = "dendrux.parts"
-# agent_runs.meta: image slots of a run's seeded prefix that its own traces do not
-# reproduce (history=, its runs= prefix, a retry rebuild). Written only when
-# non-zero; ``None`` = unknown (no slot mapping for a later single-source carry).
-IMAGE_SEEDED_KEY = "dendrux.images.seeded_slots"
 
-_TERMINAL_STATUSES = frozenset({"success", "error", "cancelled", "max_iterations"})
 
 ReplayLast = int | Literal["all"]
 
@@ -180,10 +194,11 @@ async def load_replay_runs(
             )
         traces = (
             await conversation_records(store, run_id)
-            if record.storage_format == 2 and capabilities(store).checkpointing
+            if record.storage_format == STORAGE_FORMAT_CHECKPOINTED
+            and capabilities(store).checkpointing
             else await store.get_traces(run_id)
         )
-        traces = [t for t in traces if not (t.meta or {}).get("dendrux.seed_prefix")]
+        traces = [t for t in traces if not (t.meta or {}).get(SEED_PREFIX_META_KEY)]
         loaded.append(LoadedRun(record=record, traces=sorted(traces, key=lambda t: t.order_index)))
     return loaded
 
@@ -351,7 +366,7 @@ async def conversation_records(
             )
             if count > bounds.max_rebuild_rows or size > bounds.max_rebuild_bytes:
                 _codes.log_code(logger, _codes.HISTORY_TOO_LARGE, run_id=run_id)
-                raise RunNotReclaimableError(run_id, "history_too_large")
+                raise RunNotReclaimableError(run_id, FailureReason.HISTORY_TOO_LARGE.value)
             if count > offset:
                 records.append(
                     TraceRecord(
@@ -408,8 +423,8 @@ async def rebuild_history(
             )
             if rows > bounds.max_rebuild_rows or size > bounds.max_rebuild_bytes:
                 _codes.log_code(logger, _codes.HISTORY_TOO_LARGE, run_id=run_id)
-                raise RunNotReclaimableError(run_id, "history_too_large")
-            step = (trace.meta or {}).get("dendrux.step")
+                raise RunNotReclaimableError(run_id, FailureReason.HISTORY_TOO_LARGE.value)
+            step = (trace.meta or {}).get(STEP_META_KEY)
             if step is not None:
                 steps.append(_step_from_dict(step))
         if len(page) < 500:
@@ -436,7 +451,7 @@ def rebuild_messages(traces: list[TraceRecord], *, reasoning_for: str | None) ->
             continue
 
         meta = trace.meta or {}
-        envelope = meta.get("dendrux.message")
+        envelope = meta.get(MESSAGE_META_KEY)
         if isinstance(envelope, dict):
             from dendrux.types import _message_from_dict
 
@@ -579,7 +594,7 @@ def _text_turn(run: LoadedRun) -> list[Message]:
 
 def _full_turn(run: LoadedRun, *, reasoning_for: str | None) -> list[Message]:
     messages = _pair_tool_calls(rebuild_messages(run.traces, reasoning_for=reasoning_for))
-    if run.record.storage_format == 2:
+    if run.record.storage_format == STORAGE_FORMAT_CHECKPOINTED:
         messages = [m for m in messages if m.role != Role.SYSTEM]
     if not messages or messages[0].role != Role.USER:
         messages.insert(0, _raw_user_message(run))
@@ -751,7 +766,7 @@ def user_trace_message(
     current = seeded_history[-1]
     meta: dict[str, Any] = {}
     if session and session.explicit:
-        meta["dendrux.skills.context"] = [
+        meta[SKILLS_CONTEXT_META_KEY] = [
             asdict(b) for b in context or [] if b.placement == "dynamic" or len(seeded_history) == 1
         ]
     if current.parts is not None:
@@ -800,7 +815,11 @@ async def record_run_prefix(
 # Image view initialisation for seeded runs (history=, runs=, retry())
 # ---------------------------------------------------------------------------
 
-IMAGE_EVENT_TYPES = ("image.rejected", "image.state", "image.view_changed")
+IMAGE_EVENT_TYPES = (
+    GovernanceEventType.IMAGE_REJECTED.value,
+    GovernanceEventType.IMAGE_STATE.value,
+    GovernanceEventType.IMAGE_VIEW_CHANGED.value,
+)
 
 
 def image_slot_count(messages: Sequence[Message]) -> int:
@@ -879,17 +898,17 @@ def initial_image_view(
             continue
         for event in source.events:
             data = event.data or {}
-            if event.event_type == "image.rejected":
+            if event.event_type == GovernanceEventType.IMAGE_REJECTED.value:
                 key = _event_key(data, source.tenant_scope)
                 if key is not None and key[0] == tenant_scope and key not in seen_rejected:
                     seen_rejected.add(key)
                     state.rejected.append(key)
-            elif event.event_type == "image.state":
+            elif event.event_type == GovernanceEventType.IMAGE_STATE.value:
                 event_scope = data.get("tenant_scope")
                 scope = event_scope if isinstance(event_scope, str) else source.tenant_scope
                 if scope == tenant_scope:
                     _fold_state_event(state, data, scope, tenant_scope, offset)
-            elif event.event_type == "image.view_changed" and carry_view:
+            elif event.event_type == GovernanceEventType.IMAGE_VIEW_CHANGED.value and carry_view:
                 epoch = data.get("epoch")
                 dropped = data.get("dropped_through")
                 if isinstance(epoch, int):

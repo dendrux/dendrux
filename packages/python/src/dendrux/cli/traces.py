@@ -12,6 +12,9 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from dendrux._lifecycle import (
+    STORAGE_FORMAT_CHECKPOINTED,
+)
 from dendrux._redact import mask_database_urls_in
 
 if TYPE_CHECKING:
@@ -73,7 +76,7 @@ async def _show_traces(run_id: str, show_tool_calls: bool, limit: int = 200) -> 
         from dendrux.runtime.replay import conversation_records
 
         async def read_traces(limit: int, offset: int = 0) -> list[TraceRecord]:
-            if run.storage_format == 2:
+            if run.storage_format == STORAGE_FORMAT_CHECKPOINTED:
                 return await conversation_records(store, run_id, limit=limit, offset=offset)
             return await store.get_traces(run_id, limit=limit, offset=offset)
 

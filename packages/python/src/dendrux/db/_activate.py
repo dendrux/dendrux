@@ -13,6 +13,7 @@ from sqlalchemy import delete, func, inspect, select, text
 from sqlalchemy.exc import IntegrityError
 
 from dendrux import _codes
+from dendrux._lifecycle import STORAGE_FORMAT_CHECKPOINTED
 from dendrux.db._dialects import is_mysql_family, mysql, postgres, require_family, sqlite
 from dendrux.db._index_check import index_exists, require_index
 from dendrux.db._migration_ddl import build_index_concurrently, drop_index_concurrently, sqlstate
@@ -131,7 +132,10 @@ def _mysql_active(conn: Connection) -> bool:
     if not inspect(conn).has_table("dendrux_settings"):
         return True
     values = mysql.read_settings(conn)
-    return values.get("storage_format") == "2" and values.get("activate_step") == "done"
+    return (
+        values.get("storage_format") == str(STORAGE_FORMAT_CHECKPOINTED)
+        and values.get("activate_step") == "done"
+    )
 
 
 def _require_current(conn: Connection) -> None:
@@ -344,6 +348,6 @@ def _activate(conn: Connection, batch_size: int, dedupe_only: bool) -> None:
         put_setting(conn, "activate_step", "format")
         conn.commit()
         # Publish the format and completion marker atomically.
-        put_setting(conn, "storage_format", "2")
+        put_setting(conn, "storage_format", str(STORAGE_FORMAT_CHECKPOINTED))
         put_setting(conn, "activate_step", "done")
         conn.commit()

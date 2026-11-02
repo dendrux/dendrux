@@ -11,11 +11,12 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from dendrux._lifecycle import FailureReason
 from dendrux.errors import NoteLimitExceededError
 from dendrux.runtime.state import UNSCOPED
 from dendrux.testing.store_kit.contracts._marks import basic
 from dendrux.testing.store_kit.contracts._support import EVENT, tool_call_kwargs, ulid, usage
-from dendrux.types import IdempotencyConflictError, compute_idempotency_fingerprint
+from dendrux.types import IdempotencyConflictError, RunStatus, compute_idempotency_fingerprint
 
 if TYPE_CHECKING:
     from dendrux.testing.store_kit._kit import Kit
@@ -35,7 +36,11 @@ async def test_create_run_round_trips_what_it_was_given(dendrux_kit: Kit) -> Non
     )
     record = await store.get_run(run_id)
     assert record is not None
-    assert (record.id, record.agent_name, record.status) == (run_id, "KitAgent", "running")
+    assert (record.id, record.agent_name, record.status) == (
+        run_id,
+        "KitAgent",
+        RunStatus.RUNNING.value,
+    )
     assert (record.tenant_id, record.model, record.strategy) == (
         "acme",
         "kit-model",
@@ -230,23 +235,30 @@ async def test_finalize_run_writes_the_terminal_state_once(dendrux_kit: Kit) -> 
     run_id = await dendrux_kit.new_run()
     assert await store.finalize_run(
         run_id,
-        status="success",
+        status=RunStatus.SUCCESS.value,
         answer="done ✓",
         iteration_count=2,
         total_usage=usage(7, 3),
-        expected_current_status="running",
+        expected_current_status=RunStatus.RUNNING.value,
     )
     record = await store.get_run(run_id)
     assert record is not None
-    assert (record.status, record.answer, record.iteration_count) == ("success", "done ✓", 2)
+    assert (record.status, record.answer, record.iteration_count) == (
+        RunStatus.SUCCESS.value,
+        "done ✓",
+        2,
+    )
     assert (record.total_input_tokens, record.total_output_tokens) == (7, 3)
     lost = await store.finalize_run(
-        run_id, status="error", error="late", expected_current_status="running"
+        run_id,
+        status=RunStatus.ERROR.value,
+        error="late",
+        expected_current_status=RunStatus.RUNNING.value,
     )
     assert lost is False
     after = await store.get_run(run_id)
     assert after is not None
-    assert (after.status, after.answer) == ("success", "done ✓")
+    assert (after.status, after.answer) == (RunStatus.SUCCESS.value, "done ✓")
 
 
 @basic()
@@ -254,17 +266,23 @@ async def test_finalize_run_if_status_in_is_a_compare_and_swap(dendrux_kit: Kit)
     store = dendrux_kit.store
     run_id = await dendrux_kit.new_run()
     miss = await store.finalize_run_if_status_in(
-        run_id, status="success", allowed_current_statuses=["waiting_approval"], answer="x"
+        run_id,
+        status=RunStatus.SUCCESS.value,
+        allowed_current_statuses=[RunStatus.WAITING_APPROVAL.value],
+        answer="x",
     )
     assert miss is False
-    assert (await store.get_run(run_id)).status == "running"
+    assert (await store.get_run(run_id)).status == RunStatus.RUNNING.value
     hit = await store.finalize_run_if_status_in(
-        run_id, status="success", allowed_current_statuses=["running", "paused"], answer="y"
+        run_id,
+        status=RunStatus.SUCCESS.value,
+        allowed_current_statuses=[RunStatus.RUNNING.value, "paused"],
+        answer="y",
     )
     assert hit is True
     record = await store.get_run(run_id)
     assert record is not None
-    assert (record.status, record.answer) == ("success", "y")
+    assert (record.status, record.answer) == (RunStatus.SUCCESS.value, "y")
 
 
 @basic()
@@ -277,7 +295,7 @@ async def test_cancel_is_a_flag_on_non_terminal_runs_only(dendrux_kit: Kit) -> N
     assert await store.is_cancel_requested(run_id) is True
     control = await store.get_run_control(run_id)
     assert control.cancel_requested is True
-    await store.finalize_run(run_id, status="cancelled")
+    await store.finalize_run(run_id, status=RunStatus.CANCELLED.value)
     assert await store.is_cancel_requested(run_id) is False, "a finished run holds no flag"
     assert await store.request_cancel(run_id) is False
     assert await store.request_cancel(ulid()) is False
@@ -289,24 +307,34 @@ async def test_pause_state_is_stored_and_a_claim_has_one_winner(dendrux_kit: Kit
     run_id = await dendrux_kit.paused_run()
     record = await store.get_run(run_id)
     assert record is not None
-    assert record.status == "waiting_client_tool"
+    assert record.status == RunStatus.WAITING_CLIENT_TOOL.value
     state = await store.get_pause_state(run_id)
     assert state is not None
     assert state["pause_id"] == "kit-pause"
-    first = await store.claim_paused_run(run_id, expected_status="waiting_client_tool")
-    second = await store.claim_paused_run(run_id, expected_status="waiting_client_tool")
+    first = await store.claim_paused_run(
+        run_id, expected_status=RunStatus.WAITING_CLIENT_TOOL.value
+    )
+    second = await store.claim_paused_run(
+        run_id, expected_status=RunStatus.WAITING_CLIENT_TOOL.value
+    )
     assert first is not False
     assert second is False
-    assert (await store.get_run(run_id)).status == "running"
+    assert (await store.get_run(run_id)).status == RunStatus.RUNNING.value
 
 
 @basic()
 async def test_a_claim_with_the_wrong_expected_status_loses(dendrux_kit: Kit) -> None:
     store = dendrux_kit.store
     run_id = await dendrux_kit.paused_run()
-    assert await store.claim_paused_run(run_id, expected_status="waiting_approval") is False
-    assert (await store.get_run(run_id)).status == "waiting_client_tool"
-    assert await store.claim_paused_run(run_id, expected_status="waiting_client_tool") is not False
+    assert (
+        await store.claim_paused_run(run_id, expected_status=RunStatus.WAITING_APPROVAL.value)
+        is False
+    )
+    assert (await store.get_run(run_id)).status == RunStatus.WAITING_CLIENT_TOOL.value
+    assert (
+        await store.claim_paused_run(run_id, expected_status=RunStatus.WAITING_CLIENT_TOOL.value)
+        is not False
+    )
 
 
 @basic()
@@ -321,15 +349,15 @@ async def test_submit_and_claim_merges_the_submission_and_claims_once(dendrux_ki
     }
     won = await store.submit_and_claim(
         run_id,
-        expected_status="waiting_client_tool",
+        expected_status=RunStatus.WAITING_CLIENT_TOOL.value,
         submitted_data={"submitted_tool_results": [{"call_id": "c1", "payload": '"v"'}]},
         submission=envelope,
     )
     assert won is not False
-    assert (await store.get_run(run_id)).status == "running"
+    assert (await store.get_run(run_id)).status == RunStatus.RUNNING.value
     lost = await store.submit_and_claim(
         run_id,
-        expected_status="waiting_client_tool",
+        expected_status=RunStatus.WAITING_CLIENT_TOOL.value,
         submitted_data={"x": 1},
         submission=envelope,
     )
@@ -342,10 +370,10 @@ async def test_a_pending_cancel_beats_a_pause(dendrux_kit: Kit) -> None:
     run_id = await dendrux_kit.new_run()
     await store.request_cancel(run_id)
     paused = await store.try_pause_run(
-        run_id, status="waiting_client_tool", pause_data={"pause_id": "p"}
+        run_id, status=RunStatus.WAITING_CLIENT_TOOL.value, pause_data={"pause_id": "p"}
     )
     assert paused is False
-    assert (await store.get_run(run_id)).status == "running"
+    assert (await store.get_run(run_id)).status == RunStatus.RUNNING.value
 
 
 @basic()
@@ -409,7 +437,7 @@ async def test_notes_are_kept_in_order_and_marked_delivered(dendrux_kit: Kit) ->
 async def test_a_note_is_refused_for_finished_missing_or_foreign_runs(dendrux_kit: Kit) -> None:
     store = dendrux_kit.store
     done = await dendrux_kit.new_run()
-    await store.finalize_run(done, status="success", answer="a")
+    await store.finalize_run(done, status=RunStatus.SUCCESS.value, answer="a")
     assert await store.add_note(done, note_id=ulid(), text="late") is False
     assert await store.add_note(ulid(), note_id=ulid(), text="nowhere") is False
     mine = await dendrux_kit.new_run(tenant_id="t1")
@@ -454,20 +482,20 @@ async def test_list_runs_orders_newest_first_and_filters(dendrux_kit: Kit) -> No
     first = await dendrux_kit.new_run(agent_name="Alpha", meta={"customer": "acme"})
     second = await dendrux_kit.new_run(agent_name="Beta", meta={"customer": "other"})
     third = await dendrux_kit.new_run(agent_name="Alpha")
-    await store.finalize_run(second, status="success", answer="a")
+    await store.finalize_run(second, status=RunStatus.SUCCESS.value, answer="a")
     assert [r.id for r in await store.list_runs()] == [third, second, first]
     assert [r.id for r in await store.list_runs(limit=2)] == [third, second]
     assert [r.id for r in await store.list_runs(limit=1, offset=1)] == [second]
     assert [r.id for r in await store.list_runs(agent_name="Alpha")] == [third, first]
-    assert [r.id for r in await store.list_runs(status="success")] == [second]
-    assert {r.id for r in await store.list_runs(status=["success", "running"])} == {
+    assert [r.id for r in await store.list_runs(status=RunStatus.SUCCESS.value)] == [second]
+    assert {r.id for r in await store.list_runs(status=["success", RunStatus.RUNNING.value])} == {
         first,
         second,
         third,
     }
     assert [r.id for r in await store.list_runs(metadata_filter={"customer": "acme"})] == [first]
     assert await store.count_runs(agent_name="Alpha") == 2
-    assert await store.count_runs(status="success") == 1
+    assert await store.count_runs(status=RunStatus.SUCCESS.value) == 1
 
 
 @basic()
@@ -517,7 +545,7 @@ async def test_a_cancel_cascade_walks_children_in_pages(dendrux_kit: Kit) -> Non
     assert rest == sorted(kids)[3:]
     assert await store.mark_cancel_requested([root, *kids], tenant_id=UNSCOPED) == 6
     assert all([await store.is_cancel_requested(r) for r in (root, *kids)])
-    await store.finalize_run(kids[0], status="cancelled")
+    await store.finalize_run(kids[0], status=RunStatus.CANCELLED.value)
     assert await store.mark_cancel_requested([kids[0]], tenant_id=UNSCOPED) == 0
 
 
@@ -532,9 +560,9 @@ async def test_sweeping_stale_running_runs_spares_fresh_ones(dendrux_kit: Kit) -
     fresh = await dendrux_kit.new_run()
     swept = await store.sweep_stale_runs(threshold)
     assert [s.run_id for s in swept] == [stale]
-    assert swept[0].previous_status == "running"
-    assert (await store.get_run(stale)).status == "error"
-    assert (await store.get_run(fresh)).status == "running"
+    assert swept[0].previous_status == RunStatus.RUNNING.value
+    assert (await store.get_run(stale)).status == RunStatus.ERROR.value
+    assert (await store.get_run(fresh)).status == RunStatus.RUNNING.value
     assert await store.sweep_stale_runs(threshold) == [], "a second sweep finds nothing new"
 
 
@@ -547,11 +575,11 @@ async def test_sweeping_abandoned_waiting_runs_spares_fresh_ones(dendrux_kit: Ki
     waiting = await dendrux_kit.paused_run()
     swept = await store.sweep_abandoned_runs(threshold)
     assert [s.run_id for s in swept] == [abandoned]
-    assert swept[0].previous_status == "waiting_client_tool"
-    assert swept[0].failure_reason == "abandoned_waiting"
-    assert (await store.get_run(abandoned)).status == "error"
-    assert (await store.get_run(waiting)).status == "waiting_client_tool"
-    assert (await store.get_run(running)).status == "running"
+    assert swept[0].previous_status == RunStatus.WAITING_CLIENT_TOOL.value
+    assert swept[0].failure_reason == FailureReason.ABANDONED_WAITING.value
+    assert (await store.get_run(abandoned)).status == RunStatus.ERROR.value
+    assert (await store.get_run(waiting)).status == RunStatus.WAITING_CLIENT_TOOL.value
+    assert (await store.get_run(running)).status == RunStatus.RUNNING.value
 
 
 @basic()
@@ -561,7 +589,7 @@ async def test_a_sweep_of_a_cancelled_run_reports_cancelled(dendrux_kit: Kit) ->
     await store.request_cancel(run_id)
     threshold = await dendrux_kit.age()
     [swept] = await store.sweep_stale_runs(threshold)
-    assert (swept.run_id, swept.status) == (run_id, "cancelled")
+    assert (swept.run_id, swept.status) == (run_id, RunStatus.CANCELLED.value)
 
 
 @basic()

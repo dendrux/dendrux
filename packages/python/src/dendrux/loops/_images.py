@@ -66,7 +66,7 @@ Capability = Literal["yes", "no", "unknown"]
 
 # Warning keys recorded in ImageViewState.warned (once per run).
 WARN_DROP_WITH_THINKING = "drop_with_thinking"
-WARN_IMAGE_UNSCANNED = "guardrail.image_unscanned"
+WARN_IMAGE_UNSCANNED = GovernanceEventType.GUARDRAIL_IMAGE_UNSCANNED.value
 
 _DESCRIBE_MAX_CHARS = 2000
 
@@ -716,7 +716,7 @@ async def _scan_images(
     if detected_count:
         build.events.append(
             GovernanceEvent(
-                "guardrail.detected",
+                GovernanceEventType.GUARDRAIL_DETECTED.value,
                 {
                     "direction": "incoming_image",
                     "findings_count": detected_count,

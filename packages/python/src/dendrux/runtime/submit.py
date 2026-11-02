@@ -22,6 +22,12 @@ from functools import lru_cache
 from typing import TYPE_CHECKING, Any, NoReturn, cast
 
 from dendrux import _codes
+from dendrux._lifecycle import PAUSE_STATUSES as _PAUSE_STATUSES
+from dendrux._lifecycle import TERMINAL_STATUSES as _TERMINAL_STATUSES
+from dendrux._lifecycle import DenialReason, GovernanceEventType, StoredEventType
+from dendrux._meta_keys import (
+    GOVERNANCE_KEY as GOVERNANCE_KEY,
+)
 from dendrux.errors import (
     InvalidToolResultError,
     PauseStatusMismatchError,
@@ -84,28 +90,9 @@ __all__ = [
     "validate_tool_results",
 ]
 
-DEFAULT_DENIAL_REASON = "User declined to run this tool."
+DEFAULT_DENIAL_REASON = DenialReason.USER_DECLINED.value
 RESUME_FAILURE_KINDS = frozenset(
     {"setup_error", "validation_error", "persistence_error", "cancelled"}
-)
-
-
-_TERMINAL_STATUSES = frozenset(
-    {
-        RunStatus.SUCCESS,
-        RunStatus.ERROR,
-        RunStatus.CANCELLED,
-        RunStatus.MAX_ITERATIONS,
-    }
-)
-
-_PAUSE_STATUSES = frozenset(
-    {
-        RunStatus.WAITING_CLIENT_TOOL,
-        RunStatus.WAITING_HUMAN_INPUT,
-        RunStatus.WAITING_APPROVAL,
-        RunStatus.PAUSED,
-    }
 )
 
 
@@ -315,7 +302,7 @@ def submission_descriptor(
 
     kind = (
         "approval"
-        if status == "waiting_approval"
+        if status == RunStatus.WAITING_APPROVAL.value
         else "input"
         if "submitted_user_input" in payload
         else "tool_results"
@@ -523,7 +510,7 @@ def _resume_aborted_event(status: str, failure: BaseException | None) -> EventWr
         return None
     return EventWrite(
         generate_ulid(),
-        "run.resume_aborted",
+        StoredEventType.RUN_RESUME_ABORTED.value,
         0,
         {"failure_kind": _resume_failure_kind(failure)},
         None,
@@ -1024,9 +1011,6 @@ def deserialize_decisions(raw: object) -> list[tuple[str, ApprovalDecision]]:
     return pairs
 
 
-GOVERNANCE_KEY = "dendrux.governance"
-
-
 def _invalid_json_constant(value: str) -> NoReturn:
     raise ValueError("non-finite JSON number")
 
@@ -1179,7 +1163,9 @@ async def report_governance_change(
     if change is None:
         return
     _codes.log_code(log, _codes.GOVERNANCE_CHANGED, run_id=run_id)
-    await store.save_run_event(run_id, event_type="governance.changed", data=change)
+    await store.save_run_event(
+        run_id, event_type=GovernanceEventType.GOVERNANCE_CHANGED.value, data=change
+    )
 
 
 def _require_approval_token(approval: bool, expected: str | None) -> None:

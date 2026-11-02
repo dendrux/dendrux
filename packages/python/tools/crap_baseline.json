@@ -10832,12 +10832,12 @@
  },
  "src/dendrux/runtime/_blob_catalog.py::write_blob_refs": {
   "complexity": 36,
-  "coverage": 0.9365,
-  "crap": 36.33,
-  "digest": "7c34cc60e1ff",
+  "coverage": 0.9048,
+  "crap": 37.12,
+  "digest": "0d8d2e523061",
   "waived": {
-   "date": "2026-11-01",
-   "reason": "Adopt enforcement: re-recorded at feat/0.6.0 62f99e8a with CI-grade coverage (Postgres run). The baseline predates the 0.6 work and MySQL-only code is uncovered in the python job; coordinator to approve.",
+   "date": "2026-11-02",
+   "reason": "Owner approved 2026-11-02: re-save from GitHub CI coverage; speed tests stopped counting toward coverage on 2026-11-01",
    "rule": "worse"
   }
  },
@@ -11738,9 +11738,14 @@
  },
  "src/dendrux/runtime/persistence.py::PersistenceRecorder.checkpoint_outcome": {
   "complexity": 21,
-  "coverage": 0.913,
-  "crap": 21.29,
-  "digest": "a811ba9e25d3"
+  "coverage": 0.8696,
+  "crap": 21.98,
+  "digest": "3bb1194c092e",
+  "waived": {
+   "date": "2026-11-02",
+   "reason": "Owner approved 2026-11-02: re-save from GitHub CI coverage; speed tests stopped counting toward coverage on 2026-11-01",
+   "rule": "worse"
+  }
  },
  "src/dendrux/runtime/persistence.py::PersistenceRecorder.checkpoint_view": {
   "complexity": 14,
@@ -12855,9 +12860,14 @@
  },
  "src/dendrux/runtime/runner.py::_persist_loop_outcome.<locals>._finalize_cancelled": {
   "complexity": 2,
-  "coverage": 1.0,
-  "crap": 2.0,
-  "digest": "49e0fe1813da"
+  "coverage": 0.8889,
+  "crap": 2.01,
+  "digest": "508b2ad6ba6f",
+  "waived": {
+   "date": "2026-11-02",
+   "reason": "Owner approved 2026-11-02: re-save from GitHub CI coverage; speed tests stopped counting toward coverage on 2026-11-01",
+   "rule": "worse"
+  }
  },
  "src/dendrux/runtime/runner.py::_persist_loop_outcome.<locals>._persisted": {
   "complexity": 4,
@@ -13471,9 +13481,14 @@
  },
  "src/dendrux/runtime/runner.py::run_stream.<locals>._cleanup": {
   "complexity": 12,
-  "coverage": 0.9688,
-  "crap": 12.0,
-  "digest": "78ccac377aa3"
+  "coverage": 0.9375,
+  "crap": 12.04,
+  "digest": "527725f6e684",
+  "waived": {
+   "date": "2026-11-02",
+   "reason": "Owner approved 2026-11-02: re-save from GitHub CI coverage; speed tests stopped counting toward coverage on 2026-11-01",
+   "rule": "worse"
+  }
  },
  "src/dendrux/runtime/runner.py::run_stream.<locals>._generate": {
   "complexity": 64,
@@ -14213,9 +14228,14 @@
  },
  "src/dendrux/runtime/stores/sql/base.py::SQLStateStore._execute_insert_plan": {
   "complexity": 5,
-  "coverage": 1.0,
-  "crap": 5.0,
-  "digest": "870f78ad2227"
+  "coverage": 0.5455,
+  "crap": 7.35,
+  "digest": "870f78ad2227",
+  "waived": {
+   "date": "2026-11-02",
+   "reason": "Owner approved 2026-11-02: re-save from GitHub CI coverage; speed tests stopped counting toward coverage on 2026-11-01",
+   "rule": "worse"
+  }
  },
  "src/dendrux/runtime/stores/sql/base.py::SQLStateStore._fence": {
   "complexity": 5,
@@ -14261,9 +14281,14 @@
  },
  "src/dendrux/runtime/stores/sql/base.py::SQLStateStore._insert_event": {
   "complexity": 17,
-  "coverage": 0.8919,
-  "crap": 17.37,
-  "digest": "8e5a65a46f61"
+  "coverage": 0.8108,
+  "crap": 18.96,
+  "digest": "a00294851f5b",
+  "waived": {
+   "date": "2026-11-02",
+   "reason": "Owner approved 2026-11-02: re-save from GitHub CI coverage; speed tests stopped counting toward coverage on 2026-11-01",
+   "rule": "worse"
+  }
  },
  "src/dendrux/runtime/stores/sql/base.py::SQLStateStore._insert_event.<locals>.conflict": {
   "complexity": 1,
@@ -14291,9 +14316,14 @@
  },
  "src/dendrux/runtime/stores/sql/base.py::SQLStateStore._insert_trace": {
   "complexity": 7,
-  "coverage": 1.0,
-  "crap": 7.0,
-  "digest": "75d3c83d40b0"
+  "coverage": 0.95,
+  "crap": 7.01,
+  "digest": "d71e18cb9bd4",
+  "waived": {
+   "date": "2026-11-02",
+   "reason": "Owner approved 2026-11-02: re-save from GitHub CI coverage; speed tests stopped counting toward coverage on 2026-11-01",
+   "rule": "worse"
+  }
  },
  "src/dendrux/runtime/stores/sql/base.py::SQLStateStore._ordered": {
   "complexity": 14,
@@ -14524,9 +14554,14 @@
  },
  "src/dendrux/runtime/stores/sql/base.py::SQLStateStore.create_run.<locals>._attempt": {
   "complexity": 26,
-  "coverage": 0.9796,
-  "crap": 26.01,
-  "digest": "765af19d701d"
+  "coverage": 0.9592,
+  "crap": 26.05,
+  "digest": "50e594cb62f2",
+  "waived": {
+   "date": "2026-11-02",
+   "reason": "Owner approved 2026-11-02: re-save from GitHub CI coverage; speed tests stopped counting toward coverage on 2026-11-01",
+   "rule": "worse"
+  }
  },
  "src/dendrux/runtime/stores/sql/base.py::SQLStateStore.create_run.<locals>._prove_creation": {
   "complexity": 8,
@@ -15076,9 +15111,14 @@
  },
  "src/dendrux/runtime/stores/sql/base.py::SQLStateStore.update_many": {
   "complexity": 12,
-  "coverage": 1.0,
-  "crap": 12.0,
-  "digest": "12520c6e3a40"
+  "coverage": 0.92,
+  "crap": 12.07,
+  "digest": "e9376b97ec26",
+  "waived": {
+   "date": "2026-11-02",
+   "reason": "Owner approved 2026-11-02: re-save from GitHub CI coverage; speed tests stopped counting toward coverage on 2026-11-01",
+   "rule": "worse"
+  }
  },
  "src/dendrux/runtime/stores/sql/base.py::SQLStateStore.update_one": {
   "complexity": 20,

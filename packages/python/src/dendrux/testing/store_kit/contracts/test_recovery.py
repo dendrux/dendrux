@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from dendrux._lifecycle import FailureReason, StoredEventType
 from dendrux.errors import RunFencedError, RunNotFoundError, RunNotReclaimableError
 from dendrux.testing.store_kit.contracts._marks import contract
 from dendrux.testing.store_kit.contracts._support import (
@@ -23,6 +24,7 @@ from dendrux.testing.store_kit.contracts._support import (
     trace_write,
     ulid,
 )
+from dendrux.types import RunStatus
 
 if TYPE_CHECKING:
     from dendrux.testing.store_kit._kit import Kit
@@ -40,8 +42,10 @@ async def test_only_stale_runs_are_marked_lease_expired(dendrux_kit: Kit) -> Non
     assert [r.run_id for r in marked.reclaimable] == [stale]
     assert marked.reclaimable[0].reclaim_limit == 3
     assert [r.run_id for r in await store.get_lease_expired(limit=10, cursor=None)] == [stale]
-    assert (await store.get_run(fresh)).status == "running"
-    assert (await store.get_run(stale)).status == "running", "marking does not end the run"
+    assert (await store.get_run(fresh)).status == RunStatus.RUNNING.value
+    assert (await store.get_run(stale)).status == RunStatus.RUNNING.value, (
+        "marking does not end the run"
+    )
 
 
 @recovery
@@ -74,7 +78,7 @@ async def test_a_reclaim_gives_a_new_epoch_once_and_fences_the_old_owner(
     assert claim.loop_state == {"v": 1, "loop": "react", "phase": "dispatch"}
     record = await store.get_run(stale)
     assert record is not None
-    assert (record.status, record.reclaim_attempts) == ("running", 1)
+    assert (record.status, record.reclaim_attempts) == (RunStatus.RUNNING.value, 1)
     with pytest.raises(RunNotReclaimableError):
         await store.reclaim_run(
             stale,
@@ -127,8 +131,8 @@ async def test_a_stale_run_with_a_pending_cancel_ends_cancelled(dendrux_kit: Kit
     cutoff = await lease_cutoff(dendrux_kit)
     marked = await mark(dendrux_kit, cutoff)
     assert marked.reclaimable == []
-    assert [(s.run_id, s.status) for s in marked.finalised] == [(run_id, "cancelled")]
-    assert (await store.get_run(run_id)).status == "cancelled"
+    assert [(s.run_id, s.status) for s in marked.finalised] == [(run_id, RunStatus.CANCELLED.value)]
+    assert (await store.get_run(run_id)).status == RunStatus.CANCELLED.value
 
 
 @recovery
@@ -147,8 +151,8 @@ async def test_a_run_past_its_reclaim_limit_is_finalised(dendrux_kit: Kit) -> No
     assert claim is not False
     cutoff = await lease_cutoff(dendrux_kit)
     ended = await mark(dendrux_kit, cutoff, reclaim_limit=1, finalise_unrecoverable=True)
-    assert [s.failure_reason for s in ended.finalised] == ["reclaim_limit"]
-    assert (await store.get_run(run_id)).status == "error"
+    assert [s.failure_reason for s in ended.finalised] == [FailureReason.RECLAIM_LIMIT.value]
+    assert (await store.get_run(run_id)).status == RunStatus.ERROR.value
     assert ended.reclaimable == []
 
 
@@ -193,17 +197,18 @@ async def test_everything_written_survives_reopening_the_store(dendrux_kit: Kit)
     paused = await dendrux_kit.paused_run()
     reopened = await dendrux_kit.reopen()
     record = await reopened.get_run(run_id)
-    assert record is not None and record.status == "running"
+    assert record is not None and record.status == RunStatus.RUNNING.value
     assert [t.content for t in await reopened.get_traces(run_id)] == ["hello ✓"]
     events = await reopened.get_run_events(run_id)
-    assert [e.event_type for e in events] == ["run.started", EVENT]
+    assert [e.event_type for e in events] == [StoredEventType.RUN_STARTED.value, EVENT]
     assert events[1].data == {"k": [1, None]}
     assert [n.text for n in await reopened.get_notes(run_id, undelivered_only=True)] == [
         "pending note"
     ]
     assert await reopened.get_loop_state(run_id) == {"v": 1, "loop": "react", "phase": "dispatch"}
     assert (
-        await reopened.claim_paused_run(paused, expected_status="waiting_client_tool") is not False
+        await reopened.claim_paused_run(paused, expected_status=RunStatus.WAITING_CLIENT_TOOL.value)
+        is not False
     )
 
 

@@ -36,6 +36,9 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from sqlalchemy import and_
 
+from dendrux._meta_keys import (
+    STORE_SESSION_KEY,
+)
 from dendrux.errors import (
     BlobNotFoundError,
     ImageLimitError,
@@ -876,7 +879,7 @@ async def write_blob_refs(
     _check_batch_owner_keys(blob_refs)
 
     # 2. Claim the blob rows with a write (rows locked in sha order first on PG).
-    store = session.info["dendrux.store"]
+    store = session.info[STORE_SESSION_KEY]
     shas = sorted({e.sha256 for e in blob_refs})
     now = store.blob_now()
     claimed: set[str] = set()

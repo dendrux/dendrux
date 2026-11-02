@@ -17,6 +17,10 @@ import time
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
+from dendrux._lifecycle import (
+    FailureReason,
+    GovernanceEventType,
+)
 from dendrux.guardrails._engine import GuardrailEngine
 from dendrux.llm._calls import complete_call, stream_call
 from dendrux.llm._evidence import persistable_response
@@ -359,7 +363,7 @@ class SingleCall(Loop):
                     await record_governance(
                         recorder,
                         resolved_run_id,
-                        "guardrail.blocked",
+                        GovernanceEventType.GUARDRAIL_BLOCKED.value,
                         1,
                         _blocked_data(
                             "incoming", block_err, findings, _incoming_location(msg, msg_idx)
@@ -368,7 +372,7 @@ class SingleCall(Loop):
                     await notify_governance(
                         notifier,
                         resolved_run_id,
-                        "guardrail.blocked",
+                        GovernanceEventType.GUARDRAIL_BLOCKED.value,
                         1,
                         _blocked_data(
                             "incoming", block_err, findings, _incoming_location(msg, msg_idx)
@@ -384,7 +388,7 @@ class SingleCall(Loop):
                         usage=UsageStats(),
                         meta={
                             **guardrail_meta(g_engine, notifier_warnings),
-                            "failure_reason": "guardrail_blocked",
+                            "failure_reason": FailureReason.GUARDRAIL_BLOCKED.value,
                         },
                     )
                 if cleaned_msg is not msg:
@@ -397,7 +401,7 @@ class SingleCall(Loop):
                 await record_governance(
                     recorder,
                     resolved_run_id,
-                    "guardrail.detected",
+                    GovernanceEventType.GUARDRAIL_DETECTED.value,
                     1,
                     {
                         "direction": "incoming",
@@ -408,7 +412,7 @@ class SingleCall(Loop):
                 await notify_governance(
                     notifier,
                     resolved_run_id,
-                    "guardrail.detected",
+                    GovernanceEventType.GUARDRAIL_DETECTED.value,
                     1,
                     {
                         "direction": "incoming",
@@ -422,14 +426,14 @@ class SingleCall(Loop):
                 await record_governance(
                     recorder,
                     resolved_run_id,
-                    "guardrail.redacted",
+                    GovernanceEventType.GUARDRAIL_REDACTED.value,
                     1,
                     {"direction": "incoming", "entities": _red_entities},
                 )
                 await notify_governance(
                     notifier,
                     resolved_run_id,
-                    "guardrail.redacted",
+                    GovernanceEventType.GUARDRAIL_REDACTED.value,
                     1,
                     {"direction": "incoming", "entities": _red_entities},
                     warnings=notifier_warnings,
@@ -438,7 +442,7 @@ class SingleCall(Loop):
         prepared = await images.prepare(messages, iteration=1, guardrails=agent.guardrails or ())
         if prepared.block_error is not None:
             await images.emit(
-                "guardrail.blocked",
+                GovernanceEventType.GUARDRAIL_BLOCKED.value,
                 _image_block_data(prepared.block_error, images.state),
                 1,
             )
@@ -451,7 +455,7 @@ class SingleCall(Loop):
                 usage=UsageStats(),
                 meta={
                     **guardrail_meta(g_engine, notifier_warnings),
-                    "failure_reason": "guardrail_blocked",
+                    "failure_reason": FailureReason.GUARDRAIL_BLOCKED.value,
                 },
             )
 
@@ -615,14 +619,14 @@ class SingleCall(Loop):
                 await record_governance(
                     recorder,
                     resolved_run_id,
-                    "guardrail.detected",
+                    GovernanceEventType.GUARDRAIL_DETECTED.value,
                     1,
                     _out_data,
                 )
                 await notify_governance(
                     notifier,
                     resolved_run_id,
-                    "guardrail.detected",
+                    GovernanceEventType.GUARDRAIL_DETECTED.value,
                     1,
                     _out_data,
                     warnings=notifier_warnings,
@@ -672,14 +676,14 @@ class SingleCall(Loop):
                 await record_governance(
                     recorder,
                     resolved_run_id,
-                    "guardrail.blocked",
+                    GovernanceEventType.GUARDRAIL_BLOCKED.value,
                     1,
                     _blocked_data("outgoing", out_block, out_findings, "output"),
                 )
                 await notify_governance(
                     notifier,
                     resolved_run_id,
-                    "guardrail.blocked",
+                    GovernanceEventType.GUARDRAIL_BLOCKED.value,
                     1,
                     _blocked_data("outgoing", out_block, out_findings, "output"),
                     warnings=notifier_warnings,
@@ -693,7 +697,7 @@ class SingleCall(Loop):
                     usage=response.usage,
                     meta={
                         **guardrail_meta(g_engine, notifier_warnings),
-                        "failure_reason": "guardrail_blocked",
+                        "failure_reason": FailureReason.GUARDRAIL_BLOCKED.value,
                     },
                 )
 

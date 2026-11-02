@@ -42,6 +42,7 @@ from sqlalchemy.schema import CreateIndex, CreateTable
 from sqlalchemy.sql.elements import UnaryExpression
 from sqlalchemy.sql.operators import desc_op
 
+from dendrux._lifecycle import STORAGE_FORMAT_CHECKPOINTED
 from dendrux.db._dialects import LockWaitTimeout
 from dendrux.db._dialects._mysql_types import nopad_collation
 from dendrux.db._storage_schema import ACTIVATION_INDEXES
@@ -558,7 +559,10 @@ def check(conn: Connection, *, exact: bool = False, settings: bool = True) -> Sc
                 f"{SETTINGS_TABLE}.{BOOTSTRAP_MARKER} (bootstrap unfinished; "
                 "run `dendrux db migrate`)"
             )
-        if values.get("storage_format") != "2" or values.get("activate_step") != "done":
+        if (
+            values.get("storage_format") != str(STORAGE_FORMAT_CHECKPOINTED)
+            or values.get("activate_step") != "done"
+        ):
             report.columns.append(
                 f"{SETTINGS_TABLE}.storage_format (expected an active format 2 schema)"
             )
@@ -925,11 +929,14 @@ def _bootstrap(conn: Connection, head: str) -> None:
             )
 
     _step("seed")
-    put_setting(conn, "storage_format", "2", overwrite=False)
+    put_setting(conn, "storage_format", str(STORAGE_FORMAT_CHECKPOINTED), overwrite=False)
     put_setting(conn, "activate_step", "done", overwrite=False)
     conn.commit()
     values = read_settings(conn)
-    if values.get("storage_format") != "2" or values.get("activate_step") != "done":
+    if (
+        values.get("storage_format") != str(STORAGE_FORMAT_CHECKPOINTED)
+        or values.get("activate_step") != "done"
+    ):
         raise _refuse("the settings table holds a different storage format.")
 
     _step("stamp")
