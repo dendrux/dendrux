@@ -2,6 +2,11 @@
 
 ## 0.6.0
 
+- Format-2 runs check that this process still owns the run immediately before each
+  provider call (one primary-key read). A stale owner stops with the existing
+  `RunFencedError` outcome instead of making a model call whose result would be
+  discarded. A database read failure at that point now fails the run before the call.
+  Format-1 runs are unchanged.
 - Add developer-called recovery for format-2 ReAct runs. `sweep(on_stale="reclaim")`
   marks bounded candidates; `agent.reclaim(..., tenant_id=..., item=...)` continues
   from committed state. Reclaim always requires explicit tenant scope. Interrupted

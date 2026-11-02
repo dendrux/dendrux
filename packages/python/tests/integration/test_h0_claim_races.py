@@ -1,16 +1,30 @@
 """Postgres claim fencing and validation after a competing committed transaction."""
 
+import asyncio
+from contextlib import AsyncExitStack
+
 import pytest
 from sqlalchemy import select, update
 
 from dendrux import tool
 from dendrux.db.models import AgentRun
-from dendrux.errors import PauseStatusMismatchError
+from dendrux.errors import (
+    PauseStatusMismatchError,
+    RunAlreadyClaimedError,
+    RunAlreadyTerminalError,
+)
 from dendrux.runtime.persistence import PersistenceRecorder
 from dendrux.runtime.submit import governance_snapshot
 from dendrux.types import LLMResponse, RunStatus, generate_ulid
 from tests._fixtures.storage import pin_storage_format
-from tests._helpers.h0_races import Gate, connection_snapshot, running, snapshot, wait_for_lock
+from tests._helpers.h0_races import (
+    Gate,
+    connection_snapshot,
+    independent_callers,
+    running,
+    snapshot,
+    wait_for_lock,
+)
 from tests._helpers.h0_races import peer as peer
 from tests._helpers.recovery_checkpoint import expire
 from tests._helpers.runtime_paths import PATHS, SUBMIT_KINDS, path_case
@@ -27,23 +41,9 @@ CONTINUATIONS = ["resume", "resume_stream", *SUBMIT_KINDS]
 
 
 @pytest.mark.parametrize("path", PATHS)
-@pytest.mark.parametrize(
-    "cut",
-    [
-        pytest.param(
-            "provider",
-            marks=pytest.mark.xfail(
-                strict=True,
-                raises=StaleProviderEffectError,
-                reason="a stale owner can start a provider call after its last control checkpoint",
-            ),
-        ),
-        "provider_result",
-        "tool",
-    ],
-)
+@pytest.mark.parametrize("cut", ["provider", "provider_result", "tool"])
 async def test_new_claim_fences_old_owner_before_next_effect(
-    store, engine, peer, monkeypatch, path, cut
+    store, engine, peer, monkeypatch, caplog, path, cut
 ):
     await pin_storage_format(engine, 2)
     effects = []
@@ -95,6 +95,11 @@ async def test_new_claim_fences_old_owner_before_next_effect(
             assert effects == [], "the old owner started a server effect after reclaim"
             assert await snapshot(other_engine) == before, "old epoch wrote after the new claim"
             assert result.status == RunStatus.RUNNING
+            assert any(
+                getattr(record, "code", None) == "run_fenced"
+                and getattr(record, "run_id", None) == run_id
+                for record in caplog.records
+            )
             if provider.calls != calls:
                 raise StaleProviderEffectError("the old owner started the next provider call")
     finally:
@@ -165,3 +170,79 @@ async def test_claim_revalidates_after_competing_generation_change(
     finally:
         gate.release.set()
         await case.agent.close()
+
+
+async def test_eight_claimants_have_one_winner(store, engine, monkeypatch):
+    await pin_storage_format(engine, 2)
+    seed = await path_case(store, engine, "submit_resume", ScriptedLLM([]))
+    run_id = seed.run_id
+    pause = await store.get_pause_state(run_id)
+    original = await store.get_run(run_id)
+    providers = [ScriptedLLM([LLMResponse(text="done")]) for _ in range(8)]
+    try:
+        async with independent_callers(engine, 8) as callers, AsyncExitStack() as stack:
+            tasks = []
+            gates = []
+            for (caller, _), provider in zip(callers, providers, strict=True):
+                agent = type(seed.agent)(
+                    name=seed.agent.name,
+                    prompt=seed.agent.prompt,
+                    tools=seed.agent.tools,
+                    provider=provider,
+                    state_store=caller,
+                    strict_tenancy=False,
+                )
+                stack.push_async_callback(agent.close)
+                gate = Gate()
+                gate.install(monkeypatch, caller, "claim_paused_run")
+                gates.append(gate)
+                tasks.append(
+                    await stack.enter_async_context(
+                        running(
+                            agent.submit_resume(
+                                run_id, tenant_id="tenant", expected_pause_id=pause["pause_id"]
+                            ),
+                            gate,
+                        )
+                    )
+                )
+            await asyncio.gather(*(gate.entered.wait() for gate in gates))
+            before = await snapshot(engine)
+            async with engine.connect() as conn:
+                tx = await conn.begin()
+                await conn.execute(
+                    select(AgentRun.id).where(AgentRun.id == run_id).with_for_update()
+                )
+                for gate in gates:
+                    gate.release.set()
+                await wait_for_lock(conn, tasks[0], count=8)
+                await tx.commit()
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            winners = [i for i, result in enumerate(results) if not isinstance(result, Exception)]
+            assert len(winners) == 1
+            assert results[winners[0]].status == RunStatus.SUCCESS
+            for i, result in enumerate(results):
+                if i != winners[0]:
+                    assert isinstance(result, (RunAlreadyClaimedError, RunAlreadyTerminalError))
+                    assert providers[i].calls == 0
+            assert providers[winners[0]].calls == 1
+            final = await store.get_run(run_id)
+            assert final.claim_epoch == original.claim_epoch + 1
+            assert final.status == RunStatus.SUCCESS.value
+            assert final.tenant_id == original.tenant_id
+            assert final.meta == original.meta
+            after = await snapshot(engine)
+            # Every prior row survives; every added child belongs to the one run.
+            for table, rows in after.items():
+                assert {row._mapping["id"] for row in before[table] if "id" in row._mapping} <= {
+                    row._mapping["id"] for row in rows if "id" in row._mapping
+                }
+                for row in rows:
+                    for key in ("run_id", "agent_run_id"):
+                        if key in row._mapping:
+                            assert row._mapping[key] == run_id
+            events = await store.get_run_events(run_id)
+            assert sum(event.event_type == "run.completed" for event in events) == 1
+            assert sum(event.event_type == "run.resumed" for event in events) == 1
+    finally:
+        await seed.agent.close()
