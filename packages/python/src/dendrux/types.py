@@ -540,7 +540,7 @@ class ToolDef:
     target: ToolTarget = ToolTarget.SERVER
     parallel: bool = True  # Governs concurrent execution scheduling
     max_calls_per_run: int | None = None  # Enforced by ReActLoop — graceful limit
-    timeout_seconds: float = DEFAULT_TOOL_TIMEOUT  # Enforced by ReActLoop via asyncio.wait_for
+    timeout_seconds: float = DEFAULT_TOOL_TIMEOUT  # Enforced by ReActLoop via asyncio.timeout
     has_explicit_timeout: bool = False  # True when developer set timeout_seconds explicitly
     meta: dict[str, Any] = field(default_factory=dict)  # MCP source info, annotations, etc.
     strict: bool = False
