@@ -182,7 +182,7 @@ def _preflight(conn: Connection, batch_size: int) -> None:
     # Scan every table before deleting anything, including after interruption.
     for table_name, column, _ in ACTIVATION_INDEXES.values():
         table = Base.metadata.tables[table_name]
-        end = conn.execute(select(func.max(table.c.id))).scalar_one()
+        end: str | None = conn.execute(select(func.max(table.c.id))).scalar_one()
         after = ""
         count = 0
         first_runs: list[str] = []
@@ -211,7 +211,7 @@ def _dedupe(conn: Connection, batch_size: int) -> None:
             continue
         put_setting(conn, "activate_step", f"dedupe:{table_name}")
         after = after or ""
-        end = conn.execute(select(func.max(table.c.id))).scalar_one()
+        end: str | None = conn.execute(select(func.max(table.c.id))).scalar_one()
         conn.commit()
         while end is not None:
             page = _page(conn, table, column, after, end, batch_size)
