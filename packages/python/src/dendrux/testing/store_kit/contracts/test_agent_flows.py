@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from dendrux import Agent
+from dendrux._lifecycle import StoredEventType
 from dendrux.llm.mock import MockLLM
 from dendrux.testing.store_kit.contracts._marks import contract
 from dendrux.tool import tool
@@ -74,13 +75,16 @@ async def test_a_plain_run_is_recorded_from_start_to_finish(dendrux_kit: Kit) ->
     record = await store.get_run(result.run_id)
     assert record is not None
     assert (record.status, record.answer, record.agent_name) == (
-        "success",
+        RunStatus.SUCCESS.value,
         "The answer is 42.",
         "KitFlow",
     )
     assert record.total_input_tokens == 10 and record.total_output_tokens == 5
     types = [e.event_type for e in await store.get_run_events(result.run_id)]
-    assert types[0] == "run.started" and "llm.completed" in types
+    assert (
+        types[0] == StoredEventType.RUN_STARTED.value
+        and StoredEventType.LLM_COMPLETED.value in types
+    )
     assert [e.sequence_index for e in await store.get_run_events(result.run_id)] == list(
         range(len(types))
     )
@@ -97,7 +101,9 @@ async def test_a_server_tool_call_is_persisted_with_its_result(dendrux_kit: Kit)
     [row] = await store.get_tool_calls(result.run_id)
     assert (row.tool_name, row.target, row.success) == ("add", "server", True)
     assert row.params == {"a": 2, "b": 3}
-    assert "tool.completed" in [e.event_type for e in await store.get_run_events(result.run_id)]
+    assert StoredEventType.TOOL_COMPLETED.value in [
+        e.event_type for e in await store.get_run_events(result.run_id)
+    ]
 
 
 @flows
@@ -109,7 +115,7 @@ async def test_a_client_tool_pause_resumes_from_stored_state(dendrux_kit: Kit) -
     paused = await agent.run("read the sheet")
     assert paused.status == RunStatus.WAITING_CLIENT_TOOL and paused.pending is not None
     record = await store.get_run(paused.run_id)
-    assert record is not None and record.status == "waiting_client_tool"
+    assert record is not None and record.status == RunStatus.WAITING_CLIENT_TOOL.value
     assert await store.get_pause_state(paused.run_id) is not None
     call_id = paused.pending.tool_calls[0].id
     done = await agent.submit_tool_results(
@@ -119,7 +125,7 @@ async def test_a_client_tool_pause_resumes_from_stored_state(dendrux_kit: Kit) -
     )
     assert done.status == RunStatus.SUCCESS and done.answer == "3 rows"
     final = await store.get_run(paused.run_id)
-    assert final is not None and final.status == "success"
+    assert final is not None and final.status == RunStatus.SUCCESS.value
     assert await store.get_pause_state(paused.run_id) is None
 
 
@@ -173,7 +179,7 @@ async def test_a_paused_run_can_be_cancelled(dendrux_kit: Kit) -> None:
     cancelled = await agent.cancel_run(paused.run_id)
     assert cancelled.status == RunStatus.CANCELLED
     record = await store.get_run(paused.run_id)
-    assert record is not None and record.status == "cancelled"
+    assert record is not None and record.status == RunStatus.CANCELLED.value
 
 
 @flows
@@ -208,7 +214,10 @@ async def test_a_streamed_run_ends_in_the_same_stored_state(dendrux_kit: Kit) ->
         result = stream.result
     assert result is not None and result.status == RunStatus.SUCCESS
     record = await store.get_run(result.run_id)
-    assert record is not None and (record.status, record.answer) == ("success", "streamed")
+    assert record is not None and (record.status, record.answer) == (
+        RunStatus.SUCCESS.value,
+        "streamed",
+    )
 
 
 @reopened_flows
@@ -228,4 +237,4 @@ async def test_a_pause_resumes_on_a_store_reopened_after_a_restart(dendrux_kit: 
     )
     assert done.status == RunStatus.SUCCESS and done.answer == "resumed after restart"
     record = await reopened.get_run(paused.run_id)
-    assert record is not None and record.status == "success"
+    assert record is not None and record.status == RunStatus.SUCCESS.value

@@ -23,6 +23,14 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, Protocol, cast, overload
 
 from dendrux import _codes
+from dendrux._lifecycle import STORAGE_FORMAT_CHECKPOINTED, TERMINAL_STATUS_VALUES, FailureReason
+from dendrux._meta_keys import (
+    LOOP_META_KEY,
+    STORE_SESSION_KEY,
+)
+from dendrux._meta_keys import (
+    PAUSE_REQUEST_META_KEY as PAUSE_REQUEST_META_KEY,
+)
 from dendrux.types import (
     CreateRunResult,
     RunStatus,
@@ -38,6 +46,8 @@ if TYPE_CHECKING:
 
     from dendrux.db.models import AgentRun
     from dendrux.media import BlobEdge
+
+_TERMINAL_STATUS_VALUES = TERMINAL_STATUS_VALUES
 
 logger = logging.getLogger(__name__)
 
@@ -138,18 +148,8 @@ def _loop_state_at_creation(
     current = _creation_loop.get()
     if current is not None and current[0] is store and current[1] == run_id:
         return _initial_loop_state(current[2])
-    return _initial_loop_state((meta or {}).get("dendrux.loop"))
+    return _initial_loop_state((meta or {}).get(LOOP_META_KEY))
 
-
-PAUSE_REQUEST_META_KEY = "dendrux.pause_request"
-"""``agent_runs.meta`` key holding the latest ``request_pause`` reason."""
-
-_TERMINAL_STATUS_VALUES = (
-    RunStatus.SUCCESS.value,
-    RunStatus.ERROR.value,
-    RunStatus.CANCELLED.value,
-    RunStatus.MAX_ITERATIONS.value,
-)
 
 _COST_DECIMALS = 6  # llm_interactions.cost_usd is Numeric(10, 6)
 _IN_CHUNK = 500  # keep IN (...) lists well under SQLite's variable limit
@@ -365,7 +365,7 @@ PAUSE_SUMMARY_KEYS = (
     "pause_reason",
     "pause_message",
     "pause_id",
-    "budget_exceeded",
+    FailureReason.BUDGET_EXCEEDED.value,
 )
 
 
@@ -583,6 +583,7 @@ class SweptRun:
     swept_at: datetime
     # Status the sweep wrote: "error", or "cancelled" for a stale RUNNING row
     # whose cancellation had been requested.
+    # Keep the public signature literal for static API comparison; pinned to RunStatus.ERROR.
     status: str = "error"
 
 
@@ -1671,7 +1672,10 @@ class _ClaimedStateStore:
                 if name == "touch_progress" and result is False:
                     _codes.log_code(logger, _codes.RUN_FENCED, run_id=run_id)
                     raise RunFencedError(run_id, claim_epoch=self.claim_epoch)
-                if self.storage_format == 2 and name in self.progress_writes:
+                if (
+                    self.storage_format == STORAGE_FORMAT_CHECKPOINTED
+                    and name in self.progress_writes
+                ):
                     from dendrux.runtime.context import get_delegation_context
 
                     ctx = get_delegation_context()
@@ -1739,7 +1743,7 @@ async def _insert_event(
 ) -> int:
     return cast(
         "int",
-        await session.info["dendrux.store"]._insert_event(
+        await session.info[STORE_SESSION_KEY]._insert_event(
             session, run_id, event_type, data, **kwargs
         ),
     )

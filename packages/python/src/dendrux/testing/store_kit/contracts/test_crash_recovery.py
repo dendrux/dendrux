@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
+from dendrux._lifecycle import StoredEventType
 from dendrux.errors import StoreOutcomeUnknown
 from dendrux.testing.store_kit._kit import CertificationFailure, store_skip
 from dendrux.testing.store_kit.contracts._marks import contract
@@ -37,6 +38,7 @@ from dendrux.testing.store_kit.contracts._support import (
     ulid,
     usage,
 )
+from dendrux.types import RunStatus
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -145,7 +147,10 @@ async def test_finalize_that_fails_around_commit_leaves_one_final_state(
 
     async def finalize() -> Any:
         return await store.finalize_run(
-            run_id, status="success", answer="done", expected_current_status="running"
+            run_id,
+            status=RunStatus.SUCCESS.value,
+            answer="done",
+            expected_current_status=RunStatus.RUNNING.value,
         )
 
     outcome = await dendrux_kit.faulted(point, finalize, sticky=True)
@@ -153,14 +158,19 @@ async def test_finalize_that_fails_around_commit_leaves_one_final_state(
     record = await store.get_run(run_id)
     assert record is not None
     if point == "before_commit":
-        assert outcome.raised is not None and record.status == "running"
+        assert outcome.raised is not None and record.status == RunStatus.RUNNING.value
         assert await finalize() is True
     else:
-        assert (record.status, record.answer) == ("success", "done"), "the commit is visible"
+        assert (record.status, record.answer) == (RunStatus.SUCCESS.value, "done"), (
+            "the commit is visible"
+        )
     final = await store.get_run(run_id)
-    assert final is not None and (final.status, final.answer) == ("success", "done")
+    assert final is not None and (final.status, final.answer) == (RunStatus.SUCCESS.value, "done")
     assert not await store.finalize_run(
-        run_id, status="error", error="again", expected_current_status="running"
+        run_id,
+        status=RunStatus.ERROR.value,
+        error="again",
+        expected_current_status=RunStatus.RUNNING.value,
     ), "the second finalize loses"
 
 
@@ -220,7 +230,9 @@ async def test_an_ambiguous_claim_commit_raises_outcome_unknown(
             record = await store.get_run(run_id)
             assert record is not None
             if committed:
-                return bool(record.status == "running" and record.reclaim_attempts == 1)
+                return bool(
+                    record.status == RunStatus.RUNNING.value and record.reclaim_attempts == 1
+                )
             return bool(record.reclaim_attempts == 0 and record.lease_expired_at is not None)
 
     elif operation == "release_run_claim":
@@ -234,13 +246,16 @@ async def test_an_ambiguous_claim_commit_raises_outcome_unknown(
 
         async def call() -> Any:
             return await store.release_run_claim(
-                run_id, status="waiting_client_tool", claim_epoch=claim.claim_epoch
+                run_id, status=RunStatus.WAITING_CLIENT_TOOL.value, claim_epoch=claim.claim_epoch
             )
 
         async def landed() -> bool:
             record = await store.get_run(run_id)
             assert record is not None
-            return bool(record.status == ("waiting_client_tool" if committed else "running"))
+            return bool(
+                record.status
+                == (RunStatus.WAITING_CLIENT_TOOL.value if committed else RunStatus.RUNNING.value)
+            )
 
     else:
         run_id = await dendrux_kit.paused_run()
@@ -253,10 +268,12 @@ async def test_an_ambiguous_claim_commit_raises_outcome_unknown(
 
         async def call() -> Any:
             if operation == "claim_paused_run":
-                return await store.claim_paused_run(run_id, expected_status="waiting_client_tool")
+                return await store.claim_paused_run(
+                    run_id, expected_status=RunStatus.WAITING_CLIENT_TOOL.value
+                )
             return await store.submit_and_claim(
                 run_id,
-                expected_status="waiting_client_tool",
+                expected_status=RunStatus.WAITING_CLIENT_TOOL.value,
                 submitted_data={"submitted_tool_results": []},
                 submission=envelope,
             )
@@ -264,7 +281,10 @@ async def test_an_ambiguous_claim_commit_raises_outcome_unknown(
         async def landed() -> bool:
             record = await store.get_run(run_id)
             assert record is not None
-            return bool(record.status == ("running" if committed else "waiting_client_tool"))
+            return bool(
+                record.status
+                == (RunStatus.RUNNING.value if committed else RunStatus.WAITING_CLIENT_TOOL.value)
+            )
 
     outcome = await dendrux_kit.faulted(point, call, sticky=True, form=form)
     outcome.expect_fired(point)
@@ -275,9 +295,9 @@ async def test_an_ambiguous_claim_commit_raises_outcome_unknown(
     assert outcome.result is None, "no ownership may be reported"
     assert await landed(), f"{point}: the stored state must be exactly what the commit decided"
     if committed and operation in ("claim_paused_run", "submit_and_claim"):
-        assert not await store.claim_paused_run(run_id, expected_status="waiting_client_tool"), (
-            "nobody can claim a claimed run again"
-        )
+        assert not await store.claim_paused_run(
+            run_id, expected_status=RunStatus.WAITING_CLIENT_TOOL.value
+        ), "nobody can claim a claimed run again"
 
 
 async def _all_or_nothing(
@@ -315,13 +335,13 @@ async def test_finalize_with_event_is_all_or_nothing(
         point,
         lambda: store.finalize_with_event(
             run_id,
-            status="success",
-            allowed_current_statuses=["running"],
-            event_type="run.completed",
+            status=RunStatus.SUCCESS.value,
+            allowed_current_statuses=[RunStatus.RUNNING.value],
+            event_type=StoredEventType.RUN_COMPLETED.value,
             answer="done",
             claim_epoch=0,
             trace=trace_write("assistant", "done", 0),
-            event=event_write("run.completed", run_id),
+            event=event_write(StoredEventType.RUN_COMPLETED.value, run_id),
         ),
         after=after,
         sticky=True,
@@ -334,16 +354,16 @@ async def test_finalize_with_event_is_all_or_nothing(
         events = [e.event_type for e in await store.get_run_events(run_id)]
         return (
             record is not None
-            and record.status == "success"
+            and record.status == RunStatus.SUCCESS.value
             and len(await store.get_traces(run_id)) == 1
-            and events == ["run.completed"]
+            and events == [StoredEventType.RUN_COMPLETED.value]
         )
 
     async def nothing() -> bool:
         record = await store.get_run(run_id)
         return (
             record is not None
-            and record.status == "running"
+            and record.status == RunStatus.RUNNING.value
             and await store.get_traces(run_id) == []
             and await store.get_run_events(run_id) == []
         )
@@ -384,7 +404,7 @@ async def test_a_tool_completion_is_all_or_nothing_and_repeatable(
             state is not None
             and state["pending"] == []
             and len(await store.get_traces(run_id)) == 1
-            and types == ["tool.started", "tool.completed"]
+            and types == [StoredEventType.TOOL_STARTED.value, StoredEventType.TOOL_COMPLETED.value]
         )
 
     async def nothing() -> bool:
@@ -394,7 +414,7 @@ async def test_a_tool_completion_is_all_or_nothing_and_repeatable(
             state is not None
             and [p["call_id"] for p in state["pending"]] == ["a"]
             and await store.get_traces(run_id) == []
-            and types == ["tool.started"]
+            and types == [StoredEventType.TOOL_STARTED.value]
         )
 
     await _all_or_nothing(point, after, outcome, done, nothing)
@@ -464,7 +484,9 @@ async def test_a_sweep_that_fails_midway_is_finished_by_the_next_sweep(
         assert outcome.raised is not None, "a sweep that cannot commit must fail"
         for run_id in runs:
             record = await store.get_run(run_id)
-            assert record is not None and record.status == "running", "nothing was swept"
+            assert record is not None and record.status == RunStatus.RUNNING.value, (
+                "nothing was swept"
+            )
     else:
         swept += [s for s in (outcome.result or [])]
     for _ in range(5):
@@ -472,4 +494,6 @@ async def test_a_sweep_that_fails_midway_is_finished_by_the_next_sweep(
     assert len(swept) == len(set(swept)), "no run is swept twice"
     for run_id in runs:
         record = await store.get_run(run_id)
-        assert record is not None and record.status == "error", "no stale run is left behind"
+        assert record is not None and record.status == RunStatus.ERROR.value, (
+            "no stale run is left behind"
+        )

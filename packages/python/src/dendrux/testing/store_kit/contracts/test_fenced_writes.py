@@ -10,9 +10,11 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
+from dendrux._lifecycle import StoredEventType
 from dendrux.errors import RunFencedError
 from dendrux.testing.store_kit.contracts._marks import contract
 from dendrux.testing.store_kit.contracts._support import EVENT, tool_call_kwargs, ulid, usage
+from dendrux.types import RunStatus
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -115,15 +117,20 @@ async def test_touch_progress_reports_a_stale_epoch_as_false(dendrux_kit: Kit) -
 async def test_a_stale_finalize_changes_nothing(dendrux_kit: Kit) -> None:
     run_id, claim = await dendrux_kit.claimed_run()
     store, stale = dendrux_kit.store, claim.claim_epoch - 1
-    assert not await store.finalize_run(run_id, status="success", answer="x", claim_epoch=stale)
+    assert not await store.finalize_run(
+        run_id, status=RunStatus.SUCCESS.value, answer="x", claim_epoch=stale
+    )
     assert not await store.finalize_run_if_status_in(
-        run_id, status="success", allowed_current_statuses=["running"], claim_epoch=stale
+        run_id,
+        status=RunStatus.SUCCESS.value,
+        allowed_current_statuses=[RunStatus.RUNNING.value],
+        claim_epoch=stale,
     )
     record = await store.get_run(run_id)
     assert record is not None
-    assert (record.status, record.answer) == ("running", None)
+    assert (record.status, record.answer) == (RunStatus.RUNNING.value, None)
     assert await store.finalize_run(
-        run_id, status="success", answer="x", claim_epoch=claim.claim_epoch
+        run_id, status=RunStatus.SUCCESS.value, answer="x", claim_epoch=claim.claim_epoch
     )
 
 
@@ -132,10 +139,13 @@ async def test_a_stale_pause_changes_nothing(dendrux_kit: Kit) -> None:
     run_id, claim = await dendrux_kit.claimed_run()
     store, stale = dendrux_kit.store, claim.claim_epoch - 1
     paused = await store.try_pause_run(
-        run_id, status="waiting_client_tool", pause_data={"pause_id": "p"}, claim_epoch=stale
+        run_id,
+        status=RunStatus.WAITING_CLIENT_TOOL.value,
+        pause_data={"pause_id": "p"},
+        claim_epoch=stale,
     )
     assert not paused
-    assert (await store.get_run(run_id)).status == "running"
+    assert (await store.get_run(run_id)).status == RunStatus.RUNNING.value
     state = await store.get_pause_state(run_id)
     assert state is None or state.get("pause_id") != "p", "the stale pause must not be stored"
 
@@ -146,11 +156,13 @@ async def test_a_second_claim_fences_the_first_executor(dendrux_kit: Kit) -> Non
     run_id, first = await dendrux_kit.claimed_run()
     await store.pause_run(
         run_id,
-        status="waiting_client_tool",
+        status=RunStatus.WAITING_CLIENT_TOOL.value,
         pause_data={"pause_id": "second"},
         claim_epoch=first.claim_epoch,
     )
-    second = await store.claim_paused_run(run_id, expected_status="waiting_client_tool")
+    second = await store.claim_paused_run(
+        run_id, expected_status=RunStatus.WAITING_CLIENT_TOOL.value
+    )
     assert second is not False
     assert second.claim_epoch > first.claim_epoch
     with pytest.raises(RunFencedError):
@@ -173,21 +185,23 @@ async def test_a_stale_pause_run_changes_nothing(dendrux_kit: Kit) -> None:
     await _refused_or_ignored(
         store.pause_run(
             run_id,
-            status="waiting_client_tool",
+            status=RunStatus.WAITING_CLIENT_TOOL.value,
             pause_data={"pause_id": "stale-owner"},
             claim_epoch=claim.claim_epoch - 1,
         )
     )
     record = await store.get_run(run_id)
-    assert record is not None and record.status == "running", "a stale owner cannot pause the run"
+    assert record is not None and record.status == RunStatus.RUNNING.value, (
+        "a stale owner cannot pause the run"
+    )
     assert (await store.get_pause_state(run_id) or {}).get("pause_id") != "stale-owner"
     await store.pause_run(
         run_id,
-        status="waiting_client_tool",
+        status=RunStatus.WAITING_CLIENT_TOOL.value,
         pause_data={"pause_id": "current-owner"},
         claim_epoch=claim.claim_epoch,
     )
-    assert (await store.get_run(run_id)).status == "waiting_client_tool"
+    assert (await store.get_run(run_id)).status == RunStatus.WAITING_CLIENT_TOOL.value
     assert (await store.get_pause_state(run_id))["pause_id"] == "current-owner"
 
 
@@ -198,24 +212,26 @@ async def test_a_stale_pause_with_event_changes_nothing(dendrux_kit: Kit) -> Non
     stale = await _refused_or_ignored(
         store.pause_with_event(
             run_id,
-            status="waiting_client_tool",
+            status=RunStatus.WAITING_CLIENT_TOOL.value,
             pause_data={"pause_id": "stale-owner"},
             claim_epoch=claim.claim_epoch - 1,
         )
     )
     assert stale is None, "a stale pause reports the loss"
     record = await store.get_run(run_id)
-    assert record is not None and record.status == "running"
+    assert record is not None and record.status == RunStatus.RUNNING.value
     assert await store.get_run_events(run_id) == [], "a lost pause publishes no event"
     sequence = await store.pause_with_event(
         run_id,
-        status="waiting_client_tool",
+        status=RunStatus.WAITING_CLIENT_TOOL.value,
         pause_data={"pause_id": "current-owner"},
         claim_epoch=claim.claim_epoch,
     )
     assert sequence == 0
-    assert (await store.get_run(run_id)).status == "waiting_client_tool"
-    assert [e.event_type for e in await store.get_run_events(run_id)] == ["run.paused"]
+    assert (await store.get_run(run_id)).status == RunStatus.WAITING_CLIENT_TOOL.value
+    assert [e.event_type for e in await store.get_run_events(run_id)] == [
+        StoredEventType.RUN_PAUSED.value
+    ]
 
 
 #: Every ``StateStore`` method that takes ``claim_epoch``, and the contract that refuses a stale

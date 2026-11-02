@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from dendrux._lifecycle import StoredEventType
 from dendrux.errors import PersistenceError, RunFencedError
 from dendrux.testing.store_kit.contracts._marks import contract
 from dendrux.testing.store_kit.contracts._support import (
@@ -21,7 +22,7 @@ from dendrux.testing.store_kit.contracts._support import (
     start_call_kwargs,
     trace_write,
 )
-from dendrux.types import InputValidationError
+from dendrux.types import InputValidationError, RunStatus
 
 if TYPE_CHECKING:
     from dendrux.testing.store_kit._kit import Kit
@@ -48,14 +49,18 @@ async def test_an_intent_publishes_its_row_and_event_together(dendrux_kit: Kit) 
     await store.start_tool_call(run_id, claim_epoch=0, **start_call_kwargs("a"))
     [row] = await store.get_tool_calls(run_id)
     assert (row.tool_call_id, row.outcome) == ("a", "started")
-    assert [e.event_type for e in await store.get_run_events(run_id)] == ["tool.started"]
+    assert [e.event_type for e in await store.get_run_events(run_id)] == [
+        StoredEventType.TOOL_STARTED.value
+    ]
 
 
 @atomic
 async def test_an_intent_with_unpersistable_values_writes_nothing(dendrux_kit: Kit) -> None:
     store = dendrux_kit.store
     run_id = await dendrux_kit.new_run()
-    bad_event = replace(event_write("tool.started", "c"), data={"call_id": "\x00"})
+    bad_event = replace(
+        event_write(StoredEventType.TOOL_STARTED.value, "c"), data={"call_id": "\x00"}
+    )
     for kwargs in (
         start_call_kwargs("c", params={"q": "\x00"}),
         start_call_kwargs("c", event=bad_event),
@@ -83,7 +88,11 @@ async def test_a_completion_publishes_result_trace_event_and_patch_together(
     assert rows["b"].outcome == "started"
     assert [t.meta["call_id"] for t in await store.get_traces(run_id)] == ["a"]
     types = [e.event_type for e in await store.get_run_events(run_id)]
-    assert types == ["tool.started", "tool.started", "tool.completed"]
+    assert types == [
+        StoredEventType.TOOL_STARTED.value,
+        StoredEventType.TOOL_STARTED.value,
+        StoredEventType.TOOL_COMPLETED.value,
+    ]
 
 
 @atomic
@@ -114,7 +123,7 @@ async def test_a_completion_with_a_different_result_conflicts(dendrux_kit: Kit) 
         result_payload='"changed"',
         success=False,
         error_message="safe",
-        event=event_write("tool.completed", "a"),
+        event=event_write(StoredEventType.TOOL_COMPLETED.value, "a"),
     )
     with pytest.raises(PersistenceError) as caught:
         await store.complete_tool_call(run_id, claim_epoch=0, **changed)
@@ -137,7 +146,9 @@ async def test_a_completion_that_cannot_publish_everything_publishes_nothing(
     [row] = await store.get_tool_calls(run_id)
     assert row.outcome == "started", "the result row must roll back with the clashing trace"
     assert [p["call_id"] for p in (await store.get_loop_state(run_id))["pending"]] == ["a"]
-    assert [e.event_type for e in await store.get_run_events(run_id)] == ["tool.started"]
+    assert [e.event_type for e in await store.get_run_events(run_id)] == [
+        StoredEventType.TOOL_STARTED.value
+    ]
 
 
 @atomic
@@ -163,39 +174,42 @@ async def test_finalize_with_event_ends_the_run_and_publishes_evidence_together(
     await store.save_run_event(run_id, event_type="before")
     sequence = await store.finalize_with_event(
         run_id,
-        status="success",
-        allowed_current_statuses=["running"],
-        event_type="run.completed",
+        status=RunStatus.SUCCESS.value,
+        allowed_current_statuses=[RunStatus.RUNNING.value],
+        event_type=StoredEventType.RUN_COMPLETED.value,
         answer="done",
         claim_epoch=0,
         trace=trace_write("assistant", "done", 0),
-        event=event_write("run.completed", run_id),
+        event=event_write(StoredEventType.RUN_COMPLETED.value, run_id),
     )
     assert sequence == 1
     record = await store.get_run(run_id)
     assert record is not None
-    assert (record.status, record.answer) == ("success", "done")
+    assert (record.status, record.answer) == (RunStatus.SUCCESS.value, "done")
     assert [t.content for t in await store.get_traces(run_id)] == ["done"]
-    assert [e.event_type for e in await store.get_run_events(run_id)] == ["before", "run.completed"]
+    assert [e.event_type for e in await store.get_run_events(run_id)] == [
+        "before",
+        StoredEventType.RUN_COMPLETED.value,
+    ]
 
 
 @atomic
 async def test_a_lost_finalize_publishes_no_evidence(dendrux_kit: Kit) -> None:
     store = dendrux_kit.store
     run_id = await dendrux_kit.new_run()
-    await store.finalize_run(run_id, status="cancelled", claim_epoch=0)
+    await store.finalize_run(run_id, status=RunStatus.CANCELLED.value, claim_epoch=0)
     sequence = await store.finalize_with_event(
         run_id,
-        status="success",
-        allowed_current_statuses=["running"],
-        event_type="run.completed",
+        status=RunStatus.SUCCESS.value,
+        allowed_current_statuses=[RunStatus.RUNNING.value],
+        event_type=StoredEventType.RUN_COMPLETED.value,
         answer="late",
         claim_epoch=0,
         trace=trace_write("assistant", "late", 0),
-        event=event_write("run.completed", run_id),
+        event=event_write(StoredEventType.RUN_COMPLETED.value, run_id),
     )
     assert sequence is None
-    assert (await store.get_run(run_id)).status == "cancelled"
+    assert (await store.get_run(run_id)).status == RunStatus.CANCELLED.value
     assert await store.get_traces(run_id) == []
     assert await store.get_run_events(run_id) == []
 
@@ -206,16 +220,16 @@ async def test_a_stale_finalize_with_event_publishes_nothing(dendrux_kit: Kit) -
     run_id, claim = await dendrux_kit.claimed_run()
     sequence = await store.finalize_with_event(
         run_id,
-        status="success",
-        allowed_current_statuses=["running"],
-        event_type="run.completed",
+        status=RunStatus.SUCCESS.value,
+        allowed_current_statuses=[RunStatus.RUNNING.value],
+        event_type=StoredEventType.RUN_COMPLETED.value,
         answer="stale",
         claim_epoch=claim.claim_epoch - 1,
         trace=trace_write("assistant", "stale", 0),
-        event=event_write("run.completed", run_id),
+        event=event_write(StoredEventType.RUN_COMPLETED.value, run_id),
     )
     assert sequence is None
-    assert (await store.get_run(run_id)).status == "running"
+    assert (await store.get_run(run_id)).status == RunStatus.RUNNING.value
     assert await store.get_traces(run_id) == []
     assert await store.get_run_events(run_id) == []
 
@@ -229,21 +243,24 @@ async def test_pause_with_event_pauses_and_publishes_together_and_loses_to_a_can
     await store.request_cancel(cancelled)
     assert (
         await store.pause_with_event(
-            cancelled, status="waiting_client_tool", pause_data={"pause_id": "p"}, claim_epoch=0
+            cancelled,
+            status=RunStatus.WAITING_CLIENT_TOOL.value,
+            pause_data={"pause_id": "p"},
+            claim_epoch=0,
         )
         is None
     )
-    assert (await store.get_run(cancelled)).status == "running"
+    assert (await store.get_run(cancelled)).status == RunStatus.RUNNING.value
     assert await store.get_run_events(cancelled) == []
     run_id = await dendrux_kit.new_run()
     sequence = await store.pause_with_event(
         run_id,
-        status="waiting_client_tool",
+        status=RunStatus.WAITING_CLIENT_TOOL.value,
         pause_data={"pause_id": "p"},
         event_data={"why": "tools"},
         claim_epoch=0,
     )
     assert sequence == 0
-    assert (await store.get_run(run_id)).status == "waiting_client_tool"
+    assert (await store.get_run(run_id)).status == RunStatus.WAITING_CLIENT_TOOL.value
     [event] = await store.get_run_events(run_id)
-    assert (event.event_type, event.sequence_index) == ("run.paused", 0)
+    assert (event.event_type, event.sequence_index) == (StoredEventType.RUN_PAUSED.value, 0)

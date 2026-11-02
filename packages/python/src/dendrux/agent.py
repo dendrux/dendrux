@@ -33,6 +33,14 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, overload
 
 from dendrux import _codes
+from dendrux._lifecycle import (
+    PAUSE_STATUS_VALUES,
+    CancelReason,
+    PauseReason,
+    StoredEventType,
+)
+from dendrux._lifecycle import TERMINAL_STATUSES as _TERMINAL_STATUS_VALUES
+from dendrux._lifecycle import WAITING_STATUSES as _WAITING_STATUS_VALUES
 from dendrux._sentinel import _OMITTED, _OmittedType, _UnsetType
 from dendrux.runtime._entry_checks import entry_checks, require_boolean
 from dendrux.runtime._tenant_checks import _tenant_scope_chosen
@@ -40,6 +48,7 @@ from dendrux.runtime.state import UNSCOPED, ReclaimableRun, TenantScope, require
 from dendrux.skills._internal import is_script, validate_executor
 from dendrux.skills._session import NAMES, SkillSession, continuation, current
 from dendrux.tool import get_tool_def, is_tool
+from dendrux.types import RunStatus
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequence
@@ -128,11 +137,6 @@ _UNSET = _UnsetType()
 MAX_NOTE_TEXT_BYTES = 32 * 1024
 MAX_NOTE_METADATA_BYTES = 8 * 1024
 MAX_PAUSE_REASON_CHARS = 1000
-
-_TERMINAL_STATUS_VALUES = frozenset({"success", "error", "cancelled", "max_iterations"})
-_WAITING_STATUS_VALUES = frozenset(
-    {"waiting_client_tool", "waiting_human_input", "waiting_approval"}
-)
 
 
 def _in_tenant_scope(record: Any, tenant_id: TenantScope) -> bool:
@@ -2153,7 +2157,7 @@ class Agent:
         result._wire_pii_mapping = mapping
         if include_pii:
             result.meta.update(_public_meta({"pii_mapping": mapping}))
-        if result.status.value == "success":
+        if result.status.value == RunStatus.SUCCESS.value:
             result.output = _cached_output(record.answer, self._output_type, run_id)
         result.pending = await facade.get_pending(run_id, tenant_id=tenant_id)
         result.pause_id = result.pending.pause_id if result.pending else None
@@ -2405,18 +2409,13 @@ class Agent:
             store,
             run_id,
             status=RunStatus.CANCELLED.value,
-            allowed_current_statuses=[
-                RunStatus.WAITING_CLIENT_TOOL.value,
-                RunStatus.WAITING_HUMAN_INPUT.value,
-                RunStatus.WAITING_APPROVAL.value,
-                RunStatus.PAUSED.value,
-            ],
-            event_type="run.cancelled",
-            event_data={"reason": "cancel_requested"},
+            allowed_current_statuses=list(PAUSE_STATUS_VALUES),
+            event_type=StoredEventType.RUN_CANCELLED.value,
+            event_data={"reason": CancelReason.CANCEL_REQUESTED.value},
         )
         if signal:
             self._task_manager.cancel(run_id)
-        return "cancelled" if cancel_won else "cancel_requested"
+        return RunStatus.CANCELLED.value if cancel_won else CancelReason.CANCEL_REQUESTED.value
 
     async def request_pause(
         self,
@@ -2509,10 +2508,10 @@ class Agent:
         affected: list[tuple[str, Any]] = []
         for rid in order:
             if await store_request_pause(rid, reason=reason):
-                affected.append((rid, "requested"))
+                affected.append((rid, PauseReason.REQUESTED.value))
                 continue
             current = await store.get_run(rid)
-            status = current.status if current is not None else "cancelled"
+            status = current.status if current is not None else RunStatus.CANCELLED.value
             if status in _WAITING_STATUS_VALUES:
                 affected.append((rid, "already_waiting"))
             elif status == RunStatus.PAUSED.value:

@@ -11,7 +11,9 @@ from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
 
+from dendrux._lifecycle import STORAGE_FORMAT_CHECKPOINTED
 from dendrux._redact import mask_database_urls_in
+from dendrux.types import RunStatus
 
 app = typer.Typer(
     name="runs",
@@ -26,7 +28,7 @@ class StorageFormat(StrEnum):
     """Storage formats accepted by the runs command."""
 
     legacy = "1"
-    checkpointed = "2"
+    checkpointed = str(STORAGE_FORMAT_CHECKPOINTED)
 
 
 @app.callback(invoke_without_command=True)
@@ -131,12 +133,12 @@ async def _list_runs(
 
     for run in runs:
         status_style = {
-            "running": "yellow",
-            "success": "green",
-            "error": "red",
-            "max_iterations": "magenta",
-            "cancelled": "dim",
-            "pending": "dim",
+            RunStatus.RUNNING.value: "yellow",
+            RunStatus.SUCCESS.value: "green",
+            RunStatus.ERROR.value: "red",
+            RunStatus.MAX_ITERATIONS.value: "magenta",
+            RunStatus.CANCELLED.value: "dim",
+            RunStatus.PENDING.value: "dim",
         }.get(run.status, "")
 
         total_tokens = run.total_input_tokens + run.total_output_tokens

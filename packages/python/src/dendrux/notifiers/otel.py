@@ -34,11 +34,12 @@ import traceback
 from itertools import islice
 from typing import TYPE_CHECKING, Any
 
+from dendrux._lifecycle import FAILED_STATUSES
 from dendrux.errors import provider_error_in
 from dendrux.llm._provider_codes import map_provider_code
 from dendrux.loops.base import BaseNotifier
 from dendrux.runtime._tracelink import validate_trace_link
-from dendrux.types import ErrorInfo
+from dendrux.types import ErrorInfo, RunStatus
 
 if TYPE_CHECKING:
     from dendrux.types import LLMResponse, Message, RunResult, ToolCall, ToolDef, ToolResult
@@ -195,7 +196,7 @@ class OpenTelemetryNotifier(BaseNotifier):
             description = None
             if result.error_info is not None:
                 description = _set_error_info(span, result.error_info)
-            if result.status.value in {"error", "max_iterations", "cancelled"}:
+            if result.status.value in FAILED_STATUSES:
                 span.set_status(Status(StatusCode.ERROR, description))
             else:
                 span.set_status(Status(StatusCode.OK))
@@ -211,7 +212,7 @@ class OpenTelemetryNotifier(BaseNotifier):
         iteration: int | None = None,
     ) -> None:
         # Same orphan-cleanup contract as on_run_finished.
-        self._close_orphan_children(run_id, terminal_status="error", error=error)
+        self._close_orphan_children(run_id, terminal_status=RunStatus.ERROR.value, error=error)
 
         span = self._run_spans.pop(run_id, None)
         self._run_models.pop(run_id, None)

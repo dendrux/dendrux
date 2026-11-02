@@ -8,6 +8,14 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
 
 from dendrux import _codes
+from dendrux._lifecycle import (
+    TERMINAL_STATUSES,
+    ApprovalReason,
+    FailureReason,
+    GovernanceEventType,
+    PauseReason,
+    StoredEventType,
+)
 from dendrux.errors import PersistenceError, RunNotFoundError, RunNotReclaimableError
 from dendrux.loops._helpers import order_observations, project_message, record_message, record_tool
 from dendrux.runtime.persistence import PersistenceRecorder, resolve_pending
@@ -95,18 +103,13 @@ async def reclaim(
             state_store=owned,
             agent=agent,
             provider=agent._require_provider(),
-            expected_status="running",
+            expected_status=RunStatus.RUNNING.value,
             extra_notifier=notifier,
             _skip_claim=True,
             _reclaim_pause=pause,
             _reclaim_history=history_records,
         )
-        if result.status in (
-            RunStatus.SUCCESS,
-            RunStatus.ERROR,
-            RunStatus.CANCELLED,
-            RunStatus.MAX_ITERATIONS,
-        ):
+        if result.status in TERMINAL_STATUSES:
             _codes.log_code(logger, _codes.RUN_FINALIZED, run_id=run_id)
         return result
 
@@ -117,14 +120,14 @@ def _rebuild_failure_reason(exc: Exception) -> str | None:
     elif isinstance(exc, PersistenceError):
         reason = exc.code
     elif isinstance(exc, (ValueError, KeyError, TypeError)):
-        reason = "recovery_state_invalid"
+        reason = FailureReason.RECOVERY_STATE_INVALID.value
     else:
         return None
     reasons = {
-        "history_too_large",
-        "recovery_call_missing",
-        "recovery_state_missing",
-        "recovery_state_invalid",
+        FailureReason.HISTORY_TOO_LARGE.value,
+        FailureReason.RECOVERY_CALL_MISSING.value,
+        FailureReason.RECOVERY_STATE_MISSING.value,
+        FailureReason.RECOVERY_STATE_INVALID.value,
     }
     return reason if reason in reasons else None
 
@@ -134,13 +137,13 @@ async def _handle_rebuild_failure(store: StateStore, run_id: str, exc: Exception
 
     reason = _rebuild_failure_reason(exc)
     if reason is None:
-        await _release_claim(store, run_id, "running")
+        await _release_claim(store, run_id, RunStatus.RUNNING.value)
         return
     await store.finalize_with_event(
         run_id,
-        status="error",
-        allowed_current_statuses=["running"],
-        event_type="run.error",
+        status=RunStatus.ERROR.value,
+        allowed_current_statuses=[RunStatus.RUNNING.value],
+        event_type=StoredEventType.RUN_ERROR.value,
         event_data={"failure_reason": reason},
         failure_reason=reason,
         error=reason,
@@ -192,7 +195,7 @@ async def rebuild_pause(
     pending = {p["call_id"]: p for p in state.get("pending", [])}
     calls = {tc.id: tc for message in rebuilt.messages for tc in message.tool_calls or []}
     if any(call_id not in calls for call_id in pending):
-        raise PersistenceError(code="recovery_call_missing")
+        raise PersistenceError(code=FailureReason.RECOVERY_CALL_MISSING.value)
     raw = await store.get_pause_state(run_id)
     pause = (
         PauseState.from_dict(raw)
@@ -227,7 +230,7 @@ async def rebuild_pause(
             continue
         trace = await store.get_trace(run_id, ref)
         if trace is None:
-            raise PersistenceError(code="recovery_state_missing")
+            raise PersistenceError(code=FailureReason.RECOVERY_STATE_MISSING.value)
         payload = json.loads(trace.content)
         if kind == "image_view":
             pause.image_view = ImageViewState.from_dict(payload)
@@ -263,7 +266,7 @@ async def needs_resolution(
 
 
 def recovery_gate() -> dict[str, str | None]:
-    return {"source": "recovery", "reason": "replay_after_crash"}
+    return {"source": "recovery", "reason": ApprovalReason.REPLAY_AFTER_CRASH.value}
 
 
 def _recovery_decisions(payload: dict[str, Any]) -> Any:
@@ -396,7 +399,7 @@ async def _recovery_barrier(
         history=history,
         pending_tool_calls=remaining,
         approval_gates={**(pause.approval_gates or {}), **gates, **started_gates} or None,
-        pause_reason="requested",
+        pause_reason=PauseReason.REQUESTED.value,
         pause_id=None,
     )
     return RunResult(
@@ -424,7 +427,7 @@ async def _hold_recovery_call(
         gates[tc.id] = recovery_gate()
         await ctx.recorder.on_governance_event(
             run_id,
-            "approval.requested",
+            GovernanceEventType.APPROVAL_REQUESTED.value,
             ctx.pause_state.iteration,
             {"call_id": tc.id, "tool_name": tc.name, **gates[tc.id]},
             correlation_id=tc.id,

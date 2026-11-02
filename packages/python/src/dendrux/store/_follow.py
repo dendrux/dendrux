@@ -35,6 +35,9 @@ from functools import partial
 from typing import TYPE_CHECKING, Any, Literal, TypeAlias, Union
 
 from dendrux import _codes
+from dendrux._lifecycle import PAUSE_STATUSES as PAUSE_STATUSES
+from dendrux._lifecycle import TERMINAL_EVENT_TYPES as _TERMINAL_EVENT_TYPES
+from dendrux._lifecycle import TERMINAL_STATUSES as TERMINAL_STATUSES
 from dendrux._sentinel import _UnsetType
 from dendrux.errors import RunNotFoundError
 from dendrux.runtime._pending import approval_calls as approval_calls
@@ -81,11 +84,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-TERMINAL_STATUSES = frozenset({"success", "error", "cancelled", "max_iterations"})
-PAUSE_STATUSES = frozenset(
-    {"waiting_client_tool", "waiting_human_input", "waiting_approval", "paused"}
-)
-_TERMINAL_EVENT_TYPES = frozenset({"run.completed", "run.error", "run.cancelled"})
 
 _DEFAULT_SHARE = _UnsetType()
 

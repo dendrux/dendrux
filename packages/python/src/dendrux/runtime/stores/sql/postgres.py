@@ -5,6 +5,9 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
 
+from dendrux._lifecycle import (
+    StoredEventType,
+)
 from dendrux.runtime.durability import _safe_database_call
 from dendrux.runtime.stores.sql.base import SQLStateStore
 
@@ -124,7 +127,10 @@ class PostgresStateStore(SQLStateStore):
 
         sequence = (
             select(func.max(RunEvent.sequence_index))
-            .where(RunEvent.agent_run_id == run_id, RunEvent.event_type == "run.paused")
+            .where(
+                RunEvent.agent_run_id == run_id,
+                RunEvent.event_type == StoredEventType.RUN_PAUSED.value,
+            )
             .scalar_subquery()
         )
         inner = (

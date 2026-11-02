@@ -12,6 +12,9 @@ from sqlalchemy import String
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.sql.functions import FunctionElement
 
+from dendrux._meta_keys import (
+    STORE_SESSION_KEY,
+)
 from dendrux.runtime.durability import _safe_database_call
 from dendrux.runtime.state import _TERMINAL_STATUS_VALUES
 from dendrux.runtime.stores.sql.base import SQLStateStore
@@ -258,7 +261,7 @@ class MySQLStateStore(SQLStateStore):
         columns = tuple(table.primary_key.columns)
         if len(pk) != len(columns) or not columns or not returning:
             raise ValueError("a complete primary key and returning projection are required")
-        session.info["dendrux.store"] = self
+        session.info[STORE_SESSION_KEY] = self
         key = and_(*(col == value for col, value in zip(columns, pk, strict=True)))
         projection = list(dict.fromkeys((*columns, *lock_projection, *returning)))
         locked = (
