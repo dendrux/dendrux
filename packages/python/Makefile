@@ -1,4 +1,10 @@
-.PHONY: test test-fast test-area test-pg test-kit test-merge test-lists test-shard-proof test-model-check test-model-install test-dbs-up test-dbs-down test-mysql bench load load-quick load-pg load-mysql load-mariadb lint typecheck arch crap cognitive duplicates deadcode cycles semgrep quality quality-stamp api-check format package-smoke ci clean
+.PHONY: dev-sync test test-fast test-area test-pg test-kit test-merge test-lists test-shard-proof test-model-check test-model-install test-dbs-up test-dbs-down test-mysql bench load load-quick load-pg load-mysql load-mariadb lint typecheck arch crap cognitive duplicates deadcode cycles semgrep quality quality-stamp api-check format package-smoke ci clean
+.DEFAULT_GOAL := test
+
+# Match a fresh CI install: exact dev tools and the newest allowed runtime dependencies.
+DEV_EXTRAS ?= dev,all
+dev-sync:
+	python -m pip install --upgrade --upgrade-strategy eager -e ".[$(DEV_EXTRAS)]"
 
 # Parallel workers for local runs: the core count, never more than 6 (owner decision 2026-11-01;
 # the machine also runs Docker and other builders). TEST_WORKERS=<n> (command line or environment)
