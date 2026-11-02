@@ -16,11 +16,15 @@ from dendrux._lifecycle import (
     STORAGE_FORMAT_CHECKPOINTED,
 )
 from dendrux._redact import mask_database_urls_in
+from dendrux.runtime._bounds import MAX_PAGE
+
+DEFAULT_TRACE_LIMIT = 200
+_TRACE_TEXT_CHARS = 500
 
 if TYPE_CHECKING:
     from dendrux.runtime.state import TraceRecord
 
-MAX_ROWS = 1000
+MAX_ROWS = MAX_PAGE
 
 console = Console()
 
@@ -29,14 +33,16 @@ def show_traces(
     run_id: str = typer.Argument(..., help="Run ID to inspect."),
     tool_calls: bool = typer.Option(False, "--tools", "-t", help="Also show tool call records."),
     limit: int = typer.Option(
-        200, "--limit", "-n", help=f"Maximum rows per section (at most {MAX_ROWS})."
+        DEFAULT_TRACE_LIMIT, "--limit", "-n", help=f"Maximum rows per section (at most {MAX_ROWS})."
     ),
 ) -> None:
     """Show the conversation trace for an agent run."""
     asyncio.run(_show_traces(run_id, tool_calls, limit))
 
 
-async def _show_traces(run_id: str, show_tool_calls: bool, limit: int = 200) -> None:
+async def _show_traces(
+    run_id: str, show_tool_calls: bool, limit: int = DEFAULT_TRACE_LIMIT
+) -> None:
     limit = max(1, min(limit, MAX_ROWS))
     try:
         from dendrux.db.session import get_engine, reset_engine
@@ -98,8 +104,10 @@ async def _show_traces(run_id: str, show_tool_calls: bool, limit: int = 200) -> 
                 header = Text(f"[{trace.order_index}] {trace.role}", style=role_style)
                 content = trace.content
                 # Truncate very long content for display
-                if len(content) > 500:
-                    content = content[:500] + f"\n… ({len(trace.content)} chars total)"
+                if len(content) > _TRACE_TEXT_CHARS:
+                    content = (
+                        content[:_TRACE_TEXT_CHARS] + f"\n… ({len(trace.content)} chars total)"
+                    )
 
                 console.print(header)
                 console.print(content, markup=False, highlight=False)

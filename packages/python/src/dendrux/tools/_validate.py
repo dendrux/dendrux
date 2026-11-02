@@ -29,6 +29,8 @@ from dendrux.tools._coerce import (
     get_args_spec,
     normalize_arguments,
 )
+from dendrux.types import JSON_MAX_DEPTH as _SCHEMA_MAX_DEPTH
+from dendrux.types import JSON_MAX_NODES as _SCHEMA_MAX_NODES
 from dendrux.types import InputValidationError, ToolDef, ToolResult, _validate_persistable
 
 if TYPE_CHECKING:
@@ -85,8 +87,8 @@ _SUBSCHEMAS = (
     "else",
 )
 # Budget for the walk; past it the schema is refused (fail closed).
-_SCHEMA_MAX_DEPTH = 32
-_SCHEMA_MAX_NODES = 10_000
+
+
 _SCHEMA_BUDGET_PROBLEM = "schema is too large or too deeply nested to check"
 
 

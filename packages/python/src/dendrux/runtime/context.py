@@ -33,13 +33,19 @@ from dendrux import _codes
 from dendrux._lifecycle import (
     FailureReason,
 )
+from dendrux.errors import safe_exception_info as safe_exception_info
+
+DEFAULT_LEASE_INTERVAL_S = 30.0
+MIN_LEASE_INTERVAL_S = 5.0
+LEASE_FAILURE_LIMIT = 2
+RENEW_DEADLINE_CAP_S = 10.0
+_RENEW_INTERVAL_DIVISOR = 2
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, AsyncIterator, Awaitable
 
     from dendrux.skills._session import SkillSession
 
-from dendrux.errors import safe_exception_info as safe_exception_info
 
 T = TypeVar("T")
 
@@ -109,7 +115,7 @@ class DelegationContext:
     state_store: Any = field(default=None, compare=False, repr=False)
     loop: asyncio.AbstractEventLoop | None = field(default=None, compare=False, repr=False)
     _heartbeat_at: list[float] = field(default_factory=lambda: [0.0], compare=False, repr=False)
-    lease_interval_s: float = 30.0
+    lease_interval_s: float = DEFAULT_LEASE_INTERVAL_S
     _lease_lock: asyncio.Lock = field(default_factory=asyncio.Lock, compare=False, repr=False)
     _lease_failures: list[int] = field(default_factory=lambda: [0], compare=False, repr=False)
     _lease_errors: list[BaseException | None] = field(
@@ -407,7 +413,9 @@ async def _renew_claim(ctx: DelegationContext) -> None:
             return
         ctx._lease_at[0] = now
         try:
-            async with asyncio.timeout(min(ctx.lease_interval_s / 2, 10.0)):
+            async with asyncio.timeout(
+                min(ctx.lease_interval_s / _RENEW_INTERVAL_DIVISOR, RENEW_DEADLINE_CAP_S)
+            ):
                 await ctx.state_store.touch_progress(ctx.run_id)
             ctx._lease_failures[0] = 0
         except RunFencedError as error:
@@ -418,7 +426,7 @@ async def _renew_claim(ctx: DelegationContext) -> None:
             _codes.log_code(
                 logger, _codes.LEASE_RENEW_FAILED, run_id=ctx.run_id, attempt=ctx._lease_failures[0]
             )
-            if ctx._lease_failures[0] >= 2:
+            if ctx._lease_failures[0] >= LEASE_FAILURE_LIMIT:
                 ctx._lease_errors[0] = PersistenceError(code=FailureReason.LEASE_LOST.value)
                 _codes.log_code(logger, _codes.LEASE_LOST, run_id=ctx.run_id)
 

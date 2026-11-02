@@ -28,6 +28,8 @@ from typing import (
 
 from pydantic import BaseModel
 
+from dendrux.types import DEFAULT_TOOL_TIMEOUT as DEFAULT_TOOL_TIMEOUT
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
@@ -62,8 +64,6 @@ _SUPPORTED_TYPES_HINT = (
 _SENTINEL: float = object()  # type: ignore[assignment]
 
 _VARIADIC_KINDS = (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
-
-DEFAULT_TOOL_TIMEOUT = 120.0
 
 
 def tool(

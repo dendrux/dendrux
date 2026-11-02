@@ -61,6 +61,7 @@ from dendrux.errors import BlobNotFoundError, NotifierUnavailableError, RunNotFo
 from dendrux.media._ids import image_id
 from dendrux.media._runtime import tenant_scope_for
 from dendrux.runtime._blob_catalog import BlobServices, CatalogBlobAccessor
+from dendrux.runtime._bounds import DEFAULT_EVENT_LIMIT, DEFAULT_LIST_LIMIT, MAX_PAGE
 from dendrux.runtime._pending import (
     _KIND_BY_STATUS as _KIND_BY_STATUS,
 )
@@ -123,9 +124,8 @@ from dendrux.runtime.stores.sql.mysql import MySQLStateStore
 from dendrux.runtime.stores.sql.postgres import PostgresStateStore
 from dendrux.runtime.stores.sql.sqlite import SQLiteStateStore
 from dendrux.store._follow import (
-    PAUSE_STATUSES as PAUSE_STATUSES,
-)
-from dendrux.store._follow import (
+    DEFAULT_MAX_DURATION_S,
+    DEFAULT_POLL_INTERVAL_S,
     EventFeed,
     Follow,
     FollowCapacityError,
@@ -135,9 +135,12 @@ from dendrux.store._follow import (
     redact_event,
 )
 from dendrux.store._follow import (
+    PAUSE_STATUSES as PAUSE_STATUSES,
+)
+from dendrux.store._follow import (
     approval_calls as approval_calls,
 )
-from dendrux.store._notifier_pg import PostgresEventNotifier
+from dendrux.store._notifier_pg import DEFAULT_RECONNECT_BACKOFF, PostgresEventNotifier
 from dendrux.store._redact import (
     PAUSE_VIEW_EVENTS,
     PastParams,
@@ -652,7 +655,7 @@ class RunStore:
             self._notifier_retry_at = 0.0
             self._notifier_retry_delay = None
         except NotifierUnavailableError:
-            initial, maximum = getattr(notifier, "reconnect_backoff", (1.0, 30.0))
+            initial, maximum = getattr(notifier, "reconnect_backoff", DEFAULT_RECONNECT_BACKOFF)
             delay = self._notifier_retry_delay or initial
             self._notifier_retry_at = asyncio.get_running_loop().time() + delay
             self._notifier_retry_delay = min(delay * 2, maximum)
@@ -672,7 +675,7 @@ class RunStore:
         started_after: datetime | None = None,
         started_before: datetime | None = None,
         metadata_filter: dict[str, Any] | None = None,
-        limit: int = 50,
+        limit: int = DEFAULT_LIST_LIMIT,
         offset: int = 0,
     ) -> list[RunSummary]:
         """List runs with SQL-side filtering and pagination, newest first.
@@ -830,7 +833,7 @@ class RunStore:
         run_id: str,
         *,
         after_sequence_index: int | None = None,
-        poll_interval_s: float = 0.5,
+        poll_interval_s: float = DEFAULT_POLL_INTERVAL_S,
         tenant_id: TenantScope | _OmittedType = _OMITTED_TENANT,
     ) -> AsyncIterator[StoredEvent]:
         """Stream raw events as they land in the durable log (0.4 behaviour).
@@ -878,7 +881,7 @@ class RunStore:
                 rows = await self._state.get_run_events(
                     run_id,
                     after_sequence_index=cursor,
-                    limit=100,
+                    limit=DEFAULT_EVENT_LIMIT,
                 )
                 if rows:
                     for row in rows:
@@ -887,7 +890,7 @@ class RunStore:
                         cursor = event.sequence_index
                     # If the batch was full, there may be more buffered — keep
                     # draining before we sleep.
-                    if len(rows) == 100:
+                    if len(rows) == DEFAULT_EVENT_LIMIT:
                         continue
                 if subscription is None:
                     await asyncio.sleep(poll_interval_s)
@@ -1042,7 +1045,7 @@ class RunStore:
         run_id: str,
         *,
         tenant_id: TenantScope = UNSCOPED,
-        limit: int = 100,
+        limit: int = DEFAULT_EVENT_LIMIT,
         include_payloads: bool = False,
     ) -> list[PausePair]:
         """First bounded pause/resume pairs; use get_pause_page for truncation metadata.
@@ -1060,7 +1063,7 @@ class RunStore:
         run_id: str,
         *,
         tenant_id: TenantScope = UNSCOPED,
-        limit: int = 100,
+        limit: int = DEFAULT_EVENT_LIMIT,
         include_payloads: bool = False,
     ) -> tuple[list[PausePair], bool]:
         """Bounded pairs (1..1000), plus an honest truncated flag.
@@ -1072,14 +1075,14 @@ class RunStore:
         With ``include_payloads=False`` past pauses' arguments are hidden and
         ``user_input`` (a person's answer) is None.
         """
-        check_read_bounded("limit", limit, 1, 1000)
+        check_read_bounded("limit", limit, 1, MAX_PAGE)
         check_read_bool("include_payloads", include_payloads)
         method = self._state.get_run_events
         kwargs: dict[str, Any] = {}
         builtin = "_pause_page" in inspect.signature(method).parameters
         if builtin:
             kwargs["_pause_page"] = True
-        row_limit = 2 * limit + 2 if builtin else min(2 * limit + 2, 1000)
+        row_limit = 2 * limit + 2 if builtin else min(2 * limit + 2, MAX_PAGE)
         rows = await self._scoped_read(
             method,
             run_id,
@@ -1164,7 +1167,7 @@ class RunStore:
         after_sequence_index: int | None = None,
         include_payloads: bool = False,
         until_terminal: bool = True,
-        max_duration_s: float | None = 900.0,
+        max_duration_s: float | None = DEFAULT_MAX_DURATION_S,
     ) -> Follow:
         """A hardened live feed of the run's events; see :meth:`EventFeed.follow`.
 

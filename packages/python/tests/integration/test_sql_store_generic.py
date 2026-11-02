@@ -405,7 +405,7 @@ async def test_uncommitted_transition_retries_without_returning_a_cas_miss(
         await commit(session)
 
     monkeypatch.setattr(AsyncSession, "commit", lose_before_commit)
-    monkeypatch.setattr(durability, "_BASE_BACKOFF_S", 0)
+    monkeypatch.setattr(durability, "BASE_BACKOFF_S", 0)
     if operation == "finalize_run":
         assert await store.finalize_run(run_id, status="success") is True
         expected = "success"

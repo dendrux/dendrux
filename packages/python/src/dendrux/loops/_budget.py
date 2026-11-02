@@ -50,6 +50,7 @@ from dendrux._lifecycle import (
     PauseReason,
 )
 from dendrux.loops._helpers import notify_governance, record_governance
+from dendrux.types import COST_DECIMALS as _COST_DECIMALS
 from dendrux.types import GovernanceEventType
 
 if TYPE_CHECKING:
@@ -66,7 +67,7 @@ EXCEEDED = 1.0
 # ``failure_reason`` and ``run.cancelled`` reason of a budget cancel.
 BUDGET_EXCEEDED = FailureReason.BUDGET_EXCEEDED.value
 # Persisted cost precision (llm_interactions.cost_usd is Numeric(10, 6)).
-_COST_DECIMALS = 6
+
 # ``budget.exceeded`` reason when an unpriced call stands in for the cost limit.
 UNPRICED_CALL = "unpriced_call"
 

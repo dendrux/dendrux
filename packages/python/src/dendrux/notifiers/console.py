@@ -24,8 +24,18 @@ from dendrux.loops.base import BaseNotifier
 from dendrux.types import ErrorInfo, Message, Role, RunStatus, ToolCall, ToolResult
 from dendrux.types import GovernanceEventType as _GovType
 
+DEFAULT_MAX_TEXT_LENGTH = 120
+_ERROR_PANEL_CHARS = 240
+_MESSAGE_PANEL_CHARS = 200
+_PANEL_WIDTH = 76
+_TOOL_ERROR_CHARS = 100
+_SUMMARY_WIDTH = 50
+_ARGUMENT_VALUE_CHARS = 30
+_ARGUMENT_SUMMARY_CHARS = 60
+_ELLIPSIS_CHARS = 3
+
 if TYPE_CHECKING:
-    from dendrux.types import LLMResponse, RunResult, ToolDef
+    from dendrux.types import LLMResponse, RunResult, ToolDef, UsageStats
 
 # Run statuses for which on_run_finished prints a "paused" inline marker.
 # The pause states are still terminal-from-runner-perspective, but the
@@ -48,7 +58,7 @@ class ConsoleNotifier(BaseNotifier):
         self,
         *,
         show_llm_text: bool = False,
-        max_text_length: int = 120,
+        max_text_length: int = DEFAULT_MAX_TEXT_LENGTH,
         show_params: bool = True,
     ) -> None:
         self._show_llm_text = show_llm_text
@@ -106,10 +116,10 @@ class ConsoleNotifier(BaseNotifier):
         _console.print(
             Panel(
                 f"[bold red]{type(error).__name__}[/bold red]: "
-                f"[white]{_truncate(_error_message(error), 240)}[/white]",
+                f"[white]{_truncate(_error_message(error), _ERROR_PANEL_CHARS)}[/white]",
                 title="[bold]run failed[/bold]",
                 border_style="red",
-                width=min(76, _console.width),
+                width=min(_PANEL_WIDTH, _console.width),
                 padding=(0, 1),
             )
         )
@@ -128,9 +138,9 @@ class ConsoleNotifier(BaseNotifier):
             _console.print()
             _console.print(
                 Panel(
-                    f"[white]{_truncate(message.content, 200)}[/white]",
+                    f"[white]{_truncate(message.content, _MESSAGE_PANEL_CHARS)}[/white]",
                     border_style="bright_blue",
-                    width=min(76, _console.width),
+                    width=min(_PANEL_WIDTH, _console.width),
                     padding=(0, 1),
                 )
             )
@@ -160,7 +170,7 @@ class ConsoleNotifier(BaseNotifier):
         duration_str = f" [dim]after {duration_ms / 1000:.1f}s[/dim]" if duration_ms else ""
         _console.print(
             f"  [red]  llm[/red]    [bold]{type(error).__name__}[/bold]{duration_str} "
-            f"[dim]{_truncate(_error_message(error), 100)}[/dim]"
+            f"[dim]{_truncate(_error_message(error), _TOOL_ERROR_CHARS)}[/dim]"
         )
 
     async def on_tool_started(self, run_id: str, tool_call: ToolCall, iteration: int) -> None:
@@ -362,6 +372,19 @@ class ConsoleNotifier(BaseNotifier):
                 f" [dim]{reason}[/dim]"
             )
 
+    def _add_cache_summary(self, table: Table, usage: UsageStats) -> None:
+        cache_read = usage.cache_read_input_tokens or self._total_cache_read
+        cache_create = usage.cache_creation_input_tokens or self._total_cache_creation
+        if cache_read or cache_create:
+            denom = (usage.input_tokens or 0) + (cache_read or 0)
+            ratio = (cache_read / denom) if denom else 0.0
+            table.add_row(
+                "cache read",
+                f"[bright_green]{cache_read:,}[/bright_green] [dim]({ratio:.0%} hit ratio)[/dim]",
+            )
+            if cache_create:
+                table.add_row("cache writes", f"[yellow]{cache_create:,}[/yellow]")
+
     def print_summary(self, result: RunResult) -> None:
         """Print a final summary panel. Call after agent.run() completes."""
         total_time = time.monotonic() - self._run_start if self._run_start else 0
@@ -375,17 +398,7 @@ class ConsoleNotifier(BaseNotifier):
         table.add_row("iterations", str(result.iteration_count))
         table.add_row("tokens", f"{result.usage.total_tokens:,}")
 
-        cache_read = result.usage.cache_read_input_tokens or self._total_cache_read
-        cache_create = result.usage.cache_creation_input_tokens or self._total_cache_creation
-        if cache_read or cache_create:
-            denom = (result.usage.input_tokens or 0) + (cache_read or 0)
-            ratio = (cache_read / denom) if denom else 0.0
-            table.add_row(
-                "cache read",
-                f"[bright_green]{cache_read:,}[/bright_green] [dim]({ratio:.0%} hit ratio)[/dim]",
-            )
-            if cache_create:
-                table.add_row("cache writes", f"[yellow]{cache_create:,}[/yellow]")
+        self._add_cache_summary(table, result.usage)
 
         table.add_row("tools called", str(self._total_tools))
         if total_time:
@@ -399,7 +412,7 @@ class ConsoleNotifier(BaseNotifier):
                 border_style="bright_green"
                 if result.status.value == RunStatus.SUCCESS.value
                 else "yellow",
-                width=min(50, _console.width),
+                width=min(_SUMMARY_WIDTH, _console.width),
                 padding=(0, 1),
             )
         )
@@ -419,12 +432,12 @@ def _format_params(params: dict[str, Any]) -> str:
     parts = []
     for k, v in params.items():
         val = repr(v)
-        if len(val) > 30:
-            val = val[:27] + "..."
+        if len(val) > _ARGUMENT_VALUE_CHARS:
+            val = val[: _ARGUMENT_VALUE_CHARS - _ELLIPSIS_CHARS] + "..."
         parts.append(f"{k}={val}")
     result = ", ".join(parts)
-    if len(result) > 60:
-        result = result[:57] + "..."
+    if len(result) > _ARGUMENT_SUMMARY_CHARS:
+        result = result[: _ARGUMENT_SUMMARY_CHARS - _ELLIPSIS_CHARS] + "..."
     return result
 
 

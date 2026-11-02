@@ -10,6 +10,15 @@ from typing import TYPE_CHECKING, Any
 
 from dendrux import _codes
 from dendrux._lifecycle import HIDDEN_ANSWER_STATUSES, PAUSE_STATUSES
+from dendrux.types import JSON_MAX_DEPTH, JSON_MAX_NODES, JSON_MAX_TEXT
+
+_REDACTION_MAX_ENTRIES = 1000
+_REDACTION_PATTERN_CHARS = 65536
+_INTEGER_MAX_BITS = 14000
+_REDACTION_SCAN_WORK = 2_000_000
+_MAX_DURATION_MS = 2147483647
+_MAX_RESULT_IMAGES = 100
+_MAX_RESULTS = 10000
 
 if TYPE_CHECKING:
     from dendrux.types import Limits, RunResult, ToolResult
@@ -22,7 +31,7 @@ def _redacted(value: Any, mapping: Any) -> Any:
     """Copy only bounded JSON data, replacing known PII with placeholders."""
     replacements = {}
     if isinstance(mapping, dict):
-        if len(mapping) > 1000:
+        if len(mapping) > _REDACTION_MAX_ENTRIES:
             return None
         for key, real in mapping.items():
             if isinstance(real, str) and real and isinstance(key, str):
@@ -30,11 +39,11 @@ def _redacted(value: Any, mapping: Any) -> Any:
     parts: list[str] = []
     pattern_size = 0
     for real in sorted(replacements, key=len, reverse=True):
-        if len(real) > 65536:
+        if len(real) > _REDACTION_PATTERN_CHARS:
             return None
         escaped = re.escape(real)
         pattern_size += len(escaped) + bool(parts)
-        if pattern_size > 65536:
+        if pattern_size > _REDACTION_PATTERN_CHARS:
             return None
         parts.append(escaped)
     pattern_text = "|".join(parts)
@@ -44,13 +53,13 @@ def _redacted(value: Any, mapping: Any) -> Any:
     def copy(item: Any, depth: int = 0) -> Any:
         nonlocal nodes, size, scan_work
         nodes += 1
-        if depth > 32 or nodes > 10000 or size > 1048576:
+        if depth > JSON_MAX_DEPTH or nodes > JSON_MAX_NODES or size > JSON_MAX_TEXT:
             raise ValueError("Wire value exceeds its display bound")
         if isinstance(item, str):
-            if len(item) > 1048576:
+            if len(item) > JSON_MAX_TEXT:
                 raise ValueError("Wire text exceeds its display bound")
             size += len(item.encode("utf-8"))
-            if size > 1048576:
+            if size > JSON_MAX_TEXT:
                 raise ValueError("Wire text exceeds its display bound")
             scan_work = _scan_budget(scan_work, len(item), len(replacements))
             return pattern.sub(lambda m: replacements[m.group(0)], item) if pattern else item
@@ -59,10 +68,10 @@ def _redacted(value: Any, mapping: Any) -> Any:
         if isinstance(item, int):
             # Below Python's default JSON integer conversion guard; also count
             # digits against the aggregate display budget before copying it.
-            if item.bit_length() > 14000:
+            if item.bit_length() > _INTEGER_MAX_BITS:
                 raise ValueError("Wire integer exceeds its display bound")
             size += len(str(item))
-            if size > 1048576:
+            if size > JSON_MAX_TEXT:
                 raise ValueError("Wire value exceeds its display bound")
             return item
         if isinstance(item, float):
@@ -85,7 +94,7 @@ def _redacted(value: Any, mapping: Any) -> Any:
 
 def _scan_budget(used: int, length: int, candidates: int) -> int:
     used += length * candidates
-    if used > 2_000_000:
+    if used > _REDACTION_SCAN_WORK:
         raise ValueError("Wire redaction exceeds its scan budget")
     return used
 
@@ -213,11 +222,11 @@ def _tool_result_fields(data: Any, limits: Limits) -> tuple[Any, Any, Any, Any, 
     if (
         isinstance(duration, bool)
         or not isinstance(duration, int)
-        or not 0 <= duration <= 2147483647
+        or not 0 <= duration <= _MAX_DURATION_MS
     ):
         raise ValueError("Tool result duration_ms must be a nonnegative integer")
     images = data.get("images", [])
-    if not isinstance(images, list) or len(images) > 100:
+    if not isinstance(images, list) or len(images) > _MAX_RESULT_IMAGES:
         raise ValueError("Tool result images must be a bounded descriptor list")
     # Metadata cannot be used to bypass server-owned annotations or size caps.
     metadata = {k: v for k, v in data.items() if k != "payload"}
@@ -290,7 +299,7 @@ def tool_results_from_dict(data: Any, limits: Limits, max_results: int) -> list[
     if (
         isinstance(max_results, bool)
         or not isinstance(max_results, int)
-        or not 1 <= max_results <= 10000
+        or not 1 <= max_results <= _MAX_RESULTS
     ):
         raise ValueError("max_results must be between 1 and 10000")
     if not isinstance(data, list) or len(data) > max_results:

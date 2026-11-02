@@ -75,6 +75,18 @@ from dendrux.store._redact import (
     without_params as without_params,
 )
 
+DEFAULT_MAX_FOLLOWERS = 500
+DEFAULT_POLL_INTERVAL_S = 0.5
+DEFAULT_POLL_MAX_S = 2.0
+DEFAULT_HEARTBEAT_S = 15.0
+DEFAULT_BUFFER = 1000
+DEFAULT_STATUS_EVERY = 4
+DEFAULT_BATCH = 100
+DEFAULT_STOP_TIMEOUT_S = 5.0
+DEFAULT_POLL_HEALTHY_S = 30.0
+DEFAULT_MAX_DURATION_S = 900.0
+_DEFAULT_TENANT_DIVISOR = 5
+
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
@@ -125,7 +137,7 @@ def _scope_key(tenant_id: TenantScope) -> tuple[str, ...]:
 def _tenant_cap(max_followers: int, value: object) -> int | None:
     """The per-tenant follower cap: a fifth of ``max_followers`` unless given."""
     if isinstance(value, _UnsetType):
-        return max(1, max_followers // 5)
+        return max(1, max_followers // _DEFAULT_TENANT_DIVISOR)
     if value is None:
         return None
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
@@ -465,17 +477,17 @@ class EventFeed:
         self,
         store: RunStore,
         *,
-        max_followers: int = 500,
+        max_followers: int = DEFAULT_MAX_FOLLOWERS,
         max_followers_per_tenant: int | None | _UnsetType = _DEFAULT_SHARE,
-        poll_interval_s: float = 0.5,
-        poll_max_s: float = 2.0,
-        heartbeat_s: float = 15.0,
-        buffer: int = 1000,
-        status_every: int = 4,
-        batch: int = 100,
-        stop_timeout_s: float = 5.0,
+        poll_interval_s: float = DEFAULT_POLL_INTERVAL_S,
+        poll_max_s: float = DEFAULT_POLL_MAX_S,
+        heartbeat_s: float = DEFAULT_HEARTBEAT_S,
+        buffer: int = DEFAULT_BUFFER,
+        status_every: int = DEFAULT_STATUS_EVERY,
+        batch: int = DEFAULT_BATCH,
+        stop_timeout_s: float = DEFAULT_STOP_TIMEOUT_S,
         notifier: EventNotifier | None = None,
-        poll_healthy_s: float = 30.0,
+        poll_healthy_s: float = DEFAULT_POLL_HEALTHY_S,
     ) -> None:
         if isinstance(max_followers, bool) or not isinstance(max_followers, int):
             raise ValueError("max_followers must be a positive int.")
@@ -521,7 +533,7 @@ class EventFeed:
         after_sequence_index: int | None = None,
         include_payloads: bool = False,
         until_terminal: bool = True,
-        max_duration_s: float | None = 900.0,
+        max_duration_s: float | None = DEFAULT_MAX_DURATION_S,
     ) -> Follow:
         """A live feed of ``run_id``'s events after ``after_sequence_index``.
 
@@ -948,7 +960,7 @@ async def _current_head(store: RunStore, run_id: str) -> int | None:
         return value - 1 if value > 0 else None
     head: int | None = None
     while True:  # custom store fallback: page to the end
-        batch = await store.get_events(run_id, after_sequence_index=head, limit=100)
+        batch = await store.get_events(run_id, after_sequence_index=head, limit=DEFAULT_BATCH)
         if not batch:
             return head
         head = batch[-1].sequence_index

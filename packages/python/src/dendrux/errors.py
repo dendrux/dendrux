@@ -62,6 +62,10 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, TypeAlias, get_args
 
 from dendrux import _codes
 
+_IDENTITY_MAX_CHARS = 255
+_ERROR_TEXT_CHARS = 500
+_EXCEPTION_WALK_LIMIT = 1024
+
 if TYPE_CHECKING:
     from collections.abc import Iterable
     from types import TracebackType
@@ -763,7 +767,7 @@ def _safe_status_code(value: Any) -> int | None:
 
 
 def _safe_identity(value: str | None) -> str | None:
-    if not isinstance(value, str) or not 1 <= len(value) <= 255:
+    if not isinstance(value, str) or not 1 <= len(value) <= _IDENTITY_MAX_CHARS:
         return None
     return value if re.fullmatch(r"[A-Za-z0-9_.:/@+\-]+", value) else None
 
@@ -817,7 +821,7 @@ class ProviderError(_KwargsReduceMixin, RuntimeError):
             status_code=status_code,
             provider_code=provider_code,
             error_type=error_type,
-            message=message[:500],
+            message=message[:_ERROR_TEXT_CHARS],
             category=category,
             retryable=retryable,
             timeout_reason=timeout_reason,
@@ -1283,7 +1287,7 @@ def provider_error_in(error: BaseException) -> ProviderError | None:
     """Find a typed provider failure without formatting worker-group messages."""
     pending = [error]
     seen: set[int] = set()
-    for _ in range(1024):
+    for _ in range(_EXCEPTION_WALK_LIMIT):
         if not pending:
             return None
         current = pending.pop()
@@ -1293,7 +1297,7 @@ def provider_error_in(error: BaseException) -> ProviderError | None:
         if isinstance(current, ProviderError):
             return current
         if isinstance(current, BaseExceptionGroup):
-            pending.extend(current.exceptions[:1024])
+            pending.extend(current.exceptions[:_EXCEPTION_WALK_LIMIT])
         if current.__cause__ is not None:
             pending.append(current.__cause__)
         elif current.__context__ is not None:
@@ -1305,7 +1309,7 @@ def provider_error_in(error: BaseException) -> ProviderError | None:
 def _database_failure_in(error: BaseException) -> bool:
     pending = [error]
     seen: set[int] = set()
-    for _ in range(1024):
+    for _ in range(_EXCEPTION_WALK_LIMIT):
         if not pending:
             return False
         current = pending.pop()
@@ -1317,7 +1321,7 @@ def _database_failure_in(error: BaseException) -> bool:
         ):
             return True
         if isinstance(current, BaseExceptionGroup):
-            pending.extend(current.exceptions[:1024])
+            pending.extend(current.exceptions[:_EXCEPTION_WALK_LIMIT])
         if current.__cause__ is not None:
             pending.append(current.__cause__)
         elif current.__context__ is not None:

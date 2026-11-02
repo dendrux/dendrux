@@ -21,6 +21,11 @@ from dendrux.db._settings import put_setting
 from dendrux.db._storage_schema import ACTIVATION_INDEXES, index_ddl
 from dendrux.db.models import Base, DendruxSetting
 
+ACTIVATION_BATCH_SIZE = 5000
+_CONFLICT_SAMPLE_SIZE = 20
+_DEDUPE_PAIR_BATCH = 100
+_DEDUPE_DELETE_BATCH = 200
+
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
@@ -56,7 +61,7 @@ class ActivationConflictError(RuntimeError):
     def __init__(self, table: str, count: int, run_ids: list[str]) -> None:
         self.table = table
         self.count = count
-        self.run_ids = tuple(run_ids[:20])
+        self.run_ids = tuple(run_ids[:_CONFLICT_SAMPLE_SIZE])
         super().__init__(
             f"Conflicting duplicates: table={table} count={count} "
             f"run_ids={','.join(self.run_ids)}. Resolve these duplicates and retry."
@@ -68,7 +73,7 @@ class ActivationIndexConflictError(RuntimeError):
 
 
 async def activate_database(
-    engine: AsyncEngine, *, batch_size: int = 5000, dedupe_only: bool = False
+    engine: AsyncEngine, *, batch_size: int = ACTIVATION_BATCH_SIZE, dedupe_only: bool = False
 ) -> None:
     """Check currency, dedupe and optionally activate; never auto-upgrade a schema.
 
@@ -79,7 +84,7 @@ async def activate_database(
     hold the maintenance ``GET_LOCK`` (their schemas are bootstrapped active, so
     there is nothing to activate); on any error that connection is invalidated.
     """
-    if isinstance(batch_size, bool) or not 1 <= batch_size <= 5000:
+    if isinstance(batch_size, bool) or not 1 <= batch_size <= ACTIVATION_BATCH_SIZE:
         raise ValueError("batch_size must be between 1 and 5000")
     async with engine.connect() as conn:
         await conn.run_sync(lambda c: _activate(c, batch_size, dedupe_only))
@@ -161,8 +166,8 @@ def _duplicates(conn: Connection, table: Table, page: list[Any]) -> tuple[list[s
     identical = []
     conflicting = []
     # Payload memory is bounded independently of the 5k ID cursor batch.
-    for start in range(0, len(pairs), 100):
-        group = pairs[start : start + 100]
+    for start in range(0, len(pairs), _DEDUPE_PAIR_BATCH):
+        group = pairs[start : start + _DEDUPE_PAIR_BATCH]
         ids = sorted({id for row in group for id in row[:2]})
         rows = {row.id: row for row in conn.execute(select(*columns).where(table.c.id.in_(ids)))}
         for id, keeper_id, run_id in group:
@@ -196,7 +201,7 @@ def _preflight(conn: Connection, batch_size: int) -> None:
                 break
             _, conflicts = _duplicates(conn, table, page)
             count += len(conflicts)
-            first_runs = sorted(set(first_runs).union(conflicts))[:20]
+            first_runs = sorted(set(first_runs).union(conflicts))[:_CONFLICT_SAMPLE_SIZE]
             after = page[-1].id
         if count:
             _codes.log_code(
@@ -224,10 +229,10 @@ def _dedupe(conn: Connection, batch_size: int) -> None:
             identical, conflicts = _duplicates(conn, table, page)
             if conflicts:
                 raise ActivationConflictError(
-                    table_name, len(conflicts), sorted(set(conflicts))[:20]
+                    table_name, len(conflicts), sorted(set(conflicts))[:_CONFLICT_SAMPLE_SIZE]
                 )
-            for start in range(0, len(identical), 200):
-                ids = identical[start : start + 200]
+            for start in range(0, len(identical), _DEDUPE_DELETE_BATCH):
+                ids = identical[start : start + _DEDUPE_DELETE_BATCH]
                 conn.execute(delete(table).where(table.c.id.in_(ids)))
             after = page[-1].id
             _checkpoint(conn, table_name, after)

@@ -39,16 +39,30 @@ from dendrux._lifecycle import (
     PauseReason,
     StoredEventType,
 )
-from dendrux._lifecycle import TERMINAL_STATUSES as _TERMINAL_STATUS_VALUES
+from dendrux._lifecycle import TERMINAL_STATUSES as _TERMINAL_STATUSES
 from dendrux._lifecycle import WAITING_STATUSES as _WAITING_STATUS_VALUES
 from dendrux._sentinel import _OMITTED, _OmittedType, _UnsetType
+from dendrux.media._store import DEFAULT_GC_AGE, DEFAULT_GC_LIMIT
+from dendrux.runtime._blob_catalog import MIN_GC_AGE
+from dendrux.runtime._bounds import MAX_SMALL_PAGE
 from dendrux.runtime._entry_checks import entry_checks, require_boolean
+from dendrux.runtime._limit_checks import (
+    MAX_NOTE_METADATA_BYTES,
+    MAX_NOTE_TEXT_BYTES,
+    MAX_PAUSE_REASON_CHARS,
+)
 from dendrux.runtime._tenant_checks import _tenant_scope_chosen
+from dendrux.runtime.context import DEFAULT_LEASE_INTERVAL_S, MIN_LEASE_INTERVAL_S
 from dendrux.runtime.state import UNSCOPED, ReclaimableRun, TenantScope, require_store_method
 from dendrux.skills._internal import is_script, validate_executor
 from dendrux.skills._session import NAMES, SkillSession, continuation, current
 from dendrux.tool import get_tool_def, is_tool
-from dendrux.types import RunStatus
+from dendrux.types import ULID_CHARS, RunStatus
+
+_CANCEL_OUTCOME_LIMIT = 999
+
+DEFAULT_MAX_ITERATIONS = 10
+DEFAULT_TOOL_THREADS_PER_AGENT = 8
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequence
@@ -107,7 +121,7 @@ def _check_result_read_arguments(run_id: Any, tenant_id: Any) -> None:
     from dendrux.types import _validate_identifier
 
     try:
-        _validate_identifier(run_id, "run_id", maximum=26)
+        _validate_identifier(run_id, "run_id", maximum=ULID_CHARS)
         if tenant_id is not None:
             _validate_identifier(tenant_id, "tenant_id")
     except ValueError:
@@ -121,7 +135,7 @@ def _valid_read_id(value: Any) -> bool:
     from dendrux.types import _validate_identifier
 
     try:
-        _validate_identifier(value, "run_id", maximum=26)
+        _validate_identifier(value, "run_id", maximum=ULID_CHARS)
     except ValueError:
         return False
     return True
@@ -134,9 +148,6 @@ MAX_ITERATIONS_CEILING = 200
 _UNSET = _UnsetType()
 
 # Inbox note limits: text is UTF-8 bytes; metadata is encoded JSON.
-MAX_NOTE_TEXT_BYTES = 32 * 1024
-MAX_NOTE_METADATA_BYTES = 8 * 1024
-MAX_PAUSE_REASON_CHARS = 1000
 
 
 def _in_tenant_scope(record: Any, tenant_id: TenantScope) -> bool:
@@ -336,7 +347,7 @@ class _AgentBlobs:
         return await (await self._target()).purge(sha256, tenant_id=tenant_id, reason=reason)
 
     async def collect_garbage(
-        self, *, older_than: timedelta = timedelta(hours=24), limit: int = 1000
+        self, *, older_than: timedelta = DEFAULT_GC_AGE, limit: int = DEFAULT_GC_LIMIT
     ) -> GcResult:
         return await (await self._target()).collect_garbage(older_than=older_than, limit=limit)
 
@@ -358,7 +369,7 @@ class Agent:
     name: str = ""
     prompt: str = ""
     tools: list[Callable[..., Any]] = []
-    max_iterations: int = 10
+    max_iterations: int = DEFAULT_MAX_ITERATIONS
     max_delegation_depth: int | None | _UnsetType = _UNSET
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
@@ -475,9 +486,9 @@ class Agent:
         blob_store: BlobStore | None = None,
         strict_tenancy: bool = True,
         limits: Limits | None = None,
-        tool_threads: int = 8,
+        tool_threads: int = DEFAULT_TOOL_THREADS_PER_AGENT,
         on_governance_change: Literal["warn", "raise"] = "raise",
-        lease_interval: timedelta = timedelta(seconds=30),
+        lease_interval: timedelta = timedelta(seconds=DEFAULT_LEASE_INTERVAL_S),
     ) -> None:
         # --- Subclass guard: block class-level provider ---
         from dendrux.llm.base import LLMProvider as _LLMBase
@@ -489,7 +500,9 @@ class Agent:
                 "Class-level provider creates a live HTTP client at class definition time."
             )
 
-        if not isinstance(lease_interval, timedelta) or lease_interval < timedelta(seconds=5):
+        if not isinstance(lease_interval, timedelta) or lease_interval < timedelta(
+            seconds=MIN_LEASE_INTERVAL_S
+        ):
             _codes.log_code(logging.getLogger(__name__), _codes.LEASE_INTERVAL, run_id=None)
             raise ValueError("lease_interval must be a timedelta of at least 5 seconds")
         self.lease_interval = lease_interval
@@ -871,7 +884,7 @@ class Agent:
             return None
 
         async def _collect() -> object:
-            return await accessor.collect_garbage(older_than=timedelta(hours=1))
+            return await accessor.collect_garbage(older_than=MIN_GC_AGE)
 
         return _collect
 
@@ -2284,12 +2297,12 @@ class Agent:
                         continue
                     outcome = await self._cancel_one(store, rid, signal=False)
                     cascade_count += 1
-                    if len(outcomes) < 999:
+                    if len(outcomes) < _CANCEL_OUTCOME_LIMIT:
                         outcomes.append({"run_id": rid, "outcome": outcome})
                     if outcome != "terminal" and not frontier_signals:
                         to_signal.append(rid)
 
-        if record.status in _TERMINAL_STATUS_VALUES:
+        if record.status in _TERMINAL_STATUSES:
             if cascade:
                 record = await store.get_run(run_id)
                 if record is None:  # pragma: no cover — concurrent deletion
@@ -2308,7 +2321,7 @@ class Agent:
         from dendrux.runtime.runner import _recovery_info
 
         result.recovery = await _recovery_info(store, record)
-        if result.status.value in _TERMINAL_STATUS_VALUES:
+        if result.status.value in _TERMINAL_STATUSES:
             from dendrux.runtime.runner import _attach_undelivered_notes
 
             await _attach_undelivered_notes(store, run_id, result)
@@ -2364,7 +2377,9 @@ class Agent:
                 following: list[str] = []
                 after = None
                 while True:
-                    page = await children(frontier, after=after, limit=500, tenant_id=tenant_id)
+                    page = await children(
+                        frontier, after=after, limit=MAX_SMALL_PAGE, tenant_id=tenant_id
+                    )
                     for child in page:
                         if child in visited:
                             continue
@@ -2373,7 +2388,7 @@ class Agent:
                             break
                         visited.add(child)
                         following.append(child)
-                    if truncated or len(page) < 500:
+                    if truncated or len(page) < MAX_SMALL_PAGE:
                         break
                     after = page[-1]
                 if following:

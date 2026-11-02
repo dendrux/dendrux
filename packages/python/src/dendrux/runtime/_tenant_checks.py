@@ -25,7 +25,7 @@ from dendrux._sentinel import _OmittedType
 from dendrux.errors import TenantScopeRequiredError
 from dendrux.runtime.context import get_delegation_context
 from dendrux.runtime.state import _Unscoped
-from dendrux.types import Limits, _validate_identifier, _validate_persistable
+from dendrux.types import ULID_CHARS, Limits, _validate_identifier, _validate_persistable
 
 if TYPE_CHECKING:
     from dendrux.agent import Agent
@@ -111,7 +111,7 @@ def check_entry(agent: Agent, entry: EntryPoint, *, tenant_id: TenantScope, **fi
 
 def _check_entry_fields(fields: dict[str, Any]) -> None:
     if fields.get("run_id") is not None:
-        _validate_identifier(fields["run_id"], "run_id", maximum=26)
+        _validate_identifier(fields["run_id"], "run_id", maximum=ULID_CHARS)
     if fields.get("idempotency_key") is not None:
         _validate_identifier(fields["idempotency_key"], "idempotency_key")
     for field in ("rejection_reason", "note_text", "note_metadata", "reason"):

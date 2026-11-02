@@ -32,6 +32,7 @@ from dendrux.llm._helpers import (
     resolve_tool_message_call,
 )
 from dendrux.llm._images import (
+    ANTHROPIC_MANY_IMAGE_RULE,
     WireImageRegistry,
     anthropic_image,
     anthropic_image_support,
@@ -43,6 +44,11 @@ from dendrux.llm._images import (
 )
 from dendrux.llm._resilience import (
     DEFAULT_CALL_TIMEOUT,
+    DEFAULT_MAX_RESPONSE_BYTES,
+    DEFAULT_MAX_RETRIES,
+    DEFAULT_MAX_STREAM_BYTES,
+    DEFAULT_MAX_STREAM_TOOL_CALLS,
+    DEFAULT_MAX_TOKENS,
     DEFAULT_STREAM_IDLE_TIMEOUT,
     TIMEOUT_UNSET,
     LoopClients,
@@ -258,22 +264,22 @@ class AnthropicProvider(LLMProvider):
         *,
         model: str,
         api_key: str | None = None,
-        max_tokens: int = 16_000,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
         temperature: float | None = None,
         thinking: bool = False,
         effort: str | None = None,
         show_thinking: bool = True,
         thinking_budget: int | None = None,
         timeout: Any = TIMEOUT_UNSET,
-        max_retries: int = 3,
+        max_retries: int = DEFAULT_MAX_RETRIES,
         cache_ttl: Literal["5m", "1h"] | None = None,
         strict: bool = True,
         call_timeout: float | None = DEFAULT_CALL_TIMEOUT,
         stream_idle_timeout: float | None = DEFAULT_STREAM_IDLE_TIMEOUT,
         stream_total_timeout: float | None = None,
-        max_response_bytes: int = 16 * 1024 * 1024,
-        max_stream_bytes: int = 16 * 1024 * 1024,
-        max_stream_tool_calls: int = 1000,
+        max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
+        max_stream_bytes: int = DEFAULT_MAX_STREAM_BYTES,
+        max_stream_tool_calls: int = DEFAULT_MAX_STREAM_TOOL_CALLS,
     ) -> None:
         """Create an Anthropic provider.
 
@@ -403,7 +409,7 @@ class AnthropicProvider(LLMProvider):
 
     def many_image_rule(self, model: str) -> tuple[int, int] | None:
         """More than 20 images in a request => every image's long side <= 2000 px."""
-        return (20, 2000)
+        return ANTHROPIC_MANY_IMAGE_RULE
 
     def image_capability_key(self, model: str) -> tuple[str, str, str]:
         return ("anthropic", normalize_base_url(self._client.base_url), model)

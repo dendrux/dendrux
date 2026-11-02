@@ -15,6 +15,10 @@ from dendrux.mcp._destination import MCPDestination, MCPDestinationPolicy
 from dendrux.mcp._errors import MCPDestinationDeniedError
 from dendrux.tools._limits import current_image_allowance, current_result_cap
 
+_MAX_CONNECTIONS = 100
+_MAX_KEEPALIVE_CONNECTIONS = 20
+_KEEPALIVE_EXPIRY_S = 5.0
+
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterable
 
@@ -214,9 +218,9 @@ class _PolicyTransport(httpx2.AsyncBaseTransport):
         self._pool = httpcore2.AsyncConnectionPool(
             ssl_context=httpx2.create_ssl_context(trust_env=False),
             network_backend=None if policy is None else _PolicyBackend(policy, on_denied),
-            max_connections=100,
-            max_keepalive_connections=20,
-            keepalive_expiry=5.0,
+            max_connections=_MAX_CONNECTIONS,
+            max_keepalive_connections=_MAX_KEEPALIVE_CONNECTIONS,
+            keepalive_expiry=_KEEPALIVE_EXPIRY_S,
         )
 
     async def handle_async_request(self, request: httpx2.Request) -> httpx2.Response:

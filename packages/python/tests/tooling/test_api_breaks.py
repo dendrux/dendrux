@@ -272,3 +272,79 @@ def test_documentary_inventory_does_not_hide_stale_active_entries() -> None:
 def test_060_changes_reference_060_migration_rows() -> None:
     entries = ab.load_allowlist(COMMITTED_ALLOWLIST)
     assert all(e.b_item.startswith("0.6:") for e in entries)
+
+
+@pytest.mark.parametrize(
+    ("definition", "signature", "breaking"),
+    [
+        ("DEFAULT = 1", "DEFAULT", False),
+        ("DEFAULT = 2", "DEFAULT", True),
+        ("DEFAULT = 1.0", "DEFAULT", True),
+        ("DEFAULT = 2 * 512", "DEFAULT", True),
+        ("DEFAULT = unknown()", "DEFAULT", True),
+    ],
+)
+def test_numeric_default_names_preserve_value_checks(repo, definition, signature, breaking):
+    package = repo / "src/demo"
+    (package / "bounds.py").write_text(definition + "\n")
+    (package / "__init__.py").write_text(
+        f"from .bounds import DEFAULT\ndef keep(a, b={signature}):\n    return a\n"
+    )
+    changes = ab.compute_breaks("demo", repo, "v1", "src")
+    defaults = [b for b in changes if b.kind == "parameter-changed-default"]
+    assert bool(defaults) is breaking
+
+
+def test_changing_the_value_of_the_same_default_name_is_a_break(repo):
+    package = repo / "src/demo"
+    (package / "__init__.py").write_text("DEFAULT = 1\ndef keep(a, b=DEFAULT):\n    return a\n")
+    _git(repo, "commit", "-qam", "name default")
+    (package / "__init__.py").write_text("DEFAULT = 2\ndef keep(a, b=DEFAULT):\n    return a\n")
+    assert any(
+        b.kind == "parameter-changed-default"
+        for b in ab.compute_breaks("demo", repo, "HEAD", "src")
+    )
+
+
+@pytest.mark.parametrize(
+    ("duration_import", "duration_call"),
+    [
+        ("from datetime import timedelta", "timedelta"),
+        ("import datetime", "datetime.timedelta"),
+        ("import datetime as dt", "dt.timedelta"),
+    ],
+)
+def test_named_default_math_and_durations_preserve_values(repo, duration_import, duration_call):
+    package = repo / "src/demo"
+    (package / "__init__.py").write_text(
+        f"{duration_import}\n"
+        f"def keep(a={duration_call}(seconds=30), b=1024 * 1024, c=(0.5, 0.9)):\n    pass\n"
+    )
+    _git(repo, "commit", "-qam", "numeric defaults")
+    (package / "bounds.py").write_text(
+        f"{duration_import}\n"
+        f"LEASE = 30.0\nDURATION = {duration_call}(seconds=LEASE)\n"
+        "MIB = 1024 * 1024\nWARN = (0.5, 0.9)\n"
+    )
+    (package / "__init__.py").write_text(
+        "from .bounds import DURATION, MIB, WARN\ndef keep(a=DURATION, b=MIB, c=WARN):\n    pass\n"
+    )
+    assert ab.compute_breaks("demo", repo, "HEAD", "src") == []
+
+
+def test_numeric_names_inside_unevaluated_default_calls(repo):
+    package = repo / "src/demo"
+    wrapper = "def option(value):\n    raise AssertionError('must not execute')\n"
+    (package / "__init__.py").write_text(wrapper + "def keep(a, b=option(1)):\n    pass\n")
+    _git(repo, "commit", "-qam", "wrapped default")
+    (package / "__init__.py").write_text(
+        wrapper + "DEFAULT = 1\ndef keep(a, b=option(DEFAULT)):\n    pass\n"
+    )
+    assert ab.compute_breaks("demo", repo, "HEAD", "src") == []
+    (package / "__init__.py").write_text(
+        wrapper + "DEFAULT = 2\ndef keep(a, b=option(DEFAULT)):\n    pass\n"
+    )
+    assert any(
+        b.kind == "parameter-changed-default"
+        for b in ab.compute_breaks("demo", repo, "HEAD", "src")
+    )

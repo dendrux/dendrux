@@ -37,8 +37,11 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 
-from dendrux.llm._images import normalize_base_url
+from dendrux.llm._images import ANTHROPIC_MANY_IMAGE_RULE, normalize_base_url
+from dendrux.llm._resilience import DEFAULT_MAX_RESPONSE_BYTES
 from dendrux.llm.openai import OpenAIProvider, _normalize_effort
+
+_MODEL_LIST_TIMEOUT_S = 10.0
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -250,7 +253,7 @@ _catalog_cache: dict[str, dict[str, OpenRouterModel] | None] = {}
 
 async def _fetch_catalog(models_url: str) -> dict[str, OpenRouterModel]:
     """Fetch {model_id -> OpenRouterModel} from OpenRouter. Raises on failure."""
-    async with httpx.AsyncClient(timeout=10.0) as client:
+    async with httpx.AsyncClient(timeout=_MODEL_LIST_TIMEOUT_S) as client:
         resp = await client.get(models_url)
         resp.raise_for_status()
         payload = resp.json()
@@ -328,7 +331,7 @@ class OpenRouterProvider(OpenAIProvider):
         effort: str | None = None,
         anthropic_cache: bool = True,
         extra_body: dict[str, Any] | None = None,
-        max_response_bytes: int = 16 * 1024 * 1024,
+        max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
         **kwargs: Any,
     ) -> None:
         """Create an OpenRouter provider.
@@ -456,7 +459,7 @@ class OpenRouterProvider(OpenAIProvider):
 
     def many_image_rule(self, model: str) -> tuple[int, int] | None:
         """Anthropic's many-image rule for ``anthropic/*`` (and ``~anthropic/*``) slugs."""
-        return (20, 2000) if _is_anthropic_model(model) else None
+        return ANTHROPIC_MANY_IMAGE_RULE if _is_anthropic_model(model) else None
 
     def image_capability_key(self, model: str) -> tuple[str, str, str]:
         return ("openrouter", normalize_base_url(self._client.base_url), model)

@@ -52,6 +52,7 @@ from dendrux._meta_keys import (
     REPLAY_META_KEY as REPLAY_META_KEY,
 )
 from dendrux.context_blocks import _fold_first, fold_first_parts
+from dendrux.runtime._bounds import MAX_SMALL_PAGE
 from dendrux.types import (
     REASONING_MODEL_META_KEY,
     REPLAYED_META_KEY,
@@ -353,7 +354,10 @@ async def conversation_records(
     scope = {"tenant_id": tenant_id} if scoped else {}
     while limit is None or len(records) < limit:
         page = await store.conversation_traces(
-            run_id, after_position=position, limit=min(500, bounds.max_rebuild_rows + 1), **scope
+            run_id,
+            after_position=position,
+            limit=min(MAX_SMALL_PAGE, bounds.max_rebuild_rows + 1),
+            **scope,
         )
         for entry in page.entries:
             count += 1
@@ -427,7 +431,7 @@ async def rebuild_history(
             step = (trace.meta or {}).get(STEP_META_KEY)
             if step is not None:
                 steps.append(_step_from_dict(step))
-        if len(page) < 500:
+        if len(page) < MAX_SMALL_PAGE:
             break
         after = page[-1].order_index
     return RebuiltHistory(messages, steps, records)

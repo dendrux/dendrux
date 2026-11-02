@@ -26,6 +26,12 @@ from dendrux.skills._internal import (
 )
 from dendrux.types import Message, Role, ToolCall, ToolDef, ToolResult
 
+_MAX_SCRIPT_ARGS = 64
+_MAX_SCRIPT_ARG_CHARS = 4096
+_TOOL_NAME_CHARS = 256
+_READ_TEXT_CHARS = 50000
+_SCRIPT_OUTPUT_CHARS = 20000
+
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Iterator, Sequence
 
@@ -232,8 +238,8 @@ class SkillSession:
                     **props,
                     "args": {
                         "type": "array",
-                        "items": {"type": "string", "maxLength": 4096},
-                        "maxItems": 64,
+                        "items": {"type": "string", "maxLength": _MAX_SCRIPT_ARG_CHARS},
+                        "maxItems": _MAX_SCRIPT_ARGS,
                     },
                 },
                 False,
@@ -255,7 +261,7 @@ class SkillSession:
                 await self.emit(
                     GovernanceEventType.SKILL_ACTIVATION_FAILED.value,
                     {
-                        "name": str(name)[:256],
+                        "name": str(name)[:_TOOL_NAME_CHARS],
                         "reason": "denied"
                         if isinstance(name, str) and name in self.denied
                         else "not_found",
@@ -286,8 +292,8 @@ class SkillSession:
             args = params.get("args")
             if (
                 not isinstance(args, list)
-                or len(args) > 64
-                or any(not isinstance(a, str) or len(a) > 4096 for a in args)
+                or len(args) > _MAX_SCRIPT_ARGS
+                or any(not isinstance(a, str) or len(a) > _MAX_SCRIPT_ARG_CHARS for a in args)
             ):
                 return self.failure(
                     tc, "args must contain at most 64 strings of at most 4096 characters."
@@ -346,8 +352,8 @@ class SkillSession:
             resource = skill.files[path]
             assert isinstance(resource, str)
             value = resource
-            truncated = len(value) > 50000
-            text = value[:50000] + (
+            truncated = len(value) > _READ_TEXT_CHARS
+            text = value[:_READ_TEXT_CHARS] + (
                 f"\n[truncated: showing 50000 of {len(value)} chars]" if truncated else ""
             )
             await self.emit(
@@ -393,7 +399,9 @@ class SkillSession:
                 tc.id,
             )
             return self.failure(tc, "invalid_result: executor must return SkillExecutionResult.")
-        truncated = len(result.stdout) > 20000 or len(result.stderr) > 20000
+        truncated = (
+            len(result.stdout) > _SCRIPT_OUTPUT_CHARS or len(result.stderr) > _SCRIPT_OUTPUT_CHARS
+        )
         duration = int((time.monotonic() - start) * 1000)
         await self.emit(
             GovernanceEventType.SKILL_SCRIPT_COMPLETED.value,
@@ -414,8 +422,8 @@ class SkillSession:
             payload=json.dumps(
                 {
                     "exit_code": result.exit_code,
-                    "stdout": result.stdout[:20000],
-                    "stderr": result.stderr[:20000],
+                    "stdout": result.stdout[:_SCRIPT_OUTPUT_CHARS],
+                    "stderr": result.stderr[:_SCRIPT_OUTPUT_CHARS],
                     "truncated": truncated,
                 }
             ),

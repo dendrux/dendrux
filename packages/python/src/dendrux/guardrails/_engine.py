@@ -22,6 +22,9 @@ from typing import TYPE_CHECKING, Any, Literal
 from dendrux.guardrails._detectors import THREAD_SCAN_THRESHOLD
 from dendrux.guardrails._protocol import UNSCANNABLE, Finding, scans_images, scans_text
 
+_PROJECTED_FINDINGS_LIMIT = 128
+_PROJECTION_CACHE_LIMIT = 256
+
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
 
@@ -449,9 +452,9 @@ class GuardrailEngine:
         cleaned, findings, blocked = await self.scan_incoming_message(msg, index=index)
         # Keep block evidence so projection at persistence cannot bypass the
         # loop's governance handling at the subsequent provider boundary.
-        if len(findings) <= 128:
+        if len(findings) <= _PROJECTED_FINDINGS_LIMIT:
             self._projected[digest(cleaned)] = (findings, blocked)
-        if len(self._projected) > 256:
+        if len(self._projected) > _PROJECTION_CACHE_LIMIT:
             self._projected.popitem(last=False)
         return cleaned, findings, blocked
 

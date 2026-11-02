@@ -39,6 +39,7 @@ from dendrux.errors import (
 from dendrux.runtime._tenant_checks import _strict_tenancy_applies
 from dendrux.runtime.state import ClaimResult
 from dendrux.types import (
+    ULID_CHARS,
     ApprovalDecision,
     ImagePart,
     ImageRef,
@@ -51,6 +52,13 @@ from dendrux.types import (
     content_part_from_dict,
     content_part_to_dict,
 )
+
+_HOOK_CACHE_SIZE = 128
+_MAX_DECISIONS = 1000
+_GOVERNANCE_SNAPSHOT_BYTES = 65536
+_MAX_RESULTS = 1000
+_MAX_RESULT_ID_CHARS = 255
+_MAX_RESULT_IMAGES = 100
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Iterable, Sequence
@@ -182,7 +190,7 @@ def pause_validator(
     from dendrux.types import _validate_identifier
 
     if expected_pause_id is not None:
-        _validate_identifier(expected_pause_id, "expected_pause_id", maximum=26)
+        _validate_identifier(expected_pause_id, "expected_pause_id", maximum=ULID_CHARS)
 
     def validate(current: dict[str, Any]) -> None:
         current_id = current.get("pause_id")
@@ -240,7 +248,7 @@ class _ClaimValidationSupport:
     logged: bool = False
 
 
-@lru_cache(maxsize=128)
+@lru_cache(maxsize=_HOOK_CACHE_SIZE)
 def _claim_validation_support(method: Any) -> _ClaimValidationSupport:
     import inspect
 
@@ -916,7 +924,7 @@ def approval_gates_of(
 
 
 def _check_decisions_size(decisions: Mapping[Any, Any]) -> None:
-    if len(decisions) > 1000:
+    if len(decisions) > _MAX_DECISIONS:
         raise ValueError("decisions exceeds its count limit")
 
 
@@ -1033,7 +1041,7 @@ def governance_snapshot(agent: Agent) -> dict[str, Any]:
 
     def digest(value: Any) -> str:
         wire = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
-        if len(wire.encode("utf-8")) > 65536:
+        if len(wire.encode("utf-8")) > _GOVERNANCE_SNAPSHOT_BYTES:
             raise ValueError("Governance fingerprint exceeds 64 KiB")
         return hashlib.sha256(wire.encode("utf-8")).hexdigest()
 
@@ -1172,7 +1180,7 @@ def _require_approval_token(approval: bool, expected: str | None) -> None:
     from dendrux.types import InputValidationError, _validate_identifier
 
     if expected is not None:
-        _validate_identifier(expected, "expected_pause_id", maximum=26)
+        _validate_identifier(expected, "expected_pause_id", maximum=ULID_CHARS)
     if approval and expected is None:
         raise InputValidationError("expected_pause_id", "pause_id_required")
 
@@ -1293,11 +1301,11 @@ async def _resume_status(store: StateStore, run_id: str) -> str | None:
 
 
 def _check_result_identities(run_id: str, results: list[ToolResult]) -> None:
-    if not isinstance(results, list) or len(results) > 1000:
+    if not isinstance(results, list) or len(results) > _MAX_RESULTS:
         raise _invalid_tool_result(run_id, "tool results exceed the batch limit")
     for result in results:
         if not isinstance(result, ToolResult) or any(
-            not isinstance(value, str) or not value or len(value) > 255
+            not isinstance(value, str) or not value or len(value) > _MAX_RESULT_ID_CHARS
             for value in (result.name, result.call_id)
         ):
             raise _invalid_tool_result(run_id, "invalid tool result identity")
@@ -1374,7 +1382,7 @@ def _validated_client_results(
     total = 0
     for result in results:
         try:
-            if len(result.images) > 100:
+            if len(result.images) > _MAX_RESULT_IMAGES:
                 raise ValueError("image count limit")
             data = {
                 "name": result.name,

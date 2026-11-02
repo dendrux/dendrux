@@ -50,12 +50,6 @@ _notifier: ContextVar[LoopNotifier | None] = ContextVar("dendrux_retry_notifier"
 _attempts: ContextVar[list[int] | None] = ContextVar("dendrux_retry_attempts", default=None)
 
 
-# Status codes the Anthropic and OpenAI SDKs treat as retryable. The hook
-# only emits for these — other 4xx (400, 401, 403, 404, 422) are caller
-# errors not retried by the SDK and so not "retry" telemetry.
-_RETRYABLE_STATUS = frozenset({408, 409, 429, 500, 502, 503, 504, 529})
-
-
 @contextmanager
 def telemetry_context(
     *,
@@ -132,7 +126,9 @@ async def _on_response(response: httpx.Response) -> None:
     observability bug never breaks an LLM call.
     """
     try:
-        if response.status_code not in _RETRYABLE_STATUS:
+        from dendrux.llm._resilience import RETRYABLE_HTTP_STATUSES
+
+        if response.status_code not in RETRYABLE_HTTP_STATUSES:
             return
 
         recorder = _recorder.get()

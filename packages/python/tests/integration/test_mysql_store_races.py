@@ -236,7 +236,7 @@ async def test_lock_timeout_rolls_back_whole_attempt(store, mysql_engine, monkey
     run_id, other_id = generate_ulid(), generate_ulid()
     await store.create_run(run_id, "agent")
     await store.create_run(other_id, "agent")
-    monkeypatch.setattr(durability, "_BASE_BACKOFF_S", 0)
+    monkeypatch.setattr(durability, "BASE_BACKOFF_S", 0)
     blocker = await mysql_engine.connect()
     transaction = await blocker.begin()
     await blocker.execute(select(AgentRun.id).where(AgentRun.id == run_id).with_for_update())

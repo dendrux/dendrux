@@ -245,7 +245,7 @@ async def test_retry_exhaustion_logs_only_closed_database_codes(monkeypatch, cap
     class SerializationError(Exception):
         sqlstate = "40001"
 
-    monkeypatch.setattr(durability, "_BASE_BACKOFF_S", 0)
+    monkeypatch.setattr(durability, "BASE_BACKOFF_S", 0)
 
     async def attempt():
         raise DBAPIError(None, None, SerializationError("PRIVATE_VALUE"))

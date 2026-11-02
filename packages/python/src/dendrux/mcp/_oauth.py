@@ -73,6 +73,15 @@ from dendrux.mcp._observability import (
 )
 from dendrux.mcp._source import MCPSource
 
+_CLAIM_TTL_MARGIN_S = 60
+_STATE_MAX_CHARS = 512
+_AUTH_CODE_MAX_CHARS = 4096
+
+DEFAULT_OAUTH_TIMEOUT = 10.0
+DEFAULT_REFRESH_SKEW = 60.0
+DEFAULT_FLOW_TTL = 600.0
+DEFAULT_CLAIM_TTL = 300.0
+
 logger = logging.getLogger(__name__)
 
 _T = TypeVar("_T")
@@ -810,6 +819,39 @@ def _positive(value: float, name: str, *, allow_zero: bool = False) -> float:
     return resolved
 
 
+def _checked_authorization_code(code: str | None) -> str:
+    if (
+        not isinstance(code, str)
+        or not code
+        or len(code) > _AUTH_CODE_MAX_CHARS
+        or not _plain(code)
+    ):
+        raise _flow_error("invalid_callback")
+    return code
+
+
+def _checked_authorization_callback(
+    flow: MCPOAuthFlow,
+    key: MCPAuthKey,
+    now: float,
+    iss: str | None,
+    error: str | None,
+    code: str | None,
+) -> str:
+    if flow.expires_at <= now:
+        raise _flow_error("expired_state")
+    if flow.key != key:
+        raise _flow_error("key_mismatch")
+    if iss is not None:
+        if iss != flow.issuer:
+            raise _flow_error("issuer_mismatch")
+    elif flow.iss_required:
+        raise _flow_error("issuer_mismatch")
+    if error is not None:
+        raise _flow_error("access_denied" if error == "access_denied" else "invalid_callback")
+    return _checked_authorization_code(code)
+
+
 class MCPOAuth:
     """OAuth sign-in and token lifecycle for remote MCP servers.
 
@@ -828,10 +870,10 @@ class MCPOAuth:
         store: MCPOAuthStore,
         client: MCPOAuthClient,
         destination_policy: MCPDestinationPolicy | None = None,
-        oauth_timeout: float = 10.0,
-        refresh_skew: float = 60.0,
-        flow_ttl: float = 600.0,
-        claim_ttl: float = 300.0,
+        oauth_timeout: float = DEFAULT_OAUTH_TIMEOUT,
+        refresh_skew: float = DEFAULT_REFRESH_SKEW,
+        flow_ttl: float = DEFAULT_FLOW_TTL,
+        claim_ttl: float = DEFAULT_CLAIM_TTL,
         allow_insecure_issuer: bool = False,
         allow_legacy_discovery: bool = False,
     ) -> None:
@@ -845,7 +887,7 @@ class MCPOAuth:
         self.refresh_skew = _positive(refresh_skew, "refresh_skew", allow_zero=True)
         self.flow_ttl = _positive(flow_ttl, "flow_ttl")
         self.claim_ttl = _positive(claim_ttl, "claim_ttl")
-        if self.claim_ttl <= self.oauth_timeout + 60:
+        if self.claim_ttl <= self.oauth_timeout + _CLAIM_TTL_MARGIN_S:
             raise ValueError(
                 "MCPOAuth claim_ttl must exceed oauth_timeout by more than 60 seconds."
             )
@@ -1464,26 +1506,14 @@ class MCPOAuth:
     ) -> MCPAuthKey:
         if not isinstance(key, MCPAuthKey):
             raise _flow_error("invalid_argument")
-        if not isinstance(state, str) or not state or len(state) > 512:
+        if not isinstance(state, str) or not state or len(state) > _STATE_MAX_CHARS:
             raise _flow_error("unknown_state")
         flow, cancelled = await self._write(self._take_flow(state))
         if cancelled:
             raise asyncio.CancelledError
         if flow is None:
             raise _flow_error("unknown_state")
-        if flow.expires_at <= self._now():
-            raise _flow_error("expired_state")
-        if flow.key != key:
-            raise _flow_error("key_mismatch")
-        if iss is not None:
-            if iss != flow.issuer:
-                raise _flow_error("issuer_mismatch")
-        elif flow.iss_required:
-            raise _flow_error("issuer_mismatch")
-        if error is not None:
-            raise _flow_error("access_denied" if error == "access_denied" else "invalid_callback")
-        if not isinstance(code, str) or not code or len(code) > 4096 or not _plain(code):
-            raise _flow_error("invalid_callback")
+        code = _checked_authorization_callback(flow, key, self._now(), iss, error, code)
 
         row = await self._load(key)
         if (row.version.generation if row is not None else None) != flow.previous_generation:

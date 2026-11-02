@@ -654,7 +654,7 @@ async def test_retry_treats_deadlock_and_serialization_as_transient(monkeypatch)
 
     import dendrux.runtime.durability as durability
 
-    monkeypatch.setattr(durability, "_BASE_BACKOFF_S", 0.0)
+    monkeypatch.setattr(durability, "BASE_BACKOFF_S", 0.0)
     for code in ("40P01", "40001"):
         calls: list[int] = []
 

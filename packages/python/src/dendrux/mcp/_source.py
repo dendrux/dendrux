@@ -16,6 +16,14 @@ from urllib.parse import parse_qsl, unquote_plus, urlsplit, urlunsplit
 
 from dendrux.mcp._destination import MCPDestinationPolicy  # noqa: TC001
 
+DEFAULT_CONNECT_TIMEOUT = 30.0
+DEFAULT_CALL_TIMEOUT = 120.0
+DEFAULT_MAX_RESULT_BYTES = 1_000_000
+DEFAULT_MAX_REDIRECTS = 20
+DEFAULT_MAX_DISCOVERY_PAGES = 100
+DEFAULT_DISCOVERY_TIMEOUT = 60.0
+DEFAULT_MAX_DISCOVERY_TOOLS = 2000
+
 MCPFailureMode = Literal["strict", "best_effort"]
 MCPPhysicalIdentity = (
     tuple[Literal["http"], str] | tuple[Literal["stdio"], tuple[str, ...], Path | None]
@@ -239,17 +247,17 @@ class MCPSource:
     auth: Any = field(default=None, repr=False, compare=False)
     env: Mapping[str, str] = field(default_factory=dict, repr=False)
     cwd: Path | None = None
-    connect_timeout: float = 30.0
-    call_timeout: float = 120.0
-    max_result_bytes: int = 1_000_000
+    connect_timeout: float = DEFAULT_CONNECT_TIMEOUT
+    call_timeout: float = DEFAULT_CALL_TIMEOUT
+    max_result_bytes: int = DEFAULT_MAX_RESULT_BYTES
     failure_mode: MCPFailureMode = "strict"
     reauthenticate_on_401: bool = False
     follow_redirects: bool = True
-    max_redirects: int = 20
+    max_redirects: int = DEFAULT_MAX_REDIRECTS
     destination_policy: MCPDestinationPolicy | None = field(default=None, repr=False)
-    max_discovery_pages: int = 100
-    discovery_timeout: float = 60.0
-    max_discovery_tools: int = 2000
+    max_discovery_pages: int = DEFAULT_MAX_DISCOVERY_PAGES
+    discovery_timeout: float = DEFAULT_DISCOVERY_TIMEOUT
+    max_discovery_tools: int = DEFAULT_MAX_DISCOVERY_TOOLS
     max_discovery_bytes: int = DEFAULT_MAX_DISCOVERY_BYTES
     trust_replay_hints: bool = False
 
@@ -312,7 +320,7 @@ class MCPSource:
         if self.command is not None and (
             self.reauthenticate_on_401
             or not self.follow_redirects
-            or self.max_redirects != 20
+            or self.max_redirects != DEFAULT_MAX_REDIRECTS
             or self.destination_policy is not None
         ):
             raise ValueError("MCPSource HTTP security settings are only valid for HTTP sources.")
@@ -364,17 +372,17 @@ class MCPSource:
         *,
         headers: Mapping[str, str] | None = None,
         auth: Any = None,
-        connect_timeout: float = 30.0,
-        call_timeout: float = 120.0,
-        max_result_bytes: int = 1_000_000,
+        connect_timeout: float = DEFAULT_CONNECT_TIMEOUT,
+        call_timeout: float = DEFAULT_CALL_TIMEOUT,
+        max_result_bytes: int = DEFAULT_MAX_RESULT_BYTES,
         failure_mode: MCPFailureMode = "strict",
         reauthenticate_on_401: bool = False,
         follow_redirects: bool = True,
-        max_redirects: int = 20,
+        max_redirects: int = DEFAULT_MAX_REDIRECTS,
         destination_policy: MCPDestinationPolicy | None = None,
-        max_discovery_pages: int = 100,
-        discovery_timeout: float = 60.0,
-        max_discovery_tools: int = 2000,
+        max_discovery_pages: int = DEFAULT_MAX_DISCOVERY_PAGES,
+        discovery_timeout: float = DEFAULT_DISCOVERY_TIMEOUT,
+        max_discovery_tools: int = DEFAULT_MAX_DISCOVERY_TOOLS,
         max_discovery_bytes: int = DEFAULT_MAX_DISCOVERY_BYTES,
         trust_replay_hints: bool = False,
     ) -> MCPSource:
@@ -407,13 +415,13 @@ class MCPSource:
         *,
         env: Mapping[str, str] | None = None,
         cwd: str | Path | None = None,
-        connect_timeout: float = 30.0,
-        call_timeout: float = 120.0,
-        max_result_bytes: int = 1_000_000,
+        connect_timeout: float = DEFAULT_CONNECT_TIMEOUT,
+        call_timeout: float = DEFAULT_CALL_TIMEOUT,
+        max_result_bytes: int = DEFAULT_MAX_RESULT_BYTES,
         failure_mode: MCPFailureMode = "strict",
-        max_discovery_pages: int = 100,
-        discovery_timeout: float = 60.0,
-        max_discovery_tools: int = 2000,
+        max_discovery_pages: int = DEFAULT_MAX_DISCOVERY_PAGES,
+        discovery_timeout: float = DEFAULT_DISCOVERY_TIMEOUT,
+        max_discovery_tools: int = DEFAULT_MAX_DISCOVERY_TOOLS,
         trust_replay_hints: bool = False,
     ) -> MCPSource:
         """Configure a trusted local subprocess MCP source."""

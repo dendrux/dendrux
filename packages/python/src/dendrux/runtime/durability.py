@@ -35,13 +35,15 @@ from dendrux.errors import (
 from dendrux.errors import StoreOutcomeUnknown as StoreOutcomeUnknown
 from dendrux.runtime.stores._errors import classify_error
 
+_EXCEPTION_WALK_LIMIT = 1024
+
 if TYPE_CHECKING:
     from collections.abc import Callable, Coroutine
 
 logger = logging.getLogger(__name__)
 
-_MAX_RETRIES = 3
-_BASE_BACKOFF_S = 0.1
+MAX_RETRIES = 3
+BASE_BACKOFF_S = 0.1
 
 T = TypeVar("T")
 
@@ -109,7 +111,7 @@ async def retry_transient_db(
     """
     failure: BaseException | None = None
     last_classified = None
-    for attempt_num in range(_MAX_RETRIES + 1):
+    for attempt_num in range(MAX_RETRIES + 1):
         try:
             return await attempt()
         except (SQLAlchemyError, PersistenceError) as exc:
@@ -117,7 +119,7 @@ async def retry_transient_db(
             if not is_transient_db_error(exc, classify=classify):
                 failure = _database_failure(exc, classify=classify)
                 break
-            if attempt_num < _MAX_RETRIES:
+            if attempt_num < MAX_RETRIES:
                 await _backoff(attempt_num, label, run_id, exc)
     if failure is None:
         failure = PersistenceError(retryable=True)
@@ -143,11 +145,11 @@ def _log_database_failure(classified: Any, run_id: Any = None) -> None:
 
 
 async def _backoff(attempt_num: int, label: str, run_id: str, exc: Exception) -> None:
-    wait = _BASE_BACKOFF_S * (2**attempt_num)
+    wait = BASE_BACKOFF_S * (2**attempt_num)
     logger.warning(
         "Transient DB failure %d/%d for %s (run %s): %s — retrying in %.1fs",
         attempt_num + 1,
-        _MAX_RETRIES,
+        MAX_RETRIES,
         label,
         run_id,
         type(exc).__name__,
@@ -237,7 +239,7 @@ def _is_driver_failure(error: BaseException) -> bool:
     if any(cls.__module__.split(".", 1)[0] in drivers for cls in type(error).__mro__):
         return True
     traceback = error.__traceback__
-    for _ in range(1024):
+    for _ in range(_EXCEPTION_WALK_LIMIT):
         if traceback is None:
             break
         module = traceback.tb_frame.f_globals.get("__name__", "")

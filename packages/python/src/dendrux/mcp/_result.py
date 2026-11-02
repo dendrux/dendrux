@@ -6,6 +6,7 @@ import json
 from typing import Any, Literal
 
 from dendrux.mcp._errors import MCPResultTooLargeError
+from dendrux.mcp._source import DEFAULT_MAX_RESULT_BYTES
 
 
 def _model_dump(value: Any) -> Any:
@@ -56,7 +57,7 @@ def _image_input(block: Any) -> Any:
 def normalize_mcp_result(
     result: Any,
     *,
-    max_result_bytes: int = 1_000_000,
+    max_result_bytes: int = DEFAULT_MAX_RESULT_BYTES,
     images: Literal["parts", "inline"] = "inline",
 ) -> Any:
     """Return a JSON-serializable result while preserving MCP content blocks.

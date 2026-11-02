@@ -211,7 +211,7 @@ _MCP_AUTH_REASONS = frozenset(
 )  # mcp/_errors.MCPAuthorizationReason
 _MCP_SKIP_REASONS = frozenset({"name_unsafe", "duplicate_name", "unknown_tool"})
 _GOVERNANCE_PARTS = frozenset(
-    {"guardrails", "before_tool", "deny", "require_approval", "limits", PauseReason.BUDGET.value}
+    {"guardrails", "before_tool", "deny", "require_approval", "limits", "budget"}
 )  # runtime/submit.governance_snapshot
 BUILTIN_GUARDRAIL_KINDS = frozenset(
     {d.name for d in _PII_DETECTORS} | {d.name for d in _SECRET_DETECTORS} | {UNSCANNABLE}

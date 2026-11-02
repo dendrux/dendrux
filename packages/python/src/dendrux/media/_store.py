@@ -10,6 +10,10 @@ from urllib.parse import quote
 
 from dendrux.errors import ImageLimitError
 
+DEFAULT_GC_AGE = timedelta(hours=24)
+DEFAULT_GC_LIMIT = 1000
+DEFAULT_MEMORY_STORE_BYTES = 256 * 1024 * 1024
+
 if TYPE_CHECKING:
     from datetime import datetime
 
@@ -55,7 +59,7 @@ class InMemoryBlobStore:
     ``calls`` records ``(operation, object_name)`` for every call, in order.
     """
 
-    def __init__(self, max_bytes: int = 256 * 1024 * 1024) -> None:
+    def __init__(self, max_bytes: int = DEFAULT_MEMORY_STORE_BYTES) -> None:
         if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes <= 0:
             raise ValueError("InMemoryBlobStore.max_bytes must be a positive int")
         self.max_bytes = max_bytes
@@ -181,5 +185,5 @@ class BlobAccessor(Protocol):
     ) -> bool: ...
 
     async def collect_garbage(
-        self, *, older_than: timedelta = timedelta(hours=24), limit: int = 1000
+        self, *, older_than: timedelta = DEFAULT_GC_AGE, limit: int = DEFAULT_GC_LIMIT
     ) -> GcResult: ...

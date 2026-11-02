@@ -11,6 +11,7 @@ import typer
 from rich.console import Console
 
 from dendrux._redact import mask_database_url, mask_database_urls_in
+from dendrux.db._activate import ACTIVATION_BATCH_SIZE
 
 app = typer.Typer(name="db", help="Database management commands.", no_args_is_help=True)
 console = Console()
@@ -162,7 +163,9 @@ async def _read_activation_status(url: str) -> tuple[str, str, str, str | None]:
 
 @app.command()
 def activate(
-    batch_size: int = typer.Option(5000, "--batch-size", min=1, max=5000),
+    batch_size: int = typer.Option(
+        ACTIVATION_BATCH_SIZE, "--batch-size", min=1, max=ACTIVATION_BATCH_SIZE
+    ),
 ) -> None:
     """Dedupe and activate format 2 after every writer and reader has been upgraded.
 
@@ -174,7 +177,9 @@ def activate(
 
 @app.command()
 def dedupe(
-    batch_size: int = typer.Option(5000, "--batch-size", min=1, max=5000),
+    batch_size: int = typer.Option(
+        ACTIVATION_BATCH_SIZE, "--batch-size", min=1, max=ACTIVATION_BATCH_SIZE
+    ),
 ) -> None:
     """Only dedupe identical rows, with the same resumable cursors as activate."""
     _run_activation(batch_size, dedupe_only=True)

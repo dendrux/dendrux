@@ -22,6 +22,9 @@ from dendrux._meta_keys import (
 )
 from dendrux.errors import ProviderResponseError
 
+_RAW_CHUNK_BYTES = 1024
+_DECODED_CHUNK_BYTES = 65536
+
 
 async def _deferred_send(
     send: Callable[..., Awaitable[httpx.Response]], request: httpx.Request, **kwargs: Any
@@ -72,8 +75,8 @@ class _RawChunks(httpx.AsyncByteStream):
             # httpx's gzip decoder expands a whole raw chunk in one allocation.
             # Restrict its input too: a single compressed transport chunk must
             # not allocate the full expanded body before we can count it.
-            for start in range(0, len(chunk), 1024):
-                yield chunk[start : start + 1024]
+            for start in range(0, len(chunk), _RAW_CHUNK_BYTES):
+                yield chunk[start : start + _RAW_CHUNK_BYTES]
 
     async def aclose(self) -> None:
         await self.upstream.aclose()
@@ -161,8 +164,8 @@ async def guard_response(response: httpx.Response) -> None:
             # Both SDKs use chunk_size=None. Explicit callers receive fixed
             # size chunks and choose that output buffer size themselves.
             async for decoded in original():
-                for start in range(0, len(decoded), 65536):
-                    piece = decoded[start : start + 65536]
+                for start in range(0, len(decoded), _DECODED_CHUNK_BYTES):
+                    piece = decoded[start : start + _DECODED_CHUNK_BYTES]
                     if not checked and not streaming:
                         budget.account(piece)
                     if chunk_size is None:

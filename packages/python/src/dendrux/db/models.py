@@ -53,7 +53,7 @@ from dendrux.db._dialects._mysql_types import (
     utc_datetime,
     utc_now_default,
 )
-from dendrux.types import RunStatus
+from dendrux.types import COST_DECIMALS, RunStatus
 
 
 def _utc_now() -> datetime.datetime:
@@ -135,7 +135,7 @@ class AgentRun(Base):
     # Aggregate token usage (rolled up from token_usage table)
     total_input_tokens: Mapped[int] = mapped_column(Integer, default=0)
     total_output_tokens: Mapped[int] = mapped_column(Integer, default=0)
-    total_cost_usd: Mapped[float | None] = mapped_column(Numeric(10, 6), nullable=True)
+    total_cost_usd: Mapped[float | None] = mapped_column(Numeric(10, COST_DECIMALS), nullable=True)
     total_cache_read_tokens: Mapped[int] = mapped_column(Integer, default=0)
     total_cache_creation_tokens: Mapped[int] = mapped_column(Integer, default=0)
     # Reasoning/thinking tokens are billed *within* total_output_tokens — this is
@@ -369,7 +369,7 @@ class TokenUsage(Base):
     provider: Mapped[str | None] = mapped_column(nopad_string(100), nullable=True)
     input_tokens: Mapped[int] = mapped_column(Integer, default=0)
     output_tokens: Mapped[int] = mapped_column(Integer, default=0)
-    cost_usd: Mapped[float | None] = mapped_column(Numeric(10, 6), nullable=True)
+    cost_usd: Mapped[float | None] = mapped_column(Numeric(10, COST_DECIMALS), nullable=True)
     duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     cache_read_input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     cache_creation_input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -424,7 +424,7 @@ class LLMInteraction(Base):
     # Token usage
     input_tokens: Mapped[int] = mapped_column(Integer, default=0)
     output_tokens: Mapped[int] = mapped_column(Integer, default=0)
-    cost_usd: Mapped[float | None] = mapped_column(Numeric(10, 6), nullable=True)
+    cost_usd: Mapped[float | None] = mapped_column(Numeric(10, COST_DECIMALS), nullable=True)
     duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     cache_read_input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     cache_creation_input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)

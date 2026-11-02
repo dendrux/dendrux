@@ -7,6 +7,9 @@ from typing import TYPE_CHECKING, Any, TypeVar
 
 from sqlalchemy.engine import URL, make_url
 
+POOL_RECYCLE_S = 1800
+POOL_PRE_PING = True
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
@@ -97,7 +100,7 @@ def engine_options(url: str | URL, supplied: dict[str, Any] | None = None) -> di
     if parsed.drivername.startswith("sqlite"):
         options["connect_args"] = {"check_same_thread": False}
     else:
-        options.update(pool_pre_ping=True, pool_recycle=1800)
+        options.update(pool_pre_ping=POOL_PRE_PING, pool_recycle=POOL_RECYCLE_S)
     incoming, _store = split_database_options(supplied)
     connect = dict(options.get("connect_args", {}))
     connect.update(incoming.pop("connect_args", {}))

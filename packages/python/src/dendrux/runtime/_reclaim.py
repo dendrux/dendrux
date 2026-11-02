@@ -18,6 +18,7 @@ from dendrux._lifecycle import (
 )
 from dendrux.errors import PersistenceError, RunNotFoundError, RunNotReclaimableError
 from dendrux.loops._helpers import order_observations, project_message, record_message, record_tool
+from dendrux.runtime._bounds import MAX_PAGE
 from dendrux.runtime.persistence import PersistenceRecorder, resolve_pending
 from dendrux.runtime.state import claimed_store
 from dendrux.types import (
@@ -261,7 +262,9 @@ async def needs_resolution(
             return False
     return any(
         row.tool_call_id in calls and row.outcome == "started"
-        for row in await store.get_tool_calls(run_id, iteration_index=pause.iteration, limit=1000)
+        for row in await store.get_tool_calls(
+            run_id, iteration_index=pause.iteration, limit=MAX_PAGE
+        )
     )
 
 
@@ -341,7 +344,7 @@ async def _recovery_approval(
         _decided_payload(run_id, outcomes),
         event_id=descriptor["submission_id"],
     )
-    rows = await store.get_tool_calls(run_id, iteration_index=pause.iteration, limit=1000)
+    rows = await store.get_tool_calls(run_id, iteration_index=pause.iteration, limit=MAX_PAGE)
     started = {row.tool_call_id for row in rows if row.outcome == "started"}
     return [
         _recovery_denial(tc, reason)
@@ -600,7 +603,7 @@ async def resolve(
     state, descriptor = await _consume_recovery_submission(store, run_id, ctx, lookups)
     pending = state.get("pending", [])
     rows = (
-        await store.get_tool_calls(run_id, iteration_index=pause.iteration, limit=1000)
+        await store.get_tool_calls(run_id, iteration_index=pause.iteration, limit=MAX_PAGE)
         if pending
         else []
     )

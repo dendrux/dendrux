@@ -92,6 +92,16 @@ from dendrux.mcp._source import (
     source_has_opaque_credentials,
 )
 
+DEFAULT_MAX_CONNECTIONS = 100
+DEFAULT_MAX_IN_FLIGHT_CALLS = 100
+DEFAULT_IDLE_TIMEOUT = 300.0
+DEFAULT_CONNECTION_WAIT_TIMEOUT = 10.0
+DEFAULT_CALL_WAIT_TIMEOUT = 10.0
+DEFAULT_SHUTDOWN_TIMEOUT = 30.0
+DEFAULT_CLOSE_TIMEOUT = 2.0
+DEFAULT_CIRCUIT_FAILURE_THRESHOLD = 5
+DEFAULT_CIRCUIT_RESET_TIMEOUT = 30.0
+
 if TYPE_CHECKING:
     from dendrux.types import ToolDef
 
@@ -1111,15 +1121,15 @@ class MCPRuntime:
     def __init__(
         self,
         *,
-        max_connections: int = 100,
-        max_in_flight_calls: int = 100,
-        idle_timeout: float | None = 300.0,
-        connection_wait_timeout: float = 10.0,
-        call_wait_timeout: float = 10.0,
-        shutdown_timeout: float = 30.0,
-        close_timeout: float = 2.0,
-        circuit_failure_threshold: int | None = 5,
-        circuit_reset_timeout: float = 30.0,
+        max_connections: int = DEFAULT_MAX_CONNECTIONS,
+        max_in_flight_calls: int = DEFAULT_MAX_IN_FLIGHT_CALLS,
+        idle_timeout: float | None = DEFAULT_IDLE_TIMEOUT,
+        connection_wait_timeout: float = DEFAULT_CONNECTION_WAIT_TIMEOUT,
+        call_wait_timeout: float = DEFAULT_CALL_WAIT_TIMEOUT,
+        shutdown_timeout: float = DEFAULT_SHUTDOWN_TIMEOUT,
+        close_timeout: float = DEFAULT_CLOSE_TIMEOUT,
+        circuit_failure_threshold: int | None = DEFAULT_CIRCUIT_FAILURE_THRESHOLD,
+        circuit_reset_timeout: float = DEFAULT_CIRCUIT_RESET_TIMEOUT,
         observer: MCPRuntimeObserver | None = None,
     ) -> None:
         self.max_connections = _positive_int(max_connections, "max_connections")
