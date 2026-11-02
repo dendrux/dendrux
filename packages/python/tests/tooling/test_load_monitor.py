@@ -596,21 +596,21 @@ async def test_stop_finishes_even_if_a_cancel_is_lost(monkeypatch):
         return ""
 
     monkeypatch.setattr(m, "command", probe)
-    sampler = m.ResourceMonitor(None, interval=0.0001)
-    safe_sample = sampler._safe_sample
+    sampler = m.ResourceMonitor(None, interval=0.01)
+    await asyncio.wait_for(sampler.start(), 10)
+    entered = asyncio.Event()
     lost = []
 
     async def swallow_one_cancel(label):
+        entered.set()
         try:
-            await safe_sample(label)
-            await asyncio.sleep(0.05)
+            await asyncio.Event().wait()
         except asyncio.CancelledError:
             if lost:
                 raise
             lost.append(label)
 
     monkeypatch.setattr(sampler, "_safe_sample", swallow_one_cancel)
-    await asyncio.wait_for(sampler.start(), 10)
-    await asyncio.sleep(0.05)
+    await asyncio.wait_for(entered.wait(), 10)
     await asyncio.wait_for(sampler.stop(1), 5)
-    assert lost
+    assert lost == ["sampling"]
