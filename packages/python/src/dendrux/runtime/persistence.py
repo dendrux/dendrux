@@ -55,6 +55,7 @@ from dendrux._meta_keys import (
 from dendrux.errors import ImagePersistenceUnsupportedError, RunFencedError, safe_exception_info
 from dendrux.loops.base import BaseRecorder
 from dendrux.runtime._blob_catalog import edges_for_parts, scrub_inline_images
+from dendrux.runtime._cancel_guard import capture
 from dendrux.runtime._capabilities import capabilities
 from dendrux.runtime.durability import retry_critical, retry_transient_db
 from dendrux.types import (
@@ -290,6 +291,10 @@ class PersistenceRecorder(BaseRecorder):
         guardrail_engine: GuardrailEngine | None = None,
     ) -> None:
         self._store = state_store
+        self._cancel_guard = capture()
+        self._store_calls = (
+            self._cancel_guard.store_calls(state_store) if self._cancel_guard else state_store
+        )
         self._tenant_scope = tenant_scope
         self._provider = provider
         self._run_id = run_id
@@ -331,7 +336,7 @@ class PersistenceRecorder(BaseRecorder):
         from dendrux.runtime.replay import conversation_records
 
         if records is None:
-            records = await conversation_records(self._store, self._run_id, limits=limits)
+            records = await conversation_records(self._store_calls, self._run_id, limits=limits)
         self._known_history.clear()
         self._system_messages.clear()
         for trace in records:
@@ -422,7 +427,7 @@ class PersistenceRecorder(BaseRecorder):
         if kind not in self._state_payloads and refs.get(field):
             from dendrux.errors import PersistenceError
 
-            saved = await self._store.get_trace(self._run_id, refs[field])
+            saved = await self._store_calls.get_trace(self._run_id, refs[field])
             try:
                 if saved is None or saved.trace_kind != "state" or saved.role != "state":
                     raise ValueError("Missing state evidence")
@@ -454,7 +459,7 @@ class PersistenceRecorder(BaseRecorder):
         self._state_payloads[kind] = content
 
         async def write_state() -> None:
-            await self._store.save_trace(
+            await self._store_calls.save_trace(
                 self._run_id,
                 "state",
                 content,
@@ -520,7 +525,7 @@ class PersistenceRecorder(BaseRecorder):
         snapshot = deepcopy(self._loop_state)
 
         async def write() -> None:
-            await self._store.checkpoint_step(
+            await self._store_calls.checkpoint_step(
                 self._run_id,
                 claim_epoch=getattr(self._store, "claim_epoch", 0),
                 loop_state=snapshot,
@@ -553,7 +558,7 @@ class PersistenceRecorder(BaseRecorder):
             return
         raw = self._resume_pause_data
         if raw is None:
-            raw = await self._store.get_pause_state(self._run_id) or {}
+            raw = await self._store_calls.get_pause_state(self._run_id) or {}
         from dendrux.runtime.submit import _submission_payload
 
         payload = _submission_payload(raw)
@@ -594,7 +599,7 @@ class PersistenceRecorder(BaseRecorder):
         )
 
         async def consume() -> None:
-            await self._store.consume_submission(
+            await self._store_calls.consume_submission(
                 self._run_id,
                 claim_epoch=getattr(self._store, "claim_epoch", 0),
                 submission_id=descriptor["submission_id"],
@@ -648,7 +653,7 @@ class PersistenceRecorder(BaseRecorder):
             # boundary compares compact digests without reading history again.
             previous = {
                 _view_identity({"role": t.role, "content": t.content, "meta": t.meta}): t.meta
-                for t in await conversation_records(self._store, self._run_id)
+                for t in await conversation_records(self._store_calls, self._run_id)
             }
             for entry, digest in zip(view, digests, strict=True):
                 entry["meta"] = {**(previous.get(digest) or {}), **entry["meta"]}
@@ -676,14 +681,15 @@ class PersistenceRecorder(BaseRecorder):
         semantic_messages: list[Message] | None = None,
         semantic_tools: list[ToolDef] | None = None,
     ) -> None:
-        if not self._format2:
-            return
-        if self._loop_source is not None:
-            await self._snapshot(iteration - 1)
-            if self._loop_state != self._durable_state:
-                await self._checkpoint()
-        # Ownership can still change between this read and the network send.
-        await self._store.get_run_control(run_id)
+        if self._format2:
+            if self._loop_source is not None:
+                await self._snapshot(iteration - 1)
+                if self._loop_state != self._durable_state:
+                    await self._checkpoint()
+            # Ownership can still change between this read and the network send.
+            await self._store_calls.get_run_control(run_id)
+        if self._cancel_guard is not None:
+            await self._cancel_guard.check(run_id)
 
     async def checkpoint_outcome(self, result: Any, provider_kwargs: Any) -> None:
         """Store pause references and the last execution boundary before releasing ownership."""
@@ -796,7 +802,7 @@ class PersistenceRecorder(BaseRecorder):
             from dendrux.runtime.state import validate_event_index, validate_event_writer
 
             validate_event_writer(self._store)
-            index = await self._store.save_run_event(
+            index = await self._store_calls.save_run_event(
                 self._run_id,
                 event_type=event_type,
                 iteration_index=iteration,
@@ -919,7 +925,7 @@ class PersistenceRecorder(BaseRecorder):
 
         # FAIL-CLOSED with retry
         async def _write() -> None:
-            await self._store.save_trace(
+            await self._store_calls.save_trace(
                 self._run_id,
                 message.role.value,
                 content,
@@ -1009,7 +1015,7 @@ class PersistenceRecorder(BaseRecorder):
         try:
 
             async def _write_interaction() -> None:
-                await self._store.save_llm_interaction(
+                await self._store_calls.save_llm_interaction(
                     self._run_id,
                     iteration_index=iteration,
                     usage=response.usage,
@@ -1052,7 +1058,7 @@ class PersistenceRecorder(BaseRecorder):
             usage_kwargs: dict[str, Any] = {"usage_id": usage_id} if idempotent_usage else {}
 
             async def _write_usage() -> None:
-                await self._store.save_usage(
+                await self._store_calls.save_usage(
                     self._run_id,
                     **usage_kwargs,
                     iteration_index=iteration,
@@ -1107,7 +1113,7 @@ class PersistenceRecorder(BaseRecorder):
 
         # BEST-EFFORT: touch progress for sweep
         try:
-            await self._store.touch_progress(self._run_id)
+            await self._store_calls.touch_progress(self._run_id)
         except RunFencedError:
             raise
         except Exception:
@@ -1135,98 +1141,110 @@ class PersistenceRecorder(BaseRecorder):
     async def on_tool_started(self, run_id: str, tool_call: ToolCall, iteration: int) -> None:
         """Persist an execution intent before an actual server dispatch."""
         if self._format2:
-            from dendrux.runtime.state import EventWrite
-
-            pending = next(
-                (p for p in self._loop_state.get("pending", []) if p["call_id"] == tool_call.id),
-                None,
-            )
-            if (
-                pending is not None
-                and pending["phase"] == "gated"
-                and tool_call.id in self._replay_calls
-                and self._tool_idempotent.get(tool_call.name, False)
-            ):
-                # A requested pause carries recovery identity even when replay
-                # itself needs no approval. Ordinary gates run before this hook.
-                pending["phase"] = "dispatchable"
-                pending["decision_id"] = None
-                await self._checkpoint()
-            if pending is None or pending["phase"] not in ("dispatchable", "approved"):
-                from dendrux.errors import PersistenceError
-
-                code = (
-                    "submission_missing"
-                    if pending and pending["phase"] == "gated"
-                    else "persistence_error"
+            await self._start_checkpointed_tool(run_id, tool_call, iteration)
+        else:
+            try:
+                # Legacy progress writes remain cancellable; format-2 intent
+                # durability is handled by the fenced branch above.
+                await self._store_calls.touch_progress(self._run_id)
+            except RunFencedError:
+                raise
+            except Exception:
+                logger.warning(
+                    "Failed to touch progress for run %s",
+                    self._run_id,
+                    exc_info=safe_exception_info(),
                 )
-                _codes.log_code(logger, _codes.REGISTRY[code], run_id=run_id)
-                raise PersistenceError(code=code)
-            if pending.get("target") == "client":
-                return
-            if pending["phase"] == "approved":
-                # One durable decision authorizes one attempt. A second crash
-                # after this boundary must ask again for a non-idempotent effect.
-                pending["phase"] = "dispatchable"
-                pending["decision_id"] = None
-                await self._checkpoint()
-            if tool_call.id in self._replay_calls:
-                event_id = generate_ulid()
+        if self._cancel_guard is not None:
+            await self._cancel_guard.check(run_id)
 
-                async def replay_event() -> None:
-                    await self._store.save_run_event(
-                        run_id,
-                        event_type=StoredEventType.TOOL_REPLAYED.value,
-                        iteration_index=iteration,
-                        data={"call_id": tool_call.id},
-                        correlation_id=tool_call.id,
-                        event_id=event_id,
-                    )
+    async def _start_checkpointed_tool(
+        self, run_id: str, tool_call: ToolCall, iteration: int
+    ) -> None:
+        pending = next(
+            (p for p in self._loop_state.get("pending", []) if p["call_id"] == tool_call.id),
+            None,
+        )
+        if (
+            pending is not None
+            and pending["phase"] == "gated"
+            and tool_call.id in self._replay_calls
+            and self._tool_idempotent.get(tool_call.name, False)
+        ):
+            # A requested pause carries recovery identity even when replay
+            # itself needs no approval. Ordinary gates run before this hook.
+            pending["phase"] = "dispatchable"
+            pending["decision_id"] = None
+            await self._checkpoint()
+        if pending is None or pending["phase"] not in ("dispatchable", "approved"):
+            from dendrux.errors import PersistenceError
 
-                await retry_critical(replay_event, label="tool_replayed", run_id=run_id)
-                _codes.log_code(logger, _codes.TOOL_REPLAYED, run_id=run_id)
-                self._replayed_calls.add(tool_call.id)
-                self._started_calls.add(tool_call.id)
-                return
-            identity = generate_ulid()
-            idempotent = self._tool_idempotent.get(tool_call.name, False)
-            event = EventWrite(
-                generate_ulid(),
-                StoredEventType.TOOL_STARTED.value,
-                iteration,
-                {"tool_name": tool_call.name, "call_id": tool_call.id, "idempotent": idempotent},
-                tool_call.id,
-                None,
+            code = (
+                "submission_missing"
+                if pending and pending["phase"] == "gated"
+                else "persistence_error"
             )
+            _codes.log_code(logger, _codes.REGISTRY[code], run_id=run_id)
+            raise PersistenceError(code=code)
+        if pending.get("target") == "client":
+            return
+        if pending["phase"] == "approved":
+            # One durable decision authorizes one attempt. A second crash
+            # after this boundary must ask again for a non-idempotent effect.
+            pending["phase"] = "dispatchable"
+            pending["decision_id"] = None
+            await self._checkpoint()
+        await self._record_tool_intent(run_id, tool_call, iteration)
 
-            async def write_intent() -> None:
-                await self._store.start_tool_call(
+    async def _record_tool_intent(self, run_id: str, tool_call: ToolCall, iteration: int) -> None:
+        from dendrux.runtime.state import EventWrite
+
+        if tool_call.id in self._replay_calls:
+            event_id = generate_ulid()
+
+            async def replay_event() -> None:
+                await self._store_calls.save_run_event(
                     run_id,
-                    claim_epoch=getattr(self._store, "claim_epoch", 0),
-                    row_id=identity,
-                    tool_call_id=tool_call.id,
-                    provider_tool_call_id=tool_call.provider_tool_call_id,
-                    tool_name=tool_call.name,
-                    target="server",
-                    params=tool_call.params or None,
+                    event_type=StoredEventType.TOOL_REPLAYED.value,
                     iteration_index=iteration,
-                    idempotent=idempotent,
-                    event=event,
+                    data={"call_id": tool_call.id},
+                    correlation_id=tool_call.id,
+                    event_id=event_id,
                 )
 
-            await retry_critical(write_intent, label="start_tool_call", run_id=run_id)
+            await retry_critical(replay_event, label="tool_replayed", run_id=run_id)
+            _codes.log_code(logger, _codes.TOOL_REPLAYED, run_id=run_id)
+            self._replayed_calls.add(tool_call.id)
             self._started_calls.add(tool_call.id)
             return
-        try:
-            # Legacy progress writes remain cancellable; format-2 intent
-            # durability is handled by the fenced branch above.
-            await self._store.touch_progress(self._run_id)
-        except RunFencedError:
-            raise
-        except Exception:
-            logger.warning(
-                "Failed to touch progress for run %s", self._run_id, exc_info=safe_exception_info()
+        identity = generate_ulid()
+        idempotent = self._tool_idempotent.get(tool_call.name, False)
+        event = EventWrite(
+            generate_ulid(),
+            StoredEventType.TOOL_STARTED.value,
+            iteration,
+            {"tool_name": tool_call.name, "call_id": tool_call.id, "idempotent": idempotent},
+            tool_call.id,
+            None,
+        )
+
+        async def write_intent() -> None:
+            await self._store_calls.start_tool_call(
+                run_id,
+                claim_epoch=getattr(self._store, "claim_epoch", 0),
+                row_id=identity,
+                tool_call_id=tool_call.id,
+                provider_tool_call_id=tool_call.provider_tool_call_id,
+                tool_name=tool_call.name,
+                target="server",
+                params=tool_call.params or None,
+                iteration_index=iteration,
+                idempotent=idempotent,
+                event=event,
             )
+
+        await retry_critical(write_intent, label="start_tool_call", run_id=run_id)
+        self._started_calls.add(tool_call.id)
 
     async def on_llm_call_failed(
         self,
@@ -1352,7 +1370,7 @@ class PersistenceRecorder(BaseRecorder):
                 extra["pii_mapping"] = self._mapping()
 
             async def complete() -> None:
-                await self._store.complete_tool_call(
+                await self._store_calls.complete_tool_call(
                     run_id,
                     claim_epoch=getattr(self._store, "claim_epoch", 0),
                     tool_call_id=tool_call.id,
@@ -1402,7 +1420,7 @@ class PersistenceRecorder(BaseRecorder):
 
         # FAIL-CLOSED with retry: save_tool_call (proof of side effects)
         async def _write_tool() -> None:
-            await self._store.save_tool_call(
+            await self._store_calls.save_tool_call(
                 self._run_id,
                 tool_call_id=tool_call.id,
                 provider_tool_call_id=tool_call.provider_tool_call_id,
@@ -1444,7 +1462,7 @@ class PersistenceRecorder(BaseRecorder):
 
         # BEST-EFFORT: touch progress for sweep
         try:
-            await self._store.touch_progress(self._run_id)
+            await self._store_calls.touch_progress(self._run_id)
         except RunFencedError:
             raise
         except Exception:
