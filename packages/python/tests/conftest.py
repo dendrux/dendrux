@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from tests._helpers import tiers
 from tests._helpers.nlp_models import configure_models
 from tests._helpers.xdist_pg import worker_scoped_pg_url
 
@@ -27,6 +28,18 @@ def pytest_configure(config: pytest.Config) -> None:
     reads the variable.
     """
     configure_models(config)
+    # Keeps the NLP/tldextract disk caches inside the test process. That hook lives in the
+    # integration conftest, which pytest only loads when a collected path is under
+    # tests/integration; a CI shard (or a single file) without one would otherwise skip it.
+    # Running it twice, when both conftests load, only stacks two harmless patches.
+    from tests.integration.conftest import pytest_configure as _scratch_caches
+
+    _scratch_caches(config)
+    for area in tiers.AREAS:
+        config.addinivalue_line("markers", f"area_{area}: tests of the {area} area (by path)")
+    config.addinivalue_line(
+        "markers", "slow: over the time threshold in tests/_helpers/tier_lists/slow.txt"
+    )
     url = os.environ.get(_PG_URL_ENV)
     worker = getattr(config, "workerinput", {}).get("workerid") or os.environ.get(
         "PYTEST_XDIST_WORKER"
@@ -55,3 +68,69 @@ def _no_test_disables_a_dendrux_logger() -> Iterator[None]:
     for name in disabled:
         logging.getLogger(name).disabled = False
     assert not disabled, f"this test disabled the logger(s) {sorted(disabled)[:5]}"
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_cmdline_main(config: pytest.Config) -> None:
+    """Choose the worker count before xdist reads it.
+
+    * A benchmark selection (``-m benchmark``) always runs in one process: benchmarks measure
+      the server and fail under parallel load.
+    * With ``DENDRUX_TEST_PG_URL`` set, no ``-n`` given and a ``-m`` expression from the
+      allowlist ``_PARALLEL_SAFE_MARKEXPRS``, run in parallel (a serial Postgres run is the slow
+      path) with the core count at most 6 workers. Any other expression, or none, could select
+      a benchmark, so it stays serial. ``-n 0`` still means serial; a run that names
+      individual tests (``path::test``) or the conformance suite (whose Postgres cells run only
+      in one process) stays serial.
+    """
+    option = config.option
+    if hasattr(option, "numprocesses") and _selects_benchmarks(option):
+        option.numprocesses = 0  # even with an explicit -n
+        return
+    if not os.environ.get(_PG_URL_ENV) or getattr(option, "numprocesses", 1) is not None:
+        return
+    if getattr(option, "collectonly", False) or not _excludes_benchmarks(option):
+        return
+    if any("::" in arg or "conformance" in arg for arg in config.args):
+        return
+    if getattr(option, "dist", "no") != "no" or "PYTEST_XDIST_WORKER" in os.environ:
+        return
+    option.numprocesses = tiers.default_workers()
+
+
+# The only -m expressions that may switch on automatic parallelism: the ones the Makefile and
+# CI emit. Anything else (for example "not benchmark or flaky") could still select a benchmark.
+_PARALLEL_SAFE_MARKEXPRS = frozenset(
+    {"not benchmark", "not benchmark and not slow", "not slow and not benchmark"}
+)
+
+
+def _excludes_benchmarks(option: object) -> bool:
+    return " ".join((getattr(option, "markexpr", "") or "").split()) in _PARALLEL_SAFE_MARKEXPRS
+
+
+def _selects_benchmarks(option: object) -> bool:
+    expression = getattr(option, "markexpr", "") or ""
+    return "benchmark" in expression and "not benchmark" not in expression
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    """Tag every test with its area, and the slow and flaky ones from the committed lists."""
+    slow = tiers.listed(tiers.load_list("slow.txt"))
+    flaky = tiers.listed(tiers.load_list("flaky.txt"))
+    benchmark = tiers.listed(tiers.load_list("benchmark.txt"))
+    root = tiers.TESTS_ROOT
+    for item in items:
+        path = getattr(item, "path", None)
+        if path is None or not path.is_relative_to(root):
+            continue
+        item.add_marker(
+            getattr(pytest.mark, f"area_{tiers.area_for(path.relative_to(root).as_posix())}")
+        )
+        nodeid = item.nodeid
+        if tiers.in_list(*slow, nodeid):
+            item.add_marker(pytest.mark.slow)
+        if tiers.in_list(*benchmark, nodeid):
+            item.add_marker(pytest.mark.benchmark)
+        if tiers.in_list(*flaky, nodeid):
+            item.add_marker(pytest.mark.flaky(reruns=1))

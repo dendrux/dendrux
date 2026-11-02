@@ -26,18 +26,19 @@ from __future__ import annotations
 import logging
 import os
 import weakref
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from sqlalchemy import UniqueConstraint, inspect, select
 from sqlalchemy.exc import DBAPIError
 
+from dendrux._lifecycle import STORAGE_FORMAT_CHECKPOINTED
 from dendrux.db._dialects import family, mysql, postgres, sqlite
 from dendrux.db._storage_schema import ACTIVATION_INDEXES
 from dendrux.db.models import Base, DendruxSetting
 from dendrux.errors import SchemaNotInitializedError, SchemaOutOfDateError
 
 if TYPE_CHECKING:
-    from collections.abc import Collection, Mapping
+    from collections.abc import Collection, Iterable, Mapping
 
     from sqlalchemy import Connection, Engine
     from sqlalchemy.ext.asyncio import AsyncEngine
@@ -126,21 +127,22 @@ def read_schema_phase(conn: Connection, *, known_tables: Collection[str] | None 
     if not has_settings:
         return "pre-activation"
     settings = dict(
-        conn.execute(
-            select(DendruxSetting.key, DendruxSetting.value).where(
-                DendruxSetting.key.in_(("storage_format", "activate_step"))
-            )
+        cast(
+            "Iterable[tuple[str, str]]",
+            conn.execute(
+                select(DendruxSetting.key, DendruxSetting.value).where(
+                    DendruxSetting.key.in_(("storage_format", "activate_step"))
+                )
+            ).all(),
         )
-        .tuples()
-        .all()
     )
     storage_format = settings.get("storage_format", "1")
     step = settings.get("activate_step")
-    if storage_format not in {"1", "2"}:
+    if storage_format not in {"1", str(STORAGE_FORMAT_CHECKPOINTED)}:
         raise RuntimeError("Invalid dendrux_settings storage format; repair the settings first.")
     if step is not None and step != "done":
         return "activating"
-    if storage_format == "2" and step == "done":
+    if storage_format == str(STORAGE_FORMAT_CHECKPOINTED) and step == "done":
         return "active"
     if storage_format == "1" and step is None:
         return "pre-activation"

@@ -36,6 +36,22 @@ from dataclasses import asdict, dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 from dendrux import _codes
+from dendrux._lifecycle import STORAGE_FORMAT_CHECKPOINTED, GovernanceEventType, StoredEventType
+from dendrux._meta_keys import (
+    IMAGE_NOTES_META_KEY as IMAGE_NOTES_META_KEY,
+)
+from dendrux._meta_keys import (
+    IMAGES_META_KEY as IMAGES_META_KEY,
+)
+from dendrux._meta_keys import (
+    MESSAGE_META_KEY,
+    OBSERVATION_META_KEY,
+    SEED_PREFIX_META_KEY,
+    STEP_META_KEY,
+)
+from dendrux._meta_keys import (
+    PARTS_META_KEY as PARTS_META_KEY,
+)
 from dendrux.errors import ImagePersistenceUnsupportedError, RunFencedError, safe_exception_info
 from dendrux.loops.base import BaseRecorder
 from dendrux.runtime._blob_catalog import edges_for_parts, scrub_inline_images
@@ -44,6 +60,7 @@ from dendrux.runtime.durability import retry_critical, retry_transient_db
 from dendrux.types import (
     ImagePart,
     ImageRef,
+    RunStatus,
     content_part_to_dict,
     generate_ulid,
     tool_call_parse_meta,
@@ -58,9 +75,6 @@ if TYPE_CHECKING:
     from dendrux.runtime.state import StateStore
     from dendrux.types import LLMResponse, Message, ToolCall, ToolDef, ToolResult, ToolTarget
 
-PARTS_META_KEY = "dendrux.parts"
-IMAGES_META_KEY = "dendrux.images"
-IMAGE_NOTES_META_KEY = "dendrux.image_notes"
 
 logger = logging.getLogger(__name__)
 
@@ -175,7 +189,7 @@ def message_trace(
     envelope = _message_to_dict(message)
     envelope.pop("content", None)
     meta = dict(message.meta)
-    meta["dendrux.message"] = envelope
+    meta[MESSAGE_META_KEY] = envelope
     if message.tool_calls:
         meta["tool_calls"] = [_tool_call_evidence(tc) for tc in message.tool_calls]
     if message.reasoning_blocks:
@@ -218,7 +232,7 @@ def seed_trace_kwargs(
     ]
     own_index = max((i for i, m in enumerate(messages) if m.role.value == "user"), default=-1)
     for i, trace in enumerate(traces):
-        trace.meta["dendrux.seed_prefix"] = i < own_index
+        trace.meta[SEED_PREFIX_META_KEY] = i < own_index
         if i == own_index and own_input is not None:
             traces[i] = replace(
                 trace, content=own_input.content, meta={**trace.meta, **own_input.meta}
@@ -232,7 +246,7 @@ def _view_identity(entry: dict[str, Any]) -> str:
         {
             "role": entry["role"],
             "content": meta.get("wire_content", entry["content"]),
-            "message": meta.get("dendrux.message", meta),
+            "message": meta.get(MESSAGE_META_KEY, meta),
         },
         sort_keys=True,
     )
@@ -283,7 +297,7 @@ class PersistenceRecorder(BaseRecorder):
         self._provider_name = provider_name
         self._target_lookup = target_lookup or {}
         self._format2 = (
-            getattr(state_store, "storage_format", 1) == 2
+            getattr(state_store, "storage_format", 1) == STORAGE_FORMAT_CHECKPOINTED
             and capabilities(state_store).checkpointing
         )
         self._order_index = (
@@ -688,9 +702,9 @@ class PersistenceRecorder(BaseRecorder):
                 await self._state_ref("image_view", pause.image_view.to_dict())
             pause.image_view_ref = self._loop_state.get("image_view_ref")
             self._loop_state["phase"] = {
-                "waiting_approval": "awaiting_approval",
-                "waiting_client_tool": "awaiting_client",
-                "waiting_human_input": "awaiting_input",
+                RunStatus.WAITING_APPROVAL.value: "awaiting_approval",
+                RunStatus.WAITING_CLIENT_TOOL.value: "awaiting_client",
+                RunStatus.WAITING_HUMAN_INPUT.value: "awaiting_input",
             }.get(result.status.value, "model_next")
             gates = pause.approval_gates or {}
             remaining = {tc.id for tc in pause.pending_tool_calls}
@@ -715,7 +729,7 @@ class PersistenceRecorder(BaseRecorder):
                 for p in self._loop_state.get("pending", [])
                 if p["call_id"] in remaining
             ]
-            if result.status.value == "waiting_human_input":
+            if result.status.value == RunStatus.WAITING_HUMAN_INPUT.value:
                 await self._state_ref(
                     "clarification",
                     {
@@ -814,7 +828,7 @@ class PersistenceRecorder(BaseRecorder):
 
                 steps = self._loop_source()["steps"]
                 if steps:
-                    trace.meta["dendrux.step"] = _step_to_dict(steps[-1])
+                    trace.meta[STEP_META_KEY] = _step_to_dict(steps[-1])
             if reserved is None:
                 self._order_index += 1
             else:
@@ -1066,7 +1080,7 @@ class PersistenceRecorder(BaseRecorder):
         # FAIL-CLOSED: run event (lifecycle audit trail). correlation_id joins
         # 1:1 to LLMCall.id, mirroring tool.completed -> ToolInvocation.tool_call_id.
         await self._emit_event(
-            "llm.completed",
+            StoredEventType.LLM_COMPLETED.value,
             iteration,
             {
                 "input_tokens": response.usage.input_tokens,
@@ -1158,7 +1172,7 @@ class PersistenceRecorder(BaseRecorder):
                 async def replay_event() -> None:
                     await self._store.save_run_event(
                         run_id,
-                        event_type="tool.replayed",
+                        event_type=StoredEventType.TOOL_REPLAYED.value,
                         iteration_index=iteration,
                         data={"call_id": tool_call.id},
                         correlation_id=tool_call.id,
@@ -1174,7 +1188,7 @@ class PersistenceRecorder(BaseRecorder):
             idempotent = self._tool_idempotent.get(tool_call.name, False)
             event = EventWrite(
                 generate_ulid(),
-                "tool.started",
+                StoredEventType.TOOL_STARTED.value,
                 iteration,
                 {"tool_name": tool_call.name, "call_id": tool_call.id, "idempotent": idempotent},
                 tool_call.id,
@@ -1227,7 +1241,7 @@ class PersistenceRecorder(BaseRecorder):
         info = ErrorInfo.from_error(error)
         try:
             await self._emit_event(
-                "llm.failed",
+                StoredEventType.LLM_FAILED.value,
                 iteration,
                 {
                     "error_info": info.to_dict(),
@@ -1310,7 +1324,7 @@ class PersistenceRecorder(BaseRecorder):
             )
             event = EventWrite(
                 generate_ulid(),
-                "tool.completed",
+                StoredEventType.TOOL_COMPLETED.value,
                 iteration,
                 {
                     "tool_name": tool_call.name,
@@ -1380,7 +1394,7 @@ class PersistenceRecorder(BaseRecorder):
             message = (
                 observation if observation is not None else self.format_observation(tool_result)
             )
-            extra["meta"] = {**meta, "dendrux.observation": _message_to_dict(message)}
+            extra["meta"] = {**meta, OBSERVATION_META_KEY: _message_to_dict(message)}
 
         # FAIL-CLOSED with retry: save_tool_call (proof of side effects)
         async def _write_tool() -> None:
@@ -1403,7 +1417,7 @@ class PersistenceRecorder(BaseRecorder):
 
         # FAIL-CLOSED: run event (lifecycle audit trail)
         await self._emit_event(
-            "tool.completed",
+            StoredEventType.TOOL_COMPLETED.value,
             iteration,
             {
                 "tool_name": tool_call.name,
@@ -1444,7 +1458,7 @@ class PersistenceRecorder(BaseRecorder):
         correlation_id: str | None = None,
     ) -> None:
         """Record a governance event. FAIL-CLOSED with retry."""
-        if self._format2 and event_type == "approval.requested":
+        if self._format2 and event_type == GovernanceEventType.APPROVAL_REQUESTED.value:
             for pending in self._loop_state.get("pending", []):
                 if pending["call_id"] == correlation_id:
                     pending["phase"] = "gated"

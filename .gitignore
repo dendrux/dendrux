@@ -43,6 +43,8 @@ Thumbs.db
 .coverage
 coverage.json
 coverage.json.sources.json
+coverage.json.*.json
+cov-*.data
 htmlcov/
 .pytest_cache/
 .mypy_cache/

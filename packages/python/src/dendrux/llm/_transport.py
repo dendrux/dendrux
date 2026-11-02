@@ -11,11 +11,16 @@ if TYPE_CHECKING:
 
 import httpx
 
+from dendrux._meta_keys import (
+    RESPONSE_BOUND_KEY as _CONFIG,
+)
+from dendrux._meta_keys import (
+    RESPONSE_ERROR_KEY as _ERROR,
+)
+from dendrux._meta_keys import (
+    STREAMING_RESPONSE_KEY as _STREAMING,
+)
 from dendrux.errors import ProviderResponseError
-
-_CONFIG = "dendrux.response_bound"
-_STREAMING = "dendrux.streaming_response"
-_ERROR = "dendrux.response_error"
 
 
 async def _deferred_send(

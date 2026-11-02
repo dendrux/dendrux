@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import traceback
 from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -12,6 +13,7 @@ from sqlalchemy import delete, func, inspect, select, text
 from sqlalchemy.exc import IntegrityError
 
 from dendrux import _codes
+from dendrux._lifecycle import STORAGE_FORMAT_CHECKPOINTED
 from dendrux.db._dialects import is_mysql_family, mysql, postgres, require_family, sqlite
 from dendrux.db._index_check import index_exists, require_index
 from dendrux.db._migration_ddl import build_index_concurrently, drop_index_concurrently, sqlstate
@@ -80,8 +82,36 @@ async def activate_database(
     """
     if isinstance(batch_size, bool) or not 1 <= batch_size <= 5000:
         raise ValueError("batch_size must be between 1 and 5000")
-    async with engine.connect() as conn:
-        await conn.run_sync(lambda c: _activate(c, batch_size, dedupe_only))
+    await _activate_on_own_connection(engine, batch_size, dedupe_only)
+
+
+async def _activate_on_own_connection(
+    engine: AsyncEngine, batch_size: int, dedupe_only: bool
+) -> None:
+    try:
+        async with engine.connect() as conn:
+            await conn.run_sync(lambda c: _activate(c, batch_size, dedupe_only))
+    except BaseException as error:
+        # The connection is closed here; a held exception must not keep its cursors alive.
+        _release_failure_frames(error)
+        raise
+
+
+def _release_failure_frames(error: BaseException) -> None:
+    """Drop the locals of every finished frame the error chain references.
+
+    A failed statement's driver cursor (and its SQLite lock) otherwise lives as long as the
+    caller keeps the exception, so a retry would still find the file locked.
+    """
+    seen: set[int] = set()
+    pending: list[BaseException | None] = [error]
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        traceback.clear_frames(current.__traceback__)
+        pending.extend((current.__cause__, current.__context__))
 
 
 @contextmanager
@@ -102,7 +132,10 @@ def _mysql_active(conn: Connection) -> bool:
     if not inspect(conn).has_table("dendrux_settings"):
         return True
     values = mysql.read_settings(conn)
-    return values.get("storage_format") == "2" and values.get("activate_step") == "done"
+    return (
+        values.get("storage_format") == str(STORAGE_FORMAT_CHECKPOINTED)
+        and values.get("activate_step") == "done"
+    )
 
 
 def _require_current(conn: Connection) -> None:
@@ -182,7 +215,7 @@ def _preflight(conn: Connection, batch_size: int) -> None:
     # Scan every table before deleting anything, including after interruption.
     for table_name, column, _ in ACTIVATION_INDEXES.values():
         table = Base.metadata.tables[table_name]
-        end = conn.execute(select(func.max(table.c.id))).scalar_one()
+        end: str | None = conn.execute(select(func.max(table.c.id))).scalar_one()
         after = ""
         count = 0
         first_runs: list[str] = []
@@ -211,7 +244,7 @@ def _dedupe(conn: Connection, batch_size: int) -> None:
             continue
         put_setting(conn, "activate_step", f"dedupe:{table_name}")
         after = after or ""
-        end = conn.execute(select(func.max(table.c.id))).scalar_one()
+        end: str | None = conn.execute(select(func.max(table.c.id))).scalar_one()
         conn.commit()
         while end is not None:
             page = _page(conn, table, column, after, end, batch_size)
@@ -315,6 +348,6 @@ def _activate(conn: Connection, batch_size: int, dedupe_only: bool) -> None:
         put_setting(conn, "activate_step", "format")
         conn.commit()
         # Publish the format and completion marker atomically.
-        put_setting(conn, "storage_format", "2")
+        put_setting(conn, "storage_format", str(STORAGE_FORMAT_CHECKPOINTED))
         put_setting(conn, "activate_step", "done")
         conn.commit()

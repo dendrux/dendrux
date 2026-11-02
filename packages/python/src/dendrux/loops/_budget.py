@@ -45,6 +45,10 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from dendrux._lifecycle import (
+    FailureReason,
+    PauseReason,
+)
 from dendrux.loops._helpers import notify_governance, record_governance
 from dendrux.types import GovernanceEventType
 
@@ -60,7 +64,7 @@ COST_USD = "cost_usd"
 # Fired-key threshold for "limit reached". warn_at fractions are in (0, 1).
 EXCEEDED = 1.0
 # ``failure_reason`` and ``run.cancelled`` reason of a budget cancel.
-BUDGET_EXCEEDED = "budget_exceeded"
+BUDGET_EXCEEDED = FailureReason.BUDGET_EXCEEDED.value
 # Persisted cost precision (llm_interactions.cost_usd is Numeric(10, 6)).
 _COST_DECIMALS = 6
 # ``budget.exceeded`` reason when an unpriced call stands in for the cost limit.
@@ -95,7 +99,7 @@ class BudgetCarry:
     def from_pause(cls, pause: PauseState) -> BudgetCarry:
         gate = (
             tuple(str(b.get("metric")) for b in pause.budget_exceeded or ())
-            if pause.pause_reason == "budget"
+            if pause.pause_reason == PauseReason.BUDGET.value
             else ()
         )
         return cls(

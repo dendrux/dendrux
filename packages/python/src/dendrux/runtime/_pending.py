@@ -8,9 +8,16 @@ import math
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from dendrux import _codes
+from dendrux._lifecycle import PAUSE_STATUSES as PAUSE_STATUSES
+from dendrux._lifecycle import PENDING_KIND_BY_STATUS, StoredEventType
+from dendrux._lifecycle import PendingKind as PendingKind
+from dendrux._meta_keys import (
+    ERROR_INFO_META_KEY as ERROR_INFO_META_KEY,
+)
+from dendrux.types import RunStatus
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -25,20 +32,17 @@ from dendrux.runtime.state import (
     _Unscoped,
 )
 
-logger = logging.getLogger(__name__)
-
-PAUSE_STATUSES = frozenset(
-    {"paused", "waiting_approval", "waiting_client_tool", "waiting_human_input"}
+PAUSE_WINDOW_EVENT_TYPES = (
+    StoredEventType.RUN_PAUSED.value,
+    StoredEventType.RUN_RESUMED.value,
+    StoredEventType.RUN_COMPLETED.value,
+    StoredEventType.RUN_ERROR.value,
+    StoredEventType.RUN_CANCELLED.value,
 )
-ERROR_INFO_META_KEY = "dendrux.error_info"
 
-PendingKind = Literal["client_tool", "approval", "input", "paused"]
-_KIND_BY_STATUS: dict[str, PendingKind] = {
-    "waiting_client_tool": "client_tool",
-    "waiting_approval": "approval",
-    "waiting_human_input": "input",
-    "paused": "paused",
-}
+_KIND_BY_STATUS = PENDING_KIND_BY_STATUS
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,7 +192,7 @@ def pause_display_calls(
     pause: Mapping[str, Any], params: Mapping[str, dict[str, Any]] | None
 ) -> Any:
     calls = pause.get("pending_tool_calls")
-    if pause.get("status") != "paused":
+    if pause.get("status") != RunStatus.PAUSED.value:
         return approval_calls(calls, params)
     targets = pause.get("pending_targets") or {}
     gates = pause.get("approval_gates") or {}
@@ -438,9 +442,7 @@ async def pause_window_start(
     stmt = select(func.coalesce(func.max(RunEvent.sequence_index), -1)).where(
         RunEvent.agent_run_id == run_id,
         _run_in_scope(run_id, tenant_id),
-        RunEvent.event_type.in_(
-            ["run.paused", "run.resumed", "run.completed", "run.error", "run.cancelled"]
-        ),
+        RunEvent.event_type.in_(PAUSE_WINDOW_EVENT_TYPES),
         RunEvent.sequence_index < pause_seq,
     )
     async with factory() as session:
@@ -461,7 +463,9 @@ async def _whole_pause_summary(
 
     paused_seq = (
         select(func.max(RunEvent.sequence_index))
-        .where(RunEvent.agent_run_id == run_id, RunEvent.event_type == "run.paused")
+        .where(
+            RunEvent.agent_run_id == run_id, RunEvent.event_type == StoredEventType.RUN_PAUSED.value
+        )
         .scalar_subquery()
     )
     stmt = _apply_tenant_scope(
@@ -493,6 +497,26 @@ def _accepts_tenant(method: Any) -> bool:
         return "tenant_id" in inspect.signature(method).parameters
     except (TypeError, ValueError):
         return False
+
+
+def _active_pause_from_events(rows: list[Any]) -> int | None:
+    if (
+        not rows
+        or len(rows) == 1000
+        or rows[-1].event_type
+        not in {StoredEventType.RUN_PAUSED.value, StoredEventType.RUN_RESUME_ABORTED.value}
+    ):
+        return None
+    for row in reversed(rows):
+        if row.event_type in {
+            StoredEventType.RUN_COMPLETED.value,
+            StoredEventType.RUN_ERROR.value,
+            StoredEventType.RUN_CANCELLED.value,
+        }:
+            return None
+        if row.event_type == StoredEventType.RUN_PAUSED.value:
+            return int(row.sequence_index)
+    return None
 
 
 class _PendingReader:
@@ -585,12 +609,17 @@ class _PendingReader:
             self._state.get_run_events,
             run_id,
             tenant_id,
-            event_types=["run.paused", "run.resumed"],
+            event_types=[
+                StoredEventType.RUN_PAUSED.value,
+                StoredEventType.RUN_RESUMED.value,
+                StoredEventType.RUN_RESUME_ABORTED.value,
+                StoredEventType.RUN_COMPLETED.value,
+                StoredEventType.RUN_ERROR.value,
+                StoredEventType.RUN_CANCELLED.value,
+            ],
             limit=1000,
         )
-        if not rows or len(rows) == 1000 or rows[-1].event_type != "run.paused":
-            return None
-        return int(rows[-1].sequence_index)
+        return _active_pause_from_events(rows)
 
     async def _approval_params(
         self, run_id: str, seq: int | None, tenant_id: TenantScope = UNSCOPED

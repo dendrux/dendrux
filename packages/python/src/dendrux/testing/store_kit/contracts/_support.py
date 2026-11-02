@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from dendrux._lifecycle import (
+    StoredEventType,
+)
 from dendrux.runtime.state import EventWrite, LoopStatePatch, TraceWrite
 from dendrux.types import UsageStats, generate_ulid
 
@@ -73,7 +76,7 @@ def start_call_kwargs(call_id: str, **overrides: Any) -> dict[str, Any]:
         "params": {},
         "iteration_index": 0,
         "idempotent": True,
-        "event": event_write("tool.started", call_id),
+        "event": event_write(StoredEventType.TOOL_STARTED.value, call_id),
     }
     values.update(overrides)
     return values
@@ -90,7 +93,7 @@ def complete_call_kwargs(call_id: str, order: int, **overrides: Any) -> dict[str
         "error_message": None,
         "replayed": False,
         "observation": trace_write("tool", '"ok"', order, meta={"call_id": call_id}),
-        "event": event_write("tool.completed", call_id),
+        "event": event_write(StoredEventType.TOOL_COMPLETED.value, call_id),
         "loop_state_patch": LoopStatePatch(remove_pending=(call_id,)),
     }
     values.update(overrides)
@@ -108,7 +111,7 @@ RECLAIM: dict[str, Any] = {
 async def started_run(kit: Kit, tenant: str | None = "t") -> str:
     """A running format-2 run that has started and checkpointed, so it can be reclaimed."""
     run_id = await kit.new_run(tenant_id=tenant)
-    await kit.store.save_run_event(run_id, event_type="run.started")
+    await kit.store.save_run_event(run_id, event_type=StoredEventType.RUN_STARTED.value)
     await kit.store.checkpoint_step(
         run_id,
         claim_epoch=0,

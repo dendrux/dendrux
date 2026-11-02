@@ -1,0 +1,22 @@
+{
+ "bare-number-timeout|dendrux.llm.openrouter|_fetch_catalog": 1,
+ "bare-number-timeout|dendrux.runtime.context|lease_scope": 1,
+ "hardcoded-terminal-status-set|dendrux._wire|<module>": 1,
+ "hardcoded-terminal-status-set|dendrux._wire|_tool_result_fields": 1,
+ "hardcoded-terminal-status-set|dendrux._wire|_wire_answer": 1,
+ "hardcoded-terminal-status-set|dendrux._wire|result_to_dict": 1,
+ "hardcoded-terminal-status-set|dendrux.agent|<module>": 2,
+ "hardcoded-terminal-status-set|dendrux.notifiers.console|<module>": 1,
+ "hardcoded-terminal-status-set|dendrux.notifiers.otel|OpenTelemetryNotifier.on_run_finished": 1,
+ "hardcoded-terminal-status-set|dendrux.runtime._pending|<module>": 2,
+ "hardcoded-terminal-status-set|dendrux.runtime._reclaim|reclaim": 1,
+ "hardcoded-terminal-status-set|dendrux.runtime.replay|<module>": 1,
+ "hardcoded-terminal-status-set|dendrux.runtime.runner|<module>": 1,
+ "hardcoded-terminal-status-set|dendrux.runtime.stores.sql.base|SQLStateStore._sweep_runs": 1,
+ "hardcoded-terminal-status-set|dendrux.runtime.stores.sql.base|SQLStateStore.get_active_pause_sequence": 1,
+ "hardcoded-terminal-status-set|dendrux.runtime.submit|<module>": 2,
+ "hardcoded-terminal-status-set|dendrux.store._follow|<module>": 2,
+ "hardcoded-terminal-status-set|dendrux.store._redact|<module>": 2,
+ "hardcoded-terminal-status-set|dendrux.testing.store_kit.contracts.test_basic|test_finalize_run_if_status_in_is_a_compare_and_swap": 1,
+ "hardcoded-terminal-status-set|dendrux.testing.store_kit.contracts.test_basic|test_list_runs_orders_newest_first_and_filters": 1
+}

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -114,7 +115,9 @@ async def test_sampler_starts_stops_and_still_records_final_sample(monkeypatch):
 
     monkeypatch.setattr(sampler, "sample", sample)
     await sampler.start()
-    await asyncio.sleep(0.035)
+    deadline = time.monotonic() + 10  # bounded: wait for the samples, not for a fixed time
+    while count < 3 and time.monotonic() < deadline:
+        await asyncio.sleep(0.005)
     out = await sampler.stop(10)
     assert out["total_samples"] >= 3 and len(out["samples"]) == 3
     assert sampler.task.done()
@@ -269,10 +272,15 @@ async def test_slow_docker_does_not_delay_app_and_database_sampling(monkeypatch)
 
     monkeypatch.setattr(m, "command", probe)
     sampler = m.ResourceMonitor(None, interval=0.01)
-    await asyncio.wait_for(sampler.start(), 0.2)
-    await asyncio.sleep(0.04)
-    assert sampler.buffer.total >= 3
-    await asyncio.wait_for(sampler.stop(1), 0.2)
+    # Docker stays blocked throughout; the timeouts only guard against a hang, not speed.
+    await asyncio.wait_for(sampler.start(), 10)
+
+    async def three_samples():
+        while sampler.buffer.total < 3:
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(three_samples(), 10)
+    await asyncio.wait_for(sampler.stop(1), 10)
 
 
 async def test_docker_probe_targets_only_named_test_containers_and_parses_io(monkeypatch):
@@ -578,3 +586,31 @@ def test_incomplete_mysql_budget_file_is_refused_before_starting_workload(
         load.main(["--url", MYSQL, "--scenarios", "runs", "--statement-budgets", str(budget)]) == 2
     )
     assert "runs.statements_per_run" in capsys.readouterr().err
+
+
+async def test_stop_finishes_even_if_a_cancel_is_lost(monkeypatch):
+    # Python 3.11's wait_for can drop a cancel when the inner await finishes at the same time.
+    m = monitor_module()
+
+    async def probe(*args):
+        return ""
+
+    monkeypatch.setattr(m, "command", probe)
+    sampler = m.ResourceMonitor(None, interval=0.01)
+    await asyncio.wait_for(sampler.start(), 10)
+    entered = asyncio.Event()
+    lost = []
+
+    async def swallow_one_cancel(label):
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            if lost:
+                raise
+            lost.append(label)
+
+    monkeypatch.setattr(sampler, "_safe_sample", swallow_one_cancel)
+    await asyncio.wait_for(entered.wait(), 10)
+    await asyncio.wait_for(sampler.stop(1), 5)
+    assert lost == ["sampling"]

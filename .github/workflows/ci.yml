@@ -2,7 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # Feature and track branches get the full matrix on every push, so heavy runs happen
+    # here instead of on a developer machine. Never push unreleased security fixes.
+    branches: [main, "feat/**"]
   pull_request:
     branches: [main]
 
@@ -12,11 +14,16 @@ permissions:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
+  # The test suite is split into four shards by test file (tools/test_tiers.py shard: a
+  # deterministic, time-balanced split; `make test-shard-proof` checks it is a disjoint cover).
+  # Each shard measures coverage into its own data file; the python-coverage job below combines
+  # the four files of a leg and applies the coverage floor and the CRAP ratchet to the whole.
+  # Lint, types, architecture and the distribution smoke test run once per leg, on shard 1.
   python:
-    name: python ${{ matrix.python-version }} / SQLAlchemy ${{ matrix.sqlalchemy-version }}
+    name: python ${{ matrix.python-version }} / SQLAlchemy ${{ matrix.sqlalchemy-version }} / shard ${{ matrix.shard }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     defaults:
@@ -29,6 +36,7 @@ jobs:
         # pyproject allows sqlalchemy>=2.0,<3.0: test both minors. 2.1 on every
         # Python, 2.0 on the oldest and newest only (5 jobs).
         sqlalchemy-version: ["2.0.*", "2.1.*"]
+        shard: [1, 2, 3, 4]
         exclude:
           - python-version: "3.12"
             sqlalchemy-version: "2.0.*"
@@ -82,15 +90,19 @@ jobs:
           python -c "import sqlalchemy; print('SQLAlchemy', sqlalchemy.__version__)"
 
       - name: Lint
+        if: matrix.shard == 1
         run: ruff check .
 
       - name: Format check
+        if: matrix.shard == 1
         run: ruff format --check .
 
       - name: Type check
+        if: matrix.shard == 1
         run: mypy src/dendrux/
 
       - name: Architecture rules
+        if: matrix.shard == 1
         run: lint-imports
 
       - name: Require the Postgres backend
@@ -103,26 +115,247 @@ jobs:
 
       - name: Test
         shell: bash
+        env:
+          COVERAGE_FILE: cov-${{ matrix.shard }}.data
         run: |
+          # This shard's test files; every file is in exactly one of the four shards.
+          files=$(python tools/test_tiers.py shard --count 4 --index ${{ matrix.shard }})
           # Benchmarks (marked benchmark) depend on the machine; `make bench` runs them.
-          pytest tests/ -v -rs -n auto -m "not benchmark" --cov=src/dendrux --cov-report=term-missing --cov-report=json:coverage.json --cov-fail-under=80 | tee pytest.log
+          pytest $files -v -rs -n auto -m "not benchmark" --cov=src/dendrux --cov-report= | tee pytest.log
           if grep -q 'DENDRUX_TEST_PG_URL not set' pytest.log; then
             echo "::error::Postgres integration tests were skipped (DENDRUX_TEST_PG_URL not set)."
             exit 1
           fi
 
+      - name: Coverage leg name
+        id: leg
+        shell: bash
+        run: |
+          sqlalchemy="${{ matrix.sqlalchemy-version }}"
+          echo "name=py${{ matrix.python-version }}-sa${sqlalchemy%.*}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload coverage data
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage-${{ steps.leg.outputs.name }}-${{ matrix.shard }}
+          path: packages/python/cov-${{ matrix.shard }}.data
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Build and smoke-test distributions
+        if: matrix.shard == 1
+        run: python scripts/mcp_distribution_smoke.py
+
+  # Combine each leg's four shards with both real MySQL-family reports before judging CRAP.
+  python-coverage:
+    name: coverage py${{ matrix.python-version }} / SQLAlchemy ${{ matrix.sqlalchemy-version }}
+    needs: [python, mysql-family]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: packages/python
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+        sqlalchemy-version: ["2.0.*", "2.1.*"]
+        exclude:
+          - python-version: "3.12"
+            sqlalchemy-version: "2.0.*"
+
+    env:
+      PYTHON_DOTENV_DISABLED: "1"
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: packages/python/pyproject.toml
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Coverage leg name
+        id: leg
+        shell: bash
+        run: |
+          sqlalchemy="${{ matrix.sqlalchemy-version }}"
+          echo "name=py${{ matrix.python-version }}-sa${sqlalchemy%.*}" >> "$GITHUB_OUTPUT"
+
+      - name: Download coverage data
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: coverage-${{ steps.leg.outputs.name }}-*
+          path: packages/python
+          merge-multiple: true
+
+      - name: Download MySQL coverage
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: coverage-mysql
+          path: packages/python
+
+      - name: Download MariaDB coverage
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: coverage-mariadb
+          path: packages/python
+
+      # Every shard and backend must be present; never silently judge partial coverage.
+      - name: Combine coverage and apply the floor
+        shell: bash
+        run: |
+          for shard in 1 2 3 4; do test -s "cov-$shard.data"; done
+          test -s cov-mysql.data
+          test -s cov-mariadb.data
+          coverage combine --keep cov-{1,2,3,4}.data cov-mysql.data cov-mariadb.data
+          coverage report --show-missing --fail-under=80
+          coverage json -o coverage.json
+
       # Tie coverage.json to the source it measured; the ratchet rejects a stale report.
       - name: Record coverage source digests
         if: matrix.python-version == '3.12' && matrix.sqlalchemy-version == '2.1.*'
-        run: python tools/crap_ratchet.py stamp --coverage coverage.json
+        run: python tools/crap_ratchet.py stamp --coverage coverage.json --mysql-coverage
 
-      # Coverage is the same on every leg, so one leg judges it.
+      # Coverage is the same on every leg, so one leg judges it. Enforcing: a new function
+      # over the threshold, or an existing one whose CRAP score rises, fails the build.
       - name: CRAP ratchet
+        id: crap
         if: matrix.python-version == '3.12' && matrix.sqlalchemy-version == '2.1.*'
-        run: python tools/crap_ratchet.py check --report-only --coverage coverage.json
+        run: python tools/crap_ratchet.py check --coverage coverage.json --ci
 
-      - name: Build and smoke-test distributions
-        run: python scripts/mcp_distribution_smoke.py
+      - name: Upload CRAP debt summary
+        if: always() && steps.crap.outcome != 'skipped'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: crap-debt-${{ steps.leg.outputs.name }}
+          path: packages/python/coverage.json.crap.json
+          if-no-files-found: error
+          retention-days: 7
+
+  # Benchmarks: tests that assert how fast something is (marked benchmark, or listed in
+  # tests/_helpers/tier_lists/benchmark.txt). They fail under the parallel load of the shard jobs,
+  # so they run here on their own, in one process, on a single leg. Blocking, like the shards.
+  # Not part of the combined coverage. A failed timing retries once (shared runners vary); a real
+  # slowdown fails both tries.
+  benchmarks:
+    name: benchmarks (python 3.12 / SQLAlchemy 2.1)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: packages/python
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: dendrux
+          POSTGRES_PASSWORD: dendrux
+          POSTGRES_DB: dendrux_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U dendrux"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      PYTHON_DOTENV_DISABLED: "1"
+      DENDRUX_TEST_PG_URL: postgresql+asyncpg://dendrux:dendrux@localhost:5432/dendrux_test
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: packages/python/pyproject.toml
+
+      - name: Install dependencies
+        run: pip install -e ".[dev,all]"
+
+      - name: Install pinned NLP test model
+        run: make test-model-install
+
+      - name: Pin SQLAlchemy 2.1.*
+        run: |
+          pip install "sqlalchemy[asyncio]==2.1.*"
+          python -c "import sqlalchemy; print('SQLAlchemy', sqlalchemy.__version__)"
+
+      - name: Benchmarks
+        shell: bash
+        run: |
+          pytest tests/ -v -rs -n 0 -m benchmark --no-cov --reruns 1 | tee pytest.log
+          if grep -q 'DENDRUX_TEST_PG_URL not set' pytest.log; then
+            echo "::error::Postgres benchmarks were skipped (DENDRUX_TEST_PG_URL not set)."
+            exit 1
+          fi
+
+  # Quality ratchets (packages/python/tools/QUALITY.md): cognitive complexity, duplicate code,
+  # dead code, import cycles and the custom Semgrep rules. Each compares with a committed
+  # baseline and fails only on a new problem or an existing one getting worse. The CRAP ratchet
+  # needs the test coverage, so it runs in the python job above.
+  quality:
+    name: quality gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: packages/python
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            packages/python/pyproject.toml
+            packages/python/tools/semgrep-requirements.txt
+
+      # complexipy, pylint and vulture come from the dev extra (exact pins). Semgrep is a
+      # CI/dev tool only; it is not a dependency of the published package.
+      - name: Install dependencies
+        run: |
+          pip install -e ".[dev]"
+          pip install -r tools/semgrep-requirements.txt
+
+      - name: Cognitive complexity
+        run: python tools/cognitive_ratchet.py check
+
+      - name: Duplicate code
+        run: python tools/duplicate_ratchet.py check
+
+      - name: Dead code
+        run: python tools/vulture_ratchet.py check
+
+      - name: Import cycles
+        run: python tools/import_cycles.py check
+
+      # Information only: where function-level imports hide coupling.
+      - name: Import cycles including function-level imports (report)
+        run: python tools/import_cycles.py report
+
+      - name: Semgrep rule fixtures
+        run: python tools/semgrep_ratchet.py test
+
+      - name: Semgrep rules
+        run: python tools/semgrep_ratchet.py check
 
   # MySQL 8.4 and MariaDB 10.11: schema, maintenance and store suites. The servers come from
   # the committed compose file (CI parity with `make test-dbs-up`); GitHub service containers
@@ -169,13 +402,27 @@ jobs:
         shell: bash
         env:
           SERVER_URL: mysql+asyncmy://root:dendrux_test@127.0.0.1:${{ matrix.port }}/dendrux_ci_test
+          COVERAGE_FILE: cov-${{ matrix.server }}.data
         run: |
           export ${{ matrix.env_name }}="$SERVER_URL"
-          pytest tests/db -v -rs -n 4 -m "not benchmark" --no-cov | tee pytest.log
+          python -c "import asyncmy"
+          pytest tests/db \
+            tests/unit/test_sql_store_contract.py \
+            tests/unit/test_sql_store_rx_errors.py \
+            tests/integration/test_mysql_store_errors.py \
+            -v -rs -n 4 -m "not benchmark" --cov=src/dendrux --cov-report= | tee pytest.log
           if grep -q '${{ matrix.env_name }} not set' pytest.log; then
             echo "::error::${{ matrix.server }} tests were skipped (${{ matrix.env_name }} not set)."
             exit 1
           fi
+
+      - name: Upload coverage data
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage-${{ matrix.server }}
+          path: packages/python/cov-${{ matrix.server }}.data
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Remove ${{ matrix.server }}
         if: always()
@@ -197,8 +444,9 @@ jobs:
           python-version: "3.12"
 
       # griffe reads source statically, so the package itself is not installed.
+      # Keep the standalone checker in step with the pyproject.toml dev pin.
       - name: Install griffe
-        run: pip install "griffe>=1.5,<3.0"
+        run: pip install "griffe==2.4.1"
 
-      - name: Compare the public API with v0.4.1
-        run: python packages/python/tools/api_breaks.py --against v0.4.1
+      - name: Compare the public API with v0.5.0
+        run: python packages/python/tools/api_breaks.py --against v0.5.0

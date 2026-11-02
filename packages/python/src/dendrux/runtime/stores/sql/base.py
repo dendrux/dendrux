@@ -13,6 +13,27 @@ from sqlalchemy import and_, select, true
 from sqlalchemy.exc import SQLAlchemyError
 
 from dendrux import _codes
+from dendrux._lifecycle import (
+    PAUSE_STATUS_VALUES,
+    STORAGE_FORMAT_CHECKPOINTED,
+    TERMINAL_STATUSES,
+    CancelReason,
+    FailureReason,
+    GovernanceEventType,
+    StoredEventType,
+)
+from dendrux._meta_keys import (
+    COMMIT_PROOFS_SESSION_KEY,
+    ERROR_INFO_META_KEY,
+    EVENT_HOOK_SESSION_KEY,
+    FRESH_EVIDENCE_SESSION_KEY,
+    GOVERNANCE_KEY,
+    LATEST_REWRITE_META_KEY,
+    OBSERVATION_META_KEY,
+    STOP_REASON_META_KEY,
+    STORE_SESSION_KEY,
+    TOUCHED_RUNS_SESSION_KEY,
+)
 from dendrux.runtime._blob_catalog import SQLBlobCatalog, write_blob_refs
 from dendrux.runtime.durability import (
     _CommitNotAppliedError,
@@ -104,9 +125,23 @@ from dendrux.runtime.stores.sql._types import (
     SetFields,
 )
 
+PAUSE_INVALIDATION_EVENT_TYPES = (
+    StoredEventType.RUN_RESUMED.value,
+    StoredEventType.RUN_COMPLETED.value,
+    StoredEventType.RUN_ERROR.value,
+    StoredEventType.RUN_CANCELLED.value,
+)
+
 logger = logging.getLogger(__name__)
 
 _COMMIT_READBACK_LOCK_TIMEOUT_MS = 5000
+
+
+async def _write_release_event(
+    session: AsyncSession, run_id: str, won: Any, event: EventWrite | None
+) -> None:
+    if won and event is not None:
+        await _write_event(session, run_id, event)
 
 
 class _UpdatedRows:
@@ -507,9 +542,9 @@ class SQLStateStore(SQLBlobCatalog):
     def _remember_write(
         self, session: AsyncSession, table: Any, predicate: Any, expected: dict[str, Any]
     ) -> None:
-        session.info.setdefault("dendrux.commit_proofs", []).append((table, predicate, expected))
+        session.info.setdefault(COMMIT_PROOFS_SESSION_KEY, []).append((table, predicate, expected))
         if "agent_run_id" in expected:
-            session.info.setdefault("dendrux.touched_runs", set()).add(expected["agent_run_id"])
+            session.info.setdefault(TOUCHED_RUNS_SESSION_KEY, set()).add(expected["agent_run_id"])
 
     def _remember_run_values(
         self, session: AsyncSession, run_id: str, values: dict[str, Any]
@@ -518,7 +553,7 @@ class SQLStateStore(SQLBlobCatalog):
 
         from dendrux.db.models import AgentRun
 
-        session.info.setdefault("dendrux.touched_runs", set()).add(run_id)
+        session.info.setdefault(TOUCHED_RUNS_SESSION_KEY, set()).add(run_id)
         expected = {
             key: value for key, value in values.items() if not isinstance(value, ClauseElement)
         }
@@ -541,7 +576,7 @@ class SQLStateStore(SQLBlobCatalog):
         operation = _database_operation.get()
         owner, name, arguments = operation if operation is not None else (None, "", {})
         run_id = arguments.get("run_id")
-        touched = session.info.setdefault("dendrux.touched_runs", set())
+        touched = session.info.setdefault(TOUCHED_RUNS_SESSION_KEY, set())
         touched.update(run_ids)
         touched.update(arguments.get("run_ids", ()))
         if run_id is not None:
@@ -556,8 +591,8 @@ class SQLStateStore(SQLBlobCatalog):
         await session.flush()
         try:
             await session.commit()
-            session.info.pop("dendrux.commit_proofs", None)
-            session.info.pop("dendrux.fresh_evidence", None)
+            session.info.pop(COMMIT_PROOFS_SESSION_KEY, None)
+            session.info.pop(FRESH_EVIDENCE_SESSION_KEY, None)
             return
         except SQLAlchemyError as exc:
             classified = self.classify_db_error(exc)
@@ -577,8 +612,8 @@ class SQLStateStore(SQLBlobCatalog):
         # covers submission claims and every other CAS without a retry identity.
         if name in ("claim_paused_run", "submit_and_claim", "reclaim_run", "release_run_claim"):
             unknown()
-        proofs = session.info.pop("dendrux.commit_proofs", [])
-        fresh_evidence = session.info.pop("dendrux.fresh_evidence", False)
+        proofs = session.info.pop(COMMIT_PROOFS_SESSION_KEY, [])
+        fresh_evidence = session.info.pop(FRESH_EVIDENCE_SESSION_KEY, False)
         transitions = {
             "finalize_run",
             "finalize_run_if_status_in",
@@ -636,9 +671,11 @@ class SQLStateStore(SQLBlobCatalog):
             elif name == "finalize_run" and arguments.get("expected_current_status") is not None:
                 predicate &= AgentRun.status == arguments["expected_current_status"]
             elif name in ("try_pause_run", "pause_with_event"):
-                predicate &= (AgentRun.status == "running") & AgentRun.cancel_requested.is_(False)
+                predicate &= (
+                    AgentRun.status == RunStatus.RUNNING.value
+                ) & AgentRun.cancel_requested.is_(False)
             elif name in ("pause_run", "consume_submission") and epoch is not None:
-                predicate &= AgentRun.status == "running"
+                predicate &= AgentRun.status == RunStatus.RUNNING.value
             if name == "consume_submission":
                 predicate &= (
                     self.json_get(AgentRun.loop_state, ("submission", "submission_id"), "str")
@@ -723,7 +760,7 @@ class SQLStateStore(SQLBlobCatalog):
         """Update a predicate match; locked readback uses the complete immutable PK."""
         from sqlalchemy import and_, select, update
 
-        session.info["dendrux.store"] = self
+        session.info[STORE_SESSION_KEY] = self
         columns = tuple(table.primary_key.columns)
         if not columns or len(pk) != len(columns):
             raise ValueError("pk must supply the complete immutable primary key")
@@ -873,7 +910,7 @@ class SQLStateStore(SQLBlobCatalog):
         _positive_page(page_size)
         if page_size > 1000:
             raise ValueError("page_size must not exceed 1000")
-        session.info["dendrux.store"] = self
+        session.info[STORE_SESSION_KEY] = self
         columns = tuple(table.primary_key.columns)
         if not columns or not returning:
             raise ValueError("a complete primary key and returning projection are required")
@@ -895,7 +932,7 @@ class SQLStateStore(SQLBlobCatalog):
                 await session.execute(
                     update(table).where(false()).ordered_values(*self._reservation_values(table))
                 )
-        keys = list((await session.execute(locking_read)).tuples().all())
+        keys = list((await session.execute(locking_read)).all())
         if not keys:
             return []
         membership = tuple_(*columns).in_(keys)
@@ -931,8 +968,8 @@ class SQLStateStore(SQLBlobCatalog):
             class_=AsyncSession,
             expire_on_commit=False,
             info={
-                "dendrux.store": self,
-                "dendrux.event_hook": lambda session, run_id: self._after_event_insert(
+                STORE_SESSION_KEY: self,
+                EVENT_HOOK_SESSION_KEY: lambda session, run_id: self._after_event_insert(
                     session, run_id
                 ),
             },
@@ -1016,7 +1053,7 @@ class SQLStateStore(SQLBlobCatalog):
             or "1"
         )
         # Activation is one-way; format 1 must still observe later activation.
-        if storage_format == 2:
+        if storage_format == STORAGE_FORMAT_CHECKPOINTED:
             self._format2_active = True
         return storage_format
 
@@ -1107,7 +1144,7 @@ class SQLStateStore(SQLBlobCatalog):
         async def _attempt() -> CreateRunResult:
             nonlocal absent_retry
             async with self._session_factory() as session:
-                session.info["dendrux.store"] = self
+                session.info[STORE_SESSION_KEY] = self
                 if parent_run_id is not None:
                     await self.reserve_parent_writer(session, parent_run_id)
                 storage_format = await self._creation_storage_format(session)
@@ -1130,9 +1167,11 @@ class SQLStateStore(SQLBlobCatalog):
                         raise RunCancelledError(run_id, parent_run_id)
                 run = AgentRun(
                     storage_format=storage_format,
-                    pii_mapping=pii_mapping if storage_format == 2 else None,
+                    pii_mapping=pii_mapping
+                    if storage_format == STORAGE_FORMAT_CHECKPOINTED
+                    else None,
                     loop_state=_loop_state_at_creation(self, run_id, meta)
-                    if storage_format == 2
+                    if storage_format == STORAGE_FORMAT_CHECKPOINTED
                     else None,
                     id=run_id,
                     agent_name=agent_name,
@@ -1166,7 +1205,7 @@ class SQLStateStore(SQLBlobCatalog):
                     },
                 )
                 try:
-                    if seed_traces and storage_format == 2:
+                    if seed_traces and storage_format == STORAGE_FORMAT_CHECKPOINTED:
                         await session.flush()
                         for trace in seed_traces:
                             await self._insert_trace(session, run_id, trace)
@@ -1257,15 +1296,9 @@ class SQLStateStore(SQLBlobCatalog):
         """
         from sqlalchemy import select
 
-        from dendrux.db.enums import AgentRunStatus
         from dendrux.db.models import AgentRun
 
-        terminal = {
-            AgentRunStatus.SUCCESS,
-            AgentRunStatus.ERROR,
-            AgentRunStatus.CANCELLED,
-            AgentRunStatus.MAX_ITERATIONS,
-        }
+        terminal = TERMINAL_STATUSES
 
         async with self._session_factory() as session:
             stmt = select(AgentRun).where(
@@ -1309,7 +1342,7 @@ class SQLStateStore(SQLBlobCatalog):
         from dendrux.db.models import AgentRun
         from dendrux.errors import RunFencedError
 
-        session.info["dendrux.store"] = self
+        session.info[STORE_SESSION_KEY] = self
 
         stmt = update(AgentRun).where(AgentRun.id == run_id)
         if claim_epoch is not None:
@@ -1320,7 +1353,10 @@ class SQLStateStore(SQLBlobCatalog):
         if claim_epoch is not None:
             values.setdefault(
                 "last_progress_at",
-                case((AgentRun.storage_format == 2, now), else_=AgentRun.last_progress_at),
+                case(
+                    (AgentRun.storage_format == STORAGE_FORMAT_CHECKPOINTED, now),
+                    else_=AgentRun.last_progress_at,
+                ),
             )
         self._remember_run_values(session, run_id, values)
         result = await session.execute(
@@ -1379,9 +1415,11 @@ class SQLStateStore(SQLBlobCatalog):
                 self._write_conflict(values["agent_run_id"])
             raise
         if inserted is not None:
-            session.info["dendrux.fresh_evidence"] = True
+            session.info[FRESH_EVIDENCE_SESSION_KEY] = True
             return str(inserted)
-        row = (await session.execute(select(model).where(model.id == values["id"]))).scalar_one()
+        row: Any = (
+            await session.execute(select(model).where(model.id == values["id"]))
+        ).scalar_one()
         equal = row.agent_run_id == values["agent_run_id"]
         if digest is not None:
             equal = equal and row.content_digest == digest
@@ -1674,16 +1712,16 @@ class SQLStateStore(SQLBlobCatalog):
 
             pointer = {"trace_id": trace.trace_id, "order_index": trace.order_index}
             current_order = self.json_get(
-                AgentRun.meta, ("dendrux.latest_rewrite", "order_index"), "int"
+                AgentRun.meta, (LATEST_REWRITE_META_KEY, "order_index"), "int"
             )
             metadata = self.json_patch_expr(
-                AgentRun.meta, SetFields({"dendrux.latest_rewrite": pointer})
+                AgentRun.meta, SetFields({LATEST_REWRITE_META_KEY: pointer})
             )
             if metadata is None:
                 current_meta = await session.scalar(
                     self.lock_clause(select(AgentRun.meta).where(AgentRun.id == run_id), "update")
                 )
-                metadata = {**(current_meta or {}), "dendrux.latest_rewrite": pointer}
+                metadata = {**(current_meta or {}), LATEST_REWRITE_META_KEY: pointer}
             await session.execute(
                 update(AgentRun)
                 .where(
@@ -2156,7 +2194,7 @@ class SQLStateStore(SQLBlobCatalog):
             rewrite_order = None
             if not include_superseded:
                 pointer = await session.scalar(
-                    select(AgentRun.meta["dendrux.latest_rewrite"]).where(
+                    select(AgentRun.meta[LATEST_REWRITE_META_KEY]).where(
                         AgentRun.id == run_id,
                         _run_in_scope(run_id, tenant_id),
                     )
@@ -2352,7 +2390,7 @@ class SQLStateStore(SQLBlobCatalog):
                     await session.execute(
                         update(AgentRun)
                         .where(AgentRun.id == run_id)
-                        .values(meta={**(old_meta or {}), "dendrux.error_info": error_info})
+                        .values(meta={**(old_meta or {}), ERROR_INFO_META_KEY: error_info})
                     )
                 await self._write_tx(session)
                 return (
@@ -2513,7 +2551,8 @@ class SQLStateStore(SQLBlobCatalog):
                 {**(current_state or {}), "phase": "finalizing"}, type_=AgentRun.loop_state.type
             )
         values["loop_state"] = case(
-            (AgentRun.storage_format == 2, finalized_state), else_=AgentRun.loop_state
+            (AgentRun.storage_format == STORAGE_FORMAT_CHECKPOINTED, finalized_state),
+            else_=AgentRun.loop_state,
         )
         if iteration_count is not None:
             values["iteration_count"] = iteration_count
@@ -2819,7 +2858,7 @@ class SQLStateStore(SQLBlobCatalog):
                 seq = await _insert_event_locked(
                     session,
                     run_id,
-                    "run.paused",
+                    StoredEventType.RUN_PAUSED.value,
                     event_data,
                     iteration_index=iteration_count or 0,
                 )
@@ -3066,7 +3105,8 @@ class SQLStateStore(SQLBlobCatalog):
                 )
                 if claim_epoch is not None:
                     stmt = stmt.where(
-                        AgentRun.claim_epoch == claim_epoch, AgentRun.status == "running"
+                        AgentRun.claim_epoch == claim_epoch,
+                        AgentRun.status == RunStatus.RUNNING.value,
                     )
                 self._remember_run_values(session, run_id, values)
                 await session.execute(stmt)
@@ -3116,16 +3156,27 @@ class SQLStateStore(SQLBlobCatalog):
 
         seq = (
             select(func.max(RunEvent.sequence_index))
-            .where(RunEvent.agent_run_id == run_id, RunEvent.event_type == "run.paused")
+            .where(
+                RunEvent.agent_run_id == run_id,
+                RunEvent.event_type == StoredEventType.RUN_PAUSED.value,
+            )
+            .scalar_subquery()
+        )
+        aborted = (
+            select(func.coalesce(func.max(RunEvent.sequence_index), -1))
+            .where(
+                RunEvent.agent_run_id == run_id,
+                RunEvent.event_type == StoredEventType.RUN_RESUME_ABORTED.value,
+            )
             .scalar_subquery()
         )
         invalidated = (
             select(func.coalesce(func.max(RunEvent.sequence_index), -1))
             .where(
                 RunEvent.agent_run_id == run_id,
-                RunEvent.event_type.in_(
-                    ["run.resumed", "run.completed", "run.error", "run.cancelled"]
-                ),
+                RunEvent.event_type.in_(PAUSE_INVALIDATION_EVENT_TYPES),
+                (RunEvent.event_type != StoredEventType.RUN_RESUMED.value)
+                | (RunEvent.sequence_index > aborted),
             )
             .scalar_subquery()
         )
@@ -3136,14 +3187,7 @@ class SQLStateStore(SQLBlobCatalog):
                         select(seq).where(
                             AgentRun.id == run_id,
                             seq > invalidated,
-                            AgentRun.status.in_(
-                                [
-                                    "waiting_client_tool",
-                                    "waiting_human_input",
-                                    "waiting_approval",
-                                    "paused",
-                                ]
-                            ),
+                            AgentRun.status.in_(PAUSE_STATUS_VALUES),
                         ),
                         tenant_id,
                     )
@@ -3167,7 +3211,9 @@ class SQLStateStore(SQLBlobCatalog):
             select(func.coalesce(func.max(RunEvent.sequence_index), -1))
             .where(
                 RunEvent.agent_run_id == run_id,
-                RunEvent.event_type.in_(["run.paused", "run.resumed"]),
+                RunEvent.event_type.in_(
+                    [StoredEventType.RUN_PAUSED.value, StoredEventType.RUN_RESUMED.value]
+                ),
                 RunEvent.sequence_index < pause_sequence,
             )
             .scalar_subquery()
@@ -3177,7 +3223,7 @@ class SQLStateStore(SQLBlobCatalog):
             .where(
                 RunEvent.agent_run_id == run_id,
                 _run_in_scope(run_id, tenant_id),
-                RunEvent.event_type == "approval.requested",
+                RunEvent.event_type == GovernanceEventType.APPROVAL_REQUESTED.value,
                 RunEvent.sequence_index > boundary,
                 RunEvent.sequence_index < pause_sequence,
             )
@@ -3216,7 +3262,10 @@ class SQLStateStore(SQLBlobCatalog):
 
         paused_seq = (
             select(func.max(RunEvent.sequence_index))
-            .where(RunEvent.agent_run_id == run_id, RunEvent.event_type == "run.paused")
+            .where(
+                RunEvent.agent_run_id == run_id,
+                RunEvent.event_type == StoredEventType.RUN_PAUSED.value,
+            )
             .scalar_subquery()
         )
         parts = self.pause_projection(AgentRun.pause_data)
@@ -3325,7 +3374,7 @@ class SQLStateStore(SQLBlobCatalog):
                         values=self._ordered(
                             AgentRun.__table__,
                             {
-                                **_status_values("running"),
+                                **_status_values(RunStatus.RUNNING.value),
                                 "last_progress_at": _dt.datetime.now(_dt.UTC),
                                 "pause_requested": False,
                                 "claim_epoch": AgentRun.claim_epoch + 1,
@@ -3362,7 +3411,7 @@ class SQLStateStore(SQLBlobCatalog):
                         *self._ordered(
                             AgentRun.__table__,
                             dict(
-                                **_status_values("running"),
+                                **_status_values(RunStatus.RUNNING.value),
                                 last_progress_at=_dt.datetime.now(_dt.UTC),
                                 pause_requested=False,
                                 claim_epoch=AgentRun.claim_epoch + 1,
@@ -3458,7 +3507,7 @@ class SQLStateStore(SQLBlobCatalog):
                         *self._ordered(
                             AgentRun.__table__,
                             dict(
-                                **_status_values("running"),
+                                **_status_values(RunStatus.RUNNING.value),
                                 last_progress_at=_dt.datetime.now(_dt.UTC),
                                 pause_requested=False,
                                 claim_epoch=AgentRun.claim_epoch + 1,
@@ -3492,7 +3541,7 @@ class SQLStateStore(SQLBlobCatalog):
                 # 3. Merge submitted_data into pause_data.
                 merged = dict(current_pause_data)
                 values: dict[str, Any] = {}
-                if run.storage_format == 2:
+                if run.storage_format == STORAGE_FORMAT_CHECKPOINTED:
                     if submission is None:
                         from dendrux.errors import PersistenceError
 
@@ -3547,7 +3596,61 @@ class SQLStateStore(SQLBlobCatalog):
             _attempt, label="submit_and_claim", run_id=run_id, classify=self.classify_db_error
         )
 
-    async def release_run_claim(self, run_id: str, *, status: str, claim_epoch: int) -> bool:
+    async def _finish_claim_release(
+        self,
+        session: AsyncSession,
+        run_id: str,
+        claim_epoch: int,
+        won: bool,
+        event: EventWrite | None,
+    ) -> bool:
+        if won:
+            await _write_release_event(session, run_id, won, event)
+            return True
+        return await self._cancel_claim_release(session, run_id, claim_epoch)
+
+    async def _cancel_claim_release(
+        self, session: AsyncSession, run_id: str, claim_epoch: int
+    ) -> bool:
+        from dendrux.db.models import AgentRun
+
+        requested = await session.scalar(
+            self.lock_clause(
+                select(AgentRun.cancel_requested).where(
+                    AgentRun.id == run_id,
+                    AgentRun.status == RunStatus.RUNNING.value,
+                    AgentRun.claim_epoch == claim_epoch,
+                    AgentRun.cancel_requested.is_(True),
+                ),
+                "update",
+            )
+        )
+        if not requested:
+            return False
+        won = await self._cas_finalize(
+            session,
+            run_id,
+            status=RunStatus.CANCELLED.value,
+            allowed_current_statuses=[RunStatus.RUNNING.value],
+            claim_epoch=claim_epoch,
+            answer=None,
+            error=None,
+            iteration_count=None,
+            total_usage=None,
+            pii_mapping=None,
+        )
+        if won:
+            await _insert_event_locked(
+                session,
+                run_id,
+                StoredEventType.RUN_CANCELLED.value,
+                {"reason": CancelReason.CANCEL_REQUESTED.value},
+            )
+        return won
+
+    async def release_run_claim(
+        self, run_id: str, *, status: str, claim_epoch: int, event: EventWrite | None = None
+    ) -> bool:
         """Return an owned claim to its pause after post-claim validation fails."""
         from sqlalchemy import update
 
@@ -3559,15 +3662,19 @@ class SQLStateStore(SQLBlobCatalog):
                     update(AgentRun)
                     .where(
                         AgentRun.id == run_id,
-                        AgentRun.status == "running",
+                        AgentRun.status == RunStatus.RUNNING.value,
                         AgentRun.claim_epoch == claim_epoch,
+                        AgentRun.cancel_requested.is_(False),
                     )
                     .ordered_values(
                         *self._ordered(AgentRun.__table__, dict(**_status_values(status)))
                     )
                 )
+                won = await self._finish_claim_release(
+                    session, run_id, claim_epoch, bool(result.rowcount), event
+                )
                 await self._write_tx(session)
-                return bool(result.rowcount)
+                return won
 
         return await retry_transient_db(
             attempt, label="release_run_claim", run_id=run_id, classify=self.classify_db_error
@@ -3583,8 +3690,6 @@ class SQLStateStore(SQLBlobCatalog):
         from sqlalchemy import select
 
         from dendrux.db.models import AgentRun
-
-        stop_key = "dendrux.stop_reason"
 
         fields = (
             AgentRun.strategy,
@@ -3610,8 +3715,8 @@ class SQLStateStore(SQLBlobCatalog):
             AgentRun.total_reasoning_tokens,
             AgentRun.total_cost_usd,
             AgentRun.output_data["answer"].as_string().label("answer"),
-            AgentRun.meta["dendrux.error_info"].label("error_info"),
-            AgentRun.meta[stop_key].as_string().label("stop_reason"),
+            AgentRun.meta[ERROR_INFO_META_KEY].label("error_info"),
+            AgentRun.meta[STOP_REASON_META_KEY].as_string().label("stop_reason"),
         )
         stmt = _apply_tenant_scope(select(*fields).where(AgentRun.id == run_id), tenant_id)
         async with self._session_factory() as session:
@@ -3627,7 +3732,7 @@ class SQLStateStore(SQLBlobCatalog):
         )
         return RunRecord(
             **values,
-            meta={"dendrux.error_info": info, stop_key: stop_reason},
+            meta={ERROR_INFO_META_KEY: info, STOP_REASON_META_KEY: stop_reason},
         )
 
     async def get_run(self, run_id: str, *, tenant_id: TenantScope = UNSCOPED) -> RunRecord | None:
@@ -3738,7 +3843,7 @@ class SQLStateStore(SQLBlobCatalog):
                 ToolCallReadRecord(
                     id=r.id,
                     outcome=r.outcome,
-                    observation=(r.meta or {}).get("dendrux.observation"),
+                    observation=(r.meta or {}).get(OBSERVATION_META_KEY),
                     idempotent=r.idempotent,
                     replayed_at=_to_aware_utc(r.replayed_at),
                     tool_call_id=r.tool_call_id,
@@ -3857,7 +3962,9 @@ class SQLStateStore(SQLBlobCatalog):
 
         async def _attempt() -> bool:
             async with self._session_factory() as session:
-                stmt = update(AgentRun).where(AgentRun.id == run_id, AgentRun.status == "running")
+                stmt = update(AgentRun).where(
+                    AgentRun.id == run_id, AgentRun.status == RunStatus.RUNNING.value
+                )
                 if claim_epoch is not None:
                     stmt = stmt.where(AgentRun.claim_epoch == claim_epoch)
                 result = await session.execute(
@@ -3925,7 +4032,7 @@ class SQLStateStore(SQLBlobCatalog):
             select(RunEvent.id)
             .where(
                 RunEvent.agent_run_id == AgentRun.id,
-                RunEvent.event_type == literal_column("'run.started'"),
+                RunEvent.event_type == literal_column(f"'{StoredEventType.RUN_STARTED.value}'"),
             )
             .limit(1)
             .correlate(AgentRun)
@@ -3949,7 +4056,9 @@ class SQLStateStore(SQLBlobCatalog):
             started.label("started"),
         )
         while inspected < max_runs and len(result.reclaimable) < max_returned:
-            statement = select(*fields).where(AgentRun.status.between("running", "running"))
+            statement = select(*fields).where(
+                AgentRun.status.between(RunStatus.RUNNING.value, RunStatus.RUNNING.value)
+            )
             if after is not None:
                 statement = statement.where(AgentRun.id > after)
             async with self._session_factory() as session:
@@ -3974,7 +4083,10 @@ class SQLStateStore(SQLBlobCatalog):
                         age = _to_aware_utc(row.last_progress_at or row.created_at)
                         if (on_stale == "error" or row.lease_expired_at is None) and age >= cutoff:
                             return None
-                        if row.storage_format == 2 and row.loop not in ("react", "single_call"):
+                        if row.storage_format == STORAGE_FORMAT_CHECKPOINTED and row.loop not in (
+                            "react",
+                            "single_call",
+                        ):
                             if on_stale != "error":
                                 _codes.log_code(logger, _codes.LOOP_UNKNOWN, run_id=run_id)
                             if on_stale is None:
@@ -3985,14 +4097,16 @@ class SQLStateStore(SQLBlobCatalog):
                             else reclaim_limit
                         )
                         legacy_reason = (
-                            "stale_running" if row.started or on_stale is None else "never_started"
+                            FailureReason.STALE_RUNNING.value
+                            if row.started or on_stale is None
+                            else FailureReason.NEVER_STARTED.value
                         )
                         reason = (
                             legacy_reason
                             if on_stale == "error"
-                            else "stale_running_legacy"
-                            if row.storage_format != 2
-                            else "reclaim_limit"
+                            else FailureReason.STALE_RUNNING_LEGACY.value
+                            if row.storage_format != STORAGE_FORMAT_CHECKPOINTED
+                            else FailureReason.RECLAIM_LIMIT.value
                             if row.reclaim_attempts >= limit
                             else legacy_reason
                             if row.loop != "react"
@@ -4000,7 +4114,9 @@ class SQLStateStore(SQLBlobCatalog):
                         )
                         if reason is not None or row.cancel_requested:
                             flagged = AgentRun.cancel_requested.is_(True)
-                            status_expr = case((flagged, "cancelled"), else_="error")
+                            status_expr = case(
+                                (flagged, RunStatus.CANCELLED.value), else_=RunStatus.ERROR.value
+                            )
                             changed = (
                                 await self._update_one_rows(
                                     session,
@@ -4008,7 +4124,7 @@ class SQLStateStore(SQLBlobCatalog):
                                     pk=(run_id,),
                                     predicate=and_(
                                         AgentRun.id == run_id,
-                                        AgentRun.status == "running",
+                                        AgentRun.status == RunStatus.RUNNING.value,
                                         AgentRun.claim_epoch == row.claim_epoch,
                                         or_(
                                             AgentRun.lease_expired_at.is_not(None)
@@ -4038,12 +4154,14 @@ class SQLStateStore(SQLBlobCatalog):
                             await _insert_event_locked(
                                 session,
                                 run_id,
-                                "run.cancelled" if status == "cancelled" else "run.interrupted",
+                                StoredEventType.RUN_CANCELLED.value
+                                if status == RunStatus.CANCELLED.value
+                                else StoredEventType.RUN_INTERRUPTED.value,
                                 {
                                     "failure_reason": reason,
                                     **(
-                                        {"reason": "cancel_requested"}
-                                        if status == "cancelled"
+                                        {"reason": CancelReason.CANCEL_REQUESTED.value}
+                                        if status == RunStatus.CANCELLED.value
                                         else {}
                                     ),
                                 },
@@ -4054,16 +4172,16 @@ class SQLStateStore(SQLBlobCatalog):
                                 logger,
                                 _codes.REGISTRY[
                                     "legacy_run_swept"
-                                    if reason == "stale_running_legacy"
-                                    else reason or "cancel_requested"
+                                    if reason == FailureReason.STALE_RUNNING_LEGACY.value
+                                    else reason or CancelReason.CANCEL_REQUESTED.value
                                 ],
                                 run_id=run_id,
                             )
                             return SweptRun(
                                 run_id,
                                 row.agent_name,
-                                "running",
-                                reason or "cancel_requested",
+                                RunStatus.RUNNING.value,
+                                reason or CancelReason.CANCEL_REQUESTED.value,
                                 _to_aware_utc(row.last_progress_at),
                                 _dt.datetime.now(_dt.UTC),
                                 status,
@@ -4080,8 +4198,8 @@ class SQLStateStore(SQLBlobCatalog):
                                 pk=(run_id,),
                                 predicate=and_(
                                     AgentRun.id == run_id,
-                                    AgentRun.status == "running",
-                                    AgentRun.storage_format == 2,
+                                    AgentRun.status == RunStatus.RUNNING.value,
+                                    AgentRun.storage_format == STORAGE_FORMAT_CHECKPOINTED,
                                     AgentRun.lease_expired_at.is_(None),
                                     AgentRun.claim_epoch == row.claim_epoch,
                                     func.coalesce(AgentRun.last_progress_at, AgentRun.created_at)
@@ -4100,7 +4218,7 @@ class SQLStateStore(SQLBlobCatalog):
                                 await session.execute(
                                     select(*fields).where(
                                         AgentRun.id == run_id,
-                                        AgentRun.status == "running",
+                                        AgentRun.status == RunStatus.RUNNING.value,
                                         AgentRun.lease_expired_at.is_not(None),
                                     )
                                 )
@@ -4109,7 +4227,7 @@ class SQLStateStore(SQLBlobCatalog):
                         await _insert_event_locked(
                             session,
                             run_id,
-                            "run.lease_expired",
+                            StoredEventType.RUN_LEASE_EXPIRED.value,
                             {"gap_s": max(0.0, (now - age).total_seconds())},
                         )
                         item = _reclaimable(marked)
@@ -4128,14 +4246,14 @@ class SQLStateStore(SQLBlobCatalog):
                     result.reclaimable.append(item)
                 elif isinstance(item, SweptRun):
                     result.finalised.append(item)
-                    if item.failure_reason == "stale_running_legacy":
+                    if item.failure_reason == FailureReason.STALE_RUNNING_LEGACY.value:
                         result.legacy.append(item)
                 if inspected >= max_runs or len(result.reclaimable) >= max_returned:
                     if inspected >= max_runs:
                         _codes.log_code(
                             logger,
                             _codes.SWEEP_CAP_REACHED,
-                            category="stale_running",
+                            category=FailureReason.STALE_RUNNING.value,
                             cap=max_runs,
                             inspected=inspected,
                         )
@@ -4161,8 +4279,8 @@ class SQLStateStore(SQLBlobCatalog):
             AgentRun.reclaim_limit,
             AgentRun.claim_epoch,
         ).where(
-            AgentRun.status == "running",
-            AgentRun.storage_format == 2,
+            AgentRun.status == RunStatus.RUNNING.value,
+            AgentRun.storage_format == STORAGE_FORMAT_CHECKPOINTED,
             AgentRun.lease_expired_at.is_not(None),
         )
         if cursor is not None:
@@ -4214,8 +4332,8 @@ class SQLStateStore(SQLBlobCatalog):
                 "lease_expired_at",
                 "claim_epoch",
                 "reclaim_attempts",
-                "reclaim_limit",
-                "cancel_requested",
+                FailureReason.RECLAIM_LIMIT.value,
+                CancelReason.CANCEL_REQUESTED.value,
                 "agent_name",
                 "meta",
                 "loop_state",
@@ -4236,9 +4354,9 @@ class SQLStateStore(SQLBlobCatalog):
                 nonlocal previous_epoch, cancelled, governance_changed, gap
                 row = SimpleNamespace(**row_mapping)
                 checks = [
-                    (row.storage_format == 2, "legacy_run"),
+                    (row.storage_format == STORAGE_FORMAT_CHECKPOINTED, "legacy_run"),
                     (self.capabilities.recovery, "store_capability"),
-                    (row.status == "running", "not_running"),
+                    (row.status == RunStatus.RUNNING.value, "not_running"),
                     (row.lease_expired_at is not None, "lease_fresh"),
                     (
                         expected_claim_epoch is None or row.claim_epoch == expected_claim_epoch,
@@ -4246,7 +4364,7 @@ class SQLStateStore(SQLBlobCatalog):
                     ),
                     (
                         row.reclaim_limit is not None and row.reclaim_attempts < row.reclaim_limit,
-                        "reclaim_limit",
+                        FailureReason.RECLAIM_LIMIT.value,
                     ),
                 ]
                 for ok, reason in checks:
@@ -4269,7 +4387,7 @@ class SQLStateStore(SQLBlobCatalog):
                     return
                 if row.agent_name != agent_name:
                     raise RunNotReclaimableError(run_id, "agent_mismatch")
-                saved = (row.meta or {}).get("dendrux.governance")
+                saved = (row.meta or {}).get(GOVERNANCE_KEY)
                 governance_changed = saved is not None and saved.get("digest") != governance.get(
                     "digest"
                 )
@@ -4303,7 +4421,7 @@ class SQLStateStore(SQLBlobCatalog):
                 )
 
             async with self._session_factory() as session:
-                session.info["dendrux.store"] = self
+                session.info[STORE_SESSION_KEY] = self
                 changed = await self.update_one(
                     session,
                     table=table,
@@ -4323,14 +4441,17 @@ class SQLStateStore(SQLBlobCatalog):
                     raise RunNotFoundError(run_id)
                 if cancelled:
                     await _insert_event_locked(
-                        session, run_id, "run.cancelled", {"reason": "cancel_requested"}
+                        session,
+                        run_id,
+                        StoredEventType.RUN_CANCELLED.value,
+                        {"reason": CancelReason.CANCEL_REQUESTED.value},
                     )
                     await self._write_tx(session)
                     raise RunNotReclaimableError(run_id, "cancelled")
                 await _insert_event_locked(
                     session,
                     run_id,
-                    "run.reclaimed",
+                    StoredEventType.RUN_RECLAIMED.value,
                     dict(
                         attempt=changed["reclaim_attempts"],
                         previous_epoch=previous_epoch,
@@ -4435,17 +4556,13 @@ class SQLStateStore(SQLBlobCatalog):
             if waiting
             else func.coalesce(AgentRun.last_progress_at, AgentRun.created_at)
         )
-        statuses = (
-            ["waiting_client_tool", "waiting_human_input", "waiting_approval", "paused"]
-            if waiting
-            else ["running"]
-        )
+        statuses = PAUSE_STATUS_VALUES if waiting else [RunStatus.RUNNING.value]
         # A scalar LIMIT subquery prevents a hashed scan of every started event.
         started = (
             select(RunEvent.id)
             .where(
                 RunEvent.agent_run_id == AgentRun.id,
-                RunEvent.event_type == literal_column("'run.started'"),
+                RunEvent.event_type == literal_column(f"'{StoredEventType.RUN_STARTED.value}'"),
             )
             .limit(1)
             .correlate(AgentRun)
@@ -4495,14 +4612,18 @@ class SQLStateStore(SQLBlobCatalog):
                     if not waiting and _to_aware_utc(row.sweep_age) >= cutoff:
                         continue
                     reason = (
-                        "abandoned_waiting"
+                        FailureReason.ABANDONED_WAITING.value
                         if waiting
-                        else "stale_running"
+                        else FailureReason.STALE_RUNNING.value
                         if row.started
-                        else "never_started"
+                        else FailureReason.NEVER_STARTED.value
                     )
                     flagged = AgentRun.cancel_requested.is_(True)
-                    new_status = "error" if waiting else case((flagged, "cancelled"), else_="error")
+                    new_status = (
+                        RunStatus.ERROR.value
+                        if waiting
+                        else case((flagged, RunStatus.CANCELLED.value), else_=RunStatus.ERROR.value)
+                    )
                     async with self._session_factory() as session:
                         result = await self._update_one_rows(
                             session,
@@ -4531,11 +4652,15 @@ class SQLStateStore(SQLBlobCatalog):
                         status = result.scalar_one_or_none()
                         if status is None:
                             continue
-                        event_type = "run.abandoned" if waiting else "run.interrupted"
+                        event_type = (
+                            StoredEventType.RUN_ABANDONED.value
+                            if waiting
+                            else StoredEventType.RUN_INTERRUPTED.value
+                        )
                         data = {"failure_reason": reason}
-                        if status == "cancelled":
-                            event_type = "run.cancelled"
-                            data["reason"] = "cancel_requested"
+                        if status == RunStatus.CANCELLED.value:
+                            event_type = StoredEventType.RUN_CANCELLED.value
+                            data["reason"] = CancelReason.CANCEL_REQUESTED.value
                         await _insert_event_locked(
                             session,
                             row.id,
@@ -4559,7 +4684,9 @@ class SQLStateStore(SQLBlobCatalog):
             _codes.log_code(
                 logger,
                 _codes.SWEEP_CAP_REACHED,
-                category="abandoned_waiting" if waiting else "stale_running",
+                category=FailureReason.ABANDONED_WAITING.value
+                if waiting
+                else FailureReason.STALE_RUNNING.value,
                 cap=max_runs,
                 inspected=visited,
             )
@@ -5050,7 +5177,7 @@ class SQLStateStore(SQLBlobCatalog):
                 stmt = (
                     select(RunEvent.agent_run_id, func.count())
                     .where(RunEvent.agent_run_id.in_(ids[start : start + _IN_CHUNK]))
-                    .where(RunEvent.event_type == "run.paused")
+                    .where(RunEvent.event_type == StoredEventType.RUN_PAUSED.value)
                     .group_by(RunEvent.agent_run_id)
                 )
                 result = await session.execute(stmt)
@@ -5274,8 +5401,8 @@ class SQLStateStore(SQLBlobCatalog):
             if row.agent_run_id != run_id or row.content_digest != digest:
                 conflict()
             return int(row.sequence_index)
-        session.info["dendrux.fresh_evidence"] = True
-        hook = session.info.get("dendrux.event_hook")
+        session.info[FRESH_EVIDENCE_SESSION_KEY] = True
+        hook = session.info.get(EVENT_HOOK_SESSION_KEY)
         if hook is not None:
             await hook(session, run_id)
         return int(seq)

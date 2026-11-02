@@ -9,12 +9,13 @@ import re
 from typing import TYPE_CHECKING, Any
 
 from dendrux import _codes
+from dendrux._lifecycle import HIDDEN_ANSWER_STATUSES, PAUSE_STATUSES
 
 if TYPE_CHECKING:
     from dendrux.types import Limits, RunResult, ToolResult
 
 WIRE_VERSION = 1
-_PAUSED = {"paused", "waiting_approval", "waiting_human_input", "waiting_client_tool"}
+_PAUSED = PAUSE_STATUSES
 
 
 def _redacted(value: Any, mapping: Any) -> Any:
@@ -90,10 +91,7 @@ def _scan_budget(used: int, length: int, candidates: int) -> int:
 
 
 def _wire_answer(result: RunResult) -> Any:
-    if isinstance(result.answer, str) and result.status.value not in (
-        "waiting_approval",
-        "waiting_human_input",
-    ):
+    if isinstance(result.answer, str) and result.status.value not in HIDDEN_ANSWER_STATUSES:
         return _redacted(result.answer, None)
     return None
 
@@ -159,7 +157,7 @@ def result_to_dict(result: RunResult) -> dict[str, Any]:
     omitted = (
         isinstance(result.answer, str)
         and answer is None
-        and result.status.value not in ("waiting_approval", "waiting_human_input")
+        and result.status.value not in HIDDEN_ANSWER_STATUSES
     )
     if omitted:
         import logging

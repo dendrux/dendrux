@@ -12,11 +12,12 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from dendrux._lifecycle import STORAGE_FORMAT_CHECKPOINTED
 from dendrux.errors import PersistenceError, RunFencedError
 from dendrux.runtime.state import LoopStatePatch
 from dendrux.testing.store_kit.contracts._marks import contract
 from dendrux.testing.store_kit.contracts._support import trace_write, ulid
-from dendrux.types import InputValidationError
+from dendrux.types import InputValidationError, RunStatus
 
 if TYPE_CHECKING:
     from dendrux.testing.store_kit._kit import Kit
@@ -133,11 +134,16 @@ async def test_a_claim_carries_the_checkpointed_state(dendrux_kit: Kit) -> None:
         run_id, claim_epoch=0, loop_state=state, pii_mapping=None, trace=None
     )
     await store.pause_run(
-        run_id, status="waiting_client_tool", pause_data={"pause_id": "p"}, claim_epoch=0
+        run_id,
+        status=RunStatus.WAITING_CLIENT_TOOL.value,
+        pause_data={"pause_id": "p"},
+        claim_epoch=0,
     )
-    claim = await store.claim_paused_run(run_id, expected_status="waiting_client_tool")
+    claim = await store.claim_paused_run(
+        run_id, expected_status=RunStatus.WAITING_CLIENT_TOOL.value
+    )
     assert claim is not False
-    assert claim.storage_format == 2
+    assert claim.storage_format == STORAGE_FORMAT_CHECKPOINTED
     assert claim.loop_state == state
     assert claim.claim_epoch == 1
 
@@ -199,14 +205,16 @@ async def _paused_for_input(kit: Kit) -> tuple[str, dict[str, object], int]:
     )
     await store.pause_run(
         run_id,
-        status="waiting_human_input",
+        status=RunStatus.WAITING_HUMAN_INPUT.value,
         pause_data={
             "schema_version": 2,
             "pause_id": "p",
             "submission": {**descriptor, "payload": "hello"},
         },
     )
-    claim = await store.claim_paused_run(run_id, expected_status="waiting_human_input")
+    claim = await store.claim_paused_run(
+        run_id, expected_status=RunStatus.WAITING_HUMAN_INPUT.value
+    )
     assert claim is not False
     return run_id, descriptor, claim.claim_epoch
 

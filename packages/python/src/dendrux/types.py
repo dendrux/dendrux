@@ -24,6 +24,9 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Literal, TypeAlias
 
 from dendrux import _codes
+from dendrux._meta_keys import (
+    REPLAYED_META_KEY as REPLAYED_META_KEY,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Coroutine
@@ -39,11 +42,6 @@ logger = logging.getLogger(__name__)
 # ``Message.meta`` key naming the model that produced an ASSISTANT message's
 # ``reasoning_blocks``. Providers replay the blocks only to that same model.
 REASONING_MODEL_META_KEY = "reasoning_model"
-
-# ``Message.meta`` flag on messages replayed from an earlier run via
-# ``agent.run(runs=...)``. Providers use it to opt replayed reasoning into
-# vendor-side prefix-binding safety nets.
-REPLAYED_META_KEY = "dendrux.replayed"
 
 
 def generate_ulid() -> str:

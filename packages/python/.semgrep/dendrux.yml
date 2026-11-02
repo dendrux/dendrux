@@ -1,0 +1,126 @@
+# Dendrux custom Semgrep rules (see tools/QUALITY.md). Each rule has positive and negative
+# cases in the fixture .semgrep/dendrux.py, run by `semgrep --test .semgrep` (Semgrep pairs a
+# rule file with the fixture of the same name). A rule's `metadata.include` / `metadata.exclude`
+# list path prefixes under src/dendrux that the ratchet script applies to its matches; they
+# are not Semgrep `paths:` so that the fixture can exercise every rule from one file. Existing matches
+# are baselined by tools/semgrep_ratchet.py (tools/semgrep_baseline.json): only a new match,
+# or more matches in a known function, fails.
+rules:
+  - id: session-commit-outside-write-tx
+    message: >-
+      A session commit in the SQL store must go through SQLStateStore._write_tx, which proves
+      the outcome after a lost acknowledgement or fails closed.
+    severity: ERROR
+    languages: [python]
+    metadata:
+      include: ["runtime/stores/sql/"]
+      # The one place allowed to commit, as module:qualified name. Semgrep cannot say "this
+      # method of this class" for a nested node, so tools/semgrep_ratchet.py applies it
+      # exactly; a same-named method elsewhere, a module function or a nested helper of
+      # another method is still a match.
+      allow_in: ["dendrux.runtime.stores.sql.base:SQLStateStore._write_tx"]
+    patterns:
+      - pattern-either:
+          - pattern: $S.commit()
+          - pattern: await $S.commit()
+
+  - id: process-tool-calls-without-tenant
+    message: >-
+      _process_tool_calls must be given tenant_id= explicitly. Omitting the tenant scope must
+      never fail open.
+    severity: ERROR
+    languages: [python]
+    patterns:
+      - pattern: _process_tool_calls(...)
+      - pattern-not: _process_tool_calls(..., tenant_id=$T, ...)
+      - pattern-not-inside: |
+          def _process_tool_calls(...):
+              ...
+
+  - id: hardcoded-terminal-status-set
+    message: >-
+      Two or more run statuses written out in a literal. Use the shared sets in
+      dendrux._lifecycle so a new status cannot be missed in one copy.
+    severity: ERROR
+    languages: [python]
+    metadata:
+      exclude: ["types.py", "_lifecycle.py"]
+    patterns:
+      - pattern-either:
+          - pattern: "[..., $A, ..., $B, ...]"
+          - pattern: "{..., $A, ..., $B, ...}"
+          - pattern: "($A, ..., $B)"
+          - pattern: "($A, $B, ...)"
+      - metavariable-regex:
+          metavariable: $A
+          regex: ^(["'](pending|running|waiting_client_tool|waiting_human_input|waiting_approval|paused|success|error|cancelled|max_iterations)["']|([A-Za-z_.]*\.)?RunStatus\.[A-Z_]+)$
+      - metavariable-regex:
+          metavariable: $B
+          regex: ^(["'](pending|running|waiting_client_tool|waiting_human_input|waiting_approval|paused|success|error|cancelled|max_iterations)["']|([A-Za-z_.]*\.)?RunStatus\.[A-Z_]+)$
+
+  - id: str-exc-in-log
+    message: >-
+      An exception rendered as text in a log call or in error_info. Exception text can carry
+      vendor message text, payloads or secrets. Log a code, a count or the exception type.
+    severity: ERROR
+    languages: [python]
+    metadata:
+      include: ["runtime/", "db/", "store/"]
+    patterns:
+      - pattern-inside: |
+          try:
+              ...
+          except $T as $E:
+              ...
+      # the exception rendered as text ...
+      - pattern-either:
+          - pattern: str($E)
+          - pattern: f"...{$E}..."
+          - pattern: f"...{str($E)}..."
+          - pattern: f"...{$E!s}..."
+      # ... anywhere inside a log call (also in extra={...} or a nested container), or in an
+      # error_info keyword, assignment or dict entry
+      - pattern-either:
+          - patterns:
+              - pattern-inside: $L.$M(...)
+              - metavariable-regex:
+                  metavariable: $L
+                  regex: ^(self\.)?_?(logger|log|LOG|LOGGER)$
+              - metavariable-regex:
+                  metavariable: $M
+                  regex: ^(debug|info|warning|warn|error|exception|critical|log)$
+          - pattern-inside: $F(..., error_info=..., ...)
+          - pattern-inside: error_info = ...
+          - pattern-inside: $X["error_info"] = ...
+          - pattern-inside: '{..., "error_info": ..., ...}'
+
+  - id: dotenv-in-src
+    message: >-
+      The library never loads or names .env files. Configuration comes from the caller.
+    severity: ERROR
+    languages: [python]
+    pattern-either:
+      - pattern: import dotenv
+      - pattern: import dotenv as $A
+      - pattern: from dotenv import $X
+      - pattern: from dotenv.$X import $Y
+      - patterns:
+          - pattern: '"$S"'
+          - metavariable-regex:
+              metavariable: $S
+              regex: ^(.*/)?\.env(\.[A-Za-z0-9_]+)?$
+
+  - id: bare-number-timeout
+    message: >-
+      A numeric literal passed as a timeout. Name it as a constant or take it from a setting
+      so it has one documented default and an override.
+    severity: INFO
+    languages: [python]
+    patterns:
+      - pattern: $F(..., $K=$N, ...)
+      - metavariable-regex:
+          metavariable: $K
+          regex: ^(timeout|timeout_s|[A-Za-z0-9_]+_timeout_s)$
+      - metavariable-regex:
+          metavariable: $N
+          regex: ^[0-9][0-9_]*(\.[0-9_]+)?$

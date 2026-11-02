@@ -93,6 +93,21 @@ def test_provider_diagnostic_uses_closed_fields(caplog):
     assert "PRIVATE_SENTINEL" not in repr(record.__dict__)
 
 
+def literal_code_strings(node):
+    from dendrux._lifecycle import CancelReason, FailureReason
+
+    if isinstance(node, ast.Constant):
+        return {node.value} if isinstance(node.value, str) else set()
+    match node:
+        case ast.Attribute(
+            value=ast.Attribute(value=ast.Name(id=enum_name), attr=member), attr="value"
+        ):
+            enums = {"FailureReason": FailureReason, "CancelReason": CancelReason}
+            if enum_name in enums:
+                return {enums[enum_name][member].value}
+    return set()
+
+
 def assigned_strings(tree, names):
     """Read code-valued assignments, excluding condition strings in ternaries."""
     definitions = {}
@@ -120,8 +135,8 @@ def assigned_strings(tree, names):
                         definitions.setdefault(target.id, []).append(value)
 
     def values(node, seen=frozenset()):
-        if isinstance(node, ast.Constant):
-            return {node.value} if isinstance(node.value, str) else set()
+        if isinstance(node, (ast.Constant, ast.Attribute)):
+            return literal_code_strings(node)
         if isinstance(node, ast.Name) and node.id not in seen:
             return set().union(
                 *(values(item, seen | {node.id}) for item in definitions.get(node.id, []))
@@ -187,9 +202,8 @@ def dynamic_registry_vocabularies():
                 and isinstance(node.func, ast.Name)
                 and node.func.id == "RunNotReclaimableError"
                 and len(node.args) > 1
-                and isinstance(node.args[1], ast.Constant)
             ):
-                vocabularies["reclaim reasons"].add(node.args[1].value)
+                vocabularies["reclaim reasons"] |= literal_code_strings(node.args[1])
             if (
                 isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
                 and node.name == "reclaim_run"
@@ -232,12 +246,9 @@ def dynamic_registry_vocabularies():
                 if isinstance(part, ast.Name)
             }
             codes = assigned_strings(body, names)
-            codes |= {
-                part.value
-                for node in direct
-                for part in ast.walk(node.slice)
-                if isinstance(part, ast.Constant) and isinstance(part.value, str)
-            }
+            codes |= set().union(
+                *(literal_code_strings(part) for node in direct for part in ast.walk(node.slice))
+            )
             if path == "runtime/state.py":
                 # The sweep projects this storage failure reason to legacy_run_swept.
                 codes.discard("stale_running_legacy")
@@ -269,3 +280,11 @@ def test_dynamic_registry_vocabularies_are_registered():
         if values - REGISTRY.keys()
     }
     assert not missing, missing
+
+
+def test_assignment_scan_resolves_shared_reason_values():
+    tree = ast.parse(
+        'reason = FailureReason.STALE_RUNNING.value if on_stale == "error" '
+        "else CancelReason.CANCEL_REQUESTED.value"
+    )
+    assert assigned_strings(tree, {"reason"}) == {"stale_running", "cancel_requested"}

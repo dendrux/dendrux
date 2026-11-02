@@ -24,7 +24,7 @@ import datetime as dt
 import re
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from sqlalchemy import (
     String,
@@ -42,6 +42,7 @@ from sqlalchemy.schema import CreateIndex, CreateTable
 from sqlalchemy.sql.elements import UnaryExpression
 from sqlalchemy.sql.operators import desc_op
 
+from dendrux._lifecycle import STORAGE_FORMAT_CHECKPOINTED
 from dendrux.db._dialects import LockWaitTimeout
 from dendrux.db._dialects._mysql_types import nopad_collation
 from dendrux.db._storage_schema import ACTIVATION_INDEXES
@@ -355,7 +356,7 @@ def read_catalog(conn: Connection, tables: Collection[str]) -> Catalog:
         ).bindparams(_expanding("names")),
         params,
     ):
-        catalog.tables[name] = TableShape(str(engine), {}, (), frozenset())
+        catalog.tables[cast("str", name)] = TableShape(str(engine), {}, (), frozenset())
     for row in conn.execute(
         text(
             "SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH, "
@@ -396,10 +397,12 @@ def read_catalog(conn: Connection, tables: Collection[str]) -> Catalog:
         ).bindparams(_expanding("names")),
         params,
     ):
-        entry = grouped.setdefault((table, index), (not int(non_unique), []))
+        entry = grouped.setdefault(
+            (cast("str", table), cast("str", index)), (not int(cast("int", non_unique)), [])
+        )
         name = str(column) if column is not None else "<expression>"
         if sub_part is not None:
-            name = f"{name}({int(sub_part)})"
+            name = f"{name}({int(cast('int', sub_part))})"
         entry[1].append((name, str(collation or "A")))
     for (table, index), (unique, columns) in grouped.items():
         if table not in catalog.tables:
@@ -423,7 +426,9 @@ def read_catalog(conn: Connection, tables: Collection[str]) -> Catalog:
         ).bindparams(_expanding("names")),
         params,
     ):
-        entry_fk = foreign.setdefault((table, name), ([], str(referenced), [], str(rule)))
+        entry_fk = foreign.setdefault(
+            (cast("str", table), cast("str", name)), ([], str(referenced), [], str(rule))
+        )
         entry_fk[0].append(str(column))
         entry_fk[2].append(str(referenced_column))
     for (table, _), (columns_fk, referenced, ref_columns, rule) in foreign.items():
@@ -554,7 +559,10 @@ def check(conn: Connection, *, exact: bool = False, settings: bool = True) -> Sc
                 f"{SETTINGS_TABLE}.{BOOTSTRAP_MARKER} (bootstrap unfinished; "
                 "run `dendrux db migrate`)"
             )
-        if values.get("storage_format") != "2" or values.get("activate_step") != "done":
+        if (
+            values.get("storage_format") != str(STORAGE_FORMAT_CHECKPOINTED)
+            or values.get("activate_step") != "done"
+        ):
             report.columns.append(
                 f"{SETTINGS_TABLE}.storage_format (expected an active format 2 schema)"
             )
@@ -802,7 +810,7 @@ def classify(conn: Connection, *, head: str, upgradeable: Collection[str]) -> st
             return "bootstrap"  # crashed between creating the table and writing the marker
     if VERSION_TABLE in present:
         revisions = [
-            str(r) for r in conn.execute(text("SELECT version_num FROM alembic_version")).scalars()
+            str(row[0]) for row in conn.execute(text("SELECT version_num FROM alembic_version"))
         ]
         if revisions == [head]:
             return "current"
@@ -921,11 +929,14 @@ def _bootstrap(conn: Connection, head: str) -> None:
             )
 
     _step("seed")
-    put_setting(conn, "storage_format", "2", overwrite=False)
+    put_setting(conn, "storage_format", str(STORAGE_FORMAT_CHECKPOINTED), overwrite=False)
     put_setting(conn, "activate_step", "done", overwrite=False)
     conn.commit()
     values = read_settings(conn)
-    if values.get("storage_format") != "2" or values.get("activate_step") != "done":
+    if (
+        values.get("storage_format") != str(STORAGE_FORMAT_CHECKPOINTED)
+        or values.get("activate_step") != "done"
+    ):
         raise _refuse("the settings table holds a different storage format.")
 
     _step("stamp")
@@ -940,7 +951,7 @@ def _bootstrap(conn: Connection, head: str) -> None:
             "stamp",
         )
     revisions = [
-        str(r) for r in conn.execute(text("SELECT version_num FROM alembic_version")).scalars()
+        str(row[0]) for row in conn.execute(text("SELECT version_num FROM alembic_version"))
     ]
     if not revisions:
         conn.execute(

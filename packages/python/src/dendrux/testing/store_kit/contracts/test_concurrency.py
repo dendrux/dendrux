@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
+from dendrux._lifecycle import StoredEventType
 from dendrux.errors import NoteLimitExceededError, PersistenceError
 from dendrux.testing.store_kit.contracts._marks import contract
 from dendrux.testing.store_kit.contracts._support import (
@@ -23,7 +24,7 @@ from dendrux.testing.store_kit.contracts._support import (
     tool_call_kwargs,
     ulid,
 )
-from dendrux.types import compute_idempotency_fingerprint
+from dendrux.types import RunStatus, compute_idempotency_fingerprint
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -65,7 +66,7 @@ async def test_parallel_claims_have_exactly_one_winner(dendrux_kit: Kit) -> None
         [
             (
                 lambda s=stores[i % 2]: s.claim_paused_run(
-                    run_id, expected_status="waiting_client_tool"
+                    run_id, expected_status=RunStatus.WAITING_CLIENT_TOOL.value
                 )
             )
             for i in range(CALLERS)
@@ -75,7 +76,7 @@ async def test_parallel_claims_have_exactly_one_winner(dendrux_kit: Kit) -> None
     winners = [r for r in results if r is not False]
     assert len(winners) == 1, f"exactly one claim may win, got {len(winners)}"
     record = await stores[0].get_run(run_id)
-    assert record is not None and record.status == "running"
+    assert record is not None and record.status == RunStatus.RUNNING.value
     if dendrux_kit.declaration.has("fenced_writes"):
         assert record.claim_epoch == 1, "one claim, one epoch step"
 
@@ -94,7 +95,7 @@ async def test_parallel_submit_and_claim_has_exactly_one_winner(dendrux_kit: Kit
         }
         return lambda: store.submit_and_claim(
             run_id,
-            expected_status="waiting_client_tool",
+            expected_status=RunStatus.WAITING_CLIENT_TOOL.value,
             submitted_data={"submitted_tool_results": [{"call_id": "c1", "payload": str(index)}]},
             submission=envelope,
         )
@@ -112,7 +113,7 @@ async def test_parallel_claims_of_different_runs_all_win(dendrux_kit: Kit) -> No
         [
             (
                 lambda s=stores[i % 2], r=run: s.claim_paused_run(
-                    r, expected_status="waiting_client_tool"
+                    r, expected_status=RunStatus.WAITING_CLIENT_TOOL.value
                 )
             )
             for i, run in enumerate(runs)
@@ -133,9 +134,9 @@ async def test_parallel_finalizes_have_exactly_one_winner_and_no_lost_update(
             (
                 lambda s=stores[i % 2], i=i: s.finalize_run(
                     run_id,
-                    status="success",
+                    status=RunStatus.SUCCESS.value,
                     answer=f"answer {i}",
-                    expected_current_status="running",
+                    expected_current_status=RunStatus.RUNNING.value,
                 )
             )
             for i in range(CALLERS)
@@ -146,7 +147,7 @@ async def test_parallel_finalizes_have_exactly_one_winner_and_no_lost_update(
     assert len(winners) == 1
     record = await stores[0].get_run(run_id)
     assert record is not None
-    assert (record.status, record.answer) == ("success", f"answer {winners[0]}")
+    assert (record.status, record.answer) == (RunStatus.SUCCESS.value, f"answer {winners[0]}")
 
 
 @concurrent
@@ -157,7 +158,7 @@ async def test_a_cancel_racing_a_pause_leaves_one_consistent_outcome(dendrux_kit
         [
             lambda: stores[0].request_cancel(run_id),
             lambda: stores[1].try_pause_run(
-                run_id, status="waiting_client_tool", pause_data={"pause_id": "p"}
+                run_id, status=RunStatus.WAITING_CLIENT_TOOL.value, pause_data={"pause_id": "p"}
             ),
         ]
     )
@@ -165,9 +166,11 @@ async def test_a_cancel_racing_a_pause_leaves_one_consistent_outcome(dendrux_kit
     record = await stores[0].get_run(run_id)
     assert record is not None
     if pause:
-        assert record.status == "waiting_client_tool"
+        assert record.status == RunStatus.WAITING_CLIENT_TOOL.value
     else:
-        assert record.status == "running" and record.cancel_requested, "a lost pause means a cancel"
+        assert record.status == RunStatus.RUNNING.value and record.cancel_requested, (
+            "a lost pause means a cancel"
+        )
     assert cancel is True and record.cancel_requested, "the cancel flag is never lost"
 
 
@@ -220,7 +223,9 @@ async def test_a_note_racing_a_finalize_is_stored_or_refused_never_lost(dendrux_
         added, finalized = await race(
             [
                 lambda r=run_id: stores[0].add_note(r, note_id=ulid(), text="n"),
-                lambda r=run_id: stores[1].finalize_run(r, status="success", answer="a"),
+                lambda r=run_id: stores[1].finalize_run(
+                    r, status=RunStatus.SUCCESS.value, answer="a"
+                ),
             ]
         )
         assert unexpected([added, finalized]) == []
@@ -328,7 +333,7 @@ async def test_two_markers_find_each_stale_run_once(dendrux_kit: Kit) -> None:
     runs = []
     for _ in range(3):
         run_id = await dendrux_kit.new_run(tenant_id="t")
-        await stores[0].save_run_event(run_id, event_type="run.started")
+        await stores[0].save_run_event(run_id, event_type=StoredEventType.RUN_STARTED.value)
         await stores[0].checkpoint_step(
             run_id,
             claim_epoch=0,

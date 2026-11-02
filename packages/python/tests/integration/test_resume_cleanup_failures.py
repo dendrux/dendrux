@@ -66,8 +66,8 @@ async def test_cancel_preserves_exception_despite_store_failure(store, path, fai
     assert str(secondary) not in caplog.text
 
 
-@pytest.mark.parametrize("failure", [None, "finalize_run", "save_run_event", "on_run_failed"])
-async def test_claimed_resume_preserves_error_and_notifies(store, failure, caplog):
+@pytest.mark.parametrize("failure", [None, "finalize_run", "save_run_event", "release_run_claim"])
+async def test_claimed_resume_prelude_preserves_error_and_releases(store, failure, caplog):
     # This fault injection / pause blob exercises the format-1 write path.
     from tests._fixtures.storage import pin_storage_format
 
@@ -81,7 +81,8 @@ async def test_claimed_resume_preserves_error_and_notifies(store, failure, caplo
     original = ValueError("original continuation failure")
     secondary = RuntimeError("injected claimed-resume cleanup failure")
     notifier = BaseNotifier()
-    failed_hook = AsyncMock(side_effect=secondary if failure == "on_run_failed" else None)
+    failed_hook = AsyncMock()
+    forbidden_write = AsyncMock(side_effect=secondary)
     with (
         patch("dendrux.runtime.runner.continuation", AsyncMock(side_effect=original)),
         patch.object(notifier, "on_run_failed", failed_hook),
@@ -95,15 +96,18 @@ async def test_claimed_resume_preserves_error_and_notifies(store, failure, caplo
             pre_claim_status="waiting_client_tool",
         )
         with pytest.raises(ValueError) as caught:
-            if failure in {None, "on_run_failed"}:
+            if failure is None:
                 await action
             else:
-                with patch.object(store, failure, AsyncMock(side_effect=secondary)):
+                with patch.object(store, failure, forbidden_write):
                     await action
     assert caught.value is original
-    failed_hook.assert_awaited_once_with(run_id, original, iteration=None)
+    failed_hook.assert_not_awaited()
     assert (await store.get_run(run_id)).status == (
-        "running" if failure == "finalize_run" else "error"
+        "running" if failure == "release_run_claim" else "waiting_client_tool"
     )
-    if failure is not None:
-        assert str(secondary) in caplog.text
+    if failure in {"finalize_run", "save_run_event"}:
+        forbidden_write.assert_not_awaited()
+    if failure == "release_run_claim":
+        assert any(getattr(r, "code", None) == "persistence_error" for r in caplog.records)
+    assert str(secondary) not in caplog.text

@@ -20,6 +20,17 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, get_args
 
 from dendrux import errors as _errors
+from dendrux._lifecycle import PAUSE_STATUSES as _PAUSE_STATUSES
+from dendrux._lifecycle import PLACEHOLDER_PAUSE_STATUSES as _PLACEHOLDER_PAUSES
+from dendrux._lifecycle import (
+    ApprovalReason,
+    CancelReason,
+    DenialReason,
+    FailureReason,
+    GovernanceEventType,
+    PauseReason,
+    StoredEventType,
+)
 from dendrux.errors import PROVIDER_ERROR_CATEGORIES, TIMEOUT_REASONS, ProviderError
 from dendrux.guardrails._engine import RESTORE_SKIPPED_CODE
 from dendrux.guardrails._pii import _DEFAULT_DETECTORS as _PII_DETECTORS
@@ -27,7 +38,7 @@ from dendrux.guardrails._protocol import UNSCANNABLE
 from dendrux.guardrails._secrets import _SECRET_DETECTORS
 from dendrux.loops._budget import BUDGET_EXCEEDED, COST_USD, TOKENS, UNPRICED_CALL
 from dendrux.loops._images import WARN_DROP_WITH_THINKING
-from dendrux.loops.react import _CLIENT_APPROVAL_REASON, _HOOK_ERROR_REASON
+from dendrux.loops.react import _CLIENT_APPROVAL_REASON
 from dendrux.media._ids import PlaceholderReason
 from dendrux.media._policy import Origin as ImageOrigin
 from dendrux.pricing import CostSource
@@ -39,7 +50,7 @@ from dendrux.runtime._pending import (
     pause_window_start,
     unknown_tool_calls,
 )
-from dendrux.runtime.submit import DEFAULT_DENIAL_REASON
+from dendrux.runtime.submit import RESUME_FAILURE_KINDS
 from dendrux.skills._session import NAMES as SKILL_TOOL_NAMES
 from dendrux.tools._limits import MAX_CALLS_CODE, SIZE_LIMIT_CODE
 from dendrux.tools._validate import (
@@ -69,12 +80,9 @@ UNKNOWN_SKILL = "<unknown_skill>"
 """Shown instead of a skill name the model invented."""
 
 # Pauses whose arguments are shown to a human as the model sent them.
-_PLACEHOLDER_PAUSES = frozenset({"waiting_approval", "waiting_human_input", "paused"})
 # Dendrux's own fixed reasons; any other reason is someone's text.
-_CONSTANT_DENIAL_REASONS = frozenset(
-    {"denied_by_policy", DEFAULT_DENIAL_REASON, _HOOK_ERROR_REASON, _CLIENT_APPROVAL_REASON}
-)
-_CONSTANT_APPROVAL_REASONS = frozenset({"requires_approval", "replay_after_crash"})
+_CONSTANT_DENIAL_REASONS = frozenset(DenialReason)
+_CONSTANT_APPROVAL_REASONS = frozenset(ApprovalReason)
 TOOL_RESULT_CODES = frozenset(
     {
         # tools/_validate.py
@@ -157,32 +165,11 @@ CUSTOM_KIND = "<custom_kind>"
 # Dendrux generated, a digest Dendrux computed, or a developer-declared name
 # whose writer only ever copies it from configuration.
 _RUN_STATUSES = frozenset(s.value for s in RunStatus)
-_PAUSE_STATUSES = frozenset(
-    {"waiting_client_tool", "waiting_human_input", "waiting_approval", "paused"}
-)
 _STOP_REASONS = frozenset(get_args(StopReason))
-_PAUSE_REASONS = frozenset({"requested", "budget"})  # react pause_reason
+_PAUSE_REASONS = frozenset(PauseReason)
 _TARGETS = frozenset({"client", "server"})  # tool(target=...)
-_CANCEL_REASONS = frozenset(
-    {"cancel_requested", "task_cancelled", "stream_closed", BUDGET_EXCEEDED}
-)
-_FAILURE_REASONS = frozenset(
-    {
-        "stale_running",
-        "never_started",
-        "abandoned_waiting",
-        "guardrail_blocked",
-        BUDGET_EXCEEDED,
-        "reclaim_limit",
-        "stale_running_legacy",
-        "pending_limit",
-        "lease_lost",
-        "history_too_large",
-        "recovery_call_missing",
-        "recovery_state_missing",
-        "recovery_state_invalid",
-    }
-)
+_CANCEL_REASONS = frozenset(CancelReason)
+_FAILURE_REASONS = frozenset(FailureReason)
 _BUDGET_METRICS = frozenset({TOKENS, COST_USD})
 _BUDGET_REASONS = frozenset({"threshold_crossed", BUDGET_EXCEEDED, UNPRICED_CALL})
 _BUDGET_ACTIONS = frozenset(get_args(BudgetAction))
@@ -192,7 +179,7 @@ _CALL_DECISIONS = frozenset({"approved", "denied"})
 _COST_SOURCES = frozenset(get_args(CostSource))
 _PHASES = frozenset({"commentary", "final_answer"})
 _DIRECTIONS = frozenset({"incoming", "outgoing", "incoming_image"})
-_GUARDRAIL_CODES = frozenset({"guardrail_blocked"})
+_GUARDRAIL_CODES = frozenset({FailureReason.GUARDRAIL_BLOCKED.value})
 _RESTORE_CODES = frozenset({RESTORE_SKIPPED_CODE})
 _VERDICT_ACTIONS = frozenset({"pass", "redact", "block", "warn"})
 _IMAGE_ORIGINS = frozenset(get_args(ImageOrigin))
@@ -224,7 +211,7 @@ _MCP_AUTH_REASONS = frozenset(
 )  # mcp/_errors.MCPAuthorizationReason
 _MCP_SKIP_REASONS = frozenset({"name_unsafe", "duplicate_name", "unknown_tool"})
 _GOVERNANCE_PARTS = frozenset(
-    {"guardrails", "before_tool", "deny", "require_approval", "limits", "budget"}
+    {"guardrails", "before_tool", "deny", "require_approval", "limits", PauseReason.BUDGET.value}
 )  # runtime/submit.governance_snapshot
 BUILTIN_GUARDRAIL_KINDS = frozenset(
     {d.name for d in _PII_DETECTORS} | {d.name for d in _SECRET_DETECTORS} | {UNSCANNABLE}
@@ -342,11 +329,12 @@ _PENDING_CALL: dict[str, Check] = {
     "args_hidden": _bool,
 }
 _SCHEMAS: dict[str, dict[str, Check]] = {
+    StoredEventType.RUN_RESUME_ABORTED.value: {"failure_kind": _enum(RESUME_FAILURE_KINDS)},
     # runtime/runner.py: Agent(name=...) and the retried run's id
-    "run.started": {"agent_name": _declared, "retry_of": _generated_id},
+    StoredEventType.RUN_STARTED.value: {"agent_name": _declared, "retry_of": _generated_id},
     # runner._pause_event_data; params only for the active pause (in _special);
     # message (a person's request_pause reason) hidden
-    "run.paused": {
+    StoredEventType.RUN_PAUSED.value: {
         "status": _enum(_PAUSE_STATUSES),
         "pause_id": _generated_id,
         "reason": _enum(_PAUSE_REASONS),
@@ -354,7 +342,7 @@ _SCHEMAS: dict[str, dict[str, Check]] = {
         "pending_tool_calls": _list(_obj(_PENDING_CALL)),
     },
     # runner resume; submitted names were checked against the pause's calls
-    "run.resumed": {
+    StoredEventType.RUN_RESUMED.value: {
         "resumed_from": _enum(_PAUSE_STATUSES),
         "image_count": _num,
         "submitted_results": _list(
@@ -367,41 +355,41 @@ _SCHEMAS: dict[str, dict[str, Check]] = {
             )
         ),
     },
-    "run.completed": {
+    StoredEventType.RUN_COMPLETED.value: {
         "status": _enum(_RUN_STATUSES),
         "stop_reason": _enum(_STOP_REASONS),
         "truncated": _bool,
     },
-    "run.error": {
+    StoredEventType.RUN_ERROR.value: {
         "failure_reason": _enum(_FAILURE_REASONS),
         "status": _enum(_RUN_STATUSES),
         "stop_reason": _enum(_STOP_REASONS),
         "truncated": _bool,
         "error_info": _ERROR_INFO,
     },
-    "run.cancelled": {
+    StoredEventType.RUN_CANCELLED.value: {
         "reason": _enum(_CANCEL_REASONS),
         "interrupted": _bool,
         "partial_output": _bool,
         "exceeded": _list(_EXCEEDED),
         "failure_reason": _enum(_FAILURE_REASONS),
     },
-    "run.lease_expired": {"gap_s": _num},
-    "run.reclaimed": {
+    StoredEventType.RUN_LEASE_EXPIRED.value: {"gap_s": _num},
+    StoredEventType.RUN_RECLAIMED.value: {
         "attempt": _num,
         "previous_epoch": _num,
         "gap_s": _num,
         "governance_changed": _bool,
     },
-    "run.interrupted": {"failure_reason": _enum(_FAILURE_REASONS)},
-    "run.abandoned": {"failure_reason": _enum(_FAILURE_REASONS)},
+    StoredEventType.RUN_INTERRUPTED.value: {"failure_reason": _enum(_FAILURE_REASONS)},
+    StoredEventType.RUN_ABANDONED.value: {"failure_reason": _enum(_FAILURE_REASONS)},
     # loops/react.py: gated calls are declared tools; params in _special
-    "approval.requested": {
+    GovernanceEventType.APPROVAL_REQUESTED.value: {
         "tool_name": _declared,
         "source": _enum(_APPROVAL_SOURCES),
         "reason": _enum(_CONSTANT_APPROVAL_REASONS),
     },
-    "approval.decided": {
+    GovernanceEventType.APPROVAL_DECIDED.value: {
         "decision": _enum(_DECISIONS),
         "run_id": _generated_id,
         "decisions": _list(
@@ -415,19 +403,19 @@ _SCHEMAS: dict[str, dict[str, Check]] = {
         ),
     },
     # react policy paths: hooks run on declared tools; error_type (a class name) hidden
-    "policy.denied": {
+    GovernanceEventType.POLICY_DENIED.value: {
         "tool_name": _declared,
         "source": _enum(_APPROVAL_SOURCES),
         "reason": _enum(_CONSTANT_DENIAL_REASONS),
     },
-    "policy.substituted": {"tool_name": _declared},
-    "policy.hook_error": {"tool_name": _declared},
-    "policy.hook_warning": {
+    GovernanceEventType.POLICY_SUBSTITUTED.value: {"tool_name": _declared},
+    GovernanceEventType.POLICY_HOOK_ERROR.value: {"tool_name": _declared},
+    GovernanceEventType.POLICY_HOOK_WARNING.value: {
         "tool_name": _declared,
         "warning": _enum({_CLIENT_APPROVAL_REASON}),
     },
     # runtime/persistence.py: numbers and enumerations; model hidden
-    "llm.completed": {
+    StoredEventType.LLM_COMPLETED.value: {
         "input_tokens": _num,
         "output_tokens": _num,
         "cache_read_input_tokens": _num,
@@ -439,16 +427,20 @@ _SCHEMAS: dict[str, dict[str, Check]] = {
         "has_tool_calls": _bool,
         "phase": _enum(_PHASES),
     },
-    "llm.failed": {
+    StoredEventType.LLM_FAILED.value: {
         "error_info": _ERROR_INFO,
         "timeout_reason": _enum(TIMEOUT_REASONS),
         "duration_ms": _num,
     },
     # persistence: tool_name and code decided in _special; parse_error hidden
     # (a provider adapter may set it), raw_length kept
-    "tool.started": {"tool_name": _declared, "call_id": lambda _: _HIDE, "idempotent": _bool},
-    "tool.replayed": {"call_id": lambda _: _HIDE},
-    "tool.completed": {
+    StoredEventType.TOOL_STARTED.value: {
+        "tool_name": _declared,
+        "call_id": lambda _: _HIDE,
+        "idempotent": _bool,
+    },
+    StoredEventType.TOOL_REPLAYED.value: {"call_id": lambda _: _HIDE},
+    StoredEventType.TOOL_COMPLETED.value: {
         "tool_name": _declared,
         "target": _enum(_TARGETS),
         "success": _bool,
@@ -458,49 +450,67 @@ _SCHEMAS: dict[str, dict[str, Check]] = {
         "image_count": _num,
     },
     # llm/_retry_telemetry.py: endpoint (request path) hidden; retry_after a number
-    "provider.retry": {"status_code": _num, "attempt": _num, "retry_after": _retry_after},
+    GovernanceEventType.PROVIDER_RETRY.value: {
+        "status_code": _num,
+        "attempt": _num,
+        "retry_after": _retry_after,
+    },
     # guardrail paths: kinds are a scanner's output, so only built-in kinds are named
-    "guardrail.blocked": {
+    GovernanceEventType.GUARDRAIL_BLOCKED.value: {
         "direction": _enum(_DIRECTIONS),
         "code": _enum(_GUARDRAIL_CODES),
         "kinds": _kinds,
         "counts": _kinds,
     },
-    "guardrail.detected": {
+    GovernanceEventType.GUARDRAIL_DETECTED.value: {
         "direction": _enum(_DIRECTIONS),
         "findings_count": _num,
         "entities": _kinds,
     },
-    "guardrail.redacted": {"direction": _enum(_DIRECTIONS), "entities": _kinds},
+    GovernanceEventType.GUARDRAIL_REDACTED.value: {
+        "direction": _enum(_DIRECTIONS),
+        "entities": _kinds,
+    },
     # runner: placeholder-shaped tokens the model wrote: only their count (in _special)
-    "guardrail.unmapped_placeholder": {},
-    "guardrail.restore_skipped": {
+    GovernanceEventType.GUARDRAIL_UNMAPPED_PLACEHOLDER.value: {},
+    GovernanceEventType.GUARDRAIL_RESTORE_SKIPPED.value: {
         "tool_name": _declared,
         "entities": _kinds,
         "count": _num,
         "code": _enum(_RESTORE_CODES),
     },
-    "guardrail.image_unscanned": {"count": _num},
+    GovernanceEventType.GUARDRAIL_IMAGE_UNSCANNED.value: {"count": _num},
     # the run's declared non-MCP tool names (positive evidence for readers):
     # redacted readers see only how many
-    "tools.declared": {},
+    StoredEventType.TOOLS_DECLARED.value: {},
     # skills/_session.py: names, revisions and paths are checked against the
     # developer's skills before they are written
-    "skill.catalog_resolved": {
+    GovernanceEventType.SKILL_CATALOG_RESOLVED.value: {
         "delivery": _enum(_SKILL_DELIVERY),
         "skills": _list(_obj({"name": _declared, "revision": _declared, "digest": _digest})),
         "denied": _list(_declared),
     },
-    "skill.activated": {"name": _declared, "digest": _digest, "origin": _enum(_SKILL_ORIGINS)},
-    "skill.activation_failed": {"name": _declared, "reason": _enum(_SKILL_ACTIVATION)},
-    "skill.resource_read": {
+    GovernanceEventType.SKILL_ACTIVATED.value: {
+        "name": _declared,
+        "digest": _digest,
+        "origin": _enum(_SKILL_ORIGINS),
+    },
+    GovernanceEventType.SKILL_ACTIVATION_FAILED.value: {
+        "name": _declared,
+        "reason": _enum(_SKILL_ACTIVATION),
+    },
+    GovernanceEventType.SKILL_RESOURCE_READ.value: {
         "name": _declared,
         "path": _declared,
         "chars": _num,
         "truncated": _bool,
     },
-    "skill.script_requested": {"name": _declared, "path": _declared, "argc": _num},
-    "skill.script_completed": {
+    GovernanceEventType.SKILL_SCRIPT_REQUESTED.value: {
+        "name": _declared,
+        "path": _declared,
+        "argc": _num,
+    },
+    GovernanceEventType.SKILL_SCRIPT_COMPLETED.value: {
         "name": _declared,
         "path": _declared,
         "exit_code": _num,
@@ -509,26 +519,26 @@ _SCHEMAS: dict[str, dict[str, Check]] = {
         "stderr_chars": _num,
         "truncated": _bool,
     },
-    "skill.script_failed": {
+    GovernanceEventType.SKILL_SCRIPT_FAILED.value: {
         "name": _declared,
         "path": _declared,
         "error_type": _enum(_SKILL_FAILURES),
     },
     # runtime/runner.py MCP: source names are configuration; exposed tool names
     # are the run's declared tool set; error text and class hidden
-    "mcp.connected": {
+    GovernanceEventType.MCP_CONNECTED.value: {
         "source_name": _declared,
         "namespace": _declared,
         "tool_count": _num,
     },
-    "mcp.error": {
+    GovernanceEventType.MCP_ERROR.value: {
         "source_name": _declared,
         "namespace": _declared,
         "code": _enum(_MCP_CODES),
         "failure_mode": _enum(_MCP_FAILURE_MODES),
         "reason": _enum(_MCP_AUTH_REASONS),
     },
-    "mcp.tools_skipped": {
+    GovernanceEventType.MCP_TOOLS_SKIPPED.value: {
         "skipped": _list(
             _obj(
                 {
@@ -541,21 +551,21 @@ _SCHEMAS: dict[str, dict[str, Check]] = {
         )
     },
     # loops/_budget.py
-    "budget.unpriced": {
+    GovernanceEventType.BUDGET_UNPRICED.value: {
         "metric": _enum(_BUDGET_METRICS),
         "used": _num,
         "max": _num,
         "unpriced_calls": _num,
         "known_cost_usd": _num,
     },
-    "budget.threshold": {
+    GovernanceEventType.BUDGET_THRESHOLD.value: {
         "metric": _enum(_BUDGET_METRICS),
         "fraction": _num,
         "used": _num,
         "max": _num,
         "reason": _enum(_BUDGET_REASONS),
     },
-    "budget.exceeded": {
+    GovernanceEventType.BUDGET_EXCEEDED.value: {
         "metric": _enum(_BUDGET_METRICS),
         "used": _num,
         "max": _num,
@@ -563,14 +573,14 @@ _SCHEMAS: dict[str, dict[str, Check]] = {
         "action": _enum(_BUDGET_ACTIONS),
     },
     # runtime/submit.py
-    "governance.changed": {
+    GovernanceEventType.GOVERNANCE_CHANGED.value: {
         "expected_digest": _digest,
         "actual_digest": _digest,
         "changed": _list(_enum(_GOVERNANCE_PARTS)),
     },
-    "inbox.delivered": {"note_id": _generated_id},
+    GovernanceEventType.INBOX_DELIVERED.value: {"note_id": _generated_id},
     # loops/_images.py: model hidden; tenant_scope is the run's own (approved)
-    "image.rejected": {
+    GovernanceEventType.IMAGE_REJECTED.value: {
         "image_id": _generated_id,
         "sha256": _digest,
         "tenant_scope": _declared,
@@ -579,14 +589,18 @@ _SCHEMAS: dict[str, dict[str, Check]] = {
         "located": _bool,
         "retried": _bool,
     },
-    "image.view_changed": {"epoch": _num, "dropped_through": _num, "visible": _num},
-    "image.degraded": {
+    GovernanceEventType.IMAGE_VIEW_CHANGED.value: {
+        "epoch": _num,
+        "dropped_through": _num,
+        "visible": _num,
+    },
+    GovernanceEventType.IMAGE_DEGRADED.value: {
         "reason": _enum(_PLACEHOLDER_REASONS),
         "count": _num,
         "slots": _list(_num),
     },
-    "image.warning": {"warning": _enum(_IMAGE_WARNINGS)},
-    "image.state": {
+    GovernanceEventType.IMAGE_WARNING.value: {"warning": _enum(_IMAGE_WARNINGS)},
+    GovernanceEventType.IMAGE_STATE.value: {
         "tenant_scope": _declared,
         "described": _list(_obj({"sha256": _digest})),
         "guardrail_verdicts": _list(
@@ -674,14 +688,14 @@ def _skipped_names(
 
 
 _SPECIAL: dict[str, Special] = {
-    "run.paused": _active_paused,
-    "approval.requested": _active_request,
-    "image.state": _image_names,
-    "tool.completed": _tool_result,
-    "skill.activation_failed": _skill_name,
-    "guardrail.unmapped_placeholder": _count_of("placeholders"),
-    "tools.declared": _count_of("local_tool_names"),
-    "mcp.tools_skipped": _skipped_names,
+    StoredEventType.RUN_PAUSED.value: _active_paused,
+    GovernanceEventType.APPROVAL_REQUESTED.value: _active_request,
+    GovernanceEventType.IMAGE_STATE.value: _image_names,
+    StoredEventType.TOOL_COMPLETED.value: _tool_result,
+    GovernanceEventType.SKILL_ACTIVATION_FAILED.value: _skill_name,
+    GovernanceEventType.GUARDRAIL_UNMAPPED_PLACEHOLDER.value: _count_of("placeholders"),
+    StoredEventType.TOOLS_DECLARED.value: _count_of("local_tool_names"),
+    GovernanceEventType.MCP_TOOLS_SKIPPED.value: _skipped_names,
 }
 
 
@@ -708,18 +722,18 @@ def _special(event: StoredEvent, raw: dict[str, Any], shown: dict[str, Any], ctx
 # it, and "<unknown_tool>" otherwise (missing or partial records, custom
 # stores, older runs, standalone ``redact_event``).
 _TOOL_NAME_PATHS: dict[str, tuple[str | None, str]] = {
-    "tool.started": (None, "tool_name"),
-    "tool.completed": (None, "tool_name"),
-    "approval.requested": (None, "tool_name"),
-    "policy.denied": (None, "tool_name"),
-    "policy.substituted": (None, "tool_name"),
-    "policy.hook_error": (None, "tool_name"),
-    "policy.hook_warning": (None, "tool_name"),
-    "guardrail.restore_skipped": (None, "tool_name"),
-    "approval.decided": ("decisions", "tool_name"),
-    "run.paused": ("pending_tool_calls", "name"),
-    "run.resumed": ("submitted_results", "name"),
-    "image.state": ("guardrail_verdicts", "tool_name"),
+    StoredEventType.TOOL_STARTED.value: (None, "tool_name"),
+    StoredEventType.TOOL_COMPLETED.value: (None, "tool_name"),
+    GovernanceEventType.APPROVAL_REQUESTED.value: (None, "tool_name"),
+    GovernanceEventType.POLICY_DENIED.value: (None, "tool_name"),
+    GovernanceEventType.POLICY_SUBSTITUTED.value: (None, "tool_name"),
+    GovernanceEventType.POLICY_HOOK_ERROR.value: (None, "tool_name"),
+    GovernanceEventType.POLICY_HOOK_WARNING.value: (None, "tool_name"),
+    GovernanceEventType.GUARDRAIL_RESTORE_SKIPPED.value: (None, "tool_name"),
+    GovernanceEventType.APPROVAL_DECIDED.value: ("decisions", "tool_name"),
+    StoredEventType.RUN_PAUSED.value: ("pending_tool_calls", "name"),
+    StoredEventType.RUN_RESUMED.value: ("submitted_results", "name"),
+    GovernanceEventType.IMAGE_STATE.value: ("guardrail_verdicts", "tool_name"),
 }
 TOOL_NAME_EVENTS = frozenset(_TOOL_NAME_PATHS)
 DENDRUX_TOOL_NAMES = SKILL_TOOL_NAMES
@@ -749,7 +763,10 @@ def _shown_tool_name(name: Any, ctx: _Context) -> Any:
 
 def _verify_tool_names(kind: str, shown: dict[str, Any], ctx: _Context) -> None:
     container, key = _TOOL_NAME_PATHS[kind]
-    if ctx.active and kind in ("run.paused", "approval.requested"):
+    if ctx.active and kind in (
+        StoredEventType.RUN_PAUSED.value,
+        GovernanceEventType.APPROVAL_REQUESTED.value,
+    ):
         return  # the active pause's names, which a client acts on (B2)
     items = [shown] if container is None else shown.get(container, [])
     for item in items:
@@ -770,14 +787,16 @@ def _unknown_tool(data: dict[str, Any], event: StoredEvent, ctx: _Context) -> bo
 
 # Event types whose correlation_id is an id Dendrux generates (an LLM
 # interaction, an inbox note). Every other correlation id is a ToolCall.id.
-_DENDRUX_CORRELATED = frozenset({"llm.completed", "inbox.delivered"})
+_DENDRUX_CORRELATED = frozenset(
+    {StoredEventType.LLM_COMPLETED.value, GovernanceEventType.INBOX_DELIVERED.value}
+)
 
 
 def _without_call_correlation(event: StoredEvent, active: bool) -> StoredEvent:
     """Hide a tool call id carried as ``correlation_id`` (a custom provider may
     choose it), except on the active pause's approval request."""
     keep = event.event_type in _DENDRUX_CORRELATED or (
-        active and event.event_type == "approval.requested"
+        active and event.event_type == GovernanceEventType.APPROVAL_REQUESTED.value
     )
     if keep or event.correlation_id is None:
         return event
@@ -884,7 +903,7 @@ def _with_recorded_args(
 ) -> dict[str, Any]:
     data = dict(event.data or {})
     if (
-        event.event_type == "run.paused"
+        event.event_type == StoredEventType.RUN_PAUSED.value
         and is_one_of(data.get("status"), _PLACEHOLDER_PAUSES)
         and isinstance(data.get("pending_tool_calls"), list)
     ):
@@ -898,17 +917,24 @@ def _with_recorded_args(
 # ---------------------------------------------------------------------------
 
 # Event types whose view depends on the run's active pause.
-PAUSE_VIEW_EVENTS = frozenset({"run.paused", "approval.requested"})
+PAUSE_VIEW_EVENTS = frozenset(
+    {StoredEventType.RUN_PAUSED.value, GovernanceEventType.APPROVAL_REQUESTED.value}
+)
 # Event types after which a cached view of the active pause may be out of date.
 PAUSE_CHANGING_EVENTS = PAUSE_VIEW_EVENTS | {
-    "run.resumed",
-    "run.completed",
-    "run.error",
-    "run.cancelled",
-    "run.interrupted",
-    "run.abandoned",
+    StoredEventType.RUN_RESUME_ABORTED.value,
+    StoredEventType.RUN_RESUMED.value,
+    StoredEventType.RUN_COMPLETED.value,
+    StoredEventType.RUN_ERROR.value,
+    StoredEventType.RUN_CANCELLED.value,
+    StoredEventType.RUN_INTERRUPTED.value,
+    StoredEventType.RUN_ABANDONED.value,
 }
-_PAUSE_EVENT_TYPES = ["approval.requested", "run.paused", "run.resumed"]
+_PAUSE_EVENT_TYPES = [
+    GovernanceEventType.APPROVAL_REQUESTED.value,
+    StoredEventType.RUN_PAUSED.value,
+    StoredEventType.RUN_RESUMED.value,
+]
 _PAGE = 1000
 _PAST_WINDOW = 1024
 
@@ -981,12 +1007,12 @@ class PastParams:
 
     def _consume(self, event: StoredEvent) -> None:
         data = data_of(event)
-        if event.event_type == "approval.requested":
+        if event.event_type == GovernanceEventType.APPROVAL_REQUESTED.value:
             call_id, params = data.get("call_id"), data.get("params")
             if isinstance(call_id, str) and isinstance(params, dict):
                 self.current[call_id] = params
         else:
-            if event.event_type == "run.paused":
+            if event.event_type == StoredEventType.RUN_PAUSED.value:
                 self.found[event.sequence_index] = self.current
                 if len(self.found) > _PAST_WINDOW:
                     del self.found[next(iter(self.found))]
@@ -1012,7 +1038,7 @@ async def view_with(
     seq = event.sequence_index
     active = False
     params = None
-    if event.event_type == "approval.requested":
+    if event.event_type == GovernanceEventType.APPROVAL_REQUESTED.value:
         # Inside the active pause's own event window, never by call id (a
         # custom provider may reuse one across pauses).
         active = (
@@ -1020,7 +1046,7 @@ async def view_with(
             and view.window_start is not None
             and view.window_start < seq < view.active
         )
-    elif event.event_type == "run.paused":
+    elif event.event_type == StoredEventType.RUN_PAUSED.value:
         active = seq == view.active
         if (include_payloads or active) and is_one_of(data.get("status"), _PLACEHOLDER_PAUSES):
             params = view.active_params if active else await past.get(store, run_id, seq, tenant_id)
@@ -1040,7 +1066,10 @@ def needs_tool_evidence(event: StoredEvent, include_payloads: bool) -> bool:
     return not include_payloads and event.event_type in TOOL_NAME_EVENTS
 
 
-_TOOL_EVIDENCE_EVENTS = ["tools.declared", "mcp.connected"]
+_TOOL_EVIDENCE_EVENTS = [
+    StoredEventType.TOOLS_DECLARED.value,
+    GovernanceEventType.MCP_CONNECTED.value,
+]
 TOOL_EVIDENCE_EVENTS = frozenset(_TOOL_EVIDENCE_EVENTS)
 
 
@@ -1056,13 +1085,17 @@ async def read_tool_evidence(store: Any, run_id: str, tenant_id: TenantScope) ->
         return ToolEvidence(None, None)
     found: dict[str, set[str]] = {}
     for row in rows:
-        key = "local_tool_names" if row.event_type == "tools.declared" else "tool_names"
+        key = (
+            "local_tool_names"
+            if row.event_type == StoredEventType.TOOLS_DECLARED.value
+            else "tool_names"
+        )
         listed = data_of(row).get(key)
         names = found.setdefault(row.event_type, set())
         if isinstance(listed, list):
             names.update(n for n in listed if isinstance(n, str))
-    local = found.get("tools.declared")
-    mcp = found.get("mcp.connected")
+    local = found.get(StoredEventType.TOOLS_DECLARED.value)
+    mcp = found.get(GovernanceEventType.MCP_CONNECTED.value)
     return ToolEvidence(
         frozenset(local) if local is not None else None,
         frozenset(mcp) if mcp is not None else None,
@@ -1071,7 +1104,7 @@ async def read_tool_evidence(store: Any, run_id: str, tenant_id: TenantScope) ->
 
 def needs_declared_tools(event: StoredEvent, include_payloads: bool) -> bool:
     """A redacted ``image.state``: its verdicts' tool names need the run's recorded tools."""
-    return not include_payloads and event.event_type == "image.state"
+    return not include_payloads and event.event_type == GovernanceEventType.IMAGE_STATE.value
 
 
 async def read_declared_tools(
@@ -1084,7 +1117,7 @@ def needs_unknown_calls(event: StoredEvent, include_payloads: bool) -> bool:
     """A redacted failed ``tool.completed``: its name needs the run's rejected calls."""
     return (
         not include_payloads
-        and event.event_type == "tool.completed"
+        and event.event_type == StoredEventType.TOOL_COMPLETED.value
         and data_of(event).get("success") is not True
     )
 

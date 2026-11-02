@@ -18,9 +18,10 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
+from dendrux._lifecycle import PAUSE_STATUSES as _PAUSE_STATUSES
 from dendrux.errors import ProviderError
 from dendrux.loops.base import BaseNotifier
-from dendrux.types import ErrorInfo, Message, Role, ToolCall, ToolResult
+from dendrux.types import ErrorInfo, Message, Role, RunStatus, ToolCall, ToolResult
 from dendrux.types import GovernanceEventType as _GovType
 
 if TYPE_CHECKING:
@@ -30,7 +31,6 @@ if TYPE_CHECKING:
 # The pause states are still terminal-from-runner-perspective, but the
 # final SUCCESS/ERROR/CANCELLED flavors get the rich print_summary panel
 # instead so we don't double-paint when callers also call print_summary.
-_PAUSE_STATUSES = {"waiting_client_tool", "waiting_human_input", "waiting_approval", "paused"}
 
 _console = Console()
 
@@ -370,7 +370,7 @@ class ConsoleNotifier(BaseNotifier):
         table.add_column(style="dim")
         table.add_column(style="bold")
 
-        status_style = "green" if result.status.value == "success" else "yellow"
+        status_style = "green" if result.status.value == RunStatus.SUCCESS.value else "yellow"
         table.add_row("status", f"[{status_style}]{result.status.value}[/{status_style}]")
         table.add_row("iterations", str(result.iteration_count))
         table.add_row("tokens", f"{result.usage.total_tokens:,}")
@@ -396,7 +396,9 @@ class ConsoleNotifier(BaseNotifier):
             Panel(
                 table,
                 title="[bold]Run Complete[/bold]",
-                border_style="bright_green" if result.status.value == "success" else "yellow",
+                border_style="bright_green"
+                if result.status.value == RunStatus.SUCCESS.value
+                else "yellow",
                 width=min(50, _console.width),
                 padding=(0, 1),
             )

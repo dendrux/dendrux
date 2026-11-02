@@ -10,6 +10,11 @@ from contextvars import ContextVar, Token
 from typing import TYPE_CHECKING, Any
 
 from dendrux import _codes
+from dendrux._lifecycle import GovernanceEventType
+from dendrux._meta_keys import (
+    INTERNAL_META_KEY,
+    SKILLS_META_KEY,
+)
 from dendrux.errors import SkillDigestMismatch
 from dendrux.skills import Skill, SkillExecutionRequest, SkillExecutionResult
 from dendrux.skills._internal import (
@@ -29,7 +34,8 @@ if TYPE_CHECKING:
     from dendrux.runtime.state import StateStore
 
 NAMES = frozenset({"use_skill", "read_skill_resource", "run_skill_script"})
-META_KEY = "dendrux.skills"
+
+META_KEY = SKILLS_META_KEY
 _current: ContextVar[SkillSession | None] = ContextVar("skill_session", default=None)
 
 
@@ -169,7 +175,7 @@ class SkillSession:
         if not self.configured:
             return
         await self.emit(
-            "skill.catalog_resolved",
+            GovernanceEventType.SKILL_CATALOG_RESOLVED.value,
             {
                 "delivery": self.delivery,
                 "skills": self.manifest()["skills"],
@@ -179,7 +185,7 @@ class SkillSession:
         names = sorted(self.available) if self.delivery == "inlined" else self.explicit
         for name in names:
             await self.emit(
-                "skill.activated",
+                GovernanceEventType.SKILL_ACTIVATED.value,
                 {
                     "name": name,
                     "digest": self.available[name].digest,
@@ -206,7 +212,7 @@ class SkillSession:
                     }[name],
                     parameters={"type": "object", "properties": props, "required": list(props)},
                     parallel=parallel,
-                    meta={"dendrux.internal": True},
+                    meta={INTERNAL_META_KEY: True},
                 )
             )
 
@@ -247,7 +253,7 @@ class SkillSession:
         if not isinstance(name, str) or name not in self.available:
             if tc.name == "use_skill":
                 await self.emit(
-                    "skill.activation_failed",
+                    GovernanceEventType.SKILL_ACTIVATION_FAILED.value,
                     {
                         "name": str(name)[:256],
                         "reason": "denied"
@@ -289,7 +295,7 @@ class SkillSession:
             if self.executor is None:
                 if approved:
                     await self.emit(
-                        "skill.script_failed",
+                        GovernanceEventType.SKILL_SCRIPT_FAILED.value,
                         {"name": name, "path": path, "error_type": "executor_unavailable"},
                         tc.id,
                     )
@@ -297,7 +303,9 @@ class SkillSession:
             if requested and tc.id not in self.requested:
                 self.requested.add(tc.id)
                 await self.emit(
-                    "skill.script_requested", {"name": name, "path": path, "argc": len(args)}, tc.id
+                    GovernanceEventType.SKILL_SCRIPT_REQUESTED.value,
+                    {"name": name, "path": path, "argc": len(args)},
+                    tc.id,
                 )
         return None
 
@@ -328,7 +336,7 @@ class SkillSession:
                     skill, scripts_runnable=self.executor is not None
                 )
                 await self.emit(
-                    "skill.activated",
+                    GovernanceEventType.SKILL_ACTIVATED.value,
                     {"name": name, "digest": skill.digest, "origin": "model"},
                     tc.id,
                 )
@@ -343,7 +351,7 @@ class SkillSession:
                 f"\n[truncated: showing 50000 of {len(value)} chars]" if truncated else ""
             )
             await self.emit(
-                "skill.resource_read",
+                GovernanceEventType.SKILL_RESOURCE_READ.value,
                 {"name": name, "path": path, "chars": len(value), "truncated": truncated},
                 tc.id,
             )
@@ -367,7 +375,9 @@ class SkillSession:
         except Exception as exc:
             error_type = "timeout" if deadline.expired() else type(exc).__name__
             await self.emit(
-                "skill.script_failed", {"name": name, "path": path, "error_type": error_type}, tc.id
+                GovernanceEventType.SKILL_SCRIPT_FAILED.value,
+                {"name": name, "path": path, "error_type": error_type},
+                tc.id,
             )
             return self.failure(tc, f"{error_type}: {exc}")
         if (
@@ -378,7 +388,7 @@ class SkillSession:
             or isinstance(result.exit_code, bool)
         ):
             await self.emit(
-                "skill.script_failed",
+                GovernanceEventType.SKILL_SCRIPT_FAILED.value,
                 {"name": name, "path": path, "error_type": "invalid_result"},
                 tc.id,
             )
@@ -386,7 +396,7 @@ class SkillSession:
         truncated = len(result.stdout) > 20000 or len(result.stderr) > 20000
         duration = int((time.monotonic() - start) * 1000)
         await self.emit(
-            "skill.script_completed",
+            GovernanceEventType.SKILL_SCRIPT_COMPLETED.value,
             {
                 "name": name,
                 "path": path,

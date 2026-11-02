@@ -30,6 +30,16 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
 from dendrux import _codes
+from dendrux._lifecycle import (
+    STORAGE_FORMAT_CHECKPOINTED,
+    ApprovalReason,
+    DenialReason,
+    FailureReason,
+    PauseReason,
+)
+from dendrux._meta_keys import (
+    NOT_EXECUTED_META_KEY,
+)
 from dendrux.errors import ImageError, ImagePersistenceUnsupportedError
 from dendrux.guardrails._engine import GuardrailEngine
 from dendrux.llm._calls import complete_call, stream_call
@@ -171,7 +181,7 @@ def _blocked_data(direction: str, error: str, findings: list[Any], location: str
     return {
         "direction": direction,
         "error": error,
-        "code": "guardrail_blocked",
+        "code": FailureReason.GUARDRAIL_BLOCKED.value,
         "kinds": sorted(counts),
         "counts": counts,
         "location": location,
@@ -334,7 +344,10 @@ def _pending_limit_result(
     usage: UsageStats,
     meta: dict[str, Any],
 ) -> RunResult | None:
-    if state_store is None or getattr(state_store, "storage_format", 1) != 2:
+    if (
+        state_store is None
+        or getattr(state_store, "storage_format", 1) != STORAGE_FORMAT_CHECKPOINTED
+    ):
         return None
     if len(response.tool_calls or ()) <= agent._limits.max_pending_calls:
         return None
@@ -347,7 +360,7 @@ def _pending_limit_result(
         commentary=_commentary(steps),
         iteration_count=iteration,
         usage=usage,
-        meta={**meta, "failure_reason": "pending_limit"},
+        meta={**meta, "failure_reason": FailureReason.PENDING_LIMIT.value},
     )
 
 
@@ -450,7 +463,7 @@ def _checkpoint_pause_result(
         iteration=iteration - 1,
         trace_order_offset=len(history),
         usage=_snapshot_usage(usage),
-        pause_reason="budget" if exceeded else "requested",
+        pause_reason=PauseReason.BUDGET.value if exceeded else PauseReason.REQUESTED.value,
         budget_exceeded=exceeded,
         image_view=image_view,
         **(budget.pause_fields() if budget is not None else {}),
@@ -714,7 +727,7 @@ async def _init_loop_state(
         if (
             msg.role == Role.TOOL
             and msg.name is not None
-            and not msg.meta.get("dendrux.not_executed")
+            and not msg.meta.get(NOT_EXECUTED_META_KEY)
         ):
             call_counts[msg.name] = call_counts.get(msg.name, 0) + 1
 
@@ -861,15 +874,20 @@ async def _process_tool_calls(
             event_data = {
                 "tool_name": tc.name,
                 "call_id": tc.id,
-                "reason": "denied_by_policy",
+                "reason": DenialReason.DENIED_BY_POLICY.value,
             }
             await _record_governance(
-                recorder, run_id, "policy.denied", iteration, event_data, correlation_id=tc.id
+                recorder,
+                run_id,
+                GovernanceEventType.POLICY_DENIED.value,
+                iteration,
+                event_data,
+                correlation_id=tc.id,
             )
             await _notify_governance(
                 notifier,
                 run_id,
-                "policy.denied",
+                GovernanceEventType.POLICY_DENIED.value,
                 iteration,
                 event_data,
                 correlation_id=tc.id,
@@ -916,7 +934,7 @@ async def _process_tool_calls(
     if guardrail_engine is not None:
 
         async def restore_skipped(data: dict[str, Any], call_id: str) -> None:
-            event = "guardrail.restore_skipped"
+            event = GovernanceEventType.GUARDRAIL_RESTORE_SKIPPED.value
             await _record_governance(
                 recorder, run_id, event, iteration, data, correlation_id=call_id
             )
@@ -985,7 +1003,7 @@ async def _process_tool_calls(
     # --- Phase 0.75: before_tool policy hook ---
     approval_set = require_approval or frozenset()
     gates: dict[str, dict[str, str | None]] = {
-        tc.id: {"source": "static", "reason": "requires_approval"}
+        tc.id: {"source": "static", "reason": ApprovalReason.REQUIRES_APPROVAL.value}
         for tc in non_denied
         if tc.name in approval_set
     }
@@ -1016,10 +1034,12 @@ async def _process_tool_calls(
                 approval_data: dict[str, Any] = {
                     "tool_name": tc.name,
                     "call_id": tc.id,
-                    "reason": "requires_approval",
+                    "reason": ApprovalReason.REQUIRES_APPROVAL.value,
                 }
                 if gate["source"] == "hook":
-                    approval_data["reason"] = gate["reason"] or "requires_approval"
+                    approval_data["reason"] = (
+                        gate["reason"] or ApprovalReason.REQUIRES_APPROVAL.value
+                    )
                     approval_data["source"] = "hook"
                 # What is being approved: the call as the model sent it
                 # (placeholder form, pre-coercion). Coercion is deterministic
@@ -1030,7 +1050,7 @@ async def _process_tool_calls(
                 await _record_governance(
                     recorder,
                     run_id,
-                    "approval.requested",
+                    GovernanceEventType.APPROVAL_REQUESTED.value,
                     iteration,
                     approval_data,
                     correlation_id=tc.id,
@@ -1038,7 +1058,7 @@ async def _process_tool_calls(
                 await _notify_governance(
                     notifier,
                     run_id,
-                    "approval.requested",
+                    GovernanceEventType.APPROVAL_REQUESTED.value,
                     iteration,
                     approval_data,
                     correlation_id=tc.id,
@@ -1118,8 +1138,8 @@ async def _hook_tenant_id(
     return record.tenant_id if record is not None else None
 
 
-_HOOK_ERROR_REASON = "policy hook error"
-_CLIENT_APPROVAL_REASON = "approval is not supported for client tools"
+_HOOK_ERROR_REASON = DenialReason.HOOK_ERROR.value
+_CLIENT_APPROVAL_REASON = DenialReason.CLIENT_APPROVAL_UNSUPPORTED.value
 
 
 def _tool_source(name: str, lookups: ToolLookups) -> Literal["local", "mcp", "skill"]:
@@ -1225,7 +1245,7 @@ async def _apply_before_tool(
     async def deny(tc: ToolCall, reason: str) -> None:
         gates.pop(tc.id, None)
         await governance(
-            "policy.denied",
+            GovernanceEventType.POLICY_DENIED.value,
             {"tool_name": tc.name, "call_id": tc.id, "reason": reason, "source": "hook"},
             tc.id,
         )
@@ -1241,7 +1261,7 @@ async def _apply_before_tool(
 
     async def hook_error(tc: ToolCall, error_type: str) -> None:
         await governance(
-            "policy.hook_error",
+            GovernanceEventType.POLICY_HOOK_ERROR.value,
             {"tool_name": tc.name, "call_id": tc.id, "error_type": error_type},
             tc.id,
         )
@@ -1272,7 +1292,7 @@ async def _apply_before_tool(
         if decision.kind == "require_approval":
             if lookups.target.get(tc.name, ToolTarget.SERVER) != ToolTarget.SERVER:
                 await governance(
-                    "policy.hook_warning",
+                    GovernanceEventType.POLICY_HOOK_WARNING.value,
                     {
                         "tool_name": tc.name,
                         "call_id": tc.id,
@@ -1317,7 +1337,11 @@ async def _apply_before_tool(
             meta={"substituted": True},
             images=sub_images,
         )
-        await governance("policy.substituted", {"tool_name": tc.name, "call_id": tc.id}, tc.id)
+        await governance(
+            GovernanceEventType.POLICY_SUBSTITUTED.value,
+            {"tool_name": tc.name, "call_id": tc.id},
+            tc.id,
+        )
         await append(tc, substituted, record=True)
     return kept
 
@@ -1432,7 +1456,7 @@ def _mark_call_rejections(
     if rejected:
         for message in history[start:]:
             if message.role == Role.TOOL and message.call_id in rejected:
-                message.meta["dendrux.not_executed"] = True
+                message.meta[NOT_EXECUTED_META_KEY] = True
 
 
 class ReActLoop(Loop):
@@ -1528,7 +1552,7 @@ class ReActLoop(Loop):
         )
         before_tool: BeforeToolHook | None = getattr(agent, "before_tool", None)
         hook_tenant_id = await _hook_tenant_id(before_tool, state_store, resolved_run_id)
-        g_engine = getattr(recorder, "guardrail_engine", None) or (
+        g_engine: GuardrailEngine | None = getattr(recorder, "guardrail_engine", None) or (
             GuardrailEngine(
                 agent.guardrails, pii_mapping=initial_pii_mapping, run_id=resolved_run_id
             )
@@ -1619,9 +1643,12 @@ class ReActLoop(Loop):
                 for msg_idx, msg in enumerate(messages):
                     if not msg.content:
                         continue
+                    shared_guardrail_engine = (
+                        getattr(recorder, "guardrail_engine", None) is g_engine
+                    )
                     project = (
                         g_engine.project_incoming_message
-                        if getattr(recorder, "guardrail_engine", None) is g_engine
+                        if shared_guardrail_engine
                         else g_engine.scan_incoming_message
                     )
                     cleaned_msg, findings, block_err = await project(msg, index=msg_idx)
@@ -1631,7 +1658,7 @@ class ReActLoop(Loop):
                         await _record_governance(
                             recorder,
                             resolved_run_id,
-                            "guardrail.blocked",
+                            GovernanceEventType.GUARDRAIL_BLOCKED.value,
                             iteration,
                             _blocked_data(
                                 "incoming", block_err, findings, _incoming_location(msg, msg_idx)
@@ -1640,7 +1667,7 @@ class ReActLoop(Loop):
                         await _notify_governance(
                             notifier,
                             resolved_run_id,
-                            "guardrail.blocked",
+                            GovernanceEventType.GUARDRAIL_BLOCKED.value,
                             iteration,
                             _blocked_data(
                                 "incoming", block_err, findings, _incoming_location(msg, msg_idx)
@@ -1657,7 +1684,7 @@ class ReActLoop(Loop):
                             usage=total_usage,
                             meta={
                                 **guardrail_meta(g_engine, notifier_warnings),
-                                "failure_reason": "guardrail_blocked",
+                                "failure_reason": FailureReason.GUARDRAIL_BLOCKED.value,
                             },
                         )
                     if cleaned_msg is not msg:
@@ -1670,7 +1697,7 @@ class ReActLoop(Loop):
                     await _record_governance(
                         recorder,
                         resolved_run_id,
-                        "guardrail.detected",
+                        GovernanceEventType.GUARDRAIL_DETECTED.value,
                         iteration,
                         {
                             "direction": "incoming",
@@ -1681,7 +1708,7 @@ class ReActLoop(Loop):
                     await _notify_governance(
                         notifier,
                         resolved_run_id,
-                        "guardrail.detected",
+                        GovernanceEventType.GUARDRAIL_DETECTED.value,
                         iteration,
                         {
                             "direction": "incoming",
@@ -1698,14 +1725,14 @@ class ReActLoop(Loop):
                     await _record_governance(
                         recorder,
                         resolved_run_id,
-                        "guardrail.redacted",
+                        GovernanceEventType.GUARDRAIL_REDACTED.value,
                         iteration,
                         {"direction": "incoming", "entities": _red_entities},
                     )
                     await _notify_governance(
                         notifier,
                         resolved_run_id,
-                        "guardrail.redacted",
+                        GovernanceEventType.GUARDRAIL_REDACTED.value,
                         iteration,
                         {"direction": "incoming", "entities": _red_entities},
                         warnings=notifier_warnings,
@@ -1863,7 +1890,7 @@ class ReActLoop(Loop):
                     await _record_governance(
                         recorder,
                         resolved_run_id,
-                        "guardrail.detected",
+                        GovernanceEventType.GUARDRAIL_DETECTED.value,
                         iteration,
                         {
                             "direction": "outgoing",
@@ -1874,7 +1901,7 @@ class ReActLoop(Loop):
                     await _notify_governance(
                         notifier,
                         resolved_run_id,
-                        "guardrail.detected",
+                        GovernanceEventType.GUARDRAIL_DETECTED.value,
                         iteration,
                         {
                             "direction": "outgoing",
@@ -1923,14 +1950,14 @@ class ReActLoop(Loop):
                     await _record_governance(
                         recorder,
                         resolved_run_id,
-                        "guardrail.blocked",
+                        GovernanceEventType.GUARDRAIL_BLOCKED.value,
                         iteration,
                         _blocked_data("outgoing", out_block, out_findings, "output"),
                     )
                     await _notify_governance(
                         notifier,
                         resolved_run_id,
-                        "guardrail.blocked",
+                        GovernanceEventType.GUARDRAIL_BLOCKED.value,
                         iteration,
                         _blocked_data("outgoing", out_block, out_findings, "output"),
                         warnings=notifier_warnings,
@@ -1945,7 +1972,7 @@ class ReActLoop(Loop):
                         usage=total_usage,
                         meta={
                             **guardrail_meta(g_engine, notifier_warnings),
-                            "failure_reason": "guardrail_blocked",
+                            "failure_reason": FailureReason.GUARDRAIL_BLOCKED.value,
                         },
                     )
 
@@ -2143,7 +2170,11 @@ class ReActLoop(Loop):
         meta: dict[str, Any],
     ) -> RunResult:
         """ERROR result for an image guardrail ``block`` (commit step 4)."""
-        await images.emit("guardrail.blocked", _image_block_data(error, images.state), iteration)
+        await images.emit(
+            GovernanceEventType.GUARDRAIL_BLOCKED.value,
+            _image_block_data(error, images.state),
+            iteration,
+        )
         return RunResult(
             run_id=run_id,
             status=RunStatus.ERROR,
@@ -2152,7 +2183,7 @@ class ReActLoop(Loop):
             commentary=_commentary(steps),
             iteration_count=iteration,
             usage=usage,
-            meta={**meta, "failure_reason": "guardrail_blocked"},
+            meta={**meta, "failure_reason": FailureReason.GUARDRAIL_BLOCKED.value},
         )
 
     async def run_stream(

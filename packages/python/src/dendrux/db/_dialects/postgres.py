@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from contextlib import contextmanager
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from sqlalchemy import exc, text
 
@@ -79,7 +79,7 @@ def read_columns(conn: Connection, tables: list[str]) -> dict[str, list[str]]:
     )
     actual: dict[str, list[str]] = {}
     for table_name, column_name in rows:
-        actual.setdefault(table_name, []).append(column_name)
+        actual.setdefault(cast("str", table_name), []).append(cast("str", column_name))
     return actual
 
 

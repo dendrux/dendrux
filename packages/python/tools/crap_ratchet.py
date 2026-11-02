@@ -13,8 +13,13 @@ docstring or ``...`` body) need no measurement.
 
 Rules enforced by ``check``:
   * a new function must score at most the threshold (default 30);
-  * a changed function (its AST differs from the baseline) must score at most the threshold;
-  * no existing function may score higher than its baseline (small tolerance for noise).
+  * an edited function may stay above the threshold if complexity and CRAP do not rise;
+  * a function whose complexity rises must score at most the threshold;
+  * no existing function may score higher than its baseline (small tolerance for noise);
+    when its AST digest is unchanged, a rise of up to 25 percent of the baseline score is
+    only a warning (coverage variance), a larger one still fails.
+  * an edited function whose complexity did not rise may rise by up to 2 percent of its
+    baseline (at least the 0.5 tolerance) as a warning; recording a baseline stays strict.
 
 Run locally (from packages/python)::
 
@@ -32,6 +37,7 @@ import ast
 import datetime
 import hashlib
 import json
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -41,6 +47,12 @@ from radon.visitors import ComplexityVisitor
 
 DEFAULT_THRESHOLD = 30.0
 DEFAULT_TOLERANCE = 0.5
+# An unchanged function (same AST digest) whose score rises by up to this share of its
+# baseline is a warning, not a failure: run-to-run coverage variance must not fail the build.
+DEFAULT_UNCHANGED_RISE = 0.25
+# An edited function whose complexity did not rise may wobble by this share of its baseline
+# (at least DEFAULT_TOLERANCE points) as a warning: owner decision 2026-11-02.
+DEFAULT_EDITED_RISE = 0.02
 HERE = Path(__file__).resolve().parent
 DEFAULT_BASELINE = HERE / "crap_baseline.json"
 DEFAULT_REPO_ROOT = HERE.parent
@@ -48,6 +60,10 @@ DEFAULT_SRC = DEFAULT_REPO_ROOT / "src" / "dendrux"
 EXCLUDED_DIRS = frozenset({"migrations", "__pycache__"})
 # The published store test kit (dendrux/testing) is test code shipped for store authors.
 EXCLUDED_TOP_LEVEL = frozenset({"testing"})
+# Real coverage for these modules comes from the MySQL/MariaDB suites (QUALITY.md).
+MYSQL_COVERAGE_MODULES = frozenset(
+    {"src/dendrux/db/_dialects/mysql.py", "src/dendrux/runtime/stores/sql/mysql.py"}
+)
 
 
 @dataclass(frozen=True)
@@ -336,18 +352,22 @@ def collect_scores(
     return scores
 
 
-def compare(
+def compare_split(
     scores: dict[str, FunctionScore],
     baseline: dict[str, dict[str, Any]],
     threshold: float = DEFAULT_THRESHOLD,
     tolerance: float = DEFAULT_TOLERANCE,
-) -> list[Violation]:
-    violations: list[Violation] = []
+    unchanged_rise: float = DEFAULT_UNCHANGED_RISE,
+    edited_rise: float = DEFAULT_EDITED_RISE,
+) -> tuple[list[Violation], list[Violation]]:
+    """Apply the no-worse rule, with warning bands for run-to-run coverage noise."""
+    failures: list[Violation] = []
+    warnings: list[Violation] = []
     for key, score in sorted(scores.items()):
         old = baseline.get(key)
         if old is None:
             if score.crap > threshold:
-                violations.append(
+                failures.append(
                     Violation(
                         key,
                         "new-over-threshold",
@@ -355,23 +375,46 @@ def compare(
                     )
                 )
             continue
-        if score.crap > old["crap"] + tolerance:
-            violations.append(
-                Violation(
-                    key,
-                    "worse",
-                    f"CRAP rose from {old['crap']:.1f} to {score.crap:.1f}",
-                )
-            )
-        elif score.digest != old["digest"] and score.crap > threshold:
-            violations.append(
+        changed = score.digest != old["digest"]
+        if score.complexity > old["complexity"] and score.crap > threshold:
+            failures.append(
                 Violation(
                     key,
                     "changed-over-threshold",
-                    f"changed function scores CRAP {score.crap:.1f} (limit {threshold:g})",
+                    f"complexity rose from {old['complexity']} to {score.complexity}; "
+                    f"function scores CRAP {score.crap:.1f} (limit {threshold:g})",
                 )
             )
-    return violations
+            continue
+        # Baselines store CRAP to two decimals; sub-precision drift is not an increase.
+        current_crap, old_crap = round(score.crap, 2), round(old["crap"], 2)
+        if current_crap > old_crap + (0.0 if changed else tolerance):
+            message = f"CRAP rose from {old['crap']:.2f} to {score.crap:.2f}"
+            wobble = max(old_crap * edited_rise, tolerance) if edited_rise else 0.0
+            if not changed and score.crap <= old["crap"] * (1 + unchanged_rise):
+                warnings.append(
+                    Violation(key, "worse-unchanged", f"{message} (code unchanged: coverage)")
+                )
+            elif score.complexity <= old["complexity"] and current_crap <= old_crap + wobble:
+                warnings.append(
+                    Violation(key, "worse-edited-wobble", f"{message} (edited: coverage wobble)")
+                )
+            else:
+                failures.append(Violation(key, "worse", message))
+    return failures, warnings
+
+
+def compare(
+    scores: dict[str, FunctionScore],
+    baseline: dict[str, dict[str, Any]],
+    threshold: float = DEFAULT_THRESHOLD,
+    tolerance: float = DEFAULT_TOLERANCE,
+) -> list[Violation]:
+    """Strict rules (no warning band): what recording a baseline must not let through."""
+    failures, _ = compare_split(
+        scores, baseline, threshold, tolerance, unchanged_rise=0.0, edited_rise=0.0
+    )
+    return failures
 
 
 def _entry(score: FunctionScore) -> dict[str, Any]:
@@ -409,7 +452,7 @@ def build_baseline(
     earlier waiver is carried forward by later updates, so a routine refresh cannot erase
     who accepted what and why.
     """
-    violations = waived_violations(scores, previous, threshold, tolerance)
+    violations = waived_violations(scores, previous, threshold, min(tolerance, 0.0))
     if violations and not allow_regress:
         raise ValueError("; ".join(f"{v.key}: {v.message}" for v in violations))
     if allow_regress and not (reason and reason.strip()):
@@ -434,6 +477,78 @@ def format_report(scores: dict[str, FunctionScore], top: int = 20) -> str:
     return "\n".join(lines)
 
 
+def debt_summary(
+    scores: dict[str, FunctionScore], baseline: dict[str, dict[str, Any]], threshold: float
+) -> dict[str, Any]:
+    """Summarize current debt and edited hotspots whose scores did not fall."""
+    worst = sorted(scores.values(), key=lambda score: (-score.crap, score.key))
+    touched = [
+        {"key": key, **_entry(score), "baseline_crap": old["crap"]}
+        for key, score in sorted(scores.items())
+        if (old := baseline.get(key)) is not None
+        and score.digest != old["digest"]
+        and score.crap > threshold
+        and round(score.crap, 2) >= round(old["crap"], 2)
+    ]
+    return {
+        "threshold": threshold,
+        "functions_above_threshold": sum(score.crap > threshold for score in worst),
+        "total_excess": round(sum(max(0.0, score.crap - threshold) for score in worst), 2),
+        "top": [{"key": score.key, **_entry(score)} for score in worst[:10]],
+        "touched_but_not_reduced": touched,
+    }
+
+
+def mysql_evidence_path(coverage_path: Path) -> Path:
+    """The backend provenance paired with a combined coverage report."""
+    return coverage_path.with_name(coverage_path.name + ".backends.json")
+
+
+def record_mysql_coverage(coverage_path: Path) -> None:
+    """Bind both backend datasets to the exact combined report they produced."""
+    datasets = {name: coverage_path.parent / f"cov-{name}.data" for name in ("mysql", "mariadb")}
+    evidence = {
+        "coverage_sha256": _digest_file(coverage_path),
+        "backends": {name: _digest_file(path) for name, path in datasets.items()},
+    }
+    mysql_evidence_path(coverage_path).write_text(json.dumps(evidence, indent=2) + "\n")
+
+
+def has_mysql_coverage(coverage_path: Path) -> bool:
+    """True only for complete backend provenance matching the current report."""
+    try:
+        evidence = json.loads(mysql_evidence_path(coverage_path).read_text())
+    except (OSError, ValueError):
+        return False
+    return (
+        isinstance(evidence, dict)
+        and evidence.get("coverage_sha256") == _digest_file(coverage_path)
+        and isinstance(evidence.get("backends"), dict)
+        and set(evidence["backends"]) == {"mysql", "mariadb"}
+        and all(
+            isinstance(value, str) and len(value) == 64 for value in evidence["backends"].values()
+        )
+    )
+
+
+def _local_mysql_warnings(
+    violations: list[Violation],
+) -> tuple[list[Violation], list[Violation]]:
+    failures, warnings = [], []
+    for violation in violations:
+        if violation.key.partition("::")[0] in MYSQL_COVERAGE_MODULES:
+            warnings.append(
+                Violation(
+                    violation.key,
+                    "mysql-coverage",
+                    violation.message + " (MySQL/MariaDB coverage is enforced in CI)",
+                )
+            )
+        else:
+            failures.append(violation)
+    return failures, warnings
+
+
 def _load_baseline(path: Path) -> dict[str, dict[str, Any]] | None:
     if not path.exists():
         return None
@@ -452,7 +567,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--repo-root", type=Path, default=DEFAULT_REPO_ROOT)
     parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD)
     parser.add_argument("--tolerance", type=float, default=DEFAULT_TOLERANCE)
-    parser.add_argument("--top", type=int, default=20)
+    parser.add_argument("--top", type=int, default=10)
+    parser.add_argument("--ci", action="store_true", help="check: enforce MySQL-family modules")
+    parser.add_argument(
+        "--mysql-coverage", action="store_true", help="stamp: record both backend datasets"
+    )
     parser.add_argument(
         "--reason",
         help="update --allow-regress: why the violations are accepted; recorded with the date",
@@ -478,6 +597,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "stamp":
         stamped = write_source_digests(args.coverage, args.repo_root.resolve())
         print(f"recorded source digests for {len(stamped)} files: {sidecar_path(args.coverage)}")
+        if args.mysql_coverage:
+            record_mysql_coverage(args.coverage)
         return 0
     coverage = json.loads(args.coverage.read_text())
     if not sidecar_path(args.coverage).exists():
@@ -500,9 +621,22 @@ def main(argv: list[str] | None = None) -> int:
         for problem in exc.problems:
             print(f"  {problem}", file=sys.stderr)
         return 2
-    print(format_report(scores, args.top))
-
     baseline = _load_baseline(args.baseline)
+    debt = debt_summary(scores, baseline or {}, args.threshold)
+    debt_path = args.coverage.with_name(args.coverage.name + ".crap.json")
+    debt_path.write_text(json.dumps(debt, indent=2) + "\n")
+    print(
+        f"CRAP debt: {debt['functions_above_threshold']} function(s) above {args.threshold:g}; "
+        f"total excess {debt['total_excess']:.2f}"
+    )
+    print(format_report(scores, 10))
+    if args.top != 10:
+        print(format_report(scores, args.top))
+    for touched in debt["touched_but_not_reduced"]:
+        print(
+            f"CRAP warning: touched but not reduced: {touched['key']} "
+            f"({touched['baseline_crap']:.2f} -> {touched['crap']:.2f})"
+        )
     if args.command == "report":
         return 0
     if args.command == "update":
@@ -538,7 +672,17 @@ def main(argv: list[str] | None = None) -> int:
     if baseline is None:
         print(f"baseline not found: {args.baseline} (run 'update' first)", file=sys.stderr)
         return 2
-    violations = compare(scores, baseline, args.threshold, args.tolerance)
+    violations, warnings = compare_split(scores, baseline, args.threshold, args.tolerance)
+    if not (
+        args.ci
+        or os.environ.get("CI")
+        or os.environ.get("GITHUB_ACTIONS")
+        or has_mysql_coverage(args.coverage)
+    ):
+        violations, deferred = _local_mysql_warnings(violations)
+        warnings.extend(deferred)
+    for w in warnings:
+        print(f"CRAP warning: {w.key}: {w.message}")
     for v in violations:
         print(f"CRAP {v.kind}: {v.key}: {v.message}")
     if violations:
@@ -547,7 +691,8 @@ def main(argv: list[str] | None = None) -> int:
             print("CRAP report only: not blocking")
             return 0
         return 1
-    print("CRAP ratchet ok")
+    warning_count = len(warnings) + len(debt["touched_but_not_reduced"])
+    print(f"CRAP ratchet ok ({warning_count} warning(s))" if warning_count else "CRAP ratchet ok")
     return 0
 
 

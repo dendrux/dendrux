@@ -47,7 +47,7 @@ class Paused:
     run_id: str
 
 
-async def _pause(kind: str, store: Any, tenant: str | None) -> Paused:
+async def _pause(kind: str, store: Any, tenant: str | None, *, before_tool=None) -> Paused:
     """Build an agent and run it to a pause of ``kind`` under ``tenant``."""
     holder: dict[str, Agent] = {}
 
@@ -75,6 +75,7 @@ async def _pause(kind: str, store: Any, tenant: str | None) -> Paused:
         tools=tools,
         require_approval=["refund"] if kind == "approval" else None,
         state_store=store,
+        before_tool=before_tool,
     )
     holder["agent"] = agent
     paused = await agent.run("go", tenant_id=tenant)

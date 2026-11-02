@@ -1,0 +1,6 @@
+# Quarantined flaky tests. Format: `path::name[params] | reason`.
+# They still run in every suite (make ci, CI) with one automatic rerun; they are never skipped.
+# Add an entry only with a reason and a way out (a bound that holds under load, or a move to the
+# quiet-machine benchmark job). Remove it when the test is fixed.
+# (tests/tooling/test_load_monitor.py::test_sampler_starts_stops_and_still_records_final_sample was here until 2026-11-01: its fixed sleep was replaced by a bounded wait.)
+tests/integration/test_050_t7b_fix3.py::test_online_clock_migration_writer_block[postgres-300k] | asserts a 200 ms writer stall bound; fails when other databases are busy on the machine

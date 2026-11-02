@@ -47,6 +47,13 @@ import warnings
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from dendrux._lifecycle import (
+    STORAGE_FORMAT_CHECKPOINTED,
+    StoredEventType,
+)
+from dendrux._meta_keys import (
+    ERROR_INFO_META_KEY as ERROR_INFO_META_KEY,
+)
 from dendrux._sentinel import _OmittedType
 from dendrux.db._notify import EventNotifier, NotifierState, Subscription
 from dendrux.db._sqlite_sync import create_sqlite_schema
@@ -159,8 +166,6 @@ if TYPE_CHECKING:
 # ``RunNotFoundError`` is re-exported from :mod:`dendrux.errors`: one class
 # everywhere since 0.5.0 (its constructor takes the run id).
 
-ERROR_INFO_META_KEY = "dendrux.error_info"
-"""``agent_runs.meta`` key holding a provider failure's :class:`ErrorInfo` dict."""
 
 _OMITTED_TENANT = _OmittedType()
 
@@ -960,7 +965,7 @@ class RunStore:
 
         if capabilities(self._state).checkpointing:
             record = await self._scoped_read(self._state.get_run, run_id, tenant_id)
-            if record is not None and record.storage_format == 2:
+            if record is not None and record.storage_format == STORAGE_FORMAT_CHECKPOINTED:
                 rows = await conversation_records(
                     self._state,
                     run_id,
@@ -1079,14 +1084,18 @@ class RunStore:
             method,
             run_id,
             tenant_id,
-            event_types=["run.paused", "run.resumed"],
+            event_types=[
+                StoredEventType.RUN_PAUSED.value,
+                StoredEventType.RUN_RESUMED.value,
+                StoredEventType.RUN_RESUME_ABORTED.value,
+            ],
             limit=row_limit,
             **kwargs,
         )
         rows = rows or []
         pairs = _derive_pauses(rows)
         truncated = len(rows) == row_limit or len(pairs) > limit
-        if len(rows) == row_limit and pairs and pairs[-1].resume_sequence_index is None:
+        if _unresolved_pause_tail(pairs, rows, row_limit):
             pairs.pop()  # unresolved lookahead is not represented as an active pause
         items = []
         past = PastParams()
@@ -1100,7 +1109,7 @@ class RunStore:
             event = StoredEvent(
                 sequence_index=pair.pause_sequence_index,
                 iteration_index=0,
-                event_type="run.paused",
+                event_type=StoredEventType.RUN_PAUSED.value,
                 correlation_id=None,
                 created_at=pair.pause_at,
                 data={"status": pair.reason, "pending_tool_calls": pair.pending_tool_calls},
@@ -1120,7 +1129,7 @@ class RunStore:
                 run_id,
                 dataclasses.replace(
                     event,
-                    event_type="run.resumed",
+                    event_type=StoredEventType.RUN_RESUMED.value,
                     data={"submitted_results": pair.submitted_results},
                 ),
                 pause_view,
@@ -1487,8 +1496,29 @@ def _tool_to_public(record: Any) -> ToolInvocation:
     )
 
 
+def _unresolved_pause_tail(pairs: list[PausePair], rows: list[Any], row_limit: int) -> bool:
+    if len(rows) != row_limit or not pairs:
+        return False
+    resume = pairs[-1].resume_sequence_index
+    return resume is None or resume == rows[-1].sequence_index
+
+
+def _effective_pause_events(events: list[Any]) -> list[Any]:
+    aborted: set[int] = set()
+    resume = None
+    for event in events:
+        if event.event_type == StoredEventType.RUN_RESUMED.value:
+            resume = event.sequence_index
+        elif event.event_type == StoredEventType.RUN_RESUME_ABORTED.value and resume is not None:
+            aborted.add(resume)
+            resume = None
+        elif event.event_type == StoredEventType.RUN_PAUSED.value:
+            resume = None
+    return [event for event in events if event.sequence_index not in aborted]
+
+
 def _derive_pauses(events: list[Any]) -> list[PausePair]:
-    """Pair ``run.paused`` with the nearest following ``run.resumed``.
+    """Pair ``run.paused`` with the nearest following non-aborted ``run.resumed``.
 
     Pairing limitation: pairing is order-based, not
     correlation-id-based. An id-based fix will upgrade this function once
@@ -1496,12 +1526,12 @@ def _derive_pauses(events: list[Any]) -> list[PausePair]:
     """
     pauses: list[PausePair] = []
     pending: Any | None = None
-    for ev in events:
-        if ev.event_type == "run.paused":
+    for ev in _effective_pause_events(events):
+        if ev.event_type == StoredEventType.RUN_PAUSED.value:
             if pending is not None:
                 pauses.append(_build_pause_pair(pending, None))
             pending = ev
-        elif ev.event_type == "run.resumed":
+        elif ev.event_type == StoredEventType.RUN_RESUMED.value:
             if pending is not None:
                 pauses.append(_build_pause_pair(pending, ev))
                 pending = None

@@ -250,12 +250,23 @@ async def test_postgres_child_plan_is_bounded_by_frontier_not_history(
             text(
                 insert_sql.format(
                     identity="'0'||lpad(g::text,25,'0')",
-                    parent=(
-                        "CASE WHEN g%10=0 OR g<10 THEN NULL "
-                        "ELSE '0'||lpad((g-g%10)::text,25,'0') END"
-                    ),
+                    parent="NULL",
                     size=1000000,
                 )
+                + " WHERE g%10=0 OR g<10"
+            )
+        )
+        # Establish realistic primary-key statistics before FK checks on the
+        # children; empty-table statistics can choose a non-leading sweep index.
+        await connection.execute(text("ANALYZE agent_runs"))
+        await connection.execute(
+            text(
+                insert_sql.format(
+                    identity="'0'||lpad(g::text,25,'0')",
+                    parent="'0'||lpad((g-g%10)::text,25,'0')",
+                    size=1000000,
+                )
+                + " WHERE g%10<>0 AND g>=10"
             )
         )
         await connection.execute(
@@ -277,6 +288,9 @@ async def test_postgres_child_plan_is_bounded_by_frontier_not_history(
             )
         )
         await connection.execute(text("ANALYZE agent_runs"))
+        assert (await connection.execute(text("SELECT count(*) FROM agent_runs"))).scalar_one() == (
+            1_008_000
+        )
     parents = ["7P" + f"{i:024d}" for i in range(1, 2001)]
     statements = []
 

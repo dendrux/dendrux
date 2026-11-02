@@ -41,6 +41,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
+from dendrux._lifecycle import StoredEventType
 from dendrux.db._dialects import is_mysql_family
 from dendrux.db._dialects._mysql_types import (
     MYSQL_TABLE_OPTIONS,
@@ -52,6 +53,7 @@ from dendrux.db._dialects._mysql_types import (
     utc_datetime,
     utc_now_default,
 )
+from dendrux.types import RunStatus
 
 
 def _utc_now() -> datetime.datetime:
@@ -107,7 +109,7 @@ class AgentRun(Base):
     id: Mapped[str] = mapped_column(nopad_string(26), primary_key=True)
     tenant_id: Mapped[str | None] = mapped_column(nopad_string(255), nullable=True, index=True)
     agent_name: Mapped[str] = mapped_column(nopad_string(255))
-    status: Mapped[str] = mapped_column(nopad_string(50), default="pending")
+    status: Mapped[str] = mapped_column(nopad_string(50), default=RunStatus.PENDING.value)
     input_data: Mapped[dict[str, Any] | None] = mapped_column(
         json_document("input_data"), nullable=True
     )
@@ -467,7 +469,7 @@ class RunEvent(Base):
 
     Event types:
         run.started, run.completed, run.error, run.cancelled,
-        run.paused, run.resumed,
+        run.paused, run.resumed, run.resume_aborted,
         llm.completed, tool.completed
     """
 
@@ -498,8 +500,10 @@ class RunEvent(Base):
         Index(
             "ix_run_events_started",
             "agent_run_id",
-            postgresql_where=text("((event_type)::text = 'run.started'::text)"),
-            sqlite_where=text("event_type = 'run.started'"),
+            postgresql_where=text(
+                f"((event_type)::text = '{StoredEventType.RUN_STARTED.value}'::text)"
+            ),
+            sqlite_where=text(f"event_type = '{StoredEventType.RUN_STARTED.value}'"),
         ).ddl_if(callable_=_not_mysql_family),
         MYSQL_TABLE_OPTIONS,
     )

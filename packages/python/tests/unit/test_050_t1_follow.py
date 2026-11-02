@@ -287,9 +287,15 @@ class TestSharing:
         for f in follows:
             await f.start()
         waiting = [asyncio.ensure_future(anext(f)) for f in follows]
+
+        async def all_attached() -> None:
+            while not (feed.watched_runs == 1 and feed.followers == 20):
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(all_attached(), 5)  # waits for slow runners; not a speed check
+        polls["n"] = 0
         await asyncio.sleep(0.15)
-        assert feed.watched_runs == 1 and feed.followers == 20
-        assert polls["n"] < 30  # one poller, not twenty
+        assert polls["n"] < 30  # one poller, not twenty (a busy runner only lowers the count)
         await state.save_run_event("00000000000000000000000301", event_type="hello")
         items = await asyncio.wait_for(asyncio.gather(*waiting), 5)
         assert all(i.event_type == "hello" for i in items)

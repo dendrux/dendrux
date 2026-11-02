@@ -11,17 +11,19 @@ deployments using native enums would need an ALTER TYPE migration.
 
 from enum import StrEnum
 
+from dendrux.types import RunStatus
+
 
 class AgentRunStatus(StrEnum):
     """Status of an agent run in the database."""
 
-    PENDING = "pending"
-    RUNNING = "running"
-    SUCCESS = "success"
-    ERROR = "error"
-    MAX_ITERATIONS = "max_iterations"
-    CANCELLED = "cancelled"
-    WAITING_CLIENT_TOOL = "waiting_client_tool"
-    WAITING_HUMAN_INPUT = "waiting_human_input"
-    WAITING_APPROVAL = "waiting_approval"
-    PAUSED = "paused"
+    PENDING = RunStatus.PENDING.value
+    RUNNING = RunStatus.RUNNING.value
+    SUCCESS = RunStatus.SUCCESS.value
+    ERROR = RunStatus.ERROR.value
+    MAX_ITERATIONS = RunStatus.MAX_ITERATIONS.value
+    CANCELLED = RunStatus.CANCELLED.value
+    WAITING_CLIENT_TOOL = RunStatus.WAITING_CLIENT_TOOL.value
+    WAITING_HUMAN_INPUT = RunStatus.WAITING_HUMAN_INPUT.value
+    WAITING_APPROVAL = RunStatus.WAITING_APPROVAL.value
+    PAUSED = RunStatus.PAUSED.value
