@@ -331,6 +331,8 @@ class ResourceMonitor:
         self.driver_probe_failed = False
         self.ps_threads_supported = True
         self.unavailable["docker"] = "not yet sampled"
+        # Loops also check this flag: Python 3.11 wait_for can drop a cancel.
+        self.stopping = False
 
     async def start(self) -> None:
         """Start observers with bounded connect/sample latency and explicit failures."""
@@ -362,7 +364,7 @@ class ResourceMonitor:
                 self.unavailable["rollback"] = type(exc).__name__
 
     async def _loop(self) -> None:
-        while True:
+        while not self.stopping:
             await asyncio.sleep(self.interval)
             await self._safe_sample("sampling")
 
@@ -490,7 +492,7 @@ class ResourceMonitor:
                     del mapping[key]
 
     async def _docker_loop(self) -> None:
-        while True:
+        while not self.stopping:
             try:
                 await self._docker_sample()
             except Exception as exc:  # noqa: BLE001
@@ -535,6 +537,7 @@ class ResourceMonitor:
 
     async def stop(self, runs: int) -> dict[str, Any]:
         """Stop, take an endpoint sample, close the observer, and return JSON-safe data."""
+        self.stopping = True
         tasks = [task for task in (self.task, self.docker_task) if task is not None]
         for task in tasks:
             task.cancel()
