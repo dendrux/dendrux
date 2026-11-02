@@ -404,7 +404,12 @@ jobs:
           COVERAGE_FILE: cov-${{ matrix.server }}.data
         run: |
           export ${{ matrix.env_name }}="$SERVER_URL"
-          pytest tests/db -v -rs -n 4 -m "not benchmark" --cov=src/dendrux --cov-report= | tee pytest.log
+          python -c "import asyncmy"
+          pytest tests/db \
+            tests/unit/test_sql_store_contract.py \
+            tests/unit/test_sql_store_rx_errors.py \
+            tests/integration/test_mysql_store_errors.py \
+            -v -rs -n 4 -m "not benchmark" --cov=src/dendrux --cov-report= | tee pytest.log
           if grep -q '${{ matrix.env_name }} not set' pytest.log; then
             echo "::error::${{ matrix.server }} tests were skipped (${{ matrix.env_name }} not set)."
             exit 1

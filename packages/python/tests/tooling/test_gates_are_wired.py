@@ -103,6 +103,14 @@ def test_mysql_family_suites_measure_and_upload_coverage() -> None:
     steps = _steps("mysql-family")
     run = steps["Test on ${{ matrix.server }}"]["run"]
     assert "--cov=src/dendrux" in run and "--no-cov" not in run
+    assert "import asyncmy" in run
+    for path in (
+        "tests/unit/test_sql_store_contract.py",
+        "tests/unit/test_sql_store_rx_errors.py",
+        "tests/integration/test_mysql_store_errors.py",
+    ):
+        assert path in run
+    assert '".[dev,mysql]"' in steps["Install dependencies"]["run"]
     assert steps["Test on ${{ matrix.server }}"]["env"]["COVERAGE_FILE"] == (
         "cov-${{ matrix.server }}.data"
     )
