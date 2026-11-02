@@ -601,6 +601,28 @@ class TestCompare:
         edited = cr.FunctionScore(old.key, complexity, 1.0, old.crap + 0.1, "new")
         assert [v.kind for v in cr.compare({edited.key: edited}, _base(old))] == ["worse"]
 
+    @pytest.mark.parametrize(("old_crap", "rise"), [(22.0, 0.01), (28.06, 0.46), (58.0, 1.1)])
+    def test_edited_wobble_is_a_warning_in_check(self, old_crap: float, rise: float) -> None:
+        # Owner 2026-11-02: complexity not up, rise within max(2%, 0.5) is coverage wobble.
+        old = cr.FunctionScore("a.py::f", 10, 0.5, old_crap, "old")
+        edited = cr.FunctionScore(old.key, 10, 0.5, old_crap + rise, "new")
+        failures, warnings = cr.compare_split({edited.key: edited}, _base(old))
+        assert failures == []
+        assert [v.kind for v in warnings] == ["worse-edited-wobble"]
+
+    @pytest.mark.parametrize(("old_crap", "rise"), [(22.0, 0.6), (58.0, 1.3)])
+    def test_edited_rise_beyond_wobble_fails_in_check(self, old_crap: float, rise: float) -> None:
+        old = cr.FunctionScore("a.py::f", 10, 0.5, old_crap, "old")
+        edited = cr.FunctionScore(old.key, 10, 0.5, old_crap + rise, "new")
+        failures, _ = cr.compare_split({edited.key: edited}, _base(old))
+        assert [v.kind for v in failures] == ["worse"]
+
+    def test_edited_wobble_never_covers_a_complexity_rise(self) -> None:
+        old = cr.FunctionScore("a.py::f", 10, 1.0, 10.0, "old")
+        edited = cr.FunctionScore(old.key, 11, 1.0, 10.2, "new")
+        failures, _ = cr.compare_split({edited.key: edited}, _base(old))
+        assert [v.kind for v in failures] == ["worse"]
+
     def test_complexity_up_under_30_with_lower_crap_passes(self) -> None:
         old = _score("a.py::f", 5, 0.0, digest="old")
         edited = _score("a.py::f", 6, 1.0, digest="new")
