@@ -125,7 +125,6 @@ async def test_store_error_after_lost_cancel_preserves_evidence():
             await guard.watch(failed())
         # A subsequent successful await must not erase the first loss.
         await guard.watch(asyncio.sleep(0))
-        await guard.watch(lose_cancel())
         with pytest.raises(asyncio.CancelledError):
             await guard.check(RUN_ID)
         await guard.check(RUN_ID)
