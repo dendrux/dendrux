@@ -2,7 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # Feature and track branches get the full matrix on every push, so heavy runs happen
+    # here instead of on a developer machine. Never push unreleased security fixes.
+    branches: [main, "feat/**"]
   pull_request:
     branches: [main]
 
@@ -12,7 +14,7 @@ permissions:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   # The test suite is split into four shards by test file (tools/test_tiers.py shard: a
