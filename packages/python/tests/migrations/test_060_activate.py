@@ -1428,3 +1428,11 @@ async def test_pg_resume_after_interrupted_replaced_index_drop(rollout_database,
         assert (
             await conn.execute(text("SELECT to_regclass(:name)"), {"name": old})
         ).scalar_one() is None
+
+
+@pytest.mark.parametrize("batch_size", [True, 0, 5001])
+async def test_activate_refuses_out_of_range_batch_size_before_connecting(batch_size):
+    from dendrux.db import _activate
+
+    with pytest.raises(ValueError, match="batch_size"):
+        await _activate.activate_database(object(), batch_size=batch_size)  # type: ignore[arg-type]
