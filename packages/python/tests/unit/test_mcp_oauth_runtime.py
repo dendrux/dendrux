@@ -36,6 +36,7 @@ from dendrux.mcp import (
     MCPStaleConnectionError,
 )
 from dendrux.mcp._runtime import _ViewToolSource
+from tests._helpers.timing import ManualTimeouts
 from tests.unit.mcp_oauth_harness import ASConfig, OAuthHarness, basic_header, free_port
 from tests.unit.test_mcp_oauth_refresh import barrier_clients
 
@@ -654,7 +655,8 @@ async def test_concurrent_revokes_write_own_tombstones_and_share_one_eviction() 
         store = MCPOAuthMemoryStore()
         oauth = make_oauth(store)
         await sign_in(harness, oauth)
-        harness.revocation_latency = 0.2
+        harness.revocation_entered = asyncio.Event()
+        harness.revocation_gate = asyncio.Event()
         recorder = Recorder()
         async with MCPRuntime(observer=recorder) as runtime:
             connection = bind(runtime, harness, oauth)
@@ -663,12 +665,22 @@ async def test_concurrent_revokes_write_own_tombstones_and_share_one_eviction() 
             first = asyncio.create_task(
                 runtime.revoke_authorization(connection_key=CONNECTION, tenant_key=TENANT)
             )
-            await asyncio.sleep(0.05)
-            flow_url = await oauth.begin_authorization(KEY, source(harness), redirect_uri=CALLBACK)
-            second = asyncio.create_task(
-                runtime.revoke_authorization(connection_key=CONNECTION, tenant_key=TENANT)
-            )
-            results = await asyncio.gather(first, second)
+            second = None
+            try:
+                await asyncio.wait_for(harness.revocation_entered.wait(), 10)
+                flow_url = await oauth.begin_authorization(
+                    KEY, source(harness), redirect_uri=CALLBACK
+                )
+                first_tombstone = (await store.load(KEY)).version
+                second = asyncio.create_task(
+                    runtime.revoke_authorization(connection_key=CONNECTION, tenant_key=TENANT)
+                )
+                async with asyncio.timeout(10):
+                    while (await store.load(KEY)).version == first_tombstone:
+                        await asyncio.sleep(0.01)
+            finally:
+                harness.revocation_gate.set()
+                results = await asyncio.gather(first, *([second] if second is not None else []))
             assert {r.local for r in results} == {"signed_out", "already_signed_out"}
             assert len(recorder.of(MCPEvictionStarted)) == 1
             assert len(recorder.of(MCPOAuthRevoked)) == 2
@@ -688,7 +700,8 @@ async def test_revoke_fences_new_leases_while_pending() -> None:
     async with OAuthHarness() as harness:
         oauth = make_oauth(MCPOAuthMemoryStore())
         await sign_in(harness, oauth)
-        harness.revocation_latency = 0.3
+        harness.revocation_gate = asyncio.Event()
+        harness.revocation_entered = asyncio.Event()
         async with MCPRuntime() as runtime:
             connection = bind(runtime, harness, oauth)
             await connection.discover()
@@ -696,11 +709,14 @@ async def test_revoke_fences_new_leases_while_pending() -> None:
             task = asyncio.create_task(
                 runtime.revoke_authorization(connection_key=CONNECTION, tenant_key=TENANT)
             )
-            await asyncio.sleep(0.05)
-            assert (await required(connection.discover())).reason == "revoked"
-            assert (await required(echo(text="x"))).reason == "revoked"
-            await view.close()
-            await task
+            try:
+                await asyncio.wait_for(harness.revocation_entered.wait(), 10)
+                assert (await required(connection.discover())).reason == "revoked"
+                assert (await required(echo(text="x"))).reason == "revoked"
+            finally:
+                harness.revocation_gate.set()
+                await view.close()
+                await task
         await oauth.aclose()
 
 
@@ -856,10 +872,9 @@ async def test_idle_retirement_during_opening_leaves_the_refresh_to_finish() -> 
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
-            for _ in range(100):
-                if (TENANT, CONNECTION) not in runtime._entries:
-                    break
-                await asyncio.sleep(0.01)
+            async with asyncio.timeout(10):
+                while (TENANT, CONNECTION) in runtime._entries:
+                    await asyncio.sleep(0.01)
             assert (TENANT, CONNECTION) not in runtime._entries
             gate.set()
             await oauth.aclose()
@@ -904,27 +919,41 @@ async def test_store_failure_in_phase_one_keeps_the_fence_and_a_retry_completes(
         await oauth.aclose()
 
 
-async def test_callback_timeout_on_an_oauth_binding_is_transient() -> None:
-    async with OAuthHarness(config=ASConfig(refresh_latency=1.0)) as harness:
+async def test_callback_timeout_on_an_oauth_binding_is_transient(monkeypatch) -> None:
+    from dendrux.mcp import _runtime
+
+    entered, release = asyncio.Event(), asyncio.Event()
+    config = ASConfig(refresh_entered=entered, refresh_gate=release)
+    async with OAuthHarness(config=config) as harness:
         store = MCPOAuthMemoryStore()
         oauth = make_oauth(store)
         await sign_in(harness, oauth)
         recorder = Recorder()
         async with MCPRuntime(observer=recorder, circuit_failure_threshold=1) as runtime:
-            connection = bind(runtime, harness, oauth, connect_timeout=0.4)
+            connection = bind(runtime, harness, oauth, connect_timeout=10)
             view, echo = await executor_for(connection)
             before = await store.load(KEY)
             harness.provider.expire_access_tokens()  # type: ignore[union-attr]
-            with pytest.raises(MCPOAuthRefreshError):
-                await echo(text="slow")
-            entry = runtime._entries[(TENANT, CONNECTION)]
-            assert not entry.refresh_failed
-            assert not recorder.of(MCPCircuitOpened)
-            for _ in range(100):
-                current = await store.load(KEY)
-                if current.credential.publication_id != before.credential.publication_id:  # type: ignore[union-attr]
-                    break
-                await asyncio.sleep(0.05)
+            deadlines = ManualTimeouts(monkeypatch, _runtime)
+            call = asyncio.create_task(echo(text="slow"))
+            try:
+                await asyncio.wait_for(entered.wait(), 10)
+                deadlines.expire()
+                with pytest.raises(MCPOAuthRefreshError):
+                    await asyncio.wait_for(call, 10)
+                entry = runtime._entries[(TENANT, CONNECTION)]
+                assert not entry.refresh_failed
+                assert not recorder.of(MCPCircuitOpened)
+            finally:
+                release.set()
+                call.cancel()
+                await asyncio.gather(call, return_exceptions=True)
+            async with asyncio.timeout(10):
+                while True:
+                    current = await store.load(KEY)
+                    if current.credential.publication_id != before.credential.publication_id:
+                        break
+                    await asyncio.sleep(0.01)
             assert current.status == "active"  # type: ignore[union-attr]
             assert await echo(text="recovered") == {"result": "recovered"}
             assert harness.counters["refresh"] == 1
@@ -932,23 +961,35 @@ async def test_callback_timeout_on_an_oauth_binding_is_transient() -> None:
         await oauth.aclose()
 
 
-async def test_get_auth_timeout_on_an_oauth_binding_is_transient() -> None:
-    async with OAuthHarness(config=ASConfig(refresh_latency=1.0)) as harness:
+async def test_get_auth_timeout_on_an_oauth_binding_is_transient(monkeypatch) -> None:
+    from dendrux.mcp import _runtime
+
+    entered, release = asyncio.Event(), asyncio.Event()
+    config = ASConfig(refresh_entered=entered, refresh_gate=release)
+    async with OAuthHarness(config=config) as harness:
         store = MCPOAuthMemoryStore()
         oauth = make_oauth(store)
         await sign_in(harness, oauth)
         shift(oauth, LATER)
         recorder = Recorder()
         async with MCPRuntime(observer=recorder, circuit_failure_threshold=1) as runtime:
-            connection = bind(runtime, harness, oauth, connect_timeout=0.4)
-            with pytest.raises(MCPOAuthRefreshError) as caught:
-                await connection.discover()
-            assert caught.value.__cause__ is None and caught.value.__context__ is None
-            assert not recorder.of(MCPCircuitOpened)
-            for _ in range(100):
-                if harness.counters["refresh"] and (await store.load(KEY)).refresh_claim is None:  # type: ignore[union-attr]
-                    break
-                await asyncio.sleep(0.05)
+            connection = bind(runtime, harness, oauth, connect_timeout=10)
+            deadlines = ManualTimeouts(monkeypatch, _runtime)
+            discovery = asyncio.create_task(connection.discover())
+            try:
+                await asyncio.wait_for(entered.wait(), 10)
+                deadlines.expire()
+                with pytest.raises(MCPOAuthRefreshError) as caught:
+                    await asyncio.wait_for(discovery, 10)
+                assert caught.value.__cause__ is None and caught.value.__context__ is None
+                assert not recorder.of(MCPCircuitOpened)
+            finally:
+                release.set()
+                discovery.cancel()
+                await asyncio.gather(discovery, return_exceptions=True)
+            async with asyncio.timeout(10):
+                while (await store.load(KEY)).refresh_claim is not None:
+                    await asyncio.sleep(0.01)
             assert (await connection.discover()).tools
             assert harness.counters["refresh"] == 1
         await oauth.aclose()

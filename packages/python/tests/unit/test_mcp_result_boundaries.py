@@ -406,11 +406,11 @@ class TestResponseBytesOnTheRealTransport:
 class TestAgainstARealServer:
     async def test_repeating_cursor_stops_on_its_own(self) -> None:
         async with _serve_pages() as (url, stats):
-            adapter = MCPClientAdapter(MCPSource.http("fake", url, call_timeout=0.2))
+            adapter = MCPClientAdapter(MCPSource.http("fake", url, call_timeout=10))
             await adapter.connect()
             try:
                 with pytest.raises(MCPDiscoveryLimitError) as caught:
-                    await asyncio.wait_for(adapter.list_tools(), timeout=5)
+                    await asyncio.wait_for(adapter.list_tools(), timeout=10)
             finally:
                 await adapter.close()
             assert caught.value.reason == "repeated_cursor"

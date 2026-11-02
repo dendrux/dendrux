@@ -460,7 +460,7 @@ class TestConnectionReuse:
 
             first_task = asyncio.create_task(first.get_tool_lookups())
             second_task = asyncio.create_task(second.get_tool_lookups())
-            await asyncio.sleep(0.05)
+            await _wait_until(lambda: len(_InstrumentedAdapter.instances) == 1, timeout=10)
 
             assert len(_InstrumentedAdapter.instances) == 1
             assert not first_task.done()
@@ -558,7 +558,7 @@ class TestCredentialResolution:
 
             first_task = asyncio.create_task(first.get_tool_lookups())
             second_task = asyncio.create_task(second.get_tool_lookups())
-            await asyncio.sleep(0.05)
+            await _wait_until(lambda: credentials.calls == 1, timeout=10)
 
             # Both Agents wait on one in-flight resolution; neither starts its own.
             assert credentials.calls == 1
@@ -592,7 +592,7 @@ class TestCredentialResolution:
             agent = Agent(prompt="first", tool_sources=[connection.tools()])
             await agent.get_tool_lookups()
             await agent.close()  # idle_timeout=0 retires immediately
-            await asyncio.sleep(0.05)
+            await _wait_until(lambda: _InstrumentedAdapter.instances[0].closed is True, timeout=10)
             assert _InstrumentedAdapter.instances[0].closed is True
 
             await Agent(prompt="second", tool_sources=[connection.tools()]).get_tool_lookups()
@@ -758,7 +758,7 @@ class TestCredentialResolution:
         agent = Agent(prompt="test", tool_sources=[_bind(runtime, credentials=credentials).tools()])
 
         discovery = asyncio.create_task(agent.get_tool_lookups())
-        await asyncio.sleep(0.02)
+        await _wait_until(lambda: credentials.calls == 1, timeout=10)
         assert credentials.calls == 1
 
         await asyncio.wait_for(runtime.close(), timeout=1.0)
@@ -1114,7 +1114,7 @@ class TestCancellationSafety:
         agent = Agent(prompt="test", tool_sources=[_bind(runtime).tools()])
 
         discovery = asyncio.create_task(agent.get_tool_lookups())
-        await asyncio.sleep(0.05)
+        await _wait_until(lambda: len(_InstrumentedAdapter.instances) == 1, timeout=10)
         assert len(_InstrumentedAdapter.instances) == 1
         assert _InstrumentedAdapter.instances[0].closed is False
 
@@ -1731,7 +1731,7 @@ class TestExplicitEviction:
         agent = Agent(prompt="test", tool_sources=[_bind(runtime).tools()])
 
         discovery = asyncio.create_task(agent.get_tool_lookups())
-        await asyncio.sleep(0.05)
+        await _wait_until(lambda: len(_InstrumentedAdapter.instances) == 1, timeout=10)
         assert len(_InstrumentedAdapter.instances) == 1
 
         await asyncio.wait_for(
@@ -2649,7 +2649,7 @@ class TestIdleRetirement:
         agent = Agent(prompt="test", tool_sources=[_bind(runtime).tools()])
 
         discovery = asyncio.create_task(agent.get_tool_lookups())
-        await asyncio.sleep(0.05)
+        await _wait_until(lambda: len(_InstrumentedAdapter.instances) == 1, timeout=10)
         assert len(_InstrumentedAdapter.instances) == 1
 
         # The only requester walks away mid-handshake: the half-open socket
@@ -6251,7 +6251,7 @@ class TestDiscovery:
 
             discovering = asyncio.create_task(connection.discover())
             leasing = asyncio.create_task(agent.get_tool_lookups())
-            await asyncio.sleep(0.05)
+            await _wait_until(lambda: len(_InstrumentedAdapter.instances) == 1, timeout=10)
             assert len(_InstrumentedAdapter.instances) == 1
 
             _InstrumentedAdapter.connect_gate.set()

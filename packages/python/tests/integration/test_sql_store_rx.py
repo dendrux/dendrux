@@ -297,7 +297,7 @@ async def test_postgres_readback_lock_wait_is_bounded(backend_engine, store, mon
     monkeypatch.setattr(AsyncSession, "commit", lose_ack)
     try:
         with pytest.raises(StoreOutcomeUnknown):
-            await asyncio.wait_for(store.finalize_run(run_id, status="success", claim_epoch=0), 1)
+            await asyncio.wait_for(store.finalize_run(run_id, status="success", claim_epoch=0), 10)
     finally:
         await held.rollback()
         await held.close()

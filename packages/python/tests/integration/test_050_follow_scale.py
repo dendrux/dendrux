@@ -80,7 +80,10 @@ async def _statements_for(engine: Any, run_store: RunStore, run_id: str, followe
     count = [0]
 
     def on_execute(*_a: Any) -> None:
-        count[0] += 1
+        task = asyncio.current_task()
+        # Count backfill work, excluding the independent live reconciliation loop.
+        if task is None or not task.get_name().startswith("dendrux-run-feed:"):
+            count[0] += 1
 
     feed = EventFeed(run_store, poll_interval_s=0.01, poll_max_s=0.02, heartbeat_s=5.0)
 
@@ -119,8 +122,7 @@ async def test_backfill_cost_per_follower_is_flat(store: Any, engine: Any) -> No
     # (a follower arriving after the feed closed pays them again: still fixed).
     assert per_follower <= 6, (small_cost, large_cost)
     # Twelve more past pauses add no statements per follower.
-    # (Per-pause reads would add at least 10 * followers = 200; a few extra
-    # poller statements under a loaded machine are noise.)
+    # Per-pause reads would add at least 10 * followers = 200.
     assert large_cost - small_cost <= 10, (small_cost, large_cost)
 
 

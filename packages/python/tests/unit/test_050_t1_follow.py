@@ -246,10 +246,15 @@ class TestFollowLifecycle:
     async def test_max_duration_ends_with_cursor(self, state: Any, store: RunStore) -> None:
         await state.create_run("00000000000000000000000301", "a")
         await state.save_run_event("00000000000000000000000301", event_type="tick")
-        items = await _collect(
-            _feed(store).follow("00000000000000000000000301", tenant_id=None, max_duration_s=0.1)
-        )
-        assert items[-1] == FollowEnd("max_duration", 0)
+        before = asyncio.get_running_loop().time()
+        async with _feed(store).follow(
+            "00000000000000000000000301", tenant_id=None, max_duration_s=10
+        ) as follow:
+            assert before + 10 <= follow._deadline <= asyncio.get_running_loop().time() + 10
+            first = await asyncio.wait_for(anext(follow), 10)
+            assert first.sequence_index == 0
+            follow._deadline = asyncio.get_running_loop().time() - 1
+            assert await asyncio.wait_for(anext(follow), 10) == FollowEnd("max_duration", 0)
 
     async def test_heartbeat_when_idle(self, state: Any, store: RunStore) -> None:
         await state.create_run("00000000000000000000000301", "a")
@@ -456,7 +461,7 @@ class TestFixRound:
         for _ in range(3):
             await state.save_run_event("00000000000000000000000301", event_type="tick")
         async with _feed(store).follow(
-            "00000000000000000000000301", tenant_id=None, max_duration_s=0.04
+            "00000000000000000000000301", tenant_id=None, max_duration_s=10
         ) as follow:
             first = await anext(follow)
             if live:
@@ -465,8 +470,8 @@ class TestFixRound:
                 first = await anext(follow)
                 assert follow._follower is not None
                 follow._follower.push(StoredEvent(3, 0, "tick", None, {}, None))
-            await asyncio.sleep(0.06)
-            async with asyncio.timeout(2):
+            follow._deadline = asyncio.get_running_loop().time() - 1
+            async with asyncio.timeout(10):
                 assert await anext(follow) == FollowEnd("max_duration", first.sequence_index)
 
     async def test_blocked_read_obeys_duration(

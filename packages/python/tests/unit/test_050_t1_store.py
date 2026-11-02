@@ -369,11 +369,17 @@ class TestEventAllocation:
                 await asyncio.sleep(0.002)
 
         poller = asyncio.create_task(poll())
-        result = await agent.run("go")
-        await asyncio.sleep(0.05)
-        stop.set()
-        await poller
-        all_seq = [e.sequence_index for e in await state.get_run_events(result.run_id)]
+        try:
+            result = await agent.run("go")
+            all_seq = [e.sequence_index for e in await state.get_run_events(result.run_id)]
+            async with asyncio.timeout(10):
+                while not all_seq or not seen or seen[-1] < all_seq[-1]:
+                    if poller.done():
+                        await poller
+                    await asyncio.sleep(0.01)
+        finally:
+            stop.set()
+            await poller
         assert all_seq == list(range(len(all_seq)))
         assert sorted(set(all_seq) - set(seen)) == []
 

@@ -239,7 +239,7 @@ class TestPhoneBoundaries:
 
 class TestPresidioQueueIsBounded:
     @staticmethod
-    def _scanner(delay: float):
+    def _scanner(delay: float, release=None):
         import threading
         from concurrent.futures import ThreadPoolExecutor
 
@@ -247,7 +247,10 @@ class TestPresidioQueueIsBounded:
 
         class Analyzer:
             def analyze(self, text: str, language: str):
-                time.sleep(delay)
+                if release is None:
+                    time.sleep(delay)
+                else:
+                    release.wait()
                 return []
 
         scanner = object.__new__(_PresidioScanner)
@@ -264,12 +267,23 @@ class TestPresidioQueueIsBounded:
         from dendrux.guardrails._protocol import UNSCANNABLE
 
         monkeypatch.setattr(_pii, "PRESIDIO_MAX_PENDING", 4)
-        scanner = self._scanner(0.05)
-        results = await asyncio.gather(*(scanner.scan("x") for _ in range(12)))
+        import threading
+
+        release = threading.Event()
+        scanner = self._scanner(0, release)
+        tasks = [asyncio.create_task(scanner.scan("x")) for _ in range(12)]
+        try:
+            async with asyncio.timeout(10):
+                while sum(task.done() for task in tasks) < 8:
+                    await asyncio.sleep(0.001)
+            assert scanner._pending == 4
+        finally:
+            release.set()
+            results = await asyncio.gather(*tasks)
+            scanner._executor.shutdown()
         refused = [r for r in results if r and r[0].entity_type == UNSCANNABLE]
         assert len(refused) == 8
         assert scanner._pending == 0
-        scanner._executor.shutdown()
 
     async def test_waiting_scans_do_not_starve_the_default_executor(
         self, monkeypatch: pytest.MonkeyPatch
