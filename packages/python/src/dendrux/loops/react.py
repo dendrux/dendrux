@@ -1556,7 +1556,7 @@ class ReActLoop(Loop):
         )
         before_tool: BeforeToolHook | None = getattr(agent, "before_tool", None)
         hook_tenant_id = await _hook_tenant_id(before_tool, state_store, resolved_run_id)
-        g_engine = getattr(recorder, "guardrail_engine", None) or (
+        g_engine: GuardrailEngine | None = getattr(recorder, "guardrail_engine", None) or (
             GuardrailEngine(
                 agent.guardrails, pii_mapping=initial_pii_mapping, run_id=resolved_run_id
             )
@@ -1647,9 +1647,12 @@ class ReActLoop(Loop):
                 for msg_idx, msg in enumerate(messages):
                     if not msg.content:
                         continue
+                    shared_guardrail_engine = (
+                        getattr(recorder, "guardrail_engine", None) is g_engine
+                    )
                     project = (
                         g_engine.project_incoming_message
-                        if getattr(recorder, "guardrail_engine", None) is g_engine
+                        if shared_guardrail_engine
                         else g_engine.scan_incoming_message
                     )
                     cleaned_msg, findings, block_err = await project(msg, index=msg_idx)

@@ -80,7 +80,7 @@ def matching_unique_constraints(conn: Connection, model_tables: list[Table]) -> 
 @contextmanager
 def maintenance_lock(conn: Connection) -> Iterator[None]:
     """Activation: an exclusive file lock retained across committed batches."""
-    timeout = conn.exec_driver_sql("PRAGMA busy_timeout").scalar_one()
+    timeout: int = conn.exec_driver_sql("PRAGMA busy_timeout").scalar_one()
     conn.exec_driver_sql("PRAGMA busy_timeout=0")
     conn.exec_driver_sql("PRAGMA locking_mode=EXCLUSIVE")
     try:
