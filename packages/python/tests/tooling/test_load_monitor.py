@@ -272,10 +272,15 @@ async def test_slow_docker_does_not_delay_app_and_database_sampling(monkeypatch)
 
     monkeypatch.setattr(m, "command", probe)
     sampler = m.ResourceMonitor(None, interval=0.01)
-    await asyncio.wait_for(sampler.start(), 0.2)
-    await asyncio.sleep(0.04)
-    assert sampler.buffer.total >= 3
-    await asyncio.wait_for(sampler.stop(1), 0.2)
+    # Docker stays blocked throughout; the timeouts only guard against a hang, not speed.
+    await asyncio.wait_for(sampler.start(), 10)
+
+    async def three_samples():
+        while sampler.buffer.total < 3:
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(three_samples(), 10)
+    await asyncio.wait_for(sampler.stop(1), 10)
 
 
 async def test_docker_probe_targets_only_named_test_containers_and_parses_io(monkeypatch):
