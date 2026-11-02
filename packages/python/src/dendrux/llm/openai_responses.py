@@ -62,6 +62,7 @@ from dendrux.llm._resilience import (
 )
 from dendrux.llm._retry_telemetry import call_attempt_tracking
 from dendrux.llm._stop_reason import responses_stop_reason
+from dendrux.llm._transport import guard_sdk_client
 from dendrux.llm._usage import openai_wire_usage
 from dendrux.llm.base import LLMProvider
 from dendrux.types import (
@@ -329,10 +330,12 @@ class OpenAIResponsesProvider(LLMProvider):
         def new_http() -> httpx.AsyncClient:
             return make_http_client(openai, deadlines, provider="openai_responses")
 
-        self._client = openai.AsyncOpenAI(
-            api_key=api_key,
-            http_client=new_http(),
-            max_retries=max_retries,
+        self._client = guard_sdk_client(
+            openai.AsyncOpenAI(
+                api_key=api_key,
+                http_client=new_http(),
+                max_retries=max_retries,
+            )
         )
         self._clients: LoopClients[openai.AsyncOpenAI] = LoopClients(
             new_http, lambda client, http: client.copy(http_client=http)
