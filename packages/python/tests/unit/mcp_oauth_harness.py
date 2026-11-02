@@ -399,6 +399,8 @@ class OAuthHarness:
     token_latency: float = 0.0
     token_entered: asyncio.Event | None = None
     revocation_latency: float = 0.0
+    revocation_entered: asyncio.Event | None = None
+    revocation_gate: asyncio.Event | None = None
     forbid_list_tools: bool = False
     reject_all_tokens: bool = False
     preregistered: dict[str, Any] = field(default_factory=dict)
@@ -571,6 +573,10 @@ class OAuthHarness:
                 return True
             if path == "/revoke":
                 provider.counters["revoke"] += 1
+                if harness.revocation_entered is not None:
+                    harness.revocation_entered.set()
+                if harness.revocation_gate is not None:
+                    await harness.revocation_gate.wait()
                 if harness.revocation_latency:
                     await asyncio.sleep(harness.revocation_latency)
                 form = {k: v[0] for k, v in parse_qs(body.decode()).items()}

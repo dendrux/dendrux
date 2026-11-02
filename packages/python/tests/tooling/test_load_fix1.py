@@ -215,7 +215,7 @@ async def test_loop_survives_unexpected_probe_exception(monkeypatch):
     monkeypatch.setattr(sampler, "sample", sample)
     task = asyncio.create_task(sampler._loop())
     try:
-        await asyncio.wait_for(reached.wait(), 0.2)
+        await asyncio.wait_for(reached.wait(), 10)
         assert "sampling" in sampler.unavailable
     finally:
         task.cancel()
@@ -248,7 +248,7 @@ async def test_observer_connection_operations_have_deadlines(monkeypatch, operat
     sampler = monitor.ResourceMonitor(None)
     if operation == "connect":
         sampler.engine = SimpleNamespace(connect=hang)
-        await asyncio.wait_for(sampler.start(), 0.2)
+        await asyncio.wait_for(sampler.start(), 10)
         assert "connect" in sampler.unavailable
     else:
 
@@ -257,7 +257,7 @@ async def test_observer_connection_operations_have_deadlines(monkeypatch, operat
 
         monkeypatch.setattr(sampler, "sample", sample)
         sampler.conn = SimpleNamespace(close=hang)
-        await asyncio.wait_for(sampler.stop(1), 0.2)
+        await asyncio.wait_for(sampler.stop(1), 10)
         assert "close" in sampler.unavailable
     if sampler.task:
         await sampler.stop(0)

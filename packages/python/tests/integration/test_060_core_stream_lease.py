@@ -60,8 +60,21 @@ async def test_500_chunks_use_one_ticker_and_at_most_two_progress_writes(
 
 
 @pytest.mark.parametrize("single", [False, True])
-async def test_twelve_second_provider_stall_keeps_five_second_lease(store, engine, single):
+async def test_twelve_second_provider_stall_keeps_five_second_lease(
+    store, engine, single, monkeypatch
+):
     writes = []
+    renewals = []
+    renewed = asyncio.Event()
+    touch = store.touch_progress
+
+    async def completed_touch(run_id, *, claim_epoch=None):
+        result = await touch(run_id, claim_epoch=claim_epoch)
+        renewals.append(1)
+        renewed.set()
+        return result
+
+    monkeypatch.setattr(store, "touch_progress", completed_touch)
 
     def capture(conn, cursor, statement, parameters, context, executemany):
         if (
@@ -73,9 +86,14 @@ async def test_twelve_second_provider_stall_keeps_five_second_lease(store, engin
     class Model(MockLLM):
         async def complete_stream(self, *args, **kwargs):
             yield StreamEvent(type=StreamEventType.TEXT_DELTA, text="x")
-            before = len(writes)
-            await asyncio.sleep(12)
-            assert len(writes) - before >= 2
+            before = len(renewals)
+            before_writes = len(writes)
+            async with asyncio.timeout(30):
+                while len(renewals) - before < 2:
+                    renewed.clear()
+                    await renewed.wait()
+            assert len(renewals) - before >= 2
+            assert len(writes) - before_writes >= 2
             yield StreamEvent(type=StreamEventType.DONE, raw=LLMResponse(text="x"))
 
     event.listen(engine.sync_engine, "before_cursor_execute", capture)

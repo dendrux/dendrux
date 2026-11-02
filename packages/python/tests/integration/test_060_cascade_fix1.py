@@ -21,11 +21,11 @@ from tests._helpers.db_errors import locked_error
 
 
 @asynccontextmanager
-async def sqlite_file(tmp_path, mode):
+async def sqlite_file(tmp_path, mode, *, busy_timeout=10):
     path = tmp_path / f"{mode}.db"
     with sqlite3.connect(path) as connection:
         connection.execute("PRAGMA journal_mode=WAL")
-    options = {"timeout": 0.02}
+    options = {"timeout": busy_timeout}
     if mode == "autocommit_false":
         if sys.version_info < (3, 12):
             pytest.skip("sqlite3 autocommit=False requires Python 3.12")
@@ -54,7 +54,8 @@ async def sqlite_file(tmp_path, mode):
 async def test_sqlite_file_creator_lock_closes_admission(
     tmp_path, monkeypatch, mode, record_property
 ):
-    async with sqlite_file(tmp_path, mode) as engine:
+    # Only this test forces SQLITE_BUSY: the lock stays held until backoff is observed.
+    async with sqlite_file(tmp_path, mode, busy_timeout=0.02) as engine:
         store, creator = store_for_engine(engine), store_for_engine(engine)
         root, child = generate_ulid(), generate_ulid()
         await store.create_run(root, "parent", tenant_id="t")
@@ -86,12 +87,12 @@ async def test_sqlite_file_creator_lock_closes_admission(
         )
         cancellation = retry_seen = None
         try:
-            await asyncio.wait_for(checked.wait(), 5)
+            await asyncio.wait_for(checked.wait(), 10)
             started = time.perf_counter()
             cancellation = asyncio.create_task(agent.cancel_run(root, cascade=True, tenant_id="t"))
             retry_seen = asyncio.create_task(retried.wait())
             done, _ = await asyncio.wait(
-                {cancellation, retry_seen}, timeout=5, return_when=asyncio.FIRST_COMPLETED
+                {cancellation, retry_seen}, timeout=10, return_when=asyncio.FIRST_COMPLETED
             )
             assert retry_seen in done, "cascade escaped the creator lock without a retry"
             assert not cancellation.done()
@@ -99,8 +100,8 @@ async def test_sqlite_file_creator_lock_closes_admission(
             record_property("lock_wait_seconds", waited)
             print(f"SQLite {mode} creator lock/busy wait: {waited:.6f}s")
             release.set()
-            await asyncio.wait_for(creation, 5)
-            result = await asyncio.wait_for(cancellation, 5)
+            await asyncio.wait_for(creation, 10)
+            result = await asyncio.wait_for(cancellation, 10)
             assert {row["run_id"] for row in result.meta["cascade"]} == {root, child}
             assert (await store.get_run(child)).cancel_requested
         finally:

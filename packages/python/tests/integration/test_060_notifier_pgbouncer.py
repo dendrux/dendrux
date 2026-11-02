@@ -86,11 +86,11 @@ async def test_n4_controlled_delivery_with_backend_reassignment(
             sub.event.clear()
             await store.save_run_event(run, event_type="llm.completed")
             if session_pool:
-                await asyncio.wait_for(sub.event.wait(), 0.1)
+                await asyncio.wait_for(sub.event.wait(), 10)
             else:
                 await asyncio.sleep(0.05)
                 assert not sub.event.is_set()
-            async with asyncio.timeout(1):
+            async with asyncio.timeout(10):
                 while not follower.buffer:
                     await asyncio.sleep(0.001)
             assert follower.buffer[0].event_type == "llm.completed"

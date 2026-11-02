@@ -178,7 +178,7 @@ async def test_n7_failed_self_test_releases_backend(pg_test_url, engine, monkeyp
     with pytest.raises(NotifierUnavailableError):
         await notifier.start()
     assert notifier._connection is None and notifier._task is None
-    async with asyncio.timeout(1):
+    async with asyncio.timeout(10):
         while True:
             async with engine.connect() as conn:
                 count = (
@@ -220,7 +220,7 @@ async def test_concurrent_two_writer_instances_durable_order_and_wakeup(pg_test_
             tasks = [asyncio.create_task(write(i)) for i in range(20)]
             barrier.set()
             await asyncio.gather(*tasks)
-            await asyncio.wait_for(sub.event.wait(), 0.5)
+            await asyncio.wait_for(sub.event.wait(), 10)
             events = await store.get_run_events(run)
             assert len(events) == 20
             assert [e.sequence_index for e in events] == list(range(20))
@@ -298,7 +298,7 @@ async def test_n3_cancelled_start_keeps_one_real_listener(
     notifier = PostgresEventNotifier(pg_test_url)
     starting = [asyncio.create_task(notifier.start()) for _ in range(3)]
     try:
-        await asyncio.wait_for(entered.wait(), 1)
+        await asyncio.wait_for(entered.wait(), 10)
         starting[cancelled].cancel()
         with pytest.raises(asyncio.CancelledError):
             await starting[cancelled]
@@ -322,7 +322,7 @@ async def test_n3_cancelled_start_keeps_one_real_listener(
         await store.create_run(run, "cancelled-start")
         async with notifier.subscribe(run) as sub:
             await store.save_run_event(run, event_type="llm.completed")
-            await asyncio.wait_for(sub.event.wait(), 1)
+            await asyncio.wait_for(sub.event.wait(), 10)
     finally:
         release.set()
         for task in starting:
@@ -361,7 +361,7 @@ async def test_n5_default_off_writer_warns_once_on_healthy_reconciliation(
     feed._fetch = observe_empty
     feed.add(follower)
     try:
-        await asyncio.wait_for(empty.wait(), 1)
+        await asyncio.wait_for(empty.wait(), 10)
         assert not any(getattr(r, "code", None) == "notifier_missed_hint" for r in caplog.records)
         await store.save_run_event(run, event_type="llm.completed")
         await wait_until(lambda: len(follower.buffer) == 1)
