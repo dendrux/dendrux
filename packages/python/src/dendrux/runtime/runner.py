@@ -261,6 +261,7 @@ class _RunLifecycle:
     started: bool = False
     recorder_closed: bool = False
     notifier_closed: bool = False
+    recorder: LoopRecorder | None = None
 
     def _claim(self, store: StateStore, loop: Loop, created: CreateRunResult) -> StateStore:
         self.run_id = created.run_id
@@ -277,29 +278,6 @@ class _RunLifecycle:
             self.manager.register_current(self.run_id)
             self.registered = True
         return self.store
-
-    async def _start(
-        self,
-        recorder: LoopRecorder | None,
-        notifier: LoopNotifier | None,
-        agent: Agent,
-        provider: LLMProvider,
-        parent: DelegationContext | None,
-        event_data: dict[str, Any],
-    ) -> tuple[Any, LoopNotifier | None]:
-        await _emit_event(self.store, self.run_id, StoredEventType.RUN_STARTED.value, event_data)
-        self.started = True
-        await record_run_started(
-            recorder, self.run_id, agent_name=agent.name, agent_model=provider.model
-        )
-        return await _start_trace(
-            notifier,
-            self.store,
-            self.run_id,
-            agent_name=agent.name,
-            agent_model=provider.model,
-            parent=parent,
-        )
 
     async def _finish(
         self, recorder: LoopRecorder | None, notifier: LoopNotifier | None, result: RunResult
@@ -441,6 +419,42 @@ def _runtime_recorder(
         seed_traces=seeds.get("seed_traces"),
         guardrail_engine=guardrails,
         **_recorder_image_kwargs(tenant_id, provider),
+    )
+
+
+async def _start_new_run(
+    lifecycle: _RunLifecycle,
+    agent: Agent,
+    provider: LLMProvider,
+    tenant_id: str | None,
+    seeds: dict[str, Any],
+    guardrails: Any,
+    notifier: LoopNotifier | None,
+    parent: DelegationContext | None,
+    event_data: dict[str, Any],
+    *,
+    before_event: Callable[[], None] | None = None,
+) -> tuple[Any, LoopNotifier | None]:
+    if lifecycle.store is not None:
+        lifecycle.recorder = _runtime_recorder(
+            lifecycle.store, agent, provider, lifecycle.run_id, tenant_id, seeds, guardrails
+        )
+    if before_event is not None:
+        before_event()
+    await _emit_event(
+        lifecycle.store, lifecycle.run_id, StoredEventType.RUN_STARTED.value, event_data
+    )
+    lifecycle.started = True
+    await record_run_started(
+        lifecycle.recorder, lifecycle.run_id, agent_name=agent.name, agent_model=provider.model
+    )
+    return await _start_trace(
+        notifier,
+        lifecycle.store,
+        lifecycle.run_id,
+        agent_name=agent.name,
+        agent_model=provider.model,
+        parent=parent,
     )
 
 
@@ -1821,16 +1835,95 @@ def _resolve_max_delegation_depth(
     return effective
 
 
-def _run_metadata(
+def _require_idempotency_store(store: StateStore | None, key: str | None) -> None:
+    if key is not None and store is None:
+        raise ValueError(
+            "idempotency_key requires persistence (database_url or state_store). "
+            "Idempotency cannot work without durable state."
+        )
+
+
+def _new_run_loop(agent: Agent, loop: Loop | None) -> Loop:
+    return loop or agent.loop or ReActLoop()
+
+
+def _new_run_input(
+    user_input: UserContent, history: list[ChatMessage] | None, loop: Loop
+) -> tuple[str, tuple[Any, ...], bool, list[Message]]:
+    text, items = split_user_content(user_input)
+    validate_chat_history(history)
+    image_input = bool(items) or history_has_images(history)
+    if image_input:
+        _require_image_loop(loop)
+    return text, items, image_input, [] if image_input else normalize_chat_history(history)
+
+
+def _new_run_history(
+    replay: ReplayRequest | None,
+    history: list[Message],
+    context: list[ContextBlock] | None,
+    user_input: str,
+    session: SkillSession,
+    parts: tuple[ContentPart, ...] | None,
+) -> list[Message] | None:
+    if replay is not None:
+        return None
+    return fold_context(history, context, user_input, session=session, user_parts=parts)
+
+
+async def _record_seeded_user(
+    recorder: LoopRecorder | None,
+    notifier: LoopNotifier | None,
+    run_id: str,
+    user_input: str,
+    history: list[Message] | None,
+    context: list[ContextBlock] | None,
+    session: SkillSession,
+) -> None:
+    if history is not None:
+        message = user_trace_message(
+            user_input, history, render_band(context, "stable"), context, session=session
+        )
+        await _record_user_trace(recorder, notifier, run_id, message)
+
+
+async def _new_run_image_view(
+    runtime: ImageRuntime | None,
+    store: StateStore | None,
+    run_id: str,
+    history: list[Message] | None,
+    replay_runs: list[Any],
+    replay_plan: ReplayPlan | None,
+    parts: tuple[ContentPart, ...] | None,
+) -> ImageViewState | None:
+    return await _start_image_view(
+        runtime,
+        store,
+        run_id,
+        seeded=(history or [])[:-1],
+        sources=_replay_sources(replay_runs),
+        single_full=_single_full_source(replay_plan),
+        input_images=parts is not None,
+    )
+
+
+def _new_run_metadata(
     agent: Agent,
     loop: Loop,
     session: SkillSession,
     metadata: dict[str, Any] | None,
     depth: int | None,
     *,
+    user_input: str,
+    idempotency_key: str | None = None,
     output_type: type | None = None,
+    history: Any = None,
+    context: Any = None,
+    replay: ReplayRequest | None = None,
+    parts: tuple[ContentPart, ...] | None = None,
     retry_of: str | None = None,
-) -> dict[str, Any]:
+    streaming: bool = False,
+) -> tuple[dict[str, Any], str | None]:
     result = dict(metadata) if metadata else {}
     result[LOOP_META_KEY] = type(loop).__name__
     result[GOVERNANCE_KEY] = governance_snapshot(agent)
@@ -1838,38 +1931,40 @@ def _run_metadata(
         result[META_KEY] = session.manifest()
     if depth is not None:
         result[MAX_DELEGATION_DEPTH_META_KEY] = depth
+    output_name = None
     if output_type is not None:
-        result[OUTPUT_TYPE_META_KEY] = f"{output_type.__module__}.{output_type.__qualname__}"
+        output_name = f"{output_type.__module__}.{output_type.__qualname__}"
+        result[OUTPUT_TYPE_META_KEY] = output_name
     if retry_of is not None:
         result[RETRY_OF_META_KEY] = retry_of
-    return result
+    fingerprint = None
+    if idempotency_key is not None:
+        fingerprint = compute_idempotency_fingerprint(
+            agent.name,
+            user_input,
+            # Preserve run's truthiness check and stream's presence check.
+            output_type_name=output_name if streaming or output_type else None,
+            history=history or None,
+            context=context or None,
+            replay=replay.fingerprint() if replay else None,
+            skills=session.fingerprint(),
+            user_input_parts=parts,
+        )
+    return result, fingerprint
 
 
-def _entry_fingerprint(
-    key: str | None,
-    name: str,
-    user_input: str,
-    output_type: type | None,
-    history: Any,
-    context: Any,
-    replay: ReplayRequest | None,
-    session: SkillSession,
-    parts: tuple[ContentPart, ...] | None,
-) -> str | None:
-    if key is None:
-        return None
-    return compute_idempotency_fingerprint(
-        name,
-        user_input,
-        output_type_name=f"{output_type.__module__}.{output_type.__qualname__}"
-        if output_type
-        else None,
-        history=history or None,
-        context=context or None,
-        replay=replay.fingerprint() if replay else None,
-        skills=session.fingerprint(),
-        user_input_parts=parts,
-    )
+async def _load_new_run_replay(
+    store: StateStore,
+    request: ReplayRequest,
+    tenant_id: str | None,
+    loop: Loop,
+    *,
+    method: str = "run",
+) -> list[Any]:
+    runs = await load_replay_runs(store, request, tenant_id=tenant_id)
+    if _replay_has_images(runs):
+        _require_image_loop(loop, method)
+    return runs
 
 
 async def _entry_replay(
@@ -1890,7 +1985,7 @@ async def _entry_replay(
             "runs= requires persistence (database_url or state_store): "
             "replay reads the earlier runs' traces."
         )
-    return request, await load_replay_runs(store, request, tenant_id=tenant_id)
+    return request, await _load_new_run_replay(store, request, tenant_id, loop)
 
 
 async def _entry_media(
@@ -2077,14 +2172,10 @@ async def run(
     """
     tenant_explicit = _tenant_scope_chosen(tenant_id)
     tenant_id = resolve_runner_tenant(agent, "run", tenant_id, state_store=state_store)
-    if idempotency_key is not None and state_store is None:
-        raise ValueError(
-            "idempotency_key requires persistence (database_url or state_store). "
-            "Idempotency cannot work without durable state."
-        )
+    _require_idempotency_store(state_store, idempotency_key)
     await ensure_agent_limits_fit(agent, state_store)
     skill_session = SkillSession.prepare(
-        agent, loop=loop or agent.loop or ReActLoop(), explicit=activate_skills
+        agent, loop=_new_run_loop(agent, loop), explicit=activate_skills
     )
     with skill_session.bind():
         # Validate + resolve depth early — before any side effects.
@@ -2107,25 +2198,20 @@ async def run(
         )
 
         resolved_strategy = strategy or NativeToolCalling()
-        resolved_loop = loop or agent.loop or ReActLoop()
+        resolved_loop = _new_run_loop(agent, loop)
         _validate_loop_skill_compat(agent, resolved_loop)
 
         # Validate input + chat history before any side effects. Raises
         # TypeError / ValueError on bad input so no DB row is created.
-        user_input, input_items = split_user_content(user_input)
-        validate_chat_history(history)
-        image_input = bool(input_items) or history_has_images(history)
-        if image_input:
-            _require_image_loop(resolved_loop)
-        normalized_history = [] if image_input else normalize_chat_history(history)
+        user_input, input_items, image_input, normalized_history = _new_run_input(
+            user_input, history, resolved_loop
+        )
         replay_req, replay_runs = await _entry_replay(
             state_store, tenant_id, runs, replay_last, replay_reasoning, resolved_loop, context
         )
-        if _replay_has_images(replay_runs):
-            _require_image_loop(resolved_loop)
         replay_plan: ReplayPlan | None = None
 
-        provider_kwargs = dict(kwargs) if kwargs else {}
+        provider_kwargs = dict(kwargs)
 
         run_id = generate_ulid()
 
@@ -2159,16 +2245,9 @@ async def run(
         # The runner will record the new user_input itself (after the recorder
         # is constructed) so seeded prior turns stay out of react_traces.
         # With runs=, the replayed prefix is folded in after expansion.
-        if replay_req is None:
-            seeded_history = fold_context(
-                normalized_history,
-                context,
-                user_input,
-                session=skill_session,
-                user_parts=user_parts,
-            )
-        else:
-            seeded_history = None
+        seeded_history = _new_run_history(
+            replay_req, normalized_history, context, user_input, skill_session, user_parts
+        )
         recorder: LoopRecorder | None = None
 
         # --- Delegation context ---
@@ -2183,29 +2262,26 @@ async def run(
         result: RunResult | None = None
         lifecycle = _RunLifecycle(run_id, state_store, getattr(agent, "_task_manager", None))
 
+        seed_kwargs: dict[str, Any] = {}
+        run_guardrails = None
         try:
             try:
                 if state_store is not None:
                     # Create the run record before the loop starts
                     # Merge loop type + depth limit into developer metadata
-                    run_meta = _run_metadata(
+                    run_meta, idem_fingerprint = _new_run_metadata(
                         agent,
                         resolved_loop,
                         skill_session,
                         metadata,
                         effective_max_depth,
+                        user_input=user_input,
+                        idempotency_key=idempotency_key,
                         output_type=output_type,
-                    )
-                    idem_fingerprint = _entry_fingerprint(
-                        idempotency_key,
-                        agent.name,
-                        user_input,
-                        output_type,
-                        normalized_history,
-                        context,
-                        replay_req,
-                        skill_session,
-                        user_parts,
+                        history=normalized_history,
+                        context=context,
+                        replay=replay_req,
+                        parts=user_parts,
                     )
 
                     seed_kwargs, run_guardrails = await _runtime_seeds(
@@ -2253,21 +2329,22 @@ async def run(
 
                     run_id = create_result.run_id
                     state_store = lifecycle._claim(state_store, resolved_loop, create_result)
-                    recorder = _runtime_recorder(
-                        state_store, agent, provider, run_id, tenant_id, seed_kwargs, run_guardrails
-                    )
 
-                trace_link, extra_notifier = await lifecycle._start(
-                    recorder,
-                    extra_notifier,
+                trace_link, extra_notifier = await _start_new_run(
+                    lifecycle,
                     agent,
                     provider,
+                    tenant_id,
+                    seed_kwargs,
+                    run_guardrails,
+                    extra_notifier,
                     parent_ctx,
                     {"agent_name": agent.name, "system_prompt": _system_prompt},
                 )
 
                 # Set delegation context for the duration of this run so nested
                 # agent.run() calls inside tools inherit the parent link.
+                recorder = lifecycle.recorder
                 this_ctx = DelegationContext(
                     run_id=run_id,
                     trace_link=trace_link,
@@ -2307,14 +2384,14 @@ async def run(
                     user_parts=user_parts,
                 )
                 await _register_memory_input(image_runtime, state_store, run_id, user_parts)
-                image_view = await _start_image_view(
+                image_view = await _new_run_image_view(
                     image_runtime,
                     state_store,
                     run_id,
-                    seeded=(seeded_history or [])[:-1],
-                    sources=_replay_sources(replay_runs),
-                    single_full=_single_full_source(replay_plan),
-                    input_images=user_parts is not None,
+                    seeded_history,
+                    replay_runs,
+                    replay_plan,
+                    user_parts,
                 )
 
                 # When chat history was provided, the loop receives a complete
@@ -2322,15 +2399,15 @@ async def run(
                 # recording. The runner records the new user_input itself so it
                 # still lands in react_traces (seeded prior turns are NOT recorded
                 # — they live in the dev's chat DB).
-                if seeded_history is not None:
-                    user_msg = user_trace_message(
-                        user_input,
-                        seeded_history,
-                        render_band(context, "stable"),
-                        context,
-                        session=skill_session,
-                    )
-                    await _record_user_trace(recorder, extra_notifier, run_id, user_msg)
+                await _record_seeded_user(
+                    recorder,
+                    extra_notifier,
+                    run_id,
+                    user_input,
+                    seeded_history,
+                    context,
+                    skill_session,
+                )
 
                 result = await resolved_loop.run(
                     agent=agent,
@@ -2367,15 +2444,15 @@ async def run(
                 return result
 
             except RunFencedError:
-                return await lifecycle._fenced(recorder, extra_notifier)
+                return await lifecycle._fenced(lifecycle.recorder, extra_notifier)
 
             except Exception as exc:
-                await lifecycle._failed(exc, mcp_meta, recorder, extra_notifier)
+                await lifecycle._failed(exc, mcp_meta, lifecycle.recorder, extra_notifier)
                 raise
 
         except asyncio.CancelledError:
             cancelled_result, swallow = await lifecycle._cancelled(
-                result, mcp_meta, recorder, extra_notifier
+                result, mcp_meta, lifecycle.recorder, extra_notifier
             )
             if swallow:
                 return cancelled_result
@@ -2992,6 +3069,71 @@ async def _retry_edges(
     return {"blob_refs": live, "blob_refs_scope": runtime.tenant_scope} if live else {}
 
 
+async def _retry_source(
+    store: StateStore, run_id: str, tenant_id: str | None
+) -> tuple[RunRecord, Any]:
+    source = await store.get_run(run_id)
+    if source is None:
+        raise RunNotFoundError(run_id)
+    if source.tenant_id != tenant_id:
+        raise RunNotFoundError(run_id)
+    return source, (source.meta or {}).get(META_KEY, {}).get("explicit", [])
+
+
+async def _start_retry_history(
+    agent: Agent,
+    provider: LLMProvider,
+    loop: Loop,
+    provider_kwargs: dict[str, Any],
+    store: StateStore,
+    run_id: str,
+    source: RunRecord,
+    replay_req: ReplayRequest | None,
+    replay_runs: list[Any],
+    history: list[Message],
+    image_runtime: ImageRuntime | None,
+    explicit: Any,
+) -> tuple[ReplayPlan | None, list[Message], ImageViewState | None]:
+    from dendrux.runtime._capabilities import capabilities
+
+    current = current_prefix(agent, provider, loop, provider_kwargs)
+    replay_plan: ReplayPlan | None = None
+    if replay_req is not None:
+        replay_plan = expand_replay(
+            replay_runs, replay_req, current=current, guardrails=bool(agent.guardrails)
+        )
+        if (
+            source.storage_format != STORAGE_FORMAT_CHECKPOINTED
+            or not capabilities(store).checkpointing
+        ):
+            history = [*replay_plan.messages, *history]
+    seeded_slots = image_slot_count(history)
+    await record_run_prefix(
+        store,
+        run_id,
+        current=current,
+        seed={"retry_of": source.id},
+        plan=replay_plan,
+        # An explicit-skills retry also traces its rebuilt first user
+        # message, so its slot mapping is not a plain offset: unknown.
+        seeded_image_slots=None if explicit and seeded_slots else seeded_slots,
+    )
+    # A retry has no new input: every seeded slot counts as sent.
+    image_view = await _start_image_view(
+        image_runtime,
+        store,
+        run_id,
+        seeded=history,
+        sources=[
+            *_replay_sources(replay_runs),
+            (source.id, source.tenant_id, source.meta),
+        ],
+        single_full=replay_plan is None,
+        input_images=False,
+    )
+    return replay_plan, history, image_view
+
+
 async def retry(
     original_run_id: str,
     *,
@@ -3045,8 +3187,6 @@ async def retry(
     tenant_explicit = _tenant_scope_chosen(tenant_id)
     tenant_id = resolve_runner_tenant(agent, "retry", tenant_id, state_store=state_store)
     await ensure_agent_limits_fit(agent, state_store)
-    from dendrux.errors import RunNotFoundError
-    from dendrux.runtime._capabilities import capabilities
 
     tenant_id = resolve_child_tenant(get_delegation_context(), tenant_id)
     runner_entry_checks(
@@ -3059,20 +3199,12 @@ async def retry(
         provider_kwargs=kwargs,
         provider=provider,
     )
-    source_run = await state_store.get_run(original_run_id)
-    if source_run is None:
-        raise RunNotFoundError(original_run_id)
-
-    if source_run.tenant_id != tenant_id:
-        raise RunNotFoundError(original_run_id)
-    explicit = (source_run.meta or {}).get(META_KEY, {}).get("explicit", [])
-    skill_session = SkillSession.prepare(
-        agent, loop=loop or agent.loop or ReActLoop(), explicit=explicit
-    )
+    source_run, explicit = await _retry_source(state_store, original_run_id, tenant_id)
+    skill_session = SkillSession.prepare(agent, loop=_new_run_loop(agent, loop), explicit=explicit)
     with skill_session.bind():
         await _check_retry_source(state_store, source_run, original_run_id)
 
-        resolved_loop = loop or agent.loop or ReActLoop()
+        resolved_loop = _new_run_loop(agent, loop)
         _validate_loop_skill_compat(agent, resolved_loop)
 
         # 3. Read traces and reconstruct approximate history. Reasoning replay
@@ -3095,7 +3227,7 @@ async def retry(
 
         # 5. Create the retry run
         resolved_strategy = strategy or NativeToolCalling()
-        provider_kwargs = dict(kwargs) if kwargs else {}
+        provider_kwargs = dict(kwargs)
 
         run_id = generate_ulid()
 
@@ -3105,13 +3237,14 @@ async def retry(
 
         _system_prompt = agent.get_system_prompt(loop=resolved_loop)
 
-        run_meta = _run_metadata(
+        run_meta, _ = _new_run_metadata(
             agent,
             resolved_loop,
             skill_session,
             metadata,
             effective_max_depth,
             retry_of=original_run_id,
+            user_input=user_input,
         )
 
         image_runtime = _retry_media(
@@ -3132,6 +3265,8 @@ async def retry(
         result: RunResult | None = None
         lifecycle = _RunLifecycle(run_id, state_store, getattr(agent, "_task_manager", None))
 
+        seed_kwargs: dict[str, Any] = {}
+        run_guardrails = None
         try:
             try:
                 seed_kwargs, run_guardrails = await _runtime_seeds(
@@ -3164,15 +3299,15 @@ async def retry(
                 )
                 run_id = create_result.run_id
                 state_store = lifecycle._claim(state_store, resolved_loop, create_result)
-                recorder = _runtime_recorder(
-                    state_store, agent, provider, run_id, tenant_id, seed_kwargs, run_guardrails
-                )
 
-                trace_link, extra_notifier = await lifecycle._start(
-                    recorder,
-                    extra_notifier,
+                trace_link, extra_notifier = await _start_new_run(
+                    lifecycle,
                     agent,
                     provider,
+                    tenant_id,
+                    seed_kwargs,
+                    run_guardrails,
+                    extra_notifier,
                     parent_ctx,
                     {
                         "agent_name": agent.name,
@@ -3181,6 +3316,7 @@ async def retry(
                     },
                 )
 
+                recorder = lifecycle.recorder
                 this_ctx = DelegationContext(
                     run_id=run_id,
                     trace_link=trace_link,
@@ -3200,40 +3336,19 @@ async def retry(
                     agent, recorder, extra_notifier, run_id, resolved_loop, mcp_meta
                 )
 
-                current = current_prefix(agent, provider, resolved_loop, provider_kwargs)
-                replay_plan: ReplayPlan | None = None
-                if replay_req is not None:
-                    replay_plan = expand_replay(
-                        replay_runs, replay_req, current=current, guardrails=bool(agent.guardrails)
-                    )
-                    if (
-                        source_run.storage_format != STORAGE_FORMAT_CHECKPOINTED
-                        or not capabilities(state_store).checkpointing
-                    ):
-                        initial_history = [*replay_plan.messages, *initial_history]
-                seeded_slots = image_slot_count(initial_history)
-                await record_run_prefix(
+                replay_plan, initial_history, image_view = await _start_retry_history(
+                    agent,
+                    provider,
+                    resolved_loop,
+                    provider_kwargs,
                     state_store,
                     run_id,
-                    current=current,
-                    seed={"retry_of": original_run_id},
-                    plan=replay_plan,
-                    # An explicit-skills retry also traces its rebuilt first user
-                    # message, so its slot mapping is not a plain offset: unknown.
-                    seeded_image_slots=None if explicit and seeded_slots else seeded_slots,
-                )
-                # A retry has no new input: every seeded slot counts as sent.
-                image_view = await _start_image_view(
+                    source_run,
+                    replay_req,
+                    replay_runs,
+                    initial_history,
                     image_runtime,
-                    state_store,
-                    run_id,
-                    seeded=initial_history,
-                    sources=[
-                        *_replay_sources(replay_runs),
-                        (original_run_id, source_run.tenant_id, source_run.meta),
-                    ],
-                    single_full=replay_plan is None,
-                    input_images=False,
+                    explicit,
                 )
 
                 if explicit:
@@ -3276,15 +3391,15 @@ async def retry(
                 return result
 
             except RunFencedError:
-                return await lifecycle._fenced(recorder, extra_notifier)
+                return await lifecycle._fenced(lifecycle.recorder, extra_notifier)
 
             except Exception as exc:
-                await lifecycle._failed(exc, mcp_meta, recorder, extra_notifier)
+                await lifecycle._failed(exc, mcp_meta, lifecycle.recorder, extra_notifier)
                 raise
 
         except asyncio.CancelledError:
             cancelled_result, swallow = await lifecycle._cancelled(
-                result, mcp_meta, recorder, extra_notifier
+                result, mcp_meta, lifecycle.recorder, extra_notifier
             )
             if swallow:
                 return cancelled_result
@@ -3295,6 +3410,66 @@ async def retry(
             lifecycle._release()
             if ctx_token is not None:
                 reset_delegation_context(ctx_token)
+
+
+def _cached_stream_event(cached: RunResult, run_id: str) -> RunEvent:
+    from dendrux.types import RunEvent
+
+    event_type = {
+        RunStatus.ERROR: RunEventType.RUN_ERROR,
+        RunStatus.CANCELLED: RunEventType.RUN_CANCELLED,
+    }.get(cached.status, RunEventType.RUN_COMPLETED)
+    return RunEvent(
+        type=event_type,
+        run_id=run_id,
+        run_result=cached,
+        error=cached.error if event_type == RunEventType.RUN_ERROR else None,
+        phase="final_answer" if cached.status == RunStatus.SUCCESS else None,
+    )
+
+
+def _stream_entry_checks(
+    agent: Agent, tenant_id: str | None, shared: dict[str, Any], **checks: Any
+) -> None:
+    try:
+        entry_tenant = resolve_child_tenant(get_delegation_context(), tenant_id)
+    except ValueError:
+        return
+    shared["existing_run"] = True
+    runner_entry_checks(agent, "stream", tenant_id=entry_tenant, **checks)
+    shared["existing_run"] = False
+
+
+async def _resolve_stream_store(
+    store: StateStore | None,
+    resolver: Callable[[], Any] | None,
+    agent: Agent,
+    tenant_id: str | None | _OmittedType,
+) -> StateStore | None:
+    if store is None and resolver is not None:
+        store = await resolver()
+        resolve_runner_tenant(agent, "stream", tenant_id, state_store=store)
+    return store
+
+
+async def _stream_replay_runs(
+    request: ReplayRequest | None,
+    store: StateStore | None,
+    tenant_id: str | None,
+    loop: Loop,
+    shared: dict[str, Any],
+) -> list[Any]:
+    if request is None:
+        return []
+    shared["existing_run"] = True
+    if store is None:
+        raise ValueError(
+            "runs= requires persistence (database_url or state_store): "
+            "replay reads the earlier runs' traces."
+        )
+    runs = await _load_new_run_replay(store, request, tenant_id, loop, method="run_stream")
+    shared["existing_run"] = False
+    return runs
 
 
 @overload
@@ -3422,7 +3597,7 @@ def run_stream(
     image_input = bool(input_items) or history_has_images(history)
     normalized_history = [] if image_input else normalize_chat_history(history)
     resolved_strategy = strategy or NativeToolCalling()
-    resolved_loop = loop or agent.loop or ReActLoop()
+    resolved_loop = _new_run_loop(agent, loop)
     _validate_loop_skill_compat(agent, resolved_loop)
     if image_input:
         _require_image_loop(resolved_loop, "run_stream")
@@ -3443,7 +3618,7 @@ def run_stream(
         else:
             validate_context(context)
             initial_seeded = None
-    provider_kwargs = dict(kwargs) if kwargs else {}
+    provider_kwargs = dict(kwargs)
 
     run_id = generate_ulid()
 
@@ -3467,6 +3642,9 @@ def run_stream(
         nonlocal run_id, extra_notifier
         store = state_store
         recorder: LoopRecorder | None = None
+        startup = _RunLifecycle(run_id, store, None)
+        seed_kwargs: dict[str, Any] = {}
+        run_guardrails = None
         seeded_history = initial_seeded
         replay_plan: ReplayPlan | None = None
         image_runtime: ImageRuntime | None = None
@@ -3477,96 +3655,62 @@ def run_stream(
         # setup they raise (no RUN_ERROR event, no run row, no hooks). A child
         # whose explicit tenant differs from its parent's still fails later, as
         # RUN_ERROR, exactly as before.
-        try:
-            entry_tenant = resolve_child_tenant(get_delegation_context(), tenant_id)
-        except ValueError:
-            pass
-        else:
-            _shared["existing_run"] = True
-            runner_entry_checks(
-                agent,
-                "stream",
-                tenant_id=entry_tenant,
-                metadata=metadata,
-                user_input=entry_user_input,
-                history=history,
-                context=context,
-                provider_kwargs=provider_kwargs,
-                idempotency_key=idempotency_key,
-                provider=provider,
-            )
-            _shared["existing_run"] = False
+        _stream_entry_checks(
+            agent,
+            tenant_id,
+            _shared,
+            metadata=metadata,
+            user_input=entry_user_input,
+            history=history,
+            context=context,
+            provider_kwargs=provider_kwargs,
+            idempotency_key=idempotency_key,
+            provider=provider,
+        )
 
         if image_input:
             # Image setup raises (no RUN_ERROR event, no run row, no hooks).
             _shared["existing_run"] = True
-            if store is None and state_store_resolver is not None:
-                store = await state_store_resolver()
-                resolve_runner_tenant(agent, "stream", requested_tenant_id, state_store=store)
+            store = await _resolve_stream_store(
+                store, state_store_resolver, agent, requested_tenant_id
+            )
             await ensure_agent_limits_fit(agent, store)
             _shared["state_store"] = store
-            try:
-                entry = await _ingest_entry_images(
-                    agent,
-                    provider,
-                    provider_kwargs.get("model") or provider.model,
-                    state_store=store,
-                    tenant_id=resolve_child_tenant(get_delegation_context(), tenant_id),
-                    run_id=run_id,
-                    items=input_items,
-                    history=history,
-                )
-            except (InvalidImageError, BlobNotFoundError) as exc:
-                hit = await _idempotent_hit_after_image_error(
-                    exc,
-                    store,
-                    idempotency_key,
-                    tenant_id=resolve_child_tenant(get_delegation_context(), tenant_id),
-                    agent_name=agent.name,
-                    user_input=user_input,
-                    items=input_items,
-                    history=history,
-                    output_type=output_type,
-                    context=context,
-                    replay=replay_req.fingerprint() if replay_req else None,
-                    skills=skill_session.fingerprint(),
-                )
-                if hit is None:
-                    raise
-                if hit.outcome != "existing_terminal":
-                    raise RunAlreadyActiveError(hit.run_id, hit.status) from None
-                assert store is not None
-                cached = await _build_cached_result(store, hit.run_id, output_type)
-                run_id = hit.run_id
+            image_runtime, user_parts, history_messages, cached = await _entry_media(
+                agent,
+                provider,
+                resolved_loop,
+                store,
+                resolve_child_tenant(get_delegation_context(), tenant_id),
+                run_id,
+                True,
+                user_input,
+                input_items,
+                history,
+                history_messages,
+                provider_kwargs,
+                idempotency_key,
+                output_type,
+                context,
+                replay_req,
+                skill_session,
+            )
+            if cached is not None:
+                run_id = cached.run_id
                 stream.run_id = run_id
-                yield RunEvent(
-                    type={
-                        RunStatus.ERROR: RunEventType.RUN_ERROR,
-                        RunStatus.CANCELLED: RunEventType.RUN_CANCELLED,
-                    }.get(cached.status, RunEventType.RUN_COMPLETED),
-                    run_id=run_id,
-                    run_result=cached,
-                    error=cached.error if cached.status == RunStatus.ERROR else None,
-                    phase="final_answer" if cached.status == RunStatus.SUCCESS else None,
-                )
+                yield _cached_stream_event(cached, run_id)
                 return
-            image_runtime, user_parts, history_messages = entry
-            if replay_req is None:
-                with skill_session.bind():
-                    seeded_history = fold_context(
-                        history_messages,
-                        context,
-                        user_input,
-                        session=skill_session,
-                        user_parts=user_parts,
-                    )
+            with skill_session.bind():
+                seeded_history = _new_run_history(
+                    replay_req, history_messages, context, user_input, skill_session, user_parts
+                )
             _shared["existing_run"] = False
 
         try:
             # 1. Resolve state store lazily (may create DB engine)
-            if store is None and state_store_resolver is not None:
-                store = await state_store_resolver()
-                resolve_runner_tenant(agent, "stream", requested_tenant_id, state_store=store)
+            store = await _resolve_stream_store(
+                store, state_store_resolver, agent, requested_tenant_id
+            )
             await ensure_agent_limits_fit(agent, store)
             _shared["state_store"] = store
 
@@ -3582,54 +3726,28 @@ def run_stream(
             # failures don't leave a DB row stuck in running.
             _system_prompt = agent.get_system_prompt(loop=resolved_loop)
 
-            if idempotency_key is not None and store is None:
-                raise ValueError(
-                    "idempotency_key requires persistence (database_url or state_store"
-                    "). Idempotency cannot work without durable state."
-                )
+            _require_idempotency_store(store, idempotency_key)
 
-            replay_runs: list[Any] = []
-            if replay_req is not None:
-                # Rejected before any row exists: no lifecycle hooks fire.
-                _shared["existing_run"] = True
-                if store is None:
-                    raise ValueError(
-                        "runs= requires persistence (database_url or state_store): "
-                        "replay reads the earlier runs' traces."
-                    )
-                replay_runs = await load_replay_runs(store, replay_req, tenant_id=eff_tenant)
-                if _replay_has_images(replay_runs):
-                    _require_image_loop(resolved_loop, "run_stream")
-                _shared["existing_run"] = False
+            replay_runs = await _stream_replay_runs(
+                replay_req, store, eff_tenant, resolved_loop, _shared
+            )
 
             if store is not None:
-                run_meta = dict(metadata) if metadata else {}
-                run_meta[LOOP_META_KEY] = type(resolved_loop).__name__
-                run_meta[GOVERNANCE_KEY] = governance_snapshot(agent)
-                if skill_session.configured:
-                    run_meta[META_KEY] = skill_session.manifest()
-                if eff_max_depth is not None:
-                    run_meta[MAX_DELEGATION_DEPTH_META_KEY] = eff_max_depth
-                if output_type is not None:
-                    run_meta[OUTPUT_TYPE_META_KEY] = (
-                        f"{output_type.__module__}.{output_type.__qualname__}"
-                    )
-                fingerprint = None
-                if idempotency_key is not None:
-                    fingerprint = compute_idempotency_fingerprint(
-                        agent.name,
-                        user_input,
-                        output_type_name=(
-                            f"{output_type.__module__}.{output_type.__qualname__}"
-                            if output_type is not None
-                            else None
-                        ),
-                        history=history_messages or None,
-                        context=context or None,
-                        replay=replay_req.fingerprint() if replay_req else None,
-                        skills=skill_session.fingerprint(),
-                        user_input_parts=user_parts,
-                    )
+                run_meta, fingerprint = _new_run_metadata(
+                    agent,
+                    resolved_loop,
+                    skill_session,
+                    metadata,
+                    eff_max_depth,
+                    user_input=user_input,
+                    idempotency_key=idempotency_key,
+                    output_type=output_type,
+                    history=history_messages,
+                    context=context,
+                    replay=replay_req,
+                    parts=user_parts,
+                    streaming=True,
+                )
                 try:
                     seed_kwargs, run_guardrails = await _runtime_seeds(
                         store,
@@ -3676,17 +3794,7 @@ def run_stream(
                 stream.run_id = run_id
                 if create_result.outcome == "existing_terminal":
                     cached = await _build_cached_result(store, run_id, output_type)
-                    event_type = {
-                        RunStatus.ERROR: RunEventType.RUN_ERROR,
-                        RunStatus.CANCELLED: RunEventType.RUN_CANCELLED,
-                    }.get(cached.status, RunEventType.RUN_COMPLETED)
-                    yield RunEvent(
-                        type=event_type,
-                        run_id=run_id,
-                        run_result=cached,
-                        error=cached.error if event_type == RunEventType.RUN_ERROR else None,
-                        phase="final_answer" if cached.status == RunStatus.SUCCESS else None,
-                    )
+                    yield _cached_stream_event(cached, run_id)
                     return
                 if create_result.outcome == "existing_active":
                     raise RunAlreadyActiveError(run_id, create_result.status)
@@ -3705,24 +3813,6 @@ def run_stream(
                 _shared["state_store"] = store
                 _shared["claimed"] = True
 
-                from dendrux.runtime.persistence import PersistenceRecorder
-                from dendrux.tool import get_tool_def
-
-                target_lookup = {}
-                for fn in agent.tools:
-                    td = get_tool_def(fn)
-                    target_lookup[td.name] = td.target
-                recorder = PersistenceRecorder(
-                    store,
-                    run_id,
-                    model=provider.model,
-                    provider_name=type(provider).__name__,
-                    target_lookup=target_lookup,
-                    seed_traces=seed_kwargs.get("seed_traces"),
-                    guardrail_engine=run_guardrails,
-                    **_recorder_image_kwargs(eff_tenant, provider),
-                )
-
             # 2. Set delegation context for the generator lifetime
             this_ctx = DelegationContext(
                 run_id=run_id,
@@ -3736,26 +3826,21 @@ def run_stream(
                 lease_interval_s=agent.lease_interval.total_seconds(),
                 loop=asyncio.get_running_loop(),
             )
-            stream_context.set_delegation(this_ctx)
-
-            # 3. Emit lifecycle start
-            await _emit_event(
-                store,
-                run_id,
-                StoredEventType.RUN_STARTED.value,
-                {"agent_name": agent.name, "system_prompt": _system_prompt},
-            )
-            await record_run_started(
-                recorder, run_id, agent_name=agent.name, agent_model=provider.model
-            )
-            trace_link, extra_notifier = await _start_trace(
+            startup.run_id = run_id
+            startup.store = store
+            trace_link, extra_notifier = await _start_new_run(
+                startup,
+                agent,
+                provider,
+                eff_tenant,
+                seed_kwargs,
+                run_guardrails,
                 extra_notifier,
-                store,
-                run_id,
-                agent_name=agent.name,
-                agent_model=provider.model,
-                parent=parent_ctx,
+                parent_ctx,
+                {"agent_name": agent.name, "system_prompt": _system_prompt},
+                before_event=lambda: stream_context.set_delegation(this_ctx),
             )
+            recorder = startup.recorder
             this_ctx = replace(this_ctx, trace_link=trace_link)
             stream_context.set_delegation(this_ctx)
             # Lifecycle pair is now open. Stash recorder/notifier so the
@@ -3766,28 +3851,9 @@ def run_stream(
 
             yield RunEvent(type=RunEventType.RUN_STARTED, run_id=run_id)
 
-            # Emit init governance events (skills + MCP)
-            try:
-                await _emit_init_events(
-                    agent,
-                    recorder,
-                    extra_notifier,
-                    run_id,
-                    resolved_loop=resolved_loop,
-                    mcp_meta=mcp_meta,
-                )
-            except _MCPDiscoveryError as mcp_exc:
-                try:
-                    await _emit_init_governance_event(
-                        recorder,
-                        extra_notifier,
-                        run_id,
-                        GovernanceEventType.MCP_ERROR,
-                        _mcp_error_payload(mcp_exc),
-                    )
-                except Exception:
-                    logger.warning("Failed to emit mcp.error event", exc_info=safe_exception_info())
-                raise mcp_exc.__cause__ or mcp_exc from mcp_exc.__cause__
+            await _discover_runtime_tools(
+                agent, recorder, extra_notifier, run_id, resolved_loop, mcp_meta
+            )
 
             replay_plan, seeded_history = await _apply_replay(
                 agent,
@@ -3805,29 +3871,17 @@ def run_stream(
                 user_parts=user_parts,
             )
             await _register_memory_input(image_runtime, store, run_id, user_parts)
-            image_view = await _start_image_view(
-                image_runtime,
-                store,
-                run_id,
-                seeded=(seeded_history or [])[:-1],
-                sources=_replay_sources(replay_runs),
-                single_full=_single_full_source(replay_plan),
-                input_images=user_parts is not None,
+            image_view = await _new_run_image_view(
+                image_runtime, store, run_id, seeded_history, replay_runs, replay_plan, user_parts
             )
 
             # When chat history was provided, the loop receives a complete
             # message list as initial_history and skips its own user-message
             # recording. Record the new user_input here so it still lands in
             # react_traces (seeded prior turns are NOT recorded).
-            if seeded_history is not None:
-                user_msg = user_trace_message(
-                    user_input,
-                    seeded_history,
-                    render_band(context, "stable"),
-                    context,
-                    session=skill_session,
-                )
-                await _record_user_trace(recorder, extra_notifier, run_id, user_msg)
+            await _record_seeded_user(
+                recorder, extra_notifier, run_id, user_input, seeded_history, context, skill_session
+            )
 
             # 3. Stream the loop. The interrupt signal lets cancel_run reach
             # an in-flight provider stream owned by this process; the closing
@@ -3901,7 +3955,7 @@ def run_stream(
         except RunFencedError:
             assert store is not None
             result = await _build_cached_result(store, run_id)
-            await _finish_fenced_lifecycle(run_id, result, recorder, extra_notifier)
+            await _finish_fenced_lifecycle(run_id, result, startup.recorder, extra_notifier)
             yield _fenced_stream_event(run_id, result)
 
         except Exception as exc:
@@ -3930,7 +3984,7 @@ def run_stream(
                     )
             if not _shared.get("existing_run"):
                 try:
-                    await record_run_failed(recorder, run_id, exc)
+                    await record_run_failed(startup.recorder, run_id, exc)
                     await notify_run_failed(extra_notifier, run_id, exc)
                 except Exception:
                     logger.warning(
