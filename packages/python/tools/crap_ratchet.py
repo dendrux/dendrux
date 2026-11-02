@@ -18,6 +18,8 @@ Rules enforced by ``check``:
   * no existing function may score higher than its baseline (small tolerance for noise);
     when its AST digest is unchanged, a rise of up to 25 percent of the baseline score is
     only a warning (coverage variance), a larger one still fails.
+  * an edited function whose complexity did not rise may rise by up to 2 percent of its
+    baseline (at least the 0.5 tolerance) as a warning; recording a baseline stays strict.
 
 Run locally (from packages/python)::
 
@@ -48,6 +50,9 @@ DEFAULT_TOLERANCE = 0.5
 # An unchanged function (same AST digest) whose score rises by up to this share of its
 # baseline is a warning, not a failure: run-to-run coverage variance must not fail the build.
 DEFAULT_UNCHANGED_RISE = 0.25
+# An edited function whose complexity did not rise may wobble by this share of its baseline
+# (at least DEFAULT_TOLERANCE points) as a warning: owner decision 2026-11-02.
+DEFAULT_EDITED_RISE = 0.02
 HERE = Path(__file__).resolve().parent
 DEFAULT_BASELINE = HERE / "crap_baseline.json"
 DEFAULT_REPO_ROOT = HERE.parent
@@ -353,8 +358,9 @@ def compare_split(
     threshold: float = DEFAULT_THRESHOLD,
     tolerance: float = DEFAULT_TOLERANCE,
     unchanged_rise: float = DEFAULT_UNCHANGED_RISE,
+    edited_rise: float = DEFAULT_EDITED_RISE,
 ) -> tuple[list[Violation], list[Violation]]:
-    """Apply the no-worse rule; only unchanged code has a coverage-noise allowance."""
+    """Apply the no-worse rule, with warning bands for run-to-run coverage noise."""
     failures: list[Violation] = []
     warnings: list[Violation] = []
     for key, score in sorted(scores.items()):
@@ -384,9 +390,14 @@ def compare_split(
         current_crap, old_crap = round(score.crap, 2), round(old["crap"], 2)
         if current_crap > old_crap + (0.0 if changed else tolerance):
             message = f"CRAP rose from {old['crap']:.2f} to {score.crap:.2f}"
+            wobble = max(old_crap * edited_rise, tolerance) if edited_rise else 0.0
             if not changed and score.crap <= old["crap"] * (1 + unchanged_rise):
                 warnings.append(
                     Violation(key, "worse-unchanged", f"{message} (code unchanged: coverage)")
+                )
+            elif score.complexity <= old["complexity"] and current_crap <= old_crap + wobble:
+                warnings.append(
+                    Violation(key, "worse-edited-wobble", f"{message} (edited: coverage wobble)")
                 )
             else:
                 failures.append(Violation(key, "worse", message))
@@ -400,7 +411,9 @@ def compare(
     tolerance: float = DEFAULT_TOLERANCE,
 ) -> list[Violation]:
     """Strict rules (no warning band): what recording a baseline must not let through."""
-    failures, _ = compare_split(scores, baseline, threshold, tolerance, unchanged_rise=0.0)
+    failures, _ = compare_split(
+        scores, baseline, threshold, tolerance, unchanged_rise=0.0, edited_rise=0.0
+    )
     return failures
 
 
