@@ -33,7 +33,7 @@ from dendrux.errors import (
     StatementTooLargeError,
 )
 from dendrux.errors import StoreOutcomeUnknown as StoreOutcomeUnknown
-from dendrux.runtime.stores._errors import classify_error
+from dendrux.runtime.stores._errors import _is_connection_loss_code, classify_error
 
 _EXCEPTION_WALK_LIMIT = 1024
 
@@ -88,7 +88,7 @@ def is_transient_db_error(exc: BaseException, *, classify: Any = classify_error)
         or (
             isinstance(exc, DBAPIError)
             and isinstance(classified.code, str)
-            and (classified.code.startswith(("08", "57P0")) or classified.code == "53300")
+            and (_is_connection_loss_code(classified.code) or classified.code == "53300")
         )
     )
 
