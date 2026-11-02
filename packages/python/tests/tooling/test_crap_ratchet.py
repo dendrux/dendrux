@@ -582,11 +582,35 @@ class TestCompare:
         better = _score("a.py::f", 20, 0.9)
         assert cr.compare({better.key: better}, _base(old)) == []
 
-    def test_changed_hotspot_that_stays_over_threshold_fails(self) -> None:
+    def test_edited_above_30_no_worse_passes(self) -> None:
         old = _score("a.py::f", 20, 0.2, digest="old")
         edited = _score("a.py::f", 20, 0.2, digest="new")
+        assert edited.crap > 30
+        assert cr.compare({edited.key: edited}, _base(old)) == []
+
+    def test_edited_above_30_complexity_up_fails_even_when_crap_falls(self) -> None:
+        old = _score("a.py::f", 40, 0.9, digest="old")
+        edited = _score("a.py::f", 41, 1.0, digest="new")
+        assert 30 < edited.crap < old.crap
         violations = cr.compare({edited.key: edited}, _base(old))
         assert [v.kind for v in violations] == ["changed-over-threshold"]
+
+    @pytest.mark.parametrize("complexity", [10, 40])
+    def test_edited_crap_above_baseline_fails_even_inside_tolerance(self, complexity: int) -> None:
+        old = _score("a.py::f", complexity, 1.0, digest="old")
+        edited = cr.FunctionScore(old.key, complexity, 1.0, old.crap + 0.1, "new")
+        assert [v.kind for v in cr.compare({edited.key: edited}, _base(old))] == ["worse"]
+
+    def test_complexity_up_under_30_with_lower_crap_passes(self) -> None:
+        old = _score("a.py::f", 5, 0.0, digest="old")
+        edited = _score("a.py::f", 6, 1.0, digest="new")
+        assert cr.compare({edited.key: edited}, _base(old)) == []
+
+    def test_comparison_uses_the_recorded_baseline_precision(self) -> None:
+        old = _score("a.py::f", 10, 1.0, digest="old")
+        edited = cr.FunctionScore(old.key, 10, 0.999, 10.0000001, "new")
+        assert cr.compare({edited.key: edited}, _base(old)) == []
+        assert cr.build_baseline({edited.key: edited}, _base(old))[old.key]["crap"] == 10.0
 
     def test_changed_function_brought_under_threshold_passes(self) -> None:
         old = _score("a.py::f", 20, 0.2, digest="old")
@@ -622,18 +646,23 @@ class TestBaseline:
         with pytest.raises(ValueError, match=r"a\.py::f"):
             cr.build_baseline({new.key: new}, {})
 
-    def test_update_refuses_a_changed_function_that_stays_over_threshold(self) -> None:
+    def test_update_accepts_an_edited_hotspot_with_no_worse_scores(self) -> None:
         old = _score("a.py::f", 40, 1.0, digest="old")
         edited = _score("a.py::f", 40, 1.0, digest="new")
-        assert [v.kind for v in cr.compare({edited.key: edited}, _base(old))] == [
-            "changed-over-threshold"
-        ]
+        out = cr.build_baseline({edited.key: edited}, _base(old))
+        assert out[old.key]["crap"] == old.crap
+        assert out[old.key]["digest"] == "new"
+
+    @pytest.mark.parametrize("tolerance", [0.0, 0.5, 10.0])
+    def test_update_refuses_even_a_small_score_increase(self, tolerance: float) -> None:
+        old = _score("a.py::f", 10, 1.0)
+        worse = cr.FunctionScore(old.key, 10, 1.0, old.crap + 0.1, old.digest)
         with pytest.raises(ValueError, match=r"a\.py::f"):
-            cr.build_baseline({edited.key: edited}, _base(old))
+            cr.build_baseline({old.key: worse}, _base(old), tolerance=tolerance)
 
     def test_allow_regress_records_rule_reason_and_date(self) -> None:
-        old = _score("a.py::f", 40, 1.0, digest="old")
-        edited = _score("a.py::f", 40, 1.0, digest="new")
+        old = _score("a.py::f", 40, 0.9, digest="old")
+        edited = _score("a.py::f", 41, 1.0, digest="new")
         out = cr.build_baseline(
             {edited.key: edited},
             _base(old),
@@ -648,8 +677,8 @@ class TestBaseline:
         }
 
     def test_allow_regress_needs_a_reason(self) -> None:
-        old = _score("a.py::f", 40, 1.0, digest="old")
-        edited = _score("a.py::f", 40, 1.0, digest="new")
+        old = _score("a.py::f", 40, 0.9, digest="old")
+        edited = _score("a.py::f", 41, 1.0, digest="new")
         for reason in (None, "", "   "):
             with pytest.raises(ValueError, match="reason"):
                 cr.build_baseline(

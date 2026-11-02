@@ -259,7 +259,9 @@ def test_the_ci_test_job_runs_every_shard_and_only_once_the_per_leg_checks() -> 
         assert steps[once]["if"] == "matrix.shard == 1", once
     assert steps["Build and smoke-test distributions"]["if"] == "matrix.shard == 1"
     combine = {s.get("name", ""): s for s in _workflow()["python-coverage"]["steps"]}
-    assert f"-eq {count}" in combine["Combine coverage and apply the floor"]["run"]
+    run = combine["Combine coverage and apply the floor"]["run"]
+    assert f"for shard in {' '.join(map(str, shards))};" in run
+    assert 'test -s "cov-$shard.data"' in run
 
 
 def test_the_coverage_job_covers_the_same_legs_as_the_test_job() -> None:

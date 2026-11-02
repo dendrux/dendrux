@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 import tomllib
 from pathlib import Path
 
@@ -64,7 +67,87 @@ def test_the_coverage_job_combines_the_shards_and_writes_coverage_json() -> None
     assert "coverage combine" in run
     assert "--fail-under=80" in run
     assert "coverage json -o coverage.json" in run
-    assert _jobs()["python-coverage"]["needs"] == "python"
+    assert set(_jobs()["python-coverage"]["needs"]) == {"python", "mysql-family"}
+
+
+def test_the_coverage_job_requires_both_mysql_family_artifacts() -> None:
+    steps = _jobs()["python-coverage"]["steps"]
+    downloads = {
+        step["with"].get("name"): step
+        for step in steps
+        if str(step.get("uses", "")).startswith("actions/download-artifact@")
+    }
+    for name in ("coverage-mysql", "coverage-mariadb"):
+        step = downloads[name]
+        assert "if" not in step
+        assert not step.get("continue-on-error", False)
+        assert step["with"]["path"] == "packages/python"
+    assert "--ci" in _steps("python-coverage")["CRAP ratchet"]["run"]
+
+
+def test_ci_preserves_machine_readable_debt_even_when_crap_fails() -> None:
+    steps = _steps("python-coverage")
+    assert steps["CRAP ratchet"]["id"] == "crap"
+    upload = steps["Upload CRAP debt summary"]
+    assert "always()" in upload["if"] and "steps.crap.outcome" in upload["if"]
+    assert upload["with"]["path"] == "packages/python/coverage.json.crap.json"
+    assert upload["with"]["if-no-files-found"] == "error"
+
+
+def test_mysql_family_suites_measure_and_upload_coverage() -> None:
+    job = _jobs()["mysql-family"]
+    assert {cell["server"] for cell in job["strategy"]["matrix"]["include"]} == {
+        "mysql",
+        "mariadb",
+    }
+    steps = _steps("mysql-family")
+    run = steps["Test on ${{ matrix.server }}"]["run"]
+    assert "--cov=src/dendrux" in run and "--no-cov" not in run
+    assert steps["Test on ${{ matrix.server }}"]["env"]["COVERAGE_FILE"] == (
+        "cov-${{ matrix.server }}.data"
+    )
+    upload = steps["Upload coverage data"]
+    assert str(upload["uses"]).startswith("actions/upload-artifact@")
+    assert upload["with"]["name"] == "coverage-${{ matrix.server }}"
+    assert upload["with"]["path"] == "packages/python/cov-${{ matrix.server }}.data"
+    assert upload["with"]["if-no-files-found"] == "error"
+    assert not upload.get("continue-on-error", False)
+
+
+@pytest.mark.parametrize(
+    "missing",
+    [(), ("mysql",), ("mariadb",), ("mysql", "mariadb"), ("1",)],
+)
+def test_coverage_combine_requires_every_backend_file(
+    tmp_path: Path, missing: tuple[str, ...]
+) -> None:
+    for name in ("1", "2", "3", "4", "mysql", "mariadb"):
+        if name not in missing:
+            (tmp_path / f"cov-{name}.data").write_text("coverage fixture")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    stub = bin_dir / "coverage"
+    stub.write_text(
+        f"#!{sys.executable}\nfrom pathlib import Path\nPath('coverage-called').touch()\n"
+    )
+    stub.chmod(0o755)
+    run = subprocess.run(
+        [
+            "bash",
+            "-e",
+            "-o",
+            "pipefail",
+            "-c",
+            _steps("python-coverage")["Combine coverage and apply the floor"]["run"],
+        ],
+        cwd=tmp_path,
+        env={**os.environ, "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"]},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert (run.returncode == 0) == (not missing), run.stderr
+    assert (tmp_path / "coverage-called").exists() == (not missing)
 
 
 def test_the_python_job_checks_architecture_and_the_coverage_job_runs_crap() -> None:
