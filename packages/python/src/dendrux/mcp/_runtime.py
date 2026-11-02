@@ -1396,7 +1396,8 @@ class MCPRuntime:
                 remaining = deadline - loop.time()
                 if remaining <= 0:
                     return False
-                await asyncio.wait_for(waiter.wait(), timeout=remaining)
+                async with asyncio.timeout(remaining):
+                    await waiter.wait()
             except TimeoutError:
                 return False
             finally:
@@ -2070,10 +2071,9 @@ class MCPRuntime:
                     # bounded, so wait it out and reconnect rather than fail.
                     await asyncio.shield(retire_task)
                     continue
-                try:
-                    await asyncio.wait_for(waiter.wait(), timeout=remaining)
-                except TimeoutError:
-                    continue  # re-check under the lock, then raise the capacity error
+                with contextlib.suppress(TimeoutError):
+                    async with asyncio.timeout(remaining):
+                        await waiter.wait()
         except MCPConnectionCapacityError:
             # The raise released the lock; the callback must stay outside it.
             self._emit(
@@ -2576,10 +2576,9 @@ class MCPRuntime:
                         self._call_queue.append(waiter)
                     waiter.event.clear()
                     event = waiter.event
-                try:
-                    await asyncio.wait_for(event.wait(), timeout=remaining)
-                except TimeoutError:
-                    continue  # re-check under the lock, then shed
+                with contextlib.suppress(TimeoutError):
+                    async with asyncio.timeout(remaining):
+                        await event.wait()
         finally:
             if waiter is not None:
                 with self._lock:

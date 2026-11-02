@@ -893,7 +893,8 @@ class Follow:
                 if follower.buffer or follower.end_reason is not None:
                     continue
                 with contextlib.suppress(TimeoutError):
-                    await asyncio.wait_for(follower.wake.wait(), timeout=max(timeout, 0.0))
+                    async with asyncio.timeout(max(timeout, 0.0)):
+                        await follower.wake.wait()
         except TimeoutError:
             yield FollowEnd("max_duration", cursor)
         finally:
