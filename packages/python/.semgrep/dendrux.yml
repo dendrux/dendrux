@@ -39,12 +39,12 @@ rules:
 
   - id: hardcoded-terminal-status-set
     message: >-
-      Two or more run statuses written out in a literal. Use the shared sets next to RunStatus
-      in dendrux.types so a new status cannot be missed in one copy.
+      Two or more run statuses written out in a literal. Use the shared sets in
+      dendrux._lifecycle so a new status cannot be missed in one copy.
     severity: ERROR
     languages: [python]
     metadata:
-      exclude: ["types.py"]
+      exclude: ["types.py", "_lifecycle.py"]
     patterns:
       - pattern-either:
           - pattern: "[..., $A, ..., $B, ...]"
