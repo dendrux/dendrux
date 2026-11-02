@@ -1821,16 +1821,23 @@ def _resolve_max_delegation_depth(
     return effective
 
 
-def _run_metadata(
+def _new_run_metadata(
     agent: Agent,
     loop: Loop,
     session: SkillSession,
     metadata: dict[str, Any] | None,
     depth: int | None,
     *,
+    user_input: str,
+    idempotency_key: str | None = None,
     output_type: type | None = None,
+    history: Any = None,
+    context: Any = None,
+    replay: ReplayRequest | None = None,
+    parts: tuple[ContentPart, ...] | None = None,
     retry_of: str | None = None,
-) -> dict[str, Any]:
+    streaming: bool = False,
+) -> tuple[dict[str, Any], str | None]:
     result = dict(metadata) if metadata else {}
     result[LOOP_META_KEY] = type(loop).__name__
     result[GOVERNANCE_KEY] = governance_snapshot(agent)
@@ -1838,38 +1845,26 @@ def _run_metadata(
         result[META_KEY] = session.manifest()
     if depth is not None:
         result[MAX_DELEGATION_DEPTH_META_KEY] = depth
+    output_name = None
     if output_type is not None:
-        result[OUTPUT_TYPE_META_KEY] = f"{output_type.__module__}.{output_type.__qualname__}"
+        output_name = f"{output_type.__module__}.{output_type.__qualname__}"
+        result[OUTPUT_TYPE_META_KEY] = output_name
     if retry_of is not None:
         result[RETRY_OF_META_KEY] = retry_of
-    return result
-
-
-def _entry_fingerprint(
-    key: str | None,
-    name: str,
-    user_input: str,
-    output_type: type | None,
-    history: Any,
-    context: Any,
-    replay: ReplayRequest | None,
-    session: SkillSession,
-    parts: tuple[ContentPart, ...] | None,
-) -> str | None:
-    if key is None:
-        return None
-    return compute_idempotency_fingerprint(
-        name,
-        user_input,
-        output_type_name=f"{output_type.__module__}.{output_type.__qualname__}"
-        if output_type
-        else None,
-        history=history or None,
-        context=context or None,
-        replay=replay.fingerprint() if replay else None,
-        skills=session.fingerprint(),
-        user_input_parts=parts,
-    )
+    fingerprint = None
+    if idempotency_key is not None:
+        fingerprint = compute_idempotency_fingerprint(
+            agent.name,
+            user_input,
+            # Preserve run's truthiness check and stream's presence check.
+            output_type_name=output_name if streaming or output_type else None,
+            history=history or None,
+            context=context or None,
+            replay=replay.fingerprint() if replay else None,
+            skills=session.fingerprint(),
+            user_input_parts=parts,
+        )
+    return result, fingerprint
 
 
 async def _entry_replay(
@@ -2188,24 +2183,19 @@ async def run(
                 if state_store is not None:
                     # Create the run record before the loop starts
                     # Merge loop type + depth limit into developer metadata
-                    run_meta = _run_metadata(
+                    run_meta, idem_fingerprint = _new_run_metadata(
                         agent,
                         resolved_loop,
                         skill_session,
                         metadata,
                         effective_max_depth,
+                        user_input=user_input,
+                        idempotency_key=idempotency_key,
                         output_type=output_type,
-                    )
-                    idem_fingerprint = _entry_fingerprint(
-                        idempotency_key,
-                        agent.name,
-                        user_input,
-                        output_type,
-                        normalized_history,
-                        context,
-                        replay_req,
-                        skill_session,
-                        user_parts,
+                        history=normalized_history,
+                        context=context,
+                        replay=replay_req,
+                        parts=user_parts,
                     )
 
                     seed_kwargs, run_guardrails = await _runtime_seeds(
@@ -3105,13 +3095,14 @@ async def retry(
 
         _system_prompt = agent.get_system_prompt(loop=resolved_loop)
 
-        run_meta = _run_metadata(
+        run_meta, _ = _new_run_metadata(
             agent,
             resolved_loop,
             skill_session,
             metadata,
             effective_max_depth,
             retry_of=original_run_id,
+            user_input=user_input,
         )
 
         image_runtime = _retry_media(
@@ -3603,33 +3594,21 @@ def run_stream(
                 _shared["existing_run"] = False
 
             if store is not None:
-                run_meta = dict(metadata) if metadata else {}
-                run_meta[LOOP_META_KEY] = type(resolved_loop).__name__
-                run_meta[GOVERNANCE_KEY] = governance_snapshot(agent)
-                if skill_session.configured:
-                    run_meta[META_KEY] = skill_session.manifest()
-                if eff_max_depth is not None:
-                    run_meta[MAX_DELEGATION_DEPTH_META_KEY] = eff_max_depth
-                if output_type is not None:
-                    run_meta[OUTPUT_TYPE_META_KEY] = (
-                        f"{output_type.__module__}.{output_type.__qualname__}"
-                    )
-                fingerprint = None
-                if idempotency_key is not None:
-                    fingerprint = compute_idempotency_fingerprint(
-                        agent.name,
-                        user_input,
-                        output_type_name=(
-                            f"{output_type.__module__}.{output_type.__qualname__}"
-                            if output_type is not None
-                            else None
-                        ),
-                        history=history_messages or None,
-                        context=context or None,
-                        replay=replay_req.fingerprint() if replay_req else None,
-                        skills=skill_session.fingerprint(),
-                        user_input_parts=user_parts,
-                    )
+                run_meta, fingerprint = _new_run_metadata(
+                    agent,
+                    resolved_loop,
+                    skill_session,
+                    metadata,
+                    eff_max_depth,
+                    user_input=user_input,
+                    idempotency_key=idempotency_key,
+                    output_type=output_type,
+                    history=history_messages,
+                    context=context,
+                    replay=replay_req,
+                    parts=user_parts,
+                    streaming=True,
+                )
                 try:
                     seed_kwargs, run_guardrails = await _runtime_seeds(
                         store,
