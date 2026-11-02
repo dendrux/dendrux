@@ -1082,6 +1082,7 @@ class GovernanceEventType(StrEnum):
 
 
 _MIB = 1024 * 1024
+_DEFAULT_MAX_TOOL_RESULT_BYTES = _MIB
 
 
 @dataclass(frozen=True)
@@ -1107,7 +1108,7 @@ class Limits:
         ValueError: If a cap is not a positive integer.
     """
 
-    max_tool_result_bytes: int = _MIB
+    max_tool_result_bytes: int = _DEFAULT_MAX_TOOL_RESULT_BYTES
     max_input_bytes: int = _MIB
     max_metadata_bytes: int = 64 * 1024
     max_notes_per_run: int = 1000
