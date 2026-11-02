@@ -150,3 +150,23 @@ async def test_only_unsubmitted_awaiting_input_recreates_a_human_pause(loop_phas
     else:
         assert result is None
         read.assert_not_awaited()
+
+
+def test_inventory_includes_consume_resume_call_phase_assignments(monkeypatch):
+    from pathlib import Path
+
+    from dendrux.runtime import persistence
+
+    path = Path(persistence.__file__).resolve()
+    original = Path.read_text
+
+    def source(candidate, *args, **kwargs):
+        text = original(candidate, *args, **kwargs)
+        if candidate == path:
+            old = '"approved"\n                    if decisions.get'
+            assert text.count(old) == 1
+            return text.replace(old, '"new_approval_phase"\n                    if decisions.get')
+        return text
+
+    monkeypatch.setattr(Path, "read_text", source)
+    assert "new_approval_phase" in source_phase_inventory()

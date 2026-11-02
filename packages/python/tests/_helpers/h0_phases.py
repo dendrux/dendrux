@@ -83,19 +83,47 @@ def _phase_expressions(node):
 
 
 def source_phase_inventory():
-    """Scan every runtime source file, including recovery writers and SQL consumers.
+    """Scan phase literals, including recovery writers and SQL consumers.
 
+    Named constants are not resolved: list their values explicitly in this
+    inventory if producers start using them. This is a literal guard, not
+    general data-flow analysis. Local maps passed to set_call_phase are traced.
     H1c should replace this literal scan with imports from runtime._loop_state;
     H1d's literal guard then owns detection of new phase literals.
     """
     found = {}
     root = Path(persistence.__file__).resolve().parent
     for path in sorted(root.rglob("*.py")):
-        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
-            for expression in _phase_expressions(node):
-                for value in _strings(expression):
-                    if value not in PHASE_POSITION_NOISE:
-                        found.setdefault(value, set()).add(
-                            f"{path.relative_to(root)}:{node.lineno}"
-                        )
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        expressions = [(n, e) for n in ast.walk(tree) for e in _phase_expressions(n)]
+        for scope in ast.walk(tree):
+            if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                expressions.extend(_call_phase_expressions(scope))
+        for node, expression in expressions:
+            for value in _strings(expression):
+                if value not in PHASE_POSITION_NOISE:
+                    found.setdefault(value, set()).add(f"{path.relative_to(root)}:{node.lineno}")
     return found
+
+
+def _call_phase_expressions(scope):
+    maps = set()
+    for node in ast.walk(scope):
+        if isinstance(node, ast.keyword) and node.arg == "set_call_phase":
+            if isinstance(node.value, ast.Name):
+                maps.add(node.value.id)
+            elif isinstance(node.value, ast.Dict):
+                yield from ((node, value) for value in node.value.values)
+    for node in ast.walk(scope):
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name):
+                if target.value.id in maps:
+                    yield node, node.value
+            elif (
+                isinstance(target, ast.Name)
+                and target.id in maps
+                and isinstance(node.value, ast.Dict)
+            ):
+                yield from ((node, value) for value in node.value.values)
