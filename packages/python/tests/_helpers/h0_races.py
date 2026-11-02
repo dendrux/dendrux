@@ -53,12 +53,13 @@ async def running(coro, *gates):
         await asyncio.gather(task, return_exceptions=True)
 
 
-@pytest_asyncio.fixture
-async def peer(engine):
-    """Separate pools; assert that every SQL statement uses distinct backend PIDs."""
+@asynccontextmanager
+async def independent_callers(engine, count):
+    """Separate pools with disjoint backend PIDs, including the seeding engine."""
     assert engine.dialect.name == "postgresql"
-    other = create_async_engine(engine.url, pool_size=2, max_overflow=0)
-    pids = [set(), set()]
+    others = [create_async_engine(engine.url, pool_size=1, max_overflow=0) for _ in range(count)]
+    sources = [engine, *others]
+    pids = [set() for _ in sources]
 
     def recorder(index):
         def record(conn, cursor, statement, parameters, context, executemany):
@@ -66,17 +67,27 @@ async def peer(engine):
 
         return record
 
-    listeners = [recorder(0), recorder(1)]
-    for source, listener in zip((engine, other), listeners, strict=True):
+    listeners = [recorder(i) for i in range(len(sources))]
+    for source, listener in zip(sources, listeners, strict=True):
         event.listen(source.sync_engine, "before_cursor_execute", listener)
     try:
-        yield store_for_engine(other), other
-        assert all(pids), "both callers must execute real SQL"
-        assert pids[0].isdisjoint(pids[1]), "callers must use independent connections"
+        yield [(store_for_engine(other), other) for other in others]
+        assert all(pids), "every caller must execute real SQL"
+        assert sum(map(len, pids)) == len(set().union(*pids)), (
+            "callers must use independent connections"
+        )
     finally:
-        for source, listener in zip((engine, other), listeners, strict=True):
+        for source, listener in zip(sources, listeners, strict=True):
             event.remove(source.sync_engine, "before_cursor_execute", listener)
-        await other.dispose()
+        for other in others:
+            await other.dispose()
+
+
+@pytest_asyncio.fixture
+async def peer(engine):
+    """A second caller on an independent Postgres pool."""
+    async with independent_callers(engine, 1) as callers:
+        yield callers[0]
 
 
 async def snapshot(engine):
@@ -91,17 +102,20 @@ async def connection_snapshot(conn):
     }
 
 
-async def wait_for_lock(conn, task):
+async def wait_for_lock(conn, task, *, count=1):
     """Prove the other caller is waiting on our row lock, not merely scheduled."""
     while True:
         blocked = await conn.scalar(
             text(
-                "SELECT count(*) FROM pg_stat_activity "
-                "WHERE datname = current_database() "
-                "AND pg_backend_pid() = ANY(pg_blocking_pids(pid))"
+                "WITH RECURSIVE waiting(pid) AS ("
+                "SELECT pg_backend_pid() UNION "
+                "SELECT a.pid FROM pg_stat_activity a JOIN waiting w "
+                "ON w.pid = ANY(pg_blocking_pids(a.pid)) "
+                "WHERE a.datname = current_database()) "
+                "SELECT count(*) - 1 FROM waiting"
             )
         )
-        if blocked:
+        if blocked >= count:
             return
         if task.done():
             raise AssertionError(
