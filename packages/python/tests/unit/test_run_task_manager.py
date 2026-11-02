@@ -14,6 +14,35 @@ import pytest
 from dendrux.runtime.tasks import RunTaskManager
 
 
+async def test_take_interrupt_without_a_current_task_is_a_noop() -> None:
+    manager = RunTaskManager()
+    manager.register_current("owned")
+    loop = asyncio.get_running_loop()
+    result = loop.create_future()
+    loop.call_soon(lambda: result.set_result(manager.take_interrupt("owned")))
+    assert await asyncio.wait_for(result, 5) == (False, False)
+    assert manager._owned == {"owned": asyncio.current_task()}
+    assert not manager._pending
+    manager.release_current("owned")
+
+
+async def test_release_current_without_a_current_task_preserves_the_owner() -> None:
+    manager = RunTaskManager()
+    manager.register_current("owned")
+    loop = asyncio.get_running_loop()
+    result = loop.create_future()
+
+    def release() -> None:
+        manager.release_current("owned")
+        result.set_result(None)
+
+    loop.call_soon(release)
+    await asyncio.wait_for(result, 5)
+    assert manager._owned == {"owned": asyncio.current_task()}
+    manager.release_current("owned")
+    assert not manager._owned
+
+
 class TestSpawnAndTracking:
     async def test_spawn_returns_running_task(self) -> None:
         mgr = RunTaskManager()

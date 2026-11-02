@@ -162,26 +162,35 @@ def _is_time_call(node: ast.AST) -> bool:
 
 
 def _time_names(function: ast.AST) -> set[str]:
-    """Names assigned (directly or through other time names) from a clock reading."""
+    """Trace clock readings through assignments, sampled collections and iteration."""
+    bindings: list[tuple[ast.AST, ast.AST]] = []
+    for node in ast.walk(function):
+        if isinstance(node, ast.Assign | ast.AugAssign | ast.AnnAssign) and node.value:
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            bindings.extend((target, node.value) for target in targets)
+        elif isinstance(node, ast.For | ast.AsyncFor | ast.comprehension):
+            bindings.append((node.target, node.iter))
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in {"append", "extend", "add"}
+            and isinstance(node.func.value, ast.Name)
+        ):
+            bindings.extend((node.func.value, argument) for argument in node.args)
     names: set[str] = set()
     changed = True
     while changed:
         changed = False
-        for node in ast.walk(function):
-            if not isinstance(node, ast.Assign | ast.AugAssign | ast.AnnAssign) or not node.value:
-                continue
-            reads = list(ast.walk(node.value))
+        for target, value in bindings:
             if not any(
-                _is_time_call(x) or (isinstance(x, ast.Name) and x.id in names) for x in reads
+                _clock_reading(x) or (isinstance(x, ast.Name) and x.id in names)
+                for x in ast.walk(value)
             ):
                 continue
-            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-            for target in targets:
-                for x in ast.walk(target):
-                    if isinstance(x, ast.Name) and x.id not in names:
-                        names.add(x.id)
-                        changed = True
-        # loop.time() style clocks: <anything>.time() on a loop
+            for name in ast.walk(target):
+                if isinstance(name, ast.Name) and name.id not in names:
+                    names.add(name.id)
+                    changed = True
     return names
 
 
