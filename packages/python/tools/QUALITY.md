@@ -17,6 +17,28 @@ python -m venv ~/.cache/dendrux-semgrep-venv
 make quality SEMGREP=~/.cache/dendrux-semgrep-venv/bin/semgrep
 ```
 
+## Toolchain parity
+
+Every direct development tool and test-support dependency in the `dev` extra has an exact
+version in `pyproject.toml`, including mypy, ruff, pytest and its plugins, coverage, griffe and
+the quality checkers. CI installs that same extra. Keep ruff's pre-commit revision and the
+API job's standalone griffe pin in step with it. Semgrep remains pinned separately in
+`tools/semgrep-requirements.txt` because of its dependency conflicts.
+
+From `packages/python`, run `make dev-sync` in your development venv to install the pinned
+tools and upgrade runtime dependencies to the newest allowed versions, as a fresh CI
+environment does. Then run `make test-model-install` if the pinned NLP model is absent.
+`DEV_EXTRAS=dev,all,mysql` also installs the optional MySQL driver; the default is `dev,all`,
+the same extras as the Python shard jobs. For a SQLAlchemy matrix run, apply the leg's
+`pip install "sqlalchemy[asyncio]==2.0.*"` or `2.1.*` after syncing.
+
+Published runtime requirements (including SQLAlchemy, provider SDKs and database drivers)
+remain ranges. CI continues to resolve their newest allowed versions and tests both
+SQLAlchemy minors. The direct tool pins are not a transitive dependency lockfile. A tool
+upgrade is a deliberate change with checks on the supported Python/SQLAlchemy matrix;
+baseline decreases are stamped only by the coordinator. Never restamp a baseline to hide
+a regression.
+
 | Target | Script | Fails when |
 |---|---|---|
 | `make cognitive` | `tools/cognitive_ratchet.py` | A new function scores above 15 (complexipy cognitive complexity), or a function already above 15 scores higher. Baseline: `cognitive_baseline.json` (only functions above 15 are recorded; overloads and setters of one name count at their worst). |

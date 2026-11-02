@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+from packaging.requirements import Requirement
 
 PKG = Path(__file__).resolve().parents[2]
 REPO = PKG.parents[1]
@@ -23,14 +24,33 @@ def _steps(job: str) -> dict[str, dict]:
     return {s.get("name", ""): s for s in _jobs()[job]["steps"]}
 
 
-def test_dev_dependencies_include_the_gate_tools_with_upper_bounds() -> None:
+def test_dev_dependencies_pin_the_tools_exactly() -> None:
     dev = tomllib.loads((PKG / "pyproject.toml").read_text())["project"]["optional-dependencies"][
         "dev"
     ]
-    for tool in ("radon", "griffe", "import-linter", "pytest-randomly", "pytest-xdist"):
-        spec = next((d for d in dev if d.startswith(tool)), None)
-        assert spec is not None, f"{tool} missing from the dev extra"
-        assert "<" in spec, f"{tool} needs an upper bound: {spec}"
+    requirements = {req.name: req for req in map(Requirement, dev)}
+    tools = {
+        "mypy",
+        "ruff",
+        "pytest",
+        "pytest-asyncio",
+        "pytest-cov",
+        "coverage",
+        "radon",
+        "griffe",
+        "import-linter",
+        "pytest-randomly",
+        "pytest-xdist",
+    }
+    assert tools <= requirements.keys(), f"tools missing from dev: {tools - requirements.keys()}"
+    for name, requirement in requirements.items():
+        if name == "dendrux":
+            continue
+        pins = list(requirement.specifier)
+        assert len(pins) == 1 and pins[0].operator == "==" and "*" not in pins[0].version, (
+            f"{name} needs an exact dev pin: {requirement}"
+        )
+    assert str(requirements["griffe"]) in _steps("api-compat")["Install griffe"]["run"]
 
 
 def test_the_python_job_runs_tests_in_parallel_and_measures_coverage() -> None:
@@ -76,6 +96,7 @@ def test_a_job_compares_the_public_api_with_the_last_release() -> None:
     assert checkout["with"]["fetch-depth"] == 0, "the release tag must be in the clone"
     runs = [s["run"] for s in job["steps"] if "tools/api_breaks.py" in s.get("run", "")]
     assert runs
+    assert all("--against v0.5.0" in run for run in runs)
     assert not any("--allow-gaps" in run for run in runs), "CI must not tolerate unmapped breaks"
 
 
