@@ -2,6 +2,11 @@
 
 ## 0.6.0
 
+- Default local database resolution now uses `./dendrux.db` for runtime helpers,
+  every CLI command and migrations when `DENDRUX_DATABASE_URL` is unset.
+  If only `~/.dendrux/dendrux.db` exists, log `local_database_default_changed`;
+  set `DENDRUX_DATABASE_URL` explicitly to keep using that file.
+
 - Add developer-called recovery for format-2 ReAct runs. `sweep(on_stale="reclaim")`
   marks bounded candidates; `agent.reclaim(..., tenant_id=..., item=...)` continues
   from committed state. Reclaim always requires explicit tenant scope. Interrupted

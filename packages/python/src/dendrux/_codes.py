@@ -22,6 +22,7 @@ class Code:
     fields: frozenset[str]
     fires_when: str
     do: str
+    message: str = ""
 
 
 _BASE_FIELDS = frozenset({"code", "kind", "run_id", "tenant_id"})
@@ -435,6 +436,18 @@ USAGE_INVALID = Code(
     _BASE_FIELDS | frozenset([]),
     "Provider usage cannot be trusted.",
     "Treat accounting as unknown and inspect the adapter.",
+)
+LOCAL_DATABASE_DEFAULT_CHANGED = Code(
+    "local_database_default_changed",
+    logging.WARNING,
+    "runtime",
+    _BASE_FIELDS,
+    "./dendrux.db is absent; ~/.dendrux/dendrux.db exists and is no longer the default.",
+    "Set DENDRUX_DATABASE_URL to use ~/.dendrux/dendrux.db, or start with ./dendrux.db.",
+    message=(
+        "./dendrux.db is absent; the old ~/.dendrux/dendrux.db exists. "
+        "Set DENDRUX_DATABASE_URL to keep using the old file."
+    ),
 )
 DATABASE_URL_ENV_IGNORED = Code(
     "database_url_env_ignored",
@@ -1786,6 +1799,7 @@ REGISTRY = MappingProxyType(
             FOLLOW_TENANT_CAPACITY,
             FOLLOW_SHUTDOWN_PENDING,
             USAGE_INVALID,
+            LOCAL_DATABASE_DEFAULT_CHANGED,
             DATABASE_URL_ENV_IGNORED,
             TENANT_SCOPE_REQUIRED,
             RESERVED_METADATA_KEY,
@@ -1890,6 +1904,12 @@ def _valid_field(name: str, value: Any) -> bool:
     return isinstance(value, str) and value in _ENUMS.get(name, ())
 
 
+def _message(code: Code) -> str:
+    if code.message:
+        return f"{code.name}: {code.message}"
+    return code.name
+
+
 def log_code(
     logger: logging.Logger,
     code: Code,
@@ -1930,4 +1950,4 @@ def log_code(
         }
         diagnostic.update({name: safe[name] for name in ("run_id", "tenant_id") if name in safe})
         logger.log(LOG_FIELD_DROPPED.level, LOG_FIELD_DROPPED.name, extra=diagnostic)
-    logger.log(code.level, code.name, extra={"code": code.name, "kind": code.kind, **safe})
+    logger.log(code.level, _message(code), extra={"code": code.name, "kind": code.kind, **safe})

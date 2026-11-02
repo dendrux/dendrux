@@ -102,14 +102,13 @@ and the [end-to-end example](https://github.com/dendrux/dendrux/blob/main/packag
 [//]: # "docs-test: skip - fragment: relies on `provider`, defined by setup shown elsewhere"
 
 ```python
-from pathlib import Path
 from dendrux.notifiers.console import ConsoleNotifier
 
 async with Agent(
     provider=provider,                  # Required: LLM provider
     prompt="...",                        # Required: system prompt
     tools=[add],                         # Optional: tool functions
-    database_url=f"sqlite+aiosqlite:///{Path.home() / '.dendrux' / 'dendrux.db'}",
+    database_url="sqlite+aiosqlite:///./dendrux.db",
 ) as agent:
     result = await agent.run(
         "What is 15 + 27?",

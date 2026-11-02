@@ -182,6 +182,7 @@ Missing or invalid codes remain unset. Category and HTTP status remain independe
 | `input_size_limit` | WARNING | `bytes`, `code`, `entry`, `field`, `kind`, `limit`, `run_id`, `tenant_id` | An input exceeds its configured bound. | Reduce the input or raise the bound deliberately. |
 | `invalid_limit` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | A recovery limit is invalid. | Use a positive limit within the documented bound. |
 | `legacy_claim_validation` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | A legacy store needs claim-time validation. | Implement the current store capabilities when upgrading. |
+| `local_database_default_changed` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | ./dendrux.db is absent; ~/.dendrux/dendrux.db exists and is no longer the default. | Set DENDRUX_DATABASE_URL to use ~/.dendrux/dendrux.db, or start with ./dendrux.db. |
 | `pause_data_not_jsonb` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | A stored pause is not a JSON object. | Inspect the stored pause format and writer versions. |
 | `pause_id_mismatch` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | A submission targets another pause generation. | Reload the pending pause and resubmit. |
 | `pending_limit` | WARNING | `code`, `count`, `kind`, `limit`, `run_id`, `tenant_id` | A model produces too many pending calls. | Reduce tool fanout or raise the pending call bound. |

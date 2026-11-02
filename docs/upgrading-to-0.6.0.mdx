@@ -56,6 +56,24 @@ Format-2 runs store conversation history in traces and execution state in a boun
 
 The store used for the call decides whether strict tenancy applies, even if the Agent itself has no store. A delegated child can inherit scope when its outer caller deliberately chose a tenant, including explicit `tenant_id=None`, or the parent already resolved scope under strict rules. A stored child under a parent whose tenant was merely omitted raises `TenantScopeRequiredError`; pass `tenant_id` on the outer run.
 
+## Default local database location
+
+When `DENDRUX_DATABASE_URL` is unset, runtime database helpers, every CLI command
+and migrations use `./dendrux.db` in the current working directory. The runtime
+helper previously used `~/.dendrux/dendrux.db`. This does not enable implicit
+persistence on `Agent`; continue passing `state_store=` or `database_url=`.
+
+If the local file is absent and the old file exists, database resolution logs
+`local_database_default_changed`. No data is moved automatically. To retain the
+old database, set an explicit absolute URL before running commands or migrations:
+
+```bash
+export DENDRUX_DATABASE_URL="sqlite+aiosqlite:///$HOME/.dendrux/dendrux.db"
+```
+
+Use the same working directory or explicit URL for your application and CLI.
+Back up the existing file before upgrading.
+
 ## Other compatibility changes
 
 | Setting or call | Earlier behavior | 0.6 behavior | Application action |
