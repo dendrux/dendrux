@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import traceback
 from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -80,8 +81,30 @@ async def activate_database(
     """
     if isinstance(batch_size, bool) or not 1 <= batch_size <= 5000:
         raise ValueError("batch_size must be between 1 and 5000")
-    async with engine.connect() as conn:
-        await conn.run_sync(lambda c: _activate(c, batch_size, dedupe_only))
+    try:
+        async with engine.connect() as conn:
+            await conn.run_sync(lambda c: _activate(c, batch_size, dedupe_only))
+    except BaseException as error:
+        # The connection is closed here; a held exception must not keep its cursors alive.
+        _release_failure_frames(error)
+        raise
+
+
+def _release_failure_frames(error: BaseException) -> None:
+    """Drop the locals of every finished frame the error chain references.
+
+    A failed statement's driver cursor (and its SQLite lock) otherwise lives as long as the
+    caller keeps the exception, so a retry would still find the file locked.
+    """
+    seen: set[int] = set()
+    pending: list[BaseException | None] = [error]
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        traceback.clear_frames(current.__traceback__)
+        pending.extend((current.__cause__, current.__context__))
 
 
 @contextmanager
