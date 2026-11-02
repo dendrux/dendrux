@@ -2,7 +2,7 @@
 
 ## 0.6.0
 
-- Recover lost Python 3.11 cancellation at persisted model/tool dispatch boundaries on the recorder's task; Python 3.12+ is unchanged.
+- Recover Python 3.11 cancellation lost during recorder store awaits at model/tool dispatch boundaries on the recorder's task, without treating handled provider/tool cancellation as a lost cancel; Python 3.12+ is unchanged.
 - Add developer-called recovery for format-2 ReAct runs. `sweep(on_stale="reclaim")`
   marks bounded candidates; `agent.reclaim(..., tenant_id=..., item=...)` continues
   from committed state. Reclaim always requires explicit tenant scope. Interrupted

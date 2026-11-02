@@ -9,7 +9,7 @@ description: How a running or paused dendrux run is cleanly cancelled from any p
 
 A run on another server is never preempted: it finishes its current model call or tool and cancels at the next checkpoint. Only a run executing in the same process, on the same `Agent` instance, is interrupted mid-step.
 
-On Python 3.11, persisted runs recover lost cancellation before the next model call or tool dispatch on the recorder's task, but this guard cannot recover cancellation lost before the recorder is created (including the run's first save), after its last dispatch checkpoint (including its final write), or on another task; Python 3.12+ is unchanged.
+On Python 3.11, persisted runs detect cancellation lost during their recorder's store awaits and recover it before the next model call or tool dispatch on the recorder's task; handled cancellation inside provider or tool code does not trigger this guard. Cancellation lost before recorder creation (including the run's first save), after its last dispatch checkpoint (including its final write), or outside the recorder's store awaits is not recovered, and parallel tool batches dispatching on worker tasks are not guarded; Python 3.12+ is unchanged.
 
 ## Two scenarios, one API
 

@@ -292,6 +292,9 @@ class PersistenceRecorder(BaseRecorder):
     ) -> None:
         self._store = state_store
         self._cancel_guard = capture()
+        self._store_calls = (
+            self._cancel_guard.store_calls(state_store) if self._cancel_guard else state_store
+        )
         self._tenant_scope = tenant_scope
         self._provider = provider
         self._run_id = run_id
@@ -333,7 +336,7 @@ class PersistenceRecorder(BaseRecorder):
         from dendrux.runtime.replay import conversation_records
 
         if records is None:
-            records = await conversation_records(self._store, self._run_id, limits=limits)
+            records = await conversation_records(self._store_calls, self._run_id, limits=limits)
         self._known_history.clear()
         self._system_messages.clear()
         for trace in records:
@@ -424,7 +427,7 @@ class PersistenceRecorder(BaseRecorder):
         if kind not in self._state_payloads and refs.get(field):
             from dendrux.errors import PersistenceError
 
-            saved = await self._store.get_trace(self._run_id, refs[field])
+            saved = await self._store_calls.get_trace(self._run_id, refs[field])
             try:
                 if saved is None or saved.trace_kind != "state" or saved.role != "state":
                     raise ValueError("Missing state evidence")
@@ -456,7 +459,7 @@ class PersistenceRecorder(BaseRecorder):
         self._state_payloads[kind] = content
 
         async def write_state() -> None:
-            await self._store.save_trace(
+            await self._store_calls.save_trace(
                 self._run_id,
                 "state",
                 content,
@@ -522,7 +525,7 @@ class PersistenceRecorder(BaseRecorder):
         snapshot = deepcopy(self._loop_state)
 
         async def write() -> None:
-            await self._store.checkpoint_step(
+            await self._store_calls.checkpoint_step(
                 self._run_id,
                 claim_epoch=getattr(self._store, "claim_epoch", 0),
                 loop_state=snapshot,
@@ -555,7 +558,7 @@ class PersistenceRecorder(BaseRecorder):
             return
         raw = self._resume_pause_data
         if raw is None:
-            raw = await self._store.get_pause_state(self._run_id) or {}
+            raw = await self._store_calls.get_pause_state(self._run_id) or {}
         from dendrux.runtime.submit import _submission_payload
 
         payload = _submission_payload(raw)
@@ -596,7 +599,7 @@ class PersistenceRecorder(BaseRecorder):
         )
 
         async def consume() -> None:
-            await self._store.consume_submission(
+            await self._store_calls.consume_submission(
                 self._run_id,
                 claim_epoch=getattr(self._store, "claim_epoch", 0),
                 submission_id=descriptor["submission_id"],
@@ -650,7 +653,7 @@ class PersistenceRecorder(BaseRecorder):
             # boundary compares compact digests without reading history again.
             previous = {
                 _view_identity({"role": t.role, "content": t.content, "meta": t.meta}): t.meta
-                for t in await conversation_records(self._store, self._run_id)
+                for t in await conversation_records(self._store_calls, self._run_id)
             }
             for entry, digest in zip(view, digests, strict=True):
                 entry["meta"] = {**(previous.get(digest) or {}), **entry["meta"]}
@@ -684,7 +687,7 @@ class PersistenceRecorder(BaseRecorder):
                 if self._loop_state != self._durable_state:
                     await self._checkpoint()
             # Ownership can still change between this read and the network send.
-            await self._store.get_run_control(run_id)
+            await self._store_calls.get_run_control(run_id)
         if self._cancel_guard is not None:
             await self._cancel_guard.check(run_id)
 
@@ -799,7 +802,7 @@ class PersistenceRecorder(BaseRecorder):
             from dendrux.runtime.state import validate_event_index, validate_event_writer
 
             validate_event_writer(self._store)
-            index = await self._store.save_run_event(
+            index = await self._store_calls.save_run_event(
                 self._run_id,
                 event_type=event_type,
                 iteration_index=iteration,
@@ -922,7 +925,7 @@ class PersistenceRecorder(BaseRecorder):
 
         # FAIL-CLOSED with retry
         async def _write() -> None:
-            await self._store.save_trace(
+            await self._store_calls.save_trace(
                 self._run_id,
                 message.role.value,
                 content,
@@ -1012,7 +1015,7 @@ class PersistenceRecorder(BaseRecorder):
         try:
 
             async def _write_interaction() -> None:
-                await self._store.save_llm_interaction(
+                await self._store_calls.save_llm_interaction(
                     self._run_id,
                     iteration_index=iteration,
                     usage=response.usage,
@@ -1055,7 +1058,7 @@ class PersistenceRecorder(BaseRecorder):
             usage_kwargs: dict[str, Any] = {"usage_id": usage_id} if idempotent_usage else {}
 
             async def _write_usage() -> None:
-                await self._store.save_usage(
+                await self._store_calls.save_usage(
                     self._run_id,
                     **usage_kwargs,
                     iteration_index=iteration,
@@ -1110,7 +1113,7 @@ class PersistenceRecorder(BaseRecorder):
 
         # BEST-EFFORT: touch progress for sweep
         try:
-            await self._store.touch_progress(self._run_id)
+            await self._store_calls.touch_progress(self._run_id)
         except RunFencedError:
             raise
         except Exception:
@@ -1143,7 +1146,7 @@ class PersistenceRecorder(BaseRecorder):
             try:
                 # Legacy progress writes remain cancellable; format-2 intent
                 # durability is handled by the fenced branch above.
-                await self._store.touch_progress(self._run_id)
+                await self._store_calls.touch_progress(self._run_id)
             except RunFencedError:
                 raise
             except Exception:
@@ -1200,7 +1203,7 @@ class PersistenceRecorder(BaseRecorder):
             event_id = generate_ulid()
 
             async def replay_event() -> None:
-                await self._store.save_run_event(
+                await self._store_calls.save_run_event(
                     run_id,
                     event_type=StoredEventType.TOOL_REPLAYED.value,
                     iteration_index=iteration,
@@ -1226,7 +1229,7 @@ class PersistenceRecorder(BaseRecorder):
         )
 
         async def write_intent() -> None:
-            await self._store.start_tool_call(
+            await self._store_calls.start_tool_call(
                 run_id,
                 claim_epoch=getattr(self._store, "claim_epoch", 0),
                 row_id=identity,
@@ -1367,7 +1370,7 @@ class PersistenceRecorder(BaseRecorder):
                 extra["pii_mapping"] = self._mapping()
 
             async def complete() -> None:
-                await self._store.complete_tool_call(
+                await self._store_calls.complete_tool_call(
                     run_id,
                     claim_epoch=getattr(self._store, "claim_epoch", 0),
                     tool_call_id=tool_call.id,
@@ -1417,7 +1420,7 @@ class PersistenceRecorder(BaseRecorder):
 
         # FAIL-CLOSED with retry: save_tool_call (proof of side effects)
         async def _write_tool() -> None:
-            await self._store.save_tool_call(
+            await self._store_calls.save_tool_call(
                 self._run_id,
                 tool_call_id=tool_call.id,
                 provider_tool_call_id=tool_call.provider_tool_call_id,
@@ -1459,7 +1462,7 @@ class PersistenceRecorder(BaseRecorder):
 
         # BEST-EFFORT: touch progress for sweep
         try:
-            await self._store.touch_progress(self._run_id)
+            await self._store_calls.touch_progress(self._run_id)
         except RunFencedError:
             raise
         except Exception:

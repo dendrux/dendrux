@@ -1,12 +1,19 @@
 """A lost database-wait cancel stops before the next external effect."""
 
 import asyncio
+from contextlib import suppress
 
 import pytest
 
 from dendrux import Agent, SingleCall, tool
 from dendrux.loops.react import ReActLoop
-from dendrux.types import LLMResponse, ProviderCapabilities, StreamEvent, StreamEventType
+from dendrux.types import (
+    LLMResponse,
+    ProviderCapabilities,
+    StreamEvent,
+    StreamEventType,
+    ToolResult,
+)
 from tests._fixtures.storage import pin_storage_format
 from tests._helpers.lost_cancel import LostCancel
 from tests._helpers.scripted_provider import ScriptedLLM, tool_call
@@ -213,6 +220,125 @@ async def test_gate_off_does_not_recover_lost_cancel(store, engine, monkeypatch,
             assert not any(
                 getattr(r, "code", None) == "run_cancel_recovered" for r in caplog.records
             )
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize("kind", ["taskgroup", "self_cancel"])
+async def test_handled_tool_cancellation_does_not_cancel_run(store, caplog, kind):
+    counts = []
+
+    @tool(parallel=False)
+    async def handled() -> str:
+        """Handle an internal failure and return a usable observation."""
+        if kind == "taskgroup":
+
+            async def fail():
+                await asyncio.sleep(0)
+                raise ValueError("child failed")
+
+            try:
+                async with asyncio.TaskGroup() as group:
+                    group.create_task(fail())
+            except ExceptionGroup:
+                pass
+        else:
+            asyncio.current_task().cancel()
+            with suppress(asyncio.CancelledError):
+                await asyncio.sleep(0)
+        counts.append(asyncio.current_task().cancelling())
+        return "one lookup failed"
+
+    provider = ScriptedLLM([tool_call("handled", pid="one"), LLMResponse(text="done")])
+    async with Agent(
+        prompt="test", provider=provider, tools=[handled], state_store=store, strict_tenancy=False
+    ) as agent:
+        task = asyncio.create_task(agent.run("go"))
+        result = await task
+        assert result.status.value == "success"
+        assert provider.calls == 2
+        assert counts
+        if kind == "self_cancel":
+            assert counts == [1]
+        assert (await store.get_run(result.run_id)).status == "success"
+        assert not any(
+            getattr(record, "code", None) == "run_cancel_recovered" for record in caplog.records
+        )
+
+
+@pytest.mark.parametrize("entry", ["resume", "resume_stream", "submit_tool_results"])
+async def test_continuation_recorder_observes_its_run_task(store, engine, monkeypatch, entry):
+    await pin_storage_format(engine, 2)
+
+    @tool(target="client")
+    async def client() -> str:
+        """Read data from the client."""
+        return ""
+
+    provider = StreamingProvider([tool_call("client", pid="one"), LLMResponse(text="done")])
+    async with Agent(
+        prompt="test", provider=provider, tools=[client], state_store=store, strict_tenancy=False
+    ) as agent:
+        paused = await agent.run("go")
+        results = [ToolResult(name="client", call_id=paused.pending.tool_calls[0].id, payload="ok")]
+        gate = LostCancel()
+        gate.install(monkeypatch, store, "on_llm_call_started", "get_run_control")
+
+        async def resume():
+            if entry == "resume_stream":
+                async with agent.resume_stream(paused.run_id, tool_results=results) as events:
+                    async for _ in events:
+                        pass
+            elif entry == "submit_tool_results":
+                return await agent.submit_tool_results(paused.run_id, results)
+            else:
+                return await agent.resume(paused.run_id, tool_results=results)
+
+        task = asyncio.create_task(resume())
+        try:
+            await asyncio.wait_for(gate.entered.wait(), 5)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert gate.dropped
+            assert provider.calls == 1
+            await assert_cancelled_run(store, paused.run_id)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_parent_store_loss_stops_before_same_task_child(store, engine, monkeypatch):
+    await pin_storage_format(engine, 2)
+    children = []
+    holder = {}
+
+    @tool(parallel=False)
+    async def delegate() -> str:
+        """Start a child on the parent's task."""
+        children.append("started")
+        return (await holder["agent"].run("child")).answer
+
+    provider = ScriptedLLM(
+        [tool_call("delegate", pid="one"), LLMResponse(text="child"), LLMResponse(text="parent")]
+    )
+    gate = LostCancel()
+    gate.install(monkeypatch, store, "on_llm_call_completed", "save_usage")
+    async with Agent(
+        prompt="test", provider=provider, tools=[delegate], state_store=store, strict_tenancy=False
+    ) as agent:
+        holder["agent"] = agent
+        task = asyncio.create_task(agent.run("go"))
+        try:
+            await asyncio.wait_for(gate.entered.wait(), 5)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert not children
+            assert provider.calls == 1
+            assert len(await store.list_runs()) == 1
+            await assert_cancelled_run(store, gate.run_id)
         finally:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
