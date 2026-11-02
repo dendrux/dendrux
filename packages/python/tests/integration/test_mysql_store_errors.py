@@ -55,6 +55,7 @@ def test_mysql_unknown_key_fails_closed(message):
 
 
 def test_mysql_factory_selects_adapter():
+    pytest.importorskip("asyncmy", reason="requires dendrux[mysql]")
     engine = create_async_engine("mysql+asyncmy://root@127.0.0.1/private_test")
     store = store_for_engine(engine)
     assert type(store).__name__ == "MySQLStateStore"
@@ -75,13 +76,13 @@ def test_mysql_sqlstate_does_not_shadow_errno(code, expected):
 
 @pytest.mark.parametrize("shape", ["interface", "os_chain", "invalidated"])
 def test_unknown_driver_codes_reach_connection_loss_fallback(shape):
-    from asyncmy.errors import InterfaceError
     from sqlalchemy.exc import DBAPIError
 
     from dendrux.runtime.durability import is_transient_db_error
 
     if shape == "interface":
-        original = InterfaceError(0, "Not connected")
+        driver_errors = pytest.importorskip("asyncmy.errors", reason="requires dendrux[mysql]")
+        original = driver_errors.InterfaceError(0, "Not connected")
         wrapped = DBAPIError(None, None, original)
     elif shape == "os_chain":
         original = Exception(9999, "PRIVATE_SENTINEL")

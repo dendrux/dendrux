@@ -129,19 +129,24 @@ async def test_jittered_parallel_tools_lose_no_rows(memory_engine) -> None:
         assert await _evidence_counts(memory_engine, result.run_id) == (width, width)
 
 
-async def _give_way_to(reader: Callable[[], Awaitable[object]]) -> None:
+async def _give_way_to(reader: Callable[[], Awaitable[object]]) -> asyncio.Task[object]:
     """Start ``reader`` in another task and let it run (if it can) before returning.
 
     Without the guard the reader finishes, and its close (pool reset ROLLBACK)
     lands between the caller's write and commit. With the guard it waits.
+    Returns the task: with the guard it may still be queued behind the caller's
+    session, and the test must await it before the engine is disposed.
     """
-    task = asyncio.create_task(reader())
+    task = asyncio.ensure_future(reader())
     await asyncio.wait({task}, timeout=0.05)
+    return task
 
 
 async def test_reader_session_does_not_undo_pending_writes(memory_engine) -> None:
     store = store_for_engine(memory_engine)
     await store.create_run("run-1", "A")
+
+    readers: list[asyncio.Task[object]] = []
 
     async def write(i: int) -> None:
         async with store._session_factory() as session:
@@ -155,11 +160,11 @@ async def test_reader_session_does_not_undo_pending_writes(memory_engine) -> Non
                 )
             )
             await session.flush()
-            await _give_way_to(lambda: store.get_run_events("run-1"))
+            readers.append(await _give_way_to(lambda: store.get_run_events("run-1")))
             await session.commit()
 
     await asyncio.gather(*[write(i) for i in range(5)])
-    await asyncio.sleep(0.01)
+    await asyncio.gather(*readers)
     assert len(await store.get_run_events("run-1")) == 5
 
 
@@ -230,14 +235,16 @@ async def test_get_session_writes_survive_concurrent_store_reads(memory_engine) 
 
     store = store_for_engine(memory_engine)
 
+    readers: list[asyncio.Task[object]] = []
+
     async def write(i: int) -> None:
         async with get_session(memory_engine) as session:
             session.add(AgentRun(id=f"run-{i}", agent_name="A", status="running"))
             await session.flush()
-            await _give_way_to(lambda: store.get_run("missing"))
+            readers.append(await _give_way_to(lambda: store.get_run("missing")))
 
     await asyncio.gather(*[write(i) for i in range(5)])
-    await asyncio.sleep(0.01)
+    await asyncio.gather(*readers)
     async with memory_engine.connect() as conn:
         count = (await conn.execute(select(func.count()).select_from(AgentRun))).scalar_one()
     assert count == 5

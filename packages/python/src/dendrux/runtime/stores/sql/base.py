@@ -902,7 +902,7 @@ class SQLStateStore(SQLBlobCatalog):
                 await session.execute(
                     update(table).where(false()).ordered_values(*self._reservation_values(table))
                 )
-        keys = list((await session.execute(locking_read)).tuples().all())
+        keys = list((await session.execute(locking_read)).all())
         if not keys:
             return []
         membership = tuple_(*columns).in_(keys)
@@ -1388,7 +1388,9 @@ class SQLStateStore(SQLBlobCatalog):
         if inserted is not None:
             session.info["dendrux.fresh_evidence"] = True
             return str(inserted)
-        row = (await session.execute(select(model).where(model.id == values["id"]))).scalar_one()
+        row: Any = (
+            await session.execute(select(model).where(model.id == values["id"]))
+        ).scalar_one()
         equal = row.agent_run_id == values["agent_run_id"]
         if digest is not None:
             equal = equal and row.content_digest == digest

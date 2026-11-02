@@ -17,3 +17,4 @@ tests/unit/test_050_detectors.py::TestPresidioQueueIsBounded::test_waiting_scans
 tests/unit/test_context_lease.py::test_a23_external_cancellation_cancels_outstanding_renewal | cancellation completes within 200 ms
 tests/tooling/test_load_fix1.py::test_hung_command_is_killed_and_reaped_at_its_deadline | killed and reaped within 400 ms
 tests/migrations/test_060_activate.py::test_b3_b4_rehearsal_5000_runs_200k_events | additive migration of 5,000 runs and 200k events in under 2 s
+tests/unit/test_client_validation_scheduling.py::test_near_megabyte_validation_keeps_ticker_responsive | structured validation ticker stall under 25 ms

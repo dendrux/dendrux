@@ -259,7 +259,9 @@ def test_the_ci_test_job_runs_every_shard_and_only_once_the_per_leg_checks() -> 
         assert steps[once]["if"] == "matrix.shard == 1", once
     assert steps["Build and smoke-test distributions"]["if"] == "matrix.shard == 1"
     combine = {s.get("name", ""): s for s in _workflow()["python-coverage"]["steps"]}
-    assert f"-eq {count}" in combine["Combine coverage and apply the floor"]["run"]
+    run = combine["Combine coverage and apply the floor"]["run"]
+    assert f"for shard in {' '.join(map(str, shards))};" in run
+    assert 'test -s "cov-$shard.data"' in run
 
 
 def test_the_coverage_job_covers_the_same_legs_as_the_test_job() -> None:
@@ -391,19 +393,30 @@ def test_the_makefile_never_asks_for_more_than_six_workers(target: str, override
     assert all(c.isdigit() and 1 <= int(c) <= 6 for c in counts), counts
 
 
-def test_the_makefile_cap_also_holds_for_the_environment_and_a_lower_request() -> None:
-    env = {k: v for k, v in os.environ.items() if not k.startswith("DENDRUX_TEST_")}
-    out = subprocess.run(
-        ["make", "-n", "test-fast"],
-        cwd=PKG,
-        capture_output=True,
-        text=True,
-        check=False,
-        env={**env, "TEST_WORKERS": "64"},
-    ).stdout
-    assert "-n 64" not in out and "-n 6 " in out
-    out = _run_make_n("test-fast", "TEST_WORKERS=2")
-    assert "-n 2 " in out
+@pytest.mark.parametrize("cpus", [None, 1, 2, 4, 11])
+def test_the_makefile_cap_also_holds_for_the_environment_and_a_lower_request(
+    tmp_path: Path, cpus: int | None
+) -> None:
+    (tmp_path / "sitecustomize.py").write_text(f"import os\nos.cpu_count = lambda: {cpus!r}\n")
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith("DENDRUX_TEST_")
+        and k not in {"MAKEFLAGS", "MFLAGS", "MAKEOVERRIDES", "TEST_WORKERS"}
+    }
+    env.update(PYTHONPATH=str(tmp_path) + os.pathsep + env.get("PYTHONPATH", ""), TEST_WORKERS="64")
+    for request in ([], ["TEST_WORKERS=2"]):
+        result = subprocess.run(
+            ["make", "-n", "test-fast", *request],
+            cwd=PKG,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+        )
+        assert result.returncode == 0, result.stderr
+        expected = min(cpus or 1, 6, 2 if request else 64)
+        assert f"-n {expected} " in result.stdout, result.stdout
 
 
 def test_quality_guide_says_the_fast_loop_excludes_slow_tests() -> None:
@@ -449,6 +462,55 @@ def test_the_scanner_finds_tight_wall_clock_bounds_and_names_the_test(tmp_path: 
         ("test_x.py::test_fast", 0.25),
         ("test_x.py::TestK::test_derived", 1.5),
     ]
+
+
+@pytest.mark.parametrize(
+    "mutation", ["append((previous, current))", "extend([(previous, current)])"]
+)
+def test_scanner_traces_clock_samples_through_collections_and_comprehensions(
+    tmp_path: Path, mutation: str
+) -> None:
+    (tmp_path / "test_samples.py").write_text(
+        "def test_stalls(loop):\n"
+        "    intervals = []\n"
+        "    def ticker():\n"
+        "        previous = loop.time()\n"
+        "        current = loop.time()\n"
+        f"        intervals.{mutation}\n"
+        "    stalls = [min(end - start, 1.0) for start, end in intervals]\n"
+        "    worst = max(stalls)\n"
+        "    assert worst < 0.025\n"
+        "\n"
+        "def test_numeric():\n"
+        "    unused_clock = time.monotonic()\n"
+        "    samples = []\n"
+        "    samples.append((1, 2))\n"
+        "    values = [end - start for start, end in samples]\n"
+        "    assert max(values) < 0.25\n"
+    )
+    assert [(f.test, f.bound) for f in tool.wallclock_asserts(tmp_path)] == [
+        ("test_samples.py::test_stalls", 0.025)
+    ]
+
+
+def test_scanner_finds_the_real_derived_ticker_stall_bound() -> None:
+    expected = (
+        "unit/test_client_validation_scheduling.py::"
+        "test_near_megabyte_validation_keeps_ticker_responsive"
+    )
+    found = [f for f in tool.wallclock_asserts(PKG / "tests") if f.test == expected]
+    assert len(found) == 1 and found[0].bound == 0.025
+
+
+def test_client_validation_speed_cases_run_only_in_the_serial_benchmark_selection() -> None:
+    target = "tests/unit/test_client_validation_scheduling.py"
+    name = "test_near_megabyte_validation_keeps_ticker_responsive"
+    assert sum(name in line for line in _collect(target, "-m", "benchmark")) == 6
+    assert not any(name in line for line in _collect(target, "-m", "not benchmark"))
+    assert any(
+        "test_small_validation_stays_inline" in line
+        for line in _collect(target, "-m", "not benchmark")
+    )
 
 
 def test_every_tight_wall_clock_assertion_is_a_benchmark_or_reviewed() -> None:
