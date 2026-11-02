@@ -81,6 +81,12 @@ async def activate_database(
     """
     if isinstance(batch_size, bool) or not 1 <= batch_size <= 5000:
         raise ValueError("batch_size must be between 1 and 5000")
+    await _activate_on_own_connection(engine, batch_size, dedupe_only)
+
+
+async def _activate_on_own_connection(
+    engine: AsyncEngine, batch_size: int, dedupe_only: bool
+) -> None:
     try:
         async with engine.connect() as conn:
             await conn.run_sync(lambda c: _activate(c, batch_size, dedupe_only))
