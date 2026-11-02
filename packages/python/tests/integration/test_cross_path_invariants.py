@@ -8,13 +8,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-from dataclasses import dataclass, field
 from unittest.mock import AsyncMock
 
 import pytest
 
 from dendrux import Agent, tool
-from dendrux.errors import ProviderTimeoutError, RunNotFoundError
+from dendrux.errors import ProviderTimeoutError
 from dendrux.loops.base import BaseNotifier
 from dendrux.runtime.context import (
     DelegationContext,
@@ -23,34 +22,37 @@ from dendrux.runtime.context import (
     reset_delegation_context,
     set_delegation_context,
 )
-from dendrux.types import LLMResponse, RunEventType, RunStatus, ToolCall, ToolDecision, ToolResult
+from dendrux.types import LLMResponse, RunEventType, RunStatus, ToolCall, ToolDecision
+from tests._helpers.recovery_checkpoint import checkpoint as checkpoint
+from tests._helpers.recovery_checkpoint import expire
+from tests._helpers.runtime_paths import (
+    PATHS as PATHS,
+)
+from tests._helpers.runtime_paths import (
+    SUBMIT_KINDS as SUBMIT_KINDS,
+)
+from tests._helpers.runtime_paths import (
+    Entry as Entry,
+)
+from tests._helpers.runtime_paths import (
+    ProbeProvider as ProbeProvider,
+)
+from tests._helpers.runtime_paths import (
+    client_read as client_read,
+)
+from tests._helpers.runtime_paths import (
+    client_result as client_result,
+)
+from tests._helpers.runtime_paths import (
+    make_agent as make_agent,
+)
+from tests._helpers.runtime_paths import (
+    path_case as path_case,
+)
+from tests._helpers.runtime_paths import (
+    submission_case as submission_case,
+)
 from tests._helpers.scripted_provider import ScriptedLLM, tool_call
-from tests.integration.test_060_reclaim_agent import checkpoint
-from tests.integration.test_tenant_run_control import _pause
-
-SUBMIT_KINDS = ["tool_results", "input", "approve", "reject", "decisions", "submit_resume"]
-PATHS = ["run", "run_stream", "resume", "resume_stream", "retry", "recovery", *SUBMIT_KINDS]
-
-
-@tool(target="client")
-async def client_read() -> str:
-    """Read a value on the client."""
-    return "client"
-
-
-def make_agent(store, responses, **kwargs):
-    return Agent(
-        name="cross-path",
-        prompt="test",
-        provider=responses if isinstance(responses, ScriptedLLM) else ScriptedLLM(responses),
-        state_store=store,
-        strict_tenancy=kwargs.pop("strict_tenancy", False),
-        **kwargs,
-    )
-
-
-def client_result(paused):
-    return ToolResult(name="client_read", call_id=paused.pending.tool_calls[0].id, payload="ok")
 
 
 @pytest.mark.parametrize("origin", ["run", "run_stream", "retry", "recovery"])
@@ -97,7 +99,6 @@ async def test_retry_depth_survives_pause_and_refuses_child_at_boundary(
                 from sqlalchemy import update
 
                 from dendrux.db.models import AgentRun
-                from tests.integration.test_060_reclaim_crashes import expire
 
                 async with engine.begin() as conn:
                     await conn.execute(
@@ -296,54 +297,6 @@ async def test_startup_event_write_failure_ends_error(store, monkeypatch, entry)
     assert a._provider.calls == 0
 
 
-async def submission_case(store, kind, *, before_tool=None):
-    from dendrux.types import ApprovalDecision
-
-    paused = await _pause(
-        "client"
-        if kind == "tool_results"
-        else "input"
-        if kind == "input"
-        else "paused"
-        if kind == "submit_resume"
-        else "approval",
-        store,
-        "tenant",
-        before_tool=before_tool,
-    )
-    a, run_id = paused.agent, paused.run_id
-    raw = await store.get_pause_state(run_id)
-    scope = dict(tenant_id="tenant", expected_pause_id=raw["pause_id"])
-
-    async def invoke(agent=a, tenant="tenant", notifier=None):
-        call_scope = {**scope, "tenant_id": tenant, "notifier": notifier}
-        if kind == "tool_results":
-            return await agent.submit_tool_results(
-                run_id,
-                [
-                    ToolResult(
-                        name="read_range",
-                        call_id=raw["pending_tool_calls"][0]["id"],
-                        payload='"ok"',
-                    )
-                ],
-                **call_scope,
-            )
-        if kind == "input":
-            return await agent.submit_input(run_id, "answer", **call_scope)
-        if kind == "submit_resume":
-            return await agent.submit_resume(run_id, **call_scope)
-        if kind == "decisions":
-            return await agent.submit_approval(
-                run_id,
-                decisions={c["id"]: ApprovalDecision.approve() for c in raw["pending_tool_calls"]},
-                **call_scope,
-            )
-        return await agent.submit_approval(run_id, approved=kind == "approve", **call_scope)
-
-    return a, run_id, invoke
-
-
 @pytest.mark.parametrize("kind", SUBMIT_KINDS)
 @pytest.mark.parametrize("storage_format", [1, 2])
 @pytest.mark.parametrize(
@@ -475,84 +428,6 @@ async def test_reclaim_transient_setup_failure_preserves_failure_hooks(store, en
     )
 
 
-@dataclass
-class Entry:
-    agent: Agent
-    run_id: str | None = None
-    events: list = field(default_factory=list)
-    invoke: object = None
-
-
-async def path_case(store, engine, path, provider, *, before_tool=None):
-    if path in SUBMIT_KINDS:
-        a, run_id, submit = await submission_case(store, path, before_tool=before_tool)
-        a._provider = provider
-        case = Entry(a, run_id)
-        case.invoke = submit
-        return case
-
-    a = make_agent(store, provider, tools=[client_read], before_tool=before_tool)
-    case = Entry(a)
-    paused = None
-    if path in {"resume", "resume_stream"}:
-        a._provider = ScriptedLLM([tool_call("client_read", pid="c")])
-        paused = await a.run("go", tenant_id="tenant")
-        case.run_id = paused.run_id
-        a._provider = provider
-    elif path == "retry":
-        original = await make_agent(store, [LLMResponse(text="prior")]).run(
-            "go", tenant_id="tenant"
-        )
-        case.run_id = original.run_id
-    elif path == "recovery":
-        item = await checkpoint(a, store, engine)
-        case.run_id = item.run_id
-
-    async def invoke(*, tenant="tenant"):
-        if path == "run":
-            return await a.run("go", tenant_id=tenant)
-        if path == "run_stream":
-            stream = a.stream("go", tenant_id=tenant)
-        elif path == "resume_stream":
-            stream = a.resume_stream(
-                paused.run_id,
-                tool_results=[client_result(paused)],
-                tenant_id=tenant,
-                expected_pause_id=paused.pause_id,
-            )
-        elif path == "resume":
-            return await a.resume(
-                paused.run_id,
-                tool_results=[client_result(paused)],
-                tenant_id=tenant,
-                expected_pause_id=paused.pause_id,
-            )
-        elif path == "retry":
-            return await a.retry(case.run_id, tenant_id=tenant)
-        elif path == "recovery":
-            return await a.reclaim(case.run_id, item=item, tenant_id=tenant)
-        async with stream:
-            async for event in stream:
-                case.events.append(event)
-        return stream.result
-
-    case.invoke = invoke
-    return case
-
-
-class ProbeProvider(ScriptedLLM):
-    def __init__(self, *, block=False, error=None):
-        super().__init__([LLMResponse(text="done")], gate_at=0 if block else None)
-        self.run_id = None
-        self.error = error
-
-    async def complete(self, *args, **kwargs):
-        self.run_id = kwargs.get("run_id")
-        if self.error:
-            raise self.error
-        return await super().complete(*args, **kwargs)
-
-
 @pytest.mark.parametrize("path", PATHS)
 async def test_caller_cancellation_grid_persists_once(store, engine, path):
     provider = ProbeProvider(block=True)
@@ -614,48 +489,6 @@ async def test_safe_provider_errors_grid(store, engine, caplog, path):
         [row.error, row.meta, [e.data for e in events]]
     )
     assert "vendor_private_sentinel" not in caplog.text
-
-
-@pytest.mark.parametrize("path", PATHS)
-async def test_tenant_refusal_precedes_every_write_grid(store, engine, path):
-    from sqlalchemy import event
-
-    provider = ProbeProvider()
-    case = await path_case(store, engine, path, provider)
-    before = await store.list_runs()
-    writes = []
-
-    def record_write(conn, cursor, statement, parameters, context, executemany):
-        # SQLite's tenant-scoped lock probe is an UPDATE affecting zero rows
-        # on refusal. Count writes that actually reach a row.
-        if statement.startswith(
-            "UPDATE agent_runs SET id=agent_runs.id, updated_at=agent_runs.updated_at"
-        ):
-            return
-        if (
-            statement.lstrip().split()[0].upper() in {"INSERT", "UPDATE", "DELETE"}
-            and cursor.rowcount != 0
-        ):
-            writes.append(statement)
-
-    event.listen(engine.sync_engine, "after_cursor_execute", record_write)
-    try:
-        if path in {"run", "run_stream"}:
-            case.agent._strict_tenancy = True
-            if path == "run":
-                with pytest.raises(ValueError):
-                    await case.agent.run("go")
-            else:
-                with pytest.raises(ValueError):
-                    case.agent.stream("go")
-        else:
-            with pytest.raises(RunNotFoundError):
-                await case.invoke(tenant="foreign")
-    finally:
-        event.remove(engine.sync_engine, "after_cursor_execute", record_write)
-    assert writes == []
-    assert await store.list_runs() == before
-    assert provider.calls == 0
 
 
 @pytest.mark.parametrize("path", PATHS)

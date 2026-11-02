@@ -3,16 +3,15 @@
 import asyncio
 import multiprocessing
 import signal
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 from functools import wraps
 
 import pytest
-from sqlalchemy import update
 
 from dendrux import Agent, sweep, tool
-from dendrux.db.models import AgentRun
 from dendrux.llm.mock import MockLLM
 from dendrux.types import LLMResponse, ToolCall, UsageStats
+from tests._helpers.recovery_checkpoint import expire as expire
 from tests.integration.test_060_core_crash_cuts import CUTS, _kill_at_cut
 
 
@@ -62,22 +61,6 @@ def recovery_agent(store, cut, effect_path, *, provider=None):
         guardrails=[],
         strict_tenancy=False,
         on_governance_change="raise",
-    )
-
-
-async def expire(store, engine, run):
-    async with engine.begin() as conn:
-        await conn.execute(
-            update(AgentRun)
-            .where(AgentRun.id == run)
-            .values(last_progress_at=datetime.now(UTC) - timedelta(minutes=10))
-        )
-    return next(
-        r
-        for r in (
-            await sweep(state_store=store, stale_running=timedelta(minutes=1), on_stale="reclaim")
-        ).reclaimable
-        if r.run_id == run
     )
 
 
