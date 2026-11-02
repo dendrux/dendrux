@@ -46,7 +46,7 @@ a regression.
 | `make deadcode` | `tools/vulture_ratchet.py` | vulture (confidence 80 or more) finds a new unused name. Intentional public API and hooks go in `vulture_whitelist.py` with a comment. Baseline: `vulture_baseline.json`. |
 | `make cycles` | `tools/import_cycles.py` | A module import cycle appears, a module joins a baselined cycle, or two cycles merge. Only top-level runtime imports count: `if TYPE_CHECKING:` blocks and imports inside functions are ignored. `python tools/import_cycles.py report` also lists the cycles that function-level imports hide (information only). Baseline: `import_cycles_baseline.json`. |
 | `make semgrep` | `tools/semgrep_ratchet.py` | A rule in `.semgrep/dendrux.yml` has a new match, or more matches in a function that already had some; or a rule stops passing its fixture. Baseline: `semgrep_baseline.json` (rule, module, function). |
-| `make crap` | `tools/crap_ratchet.py` | A new function scores CRAP above 30, a changed function scores above 30, or an existing function's score rises (by more than 0.5). If the function's code is unchanged (same AST digest) a rise of up to 25 percent of its baseline score is only a warning; a bigger rise fails. Needs `coverage.json` from `make test`. Baseline: `crap_baseline.json`. |
+| `make crap` | `tools/crap_ratchet.py` | A new function scores above 30; complexity rises and the function scores above 30; or edited code exceeds its own recorded CRAP baseline. An edited function may remain above 30 when neither complexity nor CRAP rises. Unchanged code retains the 0.5-point noise band and the warning allowance for rises up to 25 percent. Backend-only local coverage is handled explicitly below. Needs `coverage.json` from `make test`. Baseline: `crap_baseline.json`. |
 
 ## Reading a failure
 
@@ -67,7 +67,61 @@ make a failure go away; `stamp` refuses to record new or worse entries.
 - CRAP: add tests for the function, or make it simpler. A `CRAP warning` line (unchanged code,
   score up by at most 25 percent) does not fail the build: it is coverage variance between
   runs. Look at it if it keeps growing; a loss above 25 percent (for example deleted tests)
-  fails. Any rise on a function whose code changed fails.
+  fails. Edited code must not exceed its recorded score, compared at the baseline's two-decimal
+  precision. The hard limit of 30 still applies to new functions and functions whose complexity rises.
+
+## CRAP coverage and debt
+
+An edited function above 30 passes when its complexity did not rise and its CRAP score is no
+higher than its own recorded baseline. This permits a type-correctness edit to an existing
+hotspot without requiring a large runtime refactor in the same task. It does not permit an
+increase. Baseline updates also refuse increases, including those inside the check's noise
+band; the coordinator alone records decreases.
+
+The short reviewed MySQL-family module list is:
+
+- `src/dendrux/db/_dialects/mysql.py`
+- `src/dendrux/runtime/stores/sql/mysql.py`
+
+Only those exact modules are advisory in a normal SQLite/Postgres local CRAP check. Their
+violations print warnings when real MySQL/MariaDB coverage is absent. Mixed modules such as
+`runtime/stores/sql/base.py` and `runtime/_blob_catalog.py` remain enforced. Missing or stale
+source evidence always fails, even for a listed module. CI enforces every module, using
+`--ci` (also selected automatically by nonempty `CI` or `GITHUB_ACTIONS`). The MySQL and
+MariaDB jobs each upload a coverage artifact; the coverage jobs require both server jobs,
+download both artifacts, and verify all four shard files plus both backend files before
+combining. A missing backend cannot silently disappear from the measurement.
+
+**Run when needed: any change under the MySQL-family list.** Install the optional `mysql`
+extra, collect the normal base-suite coverage, then run:
+
+```sh
+make cov-mysql
+make crap
+```
+
+`cov-mysql` is opt-in and is in neither `make ci` nor `make test-merge`. It requires the
+already-running `dendrux-test-mysql` (127.0.0.1:53306) and `dendrux-test-mariadb`
+(127.0.0.1:53307) containers, with the test credentials `root` / `dendrux_test`. It never
+starts or stops containers; a stopped container or unavailable Docker produces a clear
+error before testing. It runs `tests/db` on one server at a time, four workers, no benchmarks,
+using private `dendrux_p5_b_cigreen_cov_<server>_test` prefixes (each fixture creates and drops
+its own private database). It requires `.coverage`, `coverage.json` and its current source
+digests from the base suite. Both backend suites must succeed before the combined report
+is replaced. Coverage from the base suite is preserved and merged with both fresh reports.
+
+The resulting `coverage.json.backends.json` binds both datasets to the combined report's
+SHA-256. When this matching provenance is present, `make crap` enforces the listed modules
+locally too. A new base-only report invalidates that provenance and restores advisory mode
+until `cov-mysql` is rerun. Advisory mode never applies to baseline updates.
+
+Every CRAP check prints the number of functions above 30, their total excess above 30, and
+the top ten scores. It also warns about **touched but not reduced**: edited functions above
+30 whose recorded score did not decrease. This warning does not change the no-worse hard
+gate. The same summary is written next to the input as `coverage.json.crap.json`, including
+the touched-function list, for merge-gate reporting. It is produced even when the check
+fails, provided the coverage evidence is valid. CI uploads it as `crap-debt-<coverage-leg>`
+even when the CRAP step fails.
 
 ## Stamping after an improvement
 
@@ -76,16 +130,15 @@ When a change fixes problems, the baselines are stale (the check prints "improve
 from `make test`) and commit the baseline diff with the fix. The diff must only remove or
 lower entries.
 
-**Baselines may only shrink unless the coordinator approves.** Never stamp over a new or
-worse entry. If one is truly unavoidable, the coordinator approves it, and the commit uses
-`stamp --allow-regress --reason "..."` (the CRAP ratchet records it as a waiver in its
-baseline) and says why in the commit message.
+**Baselines only shrink.** The coordinator records decreases; never stamp over a new or
+worse entry. A local coverage warning is not permission to increase a baseline.
 
 ## Test tiers
 
 Four tiers, from the loop you run while building to the gate the coordinator runs before a merge.
-Local runs use SQLite and Postgres only (MySQL and MariaDB run in GitHub CI), one heavy suite at a
-time, and at most 6 xdist workers (`DENDRUX_TEST_WORKERS` or `TEST_WORKERS=<n>` can lower it;
+Normal local gates use SQLite and Postgres; MySQL and MariaDB run in GitHub CI and the explicit
+`cov-mysql` target above. Run one heavy suite at a time, and at most 6 xdist workers
+(`DENDRUX_TEST_WORKERS` or `TEST_WORKERS=<n>` can lower it;
 a larger number or `auto` ends at 6).
 
 | Tier | Command | What runs | Measured (11 cores, idle machine) |

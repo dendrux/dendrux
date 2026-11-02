@@ -147,11 +147,10 @@ jobs:
         if: matrix.shard == 1
         run: python scripts/mcp_distribution_smoke.py
 
-  # Combines the four shards of each leg, then judges the whole: the coverage floor on every
-  # leg, and the CRAP ratchet (which needs complete coverage) on one leg.
+  # Combine each leg's four shards with both real MySQL-family reports before judging CRAP.
   python-coverage:
     name: coverage py${{ matrix.python-version }} / SQLAlchemy ${{ matrix.sqlalchemy-version }}
-    needs: python
+    needs: [python, mysql-family]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     defaults:
@@ -197,25 +196,49 @@ jobs:
           path: packages/python
           merge-multiple: true
 
-      # All four shard files must be present: a missing shard would silently lower coverage.
+      - name: Download MySQL coverage
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: coverage-mysql
+          path: packages/python
+
+      - name: Download MariaDB coverage
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: coverage-mariadb
+          path: packages/python
+
+      # Every shard and backend must be present; never silently judge partial coverage.
       - name: Combine coverage and apply the floor
         shell: bash
         run: |
-          test "$(ls cov-*.data | wc -l)" -eq 4
-          coverage combine cov-*.data
+          for shard in 1 2 3 4; do test -s "cov-$shard.data"; done
+          test -s cov-mysql.data
+          test -s cov-mariadb.data
+          coverage combine --keep cov-{1,2,3,4}.data cov-mysql.data cov-mariadb.data
           coverage report --show-missing --fail-under=80
           coverage json -o coverage.json
 
       # Tie coverage.json to the source it measured; the ratchet rejects a stale report.
       - name: Record coverage source digests
         if: matrix.python-version == '3.12' && matrix.sqlalchemy-version == '2.1.*'
-        run: python tools/crap_ratchet.py stamp --coverage coverage.json
+        run: python tools/crap_ratchet.py stamp --coverage coverage.json --mysql-coverage
 
       # Coverage is the same on every leg, so one leg judges it. Enforcing: a new function
       # over the threshold, or an existing one whose CRAP score rises, fails the build.
       - name: CRAP ratchet
+        id: crap
         if: matrix.python-version == '3.12' && matrix.sqlalchemy-version == '2.1.*'
-        run: python tools/crap_ratchet.py check --coverage coverage.json
+        run: python tools/crap_ratchet.py check --coverage coverage.json --ci
+
+      - name: Upload CRAP debt summary
+        if: always() && steps.crap.outcome != 'skipped'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: crap-debt-${{ steps.leg.outputs.name }}
+          path: packages/python/coverage.json.crap.json
+          if-no-files-found: error
+          retention-days: 7
 
   # Benchmarks: tests that assert how fast something is (marked benchmark, or listed in
   # tests/_helpers/tier_lists/benchmark.txt). They fail under the parallel load of the shard jobs,
@@ -378,13 +401,22 @@ jobs:
         shell: bash
         env:
           SERVER_URL: mysql+asyncmy://root:dendrux_test@127.0.0.1:${{ matrix.port }}/dendrux_ci_test
+          COVERAGE_FILE: cov-${{ matrix.server }}.data
         run: |
           export ${{ matrix.env_name }}="$SERVER_URL"
-          pytest tests/db -v -rs -n 4 -m "not benchmark" --no-cov | tee pytest.log
+          pytest tests/db -v -rs -n 4 -m "not benchmark" --cov=src/dendrux --cov-report= | tee pytest.log
           if grep -q '${{ matrix.env_name }} not set' pytest.log; then
             echo "::error::${{ matrix.server }} tests were skipped (${{ matrix.env_name }} not set)."
             exit 1
           fi
+
+      - name: Upload coverage data
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage-${{ matrix.server }}
+          path: packages/python/cov-${{ matrix.server }}.data
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Remove ${{ matrix.server }}
         if: always()
