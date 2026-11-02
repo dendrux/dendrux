@@ -51,6 +51,7 @@ async def test_two_hundred_budget_runs_with_lost_forensics(engine, monkeypatch, 
         checked -= 1
 
     durations = []
+    verified: list[str] = []
 
     async def run_one():
         responses = [tool_call("work", pid=str(i)) for i in range(3)]
@@ -74,6 +75,7 @@ async def test_two_hundred_budget_runs_with_lost_forensics(engine, monkeypatch, 
         events = await store.get_run_events(result.run_id)
         assert len({e.sequence_index for e in events}) == len(events)
         assert sum(e.event_type == "run.cancelled" for e in events) == 1
+        verified.append(result.run_id)
 
     async def run_all():
         # A TaskGroup cancels and awaits the other runs when one fails, while the loop is
@@ -93,6 +95,8 @@ async def test_two_hundred_budget_runs_with_lost_forensics(engine, monkeypatch, 
         event.remove(load_engine.sync_engine, "checkin", checkin)
         if load_engine is not engine:
             await load_engine.dispose()
+    # A TaskGroup ignores a child that ends cancelled, so prove every run reached its checks.
+    assert len(verified) == 200
     durations.sort()
     metrics = {
         "p50_ms": round(durations[99], 2),
