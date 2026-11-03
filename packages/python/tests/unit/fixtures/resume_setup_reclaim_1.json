@@ -1,0 +1,11 @@
+{
+  "calls": {
+    "reclaim_run": 1,
+    "update_one": 1
+  },
+  "transactions": [
+    "BEGIN",
+    "UPDATE agent_runs SET id=agent_runs.id, updated_at=agent_runs.updated_at WHERE agent_runs.id = ? AND agent_runs.tenant_id IS ? RETURNING id, tenant_id, storage_format, status, lease_expired_at, claim_epoch, reclaim_attempts, reclaim_limit, cancel_requested, agent_name, meta, loop_state, last_progress_at, created_at, last_reclaimed_at",
+    "ROLLBACK"
+  ]
+}

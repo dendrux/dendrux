@@ -30,6 +30,8 @@ from typing import TYPE_CHECKING, Any, NamedTuple, get_args, overload
 from dendrux import _codes
 from dendrux._lifecycle import (
     CANCEL_FINALIZE_STATUS_VALUES,
+    RESUME_INPUT_STATUS_VALUES,
+    RESUME_RESULTS_STATUS_VALUES,
     STORAGE_FORMAT_CHECKPOINTED,
     TERMINAL_STATUSES,
     CancelReason,
@@ -144,6 +146,7 @@ from dendrux.skills._session import META_KEY, SkillSession, continuation, curren
 from dendrux.skills._session import current as current_skill_session
 from dendrux.strategies.native import NativeToolCalling
 from dendrux.types import (
+    AgentStep,
     ApprovalDecision,
     ErrorInfo,
     GovernanceEventType,
@@ -4421,7 +4424,7 @@ async def _load_pause_state(
 ) -> PauseState:
     from dendrux.errors import PersistenceError, RunNotReclaimableError
     from dendrux.runtime.replay import rebuild_history
-    from dendrux.types import InputValidationError, _usage_from_dict
+    from dendrux.types import InputValidationError
 
     pause = PauseState.from_dict(raw)
     if pause.schema_version != 2:
@@ -4454,11 +4457,57 @@ async def _load_pause_state(
     if reads is not None:
         reads.history_records = messages.records
         reads.checkpoint = checkpoint
-    pause.steps = messages.steps
-    pause.usage = _usage_from_dict(checkpoint["usage"])
-    pause.iteration = checkpoint["iteration"]
-    pause.trace_order_offset = checkpoint["trace_order_offset"]
-    pause.provider_kwargs = dict(checkpoint["provider_kwargs"])
+    await _overlay_pause_checkpoint(pause, store, run_id, agent, checkpoint, messages.steps)
+    return pause
+
+
+async def _overlay_pause_checkpoint(
+    pause: PauseState,
+    store: StateStore,
+    run_id: str,
+    agent: Agent,
+    checkpoint: dict[str, Any],
+    steps: list[AgentStep],
+    *,
+    recovery: bool = False,
+) -> None:
+    from dendrux.types import _usage_from_dict
+
+    pause.steps = steps
+    # Reclaim tolerates absent counters; resume rejects incomplete checkpoints.
+    if recovery:
+        pause.iteration = checkpoint.get("iteration", 0)
+        pause.trace_order_offset = checkpoint.get("trace_order_offset", 0)
+        pause.usage = _usage_from_dict(checkpoint.get("usage", {}))
+        pause.provider_kwargs = dict(checkpoint.get("provider_kwargs", {}))
+    else:
+        pause.usage = _usage_from_dict(checkpoint["usage"])
+        pause.iteration = checkpoint["iteration"]
+        pause.trace_order_offset = checkpoint["trace_order_offset"]
+        pause.provider_kwargs = dict(checkpoint["provider_kwargs"])
+    await _restore_pause_refs(
+        pause,
+        store,
+        run_id,
+        agent,
+        checkpoint,
+        missing_code=FailureReason.RECOVERY_STATE_MISSING.value
+        if recovery
+        else "pause_format_unsupported",
+    )
+
+
+async def _restore_pause_refs(
+    pause: PauseState,
+    store: StateStore,
+    run_id: str,
+    agent: Agent,
+    checkpoint: dict[str, Any],
+    *,
+    missing_code: str,
+) -> None:
+    from dendrux.errors import PersistenceError
+
     for kind, ref in (
         ("image_view", checkpoint.get("image_view_ref")),
         ("skills_session", checkpoint.get("skills", {}).get("session_ref")),
@@ -4468,7 +4517,7 @@ async def _load_pause_state(
             continue
         state_trace = await store.get_trace(run_id, ref)
         if state_trace is None:
-            raise PersistenceError(code="pause_format_unsupported")
+            raise PersistenceError(code=missing_code)
         payload = json.loads(state_trace.content)
         if kind == "image_view":
             pause.image_view = ImageViewState.from_dict(payload)
@@ -4478,7 +4527,28 @@ async def _load_pause_state(
                 session.restore_snapshot(payload)
         else:
             pause.pause_message = payload.get("pause_message")
-    return pause
+
+
+def _resumed_payload(
+    expected_status: str,
+    tool_results: list[ToolResult] | None,
+    user_input: str | None,
+    user_parts: tuple[ContentPart, ...] | None,
+) -> dict[str, Any]:
+    resume_data: dict[str, Any] = {"resumed_from": expected_status}
+    if tool_results is not None:
+        submitted: list[dict[str, Any]] = []
+        for tr in tool_results:
+            entry: dict[str, Any] = {"call_id": tr.call_id, "name": tr.name, "success": tr.success}
+            if tr.images:
+                entry["image_count"] = len(tr.images)
+            submitted.append(entry)
+        resume_data["submitted_results"] = submitted
+    elif user_input is not None:
+        resume_data["user_input"] = user_input
+        if user_parts is not None:
+            resume_data["image_count"] = sum(1 for p in user_parts if isinstance(p, ImagePart))
+    return resume_data
 
 
 async def _prepare_resume(
@@ -4520,21 +4590,12 @@ async def _prepare_resume(
     resolved_loop = loop or agent.loop or ReActLoop()
     _validate_loop_skill_compat(agent, resolved_loop)
 
-    # 1. Record resume event with enriched payload for dashboard
-    resume_data: dict[str, Any] = {"resumed_from": expected_status}
-    if tool_results is not None:
-        submitted: list[dict[str, Any]] = []
-        for tr in tool_results:
-            entry: dict[str, Any] = {"call_id": tr.call_id, "name": tr.name, "success": tr.success}
-            if tr.images:
-                entry["image_count"] = len(tr.images)
-            submitted.append(entry)
-        resume_data["submitted_results"] = submitted
-    elif user_input is not None:
-        resume_data["user_input"] = user_input
-        if user_parts is not None:
-            resume_data["image_count"] = sum(1 for p in user_parts if isinstance(p, ImagePart))
-    await _emit_event(state_store, run_id, StoredEventType.RUN_RESUMED.value, resume_data)
+    await _emit_event(
+        state_store,
+        run_id,
+        StoredEventType.RUN_RESUMED.value,
+        _resumed_payload(expected_status, tool_results, user_input, user_parts),
+    )
 
     # 3. Build resume history
     history = list(pause_state.history)
@@ -5232,9 +5293,7 @@ async def _ingest_resume_images(
     if record is None:
         raise RunNotFoundError(run_id)
     allowed = (
-        (RunStatus.WAITING_CLIENT_TOOL.value, RunStatus.WAITING_APPROVAL.value)
-        if tool_results is not None
-        else (RunStatus.WAITING_HUMAN_INPUT.value,)
+        RESUME_RESULTS_STATUS_VALUES if tool_results is not None else RESUME_INPUT_STATUS_VALUES
     )
     if record.status not in allowed:
         await _raise_resume_claim_failure(state_store, run_id, allowed[0])
@@ -5632,6 +5691,8 @@ async def _read_resume_pause(
     reads: _PauseReads,
     skip_claim: bool,
     expected_pause_id: str | None,
+    *,
+    read_record: bool = False,
 ) -> PauseState:
     if raw is None:
         raise ValueError(f"Run '{run_id}' has no pause state — cannot resume.")
@@ -5639,7 +5700,33 @@ async def _read_resume_pause(
         require_pause_id(
             agent, expected_pause_id, pause_id=raw.get("pause_id"), store=store, run_id=run_id
         )
+    return await _load_resume_pause(
+        store, agent, provider, run_id, raw, reads, read_record=read_record
+    )
+
+
+async def _load_resume_pause(
+    store: StateStore,
+    agent: Agent,
+    provider: LLMProvider,
+    run_id: str,
+    raw: dict[str, Any],
+    reads: _PauseReads,
+    *,
+    read_record: bool,
+) -> PauseState:
+    if read_record:
+        reads.record = await store.get_run(run_id)
     return await _load_pause_state(store, run_id, raw, agent, provider, reads=reads)
+
+
+def _require_pause_agent(pause: PauseState, agent: Agent, run_id: str, streaming: bool) -> None:
+    if pause.agent_name and pause.agent_name != agent.name:
+        raise ValueError(
+            f"Agent name mismatch: run '{run_id}' was paused by "
+            f"'{pause.agent_name}', but resume called with '{agent.name}'."
+            + ("" if streaming else " This can cause state corruption.")
+        )
 
 
 async def _read_resume_state(
@@ -5651,11 +5738,12 @@ async def _read_resume_state(
     expected_pause_id: str | None,
     supplied_raw: dict[str, Any] | None,
     reclaimed: PauseState | None,
+    *,
+    streaming: bool = False,
 ) -> tuple[RunRecord | None, _PauseReads, Any, PauseState, bool, Any]:
     from dendrux.runtime._reclaim import needs_resolution
 
-    record = await store.get_run(run_id)
-    reads = _PauseReads(record)
+    reads = _PauseReads(None if streaming else await store.get_run(run_id))
     raw = None if reclaimed is not None else supplied_raw
     if reclaimed is None and raw is None:
         raw = await store.get_pause_state(run_id)
@@ -5663,20 +5751,23 @@ async def _read_resume_state(
         reclaimed
         if reclaimed is not None
         else await _read_resume_pause(
-            store, agent, provider, run_id, raw, reads, skip_claim, expected_pause_id
+            store,
+            agent,
+            provider,
+            run_id,
+            raw,
+            reads,
+            skip_claim,
+            expected_pause_id,
+            read_record=streaming,
         )
     )
     recovering = reclaimed is not None or await needs_resolution(
         store, run_id, pause, checkpoint=reads.checkpoint
     )
-    pii = await store.get_pii_mapping(run_id)
-    if pause.agent_name and pause.agent_name != agent.name:
-        raise ValueError(
-            f"Agent name mismatch: run '{run_id}' was paused by "
-            f"'{pause.agent_name}', but resume called with '{agent.name}'. "
-            "This can cause state corruption."
-        )
-    return record, reads, raw, pause, recovering, pii
+    pii = None if streaming else await store.get_pii_mapping(run_id)
+    _require_pause_agent(pause, agent, run_id, streaming)
+    return reads.record, reads, raw, pause, recovering, pii
 
 
 async def _resume_submission(
@@ -5785,6 +5876,71 @@ async def _finish_resumed_result(
     return result
 
 
+async def _resume_approval_batch(
+    agent: Agent,
+    store: StateStore,
+    run_id: str,
+    ctx: _ResumeContext,
+    expected: str,
+    results: list[ToolResult] | None,
+    user_input: str | None,
+    image_runtime: ImageRuntime | None,
+    *,
+    decisions: Any = None,
+    on_work: Callable[[], None] | None = None,
+    streaming: bool = False,
+) -> tuple[_ApprovalResume | None, bool]:
+    pause = ctx.pause_state
+    approving = (
+        results is None and user_input is None and expected == RunStatus.WAITING_APPROVAL.value
+    )
+    paused_batch = expected == RunStatus.PAUSED.value and bool(pause.pending_tool_calls)
+    if not (approving or paused_batch):
+        return None, approving
+    decision_map = None
+    if not approving:
+        decision_map = _pending_decision_map(pause)
+    elif not streaming:
+        decision_map = await _validated_decisions(agent, ctx, run_id, pause, decisions)
+    approval = await _execute_approved_tools(
+        agent,
+        pause,
+        ctx.recorder,
+        ctx.notifier,
+        run_id,
+        history=ctx.history,
+        resolved_loop=ctx.resolved_loop,
+        decisions=decision_map,
+        state_store=store,
+        image_runtime=image_runtime,
+        on_work=on_work,
+    )
+    return approval, approving
+
+
+async def _finish_approval_batch(
+    run_id: str,
+    ctx: _ResumeContext,
+    expected: str,
+    results: list[ToolResult] | None,
+    approval: _ApprovalResume | None,
+    approving: bool,
+) -> RunResult | None:
+    pause = ctx.pause_state
+    if approval is not None:
+        if approving:
+            await _record_approval_decided(
+                ctx.recorder, ctx.notifier, run_id, pause.iteration, approval.decided
+            )
+        stop = _approval_stop_result(run_id, pause, ctx.history, approval)
+        if stop is not None:
+            return stop
+    if results is not None and expected == RunStatus.WAITING_APPROVAL.value:
+        data = _rejection_decided_payload(run_id, pause, results)
+        await _record_approval_decided(ctx.recorder, ctx.notifier, run_id, pause.iteration, data)
+    return None
+
+
 async def _resume_approval_work(
     agent: Agent,
     store: StateStore,
@@ -5797,59 +5953,35 @@ async def _resume_approval_work(
     image_runtime: ImageRuntime | None,
     on_work: Callable[[], None],
 ) -> RunResult | None:
-    pause = ctx.pause_state
-    approving = (
-        tool_results is None and user_input is None and expected == RunStatus.WAITING_APPROVAL.value
+    approval, approving = await _resume_approval_batch(
+        agent,
+        store,
+        run_id,
+        ctx,
+        expected,
+        tool_results,
+        user_input,
+        image_runtime,
+        decisions=decisions,
+        on_work=on_work,
     )
-    paused_batch = expected == RunStatus.PAUSED.value and bool(pause.pending_tool_calls)
-    if approving or paused_batch:
-        decision_map = (
-            await _validated_decisions(agent, ctx, run_id, pause, decisions)
-            if approving
-            else _pending_decision_map(pause)
-        )
-        approval = await _execute_approved_tools(
-            agent,
-            pause,
-            ctx.recorder,
-            ctx.notifier,
-            run_id,
-            history=ctx.history,
-            resolved_loop=ctx.resolved_loop,
-            decisions=decision_map,
-            state_store=store,
-            image_runtime=image_runtime,
-            on_work=on_work,
-        )
-        if approving:
-            await _record_approval_decided(
-                ctx.recorder, ctx.notifier, run_id, pause.iteration, approval.decided
-            )
-        stop = _approval_stop_result(run_id, pause, ctx.history, approval)
-        if stop is not None:
-            return stop
-    if tool_results is not None and expected == RunStatus.WAITING_APPROVAL.value:
-        data = _rejection_decided_payload(run_id, pause, tool_results)
-        await _record_approval_decided(ctx.recorder, ctx.notifier, run_id, pause.iteration, data)
-    return None
+    return await _finish_approval_batch(run_id, ctx, expected, tool_results, approval, approving)
 
 
-async def _run_resumed_loop(
+def _resumed_loop_kwargs(
     agent: Agent,
     provider: LLMProvider,
     store: StateStore,
     run_id: str,
     ctx: _ResumeContext,
-    pii: Any,
     image_runtime: ImageRuntime | None,
-    on_work: Callable[[], None],
-) -> RunResult:
-    carry = _budget_carry_kwargs(ctx.resolved_loop.run, ctx.pause_state)
+    loop_method: Any,
+) -> dict[str, Any]:
+    carry = _budget_carry_kwargs(loop_method, ctx.pause_state)
     images = _image_loop_kwargs(
-        ctx.resolved_loop.run, image_runtime, _resume_image_view(ctx.pause_state, ctx.history)
+        loop_method, image_runtime, _resume_image_view(ctx.pause_state, ctx.history)
     )
-    on_work()
-    return await ctx.resolved_loop.run(
+    return dict(
         agent=agent,
         provider=provider,
         strategy=ctx.resolved_strategy,
@@ -5862,11 +5994,27 @@ async def _run_resumed_loop(
         iteration_offset=ctx.pause_state.iteration,
         initial_usage=ctx.pause_state.usage,
         provider_kwargs=ctx.pause_state.provider_kwargs or None,
-        initial_pii_mapping=pii,
         state_store=store,
         **carry,
         **images,
     )
+
+
+async def _run_resumed_loop(
+    agent: Agent,
+    provider: LLMProvider,
+    store: StateStore,
+    run_id: str,
+    ctx: _ResumeContext,
+    pii: Any,
+    image_runtime: ImageRuntime | None,
+    on_work: Callable[[], None],
+) -> RunResult:
+    kwargs = _resumed_loop_kwargs(
+        agent, provider, store, run_id, ctx, image_runtime, ctx.resolved_loop.run
+    )
+    on_work()
+    return await ctx.resolved_loop.run(**kwargs, initial_pii_mapping=pii)
 
 
 async def _cancel_resumed_run(
@@ -6246,31 +6394,17 @@ async def _stream_resume_state(
     skill_session = await continuation(agent, store, run_id)
     stream_context.set_session(skill_session)
 
-    # 2. Load pause state
-    raw_pause = await store.get_pause_state(run_id)
-    if raw_pause is None:
-        raise ValueError(f"Run '{run_id}' has no pause state — cannot resume.")
-    require_pause_id(
+    run_record, reads, raw_pause, pause_state, recovering, _ = await _read_resume_state(
+        store,
         agent,
+        provider,
+        run_id,
+        False,
         expected_pause_id,
-        pause_id=raw_pause.get("pause_id"),
-        store=store,
-        run_id=run_id,
+        None,
+        None,
+        streaming=True,
     )
-    run_record = await store.get_run(run_id)
-    reads = _PauseReads(run_record)
-    pause_state = await _load_pause_state(store, run_id, raw_pause, agent, provider, reads=reads)
-    from dendrux.runtime._reclaim import needs_resolution
-
-    recovering = await needs_resolution(store, run_id, pause_state, checkpoint=reads.checkpoint)
-
-    # 2b. Verify agent identity
-    if pause_state.agent_name and pause_state.agent_name != agent.name:
-        raise ValueError(
-            f"Agent name mismatch: run '{run_id}' was paused by "
-            f"'{pause_state.agent_name}', but resume called with "
-            f"'{agent.name}'."
-        )
 
     if stream_results is not None:
         validate_result_names(run_id, pause_state, stream_results, json_payload=False)
@@ -6280,37 +6414,6 @@ async def _stream_resume_state(
             )
 
     return run_record, reads, raw_pause, pause_state, recovering, stream_results
-
-
-async def _stream_approval_batch(
-    agent: Agent,
-    store: StateStore,
-    run_id: str,
-    ctx: _ResumeContext,
-    expected: str,
-    results: list[ToolResult] | None,
-    user_input: str | None,
-    image_runtime: ImageRuntime | None,
-) -> tuple[_ApprovalResume | None, bool]:
-    approving = (
-        results is None and user_input is None and expected == RunStatus.WAITING_APPROVAL.value
-    )
-    paused_batch = expected == RunStatus.PAUSED.value and bool(ctx.pause_state.pending_tool_calls)
-    if not (approving or paused_batch):
-        return None, approving
-    approval = await _execute_approved_tools(
-        agent,
-        ctx.pause_state,
-        ctx.recorder,
-        ctx.notifier,
-        run_id,
-        history=ctx.history,
-        resolved_loop=ctx.resolved_loop,
-        decisions=None if approving else _pending_decision_map(ctx.pause_state),
-        state_store=store,
-        image_runtime=image_runtime,
-    )
-    return approval, approving
 
 
 def _stopped_stream_event(result: RunResult) -> RunEvent:
@@ -6337,8 +6440,16 @@ async def _stream_approval_events(
 ) -> AsyncGenerator[RunEvent, None]:
     from dendrux.types import RunEvent
 
-    approval, approving = await _stream_approval_batch(
-        agent, store, run_id, ctx, expected, results, user_input, image_runtime
+    approval, approving = await _resume_approval_batch(
+        agent,
+        store,
+        run_id,
+        ctx,
+        expected,
+        results,
+        user_input,
+        image_runtime,
+        streaming=True,
     )
     if approval is not None:
         for tc, tr in approval.results:
@@ -6349,20 +6460,10 @@ async def _stream_approval_events(
                 iteration=ctx.pause_state.iteration,
                 phase="commentary",
             )
-        if approving:
-            await _record_approval_decided(
-                ctx.recorder, ctx.notifier, run_id, ctx.pause_state.iteration, approval.decided
-            )
-        stop = _approval_stop_result(run_id, ctx.pause_state, ctx.history, approval)
-        if stop is not None:
-            _attach_mcp_meta(stop, meta)
-            yield _stopped_stream_event(await _finish_resumed_result(store, run_id, ctx, stop))
-            return
-    if results is not None and expected == RunStatus.WAITING_APPROVAL.value:
-        data = _rejection_decided_payload(run_id, ctx.pause_state, results)
-        await _record_approval_decided(
-            ctx.recorder, ctx.notifier, run_id, ctx.pause_state.iteration, data
-        )
+    stop = await _finish_approval_batch(run_id, ctx, expected, results, approval, approving)
+    if stop is not None:
+        _attach_mcp_meta(stop, meta)
+        yield _stopped_stream_event(await _finish_resumed_result(store, run_id, ctx, stop))
 
 
 async def _stream_resume_failure(
@@ -6387,6 +6488,49 @@ async def _stream_resume_failure(
             run_id,
             exc_info=safe_exception_info(),
         )
+
+
+async def _finish_resume_stream_cleanup(
+    store: StateStore | None,
+    run_id: str,
+    _shared: dict[str, Any],
+    mcp_meta: dict[str, Any],
+    cancel_won: bool,
+    persisted_row: RunRecord | None | _OmittedType,
+) -> RunResult:
+    from dendrux.types import RunResult
+
+    cleanup_recorder = _shared.get("recorder")
+    terminal_status = RunStatus.CANCELLED
+    cancel_persisted = cancel_won
+    if store is not None and not cancel_won:
+        try:
+            run_record = (
+                await store.get_run(run_id)
+                if isinstance(persisted_row, _OmittedType)
+                else persisted_row
+            )
+            if run_record is not None:
+                terminal_status = RunStatus(run_record.status)
+                cancel_persisted = terminal_status == RunStatus.CANCELLED
+        except Exception:
+            pass  # CANCELLED is a safe fallback
+    cancelled_result = RunResult(
+        run_id=run_id,
+        status=terminal_status,
+        meta={**deepcopy(mcp_meta), CANCEL_PERSISTED_META_KEY: cancel_persisted},
+    )
+    try:
+        await record_run_finished(cleanup_recorder, run_id, cancelled_result)
+        await notify_run_finished(_shared.get("notifier"), run_id, cancelled_result)
+    except Exception:
+        logger.warning(
+            "Lifecycle finish hooks failed during resume stream cleanup for run %s",
+            run_id,
+            exc_info=safe_exception_info(),
+        )
+
+    return cancelled_result
 
 
 def resume_stream(
@@ -6567,20 +6711,8 @@ def resume_stream(
                     tenant_id=run_record.tenant_id if run_record else None,
                 )
                 if stop is not None:
-                    stopped = await _persist_loop_outcome(
-                        recorder=ctx.recorder,
-                        provider_kwargs=ctx.pause_state.provider_kwargs,
-                        state_store=store,
-                        run_id=run_id,
-                        result=stop,
-                    )
-                    await record_run_finished(ctx.recorder, run_id, stopped)
-                    await notify_run_finished(ctx.notifier, run_id, stopped)
-                    yield RunEvent(
-                        type=RunEventType.RUN_CANCELLED
-                        if stopped.status == RunStatus.CANCELLED
-                        else RunEventType.RUN_PAUSED,
-                        run_result=stopped,
+                    yield _stopped_stream_event(
+                        await _finish_resumed_result(store, run_id, ctx, stop)
                     )
                     return
 
@@ -6606,26 +6738,10 @@ def resume_stream(
             # 9. Stream the loop (see run_stream for interrupt + closing notes)
             interrupt = agent._task_manager.register_interrupt(run_id)
             loop_stream = ctx.resolved_loop.run_stream(
-                agent=agent,
-                provider=provider,
-                strategy=ctx.resolved_strategy,
-                user_input="",
-                run_id=run_id,
-                recorder=ctx.recorder,
-                notifier=ctx.notifier,
-                initial_history=ctx.history,
-                initial_steps=ctx.pause_state.steps,
-                iteration_offset=ctx.pause_state.iteration,
-                initial_usage=ctx.pause_state.usage,
-                provider_kwargs=ctx.pause_state.provider_kwargs or None,
-                state_store=store,
-                interrupt=interrupt,
-                **_budget_carry_kwargs(ctx.resolved_loop.run_stream, ctx.pause_state),
-                **_image_loop_kwargs(
-                    ctx.resolved_loop.run_stream,
-                    image_runtime,
-                    _resume_image_view(ctx.pause_state, ctx.history),
+                **_resumed_loop_kwargs(
+                    agent, provider, store, run_id, ctx, image_runtime, ctx.resolved_loop.run_stream
                 ),
+                interrupt=interrupt,
             )
             async with aclosing(
                 _stream_loop_events(
@@ -6717,37 +6833,9 @@ def resume_stream(
                 )
 
         if "notifier" in _shared:
-            cleanup_recorder = _shared.get("recorder")
-            terminal_status = RunStatus.CANCELLED
-            cancel_persisted = cancel_won
-            if store is not None and not cancel_won:
-                try:
-                    run_record = (
-                        await store.get_run(run_id)
-                        if isinstance(persisted_row, _OmittedType)
-                        else persisted_row
-                    )
-                    if run_record is not None:
-                        terminal_status = RunStatus(run_record.status)
-                        cancel_persisted = terminal_status == RunStatus.CANCELLED
-                except Exception:
-                    pass  # CANCELLED is a safe fallback
-            cancelled_result = RunResult(
-                run_id=run_id,
-                status=terminal_status,
-                meta={**deepcopy(mcp_meta), CANCEL_PERSISTED_META_KEY: cancel_persisted},
+            return await _finish_resume_stream_cleanup(
+                store, run_id, _shared, mcp_meta, cancel_won, persisted_row
             )
-            try:
-                await record_run_finished(cleanup_recorder, run_id, cancelled_result)
-                await notify_run_finished(_shared.get("notifier"), run_id, cancelled_result)
-            except Exception:
-                logger.warning(
-                    "Lifecycle finish hooks failed during resume stream cleanup for run %s",
-                    run_id,
-                    exc_info=safe_exception_info(),
-                )
-
-            return cancelled_result
         return None
 
     return _RunStream(
