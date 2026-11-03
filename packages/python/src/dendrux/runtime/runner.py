@@ -30,6 +30,8 @@ from typing import TYPE_CHECKING, Any, NamedTuple, get_args, overload
 from dendrux import _codes
 from dendrux._lifecycle import (
     CANCEL_FINALIZE_STATUS_VALUES,
+    RESUME_INPUT_STATUS_VALUES,
+    RESUME_RESULTS_STATUS_VALUES,
     STORAGE_FORMAT_CHECKPOINTED,
     TERMINAL_STATUSES,
     CancelReason,
@@ -5291,9 +5293,7 @@ async def _ingest_resume_images(
     if record is None:
         raise RunNotFoundError(run_id)
     allowed = (
-        (RunStatus.WAITING_CLIENT_TOOL.value, RunStatus.WAITING_APPROVAL.value)
-        if tool_results is not None
-        else (RunStatus.WAITING_HUMAN_INPUT.value,)
+        RESUME_RESULTS_STATUS_VALUES if tool_results is not None else RESUME_INPUT_STATUS_VALUES
     )
     if record.status not in allowed:
         await _raise_resume_claim_failure(state_store, run_id, allowed[0])
