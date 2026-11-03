@@ -959,8 +959,15 @@ async def _apply_static_deny(
             continue
         result, data = static_denial(tc.name, tc.id)
         await batch.governance(GovernanceEventType.POLICY_DENIED.value, data, tc.id)
-        await batch.append_message(tc, result)
+        await _append_denial_message(tc, result, batch)
     return kept
+
+
+async def _append_denial_message(tc: ToolCall, result: ToolResult, batch: _ToolBatch) -> None:
+    msg = _format_result(batch.strategy, result)
+    msg.meta[NOT_EXECUTED_META_KEY] = True
+    batch.history.append(msg)
+    await batch._commit(tc, result, msg)
 
 
 async def _reject_unknown(
@@ -1437,7 +1444,7 @@ async def _hook_deny(
         error=reason,
     )
     # Like static deny: not an execution, no tool_calls row.
-    await batch.append_message(tc, result)
+    await _append_denial_message(tc, result, batch)
 
 
 async def _hook_error(

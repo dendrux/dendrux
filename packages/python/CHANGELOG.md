@@ -200,6 +200,8 @@
 
 ### Fixed
 
+- Denied tool calls no longer consume a tool’s per-run call limit after resuming.
+
 - Streaming recovery marks dispatched work before side effects and finalizes subsequent failures.
 - Approved tools use the resumed strategy and retain notifier warnings in the run result.
 - Recovered approval denials use the same structured tool result as live and approved calls.

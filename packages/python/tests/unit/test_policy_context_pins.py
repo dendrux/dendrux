@@ -131,8 +131,8 @@ async def test_static_denial_exact_result_event_and_execution_flag():
     assert live.all_results == approved.results == recovered.all_results == [(tc, expected)]
     assert history[-1].content == state.history[-1].content == recovered_history[-1].content
     assert history[-1].content == expected.payload
-    assert NOT_EXECUTED_META_KEY not in history[-1].meta
-    assert NOT_EXECUTED_META_KEY not in recovered_history[-1].meta
+    assert history[-1].meta[NOT_EXECUTED_META_KEY] is True
+    assert recovered_history[-1].meta[NOT_EXECUTED_META_KEY] is True
     assert state.history[-1].meta[NOT_EXECUTED_META_KEY] is True
     assert recorder.on_governance_event.await_count == 3
     for event in recorder.on_governance_event.call_args_list:
