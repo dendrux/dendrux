@@ -39,8 +39,9 @@ rules:
 
   - id: hardcoded-terminal-status-set
     message: >-
-      Two or more run statuses written out in a literal. Use the shared sets in
-      dendrux._lifecycle so a new status cannot be missed in one copy.
+      Two or more run statuses written out in a literal (a string, RunStatus.X or
+      RunStatus.X.value). Use the shared sets in dendrux._lifecycle so a new status cannot be
+      missed in one copy.
     severity: ERROR
     languages: [python]
     metadata:
@@ -53,10 +54,10 @@ rules:
           - pattern: "($A, $B, ...)"
       - metavariable-regex:
           metavariable: $A
-          regex: ^(["'](pending|running|waiting_client_tool|waiting_human_input|waiting_approval|paused|success|error|cancelled|max_iterations)["']|([A-Za-z_.]*\.)?RunStatus\.[A-Z_]+)$
+          regex: ^(["'](pending|running|waiting_client_tool|waiting_human_input|waiting_approval|paused|success|error|cancelled|max_iterations)["']|([A-Za-z_.]*\.)?RunStatus\.[A-Z_]+(\.value)?)$
       - metavariable-regex:
           metavariable: $B
-          regex: ^(["'](pending|running|waiting_client_tool|waiting_human_input|waiting_approval|paused|success|error|cancelled|max_iterations)["']|([A-Za-z_.]*\.)?RunStatus\.[A-Z_]+)$
+          regex: ^(["'](pending|running|waiting_client_tool|waiting_human_input|waiting_approval|paused|success|error|cancelled|max_iterations)["']|([A-Za-z_.]*\.)?RunStatus\.[A-Z_]+(\.value)?)$
 
   - id: str-exc-in-log
     message: >-
@@ -124,3 +125,290 @@ rules:
       - metavariable-regex:
           metavariable: $N
           regex: ^[0-9][0-9_]*(\.[0-9_]+)?$
+
+  # --- shared vocabulary (H1d): each value lives in one module; a copy is a rule match. Path
+  # scope (metadata.include / exclude) and allow_in (module:function) are applied by
+  # tools/semgrep_ratchet.py, so the fixture can exercise every shape from one file. ---
+
+  - id: stored-event-name-literal
+    message: >-
+      A stored event name written as a string. Use StoredEventType from dendrux._lifecycle so
+      a rename cannot miss one copy. Migrations keep their historical literals.
+    severity: ERROR
+    languages: [python]
+    metadata:
+      exclude: ["_lifecycle.py", "db/migrations/"]
+    patterns:
+      - pattern: '"$S"'
+      - metavariable-regex:
+          metavariable: $S
+          regex: ^(run\.(started|paused|resumed|resume_aborted|completed|error|cancelled|interrupted|abandoned|reclaimed|lease_expired)|tool\.(started|completed|replayed)|tools\.declared|llm\.(completed|failed))$
+
+  - id: lifecycle-reason-literal
+    message: >-
+      A failure, cancel, pause, approval or denial reason written as a string. Use the enums in
+      dendrux._lifecycle (FailureReason, CancelReason, PauseReason, ApprovalReason,
+      DenialReason). The generic words "requested" and "budget" are only matched where the
+      name or key says reason.
+    severity: ERROR
+    languages: [python]
+    metadata:
+      exclude: ["_lifecycle.py", "_codes.py", "db/migrations/"]
+    pattern-either:
+      # distinctive values: matched as a keyword value, dict value, comparison or assignment
+      - patterns:
+          - pattern-either:
+              - pattern: $F(..., $N="$S", ...)
+              - pattern: '{..., $N: "$S", ...}'
+              - pattern: $N == "$S"
+              - pattern: $N != "$S"
+              - pattern: $N in (..., "$S", ...)
+              - pattern: $N in [..., "$S", ...]
+              - pattern: '$N in {..., "$S", ...}'
+              - pattern: $N = "$S"
+              # a reason chosen by a conditional expression
+              - pattern: $F(..., $N="$S" if $C else $D, ...)
+              - pattern: $F(..., $N=$D if $C else "$S", ...)
+              - pattern: '{..., $N: "$S" if $C else $D, ...}'
+              - pattern: '{..., $N: $D if $C else "$S", ...}'
+              - pattern: $N = "$S" if $C else $D
+              - pattern: $N = $D if $C else "$S"
+          - metavariable-regex:
+              metavariable: $S
+              regex: ^(stale_running|never_started|abandoned_waiting|stale_running_legacy|reclaim_limit|guardrail_blocked|pending_limit|budget_exceeded|lease_lost|history_too_large|recovery_call_missing|recovery_state_missing|recovery_state_invalid|cancel_requested|task_cancelled|stream_closed|requires_approval|replay_after_crash|denied_by_policy|User declined to run this tool\.|policy hook error|approval is not supported for client tools)$
+      # generic words: only where the keyword, key, variable or subscript names a reason
+      - patterns:
+          - pattern-either:
+              - pattern: $F(..., $N="$S", ...)
+              - pattern: '{..., $N: "$S", ...}'
+              - pattern: $N == "$S"
+              - pattern: $N != "$S"
+              - pattern: $N in (..., "$S", ...)
+              - pattern: $N in [..., "$S", ...]
+              - pattern: '$N in {..., "$S", ...}'
+              - pattern: $N = "$S"
+              # a reason chosen by a conditional expression
+              - pattern: $F(..., $N="$S" if $C else $D, ...)
+              - pattern: $F(..., $N=$D if $C else "$S", ...)
+              - pattern: '{..., $N: "$S" if $C else $D, ...}'
+              - pattern: '{..., $N: $D if $C else "$S", ...}'
+              - pattern: $N = "$S" if $C else $D
+              - pattern: $N = $D if $C else "$S"
+          - metavariable-regex:
+              metavariable: $S
+              regex: ^(requested|budget)$
+          - metavariable-regex:
+              metavariable: $N
+              regex: (?i).*reason.*
+
+  - id: storage-format-literal
+    message: >-
+      The checkpointed storage format is STORAGE_FORMAT_CHECKPOINTED in dendrux._lifecycle.
+      Compare against that name, not the number 2. (The legacy format 1 is not matched.)
+    severity: ERROR
+    languages: [python]
+    metadata:
+      exclude: ["_lifecycle.py", "db/migrations/"]
+    patterns:
+      - pattern-either:
+          - pattern: $N == 2
+          - pattern: $N != 2
+          - pattern: $N >= 2
+          - pattern: $N > 2
+          - pattern: $N <= 2
+          - pattern: $N < 2
+          - pattern: 2 == $N
+          - pattern: 2 != $N
+          - pattern: $N in (..., 2, ...)
+          - pattern: $N in [..., 2, ...]
+          - pattern: '$N in {..., 2, ...}'
+          - pattern: $N = 2
+          - pattern: '$N: $T = 2'
+          - pattern: '{..., $N: 2, ...}'
+          - pattern: $F(..., $N=2, ...)
+      - metavariable-regex:
+          metavariable: $N
+          regex: (?i).*storage_format.*
+
+  - id: meta-key-literal
+    message: >-
+      A metadata or session key written as a string. Import the constant from
+      dendrux._meta_keys. Only key uses are matched (dict key, subscript, get/pop/setdefault
+      argument, `in` test, or a constant assignment); module names, logger names and
+      docstrings are not keys.
+    severity: ERROR
+    languages: [python]
+    metadata:
+      exclude: ["_meta_keys.py", "notifiers/otel.py"]
+    patterns:
+      - pattern-either:
+          - pattern: '{..., "$S": $V, ...}'
+          - pattern: $X["$S"]
+          - pattern: $X.get("$S", ...)
+          - pattern: $X.pop("$S", ...)
+          - pattern: $X.setdefault("$S", ...)
+          - pattern: '"$S" in $X'
+          - pattern: '"$S" not in $X'
+          - pattern: $N = "$S"
+      - pattern-not-inside: $X.__module__ = "$S"
+      - metavariable-regex:
+          metavariable: $S
+          regex: ^dendrux\.(error_info|stop_reason|pause_request|governance|parts|images|image_notes|prefix|replay|images\.seeded_slots|skills|replayed|response_bound|streaming_response|response_error|loop|max_delegation_depth|output_type|retry_of|cancel_persisted|not_executed|seed_prefix|skills\.context|step|message|observation|latest_rewrite|internal|store|touched_runs|commit_proofs|fresh_evidence|event_hook)$
+
+  - id: default-sqlite-url-literal
+    message: >-
+      The default local SQLite database is named once, in dendrux.db.session
+      (DEFAULT_SQLITE_URL and its resolver). Take the URL from there.
+    severity: ERROR
+    languages: [python]
+    metadata:
+      exclude: ["db/session.py", "_codes.py"]
+    patterns:
+      - pattern: '"$S"'
+      - metavariable-regex:
+          metavariable: $S
+          regex: (?s).*\./dendrux\.db.*
+
+  - id: connection-loss-code-copy
+    message: >-
+      The connection-loss SQLSTATE test (class 08 and 57P01 to 57P03) lives in
+      _is_connection_loss_code. Call it instead of copying the codes. 53300 is a different
+      policy and is not matched.
+    severity: ERROR
+    languages: [python]
+    metadata:
+      exclude: ["_codes.py"]
+      allow_in: ["dendrux.runtime.stores._errors:_is_connection_loss_code"]
+    pattern-either:
+      - pattern: $X.startswith("08")
+      - pattern: $X.startswith((..., "08", ...))
+      - pattern: $X[:2] == "08"
+      - pattern: $X[0:2] == "08"
+      - pattern: '"08" == $X[:2]'
+      - pattern: '"08" == $X[0:2]'
+      - pattern: $X[:2] in (..., "08", ...)
+      - pattern: $X[0:2] in (..., "08", ...)
+      - patterns:
+          - pattern: '"$S"'
+          - metavariable-regex:
+              metavariable: $S
+              regex: ^57P0[123]$
+
+  - id: new-run-fingerprint-outside-helper
+    message: >-
+      A new run's idempotency fingerprint and output-type name come from _new_run_metadata, so
+      the first write and every retry agree. Call it instead of recomputing them.
+    severity: ERROR
+    languages: [python]
+    metadata:
+      include: ["runtime/", "agent.py", "loops/"]
+      allow_in:
+        - "dendrux.runtime.runner:_new_run_metadata"
+        # A real copy (image-error idempotent hit); the H5/H6 runner work removes it.
+        - "dendrux.runtime.runner:_idempotent_hit_after_image_error"
+    pattern-either:
+      - pattern: compute_idempotency_fingerprint(...)
+      - pattern: f"{$A.__module__}.{$B.__qualname__}"
+
+  - id: run-started-outside-startup
+    message: >-
+      run.started is written once, by _start_new_run. Resume paths use their own events.
+    severity: ERROR
+    languages: [python]
+    metadata:
+      exclude: ["runtime/stores/", "runtime/state.py", "testing/", "db/"]
+      allow_in: ["dendrux.runtime.runner:_start_new_run"]
+    pattern-either:
+      - patterns:
+          - pattern-either:
+              - pattern: $F(..., $E, ...)
+              - pattern: $F(..., $K=$E, ...)
+          - metavariable-regex:
+              metavariable: $F
+              regex: ^(.*\.)?(_?emit_event(_safe)?|save_run_event|finalize_with_event|_transition_with_event|EventWrite)$
+          - metavariable-regex:
+              metavariable: $E
+              regex: ^([A-Za-z_.]*\.)?StoredEventType\.RUN_STARTED(\.value)?$
+      # the writer bound to a local name first (as _persist_run_failure does), then called
+      - patterns:
+          - pattern-inside: |
+              $EMIT = $RHS
+              ...
+          - pattern-either:
+              - pattern: $EMIT(..., $E, ...)
+              - pattern: $EMIT(..., $K=$E, ...)
+          - metavariable-regex:
+              metavariable: $RHS
+              regex: .*(emit_event|save_run_event).*
+          - metavariable-regex:
+              metavariable: $E
+              regex: ^([A-Za-z_.]*\.)?StoredEventType\.RUN_STARTED(\.value)?$
+
+  - id: error-finalize-outside-helper
+    message: >-
+      A run is failed through _persist_run_failure, which finalizes the row and writes
+      run.error under one rule. Do not finalize with the error status or write run.error
+      by hand. (Kept exceptions are listed in allow_in.)
+    severity: ERROR
+    languages: [python]
+    metadata:
+      exclude: ["runtime/stores/", "runtime/state.py", "testing/", "db/"]
+      allow_in:
+        - "dendrux.runtime.runner:_persist_run_failure"
+        - "dendrux.runtime._reclaim:_handle_rebuild_failure"
+    pattern-either:
+      - patterns:
+          - pattern: $F(..., status=$V, ...)
+          - metavariable-regex:
+              metavariable: $F
+              regex: ^(.*\.)?(finalize_run|finalize_with_event|finalize_run_if_status_in|_transition_with_event)$
+          - metavariable-regex:
+              metavariable: $V
+              regex: ^(["']error["']|([A-Za-z_.]*\.)?RunStatus\.ERROR(\.value)?)$
+      - patterns:
+          - pattern-either:
+              - pattern: $F(..., $E, ...)
+              - pattern: $F(..., $K=$E, ...)
+          - metavariable-regex:
+              metavariable: $F
+              regex: ^(.*\.)?(_?emit_event(_safe)?|save_run_event|finalize_with_event|_transition_with_event|EventWrite)$
+          - metavariable-regex:
+              metavariable: $E
+              regex: ^([A-Za-z_.]*\.)?StoredEventType\.RUN_ERROR(\.value)?$
+      # the writer bound to a local name first (as _persist_run_failure does), then called
+      - patterns:
+          - pattern-inside: |
+              $EMIT = $RHS
+              ...
+          - pattern-either:
+              - pattern: $EMIT(..., $E, ...)
+              - pattern: $EMIT(..., $K=$E, ...)
+          - metavariable-regex:
+              metavariable: $RHS
+              regex: .*(emit_event|save_run_event).*
+          - metavariable-regex:
+              metavariable: $E
+              regex: ^([A-Za-z_.]*\.)?StoredEventType\.RUN_ERROR(\.value)?$
+
+  - id: cancel-finalize-outside-helper
+    message: >-
+      A run is cancelled through _persist_run_cancellation. Do not finalize with the cancelled
+      status by hand. (The loop cancel, the pause with a cancel request and the public cancel
+      go through _transition_with_event and are listed in allow_in.)
+    severity: ERROR
+    languages: [python]
+    metadata:
+      exclude: ["runtime/stores/", "runtime/state.py", "testing/", "db/"]
+      allow_in:
+        - "dendrux.runtime.runner:_persist_run_cancellation"
+        - "dendrux.runtime.runner:_finalize_loop_cancelled"
+        - "dendrux.runtime.runner:_pause_with_event"
+        - "dendrux.agent:Agent._cancel_one"
+    patterns:
+      - pattern: $F(..., status=$V, ...)
+      - metavariable-regex:
+          metavariable: $F
+          regex: ^(.*\.)?(finalize_run|finalize_with_event|finalize_run_if_status_in|_transition_with_event)$
+      - metavariable-regex:
+          metavariable: $V
+          regex: ^(["']cancelled["']|([A-Za-z_.]*\.)?RunStatus\.CANCELLED(\.value)?)$
