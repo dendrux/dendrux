@@ -343,8 +343,7 @@ RESPONSES_SCENARIOS = (
         TEXT_TURN,
         call={"cache_key_prefix": "agent:gpt-5-mini"},
     ),
-    # B9 drift, pinned as today: Responses has no endpoint gate, so a custom
-    # OPENAI_BASE_URL still receives prompt_cache_key / prompt_cache_retention.
+    # OpenAI cache routing fields must stay off compatible endpoints.
     Scenario(
         "cache_custom_base_url_env",
         lambda: _responses(prompt_cache_retention="24h"),
@@ -535,8 +534,21 @@ def test_snapshots_cover_the_brief() -> None:
     assert chat["structured__batch"]["sdk_calls"][0]["response_format"]["type"] == "json_schema"
     fmt = responses["structured__batch"]["sdk_calls"][0]["text"]["format"]
     assert fmt["name"] == "City" and fmt["strict"] is True
-    # Chat gates the cache key on the official endpoint; Responses does not (B9).
+    # Both adapters keep OpenAI cache routing fields off compatible endpoints.
     assert "prompt_cache_key" not in chat["cache_custom_base_url__batch"]["sdk_calls"][0]
     custom = responses["cache_custom_base_url_env__batch"]["sdk_calls"][0]
-    assert custom["prompt_cache_key"] == "dendrux:agent:gpt-5-mini"
-    assert custom["prompt_cache_retention"] == "24h"
+    assert "prompt_cache_key" not in custom
+    assert "prompt_cache_retention" not in custom
+
+
+@pytest.mark.parametrize("mode", ["batch", "stream"])
+async def test_responses_custom_endpoint_omits_cache_routing(
+    mode: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario = next(s for s in RESPONSES_SCENARIOS if s.name == "cache_custom_base_url_env")
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://localhost:8000/v1")
+    cell = await run_cell("openai_responses", scenario, mode)
+    for payload in [*cell["sdk_calls"], cell["response"]["provider_request"]]:
+        assert "prompt_cache_key" not in payload
+        assert "prompt_cache_retention" not in payload

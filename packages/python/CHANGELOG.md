@@ -198,6 +198,14 @@
   guides; expand scaling, observability and tracing guidance. See `docs/upgrading-to-0.6.0.mdx`
   for the rollout.
 
+### Fixed
+
+- Provider retry telemetry warnings omit SQL statements and parameters from database failures.
+- OpenAI Chat, Responses and OpenRouter streaming image failures release request holders from tracebacks.
+- Anthropic image-bearing streaming failures drop the SDK stream from traceback locals.
+- OpenRouter tool-call warnings identify the adapter and the model selected for each call.
+- OpenAI Responses no longer sends prompt cache keys or retention to non-OpenAI endpoints.
+
 ## 0.5.0 - 2026-10-28
 
 "Trust". Pending and live reads require a tenant scope and hide payloads by default; provider

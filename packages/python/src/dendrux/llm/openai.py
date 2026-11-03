@@ -39,8 +39,8 @@ from dendrux.llm._openai_family import (
     OpenAIFamilyProvider,
     PendingImages,
     WireBlocks,
-    apply_cache_routing,
     apply_call_defaults,
+    apply_openai_cache_routing,
     extra_field,
     forward_kwargs,
     inject_structured_output,
@@ -456,13 +456,13 @@ class OpenAIProvider(OpenAIFamilyProvider):
 
         # Cache routing. Skip on non-OpenAI base_urls (Groq/Together/vLLM/etc.)
         # since some compatible backends reject unknown OpenAI-specific fields.
-        if is_openai_endpoint:
-            apply_cache_routing(
-                api_kwargs,
-                own_prefix=self._cache_key_prefix,
-                call_prefix=cache_key_prefix,
-                retention=self._prompt_cache_retention,
-            )
+        apply_openai_cache_routing(
+            api_kwargs,
+            base_url=str(self._client.base_url),
+            own_prefix=self._cache_key_prefix,
+            call_prefix=cache_key_prefix,
+            retention=self._prompt_cache_retention,
+        )
 
         # Vendor extensions of the request body (e.g. OpenRouter's `provider`
         # routing block). Per-call extra_body shallow-merges over the
@@ -602,6 +602,7 @@ class OpenAIProvider(OpenAIFamilyProvider):
 
         failure: Exception | None = None
         stream: Any = None
+        chunk_iter: Any = None
         done_seen: list[bool] | None = None
         try:
             async with opened_stream(
@@ -711,7 +712,9 @@ class OpenAIProvider(OpenAIFamilyProvider):
                         semantic = True
                         finish_reason = choice.finish_reason
                         clock.check_tool_count(len(tool_calls) + len(_tool_buffers))
-                        for flush_event in self._drain_tool_buffers(_tool_buffers, tool_calls):
+                        for flush_event in self._drain_tool_buffers(
+                            _tool_buffers, tool_calls, model=model
+                        ):
                             yield flush_event
 
                     if semantic:
@@ -721,9 +724,8 @@ class OpenAIProvider(OpenAIFamilyProvider):
         except Exception as exc:
             failure = raise_or_defer(self, exc, request.registry, model, streaming=True)
         if failure is not None:
-            # Raised outside any handler, so it chains nothing that holds the
-            # request body; the SDK stream (its response holds the body) is dropped.
-            del stream
+            # Drop every request and SDK-stream alias before retaining this frame.
+            del request, stream, chunk_iter
             raise failure
 
         if finish_reason is None and not saw_usage and not (done_seen and done_seen[0]):
@@ -738,7 +740,7 @@ class OpenAIProvider(OpenAIFamilyProvider):
         # Some compatible backends end the stream ([DONE]) without ever sending
         # a finish_reason; flush whatever is still buffered so calls are not
         # lost. No-op when the finish_reason chunk drained the buffers.
-        for flush_event in self._drain_tool_buffers(_tool_buffers, tool_calls):
+        for flush_event in self._drain_tool_buffers(_tool_buffers, tool_calls, model=model):
             yield flush_event
 
         # Assemble the final LLMResponse
@@ -771,6 +773,8 @@ class OpenAIProvider(OpenAIFamilyProvider):
         self,
         buffers: dict[int, _ToolCallBuffer],
         tool_calls: list[ToolCall],
+        *,
+        model: str,
     ) -> list[StreamEvent]:
         """Turn buffered tool-call fragments into START/END events and clear them.
 
@@ -796,8 +800,8 @@ class OpenAIProvider(OpenAIFamilyProvider):
             if buf.name is None:
                 logger.warning(
                     "Tool call completed with no name — provider=%s model=%s call_id=%s",
-                    "openai",
-                    self._model,
+                    self._image_provider_name,
+                    model,
                     buf.tool_call_id,
                 )
 
@@ -805,8 +809,8 @@ class OpenAIProvider(OpenAIFamilyProvider):
                 buf.name or "unknown",
                 raw_json,
                 provider_tool_call_id=buf.tool_call_id,
-                provider="openai",
-                model=self._model,
+                provider=self._image_provider_name,
+                model=model,
             )
             tool_calls.append(tc)
             events.append(
@@ -965,8 +969,8 @@ class OpenAIProvider(OpenAIFamilyProvider):
                         tc.function.name,
                         tc.function.arguments or "",
                         provider_tool_call_id=tc.id,
-                        provider="openai",
-                        model=self._model,
+                        provider=self._image_provider_name,
+                        model=model,
                     )
                 )
 

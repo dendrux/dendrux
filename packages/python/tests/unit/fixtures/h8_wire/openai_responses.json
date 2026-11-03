@@ -12,9 +12,7 @@
     ],
     "instructions": "You are terse.",
     "max_output_tokens": 16000,
-    "model": "gpt-5-mini",
-    "prompt_cache_key": "dendrux:agent:gpt-5-mini",
-    "prompt_cache_retention": "24h"
+    "model": "gpt-5-mini"
    },
    "provider_response": {
     "id": "resp_oracle_1",
@@ -60,9 +58,7 @@
     ],
     "instructions": "You are terse.",
     "max_output_tokens": 16000,
-    "model": "gpt-5-mini",
-    "prompt_cache_key": "dendrux:agent:gpt-5-mini",
-    "prompt_cache_retention": "24h"
+    "model": "gpt-5-mini"
    }
   ]
  },
@@ -92,9 +88,7 @@
     ],
     "instructions": "You are terse.",
     "max_output_tokens": 16000,
-    "model": "gpt-5-mini",
-    "prompt_cache_key": "dendrux:agent:gpt-5-mini",
-    "prompt_cache_retention": "24h"
+    "model": "gpt-5-mini"
    },
    "provider_response": {
     "id": "resp_oracle_1",
@@ -141,8 +135,6 @@
     "instructions": "You are terse.",
     "max_output_tokens": 16000,
     "model": "gpt-5-mini",
-    "prompt_cache_key": "dendrux:agent:gpt-5-mini",
-    "prompt_cache_retention": "24h",
     "stream": true
    }
   ]
