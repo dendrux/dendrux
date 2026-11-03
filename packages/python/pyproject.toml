@@ -90,11 +90,11 @@ dev = [
     "griffe==2.4.1",
     "import-linter==2.15",
     # Keep in step with .pre-commit-config.yaml (rev: v0.15.17).
-    "ruff==0.15.17",
-    "mypy==1.20.2",
+    "ruff==0.17.3",
+    "mypy==2.4.1",
     "types-PyYAML==6.0.12.20261030",
     "python-dotenv==1.2.4",
-    "twine==6.2.0",
+    "twine==7.0.0",
     "dendrux[otel]",
     "opentelemetry-sdk==1.45.2",
 ]
