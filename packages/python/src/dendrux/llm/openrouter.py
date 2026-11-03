@@ -37,9 +37,11 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 
-from dendrux.llm._images import ANTHROPIC_MANY_IMAGE_RULE, normalize_base_url
+from dendrux.llm._helpers import normalize_effort
+from dendrux.llm._images import ANTHROPIC_MANY_IMAGE_RULE
+from dendrux.llm._openai_family import usage_extra_field
 from dendrux.llm._resilience import DEFAULT_MAX_RESPONSE_BYTES
-from dendrux.llm.openai import OpenAIProvider, _normalize_effort
+from dendrux.llm.openai import OpenAIProvider
 
 _MODEL_LIST_TIMEOUT_S = 10.0
 
@@ -281,27 +283,6 @@ async def _get_catalog(models_url: str) -> dict[str, OpenRouterModel] | None:
     return _catalog_cache[models_url]
 
 
-def _read_usage_extra(obj: Any, field: str) -> Any:
-    """Read a non-standard usage field OpenRouter adds on the OpenAI wire.
-
-    The OpenAI SDK retains fields its schema does not define (``extra='allow'``),
-    so OpenRouter's ``cost`` / ``cache_write_tokens`` surface via attribute
-    access or ``model_extra``; a raw dict is handled too. Returns ``None`` when
-    the field is absent.
-    """
-    if obj is None:
-        return None
-    if isinstance(obj, dict):
-        return obj.get(field)
-    value = getattr(obj, field, None)
-    if value is not None:
-        return value
-    extra = getattr(obj, "model_extra", None)
-    if isinstance(extra, dict):
-        return extra.get(field)
-    return None
-
-
 class OpenRouterProvider(OpenAIProvider):
     """OpenRouter provider — open-source and premium models via one API.
 
@@ -433,6 +414,7 @@ class OpenRouterProvider(OpenAIProvider):
     # images are never located: an upstream's error path indexes the
     # upstream's wire format, not this request.
     _image_provider_name = "openrouter"
+    _image_capability_family = "openrouter"
     _locate_rejected_images = False
     _deprecation_stacklevel = 4
 
@@ -460,9 +442,6 @@ class OpenRouterProvider(OpenAIProvider):
     def many_image_rule(self, model: str) -> tuple[int, int] | None:
         """Anthropic's many-image rule for ``anthropic/*`` (and ``~anthropic/*``) slugs."""
         return ANTHROPIC_MANY_IMAGE_RULE if _is_anthropic_model(model) else None
-
-    def image_capability_key(self, model: str) -> tuple[str, str, str]:
-        return ("openrouter", normalize_base_url(self._client.base_url), model)
 
     async def list_models(self, *, refresh: bool = False) -> list[OpenRouterModel]:
         """List the OpenRouter model catalog as typed snapshots.
@@ -573,7 +552,7 @@ class OpenRouterProvider(OpenAIProvider):
         if thinking is False:
             return {"enabled": False}
         if effort is not None:
-            return {"effort": _normalize_effort(effort)}
+            return {"effort": normalize_effort(effort)}
         if thinking is True:
             return {"enabled": True}
         return None
@@ -665,12 +644,29 @@ class OpenRouterProvider(OpenAIProvider):
         unchanged; a reported zero (e.g. free models) is preserved.
         """
         base = super()._normalize_usage(usage)
-        cost = _read_usage_extra(usage, "cost")
+        # OpenRouter's ``cost`` rides through the SDK as an extra field (a raw
+        # dict is read too).
+        cost = usage_extra_field(usage, "cost")
         from dendrux.llm._usage import normalize_usage
 
         if cost is None or not base.usage_reported:
             return base
         return normalize_usage(replace(base, cost_usd=cost, cost_source="provider"))
+
+    async def _prepare_call(self, tools: list[ToolDef] | None, kwargs: dict[str, Any]) -> None:
+        """Guards and per-call request shaping shared by ``complete`` and ``complete_stream``.
+
+        Resolves the model (raising without one), runs the native-tools and
+        mandatory-reasoning guards, then merges the reasoning block and the
+        automatic ``cache_control`` into ``kwargs``.
+        """
+        model = self._require_model(kwargs)
+        thinking, reasoning = self._resolve_reasoning(kwargs)
+        if tools:
+            await self._ensure_native_tool_support(model)
+        await self._ensure_reasoning_allowed(model, thinking)
+        self._apply_reasoning(kwargs, reasoning)
+        self._apply_cache_control(kwargs, model)
 
     async def complete(
         self,
@@ -683,13 +679,7 @@ class OpenRouterProvider(OpenAIProvider):
         **kwargs: Any,
     ) -> LLMResponse:
         """Send messages via OpenRouter; guards native tool support when tools are passed."""
-        model = self._require_model(kwargs)
-        thinking, reasoning = self._resolve_reasoning(kwargs)
-        if tools:
-            await self._ensure_native_tool_support(model)
-        await self._ensure_reasoning_allowed(model, thinking)
-        self._apply_reasoning(kwargs, reasoning)
-        self._apply_cache_control(kwargs, model)
+        await self._prepare_call(tools, kwargs)
         return await super().complete(
             messages,
             tools,
@@ -710,13 +700,7 @@ class OpenRouterProvider(OpenAIProvider):
         **kwargs: Any,
     ) -> AsyncGenerator[StreamEvent, None]:
         """Stream via OpenRouter; guards native tool support when tools are passed."""
-        model = self._require_model(kwargs)
-        thinking, reasoning = self._resolve_reasoning(kwargs)
-        if tools:
-            await self._ensure_native_tool_support(model)
-        await self._ensure_reasoning_allowed(model, thinking)
-        self._apply_reasoning(kwargs, reasoning)
-        self._apply_cache_control(kwargs, model)
+        await self._prepare_call(tools, kwargs)
         async with contextlib.aclosing(
             super().complete_stream(
                 messages,

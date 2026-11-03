@@ -30,12 +30,6 @@ layers =
     types : _wire : _lifecycle
     errors | _sentinel | _redact | _meta_keys
     _codes
-ignore_imports =
-    # KNOWN VIOLATION: the retry telemetry helper in the provider layer reports
-    # governance events through the loop helpers, so llm reaches up into loops
-    # (a function-local import, line 164). It should take the notify/record
-    # callables as arguments instead. Remove this line when it does.
-    dendrux.llm._retry_telemetry -> dendrux.loops._helpers
 
 [importlinter:contract:no-persistence-below-the-runtime]
 name = Core layers know nothing about persistence or the runtime
@@ -57,9 +51,6 @@ forbidden_modules =
     dendrux.runtime
     sqlalchemy
     alembic
-ignore_imports =
-    # KNOWN VIOLATION: same import as above; it pulls the runtime in through the loop helpers.
-    dendrux.llm._retry_telemetry -> dendrux.loops._helpers
 
 [importlinter:contract:provider-sdk-in-adapters]
 name = The Anthropic and OpenAI SDKs are imported only by their provider adapters

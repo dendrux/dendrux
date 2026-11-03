@@ -7,9 +7,11 @@ HTTP response — including the ones the SDK is about to retry on —
 without changing any SDK behavior.
 
 The hook is several call frames removed from where dendrux holds the
-loop's recorder/notifier/iteration state. We carry that state through
-the async call tree with ``contextvars``, set by the loop just before
-each ``provider.complete()`` call and reset after.
+loop's iteration state. We carry that state through the async call tree
+with ``contextvars``, set by the loop just before each
+``provider.complete()`` call and reset after. Events leave through two
+sinks the loop hands in (``TelemetrySinks``): this module never imports
+the loops, so the provider layer stays below them.
 
 Failure contract: the hook is observability only. Any exception inside
 is logged and swallowed — an instrumentation bug must never break a
@@ -18,31 +20,47 @@ real LLM call.
 
 from __future__ import annotations
 
+import functools
 import logging
 from collections.abc import AsyncGenerator
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import httpx
 
 from dendrux._lifecycle import GovernanceEventType
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Iterator
+    from collections.abc import Awaitable, Callable, Iterable, Iterator
 
-    from dendrux.loops.base import LoopNotifier, LoopRecorder
     from dendrux.types import StreamEvent
+
+    # ``(event_type, iteration, data)``; the run is bound by whoever built it.
+    GovernanceSink = Callable[[str, int, dict[str, Any]], Awaitable[None]]
 
 _logger = logging.getLogger(__name__)
 
 
+class TelemetrySinks(NamedTuple):
+    """Where the hook reports ``provider.retry``: persistence, then notification.
+
+    Each sink is an async ``(event_type, iteration, data)`` callable bound to
+    one run, or None. The loop builds the pair from its recorder and notifier
+    (``dendrux.loops._helpers.governance_sinks``).
+    """
+
+    record: GovernanceSink | None
+    notify: GovernanceSink | None
+
+
 # State carried into the httpx hook. Set by the loop around every
 # ``provider.complete()`` / ``provider.complete_stream()`` call.
+# The run the binding belongs to (the sinks carry their own run id).
 _run_id: ContextVar[str | None] = ContextVar("dendrux_retry_run_id", default=None)
 _iteration: ContextVar[int] = ContextVar("dendrux_retry_iteration", default=0)
-_recorder: ContextVar[LoopRecorder | None] = ContextVar("dendrux_retry_recorder", default=None)
-_notifier: ContextVar[LoopNotifier | None] = ContextVar("dendrux_retry_notifier", default=None)
+_sinks: ContextVar[TelemetrySinks | None] = ContextVar("dendrux_retry_sinks", default=None)
+_NO_SINKS = TelemetrySinks(None, None)
 
 # Per-call attempt counter — set by the provider at the start of each
 # ``complete()`` call so the hook can label retries 1..N within one
@@ -55,38 +73,35 @@ def telemetry_context(
     *,
     run_id: str | None,
     iteration: int,
-    recorder: LoopRecorder | None,
-    notifier: LoopNotifier | None,
+    sinks: TelemetrySinks | None,
 ) -> Iterator[None]:
     """Bind retry-telemetry context for the duration of a ``with`` block.
 
     Wrap each ``provider.complete()`` / ``provider.complete_stream()``
     call so the httpx hook can attribute retries to the right run +
-    iteration and route events through the loop's recorder/notifier.
+    iteration and route events through the run's sinks (``None``: no
+    events).
 
     Example::
 
         with telemetry_context(
             run_id=run_id,
             iteration=iteration,
-            recorder=recorder,
-            notifier=notifier,
+            sinks=governance_sinks(recorder, notifier, run_id),
         ):
             response = await provider.complete(...)
     """
     tokens = (
         _run_id.set(run_id),
         _iteration.set(iteration),
-        _recorder.set(recorder),
-        _notifier.set(notifier),
+        _sinks.set(sinks),
     )
     try:
         yield
     finally:
         _run_id.reset(tokens[0])
         _iteration.reset(tokens[1])
-        _recorder.reset(tokens[2])
-        _notifier.reset(tokens[3])
+        _sinks.reset(tokens[2])
 
 
 @contextmanager
@@ -119,22 +134,19 @@ def end_call_attempt_tracking(token: Token[list[int] | None]) -> None:
     _attempts.reset(token)
 
 
-async def _on_response(response: httpx.Response) -> None:
+async def _on_response(response: httpx.Response, *, retryable_statuses: frozenset[int]) -> None:
     """httpx response hook — emit ``provider.retry`` on retryable failures.
 
     Fail-open: any exception inside is logged and swallowed so an
     observability bug never breaks an LLM call.
     """
     try:
-        from dendrux.llm._resilience import RETRYABLE_HTTP_STATUSES
-
-        if response.status_code not in RETRYABLE_HTTP_STATUSES:
+        if response.status_code not in retryable_statuses:
             return
 
-        recorder = _recorder.get()
-        notifier = _notifier.get()
-        run_id = _run_id.get() or ""
-        if recorder is None and notifier is None:
+        sinks = _sinks.get()
+        record, notify = sinks if sinks is not None else _NO_SINKS
+        if record is None and notify is None:
             # Hook fired outside dendrux context (e.g. user shares the
             # provider with another framework) — nothing to write.
             return
@@ -159,34 +171,41 @@ async def _on_response(response: httpx.Response) -> None:
             "retry_after": response.headers.get("retry-after"),
         }
 
-        # Fire through the standard governance plumbing. Imports are
-        # local to avoid a circular import at module load.
-        from dendrux.loops._helpers import (
-            notify_governance,
-            record_governance,
-        )
-
-        if recorder is not None:
-            try:
-                await record_governance(
-                    recorder, run_id, GovernanceEventType.PROVIDER_RETRY.value, iteration, data
-                )
-            except Exception:
-                _logger.warning("provider.retry recorder write failed", exc_info=True)
-        if notifier is not None:
-            try:
-                await notify_governance(
-                    notifier, run_id, GovernanceEventType.PROVIDER_RETRY.value, iteration, data
-                )
-            except Exception:
-                _logger.warning("provider.retry notifier broadcast failed", exc_info=True)
+        await _emit(record, notify, iteration, data)
     except Exception:
         _logger.warning("retry telemetry hook raised", exc_info=True)
 
 
-def telemetry_event_hooks() -> dict[str, list[Callable[..., Awaitable[None]]]]:
-    """Fresh httpx hooks for clients that also configure limits or deadlines."""
-    return {"response": [_on_response]}
+async def _emit(
+    record: GovernanceSink | None,
+    notify: GovernanceSink | None,
+    iteration: int,
+    data: dict[str, Any],
+) -> None:
+    """Send one ``provider.retry`` to each sink; a failing sink never stops the other."""
+    event_type = GovernanceEventType.PROVIDER_RETRY.value
+    if record is not None:
+        try:
+            await record(event_type, iteration, data)
+        except Exception:
+            _logger.warning("provider.retry recorder write failed", exc_info=True)
+    if notify is not None:
+        try:
+            await notify(event_type, iteration, data)
+        except Exception:
+            _logger.warning("provider.retry notifier broadcast failed", exc_info=True)
+
+
+def telemetry_event_hooks(
+    retryable_statuses: Iterable[int],
+) -> dict[str, list[Callable[..., Awaitable[None]]]]:
+    """Fresh httpx hooks for clients that also configure limits or deadlines.
+
+    ``retryable_statuses`` are the HTTP statuses the SDK retries; only those
+    emit ``provider.retry`` (the provider layer passes its one shared set).
+    """
+    hook = functools.partial(_on_response, retryable_statuses=frozenset(retryable_statuses))
+    return {"response": [hook]}
 
 
 class TelemetryStream(AsyncGenerator["StreamEvent", None]):
@@ -198,23 +217,17 @@ class TelemetryStream(AsyncGenerator["StreamEvent", None]):
         *,
         run_id: str,
         iteration: int,
-        recorder: LoopRecorder | None,
-        notifier: LoopNotifier | None,
+        sinks: TelemetrySinks | None,
     ):
         self._stream = stream
         self._run_id, self._iteration = run_id, iteration
-        self._recorder, self._notifier = recorder, notifier
+        self._sinks = sinks
         self._closed = False
         with self._binding():
             self._iterator = aiter(stream)
 
     def _binding(self) -> Any:
-        return telemetry_context(
-            run_id=self._run_id,
-            iteration=self._iteration,
-            recorder=self._recorder,
-            notifier=self._notifier,
-        )
+        return telemetry_context(run_id=self._run_id, iteration=self._iteration, sinks=self._sinks)
 
     async def __anext__(self) -> StreamEvent:
         if self._closed:
@@ -246,16 +259,14 @@ def telemetry_stream(
     *,
     run_id: str,
     iteration: int,
-    recorder: LoopRecorder | None,
-    notifier: LoopNotifier | None,
+    sinks: TelemetrySinks | None,
 ) -> TelemetryStream:
-    return TelemetryStream(
-        stream, run_id=run_id, iteration=iteration, recorder=recorder, notifier=notifier
-    )
+    return TelemetryStream(stream, run_id=run_id, iteration=iteration, sinks=sinks)
 
 
 def make_telemetry_http_client(
     timeout: httpx.Timeout,
+    retryable_statuses: Iterable[int],
 ) -> httpx.AsyncClient:
     """Build an ``httpx.AsyncClient`` with the dendrux retry hook attached.
 
@@ -265,11 +276,12 @@ def make_telemetry_http_client(
     """
     return httpx.AsyncClient(
         timeout=timeout,
-        event_hooks=telemetry_event_hooks(),
+        event_hooks=telemetry_event_hooks(retryable_statuses),
     )
 
 
 __all__ = [
+    "TelemetrySinks",
     "begin_call_attempt_tracking",
     "call_attempt_tracking",
     "end_call_attempt_tracking",

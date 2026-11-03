@@ -23,6 +23,7 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
 
 from dendrux.errors import safe_exception_info
+from dendrux.llm._retry_telemetry import TelemetrySinks
 from dendrux.pricing import price_usage
 
 if TYPE_CHECKING:
@@ -700,6 +701,30 @@ async def notify_governance(
         logger.warning("Notifier.on_governance_event failed", exc_info=safe_exception_info())
         if warnings is not None:
             warnings.append(f"on_governance_event failed at iteration {iteration}")
+
+
+def governance_sinks(
+    recorder: LoopRecorder | None, notifier: LoopNotifier | None, run_id: str
+) -> TelemetrySinks | None:
+    """The retry-telemetry sinks of one run: record, then notify (None when neither is set).
+
+    Recording goes through :func:`record_governance` (failures propagate to
+    the caller, which logs them) and notification through
+    :func:`notify_governance` (failures swallowed and logged there).
+    """
+    if recorder is None and notifier is None:
+        return None
+
+    async def record(event_type: str, iteration: int, data: dict[str, Any]) -> None:
+        await record_governance(recorder, run_id, event_type, iteration, data)
+
+    async def notify(event_type: str, iteration: int, data: dict[str, Any]) -> None:
+        await notify_governance(notifier, run_id, event_type, iteration, data)
+
+    return TelemetrySinks(
+        record if recorder is not None else None,
+        notify if notifier is not None else None,
+    )
 
 
 def lease_scope(recorder: LoopRecorder | None) -> AbstractAsyncContextManager[None]:

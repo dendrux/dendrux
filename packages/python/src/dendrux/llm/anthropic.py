@@ -28,6 +28,7 @@ from dendrux.errors import ProviderError
 from dendrux.llm._helpers import (
     build_call_index,
     build_tool_call,
+    normalize_effort,
     replayable_reasoning_blocks,
     resolve_tool_message_call,
 )
@@ -198,10 +199,6 @@ _SUPPORTED_KWARGS = frozenset(
     {"temperature", "top_p", "top_k", "stop_sequences", "model", "max_tokens"}
 )
 
-# Dendrux effort vocabulary → Anthropic. "extra" is the consumer label for
-# "xhigh"; every other value passes through (Anthropic validates it).
-_EFFORT_ALIASES = {"extra": "xhigh"}
-
 # Content block types replayed verbatim on assistant turns, and never given a
 # cache_control marker.
 _THINKING_BLOCK_TYPES = frozenset({"thinking", "redacted_thinking"})
@@ -210,11 +207,6 @@ _THINKING_BLOCK_TYPES = frozenset({"thinking", "redacted_thinking"})
 # account enforcing preserved-thinking prefix binding drops a mismatched block
 # instead of failing the request.
 _THINKING_BINDING_BETA = "thinking-binding-controls-2026-08-01"
-
-
-def _normalize_effort(effort: str) -> str:
-    """Map a Dendrux effort alias to Anthropic's vocabulary."""
-    return _EFFORT_ALIASES.get(effort, effort)
 
 
 def _reasoning_tokens_from_details(details: Any) -> int | None:
@@ -591,7 +583,7 @@ class AnthropicProvider(LLMProvider):
         else:
             api_kwargs["thinking"] = {"type": "adaptive", "display": display}
         if effort is not None:
-            api_kwargs["output_config"] = {"effort": _normalize_effort(effort)}
+            api_kwargs["output_config"] = {"effort": normalize_effort(effort)}
 
     @logs_provider_errors
     async def complete(

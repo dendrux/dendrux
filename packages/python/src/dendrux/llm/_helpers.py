@@ -2,6 +2,7 @@
 
 Internal module — not part of the public API. Contains small, pure functions
 that all three providers (Anthropic, OpenAI, OpenAI Responses) share:
+  - The reasoning effort alias table
   - Tool call JSON parsing (one never-raising parser for batch and stream)
   - Message history helpers (call index, tool message resolution)
   - Reasoning replay selection (which stored blocks go back on the wire)
@@ -23,6 +24,20 @@ if TYPE_CHECKING:
     from dendrux.types import Message
 
 logger = logging.getLogger(__name__)
+
+
+# ------------------------------------------------------------------
+# Reasoning effort vocabulary
+# ------------------------------------------------------------------
+
+# Dendrux effort vocabulary → vendor. "extra" is the consumer label for
+# "xhigh"; every other value passes through (the vendor validates it).
+EFFORT_ALIASES = {"extra": "xhigh"}
+
+
+def normalize_effort(effort: str) -> str:
+    """Map a Dendrux effort alias to the vendor vocabulary (Anthropic, OpenAI)."""
+    return EFFORT_ALIASES.get(effort, effort)
 
 
 # ------------------------------------------------------------------

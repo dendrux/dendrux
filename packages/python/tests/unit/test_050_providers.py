@@ -1262,7 +1262,10 @@ class TestTransport:
         from dendrux.llm import _retry_telemetry
 
         hooks = chat_provider()._client._client.event_hooks
-        assert _retry_telemetry._on_response in hooks["response"]
+        assert any(
+            getattr(hook, "func", hook) is _retry_telemetry._on_response
+            for hook in hooks["response"]
+        )
         assert any(
             getattr(hook, "func", hook) is _resilience._on_request for hook in hooks["request"]
         )

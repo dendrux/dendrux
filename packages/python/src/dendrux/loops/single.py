@@ -30,6 +30,7 @@ from dendrux.loops._helpers import (
     StreamInterruptedError,
     build_cache_key_prefix,
     final_stop_reason,
+    governance_sinks,
     guardrail_meta,
     interruptible,
     lease_scope,
@@ -485,8 +486,7 @@ class SingleCall(Loop):
                 with telemetry_context(
                     run_id=resolved_run_id,
                     iteration=1,
-                    recorder=recorder,
-                    notifier=notifier,
+                    sinks=governance_sinks(recorder, notifier, resolved_run_id),
                 ):
                     async with lease_scope(recorder):
                         if output_type is not None:
@@ -891,8 +891,7 @@ class SingleCall(Loop):
             ),
             run_id=resolved_run_id,
             iteration=1,
-            recorder=recorder,
-            notifier=notifier,
+            sinks=governance_sinks(recorder, notifier, resolved_run_id),
         )
         partial_text: list[str] = []
         interrupted = False
@@ -1020,8 +1019,7 @@ class SingleCall(Loop):
                     ),
                     run_id=resolved_run_id,
                     iteration=1,
-                    recorder=recorder,
-                    notifier=notifier,
+                    sinks=governance_sinks(recorder, notifier, resolved_run_id),
                 )
         finally:
             await active_stream.aclose()
