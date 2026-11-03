@@ -292,7 +292,7 @@ def _recovery_denial(tc: ToolCall, reason: str | None) -> Message:
         ToolResult(
             name=tc.name,
             call_id=tc.id,
-            payload=json.dumps(reason),
+            payload=json.dumps({"denied": reason}),
             success=False,
             error=reason,
         )

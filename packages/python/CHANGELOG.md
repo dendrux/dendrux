@@ -200,6 +200,7 @@
 
 ### Fixed
 
+- Recovered approval denials use the same structured tool result as live and approved calls.
 - Streaming provider errors release image request holders on every failure path.
 
 - Provider retry telemetry warnings omit SQL statements and parameters from database failures.
