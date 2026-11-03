@@ -1,0 +1,5 @@
+[
+  "BEGIN",
+  "UPDATE agent_runs SET updated_at=?, loop_state=?, last_progress_at=CASE WHEN (agent_runs.storage_format = ?) THEN ? ELSE agent_runs.last_progress_at END WHERE agent_runs.id = ? AND agent_runs.claim_epoch = ?",
+  "COMMIT"
+]
