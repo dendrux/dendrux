@@ -25,7 +25,7 @@ import json
 import logging
 import time
 import traceback
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
 from dendrux import _codes
@@ -154,11 +154,12 @@ if TYPE_CHECKING:
     from dendrux.agent import Agent
     from dendrux.llm.base import LLMProvider
     from dendrux.loops.base import LoopNotifier, LoopRecorder
+    from dendrux.media._prepared import PreparedRequest
     from dendrux.media._runtime import ImageRuntime
     from dendrux.runtime.state import StateStore
     from dendrux.skills._session import SkillSession
     from dendrux.strategies.base import Strategy
-    from dendrux.types import BeforeToolHook, ToolResultTransform
+    from dendrux.types import BeforeToolHook, ToolDef, ToolResultTransform
 
 logger = logging.getLogger(__name__)
 
@@ -1614,6 +1615,721 @@ def _mark_call_rejections(
                 message.meta[NOT_EXECUTED_META_KEY] = True
 
 
+@dataclass(slots=True)
+class _RunContext:
+    """Per-run state shared by ``ReActLoop.run`` and ``run_stream`` and their helpers."""
+
+    loop: Loop
+    agent: Agent
+    provider: LLMProvider
+    strategy: Strategy
+    run_id: str
+    recorder: LoopRecorder | None
+    notifier: LoopNotifier | None
+    state_store: StateStore | None
+    interrupt: asyncio.Event | None
+    image_runtime: ImageRuntime | None
+    pkw: dict[str, Any]
+    cache_key_prefix: str | None
+    lookups: ToolLookups
+    tool_defs: list[ToolDef]
+    state: _LoopState
+    images: ImageCallSite
+    budget: BudgetTracker
+    before_tool: BeforeToolHook | None
+    hook_tenant_id: str | None
+    g_engine: GuardrailEngine | None = None
+
+    def meta(self) -> dict[str, Any]:
+        """Terminal result meta: the PII mapping (batch only) and notifier warnings."""
+        return guardrail_meta(self.g_engine, self.state.warnings)
+
+    def pause_view(self) -> ImageViewState | None:
+        return pause_image_view(self.state.image_view, self.state.history)
+
+    async def control_reader(self) -> Any:
+        """Run control for the image-retry checkpoint.
+
+        An in-process cancel (``cancel_run`` in this process) wins, as at the
+        top-of-iteration checkpoint.
+        """
+        if self.interrupt is not None and self.interrupt.is_set():
+            return _LegacyControl(cancel_requested=True)
+        if self.state_store is None:
+            return await no_control()
+        return await _read_control(self.state_store, self.run_id)
+
+
+async def _start_run(
+    loop: Loop,
+    agent: Agent,
+    provider: LLMProvider,
+    strategy: Strategy,
+    user_input: str,
+    *,
+    run_id: str | None,
+    recorder: LoopRecorder | None,
+    notifier: LoopNotifier | None,
+    initial_history: list[Message] | None,
+    initial_steps: list[AgentStep] | None,
+    iteration_offset: int,
+    initial_usage: UsageStats | None,
+    provider_kwargs: dict[str, Any] | None,
+    state_store: StateStore | None,
+    budget_carry: BudgetCarry | None,
+    image_runtime: ImageRuntime | None,
+    image_view_state: ImageViewState | None,
+    interrupt: asyncio.Event | None,
+) -> _RunContext:
+    """Shared setup of ``run`` and ``run_stream``: ids, tools, loop state, images, budget, hook."""
+    resolved_run_id = run_id or generate_ulid()
+    pkw = provider_kwargs or {}
+    cache_key_prefix = build_cache_key_prefix(agent)
+    lookups = await agent.get_tool_lookups(loop=loop)
+    tool_defs = agent.get_all_tool_defs(loop=loop)
+    state = await _init_loop_state(
+        user_input=user_input,
+        recorder=recorder,
+        notifier=notifier,
+        run_id=resolved_run_id,
+        initial_history=initial_history,
+        initial_steps=initial_steps,
+        initial_usage=initial_usage,
+        image_view_state=image_view_state,
+    )
+    images = ImageCallSite(
+        state=state.image_view,
+        policy=_image_policy(agent, image_runtime),
+        runtime=image_runtime,
+        provider=provider,
+        model=str(pkw.get("model") or provider.model),
+        recorder=recorder,
+        notifier=notifier,
+        run_id=resolved_run_id,
+        warnings=state.warnings,
+    )
+    budget = BudgetTracker(
+        agent.budget,
+        run_id=resolved_run_id,
+        usage=state.usage,
+        recorder=recorder,
+        notifier=notifier,
+        warnings=state.warnings,
+        state_store=state_store,
+        carry=budget_carry,
+        fresh=iteration_offset == 0,
+    )
+    before_tool: BeforeToolHook | None = getattr(agent, "before_tool", None)
+    hook_tenant_id = await _hook_tenant_id(before_tool, state_store, resolved_run_id)
+    return _RunContext(
+        loop=loop,
+        agent=agent,
+        provider=provider,
+        strategy=strategy,
+        run_id=resolved_run_id,
+        recorder=recorder,
+        notifier=notifier,
+        state_store=state_store,
+        interrupt=interrupt,
+        image_runtime=image_runtime,
+        pkw=pkw,
+        cache_key_prefix=cache_key_prefix,
+        lookups=lookups,
+        tool_defs=tool_defs,
+        state=state,
+        images=images,
+        budget=budget,
+        before_tool=before_tool,
+        hook_tenant_id=hook_tenant_id,
+    )
+
+
+def _bind_run_checkpoint(ctx: _RunContext) -> None:
+    _bind_checkpoint(
+        ctx.recorder,
+        state=ctx.state,
+        budget=ctx.budget,
+        provider_kwargs=ctx.pkw,
+        tool_defs=ctx.tool_defs,
+        strategy=ctx.strategy,
+        engine=ctx.g_engine,
+        agent=ctx.agent,
+    )
+
+
+async def _gate_control(ctx: _RunContext) -> Any:
+    """The checkpoint's run control. An in-process interrupt is free and is
+    checked first: it reads as a cancel without a store read."""
+    if ctx.interrupt is not None and ctx.interrupt.is_set():
+        return _LegacyControl(cancel_requested=True)
+    if ctx.state_store is None:
+        return None
+    return await _read_control(ctx.state_store, ctx.run_id)
+
+
+def _control_gate_result(ctx: _RunContext, control: Any, iteration: int) -> RunResult | None:
+    """CANCELLED or PAUSED for a cancel or a requested pause, else None (cancel wins)."""
+    if control is None:
+        return None
+    if control.cancel_requested:
+        return RunResult(
+            run_id=ctx.run_id,
+            status=RunStatus.CANCELLED,
+            steps=ctx.state.steps,
+            commentary=_commentary(ctx.state.steps),
+            iteration_count=iteration - 1,
+            usage=ctx.state.usage,
+            meta=ctx.meta(),
+        )
+    if control.pause_requested:
+        return _checkpoint_pause_result(
+            agent_name=ctx.agent.name,
+            run_id=ctx.run_id,
+            history=ctx.state.history,
+            steps=ctx.state.steps,
+            iteration=iteration,
+            usage=ctx.state.usage,
+            meta=ctx.meta(),
+            budget=ctx.budget,
+            image_view=ctx.pause_view(),
+        )
+    return None
+
+
+async def _iteration_gate(ctx: _RunContext, iteration: int) -> RunResult | None:
+    """Cooperative checkpoint before an iteration starts.
+
+    Cancel > requested pause > budget pause/cancel; then inbox notes are
+    delivered. The current iteration's LLM call and tools are not preempted:
+    flags are seen here or at the runner's pre-pause checkpoint.
+    """
+    control = await _gate_control(ctx)
+    stopped = _control_gate_result(ctx, control, iteration)
+    if stopped is not None:
+        return stopped
+    budget_result = await _budget_stop(
+        ctx.budget,
+        agent_name=ctx.agent.name,
+        run_id=ctx.run_id,
+        history=ctx.state.history,
+        steps=ctx.state.steps,
+        iteration=iteration,
+        usage=ctx.state.usage,
+        meta=ctx.meta(),
+        image_view=ctx.pause_view,
+    )
+    if budget_result is not None:
+        return budget_result
+    if control is not None and control.has_pending_notes:
+        assert ctx.state_store is not None
+        await _deliver_inbox(
+            ctx.state_store,
+            ctx.recorder,
+            ctx.notifier,
+            ctx.run_id,
+            iteration,
+            ctx.state.history,
+            ctx.state.warnings,
+        )
+    return None
+
+
+def _stop_event(result: RunResult) -> RunEvent:
+    """The stream event for a checkpoint stop: cancelled or paused."""
+    return RunEvent(
+        type=(
+            RunEventType.RUN_CANCELLED
+            if result.status == RunStatus.CANCELLED
+            else RunEventType.RUN_PAUSED
+        ),
+        run_result=result,
+    )
+
+
+def _build_messages(ctx: _RunContext) -> tuple[list[Message], Any]:
+    return ctx.strategy.build_messages(
+        system_prompt=ctx.agent.get_system_prompt(loop=ctx.loop),
+        history=ctx.state.history,
+        tool_defs=ctx.tool_defs,
+    )
+
+
+def _settle_response(
+    ctx: _RunContext, prepared: PreparedRequest, response: LLMResponse, t0: float
+) -> tuple[PreparedRequest, int, LLMResponse]:
+    """After the provider returns: commit the image view, time the call, price the response."""
+    prepared = ctx.images.mark_sent(prepared)
+    duration_ms = int((time.monotonic() - t0) * 1000)
+    response = persistable_response(response)
+    response = price_response(
+        response,
+        pricing=ctx.agent.pricing,
+        default_model=ctx.provider.model,
+        model=ctx.pkw.get("model"),
+    )
+    return prepared, duration_ms, response
+
+
+def _llm_findings(
+    ctx: _RunContext, prepared: PreparedRequest, base: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    return None if base is None else ctx.images.findings(prepared, base)
+
+
+async def _after_response(
+    ctx: _RunContext,
+    response: LLMResponse,
+    *,
+    prepared: PreparedRequest,
+    tools: Any,
+    iteration: int,
+    duration_ms: int,
+    findings: dict[str, Any] | None,
+) -> tuple[AgentStep, RunResult | None]:
+    """Record the response (raw: the DB is ground truth), count usage and budget, parse it.
+
+    Returns the step and, past the pending-call limit, the ERROR result.
+    ``findings`` is the batch's guardrail findings (``None`` on stream).
+    """
+    await _record_llm(
+        ctx.recorder,
+        ctx.run_id,
+        response,
+        iteration,
+        semantic_messages=prepared.semantic,
+        semantic_tools=tools,
+        duration_ms=duration_ms,
+        guardrail_findings=_llm_findings(ctx, prepared, findings),
+    )
+    await _notify_llm(
+        ctx.notifier,
+        ctx.run_id,
+        response,
+        iteration,
+        ctx.state.warnings,
+        semantic_messages=prepared.semantic,
+        semantic_tools=tools,
+        duration_ms=duration_ms,
+        guardrail_findings=_llm_findings(ctx, prepared, findings),
+    )
+    _accumulate_usage(ctx.state.usage, response.usage)
+    ctx.budget.add_response(response.usage)
+    await ctx.budget.evaluate(iteration)
+    step = ctx.strategy.parse_response(response)
+    if response.reasoning is not None:
+        step = replace(step, meta={**step.meta, "reasoning": response.reasoning})
+    ctx.state.steps.append(step)
+    limited = _pending_limit_result(
+        agent=ctx.agent,
+        state_store=ctx.state_store,
+        response=response,
+        run_id=ctx.run_id,
+        iteration=iteration,
+        steps=ctx.state.steps,
+        usage=ctx.state.usage,
+        meta=ctx.meta(),
+    )
+    return step, limited
+
+
+async def _append_turn(
+    ctx: _RunContext, response: LLMResponse, iteration: int, *, phase: str
+) -> None:
+    await _append_assistant(
+        response,
+        ctx.state.history,
+        ctx.recorder,
+        ctx.notifier,
+        ctx.run_id,
+        iteration,
+        ctx.state.warnings,
+        phase=phase,
+    )
+
+
+async def _finish_result(
+    ctx: _RunContext, response: LLMResponse, action: Finish, iteration: int
+) -> RunResult:
+    await _append_turn(ctx, response, iteration, phase="final_answer")
+    return RunResult(
+        run_id=ctx.run_id,
+        status=RunStatus.SUCCESS,
+        answer=action.answer,
+        steps=ctx.state.steps,
+        commentary=_commentary(ctx.state.steps),
+        iteration_count=iteration,
+        usage=ctx.state.usage,
+        meta=ctx.meta(),
+        stop_reason=final_stop_reason(
+            response, run_id=ctx.run_id, default_model=ctx.provider.model
+        ),
+    )
+
+
+def _pause_result(
+    ctx: _RunContext,
+    status: RunStatus,
+    iteration: int,
+    *,
+    pending_calls: list[ToolCall],
+    approval_gates: dict[str, dict[str, str | None]] | None = None,
+    answer: str | None = None,
+) -> RunResult:
+    pause = _build_pause(
+        agent_name=ctx.agent.name,
+        pending_calls=pending_calls,
+        target_lookup=ctx.lookups.target,
+        history=ctx.state.history,
+        steps=ctx.state.steps,
+        iteration=iteration,
+        usage=ctx.state.usage,
+        approval_gates=approval_gates,
+        budget=ctx.budget,
+        image_view=ctx.pause_view(),
+    )
+    return RunResult(
+        run_id=ctx.run_id,
+        status=status,
+        answer=answer,
+        steps=ctx.state.steps,
+        commentary=_commentary(ctx.state.steps),
+        iteration_count=iteration,
+        usage=ctx.state.usage,
+        meta={"pause_state": pause, **ctx.meta()},
+    )
+
+
+async def _clarification_result(
+    ctx: _RunContext, response: LLMResponse, action: Clarification, iteration: int
+) -> RunResult:
+    await _append_turn(ctx, response, iteration, phase="final_answer")
+    return _pause_result(
+        ctx, RunStatus.WAITING_HUMAN_INPUT, iteration, pending_calls=[], answer=action.question
+    )
+
+
+async def _run_tool_step(
+    ctx: _RunContext, response: LLMResponse, step: AgentStep, iteration: int
+) -> tuple[_ToolCallOutcome, int]:
+    """Append the assistant turn and run its tool calls; returns the outcome and
+    where this iteration's tool messages start in history."""
+    await _append_turn(ctx, response, iteration, phase="commentary")
+    if ctx.state_store is not None:
+        # The provider may have returned after sweep revoked this worker.
+        await _read_control(ctx.state_store, ctx.run_id)
+    tool_history_start = len(ctx.state.history)
+    outcome = await _process_tool_calls(
+        step=step,
+        call_counts=ctx.state.call_counts,
+        lookups=ctx.lookups,
+        strategy=ctx.strategy,
+        recorder=ctx.recorder,
+        notifier=ctx.notifier,
+        run_id=ctx.run_id,
+        iteration=iteration,
+        history=ctx.state.history,
+        warnings=ctx.state.warnings,
+        deny=ctx.agent.deny,
+        require_approval=ctx.agent.require_approval,
+        tool_result_transform=ctx.agent.tool_result_transform,
+        # Always None on stream: streaming with guardrails is refused by the Agent.
+        guardrail_engine=ctx.g_engine,
+        before_tool=ctx.before_tool,
+        tenant_id=ctx.hook_tenant_id,
+        image_runtime=ctx.image_runtime,
+    )
+    return outcome, tool_history_start
+
+
+def _after_tools(
+    ctx: _RunContext, outcome: _ToolCallOutcome, tool_history_start: int, iteration: int
+) -> RunResult | None:
+    """Mark generated rejections, order observations; a pause result if calls are pending."""
+    _mark_call_rejections(ctx.state.history, tool_history_start, outcome.all_results)
+    order_observations(ctx.recorder, ctx.state.history)
+    if not outcome.pending_calls:
+        return None
+    status = (
+        RunStatus.WAITING_APPROVAL if outcome.pending_approval else RunStatus.WAITING_CLIENT_TOOL
+    )
+    return _pause_result(
+        ctx,
+        status,
+        iteration,
+        pending_calls=outcome.pending_calls,
+        approval_gates=outcome.approval_gates,
+    )
+
+
+def _max_iterations_result(ctx: _RunContext) -> RunResult:
+    return RunResult(
+        run_id=ctx.run_id,
+        status=RunStatus.MAX_ITERATIONS,
+        steps=ctx.state.steps,
+        commentary=_commentary(ctx.state.steps),
+        iteration_count=ctx.agent.max_iterations,
+        usage=ctx.state.usage,
+        meta=ctx.meta(),
+    )
+
+
+def _run_guardrail_engine(
+    agent: Agent, recorder: LoopRecorder | None, pii_mapping: dict[str, str] | None, run_id: str
+) -> GuardrailEngine | None:
+    """The recorder's engine (shared with persistence), else one for the agent's guardrails."""
+    shared: GuardrailEngine | None = getattr(recorder, "guardrail_engine", None)
+    if shared:
+        return shared
+    if not agent.guardrails:
+        return None
+    return GuardrailEngine(agent.guardrails, pii_mapping=pii_mapping, run_id=run_id)
+
+
+async def _incoming_project(
+    ctx: _RunContext, engine: GuardrailEngine, msg: Message, index: int
+) -> tuple[Message, list[Any], str | None]:
+    shared = getattr(ctx.recorder, "guardrail_engine", None) is engine
+    project = engine.project_incoming_message if shared else engine.scan_incoming_message
+    return await project(msg, index=index)
+
+
+async def _incoming_blocked(
+    ctx: _RunContext, error: str, findings: list[Any], msg: Message, index: int, iteration: int
+) -> RunResult:
+    await _record_governance(
+        ctx.recorder,
+        ctx.run_id,
+        GovernanceEventType.GUARDRAIL_BLOCKED.value,
+        iteration,
+        _blocked_data("incoming", error, findings, _incoming_location(msg, index)),
+    )
+    await _notify_governance(
+        ctx.notifier,
+        ctx.run_id,
+        GovernanceEventType.GUARDRAIL_BLOCKED.value,
+        iteration,
+        _blocked_data("incoming", error, findings, _incoming_location(msg, index)),
+        warnings=ctx.state.warnings,
+    )
+    return _guardrail_error(ctx, error, iteration)
+
+
+def _guardrail_error(ctx: _RunContext, error: str, iteration: int) -> RunResult:
+    return RunResult(
+        run_id=ctx.run_id,
+        status=RunStatus.ERROR,
+        error=error,
+        steps=ctx.state.steps,
+        commentary=_commentary(ctx.state.steps),
+        iteration_count=iteration,
+        usage=ctx.state.usage,
+        meta={**ctx.meta(), "failure_reason": FailureReason.GUARDRAIL_BLOCKED.value},
+    )
+
+
+async def _incoming_events(
+    ctx: _RunContext,
+    findings: list[Any],
+    redacted: bool,
+    iteration: int,
+    all_findings: dict[str, Any],
+) -> None:
+    """``guardrail.detected`` and ``guardrail.redacted`` for the incoming scan."""
+    if findings:
+        entities = list({f.entity_type for f in findings})
+        await _record_governance(
+            ctx.recorder,
+            ctx.run_id,
+            GovernanceEventType.GUARDRAIL_DETECTED.value,
+            iteration,
+            {"direction": "incoming", "findings_count": len(findings), "entities": entities},
+        )
+        await _notify_governance(
+            ctx.notifier,
+            ctx.run_id,
+            GovernanceEventType.GUARDRAIL_DETECTED.value,
+            iteration,
+            {"direction": "incoming", "findings_count": len(findings), "entities": entities},
+            warnings=ctx.state.warnings,
+        )
+        all_findings["incoming"] = [
+            {"entity_type": f.entity_type, "score": f.score} for f in findings
+        ]
+    if redacted:
+        red_entities = list({f.entity_type for f in findings})
+        await _record_governance(
+            ctx.recorder,
+            ctx.run_id,
+            GovernanceEventType.GUARDRAIL_REDACTED.value,
+            iteration,
+            {"direction": "incoming", "entities": red_entities},
+        )
+        await _notify_governance(
+            ctx.notifier,
+            ctx.run_id,
+            GovernanceEventType.GUARDRAIL_REDACTED.value,
+            iteration,
+            {"direction": "incoming", "entities": red_entities},
+            warnings=ctx.state.warnings,
+        )
+
+
+async def _scan_incoming(
+    ctx: _RunContext, messages: list[Message], iteration: int, all_findings: dict[str, Any]
+) -> RunResult | None:
+    """Incoming guardrail (batch only): scan every message before the LLM call.
+
+    Redacted messages replace their originals in ``messages``; a block ends
+    the run with an ERROR result.
+    """
+    engine = ctx.g_engine
+    if engine is None:
+        return None
+    all_in_findings: list[Any] = []
+    redacted = False
+    for index, msg in enumerate(messages):
+        if not msg.content:
+            continue
+        cleaned, findings, block_error = await _incoming_project(ctx, engine, msg, index)
+        if findings:
+            all_in_findings.extend(findings)
+        if block_error is not None:
+            return await _incoming_blocked(ctx, block_error, findings, msg, index, iteration)
+        if cleaned is not msg:
+            redacted = True
+            # The engine's replace() preserves the origin envelope
+            # (kind/placement/source) through redaction.
+            messages[index] = cleaned
+    await _incoming_events(ctx, all_in_findings, redacted, iteration, all_findings)
+    return None
+
+
+async def _outgoing_detected(
+    ctx: _RunContext, findings: list[Any], iteration: int, all_findings: dict[str, Any]
+) -> None:
+    all_findings["outgoing"] = [{"entity_type": f.entity_type, "score": f.score} for f in findings]
+    entities = list({f.entity_type for f in findings})
+    await _record_governance(
+        ctx.recorder,
+        ctx.run_id,
+        GovernanceEventType.GUARDRAIL_DETECTED.value,
+        iteration,
+        {"direction": "outgoing", "findings_count": len(findings), "entities": entities},
+    )
+    await _notify_governance(
+        ctx.notifier,
+        ctx.run_id,
+        GovernanceEventType.GUARDRAIL_DETECTED.value,
+        iteration,
+        {"direction": "outgoing", "findings_count": len(findings), "entities": entities},
+        warnings=ctx.state.warnings,
+    )
+
+
+async def _outgoing_blocked(
+    ctx: _RunContext,
+    response: LLMResponse,
+    *,
+    prepared: PreparedRequest,
+    tools: Any,
+    iteration: int,
+    duration_ms: int,
+    all_findings: dict[str, Any],
+    error: str,
+    findings: list[Any],
+) -> RunResult:
+    """Record the scrubbed response, count it, then ``guardrail.blocked`` and ERROR."""
+    # Scrub before recording: a block means the original text/params
+    # contain the PII that triggered it.
+    blocked_response = LLMResponse(
+        text="[blocked by guardrail]",
+        tool_calls=None,
+        raw=response.raw,
+        usage=response.usage,
+        provider_request=response.provider_request,
+        provider_response=None,
+        stop_reason=response.stop_reason,
+        raw_stop_reason=response.raw_stop_reason,
+    )
+    await _record_llm(
+        ctx.recorder,
+        ctx.run_id,
+        blocked_response,
+        iteration,
+        semantic_messages=prepared.semantic,
+        semantic_tools=tools,
+        duration_ms=duration_ms,
+        guardrail_findings=ctx.images.findings(prepared, all_findings),
+    )
+    await _notify_llm(
+        ctx.notifier,
+        ctx.run_id,
+        blocked_response,
+        iteration,
+        ctx.state.warnings,
+        semantic_messages=prepared.semantic,
+        semantic_tools=tools,
+        duration_ms=duration_ms,
+        guardrail_findings=ctx.images.findings(prepared, all_findings),
+    )
+    _accumulate_usage(ctx.state.usage, response.usage)
+    ctx.budget.add_response(response.usage)
+    await ctx.budget.evaluate(iteration)
+    await _record_governance(
+        ctx.recorder,
+        ctx.run_id,
+        GovernanceEventType.GUARDRAIL_BLOCKED.value,
+        iteration,
+        _blocked_data("outgoing", error, findings, "output"),
+    )
+    await _notify_governance(
+        ctx.notifier,
+        ctx.run_id,
+        GovernanceEventType.GUARDRAIL_BLOCKED.value,
+        iteration,
+        _blocked_data("outgoing", error, findings, "output"),
+        warnings=ctx.state.warnings,
+    )
+    return _guardrail_error(ctx, error, iteration)
+
+
+async def _scan_outgoing(
+    ctx: _RunContext,
+    response: LLMResponse,
+    *,
+    prepared: PreparedRequest,
+    tools: Any,
+    iteration: int,
+    duration_ms: int,
+    all_findings: dict[str, Any],
+) -> RunResult | None:
+    """Output guardrail (batch only): detection, and block/warn policies.
+
+    Persistence stores the raw response (the DB is ground truth); the next
+    incoming scan redacts for the LLM.
+    """
+    engine = ctx.g_engine
+    if engine is None or not (response.text or response.tool_calls):
+        return None
+    tc_params = [tc.params for tc in response.tool_calls] if response.tool_calls else None
+    out_findings, out_block = await engine.scan_outgoing(response.text or "", tc_params)
+    if out_findings:
+        await _outgoing_detected(ctx, out_findings, iteration, all_findings)
+    if out_block is None:
+        return None
+    return await _outgoing_blocked(
+        ctx,
+        response,
+        prepared=prepared,
+        tools=tools,
+        iteration=iteration,
+        duration_ms=duration_ms,
+        all_findings=all_findings,
+        error=out_block,
+        findings=out_findings,
+    )
+
+
 class ReActLoop(Loop):
     """Think → act → observe → repeat.
 
@@ -1659,239 +2375,45 @@ class ReActLoop(Loop):
         (tenant scope, catalog, stores); ``image_view_state`` restores the
         request-view state from a pause or seeds it for a new run.
         """
-        resolved_run_id = run_id or generate_ulid()
-        _pkw = provider_kwargs or {}
-        cache_key_prefix = build_cache_key_prefix(agent)
-        lookups = await agent.get_tool_lookups(loop=self)
-        tool_defs = agent.get_all_tool_defs(loop=self)
-        state = await _init_loop_state(
-            user_input=user_input,
+        ctx = await _start_run(
+            self,
+            agent,
+            provider,
+            strategy,
+            user_input,
+            run_id=run_id,
             recorder=recorder,
             notifier=notifier,
-            run_id=resolved_run_id,
             initial_history=initial_history,
             initial_steps=initial_steps,
+            iteration_offset=iteration_offset,
             initial_usage=initial_usage,
-            image_view_state=image_view_state,
-        )
-        history, call_counts, steps = state.history, state.call_counts, state.steps
-        total_usage, notifier_warnings = state.usage, state.warnings
-        image_state = state.image_view
-        images = ImageCallSite(
-            state=image_state,
-            policy=_image_policy(agent, image_runtime),
-            runtime=image_runtime,
-            provider=provider,
-            model=str(_pkw.get("model") or provider.model),
-            recorder=recorder,
-            notifier=notifier,
-            run_id=resolved_run_id,
-            warnings=notifier_warnings,
-        )
-
-        async def _control_reader() -> Any:
-            if state_store is None:
-                return await no_control()
-            return await _read_control(state_store, resolved_run_id)
-
-        budget = BudgetTracker(
-            agent.budget,
-            run_id=resolved_run_id,
-            usage=total_usage,
-            recorder=recorder,
-            notifier=notifier,
-            warnings=notifier_warnings,
+            provider_kwargs=provider_kwargs,
             state_store=state_store,
-            carry=budget_carry,
-            fresh=iteration_offset == 0,
+            budget_carry=budget_carry,
+            image_runtime=image_runtime,
+            image_view_state=image_view_state,
+            interrupt=None,
         )
-        before_tool: BeforeToolHook | None = getattr(agent, "before_tool", None)
-        hook_tenant_id = await _hook_tenant_id(before_tool, state_store, resolved_run_id)
-        g_engine: GuardrailEngine | None = getattr(recorder, "guardrail_engine", None) or (
-            GuardrailEngine(
-                agent.guardrails, pii_mapping=initial_pii_mapping, run_id=resolved_run_id
-            )
-            if agent.guardrails
-            else None
-        )
-
-        _bind_checkpoint(
-            recorder,
-            state=state,
-            budget=budget,
-            provider_kwargs=_pkw,
-            tool_defs=tool_defs,
-            strategy=strategy,
-            engine=g_engine,
-            agent=agent,
-        )
+        resolved_run_id, _pkw, cache_key_prefix = ctx.run_id, ctx.pkw, ctx.cache_key_prefix
+        history, steps, total_usage = ctx.state.history, ctx.state.steps, ctx.state.usage
+        notifier_warnings, image_state = ctx.state.warnings, ctx.state.image_view
+        images, budget, _control_reader = ctx.images, ctx.budget, ctx.control_reader
+        g_engine = _run_guardrail_engine(agent, recorder, initial_pii_mapping, resolved_run_id)
+        ctx.g_engine = g_engine
+        _bind_run_checkpoint(ctx)
         start_iteration = iteration_offset + 1
         end_iteration = agent.max_iterations + 1
         for iteration in range(start_iteration, end_iteration):
-            # Cooperative checkpoint before starting the next iteration:
-            # cancel > requested pause > budget pause/cancel; then inbox notes
-            # are delivered. The current iteration's LLM/tools are not
-            # preempted — flags are seen here or at the runner's pre-pause
-            # checkpoint.
-            control = (
-                await _read_control(state_store, resolved_run_id)
-                if state_store is not None
-                else None
-            )
-            if control is not None and control.cancel_requested:
-                return RunResult(
-                    run_id=resolved_run_id,
-                    status=RunStatus.CANCELLED,
-                    steps=steps,
-                    commentary=_commentary(steps),
-                    iteration_count=iteration - 1,
-                    usage=total_usage,
-                    meta=guardrail_meta(g_engine, notifier_warnings),
-                )
-            if control is not None and control.pause_requested:
-                return _checkpoint_pause_result(
-                    agent_name=agent.name,
-                    run_id=resolved_run_id,
-                    history=history,
-                    steps=steps,
-                    iteration=iteration,
-                    usage=total_usage,
-                    meta=guardrail_meta(g_engine, notifier_warnings),
-                    budget=budget,
-                    image_view=pause_image_view(image_state, history),
-                )
-            budget_result = await _budget_stop(
-                budget,
-                agent_name=agent.name,
-                run_id=resolved_run_id,
-                history=history,
-                steps=steps,
-                iteration=iteration,
-                usage=total_usage,
-                meta=guardrail_meta(g_engine, notifier_warnings),
-                image_view=lambda: pause_image_view(image_state, history),
-            )
-            if budget_result is not None:
-                return budget_result
-            if control is not None and control.has_pending_notes:
-                assert state_store is not None
-                await _deliver_inbox(
-                    state_store,
-                    recorder,
-                    notifier,
-                    resolved_run_id,
-                    iteration,
-                    history,
-                    notifier_warnings,
-                )
+            stopped = await _iteration_gate(ctx, iteration)
+            if stopped is not None:
+                return stopped
 
-            messages, tools = strategy.build_messages(
-                system_prompt=agent.get_system_prompt(loop=self),
-                history=history,
-                tool_defs=tool_defs,
-            )
-            # Incoming guardrail — scan ALL messages before LLM call
+            messages, tools = _build_messages(ctx)
             _all_guardrail_findings: dict[str, Any] = {}
-            if g_engine is not None:
-                all_in_findings: list[Any] = []
-                _in_was_redacted = False
-                for msg_idx, msg in enumerate(messages):
-                    if not msg.content:
-                        continue
-                    shared_guardrail_engine = (
-                        getattr(recorder, "guardrail_engine", None) is g_engine
-                    )
-                    project = (
-                        g_engine.project_incoming_message
-                        if shared_guardrail_engine
-                        else g_engine.scan_incoming_message
-                    )
-                    cleaned_msg, findings, block_err = await project(msg, index=msg_idx)
-                    if findings:
-                        all_in_findings.extend(findings)
-                    if block_err is not None:
-                        await _record_governance(
-                            recorder,
-                            resolved_run_id,
-                            GovernanceEventType.GUARDRAIL_BLOCKED.value,
-                            iteration,
-                            _blocked_data(
-                                "incoming", block_err, findings, _incoming_location(msg, msg_idx)
-                            ),
-                        )
-                        await _notify_governance(
-                            notifier,
-                            resolved_run_id,
-                            GovernanceEventType.GUARDRAIL_BLOCKED.value,
-                            iteration,
-                            _blocked_data(
-                                "incoming", block_err, findings, _incoming_location(msg, msg_idx)
-                            ),
-                            warnings=notifier_warnings,
-                        )
-                        return RunResult(
-                            run_id=resolved_run_id,
-                            status=RunStatus.ERROR,
-                            error=block_err,
-                            steps=steps,
-                            commentary=_commentary(steps),
-                            iteration_count=iteration,
-                            usage=total_usage,
-                            meta={
-                                **guardrail_meta(g_engine, notifier_warnings),
-                                "failure_reason": FailureReason.GUARDRAIL_BLOCKED.value,
-                            },
-                        )
-                    if cleaned_msg is not msg:
-                        _in_was_redacted = True
-                        # The engine's replace() preserves the origin envelope
-                        # (kind/placement/source) through redaction.
-                        messages[msg_idx] = cleaned_msg
-                if all_in_findings:
-                    _in_entities = list({f.entity_type for f in all_in_findings})
-                    await _record_governance(
-                        recorder,
-                        resolved_run_id,
-                        GovernanceEventType.GUARDRAIL_DETECTED.value,
-                        iteration,
-                        {
-                            "direction": "incoming",
-                            "findings_count": len(all_in_findings),
-                            "entities": _in_entities,
-                        },
-                    )
-                    await _notify_governance(
-                        notifier,
-                        resolved_run_id,
-                        GovernanceEventType.GUARDRAIL_DETECTED.value,
-                        iteration,
-                        {
-                            "direction": "incoming",
-                            "findings_count": len(all_in_findings),
-                            "entities": _in_entities,
-                        },
-                        warnings=notifier_warnings,
-                    )
-                    _all_guardrail_findings["incoming"] = [
-                        {"entity_type": f.entity_type, "score": f.score} for f in all_in_findings
-                    ]
-                if _in_was_redacted:
-                    _red_entities = list({f.entity_type for f in all_in_findings})
-                    await _record_governance(
-                        recorder,
-                        resolved_run_id,
-                        GovernanceEventType.GUARDRAIL_REDACTED.value,
-                        iteration,
-                        {"direction": "incoming", "entities": _red_entities},
-                    )
-                    await _notify_governance(
-                        notifier,
-                        resolved_run_id,
-                        GovernanceEventType.GUARDRAIL_REDACTED.value,
-                        iteration,
-                        {"direction": "incoming", "entities": _red_entities},
-                        warnings=notifier_warnings,
-                    )
+            blocked = await _scan_incoming(ctx, messages, iteration, _all_guardrail_findings)
+            if blocked is not None:
+                return blocked
 
             await _checkpoint_view(recorder, messages, iteration)
 
@@ -2016,301 +2538,41 @@ class ReActLoop(Loop):
                         usage=total_usage,
                         meta=guardrail_meta(g_engine, notifier_warnings),
                     )
-            prepared = images.mark_sent(prepared)
-            llm_duration_ms = int((time.monotonic() - t0) * 1000)
-            response = persistable_response(response)
-            response = price_response(
+            prepared, llm_duration_ms, response = _settle_response(ctx, prepared, response, t0)
+            blocked = await _scan_outgoing(
+                ctx,
                 response,
-                pricing=agent.pricing,
-                default_model=provider.model,
-                model=_pkw.get("model"),
-            )
-
-            # Output guardrail — detection-only. Persistence stores raw
-            # (DB is ground truth); the next scan_incoming redacts for
-            # the LLM. Outgoing enforces block/warn policies.
-            if g_engine is not None and (response.text or response.tool_calls):
-                tc_params = (
-                    [tc.params for tc in response.tool_calls] if response.tool_calls else None
-                )
-                out_findings, out_block = await g_engine.scan_outgoing(
-                    response.text or "", tc_params
-                )
-                if out_findings:
-                    _all_guardrail_findings["outgoing"] = [
-                        {"entity_type": f.entity_type, "score": f.score} for f in out_findings
-                    ]
-                    _out_entities = list({f.entity_type for f in out_findings})
-                    await _record_governance(
-                        recorder,
-                        resolved_run_id,
-                        GovernanceEventType.GUARDRAIL_DETECTED.value,
-                        iteration,
-                        {
-                            "direction": "outgoing",
-                            "findings_count": len(out_findings),
-                            "entities": _out_entities,
-                        },
-                    )
-                    await _notify_governance(
-                        notifier,
-                        resolved_run_id,
-                        GovernanceEventType.GUARDRAIL_DETECTED.value,
-                        iteration,
-                        {
-                            "direction": "outgoing",
-                            "findings_count": len(out_findings),
-                            "entities": _out_entities,
-                        },
-                        warnings=notifier_warnings,
-                    )
-                if out_block is not None:
-                    # Scrub response before recording — block means the
-                    # original text/params contain the PII that triggered it.
-                    _blocked_response = LLMResponse(
-                        text="[blocked by guardrail]",
-                        tool_calls=None,
-                        raw=response.raw,
-                        usage=response.usage,
-                        provider_request=response.provider_request,
-                        provider_response=None,
-                        stop_reason=response.stop_reason,
-                        raw_stop_reason=response.raw_stop_reason,
-                    )
-                    await _record_llm(
-                        recorder,
-                        resolved_run_id,
-                        _blocked_response,
-                        iteration,
-                        semantic_messages=prepared.semantic,
-                        semantic_tools=tools,
-                        duration_ms=llm_duration_ms,
-                        guardrail_findings=images.findings(prepared, _all_guardrail_findings),
-                    )
-                    await _notify_llm(
-                        notifier,
-                        resolved_run_id,
-                        _blocked_response,
-                        iteration,
-                        notifier_warnings,
-                        semantic_messages=prepared.semantic,
-                        semantic_tools=tools,
-                        duration_ms=llm_duration_ms,
-                        guardrail_findings=images.findings(prepared, _all_guardrail_findings),
-                    )
-                    _accumulate_usage(total_usage, response.usage)
-                    budget.add_response(response.usage)
-                    await budget.evaluate(iteration)
-                    await _record_governance(
-                        recorder,
-                        resolved_run_id,
-                        GovernanceEventType.GUARDRAIL_BLOCKED.value,
-                        iteration,
-                        _blocked_data("outgoing", out_block, out_findings, "output"),
-                    )
-                    await _notify_governance(
-                        notifier,
-                        resolved_run_id,
-                        GovernanceEventType.GUARDRAIL_BLOCKED.value,
-                        iteration,
-                        _blocked_data("outgoing", out_block, out_findings, "output"),
-                        warnings=notifier_warnings,
-                    )
-                    return RunResult(
-                        run_id=resolved_run_id,
-                        status=RunStatus.ERROR,
-                        error=out_block,
-                        steps=steps,
-                        commentary=_commentary(steps),
-                        iteration_count=iteration,
-                        usage=total_usage,
-                        meta={
-                            **guardrail_meta(g_engine, notifier_warnings),
-                            "failure_reason": FailureReason.GUARDRAIL_BLOCKED.value,
-                        },
-                    )
-
-            # Record the LLM response (raw — DB is ground truth)
-            # and accumulate usage.
-            await _record_llm(
-                recorder,
-                resolved_run_id,
-                response,
-                iteration,
-                semantic_messages=prepared.semantic,
-                semantic_tools=tools,
-                duration_ms=llm_duration_ms,
-                guardrail_findings=images.findings(prepared, _all_guardrail_findings),
-            )
-            await _notify_llm(
-                notifier,
-                resolved_run_id,
-                response,
-                iteration,
-                notifier_warnings,
-                semantic_messages=prepared.semantic,
-                semantic_tools=tools,
-                duration_ms=llm_duration_ms,
-                guardrail_findings=images.findings(prepared, _all_guardrail_findings),
-            )
-            _accumulate_usage(total_usage, response.usage)
-            budget.add_response(response.usage)
-            await budget.evaluate(iteration)
-
-            step = strategy.parse_response(response)
-            if response.reasoning is not None:
-                step = replace(step, meta={**step.meta, "reasoning": response.reasoning})
-            steps.append(step)
-
-            limited = _pending_limit_result(
-                agent=agent,
-                state_store=state_store,
-                response=response,
-                run_id=resolved_run_id,
+                prepared=prepared,
+                tools=tools,
                 iteration=iteration,
-                steps=steps,
-                usage=total_usage,
-                meta=guardrail_meta(g_engine, notifier_warnings),
+                duration_ms=llm_duration_ms,
+                all_findings=_all_guardrail_findings,
+            )
+            if blocked is not None:
+                return blocked
+
+            step, limited = await _after_response(
+                ctx,
+                response,
+                prepared=prepared,
+                tools=tools,
+                iteration=iteration,
+                duration_ms=llm_duration_ms,
+                findings=_all_guardrail_findings,
             )
             if limited is not None:
                 return limited
-
             if isinstance(step.action, Finish):
-                await _append_assistant(
-                    response,
-                    history,
-                    recorder,
-                    notifier,
-                    resolved_run_id,
-                    iteration,
-                    notifier_warnings,
-                    phase="final_answer",
-                )
-                return RunResult(
-                    run_id=resolved_run_id,
-                    status=RunStatus.SUCCESS,
-                    answer=step.action.answer,
-                    steps=steps,
-                    commentary=_commentary(steps),
-                    iteration_count=iteration,
-                    usage=total_usage,
-                    meta=guardrail_meta(g_engine, notifier_warnings),
-                    stop_reason=final_stop_reason(
-                        response, run_id=resolved_run_id, default_model=provider.model
-                    ),
-                )
-
+                return await _finish_result(ctx, response, step.action, iteration)
             if isinstance(step.action, Clarification):
-                await _append_assistant(
-                    response,
-                    history,
-                    recorder,
-                    notifier,
-                    resolved_run_id,
-                    iteration,
-                    notifier_warnings,
-                    phase="final_answer",
-                )
-                pause = _build_pause(
-                    agent_name=agent.name,
-                    pending_calls=[],
-                    target_lookup=lookups.target,
-                    history=history,
-                    steps=steps,
-                    iteration=iteration,
-                    usage=total_usage,
-                    budget=budget,
-                    image_view=pause_image_view(image_state, history),
-                )
-                meta: dict[str, Any] = {
-                    "pause_state": pause,
-                    **guardrail_meta(g_engine, notifier_warnings),
-                }
-                return RunResult(
-                    run_id=resolved_run_id,
-                    status=RunStatus.WAITING_HUMAN_INPUT,
-                    answer=step.action.question,
-                    steps=steps,
-                    commentary=_commentary(steps),
-                    iteration_count=iteration,
-                    usage=total_usage,
-                    meta=meta,
-                )
-
+                return await _clarification_result(ctx, response, step.action, iteration)
             if isinstance(step.action, ToolCall):
-                await _append_assistant(
-                    response,
-                    history,
-                    recorder,
-                    notifier,
-                    resolved_run_id,
-                    iteration,
-                    notifier_warnings,
-                    phase="commentary",
-                )
-                if state_store is not None:
-                    # The provider may have returned after sweep revoked this worker.
-                    await _read_control(state_store, resolved_run_id)
-                tool_history_start = len(history)
-                outcome = await _process_tool_calls(
-                    step=step,
-                    call_counts=call_counts,
-                    lookups=lookups,
-                    strategy=strategy,
-                    recorder=recorder,
-                    notifier=notifier,
-                    run_id=resolved_run_id,
-                    iteration=iteration,
-                    history=history,
-                    warnings=notifier_warnings,
-                    deny=agent.deny,
-                    require_approval=agent.require_approval,
-                    tool_result_transform=agent.tool_result_transform,
-                    guardrail_engine=g_engine,
-                    before_tool=before_tool,
-                    tenant_id=hook_tenant_id,
-                    image_runtime=image_runtime,
-                )
-                _mark_call_rejections(history, tool_history_start, outcome.all_results)
-                order_observations(recorder, history)
-                if outcome.pending_calls:
-                    pause_status = (
-                        RunStatus.WAITING_APPROVAL
-                        if outcome.pending_approval
-                        else RunStatus.WAITING_CLIENT_TOOL
-                    )
-                    pause = _build_pause(
-                        agent_name=agent.name,
-                        pending_calls=outcome.pending_calls,
-                        target_lookup=lookups.target,
-                        history=history,
-                        steps=steps,
-                        iteration=iteration,
-                        usage=total_usage,
-                        approval_gates=outcome.approval_gates,
-                        budget=budget,
-                        image_view=pause_image_view(image_state, history),
-                    )
-                    meta = {"pause_state": pause, **guardrail_meta(g_engine, notifier_warnings)}
-                    return RunResult(
-                        run_id=resolved_run_id,
-                        status=pause_status,
-                        steps=steps,
-                        commentary=_commentary(steps),
-                        iteration_count=iteration,
-                        usage=total_usage,
-                        meta=meta,
-                    )
+                outcome, tool_history_start = await _run_tool_step(ctx, response, step, iteration)
+                paused = _after_tools(ctx, outcome, tool_history_start, iteration)
+                if paused is not None:
+                    return paused
 
-        return RunResult(
-            run_id=resolved_run_id,
-            status=RunStatus.MAX_ITERATIONS,
-            steps=steps,
-            commentary=_commentary(steps),
-            iteration_count=agent.max_iterations,
-            usage=total_usage,
-            meta=guardrail_meta(g_engine, notifier_warnings),
-        )
+        return _max_iterations_result(ctx)
 
     @staticmethod
     async def _image_blocked(
@@ -2369,153 +2631,44 @@ class ReActLoop(Loop):
         deltas live and yielding TOOL_RESULT events after execution.
         Terminal event is RUN_COMPLETED or RUN_PAUSED.
         """
-        resolved_run_id = run_id or generate_ulid()
-        _pkw = provider_kwargs or {}
-        cache_key_prefix = build_cache_key_prefix(agent)
-        lookups = await agent.get_tool_lookups(loop=self)
-        tool_defs = agent.get_all_tool_defs(loop=self)
-        state = await _init_loop_state(
-            user_input=user_input,
+        ctx = await _start_run(
+            self,
+            agent,
+            provider,
+            strategy,
+            user_input,
+            run_id=run_id,
             recorder=recorder,
             notifier=notifier,
-            run_id=resolved_run_id,
             initial_history=initial_history,
             initial_steps=initial_steps,
+            iteration_offset=iteration_offset,
             initial_usage=initial_usage,
-            image_view_state=image_view_state,
-        )
-        history, call_counts, steps = state.history, state.call_counts, state.steps
-        total_usage, notifier_warnings = state.usage, state.warnings
-        image_state = state.image_view
-        images = ImageCallSite(
-            state=image_state,
-            policy=_image_policy(agent, image_runtime),
-            runtime=image_runtime,
-            provider=provider,
-            model=str(_pkw.get("model") or provider.model),
-            recorder=recorder,
-            notifier=notifier,
-            run_id=resolved_run_id,
-            warnings=notifier_warnings,
-        )
-
-        async def _control_reader() -> Any:
-            # An in-process cancel (cancel_run in this process) wins, as at the
-            # top-of-iteration checkpoint.
-            if interrupt is not None and interrupt.is_set():
-                return _LegacyControl(cancel_requested=True)
-            if state_store is None:
-                return await no_control()
-            return await _read_control(state_store, resolved_run_id)
-
-        budget = BudgetTracker(
-            agent.budget,
-            run_id=resolved_run_id,
-            usage=total_usage,
-            recorder=recorder,
-            notifier=notifier,
-            warnings=notifier_warnings,
+            provider_kwargs=provider_kwargs,
             state_store=state_store,
-            carry=budget_carry,
-            fresh=iteration_offset == 0,
+            budget_carry=budget_carry,
+            image_runtime=image_runtime,
+            image_view_state=image_view_state,
+            interrupt=interrupt,
         )
-        before_tool: BeforeToolHook | None = getattr(agent, "before_tool", None)
-        hook_tenant_id = await _hook_tenant_id(before_tool, state_store, resolved_run_id)
-
-        _bind_checkpoint(
-            recorder,
-            state=state,
-            budget=budget,
-            provider_kwargs=_pkw,
-            tool_defs=tool_defs,
-            strategy=strategy,
-            engine=None,
-            agent=agent,
-        )
+        resolved_run_id, _pkw, cache_key_prefix = ctx.run_id, ctx.pkw, ctx.cache_key_prefix
+        history, steps, total_usage = ctx.state.history, ctx.state.steps, ctx.state.usage
+        notifier_warnings, image_state = ctx.state.warnings, ctx.state.image_view
+        images, budget, _control_reader = ctx.images, ctx.budget, ctx.control_reader
+        _bind_run_checkpoint(ctx)
         start_iteration = iteration_offset + 1
         end_iteration = agent.max_iterations + 1
         for iteration in range(start_iteration, end_iteration):
-            # Cooperative checkpoint (see run() for rationale). The in-process
-            # interrupt is checked first: it is free, and it lets a cancel
-            # that landed during tool execution stop the run before the next
-            # provider call is even started.
-            interrupted_here = interrupt is not None and interrupt.is_set()
-            control = (
-                await _read_control(state_store, resolved_run_id)
-                if state_store is not None and not interrupted_here
-                else None
-            )
-            if interrupted_here or (control is not None and control.cancel_requested):
-                cancel_meta: dict[str, Any] = (
-                    {"notifier_warnings": notifier_warnings} if notifier_warnings else {}
-                )
-                yield RunEvent(
-                    type=RunEventType.RUN_CANCELLED,
-                    run_result=RunResult(
-                        run_id=resolved_run_id,
-                        status=RunStatus.CANCELLED,
-                        steps=steps,
-                        commentary=_commentary(steps),
-                        iteration_count=iteration - 1,
-                        usage=total_usage,
-                        meta=cancel_meta,
-                    ),
-                )
+            # Cooperative checkpoint (see run()). The in-process interrupt is
+            # checked first: it is free, and it lets a cancel that landed
+            # during tool execution stop the run before the next provider
+            # call is even started.
+            stopped = await _iteration_gate(ctx, iteration)
+            if stopped is not None:
+                yield _stop_event(stopped)
                 return
-            if control is not None and control.pause_requested:
-                yield RunEvent(
-                    type=RunEventType.RUN_PAUSED,
-                    run_result=_checkpoint_pause_result(
-                        agent_name=agent.name,
-                        run_id=resolved_run_id,
-                        history=history,
-                        steps=steps,
-                        iteration=iteration,
-                        usage=total_usage,
-                        meta={"notifier_warnings": notifier_warnings} if notifier_warnings else {},
-                        budget=budget,
-                        image_view=pause_image_view(image_state, history),
-                    ),
-                )
-                return
-            budget_result = await _budget_stop(
-                budget,
-                agent_name=agent.name,
-                run_id=resolved_run_id,
-                history=history,
-                steps=steps,
-                iteration=iteration,
-                usage=total_usage,
-                meta={"notifier_warnings": notifier_warnings} if notifier_warnings else {},
-                image_view=lambda: pause_image_view(image_state, history),
-            )
-            if budget_result is not None:
-                yield RunEvent(
-                    type=(
-                        RunEventType.RUN_CANCELLED
-                        if budget_result.status == RunStatus.CANCELLED
-                        else RunEventType.RUN_PAUSED
-                    ),
-                    run_result=budget_result,
-                )
-                return
-            if control is not None and control.has_pending_notes:
-                assert state_store is not None
-                await _deliver_inbox(
-                    state_store,
-                    recorder,
-                    notifier,
-                    resolved_run_id,
-                    iteration,
-                    history,
-                    notifier_warnings,
-                )
 
-            messages, tools = strategy.build_messages(
-                system_prompt=agent.get_system_prompt(loop=self),
-                history=history,
-                tool_defs=tool_defs,
-            )
+            messages, tools = _build_messages(ctx)
             await _checkpoint_view(recorder, messages, iteration)
 
             # Image request view (§5.1). Image guardrails are batch-only:
@@ -2709,18 +2862,11 @@ class ReActLoop(Loop):
                     steps=steps,
                     iteration=iteration,
                     usage=total_usage,
-                    meta={"notifier_warnings": notifier_warnings} if notifier_warnings else {},
+                    meta=guardrail_meta(None, notifier_warnings),
                     budget=budget,
                     image_view=pause_image_view(image_state, history),
                 )
-                yield RunEvent(
-                    type=(
-                        RunEventType.RUN_CANCELLED
-                        if stop_result.status == RunStatus.CANCELLED
-                        else RunEventType.RUN_PAUSED
-                    ),
-                    run_result=stop_result,
-                )
+                yield _stop_event(stop_result)
                 return
 
             if interrupted:
@@ -2739,168 +2885,45 @@ class ReActLoop(Loop):
                     ),
                 )
                 return
-
             # The try-block raised if no DONE arrived; only the interrupted path
             # (handled above) leaves this None.
             assert llm_response is not None
-            prepared = images.mark_sent(prepared)
-            llm_duration_ms = int((time.monotonic() - t0) * 1000)
-            llm_response = persistable_response(llm_response)
-            llm_response = price_response(
-                llm_response,
-                pricing=agent.pricing,
-                default_model=provider.model,
-                model=_pkw.get("model"),
+            prepared, llm_duration_ms, llm_response = _settle_response(
+                ctx, prepared, llm_response, t0
             )
-
-            await _record_llm(
-                recorder,
-                resolved_run_id,
+            step, limited = await _after_response(
+                ctx,
                 llm_response,
-                iteration,
-                semantic_messages=prepared.semantic,
-                semantic_tools=tools,
-                duration_ms=llm_duration_ms,
-            )
-            await _notify_llm(
-                notifier,
-                resolved_run_id,
-                llm_response,
-                iteration,
-                notifier_warnings,
-                semantic_messages=prepared.semantic,
-                semantic_tools=tools,
-                duration_ms=llm_duration_ms,
-            )
-            _accumulate_usage(total_usage, llm_response.usage)
-            budget.add_response(llm_response.usage)
-            await budget.evaluate(iteration)
-
-            step = strategy.parse_response(llm_response)
-            if llm_response.reasoning is not None:
-                step = replace(step, meta={**step.meta, "reasoning": llm_response.reasoning})
-            steps.append(step)
-
-            limited = _pending_limit_result(
-                agent=agent,
-                state_store=state_store,
-                response=llm_response,
-                run_id=resolved_run_id,
+                prepared=prepared,
+                tools=tools,
                 iteration=iteration,
-                steps=steps,
-                usage=total_usage,
-                meta={"notifier_warnings": notifier_warnings} if notifier_warnings else {},
+                duration_ms=llm_duration_ms,
+                findings=None,
             )
             if limited is not None:
                 yield RunEvent(type=RunEventType.RUN_ERROR, run_result=limited)
                 return
 
             if isinstance(step.action, Finish):
-                await _append_assistant(
-                    llm_response,
-                    history,
-                    recorder,
-                    notifier,
-                    resolved_run_id,
-                    iteration,
-                    notifier_warnings,
-                    phase="final_answer",
-                )
-                meta: dict[str, Any] = (
-                    {"notifier_warnings": notifier_warnings} if notifier_warnings else {}
-                )
                 yield RunEvent(
                     type=RunEventType.RUN_COMPLETED,
                     phase="final_answer",
-                    run_result=RunResult(
-                        run_id=resolved_run_id,
-                        status=RunStatus.SUCCESS,
-                        answer=step.action.answer,
-                        steps=steps,
-                        commentary=_commentary(steps),
-                        iteration_count=iteration,
-                        usage=total_usage,
-                        meta=meta,
-                        stop_reason=final_stop_reason(
-                            llm_response, run_id=resolved_run_id, default_model=provider.model
-                        ),
-                    ),
+                    run_result=await _finish_result(ctx, llm_response, step.action, iteration),
                 )
                 return
 
             if isinstance(step.action, Clarification):
-                await _append_assistant(
-                    llm_response,
-                    history,
-                    recorder,
-                    notifier,
-                    resolved_run_id,
-                    iteration,
-                    notifier_warnings,
-                    phase="final_answer",
-                )
-                pause = _build_pause(
-                    agent_name=agent.name,
-                    pending_calls=[],
-                    target_lookup=lookups.target,
-                    history=history,
-                    steps=steps,
-                    iteration=iteration,
-                    usage=total_usage,
-                    budget=budget,
-                    image_view=pause_image_view(image_state, history),
-                )
-                meta = {"pause_state": pause}
-                if notifier_warnings:
-                    meta["notifier_warnings"] = notifier_warnings
                 yield RunEvent(
                     type=RunEventType.RUN_PAUSED,
-                    run_result=RunResult(
-                        run_id=resolved_run_id,
-                        status=RunStatus.WAITING_HUMAN_INPUT,
-                        answer=step.action.question,
-                        steps=steps,
-                        commentary=_commentary(steps),
-                        iteration_count=iteration,
-                        usage=total_usage,
-                        meta=meta,
+                    run_result=await _clarification_result(
+                        ctx, llm_response, step.action, iteration
                     ),
                 )
                 return
 
             if isinstance(step.action, ToolCall):
-                await _append_assistant(
-                    llm_response,
-                    history,
-                    recorder,
-                    notifier,
-                    resolved_run_id,
-                    iteration,
-                    notifier_warnings,
-                    phase="commentary",
-                )
-                if state_store is not None:
-                    # The provider may have returned after sweep revoked this worker.
-                    await _read_control(state_store, resolved_run_id)
-                tool_history_start = len(history)
-                outcome = await _process_tool_calls(
-                    step=step,
-                    call_counts=call_counts,
-                    lookups=lookups,
-                    strategy=strategy,
-                    recorder=recorder,
-                    notifier=notifier,
-                    run_id=resolved_run_id,
-                    iteration=iteration,
-                    history=history,
-                    warnings=notifier_warnings,
-                    deny=agent.deny,
-                    require_approval=agent.require_approval,
-                    tool_result_transform=agent.tool_result_transform,
-                    guardrail_engine=None,  # streaming + guardrails banned at Agent level
-                    before_tool=before_tool,
-                    tenant_id=hook_tenant_id,
-                    image_runtime=image_runtime,
+                outcome, tool_history_start = await _run_tool_step(
+                    ctx, llm_response, step, iteration
                 )
                 for tc, tool_result in outcome.all_results:
                     yield RunEvent(
@@ -2910,56 +2933,12 @@ class ReActLoop(Loop):
                         iteration=iteration,
                         phase="commentary",
                     )
-                _mark_call_rejections(history, tool_history_start, outcome.all_results)
-                order_observations(recorder, history)
-                if outcome.pending_calls:
-                    pause_status = (
-                        RunStatus.WAITING_APPROVAL
-                        if outcome.pending_approval
-                        else RunStatus.WAITING_CLIENT_TOOL
-                    )
-                    pause = _build_pause(
-                        agent_name=agent.name,
-                        pending_calls=outcome.pending_calls,
-                        target_lookup=lookups.target,
-                        history=history,
-                        steps=steps,
-                        iteration=iteration,
-                        usage=total_usage,
-                        approval_gates=outcome.approval_gates,
-                        budget=budget,
-                        image_view=pause_image_view(image_state, history),
-                    )
-                    meta = {"pause_state": pause}
-                    if notifier_warnings:
-                        meta["notifier_warnings"] = notifier_warnings
-                    yield RunEvent(
-                        type=RunEventType.RUN_PAUSED,
-                        run_result=RunResult(
-                            run_id=resolved_run_id,
-                            status=pause_status,
-                            steps=steps,
-                            commentary=_commentary(steps),
-                            iteration_count=iteration,
-                            usage=total_usage,
-                            meta=meta,
-                        ),
-                    )
+                paused = _after_tools(ctx, outcome, tool_history_start, iteration)
+                if paused is not None:
+                    yield RunEvent(type=RunEventType.RUN_PAUSED, run_result=paused)
                     return
 
-        meta = {"notifier_warnings": notifier_warnings} if notifier_warnings else {}
-        yield RunEvent(
-            type=RunEventType.RUN_COMPLETED,
-            run_result=RunResult(
-                run_id=resolved_run_id,
-                status=RunStatus.MAX_ITERATIONS,
-                steps=steps,
-                commentary=_commentary(steps),
-                iteration_count=agent.max_iterations,
-                usage=total_usage,
-                meta=meta,
-            ),
-        )
+        yield RunEvent(type=RunEventType.RUN_COMPLETED, run_result=_max_iterations_result(ctx))
 
 
 def _interrupted_result(
