@@ -976,30 +976,33 @@ async def retry_unstarted_stream(
     generator is always closed, so early ``aclose()`` and cancellation close
     the upstream response.
     """
-    attempts = 0
-    while True:
-        attempts += 1
-        attempt = open_attempt()
-        yielded = False
-        retry = False
-        try:
-            async for event in attempt:
-                yielded = True
-                yield event
-            return
-        except ProviderStreamIncompleteError:
-            if yielded or attempts > 1:
-                raise
-            retry = True
-        finally:
-            await attempt.aclose()
-        if retry:
-            logger.warning(
-                "provider.stream_retry run_id=%s provider=%s model=%s reason=stream_incomplete",
-                run_id,
-                provider,
-                model,
-            )
+    try:
+        attempts = 0
+        while True:
+            attempts += 1
+            attempt = open_attempt()
+            yielded = False
+            retry = False
+            try:
+                async for event in attempt:
+                    yielded = True
+                    yield event
+                return
+            except ProviderStreamIncompleteError:
+                if yielded or attempts > 1:
+                    raise
+                retry = True
+            finally:
+                await attempt.aclose()
+            if retry:
+                logger.warning(
+                    "provider.stream_retry run_id=%s provider=%s model=%s reason=stream_incomplete",
+                    run_id,
+                    provider,
+                    model,
+                )
+    finally:
+        del open_attempt
 
 
 class WireRequest:

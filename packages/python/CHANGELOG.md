@@ -200,6 +200,7 @@
 
 ### Fixed
 
+- OpenAI Chat, Responses and OpenRouter streaming image failures release request holders from tracebacks.
 - Anthropic image-bearing streaming failures drop the SDK stream from traceback locals.
 - OpenRouter tool-call warnings identify the adapter and the model selected for each call.
 - OpenAI Responses no longer sends prompt cache keys or retention to non-OpenAI endpoints.

@@ -677,6 +677,7 @@ class OpenAIResponsesProvider(OpenAIFamilyProvider):
 
         failure: Exception | None = None
         stream: Any = None
+        iterator: Any = None
         try:
             async with opened_stream(
                 clock, functools.partial(self._create, client, request)
@@ -802,9 +803,8 @@ class OpenAIResponsesProvider(OpenAIFamilyProvider):
         except Exception as exc:
             failure = raise_or_defer(self, exc, request.registry, model, streaming=True)
         if failure is not None:
-            # Raised outside any handler, so it chains nothing that holds the
-            # request body; the SDK stream (its response holds the body) is dropped.
-            del stream
+            # Drop every request and SDK-stream alias before retaining this frame.
+            del request, stream, iterator
             raise failure
 
         if _completed_response is None:

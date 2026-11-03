@@ -602,6 +602,7 @@ class OpenAIProvider(OpenAIFamilyProvider):
 
         failure: Exception | None = None
         stream: Any = None
+        chunk_iter: Any = None
         done_seen: list[bool] | None = None
         try:
             async with opened_stream(
@@ -723,9 +724,8 @@ class OpenAIProvider(OpenAIFamilyProvider):
         except Exception as exc:
             failure = raise_or_defer(self, exc, request.registry, model, streaming=True)
         if failure is not None:
-            # Raised outside any handler, so it chains nothing that holds the
-            # request body; the SDK stream (its response holds the body) is dropped.
-            del stream
+            # Drop every request and SDK-stream alias before retaining this frame.
+            del request, stream, chunk_iter
             raise failure
 
         if finish_reason is None and not saw_usage and not (done_seen and done_seen[0]):
