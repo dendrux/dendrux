@@ -52,7 +52,7 @@ async def test_recovery_dispatch_rechecks_current_policy(store, engine, policy):
 
 
 @pytest.mark.parametrize("streaming", [False, True])
-async def test_stream_recovery_omits_work_callback(store, engine, monkeypatch, streaming):
+async def test_recovery_passes_work_callback_on_both_paths(store, engine, monkeypatch, streaming):
     agent, paused, effects = await paused_recovery(store, engine)
     resolve = _reclaim.resolve
     callbacks = []
@@ -75,4 +75,4 @@ async def test_stream_recovery_omits_work_callback(store, engine, monkeypatch, s
         )
     assert result.status == RunStatus.SUCCESS and effects == [True]
     assert len(callbacks) == 1
-    assert (callbacks[0] is None) is streaming
+    assert callable(callbacks[0])

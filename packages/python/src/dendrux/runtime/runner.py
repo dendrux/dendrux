@@ -4378,6 +4378,7 @@ class _ResumeContext:
         "resolved_strategy",
         "recorder_started",
         "notifier_started",
+        "notifier_warnings",
     )
 
     def __init__(
@@ -4398,6 +4399,7 @@ class _ResumeContext:
         self.resolved_strategy = resolved_strategy
         self.recorder_started = False
         self.notifier_started = False
+        self.notifier_warnings: list[str] = []
 
     def _mark_notifier_started(self) -> None:
         self.notifier_started = True
@@ -4935,6 +4937,15 @@ async def _approval_policy_denial(
     return result
 
 
+def _approval_dispatch_inputs(
+    strategy: Strategy | None, warnings: list[str] | None
+) -> tuple[Strategy, list[str]]:
+    return (
+        strategy if strategy is not None else NativeToolCalling(),
+        warnings if warnings is not None else [],
+    )
+
+
 async def _execute_approved_tools(
     agent: Agent,
     pause_state: PauseState,
@@ -4944,6 +4955,8 @@ async def _execute_approved_tools(
     *,
     history: list[Message] | None = None,
     resolved_loop: Loop | None = None,
+    strategy: Strategy | None = None,
+    notifier_warnings: list[str] | None = None,
     decisions: dict[str, ApprovalDecision] | None = None,
     state_store: StateStore | None = None,
     image_runtime: ImageRuntime | None = None,
@@ -4977,12 +4990,13 @@ async def _execute_approved_tools(
     from dendrux.loops._helpers import notify_tool as _ntfy_tool
     from dendrux.loops._helpers import notify_tool_started as _ntfy_tool_started
     from dendrux.loops._helpers import record_tool_started as _rec_tool_started
-    from dendrux.loops.react import _execute_tool, _process_tool_calls
+    from dendrux.loops.react import _execute_tool, _format_result, _process_tool_calls
     from dendrux.skills._session import SkillTool
     from dendrux.tools import enforce_call_limits
     from dendrux.tools._validate import check_tool_call
     from dendrux.types import AgentStep, ToolResult
 
+    strategy, notifier_warnings = _approval_dispatch_inputs(strategy, notifier_warnings)
     target_history = history if history is not None else pause_state.history
     lookups = await agent.get_tool_lookups(loop=resolved_loop)
     configure = getattr(recorder, "configure_tools", None)
@@ -5009,15 +5023,15 @@ async def _execute_approved_tools(
         if executed:
             await record_tool(recorder, run_id, tc, tr, iteration)
             _mark_work(on_work)
-            await _ntfy_tool(notifier, run_id, tc, tr, iteration)
-        result_msg = tool_result_message(tr)
+            await _ntfy_tool(notifier, run_id, tc, tr, iteration, warnings=notifier_warnings)
+        result_msg = _format_result(strategy, tr)
         if not executed or tr.meta.get("code") == "max_calls":
             result_msg.meta[NOT_EXECUTED_META_KEY] = True
         target_history.append(result_msg)
         result_msg = await record_message(recorder, run_id, result_msg, iteration)
         _mark_work(on_work)
         target_history[-1] = result_msg
-        await _ntfy_msg(notifier, run_id, result_msg, iteration)
+        await _ntfy_msg(notifier, run_id, result_msg, iteration, warnings=notifier_warnings)
         results.append((tc, tr))
 
     for index, (tc, outcome, reason) in enumerate(outcomes):
@@ -5043,7 +5057,7 @@ async def _execute_approved_tools(
             )
             if getattr(state_store, "storage_format", 1) != STORAGE_FORMAT_CHECKPOINTED:
                 await _rec_tool_started(recorder, run_id, tc, iteration)
-            await _ntfy_tool_started(notifier, run_id, tc, iteration)
+            await _ntfy_tool_started(notifier, run_id, tc, iteration, warnings=notifier_warnings)
             await _append(tc, denied)
             continue
 
@@ -5059,13 +5073,13 @@ async def _execute_approved_tools(
                 step=AgentStep(reasoning=None, action=tc),
                 call_counts=counts,
                 lookups=lookups,
-                strategy=NativeToolCalling(),
+                strategy=strategy,
                 recorder=recorder,
                 notifier=notifier,
                 run_id=run_id,
                 iteration=iteration,
                 history=target_history,
-                warnings=[],
+                warnings=notifier_warnings,
                 deny=agent._deny,
                 tool_result_transform=agent.tool_result_transform,
                 tenant_id=None,
@@ -5090,7 +5104,7 @@ async def _execute_approved_tools(
         if invalid_result is None:
             await _rec_tool_started(recorder, run_id, tc, iteration)
             _mark_work(on_work)
-            await _ntfy_tool_started(notifier, run_id, tc, iteration)
+            await _ntfy_tool_started(notifier, run_id, tc, iteration, warnings=notifier_warnings)
             from dendrux.loops._helpers import lease_scope
 
             async with lease_scope(recorder):
@@ -5838,9 +5852,27 @@ def _resume_delegation(
     )
 
 
+def _resume_warning_meta(ctx: _ResumeContext | None, meta: dict[str, Any]) -> dict[str, Any]:
+    warnings = getattr(ctx, "notifier_warnings", None)
+    if warnings:
+        meta["notifier_warnings"] = warnings + meta.get("notifier_warnings", [])
+    return meta
+
+
+async def _resume_loop_stream(
+    ctx: _ResumeContext, events: AsyncGenerator[RunEvent, None]
+) -> AsyncGenerator[RunEvent, None]:
+    async with aclosing(events):
+        async for event in events:
+            if event.run_result is not None:
+                _resume_warning_meta(ctx, event.run_result.meta)
+            yield event
+
+
 async def _finish_resumed_result(
     store: StateStore, run_id: str, ctx: _ResumeContext, result: RunResult
 ) -> RunResult:
+    _resume_warning_meta(ctx, result.meta)
     result = await _persist_loop_outcome(
         recorder=ctx.recorder,
         provider_kwargs=ctx.pause_state.provider_kwargs,
@@ -5887,6 +5919,8 @@ async def _resume_approval_batch(
         run_id,
         history=ctx.history,
         resolved_loop=ctx.resolved_loop,
+        strategy=ctx.resolved_strategy,
+        notifier_warnings=ctx.notifier_warnings,
         decisions=decision_map,
         state_store=store,
         image_runtime=image_runtime,
@@ -6301,7 +6335,14 @@ async def _resume_core(
 
         except Exception as exc:
             await _handle_resume_failure(
-                state_store, run_id, expected_status, ctx, exc, progress, _skip_claim, mcp_meta
+                state_store,
+                run_id,
+                expected_status,
+                ctx,
+                exc,
+                progress,
+                _skip_claim,
+                _resume_warning_meta(ctx, mcp_meta),
             )
             raise
 
@@ -6443,12 +6484,21 @@ async def _stream_approval_events(
         yield _stopped_stream_event(await _finish_resumed_result(store, run_id, ctx, stop))
 
 
+def _mark_stream_recovery_work(shared: dict[str, Any]) -> None:
+    shared["work_started"] = True
+
+
+def _stream_resume_started(shared: dict[str, Any]) -> bool:
+    # Work is an independent reason to finalize; it must never be made retryable.
+    return bool(shared.get("work_started") or shared.get("claimed"))
+
+
 async def _stream_resume_failure(
     _shared: dict[str, Any], extra_notifier: LoopNotifier | None, run_id: str, exc: Exception
 ) -> None:
     store = _shared.get("state_store")
     err_ctx = _shared.get("ctx")
-    if store is not None and _shared.get("claimed"):
+    if store is not None and _stream_resume_started(_shared):
         await _persist_run_failure(store, run_id, exc, safe_event=True)
     try:
         if err_ctx is not None:
@@ -6686,6 +6736,7 @@ def resume_stream(
                     ctx,
                     image_runtime=image_runtime,
                     tenant_id=run_record.tenant_id if run_record else None,
+                    on_work=partial(_mark_stream_recovery_work, _shared),
                 )
                 if stop is not None:
                     yield _stopped_stream_event(
@@ -6722,7 +6773,7 @@ def resume_stream(
             )
             async with aclosing(
                 _stream_loop_events(
-                    loop_stream,
+                    _resume_loop_stream(ctx, loop_stream),
                     state_store=store,
                     recorder=ctx.recorder,
                     notifier=ctx.notifier,
@@ -6755,7 +6806,9 @@ def resume_stream(
                     status=RunStatus.ERROR,
                     error=_safe_error(exc),
                     error_info=_provider_error_info(exc),
-                    meta=_stream_error_meta(mcp_meta, exc),
+                    meta=_resume_warning_meta(
+                        _shared.get("ctx"), _stream_error_meta(mcp_meta, exc)
+                    ),
                 ),
                 error=_safe_error(exc),
             )
