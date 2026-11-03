@@ -36,7 +36,7 @@ class DriverError(Exception):
 class Raises:
     """Expected outcome: classification raises this exception type with this text."""
 
-    def __init__(self, kind: type[BaseException], text: str) -> None:
+    def __init__(self, kind: type[BaseException], text: str | None) -> None:
         self.kind = kind
         self.text = text
 
@@ -53,6 +53,25 @@ class OrigStopIterationError(Exception):
     @property
     def orig(self) -> Any:
         raise StopIteration("orig-read")
+
+
+class RaisingClass:
+    """An object whose ``__class__`` read raises, as an ``isinstance`` test sees it."""
+
+    @property
+    def __class__(self) -> Any:
+        raise StopIteration("class-read")
+
+
+class OrigRaisingClassError(Exception):
+    orig = RaisingClass()
+
+
+def context_with_raising_class_orig() -> Exception:
+    root = Exception("flagged")
+    root.connection_invalidated = True  # type: ignore[attr-defined]
+    root.__context__ = OrigRaisingClassError()
+    return root
 
 
 def context_with_orig_stopiteration() -> Exception:
@@ -294,6 +313,13 @@ ROWS += [
         Raises(StopIteration, "orig-read"),
     ),
     (
+        # inside the old generator expression, so Python turns it into RuntimeError
+        "review-m4-stopiteration-in-isinstance-becomes-runtime-error",
+        LIMIT,
+        context_with_raising_class_orig,
+        Raises(RuntimeError, None),
+    ),
+    (
         "review-m5-stopiteration-in-params-getter",
         LIMIT,
         ParamsStopIterationError,
@@ -312,7 +338,8 @@ def test_classify_db_error_table(
         with pytest.raises(expected.kind) as caught:
             store(limit).classify_db_error(build())
         assert type(caught.value) is expected.kind
-        assert str(caught.value) == expected.text
+        if expected.text is not None:
+            assert str(caught.value) == expected.text
     else:
         assert store(limit).classify_db_error(build()) == expected
 

@@ -57,10 +57,14 @@ def _packet_limit(facts: Any) -> int | None:
     return None if facts is None else facts.max_allowed_packet
 
 
-def _nested_errors(error: BaseException) -> list[BaseException]:
-    """``orig``, cause and context, in the order they are pushed on the walk stack."""
+def _nested_errors(error: BaseException) -> Iterator[BaseException]:
+    """``orig``, cause and context, in the order they are pushed on the walk stack.
+
+    The getters are read eagerly, outside the generator, so an exception they
+    raise propagates unchanged; only the ``isinstance`` test runs inside it.
+    """
     nested = (getattr(error, "orig", None), error.__cause__, error.__context__)
-    return [item for item in nested if isinstance(item, BaseException)]
+    return (item for item in nested if isinstance(item, BaseException))
 
 
 def _value_over_limit(value: str | bytes | bytearray | memoryview, limit: int) -> bool:
