@@ -24,6 +24,7 @@ import inspect
 import json
 import logging
 import time
+from contextlib import aclosing
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
@@ -40,23 +41,20 @@ from dendrux._meta_keys import (
 )
 from dendrux.errors import ImageError, ImagePersistenceUnsupportedError
 from dendrux.guardrails._engine import GuardrailEngine
-from dendrux.llm._calls import complete_call, stream_call
+from dendrux.llm._calls import complete_call
 from dendrux.llm._evidence import (
     RejectedArguments,
     RejectedToolName,
     persistable_call,
 )
-from dendrux.llm._retry_telemetry import telemetry_context, telemetry_stream
+from dendrux.llm._retry_telemetry import telemetry_context
 from dendrux.loops._budget import BudgetBreach, BudgetCarry, BudgetTracker, breach_payload
 from dendrux.loops._helpers import (
-    StreamInterruptedError,
     build_cache_key_prefix,
     final_stop_reason,
     governance_sinks,
     guardrail_meta,
-    interruptible,
     lease_scope,
-    leased_stream,
     notify_governance,
     notify_llm,
     notify_llm_started,
@@ -79,7 +77,7 @@ from dendrux.loops._images import (
     release_wire,
     tool_result_images_dropped,
 )
-from dendrux.loops._llm_call import ProviderCallSite
+from dendrux.loops._llm_call import EventRelay, ProviderCallSite, StreamCall, stream_call_events
 from dendrux.loops._policy_context import initial_call_counts, static_denial, tool_call_context
 from dendrux.loops.base import Loop
 from dendrux.media._ids import IMAGE_ID_RE
@@ -154,7 +152,7 @@ if TYPE_CHECKING:
     from dendrux.runtime.state import StateStore
     from dendrux.skills._session import SkillSession
     from dendrux.strategies.base import Strategy
-    from dendrux.types import BeforeToolHook, ToolDef, ToolResultTransform
+    from dendrux.types import BeforeToolHook, StreamEvent, ToolDef, ToolResultTransform
 
 logger = logging.getLogger(__name__)
 
@@ -1855,6 +1853,133 @@ def _stop_event(result: RunResult) -> RunEvent:
     )
 
 
+class _StreamDeltas:
+    """ReAct's events for a streamed call; text after a tool block is known commentary."""
+
+    __slots__ = ("iteration", "saw_tool_use")
+
+    def __init__(self, iteration: int) -> None:
+        self.iteration = iteration
+        self.saw_tool_use = False
+
+    def __call__(self, event: StreamEvent) -> RunEvent | None:
+        if event.type == StreamEventType.TEXT_DELTA:
+            return RunEvent(
+                type=RunEventType.TEXT_DELTA,
+                text=event.text,
+                iteration=self.iteration,
+                phase=event.phase or ("commentary" if self.saw_tool_use else None),
+            )
+        if event.type == StreamEventType.REASONING_DELTA:
+            return RunEvent(
+                type=RunEventType.REASONING_DELTA, text=event.text, iteration=self.iteration
+            )
+        if event.type == StreamEventType.TOOL_USE_START:
+            self.saw_tool_use = True
+            return RunEvent(
+                type=RunEventType.TOOL_USE_START,
+                tool_name=event.tool_name,
+                tool_call_id=event.tool_call_id,
+                iteration=self.iteration,
+                phase="commentary",
+            )
+        if event.type == StreamEventType.TOOL_USE_END:
+            self.saw_tool_use = True
+            return RunEvent(
+                type=RunEventType.TOOL_USE_END,
+                tool_call=persistable_call(event.tool_call),
+                tool_name=event.tool_name,
+                tool_call_id=event.tool_call_id,
+                iteration=self.iteration,
+                phase="commentary",
+            )
+        return None
+
+
+async def _stream_call(
+    ctx: _RunContext, messages: list[Message], tools: Any, iteration: int
+) -> StreamCall:
+    """The iteration's streamed provider call over its image request view (§5.1).
+
+    Image guardrails are batch-only: stream() rejects guardrails at the Agent level.
+    """
+    return StreamCall(
+        ctx.calls,
+        await ctx.images.prepare(messages, iteration=iteration),
+        messages,
+        tools=tools,
+        iteration=iteration,
+        interrupt=ctx.interrupt,
+        control_reader=ctx.control_reader,
+        cache_key_prefix=ctx.cache_key_prefix,
+        translate=_StreamDeltas(iteration),
+        check=_require_done,
+    )
+
+
+def _call_end_event(ctx: _RunContext, call: StreamCall, iteration: int) -> RunEvent | None:
+    """The terminal event of a streamed call that ended without a response, else None."""
+    state = ctx.state
+    if call.stop is not None:
+        return _stop_event(
+            _control_stop_result(
+                call.stop,
+                agent_name=ctx.agent.name,
+                run_id=ctx.run_id,
+                history=state.history,
+                steps=state.steps,
+                iteration=iteration,
+                usage=state.usage,
+                meta=guardrail_meta(None, state.warnings),
+                budget=ctx.budget,
+                image_view=pause_image_view(state.image_view, state.history),
+            )
+        )
+    if call.interrupted:
+        # Mid-stream interrupt (cancel_run reached this process). The
+        # interrupted call reported no usage, so the usage covers completed
+        # iterations only. Partial text becomes the answer.
+        return RunEvent(
+            type=RunEventType.RUN_CANCELLED,
+            run_result=_interrupted_result(
+                run_id=ctx.run_id,
+                partial_text=call.partial_text,
+                steps=state.steps,
+                iteration=iteration,
+                usage=state.usage,
+                notifier_warnings=state.warnings,
+            ),
+        )
+    return None
+
+
+async def _answer_event(
+    ctx: _RunContext, response: LLMResponse, action: Any, iteration: int
+) -> RunEvent | None:
+    """The stream's terminal event for a Finish or a Clarification, else None."""
+    if isinstance(action, Finish):
+        return RunEvent(
+            type=RunEventType.RUN_COMPLETED,
+            phase="final_answer",
+            run_result=await _finish_result(ctx, response, action, iteration),
+        )
+    if isinstance(action, Clarification):
+        return RunEvent(
+            type=RunEventType.RUN_PAUSED,
+            run_result=await _clarification_result(ctx, response, action, iteration),
+        )
+    return None
+
+
+def _require_done(response: LLMResponse | None, iteration: int) -> None:
+    if response is None:
+        raise RuntimeError(
+            f"Provider stream ended without DONE event at iteration "
+            f"{iteration}. complete_stream() must yield "
+            f"StreamEvent(type=DONE, raw=LLMResponse)."
+        )
+
+
 def _build_messages(ctx: _RunContext) -> tuple[list[Message], Any]:
     return ctx.strategy.build_messages(
         system_prompt=ctx.agent.get_system_prompt(loop=ctx.loop),
@@ -2628,11 +2753,6 @@ class ReActLoop(Loop):
             image_view_state=image_view_state,
             interrupt=interrupt,
         )
-        resolved_run_id, _pkw, cache_key_prefix = ctx.run_id, ctx.pkw, ctx.cache_key_prefix
-        history, steps, total_usage = ctx.state.history, ctx.state.steps, ctx.state.usage
-        notifier_warnings, image_state = ctx.state.warnings, ctx.state.image_view
-        images, budget, _control_reader = ctx.images, ctx.budget, ctx.control_reader
-        calls = ctx.calls
         _bind_run_checkpoint(ctx)
         start_iteration = iteration_offset + 1
         end_iteration = agent.max_iterations + 1
@@ -2649,203 +2769,26 @@ class ReActLoop(Loop):
             messages, tools = _build_messages(ctx)
             await _checkpoint_view(recorder, messages, iteration)
 
-            # Image request view (§5.1). Image guardrails are batch-only:
-            # stream() rejects guardrails at the Agent level.
-            prepared = await images.prepare(messages, iteration=iteration)
-
-            # LLM call — streaming (lifecycle: started → completed/failed)
-            await _record_llm_started(
-                recorder,
-                resolved_run_id,
-                iteration,
-                semantic_messages=prepared.semantic,
-                semantic_tools=tools,
-            )
-            await _notify_llm_started(
-                notifier,
-                resolved_run_id,
-                iteration,
-                notifier_warnings,
-                semantic_messages=prepared.semantic,
-                semantic_tools=tools,
-            )
-            t0 = time.monotonic()
-            llm_response: LLMResponse | None = None
-            provider_stream = telemetry_stream(
-                stream_call(
-                    provider,
-                    prepared.wire,
-                    tools=tools,
-                    run_id=resolved_run_id,
-                    cache_key_prefix=cache_key_prefix,
-                    **_pkw,
-                ),
-                run_id=resolved_run_id,
-                iteration=iteration,
-                sinks=governance_sinks(recorder, notifier, resolved_run_id),
-            )
-            partial_text: list[str] = []
-            # Text after a tool block in the same call is known commentary.
-            saw_tool_use = False
-            interrupted = False
-            retried = False
-            stop_control: Any = None
-            try:
-                while True:
-                    failure: Exception | None = None
-                    # Externally visible deltas of this provider call (§5.7 guard).
-                    visible_deltas = 0
-                    active_stream = leased_stream(
-                        interruptible(provider_stream, interrupt), recorder
-                    )
+            # LLM call — streaming (lifecycle: started → completed/failed). The
+            # call is driven here, in the consumer's task, and closed with it.
+            call = await _stream_call(ctx, messages, tools, iteration)
+            relay = EventRelay(stream_call_events(call))
+            async with aclosing(relay.events):
+                while (event := await relay.next()) is not None:
                     try:
-                        async for event in active_stream:
-                            if event.type == StreamEventType.TEXT_DELTA:
-                                partial_text.append(event.text or "")
-                                visible_deltas += 1
-                                yield RunEvent(
-                                    type=RunEventType.TEXT_DELTA,
-                                    text=event.text,
-                                    iteration=iteration,
-                                    phase=event.phase or ("commentary" if saw_tool_use else None),
-                                )
-                            elif event.type == StreamEventType.REASONING_DELTA:
-                                visible_deltas += 1
-                                yield RunEvent(
-                                    type=RunEventType.REASONING_DELTA,
-                                    text=event.text,
-                                    iteration=iteration,
-                                )
-                            elif event.type == StreamEventType.TOOL_USE_START:
-                                saw_tool_use = True
-                                visible_deltas += 1
-                                yield RunEvent(
-                                    type=RunEventType.TOOL_USE_START,
-                                    tool_name=event.tool_name,
-                                    tool_call_id=event.tool_call_id,
-                                    iteration=iteration,
-                                    phase="commentary",
-                                )
-                            elif event.type == StreamEventType.TOOL_USE_END:
-                                saw_tool_use = True
-                                visible_deltas += 1
-                                yield RunEvent(
-                                    type=RunEventType.TOOL_USE_END,
-                                    tool_call=persistable_call(event.tool_call),
-                                    tool_name=event.tool_name,
-                                    tool_call_id=event.tool_call_id,
-                                    iteration=iteration,
-                                    phase="commentary",
-                                )
-                            elif event.type == StreamEventType.DONE:
-                                llm_response = event.raw
-                        # Validate inside the same try so a contract-violating
-                        # provider stream still pairs with on_llm_call_failed.
-                        if llm_response is None:
-                            raise RuntimeError(
-                                f"Provider stream ended without DONE event at iteration "
-                                f"{iteration}. complete_stream() must yield "
-                                f"StreamEvent(type=DONE, raw=LLMResponse)."
-                            )
-                    except Exception as _stream_exc:
-                        await calls.record_failure(_stream_exc, t0, iteration)
-                        if isinstance(_stream_exc, StreamInterruptedError):
-                            interrupted = True
-                        elif not prepared.slots:
-                            raise
-                        else:
-                            failure = _stream_exc
-                            prepared = release_wire(prepared)
-                    if failure is None:
-                        break
-                    stop_control, error, decision = await calls.decide(
-                        failure,
-                        prepared,
-                        iteration,
-                        retried=retried,
-                        visible_deltas=visible_deltas,
-                        control_reader=_control_reader,
-                    )
-                    del failure
-                    if stop_control is not None:
-                        break
-                    if error is not None:
-                        raise error
-                    # Retry in place (N-15.2): close the first stream, keep the
-                    # telemetry context, open a new stream for the new view.
-                    retried = True
-                    await provider_stream.aclose()
-                    prepared = await images.prepare(
-                        messages, iteration=iteration, force_tombstones=decision.tombstones
-                    )
-                    await _record_llm_started(
-                        recorder,
-                        resolved_run_id,
-                        iteration,
-                        semantic_messages=prepared.semantic,
-                        semantic_tools=tools,
-                    )
-                    await _notify_llm_started(
-                        notifier,
-                        resolved_run_id,
-                        iteration,
-                        notifier_warnings,
-                        semantic_messages=prepared.semantic,
-                        semantic_tools=tools,
-                    )
-                    t0 = time.monotonic()
-                    provider_stream = telemetry_stream(
-                        stream_call(
-                            provider,
-                            prepared.wire,
-                            tools=tools,
-                            run_id=resolved_run_id,
-                            cache_key_prefix=cache_key_prefix,
-                            **_pkw,
-                        ),
-                        run_id=resolved_run_id,
-                        iteration=iteration,
-                        sinks=governance_sinks(recorder, notifier, resolved_run_id),
-                    )
-            finally:
-                await active_stream.aclose()
-                await provider_stream.aclose()
-            if stop_control is not None:
-                stop_result = _control_stop_result(
-                    stop_control,
-                    agent_name=agent.name,
-                    run_id=resolved_run_id,
-                    history=history,
-                    steps=steps,
-                    iteration=iteration,
-                    usage=total_usage,
-                    meta=guardrail_meta(None, notifier_warnings),
-                    budget=budget,
-                    image_view=pause_image_view(image_state, history),
-                )
-                yield _stop_event(stop_result)
+                        yield event
+                    except Exception as thrown:
+                        relay.throw(thrown)
+            ended = _call_end_event(ctx, call, iteration)
+            if ended is not None:
+                yield ended
                 return
-
-            if interrupted:
-                # Mid-stream interrupt (cancel_run reached this process). The
-                # interrupted call reported no usage, so total_usage covers
-                # completed iterations only. Partial text becomes the answer.
-                yield RunEvent(
-                    type=RunEventType.RUN_CANCELLED,
-                    run_result=_interrupted_result(
-                        run_id=resolved_run_id,
-                        partial_text=partial_text,
-                        steps=steps,
-                        iteration=iteration,
-                        usage=total_usage,
-                        notifier_warnings=notifier_warnings,
-                    ),
-                )
-                return
-            # The try-block raised if no DONE arrived; only the interrupted path
+            # The call raised if no DONE arrived; only a stop or an interrupt
             # (handled above) leaves this None.
-            assert llm_response is not None
-            prepared, llm_duration_ms, llm_response = calls.settle(prepared, llm_response, t0)
+            assert call.response is not None
+            prepared, llm_duration_ms, llm_response = ctx.calls.settle(
+                call.prepared, call.response, call.t0
+            )
             step, limited = await _after_response(
                 ctx,
                 llm_response,
@@ -2859,21 +2802,9 @@ class ReActLoop(Loop):
                 yield RunEvent(type=RunEventType.RUN_ERROR, run_result=limited)
                 return
 
-            if isinstance(step.action, Finish):
-                yield RunEvent(
-                    type=RunEventType.RUN_COMPLETED,
-                    phase="final_answer",
-                    run_result=await _finish_result(ctx, llm_response, step.action, iteration),
-                )
-                return
-
-            if isinstance(step.action, Clarification):
-                yield RunEvent(
-                    type=RunEventType.RUN_PAUSED,
-                    run_result=await _clarification_result(
-                        ctx, llm_response, step.action, iteration
-                    ),
-                )
+            answered = await _answer_event(ctx, llm_response, step.action, iteration)
+            if answered is not None:
+                yield answered
                 return
 
             if isinstance(step.action, ToolCall):

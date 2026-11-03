@@ -14,6 +14,7 @@ Constraints:
 from __future__ import annotations
 
 import time
+from contextlib import aclosing
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -22,18 +23,15 @@ from dendrux._lifecycle import (
     GovernanceEventType,
 )
 from dendrux.guardrails._engine import GuardrailEngine
-from dendrux.llm._calls import complete_call, stream_call
-from dendrux.llm._retry_telemetry import telemetry_context, telemetry_stream
+from dendrux.llm._calls import complete_call
+from dendrux.llm._retry_telemetry import telemetry_context
 from dendrux.loops._budget import BudgetTracker
 from dendrux.loops._helpers import (
-    StreamInterruptedError,
     build_cache_key_prefix,
     final_stop_reason,
     governance_sinks,
     guardrail_meta,
-    interruptible,
     lease_scope,
-    leased_stream,
     notify_governance,
     notify_llm,
     notify_llm_started,
@@ -45,7 +43,7 @@ from dendrux.loops._helpers import (
     record_message,
 )
 from dendrux.loops._images import ImageCallSite, release_wire
-from dendrux.loops._llm_call import ProviderCallSite
+from dendrux.loops._llm_call import EventRelay, ProviderCallSite, StreamCall, stream_call_events
 from dendrux.loops.base import Loop
 from dendrux.loops.react import (
     _bind_checkpoint,
@@ -84,7 +82,7 @@ if TYPE_CHECKING:
     from dendrux.media._runtime import ImageRuntime
     from dendrux.runtime.state import StateStore
     from dendrux.strategies.base import Strategy
-    from dendrux.types import AgentStep, Budget
+    from dendrux.types import AgentStep, Budget, StreamEvent
 
 
 async def _single_call_budget(
@@ -882,152 +880,29 @@ class SingleCall(Loop):
             )
             return
 
-        prepared = await images.prepare(messages, iteration=1)
-
-        # LLM call (lifecycle: started → completed/failed)
-        await record_llm_started(
-            recorder,
-            resolved_run_id,
-            1,
-            semantic_messages=prepared.semantic,
-            semantic_tools=None,
-        )
-        await notify_llm_started(
-            notifier,
-            resolved_run_id,
-            1,
-            notifier_warnings,
-            semantic_messages=prepared.semantic,
-            semantic_tools=None,
-        )
-        t0 = time.monotonic()
-        llm_response: LLMResponse | None = None
-        provider_stream = telemetry_stream(
-            stream_call(
-                provider,
-                prepared.wire,
-                tools=None,
-                run_id=resolved_run_id,
-                cache_key_prefix=cache_key_prefix,
-                **_pkw,
-            ),
-            run_id=resolved_run_id,
+        # LLM call (lifecycle: started → completed/failed), driven here in the
+        # consumer's task and closed with this generator.
+        call = StreamCall(
+            calls,
+            await images.prepare(messages, iteration=1),
+            messages,
+            tools=None,
             iteration=1,
-            sinks=governance_sinks(recorder, notifier, resolved_run_id),
+            interrupt=interrupt,
+            control_reader=control_reader,
+            cache_key_prefix=cache_key_prefix,
+            translate=_single_delta,
+            check=_require_single_done,
         )
-        partial_text: list[str] = []
-        interrupted = False
-        retried = False
-        cancelled = False
-        try:
-            while True:
-                failure: Exception | None = None
-                visible_deltas = 0
-                active_stream = leased_stream(interruptible(provider_stream, interrupt), recorder)
+        relay = EventRelay(stream_call_events(call))
+        async with aclosing(relay.events):
+            while (event := await relay.next()) is not None:
                 try:
-                    async for event in active_stream:
-                        if event.type == StreamEventType.TEXT_DELTA:
-                            partial_text.append(event.text or "")
-                            visible_deltas += 1
-                            yield RunEvent(
-                                type=RunEventType.TEXT_DELTA,
-                                text=event.text,
-                                iteration=1,
-                                phase="final_answer",
-                            )
-                        elif event.type == StreamEventType.REASONING_DELTA:
-                            visible_deltas += 1
-                            yield RunEvent(
-                                type=RunEventType.REASONING_DELTA, text=event.text, iteration=1
-                            )
-                        elif event.type in (
-                            StreamEventType.TOOL_USE_START,
-                            StreamEventType.TOOL_USE_END,
-                        ):
-                            raise RuntimeError(
-                                f"SingleCall received unexpected {event.type.value} event "
-                                f"from provider stream. SingleCall agents must have zero "
-                                f"tools — the provider should not produce tool events."
-                            )
-                        elif event.type == StreamEventType.DONE:
-                            llm_response = event.raw
-                    # Validate inside the same try so contract violations still
-                    # pair with on_llm_call_failed (started already fired).
-                    if llm_response is None:
-                        raise RuntimeError(
-                            "Provider stream ended without DONE event. "
-                            "complete_stream() must yield StreamEvent(type=DONE, raw=LLMResponse)."
-                        )
-                    if llm_response.tool_calls:
-                        raise RuntimeError(
-                            f"SingleCall received unexpected tool_calls from provider "
-                            f"({len(llm_response.tool_calls)} calls). SingleCall agents must "
-                            f"have zero tools — the provider should not produce tool calls."
-                        )
-                except Exception as _stream_exc:
-                    await calls.record_failure(_stream_exc, t0, 1)
-                    if isinstance(_stream_exc, StreamInterruptedError):
-                        interrupted = True
-                    elif not prepared.slots:
-                        raise
-                    else:
-                        failure = _stream_exc
-                        prepared = release_wire(prepared)
-                if failure is None:
-                    break
-                stop, error, decision = await calls.decide(
-                    failure,
-                    prepared,
-                    1,
-                    retried=retried,
-                    visible_deltas=visible_deltas,
-                    control_reader=control_reader,
-                )
-                del failure
-                if stop is not None:
-                    cancelled = True
-                    break
-                if error is not None:
-                    raise error
-                retried = True
-                await provider_stream.aclose()
-                prepared = await images.prepare(
-                    messages, iteration=1, force_tombstones=decision.tombstones
-                )
-                await record_llm_started(
-                    recorder,
-                    resolved_run_id,
-                    1,
-                    semantic_messages=prepared.semantic,
-                    semantic_tools=None,
-                )
-                await notify_llm_started(
-                    notifier,
-                    resolved_run_id,
-                    1,
-                    notifier_warnings,
-                    semantic_messages=prepared.semantic,
-                    semantic_tools=None,
-                )
-                t0 = time.monotonic()
-                provider_stream = telemetry_stream(
-                    stream_call(
-                        provider,
-                        prepared.wire,
-                        tools=None,
-                        run_id=resolved_run_id,
-                        cache_key_prefix=cache_key_prefix,
-                        **_pkw,
-                    ),
-                    run_id=resolved_run_id,
-                    iteration=1,
-                    sinks=governance_sinks(recorder, notifier, resolved_run_id),
-                )
-        finally:
-            await active_stream.aclose()
-            await provider_stream.aclose()
+                    yield event
+                except Exception as thrown:
+                    relay.throw(thrown)
 
-        if cancelled:
+        if call.stop is not None:
             yield RunEvent(
                 type=RunEventType.RUN_CANCELLED,
                 run_result=RunResult(
@@ -1040,12 +915,12 @@ class SingleCall(Loop):
             )
             return
 
-        if interrupted:
+        if call.interrupted:
             yield RunEvent(
                 type=RunEventType.RUN_CANCELLED,
                 run_result=_interrupted_result(
                     run_id=resolved_run_id,
-                    partial_text=partial_text,
+                    partial_text=call.partial_text,
                     steps=[],
                     iteration=1,
                     usage=UsageStats(),
@@ -1054,10 +929,12 @@ class SingleCall(Loop):
             )
             return
 
-        # The try-block raised if no DONE arrived; only the interrupted path
+        # The call raised if no DONE arrived; only the interrupted path
         # (handled above) leaves this None.
-        assert llm_response is not None
-        prepared, llm_duration_ms, llm_response = calls.settle(prepared, llm_response, t0)
+        assert call.response is not None
+        prepared, llm_duration_ms, llm_response = calls.settle(
+            call.prepared, call.response, call.t0
+        )
 
         await record_llm(
             recorder,
@@ -1112,6 +989,38 @@ class SingleCall(Loop):
                     llm_response, run_id=resolved_run_id, default_model=provider.model
                 ),
             ),
+        )
+
+
+def _single_delta(event: StreamEvent) -> RunEvent | None:
+    """SingleCall's event for a streamed delta; a tool event breaks its contract."""
+    if event.type == StreamEventType.TEXT_DELTA:
+        return RunEvent(
+            type=RunEventType.TEXT_DELTA, text=event.text, iteration=1, phase="final_answer"
+        )
+    if event.type == StreamEventType.REASONING_DELTA:
+        return RunEvent(type=RunEventType.REASONING_DELTA, text=event.text, iteration=1)
+    if event.type in (StreamEventType.TOOL_USE_START, StreamEventType.TOOL_USE_END):
+        raise RuntimeError(
+            f"SingleCall received unexpected {event.type.value} event "
+            f"from provider stream. SingleCall agents must have zero "
+            f"tools — the provider should not produce tool events."
+        )
+    return None
+
+
+def _require_single_done(response: LLMResponse | None, iteration: int) -> None:
+    # Contract violations still pair with on_llm_call_failed (started already fired).
+    if response is None:
+        raise RuntimeError(
+            "Provider stream ended without DONE event. "
+            "complete_stream() must yield StreamEvent(type=DONE, raw=LLMResponse)."
+        )
+    if response.tool_calls:
+        raise RuntimeError(
+            f"SingleCall received unexpected tool_calls from provider "
+            f"({len(response.tool_calls)} calls). SingleCall agents must "
+            f"have zero tools — the provider should not produce tool calls."
         )
 
 
