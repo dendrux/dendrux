@@ -133,7 +133,9 @@ from dendrux.runtime.state import ClaimResult, _initial_loop_state, claimed_stor
 from dendrux.runtime.stores._limits_fit import ensure_agent_limits_fit
 from dendrux.runtime.submit import (
     GOVERNANCE_KEY,
-    claim_paused_validated,
+    _claim_request,
+    _claim_submission,
+    _claimed_submission_view,
     governance_snapshot,
     legacy_approval_denial,
     prepare_resume_results,
@@ -5507,6 +5509,45 @@ def _canonicalize_legacy_denials(
         results[:] = legacy_approval_denial(run_id, PauseState.from_dict(raw), results)
 
 
+def _resume_claim_fallbacks(
+    expected: str, results: list[ToolResult] | None, user_input: Any
+) -> tuple[str, ...]:
+    if results is not None and expected != RunStatus.WAITING_APPROVAL.value:
+        return (RunStatus.WAITING_APPROVAL.value,)
+    if results is None and user_input is None and expected == RunStatus.WAITING_APPROVAL.value:
+        return (RunStatus.PAUSED.value,)
+    return ()
+
+
+def _resume_claim_payload(
+    raw: dict[str, Any],
+    status: str,
+    results: list[ToolResult] | None,
+    user_input: Any,
+    user_parts: tuple[ContentPart, ...] | None,
+    decisions: list[tuple[str, ApprovalDecision]] | None,
+) -> dict[str, Any] | None:
+    if raw.get("schema_version") != 2 or (
+        results is None and user_input is None and status != RunStatus.WAITING_APPROVAL.value
+    ):
+        return None
+    from dendrux.runtime.submit import serialize_decisions, serialize_tool_results
+    from dendrux.types import content_part_to_dict
+
+    payload: dict[str, Any] = (
+        {"submitted_decisions": serialize_decisions(PauseState.from_dict(raw), dict(decisions))}
+        if decisions is not None
+        else {"submitted_tool_results": serialize_tool_results(results)}
+        if results is not None
+        else {"submitted_user_input": user_input}
+        if user_input is not None
+        else {"approved": True}
+    )
+    if user_parts is not None:
+        payload["submitted_user_parts"] = [content_part_to_dict(p) for p in user_parts]
+    return payload
+
+
 async def _claim_resume(
     store: StateStore,
     run_id: str,
@@ -5521,13 +5562,14 @@ async def _claim_resume(
     decisions: list[tuple[str, ApprovalDecision]] | None = None,
     checkpoint: dict[str, Any] | None = None,
 ) -> tuple[StateStore, str, dict[str, Any]]:
-    allowed = [expected]
-    if results is not None and expected != RunStatus.WAITING_APPROVAL.value:
-        allowed.append(RunStatus.WAITING_APPROVAL.value)
-    elif results is None and user_input is None and expected == RunStatus.WAITING_APPROVAL.value:
-        allowed.append(RunStatus.PAUSED.value)
+    request = _claim_request(
+        raw,
+        expected,
+        expected_pause_id,
+        fallbacks=_resume_claim_fallbacks(expected, results, user_input),
+    )
     validate = submission_validator(
-        run_id, raw, agent=agent, expected_pause_id=expected_pause_id, call_results=results
+        run_id, raw, agent=agent, expected_pause_id=request.generation, call_results=results
     )
     record = await store.get_run(run_id)
     require_pause_id(
@@ -5543,60 +5585,22 @@ async def _claim_resume(
         ),
         run_id=run_id,
     )
-    epoch: ClaimResult | int | bool
-    for status in allowed:
-        descriptor = None
+    for status in request.statuses:
         _canonicalize_legacy_denials(status, run_id, raw, results)
-        if raw.get("schema_version") == 2 and (
-            results is not None
-            or user_input is not None
-            or status == RunStatus.WAITING_APPROVAL.value
-        ):
-            from dendrux.runtime.submit import (
-                serialize_decisions,
-                serialize_tool_results,
-                submission_descriptor,
-            )
-
-            payload: dict[str, Any] = (
-                {
-                    "submitted_decisions": serialize_decisions(
-                        PauseState.from_dict(raw), dict(decisions)
-                    )
-                }
-                if decisions is not None
-                else {"submitted_tool_results": serialize_tool_results(results)}
-                if results is not None
-                else {"submitted_user_input": user_input}
-                if user_input is not None
-                else {"approved": True}
-            )
-            if user_parts is not None:
-                from dendrux.types import content_part_to_dict
-
-                payload["submitted_user_parts"] = [content_part_to_dict(p) for p in user_parts]
-            if status == RunStatus.WAITING_APPROVAL.value and results is not None:
-                payload["approved"] = False
-            descriptor = submission_descriptor(
-                raw,
-                checkpoint if checkpoint is not None else await store.get_loop_state(run_id) or {},
-                payload,
-                status,
-            )
-            epoch = await store.submit_and_claim(
-                run_id,
-                expected_status=status,
-                submitted_data=payload,
-                submission=descriptor,
-                validate=validate,
-            )
-        else:
-            epoch = await claim_paused_validated(
-                store,
-                run_id,
-                expected_status=status,
-                validate=validate,
-            )
+        payload = _resume_claim_payload(raw, status, results, user_input, user_parts, decisions)
+        epoch, descriptor, payload = await _claim_submission(
+            store,
+            run_id,
+            request,
+            status,
+            validate=validate,
+            payload=payload,
+            checkpointing=True,
+            approval=False
+            if status == RunStatus.WAITING_APPROVAL.value and results is not None
+            else None,
+            checkpoint=checkpoint,
+        )
         if epoch:
             view = claimed_store(store, run_id, epoch)
             try:
@@ -5604,18 +5608,7 @@ async def _claim_resume(
             except BaseException:
                 await _release_claim(view, run_id, status)
                 raise
-            if descriptor is not None:
-                raw = {
-                    **raw,
-                    "submission": {
-                        **{
-                            k: descriptor[k]
-                            for k in ("submission_id", "kind", "pause_id", "call_ids")
-                        },
-                        "payload": payload,
-                    },
-                }
-            return view, status, raw
+            return view, status, _claimed_submission_view(raw, descriptor, payload)
     await _raise_resume_claim_failure(store, run_id, expected)
     raise AssertionError("unreachable")
 

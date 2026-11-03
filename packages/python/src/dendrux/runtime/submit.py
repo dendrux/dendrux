@@ -302,6 +302,85 @@ async def claim_paused_validated(
     return epoch
 
 
+@dataclass(frozen=True)
+class _ClaimRequest:
+    raw: dict[str, Any]
+    statuses: tuple[str, ...]
+    generation: str | None
+
+
+def _pause_generation(raw: dict[str, Any], expected_pause_id: str | None) -> str | None:
+    return expected_pause_id if expected_pause_id is not None else raw.get("pause_id")
+
+
+def _claim_request(
+    raw: dict[str, Any],
+    expected_status: str,
+    expected_pause_id: str | None,
+    *,
+    fallbacks: tuple[str, ...] = (),
+) -> _ClaimRequest:
+    return _ClaimRequest(
+        raw, (expected_status, *fallbacks), _pause_generation(raw, expected_pause_id)
+    )
+
+
+async def _claim_submission(
+    store: StateStore,
+    run_id: str,
+    request: _ClaimRequest,
+    status: str,
+    *,
+    validate: Callable[[dict[str, Any]], None],
+    payload: dict[str, Any] | None,
+    checkpointing: bool,
+    submit_empty: bool = False,
+    approval: bool | None = None,
+    checkpoint: dict[str, Any] | None = None,
+    blob_refs: Sequence[BlobEdge] | None = None,
+    blob_refs_scope: str | None = None,
+) -> tuple[ClaimResult | int | bool, dict[str, Any] | None, dict[str, Any] | None]:
+    descriptor = None
+    if (
+        request.raw.get("schema_version") == 2
+        and checkpointing
+        and (payload is not None or submit_empty)
+    ):
+        payload = dict(payload or {})
+        if approval is not None:
+            payload["approved"] = approval
+        checkpoint = (
+            checkpoint if checkpoint is not None else await store.get_loop_state(run_id) or {}
+        )
+        descriptor = submission_descriptor(request.raw, checkpoint, payload, status)
+    if payload is None:
+        won = await claim_paused_validated(store, run_id, expected_status=status, validate=validate)
+    else:
+        kwargs: dict[str, Any] = {"validate": validate}
+        if descriptor is not None:
+            kwargs["submission"] = descriptor
+        if blob_refs:
+            kwargs.update(blob_refs=list(blob_refs), blob_refs_scope=blob_refs_scope)
+        won = await store.submit_and_claim(
+            run_id, expected_status=status, submitted_data=payload, **kwargs
+        )
+    return won, descriptor, payload
+
+
+def _claimed_submission_view(
+    raw: dict[str, Any], descriptor: dict[str, Any] | None, payload: dict[str, Any] | None
+) -> dict[str, Any]:
+    if descriptor is None:
+        return raw
+    return {
+        **raw,
+        "submission": {
+            **{k: descriptor[k] for k in ("submission_id", "kind", "pause_id", "call_ids")},
+            "payload": payload,
+        },
+    }
+
+
 def submission_descriptor(
     raw: dict[str, Any], checkpoint: dict[str, Any], payload: dict[str, Any], status: str
 ) -> dict[str, Any]:
@@ -412,50 +491,31 @@ async def claim_or_raise(
             store=store,
             run_id=run_id,
         )
+    request = _claim_request(raw, expected_status.value, expected_pause_id)
     validate = submission_validator(
         run_id,
         raw,
         agent=agent,
-        expected_pause_id=expected_pause_id,
+        expected_pause_id=request.generation,
         call_results=call_results,
         extra=validate,
     )
 
-    # --- Claim: run was expected_status at preflight, attempt CAS. ---
     from dendrux.runtime._capabilities import capabilities
 
-    descriptor = None
-    if (
-        raw.get("schema_version") == 2
-        and capabilities(store).checkpointing
-        and (submitted_data is not None or approval)
-    ):
-        submitted_data = dict(submitted_data or {})
-        if expected_status == RunStatus.WAITING_APPROVAL:
-            submitted_data["approved"] = approval
-        checkpoint = await store.get_loop_state(run_id) or {}
-        descriptor = submission_descriptor(raw, checkpoint, submitted_data, expected_status.value)
-    won: ClaimResult | int | bool
-    if submitted_data is not None:
-        claim_kwargs: dict[str, Any] = {} if validate is None else {"validate": validate}
-        if descriptor is not None:
-            claim_kwargs["submission"] = descriptor
-        if blob_refs:
-            claim_kwargs["blob_refs"] = list(blob_refs)
-            claim_kwargs["blob_refs_scope"] = blob_refs_scope
-        won = await store.submit_and_claim(
-            run_id,
-            expected_status=expected_status.value,
-            submitted_data=submitted_data,
-            **claim_kwargs,
-        )
-    else:
-        won = await claim_paused_validated(
-            store,
-            run_id,
-            expected_status=expected_status.value,
-            validate=validate,
-        )
+    won, _, _ = await _claim_submission(
+        store,
+        run_id,
+        request,
+        request.statuses[0],
+        validate=validate,
+        payload=submitted_data,
+        checkpointing=raw.get("schema_version") == 2 and capabilities(store).checkpointing,
+        submit_empty=approval,
+        approval=approval if expected_status == RunStatus.WAITING_APPROVAL else None,
+        blob_refs=blob_refs,
+        blob_refs_scope=blob_refs_scope,
+    )
 
     if won:
         if agent is not None:
@@ -1128,7 +1188,7 @@ def submission_validator(
     from dendrux.errors import GovernanceMismatchError
 
     # Even an optional-token client is bound to the generation we observed.
-    generation = expected_pause_id if expected_pause_id is not None else raw.get("pause_id")
+    generation = _pause_generation(raw, expected_pause_id)
     base = pause_validator(
         run_id, generation, agent_name=agent.name if agent else None, call_results=call_results
     )
