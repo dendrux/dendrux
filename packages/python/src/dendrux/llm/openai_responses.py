@@ -39,8 +39,8 @@ from dendrux.llm._openai_family import (
     OpenAIFamilyProvider,
     PendingImages,
     WireBlocks,
-    apply_cache_routing,
     apply_call_defaults,
+    apply_openai_cache_routing,
     forward_kwargs,
     inject_structured_output,
     opened_stream,
@@ -542,9 +542,9 @@ class OpenAIResponsesProvider(OpenAIFamilyProvider):
         }
         forward_kwargs(api_kwargs, kwargs, _SUPPORTED_KWARGS - already_handled)
 
-        # Cache routing. Sent on every endpoint (no base_url gate here).
-        apply_cache_routing(
+        apply_openai_cache_routing(
             api_kwargs,
+            base_url=str(self._client.base_url),
             own_prefix=self._cache_key_prefix,
             call_prefix=cache_key_prefix,
             retention=self._prompt_cache_retention,

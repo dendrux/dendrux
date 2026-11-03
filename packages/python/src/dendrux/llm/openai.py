@@ -39,8 +39,8 @@ from dendrux.llm._openai_family import (
     OpenAIFamilyProvider,
     PendingImages,
     WireBlocks,
-    apply_cache_routing,
     apply_call_defaults,
+    apply_openai_cache_routing,
     extra_field,
     forward_kwargs,
     inject_structured_output,
@@ -456,13 +456,13 @@ class OpenAIProvider(OpenAIFamilyProvider):
 
         # Cache routing. Skip on non-OpenAI base_urls (Groq/Together/vLLM/etc.)
         # since some compatible backends reject unknown OpenAI-specific fields.
-        if is_openai_endpoint:
-            apply_cache_routing(
-                api_kwargs,
-                own_prefix=self._cache_key_prefix,
-                call_prefix=cache_key_prefix,
-                retention=self._prompt_cache_retention,
-            )
+        apply_openai_cache_routing(
+            api_kwargs,
+            base_url=str(self._client.base_url),
+            own_prefix=self._cache_key_prefix,
+            call_prefix=cache_key_prefix,
+            retention=self._prompt_cache_retention,
+        )
 
         # Vendor extensions of the request body (e.g. OpenRouter's `provider`
         # routing block). Per-call extra_body shallow-merges over the

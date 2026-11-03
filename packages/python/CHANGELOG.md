@@ -198,6 +198,10 @@
   guides; expand scaling, observability and tracing guidance. See `docs/upgrading-to-0.6.0.mdx`
   for the rollout.
 
+### Fixed
+
+- OpenAI Responses no longer sends prompt cache keys or retention to non-OpenAI endpoints.
+
 ## 0.5.0 - 2026-10-28
 
 "Trust". Pending and live reads require a tenant scope and hide payloads by default; provider
