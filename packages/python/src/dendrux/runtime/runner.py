@@ -205,7 +205,7 @@ _STOP_REASONS = frozenset(get_args(StopReason))
 
 async def _persist_run_failure(
     store: StateStore, run_id: str, exc: Exception, *, safe_event: bool = False
-) -> None:
+) -> bool:
     try:
         won = await store.finalize_run(
             run_id,
@@ -219,10 +219,33 @@ async def _persist_run_failure(
         logger.error(
             "Failed to persist ERROR status for run %s", run_id, exc_info=safe_exception_info()
         )
-        return
+        return False
     if won:
         emit = _emit_event_safe if safe_event else _emit_event
         await emit(store, run_id, StoredEventType.RUN_ERROR.value, _error_payload(exc))
+    return bool(won)
+
+
+async def _stream_run_failure(
+    store: StateStore | None,
+    shared: dict[str, Any],
+    recorder: LoopRecorder | None,
+    notifier: LoopNotifier | None,
+    run_id: str,
+    exc: Exception,
+) -> None:
+    if store is not None and shared.get("claimed"):
+        await _persist_run_failure(store, run_id, exc, safe_event=True)
+    if not shared.get("existing_run"):
+        try:
+            await record_run_failed(recorder, run_id, exc)
+            await notify_run_failed(notifier, run_id, exc)
+        except Exception:
+            logger.warning(
+                "Lifecycle hooks failed during stream error handler for run %s",
+                run_id,
+                exc_info=safe_exception_info(),
+            )
 
 
 def _take_task_interrupt(manager: RunTaskManager | None, run_id: str) -> tuple[bool, bool]:
@@ -884,6 +907,17 @@ async def _closing_loop_stream(
             logger.warning(
                 "Loop stream cleanup raised for run %s", run_id, exc_info=safe_exception_info()
             )
+
+
+def _terminal_stream_result(event: RunEvent) -> RunResult | None:
+    if event.type in (
+        RunEventType.RUN_COMPLETED,
+        RunEventType.RUN_ERROR,
+        RunEventType.RUN_PAUSED,
+        RunEventType.RUN_CANCELLED,
+    ):
+        return event.run_result
+    return None
 
 
 def _track_partial_text(shared: dict[str, Any], event: RunEvent) -> None:
@@ -3087,6 +3121,7 @@ async def _start_retry_history(
     provider_kwargs: dict[str, Any],
     store: StateStore,
     run_id: str,
+    original_run_id: str,
     source: RunRecord,
     replay_req: ReplayRequest | None,
     replay_runs: list[Any],
@@ -3112,7 +3147,7 @@ async def _start_retry_history(
         store,
         run_id,
         current=current,
-        seed={"retry_of": source.id},
+        seed={"retry_of": original_run_id},
         plan=replay_plan,
         # An explicit-skills retry also traces its rebuilt first user
         # message, so its slot mapping is not a plain offset: unknown.
@@ -3126,7 +3161,7 @@ async def _start_retry_history(
         seeded=history,
         sources=[
             *_replay_sources(replay_runs),
-            (source.id, source.tenant_id, source.meta),
+            (original_run_id, source.tenant_id, source.meta),
         ],
         single_full=replay_plan is None,
         input_images=False,
@@ -3343,6 +3378,7 @@ async def retry(
                     provider_kwargs,
                     state_store,
                     run_id,
+                    original_run_id,
                     source_run,
                     replay_req,
                     replay_runs,
@@ -3905,13 +3941,7 @@ def run_stream(
             )
             async with _closing_loop_stream(loop_stream, run_id):
                 async for event in loop_stream:
-                    _terminal_types = (
-                        RunEventType.RUN_COMPLETED,
-                        RunEventType.RUN_ERROR,
-                        RunEventType.RUN_PAUSED,
-                        RunEventType.RUN_CANCELLED,
-                    )
-                    terminal_result = event.run_result if event.type in _terminal_types else None
+                    terminal_result = _terminal_stream_result(event)
                     if terminal_result is not None:
                         _ensure_pause_generation(terminal_result, provider_kwargs)
                         if replay_plan is not None:
@@ -3961,37 +3991,7 @@ def run_stream(
         except Exception as exc:
             # Persist error, yield RUN_ERROR, return cleanly. No re-raise.
             # Covers both setup failures and loop execution errors.
-            if store is not None and _shared.get("claimed"):
-                error_won = False
-                try:
-                    error_won = await store.finalize_run(
-                        run_id,
-                        status=RunStatus.ERROR.value,
-                        error=_safe_error(exc),
-                        **_error_store_kwargs(store, exc),
-                        total_usage=None,
-                        expected_current_status=RunStatus.RUNNING.value,
-                    )
-                except Exception:
-                    logger.error(
-                        "Failed to persist ERROR status for run %s",
-                        run_id,
-                        exc_info=safe_exception_info(),
-                    )
-                if error_won:
-                    await _emit_event_safe(
-                        store, run_id, StoredEventType.RUN_ERROR.value, _error_payload(exc)
-                    )
-            if not _shared.get("existing_run"):
-                try:
-                    await record_run_failed(startup.recorder, run_id, exc)
-                    await notify_run_failed(extra_notifier, run_id, exc)
-                except Exception:
-                    logger.warning(
-                        "Lifecycle hooks failed during stream error handler for run %s",
-                        run_id,
-                        exc_info=safe_exception_info(),
-                    )
+            await _stream_run_failure(store, _shared, startup.recorder, extra_notifier, run_id, exc)
 
             yield RunEvent(
                 type=RunEventType.RUN_ERROR,
