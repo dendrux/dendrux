@@ -486,17 +486,20 @@ async def _dispatch_recovery_call(
     tenant_id: str | None,
     on_work: Callable[[], None] | None,
 ) -> Any:
+    from dendrux.loops._policy_context import dispatch_policy
     from dendrux.loops.react import _process_tool_calls
     from dendrux.runtime.runner import _mark_work
 
     recorder = cast("PersistenceRecorder", ctx.recorder)
     if kind == "replay":
         recorder._replay_calls.add(tc.id)
-    require_approval = agent.require_approval
-    if phase == "approved":
-        require_approval = frozenset()
-    elif kind == "approval":
-        require_approval = require_approval | {tc.name}
+    policy = dispatch_policy(
+        name=tc.name,
+        phase=phase,
+        kind=kind,
+        require_approval=agent.require_approval,
+        before_tool=agent.before_tool,
+    )
     _mark_work(on_work)
     return await _process_tool_calls(
         step=AgentStep(reasoning=None, action=tc),
@@ -510,13 +513,11 @@ async def _dispatch_recovery_call(
         history=ctx.history,
         warnings=[],
         deny=agent.deny,
-        require_approval=require_approval,
-        before_tool=None if phase == "approved" else agent.before_tool,
         tenant_id=tenant_id,
         guardrail_engine=recorder.guardrail_engine,
         tool_result_transform=agent.tool_result_transform,
-        approved_skills=phase == "approved",
         image_runtime=image_runtime,
+        **policy,
     )
 
 
