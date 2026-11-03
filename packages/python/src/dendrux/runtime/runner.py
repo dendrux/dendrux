@@ -6484,12 +6484,21 @@ async def _stream_approval_events(
         yield _stopped_stream_event(await _finish_resumed_result(store, run_id, ctx, stop))
 
 
+def _mark_stream_recovery_work(shared: dict[str, Any]) -> None:
+    shared["work_started"] = True
+
+
+def _stream_resume_started(shared: dict[str, Any]) -> bool:
+    # Work is an independent reason to finalize; it must never be made retryable.
+    return bool(shared.get("work_started") or shared.get("claimed"))
+
+
 async def _stream_resume_failure(
     _shared: dict[str, Any], extra_notifier: LoopNotifier | None, run_id: str, exc: Exception
 ) -> None:
     store = _shared.get("state_store")
     err_ctx = _shared.get("ctx")
-    if store is not None and _shared.get("claimed"):
+    if store is not None and _stream_resume_started(_shared):
         await _persist_run_failure(store, run_id, exc, safe_event=True)
     try:
         if err_ctx is not None:
@@ -6727,6 +6736,7 @@ def resume_stream(
                     ctx,
                     image_runtime=image_runtime,
                     tenant_id=run_record.tenant_id if run_record else None,
+                    on_work=partial(_mark_stream_recovery_work, _shared),
                 )
                 if stop is not None:
                     yield _stopped_stream_event(
