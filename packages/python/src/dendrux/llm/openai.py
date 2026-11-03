@@ -585,6 +585,7 @@ class OpenAIProvider(OpenAIFamilyProvider):
     ) -> AsyncGenerator[StreamEvent, None]:
         """One streaming request: open, relay chunks, require the terminal chunk."""
         model = request.model
+        captured_request = request.captured_request
         # Accumulators for building the final LLMResponse
         text_parts: list[str] = []
         tool_calls: list[ToolCall] = []
@@ -723,9 +724,10 @@ class OpenAIProvider(OpenAIFamilyProvider):
             raise
         except Exception as exc:
             failure = raise_or_defer(self, exc, request.registry, model, streaming=True)
-        if failure is not None:
-            # Drop every request and SDK-stream alias before retaining this frame.
+        finally:
+            # Always drop request and SDK-stream aliases, including typed errors.
             del request, stream, chunk_iter
+        if failure is not None:
             raise failure
 
         if finish_reason is None and not saw_usage and not (done_seen and done_seen[0]):
@@ -755,7 +757,7 @@ class OpenAIProvider(OpenAIFamilyProvider):
             stop_reason=stop_reason,
             raw_stop_reason=raw_stop_reason,
         )
-        llm_response.provider_request = request.captured_request
+        llm_response.provider_request = captured_request
         llm_response.model = model
         llm_response.provider_response = {
             "object": "chat.completion.chunked",

@@ -209,11 +209,13 @@ async def opened_stream(
     clock: StreamClock, make_call: Callable[[], Awaitable[Any]]
 ) -> AsyncIterator[Any]:
     """Open one SDK stream within the clock's deadlines; always close it quietly."""
-    stream = await clock.open(make_call)
+    stream: Any = None
     try:
+        stream = await clock.open(make_call)
         yield stream
     finally:
         await close_quietly(stream)
+        del make_call, stream
 
 
 # ------------------------------------------------------------------

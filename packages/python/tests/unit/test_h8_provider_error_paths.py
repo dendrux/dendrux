@@ -11,6 +11,7 @@ mock transport, real SDK), for Chat, Responses and OpenRouter:
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import json
 import logging
@@ -24,9 +25,13 @@ import pytest
 openai = pytest.importorskip("openai", reason="openai extra not installed")
 
 from dendrux.errors import (  # noqa: E402
+    ContentFilteredError,
     ImageRejectedError,
+    ModelRefusalError,
     ProviderError,
+    ProviderResponseError,
     ProviderStreamIncompleteError,
+    ProviderTimeoutError,
 )
 from dendrux.llm._images import WireImageRegistry  # noqa: E402
 from dendrux.llm._resilience import WireRequest  # noqa: E402
@@ -284,21 +289,12 @@ STREAM_REJECTIONS = {
 async def test_image_rejection_mid_stream(
     adapter: str,
     caplog: pytest.LogCaptureFixture,
-    monkeypatch: pytest.MonkeyPatch,
+    sensitive_ids: set[int],
 ) -> None:
     caplog.set_level(logging.DEBUG, logger="dendrux")
     factory, label = FACTORIES[adapter]
     provider = factory()
     wire_openai(provider, STREAM_REJECTIONS[adapter]())
-    sensitive_ids: set[int] = set()
-    original = provider._wire_request
-
-    def capture_request(*args: Any, **kwargs: Any) -> WireRequest:
-        request = original(*args, **kwargs)
-        sensitive_ids.update((id(request), id(request.registry), id(request.api_kwargs)))
-        return request
-
-    monkeypatch.setattr(provider, "_wire_request", capture_request)
     seen: list[Any] = []
     with pytest.raises(ImageRejectedError) as info:
         async for event in provider.complete_stream(USER_IMAGE):
@@ -319,7 +315,9 @@ async def test_image_rejection_mid_stream(
 
 
 @pytest.mark.parametrize("during_open", [False, True])
-async def test_anthropic_stream_tail_drops_its_stream_local(during_open: bool) -> None:
+async def test_anthropic_stream_tail_drops_its_stream_local(
+    during_open: bool, sensitive_ids: set[int]
+) -> None:
     """Image-bearing failures drop the SDK stream before raising."""
     claude = AnthropicProvider(model="claude-sonnet-4-6", api_key="test-key", max_retries=0)
     events = [*_anthropic_head(), ("error", ANTHROPIC_REJECTED_UNLOCATED)]
@@ -331,6 +329,7 @@ async def test_anthropic_stream_tail_drops_its_stream_local(during_open: bool) -
         async for _ in claude.complete_stream(USER_IMAGE):
             pass
     assert_clean(info.value)
+    assert _reachable_request_holders(info.value, sensitive_ids) == set()
     assert "stream" not in _frame_locals(info.value, "_stream_attempt")
 
 
@@ -614,3 +613,192 @@ async def test_retry_attempts_open_pull_and_close_in_consumer_task() -> None:
         ("pull", 2, True),
         ("close", 2, True),
     ]
+
+
+@pytest.fixture
+def sensitive_ids(monkeypatch: pytest.MonkeyPatch) -> Any:
+    # Keep objects alive in the fixture frame (outside the error traceback), so
+    # CPython cannot reuse their ids before the strict scan, including on 3.13.
+    held: list[Any] = []
+    identities: set[int] = set()
+    original = WireRequest.__init__
+
+    def capture(request: WireRequest, *args: Any, **kwargs: Any) -> None:
+        original(request, *args, **kwargs)
+        held.extend((request, request.registry, request.api_kwargs))
+        identities.update(map(id, held))
+
+    monkeypatch.setattr(WireRequest, "__init__", capture)
+    yield identities
+    held.clear()
+
+
+class _WaitingBody(httpx.AsyncByteStream):
+    def __init__(self, first: bytes) -> None:
+        self.first = first
+
+    async def __aiter__(self) -> Any:
+        yield self.first
+        await asyncio.Event().wait()
+
+
+def _failure_body(adapter: str, failure: str) -> bytes:
+    if adapter == "anthropic":
+        events: list[tuple[str | None, Any]] = list(_anthropic_head())
+        if failure in {"filter", "refusal"}:
+            events.extend(
+                [
+                    ("content_block_stop", {"type": "content_block_stop", "index": 0}),
+                    (
+                        "message_delta",
+                        {
+                            "type": "message_delta",
+                            "delta": {
+                                "stop_reason": "refusal",
+                                "stop_sequence": None,
+                            },
+                            "usage": {"output_tokens": 2},
+                        },
+                    ),
+                    ("message_stop", {"type": "message_stop"}),
+                ]
+            )
+    elif adapter == "responses":
+        events = [
+            (
+                "response.output_text.delta",
+                {
+                    "type": "response.output_text.delta",
+                    "delta": "Hello",
+                    "item_id": "msg_1",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "sequence_number": 1,
+                    "logprobs": [],
+                },
+            )
+        ]
+        if failure == "refusal":
+            events.append(
+                (
+                    "response.refusal.delta",
+                    {
+                        "type": "response.refusal.delta",
+                        "delta": "No",
+                        "item_id": "msg_1",
+                        "output_index": 0,
+                        "content_index": 0,
+                        "sequence_number": 2,
+                    },
+                )
+            )
+        if failure in {"filter", "refusal"}:
+            events.append(
+                (
+                    "response.incomplete",
+                    {
+                        "type": "response.incomplete",
+                        "sequence_number": 3,
+                        "response": {
+                            "id": "r1",
+                            "object": "response",
+                            "created_at": 0,
+                            "model": "m",
+                            "output": [],
+                            "status": "incomplete",
+                            "incomplete_details": {"reason": "content_filter"},
+                        },
+                    },
+                )
+            )
+    else:
+        events = [(None, _chat_chunk("Hello"))]
+        if failure in {"filter", "refusal"}:
+            chunk = _chat_chunk("")
+            chunk["choices"][0]["finish_reason"] = (
+                "content_filter" if failure == "filter" else "stop"
+            )
+            if failure == "refusal":
+                chunk["choices"][0]["delta"] = {"refusal": "No"}
+            events.extend([(None, chunk), (None, "[DONE]")])
+    return b"".join(
+        (
+            (f"event: {kind}\n" if kind else "")
+            + "data: "
+            + (value if isinstance(value, str) else json.dumps(value))
+            + "\n\n"
+        ).encode()
+        for kind, value in events
+    )
+
+
+@pytest.mark.parametrize("adapter", [*FACTORIES, "anthropic"])
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "incomplete",
+        "broken",
+        "filter",
+        "refusal",
+        "idle",
+        "total",
+        "size",
+        "open_idle",
+        "open_total",
+    ],
+)
+async def test_image_stream_errors_drop_all_request_holders(
+    adapter: str,
+    failure: str,
+    sensitive_ids: set[int],
+) -> None:
+    if adapter == "anthropic" and failure == "filter":
+        pytest.skip("Anthropic reports refusal, not content_filter")
+    provider = (
+        AnthropicProvider(model="claude-sonnet-4-6", api_key="test-key", max_retries=0)
+        if adapter == "anthropic"
+        else FACTORIES[adapter][0]()
+    )
+    from dataclasses import replace
+
+    changes: dict[str, Any] = {}
+    if "idle" in failure:
+        changes["stream_idle_timeout"] = 1.0
+    if "total" in failure:
+        changes["stream_total_timeout"] = 1.0
+    if failure == "size":
+        changes["max_stream_bytes"] = 1
+    provider._deadlines = replace(provider._deadlines, **changes)
+    body = _failure_body(adapter, failure)
+    calls = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        if failure.startswith("open_"):
+            await asyncio.Event().wait()
+        stream = (
+            _WaitingBody(body)
+            if failure in {"idle", "total"}
+            else _BrokenBody(body)
+            if failure == "broken"
+            else httpx.ByteStream(body)
+        )
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=stream)
+
+    (wire_anthropic if adapter == "anthropic" else wire_openai)(provider, handler)
+    expected = {
+        "filter": ContentFilteredError,
+        "refusal": ModelRefusalError,
+        "size": ProviderResponseError,
+        "idle": ProviderTimeoutError,
+        "total": ProviderTimeoutError,
+        "open_idle": ProviderTimeoutError,
+        "open_total": ProviderTimeoutError,
+    }.get(failure, ProviderStreamIncompleteError)
+    with pytest.raises(expected) as info:
+        async for _ in provider.complete_stream(USER_IMAGE):
+            pass
+    assert len(calls) == 1
+    assert len(sensitive_ids) == 3
+    assert _reachable_request_holders(info.value, sensitive_ids) == set()
+    assert_clean(info.value)

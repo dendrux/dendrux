@@ -200,6 +200,8 @@
 
 ### Fixed
 
+- Streaming provider errors release image request holders on every failure path.
+
 - Provider retry telemetry warnings omit SQL statements and parameters from database failures.
 - OpenAI Chat, Responses and OpenRouter streaming image failures release request holders from tracebacks.
 - Anthropic image-bearing streaming failures drop the SDK stream from traceback locals.
