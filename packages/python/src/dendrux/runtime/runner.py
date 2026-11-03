@@ -5700,9 +5700,33 @@ async def _read_resume_pause(
         require_pause_id(
             agent, expected_pause_id, pause_id=raw.get("pause_id"), store=store, run_id=run_id
         )
+    return await _load_resume_pause(
+        store, agent, provider, run_id, raw, reads, read_record=read_record
+    )
+
+
+async def _load_resume_pause(
+    store: StateStore,
+    agent: Agent,
+    provider: LLMProvider,
+    run_id: str,
+    raw: dict[str, Any],
+    reads: _PauseReads,
+    *,
+    read_record: bool,
+) -> PauseState:
     if read_record:
         reads.record = await store.get_run(run_id)
     return await _load_pause_state(store, run_id, raw, agent, provider, reads=reads)
+
+
+def _require_pause_agent(pause: PauseState, agent: Agent, run_id: str, streaming: bool) -> None:
+    if pause.agent_name and pause.agent_name != agent.name:
+        raise ValueError(
+            f"Agent name mismatch: run '{run_id}' was paused by "
+            f"'{pause.agent_name}', but resume called with '{agent.name}'."
+            + ("" if streaming else " This can cause state corruption.")
+        )
 
 
 async def _read_resume_state(
@@ -5742,12 +5766,7 @@ async def _read_resume_state(
         store, run_id, pause, checkpoint=reads.checkpoint
     )
     pii = None if streaming else await store.get_pii_mapping(run_id)
-    if pause.agent_name and pause.agent_name != agent.name:
-        raise ValueError(
-            f"Agent name mismatch: run '{run_id}' was paused by "
-            f"'{pause.agent_name}', but resume called with '{agent.name}'."
-            + ("" if streaming else " This can cause state corruption.")
-        )
+    _require_pause_agent(pause, agent, run_id, streaming)
     return reads.record, reads, raw, pause, recovering, pii
 
 
