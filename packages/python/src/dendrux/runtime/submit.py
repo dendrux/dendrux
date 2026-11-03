@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, Any, NoReturn, cast
 from dendrux import _codes
 from dendrux._lifecycle import PAUSE_STATUSES as _PAUSE_STATUSES
 from dendrux._lifecycle import TERMINAL_STATUSES as _TERMINAL_STATUSES
-from dendrux._lifecycle import DenialReason, GovernanceEventType, StoredEventType
+from dendrux._lifecycle import DenialReason, FailureReason, GovernanceEventType, StoredEventType
 from dendrux._meta_keys import (
     GOVERNANCE_KEY as GOVERNANCE_KEY,
 )
@@ -33,6 +33,7 @@ from dendrux.errors import (
     PauseStatusMismatchError,
     RunAlreadyClaimedError,
     RunAlreadyTerminalError,
+    RunControlError,
     RunNotFoundError,
     RunNotPausedError,
 )
@@ -68,7 +69,7 @@ if TYPE_CHECKING:
     from dendrux.media._catalog import BlobEdge
     from dendrux.media._policy import ImagePolicy, Origin
     from dendrux.media._runtime import ImageRuntime
-    from dendrux.runtime.state import EventWrite, StateStore
+    from dendrux.runtime.state import EventWrite, RunRecord, StateStore
     from dendrux.types import ContentPart
 
 __all__ = [
@@ -220,6 +221,74 @@ def pause_validator(
     return validate
 
 
+_RESUME_CLAIM_MESSAGE = (
+    "Run '{run_id}' is not in status '{expected}' — "
+    "cannot resume. It may have been claimed by another caller."
+)
+
+
+@dataclass(frozen=True)
+class _ClaimFailureMapping:
+    submit_error: Callable[[str, RunStatus, RunStatus], RunControlError | RunNotFoundError]
+    resume_message: str = _RESUME_CLAIM_MESSAGE
+
+
+_CLAIM_FAILURES: dict[str | tuple[str, str], _ClaimFailureMapping] = {
+    "missing": _ClaimFailureMapping(lambda run_id, current, expected: RunNotFoundError(run_id)),
+    "terminal": _ClaimFailureMapping(
+        lambda run_id, current, expected: RunAlreadyTerminalError(run_id, current)
+    ),
+    (RunStatus.ERROR.value, FailureReason.ABANDONED_WAITING.value): _ClaimFailureMapping(
+        lambda run_id, current, expected: RunAlreadyTerminalError(run_id, current),
+        "Run '{run_id}' was abandoned (swept as expired waiting run). It cannot be resumed.",
+    ),
+    (RunStatus.ERROR.value, FailureReason.STALE_RUNNING.value): _ClaimFailureMapping(
+        lambda run_id, current, expected: RunAlreadyTerminalError(run_id, current),
+        "Run '{run_id}' was swept as stale ({reason}). It cannot be resumed.",
+    ),
+    (RunStatus.ERROR.value, FailureReason.NEVER_STARTED.value): _ClaimFailureMapping(
+        lambda run_id, current, expected: RunAlreadyTerminalError(run_id, current),
+        "Run '{run_id}' was swept as stale ({reason}). It cannot be resumed.",
+    ),
+    "claimed": _ClaimFailureMapping(
+        lambda run_id, current, expected: RunAlreadyClaimedError(run_id)
+    ),
+    "pause": _ClaimFailureMapping(
+        lambda run_id, current, expected: PauseStatusMismatchError(run_id, current, expected)
+    ),
+    "not_paused": _ClaimFailureMapping(
+        lambda run_id, current, expected: RunNotPausedError(run_id, current)
+    ),
+}
+
+
+def _claim_failure_mapping(
+    record: RunRecord | None, *, after_preflight: bool
+) -> _ClaimFailureMapping:
+    if record is None:
+        return _CLAIM_FAILURES["missing"]
+    if record.status in _TERMINAL_STATUSES:
+        if record.status == RunStatus.ERROR.value:
+            return _CLAIM_FAILURES.get(
+                (record.status, getattr(record, "failure_reason", None) or ""),
+                _CLAIM_FAILURES["terminal"],
+            )
+        return _CLAIM_FAILURES["terminal"]
+    if after_preflight and record.status == RunStatus.RUNNING.value:
+        return _CLAIM_FAILURES["claimed"]
+    if record.status in _PAUSE_STATUSES:
+        return _CLAIM_FAILURES["pause"]
+    return _CLAIM_FAILURES["not_paused"]
+
+
+def _raise_submit_claim_failure(
+    record: RunRecord | None, run_id: str, expected: RunStatus, *, after_preflight: bool
+) -> NoReturn:
+    current = RunStatus(record.status) if record is not None else RunStatus.PENDING
+    rule = _claim_failure_mapping(record, after_preflight=after_preflight)
+    raise rule.submit_error(run_id, current, expected)
+
+
 async def preflight_status(store: StateStore, run_id: str, expected_status: RunStatus) -> None:
     """Raise the most specific error unless ``run_id`` is in ``expected_status``.
 
@@ -228,18 +297,13 @@ async def preflight_status(store: StateStore, run_id: str, expected_status: RunS
     checkpoint.
     """
     record = await store.get_run(run_id)
-    if record is None:
-        raise RunNotFoundError(run_id)
-    current = RunStatus(record.status)
-    if current != expected_status:
-        if current in _TERMINAL_STATUSES:
-            raise RunAlreadyTerminalError(run_id, current)
-        if current in _PAUSE_STATUSES:
-            raise PauseStatusMismatchError(run_id, current, expected_status)
-        # RUNNING, PENDING, or anything else non-paused.
-        raise RunNotPausedError(run_id, current)
-    if record.cancel_requested:
-        raise RunAlreadyTerminalError(run_id, RunStatus.CANCELLED)
+    if record is not None and RunStatus(record.status) == expected_status:
+        if record.cancel_requested:
+            raise _CLAIM_FAILURES["terminal"].submit_error(
+                run_id, RunStatus.CANCELLED, expected_status
+            )
+        return
+    _raise_submit_claim_failure(record, run_id, expected_status, after_preflight=False)
 
 
 @dataclass
@@ -526,24 +590,9 @@ async def claim_or_raise(
                 raise
         return won
 
-    # CAS lost after preflight succeeded — something transitioned the run
-    # between the two reads. Re-check to pick the most specific error.
+    # The successful preflight distinguishes a competing claim from a never-paused run.
     record = await store.get_run(run_id)
-    if record is None:
-        # Extremely unlikely — run vanished mid-submit.
-        raise RunNotFoundError(run_id)
-
-    current = RunStatus(record.status)
-    if current in _TERMINAL_STATUSES:
-        raise RunAlreadyTerminalError(run_id, current)
-    if current == RunStatus.RUNNING:
-        # We just observed ``expected_status``; RUNNING now means a
-        # concurrent submit claimed it.
-        raise RunAlreadyClaimedError(run_id)
-    if current in _PAUSE_STATUSES:
-        # Unusual — paused status changed between preflight and CAS.
-        raise PauseStatusMismatchError(run_id, current, expected_status)
-    raise RunNotPausedError(run_id, current)
+    _raise_submit_claim_failure(record, run_id, expected_status, after_preflight=True)
 
 
 async def _release_claim_result(

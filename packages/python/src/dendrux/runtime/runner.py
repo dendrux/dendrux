@@ -133,6 +133,7 @@ from dendrux.runtime.state import ClaimResult, _initial_loop_state, claimed_stor
 from dendrux.runtime.stores._limits_fit import ensure_agent_limits_fit
 from dendrux.runtime.submit import (
     GOVERNANCE_KEY,
+    _claim_failure_mapping,
     _claim_request,
     _claim_submission,
     _claimed_submission_view,
@@ -3040,18 +3041,11 @@ async def _raise_resume_claim_failure(
     (abandoned/stale) runs instead of the generic "claimed by another caller."
     """
     run = await state_store.get_run(run_id)
-    if run is not None and run.status == RunStatus.ERROR.value and run.failure_reason:
-        reason = run.failure_reason
-        if reason == FailureReason.ABANDONED_WAITING.value:
-            raise ValueError(
-                f"Run '{run_id}' was abandoned (swept as expired waiting run). "
-                f"It cannot be resumed."
-            )
-        if reason in (FailureReason.STALE_RUNNING.value, FailureReason.NEVER_STARTED.value):
-            raise ValueError(f"Run '{run_id}' was swept as stale ({reason}). It cannot be resumed.")
+    rule = _claim_failure_mapping(run, after_preflight=True)
     raise ValueError(
-        f"Run '{run_id}' is not in status '{expected_status}' — "
-        f"cannot resume. It may have been claimed by another caller."
+        rule.resume_message.format(
+            run_id=run_id, expected=expected_status, reason=getattr(run, "failure_reason", None)
+        )
     )
 
 
