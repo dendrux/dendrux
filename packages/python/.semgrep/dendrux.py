@@ -203,6 +203,24 @@ async def reasons(store, meta, reason, result):
     pause_reason = "requested"
     # ruleid: lifecycle-reason-literal
     deny(reason="User declined to run this tool.")
+    # ruleid: lifecycle-reason-literal
+    lost = reason in {"lease_lost", "reclaim_limit"}
+    # ruleid: lifecycle-reason-literal
+    lost = reason in ["lease_lost"]
+    # ruleid: lifecycle-reason-literal
+    await emit("r", {"failure_reason": "lease_lost" if lost else None})
+    # ruleid: lifecycle-reason-literal
+    await emit("r", {"failure_reason": None if lost else "lease_lost"})
+    # ruleid: lifecycle-reason-literal
+    await store.finalize_run("r", failure_reason="lease_lost" if lost else None)
+    # ruleid: lifecycle-reason-literal
+    paused = reason in {"requested", "budget"}
+    # ok: lifecycle-reason-literal
+    other = kind in {"requested", "budget"}
+    # ok: lifecycle-reason-literal
+    await emit("r", {"kind": "requested" if lost else None})
+    # ok: lifecycle-reason-literal
+    await emit("r", {"failure_reason": FailureReason.LEASE_LOST.value if lost else None})
     # ok: lifecycle-reason-literal
     await store.finalize_run("r", failure_reason=FailureReason.STALE_RUNNING.value)
     # ok: lifecycle-reason-literal
@@ -234,6 +252,20 @@ def formats(record, row):
     AgentRun(storage_format=2)
     # ruleid: storage-format-literal
     current = record.storage_format >= 2
+    # ruleid: storage-format-literal
+    reversed_check = 2 == record.storage_format
+    # ruleid: storage-format-literal
+    reversed_other = 2 != storage_format
+    # ruleid: storage-format-literal
+    known = record.storage_format in (1, 2)
+    # ruleid: storage-format-literal
+    known_set = record.storage_format in {1, 2}
+    # ok: storage-format-literal
+    legacy_only = record.storage_format in (1,)
+    # ok: storage-format-literal
+    reversed_legacy = 1 == record.storage_format
+    # ok: storage-format-literal
+    other_member = record.iteration_count in (1, 2)
     # ok: storage-format-literal
     checkpointed = record.storage_format == STORAGE_FORMAT_CHECKPOINTED
     # ok: storage-format-literal
@@ -246,6 +278,11 @@ def formats(record, row):
     row = {"storage_format": 1}
     # ok: storage-format-literal
     total = record.iteration_count == 2
+
+
+def documented_key():
+    # ok: meta-key-literal
+    """dendrux.parts"""
 
 
 def meta_keys(meta, session, run):
@@ -261,6 +298,16 @@ def meta_keys(meta, session, run):
     MY_KEY = "dendrux.stop_reason"
     # ruleid: meta-key-literal
     seen = "dendrux.images.seeded_slots" in meta
+    # ruleid: meta-key-literal
+    value = meta.pop("dendrux.step", None)
+    # ruleid: meta-key-literal
+    value = meta.setdefault("dendrux.message", {})
+    # ok: meta-key-literal
+    module = importlib.import_module("dendrux.store")
+    # ok: meta-key-literal
+    named = logging.getLogger("dendrux.store")
+    # ok: meta-key-literal
+    return_value = f("dendrux.parts")
     # ok: meta-key-literal
     parts = meta[PARTS_META_KEY]
     # ok: meta-key-literal
@@ -300,6 +347,18 @@ def connection_loss(code, classified):
     starting = code == "57P03"
     # ruleid: connection-loss-code-copy
     class_08 = code[:2] == "08"
+    # ruleid: connection-loss-code-copy
+    lost_tuple = code.startswith(("08",))
+    # ruleid: connection-loss-code-copy
+    lost_zero_slice = code[0:2] == "08"
+    # ruleid: connection-loss-code-copy
+    lost_reversed = "08" == code[:2]
+    # ruleid: connection-loss-code-copy
+    lost_member = code[:2] in ("08", "57")
+    # ok: connection-loss-code-copy
+    integrity_tuple = code.startswith(("23", "40"))
+    # ok: connection-loss-code-copy
+    integrity_slice = code[0:2] == "23"
     # ok: connection-loss-code-copy
     too_many = code == "53300"
     # ok: connection-loss-code-copy
@@ -365,6 +424,28 @@ async def failures(store, run_id, exc, payload):
     failed = payload.event_type == StoredEventType.RUN_ERROR.value
     # ok: error-finalize-outside-helper
     await store.finalize_run(run_id, status=result.status.value)
+
+
+async def local_emitter_aliases(store, run_id, safe_event, payload):
+    emit = _emit_event_safe if safe_event else _emit_event
+    write = store.save_run_event
+    if payload:
+        # ruleid: error-finalize-outside-helper
+        await emit(store, run_id, StoredEventType.RUN_ERROR.value, payload)
+        # ruleid: run-started-outside-startup
+        await emit(store, run_id, StoredEventType.RUN_STARTED.value, payload)
+        # ruleid: error-finalize-outside-helper
+        await write(run_id, event_type=StoredEventType.RUN_ERROR.value, data=payload)
+        # ok: error-finalize-outside-helper
+        await emit(store, run_id, StoredEventType.RUN_PAUSED.value, payload)
+
+
+async def not_an_emitter_alias(store, run_id, payload, other):
+    emit = other.emit
+    # ok: error-finalize-outside-helper
+    await emit(store, run_id, StoredEventType.RUN_ERROR.value, payload)
+    # ok: error-finalize-outside-helper
+    await other(store, run_id, StoredEventType.RUN_ERROR.value, payload)
 
 
 async def cancellations(store, run_id, payload, allowed):

@@ -288,38 +288,105 @@ _FINGERPRINT = "fp = compute_idempotency_fingerprint(name, text)"
 _OUTPUT_NAME = 'fp = f"{name.__module__}.{name.__qualname__}"'
 _LOSS = 'return code.startswith("08")'
 
-# (file, template, class, allowed function, body); the class is empty for a module function
+# (rule, file, template, class, allowed function, body); the class is empty for a module
+# function. Each rule has its own wrong-function name, so a surviving rule cannot stand in
+# for a deleted one.
 ALLOWED_COPIES = [
-    ("runtime/runner.py", _FUNCTION, "", "_persist_run_failure", _FAIL),
-    ("runtime/_reclaim.py", _FUNCTION, "", "_handle_rebuild_failure", _REBUILD),
-    ("runtime/runner.py", _FUNCTION, "", "_persist_run_cancellation", _CANCEL),
-    ("runtime/runner.py", _FUNCTION, "", "_finalize_loop_cancelled", _CANCEL),
-    ("runtime/runner.py", _FUNCTION, "", "_pause_with_event", _CANCEL),
-    ("agent.py", _METHOD, "Agent", "_cancel_one", _CANCEL),
-    ("runtime/runner.py", _FUNCTION, "", "_start_new_run", _STARTED),
-    ("runtime/runner.py", _FUNCTION, "", "_new_run_metadata", _FINGERPRINT),
-    ("runtime/runner.py", _FUNCTION, "", "_new_run_metadata", _OUTPUT_NAME),
-    ("runtime/runner.py", _FUNCTION, "", "_idempotent_hit_after_image_error", _FINGERPRINT),
-    ("runtime/stores/_errors.py", _FUNCTION, "", "_is_connection_loss_code", _LOSS),
+    (
+        "error-finalize-outside-helper",
+        "runtime/runner.py",
+        _FUNCTION,
+        "",
+        "_persist_run_failure",
+        _FAIL,
+    ),
+    (
+        "error-finalize-outside-helper",
+        "runtime/_reclaim.py",
+        _FUNCTION,
+        "",
+        "_handle_rebuild_failure",
+        _REBUILD,
+    ),
+    (
+        "cancel-finalize-outside-helper",
+        "runtime/runner.py",
+        _FUNCTION,
+        "",
+        "_persist_run_cancellation",
+        _CANCEL,
+    ),
+    (
+        "cancel-finalize-outside-helper",
+        "runtime/runner.py",
+        _FUNCTION,
+        "",
+        "_finalize_loop_cancelled",
+        _CANCEL,
+    ),
+    (
+        "cancel-finalize-outside-helper",
+        "runtime/runner.py",
+        _FUNCTION,
+        "",
+        "_pause_with_event",
+        _CANCEL,
+    ),
+    ("cancel-finalize-outside-helper", "agent.py", _METHOD, "Agent", "_cancel_one", _CANCEL),
+    ("run-started-outside-startup", "runtime/runner.py", _FUNCTION, "", "_start_new_run", _STARTED),
+    (
+        "new-run-fingerprint-outside-helper",
+        "runtime/runner.py",
+        _FUNCTION,
+        "",
+        "_new_run_metadata",
+        _FINGERPRINT,
+    ),
+    (
+        "new-run-fingerprint-outside-helper",
+        "runtime/runner.py",
+        _FUNCTION,
+        "",
+        "_new_run_metadata",
+        _OUTPUT_NAME,
+    ),
+    (
+        "new-run-fingerprint-outside-helper",
+        "runtime/runner.py",
+        _FUNCTION,
+        "",
+        "_idempotent_hit_after_image_error",
+        _FINGERPRINT,
+    ),
+    (
+        "connection-loss-code-copy",
+        "runtime/stores/_errors.py",
+        _FUNCTION,
+        "",
+        "_is_connection_loss_code",
+        _LOSS,
+    ),
 ]
 
 
 @SKIP_NO_SEMGREP
 def test_an_allowed_shape_passes_only_in_its_own_function(tmp_path: Path) -> None:
     files: dict[str, str] = {}
-    expected: set[tuple[str, str]] = set()
-    for where, template, cls, name, body in ALLOWED_COPIES:
+    expected: set[tuple[str, str, str]] = set()
+    for rule, where, template, cls, name, body in ALLOWED_COPIES:
         module = "dendrux." + where.removesuffix(".py").replace("/", ".")
+        stem = rule.removesuffix("-outside-helper").removesuffix("-outside-startup")
+        wrong_name = "wrong_" + stem.replace("-", "_")
         # The allowed place first, then the same code in the wrong place (another name and,
         # for a method, another class): only the wrong places may be reported.
-        wrong = [("Other", name), (cls, "somewhere_else")] if cls else [("", "somewhere_else")]
+        wrong = [("Other", name), (cls, wrong_name)] if cls else [("", wrong_name)]
         for place_cls, place_name in [(cls, name), *wrong]:
             files[where] = files.get(where, "") + template.format(
                 cls=place_cls, name=place_name, body=body
             )
-        expected.update((module, f"{c}.{n}" if c else n) for c, n in wrong)
+        expected.update((rule, module, f"{c}.{n}" if c else n) for c, n in wrong)
     keys = sr.collect_keys(_scratch_tree(tmp_path, files))
-    assert {tuple(key.split("|")[1:]) for key in keys} == expected
+    assert {tuple(key.split("|")) for key in keys} == expected
 
 
 @SKIP_NO_SEMGREP
@@ -349,26 +416,69 @@ def test_definition_sites_and_historical_migrations_are_out_of_scope(tmp_path: P
     assert sr.collect_keys(_scratch_tree(tmp_path, definitions)) == {}
 
 
+# function name -> (rule it must trip, line)
+COPIES = {
+    "event": ("stored-event-name-literal", 'EVENT = "run.started"'),
+    "reason": ("lifecycle-reason-literal", 'REASON = {"reason": "stale_running"}'),
+    "reason_set": ("lifecycle-reason-literal", 'LOST = reason in {"lease_lost"}'),
+    "reason_cond": (
+        "lifecycle-reason-literal",
+        'REASON = {"failure_reason": "lease_lost" if code else None}',
+    ),
+    "storage": ("storage-format-literal", "FORMAT_OK = record.storage_format == 2"),
+    "storage_reversed": ("storage-format-literal", "FORMAT_OK = 2 == record.storage_format"),
+    "storage_member": ("storage-format-literal", "FORMAT_OK = record.storage_format in (1, 2)"),
+    "meta": ("meta-key-literal", 'PARTS = meta["dendrux.parts"]'),
+    "meta_get": ("meta-key-literal", 'PARTS = meta.get("dendrux.parts")'),
+    "url": ("default-sqlite-url-literal", 'URL = "sqlite+aiosqlite:///./dendrux.db"'),
+    "loss": ("connection-loss-code-copy", 'LOST = code in ("57P01", "57P03")'),
+    "loss_tuple": ("connection-loss-code-copy", 'LOST = code.startswith(("08",))'),
+    "loss_slice": ("connection-loss-code-copy", 'LOST = code[0:2] == "08"'),
+    "status_values": (
+        "hardcoded-terminal-status-set",
+        "DONE = (RunStatus.SUCCESS.value, RunStatus.ERROR.value)",
+    ),
+}
+# Events written through a local alias of the writer, as _persist_run_failure does.
+ALIASED_WRITES = {
+    "started_alias": (
+        "run-started-outside-startup",
+        "StoredEventType.RUN_STARTED.value",
+    ),
+    "error_alias": ("error-finalize-outside-helper", "StoredEventType.RUN_ERROR.value"),
+}
+
+
 @SKIP_NO_SEMGREP
 def test_a_copy_of_a_shared_value_outside_its_module_is_flagged(tmp_path: Path) -> None:
-    copies = {
-        "event": 'EVENT = "run.started"',
-        "reason": 'REASON = {"reason": "stale_running"}',
-        "storage": "FORMAT_OK = record.storage_format == 2",
-        "meta": 'PARTS = meta["dendrux.parts"]',
-        "url": 'URL = "sqlite+aiosqlite:///./dendrux.db"',
-        "loss": 'LOST = code in ("57P01", "57P03")',
-    }
     source = "".join(
-        f"def {name}(record, code, meta):\n    {line}\n" for name, line in copies.items()
+        f"def {name}(record, code, meta):\n    {line}\n" for name, (_, line) in COPIES.items()
+    )
+    source += "".join(
+        f"async def {name}(store, run_id, safe):\n"
+        "    emit = _emit_event_safe if safe else _emit_event\n"
+        f"    if safe:\n        await emit(store, run_id, {event}, {{}})\n"
+        for name, (_, event) in ALIASED_WRITES.items()
     )
     keys = sr.collect_keys(_scratch_tree(tmp_path, {"runtime/m.py": source}))
-    assert {key.split("|")[0] for key in keys} == {
-        "stored-event-name-literal",
-        "lifecycle-reason-literal",
-        "storage-format-literal",
-        "meta-key-literal",
-        "default-sqlite-url-literal",
-        "connection-loss-code-copy",
+    expected = {
+        (rule, "dendrux.runtime.m", name)
+        for name, (rule, _) in {**COPIES, **ALIASED_WRITES}.items()
     }
-    assert {key.rsplit("|", 1)[1] for key in keys} == set(copies)
+    assert {tuple(key.split("|")) for key in keys} == expected
+
+
+@SKIP_NO_SEMGREP
+def test_documentation_module_names_and_other_domains_are_not_flagged(tmp_path: Path) -> None:
+    source = (
+        'def parts():\n    """dendrux.parts"""\n'
+        "def names(code, record, kind):\n"
+        '    importlib.import_module("dendrux.store")\n'
+        '    logging.getLogger("dendrux.store")\n'
+        '    PendingPause.__module__ = "dendrux.store"\n'
+        '    return code[0:2] == "23" or code.startswith(("23", "40")) or code == "53300"\n'
+        "def formats(record, kind):\n"
+        "    return record.storage_format in (1,) or 1 == record.storage_format "
+        'or kind in {"requested"}\n'
+    )
+    assert sr.collect_keys(_scratch_tree(tmp_path, {"runtime/m.py": source})) == {}

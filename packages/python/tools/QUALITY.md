@@ -55,22 +55,25 @@ a regression.
 
 ### Semgrep rules that stop a shared definition being copied
 
-Each rule has one definition site; the same value or step written anywhere else is a match.
+Each rule has one definition site; the shapes below, written anywhere else, are a match.
 Path scope and `allow_in` (module:function) live in the rule's `metadata`; `allow_in` lists
-only places that need the copy today.
+only places that need the copy today. Rules read the spelling in the source: they do not
+follow import aliases (`RunStatus as Status`) or aliased callables, except a writer bound
+to a local name first (`emit = _emit_event_safe if ...`), which is matched for run.started
+and run.error.
 
-| Rule | Copy it stops (definition site) |
+| Rule | Shapes matched (definition site) and kept exceptions |
 |---|---|
 | `stored-event-name-literal` | a stored event name as a string (`StoredEventType`, `_lifecycle.py`; migrations excluded) |
-| `lifecycle-reason-literal` | a failure, cancel, pause, approval or denial reason as a string (`_lifecycle.py`, `_codes.py`) |
-| `storage-format-literal` | a number 2 compared with or assigned to `storage_format` (`STORAGE_FORMAT_CHECKPOINTED`) |
-| `meta-key-literal` | a `dendrux.*` metadata or session key as a string (`_meta_keys.py`) |
-| `default-sqlite-url-literal` | `./dendrux.db` outside `db/session.py` (`_codes.py` messages excluded) |
-| `connection-loss-code-copy` | `startswith("08")` and `57P01` to `57P03` outside `_is_connection_loss_code` |
-| `new-run-fingerprint-outside-helper` | `compute_idempotency_fingerprint(` and the output-type name string outside `_new_run_metadata` |
-| `run-started-outside-startup` | `StoredEventType.RUN_STARTED` passed to an event write outside `_start_new_run` |
-| `error-finalize-outside-helper` | finalizing with the error status or writing `run.error` outside `_persist_run_failure` |
-| `cancel-finalize-outside-helper` | finalizing with the cancelled status outside `_persist_run_cancellation` (and the listed cancel paths) |
+| `lifecycle-reason-literal` | a reason string as a keyword or dict value, comparison, tuple/list/set membership, assignment or conditional-expression value (`_lifecycle.py`, `_codes.py`); the words `requested` and `budget` only where the name or key contains "reason" |
+| `storage-format-literal` | the number 2 compared (either side), tested with `in`, or assigned for `storage_format` (`STORAGE_FORMAT_CHECKPOINTED`); format 1 is not matched |
+| `meta-key-literal` | a `dendrux.*` key as a dict key, subscript, get/pop/setdefault argument, `in` operand or constant assignment (`_meta_keys.py`; OTel excluded); docstrings, module names and logger names are not keys |
+| `default-sqlite-url-literal` | `./dendrux.db` inside a string outside `db/session.py` (`_codes.py` messages excluded); prose in a docstring also matches |
+| `connection-loss-code-copy` | `startswith("08")` (also in a tuple), `[:2]`/`[0:2]` tests against `"08"`, and `57P01` to `57P03`, outside `_is_connection_loss_code`; `53300` is not matched |
+| `new-run-fingerprint-outside-helper` | `compute_idempotency_fingerprint(` and the output-type name f-string under `runtime/`, `agent.py`, `loops/`, outside `_new_run_metadata`; kept: `_idempotent_hit_after_image_error` |
+| `run-started-outside-startup` | `StoredEventType.RUN_STARTED` passed to an event write (also through a local writer alias) outside `_start_new_run` |
+| `error-finalize-outside-helper` | finalizing with the error status, or writing `run.error`, outside `_persist_run_failure`; kept: `_reclaim._handle_rebuild_failure` |
+| `cancel-finalize-outside-helper` | finalizing with the cancelled status outside `_persist_run_cancellation`; kept: `_finalize_loop_cancelled`, `_pause_with_event`, `Agent._cancel_one` |
 
 `hardcoded-terminal-status-set` also matches `RunStatus.X.value` operands.
 
