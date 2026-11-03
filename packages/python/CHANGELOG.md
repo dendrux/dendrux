@@ -200,15 +200,11 @@
 
 ### Fixed
 
-- Resumed loops initialize tool call limits from saved execution counts, falling back to history for legacy runs.
-
-- Denied tool calls no longer consume a tool’s per-run call limit after resuming.
-
-- Streaming recovery marks dispatched work before side effects and finalizes subsequent failures.
-- Approved tools use the resumed strategy and retain notifier warnings in the run result.
-- Recovered approval denials use the same structured tool result as live and approved calls.
+- Denied tool calls no longer use up a tool's per-run call limit after a resume.
+- Resumed loops start their tool call counts from the saved execution counts when available, falling back to history.
+- Approved tools use the resumed run's tool-calling strategy and keep notifier warnings in the run result.
+- Recovered approval denials return the same structured tool result as live and approved calls.
 - Streaming provider errors release image request holders on every failure path.
-
 - Provider retry telemetry warnings omit SQL statements and parameters from database failures.
 - OpenAI Chat, Responses and OpenRouter streaming image failures release request holders from tracebacks.
 - Anthropic image-bearing streaming failures drop the SDK stream from traceback locals.
