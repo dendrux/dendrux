@@ -144,6 +144,7 @@ from dendrux.skills._session import META_KEY, SkillSession, continuation, curren
 from dendrux.skills._session import current as current_skill_session
 from dendrux.strategies.native import NativeToolCalling
 from dendrux.types import (
+    AgentStep,
     ApprovalDecision,
     ErrorInfo,
     GovernanceEventType,
@@ -4421,7 +4422,7 @@ async def _load_pause_state(
 ) -> PauseState:
     from dendrux.errors import PersistenceError, RunNotReclaimableError
     from dendrux.runtime.replay import rebuild_history
-    from dendrux.types import InputValidationError, _usage_from_dict
+    from dendrux.types import InputValidationError
 
     pause = PauseState.from_dict(raw)
     if pause.schema_version != 2:
@@ -4454,11 +4455,57 @@ async def _load_pause_state(
     if reads is not None:
         reads.history_records = messages.records
         reads.checkpoint = checkpoint
-    pause.steps = messages.steps
-    pause.usage = _usage_from_dict(checkpoint["usage"])
-    pause.iteration = checkpoint["iteration"]
-    pause.trace_order_offset = checkpoint["trace_order_offset"]
-    pause.provider_kwargs = dict(checkpoint["provider_kwargs"])
+    await _overlay_pause_checkpoint(pause, store, run_id, agent, checkpoint, messages.steps)
+    return pause
+
+
+async def _overlay_pause_checkpoint(
+    pause: PauseState,
+    store: StateStore,
+    run_id: str,
+    agent: Agent,
+    checkpoint: dict[str, Any],
+    steps: list[AgentStep],
+    *,
+    recovery: bool = False,
+) -> None:
+    from dendrux.types import _usage_from_dict
+
+    pause.steps = steps
+    # Reclaim tolerates absent counters; resume rejects incomplete checkpoints.
+    if recovery:
+        pause.iteration = checkpoint.get("iteration", 0)
+        pause.trace_order_offset = checkpoint.get("trace_order_offset", 0)
+        pause.usage = _usage_from_dict(checkpoint.get("usage", {}))
+        pause.provider_kwargs = dict(checkpoint.get("provider_kwargs", {}))
+    else:
+        pause.usage = _usage_from_dict(checkpoint["usage"])
+        pause.iteration = checkpoint["iteration"]
+        pause.trace_order_offset = checkpoint["trace_order_offset"]
+        pause.provider_kwargs = dict(checkpoint["provider_kwargs"])
+    await _restore_pause_refs(
+        pause,
+        store,
+        run_id,
+        agent,
+        checkpoint,
+        missing_code=FailureReason.RECOVERY_STATE_MISSING.value
+        if recovery
+        else "pause_format_unsupported",
+    )
+
+
+async def _restore_pause_refs(
+    pause: PauseState,
+    store: StateStore,
+    run_id: str,
+    agent: Agent,
+    checkpoint: dict[str, Any],
+    *,
+    missing_code: str,
+) -> None:
+    from dendrux.errors import PersistenceError
+
     for kind, ref in (
         ("image_view", checkpoint.get("image_view_ref")),
         ("skills_session", checkpoint.get("skills", {}).get("session_ref")),
@@ -4468,7 +4515,7 @@ async def _load_pause_state(
             continue
         state_trace = await store.get_trace(run_id, ref)
         if state_trace is None:
-            raise PersistenceError(code="pause_format_unsupported")
+            raise PersistenceError(code=missing_code)
         payload = json.loads(state_trace.content)
         if kind == "image_view":
             pause.image_view = ImageViewState.from_dict(payload)
@@ -4478,7 +4525,6 @@ async def _load_pause_state(
                 session.restore_snapshot(payload)
         else:
             pause.pause_message = payload.get("pause_message")
-    return pause
 
 
 async def _prepare_resume(
@@ -5632,6 +5678,8 @@ async def _read_resume_pause(
     reads: _PauseReads,
     skip_claim: bool,
     expected_pause_id: str | None,
+    *,
+    read_record: bool = False,
 ) -> PauseState:
     if raw is None:
         raise ValueError(f"Run '{run_id}' has no pause state — cannot resume.")
@@ -5639,6 +5687,8 @@ async def _read_resume_pause(
         require_pause_id(
             agent, expected_pause_id, pause_id=raw.get("pause_id"), store=store, run_id=run_id
         )
+    if read_record:
+        reads.record = await store.get_run(run_id)
     return await _load_pause_state(store, run_id, raw, agent, provider, reads=reads)
 
 
@@ -5651,11 +5701,12 @@ async def _read_resume_state(
     expected_pause_id: str | None,
     supplied_raw: dict[str, Any] | None,
     reclaimed: PauseState | None,
+    *,
+    streaming: bool = False,
 ) -> tuple[RunRecord | None, _PauseReads, Any, PauseState, bool, Any]:
     from dendrux.runtime._reclaim import needs_resolution
 
-    record = await store.get_run(run_id)
-    reads = _PauseReads(record)
+    reads = _PauseReads(None if streaming else await store.get_run(run_id))
     raw = None if reclaimed is not None else supplied_raw
     if reclaimed is None and raw is None:
         raw = await store.get_pause_state(run_id)
@@ -5663,20 +5714,28 @@ async def _read_resume_state(
         reclaimed
         if reclaimed is not None
         else await _read_resume_pause(
-            store, agent, provider, run_id, raw, reads, skip_claim, expected_pause_id
+            store,
+            agent,
+            provider,
+            run_id,
+            raw,
+            reads,
+            skip_claim,
+            expected_pause_id,
+            read_record=streaming,
         )
     )
     recovering = reclaimed is not None or await needs_resolution(
         store, run_id, pause, checkpoint=reads.checkpoint
     )
-    pii = await store.get_pii_mapping(run_id)
+    pii = None if streaming else await store.get_pii_mapping(run_id)
     if pause.agent_name and pause.agent_name != agent.name:
         raise ValueError(
             f"Agent name mismatch: run '{run_id}' was paused by "
-            f"'{pause.agent_name}', but resume called with '{agent.name}'. "
-            "This can cause state corruption."
+            f"'{pause.agent_name}', but resume called with '{agent.name}'."
+            + ("" if streaming else " This can cause state corruption.")
         )
-    return record, reads, raw, pause, recovering, pii
+    return reads.record, reads, raw, pause, recovering, pii
 
 
 async def _resume_submission(
@@ -6246,31 +6305,17 @@ async def _stream_resume_state(
     skill_session = await continuation(agent, store, run_id)
     stream_context.set_session(skill_session)
 
-    # 2. Load pause state
-    raw_pause = await store.get_pause_state(run_id)
-    if raw_pause is None:
-        raise ValueError(f"Run '{run_id}' has no pause state — cannot resume.")
-    require_pause_id(
+    run_record, reads, raw_pause, pause_state, recovering, _ = await _read_resume_state(
+        store,
         agent,
+        provider,
+        run_id,
+        False,
         expected_pause_id,
-        pause_id=raw_pause.get("pause_id"),
-        store=store,
-        run_id=run_id,
+        None,
+        None,
+        streaming=True,
     )
-    run_record = await store.get_run(run_id)
-    reads = _PauseReads(run_record)
-    pause_state = await _load_pause_state(store, run_id, raw_pause, agent, provider, reads=reads)
-    from dendrux.runtime._reclaim import needs_resolution
-
-    recovering = await needs_resolution(store, run_id, pause_state, checkpoint=reads.checkpoint)
-
-    # 2b. Verify agent identity
-    if pause_state.agent_name and pause_state.agent_name != agent.name:
-        raise ValueError(
-            f"Agent name mismatch: run '{run_id}' was paused by "
-            f"'{pause_state.agent_name}', but resume called with "
-            f"'{agent.name}'."
-        )
 
     if stream_results is not None:
         validate_result_names(run_id, pause_state, stream_results, json_payload=False)
