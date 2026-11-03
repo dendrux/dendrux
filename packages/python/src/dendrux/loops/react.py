@@ -24,7 +24,6 @@ import inspect
 import json
 import logging
 import time
-import traceback
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
@@ -46,7 +45,6 @@ from dendrux.llm._evidence import (
     RejectedArguments,
     RejectedToolName,
     persistable_call,
-    persistable_response,
 )
 from dendrux.llm._retry_telemetry import telemetry_context, telemetry_stream
 from dendrux.loops._budget import BudgetBreach, BudgetCarry, BudgetTracker, breach_payload
@@ -61,17 +59,14 @@ from dendrux.loops._helpers import (
     leased_stream,
     notify_governance,
     notify_llm,
-    notify_llm_failed,
     notify_llm_started,
     notify_message,
     notify_tool,
     notify_tool_started,
     order_observations,
-    price_response,
     project_message,
     record_governance,
     record_llm,
-    record_llm_failed,
     record_llm_started,
     record_message,
     record_tool,
@@ -79,12 +74,12 @@ from dendrux.loops._helpers import (
 )
 from dendrux.loops._images import (
     ImageCallSite,
-    control_stop,
     no_control,
     pause_image_view,
     release_wire,
     tool_result_images_dropped,
 )
+from dendrux.loops._llm_call import ProviderCallSite
 from dendrux.loops._policy_context import history_call_counts, static_denial, tool_call_context
 from dendrux.loops.base import Loop
 from dendrux.media._ids import IMAGE_ID_RE
@@ -167,14 +162,12 @@ logger = logging.getLogger(__name__)
 _record_message = record_message
 _record_llm = record_llm
 _record_llm_started = record_llm_started
-_record_llm_failed = record_llm_failed
 _record_tool = record_tool
 _record_tool_started = record_tool_started
 _record_governance = record_governance
 _notify_message = notify_message
 _notify_llm = notify_llm
 _notify_llm_started = notify_llm_started
-_notify_llm_failed = notify_llm_failed
 _notify_tool = notify_tool
 _notify_tool_started = notify_tool_started
 _notify_governance = notify_governance
@@ -329,11 +322,6 @@ async def _commit_message(
     history[-1] = msg
     await _notify_message(notifier, run_id, msg, iteration, warnings)
     return msg
-
-
-def _drop_frame_locals(exc: BaseException) -> None:
-    """Clear finished frames' locals in ``exc``'s traceback (they may hold wire bytes)."""
-    traceback.clear_frames(exc.__traceback__)
 
 
 def _format_result(strategy: Strategy, result: ToolResult) -> Message:
@@ -1638,6 +1626,7 @@ class _RunContext:
     budget: BudgetTracker
     before_tool: BeforeToolHook | None
     hook_tenant_id: str | None
+    calls: ProviderCallSite
     g_engine: GuardrailEngine | None = None
 
     def meta(self) -> dict[str, Any]:
@@ -1741,6 +1730,16 @@ async def _start_run(
         budget=budget,
         before_tool=before_tool,
         hook_tenant_id=hook_tenant_id,
+        calls=ProviderCallSite(
+            images,
+            agent=agent,
+            provider=provider,
+            pkw=pkw,
+            recorder=recorder,
+            notifier=notifier,
+            run_id=resolved_run_id,
+            warnings=state.warnings,
+        ),
     )
 
 
@@ -1852,22 +1851,6 @@ def _build_messages(ctx: _RunContext) -> tuple[list[Message], Any]:
         history=ctx.state.history,
         tool_defs=ctx.tool_defs,
     )
-
-
-def _settle_response(
-    ctx: _RunContext, prepared: PreparedRequest, response: LLMResponse, t0: float
-) -> tuple[PreparedRequest, int, LLMResponse]:
-    """After the provider returns: commit the image view, time the call, price the response."""
-    prepared = ctx.images.mark_sent(prepared)
-    duration_ms = int((time.monotonic() - t0) * 1000)
-    response = persistable_response(response)
-    response = price_response(
-        response,
-        pricing=ctx.agent.pricing,
-        default_model=ctx.provider.model,
-        model=ctx.pkw.get("model"),
-    )
-    return prepared, duration_ms, response
 
 
 def _llm_findings(
@@ -2399,6 +2382,7 @@ class ReActLoop(Loop):
         history, steps, total_usage = ctx.state.history, ctx.state.steps, ctx.state.usage
         notifier_warnings, image_state = ctx.state.warnings, ctx.state.image_view
         images, budget, _control_reader = ctx.images, ctx.budget, ctx.control_reader
+        calls = ctx.calls
         g_engine = _run_guardrail_engine(agent, recorder, initial_pii_mapping, resolved_run_id)
         ctx.g_engine = g_engine
         _bind_run_checkpoint(ctx)
@@ -2469,37 +2453,22 @@ class ReActLoop(Loop):
                                 **_pkw,
                             )
                 except Exception as _llm_exc:
-                    _llm_fail_ms = int((time.monotonic() - t0) * 1000)
-                    await _record_llm_failed(
-                        recorder,
-                        resolved_run_id,
-                        iteration,
-                        _llm_exc,
-                        duration_ms=_llm_fail_ms,
-                    )
-                    await _notify_llm_failed(
-                        notifier,
-                        resolved_run_id,
-                        iteration,
-                        _llm_exc,
-                        notifier_warnings,
-                        duration_ms=_llm_fail_ms,
-                    )
+                    await calls.record_failure(_llm_exc, t0, iteration)
                     if not prepared.slots:
                         raise
                     failure = _llm_exc
                     prepared = release_wire(prepared)
                 if failure is None:
                     break
-                decision = await images.on_failure(
+                stop, error, decision = await calls.decide(
                     failure,
                     prepared,
-                    iteration=iteration,
+                    iteration,
                     retried=retried,
                     visible_deltas=0,
                     control_reader=_control_reader,
                 )
-                stop = control_stop(decision)
+                del failure
                 if stop is not None:
                     return _control_stop_result(
                         stop,
@@ -2513,14 +2482,8 @@ class ReActLoop(Loop):
                         budget=budget,
                         image_view=pause_image_view(image_state, history),
                     )
-                if decision.action == "propagate":
-                    _drop_frame_locals(failure)
-                    raise failure
-                if decision.action == "raise":
-                    assert decision.error is not None
-                    del failure
-                    raise decision.error
-                del failure
+                if error is not None:
+                    raise error
                 retried = True
                 prepared = await images.prepare(
                     messages,
@@ -2538,7 +2501,7 @@ class ReActLoop(Loop):
                         usage=total_usage,
                         meta=guardrail_meta(g_engine, notifier_warnings),
                     )
-            prepared, llm_duration_ms, response = _settle_response(ctx, prepared, response, t0)
+            prepared, llm_duration_ms, response = calls.settle(prepared, response, t0)
             blocked = await _scan_outgoing(
                 ctx,
                 response,
@@ -2655,6 +2618,7 @@ class ReActLoop(Loop):
         history, steps, total_usage = ctx.state.history, ctx.state.steps, ctx.state.usage
         notifier_warnings, image_state = ctx.state.warnings, ctx.state.image_view
         images, budget, _control_reader = ctx.images, ctx.budget, ctx.control_reader
+        calls = ctx.calls
         _bind_run_checkpoint(ctx)
         start_iteration = iteration_offset + 1
         end_iteration = agent.max_iterations + 1
@@ -2770,22 +2734,7 @@ class ReActLoop(Loop):
                                 f"StreamEvent(type=DONE, raw=LLMResponse)."
                             )
                     except Exception as _stream_exc:
-                        _stream_fail_ms = int((time.monotonic() - t0) * 1000)
-                        await _record_llm_failed(
-                            recorder,
-                            resolved_run_id,
-                            iteration,
-                            _stream_exc,
-                            duration_ms=_stream_fail_ms,
-                        )
-                        await _notify_llm_failed(
-                            notifier,
-                            resolved_run_id,
-                            iteration,
-                            _stream_exc,
-                            notifier_warnings,
-                            duration_ms=_stream_fail_ms,
-                        )
+                        await calls.record_failure(_stream_exc, t0, iteration)
                         if isinstance(_stream_exc, StreamInterruptedError):
                             interrupted = True
                         elif not prepared.slots:
@@ -2795,25 +2744,19 @@ class ReActLoop(Loop):
                             prepared = release_wire(prepared)
                     if failure is None:
                         break
-                    decision = await images.on_failure(
+                    stop_control, error, decision = await calls.decide(
                         failure,
                         prepared,
-                        iteration=iteration,
+                        iteration,
                         retried=retried,
                         visible_deltas=visible_deltas,
                         control_reader=_control_reader,
                     )
-                    stop_control = control_stop(decision)
+                    del failure
                     if stop_control is not None:
                         break
-                    if decision.action == "propagate":
-                        _drop_frame_locals(failure)
-                        raise failure
-                    if decision.action == "raise":
-                        assert decision.error is not None
-                        del failure
-                        raise decision.error
-                    del failure
+                    if error is not None:
+                        raise error
                     # Retry in place (N-15.2): close the first stream, keep the
                     # telemetry context, open a new stream for the new view.
                     retried = True
@@ -2888,9 +2831,7 @@ class ReActLoop(Loop):
             # The try-block raised if no DONE arrived; only the interrupted path
             # (handled above) leaves this None.
             assert llm_response is not None
-            prepared, llm_duration_ms, llm_response = _settle_response(
-                ctx, prepared, llm_response, t0
-            )
+            prepared, llm_duration_ms, llm_response = calls.settle(prepared, llm_response, t0)
             step, limited = await _after_response(
                 ctx,
                 llm_response,

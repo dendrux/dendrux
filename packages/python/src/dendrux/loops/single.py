@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from dendrux._lifecycle import (
     FailureReason,
@@ -23,7 +23,6 @@ from dendrux._lifecycle import (
 )
 from dendrux.guardrails._engine import GuardrailEngine
 from dendrux.llm._calls import complete_call, stream_call
-from dendrux.llm._evidence import persistable_response
 from dendrux.llm._retry_telemetry import telemetry_context, telemetry_stream
 from dendrux.loops._budget import BudgetTracker
 from dendrux.loops._helpers import (
@@ -37,22 +36,20 @@ from dendrux.loops._helpers import (
     leased_stream,
     notify_governance,
     notify_llm,
-    notify_llm_failed,
     notify_llm_started,
     notify_message,
     price_response,
     record_governance,
     record_llm,
-    record_llm_failed,
     record_llm_started,
     record_message,
 )
-from dendrux.loops._images import ImageCallSite, control_stop, release_wire
+from dendrux.loops._images import ImageCallSite, release_wire
+from dendrux.loops._llm_call import ProviderCallSite
 from dendrux.loops.base import Loop
 from dendrux.loops.react import (
     _bind_checkpoint,
     _blocked_data,
-    _drop_frame_locals,
     _image_block_data,
     _image_policy,
     _incoming_location,
@@ -233,6 +230,106 @@ def _single_checkpoint(
     return state, budget
 
 
+def _refuse_resume(
+    initial_steps: list[AgentStep] | None,
+    iteration_offset: int,
+    initial_usage: UsageStats | None,
+) -> None:
+    if initial_steps or iteration_offset != 0 or initial_usage is not None:
+        raise RuntimeError(
+            "SingleCall does not support resume. It never pauses "
+            "(no tools, no waiting states), so receiving resume parameters "
+            "(initial_steps, iteration_offset, initial_usage) "
+            "indicates a bug in the caller."
+        )
+
+
+class _SinglePrelude(NamedTuple):
+    run_id: str
+    pkw: dict[str, Any]
+    cache_key_prefix: str | None
+    warnings: list[str]
+    history: list[Message]
+    messages: list[Message]
+    images: ImageCallSite
+    calls: ProviderCallSite
+
+
+async def _seed_history(
+    initial_history: list[Message] | None,
+    user_input: str,
+    recorder: LoopRecorder | None,
+    notifier: LoopNotifier | None,
+    run_id: str,
+    warnings: list[str],
+) -> list[Message]:
+    if initial_history is not None:
+        # Seeded chat history (or resume) — caller already persisted what's
+        # supposed to land in react_traces. Use as-is, do not re-record.
+        return list(initial_history)
+    from dendrux.context_blocks import wire_user_input
+
+    user_msg = Message(role=Role.USER, content=wire_user_input(user_input, [], None))
+    history = [user_msg]
+    await record_message(recorder, run_id, user_msg, 0)
+    await notify_message(notifier, run_id, user_msg, 0, warnings)
+    return history
+
+
+async def _single_prelude(
+    loop: Loop,
+    agent: Agent,
+    provider: LLMProvider,
+    strategy: Strategy,
+    user_input: str,
+    *,
+    run_id: str | None,
+    recorder: LoopRecorder | None,
+    notifier: LoopNotifier | None,
+    initial_history: list[Message] | None,
+    provider_kwargs: dict[str, Any] | None,
+    image_runtime: ImageRuntime | None,
+    image_view_state: ImageViewState | None,
+) -> _SinglePrelude:
+    """Shared start of ``run`` and ``run_stream``: ids, history, the request, call sites."""
+    resolved_run_id = run_id or generate_ulid()
+    pkw = provider_kwargs or {}
+    cache_key_prefix = build_cache_key_prefix(agent)
+    warnings: list[str] = []
+    history = await _seed_history(
+        initial_history, user_input, recorder, notifier, resolved_run_id, warnings
+    )
+    messages, _tools = strategy.build_messages(
+        system_prompt=agent.get_system_prompt(loop=loop),
+        history=history,
+        tool_defs=[],
+    )
+    images = _image_site(
+        agent,
+        provider,
+        image_runtime,
+        image_view_state,
+        pkw,
+        recorder,
+        notifier,
+        resolved_run_id,
+        warnings,
+    )
+    calls = ProviderCallSite(
+        images,
+        agent=agent,
+        provider=provider,
+        pkw=pkw,
+        recorder=recorder,
+        notifier=notifier,
+        run_id=resolved_run_id,
+        warnings=warnings,
+    )
+    return _SinglePrelude(
+        resolved_run_id, pkw, cache_key_prefix, warnings, history, messages, images, calls
+    )
+
+
 class SingleCall(Loop):
     """One LLM call, no tools, no iteration.
 
@@ -287,48 +384,24 @@ class SingleCall(Loop):
                 "without output_type, or output_type without guardrails."
             )
 
-        is_resume = initial_steps or iteration_offset != 0 or initial_usage is not None
-        if is_resume:
-            raise RuntimeError(
-                "SingleCall does not support resume. It never pauses "
-                "(no tools, no waiting states), so receiving resume parameters "
-                "(initial_steps, iteration_offset, initial_usage) "
-                "indicates a bug in the caller."
-            )
-
-        resolved_run_id = run_id or generate_ulid()
-        _pkw = provider_kwargs or {}
-        cache_key_prefix = build_cache_key_prefix(agent)
-        notifier_warnings: list[str] = []
-
-        if initial_history is not None:
-            # Seeded chat history (or resume) — caller already persisted what's
-            # supposed to land in react_traces. Use as-is, do not re-record.
-            history: list[Message] = list(initial_history)
-        else:
-            from dendrux.context_blocks import wire_user_input
-
-            user_msg = Message(role=Role.USER, content=wire_user_input(user_input, [], None))
-            history = [user_msg]
-            await record_message(recorder, resolved_run_id, user_msg, 0)
-            await notify_message(notifier, resolved_run_id, user_msg, 0, notifier_warnings)
-
-        messages, _tools = strategy.build_messages(
-            system_prompt=agent.get_system_prompt(loop=self),
-            history=history,
-            tool_defs=[],
-        )
-        images = _image_site(
+        _refuse_resume(initial_steps, iteration_offset, initial_usage)
+        pre = await _single_prelude(
+            self,
             agent,
             provider,
-            image_runtime,
-            image_view_state,
-            _pkw,
-            recorder,
-            notifier,
-            resolved_run_id,
-            notifier_warnings,
+            strategy,
+            user_input,
+            run_id=run_id,
+            recorder=recorder,
+            notifier=notifier,
+            initial_history=initial_history,
+            provider_kwargs=provider_kwargs,
+            image_runtime=image_runtime,
+            image_view_state=image_view_state,
         )
+        resolved_run_id, _pkw, cache_key_prefix = pre.run_id, pre.pkw, pre.cache_key_prefix
+        notifier_warnings, history, messages = pre.warnings, pre.history, pre.messages
+        images, calls = pre.images, pre.calls
         control_reader = _cancel_reader(state_store, resolved_run_id)
 
         # Incoming guardrail — scan all messages
@@ -531,37 +604,24 @@ class SingleCall(Loop):
                 )
                 raise
             except Exception as _llm_exc:
-                _llm_fail_ms = int((time.monotonic() - t0) * 1000)
-                await record_llm_failed(
-                    recorder,
-                    resolved_run_id,
-                    1,
-                    _llm_exc,
-                    duration_ms=_llm_fail_ms,
-                )
-                await notify_llm_failed(
-                    notifier,
-                    resolved_run_id,
-                    1,
-                    _llm_exc,
-                    notifier_warnings,
-                    duration_ms=_llm_fail_ms,
-                )
+                await calls.record_failure(_llm_exc, t0, 1)
                 if not prepared.slots:
                     raise
                 failure = _llm_exc
                 prepared = release_wire(prepared)
             if failure is None:
                 break
-            decision = await images.on_failure(
+            stop, error, decision = await calls.decide(
                 failure,
                 prepared,
-                iteration=1,
+                1,
                 retried=retried,
                 visible_deltas=0,
                 control_reader=control_reader,
             )
-            if control_stop(decision) is not None:
+            del failure
+            if stop is not None:
+                # SingleCall honours cancel only: nothing ran, so iteration 0.
                 return RunResult(
                     run_id=resolved_run_id,
                     status=RunStatus.CANCELLED,
@@ -570,14 +630,8 @@ class SingleCall(Loop):
                     usage=UsageStats(),
                     meta=guardrail_meta(g_engine, notifier_warnings),
                 )
-            if decision.action == "propagate":
-                _drop_frame_locals(failure)
-                raise failure
-            if decision.action == "raise":
-                assert decision.error is not None
-                del failure
-                raise decision.error
-            del failure
+            if error is not None:
+                raise error
             retried = True
             prepared = await images.prepare(
                 messages,
@@ -586,15 +640,7 @@ class SingleCall(Loop):
                 force_tombstones=decision.tombstones,
             )
 
-        prepared = images.mark_sent(prepared)
-        llm_duration_ms = int((time.monotonic() - t0) * 1000)
-        response = persistable_response(response)
-        response = price_response(
-            response,
-            pricing=agent.pricing,
-            default_model=provider.model,
-            model=_pkw.get("model"),
-        )
+        prepared, llm_duration_ms, response = calls.settle(prepared, response, t0)
 
         # Output guardrail — detection-only. Persistence stores raw
         # (DB is ground truth); block policies abort the run, findings
@@ -790,48 +836,24 @@ class SingleCall(Loop):
                 "Use agent.run() for structured output, or agent.stream() without output_type."
             )
 
-        is_resume = initial_steps or iteration_offset != 0 or initial_usage is not None
-        if is_resume:
-            raise RuntimeError(
-                "SingleCall does not support resume. It never pauses "
-                "(no tools, no waiting states), so receiving resume parameters "
-                "(initial_steps, iteration_offset, initial_usage) "
-                "indicates a bug in the caller."
-            )
-
-        resolved_run_id = run_id or generate_ulid()
-        _pkw = provider_kwargs or {}
-        cache_key_prefix = build_cache_key_prefix(agent)
-        notifier_warnings: list[str] = []
-
-        if initial_history is not None:
-            # Seeded chat history (or resume) — caller already persisted what's
-            # supposed to land in react_traces. Use as-is, do not re-record.
-            history: list[Message] = list(initial_history)
-        else:
-            from dendrux.context_blocks import wire_user_input
-
-            user_msg = Message(role=Role.USER, content=wire_user_input(user_input, [], None))
-            history = [user_msg]
-            await record_message(recorder, resolved_run_id, user_msg, 0)
-            await notify_message(notifier, resolved_run_id, user_msg, 0, notifier_warnings)
-
-        messages, _tools = strategy.build_messages(
-            system_prompt=agent.get_system_prompt(loop=self),
-            history=history,
-            tool_defs=[],
-        )
-        images = _image_site(
+        _refuse_resume(initial_steps, iteration_offset, initial_usage)
+        pre = await _single_prelude(
+            self,
             agent,
             provider,
-            image_runtime,
-            image_view_state,
-            _pkw,
-            recorder,
-            notifier,
-            resolved_run_id,
-            notifier_warnings,
+            strategy,
+            user_input,
+            run_id=run_id,
+            recorder=recorder,
+            notifier=notifier,
+            initial_history=initial_history,
+            provider_kwargs=provider_kwargs,
+            image_runtime=image_runtime,
+            image_view_state=image_view_state,
         )
+        resolved_run_id, _pkw, cache_key_prefix = pre.run_id, pre.pkw, pre.cache_key_prefix
+        notifier_warnings, history, messages = pre.warnings, pre.history, pre.messages
+        images, calls = pre.images, pre.calls
         checkpoint_state, checkpoint_budget = _single_checkpoint(
             recorder,
             agent,
@@ -943,22 +965,7 @@ class SingleCall(Loop):
                             f"have zero tools — the provider should not produce tool calls."
                         )
                 except Exception as _stream_exc:
-                    _stream_fail_ms = int((time.monotonic() - t0) * 1000)
-                    await record_llm_failed(
-                        recorder,
-                        resolved_run_id,
-                        1,
-                        _stream_exc,
-                        duration_ms=_stream_fail_ms,
-                    )
-                    await notify_llm_failed(
-                        notifier,
-                        resolved_run_id,
-                        1,
-                        _stream_exc,
-                        notifier_warnings,
-                        duration_ms=_stream_fail_ms,
-                    )
+                    await calls.record_failure(_stream_exc, t0, 1)
                     if isinstance(_stream_exc, StreamInterruptedError):
                         interrupted = True
                     elif not prepared.slots:
@@ -968,25 +975,20 @@ class SingleCall(Loop):
                         prepared = release_wire(prepared)
                 if failure is None:
                     break
-                decision = await images.on_failure(
+                stop, error, decision = await calls.decide(
                     failure,
                     prepared,
-                    iteration=1,
+                    1,
                     retried=retried,
                     visible_deltas=visible_deltas,
                     control_reader=control_reader,
                 )
-                if control_stop(decision) is not None:
+                del failure
+                if stop is not None:
                     cancelled = True
                     break
-                if decision.action == "propagate":
-                    _drop_frame_locals(failure)
-                    raise failure
-                if decision.action == "raise":
-                    assert decision.error is not None
-                    del failure
-                    raise decision.error
-                del failure
+                if error is not None:
+                    raise error
                 retried = True
                 await provider_stream.aclose()
                 prepared = await images.prepare(
@@ -1055,15 +1057,7 @@ class SingleCall(Loop):
         # The try-block raised if no DONE arrived; only the interrupted path
         # (handled above) leaves this None.
         assert llm_response is not None
-        prepared = images.mark_sent(prepared)
-        llm_duration_ms = int((time.monotonic() - t0) * 1000)
-        llm_response = persistable_response(llm_response)
-        llm_response = price_response(
-            llm_response,
-            pricing=agent.pricing,
-            default_model=provider.model,
-            model=_pkw.get("model"),
-        )
+        prepared, llm_duration_ms, llm_response = calls.settle(prepared, llm_response, t0)
 
         await record_llm(
             recorder,
