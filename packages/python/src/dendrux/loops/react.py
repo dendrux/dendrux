@@ -156,6 +156,7 @@ if TYPE_CHECKING:
     from dendrux.loops.base import LoopNotifier, LoopRecorder
     from dendrux.media._runtime import ImageRuntime
     from dendrux.runtime.state import StateStore
+    from dendrux.skills._session import SkillSession
     from dendrux.strategies.base import Strategy
     from dendrux.types import BeforeToolHook, ToolResultTransform
 
@@ -310,6 +311,19 @@ async def _append_assistant(
         reasoning_blocks=response.reasoning_blocks,
     )
     history.append(msg)
+    return await _commit_message(history, msg, recorder, notifier, run_id, iteration, warnings)
+
+
+async def _commit_message(
+    history: list[Message],
+    msg: Message,
+    recorder: LoopRecorder | None,
+    notifier: LoopNotifier | None,
+    run_id: str,
+    iteration: int,
+    warnings: list[str],
+) -> Message:
+    """Record then notify ``msg``, the last history entry; history keeps the recorded form."""
     msg = await _record_message(recorder, run_id, msg, iteration)
     history[-1] = msg
     await _notify_message(notifier, run_id, msg, iteration, warnings)
@@ -620,9 +634,7 @@ async def _deliver_inbox(
             meta={"note_id": note.id},
         )
         history.append(msg)
-        msg = await _record_message(recorder, run_id, msg, iteration)
-        history[-1] = msg
-        await _notify_message(notifier, run_id, msg, iteration, warnings)
+        await _commit_message(history, msg, recorder, notifier, run_id, iteration, warnings)
     await state_store.mark_notes_delivered(run_id, [n.id for n in notes], iteration=iteration)
     for note in notes:
         data = {"note_id": note.id}
@@ -779,6 +791,412 @@ def _persistable_argument_validator(validator: Any) -> Any:
 prepare_tool_call = _persistable_argument_validator(prepare_tool_call)
 
 
+class _Governance:
+    """Record then notify a governance event of one iteration.
+
+    Also the skill session's sink, so it holds only what the event needs.
+    """
+
+    __slots__ = ("notifier", "recorder", "run_id", "iteration", "warnings")
+
+    def __init__(
+        self,
+        recorder: LoopRecorder | None,
+        notifier: LoopNotifier | None,
+        run_id: str,
+        iteration: int,
+        warnings: list[str],
+    ) -> None:
+        self.recorder = recorder
+        self.notifier = notifier
+        self.run_id = run_id
+        self.iteration = iteration
+        self.warnings = warnings
+
+    async def __call__(self, event: str, data: dict[str, Any], call_id: str | None) -> None:
+        await _record_governance(
+            self.recorder, self.run_id, event, self.iteration, data, correlation_id=call_id
+        )
+        await _notify_governance(
+            self.notifier,
+            self.run_id,
+            event,
+            self.iteration,
+            data,
+            correlation_id=call_id,
+            warnings=self.warnings,
+        )
+
+
+class _ToolBatch:
+    """The shared state of one ``_process_tool_calls`` batch and its writes.
+
+    ``all_results`` and ``history`` grow in phase order. Every write keeps
+    the order the stages always used: a rejected call gets its tool row,
+    then its message; a skill preflight failure joins history first.
+    """
+
+    __slots__ = ("strategy", "history", "all_results", "governance")
+
+    def __init__(
+        self,
+        *,
+        strategy: Strategy,
+        recorder: LoopRecorder | None,
+        notifier: LoopNotifier | None,
+        run_id: str,
+        iteration: int,
+        history: list[Message],
+        warnings: list[str],
+    ) -> None:
+        self.strategy = strategy
+        self.history = history
+        self.all_results: list[tuple[ToolCall, ToolResult]] = []
+        self.governance = _Governance(recorder, notifier, run_id, iteration, warnings)
+
+    @property
+    def recorder(self) -> LoopRecorder | None:
+        return self.governance.recorder
+
+    @property
+    def notifier(self) -> LoopNotifier | None:
+        return self.governance.notifier
+
+    @property
+    def run_id(self) -> str:
+        return self.governance.run_id
+
+    @property
+    def iteration(self) -> int:
+        return self.governance.iteration
+
+    @property
+    def warnings(self) -> list[str]:
+        return self.governance.warnings
+
+    async def restore_skipped(self, data: dict[str, Any], call_id: str) -> None:
+        await self.governance(GovernanceEventType.GUARDRAIL_RESTORE_SKIPPED.value, data, call_id)
+
+    async def tool_row(self, tc: ToolCall, result: ToolResult) -> None:
+        await _record_tool(self.recorder, self.run_id, tc, result, self.iteration)
+        await _notify_tool(self.notifier, self.run_id, tc, result, self.iteration, self.warnings)
+
+    async def append_message(self, tc: ToolCall, result: ToolResult) -> None:
+        """Append the result message, record then notify it, and keep the pair."""
+        msg = _format_result(self.strategy, result)
+        self.history.append(msg)
+        await self._commit(tc, result, msg)
+
+    async def reject(self, tc: ToolCall, result: ToolResult) -> None:
+        """A call answered before execution: tool row, then message."""
+        await self.tool_row(tc, result)
+        await self.append_message(tc, result)
+
+    async def reject_listed_first(self, tc: ToolCall, result: ToolResult) -> None:
+        """Skill preflight order: the message joins history before the tool row."""
+        msg = _format_result(self.strategy, result)
+        self.history.append(msg)
+        await self.tool_row(tc, result)
+        await self._commit(tc, result, msg)
+
+    async def _commit(self, tc: ToolCall, result: ToolResult, msg: Message) -> None:
+        await _commit_message(
+            self.history,
+            msg,
+            self.recorder,
+            self.notifier,
+            self.run_id,
+            self.iteration,
+            self.warnings,
+        )
+        self.all_results.append((tc, result))
+
+
+def _bind_skill_session(lookups: ToolLookups, governance: _Governance) -> SkillSession | None:
+    """The batch's skill session (None without skill tools), bound to this run and iteration."""
+    from dendrux.skills._session import SkillTool
+
+    session = next((fn.session for fn in lookups.fn.values() if isinstance(fn, SkillTool)), None)
+    if session is not None:
+        session.run_id = governance.run_id
+        session.sink = governance
+    return session
+
+
+async def _json_failure(
+    tc: ToolCall, lookups: ToolLookups, session: SkillSession | None
+) -> ToolResult | None:
+    """Invalid JSON arguments, or an invalid call of a skill tool (activations preflight)."""
+    from dendrux.skills._session import SkillTool
+
+    result = check_tool_json(tc)
+    if result is not None or session is None:
+        return result
+    if not isinstance(lookups.fn.get(tc.name), SkillTool):
+        return None
+    result = check_tool_call(tc, lookups.defs.get(tc.name))
+    if result is not None and tc.name == "use_skill":
+        await session.preflight(tc)
+    return result
+
+
+async def _reject_invalid_json(
+    calls: list[ToolCall],
+    lookups: ToolLookups,
+    session: SkillSession | None,
+    batch: _ToolBatch,
+) -> list[ToolCall]:
+    """Stage 1. Runs before deny and approval: a call with no usable arguments
+    must never reach a human as "{}", and the model needs the parse error
+    (not a policy message) to repair it."""
+    parsed: list[ToolCall] = []
+    for tc in calls:
+        result = await _json_failure(tc, lookups, session)
+        if result is None:
+            parsed.append(tc)
+        else:
+            await batch.reject(tc, result)
+    return parsed
+
+
+async def _apply_static_deny(
+    calls: list[ToolCall], deny: frozenset[str], batch: _ToolBatch
+) -> list[ToolCall]:
+    """Stage 2. A denied call is not an execution: governance event and message, no tool row."""
+    kept: list[ToolCall] = []
+    for tc in calls:
+        if tc.name not in deny:
+            kept.append(tc)
+            continue
+        result, data = static_denial(tc.name, tc.id)
+        await batch.governance(GovernanceEventType.POLICY_DENIED.value, data, tc.id)
+        await batch.append_message(tc, result)
+    return kept
+
+
+async def _reject_unknown(
+    calls: list[ToolCall], lookups: ToolLookups, batch: _ToolBatch
+) -> list[ToolCall]:
+    """Stage 3. Unknown tools are answered now, never hooked or approved."""
+    known: list[ToolCall] = []
+    for tc in calls:
+        if tc.name in lookups.fn:
+            known.append(tc)
+        else:
+            await batch.reject(tc, _unknown_tool_result(tc, lookups))
+    return known
+
+
+async def _restore_calls(
+    engine: GuardrailEngine | None,
+    calls: list[ToolCall],
+    lookups: ToolLookups,
+    batch: _ToolBatch,
+) -> list[ToolCall]:
+    """Stage 4. Real values for the PII placeholders, as the guardrail decides."""
+    if engine is None:
+        return calls
+    for i, tc in enumerate(calls):
+        if tc.params:
+            params = await _restore_params(engine, tc, lookups, batch.restore_skipped)
+            if params != tc.params:
+                calls[i] = replace(tc, params=params)
+    return calls
+
+
+async def _validate_calls(
+    calls: list[ToolCall],
+    lookups: ToolLookups,
+    placeholders: frozenset[str],
+    batch: _ToolBatch,
+) -> list[ToolCall]:
+    """Stage 5. Validate, then coerce local tools to normalised arguments.
+
+    Before hooks and approval: a human never approves a malformed call, and
+    everything downstream sees exactly the arguments the function receives.
+    """
+    valid: list[ToolCall] = []
+    for tc in calls:
+        prepared = prepare_tool_call(
+            tc, lookups.defs.get(tc.name), lookups.fn.get(tc.name), placeholders=placeholders
+        )
+        if isinstance(prepared, ToolResult):
+            await batch.reject(tc, prepared)
+        else:
+            valid.append(prepared)
+    return valid
+
+
+async def _enforce_limits(
+    calls: list[ToolCall],
+    lookups: ToolLookups,
+    call_counts: dict[str, int],
+    batch: _ToolBatch,
+) -> list[ToolCall]:
+    """Stage 6. ``max_calls_per_run``, before hooks and approval (counts are read only)."""
+    kept, over_limit = enforce_call_limits(
+        calls, max_calls=lookups.max_calls, call_counts=call_counts
+    )
+    for tc, result in over_limit:
+        await batch.reject(tc, result)
+    return kept
+
+
+async def _preflight_skills(
+    calls: list[ToolCall],
+    lookups: ToolLookups,
+    session: SkillSession,
+    approved: bool,
+    batch: _ToolBatch,
+) -> list[ToolCall]:
+    """Stage 6b. Skill preflight before approval.
+
+    Earlier valid activations in this batch may satisfy reads; execution
+    rechecks against the activations that actually succeed.
+    """
+    from dendrux.skills._session import SkillTool
+
+    ready: list[ToolCall] = []
+    anticipated: set[str] = set()
+    for tc in calls:
+        is_skill = isinstance(lookups.fn.get(tc.name), SkillTool)
+        failure = (
+            await session.preflight(
+                tc, requested=not approved, anticipated=anticipated, approved=approved
+            )
+            if is_skill
+            else None
+        )
+        if failure is not None:
+            await batch.reject_listed_first(tc, failure)
+            continue
+        ready.append(tc)
+        if is_skill and tc.name == "use_skill":
+            anticipated.add(tc.params["name"])
+    return ready
+
+
+def _static_gates(
+    calls: list[ToolCall], require_approval: frozenset[str] | None
+) -> dict[str, dict[str, str | None]]:
+    approval_set = require_approval or frozenset()
+    return {
+        tc.id: {"source": "static", "reason": ApprovalReason.REQUIRES_APPROVAL.value}
+        for tc in calls
+        if tc.name in approval_set
+    }
+
+
+def _approval_data(
+    tc: ToolCall,
+    gate: dict[str, str | None],
+    sent_params: dict[str, dict[str, Any]],
+    pii_mapping: dict[str, str],
+) -> dict[str, Any]:
+    data: dict[str, Any] = {
+        "tool_name": tc.name,
+        "call_id": tc.id,
+        "reason": ApprovalReason.REQUIRES_APPROVAL.value,
+    }
+    if gate["source"] == "hook":
+        data["reason"] = gate["reason"] or ApprovalReason.REQUIRES_APPROVAL.value
+        data["source"] = "hook"
+    # What is being approved: the call as the model sent it (placeholder
+    # form, pre-coercion). Coercion is deterministic from these arguments,
+    # and no restored value can appear.
+    data["params"] = approval_view(sent_params.get(tc.id, _NO_SENT_PARAMS), pii_mapping)
+    return data
+
+
+async def _request_approvals(
+    calls: list[ToolCall],
+    gates: dict[str, dict[str, str | None]],
+    sent_params: dict[str, dict[str, Any]],
+    pii_mapping: dict[str, str],
+    batch: _ToolBatch,
+) -> None:
+    """Stage 8. One ``approval.requested`` per gated call; the whole batch pauses."""
+    for tc in calls:
+        gate = gates.get(tc.id)
+        if gate is not None:
+            await batch.governance(
+                GovernanceEventType.APPROVAL_REQUESTED.value,
+                _approval_data(tc, gate, sent_params, pii_mapping),
+                tc.id,
+            )
+
+
+def _split_targets(
+    calls: list[ToolCall], lookups: ToolLookups
+) -> tuple[list[ToolCall], list[ToolCall]]:
+    """Stage 9. Server calls run now; the others pause for the client."""
+    server_calls: list[ToolCall] = []
+    pending_calls: list[ToolCall] = []
+    for tc in calls:
+        if lookups.target.get(tc.name, ToolTarget.SERVER) == ToolTarget.SERVER:
+            server_calls.append(tc)
+        else:
+            pending_calls.append(tc)
+    return server_calls, pending_calls
+
+
+async def _dispatch_server_calls(
+    calls: list[ToolCall],
+    lookups: ToolLookups,
+    batch: _ToolBatch,
+    transform: ToolResultTransform | None,
+    image_runtime: ImageRuntime | None,
+) -> list[tuple[ToolCall, ToolResult]]:
+    """Stage 10. Execute in groups; each call writes its tool row as it finishes."""
+    executed: list[tuple[ToolCall, ToolResult]] = []
+    for group, is_parallel in _build_execution_groups(calls, lookups.parallel):
+        if is_parallel and len(group) > 1:
+            executed.extend(
+                await _execute_parallel_group(
+                    group,
+                    lookups,
+                    batch.recorder,
+                    batch.notifier,
+                    batch.run_id,
+                    batch.iteration,
+                    batch.warnings,
+                    transform,
+                    image_runtime=image_runtime,
+                )
+            )
+            continue
+        for tc in group:
+            executed.append(
+                await _execute_record_notify(
+                    tc,
+                    lookups,
+                    batch.recorder,
+                    batch.notifier,
+                    batch.run_id,
+                    batch.iteration,
+                    batch.warnings,
+                    transform,
+                    image_runtime=image_runtime,
+                )
+            )
+    return executed
+
+
+async def _record_executed(
+    executed: list[tuple[ToolCall, ToolResult]],
+    call_counts: dict[str, int],
+    batch: _ToolBatch,
+) -> None:
+    """Stage 11. Messages in dispatch order (deterministic for the model); count executions."""
+    for tc, result in executed:
+        call_counts[tc.name] = call_counts.get(tc.name, 0) + 1
+        await batch.append_message(tc, result)
+
+
+def _pii_placeholders(engine: GuardrailEngine | None) -> dict[str, str]:
+    return placeholder_mapping(engine.get_pii_mapping()) if engine is not None else {}
+
+
 async def _process_tool_calls(
     *,
     step: AgentStep,
@@ -807,310 +1225,58 @@ async def _process_tool_calls(
     whether to yield events from the results.
 
     Side effects: mutates call_counts, appends to history, records then notifies.
+    The stages run in this order: invalid JSON, static deny, unknown tool,
+    restore, validate, call limits, skill preflight, hook, approval (the only
+    early return), target split, dispatch, record.
     """
-    from dendrux.skills._session import SkillTool
-
-    session = next((fn.session for fn in lookups.fn.values() if isinstance(fn, SkillTool)), None)
-    if session is not None:
-        session.run_id = run_id
-
-        async def skill_sink(event: str, data: dict[str, Any], call_id: str | None) -> None:
-            await _record_governance(
-                recorder, run_id, event, iteration, data, correlation_id=call_id
-            )
-            await _notify_governance(
-                notifier, run_id, event, iteration, data, correlation_id=call_id, warnings=warnings
-            )
-
-        session.sink = skill_sink
-    all_calls: list[ToolCall] = step.meta.get("all_tool_calls", [step.action])
-    all_results: list[tuple[ToolCall, ToolResult]] = []
-    deny_set = deny or frozenset()
-
-    # --- Phase -1: Reject calls whose arguments were not valid JSON ---
-    # Runs before deny/approval: such a call has no usable arguments, so
-    # pausing it for approval would ask a human to approve "{}", and the
-    # model needs the parse error (not a policy message) to repair the call.
-    parsed_calls: list[ToolCall] = []
-    for tc in all_calls:
-        json_result = check_tool_json(tc)
-        if (
-            json_result is None
-            and session is not None
-            and isinstance(lookups.fn.get(tc.name), SkillTool)
-        ):
-            json_result = check_tool_call(tc, lookups.defs.get(tc.name))
-            if json_result is not None and tc.name == "use_skill":
-                await session.preflight(tc)
-        if json_result is None:
-            parsed_calls.append(tc)
-            continue
-        await _record_tool(recorder, run_id, tc, json_result, iteration)
-        await _notify_tool(notifier, run_id, tc, json_result, iteration, warnings)
-        result_msg = _format_result(strategy, json_result)
-        history.append(result_msg)
-        result_msg = await _record_message(recorder, run_id, result_msg, iteration)
-        history[-1] = result_msg
-        await _notify_message(notifier, run_id, result_msg, iteration, warnings)
-        all_results.append((tc, json_result))
-
-    # --- Phase 0: Deny check (governance) ---
-    non_denied: list[ToolCall] = []
-    for tc in parsed_calls:
-        if tc.name in deny_set:
-            deny_result, event_data = static_denial(tc.name, tc.id)
-            # No _record_tool / _notify_tool — denied tools are not executions.
-            # Only policy.denied event + synthetic message for the model.
-            await _record_governance(
-                recorder,
-                run_id,
-                GovernanceEventType.POLICY_DENIED.value,
-                iteration,
-                event_data,
-                correlation_id=tc.id,
-            )
-            await _notify_governance(
-                notifier,
-                run_id,
-                GovernanceEventType.POLICY_DENIED.value,
-                iteration,
-                event_data,
-                correlation_id=tc.id,
-                warnings=warnings,
-            )
-            result_msg = _format_result(strategy, deny_result)
-            history.append(result_msg)
-            result_msg = await _record_message(recorder, run_id, result_msg, iteration)
-            history[-1] = result_msg
-            await _notify_message(notifier, run_id, result_msg, iteration, warnings)
-            all_results.append((tc, deny_result))
-        else:
-            non_denied.append(tc)
-
-    async def reject(tc: ToolCall, result: ToolResult) -> None:
-        """Record, notify and append a call rejected before execution."""
-        await _record_tool(recorder, run_id, tc, result, iteration)
-        await _notify_tool(notifier, run_id, tc, result, iteration, warnings)
-        result_msg = _format_result(strategy, result)
-        history.append(result_msg)
-        result_msg = await _record_message(recorder, run_id, result_msg, iteration)
-        history[-1] = result_msg
-        await _notify_message(notifier, run_id, result_msg, iteration, warnings)
-        all_results.append((tc, result))
-
-    # --- Phase 0.25: Unknown tools are answered now, never hooked or approved ---
-    known: list[ToolCall] = []
-    for tc in non_denied:
-        if tc.name in lookups.fn:
-            known.append(tc)
-        else:
-            await reject(tc, _unknown_tool_result(tc, lookups))
-    non_denied = known
-
-    # --- Phase 0.5: Deanonymize tool call params ---
-    pii_mapping = (
-        placeholder_mapping(guardrail_engine.get_pii_mapping())
-        if guardrail_engine is not None
-        else {}
+    batch = _ToolBatch(
+        strategy=strategy,
+        recorder=recorder,
+        notifier=notifier,
+        run_id=run_id,
+        iteration=iteration,
+        history=history,
+        warnings=warnings,
     )
+    session = _bind_skill_session(lookups, batch.governance)
+    all_calls: list[ToolCall] = step.meta.get("all_tool_calls", [step.action])
+    calls = await _reject_invalid_json(all_calls, lookups, session, batch)
+    calls = await _apply_static_deny(calls, deny or frozenset(), batch)
+    calls = await _reject_unknown(calls, lookups, batch)
+    pii_mapping = _pii_placeholders(guardrail_engine)
     # The arguments as the model sent them (placeholder form, pre-restore and
     # pre-coercion), per call id: the only form approval views ever show.
-    sent_params: dict[str, dict[str, Any]] = {tc.id: tc.params for tc in non_denied}
-    if guardrail_engine is not None:
-
-        async def restore_skipped(data: dict[str, Any], call_id: str) -> None:
-            event = GovernanceEventType.GUARDRAIL_RESTORE_SKIPPED.value
-            await _record_governance(
-                recorder, run_id, event, iteration, data, correlation_id=call_id
-            )
-            await _notify_governance(
-                notifier, run_id, event, iteration, data, correlation_id=call_id, warnings=warnings
-            )
-
-        for i, tc in enumerate(non_denied):
-            if tc.params:
-                deaned = await _restore_params(guardrail_engine, tc, lookups, restore_skipped)
-                if deaned != tc.params:
-                    non_denied[i] = replace(tc, params=deaned)
-
-    # --- Phase 0.6: Validate, then coerce local tools to normalised arguments ---
-    # Before hooks and approval: a human never approves a malformed call, and
-    # everything downstream sees exactly the arguments the function receives.
-    placeholders = frozenset(pii_mapping)
-    valid_calls: list[ToolCall] = []
-    for tc in non_denied:
-        prepared = prepare_tool_call(
-            tc, lookups.defs.get(tc.name), lookups.fn.get(tc.name), placeholders=placeholders
-        )
-        if isinstance(prepared, ToolResult):
-            await reject(tc, prepared)
-        else:
-            valid_calls.append(prepared)
-
-    # --- Phase 0.7: Enforce max_calls_per_run (before hooks and approval) ---
-    non_denied, over_limit = enforce_call_limits(
-        valid_calls, max_calls=lookups.max_calls, call_counts=call_counts
-    )
-    for tc, limit_result in over_limit:
-        await reject(tc, limit_result)
-
-    # Preflight before approval. Earlier valid activation barriers in this batch
-    # may satisfy reads; execution rechecks against actual successful activations.
+    sent_params: dict[str, dict[str, Any]] = {tc.id: tc.params for tc in calls}
+    calls = await _restore_calls(guardrail_engine, calls, lookups, batch)
+    calls = await _validate_calls(calls, lookups, frozenset(pii_mapping), batch)
+    calls = await _enforce_limits(calls, lookups, call_counts, batch)
     if session is not None:
-        ready: list[ToolCall] = []
-        anticipated: set[str] = set()
-        for tc in non_denied:
-            failure = (
-                await session.preflight(
-                    tc,
-                    requested=not approved_skills,
-                    anticipated=anticipated,
-                    approved=approved_skills,
-                )
-                if isinstance(lookups.fn.get(tc.name), SkillTool)
-                else None
-            )
-            if failure is None:
-                ready.append(tc)
-                if tc.name == "use_skill" and isinstance(lookups.fn.get(tc.name), SkillTool):
-                    anticipated.add(tc.params["name"])
-                continue
-            result_msg = _format_result(strategy, failure)
-            history.append(result_msg)
-            await _record_tool(recorder, run_id, tc, failure, iteration)
-            await _notify_tool(notifier, run_id, tc, failure, iteration, warnings)
-            result_msg = await _record_message(recorder, run_id, result_msg, iteration)
-            history[-1] = result_msg
-            await _notify_message(notifier, run_id, result_msg, iteration, warnings)
-            all_results.append((tc, failure))
-        non_denied = ready
-
-    # --- Phase 0.75: before_tool policy hook ---
-    approval_set = require_approval or frozenset()
-    gates: dict[str, dict[str, str | None]] = {
-        tc.id: {"source": "static", "reason": ApprovalReason.REQUIRES_APPROVAL.value}
-        for tc in non_denied
-        if tc.name in approval_set
-    }
+        calls = await _preflight_skills(calls, lookups, session, approved_skills, batch)
+    gates = _static_gates(calls, require_approval)
     if before_tool is not None:
-        non_denied = await _apply_before_tool(
+        calls = await _apply_before_tool(
             before_tool,
-            non_denied,
+            calls,
             gates,
+            batch,
             lookups=lookups,
-            strategy=strategy,
-            recorder=recorder,
-            notifier=notifier,
-            run_id=run_id,
-            iteration=iteration,
-            history=history,
-            warnings=warnings,
-            all_results=all_results,
             tenant_id=tenant_id,
             image_runtime=image_runtime,
         )
-
-    # --- Phase 1: Approval check (governance) ---
     if gates:
-        # Any tool in the batch needs approval → entire remaining batch pauses.
-        for tc in non_denied:
-            gate = gates.get(tc.id)
-            if gate is not None:
-                approval_data: dict[str, Any] = {
-                    "tool_name": tc.name,
-                    "call_id": tc.id,
-                    "reason": ApprovalReason.REQUIRES_APPROVAL.value,
-                }
-                if gate["source"] == "hook":
-                    approval_data["reason"] = (
-                        gate["reason"] or ApprovalReason.REQUIRES_APPROVAL.value
-                    )
-                    approval_data["source"] = "hook"
-                # What is being approved: the call as the model sent it
-                # (placeholder form, pre-coercion). Coercion is deterministic
-                # from these arguments, and no restored value can appear.
-                approval_data["params"] = approval_view(
-                    sent_params.get(tc.id, _NO_SENT_PARAMS), pii_mapping
-                )
-                await _record_governance(
-                    recorder,
-                    run_id,
-                    GovernanceEventType.APPROVAL_REQUESTED.value,
-                    iteration,
-                    approval_data,
-                    correlation_id=tc.id,
-                )
-                await _notify_governance(
-                    notifier,
-                    run_id,
-                    GovernanceEventType.APPROVAL_REQUESTED.value,
-                    iteration,
-                    approval_data,
-                    correlation_id=tc.id,
-                    warnings=warnings,
-                )
+        await _request_approvals(calls, gates, sent_params, pii_mapping, batch)
         return _ToolCallOutcome(
-            all_results=all_results,
-            pending_calls=non_denied,
+            all_results=batch.all_results,
+            pending_calls=calls,
             pending_approval=True,
             approval_gates=gates,
         )
-
-    # --- Phase 2: Split into server (execute now) vs non-server (pause) ---
-    server_calls: list[ToolCall] = []
-    pending_calls: list[ToolCall] = []
-    for tc in non_denied:
-        target = lookups.target.get(tc.name, ToolTarget.SERVER)
-        if target == ToolTarget.SERVER:
-            server_calls.append(tc)
-        else:
-            pending_calls.append(tc)
-
-    # --- Phase 3: Execute server tools ---
-    exec_groups = _build_execution_groups(server_calls, lookups.parallel)
-    executed: list[tuple[ToolCall, ToolResult]] = []
-    for group, is_parallel in exec_groups:
-        if is_parallel and len(group) > 1:
-            executed.extend(
-                await _execute_parallel_group(
-                    group,
-                    lookups,
-                    recorder,
-                    notifier,
-                    run_id,
-                    iteration,
-                    warnings,
-                    tool_result_transform,
-                    image_runtime=image_runtime,
-                )
-            )
-        else:
-            for tc in group:
-                executed.append(
-                    await _execute_record_notify(
-                        tc,
-                        lookups,
-                        recorder,
-                        notifier,
-                        run_id,
-                        iteration,
-                        warnings,
-                        tool_result_transform,
-                        image_runtime=image_runtime,
-                    )
-                )
-
-    # --- Phase 4: Append history in original order (deterministic for LLM) ---
-    for tc, tool_result in executed:
-        call_counts[tc.name] = call_counts.get(tc.name, 0) + 1
-        result_msg = _format_result(strategy, tool_result)
-        history.append(result_msg)
-        result_msg = await _record_message(recorder, run_id, result_msg, iteration)
-        history[-1] = result_msg
-        await _notify_message(notifier, run_id, result_msg, iteration, warnings)
-        all_results.append((tc, tool_result))
-
-    return _ToolCallOutcome(all_results=all_results, pending_calls=pending_calls)
+    server_calls, pending_calls = _split_targets(calls, lookups)
+    executed = await _dispatch_server_calls(
+        server_calls, lookups, batch, tool_result_transform, image_runtime
+    )
+    await _record_executed(executed, call_counts, batch)
+    return _ToolCallOutcome(all_results=batch.all_results, pending_calls=pending_calls)
 
 
 async def _hook_tenant_id(
@@ -1190,16 +1356,9 @@ async def _apply_before_tool(
     hook: BeforeToolHook,
     calls: list[ToolCall],
     gates: dict[str, dict[str, str | None]],
+    batch: _ToolBatch,
     *,
     lookups: ToolLookups,
-    strategy: Strategy,
-    recorder: LoopRecorder | None,
-    notifier: LoopNotifier | None,
-    run_id: str,
-    iteration: int,
-    history: list[Message],
-    warnings: list[str],
-    all_results: list[tuple[ToolCall, ToolResult]],
     tenant_id: str | None,
     image_runtime: ImageRuntime | None = None,
 ) -> list[ToolCall]:
@@ -1209,126 +1368,137 @@ async def _apply_before_tool(
     ``require_approval`` adds a gate to ``gates`` (mutated in place).
     A hook deny overrides a static approval gate; nothing else does.
     """
-
-    async def governance(event: str, data: dict[str, Any], call_id: str) -> None:
-        await _record_governance(recorder, run_id, event, iteration, data, correlation_id=call_id)
-        await _notify_governance(
-            notifier, run_id, event, iteration, data, correlation_id=call_id, warnings=warnings
-        )
-
-    async def append(tc: ToolCall, result: ToolResult, *, record: bool) -> None:
-        if record:
-            await _record_tool(recorder, run_id, tc, result, iteration)
-            await _notify_tool(notifier, run_id, tc, result, iteration, warnings)
-        result_msg = _format_result(strategy, result)
-        history.append(result_msg)
-        result_msg = await _record_message(recorder, run_id, result_msg, iteration)
-        history[-1] = result_msg
-        await _notify_message(notifier, run_id, result_msg, iteration, warnings)
-        all_results.append((tc, result))
-
-    async def deny(tc: ToolCall, reason: str) -> None:
-        gates.pop(tc.id, None)
-        await governance(
-            GovernanceEventType.POLICY_DENIED.value,
-            {"tool_name": tc.name, "call_id": tc.id, "reason": reason, "source": "hook"},
-            tc.id,
-        )
-        result = ToolResult(
-            name=tc.name,
-            call_id=tc.id,
-            payload=json.dumps({"denied": reason}),
-            success=False,
-            error=reason,
-        )
-        # Like static deny: not an execution, no tool_calls row.
-        await append(tc, result, record=False)
-
-    async def hook_error(tc: ToolCall, error_type: str) -> None:
-        await governance(
-            GovernanceEventType.POLICY_HOOK_ERROR.value,
-            {"tool_name": tc.name, "call_id": tc.id, "error_type": error_type},
-            tc.id,
-        )
-        await deny(tc, _HOOK_ERROR_REASON)
-
     kept: list[ToolCall] = []
-    run_images = _run_image_index(history)
+    run_images = _run_image_index(batch.history)
     for tc in calls:
         decision, error_type = await _call_before_tool(
             hook,
             tc,
             lookups,
-            run_id=run_id,
-            iteration=iteration,
+            run_id=batch.run_id,
+            iteration=batch.iteration,
             tenant_id=tenant_id,
             images=_referenced_images(tc.params, run_images),
         )
         if error_type is not None:
-            await hook_error(tc, error_type)
-            continue
-        if decision is None or decision.kind == "allow":
+            await _hook_error(tc, error_type, gates, batch)
+        elif await _apply_decision(decision, tc, gates, batch, lookups, image_runtime):
             kept.append(tc)
-            continue
-        if decision.kind == "deny":
-            await deny(tc, decision.reason or _HOOK_ERROR_REASON)
-            continue
-        statically_gated = tc.id in gates
-        if decision.kind == "require_approval":
-            if lookups.target.get(tc.name, ToolTarget.SERVER) != ToolTarget.SERVER:
-                await governance(
-                    GovernanceEventType.POLICY_HOOK_WARNING.value,
-                    {
-                        "tool_name": tc.name,
-                        "call_id": tc.id,
-                        "warning": _CLIENT_APPROVAL_REASON,
-                    },
-                    tc.id,
-                )
-                await deny(tc, _CLIENT_APPROVAL_REASON)
-                continue
-            if not statically_gated:
-                gates[tc.id] = {"source": "hook", "reason": decision.reason}
-            kept.append(tc)
-            continue
-        # substitute
-        if statically_gated:
-            # Static approval gate stays in place; the call goes to a human.
-            kept.append(tc)
-            continue
-        sub_images: tuple[ImagePart, ...] = ()
-        try:
-            if isinstance(decision.result, ToolOutput):
-                payload = json.dumps(decision.result.result)
-            else:
-                payload = json.dumps(decision.result)
-        except (TypeError, ValueError) as exc:
-            await hook_error(tc, type(exc).__name__)
-            continue
-        if isinstance(decision.result, ToolOutput) and decision.result.images:
-            try:
-                sub_images = await _ingest_tool_images(
-                    decision.result.images, tc.name, image_runtime
-                )
-            except Exception as exc:
-                # Fails closed like a serialisation error: the call is denied.
-                await hook_error(tc, type(exc).__name__)
-                continue
-        substituted = ToolResult(
-            name=tc.name,
-            call_id=tc.id,
-            payload=payload,
-            success=True,
-            meta={"substituted": True},
-            images=sub_images,
-        )
-        await governance(
-            GovernanceEventType.POLICY_SUBSTITUTED.value,
-            {"tool_name": tc.name, "call_id": tc.id},
+    return kept
+
+
+async def _apply_decision(
+    decision: ToolDecision | None,
+    tc: ToolCall,
+    gates: dict[str, dict[str, str | None]],
+    batch: _ToolBatch,
+    lookups: ToolLookups,
+    image_runtime: ImageRuntime | None,
+) -> bool:
+    """Apply one hook decision; True when the call continues."""
+    if decision is None or decision.kind == "allow":
+        return True
+    if decision.kind == "deny":
+        await _hook_deny(tc, decision.reason or _HOOK_ERROR_REASON, gates, batch)
+        return False
+    if decision.kind == "require_approval":
+        return await _hook_gate(decision, tc, gates, batch, lookups)
+    if tc.id in gates:
+        # Substitute on a statically gated call: the gate stays, a human decides.
+        return True
+    await _substitute(decision, tc, gates, batch, image_runtime)
+    return False
+
+
+async def _hook_gate(
+    decision: ToolDecision,
+    tc: ToolCall,
+    gates: dict[str, dict[str, str | None]],
+    batch: _ToolBatch,
+    lookups: ToolLookups,
+) -> bool:
+    """Hook ``require_approval``: a server call gets a gate; a client call is denied."""
+    if lookups.target.get(tc.name, ToolTarget.SERVER) != ToolTarget.SERVER:
+        await batch.governance(
+            GovernanceEventType.POLICY_HOOK_WARNING.value,
+            {"tool_name": tc.name, "call_id": tc.id, "warning": _CLIENT_APPROVAL_REASON},
             tc.id,
         )
-        await append(tc, substituted, record=True)
-    return kept
+        await _hook_deny(tc, _CLIENT_APPROVAL_REASON, gates, batch)
+        return False
+    if tc.id not in gates:
+        gates[tc.id] = {"source": "hook", "reason": decision.reason}
+    return True
+
+
+async def _hook_deny(
+    tc: ToolCall, reason: str, gates: dict[str, dict[str, str | None]], batch: _ToolBatch
+) -> None:
+    gates.pop(tc.id, None)
+    await batch.governance(
+        GovernanceEventType.POLICY_DENIED.value,
+        {"tool_name": tc.name, "call_id": tc.id, "reason": reason, "source": "hook"},
+        tc.id,
+    )
+    result = ToolResult(
+        name=tc.name,
+        call_id=tc.id,
+        payload=json.dumps({"denied": reason}),
+        success=False,
+        error=reason,
+    )
+    # Like static deny: not an execution, no tool_calls row.
+    await batch.append_message(tc, result)
+
+
+async def _hook_error(
+    tc: ToolCall, error_type: str, gates: dict[str, dict[str, str | None]], batch: _ToolBatch
+) -> None:
+    await batch.governance(
+        GovernanceEventType.POLICY_HOOK_ERROR.value,
+        {"tool_name": tc.name, "call_id": tc.id, "error_type": error_type},
+        tc.id,
+    )
+    await _hook_deny(tc, _HOOK_ERROR_REASON, gates, batch)
+
+
+async def _substitute(
+    decision: ToolDecision,
+    tc: ToolCall,
+    gates: dict[str, dict[str, str | None]],
+    batch: _ToolBatch,
+    image_runtime: ImageRuntime | None,
+) -> None:
+    """Hook ``substitute``: governance, tool row, message; a bad result denies the call."""
+    value = decision.result
+    try:
+        payload = json.dumps(value.result if isinstance(value, ToolOutput) else value)
+    except (TypeError, ValueError) as exc:
+        await _hook_error(tc, type(exc).__name__, gates, batch)
+        return
+    sub_images: tuple[ImagePart, ...] = ()
+    if isinstance(value, ToolOutput) and value.images:
+        try:
+            sub_images = await _ingest_tool_images(value.images, tc.name, image_runtime)
+        except Exception as exc:
+            # Fails closed like a serialisation error: the call is denied.
+            await _hook_error(tc, type(exc).__name__, gates, batch)
+            return
+    substituted = ToolResult(
+        name=tc.name,
+        call_id=tc.id,
+        payload=payload,
+        success=True,
+        meta={"substituted": True},
+        images=sub_images,
+    )
+    await batch.governance(
+        GovernanceEventType.POLICY_SUBSTITUTED.value,
+        {"tool_name": tc.name, "call_id": tc.id},
+        tc.id,
+    )
+    await batch.tool_row(tc, substituted)
+    await batch.append_message(tc, substituted)
 
 
 def _run_image_index(history: list[Message]) -> dict[str, list[ImageRef]]:

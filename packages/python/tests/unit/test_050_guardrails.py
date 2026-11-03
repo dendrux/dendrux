@@ -659,7 +659,8 @@ async def _run_injection(restore: str | None, tool_name: str) -> RunStatus:
 def _call_site_passes_tool_def() -> bool:
     from dendrux.loops import react
 
-    return "tool_def=" in inspect.getsource(react._process_tool_calls)
+    # The restore call site is ``_restore_params`` (called by the tool pipeline).
+    return "tool_def=" in inspect.getsource(react._restore_params)
 
 
 class TestIndirectInjectionEndToEnd:
