@@ -82,7 +82,7 @@ from dendrux.types import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Sequence
+    from collections.abc import AsyncGenerator, Iterator, Sequence
 
     import httpx
 
@@ -119,31 +119,26 @@ def _function_call_output(wire_call_id: str, output: Any) -> dict[str, Any]:
     return {"type": "function_call_output", "call_id": wire_call_id, "output": output}
 
 
-def _assistant_items(msg: Message, replay_reasoning_for: str | None) -> list[dict[str, Any]]:
-    """An ASSISTANT message: replayed reasoning items, its text, its function calls."""
+def _assistant_items(msg: Message, replay_reasoning_for: str | None) -> Iterator[dict[str, Any]]:
+    """An ASSISTANT message, in wire order: replayed reasoning, its text, its function calls.
+
+    Yields straight into the caller's ``input_items`` (no per-turn list).
+    """
     # The API rejects null-valued fields (e.g. ``status: None`` from the
     # SDK's model_dump), so only those are dropped.
-    items = [
-        {k: v for k, v in item.items() if v is not None}
-        for item in replayable_reasoning_blocks(
-            msg, model=replay_reasoning_for, block_types=_REASONING_ITEM_TYPES
-        )
-    ]
-    if not msg.tool_calls:
-        items.append(_assistant_item(msg))
-        return items
-    if msg.content:
-        items.append(_assistant_item(msg))
-    items.extend(
-        {
+    for item in replayable_reasoning_blocks(
+        msg, model=replay_reasoning_for, block_types=_REASONING_ITEM_TYPES
+    ):
+        yield {k: v for k, v in item.items() if v is not None}
+    if not msg.tool_calls or msg.content:
+        yield _assistant_item(msg)
+    for tc in msg.tool_calls or ():
+        yield {
             "type": "function_call",
             "call_id": tc.provider_tool_call_id or tc.id,
             "name": tc.name,
             "arguments": json.dumps(tc.params),
         }
-        for tc in msg.tool_calls
-    )
-    return items
 
 
 def _native_tool_output(
