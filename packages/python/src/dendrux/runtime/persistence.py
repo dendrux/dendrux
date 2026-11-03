@@ -68,13 +68,21 @@ from dendrux.types import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Collection, Sequence
     from contextlib import AbstractAsyncContextManager
 
     from dendrux.guardrails import GuardrailEngine
     from dendrux.media import BlobEdge
     from dendrux.runtime.state import StateStore
-    from dendrux.types import LLMResponse, Message, ToolCall, ToolDef, ToolResult, ToolTarget
+    from dendrux.types import (
+        AgentStep,
+        LLMResponse,
+        Message,
+        ToolCall,
+        ToolDef,
+        ToolResult,
+        ToolTarget,
+    )
 
 
 logger = logging.getLogger(__name__)
@@ -184,6 +192,17 @@ def message_trace(
     tenant_scope: str | None = None,
 ) -> Any:
     """A lossless conversation envelope, with content stored only once."""
+    return _message_trace(message, order, generate_ulid(), kind=kind, tenant_scope=tenant_scope)
+
+
+def _message_trace(
+    message: Message,
+    order: int,
+    trace_id: str,
+    *,
+    kind: str = "turn",
+    tenant_scope: str | None = None,
+) -> Any:
     from dendrux.runtime.state import TraceWrite
     from dendrux.types import _message_to_dict
 
@@ -207,7 +226,7 @@ def message_trace(
         else []
     )
     return TraceWrite(
-        generate_ulid(),
+        trace_id,
         message.role.value,
         message.content,
         order,
@@ -216,6 +235,104 @@ def message_trace(
         blob_refs=edges or None,
         blob_refs_scope=tenant_scope if edges else None,
     )
+
+
+@dataclass(frozen=True)
+class _MessagePlan:
+    trace: Any
+    pending: list[dict[str, Any]]
+    phase: str | None
+    order_delta: int
+    final_trace: bool = False
+    clarification: dict[str, Any] | None = None
+    phase_after_state: str | None = None
+
+
+def _planned_call(
+    tc: ToolCall,
+    order: int,
+    targets: dict[str, Any],
+    gates: Collection[str],
+    denied: Collection[str],
+) -> dict[str, Any]:
+    if tc.parse_error or tc.name not in targets or tc.name in denied:
+        phase = "invalid"
+    elif tc.name in gates:
+        phase = "gated"
+    elif targets.get(tc.name) == "client":
+        phase = "client"
+    else:
+        phase = "dispatchable"
+    return {
+        "call_id": tc.id,
+        "tool": tc.name,
+        "phase": phase,
+        "decision_id": None,
+        "order_index": order,
+        "target": targets.get(tc.name, "server"),
+    }
+
+
+def _plan_assistant(
+    plan: _MessagePlan, last_step: AgentStep | None, atomic_completion: bool
+) -> _MessagePlan:
+    from dendrux.types import Clarification
+
+    if last_step is not None and isinstance(last_step.action, Clarification):
+        phase = "awaiting_input"
+        return replace(
+            plan,
+            clarification={"v": 1, "question": last_step.action.question, "pause_message": None},
+            phase_after_state=phase,
+        )
+    # A kill before the final transaction must leave model_next: there is
+    # no committed final answer to finalize from yet.
+    phase = "model_next" if atomic_completion else "finalizing"
+    return replace(plan, phase=phase, final_trace=atomic_completion)
+
+
+def _message_position(
+    call_id: str | None, pending: list[dict[str, Any]], phase: str | None, order_index: int
+) -> tuple[int, list[dict[str, Any]], str | None, int]:
+    reserved = next((p for p in pending if p["call_id"] == call_id), None)
+    if reserved is None:
+        return order_index, pending, phase, 1
+    pending = [p for p in pending if p["call_id"] != call_id]
+    phase = "dispatch" if pending else "model_next"
+    return reserved["order_index"], pending, phase, 0
+
+
+def _plan_message(
+    message: Message,
+    *,
+    trace_id: str,
+    pending: list[dict[str, Any]],
+    phase: str | None,
+    order_index: int,
+    tenant_scope: str | None,
+    last_step: AgentStep | None,
+    targets: dict[str, Any],
+    gates: Collection[str],
+    denied: Collection[str],
+    atomic_completion: bool,
+) -> _MessagePlan:
+    from dendrux.types import _step_to_dict
+
+    order, pending, phase, delta = _message_position(message.call_id, pending, phase, order_index)
+    trace = _message_trace(message, order, trace_id, tenant_scope=tenant_scope)
+    if message.role.value == "assistant" and last_step is not None:
+        trace.meta[STEP_META_KEY] = _step_to_dict(last_step)
+    if message.tool_calls:
+        pending = [
+            _planned_call(tc, order_index + delta + i, targets, gates, denied)
+            for i, tc in enumerate(message.tool_calls)
+        ]
+        delta += len(message.tool_calls)
+        phase = "dispatch"
+    plan = _MessagePlan(trace, pending, phase, delta)
+    if message.role.value == "assistant" and not message.tool_calls:
+        return _plan_assistant(plan, last_step, atomic_completion)
+    return plan
 
 
 def seed_trace_kwargs(
@@ -813,86 +930,60 @@ class PersistenceRecorder(BaseRecorder):
 
     async def on_message_appended(self, run_id: str, message: Message, iteration: int) -> None:
         """Persist a message to react_traces. FAIL-CLOSED."""
-        if self._format2:
-            if message.role.value == "user" and self._consumed_user_count:
-                self._consumed_user_count -= 1
-                return
-            if message.call_id in self._completed_observations:
-                self._completed_observations.remove(message.call_id)
-                return
-            # The runner's seed already includes its input. Resume injections
-            # occur before bind_loop and still need their own trace.
-            if self._seed_input_pending and message.role.value == "user":
-                self._seed_input_pending = False
-                return
-            await self._snapshot(iteration)
-            pending = self._loop_state.setdefault("pending", [])
-            reserved = next((p for p in pending if p["call_id"] == message.call_id), None)
-            order = reserved["order_index"] if reserved is not None else self._order_index
-            trace = message_trace(message, order, tenant_scope=self._tenant_scope)
-            if message.role.value == "assistant" and self._loop_source:
-                from dendrux.types import _step_to_dict
-
-                steps = self._loop_source()["steps"]
-                if steps:
-                    trace.meta[STEP_META_KEY] = _step_to_dict(steps[-1])
-            if reserved is None:
-                self._order_index += 1
-            else:
-                self._loop_state["pending"] = [
-                    p for p in pending if p["call_id"] != message.call_id
-                ]
-                self._loop_state["phase"] = (
-                    "dispatch" if self._loop_state["pending"] else "model_next"
-                )
-            if message.tool_calls:
-                data = self._loop_source() if self._loop_source else {}
-                targets = data.get("tool_targets", {})
-                gates = data.get("approval_tools", ())
-                denied = data.get("denied_tools", ())
-                self._loop_state["pending"] = [
-                    {
-                        "call_id": tc.id,
-                        "tool": tc.name,
-                        "phase": (
-                            "invalid"
-                            if tc.parse_error or tc.name not in targets or tc.name in denied
-                            else "gated"
-                            if tc.name in gates
-                            else "client"
-                            if targets.get(tc.name) == "client"
-                            else "dispatchable"
-                        ),
-                        "decision_id": None,
-                        "order_index": self._order_index + i,
-                        "target": targets.get(tc.name, "server"),
-                    }
-                    for i, tc in enumerate(message.tool_calls)
-                ]
-                self._order_index += len(message.tool_calls)
-                self._loop_state["phase"] = "dispatch"
-            elif message.role.value == "assistant":
-                from dendrux.types import Clarification
-
-                steps = self._loop_source()["steps"] if self._loop_source else []
-                if steps and isinstance(steps[-1].action, Clarification):
-                    await self._state_ref(
-                        "clarification",
-                        {"v": 1, "question": steps[-1].action.question, "pause_message": None},
-                    )
-                    self._loop_state["phase"] = "awaiting_input"
-                elif capabilities(self._store).atomic_completion:
-                    # A kill before the final transaction leaves model_next:
-                    # no committed final answer exists to finalize from yet.
-                    self._loop_state["phase"] = "model_next"
-                    self._final_trace = trace
-                    await self._checkpoint()
-                    return
-                else:
-                    self._loop_state["phase"] = "finalizing"
-            await self._checkpoint(trace)
-            self._remember(trace)
+        if not self._format2:
+            await self._append_legacy_message(message, iteration)
             return
+        if message.role.value == "user" and self._consumed_user_count:
+            self._consumed_user_count -= 1
+            return
+        if message.call_id in self._completed_observations:
+            self._completed_observations.remove(message.call_id)
+            return
+        # The runner's seed already includes its input. Resume injections
+        # occur before bind_loop and still need their own trace.
+        if self._seed_input_pending and message.role.value == "user":
+            self._seed_input_pending = False
+            return
+        await self._snapshot(iteration)
+        data = (
+            self._loop_source()
+            if self._loop_source and (message.role.value == "assistant" or message.tool_calls)
+            else {}
+        )
+        steps = data.get("steps", [])
+        plan = _plan_message(
+            message,
+            trace_id=generate_ulid(),
+            pending=deepcopy(self._loop_state.setdefault("pending", [])),
+            phase=self._loop_state.get("phase"),
+            order_index=self._order_index,
+            tenant_scope=self._tenant_scope,
+            last_step=steps[-1] if steps else None,
+            targets=data.get("tool_targets", {}),
+            gates=data.get("approval_tools", ()),
+            denied=data.get("denied_tools", ()),
+            atomic_completion=capabilities(self._store).atomic_completion,
+        )
+        await self._apply_message_plan(plan)
+
+    async def _apply_message_plan(self, plan: _MessagePlan) -> None:
+        self._order_index += plan.order_delta
+        self._loop_state["pending"] = plan.pending
+        if plan.phase is not None:
+            self._loop_state["phase"] = plan.phase
+        if plan.clarification is not None:
+            # Message order N is reserved before this separate state write
+            # consumes N+1; awaiting_input applies only after it succeeds.
+            await self._state_ref("clarification", plan.clarification)
+            self._loop_state["phase"] = plan.phase_after_state
+        if plan.final_trace:
+            self._final_trace = plan.trace
+            await self._checkpoint()
+            return
+        await self._checkpoint(plan.trace)
+        self._remember(plan.trace)
+
+    async def _append_legacy_message(self, message: Message, iteration: int) -> None:
         meta = dict(message.meta) if message.meta else {}
         meta["iteration"] = iteration
 
