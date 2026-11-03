@@ -24,6 +24,7 @@ import logging
 from contextlib import aclosing, asynccontextmanager
 from copy import deepcopy
 from dataclasses import dataclass, replace
+from functools import partial
 from typing import TYPE_CHECKING, Any, NamedTuple, get_args, overload
 
 from dendrux import _codes
@@ -205,7 +206,7 @@ _STOP_REASONS = frozenset(get_args(StopReason))
 
 async def _persist_run_failure(
     store: StateStore, run_id: str, exc: Exception, *, safe_event: bool = False
-) -> None:
+) -> bool:
     try:
         won = await store.finalize_run(
             run_id,
@@ -219,10 +220,33 @@ async def _persist_run_failure(
         logger.error(
             "Failed to persist ERROR status for run %s", run_id, exc_info=safe_exception_info()
         )
-        return
+        return False
     if won:
         emit = _emit_event_safe if safe_event else _emit_event
         await emit(store, run_id, StoredEventType.RUN_ERROR.value, _error_payload(exc))
+    return bool(won)
+
+
+async def _stream_run_failure(
+    store: StateStore | None,
+    shared: dict[str, Any],
+    recorder: LoopRecorder | None,
+    notifier: LoopNotifier | None,
+    run_id: str,
+    exc: Exception,
+) -> None:
+    if store is not None and shared.get("claimed"):
+        await _persist_run_failure(store, run_id, exc, safe_event=True)
+    if not shared.get("existing_run"):
+        try:
+            await record_run_failed(recorder, run_id, exc)
+            await notify_run_failed(notifier, run_id, exc)
+        except Exception:
+            logger.warning(
+                "Lifecycle hooks failed during stream error handler for run %s",
+                run_id,
+                exc_info=safe_exception_info(),
+            )
 
 
 def _take_task_interrupt(manager: RunTaskManager | None, run_id: str) -> tuple[bool, bool]:
@@ -886,6 +910,107 @@ async def _closing_loop_stream(
             )
 
 
+def _terminal_stream_result(event: RunEvent) -> RunResult | None:
+    if event.type in (
+        RunEventType.RUN_COMPLETED,
+        RunEventType.RUN_ERROR,
+        RunEventType.RUN_PAUSED,
+        RunEventType.RUN_CANCELLED,
+    ):
+        return event.run_result
+    return None
+
+
+async def _finish_stream_event(
+    event: RunEvent,
+    result: RunResult,
+    *,
+    state_store: StateStore | None,
+    recorder: LoopRecorder | None,
+    notifier: LoopNotifier | None,
+    run_id: str,
+    provider_kwargs: dict[str, Any] | None,
+) -> RunEvent:
+    from dendrux.types import RunEvent
+
+    if state_store is not None:
+        result = await _persist_loop_outcome(
+            recorder=recorder,
+            provider_kwargs=provider_kwargs,
+            state_store=state_store,
+            run_id=run_id,
+            result=result,
+        )
+        # A pre-pause cancellation changes the terminal event delivered to the consumer.
+        if result.status == RunStatus.CANCELLED:
+            event = RunEvent(type=RunEventType.RUN_CANCELLED, run_result=result)
+        else:
+            event = RunEvent(type=event.type, run_result=result, phase=event.phase)
+    await record_run_finished(recorder, run_id, result)
+    await notify_run_finished(notifier, run_id, result)
+    if state_store is None:
+        result.meta = _public_meta(result.meta)
+    return event
+
+
+def _prepare_stream_result(
+    result: RunResult,
+    provider_kwargs: dict[str, Any] | None,
+    mcp_meta: dict[str, Any],
+    replay_plan: ReplayPlan | None,
+    new_run: bool,
+) -> None:
+    if new_run:
+        _ensure_pause_generation(result, provider_kwargs)
+        if replay_plan is not None:
+            result.replay = replay_plan.summary
+    _attach_mcp_meta(result, mcp_meta)
+
+
+async def _stream_loop_events(
+    loop_stream: AsyncGenerator[RunEvent, None],
+    *,
+    state_store: StateStore | None,
+    recorder: LoopRecorder | None,
+    notifier: LoopNotifier | None,
+    run_id: str,
+    provider_kwargs: dict[str, Any] | None,
+    shared: dict[str, Any],
+    mcp_meta: dict[str, Any],
+    replay_plan: ReplayPlan | None = None,
+    new_run: bool = False,
+) -> AsyncGenerator[RunEvent, None]:
+    async with _closing_loop_stream(loop_stream, run_id):
+        async for event in loop_stream:
+            result = _terminal_stream_result(event)
+            if result is None or (not new_run and not result):
+                _track_partial_text(shared, event)
+                yield event
+                continue
+            _prepare_stream_result(result, provider_kwargs, mcp_meta, replay_plan, new_run)
+            yield await _finish_stream_event(
+                event,
+                result,
+                state_store=state_store,
+                recorder=recorder,
+                notifier=notifier,
+                run_id=run_id,
+                provider_kwargs=provider_kwargs,
+            )
+
+
+async def _resolve_resume_stream_store(
+    store: StateStore | None, resolver: Callable[[], Any] | None
+) -> StateStore:
+    if store is None and resolver is not None:
+        store = await resolver()
+    if store is None:
+        raise ValueError(
+            "resume_stream() requires persistence. Pass database_url or state_store to the agent."
+        )
+    return store
+
+
 def _track_partial_text(shared: dict[str, Any], event: RunEvent) -> None:
     """Buffer streamed text so an abandoned stream can persist a partial answer.
 
@@ -1089,6 +1214,152 @@ def _terminal_failure_kwargs(state_store: StateStore, result: RunResult) -> dict
     return failure_kwargs
 
 
+async def _final_run_recovery(state_store: StateStore, run_id: str, records: Any) -> Any:
+    from dendrux.runtime._capabilities import capabilities
+
+    if not capabilities(state_store).recovery:
+        return None
+    record = records[-1] if records else await state_store.get_run(run_id)
+    return await _recovery_info(state_store, record)
+
+
+def _wrap_loop_result(
+    run_id: str,
+    result: RunResult,
+    user_answer: str | None,
+    pii_mapping: dict[str, Any],
+    *,
+    status: RunStatus,
+    won: bool,
+    recovery: Any = None,
+) -> RunResult:
+    from dendrux.guardrails._engine import deanonymize_text
+    from dendrux.types import RunResult
+
+    pause_id, pending = (
+        (result.pause_id, result.pending) if status in _PAUSE_STATUSES else (None, None)
+    )
+    return RunResult(
+        run_id=run_id,
+        status=status,
+        answer=user_answer,
+        output=result.output,
+        error_info=result.error_info,
+        error=result.error,
+        steps=result.steps,
+        iteration_count=result.iteration_count,
+        usage=result.usage,
+        meta={**_public_meta(result.meta), "_finalize_won": won},
+        commentary=[deanonymize_text(c, pii_mapping)[0] or c for c in result.commentary],
+        replay=result.replay,
+        stop_reason=result.stop_reason if status == RunStatus.SUCCESS else None,
+        pause_id=pause_id,
+        pending=pending,
+        recovery=recovery,
+    )
+
+
+async def _persisted_loop_result(
+    state_store: StateStore,
+    run_id: str,
+    result: RunResult,
+    user_answer: str | None,
+    pii_mapping: dict[str, Any],
+    status_if_missing: RunStatus,
+) -> RunResult:
+    record = await state_store.get_run(run_id)
+    status = RunStatus(record.status) if record is not None else status_if_missing
+    persisted = _wrap_loop_result(
+        run_id, result, user_answer, pii_mapping, status=status, won=False
+    )
+    if record is not None:
+        persisted.answer = record.answer
+        persisted.output = None
+        persisted.error = record.error
+        persisted.error_info = _error_info_from_meta(record.meta)
+    if status not in _PAUSE_STATUSES:
+        persisted.meta.pop("pause_state", None)
+        await _attach_undelivered_notes(state_store, run_id, persisted)
+    return await _attach_persisted_pending(state_store, persisted, record)
+
+
+async def _finalize_loop_cancelled(
+    state_store: StateStore,
+    run_id: str,
+    result: RunResult,
+    user_answer: str | None,
+    pii_mapping: dict[str, Any],
+    allowed: list[str],
+    payload: dict[str, Any],
+    failure_reason: str | None = None,
+) -> RunResult:
+    from dendrux.runtime.state import _capture_finalized_run
+
+    with _capture_finalized_run(unclaimed_store(state_store), run_id) as records:
+        won = await _transition_with_event(
+            state_store,
+            run_id,
+            status=RunStatus.CANCELLED.value,
+            allowed_current_statuses=allowed,
+            event_type=StoredEventType.RUN_CANCELLED.value,
+            event_data=payload,
+            answer=user_answer,
+            iteration_count=result.iteration_count,
+            total_usage=result.usage,
+            pii_mapping=result.meta.get("pii_mapping"),
+            failure_reason=failure_reason,
+        )
+    if not won:
+        return await _persisted_loop_result(
+            state_store, run_id, result, user_answer, pii_mapping, RunStatus.CANCELLED
+        )
+    recovery = await _final_run_recovery(state_store, run_id, records)
+    cancelled = _wrap_loop_result(
+        run_id,
+        result,
+        user_answer,
+        pii_mapping,
+        status=RunStatus.CANCELLED,
+        won=True,
+        recovery=recovery,
+    )
+    cancelled.meta.pop("pause_state", None)
+    await _attach_undelivered_notes(state_store, run_id, cancelled)
+    return cancelled
+
+
+def _loop_cancel_request(result: RunResult) -> tuple[list[str], dict[str, Any], str | None] | None:
+    if result.status != RunStatus.CANCELLED:
+        return None
+    if result.meta.get("budget_exceeded"):
+        return (
+            [RunStatus.RUNNING.value],
+            {"reason": BUDGET_EXCEEDED, "exceeded": result.meta["budget_exceeded"]},
+            BUDGET_EXCEEDED,
+        )
+    payload: dict[str, Any] = {"reason": CancelReason.CANCEL_REQUESTED.value}
+    if result.meta.get("interrupted"):
+        payload["interrupted"] = True
+        payload["partial_output"] = bool(result.meta.get("partial_output"))
+    return list(CANCEL_FINALIZE_STATUS_VALUES), payload, None
+
+
+def _terminal_loop_event(result: RunResult) -> tuple[StopReason | None, str, dict[str, Any]]:
+    stop_reason = result.stop_reason if result.status == RunStatus.SUCCESS else None
+    event_type = (
+        StoredEventType.RUN_ERROR.value
+        if result.status == RunStatus.ERROR
+        else StoredEventType.RUN_COMPLETED.value
+    )
+    event_data = {
+        **({"error": result.error} if result.status == RunStatus.ERROR else {}),
+        "status": result.status.value,
+        "stop_reason": stop_reason,
+        "truncated": stop_reason == "max_tokens",
+    }
+    return stop_reason, event_type, event_data
+
+
 async def _persist_loop_outcome(
     *,
     state_store: StateStore,
@@ -1119,98 +1390,20 @@ async def _persist_loop_outcome(
     from dendrux.guardrails._engine import deanonymize_text
     from dendrux.runtime._capabilities import capabilities
     from dendrux.runtime.state import _capture_finalized_run
-    from dendrux.types import RunResult
-
-    recovery = None
-
-    async def _final_recovery(records: Any) -> Any:
-        if not capabilities(state_store).recovery:
-            return None
-        record = records[-1] if records else await state_store.get_run(run_id)
-        return await _recovery_info(state_store, record)
 
     pii_mapping = result.meta.get("pii_mapping") or {}
     user_answer, unmapped_placeholders = deanonymize_text(result.answer, pii_mapping)
+    _wrap = partial(_wrap_loop_result, run_id, result, user_answer, pii_mapping)
+    _persisted = partial(
+        _persisted_loop_result, state_store, run_id, result, user_answer, pii_mapping
+    )
+    _finalize_cancelled = partial(
+        _finalize_loop_cancelled, state_store, run_id, result, user_answer, pii_mapping
+    )
 
-    def _wrap(*, status: RunStatus, won: bool) -> RunResult:
-        pause_id, pending = (
-            (result.pause_id, result.pending) if status in _PAUSE_STATUSES else (None, None)
-        )
-        return RunResult(
-            run_id=run_id,
-            status=status,
-            answer=user_answer,
-            output=result.output,
-            error_info=result.error_info,
-            error=result.error,
-            steps=result.steps,
-            iteration_count=result.iteration_count,
-            usage=result.usage,
-            meta={**_public_meta(result.meta), "_finalize_won": won},
-            commentary=[deanonymize_text(c, pii_mapping)[0] or c for c in result.commentary],
-            replay=result.replay,
-            stop_reason=result.stop_reason if status == RunStatus.SUCCESS else None,
-            pause_id=pause_id,
-            pending=pending,
-            recovery=recovery,
-        )
-
-    async def _persisted(status_if_missing: RunStatus) -> RunResult:
-        """The persisted winner after a lost CAS (never the loop's proposal)."""
-        record = await state_store.get_run(run_id)
-        status = RunStatus(record.status) if record is not None else status_if_missing
-        persisted = _wrap(status=status, won=False)
-        if record is not None:
-            persisted.answer = record.answer
-            persisted.output = None
-            persisted.error = record.error
-            persisted.error_info = _error_info_from_meta(record.meta)
-        if status not in _PAUSE_STATUSES:
-            persisted.meta.pop("pause_state", None)
-            await _attach_undelivered_notes(state_store, run_id, persisted)
-        return await _attach_persisted_pending(state_store, persisted, record)
-
-    async def _finalize_cancelled(
-        allowed: list[str], payload: dict[str, Any], failure_reason: str | None = None
-    ) -> RunResult:
-        nonlocal recovery
-        with _capture_finalized_run(unclaimed_store(state_store), run_id) as records:
-            won = await _transition_with_event(
-                state_store,
-                run_id,
-                status=RunStatus.CANCELLED.value,
-                allowed_current_statuses=allowed,
-                event_type=StoredEventType.RUN_CANCELLED.value,
-                event_data=payload,
-                answer=user_answer,
-                iteration_count=result.iteration_count,
-                total_usage=result.usage,
-                pii_mapping=result.meta.get("pii_mapping"),
-                failure_reason=failure_reason,
-            )
-        if not won:
-            return await _persisted(RunStatus.CANCELLED)
-        recovery = await _final_recovery(records)
-        cancelled = _wrap(status=RunStatus.CANCELLED, won=True)
-        cancelled.meta.pop("pause_state", None)
-        await _attach_undelivered_notes(state_store, run_id, cancelled)
-        return cancelled
-
-    if result.status == RunStatus.CANCELLED and result.meta.get("budget_exceeded"):
-        # Budget cancel from the loop's checkpoint: distinct event reason and
-        # failure_reason so it never reads as a user cancellation.
-        return await _finalize_cancelled(
-            [RunStatus.RUNNING.value],
-            {"reason": BUDGET_EXCEEDED, "exceeded": result.meta["budget_exceeded"]},
-            failure_reason=BUDGET_EXCEEDED,
-        )
-
-    if result.status == RunStatus.CANCELLED:
-        payload: dict[str, Any] = {"reason": CancelReason.CANCEL_REQUESTED.value}
-        if result.meta.get("interrupted"):
-            payload["interrupted"] = True
-            payload["partial_output"] = bool(result.meta.get("partial_output"))
-        return await _finalize_cancelled(list(CANCEL_FINALIZE_STATUS_VALUES), payload)
+    cancel_request = _loop_cancel_request(result)
+    if cancel_request is not None:
+        return await _finalize_cancelled(*cancel_request)
 
     if result.status in _PAUSE_STATUSES:
         # Pre-pause checkpoint as one CAS: the pause persists only while the
@@ -1280,18 +1473,7 @@ async def _persist_loop_outcome(
     failure_kwargs = _terminal_failure_kwargs(state_store, result)
     from dendrux.runtime.state import EventWrite
 
-    stop_reason = result.stop_reason if result.status == RunStatus.SUCCESS else None
-    event_type = (
-        StoredEventType.RUN_ERROR.value
-        if result.status == RunStatus.ERROR
-        else StoredEventType.RUN_COMPLETED.value
-    )
-    event_data = {
-        **({"error": result.error} if result.status == RunStatus.ERROR else {}),
-        "status": result.status.value,
-        "stop_reason": stop_reason,
-        "truncated": stop_reason == "max_tokens",
-    }
+    stop_reason, event_type, event_data = _terminal_loop_event(result)
     atomic_final = (
         getattr(state_store, "storage_format", 1) == STORAGE_FORMAT_CHECKPOINTED
         and capabilities(state_store).atomic_completion
@@ -1334,7 +1516,7 @@ async def _persist_loop_outcome(
             )
     if not finalize_won:
         return await _persisted(result.status)
-    recovery = await _final_recovery(records)
+    recovery = await _final_run_recovery(state_store, run_id, records)
     if unmapped_placeholders:
         await _emit_event(
             state_store,
@@ -1346,7 +1528,7 @@ async def _persist_loop_outcome(
         await _record_stop_reason(state_store, run_id, stop_reason)
     if not atomic_final:
         await _emit_event(state_store, run_id, event_type, event_data)
-    finished = _wrap(status=result.status, won=True)
+    finished = _wrap(status=result.status, won=True, recovery=recovery)
     await _attach_undelivered_notes(state_store, run_id, finished)
     return finished
 
@@ -2248,7 +2430,6 @@ async def run(
         seeded_history = _new_run_history(
             replay_req, normalized_history, context, user_input, skill_session, user_parts
         )
-        recorder: LoopRecorder | None = None
 
         # --- Delegation context ---
         parent_run_id, delegation_level = resolve_parent_link(parent_ctx, state_store)
@@ -2344,7 +2525,6 @@ async def run(
 
                 # Set delegation context for the duration of this run so nested
                 # agent.run() calls inside tools inherit the parent link.
-                recorder = lifecycle.recorder
                 this_ctx = DelegationContext(
                     run_id=run_id,
                     trace_link=trace_link,
@@ -2365,7 +2545,7 @@ async def run(
                 # _MCPDiscoveryError is caught here, mcp.error emitted, then the
                 # original cause is re-raised for the outer except Exception.
                 await _discover_runtime_tools(
-                    agent, recorder, extra_notifier, run_id, resolved_loop, mcp_meta
+                    agent, lifecycle.recorder, extra_notifier, run_id, resolved_loop, mcp_meta
                 )
 
                 replay_plan, seeded_history = await _apply_replay(
@@ -2400,7 +2580,7 @@ async def run(
                 # still lands in react_traces (seeded prior turns are NOT recorded
                 # — they live in the dev's chat DB).
                 await _record_seeded_user(
-                    recorder,
+                    lifecycle.recorder,
                     extra_notifier,
                     run_id,
                     user_input,
@@ -2415,7 +2595,7 @@ async def run(
                     strategy=resolved_strategy,
                     user_input=user_input,
                     run_id=run_id,
-                    recorder=recorder,
+                    recorder=lifecycle.recorder,
                     notifier=extra_notifier,
                     initial_history=seeded_history,
                     provider_kwargs=provider_kwargs or None,
@@ -2430,14 +2610,14 @@ async def run(
                 _ensure_pause_generation(result, provider_kwargs)
                 if state_store is not None:
                     result = await _persist_loop_outcome(
-                        recorder=recorder,
+                        recorder=lifecycle.recorder,
                         provider_kwargs=provider_kwargs,
                         state_store=state_store,
                         run_id=run_id,
                         result=result,
                     )
 
-                await lifecycle._finish(recorder, extra_notifier, result)
+                await lifecycle._finish(lifecycle.recorder, extra_notifier, result)
 
                 result.meta = _public_meta(result.meta)
 
@@ -2761,6 +2941,47 @@ def _single_full_source(plan: ReplayPlan | None) -> bool:
     return plan is not None and len(plan.summary.runs_full) == 1 and not plan.summary.runs_text
 
 
+async def _read_cancel_winner(
+    store: StateStore, run_id: str, *, safe: bool = False
+) -> RunRecord | None:
+    try:
+        return await store.get_run(run_id)
+    except Exception:
+        if not safe:
+            raise
+        return None
+
+
+async def _persist_run_cancellation(
+    store: StateStore,
+    run_id: str,
+    payload: dict[str, Any],
+    *,
+    on_won: Callable[[], None],
+    answer: str | None | _OmittedType = _OMITTED,
+    emit_event: bool = True,
+    read_on_loss: Callable[[], bool] | None = None,
+    safe_read: bool = False,
+) -> tuple[bool, RunRecord | None]:
+    kwargs: dict[str, Any] = {} if isinstance(answer, _OmittedType) else {"answer": answer}
+    won = await store.finalize_run(
+        run_id,
+        status=RunStatus.CANCELLED.value,
+        expected_current_status=RunStatus.RUNNING.value,
+        **kwargs,
+    )
+    if won:
+        # Remember the committed CAS even if the separate event write raises.
+        on_won()
+        if emit_event:
+            await _emit_event(store, run_id, StoredEventType.RUN_CANCELLED.value, payload)
+        return True, None
+    record = None
+    if read_on_loss is None or read_on_loss():
+        record = await _read_cancel_winner(store, run_id, safe=safe_read)
+    return False, record
+
+
 async def _persist_task_cancellation(
     state_store: StateStore | None,
     run_id: str,
@@ -2784,23 +3005,17 @@ async def _persist_task_cancellation(
     if state_store is None:
         return result
     try:
-        won = await state_store.finalize_run(
+        won, record = await _persist_run_cancellation(
+            state_store,
             run_id,
-            status=RunStatus.CANCELLED.value,
-            expected_current_status=RunStatus.RUNNING.value,
+            {"reason": CancelReason.CANCEL_REQUESTED.value, **interrupt_meta}
+            if interrupted
+            else {"reason": CancelReason.TASK_CANCELLED.value},
+            on_won=lambda: result.meta.update({CANCEL_PERSISTED_META_KEY: True}),
         )
         if won:
-            result.meta[CANCEL_PERSISTED_META_KEY] = True
-            await _emit_event(
-                state_store,
-                run_id,
-                StoredEventType.RUN_CANCELLED.value,
-                {"reason": CancelReason.CANCEL_REQUESTED.value, **interrupt_meta}
-                if interrupted
-                else {"reason": CancelReason.TASK_CANCELLED.value},
-            )
             await _attach_undelivered_notes(state_store, run_id, result)
-        elif await state_store.get_run(run_id) is not None:
+        elif record is not None:
             result = await _build_cached_result(state_store, run_id)
             if result.status == RunStatus.CANCELLED:
                 result.meta[CANCEL_PERSISTED_META_KEY] = True
@@ -3087,6 +3302,7 @@ async def _start_retry_history(
     provider_kwargs: dict[str, Any],
     store: StateStore,
     run_id: str,
+    original_run_id: str,
     source: RunRecord,
     replay_req: ReplayRequest | None,
     replay_runs: list[Any],
@@ -3112,7 +3328,7 @@ async def _start_retry_history(
         store,
         run_id,
         current=current,
-        seed={"retry_of": source.id},
+        seed={"retry_of": original_run_id},
         plan=replay_plan,
         # An explicit-skills retry also traces its rebuilt first user
         # message, so its slot mapping is not a plain offset: unknown.
@@ -3126,7 +3342,7 @@ async def _start_retry_history(
         seeded=history,
         sources=[
             *_replay_sources(replay_runs),
-            (source.id, source.tenant_id, source.meta),
+            (original_run_id, source.tenant_id, source.meta),
         ],
         single_full=replay_plan is None,
         input_images=False,
@@ -3258,8 +3474,6 @@ async def retry(
             replay_runs,
         )
         input_edges = await _retry_edges(image_runtime, source_parts)
-
-        recorder: LoopRecorder | None = None
         ctx_token = None
         mcp_meta: dict[str, Any] = {}
         result: RunResult | None = None
@@ -3315,8 +3529,6 @@ async def retry(
                         "retry_of": original_run_id,
                     },
                 )
-
-                recorder = lifecycle.recorder
                 this_ctx = DelegationContext(
                     run_id=run_id,
                     trace_link=trace_link,
@@ -3333,7 +3545,7 @@ async def retry(
                 ctx_token = set_delegation_context(this_ctx)
 
                 await _discover_runtime_tools(
-                    agent, recorder, extra_notifier, run_id, resolved_loop, mcp_meta
+                    agent, lifecycle.recorder, extra_notifier, run_id, resolved_loop, mcp_meta
                 )
 
                 replay_plan, initial_history, image_view = await _start_retry_history(
@@ -3343,6 +3555,7 @@ async def retry(
                     provider_kwargs,
                     state_store,
                     run_id,
+                    original_run_id,
                     source_run,
                     replay_req,
                     replay_runs,
@@ -3359,7 +3572,7 @@ async def retry(
                         retry_context,
                         session=skill_session,
                     )
-                    await _record_user_trace(recorder, extra_notifier, run_id, trace_user)
+                    await _record_user_trace(lifecycle.recorder, extra_notifier, run_id, trace_user)
 
                 result = await resolved_loop.run(
                     agent=agent,
@@ -3367,7 +3580,7 @@ async def retry(
                     strategy=resolved_strategy,
                     user_input=user_input,
                     run_id=run_id,
-                    recorder=recorder,
+                    recorder=lifecycle.recorder,
                     notifier=extra_notifier,
                     initial_history=initial_history,
                     provider_kwargs=provider_kwargs or None,
@@ -3379,14 +3592,14 @@ async def retry(
                     result.replay = replay_plan.summary
                 _attach_mcp_meta(result, mcp_meta)
                 result = await _persist_loop_outcome(
-                    recorder=recorder,
+                    recorder=lifecycle.recorder,
                     provider_kwargs=provider_kwargs,
                     state_store=state_store,
                     run_id=run_id,
                     result=result,
                 )
 
-                await lifecycle._finish(recorder, extra_notifier, result)
+                await lifecycle._finish(lifecycle.recorder, extra_notifier, result)
 
                 return result
 
@@ -3641,7 +3854,6 @@ def run_stream(
         # Starts as the pre-provided value (often None for the lazy path).
         nonlocal run_id, extra_notifier
         store = state_store
-        recorder: LoopRecorder | None = None
         startup = _RunLifecycle(run_id, store, None)
         seed_kwargs: dict[str, Any] = {}
         run_guardrails = None
@@ -3840,19 +4052,18 @@ def run_stream(
                 {"agent_name": agent.name, "system_prompt": _system_prompt},
                 before_event=lambda: stream_context.set_delegation(this_ctx),
             )
-            recorder = startup.recorder
             this_ctx = replace(this_ctx, trace_link=trace_link)
             stream_context.set_delegation(this_ctx)
             # Lifecycle pair is now open. Stash recorder/notifier so the
             # cleanup callback can close it with a CANCELLED finish if the
             # consumer abandons the stream before a terminal event.
-            _shared["recorder"] = recorder
+            _shared["recorder"] = startup.recorder
             _shared["notifier"] = extra_notifier
 
             yield RunEvent(type=RunEventType.RUN_STARTED, run_id=run_id)
 
             await _discover_runtime_tools(
-                agent, recorder, extra_notifier, run_id, resolved_loop, mcp_meta
+                agent, startup.recorder, extra_notifier, run_id, resolved_loop, mcp_meta
             )
 
             replay_plan, seeded_history = await _apply_replay(
@@ -3880,7 +4091,13 @@ def run_stream(
             # recording. Record the new user_input here so it still lands in
             # react_traces (seeded prior turns are NOT recorded).
             await _record_seeded_user(
-                recorder, extra_notifier, run_id, user_input, seeded_history, context, skill_session
+                startup.recorder,
+                extra_notifier,
+                run_id,
+                user_input,
+                seeded_history,
+                context,
+                skill_session,
             )
 
             # 3. Stream the loop. The interrupt signal lets cancel_run reach
@@ -3894,7 +4111,7 @@ def run_stream(
                 strategy=resolved_strategy,
                 user_input=user_input,
                 run_id=run_id,
-                recorder=recorder,
+                recorder=startup.recorder,
                 notifier=extra_notifier,
                 initial_history=seeded_history,
                 provider_kwargs=provider_kwargs or None,
@@ -3903,54 +4120,22 @@ def run_stream(
                 interrupt=interrupt,
                 **_image_loop_kwargs(resolved_loop.run_stream, image_runtime, image_view),
             )
-            async with _closing_loop_stream(loop_stream, run_id):
-                async for event in loop_stream:
-                    _terminal_types = (
-                        RunEventType.RUN_COMPLETED,
-                        RunEventType.RUN_ERROR,
-                        RunEventType.RUN_PAUSED,
-                        RunEventType.RUN_CANCELLED,
-                    )
-                    terminal_result = event.run_result if event.type in _terminal_types else None
-                    if terminal_result is not None:
-                        _ensure_pause_generation(terminal_result, provider_kwargs)
-                        if replay_plan is not None:
-                            terminal_result.replay = replay_plan.summary
-                        _attach_mcp_meta(terminal_result, mcp_meta)
-                        if store is not None:
-                            persisted = await _persist_loop_outcome(
-                                recorder=recorder,
-                                provider_kwargs=provider_kwargs,
-                                state_store=store,
-                                run_id=run_id,
-                                result=terminal_result,
-                            )
-                            # Pre-pause checkpoint can flip a PAUSED iteration to
-                            # CANCELLED. Re-derive the event type from the persisted
-                            # status so the consumer sees the correct terminal event.
-                            if persisted.status == RunStatus.CANCELLED:
-                                event = RunEvent(
-                                    type=RunEventType.RUN_CANCELLED, run_result=persisted
-                                )
-                            else:
-                                event = RunEvent(
-                                    type=event.type, run_result=persisted, phase=event.phase
-                                )
-                            await record_run_finished(recorder, run_id, persisted)
-                            await notify_run_finished(extra_notifier, run_id, persisted)
-                        else:
-                            # No persistence: skip _persist_loop_outcome but still
-                            # close the lifecycle pair so notifier-side spans
-                            # (OTel root span) don't leak.
-                            await record_run_finished(recorder, run_id, terminal_result)
-                            await notify_run_finished(extra_notifier, run_id, terminal_result)
-                        if event.run_result is not None:
-                            event.run_result.meta = _public_meta(event.run_result.meta)
-                        yield event
-                    else:
-                        # TEXT_DELTA, TOOL_USE_START, TOOL_USE_END, TOOL_RESULT — pass through
-                        _track_partial_text(_shared, event)
-                        yield event
+            async with aclosing(
+                _stream_loop_events(
+                    loop_stream,
+                    state_store=store,
+                    recorder=startup.recorder,
+                    notifier=extra_notifier,
+                    run_id=run_id,
+                    provider_kwargs=provider_kwargs,
+                    shared=_shared,
+                    mcp_meta=mcp_meta,
+                    replay_plan=replay_plan,
+                    new_run=True,
+                )
+            ) as events:
+                async for event in events:
+                    yield event
 
         except RunFencedError:
             assert store is not None
@@ -3961,37 +4146,7 @@ def run_stream(
         except Exception as exc:
             # Persist error, yield RUN_ERROR, return cleanly. No re-raise.
             # Covers both setup failures and loop execution errors.
-            if store is not None and _shared.get("claimed"):
-                error_won = False
-                try:
-                    error_won = await store.finalize_run(
-                        run_id,
-                        status=RunStatus.ERROR.value,
-                        error=_safe_error(exc),
-                        **_error_store_kwargs(store, exc),
-                        total_usage=None,
-                        expected_current_status=RunStatus.RUNNING.value,
-                    )
-                except Exception:
-                    logger.error(
-                        "Failed to persist ERROR status for run %s",
-                        run_id,
-                        exc_info=safe_exception_info(),
-                    )
-                if error_won:
-                    await _emit_event_safe(
-                        store, run_id, StoredEventType.RUN_ERROR.value, _error_payload(exc)
-                    )
-            if not _shared.get("existing_run"):
-                try:
-                    await record_run_failed(startup.recorder, run_id, exc)
-                    await notify_run_failed(extra_notifier, run_id, exc)
-                except Exception:
-                    logger.warning(
-                        "Lifecycle hooks failed during stream error handler for run %s",
-                        run_id,
-                        exc_info=safe_exception_info(),
-                    )
+            await _stream_run_failure(store, _shared, startup.recorder, extra_notifier, run_id, exc)
 
             yield RunEvent(
                 type=RunEventType.RUN_ERROR,
@@ -4035,25 +4190,28 @@ def run_stream(
         store = _shared.get("state_store")
 
         cancel_won = False
+        persisted_row: RunRecord | None | _OmittedType = _OMITTED
+
+        def mark_cancelled() -> None:
+            nonlocal cancel_won
+            cancel_won = True
+
         partial_answer = _partial_answer(_shared)
         if store is not None:
             try:
-                cancel_won = await store.finalize_run(
+                cancel_won, persisted_row = await _persist_run_cancellation(
+                    store,
                     run_id,
-                    status=RunStatus.CANCELLED.value,
+                    {
+                        "reason": CancelReason.STREAM_CLOSED.value,
+                        "partial_output": partial_answer is not None,
+                    },
+                    on_won=mark_cancelled,
                     answer=partial_answer,
-                    expected_current_status=RunStatus.RUNNING.value,
+                    emit_event=True,
+                    read_on_loss=lambda: "notifier" in _shared,
+                    safe_read=True,
                 )
-                if cancel_won:
-                    await _emit_event(
-                        store,
-                        run_id,
-                        StoredEventType.RUN_CANCELLED.value,
-                        {
-                            "reason": CancelReason.STREAM_CLOSED.value,
-                            "partial_output": partial_answer is not None,
-                        },
-                    )
             except Exception:
                 logger.error(
                     "Failed to cancel run %s during stream cleanup",
@@ -4068,7 +4226,11 @@ def run_stream(
             cancel_persisted = cancel_won
             if store is not None and not cancel_won:
                 try:
-                    run_record = await store.get_run(run_id)
+                    run_record = (
+                        await store.get_run(run_id)
+                        if isinstance(persisted_row, _OmittedType)
+                        else persisted_row
+                    )
                     if run_record is not None:
                         terminal_status = RunStatus(run_record.status)
                         cancel_persisted = terminal_status == RunStatus.CANCELLED
@@ -6287,16 +6449,9 @@ def resume_stream(
             )
 
         try:
-            # 1. Resolve state store
-            if store is None and state_store_resolver is not None:
-                store = await state_store_resolver()
+            store = await _resolve_resume_stream_store(store, state_store_resolver)
             _shared["state_store"] = store
 
-            if store is None:
-                raise ValueError(
-                    "resume_stream() requires persistence. "
-                    "Pass database_url or state_store to the agent."
-                )
             await ensure_agent_limits_fit(agent, store)
 
             (
@@ -6472,38 +6627,20 @@ def resume_stream(
                     _resume_image_view(ctx.pause_state, ctx.history),
                 ),
             )
-            async with _closing_loop_stream(loop_stream, run_id):
-                async for event in loop_stream:
-                    if (
-                        event.type
-                        in (
-                            RunEventType.RUN_COMPLETED,
-                            RunEventType.RUN_ERROR,
-                            RunEventType.RUN_PAUSED,
-                            RunEventType.RUN_CANCELLED,
-                        )
-                        and event.run_result
-                    ):
-                        _attach_mcp_meta(event.run_result, mcp_meta)
-                        persisted = await _persist_loop_outcome(
-                            recorder=ctx.recorder,
-                            provider_kwargs=ctx.pause_state.provider_kwargs,
-                            state_store=store,
-                            run_id=run_id,
-                            result=event.run_result,
-                        )
-                        if persisted.status == RunStatus.CANCELLED:
-                            event = RunEvent(type=RunEventType.RUN_CANCELLED, run_result=persisted)
-                        else:
-                            event = RunEvent(
-                                type=event.type, run_result=persisted, phase=event.phase
-                            )
-                        await record_run_finished(ctx.recorder, run_id, persisted)
-                        await notify_run_finished(ctx.notifier, run_id, persisted)
-                        yield event
-                    else:
-                        _track_partial_text(_shared, event)
-                        yield event
+            async with aclosing(
+                _stream_loop_events(
+                    loop_stream,
+                    state_store=store,
+                    recorder=ctx.recorder,
+                    notifier=ctx.notifier,
+                    run_id=run_id,
+                    provider_kwargs=ctx.pause_state.provider_kwargs,
+                    shared=_shared,
+                    mcp_meta=mcp_meta,
+                )
+            ) as events:
+                async for event in events:
+                    yield event
 
         except RunFencedError:
             store = _shared["state_store"]
@@ -6550,25 +6687,28 @@ def resume_stream(
         resumed = _shared.get("ctx") is not None
 
         cancel_won = False
+        persisted_row: RunRecord | None | _OmittedType = _OMITTED
+
+        def mark_cancelled() -> None:
+            nonlocal cancel_won
+            cancel_won = True
+
         partial_answer = _partial_answer(_shared)
         if store is not None:
             try:
-                cancel_won = await store.finalize_run(
+                cancel_won, persisted_row = await _persist_run_cancellation(
+                    store,
                     run_id,
-                    status=RunStatus.CANCELLED.value,
+                    {
+                        "reason": CancelReason.STREAM_CLOSED.value,
+                        "partial_output": partial_answer is not None,
+                    },
+                    on_won=mark_cancelled,
                     answer=partial_answer,
-                    expected_current_status=RunStatus.RUNNING.value,
+                    emit_event=resumed,
+                    read_on_loss=lambda: "notifier" in _shared,
+                    safe_read=True,
                 )
-                if cancel_won and resumed:
-                    await _emit_event(
-                        store,
-                        run_id,
-                        StoredEventType.RUN_CANCELLED.value,
-                        {
-                            "reason": CancelReason.STREAM_CLOSED.value,
-                            "partial_output": partial_answer is not None,
-                        },
-                    )
             except Exception:
                 logger.error(
                     "Failed to cancel run %s during resume stream cleanup",
@@ -6582,7 +6722,11 @@ def resume_stream(
             cancel_persisted = cancel_won
             if store is not None and not cancel_won:
                 try:
-                    run_record = await store.get_run(run_id)
+                    run_record = (
+                        await store.get_run(run_id)
+                        if isinstance(persisted_row, _OmittedType)
+                        else persisted_row
+                    )
                     if run_record is not None:
                         terminal_status = RunStatus(run_record.status)
                         cancel_persisted = terminal_status == RunStatus.CANCELLED
