@@ -94,6 +94,7 @@ from dendrux.loops._helpers import (
     record_run_started,
     record_tool,
 )
+from dendrux.loops._policy_context import dispatch_policy, history_call_counts, static_denial
 from dendrux.loops.react import ReActLoop
 from dendrux.runtime._entry_checks import resolve_runner_tenant, runner_entry_checks
 from dendrux.runtime._tenant_checks import _tenant_scope_chosen
@@ -4859,15 +4860,12 @@ def _rejection_decided_payload(
 
 
 def _approval_call_counts(recorder: LoopRecorder, pause_state: PauseState) -> dict[str, int]:
-    restored_counts = getattr(recorder, "execution_counts", lambda: None)()
-    counts: dict[str, int] = restored_counts if restored_counts is not None else {}
-    for message in [] if restored_counts is not None else pause_state.history:
-        if (
-            message.role == Role.TOOL
-            and message.name
-            and not message.meta.get(NOT_EXECUTED_META_KEY)
-        ):
-            counts[message.name] = counts.get(message.name, 0) + 1
+    restored_counts: dict[str, int] | None = getattr(recorder, "execution_counts", lambda: None)()
+    if restored_counts is not None:
+        return restored_counts
+    counts = history_call_counts(pause_state.history)
+    # The approved fallback historically excludes empty names, too.
+    counts.pop("", None)
     return counts
 
 
@@ -4915,10 +4913,8 @@ async def _approval_policy_denial(
     on_work: Callable[[], None] | None,
 ) -> ToolResult:
     from dendrux.loops._helpers import notify_governance, record_governance
-    from dendrux.types import ToolResult
 
-    message = f"Tool '{tc.name}' is denied by policy."
-    data = {"tool_name": tc.name, "call_id": tc.id, "reason": DenialReason.DENIED_BY_POLICY.value}
+    result, data = static_denial(tc.name, tc.id)
     await record_governance(
         recorder,
         run_id,
@@ -4936,13 +4932,7 @@ async def _approval_policy_denial(
         data,
         correlation_id=tc.id,
     )
-    return ToolResult(
-        name=tc.name,
-        call_id=tc.id,
-        payload=json.dumps({"denied": message}),
-        success=False,
-        error=message,
-    )
+    return result
 
 
 async def _execute_approved_tools(
@@ -5078,8 +5068,8 @@ async def _execute_approved_tools(
                 warnings=[],
                 deny=agent._deny,
                 tool_result_transform=agent.tool_result_transform,
-                approved_skills=True,
                 tenant_id=None,
+                **dispatch_policy(name=tc.name, phase="approved"),
                 **_tool_image_kwargs(_process_tool_calls, image_runtime),
             )
             results.extend(outcome_s.all_results)

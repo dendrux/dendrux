@@ -20,7 +20,6 @@ Notifier hooks fire at three kinds of points:
 from __future__ import annotations
 
 import asyncio
-import copy
 import inspect
 import json
 import logging
@@ -86,6 +85,7 @@ from dendrux.loops._images import (
     release_wire,
     tool_result_images_dropped,
 )
+from dendrux.loops._policy_context import history_call_counts, static_denial, tool_call_context
 from dendrux.loops.base import Loop
 from dendrux.media._ids import IMAGE_ID_RE
 from dendrux.media._image import Image, ToolOutput
@@ -134,7 +134,6 @@ from dendrux.types import (
     RunStatus,
     StreamEventType,
     ToolCall,
-    ToolCallContext,
     ToolDecision,
     ToolResult,
     ToolResultContext,
@@ -727,14 +726,7 @@ async def _init_loop_state(
         history[-1] = user_msg
         await _notify_message(notifier, run_id, user_msg, 0)
 
-    call_counts: dict[str, int] = {}
-    for msg in history:
-        if (
-            msg.role == Role.TOOL
-            and msg.name is not None
-            and not msg.meta.get(NOT_EXECUTED_META_KEY)
-        ):
-            call_counts[msg.name] = call_counts.get(msg.name, 0) + 1
+    call_counts = history_call_counts(history)
 
     steps: list[AgentStep] = list(initial_steps) if initial_steps else []
     usage = UsageStats(
@@ -866,21 +858,9 @@ async def _process_tool_calls(
     non_denied: list[ToolCall] = []
     for tc in parsed_calls:
         if tc.name in deny_set:
-            deny_msg = f"Tool '{tc.name}' is denied by policy."
-            deny_result = ToolResult(
-                name=tc.name,
-                call_id=tc.id,
-                payload=json.dumps({"denied": deny_msg}),
-                success=False,
-                error=deny_msg,
-            )
+            deny_result, event_data = static_denial(tc.name, tc.id)
             # No _record_tool / _notify_tool — denied tools are not executions.
             # Only policy.denied event + synthetic message for the model.
-            event_data = {
-                "tool_name": tc.name,
-                "call_id": tc.id,
-                "reason": DenialReason.DENIED_BY_POLICY.value,
-            }
             await _record_governance(
                 recorder,
                 run_id,
@@ -1173,14 +1153,14 @@ async def _call_before_tool(
     subclasses propagate. A non-``ToolDecision`` return is an error.
     """
     try:
-        ctx = ToolCallContext(
+        ctx = tool_call_context(
             run_id=run_id,
             call_id=tc.id,
             tool_name=tc.name,
-            params=copy.deepcopy(tc.params),
+            params=tc.params,
             target=lookups.target.get(tc.name, ToolTarget.SERVER),
             source=_tool_source(tc.name, lookups),
-            meta=copy.deepcopy(lookups.meta.get(tc.name, {})),
+            meta=lookups.meta.get(tc.name, {}),
             iteration=iteration,
             tenant_id=tenant_id,
             images=images,
