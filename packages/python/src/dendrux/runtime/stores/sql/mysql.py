@@ -57,24 +57,10 @@ def _packet_limit(facts: Any) -> int | None:
     return None if facts is None else facts.max_allowed_packet
 
 
-def _walk_errors(root: BaseException) -> Iterator[BaseException]:
-    """Distinct errors reachable through ``orig``, cause and context, at most 64.
-
-    Context is visited first and is not part of the shared ``error_chain``.
-    """
-    errors = [root]
-    seen: set[int] = set()
-    while errors and len(seen) < _ERROR_WALK_LIMIT:
-        error = errors.pop()
-        if id(error) in seen:
-            continue
-        seen.add(id(error))
-        errors.extend(
-            nested
-            for nested in (getattr(error, "orig", None), error.__cause__, error.__context__)
-            if isinstance(nested, BaseException)
-        )
-        yield error
+def _nested_errors(error: BaseException) -> list[BaseException]:
+    """``orig``, cause and context, in the order they are pushed on the walk stack."""
+    nested = (getattr(error, "orig", None), error.__cause__, error.__context__)
+    return [item for item in nested if isinstance(item, BaseException)]
 
 
 def _value_over_limit(value: str | bytes | bytearray | memoryview, limit: int) -> bool:
@@ -114,9 +100,22 @@ def _params_over_limit(params: Any, limit: int) -> bool:
 
 
 def _binds_over_limit(exc: BaseException, limit: int) -> bool:
-    return any(
-        _params_over_limit(getattr(error, "params", None), limit) for error in _walk_errors(exc)
-    )
+    """Walk at most 64 distinct errors (context first) looking for an oversize bound value.
+
+    A plain loop, not a generator: an exception raised by a metadata getter
+    must propagate unchanged.
+    """
+    errors = [exc]
+    seen: set[int] = set()
+    while errors and len(seen) < _ERROR_WALK_LIMIT:
+        error = errors.pop()
+        if id(error) in seen:
+            continue
+        seen.add(id(error))
+        errors.extend(_nested_errors(error))
+        if _params_over_limit(getattr(error, "params", None), limit):
+            return True
+    return False
 
 
 class MySQLStateStore(SQLStateStore):

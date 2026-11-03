@@ -16,6 +16,36 @@ import pytest
 from dendrux.runtime.stores._errors import DbError, classify_error, error_chain
 
 
+class Raises:
+    """Expected outcome: ``classify_error`` raises this exception type with this text."""
+
+    def __init__(self, kind: type[BaseException], text: str) -> None:
+        self.kind = kind
+        self.text = text
+
+
+class RaisingConstraintError(Exception):
+    sqlstate = "42P01"
+
+    @property
+    def constraint_name(self) -> Any:
+        raise ValueError("constraint-read")
+
+
+class ChangingSQLiteMessage(sqlite3.IntegrityError):
+    """Reads as ``x`` twice, then as an index-form message: each ``str()`` is a fresh read."""
+
+    sqlite_errorcode = sqlite3.SQLITE_CONSTRAINT_UNIQUE
+
+    def __init__(self) -> None:
+        super().__init__("x")
+        self.reads = 0
+
+    def __str__(self) -> str:
+        self.reads += 1
+        return "UNIQUE constraint failed: index 'ix'" if self.reads >= 3 else "x"
+
+
 def _driver(module: str, name: str = "DriverError") -> type[Exception]:
     return type(name, (Exception,), {"__module__": module})
 
@@ -589,12 +619,40 @@ def chain_rows() -> list[tuple[str, Any, DbError]]:
     ]
 
 
-ROWS = packet_rows() + sqlstate_rows() + sqlite_rows() + mysql_rows() + chain_rows()
+def evaluation_order_rows() -> list[tuple[str, Any, Any]]:
+    return [
+        (
+            "review-s2-metadata-read-can-raise-for-nonunique-state",
+            RaisingConstraintError(),
+            Raises(ValueError, "constraint-read"),
+        ),
+        (
+            "review-s3-second-regex-stringifies-again",
+            ChangingSQLiteMessage(),
+            DbError("unique_violation", "ix", sqlite3.SQLITE_CONSTRAINT_UNIQUE),
+        ),
+    ]
+
+
+ROWS = (
+    packet_rows()
+    + sqlstate_rows()
+    + sqlite_rows()
+    + mysql_rows()
+    + chain_rows()
+    + evaluation_order_rows()
+)
 
 
 @pytest.mark.parametrize(("exc", "expected"), [row[1:] for row in ROWS], ids=[r[0] for r in ROWS])
-def test_classify_error_precedence_table(exc: BaseException, expected: DbError) -> None:
-    assert classify_error(exc) == expected
+def test_classify_error_precedence_table(exc: BaseException, expected: Any) -> None:
+    if isinstance(expected, Raises):
+        with pytest.raises(expected.kind) as caught:
+            classify_error(exc)
+        assert type(caught.value) is expected.kind
+        assert str(caught.value) == expected.text
+    else:
+        assert classify_error(exc) == expected
 
 
 def test_table_covers_every_stage_and_overlap() -> None:

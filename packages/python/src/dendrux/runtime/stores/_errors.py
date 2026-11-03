@@ -105,8 +105,11 @@ def _constraint_name(chain: list[BaseException]) -> Any:
 
 
 def _sqlstate_error(code: str, chain: list[BaseException]) -> DbError:
+    # Read the metadata for every SQLSTATE, as the single pass always did: the
+    # getters can raise, and that must not depend on the code.
+    constraint = _constraint_name(chain)
     if code == "23505":
-        return DbError("unique_violation", _constraint_name(chain), code)
+        return DbError("unique_violation", constraint, code)
     kind = _SQLSTATE_KINDS.get(code)
     if kind is not None:
         return DbError(kind, code=code)
@@ -126,10 +129,12 @@ def _stage_sqlstate(chain: list[BaseException]) -> DbError | None:
     return None
 
 
-def _sqlite_unique_constraint(message: str) -> str | None:
+def _sqlite_unique_constraint(error: BaseException) -> str | None:
     # SQLite exposes unique column lists only in its message. Keep only
     # identifiers; never retain arbitrary message text or bound values.
-    match = _SQLITE_UNIQUE_COLUMNS.fullmatch(message) or _SQLITE_UNIQUE_INDEX.fullmatch(message)
+    match = _SQLITE_UNIQUE_COLUMNS.fullmatch(str(error))
+    if match is None:
+        match = _SQLITE_UNIQUE_INDEX.fullmatch(str(error))
     return match[1] if match else None
 
 
@@ -149,7 +154,7 @@ def _sqlite_error(error: BaseException, code: int) -> DbError:
     if code & 0xFF in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
         return DbError("lock_timeout", code=code)
     if code in (sqlite3.SQLITE_CONSTRAINT_UNIQUE, sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY):
-        return DbError("unique_violation", _sqlite_unique_constraint(str(error)), code)
+        return DbError("unique_violation", _sqlite_unique_constraint(error), code)
     return DbError("other", code=code)
 
 

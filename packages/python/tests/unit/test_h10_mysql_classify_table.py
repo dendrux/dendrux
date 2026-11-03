@@ -33,6 +33,35 @@ class DriverError(Exception):
     __module__ = "asyncmy.errors"
 
 
+class Raises:
+    """Expected outcome: classification raises this exception type with this text."""
+
+    def __init__(self, kind: type[BaseException], text: str) -> None:
+        self.kind = kind
+        self.text = text
+
+
+class ParamsStopIterationError(Exception):
+    connection_invalidated = True
+
+    @property
+    def params(self) -> Any:
+        raise StopIteration("params-read")
+
+
+class OrigStopIterationError(Exception):
+    @property
+    def orig(self) -> Any:
+        raise StopIteration("orig-read")
+
+
+def context_with_orig_stopiteration() -> Exception:
+    root = Exception("flagged")
+    root.connection_invalidated = True  # type: ignore[attr-defined]
+    root.__context__ = OrigStopIterationError()
+    return root
+
+
 def store(limit: int | None | str = LIMIT) -> MySQLStateStore:
     built = object.__new__(MySQLStateStore)
     if limit == "no-facts":
@@ -257,13 +286,35 @@ def context_with_params() -> Exception:
     return root
 
 
+ROWS += [
+    (
+        "review-m4-stopiteration-in-context-orig-getter",
+        LIMIT,
+        context_with_orig_stopiteration,
+        Raises(StopIteration, "orig-read"),
+    ),
+    (
+        "review-m5-stopiteration-in-params-getter",
+        LIMIT,
+        ParamsStopIterationError,
+        Raises(StopIteration, "params-read"),
+    ),
+]
+
+
 @pytest.mark.parametrize(
     ("limit", "build", "expected"), [row[1:] for row in ROWS], ids=[row[0] for row in ROWS]
 )
 def test_classify_db_error_table(
-    limit: int | None | str, build: Callable[[], BaseException], expected: DbError
+    limit: int | None | str, build: Callable[[], BaseException], expected: Any
 ) -> None:
-    assert store(limit).classify_db_error(build()) == expected
+    if isinstance(expected, Raises):
+        with pytest.raises(expected.kind) as caught:
+            store(limit).classify_db_error(build())
+        assert type(caught.value) is expected.kind
+        assert str(caught.value) == expected.text
+    else:
+        assert store(limit).classify_db_error(build()) == expected
 
 
 def test_walk_bounds_are_the_documented_ones() -> None:
