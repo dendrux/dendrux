@@ -269,16 +269,20 @@ async def test_image_rejection_mid_stream(adapter: str, caplog: pytest.LogCaptur
     assert "stream" not in _frame_locals(err, "_stream_attempt")
 
 
-async def test_anthropic_stream_tail_keeps_its_stream_local() -> None:
-    """B3 drift, pinned as today: the Anthropic tail has no ``del stream``."""
+@pytest.mark.parametrize("during_open", [False, True])
+async def test_anthropic_stream_tail_drops_its_stream_local(during_open: bool) -> None:
+    """Image-bearing failures drop the SDK stream before raising."""
     claude = AnthropicProvider(model="claude-sonnet-4-6", api_key="test-key", max_retries=0)
     events = [*_anthropic_head(), ("error", ANTHROPIC_REJECTED_UNLOCATED)]
-    wire_anthropic(claude, sse_response(*events))
+    handler = (
+        json_response(400, ANTHROPIC_REJECTED_UNLOCATED) if during_open else sse_response(*events)
+    )
+    wire_anthropic(claude, handler)
     with pytest.raises(ImageRejectedError) as info:
         async for _ in claude.complete_stream(USER_IMAGE):
             pass
     assert_clean(info.value)
-    assert "stream" in _frame_locals(info.value, "_stream_attempt")
+    assert "stream" not in _frame_locals(info.value, "_stream_attempt")
 
 
 # ---------------------------------------------------------------------------
