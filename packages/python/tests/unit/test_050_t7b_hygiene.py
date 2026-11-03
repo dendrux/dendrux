@@ -7,6 +7,7 @@ import pytest
 
 from dendrux import Agent
 from dendrux.llm import _retry_telemetry as telemetry
+from dendrux.llm._resilience import RETRYABLE_HTTP_STATUSES
 from dendrux.loops.react import _accumulate_usage
 from dendrux.loops.single import SingleCall, _call_usage
 from dendrux.runtime.tasks import RunTaskManager
@@ -111,7 +112,7 @@ async def test_run_task_logging_does_not_format_vendor_cause(caplog):
 def test_public_retry_telemetry_hook():
     factory = getattr(telemetry, "telemetry_event_hooks", None)
     assert callable(factory), "provide the public response-hook factory"
-    first, second = factory(), factory()
+    first, second = factory(RETRYABLE_HTTP_STATUSES), factory(RETRYABLE_HTTP_STATUSES)
     assert callable(first["response"][0])
     assert first is not second and first["response"] is not second["response"]
 

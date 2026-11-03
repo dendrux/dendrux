@@ -266,7 +266,10 @@ def make_http_client(
                     _on_request, deadlines=deadlines, provider=provider or sdk.__name__
                 )
             ],
-            "response": [_on_response, *telemetry_event_hooks()["response"]],
+            "response": [
+                _on_response,
+                *telemetry_event_hooks(RETRYABLE_HTTP_STATUSES)["response"],
+            ],
         },
     )
     return client

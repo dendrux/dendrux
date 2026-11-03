@@ -18,6 +18,7 @@ import httpx
 from sqlalchemy.exc import OperationalError
 
 from dendrux.errors import safe_exception_info
+from dendrux.llm._resilience import RETRYABLE_HTTP_STATUSES
 from dendrux.llm._retry_telemetry import (
     call_attempt_tracking,
     make_telemetry_http_client,
@@ -47,7 +48,7 @@ class _FailingNotifier(BaseNotifier):
 
 
 async def _one_retryable_response(recorder: Any, notifier: Any) -> None:
-    client = make_telemetry_http_client(httpx.Timeout(5.0))
+    client = make_telemetry_http_client(httpx.Timeout(5.0), RETRYABLE_HTTP_STATUSES)
     client._transport = httpx.MockTransport(lambda request: httpx.Response(503))  # type: ignore[attr-defined]
     try:
         with (
@@ -108,5 +109,5 @@ async def test_hook_failure_is_logged_and_swallowed(caplog: pytest.LogCaptureFix
     with telemetry_context(
         run_id="r", iteration=1, sinks=governance_sinks(_FailingRecorder(), None, "r")
     ):
-        await telemetry._on_response(response)
+        await telemetry._on_response(response, retryable_statuses=RETRYABLE_HTTP_STATUSES)
     assert "retry telemetry hook raised" in caplog.text

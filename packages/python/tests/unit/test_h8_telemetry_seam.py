@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any
 import httpx
 
 from dendrux.llm import _retry_telemetry as telemetry
+from dendrux.llm._resilience import RETRYABLE_HTTP_STATUSES
 from dendrux.llm._retry_telemetry import TelemetrySinks, telemetry_context, telemetry_stream
 from dendrux.loops._helpers import governance_sinks
 from dendrux.loops.base import BaseNotifier, BaseRecorder
@@ -91,11 +92,13 @@ async def test_hook_returns_before_counting_without_sinks() -> None:
     try:
         with telemetry_context(run_id="r", iteration=1, sinks=None):
             await telemetry._on_response(
-                httpx.Response(503, request=httpx.Request("GET", "https://x.test/v1/a"))
+                httpx.Response(503, request=httpx.Request("GET", "https://x.test/v1/a")),
+                retryable_statuses=RETRYABLE_HTTP_STATUSES,
             )
         with telemetry_context(run_id="r", iteration=1, sinks=TelemetrySinks(None, None)):
             await telemetry._on_response(
-                httpx.Response(503, request=httpx.Request("GET", "https://x.test/v1/a"))
+                httpx.Response(503, request=httpx.Request("GET", "https://x.test/v1/a")),
+                retryable_statuses=RETRYABLE_HTTP_STATUSES,
             )
     finally:
         telemetry._attempts.reset(token)
@@ -116,7 +119,8 @@ async def test_one_failing_sink_does_not_stop_the_other(caplog: pytest.LogCaptur
         telemetry_context(run_id="r", iteration=4, sinks=TelemetrySinks(record, notify)),
     ):
         await telemetry._on_response(
-            httpx.Response(429, request=httpx.Request("GET", "https://x.test/v1/a"))
+            httpx.Response(429, request=httpx.Request("GET", "https://x.test/v1/a")),
+            retryable_statuses=RETRYABLE_HTTP_STATUSES,
         )
     assert [(e, i) for e, i, _ in seen] == [("provider.retry", 4)]
     assert "provider.retry recorder write failed" in caplog.text
@@ -142,3 +146,28 @@ def test_provider_layer_never_imports_the_loops() -> None:
         for node in ast.walk(ast.parse(path.read_text())):
             if isinstance(node, ast.ImportFrom) and node.module:
                 assert not node.module.startswith("dendrux.loops"), (path.name, node.lineno)
+
+
+async def test_hook_uses_the_status_set_it_is_given() -> None:
+    """H8c: the retryable statuses are handed to the hook factory (no import per response)."""
+    from dendrux.llm._retry_telemetry import telemetry_event_hooks
+
+    seen: list[int] = []
+
+    async def record(event_type: str, iteration: int, data: dict[str, Any]) -> None:
+        seen.append(data["status_code"])
+
+    (hook,) = telemetry_event_hooks(frozenset({418}))["response"]
+    request = httpx.Request("GET", "https://x.test/v1/a")
+    with telemetry_context(run_id="r", iteration=1, sinks=TelemetrySinks(record, None)):
+        await hook(httpx.Response(418, request=request))
+        await hook(httpx.Response(503, request=request))
+    assert seen == [418]
+
+
+def test_retry_telemetry_has_no_function_local_imports() -> None:
+    tree = ast.parse((LLM_DIR / "_retry_telemetry.py").read_text())
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            inner = [n for n in ast.walk(node) if isinstance(n, ast.Import | ast.ImportFrom)]
+            assert not inner, node.name
