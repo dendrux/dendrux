@@ -34,21 +34,19 @@ from dendrux.loops._helpers import (
     lease_scope,
     notify_governance,
     notify_llm,
-    notify_llm_started,
     notify_message,
     price_response,
     record_governance,
     record_llm,
-    record_llm_started,
     record_message,
 )
 from dendrux.loops._images import ImageCallSite, release_wire
 from dendrux.loops._llm_call import EventRelay, ProviderCallSite, StreamCall, stream_call_events
 from dendrux.loops.base import Loop
 from dendrux.loops.react import (
+    ReActLoop,
     _bind_checkpoint,
     _blocked_data,
-    _image_block_data,
     _image_policy,
     _incoming_location,
     _interrupted_result,
@@ -79,6 +77,7 @@ if TYPE_CHECKING:
     from dendrux.agent import Agent
     from dendrux.llm.base import LLMProvider
     from dendrux.loops.base import LoopNotifier, LoopRecorder
+    from dendrux.media._prepared import PreparedRequest
     from dendrux.media._runtime import ImageRuntime
     from dendrux.runtime.state import StateStore
     from dendrux.strategies.base import Strategy
@@ -328,6 +327,287 @@ async def _single_prelude(
     )
 
 
+class _Attempt(NamedTuple):
+    """One batch provider call: the answer, or the failure an image retry may answer."""
+
+    prepared: PreparedRequest
+    response: LLMResponse | None
+    output: Any
+    t0: float
+    failure: Exception | None
+
+
+async def _single_complete(
+    pre: _SinglePrelude, prepared: PreparedRequest, output_type: type[BaseModel] | None
+) -> tuple[LLMResponse, Any]:
+    """The provider call itself (structured or plain), under telemetry and a lease."""
+    calls = pre.calls
+    validated_output: Any = None
+    with telemetry_context(
+        run_id=pre.run_id,
+        iteration=1,
+        sinks=governance_sinks(calls.recorder, calls.notifier, pre.run_id),
+    ):
+        async with lease_scope(calls.recorder):
+            if output_type is not None:
+                from dendrux.llm.structured import structured_complete
+
+                response, validated_output = await structured_complete(
+                    calls.provider,
+                    prepared.wire,
+                    output_type,
+                    run_id=pre.run_id,
+                    cache_key_prefix=pre.cache_key_prefix,
+                    **pre.pkw,
+                )
+            else:
+                response = await complete_call(
+                    calls.provider,
+                    prepared.wire,
+                    tools=None,
+                    run_id=pre.run_id,
+                    cache_key_prefix=pre.cache_key_prefix,
+                    **pre.pkw,
+                )
+
+        if response.tool_calls:
+            raise RuntimeError(
+                f"SingleCall received unexpected tool_calls from provider "
+                f"({len(response.tool_calls)} calls). SingleCall agents must "
+                f"have zero tools — the provider should not produce tool calls."
+            )
+    return response, validated_output
+
+
+async def _single_attempt(
+    pre: _SinglePrelude, prepared: PreparedRequest, output_type: type[BaseModel] | None
+) -> _Attempt:
+    """``llm.started``, one provider call, and the failure record when it raises.
+
+    A rejected structured output and a failure with no image to retry
+    propagate; any other failure comes back with its wire bytes dropped.
+    """
+    calls = pre.calls
+    await calls.started(prepared, None, 1)
+    t0 = time.monotonic()
+    try:
+        response, validated_output = await _single_complete(pre, prepared, output_type)
+    except StructuredOutputValidationError as _invalid:
+        await _record_rejected_call(
+            _invalid,
+            agent=calls.agent,
+            provider=calls.provider,
+            run_id=pre.run_id,
+            recorder=calls.recorder,
+            notifier=calls.notifier,
+            warnings=pre.warnings,
+            semantic_messages=prepared.semantic,
+            duration_ms=int((time.monotonic() - t0) * 1000),
+            model=pre.pkw.get("model"),
+        )
+        raise
+    except Exception as _llm_exc:
+        await calls.record_failure(_llm_exc, t0, 1)
+        if not prepared.slots:
+            raise
+        prepared = release_wire(prepared)
+        return _Attempt(prepared, None, None, t0, _llm_exc)
+    return _Attempt(prepared, response, validated_output, t0, None)
+
+
+async def _single_batch_call(
+    pre: _SinglePrelude,
+    output_type: type[BaseModel] | None,
+    control_reader: Callable[[], Awaitable[Any]],
+    g_engine: GuardrailEngine | None,
+) -> RunResult | _Attempt:
+    """The batch provider call over its image request view, retried once on an image failure.
+
+    Returns the answered attempt, or the run's end: an image guardrail block,
+    or a cancel seen before the retry.
+    """
+    images, calls = pre.images, pre.calls
+    guardrails = calls.agent.guardrails or ()
+    prepared = await images.prepare(pre.messages, iteration=1, guardrails=guardrails)
+    if prepared.block_error is not None:
+        return await ReActLoop._image_blocked(
+            prepared.block_error,
+            images=images,
+            run_id=pre.run_id,
+            iteration=1,
+            steps=[],
+            usage=UsageStats(),
+            meta=guardrail_meta(g_engine, pre.warnings),
+        )
+    retried = False
+    while True:
+        attempt = await _single_attempt(pre, prepared, output_type)
+        if attempt.failure is None:
+            return attempt
+        prepared = attempt.prepared
+        stop, error, decision = await calls.decide(
+            attempt.failure,
+            prepared,
+            1,
+            retried=retried,
+            visible_deltas=0,
+            control_reader=control_reader,
+        )
+        del attempt
+        if stop is not None:
+            # SingleCall honours cancel only: nothing ran, so iteration 0.
+            return RunResult(
+                run_id=pre.run_id,
+                status=RunStatus.CANCELLED,
+                steps=[],
+                iteration_count=0,
+                usage=UsageStats(),
+                meta=guardrail_meta(g_engine, pre.warnings),
+            )
+        if error is not None:
+            raise error
+        retried = True
+        prepared = await images.prepare(
+            pre.messages,
+            iteration=1,
+            guardrails=guardrails,
+            force_tombstones=decision.tombstones,
+        )
+
+
+async def _scan_single_incoming(
+    g_engine: GuardrailEngine | None,
+    messages: list[Message],
+    *,
+    recorder: LoopRecorder | None,
+    notifier: LoopNotifier | None,
+    run_id: str,
+    warnings: list[str],
+) -> tuple[list[Any], RunResult | None]:
+    """Incoming guardrail scan of every message, redacting ``messages`` in place.
+
+    Returns the findings and, when a guardrail blocks, the run's ERROR result.
+    """
+    all_in_findings: list[Any] = []
+    if g_engine is None:
+        return all_in_findings, None
+    _in_was_redacted = False
+    for msg_idx, msg in enumerate(messages):
+        if not msg.content:
+            continue
+        cleaned_msg, findings, block_err = await g_engine.scan_incoming_message(msg, index=msg_idx)
+        if findings:
+            all_in_findings.extend(findings)
+        if block_err is not None:
+            await _incoming_blocked(
+                block_err,
+                findings,
+                _incoming_location(msg, msg_idx),
+                recorder,
+                notifier,
+                run_id,
+                warnings,
+            )
+            return all_in_findings, RunResult(
+                run_id=run_id,
+                status=RunStatus.ERROR,
+                error=block_err,
+                steps=[],
+                iteration_count=1,
+                usage=UsageStats(),
+                meta={
+                    **guardrail_meta(g_engine, warnings),
+                    "failure_reason": FailureReason.GUARDRAIL_BLOCKED.value,
+                },
+            )
+        if cleaned_msg is not msg:
+            _in_was_redacted = True
+            # The engine's replace() preserves the origin envelope
+            # (kind/placement/source) through redaction.
+            messages[msg_idx] = cleaned_msg
+    await _incoming_summary(all_in_findings, _in_was_redacted, recorder, notifier, run_id, warnings)
+    return all_in_findings, None
+
+
+async def _incoming_blocked(
+    block_err: str,
+    findings: list[Any],
+    location: str,
+    recorder: LoopRecorder | None,
+    notifier: LoopNotifier | None,
+    run_id: str,
+    warnings: list[str],
+) -> None:
+    await record_governance(
+        recorder,
+        run_id,
+        GovernanceEventType.GUARDRAIL_BLOCKED.value,
+        1,
+        _blocked_data("incoming", block_err, findings, location),
+    )
+    await notify_governance(
+        notifier,
+        run_id,
+        GovernanceEventType.GUARDRAIL_BLOCKED.value,
+        1,
+        _blocked_data("incoming", block_err, findings, location),
+        warnings=warnings,
+    )
+
+
+async def _incoming_summary(
+    all_in_findings: list[Any],
+    was_redacted: bool,
+    recorder: LoopRecorder | None,
+    notifier: LoopNotifier | None,
+    run_id: str,
+    warnings: list[str],
+) -> None:
+    """``guardrail.detected`` then ``guardrail.redacted`` for the incoming scan."""
+    if all_in_findings:
+        _in_entities = list({f.entity_type for f in all_in_findings})
+        await record_governance(
+            recorder,
+            run_id,
+            GovernanceEventType.GUARDRAIL_DETECTED.value,
+            1,
+            {
+                "direction": "incoming",
+                "findings_count": len(all_in_findings),
+                "entities": _in_entities,
+            },
+        )
+        await notify_governance(
+            notifier,
+            run_id,
+            GovernanceEventType.GUARDRAIL_DETECTED.value,
+            1,
+            {
+                "direction": "incoming",
+                "findings_count": len(all_in_findings),
+                "entities": _in_entities,
+            },
+            warnings=warnings,
+        )
+    if was_redacted:
+        _red_entities = list({f.entity_type for f in all_in_findings})
+        await record_governance(
+            recorder,
+            run_id,
+            GovernanceEventType.GUARDRAIL_REDACTED.value,
+            1,
+            {"direction": "incoming", "entities": _red_entities},
+        )
+        await notify_governance(
+            notifier,
+            run_id,
+            GovernanceEventType.GUARDRAIL_REDACTED.value,
+            1,
+            {"direction": "incoming", "entities": _red_entities},
+            warnings=warnings,
+        )
+
+
 class SingleCall(Loop):
     """One LLM call, no tools, no iteration.
 
@@ -397,7 +677,7 @@ class SingleCall(Loop):
             image_runtime=image_runtime,
             image_view_state=image_view_state,
         )
-        resolved_run_id, _pkw, cache_key_prefix = pre.run_id, pre.pkw, pre.cache_key_prefix
+        resolved_run_id, _pkw = pre.run_id, pre.pkw
         notifier_warnings, history, messages = pre.warnings, pre.history, pre.messages
         images, calls = pre.images, pre.calls
         control_reader = _cancel_reader(state_store, resolved_run_id)
@@ -420,225 +700,25 @@ class SingleCall(Loop):
             notifier,
             notifier_warnings,
         )
-        if g_engine is not None:
-            all_in_findings: list[Any] = []
-            _in_was_redacted = False
-            for msg_idx, msg in enumerate(messages):
-                if not msg.content:
-                    continue
-                cleaned_msg, findings, block_err = await g_engine.scan_incoming_message(
-                    msg, index=msg_idx
-                )
-                if findings:
-                    all_in_findings.extend(findings)
-                if block_err is not None:
-                    await record_governance(
-                        recorder,
-                        resolved_run_id,
-                        GovernanceEventType.GUARDRAIL_BLOCKED.value,
-                        1,
-                        _blocked_data(
-                            "incoming", block_err, findings, _incoming_location(msg, msg_idx)
-                        ),
-                    )
-                    await notify_governance(
-                        notifier,
-                        resolved_run_id,
-                        GovernanceEventType.GUARDRAIL_BLOCKED.value,
-                        1,
-                        _blocked_data(
-                            "incoming", block_err, findings, _incoming_location(msg, msg_idx)
-                        ),
-                        warnings=notifier_warnings,
-                    )
-                    return RunResult(
-                        run_id=resolved_run_id,
-                        status=RunStatus.ERROR,
-                        error=block_err,
-                        steps=[],
-                        iteration_count=1,
-                        usage=UsageStats(),
-                        meta={
-                            **guardrail_meta(g_engine, notifier_warnings),
-                            "failure_reason": FailureReason.GUARDRAIL_BLOCKED.value,
-                        },
-                    )
-                if cleaned_msg is not msg:
-                    _in_was_redacted = True
-                    # The engine's replace() preserves the origin envelope
-                    # (kind/placement/source) through redaction.
-                    messages[msg_idx] = cleaned_msg
-            if all_in_findings:
-                _in_entities = list({f.entity_type for f in all_in_findings})
-                await record_governance(
-                    recorder,
-                    resolved_run_id,
-                    GovernanceEventType.GUARDRAIL_DETECTED.value,
-                    1,
-                    {
-                        "direction": "incoming",
-                        "findings_count": len(all_in_findings),
-                        "entities": _in_entities,
-                    },
-                )
-                await notify_governance(
-                    notifier,
-                    resolved_run_id,
-                    GovernanceEventType.GUARDRAIL_DETECTED.value,
-                    1,
-                    {
-                        "direction": "incoming",
-                        "findings_count": len(all_in_findings),
-                        "entities": _in_entities,
-                    },
-                    warnings=notifier_warnings,
-                )
-            if _in_was_redacted:
-                _red_entities = list({f.entity_type for f in all_in_findings})
-                await record_governance(
-                    recorder,
-                    resolved_run_id,
-                    GovernanceEventType.GUARDRAIL_REDACTED.value,
-                    1,
-                    {"direction": "incoming", "entities": _red_entities},
-                )
-                await notify_governance(
-                    notifier,
-                    resolved_run_id,
-                    GovernanceEventType.GUARDRAIL_REDACTED.value,
-                    1,
-                    {"direction": "incoming", "entities": _red_entities},
-                    warnings=notifier_warnings,
-                )
+        all_in_findings, blocked = await _scan_single_incoming(
+            g_engine,
+            messages,
+            recorder=recorder,
+            notifier=notifier,
+            run_id=resolved_run_id,
+            warnings=notifier_warnings,
+        )
+        if blocked is not None:
+            return blocked
 
-        prepared = await images.prepare(messages, iteration=1, guardrails=agent.guardrails or ())
-        if prepared.block_error is not None:
-            await images.emit(
-                GovernanceEventType.GUARDRAIL_BLOCKED.value,
-                _image_block_data(prepared.block_error, images.state),
-                1,
-            )
-            return RunResult(
-                run_id=resolved_run_id,
-                status=RunStatus.ERROR,
-                error=prepared.block_error,
-                steps=[],
-                iteration_count=1,
-                usage=UsageStats(),
-                meta={
-                    **guardrail_meta(g_engine, notifier_warnings),
-                    "failure_reason": FailureReason.GUARDRAIL_BLOCKED.value,
-                },
-            )
-
-        # Structured output path: use the structured helper
-        validated_output: Any = None
-        retried = False
-        while True:
-            # LLM call (lifecycle: started → completed/failed)
-            await record_llm_started(
-                recorder,
-                resolved_run_id,
-                1,
-                semantic_messages=prepared.semantic,
-                semantic_tools=None,
-            )
-            await notify_llm_started(
-                notifier,
-                resolved_run_id,
-                1,
-                notifier_warnings,
-                semantic_messages=prepared.semantic,
-                semantic_tools=None,
-            )
-            t0 = time.monotonic()
-            failure: Exception | None = None
-            try:
-                with telemetry_context(
-                    run_id=resolved_run_id,
-                    iteration=1,
-                    sinks=governance_sinks(recorder, notifier, resolved_run_id),
-                ):
-                    async with lease_scope(recorder):
-                        if output_type is not None:
-                            from dendrux.llm.structured import structured_complete
-
-                            response, validated_output = await structured_complete(
-                                provider,
-                                prepared.wire,
-                                output_type,
-                                run_id=resolved_run_id,
-                                cache_key_prefix=cache_key_prefix,
-                                **_pkw,
-                            )
-                        else:
-                            response = await complete_call(
-                                provider,
-                                prepared.wire,
-                                tools=None,
-                                run_id=resolved_run_id,
-                                cache_key_prefix=cache_key_prefix,
-                                **_pkw,
-                            )
-
-                    if response.tool_calls:
-                        raise RuntimeError(
-                            f"SingleCall received unexpected tool_calls from provider "
-                            f"({len(response.tool_calls)} calls). SingleCall agents must "
-                            f"have zero tools — the provider should not produce tool calls."
-                        )
-            except StructuredOutputValidationError as _invalid:
-                await _record_rejected_call(
-                    _invalid,
-                    agent=agent,
-                    provider=provider,
-                    run_id=resolved_run_id,
-                    recorder=recorder,
-                    notifier=notifier,
-                    warnings=notifier_warnings,
-                    semantic_messages=prepared.semantic,
-                    duration_ms=int((time.monotonic() - t0) * 1000),
-                    model=_pkw.get("model"),
-                )
-                raise
-            except Exception as _llm_exc:
-                await calls.record_failure(_llm_exc, t0, 1)
-                if not prepared.slots:
-                    raise
-                failure = _llm_exc
-                prepared = release_wire(prepared)
-            if failure is None:
-                break
-            stop, error, decision = await calls.decide(
-                failure,
-                prepared,
-                1,
-                retried=retried,
-                visible_deltas=0,
-                control_reader=control_reader,
-            )
-            del failure
-            if stop is not None:
-                # SingleCall honours cancel only: nothing ran, so iteration 0.
-                return RunResult(
-                    run_id=resolved_run_id,
-                    status=RunStatus.CANCELLED,
-                    steps=[],
-                    iteration_count=0,
-                    usage=UsageStats(),
-                    meta=guardrail_meta(g_engine, notifier_warnings),
-                )
-            if error is not None:
-                raise error
-            retried = True
-            prepared = await images.prepare(
-                messages,
-                iteration=1,
-                guardrails=agent.guardrails or (),
-                force_tombstones=decision.tombstones,
-            )
-
-        prepared, llm_duration_ms, response = calls.settle(prepared, response, t0)
+        called = await _single_batch_call(pre, output_type, control_reader, g_engine)
+        if isinstance(called, RunResult):
+            return called
+        assert called.response is not None  # an attempt without a failure answered
+        validated_output = called.output
+        prepared, llm_duration_ms, response = calls.settle(
+            called.prepared, called.response, called.t0
+        )
 
         # Output guardrail — detection-only. Persistence stores raw
         # (DB is ground truth); block policies abort the run, findings
