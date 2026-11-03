@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
-import os
 from contextlib import aclosing, asynccontextmanager
 from typing import TYPE_CHECKING, Any
 
@@ -274,12 +273,13 @@ def _first_delta(event: RunEvent) -> bool:
 
 
 def _holders(err: BaseException, targets: list[Any]) -> list[str]:
-    """Dendrux traceback frames whose locals are, or directly hold, one of ``targets``."""
+    """Library traceback frames whose locals are, or directly hold, one of ``targets``."""
     found: list[str] = []
     tb = err.__traceback__
     while tb is not None:
         frame = tb.tb_frame
-        if f"{os.sep}dendrux{os.sep}" not in frame.f_code.co_filename:
+        # By module, not path: a checkout path may itself contain "dendrux".
+        if not frame.f_globals.get("__name__", "").startswith("dendrux."):
             tb = tb.tb_next
             continue
         for name, value in dict(frame.f_locals).items():
