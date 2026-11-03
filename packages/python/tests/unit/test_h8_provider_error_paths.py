@@ -349,11 +349,11 @@ EXTRA_CASES = [
     ("case", "obj", "chat_value", "router_value"), EXTRA_CASES, ids=[c[0] for c in EXTRA_CASES]
 )
 def test_extra_field_readers(case: str, obj: Any, chat_value: Any, router_value: Any) -> None:
-    from dendrux.llm import openai as chat_module
-    from dendrux.llm import openrouter as router_module
+    # The chat reasoning readers and the OpenRouter cost reader (shared in H8).
+    from dendrux.llm._openai_family import extra_field, usage_extra_field
 
-    assert chat_module._extra_attr(obj, "cost") == chat_value
-    assert router_module._read_usage_extra(obj, "cost") == router_value
+    assert extra_field(obj, "cost") == chat_value
+    assert usage_extra_field(obj, "cost") == router_value
 
 
 # ---------------------------------------------------------------------------
