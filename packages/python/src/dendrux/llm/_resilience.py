@@ -824,6 +824,7 @@ async def run_with_deadline(
         raise _deadline_error(state, reason=reason, limit=limit, provider=provider, model=model)
     finally:
         _call_state.reset(token)
+        del make_call
 
 
 async def call_with_timeout(
@@ -933,14 +934,17 @@ class StreamClock:
 
     async def open(self, make_call: Callable[[], Awaitable[T]]) -> T:
         when, reason, limit = self._next()
-        return await run_with_deadline(
-            make_call,
-            when=when,
-            reason=reason,
-            limit=limit,
-            provider=self.provider,
-            model=self.model,
-        )
+        try:
+            return await run_with_deadline(
+                make_call,
+                when=when,
+                reason=reason,
+                limit=limit,
+                provider=self.provider,
+                model=self.model,
+            )
+        finally:
+            del make_call
 
     async def step(self, awaitable: Awaitable[T]) -> T:
         when, reason, limit = self._next()

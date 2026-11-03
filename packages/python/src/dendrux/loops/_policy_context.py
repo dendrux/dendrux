@@ -29,6 +29,13 @@ def history_call_counts(history: Iterable[Message]) -> dict[str, int]:
     return counts
 
 
+def initial_call_counts(history: Iterable[Message], saved: dict[str, int] | None) -> dict[str, int]:
+    """Copy saved execution counts, including an empty snapshot, or count legacy history."""
+    if saved is not None:
+        return dict(saved)
+    return history_call_counts(history)
+
+
 def static_denial(name: str, call_id: str) -> tuple[ToolResult, dict[str, Any]]:
     """Build the model result and event data for a static policy denial."""
     message = f"Tool '{name}' is denied by policy."

@@ -661,6 +661,7 @@ class OpenAIResponsesProvider(OpenAIFamilyProvider):
     ) -> AsyncGenerator[StreamEvent, None]:
         """One streaming request: open, relay events, require the terminal event."""
         model = request.model
+        captured_request = request.captured_request
         # Accumulators for building the final LLMResponse
         text_parts: list[str] = []
         reasoning_parts: list[str] = []
@@ -802,9 +803,10 @@ class OpenAIResponsesProvider(OpenAIFamilyProvider):
             raise
         except Exception as exc:
             failure = raise_or_defer(self, exc, request.registry, model, streaming=True)
-        if failure is not None:
-            # Drop every request and SDK-stream alias before retaining this frame.
+        finally:
+            # Always drop request and SDK-stream aliases, including typed errors.
             del request, stream, iterator
+        if failure is not None:
             raise failure
 
         if _completed_response is None:
@@ -834,7 +836,7 @@ class OpenAIResponsesProvider(OpenAIFamilyProvider):
             stop_reason=stop_reason,
             raw_stop_reason=raw_stop_reason,
         )
-        llm_response.provider_request = request.captured_request
+        llm_response.provider_request = captured_request
         llm_response.model = model
         if hasattr(_completed_response, "model_dump"):
             llm_response.provider_response = _completed_response.model_dump()

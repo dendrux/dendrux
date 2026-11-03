@@ -131,8 +131,8 @@ async def test_static_denial_exact_result_event_and_execution_flag():
     assert live.all_results == approved.results == recovered.all_results == [(tc, expected)]
     assert history[-1].content == state.history[-1].content == recovered_history[-1].content
     assert history[-1].content == expected.payload
-    assert NOT_EXECUTED_META_KEY not in history[-1].meta
-    assert NOT_EXECUTED_META_KEY not in recovered_history[-1].meta
+    assert history[-1].meta[NOT_EXECUTED_META_KEY] is True
+    assert recovered_history[-1].meta[NOT_EXECUTED_META_KEY] is True
     assert state.history[-1].meta[NOT_EXECUTED_META_KEY] is True
     assert recorder.on_governance_event.await_count == 3
     for event in recorder.on_governance_event.call_args_list:
@@ -148,9 +148,9 @@ async def test_static_denial_exact_result_event_and_execution_flag():
 
 
 @pytest.mark.parametrize("reason", [None, 'human says "no"'])
-def test_recovery_decision_denial_keeps_scalar_payload(reason):
+def test_recovery_decision_denial_wraps_reason(reason):
     message = _recovery_denial(ToolCall("work", id="call"), reason)
-    assert message.content == json.dumps(reason)
+    assert message.content == json.dumps({"denied": reason})
     assert message.name == "work" and message.call_id == "call"
     assert message.meta["is_error"] is True
 
@@ -249,7 +249,9 @@ async def test_approved_decision_denial_keeps_wrapped_reason(storage_format):
         decisions={tc.id: ApprovalDecision(approved=False, reason="human_denied")},
         state_store=SimpleNamespace(storage_format=storage_format),
     )
-    assert result.results[0][1].payload == json.dumps({"denied": "human_denied"})
+    expected = json.dumps({"denied": "human_denied"})
+    assert result.results[0][1].payload == expected
+    assert _recovery_denial(tc, "human_denied").content == expected
     assert recorder.on_tool_started.await_count == (storage_format == 1)
 
 
