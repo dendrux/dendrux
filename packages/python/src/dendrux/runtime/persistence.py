@@ -292,9 +292,7 @@ class PersistenceRecorder(BaseRecorder):
     ) -> None:
         self._store = state_store
         self._cancel_guard = capture()
-        self._store_calls = (
-            self._cancel_guard.store_calls(state_store) if self._cancel_guard else state_store
-        )
+        self._store_calls = self._cancel_guard.store_calls(state_store)
         self._tenant_scope = tenant_scope
         self._provider = provider
         self._run_id = run_id
@@ -688,8 +686,7 @@ class PersistenceRecorder(BaseRecorder):
                     await self._checkpoint()
             # Ownership can still change between this read and the network send.
             await self._store_calls.get_run_control(run_id)
-        if self._cancel_guard is not None:
-            await self._cancel_guard.check(run_id)
+        await self._cancel_guard.check(run_id)
 
     async def checkpoint_outcome(self, result: Any, provider_kwargs: Any) -> None:
         """Store pause references and the last execution boundary before releasing ownership."""
@@ -1155,8 +1152,7 @@ class PersistenceRecorder(BaseRecorder):
                     self._run_id,
                     exc_info=safe_exception_info(),
                 )
-        if self._cancel_guard is not None:
-            await self._cancel_guard.check(run_id)
+        await self._cancel_guard.check(run_id)
 
     async def _start_checkpointed_tool(
         self, run_id: str, tool_call: ToolCall, iteration: int

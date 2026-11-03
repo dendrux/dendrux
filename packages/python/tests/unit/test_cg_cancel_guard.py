@@ -163,7 +163,7 @@ async def test_other_task_does_not_use_recorders_baseline():
 async def test_gate_off_has_no_guard_or_extra_suspension(monkeypatch):
     monkeypatch.setattr(_cancel_guard, "_ENABLED", False)
     persistence = recorder()
-    assert persistence._cancel_guard is None
+    await assert_inactive(persistence._cancel_guard)
     assert persistence._store_calls is persistence._store
     for operation in (
         persistence.on_llm_call_started(RUN_ID, 1),
@@ -173,13 +173,25 @@ async def test_gate_off_has_no_guard_or_extra_suspension(monkeypatch):
             operation.send(None)
 
 
+async def assert_inactive(guard):
+    store = object()
+    assert not isinstance(guard, _cancel_guard._CancelGuard)
+    assert guard.store_calls(store) is store
+    assert await guard.check("run") is None
+
+
 def test_capture_without_running_loop():
-    assert _cancel_guard.capture() is None
+    asyncio.run(assert_inactive(_cancel_guard.capture()))
 
 
 async def test_capture_without_current_task(monkeypatch):
     monkeypatch.setattr(_cancel_guard.asyncio, "current_task", lambda: None)
-    assert _cancel_guard.capture() is None
+    await assert_inactive(_cancel_guard.capture())
+
+
+async def test_capture_with_gate_off_is_inactive(monkeypatch):
+    monkeypatch.setattr(_cancel_guard, "_ENABLED", False)
+    await assert_inactive(_cancel_guard.capture())
 
 
 @pytest.mark.parametrize("stream", [False, True])

@@ -71,11 +71,21 @@ class _StoreCalls:
         return watched
 
 
-def capture() -> _CancelGuard | None:
-    if not _ENABLED:
+class _InactiveGuard:
+    """Stands in when the guard is off: stores pass through and checks do nothing."""
+
+    def store_calls(self, store: T) -> T:
+        return store
+
+    async def check(self, run_id: str) -> None:
         return None
+
+
+def capture() -> _CancelGuard | _InactiveGuard:
+    if not _ENABLED:
+        return _InactiveGuard()
     try:
         task = asyncio.current_task()
     except RuntimeError:
-        return None
-    return _CancelGuard(task) if task is not None else None
+        return _InactiveGuard()
+    return _CancelGuard(task) if task is not None else _InactiveGuard()
