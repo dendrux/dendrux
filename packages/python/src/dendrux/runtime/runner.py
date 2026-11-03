@@ -5979,6 +5979,13 @@ async def _resume_approval_work(
     return await _finish_approval_batch(run_id, ctx, expected, tool_results, approval, approving)
 
 
+def _initial_call_counts_kwargs(loop_method: Any, recorder: LoopRecorder) -> dict[str, Any]:
+    if not _accepts_kwarg(loop_method, "_initial_call_counts"):
+        return {}
+    counts = getattr(recorder, "execution_counts", lambda: None)()
+    return {"_initial_call_counts": counts}
+
+
 def _resumed_loop_kwargs(
     agent: Agent,
     provider: LLMProvider,
@@ -6006,6 +6013,7 @@ def _resumed_loop_kwargs(
         initial_usage=ctx.pause_state.usage,
         provider_kwargs=ctx.pause_state.provider_kwargs or None,
         state_store=store,
+        **_initial_call_counts_kwargs(loop_method, ctx.recorder),
         **carry,
         **images,
     )

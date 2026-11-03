@@ -80,7 +80,7 @@ from dendrux.loops._images import (
     tool_result_images_dropped,
 )
 from dendrux.loops._llm_call import ProviderCallSite
-from dendrux.loops._policy_context import history_call_counts, static_denial, tool_call_context
+from dendrux.loops._policy_context import initial_call_counts, static_denial, tool_call_context
 from dendrux.loops.base import Loop
 from dendrux.media._ids import IMAGE_ID_RE
 from dendrux.media._image import Image, ToolOutput
@@ -713,6 +713,7 @@ async def _init_loop_state(
     initial_history: list[Message] | None,
     initial_steps: list[AgentStep] | None,
     initial_usage: UsageStats | None,
+    _initial_call_counts: dict[str, int] | None = None,
     image_view_state: ImageViewState | None = None,
 ) -> _LoopState:
     """Initialize mutable loop state — shared between run() and run_stream()."""
@@ -727,7 +728,7 @@ async def _init_loop_state(
         history[-1] = user_msg
         await _notify_message(notifier, run_id, user_msg, 0)
 
-    call_counts = history_call_counts(history)
+    call_counts = initial_call_counts(history, _initial_call_counts)
 
     steps: list[AgentStep] = list(initial_steps) if initial_steps else []
     usage = UsageStats(
@@ -1670,6 +1671,7 @@ async def _start_run(
     initial_steps: list[AgentStep] | None,
     iteration_offset: int,
     initial_usage: UsageStats | None,
+    _initial_call_counts: dict[str, int] | None,
     provider_kwargs: dict[str, Any] | None,
     state_store: StateStore | None,
     budget_carry: BudgetCarry | None,
@@ -1691,6 +1693,7 @@ async def _start_run(
         initial_history=initial_history,
         initial_steps=initial_steps,
         initial_usage=initial_usage,
+        _initial_call_counts=_initial_call_counts,
         image_view_state=image_view_state,
     )
     images = ImageCallSite(
@@ -2350,6 +2353,7 @@ class ReActLoop(Loop):
         initial_steps: list[AgentStep] | None = None,
         iteration_offset: int = 0,
         initial_usage: UsageStats | None = None,
+        _initial_call_counts: dict[str, int] | None = None,
         provider_kwargs: dict[str, Any] | None = None,
         output_type: type[BaseModel] | None = None,
         initial_pii_mapping: dict[str, str] | None = None,
@@ -2378,6 +2382,7 @@ class ReActLoop(Loop):
             initial_steps=initial_steps,
             iteration_offset=iteration_offset,
             initial_usage=initial_usage,
+            _initial_call_counts=_initial_call_counts,
             provider_kwargs=provider_kwargs,
             state_store=state_store,
             budget_carry=budget_carry,
@@ -2586,6 +2591,7 @@ class ReActLoop(Loop):
         initial_steps: list[AgentStep] | None = None,
         iteration_offset: int = 0,
         initial_usage: UsageStats | None = None,
+        _initial_call_counts: dict[str, int] | None = None,
         provider_kwargs: dict[str, Any] | None = None,
         output_type: type[BaseModel] | None = None,
         state_store: StateStore | None = None,
@@ -2614,6 +2620,7 @@ class ReActLoop(Loop):
             initial_steps=initial_steps,
             iteration_offset=iteration_offset,
             initial_usage=initial_usage,
+            _initial_call_counts=_initial_call_counts,
             provider_kwargs=provider_kwargs,
             state_store=state_store,
             budget_carry=budget_carry,

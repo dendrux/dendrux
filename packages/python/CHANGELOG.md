@@ -200,6 +200,8 @@
 
 ### Fixed
 
+- Resumed loops initialize tool call limits from saved execution counts, falling back to history for legacy runs.
+
 - Denied tool calls no longer consume a tool’s per-run call limit after resuming.
 
 - Streaming recovery marks dispatched work before side effects and finalizes subsequent failures.
