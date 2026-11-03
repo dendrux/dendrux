@@ -53,6 +53,27 @@ a regression.
 | `make semgrep` | `tools/semgrep_ratchet.py` | A rule in `.semgrep/dendrux.yml` has a new match, or more matches in a function that already had some; or a rule stops passing its fixture. Baseline: `semgrep_baseline.json` (rule, module, function). |
 | `make crap` | `tools/crap_ratchet.py` | A new function scores above 30; complexity rises and the function scores above 30; or edited code exceeds its own recorded CRAP baseline. An edited function may remain above 30 when neither complexity nor CRAP rises. Unchanged code retains the 0.5-point noise band and the warning allowance for rises up to 25 percent. Backend-only local coverage is handled explicitly below. Needs `coverage.json` from `make test`. Baseline: `crap_baseline.json`. |
 
+### Semgrep rules that stop a shared definition being copied
+
+Each rule has one definition site; the same value or step written anywhere else is a match.
+Path scope and `allow_in` (module:function) live in the rule's `metadata`; `allow_in` lists
+only places that need the copy today.
+
+| Rule | Copy it stops (definition site) |
+|---|---|
+| `stored-event-name-literal` | a stored event name as a string (`StoredEventType`, `_lifecycle.py`; migrations excluded) |
+| `lifecycle-reason-literal` | a failure, cancel, pause, approval or denial reason as a string (`_lifecycle.py`, `_codes.py`) |
+| `storage-format-literal` | a number 2 compared with or assigned to `storage_format` (`STORAGE_FORMAT_CHECKPOINTED`) |
+| `meta-key-literal` | a `dendrux.*` metadata or session key as a string (`_meta_keys.py`) |
+| `default-sqlite-url-literal` | `./dendrux.db` outside `db/session.py` (`_codes.py` messages excluded) |
+| `connection-loss-code-copy` | `startswith("08")` and `57P01` to `57P03` outside `_is_connection_loss_code` |
+| `new-run-fingerprint-outside-helper` | `compute_idempotency_fingerprint(` and the output-type name string outside `_new_run_metadata` |
+| `run-started-outside-startup` | `StoredEventType.RUN_STARTED` passed to an event write outside `_start_new_run` |
+| `error-finalize-outside-helper` | finalizing with the error status or writing `run.error` outside `_persist_run_failure` |
+| `cancel-finalize-outside-helper` | finalizing with the cancelled status outside `_persist_run_cancellation` (and the listed cancel paths) |
+
+`hardcoded-terminal-status-set` also matches `RunStatus.X.value` operands.
+
 ## Reading a failure
 
 Each failure line names the gate, the problem and where: `NEW` is a problem that was not in

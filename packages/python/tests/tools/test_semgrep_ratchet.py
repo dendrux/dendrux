@@ -273,3 +273,102 @@ def test_safe_exception_reporting_is_not_flagged(tmp_path: Path) -> None:
         + "        text = str(exc)\n"
     )
     assert _clean_then_bad(tmp_path, clean, safe) == 0
+
+
+# --- shared-vocabulary rules: allow_in is exact, and path scope keeps definitions out.
+# Each test builds one scratch tree and runs Semgrep once. ---
+
+_FUNCTION = "async def {name}(store, run_id, code, name, text):\n    {body}\n\n"
+_METHOD = "class {cls}:\n    async def {name}(self, store, run_id):\n        {body}\n\n"
+_FAIL = "await store.finalize_run(run_id, status=RunStatus.ERROR.value)"
+_REBUILD = "await store.finalize_with_event(run_id, status=RunStatus.ERROR.value, event_type=EV)"
+_CANCEL = "await store.finalize_run(run_id, status=RunStatus.CANCELLED.value)"
+_STARTED = "await _emit_event(store, run_id, StoredEventType.RUN_STARTED.value, {})"
+_FINGERPRINT = "fp = compute_idempotency_fingerprint(name, text)"
+_OUTPUT_NAME = 'fp = f"{name.__module__}.{name.__qualname__}"'
+_LOSS = 'return code.startswith("08")'
+
+# (file, template, class, allowed function, body); the class is empty for a module function
+ALLOWED_COPIES = [
+    ("runtime/runner.py", _FUNCTION, "", "_persist_run_failure", _FAIL),
+    ("runtime/_reclaim.py", _FUNCTION, "", "_handle_rebuild_failure", _REBUILD),
+    ("runtime/runner.py", _FUNCTION, "", "_persist_run_cancellation", _CANCEL),
+    ("runtime/runner.py", _FUNCTION, "", "_finalize_loop_cancelled", _CANCEL),
+    ("runtime/runner.py", _FUNCTION, "", "_pause_with_event", _CANCEL),
+    ("agent.py", _METHOD, "Agent", "_cancel_one", _CANCEL),
+    ("runtime/runner.py", _FUNCTION, "", "_start_new_run", _STARTED),
+    ("runtime/runner.py", _FUNCTION, "", "_new_run_metadata", _FINGERPRINT),
+    ("runtime/runner.py", _FUNCTION, "", "_new_run_metadata", _OUTPUT_NAME),
+    ("runtime/runner.py", _FUNCTION, "", "_idempotent_hit_after_image_error", _FINGERPRINT),
+    ("runtime/stores/_errors.py", _FUNCTION, "", "_is_connection_loss_code", _LOSS),
+]
+
+
+@SKIP_NO_SEMGREP
+def test_an_allowed_shape_passes_only_in_its_own_function(tmp_path: Path) -> None:
+    files: dict[str, str] = {}
+    expected: set[tuple[str, str]] = set()
+    for where, template, cls, name, body in ALLOWED_COPIES:
+        module = "dendrux." + where.removesuffix(".py").replace("/", ".")
+        # The allowed place first, then the same code in the wrong place (another name and,
+        # for a method, another class): only the wrong places may be reported.
+        wrong = [("Other", name), (cls, "somewhere_else")] if cls else [("", "somewhere_else")]
+        for place_cls, place_name in [(cls, name), *wrong]:
+            files[where] = files.get(where, "") + template.format(
+                cls=place_cls, name=place_name, body=body
+            )
+        expected.update((module, f"{c}.{n}" if c else n) for c, n in wrong)
+    keys = sr.collect_keys(_scratch_tree(tmp_path, files))
+    assert {tuple(key.split("|")[1:]) for key in keys} == expected
+
+
+@SKIP_NO_SEMGREP
+def test_definition_sites_and_historical_migrations_are_out_of_scope(tmp_path: Path) -> None:
+    definitions = {
+        "_lifecycle.py": (
+            'RUN_STARTED = "run.started"\nSTALE = "stale_running"\n'
+            'CHECKPOINTED = {"storage_format": 2}\n'
+        ),
+        "_codes.py": 'STALE = "stale_running"\nHELP = "Start with ./dendrux.db or set the URL."\n'
+        'LOST = ("57P01", "57P02")\n',
+        "_meta_keys.py": 'PARTS = "dendrux.parts"\n',
+        "db/session.py": 'DEFAULT = "sqlite+aiosqlite:///./dendrux.db"\n',
+        "db/migrations/versions/old.py": (
+            'EVENT = "run.started"\nREASON = {"reason": "cancel_requested"}\n'
+        ),
+        "runtime/stores/sql/base.py": (
+            "async def f(store, run_id):\n"
+            "    await store.finalize_run(run_id, status=RunStatus.CANCELLED.value)\n"
+        ),
+        "guardrails/_protocol.py": 'GID = f"{kind.__module__}.{kind.__qualname__}"\n',
+        "m.py": (
+            'PendingPause.__module__ = "dendrux.store"\n'
+            "def f(code):\n    return code == '53300' or code.startswith('23')\n"
+        ),
+    }
+    assert sr.collect_keys(_scratch_tree(tmp_path, definitions)) == {}
+
+
+@SKIP_NO_SEMGREP
+def test_a_copy_of_a_shared_value_outside_its_module_is_flagged(tmp_path: Path) -> None:
+    copies = {
+        "event": 'EVENT = "run.started"',
+        "reason": 'REASON = {"reason": "stale_running"}',
+        "storage": "FORMAT_OK = record.storage_format == 2",
+        "meta": 'PARTS = meta["dendrux.parts"]',
+        "url": 'URL = "sqlite+aiosqlite:///./dendrux.db"',
+        "loss": 'LOST = code in ("57P01", "57P03")',
+    }
+    source = "".join(
+        f"def {name}(record, code, meta):\n    {line}\n" for name, line in copies.items()
+    )
+    keys = sr.collect_keys(_scratch_tree(tmp_path, {"runtime/m.py": source}))
+    assert {key.split("|")[0] for key in keys} == {
+        "stored-event-name-literal",
+        "lifecycle-reason-literal",
+        "storage-format-literal",
+        "meta-key-literal",
+        "default-sqlite-url-literal",
+        "connection-loss-code-copy",
+    }
+    assert {key.rsplit("|", 1)[1] for key in keys} == set(copies)
