@@ -55,6 +55,7 @@ from dendrux.loops._helpers import (
     StreamInterruptedError,
     build_cache_key_prefix,
     final_stop_reason,
+    governance_sinks,
     guardrail_meta,
     interruptible,
     lease_scope,
@@ -1784,8 +1785,7 @@ class ReActLoop(Loop):
                     with telemetry_context(
                         run_id=resolved_run_id,
                         iteration=iteration,
-                        recorder=recorder,
-                        notifier=notifier,
+                        sinks=governance_sinks(recorder, notifier, resolved_run_id),
                     ):
                         async with lease_scope(recorder):
                             response = await complete_call(
@@ -2401,8 +2401,7 @@ class ReActLoop(Loop):
                 ),
                 run_id=resolved_run_id,
                 iteration=iteration,
-                recorder=recorder,
-                notifier=notifier,
+                sinks=governance_sinks(recorder, notifier, resolved_run_id),
             )
             partial_text: list[str] = []
             # Text after a tool block in the same call is known commentary.
@@ -2546,8 +2545,7 @@ class ReActLoop(Loop):
                         ),
                         run_id=resolved_run_id,
                         iteration=iteration,
-                        recorder=recorder,
-                        notifier=notifier,
+                        sinks=governance_sinks(recorder, notifier, resolved_run_id),
                     )
             finally:
                 await active_stream.aclose()

@@ -20,6 +20,7 @@ from dendrux.llm._retry_telemetry import (
     make_telemetry_http_client,
     telemetry_context,
 )
+from dendrux.loops._helpers import governance_sinks
 from dendrux.loops.base import BaseRecorder
 
 
@@ -72,8 +73,7 @@ async def test_hook_emits_retry_event_on_retryable_failure() -> None:
         telemetry_context(
             run_id="run-1",
             iteration=2,
-            recorder=recorder,
-            notifier=notifier,
+            sinks=governance_sinks(recorder, notifier, "run-1"),
         ),
         call_attempt_tracking(),
     ):
@@ -103,7 +103,9 @@ async def test_hook_counts_attempts_within_one_logical_call() -> None:
     client._transport = _seq_transport(503, 429, 200)  # type: ignore[attr-defined]
 
     with (
-        telemetry_context(run_id="run-2", iteration=1, recorder=recorder, notifier=None),
+        telemetry_context(
+            run_id="run-2", iteration=1, sinks=governance_sinks(recorder, None, "run-2")
+        ),
         call_attempt_tracking(),
     ):
         # Three sequential calls within one tracking scope —
@@ -130,7 +132,9 @@ async def test_attempt_counter_resets_between_calls() -> None:
     client = make_telemetry_http_client(httpx.Timeout(10.0))
     client._transport = _seq_transport(503, 503, 503, 503)  # type: ignore[attr-defined]
 
-    with telemetry_context(run_id="run-3", iteration=1, recorder=recorder, notifier=None):
+    with telemetry_context(
+        run_id="run-3", iteration=1, sinks=governance_sinks(recorder, None, "run-3")
+    ):
         # First logical call (2 retryable responses)
         with call_attempt_tracking():
             await client.get("https://api.example.com/v1/messages")
@@ -155,7 +159,9 @@ async def test_non_retryable_status_codes_do_not_emit() -> None:
     client._transport = _seq_transport(401, 404, 422)  # type: ignore[attr-defined]
 
     with (
-        telemetry_context(run_id="run-4", iteration=1, recorder=recorder, notifier=None),
+        telemetry_context(
+            run_id="run-4", iteration=1, sinks=governance_sinks(recorder, None, "run-4")
+        ),
         call_attempt_tracking(),
     ):
         await client.get("https://api.example.com/v1/messages")
@@ -201,7 +207,9 @@ async def test_recorder_failure_is_swallowed_not_propagated() -> None:
     client._transport = _seq_transport(503)  # type: ignore[attr-defined]
 
     with (
-        telemetry_context(run_id="run-5", iteration=1, recorder=_BrokenRecorder(), notifier=None),
+        telemetry_context(
+            run_id="run-5", iteration=1, sinks=governance_sinks(_BrokenRecorder(), None, "run-5")
+        ),
         call_attempt_tracking(),
     ):
         response = await client.get("https://api.example.com/v1/messages")
@@ -218,7 +226,9 @@ async def test_token_based_call_tracking_resets_correctly() -> None:
     client = make_telemetry_http_client(httpx.Timeout(10.0))
     client._transport = _seq_transport(503, 503)  # type: ignore[attr-defined]
 
-    with telemetry_context(run_id="run-6", iteration=1, recorder=recorder, notifier=None):
+    with telemetry_context(
+        run_id="run-6", iteration=1, sinks=governance_sinks(recorder, None, "run-6")
+    ):
         token = begin_call_attempt_tracking()
         try:
             await client.get("https://api.example.com/v1/messages")

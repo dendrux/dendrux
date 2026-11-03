@@ -23,6 +23,7 @@ from dendrux.llm._retry_telemetry import (
     make_telemetry_http_client,
     telemetry_context,
 )
+from dendrux.loops._helpers import governance_sinks
 from dendrux.loops.base import BaseNotifier, BaseRecorder
 
 if TYPE_CHECKING:
@@ -50,7 +51,11 @@ async def _one_retryable_response(recorder: Any, notifier: Any) -> None:
     client._transport = httpx.MockTransport(lambda request: httpx.Response(503))  # type: ignore[attr-defined]
     try:
         with (
-            telemetry_context(run_id="run-leak", iteration=1, recorder=recorder, notifier=notifier),
+            telemetry_context(
+                run_id="run-leak",
+                iteration=1,
+                sinks=governance_sinks(recorder, notifier, "run-leak"),
+            ),
             call_attempt_tracking(),
         ):
             await client.get("https://api.example.com/v1/chat/completions")
@@ -100,6 +105,8 @@ async def test_hook_failure_is_logged_and_swallowed(caplog: pytest.LogCaptureFix
 
     response = httpx.Response(503, request=httpx.Request("GET", "https://x.test/v1/a"))
     response.headers = Exploding()  # type: ignore[assignment]
-    with telemetry_context(run_id="r", iteration=1, recorder=_FailingRecorder(), notifier=None):
+    with telemetry_context(
+        run_id="r", iteration=1, sinks=governance_sinks(_FailingRecorder(), None, "r")
+    ):
         await telemetry._on_response(response)
     assert "retry telemetry hook raised" in caplog.text
