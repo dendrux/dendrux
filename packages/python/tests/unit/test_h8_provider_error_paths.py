@@ -357,7 +357,7 @@ def test_extra_field_readers(case: str, obj: Any, chat_value: Any, router_value:
 
 
 # ---------------------------------------------------------------------------
-# B12: provider labels on tool-call warnings (pinned as today)
+# B12: provider labels on tool-call warnings
 # ---------------------------------------------------------------------------
 
 
@@ -391,8 +391,11 @@ def _malformed_tool_stream() -> Callable[[httpx.Request], httpx.Response]:
     ("adapter", "model", "logged"),
     [
         ("chat", "gpt-4o", "provider=openai model=gpt-4o"),
-        # Drift (named-fix candidate): OpenRouter reports itself as "openai".
-        ("openrouter", "deepseek/deepseek-chat", "provider=openai model=deepseek/deepseek-chat"),
+        (
+            "openrouter",
+            "deepseek/deepseek-chat",
+            "provider=openrouter model=deepseek/deepseek-chat",
+        ),
     ],
 )
 async def test_malformed_stream_tool_call_label(
@@ -408,12 +411,73 @@ async def test_malformed_stream_tool_call_label(
     assert logged in caplog.text
 
 
-async def test_openrouter_per_call_model_is_not_the_logged_model(
+async def test_openrouter_per_call_model_is_the_logged_model(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """B12 drift pinned: the warning names the constructor model, not the call's model."""
+    """Malformed tool-call logs identify the adapter and the model of this call."""
     caplog.set_level(logging.WARNING, logger="dendrux")
-    provider = _router()
+    provider = OpenRouterProvider(model="x/a", api_key="test-key", max_retries=0)
     wire_openai(provider, _malformed_tool_stream())
-    _ = [e async for e in provider.complete_stream(TEXT, model="qwen/qwen3")]
-    assert "provider=openai model=deepseek/deepseek-chat" in caplog.text
+    _ = [e async for e in provider.complete_stream(TEXT, model="q/b")]
+    assert "provider=openrouter model=q/b" in caplog.text
+
+
+async def test_openrouter_missing_tool_name_uses_per_call_model(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING, logger="dendrux")
+    provider = OpenRouterProvider(model="x/a", api_key="test-key", max_retries=0)
+    chunk = _chat_chunk("")
+    chunk["choices"][0]["delta"] = {
+        "tool_calls": [
+            {
+                "index": 0,
+                "id": "call_X",
+                "type": "function",
+                "function": {"arguments": "{}"},
+            }
+        ]
+    }
+    chunk["choices"][0]["finish_reason"] = "tool_calls"
+    wire_openai(provider, sse_response((None, chunk), (None, "[DONE]")))
+    _ = [event async for event in provider.complete_stream(TEXT, model="q/b")]
+    assert "Tool call completed with no name — provider=openrouter model=q/b" in caplog.text
+
+
+async def test_openrouter_batch_tool_warning_uses_per_call_model(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING, logger="dendrux")
+    provider = OpenRouterProvider(model="x/a", api_key="test-key", max_retries=0)
+    wire_openai(
+        provider,
+        json_response(
+            200,
+            {
+                "id": "c1",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "q/b",
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "tool_calls",
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "call_X",
+                                    "type": "function",
+                                    "function": {"name": "add", "arguments": "{not json"},
+                                }
+                            ],
+                        },
+                    }
+                ],
+            },
+        ),
+    )
+    response = await provider.complete(TEXT, model="q/b")
+    assert response.tool_calls and response.tool_calls[0].parse_error is not None
+    assert "provider=openrouter model=q/b" in caplog.text

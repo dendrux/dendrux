@@ -200,6 +200,7 @@
 
 ### Fixed
 
+- OpenRouter tool-call warnings identify the adapter and the model selected for each call.
 - OpenAI Responses no longer sends prompt cache keys or retention to non-OpenAI endpoints.
 
 ## 0.5.0 - 2026-10-28
