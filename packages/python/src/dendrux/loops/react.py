@@ -2789,6 +2789,8 @@ class ReActLoop(Loop):
             prepared, llm_duration_ms, llm_response = ctx.calls.settle(
                 call.prepared, call.response, call.t0
             )
+            # The call still holds the byte-bearing request; only the released one goes on.
+            del call
             step, limited = await _after_response(
                 ctx,
                 llm_response,

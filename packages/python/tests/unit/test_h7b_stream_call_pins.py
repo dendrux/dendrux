@@ -605,6 +605,28 @@ async def test_single_exception_thrown_at_a_delta_is_a_failed_call(trace: Trace)
     assert trace.lines == SINGLE_THROWN
 
 
+async def _completion_record_fails(self: Any, *args: Any, **kw: Any) -> None:
+    raise RuntimeError("completion record unavailable")
+
+
+def _sent_image_bytes(wires: list[Any]) -> bool:
+    return any(getattr(part, "data", None) for w in wires for m in w for part in m.parts or [])
+
+
+@pytest.mark.parametrize("loop", ["react", "single"])
+async def test_success_then_record_error_holds_no_wire(
+    trace: Trace, monkeypatch: pytest.MonkeyPatch, loop: str
+) -> None:
+    """An image call succeeds, then recording it fails: no frame keeps the image request."""
+    monkeypatch.setattr(ProbeRecorder, "on_llm_call_completed", _completion_record_fails)
+    drive = _react if loop == "react" else _single
+    scripts = [Script(text("ok"), done(LLMResponse(text="ok")))]
+    probe, err = await drive(trace, scripts, images=True)
+    assert isinstance(err, RuntimeError) and str(err) == "completion record unavailable"
+    assert _sent_image_bytes(probe.wires)
+    assert _holders(err, probe.wires) == []
+
+
 # --------------------------------------------------------------------------- expected traces
 # Captured from the code before H7b (2320646d).
 

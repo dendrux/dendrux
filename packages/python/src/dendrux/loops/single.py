@@ -719,6 +719,8 @@ class SingleCall(Loop):
         prepared, llm_duration_ms, response = calls.settle(
             called.prepared, called.response, called.t0
         )
+        # The attempt still holds the byte-bearing request; only the released one goes on.
+        del called
 
         # Output guardrail — detection-only. Persistence stores raw
         # (DB is ground truth); block policies abort the run, findings
@@ -1015,6 +1017,8 @@ class SingleCall(Loop):
         prepared, llm_duration_ms, llm_response = calls.settle(
             call.prepared, call.response, call.t0
         )
+        # The call still holds the byte-bearing request; only the released one goes on.
+        del call
 
         await record_llm(
             recorder,

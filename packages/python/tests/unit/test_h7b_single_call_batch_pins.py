@@ -33,7 +33,13 @@ from dendrux.types import (
     UsageStats,
 )
 from tests.unit.test_guardrail_images import RAW, NsfwScan
-from tests.unit.test_h7b_stream_call_pins import ProbeRecorder, Trace, _holders
+from tests.unit.test_h7b_stream_call_pins import (
+    ProbeRecorder,
+    Trace,
+    _completion_record_fails,
+    _holders,
+    _sent_image_bytes,
+)
 from tests.unit.test_loop_images import (
     ControlStore,
     ImageLLM,
@@ -297,6 +303,17 @@ async def test_outgoing_block(trace: Trace) -> None:
     )
     assert err is None
     assert trace.lines == OUTGOING_BLOCK
+
+
+async def test_success_then_record_error_holds_no_wire(
+    trace: Trace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An image call succeeds, then recording it fails: no frame keeps the image request."""
+    monkeypatch.setattr(BatchRecorder, "on_llm_call_completed", _completion_record_fails)
+    probe, err = await _run(trace, [LLMResponse(text="ok")], image=PNG)
+    assert isinstance(err, RuntimeError) and str(err) == "completion record unavailable"
+    assert _sent_image_bytes(probe.wires)
+    assert _holders(err, probe.wires) == []
 
 
 # --------------------------------------------------------------------------- expected traces
