@@ -1,0 +1,5 @@
+[
+  "BEGIN",
+  "UPDATE agent_runs SET status_changed_at=CASE WHEN (agent_runs.status != ?) THEN ? ELSE agent_runs.status_changed_at END, status=?, error=?, pause_data=?, cancel_requested=?, pause_requested=?, updated_at=? WHERE agent_runs.id = ? AND agent_runs.status = ?",
+  "COMMIT"
+]

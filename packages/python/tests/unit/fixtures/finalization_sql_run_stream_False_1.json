@@ -1,0 +1,11 @@
+[
+  "BEGIN",
+  "UPDATE agent_runs SET status_changed_at=CASE WHEN (agent_runs.status != ?) THEN ? ELSE agent_runs.status_changed_at END, status=?, output_data=?, pause_data=?, cancel_requested=?, pause_requested=?, updated_at=? WHERE agent_runs.id = ? AND agent_runs.status = ? AND agent_runs.claim_epoch = ?",
+  "COMMIT",
+  "BEGIN",
+  "SELECT agent_runs.cancel_requested, agent_runs.pause_requested, EXISTS (SELECT ? AS anon_2 FROM run_inbox WHERE run_inbox.run_id = agent_runs.id AND run_inbox.delivered_at IS NULL) AS anon_1, agent_runs.claim_epoch, agent_runs.status FROM agent_runs WHERE agent_runs.id = ?",
+  "ROLLBACK",
+  "BEGIN",
+  "SELECT agent_runs.id, agent_runs.tenant_id, agent_runs.agent_name, agent_runs.status, agent_runs.input_data, agent_runs.output_data, agent_runs.iteration_count, agent_runs.model, agent_runs.strategy, agent_runs.parent_run_id, agent_runs.delegation_level, agent_runs.retry_of_run_id, agent_runs.total_input_tokens, agent_runs.total_output_tokens, agent_runs.total_cost_usd, agent_runs.total_cache_read_tokens, agent_runs.total_cache_creation_tokens, agent_runs.total_reasoning_tokens, agent_runs.meta, agent_runs.pause_data, agent_runs.pii_mapping, agent_runs.error, agent_runs.last_progress_at, agent_runs.failure_reason, agent_runs.idempotency_key, agent_runs.idempotency_fingerprint, agent_runs.cancel_requested, agent_runs.pause_requested, agent_runs.claim_epoch, agent_runs.storage_format, agent_runs.reclaim_attempts, agent_runs.reclaim_limit, agent_runs.lease_expired_at, agent_runs.last_reclaimed_at, agent_runs.loop_state, agent_runs.trace_link, agent_runs.created_at, agent_runs.updated_at, agent_runs.status_changed_at FROM agent_runs WHERE agent_runs.id = ?",
+  "ROLLBACK"
+]
