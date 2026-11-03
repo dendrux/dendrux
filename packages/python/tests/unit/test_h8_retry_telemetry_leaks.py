@@ -1,34 +1,26 @@
-"""Sentinel leak scan of the retry-telemetry warnings (H8).
+"""Retry telemetry warnings omit database statements and their parameters.
 
-The hook logs a failed recorder write with ``exc_info=True``. For a database
-failure that carries the statement (and so request data), ``exc_info=True``
-puts the sentinel in the log text, where the loop helpers'
-``safe_exception_info()`` would replace the error with a bare
-``PersistenceError``. Pinned as today; listed as a named-fix candidate.
-The notifier path goes through ``notify_governance``, which already logs with
-``safe_exception_info()``: no sentinel.
+Production notifier callbacks also retain their safe exception projection.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import httpx
+import pytest
 from sqlalchemy.exc import OperationalError
 
-from dendrux.errors import safe_exception_info
 from dendrux.llm._resilience import RETRYABLE_HTTP_STATUSES
 from dendrux.llm._retry_telemetry import (
+    TelemetrySinks,
     call_attempt_tracking,
     make_telemetry_http_client,
     telemetry_context,
 )
 from dendrux.loops._helpers import governance_sinks
 from dendrux.loops.base import BaseNotifier, BaseRecorder
-
-if TYPE_CHECKING:
-    import pytest
 
 SECRET = "SECRET-H8-sink-91c2"
 
@@ -72,18 +64,14 @@ def _formatted(caplog: pytest.LogCaptureFixture, message: str) -> str:
     return handler.format(records[0])
 
 
-async def test_recorder_sink_failure_log_today_formats_the_db_statement(
+async def test_recorder_sink_failure_log_omits_the_db_statement(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     caplog.set_level(logging.WARNING, logger="dendrux")
     await _one_retryable_response(_FailingRecorder(), None)
     text = _formatted(caplog, "provider.retry recorder write failed")
-    # Today: exc_info=True formats the full DB error (named-fix candidate).
-    assert SECRET in text
-    # What safe_exception_info() would have logged instead: no sentinel.
-    safe = safe_exception_info(_db_error())
-    assert isinstance(safe, tuple)
-    assert SECRET not in "".join(str(part) for part in safe[:2])
+    assert SECRET not in text
+    assert "INSERT INTO" not in text
 
 
 async def test_notifier_sink_failure_is_logged_safely(caplog: pytest.LogCaptureFixture) -> None:
@@ -94,13 +82,19 @@ async def test_notifier_sink_failure_is_logged_safely(caplog: pytest.LogCaptureF
     assert "provider.retry notifier broadcast failed" not in caplog.text
 
 
-async def test_hook_failure_is_logged_and_swallowed(caplog: pytest.LogCaptureFixture) -> None:
+@pytest.mark.parametrize("database_failure", [False, True])
+async def test_hook_failure_is_logged_and_swallowed(
+    caplog: pytest.LogCaptureFixture,
+    database_failure: bool,
+) -> None:
     """The outer fail-open guard keeps its wording."""
     caplog.set_level(logging.WARNING, logger="dendrux")
 
     class Exploding:
         def get(self, name: str, default: Any = None) -> Any:
-            raise RuntimeError(f"header read {SECRET}")
+            if database_failure:
+                raise _db_error()
+            raise RuntimeError("header read failed")
 
     from dendrux.llm import _retry_telemetry as telemetry
 
@@ -110,4 +104,22 @@ async def test_hook_failure_is_logged_and_swallowed(caplog: pytest.LogCaptureFix
         run_id="r", iteration=1, sinks=governance_sinks(_FailingRecorder(), None, "r")
     ):
         await telemetry._on_response(response, retryable_statuses=RETRYABLE_HTTP_STATUSES)
-    assert "retry telemetry hook raised" in caplog.text
+    assert SECRET not in _formatted(caplog, "retry telemetry hook raised")
+
+
+async def test_direct_notifier_sink_failure_log_omits_the_db_statement(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from dendrux.llm import _retry_telemetry as telemetry
+
+    caplog.set_level(logging.WARNING, logger="dendrux")
+
+    async def fail(*args: Any) -> None:
+        raise _db_error()
+
+    response = httpx.Response(503, request=httpx.Request("GET", "https://x.test/v1/a"))
+    with telemetry_context(run_id="r", iteration=1, sinks=TelemetrySinks(None, fail)):
+        await telemetry._on_response(response, retryable_statuses=RETRYABLE_HTTP_STATUSES)
+    text = _formatted(caplog, "provider.retry notifier broadcast failed")
+    assert SECRET not in text
+    assert "INSERT INTO" not in text

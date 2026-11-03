@@ -200,6 +200,7 @@
 
 ### Fixed
 
+- Provider retry telemetry warnings omit SQL statements and parameters from database failures.
 - OpenAI Chat, Responses and OpenRouter streaming image failures release request holders from tracebacks.
 - Anthropic image-bearing streaming failures drop the SDK stream from traceback locals.
 - OpenRouter tool-call warnings identify the adapter and the model selected for each call.
