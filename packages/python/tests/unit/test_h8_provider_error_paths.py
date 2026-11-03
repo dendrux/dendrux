@@ -4,18 +4,17 @@ Captured from the code before the H8 helper move, at the HTTP layer (httpx
 mock transport, real SDK), for Chat, Responses and OpenRouter:
 
 * a connection failure in ``complete`` and a broken stream after a delta;
-* an image-bearing rejection: typed, unchained, no image bytes in the error or
-  the logs, and the wire request / image registry not reachable from the
-  raised error's traceback frames (batch). Streams are pinned as they are
-  today: the ``WireRequest`` is still a local of ``complete_stream`` and
-  ``_stream_attempt`` (a named-fix candidate), and the SDK stream object is not;
-* drift kept on purpose (B3, B11, B12), so the move cannot change it by accident.
+* image-bearing rejections are typed and unchained, with no image bytes in
+  errors or logs and no wire request retained in the streaming traceback;
+* adapter labels, stream cleanup, lifecycle and extra-field readers.
 """
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
+from types import AsyncGeneratorType, GeneratorType
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -119,6 +118,42 @@ def _holders(err: BaseException) -> dict[str, list[str]]:
         )
         if names:
             found[frame.f_code.co_name] = names
+        tb = tb.tb_next
+    return found
+
+
+def _reachable_request_holders(err: BaseException, sensitive_ids: set[int]) -> set[str]:
+    found: set[str] = set()
+
+    def visit(value: Any, path: str, depth: int, seen: set[int]) -> None:
+        identity = id(value)
+        if identity in sensitive_ids or isinstance(value, WireRequest | WireImageRegistry):
+            found.add(path)
+            return
+        if identity in seen:
+            return
+        seen.add(identity)
+        if isinstance(value, functools.partial):
+            visit(value.args, path + ".args", depth, seen)
+            visit(value.keywords, path + ".keywords", depth, seen)
+        elif isinstance(value, AsyncGeneratorType | GeneratorType):
+            frame = value.ag_frame if isinstance(value, AsyncGeneratorType) else value.gi_frame
+            if frame is not None:
+                visit(frame.f_locals, path + ".frame", depth, seen)
+        elif isinstance(value, dict):
+            for key, item in value.items():
+                visit(item, f"{path}[{key}]", depth, seen)
+        elif isinstance(value, tuple | list):
+            for index, item in enumerate(value):
+                visit(item, f"{path}[{index}]", depth, seen)
+        elif depth:
+            for name, item in getattr(value, "__dict__", {}).items():
+                visit(item, path + "." + name, depth - 1, seen)
+
+    tb = err.__traceback__
+    while tb is not None:
+        for name, value in tb.tb_frame.f_locals.items():
+            visit(value, tb.tb_frame.f_code.co_name + "." + name, 1, set())
         tb = tb.tb_next
     return found
 
@@ -245,11 +280,24 @@ STREAM_REJECTIONS = {
 
 
 @pytest.mark.parametrize("adapter", sorted(FACTORIES))
-async def test_image_rejection_mid_stream(adapter: str, caplog: pytest.LogCaptureFixture) -> None:
+async def test_image_rejection_mid_stream(
+    adapter: str,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     caplog.set_level(logging.DEBUG, logger="dendrux")
     factory, label = FACTORIES[adapter]
     provider = factory()
     wire_openai(provider, STREAM_REJECTIONS[adapter]())
+    sensitive_ids: set[int] = set()
+    original = provider._wire_request
+
+    def capture_request(*args: Any, **kwargs: Any) -> WireRequest:
+        request = original(*args, **kwargs)
+        sensitive_ids.update((id(request), id(request.registry), id(request.api_kwargs)))
+        return request
+
+    monkeypatch.setattr(provider, "_wire_request", capture_request)
     seen: list[Any] = []
     with pytest.raises(ImageRejectedError) as info:
         async for event in provider.complete_stream(USER_IMAGE):
@@ -261,24 +309,28 @@ async def test_image_rejection_mid_stream(adapter: str, caplog: pytest.LogCaptur
     assert_clean(err)
     for marker in LEAK_MARKERS:
         assert marker not in caplog.text
-    # Pinned as today (named-fix candidate): the request is still reachable
-    # from the stream frames; the SDK stream object is deleted before raising.
-    holders = _holders(err)
-    assert set(holders) <= {"complete_stream", "_stream_attempt"}
-    assert all(names == ["request"] for names in holders.values())
+    assert len(sensitive_ids) == 3
+    assert _reachable_request_holders(err, sensitive_ids) == set()
+    assert _holders(err) == {}
     assert "stream" not in _frame_locals(err, "_stream_attempt")
+    assert "chunk_iter" not in _frame_locals(err, "_stream_attempt")
+    assert "iterator" not in _frame_locals(err, "_stream_attempt")
 
 
-async def test_anthropic_stream_tail_keeps_its_stream_local() -> None:
-    """B3 drift, pinned as today: the Anthropic tail has no ``del stream``."""
+@pytest.mark.parametrize("during_open", [False, True])
+async def test_anthropic_stream_tail_drops_its_stream_local(during_open: bool) -> None:
+    """Image-bearing failures drop the SDK stream before raising."""
     claude = AnthropicProvider(model="claude-sonnet-4-6", api_key="test-key", max_retries=0)
     events = [*_anthropic_head(), ("error", ANTHROPIC_REJECTED_UNLOCATED)]
-    wire_anthropic(claude, sse_response(*events))
+    handler = (
+        json_response(400, ANTHROPIC_REJECTED_UNLOCATED) if during_open else sse_response(*events)
+    )
+    wire_anthropic(claude, handler)
     with pytest.raises(ImageRejectedError) as info:
         async for _ in claude.complete_stream(USER_IMAGE):
             pass
     assert_clean(info.value)
-    assert "stream" in _frame_locals(info.value, "_stream_attempt")
+    assert "stream" not in _frame_locals(info.value, "_stream_attempt")
 
 
 # ---------------------------------------------------------------------------
@@ -357,7 +409,7 @@ def test_extra_field_readers(case: str, obj: Any, chat_value: Any, router_value:
 
 
 # ---------------------------------------------------------------------------
-# B12: provider labels on tool-call warnings (pinned as today)
+# B12: provider labels on tool-call warnings
 # ---------------------------------------------------------------------------
 
 
@@ -391,8 +443,11 @@ def _malformed_tool_stream() -> Callable[[httpx.Request], httpx.Response]:
     ("adapter", "model", "logged"),
     [
         ("chat", "gpt-4o", "provider=openai model=gpt-4o"),
-        # Drift (named-fix candidate): OpenRouter reports itself as "openai".
-        ("openrouter", "deepseek/deepseek-chat", "provider=openai model=deepseek/deepseek-chat"),
+        (
+            "openrouter",
+            "deepseek/deepseek-chat",
+            "provider=openrouter model=deepseek/deepseek-chat",
+        ),
     ],
 )
 async def test_malformed_stream_tool_call_label(
@@ -408,12 +463,153 @@ async def test_malformed_stream_tool_call_label(
     assert logged in caplog.text
 
 
-async def test_openrouter_per_call_model_is_not_the_logged_model(
+async def test_openrouter_per_call_model_is_the_logged_model(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """B12 drift pinned: the warning names the constructor model, not the call's model."""
+    """Malformed tool-call logs identify the adapter and the model of this call."""
     caplog.set_level(logging.WARNING, logger="dendrux")
-    provider = _router()
+    provider = OpenRouterProvider(model="x/a", api_key="test-key", max_retries=0)
     wire_openai(provider, _malformed_tool_stream())
-    _ = [e async for e in provider.complete_stream(TEXT, model="qwen/qwen3")]
-    assert "provider=openai model=deepseek/deepseek-chat" in caplog.text
+    _ = [e async for e in provider.complete_stream(TEXT, model="q/b")]
+    assert "provider=openrouter model=q/b" in caplog.text
+
+
+async def test_openrouter_missing_tool_name_uses_per_call_model(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING, logger="dendrux")
+    provider = OpenRouterProvider(model="x/a", api_key="test-key", max_retries=0)
+    chunk = _chat_chunk("")
+    chunk["choices"][0]["delta"] = {
+        "tool_calls": [
+            {
+                "index": 0,
+                "id": "call_X",
+                "type": "function",
+                "function": {"arguments": "{}"},
+            }
+        ]
+    }
+    chunk["choices"][0]["finish_reason"] = "tool_calls"
+    wire_openai(provider, sse_response((None, chunk), (None, "[DONE]")))
+    _ = [event async for event in provider.complete_stream(TEXT, model="q/b")]
+    assert "Tool call completed with no name — provider=openrouter model=q/b" in caplog.text
+
+
+async def test_openrouter_batch_tool_warning_uses_per_call_model(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING, logger="dendrux")
+    provider = OpenRouterProvider(model="x/a", api_key="test-key", max_retries=0)
+    wire_openai(
+        provider,
+        json_response(
+            200,
+            {
+                "id": "c1",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "q/b",
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "tool_calls",
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "call_X",
+                                    "type": "function",
+                                    "function": {"name": "add", "arguments": "{not json"},
+                                }
+                            ],
+                        },
+                    }
+                ],
+            },
+        ),
+    )
+    response = await provider.complete(TEXT, model="q/b")
+    assert response.tool_calls and response.tool_calls[0].parse_error is not None
+    assert "provider=openrouter model=q/b" in caplog.text
+
+
+def test_request_holder_scan_follows_partial_iterator_and_attributes() -> None:
+    from types import SimpleNamespace
+
+    registry = WireImageRegistry()
+    api_kwargs = {"model": "m"}
+    request = WireRequest(api_kwargs, {}, registry)
+    sensitive_ids = {id(request), id(registry), id(api_kwargs)}
+
+    def iterator_alias(request: WireRequest) -> Any:
+        yield None
+
+    iterator = iterator_alias(request)
+    next(iterator)
+    aliases = [
+        functools.partial(id, request),
+        iterator,
+        SimpleNamespace(registry=registry, api_kwargs=api_kwargs),
+    ]
+
+    def fail(aliases: list[Any]) -> None:
+        raise RuntimeError("holder probe")
+
+    try:
+        with pytest.raises(RuntimeError) as info:
+            fail(aliases)
+        holders = _reachable_request_holders(info.value, sensitive_ids)
+        assert "fail.aliases[0].args[0]" in holders
+        assert "fail.aliases[1].frame[request]" in holders
+        assert "fail.aliases[2].registry" in holders
+        assert "fail.aliases[2].api_kwargs" in holders
+    finally:
+        iterator.close()
+
+
+async def test_retry_attempts_open_pull_and_close_in_consumer_task() -> None:
+    import asyncio
+
+    from dendrux.llm._resilience import retry_unstarted_stream
+    from dendrux.types import StreamEvent
+
+    owner = asyncio.current_task()
+    calls: list[tuple[str, int, bool]] = []
+    attempts = 0
+
+    def make_attempt() -> Any:
+        nonlocal attempts
+        attempts += 1
+        number = attempts
+        calls.append(("open", number, asyncio.current_task() is owner))
+
+        async def stream() -> Any:
+            try:
+                calls.append(("pull", number, asyncio.current_task() is owner))
+                if number == 1:
+                    raise ProviderStreamIncompleteError(provider="probe")
+                yield StreamEvent(type=StreamEventType.TEXT_DELTA, text="ok")
+            finally:
+                calls.append(("close", number, asyncio.current_task() is owner))
+
+        return stream()
+
+    events = [
+        event
+        async for event in retry_unstarted_stream(
+            make_attempt,
+            provider="probe",
+            model="m",
+        )
+    ]
+    assert [event.text for event in events] == ["ok"]
+    assert calls == [
+        ("open", 1, True),
+        ("pull", 1, True),
+        ("close", 1, True),
+        ("open", 2, True),
+        ("pull", 2, True),
+        ("close", 2, True),
+    ]

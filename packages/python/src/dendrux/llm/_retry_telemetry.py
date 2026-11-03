@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 import httpx
 
 from dendrux._lifecycle import GovernanceEventType
+from dendrux.errors import safe_exception_info
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Iterable, Iterator
@@ -173,7 +174,7 @@ async def _on_response(response: httpx.Response, *, retryable_statuses: frozense
 
         await _emit(record, notify, iteration, data)
     except Exception:
-        _logger.warning("retry telemetry hook raised", exc_info=True)
+        _logger.warning("retry telemetry hook raised", exc_info=safe_exception_info())
 
 
 async def _emit(
@@ -188,12 +189,14 @@ async def _emit(
         try:
             await record(event_type, iteration, data)
         except Exception:
-            _logger.warning("provider.retry recorder write failed", exc_info=True)
+            _logger.warning("provider.retry recorder write failed", exc_info=safe_exception_info())
     if notify is not None:
         try:
             await notify(event_type, iteration, data)
         except Exception:
-            _logger.warning("provider.retry notifier broadcast failed", exc_info=True)
+            _logger.warning(
+                "provider.retry notifier broadcast failed", exc_info=safe_exception_info()
+            )
 
 
 def telemetry_event_hooks(

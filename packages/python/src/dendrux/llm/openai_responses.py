@@ -39,8 +39,8 @@ from dendrux.llm._openai_family import (
     OpenAIFamilyProvider,
     PendingImages,
     WireBlocks,
-    apply_cache_routing,
     apply_call_defaults,
+    apply_openai_cache_routing,
     forward_kwargs,
     inject_structured_output,
     opened_stream,
@@ -542,9 +542,9 @@ class OpenAIResponsesProvider(OpenAIFamilyProvider):
         }
         forward_kwargs(api_kwargs, kwargs, _SUPPORTED_KWARGS - already_handled)
 
-        # Cache routing. Sent on every endpoint (no base_url gate here).
-        apply_cache_routing(
+        apply_openai_cache_routing(
             api_kwargs,
+            base_url=str(self._client.base_url),
             own_prefix=self._cache_key_prefix,
             call_prefix=cache_key_prefix,
             retention=self._prompt_cache_retention,
@@ -677,6 +677,7 @@ class OpenAIResponsesProvider(OpenAIFamilyProvider):
 
         failure: Exception | None = None
         stream: Any = None
+        iterator: Any = None
         try:
             async with opened_stream(
                 clock, functools.partial(self._create, client, request)
@@ -802,9 +803,8 @@ class OpenAIResponsesProvider(OpenAIFamilyProvider):
         except Exception as exc:
             failure = raise_or_defer(self, exc, request.registry, model, streaming=True)
         if failure is not None:
-            # Raised outside any handler, so it chains nothing that holds the
-            # request body; the SDK stream (its response holds the body) is dropped.
-            del stream
+            # Drop every request and SDK-stream alias before retaining this frame.
+            del request, stream, iterator
             raise failure
 
         if _completed_response is None:

@@ -773,6 +773,7 @@ class AnthropicProvider(LLMProvider):
         _current_tool_json_parts: list[str] = []
 
         failure: Exception | None = None
+        stream: Any = None
         final_message: Any = None
         try:
             async with contextlib.AsyncExitStack() as stack:
@@ -900,8 +901,8 @@ class AnthropicProvider(LLMProvider):
                 raise mapped from exc
             failure = mapped
         if failure is not None:
-            # Frame locals reach tracebacks (and error trackers): the request
-            # (with its base64 payloads) is never bound here.
+            # Drop the SDK stream before the image-bearing failure reaches a traceback.
+            del stream
             raise failure
 
         final_stop = getattr(final_message, "stop_reason", None) if final_message else None

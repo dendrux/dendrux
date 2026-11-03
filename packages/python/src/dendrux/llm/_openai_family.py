@@ -123,6 +123,21 @@ def forward_kwargs(api_kwargs: dict[str, Any], kwargs: dict[str, Any], keys: Ite
             api_kwargs[key] = kwargs.pop(key)
 
 
+def apply_openai_cache_routing(
+    api_kwargs: dict[str, Any],
+    *,
+    base_url: str,
+    own_prefix: str | None,
+    call_prefix: str | None,
+    retention: str | None,
+) -> None:
+    """Send OpenAI cache routing fields only to the official endpoint."""
+    if base_url == OPENAI_DEFAULT_BASE_URL:
+        apply_cache_routing(
+            api_kwargs, own_prefix=own_prefix, call_prefix=call_prefix, retention=retention
+        )
+
+
 def apply_cache_routing(
     api_kwargs: dict[str, Any],
     *,
