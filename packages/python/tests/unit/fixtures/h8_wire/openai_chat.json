@@ -1,0 +1,2055 @@
+{
+ "cache_custom_base_url__batch": {
+  "events": [],
+  "response": {
+   "model": "gpt-4o",
+   "provider_request": {
+    "extra_body": {
+     "repetition_penalty": 1.1,
+     "top_k": 3
+    },
+    "max_tokens": 16000,
+    "messages": [
+     {
+      "content": "You are terse.",
+      "role": "system"
+     },
+     {
+      "content": "Say hi.",
+      "role": "user"
+     }
+    ],
+    "model": "gpt-4o"
+   },
+   "provider_response": {
+    "choices": [
+     {
+      "finish_reason": "stop",
+      "index": 0,
+      "message": {
+       "content": "Hi there, friend.",
+       "role": "assistant",
+       "tool_calls": null
+      }
+     }
+    ],
+    "id": "chatcmpl-oracle-1",
+    "model": "gpt-4o",
+    "object": "chat.completion",
+    "usage": {
+     "completion_tokens": 21,
+     "prompt_tokens": 510,
+     "prompt_tokens_details": {
+      "cached_tokens": 400
+     },
+     "total_tokens": 531
+    }
+   },
+   "raw_stop_reason": "stop",
+   "reasoning": null,
+   "reasoning_blocks": null,
+   "stop_reason": "end_turn",
+   "text": "Hi there, friend.",
+   "tool_calls": [],
+   "usage": {
+    "cache_creation_input_tokens": null,
+    "cache_read_input_tokens": 400,
+    "cost_source": null,
+    "cost_unknown": false,
+    "cost_usd": null,
+    "input_tokens": 110,
+    "output_tokens": 21,
+    "reasoning_tokens": null,
+    "total_tokens": 131,
+    "usage_reported": true
+   }
+  },
+  "sdk_calls": [
+   {
+    "extra_body": {
+     "repetition_penalty": 1.1,
+     "top_k": 3
+    },
+    "max_tokens": 16000,
+    "messages": [
+     {
+      "content": "You are terse.",
+      "role": "system"
+     },
+     {
+      "content": "Say hi.",
+      "role": "user"
+     }
+    ],
+    "model": "gpt-4o",
+    "tools": "<NOT_GIVEN>"
+   }
+  ]
+ },
+ "cache_custom_base_url__stream": {
+  "events": [
+   {
+    "text": "Hi there",
+    "tool_call_id": null,
+    "tool_name": null,
+    "type": "text_delta"
+   },
+   {
+    "text": ", friend.",
+    "tool_call_id": null,
+    "tool_name": null,
+    "type": "text_delta"
+   }
+  ],
+  "response": {
+   "model": "gpt-4o",
+   "provider_request": {
+    "extra_body": {
+     "repetition_penalty": 1.1,
+     "top_k": 3
+    },
+    "max_tokens": 16000,
+    "messages": [
+     {
+      "content": "You are terse.",
+      "role": "system"
+     },
+     {
+      "content": "Say hi.",
+      "role": "user"
+     }
+    ],
+    "model": "gpt-4o"
+   },
+   "provider_response": {
+    "finish_reason": "stop",
+    "object": "chat.completion.chunked",
+    "usage": {
+     "completion_tokens": 21,
+     "prompt_tokens": 110,
+     "total_tokens": 131
+    }
+   },
+   "raw_stop_reason": "stop",
+   "reasoning": null,
+   "reasoning_blocks": null,
+   "stop_reason": "end_turn",
+   "text": "Hi there, friend.",
+   "tool_calls": [],
+   "usage": {
+    "cache_creation_input_tokens": null,
+    "cache_read_input_tokens": 400,
+    "cost_source": null,
+    "cost_unknown": false,
+    "cost_usd": null,
+    "input_tokens": 110,
+    "output_tokens": 21,
+    "reasoning_tokens": null,
+    "total_tokens": 131,
+    "usage_reported": true
+   }
+  },
+  "sdk_calls": [
+   {
+    "extra_body": {
+     "repetition_penalty": 1.1,
+     "top_k": 3
+    },
+    "max_tokens": 16000,
+    "messages": [
+     {
+      "content": "You are terse.",
+      "role": "system"
+     },
+     {
+      "content": "Say hi.",
+      "role": "user"
+     }
+    ],
+    "model": "gpt-4o",
+    "stream": true,
+    "stream_options": {
+     "include_usage": true
+    },
+    "tools": "<NOT_GIVEN>"
+   }
+  ]
+ },
+ "cache_official__batch": {
+  "events": [],
+  "response": {
+   "model": "gpt-4o",
+   "provider_request": {
+    "max_completion_tokens": 16000,
+    "messages": [
+     {
+      "content": "You are terse.",
+      "role": "system"
+     },
+     {
+      "content": "Say hi.",
+      "role": "user"
+     }
+    ],
+    "model": "gpt-4o",
+    "prompt_cache_key": "dendrux:agent:gpt-4o",
+    "prompt_cache_retention": "24h"
+   },
+   "provider_response": {
+    "choices": [
+     {
+      "finish_reason": "stop",
+      "index": 0,
+      "message": {
+       "content": "Hi there, friend.",
+       "role": "assistant",
+       "tool_calls": null
+      }
+     }
+    ],
+    "id": "chatcmpl-oracle-1",
+    "model": "gpt-4o",
+    "object": "chat.completion",
+    "usage": {
+     "completion_tokens": 21,
+     "prompt_tokens": 510,
+     "prompt_tokens_details": {
+      "cached_tokens": 400
+     },
+     "total_tokens": 531
+    }
+   },
+   "raw_stop_reason": "stop",
+   "reasoning": null,
+   "reasoning_blocks": null,
+   "stop_reason": "end_turn",
+   "text": "Hi there, friend.",
+   "tool_calls": [],
+   "usage": {
+    "cache_creation_input_tokens": null,
+    "cache_read_input_tokens": 400,
+    "cost_source": null,
+    "cost_unknown": false,
+    "cost_usd": null,
+    "input_tokens": 110,
+    "output_tokens": 21,
+    "reasoning_tokens": null,
+    "total_tokens": 131,
+    "usage_reported": true
+   }
+  },
+  "sdk_calls": [
+   {
+    "max_completion_tokens": 16000,
+    "messages": [
+     {
+      "content": "You are terse.",
+      "role": "system"
+     },
+     {
+      "content": "Say hi.",
+      "role": "user"
+     }
+    ],
+    "model": "gpt-4o",
+    "prompt_cache_key": "dendrux:agent:gpt-4o",
+    "prompt_cache_retention": "24h",
+    "tools": "<NOT_GIVEN>"
+   }
+  ]
+ },
+ "cache_official__stream": {
+  "events": [
+   {
+    "text": "Hi there",
+    "tool_call_id": null,
+    "tool_name": null,
+    "type": "text_delta"
+   },
+   {
+    "text": ", friend.",
+    "tool_call_id": null,
+    "tool_name": null,
+    "type": "text_delta"
+   }
+  ],
+  "response": {
+   "model": "gpt-4o",
+   "provider_request": {
+    "max_completion_tokens": 16000,
+    "messages": [
+     {
+      "content": "You are terse.",
+      "role": "system"
+     },
+     {
+      "content": "Say hi.",
+      "role": "user"
+     }
+    ],
+    "model": "gpt-4o",
+    "prompt_cache_key": "dendrux:agent:gpt-4o",
+    "prompt_cache_retention": "24h"
+   },
+   "provider_response": {
+    "finish_reason": "stop",
+    "object": "chat.completion.chunked",
+    "usage": {
+     "completion_tokens": 21,
+     "prompt_tokens": 110,
+     "total_tokens": 131
+    }
+   },
+   "raw_stop_reason": "stop",
+   "reasoning": null,
+   "reasoning_blocks": null,
+   "stop_reason": "end_turn",
+   "text": "Hi there, friend.",
+   "tool_calls": [],
+   "usage": {
+    "cache_creation_input_tokens": null,
+    "cache_read_input_tokens": 400,
+    "cost_source": null,
+    "cost_unknown": false,
+    "cost_usd": null,
+    "input_tokens": 110,
+    "output_tokens": 21,
+    "reasoning_tokens": null,
+    "total_tokens": 131,
+    "usage_reported": true
+   }
+  },
+  "sdk_calls": [
+   {
+    "max_completion_tokens": 16000,
+    "messages": [
+     {
+      "content": "You are terse.",
+      "role": "system"
+     },
+     {
+      "content": "Say hi.",
+      "role": "user"
+     }
+    ],
+    "model": "gpt-4o",
+    "prompt_cache_key": "dendrux:agent:gpt-4o",
+    "prompt_cache_retention": "24h",
+    "stream": true,
+    "stream_options": {
+     "include_usage": true
+    },
+    "tools": "<NOT_GIVEN>"
+   }
+  ]
+ },
+ "cache_official_ctor_prefix__batch": {
+  "events": [],
+  "response": {
+   "model": "gpt-4o",
+   "provider_request": {
+    "max_completion_tokens": 16000,
+    "messages": [
+     {
+      "content": "You are terse.",
+      "role": "system"
+     },
+     {
+      "content": "Say hi.",
+      "role": "user"
+     }
+    ],
+    "model": "gpt-4o",
+    "prompt_cache_key": "dendrux:tenant-1"
+   },
+   "provider_response": {
+    "choices": [
+     {
+      "finish_reason": "stop",
+      "index": 0,
+      "message": {
+       "content": "Hi there, friend.",
+       "role": "assistant",
+       "tool_calls": null
+      }
+     }
+    ],
+    "id": "chatcmpl-oracle-1",
+    "model": "gpt-4o",
+    "object": "chat.completion",
+    "usage": {
+     "completion_tokens": 21,
+     "prompt_tokens": 510,
+     "prompt_tokens_details": {
+      "cached_tokens": 400
+     },
+     "total_tokens": 531
+    }
+   },
+   "raw_stop_reason": "stop",
+   "reasoning": null,
+   "reasoning_blocks": null,
+   "stop_reason": "end_turn",
+   "text": "Hi there, friend.",
+   "tool_calls": [],
+   "usage": {
+    "cache_creation_input_tokens": null,
+    "cache_read_input_tokens": 400,
+    "cost_source": null,
+    "cost_unknown": false,
+    "cost_usd": null,
+    "input_tokens": 110,
+    "output_tokens": 21,
+    "reasoning_tokens": null,
+    "total_tokens": 131,
+    "usage_reported": true
+   }
+  },
+  "sdk_calls": [
+   {
+    "max_completion_tokens": 16000,
+    "messages": [
+     {
+      "content": "You are terse.",
+      "role": "system"
+     },
+     {
+      "content": "Say hi.",
+      "role": "user"
+     }
+    ],
+    "model": "gpt-4o",
+    "prompt_cache_key": "dendrux:tenant-1",
+    "tools": "<NOT_GIVEN>"
+   }
+  ]
+ },
+ "cache_official_ctor_prefix__stream": {
+  "events": [
+   {
+    "text": "Hi there",
+    "tool_call_id": null,
+    "tool_name": null,
+    "type": "text_delta"
+   },
+   {
+    "text": ", friend.",
+    "tool_call_id": null,
+    "tool_name": null,
+    "type": "text_delta"
+   }
+  ],
+  "response": {
+   "model": "gpt-4o",
+   "provider_request": {
+    "max_completion_tokens": 16000,
+    "messages": [
+     {
+      "content": "You are terse.",
+      "role": "system"
+     },
+     {
+      "content": "Say hi.",
+      "role": "user"
+     }
+    ],
+    "model": "gpt-4o",
+    "prompt_cache_key": "dendrux:tenant-1"
+   },
+   "provider_response": {
+    "finish_reason": "stop",
+    "object": "chat.completion.chunked",
+    "usage": {
+     "completion_tokens": 21,
+     "prompt_tokens": 110,
+     "total_tokens": 131
+    }
+   },
+   "raw_stop_reason": "stop",
+   "reasoning": null,
+   "reasoning_blocks": null,
+   "stop_reason": "end_turn",
+   "text": "Hi there, friend.",
+   "tool_calls": [],
+   "usage": {
+    "cache_creation_input_tokens": null,
+    "cache_read_input_tokens": 400,
+    "cost_source": null,
+    "cost_unknown": false,
+    "cost_usd": null,
+    "input_tokens": 110,
+    "output_tokens": 21,
+    "reasoning_tokens": null,
+    "total_tokens": 131,
+    "usage_reported": true
+   }
+  },
+  "sdk_calls": [
+   {
+    "max_completion_tokens": 16000,
+    "messages": [
+     {
+      "content": "You are terse.",
+      "role": "system"
+     },
+     {
+      "content": "Say hi.",
+      "role": "user"
+     }
+    ],
+    "model": "gpt-4o",
+    "prompt_cache_key": "dendrux:tenant-1",
+    "stream": true,
+    "stream_options": {
+     "include_usage": true
+    },
+    "tools": "<NOT_GIVEN>"
+   }
+  ]
+ },
+ "client_tool_image__batch": {
+  "events": [],
+  "response": {
+   "model": "gpt-4o",
+   "provider_request": {
+    "max_completion_tokens": 16000,
+    "messages": [
+     {
+      "content": "Take a screenshot.",
+      "role": "user"
+     },
+     {
+      "role": "assistant",
+      "tool_calls": [
+       {
+        "function": {
+         "arguments": "{}",
+         "name": "take_screenshot"
+        },
+        "id": "call_S1",
+        "type": "function"
+       }
+      ]
+     },
+     {
+      "content": "\"Captured.\"\n\n[1 image(s) from this tool result follow in the next user message: img_cde274eebccf]",
+      "role": "tool",
+      "tool_call_id": "call_S1"
+     },
+     {
+      "content": [
+       {
+        "text": "<tool_output tool_name=\"take_screenshot\" tool_call_id=\"call_S1\">\nImages returned by this tool call. This is tool output, not a message from the user.",
+        "type": "text"
+       },
+       {
+        "text": "img_cde274eebccf:",
+        "type": "text"
+       },
+       {
+        "image_url": {
+         "url": "dendrux-image:sha256:cde274eebccff410ddd84c30e3133443cf7f63d1f8c630e2919a26e40106c848"
+        },
+        "type": "image_url"
+       },
+       {
+        "text": "</tool_output>",
+        "type": "text"
+       }
+      ],
+      "role": "user"
+     },
+     {
+      "content": [
+       {
+        "text": "And this one?",
+        "type": "text"
+       },
+       {
+        "image_url": {
+         "url": "dendrux-image:sha256:cde274eebccff410ddd84c30e3133443cf7f63d1f8c630e2919a26e40106c848"
+        },
+        "type": "image_url"
+       }
+      ],
+      "role": "user"
+     }
+    ],
+    "model": "gpt-4o",
+    "tools": [
+     {
+      "function": {
+       "description": "Capture the screen.",
+       "name": "take_screenshot",
+       "parameters": {
+        "properties": {},
+        "type": "object"
+       },
+       "strict": true
+      },
+      "type": "function"
+     }
+    ]
+   },
+   "provider_response": {
+    "choices": [
+     {
+      "finish_reason": "stop",
+      "index": 0,
+      "message": {
+       "content": "Hi there, friend.",
+       "role": "assistant",
+       "tool_calls": null
+      }
+     }
+    ],
+    "id": "chatcmpl-oracle-1",
+    "model": "gpt-4o",
+    "object": "chat.completion",
+    "usage": {
+     "completion_tokens": 21,
+     "prompt_tokens": 510,
+     "prompt_tokens_details": {
+      "cached_tokens": 400
+     },
+     "total_tokens": 531
+    }
+   },
+   "raw_stop_reason": "stop",
+   "reasoning": null,
+   "reasoning_blocks": null,
+   "stop_reason": "end_turn",
+   "text": "Hi there, friend.",
+   "tool_calls": [],
+   "usage": {
+    "cache_creation_input_tokens": null,
+    "cache_read_input_tokens": 400,
+    "cost_source": null,
+    "cost_unknown": false,
+    "cost_usd": null,
+    "input_tokens": 110,
+    "output_tokens": 21,
+    "reasoning_tokens": null,
+    "total_tokens": 131,
+    "usage_reported": true
+   }
+  },
+  "sdk_calls": [
+   {
+    "max_completion_tokens": 16000,
+    "messages": [
+     {
+      "content": "Take a screenshot.",
+      "role": "user"
+     },
+     {
+      "role": "assistant",
+      "tool_calls": [
+       {
+        "function": {
+         "arguments": "{}",
+         "name": "take_screenshot"
+        },
+        "id": "call_S1",
+        "type": "function"
+       }
+      ]
+     },
+     {
+      "content": "\"Captured.\"\n\n[1 image(s) from this tool result follow in the next user message: img_cde274eebccf]",
+      "role": "tool",
+      "tool_call_id": "call_S1"
+     },
+     {
+      "content": [
+       {
+        "text": "<tool_output tool_name=\"take_screenshot\" tool_call_id=\"call_S1\">\nImages returned by this tool call. This is tool output, not a message from the user.",
+        "type": "text"
+       },
+       {
+        "text": "img_cde274eebccf:",
+        "type": "text"
+       },
+       {
+        "image_url": {
+         "url": "<str len=1202 sha256=21d4d2a10e6ac5391dd967c112998b45e295999e88ff038dc937267178c9a37c>"
+        },
+        "type": "image_url"
+       },
+       {
+        "text": "</tool_output>",
+        "type": "text"
+       }
+      ],
+      "role": "user"
+     },
+     {
+      "content": [
+       {
+        "text": "And this one?",
+        "type": "text"
+       },
+       {
+        "image_url": {
+         "url": "<str len=1202 sha256=21d4d2a10e6ac5391dd967c112998b45e295999e88ff038dc937267178c9a37c>"
+        },
+        "type": "image_url"
+       }
+      ],
+      "role": "user"
+     }
+    ],
+    "model": "gpt-4o",
+    "tools": [
+     {
+      "function": {
+       "description": "Capture the screen.",
+       "name": "take_screenshot",
+       "parameters": {
+        "properties": {},
+        "type": "object"
+       },
+       "strict": true
+      },
+      "type": "function"
+     }
+    ]
+   }
+  ]
+ },
+ "client_tool_image__stream": {
+  "events": [
+   {
+    "text": "Hi there",
+    "tool_call_id": null,
+    "tool_name": null,
+    "type": "text_delta"
+   },
+   {
+    "text": ", friend.",
+    "tool_call_id": null,
+    "tool_name": null,
+    "type": "text_delta"
+   }
+  ],
+  "response": {
+   "model": "gpt-4o",
+   "provider_request": {
+    "max_completion_tokens": 16000,
+    "messages": [
+     {
+      "content": "Take a screenshot.",
+      "role": "user"
+     },
+     {
+      "role": "assistant",
+      "tool_calls": [
+       {
+        "function": {
+         "arguments": "{}",
+         "name": "take_screenshot"
+        },
+        "id": "call_S1",
+        "type": "function"
+       }
+      ]
+     },
+     {
+      "content": "\"Captured.\"\n\n[1 image(s) from this tool result follow in the next user message: img_cde274eebccf]",
+      "role": "tool",
+      "tool_call_id": "call_S1"
+     },
+     {
+      "content": [
+       {
+        "text": "<tool_output tool_name=\"take_screenshot\" tool_call_id=\"call_S1\">\nImages returned by this tool call. This is tool output, not a message from the user.",
+        "type": "text"
+       },
+       {
+        "text": "img_cde274eebccf:",
+        "type": "text"
+       },
+       {
+        "image_url": {
+         "url": "dendrux-image:sha256:cde274eebccff410ddd84c30e3133443cf7f63d1f8c630e2919a26e40106c848"
+        },
+        "type": "image_url"
+       },
+       {
+        "text": "</tool_output>",
+        "type": "text"
+       }
+      ],
+      "role": "user"
+     },
+     {
+      "content": [
+       {
+        "text": "And this one?",
+        "type": "text"
+       },
+       {
+        "image_url": {
+         "url": "dendrux-image:sha256:cde274eebccff410ddd84c30e3133443cf7f63d1f8c630e2919a26e40106c848"
+        },
+        "type": "image_url"
+       }
+      ],
+      "role": "user"
+     }
+    ],
+    "model": "gpt-4o",
+    "tools": [
+     {
+      "function": {
+       "description": "Capture the screen.",
+       "name": "take_screenshot",
+       "parameters": {
+        "properties": {},
+        "type": "object"
+       },
+       "strict": true
+      },
+      "type": "function"
+     }
+    ]
+   },
+   "provider_response": {
+    "finish_reason": "stop",
+    "object": "chat.completion.chunked",
+    "usage": {
+     "completion_tokens": 21,
+     "prompt_tokens": 110,
+     "total_tokens": 131
+    }
+   },
+   "raw_stop_reason": "stop",
+   "reasoning": null,
+   "reasoning_blocks": null,
+   "stop_reason": "end_turn",
+   "text": "Hi there, friend.",
+   "tool_calls": [],
+   "usage": {
+    "cache_creation_input_tokens": null,
+    "cache_read_input_tokens": 400,
+    "cost_source": null,
+    "cost_unknown": false,
+    "cost_usd": null,
+    "input_tokens": 110,
+    "output_tokens": 21,
+    "reasoning_tokens": null,
+    "total_tokens": 131,
+    "usage_reported": true
+   }
+  },
+  "sdk_calls": [
+   {
+    "max_completion_tokens": 16000,
+    "messages": [
+     {
+      "content": "Take a screenshot.",
+      "role": "user"
+     },
+     {
+      "role": "assistant",
+      "tool_calls": [
+       {
+        "function": {
+         "arguments": "{}",
+         "name": "take_screenshot"
+        },
+        "id": "call_S1",
+        "type": "function"
+       }
+      ]
+     },
+     {
+      "content": "\"Captured.\"\n\n[1 image(s) from this tool result follow in the next user message: img_cde274eebccf]",
+      "role": "tool",
+      "tool_call_id": "call_S1"
+     },
+     {
+      "content": [
+       {
+        "text": "<tool_output tool_name=\"take_screenshot\" tool_call_id=\"call_S1\">\nImages returned by this tool call. This is tool output, not a message from the user.",
+        "type": "text"
+       },
+       {
+        "text": "img_cde274eebccf:",
+        "type": "text"
+       },
+       {
+        "image_url": {
+         "url": "<str len=1202 sha256=21d4d2a10e6ac5391dd967c112998b45e295999e88ff038dc937267178c9a37c>"
+        },
+        "type": "image_url"
+       },
+       {
+        "text": "</tool_output>",
+        "type": "text"
+       }
+      ],
+      "role": "user"
+     },
+     {
+      "content": [
+       {
+        "text": "And this one?",
+        "type": "text"
+       },
+       {
+        "image_url": {
+         "url": "<str len=1202 sha256=21d4d2a10e6ac5391dd967c112998b45e295999e88ff038dc937267178c9a37c>"
+        },
+        "type": "image_url"
+       }
+      ],
+      "role": "user"
+     }
+    ],
+    "model": "gpt-4o",
+    "stream": true,
+    "stream_options": {
+     "include_usage": true
+    },
+    "tools": [
+     {
+      "function": {
+       "description": "Capture the screen.",
+       "name": "take_screenshot",
+       "parameters": {
+        "properties": {},
+        "type": "object"
+       },
+       "strict": true
+      },
+      "type": "function"
+     }
+    ]
+   }
+  ]
+ },
+ "reasoning__batch": {
+  "events": [],
+  "response": {
+   "model": "gpt-4o",
+   "provider_request": {
+    "max_completion_tokens": 16000,
+    "messages": [
+     {
+      "content": "You are terse.",
+      "role": "system"
+     },
+     {
+      "content": "Say hi.",
+      "role": "user"
+     }
+    ],
+    "model": "gpt-4o",
+    "reasoning_effort": "xhigh",
+    "seed": 7,
+    "temperature": 0.2,
+    "top_p": 0.9
+   },
+   "provider_response": {
+    "choices": [
+     {
+      "finish_reason": "stop",
+      "index": 0,
+      "message": {
+       "content": "Hi there, friend.",
+       "role": "assistant",
+       "tool_calls": null
+      }
+     }
+    ],
+    "id": "chatcmpl-oracle-1",
+    "model": "gpt-4o",
+    "object": "chat.completion",
+    "usage": {
+     "completion_tokens": 21,
+     "prompt_tokens": 510,
+     "prompt_tokens_details": {
+      "cached_tokens": 400
+     },
+     "total_tokens": 531
+    }
+   },
+   "raw_stop_reason": "stop",
+   "reasoning": null,
+   "reasoning_blocks": null,
+   "stop_reason": "end_turn",
+   "text": "Hi there, friend.",
+   "tool_calls": [],
+   "usage": {
+    "cache_creation_input_tokens": null,
+    "cache_read_input_tokens": 400,
+    "cost_source": null,
+    "cost_unknown": false,
+    "cost_usd": null,
+    "input_tokens": 110,
+    "output_tokens": 21,
+    "reasoning_tokens": null,
+    "total_tokens": 131,
+    "usage_reported": true
+   }
+  },
+  "sdk_calls": [
+   {
+    "max_completion_tokens": 16000,
+    "messages": [
+     {
+      "content": "You are terse.",
+      "role": "system"
+     },
+     {
+      "content": "Say hi.",
+      "role": "user"
+     }
+    ],
+    "model": "gpt-4o",
+    "reasoning_effort": "xhigh",
+    "seed": 7,
+    "temperature": 0.2,
+    "tools": "<NOT_GIVEN>",
+    "top_p": 0.9
+   }
+  ]
+ },
+ "reasoning__stream": {
+  "events": [
+   {
+    "text": "Hi there",
+    "tool_call_id": null,
+    "tool_name": null,
+    "type": "text_delta"
+   },
+   {
+    "text": ", friend.",
+    "tool_call_id": null,
+    "tool_name": null,
+    "type": "text_delta"
+   }
+  ],
+  "response": {
+   "model": "gpt-4o",
+   "provider_request": {
+    "max_completion_tokens": 16000,
+    "messages": [
+     {
+      "content": "You are terse.",
+      "role": "system"
+     },
+     {
+      "content": "Say hi.",
+      "role": "user"
+     }
+    ],
+    "model": "gpt-4o",
+    "reasoning_effort": "xhigh",
+    "seed": 7,
+    "temperature": 0.2,
+    "top_p": 0.9
+   },
+   "provider_response": {
+    "finish_reason": "stop",
+    "object": "chat.completion.chunked",
+    "usage": {
+     "completion_tokens": 21,
+     "prompt_tokens": 110,
+     "total_tokens": 131
+    }
+   },
+   "raw_stop_reason": "stop",
+   "reasoning": null,
+   "reasoning_blocks": null,
+   "stop_reason": "end_turn",
+   "text": "Hi there, friend.",
+   "tool_calls": [],
+   "usage": {
+    "cache_creation_input_tokens": null,
+    "cache_read_input_tokens": 400,
+    "cost_source": null,
+    "cost_unknown": false,
+    "cost_usd": null,
+    "input_tokens": 110,
+    "output_tokens": 21,
+    "reasoning_tokens": null,
+    "total_tokens": 131,
+    "usage_reported": true
+   }
+  },
+  "sdk_calls": [
+   {
+    "max_completion_tokens": 16000,
+    "messages": [
+     {
+      "content": "You are terse.",
+      "role": "system"
+     },
+     {
+      "content": "Say hi.",
+      "role": "user"
+     }
+    ],
+    "model": "gpt-4o",
+    "reasoning_effort": "xhigh",
+    "seed": 7,
+    "stream": true,
+    "stream_options": {
+     "include_usage": true
+    },
+    "temperature": 0.2,
+    "tools": "<NOT_GIVEN>",
+    "top_p": 0.9
+   }
+  ]
+ },
+ "reasoning_legacy__batch": {
+  "events": [],
+  "response": {
+   "model": "gpt-4o",
+   "provider_request": {
+    "max_completion_tokens": 77,
+    "messages": [
+     {
+      "content": "You are terse.",
+      "role": "system"
+     },
+     {
+      "content": "Say hi.",
+      "role": "user"
+     }
+    ],
+    "model": "gpt-4o",
+    "reasoning_effort": "medium",
+    "stop": [
+     "END"
+    ]
+   },
+   "provider_response": {
+    "choices": [
+     {
+      "finish_reason": "stop",
+      "index": 0,
+      "message": {
+       "content": "Hi there, friend.",
+       "role": "assistant",
+       "tool_calls": null
+      }
+     }
+    ],
+    "id": "chatcmpl-oracle-1",
+    "model": "gpt-4o",
+    "object": "chat.completion",
+    "usage": {
+     "completion_tokens": 21,
+     "prompt_tokens": 510,
+     "prompt_tokens_details": {
+      "cached_tokens": 400
+     },
+     "total_tokens": 531
+    }
+   },
+   "raw_stop_reason": "stop",
+   "reasoning": null,
+   "reasoning_blocks": null,
+   "stop_reason": "end_turn",
+   "text": "Hi there, friend.",
+   "tool_calls": [],
+   "usage": {
+    "cache_creation_input_tokens": null,
+    "cache_read_input_tokens": 400,
+    "cost_source": null,
+    "cost_unknown": false,
+    "cost_usd": null,
+    "input_tokens": 110,
+    "output_tokens": 21,
+    "reasoning_tokens": null,
+    "total_tokens": 131,
+    "usage_reported": true
+   }
+  },
+  "sdk_calls": [
+   {
+    "max_completion_tokens": 77,
+    "messages": [
+     {
+      "content": "You are terse.",
+      "role": "system"
+     },
+     {
+      "content": "Say hi.",
+      "role": "user"
+     }
+    ],
+    "model": "gpt-4o",
+    "reasoning_effort": "medium",
+    "stop": [
+     "END"
+    ],
+    "tools": "<NOT_GIVEN>"
+   }
+  ]
+ },
+ "reasoning_legacy__stream": {
+  "events": [
+   {
+    "text": "Hi there",
+    "tool_call_id": null,
+    "tool_name": null,
+    "type": "text_delta"
+   },
+   {
+    "text": ", friend.",
+    "tool_call_id": null,
+    "tool_name": null,
+    "type": "text_delta"
+   }
+  ],
+  "response": {
+   "model": "gpt-4o",
+   "provider_request": {
+    "max_completion_tokens": 77,
+    "messages": [
+     {
+      "content": "You are terse.",
+      "role": "system"
+     },
+     {
+      "content": "Say hi.",
+      "role": "user"
+     }
+    ],
+    "model": "gpt-4o",
+    "reasoning_effort": "medium",
+    "stop": [
+     "END"
+    ]
+   },
+   "provider_response": {
+    "finish_reason": "stop",
+    "object": "chat.completion.chunked",
+    "usage": {
+     "completion_tokens": 21,
+     "prompt_tokens": 110,
+     "total_tokens": 131
+    }
+   },
+   "raw_stop_reason": "stop",
+   "reasoning": null,
+   "reasoning_blocks": null,
+   "stop_reason": "end_turn",
+   "text": "Hi there, friend.",
+   "tool_calls": [],
+   "usage": {
+    "cache_creation_input_tokens": null,
+    "cache_read_input_tokens": 400,
+    "cost_source": null,
+    "cost_unknown": false,
+    "cost_usd": null,
+    "input_tokens": 110,
+    "output_tokens": 21,
+    "reasoning_tokens": null,
+    "total_tokens": 131,
+    "usage_reported": true
+   }
+  },
+  "sdk_calls": [
+   {
+    "max_completion_tokens": 77,
+    "messages": [
+     {
+      "content": "You are terse.",
+      "role": "system"
+     },
+     {
+      "content": "Say hi.",
+      "role": "user"
+     }
+    ],
+    "model": "gpt-4o",
+    "reasoning_effort": "medium",
+    "stop": [
+     "END"
+    ],
+    "stream": true,
+    "stream_options": {
+     "include_usage": true
+    },
+    "tools": "<NOT_GIVEN>"
+   }
+  ]
+ },
+ "server_tool__batch": {
+  "events": [],
+  "response": {
+   "model": "gpt-4o",
+   "provider_request": {
+    "max_completion_tokens": 16000,
+    "messages": [
+     {
+      "content": "Use tools.",
+      "role": "system"
+     },
+     {
+      "content": "What is 2+3?",
+      "role": "user"
+     },
+     {
+      "content": "Let me add.",
+      "role": "assistant",
+      "tool_calls": [
+       {
+        "function": {
+         "arguments": "{\"a\": 2, \"b\": 3}",
+         "name": "add"
+        },
+        "id": "call_A1",
+        "type": "function"
+       }
+      ]
+     },
+     {
+      "content": "5",
+      "role": "tool",
+      "tool_call_id": "call_A1"
+     }
+    ],
+    "model": "gpt-4o",
+    "tools": [
+     {
+      "function": {
+       "description": "Add two numbers.",
+       "name": "add",
+       "parameters": {
+        "properties": {
+         "a": {
+          "type": "integer"
+         },
+         "b": {
+          "type": "integer"
+         }
+        },
+        "required": [
+         "a",
+         "b"
+        ],
+        "type": "object"
+       }
+      },
+      "type": "function"
+     }
+    ]
+   },
+   "provider_response": {
+    "choices": [
+     {
+      "finish_reason": "tool_calls",
+      "index": 0,
+      "message": {
+       "content": "Adding again.",
+       "role": "assistant",
+       "tool_calls": [
+        {
+         "function": {
+          "arguments": "{\"a\": 5, \"b\": 1}",
+          "name": "add"
+         },
+         "id": "call_B2",
+         "type": "function"
+        }
+       ]
+      }
+     }
+    ],
+    "id": "chatcmpl-oracle-1",
+    "model": "gpt-4o",
+    "object": "chat.completion",
+    "usage": {
+     "completion_tokens": 21,
+     "prompt_tokens": 510,
+     "prompt_tokens_details": {
+      "cached_tokens": 400
+     },
+     "total_tokens": 531
+    }
+   },
+   "raw_stop_reason": "tool_calls",
+   "reasoning": null,
+   "reasoning_blocks": null,
+   "stop_reason": "tool_use",
+   "text": "Adding again.",
+   "tool_calls": [
+    {
+     "name": "add",
+     "params": {
+      "a": 5,
+      "b": 1
+     },
+     "parse_error": null,
+     "provider_tool_call_id": "call_B2"
+    }
+   ],
+   "usage": {
+    "cache_creation_input_tokens": null,
+    "cache_read_input_tokens": 400,
+    "cost_source": null,
+    "cost_unknown": false,
+    "cost_usd": null,
+    "input_tokens": 110,
+    "output_tokens": 21,
+    "reasoning_tokens": null,
+    "total_tokens": 131,
+    "usage_reported": true
+   }
+  },
+  "sdk_calls": [
+   {
+    "max_completion_tokens": 16000,
+    "messages": [
+     {
+      "content": "Use tools.",
+      "role": "system"
+     },
+     {
+      "content": "What is 2+3?",
+      "role": "user"
+     },
+     {
+      "content": "Let me add.",
+      "role": "assistant",
+      "tool_calls": [
+       {
+        "function": {
+         "arguments": "{\"a\": 2, \"b\": 3}",
+         "name": "add"
+        },
+        "id": "call_A1",
+        "type": "function"
+       }
+      ]
+     },
+     {
+      "content": "5",
+      "role": "tool",
+      "tool_call_id": "call_A1"
+     }
+    ],
+    "model": "gpt-4o",
+    "tools": [
+     {
+      "function": {
+       "description": "Add two numbers.",
+       "name": "add",
+       "parameters": {
+        "properties": {
+         "a": {
+          "type": "integer"
+         },
+         "b": {
+          "type": "integer"
+         }
+        },
+        "required": [
+         "a",
+         "b"
+        ],
+        "type": "object"
+       }
+      },
+      "type": "function"
+     }
+    ]
+   }
+  ]
+ },
+ "server_tool__stream": {
+  "events": [
+   {
+    "text": "Adding",
+    "tool_call_id": null,
+    "tool_name": null,
+    "type": "text_delta"
+   },
+   {
+    "text": " again.",
+    "tool_call_id": null,
+    "tool_name": null,
+    "type": "text_delta"
+   },
+   {
+    "text": null,
+    "tool_call_id": "call_B2",
+    "tool_name": "add",
+    "type": "tool_use_start"
+   },
+   {
+    "text": null,
+    "tool_call_id": "call_B2",
+    "tool_name": "add",
+    "type": "tool_use_end"
+   }
+  ],
+  "response": {
+   "model": "gpt-4o",
+   "provider_request": {
+    "max_completion_tokens": 16000,
+    "messages": [
+     {
+      "content": "Use tools.",
+      "role": "system"
+     },
+     {
+      "content": "What is 2+3?",
+      "role": "user"
+     },
+     {
+      "content": "Let me add.",
+      "role": "assistant",
+      "tool_calls": [
+       {
+        "function": {
+         "arguments": "{\"a\": 2, \"b\": 3}",
+         "name": "add"
+        },
+        "id": "call_A1",
+        "type": "function"
+       }
+      ]
+     },
+     {
+      "content": "5",
+      "role": "tool",
+      "tool_call_id": "call_A1"
+     }
+    ],
+    "model": "gpt-4o",
+    "tools": [
+     {
+      "function": {
+       "description": "Add two numbers.",
+       "name": "add",
+       "parameters": {
+        "properties": {
+         "a": {
+          "type": "integer"
+         },
+         "b": {
+          "type": "integer"
+         }
+        },
+        "required": [
+         "a",
+         "b"
+        ],
+        "type": "object"
+       }
+      },
+      "type": "function"
+     }
+    ]
+   },
+   "provider_response": {
+    "finish_reason": "tool_calls",
+    "object": "chat.completion.chunked",
+    "usage": {
+     "completion_tokens": 21,
+     "prompt_tokens": 110,
+     "total_tokens": 131
+    }
+   },
+   "raw_stop_reason": "tool_calls",
+   "reasoning": null,
+   "reasoning_blocks": null,
+   "stop_reason": "tool_use",
+   "text": "Adding again.",
+   "tool_calls": [
+    {
+     "name": "add",
+     "params": {
+      "a": 5,
+      "b": 1
+     },
+     "parse_error": null,
+     "provider_tool_call_id": "call_B2"
+    }
+   ],
+   "usage": {
+    "cache_creation_input_tokens": null,
+    "cache_read_input_tokens": 400,
+    "cost_source": null,
+    "cost_unknown": false,
+    "cost_usd": null,
+    "input_tokens": 110,
+    "output_tokens": 21,
+    "reasoning_tokens": null,
+    "total_tokens": 131,
+    "usage_reported": true
+   }
+  },
+  "sdk_calls": [
+   {
+    "max_completion_tokens": 16000,
+    "messages": [
+     {
+      "content": "Use tools.",
+      "role": "system"
+     },
+     {
+      "content": "What is 2+3?",
+      "role": "user"
+     },
+     {
+      "content": "Let me add.",
+      "role": "assistant",
+      "tool_calls": [
+       {
+        "function": {
+         "arguments": "{\"a\": 2, \"b\": 3}",
+         "name": "add"
+        },
+        "id": "call_A1",
+        "type": "function"
+       }
+      ]
+     },
+     {
+      "content": "5",
+      "role": "tool",
+      "tool_call_id": "call_A1"
+     }
+    ],
+    "model": "gpt-4o",
+    "stream": true,
+    "stream_options": {
+     "include_usage": true
+    },
+    "tools": [
+     {
+      "function": {
+       "description": "Add two numbers.",
+       "name": "add",
+       "parameters": {
+        "properties": {
+         "a": {
+          "type": "integer"
+         },
+         "b": {
+          "type": "integer"
+         }
+        },
+        "required": [
+         "a",
+         "b"
+        ],
+        "type": "object"
+       }
+      },
+      "type": "function"
+     }
+    ]
+   }
+  ]
+ },
+ "structured__batch": {
+  "events": [],
+  "response": {
+   "model": "gpt-4o",
+   "provider_request": {
+    "max_completion_tokens": 16000,
+    "messages": [
+     {
+      "content": "Name a city.",
+      "role": "user"
+     }
+    ],
+    "model": "gpt-4o",
+    "response_format": {
+     "json_schema": {
+      "name": "City",
+      "schema": {
+       "additionalProperties": false,
+       "properties": {
+        "name": {
+         "type": "string"
+        },
+        "population": {
+         "type": "integer"
+        }
+       },
+       "required": [
+        "name",
+        "population"
+       ],
+       "title": "City",
+       "type": "object"
+      },
+      "strict": true
+     },
+     "type": "json_schema"
+    }
+   },
+   "provider_response": {
+    "choices": [
+     {
+      "finish_reason": "stop",
+      "index": 0,
+      "message": {
+       "content": "{\"name\": \"Oslo\", \"population\": 700000}",
+       "role": "assistant",
+       "tool_calls": null
+      }
+     }
+    ],
+    "id": "chatcmpl-oracle-1",
+    "model": "gpt-4o",
+    "object": "chat.completion",
+    "usage": {
+     "completion_tokens": 21,
+     "prompt_tokens": 510,
+     "prompt_tokens_details": {
+      "cached_tokens": 400
+     },
+     "total_tokens": 531
+    }
+   },
+   "raw_stop_reason": "stop",
+   "reasoning": null,
+   "reasoning_blocks": null,
+   "stop_reason": "end_turn",
+   "text": "{\"name\": \"Oslo\", \"population\": 700000}",
+   "tool_calls": [],
+   "usage": {
+    "cache_creation_input_tokens": null,
+    "cache_read_input_tokens": 400,
+    "cost_source": null,
+    "cost_unknown": false,
+    "cost_usd": null,
+    "input_tokens": 110,
+    "output_tokens": 21,
+    "reasoning_tokens": null,
+    "total_tokens": 131,
+    "usage_reported": true
+   }
+  },
+  "sdk_calls": [
+   {
+    "max_completion_tokens": 16000,
+    "messages": [
+     {
+      "content": "Name a city.",
+      "role": "user"
+     }
+    ],
+    "model": "gpt-4o",
+    "response_format": {
+     "json_schema": {
+      "name": "City",
+      "schema": {
+       "additionalProperties": false,
+       "properties": {
+        "name": {
+         "type": "string"
+        },
+        "population": {
+         "type": "integer"
+        }
+       },
+       "required": [
+        "name",
+        "population"
+       ],
+       "title": "City",
+       "type": "object"
+      },
+      "strict": true
+     },
+     "type": "json_schema"
+    },
+    "tools": "<NOT_GIVEN>"
+   }
+  ]
+ },
+ "structured__stream": {
+  "events": [
+   {
+    "text": "{\"name\": \"Oslo\", \"p",
+    "tool_call_id": null,
+    "tool_name": null,
+    "type": "text_delta"
+   },
+   {
+    "text": "opulation\": 700000}",
+    "tool_call_id": null,
+    "tool_name": null,
+    "type": "text_delta"
+   }
+  ],
+  "response": {
+   "model": "gpt-4o",
+   "provider_request": {
+    "max_completion_tokens": 16000,
+    "messages": [
+     {
+      "content": "Name a city.",
+      "role": "user"
+     }
+    ],
+    "model": "gpt-4o",
+    "response_format": {
+     "json_schema": {
+      "name": "City",
+      "schema": {
+       "additionalProperties": false,
+       "properties": {
+        "name": {
+         "type": "string"
+        },
+        "population": {
+         "type": "integer"
+        }
+       },
+       "required": [
+        "name",
+        "population"
+       ],
+       "title": "City",
+       "type": "object"
+      },
+      "strict": true
+     },
+     "type": "json_schema"
+    }
+   },
+   "provider_response": {
+    "finish_reason": "stop",
+    "object": "chat.completion.chunked",
+    "usage": {
+     "completion_tokens": 21,
+     "prompt_tokens": 110,
+     "total_tokens": 131
+    }
+   },
+   "raw_stop_reason": "stop",
+   "reasoning": null,
+   "reasoning_blocks": null,
+   "stop_reason": "end_turn",
+   "text": "{\"name\": \"Oslo\", \"population\": 700000}",
+   "tool_calls": [],
+   "usage": {
+    "cache_creation_input_tokens": null,
+    "cache_read_input_tokens": 400,
+    "cost_source": null,
+    "cost_unknown": false,
+    "cost_usd": null,
+    "input_tokens": 110,
+    "output_tokens": 21,
+    "reasoning_tokens": null,
+    "total_tokens": 131,
+    "usage_reported": true
+   }
+  },
+  "sdk_calls": [
+   {
+    "max_completion_tokens": 16000,
+    "messages": [
+     {
+      "content": "Name a city.",
+      "role": "user"
+     }
+    ],
+    "model": "gpt-4o",
+    "response_format": {
+     "json_schema": {
+      "name": "City",
+      "schema": {
+       "additionalProperties": false,
+       "properties": {
+        "name": {
+         "type": "string"
+        },
+        "population": {
+         "type": "integer"
+        }
+       },
+       "required": [
+        "name",
+        "population"
+       ],
+       "title": "City",
+       "type": "object"
+      },
+      "strict": true
+     },
+     "type": "json_schema"
+    },
+    "stream": true,
+    "stream_options": {
+     "include_usage": true
+    },
+    "tools": "<NOT_GIVEN>"
+   }
+  ]
+ },
+ "text__batch": {
+  "events": [],
+  "response": {
+   "model": "gpt-4o",
+   "provider_request": {
+    "max_completion_tokens": 16000,
+    "messages": [
+     {
+      "content": "You are terse.",
+      "role": "system"
+     },
+     {
+      "content": "Say hi.",
+      "role": "user"
+     }
+    ],
+    "model": "gpt-4o"
+   },
+   "provider_response": {
+    "choices": [
+     {
+      "finish_reason": "stop",
+      "index": 0,
+      "message": {
+       "content": "Hi there, friend.",
+       "role": "assistant",
+       "tool_calls": null
+      }
+     }
+    ],
+    "id": "chatcmpl-oracle-1",
+    "model": "gpt-4o",
+    "object": "chat.completion",
+    "usage": {
+     "completion_tokens": 21,
+     "prompt_tokens": 510,
+     "prompt_tokens_details": {
+      "cached_tokens": 400
+     },
+     "total_tokens": 531
+    }
+   },
+   "raw_stop_reason": "stop",
+   "reasoning": null,
+   "reasoning_blocks": null,
+   "stop_reason": "end_turn",
+   "text": "Hi there, friend.",
+   "tool_calls": [],
+   "usage": {
+    "cache_creation_input_tokens": null,
+    "cache_read_input_tokens": 400,
+    "cost_source": null,
+    "cost_unknown": false,
+    "cost_usd": null,
+    "input_tokens": 110,
+    "output_tokens": 21,
+    "reasoning_tokens": null,
+    "total_tokens": 131,
+    "usage_reported": true
+   }
+  },
+  "sdk_calls": [
+   {
+    "max_completion_tokens": 16000,
+    "messages": [
+     {
+      "content": "You are terse.",
+      "role": "system"
+     },
+     {
+      "content": "Say hi.",
+      "role": "user"
+     }
+    ],
+    "model": "gpt-4o",
+    "tools": "<NOT_GIVEN>"
+   }
+  ]
+ },
+ "text__stream": {
+  "events": [
+   {
+    "text": "Hi there",
+    "tool_call_id": null,
+    "tool_name": null,
+    "type": "text_delta"
+   },
+   {
+    "text": ", friend.",
+    "tool_call_id": null,
+    "tool_name": null,
+    "type": "text_delta"
+   }
+  ],
+  "response": {
+   "model": "gpt-4o",
+   "provider_request": {
+    "max_completion_tokens": 16000,
+    "messages": [
+     {
+      "content": "You are terse.",
+      "role": "system"
+     },
+     {
+      "content": "Say hi.",
+      "role": "user"
+     }
+    ],
+    "model": "gpt-4o"
+   },
+   "provider_response": {
+    "finish_reason": "stop",
+    "object": "chat.completion.chunked",
+    "usage": {
+     "completion_tokens": 21,
+     "prompt_tokens": 110,
+     "total_tokens": 131
+    }
+   },
+   "raw_stop_reason": "stop",
+   "reasoning": null,
+   "reasoning_blocks": null,
+   "stop_reason": "end_turn",
+   "text": "Hi there, friend.",
+   "tool_calls": [],
+   "usage": {
+    "cache_creation_input_tokens": null,
+    "cache_read_input_tokens": 400,
+    "cost_source": null,
+    "cost_unknown": false,
+    "cost_usd": null,
+    "input_tokens": 110,
+    "output_tokens": 21,
+    "reasoning_tokens": null,
+    "total_tokens": 131,
+    "usage_reported": true
+   }
+  },
+  "sdk_calls": [
+   {
+    "max_completion_tokens": 16000,
+    "messages": [
+     {
+      "content": "You are terse.",
+      "role": "system"
+     },
+     {
+      "content": "Say hi.",
+      "role": "user"
+     }
+    ],
+    "model": "gpt-4o",
+    "stream": true,
+    "stream_options": {
+     "include_usage": true
+    },
+    "tools": "<NOT_GIVEN>"
+   }
+  ]
+ }
+}
