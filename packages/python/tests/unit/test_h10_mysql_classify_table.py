@@ -64,13 +64,15 @@ class RaisingClass:
 
 
 class OrigRaisingClassError(Exception):
-    orig = RaisingClass()
+    """Carries ``orig``; the hostile object is attached per call, never at import."""
 
 
 def context_with_raising_class_orig() -> Exception:
     root = Exception("flagged")
     root.connection_invalidated = True  # type: ignore[attr-defined]
-    root.__context__ = OrigRaisingClassError()
+    err = OrigRaisingClassError()
+    err.orig = RaisingClass()
+    root.__context__ = err
     return root
 
 

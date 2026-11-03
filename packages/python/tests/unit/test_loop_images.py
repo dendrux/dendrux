@@ -1325,7 +1325,7 @@ async def test_no_wire_bytes_retained_after_multi_iteration_run() -> None:
         return sum(
             1
             for o in gc.get_objects()
-            if isinstance(o, ImagePart) and o.data is not None and o.data in marks
+            if type(o) is ImagePart and o.data is not None and o.data in marks
         )
 
     during: list[int] = []
