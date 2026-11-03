@@ -14,6 +14,7 @@ from __future__ import annotations
 import functools
 import json
 import logging
+from collections.abc import Mapping
 from types import AsyncGeneratorType, GeneratorType
 from typing import TYPE_CHECKING, Any
 
@@ -140,7 +141,7 @@ def _reachable_request_holders(err: BaseException, sensitive_ids: set[int]) -> s
             frame = value.ag_frame if isinstance(value, AsyncGeneratorType) else value.gi_frame
             if frame is not None:
                 visit(frame.f_locals, path + ".frame", depth, seen)
-        elif isinstance(value, dict):
+        elif isinstance(value, Mapping):
             for key, item in value.items():
                 visit(item, f"{path}[{key}]", depth, seen)
         elif isinstance(value, tuple | list):
