@@ -61,7 +61,7 @@
 - **Run control**: `agent.request_pause(run_id)` parks a running run as `paused` and `agent.submit_resume(run_id)` continues it. `cancel_run(run_id, cascade=True)` stops delegated children too, and `cancel_run` now interrupts an in-flight `run()` in the same process.
 - **Inbox notes**: `agent.submit_note(run_id, "...")` tells a run something while it works; the model sees it at the next iteration.
 - **Dollar budgets**: `Budget(max_cost_usd=..., on_exceed="pause" | "cancel", include_children=True)` enforces token and dollar limits across a run and its children.
-- **Subtree reads**: `RunStore.get_subtree(run_id)` returns a delegation tree with live rolled-up usage, plus `get_notes`, `event_types=` and `before=` filters.
+- **Subtree reads**: `RunStore.get_subtree(run_id)` returns a delegation tree with live rolled-up usage, plus `get_notes`, `event_types=` and `before=` filters. (On 0.6+, pass `max_nodes=`: omitting it warns and the default becomes 10,000 in 0.7. See [bounded reads](docs/reference/run-store.mdx#get_subtree).)
 - **`MCPConnection.call_tool`** runs a server tool directly from your app (outside Agent governance).
 - **Gateway fixes** for OpenAI-compatible endpoints, including a typed `ContextLengthExceededError`.
 - **Migration**: run `dendrux db migrate` (new revision `b5c6d7e8f9a0`). See the [CHANGELOG](packages/python/CHANGELOG.md).
@@ -184,7 +184,7 @@ results = await sweep(
 [//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
 
 ```python
-result = await agent.retry("01JR...")
+result = await agent.retry("01JR...", tenant_id=tenant)
 ```
 
 **Idempotency**: pass a key to prevent duplicate runs. Same key + same input returns the existing run. Same key + different input raises `IdempotencyConflictError`. Keys are unique per tenant.
@@ -195,6 +195,7 @@ result = await agent.retry("01JR...")
 result = await agent.run(
     "Analyze Q3 report",
     idempotency_key="q3-analysis-2026",
+    tenant_id=tenant,
 )
 ```
 
@@ -325,7 +326,7 @@ async def research(query: str) -> str:
         return result.answer
 ```
 
-The state store links parent and child runs. Read the delegation tree with `RunStore.get_subtree(..., tenant_id=...)` and render it in your app. Depth guards prevent runaway recursion.
+The state store links parent and child runs. Read the delegation tree with `RunStore.get_subtree(..., tenant_id=..., max_nodes=10_000)` (it raises `SubtreeTooLargeError` at the bound; see [bounded reads](docs/reference/run-store.mdx#get_subtree)) and render it in your app. Depth guards prevent runaway recursion.
 
 ### 📚 Skills
 
@@ -373,6 +374,7 @@ class ResultItem(BaseModel):
 
 class ResultsBody(BaseModel):
     results: list[ResultItem]
+    expected_pause_id: str | None = None  # the pause id the client reviewed, from /pending
 
 store = RunStore.from_database_url(db_url)
 
@@ -390,7 +392,11 @@ async def submit(run_id: str, body: ResultsBody, user=Depends(require_user)):
         ToolResult(name=r.tool_name, call_id=r.tool_call_id, payload=r.payload)
         for r in body.results
     ]
-    return await agent.submit_tool_results(run_id, results, tenant_id=user.org_id)
+    # Forward the id the client reviewed; do not look up the newest one here. Under the
+    # default strict tenancy a missing or stale id is refused.
+    return await agent.submit_tool_results(
+        run_id, results, expected_pause_id=body.expected_pause_id, tenant_id=user.org_id
+    )
 ```
 
 Pause/resume orchestration and the CAS-safe claim are Dendrux's job. Auth, schema, error shape, and framework choice are yours; for the client's side, build `GET /runs/{id}/pending` over `RunStore.get_pending`, and add live updates with `RunStore.follow` if you want them (see [Client-side tools](docs/recipes/client-tools.mdx)). Never pipe `agent.stream()` into a browser SSE response: closing the tab cancels the run.
