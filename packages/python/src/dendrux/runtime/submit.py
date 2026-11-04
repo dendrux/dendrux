@@ -1283,13 +1283,21 @@ async def report_governance_change(
     )
 
 
+def _pause_id_required() -> ValueError:
+    from dendrux.types import InputValidationError
+
+    error = InputValidationError("expected_pause_id", "pause_id_required")
+    error.args = (str(error) + " Send the pause_id from get_pending as expected_pause_id.",)
+    return error
+
+
 def _require_approval_token(approval: bool, expected: str | None) -> None:
-    from dendrux.types import InputValidationError, _validate_identifier
+    from dendrux.types import _validate_identifier
 
     if expected is not None:
         _validate_identifier(expected, "expected_pause_id", maximum=ULID_CHARS)
     if approval and expected is None:
-        raise InputValidationError("expected_pause_id", "pause_id_required")
+        raise _pause_id_required()
 
 
 def require_pause_id(
@@ -1304,9 +1312,7 @@ def require_pause_id(
     """Require a token only when the stored pause has a durable generation."""
     _require_approval_token(approval and pause_id is not None, expected)
     if pause_id is not None and expected is None and _strict_tenancy_applies(agent, store):
-        from dendrux.types import InputValidationError
-
-        raise InputValidationError("expected_pause_id", "pause_id_required")
+        raise _pause_id_required()
     if run_id is not None:
         pause_validator(run_id, expected)({"pause_id": pause_id})
 

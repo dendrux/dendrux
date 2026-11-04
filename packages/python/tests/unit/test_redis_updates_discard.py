@@ -52,3 +52,25 @@ async def test_interrupted_discard_fails_connection_instead_of_replaying_partial
     with pytest.raises(ConnectionError):
         async with asyncio.timeout(0.02):
             await parser.read_response()
+
+
+@pytest.mark.parametrize(
+    "responses",
+    [
+        [[None, None, b"wrong"]],
+        [[None, None, b"hello"], [None, None, ru._DISCARDED], [None, None, b"wrong"]],
+    ],
+)
+async def test_parser_compatibility_check_refuses_corrupted_frames(responses):
+    class BrokenParser:
+        def on_connect(self, connection):
+            pass
+
+        async def read_response(self):
+            return responses.pop(0)
+
+    class Connection:
+        def __init__(self, *, parser_class, protocol):
+            self._parser = parser_class()
+
+    assert await ru._check_parser(Connection, BrokenParser, 7900) is not None

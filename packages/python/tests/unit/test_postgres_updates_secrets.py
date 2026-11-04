@@ -84,3 +84,29 @@ async def test_cancelled_connect_does_not_retain_secrets(monkeypatch):
     await updates.close()
     assert SECRET not in repr(vars(updates))
     assert HOST not in repr(vars(updates))
+
+
+def test_connection_settings_cannot_be_pickled_into_plaintext():
+    import pickle
+
+    updates = PostgresUpdates(url=f"postgresql://u:{SECRET}@{HOST}/db")
+    with pytest.raises(TypeError) as caught:
+        pickle.dumps(updates)
+    assert SECRET not in str(caught.value) and HOST not in str(caught.value)
+
+
+async def test_unbound_transport_fails_without_using_environment_defaults():
+    updates = PostgresUpdates()
+    with pytest.raises(ValueError, match="url="):
+        await updates.send(['["r"]'])
+
+
+def test_password_query_without_user_is_preserved_but_redacted():
+    from sqlalchemy.engine import make_url
+
+    from dendrux.db._postgres_updates import asyncpg_dsn
+
+    dsn = asyncpg_dsn(f"postgresql://localhost/db?password={SECRET}")
+    assert make_url(dsn).query["password"] == SECRET
+    updates = PostgresUpdates(url=dsn)
+    assert SECRET not in repr(vars(updates))

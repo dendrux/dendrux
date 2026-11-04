@@ -55,7 +55,7 @@ _NUMBERS = frozenset(
     }
 )
 _ENUMS = {
-    "error_kind": frozenset({"timeout", "connection", "cancelled", "closed", "other"}),
+    "error_kind": frozenset({"timeout", "connection", "cancelled", "closed", "other", "tls"}),
     "db_kind": frozenset(
         [
             "unique_violation",
@@ -980,7 +980,7 @@ LIVE_UPDATES_DEGRADED = Code(
     "live_updates_degraded",
     logging.WARNING,
     "live_updates",
-    _BASE_FIELDS | frozenset(["error_kind"]),
+    _BASE_FIELDS | frozenset(["error_kind", "error_type"]),
     "The listener loses its subscription; readers poll.",
     "Check bus connectivity; alert after one minute.",
 )
@@ -998,7 +998,7 @@ LIVE_UPDATES_UNAVAILABLE = Code(
     "live_updates_unavailable",
     logging.WARNING,
     "live_updates",
-    _BASE_FIELDS | frozenset(["error_kind"]),
+    _BASE_FIELDS | frozenset(["error_kind", "error_type"]),
     "The listener cannot become ready.",
     "Check the live-update transport; polling remains available.",
 )
@@ -1016,7 +1016,7 @@ LIVE_UPDATES_SEND_FAILED = Code(
     "live_updates_send_failed",
     logging.WARNING,
     "live_updates",
-    _BASE_FIELDS | frozenset(["error_kind", "count"]),
+    _BASE_FIELDS | frozenset(["error_kind", "error_type", "count"]),
     "An announcement fails and sending enters backoff.",
     "Check bus connectivity; the database commit is unaffected.",
 )
@@ -1038,6 +1038,16 @@ LIVE_UPDATES_OVERFLOW = Code(
     "Pending announcements exceed their bound.",
     "Share stores or raise the pending bound; readers recover by polling.",
 )
+
+LIVE_UPDATES_OVERSIZE = Code(
+    "live_updates_oversize",
+    logging.WARNING,
+    "live_updates",
+    _BASE_FIELDS | frozenset(["count", "limit"]),
+    "A live-update hint exceeded the message byte limit and was dropped.",
+    "Increase max_message_bytes within the transport limit, or use shorter run ids.",
+)
+
 
 LIVE_UPDATES_WRONG_LOOP = Code(
     "live_updates_wrong_loop",
@@ -1981,6 +1991,7 @@ REGISTRY = MappingProxyType(
             LIVE_UPDATES_SEND_FAILED,
             LIVE_UPDATES_SEND_RECOVERED,
             LIVE_UPDATES_OVERFLOW,
+            LIVE_UPDATES_OVERSIZE,
             LIVE_UPDATES_WRONG_LOOP,
             LIVE_UPDATES_BAD_MESSAGE,
             LIVE_UPDATES_CLOSE_TIMEOUT,
@@ -2021,7 +2032,15 @@ def _valid_field(name: str, value: Any) -> bool:
         return type(value) in (int, float) and (type(value) is int or math.isfinite(value))
     if name in {"retryable", "truncated"}:
         return type(value) is bool
-    return isinstance(value, str) and value in _ENUMS.get(name, ())
+    return _valid_text_field(name, value)
+
+
+def _valid_text_field(name: str, value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    if name == "error_type":
+        return value.isascii() and value.isidentifier() and len(value) <= 128
+    return value in _ENUMS.get(name, ())
 
 
 def _message(code: Code) -> str:

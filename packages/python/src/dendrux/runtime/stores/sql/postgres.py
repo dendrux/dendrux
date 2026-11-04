@@ -49,6 +49,16 @@ class PostgresStateStore(SQLStateStore):
         super().__init__(engine, live_updates=live_updates)
         self.capabilities = replace(self.capabilities, deployment="multi_server")
 
+    def _resolve_live_updates(self, updates: LiveUpdates | bool) -> LiveUpdates:
+        from dendrux.db._live_updates import LiveUpdates
+
+        if updates is not True and not isinstance(updates, LiveUpdates):
+            raise ValueError(
+                "PostgresStateStore live_updates requires True or PostgresUpdates(), "
+                "or another LiveUpdates instance such as RedisUpdates(...)."
+            )
+        return super()._resolve_live_updates(updates)
+
     def _native_live_updates(self) -> LiveUpdates | None:
         from dendrux.db._postgres_updates import PostgresUpdates
 

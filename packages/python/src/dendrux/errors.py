@@ -118,7 +118,11 @@ class StoreCapabilityError(TypeError):
         self.method = method
         self.missing = missing
         super().__init__(
-            f"StateStore {store} capability '{capability}': {method} lacks {missing!r}."
+            f"StateStore {store} capability '{capability}': {method} lacks {missing!r}. "
+            "Copy the base store method signature, including explicit keyword-only parameters, "
+            "or declare narrower capabilities: "
+            "self.capabilities = StoreCapabilities(deployment=self.capabilities.deployment). "
+            "That declaration disables optional capabilities; enable only those you implement."
         )
 
 

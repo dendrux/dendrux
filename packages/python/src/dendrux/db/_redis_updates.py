@@ -19,7 +19,9 @@ from __future__ import annotations
 import asyncio
 import codecs
 import secrets
+import ssl
 import threading
+from collections.abc import Mapping
 from contextlib import suppress
 from functools import lru_cache
 from time import monotonic
@@ -30,7 +32,7 @@ from urllib.parse import parse_qsl, urlsplit
 from dendrux.db._live_updates import LiveUpdates
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
+    from collections.abc import AsyncIterator, Iterable, Sequence
 
     from dendrux.db._live_updates import _Gap
 
@@ -262,6 +264,7 @@ def _checked_url(url: object) -> str:
     if query is None:
         raise ValueError("url is not a valid Redis URL")
     _checked_query(query)
+    _check_port(url)
     return url
 
 
@@ -285,8 +288,46 @@ def _is_utf8(name: object) -> bool:
         return False
 
 
+def _option_mapping(options: Mapping[str, Any] | None) -> dict[str, Any]:
+    if options is not None and not isinstance(options, Mapping):
+        raise TypeError("client_options must be a mapping")
+    return dict(options or {})
+
+
+def _check_port(url: str) -> None:
+    valid = False
+    try:
+        port = urlsplit(url).port
+        valid = port is None or 0 < port <= 65_535
+    except ValueError:
+        pass
+    if not valid:
+        raise ValueError("Redis URL port must be a number from 1 to 65535")
+
+
+def _tls_failure(error: BaseException) -> bool:
+    current: BaseException | None = error
+    for _ in range(8):
+        if current is None:
+            return False
+        if isinstance(current, ssl.SSLError):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _redis_error(api: Any, error: BaseException) -> Exception:
+    if _tls_failure(error):
+        return ssl.SSLError("Redis live updates TLS handshake failed")
+    if isinstance(error, (TimeoutError, api.TimeoutError)):
+        return TimeoutError("Redis live updates timed out")
+    if isinstance(error, (OSError, api.ConnectionError)):
+        return ConnectionError("Redis live updates connection failed")
+    return RuntimeError("Redis live updates failed")
+
+
 def _checked_options(options: Mapping[str, Any] | None) -> dict[str, Any]:
-    chosen = dict(options or {})
+    chosen = _option_mapping(options)
     if "encoding" in chosen and not _is_utf8(chosen["encoding"]):
         raise ValueError("client_options encoding must be utf-8, the encoding of the wire format")
     refused = sorted(key for key in chosen if key in _FORBIDDEN_OPTIONS)
@@ -392,11 +433,11 @@ class _Subscription:
     def _message(self, data: object) -> str | None:
         self._alive()
         if data is _DISCARDED:
-            self.owner._counts["dropped_oversize"] += 1
+            self.owner._oversize_dropped()
             return None
         text = _text(data)
         if len(text.encode("utf-8")) > self.owner.max_message_bytes:
-            self.owner._counts["dropped_oversize"] += 1
+            self.owner._oversize_dropped()
             return None
         return text
 
@@ -474,14 +515,13 @@ class RedisUpdates(LiveUpdates):
         except Exception:
             valid = False
         if not valid:
-            raise ValueError("url or client_options are not accepted by the Redis client")
+            raise ValueError(
+                "A Redis URL option or client_options setting is unsupported; "
+                "check the option names and types"
+            )
 
     def _plain_error(self, error: BaseException) -> Exception:
-        if isinstance(error, (TimeoutError, self._api.TimeoutError)):
-            return TimeoutError("Redis live updates timed out")
-        if isinstance(error, (OSError, self._api.ConnectionError)):
-            return ConnectionError("Redis live updates connection failed")
-        return RuntimeError("Redis live updates failed")
+        return _redis_error(self._api, error)
 
     # -- send ------------------------------------------------------------------------------
 
