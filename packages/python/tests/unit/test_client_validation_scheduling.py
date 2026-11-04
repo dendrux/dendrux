@@ -21,7 +21,7 @@ async def read_range() -> list:
 @pytest.mark.parametrize("shape", ["numbers", "arrays", "objects"])
 @pytest.mark.parametrize("from_wire", [False, True])
 async def test_near_megabyte_validation_keeps_ticker_responsive(monkeypatch, from_wire, shape):
-    import dendrux.types as types
+    import dendrux._wire as wire
 
     payload = {
         "numbers": "[" + "0," * 524280 + "0]",
@@ -30,7 +30,7 @@ async def test_near_megabyte_validation_keeps_ticker_responsive(monkeypatch, fro
     }[shape]
     call = ToolCall("read_range")
     pause = SimpleNamespace(pending_tool_calls=[call])
-    original = types._validate_persistable
+    original = wire._validate_persistable
     walks = []
     work_intervals = []
 
@@ -44,7 +44,7 @@ async def test_near_megabyte_validation_keeps_ticker_responsive(monkeypatch, fro
         finally:
             work_intervals.append((started, time.monotonic()))
 
-    monkeypatch.setattr(types, "_validate_persistable", observed)
+    monkeypatch.setattr(wire, "_validate_persistable", observed)
     ready = asyncio.Event()
     stop = asyncio.Event()
     gaps = []
