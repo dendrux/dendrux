@@ -287,3 +287,44 @@ async def test_connect_failure_never_logs_driver_text_or_destination(
     await updates.close()
     text = caplog.text + " ".join(str(r.__dict__) for r in caplog.records)
     assert "refused" not in text and "pooler" not in text and "pw" not in text
+
+
+@pytest.mark.parametrize(
+    ("health_check_s", "send_timeout_s"),
+    [(0.02, 0.05), (0.05, 0.01), (0.2, 0.01), (0.1, 0.1)],
+)
+async def test_silent_connection_loss_is_detected_within_twice_the_health_interval(
+    driver: Driver, monkeypatch: pytest.MonkeyPatch, health_check_s: float, send_timeout_s: float
+) -> None:
+    from types import SimpleNamespace
+
+    from dendrux.db import _postgres_updates as module
+
+    probes: list[float] = []
+    real_timeout = asyncio.timeout
+
+    def recording(seconds: float | None) -> Any:
+        probes.append(seconds if seconds is not None else float("inf"))
+        return real_timeout(seconds)
+
+    monkeypatch.setattr(
+        module, "asyncio", SimpleNamespace(**(vars(asyncio) | {"timeout": recording}))
+    )
+    updates = _updates(
+        health_check_s=health_check_s,
+        send_timeout_s=send_timeout_s,
+        flush_deadline_s=max(send_timeout_s, 0.05),
+    )
+    stream = updates.receive()
+    await _first(stream)
+    driver.connections[0].hang = "ping"
+    with pytest.raises(TimeoutError):
+        async with asyncio.timeout(5):
+            await anext(stream)
+    (probe,) = probes
+    assert probe <= health_check_s  # silence + probe <= 2 x health_check_s
+    assert probe == min(4 * send_timeout_s, health_check_s)
+
+
+def test_default_probe_deadline_is_four_send_timeouts() -> None:
+    assert _updates()._probe_timeout_s == 2.0  # 4 x 0.5 s, well inside 15 s of silence

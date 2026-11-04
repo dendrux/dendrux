@@ -268,6 +268,8 @@ class PostgresUpdates(LiveUpdates):
         self._listen_dsn: str | None = explicit_listen or self._send_dsn
         self._tls_checked = False
         self._sender: Any = None
+        # Silence (health_check_s) plus this probe stays within 2 x health_check_s.
+        self._probe_timeout_s = min(self.send_timeout_s * 4, self.health_check_s)
         self._listener: Any = None
 
     def bind(self, store: object) -> None:
@@ -341,7 +343,9 @@ class PostgresUpdates(LiveUpdates):
         """LISTEN on a dedicated connection; ``None`` once LISTEN has executed.
 
         Liveness: after ``health_check_s`` without a message, ``SELECT 1`` runs
-        on this same connection; a failure or a lost connection ends the stream.
+        on this same connection with ``min(4 x send_timeout_s, health_check_s)``
+        to answer, so a dead connection is found within ``2 x health_check_s``;
+        a failure or a lost connection ends the stream.
         The connection is always terminated when the stream ends.
         """
         buffer = self._new_inbound_buffer()
@@ -371,7 +375,7 @@ class PostgresUpdates(LiveUpdates):
             if message is not None:
                 return cast("str | _Gap", message)
             if not lost.is_set():
-                async with asyncio.timeout(self.send_timeout_s * 4):
+                async with asyncio.timeout(self._probe_timeout_s):
                     await connection.execute("SELECT 1")
 
     async def _wait_message(self, buffer: Any, lost: asyncio.Event) -> object | None:
