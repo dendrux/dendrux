@@ -948,6 +948,8 @@ def _backoff(delay: float, params: _Params) -> float:
 class _RunWaker:
     """A ``stream_events`` hub consumer: one coalescing event for one run."""
 
+    _live_updates_run_waker = True
+
     def __init__(self, run_id: str) -> None:
         self.run_id = run_id
         self.event = asyncio.Event()
