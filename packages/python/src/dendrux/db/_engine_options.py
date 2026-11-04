@@ -133,7 +133,6 @@ def split_database_options(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Keep store-only configuration away from SQLAlchemy engine construction."""
     engine = dict(supplied or {})
-    store = {}
-    if "notify_channel" in engine:
-        store["notify_channel"] = engine.pop("notify_channel")
-    return engine, store
+    if {"live_updates", "notify_channel"}.intersection(engine):
+        raise ValueError("Live updates require an explicit store; use Agent(state_store=...)")
+    return engine, {}
