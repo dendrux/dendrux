@@ -122,6 +122,26 @@ A retried transaction is attempted at most three more times after the first try,
 
 Drain those runs before upgrading, or explicitly keep `Budget(..., count_cache_tokens=False)` for the upgrade window. If you intend to change the accounting while continuing existing runs, use `Agent(..., on_governance_change="warn")` while they drain and review the token limit. An existing token budget that already chose `count_cache_tokens=True` keeps that choice. Budget amounts remain outside the digest so raising a paused run's limit is still allowed.
 
+## Bounded reads
+
+Four `RunStore` list reads and `get_subtree` can return as much as a run holds. 0.6.0 keeps them working and warns, so you can fix your calls before 0.7 changes the defaults.
+
+| Call | 0.6.0 | 0.7 |
+| --- | --- | --- |
+| `get_events`, `get_traces`, `get_llm_calls`, `get_tool_invocations` without `limit` | Reads every row and emits a `FutureWarning` | `limit` defaults to 1,000 |
+| The same with `limit` above 1,000 | `FutureWarning`; SQL stores and the format-2 `get_traces` clamp to 1,000, a custom store receives the limit unchanged | Raises |
+| `get_subtree` without `max_nodes` | Reads the whole tree and emits a `FutureWarning` | `max_nodes` defaults to 10,000 |
+
+What to do:
+
+- Pass `limit=` (1 to 1,000) on every list read. Page events with `after_sequence_index=` (the last `sequence_index` you got) and the other three with `offset=` (plus the rows you got). A full-history export loops until a page comes back empty; the loops are on the [RunStore reference](/docs/reference/run-store#bounded-list-reads).
+- Pass `max_nodes=` to `get_subtree` and handle `SubtreeTooLargeError`, raised when the descendants (root excluded) reach the bound. It bounds the node count, not memory.
+- A format-2 `get_traces` rebuilds the conversation on every page, within 20,000 expanded rows and 16 MiB; above that it raises `RunNotReclaimableError(reason="history_too_large")`. A smaller page does not avoid it.
+- Find the calls that still warn with `python -W error::FutureWarning` over your tests. The `sweep()` warning about omitting `on_stale=` is separate.
+- Zero and negative limits now read one row on every SQL path, including the format-2 `get_traces`, which used to return an empty list.
+
+Close the reader before you dispose its engine, in `async with` or a `finally`. Closing the last follower leaves the shared coordinator running until it idles out after about 60 seconds or the reader closes; disposing the engine first can make its next read fail with a pool error and log `follow_read_failed`. See [Scaling workers](/docs/guides/scaling#build-the-store-once-at-startup).
+
 ## Other changes to check
 
 - `agent.reclaim()` always requires an explicit `tenant_id`, including when `strict_tenancy=False`. Prefer the `tenant_id` on the returned sweep item. Explicit `None` selects untenanted runs; trusted cross-tenant code can pass `UNSCOPED`.
