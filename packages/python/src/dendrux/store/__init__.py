@@ -944,8 +944,9 @@ class RunStore:
         generator. A run's tenant never changes, so the scope is checked once.
 
         With live updates (``RunStore(store)`` on a store that has them) a
-        hint for this run wakes the next read at once; ``poll_interval_s``
-        still bounds every wait. Each caller registers one hub consumer, at
+        hint for this run wakes the next read, with a minimum read interval
+        of ``poll_interval_s / 10``; ``poll_interval_s`` still bounds idle waits.
+        Each caller registers one hub consumer, at
         most 10,000 per ``LiveUpdates`` (``FollowCapacityError`` before the
         first yield). Prefer :meth:`follow`.
         """
@@ -987,6 +988,7 @@ class RunStore:
     ) -> AsyncIterator[StoredEvent]:
         """Per-caller polling, woken early by hints for this run."""
         while True:
+            read_at = asyncio.get_running_loop().time()
             waker.event.clear()
             rows = await self._state.get_run_events(
                 run_id, after_sequence_index=cursor, limit=DEFAULT_EVENT_LIMIT
@@ -998,9 +1000,7 @@ class RunStore:
             # A full batch may have more buffered: keep draining before waiting.
             if len(rows) == DEFAULT_EVENT_LIMIT:
                 continue
-            with contextlib.suppress(TimeoutError):
-                async with asyncio.timeout(poll_interval_s):
-                    await waker.event.wait()
+            await waker.wait(poll_interval_s, read_at)
 
     async def get_llm_calls(
         self,

@@ -1016,6 +1016,9 @@ async def test_stream_events_is_woken_by_the_hub_and_unregisters(clock: Clock) -
     state.write("r1")
     live.hint("r1")
     await ticks()
+    assert not reader.done()  # Coalesced until poll_interval_s / 10.
+    clock.advance(100)
+    await ticks(40)
     assert reader.done() and reader.result().sequence_index == 0
     await stream.aclose()
     assert live._stream_consumers == 0
@@ -1055,6 +1058,9 @@ async def test_stream_events_hint_during_a_read_is_not_lost(clock: Clock) -> Non
     live.hint("r1")  # lands while the empty read is in flight
     await ticks()
     state.gate.set()
+    await ticks(40)
+    assert not reader.done()  # Coalesced until poll_interval_s / 10.
+    clock.advance(100)
     await ticks(40)
     assert reader.done() and reader.result().sequence_index == 0
     await stream.aclose()

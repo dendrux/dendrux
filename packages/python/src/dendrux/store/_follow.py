@@ -879,6 +879,13 @@ class _RunWaker:
     def on_gap(self) -> None:
         self.event.set()
 
+    async def wait(self, poll_interval_s: float, read_at: float) -> None:
+        with contextlib.suppress(TimeoutError):
+            async with asyncio.timeout(poll_interval_s):
+                await self.event.wait()
+        remaining = read_at + poll_interval_s / 10 - asyncio.get_running_loop().time()
+        await asyncio.sleep(max(0.0, remaining))
+
 
 class EventFeed:
     """Followers of many runs with a follower cap, over one ``RunStore``.
