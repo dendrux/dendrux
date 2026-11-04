@@ -1,8 +1,10 @@
 """Detached close must release real server connections before garbage collection."""
 
 import asyncio
+import gc
 import os
 import uuid
+import warnings
 
 import asyncpg
 import pytest
@@ -28,9 +30,7 @@ async def _count(kind, url, name):
         await connection.aclose()
 
 
-@pytest.mark.parametrize("kind", ["postgres", "redis"])
-@pytest.mark.parametrize("cancel_listener", [True, False])
-def test_closed_loop_close_disconnects_without_gc(pg_test_url, kind, cancel_listener):
+def _assert_closed_loop_close(pg_test_url, kind, cancel_listener):
     name = "rf2fix-" + uuid.uuid4().hex
     if kind == "postgres":
         url = (
@@ -72,3 +72,16 @@ def test_closed_loop_close_disconnects_without_gc(pg_test_url, kind, cancel_list
         assert bus._sender is None and bus._listener is None
     else:
         assert bus._wire.pool is None and bus._wire.subscription is None
+
+
+@pytest.mark.parametrize("kind", ["postgres", "redis"])
+@pytest.mark.parametrize("cancel_listener", [True, False])
+def test_closed_loop_close_disconnects_without_gc(pg_test_url, kind, cancel_listener):
+    try:
+        _assert_closed_loop_close(pg_test_url, kind, cancel_listener)
+    finally:
+        # The helper's local references are gone. Collect the deliberately abandoned
+        # loop objects here so their ResourceWarnings cannot escape into another test.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", ResourceWarning)
+            gc.collect()
