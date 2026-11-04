@@ -198,6 +198,10 @@
   guides; expand scaling, observability and tracing guidance. See `docs/upgrading-to-0.6.0.mdx`
   for the rollout.
 
+### Deprecated
+
+- ConsoleNotifier warns when unused show_llm_text or max_text_length options are set to non-default values.
+
 ### Fixed
 
 - SingleCall stops before retrying a provider call when an image guardrail blocks the retry.
