@@ -119,7 +119,7 @@ See [Recovery](/docs/guides/recovery) for attempt limits, recovery approval and 
 
 ## Live updates
 
-Live updates tell other processes that a run may have changed, so `follow()` and `stream_events()` wake within milliseconds instead of waiting for the next poll. They are optional and off by default.
+Live updates tell other processes that a run may have changed, so `follow()` and `stream_events()` read it as soon as the hint arrives instead of waiting for the next poll. They are optional and off by default.
 
 > **Hints are lossy; the database is the truth.** A hint carries only run ids. It can arrive late, twice, out of order or never, and a reader always re-reads the database before it shows anything. An announcement never fails, rolls back or changes the result of a save. If every hint is lost, followers still see every event: they poll.
 
@@ -241,7 +241,7 @@ from dendrux.store import MySQLStateStore, RedisUpdates, RunStore
 updates = RedisUpdates(
     "rediss://redis.internal:6379/0",
     channel="myapp:prod:dendrux",      # unique per application and environment
-    client_options=None,               # for example {"password": ...}
+    client_options=None,               # extra redis-py options, for example {"ssl_cert_reqs": "required"}
 )
 state = MySQLStateStore(engine, live_updates=updates)
 reads = RunStore(state)
@@ -249,7 +249,7 @@ reads = RunStore(state)
 
 - **Importing needs nothing; constructing needs the extra.** `from dendrux.store import RedisUpdates` works without the Redis client. Calling `RedisUpdates(...)` without it raises `ImportError` that names `pip install dendrux[redis]`. The client is `redis>=5.0.1,<9`. Releases 5.0.1, 5.3.1, 6.4.0, 7.4.0 and 8.1.0 are tested; another release in the range is checked when you construct the transport and refused with `ImportError` if its parser cannot bound a message.
 - **Name the channel.** Pub/Sub ignores the Redis database number, so the default `dendrux:events` is a starting point, not a namespace. Use one channel per application and environment, and the same one on every writer and reader.
-- **URLs.** `redis://`, `rediss://` (TLS) and `unix://`. A URL or `client_options` that sets the timeouts, retries, connection pool, `protocol`, `parser_class`, `host`, `port` or a second connection is refused with a `ValueError`, because Dendrux fixes those. A text `encoding` other than UTF-8 is refused too.
+- **URLs.** `redis://`, `rediss://` (TLS) and `unix://`. A URL query string or `client_options` that sets the timeouts, retries, connection pool, `protocol`, `parser_class`, `host`, `port` or a second connection is refused with a `ValueError`, because Dendrux fixes those. A text `encoding` other than UTF-8 is refused too.
 - **Connections.** The sender is one connection used for one pipelined round trip per send. The listener is one Pub/Sub connection on the pure-Python RESP2 parser (hiredis is not used for it), so an oversized message is refused before it is read. It never reconnects silently: a lost connection is reported as a gap and the transport reconnects with backoff.
 - **Liveness.** The listener sends a token-matched `PING` on its own connection after `health_check_s` (15 s) of silence and finds a dead connection within twice that time.
 - **Secrets.** The URL, host and password never appear in logs, errors or `repr`. Hints carry run ids only, but the channel is as trusted as the Redis server: use ACLs and `rediss://`.
