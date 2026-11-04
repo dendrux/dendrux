@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 
+from dendrux._meta_keys import NOT_EXECUTED_META_KEY
 from dendrux.agent import Agent
 from dendrux.llm._helpers import NOT_AN_OBJECT_ERROR, build_tool_call, parse_tool_json
 from dendrux.llm.mock import MockLLM
@@ -283,7 +284,7 @@ class TestLoop:
         assert WRITES == [GOOD_PARAMS]
         (first,) = _tool_messages(llm, 1)
         assert first.call_id == bad.id
-        assert first.meta == {"is_error": True}
+        assert first.meta == {"is_error": True, NOT_EXECUTED_META_KEY: True}
         assert json.loads(first.content) == {
             "error": format_invalid_json("write_file", DOCSTRING_ERROR),
             "code": "invalid_json",
