@@ -78,6 +78,7 @@ def test_the_mysql_family_jobs_run_the_live_contract_on_their_server(server: str
     [
         ("python", "Store kit live-update contract on Postgres", "postgres"),
         ("mysql-family", "Store kit live-update contract on", "mysql"),
+        ("mysql-family", "Store kit live-update contract on", "mariadb"),
     ],
 )
 class TestTheSkipGuard:
@@ -85,16 +86,34 @@ class TestTheSkipGuard:
         self, job: str, prefix: str, db: str, tmp_path: Path
     ) -> None:
         run = step(job, prefix)["run"]
-        result = run_guard(run, GOOD.format(db=db) + "\n7 passed, 205 deselected\n", tmp_path)
+        result = run_guard(
+            run, GOOD.format(db=db) + "\n===== 7 passed, 205 deselected in 1.0s =====\n", tmp_path
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+
+    @pytest.mark.parametrize(
+        "test_id",
+        ["9 passed, 1 skipped", " SKIPPED [1]", "live updates: not tested", "no tests ran"],
+    )
+    def test_skip_words_in_a_passing_test_id_are_accepted(
+        self, job: str, prefix: str, db: str, test_id: str, tmp_path: Path
+    ) -> None:
+        run = step(job, prefix)["run"]
+        log = GOOD.format(db=db).replace("test_live_a", f"test_live_a[{test_id}]")
+        result = run_guard(run, log + "\n===== 7 passed in 1.0s =====\n", tmp_path)
         assert result.returncode == 0, result.stdout + result.stderr
 
     @pytest.mark.parametrize(
         "log",
         [
             "",  # nothing ran
-            "7 skipped, 205 deselected\n",
-            GOOD + "\ntests/conformance/test_store_kit.py::test_live_x [db] SKIPPED (why)\n",
+            "===== 7 skipped, 205 deselected in 1.0s =====\n",
+            GOOD + "\n===== 7 passed, 1 skipped in 1.0s =====\n",
+            GOOD + "\nSKIPPED [1] unrelated reason\n",
+            GOOD + "\ntests/conformance/test_store_kit.py::test_live_x [db] SKIPPED (why)\n"
+            "SKIPPED [1] why\n",
             GOOD + "\n  live updates: not tested (no dendrux_live_store_factory fixture)\n",
+            GOOD + "\n===== no tests ran in 1.0s =====\n",
             "\n".join(GOOD.splitlines()[:6]),  # one contract short
         ],
     )

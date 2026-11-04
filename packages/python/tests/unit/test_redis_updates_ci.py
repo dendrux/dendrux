@@ -51,11 +51,21 @@ def test_the_suites_run_against_a_real_redis_service_and_fail_on_a_skip() -> Non
 @pytest.mark.parametrize(
     ("output", "pytest_status", "expected"),
     [
-        ("10 passed", 0, 0),
-        ("9 passed, 1 skipped", 0, 1),
+        ("===== 10 passed in 1.0s =====", 0, 0),
+        (
+            "tests/unit/test_redis_updates_ci.py::"
+            "test_redis_ci_shell_rejects_any_skip_or_pytest_failure"
+            "[9 passed, 1 skipped-0-1] PASSED [100%]\n"
+            "===== 10 passed in 1.0s =====",
+            0,
+            0,
+        ),
+        ("skipped [1] diagnostic only\n===== 10 passed in 1.0s =====", 0, 0),
+        ("===== 9 passed, 1 skipped in 1.0s =====", 0, 1),
+        ("===== 1 skipped in 1.0s =====", 0, 1),
         ("SKIPPED [1] unrelated reason", 0, 1),
         ("SKIPPED [1] DENDRUX_TEST_REDIS_URL not set", 0, 1),
-        ("1 failed, 9 passed", 1, 1),
+        ("===== 1 failed, 9 passed in 1.0s =====", 1, 1),
     ],
 )
 def test_redis_ci_shell_rejects_any_skip_or_pytest_failure(

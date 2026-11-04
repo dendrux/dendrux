@@ -166,7 +166,7 @@ jobs:
         run: |
           pytest tests/conformance/test_store_kit.py -k "test_live_ and postgres" -n 0 --no-cov -v -rs -p no:randomly | tee kit-live.log
           passed=$(grep -c ' PASSED' kit-live.log || true)
-          if [ "$passed" -lt 7 ] || grep -Eq ' SKIPPED|[0-9]+ skipped|live updates: not tested|no tests ran' kit-live.log; then
+          if [ "$passed" -lt 7 ] || grep -Eq '^SKIPPED \[|^=+ .*[0-9]+ skipped|^[[:space:]]*live updates: not tested|^=+ .*no tests ran' kit-live.log; then
             echo "::error::The live-update kit contract must pass 7 times on Postgres and skip never (got $passed passed)."
             exit 1
           fi
@@ -400,7 +400,7 @@ jobs:
         shell: bash
         run: |
           pytest tests/unit/test_redis_updates*.py tests/integration/test_redis_updates.py -n 0 --no-cov -v -rs -p no:randomly | tee pytest.log
-          if grep -Eiq '(^SKIPPED|[0-9]+ skipped)' pytest.log; then
+          if grep -Eq '^SKIPPED \[|^=+ .*[0-9]+ skipped' pytest.log; then
             echo "::error::Redis compatibility tests were skipped."
             exit 1
           fi
@@ -528,7 +528,7 @@ jobs:
           export ${{ matrix.env_name }}="$SERVER_URL"
           pytest tests/conformance/test_store_kit.py -k "test_live_ and ${{ matrix.server }}" -n 0 --no-cov -v -rs -p no:randomly | tee kit-live.log
           passed=$(grep -c ' PASSED' kit-live.log || true)
-          if [ "$passed" -lt 7 ] || grep -Eq ' SKIPPED|[0-9]+ skipped|live updates: not tested|no tests ran' kit-live.log; then
+          if [ "$passed" -lt 7 ] || grep -Eq '^SKIPPED \[|^=+ .*[0-9]+ skipped|^[[:space:]]*live updates: not tested|^=+ .*no tests ran' kit-live.log; then
             echo "::error::The live-update kit contract must pass 7 times on ${{ matrix.server }} and skip never (got $passed passed)."
             exit 1
           fi
