@@ -58,6 +58,7 @@ from dendrux.runtime._blob_catalog import edges_for_parts, scrub_inline_images
 from dendrux.runtime._cancel_guard import capture
 from dendrux.runtime._capabilities import capabilities
 from dendrux.runtime.durability import retry_critical, retry_transient_db
+from dendrux.runtime.state import read_run_control
 from dendrux.types import (
     ImagePart,
     ImageRef,
@@ -822,7 +823,7 @@ class PersistenceRecorder(BaseRecorder):
             if self._loop_state != self._durable_state:
                 await self._checkpoint()
         # Ownership can still change between this read and the network send.
-        await self._store_calls.get_run_control(run_id)
+        await read_run_control(self._store_calls, run_id)
         await self._cancel_guard.check(run_id)
 
     async def checkpoint_outcome(self, result: Any, provider_kwargs: Any) -> None:
