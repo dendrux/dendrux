@@ -203,8 +203,6 @@
 
 ### Fixed
 
-- Format-1 runs check ownership before each provider call and stop if ownership cannot be verified.
-
 - SingleCall stops before retrying a provider call when an image guardrail blocks the retry.
 
 - Client tool calls retain their per-run call limits across pauses on both storage formats.
