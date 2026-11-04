@@ -239,6 +239,10 @@
 ### Deprecated
 
 - ConsoleNotifier warns when unused show_llm_text or max_text_length options are set to non-default values.
+- Reading all events, traces, LLM calls or tool invocations through `RunStore` without `limit=` now emits `FutureWarning`; the default becomes 1,000 in 0.7. Page events with `after_sequence_index` and the other reads with `offset`.
+- `RunStore` limits above 1,000 now warn. SQL stores and format-2 public trace reads clamp to 1,000, while custom stores receive the limit unchanged. Oversized explicit limits will raise in 0.7. Zero and negative limits read one row on SQL stores and on the format-2 trace read (which used to return nothing).
+- Unbounded `RunStore.get_subtree` reads now emit `FutureWarning`; the 0.7 default becomes `max_nodes=10_000`. Pass an explicit positive bound and handle the new `dendrux.errors.SubtreeTooLargeError` (a `ValueError`), raised when the descendants, root excluded, reach it. It bounds the node count, not memory.
+- A format-2 `RunStore.get_traces` rebuilds the conversation within 20,000 expanded rows and 16 MiB and raises `RunNotReclaimableError(reason="history_too_large")` above that; paging does not avoid the bound.
 
 ### Fixed
 
