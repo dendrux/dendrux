@@ -39,7 +39,9 @@ from dendrux._lifecycle import PAUSE_STATUSES as PAUSE_STATUSES
 from dendrux._lifecycle import TERMINAL_EVENT_TYPES as _TERMINAL_EVENT_TYPES
 from dendrux._lifecycle import TERMINAL_STATUSES as TERMINAL_STATUSES
 from dendrux._sentinel import _UnsetType
-from dendrux.errors import FollowCapacityError, RunNotFoundError
+from dendrux.errors import FollowCapacityError as FollowCapacityError
+from dendrux.errors import RunNotFoundError
+from dendrux.errors import _capacity_error as _capacity_error
 from dendrux.runtime._pending import approval_calls as approval_calls
 from dendrux.runtime._pending import (
     check_read_bool,

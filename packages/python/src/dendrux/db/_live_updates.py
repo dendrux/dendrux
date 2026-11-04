@@ -6,18 +6,20 @@ import asyncio
 import json
 import logging
 import math
+import random
 from abc import ABC, abstractmethod
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from contextlib import suppress
 from dataclasses import dataclass
 from functools import wraps
 from time import monotonic
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Protocol, cast
 
 from dendrux import _codes
+from dendrux.errors import FollowCapacityError, LiveUpdatesUnavailableError
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Iterable, Sequence
+    from collections.abc import AsyncIterator, Callable, Iterable, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +34,7 @@ class LiveUpdatesStats:
     dropped_overflow: int = 0
     dropped_invalid: int = 0
     dropped_oversize: int = 0
+    dropped_inbound: int = 0
     dropped_failed: int = 0
     dropped_closed: int = 0
     dropped_wrong_loop: int = 0
@@ -65,12 +68,53 @@ def _quoted(run_id: str) -> str:
     return json.dumps(run_id, ensure_ascii=False, separators=(",", ":"))
 
 
+class _Consumer(Protocol):
+    def on_hints(self, run_ids: Sequence[str]) -> None: ...
+
+    def on_gap(self) -> None: ...
+
+
+class _InboundBuffer:
+    def __init__(self, limit: int, dropped: Callable[[], None]) -> None:
+        self._limit = limit
+        self._dropped = dropped
+        self._messages: deque[str] = deque()
+        self._ready = asyncio.Event()
+        self._gap = False
+
+    def put(self, message: str) -> None:
+        """Offer a transport message, dropping oldest on overflow with a sticky gap."""
+        if len(self._messages) == self._limit:
+            self._messages.popleft()
+            self._gap = True
+            self._dropped()
+        self._messages.append(message)
+        self._ready.set()
+
+    async def get(self) -> str:
+        """Return a gap before any retained messages after an overflow."""
+        await self._ready.wait()
+        if self._gap:
+            self._gap = False
+            return LiveUpdates.GAP
+        message = self._messages.popleft()
+        if not self._messages:
+            self._ready.clear()
+        return message
+
+    def qsize(self) -> int:
+        """Number of retained messages, excluding the coalesced gap marker."""
+        return len(self._messages)
+
+
 class LiveUpdates(ABC):
     """A lossy announcement bus with no sender task.
 
     ``send`` must cooperate with cancellation; abort hooks must be synchronous,
     prompt and idempotent. All limits count ids or UTF-8 wire bytes, never payloads.
     """
+
+    GAP = "\x00dendrux-live-updates-gap"
 
     def __init__(
         self,
@@ -124,6 +168,7 @@ class LiveUpdates(ABC):
         self.backoff_max_s = backoff_max_s
         self.health_check_s = health_check_s
         self._init_sender()
+        self._init_listener()
 
     def __init_subclass__(cls, **kwargs: object) -> None:
         super().__init_subclass__(**kwargs)
@@ -149,6 +194,7 @@ class LiveUpdates(ABC):
             dropped_overflow=0,
             dropped_invalid=0,
             dropped_oversize=0,
+            dropped_inbound=0,
             dropped_failed=0,
             dropped_closed=0,
             dropped_wrong_loop=0,
@@ -388,3 +434,249 @@ class LiveUpdates(ABC):
     async def aclose_sender(self) -> None:
         """Close the sender connection at instance shutdown."""
         return None
+
+    def _init_listener(self) -> None:
+        self._healthy = False
+        self._generation = 0
+        self._listener_failed = False
+        self._listener_backoff = self.backoff_initial_s
+        self._listener_lock = asyncio.Lock()
+        self._close_lock = asyncio.Lock()
+        self._listener_task: asyncio.Task[None] | None = None
+        self._listener_stopping = False
+        self._leases: set[object] = set()
+        self._consumers: dict[object, tuple[_Consumer, bool]] = {}
+        self._stream_consumers = 0
+
+    @property
+    def healthy(self) -> bool:
+        """Whether the listener has confirmed a live subscription."""
+        return self._healthy
+
+    @property
+    def generation(self) -> int:
+        """Monotonic generation of health transitions and missed hints."""
+        return self._generation
+
+    def _new_inbound_buffer(self) -> _InboundBuffer:
+        return _InboundBuffer(self.max_inbound, self._inbound_dropped)
+
+    def _inbound_dropped(self) -> None:
+        self._counts["dropped_inbound"] += 1
+
+    # Subclasses may lower or raise this cap for their deployment.
+    max_stream_consumers = 10_000
+
+    def register(self, consumer: _Consumer, *, stream_events: bool = True) -> object:
+        """Register callbacks; coordinators pass ``stream_events=False``.
+
+        Return an opaque handle for idempotent ``unregister``. Stream consumers
+        share the overridable ``max_stream_consumers`` class-level cap.
+        """
+        self._require_loop()
+        self._require_open()
+        if stream_events and self._stream_consumers >= self.max_stream_consumers:
+            _codes.log_code(logger, _codes.FOLLOW_CAPACITY, limit=self.max_stream_consumers)
+            raise FollowCapacityError(self.max_stream_consumers)
+        handle = object()
+        self._consumers[handle] = (consumer, stream_events)
+        self._stream_consumers += int(stream_events)
+        return handle
+
+    def unregister(self, handle: object) -> None:
+        """Idempotently remove a hub registration."""
+        self._require_loop()
+        registration = self._consumers.pop(handle, None)
+        if registration is not None:
+            self._stream_consumers -= int(registration[1])
+
+    def _deliver(self, message: str) -> None:
+        if message == self.GAP:
+            self._gap()
+            return
+        ids = self._decode(message)
+        if ids is not None:
+            for consumer, _ in tuple(self._consumers.values()):
+                with suppress(Exception, asyncio.CancelledError):
+                    consumer.on_hints(ids)
+
+    def _gap(self) -> None:
+        self._generation += 1
+        self._counts["gaps"] += 1
+        for consumer, _ in tuple(self._consumers.values()):
+            with suppress(Exception, asyncio.CancelledError):
+                consumer.on_gap()
+
+    def _health(self, healthy: bool) -> None:
+        if self._healthy == healthy:
+            return
+        self._healthy = healthy
+        self._gap()
+        if healthy:
+            self._listener_failed = False
+            self._listener_backoff = self.backoff_initial_s
+            _codes.log_code(logger, _codes.LIVE_UPDATES_RECOVERED)
+
+    def _degraded(self, error: BaseException) -> None:
+        self._health(False)
+        if not self._listener_failed:
+            self._listener_failed = True
+            _codes.log_code(logger, _codes.LIVE_UPDATES_DEGRADED, error_kind=_error_kind(error))
+
+    def _require_loop(self) -> None:
+        if not self._check_loop():
+            raise RuntimeError("LiveUpdates belongs to another event loop")
+
+    def _require_open(self) -> None:
+        if self._state != "open":
+            raise LiveUpdatesUnavailableError("closed")
+
+    async def acquire_listener(self) -> object:
+        """Lease one listener task; readiness is exposed by ``healthy`` and hub gaps."""
+        self._require_loop()
+        async with self._listener_lock:
+            self._require_open()
+            await self._start_listener()
+            handle = object()
+            self._leases.add(handle)
+            return handle
+
+    async def _start_listener(self) -> None:
+        if self._listener_stopping:
+            await self._stop_listener(monotonic() + self.close_timeout_s)
+        if self._listener_task is not None and not self._listener_task.done():
+            if self._listener_stopping:
+                raise LiveUpdatesUnavailableError("timeout")
+            return
+        self._require_open()
+        self._listener_stopping = False
+        self._listener_task = asyncio.create_task(self._listen(), name="dendrux-live-updates")
+
+    async def release_listener(self, handle: object) -> None:
+        """Idempotently release a lease, stopping the listener after the last one."""
+        self._require_loop()
+        async with self._listener_lock:
+            if handle not in self._leases:
+                return
+            self._leases.remove(handle)
+            if not self._leases:
+                await self._stop_listener(monotonic() + self.close_timeout_s)
+
+    async def _listen(self) -> None:
+        try:
+            while self._state == "open":
+                await self._listen_attempt()
+                delay = random.uniform(0, self._listener_backoff)
+                self._listener_backoff = min(self._listener_backoff * 2, self.backoff_max_s)
+                await asyncio.sleep(delay)
+        finally:
+            self._health(False)
+
+    async def _listen_attempt(self) -> None:
+        try:
+            await self._receive_messages()
+        except (Exception, asyncio.CancelledError) as error:
+            self._listener_failure(error)
+        else:
+            self._degraded(ConnectionError())
+
+    def _listener_failure(self, error: BaseException) -> None:
+        if _caller_cancelled():
+            raise asyncio.CancelledError from None
+        self._degraded(error)
+
+    async def _receive_messages(self) -> None:
+        iterator = self.receive()
+        try:
+            async with asyncio.timeout(self.send_timeout_s * 4):
+                first = await anext(iterator)
+                if first is not None:
+                    raise LiveUpdatesUnavailableError()
+            self._health(True)
+            async for message in iterator:
+                if message is None:
+                    raise LiveUpdatesUnavailableError()
+                self._deliver(message)
+        finally:
+            self._health(False)
+            close = getattr(iterator, "aclose", None)
+            if close is not None:
+                await close()
+
+    async def _stop_listener(self, deadline: float) -> None:
+        task = self._listener_task
+        if task is None:
+            return
+        self._cancel_listener()
+        try:
+            done, _ = await asyncio.wait({task}, timeout=max(0.0, deadline - monotonic()))
+            if not done:
+                self._abort_listener_safe()
+                self._close_timeout()
+        except asyncio.CancelledError:
+            self._abort_listener_safe()
+            raise
+        finally:
+            self._health(False)
+        if task.done():
+            self._listener_task = None
+            self._listener_stopping = False
+
+    def _cancel_listener(self) -> None:
+        if self._listener_task is not None and not self._listener_stopping:
+            self._listener_stopping = True
+            self._listener_task.cancel()
+
+    def _abort_listener_safe(self) -> None:
+        with suppress(Exception, asyncio.CancelledError):
+            self.abort_listener()
+
+    def _abort_all(self) -> None:
+        self._abort_sender_safe()
+        self._cancel_listener()
+        self._abort_listener_safe()
+        self._health(False)
+
+    def _close_timeout(self) -> None:
+        _codes.log_code(logger, _codes.LIVE_UPDATES_CLOSE_TIMEOUT, timeout_s=self.close_timeout_s)
+
+    async def close(self) -> None:
+        """Drain and close within one total deadline; a cancelled closer may be retried."""
+        self._require_loop()
+        async with self._close_lock:
+            if self._state == "closed":
+                return
+            self._state = "closing"
+            await self._close_owned()
+            self._state = "closed"
+            self._counts["dropped_closed"] += len(self._pending)
+            self._pending.clear()
+            self._leases.clear()
+            self._consumers.clear()
+            self._stream_consumers = 0
+
+    async def _close_owned(self) -> None:
+        deadline = monotonic() + self.close_timeout_s
+        try:
+            async with asyncio.timeout(self.close_timeout_s):
+                await self._close_resources(deadline)
+        except asyncio.CancelledError:
+            self._abort_all()
+            if _caller_cancelled():
+                raise
+        except TimeoutError:
+            self._abort_all()
+            self._close_timeout()
+        except Exception as error:
+            self._abort_all()
+            _codes.log_code(logger, _codes.LIVE_UPDATES_UNAVAILABLE, error_kind=_error_kind(error))
+
+    async def _close_resources(self, deadline: float) -> None:
+        await self._idle.wait()
+        await self._flush_until(min(deadline, monotonic() + self.flush_deadline_s))
+        async with self._listener_lock:
+            self._leases.clear()
+            await self._stop_listener(deadline)
+        if monotonic() >= deadline:
+            raise TimeoutError
+        await self.aclose_sender()
