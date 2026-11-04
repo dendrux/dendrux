@@ -29,7 +29,7 @@
 - Add the additive storage migration `f9a0b1c2d3e4`, resumable `dendrux db activate`
   and `db dedupe`, and storage-format/activation output in `db status`. Migrate,
   roll every worker and reader, back up, then activate before enabling reclaim or
-  notifications. Activation is one-way; rollback requires the pre-activation backup.
+  live updates. Activation is one-way; rollback requires the pre-activation backup.
   Runs keep their creation format; stale format-1 runs cannot be reclaimed.
 - Declare and validate `StateStore` capabilities at Agent construction. Undeclared
   custom stores retain legacy signatures and format 1. Subclass overrides must
@@ -47,17 +47,52 @@
   Format-2 options must be JSON-only and fit 2 KiB; pending assistant calls default
   to 64 (`Limits.max_pending_calls`). Checkpoints fit 32 KiB. History rebuild defaults
   to 16 MiB and 20,000 rows and refuses excess rather than truncating context.
-- Add opt-in `PostgresEventNotifier` hints for `follow` and `stream_events`. Writers
-  enable `notify_channel="dendrux_events"`; default-off writers issue no NOTIFY.
-  Readers use `listen_url=` on a primary direct or session-pool endpoint, or borrow
-  a started `notifier=`. LISTEN cannot use PgBouncer transaction pooling. Each notifying
-  transaction takes a database-wide commit lock; a 50-writer local probe saw about
-  45% lower write throughput. Monitor `pg_notification_queue_usage()` because a full
-  queue fails notifying writes. Every listener receives every hint on its channel.
-  Export `EventNotifier`, `NotifierState` and `Subscription` from `dendrux.store`.
+- Add optional live updates for `follow` and `stream_events`. Every SQL store takes
+  `live_updates=`: `None` or `False` (default) is off, `True` is the store's built-in
+  transport (Postgres LISTEN/NOTIFY; any other store raises `ValueError` naming
+  `RedisUpdates`), or pass a `LiveUpdates` instance: `PostgresUpdates`, `RedisUpdates`
+  (`pip install "dendrux[redis]"`, not part of `dendrux[all]`) or your own subclass that
+  writes `send` and `receive`. All are exported from `dendrux.store`. After a write's
+  COMMIT is issued the store announces the changed run ids on a separate connection, when
+  the outermost store call returns, and never fails, rolls back or delays the save by more
+  than `flush_deadline_s` (1 second), after which sending backs off. Hints are lossy and
+  carry run ids only: the database stays the truth and readers re-read it. Only
+  `RunStore(store)` listens; `RunStore.from_engine` and `RunStore.from_database_url` keep
+  polling. `Agent(database_options=)`, `sweep(database_url=)`, `get_engine` and
+  `RunStore.from_database_url` refuse `live_updates` and `notify_channel` with a
+  `ValueError`; build the store and pass it as `state_store=`. `await store.close()` closes
+  the bus and never disposes your engine; `Agent.close()` closes only a store it built.
+  `PostgresUpdates` uses two dedicated asyncpg connections (a lazy sender and a listener,
+  `listen_url=` for PgBouncer transaction pooling) and refuses SQLAlchemy-only URL keys
+  such as `?ssl=require` with a `ValueError` naming the key; pass `url=` with an
+  asyncpg-readable URL or `connect_args={"ssl": ...}`. `RedisUpdates` fixes its timeouts,
+  retries and protocol and needs a unique channel per application and environment. A
+  process with more than 16 open live-update stores for one database warns once. Each
+  announcement is one round trip, bounded by 10,000 pending ids, 500 ids per batch and
+  7,900 bytes per message. A final flush is skipped at `close()` while sending is in
+  backoff, a sweep that fails mid-page still flushes its earlier successes (at most
+  `flush_deadline_s`), and `close()` or a listener lease from another event loop is
+  refused. Monitor `pg_notification_queue_usage()`; a full queue fails announcements,
+  not saves. Every listener receives every hint on its channel.
+- `follow()` is served by one coordinator per `RunStore` and event loop that reads all
+  watched runs in batches (up to 200 runs and 2,000 rows per query, at most 20 queries a
+  second, the longest-waiting run first) instead of one poller per run. A hint makes a
+  run due at once; with healthy live updates a safety poll still runs every 10 seconds
+  (20% jitter either way), and without them an idle run is read every 0.5 seconds backing
+  off to 2 seconds. Status is never more than 30 seconds old and a terminal run is drained
+  before `FollowEnd`. `SQLStateStore` gains the batched `get_events_for_runs` and
+  `get_run_statuses` reads (indexed; Postgres uses `LATERAL`), custom stores without them
+  are read per run, and `events_for_runs_query` is an optional hook. `FollowCapacityError`
+  is defined in `dendrux.errors` and stays importable from `dendrux.store`.
+- Add `LiveUpdatesUnavailableError` and log codes `live_updates_degraded`,
+  `live_updates_recovered`, `live_updates_unavailable`, `live_updates_missed_hint`,
+  `live_updates_send_failed`, `live_updates_send_recovered`, `live_updates_overflow`,
+  `live_updates_wrong_loop`, `live_updates_bad_message`, `live_updates_close_timeout`,
+  `live_updates_tls_unknown`, `live_updates_many_stores`, `follow_read_failed` and
+  `follow_coordinator_restart`.
 - Add coded diagnostics and the generated log-code reference. Strict field checks
-  require `DENDRUX_STRICT_LOG_FIELDS=1`. Alert on `notifier_degraded`,
-  `notifier_unavailable` and `notifier_missed_hint`; polling remains the fallback.
+  require `DENDRUX_STRICT_LOG_FIELDS=1`. Alert on `live_updates_degraded`,
+  `live_updates_unavailable` and `live_updates_missed_hint`; polling remains the fallback.
   Provider-code projections use a closed set; unknown vendor or unmapped custom-provider
   codes become `provider_unknown`, with raw values only on `provider_code_raw`.
 - Persist trace links across pause, resume, submissions and reclaim. Delegated OTel
@@ -95,7 +130,8 @@
   included. `dendrux db migrate` builds the schema in resumable steps under a
   server-wide named lock, is forward-only, may share a database with application tables
   and refuses a database where the application keeps its own Alembic version table.
-  Event notifications stay PostgreSQL-only. See `docs/guides/mysql.mdx`.
+  The built-in live-update transport is PostgreSQL-only; a MySQL or MariaDB store takes
+  `RedisUpdates` or your own `LiveUpdates`. See `docs/guides/mysql.mdx`.
 - Handle statements larger than the database accepts. When MySQL or MariaDB answers with
   its packet-too-large error (1153, or 1301), the store raises the new
   `StatementTooLargeError` (a `PersistenceError`, code `statement_too_large`, with the
@@ -115,7 +151,7 @@
   `store_for_engine(engine)` picks the class from the engine's dialect and is used by
   `Agent`, `RunStore`, the CLI and `sweep`. **Breaking:** `SQLAlchemyStateStore` is removed
   with no alias. Use the matching concrete store or `store_for_engine`; subclasses change
-  their base; `notify_channel` is accepted only by `PostgresStateStore`. The types the
+  their base. The types the
   dialect hooks take and return (`ConflictSpec`, `InsertPlan`, `SelectSource`, `SetFields`,
   `AppendArray`, `RunLockScope`, `DialectFacts`, `DbError` and the rest) are exported from
   `dendrux.store`, so a store for another database needs no private import; pass such a
@@ -155,10 +191,13 @@
   capability. A session that prints NOT CERTIFIED, including an incomplete run, exits
   non-zero; a pass with unverified checks prints `CERTIFIED with caveats` and exits zero.
   A missing `dendrux_store_factory` fails one test with a setup message instead of every
-  contract. The kit also checks that a store declaring `notify` implements the hook (the
-  base class declares it with a hook that does nothing, so a subclass sets `notify=False`),
-  covers `get_replayed_tool_calls`, and keeps two store classes with one name apart in the
-  report. The guide now holds a complete public-import store that passes the kit, every
+  contract. The kit covers `get_replayed_tool_calls`, keeps two store classes with one name
+  apart in the report, and, with the optional `dendrux_live_store_factory` fixture, certifies
+  live updates (`live_updates` group): a committed write is announced only after a second
+  connection can see it, a write proved not to have applied announces nothing, and a write
+  whose COMMIT was issued is announced at the next flush even if the call failed. Without
+  the fixture the verdict says "live updates: not tested". `RecordingLiveUpdates` is
+  exported from `dendrux.testing.store_kit`. The guide now holds a complete public-import store that passes the kit, every
   hook with its signature, and how to plug in and create the schema of a store of your own.
   See `docs/guides/build-your-own-store.mdx`.
 - Extend the developer load harness to private MySQL and MariaDB databases, with bounded
