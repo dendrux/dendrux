@@ -144,11 +144,11 @@ jobs:
           files=$(python tools/test_tiers.py shard --count 4 --index ${{ matrix.shard }})
           # Benchmarks (marked benchmark) depend on the machine; `make bench` runs them.
           pytest $files -v -rs -n auto -m "not benchmark" --cov=src/dendrux --cov-report= | tee pytest.log
-          if grep -q 'DENDRUX_TEST_PG_URL not set' pytest.log; then
+          if grep -Eq '^SKIPPED \[[0-9]+\].*DENDRUX_TEST_PG_URL not set' pytest.log; then
             echo "::error::Postgres integration tests were skipped (DENDRUX_TEST_PG_URL not set)."
             exit 1
           fi
-          if grep -q 'DENDRUX_TEST_REDIS_URL not set' pytest.log; then
+          if grep -Eq '^SKIPPED \[[0-9]+\].*DENDRUX_TEST_REDIS_URL not set' pytest.log; then
             echo "::error::Redis integration tests were skipped (DENDRUX_TEST_REDIS_URL not set)."
             exit 1
           fi
@@ -342,7 +342,7 @@ jobs:
         shell: bash
         run: |
           pytest tests/ -v -rs -n 0 -m benchmark --no-cov --reruns 1 | tee pytest.log
-          if grep -q 'DENDRUX_TEST_PG_URL not set' pytest.log; then
+          if grep -Eq '^SKIPPED \[[0-9]+\].*DENDRUX_TEST_PG_URL not set' pytest.log; then
             echo "::error::Postgres benchmarks were skipped (DENDRUX_TEST_PG_URL not set)."
             exit 1
           fi
