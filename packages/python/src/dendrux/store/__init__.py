@@ -843,11 +843,13 @@ class RunStore:
         """Read events for a run in ``sequence_index`` order.
 
         ``after_sequence_index`` is an exclusive cursor. Pass the previous
-        batch's last ``sequence_index`` to continue. ``limit`` is clamped to
-        1..1000 (``None`` reads every event). ``event_types`` keeps only those
+        batch's last ``sequence_index`` to continue. ``None`` reads every
+        event. ``event_types`` keeps only those
         types (an empty list matches nothing). ``before`` is an exclusive,
         timezone-aware upper bound on ``created_at``. Empty when the run is
-        outside ``tenant_id``.
+        outside ``tenant_id``. SQL stores clamp pages to 1,000; custom stores
+        receive ``limit`` unchanged. Omitting it or exceeding 1,000 warns.
+        In 0.7 the default becomes 1,000 and larger limits raise.
         """
         check_read_int("after_sequence_index", after_sequence_index)
         check_read_int("limit", limit, wide=True)
@@ -1068,7 +1070,10 @@ class RunStore:
     ) -> list[TraceEntry]:
         """Return the conversation trace (user / assistant / tool messages)
         for a run, ordered by ``order_index``. ``limit``/``offset`` push
-        pagination into SQL. Empty when the run is outside ``tenant_id``."""
+        pagination into SQL. SQL stores and the format-2 branch clamp pages
+        to 1,000; custom format-1 stores receive ``limit`` unchanged. Omitting
+        it or exceeding 1,000 warns. In 0.7 the default becomes 1,000 and
+        larger limits raise. Empty when the run is outside ``tenant_id``."""
         _check_page(None, limit, offset)
         check_run_id(run_id)
         check_read_scope(tenant_id)

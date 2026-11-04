@@ -117,8 +117,8 @@ async def test_custom_store_limit_after_loading(descendants, refuses, caplog):
     assert len(loaded) == 1
 
 
-@pytest.mark.parametrize("value", [0, -1, True, 1.5, "10"])
-async def test_invalid_max_nodes_before_io(value):
+@pytest.mark.parametrize("value", [0, -1, True, 1.5, "10", 2**63, 2**64])
+async def test_invalid_max_nodes_before_io(value, caplog):
     class Legacy:
         async def get_subtree(self, *args, **kwargs):
             pytest.fail("read before validation")
@@ -128,6 +128,8 @@ async def test_invalid_max_nodes_before_io(value):
         with pytest.raises(ValueError):
             await RunStore(Legacy()).get_subtree("00000000000000000000000700", max_nodes=value)
     assert not caught
+    records = [r for r in caplog.records if getattr(r, "code", None) == "read_argument_invalid"]
+    assert len(records) == 1 and records[0].argument == "max_nodes"
 
 
 @pytest.mark.parametrize("reason", ["subtree_limit", "unpriced_model"])

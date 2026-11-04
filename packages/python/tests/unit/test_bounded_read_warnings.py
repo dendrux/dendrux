@@ -181,3 +181,19 @@ async def test_scheduled_task_attribution_is_asyncio():
             await asyncio.create_task(RunStore(ExplodingStore()).get_events("root"))
     assert len(caught) == 1
     assert "asyncio" in caught[0].filename
+
+
+def test_shared_frame_walk_keeps_capability_warning_at_caller():
+    from dendrux.runtime._capabilities import validate_capabilities
+
+    class LegacyDeclaration:
+        capabilities = StoreCapabilities()
+
+    store = LegacyDeclaration()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", DeprecationWarning)
+        line = inspect.currentframe().f_lineno + 1
+        validate_capabilities(store)
+        assert validate_capabilities(store) is store.capabilities
+    assert len(caught) == 1
+    assert caught[0].filename == __file__ and caught[0].lineno == line

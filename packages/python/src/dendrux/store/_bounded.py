@@ -10,18 +10,14 @@ from typing import Any
 from dendrux import _codes
 from dendrux.errors import BudgetConfigurationError, SubtreeTooLargeError
 from dendrux.runtime._bounds import MAX_PAGE
+from dendrux.runtime._capabilities import _developer_stacklevel
+from dendrux.runtime._pending import check_read_int
 
 logger = logging.getLogger(__name__)
 
 
 def _warn(message: str) -> None:
-    frame = inspect.currentframe()
-    stacklevel = 1
-    while frame is not None and frame.f_globals.get("__name__", "").startswith("dendrux."):
-        stacklevel += 1
-        frame = frame.f_back
-    del frame
-    warnings.warn(message, FutureWarning, stacklevel=stacklevel)
+    warnings.warn(message, FutureWarning, stacklevel=_developer_stacklevel())
 
 
 def _warn_page(method: str, limit: int | None, cursor: str) -> None:
@@ -43,12 +39,14 @@ def _trace_page_limit(limit: int | None) -> int | None:
 
 
 def _check_subtree_bound(max_nodes: int | None) -> None:
+    check_read_int("max_nodes", max_nodes, wide=True)
     if max_nodes is None:
         _warn(
             "RunStore.get_subtree() reads every descendant; pass max_nodes=. "
             "In 0.7 the default max_nodes becomes 10,000."
         )
-    elif isinstance(max_nodes, bool) or not isinstance(max_nodes, int) or max_nodes < 1:
+    elif max_nodes < 1:
+        _codes.log_code(logger, _codes.READ_ARGUMENT_INVALID, argument="max_nodes")
         raise ValueError("max_nodes must be a positive integer or None")
 
 
@@ -75,7 +73,7 @@ async def _read_subtree(method: Any, run_id: str, tenant_id: Any, max_nodes: int
     except BudgetConfigurationError as exc:
         if exc.reason != "subtree_limit" or max_nodes is None:
             raise
-        raise _limit_error(run_id, max_nodes) from exc
+        raise SubtreeTooLargeError(run_id, max_nodes) from exc
     if record is not None and max_nodes is not None and len(record.nodes) - 1 >= max_nodes:
         raise _limit_error(run_id, max_nodes)
     return record

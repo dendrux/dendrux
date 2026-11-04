@@ -109,12 +109,9 @@ async def test_subtree_ten_times_realistic_and_hostile_boundary(
                 assert "LIMIT" in statements[-1][0]
                 assert 10000 in statements[-1][1]
                 assert not any("llm_interactions" in sql for sql, _ in statements)
-                assert any(
-                    getattr(r, "code", None) == "subtree_limit"
-                    and r.run_id == ROOT
-                    and r.limit == 10000
-                    for r in caplog.records
-                )
+                records = [r for r in caplog.records if getattr(r, "code", None) == "subtree_limit"]
+                assert len(records) == 1
+                assert records[0].run_id == ROOT and records[0].limit == 10000
             else:
                 tree = await RunStore(state).get_subtree(ROOT, tenant_id="mine", max_nodes=10000)
                 assert len(tree.nodes) == 10000
@@ -222,3 +219,89 @@ async def test_live_audit_helpers_keep_full_history(engine, tmp_path, monkeypatc
         warnings.simplefilter("error", FutureWarning)
         assert len(await ctx.audit(ROOT)) == 1001
         assert [r.sequence_index for r in await ctx.events(ROOT, ["test"])] == list(range(1001))
+
+
+@pytest.mark.parametrize("value", [2**63, 2**64])
+async def test_oversized_subtree_limit_rejected_before_sql(engine, value, caplog):
+    state = store_for_engine(engine)
+    await state.create_run(ROOT, "root")
+    statements = []
+
+    def capture(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    event.listen(engine.sync_engine, "before_cursor_execute", capture)
+    try:
+        with pytest.raises(ValueError):
+            await RunStore(state).get_subtree(ROOT, max_nodes=value)
+        assert statements == []
+        records = [r for r in caplog.records if getattr(r, "code", None) == "read_argument_invalid"]
+        assert len(records) == 1 and records[0].argument == "max_nodes"
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", capture)
+
+
+async def test_descendant_batch_orders_by_created_at_then_id(engine):
+    from datetime import UTC, datetime
+
+    state = store_for_engine(engine)
+    await state.create_run(ROOT, "root", tenant_id="mine")
+    await seed(
+        engine,
+        AgentRun,
+        [
+            dict(
+                id="00000000000000000000000703",
+                agent_name="late",
+                parent_run_id=ROOT,
+                tenant_id="mine",
+                created_at=datetime(2026, 1, 2, tzinfo=UTC),
+            ),
+            dict(
+                id="00000000000000000000000702",
+                agent_name="early-b",
+                parent_run_id=ROOT,
+                tenant_id="mine",
+                created_at=datetime(2026, 1, 1, tzinfo=UTC),
+            ),
+            dict(
+                id="00000000000000000000000701",
+                agent_name="early-a",
+                parent_run_id=ROOT,
+                tenant_id="mine",
+                created_at=datetime(2026, 1, 1, tzinfo=UTC),
+            ),
+        ],
+    )
+    tree = await RunStore(state).get_subtree(ROOT, tenant_id="mine", max_nodes=10)
+    assert [node.run.agent_name for node in tree.nodes] == ["root", "early-a", "early-b", "late"]
+
+
+async def test_unbounded_subtree_keeps_tenant_scope_on_every_branch(engine):
+    state = store_for_engine(engine)
+    await state.create_run(ROOT, "root", tenant_id="mine")
+    await state.create_run(
+        "00000000000000000000000701", "mine", tenant_id="mine", parent_run_id=ROOT
+    )
+    await state.create_run(
+        "00000000000000000000000702", "foreign", tenant_id="other", parent_run_id=ROOT
+    )
+    await state.create_run(
+        "00000000000000000000000703",
+        "hidden",
+        tenant_id="mine",
+        parent_run_id="00000000000000000000000702",
+    )
+    reader = RunStore(state)
+    with pytest.warns(FutureWarning):
+        tree = await reader.get_subtree(ROOT, tenant_id="mine")
+    assert {node.run.agent_name for node in tree.nodes} == {"root", "mine"}
+    with pytest.warns(FutureWarning), pytest.raises(errors.RunNotFoundError):
+        await reader.get_subtree(ROOT, tenant_id="other")
+
+
+async def test_largest_int64_subtree_limit_still_passes(engine):
+    state = store_for_engine(engine)
+    await state.create_run(ROOT, "root")
+    tree = await RunStore(state).get_subtree(ROOT, max_nodes=2**63 - 1)
+    assert [node.run.run_id for node in tree.nodes] == [ROOT]

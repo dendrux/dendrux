@@ -191,6 +191,7 @@ _ENUMS = {
             "limit",
             "max_duration_s",
             "max_events",
+            "max_nodes",
             "max_runs",
             "metadata_filter",
             "offset",
