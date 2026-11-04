@@ -883,21 +883,24 @@ class SQLStateStore(SQLBlobCatalog):
         return None
 
     def _bind_live_updates(self, updates: LiveUpdates | bool | None) -> LiveUpdates | None:
-        from dendrux.db._live_updates import LiveUpdates
-
-        if updates is None:
+        if updates is None or updates is False:
             return None
-        if updates is True:
-            updates = self._native_live_updates()
-        if not isinstance(updates, LiveUpdates):
-            raise ValueError(
-                f"{type(self).__name__} requires a LiveUpdates instance; use RedisUpdates"
-            )
         from dendrux.runtime.stores.sql._live_registry import register
 
+        updates = self._resolve_live_updates(updates)
         updates.bind(self)
         register(self)
         return updates
+
+    def _resolve_live_updates(self, updates: LiveUpdates | bool) -> LiveUpdates:
+        from dendrux.db._live_updates import LiveUpdates
+
+        resolved = self._native_live_updates() if updates is True else updates
+        if not isinstance(resolved, LiveUpdates):
+            raise ValueError(
+                f"{type(self).__name__} requires a LiveUpdates instance; use RedisUpdates"
+            )
+        return resolved
 
     async def close(self) -> None:
         """Close store-owned live updates without disposing the engine."""

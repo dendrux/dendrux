@@ -49,7 +49,7 @@ async def test_bus_bound_property_close_and_engine_ownership(dialect, monkeypatc
     dispose.assert_not_awaited()
 
 
-@pytest.mark.parametrize("value", [True, False, 1, "sentinel"])
+@pytest.mark.parametrize("value", [True, 1, "sentinel"])
 async def test_non_native_rejects_invalid_configuration(value):
     engine = create_async_engine("sqlite+aiosqlite://")
     try:
@@ -97,3 +97,42 @@ async def test_agent_closes_only_owned_store(monkeypatch):
     await Agent(prompt="test", state_store=external).close()
     external.close.assert_not_awaited()
     await external._engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "dialect,entry",
+    [(d, e) for d in ("sqlite", "postgresql", "mysql") for e in ("direct", "factory")]
+    + [("mysql", "url")],
+)
+@pytest.mark.parametrize("off", [None, False])
+async def test_disabled_live_updates_is_off_on_every_store_path(dialect, entry, off):
+    from dendrux.runtime.stores.sql.mysql import MySQLStateStore
+    from dendrux.runtime.stores.sql.postgres import PostgresStateStore
+    from dendrux.runtime.stores.sql.sqlite import SQLiteStateStore
+
+    classes = {
+        "sqlite": SQLiteStateStore,
+        "postgresql": PostgresStateStore,
+        "mysql": MySQLStateStore,
+    }
+    urls = {
+        "sqlite": "sqlite+aiosqlite://",
+        "postgresql": "postgresql+asyncpg://",
+        "mysql": "mysql+asyncmy://",
+    }
+    if dialect == "mysql":
+        pytest.importorskip("asyncmy")
+    engine = create_async_engine(urls[dialect])
+    try:
+        if entry == "url":
+            store = MySQLStateStore.from_url(urls[dialect], live_updates=off)
+            await engine.dispose()
+            engine = store._engine
+        elif entry == "factory":
+            store = store_for_engine(engine, live_updates=off)
+        else:
+            store = classes[dialect](engine, live_updates=off)
+        assert store.live_updates is None
+        await store.close()
+    finally:
+        await engine.dispose()
