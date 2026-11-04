@@ -14,6 +14,8 @@ from dendrux.runtime.stores.sql.base import SQLStateStore
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncEngine
 
+    from dendrux.db._live_updates import LiveUpdates
+
 
 class PostgresStateStore(SQLStateStore):
     """Durable, multi-server state store for PostgreSQL."""
@@ -36,14 +38,35 @@ class PostgresStateStore(SQLStateStore):
             {"timeout": f"{_COMMIT_READBACK_LOCK_TIMEOUT_MS}ms"},
         )
 
-    def __init__(self, engine: AsyncEngine, *, notify_channel: str | None = None) -> None:
+    def __init__(
+        self,
+        engine: AsyncEngine,
+        *,
+        notify_channel: str | None = None,
+        live_updates: LiveUpdates | bool | None = None,
+    ) -> None:
         from dendrux.db._notify import validate_channel
 
         if notify_channel is not None:
             validate_channel(notify_channel)
-        super().__init__(engine)
+        super().__init__(engine, live_updates=live_updates)
         self.notify_channel = notify_channel
         self.capabilities = replace(self.capabilities, deployment="multi_server")
+
+    def _native_live_updates(self) -> LiveUpdates | None:
+        from importlib import import_module
+
+        from dendrux.errors import LiveUpdatesUnavailableError
+
+        try:
+            module = import_module("._postgres_updates", package="dendrux.db")
+        except ModuleNotFoundError as error:
+            if error.name != "dendrux.db" + "._postgres_updates":
+                raise
+            # Step B supplies the native transport; explicit buses work already.
+            raise LiveUpdatesUnavailableError() from None
+        return cast("LiveUpdates", module.PostgresUpdates())
+
 
     def _insert(self, table: Any) -> Any:
         from sqlalchemy.dialects.postgresql import insert

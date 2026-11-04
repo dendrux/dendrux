@@ -11,6 +11,8 @@ from dendrux.runtime.stores.sql.base import SQLStateStore
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncEngine
 
+    from dendrux.db._live_updates import LiveUpdates
+
 
 class SQLiteStateStore(SQLStateStore):
     """SQLite state store, scoped to one process or one shared filesystem host."""
@@ -21,8 +23,10 @@ class SQLiteStateStore(SQLStateStore):
     supports_row_locks = False
     ddl_transactional = True
 
-    def __init__(self, engine: AsyncEngine) -> None:
-        super().__init__(engine)
+    def __init__(
+        self, engine: AsyncEngine, *, live_updates: LiveUpdates | bool | None = None
+    ) -> None:
+        super().__init__(engine, live_updates=live_updates)
         memory = (
             engine.url.database in (None, "", ":memory:", "file::memory:")
             or engine.url.query.get("mode") == "memory"

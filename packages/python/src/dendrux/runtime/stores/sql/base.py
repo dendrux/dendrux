@@ -76,6 +76,7 @@ if TYPE_CHECKING:
 
     from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
+    from dendrux.db._live_updates import LiveUpdates
     from dendrux.db.models import AgentRun
     from dendrux.media import BlobEdge
     from dendrux.runtime.stores._errors import DbError
@@ -975,7 +976,9 @@ class SQLStateStore(SQLBlobCatalog):
             .all()
         )
 
-    def __init__(self, engine: AsyncEngine) -> None:
+    def __init__(
+        self, engine: AsyncEngine, *, live_updates: LiveUpdates | bool | None = None
+    ) -> None:
         import asyncio
 
         if engine.dialect.name not in self.dialect_names:
@@ -1009,6 +1012,38 @@ class SQLStateStore(SQLBlobCatalog):
             warn_if_shared_connection(engine)
             self._session_factory = _SerializedSessionFactory(engine, self._session_factory)
         self._session_factory = _CheckedSessionFactory(self, self._session_factory)
+        self._live_updates = self._bind_live_updates(live_updates)
+
+    @property
+    def live_updates(self) -> LiveUpdates | None:
+        """The live update bus owned by this store, if enabled."""
+        return self._live_updates
+
+
+    def _native_live_updates(self) -> LiveUpdates | None:
+        return None
+
+
+    def _bind_live_updates(self, updates: LiveUpdates | bool | None) -> LiveUpdates | None:
+        from dendrux.db._live_updates import LiveUpdates
+
+        if updates is None:
+            return None
+        if updates is True:
+            updates = self._native_live_updates()
+        if not isinstance(updates, LiveUpdates):
+            raise ValueError(
+                f"{type(self).__name__} requires a LiveUpdates instance; use RedisUpdates"
+            )
+        updates.bind(self)
+        return updates
+
+
+    async def close(self) -> None:
+        """Close store-owned live updates without disposing the engine."""
+        if self._live_updates is not None:
+            await self._live_updates.close()
+
 
     async def _check_connection(self, session: AsyncSession) -> None:
         if self._dialect_facts is not None:

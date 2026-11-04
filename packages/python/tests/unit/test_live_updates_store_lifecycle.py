@@ -1,0 +1,99 @@
+"""Store ownership and explicit live-update configuration."""
+
+from collections.abc import AsyncIterator, Sequence
+from unittest.mock import AsyncMock
+
+import pytest
+from sqlalchemy.ext.asyncio import create_async_engine
+
+from dendrux.db._live_updates import LiveUpdates
+from dendrux.runtime.stores._factory import store_for_engine
+
+
+class RecordingUpdates(LiveUpdates):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.messages = []
+        self.aclose_sender = AsyncMock()
+
+    async def send(self, messages: Sequence[str]) -> None:
+        self.messages.extend(messages)
+
+    async def receive(self) -> AsyncIterator[str | None]:
+        yield None
+
+
+@pytest.mark.parametrize("dialect", ["sqlite", "postgresql", "mysql"])
+async def test_bus_bound_property_close_and_engine_ownership(dialect, monkeypatch):
+    urls = {
+        "sqlite": "sqlite+aiosqlite://",
+        "postgresql": "postgresql+asyncpg://",
+        "mysql": "mysql+asyncmy://",
+    }
+    if dialect == "mysql":
+        pytest.importorskip("asyncmy")
+    engine = create_async_engine(urls[dialect])
+    dispose = AsyncMock()
+    monkeypatch.setattr(type(engine), "dispose", dispose)
+    bus = RecordingUpdates()
+    store = store_for_engine(engine, live_updates=bus)
+    assert store.live_updates is bus
+    assert bus._store is store
+    with pytest.raises(AttributeError):
+        store.live_updates = None
+    with pytest.raises(ValueError, match="another store"):
+        store_for_engine(engine, live_updates=bus)
+    await store.close()
+    await store.close()
+    bus.aclose_sender.assert_awaited_once()
+    dispose.assert_not_awaited()
+
+
+@pytest.mark.parametrize("value", [True, False, 1, "sentinel"])
+async def test_non_native_rejects_invalid_configuration(value):
+    engine = create_async_engine("sqlite+aiosqlite://")
+    try:
+        with pytest.raises(ValueError, match="SQLiteStateStore.*RedisUpdates"):
+            store_for_engine(engine, live_updates=value)
+    finally:
+        await engine.dispose()
+
+
+async def test_postgres_native_hook_is_lazy_and_typed_until_b():
+    from dendrux.errors import LiveUpdatesUnavailableError
+
+    engine = create_async_engine("postgresql+asyncpg://")
+    try:
+        assert store_for_engine(engine).live_updates is None
+        with pytest.raises(LiveUpdatesUnavailableError):
+            store_for_engine(engine, live_updates=True)
+    finally:
+        await engine.dispose()
+
+
+async def test_mysql_from_url_names_bus_without_forwarding_to_engine():
+    pytest.importorskip("asyncmy")
+    from dendrux.runtime.stores.sql.mysql import MySQLStateStore
+
+    bus = RecordingUpdates()
+    store = MySQLStateStore.from_url("mysql+asyncmy://", live_updates=bus)
+    assert store.live_updates is bus
+    await store.close()
+    await store._engine.dispose()
+
+
+async def test_agent_closes_only_owned_store(monkeypatch):
+    from dendrux import Agent
+
+    agent = Agent(prompt="test", database_url="sqlite+aiosqlite://")
+    store = await agent._open_state_store()
+    close = AsyncMock(wraps=store.close)
+    monkeypatch.setattr(store, "close", close)
+    await agent.close()
+    await agent.close()
+    close.assert_awaited_once()
+    external = store_for_engine(create_async_engine("sqlite+aiosqlite://"))
+    monkeypatch.setattr(external, "close", AsyncMock())
+    await Agent(prompt="test", state_store=external).close()
+    external.close.assert_not_awaited()
+    await external._engine.dispose()
