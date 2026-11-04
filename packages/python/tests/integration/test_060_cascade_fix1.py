@@ -51,8 +51,9 @@ async def sqlite_file(tmp_path, mode, *, busy_timeout=10):
 
 
 @pytest.mark.parametrize("mode", ["legacy", "explicit_begin", "autocommit_false"])
+@pytest.mark.parametrize("commit_stall", [0, 0.5])
 async def test_sqlite_file_creator_lock_closes_admission(
-    tmp_path, monkeypatch, mode, record_property
+    tmp_path, monkeypatch, mode, record_property, commit_stall
 ):
     # Only this test forces SQLITE_BUSY: the lock stays held until backoff is observed.
     async with sqlite_file(tmp_path, mode, busy_timeout=0.02) as engine:
@@ -70,6 +71,7 @@ async def test_sqlite_file_creator_lock_closes_admission(
                 async def delayed():
                     checked.set()
                     await release.wait()
+                    await asyncio.sleep(commit_stall)
                     await commit()
 
                 session.commit = delayed
@@ -78,6 +80,7 @@ async def test_sqlite_file_creator_lock_closes_admission(
         async def backoff(*args):
             retried.set()
             await release.wait()
+            await asyncio.wait({creation})  # The creator has committed and released its lock.
 
         monkeypatch.setattr(creator, "_session_factory", held_commit)
         monkeypatch.setattr(durability, "_backoff", backoff)
