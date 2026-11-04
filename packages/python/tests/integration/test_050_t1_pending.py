@@ -217,7 +217,7 @@ async def test_many_followers_one_poller(store: Any, run_store: RunStore, monkey
     n_followers, n_events = 60, 30
     release_head = asyncio.Event()
     slots_ready, registered, polled = asyncio.Event(), asyncio.Event(), asyncio.Event()
-    original_acquire, original_add = feed._acquire, _follow._RunFeed.add
+    original_acquire, original_add = feed._acquire, _follow._WatchedRun.add
 
     def acquire(*args: Any):
         original_acquire(*args)
@@ -231,7 +231,7 @@ async def test_many_followers_one_poller(store: Any, run_store: RunStore, monkey
         return head
 
     monkeypatch.setattr(feed, "_acquire", acquire)
-    monkeypatch.setattr(_follow._RunFeed, "add", add)
+    monkeypatch.setattr(_follow._WatchedRun, "add", add)
     original_head = _follow._current_head
 
     async def slow_head(*args):

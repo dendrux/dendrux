@@ -20,8 +20,6 @@ tests/integration/test_050_t1_pending.py::test_many_followers_one_poller | small
 tests/integration/test_050_t1_pending.py::test_immediate_refollow_reuses_slot_without_capacity_errors | small values set poll cadence; refollow is awaited rather than timed
 tests/integration/test_060_notifier_liveness.py::test_p1_2_frozen_tcp_path_degrades_then_recovers | health cadence is short; the test fires the health deadline only after proxy traffic blocks
 tests/integration/test_060_notifier_pg.py::test_n7_failed_self_test_releases_backend | delivery is deliberately suppressed, so the self-test must time out; backend release gets 10 s
-tests/integration/test_060_notifier_pg.py::test_n5_default_off_writer_warns_once_on_healthy_reconciliation | short reconciliation cadence only; delivery is condition-based with a separate hang guard
-tests/integration/test_060_notifier_pgbouncer.py::test_n4_controlled_delivery_with_backend_reassignment | short reconciliation cadence only; real notification and durable delivery each get 10 s
 tests/integration/test_oreo_regressions.py::test_run_timeout_finalizes_and_reraises | provider is already blocked on a never-set event before wait_for forces cancellation
 tests/integration/test_oreo_regressions.py::test_timeout_during_error_finalization_cancels_run | finalization is already blocked on a never-set event before wait_for forces cancellation
 tests/integration/test_run_store.py::TestStreamEvents::test_yields_existing_then_new | short poll cadence only; reads are awaited without a small delivery deadline

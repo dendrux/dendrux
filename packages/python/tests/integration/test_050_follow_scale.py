@@ -115,14 +115,14 @@ def _counted_statements(engine: Any) -> Iterator[collections.Counter[str]]:
     """Statements the followers issue, by bucket.
 
     ``follower`` holds each follower's own work (scope check, event pages,
-    argument pages); every shared reader has its own bucket. The run's live
-    poller (a named task) is not counted: its work grows with elapsed time.
+    argument pages); every shared reader has its own bucket. The store's
+    coordinator (a named task) is not counted: its work grows with elapsed time.
     """
     counts: collections.Counter[str] = collections.Counter()
 
     def on_execute(*_a: Any) -> None:
         task = asyncio.current_task()
-        if task is not None and task.get_name().startswith("dendrux-run-feed:"):
+        if task is not None and task.get_name().startswith("dendrux-follow-coordinator"):
             return
         counts[_reader.get() or _FOLLOWER] += 1
 

@@ -528,16 +528,21 @@ class TestFixRound:
         assert feed.followers == feed.watched_runs == 0
         await feed.aclose()
 
-    async def test_slow_cancellation_stays_tracked(
-        self, state: Any, store: RunStore, monkeypatch: Any
+    async def test_close_bounds_a_slow_cancelling_coordinator(
+        self, state: Any, store: RunStore, monkeypatch: Any, caplog: Any
     ) -> None:
+        import logging
+
+        import dendrux.store as store_module
+
+        caplog.set_level(logging.WARNING)
         await state.create_run("00000000000000000000000301", "a")
         await state.save_run_event("00000000000000000000000301", event_type="tick")
         entered, cancelled, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
         original = store.get_events
 
         async def slow(*a: Any, **kw: Any) -> Any:
-            if asyncio.current_task().get_name().startswith("dendrux-run-feed:"):
+            if asyncio.current_task().get_name().startswith("dendrux-follow-coordinator"):
                 entered.set()
                 try:
                     await asyncio.Event().wait()
@@ -548,25 +553,24 @@ class TestFixRound:
             return await original(*a, **kw)
 
         monkeypatch.setattr(store, "get_events", slow)
-        feed = _feed(store, max_followers=1, stop_timeout_s=0.001)
+        monkeypatch.setattr(store, "_batched_events", lambda: None)  # force per-run reads
+        monkeypatch.setattr(store_module, "DEFAULT_STOP_TIMEOUT_S", 0.001)
+        feed = _feed(store, max_followers=1)
         follow = feed.follow("00000000000000000000000301", tenant_id=None)
         await anext(follow)
         await entered.wait()
-        poller = feed._feeds["00000000000000000000000301"].task
-        await follow.aclose()
-        assert cancelled.is_set() and not poller.done()
-        assert feed.followers == 0 and feed.watched_runs == 1
-        with pytest.raises(FollowCapacityError):
-            await feed.follow("00000000000000000000000301", tenant_id=None).start()
-        shutdown = asyncio.create_task(feed.aclose())
-        await asyncio.sleep(0)
-        shutdown.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await shutdown
-        assert feed.watched_runs == 1
+        (coordinator,) = store._coordinators.values()
+        task = coordinator._task
+        await store.close()  # returns although the coordinator is still unwinding
+        assert cancelled.is_set() and not task.done()
+        codes = [getattr(r, "code", None) for r in caplog.records]
+        assert "follow_shutdown_pending" in codes
+        with pytest.raises(RuntimeError, match="closed"):
+            await store.follow("00000000000000000000000301", tenant_id=None).start()
         release.set()
-        await feed.aclose()
-        assert poller.done() and feed.watched_runs == 0
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 5)
+        await follow.aclose()
+        assert feed.followers == 0 and feed.watched_runs == 0
 
     @pytest.mark.parametrize(
         "transition", ["resume", "resume_event_only", "terminal", "replacement"]

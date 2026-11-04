@@ -1,4 +1,4 @@
-"""P2-9: controlled CI worker URLs and delayed server-side socket cleanup."""
+"""P2-9: delayed server-side socket cleanup and the wake budget allowance."""
 
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
@@ -7,27 +7,6 @@ import pytest
 
 from dendrux.errors import NotifierUnavailableError
 from tests.integration import test_060_notifier_pg as pg_tests
-from tests.integration import test_060_notifier_pgbouncer as pool_tests
-
-
-@pytest.mark.parametrize("session_pool", [False, True])
-async def test_p2_9_pgbouncer_gate_accepts_matching_worker_database(monkeypatch, session_pool):
-    url = "postgresql+asyncpg://postgres:root@localhost:5432/unit_worker_test"
-    key = "DENDRUX_TEST_PGBOUNCER_SESSION_URL" if session_pool else "DENDRUX_TEST_PGBOUNCER_URL"
-    monkeypatch.setenv(key, url)
-
-    class ValidatedError(Exception):
-        pass
-
-    def validated(*args, **kwargs):
-        raise ValidatedError
-
-    monkeypatch.setattr(pool_tests, "PostgresEventNotifier", validated)
-    engine = SimpleNamespace(dialect=SimpleNamespace(name="postgresql"))
-    with pytest.raises(ValidatedError):
-        await pool_tests.test_n4_controlled_delivery_with_backend_reassignment(
-            url, engine, None, session_pool, monkeypatch
-        )
 
 
 async def test_p2_9_failed_start_waits_for_backend_disappearance(monkeypatch):
