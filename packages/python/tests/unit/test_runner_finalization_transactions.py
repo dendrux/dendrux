@@ -1,4 +1,4 @@
-"""Finalization keeps its SQL statements and transaction grouping byte-for-byte."""
+"""Atomic finalization pins SQL statements and transaction grouping byte-for-byte."""
 
 import json
 from pathlib import Path

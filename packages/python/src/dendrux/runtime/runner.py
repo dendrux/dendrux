@@ -212,24 +212,54 @@ logger = logging.getLogger(__name__)
 _STOP_REASONS = frozenset(get_args(StopReason))
 
 
+async def _finalize_running_event(
+    store: StateStore,
+    run_id: str,
+    status: str,
+    event_type: str,
+    event_data: dict[str, Any],
+    *,
+    emit_event: bool = True,
+    **kwargs: Any,
+) -> tuple[bool, bool]:
+    atomic = getattr(store, "finalize_with_event", None)
+    if atomic is not None and emit_event:
+        kwargs.pop("error_info", None)  # Carried by the atomic lifecycle event.
+        seq = await atomic(
+            run_id,
+            status=status,
+            allowed_current_statuses=[RunStatus.RUNNING.value],
+            event_type=event_type,
+            event_data=event_data,
+            **kwargs,
+        )
+        return seq is not None, False
+    won = await store.finalize_run(
+        run_id, status=status, expected_current_status=RunStatus.RUNNING.value, **kwargs
+    )
+    return bool(won), bool(won and emit_event)
+
+
 async def _persist_run_failure(
     store: StateStore, run_id: str, exc: Exception, *, safe_event: bool = False
 ) -> bool:
     try:
-        won = await store.finalize_run(
+        won, needs_event = await _finalize_running_event(
+            store,
             run_id,
-            status=RunStatus.ERROR.value,
+            RunStatus.ERROR.value,
+            StoredEventType.RUN_ERROR.value,
+            _error_payload(exc),
             error=_safe_error(exc),
             **_error_store_kwargs(store, exc),
             total_usage=None,
-            expected_current_status=RunStatus.RUNNING.value,
         )
     except Exception:
         logger.error(
             "Failed to persist ERROR status for run %s", run_id, exc_info=safe_exception_info()
         )
         return False
-    if won:
+    if needs_event:
         emit = _emit_event_safe if safe_event else _emit_event
         await emit(store, run_id, StoredEventType.RUN_ERROR.value, _error_payload(exc))
     return bool(won)
@@ -1486,6 +1516,13 @@ async def _persist_loop_outcome(
         getattr(state_store, "storage_format", 1) == STORAGE_FORMAT_CHECKPOINTED
         and capabilities(state_store).atomic_completion
     )
+    if unmapped_placeholders:
+        await _emit_event(
+            state_store,
+            run_id,
+            GovernanceEventType.GUARDRAIL_UNMAPPED_PLACEHOLDER.value,
+            {"placeholders": unmapped_placeholders},
+        )
     with _capture_finalized_run(unclaimed_store(state_store), run_id) as records:
         if atomic_final:
             event = EventWrite(
@@ -1525,13 +1562,6 @@ async def _persist_loop_outcome(
     if not finalize_won:
         return await _persisted(result.status)
     recovery = await _final_run_recovery(state_store, run_id, records)
-    if unmapped_placeholders:
-        await _emit_event(
-            state_store,
-            run_id,
-            GovernanceEventType.GUARDRAIL_UNMAPPED_PLACEHOLDER.value,
-            {"placeholders": unmapped_placeholders},
-        )
     if stop_reason is not None:
         await _record_stop_reason(state_store, run_id, stop_reason)
     if not atomic_final:
@@ -2972,16 +3002,19 @@ async def _persist_run_cancellation(
     safe_read: bool = False,
 ) -> tuple[bool, RunRecord | None]:
     kwargs: dict[str, Any] = {} if isinstance(answer, _OmittedType) else {"answer": answer}
-    won = await store.finalize_run(
+    won, needs_event = await _finalize_running_event(
+        store,
         run_id,
-        status=RunStatus.CANCELLED.value,
-        expected_current_status=RunStatus.RUNNING.value,
+        RunStatus.CANCELLED.value,
+        StoredEventType.RUN_CANCELLED.value,
+        payload,
+        emit_event=emit_event,
         **kwargs,
     )
     if won:
         # Remember the committed CAS even if the separate event write raises.
         on_won()
-        if emit_event:
+        if needs_event:
             await _emit_event(store, run_id, StoredEventType.RUN_CANCELLED.value, payload)
         return True, None
     record = None

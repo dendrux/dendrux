@@ -101,6 +101,7 @@ MAX_READS_PER_S = 20.0
 STATUS_MAX_AGE_S = 30.0
 IDLE_EXIT_S = 60.0
 MISSED_HINT_GRACE_S = 5.0
+TERMINAL_DRAIN_GRACE_S = 0.1
 HEALTHY_JITTER = 0.2
 MAX_RESTARTS = 3
 
@@ -250,6 +251,7 @@ class _WatchedRun:
         self.followers: set[_Follower] = set()
         self.params = _DEFAULT_PARAMS
         self.terminal = self.status_terminal = self.drain = False
+        self.terminal_drain_at = -math.inf
         self.events_due = self.status_due = self.requested = _NEVER
         self.status_with_next = False
         self.reason = "join"
@@ -452,6 +454,7 @@ class _Coordinator:
     def request(self, run: _WatchedRun, reason: str, at: float | None = None) -> None:
         """Make ``run`` due (events and status) no later than ``at`` (default now)."""
         when = self._now() if at is None else at
+        when = max(when, run.terminal_drain_at)
         run.events_due = min(run.events_due, when)
         if not run.status_terminal:
             run.status_due = min(run.status_due, when)
@@ -729,11 +732,21 @@ class _Coordinator:
         if events:
             self._again(run, now, "drain")
             return True
-        run.drain = False
         if snapshot.status_terminal:
+            return self._terminal_drain(run, now)
+        run.drain = False
+        return False
+
+    def _terminal_drain(self, run: _WatchedRun, now: float) -> bool:
+        if run.terminal_drain_at == -math.inf:
+            run.terminal_drain_at = now + TERMINAL_DRAIN_GRACE_S
+        elif now >= run.terminal_drain_at:
+            run.drain = False
             self._finish(run, now)
             return True
-        return False
+        run.events_due = run.terminal_drain_at
+        run.reason = "drain"
+        return True
 
     def _again(self, run: _WatchedRun, now: float, reason: str) -> None:
         """Due again now, behind runs already waiting (a hot run re-enters at the back)."""
@@ -1159,6 +1172,7 @@ class Follow:
         if status is None:
             raise RunNotFoundError(self.run_id)
         if status in TERMINAL_STATUSES and self._until_terminal:
+            await asyncio.sleep(TERMINAL_DRAIN_GRACE_S)
             pending = await store.get_events(
                 self.run_id, after_sequence_index=self._cursor, limit=1
             )

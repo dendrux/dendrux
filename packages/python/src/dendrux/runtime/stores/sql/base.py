@@ -2440,6 +2440,7 @@ class SQLStateStore(SQLBlobCatalog):
                 if not won:
                     await session.rollback()
                     return None
+                await self._finalize_error_info(session, run_id, event_data)
                 if trace is not None:
                     await self._insert_trace(session, run_id, trace)
                 seq = (
@@ -2453,6 +2454,23 @@ class SQLStateStore(SQLBlobCatalog):
 
         return await retry_transient_db(
             _attempt, label="finalize_with_event", run_id=run_id, classify=self.classify_db_error
+        )
+
+    async def _finalize_error_info(
+        self, session: AsyncSession, run_id: str, event_data: dict[str, Any] | None
+    ) -> None:
+        info = (event_data or {}).get("error_info")
+        if info is None:
+            return
+        from sqlalchemy import update
+
+        from dendrux.db.models import AgentRun
+
+        old_meta = await session.scalar(select(AgentRun.meta).where(AgentRun.id == run_id))
+        await session.execute(
+            update(AgentRun)
+            .where(AgentRun.id == run_id)
+            .values(meta={**(old_meta or {}), ERROR_INFO_META_KEY: info})
         )
 
     async def _cas_finalize(

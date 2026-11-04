@@ -1,7 +1,7 @@
 [
   "BEGIN",
-  "UPDATE agent_runs SET status_changed_at=CASE WHEN (agent_runs.status != ?) THEN ? ELSE agent_runs.status_changed_at END, status=?, output_data=?, pause_data=?, cancel_requested=?, pause_requested=?, updated_at=? WHERE agent_runs.id = ? AND agent_runs.status = ? AND agent_runs.claim_epoch = ?",
-  "COMMIT",
+  "UPDATE agent_runs SET status_changed_at=CASE WHEN (agent_runs.status != ?) THEN ? ELSE agent_runs.status_changed_at END, status=?, pause_data=?, cancel_requested=?, pause_requested=?, loop_state=CASE WHEN (agent_runs.storage_format = ?) THEN json_set(coalesce(nullif(agent_runs.loop_state, ?), ?), ?, json(?)) ELSE agent_runs.loop_state END, output_data=?, updated_at=? WHERE agent_runs.id = ? AND agent_runs.status IN (?) AND agent_runs.claim_epoch = ?",
+  "ROLLBACK",
   "BEGIN",
   "SELECT agent_runs.cancel_requested, agent_runs.pause_requested, EXISTS (SELECT ? AS anon_2 FROM run_inbox WHERE run_inbox.run_id = agent_runs.id AND run_inbox.delivered_at IS NULL) AS anon_1, agent_runs.claim_epoch, agent_runs.status FROM agent_runs WHERE agent_runs.id = ?",
   "ROLLBACK",

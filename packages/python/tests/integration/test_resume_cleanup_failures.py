@@ -42,6 +42,11 @@ async def test_cancel_preserves_exception_despite_store_failure(store, path, fai
         entered.set()
         await asyncio.Event().wait()
 
+    # Exercise both atomic failure and the preserved legacy split-event fallback.
+    if failure == "save_run_event":
+        store.finalize_with_event = None
+    else:
+        failure = "finalize_with_event"
     secondary = RuntimeError("injected cancellation persistence failure")
     with (
         patch("dendrux.runtime.runner._prepare_resume", preparing),
@@ -60,7 +65,7 @@ async def test_cancel_preserves_exception_despite_store_failure(store, path, fai
 
     # A failed event write must not prevent an otherwise healthy finalization.
     assert (await store.get_run(run_id)).status == (
-        "running" if failure == "finalize_run" else "cancelled"
+        "running" if failure == "finalize_with_event" else "cancelled"
     )
     assert any(getattr(r, "code", None) == "cancel_persist_failed" for r in caplog.records)
     assert str(secondary) not in caplog.text

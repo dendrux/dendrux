@@ -314,6 +314,8 @@ async def test_status_only_hint_reaches_follow_end_within_one_cycle(clock: Clock
     state.statuses["r1"] = "success"  # finalized without an event
     live.hint("r1")
     await ticks()
+    clock.advance(_follow.TERMINAL_DRAIN_GRACE_S)
+    await ticks(40)
     assert follow._follower.end_reason == "terminal"
 
 
@@ -338,8 +340,10 @@ async def test_drain_reads_until_an_empty_page(clock: Clock) -> None:
     clock.advance(0.51)
     await ticks(60)
     assert _seqs(follow) == [0, 1, 2]
+    clock.advance(_follow.TERMINAL_DRAIN_GRACE_S)
+    await ticks(40)
     assert follow._follower.end_reason == "terminal"
-    assert reads["n"] == 4  # events read, drain [1], drain [2], empty drain
+    assert reads["n"] == 5  # events, two tails, empty drain, grace drain
 
 
 async def test_deleted_run_is_terminal_after_one_drain_read(clock: Clock) -> None:
@@ -351,6 +355,8 @@ async def test_deleted_run_is_terminal_after_one_drain_read(clock: Clock) -> Non
     del state.statuses["gone"]
     clock.advance(0.51)
     await ticks(60)
+    clock.advance(_follow.TERMINAL_DRAIN_GRACE_S)
+    await ticks(40)
     assert follow._follower.end_reason == "terminal"
 
 
@@ -516,7 +522,11 @@ async def test_budget_is_shared_by_full_page_and_drain_reads(
         state.write("done")
     state.write("done", TERMINAL)
     feed = _feed(_store(state))
-    await attach(feed, "done", after_sequence_index=899)
+    starting = asyncio.create_task(attach(feed, "done", after_sequence_index=899))
+    await ticks()
+    clock.advance(_follow.TERMINAL_DRAIN_GRACE_S)
+    await ticks()
+    await starting
     start = clock.now
     for _ in range(20):
         await ticks()

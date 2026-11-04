@@ -101,8 +101,10 @@ async def test_cancellation_cleanup_failure_does_not_mask_cancellation(store, mo
 
     provider = MockLLM([])
     monkeypatch.setattr(provider, "complete", cancelled)
-    monkeypatch.setattr(store, "finalize_run", AsyncMock(side_effect=RuntimeError("db down")))
     agent = Agent(strict_tenancy=False, provider=provider, prompt="test", state_store=store)
+    monkeypatch.setattr(
+        store, "finalize_with_event", AsyncMock(side_effect=RuntimeError("db down"))
+    )
     with pytest.raises(asyncio.CancelledError):
         await agent.run("hello")
 
@@ -123,9 +125,10 @@ async def test_cancellation_without_persistence_closes_lifecycle(monkeypatch):
 
 async def test_timeout_during_error_finalization_cancels_run(store, monkeypatch):
     entered = asyncio.Event()
-    finalize = store.finalize_run
+    finalize = store.finalize_with_event
     run_ids = []
 
+    @functools.wraps(finalize)
     async def blocked_error(run_id, **kwargs):
         run_ids.append(run_id)
         if kwargs["status"] == "error":
@@ -133,7 +136,7 @@ async def test_timeout_during_error_finalization_cancels_run(store, monkeypatch)
             await asyncio.Event().wait()
         return await finalize(run_id, **kwargs)
 
-    monkeypatch.setattr(store, "finalize_run", blocked_error)
+    monkeypatch.setattr(store, "finalize_with_event", blocked_error)
     notifier = AsyncMock()
     agent = Agent(strict_tenancy=False, provider=MockLLM([]), prompt="test", state_store=store)
     task = asyncio.create_task(agent.run("hello", notifier=notifier))
@@ -160,7 +163,12 @@ async def test_repeated_cancellation_waits_for_durable_cleanup(store, monkeypatc
         model_entered.set()
         await asyncio.Event().wait()
 
-    finalize = store.finalize_run
+    agent = Agent(strict_tenancy=False, provider=provider, prompt="test", state_store=store)
+    method = "finalize_with_event"
+    if blocked_write == "event":
+        monkeypatch.setattr(store, "finalize_with_event", None)
+        method = "finalize_run"
+    finalize = getattr(store, method)
     save_event = store.save_run_event
 
     async def gated_finalize(run_id, **kwargs):
@@ -178,10 +186,9 @@ async def test_repeated_cancellation_waits_for_durable_cleanup(store, monkeypatc
         return await save_event(run_id, **kwargs)
 
     monkeypatch.setattr(provider, "complete", blocked_model)
-    monkeypatch.setattr(store, "finalize_run", gated_finalize)
+    monkeypatch.setattr(store, method, gated_finalize)
     monkeypatch.setattr(store, "save_run_event", gated_event)
     notifier = AsyncMock()
-    agent = Agent(strict_tenancy=False, provider=provider, prompt="test", state_store=store)
     task = asyncio.create_task(agent.run("hello", notifier=notifier))
     await asyncio.wait_for(model_entered.wait(), 5)
     task.cancel("initial cancellation")

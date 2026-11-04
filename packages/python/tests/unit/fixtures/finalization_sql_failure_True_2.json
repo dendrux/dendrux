@@ -1,9 +1,6 @@
 [
   "BEGIN",
-  "UPDATE agent_runs SET status_changed_at=CASE WHEN (agent_runs.status != ?) THEN ? ELSE agent_runs.status_changed_at END, status=?, error=?, pause_data=?, cancel_requested=?, pause_requested=?, updated_at=? WHERE agent_runs.id = ? AND agent_runs.status = ?",
-  "COMMIT",
-  "BEGIN",
-  "UPDATE agent_runs SET updated_at=? WHERE agent_runs.id = ?",
+  "UPDATE agent_runs SET status_changed_at=CASE WHEN (agent_runs.status != ?) THEN ? ELSE agent_runs.status_changed_at END, status=?, pause_data=?, cancel_requested=?, pause_requested=?, loop_state=CASE WHEN (agent_runs.storage_format = ?) THEN json_set(coalesce(nullif(agent_runs.loop_state, ?), ?), ?, json(?)) ELSE agent_runs.loop_state END, error=?, updated_at=? WHERE agent_runs.id = ? AND agent_runs.status IN (?)",
   "INSERT INTO run_events (id, agent_run_id, event_type, sequence_index, iteration_index, correlation_id, data, created_at, content_digest) SELECT ? AS anon_1, ? AS anon_2, ? AS anon_3, (SELECT coalesce(max(run_events.sequence_index), ?) + ? AS anon_5 FROM run_events WHERE run_events.agent_run_id = ?) AS anon_4, ? AS anon_6, ? AS anon_7, ? AS anon_8, ? AS anon_9, ? AS anon_10 ON CONFLICT (id) DO NOTHING RETURNING sequence_index",
   "COMMIT"
 ]
