@@ -452,8 +452,8 @@ class _Coordinator:
         run.dirty += 1
         run.reason = reason
         self._wake.set()
-        if not self._closed:
-            self.revive()
+        if reason == "join" and not self._closed:
+            self.revive()  # hints and gaps never start a task (e.g. during loop shutdown)
 
     def _raise_if_closed(self) -> None:
         if self._closed:

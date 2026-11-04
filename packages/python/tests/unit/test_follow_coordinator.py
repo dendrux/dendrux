@@ -924,3 +924,18 @@ async def test_a_thousand_concurrent_joins_coalesce_into_one_read(clock: Clock) 
     assert all(_seqs(f) == [0] for f in follows)  # each got the event once, from memory
     await ticks(20)
     assert len(state.event_reads) == reads + 1
+
+
+async def test_hints_and_gaps_never_start_a_coordinator_task(clock: Clock) -> None:
+    """At loop shutdown the listener's last gap must not spawn an orphan coordinator."""
+    state = BatchedState()
+    state.create("r1")
+    feed = _feed(_store(state))
+    live, _ = await _healthy(state, feed.store, feed, "r1")
+    (task,) = _coordinator_tasks()
+    task.cancel()  # what the event loop runner does to every task at shutdown
+    await ticks()
+    live.gap()
+    live.hint("r1")
+    await ticks()
+    assert _coordinator_tasks() == []
