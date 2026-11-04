@@ -333,7 +333,7 @@ async def test_a_killed_listener_connection_surfaces_a_gap_and_resubscribes_once
     await writer.close()
 
 
-async def test_an_oversized_message_drops_the_listener_connection_and_surfaces_a_gap(
+async def test_an_oversized_message_is_dropped_without_a_connection_gap(
     admin: Any, channel: str, name: str
 ) -> None:
     reader = make(channel=channel, client_options={"client_name": name})
@@ -341,8 +341,8 @@ async def test_an_oversized_message_drops_the_listener_connection_and_surfaces_a
     lease = await listening(reader, consumer)
     gaps = consumer.gaps
     await admin.publish(channel, "x" * 1_000_000)  # 127x the 7,900-byte bound
-    # the listener refused it before reading the body, dropped the connection, and recovered
-    await eventually(lambda: consumer.gaps == gaps + 2 and reader.healthy)
+    await eventually(lambda: reader.stats().dropped_oversize == 1)
+    assert consumer.gaps == gaps and reader.healthy
     assert consumer.hints == [] and reader.stats().bad_messages == 0  # it never reached the decoder
     await eventually_async(lambda: _count(admin, name), 1)
     writer = make(channel=channel)
@@ -498,3 +498,24 @@ def test_the_real_client_refuses_a_bad_option_without_a_server_and_without_a_loo
     assert "sentinel" not in str(caught.value)
     assert ru.RedisUpdates("rediss://127.0.0.1:6399/0", client_options={"client_name": "x"})
     assert ru.RedisUpdates("unix:///tmp/none.sock")
+
+
+async def test_oversized_publications_keep_listener_and_count_whole_drops(admin, channel):
+    updates = ru.RedisUpdates(REDIS_URL, channel=channel, **FAST)
+    consumer = Consumer()
+    updates.register(consumer)
+    await updates.acquire_listener()
+    try:
+        await eventually(lambda: updates.healthy)
+        generation = updates.generation
+        connection = updates._wire.subscription.pubsub.connection
+        for size in (7901, 9000, 1_000_000):
+            await admin.publish(channel, b"x" * size)
+        await admin.publish(channel, b'["good"]')
+        await eventually(lambda: "good" in consumer.ids)
+        assert updates.stats().dropped_oversize == 3
+        assert updates.generation == generation
+        assert updates._wire.subscription.pubsub.connection is connection
+        assert updates.healthy
+    finally:
+        await updates.close()

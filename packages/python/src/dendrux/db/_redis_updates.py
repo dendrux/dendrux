@@ -55,6 +55,7 @@ _FORBIDDEN_OPTIONS = frozenset(
         "unix_socket_path",
         "protocol",
         "parser_class",
+        "decode_responses",
     }
 )
 _POOL_ATTRIBUTES = ("_in_use_connections", "_available_connections")
@@ -65,7 +66,8 @@ def _load_api() -> Any:
 
     Importing the parser classes proves nothing about how they read a message, so the bound on
     incoming messages is not trusted here: ``bounded_parser(limit)`` runs the parser on in-memory
-    streams and only returns it if it reads a normal message and refuses an oversized one.
+    streams and only returns it if it reads a normal message, discards an oversized one,
+    and preserves the next reply.
     """
     try:
         from redis import exceptions
@@ -88,23 +90,34 @@ def _load_api() -> Any:
     )
 
 
-class _OversizeMessageError(Exception):
-    """A bulk reply longer than the bound. The stream is no longer in step: drop the connection."""
+_DISCARDED = b"\x00dendrux-discarded-bulk"
+_DISCARD_CHUNK_BYTES = 65_536
+
+
+async def _discard_bulk(parser: Any, length: int) -> bytes:
+    remaining = length + 2
+    buffered = min(remaining, max(0, len(parser._buffer) - parser._pos))
+    remaining -= buffered
+    try:
+        while remaining:
+            size = min(remaining, _DISCARD_CHUNK_BYTES)
+            await parser._stream.readexactly(size)
+            remaining -= size
+    except (asyncio.CancelledError, asyncio.IncompleteReadError):
+        # A partial discard cannot be replayed from redis-py's retry buffer.
+        # Force teardown even when get_message would normally swallow a poll timeout.
+        raise ConnectionError("Redis live updates discard interrupted") from None
+    parser._pos += length + 2
+    return _DISCARDED
 
 
 def _bounded_parser(base: type, limit: int) -> type:
-    """``base`` (redis-py's pure-Python RESP2 parser) refusing a bulk longer than ``limit``.
-
-    redis-py reads a bulk reply with ``_read(length)`` after parsing its declared length, so
-    checking the length there refuses an oversized message before any of its body is read or
-    allocated. That is an internal hook: nothing here assumes it still works. ``_verified_parser``
-    proves it on the installed redis-py before the parser is ever used.
-    """
+    """Drain oversized bulks without appending their bodies to redis-py's retry buffer."""
 
     class BoundedParser(base):  # type: ignore[misc]
         async def _read(self, length: int) -> bytes:
             if length > limit:
-                raise _OversizeMessageError
+                return await _discard_bulk(self, length)
             return bytes(await super()._read(length))
 
     return BoundedParser
@@ -127,14 +140,12 @@ async def _check_parser(connection_class: type, parser_class: type, limit: int) 
     reader.feed_data(_reply(b"hello"))
     if (await asyncio.wait_for(parser.read_response(), 2))[2] != b"hello":
         return "it does not read an ordinary message"
-    reader.feed_data(_reply(b"x" * (limit + 1)))  # the whole oversized message is on the stream
-    try:
-        await asyncio.wait_for(parser.read_response(), 2)
-    except _OversizeMessageError:
-        return None
-    except Exception:
-        return "it does not refuse an oversized message"
-    return "it accepts an oversized message"
+    reader.feed_data(_reply(b"x" * (limit + 1)) + _reply(b"after"))
+    if (await asyncio.wait_for(parser.read_response(), 2))[2] is not _DISCARDED:
+        return "it does not discard an oversized message"
+    if (await asyncio.wait_for(parser.read_response(), 2))[2] != b"after":
+        return "it does not preserve the following message"
+    return None
 
 
 def _problem_with(connection_class: type, parser_class: type, limit: int) -> str | None:
@@ -369,8 +380,7 @@ class _Subscription:
     def _interpret(self, reply: dict[str, Any]) -> str | _Gap | None:
         kind = reply.get("type")
         if kind == "message":
-            self._alive()
-            return _text(reply.get("data"))
+            return self._message(reply.get("data"))
         if kind == "pong" and self._token is not None and _text(reply.get("data")) == self._token:
             self._token = None
             self._alive()
@@ -378,6 +388,17 @@ class _Subscription:
             # a second subscribe acknowledgement means the client resubscribed behind our back
             return LiveUpdates.GAP
         return None
+
+    def _message(self, data: object) -> str | None:
+        self._alive()
+        if data is _DISCARDED:
+            self.owner._counts["dropped_oversize"] += 1
+            return None
+        text = _text(data)
+        if len(text.encode("utf-8")) > self.owner.max_message_bytes:
+            self.owner._counts["dropped_oversize"] += 1
+            return None
+        return text
 
     async def _on_silence(self) -> None:
         remaining = self._detect_by - monotonic()
@@ -439,7 +460,7 @@ class RedisUpdates(LiveUpdates):
             "retry": api.Retry(api.NoBackoff(), 0, supported_errors=()),
         }
         if listening:
-            # RESP2 with a parser that refuses an oversized message before reading it
+            # RESP2 with a parser that drains oversized messages in bounded chunks
             options["protocol"] = 2
             options["parser_class"] = self._listen_parser
         return api.ConnectionPool.from_url(self._url.reveal(), **options)
@@ -456,8 +477,6 @@ class RedisUpdates(LiveUpdates):
             raise ValueError("url or client_options are not accepted by the Redis client")
 
     def _plain_error(self, error: BaseException) -> Exception:
-        if isinstance(error, _OversizeMessageError):
-            return ConnectionError("Redis live updates message too large")
         if isinstance(error, (TimeoutError, self._api.TimeoutError)):
             return TimeoutError("Redis live updates timed out")
         if isinstance(error, (OSError, self._api.ConnectionError)):
