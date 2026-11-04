@@ -127,6 +127,12 @@ from dendrux.runtime.stores.sql.base import SQLStateStore
 from dendrux.runtime.stores.sql.mysql import MySQLStateStore
 from dendrux.runtime.stores.sql.postgres import PostgresStateStore
 from dendrux.runtime.stores.sql.sqlite import SQLiteStateStore
+from dendrux.store._bounded import (
+    _check_subtree_bound,
+    _read_subtree,
+    _trace_page_limit,
+    _warn_page,
+)
 from dendrux.store._follow import (
     DEFAULT_MAX_DURATION_S,
     DEFAULT_POLL_INTERVAL_S,
@@ -837,16 +843,21 @@ class RunStore:
         """Read events for a run in ``sequence_index`` order.
 
         ``after_sequence_index`` is an exclusive cursor. Pass the previous
-        batch's last ``sequence_index`` to continue. ``limit`` is clamped to
-        1..1000 (``None`` reads every event). ``event_types`` keeps only those
+        batch's last ``sequence_index`` to continue. ``None`` reads every
+        event. ``event_types`` keeps only those
         types (an empty list matches nothing). ``before`` is an exclusive,
         timezone-aware upper bound on ``created_at``. Empty when the run is
-        outside ``tenant_id``.
+        outside ``tenant_id``. SQL stores clamp pages to 1,000; custom stores
+        receive ``limit`` unchanged. Omitting it or exceeding 1,000 warns.
+        In 0.7 the default becomes 1,000 and larger limits raise.
         """
         check_read_int("after_sequence_index", after_sequence_index)
         check_read_int("limit", limit, wide=True)
         check_read_names("event_types", event_types)
         check_read_datetime("before", before)
+        check_run_id(run_id)
+        check_read_scope(tenant_id)
+        _warn_page("get_events", limit, "after_sequence_index")
         rows = await self._scoped_read(
             self._state.get_run_events,
             run_id,
@@ -858,7 +869,9 @@ class RunStore:
         )
         return [_event_to_stored(r) for r in rows or []]
 
-    async def get_subtree(self, run_id: str, *, tenant_id: TenantScope = UNSCOPED) -> RunSubtree:
+    async def get_subtree(
+        self, run_id: str, *, tenant_id: TenantScope = UNSCOPED, max_nodes: int | None = None
+    ) -> RunSubtree:
         """Return a run, all its descendants, and live rolled-up usage.
 
         ``RunSubtree.usage`` is the authoritative usage: it is summed from
@@ -876,13 +889,22 @@ class RunStore:
         (otherwise it reads as missing) and so must every descendant; runs
         outside the scope are excluded together with everything below them.
 
-        Raises :class:`RunNotFoundError` if the run does not exist.
+        ``max_nodes`` refuses when descendants (root excluded) reach the bound.
+        This is a node bound, not a memory bound. Custom stores without a named
+        ``max_nodes`` keyword are checked after loading. ``None`` warns and
+        keeps the unbounded read; 0.7 defaults to 10,000.
+
+        Raises :class:`RunNotFoundError` for a missing root and
+        :class:`~dendrux.errors.SubtreeTooLargeError` at the bound.
         """
         from dendrux.runtime.state import require_store_method
 
         check_run_id(run_id)
         check_read_scope(tenant_id)
-        record = await require_store_method(self._state, "get_subtree")(run_id, tenant_id=tenant_id)
+        _check_subtree_bound(max_nodes)
+        record = await _read_subtree(
+            require_store_method(self._state, "get_subtree"), run_id, tenant_id, max_nodes
+        )
         if record is None:
             raise RunNotFoundError(run_id)
         return RunSubtree(
@@ -995,6 +1017,9 @@ class RunStore:
         upper bound on ``created_at``. Empty when the run is outside
         ``tenant_id``."""
         _check_page(iteration, limit, offset, before)
+        check_run_id(run_id)
+        check_read_scope(tenant_id)
+        _warn_page("get_llm_calls", limit, "offset")
         rows = await self._scoped_read(
             self._state.get_llm_interactions,
             run_id,
@@ -1021,6 +1046,9 @@ class RunStore:
         upper bound on ``created_at``. Empty when the run is outside
         ``tenant_id``."""
         _check_page(iteration, limit, offset, before)
+        check_run_id(run_id)
+        check_read_scope(tenant_id)
+        _warn_page("get_tool_invocations", limit, "offset")
         rows = await self._scoped_read(
             self._state.get_tool_calls,
             run_id,
@@ -1042,8 +1070,14 @@ class RunStore:
     ) -> list[TraceEntry]:
         """Return the conversation trace (user / assistant / tool messages)
         for a run, ordered by ``order_index``. ``limit``/``offset`` push
-        pagination into SQL. Empty when the run is outside ``tenant_id``."""
+        pagination into SQL. SQL stores and the format-2 branch clamp pages
+        to 1,000; custom format-1 stores receive ``limit`` unchanged. Omitting
+        it or exceeding 1,000 warns. In 0.7 the default becomes 1,000 and
+        larger limits raise. Empty when the run is outside ``tenant_id``."""
         _check_page(None, limit, offset)
+        check_run_id(run_id)
+        check_read_scope(tenant_id)
+        _warn_page("get_traces", limit, "offset")
         from dendrux.runtime._capabilities import capabilities
         from dendrux.runtime.replay import conversation_records
 
@@ -1055,7 +1089,7 @@ class RunStore:
                     run_id,
                     tenant_id=tenant_id,
                     scoped=True,
-                    limit=limit,
+                    limit=_trace_page_limit(limit),
                     offset=offset,
                 )
                 return [_trace_to_public(r) for r in rows]

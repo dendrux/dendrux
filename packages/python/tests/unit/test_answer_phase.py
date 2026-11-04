@@ -243,7 +243,7 @@ async def test_assistant_traces_carry_phase(engine, state_store):
         state_store=state_store,
     )
     result = await agent.run("hi")
-    traces = await RunStore.from_engine(engine).get_traces(result.run_id)
+    traces = await RunStore.from_engine(engine).get_traces(result.run_id, limit=1000)
     assistant = [t for t in traces if t.role == "assistant"]
     assert [t.phase for t in assistant] == [
         "commentary",
@@ -264,7 +264,7 @@ async def test_single_call_trace_is_final_answer(engine, state_store):
         state_store=state_store,
     )
     result = await agent.run("hi")
-    traces = await RunStore.from_engine(engine).get_traces(result.run_id)
+    traces = await RunStore.from_engine(engine).get_traces(result.run_id, limit=1000)
     assert [t.phase for t in traces if t.role == "assistant"] == ["final_answer"]
 
 
@@ -282,31 +282,30 @@ async def test_sse_event_log_carries_iteration_and_phase(engine, state_store):
         state_store=state_store,
     )
     result = await agent.run("hi")
-    store = RunStore.from_engine(engine)
+    async with RunStore.from_engine(engine) as store:
+        frames = []
+        async with store.follow(result.run_id, tenant_id=None) as feed:
+            async for item in feed:
+                if isinstance(item, StoredEvent):
+                    frames.append(
+                        {
+                            "iteration_index": item.iteration_index,
+                            "data": item.data,
+                            "event_type": item.event_type,
+                        }
+                    )
 
-    frames = []
-    async with store.follow(result.run_id, tenant_id=None) as feed:
-        async for item in feed:
-            if isinstance(item, StoredEvent):
-                frames.append(
-                    {
-                        "iteration_index": item.iteration_index,
-                        "data": item.data,
-                        "event_type": item.event_type,
-                    }
-                )
-
-    llm = [
-        (f["iteration_index"], f["data"]["phase"])
-        for f in frames
-        if f["event_type"] == "llm.completed"
-    ]
-    assert llm == [
-        (1, "commentary"),
-        (2, "commentary"),
-        (3, "commentary"),
-        (4, "final_answer"),
-    ]
+        llm = [
+            (f["iteration_index"], f["data"]["phase"])
+            for f in frames
+            if f["event_type"] == "llm.completed"
+        ]
+        assert llm == [
+            (1, "commentary"),
+            (2, "commentary"),
+            (3, "commentary"),
+            (4, "final_answer"),
+        ]
 
 
 # ------------------------------------------------------------------

@@ -67,11 +67,10 @@ async def _poison_pause_data(engine: Any, run_id: str, bad: str) -> None:
     ("escape", "char"), [("\\u0000", "\x00"), ("\\ud800", "\ud800")], ids=["nul", "surrogate"]
 )
 async def test_unconvertible_pause_still_reads(
-    store: Any, engine: Any, escape: str, char: str
+    run_store: RunStore, store: Any, engine: Any, escape: str, char: str
 ) -> None:
     agent, run_id = await _paused(store)
     await _poison_pause_data(engine, run_id, escape)
-    run_store = RunStore.from_engine(engine)
     pending = await run_store.get_pending(run_id, tenant_id="A")
     assert pending is not None and pending.kind == "client_tool"
     assert pending.tool_calls[0].params == {"sheet": f"S{char}1"}
@@ -125,7 +124,9 @@ async def test_postgres_summary_converts_pause_data_once(store: Any, engine: Any
     assert summary[0].upper().count("AS JSONB") == 1, summary[0]
 
 
-async def test_event_reads_survive_unconvertible_event_data(store: Any, engine: Any) -> None:
+async def test_event_reads_survive_unconvertible_event_data(
+    run_store: RunStore, store: Any, engine: Any
+) -> None:
     """Approval arguments and events holding U+0000 still stream and view."""
     from dendrux.store import FollowEnd, FollowHeartbeat
 
@@ -155,7 +156,6 @@ async def test_event_reads_survive_unconvertible_event_data(store: Any, engine: 
             ),
             {"d": '{"tool_name": "t", "call_id": "c1", "params": {"q": "a\\u0000b"}}', "i": run_id},
         )
-    run_store = RunStore.from_engine(engine)
     pending = await run_store.get_pending(run_id, tenant_id="A")
     assert pending is not None and pending.tool_calls[0].params == {"q": "a\x00b"}
     seen = []

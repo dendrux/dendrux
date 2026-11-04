@@ -57,7 +57,9 @@ async def _follow(run_store: RunStore, run_id: str) -> list[StoredEvent]:
     return out
 
 
-async def test_reused_call_id_never_shows_an_older_pause(store: Any, engine: Any) -> None:
+async def test_reused_call_id_never_shows_an_older_pause(
+    run_store: RunStore, store: Any, engine: Any
+) -> None:
     llm = ScriptedLLM([_reused(PAST), _reused(NOW), LLMResponse(text="done")])
     agent = Agent(
         provider=llm,
@@ -72,12 +74,11 @@ async def test_reused_call_id_never_shows_an_older_pause(store: Any, engine: Any
         first.run_id, approved=True, tenant_id="A", expected_pause_id=first.pause_id
     )
     assert second.status.value == "waiting_approval"
-    run_store = RunStore.from_engine(engine)
     for events in (
         await _follow(run_store, first.run_id),
         [
             await run_store.get_event_view(first.run_id, e, tenant_id="A")
-            for e in await run_store.get_events(first.run_id, tenant_id="A")
+            for e in await run_store.get_events(first.run_id, tenant_id="A", limit=1000)
         ],
     ):
         requests = [e for e in events if e.event_type == "approval.requested"]
@@ -89,7 +90,7 @@ async def test_reused_call_id_never_shows_an_older_pause(store: Any, engine: Any
     assert pending is not None and pending.tool_calls[0].params == {"q": NOW}
 
 
-async def test_mcp_tool_names_are_never_shown(store: Any, engine: Any) -> None:
+async def test_mcp_tool_names_are_never_shown(run_store: RunStore, store: Any, engine: Any) -> None:
     await store.create_run("rm".ljust(26, "0"), "a", tenant_id="A")
     run_id = "rm".ljust(26, "0")
     await store.save_run_event(
@@ -108,7 +109,6 @@ async def test_mcp_tool_names_are_never_shown(store: Any, engine: Any) -> None:
         data={"decision": "approved", "decisions": [{"tool_name": SECRET, "decision": "approved"}]},
     )
     await store.finalize_run(run_id, status="success")
-    run_store = RunStore.from_engine(engine)
     events = await _follow(run_store, run_id)
     assert SECRET not in json.dumps([e.data for e in events])
     connected, completed, decided = events
@@ -117,7 +117,7 @@ async def test_mcp_tool_names_are_never_shown(store: Any, engine: Any) -> None:
     assert decided.data["decisions"][0]["tool_name"] == "<mcp_tool>"
     views = [
         await run_store.get_event_view(run_id, e, tenant_id="A")
-        for e in await run_store.get_events(run_id, tenant_id="A")
+        for e in await run_store.get_events(run_id, tenant_id="A", limit=1000)
     ]
     assert SECRET not in json.dumps([v.data for v in views])
 
@@ -203,23 +203,26 @@ async def test_custom_store_that_omits_mcp_records_shows_no_name(engine: Any) ->
     state = OmittingStore(engine)
     name = f"mcp__{SECRET}"
     await _tool_run(state, "rc".ljust(26, "0"), name, connected=True)
-    run_store = RunStore(state)
-    (completed,) = await run_store.get_events("rc".ljust(26, "0"), tenant_id="A")
-    view = await run_store.get_event_view("rc".ljust(26, "0"), completed, tenant_id="A")
-    assert view.data["tool_name"] == "<unknown_tool>"
-    events = await _follow(run_store, "rc".ljust(26, "0"))
-    assert SECRET not in json.dumps([e.data for e in events])
+    async with RunStore(state) as run_store:
+        (completed,) = await run_store.get_events("rc".ljust(26, "0"), tenant_id="A", limit=1000)
+        view = await run_store.get_event_view("rc".ljust(26, "0"), completed, tenant_id="A")
+        assert view.data["tool_name"] == "<unknown_tool>"
+        events = await _follow(run_store, "rc".ljust(26, "0"))
+        assert SECRET not in json.dumps([e.data for e in events])
 
 
-async def test_older_run_without_records_shows_no_name(store: Any, engine: Any) -> None:
+async def test_older_run_without_records_shows_no_name(
+    run_store: RunStore, store: Any, engine: Any
+) -> None:
     await _tool_run(store, "ro".ljust(26, "0"), SECRET, connected=False)
-    run_store = RunStore.from_engine(engine)
-    (completed,) = await run_store.get_events("ro".ljust(26, "0"), tenant_id="A")
+    (completed,) = await run_store.get_events("ro".ljust(26, "0"), tenant_id="A", limit=1000)
     view = await run_store.get_event_view("ro".ljust(26, "0"), completed, tenant_id="A")
     assert view.data["tool_name"] == "<unknown_tool>"
 
 
-async def test_declared_local_tools_are_positive_evidence(store: Any, engine: Any) -> None:
+async def test_declared_local_tools_are_positive_evidence(
+    run_store: RunStore, store: Any, engine: Any
+) -> None:
     run_id = "rd".ljust(26, "0")
     await store.create_run(run_id, "a", tenant_id="A")
     await store.save_run_event(
@@ -230,17 +233,17 @@ async def test_declared_local_tools_are_positive_evidence(store: Any, engine: An
             run_id, event_type="tool.completed", data={"tool_name": name, "success": True}
         )
     await store.finalize_run(run_id, status="success")
-    run_store = RunStore.from_engine(engine)
     events = await _follow(run_store, run_id)
     declared, *completed = events
     assert declared.data == {"count": 1}
     assert [e.data["tool_name"] for e in completed] == ["lookup", "use_skill", "<unknown_tool>"]
 
 
-async def test_mcp_tool_with_a_reserved_name_is_still_an_mcp_tool(store: Any, engine: Any) -> None:
+async def test_mcp_tool_with_a_reserved_name_is_still_an_mcp_tool(
+    run_store: RunStore, store: Any, engine: Any
+) -> None:
     """MCP evidence is checked before Dendrux's reserved skill-tool names."""
     run_id = "rs".ljust(26, "0")
     await _tool_run(store, run_id, "use_skill", connected=True)
-    run_store = RunStore.from_engine(engine)
     events = await _follow(run_store, run_id)
     assert events[-1].data["tool_name"] == "<mcp_tool>"

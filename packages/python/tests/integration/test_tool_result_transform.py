@@ -67,12 +67,12 @@ async def test_persisted_payload_matches_model_input(db_store, run_store) -> Non
     (model_content,) = _model_tool_contents(llm, 1)
     assert json.loads(model_content) == expected
 
-    (inv,) = await run_store.get_tool_invocations(result.run_id)
+    (inv,) = await run_store.get_tool_invocations(result.run_id, limit=1000)
     assert inv.success is True
     assert inv.params == {"limit": 2}
     assert inv.result == expected
 
-    traces = await run_store.get_traces(result.run_id)
+    traces = await run_store.get_traces(result.run_id, limit=1000)
     tool_traces = [t for t in traces if t.role == "tool"]
     assert [json.loads(t.content) for t in tool_traces] == [expected]
 
@@ -93,7 +93,7 @@ async def test_transform_failure_is_persisted_as_failed_call(db_store, run_store
     )
     result = await agent.run("go")
 
-    (inv,) = await run_store.get_tool_invocations(result.run_id)
+    (inv,) = await run_store.get_tool_invocations(result.run_id, limit=1000)
     assert inv.success is False
     assert "tool_result_transform" in (inv.error or "")
     assert "bad shape" in (inv.error or "")
@@ -119,7 +119,7 @@ async def test_not_applied_when_tool_raises(db_store, run_store) -> None:
     result = await agent.run("go")
 
     assert calls == []
-    (inv,) = await run_store.get_tool_invocations(result.run_id)
+    (inv,) = await run_store.get_tool_invocations(result.run_id, limit=1000)
     assert inv.success is False
     assert inv.error == "boom"
 
@@ -147,5 +147,5 @@ async def test_applied_on_approval_resume_path(db_store, run_store) -> None:
     expected = {"result_id": "r-get_rows", "rows": [{"x": 0}]}
     (model_content,) = _model_tool_contents(llm, 1)
     assert json.loads(model_content) == expected
-    (inv,) = await run_store.get_tool_invocations(paused.run_id)
+    (inv,) = await run_store.get_tool_invocations(paused.run_id, limit=1000)
     assert inv.result == expected

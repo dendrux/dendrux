@@ -62,6 +62,16 @@ _CACHE: dict[int, tuple[weakref.ReferenceType[Any], StoreCapabilities]] = {}
 logger = logging.getLogger(__name__)
 
 
+def _developer_stacklevel() -> int:
+    frame = inspect.currentframe()
+    stacklevel = 0
+    while frame is not None and frame.f_globals.get("__name__", "").startswith("dendrux."):
+        stacklevel += 1
+        frame = frame.f_back
+    del frame
+    return stacklevel
+
+
 def validate_capabilities(store: Any) -> StoreCapabilities:
     """Validate each declared capability once per live store object."""
     key = id(store)
@@ -74,16 +84,10 @@ def validate_capabilities(store: Any) -> StoreCapabilities:
     if not isinstance(caps, StoreCapabilities) or caps.version != 1:
         _refuse(store, "version", "capabilities", ("version=1",))
     if caps.deployment is None:
-        frame = inspect.currentframe()
-        stacklevel = 1
-        while frame is not None and frame.f_globals.get("__name__", "").startswith("dendrux."):
-            stacklevel += 1
-            frame = frame.f_back
-        del frame
         warnings.warn(
             "StateStore capabilities should declare deployment; legacy declaration is undeclared.",
             DeprecationWarning,
-            stacklevel=stacklevel,
+            stacklevel=_developer_stacklevel(),
         )
     elif caps.deployment not in ("single_process", "single_host", "multi_server"):
         _refuse(store, "deployment", "capabilities", ("deployment",))

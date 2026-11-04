@@ -364,3 +364,15 @@ def test_postgres_updates_is_exported_from_dendrux_store() -> None:
 
     assert dendrux.store.PostgresUpdates is PostgresUpdates
     assert "PostgresUpdates" in dendrux.store.__all__
+
+
+@pytest.mark.parametrize("channel", ["", "x" * 64, "é" * 32, "a\x00b", 1, b"bytes", True])
+def test_channel_rejects_invalid_postgres_identifiers(channel: Any) -> None:
+    with pytest.raises(ValueError, match="channel"):
+        PostgresUpdates(channel=channel)
+
+
+def test_channel_accepts_the_63_byte_limit() -> None:
+    channel = "é" * 31 + "x"
+    assert len(channel.encode()) == 63
+    assert PostgresUpdates(channel=channel).channel == channel

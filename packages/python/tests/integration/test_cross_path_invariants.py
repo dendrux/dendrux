@@ -934,7 +934,7 @@ async def test_released_submit_reports_abort_without_failure_hooks(
     try:
         raw = next(
             event
-            for event in await reader.get_events(run_id, tenant_id="tenant")
+            for event in await reader.get_events(run_id, tenant_id="tenant", limit=1000)
             if event.event_type == "run.resume_aborted"
         )
         assert (await reader.get_event_view(run_id, raw, tenant_id="tenant")).data == raw.data

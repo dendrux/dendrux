@@ -4917,6 +4917,31 @@ class SQLStateStore(SQLBlobCatalog):
         ancestry.reverse()
         return ancestry, complete
 
+    async def _descendant_batch(
+        self,
+        session: AsyncSession,
+        root_id: str,
+        parent_ids: list[str],
+        *,
+        tenant_id: TenantScope,
+        light: bool,
+        max_nodes: int | None,
+        loaded: int,
+    ) -> list[AgentRun]:
+        from sqlalchemy.orm import load_only
+
+        from dendrux.db.models import AgentRun
+
+        stmt = _apply_tenant_scope(
+            select(AgentRun).where(AgentRun.parent_run_id.in_(parent_ids)), tenant_id
+        )
+        if light:
+            stmt = stmt.options(load_only(AgentRun.id, AgentRun.parent_run_id, AgentRun.tenant_id))
+        if max_nodes is not None:
+            stmt = stmt.where(AgentRun.id != root_id).limit(max_nodes - loaded)
+        result = await session.execute(stmt.order_by(AgentRun.created_at, AgentRun.id))
+        return list(result.scalars())
+
     async def _bfs_descendants(
         self,
         session: AsyncSession,
@@ -4933,11 +4958,6 @@ class SQLStateStore(SQLBlobCatalog):
         everything below them. ``light`` loads only id / parent / tenant so
         usage-only callers don't pull large JSON columns.
         """
-        from sqlalchemy import select
-        from sqlalchemy.orm import load_only
-
-        from dendrux.db.models import AgentRun
-
         seen: set[str] = {root_id}
         current_level = [root_id]
         found: list[tuple[AgentRun, int]] = []
@@ -4947,25 +4967,27 @@ class SQLStateStore(SQLBlobCatalog):
             depth += 1
             rows: list[AgentRun] = []
             for i in range(0, len(current_level), _IN_CHUNK):
-                stmt = select(AgentRun).where(
-                    AgentRun.parent_run_id.in_(current_level[i : i + _IN_CHUNK])
-                )
-                if light:
-                    stmt = stmt.options(
-                        load_only(AgentRun.id, AgentRun.parent_run_id, AgentRun.tenant_id)
+                rows.extend(
+                    await self._descendant_batch(
+                        session,
+                        root_id,
+                        current_level[i : i + _IN_CHUNK],
+                        tenant_id=tenant_id,
+                        light=light,
+                        max_nodes=max_nodes,
+                        loaded=len(found) + len(rows),
                     )
-                stmt = _apply_tenant_scope(stmt, tenant_id)
-                if max_nodes is not None:
-                    stmt = stmt.limit(max_nodes - len(found) - len(rows))
-                result = await session.execute(stmt.order_by(AgentRun.created_at, AgentRun.id))
-                rows.extend(result.scalars().all())
+                )
                 if max_nodes is not None and len(found) + len(rows) >= max_nodes:
                     import logging
 
                     from dendrux.errors import BudgetConfigurationError
 
                     _codes.log_code(
-                        logging.getLogger(__name__), _codes.SUBTREE_LIMIT, run_id=root_id
+                        logging.getLogger(__name__),
+                        _codes.SUBTREE_LIMIT,
+                        run_id=root_id,
+                        limit=max_nodes,
                     )
                     raise BudgetConfigurationError(reason="subtree_limit")
 
@@ -5077,7 +5099,7 @@ class SQLStateStore(SQLBlobCatalog):
         return out
 
     async def get_subtree(
-        self, run_id: str, *, tenant_id: TenantScope = UNSCOPED
+        self, run_id: str, *, tenant_id: TenantScope = UNSCOPED, max_nodes: int | None = None
     ) -> SubtreeRecord | None:
         from sqlalchemy import select
 
@@ -5089,7 +5111,12 @@ class SQLStateStore(SQLBlobCatalog):
             if root is None:
                 return None
 
-            rows = [(root, 0), *await self._bfs_descendants(session, root.id, tenant_id=tenant_id)]
+            rows = [
+                (root, 0),
+                *await self._bfs_descendants(
+                    session, root.id, tenant_id=tenant_id, max_nodes=max_nodes
+                ),
+            ]
             usage = await self._usage_by_run(session, [r.id for r, _ in rows])
             nodes = [
                 SubtreeNodeRecord(

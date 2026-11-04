@@ -50,8 +50,9 @@ def state(engine: Any) -> SQLStateStore:
 
 
 @pytest.fixture
-def store(engine: Any) -> RunStore:
-    return RunStore.from_engine(engine)
+async def store(engine: Any) -> Any:
+    async with RunStore.from_engine(engine) as reader:
+        yield reader
 
 
 def _feed(store: RunStore, **kw: Any) -> EventFeed:

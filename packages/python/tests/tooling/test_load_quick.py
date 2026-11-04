@@ -364,3 +364,44 @@ async def test_store_cleanup_supports_current_and_historical_stores(has_close):
     store = SimpleNamespace(close=close) if has_close else SimpleNamespace()
     await load.close_store(store)
     assert close.await_count == int(has_close)
+
+
+@pytest.mark.parametrize(
+    ("p95_ms", "connections", "expected"),
+    [
+        (105, {"dendrux-live-updates": 4}, [True, True]),
+        (1_000, {"dendrux-live-updates": 1}, [True, True]),
+        (8_400, {"dendrux-live-updates": 4}, [False, True]),
+        (105, {}, [True, False]),
+        (105, {"dendrux-live-updates": 0}, [True, False]),
+        (105, {"dendrux-live-updates": 5}, [True, False]),
+    ],
+)
+def test_live_hint_delivery_checks(p95_ms, connections, expected):
+    outcome = load.Outcome(
+        metrics={
+            "trickle_delivery_lag_ms": {"p95_ms": p95_ms},
+            "server": {"peak_connections_by_role": connections},
+        }
+    )
+    load.check_live_hint_delivery(outcome, workers=2, enabled=True)
+    assert [check["ok"] for check in outcome.checks] == expected
+    assert outcome.checks[0]["limit"] == 1_000
+    assert outcome.checks[1]["limit"] == 4
+
+
+def test_live_hint_delivery_checks_require_latency_samples():
+    outcome = load.Outcome(
+        metrics={
+            "trickle_delivery_lag_ms": {"n": 0},
+            "server": {"peak_connections_by_role": {"dendrux-live-updates": 4}},
+        }
+    )
+    load.check_live_hint_delivery(outcome, workers=2, enabled=True)
+    assert not outcome.checks[0]["ok"]
+
+
+def test_live_hint_delivery_checks_do_not_apply_to_polling():
+    outcome = load.Outcome()
+    load.check_live_hint_delivery(outcome, workers=2, enabled=False)
+    assert not outcome.checks

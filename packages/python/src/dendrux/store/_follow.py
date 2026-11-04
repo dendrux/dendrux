@@ -45,6 +45,7 @@ from dendrux.db._live_updates import _error_kind
 from dendrux.errors import FollowCapacityError as FollowCapacityError
 from dendrux.errors import LiveUpdatesUnavailableError, RunNotFoundError
 from dendrux.errors import _capacity_error as _capacity_error
+from dendrux.runtime._bounds import MAX_PAGE
 from dendrux.runtime._pending import approval_calls as approval_calls
 from dendrux.runtime._pending import (
     check_read_bool,
@@ -473,8 +474,7 @@ class _Coordinator:
         Called by joins, hints and every follower before it waits, so an
         existing follower notices a dead coordinator at its next wait.
         """
-        task = self._task
-        if self._closed or (task is not None and not task.done()):
+        if self._closed or not self._task_exited():
             return
         if self._crashed:
             if not self._restart_allowed():
@@ -489,6 +489,16 @@ class _Coordinator:
         self._crashed = False
         self._task = self._loop.create_task(self._main(), name="dendrux-follow-coordinator")
         self._task.add_done_callback(self._on_exit)
+
+    def _task_exited(self) -> bool:
+        task = self._task
+        if task is None:
+            return True
+        if not task.done():
+            return False
+        # A waiter can resume before the task's queued done callback runs.
+        self._on_exit(task)
+        return True
 
     @staticmethod
     def request_due(run: _WatchedRun, now: float) -> None:
@@ -517,6 +527,12 @@ class _Coordinator:
         self._candidates.clear()
 
     def _on_exit(self, task: asyncio.Task[None]) -> None:
+        if task is not self._task:
+            return
+        self._task = None
+        self._record_crash(task)
+
+    def _record_crash(self, task: asyncio.Task[None]) -> None:
         if task.cancelled() or task.exception() is None:
             return
         self._crashed = True
@@ -879,8 +895,8 @@ class EventFeed:
             (±20 % jitter).
         status_every: without healthy live updates, a status read rides with
             every Nth events read.
-        batch: most events per run in one read (the coordinator may read
-            fewer to keep one query under 2,000 rows).
+        batch: most events per run in one read, clamped to 1,000 (the
+            coordinator may read fewer to keep one query under 2,000 rows).
         stop_timeout_s: how long ``RunStore.close()`` waits for the coordinator.
         heartbeat_s: idle time before a :class:`FollowHeartbeat` is yielded.
         buffer: events buffered per follower before it ends as ``"lagging"``.
@@ -921,6 +937,7 @@ class EventFeed:
         self.heartbeat_s = heartbeat_s
         self.buffer = buffer
         self.status_every = status_every
+        batch = min(batch, MAX_PAGE)
         self.batch = batch
         self.stop_timeout_s = stop_timeout_s
         self._params = _Params(poll_interval_s, poll_max_s, poll_healthy_s, status_every, batch)

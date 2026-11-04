@@ -349,3 +349,12 @@ def store(engine):
 def session_factory(engine):
     """Raw async session factory for direct DB assertions."""
     return sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+
+@pytest.fixture
+async def run_store(engine):
+    """Own the reader before the engine fixture disposes its pool."""
+    from dendrux.store import RunStore
+
+    async with RunStore.from_engine(engine) as reader:
+        yield reader

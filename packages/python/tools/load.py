@@ -75,6 +75,7 @@ MONITOR_INTERVAL: ContextVar[float] = ContextVar("load_monitor_interval", defaul
 POOL = {"pool_size": 10, "max_overflow": 5, "pool_timeout": 120, "pool_pre_ping": True}
 POOL_CEILING = POOL["pool_size"] + POOL["max_overflow"]
 SAMPLE_INTERVAL_S = 0.01
+LIVE_HINT_DELIVERY_P95_MS = 1_000
 BIG_CHARS = 985_000  # 17 results put the full history just below the 16 MiB rebuild bound
 V050_REFERENCE_A = 59.0  # recorded 2026-10-27, commit dca4f05e (owner-docs load-test-results.md)
 # Informational release comparison only (§12.53); baseline edits cannot change it.
@@ -2514,6 +2515,26 @@ async def ctl_kill(url: str, cfg: dict[str, Any], workers: int, kill: str) -> Ou
     return out
 
 
+def check_live_hint_delivery(out: Outcome, *, workers: int, enabled: bool) -> None:
+    """Require timely hints and bounded native transport connections when enabled."""
+    if not enabled:
+        return
+    p95 = out.metrics["trickle_delivery_lag_ms"].get("p95_ms", math.inf)
+    out.check(
+        "live-hint delivery trickle p95 within 1,000 ms",
+        p95 <= LIVE_HINT_DELIVERY_P95_MS,
+        p95,
+        LIVE_HINT_DELIVERY_P95_MS,
+    )
+    peak = out.metrics["server"]["peak_connections_by_role"].get("dendrux-live-updates", 0)
+    out.check(
+        "live-hint transport peak connections above zero and at most two per worker",
+        0 < peak <= 2 * workers,
+        peak,
+        2 * workers,
+    )
+
+
 async def ctl_followers(url: str, cfg: dict[str, Any], workers: int, notify: bool) -> Outcome:
     out = Outcome()
     n = cfg["followers_runs"]
@@ -2599,6 +2620,7 @@ async def ctl_followers(url: str, cfg: dict[str, Any], workers: int, notify: boo
         metrics["followers_open_after_close"],
         0,
     )
+    check_live_hint_delivery(out, workers=workers, enabled=notify)
     key = "followers_on" if notify else "followers_off"
     out.gates[f"{key}.attach_statements_per_follower"] = metrics["attach_statements_per_follower"]
     return out

@@ -82,3 +82,38 @@ def test_redis_ci_shell_rejects_any_skip_or_pytest_failure(
         check=False,
     )
     assert result.returncode == expected, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    ("output", "expected"),
+    [
+        ("===== 10 passed, 2 skipped in 1.0s =====", 0),
+        ("tests/unit/test_ci.py::test_guard[SKIPPED [1] DENDRUX_TEST_REDIS_URL not set] PASSED", 0),
+        ("[gw0] [ 9%] PASSED tests/unit/test_ci.py::test[DENDRUX_TEST_PG_URL not set]", 0),
+        (
+            "SKIPPED [1] tests/integration/test_redis_updates.py:9: DENDRUX_TEST_REDIS_URL not set",
+            1,
+        ),
+        ("SKIPPED [12] tests/integration/conftest.py:40: DENDRUX_TEST_PG_URL not set", 1),
+    ],
+)
+def test_the_suite_guard_fails_on_a_real_backend_skip_only(
+    tmp_path: Path, output: str, expected: int
+) -> None:
+    jobs = yaml.safe_load(CI.read_text())["jobs"]
+    run = next(
+        step["run"]
+        for spec in jobs.values()
+        for step in spec.get("steps", [])
+        if step.get("name") == "Test"
+    ).replace("${{ matrix.shard }}", "1")
+    fake = 'python() { :; }\npytest() { printf "%s\\n" "$TEST_OUTPUT"; }\n'
+    result = subprocess.run(
+        ["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", fake + run],
+        cwd=tmp_path,
+        env={**os.environ, "TEST_OUTPUT": output},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == expected, result.stdout + result.stderr

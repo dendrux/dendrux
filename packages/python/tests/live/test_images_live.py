@@ -271,6 +271,24 @@ def assert_clean_exception(exc: BaseException) -> None:
         assert needle not in blob, f"image bytes reachable from the error ({needle})"
 
 
+async def _audit_calls(store: RunStore, run_id: str) -> list[LLMCall]:
+    calls: list[LLMCall] = []
+    while page := await store.get_llm_calls(run_id, limit=1000, offset=len(calls)):
+        calls.extend(page)
+    return calls
+
+
+async def _audit_events(store: RunStore, run_id: str, kinds: list[str]) -> list[Any]:
+    events = []
+    cursor = None
+    while page := await store.get_events(
+        run_id, event_types=kinds, limit=1000, after_sequence_index=cursor
+    ):
+        events.extend(page)
+        cursor = page[-1].sequence_index
+    return events
+
+
 class Ctx:
     def __init__(self, case: Case, tmp_path: Path, rec: dict[str, Any]) -> None:
         self.case = case
@@ -303,7 +321,7 @@ class Ctx:
     async def audit(self, run_id: str, label: str = "run") -> list[LLMCall]:
         """Per-call usage and request hash; fail on inline bytes or more than 4 cache markers."""
         async with self.store() as store:
-            calls = await store.get_llm_calls(run_id)
+            calls = await _audit_calls(store, run_id)
         for call in calls:
             request = call.provider_request or {}
             text = json.dumps(request, sort_keys=True, default=str)
@@ -350,7 +368,7 @@ class Ctx:
 
     async def events(self, run_id: str, kinds: list[str]) -> list[Any]:
         async with self.store() as store:
-            return list(await store.get_events(run_id, event_types=kinds))
+            return await _audit_events(store, run_id, kinds)
 
 
 # --------------------------------------------------------------------------- scenarios
@@ -540,7 +558,7 @@ async def s9a_many_image_rule(ctx: Ctx) -> None:
     assert result.status is RunStatus.ERROR, result.status
     assert "many" in (result.error or "").lower() or "2000" in (result.error or ""), result.error
     async with ctx.store() as store:
-        assert not await store.get_llm_calls(result.run_id), "a request was sent"
+        assert not await store.get_llm_calls(result.run_id, limit=1000), "a request was sent"
 
 
 async def l06_text_only(ctx: Ctx) -> None:
