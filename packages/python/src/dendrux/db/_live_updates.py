@@ -1,6 +1,7 @@
 """Bounded, best-effort live-update hints; durable reads remain the source of truth.
 
-Close must run on the bound event loop. Its final flush respects sender backoff:
+Close runs on the bound event loop, or aborts synchronously once that loop is closed.
+Its final flush respects sender backoff:
 when sending is paused, the final flush is skipped and remaining hints are counted
 as closed drops. Readers recover those changes through polling.
 """
@@ -12,13 +13,15 @@ import json
 import logging
 import math
 import random
+import socket
+import ssl
 from abc import ABC, abstractmethod
 from collections import OrderedDict, deque
 from contextlib import suppress
 from dataclasses import dataclass
 from functools import wraps
 from time import monotonic
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from dendrux import _codes
 from dendrux.errors import FollowCapacityError, LiveUpdatesUnavailableError
@@ -45,6 +48,9 @@ class LiveUpdatesStats:
     dropped_wrong_loop: int = 0
     bad_messages: int = 0
     gaps: int = 0
+    received: int = 0
+    last_received_age_s: float | None = None
+    last_error_type: str | None = None
 
 
 def _positive(name: str, value: object, *, integer: bool = False) -> None:
@@ -57,11 +63,42 @@ def _positive(name: str, value: object, *, integer: bool = False) -> None:
 
 
 def _error_kind(error: BaseException) -> str:
-    if isinstance(error, TimeoutError):
-        return "timeout"
-    if isinstance(error, asyncio.CancelledError):
-        return "cancelled"
-    return "connection" if isinstance(error, OSError) else "other"
+    for kind, cls in (
+        ("timeout", TimeoutError),
+        ("cancelled", asyncio.CancelledError),
+        ("tls", ssl.SSLError),
+        ("connection", OSError),
+    ):
+        if isinstance(error, cls):
+            return kind
+    return "other"
+
+
+def _error_type(error: BaseException) -> str:
+    name = type(error).__name__
+    return name if name.isascii() and name.isidentifier() and len(name) <= 128 else "Exception"
+
+
+def _check_limits(counts: dict[str, int], times: dict[str, float]) -> None:
+    for name, count in counts.items():
+        _positive(name, count, integer=True)
+    for name, seconds in times.items():
+        _positive(name, seconds)
+    if counts["max_batch"] > counts["max_pending"]:
+        raise ValueError("max_batch must not exceed max_pending")
+    if times["send_timeout_s"] > times["flush_deadline_s"]:
+        raise ValueError("send_timeout_s must not exceed flush_deadline_s")
+    if times["backoff_initial_s"] > times["backoff_max_s"]:
+        raise ValueError("backoff_initial_s must not exceed backoff_max_s")
+    if counts["max_message_bytes"] < counts["max_run_id_len"] + 4:
+        raise ValueError("max_message_bytes must hold one max_run_id_len ASCII id (length + 4)")
+    if times["health_check_s"] < 0.1:
+        raise ValueError("health_check_s must be at least 0.1 seconds")
+
+
+def _shutdown_socket(transport: Any) -> None:
+    with suppress(Exception):
+        transport.get_extra_info("socket").shutdown(socket.SHUT_RDWR)
 
 
 def _caller_cancelled() -> bool:
@@ -160,16 +197,7 @@ class LiveUpdates(ABC):
             backoff_max_s=backoff_max_s,
             health_check_s=health_check_s,
         )
-        for name, count in counts.items():
-            _positive(name, count, integer=True)
-        for name, seconds in times.items():
-            _positive(name, seconds)
-        if max_batch > max_pending:
-            raise ValueError("max_batch must not exceed max_pending")
-        if send_timeout_s > flush_deadline_s:
-            raise ValueError("send_timeout_s must not exceed flush_deadline_s")
-        if backoff_initial_s > backoff_max_s:
-            raise ValueError("backoff_initial_s must not exceed backoff_max_s")
+        _check_limits(counts, times)
         self.max_pending = max_pending
         self.max_batch = max_batch
         self.max_message_bytes = max_message_bytes
@@ -213,6 +241,7 @@ class LiveUpdates(ABC):
             dropped_wrong_loop=0,
             bad_messages=0,
             gaps=0,
+            received=0,
         )
         self._in_flight = False
         self._idle = asyncio.Event()
@@ -220,6 +249,9 @@ class LiveUpdates(ABC):
         self._next_attempt_at = 0.0
         self._backoff = self.backoff_initial_s
         self._send_failed = False
+        self._last_received_at: float | None = None
+        self._last_error_type: str | None = None
+        self._oversize_logged = False
         self._overflow_episode = False
         self._wrong_loop_logged = False
         self._bad_message_at = -math.inf
@@ -239,12 +271,14 @@ class LiveUpdates(ABC):
 
     def bind(self, store: object) -> None:
         """Associate this bus with one store; subclass hooks run after the ownership check."""
+        self._require_initialized()
         if self._bound and self._store is not store:
             raise ValueError("LiveUpdates already belongs to another store")
         self._store = store
         self._bound = True
 
     def _bind_hook(self, hook: Callable[[LiveUpdates, object], None], store: object) -> None:
+        self._require_initialized()
         previous = self._store, self._bound
         LiveUpdates.bind(self, store)
         try:
@@ -252,6 +286,10 @@ class LiveUpdates(ABC):
         except BaseException:
             self._store, self._bound = previous
             raise
+
+    def _require_initialized(self) -> None:
+        if not hasattr(self, "_bound"):
+            raise RuntimeError("LiveUpdates subclasses must call super().__init__() in __init__.")
 
     def _check_loop(self) -> bool:
         try:
@@ -302,10 +340,18 @@ class LiveUpdates(ABC):
             self._counts["dropped_invalid"] += 1
             return
         if len(_quoted(run_id).encode("utf-8")) + 2 > self.max_message_bytes:
-            self._counts["dropped_oversize"] += 1
+            self._oversize_dropped()
             return
         self._pending.setdefault(run_id, monotonic())
         self._trim_pending()
+
+    def _oversize_dropped(self) -> None:
+        self._counts["dropped_oversize"] += 1
+        if not self._oversize_logged:
+            self._oversize_logged = True
+            _codes.log_code(
+                logger, _codes.LIVE_UPDATES_OVERSIZE, count=1, limit=self.max_message_bytes
+            )
 
     def _valid_id(self, run_id: object) -> bool:
         if not isinstance(run_id, str) or not 0 < len(run_id) <= self.max_run_id_len:
@@ -338,8 +384,15 @@ class LiveUpdates(ABC):
         return LiveUpdatesStats(
             pending=len(self._pending),
             oldest_pending_age_s=age,
+            last_received_age_s=self._received_age(),
+            last_error_type=self._last_error_type,
             **self._counts,
         )
+
+    def _received_age(self) -> float | None:
+        if self._last_received_at is None:
+            return None
+        return max(0.0, monotonic() - self._last_received_at)
 
     def _encode(self, run_ids: Sequence[str]) -> list[str]:
         messages: list[str] = []
@@ -446,12 +499,17 @@ class LiveUpdates(ABC):
             self.abort_sender()
 
     def _send_failure(self, error: BaseException, count: int) -> None:
+        self._last_error_type = _error_type(error)
         self._next_attempt_at = monotonic() + self._backoff
         self._backoff = min(self._backoff * 2, self.backoff_max_s)
         if not self._send_failed:
             self._send_failed = True
             _codes.log_code(
-                logger, _codes.LIVE_UPDATES_SEND_FAILED, error_kind=_error_kind(error), count=count
+                logger,
+                _codes.LIVE_UPDATES_SEND_FAILED,
+                error_kind=_error_kind(error),
+                error_type=self._last_error_type,
+                count=count,
             )
 
     def _send_success(self) -> None:
@@ -487,15 +545,24 @@ class LiveUpdates(ABC):
         self._leases: set[object] = set()
         self._consumers: dict[object, tuple[_Consumer, bool]] = {}
         self._stream_consumers = 0
+        self._wakers_by_run: dict[str, dict[object, _Consumer]] = {}
+        self._waker_runs: dict[object, str] = {}
+        self._general_consumers: dict[object, _Consumer] = {}
 
     @property
     def healthy(self) -> bool:
-        """Whether the listener has confirmed a live subscription."""
-        return self._healthy
+        """Whether the listener is subscribed and the sender is outside failure backoff."""
+        return self._effective_health()
+
+    def _effective_health(self) -> bool:
+        return self._healthy and not self._sender_backoff_active()
+
+    def _sender_backoff_active(self) -> bool:
+        return self._send_failed and monotonic() < self._next_attempt_at
 
     @property
     def generation(self) -> int:
-        """Monotonic generation of health transitions and missed hints."""
+        """Monotonic generation of listener health transitions and missed hints."""
         return self._generation
 
     def _new_inbound_buffer(self) -> _InboundBuffer:
@@ -513,6 +580,7 @@ class LiveUpdates(ABC):
         Return an opaque handle for idempotent ``unregister``. Stream consumers
         share the overridable ``max_stream_consumers`` class-level cap.
         """
+        run_id = self._consumer_run_id(consumer, stream_events)
         self._require_loop()
         self._require_open()
         if stream_events and self._stream_consumers >= self.max_stream_consumers:
@@ -520,6 +588,7 @@ class LiveUpdates(ABC):
             raise FollowCapacityError(self.max_stream_consumers)
         handle = object()
         self._consumers[handle] = (consumer, stream_events)
+        self._index_consumer(handle, consumer, run_id)
         self._stream_consumers += int(stream_events)
         return handle
 
@@ -527,8 +596,38 @@ class LiveUpdates(ABC):
         """Idempotently remove a hub registration."""
         self._require_loop()
         registration = self._consumers.pop(handle, None)
+        self._unindex_consumer(handle)
         if registration is not None:
             self._stream_consumers -= int(registration[1])
+
+    @staticmethod
+    def _consumer_run_id(consumer: _Consumer, stream: bool) -> object:
+        indexed = getattr(consumer, "_live_updates_run_waker", False) is True
+        return getattr(consumer, "run_id", None) if indexed and stream else None
+
+    def _index_consumer(self, handle: object, consumer: _Consumer, run_id: object) -> None:
+        if isinstance(run_id, str):
+            self._wakers_by_run.setdefault(run_id, {})[handle] = consumer
+            self._waker_runs[handle] = run_id
+        else:
+            self._general_consumers[handle] = consumer
+
+    def _unindex_consumer(self, handle: object) -> None:
+        self._general_consumers.pop(handle, None)
+        run_id = self._waker_runs.pop(handle, None)
+        if run_id is not None:
+            wakers = self._wakers_by_run[run_id]
+            wakers.pop(handle)
+            if not wakers:
+                del self._wakers_by_run[run_id]
+
+    def _hint_targets(self, ids: tuple[str, ...]) -> list[tuple[_Consumer, tuple[str, ...]]]:
+        targets = [(consumer, ids) for consumer in self._general_consumers.values()]
+        for run_id in dict.fromkeys(ids):
+            targets.extend(
+                (consumer, (run_id,)) for consumer in self._wakers_by_run.get(run_id, {}).values()
+            )
+        return targets
 
     def _deliver(self, message: str | _Gap) -> None:
         if message is self.GAP:
@@ -536,9 +635,15 @@ class LiveUpdates(ABC):
             return
         ids = self._decode(cast("str", message))
         if ids is not None:
-            for consumer, _ in tuple(self._consumers.values()):
+            self._received(ids)
+            for consumer, hints in self._hint_targets(ids):
                 with suppress(Exception, asyncio.CancelledError):
-                    consumer.on_hints(ids)
+                    consumer.on_hints(hints)
+
+    def _received(self, ids: tuple[str, ...]) -> None:
+        if ids:
+            self._counts["received"] += len(ids)
+            self._last_received_at = monotonic()
 
     def _gap(self) -> None:
         self._generation += 1
@@ -563,10 +668,16 @@ class LiveUpdates(ABC):
             self._listener_backoff = self.backoff_initial_s
 
     def _degraded(self, error: BaseException) -> None:
+        self._last_error_type = _error_type(error)
         self._health(False)
         if not self._listener_failed:
             self._listener_failed = True
-            _codes.log_code(logger, _codes.LIVE_UPDATES_DEGRADED, error_kind=_error_kind(error))
+            _codes.log_code(
+                logger,
+                _codes.LIVE_UPDATES_DEGRADED,
+                error_kind=_error_kind(error),
+                error_type=self._last_error_type,
+            )
 
     def _require_loop(self) -> None:
         if not self._check_loop():
@@ -692,19 +803,44 @@ class LiveUpdates(ABC):
         _codes.log_code(logger, _codes.LIVE_UPDATES_CLOSE_TIMEOUT, timeout_s=self.close_timeout_s)
 
     async def close(self) -> None:
-        """Drain and close within one total deadline; a cancelled closer may be retried."""
+        """Drain within one deadline, or abort synchronously after the owning loop closes."""
+        if self._bound_loop_closed():
+            self._close_detached()
+            return
+        await self._close_on_loop()
+
+    def _bound_loop_closed(self) -> bool:
+        return self._loop is not None and self._loop.is_closed()
+
+    def _close_detached(self) -> None:
+        if self._state == "closed":
+            return
+        self._state = "closing"
+        self._abort_sender_safe()
+        self._abort_listener_safe()
+        self._listener_task = None
+        self._healthy = False
+        self._finish_close()
+
+    async def _close_on_loop(self) -> None:
         self._require_loop()
         async with self._close_lock:
             if self._state == "closed":
                 return
             self._state = "closing"
             await self._close_owned()
-            self._state = "closed"
-            self._counts["dropped_closed"] += len(self._pending)
-            self._pending.clear()
-            self._leases.clear()
-            self._consumers.clear()
-            self._stream_consumers = 0
+            self._finish_close()
+
+    def _finish_close(self) -> None:
+        self._state = "closed"
+        self._counts["dropped_closed"] += len(self._pending)
+        self._pending.clear()
+        self._leases.clear()
+        self._consumers.clear()
+        self._wakers_by_run.clear()
+        self._waker_runs.clear()
+        self._general_consumers.clear()
+        self._stream_consumers = 0
 
     async def _close_owned(self) -> None:
         self._close_timeout_logged = False
@@ -720,8 +856,14 @@ class LiveUpdates(ABC):
             self._abort_all()
             self._close_timeout()
         except Exception as error:
+            self._last_error_type = _error_type(error)
             self._abort_all()
-            _codes.log_code(logger, _codes.LIVE_UPDATES_UNAVAILABLE, error_kind=_error_kind(error))
+            _codes.log_code(
+                logger,
+                _codes.LIVE_UPDATES_UNAVAILABLE,
+                error_kind=_error_kind(error),
+                error_type=_error_type(error),
+            )
 
     async def _close_resources(self, deadline: float) -> None:
         await self._idle.wait()

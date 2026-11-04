@@ -19,7 +19,9 @@ from __future__ import annotations
 import asyncio
 import codecs
 import secrets
+import ssl
 import threading
+from collections.abc import Mapping
 from contextlib import suppress
 from functools import lru_cache
 from time import monotonic
@@ -27,10 +29,10 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qsl, urlsplit
 
-from dendrux.db._live_updates import LiveUpdates
+from dendrux.db._live_updates import LiveUpdates, _shutdown_socket
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
+    from collections.abc import AsyncIterator, Iterable, Sequence
 
     from dendrux.db._live_updates import _Gap
 
@@ -55,6 +57,7 @@ _FORBIDDEN_OPTIONS = frozenset(
         "unix_socket_path",
         "protocol",
         "parser_class",
+        "decode_responses",
     }
 )
 _POOL_ATTRIBUTES = ("_in_use_connections", "_available_connections")
@@ -65,7 +68,8 @@ def _load_api() -> Any:
 
     Importing the parser classes proves nothing about how they read a message, so the bound on
     incoming messages is not trusted here: ``bounded_parser(limit)`` runs the parser on in-memory
-    streams and only returns it if it reads a normal message and refuses an oversized one.
+    streams and only returns it if it reads a normal message, discards an oversized one,
+    and preserves the next reply.
     """
     try:
         from redis import exceptions
@@ -88,23 +92,52 @@ def _load_api() -> Any:
     )
 
 
-class _OversizeMessageError(Exception):
-    """A bulk reply longer than the bound. The stream is no longer in step: drop the connection."""
+_DISCARDED = b"\x00dendrux-discarded-bulk"
+_DISCARD_CHUNK_BYTES = 65_536
+
+
+async def _discard_bulk(parser: Any, length: int) -> bytes:
+    remaining = length + 2
+    buffered = min(remaining, max(0, len(parser._buffer) - parser._pos))
+    remaining -= buffered
+    try:
+        while remaining:
+            size = min(remaining, _DISCARD_CHUNK_BYTES)
+            await parser._stream.readexactly(size)
+            remaining -= size
+    except (asyncio.CancelledError, asyncio.IncompleteReadError):
+        # A partial discard cannot be replayed from redis-py's retry buffer.
+        # Force teardown even when get_message would normally swallow a poll timeout.
+        raise ConnectionError("Redis live updates discard interrupted") from None
+    parser._pos += length + 2
+    return _DISCARDED
+
+
+def _check_frame_replay(poisoned: bool) -> None:
+    if poisoned:
+        raise ConnectionError("Redis live updates cannot replay a discarded frame")
 
 
 def _bounded_parser(base: type, limit: int) -> type:
-    """``base`` (redis-py's pure-Python RESP2 parser) refusing a bulk longer than ``limit``.
-
-    redis-py reads a bulk reply with ``_read(length)`` after parsing its declared length, so
-    checking the length there refuses an oversized message before any of its body is read or
-    allocated. That is an internal hook: nothing here assumes it still works. ``_verified_parser``
-    proves it on the installed redis-py before the parser is ever used.
-    """
+    """Drain oversized bulks without appending their bodies to redis-py's retry buffer."""
 
     class BoundedParser(base):  # type: ignore[misc]
+        _frame_poisoned = False
+
+        def on_connect(self, connection: Any) -> None:
+            self._frame_poisoned = False
+            super().on_connect(connection)
+
+        async def read_response(self, disable_decoding: bool = False) -> Any:
+            _check_frame_replay(self._frame_poisoned)
+            response = await super().read_response(disable_decoding=disable_decoding)
+            self._frame_poisoned = False
+            return response
+
         async def _read(self, length: int) -> bytes:
             if length > limit:
-                raise _OversizeMessageError
+                self._frame_poisoned = True
+                return await _discard_bulk(self, length)
             return bytes(await super()._read(length))
 
     return BoundedParser
@@ -127,14 +160,12 @@ async def _check_parser(connection_class: type, parser_class: type, limit: int) 
     reader.feed_data(_reply(b"hello"))
     if (await asyncio.wait_for(parser.read_response(), 2))[2] != b"hello":
         return "it does not read an ordinary message"
-    reader.feed_data(_reply(b"x" * (limit + 1)))  # the whole oversized message is on the stream
-    try:
-        await asyncio.wait_for(parser.read_response(), 2)
-    except _OversizeMessageError:
-        return None
-    except Exception:
-        return "it does not refuse an oversized message"
-    return "it accepts an oversized message"
+    reader.feed_data(_reply(b"x" * (limit + 1)) + _reply(b"after"))
+    if (await asyncio.wait_for(parser.read_response(), 2))[2] is not _DISCARDED:
+        return "it does not discard an oversized message"
+    if (await asyncio.wait_for(parser.read_response(), 2))[2] != b"after":
+        return "it does not preserve the following message"
+    return None
 
 
 def _problem_with(connection_class: type, parser_class: type, limit: int) -> str | None:
@@ -251,6 +282,7 @@ def _checked_url(url: object) -> str:
     if query is None:
         raise ValueError("url is not a valid Redis URL")
     _checked_query(query)
+    _check_port(url)
     return url
 
 
@@ -274,8 +306,46 @@ def _is_utf8(name: object) -> bool:
         return False
 
 
+def _option_mapping(options: Mapping[str, Any] | None) -> dict[str, Any]:
+    if options is not None and not isinstance(options, Mapping):
+        raise TypeError("client_options must be a mapping")
+    return dict(options or {})
+
+
+def _check_port(url: str) -> None:
+    valid = False
+    try:
+        port = urlsplit(url).port
+        valid = port is None or 0 < port <= 65_535
+    except ValueError:
+        pass
+    if not valid:
+        raise ValueError("Redis URL port must be a number from 1 to 65535")
+
+
+def _tls_failure(error: BaseException) -> bool:
+    current: BaseException | None = error
+    for _ in range(8):
+        if current is None:
+            return False
+        if isinstance(current, ssl.SSLError):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _redis_error(api: Any, error: BaseException) -> Exception:
+    if _tls_failure(error):
+        return ssl.SSLError("Redis live updates TLS handshake failed")
+    if isinstance(error, (TimeoutError, api.TimeoutError)):
+        return TimeoutError("Redis live updates timed out")
+    if isinstance(error, (OSError, api.ConnectionError)):
+        return ConnectionError("Redis live updates connection failed")
+    return RuntimeError("Redis live updates failed")
+
+
 def _checked_options(options: Mapping[str, Any] | None) -> dict[str, Any]:
-    chosen = dict(options or {})
+    chosen = _option_mapping(options)
     if "encoding" in chosen and not _is_utf8(chosen["encoding"]):
         raise ValueError("client_options encoding must be utf-8, the encoding of the wire format")
     refused = sorted(key for key in chosen if key in _FORBIDDEN_OPTIONS)
@@ -287,7 +357,7 @@ def _checked_options(options: Mapping[str, Any] | None) -> dict[str, Any]:
     return chosen
 
 
-def _abort_transports(pool: Any, extra: Iterable[Any] = ()) -> None:
+def _abort_transports(pool: Any, extra: Iterable[Any] = (), *, closed_loop: bool = False) -> None:
     """Synchronously drop the sockets of every connection a pool holds, plus ``extra``."""
     connections = [conn for conn in extra if conn is not None]
     if pool is not None:
@@ -295,7 +365,13 @@ def _abort_transports(pool: Any, extra: Iterable[Any] = ()) -> None:
             connections.extend(getattr(pool, name, None) or ())
     for connection in connections:
         with suppress(Exception):
-            connection._writer.transport.abort()
+            _abort_transport(connection._writer.transport, closed_loop)
+
+
+def _abort_transport(transport: Any, closed_loop: bool) -> None:
+    if closed_loop:
+        _shutdown_socket(transport)
+    transport.abort()
 
 
 def _text(data: object) -> str:
@@ -329,7 +405,11 @@ class _Subscription:
         self._detect_by = self._idle_until + self.probe_s
 
     def abort(self) -> None:
-        _abort_transports(self.pool, [getattr(self.pubsub, "connection", None)])
+        _abort_transports(
+            self.pool,
+            [getattr(self.pubsub, "connection", None)],
+            closed_loop=self.owner._bound_loop_closed(),
+        )
 
     async def open(self) -> None:
         owner = self.owner
@@ -369,8 +449,7 @@ class _Subscription:
     def _interpret(self, reply: dict[str, Any]) -> str | _Gap | None:
         kind = reply.get("type")
         if kind == "message":
-            self._alive()
-            return _text(reply.get("data"))
+            return self._message(reply.get("data"))
         if kind == "pong" and self._token is not None and _text(reply.get("data")) == self._token:
             self._token = None
             self._alive()
@@ -378,6 +457,17 @@ class _Subscription:
             # a second subscribe acknowledgement means the client resubscribed behind our back
             return LiveUpdates.GAP
         return None
+
+    def _message(self, data: object) -> str | None:
+        self._alive()
+        if data is _DISCARDED:
+            self.owner._oversize_dropped()
+            return None
+        text = _text(data)
+        if len(text.encode("utf-8")) > self.owner.max_message_bytes:
+            self.owner._oversize_dropped()
+            return None
+        return text
 
     async def _on_silence(self) -> None:
         remaining = self._detect_by - monotonic()
@@ -439,7 +529,7 @@ class RedisUpdates(LiveUpdates):
             "retry": api.Retry(api.NoBackoff(), 0, supported_errors=()),
         }
         if listening:
-            # RESP2 with a parser that refuses an oversized message before reading it
+            # RESP2 with a parser that drains oversized messages in bounded chunks
             options["protocol"] = 2
             options["parser_class"] = self._listen_parser
         return api.ConnectionPool.from_url(self._url.reveal(), **options)
@@ -453,16 +543,13 @@ class RedisUpdates(LiveUpdates):
         except Exception:
             valid = False
         if not valid:
-            raise ValueError("url or client_options are not accepted by the Redis client")
+            raise ValueError(
+                "A Redis URL option or client_options setting is unsupported; "
+                "check the option names and types"
+            )
 
     def _plain_error(self, error: BaseException) -> Exception:
-        if isinstance(error, _OversizeMessageError):
-            return ConnectionError("Redis live updates message too large")
-        if isinstance(error, (TimeoutError, self._api.TimeoutError)):
-            return TimeoutError("Redis live updates timed out")
-        if isinstance(error, (OSError, self._api.ConnectionError)):
-            return ConnectionError("Redis live updates connection failed")
-        return RuntimeError("Redis live updates failed")
+        return _redis_error(self._api, error)
 
     # -- send ------------------------------------------------------------------------------
 
@@ -491,7 +578,9 @@ class RedisUpdates(LiveUpdates):
         wire = self._wire
         pipeline, pool = wire.pipeline, wire.pool
         wire.pipeline = wire.pool = wire.client = None  # the next send starts from scratch
-        _abort_transports(pool, [getattr(pipeline, "connection", None)])
+        _abort_transports(
+            pool, [getattr(pipeline, "connection", None)], closed_loop=self._bound_loop_closed()
+        )
 
     async def aclose_sender(self) -> None:
         # The handles stay until cleanup is over: if cleanup stalls, is cancelled or times out,
@@ -529,5 +618,6 @@ class RedisUpdates(LiveUpdates):
             raise failure
 
     def abort_listener(self) -> None:
-        if self._wire.subscription is not None:
-            self._wire.subscription.abort()
+        subscription, self._wire.subscription = self._wire.subscription, None
+        if subscription is not None:
+            subscription.abort()

@@ -24,7 +24,7 @@ FAST: dict[str, Any] = dict(
     close_timeout_s=1.0,
     backoff_initial_s=0.01,
     backoff_max_s=0.02,
-    health_check_s=0.05,
+    health_check_s=0.1,
 )
 
 

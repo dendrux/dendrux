@@ -21,7 +21,7 @@ async def test_live_updates_true_binds_postgres_updates_to_the_engine_url() -> N
         store = store_for_engine(engine, live_updates=True)
         updates = store.live_updates
         assert isinstance(updates, PostgresUpdates)
-        assert updates._send_dsn == updates._listen_dsn == asyncpg_dsn(engine.url)
+        assert updates._settings.send_dsn == updates._settings.listen_dsn == asyncpg_dsn(engine.url)
         await store.close()
     finally:
         await engine.dispose()

@@ -24,7 +24,7 @@ FAST: dict[str, Any] = dict(
     close_timeout_s=1.0,
     backoff_initial_s=0.01,
     backoff_max_s=0.02,
-    health_check_s=0.05,
+    health_check_s=0.1,
 )
 
 
@@ -181,16 +181,15 @@ def message(size: int) -> bytes:
     )
 
 
-async def test_real_a_message_at_the_bound_is_read_and_one_byte_more_is_refused() -> None:
+async def test_real_a_message_at_the_bound_is_read_and_one_byte_more_is_discarded() -> None:
     updates = ru.RedisUpdates(f"redis://{HOST}/0", **FAST)  # max_message_bytes 7,900
     parser, reader = listen_parser(updates)
     reader.feed_data(message(7_900))
     assert len((await parser.read_response())[2]) == 7_900
     reader.feed_data(message(7_901))
-    with pytest.raises(Exception) as caught:
-        await parser.read_response()
-    assert type(updates._plain_error(caught.value)) is ConnectionError
-    assert "xxxx" not in str(caught.value)
+    assert (await parser.read_response())[2] is ru._DISCARDED
+    reader.feed_data(message(1_000))
+    assert len((await parser.read_response())[2]) == 1_000
 
 
 async def test_real_a_realistic_message_ten_times_over_is_read() -> None:
@@ -199,13 +198,13 @@ async def test_real_a_realistic_message_ten_times_over_is_read() -> None:
     assert len((await parser.read_response())[2]) == 1_000
 
 
-async def test_real_a_huge_declared_length_is_refused_before_any_body_arrives() -> None:
+async def test_real_a_huge_declared_length_cannot_wait_beyond_the_read_deadline() -> None:
     parser, reader = listen_parser(ru.RedisUpdates(f"redis://{HOST}/0", **FAST))
     reader.feed_data(b"*3\r\n$7\r\nmessage\r\n$1\r\nc\r\n$1000000000\r\n")  # and no body at all
-    with pytest.raises(Exception) as caught:  # noqa: B017
-        async with asyncio.timeout(1):  # waiting for the body would end in this timeout instead
+    with pytest.raises(ConnectionError):
+        async with asyncio.timeout(0.02):
             await parser.read_response()
-    assert not isinstance(caught.value, TimeoutError)
+    assert sum(map(len, parser._chunks)) + len(parser._buffer) < 1_000
 
 
 async def test_real_the_bound_follows_max_message_bytes() -> None:
@@ -213,8 +212,7 @@ async def test_real_the_bound_follows_max_message_bytes() -> None:
     reader.feed_data(message(3_000))
     assert len((await parser.read_response())[2]) == 3_000
     reader.feed_data(message(3_001))
-    with pytest.raises(Exception):  # noqa: B017
-        await parser.read_response()
+    assert (await parser.read_response())[2] is ru._DISCARDED
 
 
 def test_real_a_redis_client_without_a_boundable_parser_is_refused(
@@ -243,14 +241,14 @@ async def test_neither_pool_lets_redis_py_retry_or_reconnect_by_itself(world: Fa
 
 async def test_the_pong_wait_is_clamped_to_the_health_check_interval(world: FakeWorld) -> None:
     world.pong_mode = "silent"
-    updates = make(health_check_s=0.03, send_timeout_s=0.5, flush_deadline_s=1.0)
+    updates = make(health_check_s=0.1, send_timeout_s=0.5, flush_deadline_s=1.0)
     iterator = updates.receive()
     await anext(iterator)
     waiting = asyncio.ensure_future(anext(iterator))
     await eventually(lambda: bool(world.pubsubs[0].pings))
     subscription = updates._wire.subscription
     assert subscription is not None
-    # 4 x send_timeout_s would be 2 s; detection is idle (30 ms) + at most 30 ms of probing
+    # 4 x send_timeout_s would be 2 s; detection is idle (100 ms) + at most 100 ms of probing
     assert subscription._pong_by - monotonic() <= updates.health_check_s
     with pytest.raises(TimeoutError):
         await asyncio.wait_for(waiting, 5)
@@ -260,7 +258,7 @@ async def test_the_pong_wait_is_clamped_to_the_health_check_interval(world: Fake
 async def test_a_read_that_ignores_its_timeout_is_cut_off_by_the_enclosing_deadline(
     world: FakeWorld,
 ) -> None:
-    updates = make(health_check_s=0.03)
+    updates = make(health_check_s=0.1)
     iterator = updates.receive()
     await anext(iterator)
     world.hang_reads = True  # e.g. redis-py busy reconnecting inside its error handler
@@ -274,7 +272,7 @@ async def test_a_ping_that_cannot_be_written_is_cut_off_by_the_probe_budget(
     world: FakeWorld,
 ) -> None:
     world.hang_ping = True
-    updates = make(health_check_s=0.03)
+    updates = make(health_check_s=0.1)
     iterator = updates.receive()
     await anext(iterator)
     with pytest.raises(TimeoutError) as caught:
@@ -396,7 +394,7 @@ async def test_a_late_idle_read_is_charged_against_the_probe_budget(world: FakeW
 async def test_an_idle_read_that_returns_after_the_whole_budget_never_pings(
     world: FakeWorld,
 ) -> None:
-    updates = make(health_check_s=0.05, send_timeout_s=0.5, flush_deadline_s=1.0)
+    updates = make(health_check_s=0.1, send_timeout_s=0.5, flush_deadline_s=1.0)
     iterator = updates.receive()
     await anext(iterator)
     pubsub = world.pubsubs[0]
@@ -509,8 +507,9 @@ async def test_real_parser_eviction_preserves_active_bounds_and_rechecks_misses(
     reader.feed_data(message(9_000))
     assert len((await parser.read_response())[2]) == 9_000
     reader.feed_data(message(9_001))
-    with pytest.raises(ru._OversizeMessageError):
-        await asyncio.wait_for(parser.read_response(), 1)
+    assert (await asyncio.wait_for(parser.read_response(), 1))[2] is ru._DISCARDED
+    reader.feed_data(message(1_000))
+    assert len((await parser.read_response())[2]) == 1_000
     await active.close()
 
 

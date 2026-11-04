@@ -162,7 +162,7 @@ async def test_termination_ends_receive_and_closes(driver: Driver) -> None:
 async def test_liveness_ping_runs_only_after_silence_on_the_listen_connection(
     driver: Driver,
 ) -> None:
-    updates = _updates(health_check_s=0.05)
+    updates = _updates(health_check_s=0.1)
     stream = updates.receive()
     await _first(stream)
     listener = driver.connections[0]
@@ -183,7 +183,7 @@ async def test_liveness_ping_runs_only_after_silence_on_the_listen_connection(
 
 
 async def test_stalled_ping_ends_receive_within_its_deadline(driver: Driver) -> None:
-    updates = _updates(health_check_s=0.05, send_timeout_s=0.05, flush_deadline_s=0.05)
+    updates = _updates(health_check_s=0.1, send_timeout_s=0.05, flush_deadline_s=0.05)
     stream = updates.receive()
     await _first(stream)
     driver.connections[0].hang = "ping"
@@ -291,7 +291,7 @@ async def test_connect_failure_never_logs_driver_text_or_destination(
 
 @pytest.mark.parametrize(
     ("health_check_s", "send_timeout_s"),
-    [(0.02, 0.05), (0.05, 0.01), (0.2, 0.01), (0.1, 0.1)],
+    [(0.1, 0.05), (0.15, 0.01), (0.2, 0.01), (0.1, 0.1)],
 )
 async def test_silent_connection_loss_is_detected_within_twice_the_health_interval(
     driver: Driver, monkeypatch: pytest.MonkeyPatch, health_check_s: float, send_timeout_s: float

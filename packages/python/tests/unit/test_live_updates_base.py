@@ -213,9 +213,9 @@ def test_decoder_refuses_whole_bad_message(message, caplog):
 
 
 def test_decoder_checks_utf8_byte_count_and_id_length():
-    bus = Bus(max_message_bytes=100, max_run_id_len=260)
+    bus = Bus(max_message_bytes=100, max_run_id_len=96)
     assert bus._decode(json.dumps(["é" * 49], ensure_ascii=False)) is None
-    bus = Bus(max_message_bytes=104, max_run_id_len=260)
+    bus = Bus(max_message_bytes=104, max_run_id_len=100)
     assert bus._decode(json.dumps(["é" * 50], ensure_ascii=False)) == ("é" * 50,)
     assert Bus(max_run_id_len=260)._decode(json.dumps(["x" * 260])) == ("x" * 260,)
     assert Bus(max_run_id_len=260)._decode(json.dumps(["x" * 261])) is None
@@ -241,13 +241,13 @@ async def test_pending_scale_invalid_and_unencodable_ids():
     assert bus.stats().pending == 10_000
     bus.enqueue(["x" * 261, "", None, "\ud800"])
     assert bus.stats().dropped_invalid == 4
-    bus.enqueue(["last"])
+    bus.enqueue(["SENTINEL_LAST_RUN"])
     assert bus.stats().dropped_overflow == 1
-    tiny = Bus(max_message_bytes=4)
-    tiny.enqueue(["x"])
+    tiny = Bus(max_message_bytes=5, max_run_id_len=1)
+    tiny.enqueue(["é"])
     assert tiny.stats().pending == 0
     assert tiny.stats().dropped_oversize == 1
-    assert "last" not in repr(asdict(bus.stats()))
+    assert "SENTINEL_LAST_RUN" not in repr(asdict(bus.stats()))
 
 
 @pytest.mark.asyncio
