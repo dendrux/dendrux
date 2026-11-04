@@ -8,11 +8,12 @@ driver text ever reaches a log line or an error.
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import logging
 import re
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import quote, urlencode
 
 from dendrux import _codes
@@ -31,6 +32,7 @@ logger = logging.getLogger(__name__)
 #: Postgres rejects NOTIFY payloads of 8,000 bytes or more.
 MAX_NOTIFY_BYTES = 7_999
 APPLICATION_NAME = "dendrux-live-updates"
+_NOTIFY_SQL = "SELECT pg_notify($1, m) FROM unnest($2::text[]) AS m"
 
 # Keys asyncpg's DSN parser reads itself (checked against the installed version
 # at import, see ``_dsn_keys``), plus the two startup settings the spec keeps.
@@ -231,6 +233,8 @@ class PostgresUpdates(LiveUpdates):
         self._explicit_listen = explicit_listen
         self._listen_dsn: str | None = explicit_listen or self._send_dsn
         self._tls_checked = False
+        self._sender: Any = None
+        self._listener: Any = None
 
     def bind(self, store: object) -> None:
         """Default ``url`` to the store's engine URL; refuse a store without one."""
@@ -258,9 +262,94 @@ class PostgresUpdates(LiveUpdates):
                 _codes.log_code(logger, _codes.LIVE_UPDATES_TLS_UNKNOWN)
                 return
 
-    async def send(self, messages: Sequence[str]) -> None:
-        raise NotImplementedError
+    async def _connect(self, dsn: str | None, timeout: float) -> Any:
+        import asyncpg
 
-    async def receive(self) -> AsyncIterator[str | None | _Gap]:  # pragma: no cover - stub
-        raise NotImplementedError
-        yield None
+        if dsn is None:
+            raise ValueError("PostgresUpdates is not bound to a store and has no url=.")
+        self._check_tls()
+        url_settings = frozenset(k for k in _STARTUP_SETTINGS if f"{k}=" in dsn.partition("?")[2])
+        options = connect_options(self._connect_args, timeout=timeout, url_settings=url_settings)
+        return await asyncpg.connect(dsn, **options)
+
+    async def send(self, messages: Sequence[str]) -> None:
+        """One ``pg_notify`` statement per call on the dedicated sender connection."""
+        connection = self._sender
+        if connection is None or connection.is_closed():
+            connection = await self._connect(self._send_dsn, self.send_timeout_s)
+            self._sender = connection
+        await connection.execute(_NOTIFY_SQL, self.channel, list(messages))
+
+    def abort_sender(self) -> None:
+        """Terminate the sender connection now; the next ``send`` reconnects."""
+        connection, self._sender = self._sender, None
+        if connection is not None:
+            connection.terminate()
+
+    async def aclose_sender(self) -> None:
+        """Close the sender connection, terminating it if a clean close fails."""
+        connection, self._sender = self._sender, None
+        if connection is None or connection.is_closed():
+            return
+        try:
+            await connection.close(timeout=self.send_timeout_s)
+        except BaseException:
+            connection.terminate()
+            raise
+
+    def abort_listener(self) -> None:
+        """Terminate the listen connection now; ``receive`` then ends."""
+        connection = self._listener
+        if connection is not None:
+            connection.terminate()
+
+    async def receive(self) -> AsyncIterator[str | None | _Gap]:
+        """LISTEN on a dedicated connection; ``None`` once LISTEN has executed.
+
+        Liveness: after ``health_check_s`` without a message, ``SELECT 1`` runs
+        on this same connection; a failure or a lost connection ends the stream.
+        The connection is always terminated when the stream ends.
+        """
+        buffer = self._new_inbound_buffer()
+        lost = asyncio.Event()
+        connection = None
+        try:
+            connection = await self._connect(self._listen_dsn, self.send_timeout_s * 4)
+            self._listener = connection
+            connection.add_termination_listener(lambda _connection: lost.set())
+            await connection.add_listener(
+                self.channel, lambda _c, _pid, _channel, payload: buffer.put(payload)
+            )
+            yield None
+            while True:
+                yield await self._next_message(connection, buffer, lost)
+        finally:
+            if self._listener is connection:
+                self._listener = None
+            if connection is not None:
+                connection.terminate()
+
+    async def _next_message(self, connection: Any, buffer: Any, lost: asyncio.Event) -> str | _Gap:
+        while True:
+            if lost.is_set():
+                raise ConnectionError("live updates listener lost")
+            message = await self._wait_message(buffer, lost)
+            if message is not None:
+                return cast("str | _Gap", message)
+            if not lost.is_set():
+                async with asyncio.timeout(self.send_timeout_s * 4):
+                    await connection.execute("SELECT 1")
+
+    async def _wait_message(self, buffer: Any, lost: asyncio.Event) -> object | None:
+        """The next buffered item, or ``None`` after ``health_check_s`` of silence or loss."""
+        getter = asyncio.ensure_future(buffer.get())
+        waiter = asyncio.ensure_future(lost.wait())
+        try:
+            await asyncio.wait(
+                {getter, waiter}, timeout=self.health_check_s, return_when=asyncio.FIRST_COMPLETED
+            )
+        finally:
+            waiter.cancel()
+            if not getter.done():
+                getter.cancel()
+        return getter.result() if getter.done() and not getter.cancelled() else None

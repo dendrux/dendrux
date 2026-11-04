@@ -57,6 +57,7 @@ from dendrux._meta_keys import (
 from dendrux._sentinel import _OmittedType
 from dendrux.db._live_updates import LiveUpdates
 from dendrux.db._notify import EventNotifier, NotifierState, Subscription
+from dendrux.db._postgres_updates import PostgresUpdates
 from dendrux.db._sqlite_sync import create_sqlite_schema
 from dendrux.errors import BlobNotFoundError, NotifierUnavailableError, RunNotFoundError
 from dendrux.media._ids import image_id
@@ -1566,6 +1567,7 @@ def _build_pause_pair(paused: Any, resumed: Any | None) -> PausePair:
 
 __all__ = [
     "LiveUpdates",
+    "PostgresUpdates",
     "StateStore",
     "StoreCapabilities",
     "SQLStateStore",

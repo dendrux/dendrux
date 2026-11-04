@@ -283,3 +283,10 @@ def test_tls_unknown_is_logged_once_for_remote_hosts(
     codes = [r for r in caplog.records if getattr(r, "code", None) == "live_updates_tls_unknown"]
     assert len(codes) == (1 if warns else 0)
     assert all("db.internal" not in r.getMessage() for r in caplog.records)
+
+
+def test_postgres_updates_is_exported_from_dendrux_store() -> None:
+    import dendrux.store
+
+    assert dendrux.store.PostgresUpdates is PostgresUpdates
+    assert "PostgresUpdates" in dendrux.store.__all__
