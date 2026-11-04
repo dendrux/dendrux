@@ -414,9 +414,9 @@ async def test_abort_listener_drops_the_real_listen_socket_and_the_base_reconnec
     reader.abort_listener()  # synchronous
     async with asyncio.timeout(5):
         await proxy.links[0].client_closed.wait()
-    # redis-py itself reconnects once while handling the error before it raises it, so there can
-    # be more than two connections; what matters is that the failure surfaced as two gaps
-    await eventually(lambda: len(proxy.links) >= 2 and reader.healthy and consumer.gaps == 3)
+    # one connection aborted, one new one made by the base: redis-py did not reconnect by itself
+    await eventually(lambda: reader.healthy and consumer.gaps == 3)
+    assert len(proxy.links) == 2
     await reader.release_listener(lease)
     await reader.close()
 

@@ -187,6 +187,9 @@ class _Subscription:
         self._idle_until = monotonic() + owner.health_check_s
         self._token: str | None = None
         self._pong_by = 0.0
+        #: Probe budget: writing the PING and waiting for its pong. Clamped to the health-check
+        #: interval so detection (idle wait + probe) never exceeds twice that interval.
+        self.probe_s = min(owner.send_timeout_s * 4, owner.health_check_s)
         owner._subscription = self
 
     def abort(self) -> None:
@@ -213,13 +216,20 @@ class _Subscription:
         )
 
     async def step(self) -> str | _Gap | None:
-        """Read at most one reply; the next message or gap to yield, or ``None`` to go on."""
-        deadline = self._idle_until if self._token is None else self._pong_by
+        """Read at most one reply; the next message or gap to yield, or ``None`` to go on.
+
+        Every wait is enclosed in an absolute deadline, so nothing redis-py does around a read
+        (a reconnect, a handshake) can outlast it.
+        """
+        probing = self._token is not None
+        deadline = self._pong_by if probing else self._idle_until
         wait = deadline - monotonic()
         if wait <= 0:
             await self._on_silence()
             return None
-        reply = await self.pubsub.get_message(ignore_subscribe_messages=False, timeout=wait)
+        grace = 0.0 if probing else min(self.owner.send_timeout_s, self.owner.health_check_s)
+        async with asyncio.timeout(wait + grace):
+            reply = await self.pubsub.get_message(ignore_subscribe_messages=False, timeout=wait)
         return self._interpret(reply) if isinstance(reply, dict) else None
 
     def _interpret(self, reply: dict[str, Any]) -> str | _Gap | None:
@@ -239,8 +249,9 @@ class _Subscription:
         if self._token is not None:
             raise TimeoutError
         self._token = secrets.token_hex(8)
-        self._pong_by = monotonic() + self.owner.send_timeout_s * 4
-        await self.pubsub.ping(self._token)
+        self._pong_by = monotonic() + self.probe_s
+        async with asyncio.timeout(self.probe_s):
+            await self.pubsub.ping(self._token)
 
     async def close(self) -> None:
         self.abort()  # first, synchronously: nothing below may leave the socket open
@@ -289,7 +300,7 @@ class RedisUpdates(LiveUpdates):
             "max_connections": 1,
             "socket_timeout": socket_timeout_s,
             "socket_connect_timeout": self.send_timeout_s,
-            "retry": api.Retry(api.NoBackoff(), 0),
+            "retry": api.Retry(api.NoBackoff(), 0, supported_errors=()),
         }
         if listening:
             # RESP2 with a parser that refuses an oversized message before reading it

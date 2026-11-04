@@ -7,6 +7,7 @@ and protocol parser are the things under test. The rest use the scripted stand-i
 from __future__ import annotations
 
 import asyncio
+from time import monotonic
 from typing import Any
 
 import pytest
@@ -220,3 +221,60 @@ def test_real_a_redis_client_without_a_boundable_parser_is_refused(
     monkeypatch.setitem(__import__("sys").modules, "redis._parsers", None)
     with pytest.raises(ImportError, match=r"dendrux\[redis\]"):
         ru._load_api()
+
+
+# -- R4: one detection budget, no reconnect inside redis-py ------------------------------------
+
+
+async def test_neither_pool_lets_redis_py_retry_or_reconnect_by_itself(world: FakeWorld) -> None:
+    updates = make()
+    await updates.send(['["a"]'])
+    iterator = updates.receive()
+    await anext(iterator)
+    sender_pool, listener_pool = world.pools
+    for pool in (sender_pool, listener_pool):
+        retry = pool.kwargs["retry"]
+        assert retry.retries == 0
+        assert retry.supported_errors == ()  # nothing is retried, so nothing is reconnected
+    await iterator.aclose()
+
+
+async def test_the_pong_wait_is_clamped_to_the_health_check_interval(world: FakeWorld) -> None:
+    world.pong_mode = "silent"
+    updates = make(health_check_s=0.03, send_timeout_s=0.5, flush_deadline_s=1.0)
+    iterator = updates.receive()
+    await anext(iterator)
+    waiting = asyncio.ensure_future(anext(iterator))
+    await eventually(lambda: bool(world.pubsubs[0].pings))
+    subscription = updates._subscription
+    assert subscription is not None
+    # 4 x send_timeout_s would be 2 s; detection is idle (30 ms) + at most 30 ms of probing
+    assert subscription._pong_by - monotonic() <= updates.health_check_s
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(waiting, 5)
+    assert world.pubsubs[0].closed
+
+
+async def test_a_read_that_ignores_its_timeout_is_cut_off_by_the_enclosing_deadline(
+    world: FakeWorld,
+) -> None:
+    updates = make(health_check_s=0.03)
+    iterator = updates.receive()
+    await anext(iterator)
+    world.hang_reads = True  # e.g. redis-py busy reconnecting inside its error handler
+    with pytest.raises(TimeoutError) as caught:
+        await asyncio.wait_for(anext(iterator), 5)
+    assert "Redis live updates" in str(caught.value)  # ours, not the test's tripwire
+    assert world.pubsubs[0].closed and world.pools[0].closed
+
+
+async def test_a_ping_that_cannot_be_written_is_cut_off_by_the_probe_budget(
+    world: FakeWorld,
+) -> None:
+    world.hang_ping = True
+    updates = make(health_check_s=0.03)
+    iterator = updates.receive()
+    await anext(iterator)
+    with pytest.raises(TimeoutError) as caught:
+        await asyncio.wait_for(anext(iterator), 5)
+    assert "Redis live updates" in str(caught.value)

@@ -150,6 +150,8 @@ class FakePubSub:
     async def ping(self, message: str | None = None) -> None:
         assert message is not None
         self.pings.append(message)
+        if self.world.hang_ping:
+            await asyncio.Event().wait()
         mode = self.world.pong_mode
         if mode == "silent":
             return
@@ -161,6 +163,8 @@ class FakePubSub:
     async def get_message(
         self, ignore_subscribe_messages: bool = False, timeout: float | None = 0.0
     ) -> Any:
+        if self.world.hang_reads:  # like a reconnect inside redis-py that ignores our timeout
+            await asyncio.Event().wait()
         try:
             if timeout is None:
                 item = await self.queue.get()
@@ -207,9 +211,12 @@ class FakeRedis:
 
 
 class FakeRetry:
-    def __init__(self, backoff: object, retries: int) -> None:
+    def __init__(
+        self, backoff: object, retries: int, supported_errors: tuple[type, ...] | None = None
+    ) -> None:
         self.backoff = backoff
         self.retries = retries
+        self.supported_errors = supported_errors
 
 
 class FakeNoBackoff:
@@ -229,6 +236,8 @@ class FakeWorld:
         self.ack_mode = "ok"  # ok | never | wrong_channel
         self.ack_delay = 0.0
         self.pong_mode = "echo"  # echo | silent | wrong
+        self.hang_reads = False  # get_message never returns, whatever timeout it is given
+        self.hang_ping = False  # ping never completes
         self.execute_hook: Any = None  # async callable(pipeline): may stall or raise
         self.reject_keys: tuple[str, ...] = ("bogus_option",)  # pool options the client refuses
 
