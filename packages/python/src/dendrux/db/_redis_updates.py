@@ -141,18 +141,38 @@ class _Redacted:
         raise TypeError("a RedisUpdates connection setting cannot be pickled")
 
 
-def _checked_url(url: object) -> str:
-    if not isinstance(url, str) or not url.startswith(_SCHEMES):
-        raise ValueError("url must be a string starting with redis://, rediss:// or unix://")
+def _query_of(url: str) -> list[tuple[str, str]] | None:
+    """The URL's decoded query pairs, or ``None`` if the URL cannot be parsed.
+
+    The parser's own error text repeats the URL (credentials included), so it is dropped here.
+    """
+    try:
+        return parse_qsl(urlsplit(url).query, keep_blank_values=True)
+    except Exception:
+        return None
+
+
+def _checked_query(query: list[tuple[str, str]]) -> None:
     # redis-py lets a query parameter override a keyword argument, so the fixed settings must be
     # refused here too; parse_qsl decodes keys exactly as redis-py's URL parser does
-    query = parse_qsl(urlsplit(url).query)
     refused = sorted({key for key, _ in query if key in _FORBIDDEN_OPTIONS})
     if refused:
         raise ValueError(
             "url may not set " + ", ".join(refused) + " in its query: RedisUpdates fixes the "
             "timeouts, retries, protocol and single connection"
         )
+    # every spelling counts: redis-py takes one of several duplicates and lets it win
+    if not all(_is_utf8(value) for key, value in query if key == "encoding"):
+        raise ValueError("url encoding must be utf-8, the encoding of the wire format")
+
+
+def _checked_url(url: object) -> str:
+    if not isinstance(url, str) or not url.startswith(_SCHEMES):
+        raise ValueError("url must be a string starting with redis://, rediss:// or unix://")
+    query = _query_of(url)  # outside any handler: nothing of the original error is retained
+    if query is None:
+        raise ValueError("url is not a valid Redis URL")
+    _checked_query(query)
     return url
 
 

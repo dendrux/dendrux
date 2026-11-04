@@ -312,3 +312,49 @@ def test_real_internal_clients_do_not_show_host_or_port_after_lazy_init() -> Non
     for text in (repr(vars(updates)), repr(updates.__dict__), repr(updates)):
         for sentinel in ("sentinel", HOST, "6380"):
             assert sentinel not in text
+
+
+# -- V2: a malformed URL never reaches an error, a cause or a context ---------------------------
+
+MALFORMED = [
+    "redis://user:s3cret-sentinel@／sentinel-host:6380/0",  # fullwidth solidus in the host
+    "redis://user:s3cret-sentinel@sentinel-host℀:6380/0",  # NFKC turns it into 'a/c'
+    "redis://user:s3cret-sentinel@[sentinel-host:6380/0",  # unbalanced IPv6 bracket
+    "rediss://:s3cret-sentinel@[::1/0?db=1",
+]
+
+
+@pytest.mark.parametrize("url", MALFORMED)
+def test_real_a_malformed_url_is_refused_with_fixed_text(url: str) -> None:
+    with pytest.raises(ValueError) as caught:
+        ru.RedisUpdates(url, **FAST)
+    error = caught.value
+    for text in (str(error), repr(error)):
+        assert "sentinel" not in text and "6380" not in text
+    assert error.__cause__ is None and error.__context__ is None
+
+
+# -- V3: the effective encoding is UTF-8 whichever way it is given -----------------------------
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "encoding=latin-1",
+        "encoding=utf-16",
+        "enc%6Fding=latin-1",  # percent-encoded key
+        "encoding=lat%69n-1",  # percent-encoded value
+        "encoding=utf-8&encoding=latin-1",  # a duplicate that redis-py may pick instead
+        "encoding=latin-1&encoding=utf-8",
+        "encoding=",
+    ],
+)
+def test_real_a_url_encoding_that_is_not_utf8_is_refused(query: str) -> None:
+    with pytest.raises(ValueError) as caught:
+        ru.RedisUpdates(f"redis://:s3cret-sentinel@{HOST}/0?{query}", **FAST)
+    assert "sentinel" not in str(caught.value) and "latin" not in str(caught.value)
+
+
+@pytest.mark.parametrize("query", ["encoding=utf-8", "encoding=UTF8", "enc%6Fding=u%74f-8"])
+def test_real_a_utf8_url_encoding_is_accepted(query: str) -> None:
+    assert ru.RedisUpdates(f"redis://{HOST}/0?{query}", **FAST)
