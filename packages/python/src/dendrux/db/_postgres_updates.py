@@ -12,9 +12,9 @@ import asyncio
 import ipaddress
 import logging
 import re
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from typing import TYPE_CHECKING, Any, cast
-from urllib.parse import quote, urlencode
+from urllib.parse import parse_qsl, quote, urlencode
 
 from dendrux import _codes
 from dendrux.db._live_updates import LiveUpdates
@@ -59,6 +59,9 @@ _FALLBACK_DSN_KEYS = frozenset(
         "krbsrvname",
         "gsslib",
     }
+)
+_KNOWN_REJECTED_KEYS = frozenset(
+    {"ssl", "prepared_statement_cache_size", "pool_size", "statement_cache_size"}
 )
 _STARTUP_SETTINGS = frozenset({"application_name", "options"})
 _FORCED_OPTIONS = ("statement_cache_size", "timeout")
@@ -144,19 +147,28 @@ def _query_hosts(parsed: URL) -> list[tuple[str, str]]:
     return pairs
 
 
-def _options(parsed: URL, allowed: frozenset[str]) -> list[tuple[str, str]]:
-    """Non-destination query keys, each one asyncpg reads; any other key is refused by name."""
-    pairs: list[tuple[str, str]] = []
-    for key, value in parsed.query.items():
+def _check_query_keys(keys: Iterable[str]) -> None:
+    allowed = _dsn_keys() | _STARTUP_SETTINGS
+    for key in keys:
         if key not in allowed:
-            raise ValueError(
-                f"PostgresUpdates cannot use the URL option {key!r}; "
-                "pass PostgresUpdates(url=...) with an asyncpg URL "
-                "(use sslmode=require in url= for TLS)."
+            label = (
+                f"the URL option {key!r}"
+                if key in _KNOWN_REJECTED_KEYS
+                else "an unsupported option"
             )
-        if key not in _DESTINATION_KEYS:
-            pairs.append((key, _single(key, value)))
-    return pairs
+            raise ValueError(
+                f"PostgresUpdates cannot use {label}; pass PostgresUpdates(url=...) "
+                "with an asyncpg URL (use sslmode=require in url= for TLS)."
+            )
+
+
+def _options(parsed: URL) -> list[tuple[str, str]]:
+    _check_query_keys(parsed.query)
+    return [
+        (key, _single(key, value))
+        for key, value in parsed.query.items()
+        if key not in _DESTINATION_KEYS
+    ]
 
 
 def _authority(user: str | None, password: str | None, host: str, port: str | None) -> str:
@@ -173,6 +185,15 @@ def _authority(user: str | None, password: str | None, host: str, port: str | No
     return userinfo + host + (f":{port}" if port is not None else "")
 
 
+def _checked_parse(url: str | URL) -> URL:
+    parsed = _parse(url)
+    if isinstance(url, str):
+        _check_query_keys(
+            [key for key, _ in parse_qsl(url.partition("?")[2], keep_blank_values=True)]
+        )
+    return parsed
+
+
 def asyncpg_dsn(url: str | URL) -> str:
     """Convert a SQLAlchemy PostgreSQL URL to an asyncpg DSN with the same destination.
 
@@ -183,14 +204,14 @@ def asyncpg_dsn(url: str | URL) -> str:
     DSN parser accepts is kept; any other key raises ``ValueError`` naming only
     the key, so nothing is silently dropped.
     """
-    parsed = _parse(url)
+    parsed = _checked_parse(url)
     query = parsed.query
     hosts = _query_hosts(parsed)
     user = _one(parsed.username, query, "user")
     password = _one(parsed.password, query, "password")
     database = _one(parsed.database, query, "database", "dbname")
     port = None if hosts else _authority_port(parsed)
-    pairs = _options(parsed, _dsn_keys() | _STARTUP_SETTINGS)
+    pairs = _options(parsed)
     if password is not None and user is None:
         pairs.append(("password", password))
     authority = _authority(user, password if user is not None else None, parsed.host or "", port)
@@ -335,6 +356,27 @@ def _engine_dsn(engine: Any) -> str:
     return asyncpg_dsn(parsed)
 
 
+class _ConnectionSettings:
+    __slots__ = ("connect_args", "send_dsn", "listen_dsn", "explicit_listen")
+
+    def __init__(
+        self,
+        url: str | URL | None,
+        listen_url: str | URL | None,
+        connect_args: Mapping[str, Any] | None,
+    ) -> None:
+        self.connect_args = _check_connect_args(connect_args)
+        self.send_dsn = asyncpg_dsn(url) if url is not None else None
+        self.explicit_listen = asyncpg_dsn(listen_url) if listen_url is not None else None
+        self.listen_dsn = self.explicit_listen or self.send_dsn
+
+    def __repr__(self) -> str:
+        return "<redacted>"
+
+    def __reduce__(self) -> Any:
+        raise TypeError("PostgresUpdates connection settings cannot be pickled")
+
+
 class PostgresUpdates(LiveUpdates):
     """Live updates over PostgreSQL ``LISTEN``/``NOTIFY``.
 
@@ -359,17 +401,21 @@ class PostgresUpdates(LiveUpdates):
         if self.max_message_bytes > MAX_NOTIFY_BYTES:
             raise ValueError(f"max_message_bytes must be at most {MAX_NOTIFY_BYTES} on Postgres.")
         self.channel = validate_channel(channel)
-        self._connect_args = _check_connect_args(connect_args)
+        self._settings = _ConnectionSettings(url, listen_url, connect_args)
         self._explicit_connect_args = connect_args is not None
-        self._send_dsn: str | None = asyncpg_dsn(url) if url is not None else None
-        explicit_listen = asyncpg_dsn(listen_url) if listen_url is not None else None
-        self._explicit_listen = explicit_listen
-        self._listen_dsn: str | None = explicit_listen or self._send_dsn
         self._tls_checked = False
         self._sender: Any = None
         # Silence (health_check_s) plus this probe stays within 2 x health_check_s.
         self._probe_timeout_s = min(self.send_timeout_s * 4, self.health_check_s)
         self._listener: Any = None
+
+    @property
+    def _send_dsn(self) -> str | None:
+        return self._settings.send_dsn
+
+    @property
+    def _listen_dsn(self) -> str | None:
+        return self._settings.listen_dsn
 
     def bind(self, store: object) -> None:
         """Default ``url`` to the store's engine URL; refuse a store without one."""
@@ -379,15 +425,15 @@ class PostgresUpdates(LiveUpdates):
         dsn = _engine_dsn(engine)
         if not self._explicit_connect_args:
             _check_engine_settings(engine)
-        self._send_dsn = dsn
-        self._listen_dsn = self._explicit_listen or self._send_dsn
+        self._settings.send_dsn = dsn
+        self._settings.listen_dsn = self._settings.explicit_listen or self._send_dsn
 
     def _check_tls(self) -> None:
         """Warn once when a remote destination has no explicit TLS setting."""
         if self._tls_checked:
             return
         self._tls_checked = True
-        if "ssl" in self._connect_args:
+        if "ssl" in self._settings.connect_args:
             return
         for dsn in {self._send_dsn, self._listen_dsn} - {None}:
             assert dsn is not None
@@ -404,7 +450,9 @@ class PostgresUpdates(LiveUpdates):
             raise ValueError("PostgresUpdates is not bound to a store and has no url=.")
         self._check_tls()
         url_settings = frozenset(k for k in _STARTUP_SETTINGS if f"{k}=" in dsn.partition("?")[2])
-        options = connect_options(self._connect_args, timeout=timeout, url_settings=url_settings)
+        options = connect_options(
+            self._settings.connect_args, timeout=timeout, url_settings=url_settings
+        )
         return await asyncpg.connect(dsn, **options)
 
     async def send(self, messages: Sequence[str]) -> None:
