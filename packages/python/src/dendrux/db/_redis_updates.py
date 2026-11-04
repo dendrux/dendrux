@@ -315,14 +315,18 @@ class RedisUpdates(LiveUpdates):
         _abort_transports(pool, [getattr(pipeline, "connection", None)])
 
     async def aclose_sender(self) -> None:
+        # The handles stay until cleanup is over: if cleanup stalls, is cancelled or times out,
+        # the ``finally`` still finds the pool and drops its sockets synchronously.
         client, pool = self._client, self._pool
-        self._pipeline = self._pool = self._client = None
-        if client is not None:
-            with suppress(Exception):
-                await client.aclose()
-        if pool is not None:
-            with suppress(Exception):
-                await pool.aclose()
+        try:
+            if client is not None:
+                with suppress(Exception):
+                    await client.aclose()
+            if pool is not None:
+                with suppress(Exception):
+                    await pool.aclose()
+        finally:
+            self.abort_sender()
 
     # -- receive ---------------------------------------------------------------------------
 

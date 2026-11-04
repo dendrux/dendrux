@@ -6,6 +6,7 @@ and protocol parser are the things under test. The rest use the scripted stand-i
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
@@ -70,3 +71,86 @@ def test_real_harmless_url_query_options_still_work_and_the_fixed_ones_win() -> 
     assert pool.max_connections == 1
     assert (connection.socket_timeout, connection.socket_connect_timeout) == (0.2, 0.05)
     assert connection.health_check_interval == 0
+
+
+# -- R2: closing the sender never loses the handle that can abort its socket -------------------
+
+
+async def eventually(predicate: Any) -> None:
+    async with asyncio.timeout(5):
+        while not predicate():
+            await asyncio.sleep(0.005)
+
+
+def stall_cleanup(world: FakeWorld) -> tuple[asyncio.Event, asyncio.Event]:
+    """Make the sender's client and pool cleanup hang; returns (entered, never_released)."""
+    entered, gate = asyncio.Event(), asyncio.Event()
+
+    async def hang(*args: Any, **kwargs: Any) -> None:
+        entered.set()
+        await gate.wait()
+
+    world.pools[0].aclose = hang  # type: ignore[method-assign]
+    world.clients[0].aclose = hang  # type: ignore[method-assign]
+    return entered, gate
+
+
+async def test_a_stalled_close_deadline_still_aborts_the_sender_socket(world: FakeWorld) -> None:
+    updates = make(close_timeout_s=0.2)
+    await updates.send(['["a"]'])
+    stall_cleanup(world)
+    async with asyncio.timeout(5):
+        await updates.close()  # the total close deadline passes while cleanup hangs
+    assert world.connections[0].aborted
+
+
+async def test_a_cancelled_close_aborts_the_sender_socket_and_a_retry_finishes(
+    world: FakeWorld,
+) -> None:
+    updates = make(close_timeout_s=30.0)
+    await updates.send(['["a"]'])
+    entered, _ = stall_cleanup(world)
+    task = asyncio.ensure_future(updates.close())
+    await asyncio.wait_for(entered.wait(), 5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert world.connections[0].aborted  # before any retry
+    async with asyncio.timeout(5):
+        await updates.close()  # a later close finishes the job
+    assert updates._state == "closed"
+
+
+async def test_a_cancelled_aclose_sender_aborts_the_socket_itself(world: FakeWorld) -> None:
+    updates = make()
+    await updates.send(['["a"]'])
+    entered, _ = stall_cleanup(world)
+    task = asyncio.ensure_future(updates.aclose_sender())
+    await asyncio.wait_for(entered.wait(), 5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert world.connections[0].aborted
+
+
+async def test_real_pool_cleanup_that_never_returns_cannot_strand_a_socket() -> None:
+    from types import SimpleNamespace
+
+    updates = ru.RedisUpdates(
+        f"redis://{HOST}/0", send_timeout_s=0.01, flush_deadline_s=0.05, close_timeout_s=0.2
+    )
+    pool = updates._sender().connection_pool  # redis-py's own pool, no connection made
+    aborted: list[bool] = []
+    transport = SimpleNamespace(abort=lambda: aborted.append(True))
+    pool._available_connections.append(
+        SimpleNamespace(_writer=SimpleNamespace(transport=transport))
+    )
+
+    async def never() -> None:
+        await asyncio.Event().wait()
+
+    pool.aclose = never  # redis-py 8 awaits maintenance work here before it disconnects
+    async with asyncio.timeout(5):
+        await updates.close()
+    assert aborted == [True]
+    pool._available_connections.clear()
