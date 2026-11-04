@@ -19,8 +19,10 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from functools import wraps
+from time import monotonic
 from typing import TYPE_CHECKING, Any, TypeVar
 
 from sqlalchemy.exc import DBAPIError, OperationalError, SQLAlchemyError, TimeoutError
@@ -38,7 +40,7 @@ from dendrux.runtime.stores._errors import _is_connection_loss_code, classify_er
 _EXCEPTION_WALK_LIMIT = 1024
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Coroutine
+    from collections.abc import AsyncIterator, Callable, Coroutine
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +52,98 @@ T = TypeVar("T")
 _database_operation: ContextVar[tuple[object, str, dict[str, Any]] | None] = ContextVar(
     "dendrux_database_operation", default=None
 )
+
+
+_live_update_scope: ContextVar[tuple[object, frozenset[int]] | None] = ContextVar(
+    "dendrux_live_update_scope", default=None
+)
+_sweep_deadlines: ContextVar[tuple[object, dict[int, float]] | None] = ContextVar(
+    "dendrux_sweep_deadlines", default=None
+)
+_SWEEP_BOUNDARIES = frozenset(
+    {
+        "_scan_expired_runs",
+        "_sweep_runs",
+        "mark_lease_expired",
+        "sweep_stale_runs",
+        "sweep_abandoned_runs",
+    }
+)
+
+
+def _task_values(scope: Any, default: Any) -> Any:
+    if scope is None or scope[0] is not asyncio.current_task():
+        return default
+    return scope[1]
+
+
+async def _flush_live_updates(store: Any) -> None:
+    updates = getattr(store, "live_updates", None)
+    if updates is None:
+        return
+    deadlines = _task_values(_sweep_deadlines.get(), {})
+    if id(store) in deadlines:
+        await updates._flush_before(deadlines[id(store)])
+    else:
+        await updates.flush()
+
+
+@asynccontextmanager
+async def _store_update_scope(store: Any) -> AsyncIterator[bool]:
+    stores = _task_values(_live_update_scope.get(), frozenset())
+    if id(store) in stores:
+        yield False
+        return
+    token = _live_update_scope.set((asyncio.current_task(), stores | {id(store)}))
+    try:
+        yield True
+    finally:
+        _live_update_scope.reset(token)
+
+
+@asynccontextmanager
+async def _live_updates_boundary(store: Any, *, sweep: bool = False) -> AsyncIterator[None]:
+    budget_token = _sweep_budget(store, sweep)
+    try:
+        async with _store_update_scope(store) as outermost:
+            yield
+            if outermost:
+                await _flush_live_updates(store)
+    finally:
+        if budget_token is not None:
+            _sweep_deadlines.reset(budget_token)
+
+
+def _sweep_budget(store: Any, sweep: bool) -> Any:
+    updates = getattr(store, "live_updates", None)
+    if not sweep or updates is None:
+        return None
+    deadlines = _task_values(_sweep_deadlines.get(), {})
+    if id(store) in deadlines:
+        return None
+    return _sweep_deadlines.set(
+        (
+            asyncio.current_task(),
+            {
+                **deadlines,
+                id(store): monotonic() + updates.flush_deadline_s,
+            },
+        )
+    )
+
+
+def _with_live_updates(method: Any) -> Any:
+    # Hooks borrowing a session or connection stay inside their caller's boundary.
+    if {"session", "conn"}.intersection(inspect.signature(method).parameters):
+        return method
+
+    @wraps(method)
+    async def call(*args: Any, **kwargs: Any) -> Any:
+        store = args[0] if args else None
+        async with _live_updates_boundary(store, sweep=method.__name__ in _SWEEP_BOUNDARIES):
+            return await method(*args, **kwargs)
+
+    return call
 
 
 class _CommitNotAppliedError(PersistenceError):
@@ -220,7 +314,7 @@ def _safe_database_call(method: Any) -> Any:
         failure.__cause__ = None
         raise failure from None
 
-    return call
+    return _with_live_updates(call)
 
 
 def _is_driver_failure(error: BaseException) -> bool:

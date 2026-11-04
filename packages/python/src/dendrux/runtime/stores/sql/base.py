@@ -23,6 +23,7 @@ from dendrux._lifecycle import (
     StoredEventType,
 )
 from dendrux._meta_keys import (
+    ANNOUNCE_MARKS_SESSION_KEY,
     COMMIT_PROOFS_SESSION_KEY,
     ERROR_INFO_META_KEY,
     EVENT_HOOK_SESSION_KEY,
@@ -71,7 +72,7 @@ from dendrux.types import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Callable, Sequence
+    from collections.abc import AsyncIterator, Callable, Mapping, Sequence
     from datetime import datetime, timedelta
 
     from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
@@ -590,190 +591,48 @@ class SQLStateStore(SQLBlobCatalog):
         if expected:
             self._remember_write(session, AgentRun.__table__, AgentRun.id == run_id, expected)
 
-    async def _write_tx(self, session: AsyncSession, *, run_ids: Sequence[str] = ()) -> None:
-        """Commit once; prove identity after a lost acknowledgement or fail closed."""
-        from sqlalchemy import select
-        from sqlalchemy.exc import SQLAlchemyError
-
-        from dendrux.errors import PersistenceError
-        from dendrux.runtime.durability import (
-            StoreOutcomeUnknown,
-            _CommitNotAppliedError,
-            _database_operation,
-            is_transient_db_error,
-        )
+    def _commit_operation(self, session: AsyncSession, run_ids: Sequence[str]) -> Any:
+        from dendrux.runtime.durability import _database_operation
 
         operation = _database_operation.get()
-        owner, name, arguments = operation if operation is not None else (None, "", {})
-        run_id = arguments.get("run_id")
+        _, _, arguments = operation or (None, "", {})
         touched = session.info.setdefault(TOUCHED_RUNS_SESSION_KEY, set())
         touched.update(run_ids)
         touched.update(arguments.get("run_ids", ()))
+        run_id = arguments.get("run_id")
         if run_id is not None:
             touched.add(run_id)
+        return operation
 
-        def unknown() -> NoReturn:
-            _codes.log_code(logger, _codes.STORE_OUTCOME_UNKNOWN, run_id=run_id)
-            raise StoreOutcomeUnknown() from None
+    def _mark_announce(self, session: AsyncSession, run_ids: Sequence[str]) -> None:
+        session.info.setdefault(ANNOUNCE_MARKS_SESSION_KEY, set()).update(run_ids)
 
-        # ORM flush is pre-COMMIT: any failure here is safe to roll back and
-        # retry through the operation's whole-transaction boundary.
+    def _enqueue_committed(self, session: AsyncSession, commit_issued: bool) -> None:
+        marks = session.info.pop(ANNOUNCE_MARKS_SESSION_KEY, ())
+        if commit_issued and marks and self._live_updates is not None:
+            self._live_updates.enqueue(marks)
+
+    async def _write_tx(self, session: AsyncSession, *, run_ids: Sequence[str] = ()) -> None:
+        """Commit once; prove identity after a lost acknowledgement or fail closed."""
+        from dendrux.runtime.stores.sql._commit import _CommitReadback
+
+        operation = self._commit_operation(session, run_ids)
+        # ORM flush remains pre-COMMIT and cannot publish hints on failure.
         await session.flush()
+        commit_issued = False
         try:
-            await session.commit()
+            try:
+                commit_issued = True
+                await session.commit()
+            except SQLAlchemyError as error:
+                await _CommitReadback(self, session, operation).resolve(error)
             session.info.pop(COMMIT_PROOFS_SESSION_KEY, None)
             session.info.pop(FRESH_EVIDENCE_SESSION_KEY, None)
-            return
-        except SQLAlchemyError as exc:
-            classified = self.classify_db_error(exc)
-            try:
-                await session.rollback()
-            except SQLAlchemyError:
-                _codes.log_code(logger, _codes.PERSISTENCE_ERROR, run_id=run_id)
-                if classified.kind == "connection_lost":
-                    unknown()
-                raise PersistenceError() from None
-            if classified.kind in ("deadlock_or_serialization", "lock_timeout") or not (
-                is_transient_db_error(exc, classify=self.classify_db_error)
-            ):
-                raise
-
-        # Claim identity cannot be reconstructed from a later epoch. This also
-        # covers submission claims and every other CAS without a retry identity.
-        if name in ("claim_paused_run", "submit_and_claim", "reclaim_run", "release_run_claim"):
-            unknown()
-        proofs = session.info.pop(COMMIT_PROOFS_SESSION_KEY, [])
-        fresh_evidence = session.info.pop(FRESH_EVIDENCE_SESSION_KEY, False)
-        transitions = {
-            "finalize_run",
-            "finalize_run_if_status_in",
-            "finalize_with_event",
-            "try_pause_run",
-            "pause_with_event",
-            "pause_run",
-            "consume_submission",
-        }
-        claim_epoch = arguments.get("claim_epoch")
-        prove_fence = name in transitions and claim_epoch is not None and not fresh_evidence
-        if name in (
-            "save_trace",
-            "save_tool_call",
-            "save_usage",
-            "save_llm_interaction",
-            "save_run_event",
-            "start_tool_call",
-            "complete_tool_call",
-            "consume_submission",
-        ):
-            evidence = [proof for proof in proofs if proof[0].name != "agent_runs"]
-            if evidence and not prove_fence:
-                # An immutable retry identity proves publication even after a
-                # sibling writer advances the run's mutable execution state.
-                proofs = evidence
-        if not proofs:
-            unknown()
-
-        async def lost(*, absent: bool = False) -> NoReturn:
-            from dendrux.db.models import AgentRun
-
-            retry_id = {
-                "save_trace": "trace_id",
-                "save_tool_call": "row_id",
-                "save_usage": "usage_id",
-                "save_llm_interaction": "interaction_id",
-                "save_run_event": "event_id",
-                "start_tool_call": "row_id",
-            }.get(name)
-            if absent and (
-                name == "create_run"
-                or (retry_id is not None and arguments.get(retry_id) is not None)
-            ):
-                raise _CommitNotAppliedError() from None
-            if name not in transitions or run_id is None:
-                unknown()
-            predicate = AgentRun.id == run_id
-            epoch = arguments.get("claim_epoch")
-            if epoch is not None:
-                predicate &= AgentRun.claim_epoch == epoch
-            statuses = arguments.get("allowed_current_statuses")
-            if statuses is not None:
-                predicate &= AgentRun.status.in_(statuses)
-            elif name == "finalize_run" and arguments.get("expected_current_status") is not None:
-                predicate &= AgentRun.status == arguments["expected_current_status"]
-            elif name in ("try_pause_run", "pause_with_event"):
-                predicate &= (
-                    AgentRun.status == RunStatus.RUNNING.value
-                ) & AgentRun.cancel_requested.is_(False)
-            elif name in ("pause_run", "consume_submission") and epoch is not None:
-                predicate &= AgentRun.status == RunStatus.RUNNING.value
-            if name == "consume_submission":
-                predicate &= (
-                    self.json_get(AgentRun.loop_state, ("submission", "submission_id"), "str")
-                    == arguments["submission_id"]
-                )
-            if await session.scalar(select(AgentRun.id).where(predicate)) is not None:
-                # Raise rather than return a CAS miss: callers such as the
-                # recorder discard return values, and the runner cancels on a miss.
-                raise _CommitNotAppliedError() from None
-            unknown()
-
-        try:
-            from decimal import ROUND_HALF_UP, Decimal
-
-            from dendrux.db.models import AgentRun
-
-            await self._prepare_commit_readback(session)
-            # Wait for an in-flight transaction before reading its evidence or
-            # precondition. Plain MVCC reads could observe the old row and cause
-            # a retry whose CAS loses against our original successful write.
-            for touched_run in sorted(touched):
-                if not self.supports_row_locks:
-                    await self.reserve_parent_writer(session, touched_run)
-                await session.execute(
-                    self.lock_clause(select(AgentRun.id).where(AgentRun.id == touched_run), "share")
-                )
-            fenced_run_proven = False
-            for table, predicate, expected in proofs:
-                check_epoch = prove_fence and table.name == "agent_runs"
-                if check_epoch:
-                    # A fenced transition's owner identity must match in the
-                    # same readback as its postcondition, including epoch zero.
-                    expected = {**expected, "claim_epoch": claim_epoch}
-                stored = (
-                    (
-                        await session.execute(
-                            self.lock_clause(
-                                select(*[table.c[key] for key in expected]).where(predicate),
-                                "share",
-                            )
-                        )
-                    )
-                    .mappings()
-                    .one_or_none()
-                )
-                if stored is None:
-                    await lost(absent=True)
-                for key, value in expected.items():
-                    actual = stored[key]
-                    if isinstance(actual, Decimal) and value is not None:
-                        value = Decimal(str(value)).quantize(
-                            Decimal("0.000001"), rounding=ROUND_HALF_UP
-                        )
-                    if isinstance(actual, _dt.datetime) and isinstance(value, _dt.datetime):
-                        actual, value = _to_aware_utc(actual), _to_aware_utc(value)
-                    if isinstance(actual, (dict, list)) or isinstance(value, (dict, list)):
-                        from dendrux.runtime._digest import content_digest
-
-                        actual, value = content_digest(actual), content_digest(value)
-                    if actual != value:
-                        await lost()
-                fenced_run_proven |= check_epoch
-            if name in transitions and not fresh_evidence and not fenced_run_proven:
-                unknown()
         except _CommitNotAppliedError:
+            commit_issued = False
             raise
-        except (SQLAlchemyError, PersistenceError):
-            unknown()
+        finally:
+            self._enqueue_committed(session, commit_issued)
 
     async def update_one(
         self,
@@ -1019,10 +878,8 @@ class SQLStateStore(SQLBlobCatalog):
         """The live update bus owned by this store, if enabled."""
         return self._live_updates
 
-
     def _native_live_updates(self) -> LiveUpdates | None:
         return None
-
 
     def _bind_live_updates(self, updates: LiveUpdates | bool | None) -> LiveUpdates | None:
         from dendrux.db._live_updates import LiveUpdates
@@ -1041,7 +898,6 @@ class SQLStateStore(SQLBlobCatalog):
         register(self)
         return updates
 
-
     async def close(self) -> None:
         """Close store-owned live updates without disposing the engine."""
         from dendrux.runtime.stores.sql._live_registry import deregister
@@ -1049,7 +905,6 @@ class SQLStateStore(SQLBlobCatalog):
         if self._live_updates is not None:
             await self._live_updates.close()
             deregister(self)
-
 
     async def _check_connection(self, session: AsyncSession) -> None:
         if self._dialect_facts is not None:
@@ -1288,6 +1143,7 @@ class SQLStateStore(SQLBlobCatalog):
                             blob_refs_scope=blob_refs_scope,
                             run_tenant_id=tenant_id,
                         )
+                    self._mark_announce(session, (run_id,))
                     await self._write_tx(session)
                 except _CommitNotAppliedError:
                     absent_retry = True
@@ -1951,6 +1807,7 @@ class SQLStateStore(SQLBlobCatalog):
                     session, run_id=run_id, blob_refs=blob_refs, blob_refs_scope=blob_refs_scope
                 )
             await _write_event(session, run_id, event)
+            self._mark_announce(session, (run_id,))
             await self._write_tx(session)
 
     async def complete_tool_call(
@@ -2048,6 +1905,7 @@ class SQLStateStore(SQLBlobCatalog):
                     session, run_id=run_id, blob_refs=blob_refs, blob_refs_scope=blob_refs_scope
                 )
             await _write_event(session, run_id, event)
+            self._mark_announce(session, (run_id,))
             await self._write_tx(session)
 
     async def consume_submission(
@@ -2094,6 +1952,7 @@ class SQLStateStore(SQLBlobCatalog):
                 .where(AgentRun.id == run_id)
                 .values(loop_state=changed, pause_data=pause)
             )
+            self._mark_announce(session, (run_id,))
             await self._write_tx(session)
             return True
 
@@ -2143,6 +2002,7 @@ class SQLStateStore(SQLBlobCatalog):
                         tenant_id,
                     )
                 )
+                self._mark_announce(session, run_ids)
                 await self._write_tx(session)
                 return int(getattr(result, "rowcount", 0))
 
@@ -2467,6 +2327,7 @@ class SQLStateStore(SQLBlobCatalog):
                         .where(AgentRun.id == run_id)
                         .values(meta={**(old_meta or {}), ERROR_INFO_META_KEY: error_info})
                     )
+                self._mark_announce(session, (run_id,))
                 await self._write_tx(session)
                 return (
                     bool(result.rowcount and result.rowcount > 0)
@@ -2515,6 +2376,7 @@ class SQLStateStore(SQLBlobCatalog):
                     failure_reason=failure_reason,
                     claim_epoch=claim_epoch,
                 )
+                self._mark_announce(session, (run_id,))
                 await self._write_tx(session)
                 return won
 
@@ -2576,6 +2438,7 @@ class SQLStateStore(SQLBlobCatalog):
                     if event is not None
                     else await _insert_event_locked(session, run_id, event_type, event_data)
                 )
+                self._mark_announce(session, (run_id,))
                 await self._write_tx(session)
                 return seq
 
@@ -2707,6 +2570,7 @@ class SQLStateStore(SQLBlobCatalog):
                     .values(cancel_requested=True)
                 )
                 result = await session.execute(stmt)
+                self._mark_announce(session, (run_id,))
                 await self._write_tx(session)
                 return bool(result.rowcount and result.rowcount > 0)
 
@@ -2740,6 +2604,7 @@ class SQLStateStore(SQLBlobCatalog):
                 if row is None:
                     return
                 row.meta = {**(row.meta or {}), **patch}
+                self._mark_announce(session, (run_id,))
                 await self._write_tx(session)
 
         await retry_transient_db(
@@ -2826,6 +2691,7 @@ class SQLStateStore(SQLBlobCatalog):
                         .where(AgentRun.id == run_id)
                         .values(meta={**meta, PAUSE_REQUEST_META_KEY: {"reason": reason}})
                     )
+                self._mark_announce(session, (run_id,))
                 await self._write_tx(session)
                 return True
 
@@ -2873,6 +2739,7 @@ class SQLStateStore(SQLBlobCatalog):
                     )
                     .ordered_values(*self._ordered(AgentRun.__table__, dict(**values)))
                 )
+                self._mark_announce(session, (run_id,))
                 await self._write_tx(session)
                 return bool(result.rowcount and result.rowcount > 0)
 
@@ -2937,6 +2804,7 @@ class SQLStateStore(SQLBlobCatalog):
                     event_data,
                     iteration_index=iteration_count or 0,
                 )
+                self._mark_announce(session, (run_id,))
                 await self._write_tx(session)
                 return seq
 
@@ -3185,6 +3053,7 @@ class SQLStateStore(SQLBlobCatalog):
                     )
                 self._remember_run_values(session, run_id, values)
                 await session.execute(stmt)
+                self._mark_announce(session, (run_id,))
                 await self._write_tx(session)
 
         await retry_transient_db(
@@ -3467,6 +3336,7 @@ class SQLStateStore(SQLBlobCatalog):
                         if validate is not None or expected_pause_id is not None
                         else None,
                     )
+                    self._mark_announce(session, (run_id,))
                     await self._write_tx(session)
                     return (
                         False
@@ -3535,6 +3405,7 @@ class SQLStateStore(SQLBlobCatalog):
                     except BaseException:
                         await session.rollback()
                         raise
+                self._mark_announce(session, (run_id,))
                 await self._write_tx(session)
                 return token if result.rowcount else False
 
@@ -3664,6 +3535,7 @@ class SQLStateStore(SQLBlobCatalog):
                     row.loop_state,
                     (row.loop_state or {}).get("submission"),
                 )
+                self._mark_announce(session, (run_id,))
                 await self._write_tx(session)
                 return token
 
@@ -3748,6 +3620,7 @@ class SQLStateStore(SQLBlobCatalog):
                 won = await self._finish_claim_release(
                     session, run_id, claim_epoch, bool(result.rowcount), event
                 )
+                self._mark_announce(session, (run_id,))
                 await self._write_tx(session)
                 return won
 
@@ -3964,8 +3837,12 @@ class SQLStateStore(SQLBlobCatalog):
                 event_id=event_id,
                 content_digest=content_digest,
             )
+            self._mark_announce(session, (run_id,))
             await self._write_tx(session)
             return seq
+
+
+
 
     async def get_run_events(
         self,
@@ -4246,6 +4123,7 @@ class SQLStateStore(SQLBlobCatalog):
                                 },
                                 iteration_index=row.iteration_count or 0,
                             )
+                            self._mark_announce(session, (run_id,))
                             await self._write_tx(session)
                             _codes.log_code(
                                 logger,
@@ -4310,6 +4188,7 @@ class SQLStateStore(SQLBlobCatalog):
                             {"gap_s": max(0.0, (now - age).total_seconds())},
                         )
                         item = _reclaimable(marked)
+                        self._mark_announce(session, (run_id,))
                         await self._write_tx(session)
                         return item
 
@@ -4525,6 +4404,7 @@ class SQLStateStore(SQLBlobCatalog):
                         StoredEventType.RUN_CANCELLED.value,
                         {"reason": CancelReason.CANCEL_REQUESTED.value},
                     )
+                    self._mark_announce(session, (run_id,))
                     await self._write_tx(session)
                     raise RunNotReclaimableError(run_id, "cancelled")
                 await _insert_event_locked(
@@ -4544,6 +4424,7 @@ class SQLStateStore(SQLBlobCatalog):
                     changed["loop_state"],
                     (changed["loop_state"] or {}).get("submission"),
                 )
+                self._mark_announce(session, (run_id,))
                 await self._write_tx(session)
                 return token
 
@@ -4588,8 +4469,11 @@ class SQLStateStore(SQLBlobCatalog):
         max_runs accepts 1..100,000. Fresh rows and losing CAS attempts count
         toward it; hitting the cap emits sweep_cap_reached.
         """
-        return await self._sweep_runs(
-            older_than, waiting=False, batch_size=batch_size, max_runs=max_runs
+        return cast(
+            "list[SweptRun]",
+            await self._sweep_runs(
+                older_than, waiting=False, batch_size=batch_size, max_runs=max_runs
+            ),
         )
 
     async def sweep_abandoned_runs(
@@ -4605,8 +4489,11 @@ class SQLStateStore(SQLBlobCatalog):
         requires both status_changed_at and updated_at to be stale. Losing CAS
         attempts count toward the cap; hitting it emits sweep_cap_reached.
         """
-        return await self._sweep_runs(
-            older_than, waiting=True, batch_size=batch_size, max_runs=max_runs
+        return cast(
+            "list[SweptRun]",
+            await self._sweep_runs(
+                older_than, waiting=True, batch_size=batch_size, max_runs=max_runs
+            ),
         )
 
     async def _sweep_runs(
@@ -4747,6 +4634,7 @@ class SQLStateStore(SQLBlobCatalog):
                             data,
                             iteration_index=row.iteration_count or 0,
                         )
+                        self._mark_announce(session, (row.id,))
                         await self._write_tx(session)
                     swept.append(
                         SweptRun(
@@ -5485,6 +5373,7 @@ class SQLStateStore(SQLBlobCatalog):
                 conflict()
             return int(row.sequence_index)
         session.info[FRESH_EVIDENCE_SESSION_KEY] = True
+        self._mark_announce(session, (run_id,))
         hook = session.info.get(EVENT_HOOK_SESSION_KEY)
         if hook is not None:
             await hook(session, run_id)
