@@ -64,4 +64,5 @@ async def test_paused_approval_batch_hides_remaining_arguments(store):
                 assert secret not in json.dumps(item.data)
                 break
     finally:
+        await reader.close()
         await agent.close()

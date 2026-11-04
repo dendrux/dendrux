@@ -52,8 +52,9 @@ def _text(events: list[StoredEvent]) -> str:
     return json.dumps([e.data for e in events], default=str)
 
 
-async def test_past_approval_args_hidden_after_rejection(store: Any, engine: Any) -> None:
-    run_store = RunStore.from_engine(engine)
+async def test_past_approval_args_hidden_after_rejection(
+    run_store: RunStore, store: Any, engine: Any
+) -> None:
     llm = ScriptedLLM([tool_call("run_sql", {"q": SQL}, pid="a"), LLMResponse(text="done")])
     agent = Agent(
         provider=llm,
@@ -83,8 +84,7 @@ async def test_past_approval_args_hidden_after_rejection(store: Any, engine: Any
     assert SQL in _text(await _follow(run_store, done.run_id, include_payloads=True))
 
 
-async def test_denial_reason_hidden(store: Any, engine: Any) -> None:
-    run_store = RunStore.from_engine(engine)
+async def test_denial_reason_hidden(run_store: RunStore, store: Any, engine: Any) -> None:
     llm = ScriptedLLM([tool_call("run_sql", {"q": "x"}, pid="a"), LLMResponse(text="done")])
     agent = Agent(
         provider=llm,
@@ -111,7 +111,7 @@ async def test_denial_reason_hidden(store: Any, engine: Any) -> None:
 
 
 async def test_answer_to_a_question_hidden(
-    store: Any, engine: Any, monkeypatch: pytest.MonkeyPatch
+    run_store: RunStore, store: Any, engine: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from dendrux.strategies.native import NativeToolCalling
     from dendrux.types import AgentStep, Clarification
@@ -124,7 +124,6 @@ async def test_answer_to_a_question_hidden(
         return original(self, response)
 
     monkeypatch.setattr(NativeToolCalling, "parse_response", parse)
-    run_store = RunStore.from_engine(engine)
     llm = ScriptedLLM([LLMResponse(text="Which email?"), LLMResponse(text="done")])
     agent = Agent(
         provider=llm,

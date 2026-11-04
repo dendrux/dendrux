@@ -26,8 +26,9 @@ pytestmark = pytest.mark.asyncio
 
 
 @pytest.fixture
-def run_store(engine: Any) -> RunStore:
-    return RunStore.from_engine(engine)
+async def run_store(engine: Any) -> Any:
+    async with RunStore.from_engine(engine) as reader:
+        yield reader
 
 
 # ---------------------------------------------------------------------------

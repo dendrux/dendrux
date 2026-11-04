@@ -103,7 +103,8 @@ async def stores(tmp_path: Any) -> Any:
     async with eng.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     state = store_for_engine(eng)
-    yield state, RunStore.from_engine(eng)
+    async with RunStore.from_engine(eng) as reader:
+        yield state, reader
     await eng.dispose()
 
 

@@ -39,7 +39,9 @@ async def _follow(run_store: RunStore, run_id: str, **kw: Any) -> list[StoredEve
     return out
 
 
-async def test_unknown_tool_name_is_a_placeholder(store: Any, engine: Any) -> None:
+async def test_unknown_tool_name_is_a_placeholder(
+    run_store: RunStore, store: Any, engine: Any
+) -> None:
     llm = ScriptedLLM(
         [
             LLMResponse(
@@ -59,7 +61,6 @@ async def test_unknown_tool_name_is_a_placeholder(store: Any, engine: Any) -> No
     await store.save_run_event(
         result.run_id, event_type="tools.declared", data={"local_tool_names": ["flaky"]}
     )
-    run_store = RunStore.from_engine(engine)
     events = await _follow(run_store, result.run_id)
     completed = [e.data for e in events if e.event_type == "tool.completed"]
     names = sorted(d["tool_name"] for d in completed)

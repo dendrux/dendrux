@@ -157,7 +157,8 @@ async def store(tmp_path: Any) -> Any:
     await state.create_run("r1", "a", tenant_id="T")
     await state.save_run_event("r1", event_type="run.resumed", data={"user_input": SECRET})
     await state.finalize_run("r1", status="success")
-    yield RunStore.from_engine(eng)
+    async with RunStore.from_engine(eng) as reader:
+        yield reader
     await eng.dispose()
 
 

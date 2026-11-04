@@ -226,41 +226,41 @@ async def _follow_all(store: RunStore, **kw: Any) -> list[StoredEvent]:
 
 async def test_follow_finished_run_leaks_no_free_text(state: Any, engine: Any) -> None:
     await _write_history(state, active=False)
-    store = RunStore.from_engine(engine)
-    events = await _follow_all(store)
-    assert [e.event_type for e in events][:4] == [
-        "approval.requested",
-        "run.paused",
-        "approval.decided",
-        "run.resumed",
-    ]
-    assert SECRET not in json.dumps([e.data for e in events])
-    trusted = await _follow_all(store, include_payloads=True)
-    assert SECRET in json.dumps([e.data for e in trusted])
+    async with RunStore.from_engine(engine) as store:
+        events = await _follow_all(store)
+        assert [e.event_type for e in events][:4] == [
+            "approval.requested",
+            "run.paused",
+            "approval.decided",
+            "run.resumed",
+        ]
+        assert SECRET not in json.dumps([e.data for e in events])
+        trusted = await _follow_all(store, include_payloads=True)
+        assert SECRET in json.dumps([e.data for e in trusted])
 
 
 async def test_follow_active_approval_request_keeps_its_params(state: Any, engine: Any) -> None:
     await _write_history(state, active=True)
-    store = RunStore.from_engine(engine)
-    events = await _follow_all(store)
-    past, active = [e.data for e in events if e.event_type == "approval.requested"]
-    assert "params" not in past and "call_id" not in past  # a past call id is hidden too
-    assert active["call_id"] == "c2" and active["params"] == {"q": "now"}
-    assert SECRET not in json.dumps([e.data for e in events])
+    async with RunStore.from_engine(engine) as store:
+        events = await _follow_all(store)
+        past, active = [e.data for e in events if e.event_type == "approval.requested"]
+        assert "params" not in past and "call_id" not in past  # a past call id is hidden too
+        assert active["call_id"] == "c2" and active["params"] == {"q": "now"}
+        assert SECRET not in json.dumps([e.data for e in events])
 
 
 async def test_event_view_and_pause_page_hide_free_text(state: Any, engine: Any) -> None:
     await _write_history(state, active=True)
-    store = RunStore.from_engine(engine)
-    raw = await store.get_events("r1", tenant_id="T")
-    views = [await store.get_event_view("r1", e, tenant_id="T") for e in raw]
-    assert SECRET not in json.dumps([v.data for v in views])
-    active_req = [v for v in views if v.event_type == "approval.requested"][-1]
-    assert active_req.data["params"] == {"q": "now"}
-    pairs, _ = await store.get_pause_page("r1", tenant_id="T")
-    assert pairs[0].user_input is None
-    trusted, _ = await store.get_pause_page("r1", tenant_id="T", include_payloads=True)
-    assert trusted[0].user_input == SECRET
+    async with RunStore.from_engine(engine) as store:
+        raw = await store.get_events("r1", tenant_id="T")
+        views = [await store.get_event_view("r1", e, tenant_id="T") for e in raw]
+        assert SECRET not in json.dumps([v.data for v in views])
+        active_req = [v for v in views if v.event_type == "approval.requested"][-1]
+        assert active_req.data["params"] == {"q": "now"}
+        pairs, _ = await store.get_pause_page("r1", tenant_id="T")
+        assert pairs[0].user_input is None
+        trusted, _ = await store.get_pause_page("r1", tenant_id="T", include_payloads=True)
+        assert trusted[0].user_input == SECRET
 
 
 async def test_live_pause_change_refreshes_the_shared_view(state: Any, engine: Any) -> None:
@@ -268,28 +268,30 @@ async def test_live_pause_change_refreshes_the_shared_view(state: Any, engine: A
     import asyncio
 
     await _write_history(state, active=True)
-    store = RunStore.from_engine(engine)
-    feed = EventFeed(store, poll_interval_s=0.01, poll_max_s=0.02, status_every=1, heartbeat_s=5)
-    async with feed.follow("r1", tenant_id="T", max_duration_s=5.0) as f:
-        backfill = [await asyncio.wait_for(anext(f), 5) for _ in range(6)]
-        assert backfill[4].data["params"] == {"q": "now"}  # active request (c2)
-        await state.save_run_event("r1", event_type="run.resumed", data={})
-        await state.save_run_event(
-            "r1",
-            event_type="approval.requested",
-            data={"tool_name": "sql", "call_id": "c3", "params": {"q": "live"}},
+    async with RunStore.from_engine(engine) as store:
+        feed = EventFeed(
+            store, poll_interval_s=0.01, poll_max_s=0.02, status_every=1, heartbeat_s=5
         )
-        await state.save_run_event(
-            "r1",
-            event_type="run.paused",
-            data={
-                "status": "waiting_approval",
-                "pending_tool_calls": [{"id": "c3", "name": "sql", "params": {"q": 3}}],
-            },
-        )
-        live = [await asyncio.wait_for(anext(f), 5) for _ in range(3)]
-    await feed.aclose()
-    assert live[1].event_type == "approval.requested"
-    # The request is committed before its pause: shown once the pause is active.
-    assert live[1].data.get("params") in (None, {"q": "live"})
-    assert live[2].data["pending_tool_calls"][0]["params"] == {"q": "live"}
+        async with feed.follow("r1", tenant_id="T", max_duration_s=5.0) as f:
+            backfill = [await asyncio.wait_for(anext(f), 5) for _ in range(6)]
+            assert backfill[4].data["params"] == {"q": "now"}  # active request (c2)
+            await state.save_run_event("r1", event_type="run.resumed", data={})
+            await state.save_run_event(
+                "r1",
+                event_type="approval.requested",
+                data={"tool_name": "sql", "call_id": "c3", "params": {"q": "live"}},
+            )
+            await state.save_run_event(
+                "r1",
+                event_type="run.paused",
+                data={
+                    "status": "waiting_approval",
+                    "pending_tool_calls": [{"id": "c3", "name": "sql", "params": {"q": 3}}],
+                },
+            )
+            live = [await asyncio.wait_for(anext(f), 5) for _ in range(3)]
+        await feed.aclose()
+        assert live[1].event_type == "approval.requested"
+        # The request is committed before its pause: shown once the pause is active.
+        assert live[1].data.get("params") in (None, {"q": "live"})
+        assert live[2].data["pending_tool_calls"][0]["params"] == {"q": "live"}

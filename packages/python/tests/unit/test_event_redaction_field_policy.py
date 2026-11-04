@@ -141,7 +141,8 @@ async def store(tmp_path: Any) -> Any:
     for event_type in ("run.paused", "approval.requested", "run.resumed", "tool.completed"):
         await state.save_run_event("r1", event_type=event_type, data=["bad"])  # type: ignore[arg-type]
     await state.finalize_run("r1", status="success")
-    yield RunStore.from_engine(eng)
+    async with RunStore.from_engine(eng) as reader:
+        yield reader
     await eng.dispose()
 
 
