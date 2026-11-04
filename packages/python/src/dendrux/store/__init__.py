@@ -547,6 +547,12 @@ class RunStore:
             split_database_options,
         )
 
+        if {"live_updates", "notify_channel"}.intersection(database_options or {}):
+            # Owner decision O2, with this entry point's own advice; checked before any engine.
+            raise ValueError(
+                "Live updates require an explicit store; build a store with "
+                "live_updates=... and pass it to RunStore(store)"
+            )
         parsed = normalized_url(database_url)
         options, store_options = split_database_options(database_options)
         engine = create_async_engine(parsed, **engine_options(parsed, options))
