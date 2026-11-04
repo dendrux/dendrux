@@ -208,7 +208,7 @@ Dendrux ships two notifiers in `dendrux.notifiers`. Both subclass `BaseNotifier`
   Step 2
 ```
 
-It overrides `on_message_appended`, `on_llm_call_completed`, `on_tool_completed`, and `on_governance_event`. The lifecycle hooks (`on_run_started` etc.) fire and are ignored — `ConsoleNotifier` does not yet render them, but you could subclass it to add a banner.
+It overrides every hook. `on_run_started` prints a `▶ run` line with the short run id, agent name and model. `on_run_finished` prints a `‖ paused` marker when a run hands control back and stays quiet for `success`, `error` and `cancelled`, which `print_summary(result)` renders. `on_run_failed` prints an error panel. `on_message_appended` prints the step headers and the first user message, `on_tool_started` and `on_tool_completed` print the `calling`, `done` and `fail` lines, `on_llm_call_completed` and `on_llm_call_failed` print token counts, duration and cache use or the failure, and `on_governance_event` prints budget, guardrail, skill and MCP lines. `on_llm_call_started` is the one hook that prints nothing, because the matching completion line carries the duration; subclass it for a live-latency display.
 
 `CompositeNotifier` fans a single set of callbacks out to a list of inner notifiers. If you want both terminal output and a metrics sink, wrap them: `CompositeNotifier([console, metrics])`. It implements every hook by forwarding to each child, swallowing per-child exceptions so one broken notifier does not prevent the others from running.
 
