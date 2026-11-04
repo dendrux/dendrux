@@ -24,7 +24,7 @@ FAST: dict[str, Any] = dict(
     close_timeout_s=1.0,
     backoff_initial_s=0.01,
     backoff_max_s=0.02,
-    health_check_s=0.05,
+    health_check_s=0.1,
 )
 
 
@@ -241,14 +241,14 @@ async def test_neither_pool_lets_redis_py_retry_or_reconnect_by_itself(world: Fa
 
 async def test_the_pong_wait_is_clamped_to_the_health_check_interval(world: FakeWorld) -> None:
     world.pong_mode = "silent"
-    updates = make(health_check_s=0.03, send_timeout_s=0.5, flush_deadline_s=1.0)
+    updates = make(health_check_s=0.1, send_timeout_s=0.5, flush_deadline_s=1.0)
     iterator = updates.receive()
     await anext(iterator)
     waiting = asyncio.ensure_future(anext(iterator))
     await eventually(lambda: bool(world.pubsubs[0].pings))
     subscription = updates._wire.subscription
     assert subscription is not None
-    # 4 x send_timeout_s would be 2 s; detection is idle (30 ms) + at most 30 ms of probing
+    # 4 x send_timeout_s would be 2 s; detection is idle (100 ms) + at most 100 ms of probing
     assert subscription._pong_by - monotonic() <= updates.health_check_s
     with pytest.raises(TimeoutError):
         await asyncio.wait_for(waiting, 5)
@@ -258,7 +258,7 @@ async def test_the_pong_wait_is_clamped_to_the_health_check_interval(world: Fake
 async def test_a_read_that_ignores_its_timeout_is_cut_off_by_the_enclosing_deadline(
     world: FakeWorld,
 ) -> None:
-    updates = make(health_check_s=0.03)
+    updates = make(health_check_s=0.1)
     iterator = updates.receive()
     await anext(iterator)
     world.hang_reads = True  # e.g. redis-py busy reconnecting inside its error handler
@@ -272,7 +272,7 @@ async def test_a_ping_that_cannot_be_written_is_cut_off_by_the_probe_budget(
     world: FakeWorld,
 ) -> None:
     world.hang_ping = True
-    updates = make(health_check_s=0.03)
+    updates = make(health_check_s=0.1)
     iterator = updates.receive()
     await anext(iterator)
     with pytest.raises(TimeoutError) as caught:
@@ -394,7 +394,7 @@ async def test_a_late_idle_read_is_charged_against_the_probe_budget(world: FakeW
 async def test_an_idle_read_that_returns_after_the_whole_budget_never_pings(
     world: FakeWorld,
 ) -> None:
-    updates = make(health_check_s=0.05, send_timeout_s=0.5, flush_deadline_s=1.0)
+    updates = make(health_check_s=0.1, send_timeout_s=0.5, flush_deadline_s=1.0)
     iterator = updates.receive()
     await anext(iterator)
     pubsub = world.pubsubs[0]

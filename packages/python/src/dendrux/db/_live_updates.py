@@ -13,6 +13,7 @@ import json
 import logging
 import math
 import random
+import socket
 import ssl
 from abc import ABC, abstractmethod
 from collections import OrderedDict, deque
@@ -20,7 +21,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from functools import wraps
 from time import monotonic
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from dendrux import _codes
 from dendrux.errors import FollowCapacityError, LiveUpdatesUnavailableError
@@ -91,8 +92,13 @@ def _check_limits(counts: dict[str, int], times: dict[str, float]) -> None:
         raise ValueError("backoff_initial_s must not exceed backoff_max_s")
     if counts["max_message_bytes"] < counts["max_run_id_len"] + 4:
         raise ValueError("max_message_bytes must hold one max_run_id_len ASCII id (length + 4)")
-    if times["health_check_s"] < 0.01:
-        raise ValueError("health_check_s must be at least 0.01 seconds")
+    if times["health_check_s"] < 0.1:
+        raise ValueError("health_check_s must be at least 0.1 seconds")
+
+
+def _shutdown_socket(transport: Any) -> None:
+    with suppress(Exception):
+        transport.get_extra_info("socket").shutdown(socket.SHUT_RDWR)
 
 
 def _caller_cancelled() -> bool:
@@ -545,15 +551,18 @@ class LiveUpdates(ABC):
 
     @property
     def healthy(self) -> bool:
-        """Whether the listener is subscribed and the sender has no unresolved failure."""
+        """Whether the listener is subscribed and the sender is outside failure backoff."""
         return self._effective_health()
 
     def _effective_health(self) -> bool:
-        return self._healthy and not self._send_failed
+        return self._healthy and not self._sender_backoff_active()
+
+    def _sender_backoff_active(self) -> bool:
+        return self._send_failed and monotonic() < self._next_attempt_at
 
     @property
     def generation(self) -> int:
-        """Monotonic generation of health transitions and missed hints."""
+        """Monotonic generation of listener health transitions and missed hints."""
         return self._generation
 
     def _new_inbound_buffer(self) -> _InboundBuffer:
@@ -571,6 +580,7 @@ class LiveUpdates(ABC):
         Return an opaque handle for idempotent ``unregister``. Stream consumers
         share the overridable ``max_stream_consumers`` class-level cap.
         """
+        run_id = self._consumer_run_id(consumer, stream_events)
         self._require_loop()
         self._require_open()
         if stream_events and self._stream_consumers >= self.max_stream_consumers:
@@ -578,7 +588,7 @@ class LiveUpdates(ABC):
             raise FollowCapacityError(self.max_stream_consumers)
         handle = object()
         self._consumers[handle] = (consumer, stream_events)
-        self._index_consumer(handle, consumer, stream_events)
+        self._index_consumer(handle, consumer, run_id)
         self._stream_consumers += int(stream_events)
         return handle
 
@@ -590,8 +600,12 @@ class LiveUpdates(ABC):
         if registration is not None:
             self._stream_consumers -= int(registration[1])
 
-    def _index_consumer(self, handle: object, consumer: _Consumer, stream: bool) -> None:
-        run_id = getattr(consumer, "run_id", None) if stream else None
+    @staticmethod
+    def _consumer_run_id(consumer: _Consumer, stream: bool) -> object:
+        indexed = getattr(consumer, "_live_updates_run_waker", False) is True
+        return getattr(consumer, "run_id", None) if indexed and stream else None
+
+    def _index_consumer(self, handle: object, consumer: _Consumer, run_id: object) -> None:
         if isinstance(run_id, str):
             self._wakers_by_run.setdefault(run_id, {})[handle] = consumer
             self._waker_runs[handle] = run_id
