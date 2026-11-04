@@ -62,9 +62,23 @@ jobs:
           --health-timeout 5s
           --health-retries 10
 
+      # Real Redis for the RedisUpdates tests (Pub/Sub only; the tests use a private channel
+      # each). The "Require the Redis backend" and "Test" steps fail the job if the variable
+      # goes missing or those tests are skipped for lack of it.
+      redis:
+        image: redis:7@sha256:b6b6e3dc0c0952737748e55d5d885272840c7e42ba41ab1d5489f693419882f5
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
     env:
       PYTHON_DOTENV_DISABLED: "1"
       DENDRUX_TEST_PG_URL: postgresql+asyncpg://dendrux:dendrux@localhost:5432/dendrux_test
+      DENDRUX_TEST_REDIS_URL: redis://localhost:6379/0
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -113,6 +127,14 @@ jobs:
             exit 1
           fi
 
+      - name: Require the Redis backend
+        shell: bash
+        run: |
+          if [ -z "${DENDRUX_TEST_REDIS_URL:-}" ]; then
+            echo "::error::DENDRUX_TEST_REDIS_URL is not set; the Redis integration tests would be skipped silently."
+            exit 1
+          fi
+
       - name: Test
         shell: bash
         env:
@@ -124,6 +146,10 @@ jobs:
           pytest $files -v -rs -n auto -m "not benchmark" --cov=src/dendrux --cov-report= | tee pytest.log
           if grep -q 'DENDRUX_TEST_PG_URL not set' pytest.log; then
             echo "::error::Postgres integration tests were skipped (DENDRUX_TEST_PG_URL not set)."
+            exit 1
+          fi
+          if grep -q 'DENDRUX_TEST_REDIS_URL not set' pytest.log; then
+            echo "::error::Redis integration tests were skipped (DENDRUX_TEST_REDIS_URL not set)."
             exit 1
           fi
 

@@ -1,14 +1,18 @@
-# Test databases for the MySQL 8.4 and MariaDB 10.11 suites (CI uses this same file).
+# Test servers for the MySQL 8.4 and MariaDB 10.11 suites and the Redis live-updates suite
+# (CI uses this same file).
 #
-#   make test-dbs-up      # start both, wait until healthy
+#   make test-dbs-up      # start all three, wait until healthy
 #   DENDRUX_TEST_MYSQL_URL=mysql+asyncmy://root:dendrux_test@127.0.0.1:53306/dendrux_test \
 #   DENDRUX_TEST_MARIADB_URL=mysql+asyncmy://root:dendrux_test@127.0.0.1:53307/dendrux_test \
 #     make test-mysql
-#   make test-dbs-down    # stop and remove both (and their data)
+#   make test-dbs-down    # stop and remove all of them (and their data)
 #
-# Only these two containers are ever touched. They listen on 127.0.0.1 only, are capped
-# at 1 GB each, and use the NO PAD binary collations Dendrux requires as server defaults
-# (the schema sets them per column too). Data is disposable: no named volumes.
+#   make test-redis-up    # only Redis: DENDRUX_TEST_REDIS_URL=redis://127.0.0.1:56379/0 make test-redis
+#   make test-redis-down
+#
+# Only these three containers are ever touched. They listen on 127.0.0.1 only, are capped
+# at 1 GB each (Redis 256 MB), and use the NO PAD binary collations Dendrux requires as server
+# defaults (the schema sets them per column too). Data is disposable: no named volumes.
 name: dendrux-test-dbs
 
 services:
@@ -42,6 +46,20 @@ services:
     mem_limit: 1g
     healthcheck:
       test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+
+  redis:
+    image: redis:7@sha256:b6b6e3dc0c0952737748e55d5d885272840c7e42ba41ab1d5489f693419882f5
+    container_name: dendrux-test-redis
+    # Pub/Sub only: nothing is persisted, and a runaway publisher cannot grow the server.
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "128mb"]
+    ports:
+      - "127.0.0.1:56379:6379"
+    mem_limit: 256m
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
       interval: 3s
       timeout: 3s
       retries: 40
