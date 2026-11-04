@@ -645,6 +645,28 @@ async def test_per_run_fallback_isolates_a_failing_run(clock: Clock, caplog: Any
     assert failed and failed[0].count == 1
 
 
+async def test_status_failures_back_off_even_while_event_reads_succeed(clock: Clock) -> None:
+    state = BatchedState()
+    state.create("r1")
+    attempts: list[float] = []
+
+    async def failing(run_ids: Any) -> dict[str, str]:
+        attempts.append(clock.now)
+        raise OSError("status backend down")
+
+    state.get_run_statuses = failing  # type: ignore[method-assign]
+    feed = _feed(_store(state), status_every=1)
+    await attach(feed, "r1")
+    await ticks()
+    start = clock.now
+    while clock.now - start < 4:
+        state.write("r1")  # every events read succeeds with new events
+        clock.advance(0.25)
+        await ticks()
+    gaps = [round(b - a, 2) for a, b in zip(attempts, attempts[1:], strict=False)]
+    assert gaps[:3] == [0.5, 1.0, 2.0]
+
+
 # --------------------------------------------------------------------------- missed hints
 
 

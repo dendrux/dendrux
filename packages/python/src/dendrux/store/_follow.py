@@ -254,7 +254,7 @@ class _WatchedRun:
         self.reason = "join"
         self.dirty = self.hints = self.reads = 0
         self.delay = self.params.poll_interval_s
-        self.fail_delay = 0.0
+        self.events_fail_delay = self.status_fail_delay = 0.0
         self.missed_logged = False
         self._view: PauseView | None = None
         self._view_generation = 0
@@ -615,8 +615,8 @@ class _Coordinator:
 
     @staticmethod
     def _status_due(run: _WatchedRun, now: float, events: list[_WatchedRun]) -> bool:
-        if run.status_terminal:
-            return False
+        if run.status_terminal or (run.status_fail_delay and run.status_due > now):
+            return False  # terminal, or backing off after a failed status read
         due = run.status_due <= now or (run.status_with_next and run in events)
         if due:
             run.status_with_next = False
@@ -685,7 +685,7 @@ class _Coordinator:
         if self.runs.get(run.run_id) is not run:
             return
         run.reads += 1
-        run.fail_delay = 0.0
+        run.events_fail_delay = 0.0
         fresh = [e for e in events if run.head is None or e.sequence_index > run.head]
         self._diagnose(run, fresh, snapshot)
         run.publish(fresh)
@@ -770,6 +770,7 @@ class _Coordinator:
         """A missing run (deleted) counts as terminal; a failed read never does."""
         if self.runs.get(run.run_id) is not run:
             return
+        run.status_fail_delay = 0.0
         if status is not None and status not in TERMINAL_STATUSES:
             run.status_due = now + STATUS_MAX_AGE_S
             return
@@ -789,12 +790,12 @@ class _Coordinator:
         )
         now = self._now()
         for run in runs:
-            params = run.params
-            run.fail_delay = min(max(run.fail_delay * 2, params.poll_interval_s), params.poll_max_s)
             if status:
-                run.status_due = now + run.fail_delay
+                run.status_fail_delay = _backoff(run.status_fail_delay, run.params)
+                run.status_due = now + run.status_fail_delay
             else:
-                run.events_due = now + run.fail_delay
+                run.events_fail_delay = _backoff(run.events_fail_delay, run.params)
+                run.events_due = now + run.events_fail_delay
 
     # ------------------------------------------------------------ missed hints
 
@@ -822,6 +823,11 @@ class _Coordinator:
                     run_id=_log_run_id(run.run_id),
                     count=1,
                 )
+
+
+def _backoff(delay: float, params: _Params) -> float:
+    """The next failure delay: ``poll_interval_s``, doubling up to ``poll_max_s``."""
+    return min(max(delay * 2, params.poll_interval_s), params.poll_max_s)
 
 
 class _RunWaker:
