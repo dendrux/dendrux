@@ -165,3 +165,23 @@ async def test_python_grouping_sorts_an_adapter_query_with_reversed_rows(read_st
     assert [[row.sequence_index for row in result[run_id]] for run_id in ids] == [
         list(range(4))
     ] * 2
+
+
+async def test_unread_backlog_returns_first_page_before_python_sort(read_store):
+    store = read_store
+    ids = await seed(store, count=2, events=20)
+    sqlite = store._engine.dialect.name == "sqlite"
+    async with store._engine.begin() as conn:
+        if sqlite:
+            await conn.execute(text("PRAGMA reverse_unordered_selects=ON"))
+    try:
+        first = await store.get_events_for_runs({ids[0]: -1, ids[1]: 4}, limit_per_run=10)
+        assert [event.sequence_index for event in first[ids[0]]] == list(range(10))
+        assert [event.sequence_index for event in first[ids[1]]] == list(range(5, 15))
+        second = await store.get_events_for_runs({ids[0]: 9, ids[1]: 14}, limit_per_run=10)
+        assert [event.sequence_index for event in second[ids[0]]] == list(range(10, 20))
+        assert [event.sequence_index for event in second[ids[1]]] == list(range(15, 20))
+    finally:
+        if sqlite:
+            async with store._engine.begin() as conn:
+                await conn.execute(text("PRAGMA reverse_unordered_selects=OFF"))
