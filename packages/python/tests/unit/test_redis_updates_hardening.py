@@ -246,7 +246,7 @@ async def test_the_pong_wait_is_clamped_to_the_health_check_interval(world: Fake
     await anext(iterator)
     waiting = asyncio.ensure_future(anext(iterator))
     await eventually(lambda: bool(world.pubsubs[0].pings))
-    subscription = updates._subscription
+    subscription = updates._wire.subscription
     assert subscription is not None
     # 4 x send_timeout_s would be 2 s; detection is idle (30 ms) + at most 30 ms of probing
     assert subscription._pong_by - monotonic() <= updates.health_check_s
@@ -278,3 +278,37 @@ async def test_a_ping_that_cannot_be_written_is_cut_off_by_the_probe_budget(
     with pytest.raises(TimeoutError) as caught:
         await asyncio.wait_for(anext(iterator), 5)
     assert "Redis live updates" in str(caught.value)
+
+
+# -- R5: setup errors and internal objects carry no caller text ---------------------------------
+
+
+async def test_a_setup_failure_inside_receive_is_sanitized_like_any_other(world: FakeWorld) -> None:
+    updates = make()
+    world.pool_error = RuntimeError("s3cret-sentinel driver text")  # after construction passed
+    with pytest.raises(RuntimeError) as caught:
+        await anext(updates.receive())
+    assert "sentinel" not in str(caught.value) and "sentinel" not in repr(caught.value)
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+
+
+@pytest.mark.parametrize("bad", ["latin-1", "utf-16", "ascii-nope", "s3cret-sentinel", 8])
+def test_real_an_encoding_that_is_not_utf8_is_refused_without_echoing_it(bad: Any) -> None:
+    with pytest.raises(ValueError) as caught:
+        ru.RedisUpdates(f"redis://{HOST}/0", client_options={"encoding": bad}, **FAST)
+    assert "sentinel" not in str(caught.value)
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+
+
+@pytest.mark.parametrize("name", ["utf-8", "UTF-8", "utf8", "U8"])
+def test_real_the_spellings_of_utf8_are_accepted(name: str) -> None:
+    assert ru.RedisUpdates(f"redis://{HOST}/0", client_options={"encoding": name}, **FAST)
+
+
+def test_real_internal_clients_do_not_show_host_or_port_after_lazy_init() -> None:
+    updates = ru.RedisUpdates(f"redis://:s3cret-sentinel@{HOST}:6380/0", **FAST)
+    updates._sender()  # lazily builds redis-py's pool and client
+    ru._Subscription(updates)  # and a listen pool and pub/sub object
+    for text in (repr(vars(updates)), repr(updates.__dict__), repr(updates)):
+        for sentinel in ("sentinel", HOST, "6380"):
+            assert sentinel not in text

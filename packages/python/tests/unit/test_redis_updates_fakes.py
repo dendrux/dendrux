@@ -236,6 +236,7 @@ class FakeWorld:
         self.ack_mode = "ok"  # ok | never | wrong_channel
         self.ack_delay = 0.0
         self.pong_mode = "echo"  # echo | silent | wrong
+        self.pool_error: BaseException | None = None  # from_url fails (a setup error)
         self.hang_reads = False  # get_message never returns, whatever timeout it is given
         self.hang_ping = False  # ping never completes
         self.execute_hook: Any = None  # async callable(pipeline): may stall or raise
@@ -251,6 +252,8 @@ class FakeWorld:
         class ConnectionPool(FakePool):
             @classmethod
             def from_url(cls, url: str, **kwargs: Any) -> FakePool:
+                if world.pool_error is not None:
+                    raise world.pool_error
                 return FakePool(world, url, kwargs)
 
         return SimpleNamespace(

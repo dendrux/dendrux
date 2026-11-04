@@ -17,6 +17,7 @@ chained original, because redis-py puts host and port into its messages.
 from __future__ import annotations
 
 import asyncio
+import codecs
 import secrets
 from contextlib import suppress
 from time import monotonic
@@ -101,6 +102,25 @@ def _bounded_parser(base: type, limit: int) -> type:
     return BoundedParser
 
 
+class _Wire:
+    """The transport handles of one RedisUpdates.
+
+    Its repr shows nothing: redis-py's pool, client and connection reprs contain the host,
+    port and user, and ``vars(updates)`` must stay free of them.
+    """
+
+    __slots__ = ("client", "pipeline", "pool", "subscription")
+
+    def __init__(self) -> None:
+        self.pool: Any = None
+        self.client: Any = None
+        self.pipeline: Any = None
+        self.subscription: _Subscription | None = None
+
+    def __repr__(self) -> str:
+        return "<wire>"
+
+
 class _Redacted:
     """Holds a value whose text must never reach a repr, a log line or a traceback."""
 
@@ -149,8 +169,17 @@ def _checked_channel(channel: object) -> str:
     return channel
 
 
+def _is_utf8(name: object) -> bool:
+    try:
+        return isinstance(name, str) and codecs.lookup(name).name == "utf-8"
+    except LookupError:
+        return False
+
+
 def _checked_options(options: Mapping[str, Any] | None) -> dict[str, Any]:
     chosen = dict(options or {})
+    if "encoding" in chosen and not _is_utf8(chosen["encoding"]):
+        raise ValueError("client_options encoding must be utf-8, the encoding of the wire format")
     refused = sorted(key for key in chosen if key in _FORBIDDEN_OPTIONS)
     if refused:
         raise ValueError(
@@ -190,7 +219,7 @@ class _Subscription:
         #: Probe budget: writing the PING and waiting for its pong. Clamped to the health-check
         #: interval so detection (idle wait + probe) never exceeds twice that interval.
         self.probe_s = min(owner.send_timeout_s * 4, owner.health_check_s)
-        owner._subscription = self
+        owner._wire.subscription = self
 
     def abort(self) -> None:
         _abort_transports(self.pool, [getattr(self.pubsub, "connection", None)])
@@ -255,8 +284,8 @@ class _Subscription:
 
     async def close(self) -> None:
         self.abort()  # first, synchronously: nothing below may leave the socket open
-        if self.owner._subscription is self:
-            self.owner._subscription = None
+        if self.owner._wire.subscription is self:
+            self.owner._wire.subscription = None
         with suppress(Exception):
             await self.pubsub.aclose()
         with suppress(Exception):
@@ -284,10 +313,7 @@ class RedisUpdates(LiveUpdates):
         self._channel = _checked_channel(channel)
         self._url = _Redacted(_checked_url(url))
         self._options = _Redacted(_checked_options(client_options))
-        self._pool: Any = None
-        self._client: Any = None
-        self._pipeline: Any = None
-        self._subscription: _Subscription | None = None
+        self._wire = _Wire()
         self._check_options()
 
     def __repr__(self) -> str:
@@ -333,35 +359,36 @@ class RedisUpdates(LiveUpdates):
     # -- send ------------------------------------------------------------------------------
 
     def _sender(self) -> Any:
-        if self._client is None:
-            self._pool = self._new_pool(self.send_timeout_s)
-            self._client = self._api.Redis(connection_pool=self._pool)
-        return self._client
+        if self._wire.client is None:
+            self._wire.pool = self._new_pool(self.send_timeout_s)
+            self._wire.client = self._api.Redis(connection_pool=self._wire.pool)
+        return self._wire.client
 
     async def send(self, messages: Sequence[str]) -> None:
         pipeline = self._sender().pipeline(transaction=False)
         for message in messages:
             pipeline.publish(self._channel, message)
-        self._pipeline = pipeline
+        self._wire.pipeline = pipeline
         failure: Exception | None = None
         try:
             await pipeline.execute()
         except Exception as error:
             failure = self._plain_error(error)
         finally:
-            self._pipeline = None
+            self._wire.pipeline = None
         if failure is not None:
             raise failure
 
     def abort_sender(self) -> None:
-        pipeline, pool = self._pipeline, self._pool
-        self._pipeline = self._pool = self._client = None  # the next send starts from scratch
+        wire = self._wire
+        pipeline, pool = wire.pipeline, wire.pool
+        wire.pipeline = wire.pool = wire.client = None  # the next send starts from scratch
         _abort_transports(pool, [getattr(pipeline, "connection", None)])
 
     async def aclose_sender(self) -> None:
         # The handles stay until cleanup is over: if cleanup stalls, is cancelled or times out,
         # the ``finally`` still finds the pool and drops its sockets synchronously.
-        client, pool = self._client, self._pool
+        client, pool = self._wire.client, self._wire.pool
         try:
             if client is not None:
                 with suppress(Exception):
@@ -375,9 +402,10 @@ class RedisUpdates(LiveUpdates):
     # -- receive ---------------------------------------------------------------------------
 
     async def receive(self) -> AsyncIterator[str | None | _Gap]:
-        subscription = _Subscription(self)
+        subscription: _Subscription | None = None
         failure: Exception | None = None
         try:
+            subscription = _Subscription(self)
             await subscription.open()
             yield None
             while True:
@@ -387,10 +415,11 @@ class RedisUpdates(LiveUpdates):
         except Exception as error:
             failure = self._plain_error(error)
         finally:
-            await subscription.close()
+            if subscription is not None:
+                await subscription.close()
         if failure is not None:
             raise failure
 
     def abort_listener(self) -> None:
-        if self._subscription is not None:
-            self._subscription.abort()
+        if self._wire.subscription is not None:
+            self._wire.subscription.abort()
