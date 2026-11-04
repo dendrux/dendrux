@@ -1,6 +1,7 @@
 """Bounded, best-effort live-update hints; durable reads remain the source of truth.
 
-Close must run on the bound event loop. Its final flush respects sender backoff:
+Close runs on the bound event loop, or aborts synchronously once that loop is closed.
+Its final flush respects sender backoff:
 when sending is paused, the final flush is skipped and remaining hints are counted
 as closed drops. Readers recover those changes through polling.
 """
@@ -487,6 +488,9 @@ class LiveUpdates(ABC):
         self._leases: set[object] = set()
         self._consumers: dict[object, tuple[_Consumer, bool]] = {}
         self._stream_consumers = 0
+        self._wakers_by_run: dict[str, dict[object, _Consumer]] = {}
+        self._waker_runs: dict[object, str] = {}
+        self._general_consumers: dict[object, _Consumer] = {}
 
     @property
     def healthy(self) -> bool:
@@ -520,6 +524,7 @@ class LiveUpdates(ABC):
             raise FollowCapacityError(self.max_stream_consumers)
         handle = object()
         self._consumers[handle] = (consumer, stream_events)
+        self._index_consumer(handle, consumer, stream_events)
         self._stream_consumers += int(stream_events)
         return handle
 
@@ -527,8 +532,34 @@ class LiveUpdates(ABC):
         """Idempotently remove a hub registration."""
         self._require_loop()
         registration = self._consumers.pop(handle, None)
+        self._unindex_consumer(handle)
         if registration is not None:
             self._stream_consumers -= int(registration[1])
+
+    def _index_consumer(self, handle: object, consumer: _Consumer, stream: bool) -> None:
+        run_id = getattr(consumer, "run_id", None) if stream else None
+        if isinstance(run_id, str):
+            self._wakers_by_run.setdefault(run_id, {})[handle] = consumer
+            self._waker_runs[handle] = run_id
+        else:
+            self._general_consumers[handle] = consumer
+
+    def _unindex_consumer(self, handle: object) -> None:
+        self._general_consumers.pop(handle, None)
+        run_id = self._waker_runs.pop(handle, None)
+        if run_id is not None:
+            wakers = self._wakers_by_run[run_id]
+            wakers.pop(handle)
+            if not wakers:
+                del self._wakers_by_run[run_id]
+
+    def _hint_targets(self, ids: tuple[str, ...]) -> list[tuple[_Consumer, tuple[str, ...]]]:
+        targets = [(consumer, ids) for consumer in self._general_consumers.values()]
+        for run_id in dict.fromkeys(ids):
+            targets.extend(
+                (consumer, (run_id,)) for consumer in self._wakers_by_run.get(run_id, {}).values()
+            )
+        return targets
 
     def _deliver(self, message: str | _Gap) -> None:
         if message is self.GAP:
@@ -536,9 +567,9 @@ class LiveUpdates(ABC):
             return
         ids = self._decode(cast("str", message))
         if ids is not None:
-            for consumer, _ in tuple(self._consumers.values()):
+            for consumer, hints in self._hint_targets(ids):
                 with suppress(Exception, asyncio.CancelledError):
-                    consumer.on_hints(ids)
+                    consumer.on_hints(hints)
 
     def _gap(self) -> None:
         self._generation += 1
@@ -692,19 +723,44 @@ class LiveUpdates(ABC):
         _codes.log_code(logger, _codes.LIVE_UPDATES_CLOSE_TIMEOUT, timeout_s=self.close_timeout_s)
 
     async def close(self) -> None:
-        """Drain and close within one total deadline; a cancelled closer may be retried."""
+        """Drain within one deadline, or abort synchronously after the owning loop closes."""
+        if self._bound_loop_closed():
+            self._close_detached()
+            return
+        await self._close_on_loop()
+
+    def _bound_loop_closed(self) -> bool:
+        return self._loop is not None and self._loop.is_closed()
+
+    def _close_detached(self) -> None:
+        if self._state == "closed":
+            return
+        self._state = "closing"
+        self._abort_sender_safe()
+        self._abort_listener_safe()
+        self._listener_task = None
+        self._healthy = False
+        self._finish_close()
+
+    async def _close_on_loop(self) -> None:
         self._require_loop()
         async with self._close_lock:
             if self._state == "closed":
                 return
             self._state = "closing"
             await self._close_owned()
-            self._state = "closed"
-            self._counts["dropped_closed"] += len(self._pending)
-            self._pending.clear()
-            self._leases.clear()
-            self._consumers.clear()
-            self._stream_consumers = 0
+            self._finish_close()
+
+    def _finish_close(self) -> None:
+        self._state = "closed"
+        self._counts["dropped_closed"] += len(self._pending)
+        self._pending.clear()
+        self._leases.clear()
+        self._consumers.clear()
+        self._wakers_by_run.clear()
+        self._waker_runs.clear()
+        self._general_consumers.clear()
+        self._stream_consumers = 0
 
     async def _close_owned(self) -> None:
         self._close_timeout_logged = False
