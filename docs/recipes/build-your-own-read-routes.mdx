@@ -16,7 +16,7 @@ FastAPI; install your web framework separately if you use the example below.
 | follow(run_id, tenant_id=..., after_sequence_index=...) | Redacted live StoredEvent values, FollowHeartbeat and FollowEnd |
 | get_event_view(run_id, event, tenant_id=...) | Contextual event view using the verified active pause and recorded model arguments |
 | redact_event(event) | Conservative standalone event projection; unverified active approval arguments fail closed |
-| get_subtree(run_id, tenant_id=...) | Delegated runs; inspect pending state on each waiting child |
+| get_subtree(run_id, tenant_id=..., max_nodes=...) | Delegated runs; inspect pending state on each waiting child |
 
 Reads validate their arguments before they query: a malformed id, tenant, cursor,
 filter or flag raises `ValueError` with a fixed message, which your route maps to

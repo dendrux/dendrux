@@ -58,14 +58,14 @@ Your application chooses its cursor policy. One possible reconnect order is:
 2. `?after=N` query string.
 3. `None`, which means replay from the start of the log.
 
-The resolved cursor is passed into `RunStore.get_events(run_id, after_sequence_index=cursor)`, which emits a SQL `WHERE sequence_index > cursor` and orders by `sequence_index`. The strict `>` is the critical piece: the event the client already saw is excluded, and every event after it is included.
+The resolved cursor is passed into `RunStore.get_events(run_id, after_sequence_index=cursor, limit=...)`, which emits a SQL `WHERE sequence_index > cursor` and orders by `sequence_index`. The strict `>` is the critical piece: the event the client already saw is excluded, and every later event is included, one page of at most `limit` rows at a time (continue from the last event returned).
 
 A client that last saw `seq=4` and reconnects gets the rest of the run, no duplicates and no gaps (on a database where every writer is on 0.5.0 or later; see the mixed-fleet note above):
 
 [//]: # "docs-test: skip - fragment: relies on `store`, defined by setup shown elsewhere"
 
 ```python
-events = await store.get_events(RUN_ID, after_sequence_index=4)
+events = await store.get_events(RUN_ID, after_sequence_index=4, limit=100)
 print([e.sequence_index for e in events])
 # [5, 6, 7, 8, 9, 10]
 ```
@@ -94,11 +94,11 @@ async def main() -> None:
 
     store = RunStore.from_database_url(url)
     async with store:
-        print([e.sequence_index for e in await store.get_events(result.run_id)])
+        print([e.sequence_index for e in await store.get_events(result.run_id, limit=100)])
         # [0, 1, 2, 3]
 
         # A client that already saw seq=0 reconnects: strict > cursor, no replay of seq 0.
-        resumed = await store.get_events(result.run_id, after_sequence_index=0)
+        resumed = await store.get_events(result.run_id, after_sequence_index=0, limit=100)
         print([e.sequence_index for e in resumed])
         # [1, 2, 3]
 

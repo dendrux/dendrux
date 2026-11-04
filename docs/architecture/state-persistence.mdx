@@ -378,8 +378,8 @@ async def main() -> None:
     store = RunStore.from_database_url(url)
     async with store:
         run = await store.get_run(result.run_id)              # the agent_runs row
-        events = await store.get_events(result.run_id)         # the run_events timeline
-        llm_calls = await store.get_llm_calls(result.run_id)   # one row per LLM turn
+        events = await store.get_events(result.run_id, limit=100)         # the run_events timeline (one page)
+        llm_calls = await store.get_llm_calls(result.run_id, limit=100)   # one row per LLM turn (one page)
 
         print(run.status, run.model)
         # success claude-haiku-4-5

@@ -42,7 +42,7 @@ await state.close()
 await engine.dispose()
 ```
 
-The store runs the agents (`PostgresStateStore` here; `MySQLStateStore` or `SQLiteStateStore` the same way, or `store_for_engine(engine)` to pick one from the engine); `RunStore(state)` supplies the read facade over the same store, and listens for live updates when the store has them (see [Live updates](#live-updates)). `RunStore.from_engine(engine)` is the polling-only alternative. Shut down in this order: agents, readers, the store, then the engine. `await state.close()` closes the store's live-update connections and never disposes your engine. You keep ownership of the engine and dispose it after all work and readers have stopped. Avoid holding a database session while you await an agent run, a tool or a browser.
+The store runs the agents (`PostgresStateStore` here; `MySQLStateStore` or `SQLiteStateStore` the same way, or `store_for_engine(engine)` to pick one from the engine); `RunStore(state)` supplies the read facade over the same store, and listens for live updates when the store has them (see [Live updates](#live-updates)). `RunStore.from_engine(engine)` is the polling-only alternative. Shut down in this order: agents, readers, the store, then the engine, and put it in `async with` or a `finally` so a failed request cannot skip it. Closing the last follower does not stop the reader's coordinator task: it ends at `reads.close()`, or on its own after about 60 seconds with nothing to watch. If the engine is disposed first, the coordinator's next read can fail with a pool error (for example a `KeyError`) and log `follow_read_failed`. `await state.close()` closes the store's live-update connections and never disposes your engine. You keep ownership of the engine and dispose it after all work and readers have stopped. Avoid holding a database session while you await an agent run, a tool or a browser.
 
 Build the engine in the worker process, after any fork, on the event loop that will use it. Async Postgres pools belong to their creating loop; using one from another loop is refused with a clear error. Build one store per worker loop instead of calling `asyncio.run` per request. See also [Web endpoints](/docs/recipes/web-endpoint).
 
@@ -149,9 +149,9 @@ async with reads.follow(run_id, tenant_id=tenant) as follow:
     async for event in follow:
         await send(event)
 
-# At shutdown, in this order:
+# At shutdown, in this order, inside a finally:
 await agent.close()
-await reads.close()    # releases this reader's listener; never closes the store
+await reads.close()    # stops the coordinator and releases the listener; never closes the store
 await state.close()    # closes the live-update connections; the engine stays yours
 await engine.dispose()
 ```

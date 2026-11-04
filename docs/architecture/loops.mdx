@@ -319,7 +319,7 @@ If the output fails validation, the run ends with `status=ERROR` and `agent.run(
 - The error carries `usage`, `model` and `stop_reason` for that call. A `stop_reason` of `"max_tokens"` means the JSON was cut off; raise `max_tokens`.
 - The call is recorded as a completed LLM call: one `llm_interactions` row with usage, cost (priced with your `PriceTable`) and the raw invalid text, and an `llm.completed` event. It counts toward `Budget` checks.
 - The run's event sequence is `run.started`, `llm.completed`, `run.error`. Earlier versions emitted `llm.failed` here. To detect a validation failure, catch the exception or watch for `run.error`.
-- `RunStore.get_subtree(run_id).usage` includes the call. The run row's own totals (`agent_runs.total_*`, and `total_*` on `RunSummary` and `RunDetail`) stay at 0 for an errored run, as for every errored run. Read usage from `get_subtree` when you need the cost of a failed run.
+- `RunStore.get_subtree(run_id, max_nodes=...).usage` includes the call. The run row's own totals (`agent_runs.total_*`, and `total_*` on `RunSummary` and `RunDetail`) stay at 0 for an errored run, as for every errored run. Read usage from `get_subtree` when you need the cost of a failed run.
 
 ## Why pluggable, not hard-coded
 

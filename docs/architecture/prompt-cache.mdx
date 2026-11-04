@@ -81,7 +81,7 @@ async def main() -> None:
     store = RunStore.from_database_url(url)
     async with store:
         for label, rid in (("run1", r1.run_id), ("run2", r2.run_id)):
-            c = (await store.get_llm_calls(rid))[0]
+            c = (await store.get_llm_calls(rid, limit=1))[0]
             print(label, "fresh:", c.input_tokens,
                   "cache_read:", c.cache_read_input_tokens,
                   "cache_creation:", c.cache_creation_input_tokens)

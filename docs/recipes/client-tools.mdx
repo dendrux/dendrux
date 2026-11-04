@@ -222,7 +222,7 @@ the request when your application needs that guarantee.
 
 `kind` is `client_tool`, `approval`, `input` (a question, with suggested `options`) or `paused` (a requested or budget pause). It is one bounded read; the run's history is never loaded. The `params` of a client-tool call are the arguments in the form a client tool receives them, so with the default `PII(restore="all")` they hold real values. They remain visible in default event views because they are instructions to the client. A past pause's arguments, tool results and server-tool parameters stay hidden from readers without payload access.
 
-A run that delegated to child runs pauses in the child, not the parent. To find those calls, list the tree with `store.get_subtree(run_id, tenant_id=tenant)` and call `get_pending` for each node whose status is a waiting one.
+A run that delegated to child runs pauses in the child, not the parent. To find those calls, list the tree with `store.get_subtree(run_id, tenant_id=tenant, max_nodes=1000)` (handle `SubtreeTooLargeError`) and call `get_pending` for each node whose status is a waiting one.
 
 ## The client side
 

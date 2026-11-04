@@ -108,14 +108,14 @@ Once you have a run from the listing, every other read API on `RunStore` is keye
 [//]: # "docs-test: skip - fragment: relies on `run`, defined by setup shown elsewhere"
 
 ```python
-events = await store.get_events(run.run_id)            # full event log
-llm_calls = await store.get_llm_calls(run.run_id)      # prompts, responses, usage, cache
-tool_calls = await store.get_tool_invocations(run.run_id)  # tool params + results
-traces = await store.get_traces(run.run_id)            # ReAct thoughts/actions
+events = await store.get_events(run.run_id, limit=100)            # first page of the event log
+llm_calls = await store.get_llm_calls(run.run_id, limit=100)      # prompts, responses, usage, cache
+tool_calls = await store.get_tool_invocations(run.run_id, limit=100)  # tool params + results
+traces = await store.get_traces(run.run_id, limit=100)            # ReAct thoughts/actions
 pauses = await store.get_pauses(run.run_id)            # HITL approval cycles
 ```
 
-The full audit/tracing surface is available through RunStore; see [Build your own read routes](/docs/recipes/build-your-own-read-routes) — just call it from your own code if you want a custom thread inspector.
+Each list read returns one page of at most 1,000 rows; page events with `after_sequence_index` and the others with `offset` (see [RunStore](/docs/reference/run-store#bounded-list-reads)). The full audit/tracing surface is available through RunStore; see [Build your own read routes](/docs/recipes/build-your-own-read-routes) — just call it from your own code if you want a custom thread inspector.
 
 ## Backend semantics
 
