@@ -57,7 +57,8 @@ from dendrux.runtime._bounds import (
 from dendrux.runtime._bounds import IN_CHUNK as _IN_CHUNK
 from dendrux.runtime.durability import (
     _CommitNotAppliedError,
-    _flush_live_updates,
+    _enqueue_live_updates,
+    _live_updates_page,
     _safe_database_call,
     retry_transient_db,
     safe_database_operations,
@@ -608,10 +609,12 @@ class SQLStateStore(SQLBlobCatalog):
     def _mark_announce(self, session: AsyncSession, run_ids: Sequence[str]) -> None:
         session.info.setdefault(ANNOUNCE_MARKS_SESSION_KEY, set()).update(run_ids)
 
-    def _enqueue_committed(self, session: AsyncSession, commit_issued: bool) -> None:
+    def _enqueue_committed(
+        self, session: AsyncSession, commit_issued: bool, succeeded: bool
+    ) -> None:
         marks = session.info.pop(ANNOUNCE_MARKS_SESSION_KEY, ())
         if commit_issued and marks and self._live_updates is not None:
-            self._live_updates.enqueue(marks)
+            _enqueue_live_updates(self, marks, succeeded)
 
     async def _write_tx(self, session: AsyncSession, *, run_ids: Sequence[str] = ()) -> None:
         """Commit once; prove identity after a lost acknowledgement or fail closed."""
@@ -621,6 +624,7 @@ class SQLStateStore(SQLBlobCatalog):
         # ORM flush remains pre-COMMIT and cannot publish hints on failure.
         await session.flush()
         commit_issued = False
+        succeeded = False
         try:
             try:
                 commit_issued = True
@@ -629,11 +633,12 @@ class SQLStateStore(SQLBlobCatalog):
                 await _CommitReadback(self, session, operation).resolve(error)
             session.info.pop(COMMIT_PROOFS_SESSION_KEY, None)
             session.info.pop(FRESH_EVIDENCE_SESSION_KEY, None)
+            succeeded = True
         except _CommitNotAppliedError:
             commit_issued = False
             raise
         finally:
-            self._enqueue_committed(session, commit_issued)
+            self._enqueue_committed(session, commit_issued, succeeded)
 
     async def update_one(
         self,
@@ -4081,51 +4086,137 @@ class SQLStateStore(SQLBlobCatalog):
                 return MarkResult(
                     result.reclaimable, result.finalised, result.legacy, inspected, None
                 )
-            for candidate in ids:
-                run_id = candidate.id
+            async with _live_updates_page(self):
+                for candidate in ids:
+                    run_id = candidate.id
 
-                async def attempt(
-                    row: Any = candidate, run_id: str = run_id
-                ) -> ReclaimableRun | SweptRun | None:
-                    async with self._session_factory() as session:
-                        age = _to_aware_utc(row.last_progress_at or row.created_at)
-                        if (on_stale == "error" or row.lease_expired_at is None) and age >= cutoff:
-                            return None
-                        if row.storage_format == STORAGE_FORMAT_CHECKPOINTED and row.loop not in (
-                            "react",
-                            "single_call",
-                        ):
-                            if on_stale != "error":
-                                _codes.log_code(logger, _codes.LOOP_UNKNOWN, run_id=run_id)
-                            if on_stale is None:
+                    async def attempt(
+                        row: Any = candidate, run_id: str = run_id
+                    ) -> ReclaimableRun | SweptRun | None:
+                        async with self._session_factory() as session:
+                            age = _to_aware_utc(row.last_progress_at or row.created_at)
+                            if (
+                                on_stale == "error" or row.lease_expired_at is None
+                            ) and age >= cutoff:
                                 return None
-                        limit = (
-                            row.reclaim_limit
-                            if row.lease_expired_at is not None and row.reclaim_limit is not None
-                            else reclaim_limit
-                        )
-                        legacy_reason = (
-                            FailureReason.STALE_RUNNING.value
-                            if row.started or on_stale is None
-                            else FailureReason.NEVER_STARTED.value
-                        )
-                        reason = (
-                            legacy_reason
-                            if on_stale == "error"
-                            else FailureReason.STALE_RUNNING_LEGACY.value
-                            if row.storage_format != STORAGE_FORMAT_CHECKPOINTED
-                            else FailureReason.RECLAIM_LIMIT.value
-                            if row.reclaim_attempts >= limit
-                            else legacy_reason
-                            if row.loop != "react"
-                            else None
-                        )
-                        if reason is not None or row.cancel_requested:
-                            flagged = AgentRun.cancel_requested.is_(True)
-                            status_expr = case(
-                                (flagged, RunStatus.CANCELLED.value), else_=RunStatus.ERROR.value
+                            if (
+                                row.storage_format == STORAGE_FORMAT_CHECKPOINTED
+                                and row.loop
+                                not in (
+                                    "react",
+                                    "single_call",
+                                )
+                            ):
+                                if on_stale != "error":
+                                    _codes.log_code(logger, _codes.LOOP_UNKNOWN, run_id=run_id)
+                                if on_stale is None:
+                                    return None
+                            limit = (
+                                row.reclaim_limit
+                                if row.lease_expired_at is not None
+                                and row.reclaim_limit is not None
+                                else reclaim_limit
                             )
-                            changed = (
+                            legacy_reason = (
+                                FailureReason.STALE_RUNNING.value
+                                if row.started or on_stale is None
+                                else FailureReason.NEVER_STARTED.value
+                            )
+                            reason = (
+                                legacy_reason
+                                if on_stale == "error"
+                                else FailureReason.STALE_RUNNING_LEGACY.value
+                                if row.storage_format != STORAGE_FORMAT_CHECKPOINTED
+                                else FailureReason.RECLAIM_LIMIT.value
+                                if row.reclaim_attempts >= limit
+                                else legacy_reason
+                                if row.loop != "react"
+                                else None
+                            )
+                            if reason is not None or row.cancel_requested:
+                                flagged = AgentRun.cancel_requested.is_(True)
+                                status_expr = case(
+                                    (flagged, RunStatus.CANCELLED.value),
+                                    else_=RunStatus.ERROR.value,
+                                )
+                                changed = (
+                                    await self._update_one_rows(
+                                        session,
+                                        table=AgentRun.__table__,
+                                        pk=(run_id,),
+                                        predicate=and_(
+                                            AgentRun.id == run_id,
+                                            AgentRun.status == RunStatus.RUNNING.value,
+                                            AgentRun.claim_epoch == row.claim_epoch,
+                                            or_(
+                                                AgentRun.lease_expired_at.is_not(None)
+                                                if on_stale != "error"
+                                                else False,
+                                                func.coalesce(
+                                                    AgentRun.last_progress_at, AgentRun.created_at
+                                                )
+                                                < cutoff,
+                                            ),
+                                        ),
+                                        values=dict(
+                                            **_status_values(status_expr),
+                                            claim_epoch=AgentRun.claim_epoch + 1,
+                                            failure_reason=reason,
+                                            error=case(
+                                                (flagged, None), else_=f"Run swept as {reason}"
+                                            ),
+                                            pause_data=None,
+                                            pause_requested=False,
+                                            cancel_requested=False,
+                                        ),
+                                        returning=[AgentRun.status],
+                                    )
+                                ).scalar_one_or_none()
+                                if changed is None:
+                                    return None
+                                status = changed
+                                await _insert_event_locked(
+                                    session,
+                                    run_id,
+                                    StoredEventType.RUN_CANCELLED.value
+                                    if status == RunStatus.CANCELLED.value
+                                    else StoredEventType.RUN_INTERRUPTED.value,
+                                    {
+                                        "failure_reason": reason,
+                                        **(
+                                            {"reason": CancelReason.CANCEL_REQUESTED.value}
+                                            if status == RunStatus.CANCELLED.value
+                                            else {}
+                                        ),
+                                    },
+                                    iteration_index=row.iteration_count or 0,
+                                )
+                                self._mark_announce(session, (run_id,))
+                                await self._write_tx(session)
+                                _codes.log_code(
+                                    logger,
+                                    _codes.REGISTRY[
+                                        "legacy_run_swept"
+                                        if reason == FailureReason.STALE_RUNNING_LEGACY.value
+                                        else reason or CancelReason.CANCEL_REQUESTED.value
+                                    ],
+                                    run_id=run_id,
+                                )
+                                return SweptRun(
+                                    run_id,
+                                    row.agent_name,
+                                    RunStatus.RUNNING.value,
+                                    reason or CancelReason.CANCEL_REQUESTED.value,
+                                    _to_aware_utc(row.last_progress_at),
+                                    _dt.datetime.now(_dt.UTC),
+                                    status,
+                                )
+                            if row.lease_expired_at is not None:
+                                return _reclaimable(row)
+                            now = _dt.datetime.now(_dt.UTC)
+                            # This session holds scalar projections, not ORM entities.
+                            # Avoid identity synchronization of the CAS's RETURNING row.
+                            marked = (
                                 await self._update_one_rows(
                                     session,
                                     table=AgentRun.__table__,
@@ -4133,144 +4224,70 @@ class SQLStateStore(SQLBlobCatalog):
                                     predicate=and_(
                                         AgentRun.id == run_id,
                                         AgentRun.status == RunStatus.RUNNING.value,
+                                        AgentRun.storage_format == STORAGE_FORMAT_CHECKPOINTED,
+                                        AgentRun.lease_expired_at.is_(None),
                                         AgentRun.claim_epoch == row.claim_epoch,
-                                        or_(
-                                            AgentRun.lease_expired_at.is_not(None)
-                                            if on_stale != "error"
-                                            else False,
-                                            func.coalesce(
-                                                AgentRun.last_progress_at, AgentRun.created_at
-                                            )
-                                            < cutoff,
-                                        ),
+                                        func.coalesce(
+                                            AgentRun.last_progress_at, AgentRun.created_at
+                                        )
+                                        < cutoff,
                                     ),
                                     values=dict(
-                                        **_status_values(status_expr),
                                         claim_epoch=AgentRun.claim_epoch + 1,
-                                        failure_reason=reason,
-                                        error=case((flagged, None), else_=f"Run swept as {reason}"),
-                                        pause_data=None,
-                                        pause_requested=False,
-                                        cancel_requested=False,
+                                        lease_expired_at=now,
+                                        reclaim_limit=limit,
                                     ),
-                                    returning=[AgentRun.status],
+                                    returning=[*fields],
                                 )
-                            ).scalar_one_or_none()
-                            if changed is None:
-                                return None
-                            status = changed
+                            ).first()
+                            if marked is None:
+                                current = (
+                                    await session.execute(
+                                        select(*fields).where(
+                                            AgentRun.id == run_id,
+                                            AgentRun.status == RunStatus.RUNNING.value,
+                                            AgentRun.lease_expired_at.is_not(None),
+                                        )
+                                    )
+                                ).first()
+                                return _reclaimable(current) if current is not None else None
                             await _insert_event_locked(
                                 session,
                                 run_id,
-                                StoredEventType.RUN_CANCELLED.value
-                                if status == RunStatus.CANCELLED.value
-                                else StoredEventType.RUN_INTERRUPTED.value,
-                                {
-                                    "failure_reason": reason,
-                                    **(
-                                        {"reason": CancelReason.CANCEL_REQUESTED.value}
-                                        if status == RunStatus.CANCELLED.value
-                                        else {}
-                                    ),
-                                },
-                                iteration_index=row.iteration_count or 0,
+                                StoredEventType.RUN_LEASE_EXPIRED.value,
+                                {"gap_s": max(0.0, (now - age).total_seconds())},
                             )
+                            item = _reclaimable(marked)
                             self._mark_announce(session, (run_id,))
                             await self._write_tx(session)
+                            return item
+
+                    item = await retry_transient_db(
+                        attempt,
+                        label="mark_lease_expired",
+                        run_id=run_id,
+                        classify=self.classify_db_error,
+                    )
+                    inspected += 1
+                    after = run_id
+                    if isinstance(item, ReclaimableRun):
+                        result.reclaimable.append(item)
+                    elif isinstance(item, SweptRun):
+                        result.finalised.append(item)
+                        if item.failure_reason == FailureReason.STALE_RUNNING_LEGACY.value:
+                            result.legacy.append(item)
+                    if inspected >= max_runs or len(result.reclaimable) >= max_returned:
+                        if inspected >= max_runs:
                             _codes.log_code(
                                 logger,
-                                _codes.REGISTRY[
-                                    "legacy_run_swept"
-                                    if reason == FailureReason.STALE_RUNNING_LEGACY.value
-                                    else reason or CancelReason.CANCEL_REQUESTED.value
-                                ],
-                                run_id=run_id,
+                                _codes.SWEEP_CAP_REACHED,
+                                category=FailureReason.STALE_RUNNING.value,
+                                cap=max_runs,
+                                inspected=inspected,
                             )
-                            return SweptRun(
-                                run_id,
-                                row.agent_name,
-                                RunStatus.RUNNING.value,
-                                reason or CancelReason.CANCEL_REQUESTED.value,
-                                _to_aware_utc(row.last_progress_at),
-                                _dt.datetime.now(_dt.UTC),
-                                status,
-                            )
-                        if row.lease_expired_at is not None:
-                            return _reclaimable(row)
-                        now = _dt.datetime.now(_dt.UTC)
-                        # This session holds scalar projections, not ORM entities.
-                        # Avoid identity synchronization of the CAS's RETURNING row.
-                        marked = (
-                            await self._update_one_rows(
-                                session,
-                                table=AgentRun.__table__,
-                                pk=(run_id,),
-                                predicate=and_(
-                                    AgentRun.id == run_id,
-                                    AgentRun.status == RunStatus.RUNNING.value,
-                                    AgentRun.storage_format == STORAGE_FORMAT_CHECKPOINTED,
-                                    AgentRun.lease_expired_at.is_(None),
-                                    AgentRun.claim_epoch == row.claim_epoch,
-                                    func.coalesce(AgentRun.last_progress_at, AgentRun.created_at)
-                                    < cutoff,
-                                ),
-                                values=dict(
-                                    claim_epoch=AgentRun.claim_epoch + 1,
-                                    lease_expired_at=now,
-                                    reclaim_limit=limit,
-                                ),
-                                returning=[*fields],
-                            )
-                        ).first()
-                        if marked is None:
-                            current = (
-                                await session.execute(
-                                    select(*fields).where(
-                                        AgentRun.id == run_id,
-                                        AgentRun.status == RunStatus.RUNNING.value,
-                                        AgentRun.lease_expired_at.is_not(None),
-                                    )
-                                )
-                            ).first()
-                            return _reclaimable(current) if current is not None else None
-                        await _insert_event_locked(
-                            session,
-                            run_id,
-                            StoredEventType.RUN_LEASE_EXPIRED.value,
-                            {"gap_s": max(0.0, (now - age).total_seconds())},
+                        return MarkResult(
+                            result.reclaimable, result.finalised, result.legacy, inspected, after
                         )
-                        item = _reclaimable(marked)
-                        self._mark_announce(session, (run_id,))
-                        await self._write_tx(session)
-                        return item
-
-                item = await retry_transient_db(
-                    attempt,
-                    label="mark_lease_expired",
-                    run_id=run_id,
-                    classify=self.classify_db_error,
-                )
-                await _flush_live_updates(self)
-                inspected += 1
-                after = run_id
-                if isinstance(item, ReclaimableRun):
-                    result.reclaimable.append(item)
-                elif isinstance(item, SweptRun):
-                    result.finalised.append(item)
-                    if item.failure_reason == FailureReason.STALE_RUNNING_LEGACY.value:
-                        result.legacy.append(item)
-                if inspected >= max_runs or len(result.reclaimable) >= max_returned:
-                    if inspected >= max_runs:
-                        _codes.log_code(
-                            logger,
-                            _codes.SWEEP_CAP_REACHED,
-                            category=FailureReason.STALE_RUNNING.value,
-                            cap=max_runs,
-                            inspected=inspected,
-                        )
-                    return MarkResult(
-                        result.reclaimable, result.finalised, result.legacy, inspected, after
-                    )
         return MarkResult(result.reclaimable, result.finalised, result.legacy, inspected, after)
 
     async def get_lease_expired(self, *, limit: int, cursor: str | None) -> list[ReclaimableRun]:
@@ -4626,82 +4643,84 @@ class SQLStateStore(SQLBlobCatalog):
                     break
                 visited += len(rows)
                 after = (rows[-1].sweep_age, rows[-1].id) if waiting else rows[-1].id
-                for row in rows:
-                    # Running rows are bounded by live concurrency. Count every
-                    # inspected row against the work cap, including fresh ones.
-                    if not waiting and _to_aware_utc(row.sweep_age) >= cutoff:
-                        continue
-                    reason = (
-                        FailureReason.ABANDONED_WAITING.value
-                        if waiting
-                        else FailureReason.STALE_RUNNING.value
-                        if row.started
-                        else FailureReason.NEVER_STARTED.value
-                    )
-                    flagged = AgentRun.cancel_requested.is_(True)
-                    new_status = (
-                        RunStatus.ERROR.value
-                        if waiting
-                        else case((flagged, RunStatus.CANCELLED.value), else_=RunStatus.ERROR.value)
-                    )
-                    async with self._session_factory() as session:
-                        result = await self._update_one_rows(
-                            session,
-                            table=AgentRun.__table__,
-                            pk=(row.id,),
-                            predicate=and_(
-                                AgentRun.id == row.id,
-                                AgentRun.status == row.status,
-                                AgentRun.claim_epoch == row.claim_epoch,
-                                age < cutoff,
-                                AgentRun.updated_at < cutoff if waiting else true(),
-                            ),
-                            values=dict(
-                                **_status_values(new_status),
-                                claim_epoch=AgentRun.claim_epoch + 1,
-                                failure_reason=reason,
-                                pause_data=None,
-                                error=f"Run swept as {reason}"
-                                if waiting
-                                else case((flagged, None), else_=f"Run swept as {reason}"),
-                                cancel_requested=False,
-                                pause_requested=False,
-                            ),
-                            returning=[AgentRun.status],
-                        )
-                        status = result.scalar_one_or_none()
-                        if status is None:
+                async with _live_updates_page(self):
+                    for row in rows:
+                        # Running rows are bounded by live concurrency. Count every
+                        # inspected row against the work cap, including fresh ones.
+                        if not waiting and _to_aware_utc(row.sweep_age) >= cutoff:
                             continue
-                        event_type = (
-                            StoredEventType.RUN_ABANDONED.value
+                        reason = (
+                            FailureReason.ABANDONED_WAITING.value
                             if waiting
-                            else StoredEventType.RUN_INTERRUPTED.value
+                            else FailureReason.STALE_RUNNING.value
+                            if row.started
+                            else FailureReason.NEVER_STARTED.value
                         )
-                        data = {"failure_reason": reason}
-                        if status == RunStatus.CANCELLED.value:
-                            event_type = StoredEventType.RUN_CANCELLED.value
-                            data["reason"] = CancelReason.CANCEL_REQUESTED.value
-                        await _insert_event_locked(
-                            session,
-                            row.id,
-                            event_type,
-                            data,
-                            iteration_index=row.iteration_count or 0,
+                        flagged = AgentRun.cancel_requested.is_(True)
+                        new_status = (
+                            RunStatus.ERROR.value
+                            if waiting
+                            else case(
+                                (flagged, RunStatus.CANCELLED.value), else_=RunStatus.ERROR.value
+                            )
                         )
-                        self._mark_announce(session, (row.id,))
-                        await self._write_tx(session)
-                    await _flush_live_updates(self)
-                    swept.append(
-                        SweptRun(
-                            run_id=row.id,
-                            agent_name=row.agent_name,
-                            previous_status=row.status,
-                            failure_reason=reason,
-                            last_progress_at=_to_aware_utc(row.last_progress_at),
-                            swept_at=_to_aware_utc(now),
-                            status=status,
+                        async with self._session_factory() as session:
+                            result = await self._update_one_rows(
+                                session,
+                                table=AgentRun.__table__,
+                                pk=(row.id,),
+                                predicate=and_(
+                                    AgentRun.id == row.id,
+                                    AgentRun.status == row.status,
+                                    AgentRun.claim_epoch == row.claim_epoch,
+                                    age < cutoff,
+                                    AgentRun.updated_at < cutoff if waiting else true(),
+                                ),
+                                values=dict(
+                                    **_status_values(new_status),
+                                    claim_epoch=AgentRun.claim_epoch + 1,
+                                    failure_reason=reason,
+                                    pause_data=None,
+                                    error=f"Run swept as {reason}"
+                                    if waiting
+                                    else case((flagged, None), else_=f"Run swept as {reason}"),
+                                    cancel_requested=False,
+                                    pause_requested=False,
+                                ),
+                                returning=[AgentRun.status],
+                            )
+                            status = result.scalar_one_or_none()
+                            if status is None:
+                                continue
+                            event_type = (
+                                StoredEventType.RUN_ABANDONED.value
+                                if waiting
+                                else StoredEventType.RUN_INTERRUPTED.value
+                            )
+                            data = {"failure_reason": reason}
+                            if status == RunStatus.CANCELLED.value:
+                                event_type = StoredEventType.RUN_CANCELLED.value
+                                data["reason"] = CancelReason.CANCEL_REQUESTED.value
+                            await _insert_event_locked(
+                                session,
+                                row.id,
+                                event_type,
+                                data,
+                                iteration_index=row.iteration_count or 0,
+                            )
+                            self._mark_announce(session, (row.id,))
+                            await self._write_tx(session)
+                        swept.append(
+                            SweptRun(
+                                run_id=row.id,
+                                agent_name=row.agent_name,
+                                previous_status=row.status,
+                                failure_reason=reason,
+                                last_progress_at=_to_aware_utc(row.last_progress_at),
+                                swept_at=_to_aware_utc(now),
+                                status=status,
+                            )
                         )
-                    )
         if visited == max_runs:
             _codes.log_code(
                 logger,

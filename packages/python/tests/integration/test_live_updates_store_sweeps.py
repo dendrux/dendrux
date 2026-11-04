@@ -1,5 +1,6 @@
 """Each sweep entry shares one budget and publishes earlier committed runs on failure."""
 
+import json
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock
 
@@ -95,16 +96,17 @@ async def test_all_sweep_boundaries_share_deadline_and_flush_between_sessions(
     flush = AsyncMock(wraps=bus._flush_before)
     monkeypatch.setattr(bus, "_flush_before", flush)
     await invoke(store, entry)
-    assert len(sent(bus)) == 1
-    assert sent(bus)[0] == ids[0]
-    assert bus.stats().pending == len(ids) - 1
+    assert sent(bus) == ids[:2]
+    assert len(bus.messages) == 1
+    assert bus.stats().pending == len(ids) - 2
     assert {call.args[0] for call in flush.await_args_list} == {101.0}
-    assert len(flush.await_args_list) >= len(ids)
+    assert len(flush.await_args_list) == len(ids) // 2 + 1
 
 
+@pytest.mark.parametrize("failed_write", [2, 4])
 @pytest.mark.parametrize("entry", ["sweep", "_scan_expired_runs", "_sweep_runs"])
 async def test_partial_failure_flushes_committed_runs_preserves_error(
-    live_store, engine, monkeypatch, entry
+    live_store, engine, monkeypatch, entry, failed_write
 ):
     store, bus = live_store
     ids = await stale(store, engine, 4)
@@ -116,7 +118,7 @@ async def test_partial_failure_flushes_committed_runs_preserves_error(
     async def fail_second(session, **kwargs):
         nonlocal calls
         calls += 1
-        if calls == 2:
+        if calls == failed_write:
             raise error
         await write(session, **kwargs)
 
@@ -124,7 +126,7 @@ async def test_partial_failure_flushes_committed_runs_preserves_error(
     with pytest.raises(ValueError) as raised:
         await invoke(store, entry)
     assert raised.value is error
-    assert sent(bus) == ids[:1]
+    assert sent(bus) == ids[: failed_write - 1]
     assert bus.stats().pending == 0
 
 
@@ -172,3 +174,90 @@ async def test_refused_sweep_leaves_pending_hints_without_flushing(live_store, k
         await sweep(state_store=store, **kwargs)
     assert bus.stats().pending == 1
     assert sent(bus) == []
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "sweep",
+        "_scan_expired_runs",
+        "_sweep_runs",
+        "mark_lease_expired",
+        "sweep_stale_runs",
+        "sweep_abandoned_runs",
+    ],
+)
+async def test_sweep_sends_one_batched_message_per_page(live_store, engine, monkeypatch, entry):
+    from dendrux.db import _live_updates
+    from dendrux.runtime import durability
+
+    store, bus = live_store
+    ids = await stale(store, engine, 5, waiting=entry == "sweep_abandoned_runs")
+    bus.messages.clear()
+    monkeypatch.setattr(durability, "monotonic", lambda: 100.0)
+    monkeypatch.setattr(_live_updates, "monotonic", lambda: 100.0)
+    await invoke(store, entry)
+    assert [json.loads(message) for message in bus.messages] == [ids[:2], ids[2:4], ids[4:]]
+    assert bus.stats().pending == 0
+
+
+@pytest.mark.parametrize("entry", ["_scan_expired_runs", "_sweep_runs"])
+async def test_failed_commit_in_page_stays_pending_after_earlier_success_flush(
+    live_store, engine, monkeypatch, entry
+):
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from dendrux.errors import StoreOutcomeUnknown
+
+    store, bus = live_store
+    ids = await stale(store, engine, 4)
+    bus.messages.clear()
+    commit = AsyncSession.commit
+    calls = 0
+    error = StoreOutcomeUnknown()
+
+    async def lost_ack(session):
+        nonlocal calls
+        calls += 1
+        await commit(session)
+        if calls == 2:
+            raise error
+
+    with monkeypatch.context() as patch:
+        patch.setattr(AsyncSession, "commit", lost_ack)
+        with pytest.raises(StoreOutcomeUnknown) as raised:
+            await invoke(store, entry)
+    assert raised.value is error
+    assert sent(bus) == ids[:1]
+    assert bus.stats().pending == 1
+    await bus.flush()
+    assert sent(bus) == ids[:2]
+
+
+async def test_successful_retry_in_page_does_not_leave_a_duplicate_hint(
+    live_store, engine, monkeypatch
+):
+    from sqlalchemy.exc import OperationalError
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    class DeadlockError(Exception):
+        sqlstate = "40P01"
+
+    store, bus = live_store
+    ids = await stale(store, engine, 2)
+    bus.messages.clear()
+    commit = AsyncSession.commit
+    calls = 0
+
+    async def retry_once(session):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OperationalError("commit-fault", {}, DeadlockError())
+        await commit(session)
+
+    monkeypatch.setattr(AsyncSession, "commit", retry_once)
+    await invoke(store, "_scan_expired_runs")
+    assert sent(bus) == ids
+    assert len(bus.messages) == 1
+    assert bus.stats().pending == 0

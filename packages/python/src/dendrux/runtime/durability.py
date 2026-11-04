@@ -60,6 +60,9 @@ _live_update_scope: ContextVar[tuple[object, frozenset[int]] | None] = ContextVa
 _sweep_deadlines: ContextVar[tuple[object, dict[int, float]] | None] = ContextVar(
     "dendrux_sweep_deadlines", default=None
 )
+_failed_page_marks: ContextVar[tuple[object, dict[int, set[str]]] | None] = ContextVar(
+    "dendrux_failed_page_marks", default=None
+)
 _SWEEP_BOUNDARIES = frozenset(
     {
         "_scan_expired_runs",
@@ -112,6 +115,34 @@ async def _live_updates_boundary(store: Any, *, sweep: bool = False) -> AsyncIte
     finally:
         if budget_token is not None:
             _sweep_deadlines.reset(budget_token)
+
+
+def _enqueue_live_updates(store: Any, marks: Any, succeeded: bool) -> None:
+    deferred = _task_values(_failed_page_marks.get(), {}).get(id(store))
+    if not succeeded and deferred is not None:
+        deferred.update(marks)
+        return
+    if deferred is not None:
+        deferred.difference_update(marks)
+    store.live_updates.enqueue(marks)
+
+
+@asynccontextmanager
+async def _live_updates_page(store: Any) -> AsyncIterator[None]:
+    deferred: set[str] = set()
+    pages = _task_values(_failed_page_marks.get(), {})
+    token = _failed_page_marks.set((asyncio.current_task(), {**pages, id(store): deferred}))
+    try:
+        yield
+    finally:
+        try:
+            await _flush_live_updates(store)
+        finally:
+            _failed_page_marks.reset(token)
+            # A failed COMMIT's hints wait for the next successful boundary,
+            # after earlier successful candidates in this page have flushed.
+            if deferred:
+                store.live_updates.enqueue(deferred)
 
 
 def _sweep_budget(store: Any, sweep: bool) -> Any:
