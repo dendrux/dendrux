@@ -270,7 +270,7 @@ def _checked_channel(channel: object) -> str:
 def _is_utf8(name: object) -> bool:
     try:
         return isinstance(name, str) and codecs.lookup(name).name == "utf-8"
-    except LookupError:
+    except (LookupError, UnicodeError, ValueError, TypeError):
         return False
 
 

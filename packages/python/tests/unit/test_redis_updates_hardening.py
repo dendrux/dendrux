@@ -512,3 +512,37 @@ async def test_real_parser_eviction_preserves_active_bounds_and_rechecks_misses(
     with pytest.raises(ru._OversizeMessageError):
         await asyncio.wait_for(parser.read_response(), 1)
     await active.close()
+
+
+def assert_encoding_refused(path: str, value: str) -> None:
+    url = f"redis://{HOST}/0"
+    options = (
+        {"url": url + "?encoding=" + value}
+        if path == "url"
+        else {"url": url, "client_options": {"encoding": value}}
+    )
+    with pytest.raises(ValueError) as caught:
+        ru.RedisUpdates(**options)
+    error = caught.value
+    expected = f"{path} encoding must be utf-8, the encoding of the wire format"
+    assert str(error) == expected
+    assert repr(error) == repr(ValueError(expected))
+    assert error.__cause__ is None
+    assert error.__context__ is None
+
+
+@pytest.mark.parametrize("path", ["url", "client_options"])
+def test_real_surrogate_encoding_is_refused_without_disclosure(path: str) -> None:
+    assert_encoding_refused(path, chr(0xD800) + "secret-sentinel")
+
+
+@pytest.mark.parametrize("path", ["url", "client_options"])
+@pytest.mark.parametrize("failure", [LookupError, UnicodeError, ValueError, TypeError])
+def test_codec_validation_errors_are_refused_without_disclosure(
+    monkeypatch: pytest.MonkeyPatch, path: str, failure: type[Exception]
+) -> None:
+    def lookup(name: str) -> Any:
+        raise failure("secret-sentinel")
+
+    monkeypatch.setattr(ru.codecs, "lookup", lookup)
+    assert_encoding_refused(path, "secret-sentinel")
