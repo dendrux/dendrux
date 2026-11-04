@@ -143,15 +143,16 @@ test-dbs-up:
 test-dbs-down:
 	$(TEST_DBS) down -v
 
-# Redis for the RedisUpdates tests (docker/test-dbs.compose.yml, service redis, 127.0.0.1:56379).
-# The tests skip cleanly when DENDRUX_TEST_REDIS_URL is unset; GitHub CI runs them on a service.
+# Redis for the RedisUpdates tests (docker/test-redis.compose.yml, 127.0.0.1:56379). The tests
+# skip cleanly when DENDRUX_TEST_REDIS_URL is unset; GitHub CI runs them on a service container.
+TEST_REDIS = docker compose -f docker/test-redis.compose.yml
 REDIS_TEST_URL ?= redis://127.0.0.1:56379/0
 
 test-redis-up:
-	$(TEST_DBS) up -d --wait redis
+	$(TEST_REDIS) up -d --wait
 
 test-redis-down:
-	$(TEST_DBS) rm -sfv redis
+	$(TEST_REDIS) down -v
 
 test-redis: test-model-check
 	DENDRUX_TEST_REDIS_URL=$(REDIS_TEST_URL) pytest tests/unit/test_redis_updates*.py tests/integration/test_redis_updates*.py -n $(TEST_WORKERS) -rs --no-cov -q

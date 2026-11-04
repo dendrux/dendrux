@@ -1,0 +1,23 @@
+# Test Redis for the RedisUpdates suite (CI runs the same image as a service container).
+#
+#   make test-redis-up     # start it, wait until healthy
+#   make test-redis        # DENDRUX_TEST_REDIS_URL=redis://127.0.0.1:56379/0 pytest ...
+#   make test-redis-down   # stop and remove it
+#
+# Only this one container is ever touched. It listens on 127.0.0.1 only, is capped at 256 MB,
+# keeps nothing on disk (Pub/Sub only) and cannot grow past 128 MB. Data is disposable.
+name: dendrux-test-redis
+
+services:
+  redis:
+    image: redis:7@sha256:b6b6e3dc0c0952737748e55d5d885272840c7e42ba41ab1d5489f693419882f5
+    container_name: dendrux-test-redis
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "128mb"]
+    ports:
+      - "127.0.0.1:56379:6379"
+    mem_limit: 256m
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
