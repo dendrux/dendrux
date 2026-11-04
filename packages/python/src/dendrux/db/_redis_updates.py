@@ -22,6 +22,7 @@ from contextlib import suppress
 from time import monotonic
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
+from urllib.parse import parse_qsl, urlsplit
 
 from dendrux.db._live_updates import LiveUpdates
 
@@ -49,6 +50,8 @@ _FORBIDDEN_OPTIONS = frozenset(
         "host",
         "port",
         "unix_socket_path",
+        "protocol",
+        "parser_class",
     }
 )
 _POOL_ATTRIBUTES = ("_in_use_connections", "_available_connections")
@@ -97,6 +100,15 @@ class _Redacted:
 def _checked_url(url: object) -> str:
     if not isinstance(url, str) or not url.startswith(_SCHEMES):
         raise ValueError("url must be a string starting with redis://, rediss:// or unix://")
+    # redis-py lets a query parameter override a keyword argument, so the fixed settings must be
+    # refused here too; parse_qsl decodes keys exactly as redis-py's URL parser does
+    query = parse_qsl(urlsplit(url).query)
+    refused = sorted({key for key, _ in query if key in _FORBIDDEN_OPTIONS})
+    if refused:
+        raise ValueError(
+            "url may not set " + ", ".join(refused) + " in its query: RedisUpdates fixes the "
+            "timeouts, retries, protocol and single connection"
+        )
     return url
 
 
