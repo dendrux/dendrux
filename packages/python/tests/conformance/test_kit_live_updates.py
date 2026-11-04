@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -170,9 +171,14 @@ def test_a_store_that_announces_correctly_passes_every_live_contract(
     result.stdout.fnmatch_lines(["*live_updates*7 passed*"])
 
 
-def test_a_single_process_store_is_read_back_through_itself(pytester: pytest.Pytester) -> None:
+def test_a_store_with_no_independent_reader_is_reported_as_unverified_not_passed(
+    pytester: pytest.Pytester,
+) -> None:
+    """In-memory SQLite has no second connection: visibility cannot be checked, and says so."""
     result = run_live(pytester, kind="sqlite-memory")
-    result.assert_outcomes(passed=CONTRACTS)
+    result.assert_outcomes(passed=1, skipped=CONTRACTS - 1)  # only the not-applied case is whole
+    result.stdout.fnmatch_lines(["*unverified: live-update visibility on a second connection*"])
+    assert "failed" not in result.parseoutcomes()
 
 
 T_CREATE = "test_live_a_created_run_is_announced_after_its_row_is_visible_elsewhere"
@@ -215,3 +221,119 @@ def test_without_a_fault_injector_only_the_commit_cases_skip(pytester: pytest.Py
     result = run_live(pytester, injector=False)
     result.assert_outcomes(passed=3, skipped=CONTRACTS - 3)
     result.stdout.fnmatch_lines(["*crash recovery: not certified*"])
+
+
+# -- a store that publishes before its commit, but whose own reads see the staged state --------
+
+
+class StagedStore:
+    """Announces before COMMIT. Its own reads see staged rows; another connection sees only the
+    committed ones. Nothing here talks to a database."""
+
+    def __init__(self, updates: Any, *, early: bool) -> None:
+        self.updates = updates
+        self.early = early
+        self.rows: dict[str, SimpleNamespace] = {}
+        self.items: dict[str, list[dict[str, Any]]] = {}
+        self.committed_rows: dict[str, SimpleNamespace] = {}
+        self.committed_items: dict[str, list[dict[str, Any]]] = {}
+        updates.bind(self)
+
+    async def _commit(self, run_id: str) -> None:
+        if self.early:
+            self.updates.enqueue([run_id])
+            await self.updates.flush()  # before the data is committed
+        self.committed_rows = dict(self.rows)
+        self.committed_items = {key: list(value) for key, value in self.items.items()}
+        if not self.early:
+            self.updates.enqueue([run_id])
+            await self.updates.flush()
+
+    async def create_run(self, run_id: str, name: str, **kwargs: Any) -> SimpleNamespace:
+        self.rows[run_id] = SimpleNamespace(run_id=run_id, storage_format=1, status="running")
+        self.items[run_id] = []
+        await self._commit(run_id)
+        return self.rows[run_id]
+
+    async def get_run(self, run_id: str) -> SimpleNamespace | None:
+        return self.rows.get(run_id)
+
+    async def get_run_events(self, run_id: str) -> list[dict[str, Any]]:
+        return self.items.get(run_id, [])
+
+    async def save_run_event(self, run_id: str, **kwargs: Any) -> None:
+        self.items[run_id].append(kwargs)
+        await self._commit(run_id)
+
+    async def finalize_run(self, run_id: str, status: str, **kwargs: Any) -> None:
+        self.rows[run_id] = SimpleNamespace(run_id=run_id, storage_format=1, status=status)
+        await self._commit(run_id)
+
+    async def close(self) -> None:
+        await self.updates.close()
+
+
+class CommittedReader:
+    def __init__(self, store: StagedStore) -> None:
+        self.store = store
+
+    async def get_run(self, run_id: str) -> SimpleNamespace | None:
+        return self.store.committed_rows.get(run_id)
+
+    async def get_run_events(self, run_id: str) -> list[dict[str, Any]]:
+        return self.store.committed_items.get(run_id, [])
+
+
+VISIBILITY_CONTRACTS = (
+    "test_live_a_created_run_is_announced_after_its_row_is_visible_elsewhere",
+    "test_live_a_run_event_is_announced_after_the_event_is_visible_elsewhere",
+    "test_live_a_status_change_is_announced_after_the_new_status_is_visible_elsewhere",
+)
+
+
+async def run_visibility_contracts(
+    *, early: bool, reader: str, needs_second: bool
+) -> dict[str, str]:
+    """Outcome of each visibility contract: passed, failed or skipped."""
+    from dendrux.testing.store_kit._declaration import LIVE_FACTORY, SECOND_INSTANCE
+    from dendrux.testing.store_kit._kit import Kit
+    from dendrux.testing.store_kit.contracts import test_live_updates as contracts
+
+    def second(store: StagedStore) -> CommittedReader:
+        if reader == "raises":
+            raise RuntimeError("an in-memory database has no second connection")
+        return CommittedReader(store)
+
+    provided: dict[str, Any] = {LIVE_FACTORY: lambda updates: StagedStore(updates, early=early)}
+    if reader != "none":
+        provided[SECOND_INSTANCE] = second
+    declaration = SimpleNamespace(needs_second_instance=needs_second, has=lambda name: False)
+    outcomes: dict[str, str] = {}
+    for name in VISIBILITY_CONTRACTS:
+        kit = Kit(provided, None, declaration, needs_format_2=False)
+        try:
+            await getattr(contracts, name)(kit)
+            outcomes[name] = "passed"
+        except AssertionError:
+            outcomes[name] = "failed"
+        except pytest.skip.Exception as skipped:
+            assert "unverified:" in str(skipped)
+            outcomes[name] = "skipped"
+    return outcomes
+
+
+async def test_an_independent_reader_is_used_even_for_a_single_process_store() -> None:
+    """The reviewer's case: staged reads hide the early announcement unless another reader looks."""
+    outcomes = await run_visibility_contracts(early=True, reader="available", needs_second=False)
+    assert set(outcomes.values()) == {"failed"}, outcomes
+
+
+async def test_a_store_that_announces_after_commit_passes_with_an_independent_reader() -> None:
+    outcomes = await run_visibility_contracts(early=False, reader="available", needs_second=False)
+    assert set(outcomes.values()) == {"passed"}, outcomes
+
+
+@pytest.mark.parametrize("reader", ["none", "raises"])
+async def test_without_an_independent_reader_visibility_is_untested_not_passed(reader: str) -> None:
+    outcomes = await run_visibility_contracts(early=True, reader=reader, needs_second=False)
+    assert set(outcomes.values()) == {"skipped"}, outcomes

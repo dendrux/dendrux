@@ -43,6 +43,7 @@ async def test_live_a_created_run_is_announced_after_its_row_is_visible_elsewher
         assert seen is not None and seen.exists, (
             "create_run announced the run before a second connection could see its row"
         )
+        stored.visibility_checked()
 
 
 @live
@@ -59,6 +60,7 @@ async def test_live_a_run_event_is_announced_after_the_event_is_visible_elsewher
             "save_run_event announced the run before a second connection could see its event"
         )
         assert stored.updates.batches[0].probe_error is None
+        stored.visibility_checked()
 
 
 @live
@@ -74,6 +76,7 @@ async def test_live_a_status_change_is_announced_after_the_new_status_is_visible
         assert seen is not None and seen.status == RunStatus.SUCCESS.value, (
             "finalize_run announced the run before a second connection could see its new status"
         )
+        stored.visibility_checked()
 
 
 @live_not_applied
@@ -126,3 +129,4 @@ async def test_live_a_commit_that_was_issued_is_announced_even_when_the_call_fai
         assert run_id in stored.updates.ids, "a write whose COMMIT was issued was never announced"
         seen = stored.seen_when_announced(run_id)
         assert seen is not None and seen.events == 1
+        stored.visibility_checked()

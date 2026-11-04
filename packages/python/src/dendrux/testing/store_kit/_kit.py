@@ -101,12 +101,23 @@ class LiveStore:
 
     store: Any
     updates: RecordingLiveUpdates
-    #: A second instance (its own connection) when the deployment has one, else the store itself.
+    #: A second instance (its own connection) when one is available, else the store itself.
     reader: Any
     kit: Kit
+    #: Whether ``reader`` is independent of the writing store. If not, what it sees may include
+    #: the store's staged, uncommitted state, so visibility after commit cannot be certified.
+    independent: bool = False
 
     async def new_run(self, **kwargs: Any) -> str:
         return await self.kit.new_run(self.store, **kwargs)
+
+    def visibility_checked(self) -> None:
+        """End a visibility contract: skip as unverified unless an independent reader looked."""
+        if not self.independent:
+            pytest.skip(
+                "unverified: live-update visibility on a second connection: no independent "
+                f"reader is available ({SECOND_INSTANCE} is missing or cannot make one)"
+            )
 
     async def settle(self) -> None:
         """Send whatever is pending and forget it: what follows starts from a clean record."""
@@ -193,12 +204,16 @@ class Kit:
             pytest.skip(f"{LIVE_FACTORY} not provided: live updates are not tested")
         updates = RecordingLiveUpdates()
         store = await maybe_await(factory(updates))
-        reader = store
-        if self.declaration.needs_second_instance and self._provided.get(SECOND_INSTANCE):
-            reader = await self.second(store)
+        reader, independent = store, False
+        if self._provided.get(SECOND_INSTANCE) is not None:
+            try:
+                reader, independent = await self.second(store), True
+            except Exception:
+                if self.declaration.needs_second_instance:
+                    raise  # this store promised a second instance; failing to make one is a failure
         updates.probe = lambda ids: _probe(reader, ids)
         try:
-            yield LiveStore(store, updates, reader, self)
+            yield LiveStore(store, updates, reader, self, independent)
         finally:
             try:
                 closer = getattr(store, "close", None)
