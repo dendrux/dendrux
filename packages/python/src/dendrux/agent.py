@@ -620,7 +620,9 @@ class Agent:
         self._database_url = database_url
         from dendrux.db._engine_options import split_database_options
 
-        self._database_options, self._store_options = split_database_options(database_options)
+        self._database_options, self._store_options = split_database_options(
+            database_options, replacement="use Agent(state_store=...)"
+        )
         if state_store is not None:
             from dendrux.runtime._capabilities import validate_capabilities
 
@@ -3426,11 +3428,19 @@ class Agent:
         with self._store_lock:
             self._store_generation += 1
             engine, self._private_engine = self._private_engine, None
+            owned_store = self._lazy_store
             if engine is not None:
                 self._lazy_store = None
         if engine is not None:
             from dendrux.db._shared_pool import release
 
+            await self._close_owned_store(owned_store, engine, release)
+
+    async def _close_owned_store(self, store: Any, engine: Any, release: Any) -> None:
+        try:
+            if store is not None:
+                await store.close()
+        finally:
             await release(engine)
 
     async def __aenter__(self) -> Agent:

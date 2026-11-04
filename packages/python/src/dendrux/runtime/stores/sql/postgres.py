@@ -12,7 +12,11 @@ from dendrux.runtime.durability import _safe_database_call
 from dendrux.runtime.stores.sql.base import SQLStateStore
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from sqlalchemy.ext.asyncio import AsyncEngine
+
+    from dendrux.db._live_updates import LiveUpdates
 
 
 class PostgresStateStore(SQLStateStore):
@@ -36,14 +40,61 @@ class PostgresStateStore(SQLStateStore):
             {"timeout": f"{_COMMIT_READBACK_LOCK_TIMEOUT_MS}ms"},
         )
 
-    def __init__(self, engine: AsyncEngine, *, notify_channel: str | None = None) -> None:
+    def __init__(
+        self,
+        engine: AsyncEngine,
+        *,
+        notify_channel: str | None = None,
+        live_updates: LiveUpdates | bool | None = None,
+    ) -> None:
         from dendrux.db._notify import validate_channel
 
         if notify_channel is not None:
             validate_channel(notify_channel)
-        super().__init__(engine)
+        super().__init__(engine, live_updates=live_updates)
         self.notify_channel = notify_channel
         self.capabilities = replace(self.capabilities, deployment="multi_server")
+
+    def _native_live_updates(self) -> LiveUpdates | None:
+        from importlib import import_module
+
+        from dendrux.errors import LiveUpdatesUnavailableError
+
+        try:
+            module = import_module("._postgres_updates", package="dendrux.db")
+        except ModuleNotFoundError as error:
+            if error.name != "dendrux.db" + "._postgres_updates":
+                raise
+            # Step B supplies the native transport; explicit buses work already.
+            raise LiveUpdatesUnavailableError() from None
+        return cast("LiveUpdates", module.PostgresUpdates())
+
+    def events_for_runs_query(self, heads: Mapping[str, int], *, limit_per_run: int) -> Any:
+        """Use indexed per-run LATERAL scans over two bound arrays."""
+        from sqlalchemy import Integer, Text, bindparam, column, func, select, true
+        from sqlalchemy.dialects.postgresql import ARRAY
+
+        from dendrux.db.models import RunEvent
+
+        inputs = (
+            func.unnest(
+                bindparam("run_ids", list(heads), type_=ARRAY(Text)),
+                bindparam("run_heads", list(heads.values()), type_=ARRAY(Integer)),
+            )
+            .table_valued(column("run_id", Text), column("head", Integer))
+            .render_derived(name="heads")
+        )
+        events = (
+            select(RunEvent.__table__)
+            .where(
+                RunEvent.agent_run_id == inputs.c.run_id,
+                RunEvent.sequence_index > inputs.c.head,
+            )
+            .order_by(RunEvent.sequence_index)
+            .limit(limit_per_run)
+            .lateral("events")
+        )
+        return select(events).select_from(inputs.join(events, true()))
 
     def _insert(self, table: Any) -> Any:
         from sqlalchemy.dialects.postgresql import insert

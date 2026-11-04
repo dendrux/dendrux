@@ -130,10 +130,11 @@ def frozen_options(value: Any) -> Any:
 
 def split_database_options(
     supplied: dict[str, Any] | None,
+    *,
+    replacement: str = "build a store with live_updates=... and pass it to Agent/sweep/RunStore",
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Keep store-only configuration away from SQLAlchemy engine construction."""
     engine = dict(supplied or {})
-    store = {}
-    if "notify_channel" in engine:
-        store["notify_channel"] = engine.pop("notify_channel")
-    return engine, store
+    if {"live_updates", "notify_channel"}.intersection(engine):
+        raise ValueError(f"Live updates require an explicit store; {replacement}")
+    return engine, {}
