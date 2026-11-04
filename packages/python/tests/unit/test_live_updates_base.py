@@ -756,7 +756,9 @@ async def test_close_waits_inflight_final_flush_and_closes_once():
     concurrent = asyncio.create_task(bus.close())
     bus.enqueue(["late"])
     assert bus.stats().dropped_closed == 1
-    assert bus.sender_closes == 0
+    done, _ = await asyncio.wait({closing}, timeout=0.02)
+    assert not done
+    assert bus.sender_closes == bus.stops == 0
     finish.set()
     await asyncio.gather(flushing, closing, concurrent)
     assert bus.sender_closes == 1
@@ -913,8 +915,8 @@ async def test_reconnect_health_falls_before_slow_iterator_cleanup():
     lease = await bus.acquire_listener()
     await until(lambda: bus.healthy)
     fail.set()
-    await closing.wait()
     try:
+        await until(closing.is_set)
         assert not bus.healthy
     finally:
         cleanup.set()
@@ -987,3 +989,58 @@ async def test_flush_before_keeps_loop_and_closed_guards():
     calls = len(bus.calls)
     await bus._flush_before(live.monotonic() + 10)
     assert len(bus.calls) == calls
+
+
+@pytest.mark.asyncio
+async def test_send_backoff_resets_after_recovery(monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr(live, "monotonic", lambda: now[0])
+    bus = Bus(backoff_initial_s=0.5, backoff_max_s=4)
+
+    async def fail():
+        raise OSError("VENDOR_SECRET")
+
+    bus.action = fail
+    for i, window in enumerate((0.5, 1, 2)):
+        bus.enqueue([str(i)])
+        await bus.flush()
+        assert bus._next_attempt_at == now[0] + window
+        now[0] += window
+    bus.action = None
+    bus.enqueue(["recovered"])
+    await bus.flush()
+    bus.action = fail
+    bus.enqueue(["failed-again"])
+    await bus.flush()
+    assert bus._next_attempt_at == now[0] + 0.5
+    bus.enqueue(["retry"])
+    await bus.flush()
+    assert len(bus.calls) == 5
+    now[0] += 0.5
+    bus.action = None
+    await bus.flush()
+    assert len(bus.calls) == 6
+
+
+@pytest.mark.asyncio
+async def test_acquire_refuses_overlap_with_listener_that_will_not_stop():
+    bus = ListeningBus(close_timeout_s=0.01)
+    lease = await bus.acquire_listener()
+    await until(lambda: bus.healthy)
+    bus.stop_gate = asyncio.Event()
+    bus.abort_listener = lambda: None
+    old_task = bus._listener_task
+    try:
+        await bus.release_listener(lease)
+        with pytest.raises(errors.LiveUpdatesUnavailableError) as caught:
+            async with asyncio.timeout(1):
+                await bus.acquire_listener()
+        assert caught.value.reason == "timeout"
+        assert bus._listener_task is old_task
+        assert not old_task.done()
+        assert bus.starts == 1
+        assert not bus._leases
+    finally:
+        bus.stop_gate.set()
+        await until(old_task.done)
+        await bus.close()
