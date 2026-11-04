@@ -16,12 +16,15 @@ Your app already stores something Dendrux does not: the order of runs in a conve
 ```python
 result = await agent.run(
     user_text,
+    tenant_id=tenant,           # the authenticated tenant; replayed runs must share it
     runs=thread.run_ids,        # ordered run ids of this conversation (yours)
     replay_last="all",          # replay every one of them in full
     replay_reasoning=True,      # and their reasoning, while the prefix allows
 )
 thread.run_ids.append(result.run_id)
 ```
+
+Pass the same authenticated `tenant_id` for the new run and for every run in `runs=`; an agent with a state store and the default `strict_tenancy=True` raises `TenantScopeRequiredError` without it (`tenant_id=None` is the explicit choice for an untenanted app).
 
 Dendrux rebuilds each run from its own `react_traces` (user message as it was sent, assistant text, tool calls, tool results, reasoning blocks) and puts them ahead of the new input. The exact prompt is in `llm_interactions.provider_request` as always. On a format-2 store the new run stores the messages it replayed again, as seed rows of its own, so storage grows with how much you replay; see [History storage grows with replay](/docs/guides/scaling#history-storage-grows-with-replay). `agent.stream()` takes the same three arguments.
 

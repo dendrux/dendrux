@@ -90,7 +90,7 @@ Structured log lines carry a stable `code`. Group alerts by that field and corre
 | `lease_renew_failed`, `lease_lost` | Sustained renew failures or any lost lease: inspect database latency, availability and event-loop stalls |
 | `run_fenced` | A small burst after reclaim is expected; a sustained rate calls for checking worker turnover and lease sizing |
 | `live_updates_degraded` | Lasting over one minute: inspect the listener's connection to the bus (for Postgres, the primary through a direct or session-pool endpoint). Readers poll meanwhile |
-| `live_updates_unavailable` | The listener cannot become ready: check reachability and the channel; reads use polling and retry after 30 seconds |
+| `live_updates_unavailable` | The reader could not take its listener lease (the instance is closed, or an earlier listener would not stop): reads use polling and the reader asks again after 30 seconds. Connection failures show as `live_updates_degraded` instead |
 | `live_updates_missed_hint` | A healthy safety poll found new events that no hint announced, once per watched run: verify that every writer's store has live updates on the same bus and channel as the readers |
 | `live_updates_send_failed` | A writer's announcement failed and sending is backing off. The database commit is unaffected; check the bus. Sustained, the writer's readers fall back to the safety poll |
 | `live_updates_overflow`, `live_updates_many_stores` | Pending announcements overflowed, or a process holds many open stores for one database: share one store per database and close the rest |
