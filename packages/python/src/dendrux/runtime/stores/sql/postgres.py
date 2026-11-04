@@ -50,18 +50,9 @@ class PostgresStateStore(SQLStateStore):
         self.capabilities = replace(self.capabilities, deployment="multi_server")
 
     def _native_live_updates(self) -> LiveUpdates | None:
-        from importlib import import_module
+        from dendrux.db._postgres_updates import PostgresUpdates
 
-        from dendrux.errors import LiveUpdatesUnavailableError
-
-        try:
-            module = import_module("._postgres_updates", package="dendrux.db")
-        except ModuleNotFoundError as error:
-            if error.name != "dendrux.db" + "._postgres_updates":
-                raise
-            # Step B supplies the native transport; explicit buses work already.
-            raise LiveUpdatesUnavailableError() from None
-        return cast("LiveUpdates", module.PostgresUpdates())
+        return PostgresUpdates()
 
     def events_for_runs_query(self, heads: Mapping[str, int], *, limit_per_run: int) -> Any:
         """Use indexed per-run LATERAL scans over two bound arrays."""

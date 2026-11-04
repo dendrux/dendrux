@@ -8,6 +8,12 @@ from sqlalchemy import event
 from dendrux.types import UsageStats
 
 
+def _assert_live_update_send(store, enabled):
+    if enabled:
+        assert store.live_updates is not None
+        assert store.live_updates.stats().sent > 0
+
+
 @pytest.mark.parametrize("streaming", [False, True])
 @pytest.mark.parametrize("live_enabled", [False, True])
 async def test_live_updates_iteration_statement_budget(
@@ -129,6 +135,7 @@ async def test_live_updates_iteration_statement_budget(
             result = events[-1].run_result
         else:
             result = await agent.run("go", notifier=Observer())
+        _assert_live_update_send(store, live_enabled)
     finally:
         event.remove(engine.sync_engine, "begin", begin)
         event.remove(engine.sync_engine, "before_cursor_execute", capture)
