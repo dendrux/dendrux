@@ -358,3 +358,53 @@ def test_real_a_url_encoding_that_is_not_utf8_is_refused(query: str) -> None:
 @pytest.mark.parametrize("query", ["encoding=utf-8", "encoding=UTF8", "enc%6Fding=u%74f-8"])
 def test_real_a_utf8_url_encoding_is_accepted(query: str) -> None:
     assert ru.RedisUpdates(f"redis://{HOST}/0?{query}", **FAST)
+
+
+# -- V4: the whole probe hangs off one absolute deadline (idle deadline + probe budget) ---------
+
+
+async def test_a_late_idle_read_is_charged_against_the_probe_budget(world: FakeWorld) -> None:
+    world.pong_mode = "silent"
+    updates = make(health_check_s=0.1, send_timeout_s=0.5, flush_deadline_s=1.0)
+    iterator = updates.receive()
+    await anext(iterator)
+    subscription = updates._wire.subscription
+    assert subscription is not None
+    idle_until = subscription._idle_until
+    pubsub = world.pubsubs[0]
+    original = pubsub.get_message
+    late = True
+
+    async def get_message(**kwargs: Any) -> Any:
+        nonlocal late
+        if late:  # the idle read comes back after its own timeout, but inside the grace
+            late = False
+            await asyncio.sleep(0.15)
+            return None
+        return await original(**kwargs)
+
+    pubsub.get_message = get_message  # type: ignore[method-assign]
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(anext(iterator), 5)
+    assert pubsub.pings, "the probe still ran"
+    # the pong deadline did not get a fresh full budget after the late return
+    assert subscription._pong_by <= idle_until + updates.health_check_s + 1e-6
+
+
+async def test_an_idle_read_that_returns_after_the_whole_budget_never_pings(
+    world: FakeWorld,
+) -> None:
+    updates = make(health_check_s=0.05, send_timeout_s=0.5, flush_deadline_s=1.0)
+    iterator = updates.receive()
+    await anext(iterator)
+    pubsub = world.pubsubs[0]
+
+    async def get_message(**kwargs: Any) -> Any:
+        await asyncio.sleep(0.3)  # longer than idle (50 ms) plus probe (50 ms)
+        return None
+
+    pubsub.get_message = get_message  # type: ignore[method-assign]
+    with pytest.raises(TimeoutError) as caught:
+        await asyncio.wait_for(anext(iterator), 5)
+    assert "Redis live updates" in str(caught.value)
+    assert pubsub.pings == []

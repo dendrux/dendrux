@@ -233,13 +233,22 @@ class _Subscription:
         self.owner = owner
         self.pool = owner._new_pool(owner.send_timeout_s * 4, listening=True)
         self.pubsub = owner._api.Redis(connection_pool=self.pool).pubsub()
-        self._idle_until = monotonic() + owner.health_check_s
-        self._token: str | None = None
-        self._pong_by = 0.0
         #: Probe budget: writing the PING and waiting for its pong. Clamped to the health-check
         #: interval so detection (idle wait + probe) never exceeds twice that interval.
         self.probe_s = min(owner.send_timeout_s * 4, owner.health_check_s)
+        self._token: str | None = None
+        self._idle_until = self._detect_by = self._pong_by = 0.0
+        self._alive()
         owner._wire.subscription = self
+
+    def _alive(self) -> None:
+        """Proof of life: restart the idle wait. One absolute deadline then covers everything
+        that follows (idle wait, PING write, pong wait, and whatever redis-py does around them).
+        While a PING is outstanding only its pong counts: other traffic does not move it."""
+        if self._token is not None:
+            return
+        self._idle_until = monotonic() + self.owner.health_check_s
+        self._detect_by = self._idle_until + self.probe_s
 
     def abort(self) -> None:
         _abort_transports(self.pool, [getattr(self.pubsub, "connection", None)])
@@ -255,7 +264,7 @@ class _Subscription:
                 )
                 if self._acknowledges(reply):
                     break
-        self._idle_until = monotonic() + owner.health_check_s
+        self._alive()
 
     def _acknowledges(self, reply: Any) -> bool:
         return (
@@ -267,39 +276,38 @@ class _Subscription:
     async def step(self) -> str | _Gap | None:
         """Read at most one reply; the next message or gap to yield, or ``None`` to go on.
 
-        Every wait is enclosed in an absolute deadline, so nothing redis-py does around a read
-        (a reconnect, a handshake) can outlast it.
+        The read sits inside the absolute detection deadline, so nothing redis-py does around it
+        (a reconnect, a handshake) can outlast the budget, and a late return is charged to it.
         """
-        probing = self._token is not None
-        deadline = self._pong_by if probing else self._idle_until
+        deadline = self._pong_by if self._token is not None else self._idle_until
         wait = deadline - monotonic()
         if wait <= 0:
             await self._on_silence()
             return None
-        grace = 0.0 if probing else min(self.owner.send_timeout_s, self.owner.health_check_s)
-        async with asyncio.timeout(wait + grace):
+        async with asyncio.timeout(self._detect_by - monotonic()):
             reply = await self.pubsub.get_message(ignore_subscribe_messages=False, timeout=wait)
         return self._interpret(reply) if isinstance(reply, dict) else None
 
     def _interpret(self, reply: dict[str, Any]) -> str | _Gap | None:
         kind = reply.get("type")
         if kind == "message":
-            self._idle_until = monotonic() + self.owner.health_check_s
+            self._alive()
             return _text(reply.get("data"))
         if kind == "pong" and self._token is not None and _text(reply.get("data")) == self._token:
             self._token = None
-            self._idle_until = monotonic() + self.owner.health_check_s
+            self._alive()
         elif self._acknowledges(reply):
             # a second subscribe acknowledgement means the client resubscribed behind our back
             return LiveUpdates.GAP
         return None
 
     async def _on_silence(self) -> None:
-        if self._token is not None:
+        remaining = self._detect_by - monotonic()
+        if self._token is not None or remaining <= 0:  # no pong in time, or no budget left to ask
             raise TimeoutError
         self._token = secrets.token_hex(8)
-        self._pong_by = monotonic() + self.probe_s
-        async with asyncio.timeout(self.probe_s):
+        self._pong_by = self._detect_by
+        async with asyncio.timeout(remaining):
             await self.pubsub.ping(self._token)
 
     async def close(self) -> None:
