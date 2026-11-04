@@ -827,14 +827,14 @@ async def _safety_poll_finds(state: BatchedState, clock: Clock, run: str) -> Non
     await ticks()
 
 
-async def test_missed_hint_is_logged_once_after_the_grace_period(clock: Clock, caplog: Any) -> None:
+async def test_missed_hint_is_logged_once_at_first_discovery(clock: Clock, caplog: Any) -> None:
     caplog.set_level(logging.WARNING)
     state = BatchedState()
     state.create("01JBQX7Q6Z1K7Y4ZZZZZZZZZZ1")
     feed = _feed(_store(state))
     await _healthy(state, feed.store, feed, "01JBQX7Q6Z1K7Y4ZZZZZZZZZZ1")
     await _safety_poll_finds(state, clock, "01JBQX7Q6Z1K7Y4ZZZZZZZZZZ1")
-    assert not _missed(caplog)
+    assert len(_missed(caplog)) == 1
     clock.advance(5.1)
     await ticks()
     assert len(_missed(caplog)) == 1
@@ -845,7 +845,9 @@ async def test_missed_hint_is_logged_once_after_the_grace_period(clock: Clock, c
     assert len(_missed(caplog)) == 1
 
 
-async def test_late_hint_within_grace_is_not_a_missed_hint(clock: Clock, caplog: Any) -> None:
+async def test_late_hint_does_not_repeat_the_discovery_diagnostic(
+    clock: Clock, caplog: Any
+) -> None:
     caplog.set_level(logging.WARNING)
     state = BatchedState()
     state.create("r1")
@@ -857,7 +859,7 @@ async def test_late_hint_within_grace_is_not_a_missed_hint(clock: Clock, caplog:
     await ticks()
     clock.advance(4)
     await ticks()
-    assert not _missed(caplog)
+    assert len(_missed(caplog)) == 1
 
 
 @pytest.mark.parametrize("cause", ["catch_up", "gap", "drain"])
@@ -1083,8 +1085,8 @@ async def test_a_thousand_concurrent_joins_coalesce_into_one_read(clock: Clock) 
     assert len(state.event_reads) == reads + 1
 
 
-async def test_hints_and_gaps_never_start_a_coordinator_task(clock: Clock) -> None:
-    """At loop shutdown the listener's last gap must not spawn an orphan coordinator."""
+async def test_hints_revive_cancelled_coordinator_but_gaps_do_not(clock: Clock) -> None:
+    """A gap alone does not restart; a hint recovers an unexpected cancellation."""
     state = BatchedState()
     state.create("r1")
     feed = _feed(_store(state))
@@ -1093,6 +1095,8 @@ async def test_hints_and_gaps_never_start_a_coordinator_task(clock: Clock) -> No
     task.cancel()  # what the event loop runner does to every task at shutdown
     await ticks()
     live.gap()
-    live.hint("r1")
     await ticks()
     assert _coordinator_tasks() == []
+    live.hint("r1")
+    await ticks()
+    assert len(_coordinator_tasks()) == 1

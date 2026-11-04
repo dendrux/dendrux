@@ -32,6 +32,7 @@ import logging
 import math
 import random
 import re
+import weakref
 from collections import deque
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, TypeAlias, Union
@@ -100,7 +101,6 @@ MAX_LIMIT_PER_RUN = 100
 MAX_READS_PER_S = 20.0
 STATUS_MAX_AGE_S = 30.0
 IDLE_EXIT_S = 60.0
-MISSED_HINT_GRACE_S = 5.0
 TERMINAL_DRAIN_GRACE_S = 0.1
 HEALTHY_JITTER = 0.2
 MAX_RESTARTS = 3
@@ -205,6 +205,8 @@ class _Follower:
     wake: asyncio.Event = field(default_factory=asyncio.Event)
     end_reason: FollowEndReason | None = None
     params: _Params = _DEFAULT_PARAMS
+    deadline: float = _NEVER
+    owner: weakref.ReferenceType[Follow] | None = None
 
     def push(self, event: StoredEvent) -> None:
         if self.end_reason is not None:
@@ -219,6 +221,15 @@ class _Follower:
         if self.end_reason is None:
             self.end_reason = reason
         self.wake.set()
+        self._retire()
+
+    def _retire(self) -> None:
+        if self.owner is None:
+            return
+        follow = self.owner()
+        if follow is not None:
+            follow._release()
+            follow._owner._detach(self)
 
 
 @dataclass(frozen=True, slots=True)
@@ -399,13 +410,16 @@ class _Coordinator:
         self._tokens = MAX_READS_PER_S
         self._tokens_at = self._now()
         self._safety_window = (0.0, -math.inf)
-        self._candidates: dict[str, tuple[float, int, _WatchedRun]] = {}
         self._registration: object | None = None
-        if live is not None:
-            try:
-                self._registration = live.register(self, stream_events=False)
-            except (LiveUpdatesUnavailableError, RuntimeError):
-                self.live = None  # closed or another loop: poll
+        self._enter_hub()
+
+    def _enter_hub(self) -> None:
+        if self.live is None or self._registration is not None:
+            return
+        try:
+            self._registration = self.live.register(self, stream_events=False)
+        except (LiveUpdatesUnavailableError, RuntimeError):
+            self.live = None  # Closed or another loop: poll.
 
     def _now(self) -> float:
         return self._loop.time()
@@ -414,7 +428,6 @@ class _Coordinator:
 
     def on_hints(self, run_ids: Sequence[str]) -> None:
         for run_id in run_ids:
-            self._candidates.pop(run_id, None)  # announced after all: not a missed hint
             run = self.runs.get(run_id)
             if run is not None:
                 run.hints += 1
@@ -422,7 +435,6 @@ class _Coordinator:
 
     def on_gap(self) -> None:
         now = self._now()
-        self._candidates.clear()
         for run in self.runs.values():
             self.request(run, "gap", now + random.uniform(0, run.params.poll_interval_s))
 
@@ -463,8 +475,8 @@ class _Coordinator:
         run.dirty += 1
         run.reason = reason
         self._wake.set()
-        if reason == "join" and not self._closed:
-            self.revive()  # hints and gaps never start a task (e.g. during loop shutdown)
+        if reason in {"join", "hint"} and not self._closed:
+            self.revive()
 
     def _raise_if_closed(self) -> None:
         if self._closed:
@@ -491,6 +503,7 @@ class _Coordinator:
         if not self.runs:
             return
         self._crashed = False
+        self._enter_hub()
         self._task = self._loop.create_task(self._main(), name="dendrux-follow-coordinator")
         self._task.add_done_callback(self._on_exit)
 
@@ -528,7 +541,6 @@ class _Coordinator:
             for follower in list(run.followers):
                 follower.end("error")
         self.runs.clear()
-        self._candidates.clear()
 
     def _on_exit(self, task: asyncio.Task[None]) -> None:
         if task is not self._task:
@@ -537,12 +549,15 @@ class _Coordinator:
         self._record_crash(task)
 
     def _record_crash(self, task: asyncio.Task[None]) -> None:
-        if task.cancelled() or task.exception() is None:
+        if not self._unexpected_exit(task):
             return
         self._crashed = True
         for run in self.runs.values():
             for follower in run.followers:
                 follower.wake.set()
+
+    def _unexpected_exit(self, task: asyncio.Task[None]) -> bool:
+        return not self._closed and (task.cancelled() or task.exception() is not None)
 
     async def aclose(self, timeout: float) -> None:
         """End every follower, stop the task (bounded) and leave the hub."""
@@ -551,7 +566,6 @@ class _Coordinator:
             for follower in list(run.followers):
                 follower.end("error")
         self.runs.clear()
-        self._candidates.clear()
         self._leave_hub()
         task = self._task
         if task is None or task.done():
@@ -571,27 +585,49 @@ class _Coordinator:
     # ------------------------------------------------------------ main loop
 
     async def _main(self) -> None:
-        while True:
+        while not self._closed:
+            _raise_if_cancelling()
             self._wake.clear()
             now = self._now()
-            self._check_missed(now)
-            if not self.runs and not self._candidates:
-                if await self._sleep(IDLE_EXIT_S) or self.runs:
-                    continue
-                return
+            self._expire_followers(now)
+            if not self.runs:
+                if await self._idle():
+                    return
+                continue
             chunk = self._due_chunk(now)
             if chunk:
                 await self._cycle(chunk, now)
             else:
                 await self._sleep(self._next_wake(now) - now)
 
+    async def _idle(self) -> bool:
+        if await self._sleep(IDLE_EXIT_S) or self.runs:
+            return False
+        self._leave_hub()
+        await self.store._release_idle_lease()
+        if self.runs:
+            self._enter_hub()
+            return False
+        return True
+
+    def _expire_followers(self, now: float) -> None:
+        for run in list(self.runs.values()):
+            for follower in list(run.followers):
+                if now >= follower.deadline:
+                    follower.end("max_duration")
+
+    def _deadlines(self) -> Iterable[float]:
+        return (f.deadline for run in self.runs.values() for f in run.followers)
+
     async def _sleep(self, seconds: float) -> bool:
-        """Wait for a wake or ``seconds``; True when woken."""
-        with contextlib.suppress(TimeoutError):
-            async with asyncio.timeout(max(seconds, 0.0)):
-                await self._wake.wait()
-                return True
-        return False
+        try:
+            with contextlib.suppress(TimeoutError):
+                async with asyncio.timeout(max(seconds, 0.0)):
+                    await self._wake.wait()
+                    return True
+            return False
+        finally:
+            _raise_if_cancelling()
 
     def _due_chunk(self, now: float) -> list[_WatchedRun]:
         due = [run for run in self.runs.values() if run.due_at() <= now]
@@ -600,7 +636,7 @@ class _Coordinator:
 
     def _next_wake(self, now: float) -> float:
         times = [run.due_at() for run in self.runs.values()]
-        times.extend(at + MISSED_HINT_GRACE_S for at, _, _ in self._candidates.values())
+        times.extend(self._deadlines())
         return min([*times, now + IDLE_EXIT_S])
 
     async def _token(self) -> None:
@@ -701,16 +737,20 @@ class _Coordinator:
         except Exception as error:
             if len(runs) == 1:
                 return {}, (runs, error)
+        finally:
+            _raise_if_cancelling()
         return await self._split_batch(runs, read)
 
     def _active_runs(self, runs: list[_WatchedRun]) -> list[_WatchedRun]:
         return [run for run in runs if self.runs.get(run.run_id) is run and run.active]
 
     async def _readable(self, runs: list[_WatchedRun]) -> list[_WatchedRun]:
+        self._expire_followers(self._now())
         active = self._active_runs(runs)
         if not active:
             return []
         await self._token()
+        self._expire_followers(self._now())
         return self._active_runs(active)
 
     async def _split_batch(
@@ -884,26 +924,20 @@ class _Coordinator:
         """Record a healthy safety poll that found events no hint announced (a heuristic)."""
         if not fresh or snapshot.reason != "safety" or snapshot.first or not snapshot.healthy:
             return
-        if run.missed_logged or run.run_id in self._candidates:
+        if run.missed_logged:
             return
         if self._generation() != snapshot.generation or run.hints != snapshot.hints:
             return
-        self._candidates[run.run_id] = (self._now(), snapshot.generation, run)
+        run.missed_logged = True
+        _codes.log_code(
+            logger, _codes.LIVE_UPDATES_MISSED_HINT, run_id=_log_run_id(run.run_id), count=1
+        )
 
-    def _check_missed(self, now: float) -> None:
-        """Log a candidate no hint followed within the grace period, once per watched run."""
-        for run_id, (seen_at, generation, run) in list(self._candidates.items()):
-            if self._generation() != generation:
-                del self._candidates[run_id]
-            elif now >= seen_at + MISSED_HINT_GRACE_S:
-                del self._candidates[run_id]
-                run.missed_logged = True
-                _codes.log_code(
-                    logger,
-                    _codes.LIVE_UPDATES_MISSED_HINT,
-                    run_id=_log_run_id(run.run_id),
-                    count=1,
-                )
+
+def _raise_if_cancelling() -> None:
+    task = asyncio.current_task()
+    if task is not None and task.cancelling():
+        raise asyncio.CancelledError
 
 
 def _backoff(delay: float, params: _Params) -> float:
@@ -1160,6 +1194,7 @@ class Follow:
         self._head_at_start: int | None = None
         self._deadline: float | None = None
         self._gen: AsyncIterator[FollowItem] | None = None
+        self._reading = False
         self.drained_terminal = False
         """True after :meth:`start` when the run is terminal and nothing is left
         after the cursor (an HTTP route answers 204 instead of streaming)."""
@@ -1181,24 +1216,35 @@ class Follow:
         async with self._start_lock:
             if self._started:
                 return
-            self._raise_if_closed()
-            coordinator = self._owner._coordinator()
-            await self._owner.store._lease_live_updates()
-            await self._check_run()
-            self._raise_if_closed()  # closed while waiting on the store: take no slot
-            # No await from here to the slot: aclose() cannot interleave.
-            self._owner._acquire(self._tenant_id)
-            self._holds_slot = True
-            try:
-                if not self.drained_terminal:
-                    await self._join(coordinator)
-            except BaseException:
-                self._release()
-                self._detach()
-                raise
-            self._started = True
-            if self._max_duration_s is not None:
-                self._deadline = asyncio.get_running_loop().time() + self._max_duration_s
+            await self._admit()
+
+    async def _admit(self) -> None:
+        store = self._owner.store
+        store._follow_admissions += 1
+        try:
+            await self._start_follow()
+        finally:
+            store._follow_admissions -= 1
+            await store._release_idle_lease()
+
+    async def _start_follow(self) -> None:
+        self._raise_if_closed()
+        coordinator = self._owner._coordinator()
+        await self._owner.store._lease_live_updates()
+        await self._check_run()
+        self._raise_if_closed()
+        self._owner._acquire(self._tenant_id)
+        self._holds_slot = True
+        try:
+            if not self.drained_terminal:
+                await self._join(coordinator)
+        except BaseException:
+            self._release()
+            self._detach()
+            raise
+        self._started = True
+        if self.drained_terminal:
+            self._release()
 
     async def _join(self, coordinator: _Coordinator) -> None:
         run = await coordinator.watch(self.run_id)
@@ -1206,13 +1252,20 @@ class Follow:
             if not run.followers:
                 coordinator.unwatch(run)  # never leave a run nobody follows
             self._raise_if_closed()
-        follower = _Follower(
+        follower = self._new_follower()
+        self._feed, self._follower = run, follower
+        self._head_at_start = self._owner._attach(run, follower)
+
+    def _new_follower(self) -> _Follower:
+        if self._max_duration_s is not None:
+            self._deadline = asyncio.get_running_loop().time() + self._max_duration_s
+        return _Follower(
             until_terminal=self._until_terminal,
             limit=self._owner.buffer,
             params=self._owner._params,
+            deadline=self._deadline if self._deadline is not None else _NEVER,
+            owner=weakref.ref(self),
         )
-        self._feed, self._follower = run, follower
-        self._head_at_start = self._owner._attach(run, follower)
 
     def _raise_if_closed(self) -> None:
         if self._closed:
@@ -1259,26 +1312,44 @@ class Follow:
             self._detach()
 
     async def __anext__(self) -> FollowItem:
-        await self.start()
-        if self._gen is None:
-            self._gen = self._run()
+        self._reading = True
         try:
-            return await self._gen.__anext__()
+            return await self._read_next()
         except BaseException:
             await self.aclose()
             raise
+        finally:
+            self._reading = False
+
+    async def _read_next(self) -> FollowItem:
+        if self._closed:
+            raise StopAsyncIteration
+        try:
+            await self.start()
+        except RuntimeError:
+            if self._closed:
+                raise StopAsyncIteration from None
+            raise
+        if self._gen is None:
+            self._gen = self._run()
+        return await self._gen.__anext__()
 
     async def aclose(self) -> None:
-        """Stop following and free the slot. Safe to call more than once."""
+        """Stop following and free the slot, including during another task's read."""
         if self._closed:
             return
         self._closed = True
         try:
-            if self._gen is not None:
-                await self._gen.aclose()  # type: ignore[attr-defined]
+            await self._close_generator()
         finally:
             self._release()
             self._detach()
+
+    async def _close_generator(self) -> None:
+        if self._follower is not None:
+            self._follower.end("error")
+        if self._gen is not None and not self._reading:
+            await self._gen.aclose()  # type: ignore[attr-defined]
 
     async def __aenter__(self) -> Follow:
         await self.start()
@@ -1301,22 +1372,31 @@ class Follow:
 
     async def _run(self) -> AsyncIterator[FollowItem]:
         try:
-            if self._owner._closed:
-                raise RuntimeError("This event feed is closed.")
-            if self.drained_terminal:
-                yield FollowEnd("terminal", self._cursor)
-                return
-            async for item in self._catch_up():
-                yield item
-                if isinstance(item, FollowEnd):
+            async for item in self._items():
+                if self._closed:
                     return
-            async for item in self._live():
                 yield item
         except TimeoutError:
-            yield FollowEnd("max_duration", self._cursor)
+            if not self._closed:
+                yield FollowEnd("max_duration", self._cursor)
         finally:
             self._release()
             self._detach()
+
+    async def _items(self) -> AsyncIterator[FollowItem]:
+        if self._owner._closed:
+            raise RuntimeError("This event feed is closed.")
+        if self.drained_terminal:
+            yield FollowEnd("terminal", self._cursor)
+            return
+        async for item in self._catch_up():
+            yield item
+            if isinstance(item, FollowEnd):
+                return
+        if self._closed:
+            return
+        async for item in self._live():
+            yield item
 
     async def _catch_up(self) -> AsyncIterator[FollowItem]:
         """Events up to the head at join, read from the database (outside the budget)."""

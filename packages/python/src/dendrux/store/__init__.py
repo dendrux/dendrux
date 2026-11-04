@@ -513,6 +513,11 @@ class RunStore:
         self._listens = True
         self._closed = False
         self._lease: object | None = None
+        self._lease_lock = asyncio.Lock()
+        self._lease_loop: asyncio.AbstractEventLoop | None = None
+        self._follow_admissions = 0
+        self._stream_readers = 0
+        self._idle_release_requested = False
         self._acquiring: asyncio.Task[None] | None = None
         self._lease_retry_at = 0.0
         self._coordinators: dict[asyncio.AbstractEventLoop, _Coordinator] = {}
@@ -652,15 +657,38 @@ class RunStore:
             await asyncio.wait({task}, timeout=timeout)
 
     async def _release_lease(self) -> None:
-        """Release this reader's lease; the handle is kept until the release finished,
-        so a cancelled close leaves enough for a later close to finish the job."""
+        if self._lease is None or self._lease_loop is not asyncio.get_running_loop():
+            return
+        async with self._lease_lock:
+            await self._release_locked()
+
+    async def _release_locked(self) -> None:
         lease, live = self._lease, self._live_updates()
         if lease is None or live is None:
             return
         with contextlib.suppress(RuntimeError, LiveUpdatesUnavailableError):
-            await live.release_listener(lease)  # idempotent per handle
+            await live.release_listener(lease)
         if self._lease is lease:
             self._lease = None
+
+    def _has_reader_demand(self) -> bool:
+        return bool(
+            self._follow_admissions
+            or self._stream_readers
+            or any(c.runs for c in self._coordinators.values())
+        )
+
+    async def _release_idle_lease(self) -> None:
+        if self._has_reader_demand() or self._lease_loop is not asyncio.get_running_loop():
+            return
+        self._idle_release_requested = True
+        for coordinator in self._coordinators.values():
+            coordinator._leave_hub()
+        if self._acquiring is not None and not self._acquiring.done():
+            return  # Acquisition owns the lock; it releases an unwanted lease itself.
+        async with self._lease_lock:
+            if not self._has_reader_demand():
+                await self._release_locked()
 
     async def __aenter__(self) -> RunStore:
         return self
@@ -673,35 +701,44 @@ class RunStore:
         return live if isinstance(live, LiveUpdates) else None
 
     async def _lease_live_updates(self) -> None:
-        """Take this reader's listener lease once; failure means polling, retried later.
-
-        The acquisition runs in a task the reader owns, so cancelling the
-        follow or stream that asked for it never cancels the acquisition or
-        the release of a lease that lands after ``close()``.
-        """
         live = self._live_updates()
-        if live is None or self._lease is not None or self._closed:
-            return
         loop = asyncio.get_running_loop()
-        if loop.time() < self._lease_retry_at:
+        if live is None:
             return
-        task = self._acquiring
-        if task is None or task.done():
-            task = loop.create_task(self._acquire(live), name="dendrux-live-updates-lease")
-            task.add_done_callback(_observe_task)  # a cancelled asker may never read it
-            self._acquiring = task
-        await asyncio.shield(task)
+        while self._lease_needed(loop):
+            self._lease_loop = loop
+            self._idle_release_requested = False
+            task = self._acquiring
+            if task is None or task.done():
+                task = loop.create_task(self._acquire(live), name="dendrux-live-updates-lease")
+                task.add_done_callback(_observe_task)
+                self._acquiring = task
+            await asyncio.shield(task)
+
+    def _lease_needed(self, loop: asyncio.AbstractEventLoop) -> bool:
+        if self._closed or self._lease_loop not in (None, loop):
+            return False
+        if self._lease is not None and not self._lease_lock.locked():
+            return False
+        return loop.time() >= self._lease_retry_at
 
     async def _acquire(self, live: LiveUpdates) -> None:
-        loop = asyncio.get_running_loop()
+        async with self._lease_lock:
+            await self._acquire_locked(live)
+        if self._release_after_acquire():
+            await self._release_lease()
+
+    def _release_after_acquire(self) -> bool:
+        return self._closed or (self._idle_release_requested and not self._has_reader_demand())
+
+    async def _acquire_locked(self, live: LiveUpdates) -> None:
+        if self._closed or self._lease is not None:
+            return
         try:
             self._lease = await live.acquire_listener()
         except (LiveUpdatesUnavailableError, RuntimeError):
-            self._lease_retry_at = loop.time() + _LEASE_RETRY_S
+            self._lease_retry_at = asyncio.get_running_loop().time() + _LEASE_RETRY_S
             _codes.log_code(logger, _codes.LIVE_UPDATES_UNAVAILABLE, error_kind="closed")
-            return
-        if self._closed:  # close() ran while we waited for the listener: give it back
-            await self._release_lease()
 
     def _follow_coordinator(self) -> _Coordinator:
         """This reader's coordinator for the running event loop (created on first use)."""
@@ -960,6 +997,7 @@ class RunStore:
             raise RunNotFoundError(run_id)
         waker = _RunWaker(run_id)
         live, handle = self._register_stream(waker)
+        self._stream_readers += 1
         try:
             await self._lease_live_updates()  # inside: a cancelled admission unregisters
             async for event in self._poll_events(
@@ -967,9 +1005,11 @@ class RunStore:
             ):
                 yield event
         finally:
+            self._stream_readers -= 1
             if live is not None and handle is not None:
                 with contextlib.suppress(RuntimeError, LiveUpdatesUnavailableError):
                     live.unregister(handle)
+            await self._release_idle_lease()
 
     def _register_stream(self, waker: _RunWaker) -> tuple[LiveUpdates | None, object | None]:
         """Register a ``stream_events`` consumer; unavailable live updates mean polling."""
