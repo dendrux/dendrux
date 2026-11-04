@@ -62,9 +62,23 @@ jobs:
           --health-timeout 5s
           --health-retries 10
 
+      # Real Redis for the RedisUpdates tests (Pub/Sub only; the tests use a private channel
+      # each). The "Require the Redis backend" and "Test" steps fail the job if the variable
+      # goes missing or those tests are skipped for lack of it.
+      redis:
+        image: redis:7@sha256:b6b6e3dc0c0952737748e55d5d885272840c7e42ba41ab1d5489f693419882f5
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
     env:
       PYTHON_DOTENV_DISABLED: "1"
       DENDRUX_TEST_PG_URL: postgresql+asyncpg://dendrux:dendrux@localhost:5432/dendrux_test
+      DENDRUX_TEST_REDIS_URL: redis://localhost:6379/0
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -113,6 +127,14 @@ jobs:
             exit 1
           fi
 
+      - name: Require the Redis backend
+        shell: bash
+        run: |
+          if [ -z "${DENDRUX_TEST_REDIS_URL:-}" ]; then
+            echo "::error::DENDRUX_TEST_REDIS_URL is not set; the Redis integration tests would be skipped silently."
+            exit 1
+          fi
+
       - name: Test
         shell: bash
         env:
@@ -124,6 +146,28 @@ jobs:
           pytest $files -v -rs -n auto -m "not benchmark" --cov=src/dendrux --cov-report= | tee pytest.log
           if grep -q 'DENDRUX_TEST_PG_URL not set' pytest.log; then
             echo "::error::Postgres integration tests were skipped (DENDRUX_TEST_PG_URL not set)."
+            exit 1
+          fi
+          if grep -q 'DENDRUX_TEST_REDIS_URL not set' pytest.log; then
+            echo "::error::Redis integration tests were skipped (DENDRUX_TEST_REDIS_URL not set)."
+            exit 1
+          fi
+
+      # The kit's live-update contract on Postgres: serial, on a private database the conformance
+      # harness is told to authorise (it drops and recreates that database's schema). It needs the
+      # stores to take live_updates= (track A2); without it every live contract skips and the guard
+      # below fails the job on purpose.
+      - name: Store kit live-update contract on Postgres
+        if: matrix.shard == 1 && matrix.python-version == '3.12' && matrix.sqlalchemy-version == '2.1.*'
+        shell: bash
+        env:
+          DENDRUX_TEST_PG_URL: postgresql+asyncpg://dendrux:dendrux@localhost:5432/dendrux_ci_kit_test
+          DENDRUX_CONFORMANCE_PG_DB: dendrux_ci_kit_test
+        run: |
+          pytest tests/conformance/test_store_kit.py -k "test_live_ and postgres" -n 0 --no-cov -v -rs -p no:randomly | tee kit-live.log
+          passed=$(grep -c ' PASSED' kit-live.log || true)
+          if [ "$passed" -lt 7 ] || grep -Eq ' SKIPPED|[0-9]+ skipped|live updates: not tested|no tests ran' kit-live.log; then
+            echo "::error::The live-update kit contract must pass 7 times on Postgres and skip never (got $passed passed)."
             exit 1
           fi
 
@@ -303,6 +347,64 @@ jobs:
             exit 1
           fi
 
+  # The Redis suites on the older redis-py releases the `redis` extra allows (5.0.1 to 7.4.0).
+  # RedisUpdates leans on redis-py internals for its message bound and proves them at run time;
+  # this keeps that proof honest across releases. 8.1.0 (the dev pin) runs in every other job.
+  redis-compat:
+    name: redis-py ${{ matrix.redis }} suites
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: packages/python
+    strategy:
+      fail-fast: false
+      matrix:
+        redis: ["5.0.1", "5.3.1", "6.4.0", "7.4.0"]
+
+    services:
+      redis:
+        image: redis:7@sha256:b6b6e3dc0c0952737748e55d5d885272840c7e42ba41ab1d5489f693419882f5
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      PYTHON_DOTENV_DISABLED: "1"
+      DENDRUX_TEST_REDIS_URL: redis://localhost:6379/0
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: packages/python/pyproject.toml
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Pin redis-py ${{ matrix.redis }}
+        run: |
+          pip install "redis==${{ matrix.redis }}"
+          python -c "import redis; assert redis.__version__ == '${{ matrix.redis }}', redis.__version__"
+
+      - name: Redis suites on redis-py ${{ matrix.redis }}
+        shell: bash
+        run: |
+          pytest tests/unit/test_redis_updates*.py tests/integration/test_redis_updates.py -n 0 --no-cov -v -rs -p no:randomly | tee pytest.log
+          if grep -Eiq '(^SKIPPED|[0-9]+ skipped)' pytest.log; then
+            echo "::error::Redis compatibility tests were skipped."
+            exit 1
+          fi
+
   # Quality ratchets (packages/python/tools/QUALITY.md): cognitive complexity, duplicate code,
   # dead code, import cycles and the custom Semgrep rules. Each compares with a committed
   # baseline and fails only on a new problem or an existing one getting worse. The CRAP ratchet
@@ -413,6 +515,21 @@ jobs:
             -v -rs -n 4 -m "not benchmark" --cov=src/dendrux --cov-report= | tee pytest.log
           if grep -q '${{ matrix.env_name }} not set' pytest.log; then
             echo "::error::${{ matrix.server }} tests were skipped (${{ matrix.env_name }} not set)."
+            exit 1
+          fi
+
+      # The kit's live-update contract on this server (the conformance harness makes a private
+      # database per test). Needs live_updates= on the stores (track A2); a skip fails the job.
+      - name: Store kit live-update contract on ${{ matrix.server }}
+        shell: bash
+        env:
+          SERVER_URL: mysql+asyncmy://root:dendrux_test@127.0.0.1:${{ matrix.port }}/dendrux_ci_test
+        run: |
+          export ${{ matrix.env_name }}="$SERVER_URL"
+          pytest tests/conformance/test_store_kit.py -k "test_live_ and ${{ matrix.server }}" -n 0 --no-cov -v -rs -p no:randomly | tee kit-live.log
+          passed=$(grep -c ' PASSED' kit-live.log || true)
+          if [ "$passed" -lt 7 ] || grep -Eq ' SKIPPED|[0-9]+ skipped|live updates: not tested|no tests ran' kit-live.log; then
+            echo "::error::The live-update kit contract must pass 7 times on ${{ matrix.server }} and skip never (got $passed passed)."
             exit 1
           fi
 

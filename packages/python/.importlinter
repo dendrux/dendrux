@@ -80,6 +80,16 @@ ignore_imports =
     dendrux.mcp.** -> httpx2
     dendrux.mcp.** -> httpcore2
 
+[importlinter:contract:redis-in-live-updates]
+name = The Redis client is imported only by the Redis live-updates transport
+type = forbidden
+source_modules = dendrux
+forbidden_modules =
+    redis
+allow_indirect_imports = True
+ignore_imports =
+    dendrux.db._redis_updates -> redis
+
 [importlinter:contract:otel-in-notifiers]
 name = OpenTelemetry is imported only by the OTel notifier
 type = forbidden

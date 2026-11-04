@@ -7,6 +7,7 @@ Each test sees a clean schema.
 
 from __future__ import annotations
 
+import inspect
 import os
 from typing import TYPE_CHECKING, Any
 
@@ -17,6 +18,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
 from dendrux.db.models import Base
+from dendrux.runtime.stores.sql.base import SQLStateStore
 from dendrux.testing.store_kit.sql import SqlFaultInjector
 from tests._fixtures.storage import pin_storage_format
 from tests._helpers import v030_oracle as o
@@ -170,3 +172,13 @@ def dendrux_fault_injector() -> Iterator[SqlFaultInjector]:
     injector = SqlFaultInjector()
     yield injector
     injector.close()
+
+
+# The kit's live-update contract needs stores that take ``live_updates=`` (track A2). Until they do
+# there is no fixture, so the contract skips and the report says "live updates: not tested"; once
+# they do, it runs on every backend above with no change here.
+if "live_updates" in inspect.signature(SQLStateStore.__init__).parameters:
+
+    @pytest.fixture
+    def dendrux_live_store_factory(kit_backend: _kit_backends.KitBackend) -> Any:
+        return kit_backend.fresh_live_store
