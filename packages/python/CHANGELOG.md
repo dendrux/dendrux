@@ -209,7 +209,7 @@
 
 - Client tool calls retain their per-run call limits across pauses on both storage formats.
 
-- Rejected tool calls no longer use up a tool's per-run call limit after a resume.
+- Rejected tool calls no longer use up a tool's per-run call limit after a resume; rejected tool messages now carry `dendrux.not_executed` in saved metadata visible in traces.
 
 - Denied tool calls no longer use up a tool's per-run call limit after a resume.
 - Resumed loops start their tool call counts from the saved execution counts when available, falling back to history.
