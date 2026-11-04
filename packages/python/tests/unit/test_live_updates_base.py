@@ -1076,3 +1076,37 @@ def test_gap_marker_is_local_identity_not_wire_text():
     bus.register(consumer)
     bus._deliver(bus.GAP)
     assert consumer.gaps == bus.generation == 1
+
+
+@pytest.mark.asyncio
+async def test_flapping_subscriptions_grow_backoff_until_stable(monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr(live, "monotonic", lambda: now[0])
+    windows = []
+
+    def jitter(low, high):
+        windows.append((low, high))
+        return 0
+
+    monkeypatch.setattr(live.random, "uniform", jitter)
+
+    class FlappingBus(ListeningBus):
+        async def receive(self):
+            self.starts += 1
+            yield None
+            # Even ordinary traffic on a short-lived connection must not reset backoff.
+            yield '["a"]'
+            if self.starts == 5:
+                now[0] += self.health_check_s
+            if self.starts >= 7:
+                await asyncio.Future()
+            raise OSError("VENDOR_SECRET")
+
+    bus = FlappingBus(backoff_initial_s=0.5, backoff_max_s=2, health_check_s=15)
+    lease = await bus.acquire_listener()
+    try:
+        await until(lambda: bus.starts >= 7)
+        assert windows[:6] == [(0, 0.5), (0, 1), (0, 2), (0, 2), (0, 0.5), (0, 1)]
+    finally:
+        await bus.release_listener(lease)
+        await bus.close()

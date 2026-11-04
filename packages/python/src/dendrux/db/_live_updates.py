@@ -448,6 +448,7 @@ class LiveUpdates(ABC):
         self._generation = 0
         self._listener_failed = False
         self._listener_backoff = self.backoff_initial_s
+        self._healthy_since = math.inf
         self._listener_lock = asyncio.Lock()
         self._close_lock = asyncio.Lock()
         self._listener_task: asyncio.Task[None] | None = None
@@ -518,12 +519,17 @@ class LiveUpdates(ABC):
     def _health(self, healthy: bool) -> None:
         if self._healthy == healthy:
             return
+        self._reset_stable_listener_backoff(healthy)
         self._healthy = healthy
         self._gap()
         if healthy:
             self._listener_failed = False
-            self._listener_backoff = self.backoff_initial_s
+            self._healthy_since = monotonic()
             _codes.log_code(logger, _codes.LIVE_UPDATES_RECOVERED)
+
+    def _reset_stable_listener_backoff(self, healthy: bool) -> None:
+        if not healthy and monotonic() - self._healthy_since >= self.health_check_s:
+            self._listener_backoff = self.backoff_initial_s
 
     def _degraded(self, error: BaseException) -> None:
         self._health(False)
