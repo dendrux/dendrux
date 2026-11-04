@@ -798,8 +798,8 @@ async def test_image_stream_errors_drop_all_request_holders(
     with pytest.raises(expected) as info:
         async for _ in provider.complete_stream(USER_IMAGE):
             pass
-    if failure.startswith("open_"):
-        # The open deadline covers SDK setup and can expire before the mock
+    if failure in {"idle", "total", "open_idle", "open_total"}:
+        # Stream deadlines cover SDK setup and can expire before the mock
         # transport handler is entered on a busy runner.
         assert len(calls) <= 1
     else:
