@@ -172,7 +172,7 @@ class TestNameSanitization:
 
 
 class TestResultNormalization:
-    """_normalize_mcp_result handles text, structuredContent, errors."""
+    """normalize_mcp_result handles text, structuredContent, errors."""
 
     def _make_result(
         self,
@@ -194,30 +194,30 @@ class TestResultNormalization:
         return ImageContent(data="aW1hZ2U=", mimeType="image/png")
 
     def test_text_content(self) -> None:
-        from dendrux.mcp._server import _normalize_mcp_result
+        from dendrux.mcp._result import normalize_mcp_result
 
         result = self._make_result(content=[self._make_text_content("hello world")])
-        assert _normalize_mcp_result(result) == "hello world"
+        assert normalize_mcp_result(result) == "hello world"
 
     def test_multiple_text_blocks(self) -> None:
-        from dendrux.mcp._server import _normalize_mcp_result
+        from dendrux.mcp._result import normalize_mcp_result
 
         result = self._make_result(
             content=[self._make_text_content("line1"), self._make_text_content("line2")]
         )
-        assert _normalize_mcp_result(result) == "line1\nline2"
+        assert normalize_mcp_result(result) == "line1\nline2"
 
     def test_empty_content(self) -> None:
-        from dendrux.mcp._server import _normalize_mcp_result
+        from dendrux.mcp._result import normalize_mcp_result
 
         result = self._make_result(content=[])
-        assert _normalize_mcp_result(result) == ""
+        assert normalize_mcp_result(result) == ""
 
     def test_non_text_content_is_preserved(self) -> None:
-        from dendrux.mcp._server import _normalize_mcp_result
+        from dendrux.mcp._result import normalize_mcp_result
 
         result = self._make_result(content=[self._make_image_content()])
-        normalized = _normalize_mcp_result(result)
+        normalized = normalize_mcp_result(result)
         assert normalized == {
             "content": [
                 {
@@ -230,25 +230,25 @@ class TestResultNormalization:
 
     def test_structured_content_preferred(self) -> None:
         """structuredContent takes priority over text blocks."""
-        from dendrux.mcp._server import _normalize_mcp_result
+        from dendrux.mcp._result import normalize_mcp_result
 
         result = self._make_result(
             content=[self._make_text_content("fallback")],
             structured_content={"key": "value", "count": 42},
         )
-        normalized = _normalize_mcp_result(result)
+        normalized = normalize_mcp_result(result)
         # Should return the dict, not a JSON string (loop handles serialization)
         assert isinstance(normalized, dict)
         assert normalized == {"key": "value", "count": 42}
 
     def test_structured_content_none_falls_back(self) -> None:
-        from dendrux.mcp._server import _normalize_mcp_result
+        from dendrux.mcp._result import normalize_mcp_result
 
         result = self._make_result(
             content=[self._make_text_content("hello")],
             structured_content=None,
         )
-        assert _normalize_mcp_result(result) == "hello"
+        assert normalize_mcp_result(result) == "hello"
 
 
 # ---------------------------------------------------------------------------

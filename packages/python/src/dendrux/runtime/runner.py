@@ -5780,7 +5780,7 @@ async def _resume_submission(
     decisions: Any,
 ) -> tuple[StateStore, str, Any, list[ToolResult] | None, tuple[ContentPart, ...] | None]:
     if tool_results is not None:
-        validate_result_names(run_id, pause, tool_results, json_payload=skip_claim)
+        validate_result_names(run_id, pause, tool_results)
         if not skip_claim:
             tool_results = await prepare_resume_results(agent, store, run_id, pause, tool_results)
     if not skip_claim and (input_items or any(tr.images for tr in tool_results or ())):
@@ -6389,7 +6389,7 @@ async def _stream_resume_images(
     if media_pause.agent_name and media_pause.agent_name != agent.name:
         raise ValueError("Agent name mismatch on resume")
     if stream_results is not None:
-        validate_result_names(run_id, media_pause, stream_results, json_payload=False)
+        validate_result_names(run_id, media_pause, stream_results)
         stream_results = await prepare_resume_results(
             agent, store, run_id, media_pause, stream_results
         )
@@ -6433,7 +6433,7 @@ async def _stream_resume_state(
     )
 
     if stream_results is not None:
-        validate_result_names(run_id, pause_state, stream_results, json_payload=False)
+        validate_result_names(run_id, pause_state, stream_results)
         if not results_prepared:
             stream_results = await prepare_resume_results(
                 agent, store, run_id, pause_state, stream_results

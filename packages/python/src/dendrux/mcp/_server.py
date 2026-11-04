@@ -62,11 +62,6 @@ def _sanitize_tool_name(name: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_-]", "_", name)
 
 
-def _normalize_mcp_result(result: Any, *, max_result_bytes: int = DEFAULT_MAX_RESULT_BYTES) -> Any:
-    """Compatibility export for the result normalizer."""
-    return normalize_mcp_result(result, max_result_bytes=max_result_bytes)
-
-
 def _annotation_dict(annotations: Any) -> dict[str, Any] | None:
     if annotations is None:
         return None

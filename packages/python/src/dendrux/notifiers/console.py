@@ -67,9 +67,7 @@ class ConsoleNotifier(BaseNotifier):
         self._iteration = 0
         self._tool_starts: dict[str, float] = {}
         self._started = False
-        self._total_tokens = 0
         self._total_tools = 0
-        self._total_tool_time = 0.0
         self._total_cache_read = 0
         self._total_cache_creation = 0
         self._run_start = 0.0
@@ -199,7 +197,6 @@ class ConsoleNotifier(BaseNotifier):
     ) -> None:
         """Called after an LLM call completes."""
         tokens = response.usage.total_tokens if response.usage else 0
-        self._total_tokens += tokens
         duration_str = f" in {duration_ms / 1000:.1f}s" if duration_ms else ""
 
         cache_str = ""
@@ -236,7 +233,6 @@ class ConsoleNotifier(BaseNotifier):
             elapsed = tool_result.duration_ms / 1000
 
         self._total_tools += 1
-        self._total_tool_time += elapsed
         duration_str = f" [dim]{elapsed:.1f}s[/dim]" if elapsed else ""
 
         if tool_result.success:

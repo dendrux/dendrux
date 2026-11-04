@@ -13,7 +13,6 @@ Usage:
 from __future__ import annotations
 
 import datetime as _dt
-import json
 import logging
 import math
 import time
@@ -377,9 +376,6 @@ PAUSE_SUMMARY_KEYS = (
     "pause_id",
     FailureReason.BUDGET_EXCEEDED.value,
 )
-
-
-_PAUSE_SCALAR_KEYS = frozenset({"agent_name", "pause_reason", "pause_message", "pause_id"})
 
 
 @dataclass(frozen=True)
@@ -1430,17 +1426,6 @@ async def _insert_event_locked(
     return await _insert_event(session, run_id, event_type, data, iteration_index=iteration_index)
 
 
-# Unique indexes that enforce idempotency keys: the 0.5 tenant-scoped one, and
-# the pre-0.5 global ones (Alembic index, Postgres ``create_all`` constraint,
-# SQLite inline UNIQUE) still present on databases that were not rebuilt.
-_IDEMPOTENCY_VIOLATION_MARKERS = (
-    "uq_agent_runs_tenant_idempotency_key",
-    "ix_agent_runs_idempotency_key",
-    "agent_runs_idempotency_key_key",
-    "UNIQUE constraint failed: agent_runs.idempotency_key",
-)
-
-
 def _apply_tenant_scope(stmt: Any, tenant_id: TenantScope) -> Any:
     """``UNSCOPED`` adds nothing; ``None`` means untenanted only; a string means that tenant."""
     from dendrux.db.models import AgentRun
@@ -1459,16 +1444,6 @@ def _finite_json_float(value: str) -> float:
     if not math.isfinite(parsed):
         raise ValueError("non-finite JSON number")
     return parsed
-
-
-def _json_value(value: Any) -> Any:
-    """A SQLite ``json_extract`` array/object result (JSON text) decoded."""
-    if isinstance(value, str):
-        try:
-            return json.loads(value)
-        except ValueError:
-            return None
-    return value
 
 
 def _check_scope(tenant_id: object) -> None:

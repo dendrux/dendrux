@@ -93,7 +93,6 @@ from dendrux.tools._limits import (
     result_cap,
     size_limit_payload,
 )
-from dendrux.tools._lookups import ToolLookups, build_tool_lookups
 from dendrux.tools._mask import approval_view, placeholder_mapping
 from dendrux.tools._pool import (
     CallTracker,
@@ -152,6 +151,7 @@ if TYPE_CHECKING:
     from dendrux.runtime.state import StateStore
     from dendrux.skills._session import SkillSession
     from dendrux.strategies.base import Strategy
+    from dendrux.tools._lookups import ToolLookups
     from dendrux.types import BeforeToolHook, StreamEvent, ToolDef, ToolResultTransform
 
 logger = logging.getLogger(__name__)
@@ -2858,10 +2858,6 @@ def _interrupted_result(
         usage=usage,
         meta=meta,
     )
-
-
-# Backwards compatibility alias for runner.py's existing import.
-_build_tool_lookups = build_tool_lookups
 
 
 def _build_execution_groups(

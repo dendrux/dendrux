@@ -1151,7 +1151,6 @@ class TestLegacyOversizeMapping:
     ) -> None:
         mapping = {f"<<IP_ADDRESS_{i + 1}>>": f"10.0.{i // 256}.{i % 256}" for i in range(20_001)}
         engine = GuardrailEngine([PII(action="redact")], pii_mapping=mapping, run_id="run-legacy")
-        assert engine._at_mapping_cap
         assert engine.get_pii_mapping() == mapping
         warnings = [r for r in caplog.records if r.levelname == "WARNING"]
         assert len(warnings) == 1

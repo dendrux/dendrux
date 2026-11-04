@@ -166,7 +166,6 @@ class TestDenySkills:
             names = [s.name for s in agent._loaded_skills]
             assert "pdf-processing" not in names
             assert "report-gen" in names
-            assert "pdf-processing" in agent._denied_skill_names
         finally:
             shutil.rmtree(cleanup)
 
@@ -191,7 +190,6 @@ class TestDenySkills:
             agent._ensure_skills_loaded()
 
             assert agent._loaded_skills == []
-            assert len(agent._denied_skill_names) == 2
         finally:
             shutil.rmtree(cleanup)
 
@@ -755,7 +753,6 @@ class TestSkillsValidation:
         await agent.close()
 
         assert agent._loaded_skills is None
-        assert agent._denied_skill_names is None
 
     def test_use_skill_name_reserved(self) -> None:
         """A local tool named 'use_skill' conflicts with the meta-tool."""

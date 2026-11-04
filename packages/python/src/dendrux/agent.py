@@ -590,7 +590,6 @@ class Agent:
 
         self._deny_skills: frozenset[str] = frozenset(deny_skills) if deny_skills else frozenset()
         self._loaded_skills: list[Skill] | None = None
-        self._denied_skill_names: list[str] | None = None
         self._inline_skill_warning_emitted: bool = False
         validate_executor(skill_executor)
         self._skill_executor = skill_executor
@@ -659,7 +658,6 @@ class Agent:
         self._strict_tenancy: bool = strict_tenancy
         # None means the default caps: B12 applies them unless the developer overrides.
         self._limits: Limits = limits if limits is not None else _Limits()
-        self._tool_threads: int = tool_threads
         self._on_governance_change: Literal["warn", "raise"] = on_governance_change
         self._tool_call_limiter: Any = make_call_limiter(tool_threads)
         self._limits_checked_for: StateStore | None = None
@@ -3282,15 +3280,11 @@ class Agent:
 
         # Apply deny_skills filter
         loaded: list[Skill] = []
-        denied: list[str] = []
         for s in all_skills:
-            if s.name in self._deny_skills:
-                denied.append(s.name)
-            else:
+            if s.name not in self._deny_skills:
                 loaded.append(s)
 
         self._loaded_skills = loaded
-        self._denied_skill_names = denied
 
     def get_system_prompt(self, loop: Loop | None = None) -> str:
         """Compose system prompt with skill catalog.
@@ -3406,7 +3400,6 @@ class Agent:
         self._mcp_skipped_sources = []
         self._mcp_skipped_tools = []
         self._loaded_skills = None
-        self._denied_skill_names = None
         self._inline_skill_warning_emitted = False
 
     async def close(self) -> None:
@@ -3428,7 +3421,6 @@ class Agent:
         self._mcp_skipped_sources = []
         self._mcp_skipped_tools = []
         self._loaded_skills = None
-        self._denied_skill_names = None
         if self._provider is not None:
             await self._provider.close()
         with self._store_lock:

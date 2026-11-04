@@ -84,7 +84,6 @@ class PromptInjection:
 
         self.action: Literal["block", "warn"] = action
         self.engine: Engine = engine
-        self._patterns: list[Pattern] = list(patterns)
         self._detectors: list[Detector] = [Detector(p.name, re.compile(p.regex)) for p in patterns]
 
     def _scan_sync(self, text: str) -> list[Finding]:

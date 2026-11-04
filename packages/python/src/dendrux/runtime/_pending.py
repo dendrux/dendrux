@@ -453,10 +453,6 @@ async def pause_window_start(
         return int((await session.execute(stmt)).scalar_one())
 
 
-async def _pg_pause_summary(state: Any, run_id: str, tenant_id: TenantScope) -> PauseSummary | None:
-    return cast("PauseSummary | None", await state.get_pause_summary(run_id, tenant_id=tenant_id))
-
-
 async def _whole_pause_summary(
     state: Any, run_id: str, tenant_id: TenantScope
 ) -> PauseSummary | None:
