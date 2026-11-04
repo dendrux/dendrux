@@ -150,7 +150,9 @@ def _options(parsed: URL, allowed: frozenset[str]) -> list[tuple[str, str]]:
     for key, value in parsed.query.items():
         if key not in allowed:
             raise ValueError(
-                f"PostgresUpdates cannot use the URL option {key!r}; pass url= explicitly."
+                f"PostgresUpdates cannot use the URL option {key!r}; "
+                "pass PostgresUpdates(url=...) with an asyncpg URL "
+                "(use sslmode=require in url= for TLS)."
             )
         if key not in _DESTINATION_KEYS:
             pairs.append((key, _single(key, value)))
@@ -243,12 +245,94 @@ def _host_of(spec: str) -> str:
 
 
 def _loopback(host: str) -> bool:
-    if not host or host.startswith("/") or host == "localhost":
+    if host.startswith("/") or host == "localhost":
         return True
     try:
         return ipaddress.ip_address(host.strip("[]")).is_loopback
     except ValueError:
         return False
+
+
+_ENGINE_SETTINGS = frozenset(
+    {
+        "host",
+        "port",
+        "database",
+        "user",
+        "password",
+        "ssl",
+        "direct_tls",
+        "dsn",
+        "sslmode",
+        "sslcert",
+        "sslkey",
+        "sslrootcert",
+        "sslcrl",
+        "sslpassword",
+        "target_session_attrs",
+        "passfile",
+        "service",
+        "servicefile",
+    }
+)
+_BIND_HINT = "Pass PostgresUpdates(url=...) or explicit transport connect_args."
+
+
+def _standard_creator(creator: Any) -> bool:
+    import inspect
+
+    from sqlalchemy import create_engine
+
+    code = getattr(creator, "__code__", None)
+    factory = inspect.unwrap(create_engine)
+    return code is not None and any(code is candidate for candidate in factory.__code__.co_consts)
+
+
+def _engine_parameters(engine: Any) -> Mapping[str, Any] | None:
+    pool = getattr(engine, "pool", None)
+    if pool is None:
+        return {}  # lightweight URL-only engine adapters have no hidden connection options
+    creator = pool._creator
+    cells = getattr(creator, "__closure__", None)
+    if not _standard_creator(creator) or cells is None:
+        return None
+    code = creator.__code__
+    values = dict(zip(code.co_freevars, (cell.cell_contents for cell in cells), strict=True))
+    params = values.get("cparams")
+    return params if isinstance(params, Mapping) else None
+
+
+def _check_engine_settings(engine: Any) -> None:
+    params = _engine_parameters(engine)
+    if params is None or "async_creator_fn" in params:
+        raise ValueError(
+            "PostgresUpdates cannot inherit the engine's connection creator. " + _BIND_HINT
+        )
+    dialect = getattr(engine, "dialect", None)
+    if dialect is not None and dialect.dispatch.do_connect:
+        raise ValueError("PostgresUpdates cannot inherit engine connection hooks. " + _BIND_HINT)
+    expected = dialect.create_connect_args(engine.url)[1] if dialect is not None else {}
+    if any(params.get(key) != expected.get(key) for key in _ENGINE_SETTINGS):
+        raise ValueError(
+            "PostgresUpdates cannot inherit engine destination or TLS settings. " + _BIND_HINT
+        )
+
+
+def _engine_dsn(engine: Any) -> str:
+    url = getattr(engine, "url", None)
+    if url is None:
+        raise ValueError(
+            "PostgresUpdates needs PostgresUpdates(url=...) for a store without an engine."
+        )
+    parsed = _parse(url)
+    host = parsed.host or parsed.query.get("host")
+    database = _one(parsed.database, parsed.query, "database", "dbname")
+    if not host or not database:
+        raise ValueError(
+            "PostgresUpdates needs an explicit engine host and database; "
+            "pass PostgresUpdates(url=...)."
+        )
+    return asyncpg_dsn(parsed)
 
 
 class PostgresUpdates(LiveUpdates):
@@ -276,6 +360,7 @@ class PostgresUpdates(LiveUpdates):
             raise ValueError(f"max_message_bytes must be at most {MAX_NOTIFY_BYTES} on Postgres.")
         self.channel = validate_channel(channel)
         self._connect_args = _check_connect_args(connect_args)
+        self._explicit_connect_args = connect_args is not None
         self._send_dsn: str | None = asyncpg_dsn(url) if url is not None else None
         explicit_listen = asyncpg_dsn(listen_url) if listen_url is not None else None
         self._explicit_listen = explicit_listen
@@ -291,10 +376,10 @@ class PostgresUpdates(LiveUpdates):
         if self._send_dsn is not None:
             return
         engine = getattr(store, "_engine", None)
-        engine_url = getattr(engine, "url", None)
-        if engine_url is None:
-            raise ValueError("PostgresUpdates needs url= for a store without a SQLAlchemy engine.")
-        self._send_dsn = asyncpg_dsn(engine_url)
+        dsn = _engine_dsn(engine)
+        if not self._explicit_connect_args:
+            _check_engine_settings(engine)
+        self._send_dsn = dsn
         self._listen_dsn = self._explicit_listen or self._send_dsn
 
     def _check_tls(self) -> None:
