@@ -74,6 +74,10 @@ class _Consumer(Protocol):
     def on_gap(self) -> None: ...
 
 
+class _Gap:
+    __slots__ = ()
+
+
 class _InboundBuffer:
     def __init__(self, limit: int, dropped: Callable[[], None]) -> None:
         self._limit = limit
@@ -91,7 +95,7 @@ class _InboundBuffer:
         self._messages.append(message)
         self._ready.set()
 
-    async def get(self) -> str:
+    async def get(self) -> str | _Gap:
         """Return a gap before any retained messages after an overflow."""
         await self._ready.wait()
         if self._gap:
@@ -114,7 +118,7 @@ class LiveUpdates(ABC):
     prompt and idempotent. All limits count ids or UTF-8 wire bytes, never payloads.
     """
 
-    GAP = "\x00dendrux-live-updates-gap"
+    GAP = _Gap()
 
     def __init__(
         self,
@@ -216,11 +220,12 @@ class LiveUpdates(ABC):
         """Send encoded messages in one transport round trip, including lazy setup."""
 
     @abstractmethod
-    def receive(self) -> AsyncIterator[str | None]:
+    def receive(self) -> AsyncIterator[str | None | _Gap]:
         """Yield None after subscription acknowledgement, then raw wire messages.
 
         Detect loss within twice ``health_check_s`` on the listening connection,
         bound undelivered messages to ``max_inbound``, and close in ``finally``.
+        Yield the local ``GAP`` object after inbound overflow; wire strings are never gaps.
         """
 
     def bind(self, store: object) -> None:
@@ -493,11 +498,11 @@ class LiveUpdates(ABC):
         if registration is not None:
             self._stream_consumers -= int(registration[1])
 
-    def _deliver(self, message: str) -> None:
-        if message == self.GAP:
+    def _deliver(self, message: str | _Gap) -> None:
+        if message is self.GAP:
             self._gap()
             return
-        ids = self._decode(message)
+        ids = self._decode(cast("str", message))
         if ids is not None:
             for consumer, _ in tuple(self._consumers.values()):
                 with suppress(Exception, asyncio.CancelledError):

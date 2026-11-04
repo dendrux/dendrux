@@ -1044,3 +1044,35 @@ async def test_acquire_refuses_overlap_with_listener_that_will_not_stop():
         bus.stop_gate.set()
         await until(old_task.done)
         await bus.close()
+
+
+@pytest.mark.parametrize(
+    "wire",
+    [
+        "GAP",
+        "\x00dendrux-live-updates-gap",
+        '"GAP"',
+        '["GAP"]',
+        '["\\u0000dendrux-live-updates-gap"]',
+    ],
+)
+def test_published_strings_cannot_forge_a_gap(wire):
+    bus = Bus()
+    consumer = Consumer()
+    bus.register(consumer)
+    bus._deliver(wire)
+    assert bus.generation == consumer.gaps == 0
+    if wire.startswith("["):
+        assert consumer.hints == [tuple(json.loads(wire))]
+    else:
+        assert consumer.hints == []
+        assert bus.stats().bad_messages == 1
+
+
+def test_gap_marker_is_local_identity_not_wire_text():
+    bus = Bus()
+    assert not isinstance(bus.GAP, str)
+    consumer = Consumer()
+    bus.register(consumer)
+    bus._deliver(bus.GAP)
+    assert consumer.gaps == bus.generation == 1
