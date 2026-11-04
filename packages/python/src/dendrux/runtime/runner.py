@@ -96,6 +96,7 @@ from dendrux.loops._helpers import (
 )
 from dendrux.loops._policy_context import dispatch_policy, history_call_counts, static_denial
 from dendrux.loops.react import ReActLoop
+from dendrux.runtime import _reclaim
 from dendrux.runtime._entry_checks import resolve_runner_tenant, runner_entry_checks
 from dendrux.runtime._tenant_checks import _tenant_scope_chosen
 from dendrux.runtime._tracelink import validate_trace_link
@@ -5732,8 +5733,6 @@ async def _read_resume_state(
     *,
     streaming: bool = False,
 ) -> tuple[RunRecord | None, _PauseReads, Any, PauseState, bool, Any]:
-    from dendrux.runtime._reclaim import needs_resolution
-
     reads = _PauseReads(None if streaming else await store.get_run(run_id))
     raw = None if reclaimed is not None else supplied_raw
     if reclaimed is None and raw is None:
@@ -5753,7 +5752,7 @@ async def _read_resume_state(
             read_record=streaming,
         )
     )
-    recovering = reclaimed is not None or await needs_resolution(
+    recovering = reclaimed is not None or await _reclaim.needs_resolution(
         store, run_id, pause, checkpoint=reads.checkpoint
     )
     pii = None if streaming else await store.get_pii_mapping(run_id)
@@ -6285,9 +6284,7 @@ async def _resume_core(
             )
 
             if recovering:
-                from dendrux.runtime._reclaim import resolve
-
-                stop = await resolve(
+                stop = await _reclaim.resolve(
                     agent,
                     state_store,
                     run_id,
@@ -6735,9 +6732,7 @@ def resume_stream(
             yield RunEvent(type=RunEventType.RUN_RESUMED, run_id=run_id)
 
             if recovering:
-                from dendrux.runtime._reclaim import resolve
-
-                stop = await resolve(
+                stop = await _reclaim.resolve(
                     agent,
                     store,
                     run_id,

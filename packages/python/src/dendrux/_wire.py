@@ -10,7 +10,15 @@ from typing import TYPE_CHECKING, Any
 
 from dendrux import _codes
 from dendrux._lifecycle import HIDDEN_ANSWER_STATUSES, PAUSE_STATUSES
-from dendrux.types import JSON_MAX_DEPTH, JSON_MAX_NODES, JSON_MAX_TEXT
+from dendrux.types import (
+    JSON_MAX_DEPTH,
+    JSON_MAX_NODES,
+    JSON_MAX_TEXT,
+    ImageRef,
+    ToolResult,
+    _validate_identifier,
+    _validate_persistable,
+)
 
 _REDACTION_MAX_ENTRIES = 1000
 _REDACTION_PATTERN_CHARS = 65536
@@ -21,7 +29,7 @@ _MAX_RESULT_IMAGES = 100
 _MAX_RESULTS = 10000
 
 if TYPE_CHECKING:
-    from dendrux.types import Limits, RunResult, ToolResult
+    from dendrux.types import Limits, RunResult
 
 WIRE_VERSION = 1
 _PAUSED = PAUSE_STATUSES
@@ -201,8 +209,6 @@ def _finite_float(value: str) -> float:
 
 
 def _tool_result_fields(data: Any, limits: Limits) -> tuple[Any, Any, Any, Any, Any]:
-    from dendrux.types import _validate_identifier, _validate_persistable
-
     allowed = {"name", "call_id", "payload", "success", "error", "duration_ms", "images"}
     if not isinstance(data, dict) or set(data) - allowed:
         raise ValueError("Tool result must be an object with only supported fields")
@@ -243,8 +249,6 @@ def _payload_int(value: str) -> int:
 
 
 def _validate_payload_json(payload: str, validated_payload: str | None) -> None:
-    from dendrux.types import _validate_persistable
-
     if validated_payload is payload:
         return
     with contextlib.suppress(json.JSONDecodeError):
@@ -260,8 +264,6 @@ def _validate_payload_json(payload: str, validated_payload: str | None) -> None:
 def tool_result_from_dict(
     data: Any, limits: Limits, *, _validated_payload: str | None = None
 ) -> ToolResult:
-    from dendrux.types import ImageRef, ToolResult
-
     success, error, duration, images, metadata = _tool_result_fields(data, limits)
     try:
         if len(json.dumps(metadata, allow_nan=False).encode()) > limits.max_metadata_bytes:
