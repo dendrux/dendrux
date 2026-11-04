@@ -26,7 +26,7 @@ from dendrux.db._engine_options import (
     mysql_dependency_error,
     normalized_url,
 )
-from dendrux.db._pool_guard import close_fully
+from dendrux.db._pool_guard import _bind_to_current_loop, close_fully
 
 
 @dataclass
@@ -50,7 +50,6 @@ logger = logging.getLogger(__name__)
 async def _initialize(engine: AsyncEngine) -> None:
     from dendrux.db._schema_check import ensure_schema_current
     from dendrux.db._sqlite_sync import create_sqlite_schema
-    from dendrux.db.session import _bind_to_current_loop
 
     if engine.dialect.name == "sqlite":
         database = engine.url.database

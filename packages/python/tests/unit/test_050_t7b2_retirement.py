@@ -1,7 +1,7 @@
 """Portable pool-lifecycle unit checks; runnable with stdlib unittest on Python 3.13.
 
-The subject is the actual source module. Only its database-option and awaited
-close dependencies are doubled, so this also runs without installed SDK deps.
+The subject is the actual source module. Only its database-option and pool-guard
+dependencies are doubled, so this also runs without installed SDK deps.
 Real SQLAlchemy/asyncpg integration is tested separately.
 """
 
@@ -30,6 +30,7 @@ def _load_subject():
     ):
         setattr(options, name, Mock())
     guard = types.ModuleType("dendrux.db._pool_guard")
+    guard._bind_to_current_loop = Mock()
     guard.close_fully = _close_fully
     source = Path(__file__).resolve().parents[2] / "src/dendrux/db/_shared_pool.py"
     spec = importlib.util.spec_from_file_location("_retirement_subject", source)

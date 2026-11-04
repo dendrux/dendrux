@@ -14,7 +14,6 @@ Agent. URLs in messages are always masked.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
 import threading
@@ -30,7 +29,13 @@ if TYPE_CHECKING:
 
 from dendrux import _codes
 from dendrux._redact import mask_database_url
-from dendrux.db._pool_guard import close_fully, serialized, shares_one_connection
+from dendrux.db import _shared_pool
+from dendrux.db._pool_guard import (
+    _bind_to_current_loop,
+    close_fully,
+    serialized,
+    shares_one_connection,
+)
 from dendrux.db._schema_check import ensure_schema_current
 from dendrux.db._sqlite_sync import create_sqlite_schema
 
@@ -71,56 +76,6 @@ def _published(resolved_url: str) -> AsyncEngine | None:
     return _engine
 
 
-def _bind_to_current_loop(engine: AsyncEngine) -> None:
-    """Make every pool checkout on another event loop fail with a clear error.
-
-    asyncpg connections belong to the loop that opened them; sharing the
-    global engine across loops (a new loop per request, ``asyncio.run`` per
-    call, worker threads) otherwise fails deep inside the driver. SQLite
-    connections are not loop-bound, so SQLite engines are left alone.
-    """
-    if engine.dialect.name == "sqlite":
-        return
-    from sqlalchemy import event
-
-    owner = asyncio.get_running_loop()
-
-    def _check_loop(*_args: object) -> None:
-        try:
-            current = asyncio.get_running_loop()
-        except RuntimeError:
-            return
-        if current is not owner:
-            raise RuntimeError(
-                "The shared dendrux database engine was created "
-                "on a different event loop and cannot be used from this one. Create one "
-                "state store per process on the loop that serves requests and pass "
-                "state_store= to every Agent, or call dendrux.db.session.reset_engine() "
-                "before switching loops."
-            )
-
-    # Pool checkout events run *after* pre-ping. Reject at the public Engine
-    # acquisition boundary, before the pool can ping, open or invalidate an
-    # asyncpg connection on the wrong loop. This also covers raw_connection
-    # and survives dispose(), which replaces the pool on this same Engine.
-    # Guard both public entry points: normal acquisition need not route through
-    # raw_connection in Connection.__init__ on any particular SQLAlchemy minor.
-    connect = engine.sync_engine.connect
-    raw_connection = engine.sync_engine.raw_connection
-
-    def _checked_connect() -> Any:
-        _check_loop()
-        return connect()
-
-    def _checked_connection() -> Any:
-        _check_loop()
-        return raw_connection()
-
-    engine.sync_engine.connect = _checked_connect  # type: ignore[method-assign]
-    engine.sync_engine.raw_connection = _checked_connection  # type: ignore[method-assign]
-    event.listen(engine.sync_engine, "checkout", _check_loop)
-
-
 async def _initialize_engine(engine: AsyncEngine) -> None:
     if engine.dialect.name == "sqlite":
         database = engine.url.database
@@ -143,7 +98,6 @@ async def get_engine(
     """
     global _engine, _engine_url, _session_factory, _engine_options_key
     from dendrux.db._engine_options import engine_options, frozen_options, normalized_url
-    from dendrux.db._shared_pool import acquire, release
 
     parsed = normalized_url(url or get_database_url())
     resolved_url = parsed.render_as_string(hide_password=False)
@@ -158,7 +112,7 @@ async def get_engine(
                 )
         if ready is not None:
             return ready
-        candidate = await acquire(
+        candidate = await _shared_pool.acquire(
             resolved_url,
             database_options,
             factory=create_async_engine,
@@ -171,7 +125,7 @@ async def get_engine(
                     candidate, class_=AsyncSession, expire_on_commit=False
                 )
                 return candidate
-        await release(candidate)
+        await _shared_pool.release(candidate)
 
 
 async def reset_engine() -> None:
@@ -190,9 +144,7 @@ async def reset_engine() -> None:
         _session_factory = None
     # Dispose outside the lock — no deadlock risk
     if engine is not None:
-        from dendrux.db._shared_pool import release
-
-        await release(engine)
+        await _shared_pool.release(engine)
 
 
 @asynccontextmanager
