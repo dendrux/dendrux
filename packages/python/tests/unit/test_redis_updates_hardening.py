@@ -154,3 +154,69 @@ async def test_real_pool_cleanup_that_never_returns_cannot_strand_a_socket() -> 
         await updates.close()
     assert aborted == [True]
     pool._available_connections.clear()
+
+
+# -- R3: an incoming message is bounded before it is read into memory --------------------------
+
+
+def listen_parser(updates: ru.RedisUpdates) -> tuple[Any, Any]:
+    """The protocol parser redis-py would use on the listen connection, over an in-memory stream."""
+    subscription = ru._Subscription(updates)
+    connection = subscription.pool.make_connection()
+    connection._reader = asyncio.StreamReader()
+    connection._parser.on_connect(connection)
+    return connection._parser, connection._reader
+
+
+def message(size: int) -> bytes:
+    return (
+        b"*3\r\n$7\r\nmessage\r\n$1\r\nc\r\n$"
+        + str(size).encode()
+        + b"\r\n"
+        + b"x" * size
+        + b"\r\n"
+    )
+
+
+async def test_real_a_message_at_the_bound_is_read_and_one_byte_more_is_refused() -> None:
+    updates = ru.RedisUpdates(f"redis://{HOST}/0", **FAST)  # max_message_bytes 7,900
+    parser, reader = listen_parser(updates)
+    reader.feed_data(message(7_900))
+    assert len((await parser.read_response())[2]) == 7_900
+    reader.feed_data(message(7_901))
+    with pytest.raises(Exception) as caught:
+        await parser.read_response()
+    assert type(updates._plain_error(caught.value)) is ConnectionError
+    assert "xxxx" not in str(caught.value)
+
+
+async def test_real_a_realistic_message_ten_times_over_is_read() -> None:
+    parser, reader = listen_parser(ru.RedisUpdates(f"redis://{HOST}/0", **FAST))
+    reader.feed_data(message(1_000))  # a normal hint is about 100 bytes
+    assert len((await parser.read_response())[2]) == 1_000
+
+
+async def test_real_a_huge_declared_length_is_refused_before_any_body_arrives() -> None:
+    parser, reader = listen_parser(ru.RedisUpdates(f"redis://{HOST}/0", **FAST))
+    reader.feed_data(b"*3\r\n$7\r\nmessage\r\n$1\r\nc\r\n$1000000000\r\n")  # and no body at all
+    with pytest.raises(Exception) as caught:  # noqa: B017
+        async with asyncio.timeout(1):  # waiting for the body would end in this timeout instead
+            await parser.read_response()
+    assert not isinstance(caught.value, TimeoutError)
+
+
+async def test_real_the_bound_follows_max_message_bytes() -> None:
+    parser, reader = listen_parser(ru.RedisUpdates(f"redis://{HOST}/0", max_message_bytes=3_000))
+    reader.feed_data(message(3_000))
+    assert len((await parser.read_response())[2]) == 3_000
+    reader.feed_data(message(3_001))
+    with pytest.raises(Exception):  # noqa: B017
+        await parser.read_response()
+
+
+def test_real_a_redis_client_without_a_boundable_parser_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(__import__("sys").modules, "redis._parsers", None)
+    with pytest.raises(ImportError, match=r"dendrux\[redis\]"):
+        ru._load_api()

@@ -61,12 +61,14 @@ def _load_api() -> Any:
     """The parts of ``redis.asyncio`` this module uses; the one place that imports redis."""
     try:
         from redis import exceptions
+        from redis._parsers import _AsyncRESP2Parser
         from redis.asyncio import ConnectionPool, Redis
         from redis.asyncio.retry import Retry
         from redis.backoff import NoBackoff
     except ImportError:
         raise ImportError(INSTALL_HINT) from None
     return SimpleNamespace(
+        bounded_parser=lambda limit: _bounded_parser(_AsyncRESP2Parser, limit),
         ConnectionPool=ConnectionPool,
         Redis=Redis,
         Retry=Retry,
@@ -75,6 +77,28 @@ def _load_api() -> Any:
         TimeoutError=exceptions.TimeoutError,
         RedisError=exceptions.RedisError,
     )
+
+
+class _OversizeMessageError(Exception):
+    """A bulk reply longer than the bound. The stream is no longer in step: drop the connection."""
+
+
+def _bounded_parser(base: type, limit: int) -> type:
+    """``base`` (redis-py's pure-Python RESP2 parser) refusing a bulk longer than ``limit``.
+
+    redis-py reads a bulk reply with ``_read(length)`` after parsing its declared length, so
+    checking the length there refuses an oversized message before any of its body is read or
+    allocated. This relies on the ``parser_class`` connection option and on that internal hook;
+    ``_load_api`` fails closed if the installed redis-py does not have them.
+    """
+
+    class BoundedParser(base):  # type: ignore[misc]
+        async def _read(self, length: int) -> bytes:
+            if length > limit:
+                raise _OversizeMessageError
+            return bytes(await super()._read(length))
+
+    return BoundedParser
 
 
 class _Redacted:
@@ -158,7 +182,7 @@ class _Subscription:
 
     def __init__(self, owner: RedisUpdates) -> None:
         self.owner = owner
-        self.pool = owner._new_pool(owner.send_timeout_s * 4)
+        self.pool = owner._new_pool(owner.send_timeout_s * 4, listening=True)
         self.pubsub = owner._api.Redis(connection_pool=self.pool).pubsub()
         self._idle_until = monotonic() + owner.health_check_s
         self._token: str | None = None
@@ -258,7 +282,7 @@ class RedisUpdates(LiveUpdates):
     def __repr__(self) -> str:
         return f"RedisUpdates(channel={self._channel!r})"
 
-    def _new_pool(self, socket_timeout_s: float) -> Any:
+    def _new_pool(self, socket_timeout_s: float, *, listening: bool = False) -> Any:
         api = self._api
         options = {
             **self._options.reveal(),
@@ -267,6 +291,12 @@ class RedisUpdates(LiveUpdates):
             "socket_connect_timeout": self.send_timeout_s,
             "retry": api.Retry(api.NoBackoff(), 0),
         }
+        if listening:
+            # RESP2 with a parser that refuses an oversized message before reading it
+            options["protocol"] = 2
+            options["parser_class"] = api.bounded_parser(
+                max(self.max_message_bytes, 4 * MAX_CHANNEL_LENGTH)
+            )
         return api.ConnectionPool.from_url(self._url.reveal(), **options)
 
     def _check_options(self) -> None:
@@ -274,12 +304,15 @@ class RedisUpdates(LiveUpdates):
         valid = True
         try:
             self._new_pool(self.send_timeout_s).make_connection()
+            self._new_pool(self.send_timeout_s, listening=True).make_connection()
         except Exception:
             valid = False
         if not valid:
             raise ValueError("url or client_options are not accepted by the Redis client")
 
     def _plain_error(self, error: BaseException) -> Exception:
+        if isinstance(error, _OversizeMessageError):
+            return ConnectionError("Redis live updates message too large")
         if isinstance(error, (TimeoutError, self._api.TimeoutError)):
             return TimeoutError("Redis live updates timed out")
         if isinstance(error, (OSError, self._api.ConnectionError)):

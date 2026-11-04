@@ -333,6 +333,27 @@ async def test_a_killed_listener_connection_surfaces_a_gap_and_resubscribes_once
     await writer.close()
 
 
+async def test_an_oversized_message_drops_the_listener_connection_and_surfaces_a_gap(
+    admin: Any, channel: str, name: str
+) -> None:
+    reader = make(channel=channel, client_options={"client_name": name})
+    consumer = Consumer()
+    lease = await listening(reader, consumer)
+    gaps = consumer.gaps
+    await admin.publish(channel, "x" * 1_000_000)  # 127x the 7,900-byte bound
+    # the listener refused it before reading the body, dropped the connection, and recovered
+    await eventually(lambda: consumer.gaps == gaps + 2 and reader.healthy)
+    assert consumer.hints == [] and reader.stats().bad_messages == 0  # it never reached the decoder
+    await eventually_async(lambda: _count(admin, name), 1)
+    writer = make(channel=channel)
+    writer.enqueue(["R1"])
+    await writer.flush()
+    await eventually(lambda: consumer.ids == ["R1"])
+    await reader.release_listener(lease)
+    await reader.close()
+    await writer.close()
+
+
 async def test_a_stalled_publish_is_aborted_and_the_next_send_uses_a_fresh_connection(
     proxy: Proxy, channel: str
 ) -> None:

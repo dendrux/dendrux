@@ -245,6 +245,7 @@ class FakeWorld:
                 return FakePool(world, url, kwargs)
 
         return SimpleNamespace(
+            bounded_parser=lambda limit: ("bounded", limit),
             ConnectionPool=ConnectionPool,
             Redis=FakeRedis,
             Retry=FakeRetry,
