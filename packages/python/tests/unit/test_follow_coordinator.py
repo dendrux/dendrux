@@ -667,6 +667,62 @@ async def test_status_failures_back_off_even_while_event_reads_succeed(clock: Cl
     assert gaps[:3] == [0.5, 1.0, 2.0]
 
 
+async def test_hints_never_shorten_status_failure_backoff(clock: Clock) -> None:
+    state = BatchedState()
+    state.create("r1")
+    attempts: list[float] = []
+    feed = _feed(_store(state))
+    live, _ = await _healthy(state, feed.store, feed, "r1")
+
+    async def failing(run_ids: Any) -> dict[str, str]:
+        attempts.append(clock.now)
+        raise OSError("status backend down")
+
+    state.get_run_statuses = failing  # type: ignore[method-assign]
+    start = clock.now
+    while clock.now - start < 5:
+        state.write("r1")
+        live.hint("r1")  # a healthy bus keeps announcing new events
+        await ticks()
+        clock.advance(0.1)
+    gaps = [round(b - a, 2) for a, b in zip(attempts, attempts[1:], strict=False)]
+    assert len(gaps) >= 3
+    for gap, backoff in zip(gaps, [0.5, 1.0, 2.0], strict=False):
+        assert backoff <= gap <= backoff + 0.15
+
+
+async def test_a_hint_during_a_failing_status_read_does_not_skip_the_backoff(
+    clock: Clock,
+) -> None:
+    state = BatchedState()
+    state.create("r1")
+    feed = _feed(_store(state))
+    live, _ = await _healthy(state, feed.store, feed, "r1")
+    attempts: list[float] = []
+    gate = asyncio.Event()
+
+    async def failing(run_ids: Any) -> dict[str, str]:
+        attempts.append(clock.now)
+        await gate.wait()
+        raise OSError("status backend down")
+
+    state.get_run_statuses = failing  # type: ignore[method-assign]
+    live.hint("r1")
+    await ticks()
+    assert len(attempts) == 1
+    live.hint("r1")  # arrives while the status read is failing
+    await ticks()
+    gate.set()
+    await ticks()
+    clock.advance(0.4)
+    live.hint("r1")
+    await ticks()
+    assert len(attempts) == 1  # still inside the 0.5 s retry delay
+    clock.advance(0.2)
+    await ticks()
+    assert len(attempts) == 2
+
+
 # --------------------------------------------------------------------------- missed hints
 
 

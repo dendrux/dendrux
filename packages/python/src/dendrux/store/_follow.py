@@ -255,6 +255,9 @@ class _WatchedRun:
         self.dirty = self.hints = self.reads = 0
         self.delay = self.params.poll_interval_s
         self.events_fail_delay = self.status_fail_delay = 0.0
+        # After a failed status read, no status read before this time; requests,
+        # hints and requeues move ``status_due`` but never this deadline.
+        self.status_retry_at = -math.inf
         self.missed_logged = False
         self._view: PauseView | None = None
         self._view_generation = 0
@@ -270,8 +273,11 @@ class _WatchedRun:
             return False
         return not (self.terminal and all(f.until_terminal for f in self.followers))
 
+    def status_ready_at(self) -> float:
+        return max(self.status_due, self.status_retry_at)
+
     def due_at(self) -> float:
-        return min(self.events_due, self.status_due) if self.active else _NEVER
+        return min(self.events_due, self.status_ready_at()) if self.active else _NEVER
 
     def add(self, follower: _Follower) -> int | None:
         """Register ``follower``; return the head it must catch up to from the database."""
@@ -615,7 +621,7 @@ class _Coordinator:
 
     @staticmethod
     def _status_due(run: _WatchedRun, now: float, events: list[_WatchedRun]) -> bool:
-        if run.status_terminal or (run.status_fail_delay and run.status_due > now):
+        if run.status_terminal or run.status_retry_at > now:
             return False  # terminal, or backing off after a failed status read
         due = run.status_due <= now or (run.status_with_next and run in events)
         if due:
@@ -770,7 +776,7 @@ class _Coordinator:
         """A missing run (deleted) counts as terminal; a failed read never does."""
         if self.runs.get(run.run_id) is not run:
             return
-        run.status_fail_delay = 0.0
+        run.status_fail_delay, run.status_retry_at = 0.0, -math.inf
         if status is not None and status not in TERMINAL_STATUSES:
             run.status_due = now + STATUS_MAX_AGE_S
             return
@@ -792,7 +798,7 @@ class _Coordinator:
         for run in runs:
             if status:
                 run.status_fail_delay = _backoff(run.status_fail_delay, run.params)
-                run.status_due = now + run.status_fail_delay
+                run.status_retry_at = run.status_due = now + run.status_fail_delay
             else:
                 run.events_fail_delay = _backoff(run.events_fail_delay, run.params)
                 run.events_due = now + run.events_fail_delay
