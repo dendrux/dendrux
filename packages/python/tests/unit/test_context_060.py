@@ -40,11 +40,10 @@ def test_traceparent_valid_and_delegation_fields():
 
 
 def test_store_options_never_reach_create_async_engine():
-    options = _engine_options.engine_options(
-        "sqlite+aiosqlite://", {"notify_channel": "app_events", "echo": True}
-    )
-    assert "notify_channel" not in options, "notify_channel is a store option"
-    assert options["echo"] is True
+    supplied = {"notify_channel": "app_events", "echo": True}
+    with pytest.raises(ValueError, match="explicit store"):
+        _engine_options.engine_options("sqlite+aiosqlite://", supplied)
+    assert supplied == {"notify_channel": "app_events", "echo": True}
 
 
 def test_delegation_context_preserves_legacy_positional_slots():
