@@ -234,7 +234,9 @@ async def stage_3_streaming_approve(db_url, notifier) -> None:
     ) as agent:
         first = await _drain_stream(agent.stream("Refund order 7.", notifier=notifier))
         assert first.status == RunStatus.WAITING_APPROVAL, first.status
-        await _drain_stream(agent.resume_stream(first.run_id, notifier=notifier))
+        await _drain_stream(
+            agent.resume_stream(first.run_id, expected_pause_id=first.pause_id, notifier=notifier)
+        )
 
 
 async def stage_4_sync_reject(db_url, notifier) -> None:
@@ -253,6 +255,7 @@ async def stage_4_sync_reject(db_url, notifier) -> None:
             first.run_id,
             approved=False,
             rejection_reason="Manager declined — order too old.",
+            expected_pause_id=first.pause_id,
             notifier=notifier,
         )
 

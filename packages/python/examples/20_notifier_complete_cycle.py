@@ -232,7 +232,7 @@ async def stage_2_streaming_deny(db_url: str, notifier) -> None:
 async def stage_3_streaming_approve(db_url: str, notifier) -> None:
     _banner(
         "Stage 3 — streaming approval (approve via resume_stream)",
-        "Initial run pauses; resume_stream(no-args) executes the approved tool.",
+        "Initial run pauses; resume_stream(expected_pause_id=...) executes the approved tool.",
     )
     async with Agent(
         provider=AnthropicProvider(model=MODEL),
@@ -245,7 +245,9 @@ async def stage_3_streaming_approve(db_url: str, notifier) -> None:
         first = await _drain_stream(agent.stream("Refund order 7.", notifier=notifier))
         assert first.status == RunStatus.WAITING_APPROVAL, first.status
         # Approve via streaming resume — fires a fresh lifecycle pair.
-        await _drain_stream(agent.resume_stream(first.run_id, notifier=notifier))
+        await _drain_stream(
+            agent.resume_stream(first.run_id, expected_pause_id=first.pause_id, notifier=notifier)
+        )
 
 
 async def stage_4_sync_reject(db_url: str, notifier) -> None:
@@ -268,6 +270,7 @@ async def stage_4_sync_reject(db_url: str, notifier) -> None:
             first.run_id,
             approved=False,
             rejection_reason="Manager declined — order too old.",
+            expected_pause_id=first.pause_id,
             notifier=notifier,
         )
 

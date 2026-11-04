@@ -67,6 +67,7 @@
 <script>
   let currentRunId = null;
   let pendingToolCalls = [];
+  let currentPauseId = null;
 
   // -- UI helpers --------------------------------------------------------
 
@@ -95,6 +96,7 @@
     document.getElementById("tool-form").style.display = "none";
     document.getElementById("tool-result-input").value = "";
     pendingToolCalls = [];
+    currentPauseId = null;
   }
 
   // -- NDJSON stream consumer --------------------------------------------
@@ -184,6 +186,7 @@
   function handlePause(runResult) {
     const toolCalls = runResult.pending_tool_calls || [];
     pendingToolCalls = toolCalls;
+    currentPauseId = runResult.pause_id || null;  // the pause this user is reviewing
 
     if (toolCalls.length > 0) {
       // UI handles the first pending tool call only
@@ -255,7 +258,7 @@
     const resp = await fetch("/resume/" + currentRunId, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ tool_results: results }),
+      body: JSON.stringify({ tool_results: results, pause_id: currentPauseId }),
     });
 
     if (!resp.ok) {

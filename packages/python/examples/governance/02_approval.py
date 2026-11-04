@@ -80,12 +80,13 @@ async def main() -> None:
             return
 
         # Show what's pending
-        pause = result.meta["pause_state"]
+        pending = result.pending
+        assert pending is not None
         print(f"\n{'=' * 50}")
         print(f"Run paused — {result.status.value}")
         print(f"Run ID: {result.run_id}")
         print(f"{'=' * 50}")
-        for tc in pause.pending_tool_calls:
+        for tc in pending.tool_calls:
             print(f"  Pending: {tc.name}({tc.params})")
         print()
 
@@ -95,7 +96,10 @@ async def main() -> None:
         if choice == "y":
             # Approve — framework executes the pending tools
             print("\nApproving...\n")
-            result = await agent.resume(result.run_id, notifier=notifier)
+            # Approving needs the id of the pause the operator just reviewed.
+            result = await agent.resume(
+                result.run_id, expected_pause_id=result.pause_id, notifier=notifier
+            )
         else:
             # Reject — provide rejection reason as tool error
             reason = input("Rejection reason: ").strip() or "Rejected by operator"
@@ -112,8 +116,9 @@ async def main() -> None:
                         success=False,
                         error=reason,
                     )
-                    for tc in pause.pending_tool_calls
+                    for tc in pending.tool_calls
                 ],
+                expected_pause_id=result.pause_id,
                 notifier=notifier,
             )
 

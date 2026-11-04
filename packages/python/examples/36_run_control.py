@@ -135,6 +135,7 @@ async def per_call_approval(agent: Agent, store: RunStore) -> None:
             first["id"]: ApprovalDecision.approve(),
             second["id"]: ApprovalDecision.deny("Order 2 is outside the refund window"),
         },
+        expected_pause_id=paused.pause_id,  # the pause the reviewer saw
     )
     decided = (await store.get_events(paused.run_id, event_types=["approval.decided"]))[0]
     print("status:", done.status.value)
@@ -156,7 +157,9 @@ async def policy_hook(agent: Agent, store: RunStore) -> None:
 
     # Only the hook-gated call needs a decision; the held lookup runs on its own.
     done = await agent.submit_approval(
-        paused.run_id, decisions={data(gates[0])["call_id"]: ApprovalDecision.approve()}
+        paused.run_id,
+        decisions={data(gates[0])["call_id"]: ApprovalDecision.approve()},
+        expected_pause_id=paused.pause_id,
     )
     print("status:", done.status.value)
     print("emails sent:", EMAILS, "| rows deleted:", DELETED)

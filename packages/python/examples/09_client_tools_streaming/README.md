@@ -53,7 +53,7 @@ Each line is a JSON object with a `type` field:
 | `tool_use_start` | `tool_name`, `tool_call_id` |
 | `tool_use_end` | `tool_name`, `tool_call_id` |
 | `tool_result` | `tool_result.call_id`, `.name`, `.success`, `.payload` |
-| `run_paused` | `run_result.status`, `run_result.pending_tool_calls` |
+| `run_paused` | `run_result.status`, `run_result.pause_id`, `run_result.pending_tool_calls` |
 | `run_completed` | `run_result.status`, `run_result.answer` |
 | `run_error` | `error` |
 
@@ -64,11 +64,17 @@ POST /resume/{run_id}
 Content-Type: application/json
 
 {
+  "pause_id": "...",
   "tool_results": [
     { "call_id": "...", "name": "read_excel_range", "result": "\"A1: Revenue\"" }
   ]
 }
 ```
+
+`pause_id` is the id the `run_paused` event carried in `run_result.pause_id`: the pause
+the user reviewed. The route passes it to `resume_stream(expected_pause_id=...)`, which
+refuses a stale or missing id under the default strict tenancy. The server never looks
+up the newest pause id itself.
 
 `result` is a JSON-encoded string. The response is an NDJSON stream
 with the same event vocabulary — first event is `run_resumed`.

@@ -103,6 +103,9 @@ def _serialize_event(event: RunEvent) -> dict[str, Any]:
             rd["answer"] = r.answer
         if r.error is not None:
             rd["error"] = r.error
+        if r.pause_id is not None:
+            # The browser sends this back on resume, so Dendrux can refuse a stale decision.
+            rd["pause_id"] = r.pause_id
         # On RUN_PAUSED: include pending tool calls for the browser
         ps = r.pending
         if ps is not None:
@@ -247,7 +250,15 @@ def create_demo_app():
                 content={"error": "Invalid tool_results: each item needs call_id and result"},
             )
 
-        stream = agent.resume_stream(run_id, tool_results=tool_results, tenant_id=None)
+        # The pause generation the browser reviewed. Dendrux requires it under strict
+        # tenancy; do not look up the newest one here, that would defeat the check.
+        pause_id = body.get("pause_id")
+        if pause_id is not None and (not isinstance(pause_id, str) or not 0 < len(pause_id) <= 26):
+            return JSONResponse(status_code=400, content={"error": "Invalid pause_id"})
+
+        stream = agent.resume_stream(
+            run_id, tool_results=tool_results, expected_pause_id=pause_id, tenant_id=None
+        )
         return _ndjson_response(stream)
 
     return app
