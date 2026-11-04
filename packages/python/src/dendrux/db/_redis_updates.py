@@ -195,9 +195,8 @@ class _Subscription:
             self._token = None
             self._idle_until = monotonic() + self.owner.health_check_s
         elif self._acknowledges(reply):
-            return (
-                LiveUpdates.GAP
-            )  # a subscribe acknowledgement after the first: a hidden reconnect
+            # a second subscribe acknowledgement means the client resubscribed behind our back
+            return LiveUpdates.GAP
         return None
 
     async def _on_silence(self) -> None:
@@ -209,7 +208,8 @@ class _Subscription:
 
     async def close(self) -> None:
         self.abort()  # first, synchronously: nothing below may leave the socket open
-        self.owner._subscription = None
+        if self.owner._subscription is self:
+            self.owner._subscription = None
         with suppress(Exception):
             await self.pubsub.aclose()
         with suppress(Exception):
