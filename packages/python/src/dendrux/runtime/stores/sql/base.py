@@ -1035,14 +1035,20 @@ class SQLStateStore(SQLBlobCatalog):
             raise ValueError(
                 f"{type(self).__name__} requires a LiveUpdates instance; use RedisUpdates"
             )
+        from dendrux.runtime.stores.sql._live_registry import register
+
         updates.bind(self)
+        register(self)
         return updates
 
 
     async def close(self) -> None:
         """Close store-owned live updates without disposing the engine."""
+        from dendrux.runtime.stores.sql._live_registry import deregister
+
         if self._live_updates is not None:
             await self._live_updates.close()
+            deregister(self)
 
 
     async def _check_connection(self, session: AsyncSession) -> None:
