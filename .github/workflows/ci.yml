@@ -153,6 +153,24 @@ jobs:
             exit 1
           fi
 
+      # The kit's live-update contract on Postgres: serial, on a private database the conformance
+      # harness is told to authorise (it drops and recreates that database's schema). It needs the
+      # stores to take live_updates= (track A2); without it every live contract skips and the guard
+      # below fails the job on purpose.
+      - name: Store kit live-update contract on Postgres
+        if: matrix.shard == 1 && matrix.python-version == '3.12' && matrix.sqlalchemy-version == '2.1.*'
+        shell: bash
+        env:
+          DENDRUX_TEST_PG_URL: postgresql+asyncpg://dendrux:dendrux@localhost:5432/dendrux_ci_kit_test
+          DENDRUX_CONFORMANCE_PG_DB: dendrux_ci_kit_test
+        run: |
+          pytest tests/conformance/test_store_kit.py -k "test_live_ and postgres" -n 0 --no-cov -v -rs -p no:randomly | tee kit-live.log
+          passed=$(grep -c ' PASSED' kit-live.log || true)
+          if [ "$passed" -lt 7 ] || grep -Eq ' SKIPPED|[0-9]+ skipped|live updates: not tested|no tests ran' kit-live.log; then
+            echo "::error::The live-update kit contract must pass 7 times on Postgres and skip never (got $passed passed)."
+            exit 1
+          fi
+
       - name: Coverage leg name
         id: leg
         shell: bash
@@ -439,6 +457,21 @@ jobs:
             -v -rs -n 4 -m "not benchmark" --cov=src/dendrux --cov-report= | tee pytest.log
           if grep -q '${{ matrix.env_name }} not set' pytest.log; then
             echo "::error::${{ matrix.server }} tests were skipped (${{ matrix.env_name }} not set)."
+            exit 1
+          fi
+
+      # The kit's live-update contract on this server (the conformance harness makes a private
+      # database per test). Needs live_updates= on the stores (track A2); a skip fails the job.
+      - name: Store kit live-update contract on ${{ matrix.server }}
+        shell: bash
+        env:
+          SERVER_URL: mysql+asyncmy://root:dendrux_test@127.0.0.1:${{ matrix.port }}/dendrux_ci_test
+        run: |
+          export ${{ matrix.env_name }}="$SERVER_URL"
+          pytest tests/conformance/test_store_kit.py -k "test_live_ and ${{ matrix.server }}" -n 0 --no-cov -v -rs -p no:randomly | tee kit-live.log
+          passed=$(grep -c ' PASSED' kit-live.log || true)
+          if [ "$passed" -lt 7 ] || grep -Eq ' SKIPPED|[0-9]+ skipped|live updates: not tested|no tests ran' kit-live.log; then
+            echo "::error::The live-update kit contract must pass 7 times on ${{ matrix.server }} and skip never (got $passed passed)."
             exit 1
           fi
 
