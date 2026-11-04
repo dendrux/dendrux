@@ -817,13 +817,12 @@ class PersistenceRecorder(BaseRecorder):
         semantic_messages: list[Message] | None = None,
         semantic_tools: list[ToolDef] | None = None,
     ) -> None:
-        if self._format2:
-            if self._loop_source is not None:
-                await self._snapshot(iteration - 1)
-                if self._loop_state != self._durable_state:
-                    await self._checkpoint()
-            # Ownership can still change between this read and the network send.
-            await self._store_calls.get_run_control(run_id)
+        if self._format2 and self._loop_source is not None:
+            await self._snapshot(iteration - 1)
+            if self._loop_state != self._durable_state:
+                await self._checkpoint()
+        # Ownership can still change between this read and the network send.
+        await self._store_calls.get_run_control(run_id)
         await self._cancel_guard.check(run_id)
 
     async def checkpoint_outcome(self, result: Any, provider_kwargs: Any) -> None:

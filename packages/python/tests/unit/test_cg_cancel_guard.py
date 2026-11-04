@@ -10,6 +10,7 @@ import pytest
 from dendrux import Agent, SingleCall
 from dendrux.runtime import _cancel_guard
 from dendrux.runtime.persistence import PersistenceRecorder
+from dendrux.runtime.state import RunControl
 from dendrux.types import LLMResponse, ToolCall, generate_ulid
 from tests._helpers.scripted_provider import ScriptedLLM
 
@@ -28,7 +29,12 @@ async def lose_cancel(*args, **kwargs):
 
 
 def recorder():
-    return PersistenceRecorder(SimpleNamespace(touch_progress=AsyncMock()), RUN_ID)
+    return PersistenceRecorder(
+        SimpleNamespace(
+            touch_progress=AsyncMock(), get_run_control=AsyncMock(return_value=RunControl())
+        ),
+        RUN_ID,
+    )
 
 
 @pytest.mark.parametrize("hook", ["model", "tool"])

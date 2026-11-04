@@ -1,4 +1,4 @@
-"""The dispatch ownership read propagates refusal and leaves legacy runs alone."""
+"""The dispatch ownership read propagates refusal on both storage formats."""
 
 import asyncio
 from types import SimpleNamespace
@@ -26,6 +26,7 @@ def recorder(control, *, storage_format=2):
     return PersistenceRecorder(bound, RUN_ID), store.get_run_control
 
 
+@pytest.mark.parametrize("storage_format", [1, 2])
 @pytest.mark.parametrize(
     "control",
     [
@@ -35,8 +36,8 @@ def recorder(control, *, storage_format=2):
     ],
     ids=["new-owner", "no-longer-running", "missing-row"],
 )
-async def test_dispatch_read_refuses_lost_ownership(control, caplog):
-    persistence, read = recorder(control)
+async def test_dispatch_read_refuses_lost_ownership(control, caplog, storage_format):
+    persistence, read = recorder(control, storage_format=storage_format)
     with pytest.raises(RunFencedError) as caught:
         await persistence.on_llm_call_started(RUN_ID, 1)
     assert caught.value.run_id == RUN_ID
@@ -45,9 +46,12 @@ async def test_dispatch_read_refuses_lost_ownership(control, caplog):
     assert any(record.code == "run_fenced" and record.run_id == RUN_ID for record in caplog.records)
 
 
+@pytest.mark.parametrize("storage_format", [1, 2])
 @pytest.mark.parametrize("error", [PersistenceError(retryable=False), asyncio.CancelledError()])
-async def test_dispatch_read_failure_propagates(error):
-    persistence, read = recorder(RunControl(claim_epoch=3, status="running"))
+async def test_dispatch_read_failure_propagates(error, storage_format):
+    persistence, read = recorder(
+        RunControl(claim_epoch=3, status="running"), storage_format=storage_format
+    )
     read.side_effect = error
     with pytest.raises(type(error)) as caught:
         await persistence.on_llm_call_started(RUN_ID, 1)
@@ -55,10 +59,10 @@ async def test_dispatch_read_failure_propagates(error):
     read.assert_awaited_once()
 
 
-async def test_legacy_dispatch_does_not_read_ownership():
-    persistence, read = recorder(RunControl(), storage_format=1)
+async def test_legacy_dispatch_reads_current_ownership():
+    persistence, read = recorder(RunControl(claim_epoch=3, status="running"), storage_format=1)
     await persistence.on_llm_call_started(RUN_ID, 1)
-    read.assert_not_awaited()
+    read.assert_awaited_once_with(RUN_ID)
 
 
 @pytest.mark.parametrize("stream", [False, True])

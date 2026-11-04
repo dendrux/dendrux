@@ -2,11 +2,10 @@
 
 ## 0.6.0
 
-- Format-2 runs check that this process still owns the run immediately before each
+- Runs on both storage formats check that this process still owns the run immediately before each
   provider call (one primary-key read). A stale owner stops with the existing
   `RunFencedError` outcome instead of making a model call whose result would be
   discarded. A database read failure at that point now fails the run before the call.
-  Format-1 runs are unchanged.
 - Default local database resolution now uses `./dendrux.db` for runtime helpers,
   every CLI command and migrations when `DENDRUX_DATABASE_URL` is unset.
   If only `~/.dendrux/dendrux.db` exists, log `local_database_default_changed`;
@@ -203,6 +202,8 @@
 - ConsoleNotifier warns when unused show_llm_text or max_text_length options are set to non-default values.
 
 ### Fixed
+
+- Format-1 runs check ownership before each provider call and stop if ownership cannot be verified.
 
 - SingleCall stops before retrying a provider call when an image guardrail blocks the retry.
 
