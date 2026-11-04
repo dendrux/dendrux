@@ -21,6 +21,7 @@ import codecs
 import secrets
 import threading
 from contextlib import suppress
+from functools import lru_cache
 from time import monotonic
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
@@ -155,16 +156,19 @@ def _problem_with(connection_class: type, parser_class: type, limit: int) -> str
     return outcome[0] if outcome else "the check did not finish"
 
 
-_PARSER_CHECKS: dict[tuple[type, int], tuple[type, str | None]] = {}
+# Retain at most 32 checked configurations; active instances own their parser after eviction.
+_PARSER_CACHE_CAPACITY = 32
+
+
+@lru_cache(maxsize=_PARSER_CACHE_CAPACITY)
+def _checked_parser(connection_class: type, base: type, limit: int) -> tuple[type, str | None]:
+    parser = _bounded_parser(base, limit)
+    return parser, _problem_with(connection_class, parser, limit)
 
 
 def _verified_parser(connection_class: type, base: type, limit: int) -> type:
     """The bounded parser for ``base``, or ``ImportError`` if redis-py cannot be made to bound."""
-    key = (base, limit)
-    if key not in _PARSER_CHECKS:
-        parser = _bounded_parser(base, limit)
-        _PARSER_CHECKS[key] = (parser, _problem_with(connection_class, parser, limit))
-    parser, problem = _PARSER_CHECKS[key]
+    parser, problem = _checked_parser(connection_class, base, limit)
     if problem is not None:
         import redis
 

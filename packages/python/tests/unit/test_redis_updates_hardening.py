@@ -7,6 +7,8 @@ and protocol parser are the things under test. The rest use the scripted stand-i
 from __future__ import annotations
 
 import asyncio
+import gc
+import weakref
 from time import monotonic
 from typing import Any
 
@@ -466,3 +468,47 @@ async def test_real_the_check_also_runs_inside_a_running_event_loop() -> None:
         patch.setattr(parsers, "_AsyncRESP2Parser", absent_hook(parsers._AsyncRESP2Parser))
         with pytest.raises(ImportError):
             ru.RedisUpdates(f"redis://{HOST}/0", **FAST)
+
+
+async def test_real_parser_cache_releases_closed_evicted_classes() -> None:
+    capacity = getattr(ru, "_PARSER_CACHE_CAPACITY", 32)
+    refs = []
+    for limit in range(20_000, 20_000 + capacity * 4):
+        updates = ru.RedisUpdates(f"redis://{HOST}/0", max_message_bytes=limit)
+        refs.append(weakref.ref(updates._listen_parser))
+        await updates.close()
+        del updates
+    gc.collect()
+    assert sum(ref() is not None for ref in refs) <= capacity
+    assert all(ref() is None for ref in refs[:-capacity])
+
+
+async def test_real_parser_eviction_preserves_active_bounds_and_rechecks_misses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checked = []
+    original = ru._problem_with
+
+    def check(connection: type, parser: type, limit: int) -> str | None:
+        checked.append(limit)
+        return original(connection, parser, limit)
+
+    monkeypatch.setattr(ru, "_problem_with", check)
+    api = ru._load_api()
+    capacity = getattr(ru, "_PARSER_CACHE_CAPACITY", 32)
+    active = ru.RedisUpdates(f"redis://{HOST}/0", max_message_bytes=9_000)
+    hot = api.bounded_parser(9_001)
+    for limit in range(30_000, 30_000 + capacity * 4):
+        api.bounded_parser(limit)
+        assert api.bounded_parser(9_001) is hot  # hits refresh recency
+    replacement = api.bounded_parser(9_000)
+    assert checked.count(9_000) == 2  # the evicted entry must be checked again
+    assert checked.count(9_001) == 1
+    assert replacement is not active._listen_parser
+    parser, reader = listen_parser(active)
+    reader.feed_data(message(9_000))
+    assert len((await parser.read_response())[2]) == 9_000
+    reader.feed_data(message(9_001))
+    with pytest.raises(ru._OversizeMessageError):
+        await asyncio.wait_for(parser.read_response(), 1)
+    await active.close()
