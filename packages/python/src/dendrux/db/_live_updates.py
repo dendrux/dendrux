@@ -351,9 +351,12 @@ class LiveUpdates(ABC):
 
     async def flush(self) -> None:
         """Send pending hints within one deadline; propagate only caller cancellation."""
+        await self._flush_before(math.inf)
+
+    async def _flush_before(self, deadline: float) -> None:
         if not self._check_loop() or self._state != "open":
             return
-        await self._flush_until(monotonic() + self.flush_deadline_s)
+        await self._flush_until(min(deadline, monotonic() + self.flush_deadline_s))
 
     async def _flush_until(self, deadline: float) -> None:
         if self._in_flight or monotonic() < self._next_attempt_at:

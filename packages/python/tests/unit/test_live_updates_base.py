@@ -928,3 +928,62 @@ def test_capacity_error_unpickles_legacy_helper_path():
     restored = pickle.loads(data)
     assert isinstance(restored, errors.FollowCapacityError)
     assert restored.limit == 5 and restored.per_tenant
+
+
+@pytest.mark.asyncio
+@pytest.mark.benchmark
+async def test_sweep_pages_share_one_announcement_deadline():
+    bus = Bus(send_timeout_s=0.2, flush_deadline_s=0.2)
+    cancelled = []
+    allowance = 0.005
+
+    async def send_page():
+        try:
+            await asyncio.sleep(0.15)
+        except asyncio.CancelledError:
+            cancelled.append(True)
+            await asyncio.sleep(allowance)
+            raise
+
+    bus.action = send_page
+    start = live.monotonic()
+    deadline = start + bus.flush_deadline_s
+    async with asyncio.timeout(1):
+        for page in range(10):
+            if live.monotonic() >= deadline:
+                break
+            bus.enqueue([str(page)])
+            await bus._flush_before(deadline)
+    assert cancelled == [True]
+    assert len(bus.calls) == 2
+    assert live.monotonic() - start < bus.flush_deadline_s + allowance + 0.03
+    bus.enqueue(["stranded"])
+    await bus._flush_before(deadline)
+    assert len(bus.calls) == 2
+    assert bus.stats().pending == 1
+
+
+@pytest.mark.asyncio
+async def test_flush_before_expired_budget_keeps_pending():
+    bus = Bus()
+    bus.enqueue(["a"])
+    await bus._flush_before(live.monotonic() - 1)
+    assert bus.calls == []
+    assert bus.stats().pending == 1
+
+
+@pytest.mark.asyncio
+async def test_flush_before_keeps_loop_and_closed_guards():
+    bus = Bus()
+    bus.enqueue(["a"])
+
+    async def foreign():
+        await bus._flush_before(live.monotonic() + 10)
+
+    await asyncio.to_thread(asyncio.run, foreign())
+    assert bus.calls == []
+    assert bus.stats().pending == 1
+    await bus.close()
+    calls = len(bus.calls)
+    await bus._flush_before(live.monotonic() + 10)
+    assert len(bus.calls) == calls
