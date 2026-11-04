@@ -21,6 +21,19 @@ class StoreFactory(Protocol):
     def __call__(self) -> Any | Awaitable[Any]: ...
 
 
+class LiveStoreFactory(Protocol):
+    """``dendrux_live_store_factory``: optional. A new store over empty data that announces.
+
+    Takes the ``LiveUpdates`` the kit gives it (``updates``, a ``RecordingLiveUpdates``) and returns
+    a store, sync or async, built to announce through it:
+    ``SomeStore(engine, live_updates=updates)``.
+    Without this fixture the kit cannot test announcements and the report says "live updates: not
+    tested". The store should have a ``close()`` if it owns the ``LiveUpdates``: the kit calls it.
+    """
+
+    def __call__(self, updates: Any) -> Any | Awaitable[Any]: ...
+
+
 class StoreDerive(Protocol):
     """``dendrux_store_reopen`` / ``dendrux_store_second_instance``.
 

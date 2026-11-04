@@ -138,6 +138,20 @@ class KitBackend:
         await self._truncate(engine)
         return self._wrap(store_for_engine(engine))
 
+    async def fresh_live_store(
+        self, live_updates: Any, build: Callable[[AsyncEngine, Any], Any] | None = None
+    ) -> Any:
+        """A new store over empty data that announces through ``live_updates``.
+
+        ``build(engine, live_updates)`` makes the store; the default is the repo's own store for
+        the engine's dialect.
+        """
+        engine = await self._prepare()
+        self._engines.append(engine)
+        await self._truncate(engine)
+        make = build or (lambda eng, updates: store_for_engine(eng, live_updates=updates))
+        return self._wrap(make(engine, live_updates))
+
     async def reopen(self, store: Any) -> Any:
         """A new store over the same data (same engine when the data lives in the engine)."""
         if self.kind in ("sqlite-memory", "sqlite-format1"):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, NoReturn, cast
@@ -16,15 +17,17 @@ from dendrux.testing.store_kit._declaration import (
     FACTORY,
     FAULT_INJECTOR,
     FORMAT_2_FLAGS,
+    LIVE_FACTORY,
     REOPEN,
     SECOND_INSTANCE,
     Declaration,
     validate_declaration,
 )
+from dendrux.testing.store_kit._live import RecordingLiveUpdates, RunView
 from dendrux.types import RunStatus
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+    from collections.abc import AsyncIterator, Awaitable, Callable
 
     from dendrux.runtime.state import ClaimResult
     from dendrux.testing.store_kit._protocols import (
@@ -92,6 +95,42 @@ class Faulted:
             )
 
 
+@dataclass
+class LiveStore:
+    """A store that announces through a ``RecordingLiveUpdates``, and who reads it back."""
+
+    store: Any
+    updates: RecordingLiveUpdates
+    #: A second instance (its own connection) when the deployment has one, else the store itself.
+    reader: Any
+    kit: Kit
+
+    async def new_run(self, **kwargs: Any) -> str:
+        return await self.kit.new_run(self.store, **kwargs)
+
+    async def settle(self) -> None:
+        """Send whatever is pending and forget it: what follows starts from a clean record."""
+        await self.updates.flush()
+        self.updates.clear()
+
+    def seen_when_announced(self, run_id: str) -> RunView | None:
+        """What the reader saw of this run the first time it was announced; ``None`` if never."""
+        for batch in self.updates.batches:
+            if run_id in batch.ids:
+                return batch.seen.get(run_id)
+        return None
+
+    async def events(self, run_id: str) -> int:
+        return len(await self.reader.get_run_events(run_id))
+
+
+async def _view(reader: Any, run_id: str) -> RunView:
+    record = await reader.get_run(run_id)
+    if record is None:
+        return RunView(False, None, 0)
+    return RunView(True, str(record.status), len(await reader.get_run_events(run_id)))
+
+
 class Kit:
     """One fresh store, its declaration and helpers for the author's other fixtures."""
 
@@ -141,6 +180,32 @@ class Kit:
         if found is None:
             pytest.skip(f"{FAULT_INJECTOR} not provided: crash recovery is not certified")
         return found
+
+    @asynccontextmanager
+    async def live_store(self) -> AsyncIterator[LiveStore]:
+        """A fresh store announcing into a recorder that probes a second connection.
+
+        The recorder asks the reader what it sees of each announced run at the moment the
+        announcement is sent: an announcement sent before its commit is visible is caught there.
+        """
+        factory = self._provided.get(LIVE_FACTORY)
+        if factory is None:
+            pytest.skip(f"{LIVE_FACTORY} not provided: live updates are not tested")
+        updates = RecordingLiveUpdates()
+        store = await maybe_await(factory(updates))
+        reader = store
+        if self.declaration.needs_second_instance and self._provided.get(SECOND_INSTANCE):
+            reader = await self.second(store)
+        updates.probe = lambda ids: _probe(reader, ids)
+        try:
+            yield LiveStore(store, updates, reader, self)
+        finally:
+            try:
+                closer = getattr(store, "close", None)
+                if closer is not None:
+                    await maybe_await(closer())
+            finally:
+                await updates.close()
 
     def require_format_2(self) -> None:
         """The rest of this test needs format-2 runs (skips at the first run created otherwise)."""
@@ -256,6 +321,10 @@ class Kit:
         return int(record.claim_epoch)
 
 
+async def _probe(reader: Any, ids: tuple[str, ...]) -> dict[str, RunView]:
+    return {run_id: await _view(reader, run_id) for run_id in ids}
+
+
 def check_declaration(store: Any, declaration: Declaration) -> None:
     """Fail certification when a declared promise lacks the methods that keep it."""
     from dendrux.errors import StoreCapabilityError
@@ -279,6 +348,7 @@ __all__ = [
     "CertificationFailure",
     "Faulted",
     "Kit",
+    "LiveStore",
     "check_declaration",
     "maybe_await",
     "store_skip",

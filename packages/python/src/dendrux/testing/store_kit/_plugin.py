@@ -19,6 +19,7 @@ from dendrux.testing.store_kit._declaration import (
     CLOCK,
     FACTORY,
     FAULT_INJECTOR,
+    LIVE_FACTORY,
     REOPEN,
     SECOND_INSTANCE,
     Declaration,
@@ -42,7 +43,8 @@ if TYPE_CHECKING:
 
 CONTRACTS_DIR = Path(__file__).resolve().parent / "contracts"
 
-#: Categories in report order. ``crash_recovery`` needs the optional fault injector.
+#: Categories in report order. ``crash_recovery`` needs the optional fault injector;
+#: ``live_updates`` needs the optional ``dendrux_live_store_factory``.
 CATEGORIES = (
     "declaration",
     "basic",
@@ -54,12 +56,14 @@ CATEGORIES = (
     "recovery",
     "concurrency",
     "crash_recovery",
+    "live_updates",
 )
 _FIXTURE_FOR = {
     "reopen": REOPEN,
     "clock": CLOCK,
     "second": SECOND_INSTANCE,
     "injector": FAULT_INJECTOR,
+    "live": LIVE_FACTORY,
 }
 
 
@@ -158,7 +162,7 @@ def dendrux_kit_provided(request: pytest.FixtureRequest) -> dict[str, Any]:
     """The author's fixtures that exist, resolved before the event loop starts running."""
     provided = {
         name: value
-        for name in (FACTORY, REOPEN, SECOND_INSTANCE, CLOCK, FAULT_INJECTOR)
+        for name in (FACTORY, REOPEN, SECOND_INSTANCE, CLOCK, FAULT_INJECTOR, LIVE_FACTORY)
         if (value := fixture_or_none(request, name)) is not None
     }
     if FACTORY not in provided:
@@ -224,6 +228,8 @@ def _check_fixtures(
             raise CertificationFailure(f"{name} is required ({obligations[name]}) but missing")
         if name == FAULT_INJECTOR:
             pytest.skip(f"{FAULT_INJECTOR} not provided: crash recovery is not certified")
+        if name == LIVE_FACTORY:
+            pytest.skip(f"{LIVE_FACTORY} not provided: live updates are not tested")
         pytest.skip(f"{name} not provided and not required for this store")
 
 
@@ -325,6 +331,8 @@ class _Reporter:
             entry.store_skips.append(_StoreSkip(function, capabilities, by_store.group(2).strip()))
         elif FAULT_INJECTOR in reason:
             entry.notes.append(f"crash recovery: not certified (no {FAULT_INJECTOR} fixture)")
+        elif LIVE_FACTORY in reason:
+            entry.notes.append(f"live updates: not tested (no {LIVE_FACTORY} fixture)")
         elif "unverified:" in reason:
             entry.notes.append("unverified: " + reason.split("unverified:", 1)[1].strip(" ')\""))
 

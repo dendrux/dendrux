@@ -27,6 +27,7 @@ REOPEN = "dendrux_store_reopen"
 SECOND_INSTANCE = "dendrux_store_second_instance"
 CLOCK = "dendrux_clock"
 FAULT_INJECTOR = "dendrux_fault_injector"
+LIVE_FACTORY = "dendrux_live_store_factory"
 
 
 def required_fixtures_for(declared: tuple[str, ...], deployment: str | None) -> dict[str, str]:
