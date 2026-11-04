@@ -18,13 +18,9 @@ import errno
 import os
 import stat
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 from dendrux.errors import SkillValidationError
 from dendrux.skills._paths import validate_file_path
-
-if TYPE_CHECKING:
-    from types import TracebackType
 
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _CLOEXEC = getattr(os, "O_CLOEXEC", 0)
@@ -81,12 +77,7 @@ class SkillDir:
     def __enter__(self) -> SkillDir:
         return self
 
-    def __exit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        tb: TracebackType | None,
-    ) -> None:
+    def __exit__(self, *_exc: object) -> None:
         self.close()
 
     def close(self) -> None:

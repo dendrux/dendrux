@@ -1,4 +1,4 @@
-"""Serialise Dendrux's database sessions on pools that share one DBAPI connection.
+"""Guard event-loop ownership and serialise sessions on single-connection pools.
 
 ``StaticPool`` (the default for ``sqlite+aiosqlite:///:memory:``) and
 ``SingletonThreadPool`` hand every session the same connection, so every
@@ -71,6 +71,56 @@ class _Guard:
 # lock, so an idle pool or a closed event loop is never kept alive by this map.
 _GUARDS: dict[tuple[Pool, asyncio.AbstractEventLoop], _Guard] = {}
 _WARNED: weakref.WeakSet[Pool] = weakref.WeakSet()
+
+
+def _bind_to_current_loop(engine: AsyncEngine) -> None:
+    """Make every pool checkout on another event loop fail with a clear error.
+
+    asyncpg connections belong to the loop that opened them; sharing the
+    global engine across loops (a new loop per request, ``asyncio.run`` per
+    call, worker threads) otherwise fails deep inside the driver. SQLite
+    connections are not loop-bound, so SQLite engines are left alone.
+    """
+    if engine.dialect.name == "sqlite":
+        return
+    from sqlalchemy import event
+
+    owner = asyncio.get_running_loop()
+
+    def _check_loop(*_args: object) -> None:
+        try:
+            current = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        if current is not owner:
+            raise RuntimeError(
+                "The shared dendrux database engine was created "
+                "on a different event loop and cannot be used from this one. Create one "
+                "state store per process on the loop that serves requests and pass "
+                "state_store= to every Agent, or call dendrux.db.session.reset_engine() "
+                "before switching loops."
+            )
+
+    # Pool checkout events run *after* pre-ping. Reject at the public Engine
+    # acquisition boundary, before the pool can ping, open or invalidate an
+    # asyncpg connection on the wrong loop. This also covers raw_connection
+    # and survives dispose(), which replaces the pool on this same Engine.
+    # Guard both public entry points: normal acquisition need not route through
+    # raw_connection in Connection.__init__ on any particular SQLAlchemy minor.
+    connect = engine.sync_engine.connect
+    raw_connection = engine.sync_engine.raw_connection
+
+    def _checked_connect() -> Any:
+        _check_loop()
+        return connect()
+
+    def _checked_connection() -> Any:
+        _check_loop()
+        return raw_connection()
+
+    engine.sync_engine.connect = _checked_connect  # type: ignore[method-assign]
+    engine.sync_engine.raw_connection = _checked_connection  # type: ignore[method-assign]
+    event.listen(engine.sync_engine, "checkout", _check_loop)
 
 
 def shares_one_connection(engine: AsyncEngine) -> bool:

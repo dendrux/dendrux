@@ -155,13 +155,11 @@ async def validate_tool_results(
 
     if parts:
         raise _invalid_tool_result(run_id, "; ".join(parts))
-    validate_result_names(run_id, pause_state, results, json_payload=False)
+    validate_result_names(run_id, pause_state, results)
     return pause_state
 
 
-def validate_result_names(
-    run_id: str, pause: PauseState, results: list[ToolResult], *, json_payload: bool = True
-) -> None:
+def validate_result_names(run_id: str, pause: PauseState, results: list[ToolResult]) -> None:
     """Bind result IDs/names and require a string payload; text is normalized later."""
 
     _check_result_identities(run_id, results)
@@ -1340,7 +1338,7 @@ async def prepare_client_results(
     from dendrux.loops.react import _apply_result_transform
 
     results = await _validate_client_results(agent, run_id, results)
-    validate_result_names(run_id, pause, results, json_payload=False)
+    validate_result_names(run_id, pause, results)
     try:
         capped = [
             _cap_client_result(result, agent._limits.max_tool_result_bytes) for result in results
@@ -1385,7 +1383,7 @@ def legacy_approval_denial(
     run_id: str, pause: PauseState, results: list[ToolResult]
 ) -> list[ToolResult]:
     """Legacy rejection is a denial, never proof that server code executed."""
-    validate_result_names(run_id, pause, results, json_payload=False)
+    validate_result_names(run_id, pause, results)
     if any(result.success is not False for result in results):
         raise _invalid_tool_result(run_id, "approval tool results must be failed denials")
     return build_rejection_results(pause)

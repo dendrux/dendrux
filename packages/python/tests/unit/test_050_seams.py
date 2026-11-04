@@ -440,7 +440,6 @@ class TestAgentKwargs:
         agent = Agent(provider=MockLLM([]), prompt="p")
         assert agent._strict_tenancy is True
         assert agent._limits == Limits()
-        assert agent._tool_threads == 8
         assert agent._on_governance_change == "raise"
         from dendrux.tools._pool import ToolCallLimiter
 
@@ -466,7 +465,7 @@ class TestAgentKwargs:
         )
         assert agent._strict_tenancy is True
         assert agent._limits is limits
-        assert agent._tool_threads == 2
+        assert agent._tool_call_limiter.slots == 2
         assert agent._on_governance_change == "raise"
 
     @pytest.mark.parametrize(

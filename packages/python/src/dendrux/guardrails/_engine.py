@@ -231,7 +231,6 @@ class GuardrailEngine:
         origins_raw = raw.pop(_ORIGINS_KEY, None)
         # Legacy runs may already exceed the cap. Keep every historical value
         # available for redaction/restoration, but admit no new distinct value.
-        self._at_mapping_cap = len(raw) >= MAX_MAPPING_ENTRIES
         if len(raw) > MAX_MAPPING_ENTRIES:
             logger.warning(
                 "Resumed PII mapping exceeds cap: run_id=%s count=%d cap=%d",
@@ -422,7 +421,6 @@ class GuardrailEngine:
                 for i, part_findings in enumerate(per_segment):
                     if part_findings:
                         segments[i] = await self._redact(segments[i], part_findings, origin)
-                self._at_mapping_cap = len(self._pii_mapping) >= MAX_MAPPING_ENTRIES
             # warn: findings collected but text unchanged
 
         return segments, all_findings, None

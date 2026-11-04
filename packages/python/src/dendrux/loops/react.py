@@ -84,6 +84,7 @@ from dendrux.media._ids import IMAGE_ID_RE
 from dendrux.media._image import Image, ToolOutput
 from dendrux.media._ingest import ingest
 from dendrux.media._policy import ImagePolicy
+from dendrux.skills._session import SkillTool
 from dendrux.tool import DEFAULT_TOOL_TIMEOUT
 from dendrux.tools._coerce import ArgumentCoercionError, build_call, get_args_spec
 from dendrux.tools._limits import (
@@ -93,7 +94,6 @@ from dendrux.tools._limits import (
     result_cap,
     size_limit_payload,
 )
-from dendrux.tools._lookups import ToolLookups, build_tool_lookups
 from dendrux.tools._mask import approval_view, placeholder_mapping
 from dendrux.tools._pool import (
     CallTracker,
@@ -152,6 +152,7 @@ if TYPE_CHECKING:
     from dendrux.runtime.state import StateStore
     from dendrux.skills._session import SkillSession
     from dendrux.strategies.base import Strategy
+    from dendrux.tools._lookups import ToolLookups
     from dendrux.types import BeforeToolHook, StreamEvent, ToolDef, ToolResultTransform
 
 logger = logging.getLogger(__name__)
@@ -902,8 +903,6 @@ class _ToolBatch:
 
 def _bind_skill_session(lookups: ToolLookups, governance: _Governance) -> SkillSession | None:
     """The batch's skill session (None without skill tools), bound to this run and iteration."""
-    from dendrux.skills._session import SkillTool
-
     session = next((fn.session for fn in lookups.fn.values() if isinstance(fn, SkillTool)), None)
     if session is not None:
         session.run_id = governance.run_id
@@ -915,8 +914,6 @@ async def _json_failure(
     tc: ToolCall, lookups: ToolLookups, session: SkillSession | None
 ) -> ToolResult | None:
     """Invalid JSON arguments, or an invalid call of a skill tool (activations preflight)."""
-    from dendrux.skills._session import SkillTool
-
     result = check_tool_json(tc)
     if result is not None or session is None:
         return result
@@ -1049,8 +1046,6 @@ async def _preflight_skills(
     Earlier valid activations in this batch may satisfy reads; execution
     rechecks against the activations that actually succeed.
     """
-    from dendrux.skills._session import SkillTool
-
     ready: list[ToolCall] = []
     anticipated: set[str] = set()
     for tc in calls:
@@ -1289,8 +1284,6 @@ _CLIENT_APPROVAL_REASON = DenialReason.CLIENT_APPROVAL_UNSUPPORTED.value
 
 
 def _tool_source(name: str, lookups: ToolLookups) -> Literal["local", "mcp", "skill"]:
-    from dendrux.skills._session import SkillTool
-
     if isinstance(lookups.fn.get(name), SkillTool):
         return "skill"
     if "mcp_tool_name" in lookups.meta.get(name, {}):
@@ -2860,10 +2853,6 @@ def _interrupted_result(
     )
 
 
-# Backwards compatibility alias for runner.py's existing import.
-_build_tool_lookups = build_tool_lookups
-
-
 def _build_execution_groups(
     tool_calls: list[ToolCall],
     parallel_lookup: dict[str, bool],
@@ -3248,8 +3237,6 @@ async def _execute_tool(
     fails the call like any tool exception. The serialised payload is capped
     at ``Limits.max_tool_result_bytes`` (images excluded).
     """
-    from dendrux.skills._session import SkillTool
-
     fn = lookups.fn.get(tool_call.name)
     if fn is None:
         return _unknown_tool_result(tool_call, lookups)
