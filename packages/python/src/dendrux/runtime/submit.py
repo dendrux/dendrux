@@ -44,6 +44,7 @@ from dendrux.types import (
     ApprovalDecision,
     ImagePart,
     ImageRef,
+    InputValidationError,
     PauseState,
     RunStatus,
     TextPart,
@@ -1283,12 +1284,17 @@ async def report_governance_change(
     )
 
 
-def _pause_id_required() -> ValueError:
-    from dendrux.types import InputValidationError
+class _PauseIdRequiredError(InputValidationError):
+    def __init__(self, field: str, code: str) -> None:
+        super().__init__(field, code)
+        self.args = (str(self) + " Send the pause_id from get_pending as expected_pause_id.",)
 
-    error = InputValidationError("expected_pause_id", "pause_id_required")
-    error.args = (str(error) + " Send the pause_id from get_pending as expected_pause_id.",)
-    return error
+    def __reduce__(self) -> tuple[Any, tuple[str, str]]:
+        return (type(self), (self.field, self.code))
+
+
+def _pause_id_required() -> ValueError:
+    return _PauseIdRequiredError("expected_pause_id", "pause_id_required")
 
 
 def _require_approval_token(approval: bool, expected: str | None) -> None:

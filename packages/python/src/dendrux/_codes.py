@@ -1045,7 +1045,8 @@ LIVE_UPDATES_OVERSIZE = Code(
     "live_updates",
     _BASE_FIELDS | frozenset(["count", "limit"]),
     "A live-update hint exceeded the message byte limit and was dropped.",
-    "Increase max_message_bytes within the transport limit, or use shorter run ids.",
+    "Use channel isolation to exclude foreign publishers; for local hints, increase "
+    "max_message_bytes within the transport limit, or use shorter run ids.",
 )
 
 

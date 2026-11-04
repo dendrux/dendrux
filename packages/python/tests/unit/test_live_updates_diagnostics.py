@@ -108,7 +108,7 @@ def test_postgres_option_error_names_native_choices():
 def test_capability_error_gives_signature_and_narrowing_call():
     error = StoreCapabilityError("CustomStore", "fenced_writes", "save_trace", ("claim_epoch",))
     assert "signature" in str(error)
-    assert "StoreCapabilities(" in str(error)
+    assert "replace(self.capabilities, fenced_writes=False)" in str(error)
     assert "capabilities =" in str(error)
 
 

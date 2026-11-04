@@ -109,6 +109,37 @@ class RunNotFoundError(_KwargsReduceMixin, LookupError):
         super().__init__(f"Run '{run_id}' not found.")
 
 
+def _capability_advice(capability: str) -> str:
+    specific = {
+        "version": (
+            "For an existing StoreCapabilities instance: from dataclasses import replace; "
+            "self.capabilities = replace(self.capabilities, version=1). Otherwise declare "
+            'StoreCapabilities(version=1, deployment="single_process") for a single-process '
+            "store; use single_host or multi_server for those implementations, and declare "
+            "only capabilities the store implements."
+        ),
+        "deployment": (
+            "Set a valid deployment matching the store: single_process, single_host, or "
+            "multi_server; for example, for a single-process store: from dataclasses import "
+            'replace; self.capabilities = replace(self.capabilities, deployment="single_process").'
+        ),
+    }
+    optional = {"fenced_writes", "retry_ids", "checkpointing", "atomic_completion", "recovery"}
+    if capability in specific:
+        return specific[capability]
+    advice = "Copy the base store method signature, including explicit keyword-only parameters."
+    if capability in optional:
+        advice += (
+            " If that capability is unsupported, narrow its StoreCapabilities declaration: "
+            "from dataclasses import replace; "
+            f"self.capabilities = replace(self.capabilities, {capability}=False). "
+            "Narrowing does not adapt incompatible method signatures."
+        )
+    if capability == "fenced_writes":
+        advice += " Disabling fenced_writes on a multi_server store removes fencing."
+    return advice
+
+
 class StoreCapabilityError(TypeError):
     """A declared store capability does not match the implementation."""
 
@@ -119,10 +150,7 @@ class StoreCapabilityError(TypeError):
         self.missing = missing
         super().__init__(
             f"StateStore {store} capability '{capability}': {method} lacks {missing!r}. "
-            "Copy the base store method signature, including explicit keyword-only parameters, "
-            "or declare narrower capabilities: "
-            "self.capabilities = StoreCapabilities(deployment=self.capabilities.deployment). "
-            "That declaration disables optional capabilities; enable only those you implement."
+            + _capability_advice(capability)
         )
 
 
