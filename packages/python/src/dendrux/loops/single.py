@@ -429,18 +429,18 @@ async def _single_batch_call(
     images, calls = pre.images, pre.calls
     guardrails = calls.agent.guardrails or ()
     prepared = await images.prepare(pre.messages, iteration=1, guardrails=guardrails)
-    if prepared.block_error is not None:
-        return await ReActLoop._image_blocked(
-            prepared.block_error,
-            images=images,
-            run_id=pre.run_id,
-            iteration=1,
-            steps=[],
-            usage=UsageStats(),
-            meta=guardrail_meta(g_engine, pre.warnings),
-        )
     retried = False
     while True:
+        if prepared.block_error is not None:
+            return await ReActLoop._image_blocked(
+                prepared.block_error,
+                images=images,
+                run_id=pre.run_id,
+                iteration=1,
+                steps=[],
+                usage=UsageStats(),
+                meta=guardrail_meta(g_engine, pre.warnings),
+            )
         attempt = await _single_attempt(pre, prepared, output_type)
         if attempt.failure is None:
             return attempt
