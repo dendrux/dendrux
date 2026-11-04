@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import warnings
 from types import SimpleNamespace
 from typing import Any
 
@@ -546,6 +547,68 @@ async def test_custom_store_falls_back_to_per_run_reads_under_the_budget(
         assert reads <= 4 + 4 * (clock.now - start) + 1e-9
     assert set(state.event_reads) == {(run,) for run in runs}
     assert _seqs(follows[3]) == [1]
+
+
+class NoSequenceState(FakeState):
+    """A custom store that cannot say where a run's log ends: only paged event reads."""
+
+    get_next_event_sequence = None  # type: ignore[assignment]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.page_limits: list[int | None] = []
+
+    async def get_run_events(self, run_id: str, **kw: Any) -> list[SimpleNamespace]:
+        self.page_limits.append(kw.get("limit"))
+        return await super().get_run_events(run_id, **kw)
+
+
+@pytest.mark.parametrize("count, pages", [(0, 1), (1, 2), (99, 2), (100, 2), (101, 3), (250, 4)])
+async def test_head_of_a_store_without_next_sequence_is_the_last_index_across_pages(
+    count: int, pages: int
+) -> None:
+    state = NoSequenceState()
+    state.create("r1")
+    for _ in range(count):
+        state.write("r1")
+    head = await _follow._current_head(_store(state), "r1")
+    assert head == (count - 1 if count else None)
+    assert state.page_limits == [_follow.DEFAULT_BATCH] * pages  # the last read is empty
+
+
+async def test_head_fallback_passes_a_limit_so_dendrux_never_warns_itself() -> None:
+    state = NoSequenceState()
+    state.create("r1")
+    for _ in range(150):
+        state.write("r1")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", FutureWarning)
+        assert await _follow._current_head(_store(state), "r1") == 149
+    assert state.page_limits and None not in state.page_limits
+
+
+async def test_new_watch_on_a_store_without_next_sequence_neither_misses_nor_repeats(
+    clock: Clock,
+) -> None:
+    state = NoSequenceState()
+    state.create("old")
+    state.create("fresh")
+    for _ in range(250):  # more than two pages already in the log
+        state.write("old")
+    feed = _feed(_store(state))
+    old = await attach(feed, "old")
+    fresh = await attach(feed, "fresh")
+    await ticks()
+    assert _seqs(old) == [] and _seqs(fresh) == []  # nothing replayed, nothing from before
+    state.write("old")
+    state.write("fresh")
+    clock.advance(0.51)
+    await ticks()
+    assert _seqs(old) == [250]
+    assert _seqs(fresh) == [0]  # an empty run's first event is not skipped
+    clock.advance(0.51)
+    await ticks()
+    assert _seqs(old) == [250] and _seqs(fresh) == [0]
 
 
 # --------------------------------------------------------------------------- failures
