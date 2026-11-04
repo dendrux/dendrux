@@ -398,6 +398,7 @@ class _Coordinator:
         self._order = itertools.count()
         self._tokens = MAX_READS_PER_S
         self._tokens_at = self._now()
+        self._safety_window = (0.0, -math.inf)
         self._candidates: dict[str, tuple[float, int, _WatchedRun]] = {}
         self._registration: object | None = None
         if live is not None:
@@ -691,22 +692,40 @@ class _Coordinator:
     async def _isolated_batch(
         self, runs: list[_WatchedRun], read: Any
     ) -> tuple[dict[str, Any], tuple[list[_WatchedRun], BaseException] | None]:
-        await self._token()
+        runs = await self._readable(runs)
+        if not runs:
+            return {}, None
         try:
-            return dict(await read(runs)), None
+            found = await read(runs)
+            return {run.run_id: found.get(run.run_id) for run in runs}, None
         except Exception as error:
             if len(runs) == 1:
                 return {}, (runs, error)
         return await self._split_batch(runs, read)
 
+    def _active_runs(self, runs: list[_WatchedRun]) -> list[_WatchedRun]:
+        return [run for run in runs if self.runs.get(run.run_id) is run and run.active]
+
+    async def _readable(self, runs: list[_WatchedRun]) -> list[_WatchedRun]:
+        active = self._active_runs(runs)
+        if not active:
+            return []
+        await self._token()
+        return self._active_runs(active)
+
     async def _split_batch(
         self, runs: list[_WatchedRun], read: Any
+    ) -> tuple[dict[str, Any], tuple[list[_WatchedRun], BaseException] | None]:
+        middle = len(runs) // 2
+        return await self._read_groups([runs[:middle], runs[middle:]], read)
+
+    async def _read_groups(
+        self, groups: list[list[_WatchedRun]], read: Any
     ) -> tuple[dict[str, Any], tuple[list[_WatchedRun], BaseException] | None]:
         found: dict[str, Any] = {}
         failed: list[_WatchedRun] = []
         error: BaseException | None = None
-        middle = len(runs) // 2
-        for group in (runs[:middle], runs[middle:]):
+        for group in groups:
             rows, failure = await self._isolated_batch(group, read)
             found.update(rows)
             if failure is not None:
@@ -720,18 +739,12 @@ class _Coordinator:
     async def _per_run(
         self, runs: list[_WatchedRun], read: Any
     ) -> tuple[dict[str, Any], tuple[list[_WatchedRun], BaseException] | None]:
-        """The custom-store fallback: one read per run, each charged to the budget."""
-        found: dict[str, Any] = {}
-        failed: list[_WatchedRun] = []
-        error: BaseException | None = None
-        for run in runs:
-            await self._token()
-            try:
-                found[run.run_id] = await read(run)
-            except Exception as exc:
-                failed.append(run)
-                error = exc
-        return found, ((failed, error) if error is not None else None)
+        return await self._read_groups(
+            [[run] for run in runs], lambda group: self._single_result(group[0], read)
+        )
+
+    async def _single_result(self, run: _WatchedRun, read: Any) -> dict[str, Any]:
+        return {run.run_id: await read(run)}
 
     def _after_events(
         self, run: _WatchedRun, events: list[StoredEvent], limit: int, snapshot: _Snapshot
@@ -794,8 +807,7 @@ class _Coordinator:
         params = run.params
         if self._healthy():
             run.delay = params.poll_interval_s
-            jitter = random.uniform(1 - HEALTHY_JITTER, 1 + HEALTHY_JITTER)
-            run.events_due = now + params.poll_healthy_s * jitter
+            run.events_due = self._safety_at(params.poll_healthy_s, now)
             run.reason = "safety"
             run.status_with_next = True
             return
@@ -807,6 +819,15 @@ class _Coordinator:
             run.delay = min(run.delay * 2, params.poll_max_s)
         run.status_with_next = run.reads % params.status_every == 0
 
+    def _safety_at(self, interval: float, now: float) -> float:
+        previous_interval, deadline = self._safety_window
+        earliest = now + interval * (1 - HEALTHY_JITTER)
+        latest = now + interval * (1 + HEALTHY_JITTER)
+        if previous_interval != interval or not earliest <= deadline <= latest:
+            deadline = random.uniform(earliest, latest)
+            self._safety_window = (interval, deadline)
+        return deadline
+
     # ------------------------------------------------------------ statuses
 
     async def _read_statuses(self, runs: list[_WatchedRun]) -> None:
@@ -815,8 +836,8 @@ class _Coordinator:
             self._failed(failed[0], failed[1], status=True)
         now = self._now()
         for run in runs:
-            if failed is None or run not in failed[0]:
-                self._after_status(run, found.get(run.run_id), now)
+            if run.run_id in found:
+                self._after_status(run, found[run.run_id], now)
 
     async def _fetch_statuses(
         self, runs: list[_WatchedRun]
