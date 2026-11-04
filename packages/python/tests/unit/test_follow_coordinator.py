@@ -128,9 +128,9 @@ class FakeState:
     ) -> list[SimpleNamespace]:
         if not _in_scope(self, run_id, tenant_id):
             return []
+        rows = self._rows(run_id, after_sequence_index, limit)  # read before any gate
         if limit != 1:  # the start check's one-row probe is not a coordinator read
             await self._events_gate((run_id,))
-        rows = self._rows(run_id, after_sequence_index, limit)
         if self.after_events_read is not None:
             self.after_events_read(run_id)
         return rows
@@ -163,12 +163,12 @@ class BatchedState(FakeState):
     ) -> dict[str, list[SimpleNamespace]]:
         assert 1 <= len(heads) <= 200 and 1 <= limit_per_run <= 100
         self.limits.append(limit_per_run)
-        await self._events_gate(tuple(heads))
-        result = {
+        result = {  # the snapshot is taken before any gate, like a real query
             run_id: self._rows(run_id, None if head < 0 else head, limit_per_run)
             for run_id, head in heads.items()
             if run_id in self.statuses
         }
+        await self._events_gate(tuple(heads))
         if self.after_events_read is not None:
             for run_id in heads:
                 self.after_events_read(run_id)
@@ -619,6 +619,30 @@ async def _until_end(follow: Any) -> list[Any]:
     async for item in follow:
         items.append(item)
     return items
+
+
+async def test_per_run_fallback_isolates_a_failing_run(clock: Clock, caplog: Any) -> None:
+    caplog.set_level(logging.WARNING)
+    state = FakeState()
+    for run in ("bad", "good"):
+        state.create(run)
+    feed = _feed(_store(state))
+    bad = await attach(feed, "bad")
+    good = await attach(feed, "good")
+    await ticks()
+    state.fail_runs = {"bad"}
+    state.write("bad")
+    state.write("good")
+    clock.advance(0.51)
+    await ticks()
+    assert _seqs(good) == [0] and _seqs(bad) == []
+    state.fail_runs = set()
+    for _ in range(12):
+        clock.advance(0.25)
+        await ticks()
+    assert _seqs(bad) == [0]
+    failed = [r for r in caplog.records if getattr(r, "code", None) == "follow_read_failed"]
+    assert failed and failed[0].count == 1
 
 
 # --------------------------------------------------------------------------- missed hints
