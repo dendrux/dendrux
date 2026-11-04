@@ -620,7 +620,9 @@ class Agent:
         self._database_url = database_url
         from dendrux.db._engine_options import split_database_options
 
-        self._database_options, self._store_options = split_database_options(database_options)
+        self._database_options, self._store_options = split_database_options(
+            database_options, replacement="use Agent(state_store=...)"
+        )
         if state_store is not None:
             from dendrux.runtime._capabilities import validate_capabilities
 

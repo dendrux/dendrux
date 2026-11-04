@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import logging
 import warnings
 import weakref
@@ -43,10 +44,20 @@ def register(store: Any) -> None:
     warnings.warn(
         f"Open live-update stores count={count}; share a store and close it at shutdown",
         RuntimeWarning,
-        stacklevel=4,
+        stacklevel=_developer_stacklevel(),
     )
     _codes.log_code(logger, _codes.LIVE_UPDATES_MANY_STORES, count=count, database_key=key)
 
 
 def deregister(store: Any) -> None:
     _remove(_database_key(store), weakref.ref(store))
+
+
+def _developer_stacklevel() -> int:
+    frame = inspect.currentframe()
+    stacklevel = 0
+    while frame is not None and frame.f_globals.get("__name__", "").startswith("dendrux."):
+        stacklevel += 1
+        frame = frame.f_back
+    del frame
+    return stacklevel

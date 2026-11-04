@@ -1,8 +1,10 @@
 """Live-store warnings count only open, reachable owners."""
 
 import gc
+import inspect
 import warnings
 
+import pytest
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from dendrux.runtime.stores._factory import store_for_engine
@@ -56,3 +58,53 @@ async def test_closed_and_collected_stores_do_not_count():
             gc.collect()
     assert not captured
     await engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "dialect,entry",
+    [(d, e) for d in ("sqlite", "postgresql", "mysql") for e in ("direct", "factory")]
+    + [("mysql", "url")],
+)
+async def test_many_stores_warning_points_to_developer_call(monkeypatch, dialect, entry):
+    from dendrux.runtime.stores.sql import _live_registry
+    from dendrux.runtime.stores.sql.mysql import MySQLStateStore
+    from dendrux.runtime.stores.sql.postgres import PostgresStateStore
+    from dendrux.runtime.stores.sql.sqlite import SQLiteStateStore
+
+    monkeypatch.setattr(_live_registry, "MANY_STORES_THRESHOLD", 0)
+    monkeypatch.setattr(_live_registry, "_warned", set())
+    monkeypatch.setattr(_live_registry, "_open_stores", {})
+    classes = {
+        "sqlite": SQLiteStateStore,
+        "postgresql": PostgresStateStore,
+        "mysql": MySQLStateStore,
+    }
+    urls = {
+        "sqlite": "sqlite+aiosqlite://",
+        "postgresql": "postgresql+asyncpg://",
+        "mysql": "mysql+asyncmy://",
+    }
+    if dialect == "mysql":
+        pytest.importorskip("asyncmy")
+    engine = create_async_engine(urls[dialect])
+    bus = RecordingUpdates()
+    try:
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always")
+            if entry == "factory":
+                line = inspect.currentframe().f_lineno + 1
+                store = store_for_engine(engine, live_updates=bus)
+            elif entry == "url":
+                line = inspect.currentframe().f_lineno + 1
+                store = MySQLStateStore.from_url(urls[dialect], live_updates=bus)
+                await engine.dispose()
+                engine = store._engine
+            else:
+                line = inspect.currentframe().f_lineno + 1
+                store = classes[dialect](engine, live_updates=bus)
+        matching = [item for item in captured if "Open live-update stores" in str(item.message)]
+        assert len(matching) == 1
+        assert (matching[0].filename, matching[0].lineno) == (__file__, line)
+        await store.close()
+    finally:
+        await engine.dispose()

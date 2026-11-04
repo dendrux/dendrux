@@ -5,7 +5,9 @@ import pytest
 
 @pytest.mark.parametrize("key", ["live_updates", "notify_channel"])
 @pytest.mark.parametrize("value", [None, False, True, "private-sentinel"])
-@pytest.mark.parametrize("entry", ["split", "agent", "engine", "sweep", "sweep_noop", "reader"])
+@pytest.mark.parametrize(
+    "entry", ["split", "agent", "engine", "engine_options", "sweep", "sweep_noop", "reader"]
+)
 async def test_database_options_refused(entry, key, value):
     from datetime import timedelta
 
@@ -15,11 +17,20 @@ async def test_database_options_refused(entry, key, value):
     from dendrux.store import RunStore
 
     options = {key: value}
-    with pytest.raises(ValueError, match=r"Agent\(state_store=") as raised:
+    hint = {
+        "agent": "Agent(state_store=...)",
+        "sweep": "sweep(state_store=...)",
+        "sweep_noop": "sweep(state_store=...)",
+    }.get(entry, "build a store with live_updates=... and pass it")
+    with pytest.raises(ValueError) as raised:
         if entry == "split":
             split_database_options(options)
         elif entry == "agent":
             Agent(prompt="test", database_url="sqlite+aiosqlite://", database_options=options)
+        elif entry == "engine_options":
+            from dendrux.db._engine_options import engine_options
+
+            engine_options("sqlite+aiosqlite://", options)
         elif entry == "engine":
             await get_engine("sqlite+aiosqlite://", database_options=options)
         elif entry == "sweep_noop":
@@ -32,5 +43,6 @@ async def test_database_options_refused(entry, key, value):
             )
         else:
             RunStore.from_database_url("sqlite+aiosqlite://", database_options=options)
+    assert hint in str(raised.value)
     assert "private-sentinel" not in str(raised.value)
     assert options == {key: value}

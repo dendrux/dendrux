@@ -222,7 +222,7 @@ def _validate_source(
     """Reject ambiguous persistence configuration before opening an engine."""
     from dendrux.db._engine_options import split_database_options
 
-    split_database_options(database_options)
+    split_database_options(database_options, replacement="use sweep(state_store=...)")
     if database_url is not None and state_store is not None:
         raise ValueError(
             "database_url and state_store are mutually exclusive. Pass one or the other."
