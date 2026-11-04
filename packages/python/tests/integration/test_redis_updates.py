@@ -201,7 +201,7 @@ async def proxy() -> AsyncIterator[Proxy]:
 
 
 def proxied(server: Proxy) -> str:
-    return f"redis://127.0.0.1:{server.port}/0"
+    return f"redis://127.0.0.1:{server.port}{urlsplit(REDIS_URL).path}"
 
 
 # -- the wire ---------------------------------------------------------------------------------
@@ -467,8 +467,9 @@ async def test_a_wrong_password_and_an_unreachable_host_leak_nothing(
     sentinels = ("s3cret-sentinel", "6399")
     parts = urlsplit(REDIS_URL)
     cases = [
-        f"redis://user:s3cret-sentinel@{parts.hostname}:{parts.port}/0",  # server has no auth
-        "redis://:s3cret-sentinel@127.0.0.1:6399/0",  # nothing listens there
+        # Server has no auth. Use the configured isolated database.
+        f"redis://user:s3cret-sentinel@{parts.hostname}:{parts.port}{parts.path}",
+        "redis://:s3cret-sentinel@127.0.0.1:6399/5",  # nothing listens there
     ]
     for url in cases:
         updates = make(url, channel=channel)
@@ -494,9 +495,9 @@ async def test_a_wrong_password_and_an_unreachable_host_leak_nothing(
 
 def test_the_real_client_refuses_a_bad_option_without_a_server_and_without_a_loop() -> None:
     with pytest.raises(ValueError) as caught:
-        ru.RedisUpdates("redis://:s3cret-sentinel@127.0.0.1:6399/0", client_options={"bogus": 1})
+        ru.RedisUpdates("redis://:s3cret-sentinel@127.0.0.1:6399/5", client_options={"bogus": 1})
     assert "sentinel" not in str(caught.value)
-    assert ru.RedisUpdates("rediss://127.0.0.1:6399/0", client_options={"client_name": "x"})
+    assert ru.RedisUpdates("rediss://127.0.0.1:6399/5", client_options={"client_name": "x"})
     assert ru.RedisUpdates("unix:///tmp/none.sock")
 
 

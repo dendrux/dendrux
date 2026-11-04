@@ -29,7 +29,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qsl, urlsplit
 
-from dendrux.db._live_updates import LiveUpdates
+from dendrux.db._live_updates import LiveUpdates, _shutdown_socket
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterable, Sequence
@@ -113,12 +113,30 @@ async def _discard_bulk(parser: Any, length: int) -> bytes:
     return _DISCARDED
 
 
+def _check_frame_replay(poisoned: bool) -> None:
+    if poisoned:
+        raise ConnectionError("Redis live updates cannot replay a discarded frame")
+
+
 def _bounded_parser(base: type, limit: int) -> type:
     """Drain oversized bulks without appending their bodies to redis-py's retry buffer."""
 
     class BoundedParser(base):  # type: ignore[misc]
+        _frame_poisoned = False
+
+        def on_connect(self, connection: Any) -> None:
+            self._frame_poisoned = False
+            super().on_connect(connection)
+
+        async def read_response(self, disable_decoding: bool = False) -> Any:
+            _check_frame_replay(self._frame_poisoned)
+            response = await super().read_response(disable_decoding=disable_decoding)
+            self._frame_poisoned = False
+            return response
+
         async def _read(self, length: int) -> bytes:
             if length > limit:
+                self._frame_poisoned = True
                 return await _discard_bulk(self, length)
             return bytes(await super()._read(length))
 
@@ -339,7 +357,7 @@ def _checked_options(options: Mapping[str, Any] | None) -> dict[str, Any]:
     return chosen
 
 
-def _abort_transports(pool: Any, extra: Iterable[Any] = ()) -> None:
+def _abort_transports(pool: Any, extra: Iterable[Any] = (), *, closed_loop: bool = False) -> None:
     """Synchronously drop the sockets of every connection a pool holds, plus ``extra``."""
     connections = [conn for conn in extra if conn is not None]
     if pool is not None:
@@ -347,7 +365,13 @@ def _abort_transports(pool: Any, extra: Iterable[Any] = ()) -> None:
             connections.extend(getattr(pool, name, None) or ())
     for connection in connections:
         with suppress(Exception):
-            connection._writer.transport.abort()
+            _abort_transport(connection._writer.transport, closed_loop)
+
+
+def _abort_transport(transport: Any, closed_loop: bool) -> None:
+    if closed_loop:
+        _shutdown_socket(transport)
+    transport.abort()
 
 
 def _text(data: object) -> str:
@@ -381,7 +405,11 @@ class _Subscription:
         self._detect_by = self._idle_until + self.probe_s
 
     def abort(self) -> None:
-        _abort_transports(self.pool, [getattr(self.pubsub, "connection", None)])
+        _abort_transports(
+            self.pool,
+            [getattr(self.pubsub, "connection", None)],
+            closed_loop=self.owner._bound_loop_closed(),
+        )
 
     async def open(self) -> None:
         owner = self.owner
@@ -550,7 +578,9 @@ class RedisUpdates(LiveUpdates):
         wire = self._wire
         pipeline, pool = wire.pipeline, wire.pool
         wire.pipeline = wire.pool = wire.client = None  # the next send starts from scratch
-        _abort_transports(pool, [getattr(pipeline, "connection", None)])
+        _abort_transports(
+            pool, [getattr(pipeline, "connection", None)], closed_loop=self._bound_loop_closed()
+        )
 
     async def aclose_sender(self) -> None:
         # The handles stay until cleanup is over: if cleanup stalls, is cancelled or times out,
@@ -588,5 +618,6 @@ class RedisUpdates(LiveUpdates):
             raise failure
 
     def abort_listener(self) -> None:
-        if self._wire.subscription is not None:
-            self._wire.subscription.abort()
+        subscription, self._wire.subscription = self._wire.subscription, None
+        if subscription is not None:
+            subscription.abort()
