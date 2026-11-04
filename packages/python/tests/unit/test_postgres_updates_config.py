@@ -124,6 +124,31 @@ def test_genuinely_ambiguous_destination_fields_are_refused(url: str) -> None:
         asyncpg_dsn(url)
 
 
+@pytest.mark.parametrize(
+    "port",
+    ["6543%2Fother%23", "abc", "0", "65536", "-1", "+5432", "5432 ", "\u0665432", "1e3"],
+)
+@pytest.mark.parametrize("shape", ["authority", "socket"])
+def test_malformed_query_port_fails_closed_without_echo(port: str, shape: str) -> None:
+    base = (
+        "postgresql+asyncpg://app:pw@localhost/orbit"
+        if shape == "authority"
+        else ("postgresql+asyncpg://app:pw@/orbit?host=/tmp&")
+    )
+    url = base + ("?" if shape == "authority" else "") + "port=" + port
+    with pytest.raises(ValueError) as caught:
+        asyncpg_dsn(url)
+    error = caught.value
+    assert error.__cause__ is None and error.__context__ is None
+    assert "port" in str(error) and "other" not in str(error) and "6543" not in str(error)
+
+
+def test_valid_query_port_is_canonical() -> None:
+    dsn = asyncpg_dsn("postgresql+asyncpg://app:pw@localhost/orbit?port=06543")
+    assert _target(dsn=dsn)[0] == (("localhost", 6543),)
+    assert ":6543/" in dsn
+
+
 def test_dsn_escapes_credentials_and_keeps_tls_keys() -> None:
     url = make_url("postgresql+asyncpg://db.internal/orbit").set(
         username="us@er:", password=SECRET, query={"sslmode": "require"}

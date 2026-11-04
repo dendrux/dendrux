@@ -104,6 +104,20 @@ def _single(key: str, value: object) -> str:
     return str(value)
 
 
+def _port(value: object) -> str:
+    """A port as canonical decimal text, 1..65535; anything else is refused unechoed."""
+    text = _single("port", value)
+    if not (text.isascii() and text.isdigit()) or not 0 < int(text) <= 65_535:
+        raise ValueError("PostgresUpdates needs the URL port as a number from 1 to 65535.")
+    return str(int(text))
+
+
+def _authority_port(parsed: URL) -> str | None:
+    """The port beside a URL host, from the URL part or the query (never both)."""
+    port = _one(parsed.port, parsed.query, "port")
+    return _port(port) if port is not None else None
+
+
 def _one(url_value: object, query: Mapping[str, Any], *keys: str) -> str | None:
     """One value for a destination field given in the URL part or the query, never both."""
     found = [str(url_value)] if url_value is not None else []
@@ -126,7 +140,7 @@ def _query_hosts(parsed: URL) -> list[tuple[str, str]]:
     if "port" in query:
         if any(":" in spec and not spec.startswith(("/", "[")) for spec in hosts.split(",")):
             raise _refuse("port")
-        pairs.append(("port", _single("port", query["port"])))
+        pairs.append(("port", _port(query["port"])))
     return pairs
 
 
@@ -173,7 +187,7 @@ def asyncpg_dsn(url: str | URL) -> str:
     user = _one(parsed.username, query, "user")
     password = _one(parsed.password, query, "password")
     database = _one(parsed.database, query, "database", "dbname")
-    port = None if hosts else _one(parsed.port, query, "port")
+    port = None if hosts else _authority_port(parsed)
     pairs = _options(parsed, _dsn_keys() | _STARTUP_SETTINGS)
     if password is not None and user is None:
         pairs.append(("password", password))
