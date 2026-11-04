@@ -400,8 +400,8 @@ jobs:
         shell: bash
         run: |
           pytest tests/unit/test_redis_updates*.py tests/integration/test_redis_updates.py -n 0 --no-cov -v -rs -p no:randomly | tee pytest.log
-          if grep -q 'DENDRUX_TEST_REDIS_URL not set' pytest.log; then
-            echo "::error::Redis integration tests were skipped (DENDRUX_TEST_REDIS_URL not set)."
+          if grep -Eiq '(^SKIPPED|[0-9]+ skipped)' pytest.log; then
+            echo "::error::Redis compatibility tests were skipped."
             exit 1
           fi
 

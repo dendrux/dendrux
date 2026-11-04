@@ -5,9 +5,12 @@ The 8.1.0 pin of the ``dev`` extra is already exercised by every ordinary job.
 
 from __future__ import annotations
 
+import os
+import subprocess
 from pathlib import Path
 from typing import Any
 
+import pytest
 import yaml
 
 CI = Path(__file__).resolve().parents[4] / ".github" / "workflows" / "ci.yml"
@@ -42,4 +45,30 @@ def test_the_suites_run_against_a_real_redis_service_and_fail_on_a_skip() -> Non
     assert (
         "tests/unit/test_redis_updates" in run and "tests/integration/test_redis_updates.py" in run
     )
-    assert "-n 0" in run and "not set" in run and "exit 1" in run
+    assert "-n 0" in run and "skipped" in run and "exit 1" in run
+
+
+@pytest.mark.parametrize(
+    ("output", "pytest_status", "expected"),
+    [
+        ("10 passed", 0, 0),
+        ("9 passed, 1 skipped", 0, 1),
+        ("SKIPPED [1] unrelated reason", 0, 1),
+        ("SKIPPED [1] DENDRUX_TEST_REDIS_URL not set", 0, 1),
+        ("1 failed, 9 passed", 1, 1),
+    ],
+)
+def test_redis_ci_shell_rejects_any_skip_or_pytest_failure(
+    tmp_path: Path, output: str, pytest_status: int, expected: int
+) -> None:
+    run = next(s["run"] for s in job()["steps"] if "pytest" in s.get("run", ""))
+    fake = 'pytest() { printf "%s\\n" "$TEST_OUTPUT"; return "$TEST_STATUS"; }\n'
+    result = subprocess.run(
+        ["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", fake + run],
+        cwd=tmp_path,
+        env={**os.environ, "TEST_OUTPUT": output, "TEST_STATUS": str(pytest_status)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == expected, result.stdout + result.stderr
