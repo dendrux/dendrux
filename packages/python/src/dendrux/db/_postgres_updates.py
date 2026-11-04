@@ -293,6 +293,15 @@ _HARMLESS_ENGINE_SETTINGS = frozenset(
         "command_timeout",
         "timeout",
         "server_settings",
+        "prepared_statement_name_func",
+        "max_cached_statement_lifetime",
+        "max_cacheable_statement_size",
+        "record_class",
+        "connect_timeout",
+        "prepare_threshold",
+        "autocommit",
+        "application_name",
+        "keepalives_idle",
     }
 )
 _ENGINE_TLS_SETTINGS = frozenset(
@@ -310,7 +319,7 @@ _ENGINE_TLS_SETTINGS = frozenset(
 _BIND_HINT = (
     "PostgresUpdates cannot safely inherit the engine connection setup. "
     "Pass PostgresUpdates(url=...) with the intended destination; "
-    "transport connect_args containing ssl can override TLS settings only."
+    "transport connect_args with non-None ssl can override TLS settings only."
 )
 
 
@@ -355,13 +364,14 @@ def _standard_dialect(dialect: Any) -> bool:
         dialect.connect.__func__ is DefaultDialect.connect,
         dialect.create_connect_args.__func__ is dialect_type.create_connect_args,
     )
-    reference = dialect_type.import_dbapi()
+    dbapi_factory: Any = dialect_type
+    reference = dbapi_factory.import_dbapi()
     dbapi = dialect.dbapi
     return (
         all(methods)
         and not dialect.dispatch.do_connect
         and type(dbapi) is type(reference)
-        and vars(dbapi) == vars(reference)
+        and vars(reference).items() <= vars(dbapi).items()
         and dbapi.connect.__func__ is reference.connect.__func__
     )
 
@@ -466,7 +476,9 @@ class PostgresUpdates(LiveUpdates):
             return
         engine = getattr(store, "_engine", None)
         dsn = _engine_dsn(engine)
-        _check_engine_settings(engine, transport_ssl="ssl" in self._settings.connect_args)
+        _check_engine_settings(
+            engine, transport_ssl=self._settings.connect_args.get("ssl") is not None
+        )
         self._settings.send_dsn = dsn
         self._settings.listen_dsn = self._settings.explicit_listen or self._settings.send_dsn
 
@@ -475,7 +487,7 @@ class PostgresUpdates(LiveUpdates):
         if self._tls_checked:
             return
         self._tls_checked = True
-        if "ssl" in self._settings.connect_args:
+        if self._settings.connect_args.get("ssl") is not None:
             return
         for dsn in {self._settings.send_dsn, self._settings.listen_dsn} - {None}:
             assert dsn is not None
