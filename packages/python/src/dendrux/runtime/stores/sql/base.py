@@ -3842,8 +3842,56 @@ class SQLStateStore(SQLBlobCatalog):
             await self._write_tx(session)
             return seq
 
+    async def get_events_for_runs(
+        self, heads: Mapping[str, int], *, limit_per_run: int
+    ) -> dict[str, list[RunEventRecord]]:
+        """Read bounded events for already-authorized run ids."""
+        from dendrux.runtime.stores.sql._batched_reads import _group_events, _validate_event_batch
 
+        _validate_event_batch(heads, limit_per_run)
+        if not heads:
+            return {}
+        async with self._session_factory() as session:
+            rows = (
+                await session.execute(
+                    self.events_for_runs_query(heads, limit_per_run=limit_per_run)
+                )
+            ).all()
+        return _group_events(rows)
 
+    def events_for_runs_query(self, heads: Mapping[str, int], *, limit_per_run: int) -> Any:
+        """Build one portable bounded UNION ALL query for an authorized chunk."""
+        from sqlalchemy import union_all
+
+        from dendrux.db.models import RunEvent
+
+        queries = [
+            select(
+                select(RunEvent.__table__)
+                .where(RunEvent.agent_run_id == run_id, RunEvent.sequence_index > head)
+                .order_by(RunEvent.sequence_index)
+                .limit(limit_per_run)
+                .subquery()
+            )
+            for run_id, head in heads.items()
+        ]
+        return union_all(*queries)
+
+    async def get_run_statuses(self, run_ids: Sequence[str]) -> dict[str, str]:
+        """Read status projections for already-authorized run ids."""
+        from dendrux.db.models import AgentRun
+        from dendrux.runtime.stores.sql._batched_reads import _validate_run_count
+
+        _validate_run_count(run_ids)
+        if not run_ids:
+            return {}
+        async with self._session_factory() as session:
+            rows = (
+                await session.execute(
+                    select(AgentRun.id, AgentRun.status).where(self.id_in(AgentRun.id, run_ids))
+                )
+            ).all()
+        return dict(rows)
 
     async def get_run_events(
         self,
