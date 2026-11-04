@@ -508,7 +508,7 @@ class RunStore:
         self._listens = True
         self._closed = False
         self._lease: object | None = None
-        self._lease_lock: asyncio.Lock | None = None
+        self._acquiring: asyncio.Task[None] | None = None
         self._lease_retry_at = 0.0
         self._coordinators: dict[asyncio.AbstractEventLoop, _Coordinator] = {}
 
@@ -630,7 +630,15 @@ class RunStore:
                 await coordinator.aclose(timeout)
                 self._coordinators.pop(loop, None)
         finally:
+            await self._settle_acquisition(timeout)
             await self._release_lease()
+
+    async def _settle_acquisition(self, timeout: float) -> None:
+        """Wait (bounded) for an in-flight acquisition. If it outlasts the wait, it
+        still releases its own lease when it lands, because the reader is closed."""
+        task = self._acquiring
+        if task is not None and not task.done():
+            await asyncio.wait({task}, timeout=timeout)
 
     async def _release_lease(self) -> None:
         """Release this reader's lease; the handle is kept until the release finished,
@@ -654,26 +662,35 @@ class RunStore:
         return live if isinstance(live, LiveUpdates) else None
 
     async def _lease_live_updates(self) -> None:
-        """Take this reader's listener lease once; failure means polling, retried later."""
+        """Take this reader's listener lease once; failure means polling, retried later.
+
+        The acquisition runs in a task the reader owns, so cancelling the
+        follow or stream that asked for it never cancels the acquisition or
+        the release of a lease that lands after ``close()``.
+        """
         live = self._live_updates()
         if live is None or self._lease is not None or self._closed:
             return
         loop = asyncio.get_running_loop()
         if loop.time() < self._lease_retry_at:
             return
-        if self._lease_lock is None:
-            self._lease_lock = asyncio.Lock()
-        async with self._lease_lock:
-            if self._lease is not None or self._closed:
-                return
-            try:
-                self._lease = await live.acquire_listener()
-            except (LiveUpdatesUnavailableError, RuntimeError):
-                self._lease_retry_at = loop.time() + _LEASE_RETRY_S
-                _codes.log_code(logger, _codes.LIVE_UPDATES_UNAVAILABLE, error_kind="closed")
-                return
-            if self._closed:  # close() ran while we waited for the listener: give it back
-                await self._release_lease()
+        task = self._acquiring
+        if task is None or task.done():
+            task = loop.create_task(self._acquire(live), name="dendrux-live-updates-lease")
+            task.add_done_callback(_observe_task)  # a cancelled asker may never read it
+            self._acquiring = task
+        await asyncio.shield(task)
+
+    async def _acquire(self, live: LiveUpdates) -> None:
+        loop = asyncio.get_running_loop()
+        try:
+            self._lease = await live.acquire_listener()
+        except (LiveUpdatesUnavailableError, RuntimeError):
+            self._lease_retry_at = loop.time() + _LEASE_RETRY_S
+            _codes.log_code(logger, _codes.LIVE_UPDATES_UNAVAILABLE, error_kind="closed")
+            return
+        if self._closed:  # close() ran while we waited for the listener: give it back
+            await self._release_lease()
 
     def _follow_coordinator(self) -> _Coordinator:
         """This reader's coordinator for the running event loop (created on first use)."""
@@ -1423,6 +1440,11 @@ def _run_to_summary(record: Any) -> RunSummary:
         replay=_replay_of(record),
         tenant_id=getattr(record, "tenant_id", None),
     )
+
+
+def _observe_task(task: asyncio.Task[None]) -> None:
+    if not task.cancelled():
+        task.exception()
 
 
 def _warn_stream_events_unscoped() -> None:

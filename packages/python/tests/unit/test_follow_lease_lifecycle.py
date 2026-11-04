@@ -50,6 +50,7 @@ async def test_listener_acquired_after_close_is_released_at_once() -> None:
     reader, live = _reader()
     await live._listener_lock.acquire()  # acquisition waits here
     follow = reader.follow("r", tenant_id=None)
+    reader._event_feed.stop_timeout_s = 0.05  # close waits this long for the acquisition
     start = asyncio.create_task(follow.start())
     await ticks()
     await reader.close()
@@ -127,4 +128,37 @@ async def test_failed_stream_admission_never_keeps_a_hub_consumer(
         await anext(reader.stream_events("r", tenant_id=None))
     assert live._stream_consumers == 0
     await reader.close()
+    await live.close()
+
+
+@pytest.mark.parametrize("close_first", [True, False], ids=["close_returns_first", "close_waits"])
+async def test_cancelled_startup_after_close_never_strands_a_lease(close_first: bool) -> None:
+    """Close, a pending acquisition and a peer reader that cancels the startup."""
+    reader, live = _reader()
+    await live._listener_lock.acquire()  # gate the first acquisition only
+    follow = reader.follow("r", tenant_id=None)
+    reader._event_feed.stop_timeout_s = 0.05  # close waits this long for the acquisition
+    start = asyncio.create_task(follow.start())
+    await ticks()
+
+    async def peer() -> None:
+        lease = await live.acquire_listener()  # a second reader queued behind startup
+        start.cancel()  # an independent cancellation while startup cleans up
+        await live.release_listener(lease)
+
+    other = asyncio.create_task(peer())
+    await ticks()
+    if close_first:
+        await reader.close()  # returns before the gate opens (bounded wait)
+        live._listener_lock.release()
+    else:
+        closing = asyncio.create_task(reader.close())
+        await ticks()
+        live._listener_lock.release()
+        await asyncio.wait_for(closing, 5)
+    await asyncio.gather(start, return_exceptions=True)
+    await asyncio.wait_for(other, 5)
+    await follow.aclose()
+    await _settle(live)
+    assert reader._lease is None and not live._leases and not live.healthy
     await live.close()
