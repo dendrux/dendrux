@@ -45,6 +45,7 @@ from dendrux.db._live_updates import _error_kind
 from dendrux.errors import FollowCapacityError as FollowCapacityError
 from dendrux.errors import LiveUpdatesUnavailableError, RunNotFoundError
 from dendrux.errors import _capacity_error as _capacity_error
+from dendrux.runtime._bounds import MAX_PAGE
 from dendrux.runtime._pending import approval_calls as approval_calls
 from dendrux.runtime._pending import (
     check_read_bool,
@@ -894,8 +895,8 @@ class EventFeed:
             (±20 % jitter).
         status_every: without healthy live updates, a status read rides with
             every Nth events read.
-        batch: most events per run in one read (the coordinator may read
-            fewer to keep one query under 2,000 rows).
+        batch: most events per run in one read, clamped to 1,000 (the
+            coordinator may read fewer to keep one query under 2,000 rows).
         stop_timeout_s: how long ``RunStore.close()`` waits for the coordinator.
         heartbeat_s: idle time before a :class:`FollowHeartbeat` is yielded.
         buffer: events buffered per follower before it ends as ``"lagging"``.
@@ -936,6 +937,7 @@ class EventFeed:
         self.heartbeat_s = heartbeat_s
         self.buffer = buffer
         self.status_every = status_every
+        batch = min(batch, MAX_PAGE)
         self.batch = batch
         self.stop_timeout_s = stop_timeout_s
         self._params = _Params(poll_interval_s, poll_max_s, poll_healthy_s, status_every, batch)

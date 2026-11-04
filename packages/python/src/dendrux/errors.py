@@ -1169,6 +1169,23 @@ class BlobContentionError(_KwargsReduceMixin, RuntimeError):
 # ---------------------------------------------------------------------------
 
 
+class SubtreeTooLargeError(_KwargsReduceMixin, ValueError):
+    """A public subtree read reached its descendant bound (root excluded).
+
+    ``run_id`` identifies the root and ``max_nodes`` the refused threshold.
+    SQL traversal stops at the threshold; custom stores without a named
+    ``max_nodes`` keyword are checked after loading. This bounds node count,
+    not payload memory.
+    """
+
+    _init_fields = ("run_id", "max_nodes")
+
+    def __init__(self, run_id: str, max_nodes: int) -> None:
+        self.run_id = run_id
+        self.max_nodes = max_nodes
+        super().__init__(f"Subtree for run {run_id!r} reached max_nodes={max_nodes} descendants.")
+
+
 class BudgetConfigurationError(_KwargsReduceMixin, ValueError):
     """A budget cannot be safely evaluated from pricing or bounded live accounting.
 
@@ -1311,6 +1328,7 @@ __all__ = [
     "SkillMissingError",
     "SkillValidationError",
     "SqliteSchemaSyncError",
+    "SubtreeTooLargeError",
     "TIMEOUT_REASONS",
     "TenantScopeRequiredError",
     "TimeoutReason",

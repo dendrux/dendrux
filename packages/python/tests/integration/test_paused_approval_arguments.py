@@ -49,7 +49,7 @@ async def test_paused_approval_batch_hides_remaining_arguments(store):
         assert secret not in json.dumps(pending.to_dict())
         fetched = await agent.get_result(paused.run_id, tenant_id="A")
         assert secret not in json.dumps(fetched.to_dict())
-        events = await reader.get_events(paused.run_id, tenant_id="A")
+        events = await reader.get_events(paused.run_id, tenant_id="A", limit=1000)
         active = [e for e in events if e.event_type == "run.paused"][-1]
         view = await reader.get_event_view(paused.run_id, active, tenant_id="A")
         assert secret not in json.dumps(view.data)

@@ -520,10 +520,10 @@ class TestRunStoreScoping:
         assert (await store.get_run("ra", tenant_id="A")).run_id == "ra"
         assert await store.get_run("ra", tenant_id="B") is None
         assert await store.get_run("ra", tenant_id=None) is None
-        assert await store.get_events("ra", tenant_id="B") == []
-        assert await store.get_traces("ra", tenant_id="B") == []
-        assert await store.get_tool_invocations("ra", tenant_id="B") == []
-        assert await store.get_llm_calls("ra", tenant_id="B") == []
+        assert await store.get_events("ra", tenant_id="B", limit=1000) == []
+        assert await store.get_traces("ra", tenant_id="B", limit=1000) == []
+        assert await store.get_tool_invocations("ra", tenant_id="B", limit=1000) == []
+        assert await store.get_llm_calls("ra", tenant_id="B", limit=1000) == []
         assert await store.get_pii_mapping("ra", tenant_id="B") == {}
         assert await store.get_pauses("ra", tenant_id="B") == []
         with pytest.raises(RunNotFoundError):
@@ -531,19 +531,19 @@ class TestRunStoreScoping:
 
     async def test_in_scope_reads_return_data(self, state: Any, store: RunStore) -> None:
         await _seed_two_tenants(state)
-        assert len(await store.get_events("rb", tenant_id="B")) == 2
-        assert (await store.get_traces("rb", tenant_id="B"))[0].content == "rb secret"
-        assert len(await store.get_tool_invocations("rb", tenant_id="B")) == 1
-        assert len(await store.get_llm_calls("rb", tenant_id="B")) == 1
+        assert len(await store.get_events("rb", tenant_id="B", limit=1000)) == 2
+        assert (await store.get_traces("rb", tenant_id="B", limit=1000))[0].content == "rb secret"
+        assert len(await store.get_tool_invocations("rb", tenant_id="B", limit=1000)) == 1
+        assert len(await store.get_llm_calls("rb", tenant_id="B", limit=1000)) == 1
         assert await store.get_pii_mapping("rb", tenant_id="B") == {"<P>": "v"}
         assert len(await store.get_pauses("rb", tenant_id="B")) == 1
         assert (await store.get_run("rn", tenant_id=None)).run_id == "rn"
-        assert len(await store.get_events("rn", tenant_id=None)) == 2
+        assert len(await store.get_events("rn", tenant_id=None, limit=1000)) == 2
 
     async def test_unscoped_reads_everything(self, state: Any, store: RunStore) -> None:
         await _seed_two_tenants(state)
         assert (await store.get_run("ra")).tenant_id == "A"
-        assert len(await store.get_events("rb", tenant_id=UNSCOPED)) == 2
+        assert len(await store.get_events("rb", tenant_id=UNSCOPED, limit=1000)) == 2
 
     async def test_list_and_count_tenant_semantics(self, state: Any, store: RunStore) -> None:
         await _seed_two_tenants(state)
@@ -576,8 +576,8 @@ class TestRunStoreScoping:
 
         await _seed_two_tenants(state)
         legacy = RunStore(Legacy())  # type: ignore[arg-type]
-        assert await legacy.get_events("ra", tenant_id="B") == []
-        assert len(await legacy.get_events("ra", tenant_id="A")) == 2
+        assert await legacy.get_events("ra", tenant_id="B", limit=1000) == []
+        assert len(await legacy.get_events("ra", tenant_id="A", limit=1000)) == 2
         assert await legacy.get_run("ra", tenant_id="B") is None
 
     async def test_detail_and_summary_carry_tenant_and_error_info(

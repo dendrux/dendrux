@@ -282,7 +282,7 @@ class TestRunNotFoundErrorAlias:
 
         async with RunStore.from_database_url(f"sqlite+aiosqlite:///{tmp_path / 'r.db'}") as store:
             with pytest.raises(RunNotFoundError) as info:
-                await store.get_subtree("missing")
+                await store.get_subtree("missing", max_nodes=10000)
             assert info.value.run_id == "missing"
             with pytest.raises(RunNotFoundError):
                 async for _ in store.stream_events("missing"):

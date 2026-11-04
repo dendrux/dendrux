@@ -252,7 +252,7 @@ async def test_follow_active_approval_request_keeps_its_params(state: Any, engin
 async def test_event_view_and_pause_page_hide_free_text(state: Any, engine: Any) -> None:
     await _write_history(state, active=True)
     async with RunStore.from_engine(engine) as store:
-        raw = await store.get_events("r1", tenant_id="T")
+        raw = await store.get_events("r1", tenant_id="T", limit=1000)
         views = [await store.get_event_view("r1", e, tenant_id="T") for e in raw]
         assert SECRET not in json.dumps([v.data for v in views])
         active_req = [v for v in views if v.event_type == "approval.requested"][-1]

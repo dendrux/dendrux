@@ -46,7 +46,7 @@ async def test_tool_result_storage_and_public_reads_keep_041_shape(
         iteration_index=1,
     )
     (record,) = await store.get_tool_calls("r")
-    (invocation,) = await RunStore(store).get_tool_invocations("r", tenant_id=None)
+    (invocation,) = await RunStore(store).get_tool_invocations("r", tenant_id=None, limit=1000)
     # c52fb9e save_tool_call: JSON values are parsed; text uses {"raw": payload}.
     # Non-finite numbers now take that same documented text fallback on both DBs.
     assert record.result == invocation.result == expected
@@ -84,7 +84,9 @@ async def test_plain_text_transform_receives_and_returns_raw_text(store, entry, 
     message = next(m for m in llm.messages[-1] if m.role.value == "tool")
     expected = output if isinstance(output, str) else json.dumps(output)
     assert message.content.encode("utf-8") == expected.encode("utf-8")
-    (invocation,) = await RunStore(store).get_tool_invocations(paused.run_id, tenant_id=None)
+    (invocation,) = await RunStore(store).get_tool_invocations(
+        paused.run_id, tenant_id=None, limit=1000
+    )
     try:
         stored = json.loads(expected)
     except ValueError:
