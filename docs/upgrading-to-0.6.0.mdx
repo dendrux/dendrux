@@ -1,20 +1,20 @@
 ---
 title: Upgrading to 0.6.0
-description: Migrate, roll every worker and reader, activate format 2, then enable recovery and event notifications. Includes every changed default and rollback rules.
+description: Migrate, roll every worker and reader, activate format 2, then enable recovery and live updates. Includes every changed default and rollback rules.
 ---
 
 # Upgrading to 0.6.0
 
-0.6.0 adds explicit recovery after a worker stops, durable execution checkpoints, optional Postgres event notifications and trace continuity across processes. Applications own their workers, maintenance jobs and read routes.
+0.6.0 adds explicit recovery after a worker stops, durable execution checkpoints, optional live updates for `follow` (Postgres or Redis hints), a batched follow reader and trace continuity across processes. Applications own their workers, maintenance jobs and read routes.
 
 > **Activation is one-way.** Take a database backup before activation. Once activation starts, rollback means restoring that backup. There is no deactivation or CLI downgrade command. Do not let a 0.5 worker or reader access an activated database.
 
 ## Upgrade in order
 
 1. **Migrate.** Install `dendrux[postgres]==0.6.0` in the migration job environment. Back up the database, then run `dendrux db migrate` once over a direct Postgres connection, before starting 0.6 workers. From the 0.5 head `e8f9a0b1c2d3`, revision `f9a0b1c2d3e4` adds recovery columns and `dendrux_settings`. It leaves the global storage format at `1` and does not build the new unique indexes. Older workers can keep working during this additive step. If upgrading from an earlier release, complete the [0.5 upgrade](/docs/upgrading-to-0.5.0) first.
-2. **Roll every worker and reader to 0.6.** Include read-only services, scripts, scheduled jobs and dashboards built on `RunStore`. Keep recovery and notifications off during the roll. Apply the default changes below in your application. Check the schema with `dendrux db check` and inspect `dendrux db status`; migration alone does not activate format 2.
+2. **Roll every worker and reader to 0.6.** Include read-only services, scripts, scheduled jobs and dashboards built on `RunStore`. Keep recovery and live updates off during the roll. Apply the default changes below in your application. Check the schema with `dendrux db check` and inspect `dendrux db status`; migration alone does not activate format 2.
 3. **Back up again, then activate.** Confirm that no old worker or reader remains. Take the pre-activation backup, then run `dendrux db activate` once over a direct Postgres connection. The command checks the schema, removes identical duplicate rows, builds three unique indexes and sets the global format to `2`. It reads the whole `react_traces`, `tool_calls` and `run_events` tables, builds the indexes concurrently on Postgres and drops the old indexes; run it in a quiet period and check free disk for the builds first. It refuses conflicting duplicates rather than choosing between different contents. Progress is durable; fix the reported condition and rerun the command after a failure. `dendrux db status` should show `storage_format=2 activate_step=done`.
-4. **Enable recovery and notifications explicitly.** Call `sweep(on_stale="reclaim", ...)` from your own maintenance job and dispatch the returned items to `agent.reclaim(..., tenant_id=..., item=...)`. Use a `stale_running` threshold at least three times `Agent.lease_interval`. For Postgres notifications, set `database_options={"notify_channel": "dendrux_events"}` on every writer, and `listen_url=` or a started `notifier=` on readers. The listener must connect to the primary through a direct or session-pooled endpoint. See [Recovery](/docs/guides/recovery) and [Scaling workers](/docs/guides/scaling#event-notifications).
+4. **Enable recovery and live updates explicitly.** Call `sweep(on_stale="reclaim", ...)` from your own maintenance job and dispatch the returned items to `agent.reclaim(..., tenant_id=..., item=...)`. Use a `stale_running` threshold at least three times `Agent.lease_interval`. Live updates are optional and off by default; `follow` polls without them. To turn them on, build the store yourself with `live_updates=True` (Postgres) or `live_updates=RedisUpdates(...)` (any store; `pip install "dendrux[redis]"`) on every writer and reader, wrap the reader's store in `RunStore(store)`, and close the store with `await store.close()` at shutdown. They cannot be set through `Agent(database_url=...)`. See [Recovery](/docs/guides/recovery) and [Live updates](/docs/guides/scaling#live-updates).
 
 The CLI reads the database URL from `DENDRUX_DATABASE_URL`; keep using your deployment's credential injection for that variable.
 
@@ -86,7 +86,7 @@ Back up the existing file before upgrading.
 
 ## Store classes: `SQLAlchemyStateStore` is removed
 
-SQL persistence is now one base class and three concrete stores, all importable from `dendrux.store`. `notify_channel` is a `PostgresStateStore` option only; the other stores do not accept it. `SQLAlchemyStateStore` is removed in 0.6.0 with no alias: importing it raises `ImportError` and names the replacements. Applications that only use `Agent(database_url=)`, `RunStore` or the CLI need no change.
+SQL persistence is now one base class and three concrete stores, all importable from `dendrux.store`, and each takes an optional `live_updates=` argument. `SQLAlchemyStateStore` is removed in 0.6.0 with no alias: importing it raises `ImportError` and names the replacements. Applications that only use `Agent(database_url=)`, `RunStore` or the CLI need no change.
 
 | You wrote | Write instead |
 | --- | --- |
@@ -132,8 +132,9 @@ Drain those runs before upgrading, or explicitly keep `Budget(..., count_cache_t
 - A non-streaming socket read timeout reports `timeout_reason=None`. `call_deadline` means Dendrux's own deadline, not a socket timeout.
 - `max_stream_bytes` also limits one SSE event's wire size. A low custom cap may now reject a final event that repeats a response. Compressed responses accept gzip or deflate; unsupported or stacked encodings raise `response_encoding_unsupported`.
 - Cascade cancellation stays inside the root run's tenant even when called unscoped. Traversal is capped by `Budget.max_subtree_nodes` (default 10,000); `cascade_truncated` means remaining branches need attention. Finished runs keep their `cancel_requested` value. On SQLite, delegated-child creation briefly acquires the write lock before checking the parent.
-- Postgres NOTIFY is off by default. Each notifying transaction takes a database-wide lock at commit. A 50-writer local probe saw about 45% lower write throughput with it enabled; this is a local measurement, not a capacity guarantee. A stuck listener can fill the notification queue and cause writes to fail. Monitor `pg_notification_queue_usage()` and the notifier [alert codes](/docs/recipes/observability#what-to-alert-on).
-- `EventNotifier`, `NotifierState`, `Subscription` and `PostgresEventNotifier` are public in `dendrux.store`.
+- Live updates are off by default and belong to the store: `live_updates=True` (Postgres only) or an instance such as `PostgresUpdates(...)` or `RedisUpdates(...)`. Only `RunStore(store)` listens; `RunStore.from_engine` and `RunStore.from_database_url` keep polling. `Agent(database_url=..., database_options=...)`, `sweep(database_url=...)`, `get_engine` and `RunStore.from_database_url` refuse `live_updates` and a `notify_channel` key with a `ValueError`; there is no `notifier=` or `listen_url=` on `RunStore`. A hint is a lossy wake-up, never data: the database stays the truth. See [Live updates](/docs/guides/scaling#live-updates) for the transports, the failure behaviour and the alert codes.
+- Followers are served differently. One coordinator task per `RunStore` and event loop reads all watched runs in batches (up to 200 runs and 2,000 rows per query, at most 20 queries per second), where 0.5 ran one poller per watched run. The ordering, heartbeats, caps and redaction of `follow` are unchanged. With healthy live updates a safety poll runs every 10 seconds; without them an idle run is read every 0.5 seconds, backing off to 2 seconds. `stream_events` keeps its own per-caller polling; prefer `follow`.
+- `PostgresUpdates` uses connections outside your pool: one sender per store that announces and one listener per store whose readers follow. Count them against the database's connection limit.
 - Resumes, submissions and reclaim use the stored trace link to stay in one trace when an OpenTelemetry notifier is supplied. In a trace, a failed tool's stack shows where Dendrux reported the failure, rather than where the tool itself crashed.
 - Structured logs carry stable codes. Strict field checking is opt-in with `DENDRUX_STRICT_LOG_FIELDS=1`; normal operation drops invalid fields. See [Log codes](/docs/reference/log-codes).
 

@@ -28,7 +28,7 @@ engine = create_async_engine(
     pool_recycle=1800,
 )
 state = PostgresStateStore(engine)
-reads = RunStore.from_engine(engine)
+reads = RunStore(state)
 agent = Agent(
     name="worker",
     prompt="Help the user.",
@@ -38,10 +38,11 @@ agent = Agent(
 # Start application requests here, then drain them before shutdown.
 await agent.close()
 await reads.close()
+await state.close()
 await engine.dispose()
 ```
 
-The store runs the agents (`PostgresStateStore` here; `MySQLStateStore` or `SQLiteStateStore` the same way, or `store_for_engine(engine)` to pick one from the engine); `RunStore.from_engine` supplies the read facade over the same engine. You keep ownership of the engine and dispose it after all work and readers have stopped. Avoid holding a database session while you await an agent run, a tool or a browser.
+The store runs the agents (`PostgresStateStore` here; `MySQLStateStore` or `SQLiteStateStore` the same way, or `store_for_engine(engine)` to pick one from the engine); `RunStore(state)` supplies the read facade over the same store, and listens for live updates when the store has them (see [Live updates](#live-updates)). `RunStore.from_engine(engine)` is the polling-only alternative. Shut down in this order: agents, readers, the store, then the engine. `await state.close()` closes the store's live-update connections and never disposes your engine. You keep ownership of the engine and dispose it after all work and readers have stopped. Avoid holding a database session while you await an agent run, a tool or a browser.
 
 Build the engine in the worker process, after any fork, on the event loop that will use it. Async Postgres pools belong to their creating loop; using one from another loop is refused with a clear error. Build one store per worker loop instead of calling `asyncio.run` per request. See also [Web endpoints](/docs/recipes/web-endpoint).
 
@@ -85,7 +86,7 @@ options = dict(
 )
 ```
 
-Pass these as `database_options=` (or as keyword arguments to `create_async_engine`). Migrations, activation and LISTEN need separate connections. Never send `listen_url` through a transaction pool, even if the notifier's startup self-test passes.
+Pass these as `database_options=` (or as keyword arguments to `create_async_engine`). Migrations, activation and LISTEN need separate connections. The live-update sender works through a transaction pool because NOTIFY is transactional; the listener does not, so give `PostgresUpdates` a direct or session-pooled `listen_url` (see [Behind PgBouncer](#behind-pgbouncer)).
 
 ## Migrations: one job, direct connection
 
@@ -101,7 +102,7 @@ For 0.6, migration is additive and leaves format 1 enabled. Roll every worker an
 
 ## MySQL and MariaDB
 
-The same rules apply: one store per worker, bounded pools and one migration job. The differences are in [MySQL and MariaDB](/docs/guides/mysql): engines need `READ COMMITTED` and a UTC connection (engines Dendrux creates set both), `dendrux db migrate` is forward-only and holds a server-wide named lock, the Agent's `Limits` are compared with the server's `max_allowed_packet` before first use, and event notifications are Postgres-only, so `follow` polls.
+The same rules apply: one store per worker, bounded pools and one migration job. The differences are in [MySQL and MariaDB](/docs/guides/mysql): engines need `READ COMMITTED` and a UTC connection (engines Dendrux creates set both), `dendrux db migrate` is forward-only and holds a server-wide named lock, the Agent's `Limits` are compared with the server's `max_allowed_packet` before first use, and live updates have no built-in MySQL transport, so `follow` polls unless you give the store a `RedisUpdates` or your own bus (see [Redis](#redis)).
 
 ## Sweep cadence
 
@@ -116,48 +117,230 @@ The same rules apply: one store per worker, bounded pools and one migration job.
 
 See [Recovery](/docs/guides/recovery) for attempt limits, recovery approval and bounded dispatch.
 
-## Event notifications
+## Live updates
 
-Postgres notifications are optional wake hints. Durable event rows remain the source of truth. Writers default to `notify_channel=None`, so ordinary writes issue no NOTIFY. With a healthy listener, events from a writer that leaves the channel off may wait until the next `poll_healthy_s` check (30 seconds by default); `notifier_missed_hint` flags this. Enable the channel on every writer:
+Live updates tell other processes that a run may have changed, so `follow()` and `stream_events()` wake within milliseconds instead of waiting for the next poll. They are optional and off by default.
+
+> **Hints are lossy; the database is the truth.** A hint carries only run ids. It can arrive late, twice, out of order or never, and a reader always re-reads the database before it shows anything. An announcement never fails, rolls back or changes the result of a save. If every hint is lost, followers still see every event: they poll.
+
+### Turn them on
+
+Live updates are configuration of the **store**, not of the `Agent` or the `RunStore`:
+
+| `live_updates=` | Meaning |
+| --- | --- |
+| `None` or `False` (default) | Off. The store announces nothing and followers poll. |
+| `True` | The store's built-in transport. Only `PostgresStateStore` has one (`PostgresUpdates`). Any other store raises `ValueError` that names the store and suggests `RedisUpdates`. |
+| a `LiveUpdates` instance | Used as given: `PostgresUpdates(...)`, `RedisUpdates(...)` or your own. An instance belongs to one store; binding it to a second store raises `ValueError`. |
+
+Every `SQLStateStore` constructor takes it (`PostgresStateStore`, `MySQLStateStore`, `SQLiteStateStore`, `store_for_engine`), and `MySQLStateStore.from_url(url, live_updates=...)` takes it as a named argument.
 
 [//]: # "docs-test: skip - application supplies its shared engine and Postgres deployment"
 
 ```python
-from dendrux.store import PostgresStateStore
+from dendrux import Agent
+from dendrux.store import PostgresStateStore, RunStore
 
-state = PostgresStateStore(engine, notify_channel="dendrux_events")
-# The Agent(database_url=...) form uses:
-# database_options={"notify_channel": "dendrux_events"}
+state = PostgresStateStore(engine, live_updates=True)   # announces after each commit
+reads = RunStore(state)                                  # listens for those announcements
+agent = Agent(provider="openai:gpt-4o-mini", prompt="Help the user.", state_store=state)
+
+async with reads.follow(run_id, tenant_id=tenant) as follow:
+    async for event in follow:
+        await send(event)
+
+# At shutdown, in this order:
+await agent.close()
+await reads.close()    # releases this reader's listener; never closes the store
+await state.close()    # closes the live-update connections; the engine stays yours
+await engine.dispose()
 ```
 
-Readers opt in separately. The database URL used for event reads may use transaction pooling. `listen_url` must connect to the **primary**, through a direct or session-pooled endpoint:
+What this does and does not do:
 
-[//]: # "docs-test: skip - requires configured Postgres reader and primary listener endpoints"
+- **Only `RunStore(store)` listens.** `RunStore.from_engine(engine)` and `RunStore.from_database_url(url)` build stores without live updates, so their followers keep polling. A reader in another process builds its own store with live updates and wraps it the same way. Several `RunStore` objects over one store each take a listener lease; the listener runs until the last one closes.
+- **Writers and readers need the same bus.** Every process that writes runs gives its store the same transport and channel as the readers. A writer without live updates is still correct: its runs are found by the safety poll.
+- **`Agent(database_url=...)` cannot enable them.** `live_updates` and the old `notify_channel` key are refused with a `ValueError` in `database_options` on `Agent`, `sweep(database_url=...)`, `get_engine` and `RunStore.from_database_url`, even when their value is `None` or `False`. Build the store yourself and pass it to `Agent(state_store=...)`, `sweep(state_store=...)` or `RunStore(store)`. `sweep(database_url=...)` uses a temporary store with no live updates.
+- **There is no `notify_channel` option and no `listen_url=` on `RunStore`.** The channel and the listen URL belong to the transport: `PostgresUpdates(channel=..., listen_url=...)`.
+- **A closed `Agent` closes only what it created.** `Agent.close()` closes the store it built from `database_url=`; a store you passed in is yours to close with `await store.close()`.
+
+### What announces
+
+A write announces the run ids it changed after its transaction's COMMIT was issued. These calls announce: creating a run; saving an event; starting and completing a tool call; finishing, pausing, claiming, releasing and reclaiming a run; submitting a pause decision; cancel and pause requests; metadata updates; lease marking; and the stale and abandoned sweeps. A write that fails before COMMIT, or whose COMMIT is proved not to have applied, announces nothing.
+
+These writes are **polling-only** and announce nothing: `save_trace`, `save_tool_call`, `save_usage`, `save_llm_interaction`, `checkpoint_step`, `set_trace_link`, `add_note`, `mark_notes_delivered`, `touch_progress` and the blob-catalog writes. Their data is readable at once; a live view shows live usage totals and similar details at its next poll.
+
+The announcement goes out when the outermost store call returns, after its database sessions are closed and outside the store's session lock. If the call raises, including `StoreOutcomeUnknown`, its ids wait for the next successful call on that store or for `close()`. A sweep flushes between pages, and flushes the earlier successes of a page that fails or is cancelled, waiting at most `flush_deadline_s` before it re-raises the original error. Hints still pending are only a delay: polling covers them.
+
+### What a reader does
+
+One coordinator task per `RunStore` and event loop serves every `follow()` on it. It reads all watched runs in chunks of up to 200 runs and 2,000 rows (one events query and one status query per chunk), spends at most 20 queries a second, and reads the run that has waited longest first. A hint never adds a run; it only makes a run you already follow due now.
+
+| Situation | When the run is read |
+| --- | --- |
+| A hint arrives, or a follower joins | At once (events and status) |
+| Live updates healthy, nothing arrives | Every `poll_healthy_s`, **10 seconds by default with 20 % jitter either way** (the safety poll) |
+| Live updates off, or the listener is down | After `poll_interval_s` (0.5 s), backing off to `poll_max_s` (2 s) while idle; status on every fourth read |
+| The listener reconnects, or incoming hints overflowed (a gap) | Every watched run once, spread by up to `poll_interval_s` of jitter |
+| Any case | Status at most 30 seconds old; a full page of events is read again at once; a terminal run is drained until a page comes back empty before `FollowEnd` |
+
+`stream_events` keeps its own per-caller polling and is woken by hints; prefer `follow`. If the live-update listener cannot start, readers poll and retry the listener after 30 seconds. Alert on the codes in [What to alert on](/docs/recipes/observability#what-to-alert-on).
+
+### Postgres
+
+`live_updates=True` builds `PostgresUpdates()`. It uses two dedicated asyncpg connections that never come from your pool: a **sender** (opened on the first announcement, one `pg_notify` statement per send, which can carry many ids) and a **listener** (opened when a reader on the store starts following). A process that writes adds one connection; a reader on the same store adds one more while it follows runs.
+
+[//]: # "docs-test: skip - needs a PostgreSQL server"
 
 ```python
-from dendrux.store import RunStore
+from dendrux.store import PostgresStateStore, PostgresUpdates
 
-async with RunStore.from_database_url(
-    reader_url,
-    database_options={"notify_channel": "dendrux_events"},
-    listen_url=primary_listen_url,
-) as reads:
-    async with reads.follow(run_id, tenant_id=tenant) as follow:
-        async for event in follow:
-            await send(event)
+updates = PostgresUpdates(
+    url=None,                      # default: the store's engine URL
+    listen_url=None,               # default: the same URL as the sender
+    connect_args=None,             # asyncpg options, for example {"ssl": ssl_context}
+    channel="dendrux_events",
+)
+state = PostgresStateStore(engine, live_updates=updates)
 ```
 
-`RunStore` owns this listener and closes it with the store. `listen_url=` uses the configured channel or defaults to `dendrux_events`; explicitly setting the channel to `None` with `listen_url` raises `ValueError`. To share a listener or change its limits, start a `PostgresEventNotifier` yourself and pass `notifier=` to `RunStore.from_engine` or `from_database_url`. That notifier is borrowed: the application starts and stops it on the same event loop. `listen_url=` and `notifier=` are mutually exclusive. Reader settings do not enable writer notifications.
+- **The URL.** SQLAlchemy's URL is converted to an asyncpg DSN with the same user, password, host, port and database, escaped. Only keys asyncpg itself reads are kept (`sslmode`, `sslrootcert`, `target_session_attrs`, `application_name`, `options` and the other connection keys). A SQLAlchemy-only key such as `?ssl=require` or `?prepared_statement_cache_size=0` is **refused** with a `ValueError` that names only the key: Dendrux never drops an option silently, because dropping `ssl` could change where and how it connects. This also applies to `live_updates=True` when the engine URL carries such a key, because the transport then uses the engine URL. The way out is to give the transport its own URL, `PostgresUpdates(url="postgresql+asyncpg://...?sslmode=require")`, or to keep the URL as it is and pass TLS settings in `connect_args={"ssl": ssl_context}`.
+- **Fixed options.** `statement_cache_size=0` and the connection timeout are set by Dendrux; `connect_args` may not set `statement_cache_size` or `timeout`. The connections are named `dendrux-live-updates` unless you set an application name.
+- **TLS.** The `connect_args` of your engine cannot be read back from SQLAlchemy. For a remote host with neither `sslmode` in the URL nor `ssl` in `connect_args`, Dendrux logs `live_updates_tls_unknown` once. Set one of them explicitly.
+- **Payload.** Postgres rejects a notification of 8,000 bytes or more, so `max_message_bytes` must be at most 7,999 (the default is 7,900).
+- **Primary only.** NOTIFY reaches listeners on the same server. A read replica never receives the notifications of its primary; point the sender and the listener at the primary.
 
-Healthy `follow` feeds reconcile every `poll_healthy_s` (default 30 seconds) and wake sooner on hints. On listener loss, they start at `poll_interval_s` (default 0.5 seconds) and back off while idle up to `poll_max_s`. Health-generation changes jitter the first fetch by up to `poll_interval_s`. An empty wake gets one retry at `poll_interval_s`, which helps when event reads use a replica. `stream_events` also uses hints, but keeps its own `poll_interval_s` rather than stretching to the healthy interval.
+### Behind PgBouncer
 
-The built-in listener defaults to 10,000 subscriptions. It checks connection health every 15 seconds with a 5-second deadline, reconnects with bounded backoff and wakes feeds on health changes. If an owned listener cannot start, reads fall back to polling. See [alert codes](/docs/recipes/observability#what-to-alert-on).
+NOTIFY is transactional and works through a transaction-mode pooler. LISTEN needs a session and does not. Keep `url` (or the engine URL) on the pooler and give the listener a direct or session-pooled endpoint of the primary:
 
-### Cost of NOTIFY
+[//]: # "docs-test: skip - requires a configured external PgBouncer endpoint and a direct primary endpoint"
 
-Each transaction that sends a NOTIFY takes one database-wide lock at commit. A local 50-writer probe measured about 45% lower write throughput with notifications enabled. Measure your own event rate and write workload before enabling them; this probe is not a capacity guarantee.
+```python
+from dendrux.store import PostgresStateStore, PostgresUpdates
 
-A stuck listener can fill Postgres's notification queue, after which notifying writes fail at commit. Monitor `pg_notification_queue_usage()` and investigate sustained growth before the queue fills. Every listener process receives **every notification on its channel**, including run ids it does not watch. Its callback work therefore follows the database's channel event rate, not just its local subscriptions. Payloads contain run ids only.
+updates = PostgresUpdates(listen_url=direct_primary_url)
+state = PostgresStateStore(engine, live_updates=updates)
+```
+
+Never point `listen_url` at a transaction pool.
+
+### Redis
+
+Any store can announce over Redis Pub/Sub. This moves the hints off the database server; it does not remove the fan-out, because Redis also delivers every message to every subscriber. Install the optional extra (it is not part of `dendrux[all]`):
+
+```bash
+pip install "dendrux[redis]"
+```
+
+[//]: # "docs-test: skip - needs a running Redis server"
+
+```python
+from dendrux.store import MySQLStateStore, RedisUpdates, RunStore
+
+updates = RedisUpdates(
+    "rediss://redis.internal:6379/0",
+    channel="myapp:prod:dendrux",      # unique per application and environment
+    client_options=None,               # for example {"password": ...}
+)
+state = MySQLStateStore(engine, live_updates=updates)
+reads = RunStore(state)
+```
+
+- **Importing needs nothing; constructing needs the extra.** `from dendrux.store import RedisUpdates` works without the Redis client. Calling `RedisUpdates(...)` without it raises `ImportError` that names `pip install dendrux[redis]`. The client is `redis>=5.0.1,<9`. Releases 5.0.1, 5.3.1, 6.4.0, 7.4.0 and 8.1.0 are tested; another release in the range is checked when you construct the transport and refused with `ImportError` if its parser cannot bound a message.
+- **Name the channel.** Pub/Sub ignores the Redis database number, so the default `dendrux:events` is a starting point, not a namespace. Use one channel per application and environment, and the same one on every writer and reader.
+- **URLs.** `redis://`, `rediss://` (TLS) and `unix://`. A URL or `client_options` that sets the timeouts, retries, connection pool, `protocol`, `parser_class`, `host`, `port` or a second connection is refused with a `ValueError`, because Dendrux fixes those. A text `encoding` other than UTF-8 is refused too.
+- **Connections.** The sender is one connection used for one pipelined round trip per send. The listener is one Pub/Sub connection on the pure-Python RESP2 parser (hiredis is not used for it), so an oversized message is refused before it is read. It never reconnects silently: a lost connection is reported as a gap and the transport reconnects with backoff.
+- **Liveness.** The listener sends a token-matched `PING` on its own connection after `health_check_s` (15 s) of silence and finds a dead connection within twice that time.
+- **Secrets.** The URL, host and password never appear in logs, errors or `repr`. Hints carry run ids only, but the channel is as trusted as the Redis server: use ACLs and `rediss://`.
+
+### Write your own bus
+
+A `LiveUpdates` subclass needs two methods; the base class owns batching, de-duplication, deadlines, backoff, the wire format, health, reconnects and shutdown.
+
+| Method | Contract |
+| --- | --- |
+| `async send(self, messages)` | Deliver the encoded messages in **one** transport round trip, including any connection setup (that counts against the flush deadline). Raise on failure. Cooperate with cancellation. |
+| `receive(self)` | An async iterator. Connect and subscribe, yield `None` **once, after the server confirmed the subscription** (within `4 * send_timeout_s`), then yield each raw message string. End or raise when the connection is lost, and detect a dead connection yourself, on the same connection you listen on, within `2 * health_check_s`. Hold at most `max_inbound` undelivered messages; when you drop the oldest, yield `LiveUpdates.GAP` (the exact object) so readers re-read. Close your listen connection in a `finally`. |
+| `bind(self, store)` (optional) | Learn what you need from the store, for example its engine URL. Called once, when the store takes the instance. |
+| `abort_sender(self)` (optional) | Synchronously drop the send connection now. Called after a failed or cancelled send; must be quick and safe to call twice. |
+| `abort_listener(self)` (optional) | Synchronously drop the listen connection when a forced shutdown gives up waiting. |
+| `async aclose_sender(self)` (optional) | Close the send connection at `close()`. |
+
+You never parse messages. On the wire a message is a compact JSON array of run-id strings of at most `max_message_bytes` UTF-8 bytes, built and read by the base class; a message that does not decode to a list of non-empty strings within the limits is dropped whole and counted. A batch of ids is split into as many messages as it needs and handed to one `send` call.
+
+This runnable example is a loopback bus that delivers hints inside one process. Replace the queue with NATS, Kafka, a socket or whatever your platform provides:
+
+```python
+import asyncio
+from collections.abc import AsyncIterator, Sequence
+
+from dendrux import Agent
+from dendrux.db.session import get_engine
+from dendrux.store import LiveUpdates, RunStore, SQLiteStateStore
+
+
+class LoopbackUpdates(LiveUpdates):
+    """Delivers hints inside one process. A real bus does the same over a network."""
+
+    def __init__(self, **limits) -> None:
+        super().__init__(**limits)
+        self._queue: asyncio.Queue[str] = asyncio.Queue()
+
+    async def send(self, messages: Sequence[str]) -> None:
+        for message in messages:
+            self._queue.put_nowait(message)
+
+    async def receive(self) -> AsyncIterator[str | None]:
+        yield None  # the subscription is live
+        while True:
+            yield await self._queue.get()
+
+
+engine = await get_engine("sqlite+aiosqlite:///live-updates.db")
+bus = LoopbackUpdates()
+state = SQLiteStateStore(engine, live_updates=bus)
+reads = RunStore(state)
+agent = Agent(
+    provider="anthropic:claude-haiku-4-5",
+    prompt="Reply briefly.",
+    state_store=state,
+    strict_tenancy=False,  # single-tenant example
+)
+result = await agent.run("Hello")
+assert bus.stats().sent > 0  # the run announced itself
+await agent.close()
+await reads.close()
+await state.close()
+```
+
+Limits are keyword arguments of the base constructor, shared by every transport:
+
+| Limit | Default | What it bounds |
+| --- | --- | --- |
+| `max_pending` | 10,000 | Ids waiting to be sent. Over the bound the oldest are dropped (counted, logged once as `live_updates_overflow`) |
+| `max_batch` | 500 | Ids per `send` call |
+| `max_message_bytes` | 7,900 | UTF-8 bytes per message |
+| `max_run_id_len` | 255 | Longer ids are dropped when enqueued |
+| `send_timeout_s` | 0.5 | One `send` call |
+| `flush_deadline_s` | 1.0 | One whole flush, connection setup included |
+| `close_timeout_s` | 3.0 | Everything `close()` does |
+| `max_inbound` | 1,000 | Received messages not yet handled; overflow is a gap |
+| `backoff_initial_s`, `backoff_max_s` | 0.5, 30.0 | Pause after a failed send, doubling; also the listener's reconnect delay, with full jitter |
+| `health_check_s` | 15.0 | Silence before a transport probes its listen connection |
+
+A custom store that is not built on `SQLStateStore` can use the same instance; see [Build your own store](/docs/guides/build-your-own-store#live-updates-in-a-custom-store).
+
+### Costs, bounds and failure behaviour
+
+- **A save pays for one announcement round trip**, on the separate sender connection, after its transaction. If the bus stalls, a save waits at most `flush_deadline_s` (1 second), the failed batch is dropped, sending pauses (0.5 seconds, doubling to 30) and further saves pay nothing until it resumes. A store call that fails never waits for an announcement.
+- **At close**, the store sends one last flush, within `flush_deadline_s` and inside the `close_timeout_s` budget for everything `close()` does. If the sender is in backoff, that final flush is skipped and the pending ids are dropped and counted; readers recover them by polling. `close()` is idempotent and safe to call from several tasks.
+- **One event loop per instance.** An instance belongs to the first event loop that uses it. Enqueueing from another loop is dropped and counted (logged once as `live_updates_wrong_loop`), so a save never fails because of it, and `close()` or a listener lease from another loop is refused with `RuntimeError`. Build one store per worker loop.
+- **Many open stores.** Each store with live updates holds its own sender connection. When more than 16 stores announce to one database in a process, Dendrux warns once (`RuntimeWarning` and `live_updates_many_stores`). Share one store per database and close the ones you no longer use.
+- **Counters.** `store.live_updates.stats()` returns a `LiveUpdatesStats` (pending count, `oldest_pending_age_s`, ids sent, drops by cause, gaps), and `.healthy` says whether the listener holds a live subscription. `oldest_pending_age_s` is how long a stranded hint has waited.
+- **Stranded hints.** There is no sender task. Ids enqueued while another flush runs, after a flush hit its deadline, or during backoff wait for the next flush or for `close()`, and may be lost. That is by design: followers find them by polling.
+- **Cost of NOTIFY on Postgres.** Postgres takes a database-wide lock at the commit of every transaction that sent a NOTIFY. In 0.6 that transaction is the sender's own short statement, not your save, and one statement carries a whole batch of ids, so a busy writer pays the lock once per batch of up to 500 ids rather than once per saved event. Measure your own event rate and write workload before relying on a capacity figure.
+- **A stuck Postgres listener can fill the notification queue.** Monitor `pg_notification_queue_usage()` and investigate sustained growth. A full queue now fails the announcement, which the store absorbs, instead of failing the save. Every listener process receives **every notification on its channel**, including run ids it does not watch, so bus load is readers times notifications on Postgres and Redis alike. Payloads contain run ids only.
 
 ## Live readers and bounded work
 
@@ -188,7 +371,7 @@ Every queue Dendrux keeps has a default and an override. Size these with your wo
 
 The follower cap is per **scope**, not per user. A string `tenant_id` is one scope, all untenanted (`None`) followers are one scope, and all `UNSCOPED` followers are one scope. A single-tenant app with more than 100 live readers per process builds its own feed with `max_followers_per_tenant=None`; see [Build your own read routes](/docs/recipes/build-your-own-read-routes).
 
-Followers of one run share one poller, so database load grows with watched runs, not with open connections. A follower costs a small constant number of statements however many pauses the run has, and `get_pending` is bounded whatever the size of the stored pause: one projected read for a client-tool or requested pause, three bounded reads (summary, active-pause sequence, recorded model arguments) for an approval or input pause. Attaching the pending pause to a result adds one projected read for a client-tool or requested pause and three for an approval or input pause, once per pause; `Agent.get_result` adds three reads, or five for an approval or input pause.
+The coordinator described under [What a reader does](#what-a-reader-does) serves every follower of a `RunStore`, so database load grows with watched runs, not with open connections. A follower costs a small constant number of statements however many pauses the run has, and `get_pending` is bounded whatever the size of the stored pause: one projected read for a client-tool or requested pause, three bounded reads (summary, active-pause sequence, recorded model arguments) for an approval or input pause. Attaching the pending pause to a result adds one projected read for a client-tool or requested pause and three for an approval or input pause, once per pause; `Agent.get_result` adds three reads, or five for an approval or input pause.
 
 Event numbering is allocated inside the insert statement, so a writer never reads the event log first. Notes are capped by one conditional insert, so concurrent `submit_note` calls cannot exceed `max_notes_per_run`.
 
@@ -199,6 +382,25 @@ Read replicas are your deployment choice. Keep claims, tool submissions, cancell
 ## Browser results
 
 `RunResult.to_dict()`, `Agent.get_result()` and `ToolResult.from_dict()` are the allowlisted shapes that cross to a browser. They are described on the [Agent reference](/docs/reference/agent#runresult), and the redaction rules for readers are on the [RunStore reference](/docs/reference/run-store#redacted-views).
+
+## History storage grows with replay
+
+Every run is stored in full, and a run that replays earlier runs stores what it replayed again. With `runs=` on a format-2 store, the replayed messages are written as seed rows (`react_traces`) of the new run, so the rows each new run writes grow with the number of runs you replay, and each model call stores its full request in `llm_interactions`. Nothing is deduplicated in 0.6, so a long replayed conversation costs storage in proportion to how much it replays, even when each turn's own tool result is small.
+
+`replay_last` limits how many of the most recent runs replay in full (text, tool calls and results); older runs replay as question and answer only. A window lowers the growth a lot, but it does not stop it: older question-and-answer pairs still replay and are stored again.
+
+One synthetic probe shows the shape. It ran 50 turns on SQLite with a fake model, one tool call and one 4,400-character result per turn, passing every earlier run in `runs=`. The figure is the sum of the stored column values, not the database file: it leaves out indexes, page overhead and the WAL.
+
+| Replay setting | After turn 1 | After turn 10 | After turn 50 |
+| --- | --- | --- | --- |
+| `replay_last="all"` | 22,894 bytes | 996,794 bytes | 22,005,246 bytes |
+| `replay_last=1` | 22,894 bytes | 419,949 bytes | 3,162,681 bytes |
+
+This is one workload with a fake model, not a capacity guarantee; real conversations differ in length, tool results and history. What to do about it:
+
+- Pass `runs=` only for the runs a turn needs, and choose a window (`replay_last=N`) for long threads. See [Memory across runs](/docs/recipes/run-replay).
+- Size the database for the replay setting you use, and measure with your own conversations.
+- Keep large tool results out of the model's context where you can; every result replayed in full is stored again.
 
 ## Load testing your deployment
 
@@ -218,7 +420,7 @@ make load-mysql
 make load-mariadb
 ```
 
-`make load-quick` runs every scenario at small scale and fails on a statement-count regression against `tools/load_baseline.json` (Postgres only); `make load` is the full run. MySQL and MariaDB have no stored baseline, so the ceilings are declared before measuring: `tools/load_budgets_mysql.json` maps each gate to a number (`runs.statements_per_run` is 50; the 0.6 runs measured about 47). The targets use it by default; pass `LOAD_STATEMENT_BUDGETS=path` to use your own file. Results are written as JSON to `LOAD_JSON` (default: `dendrux-load-results.json` in your temporary directory) with a compact Markdown table. Workloads that need Postgres NOTIFY are skipped on MySQL and MariaDB, with a note.
+`make load-quick` runs every scenario at small scale and fails on a statement-count regression against `tools/load_baseline.json` (Postgres only); `make load` is the full run. MySQL and MariaDB have no stored baseline, so the ceilings are declared before measuring: `tools/load_budgets_mysql.json` maps each gate to a number (`runs.statements_per_run` is 50; the 0.6 runs measured about 47). The targets use it by default; pass `LOAD_STATEMENT_BUDGETS=path` to use your own file. Results are written as JSON to `LOAD_JSON` (default: `dendrux-load-results.json` in your temporary directory) with a compact Markdown table. Workloads that need the Postgres live-update transport (the `notify` scenarios) are skipped on MySQL and MariaDB, with a note.
 
 ## What we measured
 
