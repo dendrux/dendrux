@@ -121,10 +121,11 @@ async def test_live_a_commit_that_was_issued_is_announced_even_when_the_call_fai
             store=stored.store,
         )
         outcome.expect_fired("after_commit")
-        assert await stored.events(run_id) == 1, "the commit happened: the write must persist"
         if outcome.raised is not None:
             # a failing call never waits for an announcement; its ids go out with the next flush
             assert run_id not in stored.updates.ids, "a call that raised flushed on its way out"
+        # With no independent reader, this successful read may flush the writer's pending ids.
+        assert await stored.events(run_id) == 1, "the commit happened: the write must persist"
         await stored.updates.flush()
         assert run_id in stored.updates.ids, "a write whose COMMIT was issued was never announced"
         seen = stored.seen_when_announced(run_id)

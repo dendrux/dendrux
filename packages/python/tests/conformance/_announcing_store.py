@@ -41,23 +41,24 @@ class AnnouncingSqliteStore(SQLiteStateStore):
         super().__init__(engine)
         assert mode in MODES
         self._mode = mode
-        self.live_updates = live_updates
+        # Keep inherited production announcements disabled so they cannot repair broken modes.
+        self._test_updates = live_updates
         if live_updates is not None:
             live_updates.bind(self)
 
     async def close(self) -> None:
-        if self.live_updates is not None:
-            await self.live_updates.close()
+        if self._test_updates is not None:
+            await self._test_updates.close()
 
     # -- send side: what track A2 adds to _write_tx and to the flush boundary ---------------
 
     def _announce(self, session: AsyncSession, run_ids: Sequence[str] = ()) -> None:
-        if self.live_updates is None or self._mode == "never":
+        if self._test_updates is None or self._mode == "never":
             return
         operation = _database_operation.get()
         named = operation[2].get("run_id") if operation is not None else None
         touched = {*session.info.get(TOUCHED_RUNS_SESSION_KEY, ()), *run_ids}
-        self.live_updates.enqueue(sorted({*touched, *([named] if named else [])}))
+        self._test_updates.enqueue(sorted({*touched, *([named] if named else [])}))
 
     async def _write_tx(self, session: AsyncSession, *, run_ids: Sequence[str] = ()) -> None:
         issued = {"commit": False}
@@ -71,8 +72,8 @@ class AnnouncingSqliteStore(SQLiteStateStore):
         try:
             if self._mode == "early":
                 self._announce(session, run_ids)
-                assert self.live_updates is not None
-                await self.live_updates.flush()
+                assert self._test_updates is not None
+                await self._test_updates.flush()
             await super()._write_tx(session, run_ids=run_ids)
             completed = True
         except _CommitNotAppliedError:
@@ -91,15 +92,15 @@ class AnnouncingSqliteStore(SQLiteStateStore):
         return issued and (completed or self._mode != "only_on_success")
 
     async def _flushed(self, call: Any) -> Any:
-        if self.live_updates is None or self._mode == "no_flush":
+        if self._test_updates is None or self._mode == "no_flush":
             return await call
         if self._mode == "flush_on_failure":
             try:
                 return await call
             finally:
-                await self.live_updates.flush()
+                await self._test_updates.flush()
         result = await call
-        await self.live_updates.flush()
+        await self._test_updates.flush()
         return result
 
     async def create_run(self, *args: Any, **kwargs: Any) -> Any:

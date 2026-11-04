@@ -92,6 +92,45 @@ async def test_the_recorder_listens_but_never_delivers() -> None:
     await updates.close()
 
 
+@pytest.mark.parametrize("backend_kind", ["sqlite-memory", "sqlite-format1"])
+@pytest.mark.parametrize("kind,identity", [("error", True), ("error", False), ("cancel", True)])
+async def test_failed_commit_is_checked_before_a_fallback_reader_can_flush(
+    tmp_path: Any, backend_kind: str, kind: str, identity: bool
+) -> None:
+    from dendrux.testing.store_kit._declaration import (
+        FAULT_INJECTOR,
+        LIVE_FACTORY,
+        SECOND_INSTANCE,
+    )
+    from dendrux.testing.store_kit._kit import Kit
+    from dendrux.testing.store_kit.contracts.test_live_updates import (
+        test_live_a_commit_that_was_issued_is_announced_even_when_the_call_failed as contract,
+    )
+    from dendrux.testing.store_kit.sql import SqlFaultInjector
+    from tests.conformance._kit_backends import KitBackend
+
+    backend = KitBackend(backend_kind, tmp_path)
+    injector = SqlFaultInjector()
+    kit = Kit(
+        {
+            LIVE_FACTORY: backend.fresh_live_store,
+            SECOND_INSTANCE: backend.second,
+            FAULT_INJECTOR: injector,
+        },
+        None,
+        SimpleNamespace(needs_second_instance=False, has=lambda name: name == "retry_ids"),
+        needs_format_2=False,
+    )
+    try:
+        # The writer doubles as reader: a successful read is allowed to flush pending ids.
+        # All assertions must pass before the kit reports independent visibility unverified.
+        with pytest.raises(pytest.skip.Exception, match="unverified: live-update visibility"):
+            await contract(kit, kind, identity)
+    finally:
+        injector.close()
+        await backend.close()
+
+
 def test_a_batch_is_plain_data() -> None:
     batch = RecordedBatch(("a",), {"a": RunView(True, "x", 0)})
     assert json.dumps(batch.ids) == '["a"]'
