@@ -57,6 +57,7 @@ from dendrux.runtime._bounds import (
 from dendrux.runtime._bounds import IN_CHUNK as _IN_CHUNK
 from dendrux.runtime.durability import (
     _CommitNotAppliedError,
+    _flush_live_updates,
     _safe_database_call,
     retry_transient_db,
     safe_database_operations,
@@ -4198,6 +4199,7 @@ class SQLStateStore(SQLBlobCatalog):
                     run_id=run_id,
                     classify=self.classify_db_error,
                 )
+                await _flush_live_updates(self)
                 inspected += 1
                 after = run_id
                 if isinstance(item, ReclaimableRun):
@@ -4496,6 +4498,7 @@ class SQLStateStore(SQLBlobCatalog):
             ),
         )
 
+    @_safe_database_call
     async def _sweep_runs(
         self,
         older_than: timedelta,
@@ -4636,6 +4639,7 @@ class SQLStateStore(SQLBlobCatalog):
                         )
                         self._mark_announce(session, (row.id,))
                         await self._write_tx(session)
+                    await _flush_live_updates(self)
                     swept.append(
                         SweptRun(
                             run_id=row.id,
