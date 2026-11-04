@@ -59,18 +59,6 @@ async def test_non_native_rejects_invalid_configuration(value):
         await engine.dispose()
 
 
-async def test_postgres_native_hook_is_lazy_and_typed_until_b():
-    from dendrux.errors import LiveUpdatesUnavailableError
-
-    engine = create_async_engine("postgresql+asyncpg://")
-    try:
-        assert store_for_engine(engine).live_updates is None
-        with pytest.raises(LiveUpdatesUnavailableError):
-            store_for_engine(engine, live_updates=True)
-    finally:
-        await engine.dispose()
-
-
 async def test_mysql_from_url_names_bus_without_forwarding_to_engine():
     pytest.importorskip("asyncmy")
     from dendrux.runtime.stores.sql.mysql import MySQLStateStore
