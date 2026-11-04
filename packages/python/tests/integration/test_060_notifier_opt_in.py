@@ -11,18 +11,19 @@ from dendrux.types import generate_ulid
 async def test_agent_forwards_writer_opt_in(engine, options):
     from dendrux import Agent
 
-    agent = Agent(
-        prompt="p",
-        database_url=engine.url.render_as_string(hide_password=False),
-        database_options=options,
-    )
-    try:
-        if engine.dialect.name == "sqlite" and "notify_channel" in options:
-            with pytest.raises(TypeError, match="notify_channel"):
+    url = engine.url.render_as_string(hide_password=False)
+    if "notify_channel" in options:  # owner decision O2: refused on every options path
+        with pytest.raises(ValueError, match="state_store"):
+            agent = Agent(prompt="p", database_url=url, database_options=options)
+            try:
                 await agent._resolve_state_store()
-        else:
-            writer = await agent._resolve_state_store()
-            assert getattr(writer, "notify_channel", None) == options.get("notify_channel")
+            finally:
+                await agent.close()
+        return
+    agent = Agent(prompt="p", database_url=url, database_options=options)
+    try:
+        writer = await agent._resolve_state_store()
+        assert getattr(writer, "notify_channel", None) is None
     finally:
         await agent.close()
 
