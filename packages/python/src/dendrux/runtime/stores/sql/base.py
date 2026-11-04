@@ -1,4 +1,9 @@
-"""Shared SQL persistence. Lock order: run, ordered children, ordered blobs, settings."""
+"""Shared SQL persistence. Lock order: run, ordered children, ordered blobs, settings.
+
+Live updates are lossy hints. If create_run commits but loses its acknowledgement
+and readback wrongly proves it absent, the retry may recover the created run from
+the unique conflict without sending a hint. Polling still observes that run.
+"""
 
 from __future__ import annotations
 

@@ -152,3 +152,27 @@ async def test_readback_compares_database_normalized_values(actual, expected, ma
         with pytest.raises(StoreOutcomeUnknown) as raised:
             await proof._check_proof(table, table.c.value == 1, {"value": expected})
         assert raised.value is failure
+
+
+async def test_created_run_with_false_absent_readback_relies_on_polling(live_store, monkeypatch):
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    store, bus = live_store
+    run_id = generate_ulid()
+    commit = AsyncSession.commit
+
+    async def committed_without_ack(session):
+        await commit(session)
+        raise OperationalError("commit-fault", {}, LostConnectionError())
+
+    with monkeypatch.context() as patch:
+        patch.setattr(AsyncSession, "commit", committed_without_ack)
+        absent = AsyncMock(side_effect=_CommitNotAppliedError())
+        patch.setattr(_CommitReadback, "_prove", absent)
+        result = await store.create_run(run_id, "false-absent")
+    absent.assert_awaited_once()
+    assert result.outcome == "created"
+    assert sent(bus) == []
+    assert bus.stats().pending == 0
+    assert await store.get_run_status(run_id) == "running"
+    assert sent(bus) == []
