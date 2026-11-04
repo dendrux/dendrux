@@ -1,4 +1,9 @@
-"""Bounded, best-effort live-update hints; durable reads remain the source of truth."""
+"""Bounded, best-effort live-update hints; durable reads remain the source of truth.
+
+Close must run on the bound event loop. Its final flush respects sender backoff:
+when sending is paused, the final flush is skipped and remaining hints are counted
+as closed drops. Readers recover those changes through polling.
+"""
 
 from __future__ import annotations
 

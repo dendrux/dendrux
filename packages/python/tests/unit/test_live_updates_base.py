@@ -1110,3 +1110,42 @@ async def test_flapping_subscriptions_grow_backoff_until_stable(monkeypatch):
     finally:
         await bus.release_listener(lease)
         await bus.close()
+
+
+@pytest.mark.asyncio
+async def test_foreign_loop_close_refuses_without_mutation_and_logs_safely(caplog):
+    bus = ListeningBus()
+    lease = await bus.acquire_listener()
+    await until(lambda: bus.healthy)
+    bus.enqueue(["PRIVATE_RUN_SENTINEL"])
+    snapshot = (
+        bus._state,
+        tuple(bus._pending.items()),
+        set(bus._leases),
+        bus._listener_task,
+        bus._loop,
+        bus.stats(),
+    )
+
+    async def foreign():
+        with pytest.raises(RuntimeError, match="event loop"):
+            await bus.close()
+
+    try:
+        await asyncio.to_thread(asyncio.run, foreign())
+        await asyncio.to_thread(asyncio.run, foreign())
+        assert (
+            bus._state,
+            tuple(bus._pending.items()),
+            set(bus._leases),
+            bus._listener_task,
+            bus._loop,
+        ) == snapshot[:5]
+        assert bus.healthy
+        assert bus.aborts == bus.listen_aborts == bus.sender_closes == bus.stops == 0
+        assert bus.stats().pending == snapshot[5].pending
+        assert [r.code for r in caplog.records] == ["live_updates_wrong_loop"]
+        assert "PRIVATE_RUN_SENTINEL" not in caplog.text
+    finally:
+        await bus.release_listener(lease)
+        await bus.close()
