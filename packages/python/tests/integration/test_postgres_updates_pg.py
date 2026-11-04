@@ -157,8 +157,11 @@ async def test_killed_sender_backend_costs_at_most_one_batch_then_recovers(
             writer.enqueue([run])
             await writer.flush()
             await asyncio.sleep(0.03)  # past any backoff
-        stats = writer.stats()
-        assert stats.dropped_failed <= 1 and stats.pending == 0
+        async with asyncio.timeout(10):  # stranded ids go out with a later flush
+            while writer.stats().pending:
+                await asyncio.sleep(0.03)
+                await writer.flush()
+        assert writer.stats().dropped_failed <= 1
         await _until(lambda: sent[-1] in consumer.hints)
         assert await _backends(pg_test_url, name + "w") == 1  # one fresh sender connection
     finally:
