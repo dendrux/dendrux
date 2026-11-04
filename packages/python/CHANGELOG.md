@@ -200,6 +200,8 @@
 
 ### Fixed
 
+- Rejected tool calls no longer use up a tool's per-run call limit after a resume.
+
 - Denied tool calls no longer use up a tool's per-run call limit after a resume.
 - Resumed loops start their tool call counts from the saved execution counts when available, falling back to history.
 - Approved tools use the resumed run's tool-calling strategy and keep notifier warnings in the run result.
