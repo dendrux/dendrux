@@ -614,6 +614,28 @@ async def test_repeated_crashes_end_every_follower_with_error() -> None:
     assert state.crash == 100 - 4  # the first run and three restarts
 
 
+async def test_revive_accounts_for_crash_before_its_done_callback() -> None:
+    state = BatchedState()
+    state.create("r1")
+    async with _store(state) as store:
+        follow = await attach(_feed(store), "r1")
+        coordinator = store._follow_coordinator()
+        task = coordinator._task
+        assert task is not None
+        task.remove_done_callback(coordinator._on_exit)
+        state.crash = 1
+        await asyncio.gather(task, return_exceptions=True)
+        assert not coordinator._crashed
+
+        coordinator.revive()
+        assert len(coordinator._restarts) == 1
+        replacement = coordinator._task
+        assert replacement is not task
+        coordinator._on_exit(task)  # the queued callback arrives after replacement
+        assert coordinator._task is replacement and not coordinator._crashed
+        await follow.aclose()
+
+
 async def _until_end(follow: Any) -> list[Any]:
     items = []
     async for item in follow:

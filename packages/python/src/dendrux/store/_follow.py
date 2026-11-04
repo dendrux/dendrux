@@ -473,8 +473,7 @@ class _Coordinator:
         Called by joins, hints and every follower before it waits, so an
         existing follower notices a dead coordinator at its next wait.
         """
-        task = self._task
-        if self._closed or (task is not None and not task.done()):
+        if self._closed or not self._task_exited():
             return
         if self._crashed:
             if not self._restart_allowed():
@@ -489,6 +488,16 @@ class _Coordinator:
         self._crashed = False
         self._task = self._loop.create_task(self._main(), name="dendrux-follow-coordinator")
         self._task.add_done_callback(self._on_exit)
+
+    def _task_exited(self) -> bool:
+        task = self._task
+        if task is None:
+            return True
+        if not task.done():
+            return False
+        # A waiter can resume before the task's queued done callback runs.
+        self._on_exit(task)
+        return True
 
     @staticmethod
     def request_due(run: _WatchedRun, now: float) -> None:
@@ -517,6 +526,12 @@ class _Coordinator:
         self._candidates.clear()
 
     def _on_exit(self, task: asyncio.Task[None]) -> None:
+        if task is not self._task:
+            return
+        self._task = None
+        self._record_crash(task)
+
+    def _record_crash(self, task: asyncio.Task[None]) -> None:
         if task.cancelled() or task.exception() is None:
             return
         self._crashed = True
