@@ -677,13 +677,42 @@ class _Coordinator:
         batched = self.store._batched_events()
         if batched is None:
             return await self._per_run(runs, lambda run: self._run_events(run, limit))
+        return await self._isolated_batch(
+            runs, lambda group: self._event_batch(group, limit, batched)
+        )
+
+    async def _event_batch(
+        self, runs: list[_WatchedRun], limit: int, read: Any
+    ) -> dict[str, list[StoredEvent]]:
         heads = {run.run_id: run.head if run.head is not None else -1 for run in runs}
+        found = await read(heads, limit)
+        return {run.run_id: found.get(run.run_id, []) for run in runs}
+
+    async def _isolated_batch(
+        self, runs: list[_WatchedRun], read: Any
+    ) -> tuple[dict[str, Any], tuple[list[_WatchedRun], BaseException] | None]:
         await self._token()
         try:
-            found = await batched(heads, limit)
+            return dict(await read(runs)), None
         except Exception as error:
-            return {}, (runs, error)
-        return {run.run_id: found.get(run.run_id, []) for run in runs}, None
+            if len(runs) == 1:
+                return {}, (runs, error)
+        return await self._split_batch(runs, read)
+
+    async def _split_batch(
+        self, runs: list[_WatchedRun], read: Any
+    ) -> tuple[dict[str, Any], tuple[list[_WatchedRun], BaseException] | None]:
+        found: dict[str, Any] = {}
+        failed: list[_WatchedRun] = []
+        error: BaseException | None = None
+        middle = len(runs) // 2
+        for group in (runs[:middle], runs[middle:]):
+            rows, failure = await self._isolated_batch(group, read)
+            found.update(rows)
+            if failure is not None:
+                failed.extend(failure[0])
+                error = failure[1]
+        return found, ((failed, error) if error is not None else None)
 
     async def _run_events(self, run: _WatchedRun, limit: int) -> list[StoredEvent]:
         return await self.store.get_events(run.run_id, after_sequence_index=run.head, limit=limit)
@@ -795,11 +824,7 @@ class _Coordinator:
         batched = self.store._batched_statuses()
         if batched is None:
             return await self._per_run(runs, lambda run: self.store._status(run.run_id))
-        await self._token()
-        try:
-            return dict(await batched([run.run_id for run in runs])), None
-        except Exception as error:
-            return {}, (runs, error)
+        return await self._isolated_batch(runs, lambda group: batched([r.run_id for r in group]))
 
     def _after_status(self, run: _WatchedRun, status: str | None, now: float) -> None:
         """A missing run (deleted) counts as terminal; a failed read never does."""
