@@ -14,6 +14,7 @@ import pytest
 from asyncpg import connect_utils
 from sqlalchemy.dialects.postgresql.asyncpg import PGDialect_asyncpg
 from sqlalchemy.engine import make_url
+from sqlalchemy.ext.asyncio import create_async_engine
 
 from dendrux.db._postgres_updates import PostgresUpdates, asyncpg_dsn, connect_options
 
@@ -294,24 +295,23 @@ def test_ten_times_realistic_message_budget_still_encodes_under_the_postgres_lim
 
 
 def test_url_defaults_to_the_bound_store_engine() -> None:
-    class Engine:
-        url = make_url(f"postgresql+asyncpg://app:{SECRET}@127.0.0.1/orbit")
+    engine = create_async_engine(f"postgresql+asyncpg://app:{SECRET}@127.0.0.1/orbit")
 
     class Store:
-        _engine = Engine()
+        _engine = engine
 
     updates = PostgresUpdates()
     updates.bind(Store())
-    assert _target(dsn=updates._send_dsn) == _target(dsn=asyncpg_dsn(Engine.url))
-    assert updates._listen_dsn == updates._send_dsn
+    assert _target(dsn=updates._settings.send_dsn) == _target(dsn=asyncpg_dsn(engine.url))
+    assert updates._settings.listen_dsn == updates._settings.send_dsn
 
 
 def test_listen_url_is_used_only_for_listening() -> None:
     updates = PostgresUpdates(
         url="postgresql://a@pooler:6432/d", listen_url="postgresql://a@direct:5432/d"
     )
-    assert _target(dsn=updates._send_dsn)[0] == (("pooler", 6432),)
-    assert _target(dsn=updates._listen_dsn)[0] == (("direct", 5432),)
+    assert _target(dsn=updates._settings.send_dsn)[0] == (("pooler", 6432),)
+    assert _target(dsn=updates._settings.listen_dsn)[0] == (("direct", 5432),)
 
 
 def test_store_without_engine_needs_an_explicit_url() -> None:

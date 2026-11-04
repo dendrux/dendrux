@@ -43,11 +43,14 @@ def test_engine_connect_settings_need_explicit_transport(options):
     with pytest.raises(ValueError, match=r"PostgresUpdates\(url="):
         PostgresStateStore(engine, live_updates=True)
     assert PostgresStateStore(engine, live_updates=None).live_updates is None
-    for bus in (
-        PostgresUpdates(url="postgresql://u@localhost/db"),
-        PostgresUpdates(connect_args=options),
-    ):
+    bus = PostgresUpdates(url="postgresql://u@localhost/db")
+    assert PostgresStateStore(engine, live_updates=bus).live_updates is bus
+    bus = PostgresUpdates(connect_args=options)
+    if "ssl" in options:
         assert PostgresStateStore(engine, live_updates=bus).live_updates is bus
+    else:
+        with pytest.raises(ValueError, match=r"PostgresUpdates\(url="):
+            PostgresStateStore(engine, live_updates=bus)
 
 
 def test_async_creator_requires_explicit_destination():
@@ -63,7 +66,8 @@ def test_socket_destination_and_database_query_are_explicit():
     engine = create_async_engine("postgresql+asyncpg://u@/db?host=/tmp")
     assert PostgresStateStore(engine, live_updates=True).live_updates is not None
     bus = PostgresUpdates()
-    bus.bind(SimpleNamespace(_engine=SimpleNamespace(url="postgresql://u@localhost?dbname=db")))
+    engine = create_async_engine("postgresql+asyncpg://u@localhost?dbname=db")
+    bus.bind(SimpleNamespace(_engine=engine))
 
 
 def test_empty_host_is_not_loopback():
