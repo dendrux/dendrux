@@ -210,7 +210,8 @@ def create_demo_app():
         if not user_input:
             return JSONResponse(status_code=400, content={"error": "input is required"})
 
-        stream = agent.stream(user_input)
+        # Single-tenant demo: runs are untenanted, which strict tenancy wants stated.
+        stream = agent.stream(user_input, tenant_id=None)
         return _ndjson_response(stream)
 
     @app.post("/resume/{run_id}")
@@ -246,7 +247,7 @@ def create_demo_app():
                 content={"error": "Invalid tool_results: each item needs call_id and result"},
             )
 
-        stream = agent.resume_stream(run_id, tool_results=tool_results)
+        stream = agent.resume_stream(run_id, tool_results=tool_results, tenant_id=None)
         return _ndjson_response(stream)
 
     return app

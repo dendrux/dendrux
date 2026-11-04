@@ -59,6 +59,7 @@ async def main() -> None:
         name="StockAnalyst",
         provider=AnthropicProvider(model="claude-sonnet-4-6"),
         database_url=f"sqlite+aiosqlite:///{db_path}",
+        strict_tenancy=False,  # single-tenant demo (see Multi-tenancy docs)
         prompt=(
             "You are a stock analyst assistant. Use the lookup_price tool to check "
             "stock prices and calculate_portfolio_value to compute portfolio totals. "

@@ -192,6 +192,7 @@ async def main() -> None:
             require_approval=["refund"],
             before_tool=policy,
             database_url=url,
+            strict_tenancy=False,  # single-tenant demo (see Multi-tenancy docs)
         ) as agent:
             store = RunStore.from_database_url(url)
             async with store:

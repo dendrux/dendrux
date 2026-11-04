@@ -122,6 +122,7 @@ async def main() -> None:
         name="ResearchOrchestrator",
         provider=AnthropicProvider(model="claude-sonnet-4-6", timeout=300),
         database_url=f"sqlite+aiosqlite:///{db_path}",
+        strict_tenancy=False,  # single-tenant demo (see Multi-tenancy docs)
         prompt=ORCHESTRATOR_PROMPT,
         tools=[research_topic, deep_read, save_report],
         max_iterations=25,

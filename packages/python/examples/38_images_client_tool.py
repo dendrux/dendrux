@@ -102,6 +102,7 @@ def build_agent(provider: LLMProvider, url: str) -> Agent:
         prompt="Use take_screenshot when you need to see the user's screen, then answer.",
         tools=[take_screenshot],
         database_url=url,
+        strict_tenancy=False,  # single-tenant demo (see Multi-tenancy docs)
     )
 
 

@@ -77,6 +77,7 @@ async def main() -> None:
         ],
         # Persistence + observability
         database_url=f"sqlite+aiosqlite:///{db_path}",
+        strict_tenancy=False,  # single-tenant demo (see Multi-tenancy docs)
         max_iterations=10,
     ) as agent:
         console.print()

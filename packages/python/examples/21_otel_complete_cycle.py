@@ -191,6 +191,7 @@ async def stage_1_streaming_server_tools(db_url, notifier) -> None:
         prompt="You look up customers and email them. Be concise.",
         tools=[lookup_customer, send_email],
         database_url=db_url,
+        strict_tenancy=False,  # single-tenant demo (see Multi-tenancy docs)
     ) as agent:
         await _drain_stream(
             agent.stream(
@@ -211,6 +212,7 @@ async def stage_2_streaming_deny(db_url, notifier) -> None:
         tools=[lookup_customer, delete_account],
         deny=["delete_account"],
         database_url=db_url,
+        strict_tenancy=False,  # single-tenant demo (see Multi-tenancy docs)
     ) as agent:
         await _drain_stream(
             agent.stream(
@@ -228,6 +230,7 @@ async def stage_3_streaming_approve(db_url, notifier) -> None:
         tools=[refund],
         require_approval=["refund"],
         database_url=db_url,
+        strict_tenancy=False,  # single-tenant demo (see Multi-tenancy docs)
     ) as agent:
         first = await _drain_stream(agent.stream("Refund order 7.", notifier=notifier))
         assert first.status == RunStatus.WAITING_APPROVAL, first.status
@@ -242,6 +245,7 @@ async def stage_4_sync_reject(db_url, notifier) -> None:
         tools=[refund],
         require_approval=["refund"],
         database_url=db_url,
+        strict_tenancy=False,  # single-tenant demo (see Multi-tenancy docs)
     ) as agent:
         first = await _drain_stream(agent.stream("Refund order 99.", notifier=notifier))
         assert first.status == RunStatus.WAITING_APPROVAL, first.status
@@ -263,6 +267,7 @@ async def stage_5_streaming_client_tool(db_url, notifier) -> None:
         ),
         tools=[read_browser_state],
         database_url=db_url,
+        strict_tenancy=False,  # single-tenant demo (see Multi-tenancy docs)
     ) as agent:
         first = await _drain_stream(
             agent.stream("What does the 'theme' field say?", notifier=notifier)
@@ -302,6 +307,7 @@ async def stage_6_streaming_budget(db_url, notifier) -> None:
         tools=[lookup_customer],
         budget=Budget(max_tokens=500),
         database_url=db_url,
+        strict_tenancy=False,  # single-tenant demo (see Multi-tenancy docs)
     ) as agent:
         await _drain_stream(
             agent.stream(
@@ -323,6 +329,7 @@ async def stage_7_sync_guardrails(db_url, notifier) -> None:
         tools=[lookup_customer, send_email],
         guardrails=[PII()],
         database_url=db_url,
+        strict_tenancy=False,  # single-tenant demo (see Multi-tenancy docs)
     ) as agent:
         await agent.run(
             "Look up customer C-4004 and email them a short hello.",

@@ -97,6 +97,7 @@ def build_agent(db_url: str) -> Agent:
         prompt=PROMPT,
         tools=[list_tables, describe_table, run_sql],
         database_url=db_url,
+        strict_tenancy=False,  # single-tenant demo (see Multi-tenancy docs)
     )
 
 

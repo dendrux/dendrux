@@ -20,6 +20,7 @@ async def main() -> None:
         name="ChatBot",
         provider=AnthropicProvider(model="claude-sonnet-4-6"),
         database_url=f"sqlite+aiosqlite:///{db_path}",
+        strict_tenancy=False,  # single-tenant demo (see Multi-tenancy docs)
         prompt="You are a friendly assistant. Reply briefly.",
         tools=[],
     ) as agent:

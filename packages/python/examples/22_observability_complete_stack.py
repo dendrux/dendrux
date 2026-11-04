@@ -306,6 +306,7 @@ async def main() -> None:
         ),
         tools=[lookup_weather, lookup_customer],
         database_url=db_url,
+        strict_tenancy=False,  # single-tenant demo (see Multi-tenancy docs)
         guardrails=[PII()],
         budget=Budget(max_tokens=20_000, warn_at=(0.5, 0.75, 0.9)),
     ) as agent:

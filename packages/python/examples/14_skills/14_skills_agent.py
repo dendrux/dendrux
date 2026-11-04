@@ -116,6 +116,7 @@ async def main() -> None:
             "filesystem__edit_file",
         ],
         database_url=f"sqlite+aiosqlite:///{db_path}",
+        strict_tenancy=False,  # single-tenant demo (see Multi-tenancy docs)
         max_iterations=10,
     ) as agent:
         # Task 1: the model activates the skill, reads its style guide, runs its script

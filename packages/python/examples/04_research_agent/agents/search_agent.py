@@ -36,6 +36,7 @@ async def run_search(query: str) -> str:
         name="SearchAgent",
         provider=AnthropicProvider(model="claude-sonnet-4-6"),
         database_url=DB_URL,
+        strict_tenancy=False,  # single-tenant demo (see Multi-tenancy docs)
         prompt=SEARCH_PROMPT,
         tools=[firecrawl_search],
     ) as agent:

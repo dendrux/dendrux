@@ -45,6 +45,7 @@ async def main() -> None:
         name="ChatBotPG",
         provider=AnthropicProvider(model="claude-sonnet-4-6"),
         database_url=DB_URL,
+        strict_tenancy=False,  # single-tenant demo (see Multi-tenancy docs)
         prompt="You are a friendly assistant. Reply briefly.",
         tools=[],
         guardrails=[

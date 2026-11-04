@@ -138,6 +138,7 @@ async def main() -> None:
             ),
             tools=[render_badge],
             database_url=url,
+            strict_tenancy=False,  # single-tenant demo (see Multi-tenancy docs)
         ) as agent:
             result = await agent.run(
                 [

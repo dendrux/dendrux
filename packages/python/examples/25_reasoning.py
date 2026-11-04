@@ -50,6 +50,7 @@ def _agent() -> Agent:
         tools=[get_population],
         budget=Budget(max_tokens=100_000),
         database_url=_DB_URL,
+        strict_tenancy=False,  # single-tenant demo (see Multi-tenancy docs)
     )
 
 

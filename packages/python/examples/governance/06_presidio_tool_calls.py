@@ -91,6 +91,7 @@ async def main() -> None:
         tools=[process_refund],
         guardrails=[PII(engine="presidio")],
         database_url=DB_URL,
+        strict_tenancy=False,  # single-tenant demo (see Multi-tenancy docs)
     ) as agent:
         notifier = ConsoleNotifier()
         result = await agent.run(user_input, notifier=notifier)

@@ -44,6 +44,7 @@ async def per_turn_model(db_url: str) -> None:
         provider="anthropic:claude-haiku-4-5",  # default model
         prompt="Reply in one short sentence.",
         database_url=db_url,
+        strict_tenancy=False,  # single-tenant demo (see Multi-tenancy docs)
         name="chat",
     ) as agent:
         default = await agent.run("Say hello.")

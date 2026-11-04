@@ -63,6 +63,7 @@ async def main() -> None:
         deny=["delete_account"],
         require_approval=["refund"],
         database_url=DB_URL,
+        strict_tenancy=False,  # single-tenant demo (see Multi-tenancy docs)
     ) as agent:
         notifier = ConsoleNotifier()
 

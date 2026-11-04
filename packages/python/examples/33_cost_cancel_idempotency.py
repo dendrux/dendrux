@@ -65,6 +65,7 @@ async def priced_run_and_final_answer(store: RunStore) -> None:
         prompt="Use lookup_city before answering. Keep the final answer to one sentence.",
         tools=[lookup_city],
         database_url=DB_URL,
+        strict_tenancy=False,  # single-tenant demo (see Multi-tenancy docs)
         pricing=PRICING,
     ) as agent:
         result = await agent.run(
@@ -88,7 +89,12 @@ async def priced_run_and_final_answer(store: RunStore) -> None:
         print(f"  turn {i}: {text[:70]!r}")
 
     section("1b. Same run without a table: cost is unknown, never 0")
-    async with Agent(provider=PROVIDER, prompt="One short sentence.", database_url=DB_URL) as plain:
+    async with Agent(
+        provider=PROVIDER,
+        prompt="One short sentence.",
+        database_url=DB_URL,
+        strict_tenancy=False,  # single-tenant demo (see Multi-tenancy docs)
+    ) as plain:
         r = await plain.run("What is 2 + 2?")
     print(f"cost_usd={r.usage.cost_usd!r}  cost_source={r.usage.cost_source!r}")
 
@@ -112,6 +118,7 @@ async def timeout_cancels_run(store: RunStore) -> None:
         provider=PROVIDER,
         prompt="Write a long essay, at least 800 words.",
         database_url=DB_URL,
+        strict_tenancy=False,  # single-tenant demo (see Multi-tenancy docs)
         pricing=PRICING,
     ) as agent:
         try:
@@ -137,6 +144,7 @@ async def stream_idempotency(store: RunStore) -> None:
         provider=PROVIDER,
         prompt="Answer in one short sentence.",
         database_url=DB_URL,
+        strict_tenancy=False,  # single-tenant demo (see Multi-tenancy docs)
         pricing=PRICING,
     ) as agent:
         key = f"demo-{uuid.uuid4().hex[:8]}"
