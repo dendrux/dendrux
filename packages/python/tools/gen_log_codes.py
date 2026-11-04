@@ -54,7 +54,7 @@ def render() -> str:
         "or raise its bound.",
         "- `reclaim_limit` at any rate: inspect the run and worker crashes.",
         "- `run_fenced` above a small sustained rate: inspect worker turnover and lease sizing.",
-        "- `notifier_degraded` lasting more than one minute: inspect the listener connection.",
+        "- `live_updates_degraded` lasting more than one minute: inspect the listener connection.",
         "- `sweep_cap_reached` on every sweep: run more often or raise the scan bound.",
         "- `follow_capacity` or `follow_tenant_capacity`: reduce followers or raise their cap.",
         "- `log_field_dropped`: fix the emitting call without adding raw values to diagnostics.",

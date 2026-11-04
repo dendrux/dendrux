@@ -46,9 +46,8 @@ class MiniStore(SQLStateStore):
 
     def __init__(self, engine):
         super().__init__(engine)
-        # Say how many processes may share the data, and turn notify off: this store
-        # sends no event hints (see "Declare what you promise").
-        self.capabilities = replace(self.capabilities, deployment="single_host", notify=False)
+        # Say how many processes may share the data.
+        self.capabilities = replace(self.capabilities, deployment="single_host")
 
     # -- writes -----------------------------------------------------------------------------
 
@@ -284,7 +283,7 @@ from dataclasses import replace
 class MyStore(SQLStateStore):
     def __init__(self, engine):
         super().__init__(engine)
-        self.capabilities = replace(self.capabilities, deployment="multi_server", notify=False)
+        self.capabilities = replace(self.capabilities, deployment="multi_server")
 ```
 
 | Field | Meaning |

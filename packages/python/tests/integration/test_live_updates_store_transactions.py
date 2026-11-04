@@ -295,8 +295,7 @@ async def test_enabled_bus_preserves_save_statement_budget_and_records_sends_sep
     event.listen(engine.sync_engine, "before_cursor_execute", capture)
     bus = RecordingUpdates()
     for enabled in (False, True):
-        options = {"notify_channel": "a2_budget"} if engine.dialect.name == "postgresql" else {}
-        store = store_for_engine(engine, live_updates=bus if enabled else None, **options)
+        store = store_for_engine(engine, live_updates=bus if enabled else None)
         active = enabled
         run_id = generate_ulid()
         await store.get_run_status(run_id)
@@ -307,6 +306,4 @@ async def test_enabled_bus_preserves_save_statement_budget_and_records_sends_sep
     assert groups[False] == groups[True]
     assert len(bus.messages) == 2
     assert bus.stats().sent == 2
-    assert sum("pg_notify" in sql for sql in groups[True]) == (
-        1 if engine.dialect.name == "postgresql" else 0
-    )
+    assert not any("pg_notify" in sql for sql in groups[True])

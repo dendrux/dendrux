@@ -1101,38 +1101,6 @@ FOLLOW_COORDINATOR_RESTART = Code(
     "Inspect store connectivity and coordinator failures.",
 )
 
-NOTIFIER_DEGRADED = Code(
-    "notifier_degraded",
-    logging.WARNING,
-    "observability",
-    _BASE_FIELDS | frozenset([]),
-    "The notification channel is unavailable and readers poll.",
-    "Check the listener connection; alert after one minute.",
-)
-NOTIFIER_RECOVERED = Code(
-    "notifier_recovered",
-    logging.INFO,
-    "observability",
-    _BASE_FIELDS | frozenset([]),
-    "The notification channel reconnects.",
-    "Confirm reader latency returns to normal.",
-)
-NOTIFIER_UNAVAILABLE = Code(
-    "notifier_unavailable",
-    logging.WARNING,
-    "observability",
-    _BASE_FIELDS | frozenset([]),
-    "The notification channel cannot start.",
-    "Check its direct or session-pooled Postgres connection.",
-)
-NOTIFIER_MISSED_HINT = Code(
-    "notifier_missed_hint",
-    logging.WARNING,
-    "notifier",
-    _BASE_FIELDS | frozenset({"count"}),
-    "A healthy feed finds new rows on reconciliation without a wake hint, once per feed.",
-    "Enable the channel on every writer and verify matching writer/listener channels.",
-)
 PROVIDER_UNKNOWN = Code(
     "provider_unknown",
     logging.WARNING,
@@ -2019,10 +1987,6 @@ REGISTRY = MappingProxyType(
             LIVE_UPDATES_MANY_STORES,
             FOLLOW_READ_FAILED,
             FOLLOW_COORDINATOR_RESTART,
-            NOTIFIER_DEGRADED,
-            NOTIFIER_RECOVERED,
-            NOTIFIER_UNAVAILABLE,
-            NOTIFIER_MISSED_HINT,
             PROVIDER_UNKNOWN,
             LOG_FIELD_DROPPED,
             PERSISTENCE_ERROR,

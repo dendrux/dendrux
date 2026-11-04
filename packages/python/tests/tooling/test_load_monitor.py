@@ -49,7 +49,7 @@ def test_store_uses_factory_and_only_postgres_notify(monkeypatch):
 
     seen = []
     monkeypatch.setattr(_factory, "store_for_engine", lambda e, **kw: seen.append(kw) or e)
-    for backend, options in [("mysql", {}), ("postgresql", {"notify_channel": load.CHANNEL})]:
+    for backend, options in [("mysql", {}), ("postgresql", {"live_updates": True})]:
         engine = SimpleNamespace(dialect=SimpleNamespace(name=backend))
         assert load.make_store(engine, notify=True) is engine
         assert seen[-1] == options

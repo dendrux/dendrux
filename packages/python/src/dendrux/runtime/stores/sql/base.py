@@ -31,7 +31,6 @@ from dendrux._meta_keys import (
     ANNOUNCE_MARKS_SESSION_KEY,
     COMMIT_PROOFS_SESSION_KEY,
     ERROR_INFO_META_KEY,
-    EVENT_HOOK_SESSION_KEY,
     FRESH_EVIDENCE_SESSION_KEY,
     GOVERNANCE_KEY,
     LATEST_REWRITE_META_KEY,
@@ -431,7 +430,6 @@ class SQLStateStore(SQLBlobCatalog):
         retry_ids=True,
         checkpointing=True,
         atomic_completion=True,
-        notify=True,
         recovery=True,
     )
 
@@ -871,9 +869,6 @@ class SQLStateStore(SQLBlobCatalog):
             expire_on_commit=False,
             info={
                 STORE_SESSION_KEY: self,
-                EVENT_HOOK_SESSION_KEY: lambda session, run_id: self._after_event_insert(
-                    session, run_id
-                ),
             },
         )
         if shares_one_connection(engine):
@@ -3823,9 +3818,6 @@ class SQLStateStore(SQLBlobCatalog):
                 for r in rows
             ]
 
-    async def _after_event_insert(self, session: AsyncSession, run_id: str) -> None:
-        return None
-
     async def save_run_event(
         self,
         run_id: str,
@@ -5453,9 +5445,6 @@ class SQLStateStore(SQLBlobCatalog):
             return int(row.sequence_index)
         session.info[FRESH_EVIDENCE_SESSION_KEY] = True
         self._mark_announce(session, (run_id,))
-        hook = session.info.get(EVENT_HOOK_SESSION_KEY)
-        if hook is not None:
-            await hook(session, run_id)
         return int(seq)
 
 

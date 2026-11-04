@@ -4,7 +4,6 @@
 # Add a test here when it compares a measured time with a small number; or, if the bound is only
 # a generous hang tripwire, list it in wallclock_reviewed.txt instead (a tooling test enforces one
 # or the other). Tests with their own @pytest.mark.benchmark need no entry.
-tests/integration/test_060_notifier_pg.py::test_n1_commit_wakes_under_50ms_and_1000_subscriptions_one_connection | commit-to-wakeup latency under 250 ms with 1,000 subscriptions
 tests/unit/test_mcp_oauth_http.py::test_cancellation_during_close_returns_and_the_close_still_finishes | cancel returns within 200 ms
 tests/unit/test_mcp_runtime_live.py::TestReleaseOwnership::test_forced_connect_cancellation_uses_one_shared_grace_period | shared grace under 450 ms (sequential would be 600 ms)
 tests/unit/test_mcp_runtime_live.py::TestConnectionCapacity::test_zero_wait_timeout_fails_fast | fails within 50 ms

@@ -353,3 +353,14 @@ async def test_memory_admin_uses_the_guarded_engine_builder(monkeypatch):
     )
     await load.w_memory(ctx)
     assert apps == ["dendrux_load_w0", "dendrux_load_admin"]
+
+
+@pytest.mark.parametrize("has_close", [False, True])
+async def test_store_cleanup_supports_current_and_historical_stores(has_close):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    close = AsyncMock()
+    store = SimpleNamespace(close=close) if has_close else SimpleNamespace()
+    await load.close_store(store)
+    assert close.await_count == int(has_close)

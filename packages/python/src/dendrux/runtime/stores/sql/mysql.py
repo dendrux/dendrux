@@ -136,7 +136,7 @@ class MySQLStateStore(SQLStateStore):
         self, engine: AsyncEngine, *, live_updates: LiveUpdates | bool | None = None
     ) -> None:
         super().__init__(engine, live_updates=live_updates)
-        self.capabilities = replace(self.capabilities, deployment="multi_server", notify=False)
+        self.capabilities = replace(self.capabilities, deployment="multi_server")
 
     def classify_db_error(self, exc: BaseException) -> Any:
         from dendrux.runtime.stores._errors import DbError

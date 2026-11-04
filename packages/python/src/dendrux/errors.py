@@ -217,15 +217,6 @@ class LiveUpdatesUnavailableError(RuntimeError):
         return _restore_logged_control_error, (type(self), self.args, self.__dict__)
 
 
-class NotifierUnavailableError(RuntimeError):
-    """The configured notifier could not become ready."""
-
-    def __init__(self, reason: str) -> None:
-        self.reason = reason
-        _codes.log_code(logging.getLogger(__name__), _codes.NOTIFIER_UNAVAILABLE, run_id=None)
-        super().__init__(f"Notifier unavailable ({reason}).")
-
-
 class RunNotPausedError(RunControlError):
     """Raised when a submit method is called on a run that is not paused.
 
@@ -1274,7 +1265,6 @@ __all__ = [
     "StoreOutcomeUnknown",
     "StatementTooLargeError",
     "JSONIntegerOutOfRangeError",
-    "NotifierUnavailableError",
     "LiveUpdatesUnavailableError",
     "FollowCapacityError",
     "StoreCapabilityError",

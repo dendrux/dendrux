@@ -3,23 +3,16 @@
 import json
 
 import pytest
-from sqlalchemy import event, text
+from sqlalchemy import event
 
 from dendrux.runtime.state import EventWrite, LoopStatePatch, TraceWrite
 from dendrux.types import UsageStats, generate_ulid
 
 
-async def test_transaction_statement_costs(store, engine, monkeypatch, record_property):
+async def test_transaction_statement_costs(store, engine, record_property):
     if engine.dialect.name != "postgresql":
-        pytest.skip("The frozen 25-statement boundary is PostgreSQL with NOTIFY")
+        pytest.skip("The statement boundary is PostgreSQL")
 
-    async def notify(session, run_id):
-        await session.execute(
-            text("SELECT pg_notify(:channel, :run_id)"),
-            {"channel": "dendrux_events", "run_id": run_id},
-        )
-
-    monkeypatch.setattr(store, "_after_event_insert", notify)
     groups = {}
     current = "creation"
 
@@ -97,9 +90,9 @@ async def test_transaction_statement_costs(store, engine, monkeypatch, record_pr
     counts = {name: len(statements) for name, statements in groups.items()}
     record_property("transaction_statements", json.dumps(counts, sort_keys=True))
     assert counts["assistant_checkpoint"] == 2
-    assert counts["intent"] == 4
-    assert counts["completion"] == 5
-    assert sum(count for name, count in counts.items() if name != "creation") <= 25
+    assert counts["intent"] == 3
+    assert counts["completion"] == 4
+    assert sum(count for name, count in counts.items() if name != "creation") == 21
 
 
 @pytest.mark.parametrize("streaming", [False, True])
@@ -108,8 +101,7 @@ async def test_agent_iteration_statement_budget(
 ):
     """Count every SQL statement in two consecutive actual nonterminal Agent iterations."""
     if engine.dialect.name != "postgresql":
-        pytest.skip("The frozen 25-statement boundary is PostgreSQL with NOTIFY")
-    store.notify_channel = "dendrux_events"
+        pytest.skip("The statement boundary is PostgreSQL")
     from contextvars import ContextVar
     from functools import wraps
 
@@ -170,15 +162,6 @@ async def test_agent_iteration_statement_budget(
         "update_run_meta",
     ):
         monkeypatch.setattr(store, name, wrap_method(name, getattr(store, name)))
-
-    async def notify(session, run_id):
-        assert store.notify_channel == "dendrux_events"
-        await session.execute(
-            text("SELECT pg_notify(:channel, :run_id)"),
-            {"channel": store.notify_channel, "run_id": run_id},
-        )
-
-    monkeypatch.setattr(store, "_after_event_insert", notify)
 
     class Observer(BaseNotifier):
         def trace_link(self, run_id):
@@ -246,7 +229,6 @@ async def test_agent_iteration_statement_budget(
     assert not counts.get("between"), counts
     for name in ("iteration_1", "iteration_2"):
         statements = [s for t in transactions if t["phase"] == name for s in t["statements"]]
-        assert sum("pg_notify" in s for s in statements) == 3
         assert (
             sum(t["operation"] == "start_tool_call" for t in transactions if t["phase"] == name)
             == 1
@@ -255,8 +237,7 @@ async def test_agent_iteration_statement_budget(
             sum(t["operation"] == "complete_tool_call" for t in transactions if t["phase"] == name)
             == 1
         )
-        assert len(statements) <= 25, counts[name]
-        assert len(statements) <= 22, counts[name]
+        assert len(statements) == 19, counts[name]
         assert not any(
             t["operation"] == "touch_progress" for t in transactions if t["phase"] == name
         ), counts[name]

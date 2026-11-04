@@ -86,5 +86,3 @@ Every SQL store requires real transactions. On first use, before any claim, it r
 At Agent construction Dendrux validates declared capability versions, methods and required keyword parameters. A mismatch raises `StoreCapabilityError` (a `TypeError`) before a run starts. `sweep(on_stale="reclaim")` also validates its store before writes.
 
 `SQLAlchemyStateStore` is removed in 0.6.0. When moving a subclass to `PostgresStateStore`, `SQLiteStateStore` or `SQLStateStore`, audit every overridden write method against the current protocol. The subclass inherits the base declaration unless it explicitly narrows it. Keep the named parameters, forward the epoch and caller-minted ids, and preserve the transaction boundaries. Test races and retries against the database you deploy.
-
-For an external notifier, the Redis [adapter recipe](/docs/recipes/redis-notifier) uses the private `_after_event_insert` hook. That publishing integration may change; the public `EventNotifier` protocol describes the reader side.

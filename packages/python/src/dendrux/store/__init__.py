@@ -57,9 +57,9 @@ from dendrux._meta_keys import (
     ERROR_INFO_META_KEY as ERROR_INFO_META_KEY,
 )
 from dendrux._sentinel import _OmittedType
-from dendrux.db._live_updates import LiveUpdates
-from dendrux.db._notify import EventNotifier, NotifierState, Subscription
+from dendrux.db._live_updates import LiveUpdates, LiveUpdatesStats
 from dendrux.db._postgres_updates import PostgresUpdates
+from dendrux.db._redis_updates import RedisUpdates
 from dendrux.db._sqlite_sync import create_sqlite_schema
 from dendrux.errors import BlobNotFoundError, LiveUpdatesUnavailableError, RunNotFoundError
 from dendrux.media._ids import image_id
@@ -147,7 +147,6 @@ from dendrux.store._follow import (
 from dendrux.store._follow import (
     approval_calls as approval_calls,
 )
-from dendrux.store._notifier_pg import PostgresEventNotifier
 from dendrux.store._redact import (
     PAUSE_VIEW_EVENTS,
     PastParams,
@@ -1653,6 +1652,8 @@ def _build_pause_pair(paused: Any, resumed: Any | None) -> PausePair:
 
 __all__ = [
     "LiveUpdates",
+    "LiveUpdatesStats",
+    "RedisUpdates",
     "PostgresUpdates",
     "StateStore",
     "StoreCapabilities",
@@ -1681,18 +1682,15 @@ __all__ = [
     "SetFields",
     "ValuesSource",
     "EventFeed",
-    "EventNotifier",
     "Follow",
     "FollowCapacityError",
     "FollowEnd",
     "FollowHeartbeat",
     "FollowItem",
     "LLMCall",
-    "NotifierState",
     "PausePair",
     "PendingPause",
     "PendingToolCall",
-    "PostgresEventNotifier",
     "RunDetail",
     "RunNote",
     "RunNotFoundError",
@@ -1702,7 +1700,6 @@ __all__ = [
     "RunUsage",
     "StoredEvent",
     "SubtreeNode",
-    "Subscription",
     "TenantScope",
     "ToolInvocation",
     "TraceEntry",

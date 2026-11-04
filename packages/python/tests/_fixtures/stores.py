@@ -829,8 +829,7 @@ for _name in (*PROTOCOL_0_5, *_PARTIAL_OPTIONAL_METHODS):
     setattr(PartialFencedRetryStore, _name, _partial_method(_name))
 
 #: contracts.md section 2 table: capability -> method -> keyword-only parameters it must accept.
-#: (``ClaimResult`` returns and the ``notify`` constructor option cannot be read from a
-#: signature; phase 1 checks them separately.)
+#: ``ClaimResult`` returns cannot be read from a signature; phase 1 checks them separately.
 CAPABILITY_REQUIREMENTS: dict[str, dict[str, tuple[str, ...]]] = {
     "fenced_writes": {
         "save_trace": ("claim_epoch",),
@@ -864,7 +863,6 @@ CAPABILITY_REQUIREMENTS: dict[str, dict[str, tuple[str, ...]]] = {
         "finalize_with_event": ("trace",),
     },
     "recovery": {"mark_lease_expired": (), "get_lease_expired": (), "reclaim_run": ()},
-    "notify": {"_after_event_insert": ()},
 }
 
 

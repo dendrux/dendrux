@@ -1,4 +1,4 @@
-"""Real writer-hook costs, batch and 50-chunk streaming, enabled and disabled."""
+"""MySQL statement costs for batch and 50-chunk streaming."""
 
 import json
 
@@ -15,7 +15,6 @@ async def test_mysql_iteration_budget(
     store, mysql_engine, monkeypatch, record_property, tmp_path, streaming
 ):
     """Count every SQL statement in two consecutive actual nonterminal Agent iterations."""
-    notify_enabled = False
     target = 22
     from contextvars import ContextVar
     from functools import wraps
@@ -77,8 +76,6 @@ async def test_mysql_iteration_budget(
         "update_run_meta",
     ):
         monkeypatch.setattr(store, name, wrap_method(name, getattr(store, name)))
-
-    store.notify_channel = "dendrux_events" if notify_enabled else None
 
     class Observer(BaseNotifier):
         def trace_link(self, run_id):
@@ -142,13 +139,10 @@ async def test_mysql_iteration_budget(
         )
     record_property("agent_transaction_statements", json.dumps(counts, sort_keys=True))
     (tmp_path / "agent-statements.json").write_text(json.dumps(transactions, indent=2))
-    print(
-        f"STREAMING={streaming}; NOTIFIER={notify_enabled}; " + json.dumps(counts, sort_keys=True)
-    )
+    print(f"STREAMING={streaming}; " + json.dumps(counts, sort_keys=True))
     assert not counts.get("between"), counts
     for name in ("iteration_1", "iteration_2"):
         statements = [s for t in transactions if t["phase"] == name for s in t["statements"]]
-        assert sum("pg_notify" in s for s in statements) == (3 if notify_enabled else 0)
         assert (
             sum(t["operation"] == "start_tool_call" for t in transactions if t["phase"] == name)
             == 1

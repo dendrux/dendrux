@@ -76,8 +76,8 @@ _FIXTURE_FOR = {
 }
 
 
-#: Capabilities whose promise the report must see exercised (``notify`` has no contracts to run).
-CERTIFIABLE = tuple(name for name in CAPABILITIES if name != "notify")
+#: Capabilities whose promise the report must see exercised.
+CERTIFIABLE = CAPABILITIES
 _STORE_SKIP = re.compile(rf"{STORE_SKIP}\[([^\]]*)\]:\s*(.*)", re.DOTALL)
 _SETUP_MESSAGE = (
     "The Dendrux store kit is switched on, but no {factory} fixture exists. Define it in your "

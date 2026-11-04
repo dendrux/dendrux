@@ -34,7 +34,6 @@ class SQLiteStateStore(SQLStateStore):
         self.capabilities = replace(
             self.capabilities,
             deployment="single_process" if memory else "single_host",
-            notify=False,
         )
 
     def _insert(self, table: Any) -> Any:

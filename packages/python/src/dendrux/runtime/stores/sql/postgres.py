@@ -44,15 +44,9 @@ class PostgresStateStore(SQLStateStore):
         self,
         engine: AsyncEngine,
         *,
-        notify_channel: str | None = None,
         live_updates: LiveUpdates | bool | None = None,
     ) -> None:
-        from dendrux.db._notify import validate_channel
-
-        if notify_channel is not None:
-            validate_channel(notify_channel)
         super().__init__(engine, live_updates=live_updates)
-        self.notify_channel = notify_channel
         self.capabilities = replace(self.capabilities, deployment="multi_server")
 
     def _native_live_updates(self) -> LiveUpdates | None:
@@ -244,15 +238,6 @@ class PostgresStateStore(SQLStateStore):
         from sqlalchemy import func
 
         return func.now()
-
-    async def _after_event_insert(self, session: Any, run_id: str) -> None:
-        if self.notify_channel is not None:
-            from sqlalchemy import text
-
-            await session.execute(
-                text("SELECT pg_notify(:channel, :run_id)"),
-                {"channel": self.notify_channel, "run_id": run_id},
-            )
 
     def json_patch_expr(self, col: Any, patch: Any) -> Any:
         from sqlalchemy import Text, case, func, literal, select

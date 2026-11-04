@@ -16,7 +16,6 @@ CAPABILITIES = (
     "checkpointing",
     "atomic_completion",
     "recovery",
-    "notify",
 )
 #: Flags that together make a store create format-2 runs (``state.py`` creation rule).
 FORMAT_2_FLAGS = ("fenced_writes", "retry_ids", "checkpointing", "atomic_completion")

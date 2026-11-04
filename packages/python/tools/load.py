@@ -15,7 +15,7 @@ controller, a billing connection per worker); the report lists every connection 
 Scenarios: ``a`` (the 0.5 client-tool pause/submit run), ``iteration`` (statements per
 one-tool iteration), ``runs`` (concurrent runs), ``kill_checkpoint`` and ``kill_inflight``
 (worker processes killed with SIGKILL, then recovered), ``followers_on`` and
-``followers_off`` (notifier on and off), ``cancel`` (a large delegation tree),
+``followers_off`` (live updates on and off), ``cancel`` (a large delegation tree),
 ``pool`` (pool exhaustion), ``history`` (a near-16 MiB history resumed in a new process)
 and ``memory`` (repeated cycles in one process).
 
@@ -74,7 +74,6 @@ MONITOR_INTERVAL: ContextVar[float] = ContextVar("load_monitor_interval", defaul
 
 POOL = {"pool_size": 10, "max_overflow": 5, "pool_timeout": 120, "pool_pre_ping": True}
 POOL_CEILING = POOL["pool_size"] + POOL["max_overflow"]
-CHANNEL = "dendrux_events"
 SAMPLE_INTERVAL_S = 0.01
 BIG_CHARS = 985_000  # 17 results put the full history just below the 16 MiB rebuild bound
 V050_REFERENCE_A = 59.0  # recorded 2026-10-27, commit dca4f05e (owner-docs load-test-results.md)
@@ -543,8 +542,15 @@ def make_store(engine: Any, *, notify: bool) -> Any:
 
         return SQLAlchemyStateStore(engine)
 
-    options = {"notify_channel": CHANNEL} if notify and engine.dialect.name == "postgresql" else {}
+    options = {"live_updates": True} if notify and engine.dialect.name == "postgresql" else {}
     return store_for_engine(engine, **options)
+
+
+async def close_store(store: Any) -> None:
+    """Close store-owned live updates when running against a current checkout."""
+    close = getattr(store, "close", None)
+    if close is not None:
+        await close()
 
 
 from sqlalchemy.pool import AsyncAdaptedQueuePool  # noqa: E402
@@ -715,6 +721,7 @@ async def w_a(ctx: Ctx) -> dict[str, Any]:
     }
     if shared is not None:
         await shared.close()
+    await close_store(store)
     await engine.dispose()
     return out
 
@@ -793,6 +800,7 @@ async def w_runs(ctx: Ctx) -> dict[str, Any]:
     await agent.close()
     if billing is not None:
         await ctx.state["bill_engine"].dispose()
+    await close_store(store)
     await engine.dispose()
     return out
 
@@ -966,6 +974,7 @@ async def w_iteration(ctx: Ctx) -> dict[str, Any]:
                 )
                 await agent.close()
             out["variants"][name] = results
+            await close_store(store)
     out["meter"] = meter.snapshot()
     await engine.dispose()
     return out
@@ -995,19 +1004,15 @@ async def followers_round(
     import asyncpg
 
     from dendrux import Agent
-    from dendrux.store import EventFeed, FollowEnd, FollowHeartbeat, PostgresEventNotifier, RunStore
+    from dendrux.store import EventFeed, FollowEnd, FollowHeartbeat, RunStore
     from dendrux.types import RunStatus, ToolResult
 
     store = make_store(engine, notify=notify)
-    notifier = PostgresEventNotifier(dsn_of(url), channel=CHANNEL) if notify else None
-    if notifier is not None:
-        await notifier.start()
-    reads = RunStore.from_engine(engine, notifier=notifier)
+    reads = RunStore(store)
     feed = EventFeed(
         reads,
         max_followers=max(10, len(keys) * followers + 10),
         max_followers_per_tenant=None,
-        notifier=notifier,
     )
     tools = make_tools(ctx.state)
     agent = Agent(
@@ -1181,8 +1186,8 @@ async def followers_round(
     await agent.close()
     await feed.aclose()
     result["followers_open_after_close"] = getattr(feed, "_open", None)
-    if notifier is not None:
-        await notifier.stop()
+    await reads.close()
+    await close_store(store)
     return result
 
 

@@ -109,9 +109,9 @@ def test_multi_server_without_a_second_instance_fails(pytester: pytest.Pytester)
 
 def test_a_complete_declaration_passes_and_prints_a_summary(pytester: pytest.Pytester) -> None:
     result = kit(pytester, BASE, "", CLOCK, REOPEN, k="test_declared or test_deployment")
-    result.assert_outcomes(passed=3, skipped=1)  # the notify check: this store does not declare it
+    result.assert_outcomes(passed=3)
     result.stdout.fnmatch_lines(
-        ["*dendrux store kit: certification summary*", "*declaration*3 passed, 1 skipped*"]
+        ["*dendrux store kit: certification summary*", "*declaration*3 passed"]
     )
 
 

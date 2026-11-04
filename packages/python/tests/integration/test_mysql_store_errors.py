@@ -60,7 +60,7 @@ def test_mysql_factory_selects_adapter():
     store = store_for_engine(engine)
     assert type(store).__name__ == "MySQLStateStore"
     assert store.capabilities.deployment == "multi_server"
-    assert store.capabilities.notify is False
+    assert store.live_updates is None
 
 
 @pytest.mark.parametrize(

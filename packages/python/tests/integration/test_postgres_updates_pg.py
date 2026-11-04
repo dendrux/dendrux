@@ -17,7 +17,7 @@ from sqlalchemy.engine import make_url
 
 from dendrux.db._postgres_updates import PostgresUpdates
 from dendrux.types import generate_ulid
-from tests.integration.test_060_notifier_liveness import Proxy
+from tests._helpers.tcp_proxy import Proxy
 
 asyncpg = pytest.importorskip("asyncpg")
 

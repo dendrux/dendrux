@@ -253,7 +253,7 @@ rules:
       - pattern-not-inside: $X.__module__ = "$S"
       - metavariable-regex:
           metavariable: $S
-          regex: ^dendrux\.(error_info|stop_reason|pause_request|governance|parts|images|image_notes|prefix|replay|images\.seeded_slots|skills|replayed|response_bound|streaming_response|response_error|loop|max_delegation_depth|output_type|retry_of|cancel_persisted|not_executed|seed_prefix|skills\.context|step|message|observation|latest_rewrite|internal|store|touched_runs|commit_proofs|fresh_evidence|event_hook)$
+          regex: ^dendrux\.(error_info|stop_reason|pause_request|governance|parts|images|image_notes|prefix|replay|images\.seeded_slots|skills|replayed|response_bound|streaming_response|response_error|loop|max_delegation_depth|output_type|retry_of|cancel_persisted|not_executed|seed_prefix|skills\.context|step|message|observation|latest_rewrite|internal|store|touched_runs|commit_proofs|fresh_evidence)$
 
   - id: default-sqlite-url-literal
     message: >-

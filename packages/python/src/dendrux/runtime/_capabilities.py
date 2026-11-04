@@ -57,7 +57,6 @@ _REQUIREMENTS: dict[str, dict[str, tuple[str, ...]]] = {
         "reclaim_run": (),
         "get_replayed_tool_calls": (),
     },
-    "notify": {"_after_event_insert": ()},
 }
 _CACHE: dict[int, tuple[weakref.ReferenceType[Any], StoreCapabilities]] = {}
 logger = logging.getLogger(__name__)
