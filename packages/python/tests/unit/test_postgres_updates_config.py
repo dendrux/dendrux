@@ -82,6 +82,48 @@ def test_dsn_keeps_the_destination_sqlalchemy_would_use(url: str) -> None:
     assert _target(dsn=asyncpg_dsn(url)) == _sqlalchemy_target(url)
 
 
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("postgresql+asyncpg://app:pw@db.internal?database=orbit", ("db.internal", 5432, "orbit")),
+        ("postgresql+asyncpg://app:pw@db.internal?dbname=orbit", ("db.internal", 5432, "orbit")),
+        ("postgresql+asyncpg://app:pw@db.internal/orbit?port=6543", ("db.internal", 6543, "orbit")),
+        (
+            "postgresql+asyncpg://db.internal/orbit?user=app&password=pw",
+            ("db.internal", 5432, "orbit"),
+        ),
+        (
+            "postgresql+asyncpg://app:pw@/orbit?host=/tmp&port=5444",
+            ("/tmp/.s.PGSQL.5444", None, "orbit"),
+        ),
+    ],
+)
+def test_query_destination_fields_reach_the_same_destination(
+    url: str, expected: tuple[Any, ...]
+) -> None:
+    addrs, user, password, database, _, _ = _target(dsn=asyncpg_dsn(url))
+    host, port, name = expected
+    assert addrs[0] == (host if port is None else (host, port))
+    assert (user, password, database) == ("app", "pw", name)
+    if "dbname" not in url:  # SQLAlchemy's dialect passes dbname= to asyncpg as-is
+        assert _target(dsn=asyncpg_dsn(url))[:4] == _sqlalchemy_target(url)[:4]
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "postgresql+asyncpg://app:pw@h/orbit?database=other",
+        "postgresql+asyncpg://app:pw@h?database=a&dbname=b",
+        "postgresql+asyncpg://app:pw@h:5433/orbit?port=6543",
+        "postgresql+asyncpg://app:pw@h/orbit?password=other",
+        "postgresql+asyncpg://app:pw@/orbit?host=h1:5432&host=h2:5433&port=6543",
+    ],
+)
+def test_genuinely_ambiguous_destination_fields_are_refused(url: str) -> None:
+    with pytest.raises(ValueError):
+        asyncpg_dsn(url)
+
+
 def test_dsn_escapes_credentials_and_keeps_tls_keys() -> None:
     url = make_url("postgresql+asyncpg://db.internal/orbit").set(
         username="us@er:", password=SECRET, query={"sslmode": "require"}
@@ -164,15 +206,22 @@ def test_ambiguous_destination_is_rejected(url: str) -> None:
         f"mysql+aiomysql://app:{SECRET}@db.internal/orbit",
         f"sqlite+aiosqlite:///{SECRET}.db",
         f"not a url {SECRET}",
+        f"postgresql://u:p@node:{SECRET}@host/db",  # bad port that carries the secret
     ],
 )
 def test_non_postgres_or_unparseable_url_never_echoes_it(url: str) -> None:
     with pytest.raises(ValueError) as caught:
         asyncpg_dsn(url)
-    assert SECRET not in str(caught.value)
-    error = caught.value
-    assert error.__cause__ is None
-    assert error.__context__ is None or error.__suppress_context__
+    chain: list[BaseException] = []
+    pending: list[BaseException | None] = [caught.value]
+    while pending:
+        error = pending.pop()
+        if error is None or error in chain:
+            continue
+        chain.append(error)
+        pending.extend([error.__cause__, error.__context__])
+    assert len(chain) == 1, "no original exception may stay reachable"
+    assert SECRET not in repr(caught.value) and SECRET not in str(caught.value)
 
 
 def test_connection_options_precedence() -> None:

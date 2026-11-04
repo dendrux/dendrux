@@ -62,8 +62,7 @@ _FALLBACK_DSN_KEYS = frozenset(
 )
 _STARTUP_SETTINGS = frozenset({"application_name", "options"})
 _FORCED_OPTIONS = ("statement_cache_size", "timeout")
-_NETLOC_KEYS = {"host": "host", "port": "port", "user": "username", "password": "password"}
-_DATABASE_KEYS = ("database", "dbname")
+_DESTINATION_KEYS = frozenset({"host", "port", "user", "password", "database", "dbname"})
 
 
 def _dsn_keys() -> frozenset[str]:
@@ -83,70 +82,105 @@ def _dsn_keys() -> frozenset[str]:
 def _parse(url: str | URL) -> URL:
     from sqlalchemy.engine import make_url
 
+    parsed: URL | None
     try:
         parsed = make_url(url)
     except Exception:
-        raise ValueError("PostgresUpdates could not parse the database URL.") from None
+        parsed = None  # raised below, outside the handler, so no chain keeps the URL
+    if parsed is None:
+        raise ValueError("PostgresUpdates could not parse the database URL.")
     if parsed.get_backend_name() not in ("postgresql", "postgres"):
         raise ValueError("PostgresUpdates needs a PostgreSQL URL.")
     return parsed
 
 
-def _query_values(parsed: URL, allowed: frozenset[str]) -> list[tuple[str, str]]:
+def _refuse(key: str) -> ValueError:
+    return ValueError(f"PostgresUpdates refuses an ambiguous {key!r} in the URL; pass url=.")
+
+
+def _single(key: str, value: object) -> str:
+    if isinstance(value, tuple):
+        raise _refuse(key)
+    return str(value)
+
+
+def _one(url_value: object, query: Mapping[str, Any], *keys: str) -> str | None:
+    """One value for a destination field given in the URL part or the query, never both."""
+    found = [str(url_value)] if url_value is not None else []
+    found += [_single(key, query[key]) for key in keys if key in query]
+    if len(found) > 1:
+        raise _refuse(keys[0])
+    return found[0] if found else None
+
+
+def _query_hosts(parsed: URL) -> list[tuple[str, str]]:
+    """Query ``host`` (and ``port``) kept as asyncpg reads them; refused next to an authority."""
+    query = parsed.query
+    if "host" not in query:
+        return []
+    if parsed.host is not None or parsed.port is not None:
+        raise _refuse("host")
+    value = query["host"]
+    hosts = ",".join(value) if isinstance(value, tuple) else str(value)
+    pairs = [("host", hosts)]
+    if "port" in query:
+        if any(":" in spec and not spec.startswith(("/", "[")) for spec in hosts.split(",")):
+            raise _refuse("port")
+        pairs.append(("port", _single("port", query["port"])))
+    return pairs
+
+
+def _options(parsed: URL, allowed: frozenset[str]) -> list[tuple[str, str]]:
+    """Non-destination query keys, each one asyncpg reads; any other key is refused by name."""
     pairs: list[tuple[str, str]] = []
     for key, value in parsed.query.items():
         if key not in allowed:
             raise ValueError(
                 f"PostgresUpdates cannot use the URL option {key!r}; pass url= explicitly."
             )
-        _check_ambiguity(parsed, key)
-        if isinstance(value, tuple):
-            if key != "host":
-                raise ValueError(f"PostgresUpdates refuses the repeated URL option {key!r}.")
-            value = ",".join(value)
-        pairs.append((key, value))
+        if key not in _DESTINATION_KEYS:
+            pairs.append((key, _single(key, value)))
     return pairs
 
 
-def _check_ambiguity(parsed: URL, key: str) -> None:
-    """Refuse a query key that SQLAlchemy and asyncpg would resolve differently."""
-    clash = getattr(parsed, _NETLOC_KEYS[key], None) if key in _NETLOC_KEYS else None
-    if key == "host" and parsed.port is not None:
-        clash = parsed.port
-    if key in _DATABASE_KEYS:
-        clash = parsed.database
-    if clash is not None:
-        raise ValueError(f"PostgresUpdates refuses the URL option {key!r} next to its URL part.")
-
-
-def _netloc(parsed: URL) -> str:
+def _authority(user: str | None, password: str | None, host: str, port: str | None) -> str:
     userinfo = ""
-    if parsed.username is not None:
-        userinfo = quote(parsed.username, safe="")
-        if parsed.password is not None:
-            userinfo += ":" + quote(str(parsed.password), safe="")
+    if user is not None:
+        userinfo = quote(user, safe="")
+        if password is not None:
+            userinfo += ":" + quote(password, safe="")
         userinfo += "@"
-    host = parsed.host or ""
     if ":" in host:
         host = f"[{host}]"
     elif host:
         host = quote(host, safe="")
-    port = f":{parsed.port}" if parsed.port is not None else ""
-    return userinfo + host + port
+    return userinfo + host + (f":{port}" if port is not None else "")
 
 
 def asyncpg_dsn(url: str | URL) -> str:
     """Convert a SQLAlchemy PostgreSQL URL to an asyncpg DSN with the same destination.
 
-    Credentials, host (IPv6 included), port and database are kept exactly and
-    escaped. Every query key asyncpg's DSN parser accepts is kept; any other key
-    raises ``ValueError`` naming only the key, so nothing is silently dropped.
+    Destination fields (user, password, host, port, database) given either in
+    the URL parts or as query keys are normalized so asyncpg resolves them
+    exactly as SQLAlchemy would; a field given twice is refused. Credentials,
+    IPv6 hosts and the database are escaped. Every other query key asyncpg's
+    DSN parser accepts is kept; any other key raises ``ValueError`` naming only
+    the key, so nothing is silently dropped.
     """
     parsed = _parse(url)
-    pairs = _query_values(parsed, _dsn_keys() | _STARTUP_SETTINGS)
-    path = "/" + quote(parsed.database, safe="") if parsed.database else "/"
-    query = "?" + urlencode(pairs) if pairs else ""
-    return f"postgresql://{_netloc(parsed)}{path}{query}"
+    query = parsed.query
+    hosts = _query_hosts(parsed)
+    user = _one(parsed.username, query, "user")
+    password = _one(parsed.password, query, "password")
+    database = _one(parsed.database, query, "database", "dbname")
+    port = None if hosts else _one(parsed.port, query, "port")
+    pairs = _options(parsed, _dsn_keys() | _STARTUP_SETTINGS)
+    if password is not None and user is None:
+        pairs.append(("password", password))
+    authority = _authority(user, password if user is not None else None, parsed.host or "", port)
+    path = "/" + quote(database, safe="") if database is not None else ""
+    query_text = "?" + urlencode([*hosts, *pairs]) if hosts or pairs else ""
+    return f"postgresql://{authority}{path}{query_text}"
 
 
 def _check_connect_args(connect_args: Mapping[str, Any] | None) -> dict[str, Any]:
