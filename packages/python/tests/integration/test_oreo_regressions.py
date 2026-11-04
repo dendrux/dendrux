@@ -526,7 +526,7 @@ async def test_stream_separates_commentary_from_answer(store):
     assert commentary == terminal.run_result.commentary == ["I'll check first."]
     assert answer == terminal.run_result.answer == "final turn"
 
-    traces = await RunStore(store).get_traces(terminal.run_result.run_id)
+    traces = await RunStore(store).get_traces(terminal.run_result.run_id, limit=1000)
     assert [(t.content, t.phase) for t in traces if t.role == "assistant"] == [
         ("I'll check first.", "commentary"),
         ("final turn", "final_answer"),
@@ -589,7 +589,7 @@ async def test_leaked_tool_syntax_argument_is_rejected_before_tool_runs(store):
     tool_msg = [m for m in provider.call_history[1]["messages"] if m.role.value == "tool"][0]
     assert "unexpected keyword argument" not in tool_msg.content
     assert json.loads(tool_msg.content) == {"error": expected, "code": "invalid_params"}
-    (invocation,) = await RunStore(store).get_tool_invocations(result.run_id)
+    (invocation,) = await RunStore(store).get_tool_invocations(result.run_id, limit=1000)
     assert invocation.success is False
     assert invocation.error == expected
     assert invocation.params == {"kind": "table", 'r4<|"|>,split': "x"}
@@ -673,7 +673,7 @@ async def test_malformed_tool_json_is_a_failed_tool_call_not_a_failed_run(store)
     assert writes == [_VALID_WRITE_PARAMS]
 
     run_store = RunStore(store)
-    first, second = await run_store.get_tool_invocations(result.run_id)
+    first, second = await run_store.get_tool_invocations(result.run_id, limit=1000)
     expected = (
         f"Your arguments for `write_file` were not valid JSON ({_MALFORMED_ERROR}). "
         "Send the call again with valid JSON; for long content, write it in smaller pieces."
@@ -710,7 +710,7 @@ async def test_malformed_tool_json_is_a_failed_tool_call_not_a_failed_run(store)
             await run_store.get_run(result.run_id),
             events,
             traces,
-            await run_store.get_tool_invocations(result.run_id),
+            await run_store.get_tool_invocations(result.run_id, limit=1000),
             [i.semantic_request for i in interactions],
             [i.semantic_response for i in interactions],
             [i.provider_request for i in interactions],

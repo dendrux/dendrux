@@ -75,7 +75,7 @@ class TestGetSubtree:
         await _call(internal_store, "a", i=1, inp=10, out=10, cost=0.25)
         await _call(internal_store, "a11", inp=100, out=100, cost=1.0, cache_read=8, reasoning=7)
 
-        tree = await store.get_subtree("root")
+        tree = await store.get_subtree("root", max_nodes=10000)
 
         assert isinstance(tree, RunSubtree)
         assert tree.root_run_id == "root"
@@ -114,7 +114,7 @@ class TestGetSubtree:
         await internal_store.create_run("c", "C", parent_run_id="p", delegation_level=1)
         await _call(internal_store, "c", inp=50, out=7)
         # Child is still RUNNING: agent_runs.total_* is 0 but live usage counts.
-        tree = await store.get_subtree("p")
+        tree = await store.get_subtree("p", max_nodes=10000)
         child = next(n for n in tree.nodes if n.run.run_id == "c")
         assert child.run.status == "running"
         assert child.run.total_input_tokens == 0
@@ -126,7 +126,7 @@ class TestGetSubtree:
         await internal_store.finalize_run(
             "c", status="success", total_usage=UsageStats(input_tokens=999)
         )
-        tree = await store.get_subtree("p")
+        tree = await store.get_subtree("p", max_nodes=10000)
         child = next(n for n in tree.nodes if n.run.run_id == "c")
         assert child.run.total_input_tokens == 999
         assert child.usage.input_tokens == 50
@@ -138,7 +138,7 @@ class TestGetSubtree:
         await _call(internal_store, "a1", cost=None)
         await _call(internal_store, "b", cost=0.25)
 
-        tree = await store.get_subtree("root")
+        tree = await store.get_subtree("root", max_nodes=10000)
         by_id = {n.run.run_id: n for n in tree.nodes}
         assert tree.usage.cost_usd is None
         assert tree.usage.unpriced_calls == 2
@@ -150,15 +150,15 @@ class TestGetSubtree:
     async def test_zero_cost_is_priced_not_unpriced(self, store, internal_store) -> None:
         await internal_store.create_run("r", "R")
         await _call(internal_store, "r", cost=0.0)
-        tree = await store.get_subtree("r")
+        tree = await store.get_subtree("r", max_nodes=10000)
         assert tree.usage.cost_usd == 0.0
         assert tree.usage.unpriced_calls == 0
 
     async def test_leaf_and_subtree_of_inner_node(self, store, internal_store) -> None:
         await _tree(internal_store)
-        leaf = await store.get_subtree("a11")
+        leaf = await store.get_subtree("a11", max_nodes=10000)
         assert [n.run.run_id for n in leaf.nodes] == ["a11"]
-        inner = await store.get_subtree("a")
+        inner = await store.get_subtree("a", max_nodes=10000)
         assert {n.run.run_id: n.depth for n in inner.nodes} == {"a": 0, "a1": 1, "a11": 2}
 
     async def test_deep_chain(self, store, internal_store) -> None:
@@ -169,7 +169,7 @@ class TestGetSubtree:
                 f"d{i}", "D", parent_run_id=f"d{i - 1}", delegation_level=i
             )
             await _call(internal_store, f"d{i}", inp=1, out=0, cost=0.001)
-        tree = await store.get_subtree("d0")
+        tree = await store.get_subtree("d0", max_nodes=10000)
         assert len(tree.nodes) == depth + 1
         assert max(n.depth for n in tree.nodes) == depth
         assert tree.usage.input_tokens == depth
@@ -180,7 +180,7 @@ class TestGetSubtree:
         for i in range(520):
             await internal_store.create_run(f"w{i:04d}", "W", parent_run_id="w")
         await _call(internal_store, "w0519", inp=3)
-        tree = await store.get_subtree("w")
+        tree = await store.get_subtree("w", max_nodes=10000)
         assert len(tree.nodes) == 521
         assert tree.usage.input_tokens == 3
         usage = await internal_store.subtree_usage("w")
@@ -197,26 +197,26 @@ class TestGetSubtree:
         await _call(internal_store, "theirs", inp=100)
         await _call(internal_store, "theirs_kid", inp=1000)
 
-        scoped = await store.get_subtree("root", tenant_id="t1")
+        scoped = await store.get_subtree("root", tenant_id="t1", max_nodes=10000)
         assert {n.run.run_id for n in scoped.nodes} == {"root", "mine"}
         assert scoped.usage.input_tokens == 1
 
-        unscoped = await store.get_subtree("root")
+        unscoped = await store.get_subtree("root", max_nodes=10000)
         assert {n.run.run_id for n in unscoped.nodes} == {"root", "mine", "theirs", "theirs_kid"}
         assert unscoped.usage.input_tokens == 1101
 
     async def test_root_of_other_tenant_is_not_found(self, store, internal_store) -> None:
         await internal_store.create_run("root", "Root", tenant_id="t1")
         with pytest.raises(RunNotFoundError):
-            await store.get_subtree("root", tenant_id="t2")
+            await store.get_subtree("root", tenant_id="t2", max_nodes=10000)
 
     async def test_untenanted_root_not_found_when_tenant_supplied(
         self, store, internal_store
     ) -> None:
         await internal_store.create_run("root", "Root")
         with pytest.raises(RunNotFoundError):
-            await store.get_subtree("root", tenant_id="t1")
-        assert (await store.get_subtree("root")).root.run.run_id == "root"
+            await store.get_subtree("root", tenant_id="t1", max_nodes=10000)
+        assert (await store.get_subtree("root", max_nodes=10000)).root.run.run_id == "root"
 
     async def test_explicit_none_scopes_to_untenanted_runs(self, store, internal_store) -> None:
         await internal_store.create_run("null-root", "N")
@@ -227,11 +227,11 @@ class TestGetSubtree:
         await _call(internal_store, "b-kid", inp=10)
         await _call(internal_store, "b-grandkid", inp=100)
 
-        scoped = await store.get_subtree("null-root", tenant_id=None)
+        scoped = await store.get_subtree("null-root", tenant_id=None, max_nodes=10000)
         assert {n.run.run_id for n in scoped.nodes} == {"null-root", "null-kid"}
         assert scoped.usage.input_tokens == 1
 
-        unscoped = await store.get_subtree("null-root")
+        unscoped = await store.get_subtree("null-root", max_nodes=10000)
         assert len(unscoped.nodes) == 4
         assert unscoped.usage.input_tokens == 111
 
@@ -240,7 +240,7 @@ class TestGetSubtree:
     ) -> None:
         await internal_store.create_run("null-root", "N")
         await internal_store.create_run("b-kid", "B", parent_run_id="null-root", tenant_id="b")
-        tree = await store.get_subtree("null-root", tenant_id=None)
+        tree = await store.get_subtree("null-root", tenant_id=None, max_nodes=10000)
         assert [n.run.run_id for n in tree.nodes] == ["null-root"]
 
     async def test_tenanted_root_with_explicit_none_is_not_found(
@@ -248,11 +248,11 @@ class TestGetSubtree:
     ) -> None:
         await internal_store.create_run("a-root", "A", tenant_id="a")
         with pytest.raises(RunNotFoundError):
-            await store.get_subtree("a-root", tenant_id=None)
+            await store.get_subtree("a-root", tenant_id=None, max_nodes=10000)
 
     async def test_missing_run_raises(self, store) -> None:
         with pytest.raises(RunNotFoundError):
-            await store.get_subtree("nope")
+            await store.get_subtree("nope", max_nodes=10000)
 
     async def test_delegation_info_still_works(self, internal_store) -> None:
         await _tree(internal_store)
@@ -293,7 +293,7 @@ class TestUsageRollupApi:
         await _tree(internal_store)
         for rid in ("root", "a", "a1", "a11", "b"):
             await _call(internal_store, rid, inp=3, out=2, cost=0.125, reasoning=1)
-        tree = await store.get_subtree("root")
+        tree = await store.get_subtree("root", max_nodes=10000)
         rollup = await internal_store.subtree_usage("root")
         assert tree.usage.input_tokens == rollup.input_tokens
         assert tree.usage.cost_usd == rollup.cost_usd
@@ -321,7 +321,7 @@ class TestBeforeFilters:
         await internal_store.create_run("r", "R")
         for et in ["run.started", "llm.completed", "tool.completed", "llm.completed"]:
             await internal_store.save_run_event("r", event_type=et)
-        events = await store.get_events("r")
+        events = await store.get_events("r", limit=1000)
         base = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
         # Event ids are not exposed publicly; stamp by sequence via a raw read.
         async with session_factory() as session:
@@ -340,40 +340,40 @@ class TestBeforeFilters:
         )
 
         cutoff = base + dt.timedelta(minutes=2)
-        got = await store.get_events("r", before=cutoff)
+        got = await store.get_events("r", before=cutoff, limit=1000)
         assert [e.sequence_index for e in got] == [0, 1]  # exclusive bound
 
-        got = await store.get_events("r", event_types=["llm.completed"])
+        got = await store.get_events("r", event_types=["llm.completed"], limit=1000)
         assert [e.sequence_index for e in got] == [1, 3]
 
-        got = await store.get_events("r", event_types=["llm.completed"], before=cutoff)
+        got = await store.get_events("r", event_types=["llm.completed"], before=cutoff, limit=1000)
         assert [e.sequence_index for e in got] == [1]
 
-        assert await store.get_events("r", event_types=[]) == []
+        assert await store.get_events("r", event_types=[], limit=1000) == []
 
         # Non-UTC aware datetimes are converted, not misread.
         plus5 = dt.timezone(dt.timedelta(hours=5))
-        got = await store.get_events("r", before=cutoff.astimezone(plus5))
+        got = await store.get_events("r", before=cutoff.astimezone(plus5), limit=1000)
         assert [e.sequence_index for e in got] == [0, 1]
 
         # Composes with the cursor.
-        got = await store.get_events("r", after_sequence_index=0, before=cutoff)
+        got = await store.get_events("r", after_sequence_index=0, before=cutoff, limit=1000)
         assert [e.sequence_index for e in got] == [1]
 
     async def test_llm_calls_before(self, store, internal_store, session_factory) -> None:
         await internal_store.create_run("r", "R")
         for i in range(3):
             await _call(internal_store, "r", i=i)
-        calls = await store.get_llm_calls("r")
+        calls = await store.get_llm_calls("r", limit=1000)
         base = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
         await self._stamp(
             session_factory,
             LLMInteraction,
             {c.id: base + dt.timedelta(hours=c.iteration) for c in calls},
         )
-        got = await store.get_llm_calls("r", before=base + dt.timedelta(hours=2))
+        got = await store.get_llm_calls("r", before=base + dt.timedelta(hours=2), limit=1000)
         assert [c.iteration for c in got] == [0, 1]
-        got = await store.get_llm_calls("r", before=base)
+        got = await store.get_llm_calls("r", before=base, limit=1000)
         assert got == []
 
     async def test_tool_invocations_before(self, store, internal_store, session_factory) -> None:
@@ -398,15 +398,17 @@ class TestBeforeFilters:
             ToolCallRecord,
             {r.id: base + dt.timedelta(hours=r.iteration_index) for r in records},
         )
-        got = await store.get_tool_invocations("r", before=base + dt.timedelta(hours=1, seconds=1))
+        got = await store.get_tool_invocations(
+            "r", before=base + dt.timedelta(hours=1, seconds=1), limit=1000
+        )
         assert [t.iteration for t in got] == [0, 1]
 
     async def test_naive_before_rejected(self, store, internal_store) -> None:
         await internal_store.create_run("r", "R")
         naive = dt.datetime(2026, 1, 1)
         with pytest.raises(ValueError, match="timezone-aware"):
-            await store.get_events("r", before=naive)
+            await store.get_events("r", before=naive, limit=1000)
         with pytest.raises(ValueError, match="timezone-aware"):
-            await store.get_llm_calls("r", before=naive)
+            await store.get_llm_calls("r", before=naive, limit=1000)
         with pytest.raises(ValueError, match="timezone-aware"):
-            await store.get_tool_invocations("r", before=naive)
+            await store.get_tool_invocations("r", before=naive, limit=1000)

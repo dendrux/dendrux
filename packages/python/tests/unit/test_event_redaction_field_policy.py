@@ -146,7 +146,7 @@ async def store(tmp_path: Any) -> Any:
 
 
 async def test_readers_survive_non_object_rows(store: RunStore) -> None:
-    raw = await store.get_events("r1", tenant_id="T")
+    raw = await store.get_events("r1", tenant_id="T", limit=1000)
     assert len(raw) == 4
     for include_payloads in (False, True):
         views = [

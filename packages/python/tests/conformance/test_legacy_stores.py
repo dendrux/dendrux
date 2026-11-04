@@ -104,3 +104,16 @@ async def test_every_fixture_runs_a_flow_on_050_which_ignores_declarations(
     assert [c["messages_sha256"] for c in golden["provider_calls"]] == [
         c["messages_sha256"] for c in expected["provider_calls"]
     ]
+
+
+@pytest.mark.parametrize("fixture", sorted(STORES))
+async def test_subtree_limit_keeps_legacy_keyword_set(fixture, sqlite_engine):
+    from dendrux.store import RunStore
+
+    state = store_for_engine(sqlite_engine)
+    await state.create_run("root", "agent")
+    legacy = STORES[fixture](state)
+    result = await RunStore(legacy).get_subtree("root", tenant_id=None, max_nodes=2)
+    assert len(result.nodes) == 1
+    expected_keys = ("run_id", "tenant_id") if fixture == "a_legacy_in_memory" else ("tenant_id",)
+    assert legacy.calls == [("get_subtree", expected_keys)]

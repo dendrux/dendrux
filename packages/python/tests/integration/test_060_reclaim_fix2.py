@@ -114,7 +114,7 @@ async def test_n3_redacted_rebuild_failure_exposes_only_closed_reason(store, eng
     reader = RunStore.from_engine(engine)
     raw = next(
         e
-        for e in await reader.get_events(item.run_id, tenant_id="tenant")
+        for e in await reader.get_events(item.run_id, tenant_id="tenant", limit=1000)
         if e.event_type == "run.error"
     )
     view = await reader.get_event_view(item.run_id, raw, tenant_id="tenant")

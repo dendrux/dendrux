@@ -77,7 +77,7 @@ async def test_reused_call_id_never_shows_an_older_pause(store: Any, engine: Any
         await _follow(run_store, first.run_id),
         [
             await run_store.get_event_view(first.run_id, e, tenant_id="A")
-            for e in await run_store.get_events(first.run_id, tenant_id="A")
+            for e in await run_store.get_events(first.run_id, tenant_id="A", limit=1000)
         ],
     ):
         requests = [e for e in events if e.event_type == "approval.requested"]
@@ -117,7 +117,7 @@ async def test_mcp_tool_names_are_never_shown(store: Any, engine: Any) -> None:
     assert decided.data["decisions"][0]["tool_name"] == "<mcp_tool>"
     views = [
         await run_store.get_event_view(run_id, e, tenant_id="A")
-        for e in await run_store.get_events(run_id, tenant_id="A")
+        for e in await run_store.get_events(run_id, tenant_id="A", limit=1000)
     ]
     assert SECRET not in json.dumps([v.data for v in views])
 
@@ -204,7 +204,7 @@ async def test_custom_store_that_omits_mcp_records_shows_no_name(engine: Any) ->
     name = f"mcp__{SECRET}"
     await _tool_run(state, "rc".ljust(26, "0"), name, connected=True)
     run_store = RunStore(state)
-    (completed,) = await run_store.get_events("rc".ljust(26, "0"), tenant_id="A")
+    (completed,) = await run_store.get_events("rc".ljust(26, "0"), tenant_id="A", limit=1000)
     view = await run_store.get_event_view("rc".ljust(26, "0"), completed, tenant_id="A")
     assert view.data["tool_name"] == "<unknown_tool>"
     events = await _follow(run_store, "rc".ljust(26, "0"))
@@ -214,7 +214,7 @@ async def test_custom_store_that_omits_mcp_records_shows_no_name(engine: Any) ->
 async def test_older_run_without_records_shows_no_name(store: Any, engine: Any) -> None:
     await _tool_run(store, "ro".ljust(26, "0"), SECRET, connected=False)
     run_store = RunStore.from_engine(engine)
-    (completed,) = await run_store.get_events("ro".ljust(26, "0"), tenant_id="A")
+    (completed,) = await run_store.get_events("ro".ljust(26, "0"), tenant_id="A", limit=1000)
     view = await run_store.get_event_view("ro".ljust(26, "0"), completed, tenant_id="A")
     assert view.data["tool_name"] == "<unknown_tool>"
 

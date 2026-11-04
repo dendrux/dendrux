@@ -201,7 +201,7 @@ Missing or invalid codes remain unset. Category and HTTP status remain independe
 | `run_cancelled` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | Child admission is refused under a cancelled parent. | Stop creating children for the parent. |
 | `run_failed` | ERROR | `code`, `error_type`, `kind`, `run_id`, `tenant_id` | A run task fails. | Inspect its safe result and trace. |
 | `skills_session_unknown` | WARNING | `code`, `count`, `kind`, `run_id`, `tenant_id` | A skill session references unknown state. | Restore the pinned skill definitions. |
-| `subtree_limit` | WARNING | `code`, `kind`, `limit`, `run_id`, `tenant_id` | A descendant traversal reaches its bound. | Inspect the subtree and raise its bound if appropriate. |
+| `subtree_limit` | WARNING | `code`, `kind`, `limit`, `run_id`, `tenant_id` | A descendant traversal or public subtree read reaches its node bound. | Inspect the subtree and raise its bound if appropriate. |
 | `wire_answer_omitted` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | A wire answer exceeds its encoding bound. | Read the bounded result through the store. |
 
 ## Store

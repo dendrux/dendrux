@@ -243,7 +243,7 @@ async def test_assistant_traces_carry_phase(engine, state_store):
         state_store=state_store,
     )
     result = await agent.run("hi")
-    traces = await RunStore.from_engine(engine).get_traces(result.run_id)
+    traces = await RunStore.from_engine(engine).get_traces(result.run_id, limit=1000)
     assistant = [t for t in traces if t.role == "assistant"]
     assert [t.phase for t in assistant] == [
         "commentary",
@@ -264,7 +264,7 @@ async def test_single_call_trace_is_final_answer(engine, state_store):
         state_store=state_store,
     )
     result = await agent.run("hi")
-    traces = await RunStore.from_engine(engine).get_traces(result.run_id)
+    traces = await RunStore.from_engine(engine).get_traces(result.run_id, limit=1000)
     assert [t.phase for t in traces if t.role == "assistant"] == ["final_answer"]
 
 

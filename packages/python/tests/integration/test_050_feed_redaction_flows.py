@@ -77,7 +77,7 @@ async def test_past_approval_args_hidden_after_rejection(store: Any, engine: Any
     assert SQL not in _text(events)
     views = [
         await run_store.get_event_view(done.run_id, e, tenant_id="A")
-        for e in await run_store.get_events(done.run_id, tenant_id="A")
+        for e in await run_store.get_events(done.run_id, tenant_id="A", limit=1000)
     ]
     assert SQL not in _text(views)
     assert SQL in _text(await _follow(run_store, done.run_id, include_payloads=True))

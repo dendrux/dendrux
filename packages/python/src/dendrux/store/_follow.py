@@ -45,6 +45,7 @@ from dendrux.db._live_updates import _error_kind
 from dendrux.errors import FollowCapacityError as FollowCapacityError
 from dendrux.errors import LiveUpdatesUnavailableError, RunNotFoundError
 from dendrux.errors import _capacity_error as _capacity_error
+from dendrux.runtime._bounds import MAX_PAGE
 from dendrux.runtime._pending import approval_calls as approval_calls
 from dendrux.runtime._pending import (
     check_read_bool,
@@ -921,6 +922,7 @@ class EventFeed:
         self.heartbeat_s = heartbeat_s
         self.buffer = buffer
         self.status_every = status_every
+        batch = min(batch, MAX_PAGE)
         self.batch = batch
         self.stop_timeout_s = stop_timeout_s
         self._params = _Params(poll_interval_s, poll_max_s, poll_healthy_s, status_every, batch)

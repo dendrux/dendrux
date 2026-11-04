@@ -628,7 +628,7 @@ SUBTREE_LIMIT = Code(
     logging.WARNING,
     "runtime",
     _BASE_FIELDS | frozenset(["limit"]),
-    "A descendant traversal reaches its bound.",
+    "A descendant traversal or public subtree read reaches its node bound.",
     "Inspect the subtree and raise its bound if appropriate.",
 )
 RUN_CANCEL_RECOVERED = Code(

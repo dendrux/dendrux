@@ -147,7 +147,7 @@ async def test_image_verdict_tool_name_checked_against_recorded_calls(stores: An
         "r1", event_type="image.state", data={"guardrail_verdicts": verdicts}
     )
     await state.finalize_run("r1", status="success")
-    _, raw = await store.get_events("r1", tenant_id="T")
+    _, raw = await store.get_events("r1", tenant_id="T", limit=1000)
     view = await store.get_event_view("r1", raw, tenant_id="T")
     names = [v["tool_name"] for v in view.data["guardrail_verdicts"]]
     assert names == ["screenshot", "<unknown_tool>"]

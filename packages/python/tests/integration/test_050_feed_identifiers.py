@@ -67,7 +67,7 @@ async def test_unknown_tool_name_is_a_placeholder(store: Any, engine: Any) -> No
     assert SECRET not in json.dumps([e.data for e in events])
     views = [
         await run_store.get_event_view(result.run_id, e, tenant_id="A")
-        for e in await run_store.get_events(result.run_id, tenant_id="A")
+        for e in await run_store.get_events(result.run_id, tenant_id="A", limit=1000)
     ]
     assert SECRET not in json.dumps([v.data for v in views])
     trusted = await _follow(run_store, result.run_id, include_payloads=True)
