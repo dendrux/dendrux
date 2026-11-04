@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Any, TypeVar
 from sqlalchemy.exc import DBAPIError, OperationalError, SQLAlchemyError, TimeoutError
 
 from dendrux import _codes
+from dendrux.db._live_updates import LiveUpdates
 from dendrux.errors import (
     PersistenceError,
     SchemaNotInitializedError,
@@ -82,7 +83,7 @@ def _task_values(scope: Any, default: Any) -> Any:
 
 async def _flush_live_updates(store: Any) -> None:
     updates = getattr(store, "live_updates", None)
-    if updates is None:
+    if not isinstance(updates, LiveUpdates):
         return
     deadlines = _task_values(_sweep_deadlines.get(), {})
     if id(store) in deadlines:
@@ -147,7 +148,7 @@ async def _live_updates_page(store: Any) -> AsyncIterator[None]:
 
 def _sweep_budget(store: Any, sweep: bool) -> Any:
     updates = getattr(store, "live_updates", None)
-    if not sweep or updates is None:
+    if not sweep or not isinstance(updates, LiveUpdates):
         return None
     deadlines = _task_values(_sweep_deadlines.get(), {})
     if id(store) in deadlines:

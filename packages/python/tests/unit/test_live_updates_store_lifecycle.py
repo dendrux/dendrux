@@ -136,3 +136,28 @@ async def test_disabled_live_updates_is_off_on_every_store_path(dialect, entry, 
         await store.close()
     finally:
         await engine.dispose()
+
+
+@pytest.mark.parametrize("attribute", [None, True, False, object(), "custom"])
+async def test_runtime_sweep_ignores_non_bus_live_updates(attribute):
+    from datetime import timedelta
+    from types import SimpleNamespace
+
+    from dendrux import sweep
+
+    if attribute == "custom":
+        attribute = SimpleNamespace(flush_deadline_s=1.0)
+    store = SimpleNamespace(
+        live_updates=attribute,
+        sweep_stale_runs=AsyncMock(return_value=[]),
+        sweep_abandoned_runs=AsyncMock(return_value=[]),
+    )
+    result = await sweep(
+        state_store=store,
+        stale_running=timedelta(hours=1),
+        abandoned_waiting=timedelta(hours=1),
+        on_stale="error",
+    )
+    assert result.stale_running == result.abandoned_waiting == []
+    store.sweep_stale_runs.assert_awaited_once()
+    store.sweep_abandoned_runs.assert_awaited_once()
