@@ -2,11 +2,10 @@
 
 ## 0.6.0
 
-- Format-2 runs check that this process still owns the run immediately before each
+- Runs on both storage formats check that this process still owns the run immediately before each
   provider call (one primary-key read). A stale owner stops with the existing
   `RunFencedError` outcome instead of making a model call whose result would be
   discarded. A database read failure at that point now fails the run before the call.
-  Format-1 runs are unchanged.
 - Default local database resolution now uses `./dendrux.db` for runtime helpers,
   every CLI command and migrations when `DENDRUX_DATABASE_URL` is unset.
   If only `~/.dendrux/dendrux.db` exists, log `local_database_default_changed`;
@@ -198,7 +197,17 @@
   guides; expand scaling, observability and tracing guidance. See `docs/upgrading-to-0.6.0.mdx`
   for the rollout.
 
+### Deprecated
+
+- ConsoleNotifier warns when unused show_llm_text or max_text_length options are set to non-default values.
+
 ### Fixed
+
+- SingleCall stops before retrying a provider call when an image guardrail blocks the retry.
+
+- Client tool calls retain their per-run call limits across pauses on both storage formats.
+
+- Rejected tool calls no longer use up a tool's per-run call limit after a resume; rejected tool messages now carry `dendrux.not_executed` in saved metadata visible in traces.
 
 - Denied tool calls no longer use up a tool's per-run call limit after a resume.
 - Resumed loops start their tool call counts from the saved execution counts when available, falling back to history.

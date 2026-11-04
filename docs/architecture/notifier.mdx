@@ -190,6 +190,8 @@ The same logic applies to runs (`on_run_started` / `on_run_finished` / `on_run_f
 
 Dendrux ships two notifiers in `dendrux.notifiers`. Both subclass `BaseNotifier`.
 
+`ConsoleNotifier` accepts `show_llm_text` and `max_text_length`, but they have no effect; non-default values emit a `DeprecationWarning`.
+
 `ConsoleNotifier` uses `rich` to render the run as a terminal panel with per-iteration steps:
 
 ```text

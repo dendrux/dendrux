@@ -398,3 +398,50 @@ async def test_only_committed_owner_fences_refresh_local_lease(
         assert (ctx._lease_at[0] > 0) == (fmt == 2 and same_run and same_store and not failed)
     finally:
         reset_delegation_context(token)
+
+
+@pytest.mark.parametrize("storage_format", [1, 2])
+@pytest.mark.parametrize("single", [False, True])
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_one_call_total_statement_budget(store, engine, storage_format, single, streaming):
+    from dendrux import Agent, SingleCall
+    from dendrux.loops.react import ReActLoop
+    from dendrux.types import LLMResponse, RunStatus
+    from tests._fixtures.storage import pin_storage_format
+    from tests._helpers.scripted_provider import ScriptedLLM
+
+    await pin_storage_format(engine, storage_format)
+
+    async def run():
+        async with Agent(
+            prompt="p",
+            provider=ScriptedLLM([LLMResponse(text="done")]),
+            loop=SingleCall() if single else ReActLoop(),
+            state_store=store,
+            strict_tenancy=False,
+        ) as agent:
+            if streaming:
+                async with agent.stream("go") as stream:
+                    async for _ in stream:
+                        pass
+                result = stream.result
+            else:
+                result = await agent.run("go")
+            assert result.status == RunStatus.SUCCESS
+
+    await run()  # Warm the format/dialect caches before counting creation through finalization.
+    statements = []
+
+    def capture(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    event.listen(engine.sync_engine, "before_cursor_execute", capture)
+    try:
+        await run()
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", capture)
+    # Format 1: 28/27 -> 29/28, exactly +1 indexed ownership read per provider call.
+    # Format 2 keeps its existing ownership read and 24/23 statement totals.
+    assert len(statements) == (
+        (28 if single else 29) if storage_format == 1 else (23 if single else 24)
+    )

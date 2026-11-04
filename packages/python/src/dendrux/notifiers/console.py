@@ -12,6 +12,7 @@ Usage:
 from __future__ import annotations
 
 import time
+import warnings
 from typing import TYPE_CHECKING, Any
 
 from rich.console import Console
@@ -45,12 +46,22 @@ if TYPE_CHECKING:
 _console = Console()
 
 
+def _warn_unused_option(name: str, value: object, default: object) -> None:
+    if value != default:
+        warnings.warn(
+            f"ConsoleNotifier.{name} has no effect and will be removed or implemented "
+            "in a later release",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+
+
 class ConsoleNotifier(BaseNotifier):
     """Rich terminal notifier for agent runs.
 
     Args:
-        show_llm_text: Show the LLM's final text content (default False).
-        max_text_length: Truncate displayed text to this length (default 120).
+        show_llm_text: Deprecated; has no effect (default False).
+        max_text_length: Deprecated; has no effect (default 120).
         show_params: Show tool call parameters (default True).
     """
 
@@ -61,6 +72,8 @@ class ConsoleNotifier(BaseNotifier):
         max_text_length: int = DEFAULT_MAX_TEXT_LENGTH,
         show_params: bool = True,
     ) -> None:
+        _warn_unused_option("show_llm_text", show_llm_text, False)
+        _warn_unused_option("max_text_length", max_text_length, DEFAULT_MAX_TEXT_LENGTH)
         self._show_llm_text = show_llm_text
         self._max_text_length = max_text_length
         self._show_params = show_params

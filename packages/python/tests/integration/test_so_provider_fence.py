@@ -21,12 +21,13 @@ class NativeStreamProvider(ScriptedLLM):
         yield StreamEvent(type=StreamEventType.DONE, raw=response)
 
 
+@pytest.mark.parametrize("storage_format", [1, 2])
 @pytest.mark.parametrize("loop", [ReActLoop, SingleCall])
 @pytest.mark.parametrize("stream", [False, True])
 async def test_dispatch_checks_unchanged_checkpoint(
-    store, engine, monkeypatch, caplog, loop, stream
+    store, engine, monkeypatch, caplog, loop, stream, storage_format
 ):
-    await pin_storage_format(engine, 2)
+    await pin_storage_format(engine, storage_format)
     provider = NativeStreamProvider([LLMResponse(text="done")])
     agent = Agent(
         prompt="test", provider=provider, state_store=store, loop=loop(), strict_tenancy=False
@@ -70,9 +71,10 @@ async def test_dispatch_checks_unchanged_checkpoint(
         await agent.close()
 
 
+@pytest.mark.parametrize("storage_format", [1, 2])
 @pytest.mark.parametrize("stream", [False, True])
-async def test_each_model_step_checks_ownership(store, engine, monkeypatch, stream):
-    await pin_storage_format(engine, 2)
+async def test_each_model_step_checks_ownership(store, engine, monkeypatch, stream, storage_format):
+    await pin_storage_format(engine, storage_format)
 
     @tool()
     async def step() -> str:

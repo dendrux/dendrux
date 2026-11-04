@@ -7,6 +7,7 @@ entry-path call (status, answer, ``error_info``, pause id presence, pending shap
 ``to_dict()`` wire shape), the stream event sequences, and per run the persisted event-type
 sequence, the trace roles and the tool-call rows. Tests never regenerate them; see
 ``regen.py`` (refused unless ``src/dendrux`` equals tag ``v0.5.0``).
+``expected_060`` adds only the approved rejection markers to recorded expectations.
 
 SQLite always; Postgres when ``DENDRUX_TEST_PG_URL`` is set::
 
@@ -19,6 +20,7 @@ from __future__ import annotations
 import pytest
 
 from dendrux.runtime.stores._factory import store_for_engine
+from tests.conformance import expected_060
 from tests.conformance import harness as h
 from tests.conformance.scenarios import CELLS
 
@@ -38,11 +40,11 @@ def test_cell_ids_are_unique_and_named_scenario_flow() -> None:
 @pytest.mark.parametrize("cell", CELLS, ids=CELL_IDS)
 async def test_cell_matches_golden_and_corpus(cell, backend_engine) -> None:
     recording = await h.run_cell(cell, backend_engine, store_for_engine(backend_engine))
-    golden = h.read_json(h.golden_path(cell.id))
+    golden = expected_060.golden(cell.id)
     actual = h.golden_view(recording)
     assert h.diff(golden, actual) is None, f"{cell.id} golden: {h.diff(golden, actual)}"
     assert h.o.dumps_canonical(golden) == h.o.dumps_canonical(actual)
     # the recorded corpus (provider messages and persisted rows) is reproduced as well
-    recorded = h.normalised_corpus(h.read_json(h.corpus_path(cell.id)))
+    recorded = h.normalised_corpus(expected_060.corpus(cell.id))
     fresh = h.normalised_corpus(h.corpus_view(recording))
     assert h.diff(recorded, fresh) is None, f"{cell.id} corpus: {h.diff(recorded, fresh)}"

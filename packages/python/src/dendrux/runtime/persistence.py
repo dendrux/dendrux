@@ -58,6 +58,7 @@ from dendrux.runtime._blob_catalog import edges_for_parts, scrub_inline_images
 from dendrux.runtime._cancel_guard import capture
 from dendrux.runtime._capabilities import capabilities
 from dendrux.runtime.durability import retry_critical, retry_transient_db
+from dendrux.runtime.state import read_run_control
 from dendrux.types import (
     ImagePart,
     ImageRef,
@@ -663,6 +664,33 @@ class PersistenceRecorder(BaseRecorder):
         """Load trusted execution hints before a direct approval-resume dispatch."""
         self._tool_idempotent = {d.name: d.idempotent for d in definitions}
 
+    def _submitted_client_counts(
+        self, pending: dict[str, Any], removed: list[str]
+    ) -> dict[str, int]:
+        counts = dict(self._loop_state.get("tool_counts", {}))
+        for call_id in set(removed):
+            call = pending.get(call_id)
+            if call is not None and call["phase"] == "client":
+                name = call["tool"]
+                counts[name] = counts.get(name, 0) + 1
+        return counts
+
+    def _submission_traces(
+        self, messages: list[Message], descriptor: dict[str, Any], pending: dict[str, Any]
+    ) -> tuple[list[Any], list[str]]:
+        traces = []
+        removed = []
+        for i, message in enumerate(messages):
+            call = pending.get(message.call_id or "")
+            order = call["order_index"] if call else descriptor["reserved_order_index"] + i
+            traces.append(message_trace(message, order, tenant_scope=self._tenant_scope))
+            self._order_index = max(self._order_index, order + 1)
+            if message.call_id is not None:
+                removed.append(message.call_id)
+            else:
+                self._consumed_user_count += 1
+        return traces, removed
+
     async def consume_resume(self, messages: list[Message]) -> None:
         """Commit submitted observations or an approval decision exactly once."""
         from dendrux.errors import PersistenceError
@@ -695,22 +723,16 @@ class PersistenceRecorder(BaseRecorder):
                     if decisions.get(call_id, payload.get("approved")) is True
                     else "rejected"
                 )
-        traces = []
-        removed = []
-        for i, message in enumerate(messages):
-            call = pending.get(message.call_id or "")
-            order = call["order_index"] if call else descriptor["reserved_order_index"] + i
-            traces.append(message_trace(message, order, tenant_scope=self._tenant_scope))
-            self._order_index = max(self._order_index, order + 1)
-            if message.call_id is not None:
-                removed.append(message.call_id)
-            else:
-                self._consumed_user_count += 1
+        traces, removed = self._submission_traces(messages, descriptor, pending)
         patch = LoopStatePatch(
             remove_pending=tuple(removed),
             set_call_phase=phases,
             set_phase="dispatch" if len(pending) > len(removed) else "model_next",
-            set_fields={"trace_order_offset": self._order_index, **self._pii_patch()},
+            set_fields={
+                "trace_order_offset": self._order_index,
+                "tool_counts": self._submitted_client_counts(pending, removed),
+                **self._pii_patch(),
+            },
         )
 
         async def consume() -> None:
@@ -796,13 +818,12 @@ class PersistenceRecorder(BaseRecorder):
         semantic_messages: list[Message] | None = None,
         semantic_tools: list[ToolDef] | None = None,
     ) -> None:
-        if self._format2:
-            if self._loop_source is not None:
-                await self._snapshot(iteration - 1)
-                if self._loop_state != self._durable_state:
-                    await self._checkpoint()
-            # Ownership can still change between this read and the network send.
-            await self._store_calls.get_run_control(run_id)
+        if self._format2 and self._loop_source is not None:
+            await self._snapshot(iteration - 1)
+            if self._loop_state != self._durable_state:
+                await self._checkpoint()
+        # Ownership can still change between this read and the network send.
+        await read_run_control(self._store_calls, run_id)
         await self._cancel_guard.check(run_id)
 
     async def checkpoint_outcome(self, result: Any, provider_kwargs: Any) -> None:

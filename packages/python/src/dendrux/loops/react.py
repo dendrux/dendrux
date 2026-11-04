@@ -879,11 +879,12 @@ class _ToolBatch:
     async def reject(self, tc: ToolCall, result: ToolResult) -> None:
         """A call answered before execution: tool row, then message."""
         await self.tool_row(tc, result)
-        await self.append_message(tc, result)
+        await _append_denial_message(tc, result, self)
 
     async def reject_listed_first(self, tc: ToolCall, result: ToolResult) -> None:
         """Skill preflight order: the message joins history before the tool row."""
         msg = _format_result(self.strategy, result)
+        msg.meta[NOT_EXECUTED_META_KEY] = True
         self.history.append(msg)
         await self.tool_row(tc, result)
         await self._commit(tc, result, msg)

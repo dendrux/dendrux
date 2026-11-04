@@ -488,6 +488,9 @@ class TestSingleCallRunnerIntegration:
             async def touch_progress(self, *args, **kwargs):
                 pass
 
+            async def is_cancel_requested(self, run_id):
+                return False
+
         store = RecordingStore()
         llm = MockLLM([_response("neutral")])
         agent = Agent(
