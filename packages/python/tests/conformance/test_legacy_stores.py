@@ -7,6 +7,7 @@ through optional methods; those cells have a pinned ``golden/legacy`` file (appr
 the stored arguments cannot be read, so ``args_hidden`` is true and ``params`` is None).
 The run-meta ``dendrux.prefix`` entry is also absent on such stores (it is written through the
 optional ``update_run_meta``); that is checked below rather than pinned per cell.
+``expected_060`` also applies the approved rejection-marker delta to recorded expectations.
 
 Cells tagged ``blob_catalog`` (images) need the built-in store's blob catalog and are skipped.
 Phase 1 must keep these results: a store with no declaration is a legacy store.
@@ -19,6 +20,7 @@ import pytest
 from dendrux.runtime.stores._factory import store_for_engine
 from tests._fixtures import stores
 from tests._fixtures.stores import KwargsLegacyStore, LegacyInMemoryStore
+from tests.conformance import expected_060
 from tests.conformance import harness as h
 from tests.conformance.scenarios import CELLS
 
@@ -29,8 +31,7 @@ STORES = {"a_legacy_in_memory": LegacyInMemoryStore, "d_kwargs_legacy": KwargsLe
 
 
 def expected_golden(cell_id: str):
-    legacy = h.golden_path(cell_id, "legacy")
-    return h.read_json(legacy if legacy.exists() else h.golden_path(cell_id))
+    return expected_060.golden(cell_id, legacy=True)
 
 
 @pytest.mark.parametrize("fixture", sorted(STORES))

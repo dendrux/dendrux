@@ -1,0 +1,13 @@
+[
+  "BEGIN",
+  "SELECT dendrux_settings.value FROM dendrux_settings WHERE dendrux_settings.\"key\" = ?",
+  "ROLLBACK",
+  "BEGIN",
+  "SELECT dendrux_settings.value FROM dendrux_settings WHERE dendrux_settings.\"key\" = ?",
+  "INSERT INTO agent_runs (id, tenant_id, agent_name, status, input_data, iteration_count, model, strategy, parent_run_id, delegation_level, retry_of_run_id, total_input_tokens, total_output_tokens, total_cost_usd, total_cache_read_tokens, total_cache_creation_tokens, total_reasoning_tokens, meta, pii_mapping, error, last_progress_at, failure_reason, idempotency_key, idempotency_fingerprint, cancel_requested, pause_requested, claim_epoch, storage_format, reclaim_attempts, reclaim_limit, lease_expired_at, last_reclaimed_at, loop_state, trace_link, created_at, updated_at, status_changed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+  "COMMIT",
+  "BEGIN",
+  "UPDATE agent_runs SET updated_at=?, last_progress_at=CASE WHEN (agent_runs.storage_format = ?) THEN ? ELSE agent_runs.last_progress_at END WHERE agent_runs.id = ? AND agent_runs.claim_epoch = ?",
+  "INSERT INTO run_events (id, agent_run_id, event_type, sequence_index, iteration_index, correlation_id, data, created_at, content_digest) SELECT ? AS anon_1, ? AS anon_2, ? AS anon_3, (SELECT coalesce(max(run_events.sequence_index), ?) + ? AS anon_5 FROM run_events WHERE run_events.agent_run_id = ?) AS anon_4, ? AS anon_6, ? AS anon_7, ? AS anon_8, ? AS anon_9, ? AS anon_10 ON CONFLICT (id) DO NOTHING RETURNING sequence_index",
+  "COMMIT"
+]

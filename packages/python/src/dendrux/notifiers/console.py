@@ -12,6 +12,7 @@ Usage:
 from __future__ import annotations
 
 import time
+import warnings
 from typing import TYPE_CHECKING, Any
 
 from rich.console import Console
@@ -45,12 +46,22 @@ if TYPE_CHECKING:
 _console = Console()
 
 
+def _warn_unused_option(name: str, value: object, default: object) -> None:
+    if value != default:
+        warnings.warn(
+            f"ConsoleNotifier.{name} has no effect and will be removed or implemented "
+            "in a later release",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+
+
 class ConsoleNotifier(BaseNotifier):
     """Rich terminal notifier for agent runs.
 
     Args:
-        show_llm_text: Show the LLM's final text content (default False).
-        max_text_length: Truncate displayed text to this length (default 120).
+        show_llm_text: Deprecated; has no effect (default False).
+        max_text_length: Deprecated; has no effect (default 120).
         show_params: Show tool call parameters (default True).
     """
 
@@ -61,15 +72,15 @@ class ConsoleNotifier(BaseNotifier):
         max_text_length: int = DEFAULT_MAX_TEXT_LENGTH,
         show_params: bool = True,
     ) -> None:
+        _warn_unused_option("show_llm_text", show_llm_text, False)
+        _warn_unused_option("max_text_length", max_text_length, DEFAULT_MAX_TEXT_LENGTH)
         self._show_llm_text = show_llm_text
         self._max_text_length = max_text_length
         self._show_params = show_params
         self._iteration = 0
         self._tool_starts: dict[str, float] = {}
         self._started = False
-        self._total_tokens = 0
         self._total_tools = 0
-        self._total_tool_time = 0.0
         self._total_cache_read = 0
         self._total_cache_creation = 0
         self._run_start = 0.0
@@ -199,7 +210,6 @@ class ConsoleNotifier(BaseNotifier):
     ) -> None:
         """Called after an LLM call completes."""
         tokens = response.usage.total_tokens if response.usage else 0
-        self._total_tokens += tokens
         duration_str = f" in {duration_ms / 1000:.1f}s" if duration_ms else ""
 
         cache_str = ""
@@ -236,7 +246,6 @@ class ConsoleNotifier(BaseNotifier):
             elapsed = tool_result.duration_ms / 1000
 
         self._total_tools += 1
-        self._total_tool_time += elapsed
         duration_str = f" [dim]{elapsed:.1f}s[/dim]" if elapsed else ""
 
         if tool_result.success:

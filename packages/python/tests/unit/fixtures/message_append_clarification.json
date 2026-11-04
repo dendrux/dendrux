@@ -1,0 +1,10 @@
+[
+  "BEGIN",
+  "UPDATE agent_runs SET updated_at=?, last_progress_at=CASE WHEN (agent_runs.storage_format = ?) THEN ? ELSE agent_runs.last_progress_at END WHERE agent_runs.id = ? AND agent_runs.claim_epoch = ?",
+  "INSERT INTO react_traces (id, agent_run_id, role, content, trace_kind, content_digest, order_index, meta, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO NOTHING RETURNING id",
+  "COMMIT",
+  "BEGIN",
+  "UPDATE agent_runs SET updated_at=?, loop_state=?, last_progress_at=CASE WHEN (agent_runs.storage_format = ?) THEN ? ELSE agent_runs.last_progress_at END WHERE agent_runs.id = ? AND agent_runs.claim_epoch = ?",
+  "INSERT INTO react_traces (id, agent_run_id, role, content, trace_kind, content_digest, order_index, meta, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO NOTHING RETURNING id",
+  "COMMIT"
+]

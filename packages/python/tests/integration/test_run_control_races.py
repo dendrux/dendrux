@@ -408,7 +408,52 @@ class Pre03Store:
         raise AttributeError(name)
 
 
+class BoolClaimPre03Store(Pre03Store):
+    """The pre-0.3 protocol with pre-0.5 boolean claim results."""
+
+    def __init__(self, inner: SQLStateStore) -> None:
+        super().__init__(inner)
+        self.claim_results: list[bool] = []
+
+    def __getattr__(self, name: str) -> Any:
+        method = super().__getattr__(name)
+        if name in {"claim_paused_run", "submit_and_claim"}:
+
+            async def claim(*args: Any, **kwargs: Any) -> bool:
+                result = bool(await method(*args, **kwargs))
+                self.claim_results.append(result)
+                return result
+
+            return claim
+        return method
+
+
 class TestPre03Store:
+    @pytest.mark.parametrize(
+        "path",
+        ["resume", "resume_stream", "tool_results", "input", "approve", "reject", "decisions"],
+    )
+    async def test_bool_claim_continuations_keep_legacy_control_fallback(
+        self, store, engine, path
+    ) -> None:
+        from tests._fixtures.storage import pin_storage_format
+        from tests._helpers.runtime_paths import path_case
+
+        await pin_storage_format(engine, 1)
+        legacy = BoolClaimPre03Store(store)
+        assert not hasattr(legacy, "get_run_control")
+        provider = ScriptedLLM([LLMResponse(text="continued")])
+        case = await path_case(legacy, engine, path, provider)
+        try:
+            result = await case.invoke()
+            assert legacy.claim_results == [True]
+            assert result.status == RunStatus.SUCCESS, (result.status, result.error)
+            assert result.answer == "continued"
+            assert provider.calls == 1
+            assert (await store.get_run(case.run_id)).storage_format == 1
+        finally:
+            await case.agent.close()
+
     async def test_existing_flows_work(self, store) -> None:
         # This fault injection / pause blob exercises the format-1 write path.
         from tests._fixtures.storage import pin_storage_format

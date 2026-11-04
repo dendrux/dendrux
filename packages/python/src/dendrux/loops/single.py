@@ -14,45 +14,39 @@ Constraints:
 from __future__ import annotations
 
 import time
+from contextlib import aclosing
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from dendrux._lifecycle import (
     FailureReason,
     GovernanceEventType,
 )
 from dendrux.guardrails._engine import GuardrailEngine
-from dendrux.llm._calls import complete_call, stream_call
-from dendrux.llm._evidence import persistable_response
-from dendrux.llm._retry_telemetry import telemetry_context, telemetry_stream
+from dendrux.llm._calls import complete_call
+from dendrux.llm._retry_telemetry import telemetry_context
 from dendrux.loops._budget import BudgetTracker
 from dendrux.loops._helpers import (
-    StreamInterruptedError,
     build_cache_key_prefix,
     final_stop_reason,
+    governance_sinks,
     guardrail_meta,
-    interruptible,
     lease_scope,
-    leased_stream,
     notify_governance,
     notify_llm,
-    notify_llm_failed,
-    notify_llm_started,
     notify_message,
     price_response,
     record_governance,
     record_llm,
-    record_llm_failed,
-    record_llm_started,
     record_message,
 )
-from dendrux.loops._images import ImageCallSite, control_stop, release_wire
+from dendrux.loops._images import ImageCallSite, release_wire
+from dendrux.loops._llm_call import EventRelay, ProviderCallSite, StreamCall, stream_call_events
 from dendrux.loops.base import Loop
 from dendrux.loops.react import (
+    ReActLoop,
     _bind_checkpoint,
     _blocked_data,
-    _drop_frame_locals,
-    _image_block_data,
     _image_policy,
     _incoming_location,
     _interrupted_result,
@@ -83,10 +77,11 @@ if TYPE_CHECKING:
     from dendrux.agent import Agent
     from dendrux.llm.base import LLMProvider
     from dendrux.loops.base import LoopNotifier, LoopRecorder
+    from dendrux.media._prepared import PreparedRequest
     from dendrux.media._runtime import ImageRuntime
     from dendrux.runtime.state import StateStore
     from dendrux.strategies.base import Strategy
-    from dendrux.types import AgentStep, Budget
+    from dendrux.types import AgentStep, Budget, StreamEvent
 
 
 async def _single_call_budget(
@@ -232,6 +227,387 @@ def _single_checkpoint(
     return state, budget
 
 
+def _refuse_resume(
+    initial_steps: list[AgentStep] | None,
+    iteration_offset: int,
+    initial_usage: UsageStats | None,
+) -> None:
+    if initial_steps or iteration_offset != 0 or initial_usage is not None:
+        raise RuntimeError(
+            "SingleCall does not support resume. It never pauses "
+            "(no tools, no waiting states), so receiving resume parameters "
+            "(initial_steps, iteration_offset, initial_usage) "
+            "indicates a bug in the caller."
+        )
+
+
+class _SinglePrelude(NamedTuple):
+    run_id: str
+    pkw: dict[str, Any]
+    cache_key_prefix: str | None
+    warnings: list[str]
+    history: list[Message]
+    messages: list[Message]
+    images: ImageCallSite
+    calls: ProviderCallSite
+
+
+async def _seed_history(
+    initial_history: list[Message] | None,
+    user_input: str,
+    recorder: LoopRecorder | None,
+    notifier: LoopNotifier | None,
+    run_id: str,
+    warnings: list[str],
+) -> list[Message]:
+    if initial_history is not None:
+        # Seeded chat history (or resume) — caller already persisted what's
+        # supposed to land in react_traces. Use as-is, do not re-record.
+        return list(initial_history)
+    from dendrux.context_blocks import wire_user_input
+
+    user_msg = Message(role=Role.USER, content=wire_user_input(user_input, [], None))
+    history = [user_msg]
+    await record_message(recorder, run_id, user_msg, 0)
+    await notify_message(notifier, run_id, user_msg, 0, warnings)
+    return history
+
+
+async def _single_prelude(
+    loop: Loop,
+    agent: Agent,
+    provider: LLMProvider,
+    strategy: Strategy,
+    user_input: str,
+    *,
+    run_id: str | None,
+    recorder: LoopRecorder | None,
+    notifier: LoopNotifier | None,
+    initial_history: list[Message] | None,
+    provider_kwargs: dict[str, Any] | None,
+    image_runtime: ImageRuntime | None,
+    image_view_state: ImageViewState | None,
+) -> _SinglePrelude:
+    """Shared start of ``run`` and ``run_stream``: ids, history, the request, call sites."""
+    resolved_run_id = run_id or generate_ulid()
+    pkw = provider_kwargs or {}
+    cache_key_prefix = build_cache_key_prefix(agent)
+    warnings: list[str] = []
+    history = await _seed_history(
+        initial_history, user_input, recorder, notifier, resolved_run_id, warnings
+    )
+    messages, _tools = strategy.build_messages(
+        system_prompt=agent.get_system_prompt(loop=loop),
+        history=history,
+        tool_defs=[],
+    )
+    images = _image_site(
+        agent,
+        provider,
+        image_runtime,
+        image_view_state,
+        pkw,
+        recorder,
+        notifier,
+        resolved_run_id,
+        warnings,
+    )
+    calls = ProviderCallSite(
+        images,
+        agent=agent,
+        provider=provider,
+        pkw=pkw,
+        recorder=recorder,
+        notifier=notifier,
+        run_id=resolved_run_id,
+        warnings=warnings,
+    )
+    return _SinglePrelude(
+        resolved_run_id, pkw, cache_key_prefix, warnings, history, messages, images, calls
+    )
+
+
+class _Attempt(NamedTuple):
+    """One batch provider call: the answer, or the failure an image retry may answer."""
+
+    prepared: PreparedRequest
+    response: LLMResponse | None
+    output: Any
+    t0: float
+    failure: Exception | None
+
+
+async def _single_complete(
+    pre: _SinglePrelude, prepared: PreparedRequest, output_type: type[BaseModel] | None
+) -> tuple[LLMResponse, Any]:
+    """The provider call itself (structured or plain), under telemetry and a lease."""
+    calls = pre.calls
+    validated_output: Any = None
+    with telemetry_context(
+        run_id=pre.run_id,
+        iteration=1,
+        sinks=governance_sinks(calls.recorder, calls.notifier, pre.run_id),
+    ):
+        async with lease_scope(calls.recorder):
+            if output_type is not None:
+                from dendrux.llm.structured import structured_complete
+
+                response, validated_output = await structured_complete(
+                    calls.provider,
+                    prepared.wire,
+                    output_type,
+                    run_id=pre.run_id,
+                    cache_key_prefix=pre.cache_key_prefix,
+                    **pre.pkw,
+                )
+            else:
+                response = await complete_call(
+                    calls.provider,
+                    prepared.wire,
+                    tools=None,
+                    run_id=pre.run_id,
+                    cache_key_prefix=pre.cache_key_prefix,
+                    **pre.pkw,
+                )
+
+        if response.tool_calls:
+            raise RuntimeError(
+                f"SingleCall received unexpected tool_calls from provider "
+                f"({len(response.tool_calls)} calls). SingleCall agents must "
+                f"have zero tools — the provider should not produce tool calls."
+            )
+    return response, validated_output
+
+
+async def _single_attempt(
+    pre: _SinglePrelude, prepared: PreparedRequest, output_type: type[BaseModel] | None
+) -> _Attempt:
+    """``llm.started``, one provider call, and the failure record when it raises.
+
+    A rejected structured output and a failure with no image to retry
+    propagate; any other failure comes back with its wire bytes dropped.
+    """
+    calls = pre.calls
+    await calls.started(prepared, None, 1)
+    t0 = time.monotonic()
+    try:
+        response, validated_output = await _single_complete(pre, prepared, output_type)
+    except StructuredOutputValidationError as _invalid:
+        await _record_rejected_call(
+            _invalid,
+            agent=calls.agent,
+            provider=calls.provider,
+            run_id=pre.run_id,
+            recorder=calls.recorder,
+            notifier=calls.notifier,
+            warnings=pre.warnings,
+            semantic_messages=prepared.semantic,
+            duration_ms=int((time.monotonic() - t0) * 1000),
+            model=pre.pkw.get("model"),
+        )
+        raise
+    except Exception as _llm_exc:
+        await calls.record_failure(_llm_exc, t0, 1)
+        if not prepared.slots:
+            raise
+        prepared = release_wire(prepared)
+        return _Attempt(prepared, None, None, t0, _llm_exc)
+    return _Attempt(prepared, response, validated_output, t0, None)
+
+
+async def _single_batch_call(
+    pre: _SinglePrelude,
+    output_type: type[BaseModel] | None,
+    control_reader: Callable[[], Awaitable[Any]],
+    g_engine: GuardrailEngine | None,
+) -> RunResult | _Attempt:
+    """The batch provider call over its image request view, retried once on an image failure.
+
+    Returns the answered attempt, or the run's end: an image guardrail block,
+    or a cancel seen before the retry.
+    """
+    images, calls = pre.images, pre.calls
+    guardrails = calls.agent.guardrails or ()
+    prepared = await images.prepare(pre.messages, iteration=1, guardrails=guardrails)
+    retried = False
+    while True:
+        if prepared.block_error is not None:
+            return await ReActLoop._image_blocked(
+                prepared.block_error,
+                images=images,
+                run_id=pre.run_id,
+                iteration=1,
+                steps=[],
+                usage=UsageStats(),
+                meta=guardrail_meta(g_engine, pre.warnings),
+            )
+        attempt = await _single_attempt(pre, prepared, output_type)
+        if attempt.failure is None:
+            return attempt
+        prepared = attempt.prepared
+        stop, error, decision = await calls.decide(
+            attempt.failure,
+            prepared,
+            1,
+            retried=retried,
+            visible_deltas=0,
+            control_reader=control_reader,
+        )
+        del attempt
+        if stop is not None:
+            # SingleCall honours cancel only: nothing ran, so iteration 0.
+            return RunResult(
+                run_id=pre.run_id,
+                status=RunStatus.CANCELLED,
+                steps=[],
+                iteration_count=0,
+                usage=UsageStats(),
+                meta=guardrail_meta(g_engine, pre.warnings),
+            )
+        if error is not None:
+            raise error
+        retried = True
+        prepared = await images.prepare(
+            pre.messages,
+            iteration=1,
+            guardrails=guardrails,
+            force_tombstones=decision.tombstones,
+        )
+
+
+async def _scan_single_incoming(
+    g_engine: GuardrailEngine | None,
+    messages: list[Message],
+    *,
+    recorder: LoopRecorder | None,
+    notifier: LoopNotifier | None,
+    run_id: str,
+    warnings: list[str],
+) -> tuple[list[Any], RunResult | None]:
+    """Incoming guardrail scan of every message, redacting ``messages`` in place.
+
+    Returns the findings and, when a guardrail blocks, the run's ERROR result.
+    """
+    all_in_findings: list[Any] = []
+    if g_engine is None:
+        return all_in_findings, None
+    _in_was_redacted = False
+    for msg_idx, msg in enumerate(messages):
+        if not msg.content:
+            continue
+        cleaned_msg, findings, block_err = await g_engine.scan_incoming_message(msg, index=msg_idx)
+        if findings:
+            all_in_findings.extend(findings)
+        if block_err is not None:
+            await _incoming_blocked(
+                block_err,
+                findings,
+                _incoming_location(msg, msg_idx),
+                recorder,
+                notifier,
+                run_id,
+                warnings,
+            )
+            return all_in_findings, RunResult(
+                run_id=run_id,
+                status=RunStatus.ERROR,
+                error=block_err,
+                steps=[],
+                iteration_count=1,
+                usage=UsageStats(),
+                meta={
+                    **guardrail_meta(g_engine, warnings),
+                    "failure_reason": FailureReason.GUARDRAIL_BLOCKED.value,
+                },
+            )
+        if cleaned_msg is not msg:
+            _in_was_redacted = True
+            # The engine's replace() preserves the origin envelope
+            # (kind/placement/source) through redaction.
+            messages[msg_idx] = cleaned_msg
+    await _incoming_summary(all_in_findings, _in_was_redacted, recorder, notifier, run_id, warnings)
+    return all_in_findings, None
+
+
+async def _incoming_blocked(
+    block_err: str,
+    findings: list[Any],
+    location: str,
+    recorder: LoopRecorder | None,
+    notifier: LoopNotifier | None,
+    run_id: str,
+    warnings: list[str],
+) -> None:
+    await record_governance(
+        recorder,
+        run_id,
+        GovernanceEventType.GUARDRAIL_BLOCKED.value,
+        1,
+        _blocked_data("incoming", block_err, findings, location),
+    )
+    await notify_governance(
+        notifier,
+        run_id,
+        GovernanceEventType.GUARDRAIL_BLOCKED.value,
+        1,
+        _blocked_data("incoming", block_err, findings, location),
+        warnings=warnings,
+    )
+
+
+async def _incoming_summary(
+    all_in_findings: list[Any],
+    was_redacted: bool,
+    recorder: LoopRecorder | None,
+    notifier: LoopNotifier | None,
+    run_id: str,
+    warnings: list[str],
+) -> None:
+    """``guardrail.detected`` then ``guardrail.redacted`` for the incoming scan."""
+    if all_in_findings:
+        _in_entities = list({f.entity_type for f in all_in_findings})
+        await record_governance(
+            recorder,
+            run_id,
+            GovernanceEventType.GUARDRAIL_DETECTED.value,
+            1,
+            {
+                "direction": "incoming",
+                "findings_count": len(all_in_findings),
+                "entities": _in_entities,
+            },
+        )
+        await notify_governance(
+            notifier,
+            run_id,
+            GovernanceEventType.GUARDRAIL_DETECTED.value,
+            1,
+            {
+                "direction": "incoming",
+                "findings_count": len(all_in_findings),
+                "entities": _in_entities,
+            },
+            warnings=warnings,
+        )
+    if was_redacted:
+        _red_entities = list({f.entity_type for f in all_in_findings})
+        await record_governance(
+            recorder,
+            run_id,
+            GovernanceEventType.GUARDRAIL_REDACTED.value,
+            1,
+            {"direction": "incoming", "entities": _red_entities},
+        )
+        await notify_governance(
+            notifier,
+            run_id,
+            GovernanceEventType.GUARDRAIL_REDACTED.value,
+            1,
+            {"direction": "incoming", "entities": _red_entities},
+            warnings=warnings,
+        )
+
+
 class SingleCall(Loop):
     """One LLM call, no tools, no iteration.
 
@@ -286,48 +662,24 @@ class SingleCall(Loop):
                 "without output_type, or output_type without guardrails."
             )
 
-        is_resume = initial_steps or iteration_offset != 0 or initial_usage is not None
-        if is_resume:
-            raise RuntimeError(
-                "SingleCall does not support resume. It never pauses "
-                "(no tools, no waiting states), so receiving resume parameters "
-                "(initial_steps, iteration_offset, initial_usage) "
-                "indicates a bug in the caller."
-            )
-
-        resolved_run_id = run_id or generate_ulid()
-        _pkw = provider_kwargs or {}
-        cache_key_prefix = build_cache_key_prefix(agent)
-        notifier_warnings: list[str] = []
-
-        if initial_history is not None:
-            # Seeded chat history (or resume) — caller already persisted what's
-            # supposed to land in react_traces. Use as-is, do not re-record.
-            history: list[Message] = list(initial_history)
-        else:
-            from dendrux.context_blocks import wire_user_input
-
-            user_msg = Message(role=Role.USER, content=wire_user_input(user_input, [], None))
-            history = [user_msg]
-            await record_message(recorder, resolved_run_id, user_msg, 0)
-            await notify_message(notifier, resolved_run_id, user_msg, 0, notifier_warnings)
-
-        messages, _tools = strategy.build_messages(
-            system_prompt=agent.get_system_prompt(loop=self),
-            history=history,
-            tool_defs=[],
-        )
-        images = _image_site(
+        _refuse_resume(initial_steps, iteration_offset, initial_usage)
+        pre = await _single_prelude(
+            self,
             agent,
             provider,
-            image_runtime,
-            image_view_state,
-            _pkw,
-            recorder,
-            notifier,
-            resolved_run_id,
-            notifier_warnings,
+            strategy,
+            user_input,
+            run_id=run_id,
+            recorder=recorder,
+            notifier=notifier,
+            initial_history=initial_history,
+            provider_kwargs=provider_kwargs,
+            image_runtime=image_runtime,
+            image_view_state=image_view_state,
         )
+        resolved_run_id, _pkw = pre.run_id, pre.pkw
+        notifier_warnings, history, messages = pre.warnings, pre.history, pre.messages
+        images, calls = pre.images, pre.calls
         control_reader = _cancel_reader(state_store, resolved_run_id)
 
         # Incoming guardrail — scan all messages
@@ -348,253 +700,27 @@ class SingleCall(Loop):
             notifier,
             notifier_warnings,
         )
-        if g_engine is not None:
-            all_in_findings: list[Any] = []
-            _in_was_redacted = False
-            for msg_idx, msg in enumerate(messages):
-                if not msg.content:
-                    continue
-                cleaned_msg, findings, block_err = await g_engine.scan_incoming_message(
-                    msg, index=msg_idx
-                )
-                if findings:
-                    all_in_findings.extend(findings)
-                if block_err is not None:
-                    await record_governance(
-                        recorder,
-                        resolved_run_id,
-                        GovernanceEventType.GUARDRAIL_BLOCKED.value,
-                        1,
-                        _blocked_data(
-                            "incoming", block_err, findings, _incoming_location(msg, msg_idx)
-                        ),
-                    )
-                    await notify_governance(
-                        notifier,
-                        resolved_run_id,
-                        GovernanceEventType.GUARDRAIL_BLOCKED.value,
-                        1,
-                        _blocked_data(
-                            "incoming", block_err, findings, _incoming_location(msg, msg_idx)
-                        ),
-                        warnings=notifier_warnings,
-                    )
-                    return RunResult(
-                        run_id=resolved_run_id,
-                        status=RunStatus.ERROR,
-                        error=block_err,
-                        steps=[],
-                        iteration_count=1,
-                        usage=UsageStats(),
-                        meta={
-                            **guardrail_meta(g_engine, notifier_warnings),
-                            "failure_reason": FailureReason.GUARDRAIL_BLOCKED.value,
-                        },
-                    )
-                if cleaned_msg is not msg:
-                    _in_was_redacted = True
-                    # The engine's replace() preserves the origin envelope
-                    # (kind/placement/source) through redaction.
-                    messages[msg_idx] = cleaned_msg
-            if all_in_findings:
-                _in_entities = list({f.entity_type for f in all_in_findings})
-                await record_governance(
-                    recorder,
-                    resolved_run_id,
-                    GovernanceEventType.GUARDRAIL_DETECTED.value,
-                    1,
-                    {
-                        "direction": "incoming",
-                        "findings_count": len(all_in_findings),
-                        "entities": _in_entities,
-                    },
-                )
-                await notify_governance(
-                    notifier,
-                    resolved_run_id,
-                    GovernanceEventType.GUARDRAIL_DETECTED.value,
-                    1,
-                    {
-                        "direction": "incoming",
-                        "findings_count": len(all_in_findings),
-                        "entities": _in_entities,
-                    },
-                    warnings=notifier_warnings,
-                )
-            if _in_was_redacted:
-                _red_entities = list({f.entity_type for f in all_in_findings})
-                await record_governance(
-                    recorder,
-                    resolved_run_id,
-                    GovernanceEventType.GUARDRAIL_REDACTED.value,
-                    1,
-                    {"direction": "incoming", "entities": _red_entities},
-                )
-                await notify_governance(
-                    notifier,
-                    resolved_run_id,
-                    GovernanceEventType.GUARDRAIL_REDACTED.value,
-                    1,
-                    {"direction": "incoming", "entities": _red_entities},
-                    warnings=notifier_warnings,
-                )
-
-        prepared = await images.prepare(messages, iteration=1, guardrails=agent.guardrails or ())
-        if prepared.block_error is not None:
-            await images.emit(
-                GovernanceEventType.GUARDRAIL_BLOCKED.value,
-                _image_block_data(prepared.block_error, images.state),
-                1,
-            )
-            return RunResult(
-                run_id=resolved_run_id,
-                status=RunStatus.ERROR,
-                error=prepared.block_error,
-                steps=[],
-                iteration_count=1,
-                usage=UsageStats(),
-                meta={
-                    **guardrail_meta(g_engine, notifier_warnings),
-                    "failure_reason": FailureReason.GUARDRAIL_BLOCKED.value,
-                },
-            )
-
-        # Structured output path: use the structured helper
-        validated_output: Any = None
-        retried = False
-        while True:
-            # LLM call (lifecycle: started → completed/failed)
-            await record_llm_started(
-                recorder,
-                resolved_run_id,
-                1,
-                semantic_messages=prepared.semantic,
-                semantic_tools=None,
-            )
-            await notify_llm_started(
-                notifier,
-                resolved_run_id,
-                1,
-                notifier_warnings,
-                semantic_messages=prepared.semantic,
-                semantic_tools=None,
-            )
-            t0 = time.monotonic()
-            failure: Exception | None = None
-            try:
-                with telemetry_context(
-                    run_id=resolved_run_id,
-                    iteration=1,
-                    recorder=recorder,
-                    notifier=notifier,
-                ):
-                    async with lease_scope(recorder):
-                        if output_type is not None:
-                            from dendrux.llm.structured import structured_complete
-
-                            response, validated_output = await structured_complete(
-                                provider,
-                                prepared.wire,
-                                output_type,
-                                run_id=resolved_run_id,
-                                cache_key_prefix=cache_key_prefix,
-                                **_pkw,
-                            )
-                        else:
-                            response = await complete_call(
-                                provider,
-                                prepared.wire,
-                                tools=None,
-                                run_id=resolved_run_id,
-                                cache_key_prefix=cache_key_prefix,
-                                **_pkw,
-                            )
-
-                    if response.tool_calls:
-                        raise RuntimeError(
-                            f"SingleCall received unexpected tool_calls from provider "
-                            f"({len(response.tool_calls)} calls). SingleCall agents must "
-                            f"have zero tools — the provider should not produce tool calls."
-                        )
-            except StructuredOutputValidationError as _invalid:
-                await _record_rejected_call(
-                    _invalid,
-                    agent=agent,
-                    provider=provider,
-                    run_id=resolved_run_id,
-                    recorder=recorder,
-                    notifier=notifier,
-                    warnings=notifier_warnings,
-                    semantic_messages=prepared.semantic,
-                    duration_ms=int((time.monotonic() - t0) * 1000),
-                    model=_pkw.get("model"),
-                )
-                raise
-            except Exception as _llm_exc:
-                _llm_fail_ms = int((time.monotonic() - t0) * 1000)
-                await record_llm_failed(
-                    recorder,
-                    resolved_run_id,
-                    1,
-                    _llm_exc,
-                    duration_ms=_llm_fail_ms,
-                )
-                await notify_llm_failed(
-                    notifier,
-                    resolved_run_id,
-                    1,
-                    _llm_exc,
-                    notifier_warnings,
-                    duration_ms=_llm_fail_ms,
-                )
-                if not prepared.slots:
-                    raise
-                failure = _llm_exc
-                prepared = release_wire(prepared)
-            if failure is None:
-                break
-            decision = await images.on_failure(
-                failure,
-                prepared,
-                iteration=1,
-                retried=retried,
-                visible_deltas=0,
-                control_reader=control_reader,
-            )
-            if control_stop(decision) is not None:
-                return RunResult(
-                    run_id=resolved_run_id,
-                    status=RunStatus.CANCELLED,
-                    steps=[],
-                    iteration_count=0,
-                    usage=UsageStats(),
-                    meta=guardrail_meta(g_engine, notifier_warnings),
-                )
-            if decision.action == "propagate":
-                _drop_frame_locals(failure)
-                raise failure
-            if decision.action == "raise":
-                assert decision.error is not None
-                del failure
-                raise decision.error
-            del failure
-            retried = True
-            prepared = await images.prepare(
-                messages,
-                iteration=1,
-                guardrails=agent.guardrails or (),
-                force_tombstones=decision.tombstones,
-            )
-
-        prepared = images.mark_sent(prepared)
-        llm_duration_ms = int((time.monotonic() - t0) * 1000)
-        response = persistable_response(response)
-        response = price_response(
-            response,
-            pricing=agent.pricing,
-            default_model=provider.model,
-            model=_pkw.get("model"),
+        all_in_findings, blocked = await _scan_single_incoming(
+            g_engine,
+            messages,
+            recorder=recorder,
+            notifier=notifier,
+            run_id=resolved_run_id,
+            warnings=notifier_warnings,
         )
+        if blocked is not None:
+            return blocked
+
+        called = await _single_batch_call(pre, output_type, control_reader, g_engine)
+        if isinstance(called, RunResult):
+            return called
+        assert called.response is not None  # an attempt without a failure answered
+        validated_output = called.output
+        prepared, llm_duration_ms, response = calls.settle(
+            called.prepared, called.response, called.t0
+        )
+        # The attempt still holds the byte-bearing request; only the released one goes on.
+        del called
 
         # Output guardrail — detection-only. Persistence stores raw
         # (DB is ground truth); block policies abort the run, findings
@@ -790,48 +916,24 @@ class SingleCall(Loop):
                 "Use agent.run() for structured output, or agent.stream() without output_type."
             )
 
-        is_resume = initial_steps or iteration_offset != 0 or initial_usage is not None
-        if is_resume:
-            raise RuntimeError(
-                "SingleCall does not support resume. It never pauses "
-                "(no tools, no waiting states), so receiving resume parameters "
-                "(initial_steps, iteration_offset, initial_usage) "
-                "indicates a bug in the caller."
-            )
-
-        resolved_run_id = run_id or generate_ulid()
-        _pkw = provider_kwargs or {}
-        cache_key_prefix = build_cache_key_prefix(agent)
-        notifier_warnings: list[str] = []
-
-        if initial_history is not None:
-            # Seeded chat history (or resume) — caller already persisted what's
-            # supposed to land in react_traces. Use as-is, do not re-record.
-            history: list[Message] = list(initial_history)
-        else:
-            from dendrux.context_blocks import wire_user_input
-
-            user_msg = Message(role=Role.USER, content=wire_user_input(user_input, [], None))
-            history = [user_msg]
-            await record_message(recorder, resolved_run_id, user_msg, 0)
-            await notify_message(notifier, resolved_run_id, user_msg, 0, notifier_warnings)
-
-        messages, _tools = strategy.build_messages(
-            system_prompt=agent.get_system_prompt(loop=self),
-            history=history,
-            tool_defs=[],
-        )
-        images = _image_site(
+        _refuse_resume(initial_steps, iteration_offset, initial_usage)
+        pre = await _single_prelude(
+            self,
             agent,
             provider,
-            image_runtime,
-            image_view_state,
-            _pkw,
-            recorder,
-            notifier,
-            resolved_run_id,
-            notifier_warnings,
+            strategy,
+            user_input,
+            run_id=run_id,
+            recorder=recorder,
+            notifier=notifier,
+            initial_history=initial_history,
+            provider_kwargs=provider_kwargs,
+            image_runtime=image_runtime,
+            image_view_state=image_view_state,
         )
+        resolved_run_id, _pkw, cache_key_prefix = pre.run_id, pre.pkw, pre.cache_key_prefix
+        notifier_warnings, history, messages = pre.warnings, pre.history, pre.messages
+        images, calls = pre.images, pre.calls
         checkpoint_state, checkpoint_budget = _single_checkpoint(
             recorder,
             agent,
@@ -860,174 +962,29 @@ class SingleCall(Loop):
             )
             return
 
-        prepared = await images.prepare(messages, iteration=1)
-
-        # LLM call (lifecycle: started → completed/failed)
-        await record_llm_started(
-            recorder,
-            resolved_run_id,
-            1,
-            semantic_messages=prepared.semantic,
-            semantic_tools=None,
-        )
-        await notify_llm_started(
-            notifier,
-            resolved_run_id,
-            1,
-            notifier_warnings,
-            semantic_messages=prepared.semantic,
-            semantic_tools=None,
-        )
-        t0 = time.monotonic()
-        llm_response: LLMResponse | None = None
-        provider_stream = telemetry_stream(
-            stream_call(
-                provider,
-                prepared.wire,
-                tools=None,
-                run_id=resolved_run_id,
-                cache_key_prefix=cache_key_prefix,
-                **_pkw,
-            ),
-            run_id=resolved_run_id,
+        # LLM call (lifecycle: started → completed/failed), driven here in the
+        # consumer's task and closed with this generator.
+        call = StreamCall(
+            calls,
+            await images.prepare(messages, iteration=1),
+            messages,
+            tools=None,
             iteration=1,
-            recorder=recorder,
-            notifier=notifier,
+            interrupt=interrupt,
+            control_reader=control_reader,
+            cache_key_prefix=cache_key_prefix,
+            translate=_single_delta,
+            check=_require_single_done,
         )
-        partial_text: list[str] = []
-        interrupted = False
-        retried = False
-        cancelled = False
-        try:
-            while True:
-                failure: Exception | None = None
-                visible_deltas = 0
-                active_stream = leased_stream(interruptible(provider_stream, interrupt), recorder)
+        relay = EventRelay(stream_call_events(call))
+        async with aclosing(relay.events):
+            while (event := await relay.next()) is not None:
                 try:
-                    async for event in active_stream:
-                        if event.type == StreamEventType.TEXT_DELTA:
-                            partial_text.append(event.text or "")
-                            visible_deltas += 1
-                            yield RunEvent(
-                                type=RunEventType.TEXT_DELTA,
-                                text=event.text,
-                                iteration=1,
-                                phase="final_answer",
-                            )
-                        elif event.type == StreamEventType.REASONING_DELTA:
-                            visible_deltas += 1
-                            yield RunEvent(
-                                type=RunEventType.REASONING_DELTA, text=event.text, iteration=1
-                            )
-                        elif event.type in (
-                            StreamEventType.TOOL_USE_START,
-                            StreamEventType.TOOL_USE_END,
-                        ):
-                            raise RuntimeError(
-                                f"SingleCall received unexpected {event.type.value} event "
-                                f"from provider stream. SingleCall agents must have zero "
-                                f"tools — the provider should not produce tool events."
-                            )
-                        elif event.type == StreamEventType.DONE:
-                            llm_response = event.raw
-                    # Validate inside the same try so contract violations still
-                    # pair with on_llm_call_failed (started already fired).
-                    if llm_response is None:
-                        raise RuntimeError(
-                            "Provider stream ended without DONE event. "
-                            "complete_stream() must yield StreamEvent(type=DONE, raw=LLMResponse)."
-                        )
-                    if llm_response.tool_calls:
-                        raise RuntimeError(
-                            f"SingleCall received unexpected tool_calls from provider "
-                            f"({len(llm_response.tool_calls)} calls). SingleCall agents must "
-                            f"have zero tools — the provider should not produce tool calls."
-                        )
-                except Exception as _stream_exc:
-                    _stream_fail_ms = int((time.monotonic() - t0) * 1000)
-                    await record_llm_failed(
-                        recorder,
-                        resolved_run_id,
-                        1,
-                        _stream_exc,
-                        duration_ms=_stream_fail_ms,
-                    )
-                    await notify_llm_failed(
-                        notifier,
-                        resolved_run_id,
-                        1,
-                        _stream_exc,
-                        notifier_warnings,
-                        duration_ms=_stream_fail_ms,
-                    )
-                    if isinstance(_stream_exc, StreamInterruptedError):
-                        interrupted = True
-                    elif not prepared.slots:
-                        raise
-                    else:
-                        failure = _stream_exc
-                        prepared = release_wire(prepared)
-                if failure is None:
-                    break
-                decision = await images.on_failure(
-                    failure,
-                    prepared,
-                    iteration=1,
-                    retried=retried,
-                    visible_deltas=visible_deltas,
-                    control_reader=control_reader,
-                )
-                if control_stop(decision) is not None:
-                    cancelled = True
-                    break
-                if decision.action == "propagate":
-                    _drop_frame_locals(failure)
-                    raise failure
-                if decision.action == "raise":
-                    assert decision.error is not None
-                    del failure
-                    raise decision.error
-                del failure
-                retried = True
-                await provider_stream.aclose()
-                prepared = await images.prepare(
-                    messages, iteration=1, force_tombstones=decision.tombstones
-                )
-                await record_llm_started(
-                    recorder,
-                    resolved_run_id,
-                    1,
-                    semantic_messages=prepared.semantic,
-                    semantic_tools=None,
-                )
-                await notify_llm_started(
-                    notifier,
-                    resolved_run_id,
-                    1,
-                    notifier_warnings,
-                    semantic_messages=prepared.semantic,
-                    semantic_tools=None,
-                )
-                t0 = time.monotonic()
-                provider_stream = telemetry_stream(
-                    stream_call(
-                        provider,
-                        prepared.wire,
-                        tools=None,
-                        run_id=resolved_run_id,
-                        cache_key_prefix=cache_key_prefix,
-                        **_pkw,
-                    ),
-                    run_id=resolved_run_id,
-                    iteration=1,
-                    recorder=recorder,
-                    notifier=notifier,
-                )
-        finally:
-            await active_stream.aclose()
-            await provider_stream.aclose()
+                    yield event
+                except Exception as thrown:
+                    relay.throw(thrown)
 
-        if cancelled:
+        if call.stop is not None:
             yield RunEvent(
                 type=RunEventType.RUN_CANCELLED,
                 run_result=RunResult(
@@ -1040,12 +997,12 @@ class SingleCall(Loop):
             )
             return
 
-        if interrupted:
+        if call.interrupted:
             yield RunEvent(
                 type=RunEventType.RUN_CANCELLED,
                 run_result=_interrupted_result(
                     run_id=resolved_run_id,
-                    partial_text=partial_text,
+                    partial_text=call.partial_text,
                     steps=[],
                     iteration=1,
                     usage=UsageStats(),
@@ -1054,18 +1011,14 @@ class SingleCall(Loop):
             )
             return
 
-        # The try-block raised if no DONE arrived; only the interrupted path
+        # The call raised if no DONE arrived; only the interrupted path
         # (handled above) leaves this None.
-        assert llm_response is not None
-        prepared = images.mark_sent(prepared)
-        llm_duration_ms = int((time.monotonic() - t0) * 1000)
-        llm_response = persistable_response(llm_response)
-        llm_response = price_response(
-            llm_response,
-            pricing=agent.pricing,
-            default_model=provider.model,
-            model=_pkw.get("model"),
+        assert call.response is not None
+        prepared, llm_duration_ms, llm_response = calls.settle(
+            call.prepared, call.response, call.t0
         )
+        # The call still holds the byte-bearing request; only the released one goes on.
+        del call
 
         await record_llm(
             recorder,
@@ -1120,6 +1073,38 @@ class SingleCall(Loop):
                     llm_response, run_id=resolved_run_id, default_model=provider.model
                 ),
             ),
+        )
+
+
+def _single_delta(event: StreamEvent) -> RunEvent | None:
+    """SingleCall's event for a streamed delta; a tool event breaks its contract."""
+    if event.type == StreamEventType.TEXT_DELTA:
+        return RunEvent(
+            type=RunEventType.TEXT_DELTA, text=event.text, iteration=1, phase="final_answer"
+        )
+    if event.type == StreamEventType.REASONING_DELTA:
+        return RunEvent(type=RunEventType.REASONING_DELTA, text=event.text, iteration=1)
+    if event.type in (StreamEventType.TOOL_USE_START, StreamEventType.TOOL_USE_END):
+        raise RuntimeError(
+            f"SingleCall received unexpected {event.type.value} event "
+            f"from provider stream. SingleCall agents must have zero "
+            f"tools — the provider should not produce tool events."
+        )
+    return None
+
+
+def _require_single_done(response: LLMResponse | None, iteration: int) -> None:
+    # Contract violations still pair with on_llm_call_failed (started already fired).
+    if response is None:
+        raise RuntimeError(
+            "Provider stream ended without DONE event. "
+            "complete_stream() must yield StreamEvent(type=DONE, raw=LLMResponse)."
+        )
+    if response.tool_calls:
+        raise RuntimeError(
+            f"SingleCall received unexpected tool_calls from provider "
+            f"({len(response.tool_calls)} calls). SingleCall agents must "
+            f"have zero tools — the provider should not produce tool calls."
         )
 
 

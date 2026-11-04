@@ -29,6 +29,7 @@ from dendrux.tools import build_tool_lookups
 from dendrux.tools._lookups import make_call_limiter
 from dendrux.tools._pool import ToolCallLimiter, _ToolPool
 from dendrux.types import LLMResponse, RunStatus, ToolCall
+from tests._helpers.timing import ManualTimeouts
 
 
 @pytest.fixture
@@ -195,73 +196,95 @@ class TestTimeouts:
         assert tool_pool_stats().queued == 0
         assert lookups.call_limiter.in_use == 0
 
-    async def test_a_started_call_times_out_as_outcome_unknown(self, small_pool) -> None:
+    async def test_a_started_call_times_out_as_outcome_unknown(
+        self, small_pool, monkeypatch
+    ) -> None:
+        from dendrux.loops import react
+
         small_pool(2)
-        release = threading.Event()
+        release, started = threading.Event(), threading.Event()
         effects: list[str] = []
 
-        @tool(timeout_seconds=0.1)
+        @tool(timeout_seconds=10)
         def slow_refund(order_id: int) -> str:
             """Refund slowly."""
-            release.wait(5)
+            started.set()
+            release.wait()
             effects.append("refunded")
             return "refunded"
 
+        deadlines = ManualTimeouts(monkeypatch, react)
         limiter = make_call_limiter(4)
         lookups = build_tool_lookups([slow_refund], call_limiter=limiter)
-        result = await _execute_tool(
-            ToolCall(name="slow_refund", params={"order_id": 7}),
-            lookups,
-            run_id="00000000000000000000000302",
+        call = asyncio.create_task(
+            _execute_tool(
+                ToolCall(name="slow_refund", params={"order_id": 7}),
+                lookups,
+                run_id="00000000000000000000000302",
+            )
         )
-
-        payload = json.loads(result.payload)
-        assert payload["code"] == "timeout_outcome_unknown"
-        assert "do not retry blindly" in payload["error"]
-        assert result.meta == {"code": "timeout_outcome_unknown", "zombie_threads": 1}
-        assert tool_pool_stats().zombies == 1
-        # The slot stays taken while the thread runs: hung calls hold their Agent's slots.
-        assert limiter.in_use == 1
-
-        release.set()
-        await _until(lambda: tool_pool_stats().zombies == 0)
-        await _until(lambda: limiter.in_use == 0)
+        try:
+            await _until(started.is_set, timeout=10)
+            deadlines.expire()
+            result = await asyncio.wait_for(call, 10)
+            payload = json.loads(result.payload)
+            assert payload["code"] == "timeout_outcome_unknown"
+            assert "do not retry blindly" in payload["error"]
+            assert result.meta == {"code": "timeout_outcome_unknown", "zombie_threads": 1}
+            assert tool_pool_stats().zombies == 1
+            assert limiter.in_use == 1
+        finally:
+            release.set()
+            call.cancel()
+            await asyncio.gather(call, return_exceptions=True)
+        await _until(lambda: tool_pool_stats().zombies == 0, timeout=10)
+        await _until(lambda: limiter.in_use == 0, timeout=10)
         assert effects == ["refunded"]
 
-    async def test_a_hung_agent_cannot_starve_another(self, small_pool) -> None:
+    async def test_a_hung_agent_cannot_starve_another(self, small_pool, monkeypatch) -> None:
+        from dendrux.loops import react
+
         small_pool(4)
         release = threading.Event()
+        started = Gauge()
 
-        @tool(timeout_seconds=0.1)
+        @tool(timeout_seconds=10)
         def hang(i: int) -> str:
             """Hang."""
-            release.wait(5)
+            with started:
+                release.wait()
             return "late"
 
-        @tool(timeout_seconds=2)
+        @tool(timeout_seconds=10)
         def fine(i: int) -> int:
             """Fine."""
             return i
 
+        deadlines = ManualTimeouts(monkeypatch, react)
         hung = Agent(prompt="p", tools=[hang], tool_threads=2)
         healthy = Agent(prompt="p", tools=[fine], tool_threads=2)
         hung_llm = _batch("hang", 3)
-        await _run(hung, hung_llm)
-        codes = sorted(p["code"] for p in _payloads(hung_llm))
-        # Two started and hung; the third waited for its own Agent's slot.
-        assert codes == [
-            "timeout_not_started",
-            "timeout_outcome_unknown",
-            "timeout_outcome_unknown",
-        ]
-        assert tool_pool_stats().zombies == 2
-
-        healthy_llm = _batch("fine", 4)
-        result = await _run(healthy, healthy_llm)
-        assert result.status == RunStatus.SUCCESS
-        assert sorted(_payloads(healthy_llm)) == [0, 1, 2, 3]
-        release.set()
-        await _until(lambda: tool_pool_stats().zombies == 0)
+        call = asyncio.create_task(_run(hung, hung_llm))
+        try:
+            await _until(lambda: started.current == 2 and len(deadlines.deadlines) == 3, timeout=10)
+            deadlines.expire()
+            await asyncio.wait_for(call, 10)
+            codes = sorted(p["code"] for p in _payloads(hung_llm))
+            assert codes == [
+                "timeout_not_started",
+                "timeout_outcome_unknown",
+                "timeout_outcome_unknown",
+            ]
+            assert tool_pool_stats().zombies == 2
+            healthy_llm = _batch("fine", 4)
+            result = await asyncio.wait_for(_run(healthy, healthy_llm), 10)
+            assert result.status == RunStatus.SUCCESS
+            assert sorted(_payloads(healthy_llm)) == [0, 1, 2, 3]
+        finally:
+            release.set()
+            call.cancel()
+            await asyncio.gather(call, return_exceptions=True)
+        await _until(lambda: tool_pool_stats().zombies == 0, timeout=10)
 
     async def test_a_timeout_raised_by_the_tool_is_an_ordinary_error(self, small_pool) -> None:
         small_pool(1)

@@ -219,12 +219,146 @@ def _marks_benchmark(node: ast.AST) -> bool:
     return any("benchmark" in ast.unparse(d) for d in decorators)
 
 
-def wallclock_asserts(tests_dir: Path) -> list[WallclockAssert]:
-    """Tests that compare a measured clock difference with a number under 2.5 seconds.
+def _positive_seconds(node: ast.AST) -> float | None:
+    if (
+        isinstance(node, ast.Constant)
+        and isinstance(node.value, int | float)
+        and not isinstance(node.value, bool)
+        and node.value > 0
+    ):
+        return float(node.value)
+    return None
 
-    Such a bound is a speed claim: it fails when the machine is busy, so the test belongs in the
-    serial benchmark step. Found by tracing names assigned from ``time.monotonic()`` and
-    friends, or ``loop.time()``, into ``assert``/``if`` comparisons with a small number.
+
+def _asyncio_call(node: ast.AST, name: str) -> bool:
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "asyncio"
+        and node.func.attr == name
+    )
+
+
+def _negative_state(node: ast.AST) -> bool:
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+        return True
+    if not isinstance(node, ast.Compare) or not all(
+        isinstance(op, ast.Eq | ast.Is) for op in node.ops
+    ):
+        return False
+    return any(
+        (
+            isinstance(value, ast.Constant)
+            and (value.value is None or value.value is False or value.value == 0)
+        )
+        or (isinstance(value, ast.List | ast.Tuple | ast.Set) and not value.elts)
+        or (isinstance(value, ast.Dict) and not value.keys)
+        or (
+            isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Name)
+            and value.func.id == "set"
+            and not value.args
+            and not value.keywords
+        )
+        for value in node.comparators
+    )
+
+
+def _sleep_then_assert(function: ast.AST) -> list[tuple[float, str]]:
+    findings = []
+    for node in ast.walk(function):
+        for field in ("body", "orelse", "finalbody"):
+            body = getattr(node, field, [])
+            if not isinstance(body, list):
+                continue
+            for previous, following in zip(body, body[1:], strict=False):
+                if not (
+                    isinstance(previous, ast.Expr)
+                    and isinstance(previous.value, ast.Await)
+                    and _asyncio_call(previous.value.value, "sleep")
+                    and isinstance(following, ast.Assert)
+                ):
+                    continue
+                call = previous.value.value
+                seconds = _positive_seconds(call.args[0]) if call.args else None
+                negative = _negative_state(following.test)
+                if seconds is not None and not negative:
+                    findings.append(
+                        (seconds, ast.unparse(previous) + "; " + ast.unparse(following))
+                    )
+    return findings
+
+
+def _integration_io(function: ast.AST, relative: str) -> bool:
+    if "integration" not in Path(relative).parts:
+        return False
+    fixtures = {"store", "state", "engine", "backend_engine", "pg_test_url", "sqlite_file"}
+    args = getattr(function, "args", None)
+    if args and any(a.arg in fixtures for a in (*args.posonlyargs, *args.args, *args.kwonlyargs)):
+        return True
+    return any(
+        isinstance(node, ast.Call)
+        and (
+            (
+                isinstance(node.func, ast.Name)
+                and node.func.id in {"create_async_engine", "PostgresEventNotifier"}
+            )
+            or _asyncio_call(node, "start_server")
+        )
+        for node in ast.walk(function)
+    )
+
+
+def _small_io_deadlines(function: ast.AST) -> list[tuple[float, str]]:
+    findings = []
+    for node in ast.walk(function):
+        if not isinstance(node, ast.Call):
+            continue
+        values = [
+            kw.value
+            for kw in node.keywords
+            if kw.arg and (kw.arg == "timeout" or kw.arg.endswith("_s"))
+        ]
+        position = 1 if _asyncio_call(node, "wait_for") else 0
+        if (_asyncio_call(node, "wait_for") or _asyncio_call(node, "timeout")) and len(
+            node.args
+        ) > position:
+            values.append(node.args[position])
+        bounds = [
+            seconds
+            for value in values
+            if (seconds := _positive_seconds(value)) is not None and seconds < 1
+        ]
+        if bounds:
+            findings.append((min(bounds), ast.unparse(node)))
+    return findings
+
+
+def _clock_assertions(function: ast.AST) -> list[tuple[float, str]]:
+    names = _time_names(function)
+    findings = []
+    for node in ast.walk(function):
+        if not isinstance(node, ast.Assert | ast.If):
+            continue
+        for compare in (c for c in ast.walk(node.test) if isinstance(c, ast.Compare)):
+            if not all(isinstance(op, ast.Lt | ast.LtE | ast.Gt | ast.GtE) for op in compare.ops):
+                continue
+            measured = any(
+                _clock_reading(value) or (isinstance(value, ast.Name) and value.id in names)
+                for value in ast.walk(compare)
+            )
+            bounds = _small_constants(compare)
+            if measured and bounds:
+                findings.append((min(bounds), ast.unparse(compare)))
+    return findings
+
+
+def wallclock_asserts(tests_dir: Path) -> list[WallclockAssert]:
+    """Find tight clock bounds, sleep/assert pairs and small integration I/O deadlines.
+
+    Integration I/O is recognized by known database fixtures or explicit server setup. Literal
+    arguments only: dynamic clocks, aliases and fixture implementations need manual review.
     """
     found: list[WallclockAssert] = []
     for path in sorted(tests_dir.rglob("*.py")):
@@ -242,37 +376,25 @@ def wallclock_asserts(tests_dir: Path) -> list[WallclockAssert]:
             for n in tree.body
         )
         for owner, function in _test_functions(tree):
-            names = _time_names(function)
             marked = module_marked or _marks_benchmark(function) or _marks_benchmark(owner)
             label = (
                 f"{rel}::{function.name}"
                 if owner is tree
                 else f"{rel}::{owner.name}::{function.name}"
             )  # type: ignore[attr-defined]
-            for node in ast.walk(function):
-                tests_ = [node.test] if isinstance(node, ast.Assert | ast.If) else []
-                for test in tests_:
-                    for compare in (c for c in ast.walk(test) if isinstance(c, ast.Compare)):
-                        if not all(
-                            isinstance(o, ast.Lt | ast.LtE | ast.Gt | ast.GtE) for o in compare.ops
-                        ):
-                            continue
-                        measured = any(
-                            _clock_reading(x) or (isinstance(x, ast.Name) and x.id in names)
-                            for x in ast.walk(compare)
-                        )
-                        bounds = _small_constants(compare)
-                        if measured and bounds:
-                            found.append(
-                                WallclockAssert(label, min(bounds), ast.unparse(compare), marked)
-                            )
-    seen: set[str] = set()
-    unique = []
-    for item in found:  # one finding per test: the tightest bound
-        if item.test not in seen:
-            seen.add(item.test)
-            unique.append(item)
-    return unique
+            patterns = _sleep_then_assert(function)
+            if _integration_io(function, rel):
+                patterns.extend(_small_io_deadlines(function))
+            found.extend(WallclockAssert(label, bound, text, marked) for bound, text in patterns)
+            found.extend(
+                WallclockAssert(label, bound, text, marked)
+                for bound, text in _clock_assertions(function)
+            )
+    unique: dict[str, WallclockAssert] = {}
+    for item in found:
+        if item.test not in unique or item.bound < unique[item.test].bound:
+            unique[item.test] = item
+    return list(unique.values())
 
 
 def _test_functions(tree: ast.Module) -> list[tuple[ast.AST, ast.AST]]:

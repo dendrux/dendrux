@@ -266,7 +266,10 @@ def make_http_client(
                     _on_request, deadlines=deadlines, provider=provider or sdk.__name__
                 )
             ],
-            "response": [_on_response, *telemetry_event_hooks()["response"]],
+            "response": [
+                _on_response,
+                *telemetry_event_hooks(RETRYABLE_HTTP_STATUSES)["response"],
+            ],
         },
     )
     return client
@@ -821,6 +824,7 @@ async def run_with_deadline(
         raise _deadline_error(state, reason=reason, limit=limit, provider=provider, model=model)
     finally:
         _call_state.reset(token)
+        del make_call
 
 
 async def call_with_timeout(
@@ -930,14 +934,17 @@ class StreamClock:
 
     async def open(self, make_call: Callable[[], Awaitable[T]]) -> T:
         when, reason, limit = self._next()
-        return await run_with_deadline(
-            make_call,
-            when=when,
-            reason=reason,
-            limit=limit,
-            provider=self.provider,
-            model=self.model,
-        )
+        try:
+            return await run_with_deadline(
+                make_call,
+                when=when,
+                reason=reason,
+                limit=limit,
+                provider=self.provider,
+                model=self.model,
+            )
+        finally:
+            del make_call
 
     async def step(self, awaitable: Awaitable[T]) -> T:
         when, reason, limit = self._next()
@@ -973,30 +980,33 @@ async def retry_unstarted_stream(
     generator is always closed, so early ``aclose()`` and cancellation close
     the upstream response.
     """
-    attempts = 0
-    while True:
-        attempts += 1
-        attempt = open_attempt()
-        yielded = False
-        retry = False
-        try:
-            async for event in attempt:
-                yielded = True
-                yield event
-            return
-        except ProviderStreamIncompleteError:
-            if yielded or attempts > 1:
-                raise
-            retry = True
-        finally:
-            await attempt.aclose()
-        if retry:
-            logger.warning(
-                "provider.stream_retry run_id=%s provider=%s model=%s reason=stream_incomplete",
-                run_id,
-                provider,
-                model,
-            )
+    try:
+        attempts = 0
+        while True:
+            attempts += 1
+            attempt = open_attempt()
+            yielded = False
+            retry = False
+            try:
+                async for event in attempt:
+                    yielded = True
+                    yield event
+                return
+            except ProviderStreamIncompleteError:
+                if yielded or attempts > 1:
+                    raise
+                retry = True
+            finally:
+                await attempt.aclose()
+            if retry:
+                logger.warning(
+                    "provider.stream_retry run_id=%s provider=%s model=%s reason=stream_incomplete",
+                    run_id,
+                    provider,
+                    model,
+                )
+    finally:
+        del open_attempt
 
 
 class WireRequest:

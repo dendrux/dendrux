@@ -43,7 +43,6 @@ class TestRefreshSkills:
 
         # Caches cleared
         assert agent._loaded_skills is None
-        assert agent._denied_skill_names is None
 
     @pytest.mark.asyncio
     async def test_refresh_picks_up_new_skills(self) -> None:
@@ -144,7 +143,6 @@ class TestRefreshMCP:
         assert agent._discovered_tool_defs is None
         assert agent._mcp_executors is None
         assert agent._loaded_skills is None
-        assert agent._denied_skill_names is None
 
 
 class TestRefreshIdempotent:

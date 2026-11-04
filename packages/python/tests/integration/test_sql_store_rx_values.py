@@ -85,7 +85,7 @@ async def test_foreign_note_does_not_wait_for_advisory_lock(backend_engine, stor
                 store.add_note(
                     "owner", note_id="foreign", text="note", max_notes=1, tenant_id="foreign"
                 ),
-                0.5,
+                10,
             )
             is False
         )

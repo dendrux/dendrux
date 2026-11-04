@@ -968,13 +968,19 @@ async def test_caller_cancelled_during_remote_revoke_keeps_the_tombstone() -> No
     async with OAuthHarness() as harness:
         oauth = make_oauth()
         await complete(oauth, await sign_in(oauth, harness))
-        harness.revocation_latency = 0.3
+        harness.revocation_entered = asyncio.Event()
+        harness.revocation_gate = asyncio.Event()
         task = asyncio.create_task(oauth.revoke(KEY))
-        await asyncio.sleep(0.15)
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        assert (await oauth.status(KEY)).state == "signed_out"
+        try:
+            await asyncio.wait_for(harness.revocation_entered.wait(), 10)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert (await oauth.status(KEY)).state == "signed_out"
+        finally:
+            harness.revocation_gate.set()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
         await oauth.aclose()
         assert harness.counters["revoke"] == 1
 

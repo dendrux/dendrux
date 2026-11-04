@@ -110,7 +110,7 @@ async def test_unstarted_telemetry_close_releases_eager_provider_once():
             self.closed += 1
 
     inner = EagerStream()
-    wrapped = telemetry_stream(inner, run_id="eager", iteration=1, recorder=None, notifier=None)
+    wrapped = telemetry_stream(inner, run_id="eager", iteration=1, sinks=None)
     await asyncio.gather(wrapped.aclose(), wrapped.aclose())
     assert inner.closed == 1, "closing an unstarted telemetry wrapper must release its eager owner"
 
@@ -180,6 +180,6 @@ async def test_exhausted_telemetry_releases_eager_provider():
             self.closed = True
 
     inner = Eager()
-    wrapped = telemetry_stream(inner, run_id="eager", iteration=1, recorder=None, notifier=None)
+    wrapped = telemetry_stream(inner, run_id="eager", iteration=1, sinks=None)
     assert [item async for item in wrapped] == []
     assert inner.closed, "exhaustion must release an eager provider as well as explicit close"

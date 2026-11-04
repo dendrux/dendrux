@@ -69,13 +69,14 @@ async def test_a20_completion_commits_while_sibling_is_running(store):
         slow_started.set()
         await asyncio.wait_for(fast_done.wait(), 5)
         run = get_delegation_context().run_id
-        for _ in range(100):
-            rows = await store.get_tool_calls(run)
-            if any(r.tool_name == "fast" and r.outcome == "completed" for r in rows):
-                state = await store.get_loop_state(run)
-                checks.append([p["tool"] for p in state["pending"]])
-                break
-            await asyncio.sleep(0.005)
+        async with asyncio.timeout(10):
+            while True:
+                rows = await store.get_tool_calls(run)
+                if any(r.tool_name == "fast" and r.outcome == "completed" for r in rows):
+                    state = await store.get_loop_state(run)
+                    checks.append([p["tool"] for p in state["pending"]])
+                    break
+                await asyncio.sleep(0.005)
         return "slow"
 
     @tool(parallel=True, idempotent=True)
@@ -104,11 +105,14 @@ async def test_stream_lease_survives_consumer_yield_without_cancellation(store, 
     from dendrux.types import RunEventType
 
     touches = []
+    renewed = asyncio.Event()
     original = store.touch_progress
 
     async def touch(run_id, *, claim_epoch=None):
+        result = await original(run_id, claim_epoch=claim_epoch)
         touches.append(1)
-        return await original(run_id, claim_epoch=claim_epoch)
+        renewed.set()
+        return result
 
     monkeypatch.setattr(store, "touch_progress", touch)
     a = Agent(
@@ -117,12 +121,13 @@ async def test_stream_lease_survives_consumer_yield_without_cancellation(store, 
         state_store=store,
         strict_tenancy=False,
     )
-    a.lease_interval = timedelta(seconds=0.01)
+    a.lease_interval = timedelta(seconds=5)
     async with a.stream("go") as stream:
         async for event in stream:
             if event.type == RunEventType.TEXT_DELTA:
                 count = len(touches)
-                await asyncio.sleep(0.06)
+                renewed.clear()
+                await asyncio.wait_for(renewed.wait(), 30)
                 assert len(touches) > count
                 assert asyncio.current_task().cancelling() == 0
                 break

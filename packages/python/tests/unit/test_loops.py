@@ -981,7 +981,7 @@ class TestReActLoopToolTimeout:
 class TestReActLoopDuplicateToolNames:
     async def test_duplicate_tool_names_raise(self) -> None:
         """A-08: Two tools with the same name should raise at loop start."""
-        from dendrux.loops.react import _build_tool_lookups
+        from dendrux.tools._lookups import build_tool_lookups
         from dendrux.types import ToolDef
 
         @tool()
@@ -1002,7 +1002,7 @@ class TestReActLoopDuplicateToolNames:
         )
 
         with pytest.raises(ValueError, match="Duplicate tool name"):
-            _build_tool_lookups([samename, samename2])
+            build_tool_lookups([samename, samename2])
 
 
 class TestBuildExecutionGroups:

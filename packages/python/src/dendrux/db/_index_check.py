@@ -36,10 +36,6 @@ def _canonical(ddl: str) -> str:
     return re.sub(r"@literal(\d+)@", lambda m: literals[int(m[1])], ddl)
 
 
-read_pg_indexes = postgres.read_indexes
-"""One catalog query: names mapped to table, definition, valid-and-ready (Postgres)."""
-
-
 def index_exists(conn: Connection, name: str) -> bool:
     """Whether an index name exists in the current schema, regardless of its owner."""
     found = family(conn.dialect)

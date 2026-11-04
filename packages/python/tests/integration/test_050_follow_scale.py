@@ -10,8 +10,11 @@
 from __future__ import annotations
 
 import asyncio
+import collections
 import contextlib
-from typing import Any
+import contextvars
+import functools
+from typing import TYPE_CHECKING, Any
 
 import pytest
 from sqlalchemy import event
@@ -24,10 +27,14 @@ from dendrux.store import (
     FollowEnd,
     FollowHeartbeat,
     RunStore,
+    _follow,
 )
 from dendrux.tool import tool
 from dendrux.types import LLMResponse, ToolResult
 from tests._helpers.scripted_provider import ScriptedLLM, tool_call
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 pytestmark = pytest.mark.asyncio
 
@@ -76,12 +83,62 @@ async def _run_with_pauses(store: Any, pauses: int) -> str:
     return result.run_id
 
 
-async def _statements_for(engine: Any, run_store: RunStore, run_id: str, followers: int) -> int:
-    count = [0]
+# Reads the followers of one run share. Concurrent followers race to run each
+# one first (a follower that arrives while another is still reading pays it
+# too), so how many of these statements run depends on scheduling and load,
+# not on the run. The counter keeps them in their own bucket, one per reader.
+_SHARED_READERS = (
+    "_current_head",
+    "read_pause_view",
+    "read_tool_evidence",
+    "read_declared_tools",
+    "read_unknown_calls",
+)
+_reader: contextvars.ContextVar[str] = contextvars.ContextVar("follow_scale_reader", default="")
+_FOLLOWER = "follower"
+
+
+def _tagged(name: str, read: Any) -> Any:
+    @functools.wraps(read)
+    async def wrapped(*args: Any, **kwargs: Any) -> Any:
+        token = _reader.set(name)
+        try:
+            return await read(*args, **kwargs)
+        finally:
+            _reader.reset(token)
+
+    return wrapped
+
+
+@contextlib.contextmanager
+def _counted_statements(engine: Any) -> Iterator[collections.Counter[str]]:
+    """Statements the followers issue, by bucket.
+
+    ``follower`` holds each follower's own work (scope check, event pages,
+    argument pages); every shared reader has its own bucket. The run's live
+    poller (a named task) is not counted: its work grows with elapsed time.
+    """
+    counts: collections.Counter[str] = collections.Counter()
 
     def on_execute(*_a: Any) -> None:
-        count[0] += 1
+        task = asyncio.current_task()
+        if task is not None and task.get_name().startswith("dendrux-run-feed:"):
+            return
+        counts[_reader.get() or _FOLLOWER] += 1
 
+    with pytest.MonkeyPatch.context() as patch:
+        for name in _SHARED_READERS:
+            patch.setattr(_follow, name, _tagged(name, getattr(_follow, name)))
+        event.listen(engine.sync_engine, "before_cursor_execute", on_execute)
+        try:
+            yield counts
+        finally:
+            event.remove(engine.sync_engine, "before_cursor_execute", on_execute)
+
+
+async def _statements_for(
+    engine: Any, run_store: RunStore, run_id: str, followers: int
+) -> collections.Counter[str]:
     feed = EventFeed(run_store, poll_interval_s=0.01, poll_max_s=0.02, heartbeat_s=5.0)
 
     async def one() -> int:
@@ -95,14 +152,13 @@ async def _statements_for(engine: Any, run_store: RunStore, run_id: str, followe
                     seen += 1
         return seen
 
-    event.listen(engine.sync_engine, "before_cursor_execute", on_execute)
-    try:
-        seen = await asyncio.gather(*[one() for _ in range(followers)])
-    finally:
-        event.remove(engine.sync_engine, "before_cursor_execute", on_execute)
-        await feed.aclose()
+    with _counted_statements(engine) as counts:
+        try:
+            seen = await asyncio.gather(*[one() for _ in range(followers)])
+        finally:
+            await feed.aclose()
     assert len(set(seen)) == 1 and seen[0] > 0
-    return count[0]
+    return counts
 
 
 async def test_backfill_cost_per_follower_is_flat(store: Any, engine: Any) -> None:
@@ -112,16 +168,19 @@ async def test_backfill_cost_per_follower_is_flat(store: Any, engine: Any) -> No
     followers = 20
     small_cost = await _statements_for(engine, run_store, small, followers)
     large_cost = await _statements_for(engine, run_store, large, followers)
-    per_follower = large_cost / followers
     print(f"statements: {followers} followers, 2 vs 12 past pauses: {small_cost} vs {large_cost}")
-    # Fixed per follower: scope check, drained check, one events batch. The
-    # head, poller and active-pause reads are shared by concurrent followers
-    # (a follower arriving after the feed closed pays them again: still fixed).
-    assert per_follower <= 6, (small_cost, large_cost)
+    for cost in (small_cost, large_cost):
+        # A follower's own work is fixed: scope check, drained check, and one
+        # events batch (the history fits in two). The head, poller and
+        # active-pause reads are shared by concurrent followers; a follower
+        # that arrives after the feed closed pays each again, never more than
+        # once. So no shared reader exceeds one statement per follower.
+        assert cost[_FOLLOWER] <= 3 * followers, cost
+        for name in _SHARED_READERS:
+            assert cost[name] <= followers, (name, cost)
     # Twelve more past pauses add no statements per follower.
-    # (Per-pause reads would add at least 10 * followers = 200; a few extra
-    # poller statements under a loaded machine are noise.)
-    assert large_cost - small_cost <= 10, (small_cost, large_cost)
+    # Per-pause reads would add at least 10 * followers = 200.
+    assert large_cost[_FOLLOWER] == small_cost[_FOLLOWER], (small_cost, large_cost)
 
 
 # ---------------------------------------------------------------------------
@@ -280,11 +339,6 @@ async def test_trusted_backfill_reads_past_arguments_in_pages(store: Any, engine
     pauses, followers = 300, 5
     run_id = await _many_approval_pauses(store, pauses)
     run_store = RunStore.from_engine(engine)
-    count = [0]
-
-    def on_execute(*_a: Any) -> None:
-        count[0] += 1
-
     feed = EventFeed(run_store, poll_interval_s=0.01, poll_max_s=0.02, heartbeat_s=5.0)
 
     async def one() -> dict[int, Any]:
@@ -299,20 +353,22 @@ async def test_trusted_backfill_reads_past_arguments_in_pages(store: Any, engine
                     shown[item.sequence_index] = item.data["pending_tool_calls"][0]["params"]
         return shown
 
-    event.listen(engine.sync_engine, "before_cursor_execute", on_execute)
-    try:
-        results = await asyncio.gather(*[one() for _ in range(followers)])
-    finally:
-        event.remove(engine.sync_engine, "before_cursor_execute", on_execute)
-        await feed.aclose()
+    with _counted_statements(engine) as count:
+        try:
+            results = await asyncio.gather(*[one() for _ in range(followers)])
+        finally:
+            await feed.aclose()
     for shown in results:
         assert len(shown) == pauses
         assert [p["n"] for _, p in sorted(shown.items())] == list(range(pauses))
     events = 3 * pauses + 1
-    print(f"trusted backfill: {followers} followers, {pauses} pauses -> {count[0]} statements")
+    print(f"trusted backfill: {followers} followers, {pauses} pauses -> {dict(count)}")
     # Per follower: about one statement per 100 events (event pages) plus one per
     # 1000 pause-related events (argument pages), never one per pause.
-    assert count[0] <= followers * (events // 100 + events // 1000 + 8), count[0]
+    assert count[_FOLLOWER] <= followers * (events // 100 + events // 1000 + 8), count
+    # Shared reads run at most once per follower, whatever the interleaving.
+    for name in _SHARED_READERS:
+        assert count[name] <= followers, (name, count)
 
 
 # ---------------------------------------------------------------------------

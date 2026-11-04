@@ -26,7 +26,7 @@ _IN_BATCH = 1000
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import Callable, Iterator, Sequence
 
     from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -52,6 +52,76 @@ def _compile_json_text(element: Any, compiler: Any, **kwargs: Any) -> str:
     )
 
 
+def _packet_limit(facts: Any) -> int | None:
+    """The server's ``max_allowed_packet`` when the capacity probe has run."""
+    return None if facts is None else facts.max_allowed_packet
+
+
+def _nested_errors(error: BaseException) -> Iterator[BaseException]:
+    """``orig``, cause and context, in the order they are pushed on the walk stack.
+
+    The getters are read eagerly, outside the generator, so an exception they
+    raise propagates unchanged; only the ``isinstance`` test runs inside it.
+    """
+    nested = (getattr(error, "orig", None), error.__cause__, error.__context__)
+    return (item for item in nested if isinstance(item, BaseException))
+
+
+def _value_over_limit(value: str | bytes | bytearray | memoryview, limit: int) -> bool:
+    if isinstance(value, str):
+        return len(value) > limit or len(value.encode("utf-8", "surrogatepass")) > limit
+    return (value.nbytes if isinstance(value, memoryview) else len(value)) > limit
+
+
+def _nested_values(value: Any) -> Iterator[Any] | None:
+    """Dict values and list/tuple items; keys and other containers are not inspected."""
+    if isinstance(value, dict):
+        return iter(value.values())
+    if isinstance(value, (list, tuple)):
+        return iter(value)
+    return None
+
+
+def _params_over_limit(params: Any, limit: int) -> bool:
+    """True when a bound value is larger than ``limit``; inspects at most 524,288 values."""
+    pending = [iter((params,))]
+    inspected = 0
+    while pending and inspected < _JSON_WALK_LIMIT:
+        try:
+            value = next(pending[-1])
+        except StopIteration:
+            pending.pop()
+            continue
+        inspected += 1
+        if isinstance(value, (str, bytes, bytearray, memoryview)):
+            if _value_over_limit(value, limit):
+                return True
+            continue
+        nested = _nested_values(value)
+        if nested is not None:
+            pending.append(nested)
+    return False
+
+
+def _binds_over_limit(exc: BaseException, limit: int) -> bool:
+    """Walk at most 64 distinct errors (context first) looking for an oversize bound value.
+
+    A plain loop, not a generator: an exception raised by a metadata getter
+    must propagate unchanged.
+    """
+    errors = [exc]
+    seen: set[int] = set()
+    while errors and len(seen) < _ERROR_WALK_LIMIT:
+        error = errors.pop()
+        if id(error) in seen:
+            continue
+        seen.add(id(error))
+        errors.extend(_nested_errors(error))
+        if _params_over_limit(getattr(error, "params", None), limit):
+            return True
+    return False
+
+
 class MySQLStateStore(SQLStateStore):
     """InnoDB store requiring READ COMMITTED and NO PAD identifier collations."""
 
@@ -69,43 +139,13 @@ class MySQLStateStore(SQLStateStore):
         from dendrux.runtime.stores._errors import DbError
 
         classified = super().classify_db_error(exc)
-        facts = self._dialect_facts
-        limit = None if facts is None else facts.max_allowed_packet
-        if classified.kind == "connection_lost" and limit is not None:
-            errors = [exc]
-            seen: set[int] = set()
-            while errors and len(seen) < _ERROR_WALK_LIMIT:
-                error = errors.pop()
-                if id(error) in seen:
-                    continue
-                seen.add(id(error))
-                errors.extend(
-                    nested
-                    for nested in (getattr(error, "orig", None), error.__cause__, error.__context__)
-                    if isinstance(nested, BaseException)
-                )
-                pending = [iter((getattr(error, "params", None),))]
-                inspected = 0
-                while pending and inspected < _JSON_WALK_LIMIT:
-                    try:
-                        value = next(pending[-1])
-                    except StopIteration:
-                        pending.pop()
-                        continue
-                    inspected += 1
-                    if isinstance(value, str):
-                        if (
-                            len(value) > limit
-                            or len(value.encode("utf-8", "surrogatepass")) > limit
-                        ):
-                            return DbError("statement_too_large", code=classified.code)
-                    elif isinstance(value, (bytes, bytearray, memoryview)):
-                        if (value.nbytes if isinstance(value, memoryview) else len(value)) > limit:
-                            return DbError("statement_too_large", code=classified.code)
-                    elif isinstance(value, dict):
-                        pending.append(iter(value.values()))
-                    elif isinstance(value, (list, tuple)):
-                        pending.append(iter(value))
+        limit = _packet_limit(self._dialect_facts)
+        if (
+            classified.kind == "connection_lost"
+            and limit is not None
+            and _binds_over_limit(exc, limit)
+        ):
+            return DbError("statement_too_large", code=classified.code)
         return classified
 
     @classmethod

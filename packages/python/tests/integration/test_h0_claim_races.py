@@ -172,8 +172,9 @@ async def test_claim_revalidates_after_competing_generation_change(
         await case.agent.close()
 
 
-async def test_eight_claimants_have_one_winner(store, engine, monkeypatch):
-    await pin_storage_format(engine, 2)
+@pytest.mark.parametrize("storage_format", [1, 2])
+async def test_eight_claimants_have_one_winner(store, engine, monkeypatch, storage_format):
+    await pin_storage_format(engine, storage_format)
     seed = await path_case(store, engine, "submit_resume", ScriptedLLM([]))
     run_id = seed.run_id
     pause = await store.get_pause_state(run_id)

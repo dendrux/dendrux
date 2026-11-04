@@ -1,0 +1,2170 @@
+{
+ "cache_custom_base_url_env__batch": {
+  "events": [],
+  "response": {
+   "model": "gpt-5-mini",
+   "provider_request": {
+    "input": [
+     {
+      "content": "Say hi.",
+      "role": "user"
+     }
+    ],
+    "instructions": "You are terse.",
+    "max_output_tokens": 16000,
+    "model": "gpt-5-mini"
+   },
+   "provider_response": {
+    "id": "resp_oracle_1",
+    "model": "gpt-5-mini",
+    "object": "response",
+    "output": [],
+    "output_text": "Hi there, friend.",
+    "usage": {
+     "input_tokens": 510,
+     "input_tokens_details": {
+      "cached_tokens": 400
+     },
+     "output_tokens": 21,
+     "total_tokens": 531
+    }
+   },
+   "raw_stop_reason": null,
+   "reasoning": null,
+   "reasoning_blocks": null,
+   "stop_reason": null,
+   "text": "Hi there, friend.",
+   "tool_calls": [],
+   "usage": {
+    "cache_creation_input_tokens": null,
+    "cache_read_input_tokens": 400,
+    "cost_source": null,
+    "cost_unknown": false,
+    "cost_usd": null,
+    "input_tokens": 110,
+    "output_tokens": 21,
+    "reasoning_tokens": null,
+    "total_tokens": 131,
+    "usage_reported": true
+   }
+  },
+  "sdk_calls": [
+   {
+    "input": [
+     {
+      "content": "Say hi.",
+      "role": "user"
+     }
+    ],
+    "instructions": "You are terse.",
+    "max_output_tokens": 16000,
+    "model": "gpt-5-mini"
+   }
+  ]
+ },
+ "cache_custom_base_url_env__stream": {
+  "events": [
+   {
+    "text": "Hi there",
+    "tool_call_id": null,
+    "tool_name": null,
+    "type": "text_delta"
+   },
+   {
+    "text": ", friend.",
+    "tool_call_id": null,
+    "tool_name": null,
+    "type": "text_delta"
+   }
+  ],
+  "response": {
+   "model": "gpt-5-mini",
+   "provider_request": {
+    "input": [
+     {
+      "content": "Say hi.",
+      "role": "user"
+     }
+    ],
+    "instructions": "You are terse.",
+    "max_output_tokens": 16000,
+    "model": "gpt-5-mini"
+   },
+   "provider_response": {
+    "id": "resp_oracle_1",
+    "model": "gpt-5-mini",
+    "object": "response",
+    "output": [],
+    "output_text": "Hi there, friend.",
+    "usage": {
+     "input_tokens": 510,
+     "input_tokens_details": {
+      "cached_tokens": 400
+     },
+     "output_tokens": 21,
+     "total_tokens": 531
+    }
+   },
+   "raw_stop_reason": null,
+   "reasoning": null,
+   "reasoning_blocks": null,
+   "stop_reason": null,
+   "text": "Hi there, friend.",
+   "tool_calls": [],
+   "usage": {
+    "cache_creation_input_tokens": null,
+    "cache_read_input_tokens": 400,
+    "cost_source": null,
+    "cost_unknown": false,
+    "cost_usd": null,
+    "input_tokens": 110,
+    "output_tokens": 21,
+    "reasoning_tokens": null,
+    "total_tokens": 131,
+    "usage_reported": true
+   }
+  },
+  "sdk_calls": [
+   {
+    "input": [
+     {
+      "content": "Say hi.",
+      "role": "user"
+     }
+    ],
+    "instructions": "You are terse.",
+    "max_output_tokens": 16000,
+    "model": "gpt-5-mini",
+    "stream": true
+   }
+  ]
+ },
+ "cache_official__batch": {
+  "events": [],
+  "response": {
+   "model": "gpt-5-mini",
+   "provider_request": {
+    "input": [
+     {
+      "content": "Say hi.",
+      "role": "user"
+     }
+    ],
+    "instructions": "You are terse.",
+    "max_output_tokens": 16000,
+    "model": "gpt-5-mini",
+    "prompt_cache_key": "dendrux:agent:gpt-5-mini",
+    "prompt_cache_retention": "24h"
+   },
+   "provider_response": {
+    "id": "resp_oracle_1",
+    "model": "gpt-5-mini",
+    "object": "response",
+    "output": [],
+    "output_text": "Hi there, friend.",
+    "usage": {
+     "input_tokens": 510,
+     "input_tokens_details": {
+      "cached_tokens": 400
+     },
+     "output_tokens": 21,
+     "total_tokens": 531
+    }
+   },
+   "raw_stop_reason": null,
+   "reasoning": null,
+   "reasoning_blocks": null,
+   "stop_reason": null,
+   "text": "Hi there, friend.",
+   "tool_calls": [],
+   "usage": {
+    "cache_creation_input_tokens": null,
+    "cache_read_input_tokens": 400,
+    "cost_source": null,
+    "cost_unknown": false,
+    "cost_usd": null,
+    "input_tokens": 110,
+    "output_tokens": 21,
+    "reasoning_tokens": null,
+    "total_tokens": 131,
+    "usage_reported": true
+   }
+  },
+  "sdk_calls": [
+   {
+    "input": [
+     {
+      "content": "Say hi.",
+      "role": "user"
+     }
+    ],
+    "instructions": "You are terse.",
+    "max_output_tokens": 16000,
+    "model": "gpt-5-mini",
+    "prompt_cache_key": "dendrux:agent:gpt-5-mini",
+    "prompt_cache_retention": "24h"
+   }
+  ]
+ },
+ "cache_official__stream": {
+  "events": [
+   {
+    "text": "Hi there",
+    "tool_call_id": null,
+    "tool_name": null,
+    "type": "text_delta"
+   },
+   {
+    "text": ", friend.",
+    "tool_call_id": null,
+    "tool_name": null,
+    "type": "text_delta"
+   }
+  ],
+  "response": {
+   "model": "gpt-5-mini",
+   "provider_request": {
+    "input": [
+     {
+      "content": "Say hi.",
+      "role": "user"
+     }
+    ],
+    "instructions": "You are terse.",
+    "max_output_tokens": 16000,
+    "model": "gpt-5-mini",
+    "prompt_cache_key": "dendrux:agent:gpt-5-mini",
+    "prompt_cache_retention": "24h"
+   },
+   "provider_response": {
+    "id": "resp_oracle_1",
+    "model": "gpt-5-mini",
+    "object": "response",
+    "output": [],
+    "output_text": "Hi there, friend.",
+    "usage": {
+     "input_tokens": 510,
+     "input_tokens_details": {
+      "cached_tokens": 400
+     },
+     "output_tokens": 21,
+     "total_tokens": 531
+    }
+   },
+   "raw_stop_reason": null,
+   "reasoning": null,
+   "reasoning_blocks": null,
+   "stop_reason": null,
+   "text": "Hi there, friend.",
+   "tool_calls": [],
+   "usage": {
+    "cache_creation_input_tokens": null,
+    "cache_read_input_tokens": 400,
+    "cost_source": null,
+    "cost_unknown": false,
+    "cost_usd": null,
+    "input_tokens": 110,
+    "output_tokens": 21,
+    "reasoning_tokens": null,
+    "total_tokens": 131,
+    "usage_reported": true
+   }
+  },
+  "sdk_calls": [
+   {
+    "input": [
+     {
+      "content": "Say hi.",
+      "role": "user"
+     }
+    ],
+    "instructions": "You are terse.",
+    "max_output_tokens": 16000,
+    "model": "gpt-5-mini",
+    "prompt_cache_key": "dendrux:agent:gpt-5-mini",
+    "prompt_cache_retention": "24h",
+    "stream": true
+   }
+  ]
+ },
+ "cache_official_ctor_prefix__batch": {
+  "events": [],
+  "response": {
+   "model": "gpt-5-mini",
+   "provider_request": {
+    "input": [
+     {
+      "content": "Say hi.",
+      "role": "user"
+     }
+    ],
+    "instructions": "You are terse.",
+    "max_output_tokens": 16000,
+    "model": "gpt-5-mini",
+    "prompt_cache_key": "dendrux:tenant-1"
+   },
+   "provider_response": {
+    "id": "resp_oracle_1",
+    "model": "gpt-5-mini",
+    "object": "response",
+    "output": [],
+    "output_text": "Hi there, friend.",
+    "usage": {
+     "input_tokens": 510,
+     "input_tokens_details": {
+      "cached_tokens": 400
+     },
+     "output_tokens": 21,
+     "total_tokens": 531
+    }
+   },
+   "raw_stop_reason": null,
+   "reasoning": null,
+   "reasoning_blocks": null,
+   "stop_reason": null,
+   "text": "Hi there, friend.",
+   "tool_calls": [],
+   "usage": {
+    "cache_creation_input_tokens": null,
+    "cache_read_input_tokens": 400,
+    "cost_source": null,
+    "cost_unknown": false,
+    "cost_usd": null,
+    "input_tokens": 110,
+    "output_tokens": 21,
+    "reasoning_tokens": null,
+    "total_tokens": 131,
+    "usage_reported": true
+   }
+  },
+  "sdk_calls": [
+   {
+    "input": [
+     {
+      "content": "Say hi.",
+      "role": "user"
+     }
+    ],
+    "instructions": "You are terse.",
+    "max_output_tokens": 16000,
+    "model": "gpt-5-mini",
+    "prompt_cache_key": "dendrux:tenant-1"
+   }
+  ]
+ },
+ "cache_official_ctor_prefix__stream": {
+  "events": [
+   {
+    "text": "Hi there",
+    "tool_call_id": null,
+    "tool_name": null,
+    "type": "text_delta"
+   },
+   {
+    "text": ", friend.",
+    "tool_call_id": null,
+    "tool_name": null,
+    "type": "text_delta"
+   }
+  ],
+  "response": {
+   "model": "gpt-5-mini",
+   "provider_request": {
+    "input": [
+     {
+      "content": "Say hi.",
+      "role": "user"
+     }
+    ],
+    "instructions": "You are terse.",
+    "max_output_tokens": 16000,
+    "model": "gpt-5-mini",
+    "prompt_cache_key": "dendrux:tenant-1"
+   },
+   "provider_response": {
+    "id": "resp_oracle_1",
+    "model": "gpt-5-mini",
+    "object": "response",
+    "output": [],
+    "output_text": "Hi there, friend.",
+    "usage": {
+     "input_tokens": 510,
+     "input_tokens_details": {
+      "cached_tokens": 400
+     },
+     "output_tokens": 21,
+     "total_tokens": 531
+    }
+   },
+   "raw_stop_reason": null,
+   "reasoning": null,
+   "reasoning_blocks": null,
+   "stop_reason": null,
+   "text": "Hi there, friend.",
+   "tool_calls": [],
+   "usage": {
+    "cache_creation_input_tokens": null,
+    "cache_read_input_tokens": 400,
+    "cost_source": null,
+    "cost_unknown": false,
+    "cost_usd": null,
+    "input_tokens": 110,
+    "output_tokens": 21,
+    "reasoning_tokens": null,
+    "total_tokens": 131,
+    "usage_reported": true
+   }
+  },
+  "sdk_calls": [
+   {
+    "input": [
+     {
+      "content": "Say hi.",
+      "role": "user"
+     }
+    ],
+    "instructions": "You are terse.",
+    "max_output_tokens": 16000,
+    "model": "gpt-5-mini",
+    "prompt_cache_key": "dendrux:tenant-1",
+    "stream": true
+   }
+  ]
+ },
+ "client_tool_image__batch": {
+  "events": [],
+  "response": {
+   "model": "gpt-5-mini",
+   "provider_request": {
+    "input": [
+     {
+      "content": "Take a screenshot.",
+      "role": "user"
+     },
+     {
+      "arguments": "{}",
+      "call_id": "call_S1",
+      "name": "take_screenshot",
+      "type": "function_call"
+     },
+     {
+      "call_id": "call_S1",
+      "output": [
+       {
+        "text": "\"Captured.\"",
+        "type": "input_text"
+       },
+       {
+        "detail": "auto",
+        "image_url": "dendrux-image:sha256:cde274eebccff410ddd84c30e3133443cf7f63d1f8c630e2919a26e40106c848",
+        "type": "input_image"
+       }
+      ],
+      "type": "function_call_output"
+     },
+     {
+      "content": [
+       {
+        "text": "And this one?",
+        "type": "input_text"
+       },
+       {
+        "detail": "auto",
+        "image_url": "dendrux-image:sha256:cde274eebccff410ddd84c30e3133443cf7f63d1f8c630e2919a26e40106c848",
+        "type": "input_image"
+       }
+      ],
+      "role": "user"
+     }
+    ],
+    "max_output_tokens": 16000,
+    "model": "gpt-5-mini",
+    "tools": [
+     {
+      "description": "Capture the screen.",
+      "name": "take_screenshot",
+      "parameters": {
+       "properties": {},
+       "type": "object"
+      },
+      "strict": true,
+      "type": "function"
+     }
+    ]
+   },
+   "provider_response": {
+    "id": "resp_oracle_1",
+    "model": "gpt-5-mini",
+    "object": "response",
+    "output": [],
+    "output_text": "Hi there, friend.",
+    "usage": {
+     "input_tokens": 510,
+     "input_tokens_details": {
+      "cached_tokens": 400
+     },
+     "output_tokens": 21,
+     "total_tokens": 531
+    }
+   },
+   "raw_stop_reason": null,
+   "reasoning": null,
+   "reasoning_blocks": null,
+   "stop_reason": null,
+   "text": "Hi there, friend.",
+   "tool_calls": [],
+   "usage": {
+    "cache_creation_input_tokens": null,
+    "cache_read_input_tokens": 400,
+    "cost_source": null,
+    "cost_unknown": false,
+    "cost_usd": null,
+    "input_tokens": 110,
+    "output_tokens": 21,
+    "reasoning_tokens": null,
+    "total_tokens": 131,
+    "usage_reported": true
+   }
+  },
+  "sdk_calls": [
+   {
+    "input": [
+     {
+      "content": "Take a screenshot.",
+      "role": "user"
+     },
+     {
+      "arguments": "{}",
+      "call_id": "call_S1",
+      "name": "take_screenshot",
+      "type": "function_call"
+     },
+     {
+      "call_id": "call_S1",
+      "output": [
+       {
+        "text": "\"Captured.\"",
+        "type": "input_text"
+       },
+       {
+        "detail": "auto",
+        "image_url": "<str len=1202 sha256=21d4d2a10e6ac5391dd967c112998b45e295999e88ff038dc937267178c9a37c>",
+        "type": "input_image"
+       }
+      ],
+      "type": "function_call_output"
+     },
+     {
+      "content": [
+       {
+        "text": "And this one?",
+        "type": "input_text"
+       },
+       {
+        "detail": "auto",
+        "image_url": "<str len=1202 sha256=21d4d2a10e6ac5391dd967c112998b45e295999e88ff038dc937267178c9a37c>",
+        "type": "input_image"
+       }
+      ],
+      "role": "user"
+     }
+    ],
+    "max_output_tokens": 16000,
+    "model": "gpt-5-mini",
+    "tools": [
+     {
+      "description": "Capture the screen.",
+      "name": "take_screenshot",
+      "parameters": {
+       "properties": {},
+       "type": "object"
+      },
+      "strict": true,
+      "type": "function"
+     }
+    ]
+   }
+  ]
+ },
+ "client_tool_image__stream": {
+  "events": [
+   {
+    "text": "Hi there",
+    "tool_call_id": null,
+    "tool_name": null,
+    "type": "text_delta"
+   },
+   {
+    "text": ", friend.",
+    "tool_call_id": null,
+    "tool_name": null,
+    "type": "text_delta"
+   }
+  ],
+  "response": {
+   "model": "gpt-5-mini",
+   "provider_request": {
+    "input": [
+     {
+      "content": "Take a screenshot.",
+      "role": "user"
+     },
+     {
+      "arguments": "{}",
+      "call_id": "call_S1",
+      "name": "take_screenshot",
+      "type": "function_call"
+     },
+     {
+      "call_id": "call_S1",
+      "output": [
+       {
+        "text": "\"Captured.\"",
+        "type": "input_text"
+       },
+       {
+        "detail": "auto",
+        "image_url": "dendrux-image:sha256:cde274eebccff410ddd84c30e3133443cf7f63d1f8c630e2919a26e40106c848",
+        "type": "input_image"
+       }
+      ],
+      "type": "function_call_output"
+     },
+     {
+      "content": [
+       {
+        "text": "And this one?",
+        "type": "input_text"
+       },
+       {
+        "detail": "auto",
+        "image_url": "dendrux-image:sha256:cde274eebccff410ddd84c30e3133443cf7f63d1f8c630e2919a26e40106c848",
+        "type": "input_image"
+       }
+      ],
+      "role": "user"
+     }
+    ],
+    "max_output_tokens": 16000,
+    "model": "gpt-5-mini",
+    "tools": [
+     {
+      "description": "Capture the screen.",
+      "name": "take_screenshot",
+      "parameters": {
+       "properties": {},
+       "type": "object"
+      },
+      "strict": true,
+      "type": "function"
+     }
+    ]
+   },
+   "provider_response": {
+    "id": "resp_oracle_1",
+    "model": "gpt-5-mini",
+    "object": "response",
+    "output": [],
+    "output_text": "Hi there, friend.",
+    "usage": {
+     "input_tokens": 510,
+     "input_tokens_details": {
+      "cached_tokens": 400
+     },
+     "output_tokens": 21,
+     "total_tokens": 531
+    }
+   },
+   "raw_stop_reason": null,
+   "reasoning": null,
+   "reasoning_blocks": null,
+   "stop_reason": null,
+   "text": "Hi there, friend.",
+   "tool_calls": [],
+   "usage": {
+    "cache_creation_input_tokens": null,
+    "cache_read_input_tokens": 400,
+    "cost_source": null,
+    "cost_unknown": false,
+    "cost_usd": null,
+    "input_tokens": 110,
+    "output_tokens": 21,
+    "reasoning_tokens": null,
+    "total_tokens": 131,
+    "usage_reported": true
+   }
+  },
+  "sdk_calls": [
+   {
+    "input": [
+     {
+      "content": "Take a screenshot.",
+      "role": "user"
+     },
+     {
+      "arguments": "{}",
+      "call_id": "call_S1",
+      "name": "take_screenshot",
+      "type": "function_call"
+     },
+     {
+      "call_id": "call_S1",
+      "output": [
+       {
+        "text": "\"Captured.\"",
+        "type": "input_text"
+       },
+       {
+        "detail": "auto",
+        "image_url": "<str len=1202 sha256=21d4d2a10e6ac5391dd967c112998b45e295999e88ff038dc937267178c9a37c>",
+        "type": "input_image"
+       }
+      ],
+      "type": "function_call_output"
+     },
+     {
+      "content": [
+       {
+        "text": "And this one?",
+        "type": "input_text"
+       },
+       {
+        "detail": "auto",
+        "image_url": "<str len=1202 sha256=21d4d2a10e6ac5391dd967c112998b45e295999e88ff038dc937267178c9a37c>",
+        "type": "input_image"
+       }
+      ],
+      "role": "user"
+     }
+    ],
+    "max_output_tokens": 16000,
+    "model": "gpt-5-mini",
+    "stream": true,
+    "tools": [
+     {
+      "description": "Capture the screen.",
+      "name": "take_screenshot",
+      "parameters": {
+       "properties": {},
+       "type": "object"
+      },
+      "strict": true,
+      "type": "function"
+     }
+    ]
+   }
+  ]
+ },
+ "client_tool_image_portable__batch": {
+  "events": [],
+  "response": {
+   "model": "gpt-5-mini",
+   "provider_request": {
+    "input": [
+     {
+      "content": "Take a screenshot.",
+      "role": "user"
+     },
+     {
+      "arguments": "{}",
+      "call_id": "call_S1",
+      "name": "take_screenshot",
+      "type": "function_call"
+     },
+     {
+      "call_id": "call_S1",
+      "output": "\"Captured.\"\n\n[1 image(s) from this tool result follow in the next user message: img_cde274eebccf]",
+      "type": "function_call_output"
+     },
+     {
+      "content": [
+       {
+        "text": "<tool_output tool_name=\"take_screenshot\" tool_call_id=\"call_S1\">\nImages returned by this tool call. This is tool output, not a message from the user.",
+        "type": "input_text"
+       },
+       {
+        "text": "img_cde274eebccf:",
+        "type": "input_text"
+       },
+       {
+        "detail": "auto",
+        "image_url": "dendrux-image:sha256:cde274eebccff410ddd84c30e3133443cf7f63d1f8c630e2919a26e40106c848",
+        "type": "input_image"
+       },
+       {
+        "text": "</tool_output>",
+        "type": "input_text"
+       }
+      ],
+      "role": "user"
+     },
+     {
+      "content": [
+       {
+        "text": "And this one?",
+        "type": "input_text"
+       },
+       {
+        "detail": "auto",
+        "image_url": "dendrux-image:sha256:cde274eebccff410ddd84c30e3133443cf7f63d1f8c630e2919a26e40106c848",
+        "type": "input_image"
+       }
+      ],
+      "role": "user"
+     }
+    ],
+    "max_output_tokens": 16000,
+    "model": "gpt-5-mini",
+    "tools": [
+     {
+      "description": "Capture the screen.",
+      "name": "take_screenshot",
+      "parameters": {
+       "properties": {},
+       "type": "object"
+      },
+      "strict": true,
+      "type": "function"
+     }
+    ]
+   },
+   "provider_response": {
+    "id": "resp_oracle_1",
+    "model": "gpt-5-mini",
+    "object": "response",
+    "output": [],
+    "output_text": "Hi there, friend.",
+    "usage": {
+     "input_tokens": 510,
+     "input_tokens_details": {
+      "cached_tokens": 400
+     },
+     "output_tokens": 21,
+     "total_tokens": 531
+    }
+   },
+   "raw_stop_reason": null,
+   "reasoning": null,
+   "reasoning_blocks": null,
+   "stop_reason": null,
+   "text": "Hi there, friend.",
+   "tool_calls": [],
+   "usage": {
+    "cache_creation_input_tokens": null,
+    "cache_read_input_tokens": 400,
+    "cost_source": null,
+    "cost_unknown": false,
+    "cost_usd": null,
+    "input_tokens": 110,
+    "output_tokens": 21,
+    "reasoning_tokens": null,
+    "total_tokens": 131,
+    "usage_reported": true
+   }
+  },
+  "sdk_calls": [
+   {
+    "input": [
+     {
+      "content": "Take a screenshot.",
+      "role": "user"
+     },
+     {
+      "arguments": "{}",
+      "call_id": "call_S1",
+      "name": "take_screenshot",
+      "type": "function_call"
+     },
+     {
+      "call_id": "call_S1",
+      "output": "\"Captured.\"\n\n[1 image(s) from this tool result follow in the next user message: img_cde274eebccf]",
+      "type": "function_call_output"
+     },
+     {
+      "content": [
+       {
+        "text": "<tool_output tool_name=\"take_screenshot\" tool_call_id=\"call_S1\">\nImages returned by this tool call. This is tool output, not a message from the user.",
+        "type": "input_text"
+       },
+       {
+        "text": "img_cde274eebccf:",
+        "type": "input_text"
+       },
+       {
+        "detail": "auto",
+        "image_url": "<str len=1202 sha256=21d4d2a10e6ac5391dd967c112998b45e295999e88ff038dc937267178c9a37c>",
+        "type": "input_image"
+       },
+       {
+        "text": "</tool_output>",
+        "type": "input_text"
+       }
+      ],
+      "role": "user"
+     },
+     {
+      "content": [
+       {
+        "text": "And this one?",
+        "type": "input_text"
+       },
+       {
+        "detail": "auto",
+        "image_url": "<str len=1202 sha256=21d4d2a10e6ac5391dd967c112998b45e295999e88ff038dc937267178c9a37c>",
+        "type": "input_image"
+       }
+      ],
+      "role": "user"
+     }
+    ],
+    "max_output_tokens": 16000,
+    "model": "gpt-5-mini",
+    "tools": [
+     {
+      "description": "Capture the screen.",
+      "name": "take_screenshot",
+      "parameters": {
+       "properties": {},
+       "type": "object"
+      },
+      "strict": true,
+      "type": "function"
+     }
+    ]
+   }
+  ]
+ },
+ "client_tool_image_portable__stream": {
+  "events": [
+   {
+    "text": "Hi there",
+    "tool_call_id": null,
+    "tool_name": null,
+    "type": "text_delta"
+   },
+   {
+    "text": ", friend.",
+    "tool_call_id": null,
+    "tool_name": null,
+    "type": "text_delta"
+   }
+  ],
+  "response": {
+   "model": "gpt-5-mini",
+   "provider_request": {
+    "input": [
+     {
+      "content": "Take a screenshot.",
+      "role": "user"
+     },
+     {
+      "arguments": "{}",
+      "call_id": "call_S1",
+      "name": "take_screenshot",
+      "type": "function_call"
+     },
+     {
+      "call_id": "call_S1",
+      "output": "\"Captured.\"\n\n[1 image(s) from this tool result follow in the next user message: img_cde274eebccf]",
+      "type": "function_call_output"
+     },
+     {
+      "content": [
+       {
+        "text": "<tool_output tool_name=\"take_screenshot\" tool_call_id=\"call_S1\">\nImages returned by this tool call. This is tool output, not a message from the user.",
+        "type": "input_text"
+       },
+       {
+        "text": "img_cde274eebccf:",
+        "type": "input_text"
+       },
+       {
+        "detail": "auto",
+        "image_url": "dendrux-image:sha256:cde274eebccff410ddd84c30e3133443cf7f63d1f8c630e2919a26e40106c848",
+        "type": "input_image"
+       },
+       {
+        "text": "</tool_output>",
+        "type": "input_text"
+       }
+      ],
+      "role": "user"
+     },
+     {
+      "content": [
+       {
+        "text": "And this one?",
+        "type": "input_text"
+       },
+       {
+        "detail": "auto",
+        "image_url": "dendrux-image:sha256:cde274eebccff410ddd84c30e3133443cf7f63d1f8c630e2919a26e40106c848",
+        "type": "input_image"
+       }
+      ],
+      "role": "user"
+     }
+    ],
+    "max_output_tokens": 16000,
+    "model": "gpt-5-mini",
+    "tools": [
+     {
+      "description": "Capture the screen.",
+      "name": "take_screenshot",
+      "parameters": {
+       "properties": {},
+       "type": "object"
+      },
+      "strict": true,
+      "type": "function"
+     }
+    ]
+   },
+   "provider_response": {
+    "id": "resp_oracle_1",
+    "model": "gpt-5-mini",
+    "object": "response",
+    "output": [],
+    "output_text": "Hi there, friend.",
+    "usage": {
+     "input_tokens": 510,
+     "input_tokens_details": {
+      "cached_tokens": 400
+     },
+     "output_tokens": 21,
+     "total_tokens": 531
+    }
+   },
+   "raw_stop_reason": null,
+   "reasoning": null,
+   "reasoning_blocks": null,
+   "stop_reason": null,
+   "text": "Hi there, friend.",
+   "tool_calls": [],
+   "usage": {
+    "cache_creation_input_tokens": null,
+    "cache_read_input_tokens": 400,
+    "cost_source": null,
+    "cost_unknown": false,
+    "cost_usd": null,
+    "input_tokens": 110,
+    "output_tokens": 21,
+    "reasoning_tokens": null,
+    "total_tokens": 131,
+    "usage_reported": true
+   }
+  },
+  "sdk_calls": [
+   {
+    "input": [
+     {
+      "content": "Take a screenshot.",
+      "role": "user"
+     },
+     {
+      "arguments": "{}",
+      "call_id": "call_S1",
+      "name": "take_screenshot",
+      "type": "function_call"
+     },
+     {
+      "call_id": "call_S1",
+      "output": "\"Captured.\"\n\n[1 image(s) from this tool result follow in the next user message: img_cde274eebccf]",
+      "type": "function_call_output"
+     },
+     {
+      "content": [
+       {
+        "text": "<tool_output tool_name=\"take_screenshot\" tool_call_id=\"call_S1\">\nImages returned by this tool call. This is tool output, not a message from the user.",
+        "type": "input_text"
+       },
+       {
+        "text": "img_cde274eebccf:",
+        "type": "input_text"
+       },
+       {
+        "detail": "auto",
+        "image_url": "<str len=1202 sha256=21d4d2a10e6ac5391dd967c112998b45e295999e88ff038dc937267178c9a37c>",
+        "type": "input_image"
+       },
+       {
+        "text": "</tool_output>",
+        "type": "input_text"
+       }
+      ],
+      "role": "user"
+     },
+     {
+      "content": [
+       {
+        "text": "And this one?",
+        "type": "input_text"
+       },
+       {
+        "detail": "auto",
+        "image_url": "<str len=1202 sha256=21d4d2a10e6ac5391dd967c112998b45e295999e88ff038dc937267178c9a37c>",
+        "type": "input_image"
+       }
+      ],
+      "role": "user"
+     }
+    ],
+    "max_output_tokens": 16000,
+    "model": "gpt-5-mini",
+    "stream": true,
+    "tools": [
+     {
+      "description": "Capture the screen.",
+      "name": "take_screenshot",
+      "parameters": {
+       "properties": {},
+       "type": "object"
+      },
+      "strict": true,
+      "type": "function"
+     }
+    ]
+   }
+  ]
+ },
+ "reasoning__batch": {
+  "events": [],
+  "response": {
+   "model": "gpt-5-mini",
+   "provider_request": {
+    "input": [
+     {
+      "content": "Say hi.",
+      "role": "user"
+     }
+    ],
+    "instructions": "You are terse.",
+    "max_output_tokens": 16000,
+    "model": "gpt-5-mini",
+    "reasoning": {
+     "effort": "xhigh",
+     "summary": "auto"
+    },
+    "temperature": 0.3,
+    "top_p": 0.5
+   },
+   "provider_response": {
+    "id": "resp_oracle_1",
+    "model": "gpt-5-mini",
+    "object": "response",
+    "output": [],
+    "output_text": "Hi there, friend.",
+    "usage": {
+     "input_tokens": 510,
+     "input_tokens_details": {
+      "cached_tokens": 400
+     },
+     "output_tokens": 21,
+     "total_tokens": 531
+    }
+   },
+   "raw_stop_reason": null,
+   "reasoning": null,
+   "reasoning_blocks": null,
+   "stop_reason": null,
+   "text": "Hi there, friend.",
+   "tool_calls": [],
+   "usage": {
+    "cache_creation_input_tokens": null,
+    "cache_read_input_tokens": 400,
+    "cost_source": null,
+    "cost_unknown": false,
+    "cost_usd": null,
+    "input_tokens": 110,
+    "output_tokens": 21,
+    "reasoning_tokens": null,
+    "total_tokens": 131,
+    "usage_reported": true
+   }
+  },
+  "sdk_calls": [
+   {
+    "input": [
+     {
+      "content": "Say hi.",
+      "role": "user"
+     }
+    ],
+    "instructions": "You are terse.",
+    "max_output_tokens": 16000,
+    "model": "gpt-5-mini",
+    "reasoning": {
+     "effort": "xhigh",
+     "summary": "auto"
+    },
+    "temperature": 0.3,
+    "top_p": 0.5
+   }
+  ]
+ },
+ "reasoning__stream": {
+  "events": [
+   {
+    "text": "Hi there",
+    "tool_call_id": null,
+    "tool_name": null,
+    "type": "text_delta"
+   },
+   {
+    "text": ", friend.",
+    "tool_call_id": null,
+    "tool_name": null,
+    "type": "text_delta"
+   }
+  ],
+  "response": {
+   "model": "gpt-5-mini",
+   "provider_request": {
+    "input": [
+     {
+      "content": "Say hi.",
+      "role": "user"
+     }
+    ],
+    "instructions": "You are terse.",
+    "max_output_tokens": 16000,
+    "model": "gpt-5-mini",
+    "reasoning": {
+     "effort": "xhigh",
+     "summary": "auto"
+    },
+    "temperature": 0.3,
+    "top_p": 0.5
+   },
+   "provider_response": {
+    "id": "resp_oracle_1",
+    "model": "gpt-5-mini",
+    "object": "response",
+    "output": [],
+    "output_text": "Hi there, friend.",
+    "usage": {
+     "input_tokens": 510,
+     "input_tokens_details": {
+      "cached_tokens": 400
+     },
+     "output_tokens": 21,
+     "total_tokens": 531
+    }
+   },
+   "raw_stop_reason": null,
+   "reasoning": null,
+   "reasoning_blocks": null,
+   "stop_reason": null,
+   "text": "Hi there, friend.",
+   "tool_calls": [],
+   "usage": {
+    "cache_creation_input_tokens": null,
+    "cache_read_input_tokens": 400,
+    "cost_source": null,
+    "cost_unknown": false,
+    "cost_usd": null,
+    "input_tokens": 110,
+    "output_tokens": 21,
+    "reasoning_tokens": null,
+    "total_tokens": 131,
+    "usage_reported": true
+   }
+  },
+  "sdk_calls": [
+   {
+    "input": [
+     {
+      "content": "Say hi.",
+      "role": "user"
+     }
+    ],
+    "instructions": "You are terse.",
+    "max_output_tokens": 16000,
+    "model": "gpt-5-mini",
+    "reasoning": {
+     "effort": "xhigh",
+     "summary": "auto"
+    },
+    "stream": true,
+    "temperature": 0.3,
+    "top_p": 0.5
+   }
+  ]
+ },
+ "reasoning_legacy__batch": {
+  "events": [],
+  "response": {
+   "model": "gpt-5-mini",
+   "provider_request": {
+    "input": [
+     {
+      "content": "Say hi.",
+      "role": "user"
+     }
+    ],
+    "instructions": "You are terse.",
+    "max_output_tokens": 55,
+    "model": "gpt-5-mini",
+    "reasoning": {
+     "effort": "medium"
+    },
+    "tool_choice": "auto"
+   },
+   "provider_response": {
+    "id": "resp_oracle_1",
+    "model": "gpt-5-mini",
+    "object": "response",
+    "output": [],
+    "output_text": "Hi there, friend.",
+    "usage": {
+     "input_tokens": 510,
+     "input_tokens_details": {
+      "cached_tokens": 400
+     },
+     "output_tokens": 21,
+     "total_tokens": 531
+    }
+   },
+   "raw_stop_reason": null,
+   "reasoning": null,
+   "reasoning_blocks": null,
+   "stop_reason": null,
+   "text": "Hi there, friend.",
+   "tool_calls": [],
+   "usage": {
+    "cache_creation_input_tokens": null,
+    "cache_read_input_tokens": 400,
+    "cost_source": null,
+    "cost_unknown": false,
+    "cost_usd": null,
+    "input_tokens": 110,
+    "output_tokens": 21,
+    "reasoning_tokens": null,
+    "total_tokens": 131,
+    "usage_reported": true
+   }
+  },
+  "sdk_calls": [
+   {
+    "input": [
+     {
+      "content": "Say hi.",
+      "role": "user"
+     }
+    ],
+    "instructions": "You are terse.",
+    "max_output_tokens": 55,
+    "model": "gpt-5-mini",
+    "reasoning": {
+     "effort": "medium"
+    },
+    "tool_choice": "auto"
+   }
+  ]
+ },
+ "reasoning_legacy__stream": {
+  "events": [
+   {
+    "text": "Hi there",
+    "tool_call_id": null,
+    "tool_name": null,
+    "type": "text_delta"
+   },
+   {
+    "text": ", friend.",
+    "tool_call_id": null,
+    "tool_name": null,
+    "type": "text_delta"
+   }
+  ],
+  "response": {
+   "model": "gpt-5-mini",
+   "provider_request": {
+    "input": [
+     {
+      "content": "Say hi.",
+      "role": "user"
+     }
+    ],
+    "instructions": "You are terse.",
+    "max_output_tokens": 55,
+    "model": "gpt-5-mini",
+    "reasoning": {
+     "effort": "medium"
+    },
+    "tool_choice": "auto"
+   },
+   "provider_response": {
+    "id": "resp_oracle_1",
+    "model": "gpt-5-mini",
+    "object": "response",
+    "output": [],
+    "output_text": "Hi there, friend.",
+    "usage": {
+     "input_tokens": 510,
+     "input_tokens_details": {
+      "cached_tokens": 400
+     },
+     "output_tokens": 21,
+     "total_tokens": 531
+    }
+   },
+   "raw_stop_reason": null,
+   "reasoning": null,
+   "reasoning_blocks": null,
+   "stop_reason": null,
+   "text": "Hi there, friend.",
+   "tool_calls": [],
+   "usage": {
+    "cache_creation_input_tokens": null,
+    "cache_read_input_tokens": 400,
+    "cost_source": null,
+    "cost_unknown": false,
+    "cost_usd": null,
+    "input_tokens": 110,
+    "output_tokens": 21,
+    "reasoning_tokens": null,
+    "total_tokens": 131,
+    "usage_reported": true
+   }
+  },
+  "sdk_calls": [
+   {
+    "input": [
+     {
+      "content": "Say hi.",
+      "role": "user"
+     }
+    ],
+    "instructions": "You are terse.",
+    "max_output_tokens": 55,
+    "model": "gpt-5-mini",
+    "reasoning": {
+     "effort": "medium"
+    },
+    "stream": true,
+    "tool_choice": "auto"
+   }
+  ]
+ },
+ "server_tool__batch": {
+  "events": [],
+  "response": {
+   "model": "gpt-5-mini",
+   "provider_request": {
+    "input": [
+     {
+      "content": "What is 2+3?",
+      "role": "user"
+     },
+     {
+      "content": "Let me add.",
+      "role": "assistant"
+     },
+     {
+      "arguments": "{\"a\": 2, \"b\": 3}",
+      "call_id": "call_A1",
+      "name": "add",
+      "type": "function_call"
+     },
+     {
+      "call_id": "call_A1",
+      "output": "5",
+      "type": "function_call_output"
+     }
+    ],
+    "instructions": "Use tools.",
+    "max_output_tokens": 16000,
+    "model": "gpt-5-mini",
+    "tools": [
+     {
+      "type": "web_search_preview"
+     },
+     {
+      "description": "Add two numbers.",
+      "name": "add",
+      "parameters": {
+       "properties": {
+        "a": {
+         "type": "integer"
+        },
+        "b": {
+         "type": "integer"
+        }
+       },
+       "required": [
+        "a",
+        "b"
+       ],
+       "type": "object"
+      },
+      "type": "function"
+     }
+    ]
+   },
+   "provider_response": {
+    "id": "resp_oracle_1",
+    "model": "gpt-5-mini",
+    "object": "response",
+    "output": [
+     {
+      "arguments": "{\"a\": 5, \"b\": 1}",
+      "call_id": "call_B2",
+      "id": "fc_oracle_1_0",
+      "name": "add",
+      "type": "function_call"
+     }
+    ],
+    "output_text": "Adding again.",
+    "usage": {
+     "input_tokens": 510,
+     "input_tokens_details": {
+      "cached_tokens": 400
+     },
+     "output_tokens": 21,
+     "total_tokens": 531
+    }
+   },
+   "raw_stop_reason": null,
+   "reasoning": null,
+   "reasoning_blocks": null,
+   "stop_reason": null,
+   "text": "Adding again.",
+   "tool_calls": [
+    {
+     "name": "add",
+     "params": {
+      "a": 5,
+      "b": 1
+     },
+     "parse_error": null,
+     "provider_tool_call_id": "call_B2"
+    }
+   ],
+   "usage": {
+    "cache_creation_input_tokens": null,
+    "cache_read_input_tokens": 400,
+    "cost_source": null,
+    "cost_unknown": false,
+    "cost_usd": null,
+    "input_tokens": 110,
+    "output_tokens": 21,
+    "reasoning_tokens": null,
+    "total_tokens": 131,
+    "usage_reported": true
+   }
+  },
+  "sdk_calls": [
+   {
+    "input": [
+     {
+      "content": "What is 2+3?",
+      "role": "user"
+     },
+     {
+      "content": "Let me add.",
+      "role": "assistant"
+     },
+     {
+      "arguments": "{\"a\": 2, \"b\": 3}",
+      "call_id": "call_A1",
+      "name": "add",
+      "type": "function_call"
+     },
+     {
+      "call_id": "call_A1",
+      "output": "5",
+      "type": "function_call_output"
+     }
+    ],
+    "instructions": "Use tools.",
+    "max_output_tokens": 16000,
+    "model": "gpt-5-mini",
+    "tools": [
+     {
+      "type": "web_search_preview"
+     },
+     {
+      "description": "Add two numbers.",
+      "name": "add",
+      "parameters": {
+       "properties": {
+        "a": {
+         "type": "integer"
+        },
+        "b": {
+         "type": "integer"
+        }
+       },
+       "required": [
+        "a",
+        "b"
+       ],
+       "type": "object"
+      },
+      "type": "function"
+     }
+    ]
+   }
+  ]
+ },
+ "server_tool__stream": {
+  "events": [
+   {
+    "text": "Adding",
+    "tool_call_id": null,
+    "tool_name": null,
+    "type": "text_delta"
+   },
+   {
+    "text": " again.",
+    "tool_call_id": null,
+    "tool_name": null,
+    "type": "text_delta"
+   },
+   {
+    "text": null,
+    "tool_call_id": "call_B2",
+    "tool_name": "add",
+    "type": "tool_use_start"
+   },
+   {
+    "text": null,
+    "tool_call_id": "call_B2",
+    "tool_name": "add",
+    "type": "tool_use_end"
+   }
+  ],
+  "response": {
+   "model": "gpt-5-mini",
+   "provider_request": {
+    "input": [
+     {
+      "content": "What is 2+3?",
+      "role": "user"
+     },
+     {
+      "content": "Let me add.",
+      "role": "assistant"
+     },
+     {
+      "arguments": "{\"a\": 2, \"b\": 3}",
+      "call_id": "call_A1",
+      "name": "add",
+      "type": "function_call"
+     },
+     {
+      "call_id": "call_A1",
+      "output": "5",
+      "type": "function_call_output"
+     }
+    ],
+    "instructions": "Use tools.",
+    "max_output_tokens": 16000,
+    "model": "gpt-5-mini",
+    "tools": [
+     {
+      "type": "web_search_preview"
+     },
+     {
+      "description": "Add two numbers.",
+      "name": "add",
+      "parameters": {
+       "properties": {
+        "a": {
+         "type": "integer"
+        },
+        "b": {
+         "type": "integer"
+        }
+       },
+       "required": [
+        "a",
+        "b"
+       ],
+       "type": "object"
+      },
+      "type": "function"
+     }
+    ]
+   },
+   "provider_response": {
+    "id": "resp_oracle_1",
+    "model": "gpt-5-mini",
+    "object": "response",
+    "output": [
+     {
+      "arguments": "{\"a\": 5, \"b\": 1}",
+      "call_id": "call_B2",
+      "id": "fc_oracle_1_0",
+      "name": "add",
+      "type": "function_call"
+     }
+    ],
+    "output_text": "Adding again.",
+    "usage": {
+     "input_tokens": 510,
+     "input_tokens_details": {
+      "cached_tokens": 400
+     },
+     "output_tokens": 21,
+     "total_tokens": 531
+    }
+   },
+   "raw_stop_reason": null,
+   "reasoning": null,
+   "reasoning_blocks": null,
+   "stop_reason": null,
+   "text": "Adding again.",
+   "tool_calls": [
+    {
+     "name": "add",
+     "params": {
+      "a": 5,
+      "b": 1
+     },
+     "parse_error": null,
+     "provider_tool_call_id": "call_B2"
+    }
+   ],
+   "usage": {
+    "cache_creation_input_tokens": null,
+    "cache_read_input_tokens": 400,
+    "cost_source": null,
+    "cost_unknown": false,
+    "cost_usd": null,
+    "input_tokens": 110,
+    "output_tokens": 21,
+    "reasoning_tokens": null,
+    "total_tokens": 131,
+    "usage_reported": true
+   }
+  },
+  "sdk_calls": [
+   {
+    "input": [
+     {
+      "content": "What is 2+3?",
+      "role": "user"
+     },
+     {
+      "content": "Let me add.",
+      "role": "assistant"
+     },
+     {
+      "arguments": "{\"a\": 2, \"b\": 3}",
+      "call_id": "call_A1",
+      "name": "add",
+      "type": "function_call"
+     },
+     {
+      "call_id": "call_A1",
+      "output": "5",
+      "type": "function_call_output"
+     }
+    ],
+    "instructions": "Use tools.",
+    "max_output_tokens": 16000,
+    "model": "gpt-5-mini",
+    "stream": true,
+    "tools": [
+     {
+      "type": "web_search_preview"
+     },
+     {
+      "description": "Add two numbers.",
+      "name": "add",
+      "parameters": {
+       "properties": {
+        "a": {
+         "type": "integer"
+        },
+        "b": {
+         "type": "integer"
+        }
+       },
+       "required": [
+        "a",
+        "b"
+       ],
+       "type": "object"
+      },
+      "type": "function"
+     }
+    ]
+   }
+  ]
+ },
+ "structured__batch": {
+  "events": [],
+  "response": {
+   "model": "gpt-5-mini",
+   "provider_request": {
+    "input": [
+     {
+      "content": "Name a city.",
+      "role": "user"
+     }
+    ],
+    "max_output_tokens": 16000,
+    "model": "gpt-5-mini",
+    "text": {
+     "format": {
+      "name": "City",
+      "schema": {
+       "additionalProperties": false,
+       "properties": {
+        "name": {
+         "type": "string"
+        },
+        "population": {
+         "type": "integer"
+        }
+       },
+       "required": [
+        "name",
+        "population"
+       ],
+       "title": "City",
+       "type": "object"
+      },
+      "strict": true,
+      "type": "json_schema"
+     }
+    }
+   },
+   "provider_response": {
+    "id": "resp_oracle_1",
+    "model": "gpt-5-mini",
+    "object": "response",
+    "output": [],
+    "output_text": "{\"name\": \"Oslo\", \"population\": 700000}",
+    "usage": {
+     "input_tokens": 510,
+     "input_tokens_details": {
+      "cached_tokens": 400
+     },
+     "output_tokens": 21,
+     "total_tokens": 531
+    }
+   },
+   "raw_stop_reason": null,
+   "reasoning": null,
+   "reasoning_blocks": null,
+   "stop_reason": null,
+   "text": "{\"name\": \"Oslo\", \"population\": 700000}",
+   "tool_calls": [],
+   "usage": {
+    "cache_creation_input_tokens": null,
+    "cache_read_input_tokens": 400,
+    "cost_source": null,
+    "cost_unknown": false,
+    "cost_usd": null,
+    "input_tokens": 110,
+    "output_tokens": 21,
+    "reasoning_tokens": null,
+    "total_tokens": 131,
+    "usage_reported": true
+   }
+  },
+  "sdk_calls": [
+   {
+    "input": [
+     {
+      "content": "Name a city.",
+      "role": "user"
+     }
+    ],
+    "max_output_tokens": 16000,
+    "model": "gpt-5-mini",
+    "text": {
+     "format": {
+      "name": "City",
+      "schema": {
+       "additionalProperties": false,
+       "properties": {
+        "name": {
+         "type": "string"
+        },
+        "population": {
+         "type": "integer"
+        }
+       },
+       "required": [
+        "name",
+        "population"
+       ],
+       "title": "City",
+       "type": "object"
+      },
+      "strict": true,
+      "type": "json_schema"
+     }
+    }
+   }
+  ]
+ },
+ "structured__stream": {
+  "events": [
+   {
+    "text": "{\"name\": \"Oslo\", \"p",
+    "tool_call_id": null,
+    "tool_name": null,
+    "type": "text_delta"
+   },
+   {
+    "text": "opulation\": 700000}",
+    "tool_call_id": null,
+    "tool_name": null,
+    "type": "text_delta"
+   }
+  ],
+  "response": {
+   "model": "gpt-5-mini",
+   "provider_request": {
+    "input": [
+     {
+      "content": "Name a city.",
+      "role": "user"
+     }
+    ],
+    "max_output_tokens": 16000,
+    "model": "gpt-5-mini",
+    "text": {
+     "format": {
+      "name": "City",
+      "schema": {
+       "additionalProperties": false,
+       "properties": {
+        "name": {
+         "type": "string"
+        },
+        "population": {
+         "type": "integer"
+        }
+       },
+       "required": [
+        "name",
+        "population"
+       ],
+       "title": "City",
+       "type": "object"
+      },
+      "strict": true,
+      "type": "json_schema"
+     }
+    }
+   },
+   "provider_response": {
+    "id": "resp_oracle_1",
+    "model": "gpt-5-mini",
+    "object": "response",
+    "output": [],
+    "output_text": "{\"name\": \"Oslo\", \"population\": 700000}",
+    "usage": {
+     "input_tokens": 510,
+     "input_tokens_details": {
+      "cached_tokens": 400
+     },
+     "output_tokens": 21,
+     "total_tokens": 531
+    }
+   },
+   "raw_stop_reason": null,
+   "reasoning": null,
+   "reasoning_blocks": null,
+   "stop_reason": null,
+   "text": "{\"name\": \"Oslo\", \"population\": 700000}",
+   "tool_calls": [],
+   "usage": {
+    "cache_creation_input_tokens": null,
+    "cache_read_input_tokens": 400,
+    "cost_source": null,
+    "cost_unknown": false,
+    "cost_usd": null,
+    "input_tokens": 110,
+    "output_tokens": 21,
+    "reasoning_tokens": null,
+    "total_tokens": 131,
+    "usage_reported": true
+   }
+  },
+  "sdk_calls": [
+   {
+    "input": [
+     {
+      "content": "Name a city.",
+      "role": "user"
+     }
+    ],
+    "max_output_tokens": 16000,
+    "model": "gpt-5-mini",
+    "stream": true,
+    "text": {
+     "format": {
+      "name": "City",
+      "schema": {
+       "additionalProperties": false,
+       "properties": {
+        "name": {
+         "type": "string"
+        },
+        "population": {
+         "type": "integer"
+        }
+       },
+       "required": [
+        "name",
+        "population"
+       ],
+       "title": "City",
+       "type": "object"
+      },
+      "strict": true,
+      "type": "json_schema"
+     }
+    }
+   }
+  ]
+ },
+ "text__batch": {
+  "events": [],
+  "response": {
+   "model": "gpt-5-mini",
+   "provider_request": {
+    "input": [
+     {
+      "content": "Say hi.",
+      "role": "user"
+     }
+    ],
+    "instructions": "You are terse.",
+    "max_output_tokens": 16000,
+    "model": "gpt-5-mini"
+   },
+   "provider_response": {
+    "id": "resp_oracle_1",
+    "model": "gpt-5-mini",
+    "object": "response",
+    "output": [],
+    "output_text": "Hi there, friend.",
+    "usage": {
+     "input_tokens": 510,
+     "input_tokens_details": {
+      "cached_tokens": 400
+     },
+     "output_tokens": 21,
+     "total_tokens": 531
+    }
+   },
+   "raw_stop_reason": null,
+   "reasoning": null,
+   "reasoning_blocks": null,
+   "stop_reason": null,
+   "text": "Hi there, friend.",
+   "tool_calls": [],
+   "usage": {
+    "cache_creation_input_tokens": null,
+    "cache_read_input_tokens": 400,
+    "cost_source": null,
+    "cost_unknown": false,
+    "cost_usd": null,
+    "input_tokens": 110,
+    "output_tokens": 21,
+    "reasoning_tokens": null,
+    "total_tokens": 131,
+    "usage_reported": true
+   }
+  },
+  "sdk_calls": [
+   {
+    "input": [
+     {
+      "content": "Say hi.",
+      "role": "user"
+     }
+    ],
+    "instructions": "You are terse.",
+    "max_output_tokens": 16000,
+    "model": "gpt-5-mini"
+   }
+  ]
+ },
+ "text__stream": {
+  "events": [
+   {
+    "text": "Hi there",
+    "tool_call_id": null,
+    "tool_name": null,
+    "type": "text_delta"
+   },
+   {
+    "text": ", friend.",
+    "tool_call_id": null,
+    "tool_name": null,
+    "type": "text_delta"
+   }
+  ],
+  "response": {
+   "model": "gpt-5-mini",
+   "provider_request": {
+    "input": [
+     {
+      "content": "Say hi.",
+      "role": "user"
+     }
+    ],
+    "instructions": "You are terse.",
+    "max_output_tokens": 16000,
+    "model": "gpt-5-mini"
+   },
+   "provider_response": {
+    "id": "resp_oracle_1",
+    "model": "gpt-5-mini",
+    "object": "response",
+    "output": [],
+    "output_text": "Hi there, friend.",
+    "usage": {
+     "input_tokens": 510,
+     "input_tokens_details": {
+      "cached_tokens": 400
+     },
+     "output_tokens": 21,
+     "total_tokens": 531
+    }
+   },
+   "raw_stop_reason": null,
+   "reasoning": null,
+   "reasoning_blocks": null,
+   "stop_reason": null,
+   "text": "Hi there, friend.",
+   "tool_calls": [],
+   "usage": {
+    "cache_creation_input_tokens": null,
+    "cache_read_input_tokens": 400,
+    "cost_source": null,
+    "cost_unknown": false,
+    "cost_usd": null,
+    "input_tokens": 110,
+    "output_tokens": 21,
+    "reasoning_tokens": null,
+    "total_tokens": 131,
+    "usage_reported": true
+   }
+  },
+  "sdk_calls": [
+   {
+    "input": [
+     {
+      "content": "Say hi.",
+      "role": "user"
+     }
+    ],
+    "instructions": "You are terse.",
+    "max_output_tokens": 16000,
+    "model": "gpt-5-mini",
+    "stream": true
+   }
+  ]
+ }
+}

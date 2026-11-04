@@ -20,8 +20,7 @@ from sqlalchemy.types import TypeDecorator, TypeEngine
 
 MYSQL_NOPAD_COLLATION = "utf8mb4_0900_bin"
 MARIADB_NOPAD_COLLATION = "utf8mb4_nopad_bin"
-PAD_SPACE_BINARY_COLLATION = "utf8mb4_bin"
-"""Forbidden on identifier columns: it ignores trailing spaces when comparing."""
+# utf8mb4_bin is forbidden on identifier columns: it ignores trailing spaces when comparing.
 
 _FAMILY = ("mysql", "mariadb")
 

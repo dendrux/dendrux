@@ -28,6 +28,7 @@ from dendrux.errors import ProviderError
 from dendrux.llm._helpers import (
     build_call_index,
     build_tool_call,
+    normalize_effort,
     replayable_reasoning_blocks,
     resolve_tool_message_call,
 )
@@ -198,10 +199,6 @@ _SUPPORTED_KWARGS = frozenset(
     {"temperature", "top_p", "top_k", "stop_sequences", "model", "max_tokens"}
 )
 
-# Dendrux effort vocabulary → Anthropic. "extra" is the consumer label for
-# "xhigh"; every other value passes through (Anthropic validates it).
-_EFFORT_ALIASES = {"extra": "xhigh"}
-
 # Content block types replayed verbatim on assistant turns, and never given a
 # cache_control marker.
 _THINKING_BLOCK_TYPES = frozenset({"thinking", "redacted_thinking"})
@@ -210,11 +207,6 @@ _THINKING_BLOCK_TYPES = frozenset({"thinking", "redacted_thinking"})
 # account enforcing preserved-thinking prefix binding drops a mismatched block
 # instead of failing the request.
 _THINKING_BINDING_BETA = "thinking-binding-controls-2026-08-01"
-
-
-def _normalize_effort(effort: str) -> str:
-    """Map a Dendrux effort alias to Anthropic's vocabulary."""
-    return _EFFORT_ALIASES.get(effort, effort)
 
 
 def _reasoning_tokens_from_details(details: Any) -> int | None:
@@ -591,7 +583,7 @@ class AnthropicProvider(LLMProvider):
         else:
             api_kwargs["thinking"] = {"type": "adaptive", "display": display}
         if effort is not None:
-            api_kwargs["output_config"] = {"effort": _normalize_effort(effort)}
+            api_kwargs["output_config"] = {"effort": normalize_effort(effort)}
 
     @logs_provider_errors
     async def complete(
@@ -746,16 +738,19 @@ class AnthropicProvider(LLMProvider):
         client = self._sdk()
         clock = StreamClock(self._deadlines, provider=_PROVIDER, model=model)
         # Closing this generator (aclose, cancel) closes the upstream response.
-        async with contextlib.aclosing(
-            retry_unstarted_stream(
-                functools.partial(self._stream_attempt, client, clock, request),
-                provider=_PROVIDER,
-                model=model,
-                run_id=run_id,
-            )
-        ) as events:
-            async for event in events:
-                yield event
+        try:
+            async with contextlib.aclosing(
+                retry_unstarted_stream(
+                    functools.partial(self._stream_attempt, client, clock, request),
+                    provider=_PROVIDER,
+                    model=model,
+                    run_id=run_id,
+                )
+            ) as events:
+                async for event in events:
+                    yield event
+        finally:
+            del request
 
     async def _stream_attempt(
         self,
@@ -765,6 +760,7 @@ class AnthropicProvider(LLMProvider):
     ) -> AsyncGenerator[StreamEvent, None]:
         """One streaming request: open, relay events, require the terminal event."""
         model = request.model
+        captured_request = request.captured_request
         # Accumulators for building the final LLMResponse
         text_parts: list[str] = []
         tool_calls: list[ToolCall] = []
@@ -781,6 +777,8 @@ class AnthropicProvider(LLMProvider):
         _current_tool_json_parts: list[str] = []
 
         failure: Exception | None = None
+        stream: Any = None
+        iterator: Any = None
         final_message: Any = None
         try:
             async with contextlib.AsyncExitStack() as stack:
@@ -907,9 +905,10 @@ class AnthropicProvider(LLMProvider):
             if not request.registry.has_images:
                 raise mapped from exc
             failure = mapped
+        finally:
+            # Always drop request and SDK-stream aliases, including typed errors.
+            del request, stream, iterator
         if failure is not None:
-            # Frame locals reach tracebacks (and error trackers): the request
-            # (with its base64 payloads) is never bound here.
             raise failure
 
         final_stop = getattr(final_message, "stop_reason", None) if final_message else None
@@ -935,7 +934,7 @@ class AnthropicProvider(LLMProvider):
             stop_reason=stop_reason,
             raw_stop_reason=raw_stop_reason,
         )
-        llm_response.provider_request = request.captured_request
+        llm_response.provider_request = captured_request
         llm_response.model = model
         llm_response.provider_response = final_message.model_dump()
 

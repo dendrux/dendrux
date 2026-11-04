@@ -39,22 +39,15 @@ def test_the_package_follows_its_import_rules() -> None:
     assert _run(CONFIG) == EXIT_STATUS_SUCCESS
 
 
-KNOWN_VIOLATIONS = [
-    r"dendrux\.llm\._retry_telemetry -> dendrux\.loops\._helpers",
-]
+def test_the_layer_contracts_excuse_no_import() -> None:
+    """No upward or persistence import is excused: those contracts carry no ignore list.
 
-
-@pytest.mark.parametrize("edge", KNOWN_VIOLATIONS)
-def test_each_known_upward_import_is_what_its_ignore_entry_covers(
-    edge: str, tmp_path: Path
-) -> None:
-    """Dropping a documented ignore makes the layer contract fail: the rule really bites."""
+    (The last one, retry telemetry reaching into the loop helpers, went in 0.6.0 H8.)
+    """
     text = CONFIG.read_text()
-    stripped = re.sub(rf"^    {edge}\n", "", text, flags=re.M)
-    assert stripped != text, f"{edge} is no longer in the config"
-    config = tmp_path / ".importlinter"
-    config.write_text(stripped)
-    assert _run(config) == EXIT_STATUS_ERROR
+    for contract in ("layers", "no-persistence-below-the-runtime"):
+        section = text.split(f"[importlinter:contract:{contract}]")[1].split("[importlinter:")[0]
+        assert "ignore_imports" not in section, contract
 
 
 @pytest.mark.parametrize(

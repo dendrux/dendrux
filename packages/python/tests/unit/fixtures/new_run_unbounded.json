@@ -1,0 +1,86 @@
+{
+  "retry": {
+    "agent_name": "setup",
+    "delegation_level": 0,
+    "input_data": {
+      "input": "hello"
+    },
+    "meta": {
+      "dendrux.governance": {
+        "digest": "b3e93777b0523ad15e481806b267cc67c0dae4c92f81bb7f514320be39007056",
+        "parts": {
+          "before_tool": "74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b",
+          "budget": "74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b",
+          "deny": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+          "guardrails": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+          "limits": "ec80e6792217599e591d4f178f57530c252e18ece17ffc402edfd5f7cbba1878",
+          "require_approval": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+        },
+        "version": 1
+      },
+      "dendrux.loop": "ReActLoop",
+      "dendrux.retry_of": "source"
+    },
+    "model": "mock",
+    "parent_run_id": null,
+    "retry_of_run_id": "source",
+    "strategy": "NativeToolCalling",
+    "tenant_id": null
+  },
+  "run": {
+    "agent_name": "setup",
+    "delegation_level": 0,
+    "idempotency_fingerprint": null,
+    "idempotency_key": null,
+    "input_data": {
+      "input": "hello"
+    },
+    "meta": {
+      "dendrux.governance": {
+        "digest": "b3e93777b0523ad15e481806b267cc67c0dae4c92f81bb7f514320be39007056",
+        "parts": {
+          "before_tool": "74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b",
+          "budget": "74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b",
+          "deny": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+          "guardrails": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+          "limits": "ec80e6792217599e591d4f178f57530c252e18ece17ffc402edfd5f7cbba1878",
+          "require_approval": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+        },
+        "version": 1
+      },
+      "dendrux.loop": "ReActLoop"
+    },
+    "model": "mock",
+    "parent_run_id": null,
+    "strategy": "NativeToolCalling",
+    "tenant_id": null
+  },
+  "stream": {
+    "agent_name": "setup",
+    "delegation_level": 0,
+    "idempotency_fingerprint": null,
+    "idempotency_key": null,
+    "input_data": {
+      "input": "hello"
+    },
+    "meta": {
+      "dendrux.governance": {
+        "digest": "b3e93777b0523ad15e481806b267cc67c0dae4c92f81bb7f514320be39007056",
+        "parts": {
+          "before_tool": "74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b",
+          "budget": "74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b",
+          "deny": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+          "guardrails": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+          "limits": "ec80e6792217599e591d4f178f57530c252e18ece17ffc402edfd5f7cbba1878",
+          "require_approval": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+        },
+        "version": 1
+      },
+      "dendrux.loop": "ReActLoop"
+    },
+    "model": "mock",
+    "parent_run_id": null,
+    "strategy": "NativeToolCalling",
+    "tenant_id": null
+  }
+}

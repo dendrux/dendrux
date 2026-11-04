@@ -89,7 +89,6 @@ _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 DEFAULT_CACHE_BYTES = 128 * 1024 * 1024
 MIN_GC_AGE = timedelta(hours=1)
 _PURGE_REASON_MAX = 200
-_TRANSIENT_STATES = ("pending", "deleting")
 _READER_STATES = ("live", "purging", "purged")
 
 

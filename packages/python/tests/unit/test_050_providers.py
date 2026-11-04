@@ -942,6 +942,24 @@ def controlled_deadlines(monkeypatch, deadline_arms):
     return timers
 
 
+async def _expire_during_backoff(provider, controlled_deadlines):
+    received = asyncio.Event()
+
+    async def observed_response(response):
+        # wire() installs the product's call-state hook before this observer.
+        received.set()
+
+    provider._client._client.event_hooks["response"].append(observed_response)
+    call = asyncio.create_task(provider.complete(USER))
+    try:
+        await asyncio.wait_for(received.wait(), 10)
+        controlled_deadlines[-1].reschedule(asyncio.get_running_loop().time())
+        return await asyncio.wait_for(call, 10)
+    finally:
+        call.cancel()
+        await asyncio.gather(call, return_exceptions=True)
+
+
 class TestDeadlines:
     @pytest.mark.parametrize("make", [anthropic_provider, chat_provider, responses_provider])
     async def test_call_timeout_abandons_without_retry(
@@ -973,11 +991,11 @@ class TestDeadlines:
             call.cancel()
             await asyncio.gather(call, return_exceptions=True)
 
-    async def test_deadline_during_429_backoff_keeps_rate_limit(self) -> None:
+    async def test_deadline_during_429_backoff_keeps_rate_limit(self, controlled_deadlines) -> None:
         provider = anthropic_provider(call_timeout=0.3, max_retries=2)
         w = wire(provider, json_handler(429, a_error("rate_limit_error"), {"retry-after": "5"}))
         with pytest.raises(ProviderRateLimitError) as info:
-            await provider.complete(USER)
+            await _expire_during_backoff(provider, controlled_deadlines)
         err = info.value
         assert err.timeout_reason == "deadline_during_backoff"
         assert err.status_code == 429
@@ -985,11 +1003,13 @@ class TestDeadlines:
         assert err.retryable is False
         assert len(w.requests) == 1
 
-    async def test_deadline_during_529_backoff_keeps_unavailable(self) -> None:
+    async def test_deadline_during_529_backoff_keeps_unavailable(
+        self, controlled_deadlines
+    ) -> None:
         provider = chat_provider(call_timeout=0.3, max_retries=2)
         w = wire(provider, json_handler(529, {"error": {"message": "x"}}, {"retry-after": "5"}))
         with pytest.raises(ProviderUnavailableError) as info:
-            await provider.complete(USER)
+            await _expire_during_backoff(provider, controlled_deadlines)
         assert info.value.timeout_reason == "deadline_during_backoff"
         assert len(w.requests) == 1
 
@@ -1242,7 +1262,10 @@ class TestTransport:
         from dendrux.llm import _retry_telemetry
 
         hooks = chat_provider()._client._client.event_hooks
-        assert _retry_telemetry._on_response in hooks["response"]
+        assert any(
+            getattr(hook, "func", hook) is _retry_telemetry._on_response
+            for hook in hooks["response"]
+        )
         assert any(
             getattr(hook, "func", hook) is _resilience._on_request for hook in hooks["request"]
         )

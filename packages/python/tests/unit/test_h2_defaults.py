@@ -201,7 +201,7 @@ def test_scaling_table_matches_named_defaults():
 
 def test_mcp_factories_share_transport_defaults():
     from dendrux.mcp._result import normalize_mcp_result
-    from dendrux.mcp._server import MCPServer, _normalize_mcp_result
+    from dendrux.mcp._server import MCPServer
     from dendrux.mcp._source import MCPSource
 
     for operation in (MCPSource, MCPSource.http, MCPSource.stdio, MCPServer):
@@ -218,10 +218,9 @@ def test_mcp_factories_share_transport_defaults():
         }.items():
             if arg in params:
                 assert params[arg].default == constant("mcp._source", bound)
-    for operation in (normalize_mcp_result, _normalize_mcp_result):
-        assert inspect.signature(operation).parameters["max_result_bytes"].default == constant(
-            "mcp._source", "DEFAULT_MAX_RESULT_BYTES"
-        )
+    assert inspect.signature(normalize_mcp_result).parameters[
+        "max_result_bytes"
+    ].default == constant("mcp._source", "DEFAULT_MAX_RESULT_BYTES")
 
 
 def test_database_error_kinds_match_log_projection():

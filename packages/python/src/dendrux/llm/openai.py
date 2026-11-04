@@ -26,18 +26,27 @@ from dendrux.errors import ProviderError
 from dendrux.llm._helpers import (
     build_call_index,
     build_tool_call,
+    normalize_effort,
     resolve_tool_message_call,
 )
 from dendrux.llm._images import (
     WireImageRegistry,
     chat_image,
     chat_text,
-    convert_parts,
-    normalize_base_url,
-    openai_image_support,
-    portable_framing,
-    portable_tool_text,
-    sdk_image_request_error,
+)
+from dendrux.llm._openai_family import (
+    OPENAI_DEFAULT_BASE_URL,
+    OpenAIFamilyProvider,
+    PendingImages,
+    WireBlocks,
+    apply_call_defaults,
+    apply_openai_cache_routing,
+    extra_field,
+    forward_kwargs,
+    inject_structured_output,
+    opened_stream,
+    portable_tool_item,
+    raise_or_defer,
 )
 from dendrux.llm._resilience import (
     DEFAULT_CALL_TIMEOUT,
@@ -51,22 +60,17 @@ from dendrux.llm._resilience import (
     LoopClients,
     StreamClock,
     WireRequest,
-    call_with_timeout,
-    close_quietly,
     content_filter_error,
     logs_provider_errors,
     logs_provider_stream_errors,
     make_http_client,
-    map_sdk_error,
     refusal_error,
     resolve_deadlines,
-    retry_unstarted_stream,
     stream_incomplete,
 )
 from dendrux.llm._retry_telemetry import call_attempt_tracking
 from dendrux.llm._stop_reason import chat_stop_reason
 from dendrux.llm._usage import openai_wire_usage
-from dendrux.llm.base import LLMProvider
 from dendrux.types import (
     LLMResponse,
     ProviderCapabilities,
@@ -82,37 +86,16 @@ if TYPE_CHECKING:
 
     import httpx
 
-    from dendrux.llm.base import ImageSupport
-    from dendrux.types import ImagePart, Message, ToolDef
+    from dendrux.types import Message, ToolDef
 
 logger = logging.getLogger(__name__)
 
 
-_OPENAI_DEFAULT_BASE_URL = "https://api.openai.com/v1/"
-
-_EFFORT_ALIASES = {"extra": "xhigh"}
+_BLOCKS = WireBlocks("messages", chat_text, chat_image)
 
 
-def _normalize_effort(effort: str) -> str:
-    """Map a Dendrux effort alias to OpenAI's vocabulary."""
-    return _EFFORT_ALIASES.get(effort, effort)
-
-
-def _extra_attr(obj: Any, field: str) -> Any:
-    """Read a field that may live in a Pydantic model's ``model_extra``.
-
-    OpenAI-compatible backends (notably OpenRouter) return reasoning fields
-    the OpenAI schema doesn't define; ``extra='allow'`` keeps them, reachable
-    via attribute access or ``model_extra``. Pure OpenAI returns none of them,
-    so every reader below is inert there.
-    """
-    value = getattr(obj, field, None)
-    if value is not None:
-        return value
-    extra = getattr(obj, "model_extra", None)
-    if isinstance(extra, dict):
-        return extra.get(field)
-    return None
+def _tool_message(wire_call_id: str, content: str) -> dict[str, Any]:
+    return {"role": "tool", "tool_call_id": wire_call_id, "content": content}
 
 
 def _reasoning_text_from(obj: Any) -> str | None:
@@ -123,7 +106,7 @@ def _reasoning_text_from(obj: Any) -> str | None:
     stays distinct from "reasoning happened" (which ``reasoning_tokens`` marks).
     """
     for field in ("reasoning", "reasoning_content"):
-        value = _extra_attr(obj, field)
+        value = extra_field(obj, field)
         if isinstance(value, str) and value:
             return value
     return None
@@ -132,7 +115,7 @@ def _reasoning_text_from(obj: Any) -> str | None:
 def _reasoning_details_from(obj: Any) -> list[Any] | None:
     """Opaque reasoning artifacts (``reasoning_details``) to replay verbatim
     across tool-call iterations, per OpenRouter's guidance."""
-    value = _extra_attr(obj, "reasoning_details")
+    value = extra_field(obj, "reasoning_details")
     return value if isinstance(value, list) and value else None
 
 
@@ -216,7 +199,7 @@ class _ToolCallBuffer:
         self.start_emitted: bool = False
 
 
-class OpenAIProvider(LLMProvider):
+class OpenAIProvider(OpenAIFamilyProvider):
     """OpenAI Chat Completions API provider.
 
     Works with OpenAI and any OpenAI-compatible API (vLLM, SGLang, Groq,
@@ -261,7 +244,10 @@ class OpenAIProvider(LLMProvider):
     # Name reported on typed image errors, and whether a rejected image may be
     # located from the vendor error's request path.
     _image_provider_name = "openai"
+    _image_capability_family = "chat"
     _locate_rejected_images = True
+    _sdk_module = openai
+    _stream_include_usage = True
     # Frames between the user's call and the ``timeout=`` deprecation warning.
     _deprecation_stacklevel = 3
 
@@ -387,80 +373,11 @@ class OpenAIProvider(LLMProvider):
         self._extra_body = extra_body
         self._cache_key_prefix = cache_key_prefix
 
-    @property
-    def model(self) -> str:
-        """The model identifier this provider is configured to use."""
-        return self._model
-
     def __repr__(self) -> str:
         base = str(self._client.base_url)
-        if base != "https://api.openai.com/v1/":
+        if base != OPENAI_DEFAULT_BASE_URL:
             return f"OpenAIProvider(model={self._model!r}, base_url={base!r})"
         return f"OpenAIProvider(model={self._model!r})"
-
-    async def close(self) -> None:
-        """Close the underlying HTTP client and release connections."""
-        # Close only what belongs to the running loop: after a loop change the
-        # home transport is first rebuilt, never awaited across loops.
-        current = self._clients.resolve(self._client)
-        self._clients.pop_current_loop_extra()
-        await current.close()
-
-    def _sdk(self) -> openai.AsyncOpenAI:
-        """The SDK client for the running event loop (rebuilt after a loop change)."""
-        return self._clients.resolve(self._client)
-
-    # ------------------------------------------------------------------
-    # Image input (0.4.0)
-    # ------------------------------------------------------------------
-
-    async def image_input_support(self, model: str) -> ImageSupport:
-        """Static table on the official OpenAI endpoint; ``"unknown"`` elsewhere."""
-        if str(self._client.base_url) != _OPENAI_DEFAULT_BASE_URL:
-            return "unknown"
-        return openai_image_support(model)
-
-    def image_capability_key(self, model: str) -> tuple[str, str, str]:
-        return ("chat", normalize_base_url(self._client.base_url), model)
-
-    def _image_error(
-        self, exc: openai.APIError, registry: WireImageRegistry, model: str, *, streaming: bool
-    ) -> Exception:
-        """Typed, sanitised error for a failed image-bearing request (not raised)."""
-        return sdk_image_request_error(
-            exc,
-            provider=self,
-            provider_name=self._image_provider_name,
-            model=model,
-            registry=registry,
-            streaming=streaming,
-            locate=self._locate_rejected_images,
-        )
-
-    def _map_failure(
-        self, exc: BaseException, registry: WireImageRegistry, model: str, *, streaming: bool
-    ) -> Exception | None:
-        """Typed error for a failed call, or None to re-raise ``exc`` unchanged."""
-        if (
-            registry.has_images
-            and isinstance(exc, openai.APIError)
-            and not isinstance(exc, openai.APIConnectionError)
-        ):
-            return self._image_error(exc, registry, model, streaming=streaming)
-        return map_sdk_error(
-            exc,
-            sdk=openai,
-            provider=self._image_provider_name,
-            model=model,
-            streaming=streaming,
-            endpoint=str(self._client.base_url),
-        )
-
-    async def __aenter__(self) -> OpenAIProvider:
-        return self
-
-    async def __aexit__(self, *exc: Any) -> None:
-        await self.close()
 
     def _build_api_kwargs(
         self,
@@ -500,7 +417,7 @@ class OpenAIProvider(LLMProvider):
             "max_completion_tokens",
             kwargs.pop("max_tokens", self._max_tokens),
         )
-        is_openai_endpoint = str(self._client.base_url) == _OPENAI_DEFAULT_BASE_URL
+        is_openai_endpoint = str(self._client.base_url) == OPENAI_DEFAULT_BASE_URL
         token_param = "max_completion_tokens" if is_openai_endpoint else "max_tokens"
 
         api_kwargs: dict[str, Any] = {
@@ -518,17 +435,14 @@ class OpenAIProvider(LLMProvider):
         kwargs.pop("thinking", None)
         effort = kwargs.pop("effort", self._effort)
         if effort is not None:
-            kwargs["reasoning_effort"] = _normalize_effort(effort)
+            kwargs["reasoning_effort"] = normalize_effort(effort)
 
         # Apply constructor defaults for optional params (per-call kwargs override)
-        for attr, key in [
-            (self._temperature, "temperature"),
-            (self._reasoning_effort, "reasoning_effort"),
-        ]:
-            if key in kwargs:
-                api_kwargs[key] = kwargs.pop(key)
-            elif attr is not None:
-                api_kwargs[key] = attr
+        apply_call_defaults(
+            api_kwargs,
+            kwargs,
+            [(self._temperature, "temperature"), (self._reasoning_effort, "reasoning_effort")],
+        )
 
         # Forward remaining supported kwargs — ignore the rest
         already_handled = {
@@ -538,20 +452,17 @@ class OpenAIProvider(LLMProvider):
             "temperature",
             "reasoning_effort",
         }
-        for key in _SUPPORTED_KWARGS - already_handled:
-            if key in kwargs:
-                api_kwargs[key] = kwargs.pop(key)
+        forward_kwargs(api_kwargs, kwargs, _SUPPORTED_KWARGS - already_handled)
 
-        # Cache routing — never keyed on run_id: a per-run key scatters one
-        # conversation's runs across cache lanes and defeats cross-run hits.
-        # Skip on non-OpenAI base_urls (Groq/Together/vLLM/etc.) since some
-        # compatible backends reject unknown OpenAI-specific request fields.
-        if is_openai_endpoint:
-            cache_key_source = self._cache_key_prefix or cache_key_prefix
-            if cache_key_source:
-                api_kwargs["prompt_cache_key"] = f"dendrux:{cache_key_source}"
-            if self._prompt_cache_retention is not None:
-                api_kwargs["prompt_cache_retention"] = self._prompt_cache_retention
+        # Cache routing. Skip on non-OpenAI base_urls (Groq/Together/vLLM/etc.)
+        # since some compatible backends reject unknown OpenAI-specific fields.
+        apply_openai_cache_routing(
+            api_kwargs,
+            base_url=str(self._client.base_url),
+            own_prefix=self._cache_key_prefix,
+            call_prefix=cache_key_prefix,
+            retention=self._prompt_cache_retention,
+        )
 
         # Vendor extensions of the request body (e.g. OpenRouter's `provider`
         # routing block). Per-call extra_body shallow-merges over the
@@ -572,20 +483,16 @@ class OpenAIProvider(LLMProvider):
         output_schema: dict[str, Any],
     ) -> None:
         """Inject response_format for structured output and update evidence."""
-        from dendrux.llm._schema import normalize_for_openai_strict
-
-        strict_schema = normalize_for_openai_strict(output_schema)
-        schema_name = output_schema.get("title", "structured_output")
-        response_format = {
-            "type": "json_schema",
-            "json_schema": {
-                "name": schema_name,
-                "strict": True,
-                "schema": strict_schema,
+        inject_structured_output(
+            api_kwargs,
+            captured_request,
+            output_schema,
+            key="response_format",
+            envelope=lambda name, schema: {
+                "type": "json_schema",
+                "json_schema": {"name": name, "strict": True, "schema": schema},
             },
-        }
-        api_kwargs["response_format"] = response_format
-        captured_request["response_format"] = response_format
+        )
 
     @logs_provider_errors
     async def complete(
@@ -617,56 +524,12 @@ class OpenAIProvider(LLMProvider):
         :class:`~dendrux.errors.ModelRefusalError` and a content filter
         :class:`~dendrux.errors.ContentFilteredError`.
         """
-        registry = WireImageRegistry()
-        api_kwargs, captured_request = self._build_api_kwargs(
-            messages,
-            tools,
-            kwargs,
-            run_id=run_id,
-            cache_key_prefix=cache_key_prefix,
-            registry=registry,
+        return await self._complete_wire(
+            messages, tools, kwargs, output_schema, run_id, cache_key_prefix
         )
 
-        if output_schema is not None:
-            self._inject_structured_output(api_kwargs, captured_request, output_schema)
-        request = WireRequest(api_kwargs, captured_request, registry)
-        model = request.model
-        del api_kwargs, captured_request
-        client = self._sdk()
-
-        # Image-bearing requests never chain SDK errors (they carry the request
-        # body): the typed error is built in the handler, raised after it.
-        failure: Exception | None = None
-        try:
-            response = await call_with_timeout(
-                functools.partial(self._create, client, request),
-                deadlines=self._deadlines,
-                provider=self._image_provider_name,
-                model=model,
-            )
-        except ProviderError:
-            raise
-        except Exception as exc:
-            mapped = self._map_failure(exc, registry, model, streaming=False)
-            if mapped is None:
-                raise
-            if not registry.has_images:
-                raise mapped from exc
-            failure = mapped
-        if failure is not None:
-            # Frame locals reach tracebacks (and error trackers): drop the
-            # request and registry, which hold the base64 payloads.
-            del request, registry
-            raise failure
-
-        llm_response = self._normalize_response(response, model=model)
-
-        # Attach adapter-boundary payloads for evidence layer
-        llm_response.provider_request = request.captured_request
-        llm_response.model = model
-        llm_response.provider_response = response.model_dump()
-
-        return llm_response
+    def _finish_response(self, response: Any, model: str) -> LLMResponse:
+        return self._normalize_response(response, model=model)
 
     @staticmethod
     async def _create(client: openai.AsyncOpenAI, request: WireRequest) -> Any:
@@ -707,33 +570,9 @@ class OpenAIProvider(LLMProvider):
         (retried once when nothing has been yielded yet). Closing the
         generator closes the upstream response.
         """
-        registry = WireImageRegistry()
-        api_kwargs, captured_request = self._build_api_kwargs(
-            messages,
-            tools,
-            kwargs,
-            run_id=run_id,
-            cache_key_prefix=cache_key_prefix,
-            registry=registry,
-        )
-
-        if output_schema is not None:
-            self._inject_structured_output(api_kwargs, captured_request, output_schema)
-        api_kwargs["stream"] = True
-        api_kwargs["stream_options"] = {"include_usage": True}
-        request = WireRequest(api_kwargs, captured_request, registry)
-        model = request.model
-        del api_kwargs, captured_request, registry
-        client = self._sdk()
-        clock = StreamClock(self._deadlines, provider=self._image_provider_name, model=model)
         # Closing this generator (aclose, cancel) closes the upstream response.
         async with contextlib.aclosing(
-            retry_unstarted_stream(
-                functools.partial(self._stream_attempt, client, clock, request),
-                provider=self._image_provider_name,
-                model=model,
-                run_id=run_id,
-            )
+            self._stream_wire(messages, tools, kwargs, output_schema, run_id, cache_key_prefix)
         ) as events:
             async for event in events:
                 yield event
@@ -746,6 +585,7 @@ class OpenAIProvider(LLMProvider):
     ) -> AsyncGenerator[StreamEvent, None]:
         """One streaming request: open, relay chunks, require the terminal chunk."""
         model = request.model
+        captured_request = request.captured_request
         # Accumulators for building the final LLMResponse
         text_parts: list[str] = []
         tool_calls: list[ToolCall] = []
@@ -763,10 +603,12 @@ class OpenAIProvider(LLMProvider):
 
         failure: Exception | None = None
         stream: Any = None
+        chunk_iter: Any = None
         done_seen: list[bool] | None = None
         try:
-            try:
-                stream = await clock.open(functools.partial(self._create, client, request))
+            async with opened_stream(
+                clock, functools.partial(self._create, client, request)
+            ) as stream:
                 done_seen = _track_sse_done(stream)
                 chunk_iter = stream.__aiter__()
                 while True:
@@ -871,27 +713,21 @@ class OpenAIProvider(LLMProvider):
                         semantic = True
                         finish_reason = choice.finish_reason
                         clock.check_tool_count(len(tool_calls) + len(_tool_buffers))
-                        for flush_event in self._drain_tool_buffers(_tool_buffers, tool_calls):
+                        for flush_event in self._drain_tool_buffers(
+                            _tool_buffers, tool_calls, model=model
+                        ):
                             yield flush_event
 
                     if semantic:
                         clock.mark_semantic()
-            finally:
-                if stream is not None:
-                    await close_quietly(stream)
         except ProviderError:
             raise
         except Exception as exc:
-            mapped = self._map_failure(exc, request.registry, model, streaming=True)
-            if mapped is None:
-                raise
-            if not request.registry.has_images:
-                raise mapped from exc
-            failure = mapped
+            failure = raise_or_defer(self, exc, request.registry, model, streaming=True)
+        finally:
+            # Always drop request and SDK-stream aliases, including typed errors.
+            del request, stream, chunk_iter
         if failure is not None:
-            # Frame locals reach tracebacks (and error trackers): the request
-            # (with its base64 payloads) is never bound here.
-            del stream
             raise failure
 
         if finish_reason is None and not saw_usage and not (done_seen and done_seen[0]):
@@ -906,7 +742,7 @@ class OpenAIProvider(LLMProvider):
         # Some compatible backends end the stream ([DONE]) without ever sending
         # a finish_reason; flush whatever is still buffered so calls are not
         # lost. No-op when the finish_reason chunk drained the buffers.
-        for flush_event in self._drain_tool_buffers(_tool_buffers, tool_calls):
+        for flush_event in self._drain_tool_buffers(_tool_buffers, tool_calls, model=model):
             yield flush_event
 
         # Assemble the final LLMResponse
@@ -921,7 +757,7 @@ class OpenAIProvider(LLMProvider):
             stop_reason=stop_reason,
             raw_stop_reason=raw_stop_reason,
         )
-        llm_response.provider_request = request.captured_request
+        llm_response.provider_request = captured_request
         llm_response.model = model
         llm_response.provider_response = {
             "object": "chat.completion.chunked",
@@ -939,6 +775,8 @@ class OpenAIProvider(LLMProvider):
         self,
         buffers: dict[int, _ToolCallBuffer],
         tool_calls: list[ToolCall],
+        *,
+        model: str,
     ) -> list[StreamEvent]:
         """Turn buffered tool-call fragments into START/END events and clear them.
 
@@ -964,8 +802,8 @@ class OpenAIProvider(LLMProvider):
             if buf.name is None:
                 logger.warning(
                     "Tool call completed with no name — provider=%s model=%s call_id=%s",
-                    "openai",
-                    self._model,
+                    self._image_provider_name,
+                    model,
                     buf.tool_call_id,
                 )
 
@@ -973,8 +811,8 @@ class OpenAIProvider(LLMProvider):
                 buf.name or "unknown",
                 raw_json,
                 provider_tool_call_id=buf.tool_call_id,
-                provider="openai",
-                model=self._model,
+                provider=self._image_provider_name,
+                model=model,
             )
             tool_calls.append(tc)
             events.append(
@@ -1016,102 +854,57 @@ class OpenAIProvider(LLMProvider):
         call_index = build_call_index(messages)
         # Visible tool images of the current tool block, flushed as one framed
         # user message before the next non-TOOL message (or at the end).
-        pending: list[tuple[str, str, tuple[ImagePart, ...]]] = []
+        pending: PendingImages = []
 
         for msg in messages:
             if pending and msg.role != Role.TOOL:
-                self._flush_tool_images(api_messages, pending, registry)
+                _BLOCKS.flush_tool_images(api_messages, pending, registry)
 
             if msg.role == Role.SYSTEM:
                 api_messages.append({"role": "system", "content": msg.content})
-
             elif msg.role == Role.USER:
-                if msg.parts is None:
-                    api_messages.append({"role": "user", "content": msg.content})
-                else:
-                    content = convert_parts(
-                        msg.parts,
-                        registry=registry,
-                        prefix=("messages", len(api_messages), "content"),
-                        text_block=chat_text,
-                        image_block=chat_image,
-                    )
-                    api_messages.append({"role": "user", "content": content})
-
+                api_messages.append(_BLOCKS.user_item(msg, registry, len(api_messages)))
             elif msg.role == Role.ASSISTANT:
-                if msg.tool_calls:
-                    # Assistant with tool calls
-                    api_msg: dict[str, Any] = {"role": "assistant"}
-                    if msg.content:
-                        api_msg["content"] = msg.content
-                    api_msg["tool_calls"] = [
-                        {
-                            "id": tc.provider_tool_call_id or tc.id,
-                            "type": "function",
-                            "function": {
-                                "name": tc.name,
-                                "arguments": json.dumps(tc.params),
-                            },
-                        }
-                        for tc in msg.tool_calls
-                    ]
-                else:
-                    api_msg = {"role": "assistant", "content": msg.content}
-                # Replay provider reasoning so multi-step tool calls keep the
-                # model's reasoning context, per OpenRouter's guidance. Prefer
-                # the structured blocks (verbatim — required for encrypted/
-                # summarized types); fall back to the plaintext string for
-                # models that only return raw reasoning. Inert for pure OpenAI,
-                # which never populates either.
-                if msg.reasoning_blocks:
-                    api_msg["reasoning_details"] = msg.reasoning_blocks
-                elif msg.reasoning:
-                    api_msg["reasoning"] = msg.reasoning
-                api_messages.append(api_msg)
-
+                api_messages.append(self._assistant_message(msg))
             elif msg.role == Role.TOOL:
                 original_call = resolve_tool_message_call(msg, call_index)
-
-                if msg.parts is None:
-                    api_messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": original_call.provider_tool_call_id or original_call.id,
-                            "content": msg.content,
-                        }
-                    )
-                else:
-                    wire_call_id = original_call.provider_tool_call_id or original_call.id
-                    api_messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": wire_call_id,
-                            "content": portable_tool_text(msg),
-                        }
-                    )
-                    if msg.images:
-                        pending.append((original_call.name, wire_call_id, msg.images))
+                api_messages.append(portable_tool_item(msg, original_call, pending, _tool_message))
 
         if pending:
-            self._flush_tool_images(api_messages, pending, registry)
+            _BLOCKS.flush_tool_images(api_messages, pending, registry)
         return api_messages
 
     @staticmethod
-    def _flush_tool_images(
-        api_messages: list[dict[str, Any]],
-        pending: list[tuple[str, str, tuple[ImagePart, ...]]],
-        registry: WireImageRegistry,
-    ) -> None:
-        """Append the framed user message for a tool block's images; clear ``pending``."""
-        content = portable_framing(
-            pending,
-            registry=registry,
-            prefix=("messages", len(api_messages), "content"),
-            text_block=chat_text,
-            image_block=chat_image,
-        )
-        api_messages.append({"role": "user", "content": content})
-        pending.clear()
+    def _assistant_message(msg: Message) -> dict[str, Any]:
+        """An ASSISTANT message, with its tool calls and replayed reasoning."""
+        if msg.tool_calls:
+            api_msg: dict[str, Any] = {"role": "assistant"}
+            if msg.content:
+                api_msg["content"] = msg.content
+            api_msg["tool_calls"] = [
+                {
+                    "id": tc.provider_tool_call_id or tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.name,
+                        "arguments": json.dumps(tc.params),
+                    },
+                }
+                for tc in msg.tool_calls
+            ]
+        else:
+            api_msg = {"role": "assistant", "content": msg.content}
+        # Replay provider reasoning so multi-step tool calls keep the
+        # model's reasoning context, per OpenRouter's guidance. Prefer
+        # the structured blocks (verbatim — required for encrypted/
+        # summarized types); fall back to the plaintext string for
+        # models that only return raw reasoning. Inert for pure OpenAI,
+        # which never populates either.
+        if msg.reasoning_blocks:
+            api_msg["reasoning_details"] = msg.reasoning_blocks
+        elif msg.reasoning:
+            api_msg["reasoning"] = msg.reasoning
+        return api_msg
 
     def _convert_tools(self, tools: list[ToolDef]) -> list[dict[str, Any]]:
         """Convert Dendrux ToolDefs to OpenAI function tool format."""
@@ -1178,8 +971,8 @@ class OpenAIProvider(LLMProvider):
                         tc.function.name,
                         tc.function.arguments or "",
                         provider_tool_call_id=tc.id,
-                        provider="openai",
-                        model=self._model,
+                        provider=self._image_provider_name,
+                        model=model,
                     )
                 )
 

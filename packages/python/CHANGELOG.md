@@ -2,11 +2,10 @@
 
 ## 0.6.0
 
-- Format-2 runs check that this process still owns the run immediately before each
+- Runs on both storage formats check that this process still owns the run immediately before each
   provider call (one primary-key read). A stale owner stops with the existing
   `RunFencedError` outcome instead of making a model call whose result would be
   discarded. A database read failure at that point now fails the run before the call.
-  Format-1 runs are unchanged.
 - Default local database resolution now uses `./dendrux.db` for runtime helpers,
   every CLI command and migrations when `DENDRUX_DATABASE_URL` is unset.
   If only `~/.dendrux/dendrux.db` exists, log `local_database_default_changed`;
@@ -20,6 +19,7 @@
   (1,048,576 bytes) are documented as separate knobs; values unchanged. The MCP HTTP
   read bound is four times the smaller of the two plus any image allowance.
 
+- Recover Python 3.11 cancellation lost during recorder store awaits at model/tool dispatch boundaries on the recorder's task, without treating handled provider/tool cancellation as a lost cancel; Python 3.12+ is unchanged.
 - Add developer-called recovery for format-2 ReAct runs. `sweep(on_stale="reclaim")`
   marks bounded candidates; `agent.reclaim(..., tenant_id=..., item=...)` continues
   from committed state. Reclaim always requires explicit tenant scope. Interrupted
@@ -196,6 +196,29 @@
 - Add upgrade, recovery, capability, database CLI, MySQL and MariaDB, and build-your-own-store
   guides; expand scaling, observability and tracing guidance. See `docs/upgrading-to-0.6.0.mdx`
   for the rollout.
+
+### Deprecated
+
+- ConsoleNotifier warns when unused show_llm_text or max_text_length options are set to non-default values.
+
+### Fixed
+
+- SingleCall stops before retrying a provider call when an image guardrail blocks the retry.
+
+- Client tool calls retain their per-run call limits across pauses on both storage formats.
+
+- Rejected tool calls no longer use up a tool's per-run call limit after a resume; rejected tool messages now carry `dendrux.not_executed` in saved metadata visible in traces.
+
+- Denied tool calls no longer use up a tool's per-run call limit after a resume.
+- Resumed loops start their tool call counts from the saved execution counts when available, falling back to history.
+- Approved tools use the resumed run's tool-calling strategy and keep notifier warnings in the run result.
+- Recovered approval denials return the same structured tool result as live and approved calls.
+- Streaming provider errors release image request holders on every failure path.
+- Provider retry telemetry warnings omit SQL statements and parameters from database failures.
+- OpenAI Chat, Responses and OpenRouter streaming image failures release request holders from tracebacks.
+- Anthropic image-bearing streaming failures drop the SDK stream from traceback locals.
+- OpenRouter tool-call warnings identify the adapter and the model selected for each call.
+- OpenAI Responses no longer sends prompt cache keys or retention to non-OpenAI endpoints.
 
 ## 0.5.0 - 2026-10-28
 

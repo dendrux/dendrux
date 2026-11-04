@@ -162,9 +162,8 @@ async def rebuild_pause(
     history_records: list[Any] | None = None,
 ) -> PauseState:
     from dendrux.runtime.replay import rebuild_history
+    from dendrux.runtime.runner import _overlay_pause_checkpoint
     from dendrux.runtime.state import TraceRecord
-    from dendrux.skills._session import current
-    from dendrux.types import ImageViewState
 
     class HistoryReader:
         def __getattr__(self, name: str) -> Any:
@@ -218,29 +217,9 @@ async def rebuild_pause(
     pause.steps = rebuilt.steps
     pause.pending_tool_calls = [calls[call_id] for call_id in pending]
     pause.pending_targets = {p["call_id"]: p["target"] for p in pending.values()}
-    pause.iteration = state.get("iteration", 0)
-    pause.trace_order_offset = state.get("trace_order_offset", 0)
-    pause.usage = _usage_from_dict(state.get("usage", {}))
-    pause.provider_kwargs = dict(state.get("provider_kwargs", {}))
-    for kind, ref in (
-        ("image_view", state.get("image_view_ref")),
-        ("skills_session", state.get("skills", {}).get("session_ref")),
-        ("clarification", state.get("clarification_ref")),
-    ):
-        if ref is None:
-            continue
-        trace = await store.get_trace(run_id, ref)
-        if trace is None:
-            raise PersistenceError(code=FailureReason.RECOVERY_STATE_MISSING.value)
-        payload = json.loads(trace.content)
-        if kind == "image_view":
-            pause.image_view = ImageViewState.from_dict(payload)
-        elif kind == "skills_session":
-            session = current(agent)
-            if session is not None:
-                session.restore_snapshot(payload)
-        else:
-            pause.pause_message = payload.get("pause_message")
+    await _overlay_pause_checkpoint(
+        pause, store, run_id, agent, state, rebuilt.steps, recovery=True
+    )
     return pause
 
 
@@ -313,7 +292,7 @@ def _recovery_denial(tc: ToolCall, reason: str | None) -> Message:
         ToolResult(
             name=tc.name,
             call_id=tc.id,
-            payload=json.dumps(reason),
+            payload=json.dumps({"denied": reason}),
             success=False,
             error=reason,
         )
@@ -507,17 +486,20 @@ async def _dispatch_recovery_call(
     tenant_id: str | None,
     on_work: Callable[[], None] | None,
 ) -> Any:
+    from dendrux.loops._policy_context import dispatch_policy
     from dendrux.loops.react import _process_tool_calls
     from dendrux.runtime.runner import _mark_work
 
     recorder = cast("PersistenceRecorder", ctx.recorder)
     if kind == "replay":
         recorder._replay_calls.add(tc.id)
-    require_approval = agent.require_approval
-    if phase == "approved":
-        require_approval = frozenset()
-    elif kind == "approval":
-        require_approval = require_approval | {tc.name}
+    policy = dispatch_policy(
+        name=tc.name,
+        phase=phase,
+        kind=kind,
+        require_approval=agent.require_approval,
+        before_tool=agent.before_tool,
+    )
     _mark_work(on_work)
     return await _process_tool_calls(
         step=AgentStep(reasoning=None, action=tc),
@@ -531,13 +513,11 @@ async def _dispatch_recovery_call(
         history=ctx.history,
         warnings=[],
         deny=agent.deny,
-        require_approval=require_approval,
-        before_tool=None if phase == "approved" else agent.before_tool,
         tenant_id=tenant_id,
         guardrail_engine=recorder.guardrail_engine,
         tool_result_transform=agent.tool_result_transform,
-        approved_skills=phase == "approved",
         image_runtime=image_runtime,
+        **policy,
     )
 
 

@@ -25,20 +25,27 @@ from dendrux.errors import ProviderError
 from dendrux.llm._helpers import (
     build_call_index,
     build_tool_call,
+    normalize_effort,
     replayable_reasoning_blocks,
     resolve_tool_message_call,
 )
 from dendrux.llm._images import (
     WireImageRegistry,
-    convert_parts,
     image_request_error,
-    normalize_base_url,
-    openai_image_support,
-    portable_framing,
-    portable_tool_text,
     responses_image,
     responses_text,
-    sdk_image_request_error,
+)
+from dendrux.llm._openai_family import (
+    OpenAIFamilyProvider,
+    PendingImages,
+    WireBlocks,
+    apply_call_defaults,
+    apply_openai_cache_routing,
+    forward_kwargs,
+    inject_structured_output,
+    opened_stream,
+    portable_tool_item,
+    raise_or_defer,
 )
 from dendrux.llm._resilience import (
     DEFAULT_CALL_TIMEOUT,
@@ -52,23 +59,18 @@ from dendrux.llm._resilience import (
     LoopClients,
     StreamClock,
     WireRequest,
-    call_with_timeout,
-    close_quietly,
     content_filter_error,
     error_from_fields,
     logs_provider_errors,
     logs_provider_stream_errors,
     make_http_client,
-    map_sdk_error,
     refusal_error,
     resolve_deadlines,
-    retry_unstarted_stream,
     stream_incomplete,
 )
 from dendrux.llm._retry_telemetry import call_attempt_tracking
 from dendrux.llm._stop_reason import responses_stop_reason
 from dendrux.llm._usage import openai_wire_usage
-from dendrux.llm.base import LLMProvider
 from dendrux.types import (
     LLMResponse,
     ProviderCapabilities,
@@ -80,19 +82,14 @@ from dendrux.types import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator
+    from collections.abc import AsyncGenerator, Iterator, Sequence
 
     import httpx
 
-    from dendrux.llm.base import ImageSupport
-    from dendrux.types import ImagePart, Message, ToolDef
+    from dendrux.types import ContentPart, Message, ToolDef
 
 logger = logging.getLogger(__name__)
 
-
-_EFFORT_ALIASES = {"extra": "xhigh"}
-
-_OPENAI_DEFAULT_BASE_URL = "https://api.openai.com/v1/"
 
 _TOOL_RESULT_IMAGE_MODES = ("native", "portable")
 
@@ -115,9 +112,41 @@ def _assistant_item(msg: Message) -> dict[str, Any]:
     return item
 
 
-def _normalize_effort(effort: str) -> str:
-    """Map a Dendrux effort alias to OpenAI's vocabulary."""
-    return _EFFORT_ALIASES.get(effort, effort)
+_BLOCKS = WireBlocks("input", responses_text, responses_image)
+
+
+def _function_call_output(wire_call_id: str, output: Any) -> dict[str, Any]:
+    return {"type": "function_call_output", "call_id": wire_call_id, "output": output}
+
+
+def _assistant_items(msg: Message, replay_reasoning_for: str | None) -> Iterator[dict[str, Any]]:
+    """An ASSISTANT message, in wire order: replayed reasoning, its text, its function calls.
+
+    Yields straight into the caller's ``input_items`` (no per-turn list).
+    """
+    # The API rejects null-valued fields (e.g. ``status: None`` from the
+    # SDK's model_dump), so only those are dropped.
+    for item in replayable_reasoning_blocks(
+        msg, model=replay_reasoning_for, block_types=_REASONING_ITEM_TYPES
+    ):
+        yield {k: v for k, v in item.items() if v is not None}
+    if not msg.tool_calls or msg.content:
+        yield _assistant_item(msg)
+    for tc in msg.tool_calls or ():
+        yield {
+            "type": "function_call",
+            "call_id": tc.provider_tool_call_id or tc.id,
+            "name": tc.name,
+            "arguments": json.dumps(tc.params),
+        }
+
+
+def _native_tool_output(
+    parts: Sequence[ContentPart], call: ToolCall, registry: WireImageRegistry, index: int
+) -> dict[str, Any]:
+    """A TOOL message with parts, images inside ``function_call_output.output``."""
+    output = _BLOCKS.parts(parts, registry, index, "output")
+    return _function_call_output(call.provider_tool_call_id or call.id, output)
 
 
 def _build_usage_with_cache(usage: Any) -> UsageStats:
@@ -179,7 +208,7 @@ _SUPPORTED_KWARGS = frozenset(
 _BUILTIN_TOOL_TYPES = frozenset({"web_search_preview"})
 
 
-class OpenAIResponsesProvider(LLMProvider):
+class OpenAIResponsesProvider(OpenAIFamilyProvider):
     """OpenAI Responses API provider.
 
     Use this when you need OpenAI's built-in tools (web search)
@@ -219,6 +248,10 @@ class OpenAIResponsesProvider(LLMProvider):
         supports_structured_output=True,
         max_context_tokens=200_000,
     )
+
+    _image_provider_name = _PROVIDER
+    _image_capability_family = "responses"
+    _sdk_module = openai
 
     def __init__(
         self,
@@ -354,47 +387,11 @@ class OpenAIResponsesProvider(LLMProvider):
         self._cache_key_prefix = cache_key_prefix
         self.tool_result_images = tool_result_images
 
-    @property
-    def model(self) -> str:
-        """The model identifier this provider is configured to use."""
-        return self._model
-
     def __repr__(self) -> str:
         parts = [f"model={self._model!r}"]
         if self._builtin_tools:
             parts.append(f"builtin_tools={self._builtin_tools!r}")
         return f"OpenAIResponsesProvider({', '.join(parts)})"
-
-    async def close(self) -> None:
-        """Close the underlying HTTP client and release connections."""
-        # Close only what belongs to the running loop: after a loop change the
-        # home transport is first rebuilt, never awaited across loops.
-        current = self._clients.resolve(self._client)
-        self._clients.pop_current_loop_extra()
-        await current.close()
-
-    def _sdk(self) -> openai.AsyncOpenAI:
-        """The SDK client for the running event loop (rebuilt after a loop change)."""
-        return self._clients.resolve(self._client)
-
-    def _map_failure(
-        self, exc: BaseException, registry: WireImageRegistry, model: str, *, streaming: bool
-    ) -> Exception | None:
-        """Typed error for a failed call, or None to re-raise ``exc`` unchanged."""
-        if (
-            registry.has_images
-            and isinstance(exc, openai.APIError)
-            and not isinstance(exc, openai.APIConnectionError)
-        ):
-            return self._image_error(exc, registry, model, streaming=streaming)
-        return map_sdk_error(
-            exc,
-            sdk=openai,
-            provider=_PROVIDER,
-            model=model,
-            streaming=streaming,
-            endpoint=str(self._client.base_url),
-        )
 
     @staticmethod
     def _event_error(error: Any, model: str) -> Exception:
@@ -432,36 +429,10 @@ class OpenAIResponsesProvider(LLMProvider):
         if refusal is not None:
             raise refusal_error(_PROVIDER, model, refusal_text=refusal)
 
-    # ------------------------------------------------------------------
-    # Image input (0.4.0)
-    # ------------------------------------------------------------------
-
-    async def image_input_support(self, model: str) -> ImageSupport:
-        """Static table on the official OpenAI endpoint; ``"unknown"`` elsewhere."""
-        if str(self._client.base_url) != _OPENAI_DEFAULT_BASE_URL:
-            return "unknown"
-        return openai_image_support(model)
-
     @property
     def thinking_enabled(self) -> bool:
         """True when the provider was configured with ``thinking=True``."""
         return bool(self._thinking)
-
-    def image_capability_key(self, model: str) -> tuple[str, str, str]:
-        return ("responses", normalize_base_url(self._client.base_url), model)
-
-    def _image_error(
-        self, exc: openai.APIError, registry: WireImageRegistry, model: str, *, streaming: bool
-    ) -> Exception:
-        """Typed, sanitised error for a failed image-bearing request (not raised)."""
-        return sdk_image_request_error(
-            exc,
-            provider=self,
-            provider_name="openai_responses",
-            model=model,
-            registry=registry,
-            streaming=streaming,
-        )
 
     def _stream_event_image_error(
         self, error: Any, registry: WireImageRegistry, model: str
@@ -488,12 +459,6 @@ class OpenAIResponsesProvider(LLMProvider):
             message=field("message") or "",
             streaming=True,
         )
-
-    async def __aenter__(self) -> OpenAIResponsesProvider:
-        return self
-
-    async def __aexit__(self, *exc: Any) -> None:
-        await self.close()
 
     def _build_api_kwargs(
         self,
@@ -545,13 +510,7 @@ class OpenAIResponsesProvider(LLMProvider):
             api_kwargs["tools"] = api_tools
 
         # Apply constructor defaults for optional params (per-call kwargs override)
-        for attr, key in [
-            (self._temperature, "temperature"),
-        ]:
-            if key in kwargs:
-                api_kwargs[key] = kwargs.pop(key)
-            elif attr is not None:
-                api_kwargs[key] = attr
+        apply_call_defaults(api_kwargs, kwargs, [(self._temperature, "temperature")])
 
         # Reasoning — Responses API uses a nested object. `effort` (cross-vendor)
         # overrides reasoning_effort; `show_thinking` requests a summary so the
@@ -562,7 +521,7 @@ class OpenAIResponsesProvider(LLMProvider):
         show_thinking = kwargs.pop("show_thinking", self._show_thinking)
         effort = kwargs.pop("effort", self._effort)
         reasoning_effort = kwargs.pop("reasoning_effort", self._reasoning_effort)
-        effective_effort = _normalize_effort(effort) if effort is not None else reasoning_effort
+        effective_effort = normalize_effort(effort) if effort is not None else reasoning_effort
         if effective_effort is not None or thinking_on:
             reasoning: dict[str, Any] = {}
             if effective_effort is not None:
@@ -581,17 +540,15 @@ class OpenAIResponsesProvider(LLMProvider):
             "max_tokens",
             "temperature",
         }
-        for key in _SUPPORTED_KWARGS - already_handled:
-            if key in kwargs:
-                api_kwargs[key] = kwargs.pop(key)
+        forward_kwargs(api_kwargs, kwargs, _SUPPORTED_KWARGS - already_handled)
 
-        # Cache routing — never keyed on run_id: a per-run key scatters one
-        # conversation's runs across cache lanes and defeats cross-run hits.
-        cache_key_source = self._cache_key_prefix or cache_key_prefix
-        if cache_key_source:
-            api_kwargs["prompt_cache_key"] = f"dendrux:{cache_key_source}"
-        if self._prompt_cache_retention is not None:
-            api_kwargs["prompt_cache_retention"] = self._prompt_cache_retention
+        apply_openai_cache_routing(
+            api_kwargs,
+            base_url=str(self._client.base_url),
+            own_prefix=self._cache_key_prefix,
+            call_prefix=cache_key_prefix,
+            retention=self._prompt_cache_retention,
+        )
 
         captured_request = dict(api_kwargs)
         if registry.has_images:
@@ -605,20 +562,15 @@ class OpenAIResponsesProvider(LLMProvider):
         output_schema: dict[str, Any],
     ) -> None:
         """Inject text.format for structured output and update evidence."""
-        from dendrux.llm._schema import normalize_for_openai_strict
-
-        strict_schema = normalize_for_openai_strict(output_schema)
-        schema_name = output_schema.get("title", "structured_output")
-        text_format = {
-            "format": {
-                "type": "json_schema",
-                "name": schema_name,
-                "strict": True,
-                "schema": strict_schema,
+        inject_structured_output(
+            api_kwargs,
+            captured_request,
+            output_schema,
+            key="text",
+            envelope=lambda name, schema: {
+                "format": {"type": "json_schema", "name": name, "strict": True, "schema": schema},
             },
-        }
-        api_kwargs["text"] = text_format
-        captured_request["text"] = text_format
+        )
 
     @logs_provider_errors
     async def complete(
@@ -649,57 +601,13 @@ class OpenAIResponsesProvider(LLMProvider):
         :class:`~dendrux.errors.ContentFilteredError` /
         :class:`~dendrux.errors.ModelRefusalError`.
         """
-        registry = WireImageRegistry()
-        api_kwargs, captured_request = self._build_api_kwargs(
-            messages,
-            tools,
-            kwargs,
-            run_id=run_id,
-            cache_key_prefix=cache_key_prefix,
-            registry=registry,
+        return await self._complete_wire(
+            messages, tools, kwargs, output_schema, run_id, cache_key_prefix
         )
 
-        if output_schema is not None:
-            self._inject_structured_output(api_kwargs, captured_request, output_schema)
-        request = WireRequest(api_kwargs, captured_request, registry)
-        model = request.model
-        del api_kwargs, captured_request
-        client = self._sdk()
-
-        # Image-bearing requests never chain SDK errors (they carry the request
-        # body): the typed error is built in the handler, raised after it.
-        failure: Exception | None = None
-        try:
-            response = await call_with_timeout(
-                functools.partial(self._create, client, request),
-                deadlines=self._deadlines,
-                provider=_PROVIDER,
-                model=model,
-            )
-        except ProviderError:
-            raise
-        except Exception as exc:
-            mapped = self._map_failure(exc, registry, model, streaming=False)
-            if mapped is None:
-                raise
-            if not registry.has_images:
-                raise mapped from exc
-            failure = mapped
-        if failure is not None:
-            # Frame locals reach tracebacks (and error trackers): drop the
-            # request and registry, which hold the base64 payloads.
-            del request, registry
-            raise failure
-
+    def _finish_response(self, response: Any, model: str) -> LLMResponse:
         self._check_response(response, model)
-        llm_response = self._normalize_response(response)
-
-        # Attach adapter-boundary payloads for evidence layer
-        llm_response.provider_request = request.captured_request
-        llm_response.model = model
-        llm_response.provider_response = response.model_dump()
-
-        return llm_response
+        return self._normalize_response(response)
 
     @staticmethod
     async def _create(client: openai.AsyncOpenAI, request: WireRequest) -> Any:
@@ -738,32 +646,9 @@ class OpenAIResponsesProvider(LLMProvider):
         when nothing has been yielded yet). Closing the generator closes the
         upstream response.
         """
-        registry = WireImageRegistry()
-        api_kwargs, captured_request = self._build_api_kwargs(
-            messages,
-            tools,
-            kwargs,
-            run_id=run_id,
-            cache_key_prefix=cache_key_prefix,
-            registry=registry,
-        )
-
-        if output_schema is not None:
-            self._inject_structured_output(api_kwargs, captured_request, output_schema)
-        api_kwargs["stream"] = True
-        request = WireRequest(api_kwargs, captured_request, registry)
-        model = request.model
-        del api_kwargs, captured_request, registry
-        client = self._sdk()
-        clock = StreamClock(self._deadlines, provider=_PROVIDER, model=model)
         # Closing this generator (aclose, cancel) closes the upstream response.
         async with contextlib.aclosing(
-            retry_unstarted_stream(
-                functools.partial(self._stream_attempt, client, clock, request),
-                provider=_PROVIDER,
-                model=model,
-                run_id=run_id,
-            )
+            self._stream_wire(messages, tools, kwargs, output_schema, run_id, cache_key_prefix)
         ) as events:
             async for event in events:
                 yield event
@@ -776,6 +661,7 @@ class OpenAIResponsesProvider(LLMProvider):
     ) -> AsyncGenerator[StreamEvent, None]:
         """One streaming request: open, relay events, require the terminal event."""
         model = request.model
+        captured_request = request.captured_request
         # Accumulators for building the final LLMResponse
         text_parts: list[str] = []
         reasoning_parts: list[str] = []
@@ -792,9 +678,11 @@ class OpenAIResponsesProvider(LLMProvider):
 
         failure: Exception | None = None
         stream: Any = None
+        iterator: Any = None
         try:
-            try:
-                stream = await clock.open(functools.partial(self._create, client, request))
+            async with opened_stream(
+                clock, functools.partial(self._create, client, request)
+            ) as stream:
                 iterator = stream.__aiter__()
                 while True:
                     try:
@@ -911,22 +799,14 @@ class OpenAIResponsesProvider(LLMProvider):
 
                     if event_type not in _NON_SEMANTIC_EVENTS:
                         clock.mark_semantic()
-            finally:
-                if stream is not None:
-                    await close_quietly(stream)
         except ProviderError:
             raise
         except Exception as exc:
-            mapped = self._map_failure(exc, request.registry, model, streaming=True)
-            if mapped is None:
-                raise
-            if not request.registry.has_images:
-                raise mapped from exc
-            failure = mapped
+            failure = raise_or_defer(self, exc, request.registry, model, streaming=True)
+        finally:
+            # Always drop request and SDK-stream aliases, including typed errors.
+            del request, stream, iterator
         if failure is not None:
-            # Raised outside any handler: it chains nothing that holds the
-            # request body, and this frame never binds the request payload.
-            del stream
             raise failure
 
         if _completed_response is None:
@@ -956,7 +836,7 @@ class OpenAIResponsesProvider(LLMProvider):
             stop_reason=stop_reason,
             raw_stop_reason=raw_stop_reason,
         )
-        llm_response.provider_request = request.captured_request
+        llm_response.provider_request = captured_request
         llm_response.model = model
         if hasattr(_completed_response, "model_dump"):
             llm_response.provider_response = _completed_response.model_dump()
@@ -996,114 +876,44 @@ class OpenAIResponsesProvider(LLMProvider):
         """
         if registry is None:
             registry = WireImageRegistry()
-        native = self.tool_result_images == "native"
         instructions_parts: list[str] = []
         input_items: list[dict[str, Any]] = []
         call_index = build_call_index(messages)
-        pending: list[tuple[str, str, tuple[ImagePart, ...]]] = []
+        pending: PendingImages = []
 
         for msg in messages:
             if pending and msg.role != Role.TOOL:
-                self._flush_tool_images(input_items, pending, registry)
+                _BLOCKS.flush_tool_images(input_items, pending, registry)
 
             if msg.role == Role.SYSTEM:
                 instructions_parts.append(msg.content)
-
             elif msg.role == Role.USER:
-                if msg.parts is None:
-                    input_items.append({"role": "user", "content": msg.content})
-                else:
-                    content = convert_parts(
-                        msg.parts,
-                        registry=registry,
-                        prefix=("input", len(input_items), "content"),
-                        text_block=responses_text,
-                        image_block=responses_image,
-                    )
-                    input_items.append({"role": "user", "content": content})
-
+                input_items.append(_BLOCKS.user_item(msg, registry, len(input_items)))
             elif msg.role == Role.ASSISTANT:
-                # The API rejects null-valued fields (e.g. ``status: None``
-                # from the SDK's model_dump), so only those are dropped.
-                for item in replayable_reasoning_blocks(
-                    msg, model=replay_reasoning_for, block_types=_REASONING_ITEM_TYPES
-                ):
-                    input_items.append({k: v for k, v in item.items() if v is not None})
-                if msg.tool_calls:
-                    # Emit text content if present
-                    if msg.content:
-                        input_items.append(_assistant_item(msg))
-                    # Emit function_call items
-                    for tc in msg.tool_calls:
-                        input_items.append(
-                            {
-                                "type": "function_call",
-                                "call_id": tc.provider_tool_call_id or tc.id,
-                                "name": tc.name,
-                                "arguments": json.dumps(tc.params),
-                            }
-                        )
-                else:
-                    input_items.append(_assistant_item(msg))
-
+                input_items.extend(_assistant_items(msg, replay_reasoning_for))
             elif msg.role == Role.TOOL:
                 original_call = resolve_tool_message_call(msg, call_index)
-                if msg.parts is None:
-                    input_items.append(
-                        {
-                            "type": "function_call_output",
-                            "call_id": original_call.provider_tool_call_id or original_call.id,
-                            "output": msg.content,
-                        }
-                    )
-                elif native:
-                    output = convert_parts(
-                        msg.parts,
-                        registry=registry,
-                        prefix=("input", len(input_items), "output"),
-                        text_block=responses_text,
-                        image_block=responses_image,
-                    )
-                    input_items.append(
-                        {
-                            "type": "function_call_output",
-                            "call_id": original_call.provider_tool_call_id or original_call.id,
-                            "output": output,
-                        }
-                    )
-                else:
-                    wire_call_id = original_call.provider_tool_call_id or original_call.id
-                    input_items.append(
-                        {
-                            "type": "function_call_output",
-                            "call_id": wire_call_id,
-                            "output": portable_tool_text(msg),
-                        }
-                    )
-                    if msg.images:
-                        pending.append((original_call.name, wire_call_id, msg.images))
+                input_items.append(
+                    self._tool_result_item(msg, original_call, pending, registry, len(input_items))
+                )
 
         if pending:
-            self._flush_tool_images(input_items, pending, registry)
+            _BLOCKS.flush_tool_images(input_items, pending, registry)
         instructions = "\n\n".join(instructions_parts)
         return instructions, input_items
 
-    @staticmethod
-    def _flush_tool_images(
-        input_items: list[dict[str, Any]],
-        pending: list[tuple[str, str, tuple[ImagePart, ...]]],
+    def _tool_result_item(
+        self,
+        msg: Message,
+        call: ToolCall,
+        pending: PendingImages,
         registry: WireImageRegistry,
-    ) -> None:
-        """Append the framed user message for a tool block's images (portable mode)."""
-        content = portable_framing(
-            pending,
-            registry=registry,
-            prefix=("input", len(input_items), "content"),
-            text_block=responses_text,
-            image_block=responses_image,
-        )
-        input_items.append({"role": "user", "content": content})
-        pending.clear()
+        index: int,
+    ) -> dict[str, Any]:
+        """A TOOL message: images inside the output (``native``) or queued (``portable``)."""
+        if self.tool_result_images == "native" and msg.parts is not None:
+            return _native_tool_output(msg.parts, call, registry, index)
+        return portable_tool_item(msg, call, pending, _function_call_output)
 
     def _build_tools(self, dendrux_tools: list[ToolDef] | None) -> list[dict[str, Any]]:
         """Build the tools array: built-in tools + Dendrux function tools."""

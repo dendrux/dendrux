@@ -35,7 +35,6 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 LOCK_TIMEOUT_SECONDS = 5
-LOCK_TIMEOUT_CODE = "migration_lock_timeout"
 
 
 @contextmanager

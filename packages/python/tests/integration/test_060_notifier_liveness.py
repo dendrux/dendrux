@@ -11,6 +11,7 @@ from sqlalchemy.engine import make_url
 
 from dendrux.store import PostgresEventNotifier
 from dendrux.types import generate_ulid
+from tests._helpers.timing import ManualTimeouts
 
 
 class Proxy:
@@ -18,6 +19,7 @@ class Proxy:
         self.host, self.port = host, port
         self.gate = asyncio.Event()
         self.gate.set()
+        self.blocked = asyncio.Event()
         self.tasks = set()
         self.writers = set()
 
@@ -28,6 +30,8 @@ class Proxy:
 
     async def pipe(self, reader, writer):
         while chunk := await reader.read(65536):
+            if not self.gate.is_set():
+                self.blocked.set()
             await self.gate.wait()
             writer.write(chunk)
             await writer.drain()
@@ -83,10 +87,12 @@ class Blackhole(Proxy):
 
 
 async def test_p1_2_frozen_tcp_path_degrades_then_recovers(
-    pg_test_url, engine, store, caplog, record_property
+    pg_test_url, engine, store, caplog, record_property, monkeypatch
 ):
     if engine.dialect.name != "postgresql":
         pytest.skip("Postgres LISTEN liveness")
+    from dendrux.store import _notifier_pg
+
     parsed = make_url(pg_test_url)
     caplog.set_level(logging.INFO)
     async with Proxy(parsed.host, parsed.port or 5432) as proxy:
@@ -96,15 +102,31 @@ async def test_p1_2_frozen_tcp_path_degrades_then_recovers(
         notifier = PostgresEventNotifier(
             url,
             health_check_interval_s=0.05,
-            health_check_timeout_s=0.1,
+            health_check_timeout_s=10,
             reconnect_backoff=(0.1, 0.2),
         )
+        probe_entered, release_probe = asyncio.Event(), asyncio.Event()
+        check_health = notifier._check_health
+
+        async def gated_health_check():
+            probe_entered.set()
+            await release_probe.wait()
+            await check_health()
+
+        monkeypatch.setattr(notifier, "_check_health", gated_health_check)
         await notifier.start()
         try:
             async with notifier.subscribe(generate_ulid()) as sub:
+                initial_generation = sub.state.generation
+                deadlines = ManualTimeouts(monkeypatch, _notifier_pg)
+                proxy.blocked.clear()
                 proxy.gate.clear()
                 started = asyncio.get_running_loop().time()
-                async with asyncio.timeout(1):
+                await asyncio.wait_for(probe_entered.wait(), 10)
+                release_probe.set()
+                await asyncio.wait_for(proxy.blocked.wait(), 10)
+                deadlines.expire()
+                async with asyncio.timeout(10):
                     while sub.state.healthy:
                         await asyncio.sleep(0.001)
                 elapsed = asyncio.get_running_loop().time() - started
@@ -112,13 +134,16 @@ async def test_p1_2_frozen_tcp_path_degrades_then_recovers(
                 record_property("silent_loss_detection_s", elapsed)
                 print(f"SILENT_LOSS_DETECTION_S={elapsed:.4f}")
                 proxy.gate.set()
-                async with asyncio.timeout(2):
+                degraded_generation = sub.state.generation
+                assert degraded_generation == initial_generation + 1
+                async with asyncio.timeout(10):
                     while not sub.state.healthy:
                         await asyncio.sleep(0.001)
-                assert sub.state.generation == 3
+                assert sub.state.generation == degraded_generation + 1
                 codes = [getattr(r, "code", None) for r in caplog.records]
                 assert codes.count("notifier_degraded") == codes.count("notifier_recovered") == 1
         finally:
+            release_probe.set()
             proxy.gate.set()
             await notifier.stop()
 

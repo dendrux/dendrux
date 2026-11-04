@@ -12,7 +12,6 @@ from dendrux.mcp import MCPServer, MCPSource
 from dendrux.mcp._errors import MCPResultTooLargeError
 from dendrux.mcp._http import wire_cap
 from dendrux.mcp._result import normalize_mcp_result
-from dendrux.mcp._server import _normalize_mcp_result
 from dendrux.mcp._source import DEFAULT_MAX_RESULT_BYTES
 from dendrux.tools._limits import cap_value_payload, result_cap
 from dendrux.types import Limits
@@ -27,7 +26,6 @@ def test_result_caps_have_separate_named_defaults():
         MCPSource.http,
         MCPSource.stdio,
         normalize_mcp_result,
-        _normalize_mcp_result,
     ):
         assert (
             inspect.signature(consumer).parameters["max_result_bytes"].default

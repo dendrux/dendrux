@@ -590,7 +590,6 @@ class Agent:
 
         self._deny_skills: frozenset[str] = frozenset(deny_skills) if deny_skills else frozenset()
         self._loaded_skills: list[Skill] | None = None
-        self._denied_skill_names: list[str] | None = None
         self._inline_skill_warning_emitted: bool = False
         validate_executor(skill_executor)
         self._skill_executor = skill_executor
@@ -659,7 +658,6 @@ class Agent:
         self._strict_tenancy: bool = strict_tenancy
         # None means the default caps: B12 applies them unless the developer overrides.
         self._limits: Limits = limits if limits is not None else _Limits()
-        self._tool_threads: int = tool_threads
         self._on_governance_change: Literal["warn", "raise"] = on_governance_change
         self._tool_call_limiter: Any = make_call_limiter(tool_threads)
         self._limits_checked_for: StateStore | None = None
@@ -964,7 +962,32 @@ class Agent:
         Governance name validation (deny/require_approval names exist in
         tools) is deferred to discovery time when tool_sources are present,
         because MCP tool names aren't known until the server is connected.
+
+        Stages run in a fixed order and the first failure wins.
         """
+        self._validate_basics()
+
+        from dendrux.loops.single import SingleCall
+
+        single_call = isinstance(self._loop, SingleCall)
+        self._validate_loop_compat(single_call)
+        has_skills = bool(self._skills_dir or self._explicit_skills)
+        self._validate_tools_and_limits(single_call, has_skills)
+
+        has_mcp = bool(self._tool_sources)
+        # Shared tool name set for deny/require_approval validation
+        known_tools: frozenset[str] = frozenset()
+        if self.tools and (self._deny or self._require_approval):
+            known_tools = frozenset(str(getattr(fn, "__name__", fn)) for fn in self.tools)
+        if has_skills:
+            known_tools |= NAMES
+
+        if self._deny:
+            self._validate_deny(single_call, has_mcp, has_skills, known_tools)
+        if self._require_approval:
+            self._validate_require_approval(single_call, has_mcp, has_skills, known_tools)
+
+    def _validate_basics(self) -> None:
         if not self.prompt:
             raise ValueError(
                 f"Agent '{self.name}' requires a prompt. "
@@ -974,10 +997,9 @@ class Agent:
         # Validate max_delegation_depth (catches subclass defaults like -1)
         _validate_max_delegation_depth(self.max_delegation_depth)
 
-        # SingleCall cannot have tools or tool_sources
-        from dendrux.loops.single import SingleCall
-
-        if isinstance(self._loop, SingleCall) and self.tools:
+    def _validate_loop_compat(self, single_call: bool) -> None:
+        """SingleCall cannot have tools, tool_sources or before_tool."""
+        if single_call and self.tools:
             tool_names = [getattr(fn, "__name__", str(fn)) for fn in self.tools]
             raise ValueError(
                 f"Agent '{self.name}' uses SingleCall loop but has {len(self.tools)} "
@@ -987,7 +1009,7 @@ class Agent:
                 f"remove the tools or switch to ReActLoop."
             )
 
-        if isinstance(self._loop, SingleCall) and self._tool_sources:
+        if single_call and self._tool_sources:
             raise ValueError(
                 f"Agent '{self.name}' uses SingleCall loop but has "
                 f"{len(self._tool_sources)} tool_source(s). SingleCall agents cannot "
@@ -995,14 +1017,15 @@ class Agent:
                 f"is required. Skills (inline-delivered) are still supported."
             )
 
-        if isinstance(self._loop, SingleCall) and self._before_tool is not None:
+        if single_call and self._before_tool is not None:
             raise ValueError(
                 f"Agent '{self.name}' has before_tool but uses SingleCall loop. "
                 f"before_tool is not supported with SingleCall (no tool calls)."
             )
 
+    def _validate_tools_and_limits(self, single_call: bool, has_skills: bool) -> None:
         # output_type requires SingleCall in v1
-        if self._output_type is not None and not isinstance(self._loop, SingleCall):
+        if self._output_type is not None and not single_call:
             raise ValueError(
                 f"Agent '{self.name}' has output_type={self._output_type.__name__} "
                 f"but does not use SingleCall loop. Structured output is only "
@@ -1018,7 +1041,6 @@ class Agent:
                 )
 
         # Reserve 'use_skill' name when skills are configured
-        has_skills = bool(self._skills_dir or self._explicit_skills)
         if has_skills:
             for fn in self.tools:
                 if getattr(fn, "__name__", None) in NAMES:
@@ -1038,91 +1060,95 @@ class Agent:
                 f"{MAX_ITERATIONS_CEILING}, got {self.max_iterations}."
             )
 
-        has_mcp = bool(self._tool_sources)
+    def _validate_deny(
+        self,
+        single_call: bool,
+        has_mcp: bool,
+        has_skills: bool,
+        known_tools: frozenset[str],
+    ) -> None:
+        # deny requires tools or tool_sources
+        if not self.tools and not has_mcp and not has_skills:
+            raise ValueError(f"Agent '{self.name}' has deny={sorted(self._deny)} but no tools.")
 
-        # --- Shared tool name set for deny/require_approval validation ---
-        known_tools: frozenset[str] = frozenset()
-        if self.tools and (self._deny or self._require_approval):
-            known_tools = frozenset(str(getattr(fn, "__name__", fn)) for fn in self.tools)
+        # deny + SingleCall is not supported
+        if single_call:
+            raise ValueError(
+                f"Agent '{self.name}' has deny={sorted(self._deny)} but uses "
+                f"SingleCall loop. deny is not supported with SingleCall."
+            )
 
-        if has_skills:
-            known_tools |= NAMES
-
-        # --- deny= validation ---
-        if self._deny:
-            # deny requires tools or tool_sources
-            if not self.tools and not has_mcp and not has_skills:
-                raise ValueError(f"Agent '{self.name}' has deny={sorted(self._deny)} but no tools.")
-
-            # deny + SingleCall is not supported
-            if isinstance(self._loop, SingleCall):
+        # Name existence check — skip if tool_sources present (names
+        # may refer to MCP tools not yet discovered). Validated at
+        # discovery time in _validate_governance_names().
+        if not has_mcp:
+            unknown = self._deny - known_tools
+            if unknown:
                 raise ValueError(
-                    f"Agent '{self.name}' has deny={sorted(self._deny)} but uses "
-                    f"SingleCall loop. deny is not supported with SingleCall."
+                    f"Agent '{self.name}' deny contains unknown tool(s): "
+                    f"{sorted(unknown)}. Available tools: {sorted(known_tools)}."
                 )
 
-            # Name existence check — skip if tool_sources present (names
-            # may refer to MCP tools not yet discovered). Validated at
-            # discovery time in _validate_governance_names().
-            if not has_mcp:
-                unknown = self._deny - known_tools
-                if unknown:
-                    raise ValueError(
-                        f"Agent '{self.name}' deny contains unknown tool(s): "
-                        f"{sorted(unknown)}. Available tools: {sorted(known_tools)}."
-                    )
+    def _validate_require_approval(
+        self,
+        single_call: bool,
+        has_mcp: bool,
+        has_skills: bool,
+        known_tools: frozenset[str],
+    ) -> None:
+        # require_approval requires tools or tool_sources
+        if not self.tools and not has_mcp and not has_skills:
+            raise ValueError(
+                f"Agent '{self.name}' has require_approval="
+                f"{sorted(self._require_approval)} but no tools."
+            )
 
-        # --- require_approval= validation ---
-        if self._require_approval:
-            # require_approval requires tools or tool_sources
-            if not self.tools and not has_mcp and not has_skills:
+        # require_approval + SingleCall is not supported
+        if single_call:
+            raise ValueError(
+                f"Agent '{self.name}' has require_approval="
+                f"{sorted(self._require_approval)} but uses SingleCall loop. "
+                f"require_approval is not supported with SingleCall."
+            )
+
+        # Name existence check — skip if tool_sources present (names
+        # may refer to MCP tools not yet discovered). Full check at
+        # discovery time in _validate_governance_names().
+        if not has_mcp:
+            unknown_approval = self._require_approval - known_tools
+            if unknown_approval:
                 raise ValueError(
-                    f"Agent '{self.name}' has require_approval="
-                    f"{sorted(self._require_approval)} but no tools."
+                    f"Agent '{self.name}' require_approval contains unknown tool(s): "
+                    f"{sorted(unknown_approval)}. Available tools: {sorted(known_tools)}."
                 )
 
-            # require_approval + SingleCall is not supported
-            if isinstance(self._loop, SingleCall):
+        # Target check on LOCAL tools — always runs, even with
+        # tool_sources. Catches client-tool approval errors early
+        # without waiting for MCP discovery.
+        self._validate_approval_targets()
+
+        # deny and require_approval must not overlap
+        overlap = self._deny & self._require_approval
+        if overlap:
+            raise ValueError(
+                f"Agent '{self.name}' has tools in both deny and "
+                f"require_approval: {sorted(overlap)}. "
+                f"A tool cannot be both denied and require approval."
+            )
+
+    def _validate_approval_targets(self) -> None:
+        if not self.tools:
+            return
+        from dendrux.tool import get_tool_def as _get_tool_def
+        from dendrux.types import ToolTarget as _ToolTarget
+
+        for fn in self.tools:
+            td = _get_tool_def(fn)
+            if td.name in self._require_approval and td.target != _ToolTarget.SERVER:
                 raise ValueError(
-                    f"Agent '{self.name}' has require_approval="
-                    f"{sorted(self._require_approval)} but uses SingleCall loop. "
-                    f"require_approval is not supported with SingleCall."
-                )
-
-            # Name existence check — skip if tool_sources present (names
-            # may refer to MCP tools not yet discovered). Full check at
-            # discovery time in _validate_governance_names().
-            if not has_mcp:
-                unknown_approval = self._require_approval - known_tools
-                if unknown_approval:
-                    raise ValueError(
-                        f"Agent '{self.name}' require_approval contains unknown tool(s): "
-                        f"{sorted(unknown_approval)}. Available tools: {sorted(known_tools)}."
-                    )
-
-            # Target check on LOCAL tools — always runs, even with
-            # tool_sources. Catches client-tool approval errors early
-            # without waiting for MCP discovery.
-            if self.tools:
-                from dendrux.tool import get_tool_def as _get_tool_def
-                from dendrux.types import ToolTarget as _ToolTarget
-
-                for fn in self.tools:
-                    td = _get_tool_def(fn)
-                    if td.name in self._require_approval and td.target != _ToolTarget.SERVER:
-                        raise ValueError(
-                            f"Agent '{self.name}' require_approval contains "
-                            f"'{td.name}' which has target={td.target.value}. "
-                            f"require_approval only supports server tools."
-                        )
-
-            # deny and require_approval must not overlap
-            overlap = self._deny & self._require_approval
-            if overlap:
-                raise ValueError(
-                    f"Agent '{self.name}' has tools in both deny and "
-                    f"require_approval: {sorted(overlap)}. "
-                    f"A tool cannot be both denied and require approval."
+                    f"Agent '{self.name}' require_approval contains "
+                    f"'{td.name}' which has target={td.target.value}. "
+                    f"require_approval only supports server tools."
                 )
 
     def _validate_governance_names(self, all_tool_defs: dict[str, ToolDef]) -> None:
@@ -3254,15 +3280,11 @@ class Agent:
 
         # Apply deny_skills filter
         loaded: list[Skill] = []
-        denied: list[str] = []
         for s in all_skills:
-            if s.name in self._deny_skills:
-                denied.append(s.name)
-            else:
+            if s.name not in self._deny_skills:
                 loaded.append(s)
 
         self._loaded_skills = loaded
-        self._denied_skill_names = denied
 
     def get_system_prompt(self, loop: Loop | None = None) -> str:
         """Compose system prompt with skill catalog.
@@ -3378,7 +3400,6 @@ class Agent:
         self._mcp_skipped_sources = []
         self._mcp_skipped_tools = []
         self._loaded_skills = None
-        self._denied_skill_names = None
         self._inline_skill_warning_emitted = False
 
     async def close(self) -> None:
@@ -3400,7 +3421,6 @@ class Agent:
         self._mcp_skipped_sources = []
         self._mcp_skipped_tools = []
         self._loaded_skills = None
-        self._denied_skill_names = None
         if self._provider is not None:
             await self._provider.close()
         with self._store_lock:

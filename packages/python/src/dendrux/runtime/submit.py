@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, Any, NoReturn, cast
 from dendrux import _codes
 from dendrux._lifecycle import PAUSE_STATUSES as _PAUSE_STATUSES
 from dendrux._lifecycle import TERMINAL_STATUSES as _TERMINAL_STATUSES
-from dendrux._lifecycle import DenialReason, GovernanceEventType, StoredEventType
+from dendrux._lifecycle import DenialReason, FailureReason, GovernanceEventType, StoredEventType
 from dendrux._meta_keys import (
     GOVERNANCE_KEY as GOVERNANCE_KEY,
 )
@@ -33,6 +33,7 @@ from dendrux.errors import (
     PauseStatusMismatchError,
     RunAlreadyClaimedError,
     RunAlreadyTerminalError,
+    RunControlError,
     RunNotFoundError,
     RunNotPausedError,
 )
@@ -68,7 +69,7 @@ if TYPE_CHECKING:
     from dendrux.media._catalog import BlobEdge
     from dendrux.media._policy import ImagePolicy, Origin
     from dendrux.media._runtime import ImageRuntime
-    from dendrux.runtime.state import EventWrite, StateStore
+    from dendrux.runtime.state import EventWrite, RunRecord, StateStore
     from dendrux.types import ContentPart
 
 __all__ = [
@@ -154,13 +155,11 @@ async def validate_tool_results(
 
     if parts:
         raise _invalid_tool_result(run_id, "; ".join(parts))
-    validate_result_names(run_id, pause_state, results, json_payload=False)
+    validate_result_names(run_id, pause_state, results)
     return pause_state
 
 
-def validate_result_names(
-    run_id: str, pause: PauseState, results: list[ToolResult], *, json_payload: bool = True
-) -> None:
+def validate_result_names(run_id: str, pause: PauseState, results: list[ToolResult]) -> None:
     """Bind result IDs/names and require a string payload; text is normalized later."""
 
     _check_result_identities(run_id, results)
@@ -220,6 +219,74 @@ def pause_validator(
     return validate
 
 
+_RESUME_CLAIM_MESSAGE = (
+    "Run '{run_id}' is not in status '{expected}' — "
+    "cannot resume. It may have been claimed by another caller."
+)
+
+
+@dataclass(frozen=True)
+class _ClaimFailureMapping:
+    submit_error: Callable[[str, RunStatus, RunStatus], RunControlError | RunNotFoundError]
+    resume_message: str = _RESUME_CLAIM_MESSAGE
+
+
+_CLAIM_FAILURES: dict[str | tuple[str, str], _ClaimFailureMapping] = {
+    "missing": _ClaimFailureMapping(lambda run_id, current, expected: RunNotFoundError(run_id)),
+    "terminal": _ClaimFailureMapping(
+        lambda run_id, current, expected: RunAlreadyTerminalError(run_id, current)
+    ),
+    (RunStatus.ERROR.value, FailureReason.ABANDONED_WAITING.value): _ClaimFailureMapping(
+        lambda run_id, current, expected: RunAlreadyTerminalError(run_id, current),
+        "Run '{run_id}' was abandoned (swept as expired waiting run). It cannot be resumed.",
+    ),
+    (RunStatus.ERROR.value, FailureReason.STALE_RUNNING.value): _ClaimFailureMapping(
+        lambda run_id, current, expected: RunAlreadyTerminalError(run_id, current),
+        "Run '{run_id}' was swept as stale ({reason}). It cannot be resumed.",
+    ),
+    (RunStatus.ERROR.value, FailureReason.NEVER_STARTED.value): _ClaimFailureMapping(
+        lambda run_id, current, expected: RunAlreadyTerminalError(run_id, current),
+        "Run '{run_id}' was swept as stale ({reason}). It cannot be resumed.",
+    ),
+    "claimed": _ClaimFailureMapping(
+        lambda run_id, current, expected: RunAlreadyClaimedError(run_id)
+    ),
+    "pause": _ClaimFailureMapping(
+        lambda run_id, current, expected: PauseStatusMismatchError(run_id, current, expected)
+    ),
+    "not_paused": _ClaimFailureMapping(
+        lambda run_id, current, expected: RunNotPausedError(run_id, current)
+    ),
+}
+
+
+def _claim_failure_mapping(
+    record: RunRecord | None, *, after_preflight: bool
+) -> _ClaimFailureMapping:
+    if record is None:
+        return _CLAIM_FAILURES["missing"]
+    if record.status in _TERMINAL_STATUSES:
+        if record.status == RunStatus.ERROR.value:
+            return _CLAIM_FAILURES.get(
+                (record.status, getattr(record, "failure_reason", None) or ""),
+                _CLAIM_FAILURES["terminal"],
+            )
+        return _CLAIM_FAILURES["terminal"]
+    if after_preflight and record.status == RunStatus.RUNNING.value:
+        return _CLAIM_FAILURES["claimed"]
+    if record.status in _PAUSE_STATUSES:
+        return _CLAIM_FAILURES["pause"]
+    return _CLAIM_FAILURES["not_paused"]
+
+
+def _raise_submit_claim_failure(
+    record: RunRecord | None, run_id: str, expected: RunStatus, *, after_preflight: bool
+) -> NoReturn:
+    current = RunStatus(record.status) if record is not None else RunStatus.PENDING
+    rule = _claim_failure_mapping(record, after_preflight=after_preflight)
+    raise rule.submit_error(run_id, current, expected)
+
+
 async def preflight_status(store: StateStore, run_id: str, expected_status: RunStatus) -> None:
     """Raise the most specific error unless ``run_id`` is in ``expected_status``.
 
@@ -228,18 +295,13 @@ async def preflight_status(store: StateStore, run_id: str, expected_status: RunS
     checkpoint.
     """
     record = await store.get_run(run_id)
-    if record is None:
-        raise RunNotFoundError(run_id)
-    current = RunStatus(record.status)
-    if current != expected_status:
-        if current in _TERMINAL_STATUSES:
-            raise RunAlreadyTerminalError(run_id, current)
-        if current in _PAUSE_STATUSES:
-            raise PauseStatusMismatchError(run_id, current, expected_status)
-        # RUNNING, PENDING, or anything else non-paused.
-        raise RunNotPausedError(run_id, current)
-    if record.cancel_requested:
-        raise RunAlreadyTerminalError(run_id, RunStatus.CANCELLED)
+    if record is not None and RunStatus(record.status) == expected_status:
+        if record.cancel_requested:
+            raise _CLAIM_FAILURES["terminal"].submit_error(
+                run_id, RunStatus.CANCELLED, expected_status
+            )
+        return
+    _raise_submit_claim_failure(record, run_id, expected_status, after_preflight=False)
 
 
 @dataclass
@@ -300,6 +362,85 @@ async def claim_paused_validated(
             await _release_claim_result(store, run_id, expected_status, epoch, exc)
             raise
     return epoch
+
+
+@dataclass(frozen=True)
+class _ClaimRequest:
+    raw: dict[str, Any]
+    statuses: tuple[str, ...]
+    generation: str | None
+
+
+def _pause_generation(raw: dict[str, Any], expected_pause_id: str | None) -> str | None:
+    return expected_pause_id if expected_pause_id is not None else raw.get("pause_id")
+
+
+def _claim_request(
+    raw: dict[str, Any],
+    expected_status: str,
+    expected_pause_id: str | None,
+    *,
+    fallbacks: tuple[str, ...] = (),
+) -> _ClaimRequest:
+    return _ClaimRequest(
+        raw, (expected_status, *fallbacks), _pause_generation(raw, expected_pause_id)
+    )
+
+
+async def _claim_submission(
+    store: StateStore,
+    run_id: str,
+    request: _ClaimRequest,
+    status: str,
+    *,
+    validate: Callable[[dict[str, Any]], None],
+    payload: dict[str, Any] | None,
+    checkpointing: bool,
+    submit_empty: bool = False,
+    approval: bool | None = None,
+    checkpoint: dict[str, Any] | None = None,
+    blob_refs: Sequence[BlobEdge] | None = None,
+    blob_refs_scope: str | None = None,
+) -> tuple[ClaimResult | int | bool, dict[str, Any] | None, dict[str, Any] | None]:
+    descriptor = None
+    if (
+        request.raw.get("schema_version") == 2
+        and checkpointing
+        and (payload is not None or submit_empty)
+    ):
+        payload = dict(payload or {})
+        if approval is not None:
+            payload["approved"] = approval
+        checkpoint = (
+            checkpoint if checkpoint is not None else await store.get_loop_state(run_id) or {}
+        )
+        descriptor = submission_descriptor(request.raw, checkpoint, payload, status)
+    if payload is None:
+        won = await claim_paused_validated(store, run_id, expected_status=status, validate=validate)
+    else:
+        kwargs: dict[str, Any] = {"validate": validate}
+        if descriptor is not None:
+            kwargs["submission"] = descriptor
+        if blob_refs:
+            kwargs.update(blob_refs=list(blob_refs), blob_refs_scope=blob_refs_scope)
+        won = await store.submit_and_claim(
+            run_id, expected_status=status, submitted_data=payload, **kwargs
+        )
+    return won, descriptor, payload
+
+
+def _claimed_submission_view(
+    raw: dict[str, Any], descriptor: dict[str, Any] | None, payload: dict[str, Any] | None
+) -> dict[str, Any]:
+    if descriptor is None:
+        return raw
+    return {
+        **raw,
+        "submission": {
+            **{k: descriptor[k] for k in ("submission_id", "kind", "pause_id", "call_ids")},
+            "payload": payload,
+        },
+    }
 
 
 def submission_descriptor(
@@ -412,50 +553,31 @@ async def claim_or_raise(
             store=store,
             run_id=run_id,
         )
+    request = _claim_request(raw, expected_status.value, expected_pause_id)
     validate = submission_validator(
         run_id,
         raw,
         agent=agent,
-        expected_pause_id=expected_pause_id,
+        expected_pause_id=request.generation,
         call_results=call_results,
         extra=validate,
     )
 
-    # --- Claim: run was expected_status at preflight, attempt CAS. ---
     from dendrux.runtime._capabilities import capabilities
 
-    descriptor = None
-    if (
-        raw.get("schema_version") == 2
-        and capabilities(store).checkpointing
-        and (submitted_data is not None or approval)
-    ):
-        submitted_data = dict(submitted_data or {})
-        if expected_status == RunStatus.WAITING_APPROVAL:
-            submitted_data["approved"] = approval
-        checkpoint = await store.get_loop_state(run_id) or {}
-        descriptor = submission_descriptor(raw, checkpoint, submitted_data, expected_status.value)
-    won: ClaimResult | int | bool
-    if submitted_data is not None:
-        claim_kwargs: dict[str, Any] = {} if validate is None else {"validate": validate}
-        if descriptor is not None:
-            claim_kwargs["submission"] = descriptor
-        if blob_refs:
-            claim_kwargs["blob_refs"] = list(blob_refs)
-            claim_kwargs["blob_refs_scope"] = blob_refs_scope
-        won = await store.submit_and_claim(
-            run_id,
-            expected_status=expected_status.value,
-            submitted_data=submitted_data,
-            **claim_kwargs,
-        )
-    else:
-        won = await claim_paused_validated(
-            store,
-            run_id,
-            expected_status=expected_status.value,
-            validate=validate,
-        )
+    won, _, _ = await _claim_submission(
+        store,
+        run_id,
+        request,
+        request.statuses[0],
+        validate=validate,
+        payload=submitted_data,
+        checkpointing=raw.get("schema_version") == 2 and capabilities(store).checkpointing,
+        submit_empty=approval,
+        approval=approval if expected_status == RunStatus.WAITING_APPROVAL else None,
+        blob_refs=blob_refs,
+        blob_refs_scope=blob_refs_scope,
+    )
 
     if won:
         if agent is not None:
@@ -466,24 +588,9 @@ async def claim_or_raise(
                 raise
         return won
 
-    # CAS lost after preflight succeeded — something transitioned the run
-    # between the two reads. Re-check to pick the most specific error.
+    # The successful preflight distinguishes a competing claim from a never-paused run.
     record = await store.get_run(run_id)
-    if record is None:
-        # Extremely unlikely — run vanished mid-submit.
-        raise RunNotFoundError(run_id)
-
-    current = RunStatus(record.status)
-    if current in _TERMINAL_STATUSES:
-        raise RunAlreadyTerminalError(run_id, current)
-    if current == RunStatus.RUNNING:
-        # We just observed ``expected_status``; RUNNING now means a
-        # concurrent submit claimed it.
-        raise RunAlreadyClaimedError(run_id)
-    if current in _PAUSE_STATUSES:
-        # Unusual — paused status changed between preflight and CAS.
-        raise PauseStatusMismatchError(run_id, current, expected_status)
-    raise RunNotPausedError(run_id, current)
+    _raise_submit_claim_failure(record, run_id, expected_status, after_preflight=True)
 
 
 async def _release_claim_result(
@@ -1128,7 +1235,7 @@ def submission_validator(
     from dendrux.errors import GovernanceMismatchError
 
     # Even an optional-token client is bound to the generation we observed.
-    generation = expected_pause_id if expected_pause_id is not None else raw.get("pause_id")
+    generation = _pause_generation(raw, expected_pause_id)
     base = pause_validator(
         run_id, generation, agent_name=agent.name if agent else None, call_results=call_results
     )
@@ -1231,7 +1338,7 @@ async def prepare_client_results(
     from dendrux.loops.react import _apply_result_transform
 
     results = await _validate_client_results(agent, run_id, results)
-    validate_result_names(run_id, pause, results, json_payload=False)
+    validate_result_names(run_id, pause, results)
     try:
         capped = [
             _cap_client_result(result, agent._limits.max_tool_result_bytes) for result in results
@@ -1276,7 +1383,7 @@ def legacy_approval_denial(
     run_id: str, pause: PauseState, results: list[ToolResult]
 ) -> list[ToolResult]:
     """Legacy rejection is a denial, never proof that server code executed."""
-    validate_result_names(run_id, pause, results, json_payload=False)
+    validate_result_names(run_id, pause, results)
     if any(result.success is not False for result in results):
         raise _invalid_tool_result(run_id, "approval tool results must be failed denials")
     return build_rejection_results(pause)

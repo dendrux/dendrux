@@ -42,6 +42,12 @@ STATUSES_WITH_ANSWER_TEXT = frozenset(RunStatus) - HIDDEN_ANSWER_STATUSES
 PLACEHOLDER_PAUSE_STATUSES = HIDDEN_ANSWER_STATUSES | {RunStatus.PAUSED}
 # Preserve the runner's existing cancellation CAS: waiting or running, without paused.
 CANCEL_FINALIZE_STATUS_VALUES = (*WAITING_STATUS_VALUES, RunStatus.RUNNING.value)
+# Pauses a direct resume may ingest images for: client-tool or approval results, or user input.
+RESUME_RESULTS_STATUS_VALUES = (
+    RunStatus.WAITING_CLIENT_TOOL.value,
+    RunStatus.WAITING_APPROVAL.value,
+)
+RESUME_INPUT_STATUS_VALUES = (RunStatus.WAITING_HUMAN_INPUT.value,)
 
 PendingKind = Literal["client_tool", "approval", "input", "paused"]
 PENDING_KIND_BY_STATUS: dict[str, PendingKind] = {
