@@ -98,7 +98,7 @@ Run `dendrux db migrate` **once per deploy, as a single job**, over a **direct**
 - `dendrux db check` compares the database with this version's head without changing anything (exit 0 current, 1 behind, 2 unknown). A non-SQLite database that was not migrated fails at startup with `SchemaOutOfDateError`.
 - Do not start abandoned-waiting sweeps until the migration has finished.
 
-For 0.6, migration is additive and leaves format 1 enabled. Roll every worker and read-only consumer, take a pre-activation backup, then run `dendrux db activate` over a direct connection. Only then enable reclaim and notifications. Activation is one-way. See [Upgrading to 0.6.0](/docs/upgrading-to-0.6.0) and the [Database CLI](/docs/reference/cli).
+For 0.6, migration is additive and leaves format 1 enabled. Roll every worker and read-only consumer, take a pre-activation backup, then run `dendrux db activate` over a direct connection. Only then enable reclaim and live updates. Activation is one-way. See [Upgrading to 0.6.0](/docs/upgrading-to-0.6.0) and the [Database CLI](/docs/reference/cli).
 
 ## MySQL and MariaDB
 
@@ -160,7 +160,7 @@ What this does and does not do:
 
 - **Only `RunStore(store)` listens.** `RunStore.from_engine(engine)` and `RunStore.from_database_url(url)` build stores without live updates, so their followers keep polling. A reader in another process builds its own store with live updates and wraps it the same way. Several `RunStore` objects over one store each take a listener lease; the listener runs until the last one closes.
 - **Writers and readers need the same bus.** Every process that writes runs gives its store the same transport and channel as the readers. A writer without live updates is still correct: its runs are found by the safety poll.
-- **`Agent(database_url=...)` cannot enable them.** `live_updates` and the old `notify_channel` key are refused with a `ValueError` in `database_options` on `Agent`, `sweep(database_url=...)`, `get_engine` and `RunStore.from_database_url`, even when their value is `None` or `False`. Build the store yourself and pass it to `Agent(state_store=...)`, `sweep(state_store=...)` or `RunStore(store)`. `sweep(database_url=...)` uses a temporary store with no live updates.
+- **`Agent(database_url=...)` cannot enable them.** `live_updates` and `notify_channel` keys are refused with a `ValueError` in `database_options` on `Agent`, `sweep(database_url=...)`, `get_engine` and `RunStore.from_database_url`, even when their value is `None` or `False`. Build the store yourself and pass it to `Agent(state_store=...)`, `sweep(state_store=...)` or `RunStore(store)`. `sweep(database_url=...)` uses a temporary store with no live updates.
 - **There is no `notify_channel` option and no `listen_url=` on `RunStore`.** The channel and the listen URL belong to the transport: `PostgresUpdates(channel=..., listen_url=...)`.
 - **A closed `Agent` closes only what it created.** `Agent.close()` closes the store it built from `database_url=`; a store you passed in is yours to close with `await store.close()`.
 

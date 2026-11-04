@@ -23,7 +23,7 @@ result = await agent.run(
 thread.run_ids.append(result.run_id)
 ```
 
-Dendrux rebuilds each run from its own `react_traces` (user message as it was sent, assistant text, tool calls, tool results, reasoning blocks) and puts them ahead of the new input. Nothing is re-persisted; the exact prompt is in `llm_interactions.provider_request` as always. `agent.stream()` takes the same three arguments.
+Dendrux rebuilds each run from its own `react_traces` (user message as it was sent, assistant text, tool calls, tool results, reasoning blocks) and puts them ahead of the new input. The exact prompt is in `llm_interactions.provider_request` as always. On a format-2 store the new run stores the messages it replayed again, as seed rows of its own, so storage grows with how much you replay; see [History storage grows with replay](/docs/guides/scaling#history-storage-grows-with-replay). `agent.stream()` takes the same three arguments.
 
 ## The three knobs
 

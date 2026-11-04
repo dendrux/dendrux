@@ -76,7 +76,7 @@ request IDs, actor/approval audit records and traces. See [OpenTelemetry](/docs/
 and [Notifier](/docs/architecture/notifier).
 
 For optional live inspection use [Build your own read routes](/docs/recipes/build-your-own-read-routes):
-`follow` shares polling and bounds iteration, while your transport bounds sends and
+`follow` batches its reads for every watched run and bounds iteration, while your transport bounds sends and
 closes every follower in `finally`. Keep raw provider payloads and PII mappings
 behind operator authorization; never copy an entire RunResult into a browser DTO.
 
@@ -89,9 +89,12 @@ Structured log lines carry a stable `code`. Group alerts by that field and corre
 | `reclaim_limit` | Any occurrence: inspect repeated worker loss and the run's recovery history |
 | `lease_renew_failed`, `lease_lost` | Sustained renew failures or any lost lease: inspect database latency, availability and event-loop stalls |
 | `run_fenced` | A small burst after reclaim is expected; a sustained rate calls for checking worker turnover and lease sizing |
-| `notifier_degraded` | Lasting over one minute: inspect the primary LISTEN connection and its direct or session-pool endpoint |
-| `notifier_unavailable` | Listener startup cannot complete: check reachability and channel configuration; reads use polling |
-| `notifier_missed_hint` | A healthy reconciliation poll found rows without a hint, once per feed: verify every writer enables the matching channel |
+| `live_updates_degraded` | Lasting over one minute: inspect the listener's connection to the bus (for Postgres, the primary through a direct or session-pool endpoint). Readers poll meanwhile |
+| `live_updates_unavailable` | The listener cannot become ready: check reachability and the channel; reads use polling and retry after 30 seconds |
+| `live_updates_missed_hint` | A healthy safety poll found new events that no hint announced, once per watched run: verify that every writer's store has live updates on the same bus and channel as the readers |
+| `live_updates_send_failed` | A writer's announcement failed and sending is backing off. The database commit is unaffected; check the bus. Sustained, the writer's readers fall back to the safety poll |
+| `live_updates_overflow`, `live_updates_many_stores` | Pending announcements overflowed, or a process holds many open stores for one database: share one store per database and close the rest |
+| `follow_read_failed`, `follow_coordinator_restart` | A reader's batched read failed, or its coordinator restarted: check store connectivity. Other chunks and the followers continue |
 | `write_conflict` | Any occurrence: inspect conflicting writer identities or content before retrying |
 | `activation_conflict` | Activation found conflicting duplicates: resolve the reported table/index conflict before retrying |
 | `checkpoint_too_large`, `history_too_large`, `pending_limit` | Inspect the run's configured bounds and reduce state or fanout; do not continue with truncated history |
@@ -101,7 +104,7 @@ Structured log lines carry a stable `code`. Group alerts by that field and corre
 | `provider_unknown` | Inspect the safe provider category and HTTP status; unknown vendor codes have no public mapping |
 | `database_url_env_ignored` | The Agent ignored an environment database URL and has no persistence: pass `state_store=` or `database_url=`; this warning is logged once per process |
 
-On Postgres, also alert on sustained growth in `pg_notification_queue_usage()` when NOTIFY is enabled. A stuck listener can fill the queue and fail notifying writes at commit. A `notifier_recovered` log signals reconnection; confirm reader latency recovers too.
+On Postgres, also alert on sustained growth in `pg_notification_queue_usage()` when live updates are enabled. A stuck listener can fill the queue; announcements then fail and back off, and the saves themselves are unaffected. A `live_updates_recovered` log signals reconnection and `live_updates_send_recovered` that sending works again; confirm reader latency recovers too. `store.live_updates.stats()` shows pending and dropped counts and the age of the oldest stranded hint. The other live-update codes are in [Log codes](/docs/reference/log-codes).
 
 Strict log-field validation is enabled only with `DENDRUX_STRICT_LOG_FIELDS=1`. In normal operation invalid fields are dropped and reported by `log_field_dropped`. Keep production diagnostics to codes, ids, counts and kinds.
 

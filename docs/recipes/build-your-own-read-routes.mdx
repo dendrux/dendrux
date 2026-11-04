@@ -65,9 +65,10 @@ decision. See [Pause ids and stale submits](/docs/architecture/pause-resume#paus
 
 ## Optional live feed over SSE
 
-`follow` has a shared poller per watched run, terminal drain, redaction, heartbeats,
-capacity (500 followers per store by default, and 100 per tenant scope) and a
-maximum iteration duration (default 900 seconds). The per-scope cap counts each
+`follow` reads all watched runs in batches through one coordinator per `RunStore`
+(woken by live updates when the store has them) and adds terminal drain, redaction,
+heartbeats, capacity (500 followers per store by default, and 100 per tenant scope)
+and a maximum iteration duration (default 900 seconds). The per-scope cap counts each
 tenant, all untenanted followers together and all `UNSCOPED` followers together,
 so a single-tenant app with more than 100 live readers per process builds
 `EventFeed(store, max_followers_per_tenant=None)` and calls `feed.follow(...)`.
