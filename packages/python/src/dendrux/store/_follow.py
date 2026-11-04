@@ -922,6 +922,7 @@ class EventFeed:
         self._open = 0
         self._by_scope: dict[tuple[str, ...], int] = {}
         self._attached: dict[_Follower, _WatchedRun] = {}
+        self._watching: dict[_WatchedRun, int] = {}  # followers per watched run
 
     @property
     def followers(self) -> int:
@@ -931,7 +932,7 @@ class EventFeed:
     @property
     def watched_runs(self) -> int:
         """Runs this feed's followers watch (each read once, however many followers)."""
-        return len({id(run) for run in self._attached.values()})
+        return len(self._watching)
 
     def follow(
         self,
@@ -1015,12 +1016,17 @@ class EventFeed:
 
     def _attach(self, run: _WatchedRun, follower: _Follower) -> int | None:
         self._attached[follower] = run
+        self._watching[run] = self._watching.get(run, 0) + 1
         return run.add(follower)
 
     def _detach(self, follower: _Follower) -> None:
         run = self._attached.pop(follower, None)
-        if run is not None:
-            run.remove(follower)
+        if run is None:
+            return
+        left = self._watching.pop(run) - 1
+        if left:
+            self._watching[run] = left
+        run.remove(follower)
 
     async def aclose(self) -> None:
         """End this feed's followers and stop watching their runs. Idempotent.
