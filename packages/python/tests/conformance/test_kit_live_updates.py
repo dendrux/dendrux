@@ -84,8 +84,9 @@ async def test_the_recorder_listens_but_never_delivers() -> None:
     await eventually(lambda: updates.healthy)
     updates.enqueue(["R1"])
     await updates.flush()
-    await asyncio.sleep(0.05)
-    assert updates.stats().gaps == 1  # only the healthy transition
+    await asyncio.sleep(0.05)  # a negative claim: slowness can only make it pass vacuously
+    gaps = updates.stats().gaps
+    assert gaps == 1  # only the healthy transition
     await updates.release_listener(lease)
     await updates.close()
 

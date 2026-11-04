@@ -263,8 +263,9 @@ async def test_healthy_is_not_reported_before_the_acknowledgement_arrives(
     reader.register(consumer, stream_events=False)
     lease = await reader.acquire_listener()
     await eventually(lambda: any(b"SUBSCRIBE" in bytes(link.up) for link in proxy.links))
-    await asyncio.sleep(0.3)
-    assert reader.healthy is False and consumer.gaps == 0
+    await asyncio.sleep(0.3)  # a negative claim: slowness can only make it pass vacuously
+    assert reader.healthy is False
+    assert consumer.gaps == 0
     proxy.release()
     await eventually(lambda: reader.healthy)
     await reader.release_listener(lease)
@@ -277,11 +278,13 @@ async def test_an_idle_listener_is_pinged_on_its_own_connection_with_fresh_token
     reader = make(proxied(proxy), channel=channel)
     consumer = Consumer()
     lease = await listening(reader, consumer)
-    await asyncio.sleep(1.2)
-    assert reader.healthy
-    wire = bytes(proxy.links[0].up)
-    tokens = re.findall(rb"PING\r\n\$16\r\n([0-9a-f]{16})\r\n", wire)
-    assert len(tokens) >= 2 and len(set(tokens)) == len(tokens)
+
+    def tokens() -> list[bytes]:
+        return re.findall(rb"PING\r\n\$16\r\n([0-9a-f]{16})\r\n", bytes(proxy.links[0].up))
+
+    await eventually(lambda: len(tokens()) >= 3)  # idle: the listener keeps asking
+    assert len(set(tokens())) == len(tokens())  # a new token each time
+    assert reader.healthy  # and the server answered every one in time
     await reader.release_listener(lease)
     await reader.close()
 
