@@ -200,6 +200,8 @@
 
 ### Fixed
 
+- Client tool calls retain their per-run call limits across pauses on both storage formats.
+
 - Rejected tool calls no longer use up a tool's per-run call limit after a resume.
 
 - Denied tool calls no longer use up a tool's per-run call limit after a resume.
