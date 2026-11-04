@@ -118,7 +118,7 @@ def data(event: StoredEvent) -> dict[str, Any]:
 
 async def pending_calls(store: RunStore, run_id: str) -> list[dict[str, Any]]:
     """The calls a run is waiting on, read from its `run.paused` event."""
-    events = await store.get_events(run_id, event_types=["run.paused"])
+    events = await store.get_events(run_id, event_types=["run.paused"], limit=100)
     calls: list[dict[str, Any]] = data(events[-1])["pending_tool_calls"]
     return calls
 
@@ -137,7 +137,9 @@ async def per_call_approval(agent: Agent, store: RunStore) -> None:
         },
         expected_pause_id=paused.pause_id,  # the pause the reviewer saw
     )
-    decided = (await store.get_events(paused.run_id, event_types=["approval.decided"]))[0]
+    decided = (await store.get_events(paused.run_id, event_types=["approval.decided"], limit=100))[
+        0
+    ]
     print("status:", done.status.value)
     print("refunded:", REFUNDED)
     print("decision:", data(decided)["decision"])
@@ -149,8 +151,10 @@ async def policy_hook(agent: Agent, store: RunStore) -> None:
     print("\n--- 2. before_tool policy ---")
     paused = await agent.run("Email everyone, clean up old orders and look up acme.")
     assert paused.status is RunStatus.WAITING_APPROVAL
-    gates = await store.get_events(paused.run_id, event_types=["approval.requested"])
-    substituted = await store.get_events(paused.run_id, event_types=["policy.substituted"])
+    gates = await store.get_events(paused.run_id, event_types=["approval.requested"], limit=100)
+    substituted = await store.get_events(
+        paused.run_id, event_types=["policy.substituted"], limit=100
+    )
     print("approval requested for:", [data(g)["tool_name"] for g in gates])
     print("reason:", data(gates[0])["reason"], "| source:", data(gates[0])["source"])
     print("substituted:", [data(s)["tool_name"] for s in substituted])
@@ -177,7 +181,7 @@ async def pause_and_resume(agent: Agent, store: RunStore) -> None:
 
     paused = await run_task
     print("run() returned:", paused.status.value)
-    event = (await store.get_events(run_id, event_types=["run.paused"]))[-1]
+    event = (await store.get_events(run_id, event_types=["run.paused"], limit=100))[-1]
     print("run.paused:", data(event)["reason"], "-", data(event)["message"])
 
     done = await agent.submit_resume(run_id)

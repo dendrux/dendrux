@@ -52,7 +52,9 @@ async def per_turn_model(db_url: str) -> None:
 
     async with RunStore.from_database_url(db_url) as store:
         for label, result in [("default", default), ("override", overridden)]:
-            calls = await store.get_llm_calls(result.run_id)
+            calls = await store.get_llm_calls(
+                result.run_id, limit=100
+            )  # one page: a short demo run
             print(f"  {label:9} -> recorded model: {calls[0].model}")
 
 

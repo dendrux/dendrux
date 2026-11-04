@@ -106,7 +106,8 @@ async def turn(db_url: str, question: str, run_ids: list[str], replay_last: int 
     try:
         result = await agent.run(question, runs=run_ids, replay_last=replay_last)
         assert agent._private_engine is not None
-        calls = await RunStore.from_engine(agent._private_engine).get_llm_calls(result.run_id)
+        reader = RunStore.from_engine(agent._private_engine)
+        calls = await reader.get_llm_calls(result.run_id, limit=100)  # one page: one turn
     finally:
         await agent.close()
 

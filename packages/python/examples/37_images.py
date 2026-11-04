@@ -153,9 +153,11 @@ async def main() -> None:
 
             # What was stored: two blobs, both referenced from this run.
             async with RunStore.from_database_url(url) as store:
-                for event in await store.get_events(result.run_id, event_types=["tool.completed"]):
+                for event in await store.get_events(
+                    result.run_id, event_types=["tool.completed"], limit=100
+                ):
                     print("tool.completed:", event.data)
-                traces = await store.get_traces(result.run_id)
+                traces = await store.get_traces(result.run_id, limit=100)
                 for trace in traces:
                     parts = (trace.meta or {}).get("dendrux.parts")
                     if parts:

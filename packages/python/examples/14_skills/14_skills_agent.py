@@ -171,7 +171,7 @@ async def main() -> None:
     store = RunStore.from_database_url(f"sqlite+aiosqlite:///{db_path}")
     async with store:
         for run_id in (result.run_id, result2.run_id, result3.run_id):
-            names = [e.event_type for e in await store.get_events(run_id)]
+            names = [e.event_type for e in await store.get_events(run_id, limit=500)]
             console.print(f"[dim]{run_id}: {[n for n in names if n.startswith('skill.')]}[/dim]")
 
     console.print()
