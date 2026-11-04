@@ -58,6 +58,15 @@ CATEGORIES = (
     "crash_recovery",
     "live_updates",
 )
+#: Why a contract skipped when an optional fixture is missing, and the report note it leaves.
+_OPTIONAL_SKIPS = {
+    FAULT_INJECTOR: f"{FAULT_INJECTOR} not provided: crash recovery is not certified",
+    LIVE_FACTORY: f"{LIVE_FACTORY} not provided: live updates are not tested",
+}
+_OPTIONAL_NOTES = {
+    FAULT_INJECTOR: f"crash recovery: not certified (no {FAULT_INJECTOR} fixture)",
+    LIVE_FACTORY: f"live updates: not tested (no {LIVE_FACTORY} fixture)",
+}
 _FIXTURE_FOR = {
     "reopen": REOPEN,
     "clock": CLOCK,
@@ -226,11 +235,9 @@ def _check_fixtures(
             continue
         if name in obligations:
             raise CertificationFailure(f"{name} is required ({obligations[name]}) but missing")
-        if name == FAULT_INJECTOR:
-            pytest.skip(f"{FAULT_INJECTOR} not provided: crash recovery is not certified")
-        if name == LIVE_FACTORY:
-            pytest.skip(f"{LIVE_FACTORY} not provided: live updates are not tested")
-        pytest.skip(f"{name} not provided and not required for this store")
+        pytest.skip(
+            _OPTIONAL_SKIPS.get(name, f"{name} not provided and not required for this store")
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -329,10 +336,8 @@ class _Reporter:
         if by_store is not None:
             capabilities = tuple(c for c in by_store.group(1).split(",") if c)
             entry.store_skips.append(_StoreSkip(function, capabilities, by_store.group(2).strip()))
-        elif FAULT_INJECTOR in reason:
-            entry.notes.append(f"crash recovery: not certified (no {FAULT_INJECTOR} fixture)")
-        elif LIVE_FACTORY in reason:
-            entry.notes.append(f"live updates: not tested (no {LIVE_FACTORY} fixture)")
+        elif (note := _not_certified_note(reason)) is not None:
+            entry.notes.append(note)
         elif "unverified:" in reason:
             entry.notes.append("unverified: " + reason.split("unverified:", 1)[1].strip(" ')\""))
 
@@ -348,6 +353,11 @@ class _Reporter:
             )
             return
         _write_summary(terminalreporter, self.report)
+
+
+def _not_certified_note(reason: str) -> str | None:
+    """The report note for a skip caused by a missing optional fixture, if it was one."""
+    return next((note for name, note in _OPTIONAL_NOTES.items() if name in reason), None)
 
 
 def _skip_reason(report: pytest.TestReport) -> str:
