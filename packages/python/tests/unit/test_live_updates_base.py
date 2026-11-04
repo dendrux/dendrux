@@ -1149,3 +1149,156 @@ async def test_foreign_loop_close_refuses_without_mutation_and_logs_safely(caplo
     finally:
         await bus.release_listener(lease)
         await bus.close()
+
+
+@pytest.mark.parametrize("failure", [ValueError("rejected"), asyncio.CancelledError()])
+def test_failed_bind_hook_rolls_back_ownership(failure):
+    class RejectOnce(Bus):
+        def bind(self, store):
+            super().bind(store)
+            if self.reject:
+                raise failure
+
+    bus = RejectOnce()
+    bus.reject = True
+    with pytest.raises(type(failure)):
+        bus.bind(object())
+    assert bus._store is None and not bus._bound
+    bus.reject = False
+    store = object()
+    bus.bind(store)
+    assert bus._bound and bus._store is store
+    bus.reject = True
+    with pytest.raises(type(failure)):
+        bus.bind(store)
+    assert bus._bound and bus._store is store
+    with pytest.raises(ValueError):
+        bus.bind(object())
+
+
+def test_enqueue_refuses_bare_string_before_queue_or_loop_mutation():
+    bus = Bus()
+    with pytest.raises(TypeError):
+        bus.enqueue("R1")
+    assert bus.stats().pending == 0
+    assert bus._loop is None
+
+
+def test_unavailable_error_pickle_does_not_emit_a_second_log(caplog):
+    error = errors.LiveUpdatesUnavailableError("timeout")
+    assert len(caplog.records) == 1
+    serialized = pickle.dumps(error)
+    caplog.clear()
+    restored = pickle.loads(serialized)
+    assert type(restored) is type(error)
+    assert restored.reason == error.reason
+    assert restored.args == error.args
+    assert caplog.records == []
+
+
+@pytest.mark.asyncio
+async def test_overflow_diagnostic_reports_dropped_count_for_enqueue(caplog):
+    bus = Bus(max_pending=2, max_batch=2)
+    bus.enqueue(["a", "b", "c", "d", "e"])
+    logs = [r for r in caplog.records if r.code == "live_updates_overflow"]
+    assert len(logs) == 1 and logs[0].count == 3
+    assert bus.stats().dropped_overflow == 3
+    bus.enqueue(["f", "g"])
+    assert len(caplog.records) == 1
+    await bus.flush()
+    caplog.clear()
+
+    def interrupted():
+        yield from ["h", "i", "j", "k"]
+        raise RuntimeError("VENDOR_SECRET")
+
+    bus.enqueue(interrupted())
+    assert len(caplog.records) == 1
+    assert caplog.records[0].count == 2
+    assert "VENDOR_SECRET" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_close_timeout_is_logged_once_across_nested_shutdown_steps(monkeypatch, caplog):
+    bus = ListeningBus(close_timeout_s=1)
+    await bus.acquire_listener()
+    await until(lambda: bus.healthy)
+    bus.stop_gate = asyncio.Event()
+    now = [100.0]
+    monkeypatch.setattr(live, "monotonic", lambda: now[0])
+
+    async def expired_wait(tasks, *, timeout):
+        now[0] += timeout + 0.001
+        return set(), tasks
+
+    monkeypatch.setattr(live.asyncio, "wait", expired_wait)
+    await bus.close()
+    await until(lambda: bus.stops == 1)
+    assert bus._state == "closed"
+    logs = [r for r in caplog.records if r.code == "live_updates_close_timeout"]
+    assert len(logs) == 1
+    await bus.close()
+    assert len([r for r in caplog.records if r.code == "live_updates_close_timeout"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_close_timeout_suppresses_late_listener_stop_diagnostic(monkeypatch, caplog):
+    bus = ListeningBus(close_timeout_s=0.01)
+    lease = await bus.acquire_listener()
+    await until(lambda: bus.healthy)
+    bus.stop_gate = asyncio.Event()
+    bus.abort_listener = lambda: None
+    waiting, finish_wait = asyncio.Event(), asyncio.Event()
+    listener = bus._listener_task
+
+    async def delayed_wait(tasks, *, timeout):
+        waiting.set()
+        await finish_wait.wait()
+        return set(), tasks
+
+    monkeypatch.setattr(live.asyncio, "wait", delayed_wait)
+    releasing = asyncio.create_task(bus.release_listener(lease))
+    try:
+        await until(waiting.is_set)
+        await bus.close()
+        assert bus._state == "closed"
+        finish_wait.set()
+        await releasing
+        assert len([r for r in caplog.records if r.code == "live_updates_close_timeout"]) == 1
+    finally:
+        finish_wait.set()
+        bus.stop_gate.set()
+        await releasing
+        await until(listener.done)
+
+
+@pytest.mark.asyncio
+async def test_foreign_enqueue_cannot_relog_owner_overflow_after_drain(caplog):
+    import threading
+
+    bus = Bus(max_pending=2, max_batch=2)
+    bus.enqueue(["seed"])
+    started, resume = threading.Event(), threading.Event()
+
+    def foreign_ids():
+        yield "foreign1"
+        started.set()
+        assert resume.wait(timeout=2)
+        yield "foreign2"
+
+    async def foreign():
+        bus.enqueue(foreign_ids())
+
+    task = asyncio.create_task(asyncio.to_thread(asyncio.run, foreign()))
+    try:
+        await until(started.is_set)
+        bus.enqueue(["a", "b", "c"])
+        await bus.flush()
+    finally:
+        resume.set()
+        await task
+    assert bus.stats().pending == 0
+    assert bus.stats().dropped_wrong_loop == 2
+    assert bus.stats().dropped_overflow == 2
+    assert not bus._overflow_episode
+    assert len([r for r in caplog.records if r.code == "live_updates_overflow"]) == 1

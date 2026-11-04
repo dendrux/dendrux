@@ -73,6 +73,11 @@ def _quoted(run_id: str) -> str:
     return json.dumps(run_id, ensure_ascii=False, separators=(",", ":"))
 
 
+def _require_run_ids(run_ids: Iterable[str]) -> None:
+    if isinstance(run_ids, str):
+        raise TypeError("run_ids must be an iterable of ids, not a bare string")
+
+
 class _Consumer(Protocol):
     def on_hints(self, run_ids: Sequence[str]) -> None: ...
 
@@ -187,8 +192,7 @@ class LiveUpdates(ABC):
 
         @wraps(hook)
         def guarded_bind(self: LiveUpdates, store: object) -> None:
-            LiveUpdates.bind(self, store)
-            hook(self, store)
+            self._bind_hook(hook, store)
 
         cls.bind = guarded_bind  # type: ignore[method-assign]
 
@@ -240,6 +244,15 @@ class LiveUpdates(ABC):
         self._store = store
         self._bound = True
 
+    def _bind_hook(self, hook: Callable[[LiveUpdates, object], None], store: object) -> None:
+        previous = self._store, self._bound
+        LiveUpdates.bind(self, store)
+        try:
+            hook(self, store)
+        except BaseException:
+            self._store, self._bound = previous
+            raise
+
     def _check_loop(self) -> bool:
         try:
             loop = asyncio.get_running_loop()
@@ -256,7 +269,8 @@ class LiveUpdates(ABC):
         return False
 
     def enqueue(self, run_ids: Iterable[str]) -> None:
-        """Retain bounded, ordered, deduplicated hints without raising."""
+        """Retain bounded hints; refuse a bare string with TypeError before mutation."""
+        _require_run_ids(run_ids)
         try:
             self._enqueue(run_ids)
         except (Exception, asyncio.CancelledError):
@@ -264,6 +278,16 @@ class LiveUpdates(ABC):
 
     def _enqueue(self, run_ids: Iterable[str]) -> None:
         valid_loop = self._check_loop()
+        if not valid_loop:
+            self._enqueue_ids(run_ids, False)
+            return
+        before = self._counts["dropped_overflow"]
+        try:
+            self._enqueue_ids(run_ids, valid_loop)
+        finally:
+            self._log_overflow(self._counts["dropped_overflow"] - before)
+
+    def _enqueue_ids(self, run_ids: Iterable[str], valid_loop: bool) -> None:
         for run_id in run_ids:
             self._enqueue_one(run_id, valid_loop)
 
@@ -296,11 +320,12 @@ class LiveUpdates(ABC):
         while len(self._pending) > self.max_pending:
             self._pending.popitem(last=False)
             self._counts["dropped_overflow"] += 1
-            if not self._overflow_episode:
-                self._overflow_episode = True
-                _codes.log_code(
-                    logger, _codes.LIVE_UPDATES_OVERFLOW, count=1, limit=self.max_pending
-                )
+
+    def _log_overflow(self, dropped: int) -> None:
+        if dropped <= 0 or self._overflow_episode:
+            return
+        self._overflow_episode = True
+        _codes.log_code(logger, _codes.LIVE_UPDATES_OVERFLOW, count=dropped, limit=self.max_pending)
 
     def _reset_overflow(self) -> None:
         if len(self._pending) < self.max_pending / 2:
@@ -456,6 +481,7 @@ class LiveUpdates(ABC):
         self._healthy_since = math.inf
         self._listener_lock = asyncio.Lock()
         self._close_lock = asyncio.Lock()
+        self._close_timeout_logged = False
         self._listener_task: asyncio.Task[None] | None = None
         self._listener_stopping = False
         self._leases: set[object] = set()
@@ -657,6 +683,12 @@ class LiveUpdates(ABC):
         self._health(False)
 
     def _close_timeout(self) -> None:
+        self._log_close_timeout()
+
+    def _log_close_timeout(self) -> None:
+        if self._state != "open" and self._close_timeout_logged:
+            return
+        self._close_timeout_logged = True
         _codes.log_code(logger, _codes.LIVE_UPDATES_CLOSE_TIMEOUT, timeout_s=self.close_timeout_s)
 
     async def close(self) -> None:
@@ -675,6 +707,7 @@ class LiveUpdates(ABC):
             self._stream_consumers = 0
 
     async def _close_owned(self) -> None:
+        self._close_timeout_logged = False
         deadline = monotonic() + self.close_timeout_s
         try:
             async with asyncio.timeout(self.close_timeout_s):

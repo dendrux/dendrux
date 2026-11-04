@@ -214,7 +214,7 @@ class LiveUpdatesUnavailableError(RuntimeError):
         super().__init__(f"Live updates unavailable ({self.reason}).")
 
     def __reduce__(self) -> Any:
-        return (type(self), (self.reason,))
+        return _restore_logged_control_error, (type(self), self.args, self.__dict__)
 
 
 class NotifierUnavailableError(RuntimeError):
