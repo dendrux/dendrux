@@ -32,14 +32,16 @@ import random
 from collections import deque
 from dataclasses import dataclass, field
 from functools import partial
-from typing import TYPE_CHECKING, Any, Literal, TypeAlias, Union
+from typing import TYPE_CHECKING, Literal, TypeAlias, Union
 
 from dendrux import _codes
 from dendrux._lifecycle import PAUSE_STATUSES as PAUSE_STATUSES
 from dendrux._lifecycle import TERMINAL_EVENT_TYPES as _TERMINAL_EVENT_TYPES
 from dendrux._lifecycle import TERMINAL_STATUSES as TERMINAL_STATUSES
 from dendrux._sentinel import _UnsetType
+from dendrux.errors import FollowCapacityError as FollowCapacityError
 from dendrux.errors import RunNotFoundError
+from dendrux.errors import _capacity_error as _capacity_error
 from dendrux.runtime._pending import approval_calls as approval_calls
 from dendrux.runtime._pending import (
     check_read_bool,
@@ -100,31 +102,6 @@ logger = logging.getLogger(__name__)
 _DEFAULT_SHARE = _UnsetType()
 
 FollowEndReason = Literal["terminal", "max_duration", "lagging", "error"]
-
-
-class FollowCapacityError(RuntimeError):
-    """The :class:`EventFeed` already serves ``max_followers`` followers, or
-    this tenant already holds ``max_followers_per_tenant`` of them.
-
-    Map it to HTTP 503 (retry shortly). ``limit`` is the cap that was hit;
-    ``per_tenant`` is True when it was the per-tenant cap.
-    """
-
-    def __init__(self, limit: int, *, per_tenant: bool = False) -> None:
-        self.limit = limit
-        self.per_tenant = per_tenant
-        scope = _CAPACITY_SCOPE[bool(per_tenant)]
-        super().__init__(f"This event feed already serves its maximum of {limit} {scope}.")
-
-    def __reduce__(self) -> Any:
-        return (_capacity_error, (self.limit, self.per_tenant))
-
-
-_CAPACITY_SCOPE = {False: "followers", True: "followers for one tenant scope"}
-
-
-def _capacity_error(limit: int, per_tenant: bool) -> FollowCapacityError:
-    return FollowCapacityError(limit, per_tenant=per_tenant)
 
 
 def _scope_key(tenant_id: TenantScope) -> tuple[str, ...]:
