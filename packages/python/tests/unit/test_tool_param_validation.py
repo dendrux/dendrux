@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+from dendrux._meta_keys import NOT_EXECUTED_META_KEY
 from dendrux.agent import Agent
 from dendrux.llm.mock import MockLLM
 from dendrux.loops.base import BaseRecorder
@@ -384,7 +385,7 @@ class TestLoopValidation:
             "show is missing required argument(s): kind. "
             "Valid arguments: kind, title, limit."
         )
-        assert tool_msgs[0].meta == {"is_error": True}
+        assert tool_msgs[0].meta == {"is_error": True, NOT_EXECUTED_META_KEY: True}
         assert recorder.started == []
         assert len(recorder.tool_results) == 1
         assert recorder.tool_results[0].success is False
