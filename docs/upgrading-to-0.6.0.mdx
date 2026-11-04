@@ -129,7 +129,7 @@ Four `RunStore` list reads and `get_subtree` can return as much as a run holds. 
 | Call | 0.6.0 | 0.7 |
 | --- | --- | --- |
 | `get_events`, `get_traces`, `get_llm_calls`, `get_tool_invocations` without `limit` | Reads every row and emits a `FutureWarning` | `limit` defaults to 1,000 |
-| The same with `limit` above 1,000 | `FutureWarning`; SQL stores and the format-2 `get_traces` clamp to 1,000, a custom store receives the limit unchanged | Raises |
+| The same with `limit` above 1,000 | `FutureWarning`; SQL stores and the format-2 `get_traces` (any backend) clamp to 1,000; a custom store receives the limit unchanged on its format-1 reads | Raises |
 | `get_subtree` without `max_nodes` | Reads the whole tree and emits a `FutureWarning` | `max_nodes` defaults to 10,000 |
 
 What to do:

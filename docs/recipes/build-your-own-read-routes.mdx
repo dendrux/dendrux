@@ -65,6 +65,8 @@ decision. See [Pause ids and stale submits](/docs/architecture/pause-resume#paus
 
 ## Optional live feed over SSE
 
+> **Close the reader at shutdown.** Closing a `Follow` or an `EventFeed` does not close the `RunStore` or stop its shared coordinator. Close the application-owned `RunStore` at shutdown, before you dispose its borrowed engine, in an `async with` or a `finally`; see [Constructors and lifecycle](/docs/reference/run-store#constructors-and-lifecycle).
+
 `follow` reads all watched runs in batches through one coordinator per `RunStore`
 (woken by live updates when the store has them) and adds terminal drain, redaction,
 heartbeats, capacity (500 followers per store by default, and 100 per tenant scope)

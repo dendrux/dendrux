@@ -230,8 +230,8 @@ Everything else is hidden or replaced with a placeholder: text written by a mode
 `get_events`, `get_traces`, `get_llm_calls` and `get_tool_invocations` return lists that grow with the run. Pass `limit=`, a page size from 1 to 1,000, and page through the rest.
 
 - **In 0.6.0, omitting `limit` still requests every matching row and emits a `FutureWarning`.** The warning names the method and the paging argument. In 0.7 the default becomes 1,000 and a `limit` above 1,000 raises.
-- **A `limit` above 1,000 also emits a `FutureWarning` and is clamped to 1,000 now.** `SQLStateStore` stores clamp it, and so does the format-2 branch of `get_traces`. A custom store receives the limit unchanged: `RunStore` warns but does not clamp its reads from a store of your own.
-- **A `limit` of zero or less reads one row** on the SQL stores and the format-2 `get_traces`. (Before this release the format-2 branch returned an empty list.) A custom store receives it unchanged.
+- **A `limit` above 1,000 also emits a `FutureWarning` and is clamped to 1,000 now.** `SQLStateStore` stores clamp it, and so does the format-2 branch of `get_traces`. A custom store receives the limit unchanged on its format-1 reads and on the event, LLM-call and tool-call reads: `RunStore` warns but does not clamp them. The format-2 public `get_traces` is normalized by `RunStore` whatever the backend, custom checkpointing stores included: an explicit limit is clamped to 1 to 1,000. Internal conversation reconstruction is not given this page clamp.
+- **A `limit` of zero or less reads one row** on the SQL stores and the format-2 `get_traces`. (Before this release the format-2 branch returned an empty list.) A custom store receives it unchanged on its format-1 reads.
 - Arguments are validated first, then the warning is emitted, before any store call. It uses Python's normal warning filtering and de-duplication. Awaited directly, it points at your line; passed straight to `asyncio.run` or scheduled as a task, it points into asyncio, so await the read from a small wrapper coroutine if you want your own location.
 - To find every call that still warns, run your tests or a script with `python -W error::FutureWarning`. `sweep()` raises its own, unrelated `FutureWarning` when it finds stale rows without `on_stale=`.
 
@@ -242,7 +242,7 @@ Everything else is hidden or replaced with a placeholder: text written by a mode
 | `get_events` | `after_sequence_index=` (exclusive) | the `sequence_index` of the last event returned |
 | `get_traces`, `get_llm_calls`, `get_tool_invocations` | `offset=` | the offset plus the number of rows actually returned |
 
-An empty page ends the walk. One page is right for a "recent history" view; a full-history export must loop. The separate reads are best-effort, not one snapshot of a run that is still writing. Process each page as it arrives instead of keeping every row when you can.
+An empty page ends the walk. A single page is right only when the view intentionally shows just that page. Without a cursor or offset these reads return the first, oldest rows, not the most recent ones: for a run with 1,001 events, `limit=100` returns sequences 0 to 99. There is no reverse-order or latest-page option. A full-history export must loop. The separate reads are best-effort, not one snapshot of a run that is still writing. Process each page as it arrives instead of keeping every row when you can.
 
 [//]: # "docs-test: skip - fragment: relies on a `reader` (RunStore) and a tenant, defined by setup shown elsewhere"
 

@@ -115,7 +115,7 @@ traces = await store.get_traces(run.run_id, limit=100)            # ReAct though
 pauses = await store.get_pauses(run.run_id)            # HITL approval cycles
 ```
 
-Each list read returns one page of at most 1,000 rows; page events with `after_sequence_index` and the others with `offset` (see [RunStore](/docs/reference/run-store#bounded-list-reads)). The full audit/tracing surface is available through RunStore; see [Build your own read routes](/docs/recipes/build-your-own-read-routes) — just call it from your own code if you want a custom thread inspector.
+The first four reads each return one page of at most 1,000 rows, starting from the oldest: page events with `after_sequence_index`, and traces, LLM calls and tool invocations with `offset` (see [RunStore](/docs/reference/run-store#bounded-list-reads)). `get_pauses` is different: it has no `offset` or cursor and returns its first bounded set of pairs (`limit` defaults to 100); `get_pause_page` returns the same set plus a flag that says whether more exist. Neither pages through a longer pause history. The full audit/tracing surface is available through RunStore; see [Build your own read routes](/docs/recipes/build-your-own-read-routes) — just call it from your own code if you want a custom thread inspector.
 
 ## Backend semantics
 
