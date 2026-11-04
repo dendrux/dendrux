@@ -26,6 +26,25 @@ Missing or invalid codes remain unset. Category and HTTP status remain independe
 | `reserved_metadata_key` | WARNING | `code`, `entry`, `kind`, `run_id`, `tenant_id` | User metadata contains a reserved key. | Remove reserved metadata keys. |
 | `tenant_scope_required` | WARNING | `code`, `entry`, `kind`, `run_id`, `tenant_id` | A strict tenancy entry has no explicit tenant scope. | Pass the intended tenant scope. |
 
+## Live Updates
+
+| Code | Level | Fields | Fires when | Do |
+| --- | --- | --- | --- | --- |
+| `follow_coordinator_restart` | WARNING | `attempt`, `code`, `kind`, `run_id`, `tenant_id` | A follower restarts a stopped coordinator. | Inspect store connectivity and coordinator failures. |
+| `follow_read_failed` | WARNING | `code`, `count`, `error_kind`, `kind`, `run_id`, `tenant_id` | A coordinator chunk read fails. | Check store connectivity; other chunks continue. |
+| `live_updates_bad_message` | WARNING | `code`, `count`, `kind`, `run_id`, `tenant_id` | A received message fails bounded wire validation. | Check channel isolation and sender limits. |
+| `live_updates_close_timeout` | WARNING | `code`, `kind`, `run_id`, `tenant_id`, `timeout_s` | Resource shutdown exhausts its deadline. | Check cancellation cooperation in the transport. |
+| `live_updates_degraded` | WARNING | `code`, `error_kind`, `kind`, `run_id`, `tenant_id` | The listener loses its subscription; readers poll. | Check bus connectivity; alert after one minute. |
+| `live_updates_many_stores` | WARNING | `code`, `count`, `database_key`, `kind`, `run_id`, `tenant_id` | Many open stores announce to one database. | Share a store within each process and close unused stores. |
+| `live_updates_missed_hint` | WARNING | `code`, `count`, `kind`, `run_id`, `tenant_id` | A healthy reader discovers changes without a hint after the grace period. | Check that writers and readers use the same bus channel. |
+| `live_updates_overflow` | WARNING | `code`, `count`, `kind`, `limit`, `run_id`, `tenant_id` | Pending announcements exceed their bound. | Share stores or raise the pending bound; readers recover by polling. |
+| `live_updates_recovered` | INFO | `code`, `kind`, `run_id`, `tenant_id` | The listener confirms its subscription. | Confirm reader latency returns to normal. |
+| `live_updates_send_failed` | WARNING | `code`, `count`, `error_kind`, `kind`, `run_id`, `tenant_id` | An announcement fails and sending enters backoff. | Check bus connectivity; the database commit is unaffected. |
+| `live_updates_send_recovered` | INFO | `code`, `kind`, `run_id`, `tenant_id` | The first announcement succeeds after a send failure. | Confirm pending announcements drain. |
+| `live_updates_tls_unknown` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | The live-update connection has no explicit TLS settings for a remote host. | Pass explicit connection TLS settings. |
+| `live_updates_unavailable` | WARNING | `code`, `error_kind`, `kind`, `run_id`, `tenant_id` | The listener cannot become ready. | Check the live-update transport; polling remains available. |
+| `live_updates_wrong_loop` | WARNING | `code`, `count`, `kind`, `run_id`, `tenant_id` | An instance is used from another event loop. | Use one instance per store and event loop. |
+
 ## MCP
 
 | Code | Level | Fields | Fires when | Do |

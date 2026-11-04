@@ -174,6 +174,49 @@ class RunCancelledError(_KwargsReduceMixin, RunControlError):
         super().__init__(f"Run '{run_id}' cannot start under parent '{parent_run_id}'.")
 
 
+class FollowCapacityError(RuntimeError):
+    """The :class:`EventFeed` already serves ``max_followers`` followers, or
+    this tenant already holds ``max_followers_per_tenant`` of them.
+
+    Map it to HTTP 503 (retry shortly). ``limit`` is the cap that was hit;
+    ``per_tenant`` is True when it was the per-tenant cap.
+    """
+
+    def __init__(self, limit: int, *, per_tenant: bool = False) -> None:
+        self.limit = limit
+        self.per_tenant = per_tenant
+        scope = _CAPACITY_SCOPE[bool(per_tenant)]
+        super().__init__(f"This event feed already serves its maximum of {limit} {scope}.")
+
+    def __reduce__(self) -> Any:
+        return (_capacity_error, (self.limit, self.per_tenant))
+
+
+_CAPACITY_SCOPE = {False: "followers", True: "followers for one tenant scope"}
+
+
+def _capacity_error(limit: int, per_tenant: bool) -> FollowCapacityError:
+    return FollowCapacityError(limit, per_tenant=per_tenant)
+
+
+class LiveUpdatesUnavailableError(RuntimeError):
+    """The live-update listener could not become ready; polling remains available."""
+
+    def __init__(self, reason: str = "other") -> None:
+        self.reason = (
+            reason if reason in {"timeout", "connection", "cancelled", "closed"} else "other"
+        )
+        _codes.log_code(
+            logging.getLogger(__name__),
+            _codes.LIVE_UPDATES_UNAVAILABLE,
+            error_kind=self.reason,
+        )
+        super().__init__(f"Live updates unavailable ({self.reason}).")
+
+    def __reduce__(self) -> Any:
+        return (type(self), (self.reason,))
+
+
 class NotifierUnavailableError(RuntimeError):
     """The configured notifier could not become ready."""
 
@@ -1232,6 +1275,8 @@ __all__ = [
     "StatementTooLargeError",
     "JSONIntegerOutOfRangeError",
     "NotifierUnavailableError",
+    "LiveUpdatesUnavailableError",
+    "FollowCapacityError",
     "StoreCapabilityError",
     "RunCancelledError",
     "RunNotReclaimableError",
