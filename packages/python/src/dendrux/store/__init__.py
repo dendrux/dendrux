@@ -625,16 +625,23 @@ class RunStore:
 
     async def _stop_live(self) -> None:
         timeout = self._event_feed.stop_timeout_s if self._event_feed else DEFAULT_STOP_TIMEOUT_S
-        coordinators, self._coordinators = list(self._coordinators.values()), {}
         try:
-            for coordinator in coordinators:
+            for loop, coordinator in list(self._coordinators.items()):
                 await coordinator.aclose(timeout)
+                self._coordinators.pop(loop, None)
         finally:
-            lease, self._lease = self._lease, None
-            live = self._live_updates()
-            if lease is not None and live is not None:
-                with contextlib.suppress(RuntimeError, LiveUpdatesUnavailableError):
-                    await live.release_listener(lease)
+            await self._release_lease()
+
+    async def _release_lease(self) -> None:
+        """Release this reader's lease; the handle is kept until the release finished,
+        so a cancelled close leaves enough for a later close to finish the job."""
+        lease, live = self._lease, self._live_updates()
+        if lease is None or live is None:
+            return
+        with contextlib.suppress(RuntimeError, LiveUpdatesUnavailableError):
+            await live.release_listener(lease)  # idempotent per handle
+        if self._lease is lease:
+            self._lease = None
 
     async def __aenter__(self) -> RunStore:
         return self
@@ -664,6 +671,9 @@ class RunStore:
             except (LiveUpdatesUnavailableError, RuntimeError):
                 self._lease_retry_at = loop.time() + _LEASE_RETRY_S
                 _codes.log_code(logger, _codes.LIVE_UPDATES_UNAVAILABLE, error_kind="closed")
+                return
+            if self._closed:  # close() ran while we waited for the listener: give it back
+                await self._release_lease()
 
     def _follow_coordinator(self) -> _Coordinator:
         """This reader's coordinator for the running event loop (created on first use)."""
@@ -905,8 +915,8 @@ class RunStore:
             raise RunNotFoundError(run_id)
         waker = _RunWaker(run_id)
         live, handle = self._register_stream(waker)
-        await self._lease_live_updates()
         try:
+            await self._lease_live_updates()  # inside: a cancelled admission unregisters
             async for event in self._poll_events(
                 run_id, after_sequence_index, waker, poll_interval_s
             ):

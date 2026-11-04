@@ -242,3 +242,37 @@ async def test_pgbouncer_sends_through_the_pool_and_listens_direct(pg_test_url: 
         await reader.release_listener(lease)
         await writer.close()
         await reader.close()
+
+
+async def test_listener_acquired_after_reader_close_leaves_no_backend(pg_test_url: str) -> None:
+    from dendrux.store import RunStore
+    from tests.unit.test_follow_coordinator import BatchedState
+
+    name = "p6b" + generate_ulid()[-8:]
+    state = BatchedState()
+    state.create("race")
+    live = state.live_updates = PostgresUpdates(
+        url=pg_test_url,
+        channel="p6b_" + generate_ulid().lower(),
+        connect_args={"server_settings": {"application_name": name}},
+    )
+    reader = RunStore(state)  # type: ignore[arg-type]
+    try:
+        await live._listener_lock.acquire()  # acquisition waits behind the real lock
+        follow = reader.follow("race", tenant_id=None)
+        start = asyncio.create_task(follow.start())
+        await asyncio.sleep(0.05)
+        await reader.close()
+        live._listener_lock.release()
+        (outcome,) = await asyncio.gather(start, return_exceptions=True)
+        assert isinstance(outcome, RuntimeError)
+        async with asyncio.timeout(10):
+            while await _backends(pg_test_url, name):
+                await asyncio.sleep(0.05)
+        assert reader._lease is None and not live._leases
+        await follow.aclose()
+    finally:
+        if live._listener_lock.locked():
+            live._listener_lock.release()
+        await reader.close()
+        await live.close()
