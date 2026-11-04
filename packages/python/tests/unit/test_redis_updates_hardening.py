@@ -408,3 +408,61 @@ async def test_an_idle_read_that_returns_after_the_whole_budget_never_pings(
         await asyncio.wait_for(anext(iterator), 5)
     assert "Redis live updates" in str(caught.value)
     assert pubsub.pings == []
+
+
+# -- V1: the bound is proven on this redis-py before the transport is accepted -----------------
+
+
+def absent_hook(base: type) -> type:
+    """redis-py after a refactor that removed ``_read`` (or made it something else)."""
+    return type("NoReadParser", (base,), {"_read": None})
+
+
+def bypassed_hook(base: type) -> type:
+    """redis-py after a refactor: bulk bodies are read by a renamed method, ``_read`` is unused."""
+    import inspect
+    import sys
+    import textwrap
+
+    source = textwrap.dedent(inspect.getsource(base._read_response)).replace(  # type: ignore[attr-defined]
+        "self._read(", "self._read_bulk("
+    )
+    namespace = dict(vars(sys.modules[base.__module__]))
+    exec(source, namespace)  # noqa: S102 - rebuilds the very method, with one name changed
+    return type(
+        "BypassedParser",
+        (base,),
+        {"_read_bulk": base._read, "_read_response": namespace["_read_response"]},  # type: ignore[attr-defined]
+    )
+
+
+@pytest.mark.parametrize("variant", [absent_hook, bypassed_hook], ids=["absent", "bypassed"])
+def test_real_a_redis_client_whose_bulk_hook_changed_is_refused_not_used_unbounded(
+    monkeypatch: pytest.MonkeyPatch, variant: Any
+) -> None:
+    import redis
+    import redis._parsers as parsers
+
+    monkeypatch.setattr(parsers, "_AsyncRESP2Parser", variant(parsers._AsyncRESP2Parser))
+    with pytest.raises(ImportError) as caught:
+        ru.RedisUpdates(f"redis://:s3cret-sentinel@{HOST}/0", **FAST)
+    text = str(caught.value)
+    assert redis.__version__ in text and "dendrux[redis]" in text  # names the client and the fix
+    assert "sentinel" not in text
+
+
+def test_real_the_installed_redis_client_passes_its_own_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert ru.RedisUpdates(f"redis://{HOST}/0", **FAST)  # and again, from the cache
+    assert ru.RedisUpdates(f"redis://{HOST}/0", max_message_bytes=3_000, **FAST)
+
+
+async def test_real_the_check_also_runs_inside_a_running_event_loop() -> None:
+    import redis._parsers as parsers
+
+    # an application builds RedisUpdates inside its own loop; the check must not need a free one
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(parsers, "_AsyncRESP2Parser", absent_hook(parsers._AsyncRESP2Parser))
+        with pytest.raises(ImportError):
+            ru.RedisUpdates(f"redis://{HOST}/0", **FAST)

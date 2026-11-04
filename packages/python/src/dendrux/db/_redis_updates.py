@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import codecs
 import secrets
+import threading
 from contextlib import suppress
 from time import monotonic
 from types import SimpleNamespace
@@ -59,17 +60,23 @@ _POOL_ATTRIBUTES = ("_in_use_connections", "_available_connections")
 
 
 def _load_api() -> Any:
-    """The parts of ``redis.asyncio`` this module uses; the one place that imports redis."""
+    """The parts of ``redis.asyncio`` this module uses; the one place that imports redis.
+
+    Importing the parser classes proves nothing about how they read a message, so the bound on
+    incoming messages is not trusted here: ``bounded_parser(limit)`` runs the parser on in-memory
+    streams and only returns it if it reads a normal message and refuses an oversized one.
+    """
     try:
         from redis import exceptions
         from redis._parsers import _AsyncRESP2Parser
         from redis.asyncio import ConnectionPool, Redis
+        from redis.asyncio.connection import Connection
         from redis.asyncio.retry import Retry
         from redis.backoff import NoBackoff
     except ImportError:
         raise ImportError(INSTALL_HINT) from None
     return SimpleNamespace(
-        bounded_parser=lambda limit: _bounded_parser(_AsyncRESP2Parser, limit),
+        bounded_parser=lambda limit: _verified_parser(Connection, _AsyncRESP2Parser, limit),
         ConnectionPool=ConnectionPool,
         Redis=Redis,
         Retry=Retry,
@@ -89,8 +96,8 @@ def _bounded_parser(base: type, limit: int) -> type:
 
     redis-py reads a bulk reply with ``_read(length)`` after parsing its declared length, so
     checking the length there refuses an oversized message before any of its body is read or
-    allocated. This relies on the ``parser_class`` connection option and on that internal hook;
-    ``_load_api`` fails closed if the installed redis-py does not have them.
+    allocated. That is an internal hook: nothing here assumes it still works. ``_verified_parser``
+    proves it on the installed redis-py before the parser is ever used.
     """
 
     class BoundedParser(base):  # type: ignore[misc]
@@ -100,6 +107,73 @@ def _bounded_parser(base: type, limit: int) -> type:
             return bytes(await super()._read(length))
 
     return BoundedParser
+
+
+def _reply(body: bytes) -> bytes:
+    """A pub/sub message reply as RESP2 puts it on the wire."""
+    return (
+        b"*3\r\n$7\r\nmessage\r\n$1\r\nc\r\n$" + str(len(body)).encode() + b"\r\n" + body + b"\r\n"
+    )
+
+
+async def _check_parser(connection_class: type, parser_class: type, limit: int) -> str | None:
+    """Why ``parser_class`` cannot be trusted to bound a message, or ``None`` if it can."""
+    connection = connection_class(parser_class=parser_class, protocol=2)
+    reader = asyncio.StreamReader()
+    connection._reader = reader
+    parser = connection._parser
+    parser.on_connect(connection)
+    reader.feed_data(_reply(b"hello"))
+    if (await asyncio.wait_for(parser.read_response(), 2))[2] != b"hello":
+        return "it does not read an ordinary message"
+    reader.feed_data(_reply(b"x" * (limit + 1)))  # the whole oversized message is on the stream
+    try:
+        await asyncio.wait_for(parser.read_response(), 2)
+    except _OversizeMessageError:
+        return None
+    except Exception:
+        return "it does not refuse an oversized message"
+    return "it accepts an oversized message"
+
+
+def _problem_with(connection_class: type, parser_class: type, limit: int) -> str | None:
+    """Run the check on a short-lived event loop in its own thread.
+
+    A thread, because RedisUpdates is built inside a running event loop as often as outside one.
+    """
+    outcome: list[str | None] = []
+
+    def run() -> None:
+        try:
+            outcome.append(asyncio.run(_check_parser(connection_class, parser_class, limit)))
+        except BaseException:
+            outcome.append("it could not be checked")
+
+    worker = threading.Thread(target=run, name="dendrux-redis-parser-check", daemon=True)
+    worker.start()
+    worker.join(10)
+    return outcome[0] if outcome else "the check did not finish"
+
+
+_PARSER_CHECKS: dict[tuple[type, int], tuple[type, str | None]] = {}
+
+
+def _verified_parser(connection_class: type, base: type, limit: int) -> type:
+    """The bounded parser for ``base``, or ``ImportError`` if redis-py cannot be made to bound."""
+    key = (base, limit)
+    if key not in _PARSER_CHECKS:
+        parser = _bounded_parser(base, limit)
+        _PARSER_CHECKS[key] = (parser, _problem_with(connection_class, parser, limit))
+    parser, problem = _PARSER_CHECKS[key]
+    if problem is not None:
+        import redis
+
+        raise ImportError(
+            f"RedisUpdates cannot bound incoming messages with redis-py {redis.__version__} "
+            f"({problem}); use a tested release (pip install 'dendrux[redis]': 5.0.1, 5.3.1, "
+            "6.4.0, 7.4.0 and 8.1.0 are exercised)"
+        )
+    return parser
 
 
 class _Wire:
@@ -342,6 +416,10 @@ class RedisUpdates(LiveUpdates):
         self._url = _Redacted(_checked_url(url))
         self._options = _Redacted(_checked_options(client_options))
         self._wire = _Wire()
+        # proven on the installed redis-py, here, before anything connects (ImportError if not)
+        self._listen_parser = self._api.bounded_parser(
+            max(self.max_message_bytes, 4 * MAX_CHANNEL_LENGTH)
+        )
         self._check_options()
 
     def __repr__(self) -> str:
@@ -359,9 +437,7 @@ class RedisUpdates(LiveUpdates):
         if listening:
             # RESP2 with a parser that refuses an oversized message before reading it
             options["protocol"] = 2
-            options["parser_class"] = api.bounded_parser(
-                max(self.max_message_bytes, 4 * MAX_CHANNEL_LENGTH)
-            )
+            options["parser_class"] = self._listen_parser
         return api.ConnectionPool.from_url(self._url.reveal(), **options)
 
     def _check_options(self) -> None:
