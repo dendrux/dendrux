@@ -42,11 +42,13 @@ import contextlib
 import dataclasses
 import functools
 import inspect
+import logging
 import re
 import warnings
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from dendrux import _codes
 from dendrux._lifecycle import (
     STORAGE_FORMAT_CHECKPOINTED,
     StoredEventType,
@@ -57,8 +59,9 @@ from dendrux._meta_keys import (
 from dendrux._sentinel import _OmittedType
 from dendrux.db._live_updates import LiveUpdates
 from dendrux.db._notify import EventNotifier, NotifierState, Subscription
+from dendrux.db._postgres_updates import PostgresUpdates
 from dendrux.db._sqlite_sync import create_sqlite_schema
-from dendrux.errors import BlobNotFoundError, NotifierUnavailableError, RunNotFoundError
+from dendrux.errors import BlobNotFoundError, LiveUpdatesUnavailableError, RunNotFoundError
 from dendrux.media._ids import image_id
 from dendrux.media._runtime import tenant_scope_for
 from dendrux.runtime._blob_catalog import BlobServices, CatalogBlobAccessor
@@ -127,12 +130,15 @@ from dendrux.runtime.stores.sql.sqlite import SQLiteStateStore
 from dendrux.store._follow import (
     DEFAULT_MAX_DURATION_S,
     DEFAULT_POLL_INTERVAL_S,
+    DEFAULT_STOP_TIMEOUT_S,
     EventFeed,
     Follow,
     FollowCapacityError,
     FollowEnd,
     FollowHeartbeat,
     FollowItem,
+    _Coordinator,
+    _RunWaker,
     redact_event,
 )
 from dendrux.store._follow import (
@@ -141,7 +147,7 @@ from dendrux.store._follow import (
 from dendrux.store._follow import (
     approval_calls as approval_calls,
 )
-from dendrux.store._notifier_pg import DEFAULT_RECONNECT_BACKOFF, PostgresEventNotifier
+from dendrux.store._notifier_pg import PostgresEventNotifier
 from dendrux.store._redact import (
     PAUSE_VIEW_EVENTS,
     PastParams,
@@ -159,7 +165,7 @@ from dendrux.store._redact import (
 from dendrux.types import ErrorInfo, ReplaySummary
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
     from datetime import datetime
 
     from sqlalchemy.ext.asyncio import AsyncEngine
@@ -172,6 +178,11 @@ if TYPE_CHECKING:
 
 
 _OMITTED_TENANT = _OmittedType()
+
+# A reader whose listener lease was refused polls and asks again after this long.
+_LEASE_RETRY_S = 30.0
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -474,6 +485,12 @@ class RunStore:
     ``close()`` (or ``async with``) disposes it. ``from_engine`` leaves
     engine ownership with the caller; ``close()`` still stops the owned event feed.
 
+    Live updates: ``RunStore(store)`` on a store with ``live_updates`` listens
+    for hints, taking a listener lease lazily on the first ``follow()`` or
+    ``stream_events()``; ``close()`` releases it and never closes the store's
+    sender (close the store yourself). ``from_engine`` and ``from_database_url``
+    always poll. Unavailable live updates mean polling, never a failed follow.
+
     Tenancy: every read takes ``tenant_id``. Omitted (``UNSCOPED``) is a
     trusted all-tenant read. A string scopes the read to that tenant and
     ``None`` to untenanted runs; a run outside the scope reads exactly like a
@@ -488,24 +505,18 @@ class RunStore:
         self._owned_engine: AsyncEngine | None = None
         self._blob_services = BlobServices.for_state_store(state_store, blob_store=blob_store)
         self._event_feed: EventFeed | None = None
-        self._notifier: EventNotifier | None = None
-        self._owned_notifier: EventNotifier | None = None
-        self._notifier_started = False
-        self._notifier_start_task: asyncio.Task[None] | None = None
-        self._notifier_retry_at = 0.0
-        self._notifier_retry_delay: float | None = None
+        self._listens = True
+        self._closed = False
+        self._lease: object | None = None
+        self._acquiring: asyncio.Task[None] | None = None
+        self._lease_retry_at = 0.0
+        self._coordinators: dict[asyncio.AbstractEventLoop, _Coordinator] = {}
 
     @classmethod
-    def from_engine(
-        cls,
-        engine: AsyncEngine,
-        *,
-        blob_store: BlobStore | None = None,
-        notifier: EventNotifier | None = None,
-    ) -> RunStore:
-        """Borrow the engine and optional notifier; the caller owns both lifecycles."""
+    def from_engine(cls, engine: AsyncEngine, *, blob_store: BlobStore | None = None) -> RunStore:
+        """Borrow the engine (the caller owns its lifecycle); followers poll."""
         instance = cls(store_for_engine(engine), blob_store=blob_store)
-        instance._notifier = notifier
+        instance._listens = False
         return instance
 
     @classmethod
@@ -515,8 +526,6 @@ class RunStore:
         *,
         blob_store: BlobStore | None = None,
         database_options: dict[str, Any] | None = None,
-        notifier: EventNotifier | None = None,
-        listen_url: str | None = None,
     ) -> RunStore:
         """Build a RunStore from a SQLAlchemy async URL.
 
@@ -527,11 +536,8 @@ class RunStore:
         upgraded raises :class:`~dendrux.errors.SqliteSchemaSyncError` from
         that first call.
 
-        ``notifier`` is borrowed; the caller starts and stops it. Alternatively,
-        ``listen_url`` creates an owned PostgreSQL notifier, started on async
-        context entry or first follow/stream and stopped by ``close``. It must be a
-        direct or session-pooled endpoint, even when ``database_url`` uses
-        PgBouncer transaction pooling. The two options are mutually exclusive.
+        The store it builds has no live updates, so followers poll. For live
+        updates build the store yourself and pass it: ``RunStore(store)``.
         """
         from sqlalchemy.ext.asyncio import create_async_engine
 
@@ -541,16 +547,14 @@ class RunStore:
             split_database_options,
         )
 
-        if notifier is not None and listen_url is not None:
-            raise ValueError("Pass either notifier or listen_url, not both.")
+        if {"live_updates", "notify_channel"}.intersection(database_options or {}):
+            # Owner decision O2, with this entry point's own advice; checked before any engine.
+            raise ValueError(
+                "Live updates require an explicit store; build a store with "
+                "live_updates=... and pass it to RunStore(store)"
+            )
         parsed = normalized_url(database_url)
         options, store_options = split_database_options(database_options)
-        channel = store_options.get("notify_channel", "dendrux_events")
-        if listen_url is not None and channel is None:
-            raise ValueError("listen_url requires an enabled notify_channel.")
-        owned_notifier = (
-            PostgresEventNotifier(listen_url, channel=channel) if listen_url is not None else None
-        )
         engine = create_async_engine(parsed, **engine_options(parsed, options))
         store: Any = store_for_engine(engine, **store_options)
         if database_url.startswith("sqlite"):
@@ -559,8 +563,7 @@ class RunStore:
             )
         instance = cls(store, blob_store=blob_store)
         instance._owned_engine = engine
-        instance._notifier = notifier if notifier is not None else owned_notifier
-        instance._owned_notifier = owned_notifier
+        instance._listens = False
         return instance
 
     @property
@@ -610,18 +613,15 @@ class RunStore:
         return await accessor.read(sha256, tenant_id=record.tenant_id)
 
     async def close(self) -> None:
-        """Stop owned feeds/listener, then dispose only engines this store owns."""
+        """Stop this reader's coordinator and release its listener lease, then
+        dispose only engines this store owns. Never closes the store's sender."""
+        self._closed = True
         try:
             if self._event_feed is not None:
                 await self._event_feed.aclose()
         finally:
             try:
-                if self._notifier_start_task is not None:
-                    self._notifier_start_task.cancel()
-                    await asyncio.gather(self._notifier_start_task, return_exceptions=True)
-                if self._owned_notifier is not None:
-                    await self._owned_notifier.stop()
-                    self._owned_notifier = None
+                await self._stop_live()
             finally:
                 if isinstance(self._state, _InitOnFirstUse):
                     self._state.closed = True
@@ -629,39 +629,107 @@ class RunStore:
                     await self._owned_engine.dispose()
                     self._owned_engine = None
 
-    async def __aenter__(self) -> RunStore:
+    async def _stop_live(self) -> None:
+        timeout = self._event_feed.stop_timeout_s if self._event_feed else DEFAULT_STOP_TIMEOUT_S
         try:
-            await self._start_owned_notifier()
-        except BaseException:
-            await self.close()
-            raise
+            for loop, coordinator in list(self._coordinators.items()):
+                await coordinator.aclose(timeout)
+                self._coordinators.pop(loop, None)
+        finally:
+            await self._settle_acquisition(timeout)
+            await self._release_lease()
+
+    async def _settle_acquisition(self, timeout: float) -> None:
+        """Wait (bounded) for an in-flight acquisition. If it outlasts the wait, it
+        still releases its own lease when it lands, because the reader is closed."""
+        task = self._acquiring
+        if task is not None and not task.done():
+            await asyncio.wait({task}, timeout=timeout)
+
+    async def _release_lease(self) -> None:
+        """Release this reader's lease; the handle is kept until the release finished,
+        so a cancelled close leaves enough for a later close to finish the job."""
+        lease, live = self._lease, self._live_updates()
+        if lease is None or live is None:
+            return
+        with contextlib.suppress(RuntimeError, LiveUpdatesUnavailableError):
+            await live.release_listener(lease)  # idempotent per handle
+        if self._lease is lease:
+            self._lease = None
+
+    async def __aenter__(self) -> RunStore:
         return self
 
-    async def _start_owned_notifier(self) -> None:
-        if self._owned_notifier is None or self._notifier_started:
+    def _live_updates(self) -> LiveUpdates | None:
+        """The store's live updates when this reader listens (``RunStore(store)`` only)."""
+        if not self._listens:
+            return None
+        live = getattr(self._state, "live_updates", None)
+        return live if isinstance(live, LiveUpdates) else None
+
+    async def _lease_live_updates(self) -> None:
+        """Take this reader's listener lease once; failure means polling, retried later.
+
+        The acquisition runs in a task the reader owns, so cancelling the
+        follow or stream that asked for it never cancels the acquisition or
+        the release of a lease that lands after ``close()``.
+        """
+        live = self._live_updates()
+        if live is None or self._lease is not None or self._closed:
             return
         loop = asyncio.get_running_loop()
-        if loop.time() < self._notifier_retry_at:
+        if loop.time() < self._lease_retry_at:
             return
-        if self._notifier_start_task is None:
-            self._notifier_start_task = loop.create_task(self._try_start_owned_notifier())
-        await asyncio.shield(self._notifier_start_task)
+        task = self._acquiring
+        if task is None or task.done():
+            task = loop.create_task(self._acquire(live), name="dendrux-live-updates-lease")
+            task.add_done_callback(_observe_task)  # a cancelled asker may never read it
+            self._acquiring = task
+        await asyncio.shield(task)
 
-    async def _try_start_owned_notifier(self) -> None:
-        notifier = self._owned_notifier
-        assert notifier is not None
+    async def _acquire(self, live: LiveUpdates) -> None:
+        loop = asyncio.get_running_loop()
         try:
-            await notifier.start()
-            self._notifier_started = True
-            self._notifier_retry_at = 0.0
-            self._notifier_retry_delay = None
-        except NotifierUnavailableError:
-            initial, maximum = getattr(notifier, "reconnect_backoff", DEFAULT_RECONNECT_BACKOFF)
-            delay = self._notifier_retry_delay or initial
-            self._notifier_retry_at = asyncio.get_running_loop().time() + delay
-            self._notifier_retry_delay = min(delay * 2, maximum)
-        finally:
-            self._notifier_start_task = None
+            self._lease = await live.acquire_listener()
+        except (LiveUpdatesUnavailableError, RuntimeError):
+            self._lease_retry_at = loop.time() + _LEASE_RETRY_S
+            _codes.log_code(logger, _codes.LIVE_UPDATES_UNAVAILABLE, error_kind="closed")
+            return
+        if self._closed:  # close() ran while we waited for the listener: give it back
+            await self._release_lease()
+
+    def _follow_coordinator(self) -> _Coordinator:
+        """This reader's coordinator for the running event loop (created on first use)."""
+        if self._closed:
+            raise RuntimeError("This RunStore is closed.")
+        loop = asyncio.get_running_loop()
+        for other in [k for k in self._coordinators if k.is_closed()]:
+            del self._coordinators[other]
+        coordinator = self._coordinators.get(loop)
+        if coordinator is None:
+            coordinator = _Coordinator(self, self._live_updates())
+            self._coordinators[loop] = coordinator
+        return coordinator
+
+    def _batched_events(
+        self,
+    ) -> Callable[[dict[str, int], int], Awaitable[dict[str, list[StoredEvent]]]] | None:
+        """The store's batched events read (spec §4.3), or None for a per-run fallback."""
+        method = getattr(self._state, "get_events_for_runs", None)
+        if method is None:
+            return None
+
+        async def read(heads: dict[str, int], limit: int) -> dict[str, list[StoredEvent]]:
+            rows = await method(heads, limit_per_run=limit)
+            return {
+                run_id: [_event_to_stored(r) for r in records] for run_id, records in rows.items()
+            }
+
+        return read
+
+    def _batched_statuses(self) -> Callable[[Sequence[str]], Awaitable[dict[str, str]]] | None:
+        """The store's batched status read, or None for a per-run fallback."""
+        return getattr(self._state, "get_run_statuses", None)
 
     async def __aexit__(self, *exc: Any) -> None:
         await self.close()
@@ -854,10 +922,11 @@ class RunStore:
         a terminal ``event_type`` or by calling ``aclose()`` on the returned
         generator. A run's tenant never changes, so the scope is checked once.
 
-        With a notifier, one subscription is held until close or cancellation,
-        and hints wake the next read immediately. ``poll_interval_s`` still
-        bounds the wait in both healthy and degraded states. The notifier's
-        subscription cap raises ``FollowCapacityError`` before the first yield.
+        With live updates (``RunStore(store)`` on a store that has them) a
+        hint for this run wakes the next read at once; ``poll_interval_s``
+        still bounds every wait. Each caller registers one hub consumer, at
+        most 10,000 per ``LiveUpdates`` (``FollowCapacityError`` before the
+        first yield). Prefer :meth:`follow`.
         """
         if isinstance(tenant_id, _OmittedType):
             _warn_stream_events_unscoped()
@@ -867,38 +936,50 @@ class RunStore:
         run = await self._scoped_run(run_id, tenant_id)
         if run is None:
             raise RunNotFoundError(run_id)
+        waker = _RunWaker(run_id)
+        live, handle = self._register_stream(waker)
+        try:
+            await self._lease_live_updates()  # inside: a cancelled admission unregisters
+            async for event in self._poll_events(
+                run_id, after_sequence_index, waker, poll_interval_s
+            ):
+                yield event
+        finally:
+            if live is not None and handle is not None:
+                with contextlib.suppress(RuntimeError, LiveUpdatesUnavailableError):
+                    live.unregister(handle)
 
-        await self._start_owned_notifier()
-        context = (
-            self._notifier.subscribe(run_id)
-            if self._notifier is not None
-            else contextlib.nullcontext(None)
-        )
-        async with context as subscription:
-            cursor = after_sequence_index
-            while True:
-                if subscription is not None:
-                    subscription.event.clear()
-                rows = await self._state.get_run_events(
-                    run_id,
-                    after_sequence_index=cursor,
-                    limit=DEFAULT_EVENT_LIMIT,
-                )
-                if rows:
-                    for row in rows:
-                        event = _event_to_stored(row)
-                        yield event
-                        cursor = event.sequence_index
-                    # If the batch was full, there may be more buffered — keep
-                    # draining before we sleep.
-                    if len(rows) == DEFAULT_EVENT_LIMIT:
-                        continue
-                if subscription is None:
-                    await asyncio.sleep(poll_interval_s)
-                else:
-                    with contextlib.suppress(TimeoutError):
-                        async with asyncio.timeout(poll_interval_s):
-                            await subscription.event.wait()
+    def _register_stream(self, waker: _RunWaker) -> tuple[LiveUpdates | None, object | None]:
+        """Register a ``stream_events`` consumer; unavailable live updates mean polling."""
+        live = self._live_updates()
+        if live is None:
+            return None, None
+        try:
+            return live, live.register(waker)
+        except FollowCapacityError:
+            raise
+        except (LiveUpdatesUnavailableError, RuntimeError):  # closed, or another event loop
+            return None, None
+
+    async def _poll_events(
+        self, run_id: str, cursor: int | None, waker: _RunWaker, poll_interval_s: float
+    ) -> AsyncIterator[StoredEvent]:
+        """Per-caller polling, woken early by hints for this run."""
+        while True:
+            waker.event.clear()
+            rows = await self._state.get_run_events(
+                run_id, after_sequence_index=cursor, limit=DEFAULT_EVENT_LIMIT
+            )
+            for row in rows:
+                event = _event_to_stored(row)
+                yield event
+                cursor = event.sequence_index
+            # A full batch may have more buffered: keep draining before waiting.
+            if len(rows) == DEFAULT_EVENT_LIMIT:
+                continue
+            with contextlib.suppress(TimeoutError):
+                async with asyncio.timeout(poll_interval_s):
+                    await waker.event.wait()
 
     async def get_llm_calls(
         self,
@@ -1172,12 +1253,13 @@ class RunStore:
     ) -> Follow:
         """A hardened live feed of the run's events; see :meth:`EventFeed.follow`.
 
-        Uses this store's shared :class:`EventFeed` (one poller per watched
-        run, at most 500 followers; build your own ``EventFeed(store, ...)``
-        for other limits). ``tenant_id`` is required. Events pass through
-        :func:`redact_event`: with ``include_payloads=False`` the system
-        prompt, provider bodies and past pauses' arguments are hidden, while
-        the active pause's arguments stay visible. Ends with a
+        Uses this store's shared :class:`EventFeed` (one coordinator reads
+        every watched run in batches, at most 500 followers; build your own
+        ``EventFeed(store, ...)`` for other limits; it shares the coordinator).
+        ``tenant_id`` is required. Events pass through :func:`redact_event`:
+        with ``include_payloads=False`` the system prompt, provider bodies and
+        past pauses' arguments are hidden, while the active pause's arguments
+        stay visible. Ends with a
         :class:`FollowEnd` (``"terminal"`` once the run finished and drained).
 
         Example::
@@ -1364,6 +1446,11 @@ def _run_to_summary(record: Any) -> RunSummary:
         replay=_replay_of(record),
         tenant_id=getattr(record, "tenant_id", None),
     )
+
+
+def _observe_task(task: asyncio.Task[None]) -> None:
+    if not task.cancelled():
+        task.exception()
 
 
 def _warn_stream_events_unscoped() -> None:
@@ -1566,6 +1653,7 @@ def _build_pause_pair(paused: Any, resumed: Any | None) -> PausePair:
 
 __all__ = [
     "LiveUpdates",
+    "PostgresUpdates",
     "StateStore",
     "StoreCapabilities",
     "SQLStateStore",

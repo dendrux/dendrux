@@ -217,7 +217,7 @@ async def test_many_followers_one_poller(store: Any, run_store: RunStore, monkey
     n_followers, n_events = 60, 30
     release_head = asyncio.Event()
     slots_ready, registered, polled = asyncio.Event(), asyncio.Event(), asyncio.Event()
-    original_acquire, original_add = feed._acquire, _follow._RunFeed.add
+    original_acquire, original_add = feed._acquire, _follow._WatchedRun.add
 
     def acquire(*args: Any):
         original_acquire(*args)
@@ -231,7 +231,7 @@ async def test_many_followers_one_poller(store: Any, run_store: RunStore, monkey
         return head
 
     monkeypatch.setattr(feed, "_acquire", acquire)
-    monkeypatch.setattr(_follow._RunFeed, "add", add)
+    monkeypatch.setattr(_follow._WatchedRun, "add", add)
     original_head = _follow._current_head
 
     async def slow_head(*args):
@@ -248,6 +248,15 @@ async def test_many_followers_one_poller(store: Any, run_store: RunStore, monkey
         return await original(run_id, **kw)
 
     run_store.get_events = counting  # type: ignore[method-assign]
+    batched = getattr(run_store._state, "get_events_for_runs", None)
+    if batched is not None:  # a store with batched reads: the coordinator uses those
+
+        async def counting_batched(*args: Any, **kw: Any) -> Any:
+            polls["n"] += 1
+            polled.set()
+            return await batched(*args, **kw)
+
+        run_store._state.get_events_for_runs = counting_batched
 
     async def follower() -> list[Any]:
         async with feed.follow("r1", tenant_id="T") as f:

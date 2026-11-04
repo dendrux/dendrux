@@ -20,8 +20,6 @@ tests/integration/test_050_t1_pending.py::test_many_followers_one_poller | small
 tests/integration/test_050_t1_pending.py::test_immediate_refollow_reuses_slot_without_capacity_errors | small values set poll cadence; refollow is awaited rather than timed
 tests/integration/test_060_notifier_liveness.py::test_p1_2_frozen_tcp_path_degrades_then_recovers | health cadence is short; the test fires the health deadline only after proxy traffic blocks
 tests/integration/test_060_notifier_pg.py::test_n7_failed_self_test_releases_backend | delivery is deliberately suppressed, so the self-test must time out; backend release gets 10 s
-tests/integration/test_060_notifier_pg.py::test_n5_default_off_writer_warns_once_on_healthy_reconciliation | short reconciliation cadence only; delivery is condition-based with a separate hang guard
-tests/integration/test_060_notifier_pgbouncer.py::test_n4_controlled_delivery_with_backend_reassignment | short reconciliation cadence only; real notification and durable delivery each get 10 s
 tests/integration/test_oreo_regressions.py::test_run_timeout_finalizes_and_reraises | provider is already blocked on a never-set event before wait_for forces cancellation
 tests/integration/test_oreo_regressions.py::test_timeout_during_error_finalization_cancels_run | finalization is already blocked on a never-set event before wait_for forces cancellation
 tests/integration/test_run_store.py::TestStreamEvents::test_yields_existing_then_new | short poll cadence only; reads are awaited without a small delivery deadline
@@ -33,3 +31,7 @@ tests/unit/test_050_t1_follow.py::TestSharing::test_many_followers_share_one_pol
 tests/unit/test_050_tool_caps.py::TestParallelSiblings::test_async_sibling_is_cancelled_and_recorded | run already raised and recorded cancellation; sleep checks that no additional row appears
 tests/unit/test_mcp_oauth_refresh.py::test_refresh_loser_receiving_another_resource_gets_resource_mismatch | assertion after sleep checks the immutable prebuilt credential, not asynchronous completion
 tests/unit/test_mcp_runtime_live.py::TestIdleRetirement::test_shutdown_cancels_timers_and_closes_once | close is awaited before observation sleep; count must remain one after shutdown
+tests/integration/test_postgres_updates_pg.py::test_killed_listener_backend_degrades_reconnects_and_delivers_again | short reconnect backoff only; recovery and delivery are condition-based with a 10 s hang guard
+tests/integration/test_postgres_updates_pg.py::test_killed_sender_backend_costs_at_most_one_batch_then_recovers | short send backoff only; delivery is condition-based with a 10 s hang guard
+tests/integration/test_postgres_updates_pg.py::test_unreachable_listener_never_turns_healthy_and_leaves_no_backend | short reconnect backoff only; asserts the listener never turns healthy
+tests/integration/test_postgres_updates_pg.py::test_frozen_tcp_path_is_detected_by_the_listen_ping_and_recovers | short health cadence only; degradation and recovery are condition-based with 10 s hang guards
