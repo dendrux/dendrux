@@ -550,11 +550,21 @@ class PostgresUpdates(LiveUpdates):
 
     async def aclose_sender(self) -> None:
         """Close the sender connection, terminating it if a clean close fails."""
+        failure = None
+        try:
+            await self._close_sender_connection()
+        except Exception as error:
+            failure = _transport_error(error)
+        if failure is not None:
+            raise failure from None
+
+    async def _close_sender_connection(self) -> None:
         connection, self._sender = self._sender, None
-        if connection is None or connection.is_closed():
+        if connection is None:
             return
         try:
-            await connection.close(timeout=self.send_timeout_s)
+            if not connection.is_closed():
+                await connection.close(timeout=self.send_timeout_s)
         except BaseException:
             self._terminate_connection(connection)
             raise
