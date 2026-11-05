@@ -421,8 +421,8 @@ async def test_one_call_total_statement_budget(store, engine, storage_format, si
         await run()
     finally:
         event.remove(engine.sync_engine, "before_cursor_execute", capture)
-    # Format 1: 28/27 -> 29/28, exactly +1 indexed ownership read per provider call.
+    # Format 1 saves two statements by committing terminal status and event together.
     # Format 2 keeps its existing ownership read and 24/23 statement totals.
     assert len(statements) == (
-        (28 if single else 29) if storage_format == 1 else (23 if single else 24)
+        (26 if single else 27) if storage_format == 1 else (23 if single else 24)
     )

@@ -137,7 +137,9 @@ async def test_first_unannounced_safety_discovery_logs_immediately(caplog):
     snapshot = _follow._Snapshot(0, 0, "safety", False, False, True, 0)
     with caplog.at_level(logging.WARNING):
         c._diagnose(run, rows, snapshot)
+        c._log_missed_hints()
         c._diagnose(run, rows, snapshot)
+        c._log_missed_hints()
     assert sum("live_updates_missed_hint" in r.message for r in caplog.records) == 1
     await reader.close()
 
@@ -183,6 +185,8 @@ async def test_idle_follow_keeps_live_lease_for_raw_stream(monkeypatch):
         await asyncio.sleep(0.04)
         assert reader._lease is not None
         await stream.aclose()
+        assert reader._lease is not None
+        await asyncio.sleep(0.04)
         assert reader._lease is None
     finally:
         await reader.close()
@@ -190,6 +194,7 @@ async def test_idle_follow_keeps_live_lease_for_raw_stream(monkeypatch):
 
 
 async def test_new_admission_during_unwanted_acquisition_release_gets_lease(monkeypatch):
+    monkeypatch.setattr(_follow, "IDLE_EXIT_S", 0.01)
     reader, state = reader_with_run(True)
     live = state.live_updates
     await live._listener_lock.acquire()
@@ -207,14 +212,18 @@ async def test_new_admission_during_unwanted_acquisition_release_gets_lease(monk
         await original(lease)
 
     monkeypatch.setattr(live, "release_listener", release)
+    await asyncio.sleep(0.03)
     live._listener_lock.release()
-    await entered.wait()
+    await asyncio.wait_for(entered.wait(), 1)
     second = reader.follow("r", tenant_id=None)
     joining = asyncio.create_task(second.start())
     await ticks()
     proceed.set()
     try:
         await asyncio.wait_for(joining, 1)
+        async with asyncio.timeout(1):
+            while reader._lease is None:
+                await asyncio.sleep(0)
         assert reader._lease is not None
         assert live._leases
     finally:
