@@ -12,6 +12,7 @@ import asyncio
 import ipaddress
 import logging
 import re
+import ssl
 from collections.abc import Iterable, Mapping
 from contextlib import aclosing, suppress
 from functools import lru_cache
@@ -19,7 +20,7 @@ from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import parse_qsl, quote, urlencode
 
 from dendrux import _codes
-from dendrux.db._live_updates import LiveUpdates, _shutdown_socket
+from dendrux.db._live_updates import LiveUpdates, _error_type, _shutdown_socket
 from dendrux.db._notify import validate_channel
 
 if TYPE_CHECKING:
@@ -37,16 +38,34 @@ APPLICATION_NAME = "dendrux-live-updates"
 _NOTIFY_SQL = "SELECT pg_notify($1, m) FROM unnest($2::text[]) AS m"
 
 
+_TRANSPORT_FAILURES = (
+    (TimeoutError, TimeoutError, "Postgres live updates timed out"),
+    (ssl.SSLError, ssl.SSLError, "Postgres live updates TLS failed"),
+    (OSError, ConnectionError, "Postgres live updates connection failed"),
+    (
+        ImportError,
+        ImportError,
+        "Postgres live updates requires asyncpg; install dendrux[postgres].",
+    ),
+    (
+        ValueError,
+        ValueError,
+        "Postgres live updates configuration failed; check url= and connect_args.",
+    ),
+    (Exception, RuntimeError, "Postgres live updates failed"),
+)
+
+
 def _transport_error(error: Exception) -> Exception:
-    if isinstance(error, TimeoutError):
-        return TimeoutError("Postgres live updates timed out")
-    if isinstance(error, OSError):
-        return ConnectionError("Postgres live updates connection failed")
-    if isinstance(error, ValueError):
-        return ValueError(
-            "Postgres live updates configuration failed; check url= and connect_args."
-        )
-    return RuntimeError("Postgres live updates failed")
+    for source, base, message in _TRANSPORT_FAILURES:
+        if isinstance(error, source):
+            # Keep only a validated class name, never the driver's class, fields
+            # or chain. The safe base preserves LiveUpdates' diagnostic kind.
+            clean_type: type[Exception] = type(
+                _error_type(error), (base,), {"__module__": __name__}
+            )
+            return clean_type(message)
+    raise AssertionError("unreachable transport error type")
 
 
 # Keys asyncpg's DSN parser reads itself (checked against the installed version
