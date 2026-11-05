@@ -55,6 +55,12 @@ from dendrux.runtime._pending import (
     check_read_scope,
     check_run_id,
 )
+from dendrux.store._follow_recovery import (
+    _Isolation,
+    _Suspects,
+    split_jobs,
+    take_job,
+)
 from dendrux.store._redact import (
     PAUSE_CHANGING_EVENTS,
     PAUSE_VIEW_EVENTS,
@@ -104,9 +110,6 @@ IDLE_EXIT_S = 60.0
 TERMINAL_DRAIN_GRACE_S = 0.1
 HEALTHY_JITTER = 0.2
 MAX_RESTARTS = 3
-SUSPECT_READS_PER_S = 2.0
-SUSPECT_RETRY_MIN_S = 5.0
-SUSPECT_RETRY_MAX_S = 30.0
 DISCOVERY_INTERVAL_S = 0.1
 HINT_PRIORITY_INTERVAL_S = 1.0
 
@@ -288,6 +291,8 @@ class _WatchedRun:
         # hints and requeues move ``status_due`` but never this deadline.
         self.status_retry_at = self.events_retry_at = -math.inf
         self.suspect = False
+        self.relapse_delay = 0.0
+        self.relapse_until = -math.inf
         self.events_pending: object | None = None
         self.status_pending: object | None = None
         self.missed_logged = False
@@ -414,13 +419,6 @@ class _WatchedRun:
         return names
 
 
-@dataclass
-class _Isolation:
-    runs: list[_WatchedRun]
-    status: bool
-    token: object = field(default_factory=object)
-
-
 class _Coordinator:
     """One reader-owned poll task per ``RunStore`` and event loop (spec §4.2).
 
@@ -443,7 +441,7 @@ class _Coordinator:
         self._tokens_at = self._now()
         self._safety_windows: dict[float, float] = {}
         self._isolations: deque[_Isolation] = deque()
-        self._probe_at = -math.inf
+        self._suspects = _Suspects()
         self._discovery_at = -math.inf
         self._missed_generation: int | None = None
         self._missed_count = 0
@@ -505,6 +503,7 @@ class _Coordinator:
     def unwatch(self, run: _WatchedRun) -> None:
         if self.runs.get(run.run_id) is run:
             del self.runs[run.run_id]
+            self._suspects.forget(run)
             self.request_idle()
 
     def request(self, run: _WatchedRun, reason: str, at: float | None = None) -> None:
@@ -519,7 +518,8 @@ class _Coordinator:
         run.reason = reason
         self._wake.set()
         if reason in {"join", "hint"} and not self._closed:
-            run.events_pending = run.status_pending = None
+            if not run.suspect:  # A suspect keeps its place in its group re-check.
+                run.events_pending = run.status_pending = None
             self._enter_hub()
             self.revive()
 
@@ -626,6 +626,7 @@ class _Coordinator:
                 follower.buffer.clear()
                 follower.end("error")
         self.runs.clear()
+        self._suspects.clear()
         self._leave_hub()
         task = self._task
         if task is None or task.done():
@@ -655,11 +656,22 @@ class _Coordinator:
                 if await self._idle():
                     return
                 continue
-            chunk = self._due_chunk(now)
-            if chunk:
-                await self._cycle(chunk, now)
-            else:
+            if not await self._read_due(now):
                 await self._sleep(self._next_wake(now) - now)
+
+    async def _read_due(self, now: float) -> bool:
+        self._suspects.queue_due(now, POLL_BATCH_RUNS)
+        recheck = (
+            take_job(self._suspects.jobs, self.runs) if now >= self._suspects.probe_at else None
+        )
+        if recheck is not None:
+            events, statuses = ([], recheck.runs) if recheck.status else (recheck.runs, [])
+            await self._read_phases(recheck.runs, events, statuses)
+            return True
+        chunk = self._due_chunk(now)
+        if chunk:
+            await self._cycle(chunk, now)
+        return bool(chunk)
 
     async def _idle(self) -> bool:
         deadline = min([*self._deadlines(), self.store._retirement_due(self._loop)])
@@ -718,13 +730,12 @@ class _Coordinator:
         return [min(probes, key=lambda run: (run.due_at(), run.order))] if probes else []
 
     def _regular_chunk(self, due: list[_WatchedRun], now: float) -> list[_WatchedRun]:
-        healthy = [run for run in due if not run.suspect]
-        if not healthy or now >= self._discovery_at:
-            isolated = self._take_isolation()
-            if isolated:
+        if not due or now >= self._discovery_at:
+            isolated = take_job(self._isolations, self.runs)
+            if isolated is not None:
                 self._discovery_at = now + DISCOVERY_INTERVAL_S
-                return isolated
-        return self._prioritize(healthy)
+                return isolated.runs
+        return self._prioritize(due)
 
     def _prioritize(self, runs: list[_WatchedRun]) -> list[_WatchedRun]:
         now = self._now()
@@ -741,30 +752,13 @@ class _Coordinator:
         return not hinted, run.due_at(), run.order
 
     def _ready_at(self, run: _WatchedRun) -> float:
-        return max(run.due_at(), self._probe_at) if run.suspect else run.due_at()
-
-    def _take_isolation(self) -> list[_WatchedRun]:
-        while self._isolations:
-            job = self._isolations.popleft()
-            group = self._isolation_members(job)
-            if group:
-                return group
-        return []
-
-    def _isolation_members(self, job: _Isolation) -> list[_WatchedRun]:
-        field = "status_pending" if job.status else "events_pending"
-        members = []
-        for run in job.runs:
-            if getattr(run, field) is job.token:
-                setattr(run, field, None)
-                if self.runs.get(run.run_id) is run and run.active and not run.suspect:
-                    members.append(run)
-        return members
+        return max(run.due_at(), self._suspects.probe_at) if run.suspect else run.due_at()
 
     def _next_wake(self, now: float) -> float:
         times = [self._ready_at(run) for run in self.runs.values()]
         times.extend(self._deadlines())
         times.append(self._isolation_wake(now))
+        times.append(self._suspects.wake_at())
         times.append(self.store._retirement_due(self._loop))
         return min(times)
 
@@ -799,12 +793,22 @@ class _Coordinator:
         events = [run for run in chunk if run.events_ready_at() <= now]
         statuses = [run for run in chunk if self._status_due(run, now, events)]
         events, statuses = self._probe_phases(events, statuses)
+        await self._read_phases(chunk, events, self._batchable_statuses(statuses), snapshots)
+
+    async def _read_phases(
+        self,
+        chunk: list[_WatchedRun],
+        events: list[_WatchedRun],
+        statuses: list[_WatchedRun],
+        snapshots: dict[_WatchedRun, _Snapshot] | None = None,
+    ) -> None:
+        snapshots = snapshots or {run: self._snapshot(run) for run in chunk}
         for run in chunk:
             run.requested = _NEVER
         if events:
             await self._read_events(events, snapshots)
         if statuses:
-            await self._read_statuses(self._batchable_statuses(statuses))
+            await self._read_statuses(statuses)
         for run in chunk:
             self._requeue_if_dirty(run, snapshots[run])
 
@@ -849,6 +853,7 @@ class _Coordinator:
         limit = max(1, min(min(r.params.batch for r in runs), MAX_LIMIT_PER_RUN))
         limit = max(1, min(limit, MAX_ROWS_PER_READ // len(runs)))
         rows, failed = await self._fetch_events(runs, limit)
+        self._suspects.note_read(bool(rows), self._now())
         self._read_failure(failed, status=False)
         self._accept_events(runs, rows, limit, snapshots)
         self._log_missed_hints()
@@ -870,7 +875,7 @@ class _Coordinator:
         """Rows by run id for the runs read; failed runs (with the error) are absent."""
         batched = self.store._batched_events()
         if batched is None:
-            return await self._per_run(runs, lambda run: self._run_events(run, limit))
+            return await self._per_run(runs, lambda run: self._run_events(run, limit), status=False)
         return await self._isolated_batch(
             runs, lambda group: self._event_batch(group, limit, batched)
         )
@@ -893,7 +898,7 @@ class _Coordinator:
             return {run.run_id: found.get(run.run_id) for run in runs}, None
         except Exception as error:
             if len(runs) == 1:
-                runs[0].suspect = True
+                self._suspects.mark(runs[0])
             return {}, (runs, error)
         finally:
             _raise_if_cancelling()
@@ -912,17 +917,17 @@ class _Coordinator:
 
     def _read_candidates(self, runs: list[_WatchedRun]) -> list[_WatchedRun]:
         active = self._active_runs(runs)
-        if self._is_probe(active) and self._now() < self._probe_at:
+        if self._is_probe(active) and self._now() < self._suspects.probe_at:
             return []
         return active
 
     @staticmethod
     def _is_probe(runs: list[_WatchedRun]) -> bool:
-        return len(runs) == 1 and runs[0].suspect
+        return all(run.suspect for run in runs)
 
     def _charge_probe(self, runs: list[_WatchedRun]) -> list[_WatchedRun]:
-        if self._is_probe(runs):
-            self._probe_at = self._now() + 1 / SUSPECT_READS_PER_S
+        if runs and self._is_probe(runs):
+            self._suspects.charge(self._now())
         return runs
 
     def _read_failure(
@@ -932,53 +937,41 @@ class _Coordinator:
             return
         runs, error = failed
         if all(run.suspect for run in runs):
+            self._suspects.note_failure(self._now())
+        if len(runs) == 1:
             self._failed(runs, error, status=status)
         else:
             self._queue_isolation(runs, status)
 
     def _queue_isolation(self, runs: list[_WatchedRun], status: bool) -> None:
-        middle = len(runs) // 2
-        field = "status_pending" if status else "events_pending"
-        for group in (runs[:middle], runs[middle:]):
-            job = _Isolation(group, status)
-            for run in group:
-                setattr(run, field, job.token)
-            self._isolations.append(job)
+        suspects = all(run.suspect for run in runs)
+        jobs = self._suspects.jobs if suspects else self._isolations
+        for job in split_jobs(runs, status, suspects):
+            job.queue()
+            jobs.append(job)
         self._prune_isolations()
 
     def _prune_isolations(self) -> None:
-        self._isolations = deque(job for job in self._isolations if self._isolation_live(job))
+        for jobs in (self._isolations, self._suspects.jobs):
+            live = [job for job in jobs if job.is_live(self.runs)]
+            jobs.clear()
+            jobs.extend(live)
 
-    def _isolation_live(self, job: _Isolation) -> bool:
-        field = "status_pending" if job.status else "events_pending"
-        return any(
-            self.runs.get(run.run_id) is run and run.active and getattr(run, field) is job.token
-            for run in job.runs
-        )
-
-    async def _read_groups(
-        self, groups: list[list[_WatchedRun]], read: Any
+    async def _per_run(
+        self, runs: list[_WatchedRun], read: Any, *, status: bool
     ) -> tuple[dict[str, Any], tuple[list[_WatchedRun], BaseException] | None]:
+        """Stores with no batched read: each run is read, and fails, alone."""
         found: dict[str, Any] = {}
-        failed: list[_WatchedRun] = []
-        error: BaseException | None = None
-        for group in groups:
-            rows, failure = await self._isolated_batch(group, read)
+        for run in runs:
+            rows, failure = await self._isolated_batch(
+                [run], lambda group: self._single_result(group[0], read)
+            )
             found.update(rows)
-            if failure is not None:
-                failed.extend(failure[0])
-                error = failure[1]
-        return found, ((failed, error) if error is not None else None)
+            self._read_failure(failure, status=status)
+        return found, None
 
     async def _run_events(self, run: _WatchedRun, limit: int) -> list[StoredEvent]:
         return await self.store.get_events(run.run_id, after_sequence_index=run.head, limit=limit)
-
-    async def _per_run(
-        self, runs: list[_WatchedRun], read: Any
-    ) -> tuple[dict[str, Any], tuple[list[_WatchedRun], BaseException] | None]:
-        return await self._read_groups(
-            [[run] for run in runs], lambda group: self._single_result(group[0], read)
-        )
 
     async def _single_result(self, run: _WatchedRun, read: Any) -> dict[str, Any]:
         return {run.run_id: await read(run)}
@@ -989,7 +982,9 @@ class _Coordinator:
         if self.runs.get(run.run_id) is not run:
             return
         run.reads += 1
+        healed = run.events_fail_delay > 0
         run.events_fail_delay, run.events_retry_at = 0.0, -math.inf
+        self._suspects.settle(run, healed, self._now())
         fresh = [e for e in events if run.head is None or e.sequence_index > run.head]
         self._diagnose(run, fresh, snapshot)
         run.publish(fresh)
@@ -1076,6 +1071,7 @@ class _Coordinator:
 
     async def _read_statuses(self, runs: list[_WatchedRun]) -> None:
         found, failed = await self._fetch_statuses(runs)
+        self._suspects.note_read(bool(found), self._now())
         self._read_failure(failed, status=True)
         now = self._now()
         for run in runs:
@@ -1087,14 +1083,18 @@ class _Coordinator:
     ) -> tuple[dict[str, Any], tuple[list[_WatchedRun], BaseException] | None]:
         batched = self.store._batched_statuses()
         if batched is None:
-            return await self._per_run(runs, lambda run: self.store._status(run.run_id))
+            return await self._per_run(
+                runs, lambda run: self.store._status(run.run_id), status=True
+            )
         return await self._isolated_batch(runs, lambda group: batched([r.run_id for r in group]))
 
     def _after_status(self, run: _WatchedRun, status: str | None, now: float) -> None:
         """A missing run (deleted) counts as terminal; a failed read never does."""
         if self.runs.get(run.run_id) is not run:
             return
+        healed = run.status_fail_delay > 0
         run.status_fail_delay, run.status_retry_at = 0.0, -math.inf
+        self._suspects.settle(run, healed, now)
         if status is not None and status not in TERMINAL_STATUSES:
             run.status_due = now + STATUS_MAX_AGE_S
             return
@@ -1116,13 +1116,13 @@ class _Coordinator:
         for run in runs:
             self._delay_failure(run, now, status)
 
-    @staticmethod
-    def _delay_failure(run: _WatchedRun, now: float, status: bool) -> None:
+    def _delay_failure(self, run: _WatchedRun, now: float, status: bool) -> None:
+        delay = self._suspects.next_delay
         if status:
-            run.status_fail_delay = _suspect_backoff(run.status_fail_delay)
+            run.status_fail_delay = delay(run, run.status_fail_delay, run.status_retry_at, now)
             run.status_retry_at = run.status_due = now + run.status_fail_delay
         else:
-            run.events_fail_delay = _suspect_backoff(run.events_fail_delay)
+            run.events_fail_delay = delay(run, run.events_fail_delay, run.events_retry_at, now)
             run.events_retry_at = run.events_due = now + run.events_fail_delay
 
     # ------------------------------------------------------------ missed hints
@@ -1155,10 +1155,6 @@ def _pending_deadline(pending: object | None, due: float, retry: float) -> float
 
 def _status_readable(run: _WatchedRun, now: float) -> bool:
     return not run.status_terminal and run.status_pending is None and run.status_retry_at <= now
-
-
-def _suspect_backoff(delay: float) -> float:
-    return min(max(delay * 2, SUSPECT_RETRY_MIN_S), SUSPECT_RETRY_MAX_S)
 
 
 def _raise_if_cancelling() -> None:

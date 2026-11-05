@@ -5,7 +5,7 @@ import logging
 
 import pytest
 
-from dendrux.store import EventFeed, RunStore, _follow
+from dendrux.store import EventFeed, RunStore, _follow, _follow_recovery
 from tests.unit.test_follow_coordinator import BatchedState, ticks
 from tests.unit.test_follow_coordinator import clock as clock
 
@@ -202,25 +202,23 @@ async def test_initial_isolation_yields_to_new_healthy_hint():
         await reader.close()
 
 
-async def test_suspect_reads_are_singletons_with_reserved_query_share(clock):
+async def test_failing_suspect_reads_hold_to_their_reserved_query_share(clock):
     state = BatchedState()
     reader = RunStore(state)
     coordinator = reader._follow_coordinator()
     coordinator._healthy = lambda: True
     for i in range(100):
         _, run = watched(reader, state, str(i))
-        run.suspect = True
+        coordinator._suspects.mark(run)
+        run.events_fail_delay = _follow_recovery.SUSPECT_RETRY_MIN_S
         run.events_due = run.status_due = clock.now
         state.fail_runs.add(str(i))
     start = clock.now
     try:
         for _ in range(20):
-            chunk = coordinator._due_chunk(clock.now)
-            if chunk:
-                await coordinator._cycle(chunk, clock.now)
+            await coordinator._read_due(clock.now)
             reads = state.event_reads + state.status_reads
-            assert all(len(group) == 1 for group in reads)
-            assert len(reads) <= 1 + _follow.SUSPECT_READS_PER_S * (clock.now - start)
+            assert len(reads) <= 1 + _follow_recovery.SUSPECT_READS_PER_S * (clock.now - start)
             clock.advance(0.1)
     finally:
         await reader.close()

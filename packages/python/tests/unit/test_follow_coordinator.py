@@ -19,7 +19,7 @@ import pytest
 
 from dendrux.db._live_updates import LiveUpdates
 from dendrux.runtime.state import UNSCOPED
-from dendrux.store import EventFeed, FollowEnd, RunStore, StoredEvent, _follow
+from dendrux.store import EventFeed, FollowEnd, RunStore, StoredEvent, _follow, _follow_recovery
 
 TERMINAL = "run.completed"
 
@@ -645,7 +645,7 @@ async def test_failed_chunk_is_isolated_logged_without_text_and_retried(
     assert _seqs(bad) == []
     state.fail_runs = set()
     state.write("bad")
-    clock.advance(_follow.SUSPECT_RETRY_MIN_S + 0.1)
+    clock.advance(_follow_recovery.SUSPECT_RETRY_MIN_S + 0.1)
     await ticks(40)
     assert _seqs(bad) == [1]
     failed = [r for r in caplog.records if getattr(r, "code", None) == "follow_read_failed"]
@@ -783,7 +783,7 @@ async def test_hints_never_shorten_status_failure_backoff(clock: Clock) -> None:
     gaps = [round(b - a, 2) for a, b in zip(attempts, attempts[1:], strict=False)]
     assert len(gaps) >= 3
     for gap, backoff in zip(gaps, [5.0, 10.0, 20.0], strict=False):
-        assert backoff <= gap <= backoff + 1 / _follow.SUSPECT_READS_PER_S + 0.1
+        assert backoff <= gap <= backoff + 1 / _follow_recovery.SUSPECT_READS_PER_S + 0.1
 
 
 async def test_a_hint_during_a_failing_status_read_does_not_skip_the_backoff(
@@ -813,7 +813,7 @@ async def test_a_hint_during_a_failing_status_read_does_not_skip_the_backoff(
     live.hint("r1")
     await ticks()
     assert len(attempts) == 1  # still inside the suspect retry delay
-    clock.advance(_follow.SUSPECT_RETRY_MIN_S)
+    clock.advance(_follow_recovery.SUSPECT_RETRY_MIN_S)
     await ticks()
     assert len(attempts) == 2
 
