@@ -128,6 +128,27 @@ What the failed call leaves in the database depends on what the database can sti
 - Dendrux then tries to record the failure. If the database answers again in time, the run is saved as `error` with the fixed message and a `run.error` event, even though the call raised: check the run's status before assuming it is still running.
 - If the database still cannot be written, the run stays `running` at its last committed state: every event and row written before the failure is there, and nothing marks it `error`. Find it with `sweep` and move it on with `reclaim` (or finish it with `on_stale="error"`); see [Recovery](/docs/guides/recovery).
 
+## When a continuation read fails
+
+In 0.6.0, `resume` and `resume_stream` follow the same setup-failure policy as
+`submit_tool_results`, `submit_input` and `submit_approval`. If a read fails after
+claiming but before the submitted input is consumed or work starts, Dendrux
+releases that exact claim back to its pause and preserves the submission for retry.
+The call still raises (or the stream emits `run_error`). Reclaim setup follows
+the same rule, leaving the run `running` for lease expiry and a new sweep.
+Release cannot change a newer owner's claim. Cancellation keeps its existing
+precedence. During execution setup, `StoreOutcomeUnknown` is excluded from this
+release decision.
+In 0.5.0, these post-claim failures ended the run as `error`.
+
+When execution returns a committed outcome, its recovery and pending reads are
+best effort. A failed recovery projection returns `recovery=None`. A failed pending
+projection, or a failed refresh immediately after committing a pause, returns
+the known status with `pending=None` and `pause_id=None`. No pending payload or
+pause token is invented: reload it from `RunStore.get_pending` before submitting.
+Each failure logs `result_read_failed` with `run_id`; cancellation still propagates.
+Reads needed to determine an unknown winning outcome remain required and can fail.
+
 ## When a commit acknowledgement is lost
 
 `StoreOutcomeUnknown` means the connection broke during `COMMIT`, so the write may or may not have landed. Never assume you own a run after it. Treat it by operation:

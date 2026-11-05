@@ -1148,6 +1148,14 @@ PERSISTENCE_ERROR = Code(
     "A durable operation fails.",
     "Restore store connectivity and inspect the run result.",
 )
+RESULT_READ_FAILED = Code(
+    "result_read_failed",
+    logging.WARNING,
+    "runtime",
+    _BASE_FIELDS,
+    "An optional read fails while returning a known durable outcome.",
+    "The outcome is preserved; reload missing recovery or pending information from the store.",
+)
 MCP_DISCOVERY_REPEATED_CURSOR = Code(
     "mcp_discovery_repeated_cursor",
     logging.WARNING,
@@ -2006,6 +2014,7 @@ REGISTRY = MappingProxyType(
             PROVIDER_UNKNOWN,
             LOG_FIELD_DROPPED,
             PERSISTENCE_ERROR,
+            RESULT_READ_FAILED,
             STORE_OUTCOME_UNKNOWN,
             MCP_DISCOVERY_REPEATED_CURSOR,
             MCP_DISCOVERY_PAGE_CAP,

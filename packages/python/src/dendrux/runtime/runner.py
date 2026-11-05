@@ -185,7 +185,7 @@ _TOOL_NAME_CHARS = 64
 _DEFAULT_RECOVERY_ITERATIONS = 10
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, AsyncIterator, Callable, Sequence
+    from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Sequence
 
     from dendrux.agent import Agent
     from dendrux.chat import ChatMessage
@@ -1177,9 +1177,13 @@ async def _recovery_info(store: StateStore, record: Any) -> Any:
 
     if record is None or not getattr(record, "reclaim_attempts", 0):
         return None
-    ids, truncated = await store.get_replayed_tool_calls(
-        record.id, limit=_CONTROL_EVENT_LIMIT, tenant_id=record.tenant_id
-    )
+    try:
+        ids, truncated = await store.get_replayed_tool_calls(
+            record.id, limit=_CONTROL_EVENT_LIMIT, tenant_id=record.tenant_id
+        )
+    except Exception:
+        _codes.log_code(logger, _codes.RESULT_READ_FAILED, run_id=record.id)
+        return None
     return RecoveryInfo(record.reclaim_attempts, record.last_reclaimed_at, ids, truncated)
 
 
@@ -1188,11 +1192,31 @@ async def _attach_persisted_pending(store: StateStore, result: RunResult, record
     if result.status in _PAUSE_STATUSES and record is not None:
         from dendrux.runtime._pending import _PendingReader
 
-        result.pending = await _PendingReader(store).get_pending(
-            result.run_id, tenant_id=getattr(record, "tenant_id", None)
-        )
+        result.pending = None
+        result.pause_id = None
+        try:
+            result.pending = await _PendingReader(store).get_pending(
+                result.run_id, tenant_id=getattr(record, "tenant_id", None)
+            )
+        except Exception:
+            _codes.log_code(logger, _codes.RESULT_READ_FAILED, run_id=result.run_id)
         result.pause_id = result.pending.pause_id if result.pending else None
     return result
+
+
+async def _committed_pause_result(
+    store: StateStore, result: RunResult, persisted: Callable[[RunStatus], Awaitable[RunResult]]
+) -> RunResult:
+    try:
+        record = await store.get_run(result.run_id)
+    except Exception:
+        _codes.log_code(logger, _codes.RESULT_READ_FAILED, run_id=result.run_id)
+        result.pending = None
+        result.pause_id = None
+        return result
+    if record is not None and record.status != result.status.value:
+        return await persisted(RunStatus(record.status))
+    return await _attach_persisted_pending(store, result, record)
 
 
 def _ensure_pause_generation(
@@ -1274,7 +1298,11 @@ async def _final_run_recovery(state_store: StateStore, run_id: str, records: Any
 
     if not capabilities(state_store).recovery:
         return None
-    record = records[-1] if records else await state_store.get_run(run_id)
+    try:
+        record = records[-1] if records else await state_store.get_run(run_id)
+    except Exception:
+        _codes.log_code(logger, _codes.RESULT_READ_FAILED, run_id=run_id)
+        return None
     return await _recovery_info(state_store, record)
 
 
@@ -1535,11 +1563,8 @@ async def _persist_loop_outcome(
         result.pause_id = pause_state.pause_id
         # Return the persisted state: a finalizer may already have acted on
         # the durable pause (e.g. cancel_run right after it committed).
-        record = await state_store.get_run(run_id)
-        if record is not None and record.status != result.status.value:
-            return await _persisted(RunStatus(record.status))
-        return await _attach_persisted_pending(
-            state_store, _wrap(status=result.status, won=True), record
+        return await _committed_pause_result(
+            state_store, _wrap(status=result.status, won=True), _persisted
         )
 
     # Terminal: success / max_iterations / error. Cooperative cancellation:
@@ -6203,16 +6228,24 @@ async def _handle_resume_failure(
     ctx: _ResumeContext | None,
     exc: Exception,
     progress: _ResumeProgress,
-    skip_claim: bool,
     meta: dict[str, Any],
 ) -> None:
-    if skip_claim and progress._can_release(ctx, exc):
+    if progress._can_release(ctx, exc):
         await _release_claim(store, run_id, status)
         await _released_resume_hooks(store, run_id, status, ctx, exc)
         return
     _attach_run_error_meta(exc, run_id, meta)
     await _persist_run_failure(store, run_id, exc)
     await _resume_failure_hooks(ctx, run_id, exc)
+
+
+async def _fenced_resume_result(
+    store: StateStore, run_id: str, ctx: _ResumeContext | None
+) -> RunResult:
+    result = await _build_cached_result(store, run_id)
+    if ctx is not None:
+        await _finish_fenced_lifecycle(run_id, result, ctx.recorder, ctx.notifier)
+    return result
 
 
 async def _resume_core(
@@ -6423,10 +6456,7 @@ async def _resume_core(
             raise
 
         except RunFencedError:
-            fenced_result = await _build_cached_result(state_store, run_id)
-            if ctx is not None:
-                await _finish_fenced_lifecycle(run_id, fenced_result, ctx.recorder, ctx.notifier)
-            return fenced_result
+            return await _fenced_resume_result(state_store, run_id, ctx)
 
         except Exception as exc:
             await _handle_resume_failure(
@@ -6436,7 +6466,6 @@ async def _resume_core(
                 ctx,
                 exc,
                 progress,
-                _skip_claim,
                 _resume_warning_meta(ctx, mcp_meta),
             )
             raise
@@ -6550,6 +6579,7 @@ async def _stream_approval_events(
     user_input: str | None,
     image_runtime: ImageRuntime | None,
     meta: dict[str, Any],
+    on_work: Callable[[], None] | None = None,
 ) -> AsyncGenerator[RunEvent, None]:
     from dendrux.types import RunEvent
 
@@ -6563,6 +6593,7 @@ async def _stream_approval_events(
         user_input,
         image_runtime,
         streaming=True,
+        on_work=on_work,
     )
     if approval is not None:
         for tc, tr in approval.results:
@@ -6579,8 +6610,17 @@ async def _stream_approval_events(
         yield _stopped_stream_event(await _finish_resumed_result(store, run_id, ctx, stop))
 
 
+def _resume_expected_status(results: list[ToolResult] | None, user_input: str | None) -> str:
+    if results is not None:
+        return RunStatus.WAITING_CLIENT_TOOL.value
+    if user_input is not None:
+        return RunStatus.WAITING_HUMAN_INPUT.value
+    return RunStatus.WAITING_APPROVAL.value
+
+
 def _mark_stream_recovery_work(shared: dict[str, Any]) -> None:
     shared["work_started"] = True
+    shared["progress"]._start()
 
 
 def _stream_resume_started(shared: dict[str, Any]) -> bool:
@@ -6593,6 +6633,11 @@ async def _stream_resume_failure(
 ) -> None:
     store = _shared.get("state_store")
     err_ctx = _shared.get("ctx")
+    progress = _shared.get("progress")
+    if store is not None and progress is not None and progress._can_release(err_ctx, exc):
+        await _release_claim(store, run_id, _shared["expected_status"])
+        await _released_resume_hooks(store, run_id, _shared["expected_status"], err_ctx, exc)
+        return
     if store is not None and _stream_resume_started(_shared):
         await _persist_run_failure(store, run_id, exc, safe_event=True)
     try:
@@ -6739,13 +6784,7 @@ def resume_stream(
             )
 
             # 4. Determine expected status and claim
-            if stream_results is not None:
-                expected = RunStatus.WAITING_CLIENT_TOOL.value
-            elif user_input is not None:
-                expected = RunStatus.WAITING_HUMAN_INPUT.value
-            else:
-                # No-arg = approval-approve, or continue a PAUSED run
-                expected = RunStatus.WAITING_APPROVAL.value
+            expected = _resume_expected_status(stream_results, user_input)
 
             store, expected, raw_pause = await _claim_resume(
                 store,
@@ -6761,6 +6800,8 @@ def resume_stream(
             )
             _shared["state_store"] = store
             _shared["claimed"] = True
+            _shared["expected_status"] = expected
+            progress = _shared["progress"] = _ResumeProgress()
 
             # 5. Prepare (shared helper — history, notifier).
             #    Does NOT fire any lifecycle hooks; that's done below inside
@@ -6784,12 +6825,14 @@ def resume_stream(
             )
             image_runtime = _image_runtime(agent, store, run_tenant, run_id)
             _shared["ctx"] = ctx
+            progress.submission = getattr(ctx.recorder, "_loop_state", {}).get("submission")
 
             # 5a. Fire run-level lifecycle hooks. After this point, any
             #     failure must pair with on_run_failed in the except handler.
             await record_run_started(
                 ctx.recorder, run_id, agent_name=agent.name, agent_model=provider.model
             )
+            ctx.recorder_started = True
             trace_link, ctx.notifier = await _start_trace(
                 ctx.notifier,
                 store,
@@ -6797,6 +6840,7 @@ def resume_stream(
                 agent_name=agent.name,
                 agent_model=provider.model,
                 saved=getattr(run_record, "trace_link", None),
+                on_started=ctx._mark_notifier_started,
             )
             # Lifecycle pair is now open. Stash recorder/notifier so the
             # cleanup callback can close it with a CANCELLED finish if the
@@ -6811,7 +6855,11 @@ def resume_stream(
             #     so a recorder failure here fires on_run_failed.
             if not recovering:
                 await _replay_resume_injected_history(
-                    ctx, run_id, tool_results=stream_results, user_input=user_input
+                    ctx,
+                    run_id,
+                    tool_results=stream_results,
+                    user_input=user_input,
+                    on_consumed=progress._start,
                 )
 
             stream_context.set_delegation(
@@ -6849,6 +6897,7 @@ def resume_stream(
                         user_input,
                         image_runtime,
                         mcp_meta,
+                        progress._start,
                     )
                 ) as approval_events:
                     async for event in approval_events:
@@ -6858,6 +6907,7 @@ def resume_stream(
 
             # 9. Stream the loop (see run_stream for interrupt + closing notes)
             interrupt = agent._task_manager.register_interrupt(run_id)
+            progress._start()
             loop_stream = ctx.resolved_loop.run_stream(
                 **_resumed_loop_kwargs(
                     agent, provider, store, run_id, ctx, image_runtime, ctx.resolved_loop.run_stream
@@ -6881,12 +6931,7 @@ def resume_stream(
 
         except RunFencedError:
             store = _shared["state_store"]
-            result = await _build_cached_result(store, run_id)
-            fenced_ctx = _shared.get("ctx")
-            if fenced_ctx is not None:
-                await _finish_fenced_lifecycle(
-                    run_id, result, fenced_ctx.recorder, fenced_ctx.notifier
-                )
+            result = await _fenced_resume_result(store, run_id, _shared.get("ctx"))
             yield _fenced_stream_event(run_id, result)
 
         except Exception as exc:

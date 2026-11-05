@@ -198,6 +198,7 @@ Missing or invalid codes remain unset. Category and HTTP status remain independe
 | `pause_id_mismatch` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | A submission targets another pause generation. | Reload the pending pause and resubmit. |
 | `pending_limit` | WARNING | `code`, `count`, `kind`, `limit`, `run_id`, `tenant_id` | A model produces too many pending calls. | Reduce tool fanout or raise the pending call bound. |
 | `read_argument_invalid` | WARNING | `argument`, `code`, `kind`, `run_id`, `tenant_id` | A read argument is invalid. | Correct the named argument. |
+| `result_read_failed` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | An optional read fails while returning a known durable outcome. | The outcome is preserved; reload missing recovery or pending information from the store. |
 | `run_cancel_recovered` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | A Python 3.11 persisted run recovers cancellation at a dispatch boundary. | Expected when a database wait loses cancellation; Python 3.12+ is unaffected. |
 | `run_cancelled` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | Child admission is refused under a cancelled parent. | Stop creating children for the parent. |
 | `run_failed` | ERROR | `code`, `error_type`, `kind`, `run_id`, `tenant_id` | A run task fails. | Inspect its safe result and trace. |

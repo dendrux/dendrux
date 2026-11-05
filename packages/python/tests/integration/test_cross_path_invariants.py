@@ -553,11 +553,8 @@ async def test_startup_write_failure_grid(store, engine, monkeypatch, path):
         new = [row for row in await store.list_runs() if row.id not in {r.id for r in before}]
         assert len(new) == 1 and new[0].status == "error"
     else:
-        # An unconsumed submit/reclaim startup is retryable by the explicit
-        # claim-release contract; direct resume owns ERROR finalization.
-        assert (await store.get_run(case.run_id)).status == (
-            old_status if path in SUBMIT_KINDS or path == "recovery" else "error"
-        )
+        # Every unconsumed continuation releases its exact claim on startup failure.
+        assert (await store.get_run(case.run_id)).status == old_status
     assert provider.calls == 0
 
 
