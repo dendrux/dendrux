@@ -331,3 +331,53 @@ async def test_public_trace_factory_paths_share_projection(tmp_path, entry):
         await reader.close()
         await engine.dispose()
         await agent.close()
+
+
+@pytest.mark.parametrize("fmt", [1, 2])
+async def test_many_redactions_keep_true_event_count(store, engine, fmt):
+    from sqlalchemy import select
+
+    from dendrux.db.models import LLMInteraction
+
+    await pin_storage_format(engine, fmt)
+    provider = MockLLM([LLMResponse(text="done")])
+    notifier = Governance()
+    result = await Agent(
+        prompt="p", provider=provider, state_store=store, guardrails=[PII(action="redact")]
+    ).run(" ".join(f"person{i}@example.com" for i in range(200)), tenant_id="t", notifier=notifier)
+    events = await RunStore(store).get_events(result.run_id, tenant_id="t", limit=50)
+    found = [(e.event_type, e.data) for e in events if e.event_type.startswith("guardrail.")]
+    assert [kind for kind, _ in found] == ["guardrail.detected", "guardrail.redacted"]
+    assert found[0][1]["findings_count"] == 200
+    assert found == [
+        (kind, data) for kind, data in notifier.events if kind.startswith("guardrail.")
+    ]
+    assert "person7@example.com" not in str(provider.wire_messages)
+    async with engine.connect() as connection:
+        saved = await connection.scalar(
+            select(LLMInteraction.guardrail_findings).where(
+                LLMInteraction.agent_run_id == result.run_id
+            )
+        )
+    assert len(saved["incoming"]) == (200 if fmt == 1 else 128)
+
+
+async def test_seeded_redactions_survive_cache_eviction_at_provider_boundary(store, engine):
+    from dendrux.chat import ChatMessage
+
+    await pin_storage_format(engine, 2)
+    provider = MockLLM([LLMResponse(text="done")])
+    history = [
+        m
+        for i in range(300)
+        for m in (ChatMessage.user(f"person{i}@example.com"), ChatMessage.assistant("ok"))
+    ]
+    result = await Agent(
+        prompt="p", provider=provider, state_store=store, guardrails=[PII(action="redact")]
+    ).run("go", history=history, tenant_id="t")
+    assert result.status == RunStatus.SUCCESS
+    events = await RunStore(store).get_events(result.run_id, tenant_id="t", limit=50)
+    detected = [e for e in events if e.event_type == "guardrail.detected"]
+    assert len(detected) == 1 and detected[0].data["findings_count"] == 300
+    assert any(e.event_type == "guardrail.redacted" for e in events)
+    assert "@example.com" not in str(provider.wire_messages)

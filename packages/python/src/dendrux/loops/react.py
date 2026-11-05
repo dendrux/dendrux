@@ -175,7 +175,9 @@ _notify_governance = notify_governance
 def _blocked_data(direction: str, error: str, findings: list[Any], location: str) -> dict[str, Any]:
     from collections import Counter
 
-    counts = dict(Counter(f.entity_type for f in findings))
+    counts = getattr(findings, "entity_counts", None)
+    if counts is None:
+        counts = dict(Counter(f.entity_type for f in findings))
     return {
         "direction": direction,
         "error": error,
@@ -2251,6 +2253,7 @@ async def _incoming_events(
     redacted: bool,
     iteration: int,
     all_findings: dict[str, Any],
+    findings_count: int | None = None,
 ) -> None:
     """``guardrail.detected`` and ``guardrail.redacted`` for the incoming scan."""
     if findings:
@@ -2260,14 +2263,22 @@ async def _incoming_events(
             ctx.run_id,
             GovernanceEventType.GUARDRAIL_DETECTED.value,
             iteration,
-            {"direction": "incoming", "findings_count": len(findings), "entities": entities},
+            {
+                "direction": "incoming",
+                "findings_count": len(findings) if findings_count is None else findings_count,
+                "entities": entities,
+            },
         )
         await _notify_governance(
             ctx.notifier,
             ctx.run_id,
             GovernanceEventType.GUARDRAIL_DETECTED.value,
             iteration,
-            {"direction": "incoming", "findings_count": len(findings), "entities": entities},
+            {
+                "direction": "incoming",
+                "findings_count": len(findings) if findings_count is None else findings_count,
+                "entities": entities,
+            },
             warnings=ctx.state.warnings,
         )
         all_findings["incoming"] = [
@@ -2305,12 +2316,16 @@ async def _scan_incoming(
         return None
     all_in_findings: list[Any] = []
     redacted = False
+    findings_count = 0
+    projected = getattr(ctx.recorder, "guardrail_engine", None) is engine
     for index, msg in enumerate(messages):
         if not msg.content:
             continue
         cleaned, findings, block_error = await _incoming_project(ctx, engine, msg, index)
         if findings:
-            all_in_findings.extend(findings)
+            findings_count += getattr(findings, "total_count", len(findings))
+            saved = findings[: max(0, 128 - len(all_in_findings))] if projected else findings
+            all_in_findings.extend(saved)
         if block_error is not None:
             return await _incoming_blocked(ctx, block_error, findings, msg, index, iteration)
         if cleaned is not msg:
@@ -2318,7 +2333,7 @@ async def _scan_incoming(
             # The engine's replace() preserves the origin envelope
             # (kind/placement/source) through redaction.
             messages[index] = cleaned
-    await _incoming_events(ctx, all_in_findings, redacted, iteration, all_findings)
+    await _incoming_events(ctx, all_in_findings, redacted, iteration, all_findings, findings_count)
     return None
 
 

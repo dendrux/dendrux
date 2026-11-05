@@ -207,6 +207,28 @@ def _message_digest(message: Message) -> bytes:
     return hashlib.sha256(json.dumps(value, ensure_ascii=False).encode()).digest()
 
 
+class _ProjectionFindings(list[Finding]):
+    def __init__(self, findings: list[Finding], total_count: int | None = None) -> None:
+        super().__init__(
+            replace(f, text="", start=0, end=0) for f in findings[:_PROJECTED_FINDINGS_LIMIT]
+        )
+        self.total_count = len(findings) if total_count is None else total_count
+        self.entity_counts = {
+            kind: sum(f.entity_type == kind for f in findings)
+            for kind in {f.entity_type for f in self}
+        }
+
+
+@dataclass(frozen=True)
+class _Projection:
+    owner: object
+    digest: bytes
+    findings: _ProjectionFindings
+    blocked: str | None
+    redacted: bool
+    location: str
+
+
 class GuardrailEngine:
     """Per-run guardrail orchestrator.
 
@@ -274,9 +296,8 @@ class GuardrailEngine:
         # restored into a tool only when it is trusted or that tool produced it;
         # a placeholder with no record (legacy or corrupt state, or minted from
         # model output) is restored nowhere until its origin is seen again.
-        self._projected: OrderedDict[bytes, tuple[list[Finding], str | None, bool, str]] = (
-            OrderedDict()
-        )
+        self._projected: OrderedDict[bytes, _Projection] = OrderedDict()
+        self._projection_owner = object()
         self._trusted: set[str] = set()
         self._tool_origins: dict[str, set[str]] = {}
         if self._allowlisted:
@@ -447,26 +468,33 @@ class GuardrailEngine:
     ) -> tuple[Message, list[Finding], str | None]:
         """Project a format-2 boundary once; retain bounded digests, never history."""
         key = _message_digest(msg)
-        previous = self._projected.get(key)
+        previous = msg._guardrail_projection
+        if (
+            not isinstance(previous, _Projection)
+            or previous.owner is not self._projection_owner
+            or previous.digest != key
+        ):
+            previous = self._projected.get(key)
         if previous is not None:
-            self._projected.move_to_end(key)
-            findings, blocked, redacted, location = previous
+            blocked = previous.blocked
             if blocked is not None:
-                blocked = blocked.replace(location, _message_location(msg, index), 1)
-            return replace(msg) if redacted else msg, findings, blocked
+                blocked = blocked.replace(previous.location, _message_location(msg, index), 1)
+            object.__setattr__(msg, "_guardrail_projection", previous)
+            return replace(msg) if previous.redacted else msg, previous.findings, blocked
         cleaned, findings, blocked = await self.scan_incoming_message(msg, index=index)
-        # Keep block evidence so projection at persistence cannot bypass the
-        # loop's governance handling at the subsequent provider boundary.
-        if len(findings) <= _PROJECTED_FINDINGS_LIMIT:
-            self._projected[_message_digest(cleaned)] = (
-                findings,
-                blocked,
-                cleaned is not msg,
-                _message_location(msg, index),
-            )
+        evidence = _Projection(
+            self._projection_owner,
+            _message_digest(cleaned),
+            _ProjectionFindings(findings),
+            blocked,
+            cleaned is not msg,
+            _message_location(msg, index),
+        )
+        object.__setattr__(cleaned, "_guardrail_projection", evidence)
+        self._projected[evidence.digest] = evidence
         if len(self._projected) > _PROJECTION_CACHE_LIMIT:
             self._projected.popitem(last=False)
-        return cleaned, findings, blocked
+        return cleaned, evidence.findings, blocked
 
     async def scan_incoming_message(
         self, msg: Message, *, index: int | None = None
