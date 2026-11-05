@@ -237,23 +237,34 @@ async def retry_transient_db(
     label: str,
     run_id: str,
     classify: Any = classify_error,
+    _raw_driver_errors: bool = False,
 ) -> T:
     """Retry a DB transaction on transient failures.
 
     Wraps the entire transaction attempt — session open, execute, commit.
     Retries transient pre-commit connection, availability and transaction failures
     (see :func:`is_transient_db_error`).
-    Other database failures fail immediately as sanitized, typed errors. Logical
-    failures such as ValueError propagate immediately. Exhaustion raises a
-    retryable PersistenceError; raw driver exceptions are never propagated.
+    SQLAlchemy and persistence errors retain the shared retry policy. Only SQL
+    stores with a COMMIT proof boundary opt into raw transient driver failures;
+    other raw errors propagate to their caller's normalization boundary.
+    Exhaustion raises a retryable PersistenceError.
     """
+
+    def check_retry_error(error: Exception) -> None:
+        _require_database_error(error)
+        allowed = isinstance(error, (SQLAlchemyError, PersistenceError)) or (
+            _raw_driver_errors and is_transient_db_error(error, classify=classify)
+        )
+        if not allowed:
+            raise error
+
     failure: BaseException | None = None
     last_classified = None
     for attempt_num in range(MAX_RETRIES + 1):
         try:
             return await attempt()
         except Exception as exc:
-            _require_database_error(exc)
+            check_retry_error(exc)
             last_classified = classify(exc)
             if not is_transient_db_error(exc, classify=classify):
                 failure = _database_failure(exc, classify=classify)
@@ -362,6 +373,7 @@ def _safe_database_call(method: Any) -> Any:
         assert failure is not None
         failure.__context__ = None
         failure.__cause__ = None
+        failure.__traceback__ = None
         raise failure from None
 
     return _with_live_updates(call)

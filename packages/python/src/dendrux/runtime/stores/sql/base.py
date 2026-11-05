@@ -1200,7 +1200,11 @@ class SQLStateStore(SQLBlobCatalog):
             )
 
         return await retry_transient_db(
-            _attempt, label="create_run", run_id=run_id, classify=self.classify_db_error
+            _attempt,
+            label="create_run",
+            run_id=run_id,
+            classify=self.classify_db_error,
+            _raw_driver_errors=True,
         )
 
     def idempotency_scope_predicate(self, tenant_id: str | None) -> Any:
@@ -2020,6 +2024,7 @@ class SQLStateStore(SQLBlobCatalog):
             label="mark_cancel_requested",
             run_id=run_ids[0],
             classify=self.classify_db_error,
+            _raw_driver_errors=True,
         )
 
     async def get_children_page(
@@ -2049,6 +2054,7 @@ class SQLStateStore(SQLBlobCatalog):
             label="get_children_page",
             run_id=parent_ids[0],
             classify=self.classify_db_error,
+            _raw_driver_errors=True,
         )
 
     async def get_loop_state(self, run_id: str) -> dict[str, Any] | None:
@@ -2345,7 +2351,11 @@ class SQLStateStore(SQLBlobCatalog):
                 )
 
         return await retry_transient_db(
-            _attempt, label="finalize_run", run_id=run_id, classify=self.classify_db_error
+            _attempt,
+            label="finalize_run",
+            run_id=run_id,
+            classify=self.classify_db_error,
+            _raw_driver_errors=True,
         )
 
     async def finalize_run_if_status_in(
@@ -2394,6 +2404,7 @@ class SQLStateStore(SQLBlobCatalog):
             label="finalize_run_if_status_in",
             run_id=run_id,
             classify=self.classify_db_error,
+            _raw_driver_errors=True,
         )
 
     async def finalize_with_event(
@@ -2453,7 +2464,11 @@ class SQLStateStore(SQLBlobCatalog):
                 return seq
 
         return await retry_transient_db(
-            _attempt, label="finalize_with_event", run_id=run_id, classify=self.classify_db_error
+            _attempt,
+            label="finalize_with_event",
+            run_id=run_id,
+            classify=self.classify_db_error,
+            _raw_driver_errors=True,
         )
 
     async def _finalize_error_info(
@@ -2602,7 +2617,11 @@ class SQLStateStore(SQLBlobCatalog):
                 return bool(result.rowcount and result.rowcount > 0)
 
         return await retry_transient_db(
-            _attempt, label="request_cancel", run_id=run_id, classify=self.classify_db_error
+            _attempt,
+            label="request_cancel",
+            run_id=run_id,
+            classify=self.classify_db_error,
+            _raw_driver_errors=True,
         )
 
     async def update_run_meta(
@@ -2635,7 +2654,11 @@ class SQLStateStore(SQLBlobCatalog):
                 await self._write_tx(session)
 
         await retry_transient_db(
-            _attempt, label="update_run_meta", run_id=run_id, classify=self.classify_db_error
+            _attempt,
+            label="update_run_meta",
+            run_id=run_id,
+            classify=self.classify_db_error,
+            _raw_driver_errors=True,
         )
 
     async def is_cancel_requested(self, run_id: str) -> bool:
@@ -2652,7 +2675,11 @@ class SQLStateStore(SQLBlobCatalog):
                 return bool(row[0]) if row is not None else False
 
         return await retry_transient_db(
-            _attempt, label="is_cancel_requested", run_id=run_id, classify=self.classify_db_error
+            _attempt,
+            label="is_cancel_requested",
+            run_id=run_id,
+            classify=self.classify_db_error,
+            _raw_driver_errors=True,
         )
 
     async def get_run_control(self, run_id: str) -> RunControl:
@@ -2688,7 +2715,11 @@ class SQLStateStore(SQLBlobCatalog):
                 )
 
         return await retry_transient_db(
-            _attempt, label="get_run_control", run_id=run_id, classify=self.classify_db_error
+            _attempt,
+            label="get_run_control",
+            run_id=run_id,
+            classify=self.classify_db_error,
+            _raw_driver_errors=True,
         )
 
     async def request_pause(self, run_id: str, *, reason: str | None = None) -> bool:
@@ -2723,7 +2754,11 @@ class SQLStateStore(SQLBlobCatalog):
                 return True
 
         return await retry_transient_db(
-            _attempt, label="request_pause", run_id=run_id, classify=self.classify_db_error
+            _attempt,
+            label="request_pause",
+            run_id=run_id,
+            classify=self.classify_db_error,
+            _raw_driver_errors=True,
         )
 
     async def try_pause_run(
@@ -2771,7 +2806,11 @@ class SQLStateStore(SQLBlobCatalog):
                 return bool(result.rowcount and result.rowcount > 0)
 
         return await retry_transient_db(
-            _attempt, label="try_pause_run", run_id=run_id, classify=self.classify_db_error
+            _attempt,
+            label="try_pause_run",
+            run_id=run_id,
+            classify=self.classify_db_error,
+            _raw_driver_errors=True,
         )
 
     async def pause_with_event(
@@ -2836,7 +2875,11 @@ class SQLStateStore(SQLBlobCatalog):
                 return seq
 
         return await retry_transient_db(
-            _attempt, label="pause_with_event", run_id=run_id, classify=self.classify_db_error
+            _attempt,
+            label="pause_with_event",
+            run_id=run_id,
+            classify=self.classify_db_error,
+            _raw_driver_errors=True,
         )
 
     async def add_note(
@@ -2940,7 +2983,11 @@ class SQLStateStore(SQLBlobCatalog):
                 return inserted
 
         return await retry_transient_db(
-            _attempt, label="add_note", run_id=run_id, classify=self.classify_db_error
+            _attempt,
+            label="add_note",
+            run_id=run_id,
+            classify=self.classify_db_error,
+            _raw_driver_errors=True,
         )
 
     async def get_notes(
@@ -3010,7 +3057,11 @@ class SQLStateStore(SQLBlobCatalog):
                 return int(result.rowcount or 0)
 
         return await retry_transient_db(
-            _attempt, label="mark_notes_delivered", run_id=run_id, classify=self.classify_db_error
+            _attempt,
+            label="mark_notes_delivered",
+            run_id=run_id,
+            classify=self.classify_db_error,
+            _raw_driver_errors=True,
         )
 
     async def get_next_event_sequence(self, run_id: str) -> int:
@@ -3034,6 +3085,7 @@ class SQLStateStore(SQLBlobCatalog):
             label="get_next_event_sequence",
             run_id=run_id,
             classify=self.classify_db_error,
+            _raw_driver_errors=True,
         )
 
     async def pause_run(
@@ -3084,7 +3136,11 @@ class SQLStateStore(SQLBlobCatalog):
                 await self._write_tx(session)
 
         await retry_transient_db(
-            _attempt, label="pause_run", run_id=run_id, classify=self.classify_db_error
+            _attempt,
+            label="pause_run",
+            run_id=run_id,
+            classify=self.classify_db_error,
+            _raw_driver_errors=True,
         )
 
     async def get_pause_state(self, run_id: str) -> dict[str, Any] | None:
@@ -3437,7 +3493,11 @@ class SQLStateStore(SQLBlobCatalog):
                 return token if result.rowcount else False
 
         return await retry_transient_db(
-            _attempt, label="claim_paused_run", run_id=run_id, classify=self.classify_db_error
+            _attempt,
+            label="claim_paused_run",
+            run_id=run_id,
+            classify=self.classify_db_error,
+            _raw_driver_errors=True,
         )
 
     async def submit_and_claim(
@@ -3567,7 +3627,11 @@ class SQLStateStore(SQLBlobCatalog):
                 return token
 
         return await retry_transient_db(
-            _attempt, label="submit_and_claim", run_id=run_id, classify=self.classify_db_error
+            _attempt,
+            label="submit_and_claim",
+            run_id=run_id,
+            classify=self.classify_db_error,
+            _raw_driver_errors=True,
         )
 
     async def _finish_claim_release(
@@ -3652,7 +3716,11 @@ class SQLStateStore(SQLBlobCatalog):
                 return won
 
         return await retry_transient_db(
-            attempt, label="release_run_claim", run_id=run_id, classify=self.classify_db_error
+            attempt,
+            label="release_run_claim",
+            run_id=run_id,
+            classify=self.classify_db_error,
+            _raw_driver_errors=True,
         )
 
     @_safe_database_call
@@ -3998,7 +4066,11 @@ class SQLStateStore(SQLBlobCatalog):
                 return bool(result.rowcount)
 
         return await retry_transient_db(
-            _attempt, label="touch_progress", run_id=run_id, classify=self.classify_db_error
+            _attempt,
+            label="touch_progress",
+            run_id=run_id,
+            classify=self.classify_db_error,
+            _raw_driver_errors=True,
         )
 
     async def mark_lease_expired(
@@ -4282,6 +4354,7 @@ class SQLStateStore(SQLBlobCatalog):
                         label="mark_lease_expired",
                         run_id=run_id,
                         classify=self.classify_db_error,
+                        _raw_driver_errors=True,
                     )
                     inspected += 1
                     after = run_id
@@ -4514,7 +4587,11 @@ class SQLStateStore(SQLBlobCatalog):
                 return token
 
         return await retry_transient_db(
-            attempt, label="reclaim_run", run_id=run_id, classify=self.classify_db_error
+            attempt,
+            label="reclaim_run",
+            run_id=run_id,
+            classify=self.classify_db_error,
+            _raw_driver_errors=True,
         )
 
     async def get_replayed_tool_calls(

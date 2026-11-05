@@ -293,7 +293,11 @@ class SQLBlobCatalog:
             return out
 
         return await retry_transient_db(
-            _attempt, label="touch_live", run_id="-", classify=self.classify_db_error
+            _attempt,
+            label="touch_live",
+            run_id="-",
+            classify=self.classify_db_error,
+            _raw_driver_errors=True,
         )
 
     async def _touch_live_in(
@@ -720,7 +724,11 @@ class SQLBlobCatalog:
                 await self._write_tx(session)
 
         await retry_transient_db(
-            _attempt, label="add_blob_refs", run_id=run_id, classify=self.classify_db_error
+            _attempt,
+            label="add_blob_refs",
+            run_id=run_id,
+            classify=self.classify_db_error,
+            _raw_driver_errors=True,
         )
 
     async def run_references(self, run_scope: str, run_id: str, sha256: str) -> bool:
