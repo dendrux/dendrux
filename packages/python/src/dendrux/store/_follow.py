@@ -560,8 +560,17 @@ class _Coordinator:
     def request_idle(self) -> None:
         self._idle_since = self._now()
         self._wake.set()
-        if not self._closed and self._task_exited():
+        if not self._closed and self._task_exited() and self._holds_resources():
             self._start_task()
+
+    def _holds_resources(self) -> bool:
+        """Anything an idle task would have to give up; without it no task is needed."""
+        return bool(
+            self.runs
+            or self._registration is not None
+            or self.store._lease is not None
+            or self.store._retiring_lease is not None
+        )
 
     def has_active_runs(self) -> bool:
         return any(run.active for run in self.runs.values())
