@@ -110,7 +110,7 @@ An invalid `lease_interval` raises `ValueError`. Declared store capabilities are
 | `max_metadata_bytes` | 64 KiB | Run `metadata` | `ValueError` |
 | `max_notes_per_run` | 1000 | `submit_note` per run | `NoteLimitExceededError` (a `ValueError`) |
 | `max_pending_calls` | 64 | One format-2 assistant call batch, before dispatch | Run ends `error` with `failure_reason="pending_limit"` |
-| `max_rebuild_bytes` | 16 MiB | Format-2 conversation reconstruction | `reclaim()` refuses with `history_too_large`; `resume()` raises `InputValidationError` (field `history`, code `history_too_large`) before claiming, so the run stays paused |
+| `max_rebuild_bytes` | 16 MiB | Format-2 conversation reconstruction | `reclaim()` refuses with `history_too_large`; `resume()` raises `InputValidationError` (field `history`, code `history_too_large`) before claiming, so the run stays paused. A `submit_*` continuation has already claimed the run when it hits this limit: it releases the claim and restores the waiting status |
 | `max_rebuild_rows` | 20,000 | Expanded conversation entries during reconstruction | Same refusal; history is never truncated to continue |
 
 [//]: # "docs-test: skip - fragment: relies on `provider`, defined by setup shown elsewhere"
@@ -212,6 +212,10 @@ in-flight model call or tool and makes `run()` *return*
 `meta["partial_output"] = False`. Existing paused or terminal outcomes are
 preserved. Stream cancellation has the partial-answer semantics described below.
 See [Cancellation](/docs/architecture/cancellation#interrupting-run).
+
+### Cancelling while a run is created or claimed
+
+Cancelling the task that awaits `run()`, `stream()`, `resume()`, a `submit_*` call or a reclaim while the run is being created or claimed has its own rules for built-in SQL stores. Before the `COMMIT` is issued, nothing changes and the request can be retried. From `COMMIT` onward the run ends `cancelled` at the epoch it acquired. A private bound of about five seconds covers only that handoff. If it expires, the run is left for `sweep`, and `sweep(on_stale="reclaim")` followed by `agent.reclaim()` can continue a run its caller cancelled. See [Cancelling while a run is created or claimed](/docs/architecture/cancellation#cancelling-while-a-run-is-created-or-claimed) for the bound, the recovery risk, custom stores and legacy boolean claims.
 
 A finished run's `RunResult.meta["undelivered_notes"]` lists inbox note ids it
 never delivered (present only when there are any); see

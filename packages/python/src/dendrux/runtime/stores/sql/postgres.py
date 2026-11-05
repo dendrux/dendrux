@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
     from sqlalchemy.ext.asyncio import AsyncEngine
+    from sqlalchemy.sql.base import Executable
 
     from dendrux.db._live_updates import LiveUpdates
 
@@ -64,7 +65,7 @@ class PostgresStateStore(SQLStateStore):
 
         return PostgresUpdates()
 
-    def events_for_runs_query(self, heads: Mapping[str, int], *, limit_per_run: int) -> Any:
+    def events_for_runs_query(self, heads: Mapping[str, int], *, limit_per_run: int) -> Executable:
         """Use indexed per-run LATERAL scans over two bound arrays."""
         from sqlalchemy import Integer, Text, bindparam, column, func, select, true
         from sqlalchemy.dialects.postgresql import ARRAY

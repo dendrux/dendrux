@@ -14,8 +14,8 @@ GUIDE = REPO / "docs/guides/scaling.mdx"
 pytestmark = pytest.mark.skipif(not GUIDE.is_file(), reason="repository checkout only")
 
 
-@pytest.mark.parametrize("listening", [False, True], ids=["no-listener", "slow-listener"])
-async def test_loopback_overflow_is_bounded_and_yields_a_gap(listening):
+@pytest.fixture
+def loopback_updates():
     snippet = next(s for s in extract_snippets(GUIDE, REPO) if "class LoopbackUpdates" in s.code)
     tree = ast.parse(snippet.code)
     tree.body = [
@@ -23,7 +23,12 @@ async def test_loopback_overflow_is_bounded_and_yields_a_gap(listening):
     ]
     namespace = {}
     exec(compile(tree, str(GUIDE), "exec"), namespace)
-    bus = namespace["LoopbackUpdates"](max_inbound=2)
+    return namespace["LoopbackUpdates"]
+
+
+@pytest.mark.parametrize("listening", [False, True], ids=["no-listener", "slow-listener"])
+async def test_loopback_overflow_is_bounded_and_yields_a_gap(listening, loopback_updates):
+    bus = loopback_updates(max_inbound=2)
     reader = bus.receive()
     try:
         if listening:
@@ -48,4 +53,39 @@ async def test_loopback_overflow_is_bounded_and_yields_a_gap(listening):
             assert [await anext(reader), await anext(reader)] == messages[-2:]
     finally:
         await reader.aclose()
+        await bus.close()
+
+
+async def test_loopback_gap_reaches_base_listener_and_advances_generation(loopback_updates):
+    bus = loopback_updates(max_inbound=2)
+    delivered = asyncio.Event()
+    hints = []
+    gaps = []
+
+    class Consumer:
+        def on_hints(self, run_ids):
+            hints.extend(run_ids)
+            if "last" in run_ids:
+                delivered.set()
+
+        def on_gap(self):
+            gaps.append(bus._generation)
+
+    handle = bus._register(Consumer(), stream_events=False)
+    lease = None
+    try:
+        await bus.send(['["dropped"]', '["kept"]', '["last"]'])
+        generation = bus._generation
+        lease = await bus._acquire_listener()
+        async with asyncio.timeout(1):
+            await delivered.wait()
+        assert hints == ["kept", "last"]
+        assert bus.healthy
+        assert gaps == [generation + 1, generation + 2]
+        assert bus._generation == generation + 2
+        assert bus.stats().gaps == 2
+    finally:
+        bus._unregister(handle)
+        if lease is not None:
+            await bus._release_listener(lease)
         await bus.close()

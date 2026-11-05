@@ -161,6 +161,23 @@ The runner tells the two apart: a cancellation it caused through `cancel_run` is
 
 [`examples/33_cost_cancel_idempotency.py`](https://github.com/dendrux/dendrux/blob/main/packages/python/examples/33_cost_cancel_idempotency.py) demonstrates this live: a `wait_for` timeout on `run()` leaves the row `cancelled` with a single `run.cancelled` event, and the same script covers stream idempotency and the final-turn `answer` contract.
 
+## Cancelling while a run is created or claimed
+
+This applies to cancelling the task that awaits `run()`, `stream()`, `resume()`, `resume_stream()`, a `submit_*` call or a reclaim, with the built-in SQL stores. The create or claim is one database transaction, so what survives depends on whether its `COMMIT` has been issued.
+
+| When the task is cancelled | What is left |
+| --- | --- |
+| Before the `COMMIT` is issued | The operation is interrupted and rolled back. A new run leaves no row. A continuation leaves the original pause and epoch unchanged, so the same request can be sent again. An interrupted reclaim leaves the run marked and spends no attempt. |
+| From the `COMMIT` onward, including during governance setup after a claim | The runner waits for the ownership result and ends the run as `cancelled` at that exact epoch. It does not restore the pause. The caller still receives `CancelledError` (`TimeoutError` under `wait_for`). Another owner at a newer epoch is not touched. |
+
+Limits to know about:
+
+- **The bound is short and narrow.** A private bound of about 5 seconds covers only the create, claim or reclaim handoff and its cancellation cleanup. It does not bound a hung finalize during governance setup or the provider phase. A final live-update flush has its own deadline, `flush_deadline_s` (1 second by default), and can add that much on top.
+- **It relies on cancellation being honoured.** The handoff waits for the store call to acknowledge cancellation. The store and its driver must both honour it. A network black hole at the `COMMIT` can exceed the bound.
+- **An unresolved handoff is left for sweep.** If the outcome or the cleanup cannot be confirmed within the bound, Dendrux logs `cancel_persist_failed` with the `run_id` and leaves the last committed state. The cancellation is not recorded. A later `sweep` finds the run once `stale_running` has passed. `sweep(on_stale="reclaim")` marks it, and `agent.reclaim()` then continues it, with a new provider call, even though its caller cancelled it. Decide in your maintenance job whether such runs should be reclaimed or finalized.
+- **Custom stores run in a joined child task.** Create, claim and reclaim store calls run in a child task that the runner joins. The store sees the caller's `ContextVar` values, but a write to a `ContextVar` inside the store call does not reach the caller. Account for this if the store keeps a task-scoped session. Provider iteration and lifecycle callbacks stay in the caller's task.
+- **Legacy boolean claims.** A custom store whose claim returns `True` instead of an epoch gives the runner no exact epoch to clean up. On the create/claim handoff and on governance setup, automatic cancellation cleanup is skipped and logged, and the run is left for `sweep`. Later routes, such as cancellation in the provider phase, still finalize as before, without epoch fencing. Return an epoch from `claim_paused_run` and `submit_and_claim` to get fenced cleanup.
+
 ## Interrupting a streamed run
 
 A chat turn is usually one iteration, so "observed at the next iteration" would make `cancel_run` useless for exactly the runs people most want to interrupt. Streamed runs therefore get an in-process interrupt.
