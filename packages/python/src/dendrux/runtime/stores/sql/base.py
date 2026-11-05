@@ -3826,10 +3826,9 @@ class SQLStateStore(SQLBlobCatalog):
         limit: int | None = None,
         offset: int = 0,
         retry: bool = False,
-        before_order_index: int | None = None,
     ) -> list[TraceRecord]:
         """Read one public page with its reservation cutoff from the same snapshot."""
-        from sqlalchemy import and_, false, func, or_, select
+        from sqlalchemy import and_, case, false, func, or_, select
 
         from dendrux._meta_keys import SEED_PREFIX_META_KEY
         from dendrux.db.models import AgentRun, ReactTrace
@@ -3845,9 +3844,19 @@ class SQLStateStore(SQLBlobCatalog):
             if not retry
             else false()
         )
+        pending_projection = (
+            select(
+                case(
+                    (AgentRun.status.in_(_TERMINAL_STATUS_VALUES), None),
+                    else_=self.json_get(AgentRun.loop_state, ("pending",), "json"),
+                )
+            )
+            .where(AgentRun.id == run_id, _run_in_scope(run_id, tenant_id))
+            .correlate(None)
+            .scalar_subquery()
+        )
         stmt = (
-            select(ReactTrace, self.json_get(AgentRun.loop_state, ("pending",), "json"))
-            .join(AgentRun, AgentRun.id == ReactTrace.agent_run_id)
+            select(ReactTrace, pending_projection)
             .where(
                 ReactTrace.agent_run_id == run_id,
                 _run_in_scope(run_id, tenant_id),

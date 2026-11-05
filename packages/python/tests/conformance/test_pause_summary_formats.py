@@ -87,3 +87,39 @@ async def test_public_trace_slots_on_every_dialect(dendrux_store_factory):
     assert [r.content for r in page] == ["slow", "fast"]
     retry = await store.get_public_traces(run_id, tenant_id="t", limit=50, retry=True)
     assert [r.content for r in retry] == ["calls", "slow", "fast"]
+
+
+@pytest.mark.parametrize("status", ["success", "error", "cancelled", "max_iterations"])
+async def test_terminal_trace_page_ignores_unfinished_reservations(dendrux_store_factory, status):
+    from sqlalchemy import insert, update
+
+    from dendrux.db.models import AgentRun, ReactTrace
+    from dendrux.runtime._public_traces import public_traces
+    from tests._helpers.public_trace_store import KeysetStore
+
+    store = await dendrux_store_factory()
+    run_id = generate_ulid()
+    await store.create_run(run_id, "terminal trace", tenant_id="t")
+    async with store._session_factory() as session:
+        await session.execute(
+            insert(ReactTrace).values(
+                id=generate_ulid(),
+                agent_run_id=run_id,
+                order_index=4,
+                trace_kind="turn",
+                role="tool",
+                content="FAST",
+                meta={},
+            )
+        )
+        await session.execute(
+            update(AgentRun)
+            .where(AgentRun.id == run_id)
+            .values(
+                status=status, loop_state={"pending": [{"order_index": 3}], "trace_order_offset": 5}
+            )
+        )
+        await session.commit()
+    for reader in (store, KeysetStore(store)):
+        page = await public_traces(reader, run_id, tenant_id="t", limit=1, offset=0)
+        assert [(row.content, row.order_index) for row in page] == [("FAST", 0)]

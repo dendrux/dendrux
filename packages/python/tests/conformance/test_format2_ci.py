@@ -22,7 +22,7 @@ def test_mysql_family_runs_clarification_projection_contract():
     check = step("mysql-family", "Pause-summary contract on")
     assert "tests/conformance/test_pause_summary_formats.py" in check["run"]
     assert "matrix.server" in check["run"]
-    assert '"$passed" -lt 3' in check["run"]
+    assert '"$passed" -lt 7' in check["run"]
     assert "-n 0" in check["run"]
     assert "skipped" in check["run"] and "exit 1" in check["run"]
     assert jobs()["mysql-family"]["strategy"]["matrix"]["include"]

@@ -11,6 +11,11 @@ class Rows:
         self.content = content
         self.calls = 0
 
+    async def get_run(self, run_id, *, tenant_id):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(status="success")
+
     async def get_traces_after(self, run_id, *, after_order_index, limit, kinds, tenant_id):
         self.calls += 1
         start = 0 if after_order_index is None else after_order_index + 1
@@ -42,3 +47,26 @@ async def test_public_page_is_independent_of_recovery_bytes():
     store = Rows(1, content="x" * (17 * 1024 * 1024))
     rows = await public_traces(store, "0" * 26, tenant_id="t", limit=1, offset=0)
     assert len(rows) == 1 and len(rows[0].content) == 17 * 1024 * 1024
+
+
+async def test_deep_small_page_skips_in_fixed_batches():
+    store = Rows(1200)
+    rows = await public_traces(store, "0" * 26, tenant_id="t", limit=1, offset=900)
+    assert [row.order_index for row in rows] == [900]
+    assert store.calls <= 3
+
+
+async def test_fallback_freezes_allocation_frontier_before_reading_new_batch():
+    class Active(Rows):
+        async def get_run(self, run_id):
+            from types import SimpleNamespace
+
+            return SimpleNamespace(status="running", tenant_id="t")
+
+        async def get_loop_state(self, run_id):
+            return {"pending": [], "trace_order_offset": 2}
+
+    store = Active(5)
+    rows = await public_traces(store, "0" * 26, tenant_id="t", limit=50, offset=0)
+    assert [r.order_index for r in rows] == [0, 1]
+    assert await public_traces(store, "0" * 26, tenant_id="foreign", limit=50, offset=0) == []

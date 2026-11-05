@@ -12,7 +12,8 @@ from tests._fixtures.storage import pin_storage_format
 from tests._helpers.recovery_checkpoint import expire
 
 
-async def test_parallel_public_paging_waits_for_missing_slot(store, engine, monkeypatch):
+@pytest.mark.parametrize("custom", [False, True])
+async def test_parallel_public_paging_waits_for_missing_slot(store, engine, monkeypatch, custom):
     if engine.dialect.name != "postgresql":
         pytest.skip("independent connections require Postgres")
     await pin_storage_format(engine, 2)
@@ -53,7 +54,10 @@ async def test_parallel_public_paging_waits_for_missing_slot(store, engine, monk
     task = asyncio.create_task(agent.run("go", tenant_id="t"))
     try:
         await fast_saved.wait()
-        reader = RunStore(store_for_engine(engine))
+        from tests._helpers.public_trace_store import KeysetStore
+
+        reader_store = store_for_engine(engine)
+        reader = RunStore(KeysetStore(reader_store) if custom else reader_store)
         page = await reader.get_traces(identity[0], tenant_id="t", limit=50)
         assert [r.role for r in page] == ["user", "assistant"]
         assert await reader.get_traces(identity[0], tenant_id="t", limit=1, offset=2) == []
@@ -264,3 +268,64 @@ async def test_rewrite_rebases_pending_observations(
     assert [m.content for m in provider.wire_messages[-1] if m.role.value == "tool"] == ['"ok"']
     public = await RunStore(store).get_traces(result.run_id, tenant_id="t", limit=50)
     assert public[0].content == "go"
+
+
+async def test_public_trace_pending_projection_is_evaluated_once(store, engine):
+    from sqlalchemy import event, insert, update
+
+    from dendrux.db.models import AgentRun, ReactTrace
+    from dendrux.types import generate_ulid
+
+    if engine.dialect.name != "postgresql":
+        pytest.skip("execution-plan assertion requires Postgres")
+    run_id = generate_ulid()
+    await store.create_run(run_id, "projection", tenant_id="t")
+    async with engine.begin() as conn:
+        await conn.execute(
+            insert(ReactTrace),
+            [
+                dict(
+                    id=generate_ulid(),
+                    agent_run_id=run_id,
+                    role="tool",
+                    content="ok",
+                    trace_kind="turn",
+                    order_index=i,
+                    meta={},
+                )
+                for i in range(1000)
+            ],
+        )
+        await conn.execute(
+            update(AgentRun)
+            .where(AgentRun.id == run_id)
+            .values(loop_state={"pending": [{"order_index": 2000 + i} for i in range(64)]})
+        )
+    captured = []
+
+    def capture(conn, cursor, statement, parameters, context, many):
+        captured.append((statement, parameters))
+
+    event.listen(engine.sync_engine, "before_cursor_execute", capture)
+    try:
+        assert len(await store.get_public_traces(run_id, tenant_id="t", limit=1, offset=900)) == 1
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", capture)
+    assert len(captured) == 1
+    statement, parameters = captured[0]
+    async with engine.connect() as conn:
+        raw = await conn.get_raw_connection()
+        plan = (
+            await raw.driver_connection.fetchval(
+                "EXPLAIN (ANALYZE, VERBOSE, FORMAT JSON) " + statement, *parameters
+            )
+        )[0]["Plan"]
+    nodes = [plan]
+    projections = []
+    while nodes:
+        node = nodes.pop()
+        nodes.extend(node.get("Plans", []))
+        if any("pending" in value and "loop_state" in value for value in node.get("Output", [])):
+            projections.append(node)
+    assert projections
+    assert all(node["Actual Loops"] == node["Actual Rows"] == 1 for node in projections)

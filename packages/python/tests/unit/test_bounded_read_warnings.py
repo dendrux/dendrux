@@ -159,7 +159,6 @@ async def test_format_two_clamp_is_at_facade_only(monkeypatch):
             "limit": 1000,
             "offset": 23,
             "retry": False,
-            "before_order_index": None,
         }
     ]
 

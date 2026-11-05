@@ -563,8 +563,8 @@ jobs:
           export ${{ matrix.env_name }}="$SERVER_URL"
           pytest tests/conformance/test_pause_summary_formats.py -k "${{ matrix.server }}" -n 0 --no-cov -v -rs -p no:randomly | tee pause-summary.log
           passed=$(grep -c ' PASSED' pause-summary.log || true)
-          if [ "$passed" -lt 3 ] || grep -Eq '^SKIPPED \[|^=+ .*[0-9]+ skipped|^=+ .*no tests ran' pause-summary.log; then
-            echo "::error::Both pause-summary versions and public trace paging must run without skips."
+          if [ "$passed" -lt 7 ] || grep -Eq '^SKIPPED \[|^=+ .*[0-9]+ skipped|^=+ .*no tests ran' pause-summary.log; then
+            echo "::error::Both pause-summary versions, live paging and terminal trace reads must run without skips."
             exit 1
           fi
 

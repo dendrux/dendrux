@@ -44,7 +44,7 @@ async def _read_traces(
     store: StateStore, run: RunRecord, limit: int, offset: int = 0
 ) -> list[TraceRecord]:
     if run.storage_format == STORAGE_FORMAT_CHECKPOINTED:
-        from dendrux.runtime._public_traces import pending_boundary, public_traces
+        from dendrux.runtime._public_traces import public_traces
 
         return await public_traces(
             store,
@@ -53,7 +53,6 @@ async def _read_traces(
             limit=limit,
             offset=offset,
             retry=run.retry_of_run_id is not None,
-            before_order_index=pending_boundary(run),
         )
     return await store.get_traces(run.id, limit=limit, offset=offset)
 
