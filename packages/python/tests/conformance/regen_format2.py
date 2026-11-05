@@ -3,7 +3,8 @@
 Maintainer command from packages/python:
 DENDRUX_REGEN_CONFORMANCE_FORMAT2=1 PYTHONPATH=src python -m tests.conformance.regen_format2
 
-Only golden/format2 is written. The v0.5 corpus and its source guard stay immutable.
+Writes golden/format2 and new edge-cell format1_additions only.
+The v0.5 corpus and its source guard stay immutable.
 Review every changed golden: the opt-in flag is not approval for new behavior.
 """
 
@@ -34,11 +35,34 @@ async def record() -> None:
             await engine.dispose()
 
 
+async def record_edges() -> None:
+    from tests.conformance.edge_scenarios import EDGE_CELLS, shared
+
+    for cell in EDGE_CELLS:
+        legacy = None
+        for version in (1, 2):
+            engine = await h.o.create_sqlite_engine()
+            try:
+                await pin_storage_format(engine, version)
+                store = store_for_engine(engine)
+                actual = await format2.view(await h.run_cell(cell, engine, store), store)
+                if version == 1:
+                    legacy = actual
+                else:
+                    assert h._norm(shared(actual)) == h._norm(shared(legacy)), cell.id
+                folder = "format2" if version == 2 else "format1_additions"
+                h.write_json(h.golden_path(cell.id, folder), actual)
+                print(f"recorded {folder} {cell.id}")
+            finally:
+                await engine.dispose()
+
+
 def main() -> None:
     if os.environ.get("DENDRUX_REGEN_CONFORMANCE_FORMAT2") != "1":
         raise SystemExit("refusing: set DENDRUX_REGEN_CONFORMANCE_FORMAT2=1")
     h.assert_imports_this_checkout()
     asyncio.run(record())
+    asyncio.run(record_edges())
 
 
 if __name__ == "__main__":

@@ -180,7 +180,7 @@ jobs:
         run: |
           pytest tests/conformance/test_conformance.py tests/conformance/test_format2.py -n 0 --no-cov -v -rs -p no:randomly | tee formats.log
           passed=$(grep -c ' PASSED' formats.log || true)
-          if [ "$passed" -lt 322 ] || grep -Eq '^SKIPPED \[|^=+ .*[0-9]+ skipped|^=+ .*no tests ran' formats.log; then
+          if [ "$passed" -lt 358 ] || grep -Eq '^SKIPPED \[|^=+ .*[0-9]+ skipped|^=+ .*no tests ran' formats.log; then
             echo "::error::Both storage formats must run on SQLite and Postgres without skips."
             exit 1
           fi
@@ -563,8 +563,8 @@ jobs:
           export ${{ matrix.env_name }}="$SERVER_URL"
           pytest tests/conformance/test_pause_summary_formats.py -k "${{ matrix.server }}" -n 0 --no-cov -v -rs -p no:randomly | tee pause-summary.log
           passed=$(grep -c ' PASSED' pause-summary.log || true)
-          if [ "$passed" -lt 2 ] || grep -Eq '^SKIPPED \[|^=+ .*[0-9]+ skipped|^=+ .*no tests ran' pause-summary.log; then
-            echo "::error::Both pause-summary versions must run without skips."
+          if [ "$passed" -lt 3 ] || grep -Eq '^SKIPPED \[|^=+ .*[0-9]+ skipped|^=+ .*no tests ran' pause-summary.log; then
+            echo "::error::Both pause-summary versions and public trace paging must run without skips."
             exit 1
           fi
 

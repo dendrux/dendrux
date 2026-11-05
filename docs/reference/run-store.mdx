@@ -346,20 +346,7 @@ async def all_tool_invocations(reader, run_id, tenant_id):
 
 **Deep offsets cost more.** An offset page makes the database scan or discard every preceding row, so page 50 costs more than page 1. These reads add no keyset parameter and no offset cap in 0.6.0. For a long history, prefer small numbers of large-enough pages (a few hundred rows) over many tiny ones, and for events use `after_sequence_index`, which the run's event index serves directly.
 
-**Format-2 traces have reconstruction bounds.** For a format-2 run, `get_traces` rebuilds the effective conversation (the latest rewrite prefix expanded, then its suffix) from its stored traces. The default bounds are **20,000 expanded rows** and **16 MiB of UTF-8 JSON**, and both count the rows an `offset` skips. Every page starts reconstruction from the beginning and re-reads what precedes its offset, so repeated paging repeats that work, and a smaller `limit` does not get around either bound. Over a bound, `get_traces` raises `dendrux.errors.RunNotReclaimableError` with `reason="history_too_large"`. `RunStore.get_traces` has no override for these bounds, and a run above them cannot necessarily be read to the end by the loop above. Catch the error and show a clear "history too large" result, labelling any pages you already read as partial; do not retry smaller pages expecting the bound to go away. For complete histories of larger workloads, keep an archive that your own code writes while the run executes, or split the work into smaller runs.
-
-[//]: # "docs-test: skip - fragment: relies on a `reader` (RunStore), `run_id` and `tenant`, defined by setup shown elsewhere"
-
-```python
-from dendrux.errors import RunNotReclaimableError
-
-try:
-    page = await reader.get_traces(run_id, tenant_id=tenant, limit=500, offset=0)
-except RunNotReclaimableError as exc:
-    if exc.reason != "history_too_large":
-        raise
-    ...  # report: this run's conversation is above the read bounds
-```
+**Trace pages are public audit rows.** Both formats return the run's own user, assistant and tool rows, excluding system prompts, seeded conversation prefixes, rewrites and state rows. Positions are dense and `offset` and `limit` count only these rows. SQL stores apply filtering and pagination in the database and load only the requested page; recovery row and byte limits do not apply. Compaction preserves earlier audit rows. During execution, format 2 withholds rows after the first unfinished tool slot so an offset cursor cannot skip a late result or repeat a row. An empty page on a running or paused run may therefore mean that work is still pending. Continue polling after the run progresses.
 
 ### `get_subtree`
 
@@ -439,7 +426,7 @@ See [Chatbot threads](/docs/recipes/chatbot-threads) for the full pattern.
 
 ## Record types
 
-For format-2 runs, `get_traces` returns the effective provider conversation: the expanded latest rewrite prefix followed by its suffix, with state rows and superseded prefixes excluded before counting `offset` or `limit`. PII placeholders remain in this view. The separate `get_pii_mapping` read is for trusted restoration. An expanded prefix entry can share its underlying rewrite row identity with other entries; use the returned conversation position for ordering.
+`get_traces` returns the run's own user, assistant and tool audit rows in original order, with dense public positions. System, seeded conversation prefixes, rewrite and state rows are excluded before paging. Retry runs expose their new turns. Format-2 PII placeholders remain in this view; `get_pii_mapping` is a separate trusted read. Internal reconstruction still reads the stored system prompt and rewrite prefixes.
 
 All returned from `dendrux.store`. Fields, exact as persisted:
 

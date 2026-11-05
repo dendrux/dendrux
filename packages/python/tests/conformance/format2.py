@@ -32,13 +32,19 @@ async def view(recording: dict, store) -> dict:
 
 
 def _assert_tool_lifecycle(events: list[dict]) -> None:
-    started = set()
+    declared = {e["correlation_id"] for e in events if e["event_type"] == "tool.started"}
+    active = set()
+    completed = set()
     for event in events:
+        call = event["correlation_id"]
         if event["event_type"] == "tool.started":
-            assert event["correlation_id"] not in started
-            started.add(event["correlation_id"])
-        elif event["event_type"] == "tool.completed" and event["correlation_id"] in started:
-            started.remove(event["correlation_id"])
+            assert call not in active and call not in completed
+            active.add(call)
+        elif event["event_type"] == "tool.completed" and call in declared:
+            assert call in active
+            active.remove(call)
+            completed.add(call)
+    assert not active
 
 
 def _event_order(events: list[list]) -> list[list]:

@@ -22,3 +22,68 @@ async def test_clarification_projection_on_every_dialect(dendrux_store_factory, 
     assert pending.question == "Which file?"
     assert pending.options == ["one", "two"]
     assert pending.to_dict()["options"] == ["one", "two"]
+
+
+async def test_public_trace_slots_on_every_dialect(dendrux_store_factory):
+    from sqlalchemy import insert, update
+
+    from dendrux._meta_keys import SEED_PREFIX_META_KEY
+    from dendrux.db.models import AgentRun, ReactTrace
+
+    store = await dendrux_store_factory()
+    run_id = generate_ulid()
+    await store.create_run(run_id, "paging", tenant_id="t")
+    rows = [
+        (0, "seed", "system", "system", {}),
+        (1, "seed", "user", "prefix", {SEED_PREFIX_META_KEY: True}),
+        (2, "seed", "user", "input", {}),
+        (3, "seed", "user", "visible", {SEED_PREFIX_META_KEY: False}),
+        (4, "turn", "assistant", "calls", {}),
+        (6, "turn", "tool", "fast", {}),
+    ]
+    async with store._session_factory() as session:
+        await session.execute(
+            insert(ReactTrace),
+            [
+                dict(
+                    id=generate_ulid(),
+                    agent_run_id=run_id,
+                    order_index=i,
+                    trace_kind=kind,
+                    role=role,
+                    content=content,
+                    meta=meta,
+                )
+                for i, kind, role, content, meta in rows
+            ],
+        )
+        await session.execute(
+            update(AgentRun)
+            .where(AgentRun.id == run_id)
+            .values(loop_state={"pending": [{"order_index": 5}]})
+        )
+        await session.commit()
+    page = await store.get_public_traces(run_id, tenant_id="t", limit=50)
+    assert [r.content for r in page] == ["input", "visible", "calls"]
+    assert await store.get_public_traces(run_id, tenant_id="t", limit=1, offset=3) == []
+    assert await store.get_public_traces(run_id, tenant_id="other", limit=1) == []
+    async with store._session_factory() as session:
+        await session.execute(
+            insert(ReactTrace).values(
+                id=generate_ulid(),
+                agent_run_id=run_id,
+                order_index=5,
+                trace_kind="turn",
+                role="tool",
+                content="slow",
+                meta={},
+            )
+        )
+        await session.execute(
+            update(AgentRun).where(AgentRun.id == run_id).values(loop_state={"pending": []})
+        )
+        await session.commit()
+    page = await store.get_public_traces(run_id, tenant_id="t", limit=2, offset=3)
+    assert [r.content for r in page] == ["slow", "fast"]
+    retry = await store.get_public_traces(run_id, tenant_id="t", limit=50, retry=True)
+    assert [r.content for r in retry] == ["calls", "slow", "fast"]
