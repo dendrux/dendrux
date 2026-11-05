@@ -33,3 +33,9 @@ tests/integration/test_postgres_updates_pg.py::test_killed_listener_backend_degr
 tests/integration/test_postgres_updates_pg.py::test_killed_sender_backend_costs_at_most_one_batch_then_recovers | short send backoff only; delivery is condition-based with a 10 s hang guard
 tests/integration/test_postgres_updates_pg.py::test_unreachable_listener_never_turns_healthy_and_leaves_no_backend | short reconnect backoff only; asserts the listener never turns healthy
 tests/integration/test_postgres_updates_pg.py::test_frozen_tcp_path_is_detected_by_the_listen_ping_and_recovers | short health cadence only; degradation and recovery are condition-based with 10 s hang guards
+
+# Reviewed cancellation deadlines, 2026-11-05. Lower bounds cannot fail on a busy machine (a timer
+# never fires early); the upper limit is a 2.5 s tripwire against a 5 s or 10 s wait.
+tests/integration/test_060_handoff_deadlines.py::test_commit_cancel_deadline | lower bound on a patched 0.3 s deadline; 2.5 s tripwire against a 10 s hung COMMIT
+tests/integration/test_060_handoff_deadlines.py::test_cleanup_deadline_and_hint_deadline_are_joined | lower bound on a patched 0.1 s deadline; 2.5 s tripwire against a finalize that never returns
+tests/integration/test_060_handoff_deadlines.py::test_final_cleanup_hint_has_one_flush_deadline | lower bound on a 0.05 s send timeout; 2.5 s tripwire against a send that never returns

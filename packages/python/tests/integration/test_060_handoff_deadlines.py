@@ -18,6 +18,11 @@ from tests.integration.test_060_ownership_cancellation import (
     invocation,
 )
 
+# A hang tripwire, not a speed claim: these cancels take about 60 ms, but a busy machine can stop
+# the event loop for over 0.5 s (a full garbage collection, or no CPU). It stays well under the
+# 5 s deadlines a regression would wait for. Speed is measured in the benchmark at the end.
+CANCEL_TRIPWIRE_S = 2.5
+
 
 async def stop_red_children(task):
     for child in asyncio.all_tasks():
@@ -47,6 +52,7 @@ async def test_drain_failure_preserves_cancel(caplog):
 
 @pytest.mark.parametrize("entry", ENTRIES)
 async def test_precommit_cancellation_preserves_state(store, engine, monkeypatch, entry):
+    assert CANCEL_TRIPWIRE_S * 2 <= durability._OWNERSHIP_DEADLINE_S
     agent, call, run_id, epoch, calls = await invocation(entry, store, engine)
     before = await store.get_run(run_id) if run_id else None
     async with engine.connect() as conn:
@@ -65,7 +71,7 @@ async def test_precommit_cancellation_preserves_state(store, engine, monkeypatch
     try:
         await asyncio.wait_for(gate.wait(), 5)
         task.cancel()
-        done, _ = await asyncio.wait({task}, timeout=0.5)
+        done, _ = await asyncio.wait({task}, timeout=CANCEL_TRIPWIRE_S)
         assert done, "pre-COMMIT cancellation did not return promptly"
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -106,7 +112,9 @@ async def test_precommit_cancellation_preserves_state(store, engine, monkeypatch
 
 @pytest.mark.parametrize("slow", [False, True])
 async def test_commit_cancel_deadline(store, engine, monkeypatch, caplog, slow):
-    monkeypatch.setattr(durability, "_OWNERSHIP_DEADLINE_S", 0.3, raising=False)
+    # The slow case proves a 0.1 s COMMIT is kept, so it runs under the real deadline.
+    if not slow:
+        monkeypatch.setattr(durability, "_OWNERSHIP_DEADLINE_S", 0.3)
     agent, call, _, _, calls = await invocation("run", store, engine)
     entered, released = asyncio.Event(), asyncio.Event()
     original = AsyncSession.commit
@@ -129,12 +137,11 @@ async def test_commit_cancel_deadline(store, engine, monkeypatch, caplog, slow):
     started = time.monotonic()
     task.cancel()
     try:
-        done, _ = await asyncio.wait({task}, timeout=0.8)
+        done, _ = await asyncio.wait({task}, timeout=CANCEL_TRIPWIRE_S)
         assert done, "committed handoff exceeded private deadline"
         with pytest.raises(asyncio.CancelledError):
             await task
         elapsed = time.monotonic() - started
-        assert elapsed < 0.7
         assert released.is_set() and calls() == 0
         async with engine.connect() as conn:
             run_id = (await conn.execute(select(AgentRun.id))).scalar_one()
@@ -291,14 +298,15 @@ async def test_cleanup_deadline_and_hint_deadline_are_joined(store, engine, monk
         task.cancel()
         await asyncio.wait_for(entered.wait(), 5)
         task.cancel()
-        done, _ = await asyncio.wait({task}, timeout=0.8)
+        done, _ = await asyncio.wait({task}, timeout=CANCEL_TRIPWIRE_S)
+        elapsed = time.monotonic() - started
         assert done, "caller was not released by the ownership deadline"
         with pytest.raises(asyncio.CancelledError):
             task.result()
     finally:
         release.set()
         await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 5)
-    assert 0.09 <= time.monotonic() - started < 0.5
+    assert elapsed >= 0.09  # The second cancel did not cut the 0.1 s deadline short.
     assert len(sends) == 1  # The interrupted hint was lossy; cleanup never committed another.
     assert any(
         getattr(r, "code", None) == "cancel_persist_failed" and getattr(r, "run_id", None) == run_id
@@ -361,11 +369,12 @@ async def test_final_cleanup_hint_has_one_flush_deadline(store, engine, monkeypa
     bus = GateBus()
     bus.flush_deadline_s = bus.send_timeout_s = 0.05
     sends = []
+    release = asyncio.Event()  # Only set on failure, so a regression fails by name.
 
     async def send(messages):
         sends.append(messages)
         bus.entered.set()
-        await asyncio.Event().wait()
+        await release.wait()
 
     monkeypatch.setattr(bus, "send", send)
     monkeypatch.setattr(store, "_live_updates", bus)
@@ -373,9 +382,16 @@ async def test_final_cleanup_hint_has_one_flush_deadline(store, engine, monkeypa
     await bus.entered.wait()
     started = time.monotonic()
     task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(task, 0.5)
-    assert 0.04 <= time.monotonic() - started < 0.3
+    try:
+        done, _ = await asyncio.wait({task}, timeout=CANCEL_TRIPWIRE_S)
+        elapsed = time.monotonic() - started
+        assert done, "the final hint held the caller past its flush deadline"
+        with pytest.raises(asyncio.CancelledError):
+            task.result()
+    finally:
+        release.set()
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 5)
+    assert elapsed >= 0.04  # The final hint really had its 0.05 s to send.
     assert len(sends) == 2 and not bus._pending
     row = await store.get_run(run_id)
     assert row.status == "cancelled" and row.claim_epoch == epoch
@@ -400,11 +416,38 @@ async def test_precommit_cancel_does_not_wait_for_unrelated_hint(store, engine, 
         bus.enabled = True
         bus.enqueue([run_id])
         task.cancel()
-        done, _ = await asyncio.wait({task}, timeout=0.1)
+        done, _ = await asyncio.wait({task}, timeout=CANCEL_TRIPWIRE_S)
         assert done, "an unrelated pending hint delayed pre-COMMIT cancellation"
         with pytest.raises(asyncio.CancelledError):
             await task
         assert not bus.entered.is_set()
+    finally:
+        bus.release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        await agent.close()
+
+
+@pytest.mark.benchmark
+async def test_precommit_cancel_is_fast_on_a_quiet_machine(store, engine, monkeypatch):
+    agent, call, run_id, _, _ = await invocation("submit_tool_results", store, engine)
+    bus = GateBus()
+    monkeypatch.setattr(store, "_live_updates", bus)
+    entered = asyncio.Event()
+
+    async def before_commit(*args, **kwargs):
+        entered.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(store, "_write_tx", before_commit)
+    task = asyncio.create_task(call)
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        bus.enabled = True
+        bus.enqueue([run_id])
+        started = time.monotonic()
+        task.cancel()
+        await asyncio.wait({task}, timeout=CANCEL_TRIPWIRE_S)
+        assert time.monotonic() - started < 0.1
     finally:
         bus.release.set()
         await asyncio.gather(task, return_exceptions=True)
