@@ -446,6 +446,7 @@ class _Coordinator:
         self._missed_generation: int | None = None
         self._missed_count = 0
         self._idle_since = self._now()
+        self._idle_timer: asyncio.TimerHandle | None = None
         self._registration: object | None = None
         self._enter_hub()
 
@@ -554,6 +555,7 @@ class _Coordinator:
     def _start_task(self) -> None:
         if self._loop.is_closed():
             return
+        self._cancel_idle_timer()
         self._task = self._loop.create_task(self._main(), name="dendrux-follow-coordinator")
         self._task.add_done_callback(self._on_exit)
 
@@ -561,7 +563,37 @@ class _Coordinator:
         self._idle_since = self._now()
         self._wake.set()
         if not self._closed and self._task_exited() and self._holds_resources():
+            self._arm_idle_timer()
+
+    def _arm_idle_timer(self) -> None:
+        """A timer, not a task: it needs no cleanup if the loop ends first, which is what
+        happens when a generator left open is closed while ``asyncio.run`` shuts down."""
+        if self._idle_timer is None and not self._loop.is_closed():
+            delay = max(self._idle_deadline() - self._now(), 0.0)
+            self._idle_timer = self._loop.call_later(delay, self._idle_timer_fired)
+
+    def _cancel_idle_timer(self) -> None:
+        if self._idle_timer is not None:
+            self._idle_timer.cancel()
+            self._idle_timer = None
+
+    def _idle_timer_fired(self) -> None:
+        self._idle_timer = None
+        if self._closed or not self._task_exited() or not self._holds_resources():
+            return
+        if self._now() < self._idle_deadline():
+            self._arm_idle_timer()  # More reads came and went since this was armed.
+        else:
             self._start_task()
+
+    def _idle_deadline(self) -> float:
+        return min(
+            [
+                *self._deadlines(),
+                self.store._retirement_due(self._loop),
+                self._idle_since + IDLE_EXIT_S,
+            ]
+        )
 
     def _holds_resources(self) -> bool:
         """Anything an idle task would have to give up; without it no task is needed."""
@@ -630,6 +662,7 @@ class _Coordinator:
     async def aclose(self, timeout: float) -> None:
         """End every follower, stop the task (bounded) and leave the hub."""
         self._closed = True
+        self._cancel_idle_timer()
         for run in list(self.runs.values()):
             for follower in list(run.followers):
                 follower.buffer.clear()
@@ -683,9 +716,7 @@ class _Coordinator:
         return bool(chunk)
 
     async def _idle(self) -> bool:
-        deadline = min([*self._deadlines(), self.store._retirement_due(self._loop)])
-        delay = min(deadline, self._idle_since + IDLE_EXIT_S) - self._now()
-        if await self._idle_wait(delay):
+        if await self._idle_wait(self._idle_deadline() - self._now()):
             return False
         self._expire_followers(self._now())
         if self._now() < self._idle_since + IDLE_EXIT_S:

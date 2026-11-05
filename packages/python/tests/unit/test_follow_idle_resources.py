@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
 
 import pytest
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -14,6 +18,8 @@ from dendrux.types import generate_ulid
 from tests.unit.test_follow_coordinator import BatchedState, FakeLive, ticks
 from tests.unit.test_follow_coordinator import clock as clock
 from tests.unit.test_follow_coordinator import fast_budget as fast_budget
+
+PACKAGE = Path(__file__).resolve().parents[2]
 
 
 @pytest.fixture
@@ -65,3 +71,74 @@ async def test_a_reader_holding_a_listener_still_retires_it_when_idle(clock):
         assert not [t for t in asyncio.all_tasks() if "coordinator" in t.get_name()]
     finally:
         await reader.close()
+
+
+EXIT_SCRIPT = """
+    import asyncio, sys, tempfile
+    sys.path.insert(0, {package!r})
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from dendrux.db._sqlite_sync import create_sqlite_schema
+    from dendrux.store import EventFeed, RunStore, SQLiteStateStore, _follow
+    from dendrux.types import generate_ulid
+    from tests.unit.test_follow_coordinator import BatchedState, FakeLive
+
+    KEEP = []
+
+    async def sqlite_stream():
+        path = tempfile.mkdtemp()
+        engine = create_async_engine(f"sqlite+aiosqlite:///{{path}}/x.db")
+        await create_sqlite_schema(engine)
+        store = SQLiteStateStore(engine)
+        run_id = generate_ulid()
+        await store.create_run(run_id, "exit")
+        await store.save_run_event(run_id, event_type="tick")
+        stream = RunStore(store).stream_events(run_id, tenant_id=None, after_sequence_index=-1)
+        await anext(stream)
+        KEEP.append(stream)
+
+    def live_reader():
+        state = BatchedState()
+        state.create("r")
+        state.write("r")
+        state.live_updates = FakeLive()
+        return state, RunStore(state)
+
+    async def live_stream():
+        _, reader = live_reader()
+        stream = reader.stream_events("r", tenant_id=None, after_sequence_index=-1)
+        await anext(stream)
+        KEEP.append(stream)
+
+    async def live_follow():
+        _, reader = live_reader()
+        follow = EventFeed(reader).follow("r", tenant_id=None)
+
+        async def read():
+            async for _ in follow:
+                pass
+
+        KEEP.append(asyncio.create_task(read()))
+        await asyncio.sleep(0.05)
+
+    asyncio.run({scenario}())
+    KEEP.clear()
+    import gc
+    gc.collect()
+    print("clean exit")
+"""
+
+
+@pytest.mark.parametrize("scenario", ["sqlite_stream", "live_stream", "live_follow"])
+def test_reader_left_open_at_loop_exit_is_quiet(scenario):
+    script = textwrap.dedent(EXIT_SCRIPT).format(package=str(PACKAGE), scenario=scenario)
+    done = subprocess.run(
+        [sys.executable, "-X", "dev", "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        cwd=PACKAGE,
+    )
+    assert done.returncode == 0, done.stderr
+    assert "clean exit" in done.stdout
+    for noise in ("Task was destroyed", "no running event loop", "was never awaited"):
+        assert noise not in done.stderr, done.stderr
