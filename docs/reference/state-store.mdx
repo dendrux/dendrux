@@ -74,6 +74,12 @@ A SQL store class may define `async statement_capacity(self) -> int | None`: the
 
 If a connection fails during `COMMIT` and the store cannot prove whether the write happened, the operation raises `StoreOutcomeUnknown`, a subclass of `PersistenceError` with code `store_outcome_unknown`. Operations that carry a retry identity read their rows back and report the real outcome. Claims and reclaims always raise it, even when a later read shows the expected epoch: never run the claimed work or retry the claim blindly. The lease and `reclaim` recover the run. See [Errors](/docs/reference/errors).
 
+## Terminal writes in a custom store
+
+Give your store a `finalize_with_event` and make it atomic. The status change, the terminal event and, for a format-2 run, the final trace are one transaction, and a lost compare-and-swap changes nothing. The runtime calls it for success, a returned error, the iteration limit, a failure and cancellation whenever the store has the method. The built-in SQL stores do this in both storage formats.
+
+Followers depend on it. A follow ends once it has seen the terminal status and drained the event log, so a status that lands before its event can end a follow early. A store without `finalize_with_event` gets separate status and event writes. Its followers get a bounded 100 ms grace and one more drain, which cannot catch an event written arbitrarily late. See [How a follow ends](/docs/reference/run-store#how-a-follow-ends).
+
 ## Format and recovery requirements
 
 Format 2 requires `fenced_writes`, `retry_ids`, `checkpointing` and `atomic_completion` together, plus an activated database setting. If any is missing, newly created runs use format 1. A run's format never changes on claim or resume.

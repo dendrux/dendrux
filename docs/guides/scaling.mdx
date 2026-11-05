@@ -14,32 +14,41 @@ Build the store when a worker starts and pass it to every `Agent` that worker se
 [//]: # "docs-test: skip - application lifecycle and an already migrated production database are required"
 
 ```python
-from sqlalchemy.ext.asyncio import create_async_engine
-from dendrux import Agent
-from dendrux.store import PostgresStateStore
-from dendrux.store import RunStore
+import asyncio
 
-engine = create_async_engine(
-    "postgresql+asyncpg://user:password@database/app",
-    pool_size=5,
-    max_overflow=0,
-    pool_timeout=10,
-    pool_pre_ping=True,
-    pool_recycle=1800,
-)
-state = PostgresStateStore(engine)
-reads = RunStore(state)
-agent = Agent(
-    name="worker",
-    prompt="Help the user.",
-    provider="openai:gpt-4o-mini",
-    state_store=state,
-)
-# Start application requests here, then drain them before shutdown.
-await agent.close()
-await reads.close()
-await state.close()
-await engine.dispose()
+from sqlalchemy.ext.asyncio import create_async_engine
+
+from dendrux import Agent
+from dendrux.store import PostgresStateStore, RunStore
+
+
+async def main() -> None:
+    engine = create_async_engine(
+        "postgresql+asyncpg://user:password@database/app",
+        pool_size=5,
+        max_overflow=0,
+        pool_timeout=10,
+        pool_pre_ping=True,
+        pool_recycle=1800,
+    )
+    state = PostgresStateStore(engine)
+    reads = RunStore(state)
+    agent = Agent(
+        name="worker",
+        prompt="Help the user.",
+        provider="openai:gpt-4o-mini",
+        state_store=state,
+    )
+    try:
+        ...  # Serve application requests here, then drain them before shutdown.
+    finally:
+        await agent.close()
+        await reads.close()
+        await state.close()
+        await engine.dispose()
+
+
+asyncio.run(main())
 ```
 
 The store runs the agents (`PostgresStateStore` here; `MySQLStateStore` or `SQLiteStateStore` the same way, or `store_for_engine(engine)` to pick one from the engine); `RunStore(state)` supplies the read facade over the same store, and listens for live updates when the store has them (see [Live updates](#live-updates)). `RunStore.from_engine(engine)` is the polling-only alternative. Shut down in this order: agents, readers, the store, then the engine, and put it in `async with` or a `finally` so a failed request cannot skip it. Closing the last follower does not stop the reader's coordinator task: it ends at `reads.close()`, or on its own after about 60 seconds with nothing to watch. If the engine is disposed first, the coordinator's next read can fail with a pool error (for example a `KeyError`) and log `follow_read_failed`. `await state.close()` closes the store's live-update connections and never disposes your engine. You keep ownership of the engine and dispose it after all work and readers have stopped. Avoid holding a database session while you await an agent run, a tool or a browser.
@@ -138,30 +147,40 @@ Every `SQLStateStore` constructor takes it (`PostgresStateStore`, `MySQLStateSto
 [//]: # "docs-test: skip - application supplies its shared engine and Postgres deployment"
 
 ```python
+import asyncio
+
+from sqlalchemy.ext.asyncio import create_async_engine
+
 from dendrux import Agent
 from dendrux.store import PostgresStateStore, RunStore
 
-state = PostgresStateStore(engine, live_updates=True)   # announces after each commit
-reads = RunStore(state)                                  # listens for those announcements
-agent = Agent(provider="openai:gpt-4o-mini", prompt="Help the user.", state_store=state)
 
-async with reads.follow(run_id, tenant_id=tenant) as follow:
-    async for event in follow:
-        await send(event)
+async def main(run_id: str, tenant: str) -> None:
+    engine = create_async_engine("postgresql+asyncpg://user:password@database/app")
+    state = PostgresStateStore(engine, live_updates=True)   # announces after each commit
+    reads = RunStore(state)                                  # listens for those announcements
+    agent = Agent(provider="openai:gpt-4o-mini", prompt="Help the user.", state_store=state)
+    try:
+        async with reads.follow(run_id, tenant_id=tenant) as follow:
+            async for event in follow:
+                print(event)
+    finally:
+        # In this order: agents, readers, the store, then the engine.
+        await agent.close()
+        await reads.close()    # stops the coordinator and releases the listener; never closes the store
+        await state.close()    # closes the live-update connections; the engine stays yours
+        await engine.dispose()
 
-# At shutdown, in this order, inside a finally:
-await agent.close()
-await reads.close()    # stops the coordinator and releases the listener; never closes the store
-await state.close()    # closes the live-update connections; the engine stays yours
-await engine.dispose()
+
+asyncio.run(main("01J...", "tenant-a"))   # your run id and tenant
 ```
 
 What this does and does not do:
 
-- **Only `RunStore(store)` listens.** `RunStore.from_engine(engine)` and `RunStore.from_database_url(url)` build stores without live updates, so their followers keep polling. A reader in another process builds its own store with live updates and wraps it the same way. Several `RunStore` objects over one store each take a listener lease; the listener runs until the last one closes.
+- **Only `RunStore(store)` listens.** `RunStore.from_engine(engine)` and `RunStore.from_database_url(url)` build a store with no live updates, so their followers poll. They do not fail and they do not warn, so a reader built this way looks healthy while it ignores every hint. Build the store, give it `live_updates=`, and wrap it: `RunStore(state)`. A reader in another process builds its own store with live updates and wraps it the same way. Several `RunStore` objects over one store each take a listener lease; the listener runs until the last one closes.
 - **Writers and readers need the same bus.** Every process that writes runs gives its store the same transport and channel as the readers. A writer without live updates is still correct: its runs are found by the safety poll.
-- **`Agent(database_url=...)` cannot enable them.** `live_updates` and `notify_channel` keys are refused with a `ValueError` in `database_options` on `Agent`, `sweep(database_url=...)`, `get_engine` and `RunStore.from_database_url`, even when their value is `None` or `False`. Build the store yourself and pass it to `Agent(state_store=...)`, `sweep(state_store=...)` or `RunStore(store)`. `sweep(database_url=...)` uses a temporary store with no live updates.
-- **There is no `notify_channel` option and no `listen_url=` on `RunStore`.** The channel and the listen URL belong to the transport: `PostgresUpdates(channel=..., listen_url=...)`.
+- **`Agent(database_url=...)` cannot enable them.** A `live_updates` key in `database_options` is refused with a `ValueError` on `Agent`, `sweep(database_url=...)`, `get_engine` and `RunStore.from_database_url`, even when its value is `None` or `False`. Build the store yourself and pass it to `Agent(state_store=...)`, `sweep(state_store=...)` or `RunStore(store)`. `sweep(database_url=...)` uses a temporary store with no live updates.
+- **There is no `listen_url=` or channel option on `RunStore`.** The channel and the listen URL belong to the transport: `PostgresUpdates(channel=..., listen_url=...)`.
 - **A closed `Agent` closes only what it created.** `Agent.close()` closes the store it built from `database_url=`; a store you passed in is yours to close with `await store.close()`.
 
 ### What announces
@@ -182,9 +201,19 @@ One coordinator task per `RunStore` and event loop serves every `follow()` on it
 | Live updates healthy, nothing arrives | Every `poll_healthy_s`, **10 seconds by default with 20 % jitter either way** (the safety poll) |
 | Live updates off, or the listener is down | After `poll_interval_s` (0.5 s), backing off to `poll_max_s` (2 s) while idle; status on every fourth read |
 | The listener reconnects, or incoming hints overflowed (a gap) | Every watched run once, spread by up to `poll_interval_s` of jitter |
-| Any case | Status at most 30 seconds old; a full page of events is read again at once; a terminal run is drained until a page comes back empty before `FollowEnd` |
+| Any case | Status at most 30 seconds old; a full page of events is read again at once; a terminal run is drained until a page comes back empty, plus a 100 ms grace, before `FollowEnd` (see [How a follow ends](/docs/reference/run-store#how-a-follow-ends)) |
 
-`stream_events` keeps its own per-caller polling and is woken by hints; prefer `follow`. While the listener is down or reconnecting, readers poll, and the transport retries its connection with jittered backoff. If a reader cannot take its listener lease at all (the instance is closed, or an earlier listener would not stop), it polls and asks again after 30 seconds. Alert on the codes in [What to alert on](/docs/recipes/observability#what-to-alert-on).
+`stream_events` keeps its own per-caller polling and is woken by hints; prefer `follow`. It never reads one run more than once every `poll_interval_s / 10`, however many hints or gaps arrive. The poll intervals and `poll_healthy_s` are set on `EventFeed`, not on `RunStore.follow`; see [`EventFeed` arguments](/docs/reference/run-store#pending-and-live-reads). While the listener is down or reconnecting, readers poll, and the transport retries its connection with jittered backoff. If a reader cannot take its listener lease at all (the instance is closed, or an earlier listener would not stop), it polls and asks again after 30 seconds. Alert on the codes in [What to alert on](/docs/recipes/observability#what-to-alert-on).
+
+How the coordinator behaves over time:
+
+- **One lease, shared.** A `RunStore` takes one listener lease and shares it between all its readers. A burst of short requests (runs that do not exist, follows that are already finished, `stream_events` calls) reuses that lease instead of taking one each. After 60 seconds with nothing to watch, the coordinator ends and the lease goes back to the transport. A new `follow()` after that starts a coordinator again and rejoins the hint hub. Use one long-lived `RunStore` where you can, and close it when you are done.
+- **Shutdown does not block new reads.** While the transport is stopping, new reads are admitted and poll, even if the stopping transport still reports healthy. `close()` waits for shutdown for a bounded time only.
+- **A second event loop polls.** The listener lease belongs to the event loop that took it. A `follow()` or `stream_events()` on another loop of the same `RunStore` polls; it neither listens nor fails.
+- **Failed reads are isolated.** When a batched read fails, the coordinator retries the runs of that batch on their own, so one bad run does not hold the others back. A run that fails alone stays a *suspect* for as long as it is watched. Suspects are read one at a time, outside the healthy batches, and share a budget of 2 reads a second inside the 20 queries a second above. A failing suspect backs off from 5 to 30 seconds, and a hint does not shorten that wait.
+- **Fair order.** Healthy runs with a hint get bounded priority; among the rest, the run that has waited longest goes first.
+- **Safety polls share a window.** Runs with the same interval are polled at one jittered time, so their reads batch into fewer queries. Each coordinator draws its own 20 % jitter, so many processes do not line up.
+- **The missed-hint warning is a hint, not proof.** `live_updates_missed_hint` is logged once per coordinator and listener generation, at the first safety poll that finds new events nobody announced. Its `count` is the number of runs found in that first batch, not a running total, and later batches in the same generation stay quiet. A hint still in flight, or a generation change, suppresses it, and a late hint can make a healthy run look missed. It tells you to check that every writer and reader share one bus and channel. It does not mean data was lost: the poll found the events.
 
 ### Postgres
 
@@ -204,9 +233,11 @@ updates = PostgresUpdates(
 state = PostgresStateStore(engine, live_updates=updates)
 ```
 
-- **The URL.** The transport uses the store's engine URL unless you pass `url=`; a custom store without a SQLAlchemy engine must pass it. SQLAlchemy's URL is converted to an asyncpg DSN with the same user, password, host, port and database, escaped. Only keys asyncpg itself reads are kept (`sslmode`, `sslrootcert`, `target_session_attrs`, `application_name`, `options` and the other connection keys). A SQLAlchemy-only key such as `?ssl=require` or `?prepared_statement_cache_size=0` is **refused** with a `ValueError` that names only the key: Dendrux never drops an option silently, because dropping `ssl` could change where and how it connects. This also applies to `live_updates=True` when the engine URL carries such a key, because the transport then uses the engine URL. The way out is to give the transport its own asyncpg-readable URL, `PostgresUpdates(url="postgresql+asyncpg://...?sslmode=require")`; the engine URL can then stay as it is. Alternatively remove the incompatible key from the URL the transport reads and pass TLS settings in `connect_args={"ssl": ssl_context}`. `connect_args` alone does not lift the refusal, because the URL is checked first.
+- **The URL.** Without `url=`, the transport reads the destination from the store's engine: the URL's user, password, host, port and database, escaped into an asyncpg DSN. The URL must name a host (in the authority, or as a non-empty `host` query key) and a database, or the store refuses with a `ValueError` that asks for `PostgresUpdates(url=...)`. Dendrux never runs your engine's `creator` to find out where it connects. Only keys asyncpg itself reads are kept (`sslmode`, `sslrootcert`, `target_session_attrs`, `application_name`, `options` and the other connection keys). A SQLAlchemy-only key such as `?ssl=require` is **refused** with a `ValueError` that names only the key: Dendrux never drops an option silently, because dropping `ssl` could change where and how it connects. This also applies to `live_updates=True`, because the transport then uses the engine URL. The way out is to give the transport its own asyncpg-readable URL, `PostgresUpdates(url="postgresql+asyncpg://...?sslmode=require")`; the engine URL can then stay as it is. Unknown query keys and values are never echoed in the error. In a URL string, percent-encode reserved characters in the password, including a literal question mark; a `URL` object keeps the escaped destination for you.
+- **What an engine can carry.** Dendrux inherits an engine only when it can verify a standard connection setup. Passing `url=` waives the destination checks. A custom `creator`, a connection hook, a changed dialect or DBAPI adapter, an unknown connection parameter, `connection_class`, `krbsrvname` or `gsslib` all need an explicit `PostgresUpdates(url=...)`. Cache, timeout and server-startup settings are fine, for example `statement_cache_size=0` for PgBouncer. Engine `connect_args` with an `ssl` key of any value (even `None` or `False`) cannot be inherited: give the transport its own `connect_args={"ssl": context}`, which waives the engine TLS check only when `ssl` is not `None`, or a `url=` with `sslmode`. An empty `connect_args` waives nothing and needs nothing. Set the engine up before you bind the store; changing it later is not a way to configure the transport. The engine stays usable after queries, SQL errors, reconnects, pool recycling and disposal; changing its driver module or connection method is refused.
 - **Fixed options.** `statement_cache_size=0` and the connection timeout are set by Dendrux; `connect_args` may not set `statement_cache_size` or `timeout`. The connections are named `dendrux-live-updates` unless you set an application name.
-- **TLS.** The `connect_args` of your engine cannot be read back from SQLAlchemy. For a remote host with neither `sslmode` in the URL nor `ssl` in `connect_args`, Dendrux logs `live_updates_tls_unknown` once. Set one of them explicitly.
+- **TLS.** The `connect_args` of your engine cannot be read back from SQLAlchemy. For a remote host where the URL has no `sslmode` and the transport's own `connect_args` have no non-`None` `ssl`, Dendrux logs `live_updates_tls_unknown` once, when the first connection is attempted (the first announcement or the first listener), not when you build the store. `ssl=None` does not silence it. Set `sslmode` in the URL or `ssl` in the transport's `connect_args`.
+- **Secrets.** The DSN does not appear in logs, errors, `repr` or `inspect.getmembers`, and the connection settings refuse pickling. This protects diagnostics. It does not protect against code that deliberately walks private memory or traceback locals.
 - **Payload.** Postgres rejects a notification of 8,000 bytes or more, so `max_message_bytes` must be at most 7,999 (the default is 7,900).
 - **Primary only.** NOTIFY reaches listeners on the same server. A read replica never receives the notifications of its primary; point the sender and the listener at the primary.
 
@@ -248,9 +279,9 @@ reads = RunStore(state)
 ```
 
 - **Importing needs nothing; constructing needs the extra.** `from dendrux.store import RedisUpdates` works without the Redis client. Calling `RedisUpdates(...)` without it raises `ImportError` that names `pip install dendrux[redis]`. The client is `redis>=5.0.1,<9`. Releases 5.0.1, 5.3.1, 6.4.0, 7.4.0 and 8.1.0 are tested; another release in the range is checked when you construct the transport and refused with `ImportError` if its parser cannot bound a message.
-- **Name the channel.** Pub/Sub ignores the Redis database number, so the default `dendrux:events` is a starting point, not a namespace. Use one channel per application and environment, and the same one on every writer and reader.
-- **URLs.** `redis://`, `rediss://` (TLS) and `unix://`. A URL query string or `client_options` that sets the timeouts, retries, connection pool, `protocol`, `parser_class`, `host`, `port` or a second connection is refused with a `ValueError`, because Dendrux fixes those. A text `encoding` other than UTF-8 is refused too.
-- **Connections.** The sender is one connection used for one pipelined round trip per send. The listener is one Pub/Sub connection on the pure-Python RESP2 parser (hiredis is not used for it), so an oversized message is refused before it is read. It never reconnects silently: a lost connection is reported as a gap and the transport reconnects with backoff.
+- **Name the channel.** Pub/Sub ignores the Redis database number, so the default `dendrux:events` is a starting point, not a namespace. Use one channel per application and environment, and the same one on every writer and reader. Channel isolation is also how you keep other publishers out: only your own writers should publish to your channel.
+- **URLs.** `redis://`, `rediss://` (TLS) and `unix://`. A URL query string or `client_options` that sets the timeouts, retries, connection pool, `protocol`, `parser_class`, `host`, `port` or a second connection is refused with a `ValueError`, because Dendrux fixes those. A text `encoding` other than UTF-8 is refused too, and so is `decode_responses`: the transport decodes the bytes itself. `client_options` must be a mapping, and a bad port and an unknown option give different errors. Neither error echoes your value.
+- **Connections.** The sender is one connection used for one pipelined round trip per send. The listener is one Pub/Sub connection on the pure-Python RESP2 parser (hiredis is not used for it), so an oversized message is refused before it is read. The parser drains such a message in chunks of at most 65,536 bytes without keeping it, then drops it whole and counts it (`live_updates_oversize`). If the connection breaks before the whole reply has been read, the parser refuses to replay the half-read frame and the transport reconnects; a reply that was fully drained leaves the connection usable. To stop oversized hints, first use channel isolation to keep foreign publishers out. Raise `max_message_bytes` or shorten your run ids only when the oversized hints are your own. It never reconnects silently: a lost connection is reported as a gap and the transport reconnects with backoff.
 - **Liveness.** The listener sends a token-matched `PING` on its own connection after `health_check_s` (15 s) of silence and finds a dead connection within twice that time.
 - **Secrets.** The URL, host and password never appear in logs, errors or `repr`. Hints carry run ids only, but the channel is as trusted as the Redis server: use ACLs and `rediss://`.
 
@@ -320,14 +351,14 @@ Limits are keyword arguments of the base constructor, shared by every transport:
 | --- | --- | --- |
 | `max_pending` | 10,000 | Ids waiting to be sent. Over the bound the oldest are dropped (counted, logged once as `live_updates_overflow`) |
 | `max_batch` | 500 | Ids per `send` call |
-| `max_message_bytes` | 7,900 | UTF-8 bytes per message |
+| `max_message_bytes` | 7,900 | UTF-8 bytes per message. Must hold one longest ASCII run id plus 4 bytes (`max_run_id_len + 4`), or the constructor raises. Ids that need escaping or multibyte characters can still exceed it and are dropped |
 | `max_run_id_len` | 255 | Longer ids are dropped when enqueued |
 | `send_timeout_s` | 0.5 | One `send` call |
 | `flush_deadline_s` | 1.0 | One whole flush, connection setup included |
-| `close_timeout_s` | 3.0 | Everything `close()` does |
+| `close_timeout_s` | 3.0 | Everything `close()` does. The final flush gets only what is left of it, even when it is below `flush_deadline_s` |
 | `max_inbound` | 1,000 | Received messages not yet handled; overflow is a gap |
 | `backoff_initial_s`, `backoff_max_s` | 0.5, 30.0 | Pause after a failed send, doubling; also the listener's reconnect delay, with full jitter |
-| `health_check_s` | 15.0 | Silence before a transport probes its listen connection |
+| `health_check_s` | 15.0 | Silence before a transport probes its listen connection. At least 0.1 |
 
 A custom store that is not built on `SQLStateStore` can use the same instance; see [Build your own store](/docs/guides/build-your-own-store#live-updates-in-a-custom-store).
 
@@ -336,9 +367,13 @@ A custom store that is not built on `SQLStateStore` can use the same instance; s
 - **Announcements cost one round trip per batch.** After its transaction, the outermost successful store call flushes. Each batch of up to 500 ids is one round trip on the separate sender connection, and one flush can send several batches (it also sends ids left over from earlier calls) within a single shared `flush_deadline_s`. A call that overlaps another flush, or arrives while sending is backing off, may send nothing. If the bus stalls, a flush waits at most `flush_deadline_s` (1 second), the failed batch is dropped, sending pauses (0.5 seconds, doubling to 30) and further calls pay nothing until it resumes.
 - **A failed call defers its hints.** An ordinary store call that raises does not wait for an announcement: its ids wait for the next successful call on that store or for `close()`. A sweep is the exception. One that fails or is cancelled partway still flushes the earlier committed successes of its page, using only what remains of the shared `flush_deadline_s` of the whole sweep, and then re-raises the original exception.
 - **At close**, the store sends one last flush, within `flush_deadline_s` and inside the `close_timeout_s` budget for everything `close()` does. If the sender is in backoff, that final flush is skipped and the pending ids are dropped and counted; readers recover them by polling. `close()` is idempotent and safe to call from several tasks.
-- **One event loop per instance.** An instance belongs to the first event loop that uses it. Enqueueing from another loop is dropped and counted (logged once as `live_updates_wrong_loop`), so a save never fails because of it, and `close()` or a listener lease from another loop is refused with `RuntimeError`. Build one store per worker loop.
+- **One event loop per instance.** An instance belongs to the first event loop that uses it. Enqueueing from another loop is dropped and counted (logged once as `live_updates_wrong_loop`), so a save never fails because of it, and `close()` or a listener lease from another live loop is refused with `RuntimeError`. If the owning loop has already closed, `close()` shuts the transport's sockets down at once and clears the sender and listener, so the server-side connections end without waiting for garbage collection. Closing a loop that still has pending Python tasks can print teardown warnings, so close the store first in ordinary shutdown. Build one store per worker loop.
 - **Many open stores.** Each store with live updates holds its own sender connection. When more than 16 stores announce to one database in a process, Dendrux warns once (`RuntimeWarning` and `live_updates_many_stores`). Share one store per database and close the ones you no longer use.
-- **Counters.** `store.live_updates.stats()` returns a `LiveUpdatesStats` (pending count, `oldest_pending_age_s`, ids sent, drops by cause, gaps), and `.healthy` says whether the listener holds a live subscription. `oldest_pending_age_s` is how long a stranded hint has waited.
+- **Counters.** `store.live_updates.stats()` returns a `LiveUpdatesStats`, and `.healthy` says whether the listener holds a live subscription. The send side counts `pending`, `oldest_pending_age_s` (how long a stranded hint has waited), `sent` (ids) and the drops by cause (`dropped_overflow`, `dropped_invalid`, `dropped_oversize`, `dropped_inbound`, `dropped_failed`, `dropped_closed`, `dropped_wrong_loop`), plus `bad_messages` and `gaps`. The receive side adds three fields:
+  - `received`: valid run ids received, duplicates included. Empty or invalid batches and gaps do not count.
+  - `last_received_age_s`: seconds since the last non-empty valid batch, or `None` if there has been none. A listener that is `healthy` but never receives anything can be the sign of a bus or channel that does not match the writers.
+  - `last_error_type`: the class name of the latest exception, kept after recovery. Never the exception text.
+- **Sender backoff is temporary.** A failed send makes `healthy` false only while its backoff runs. It recovers on its own when the backoff ends, even if no new write arrives. Repeated failures stay visible in `last_error_type` and `dropped_failed`. Backoff is not a listener transition: it does not bump the generation or send a gap to readers. The missed-hint check starts again when backoff ends, and polling stays the truth throughout.
 - **Stranded hints.** There is no sender task. Ids enqueued while another flush runs, after a flush hit its deadline, or during backoff wait for the next flush or for `close()`, and may be lost. That is by design: followers find them by polling.
 - **Cost of NOTIFY on Postgres.** Postgres takes a database-wide lock at the commit of every transaction that sent a NOTIFY. In 0.6 that transaction is the sender's own short statement, not your save, and one statement carries a whole batch of ids, so a busy writer pays the lock once per batch of up to 500 ids rather than once per saved event. Measure your own event rate and write workload before relying on a capacity figure.
 - **A stuck Postgres listener can fill the notification queue.** Monitor `pg_notification_queue_usage()` and investigate sustained growth. A full queue now fails the announcement, which the store absorbs, instead of failing the save. Every listener process receives **every notification on its channel**, including run ids it does not watch, so bus load is readers times notifications on Postgres and Redis alike. Payloads contain run ids only.
