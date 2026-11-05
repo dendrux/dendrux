@@ -2721,11 +2721,20 @@ def _recovery_loop_name(loop: Loop) -> str | None:
 async def _create_runtime_run(
     store: StateStore, loop: Loop, run_id: str, agent_name: str, **kwargs: Any
 ) -> CreateRunResult:
+    from dendrux.runtime.durability import _ownership_handoff
     from dendrux.runtime.state import _creation_loop_scope
+
+    async def cancel_created(created: CreateRunResult) -> None:
+        if created.outcome == "created":
+            await _persist_task_cancellation(
+                claimed_store(store, created.run_id, 0), created.run_id
+            )
 
     native_store = unclaimed_store(store)
     with _creation_loop_scope(native_store, run_id, _recovery_loop_name(loop)):
-        return await store.create_run(run_id, agent_name, **kwargs)
+        return await _ownership_handoff(
+            store, store.create_run(run_id, agent_name, **kwargs), cancel_created
+        )
 
 
 async def _runtime_seeds(
@@ -5674,7 +5683,15 @@ async def _release_claim(store: StateStore, run_id: str, status: str) -> None:
 
     from dendrux.runtime.submit import release_claim
 
-    await release_claim(store, run_id, status, failure=sys.exception())
+    failure = sys.exception()
+    if isinstance(failure, asyncio.CancelledError):
+        await _drain_task_cancellation(store, run_id, False)
+    else:
+        try:
+            await release_claim(store, run_id, status, failure=failure)
+        except asyncio.CancelledError:
+            await _drain_task_cancellation(store, run_id, False)
+            raise
 
 
 async def _shielded_cleanup(cleanup: Callable[[], Any]) -> Any:
@@ -5689,18 +5706,14 @@ async def _shielded_cleanup(cleanup: Callable[[], Any]) -> Any:
     return result
 
 
-def _release_setup_allowed(enabled: bool, exc: Exception) -> bool:
-    return enabled and not isinstance(exc, RunFencedError)
-
-
 @asynccontextmanager
 async def _release_setup_failure(
     store: StateStore, run_id: str, status: str, *, enabled: bool = True
 ) -> AsyncIterator[None]:
     try:
         yield
-    except Exception as exc:
-        if _release_setup_allowed(enabled, exc):
+    except BaseException as exc:
+        if enabled and not isinstance(exc, RunFencedError):
             await _release_claim(store, run_id, status)
         raise
 

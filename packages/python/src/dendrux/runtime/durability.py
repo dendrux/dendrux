@@ -111,6 +111,36 @@ async def _store_update_scope(store: Any) -> AsyncIterator[bool]:
         _live_update_scope.reset(token)
 
 
+async def _without_live_flush(store: Any, operation: Coroutine[Any, Any, T]) -> T:
+    async with _store_update_scope(store):
+        return await operation
+
+
+async def _ownership_handoff(
+    store: Any,
+    operation: Coroutine[Any, Any, T],
+    on_cancel: Callable[[T], Coroutine[Any, Any, Any]],
+) -> T:
+    from dendrux.runtime.state import unclaimed_store
+    from dendrux.runtime.tasks import _drain_cleanup
+
+    native = unclaimed_store(store)
+    # Join only the ownership-changing store operation. Cancellation must not
+    # interrupt COMMIT or discard its returned epoch. Provider work stays on
+    # the caller's task; hints flush there after the token is safely retained.
+    result, cancelled = await _drain_cleanup(_without_live_flush(native, operation))
+    try:
+        if cancelled is not None:
+            raise cancelled
+        await _flush_live_updates(native)
+    except asyncio.CancelledError as cancellation:
+        try:
+            await _drain_cleanup(_without_live_flush(native, on_cancel(result)))
+        finally:
+            raise cancellation
+    return result
+
+
 @asynccontextmanager
 async def _live_updates_boundary(store: Any, *, sweep: bool = False) -> AsyncIterator[None]:
     budget_token = _sweep_budget(store, sweep)

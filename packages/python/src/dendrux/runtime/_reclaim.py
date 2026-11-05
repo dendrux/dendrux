@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+from contextlib import asynccontextmanager
 from dataclasses import replace
+from functools import partial
 from typing import TYPE_CHECKING, Any, cast
 
 from dendrux import _codes
@@ -34,7 +37,7 @@ from dendrux.types import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import AsyncIterator, Callable
 
     from dendrux.agent import Agent
     from dendrux.loops.base import LoopNotifier
@@ -55,8 +58,9 @@ async def reclaim(
 ) -> RunResult:
     from dendrux.loops.react import ReActLoop
     from dendrux.runtime._capabilities import capabilities
+    from dendrux.runtime.durability import _ownership_handoff
     from dendrux.runtime.runner import _resume_core
-    from dendrux.runtime.submit import governance_snapshot
+    from dendrux.runtime.submit import _cancel_claim, governance_snapshot
     from dendrux.skills._session import SkillSession
 
     if not capabilities(store).recovery:
@@ -67,17 +71,21 @@ async def reclaim(
     session = SkillSession.prepare(agent)
     session.run_id = run_id
     try:
-        claim = await store.reclaim_run(
-            run_id,
-            tenant_id=tenant_id,
-            agent_name=agent.name,
-            expected_claim_epoch=item.claim_epoch if item else None,
-            governance=governance_snapshot(agent),
-            governance_policy=agent._on_governance_change,
-            skill_pins={s.name: s.digest for s in session.available.values()},
-            loop_type="react"
-            if isinstance(agent._effective_loop(None) or ReActLoop(), ReActLoop)
-            else "single_call",
+        claim = await _ownership_handoff(
+            store,
+            store.reclaim_run(
+                run_id,
+                tenant_id=tenant_id,
+                agent_name=agent.name,
+                expected_claim_epoch=item.claim_epoch if item else None,
+                governance=governance_snapshot(agent),
+                governance_policy=agent._on_governance_change,
+                skill_pins={s.name: s.digest for s in session.available.values()},
+                loop_type="react"
+                if isinstance(agent._effective_loop(None) or ReActLoop(), ReActLoop)
+                else "single_call",
+            ),
+            partial(_cancel_claim, store, run_id),
         )
         if claim is False:
             raise RunNotReclaimableError(run_id, "already_reclaimed")
@@ -92,18 +100,16 @@ async def reclaim(
     owned = claimed_store(store, run_id, claim)
     with session.bind():
         history_records: list[Any] = []
-        try:
+        async with _reclaim_setup(owned, run_id):
             pause = await rebuild_pause(
                 agent, owned, run_id, claim.loop_state or {}, history_records=history_records
             )
-        except Exception as exc:
-            await _handle_rebuild_failure(owned, run_id, exc)
-            raise
+            provider = agent._require_provider()
         result = await _resume_core(
             run_id,
             state_store=owned,
             agent=agent,
-            provider=agent._require_provider(),
+            provider=provider,
             expected_status=RunStatus.RUNNING.value,
             extra_notifier=notifier,
             _skip_claim=True,
@@ -113,6 +119,21 @@ async def reclaim(
         if result.status in TERMINAL_STATUSES:
             _codes.log_code(logger, _codes.RUN_FINALIZED, run_id=run_id)
         return result
+
+
+@asynccontextmanager
+async def _reclaim_setup(store: StateStore, run_id: str) -> AsyncIterator[None]:
+    from dendrux.runtime.runner import _drain_task_cancellation
+
+    try:
+        try:
+            yield
+        except Exception as exc:
+            await _handle_rebuild_failure(store, run_id, exc)
+            raise
+    except asyncio.CancelledError:
+        await _drain_task_cancellation(store, run_id, False)
+        raise
 
 
 def _rebuild_failure_reason(exc: Exception) -> str | None:
