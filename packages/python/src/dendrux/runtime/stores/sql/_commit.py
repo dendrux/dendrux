@@ -18,7 +18,11 @@ from dendrux._meta_keys import (
 )
 from dendrux.db.models import AgentRun
 from dendrux.errors import PersistenceError, StoreOutcomeUnknown
-from dendrux.runtime.durability import _CommitNotAppliedError, is_transient_db_error
+from dendrux.runtime.durability import (
+    _CommitNotAppliedError,
+    _is_driver_failure,
+    is_transient_db_error,
+)
 from dendrux.runtime.state import _to_aware_utc
 from dendrux.types import RunStatus
 
@@ -98,18 +102,45 @@ class _CommitReadback:
                 return evidence
         return proofs
 
-    async def resolve(self, error: SQLAlchemyError) -> None:
-        classified = self.store.classify_db_error(error)
+    @staticmethod
+    def _database_error(error: BaseException) -> bool:
+        return isinstance(error, Exception) and _CommitReadback._database_exception(error)
+
+    @staticmethod
+    def _database_exception(error: Exception) -> bool:
+        return isinstance(
+            error, (SQLAlchemyError, OSError, PersistenceError)
+        ) or _is_driver_failure(error)
+
+    def _needs_readback(self, error: Exception, classified: Any) -> bool:
+        # A raw OS failure (including asyncio's bare timeout) during COMMIT
+        # carries no proof that the transaction was rejected.
+        if isinstance(error, OSError):
+            return True
+        return classified.kind not in (
+            "deadlock_or_serialization",
+            "lock_timeout",
+        ) and is_transient_db_error(error, classify=self.store.classify_db_error)
+
+    async def _rollback(self, *, ambiguous: bool) -> None:
         try:
             await self.session.rollback()
-        except SQLAlchemyError:
+        except BaseException as error:
+            if not self._database_error(error):
+                self._reraise_clean(error)
             _codes.log_code(logger, _codes.PERSISTENCE_ERROR, run_id=self.run_id)
-            if classified.kind == "connection_lost":
+            if ambiguous:
                 self.unknown()
             raise PersistenceError() from None
-        if classified.kind in ("deadlock_or_serialization", "lock_timeout") or not (
-            is_transient_db_error(error, classify=self.store.classify_db_error)
-        ):
+
+    async def resolve(self, error: Exception) -> None:
+        if isinstance(error, PersistenceError) or not self._database_error(error):
+            raise error
+        classified = self.store.classify_db_error(error)
+        await self._rollback(
+            ambiguous=isinstance(error, OSError) or classified.kind == "connection_lost"
+        )
+        if not self._needs_readback(error, classified):
             raise error
         if self.name in (
             "claim_paused_run",
@@ -137,8 +168,21 @@ class _CommitReadback:
                 self.unknown()
         except _CommitNotAppliedError:
             raise
-        except (SQLAlchemyError, PersistenceError):
+        except BaseException as error:
+            self._readback_failed(error)
+
+    def _readback_failed(self, error: BaseException) -> NoReturn:
+        if self._database_error(error):
             self.unknown()
+        self._reraise_clean(error)
+
+    @staticmethod
+    def _reraise_clean(error: BaseException) -> NoReturn:
+        # A logic failure or cancellation during readback must not retain the
+        # COMMIT driver's credentials through Python's implicit exception chain.
+        error.__context__ = None
+        error.__cause__ = None
+        raise error from None
 
     async def _lock_touched(self) -> None:
         for run_id in sorted(self.session.info[TOUCHED_RUNS_SESSION_KEY]):

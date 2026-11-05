@@ -12,18 +12,19 @@ import asyncio
 import ipaddress
 import logging
 import re
+import ssl
 from collections.abc import Iterable, Mapping
-from contextlib import suppress
+from contextlib import aclosing, suppress
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import parse_qsl, quote, urlencode
 
 from dendrux import _codes
-from dendrux.db._live_updates import LiveUpdates, _shutdown_socket
+from dendrux.db._live_updates import LiveUpdates, _error_type, _shutdown_socket
 from dendrux.db._notify import validate_channel
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Sequence
+    from collections.abc import AsyncGenerator, AsyncIterator, Sequence
 
     from sqlalchemy.engine import URL
 
@@ -35,6 +36,35 @@ logger = logging.getLogger(__name__)
 MAX_NOTIFY_BYTES = 7_999
 APPLICATION_NAME = "dendrux-live-updates"
 _NOTIFY_SQL = "SELECT pg_notify($1, m) FROM unnest($2::text[]) AS m"
+
+
+_TRANSPORT_FAILURES = (
+    (TimeoutError, TimeoutError, ("Postgres live updates timed out",)),
+    (ssl.SSLError, ssl.SSLError, (ssl.SSL_ERROR_SSL, "Postgres live updates TLS failed")),
+    (OSError, ConnectionError, ("Postgres live updates connection failed",)),
+    (
+        ImportError,
+        ImportError,
+        ("Postgres live updates requires asyncpg; install dendrux[postgres].",),
+    ),
+    (
+        ValueError,
+        ValueError,
+        ("Postgres live updates configuration failed; check url= and connect_args.",),
+    ),
+    (Exception, RuntimeError, ("Postgres live updates failed",)),
+)
+
+
+def _transport_error(error: Exception) -> Exception:
+    for source, base, arguments in _TRANSPORT_FAILURES:
+        if isinstance(error, source):
+            failure: Any = base(*arguments)
+            # Keep only a validated name; the builtin preserves kind and pickling.
+            failure.safe_type = _error_type(error)
+            return cast("Exception", failure)
+    raise AssertionError("unreachable transport error type")
+
 
 # Keys asyncpg's DSN parser reads itself (checked against the installed version
 # at import, see ``_dsn_keys``), plus the two startup settings the spec keeps.
@@ -511,11 +541,24 @@ class PostgresUpdates(LiveUpdates):
 
     async def send(self, messages: Sequence[str]) -> None:
         """One ``pg_notify`` statement per call on the dedicated sender connection."""
-        connection = self._sender
-        if connection is None or connection.is_closed():
-            connection = await self._connect(self._settings.send_dsn, self.send_timeout_s)
-            self._sender = connection
-        await connection.execute(_NOTIFY_SQL, self.channel, list(messages))
+        failure = None
+        try:
+            await self._send_messages(messages)
+        except Exception as error:
+            failure = _transport_error(error)
+        if failure is not None:
+            raise failure from None
+
+    async def _send_messages(self, messages: Sequence[str]) -> None:
+        try:
+            connection = self._sender
+            if connection is None or connection.is_closed():
+                connection = await self._connect(self._settings.send_dsn, self.send_timeout_s)
+                self._sender = connection
+            await connection.execute(_NOTIFY_SQL, self.channel, list(messages))
+        except BaseException:
+            self.abort_sender()
+            raise
 
     def abort_sender(self) -> None:
         """Terminate the sender connection now; the next ``send`` reconnects."""
@@ -524,11 +567,21 @@ class PostgresUpdates(LiveUpdates):
 
     async def aclose_sender(self) -> None:
         """Close the sender connection, terminating it if a clean close fails."""
+        failure = None
+        try:
+            await self._close_sender_connection()
+        except Exception as error:
+            failure = _transport_error(error)
+        if failure is not None:
+            raise failure from None
+
+    async def _close_sender_connection(self) -> None:
         connection, self._sender = self._sender, None
-        if connection is None or connection.is_closed():
+        if connection is None:
             return
         try:
-            await connection.close(timeout=self.send_timeout_s)
+            if not connection.is_closed():
+                await connection.close(timeout=self.send_timeout_s)
         except BaseException:
             self._terminate_connection(connection)
             raise
@@ -555,6 +608,17 @@ class PostgresUpdates(LiveUpdates):
         a failure or a lost connection ends the stream.
         The connection is always terminated when the stream ends.
         """
+        failure = None
+        try:
+            async with aclosing(self._listen_messages()) as stream:
+                async for message in stream:
+                    yield message
+        except Exception as error:
+            failure = _transport_error(error)
+        if failure is not None:
+            raise failure from None
+
+    async def _listen_messages(self) -> AsyncGenerator[str | None | _Gap, None]:
         buffer = self._new_inbound_buffer()
         lost = asyncio.Event()
         connection = None

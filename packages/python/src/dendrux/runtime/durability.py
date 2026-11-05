@@ -25,7 +25,12 @@ from functools import wraps
 from time import monotonic
 from typing import TYPE_CHECKING, Any, TypeVar
 
-from sqlalchemy.exc import DBAPIError, OperationalError, SQLAlchemyError, TimeoutError
+from sqlalchemy.exc import (
+    DisconnectionError,
+    OperationalError,
+    SQLAlchemyError,
+    TimeoutError,
+)
 
 from dendrux import _codes
 from dendrux.db._live_updates import LiveUpdates
@@ -36,7 +41,7 @@ from dendrux.errors import (
     StatementTooLargeError,
 )
 from dendrux.errors import StoreOutcomeUnknown as StoreOutcomeUnknown
-from dendrux.runtime.stores._errors import _is_connection_loss_code, classify_error
+from dendrux.runtime.stores._errors import classify_error, error_chain
 
 _EXCEPTION_WALK_LIMIT = 1024
 
@@ -199,7 +204,11 @@ def _statement_too_large(limit: int | None) -> StatementTooLargeError:
 
 
 def is_transient_db_error(exc: BaseException, *, classify: Any = classify_error) -> bool:
-    """True for failures a fresh attempt of the same transaction may not hit."""
+    """True for temporary failures, not proof that COMMIT was unapplied.
+
+    Callers must roll back pre-commit failures and resolve ambiguous commits
+    before retrying. StoreOutcomeUnknown remains non-retryable.
+    """
     if isinstance(exc, PersistenceError):
         return exc.retryable
     classified = classify(exc)
@@ -209,13 +218,16 @@ def is_transient_db_error(exc: BaseException, *, classify: Any = classify_error)
     ):
         return False
     return (
-        isinstance(exc, (OperationalError, TimeoutError))
+        _transient_wrapper(exc)
         or classified.kind in ("deadlock_or_serialization", "lock_timeout", "connection_lost")
-        or (
-            isinstance(exc, DBAPIError)
-            and isinstance(classified.code, str)
-            and (_is_connection_loss_code(classified.code) or classified.code == "53300")
-        )
+        or classified.code == "53300"
+    )
+
+
+def _transient_wrapper(exc: BaseException) -> bool:
+    return any(
+        isinstance(error, (OperationalError, TimeoutError, DisconnectionError))
+        for error in error_chain(exc)
     )
 
 
@@ -225,22 +237,34 @@ async def retry_transient_db(
     label: str,
     run_id: str,
     classify: Any = classify_error,
+    _raw_driver_errors: bool = False,
 ) -> T:
     """Retry a DB transaction on transient failures.
 
     Wraps the entire transaction attempt — session open, execute, commit.
     Retries transient pre-commit connection, availability and transaction failures
     (see :func:`is_transient_db_error`).
-    Other database failures fail immediately as sanitized, typed errors. Logical
-    failures such as ValueError propagate immediately. Exhaustion raises a
-    retryable PersistenceError; raw driver exceptions are never propagated.
+    SQLAlchemy and persistence errors retain the shared retry policy. Only SQL
+    stores with a COMMIT proof boundary opt into raw transient driver failures;
+    other raw errors propagate to their caller's normalization boundary.
+    Exhaustion raises a retryable PersistenceError.
     """
+
+    def check_retry_error(error: Exception) -> None:
+        _require_database_error(error)
+        allowed = isinstance(error, (SQLAlchemyError, PersistenceError)) or (
+            _raw_driver_errors and is_transient_db_error(error, classify=classify)
+        )
+        if not allowed:
+            raise error
+
     failure: BaseException | None = None
     last_classified = None
     for attempt_num in range(MAX_RETRIES + 1):
         try:
             return await attempt()
-        except (SQLAlchemyError, PersistenceError) as exc:
+        except Exception as exc:
+            check_retry_error(exc)
             last_classified = classify(exc)
             if not is_transient_db_error(exc, classify=classify):
                 failure = _database_failure(exc, classify=classify)
@@ -253,6 +277,11 @@ async def retry_transient_db(
     failure.__context__ = None
     failure.__cause__ = None
     raise failure from None
+
+
+def _require_database_error(error: Exception) -> None:
+    if not isinstance(error, (SQLAlchemyError, PersistenceError)) and not _is_driver_failure(error):
+        raise error
 
 
 def _log_database_failure(classified: Any, run_id: Any = None) -> None:
@@ -344,6 +373,7 @@ def _safe_database_call(method: Any) -> Any:
         assert failure is not None
         failure.__context__ = None
         failure.__cause__ = None
+        failure.__traceback__ = None
         raise failure from None
 
     return _with_live_updates(call)

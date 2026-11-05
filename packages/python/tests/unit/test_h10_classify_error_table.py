@@ -428,9 +428,9 @@ def mysql_rows() -> list[tuple[str, Any, DbError]]:
             DbError("other", None, errno.ENOENT),
         ),
         (
-            "s4-os-without-number-skipped",
+            "s4-os-without-number-is-availability",
             OSError("socket"),
-            DbError("other", None, None),
+            DbError("connection_lost", None, None),
         ),
         (
             "s4-non-os-error-with-reset-number-is-unknown",
