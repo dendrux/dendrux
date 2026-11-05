@@ -753,6 +753,10 @@ class GuardrailEngine:
                 mapping[_ORIGINS_KEY] = json.dumps(record, sort_keys=True)
         return mapping
 
+    @property
+    def has_guardrails(self) -> bool:
+        return len(self._guardrails) > 0
+
 
 def _deny_all(placeholder: str) -> bool:
     return False
