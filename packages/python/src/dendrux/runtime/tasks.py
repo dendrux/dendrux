@@ -38,6 +38,19 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T")
 
 
+def _resolve_drained(
+    task: asyncio.Task[T], cancellation: asyncio.CancelledError | None, run_id: str | None
+) -> T:
+    try:
+        return task.result()
+    except BaseException as error:
+        if cancellation is None:
+            raise
+        if not isinstance(error, asyncio.CancelledError):
+            _codes.log_code(logger, _codes.PERSISTENCE_ERROR, run_id=run_id)
+        raise cancellation from None
+
+
 async def _drain_cleanup(
     coro: Coroutine[Any, Any, T], *, name: str | None = None, run_id: str | None = None
 ) -> tuple[T, asyncio.CancelledError | None]:
@@ -54,14 +67,7 @@ async def _drain_cleanup(
                     cancellation = exc
             except Exception:
                 pass  # task.result() resolves failures against the retained cancellation.
-        try:
-            result = task.result()
-        except BaseException as error:
-            if cancellation is not None:
-                if not isinstance(error, asyncio.CancelledError):
-                    _codes.log_code(logger, _codes.PERSISTENCE_ERROR, run_id=run_id)
-                raise cancellation from None
-            raise
+        result = _resolve_drained(task, cancellation, run_id)
     return result, cancellation
 
 
