@@ -90,8 +90,11 @@ async def test_raw_failure_while_commit_is_in_flight(
                 )
             )
             await asyncio.wait_for(pending.wait(), 5)
+            assert committing is not None
+            # Observation window only: the advisory gate holds COMMIT, so a slow machine
+            # can only miss a regression here, never fail a correct build.
             await asyncio.sleep(0.05)
-            assert committing is not None and not committing.done()
+            assert not committing.done()
             assert not task.done(), "readback must wait for the server's unfinished COMMIT"
             await gate.execute(text("SELECT pg_advisory_unlock(1399335)"))
             await asyncio.wait_for(committing, 5)
