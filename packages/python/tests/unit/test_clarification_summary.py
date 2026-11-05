@@ -11,13 +11,13 @@ from dendrux.types import Limits
 @pytest.mark.parametrize("value", ["😀", '"', "\\", "\n"])
 def test_encoded_summary_bound(value):
     summary = clarification_summary(value * 10000, [value] * 10000, max_bytes=128)
-    assert len(json.dumps(summary).encode()) <= 128
+    assert len(json.dumps(summary, ensure_ascii=False).encode("utf-8")) <= 128
     assert summary["question"].endswith("[truncated]")
 
 
 def test_empty_options_still_consume_space():
     summary = clarification_summary("Which?", [""] * 10000, max_bytes=128)
-    assert len(json.dumps(summary).encode()) <= 128
+    assert len(json.dumps(summary, ensure_ascii=False).encode("utf-8")) <= 128
     assert summary["question"] == "Which?"
     assert len(summary["options"]) < 10000
 

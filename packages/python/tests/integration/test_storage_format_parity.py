@@ -256,7 +256,7 @@ async def test_single_call_keeps_question_text_as_final_answer(store, engine, fm
         loop=SingleCall(),
         state_store=store,
     )
-    result = await _invoke(agent, path)
+    result = await _invoke(agent, path, strategy=Questions())
     assert result.status == RunStatus.SUCCESS
     assert result.answer == "Which?" and result.pending is None
 

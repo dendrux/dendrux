@@ -1164,13 +1164,13 @@ def _governed_limits(limits: Any) -> dict[str, Any]:
         "max_pending_calls",
         "max_rebuild_bytes",
         "max_rebuild_rows",
-        "max_pause_summary_bytes",
     }
     # Default recovery bounds preserve older governance snapshots; overrides remain governed.
     return {
         key: value
         for key, value in asdict(limits).items()
-        if key not in recovery_bounds or value != getattr(defaults, key)
+        if key != "max_pause_summary_bytes"
+        and (key not in recovery_bounds or value != getattr(defaults, key))
     }
 
 

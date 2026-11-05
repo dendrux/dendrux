@@ -134,8 +134,9 @@ def _clarification_fields(
         (pause.get("clarification") or (last_step or {}).get("action")) if kind == "input" else None
     )
     if isinstance(action, dict) and action.get("type", "clarification") == "clarification":
-        question = action.get("question")
-        options = [str(o) for o in action.get("options") or []]
+        question = action.get("question") if isinstance(action.get("question"), str) else None
+        saved_options = action.get("options")
+        options = [str(o) for o in saved_options] if isinstance(saved_options, list) else []
     return question, options
 
 

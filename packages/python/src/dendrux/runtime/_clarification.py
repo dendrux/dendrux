@@ -12,20 +12,20 @@ DEFAULT_PAUSE_SUMMARY_BYTES = 65536
 
 
 def _text(value: str, budget: int) -> tuple[str, int, bool]:
-    candidate = value[:budget]
-    encoded = json.dumps(candidate)
+    candidate = value[:budget].encode("utf-8", errors="replace").decode("utf-8")
+    encoded = json.dumps(candidate, ensure_ascii=False).encode("utf-8")
     if len(candidate) == len(value) and len(encoded) <= budget:
         return candidate, len(encoded), False
     suffix = "[truncated]"
     lo, hi = 0, len(candidate)
     while lo < hi:
         mid = (lo + hi + 1) // 2
-        if len(json.dumps(candidate[:mid] + suffix)) <= budget:
+        if len(json.dumps(candidate[:mid] + suffix, ensure_ascii=False).encode("utf-8")) <= budget:
             lo = mid
         else:
             hi = mid - 1
     result = candidate[:lo] + suffix
-    return result, len(json.dumps(result)), True
+    return result, len(json.dumps(result, ensure_ascii=False).encode("utf-8")), True
 
 
 def clarification_summary(

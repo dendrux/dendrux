@@ -304,6 +304,7 @@ def _plan_assistant(
     atomic_completion: bool,
     pause_summary_bytes: int = DEFAULT_PAUSE_SUMMARY_BYTES,
     run_id: str | None = None,
+    clarification: dict[str, Any] | None = None,
 ) -> _MessagePlan:
     from dendrux.types import Clarification
 
@@ -313,11 +314,15 @@ def _plan_assistant(
             plan,
             clarification={
                 "v": 1,
-                **clarification_summary(
-                    last_step.action.question,
-                    last_step.action.options,
-                    max_bytes=pause_summary_bytes,
-                    run_id=run_id,
+                **(
+                    clarification
+                    if clarification is not None
+                    else clarification_summary(
+                        last_step.action.question,
+                        last_step.action.options,
+                        max_bytes=pause_summary_bytes,
+                        run_id=run_id,
+                    )
                 ),
                 "pause_message": None,
             },
@@ -365,6 +370,7 @@ def _plan_message(
     atomic_completion: bool,
     pause_summary_bytes: int = DEFAULT_PAUSE_SUMMARY_BYTES,
     run_id: str | None = None,
+    clarification: dict[str, Any] | None = None,
 ) -> _MessagePlan:
     from dendrux.types import _step_to_dict
 
@@ -383,7 +389,9 @@ def _plan_message(
         phase = "dispatch"
     plan = _MessagePlan(trace, pending, phase, delta)
     if message.role.value == "assistant" and not message.tool_calls:
-        return _plan_assistant(plan, last_step, atomic_completion, pause_summary_bytes, run_id)
+        return _plan_assistant(
+            plan, last_step, atomic_completion, pause_summary_bytes, run_id, clarification
+        )
     return plan
 
 
@@ -498,7 +506,16 @@ class PersistenceRecorder(BaseRecorder):
         self._final_trace: Any = None
         self._resume_pause_data: dict[str, Any] | None = None
         self._history_limits: Limits | None = None
-        self._pause_summary_bytes = DEFAULT_PAUSE_SUMMARY_BYTES
+        self._clarification: dict[str, Any] | None = None
+
+    @property
+    def _pause_summary_bytes(self) -> int:
+        return (
+            self._history_limits.max_pause_summary_bytes
+            if self._history_limits is not None
+            else DEFAULT_PAUSE_SUMMARY_BYTES
+        )
+
 
     async def restore_history(self, *, limits: Any, records: Any = None) -> None:
         self._history_limits = limits
@@ -549,7 +566,7 @@ class PersistenceRecorder(BaseRecorder):
         live = source()
         from dendrux.types import Limits, _validate_provider_kwargs
 
-        self._pause_summary_bytes = (live.get("limits") or Limits()).max_pause_summary_bytes
+        self._history_limits = live.get("limits", self._history_limits) or Limits()
 
         _validate_provider_kwargs(live.get("provider_kwargs", {}), run_id=self._run_id)
         self._tool_idempotent = live.get("idempotent", {})
@@ -565,6 +582,9 @@ class PersistenceRecorder(BaseRecorder):
                 else:
                     target.clear()
                     target.update(saved_value)
+        self._restore_budget(budget)
+
+    def _restore_budget(self, budget: Any) -> None:
         saved = self._loop_state.get("budget")
         if saved:
             from dendrux.loops._budget import BudgetState
@@ -581,6 +601,7 @@ class PersistenceRecorder(BaseRecorder):
                     ),
                 )
             budget.restore(restored)
+
 
     async def _state_ref(self, kind: str, payload: dict[str, Any]) -> str | None:
         from dendrux.runtime.state import TraceWrite
@@ -939,12 +960,15 @@ class PersistenceRecorder(BaseRecorder):
             max_bytes=self._pause_summary_bytes,
             run_id=self._run_id,
         )
+        self._clarification = summary
         if summary == {"question": action.question, "options": action.options}:
             return response, step
         bounded = Clarification(question=summary["question"], options=summary["options"])
-        return replace(response, text=bounded.question), replace(
-            step, action=bounded, raw_response=None
-        )
+        if bounded.question != action.question:
+            return replace(response, text=bounded.question), replace(
+                step, action=bounded, raw_response=None
+            )
+        return response, replace(step, action=bounded)
 
     async def _checkpoint_clarification(self, result: Any, pause: Any) -> None:
         from dendrux.types import Clarification
@@ -955,11 +979,15 @@ class PersistenceRecorder(BaseRecorder):
             if isinstance(action, Clarification)
             else (pause.clarification or {}).get("options", [])
         )
-        pause.clarification = clarification_summary(
-            result.answer or "",
-            options,
-            max_bytes=self._pause_summary_bytes,
-            run_id=self._run_id,
+        pause.clarification = (
+            self._clarification
+            if self._clarification is not None
+            else clarification_summary(
+                result.answer or "",
+                options,
+                max_bytes=self._pause_summary_bytes,
+                run_id=self._run_id,
+            )
         )
         await self._state_ref(
             "clarification",
@@ -1069,6 +1097,7 @@ class PersistenceRecorder(BaseRecorder):
             atomic_completion=capabilities(self._store).atomic_completion,
             pause_summary_bytes=self._pause_summary_bytes,
             run_id=self._run_id,
+            clarification=self._clarification,
         )
         plan.trace.meta["iteration"] = iteration
         await self._apply_message_plan(plan)
