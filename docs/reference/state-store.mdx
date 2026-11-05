@@ -130,8 +130,10 @@ The message names the capability, the method and the parameters it lacks, and te
 | The message says | What is wrong | Fix |
 | --- | --- | --- |
 | `capability 'version'` | `capabilities` is not a `StoreCapabilities`, or its `version` is not 1 | Use a `StoreCapabilities` instance with `version=1`. To repair an instance you have: `self.capabilities = replace(self.capabilities, version=1)` |
-| `capability 'deployment'` | `deployment` is missing or not one of `single_process`, `single_host`, `multi_server` | Set the one that matches your store: `self.capabilities = replace(self.capabilities, deployment="single_host")` |
+| `capability 'deployment'` | A non-`None` `deployment` is not one of `single_process`, `single_host`, `multi_server` | Set the one that matches your store: `self.capabilities = replace(self.capabilities, deployment="single_host")` |
 | a flag name, such as `capability 'fenced_writes'` | A method that flag requires lacks a named keyword parameter (for example `save_trace` lacks `claim_epoch`) | Copy the base method signature with its explicit keyword-only parameters and forward them. A `*args, **kwargs` signature does not count |
+
+Omitting `deployment` from a `StoreCapabilities` declaration, or setting it to `None`, is currently accepted with a `DeprecationWarning`.
 
 If your store does not support a capability, turn that one flag off and keep the rest of the declaration. Do it in `__init__`, after `super().__init__(...)`:
 
