@@ -244,3 +244,40 @@ class TestTraceLimitNotices:
         out = _plain(runner.invoke(app, ["traces", "big", "--tools", "--limit", "999999"]).output)
         assert "more traces not shown" in out
         assert "more tool calls not shown" in out
+
+
+@pytest.mark.parametrize("storage_format", [1, 2])
+def test_trace_command_uses_public_rows_and_positions(tmp_path, monkeypatch, storage_format):
+    from dendrux import Agent
+    from dendrux.db.session import get_engine, reset_engine
+    from dendrux.llm.mock import MockLLM
+    from dendrux.runtime.stores._factory import store_for_engine
+    from dendrux.types import LLMResponse
+    from tests._fixtures.storage import pin_storage_format
+
+    url = f"sqlite+aiosqlite:///{tmp_path / 'public-traces.db'}"
+    monkeypatch.setenv("DENDRUX_DATABASE_URL", url)
+
+    async def seed():
+        engine = await get_engine(url)
+        await pin_storage_format(engine, storage_format)
+        store = store_for_engine(engine)
+        agent = Agent(
+            prompt="private system text",
+            provider=MockLLM([LLMResponse(text="visible answer")]),
+            state_store=store,
+        )
+        result = await agent.run("visible input", tenant_id="tenant")
+        assert (await store.get_run(result.run_id)).storage_format == storage_format
+        await pin_storage_format(engine, 2)
+        await agent.close()
+        await reset_engine()
+        return result.run_id
+
+    run_id = asyncio.run(seed())
+    result = runner.invoke(app, ["traces", run_id, "--limit", "1"])
+    assert result.exit_code == 0, result.output
+    assert "private system text" not in result.output
+    assert "[0] user" in result.output and "visible input" in result.output
+    assert "visible answer" not in result.output
+    assert "more traces not shown" in result.output
