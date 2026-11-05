@@ -80,6 +80,25 @@ Give your store a `finalize_with_event` and make it atomic. The status change, t
 
 Followers depend on it. A follow ends once it has seen the terminal status and drained the event log, so a status that lands before its event can end a follow early. A store without `finalize_with_event` gets separate status and event writes. Its followers get a bounded 100 ms grace and one more drain, which cannot catch an event written arbitrarily late. See [How a follow ends](/docs/reference/run-store#how-a-follow-ends).
 
+## Events that do not pass through `save_run_event`
+
+`save_run_event` is not the only way an event reaches the log. Some events are written in the same transaction as the change they describe, by a combined method, and never call `save_run_event`:
+
+| Event | Written by |
+| --- | --- |
+| `run.paused` | `pause_with_event` |
+| `run.completed`, `run.error`, `run.cancelled` from the run loop | `finalize_with_event` |
+| `tool.started` and `tool.completed` of a server tool, on a format-2 run | `start_tool_call` and `complete_tool_call` |
+
+A 0.5 subclass that overrides only `save_run_event` to audit every event therefore sees fewer events than the log holds. In a check on SQLite, a format-2 run with one server tool and one client tool stored 12 events and the override saw 8. Marking an expired lease, reclaiming and sweeping write their events in their own transactions as well.
+
+What a custom writer must do:
+
+- **Audit from the log.** The event log is the truth and holds every event in order. Read it with `RunStore.get_events`, paging with `after_sequence_index` (see [Bounded list reads](/docs/reference/run-store#bounded-list-reads)), or write the audit trail from a store-level hook that you place on the combined methods too.
+- **If you override the combined methods, keep their full signatures.** Copy the base signature, call `super()`, and read the event from the `event` argument (an `EventWrite`) or from `event_type` and `event_data`. A bare `*args, **kwargs` override does not pass capability validation.
+- **If you write your own store, put every event in one log.** Whichever method wrote it, an event takes its sequence index inside the same insert and lands in the same transaction as the change it belongs to. Followers read that one log.
+- **Do not rely on narrowing to get the old behaviour back.** Declaring `atomic_completion=False` makes the runtime use plain `save_run_event` for the tool events, but new runs then start at format 1, and `run.paused` and the terminal events still use their combined methods.
+
 ## Format and recovery requirements
 
 Format 2 requires `fenced_writes`, `retry_ids`, `checkpointing` and `atomic_completion` together, plus an activated database setting. If any is missing, newly created runs use format 1. A run's format never changes on claim or resume.
