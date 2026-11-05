@@ -290,6 +290,21 @@ def _validate_checkpoint(run_id: str, value: dict[str, Any]) -> None:
         _checkpoint_error(run_id)
 
 
+def _validate_rewrite_entries(run_id: str, value: Any) -> None:
+    if not isinstance(value, list) or len(value) > _RECOVERY_MAX_MESSAGES:
+        _checkpoint_error(run_id)
+    if any(
+        not isinstance(m, dict)
+        or not isinstance(m.get("role"), str)
+        or not isinstance(m.get("content"), str)
+        for m in value
+    ):
+        raise ValueError("Rewrite entries require role and content")
+    if any(not isinstance(m.get("meta", {}), dict) for m in value):
+        _codes.log_code(logger, _codes.REWRITE_INVALID, run_id=run_id)
+        raise ValueError("Rewrite entry metadata must be an object")
+
+
 def _validate_trace_write(run_id: str, trace: TraceWrite) -> None:
     from dendrux.types import _validate_persistable
 
@@ -302,18 +317,7 @@ def _validate_trace_write(run_id: str, trace: TraceWrite) -> None:
             _checkpoint_error(run_id)
         value = json.loads(trace.content)
         if trace.trace_kind == "rewrite":
-            if not isinstance(value, list) or len(value) > _RECOVERY_MAX_MESSAGES:
-                _checkpoint_error(run_id)
-            if any(
-                not isinstance(m, dict)
-                or not isinstance(m.get("role"), str)
-                or not isinstance(m.get("content"), str)
-                for m in value
-            ):
-                raise ValueError("Rewrite entries require role and content")
-            if any(not isinstance(m.get("meta", {}), dict) for m in value):
-                _codes.log_code(logger, _codes.REWRITE_INVALID, run_id=run_id)
-                raise ValueError("Rewrite entry metadata must be an object")
+            _validate_rewrite_entries(run_id, value)
         elif not isinstance(value, dict) or value.get("kind") not in (
             "image_view",
             "skills_session",
