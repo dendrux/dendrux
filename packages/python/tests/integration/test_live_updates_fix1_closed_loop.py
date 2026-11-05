@@ -38,7 +38,9 @@ def _assert_closed_loop_close(pg_test_url, kind, cancel_listener):
         )
         bus = PostgresUpdates(url=url, connect_args={"server_settings": {"application_name": name}})
     else:
-        url = os.environ["DENDRUX_TEST_REDIS_URL"]
+        url = os.environ.get("DENDRUX_TEST_REDIS_URL")
+        if not url:
+            pytest.skip("DENDRUX_TEST_REDIS_URL not set")
         bus = RedisUpdates(url, channel=name, client_options={"client_name": name})
     loop = asyncio.new_event_loop()
 
