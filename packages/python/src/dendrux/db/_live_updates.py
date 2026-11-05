@@ -75,8 +75,12 @@ def _error_kind(error: BaseException) -> str:
 
 
 def _error_type(error: BaseException) -> str:
-    name = type(error).__name__
-    return name if name.isascii() and name.isidentifier() and len(name) <= 128 else "Exception"
+    name = getattr(error, "safe_type", type(error).__name__)
+    return (
+        name
+        if isinstance(name, str) and all((name.isascii(), name.isidentifier(), len(name) <= 128))
+        else "Exception"
+    )
 
 
 def _check_limits(counts: dict[str, int], times: dict[str, float]) -> None:

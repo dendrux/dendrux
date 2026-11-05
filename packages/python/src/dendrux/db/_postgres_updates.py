@@ -39,32 +39,30 @@ _NOTIFY_SQL = "SELECT pg_notify($1, m) FROM unnest($2::text[]) AS m"
 
 
 _TRANSPORT_FAILURES = (
-    (TimeoutError, TimeoutError, "Postgres live updates timed out"),
-    (ssl.SSLError, ssl.SSLError, "Postgres live updates TLS failed"),
-    (OSError, ConnectionError, "Postgres live updates connection failed"),
+    (TimeoutError, TimeoutError, ("Postgres live updates timed out",)),
+    (ssl.SSLError, ssl.SSLError, (ssl.SSL_ERROR_SSL, "Postgres live updates TLS failed")),
+    (OSError, ConnectionError, ("Postgres live updates connection failed",)),
     (
         ImportError,
         ImportError,
-        "Postgres live updates requires asyncpg; install dendrux[postgres].",
+        ("Postgres live updates requires asyncpg; install dendrux[postgres].",),
     ),
     (
         ValueError,
         ValueError,
-        "Postgres live updates configuration failed; check url= and connect_args.",
+        ("Postgres live updates configuration failed; check url= and connect_args.",),
     ),
-    (Exception, RuntimeError, "Postgres live updates failed"),
+    (Exception, RuntimeError, ("Postgres live updates failed",)),
 )
 
 
 def _transport_error(error: Exception) -> Exception:
-    for source, base, message in _TRANSPORT_FAILURES:
+    for source, base, arguments in _TRANSPORT_FAILURES:
         if isinstance(error, source):
-            # Keep only a validated class name, never the driver's class, fields
-            # or chain. The safe base preserves LiveUpdates' diagnostic kind.
-            clean_type: type[Exception] = type(
-                _error_type(error), (base,), {"__module__": __name__}
-            )
-            return clean_type(message)
+            failure: Any = base(*arguments)
+            # Keep only a validated name; the builtin preserves kind and pickling.
+            failure.safe_type = _error_type(error)
+            return cast("Exception", failure)
     raise AssertionError("unreachable transport error type")
 
 

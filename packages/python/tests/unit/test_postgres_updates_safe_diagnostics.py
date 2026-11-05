@@ -84,3 +84,53 @@ async def test_early_listener_close_closes_retained_inner_generator(monkeypatch)
         assert inner.ag_frame is None
     finally:
         await inner.aclose()
+
+
+@pytest.mark.parametrize(
+    "source,expected",
+    [
+        (ssl.SSLCertVerificationError, ssl.SSLError),
+        (asyncpg.InvalidPasswordError, RuntimeError),
+        (asyncpg.TooManyConnectionsError, RuntimeError),
+        (ImportError, ImportError),
+        (TimeoutError, TimeoutError),
+        (ConnectionResetError, ConnectionError),
+        (ValueError, ValueError),
+    ],
+)
+async def test_transport_errors_use_plain_picklable_builtins(monkeypatch, source, expected):
+    import pickle
+
+    updates = PostgresUpdates(url="postgresql://u@localhost/test")
+    monkeypatch.setattr(asyncpg, "connect", AsyncMock(side_effect=source(SECRET)))
+    with pytest.raises(expected) as caught:
+        await updates.send(["[]"])
+    error = caught.value
+    assert type(error) is expected
+    assert error.safe_type == source.__name__
+    restored = pickle.loads(pickle.dumps(error))
+    assert type(restored) is expected
+    assert str(restored) == str(error)
+    assert _error_type(restored) == source.__name__
+    assert _error_kind(restored) == _error_kind(error)
+    assert SECRET not in repr(vars(restored)) + repr(restored.args)
+    assert restored.__context__ is None and restored.__cause__ is None
+
+
+async def test_tls_failure_has_plain_fixed_text(monkeypatch):
+    updates = PostgresUpdates(url="postgresql://u@localhost/test")
+    monkeypatch.setattr(
+        asyncpg, "connect", AsyncMock(side_effect=ssl.SSLCertVerificationError(1, SECRET))
+    )
+    with pytest.raises(ssl.SSLError) as caught:
+        await updates.send(["[]"])
+    assert str(caught.value) == "Postgres live updates TLS failed"
+
+
+@pytest.mark.parametrize("safe_name", ["TooManyConnectionsError", "bad name", "ü", "x" * 129, 1])
+def test_safe_diagnostic_type_name_is_validated(safe_name):
+    error = RuntimeError("fixed")
+    error.safe_type = safe_name
+    assert _error_type(error) == (
+        "TooManyConnectionsError" if safe_name == "TooManyConnectionsError" else "Exception"
+    )
