@@ -116,7 +116,11 @@ async def main(mode: str) -> int:
             ) as agent:
                 paused = await agent.run("What is the selection total?")
                 assert paused.status == RunStatus.WAITING_CLIENT_TOOL
-                call = paused.pending.tool_calls[0]
+                pending = paused.pending or await reads.get_pending(paused.run_id, tenant_id=None)
+                if pending is None or pending.kind != "client_tool" or not pending.tool_calls:
+                    print("Pause changed; reload the run before submitting.")
+                    return 0
+                call = pending.tool_calls[0]
                 print(f"mode: {mode}; paused run {paused.run_id}, waiting for {call.name!r}")
 
                 seen: list[str] = []
@@ -128,7 +132,7 @@ async def main(mode: str) -> int:
                     paused.run_id,
                     [ToolResult(call.name, call.id, '"6 + 36"')],
                     tenant_id=None,
-                    expected_pause_id=paused.pause_id,
+                    expected_pause_id=pending.pause_id,
                 )
                 reason = await asyncio.wait_for(follower, timeout=30)
                 delay = time.monotonic() - started

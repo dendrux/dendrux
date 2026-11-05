@@ -18,7 +18,7 @@ ENTRIES = ["tool_results", "input", "approve", "resume", "resume_stream", "recov
 
 async def invoke_failure(case, entry):
     if entry == "resume_stream":
-        assert (await case.invoke()).status == RunStatus.ERROR
+        assert (await case.invoke()).error_info.category == "persistence_error"
     else:
         with pytest.raises(PersistenceError):
             await case.invoke()
@@ -57,7 +57,9 @@ async def test_setup_read_failure_releases_exact_claim(
 
 
 @pytest.mark.parametrize("entry", ENTRIES)
-async def test_stale_setup_release_cannot_change_new_claim(store, engine, monkeypatch, entry):
+async def test_stale_setup_release_cannot_change_new_claim(
+    store, engine, monkeypatch, entry, *, release_available=True
+):
     if engine.dialect.name not in {"postgresql", "mysql"}:
         pytest.skip("independent connection race requires row locking")
     case = await path_case(store, engine, entry, ProbeProvider())
@@ -104,6 +106,8 @@ async def test_stale_setup_release_cannot_change_new_claim(store, engine, monkey
                 assert len(winners) == 1
                 winner = winners[0]
             assert winner.claim_epoch > old.claim_epoch
+            if not release_available:
+                patcher.setattr(store, "release_run_claim", None)
             proceed.set()
             await asyncio.wait_for(task, 10)
             row = await store.get_run(case.run_id)

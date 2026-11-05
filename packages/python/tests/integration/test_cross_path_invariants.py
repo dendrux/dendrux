@@ -543,7 +543,9 @@ async def test_startup_write_failure_grid(store, engine, monkeypatch, path):
     monkeypatch.setattr(store, "save_run_event", fail_start)
     if path in {"run_stream", "resume_stream"}:
         result = await case.invoke()
-        assert result.status == RunStatus.ERROR
+        assert result.status == (
+            RunStatus(old_status) if path == "resume_stream" else RunStatus.ERROR
+        )
         assert case.events[-1].type == RunEventType.RUN_ERROR
     else:
         with pytest.raises(RuntimeError) as caught:
@@ -1216,7 +1218,7 @@ async def test_overlapping_same_agent_submit_preserves_new_owner_and_interrupts(
         with pytest.raises(RuntimeError) as caught:
             await first
         assert caught.value is original
-        notifier.on_run_failed.assert_not_awaited()
+        notifier.on_run_failed.assert_awaited_once_with(run_id, original, iteration=None)
         assert a._task_manager._tasks.get(run_id) is new_owner
         assert a._task_manager._owned.get(run_id) is new_owner
         assert not new_owner.done()

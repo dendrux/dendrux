@@ -1171,8 +1171,8 @@ def _in_memory_pending(result: RunResult) -> Any:
     return _pending_from(result.run_id, result.status.value, kind, pause, last)
 
 
-async def _recovery_info(store: StateStore, record: Any) -> Any:
-    """Use the same bounded durable projection for direct and read results."""
+async def _recovery_info(store: StateStore, record: Any, *, best_effort: bool = True) -> Any:
+    """Project recovery strictly for reads, or best effort after a durable outcome."""
     from dendrux.types import RecoveryInfo
 
     if record is None or not getattr(record, "reclaim_attempts", 0):
@@ -1182,6 +1182,8 @@ async def _recovery_info(store: StateStore, record: Any) -> Any:
             record.id, limit=_CONTROL_EVENT_LIMIT, tenant_id=record.tenant_id
         )
     except Exception:
+        if not best_effort:
+            raise
         _codes.log_code(logger, _codes.RESULT_READ_FAILED, run_id=record.id)
         return None
     return RecoveryInfo(record.reclaim_attempts, record.last_reclaimed_at, ids, truncated)
@@ -5674,6 +5676,7 @@ async def _claim_resume(
     user_parts: tuple[ContentPart, ...] | None = None,
     decisions: list[tuple[str, ApprovalDecision]] | None = None,
     checkpoint: dict[str, Any] | None = None,
+    on_release: Callable[[StateStore, bool | None], None] | None = None,
 ) -> tuple[StateStore, str, dict[str, Any]]:
     request = _claim_request(
         raw,
@@ -5716,24 +5719,41 @@ async def _claim_resume(
         )
         if epoch:
             view = claimed_store(store, run_id, epoch)
-            try:
-                await report_governance_change(agent, view, run_id, raw)
-            except BaseException:
-                await _release_claim(view, run_id, status)
-                raise
+            await _report_claim_governance(agent, view, run_id, raw, status, on_release)
             return view, status, _claimed_submission_view(raw, descriptor, payload)
     await _raise_resume_claim_failure(store, run_id, expected)
     raise AssertionError("unreachable")
 
 
-async def _release_claim(store: StateStore, run_id: str, status: str) -> None:
+async def _report_claim_governance(
+    agent: Agent,
+    store: StateStore,
+    run_id: str,
+    raw: dict[str, Any],
+    status: str,
+    on_release: Callable[[StateStore, bool | None], None] | None,
+) -> None:
+    try:
+        await report_governance_change(agent, store, run_id, raw)
+    except BaseException as exc:
+        released = await _release_claim(store, run_id, status)
+        if on_release is not None and isinstance(exc, Exception):
+            on_release(store, released)
+        raise
+
+
+async def _release_claim(
+    store: StateStore, run_id: str, status: str, *, finalize_unsupported: bool = True
+) -> bool | None:
     import sys
 
     from dendrux.runtime.submit import _release_claim_result
 
     epoch = getattr(store, "claim_epoch", True)
     try:
-        await _release_claim_result(store, run_id, status, epoch, sys.exception())
+        return await _release_claim_result(
+            store, run_id, status, epoch, sys.exception(), finalize_unsupported=finalize_unsupported
+        )
     except asyncio.CancelledError as cancellation:
         await _release_claim_result(store, run_id, status, epoch, cancellation)
         raise
@@ -6180,29 +6200,29 @@ async def _resume_failure_hooks(ctx: _ResumeContext | None, run_id: str, exc: Ex
         )
 
 
-async def _released_resume_status(store: StateStore, run_id: str, status: str) -> RunStatus:
+async def _released_resume_status(store: StateStore, run_id: str) -> RunStatus:
     try:
         record = await store.get_run(run_id)
-        if record is not None and record.status == RunStatus.CANCELLED.value:
-            return RunStatus.CANCELLED
+        if record is not None:
+            return RunStatus(record.status)
     except Exception:
         logger.warning(
             "Released run status read failed for %s", run_id, exc_info=safe_exception_info()
         )
-    return RunStatus(status)
+    return RunStatus.RUNNING
 
 
 async def _released_resume_hooks(
-    store: StateStore, run_id: str, status: str, ctx: _ResumeContext | None, exc: Exception
-) -> None:
+    store: StateStore, run_id: str, ctx: _ResumeContext | None, exc: Exception
+) -> RunStatus:
     from dendrux.types import RunResult
 
+    outcome = await _released_resume_status(store, run_id)
     if ctx is None:
-        return
-    outcome = await _released_resume_status(store, run_id, status)
+        return outcome
     if outcome == RunStatus.RUNNING:
         await _resume_failure_hooks(ctx, run_id, exc)
-        return
+        return outcome
     result = RunResult(
         run_id=run_id,
         status=outcome,
@@ -6219,6 +6239,19 @@ async def _released_resume_hooks(
             )
     if ctx.notifier_started:
         await notify_run_finished(ctx.notifier, run_id, result)
+    return outcome
+
+
+async def _try_resume_release(
+    store: StateStore, run_id: str, status: str, ctx: _ResumeContext | None, exc: Exception
+) -> RunStatus | None:
+    released = await _release_claim(store, run_id, status, finalize_unsupported=False)
+    if released is None:
+        return None
+    if released:
+        return await _released_resume_hooks(store, run_id, ctx, exc)
+    await _resume_failure_hooks(ctx, run_id, exc)
+    return await _released_resume_status(store, run_id)
 
 
 async def _handle_resume_failure(
@@ -6230,9 +6263,10 @@ async def _handle_resume_failure(
     progress: _ResumeProgress,
     meta: dict[str, Any],
 ) -> None:
-    if progress._can_release(ctx, exc):
-        await _release_claim(store, run_id, status)
-        await _released_resume_hooks(store, run_id, status, ctx, exc)
+    if (
+        progress._can_release(ctx, exc)
+        and await _try_resume_release(store, run_id, status, ctx, exc) is not None
+    ):
         return
     _attach_run_error_meta(exc, run_id, meta)
     await _persist_run_failure(store, run_id, exc)
@@ -6630,14 +6664,14 @@ def _stream_resume_started(shared: dict[str, Any]) -> bool:
 
 async def _stream_resume_failure(
     _shared: dict[str, Any], extra_notifier: LoopNotifier | None, run_id: str, exc: Exception
-) -> None:
+) -> RunStatus:
     store = _shared.get("state_store")
     err_ctx = _shared.get("ctx")
     progress = _shared.get("progress")
     if store is not None and progress is not None and progress._can_release(err_ctx, exc):
-        await _release_claim(store, run_id, _shared["expected_status"])
-        await _released_resume_hooks(store, run_id, _shared["expected_status"], err_ctx, exc)
-        return
+        outcome = await _try_resume_release(store, run_id, _shared["expected_status"], err_ctx, exc)
+        if outcome is not None:
+            return outcome
     if store is not None and _stream_resume_started(_shared):
         await _persist_run_failure(store, run_id, exc, safe_event=True)
     try:
@@ -6655,6 +6689,16 @@ async def _stream_resume_failure(
             run_id,
             exc_info=safe_exception_info(),
         )
+    prelude = _shared.get("released_prelude")
+    if prelude is not None and prelude[1] is not None:
+        return await _released_resume_status(prelude[0], run_id)
+    return RunStatus.ERROR
+
+
+def _remember_stream_release(
+    shared: dict[str, Any], store: StateStore, released: bool | None
+) -> None:
+    shared["released_prelude"] = (store, released)
 
 
 async def _finish_resume_stream_cleanup(
@@ -6718,8 +6762,9 @@ def resume_stream(
     Synchronous — returns immediately. All async setup (store resolution,
     pause state load, claim, history build) runs lazily on first iteration.
 
-    Same error contract as run_stream(): exceptions are caught, persisted,
-    and yielded as RUN_ERROR events. No exception is raised to the consumer.
+    Execution exceptions yield RUN_ERROR events. Before consumption or work,
+    cleanup can release the claim; the result reports the observed status and
+    the failed attempt's error. Otherwise the run is finalized as ERROR.
 
     First event is RUN_RESUMED (not RUN_STARTED) carrying the existing run_id.
 
@@ -6797,6 +6842,7 @@ def resume_stream(
                 user_input=user_input,
                 user_parts=user_parts,
                 checkpoint=reads.checkpoint,
+                on_release=partial(_remember_stream_release, _shared),
             )
             _shared["state_store"] = store
             _shared["claimed"] = True
@@ -6805,8 +6851,8 @@ def resume_stream(
 
             # 5. Prepare (shared helper — history, notifier).
             #    Does NOT fire any lifecycle hooks; that's done below inside
-            #    the same try block so on_run_failed pairs with any failure
-            #    after on_run_started fires.
+            #    the same try block so failure or released-finish hooks pair
+            #    with on_run_started.
             run_tenant = run_record.tenant_id if run_record else None
             ctx = await _prepare_resume(
                 run_id,
@@ -6827,8 +6873,8 @@ def resume_stream(
             _shared["ctx"] = ctx
             progress.submission = getattr(ctx.recorder, "_loop_state", {}).get("submission")
 
-            # 5a. Fire run-level lifecycle hooks. After this point, any
-            #     failure must pair with on_run_failed in the except handler.
+            # 5a. Fire run-level lifecycle hooks. The exception handler closes
+            #     the pair with failure or the observed released status.
             await record_run_started(
                 ctx.recorder, run_id, agent_name=agent.name, agent_model=provider.model
             )
@@ -6935,13 +6981,13 @@ def resume_stream(
             yield _fenced_stream_event(run_id, result)
 
         except Exception as exc:
-            await _stream_resume_failure(_shared, extra_notifier, run_id, exc)
+            failure_status = await _stream_resume_failure(_shared, extra_notifier, run_id, exc)
 
             yield RunEvent(
                 type=RunEventType.RUN_ERROR,
                 run_result=RunResult(
                     run_id=run_id,
-                    status=RunStatus.ERROR,
+                    status=failure_status,
                     error=_safe_error(exc),
                     error_info=_provider_error_info(exc),
                     meta=_resume_warning_meta(

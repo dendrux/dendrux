@@ -622,15 +622,23 @@ async def _release_claim_result(
     status: str,
     result: ClaimResult | int | bool,
     failure: BaseException | None,
-) -> None:
+    *,
+    finalize_unsupported: bool = True,
+) -> bool | None:
     if isinstance(failure, asyncio.CancelledError):
         from dendrux.runtime.tasks import _drain_cleanup
 
         await _drain_cleanup(_cancel_claim(store, run_id, result), run_id=run_id)
-        return
+        return True
     epoch = result.claim_epoch if isinstance(result, ClaimResult) else result
     token = epoch if isinstance(epoch, int) and not isinstance(epoch, bool) else None
-    await release_claim(store, run_id, status, claim_epoch=token, failure=failure)
+    released = await release_claim(store, run_id, status, claim_epoch=token, failure=failure)
+    if released is None and finalize_unsupported and isinstance(failure, Exception):
+        from dendrux.runtime.runner import _persist_run_failure
+        from dendrux.runtime.state import claimed_store
+
+        await _persist_run_failure(claimed_store(store, run_id, result), run_id, failure)
+    return released
 
 
 def _resume_failure_kind(failure: BaseException | None) -> str:
@@ -689,30 +697,37 @@ async def release_claim(
     *,
     claim_epoch: int | None = None,
     failure: BaseException | None = None,
-) -> None:
-    """Drain claim release, preserving failures unless the caller cancels."""
+) -> bool | None:
+    """Return True if released, False on failed release, None if unsupported.
+
+    Drain cleanup, preserving failures unless the caller cancels.
+    """
     import logging
 
     from dendrux.runtime.tasks import _drain_cleanup
 
     epoch = claim_epoch if claim_epoch is not None else getattr(store, "claim_epoch", None)
     release = getattr(store, "release_run_claim", None)
-    if epoch is None or release is None:
+    if not isinstance(epoch, int) or isinstance(epoch, bool) or not callable(release):
         _codes.log_code(logging.getLogger(__name__), _codes.PERSISTENCE_ERROR, run_id=run_id)
-        return
+        return None
     event = _resume_aborted_event(status, failure)
 
-    async def cleanup() -> None:
+    async def cleanup() -> bool:
         try:
             if await _release_with_event(store, release, run_id, status, epoch, event):
-                return
+                return True
         except (Exception, asyncio.CancelledError):
             pass
         _codes.log_code(logging.getLogger(__name__), _codes.PERSISTENCE_ERROR, run_id=run_id)
+        return False
 
-    _, cancelled = await _drain_cleanup(cleanup(), name=f"release-claim:{run_id}", run_id=run_id)
+    released, cancelled = await _drain_cleanup(
+        cleanup(), name=f"release-claim:{run_id}", run_id=run_id
+    )
     if cancelled is not None:
         raise cancelled
+    return released
 
 
 def build_rejection_results(

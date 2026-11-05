@@ -1251,7 +1251,7 @@ class ErrorInfo:
 
 @dataclass(frozen=True)
 class RecoveryInfo:
-    """Durable recovery summary, absent for runs that were never reclaimed."""
+    """Durable recovery summary, when requested recovery reads succeed."""
 
     reclaim_attempts: int
     last_reclaimed_at: datetime | None
@@ -1300,10 +1300,15 @@ class RunResult:
     (``stop_reason == "max_tokens"``): the run still ends SUCCESS, but the
     answer is cut off.
 
-    ``error_info`` describes a provider failure that ended the run (ERROR
-    only). ``pause_id`` identifies the current pause of a paused run.
+    ``error_info`` describes a failed attempt. Usually its status is ERROR;
+    a resumed stream can instead preserve a released pause or running status.
+    ``pause_id`` identifies the current pause of a paused run.
     ``recovery`` summarizes durable reclaims and replayed calls. It is None
-    for unreclaimed runs, whose wire DTO omits the additive recovery key.
+    for unreclaimed runs, or when optional reads fail while returning a
+    committed outcome or cancellation response. The wire DTO then omits the
+    recovery key. ``Agent.get_result`` is strict and propagates recovery read
+    failures. Committed pause results may lack ``pending`` and ``pause_id``
+    after a projection failure; reload pending before submitting.
     """
 
     run_id: str

@@ -122,11 +122,50 @@ Eligibility requires a SQLAlchemy or typed persistence error, or native-driver p
 
 A driver or OS failure during `COMMIT`, including a bare timeout, can leave the outcome unclear. A write with a stable identity reads back its rows. Proven success returns the result. Safe, proven absence permits a retry. Otherwise the store raises non-retryable `StoreOutcomeUnknown`. Claims, reclaims, `submit_and_claim` and releases never infer ownership from a later read. PostgreSQL readback waits for a concurrent writer for at most about five seconds. Do not replay an unknown outcome blindly. See [Errors](/docs/reference/errors#when-a-commit-acknowledgement-is-lost).
 
-At most three retries wait 0.1, 0.2 and 0.4 seconds. The 0.7 seconds covers backoff only; driver operations add their own duration. A short refused-connection window can be bridged. Longer outages can exhaust the budget. A failed write makes `agent.run` raise `PersistenceError`; a stream ends with `run_error`. The run is saved as `error` if the database answers again in time. Otherwise it keeps its last committed state. Restart terminal-error runs as appropriate. Use `sweep` and `reclaim` for runs left running. Each retry logs `Transient DB failure n/3` with the operation and run id, without SQL or driver text. This does not promise every reader or sweep survives a restart.
+At most three retries wait 0.1, 0.2 and 0.4 seconds. The 0.7 seconds covers backoff only; driver operations add their own duration. A short refused-connection window can be bridged. Longer outages can exhaust the budget. A failed write makes `agent.run` raise `PersistenceError`; a stream ends with `run_error`. After work starts, the run is saved as `error` if the database answers again in time. Otherwise it keeps its last committed state. Unconsumed continuations can instead release back to their pause; see [Continuation setup failures](#continuation-setup-failures). Restart terminal-error runs as appropriate. Use `sweep` and `reclaim` for runs left running. Each retry logs `Transient DB failure n/3` with the operation and run id, without SQL or driver text. This does not promise every reader or sweep survives a restart.
 
 Recorder and runner scopes keep their previous SQLAlchemy and typed-persistence retry policy. They do not newly retry raw driver failures from custom stores. A custom store must resolve an ambiguous `COMMIT` itself. Do not report it as retryable without proof or a safe stable-identity protocol. Wrapping a landed commit failure in SQLAlchemy `OperationalError` can still cause replay under the existing policy.
 
 Normalized SQL errors discard internal traceback frames that could retain driver text. Direct `PostgresUpdates` send, receive and sender-close failures use plain builtin exceptions with fixed text and no raw exception chain. TLS failures keep the `tls` kind. `last_error_type` keeps a validated original class name, rather than the original exception class. Native driver exception handlers therefore do not catch these normalized direct-hook failures. Missing drivers retain the installation hint for `dendrux[postgres]` or `dendrux[mysql]`.
+
+### Continuation setup failures
+
+In 0.5.0, post-claim setup failures in `resume` and `resume_stream` usually ended
+the run as `error`. In 0.6.0, continuations (`resume`, `resume_stream`, `submit_*`
+and `reclaim`) can release their exact claim when an ordinary exception occurs before
+submission consumption or work starts. This includes failed setup reads and writes
+such as `run.resumed`, `save_trace` and `consume_submission`, provided consumption
+has not committed. `StoreOutcomeUnknown` during execution setup does not release.
+Cancellation keeps its existing precedence.
+
+A released continuation returns to its pause. Reclaim releases to `running`, for
+a later lease expiry and sweep. No automatic timeout or retry ends a released
+pause: resubmit the original input/results/decisions explicitly, or call
+`cancel_run` if you give up. Permanent setup failures will fail again until fixed.
+Monitor exceptions, `run_error` stream events and `run.resume_aborted` events;
+a monitor counting only rows with `status=error` will miss these attempts.
+
+For a confirmed release to a non-running status, started observers receive
+`on_run_finished` with that observed status. A released reclaim still reports
+failure hooks because its row remains `running`. Failure hooks also run when
+release is unavailable, fails, or its status cannot be read.
+A store without a release method or an integer claim epoch falls back to terminal
+error persistence. An attempted release that fails leaves the last durable state
+for `sweep`/`reclaim`; stores without recovery use `sweep(on_stale="error")`.
+
+`resume_stream` still emits `run_error` for the failed attempt, but its
+`run_result.status` (and `stream.result.status`) reflects the observed row after
+release, which can be a pause or `running`. If the cleanup status read fails,
+`running` is the conservative fallback, not proof of current ownership. Read the
+store before retrying. The error event keeps the failure information and does not
+supply a pending payload or pause token.
+
+After an outcome commits, an optional projection failure cannot hide it.
+A pause result may have `pending=None` and `pause_id=None`; reload with
+`RunStore.get_pending` before submitting, and handle a pause that has since changed.
+`recovery=None` can mean its projection failed on a committed-outcome or
+`cancel_run` response; `result_read_failed` logs that case. `get_result` remains a
+strict read and raises if recovery or pending cannot be read.
 
 ### Cancellation during create or claim
 

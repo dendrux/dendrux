@@ -75,7 +75,11 @@ async def main() -> int:
         ) as agent:
             paused = await agent.run("What is the selection total?", tenant_id=TENANT)
             assert paused.status == RunStatus.WAITING_CLIENT_TOOL
-            call = paused.pending.tool_calls[0]
+            pending = paused.pending or await reads.get_pending(paused.run_id, tenant_id=TENANT)
+            if pending is None or pending.kind != "client_tool" or not pending.tool_calls:
+                print("Pause changed; reload the run before submitting.")
+                return 0
+            call = pending.tool_calls[0]
             print(f"Paused run {paused.run_id}: waiting for the client tool {call.name!r}.")
 
             # Any worker sharing the database could do this part, in another process.
@@ -83,7 +87,7 @@ async def main() -> int:
                 paused.run_id,
                 [ToolResult(call.name, call.id, '"6 + 36"')],
                 tenant_id=TENANT,
-                expected_pause_id=paused.pause_id,
+                expected_pause_id=pending.pause_id,
             )
             print(f"Finished: {finished.status.value}: {finished.answer}")
 
