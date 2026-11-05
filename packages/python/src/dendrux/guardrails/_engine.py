@@ -16,7 +16,7 @@ import re
 import threading
 from bisect import bisect_right
 from collections import Counter, OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Literal
 
 from dendrux.guardrails._detectors import THREAD_SCAN_THRESHOLD
@@ -192,6 +192,74 @@ def tool_origin(name: str) -> Origin:
     return Origin("tool", name)
 
 
+def _message_digest(message: Message) -> bytes:
+    from dendrux.types import TextPart
+
+    value = (
+        message.role.value,
+        message.name,
+        message.call_id,
+        message.content,
+        [p.text if isinstance(p, TextPart) else None for p in message.parts]
+        if message.parts is not None
+        else None,
+    )
+    return hashlib.sha256(json.dumps(value, ensure_ascii=False).encode()).digest()
+
+
+class _FindingCounts(dict[str, int]):
+    def __init__(self, max_kinds: int | None = 128) -> None:
+        super().__init__()
+        self.max_kinds = max_kinds
+
+    def add(self, kind: str, count: int = 1) -> None:
+        if self.max_kinds is not None and kind not in self and len(self) >= self.max_kinds:
+            kind = UNSCANNABLE
+        self[kind] = self.get(kind, 0) + count
+
+    def include(self, findings: list[Finding]) -> None:
+        counts = getattr(findings, "entity_counts", None)
+        if counts is not None:
+            for kind, count in counts.items():
+                self.add(kind, count)
+        else:
+            for finding in findings:
+                self.add(finding.entity_type)
+
+
+class _ProjectionFindings(list[Finding]):
+    def __init__(self, findings: list[Finding], total_count: int | None = None) -> None:
+        super().__init__(
+            replace(f, text="", start=0, end=0) for f in findings[:_PROJECTED_FINDINGS_LIMIT]
+        )
+        self.total_count = len(findings) if total_count is None else total_count
+        self.entity_counts = _FindingCounts()
+        self.entity_counts.include(findings)
+
+
+@dataclass(frozen=True)
+class _Projection:
+    owner: object
+    digest: bytes
+    findings: _ProjectionFindings
+    blocked: str | None
+    redacted: bool
+    location: str
+
+    def __deepcopy__(self, memo: Any) -> None:
+        return None
+
+    def __reduce__(self) -> tuple[Any, tuple[()]]:
+        return type(None), ()
+
+
+def _with_projection(message: Message, evidence: _Projection, *, copy: bool) -> Message:
+    if copy:
+        message = replace(message)
+    object.__setattr__(message, "_guardrail_projection", evidence)
+    return message
+
+
 class GuardrailEngine:
     """Per-run guardrail orchestrator.
 
@@ -259,7 +327,8 @@ class GuardrailEngine:
         # restored into a tool only when it is trusted or that tool produced it;
         # a placeholder with no record (legacy or corrupt state, or minted from
         # model output) is restored nowhere until its origin is seen again.
-        self._projected: OrderedDict[bytes, tuple[list[Finding], str | None]] = OrderedDict()
+        self._projected: OrderedDict[bytes, _Projection] = OrderedDict()
+        self._projection_owner = object()
         self._trusted: set[str] = set()
         self._tool_origins: dict[str, set[str]] = {}
         if self._allowlisted:
@@ -429,32 +498,49 @@ class GuardrailEngine:
         self, msg: Message, *, index: int | None = None
     ) -> tuple[Message, list[Finding], str | None]:
         """Project a format-2 boundary once; retain bounded digests, never history."""
-        from dendrux.types import TextPart
-
-        def digest(message: Message) -> bytes:
-            value = (
-                message.role.value,
-                message.name,
-                message.content,
-                [p.text if isinstance(p, TextPart) else None for p in message.parts]
-                if message.parts is not None
-                else None,
-            )
-            return hashlib.sha256(json.dumps(value, ensure_ascii=False).encode()).digest()
-
-        key = digest(msg)
-        previous = self._projected.get(key)
+        key = _message_digest(msg)
+        previous = getattr(msg, "_guardrail_projection", None)
+        if (
+            not isinstance(previous, _Projection)
+            or previous.owner is not self._projection_owner
+            or previous.digest != key
+        ):
+            previous = None if hasattr(msg, "_guardrail_projection") else self._projected.get(key)
         if previous is not None:
-            self._projected.move_to_end(key)
-            return msg, previous[0], previous[1]
+            blocked = previous.blocked
+            if blocked is not None:
+                blocked = blocked.replace(previous.location, _message_location(msg, index), 1)
+            if previous.findings or previous.redacted:
+                msg = _with_projection(
+                    msg,
+                    previous,
+                    copy=previous.redacted or not hasattr(msg, "_guardrail_projection"),
+                )
+            return msg, previous.findings, blocked
         cleaned, findings, blocked = await self.scan_incoming_message(msg, index=index)
-        # Keep block evidence so projection at persistence cannot bypass the
-        # loop's governance handling at the subsequent provider boundary.
-        if len(findings) <= _PROJECTED_FINDINGS_LIMIT:
-            self._projected[digest(cleaned)] = (findings, blocked)
+        evidence = _Projection(
+            self._projection_owner,
+            _message_digest(cleaned),
+            _ProjectionFindings(findings),
+            blocked,
+            cleaned is not msg,
+            _message_location(msg, index),
+        )
+        if findings or evidence.redacted:
+            cleaned = _with_projection(cleaned, evidence, copy=cleaned is msg)
+        self._projected[evidence.digest] = evidence
         if len(self._projected) > _PROJECTION_CACHE_LIMIT:
             self._projected.popitem(last=False)
-        return cleaned, findings, blocked
+        return cleaned, evidence.findings, blocked
+
+    def projected_redaction(self, message: Message) -> bool:
+        """Whether this engine's projection changed the message's text."""
+        evidence = getattr(message, "_guardrail_projection", None)
+        return (
+            isinstance(evidence, _Projection)
+            and evidence.owner is self._projection_owner
+            and evidence.redacted
+        )
 
     async def scan_incoming_message(
         self, msg: Message, *, index: int | None = None

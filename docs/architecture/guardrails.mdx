@@ -286,6 +286,12 @@ governance events:
 
 The blocked event, a terminal `run.error` (not `run.completed`, which a blocked run ended with before 0.5.0) and no LLM call. The run row gets the same safe `error` and `failure_reason="guardrail_blocked"`. The message carries the pattern name, a count and a location (message index counting the system prompt as message 0, role, and the tool call id for tool results), and never the matched text, so a reader can see which rule fired and where without the secret being copied into the stored events.
 
+In format 2, projection may happen before persistence and be reused at the provider
+boundary. Cached projections still emit `guardrail.redacted` through the store and
+notifier, and block locations use the message's current request index, including for
+submitted tool results. Reconstructed placeholder text is not counted as a fresh
+finding after resume; counts can be lower than a format-1 raw-history rescan.
+
 ## Prompt injection — domain-specific by design
 
 `PromptInjection` is the third built-in. It targets the "ignore previous instructions" / "reveal the system prompt" / hidden-comment / ChatML-token class of attacks, and it covers two boundaries simultaneously:

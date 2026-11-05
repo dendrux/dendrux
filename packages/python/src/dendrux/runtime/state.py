@@ -373,6 +373,7 @@ PAUSE_SUMMARY_KEYS = (
     "pause_reason",
     "pause_message",
     "pause_id",
+    "clarification",
     FailureReason.BUDGET_EXCEEDED.value,
 )
 

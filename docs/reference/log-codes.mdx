@@ -164,6 +164,7 @@ Missing or invalid codes remain unset. Category and HTTP status remain independe
 | `never_started` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | Sweep finalizes a stale run that never started. | Inspect worker startup and retry with a new run. |
 | `not_running` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | Reclaim targets a run that is no longer running. | Read the current result before retrying recovery. |
 | `pause_format_unsupported` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | A stored pause format is unsupported. | Upgrade every worker before continuing the run. |
+| `pause_summary_truncated` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | A human-input display summary exceeded its byte bound. | Read the full model turn or raise max_pause_summary_bytes. |
 | `reclaim_limit` | WARNING | `attempt`, `code`, `kind`, `run_id`, `tenant_id` | A run reaches its reclaim attempt limit. | Alert at any rate and inspect worker crashes. |
 | `recovery_call_missing` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | Recovery cannot locate a checkpointed tool call. | Inspect durable tool rows before restarting the run. |
 | `recovery_scan_limit` | WARNING | `code`, `kind`, `limit`, `run_id`, `tenant_id` | A recovery scan bound exceeds the supported maximum. | Reduce the scan bound. |

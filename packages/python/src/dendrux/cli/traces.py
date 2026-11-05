@@ -22,7 +22,7 @@ DEFAULT_TRACE_LIMIT = 200
 _TRACE_TEXT_CHARS = 500
 
 if TYPE_CHECKING:
-    from dendrux.runtime.state import TraceRecord
+    from dendrux.runtime.state import RunRecord, StateStore, TraceRecord
 
 MAX_ROWS = MAX_PAGE
 
@@ -38,6 +38,23 @@ def show_traces(
 ) -> None:
     """Show the conversation trace for an agent run."""
     asyncio.run(_show_traces(run_id, tool_calls, limit))
+
+
+async def _read_traces(
+    store: StateStore, run: RunRecord, limit: int, offset: int = 0
+) -> list[TraceRecord]:
+    if run.storage_format == STORAGE_FORMAT_CHECKPOINTED:
+        from dendrux.runtime._public_traces import public_traces
+
+        return await public_traces(
+            store,
+            run.id,
+            tenant_id=run.tenant_id,
+            limit=limit,
+            offset=offset,
+            retry=run.retry_of_run_id is not None,
+        )
+    return await store.get_traces(run.id, limit=limit, offset=offset)
 
 
 async def _show_traces(
@@ -79,17 +96,10 @@ async def _show_traces(
         )
 
         # Fetch and display traces
-        from dendrux.runtime.replay import conversation_records
-
-        async def read_traces(limit: int, offset: int = 0) -> list[TraceRecord]:
-            if run.storage_format == STORAGE_FORMAT_CHECKPOINTED:
-                return await conversation_records(store, run_id, limit=limit, offset=offset)
-            return await store.get_traces(run_id, limit=limit, offset=offset)
-
-        traces = await read_traces(limit)
+        traces = await _read_traces(store, run, limit)
         # Probe one row past the page in a separate read: the store clamps
         # ``limit`` to 1000, so asking for limit + 1 cannot detect overflow at the maximum.
-        more_traces = len(traces) == limit and bool(await read_traces(1, offset=limit))
+        more_traces = len(traces) == limit and bool(await _read_traces(store, run, 1, offset=limit))
         if not traces:
             console.print("[dim]No traces recorded.[/dim]")
         else:

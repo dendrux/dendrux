@@ -259,6 +259,7 @@ async def test_large_clarification_and_serializer_state_rows(store):
     assert json.loads(row.content) == {
         "kind": "clarification",
         "v": 1,
+        "options": [],
         "question": question,
         "pause_message": None,
     }

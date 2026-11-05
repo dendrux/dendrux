@@ -98,7 +98,7 @@ async def test_a7_mixed_resume_corpus(store, flow, entry, approved, large):
         async def complete(self, messages, tools=None, **kwargs):
             tools_seen = [m.call_id for m in messages if m.role == Role.TOOL]
             if tools_seen:
-                assert tools_seen == [call.id for call in calls]
+                assert tools_seen == [calls[1].id, calls[0].id]
                 rebuilt = await rebuild_history(store, kwargs["run_id"])
                 assert [h.message_view(m) for m in messages] == [
                     h.message_view(m) for m in rebuilt.messages
@@ -133,7 +133,7 @@ async def test_a7_mixed_resume_corpus(store, flow, entry, approved, large):
     else:
         result = await agent.resume(paused.run_id, **kwargs)
     assert result.status.value == "success", result.error
-    assert observed == [[call.id for call in calls]]
+    assert observed == [[calls[1].id, calls[0].id]]
     assert not await store.get_traces_after(
         result.run_id, after_order_index=None, kinds=("rewrite",)
     )

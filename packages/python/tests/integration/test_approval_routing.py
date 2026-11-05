@@ -253,9 +253,7 @@ class TestPerCallDecisions:
         final = await _finish_client(agent, store, paused.run_id)
         assert final.status == RunStatus.SUCCESS
         contents = _tool_contents(llm, 1)
-        # Format 2 follows assistant call order; format 1 preserves the
-        # legacy server-then-client order.
-        assert list(contents) == (ids if fmt == 2 else [ids[0], ids[1], ids[3], ids[2]])
+        assert list(contents) == [ids[0], ids[1], ids[3], ids[2]]
         assert json.loads(contents[ids[0]]) == {"denied": "Too large"}
         assert json.loads(contents[ids[3]]) == "Refunded 2"
 

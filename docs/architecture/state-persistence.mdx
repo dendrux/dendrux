@@ -119,7 +119,7 @@ created_at:   2026-10-27 08:29:16.427239
 
 The `order_index` is what guarantees stable ordering. SQL timestamps aren't precise enough (two messages in the same millisecond would tie); `order_index` is monotonic per run.
 
-Format-2 seeds may also have role `system`. After activation a unique index on `(agent_run_id, order_index)` keeps positions distinct. Use `RunStore.get_traces` for effective conversation: it expands the latest rewrite prefix once, includes its suffix and excludes state rows before pagination. It returns the provider form with PII placeholders. Keep reverse mappings behind trusted access.
+Format-2 seeds may also have role `system`. After activation a unique index on `(agent_run_id, order_index)` keeps positions distinct. Use `RunStore.get_traces` for the run's own user, assistant and tool audit rows in their original order, with dense positions. It excludes system prompts, seeded conversation prefixes, rewrite and state rows before pagination; compaction preserves earlier audit rows. Rows beyond the first unfinished tool slot are withheld until preceding observations are committed. Internal reconstruction still uses the system prompt and latest rewrite prefix. It returns the provider form with PII placeholders. Keep reverse mappings behind trusted access.
 
 Sub-agent isolation is **structural**: a sub-agent has its own `agent_run_id`, so its traces are naturally a separate set. No `instance_id` or delegation columns are needed inside this table.
 

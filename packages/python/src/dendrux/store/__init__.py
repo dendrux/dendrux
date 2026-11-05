@@ -387,6 +387,9 @@ class ToolInvocation:
 class TraceEntry:
     """One entry in the conversation trace — user / assistant / tool message.
 
+    System prompts, seeded prefixes and recovery metadata are internal.
+    ``order_index`` counts only the run's own conversation rows.
+
     ``phase`` is ``"commentary"`` or ``"final_answer"`` on assistant entries
     (None for other roles and for rows written before phases were recorded).
     """
@@ -439,6 +442,12 @@ class _InitOnFirstUse:
         self._dispose = dispose
         self._done = False
         self.closed = False
+
+    @property
+    def capabilities(self) -> StoreCapabilities:
+        from dendrux.runtime._capabilities import capabilities
+
+        return capabilities(self._inner)
 
     async def _ensure(self) -> None:
         from sqlalchemy.exc import InvalidRequestError
@@ -1178,7 +1187,12 @@ class RunStore:
     ) -> list[TraceEntry]:
         """Return the conversation trace (user / assistant / tool messages)
         for a run, ordered by ``order_index``. ``limit``/``offset`` push
-        pagination into SQL. SQL stores and the format-2 branch clamp pages
+        pagination into SQL for both formats. Format 2 withholds rows beyond the
+        first pending observation until the preceding slots are filled or the run
+        reaches a terminal status.
+        System prompts and seeded history are excluded before counting rows,
+        positions and pagination. Recovery metadata is not exposed.
+        SQL stores and the format-2 branch clamp pages
         to 1,000; custom format-1 stores receive ``limit`` unchanged. Omitting
         it or exceeding 1,000 warns. In 0.7 the default becomes 1,000 and
         larger limits raise. Empty when the run is outside ``tenant_id``."""
@@ -1187,18 +1201,18 @@ class RunStore:
         check_read_scope(tenant_id)
         _warn_page("get_traces", limit, "offset")
         from dendrux.runtime._capabilities import capabilities
-        from dendrux.runtime.replay import conversation_records
+        from dendrux.runtime._public_traces import public_traces
 
         if capabilities(self._state).checkpointing:
             record = await self._scoped_read(self._state.get_run, run_id, tenant_id)
             if record is not None and record.storage_format == STORAGE_FORMAT_CHECKPOINTED:
-                rows = await conversation_records(
+                rows = await public_traces(
                     self._state,
                     run_id,
                     tenant_id=tenant_id,
-                    scoped=True,
                     limit=_trace_page_limit(limit),
                     offset=offset,
+                    retry=record.retry_of_run_id is not None,
                 )
                 return [_trace_to_public(r) for r in rows]
         rows = await self._scoped_read(

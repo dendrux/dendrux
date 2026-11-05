@@ -111,6 +111,7 @@ An invalid `lease_interval` raises `ValueError`. Declared store capabilities are
 | `max_notes_per_run` | 1000 | `submit_note` per run | `NoteLimitExceededError` (a `ValueError`) |
 | `max_pending_calls` | 64 | One format-2 assistant call batch, before dispatch | Run ends `error` with `failure_reason="pending_limit"` |
 | `max_rebuild_bytes` | 16 MiB | Format-2 conversation reconstruction | `reclaim()` refuses with `history_too_large`; `resume()` raises `InputValidationError` (field `history`, code `history_too_large`) before claiming, so the run stays paused. A `submit_*` continuation has already claimed the run when it hits this limit: it releases the claim and restores the waiting status |
+| `max_pause_summary_bytes` | 64 KiB | Format-2 human-input display summary; UTF-8 JSON, supported range 128 bytes to 512 KiB | Question first, then options; excess text gets `[truncated]` and options that do not fit are omitted. Pause succeeds. Excluded from governance; reclaim uses the configured value |
 | `max_rebuild_rows` | 20,000 | Expanded conversation entries during reconstruction | Same refusal; history is never truncated to continue |
 
 [//]: # "docs-test: skip - fragment: relies on `provider`, defined by setup shown elsewhere"
