@@ -32,7 +32,6 @@ import itertools
 import logging
 import math
 import random
-import re
 import weakref
 from collections import deque
 from dataclasses import dataclass, field
@@ -119,7 +118,6 @@ HINT_PRIORITY_INTERVAL_S = 1.0
 OLDEST_READ_INTERVAL = 20
 
 _NEVER = math.inf
-_ULID = re.compile(r"[0-7][0-9A-HJKMNP-TV-Z]{25}")
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterable, Sequence
@@ -152,11 +150,6 @@ def _tenant_cap(max_followers: int, value: object) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError("max_followers_per_tenant must be a positive int or None.")
     return value
-
-
-def _log_run_id(run_id: str) -> str | None:
-    """Run ids reach logs only in ULID form; anything else is caller data."""
-    return run_id if _ULID.fullmatch(run_id) else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1330,6 +1323,12 @@ class EventFeed:
         stop_timeout_s: float = DEFAULT_STOP_TIMEOUT_S,
         poll_healthy_s: float = DEFAULT_POLL_HEALTHY_S,
     ) -> None:
+        from dendrux.store import RunStore
+
+        if not isinstance(store, RunStore):
+            raise TypeError(
+                "EventFeed requires a RunStore; wrap a state store with RunStore(state_store)."
+            )
         if isinstance(max_followers, bool) or not isinstance(max_followers, int):
             raise ValueError("max_followers must be a positive int.")
         if max_followers <= 0 or buffer <= 0 or status_every <= 0 or batch <= 0:

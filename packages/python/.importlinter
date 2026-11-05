@@ -29,7 +29,7 @@ layers =
     pricing | context_blocks | strategies | media | db
     types : _wire : _lifecycle
     errors | _sentinel | _redact | _meta_keys
-    _codes
+    _codes | _warnings
 
 [importlinter:contract:no-persistence-below-the-runtime]
 name = Core layers know nothing about persistence or the runtime

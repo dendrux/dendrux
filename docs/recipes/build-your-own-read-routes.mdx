@@ -29,7 +29,9 @@ still default to all tenants; your routes must never rely on that default.
 
 ## Pending state and sensitive arguments
 
-In these snippets `store` and `app` are application-owned objects. Your
+In these snippets `store` is an application-owned `RunStore` reader and `app`
+is your web application. Build the reader with `store = RunStore(state_store)`
+over the state store used by your `Agent`. Your
 `current_tenant` dependency authenticates a header credential and resolves its
 tenant. Your `owned_run` dependency additionally verifies that the authenticated
 actor may access the requested run, returning its ID or the same 404 as a missing
@@ -68,13 +70,15 @@ decision. See [Pause ids and stale submits](/docs/architecture/pause-resume#paus
 > **Close the reader at shutdown.** Closing a `Follow` or an `EventFeed` does not close the `RunStore` or stop its shared coordinator. Close the application-owned `RunStore` at shutdown, before you dispose its borrowed engine, in an `async with` or a `finally`; see [Constructors and lifecycle](/docs/reference/run-store#constructors-and-lifecycle).
 
 `follow` reads all watched runs in batches through one coordinator per `RunStore`
-(woken by live updates when you build the reader as `RunStore(store)` over a store that has them; a reader from `from_engine` or `from_database_url` polls) and adds terminal drain, redaction,
+(woken by live updates when you build the reader as `RunStore(state_store)` over a state store that has them; a reader from `from_engine` or `from_database_url` polls) and adds terminal drain, redaction,
 heartbeats, capacity (500 followers per store by default, and 100 per tenant scope)
 and a maximum iteration duration (default 900 seconds). The per-scope cap counts each
 tenant, all untenanted followers together and all `UNSCOPED` followers together,
 so a single-tenant app with more than 100 live readers per process builds
 `EventFeed(store, max_followers_per_tenant=None)` and calls `feed.follow(...)`.
-`EventFeed(store, max_followers=...)` customizes the store cap.
+`EventFeed(store, max_followers=...)` customizes the feed cap. Its first argument
+must be the `RunStore` reader; passing a state store directly raises `TypeError`
+at construction. Reuse the reader and close it before the state store.
 A feed yields a `FollowEnd` with a cursor on terminal drain, lag or duration expiry.
 Reconnect using `Last-Event-ID`; rerun authentication and ownership on every request.
 

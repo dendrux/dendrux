@@ -175,15 +175,12 @@ class LoadedRun:
     traces: list[TraceRecord]
 
 
-async def load_replay_runs(
-    store: StateStore, request: ReplayRequest, *, tenant_id: str | None
-) -> list[LoadedRun]:
-    """Load and validate every run in ``request.runs``. Raises ``ReplayRunError``."""
-    return await _load_replay_runs(store, request, tenant_id=tenant_id, limits=None)
-
-
 async def _load_replay_runs(
-    store: StateStore, request: ReplayRequest, *, tenant_id: str | None, limits: Limits | None
+    store: StateStore,
+    request: ReplayRequest,
+    *,
+    tenant_id: str | None,
+    limits: Limits | None = None,
 ) -> list[LoadedRun]:
     from dendrux.errors import ReplayRunError
     from dendrux.runtime._capabilities import capabilities
@@ -208,6 +205,9 @@ async def _load_replay_runs(
         traces = [t for t in traces if not (t.meta or {}).get(SEED_PREFIX_META_KEY)]
         loaded.append(LoadedRun(record=record, traces=sorted(traces, key=lambda t: t.order_index)))
     return loaded
+
+
+load_replay_runs = _load_replay_runs
 
 
 # ---------------------------------------------------------------------------

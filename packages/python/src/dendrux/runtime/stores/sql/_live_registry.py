@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import hashlib
-import inspect
 import logging
 import warnings
 import weakref
 from typing import Any
 
 from dendrux import _codes
+from dendrux._warnings import _developer_stacklevel
 
 #: Warn above this many open live-update stores against one database per process.
 MANY_STORES_THRESHOLD = 16
@@ -51,13 +51,3 @@ def register(store: Any) -> None:
 
 def deregister(store: Any) -> None:
     _remove(_database_key(store), weakref.ref(store))
-
-
-def _developer_stacklevel() -> int:
-    frame = inspect.currentframe()
-    stacklevel = 0
-    while frame is not None and frame.f_globals.get("__name__", "").startswith("dendrux."):
-        stacklevel += 1
-        frame = frame.f_back
-    del frame
-    return stacklevel
