@@ -86,6 +86,7 @@ async def reclaim(
                 else "single_call",
             ),
             partial(_cancel_claim, store, run_id),
+            run_id=run_id,
         )
         if claim is False:
             raise RunNotReclaimableError(run_id, "already_reclaimed")

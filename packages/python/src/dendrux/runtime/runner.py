@@ -311,6 +311,7 @@ async def _drain_task_cancellation(
     result, _ = await _drain_cleanup(
         _persist_task_cancellation(store, run_id, interrupted=interrupted),
         name=f"cancel-run:{run_id}",
+        run_id=run_id,
     )
     return result
 
@@ -2746,7 +2747,7 @@ async def _create_runtime_run(
     native_store = unclaimed_store(store)
     with _creation_loop_scope(native_store, run_id, _recovery_loop_name(loop)):
         return await _ownership_handoff(
-            store, store.create_run(run_id, agent_name, **kwargs), cancel_created
+            store, store.create_run(run_id, agent_name, **kwargs), cancel_created, run_id=run_id
         )
 
 
@@ -4346,7 +4347,7 @@ def run_stream(
     stream = _RunStream(
         run_id=run_id,
         generator=stream_context.wrap(_generate()),
-        cleanup=lambda: _shielded_cleanup(_cleanup),
+        cleanup=lambda: _shielded_cleanup(_cleanup, run_id=run_id),
     )
     return stream
 
@@ -5713,12 +5714,12 @@ async def _release_claim(store: StateStore, run_id: str, status: str) -> None:
         raise
 
 
-async def _shielded_cleanup(cleanup: Callable[[], Any]) -> Any:
+async def _shielded_cleanup(cleanup: Callable[[], Any], *, run_id: str | None = None) -> Any:
     import anyio
 
     from dendrux.runtime.tasks import _drain_cleanup
 
-    result, cancellation = await _drain_cleanup(cleanup())
+    result, cancellation = await _drain_cleanup(cleanup(), run_id=run_id)
     if cancellation is not None:
         raise cancellation
     await anyio.lowlevel.checkpoint_if_cancelled()
@@ -6963,7 +6964,7 @@ def resume_stream(
     return _RunStream(
         run_id=run_id,
         generator=stream_context.wrap(_generate()),
-        cleanup=lambda: _shielded_cleanup(_cleanup),
+        cleanup=lambda: _shielded_cleanup(_cleanup, run_id=run_id),
     )
 
 

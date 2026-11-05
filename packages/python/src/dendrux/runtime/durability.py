@@ -47,7 +47,7 @@ from dendrux.runtime.stores._errors import _is_connection_loss_code, classify_er
 _EXCEPTION_WALK_LIMIT = 1024
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Callable, Coroutine
+    from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
 
 logger = logging.getLogger(__name__)
 
@@ -122,12 +122,11 @@ _handoff_commit: ContextVar[dict[str, Any] | None] = ContextVar(
 def _mark_commit_issued() -> None:
     marker = _handoff_commit.get()
     if marker is not None:
-        operation = _database_operation.get()
-        marker.update(issued=True, run_id=operation[2].get("run_id") if operation else None)
+        marker["issued"] = True
 
 
 async def _without_live_flush(
-    store: Any, operation: Coroutine[Any, Any, T], marker: dict[str, Any] | None = None
+    store: Any, operation: Awaitable[T], marker: dict[str, Any] | None = None
 ) -> T:
     token = _handoff_commit.set(marker)
     try:
@@ -137,18 +136,24 @@ async def _without_live_flush(
         _handoff_commit.reset(token)
 
 
+def _log_handoff_failure(marker: dict[str, Any], run_id: str) -> None:
+    code = _codes.CANCEL_PERSIST_FAILED if marker.get("issued") else _codes.PERSISTENCE_ERROR
+    _codes.log_code(logger, code, run_id=run_id)
+
+
 async def _cancel_handoff(
     store: Any,
     task: asyncio.Task[T],
     on_cancel: Callable[[T], Coroutine[Any, Any, Any]],
     marker: dict[str, Any],
+    run_id: str,
 ) -> None:
     try:
         async with asyncio.timeout(_OWNERSHIP_DEADLINE_S):
             result = await task
             await _without_live_flush(store, on_cancel(result))
     except Exception:
-        _codes.log_code(logger, _codes.CANCEL_PERSIST_FAILED, run_id=marker.get("run_id"))
+        _log_handoff_failure(marker, run_id)
     finally:
         # LiveUpdates supplies its own flush deadline. Do this once even when
         # cleanup times out; hints never decide whether cleanup runs.
@@ -158,8 +163,10 @@ async def _cancel_handoff(
 
 async def _ownership_handoff(
     store: Any,
-    operation: Coroutine[Any, Any, T],
+    operation: Awaitable[T],
     on_cancel: Callable[[T], Coroutine[Any, Any, Any]],
+    *,
+    run_id: str,
 ) -> T:
     from dendrux.runtime.state import unclaimed_store
     from dendrux.runtime.tasks import _drain_cleanup
@@ -176,12 +183,17 @@ async def _ownership_handoff(
         if not marker.get("issued"):
             task.cancel()
         try:
-            await _drain_cleanup(_cancel_handoff(native, task, on_cancel, marker))
+            await _drain_cleanup(
+                _cancel_handoff(native, task, on_cancel, marker, run_id), run_id=run_id
+            )
         except Exception:
-            _codes.log_code(logger, _codes.CANCEL_PERSIST_FAILED, run_id=marker.get("run_id"))
+            _log_handoff_failure(marker, run_id)
         finally:
-            operation.close()  # Also close an operation whose child was cancelled before starting.
-            raise cancellation
+            try:
+                if inspect.iscoroutine(operation):
+                    operation.close()  # The child may have been cancelled before its first step.
+            finally:
+                raise cancellation
 
 
 @asynccontextmanager
