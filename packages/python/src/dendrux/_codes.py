@@ -920,6 +920,14 @@ HISTORY_TOO_LARGE = Code(
     "Conversation rebuild exceeds its bound.",
     "Reduce history or raise the documented rebuild bound.",
 )
+PAUSE_SUMMARY_TRUNCATED = Code(
+    "pause_summary_truncated",
+    logging.WARNING,
+    "recovery",
+    _BASE_FIELDS,
+    "A human-input display summary exceeded its byte bound.",
+    "Read the full model turn or raise max_pause_summary_bytes.",
+)
 PAUSE_FORMAT_UNSUPPORTED = Code(
     "pause_format_unsupported",
     logging.WARNING,
@@ -1982,6 +1990,7 @@ REGISTRY = MappingProxyType(
             LEASE_LOST,
             HISTORY_TOO_LARGE,
             PAUSE_FORMAT_UNSUPPORTED,
+            PAUSE_SUMMARY_TRUNCATED,
             STORE_CAPABILITY,
             STORE_STATEMENT_LIMIT,
             SKILLS_SESSION_UNKNOWN,

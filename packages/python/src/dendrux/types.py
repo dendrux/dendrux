@@ -1101,6 +1101,8 @@ class Limits:
         max_pending_calls: Most calls in one format-2 assistant batch. Default 64.
         max_rebuild_bytes: Largest recovered conversation, in UTF-8 JSON bytes.
             Default 16 MiB.
+        max_pause_summary_bytes: Maximum JSON bytes in a saved human-input display
+            summary. Default 64 KiB; 128 bytes to 512 KiB. Excess text is truncated.
         max_rebuild_rows: Most expanded entries in a recovered conversation.
             Default 20,000.
 
@@ -1115,8 +1117,15 @@ class Limits:
     max_pending_calls: int = 64
     max_rebuild_bytes: int = 16 * _MIB
     max_rebuild_rows: int = 20_000
+    max_pause_summary_bytes: int = 65536
 
     def __post_init__(self) -> None:
+        if (
+            type(self.max_pause_summary_bytes) is not int
+            or not 128 <= self.max_pause_summary_bytes <= 524288
+        ):
+            _codes.log_code(logger, _codes.INVALID_LIMIT, run_id=None)
+            raise ValueError("max_pause_summary_bytes must be an integer from 128 to 524288")
         for name in (
             "max_tool_result_bytes",
             "max_input_bytes",
@@ -1530,12 +1539,11 @@ class ImageViewState:
 class PauseState:
     """Everything needed to resume a paused agent run.
 
-    This is execution state, not observability state. It is persisted
-    raw in pause_data (JSON column) and cleared on finalize — the DB
-    is ground truth across traces, tool_calls, and pause_data alike.
-    Guardrail redaction (placeholders) applies only at the LLM-call
-    boundary; the bijection lives on agent_runs.pii_mapping for audit
-    replay.
+    Persisted in pause_data and cleared on finalize. Format 1 stores the
+    history and steps; format 2 stores recovery references and a bounded
+    clarification summary. The question and options retain model text,
+    including PII placeholders. The PII bijection lives on agent_runs.pii_mapping.
+    Format-2 conversation checkpoints retain the provider-ready message view.
     """
 
     agent_name: str
@@ -1578,6 +1586,7 @@ class PauseState:
     provider_kwargs: dict[str, Any] = field(default_factory=dict)
     image_view_ref: str | None = None
     loop_state_ref: bool = False
+    clarification: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to JSON-compatible dict for DB storage.
@@ -1627,11 +1636,7 @@ class PauseState:
             if k in {"model", "max_tokens", "temperature", "thinking", "effort"}
         }
         if self.schema_version == 2:
-            for key in ("history", "steps", "image_view"):
-                d.pop(key, None)
-            d["image_view_ref"] = self.image_view_ref
-            d["loop_state_ref"] = True
-            d["provider_kwargs"] = dict(self.provider_kwargs)
+            self._checkpoint_fields(d)
         # Validate JSON safety — catch non-serializable meta values early
         try:
             json.dumps(d)
@@ -1641,6 +1646,15 @@ class PauseState:
                 f"Ensure all Message.meta and AgentStep.meta values are JSON-safe."
             ) from e
         return d
+
+    def _checkpoint_fields(self, d: dict[str, Any]) -> None:
+        for key in ("history", "steps", "image_view"):
+            d.pop(key, None)
+        if self.clarification is not None:
+            d["clarification"] = self.clarification
+        d["image_view_ref"] = self.image_view_ref
+        d["loop_state_ref"] = True
+        d["provider_kwargs"] = dict(self.provider_kwargs)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> PauseState:
@@ -1683,6 +1697,7 @@ class PauseState:
             schema_version=data.get("schema_version") or 1,
             image_view_ref=data.get("image_view_ref"),
             loop_state_ref=bool(data.get("loop_state_ref", False)),
+            clarification=data.get("clarification"),
             provider_kwargs={
                 k: v
                 for k, v in (data.get("provider_kwargs") or {}).items()

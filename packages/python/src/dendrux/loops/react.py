@@ -673,6 +673,7 @@ def _bind_checkpoint(
         bind(
             lambda: {
                 "loop": loop_type,
+                "limits": agent._limits,
                 "format_result": lambda result: _format_result(strategy, result),
                 "idempotent": {t.name: t.idempotent for t in tool_defs},
                 "steps": state.steps,
@@ -2114,6 +2115,11 @@ def _pause_result(
 async def _clarification_result(
     ctx: _RunContext, response: LLMResponse, action: Clarification, iteration: int
 ) -> RunResult:
+    prepare = getattr(ctx.recorder, "prepare_clarification", None)
+    if prepare is not None:
+        response, step = prepare(response, ctx.state.steps[-1])
+        ctx.state.steps[-1] = step
+        action = step.action
     await _append_turn(ctx, response, iteration, phase="final_answer")
     return _pause_result(
         ctx, RunStatus.WAITING_HUMAN_INPUT, iteration, pending_calls=[], answer=action.question

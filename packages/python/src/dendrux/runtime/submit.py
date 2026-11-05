@@ -1156,6 +1156,24 @@ def _invalid_json_constant(value: str) -> NoReturn:
     raise ValueError("non-finite JSON number")
 
 
+def _governed_limits(limits: Any) -> dict[str, Any]:
+    from dendrux.types import Limits
+
+    defaults = Limits()
+    recovery_bounds = {
+        "max_pending_calls",
+        "max_rebuild_bytes",
+        "max_rebuild_rows",
+        "max_pause_summary_bytes",
+    }
+    # Default recovery bounds preserve older governance snapshots; overrides remain governed.
+    return {
+        key: value
+        for key, value in asdict(limits).items()
+        if key not in recovery_bounds or value != getattr(defaults, key)
+    }
+
+
 def governance_snapshot(agent: Agent) -> dict[str, Any]:
     """Versioned digests of stable governance configuration, never object reprs.
 
@@ -1198,17 +1216,7 @@ def governance_snapshot(agent: Agent) -> dict[str, Any]:
             }
         )
     budget = agent.budget
-    from dendrux.types import Limits
-
-    defaults = Limits()
-    recovery_bounds = {"max_pending_calls", "max_rebuild_bytes", "max_rebuild_rows"}
-    # Default recovery bounds must not invalidate pre-0.6 governance snapshots.
-    # Explicit overrides remain governed, so changing one still requires policy.
-    limits = {
-        key: value
-        for key, value in asdict(agent._limits).items()
-        if key not in recovery_bounds or value != getattr(defaults, key)
-    }
+    limits = _governed_limits(agent._limits)
     parts = {
         "guardrails": guards,
         "before_tool": qualified(agent.before_tool) if agent.before_tool else None,

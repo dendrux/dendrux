@@ -45,6 +45,7 @@ from dendrux._meta_keys import (
 )
 from dendrux._meta_keys import (
     MESSAGE_META_KEY,
+    NOT_EXECUTED_META_KEY,
     OBSERVATION_META_KEY,
     SEED_PREFIX_META_KEY,
     STEP_META_KEY,
@@ -57,6 +58,7 @@ from dendrux.loops.base import BaseRecorder
 from dendrux.runtime._blob_catalog import edges_for_parts, scrub_inline_images
 from dendrux.runtime._cancel_guard import capture
 from dendrux.runtime._capabilities import capabilities
+from dendrux.runtime._clarification import DEFAULT_PAUSE_SUMMARY_BYTES, clarification_summary
 from dendrux.runtime.durability import retry_critical, retry_transient_db
 from dendrux.runtime.state import read_run_control
 from dendrux.types import (
@@ -88,6 +90,27 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+
+def _paused_call(call: dict[str, Any], pause: Any) -> dict[str, Any]:
+    """Retain decisions already made and assign the remaining pause gates."""
+    call = {**call, "decision_id": call.get("decision_id")}
+    call_id = call["call_id"]
+    decided = call["phase"] in ("approved", "rejected") and call_id in (
+        pause.pending_decisions or {}
+    )
+    if decided:
+        return call
+    if call_id in (pause.approval_gates or {}):
+        call.update(phase="gated", decision_id=f"{pause.pause_id}:{call_id}")
+    elif call.get("target") == "client":
+        call["phase"] = "client"
+    return call
+
+
+def _pause_pending(pending: list[dict[str, Any]], pause: Any) -> list[dict[str, Any]]:
+    remaining = {tc.id for tc in pause.pending_tool_calls}
+    return [_paused_call(call, pause) for call in pending if call["call_id"] in remaining]
 
 
 def _tool_call_evidence(tc: ToolCall) -> dict[str, Any]:
@@ -276,7 +299,11 @@ def _planned_call(
 
 
 def _plan_assistant(
-    plan: _MessagePlan, last_step: AgentStep | None, atomic_completion: bool
+    plan: _MessagePlan,
+    last_step: AgentStep | None,
+    atomic_completion: bool,
+    pause_summary_bytes: int = DEFAULT_PAUSE_SUMMARY_BYTES,
+    run_id: str | None = None,
 ) -> _MessagePlan:
     from dendrux.types import Clarification
 
@@ -284,7 +311,16 @@ def _plan_assistant(
         phase = "awaiting_input"
         return replace(
             plan,
-            clarification={"v": 1, "question": last_step.action.question, "pause_message": None},
+            clarification={
+                "v": 1,
+                **clarification_summary(
+                    last_step.action.question,
+                    last_step.action.options,
+                    max_bytes=pause_summary_bytes,
+                    run_id=run_id,
+                ),
+                "pause_message": None,
+            },
             phase_after_state=phase,
         )
     # A kill before the final transaction must leave model_next: there is
@@ -294,11 +330,21 @@ def _plan_assistant(
 
 
 def _message_position(
-    call_id: str | None, pending: list[dict[str, Any]], phase: str | None, order_index: int
+    call_id: str | None,
+    pending: list[dict[str, Any]],
+    phase: str | None,
+    order_index: int,
+    rejected: bool = False,
 ) -> tuple[int, list[dict[str, Any]], str | None, int]:
     reserved = next((p for p in pending if p["call_id"] == call_id), None)
     if reserved is None:
         return order_index, pending, phase, 1
+    if rejected:
+        first = min(pending, key=lambda p: p["order_index"])
+        first["order_index"], reserved["order_index"] = (
+            reserved["order_index"],
+            first["order_index"],
+        )
     pending = [p for p in pending if p["call_id"] != call_id]
     phase = "dispatch" if pending else "model_next"
     return reserved["order_index"], pending, phase, 0
@@ -317,10 +363,14 @@ def _plan_message(
     gates: Collection[str],
     denied: Collection[str],
     atomic_completion: bool,
+    pause_summary_bytes: int = DEFAULT_PAUSE_SUMMARY_BYTES,
+    run_id: str | None = None,
 ) -> _MessagePlan:
     from dendrux.types import _step_to_dict
 
-    order, pending, phase, delta = _message_position(message.call_id, pending, phase, order_index)
+    order, pending, phase, delta = _message_position(
+        message.call_id, pending, phase, order_index, bool(message.meta.get(NOT_EXECUTED_META_KEY))
+    )
     trace = _message_trace(message, order, trace_id, tenant_scope=tenant_scope)
     if message.role.value == "assistant" and last_step is not None:
         trace.meta[STEP_META_KEY] = _step_to_dict(last_step)
@@ -333,7 +383,7 @@ def _plan_message(
         phase = "dispatch"
     plan = _MessagePlan(trace, pending, phase, delta)
     if message.role.value == "assistant" and not message.tool_calls:
-        return _plan_assistant(plan, last_step, atomic_completion)
+        return _plan_assistant(plan, last_step, atomic_completion, pause_summary_bytes, run_id)
     return plan
 
 
@@ -353,6 +403,7 @@ def seed_trace_kwargs(
     own_index = max((i for i, m in enumerate(messages) if m.role.value == "user"), default=-1)
     for i, trace in enumerate(traces):
         trace.meta[SEED_PREFIX_META_KEY] = i < own_index
+        trace.meta["iteration"] = 0
         if i == own_index and own_input is not None:
             traces[i] = replace(
                 trace, content=own_input.content, meta={**trace.meta, **own_input.meta}
@@ -447,6 +498,7 @@ class PersistenceRecorder(BaseRecorder):
         self._final_trace: Any = None
         self._resume_pause_data: dict[str, Any] | None = None
         self._history_limits: Limits | None = None
+        self._pause_summary_bytes = DEFAULT_PAUSE_SUMMARY_BYTES
 
     async def restore_history(self, *, limits: Any, records: Any = None) -> None:
         self._history_limits = limits
@@ -495,7 +547,9 @@ class PersistenceRecorder(BaseRecorder):
             return
         self._loop_source = source
         live = source()
-        from dendrux.types import _validate_provider_kwargs
+        from dendrux.types import Limits, _validate_provider_kwargs
+
+        self._pause_summary_bytes = (live.get("limits") or Limits()).max_pause_summary_bytes
 
         _validate_provider_kwargs(live.get("provider_kwargs", {}), run_id=self._run_id)
         self._tool_idempotent = live.get("idempotent", {})
@@ -687,6 +741,7 @@ class PersistenceRecorder(BaseRecorder):
             call = pending.get(message.call_id or "")
             order = call["order_index"] if call else descriptor["reserved_order_index"] + i
             traces.append(message_trace(message, order, tenant_scope=self._tenant_scope))
+            traces[-1].meta["iteration"] = int(self._loop_state.get("iteration", 0))
             self._order_index = max(self._order_index, order + 1)
             if message.call_id is not None:
                 removed.append(message.call_id)
@@ -758,7 +813,7 @@ class PersistenceRecorder(BaseRecorder):
         self._durable_state = deepcopy(self._loop_state)
 
     def order_observations(self, history: list[Message]) -> None:
-        """Use reserved call order for each format-2 batch, including resumed batches."""
+        """Keep validation results first, followed by reserved execution order."""
         if not self._format2:
             return
         order: dict[str, int] = {}
@@ -767,7 +822,13 @@ class PersistenceRecorder(BaseRecorder):
             if message is not None and message.role.value == "tool":
                 continue
             history[start:i] = sorted(
-                history[start:i], key=lambda m: order.get(m.call_id or "", len(order))
+                history[start:i],
+                key=lambda m: (
+                    0 if m.meta.get(NOT_EXECUTED_META_KEY) else 1,
+                    0
+                    if m.meta.get(NOT_EXECUTED_META_KEY)
+                    else order.get(m.call_id or "", len(order)),
+                ),
             )
             if message is not None and message.tool_calls:
                 order = {tc.id: n for n, tc in enumerate(message.tool_calls)}
@@ -858,41 +919,56 @@ class PersistenceRecorder(BaseRecorder):
                 RunStatus.WAITING_CLIENT_TOOL.value: "awaiting_client",
                 RunStatus.WAITING_HUMAN_INPUT.value: "awaiting_input",
             }.get(result.status.value, "model_next")
-            gates = pause.approval_gates or {}
-            remaining = {tc.id for tc in pause.pending_tool_calls}
-            self._loop_state["pending"] = [
-                {
-                    **p,
-                    "phase": p["phase"]
-                    if p["phase"] in ("approved", "rejected")
-                    and p["call_id"] in (pause.pending_decisions or {})
-                    else "gated"
-                    if p["call_id"] in gates
-                    else "client"
-                    if p.get("target") == "client"
-                    else p["phase"],
-                    "decision_id": p.get("decision_id")
-                    if p["phase"] in ("approved", "rejected")
-                    and p["call_id"] in (pause.pending_decisions or {})
-                    else f"{pause.pause_id}:{p['call_id']}"
-                    if p["call_id"] in gates
-                    else p.get("decision_id"),
-                }
-                for p in self._loop_state.get("pending", [])
-                if p["call_id"] in remaining
-            ]
+            self._loop_state["pending"] = _pause_pending(self._loop_state.get("pending", []), pause)
             if result.status.value == RunStatus.WAITING_HUMAN_INPUT.value:
-                await self._state_ref(
-                    "clarification",
-                    {
-                        "v": 1,
-                        "question": result.answer or "",
-                        "pause_message": pause.pause_message,
-                    },
-                )
+                await self._checkpoint_clarification(result, pause)
         else:
             self._loop_state["phase"] = "finalizing"
         await self._checkpoint()
+
+    def prepare_clarification(self, response: Any, step: Any) -> tuple[Any, Any]:
+        """Bound a format-2 question before it becomes history needed to resume."""
+        from dendrux.types import Clarification
+
+        if not self._format2 or not isinstance(step.action, Clarification):
+            return response, step
+        action = step.action
+        summary = clarification_summary(
+            action.question,
+            action.options,
+            max_bytes=self._pause_summary_bytes,
+            run_id=self._run_id,
+        )
+        if summary == {"question": action.question, "options": action.options}:
+            return response, step
+        bounded = Clarification(question=summary["question"], options=summary["options"])
+        return replace(response, text=bounded.question), replace(
+            step, action=bounded, raw_response=None
+        )
+
+    async def _checkpoint_clarification(self, result: Any, pause: Any) -> None:
+        from dendrux.types import Clarification
+
+        action = pause.steps[-1].action if pause.steps else None
+        options = (
+            action.options
+            if isinstance(action, Clarification)
+            else (pause.clarification or {}).get("options", [])
+        )
+        pause.clarification = clarification_summary(
+            result.answer or "",
+            options,
+            max_bytes=self._pause_summary_bytes,
+            run_id=self._run_id,
+        )
+        await self._state_ref(
+            "clarification",
+            {
+                "v": 1,
+                **pause.clarification,
+                "pause_message": pause.pause_message,
+            },
+        )
 
     def check_lease(self) -> None:
         from dendrux.runtime.context import get_delegation_context
@@ -991,7 +1067,10 @@ class PersistenceRecorder(BaseRecorder):
             gates=data.get("approval_tools", ()),
             denied=data.get("denied_tools", ()),
             atomic_completion=capabilities(self._store).atomic_completion,
+            pause_summary_bytes=self._pause_summary_bytes,
+            run_id=self._run_id,
         )
+        plan.trace.meta["iteration"] = iteration
         await self._apply_message_plan(plan)
 
     async def _apply_message_plan(self, plan: _MessagePlan) -> None:
@@ -1459,6 +1538,7 @@ class PersistenceRecorder(BaseRecorder):
             observation_trace = message_trace(
                 message, pending["order_index"], tenant_scope=self._tenant_scope
             )
+            observation_trace.meta["iteration"] = iteration
             event = EventWrite(
                 generate_ulid(),
                 StoredEventType.TOOL_COMPLETED.value,

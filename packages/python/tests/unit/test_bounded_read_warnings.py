@@ -130,14 +130,14 @@ async def test_invalid_filters_do_not_warn_or_read(method, kwargs):
 
 async def test_format_two_clamp_is_at_facade_only(monkeypatch):
     from dendrux._lifecycle import STORAGE_FORMAT_CHECKPOINTED
-    from dendrux.runtime import replay
+    from dendrux.runtime import _public_traces
 
     class CheckpointStore(ExplodingStore):
         capabilities = StoreCapabilities(checkpointing=True, deployment="multi_server")
 
         async def get_run(self, run_id, *, tenant_id):
             assert tenant_id == "tenant"
-            return SimpleNamespace(storage_format=STORAGE_FORMAT_CHECKPOINTED)
+            return SimpleNamespace(storage_format=STORAGE_FORMAT_CHECKPOINTED, retry_of_run_id=None)
 
     seen = []
 
@@ -145,7 +145,7 @@ async def test_format_two_clamp_is_at_facade_only(monkeypatch):
         seen.append(kwargs)
         return []
 
-    monkeypatch.setattr(replay, "conversation_records", records)
+    monkeypatch.setattr(_public_traces, "public_traces", records)
     with pytest.warns(FutureWarning):
         assert (
             await RunStore(CheckpointStore()).get_traces(
@@ -153,7 +153,7 @@ async def test_format_two_clamp_is_at_facade_only(monkeypatch):
             )
             == []
         )
-    assert seen == [{"tenant_id": "tenant", "scoped": True, "limit": 1000, "offset": 23}]
+    assert seen == [{"tenant_id": "tenant", "limit": 1000, "offset": 23, "retry": False}]
 
 
 async def test_warning_uses_stdlib_deduplication():
