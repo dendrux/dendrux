@@ -259,11 +259,12 @@ async def test_cleanup_deadline_and_hint_deadline_are_joined(store, engine, monk
     bus = GateBus()
     bus.flush_deadline_s = bus.send_timeout_s = 0.05
     sends = []
+    release = asyncio.Event()  # Only set on failure, so a regression fails by name.
 
     async def blocked_send(messages):
         sends.append(messages)
         bus.entered.set()
-        await asyncio.Event().wait()
+        await release.wait()
 
     monkeypatch.setattr(bus, "send", blocked_send)
     monkeypatch.setattr(store, "_live_updates", bus)
@@ -273,20 +274,26 @@ async def test_cleanup_deadline_and_hint_deadline_are_joined(store, engine, monk
     async def hung_finalize(*args, **kwargs):
         entered.set()
         try:
-            await asyncio.Event().wait()
+            await release.wait()
         finally:
             stopped.set()
 
     monkeypatch.setattr(store, "finalize_with_event", hung_finalize)
     bus.enabled = True
     task = asyncio.create_task(call)
-    await bus.entered.wait()
-    started = time.monotonic()
-    task.cancel()
-    await entered.wait()
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(task, 0.8)
+    try:
+        await asyncio.wait_for(bus.entered.wait(), 5)
+        started = time.monotonic()
+        task.cancel()
+        await asyncio.wait_for(entered.wait(), 5)
+        task.cancel()
+        done, _ = await asyncio.wait({task}, timeout=0.8)
+        assert done, "caller was not released by the ownership deadline"
+        with pytest.raises(asyncio.CancelledError):
+            task.result()
+    finally:
+        release.set()
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 5)
     assert 0.09 <= time.monotonic() - started < 0.5
     assert len(sends) == 1  # The interrupted hint was lossy; cleanup never committed another.
     assert any(
@@ -305,7 +312,10 @@ async def test_cleanup_deadline_and_hint_deadline_are_joined(store, engine, monk
 
 
 @pytest.mark.parametrize("entry", ["resume", "resume_stream", "submit_tool_results"])
-async def test_legacy_governance_cancel_has_no_epoch_authority(store, engine, monkeypatch, entry):
+@pytest.mark.parametrize("superseded", [False, True])
+async def test_legacy_governance_cancel_has_no_epoch_authority(
+    store, engine, monkeypatch, entry, superseded
+):
     from sqlalchemy import update
 
     from dendrux.runtime import runner, submit
@@ -328,15 +338,16 @@ async def test_legacy_governance_cancel_has_no_epoch_authority(store, engine, mo
     )
     task = asyncio.create_task(call)
     await asyncio.wait_for(entered.wait(), 5)
-    async with engine.begin() as conn:
-        await conn.execute(
-            update(AgentRun).where(AgentRun.id == run_id).values(claim_epoch=epoch + 1)
-        )
+    if superseded:
+        async with engine.begin() as conn:
+            await conn.execute(
+                update(AgentRun).where(AgentRun.id == run_id).values(claim_epoch=epoch + 1)
+            )
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
     row = await store.get_run(run_id)
-    assert row.status == "running" and row.claim_epoch == epoch + 1
+    assert row.status == "running" and row.claim_epoch == epoch + int(superseded)
     assert not any(e.event_type == "run.cancelled" for e in await store.get_run_events(run_id))
     await agent.close()
 

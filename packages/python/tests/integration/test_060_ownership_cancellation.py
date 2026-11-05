@@ -450,16 +450,11 @@ async def test_cancelled_idempotent_create_does_not_own_existing_run(store, monk
     if terminal:
         await store.finalize_run(run_id, status="success")
     before = await store.get_run(run_id)
-    entered, release = asyncio.Event(), asyncio.Event()
-    original = store.create_run
-
-    async def create(*args, **kw):
-        result = await original(*args, **kw)
-        entered.set()
-        await release.wait()
-        return result
-
-    monkeypatch.setattr(store, "create_run", create)
+    bus = GateBus()
+    monkeypatch.setattr(store, "_live_updates", bus)
+    bus.enqueue([run_id])
+    bus.enabled = True
+    entered, release = bus.entered, bus.release
     task = asyncio.create_task(
         _create_runtime_run(store, ReActLoop(), generate_ulid(), "handoff", **kwargs)
     )
