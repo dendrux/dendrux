@@ -36,7 +36,7 @@ Missing or invalid codes remain unset. Category and HTTP status remain independe
 | `live_updates_close_timeout` | WARNING | `code`, `kind`, `run_id`, `tenant_id`, `timeout_s` | Resource shutdown exhausts its deadline. | Check cancellation cooperation in the transport. |
 | `live_updates_degraded` | WARNING | `code`, `error_kind`, `kind`, `run_id`, `tenant_id` | The listener loses its subscription; readers poll. | Check bus connectivity; alert after one minute. |
 | `live_updates_many_stores` | WARNING | `code`, `count`, `database_key`, `kind`, `run_id`, `tenant_id` | Many open stores announce to one database. | Share a store within each process and close unused stores. |
-| `live_updates_missed_hint` | WARNING | `code`, `count`, `kind`, `run_id`, `tenant_id` | A healthy reader discovers changes without a hint after the grace period. | Check that writers and readers use the same bus channel. |
+| `live_updates_missed_hint` | WARNING | `code`, `count`, `kind`, `run_id`, `tenant_id` | A healthy safety poll finds events no hint announced (first discovery per coordinator and generation; heuristic). | Check that writers and readers use the same bus channel. |
 | `live_updates_overflow` | WARNING | `code`, `count`, `kind`, `limit`, `run_id`, `tenant_id` | Pending announcements exceed their bound. | Share stores or raise the pending bound; readers recover by polling. |
 | `live_updates_recovered` | INFO | `code`, `kind`, `run_id`, `tenant_id` | The listener confirms its subscription. | Confirm reader latency returns to normal. |
 | `live_updates_send_failed` | WARNING | `code`, `count`, `error_kind`, `kind`, `run_id`, `tenant_id` | An announcement fails and sending enters backoff. | Check bus connectivity; the database commit is unaffected. |
