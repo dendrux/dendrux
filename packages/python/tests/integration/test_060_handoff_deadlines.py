@@ -231,10 +231,11 @@ async def test_store_failure_never_replaces_caller_cancel(store, engine, monkeyp
 
     monkeypatch.setattr(AsyncSession, "commit", fail)
     continued = []
+    deadline = asyncio.timeout(None)
 
     async def consume():
         if entry == "timeout":
-            async with asyncio.timeout(0.05):
+            async with deadline:
                 await call
         else:
             await call
@@ -243,7 +244,10 @@ async def test_store_failure_never_replaces_caller_cancel(store, engine, monkeyp
     task = asyncio.create_task(consume())
     await entered.wait()
     if entry == "timeout":
-        await asyncio.sleep(0.1)
+        # Expire the caller's own timeout only once COMMIT is in flight.
+        deadline.reschedule(asyncio.get_running_loop().time())
+        while not deadline.expired():
+            await asyncio.sleep(0)
     else:
         task.cancel()
         await asyncio.sleep(0)
