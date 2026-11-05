@@ -3,7 +3,7 @@
 import asyncio
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from dendrux import Agent
@@ -11,7 +11,7 @@ from dendrux.db.models import AgentRun
 from dendrux.llm.mock import MockLLM
 from dendrux.runtime.submit import governance_snapshot
 from dendrux.store import LiveUpdates
-from dendrux.types import LLMResponse, ToolResult
+from dendrux.types import ApprovalDecision, LLMResponse, ToolResult
 from tests._helpers.paused_runs import _pause
 from tests._helpers.recovery_checkpoint import checkpoint, expire
 from tests.integration.test_060_reclaim_agent import make_agent
@@ -25,6 +25,17 @@ ENTRIES = (
     "submit_input",
     "submit_approval",
     "reclaim",
+)
+
+
+BUDGET_ENTRIES = ENTRIES
+ENTRIES += (
+    "retry",
+    "runs",
+    "submit_resume",
+    "resume_paused",
+    "approval_rejected",
+    "approval_decisions",
 )
 
 
@@ -51,14 +62,25 @@ async def consume(stream):
 
 
 async def invocation(entry, store, engine):
-    if entry in ("run", "stream"):
-        provider = MockLLM([LLMResponse(text="done")])
+    if entry in ("run", "stream", "retry", "runs"):
+        provider = MockLLM([LLMResponse(text="done"), LLMResponse(text="again")])
         agent = Agent(name="handoff", prompt="p", provider=provider, state_store=store)
         call = (
             agent.run("go", tenant_id="tenant")
             if entry == "run"
             else consume(agent.stream("go", tenant_id="tenant"))
         )
+        if entry in ("retry", "runs"):
+            call.close()
+            source = await agent.run("source", tenant_id="tenant")
+            if entry == "retry":
+                async with engine.begin() as conn:
+                    await conn.execute(
+                        update(AgentRun).where(AgentRun.id == source.run_id).values(status="error")
+                    )
+                call = agent.retry(source.run_id, tenant_id="tenant")
+            else:
+                call = agent.run("again", runs=[source.run_id], tenant_id="tenant")
         return agent, call, None, 0, lambda: provider._call_count
     if entry == "reclaim":
         agent = make_agent(store)
@@ -74,33 +96,66 @@ async def invocation(entry, store, engine):
         "input"
         if entry == "submit_input"
         else "approval"
-        if entry == "submit_approval"
+        if entry in ("submit_approval", "approval_rejected", "approval_decisions")
+        else "paused"
+        if entry in ("submit_resume", "resume_paused")
         else "client"
     )
     paused = await _pause(kind, store, "tenant")
     raw = await store.get_pause_state(paused.run_id)
+    return (
+        paused.agent,
+        continuation(entry, paused.agent, paused.run_id, raw),
+        paused.run_id,
+        1,
+        lambda: paused.provider.calls,
+    )
+
+
+def continuation(entry, agent, run_id, raw):
     kwargs = dict(tenant_id="tenant", expected_pause_id=raw["pause_id"])
     results = [ToolResult(c["name"], c["id"], '"ok"') for c in raw["pending_tool_calls"]]
-    if entry == "submit_input":
-        call = paused.agent.submit_input(paused.run_id, "answer", **kwargs)
+    if entry == "submit_resume":
+        call = agent.submit_resume(run_id, **kwargs)
+    elif entry == "resume_paused":
+        call = agent.resume(run_id, **kwargs)
+    elif entry == "approval_rejected":
+        call = agent.submit_approval(run_id, approved=False, **kwargs)
+    elif entry == "approval_decisions":
+        call = agent.submit_approval(
+            run_id,
+            decisions={c["id"]: ApprovalDecision.approve() for c in raw["pending_tool_calls"]},
+            **kwargs,
+        )
+    elif entry == "submit_input":
+        call = agent.submit_input(run_id, "answer", **kwargs)
     elif entry == "submit_approval":
-        call = paused.agent.submit_approval(paused.run_id, approved=True, **kwargs)
+        call = agent.submit_approval(run_id, approved=True, **kwargs)
     elif entry == "submit_tool_results":
-        call = paused.agent.submit_tool_results(paused.run_id, results, **kwargs)
+        call = agent.submit_tool_results(run_id, results, **kwargs)
     elif entry == "resume":
-        call = paused.agent.resume(paused.run_id, tool_results=results, **kwargs)
+        call = agent.resume(run_id, tool_results=results, **kwargs)
     else:
-        call = consume(paused.agent.resume_stream(paused.run_id, tool_results=results, **kwargs))
-    return paused.agent, call, paused.run_id, 1, lambda: paused.provider.calls
+        call = consume(agent.resume_stream(run_id, tool_results=results, **kwargs))
+    return call
 
 
 @pytest.mark.parametrize("entry", ENTRIES)
-@pytest.mark.parametrize("boundary", ["hint", "commit_before", "commit_after", "return"])
+@pytest.mark.parametrize("boundary", ["hint", "commit_issued", "commit_after", "return"])
 async def test_cancel_ownership_handoff(store, engine, monkeypatch, entry, boundary):
     bus = GateBus()
     monkeypatch.setattr(store, "_live_updates", bus)
     agent, call, run_id, epoch, calls = await invocation(entry, store, engine)
     before_calls = calls()
+    before_tool_events = (
+        [
+            e.event_type
+            for e in await store.get_run_events(run_id)
+            if e.event_type.startswith("tool.")
+        ]
+        if run_id
+        else []
+    )
     entered, release = asyncio.Event(), asyncio.Event()
     if boundary == "hint":
         bus.enabled = True
@@ -113,7 +168,7 @@ async def test_cancel_ownership_handoff(store, engine, monkeypatch, entry, bound
             nonlocal armed
             gate = armed
             armed = False
-            if gate and boundary == "commit_before":
+            if gate and boundary == "commit_issued":
                 entered.set()
                 await release.wait()
             await original(session)
@@ -125,9 +180,11 @@ async def test_cancel_ownership_handoff(store, engine, monkeypatch, entry, bound
     else:
         method = (
             "create_run"
-            if entry in ("run", "stream")
+            if entry in ("run", "stream", "retry", "runs")
             else "reclaim_run"
             if entry == "reclaim"
+            else "claim_paused_run"
+            if entry in ("submit_resume", "resume_paused")
             else "submit_and_claim"
         )
         original = getattr(store, method)
@@ -150,24 +207,22 @@ async def test_cancel_ownership_handoff(store, engine, monkeypatch, entry, bound
             await asyncio.wait_for(task, 10)
         if run_id is None:
             async with engine.connect() as conn:
-                run_id = (await conn.execute(select(AgentRun.id))).scalar_one_or_none()
-        if boundary == "commit_before" and run_id is None:
-            assert calls() == before_calls  # Cancellation may roll back before COMMIT.
-            return
+                run_id = (
+                    await conn.execute(
+                        select(AgentRun.id)
+                        .order_by(AgentRun.created_at.desc(), AgentRun.id.desc())
+                        .limit(1)
+                    )
+                ).scalar_one_or_none()
         row = await store.get_run(run_id)
-        if boundary == "commit_before" and row.status.startswith("waiting_"):
-            assert row.claim_epoch == epoch - 1
-            return
-        if boundary == "commit_before" and entry == "reclaim" and row.claim_epoch == epoch - 1:
-            expired = await store.get_lease_expired(limit=100, cursor=None)
-            assert any(item.run_id == run_id for item in expired)
-            assert calls() == before_calls
-            return
         assert row.status == "cancelled"
         assert row.claim_epoch == epoch
         assert calls() == before_calls
         events = await store.get_run_events(run_id)
         assert sum(e.event_type == "run.cancelled" for e in events) == 1
+        assert [
+            e.event_type for e in events if e.event_type.startswith("tool.")
+        ] == before_tool_events
         assert not agent._task_manager.is_running(run_id)
     finally:
         release.set()
@@ -248,20 +303,40 @@ async def test_parallel_cancel_at_handoff_has_one_finalize(store, engine, monkey
         await asyncio.wait_for(bus.entered.wait(), 5)
         start = asyncio.Event()
 
+        from dendrux.runtime.runner import _persist_task_cancellation
+        from dendrux.runtime.state import claimed_store
+
+        original = store.finalize_with_event
+        entered = 0
+        ready = asyncio.Event()
+        outcomes = []
+
+        async def finalize(rid, *, claim_epoch=None, **kwargs):
+            nonlocal entered
+            entered += 1
+            if entered == 9:
+                ready.set()
+            await asyncio.wait_for(ready.wait(), 5)
+            result = await original(rid, claim_epoch=claim_epoch, **kwargs)
+            outcomes.append(result)
+            return result
+
+        monkeypatch.setattr(store, "finalize_with_event", finalize)
+
         async def cancel():
             await start.wait()
-            return await agent.cancel_run(run_id, tenant_id="tenant")
+            await _persist_task_cancellation(claimed_store(store, run_id, epoch), run_id)
 
         cancellers = [asyncio.create_task(cancel()) for _ in range(8)]
         start.set()
         task.cancel()
-        results = await asyncio.gather(*cancellers)
+        await asyncio.gather(*cancellers)
         bus.release.set()
         with pytest.raises(asyncio.CancelledError):
             await task
         row = await store.get_run(run_id)
         assert row.status == "cancelled" and row.claim_epoch == epoch
-        assert all(result.status.value in ("running", "cancelled") for result in results)
+        assert entered == 9 and sum(bool(result) for result in outcomes) == 1
         assert calls() == 1
         events = await store.get_run_events(run_id)
         assert sum(e.event_type == "run.cancelled" for e in events) == 1
@@ -306,7 +381,13 @@ async def test_repeated_cancel_during_exact_epoch_cleanup(store, engine, monkeyp
             await asyncio.wait_for(task, 10)
         if run_id is None:
             async with engine.connect() as conn:
-                run_id = (await conn.execute(select(AgentRun.id))).scalar_one()
+                run_id = (
+                    await conn.execute(
+                        select(AgentRun.id)
+                        .order_by(AgentRun.created_at.desc(), AgentRun.id.desc())
+                        .limit(1)
+                    )
+                ).scalar_one()
         row = await store.get_run(run_id)
         assert row.status == "cancelled" and row.claim_epoch == epoch
         assert finalizations == [epoch]
@@ -319,7 +400,7 @@ async def test_repeated_cancel_during_exact_epoch_cleanup(store, engine, monkeyp
         await agent.close()
 
 
-@pytest.mark.parametrize("entry", ENTRIES)
+@pytest.mark.parametrize("entry", BUDGET_ENTRIES)
 @pytest.mark.parametrize("live", [False, True])
 async def test_ownership_handoff_query_count(
     store, engine, monkeypatch, entry, live, record_property
@@ -407,7 +488,13 @@ async def test_handoff_cancellation_cannot_finalize_newer_epoch(store, engine, m
         await asyncio.wait_for(bus.entered.wait(), 5)
         if run_id is None:
             async with engine.connect() as conn:
-                run_id = (await conn.execute(select(AgentRun.id))).scalar_one()
+                run_id = (
+                    await conn.execute(
+                        select(AgentRun.id)
+                        .order_by(AgentRun.created_at.desc(), AgentRun.id.desc())
+                        .limit(1)
+                    )
+                ).scalar_one()
         item = await expire(store, engine, run_id)
         claimed = await store.reclaim_run(
             run_id,

@@ -63,6 +63,7 @@ from dendrux.runtime.durability import (
     _CommitNotAppliedError,
     _enqueue_live_updates,
     _live_updates_page,
+    _mark_commit_issued,
     _safe_database_call,
     retry_transient_db,
     safe_database_operations,
@@ -631,6 +632,7 @@ class SQLStateStore(SQLBlobCatalog):
         try:
             try:
                 commit_issued = True
+                _mark_commit_issued()
                 await session.commit()
             except SQLAlchemyError as error:
                 await _CommitReadback(self, session, operation).resolve(error)

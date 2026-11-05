@@ -5703,17 +5703,14 @@ async def _claim_resume(
 async def _release_claim(store: StateStore, run_id: str, status: str) -> None:
     import sys
 
-    from dendrux.runtime.submit import release_claim
+    from dendrux.runtime.submit import _release_claim_result
 
-    failure = sys.exception()
-    if isinstance(failure, asyncio.CancelledError):
-        await _drain_task_cancellation(store, run_id, False)
-    else:
-        try:
-            await release_claim(store, run_id, status, failure=failure)
-        except asyncio.CancelledError:
-            await _drain_task_cancellation(store, run_id, False)
-            raise
+    epoch = getattr(store, "claim_epoch", True)
+    try:
+        await _release_claim_result(store, run_id, status, epoch, sys.exception())
+    except asyncio.CancelledError as cancellation:
+        await _release_claim_result(store, run_id, status, epoch, cancellation)
+        raise
 
 
 async def _shielded_cleanup(cleanup: Callable[[], Any]) -> Any:

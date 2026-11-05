@@ -439,8 +439,15 @@ async def _cancel_claim(store: StateStore, run_id: str, result: ClaimResult | in
     from dendrux.runtime.runner import _persist_task_cancellation
     from dendrux.runtime.state import claimed_store
 
-    if result:
-        await _persist_task_cancellation(claimed_store(store, run_id, result), run_id)
+    if not result or isinstance(result, bool):
+        import logging
+
+        if result:
+            _codes.log_code(
+                logging.getLogger(__name__), _codes.CANCEL_PERSIST_FAILED, run_id=run_id
+            )
+        return
+    await _persist_task_cancellation(claimed_store(store, run_id, result), run_id)
 
 
 def _claimed_submission_view(
@@ -612,7 +619,7 @@ async def _release_claim_result(
     run_id: str,
     status: str,
     result: ClaimResult | int | bool,
-    failure: BaseException,
+    failure: BaseException | None,
 ) -> None:
     if isinstance(failure, asyncio.CancelledError):
         from dendrux.runtime.tasks import _drain_cleanup
@@ -627,8 +634,6 @@ async def _release_claim_result(
 def _resume_failure_kind(failure: BaseException | None) -> str:
     from dendrux.errors import PersistenceError
 
-    if isinstance(failure, asyncio.CancelledError):
-        return "cancelled"
     if isinstance(failure, PersistenceError):
         return "persistence_error"
     if isinstance(failure, (ValueError, KeyError, TypeError)):

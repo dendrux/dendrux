@@ -158,3 +158,33 @@ async def test_history_rereads_keep_explicit_large_limits(store, monkeypatch, ki
             )
         assert result.status == RunStatus.SUCCESS
         assert observed and all(bound is limits for bound in observed)
+
+
+async def test_retry_replay_keeps_configured_limits(store, engine, monkeypatch):
+    from sqlalchemy import update
+
+    from dendrux.db.models import AgentRun
+    from dendrux.runtime import runner
+
+    limits = Limits(max_rebuild_rows=200_000, max_rebuild_bytes=160 * 1024 * 1024)
+    provider = MockLLM(
+        [LLMResponse(text="one"), LLMResponse(text="two"), LLMResponse(text="three")]
+    )
+    async with Agent(prompt="p", provider=provider, state_store=store, limits=limits) as agent:
+        first = await agent.run("one", tenant_id="tenant")
+        source = await agent.run("two", runs=[first.run_id], tenant_id="tenant")
+        async with engine.begin() as conn:
+            await conn.execute(
+                update(AgentRun).where(AgentRun.id == source.run_id).values(status="error")
+            )
+        observed = []
+        original = runner._load_replay_runs
+
+        async def capture(*args, **kwargs):
+            observed.append(kwargs.get("limits"))
+            return await original(*args, **kwargs)
+
+        monkeypatch.setattr(runner, "_load_replay_runs", capture)
+        result = await agent.retry(source.run_id, tenant_id="tenant")
+        assert result.status == RunStatus.SUCCESS
+        assert observed == [limits]

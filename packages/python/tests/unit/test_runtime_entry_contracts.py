@@ -139,10 +139,9 @@ def test_resume_aborted_view_keeps_only_closed_failure_kinds():
     assert redact_event(replace(event, data={"failure_kind": "private_abort_sentinel"})).data == {}
 
 
-@pytest.mark.parametrize("failure_kind", ["validation_error", "persistence_error", "cancelled"])
+@pytest.mark.parametrize("failure_kind", ["validation_error", "persistence_error", "setup_error"])
 @pytest.mark.parametrize("view", ["raw", "claimed", "kwargs"])
 async def test_legacy_claim_release_publishes_only_safe_failure_kind(failure_kind, view, caplog):
-    import asyncio
     import json
     from types import SimpleNamespace
     from unittest.mock import AsyncMock
@@ -154,7 +153,7 @@ async def test_legacy_claim_release_publishes_only_safe_failure_kind(failure_kin
     failures = {
         "validation_error": ValueError("private_abort_sentinel"),
         "persistence_error": PersistenceError(),
-        "cancelled": asyncio.CancelledError("private_abort_sentinel"),
+        "setup_error": RuntimeError("private_abort_sentinel"),
     }
     released = []
 
