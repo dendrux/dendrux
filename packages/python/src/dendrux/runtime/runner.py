@@ -861,13 +861,7 @@ async def _emit_event_safe(
     data: dict[str, Any] | None = None,
     correlation_id: str | None = None,
 ) -> None:
-    """Best-effort lifecycle event — for use inside streaming error handlers.
-
-    In streaming generators, the error handler itself must not raise
-    (the stream contract promises no exception escapes). This variant
-    logs and swallows persistence failures instead of propagating.
-    Used ONLY in the ``except`` block of streaming generators.
-    """
+    """Best-effort evidence or failure event; ownership fencing still propagates."""
     if state_store is None:
         return
     try:
@@ -876,7 +870,7 @@ async def _emit_event_safe(
         raise
     except Exception:
         logger.warning(
-            "Failed to record %s for run %s (in error handler)",
+            "Failed to record %s for run %s",
             event_type,
             run_id,
             exc_info=safe_exception_info(),
@@ -1398,6 +1392,28 @@ def _terminal_loop_event(result: RunResult) -> tuple[StopReason | None, str, dic
     return stop_reason, event_type, event_data
 
 
+def _completion_evidence(
+    state_store: StateStore,
+    result: RunResult,
+    recorder: LoopRecorder | None,
+    event_type: str,
+    event_data: dict[str, Any],
+) -> dict[str, Any]:
+    from dendrux.runtime._capabilities import capabilities
+    from dendrux.runtime.state import EventWrite
+
+    if getattr(state_store, "storage_format", 1) != STORAGE_FORMAT_CHECKPOINTED:
+        return {}
+    if not capabilities(state_store).atomic_completion:
+        return {}
+    return {
+        "trace": getattr(recorder, "finalization_trace", lambda: None)(),
+        "event": EventWrite(
+            generate_ulid(), event_type, result.iteration_count, event_data, None, None
+        ),
+    }
+
+
 async def _persist_loop_outcome(
     *,
     state_store: StateStore,
@@ -1426,7 +1442,6 @@ async def _persist_loop_outcome(
     the raw LLM output so the dashboard's audit view stays placeholder-faithful.
     """
     from dendrux.guardrails._engine import deanonymize_text
-    from dendrux.runtime._capabilities import capabilities
     from dendrux.runtime.state import _capture_finalized_run
 
     pii_mapping = result.meta.get("pii_mapping") or {}
@@ -1509,15 +1524,10 @@ async def _persist_loop_outcome(
     # that finished — its work and side effects happened.
     _run_pii = result.meta.get("pii_mapping")
     failure_kwargs = _terminal_failure_kwargs(state_store, result)
-    from dendrux.runtime.state import EventWrite
-
     stop_reason, event_type, event_data = _terminal_loop_event(result)
-    atomic_final = (
-        getattr(state_store, "storage_format", 1) == STORAGE_FORMAT_CHECKPOINTED
-        and capabilities(state_store).atomic_completion
-    )
+    atomic_final = getattr(state_store, "finalize_with_event", None) is not None
     if unmapped_placeholders:
-        await _emit_event(
+        await _emit_event_safe(
             state_store,
             run_id,
             GovernanceEventType.GUARDRAIL_UNMAPPED_PLACEHOLDER.value,
@@ -1525,10 +1535,6 @@ async def _persist_loop_outcome(
         )
     with _capture_finalized_run(unclaimed_store(state_store), run_id) as records:
         if atomic_final:
-            event = EventWrite(
-                generate_ulid(), event_type, result.iteration_count, event_data, None, None
-            )
-            final_trace = getattr(recorder, "finalization_trace", lambda: None)()
             finalize_won = (
                 await state_store.finalize_with_event(
                     run_id,
@@ -1541,8 +1547,7 @@ async def _persist_loop_outcome(
                     error=result.error,
                     event_type=event_type,
                     event_data=event_data,
-                    trace=final_trace,
-                    event=event,
+                    **_completion_evidence(state_store, result, recorder, event_type, event_data),
                     **failure_kwargs,
                 )
                 is not None

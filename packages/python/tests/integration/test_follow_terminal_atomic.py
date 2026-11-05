@@ -5,16 +5,23 @@ import asyncio
 import pytest
 
 from dendrux.runtime import runner
-from dendrux.types import generate_ulid
+from dendrux.types import RunResult, RunStatus, generate_ulid
+from tests._fixtures.storage import pin_storage_format
 
 pytestmark = pytest.mark.parametrize("engine", ["postgres"], indirect=True)
 
 
-@pytest.mark.parametrize("kind", ["failure", "cancellation"])
+@pytest.mark.parametrize("kind", ["failure", "cancellation", "success"])
 async def test_finalizer_visibility_and_one_winner(store, engine, monkeypatch, kind):
+    if kind == "success":
+        await pin_storage_format(engine, 1)
     run_id = generate_ulid()
     await store.create_run(run_id, "atomic-terminal")
-    expected = "run.error" if kind == "failure" else "run.cancelled"
+    expected = {
+        "failure": "run.error",
+        "cancellation": "run.cancelled",
+        "success": "run.completed",
+    }[kind]
     observed = []
     for name in ("finalize_run", "finalize_with_event"):
         original = getattr(store, name)
@@ -28,6 +35,13 @@ async def test_finalizer_visibility_and_one_winner(store, engine, monkeypatch, k
         monkeypatch.setattr(store, name, observe)
 
     async def finish():
+        if kind == "success":
+            result = await runner._persist_loop_outcome(
+                state_store=store,
+                run_id=run_id,
+                result=RunResult(run_id=run_id, status=RunStatus.SUCCESS, answer="done"),
+            )
+            return result.meta["_finalize_won"]
         if kind == "failure":
             return await runner._persist_run_failure(store, run_id, RuntimeError("safe"))
         won, _ = await runner._persist_run_cancellation(

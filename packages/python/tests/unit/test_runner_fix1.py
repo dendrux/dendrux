@@ -1,0 +1,61 @@
+"""All storage formats complete atomically and preserve best-effort observations."""
+
+from unittest.mock import AsyncMock
+
+import pytest
+
+from dendrux.runtime import runner
+from dendrux.types import RunResult, RunStatus
+from tests._fixtures.storage import pin_storage_format
+from tests.unit.test_runner_failure_save import store as store
+
+
+@pytest.mark.parametrize("status", [RunStatus.SUCCESS, RunStatus.MAX_ITERATIONS, RunStatus.ERROR])
+@pytest.mark.parametrize("storage_format", [1, 2])
+async def test_terminal_result_uses_atomic_transition(store, monkeypatch, status, storage_format):
+    await pin_storage_format(store._engine, storage_format)
+    await store.create_run("r", "test")
+    store.storage_format = storage_format
+    atomic = AsyncMock(wraps=store.finalize_with_event)
+    split = AsyncMock(wraps=store.finalize_run)
+    monkeypatch.setattr(store, "finalize_with_event", atomic)
+    monkeypatch.setattr(store, "finalize_run", split)
+    await runner._persist_loop_outcome(
+        state_store=store,
+        run_id="r",
+        result=RunResult(run_id="r", status=status, answer="done"),
+    )
+    assert atomic.await_count == 1
+    split.assert_not_awaited()
+    if storage_format == 1:
+        assert "trace" not in atomic.call_args.kwargs
+        assert "event" not in atomic.call_args.kwargs
+    row = await store.get_run("r")
+    assert row.status == status.value and row.answer == "done"
+    assert len(await store.get_run_events("r")) == 1
+
+
+async def test_failed_placeholder_observation_still_persists_answer(store, monkeypatch):
+    await store.create_run("r", "test")
+    emit = runner._emit_event
+
+    async def fail_observation(state, run_id, event_type, *args, **kwargs):
+        if event_type == "guardrail.unmapped_placeholder":
+            raise RuntimeError("evidence unavailable")
+        return await emit(state, run_id, event_type, *args, **kwargs)
+
+    monkeypatch.setattr(runner, "_emit_event", fail_observation)
+    result = await runner._persist_loop_outcome(
+        state_store=store,
+        run_id="r",
+        result=RunResult(
+            run_id="r",
+            status=RunStatus.SUCCESS,
+            answer="<<PERSON_99>>",
+            meta={"pii_mapping": {"<<PERSON_1>>": "example"}},
+        ),
+    )
+    assert result.status == RunStatus.SUCCESS
+    row = await store.get_run("r")
+    assert row.status == "success" and row.answer == "<<PERSON_99>>"
+    assert [e.event_type for e in await store.get_run_events("r")] == ["run.completed"]
