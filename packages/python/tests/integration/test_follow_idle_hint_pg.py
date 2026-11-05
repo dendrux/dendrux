@@ -11,6 +11,8 @@ from dendrux.types import generate_ulid
 pytestmark = pytest.mark.parametrize("engine", ["postgres"], indirect=True)
 
 
+# Real transport latency must remain far below the 20-second safety poll.
+@pytest.mark.benchmark
 async def test_join_during_idle_sleep_gets_postgres_hint(engine):
     channel = "rf1_idle_" + generate_ulid().lower()
     state = PostgresStateStore(engine, live_updates=PostgresUpdates(channel=channel))
