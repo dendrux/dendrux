@@ -32,19 +32,26 @@ async def consume_terminal(follow, delivered, rid):
             return item
 
 
+# The fake clock starts where the loop's own clock is, which differs per machine. Two
+# pinned starts keep both phases of the safety reads in every run: the quiet runs all due
+# together, and some of them read just before the write, so they come due later.
 @pytest.mark.parametrize(
-    "state_type,hot_count,quiet_count",
+    "state_type,hot_count,quiet_count,start",
     [
-        (FakeState, 100, 1),
-        (FakeState, 100, 7),
-        (BatchedState, 4500, 1),
-        (BatchedState, 4500, 7),
-        (BatchedState, 4500, 401),
+        (FakeState, 100, 1, None),
+        (FakeState, 100, 7, None),
+        (FakeState, 100, 7, 1000.0),
+        (FakeState, 100, 7, 54321.123),
+        (BatchedState, 4500, 1, None),
+        (BatchedState, 4500, 7, None),
+        (BatchedState, 4500, 401, None),
     ],
 )
 async def test_missed_terminal_hints_progress_across_tenants(
-    clock, state_type, hot_count, quiet_count
+    clock, state_type, hot_count, quiet_count, start
 ):
+    if start is not None:
+        clock.now = start
     state, live = state_type(), FakeLive()
     state.live_updates = live
     reader = RunStore(state)
@@ -69,6 +76,11 @@ async def test_missed_terminal_hints_progress_across_tenants(
             state.write(rid, "run.completed")
             state.statuses[rid] = "success"
             consumers.append(asyncio.create_task(consume_terminal(follow, delivered, rid)))
+        coordinator = reader._follow_coordinator()
+        # The scheduler reads the run that has waited longest, not the first one in the list.
+        oldest_due_first = sorted(
+            quiet, key=lambda rid: (coordinator.runs[rid].due_at(), coordinator.runs[rid].order)
+        )
         before = len(state.event_reads)
         queries_before = query_count(state)
         started = clock.now
@@ -84,11 +96,11 @@ async def test_missed_terminal_hints_progress_across_tenants(
             "missed terminal hint starved behind hot tenant"
         )
         assert all(task.result().reason == "terminal" for task in consumers)
-        assert delivered == quiet
+        assert delivered == oldest_due_first
         first_reads = list(
             dict.fromkeys(rid for ids in state.event_reads[before:] for rid in ids if rid in quiet)
         )
-        assert first_reads == quiet
+        assert first_reads == oldest_due_first
         # Token bucket: 20 initial tokens plus 20 per fake second, including status reads.
         assert query_count(state) - queries_before <= 20 + math.ceil(20 * elapsed)
     finally:
