@@ -1008,7 +1008,10 @@ LIVE_UPDATES_MISSED_HINT = Code(
     logging.WARNING,
     "live_updates",
     _BASE_FIELDS | frozenset(["count"]),
-    "A healthy reader discovers changes without a hint after the grace period.",
+    (
+        "A healthy safety poll finds events no hint announced "
+        "(first discovery per coordinator and generation; heuristic)."
+    ),
     "Check that writers and readers use the same bus channel.",
 )
 

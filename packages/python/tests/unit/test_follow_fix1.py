@@ -223,23 +223,36 @@ async def test_mixed_safety_intervals_keep_independent_windows(clock, monkeypatc
         await reader.close()
 
 
-async def test_failed_singleton_keeps_retry_deadline_despite_hints():
+async def test_failed_singleton_keeps_retry_deadline_despite_hints(clock):
     state = BatchedState()
     state.create("bad")
+    state.create("good")
     state.fail_runs.add("bad")
     reader = RunStore(state)
-    follow = reader.follow("bad", tenant_id=None)
+    feed = EventFeed(reader)
+    follows = [feed.follow(rid, tenant_id=None) for rid in ("bad", "good")]
     try:
-        await follow.start()
-        await ticks(40)
-        before = len(state.event_reads)
+        for follow in follows:
+            await follow.start()
         coordinator = reader._follow_coordinator()
-        for _ in range(10):
-            coordinator.on_hints(("bad",))
+        for _ in range(12):  # Past the query share's gate, so only the deadline holds it back.
+            clock.advance(0.1)
             await ticks(10)
-        assert len(state.event_reads) == before
+        bad = coordinator.runs["bad"]
+        assert bad.suspect
+        deadline = bad.events_retry_at
+        before = len([read for read in state.event_reads if "bad" in read])
+        while clock.now + 0.6 < deadline:
+            coordinator.on_hints(("bad",))
+            clock.advance(0.6)
+            await ticks(20)
+        assert len([read for read in state.event_reads if "bad" in read]) == before
+        clock.advance(0.7)
+        await ticks(20)
+        assert len([read for read in state.event_reads if "bad" in read]) == before + 1
     finally:
-        await follow.aclose()
+        for follow in follows:
+            await follow.aclose()
         await reader.close()
 
 

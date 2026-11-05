@@ -1231,19 +1231,37 @@ def _pause_event_data(result: RunResult, pause_state: PauseState) -> dict[str, A
     return paused_data
 
 
+def _terminal_writer(store: StateStore) -> Any:
+    """The method that will write a loop's terminal status on ``store``."""
+    return getattr(store, "finalize_with_event", None) or store.finalize_run
+
+
+def _terminal_failure_reason(result: RunResult) -> str | None:
+    """The reason a returned error ended the run, for the reasons a store may keep."""
+    if result.status != RunStatus.ERROR:
+        return None
+    reason = result.meta.get("failure_reason")
+    known = (FailureReason.GUARDRAIL_BLOCKED.value, FailureReason.PENDING_LIMIT.value)
+    return reason if reason in known else None
+
+
 def _terminal_failure_kwargs(state_store: StateStore, result: RunResult) -> dict[str, Any]:
     """Keep guardrail reason support optional for legacy custom stores."""
-    failure_kwargs: dict[str, Any] = {}
     base = unclaimed_store(state_store)
+    reason = _terminal_failure_reason(result)
     if (
-        base is not None
-        and result.status == RunStatus.ERROR
-        and result.meta.get("failure_reason")
-        in (FailureReason.GUARDRAIL_BLOCKED.value, FailureReason.PENDING_LIMIT.value)
-        and _accepts_kwarg(base.finalize_run, "failure_reason")
+        base is None
+        or reason is None
+        or not _accepts_kwarg(_terminal_writer(base), "failure_reason")
     ):
-        failure_kwargs["failure_reason"] = result.meta["failure_reason"]
-    return failure_kwargs
+        return {}
+    return {"failure_reason": reason}
+
+
+def _unstored_failure_reason(result: RunResult, stored: dict[str, Any]) -> dict[str, Any]:
+    """The reason for the event, when the store's write cannot keep it on the row."""
+    reason = _terminal_failure_reason(result)
+    return {"failure_reason": reason} if reason and "failure_reason" not in stored else {}
 
 
 async def _final_run_recovery(state_store: StateStore, run_id: str, records: Any) -> Any:
@@ -1525,6 +1543,7 @@ async def _persist_loop_outcome(
     _run_pii = result.meta.get("pii_mapping")
     failure_kwargs = _terminal_failure_kwargs(state_store, result)
     stop_reason, event_type, event_data = _terminal_loop_event(result)
+    event_data.update(_unstored_failure_reason(result, failure_kwargs))
     atomic_final = getattr(state_store, "finalize_with_event", None) is not None
     if unmapped_placeholders:
         await _emit_event_safe(

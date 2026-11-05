@@ -740,7 +740,10 @@ class RunStore:
         )
 
     def _reader_idle(self) -> None:
-        if not self._closed:
+        if self._closed:
+            return
+        known = asyncio.get_running_loop() in self._coordinators
+        if known or self._lease is not None or self._retiring_lease is not None:
             self._follow_coordinator().request_idle()
 
     async def _release_idle_lease(self) -> None:
