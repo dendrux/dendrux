@@ -49,9 +49,17 @@ def error_chain(exc: BaseException) -> list[BaseException]:
     while current is not None and id(current) not in seen:
         seen.add(id(current))
         chain.append(current)
-        nested = getattr(current, "orig", None)
-        current = nested if isinstance(nested, BaseException) else current.__cause__
+        current = _nested_error(current)
     return chain
+
+
+def _nested_error(error: BaseException) -> BaseException | None:
+    nested = getattr(error, "orig", None)
+    if isinstance(nested, BaseException):
+        return nested
+    if error.__cause__ is not None:
+        return error.__cause__
+    return None if error.__suppress_context__ else error.__context__
 
 
 def _is_connection_loss_code(code: str) -> bool:
@@ -168,14 +176,26 @@ def _stage_sqlite(chain: list[BaseException]) -> DbError | None:
 
 
 def _is_connection_reset(error: BaseException, code: int | None) -> bool:
+    return _is_connection_type(error) or _is_connection_errno(error, code)
+
+
+def _is_connection_type(error: BaseException) -> bool:
+    return isinstance(error, ConnectionError) and error.errno is None
+
+
+def _is_connection_errno(error: BaseException, code: int | None) -> bool:
     # Read the errno constants at call time: they are platform values, and tests
     # substitute them.
     return isinstance(error, OSError) and (getattr(error, "errno", None) or code) in (
+        errno.ECONNREFUSED,
         errno.ECONNRESET,
         errno.ECONNABORTED,
         errno.EPIPE,
         errno.ENOTCONN,
         errno.ETIMEDOUT,
+        errno.EHOSTUNREACH,
+        errno.ENETUNREACH,
+        errno.ENETDOWN,
     )
 
 

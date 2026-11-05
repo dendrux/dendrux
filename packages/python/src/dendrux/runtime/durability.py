@@ -25,7 +25,13 @@ from functools import wraps
 from time import monotonic
 from typing import TYPE_CHECKING, Any, TypeVar
 
-from sqlalchemy.exc import DBAPIError, OperationalError, SQLAlchemyError, TimeoutError
+from sqlalchemy.exc import (
+    DBAPIError,
+    DisconnectionError,
+    OperationalError,
+    SQLAlchemyError,
+    TimeoutError,
+)
 
 from dendrux import _codes
 from dendrux.db._live_updates import LiveUpdates
@@ -36,7 +42,7 @@ from dendrux.errors import (
     StatementTooLargeError,
 )
 from dendrux.errors import StoreOutcomeUnknown as StoreOutcomeUnknown
-from dendrux.runtime.stores._errors import _is_connection_loss_code, classify_error
+from dendrux.runtime.stores._errors import _is_connection_loss_code, classify_error, error_chain
 
 _EXCEPTION_WALK_LIMIT = 1024
 
@@ -199,7 +205,11 @@ def _statement_too_large(limit: int | None) -> StatementTooLargeError:
 
 
 def is_transient_db_error(exc: BaseException, *, classify: Any = classify_error) -> bool:
-    """True for failures a fresh attempt of the same transaction may not hit."""
+    """True for temporary failures, not proof that COMMIT was unapplied.
+
+    Callers must roll back pre-commit failures and resolve ambiguous commits
+    before retrying. StoreOutcomeUnknown remains non-retryable.
+    """
     if isinstance(exc, PersistenceError):
         return exc.retryable
     classified = classify(exc)
@@ -209,13 +219,20 @@ def is_transient_db_error(exc: BaseException, *, classify: Any = classify_error)
     ):
         return False
     return (
-        isinstance(exc, (OperationalError, TimeoutError))
+        _transient_wrapper(exc)
         or classified.kind in ("deadlock_or_serialization", "lock_timeout", "connection_lost")
         or (
             isinstance(exc, DBAPIError)
             and isinstance(classified.code, str)
             and (_is_connection_loss_code(classified.code) or classified.code == "53300")
         )
+    )
+
+
+def _transient_wrapper(exc: BaseException) -> bool:
+    return any(
+        isinstance(error, (OperationalError, TimeoutError, DisconnectionError))
+        for error in error_chain(exc)
     )
 
 
