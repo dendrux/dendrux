@@ -42,9 +42,12 @@ async def test_per_request_readers_without_live_updates_leave_no_task(sqlite_sto
         stream = reader.stream_events(run_id, tenant_id=None, after_sequence_index=-1)
         await anext(stream)
         await stream.aclose()
+        assert not reader._coordinators
     for _ in range(500):
+        reader = RunStore(sqlite_store)
         with pytest.raises(RunNotFoundError):
-            await RunStore(sqlite_store).follow(generate_ulid(), tenant_id=None).start()
+            await reader.follow(generate_ulid(), tenant_id=None).start()
+        assert reader._follow_coordinator()._idle_timer is None
     await asyncio.sleep(0)
     assert asyncio.all_tasks() - before == set()
 
@@ -65,12 +68,30 @@ async def test_a_reader_holding_a_listener_still_retires_it_when_idle(clock):
         await stream.aclose()
         await ticks(20)
         assert reader._lease is not None  # Kept for the next request of a burst.
+        assert reader._follow_coordinator()._idle_timer is not None
         clock.advance(_follow.IDLE_EXIT_S + 1)
         await ticks(40)
         assert reader._lease is None and not live._leases
         assert not [t for t in asyncio.all_tasks() if "coordinator" in t.get_name()]
     finally:
         await reader.close()
+
+
+async def test_closing_a_reader_cancels_its_idle_timer(clock):
+    state = BatchedState()
+    state.create("r")
+    state.live_updates = FakeLive()
+    reader = RunStore(state)
+    stream = reader.stream_events("r", tenant_id=None, poll_interval_s=0.5)
+    reading = asyncio.ensure_future(anext(stream))
+    await ticks(20)
+    reading.cancel()
+    await asyncio.gather(reading, return_exceptions=True)
+    await stream.aclose()
+    coordinator = reader._follow_coordinator()
+    assert coordinator._idle_timer is not None
+    await reader.close()
+    assert coordinator._idle_timer is None
 
 
 async def test_idle_clock_starts_when_the_last_active_run_stops(clock):

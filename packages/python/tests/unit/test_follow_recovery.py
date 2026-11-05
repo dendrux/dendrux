@@ -6,6 +6,7 @@ reads that include those runs fail (a truly bad run).
 
 from __future__ import annotations
 
+from collections import deque
 from typing import Any
 
 import pytest
@@ -374,5 +375,102 @@ async def test_healthy_hints_keep_their_share_while_groups_wait(clock, monkeypat
             coordinator.on_hints((healthy.run_id,))
             await pass_time(clock, 0.5)
             assert healthy.head == index
+    finally:
+        await reader.close()
+
+
+async def test_a_failed_read_returns_suspects_to_the_small_share(clock, monkeypatch):
+    real_budget(monkeypatch)
+    state = BatchedState()
+    reader = RunStore(state)
+    runs = many(reader, state, 300)
+    state.fail_runs |= {run.run_id for run in runs}
+    for run in runs:
+        state.write(run.run_id)
+    try:
+        await pass_time(clock, 60)
+        assert suspects(runs) == 300
+        state.fail_runs.discard("r0")  # One healed read speeds the share up, once.
+        while runs[0].suspect:
+            await pass_time(clock, 1)
+        state.event_reads.clear()
+        await pass_time(clock, 30)
+        failing = [read for read in state.event_reads if set(read) & state.fail_runs]
+        assert failing and len(failing) / 30 <= _follow_recovery.SUSPECT_READS_PER_S + 0.1
+    finally:
+        await reader.close()
+
+
+def group(runs: list[_follow._WatchedRun], *, suspects: bool = True) -> _follow_recovery._Isolation:
+    job = _follow_recovery._Isolation(list(runs), False, suspects)
+    job.queue()
+    return job
+
+
+async def test_a_hint_leaves_a_suspect_in_its_group_and_frees_a_healthy_run(clock):
+    state = BatchedState()
+    reader = RunStore(state)
+    coordinator = reader._follow_coordinator()
+    suspect, healthy = watch(reader, state, "s"), watch(reader, state, "h")
+    coordinator._suspects.mark(suspect)
+    suspect_job, healthy_job = group([suspect]), group([healthy], suspects=False)
+    try:
+        coordinator.on_hints(("s", "h"))
+        assert suspect_job.holds(suspect) and not healthy_job.holds(healthy)
+    finally:
+        await reader.close()
+
+
+async def test_a_group_only_reads_runs_of_its_own_kind(clock):
+    state = BatchedState()
+    reader = RunStore(state)
+    coordinator = reader._follow_coordinator()
+    runs = [watch(reader, state, f"r{i}") for i in range(4)]
+    job = group(runs, suspects=False)
+    coordinator._suspects.mark(runs[0])
+    try:
+        assert job.take(coordinator.runs) == runs[1:]
+        assert runs[0].events_pending is None
+    finally:
+        await reader.close()
+
+
+async def test_a_failed_group_of_suspects_stays_on_the_suspect_queue(clock):
+    state = BatchedState()
+    reader = RunStore(state)
+    coordinator = reader._follow_coordinator()
+    runs = [watch(reader, state, f"r{i}") for i in range(4)]
+    for run in runs:
+        coordinator._suspects.mark(run)
+    try:
+        coordinator._queue_isolation(runs, False)
+        assert len(coordinator._suspects.jobs) == 2 and not coordinator._isolations
+    finally:
+        await reader.close()
+
+
+async def test_merged_groups_never_pass_the_batch_size(clock):
+    state = BatchedState()
+    reader = RunStore(state)
+    coordinator = reader._follow_coordinator()
+    runs = [watch(reader, state, f"r{i}") for i in range(25)]
+    jobs = deque(group(runs[start : start + 5], suspects=False) for start in range(0, 25, 5))
+    try:
+        _follow_recovery.merge_jobs(jobs, coordinator.runs, 10)
+        assert [len(job.runs) for job in jobs] == [10, 10, 5]
+        assert all(job.holds(run) for job in jobs for run in job.runs)
+    finally:
+        await reader.close()
+
+
+async def test_a_suspect_that_stops_being_watched_is_forgotten(clock):
+    state = BatchedState()
+    reader = RunStore(state)
+    coordinator = reader._follow_coordinator()
+    run = watch(reader, state, "gone")
+    coordinator._suspects.mark(run)
+    try:
+        coordinator.unwatch(run)
+        assert not coordinator._suspects.runs
     finally:
         await reader.close()

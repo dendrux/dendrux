@@ -581,12 +581,8 @@ class _Coordinator:
 
     def _idle_timer_fired(self) -> None:
         self._idle_timer = None
-        if self._closed or not self._task_exited() or not self._holds_resources():
-            return
-        if self._now() < self._idle_deadline():
-            self._arm_idle_timer()  # More reads came and went since this was armed.
-        else:
-            self._start_task()
+        if not self._closed and self._task_exited() and self._holds_resources():
+            self._start_task()  # ``_idle`` waits out any reads that came since this was armed.
 
     def _idle_deadline(self) -> float:
         return min(
