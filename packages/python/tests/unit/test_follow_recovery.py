@@ -598,3 +598,35 @@ async def test_a_group_of_suspects_drops_a_run_that_has_healed(clock):
         assert runs[0].events_pending is None
     finally:
         await reader.close()
+
+
+async def test_per_run_store_reads_a_hinted_suspect_ahead_of_the_drain(clock, monkeypatch):
+    real_budget(monkeypatch)
+    state = FakeState()
+    outage = Outage(state)
+    reader = RunStore(state)
+    runs = many(reader, state, 300)
+    coordinator = reader._follow_coordinator()
+    try:
+        await pass_time(clock, 30)
+        outage.down = True
+        for run in runs:
+            run.events_due = run.status_due = clock.now
+        while suspects(runs) < 300:
+            await pass_time(clock, 1)
+        outage.down = False
+        await pass_time(clock, _follow_recovery.SUSPECT_RETRY_MIN_S + 1)  # Every deadline passed.
+        delays = []
+        for run in reversed(runs):  # Youngest in the drain: the longest wait if it took its turn.
+            if len(delays) == 5 or suspects(runs) == 0:
+                break
+            if run.suspect:
+                state.write(run.run_id)
+                target, started = state.events[run.run_id][-1].sequence_index, clock.now
+                coordinator.on_hints((run.run_id,))
+                while run.head != target and clock.now - started < 60:
+                    await pass_time(clock, 0.05, step=0.05)
+                delays.append(clock.now - started)
+        assert len(delays) == 5 and max(delays) <= 2.0
+    finally:
+        await reader.close()

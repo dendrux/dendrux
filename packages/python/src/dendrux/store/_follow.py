@@ -768,15 +768,14 @@ class _Coordinator:
             _raise_if_cancelling()
 
     def _due_chunk(self, due: list[_WatchedRun]) -> list[_WatchedRun]:
-        return self._next_probe(due) or self._prioritize(due)
+        return self._next_probe(due, self._now()) or self._prioritize(due)
 
     def _due_runs(self, now: float) -> list[_WatchedRun]:
         return [run for run in self.runs.values() if self._ready_at(run) <= now]
 
-    @staticmethod
-    def _next_probe(runs: list[_WatchedRun]) -> list[_WatchedRun]:
+    def _next_probe(self, runs: list[_WatchedRun], now: float) -> list[_WatchedRun]:
         probes = [run for run in runs if run.suspect]
-        return [min(probes, key=lambda run: (run.due_at(), run.order))] if probes else []
+        return [min(probes, key=lambda run: self._priority(run, now))] if probes else []
 
     def _next_job(self, due: list[_WatchedRun], now: float) -> _Isolation | None:
         """A waiting group of suspects, if the allowance permits, else of failed healthy runs."""
