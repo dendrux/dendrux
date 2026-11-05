@@ -550,3 +550,51 @@ async def test_a_healed_read_speeds_up_the_share_and_a_failure_slows_it_again(cl
         assert share.probe_at == clock.now + slow
     finally:
         await reader.close()
+
+
+async def test_per_run_store_keeps_healthy_hints_flowing_while_recovery_drains(clock, monkeypatch):
+    real_budget(monkeypatch)
+    state = FakeState()
+    outage = Outage(state)
+    reader = RunStore(state)
+    runs = many(reader, state, 300)
+    coordinator = reader._follow_coordinator()
+    try:
+        await pass_time(clock, 30)
+        outage.down = True
+        for run in runs:
+            run.events_due = run.status_due = clock.now
+        while suspects(runs) < 300:
+            await pass_time(clock, 1)
+        outage.down = False
+        delays = []
+        while suspects(runs) > 30:
+            healthy = next((run for run in runs if not run.suspect), None)
+            if healthy is None:
+                await pass_time(clock, 0.5)
+                continue
+            state.write(healthy.run_id)
+            target, started = state.events[healthy.run_id][-1].sequence_index, clock.now
+            coordinator.on_hints((healthy.run_id,))
+            while healthy.head != target and clock.now - started < 30:
+                await pass_time(clock, 0.05, step=0.05)
+            delays.append(clock.now - started)
+        assert delays and max(delays) <= 2.0
+    finally:
+        await reader.close()
+
+
+async def test_a_group_of_suspects_drops_a_run_that_has_healed(clock):
+    state = BatchedState()
+    reader = RunStore(state)
+    coordinator = reader._follow_coordinator()
+    runs = [watch(reader, state, f"r{i}") for i in range(4)]
+    for run in runs:
+        coordinator._suspects.mark(run)
+    job = group(runs)
+    coordinator._suspects.settle(runs[0], True, clock.now)
+    try:
+        assert job.take(coordinator.runs) == runs[1:]
+        assert runs[0].events_pending is None
+    finally:
+        await reader.close()

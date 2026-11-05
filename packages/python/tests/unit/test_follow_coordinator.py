@@ -550,12 +550,15 @@ async def test_custom_store_falls_back_to_per_run_reads_under_the_budget(
     assert len(state.event_reads) <= 4  # one token per per-run read
     start = clock.now
     state.write("r3")
-    while not _seqs(follows[3]) and clock.now - start < 10:
+    every_run = {(run,) for run in runs}
+    while (not _seqs(follows[3]) or set(state.event_reads) != every_run) and (
+        clock.now - start < 10
+    ):
         clock.advance(0.25)
         await ticks()
         reads = len(state.event_reads) + len(state.per_run_status_reads)
         assert reads <= 4 + 4 * (clock.now - start) + 1e-9
-    assert set(state.event_reads) == {(run,) for run in runs}
+    assert set(state.event_reads) == every_run
     assert _seqs(follows[3]) == [1]
 
 
