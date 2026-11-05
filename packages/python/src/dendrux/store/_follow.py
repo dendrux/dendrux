@@ -1026,7 +1026,14 @@ class _Coordinator:
             self._queue_isolation(runs, status)
 
     def _queue_isolation(self, runs: list[_WatchedRun], status: bool) -> None:
-        split = self._suspects.split(runs, status, self._now())
+        now = self._now()
+        due = "status_due" if status else "events_due"
+        for run in runs:
+            if not run.suspect:
+                # A hint may release this group; a failed attempt gives up its old place.
+                setattr(run, due, max(getattr(run, due), now))
+                run.order = next(self._order)
+        split = self._suspects.split(runs, status, now)
         (self._suspects.jobs if split[0].suspects else self._isolations).extend(split)
         self._prune_isolations()
 

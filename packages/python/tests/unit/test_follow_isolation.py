@@ -11,12 +11,16 @@ from tests.unit.test_follow_coordinator import BatchedState
 
 @pytest.mark.parametrize("phase", ["events", "status"])
 async def test_bad_tenant_isolated_with_shared_read_budget(phase, caplog):
+    status_ok: set[str] = set()
+
     class Poisoned(BatchedState):
         async def get_run_statuses(self, run_ids):
             if phase == "status" and "private-bad" in run_ids:
                 self.status_reads.append(tuple(run_ids))
                 raise ValueError("private-tenant driver payload")
-            return await super().get_run_statuses(run_ids)
+            found = await super().get_run_statuses(run_ids)
+            status_ok.update(found)
+            return found
 
     state = Poisoned()
     reader = RunStore(state)
@@ -36,7 +40,7 @@ async def test_bad_tenant_isolated_with_shared_read_budget(phase, caplog):
         c.revive()
         async with asyncio.timeout(5):
             while not all(
-                run.head == 0 if phase == "events" else run.status_due > before
+                run.head == 0 if phase == "events" else rid in status_ok
                 for rid, run in c.runs.items()
                 if rid != "private-bad"
             ):
@@ -47,7 +51,7 @@ async def test_bad_tenant_isolated_with_shared_read_budget(phase, caplog):
         if phase == "events":
             assert run.head == 0
         else:
-            assert run.status_due > before
+            assert rid in status_ok
             assert run.status_fail_delay == 0
     calls = len(state.event_reads) + len(state.status_reads)
     assert calls <= 20 + 20 * (c._now() - before)
