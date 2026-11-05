@@ -447,6 +447,7 @@ class _Coordinator:
         self._missed_count = 0
         self._idle_since = self._now()
         self._idle_timer: asyncio.TimerHandle | None = None
+        self._was_active = False
         self._registration: object | None = None
         self._enter_hub()
 
@@ -694,12 +695,20 @@ class _Coordinator:
             self._wake.clear()
             now = self._now()
             self._expire_followers(now)
-            if not self.has_active_runs():
+            if not self._note_activity():
                 if await self._idle():
                     return
                 continue
             if not await self._read_due(now):
                 await self._sleep(self._next_wake(now) - now)
+
+    def _note_activity(self) -> bool:
+        """Whether any run is being read; the idle clock starts when the last one stops."""
+        active = self.has_active_runs()
+        if self._was_active and not active:
+            self._idle_since = self._now()
+        self._was_active = active
+        return active
 
     async def _read_due(self, now: float) -> bool:
         self._suspects.queue_due(now, POLL_BATCH_RUNS)

@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from dendrux.db._sqlite_sync import create_sqlite_schema
 from dendrux.errors import RunNotFoundError
-from dendrux.store import RunStore, SQLiteStateStore, _follow
+from dendrux.store import EventFeed, RunStore, SQLiteStateStore, _follow
 from dendrux.types import generate_ulid
 from tests.unit.test_follow_coordinator import BatchedState, FakeLive, ticks
 from tests.unit.test_follow_coordinator import clock as clock
@@ -70,6 +70,35 @@ async def test_a_reader_holding_a_listener_still_retires_it_when_idle(clock):
         assert reader._lease is None and not live._leases
         assert not [t for t in asyncio.all_tasks() if "coordinator" in t.get_name()]
     finally:
+        await reader.close()
+
+
+async def test_idle_clock_starts_when_the_last_active_run_stops(clock):
+    state = BatchedState()
+    state.create("r")
+    state.live_updates = FakeLive()
+    reader = RunStore(state)
+    feed = EventFeed(reader, poll_healthy_s=1.0)
+    follow = feed.follow("r", tenant_id=None)
+    try:
+        await follow.start()
+        await ticks(20)
+        for _ in range(int(_follow.IDLE_EXIT_S) + 5):  # A long run: older than the idle period.
+            clock.advance(1.0)
+            await ticks(10)
+        state.write("r", "run.completed")
+        state.statuses["r"] = "success"
+        state.live_updates.hint("r")
+        for _ in range(40):  # Terminal, with the event still unread by a slow consumer.
+            clock.advance(_follow.TERMINAL_DRAIN_GRACE_S)
+            await ticks(10)
+        assert follow._follower.end_reason == "terminal" and follow._follower.buffer
+        assert reader._lease is not None
+        clock.advance(_follow.IDLE_EXIT_S + 1)
+        await ticks(40)
+        assert reader._lease is None
+    finally:
+        await follow.aclose()
         await reader.close()
 
 
