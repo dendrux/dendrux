@@ -58,6 +58,7 @@ from dendrux.runtime._pending import (
 from dendrux.store._follow_recovery import (
     _Isolation,
     _Suspects,
+    merge_jobs,
     split_jobs,
     take_job,
 )
@@ -712,14 +713,12 @@ class _Coordinator:
 
     async def _read_due(self, now: float) -> bool:
         self._suspects.queue_due(now, POLL_BATCH_RUNS)
-        recheck = (
-            take_job(self._suspects.jobs, self.runs) if now >= self._suspects.probe_at else None
-        )
-        if recheck is not None:
-            events, statuses = ([], recheck.runs) if recheck.status else (recheck.runs, [])
-            await self._read_phases(recheck.runs, events, statuses)
+        due = self._due_runs(now)
+        job = self._next_job(due, now)
+        if job is not None:
+            await self._read_job(job)
             return True
-        chunk = self._due_chunk(now)
+        chunk = self._due_chunk(due)
         if chunk:
             await self._cycle(chunk, now)
         return bool(chunk)
@@ -766,9 +765,8 @@ class _Coordinator:
         finally:
             _raise_if_cancelling()
 
-    def _due_chunk(self, now: float) -> list[_WatchedRun]:
-        due = self._due_runs(now)
-        return self._next_probe(due) or self._regular_chunk(due, now)
+    def _due_chunk(self, due: list[_WatchedRun]) -> list[_WatchedRun]:
+        return self._next_probe(due) or self._prioritize(due)
 
     def _due_runs(self, now: float) -> list[_WatchedRun]:
         return [run for run in self.runs.values() if self._ready_at(run) <= now]
@@ -778,13 +776,28 @@ class _Coordinator:
         probes = [run for run in runs if run.suspect]
         return [min(probes, key=lambda run: (run.due_at(), run.order))] if probes else []
 
-    def _regular_chunk(self, due: list[_WatchedRun], now: float) -> list[_WatchedRun]:
-        if not due or now >= self._discovery_at:
-            isolated = take_job(self._isolations, self.runs)
-            if isolated is not None:
-                self._discovery_at = now + DISCOVERY_INTERVAL_S
-                return isolated.runs
-        return self._prioritize(due)
+    def _next_job(self, due: list[_WatchedRun], now: float) -> _Isolation | None:
+        """A waiting group of suspects, if the allowance permits, else of failed healthy runs."""
+        job = take_job(self._suspects.jobs, self.runs) if now >= self._suspects.probe_at else None
+        if job is None and (not due or now >= self._discovery_at):
+            job = take_job(self._isolations, self.runs)
+        return job
+
+    async def _read_job(self, job: _Isolation) -> None:
+        """Read one waiting group's failed phase. A good read means the store works, so groups
+        still waiting from the same failure merge again instead of being read one small piece
+        at a time; a run that really is bad just splits out of its group again."""
+        good_reads = self._suspects.good_reads
+        events, statuses = ([], job.runs) if job.status else (job.runs, [])
+        await self._read_phases(job.runs, events, statuses)
+        if not job.suspects:
+            self._discovery_at = self._now() + DISCOVERY_INTERVAL_S
+        if self._suspects.good_reads > good_reads:
+            merge_jobs(
+                self._suspects.jobs if job.suspects else self._isolations,
+                self.runs,
+                POLL_BATCH_RUNS,
+            )
 
     def _prioritize(self, runs: list[_WatchedRun]) -> list[_WatchedRun]:
         now = self._now()

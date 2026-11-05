@@ -317,3 +317,62 @@ async def test_isolation_queues_stay_bounded_during_an_outage_with_hints(clock):
         assert peak <= 2 * len(runs)
     finally:
         await reader.close()
+
+
+async def test_groups_left_waiting_by_an_outage_merge_once_the_store_is_back(clock, monkeypatch):
+    rate = real_budget(monkeypatch)
+    state = BatchedState()
+    outage = Outage(state)
+    reader = RunStore(state)
+    runs = many(reader, state, 1000)
+    coordinator = reader._follow_coordinator()
+    try:
+        await pass_time(clock, 1)
+        outage.down = True
+        for run in runs:
+            run.events_due = run.status_due = clock.now
+        await pass_time(clock, 30)
+        waiting = queued(coordinator)
+        assert waiting > 100  # Long enough for the groups to have become small.
+        outage.down = False
+        before, waited = reads(state), 0.0
+        while queued(coordinator) and waited < 15:
+            await pass_time(clock, 0.5)
+            waited += 0.5
+        assert queued(coordinator) == 0
+        assert reads(state) - before <= min(waiting, rate * (waited + 1))
+    finally:
+        await reader.close()
+
+
+async def test_healthy_hints_keep_their_share_while_groups_wait(clock, monkeypatch):
+    real_budget(monkeypatch)
+    state = BatchedState()
+    reader = RunStore(state)
+    runs = many(reader, state, 600)
+    coordinator = reader._follow_coordinator()
+    state.fail_runs |= {f"r{i}" for i in range(1, 600, 2)}  # Half are bad: groups keep failing.
+    statuses = state.get_run_statuses
+
+    async def failing_statuses(run_ids):
+        if state.fail_runs & set(run_ids):
+            raise OSError("bad run")
+        return await statuses(run_ids)
+
+    state.get_run_statuses = failing_statuses
+    for run_id in state.fail_runs:
+        state.write(run_id)
+    try:
+        await pass_time(clock, 1)
+        for run in runs:
+            run.events_due = run.status_due = clock.now
+        await pass_time(clock, 1)
+        assert coordinator._isolations
+        healthy = runs[100]
+        for index in range(15):
+            state.write(healthy.run_id)
+            coordinator.on_hints((healthy.run_id,))
+            await pass_time(clock, 0.5)
+            assert healthy.head == index
+    finally:
+        await reader.close()

@@ -82,6 +82,22 @@ def split_jobs(runs: list[_WatchedRun], status: bool, suspects: bool) -> list[_I
     return [_Isolation(group, status, suspects) for group in (runs[:middle], runs[middle:])]
 
 
+def merge_jobs(jobs: deque[_Isolation], watched: dict[str, _WatchedRun], size: int) -> None:
+    """Rebuild waiting jobs into groups of up to ``size`` runs, per phase, oldest first."""
+    if len(jobs) < 2:
+        return
+    suspects = jobs[0].suspects
+    waiting: dict[bool, list[_WatchedRun]] = {False: [], True: []}
+    while jobs:
+        job = jobs.popleft()
+        waiting[job.status].extend(job.take(watched))
+    for status, runs in waiting.items():
+        for group in _batches(runs, size):
+            job = _Isolation(group, status, suspects)
+            job.queue()
+            jobs.append(job)
+
+
 def retry_backoff(delay: float) -> float:
     return min(max(delay * 2, SUSPECT_RETRY_MIN_S), SUSPECT_RETRY_MAX_S)
 
@@ -105,6 +121,7 @@ class _Suspects:
         self.jobs: deque[_Isolation] = deque()
         self.probe_at = -math.inf
         self.read_ok_at = -math.inf
+        self.good_reads = 0
         self._recheck_at = -math.inf
         self._interval = 1 / SUSPECT_READS_PER_S
 
@@ -145,6 +162,7 @@ class _Suspects:
     def note_read(self, worked: bool, now: float) -> None:
         if worked:
             self.read_ok_at = now
+            self.good_reads += 1
 
     def note_failure(self, now: float) -> None:
         self._interval = 1 / SUSPECT_READS_PER_S

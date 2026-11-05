@@ -29,7 +29,7 @@ async def test_thousand_idle_runs_share_default_jitter_batches(clock: Clock, mon
     start = clock.now
     steady_reads = 0
     while clock.now < start + 60:
-        chunk = c._due_chunk(clock.now)
+        chunk = c._due_chunk(c._due_runs(clock.now))
         if chunk:
             before = len(state.event_reads) + len(state.status_reads)
             await c._cycle(chunk, clock.now)
