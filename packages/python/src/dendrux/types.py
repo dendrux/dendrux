@@ -1251,7 +1251,7 @@ class ErrorInfo:
 
 @dataclass(frozen=True)
 class RecoveryInfo:
-    """Durable recovery summary, absent for runs that were never reclaimed."""
+    """Durable recovery summary, when requested recovery reads succeed."""
 
     reclaim_attempts: int
     last_reclaimed_at: datetime | None
@@ -1300,10 +1300,15 @@ class RunResult:
     (``stop_reason == "max_tokens"``): the run still ends SUCCESS, but the
     answer is cut off.
 
-    ``error_info`` describes a provider failure that ended the run (ERROR
-    only). ``pause_id`` identifies the current pause of a paused run.
+    ``error_info`` describes a failed attempt. Usually its status is ERROR;
+    a resumed stream can instead preserve a released pause or running status.
+    ``pause_id`` identifies the current pause of a paused run.
     ``recovery`` summarizes durable reclaims and replayed calls. It is None
-    for unreclaimed runs, whose wire DTO omits the additive recovery key.
+    for unreclaimed runs, or when optional reads fail while returning a
+    committed outcome or cancellation response. The wire DTO then omits the
+    recovery key. ``Agent.get_result`` is strict and propagates recovery read
+    failures. Committed pause results may lack ``pending`` and ``pause_id``
+    after a projection failure; reload pending before submitting.
     """
 
     run_id: str
@@ -1944,7 +1949,9 @@ class RunEventType(StrEnum):
         RUN_RESUMED: First event for resumed runs. Carries run_id.
         RUN_COMPLETED: Terminal. Run finished (success or max_iterations).
         RUN_PAUSED: Terminal. Run paused for client tool or human input.
-        RUN_ERROR: Terminal. Run failed. No exception is raised to the consumer.
+        RUN_ERROR: Ends this stream attempt without raising to the consumer.
+            The result can report a paused or running row after continuation
+            cleanup, rather than a terminal run failure.
         RUN_CANCELLED: Terminal. Run was cancelled cooperatively.
 
     LLM output events (translated from provider StreamEvent):

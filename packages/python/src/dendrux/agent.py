@@ -2171,6 +2171,7 @@ class Agent:
 
         Never accepts UNSCOPED. Routes must separately authorize their actor's
         access to this run. Pending arguments use RunStore.get_pending's view.
+        Recovery and pending projection failures propagate from this read.
         """
         from dendrux.errors import PersistenceNotConfiguredError, RunNotFoundError
         from dendrux.guardrails._engine import deanonymize_text
@@ -2192,7 +2193,7 @@ class Agent:
         if record is None or record.agent_name != self.name:
             raise RunNotFoundError(run_id)
         result = _record_to_run_result(record)
-        result.recovery = await _recovery_info(store, record)
+        result.recovery = await _recovery_info(store, record, best_effort=False)
         mapping = await facade.get_pii_mapping(run_id, tenant_id=tenant_id) or {}
         result.answer = deanonymize_text(record.answer, mapping)[0]
         result._wire_pii_mapping = mapping
@@ -2314,55 +2315,67 @@ class Agent:
             and callable(getattr(store, "mark_cancel_requested", None))
             and callable(getattr(store, "get_children_page", None))
         )
-        traversal_truncated = False
-        if cascade:
-            levels, traversal_truncated = await self._mark_cancel_subtree(
-                store, run_id, tenant_id=record.tenant_id
-            )
-            for level in reversed(levels):
-                for rid in level:
-                    if rid == run_id:
-                        continue
-                    outcome = await self._cancel_one(store, rid, signal=False)
-                    cascade_count += 1
-                    if len(outcomes) < _CANCEL_OUTCOME_LIMIT:
-                        outcomes.append({"run_id": rid, "outcome": outcome})
-                    if outcome != "terminal" and not frontier_signals:
-                        to_signal.append(rid)
-
-        if record.status in _TERMINAL_STATUSES:
+        try:
+            traversal_truncated = False
             if cascade:
+                cascade_count, traversal_truncated = await self._cancel_descendant_outcomes(
+                    store, run_id, record.tenant_id, frontier_signals, outcomes, to_signal
+                )
+
+            if record.status in _TERMINAL_STATUSES:
+                if cascade:
+                    record = await store.get_run(run_id)
+                    if record is None:  # pragma: no cover — concurrent deletion
+                        raise RunNotFoundError(run_id)
+                result = _record_to_run_result(record)
+                outcomes.append({"run_id": run_id, "outcome": "terminal"})
+            else:
+                outcome = await self._cancel_one(store, run_id, signal=False)
+                if outcome != "terminal" and not frontier_signals:
+                    to_signal.append(run_id)
+                outcomes.append({"run_id": run_id, "outcome": outcome})
                 record = await store.get_run(run_id)
-                if record is None:  # pragma: no cover — concurrent deletion
+                if record is None:  # pragma: no cover — we just preflight-checked
                     raise RunNotFoundError(run_id)
-            result = _record_to_run_result(record)
-            outcomes.append({"run_id": run_id, "outcome": "terminal"})
-        else:
-            outcome = await self._cancel_one(store, run_id, signal=False)
-            outcomes.append({"run_id": run_id, "outcome": outcome})
-            record = await store.get_run(run_id)
-            if record is None:  # pragma: no cover — we just preflight-checked
-                raise RunNotFoundError(run_id)
+                result = _record_to_run_result(record)
+            from dendrux.runtime.runner import _recovery_info
+
+            result.recovery = await _recovery_info(store, record)
+            if result.status.value in _TERMINAL_STATUSES:
+                from dendrux.runtime.runner import _attach_undelivered_notes
+
+                await _attach_undelivered_notes(store, run_id, result)
+            if cascade:
+                result.meta["cascade"] = outcomes
+                result.meta["cascade_count"] = cascade_count + 1
+                result.meta["cascade_truncated"] = traversal_truncated or cascade_count + 1 > len(
+                    outcomes
+                )
+            return result
+        finally:
+            for rid in to_signal:
+                self._task_manager.cancel(rid)
+
+    async def _cancel_descendant_outcomes(
+        self,
+        store: StateStore,
+        run_id: str,
+        tenant_id: str | None,
+        frontier_signals: bool,
+        outcomes: list[dict[str, str]],
+        to_signal: list[str],
+    ) -> tuple[int, bool]:
+        levels, truncated = await self._mark_cancel_subtree(store, run_id, tenant_id=tenant_id)
+        count = 0
+        descendants = (rid for level in reversed(levels) for rid in level if rid != run_id)
+        for rid in descendants:
+            outcome = await self._cancel_one(store, rid, signal=False)
             if outcome != "terminal" and not frontier_signals:
-                to_signal.append(run_id)
-            result = _record_to_run_result(record)
-        from dendrux.runtime.runner import _recovery_info
-
-        result.recovery = await _recovery_info(store, record)
-        if result.status.value in _TERMINAL_STATUSES:
-            from dendrux.runtime.runner import _attach_undelivered_notes
-
-            await _attach_undelivered_notes(store, run_id, result)
-        if cascade:
-            result.meta["cascade"] = outcomes
-            result.meta["cascade_count"] = cascade_count + 1
-            result.meta["cascade_truncated"] = traversal_truncated or cascade_count + 1 > len(
-                outcomes
-            )
-        # Non-cascade and legacy stores signal after the durable request and snapshot.
-        for rid in to_signal:
-            self._task_manager.cancel(rid)
-        return result
+                to_signal.append(rid)
+            count += 1
+            if len(outcomes) < _CANCEL_OUTCOME_LIMIT:
+                outcomes.append({"run_id": rid, "outcome": outcome})
+        return count, truncated
 
     async def _mark_cancel_subtree(
         self, store: StateStore, run_id: str, *, tenant_id: str | None
@@ -2448,14 +2461,18 @@ class Agent:
         # emits run.cancelled at a checkpoint.
         from dendrux.runtime.runner import _transition_with_event
 
-        cancel_won = await _transition_with_event(
-            store,
-            run_id,
-            status=RunStatus.CANCELLED.value,
-            allowed_current_statuses=list(PAUSE_STATUS_VALUES),
-            event_type=StoredEventType.RUN_CANCELLED.value,
-            event_data={"reason": CancelReason.CANCEL_REQUESTED.value},
-        )
+        try:
+            cancel_won = await _transition_with_event(
+                store,
+                run_id,
+                status=RunStatus.CANCELLED.value,
+                allowed_current_statuses=list(PAUSE_STATUS_VALUES),
+                event_type=StoredEventType.RUN_CANCELLED.value,
+                event_data={"reason": CancelReason.CANCEL_REQUESTED.value},
+            )
+        except BaseException:
+            self._task_manager.cancel(run_id)
+            raise
         if signal:
             self._task_manager.cancel(run_id)
         return RunStatus.CANCELLED.value if cancel_won else CancelReason.CANCEL_REQUESTED.value

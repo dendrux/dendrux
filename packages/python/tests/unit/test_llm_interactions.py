@@ -282,7 +282,6 @@ class TestResumeCoreCAsBugFix:
             None,
             RuntimeError("resume failure"),
             runner._ResumeProgress(started=True),
-            True,
             {},
         )
         store.finalize_run.assert_awaited_once()

@@ -125,8 +125,49 @@ Dendrux writes a run's state as it goes: the run row, its events, traces, tool c
 What the failed call leaves in the database depends on what the database can still do:
 
 - If the run could not be created, no run exists.
-- Dendrux then tries to record the failure. If the database answers again in time, the run is saved as `error` with the fixed message and a `run.error` event, even though the call raised: check the run's status before assuming it is still running.
+- After work starts, Dendrux tries to record the failure. If the database answers again in time, the run is saved as `error` with the fixed message and a `run.error` event. Unconsumed continuations can instead release to their pause as described below: check the run's status before deciding how to retry.
 - If the database still cannot be written, the run stays `running` at its last committed state: every event and row written before the failure is there, and nothing marks it `error`. Find it with `sweep` and move it on with `reclaim` (or finish it with `on_stale="error"`); see [Recovery](/docs/guides/recovery).
+
+## When continuation setup fails
+
+In 0.6.0, `resume`, `resume_stream`, `submit_*` and `reclaim` use the same
+execution-setup failure policy. Any ordinary exception before submission
+consumption or work starts can release the exact claim, including setup reads and
+writes (`run.resumed`, `save_trace`, or `consume_submission` before it commits).
+`StoreOutcomeUnknown` during execution setup is excluded from release.
+Cancellation retains its existing precedence. In 0.5.0 these post-claim failures
+ended direct resume attempts as `error`.
+
+A successful release restores the pause, but does not schedule a retry. Resubmit
+the input/results/decisions explicitly; do not rely on a saved submission being
+picked up automatically. Permanent setup failures will repeat until corrected;
+call `cancel_run` if you give up. Paused rows do not time out automatically.
+Reclaim releases to `running` for lease expiry and a new sweep.
+
+For a claimed pause, a store without a release method or integer epoch falls back
+to persisting `error`. Reclaim stays `running` for a later sweep even without a
+release method. If a release is attempted but fails, the row can stay
+`running`; use `sweep` and `reclaim`, or `sweep(on_stale="error")` for stores without
+recovery. A stale release cannot change a newer epoch. Started observers get
+`on_run_finished` after a confirmed release to an observed non-running status.
+Failure hooks run when no release is confirmed or the observed status remains
+`running` (including reclaim). An unavailable cleanup status read falls back to
+`running` and failure hooks rather than inventing a pause.
+
+The call raises; `resume_stream` emits `run_error` with the failure information.
+After release, that event's result preserves the observed durable status instead
+of claiming terminal `error`; `stream.result` can therefore be paused or running.
+It does not supply a pending payload or pause token. Monitors must count failed
+attempts as well as terminal-error rows.
+
+When execution returns a committed outcome, recovery and pending projections
+are best effort. A failed recovery projection returns `recovery=None`. A failed
+pending projection, or failed refresh after committing a pause, returns the known
+status with `pending=None` and `pause_id=None`. Reload with `RunStore.get_pending`
+before submitting. Each failure logs `result_read_failed` with `run_id`;
+`CancelledError` still propagates. `cancel_run` also treats recovery as optional,
+but `get_result` remains strict and raises on projection failure. Reads needed to
+determine an unknown winning outcome remain required.
 
 ## When a commit acknowledgement is lost
 
