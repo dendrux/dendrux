@@ -645,7 +645,7 @@ async def test_failed_chunk_is_isolated_logged_without_text_and_retried(
     assert _seqs(bad) == []
     state.fail_runs = set()
     state.write("bad")
-    clock.advance(2.1)
+    clock.advance(_follow.SUSPECT_RETRY_MIN_S + 0.1)
     await ticks(40)
     assert _seqs(bad) == [1]
     failed = [r for r in caplog.records if getattr(r, "code", None) == "follow_read_failed"]
@@ -732,7 +732,7 @@ async def test_per_run_fallback_isolates_a_failing_run(clock: Clock, caplog: Any
     await ticks()
     assert _seqs(good) == [0] and _seqs(bad) == []
     state.fail_runs = set()
-    for _ in range(12):
+    for _ in range(24):
         clock.advance(0.25)
         await ticks()
     assert _seqs(bad) == [0]
@@ -754,12 +754,12 @@ async def test_status_failures_back_off_even_while_event_reads_succeed(clock: Cl
     await attach(feed, "r1")
     await ticks()
     start = clock.now
-    while clock.now - start < 4:
+    while clock.now - start < 36:
         state.write("r1")  # every events read succeeds with new events
         clock.advance(0.25)
         await ticks()
     gaps = [round(b - a, 2) for a, b in zip(attempts, attempts[1:], strict=False)]
-    assert gaps[:3] == [0.5, 1.0, 2.0]
+    assert gaps[:3] == [5.0, 10.0, 20.0]
 
 
 async def test_hints_never_shorten_status_failure_backoff(clock: Clock) -> None:
@@ -775,15 +775,15 @@ async def test_hints_never_shorten_status_failure_backoff(clock: Clock) -> None:
 
     state.get_run_statuses = failing  # type: ignore[method-assign]
     start = clock.now
-    while clock.now - start < 5:
+    while clock.now - start < 37:
         state.write("r1")
         live.hint("r1")  # a healthy bus keeps announcing new events
         await ticks()
         clock.advance(0.1)
     gaps = [round(b - a, 2) for a, b in zip(attempts, attempts[1:], strict=False)]
     assert len(gaps) >= 3
-    for gap, backoff in zip(gaps, [0.5, 1.0, 2.0], strict=False):
-        assert backoff <= gap <= backoff + 0.15
+    for gap, backoff in zip(gaps, [5.0, 10.0, 20.0], strict=False):
+        assert backoff <= gap <= backoff + 1 / _follow.SUSPECT_READS_PER_S + 0.1
 
 
 async def test_a_hint_during_a_failing_status_read_does_not_skip_the_backoff(
@@ -812,8 +812,8 @@ async def test_a_hint_during_a_failing_status_read_does_not_skip_the_backoff(
     clock.advance(0.4)
     live.hint("r1")
     await ticks()
-    assert len(attempts) == 1  # still inside the 0.5 s retry delay
-    clock.advance(0.2)
+    assert len(attempts) == 1  # still inside the suspect retry delay
+    clock.advance(_follow.SUSPECT_RETRY_MIN_S)
     await ticks()
     assert len(attempts) == 2
 
@@ -838,7 +838,8 @@ async def test_missed_hint_is_logged_once_at_first_discovery(clock: Clock, caplo
     clock.advance(5.1)
     await ticks()
     assert len(_missed(caplog)) == 1
-    assert _missed(caplog)[0].run_id == "01JBQX7Q6Z1K7Y4ZZZZZZZZZZ1"
+    assert _missed(caplog)[0].count == 1
+    assert not hasattr(_missed(caplog)[0], "run_id")
     await _safety_poll_finds(state, clock, "01JBQX7Q6Z1K7Y4ZZZZZZZZZZ1")
     clock.advance(5.1)
     await ticks()

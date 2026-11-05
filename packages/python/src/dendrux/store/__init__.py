@@ -519,6 +519,9 @@ class RunStore:
         self._stream_readers = 0
         self._idle_release_requested = False
         self._acquiring: asyncio.Task[None] | None = None
+        self._releasing: asyncio.Task[None] | None = None
+        self._retiring_lease: tuple[LiveUpdates, object] | None = None
+        self._retirement_retry_at = float("inf")
         self._lease_retry_at = 0.0
         self._coordinators: dict[asyncio.AbstractEventLoop, _Coordinator] = {}
 
@@ -657,38 +660,94 @@ class RunStore:
             await asyncio.wait({task}, timeout=timeout)
 
     async def _release_lease(self) -> None:
-        if self._lease is None or self._lease_loop is not asyncio.get_running_loop():
-            return
-        async with self._lease_lock:
-            await self._release_locked()
+        self._begin_release()
+        task = self._releasing
+        if task is not None and self._lease_loop is asyncio.get_running_loop():
+            await asyncio.wait({task}, timeout=self._listener_stop_timeout())
 
-    async def _release_locked(self) -> None:
-        lease, live = self._lease, self._live_updates()
-        if lease is None or live is None:
+    def _listener_stop_timeout(self) -> float:
+        return self._event_feed.stop_timeout_s if self._event_feed else DEFAULT_STOP_TIMEOUT_S
+
+    def _begin_release(self) -> None:
+        if self._lease_loop is not asyncio.get_running_loop() or self._releasing is not None:
             return
+        self._take_retiring_lease()
+        if self._retiring_lease is not None:
+            self._retirement_retry_at = float("inf")
+            self._releasing = asyncio.create_task(
+                self._retire_lease(), name="dendrux-live-updates-retire"
+            )
+            self._releasing.add_done_callback(self._released)
+
+    def _take_retiring_lease(self) -> None:
+        live = self._live_updates()
+        if self._lease is not None and live is not None:
+            self._retiring_lease = (live, self._lease)
+            self._lease = None
+
+    async def _retire_lease(self) -> None:
+        owned = self._retiring_lease
+        if owned is None:
+            return
+        live, lease = owned
         with contextlib.suppress(RuntimeError, LiveUpdatesUnavailableError):
             await live.release_listener(lease)
-        if self._lease is lease:
-            self._lease = None
+        if self._retiring_lease is owned:
+            self._retiring_lease = None
+
+    def _released(self, task: asyncio.Task[None]) -> None:
+        _observe_task(task)
+        if self._releasing is task:
+            self._releasing = None
+        if self._retirement_failed(task):
+            return
+        if task.cancelled() or self._closed or not self._has_reader_demand():
+            return
+        self._reacquire_after_release()
+
+    def _retirement_failed(self, task: asyncio.Task[None]) -> bool:
+        if self._retiring_lease is None:
+            return False
+        self._retirement_retry_at = asyncio.get_running_loop().time() + _LEASE_RETRY_S
+        if task.cancelled():
+            for coordinator in self._coordinators.values():
+                coordinator._wake.set()
+        else:
+            self._reader_idle()
+        return True
+
+    def _retirement_due(self, loop: asyncio.AbstractEventLoop) -> float:
+        if self._lease_loop is not loop or self._releasing is not None:
+            return float("inf")
+        return self._retirement_retry_at
+
+    def _retry_retirement(self) -> None:
+        loop = asyncio.get_running_loop()
+        if self._retirement_due(loop) <= loop.time():
+            self._begin_release()
+
+    def _reacquire_after_release(self) -> None:
+        loop = asyncio.get_running_loop()
+        live = self._live_updates()
+        if live is not None and self._lease_needed(loop):
+            self._queue_acquisition(live, loop)
 
     def _has_reader_demand(self) -> bool:
         return bool(
             self._follow_admissions
             or self._stream_readers
-            or any(c.runs for c in self._coordinators.values())
+            or any(c.has_active_runs() for c in self._coordinators.values())
         )
+
+    def _reader_idle(self) -> None:
+        if not self._closed:
+            self._follow_coordinator().request_idle()
 
     async def _release_idle_lease(self) -> None:
         if self._has_reader_demand() or self._lease_loop is not asyncio.get_running_loop():
             return
         self._idle_release_requested = True
-        for coordinator in self._coordinators.values():
-            coordinator._leave_hub()
-        if self._acquiring is not None and not self._acquiring.done():
-            return  # Acquisition owns the lock; it releases an unwanted lease itself.
-        async with self._lease_lock:
-            if not self._has_reader_demand():
-                await self._release_locked()
+        self._begin_release()
 
     async def __aenter__(self) -> RunStore:
         return self
@@ -705,20 +764,26 @@ class RunStore:
         loop = asyncio.get_running_loop()
         if live is None:
             return
+        if self._lease_loop in (None, loop):
+            self._idle_release_requested = False
         while self._lease_needed(loop):
             self._lease_loop = loop
-            self._idle_release_requested = False
-            task = self._acquiring
-            if task is None or task.done():
-                task = loop.create_task(self._acquire(live), name="dendrux-live-updates-lease")
-                task.add_done_callback(_observe_task)
-                self._acquiring = task
-            await asyncio.shield(task)
+            await asyncio.shield(self._queue_acquisition(live, loop))
+
+    def _queue_acquisition(
+        self, live: LiveUpdates, loop: asyncio.AbstractEventLoop
+    ) -> asyncio.Task[None]:
+        task = self._acquiring
+        if task is None or task.done():
+            task = loop.create_task(self._acquire(live), name="dendrux-live-updates-lease")
+            task.add_done_callback(_observe_task)
+            self._acquiring = task
+        return task
 
     def _lease_needed(self, loop: asyncio.AbstractEventLoop) -> bool:
         if self._closed or self._lease_loop not in (None, loop):
             return False
-        if self._lease is not None and not self._lease_lock.locked():
+        if self._lease is not None or self._retiring_lease is not None:
             return False
         return loop.time() >= self._lease_retry_at
 
@@ -726,7 +791,7 @@ class RunStore:
         async with self._lease_lock:
             await self._acquire_locked(live)
         if self._release_after_acquire():
-            await self._release_lease()
+            self._begin_release()
 
     def _release_after_acquire(self) -> bool:
         return self._closed or (self._idle_release_requested and not self._has_reader_demand())
@@ -1009,7 +1074,7 @@ class RunStore:
             if live is not None and handle is not None:
                 with contextlib.suppress(RuntimeError, LiveUpdatesUnavailableError):
                     live.unregister(handle)
-            await self._release_idle_lease()
+            self._reader_idle()
 
     def _register_stream(self, waker: _RunWaker) -> tuple[LiveUpdates | None, object | None]:
         """Register a ``stream_events`` consumer; unavailable live updates mean polling."""

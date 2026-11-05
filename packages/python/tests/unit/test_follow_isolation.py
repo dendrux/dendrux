@@ -33,7 +33,14 @@ async def test_bad_tenant_isolated_with_shared_read_budget(phase, caplog):
         c.runs[rid] = run
     before = c._now()
     with caplog.at_level(logging.WARNING):
-        await asyncio.wait_for(c._cycle(list(c.runs.values()), c._now()), 5)
+        c.revive()
+        async with asyncio.timeout(5):
+            while not all(
+                run.head == 0 if phase == "events" else run.status_due > before
+                for rid, run in c.runs.items()
+                if rid != "private-bad"
+            ):
+                await asyncio.sleep(0.01)
     for rid, run in c.runs.items():
         if rid == "private-bad":
             continue

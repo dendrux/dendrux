@@ -79,7 +79,8 @@ async def test_cancelled_close_keeps_the_handle_and_a_retry_releases_it(where: s
     with contextlib.suppress(asyncio.CancelledError):
         await close
     if where == "before_release_lock":
-        assert reader._lease is not None  # not forgotten by a cancelled close
+        assert reader._retiring_lease is not None  # owned retirement survives client cancellation
+        assert reader._retiring_lease[1] in live._leases
         live._listener_lock.release()
     live.stopping.set()
     await reader.close()
