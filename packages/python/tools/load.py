@@ -81,7 +81,11 @@ V050_REFERENCE_A = 59.0  # recorded 2026-10-27, commit dca4f05e (owner-docs load
 # Informational release comparison only (§12.53); baseline edits cannot change it.
 # Measured after 3d-trim (8a189402), 2026-10-31, 200 flows per mode / two workers.
 # Durable evidence: owner-docs/build-0.6.0/work/p3c-load/fix1-a-calibration.json.
-SCENARIO_A_BUDGETS = {"a_notify_off": 74, "a_notify_on": 83}
+# 2026-11-05 (owner): one read before each provider call checks for a cancel or pause, which costs
+# one statement per call. Live updates add no statements now. Measured at ee2fd2ef: about 75.2 per
+# flow and 19 per iteration (owner-docs/build-0.6.0/work/rfint/load/quick-ee2fd2ef.json).
+ITERATION_BUDGET = 19
+SCENARIO_A_BUDGETS = {"a_notify_off": 76, "a_notify_on": 76}
 
 LABEL: ContextVar[str] = ContextVar("load_label", default="other")
 OP: ContextVar[str] = ContextVar("load_op", default="-")
@@ -2337,10 +2341,13 @@ async def ctl_iteration(url: str, cfg: dict[str, Any], workers: int) -> Outcome:
 
 
 def iteration_budget_checks(variants: dict[str, Any]) -> list[dict[str, Any]]:
-    """Keep the spec's 21-notify-on/18-off PostgreSQL iteration ceilings fixed."""
+    """Keep the fixed per-iteration ceiling (19, owner 2026-11-05) for every variant.
+
+    The pre-call cancel/pause read costs one statement per provider call; live updates add none.
+    """
     checks = []
     for name, variant in variants.items():
-        budget = 21 if name.startswith("notify_on") else 18
+        budget = ITERATION_BUDGET
         value = variant["max_non_terminal"]
         checks.append(
             {

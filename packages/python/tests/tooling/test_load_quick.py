@@ -239,22 +239,22 @@ def test_baseline_scale_is_checked_before_comparing_counts():
         load.compare_gates({"x": 10}, {"scale": "quick", "gates": {"x": 10}}, scale="full")
 
 
-def test_scenario_a_uses_absolute_budgets_and_reports_the_release_comparison(monkeypatch):
-    monkeypatch.setattr(load, "SCENARIO_A_BUDGETS", {"a_notify_off": 74, "a_notify_on": 83})
+def test_scenario_a_uses_absolute_budgets_and_reports_the_release_comparison():
+    assert load.SCENARIO_A_BUDGETS == {"a_notify_off": 76, "a_notify_on": 76}
     outcomes = {
-        "a_notify_off": load.Outcome(metrics={"statements_per_run": 74}),
-        "a_notify_on": load.Outcome(metrics={"statements_per_run": 84}),
+        "a_notify_off": load.Outcome(metrics={"statements_per_run": 76}),
+        "a_notify_on": load.Outcome(metrics={"statements_per_run": 76}),
     }
     checks = load.scenario_a_checks(outcomes)
-    assert [(c["ok"], c["limit"]) for c in checks] == [(True, 74), (False, 83)]
+    assert [(c["ok"], c["limit"]) for c in checks] == [(True, 76), (True, 76)]
     assert all("0.6" in c["name"] for c in checks)
-    assert outcomes["a_notify_off"].metrics["vs_v050_percent"] == 25.4
+    assert outcomes["a_notify_off"].metrics["vs_v050_percent"] == 28.8
 
 
-def test_post_trim_a_cost_above_budget_fails_before_twenty_percent_regression():
+def test_scenario_a_cost_one_statement_above_budget_fails_before_the_twenty_percent_gate():
     outcomes = {
-        "a_notify_off": load.Outcome(metrics={"statements_per_run": 75}),
-        "a_notify_on": load.Outcome(metrics={"statements_per_run": 84}),
+        "a_notify_off": load.Outcome(metrics={"statements_per_run": 77}),
+        "a_notify_on": load.Outcome(metrics={"statements_per_run": 77}),
     }
     assert not any(c["ok"] for c in load.scenario_a_checks(outcomes))
 

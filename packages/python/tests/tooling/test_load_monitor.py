@@ -542,15 +542,19 @@ def test_postgres_dsn_adapter_refuses_mysql():
         load.dsn_of(MYSQL)
 
 
-def test_iteration_budgets_are_fixed_at_21_on_and_18_off():
+def test_iteration_budgets_are_fixed_at_19_for_both_variants():
     assert hasattr(load, "iteration_budget_checks"), "fixed iteration budgets missing"
-    variants = {
-        "notify_on_batch": {"max_non_terminal": 22},
+    at_budget = {
+        "notify_on_batch": {"max_non_terminal": 19},
         "notify_off_batch": {"max_non_terminal": 19},
     }
-    checks = load.iteration_budget_checks(variants)
-    assert [c["ok"] for c in checks] == [False, False]
-    assert [c["limit"] for c in checks] == [21, 18]
+    checks = load.iteration_budget_checks(at_budget)
+    assert [(c["ok"], c["limit"]) for c in checks] == [(True, 19), (True, 19)]
+    over = {
+        "notify_on_batch": {"max_non_terminal": 20},
+        "notify_off_batch": {"max_non_terminal": 20},
+    }
+    assert [c["ok"] for c in load.iteration_budget_checks(over)] == [False, False]
 
 
 async def test_pool_records_real_wait_latency(tmp_path):
