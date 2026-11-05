@@ -3818,6 +3818,55 @@ class SQLStateStore(SQLBlobCatalog):
             )
             return int(value) + 1 if value is not None else 0
 
+    async def get_public_traces(
+        self,
+        run_id: str,
+        *,
+        tenant_id: TenantScope = UNSCOPED,
+        limit: int | None = None,
+        offset: int = 0,
+        retry: bool = False,
+        before_order_index: int | None = None,
+    ) -> list[TraceRecord]:
+        """Read one public page with its reservation cutoff from the same snapshot."""
+        from sqlalchemy import and_, false, func, or_, select
+
+        from dendrux._meta_keys import SEED_PREFIX_META_KEY
+        from dendrux.db.models import AgentRun, ReactTrace
+
+        visible_seed = (
+            and_(
+                ReactTrace.trace_kind == "seed",
+                func.coalesce(
+                    self.json_get(ReactTrace.meta, (SEED_PREFIX_META_KEY,), "bool"), false()
+                )
+                == false(),
+            )
+            if not retry
+            else false()
+        )
+        stmt = (
+            select(ReactTrace, self.json_get(AgentRun.loop_state, ("pending",), "json"))
+            .join(AgentRun, AgentRun.id == ReactTrace.agent_run_id)
+            .where(
+                ReactTrace.agent_run_id == run_id,
+                _run_in_scope(run_id, tenant_id),
+                ReactTrace.role.in_(("user", "assistant", "tool")),
+                or_(ReactTrace.trace_kind == "turn", visible_seed),
+            )
+            .order_by(ReactTrace.order_index)
+            .offset(offset)
+        )
+        if limit is not None:
+            stmt = stmt.limit(limit)
+        async with self._session_factory() as session:
+            result = (await session.execute(stmt)).all()
+            # A separately fetched checkpoint could expose a late row after a reservation moves.
+            pending = (result[0][1] or []) if result else []
+            boundary = min((p["order_index"] for p in pending), default=None)
+            rows = [r for r, _ in result if boundary is None or r.order_index < boundary]
+            return [_trace_record(row) for row in rows]
+
     async def get_traces(
         self,
         run_id: str,

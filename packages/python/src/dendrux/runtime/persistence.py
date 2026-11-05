@@ -345,12 +345,14 @@ def _message_position(
     if reserved is None:
         return order_index, pending, phase, 1
     if rejected:
-        first = min(pending, key=lambda p: p["order_index"])
-        first["order_index"], reserved["order_index"] = (
-            reserved["order_index"],
-            first["order_index"],
-        )
-    pending = [p for p in pending if p["call_id"] != call_id]
+        ordered = sorted(pending, key=lambda p: p["order_index"])
+        slots = [p["order_index"] for p in ordered]
+        reordered = [reserved, *[p for p in ordered if p is not reserved]]
+        for call, slot in zip(reordered, slots, strict=True):
+            call["order_index"] = slot
+    pending = sorted(
+        (p for p in pending if p["call_id"] != call_id), key=lambda p: p["order_index"]
+    )
     phase = "dispatch" if pending else "model_next"
     return reserved["order_index"], pending, phase, 0
 
@@ -385,6 +387,12 @@ def _plan_message(
             _planned_call(tc, order_index + delta + i, targets, gates, denied)
             for i, tc in enumerate(message.tool_calls)
         ]
+        slots = sorted(p["order_index"] for p in pending)
+        pending.sort(
+            key=lambda p: 0 if p["phase"] == "invalid" else 2 if p["phase"] == "client" else 1
+        )
+        for call, slot in zip(pending, slots, strict=True):
+            call["order_index"] = slot
         delta += len(message.tool_calls)
         phase = "dispatch"
     plan = _MessagePlan(trace, pending, phase, delta)
@@ -490,6 +498,7 @@ class PersistenceRecorder(BaseRecorder):
         self._loop_source: Any = None
         self._loop_state: dict[str, Any] = deepcopy(getattr(state_store, "loop_state", None) or {})
         self._known_history: list[tuple[int, str]] = []
+        self._observation_order: dict[str, int] = {}
         self._system_messages: list[Message] = []
         for trace in seed_traces or [] if self._format2 else []:
             self._remember(trace)
@@ -516,7 +525,6 @@ class PersistenceRecorder(BaseRecorder):
             else DEFAULT_PAUSE_SUMMARY_BYTES
         )
 
-
     async def restore_history(self, *, limits: Any, records: Any = None) -> None:
         self._history_limits = limits
         if not self._format2:
@@ -540,6 +548,11 @@ class PersistenceRecorder(BaseRecorder):
                 _view_identity({"role": trace.role, "content": trace.content, "meta": trace.meta}),
             ),
         )
+        call_id = (trace.meta or {}).get("call_id")
+        if call_id:
+            self._observation_order[call_id] = (
+                trace.order_index * 1000 if position is None else position
+            )
         if trace.role == "system":
             self._system_messages.append(Message(role=Role.SYSTEM, content=trace.content))
 
@@ -601,7 +614,6 @@ class PersistenceRecorder(BaseRecorder):
                     ),
                 )
             budget.restore(restored)
-
 
     async def _state_ref(self, kind: str, payload: dict[str, Any]) -> str | None:
         from dendrux.runtime.state import TraceWrite
@@ -834,25 +846,16 @@ class PersistenceRecorder(BaseRecorder):
         self._durable_state = deepcopy(self._loop_state)
 
     def order_observations(self, history: list[Message]) -> None:
-        """Keep validation results first, followed by reserved execution order."""
+        """Use the durable observation slots, including decisions made after resume."""
         if not self._format2:
             return
-        order: dict[str, int] = {}
         start = 0
         for i, message in enumerate([*history, None]):
             if message is not None and message.role.value == "tool":
                 continue
             history[start:i] = sorted(
-                history[start:i],
-                key=lambda m: (
-                    0 if m.meta.get(NOT_EXECUTED_META_KEY) else 1,
-                    0
-                    if m.meta.get(NOT_EXECUTED_META_KEY)
-                    else order.get(m.call_id or "", len(order)),
-                ),
+                history[start:i], key=lambda m: self._observation_order.get(m.call_id or "", 0)
             )
-            if message is not None and message.tool_calls:
-                order = {tc.id: n for n, tc in enumerate(message.tool_calls)}
             start = i + 1
 
     async def checkpoint_view(self, messages: list[Message], iteration: int) -> None:
@@ -869,13 +872,25 @@ class PersistenceRecorder(BaseRecorder):
         if digests != [digest for _, digest in self._known_history]:
             trace = await self._edited_view(view, digests)
             self._order_index += 1
+            self._rebase_pending(trace.order_index)
             await self._checkpoint(trace)
             self._known_history = [
                 (trace.order_index * 1000 + i, digest) for i, digest in enumerate(digests)
             ]
+            self._observation_order = {
+                m.call_id: trace.order_index * 1000 + i
+                for i, m in enumerate(messages)
+                if m.call_id is not None
+            }
             self._system_messages = [m for m in messages if m.role.value == "system"]
         elif self._loop_state != self._durable_state:
             await self._checkpoint()
+
+    def _rebase_pending(self, rewrite_order: int) -> None:
+        pending = sorted(self._loop_state.get("pending", []), key=lambda p: p["order_index"])
+        for i, call in enumerate(pending):
+            call["order_index"] = rewrite_order + 1 + i
+        self._order_index = max(self._order_index, rewrite_order + 1 + len(pending))
 
     async def _edited_view(self, view: list[dict[str, Any]], digests: list[str]) -> TraceWrite:
         from dendrux.runtime.replay import conversation_records

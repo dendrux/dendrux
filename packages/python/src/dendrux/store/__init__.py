@@ -1187,7 +1187,8 @@ class RunStore:
     ) -> list[TraceEntry]:
         """Return the conversation trace (user / assistant / tool messages)
         for a run, ordered by ``order_index``. ``limit``/``offset`` push
-        pagination into SQL for format 1; format 2 scans bounded physical pages.
+        pagination into SQL for both formats. Format 2 withholds rows beyond the
+        first pending observation until the preceding slots are filled.
         System prompts and seeded history are excluded before counting rows,
         positions and pagination. Recovery metadata is not exposed.
         SQL stores and the format-2 branch clamp pages
@@ -1199,7 +1200,7 @@ class RunStore:
         check_read_scope(tenant_id)
         _warn_page("get_traces", limit, "offset")
         from dendrux.runtime._capabilities import capabilities
-        from dendrux.runtime._public_traces import public_traces
+        from dendrux.runtime._public_traces import pending_boundary, public_traces
 
         if capabilities(self._state).checkpointing:
             record = await self._scoped_read(self._state.get_run, run_id, tenant_id)
@@ -1211,6 +1212,7 @@ class RunStore:
                     limit=_trace_page_limit(limit),
                     offset=offset,
                     retry=record.retry_of_run_id is not None,
+                    before_order_index=pending_boundary(record),
                 )
                 return [_trace_to_public(r) for r in rows]
         rows = await self._scoped_read(

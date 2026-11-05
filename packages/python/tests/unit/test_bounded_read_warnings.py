@@ -153,7 +153,15 @@ async def test_format_two_clamp_is_at_facade_only(monkeypatch):
             )
             == []
         )
-    assert seen == [{"tenant_id": "tenant", "limit": 1000, "offset": 23, "retry": False}]
+    assert seen == [
+        {
+            "tenant_id": "tenant",
+            "limit": 1000,
+            "offset": 23,
+            "retry": False,
+            "before_order_index": None,
+        }
+    ]
 
 
 async def test_warning_uses_stdlib_deduplication():

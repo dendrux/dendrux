@@ -2,19 +2,14 @@
 
 from __future__ import annotations
 
-import json
-import logging
-from dataclasses import dataclass, field, replace
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
-from dendrux import _codes
 from dendrux._meta_keys import MESSAGE_META_KEY, SEED_PREFIX_META_KEY, STEP_META_KEY
-from dendrux.errors import RunNotReclaimableError
 from dendrux.runtime._bounds import MAX_SMALL_PAGE
-from dendrux.types import Limits
 
 if TYPE_CHECKING:
-    from dendrux.runtime.state import StateStore, TenantScope, TraceRecord
+    from dendrux.runtime.state import RunRecord, StateStore, TenantScope, TraceRecord
 
 
 async def public_traces(
@@ -25,33 +20,55 @@ async def public_traces(
     limit: int | None,
     offset: int,
     retry: bool = False,
+    before_order_index: int | None = None,
 ) -> list[TraceRecord]:
     """Page the run's own user, assistant and tool rows in their original order."""
+    sql_page = getattr(store, "get_public_traces", None)
+    if sql_page is not None:
+        rows = await sql_page(
+            run_id,
+            tenant_id=tenant_id,
+            limit=limit,
+            offset=offset,
+            retry=retry,
+            before_order_index=before_order_index,
+        )
+        return [_public_record(row, offset + i) for i, row in enumerate(rows)]
     records: list[TraceRecord] = []
-    budget = _ScanBudget(run_id)
     after = None
     ordinal = 0
     while limit is None or len(records) < limit:
         page = await store.get_traces_after(
             run_id,
             after_order_index=after,
-            limit=MAX_SMALL_PAGE,
+            limit=min(MAX_SMALL_PAGE, limit - len(records))
+            if limit is not None
+            else MAX_SMALL_PAGE,
             kinds=("seed", "turn"),
             tenant_id=tenant_id,
         )
         if not page:
             break
-        for row in page:
-            budget.add(row)
-            if not _visible(row, retry):
-                continue
-            if ordinal >= offset:
-                records.append(_public_record(row, ordinal))
-            ordinal += 1
-            if len(records) == limit:
-                break
-        after = page[-1].order_index
+        last = page[-1].order_index
+        if before_order_index is not None:
+            page = [row for row in page if row.order_index < before_order_index]
+        if not page:
+            break
+        shown, count = _visible_page(page, retry, offset, ordinal)
+        records.extend(shown)
+        ordinal += count
+        after = last
     return records
+
+
+def _visible_page(
+    page: list[TraceRecord], retry: bool, offset: int, ordinal: int
+) -> tuple[list[TraceRecord], int]:
+    visible = [row for row in page if _visible(row, retry)]
+    skip = max(0, offset - ordinal)
+    return [_public_record(row, ordinal + i) for i, row in enumerate(visible) if i >= skip], len(
+        visible
+    )
 
 
 def _visible(row: TraceRecord, retry: bool) -> bool:
@@ -71,24 +88,6 @@ def _public_record(row: TraceRecord, ordinal: int) -> TraceRecord:
     return replace(row, order_index=ordinal, meta=shown)
 
 
-@dataclass
-class _ScanBudget:
-    run_id: str
-    limits: Limits = field(default_factory=Limits)
-    rows: int = 0
-    size: int = 0
-
-    def add(self, row: TraceRecord) -> None:
-        self.rows += 1
-        self.size += len(
-            json.dumps(
-                {"role": row.role, "content": row.content, "meta": row.meta},
-                ensure_ascii=False,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        )
-        if self.rows > self.limits.max_rebuild_rows or self.size > self.limits.max_rebuild_bytes:
-            _codes.log_code(
-                logging.getLogger(__name__), _codes.HISTORY_TOO_LARGE, run_id=self.run_id
-            )
-            raise RunNotReclaimableError(self.run_id, "history_too_large")
+def pending_boundary(record: RunRecord | None) -> int | None:
+    pending = (getattr(record, "loop_state", None) or {}).get("pending", [])
+    return min((p["order_index"] for p in pending), default=None)

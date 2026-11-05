@@ -1,8 +1,5 @@
-"""Public trace filtering cannot turn a small requested page into an unlimited scan."""
+"""Custom public trace pages do not inherit recovery history limits."""
 
-import pytest
-
-from dendrux.errors import RunNotReclaimableError
 from dendrux.runtime._public_traces import public_traces
 from dendrux.runtime.state import TraceRecord
 
@@ -30,11 +27,9 @@ class Rows:
         ]
 
 
-async def test_hidden_prefix_scan_is_bounded():
-    store = Rows(20001, hidden=True)
-    with pytest.raises(RunNotReclaimableError, match="history_too_large"):
-        await public_traces(store, "0" * 26, tenant_id="t", limit=1, offset=0)
-    assert store.calls <= 81
+async def test_hidden_prefix_is_not_returned():
+    store = Rows(21, hidden=True)
+    assert await public_traces(store, "0" * 26, tenant_id="t", limit=1, offset=0) == []
 
 
 async def test_ten_times_realistic_trace_history_can_be_paged():
@@ -43,7 +38,7 @@ async def test_ten_times_realistic_trace_history_can_be_paged():
     assert [r.order_index for r in rows] == list(range(9990, 10000))
 
 
-async def test_trace_byte_scan_is_bounded():
+async def test_public_page_is_independent_of_recovery_bytes():
     store = Rows(1, content="x" * (17 * 1024 * 1024))
-    with pytest.raises(RunNotReclaimableError, match="history_too_large"):
-        await public_traces(store, "0" * 26, tenant_id="t", limit=1, offset=0)
+    rows = await public_traces(store, "0" * 26, tenant_id="t", limit=1, offset=0)
+    assert len(rows) == 1 and len(rows[0].content) == 17 * 1024 * 1024
