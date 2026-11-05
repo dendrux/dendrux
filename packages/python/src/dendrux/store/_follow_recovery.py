@@ -8,6 +8,10 @@ runs, and a failed group is halved like any failed batch.
 Each failed phase waits out its own retry deadline, which hints never shorten. The deadline only
 grows when some other read worked since this run last failed, or when the run keeps relapsing;
 during an outage nothing works, so every run stays ready to be re-checked as soon as it ends.
+
+Groups split while no read had worked for a while say nothing about their runs. Once a read works
+again they merge back, instead of being read one small piece at a time. Groups split while reads
+were working are kept apart: that failure really does point at one of their runs.
 """
 
 from __future__ import annotations
@@ -27,6 +31,7 @@ SUSPECT_RECOVERY_READS_PER_S = 10.0
 SUSPECT_RETRY_MIN_S = 5.0
 SUSPECT_RETRY_MAX_S = 30.0
 SUSPECT_RECHECK_S = 5.0
+OUTAGE_AFTER_S = 5.0
 RELAPSE_WINDOW_S = 60.0
 
 
@@ -41,6 +46,7 @@ class _Isolation:
     runs: list[_WatchedRun]
     status: bool
     suspects: bool = False
+    outage: bool = False
     token: object = field(default_factory=object)
 
     def queue(self) -> None:
@@ -77,25 +83,24 @@ def take_job(jobs: deque[_Isolation], watched: dict[str, _WatchedRun]) -> _Isola
     return None
 
 
-def split_jobs(runs: list[_WatchedRun], status: bool, suspects: bool) -> list[_Isolation]:
-    middle = len(runs) // 2
-    return [_Isolation(group, status, suspects) for group in (runs[:middle], runs[middle:])]
-
-
-def merge_jobs(jobs: deque[_Isolation], watched: dict[str, _WatchedRun], size: int) -> None:
-    """Rebuild waiting jobs into groups of up to ``size`` runs, per phase, oldest first."""
-    if len(jobs) < 2:
-        return
-    suspects = jobs[0].suspects
+def merge_outage_jobs(jobs: deque[_Isolation], watched: dict[str, _WatchedRun], size: int) -> None:
+    """Rebuild the jobs split during an outage into full groups, per phase, oldest first."""
+    kept: list[_Isolation] = []
     waiting: dict[bool, list[_WatchedRun]] = {False: [], True: []}
-    while jobs:
-        job = jobs.popleft()
-        waiting[job.status].extend(job.take(watched))
+    suspects = False
+    for job in jobs:
+        suspects = job.suspects
+        if job.outage:
+            waiting[job.status].extend(job.take(watched))
+        else:
+            kept.append(job)
+    jobs.clear()
     for status, runs in waiting.items():
         for group in _batches(runs, size):
             job = _Isolation(group, status, suspects)
             job.queue()
             jobs.append(job)
+    jobs.extend(kept)
 
 
 def retry_backoff(delay: float) -> float:
@@ -116,12 +121,12 @@ def _batches(runs: list[_WatchedRun], size: int) -> Iterable[list[_WatchedRun]]:
 class _Suspects:
     """The suspects of one coordinator, their group re-checks and their read allowance."""
 
-    def __init__(self) -> None:
+    def __init__(self, now: float) -> None:
         self.runs: set[_WatchedRun] = set()
         self.jobs: deque[_Isolation] = deque()
         self.probe_at = -math.inf
-        self.read_ok_at = -math.inf
-        self.good_reads = 0
+        self.read_ok_at = now
+        self.outage_jobs = False
         self._recheck_at = -math.inf
         self._interval = 1 / SUSPECT_READS_PER_S
 
@@ -162,7 +167,19 @@ class _Suspects:
     def note_read(self, worked: bool, now: float) -> None:
         if worked:
             self.read_ok_at = now
-            self.good_reads += 1
+
+    def split(self, runs: list[_WatchedRun], status: bool, now: float) -> list[_Isolation]:
+        """A failed group's two halves, ready to wait for their own reads."""
+        suspects = all(run.suspect for run in runs)
+        outage = now - self.read_ok_at >= OUTAGE_AFTER_S
+        self.outage_jobs |= outage
+        middle = len(runs) // 2
+        jobs = [
+            _Isolation(group, status, suspects, outage) for group in (runs[:middle], runs[middle:])
+        ]
+        for job in jobs:
+            job.queue()
+        return jobs
 
     def note_failure(self, now: float) -> None:
         self._interval = 1 / SUSPECT_READS_PER_S
@@ -177,7 +194,9 @@ class _Suspects:
         for status in (False, True):
             ready = [run for run in ordered if _phase_ready(run, status, now)]
             for group in _batches(ready, batch):
-                job = _Isolation(group, status, suspects=True)
+                outage = now - self.read_ok_at >= OUTAGE_AFTER_S
+                self.outage_jobs |= outage
+                job = _Isolation(group, status, True, outage)
                 job.queue()
                 self.jobs.append(job)
 
@@ -186,3 +205,10 @@ class _Suspects:
         if self.runs:
             times.append(self._recheck_at)
         return min(times, default=math.inf)
+
+    def store_is_back(self, now: float) -> bool:
+        """True once after jobs were split during an outage, when a read has worked again."""
+        if self.outage_jobs and now - self.read_ok_at < OUTAGE_AFTER_S:
+            self.outage_jobs = False
+            return True
+        return False

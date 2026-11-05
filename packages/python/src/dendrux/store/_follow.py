@@ -58,8 +58,7 @@ from dendrux.runtime._pending import (
 from dendrux.store._follow_recovery import (
     _Isolation,
     _Suspects,
-    merge_jobs,
-    split_jobs,
+    merge_outage_jobs,
     take_job,
 )
 from dendrux.store._redact import (
@@ -442,7 +441,7 @@ class _Coordinator:
         self._tokens_at = self._now()
         self._safety_windows: dict[float, float] = {}
         self._isolations: deque[_Isolation] = deque()
-        self._suspects = _Suspects()
+        self._suspects = _Suspects(self._now())
         self._discovery_at = -math.inf
         self._missed_generation: int | None = None
         self._missed_count = 0
@@ -709,6 +708,9 @@ class _Coordinator:
 
     async def _read_due(self, now: float) -> bool:
         self._suspects.queue_due(now, POLL_BATCH_RUNS)
+        if self._suspects.store_is_back(now):
+            for jobs in (self._isolations, self._suspects.jobs):
+                merge_outage_jobs(jobs, self.runs, POLL_BATCH_RUNS)
         due = self._due_runs(now)
         job = self._next_job(due, now)
         if job is not None:
@@ -780,20 +782,11 @@ class _Coordinator:
         return job
 
     async def _read_job(self, job: _Isolation) -> None:
-        """Read one waiting group's failed phase. A good read means the store works, so groups
-        still waiting from the same failure merge again instead of being read one small piece
-        at a time; a run that really is bad just splits out of its group again."""
-        good_reads = self._suspects.good_reads
+        """Read one waiting group's failed phase."""
         events, statuses = ([], job.runs) if job.status else (job.runs, [])
         await self._read_phases(job.runs, events, statuses)
         if not job.suspects:
             self._discovery_at = self._now() + DISCOVERY_INTERVAL_S
-        if self._suspects.good_reads > good_reads:
-            merge_jobs(
-                self._suspects.jobs if job.suspects else self._isolations,
-                self.runs,
-                POLL_BATCH_RUNS,
-            )
 
     def _prioritize(self, runs: list[_WatchedRun]) -> list[_WatchedRun]:
         now = self._now()
@@ -1002,11 +995,8 @@ class _Coordinator:
             self._queue_isolation(runs, status)
 
     def _queue_isolation(self, runs: list[_WatchedRun], status: bool) -> None:
-        suspects = all(run.suspect for run in runs)
-        jobs = self._suspects.jobs if suspects else self._isolations
-        for job in split_jobs(runs, status, suspects):
-            job.queue()
-            jobs.append(job)
+        split = self._suspects.split(runs, status, self._now())
+        (self._suspects.jobs if split[0].suspects else self._isolations).extend(split)
         self._prune_isolations()
 
     def _prune_isolations(self) -> None:

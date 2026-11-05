@@ -449,16 +449,41 @@ async def test_a_failed_group_of_suspects_stays_on_the_suspect_queue(clock):
         await reader.close()
 
 
-async def test_merged_groups_never_pass_the_batch_size(clock):
+async def test_groups_split_during_an_outage_merge_and_others_stay_apart(clock):
     state = BatchedState()
     reader = RunStore(state)
     coordinator = reader._follow_coordinator()
-    runs = [watch(reader, state, f"r{i}") for i in range(25)]
+    runs = [watch(reader, state, f"r{i}") for i in range(30)]
     jobs = deque(group(runs[start : start + 5], suspects=False) for start in range(0, 25, 5))
+    for job in jobs:
+        job.outage = True
+    apart = group(runs[25:], suspects=False)
+    jobs.append(apart)
     try:
-        _follow_recovery.merge_jobs(jobs, coordinator.runs, 10)
-        assert [len(job.runs) for job in jobs] == [10, 10, 5]
+        _follow_recovery.merge_outage_jobs(jobs, coordinator.runs, 10)
+        assert [len(job.runs) for job in jobs] == [10, 10, 5, 5]
+        assert jobs[-1] is apart
         assert all(job.holds(run) for job in jobs for run in job.runs)
+    finally:
+        await reader.close()
+
+
+async def test_a_failed_group_is_only_an_outage_when_nothing_has_worked_for_a_while(clock):
+    state = BatchedState()
+    reader = RunStore(state)
+    coordinator = reader._follow_coordinator()
+    runs = [watch(reader, state, f"r{i}") for i in range(4)]
+    suspects_ = coordinator._suspects
+    try:
+        suspects_.note_read(True, clock.now)
+        early = suspects_.split(runs, False, clock.now + _follow_recovery.OUTAGE_AFTER_S - 0.1)
+        assert not any(job.outage for job in early)
+        late = suspects_.split(runs, False, clock.now + _follow_recovery.OUTAGE_AFTER_S)
+        assert all(job.outage for job in late)
+        assert not suspects_.store_is_back(clock.now + _follow_recovery.OUTAGE_AFTER_S)
+        suspects_.note_read(True, clock.now + 20)
+        assert suspects_.store_is_back(clock.now + 20)
+        assert not suspects_.store_is_back(clock.now + 20)  # Once per outage.
     finally:
         await reader.close()
 
