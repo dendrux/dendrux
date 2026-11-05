@@ -223,7 +223,7 @@ All frozen dataclasses. Top-level fields are immutable; nested `dict`/`list` val
 [//]: # "docs-test: skip - placeholder: `...` stands for your other arguments"
 
 ```python
-# Store-owned engine (typical)
+# Store-owned engine (typical), inside an async function
 async with RunStore.from_database_url("postgresql+asyncpg://...") as store:
     ...
 

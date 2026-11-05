@@ -270,7 +270,7 @@ After a page reload, a dropped request or a retried idempotent call, call `GET /
 
 `call.id` is the dendrux-owned ULID for the tool call. Use it (not the provider's id) when shipping back the result. The runtime correlates by `call_id`. `payload` is a JSON-encoded string. Encode whatever the LLM should see; dendrux passes it through as the tool message content.
 
-### Optional: live updates with `follow`
+### Optional: a live feed with `follow`
 
 If you want progress in the UI while the model works, add a route over `RunStore.follow` and let the client subscribe. It is an addition; the flow above works without it. See [Build your own read routes](/docs/recipes/build-your-own-read-routes) for the route, redaction, caps and how to authenticate an SSE connection.
 

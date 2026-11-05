@@ -7,15 +7,22 @@ description: The read-only facade over Dendrux's six tables. Constructors, every
 
 `RunStore` is the public, read-only way to query everything Dendrux persisted about a run. It is a plain Python object you can call from any code (routes, admin scripts, background jobs) it supports routes and inspection tools owned by your app.
 
-[//]: # "docs-test: skip - fragment: relies on `run_id`, defined by setup shown elsewhere"
+[//]: # "docs-test: skip - fragment: needs an existing database and a real run id"
 
 ```python
+import asyncio
+
 from dendrux.store import RunStore
 
-store = RunStore.from_database_url("sqlite+aiosqlite:///app.db")
-async with store:
-    run = await store.get_run(run_id)
-    events = await store.get_events(run_id, limit=100)   # one page; see Bounded list reads
+
+async def main(run_id: str) -> None:
+    async with RunStore.from_database_url("sqlite+aiosqlite:///app.db") as store:
+        run = await store.get_run(run_id)
+        events = await store.get_events(run_id, limit=100)   # one page; see Bounded list reads
+        print(run, len(events))
+
+
+asyncio.run(main("01J..."))   # the id of a run in app.db
 ```
 
 ## Constructors and lifecycle
@@ -47,7 +54,7 @@ async def read_image(run_id: str, sha256: str, *, tenant_id=...) -> bytes
 
 `from_database_url` creates and owns an engine; `close()` (or exiting the `async with`) disposes it. `from_engine` and `RunStore(store)` leave engine ownership with you. Closing any of them also stops its live feed. `RunStore` is an async context manager.
 
-**Live updates.** Only `RunStore(store)` listens, and only when `store.live_updates` is set (see [Scaling](/docs/guides/scaling#live-updates)). It takes a listener lease the first time you call `follow()` or `stream_events()`; `close()` releases that lease and never closes the store or its sender, so close the store yourself afterwards with `await store.close()`. Several `RunStore` objects over one store each hold their own lease. `from_engine` and `from_database_url` never listen, and nothing warns you: their followers poll. To listen, build the store yourself and wrap it with `RunStore(store)`. A reader whose live updates are unavailable polls instead of failing. If it cannot take its lease, it asks again after 30 seconds; connection failures after that are retried by the transport itself with backoff. There is no `notifier=` or `listen_url=` argument: the listen URL is `PostgresUpdates(listen_url=...)`. One `RunStore` shares one lease between all its readers and gives it back after 60 seconds with nothing to watch; see [What a reader does](/docs/guides/scaling#what-a-reader-does). Use one long-lived `RunStore` where you can.
+**Live updates.** Only `RunStore(store)` listens, and only when `store.live_updates` is set (see [Scaling](/docs/guides/scaling#live-updates)). It takes a listener lease the first time you call `follow()` or `stream_events()`; `close()` releases that lease and never closes the store or its sender, so close the store yourself afterwards with `await store.close()`. Several `RunStore` objects over one store each hold their own lease. `from_engine` and `from_database_url` never listen, and nothing warns you: their followers poll. To listen, build the store yourself and wrap it with `RunStore(store)`. A reader whose live updates are unavailable polls instead of failing. If it cannot take its lease, it asks again after 30 seconds; connection failures after that are retried by the transport itself with backoff. The listen URL belongs to the transport: `PostgresUpdates(listen_url=...)`. One `RunStore` shares one lease between all its readers and gives it back after 60 seconds with nothing to watch; see [What a reader does](/docs/guides/scaling#what-a-reader-does). Use one long-lived `RunStore` where you can.
 
 **Shutdown order.** Close the reader before you dispose its engine, in `async with` or a `finally`. One coordinator task per `RunStore` serves every follower, and closing the last follower does not stop it: it ends on its own after about 60 seconds with nothing to watch, or at `close()`. If you dispose the engine first, the coordinator's next read can fail with a pool error (for example a `KeyError`) and log `follow_read_failed`. For a borrowed engine (`RunStore(store)`, `from_engine`), `await reader.close()` and only then `await engine.dispose()`. `async with RunStore.from_engine(engine) as reader:` closes the reader on exit; dispose the engine after the block. A reader from `from_database_url` owns its engine, and `close()` disposes it.
 
@@ -374,7 +381,7 @@ print(tree.usage.input_tokens, tree.usage.output_tokens, tree.usage.cost_usd)
 - **Tenancy.** Omit `tenant_id` (or pass `UNSCOPED`) for a trusted, unscoped read of all descendants. Pass a string to scope to that tenant, or an explicit `None` to scope to untenanted runs. The root must be in scope (otherwise it reads as missing) and so must every descendant; a run outside the scope is excluded together with everything below it.
 - Raises `RunNotFoundError` if the root does not exist or is out of scope.
 
-**Bounding the tree: `max_nodes`.** Pass a positive integer (not `bool`, at most `2**63 - 1`; anything else raises `ValueError` and logs `read_argument_invalid` before any store call). The root does not count. The read **refuses when the descendants reach `max_nodes`**: with `max_nodes=10_000`, 9,999 descendants pass and 10,000 refuse. Refusal raises `dendrux.errors.SubtreeTooLargeError` (a `ValueError`) carrying `run_id` and `max_nodes`, and logs the code `subtree_limit` with `run_id` and `limit`. Catch it to report the refusal, or retry with a larger bound you chose. The root and every returned descendant stay tenant scoped; foreign-tenant branches are excluded as before.
+**Bounding the tree: `max_nodes`.** Pass a positive integer (not `bool`, at most `2**63 - 1`; anything else raises `ValueError` and logs `read_argument_invalid` before any store call). The bound counts descendants only; the run you pass in is not counted, although `tree.nodes` lists it first. The read **refuses when the descendants reach `max_nodes`**: with `max_nodes=10_000`, 9,999 descendants pass (so `tree.nodes` holds up to 10,000 entries, the root included) and 10,000 descendants refuse. Refusal raises `dendrux.errors.SubtreeTooLargeError` (a `ValueError`) carrying `run_id` and `max_nodes`, and logs the code `subtree_limit` with `run_id` and `limit`. Catch it to report the refusal, or retry with a larger bound you chose. The root and every returned descendant stay tenant scoped; foreign-tenant branches are excluded as before.
 
 [//]: # "docs-test: skip - fragment: relies on `store`, `run_id` and `tenant`, defined by setup shown elsewhere"
 

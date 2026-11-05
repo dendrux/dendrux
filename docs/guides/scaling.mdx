@@ -130,6 +130,8 @@ See [Recovery](/docs/guides/recovery) for attempt limits, recovery approval and 
 
 Live updates tell other processes that a run may have changed, so `follow()` and `stream_events()` read it as soon as the hint arrives instead of waiting for the next poll. They are optional and off by default.
 
+> **Two names, two things.** In these docs *live updates* are the optional hints described on this page (the `live_updates=` option of a store). The *live feed* is what `RunStore.follow` returns to your route. The feed works with or without live updates; they only make it faster.
+
 > **Hints are lossy; the database is the truth.** A hint carries only run ids. It can arrive late, twice, out of order or never, and a reader always re-reads the database before it shows anything. An announcement never fails, rolls back or changes the result of a save. If every hint is lost, followers still see every event: they poll.
 
 ### Turn them on
@@ -180,7 +182,7 @@ What this does and does not do:
 - **Only `RunStore(store)` listens.** `RunStore.from_engine(engine)` and `RunStore.from_database_url(url)` build a store with no live updates, so their followers poll. They do not fail and they do not warn, so a reader built this way looks healthy while it ignores every hint. Build the store, give it `live_updates=`, and wrap it: `RunStore(state)`. A reader in another process builds its own store with live updates and wraps it the same way. Several `RunStore` objects over one store each take a listener lease; the listener runs until the last one closes.
 - **Writers and readers need the same bus.** Every process that writes runs gives its store the same transport and channel as the readers. A writer without live updates is still correct: its runs are found by the safety poll.
 - **`Agent(database_url=...)` cannot enable them.** A `live_updates` key in `database_options` is refused with a `ValueError` on `Agent`, `sweep(database_url=...)`, `get_engine` and `RunStore.from_database_url`, even when its value is `None` or `False`. Build the store yourself and pass it to `Agent(state_store=...)`, `sweep(state_store=...)` or `RunStore(store)`. `sweep(database_url=...)` uses a temporary store with no live updates.
-- **There is no `listen_url=` or channel option on `RunStore`.** The channel and the listen URL belong to the transport: `PostgresUpdates(channel=..., listen_url=...)`.
+- **The channel and the listen URL belong to the transport.** Set them on the transport, `PostgresUpdates(channel=..., listen_url=...)`, not on `RunStore`.
 - **A closed `Agent` closes only what it created.** `Agent.close()` closes the store it built from `database_url=`; a store you passed in is yours to close with `await store.close()`.
 
 ### What announces
@@ -198,7 +200,7 @@ One coordinator task per `RunStore` and event loop serves every `follow()` on it
 | Situation | When the run is read |
 | --- | --- |
 | A hint arrives, or a follower joins | At once (events and status) |
-| Live updates healthy, nothing arrives | Every `poll_healthy_s`, **10 seconds by default with 20 % jitter either way** (the safety poll) |
+| Live updates healthy, nothing arrives | Every `poll_healthy_s`, **10 seconds by default with 20 % jitter either way** (the safety poll). Set it on `EventFeed(store, poll_healthy_s=...)`; `RunStore.follow` has no such argument |
 | Live updates off, or the listener is down | After `poll_interval_s` (0.5 s), backing off to `poll_max_s` (2 s) while idle; status on every fourth read |
 | The listener reconnects, or incoming hints overflowed (a gap) | Every watched run once, spread by up to `poll_interval_s` of jitter |
 | Any case | Status at most 30 seconds old; a full page of events is read again at once; a terminal run is drained until a page comes back empty, plus a 100 ms grace, before `FollowEnd` (see [How a follow ends](/docs/reference/run-store#how-a-follow-ends)) |
@@ -300,15 +302,19 @@ A `LiveUpdates` subclass needs two methods; the base class owns batching, de-dup
 
 You never parse messages. On the wire a message is a compact JSON array of run-id strings of at most `max_message_bytes` UTF-8 bytes, built and read by the base class; a message that does not decode to a list of non-empty strings within the limits is dropped whole and counted. A batch of ids is split into as many messages as it needs and handed to one `send` call.
 
-This runnable example is a loopback bus that delivers hints inside one process. Replace the queue with NATS, Kafka, a socket or whatever your platform provides:
+This loopback bus delivers hints inside one process. It runs as it is: a mock model, no API key and a temporary SQLite file. Replace the queue with NATS, Kafka, a socket or whatever your platform provides. The full example with a follower is `examples/40_live_updates.py`.
 
 ```python
 import asyncio
+import tempfile
 from collections.abc import AsyncIterator, Sequence
+from pathlib import Path
 
 from dendrux import Agent
-from dendrux.db.session import get_engine
+from dendrux.db.session import get_engine, reset_engine
+from dendrux.llm.mock import MockLLM
 from dendrux.store import LiveUpdates, RunStore, SQLiteStateStore
+from dendrux.types import LLMResponse
 
 
 class LoopbackUpdates(LiveUpdates):
@@ -328,21 +334,29 @@ class LoopbackUpdates(LiveUpdates):
             yield await self._queue.get()
 
 
-engine = await get_engine("sqlite+aiosqlite:///live-updates.db")
-bus = LoopbackUpdates()
-state = SQLiteStateStore(engine, live_updates=bus)
-reads = RunStore(state)
-agent = Agent(
-    provider="anthropic:claude-haiku-4-5",
-    prompt="Reply briefly.",
-    state_store=state,
-    strict_tenancy=False,  # single-tenant example
-)
-result = await agent.run("Hello")
-assert bus.stats().sent > 0  # the run announced itself
-await agent.close()
-await reads.close()
-await state.close()
+async def main() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        engine = await get_engine(f"sqlite+aiosqlite:///{Path(tmp) / 'live.db'}")
+        bus = LoopbackUpdates()
+        state = SQLiteStateStore(engine, live_updates=bus)
+        reads = RunStore(state)
+        agent = Agent(
+            provider=MockLLM([LLMResponse(text="Hello!")]),  # use a real provider in your app
+            prompt="Reply briefly.",
+            state_store=state,
+            strict_tenancy=False,  # single-tenant example
+        )
+        try:
+            await agent.run("Hello")
+            assert bus.stats().sent > 0  # the run announced itself
+        finally:
+            await agent.close()
+            await reads.close()
+            await state.close()
+            await reset_engine()  # disposes the engine that get_engine created
+
+
+asyncio.run(main())
 ```
 
 Limits are keyword arguments of the base constructor, shared by every transport:

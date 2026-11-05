@@ -22,10 +22,22 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-green.svg" alt="License: Apache 2.0" /></a>
 </p>
 
-> `v0.5.0` - core API stabilizing, actively developed.
+> `v0.6.0` - core API stabilizing, actively developed.
 
 
 ---
+
+## What's new in 0.6.0
+
+0.6.0 ("Production") adds recovery after a worker stops and the tools to run Dendrux across many processes. Read the [upgrade guide](docs/upgrading-to-0.6.0.mdx) before you deploy: migrate, roll every worker and reader, take a backup, then activate storage format 2. Activation is one way.
+
+- **Recovery.** `sweep(on_stale="reclaim")` marks runs whose worker stopped, and `agent.reclaim(...)` continues them from their last committed state. You call both from your own jobs; Dendrux starts no background workers. See [Recovery](docs/guides/recovery.mdx).
+- **Durable checkpoints.** Storage format 2 keeps conversation history and execution state in bounded rows, so a run survives a restart between steps.
+- **Optional live updates.** Postgres or Redis hints wake `RunStore.follow` early. They are off by default and only a wake-up: the database stays the truth. Only `RunStore(store)` listens; `RunStore.from_engine` polls. See [Scaling workers](docs/guides/scaling.mdx#live-updates) and `examples/40_live_updates.py`.
+- **One reader coordinator.** `follow` is served by one coordinator per `RunStore`, which reads all watched runs in batches.
+- **MySQL and MariaDB.** `MySQLStateStore` and a store test kit for any other SQL database. See [MySQL and MariaDB](docs/guides/mysql.mdx) and [Build your own store](docs/guides/build-your-own-store.mdx).
+- **Bounded reads.** `get_events`, `get_traces`, `get_llm_calls`, `get_tool_invocations` and `get_subtree` take `limit=` or `max_nodes=`. Omitting it warns in 0.6 and defaults to a bound in 0.7.
+- **Defaults flip.** Strict tenancy, `on_governance_change="raise"` and cache-token budgets are on. The Agent ignores `DENDRUX_DATABASE_URL`. See [Every default change](docs/upgrading-to-0.6.0.mdx#every-default-change).
 
 ## What's new in 0.5.0
 
@@ -399,7 +411,7 @@ async def submit(run_id: str, body: ResultsBody, user=Depends(require_user)):
     )
 ```
 
-Pause/resume orchestration and the CAS-safe claim are Dendrux's job. Auth, schema, error shape, and framework choice are yours; for the client's side, build `GET /runs/{id}/pending` over `RunStore.get_pending`, and add live updates with `RunStore.follow` if you want them (see [Client-side tools](docs/recipes/client-tools.mdx)). Never pipe `agent.stream()` into a browser SSE response: closing the tab cancels the run.
+Pause/resume orchestration and the CAS-safe claim are Dendrux's job. Auth, schema, error shape, and framework choice are yours; for the client's side, build `GET /runs/{id}/pending` over `RunStore.get_pending`, and add a live feed with `RunStore.follow` if you want one (see [Client-side tools](docs/recipes/client-tools.mdx)). Never pipe `agent.stream()` into a browser SSE response: closing the tab cancels the run.
 
 ### 🔀 Streaming
 
@@ -554,15 +566,15 @@ ANTHROPIC_API_KEY=sk-... python 01_hello_world.py
 | Min coverage enforced | 80% |
 | Python versions tested | 3.11, 3.12, 3.13 |
 | CI checks | lint, format, types, architecture, tests, API-break check |
-| Alembic migrations | 17 |
-| Examples | 39 runnable scripts + 5 example apps |
+| Alembic migrations | 18 |
+| Examples | 40 runnable scripts + 5 example apps |
 | Development started | March 11, 2026 |
 
 ---
 
 ## Status
 
-Dendrux is in active development (`v0.5.0`). The core API is stabilizing. `Agent`, `tool`, `run`, `stream`, `retry`, `resume`, `submit_tool_results`, `submit_input`, `submit_approval`, `cancel_run`, `sweep`, `RunStore` are the public surface and unlikely to break. Internal modules may still change.
+Dendrux is in active development (`v0.6.0`). The core API is stabilizing. `Agent`, `tool`, `run`, `stream`, `retry`, `resume`, `submit_tool_results`, `submit_input`, `submit_approval`, `cancel_run`, `sweep`, `RunStore` are the public surface and unlikely to break. Internal modules may still change.
 
 | Layer | Status |
 |-------|--------|
