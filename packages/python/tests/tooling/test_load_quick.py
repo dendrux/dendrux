@@ -82,15 +82,15 @@ def test_rss_measurement_does_not_require_permission_to_spawn_ps(monkeypatch):
 def test_baseline_comparison_fails_only_on_a_regression_over_twenty_percent():
     baseline = {
         "scale": "quick",
-        "gates": {"a.statements_per_run": 100, "iteration.notify_on_batch": 20},
+        "gates": {"a.statements_per_run": 100, "iteration.live_on_batch": 20},
     }
     rows, failed = load.compare_gates(
-        {"a.statements_per_run": 119, "iteration.notify_on_batch": 20}, baseline, scale="quick"
+        {"a.statements_per_run": 119, "iteration.live_on_batch": 20}, baseline, scale="quick"
     )
     assert not failed
     assert [r[-1] for r in rows] == ["ok", "ok"]
     rows, failed = load.compare_gates(
-        {"a.statements_per_run": 121, "iteration.notify_on_batch": 20}, baseline, scale="quick"
+        {"a.statements_per_run": 121, "iteration.live_on_batch": 20}, baseline, scale="quick"
     )
     assert failed
     assert dict((r[0], r[-1]) for r in rows)["a.statements_per_run"] == "FAIL"
@@ -100,11 +100,43 @@ def test_baseline_comparison_fails_only_on_a_regression_over_twenty_percent():
     )[1]
 
 
+def test_baseline_gates_recorded_under_the_notify_names_are_read_under_the_live_names(tmp_path):
+    path = tmp_path / "old.json"
+    path.write_text(
+        json.dumps(
+            {
+                "scale": "quick",
+                "gates": {
+                    "a_notify_off.statements_per_run": 74.0,
+                    "a_notify_on.statements_per_run": 83.0,
+                    "a_shared_agent.statements_per_run": 74.0,
+                    "iteration.notify_on_stream": 21,
+                    "iteration.notify_off_batch": 18,
+                    "runs.statements_per_run": 42.0,
+                },
+            }
+        )
+    )
+    assert load.load_baseline(path)["gates"] == {
+        "a_live_off.statements_per_run": 74.0,
+        "a_live_on.statements_per_run": 83.0,
+        "a_shared_agent.statements_per_run": 74.0,
+        "iteration.live_on_stream": 21,
+        "iteration.live_off_batch": 18,
+        "runs.statements_per_run": 42.0,
+    }
+    current = {"a_live_on.statements_per_run": 76.0, "iteration.live_off_batch": 19}
+    rows, failed = load.compare_gates(current, load.load_baseline(path), scale="quick")
+    assert not failed
+    assert {r[0] for r in rows} == set(current)
+
+
 def test_committed_baseline_carries_the_gates_and_the_machine():
-    baseline = json.loads((PKG / "tools" / "load_baseline.json").read_text())
+    # load_baseline() reads a baseline recorded before the live_* rename under the new names
+    baseline = load.load_baseline(PKG / "tools" / "load_baseline.json")
     assert baseline["scale"] == "quick"
-    assert "iteration.notify_on_batch" in baseline["gates"]
-    assert baseline["gates"]["iteration.notify_on_batch"] <= 25
+    assert "iteration.live_on_batch" in baseline["gates"]
+    assert baseline["gates"]["iteration.live_on_batch"] <= 25
     recorded = baseline["recorded"]
     assert recorded["machine"] and recorded["cores"] > 0
     # Sandboxed sysctl may be unavailable; keep the raw empty/null values honest.
@@ -192,14 +224,14 @@ def test_a_tiny_load_run_passes_its_checks_on_postgres(tmp_path):
     failed = [c["name"] for c in results["checks"] if not c["ok"]]
     assert not failed, failed
     gates = results["gates"]
-    assert gates["iteration.notify_on_batch"] <= 25
+    assert gates["iteration.live_on_batch"] <= 25
     kill = results["scenarios"]["kill_checkpoint"]["metrics"]
     assert kill["extra_billed_calls"] == 0 and kill["runs_in_killed_process"] >= 1
     assert kill["killed_worker_statements"] > 0
     assert kill["statements_including_recovery"] == (
         kill["statements"] + kill["recovery_statements"]
     )
-    assert results["scenarios"]["a_notify_off"]["metrics"]["statements_per_run"] > 0
+    assert results["scenarios"]["a_live_off"]["metrics"]["statements_per_run"] > 0
     assert proc.returncode == int(any(not c["ok"] for c in results["checks"]))
 
 
@@ -240,21 +272,21 @@ def test_baseline_scale_is_checked_before_comparing_counts():
 
 
 def test_scenario_a_uses_absolute_budgets_and_reports_the_release_comparison():
-    assert load.SCENARIO_A_BUDGETS == {"a_notify_off": 76, "a_notify_on": 76}
+    assert load.SCENARIO_A_BUDGETS == {"a_live_off": 76, "a_live_on": 76}
     outcomes = {
-        "a_notify_off": load.Outcome(metrics={"statements_per_run": 76}),
-        "a_notify_on": load.Outcome(metrics={"statements_per_run": 76}),
+        "a_live_off": load.Outcome(metrics={"statements_per_run": 76}),
+        "a_live_on": load.Outcome(metrics={"statements_per_run": 76}),
     }
     checks = load.scenario_a_checks(outcomes)
     assert [(c["ok"], c["limit"]) for c in checks] == [(True, 76), (True, 76)]
     assert all("0.6" in c["name"] for c in checks)
-    assert outcomes["a_notify_off"].metrics["vs_v050_percent"] == 28.8
+    assert outcomes["a_live_off"].metrics["vs_v050_percent"] == 28.8
 
 
 def test_scenario_a_cost_one_statement_above_budget_fails_before_the_twenty_percent_gate():
     outcomes = {
-        "a_notify_off": load.Outcome(metrics={"statements_per_run": 77}),
-        "a_notify_on": load.Outcome(metrics={"statements_per_run": 77}),
+        "a_live_off": load.Outcome(metrics={"statements_per_run": 77}),
+        "a_live_on": load.Outcome(metrics={"statements_per_run": 77}),
     }
     assert not any(c["ok"] for c in load.scenario_a_checks(outcomes))
 

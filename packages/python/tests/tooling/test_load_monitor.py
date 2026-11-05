@@ -44,14 +44,14 @@ def test_mysql_never_allows_remote_even_with_postgres_opt_in():
         load.check_private_url(MYSQL.replace("127.0.0.1", "elsewhere"), allow_remote_host=True)
 
 
-def test_store_uses_factory_and_only_postgres_notify(monkeypatch):
+def test_store_uses_factory_and_only_postgres_live_updates(monkeypatch):
     from dendrux.runtime.stores import _factory
 
     seen = []
     monkeypatch.setattr(_factory, "store_for_engine", lambda e, **kw: seen.append(kw) or e)
     for backend, options in [("mysql", {}), ("postgresql", {"live_updates": True})]:
         engine = SimpleNamespace(dialect=SimpleNamespace(name=backend))
-        assert load.make_store(engine, notify=True) is engine
+        assert load.make_store(engine, live=True) is engine
         assert seen[-1] == options
 
 
@@ -66,14 +66,14 @@ def test_mysql_engine_has_no_asyncpg_connection_args(monkeypatch):
     assert seen["connect_args"] == {}
 
 
-def test_mysql_plan_skips_notify_followers_with_notes():
+def test_mysql_plan_skips_live_update_variants_with_notes():
     assert hasattr(load, "scenario_jobs"), "dialect-aware scenario planning missing"
     jobs, notes = load.scenario_jobs(MYSQL, load.PRESETS["tiny"], 2, load.ALL_SCENARIOS, False)
     names = [name for name, _ in jobs]
-    assert "runs" in names and "a_notify_off" in names and "iteration" in names
-    assert "a_notify_on" not in names and "followers_on" not in names
+    assert "runs" in names and "a_live_off" in names and "iteration" in names
+    assert "a_live_on" not in names and "followers_on" not in names
     assert "followers_off" not in names
-    assert any("NOTIFY" in note for note in notes)
+    assert any("live updates" in note for note in notes)
 
 
 def test_summary_ring_is_bounded_and_uses_last_half_median():
@@ -520,7 +520,7 @@ async def test_mysql_driver_counters_count_protocol_and_sql_events():
     assert "performance_schema" in queries[0] and "statement/%" in queries[0]
 
 
-def test_iteration_render_supports_mysql_without_notify_on_variants():
+def test_iteration_render_supports_mysql_without_live_on_variants():
     variant = {
         "startup": 1,
         "iteration_1": 18,
@@ -533,7 +533,7 @@ def test_iteration_render_supports_mysql_without_notify_on_variants():
         "model_calls": 3,
         "latency_ms": {"n": 1},
     }
-    out = load.Outcome(metrics={"variants": {"notify_off_batch": variant}, "server": {}})
+    out = load.Outcome(metrics={"variants": {"live_off_batch": variant}, "server": {}})
     assert "checkpoint_step" in "\n".join(load.render("iteration", out))
 
 
@@ -545,14 +545,14 @@ def test_postgres_dsn_adapter_refuses_mysql():
 def test_iteration_budgets_are_fixed_at_19_for_both_variants():
     assert hasattr(load, "iteration_budget_checks"), "fixed iteration budgets missing"
     at_budget = {
-        "notify_on_batch": {"max_non_terminal": 19},
-        "notify_off_batch": {"max_non_terminal": 19},
+        "live_on_batch": {"max_non_terminal": 19},
+        "live_off_batch": {"max_non_terminal": 19},
     }
     checks = load.iteration_budget_checks(at_budget)
     assert [(c["ok"], c["limit"]) for c in checks] == [(True, 19), (True, 19)]
     over = {
-        "notify_on_batch": {"max_non_terminal": 20},
-        "notify_off_batch": {"max_non_terminal": 20},
+        "live_on_batch": {"max_non_terminal": 20},
+        "live_off_batch": {"max_non_terminal": 20},
     }
     assert [c["ok"] for c in load.iteration_budget_checks(over)] == [False, False]
 
