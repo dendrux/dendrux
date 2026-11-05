@@ -8,9 +8,9 @@ import warnings
 from typing import Any
 
 from dendrux import _codes
+from dendrux._warnings import _developer_stacklevel
 from dendrux.errors import BudgetConfigurationError, SubtreeTooLargeError
 from dendrux.runtime._bounds import MAX_PAGE
-from dendrux.runtime._capabilities import _developer_stacklevel
 from dendrux.runtime._pending import check_read_int
 
 logger = logging.getLogger(__name__)

@@ -188,14 +188,15 @@ Follower limits (`FollowCapacityError`, answer 503 with a short `Retry-After`):
 - at most **100 per tenant scope** by default, a fifth of the store cap. The cap is per scope, not per user: each string `tenant_id` is one scope, all untenanted (`tenant_id=None`) followers together are one scope, and all `UNSCOPED` followers together are one scope. `FollowCapacityError.per_tenant` tells the two caps apart;
 - **900 seconds** per follow by default (`max_duration_s`), ending with a resume cursor.
 
-A single-tenant app that serves more than 100 live readers per process builds its own feed, and calls `feed.follow(...)` instead of `store.follow(...)`:
+A single-tenant app that serves more than 100 live readers per process builds its own feed, and calls `feed.follow(...)` instead of `reads.follow(...)`:
 
-[//]: # "docs-test: skip - fragment: relies on `store`, defined by setup shown elsewhere"
+[//]: # "docs-test: skip - fragment: relies on `state_store`, defined by setup shown elsewhere"
 
 ```python
-from dendrux.store import EventFeed
+from dendrux.store import EventFeed, RunStore
 
-feed = EventFeed(store, max_followers=2000, max_followers_per_tenant=None)
+reads = RunStore(state_store)
+feed = EventFeed(reads, max_followers=2000, max_followers_per_tenant=None)
 ```
 
 `max_followers_per_tenant=None` turns the per-scope cap off; a number sets it. The caps are per process: size them with your worker count and database pool. `EventFeed(batch=...)` is clamped to at most 1,000 events per run in one read, so Dendrux's own reads stay within the page cap; the coordinator may read fewer to share its query budget, and a terminal run is still drained across every page.
@@ -206,7 +207,7 @@ feed = EventFeed(store, max_followers=2000, max_followers_per_tenant=None)
 
 The feed bounds iteration; your HTTP transport must bound blocked sends and call `aclose()` in `finally`, including if no generator iteration begins.
 
-**`EventFeed` arguments.** Pass these to `EventFeed(store, ...)`. `RunStore.follow` uses the defaults.
+**`EventFeed` arguments.** Pass a `RunStore` as `EventFeed(reads, ...)`, where `reads = RunStore(state_store)`, then set these keyword arguments. A state store passed directly raises `TypeError` at construction. Reuse the reader and close it before the state store. `RunStore.follow` uses the defaults.
 
 | Argument | Default | Meaning |
 | --- | --- | --- |

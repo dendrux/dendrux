@@ -34,19 +34,13 @@ The value is durable pause/resume. If your agent never needs to stop and wait fo
 
 Everything in dendrux serves one of these. Each has a front-door page:
 
-<div className="docs-cards">
-
 **[Pause and resume](/docs/architecture/pause-resume)**: the differentiator. A run can stop for an approval, a human answer, or a client-side tool, persist to your database, and resume in a *different* process, by ID.
 
 **[Governance](/docs/architecture/governance)**: four protective layers (tool deny and policy hooks, human approval, token and dollar budgets, content guardrails with PII redaction) you turn on per agent as kwargs, not per call.
 
 **[Evidence and observability](/docs/recipes/observability)**: one stack: a fail-closed recorder, a fail-open notifier, OpenTelemetry, and RunStore reads for inspection tools you build. Every LLM call, tool execution, and pause is recorded.
 
-</div>
-
 ## Where to go next
-
-<div className="docs-cards">
 
 **[Quickstart](/docs/quickstart)**: install dendrux and run your first pause/resume agent in five minutes. Start here.
 
@@ -57,7 +51,5 @@ Everything in dendrux serves one of these. Each has a front-door page:
 **[Upgrading to 0.5.0](/docs/upgrading-to-0.5.0)**: the migration step, the rolling-deploy rules and a note for every behaviour change.
 
 **[Building a product?](/docs/recipes/app-database-boundary)** Read [Your app DB vs the Dendrux DB](/docs/recipes/app-database-boundary): which data lives in your database vs Dendrux's, a minimal ChatGPT-style schema, and the request lifecycle for one chat turn.
-
-</div>
 
 The recommended order is **Quickstart, then Architecture, then Recipes**. Run the five-minute pause/resume demo first: dendrux's value is in *how* it persists and resumes, and the architecture pages land far better once you've seen it happen.

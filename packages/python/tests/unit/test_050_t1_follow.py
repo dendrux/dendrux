@@ -66,6 +66,13 @@ def _feed(store: RunStore, **kw: Any) -> EventFeed:
     return EventFeed(store, **params)
 
 
+@pytest.mark.parametrize("kind", ["state_store", "object", "none"])
+def test_event_feed_requires_run_store(state: SQLStateStore, kind: str) -> None:
+    candidate: Any = {"state_store": state, "object": object(), "none": None}[kind]
+    with pytest.raises(TypeError, match=r"EventFeed requires a RunStore.*RunStore\(state_store\)"):
+        EventFeed(candidate)
+
+
 async def _collect(follow: Any) -> list[Any]:
     items: list[Any] = []
     async with follow as f:

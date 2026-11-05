@@ -195,12 +195,17 @@ The announcement goes out when the outermost store call returns, after its datab
 
 ### What a reader does
 
+`EventFeed` takes a `RunStore`, not a state store. In the settings below,
+`reads = RunStore(store)` wraps the state store your `Agent` uses. Reuse that
+reader for each feed and close it before closing the state store. Passing a
+state store directly to `EventFeed` raises `TypeError` at construction.
+
 One coordinator task per `RunStore` and event loop serves every `follow()` on it. Stores with both batched read methods are read in chunks of up to 200 runs and 2,000 rows, with at most one events query and one status query per chunk. Stores without batched reads are read one run at a time. All reads share a token budget that starts with 20 tokens, holds at most 20, and replenishes at 20 queries a second. An idle second restores the full 20-token burst, so a full bucket can allow about 40 queries within a second. Hints get priority between reserved oldest-due turns. A hint never adds a run; it only makes a run you already follow due now.
 
 | Situation | When the run is read |
 | --- | --- |
 | A hint arrives, or a follower joins | Due immediately (events and status), subject to the shared budget and fair order |
-| Live updates healthy, nothing arrives | Due after `poll_healthy_s`, **10 seconds by default with 20 % jitter either way** (the safety poll); the shared budget can delay the read. Set it on `EventFeed(store, poll_healthy_s=...)`; `RunStore.follow` has no such argument |
+| Live updates healthy, nothing arrives | Due after `poll_healthy_s`, **10 seconds by default with 20 % jitter either way** (the safety poll); the shared budget can delay the read. Set it on `EventFeed(reads, poll_healthy_s=...)`; `RunStore.follow` has no such argument |
 | Live updates off, or the listener is down | Due after `poll_interval_s` (0.5 s), backing off to `poll_max_s` (2 s) while idle; status on every fourth read |
 | The listener reconnects, or incoming hints overflowed (a gap) | Every watched run becomes due, spread by up to `poll_interval_s` of jitter |
 | Any case | Status becomes due after at most 30 seconds; a full page of events becomes due again immediately. Reads still share the budget. A terminal run is drained until a page comes back empty, plus a 100 ms grace, before `FollowEnd` (see [How a follow ends](/docs/reference/run-store#how-a-follow-ends)) |
@@ -435,8 +440,8 @@ Every queue Dendrux keeps has a default and an override. Size these with your wo
 
 | Resource | Default | Over the bound | Override |
 | --- | --- | --- | --- |
-| Live `follow` readers per store (process) | 500 | `FollowCapacityError`, answer 503 | `EventFeed(store, max_followers=...)` |
-| Live `follow` readers per tenant scope | 100 (a fifth of the store cap) | `FollowCapacityError(per_tenant=True)` | `EventFeed(store, max_followers_per_tenant=...)`, or `None` to turn it off |
+| Live `follow` readers per store (process) | 500 | `FollowCapacityError`, answer 503 | `EventFeed(reads, max_followers=...)` |
+| Live `follow` readers per tenant scope | 100 (a fifth of the store cap) | `FollowCapacityError(per_tenant=True)` | `EventFeed(reads, max_followers_per_tenant=...)`, or `None` to turn it off |
 | One `follow` reader | 900 s | ends with `FollowEnd("max_duration", cursor)` | `max_duration_s=` |
 | Sync tool threads per process | 32 | calls queue | `DENDRUX_TOOL_THREADS` |
 | Sync tool threads per Agent | 8 | calls queue | `Agent(tool_threads=...)` |

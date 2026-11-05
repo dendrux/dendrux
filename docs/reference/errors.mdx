@@ -128,6 +128,27 @@ What the failed call leaves in the database depends on what the database can sti
 - After work starts, Dendrux tries to record the failure. If the database answers again in time, the run is saved as `error` with the fixed message and a `run.error` event. Unconsumed continuations can instead release to their pause as described below: check the run's status before deciding how to retry.
 - If the database still cannot be written, the run stays `running` at its last committed state: every event and row written before the failure is there, and nothing marks it `error`. Find it with `sweep` and move it on with `reclaim` (or finish it with `on_stale="error"`); see [Recovery](/docs/guides/recovery).
 
+## Fencing and heartbeats
+
+A stale claim stops further writes by that worker. Inside a tool, `aheartbeat()`
+can raise `RuntimeError`; `heartbeat()` retains a fence found in the background
+and raises it at the next heartbeat or step boundary. The concrete exception is
+currently the internal `dendrux.errors.RunFencedError`, a `RuntimeError` subclass.
+It is not exported in `__all__` or from `dendrux`, and its name and fields are not
+public API. Do not rely on importing it or matching its message.
+
+Let the exception leave the tool. If you catch `RuntimeError` to clean up, re-raise
+it; do not continue work or retry side effects after losing ownership. Repeated
+lease-renewal failures instead raise the public `PersistenceError` with
+`code="lease_lost"`; stop the tool for that error too.
+
+The runner normally handles a fence by reading and returning the durable winner's
+current outcome, without writing a new failure. A streaming caller receives the
+corresponding outcome event; if the winner is still running, its local feed ends
+with `RUN_ERROR` and `ErrorInfo(category="run_fenced", retryable=False)` while
+preserving the durable status. Read `Agent.get_result` or `RunStore` before
+choosing a next action. A fence is not a signal to start the same work again.
+
 ## When continuation setup fails
 
 In 0.6.0, `resume`, `resume_stream`, `submit_*` and `reclaim` use the same

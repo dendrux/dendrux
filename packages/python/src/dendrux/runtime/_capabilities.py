@@ -9,6 +9,7 @@ import weakref
 from typing import Any, NoReturn
 
 from dendrux import _codes
+from dendrux._warnings import _developer_stacklevel
 from dendrux.errors import StoreCapabilityError
 from dendrux.runtime.state import StoreCapabilities
 
@@ -60,16 +61,6 @@ _REQUIREMENTS: dict[str, dict[str, tuple[str, ...]]] = {
 }
 _CACHE: dict[int, tuple[weakref.ReferenceType[Any], StoreCapabilities]] = {}
 logger = logging.getLogger(__name__)
-
-
-def _developer_stacklevel() -> int:
-    frame = inspect.currentframe()
-    stacklevel = 0
-    while frame is not None and frame.f_globals.get("__name__", "").startswith("dendrux."):
-        stacklevel += 1
-        frame = frame.f_back
-    del frame
-    return stacklevel
 
 
 def validate_capabilities(store: Any) -> StoreCapabilities:
