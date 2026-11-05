@@ -1,4 +1,5 @@
 import asyncio
+from collections import Counter
 from functools import wraps
 
 import pytest
@@ -69,7 +70,7 @@ async def test_parallel_public_paging_waits_for_missing_slot(store, engine, monk
     assert [r.order_index for r in page + following] == list(range(5))
 
 
-def _slot_agent(store, effects, provider):
+def _slot_agent(store, effects, provider, running=None):
     @tool(idempotent=True)
     async def first() -> str:
         with open(effects, "a") as output:
@@ -80,6 +81,9 @@ def _slot_agent(store, effects, provider):
     async def second() -> str:
         with open(effects, "a") as output:
             output.write("B\n")
+        if running is not None:  # the effect is out, the completion is never reached
+            running.set()
+            await asyncio.Event().wait()
         return "B"
 
     @tool(target="client")
@@ -104,6 +108,7 @@ def _slot_worker(url, boundary, effects, pipe):
 
     async def main():
         engine = create_async_engine(url)
+        running = asyncio.Event() if boundary == "first_complete_second_running" else None
 
         class Store(type(store_for_engine(engine))):
             @wraps(SQLStateStore.checkpoint_step)
@@ -119,10 +124,14 @@ def _slot_worker(url, boundary, effects, pipe):
 
             @wraps(SQLStateStore.complete_tool_call)
             async def complete_tool_call(self, run_id, **kwargs):
+                if running is not None and kwargs["tool_call_id"] == "a":
+                    await running.wait()
                 await super().complete_tool_call(run_id, **kwargs)
-                if kwargs["tool_call_id"] == {"first_complete": "a", "second_complete": "b"}.get(
-                    boundary
-                ):
+                if kwargs["tool_call_id"] == {
+                    "first_complete": "a",
+                    "first_complete_second_running": "a",
+                    "second_complete": "b",
+                }.get(boundary):
                     halt(run_id)
 
         if boundary == "rewrite":
@@ -151,7 +160,7 @@ def _slot_worker(url, boundary, effects, pipe):
                 )
             ]
         )
-        await _slot_agent(Store(engine), effects, provider).run("go", tenant_id="t")
+        await _slot_agent(Store(engine), effects, provider, running).run("go", tenant_id="t")
         raise AssertionError("crash boundary was not reached")
 
     try:
@@ -163,10 +172,38 @@ def _slot_worker(url, boundary, effects, pipe):
         raise
 
 
-@pytest.mark.parametrize(
-    "boundary",
-    ["reserved", "rejected", "late_rejected", "first_complete", "second_complete", "rewrite"],
-)
+async def _server_call_states(engine, run):
+    from sqlalchemy import select
+
+    from dendrux.db.models import ToolCallRecord
+
+    async with engine.connect() as conn:
+        rows = (
+            await conn.execute(
+                select(
+                    ToolCallRecord.tool_call_id, ToolCallRecord.outcome, ToolCallRecord.replayed_at
+                ).where(ToolCallRecord.agent_run_id == run)
+            )
+        ).all()
+    assert len({r[0] for r in rows}) == len(rows), "one row per call"
+    return {r[0]: (r[1], r[2]) for r in rows if r[0] in ("a", "b")}
+
+
+# What is durable for the two idempotent calls when the worker dies. The two calls run
+# in parallel, so the other call of a completion boundary may be unstarted, started or
+# completed by then; that call is left out and checked against the rows read after the kill.
+DURABLE_AT_KILL = {
+    "reserved": {},
+    "rejected": {},
+    "late_rejected": {},
+    "first_complete": {"a": "completed"},
+    "second_complete": {"b": "completed"},
+    "first_complete_second_running": {"a": "completed", "b": "started"},
+    "rewrite": {"a": "completed", "b": "completed"},
+}
+
+
+@pytest.mark.parametrize("boundary", list(DURABLE_AT_KILL))
 async def test_crashed_slot_boundaries_reclaim_once(store, engine, tmp_path, boundary):
     from tests.integration.test_060_reclaim_crashes import kill_process
 
@@ -179,6 +216,13 @@ async def test_crashed_slot_boundaries_reclaim_once(store, engine, tmp_path, bou
     )
     before = await RunStore(store).get_traces(run, tenant_id="t", limit=50)
     item = await expire(store, engine, run)
+    at_kill = {
+        call: outcome for call, (outcome, _) in (await _server_call_states(engine, run)).items()
+    }
+    for call, outcome in DURABLE_AT_KILL[boundary].items():
+        assert at_kill.get(call) == outcome, (boundary, at_kill)
+    if boundary in ("reserved", "rejected", "late_rejected", "rewrite"):
+        assert set(at_kill) == set(DURABLE_AT_KILL[boundary]), (boundary, at_kill)
     provider = MockLLM([LLMResponse(text="done")])
     peers = [_slot_agent(store_for_engine(engine), effects, provider) for _ in range(2)]
     results = await asyncio.gather(
@@ -195,7 +239,25 @@ async def test_crashed_slot_boundaries_reclaim_once(store, engine, tmp_path, bou
         expected_pause_id=paused.pause_id,
     )
     assert result.status == RunStatus.SUCCESS
-    assert sorted(effects.read_text().splitlines()) == ["A", "B"]
+    # An idempotent call whose completion was durable is never run again. One that had only
+    # its started intent replays once, and its effect is out once or twice (twice when the
+    # worker had already run it). One with no intent runs once.
+    runs = Counter(effects.read_text().splitlines())
+    started = sorted(call for call, outcome in at_kill.items() if outcome == "started")
+    for call, name in (("a", "A"), ("b", "B")):
+        assert runs[name] in ((1, 2) if call in started else (1,)), (boundary, at_kill, runs)
+    assert set(runs) == {"A", "B"}
+    if boundary == "first_complete_second_running":
+        assert runs == {"A": 1, "B": 2}
+    replays = await store.get_run_events(run, event_types=["tool.replayed"], tenant_id="t")
+    assert sorted(e.correlation_id for e in replays) == started
+    assert result.recovery.replayed_tool_calls == started
+    final = await _server_call_states(engine, run)
+    assert {call: outcome for call, (outcome, _) in final.items()} == {
+        "a": "completed",
+        "b": "completed",
+    }
+    assert sorted(call for call, (_, replayed_at) in final.items() if replayed_at) == started
     after = await RunStore(store).get_traces(run, tenant_id="t", limit=50)
     assert [(r.content, r.order_index) for r in before] == [
         (r.content, r.order_index) for r in after[: len(before)]
