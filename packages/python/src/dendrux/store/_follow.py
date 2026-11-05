@@ -8,7 +8,8 @@ Load model. Every follower on one ``RunStore`` (per event loop) is served by
 **one coordinator task** that reads all watched runs in batches: per chunk of
 up to 200 due runs, one events query and one status query (a custom store
 without the batched reads gets one read per run under the same budget). The
-coordinator spends at most 20 queries per second, oldest-due run first, and
+coordinator uses a 20-query-per-second token budget, with bounded hint priority
+and reserved oldest-due batches, and
 fans events out in memory, so database load grows with watched runs, not with
 open connections. Without live updates an idle run is read every 0.5 s,
 backing off to 2 s, with a status read every 4th read. With healthy live
@@ -115,6 +116,7 @@ HEALTHY_JITTER = 0.2
 MAX_RESTARTS = 3
 DISCOVERY_INTERVAL_S = 0.1
 HINT_PRIORITY_INTERVAL_S = 1.0
+OLDEST_READ_INTERVAL = 20
 
 _NEVER = math.inf
 _ULID = re.compile(r"[0-7][0-9A-HJKMNP-TV-Z]{25}")
@@ -447,6 +449,7 @@ class _Coordinator:
         self._suspects = _Suspects(self._now())
         self._discovery_at = -math.inf
         self._oldest_probe_at = -math.inf
+        self._reads_until_oldest = OLDEST_READ_INTERVAL
         self._missed_generation: int | None = None
         self._missed_count = 0
         self._idle_since = self._now()
@@ -717,6 +720,10 @@ class _Coordinator:
                 for jobs in (self._isolations, self._suspects.jobs):
                     merge_outage_jobs(jobs, self.runs, POLL_BATCH_RUNS)
         due = self._due_runs(now)
+        oldest = self._oldest_healthy_chunk(due)
+        if oldest:
+            await self._cycle(oldest, now)
+            return True
         job = self._next_job(due, now)
         if job is not None:
             await self._read_job(job)
@@ -771,6 +778,16 @@ class _Coordinator:
     def _due_chunk(self, due: list[_WatchedRun]) -> list[_WatchedRun]:
         return self._next_probe(due, self._now()) or self._prioritize(due)
 
+    def _oldest_healthy_chunk(self, due: list[_WatchedRun]) -> list[_WatchedRun]:
+        if self._reads_until_oldest:
+            return []
+        healthy = [run for run in due if not run.suspect]
+        if not healthy:
+            return []
+        # Count existing budget grants, including retries; idle time creates no work.
+        self._reads_until_oldest = OLDEST_READ_INTERVAL
+        return self._prioritize(healthy, oldest=True)
+
     def _due_runs(self, now: float) -> list[_WatchedRun]:
         return [run for run in self.runs.values() if self._ready_at(run) <= now]
 
@@ -779,10 +796,10 @@ class _Coordinator:
         if not probes:
             return []
         # Bound hint preference across all runs and tenants, not just per hinted run.
-        if now >= self._oldest_probe_at:
+        oldest = now >= self._oldest_probe_at
+        if oldest:
             self._oldest_probe_at = now + HINT_PRIORITY_INTERVAL_S
-            return [min(probes, key=lambda run: (run.due_at(), run.order))]
-        return [min(probes, key=lambda run: self._priority(run, now))]
+        return [min(probes, key=lambda run: self._priority(run, now, oldest=oldest))]
 
     def _next_job(self, due: list[_WatchedRun], now: float) -> _Isolation | None:
         """A waiting group of suspects, if the allowance permits, else of failed healthy runs."""
@@ -798,10 +815,11 @@ class _Coordinator:
         if not job.suspects:
             self._discovery_at = self._now() + DISCOVERY_INTERVAL_S
 
-    def _prioritize(self, runs: list[_WatchedRun]) -> list[_WatchedRun]:
+    def _prioritize(self, runs: list[_WatchedRun], *, oldest: bool = False) -> list[_WatchedRun]:
         now = self._now()
-        runs.sort(key=lambda run: self._priority(run, now))
-        size = POLL_BATCH_RUNS if self.store._batched_events() else PER_RUN_CHUNK_RUNS
+        runs.sort(key=lambda run: self._priority(run, now, oldest=oldest))
+        batched = self.store._batched_events() and (not oldest or self.store._batched_statuses())
+        size = POLL_BATCH_RUNS if batched else PER_RUN_CHUNK_RUNS
         chunk = runs[:size]
         for run in chunk:
             if run.reason == "hint":
@@ -809,8 +827,8 @@ class _Coordinator:
         return chunk
 
     @staticmethod
-    def _priority(run: _WatchedRun, now: float) -> tuple[bool, float, int]:
-        hinted = run.reason == "hint" and now >= run.hint_priority_at
+    def _priority(run: _WatchedRun, now: float, *, oldest: bool = False) -> tuple[bool, float, int]:
+        hinted = not oldest and run.reason == "hint" and now >= run.hint_priority_at
         return not hinted, run.due_at(), run.order
 
     def _ready_at(self, run: _WatchedRun) -> float:
@@ -837,6 +855,7 @@ class _Coordinator:
             self._tokens_at = now
             if self._tokens >= 1:
                 self._tokens -= 1
+                self._reads_until_oldest = max(0, self._reads_until_oldest - 1)
                 return
             await asyncio.sleep((1 - self._tokens) / rate)
 
