@@ -11,7 +11,7 @@ from typing import Any
 
 import pytest
 
-from dendrux.store import RunStore, _follow, _follow_recovery
+from dendrux.store import EventFeed, RunStore, _follow, _follow_recovery
 from tests.unit.test_follow_coordinator import BatchedState, FakeState, ticks
 from tests.unit.test_follow_coordinator import clock as clock
 from tests.unit.test_follow_coordinator import fast_budget as fast_budget
@@ -549,4 +549,142 @@ async def test_a_healed_read_speeds_up_the_share_and_a_failure_slows_it_again(cl
         share.note_failure(clock.now)
         assert share.probe_at == clock.now + slow
     finally:
+        await reader.close()
+
+
+async def test_per_run_store_keeps_healthy_hints_flowing_while_recovery_drains(clock, monkeypatch):
+    real_budget(monkeypatch)
+    state = FakeState()
+    outage = Outage(state)
+    reader = RunStore(state)
+    runs = many(reader, state, 300)
+    coordinator = reader._follow_coordinator()
+    try:
+        await pass_time(clock, 30)
+        outage.down = True
+        for run in runs:
+            run.events_due = run.status_due = clock.now
+        while suspects(runs) < 300:
+            await pass_time(clock, 1)
+        outage.down = False
+        delays = []
+        while suspects(runs) > 30:
+            healthy = next((run for run in runs if not run.suspect), None)
+            if healthy is None:
+                await pass_time(clock, 0.5)
+                continue
+            state.write(healthy.run_id)
+            target, started = state.events[healthy.run_id][-1].sequence_index, clock.now
+            coordinator.on_hints((healthy.run_id,))
+            while healthy.head != target and clock.now - started < 30:
+                await pass_time(clock, 0.05, step=0.05)
+            delays.append(clock.now - started)
+        assert delays and max(delays) <= 2.0
+    finally:
+        await reader.close()
+
+
+async def test_a_group_of_suspects_drops_a_run_that_has_healed(clock):
+    state = BatchedState()
+    reader = RunStore(state)
+    coordinator = reader._follow_coordinator()
+    runs = [watch(reader, state, f"r{i}") for i in range(4)]
+    for run in runs:
+        coordinator._suspects.mark(run)
+    job = group(runs)
+    coordinator._suspects.settle(runs[0], True, clock.now)
+    try:
+        assert job.take(coordinator.runs) == runs[1:]
+        assert runs[0].events_pending is None
+    finally:
+        await reader.close()
+
+
+async def test_per_run_store_reads_a_hinted_suspect_ahead_of_the_drain(clock, monkeypatch):
+    real_budget(monkeypatch)
+    state = FakeState()
+    outage = Outage(state)
+    reader = RunStore(state)
+    runs = many(reader, state, 300)
+    coordinator = reader._follow_coordinator()
+    try:
+        await pass_time(clock, 30)
+        outage.down = True
+        for run in runs:
+            run.events_due = run.status_due = clock.now
+        while suspects(runs) < 300:
+            await pass_time(clock, 1)
+        outage.down = False
+        await pass_time(clock, _follow_recovery.SUSPECT_RETRY_MIN_S + 1)  # Every deadline passed.
+        delays = []
+        for run in reversed(runs):  # Youngest in the drain: the longest wait if it took its turn.
+            if len(delays) == 5 or suspects(runs) == 0:
+                break
+            if run.suspect:
+                state.write(run.run_id)
+                target, started = state.events[run.run_id][-1].sequence_index, clock.now
+                coordinator.on_hints((run.run_id,))
+                while run.head != target and clock.now - started < 60:
+                    await pass_time(clock, 0.05, step=0.05)
+                delays.append(clock.now - started)
+        assert len(delays) == 5 and max(delays) <= 2.0
+    finally:
+        await reader.close()
+
+
+async def test_per_run_retry_backoff_has_a_future_wake(clock):
+    state = FakeState()
+    state.fail_runs.add("bad")
+    reader = RunStore(state)
+    run = watch(reader, state, "bad")
+    coordinator = reader._follow_coordinator()
+    try:
+        assert await coordinator._read_due(clock.now)
+        assert run.suspect
+        # Finish any other due phase; neither retries nor the probe gate are due now.
+        clock.advance(0.5)
+        await coordinator._read_due(clock.now)
+        assert not await coordinator._read_due(clock.now)
+        assert coordinator._next_wake(clock.now) > clock.now
+    finally:
+        await reader.close()
+
+
+async def test_hinted_bad_tenant_cannot_starve_another_tenants_due_suspect(clock, monkeypatch):
+    real_budget(monkeypatch)
+    state = FakeState()
+    outage = Outage(state)
+    reader = RunStore(state)
+    feed = EventFeed(reader, max_followers=500, max_followers_per_tenant=100)
+    hot = [f"hot{i}" for i in range(100)]
+    follows = []
+    try:
+        for rid in [*hot, "quiet"]:
+            tenant = "hot-tenant" if rid in hot else "quiet-tenant"
+            state.create(rid, tenant=tenant)
+            state.write(rid)
+            follow = feed.follow(rid, tenant_id=tenant, until_terminal=False)
+            await follow.start()
+            follows.append(follow)
+        coordinator = reader._follow_coordinator()
+        monkeypatch.setattr(coordinator, "_healthy", lambda: True)
+        await pass_time(clock, 15)
+        outage.down = True
+        for run in coordinator.runs.values():
+            run.events_due = run.status_due = clock.now
+        await pass_time(clock, 120)
+        assert suspects(list(coordinator.runs.values())) == 101
+        outage.down = False
+        state.fail_runs.update(hot)
+        target = state.write("quiet")
+        for _ in range(300):
+            coordinator.on_hints(tuple(hot))
+            await pass_time(clock, 1)
+        assert coordinator.runs["quiet"].head == target
+        # The public iterator receives the pending event, not just the coordinator.
+        assert (await anext(follows[-1])).sequence_index == 0
+        assert (await anext(follows[-1])).sequence_index == target
+    finally:
+        for follow in follows:
+            await follow.aclose()
         await reader.close()

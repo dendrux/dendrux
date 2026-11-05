@@ -103,9 +103,8 @@ _DEFAULT_TENANT_DIVISOR = 5
 #: Coordinator limits (spec §4.2, §4.3); module constants so tests and docs share them.
 POLL_BATCH_RUNS = 200
 #: Runs read per cycle on a store with no batched read, where each run costs its own reads:
-#: small enough that suspects and hinted runs get their turn, with half the budget each way.
-PER_RUN_CHUNK_RUNS = 5
-PER_RUN_RECHECK_RUNS = 10
+#: one, so suspects and hinted runs get their turn between reads.
+PER_RUN_CHUNK_RUNS = 1
 MAX_ROWS_PER_READ = 2_000
 MAX_LIMIT_PER_RUN = 100
 MAX_READS_PER_S = 20.0
@@ -446,8 +445,8 @@ class _Coordinator:
         self._safety_windows: dict[float, float] = {}
         self._isolations: deque[_Isolation] = deque()
         self._suspects = _Suspects(self._now())
-        self._reading_job = False
         self._discovery_at = -math.inf
+        self._oldest_probe_at = -math.inf
         self._missed_generation: int | None = None
         self._missed_count = 0
         self._idle_since = self._now()
@@ -712,11 +711,11 @@ class _Coordinator:
         return active
 
     async def _read_due(self, now: float) -> bool:
-        batched = self.store._batched_events() is not None
-        self._suspects.queue_due(now, POLL_BATCH_RUNS if batched else PER_RUN_RECHECK_RUNS)
-        if self._suspects.store_is_back(now):
-            for jobs in (self._isolations, self._suspects.jobs):
-                merge_outage_jobs(jobs, self.runs, POLL_BATCH_RUNS)
+        if self.store._batched_events() is not None:  # Grouping saves nothing without batches.
+            self._suspects.queue_due(now, POLL_BATCH_RUNS)
+            if self._suspects.store_is_back(now):
+                for jobs in (self._isolations, self._suspects.jobs):
+                    merge_outage_jobs(jobs, self.runs, POLL_BATCH_RUNS)
         due = self._due_runs(now)
         job = self._next_job(due, now)
         if job is not None:
@@ -770,15 +769,20 @@ class _Coordinator:
             _raise_if_cancelling()
 
     def _due_chunk(self, due: list[_WatchedRun]) -> list[_WatchedRun]:
-        return self._next_probe(due) or self._prioritize(due)
+        return self._next_probe(due, self._now()) or self._prioritize(due)
 
     def _due_runs(self, now: float) -> list[_WatchedRun]:
         return [run for run in self.runs.values() if self._ready_at(run) <= now]
 
-    @staticmethod
-    def _next_probe(runs: list[_WatchedRun]) -> list[_WatchedRun]:
+    def _next_probe(self, runs: list[_WatchedRun], now: float) -> list[_WatchedRun]:
         probes = [run for run in runs if run.suspect]
-        return [min(probes, key=lambda run: (run.due_at(), run.order))] if probes else []
+        if not probes:
+            return []
+        # Bound hint preference across all runs and tenants, not just per hinted run.
+        if now >= self._oldest_probe_at:
+            self._oldest_probe_at = now + HINT_PRIORITY_INTERVAL_S
+            return [min(probes, key=lambda run: (run.due_at(), run.order))]
+        return [min(probes, key=lambda run: self._priority(run, now))]
 
     def _next_job(self, due: list[_WatchedRun], now: float) -> _Isolation | None:
         """A waiting group of suspects, if the allowance permits, else of failed healthy runs."""
@@ -790,11 +794,7 @@ class _Coordinator:
     async def _read_job(self, job: _Isolation) -> None:
         """Read one waiting group's failed phase."""
         events, statuses = ([], job.runs) if job.status else (job.runs, [])
-        self._reading_job = True  # Paced as one read, however many a store needs to make it.
-        try:
-            await self._read_phases(job.runs, events, statuses)
-        finally:
-            self._reading_job = False
+        await self._read_phases(job.runs, events, statuses)
         if not job.suspects:
             self._discovery_at = self._now() + DISCOVERY_INTERVAL_S
 
@@ -820,7 +820,8 @@ class _Coordinator:
         times = [self._ready_at(run) for run in self.runs.values()]
         times.extend(self._deadlines())
         times.append(self._isolation_wake(now))
-        times.append(self._suspects.wake_at())
+        if self.store._batched_events() is not None:
+            times.append(self._suspects.wake_at())
         times.append(self.store._retirement_due(self._loop))
         return min(times)
 
@@ -979,11 +980,7 @@ class _Coordinator:
 
     def _read_candidates(self, runs: list[_WatchedRun]) -> list[_WatchedRun]:
         active = self._active_runs(runs)
-        if (
-            not self._reading_job
-            and self._is_probe(active)
-            and self._now() < self._suspects.probe_at
-        ):
+        if self._is_probe(active) and self._now() < self._suspects.probe_at:
             return []
         return active
 
