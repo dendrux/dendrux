@@ -446,6 +446,7 @@ class _Coordinator:
         self._isolations: deque[_Isolation] = deque()
         self._suspects = _Suspects(self._now())
         self._discovery_at = -math.inf
+        self._oldest_probe_at = -math.inf
         self._missed_generation: int | None = None
         self._missed_count = 0
         self._idle_since = self._now()
@@ -775,7 +776,13 @@ class _Coordinator:
 
     def _next_probe(self, runs: list[_WatchedRun], now: float) -> list[_WatchedRun]:
         probes = [run for run in runs if run.suspect]
-        return [min(probes, key=lambda run: self._priority(run, now))] if probes else []
+        if not probes:
+            return []
+        # Bound hint preference across all runs and tenants, not just per hinted run.
+        if now >= self._oldest_probe_at:
+            self._oldest_probe_at = now + HINT_PRIORITY_INTERVAL_S
+            return [min(probes, key=lambda run: (run.due_at(), run.order))]
+        return [min(probes, key=lambda run: self._priority(run, now))]
 
     def _next_job(self, due: list[_WatchedRun], now: float) -> _Isolation | None:
         """A waiting group of suspects, if the allowance permits, else of failed healthy runs."""
@@ -813,7 +820,8 @@ class _Coordinator:
         times = [self._ready_at(run) for run in self.runs.values()]
         times.extend(self._deadlines())
         times.append(self._isolation_wake(now))
-        times.append(self._suspects.wake_at())
+        if self.store._batched_events() is not None:
+            times.append(self._suspects.wake_at())
         times.append(self.store._retirement_due(self._loop))
         return min(times)
 
