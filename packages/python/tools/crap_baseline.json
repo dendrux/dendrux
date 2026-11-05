@@ -12999,10 +12999,10 @@
   "digest": "899b1ccc62d3"
  },
  "src/dendrux/runtime/runner.py::_release_claim": {
-  "complexity": 1,
+  "complexity": 2,
   "coverage": 1.0,
-  "crap": 1.0,
-  "digest": "6ba5ebf64b06"
+  "crap": 2.0,
+  "digest": "e486772da73c"
  },
  "src/dendrux/runtime/runner.py::_release_memory_edges": {
   "complexity": 3,
@@ -13017,10 +13017,10 @@
   "digest": "316f2b1e9ab1"
  },
  "src/dendrux/runtime/runner.py::_release_setup_failure": {
-  "complexity": 3,
+  "complexity": 4,
   "coverage": 1.0,
-  "crap": 3.0,
-  "digest": "a68927182011"
+  "crap": 4.0,
+  "digest": "af0a91d2db36"
  },
  "src/dendrux/runtime/runner.py::_released_resume_hooks": {
   "complexity": 6,
@@ -15702,10 +15702,10 @@
   "digest": "054f79635805"
  },
  "src/dendrux/runtime/submit.py::_release_claim_result": {
-  "complexity": 4,
+  "complexity": 5,
   "coverage": 1.0,
-  "crap": 4.0,
-  "digest": "40c71b623f0a"
+  "crap": 5.0,
+  "digest": "328d0f84d9af"
  },
  "src/dendrux/runtime/submit.py::_release_with_event": {
   "complexity": 6,
