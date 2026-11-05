@@ -171,6 +171,20 @@ jobs:
             exit 1
           fi
 
+      - name: Storage-format conformance on SQLite and Postgres
+        if: matrix.shard == 1 && matrix.python-version == '3.12' && matrix.sqlalchemy-version == '2.1.*'
+        shell: bash
+        env:
+          DENDRUX_TEST_PG_URL: postgresql+asyncpg://dendrux:dendrux@localhost:5432/dendrux_ci_formats_test
+          DENDRUX_CONFORMANCE_PG_DB: dendrux_ci_formats_test
+        run: |
+          pytest tests/conformance/test_conformance.py tests/conformance/test_format2.py -n 0 --no-cov -v -rs -p no:randomly | tee formats.log
+          passed=$(grep -c ' PASSED' formats.log || true)
+          if [ "$passed" -lt 322 ] || grep -Eq '^SKIPPED \[|^=+ .*[0-9]+ skipped|^=+ .*no tests ran' formats.log; then
+            echo "::error::Both storage formats must run on SQLite and Postgres without skips."
+            exit 1
+          fi
+
       - name: Coverage leg name
         id: leg
         shell: bash
@@ -540,6 +554,19 @@ jobs:
           path: packages/python/cov-${{ matrix.server }}.data
           if-no-files-found: error
           retention-days: 1
+
+      - name: Pause-summary contract on ${{ matrix.server }}
+        shell: bash
+        env:
+          SERVER_URL: mysql+asyncmy://root:dendrux_test@127.0.0.1:${{ matrix.port }}/dendrux_ci_test
+        run: |
+          export ${{ matrix.env_name }}="$SERVER_URL"
+          pytest tests/conformance/test_pause_summary_formats.py -k "${{ matrix.server }}" -n 0 --no-cov -v -rs -p no:randomly | tee pause-summary.log
+          passed=$(grep -c ' PASSED' pause-summary.log || true)
+          if [ "$passed" -lt 2 ] || grep -Eq '^SKIPPED \[|^=+ .*[0-9]+ skipped|^=+ .*no tests ran' pause-summary.log; then
+            echo "::error::Both pause-summary versions must run without skips."
+            exit 1
+          fi
 
       - name: Remove ${{ matrix.server }}
         if: always()

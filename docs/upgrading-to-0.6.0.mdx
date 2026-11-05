@@ -179,6 +179,53 @@ Close the reader before you dispose its engine, in `async with` or a `finally`. 
 - Resumes, submissions and reclaim use the stored trace link to stay in one trace when an OpenTelemetry notifier is supplied. In a trace, a failed tool's stack shows where Dendrux reported the failure, rather than where the tool itself crashed.
 - Structured logs carry stable codes. Strict field checking is opt-in with `DENDRUX_STRICT_LOG_FIELDS=1`; normal operation drops invalid fields. See [Log codes](/docs/reference/log-codes).
 
+## Storage-format compatibility
+
+Fresh and activated databases create format-2 runs. Existing format-1 runs retain their
+format. Human-input pauses expose the question and suggested options through
+`RunResult.pending`, `RunResult.to_dict()`, `Agent.get_result()` and
+`RunStore.get_pending()` in both formats. Re-pausing replaces the question and options
+with those for the new pause.
+
+Format 2 saves a bounded display copy in `pause_data.clarification`, without a schema
+migration. `Limits(max_pause_summary_bytes=65536)` sets the JSON byte budget; the
+supported range is 128 bytes to 512 KiB. The question has priority, followed by options
+in order. Excess text ends with `[truncated]`; options that do not fit are omitted.
+The pause still succeeds and emits the `pause_summary_truncated` log code, with no
+question or option text in the log. When truncation is needed, the clarification turn
+used for subsequent model calls and recovery is also bounded; its duplicated
+raw-response step field is omitted.
+The original LLM interaction record is retained. This prevents a long question alone
+from making the pause unresumable. Saved questions follow the same model-text and PII
+rules as other saved model output.
+
+`RunStore.get_traces()` returns the run's own user, assistant and tool rows in both
+formats. It excludes system prompts, seeded conversation prefixes and recovery state.
+`order_index` is the zero-based position among these rows, and `limit` and `offset`
+count only these rows. Retry runs show their new turns, not the predecessor's seed.
+Compaction does not remove earlier audit rows. The system prompt remains stored for
+internal recovery and reconstruction. Public reads retain the existing 20,000-row
+and 16 MiB scan limits, including rows skipped by filtering or offset.
+
+These format-2 differences are intentional:
+
+| Surface | Change and application action |
+| --- | --- |
+| Stored events and `follow` | `tool.started` records a durable server-tool execution intent, with `call_id`, `tool_name` and `idempotent`. It precedes that attempt's completion. Accept this additional event type. It does not mean the external effect has completed. |
+| Terminal event iteration | `run.completed.iteration_index`, and loop-produced `run.error.iteration_index`, identify the final iteration rather than the format-1 placeholder zero. |
+| Event cursors and pause pairs | Added events consume sequence indexes, so exact indexes differ across formats. Use returned cursors and pause ids; do not calculate them from a fixed event count. Parallel tools can interleave their start and completion events, while each call retains its lifecycle order. |
+| PII in traces | Format-2 checkpoints retain the provider-ready placeholder form of incoming text. Public trace content can therefore contain placeholders where format 1 retained raw text. No raw PII is sent to the provider. |
+| Resumed guardrail accounting | Previously projected messages need no new redaction after reconstruction. Incoming `guardrail.detected.findings_count` and saved LLM findings may be lower after resume than with format 1's raw-history rescan. `guardrail.redacted` remains stored and notified when redaction occurs. |
+| Trace metadata | `meta.iteration` keeps its format-1 meaning. Internal `dendrux.message`, `dendrux.seed_prefix` and `dendrux.step` are excluded from public trace reads. In particular, `dendrux.step.raw_response` is recovery evidence, not a public trace field. Existing public phase, tool, image and reasoning metadata remains available. |
+| Independent executions | Timestamps, durations, generated ids and delivery or sweep times differ between runs. Compare their meaning rather than exact values across formats. |
+| Low-level persisted state | Format-2 `pause_data` has `schema_version=2`, `loop_state_ref` and `image_view_ref`; history, steps and image-view state are reconstructed from evidence instead of copied into each pause. Physical traces include system, seed, rewrite and state rows. Internal observation records and blob owner indexes refer to physical positions. Use public reads rather than interpreting these storage details. |
+
+`RunResult` also has an optional `recovery` attribute (normally `None`), and `ToolCall`
+has an optional `raw_length` attribute for malformed arguments. Their dataclass fields
+and representations have grown; the wire result omits recovery when none occurred.
+`RunAlreadyTerminalError` now also inherits from `RunControlError` and remains a
+`RuntimeError`. Avoid parsing exception or dataclass representations as a protocol.
+
 ## Rollback
 
 Before activation starts, the migration is additive and old workers can still use format-1 data. Alembic can downgrade that revision only while activation has never started. The migration refuses downgrade as soon as `activate_step` exists, even if activation did not finish.
