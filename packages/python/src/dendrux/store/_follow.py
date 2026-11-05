@@ -102,6 +102,10 @@ _DEFAULT_TENANT_DIVISOR = 5
 
 #: Coordinator limits (spec §4.2, §4.3); module constants so tests and docs share them.
 POLL_BATCH_RUNS = 200
+#: Runs read per cycle on a store with no batched read, where each run costs its own reads:
+#: small enough that suspects and hinted runs get their turn, with half the budget each way.
+PER_RUN_CHUNK_RUNS = 5
+PER_RUN_RECHECK_RUNS = 10
 MAX_ROWS_PER_READ = 2_000
 MAX_LIMIT_PER_RUN = 100
 MAX_READS_PER_S = 20.0
@@ -442,6 +446,7 @@ class _Coordinator:
         self._safety_windows: dict[float, float] = {}
         self._isolations: deque[_Isolation] = deque()
         self._suspects = _Suspects(self._now())
+        self._reading_job = False
         self._discovery_at = -math.inf
         self._missed_generation: int | None = None
         self._missed_count = 0
@@ -707,7 +712,8 @@ class _Coordinator:
         return active
 
     async def _read_due(self, now: float) -> bool:
-        self._suspects.queue_due(now, POLL_BATCH_RUNS)
+        batched = self.store._batched_events() is not None
+        self._suspects.queue_due(now, POLL_BATCH_RUNS if batched else PER_RUN_RECHECK_RUNS)
         if self._suspects.store_is_back(now):
             for jobs in (self._isolations, self._suspects.jobs):
                 merge_outage_jobs(jobs, self.runs, POLL_BATCH_RUNS)
@@ -784,14 +790,19 @@ class _Coordinator:
     async def _read_job(self, job: _Isolation) -> None:
         """Read one waiting group's failed phase."""
         events, statuses = ([], job.runs) if job.status else (job.runs, [])
-        await self._read_phases(job.runs, events, statuses)
+        self._reading_job = True  # Paced as one read, however many a store needs to make it.
+        try:
+            await self._read_phases(job.runs, events, statuses)
+        finally:
+            self._reading_job = False
         if not job.suspects:
             self._discovery_at = self._now() + DISCOVERY_INTERVAL_S
 
     def _prioritize(self, runs: list[_WatchedRun]) -> list[_WatchedRun]:
         now = self._now()
         runs.sort(key=lambda run: self._priority(run, now))
-        chunk = runs[:POLL_BATCH_RUNS]
+        size = POLL_BATCH_RUNS if self.store._batched_events() else PER_RUN_CHUNK_RUNS
+        chunk = runs[:size]
         for run in chunk:
             if run.reason == "hint":
                 run.hint_priority_at = now + HINT_PRIORITY_INTERVAL_S
@@ -968,7 +979,11 @@ class _Coordinator:
 
     def _read_candidates(self, runs: list[_WatchedRun]) -> list[_WatchedRun]:
         active = self._active_runs(runs)
-        if self._is_probe(active) and self._now() < self._suspects.probe_at:
+        if (
+            not self._reading_job
+            and self._is_probe(active)
+            and self._now() < self._suspects.probe_at
+        ):
             return []
         return active
 

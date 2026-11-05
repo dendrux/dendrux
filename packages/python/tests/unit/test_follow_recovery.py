@@ -499,3 +499,31 @@ async def test_a_suspect_that_stops_being_watched_is_forgotten(clock):
         assert not coordinator._suspects.runs
     finally:
         await reader.close()
+
+
+async def test_per_run_store_keeps_recovering_under_the_real_read_budget(clock, monkeypatch):
+    real_budget(monkeypatch)
+    state = FakeState()
+    outage = Outage(state)
+    reader = RunStore(state)
+    runs = many(reader, state, 200)
+    coordinator = reader._follow_coordinator()
+    try:
+        await pass_time(clock, 30)
+        outage.down = True
+        for run in runs:
+            run.events_due = run.status_due = clock.now
+        while suspects(runs) < 200:
+            await pass_time(clock, 1)
+        outage.down = False
+        waited = 0.0
+        while suspects(runs) and waited < 60:  # Two reads per run, at most ten a second.
+            await pass_time(clock, 1)
+            waited += 1
+        assert suspects(runs) == 0
+        state.write("r3")
+        coordinator.on_hints(("r3",))
+        await pass_time(clock, 2)
+        assert runs[3].head == 0
+    finally:
+        await reader.close()
