@@ -80,6 +80,8 @@ Give your store a `finalize_with_event` and make it atomic. The status change, t
 
 Followers depend on it. A follow ends once it has seen the terminal status and drained the event log, so a status that lands before its event can end a follow early. A store without `finalize_with_event` gets separate status and event writes. Its followers get a bounded 100 ms grace and one more drain, which cannot catch an event written arbitrarily late. See [How a follow ends](/docs/reference/run-store#how-a-follow-ends).
 
+**Typed provider errors.** `finalize_with_event` has no `error_info` keyword, and it does not need one. When a typed provider failure ends the run, the structured error information is in `event_data["error_info"]` of the terminal event. `RunStore.get_run` shows it as `RunDetail.error_info`, which it reads from the run's `meta` under the key `dendrux.error_info`. If your store keeps that projection, update it from the event payload in the same transaction that wins the status change. Do not rely on `finalize_run(error_info=...)`: the runtime picks `finalize_with_event` whenever your store has it. The built-in SQL stores do this for you. A lost compare-and-swap must change neither the event log nor the projection.
+
 ## Events that do not pass through `save_run_event`
 
 `save_run_event` is not the only way an event reaches the log. Some events are written in the same transaction as the change they describe, by a combined method, and never call `save_run_event`:
@@ -120,5 +122,34 @@ Every SQL store requires real transactions. On first use, before any claim, it r
 ## Validation and subclass upgrades
 
 At Agent construction Dendrux validates declared capability versions, methods and required keyword parameters. A mismatch raises `StoreCapabilityError` (a `TypeError`) before a run starts. `sweep(on_stale="reclaim")` also validates its store before writes.
+
+### Fixing a `StoreCapabilityError`
+
+The message names the capability, the method and the parameters it lacks, and tells you the repair. There are three kinds:
+
+| The message says | What is wrong | Fix |
+| --- | --- | --- |
+| `capability 'version'` | `capabilities` is not a `StoreCapabilities`, or its `version` is not 1 | Use a `StoreCapabilities` instance with `version=1`. To repair an instance you have: `self.capabilities = replace(self.capabilities, version=1)` |
+| `capability 'deployment'` | `deployment` is missing or not one of `single_process`, `single_host`, `multi_server` | Set the one that matches your store: `self.capabilities = replace(self.capabilities, deployment="single_host")` |
+| a flag name, such as `capability 'fenced_writes'` | A method that flag requires lacks a named keyword parameter (for example `save_trace` lacks `claim_epoch`) | Copy the base method signature with its explicit keyword-only parameters and forward them. A `*args, **kwargs` signature does not count |
+
+If your store does not support a capability, turn that one flag off and keep the rest of the declaration. Do it in `__init__`, after `super().__init__(...)`:
+
+[//]: # "docs-test: skip - fragment: shows a constructor to complete with your own store"
+
+```python
+from dataclasses import replace
+
+class MyStore(SQLStateStore):
+    def __init__(self, engine):
+        super().__init__(engine)
+        self.capabilities = replace(self.capabilities, fenced_writes=False)
+```
+
+Narrowing has costs, so choose it knowingly:
+
+- It removes the promise. Turning off `fenced_writes` on a `multi_server` store removes fencing: an old owner can then write to a run it lost.
+- It does not adapt your methods. The other flags are still checked, so implement the base signature wherever a flag you keep requires it.
+- Format 2 needs `fenced_writes`, `retry_ids`, `checkpointing` and `atomic_completion` together. Narrowing any of them makes new runs start at format 1.
 
 `SQLAlchemyStateStore` is removed in 0.6.0. When moving a subclass to `PostgresStateStore`, `SQLiteStateStore` or `SQLStateStore`, audit every overridden write method against the current protocol. The subclass inherits the base declaration unless it explicitly narrows it. Keep the named parameters, forward the epoch and caller-minted ids, and preserve the transaction boundaries. Test races and retries against the database you deploy.

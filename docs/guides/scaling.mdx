@@ -241,6 +241,7 @@ state = PostgresStateStore(engine, live_updates=updates)
 - **TLS.** The `connect_args` of your engine cannot be read back from SQLAlchemy. For a remote host where the URL has no `sslmode` and the transport's own `connect_args` have no non-`None` `ssl`, Dendrux logs `live_updates_tls_unknown` once, when the first connection is attempted (the first announcement or the first listener), not when you build the store. `ssl=None` does not silence it. Set `sslmode` in the URL or `ssl` in the transport's `connect_args`.
 - **Secrets.** The DSN does not appear in logs, errors, `repr` or `inspect.getmembers`, and the connection settings refuse pickling. This protects diagnostics. It does not protect against code that deliberately walks private memory or traceback locals.
 - **Payload.** Postgres rejects a notification of 8,000 bytes or more, so `max_message_bytes` must be at most 7,999 (the default is 7,900).
+- **Who can see the run ids.** Postgres has no permission for a single channel. Any role that can connect to the database can `LISTEN` on your channel and receive every run id announced on it, across all tenants. A hint carries only run ids, never tenant names or data, and a reader always checks tenant scope when it reads, so a stray hint cannot show a run to the wrong tenant. But treat run ids as identifiers, not secrets: do not rely on an id being unknown to keep a run private. A different channel name keeps cooperating applications from waking each other, but it is not a security boundary. To keep ids apart, give each trust boundary its own database (notifications stay inside one database) and limit who may connect to it.
 - **Primary only.** NOTIFY reaches listeners on the same server. A read replica never receives the notifications of its primary; point the sender and the listener at the primary.
 
 ### Behind PgBouncer
@@ -285,7 +286,7 @@ reads = RunStore(state)
 - **URLs.** `redis://`, `rediss://` (TLS) and `unix://`. A URL query string or `client_options` that sets the timeouts, retries, connection pool, `protocol`, `parser_class`, `host`, `port` or a second connection is refused with a `ValueError`, because Dendrux fixes those. A text `encoding` other than UTF-8 is refused too, and so is `decode_responses`: the transport decodes the bytes itself. `client_options` must be a mapping, and a bad port and an unknown option give different errors. Neither error echoes your value.
 - **Connections.** The sender is one connection used for one pipelined round trip per send. The listener is one Pub/Sub connection on the pure-Python RESP2 parser (hiredis is not used for it), so an oversized message is refused before it is read. The parser drains such a message in chunks of at most 65,536 bytes without keeping it, then drops it whole and counts it (`live_updates_oversize`). If the connection breaks before the whole reply has been read, the parser refuses to replay the half-read frame and the transport reconnects; a reply that was fully drained leaves the connection usable. To stop oversized hints, first use channel isolation to keep foreign publishers out. Raise `max_message_bytes` or shorten your run ids only when the oversized hints are your own. It never reconnects silently: a lost connection is reported as a gap and the transport reconnects with backoff.
 - **Liveness.** The listener sends a token-matched `PING` on its own connection after `health_check_s` (15 s) of silence and finds a dead connection within twice that time.
-- **Secrets.** The URL, host and password never appear in logs, errors or `repr`. Hints carry run ids only, but the channel is as trusted as the Redis server: use ACLs and `rediss://`.
+- **Secrets.** The URL, host and password never appear in logs, errors or `repr`. Hints carry run ids only, but the channel is as trusted as the Redis server: anyone who can subscribe sees every run id on it, so run ids are identifiers, not secrets. Use ACLs that limit who may publish and subscribe to your channel, and `rediss://`.
 
 ### Write your own bus
 
@@ -472,15 +473,15 @@ make load-mariadb
 
 `make load-quick` runs every scenario at small scale and fails on a statement-count regression against `tools/load_baseline.json` (Postgres only); `make load` is the full run. MySQL and MariaDB have no stored baseline, so the ceilings are declared before measuring: `tools/load_budgets_mysql.json` maps each gate to a number (`runs.statements_per_run` is 50; the 0.6 runs measured about 47). The targets use it by default; pass `LOAD_STATEMENT_BUDGETS=path` to use your own file. Results are written as JSON to `LOAD_JSON` (default: `dendrux-load-results.json` in your temporary directory) with a compact Markdown table. Workloads that need the Postgres live-update transport (the `notify` scenarios) are skipped on MySQL and MariaDB, with a note.
 
-## What we measured
+## Measured results
 
-> **Coordinator to fill before release.** Add results from the 0.6 load run under these headings. No capacity claim is made here yet.
+> **Results pending.** The numbers from the 0.6 load run are not in this page yet. Until they are, this page makes no capacity claim: measure your own workload with the harness above. The headings below are where the results will go.
 
 ### Environment and workload
 
 ### Write throughput and statement counts
 
-### Follow latency and notifier cost
+### Follow latency and live-update cost
 
 ### Recovery and reclaim
 
