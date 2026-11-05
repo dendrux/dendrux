@@ -16,7 +16,7 @@ import re
 import threading
 from bisect import bisect_right
 from collections import Counter, OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Literal
 
 from dendrux.guardrails._detectors import THREAD_SCAN_THRESHOLD
@@ -192,6 +192,21 @@ def tool_origin(name: str) -> Origin:
     return Origin("tool", name)
 
 
+def _message_digest(message: Message) -> bytes:
+    from dendrux.types import TextPart
+
+    value = (
+        message.role.value,
+        message.name,
+        message.call_id,
+        message.content,
+        [p.text if isinstance(p, TextPart) else None for p in message.parts]
+        if message.parts is not None
+        else None,
+    )
+    return hashlib.sha256(json.dumps(value, ensure_ascii=False).encode()).digest()
+
+
 class GuardrailEngine:
     """Per-run guardrail orchestrator.
 
@@ -259,7 +274,9 @@ class GuardrailEngine:
         # restored into a tool only when it is trusted or that tool produced it;
         # a placeholder with no record (legacy or corrupt state, or minted from
         # model output) is restored nowhere until its origin is seen again.
-        self._projected: OrderedDict[bytes, tuple[list[Finding], str | None]] = OrderedDict()
+        self._projected: OrderedDict[bytes, tuple[list[Finding], str | None, bool, str]] = (
+            OrderedDict()
+        )
         self._trusted: set[str] = set()
         self._tool_origins: dict[str, set[str]] = {}
         if self._allowlisted:
@@ -429,29 +446,24 @@ class GuardrailEngine:
         self, msg: Message, *, index: int | None = None
     ) -> tuple[Message, list[Finding], str | None]:
         """Project a format-2 boundary once; retain bounded digests, never history."""
-        from dendrux.types import TextPart
-
-        def digest(message: Message) -> bytes:
-            value = (
-                message.role.value,
-                message.name,
-                message.content,
-                [p.text if isinstance(p, TextPart) else None for p in message.parts]
-                if message.parts is not None
-                else None,
-            )
-            return hashlib.sha256(json.dumps(value, ensure_ascii=False).encode()).digest()
-
-        key = digest(msg)
+        key = _message_digest(msg)
         previous = self._projected.get(key)
         if previous is not None:
             self._projected.move_to_end(key)
-            return msg, previous[0], previous[1]
+            findings, blocked, redacted, location = previous
+            if blocked is not None:
+                blocked = blocked.replace(location, _message_location(msg, index), 1)
+            return replace(msg) if redacted else msg, findings, blocked
         cleaned, findings, blocked = await self.scan_incoming_message(msg, index=index)
         # Keep block evidence so projection at persistence cannot bypass the
         # loop's governance handling at the subsequent provider boundary.
         if len(findings) <= _PROJECTED_FINDINGS_LIMIT:
-            self._projected[digest(cleaned)] = (findings, blocked)
+            self._projected[_message_digest(cleaned)] = (
+                findings,
+                blocked,
+                cleaned is not msg,
+                _message_location(msg, index),
+            )
         if len(self._projected) > _PROJECTION_CACHE_LIMIT:
             self._projected.popitem(last=False)
         return cleaned, findings, blocked
