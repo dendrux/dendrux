@@ -59,7 +59,7 @@ def _nested_error(error: BaseException) -> BaseException | None:
         return nested
     if error.__cause__ is not None:
         return error.__cause__
-    return None if error.__suppress_context__ else error.__context__
+    return None
 
 
 def _is_connection_loss_code(code: str) -> bool:
@@ -180,7 +180,13 @@ def _is_connection_reset(error: BaseException, code: int | None) -> bool:
 
 
 def _is_connection_type(error: BaseException) -> bool:
-    return isinstance(error, (ConnectionError, TimeoutError)) and error.errno is None
+    return _connection_class(error) and getattr(error, "errno", None) is None
+
+
+def _connection_class(error: BaseException) -> bool:
+    # asyncio aggregates multi-address connect failures into an exact OSError.
+    # Subclasses such as TimeoutError and gaierror carry different semantics.
+    return type(error) is OSError or isinstance(error, ConnectionError)
 
 
 def _is_connection_errno(error: BaseException, code: int | None) -> bool:

@@ -103,7 +103,11 @@ class _CommitReadback:
         return proofs
 
     @staticmethod
-    def _database_error(error: Exception) -> bool:
+    def _database_error(error: BaseException) -> bool:
+        return isinstance(error, Exception) and _CommitReadback._database_exception(error)
+
+    @staticmethod
+    def _database_exception(error: Exception) -> bool:
         return isinstance(
             error, (SQLAlchemyError, OSError, PersistenceError)
         ) or _is_driver_failure(error)
@@ -121,9 +125,9 @@ class _CommitReadback:
     async def _rollback(self, *, ambiguous: bool) -> None:
         try:
             await self.session.rollback()
-        except Exception as error:
+        except BaseException as error:
             if not self._database_error(error):
-                raise
+                self._reraise_clean(error)
             _codes.log_code(logger, _codes.PERSISTENCE_ERROR, run_id=self.run_id)
             if ambiguous:
                 self.unknown()
@@ -164,13 +168,21 @@ class _CommitReadback:
                 self.unknown()
         except _CommitNotAppliedError:
             raise
-        except Exception as error:
+        except BaseException as error:
             self._readback_failed(error)
 
-    def _readback_failed(self, error: Exception) -> NoReturn:
+    def _readback_failed(self, error: BaseException) -> NoReturn:
         if self._database_error(error):
             self.unknown()
-        raise error
+        self._reraise_clean(error)
+
+    @staticmethod
+    def _reraise_clean(error: BaseException) -> NoReturn:
+        # A logic failure or cancellation during readback must not retain the
+        # COMMIT driver's credentials through Python's implicit exception chain.
+        error.__context__ = None
+        error.__cause__ = None
+        raise error from None
 
     async def _lock_touched(self) -> None:
         for run_id in sorted(self.session.info[TOUCHED_RUNS_SESSION_KEY]):

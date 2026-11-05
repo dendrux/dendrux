@@ -26,7 +26,6 @@ from time import monotonic
 from typing import TYPE_CHECKING, Any, TypeVar
 
 from sqlalchemy.exc import (
-    DBAPIError,
     DisconnectionError,
     OperationalError,
     SQLAlchemyError,
@@ -42,7 +41,7 @@ from dendrux.errors import (
     StatementTooLargeError,
 )
 from dendrux.errors import StoreOutcomeUnknown as StoreOutcomeUnknown
-from dendrux.runtime.stores._errors import _is_connection_loss_code, classify_error, error_chain
+from dendrux.runtime.stores._errors import classify_error, error_chain
 
 _EXCEPTION_WALK_LIMIT = 1024
 
@@ -221,11 +220,7 @@ def is_transient_db_error(exc: BaseException, *, classify: Any = classify_error)
     return (
         _transient_wrapper(exc)
         or classified.kind in ("deadlock_or_serialization", "lock_timeout", "connection_lost")
-        or (
-            isinstance(exc, DBAPIError)
-            and isinstance(classified.code, str)
-            and (_is_connection_loss_code(classified.code) or classified.code == "53300")
-        )
+        or classified.code == "53300"
     )
 
 
@@ -257,7 +252,8 @@ async def retry_transient_db(
     for attempt_num in range(MAX_RETRIES + 1):
         try:
             return await attempt()
-        except (SQLAlchemyError, PersistenceError) as exc:
+        except Exception as exc:
+            _require_database_error(exc)
             last_classified = classify(exc)
             if not is_transient_db_error(exc, classify=classify):
                 failure = _database_failure(exc, classify=classify)
@@ -270,6 +266,11 @@ async def retry_transient_db(
     failure.__context__ = None
     failure.__cause__ = None
     raise failure from None
+
+
+def _require_database_error(error: Exception) -> None:
+    if not isinstance(error, (SQLAlchemyError, PersistenceError)) and not _is_driver_failure(error):
+        raise error
 
 
 def _log_database_failure(classified: Any, run_id: Any = None) -> None:

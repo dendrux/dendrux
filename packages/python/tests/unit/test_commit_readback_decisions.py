@@ -42,3 +42,39 @@ async def test_readback_requires_parent_fence_and_preserves_absent_signal(mode):
     else:
         await proof._prove()
         assert proof._check_proof.await_args.args[2] == {"status": "success", "claim_epoch": 7}
+
+
+async def test_retryable_persistence_error_from_commit_is_passed_through():
+    from dendrux.errors import PersistenceError
+    from dendrux.runtime.stores._errors import classify_error
+
+    session = SimpleNamespace(info={}, rollback=AsyncMock())
+    store = SimpleNamespace(classify_db_error=classify_error)
+    proof = _CommitReadback(store, session, None)
+    original = PersistenceError(retryable=True)
+    with pytest.raises(PersistenceError) as caught:
+        await proof.resolve(original)
+    assert caught.value is original
+    assert caught.value.retryable
+    session.rollback.assert_not_called()
+
+
+@pytest.mark.parametrize("phase", ["rollback", "readback"])
+async def test_driver_provenance_cannot_convert_readback_cancellation(monkeypatch, phase):
+    import asyncio
+
+    from dendrux.runtime.stores.sql import _commit
+
+    cancelled = asyncio.CancelledError()
+    session = SimpleNamespace(info={}, rollback=AsyncMock(side_effect=cancelled))
+    store = SimpleNamespace(_prepare_commit_readback=AsyncMock(side_effect=cancelled))
+    proof = _CommitReadback(store, session, None)
+    # Native cancellation tracebacks can contain driver frames, too.
+    monkeypatch.setattr(_commit, "_is_driver_failure", lambda error: True)
+    with pytest.raises(asyncio.CancelledError) as caught:
+        if phase == "rollback":
+            await proof._rollback(ambiguous=True)
+        else:
+            await proof._prove()
+    assert caught.value is cancelled
+    assert cancelled.__cause__ is None and cancelled.__context__ is None

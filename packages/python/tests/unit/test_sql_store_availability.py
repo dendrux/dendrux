@@ -42,8 +42,8 @@ def test_transport_errno_is_transient(code, depth):
 
 
 @pytest.mark.parametrize("depth", [0, 1, 2])
-def test_bare_timeout_is_transient_with_commit_guard(depth):
-    assert is_transient_db_error(wrap(TimeoutError(), depth))
+def test_bare_timeout_is_not_transient(depth):
+    assert not is_transient_db_error(wrap(TimeoutError(), depth))
 
 
 @pytest.mark.parametrize(
@@ -56,13 +56,13 @@ def test_postgres_shutdown_states(code, depth):
     assert is_transient_db_error(wrap(error, depth))
 
 
-def test_implicit_driver_context_and_cycles():
+def test_implicit_context_is_ignored_even_with_cycles():
     inner = ConnectionRefusedError(errno.ECONNREFUSED, "PRIVATE_DB_SENTINEL")
     outer = Exception("wrapper")
     outer.__context__ = inner
     inner.__context__ = outer
-    assert error_chain(outer) == [outer, inner]
-    assert is_transient_db_error(wrap(outer, 2))
+    assert error_chain(outer) == [outer]
+    assert not is_transient_db_error(wrap(outer, 2))
     outer.__suppress_context__ = True
     assert error_chain(outer) == [outer]
 
@@ -77,7 +77,6 @@ def test_sqlalchemy_disconnect_flag(depth):
     "error",
     [
         OSError(errno.EACCES, "private"),
-        OSError("multiple errors"),
         sqlite3.OperationalError("unable to open database file"),
         ValueError("no active connection"),
     ],
@@ -160,3 +159,16 @@ async def test_refused_write_has_bounded_backoff_and_sanitized_exhaustion(monkey
 )
 def test_connection_exception_types_without_errno(depth, kind):
     assert is_transient_db_error(wrap(kind("private"), depth))
+
+
+@pytest.mark.parametrize("depth", [0, 1, 2])
+def test_exact_errno_less_oserror_is_availability(depth):
+    assert is_transient_db_error(wrap(OSError("PRIVATE_DB_SENTINEL"), depth))
+
+
+def test_implicit_operational_error_does_not_make_logic_failure_transient():
+    from sqlalchemy.exc import NoResultFound, OperationalError
+
+    error = NoResultFound()
+    error.__context__ = OperationalError(None, None, Exception())
+    assert not is_transient_db_error(error)

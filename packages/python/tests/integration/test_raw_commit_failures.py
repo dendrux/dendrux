@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from dendrux.errors import StoreOutcomeUnknown
+from dendrux.errors import PersistenceError, StoreOutcomeUnknown
 from dendrux.runtime.durability import retry_transient_db
 from dendrux.runtime.stores.sql._commit import _CommitReadback
 from dendrux.types import generate_ulid
@@ -20,10 +20,13 @@ FAULTS = [
     lambda: ConnectionRefusedError(errno.ECONNREFUSED, SECRET),
     lambda: ConnectionResetError(errno.ECONNRESET, SECRET),
     lambda: OSError(errno.EACCES, SECRET),
+    lambda: OSError(SECRET),
 ]
 
 
-@pytest.mark.parametrize("fault", FAULTS, ids=["timeout", "refused", "reset", "os-other"])
+@pytest.mark.parametrize(
+    "fault", FAULTS, ids=["timeout", "refused", "reset", "os-other", "os-aggregate"]
+)
 @pytest.mark.parametrize("phase", ["commit", "rollback", "prepare", "lock", "proof"])
 async def test_landed_write_is_proven_or_unknown_never_replayed(
     store, monkeypatch, caplog, fault, phase
@@ -144,6 +147,9 @@ async def test_readback_non_database_failure_is_not_normalized(store, monkeypatc
         with pytest.raises(type(fault)) as caught:
             await store.save_run_event(run_id, event_type="tick")
         assert caught.value is fault
+        assert caught.value.__context__ is None
+        assert caught.value.__cause__ is None
+        assert SECRET not in "".join(traceback.format_exception(caught.value))
     assert len(await store.get_run_events(run_id)) == 1
 
 
@@ -178,28 +184,30 @@ async def test_absent_raw_timeout_retries_only_a_stable_write(store, monkeypatch
     assert len(await store.get_run_events(run_id)) == (1 if stable_id else 0)
 
 
-async def test_precommit_driver_timeout_retries_safely(store, monkeypatch):
+async def test_precommit_driver_timeout_is_not_retried(store, monkeypatch):
     class DriverTimeoutError(TimeoutError):
         __module__ = "asyncpg"
 
     run_id = generate_ulid()
     await store.create_run(run_id, "precommit-timeout")
     execute = AsyncSession.execute
-    failed = False
+    calls = 0
 
     async def fail_once(session, *args, **kwargs):
-        nonlocal failed
-        if not failed:
-            failed = True
+        nonlocal calls
+        calls += 1
+        if calls == 1:
             raise DriverTimeoutError(SECRET)
         return await execute(session, *args, **kwargs)
 
     with monkeypatch.context() as patch:
         patch.setattr(AsyncSession, "execute", fail_once)
-        await retry_transient_db(
-            lambda: store.save_run_event(run_id, event_type="tick"),
-            label="precommit-timeout",
-            run_id=run_id,
-        )
-    assert failed
-    assert len(await store.get_run_events(run_id)) == 1
+        with pytest.raises(PersistenceError) as caught:
+            await retry_transient_db(
+                lambda: store.save_run_event(run_id, event_type="tick"),
+                label="precommit-timeout",
+                run_id=run_id,
+            )
+        assert not caught.value.retryable
+    assert calls == 1
+    assert await store.get_run_events(run_id) == []

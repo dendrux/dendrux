@@ -17,7 +17,7 @@ _FAKE_OTHER = 31002
 
 def _wrapped(os_code: int) -> Exception:
     original = Exception(9999, "driver text")
-    original.__cause__ = OSError(os_code)
+    original.__cause__ = OSError(os_code, "driver text")
     return original
 
 

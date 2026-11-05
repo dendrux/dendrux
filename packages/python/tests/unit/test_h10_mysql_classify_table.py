@@ -315,11 +315,11 @@ ROWS += [
         Raises(StopIteration, "orig-read"),
     ),
     (
-        # The shared classifier now inspects implicit context before the packet scan.
-        "review-m4-stopiteration-in-context-classification",
+        # inside the old generator expression, so Python turns it into RuntimeError
+        "review-m4-stopiteration-in-isinstance-becomes-runtime-error",
         LIMIT,
         context_with_raising_class_orig,
-        Raises(StopIteration, "class-read"),
+        Raises(RuntimeError, None),
     ),
     (
         "review-m5-stopiteration-in-params-getter",

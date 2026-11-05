@@ -428,9 +428,9 @@ def mysql_rows() -> list[tuple[str, Any, DbError]]:
             DbError("other", None, errno.ENOENT),
         ),
         (
-            "s4-os-without-number-skipped",
+            "s4-os-without-number-is-availability",
             OSError("socket"),
-            DbError("other", None, None),
+            DbError("connection_lost", None, None),
         ),
         (
             "s4-non-os-error-with-reset-number-is-unknown",
@@ -613,7 +613,7 @@ def chain_rows() -> list[tuple[str, Any, DbError]]:
             non_exception_orig,
             DbError("lock_timeout", None, 1205),
         ),
-        ("chain-context-followed", context_only, DbError("deadlock_or_serialization", None, 1213)),
+        ("chain-context-ignored", context_only, DbError("other", None, None)),
         ("chain-cycle-terminates", cycle_a, DbError("missing_table", None, 1146)),
         ("chain-deep-cause", deep, DbError("deadlock_or_serialization", None, "40001")),
     ]
