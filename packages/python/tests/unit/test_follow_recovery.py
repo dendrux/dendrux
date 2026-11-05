@@ -527,3 +527,26 @@ async def test_per_run_store_keeps_recovering_under_the_real_read_budget(clock, 
         assert runs[3].head == 0
     finally:
         await reader.close()
+
+
+async def test_a_healed_read_speeds_up_the_share_and_a_failure_slows_it_again(clock):
+    state = BatchedState()
+    reader = RunStore(state)
+    coordinator = reader._follow_coordinator()
+    run = watch(reader, state, "r")
+    share = coordinator._suspects
+    slow, fast = (
+        1 / _follow_recovery.SUSPECT_READS_PER_S,
+        1 / _follow_recovery.SUSPECT_RECOVERY_READS_PER_S,
+    )
+    try:
+        share.mark(run)
+        share.charge(clock.now)
+        assert share.probe_at == clock.now + slow
+        share.settle(run, True, clock.now)
+        share.charge(clock.now)
+        assert share.probe_at == clock.now + fast
+        share.note_failure(clock.now)
+        assert share.probe_at == clock.now + slow
+    finally:
+        await reader.close()
