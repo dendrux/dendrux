@@ -17,6 +17,16 @@ def test_live_update_types_are_public(kind):
     assert kind.__name__ in store.__all__
 
 
+@pytest.mark.parametrize("kind", [LiveUpdates, PostgresUpdates, RedisUpdates])
+def test_listener_coordination_is_internal(kind):
+    for name in ("register", "unregister", "acquire_listener", "release_listener", "generation"):
+        # ABCMeta.register is Python's virtual-subclass API, not the hint hub hook.
+        assert all(name not in vars(base) for base in kind.__mro__), name
+        assert hasattr(kind, "_" + name), name
+        assert name not in store.__all__
+    assert kind.__abstractmethods__ <= {"send", "receive"}
+
+
 def test_public_redis_import_does_not_load_optional_dependency():
     code = """
 import sys

@@ -200,12 +200,12 @@ async def test_setup_failure_terminates_the_half_open_connection(
     caplog.set_level(logging.DEBUG)
     driver.hang = hang
     updates = _updates(send_timeout_s=0.05, flush_deadline_s=0.05)
-    lease = await updates.acquire_listener()
+    lease = await updates._acquire_listener()
     async with asyncio.timeout(5):
         while not (driver.connections and driver.connections[0].terminated):
             await asyncio.sleep(0.01)
     assert not updates.healthy
-    await updates.release_listener(lease)
+    await updates._release_listener(lease)
     assert all(c.terminated for c in driver.connections)
     assert "driver text" not in caplog.text and "pooler" not in caplog.text
 
@@ -256,8 +256,8 @@ async def test_listener_lease_delivers_hints_to_consumers_and_reconnects(driver:
         def on_gap(self) -> None:
             Consumer.gaps += 1
 
-    updates.register(Consumer(), stream_events=False)
-    lease = await updates.acquire_listener()
+    updates._register(Consumer(), stream_events=False)
+    lease = await updates._acquire_listener()
     async with asyncio.timeout(5):
         while not updates.healthy:
             await asyncio.sleep(0.01)
@@ -269,7 +269,7 @@ async def test_listener_lease_delivers_hints_to_consumers_and_reconnects(driver:
             await asyncio.sleep(0.01)
     assert hints == [("r1", "r2")]
     assert Consumer.gaps >= 3  # healthy, degraded, healthy again
-    await updates.release_listener(lease)
+    await updates._release_listener(lease)
     assert all(c.terminated for c in driver.connections)
 
 
@@ -281,9 +281,9 @@ async def test_connect_failure_never_logs_driver_text_or_destination(
     updates = _updates(backoff_initial_s=0.01, backoff_max_s=0.02)
     updates.enqueue(["r1"])
     await updates.flush()
-    lease = await updates.acquire_listener()
+    lease = await updates._acquire_listener()
     await asyncio.sleep(0.05)
-    await updates.release_listener(lease)
+    await updates._release_listener(lease)
     await updates.close()
     text = caplog.text + " ".join(str(r.__dict__) for r in caplog.records)
     assert "refused" not in text and "pooler" not in text and "pw" not in text

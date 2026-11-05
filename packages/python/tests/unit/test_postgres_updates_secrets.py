@@ -51,9 +51,9 @@ async def test_driver_failure_and_cancellation_diagnostics_are_secret_free(monke
     updates = PostgresUpdates(url=f"postgresql://u:{SECRET}@{HOST}/db")
     updates.enqueue(["run"])
     await updates.flush()
-    lease = await updates.acquire_listener()
+    lease = await updates._acquire_listener()
     await asyncio.sleep(0.01)
-    await updates.release_listener(lease)
+    await updates._release_listener(lease)
     await updates.close()
     for value in [
         repr(vars(updates)),

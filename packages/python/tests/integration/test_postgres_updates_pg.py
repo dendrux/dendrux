@@ -90,8 +90,8 @@ async def test_real_notify_reaches_a_leased_listener_on_its_own_connections(
     name = "p6b" + generate_ulid()[-8:]
     writer, reader = _pair(pg_test_url, name)
     consumer = Consumer()
-    reader.register(consumer, stream_events=False)
-    lease = await reader.acquire_listener()
+    reader._register(consumer, stream_events=False)
+    lease = await reader._acquire_listener()
     try:
         await _until(lambda: reader.healthy)
         runs = [generate_ulid() for _ in range(600)]  # two messages, one statement
@@ -102,7 +102,7 @@ async def test_real_notify_reaches_a_leased_listener_on_its_own_connections(
         assert await _backends(pg_test_url, name + "w") == 1  # the sender, nothing pooled
         assert await _backends(pg_test_url, name + "r") == 1  # the listener only
     finally:
-        await reader.release_listener(lease)
+        await reader._release_listener(lease)
         await writer.close()
         await reader.close()
     async with asyncio.timeout(10):
@@ -117,13 +117,13 @@ async def test_killed_listener_backend_degrades_reconnects_and_delivers_again(
     name = "p6b" + generate_ulid()[-8:]
     writer, reader = _pair(pg_test_url, name, backoff_initial_s=0.05, backoff_max_s=0.1)
     consumer = Consumer()
-    reader.register(consumer, stream_events=False)
-    lease = await reader.acquire_listener()
+    reader._register(consumer, stream_events=False)
+    lease = await reader._acquire_listener()
     try:
         await _until(lambda: reader.healthy)
-        generation = reader.generation
+        generation = reader._generation
         assert await _kill(pg_test_url, name + "r") == 1
-        await _until(lambda: reader.generation >= generation + 2 and reader.healthy)
+        await _until(lambda: reader._generation >= generation + 2 and reader.healthy)
         run = generate_ulid()
         writer.enqueue([run])
         await writer.flush()
@@ -133,7 +133,7 @@ async def test_killed_listener_backend_degrades_reconnects_and_delivers_again(
         assert codes.count("live_updates_recovered") == 2
         assert pg_test_url.split("@")[-1] not in caplog.text
     finally:
-        await reader.release_listener(lease)
+        await reader._release_listener(lease)
         await writer.close()
         await reader.close()
 
@@ -145,8 +145,8 @@ async def test_killed_sender_backend_costs_at_most_one_batch_then_recovers(
     writer, reader = _pair(pg_test_url, name, backoff_initial_s=0.01, backoff_max_s=0.02)
     writer._backoff = writer._listener_backoff = 0.01
     consumer = Consumer()
-    reader.register(consumer, stream_events=False)
-    lease = await reader.acquire_listener()
+    reader._register(consumer, stream_events=False)
+    lease = await reader._acquire_listener()
     try:
         await _until(lambda: reader.healthy)
         writer.enqueue([generate_ulid()])
@@ -165,7 +165,7 @@ async def test_killed_sender_backend_costs_at_most_one_batch_then_recovers(
         await _until(lambda: sent[-1] in consumer.hints)
         assert await _backends(pg_test_url, name + "w") == 1  # one fresh sender connection
     finally:
-        await reader.release_listener(lease)
+        await reader._release_listener(lease)
         await writer.close()
         await reader.close()
 
@@ -178,10 +178,10 @@ async def test_unreachable_listener_never_turns_healthy_and_leaves_no_backend(
     reader = PostgresUpdates(
         url=pg_test_url, listen_url=missing, backoff_initial_s=0.05, backoff_max_s=0.1
     )
-    lease = await reader.acquire_listener()
+    lease = await reader._acquire_listener()
     await asyncio.sleep(0.3)
     assert not reader.healthy
-    await reader.release_listener(lease)
+    await reader._release_listener(lease)
     await reader.close()
     text = caplog.text + " ".join(str(r.__dict__) for r in caplog.records)
     assert "p6b_missing_database_test" not in text and "root" not in text
@@ -205,17 +205,17 @@ async def test_frozen_tcp_path_is_detected_by_the_listen_ping_and_recovers(
             backoff_initial_s=0.05,
             backoff_max_s=0.1,
         )
-        lease = await reader.acquire_listener()
+        lease = await reader._acquire_listener()
         try:
             await _until(lambda: reader.healthy)
-            generation = reader.generation
+            generation = reader._generation
             proxy.gate.clear()  # bytes stop flowing; no socket closes
             await _until(lambda: not reader.healthy)
             proxy.gate.set()
-            await _until(lambda: reader.healthy and reader.generation >= generation + 2)
+            await _until(lambda: reader.healthy and reader._generation >= generation + 2)
         finally:
             proxy.gate.set()
-            await reader.release_listener(lease)
+            await reader._release_listener(lease)
             await reader.close()
 
 
@@ -228,8 +228,8 @@ async def test_pgbouncer_sends_through_the_pool_and_listens_direct(pg_test_url: 
     writer = PostgresUpdates(url=pooled, channel=channel)
     reader = PostgresUpdates(url=pooled, listen_url=pg_test_url, channel=channel)
     consumer = Consumer()
-    reader.register(consumer, stream_events=False)
-    lease = await reader.acquire_listener()
+    reader._register(consumer, stream_events=False)
+    lease = await reader._acquire_listener()
     try:
         await _until(lambda: reader.healthy)
         for _ in range(5):  # several sends may land on different pooled backends
@@ -239,7 +239,7 @@ async def test_pgbouncer_sends_through_the_pool_and_listens_direct(pg_test_url: 
             await _until(lambda run=run: run in consumer.hints)
         assert writer.stats().dropped_failed == 0
     finally:
-        await reader.release_listener(lease)
+        await reader._release_listener(lease)
         await writer.close()
         await reader.close()
 
@@ -300,9 +300,9 @@ async def test_cancelled_startup_after_reader_close_leaves_no_backend(pg_test_ur
         await asyncio.sleep(0.05)
 
         async def peer() -> None:
-            lease = await live.acquire_listener()  # another reader, queued behind startup
+            lease = await live._acquire_listener()  # another reader, queued behind startup
             start.cancel()
-            await live.release_listener(lease)
+            await live._release_listener(lease)
 
         other = asyncio.create_task(peer())
         await asyncio.sleep(0.05)

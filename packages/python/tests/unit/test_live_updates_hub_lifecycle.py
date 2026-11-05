@@ -18,11 +18,11 @@ async def test_only_matching_wakers_are_visited_and_gaps_reach_all():
     calls = Counter()
     bus = Bus()
     wakers = [Waker(str(i)) for i in range(10_000)]
-    handles = [bus.register(waker) for waker in wakers]
+    handles = [bus._register(waker) for waker in wakers]
     bus._deliver('["7","9","7"]')
     assert calls == {"7": 1, "9": 1}
     assert sum(w.event.is_set() for w in wakers) == 2
-    bus.unregister(handles[7])
+    bus._unregister(handles[7])
     wakers[7].event.clear()
     bus._deliver('["7"]')
     assert calls == {"7": 1, "9": 1}
@@ -36,8 +36,8 @@ async def test_only_matching_wakers_are_visited_and_gaps_reach_all():
 async def test_index_preserves_duplicates_and_general_consumers():
     bus = Bus()
     first, second = _RunWaker("same"), _RunWaker("same")
-    first_handle = bus.register(first)
-    bus.register(second)
+    first_handle = bus._register(first)
+    bus._register(second)
     seen = []
 
     class General:
@@ -47,11 +47,11 @@ async def test_index_preserves_duplicates_and_general_consumers():
         def on_gap(self):
             pass
 
-    bus.register(General(), stream_events=False)
+    bus._register(General(), stream_events=False)
     bus._deliver('["same","other"]')
     assert first.event.is_set() and second.event.is_set()
     assert seen == [("same", "other")]
-    bus.unregister(first_handle)
+    bus._unregister(first_handle)
     second.event.clear()
     bus._deliver('["same"]')
     assert second.event.is_set()
@@ -81,8 +81,8 @@ def test_store_close_after_bound_loop_closed_aborts_without_awaiting():
 
     async def first():
         bus.enqueue(["pending"])
-        bus.register(_RunWaker("pending"))
-        await bus.acquire_listener()
+        bus._register(_RunWaker("pending"))
+        await bus._acquire_listener()
 
     asyncio.run(first())
     assert bus._loop.is_closed()

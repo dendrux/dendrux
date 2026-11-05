@@ -691,7 +691,7 @@ class RunStore:
             return
         live, lease = owned
         with contextlib.suppress(RuntimeError, LiveUpdatesUnavailableError):
-            await live.release_listener(lease)
+            await live._release_listener(lease)
         if self._retiring_lease is owned:
             self._retiring_lease = None
 
@@ -803,7 +803,7 @@ class RunStore:
         if self._closed or self._lease is not None:
             return
         try:
-            self._lease = await live.acquire_listener()
+            self._lease = await live._acquire_listener()
         except (LiveUpdatesUnavailableError, RuntimeError):
             self._lease_retry_at = asyncio.get_running_loop().time() + _LEASE_RETRY_S
             _codes.log_code(logger, _codes.LIVE_UPDATES_UNAVAILABLE, error_kind="closed")
@@ -1076,7 +1076,7 @@ class RunStore:
             self._stream_readers -= 1
             if live is not None and handle is not None:
                 with contextlib.suppress(RuntimeError, LiveUpdatesUnavailableError):
-                    live.unregister(handle)
+                    live._unregister(handle)
             self._reader_idle()
 
     def _register_stream(self, waker: _RunWaker) -> tuple[LiveUpdates | None, object | None]:
@@ -1085,7 +1085,7 @@ class RunStore:
         if live is None:
             return None, None
         try:
-            return live, live.register(waker)
+            return live, live._register(waker)
         except FollowCapacityError:
             raise
         except (LiveUpdatesUnavailableError, RuntimeError):  # closed, or another event loop

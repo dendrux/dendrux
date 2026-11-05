@@ -459,7 +459,7 @@ class _Coordinator:
         if self.live is None or self._registration is not None:
             return
         try:
-            self._registration = self.live.register(self, stream_events=False)
+            self._registration = self.live._register(self, stream_events=False)
         except (LiveUpdatesUnavailableError, RuntimeError):
             self.live = None  # Closed or another loop: poll.
 
@@ -489,7 +489,7 @@ class _Coordinator:
         return self.live if self.store._retiring_lease is None else None
 
     def _generation(self) -> int:
-        return self.live.generation if self.live is not None else 0
+        return self.live._generation if self.live is not None else 0
 
     # ------------------------------------------------------------ watched runs
 
@@ -684,7 +684,7 @@ class _Coordinator:
         self._registration = None
         if live is not None and handle is not None:
             with contextlib.suppress(RuntimeError, LiveUpdatesUnavailableError):
-                live.unregister(handle)
+                live._unregister(handle)
 
     # ------------------------------------------------------------ main loop
 

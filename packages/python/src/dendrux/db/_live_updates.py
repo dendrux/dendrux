@@ -537,7 +537,7 @@ class LiveUpdates(ABC):
 
     def _init_listener(self) -> None:
         self._healthy = False
-        self._generation = 0
+        self._listener_generation = 0
         self._listener_failed = False
         self._listener_backoff = self.backoff_initial_s
         self._healthy_since = math.inf
@@ -565,9 +565,9 @@ class LiveUpdates(ABC):
         return self._send_failed and monotonic() < self._next_attempt_at
 
     @property
-    def generation(self) -> int:
+    def _generation(self) -> int:
         """Monotonic generation of listener health transitions and missed hints."""
-        return self._generation
+        return self._listener_generation
 
     def _new_inbound_buffer(self) -> _InboundBuffer:
         return _InboundBuffer(self.max_inbound, self._inbound_dropped)
@@ -578,10 +578,10 @@ class LiveUpdates(ABC):
     # Subclasses may lower or raise this cap for their deployment.
     max_stream_consumers = 10_000
 
-    def register(self, consumer: _Consumer, *, stream_events: bool = True) -> object:
+    def _register(self, consumer: _Consumer, *, stream_events: bool = True) -> object:
         """Register callbacks; coordinators pass ``stream_events=False``.
 
-        Return an opaque handle for idempotent ``unregister``. Stream consumers
+        Return an opaque handle for idempotent ``_unregister``. Stream consumers
         share the overridable ``max_stream_consumers`` class-level cap.
         """
         run_id = self._consumer_run_id(consumer, stream_events)
@@ -596,7 +596,7 @@ class LiveUpdates(ABC):
         self._stream_consumers += int(stream_events)
         return handle
 
-    def unregister(self, handle: object) -> None:
+    def _unregister(self, handle: object) -> None:
         """Idempotently remove a hub registration."""
         self._require_loop()
         registration = self._consumers.pop(handle, None)
@@ -650,7 +650,7 @@ class LiveUpdates(ABC):
             self._last_received_at = monotonic()
 
     def _gap(self) -> None:
-        self._generation += 1
+        self._listener_generation += 1
         self._counts["gaps"] += 1
         for consumer, _ in tuple(self._consumers.values()):
             with suppress(Exception, asyncio.CancelledError):
@@ -691,7 +691,7 @@ class LiveUpdates(ABC):
         if self._state != "open":
             raise LiveUpdatesUnavailableError("closed")
 
-    async def acquire_listener(self) -> object:
+    async def _acquire_listener(self) -> object:
         """Lease one listener task; readiness is exposed by ``healthy`` and hub gaps."""
         self._require_loop()
         async with self._listener_lock:
@@ -712,7 +712,7 @@ class LiveUpdates(ABC):
         self._listener_stopping = False
         self._listener_task = asyncio.create_task(self._listen(), name="dendrux-live-updates")
 
-    async def release_listener(self, handle: object) -> None:
+    async def _release_listener(self, handle: object) -> None:
         """Idempotently release a lease, stopping the listener after the last one."""
         self._require_loop()
         async with self._listener_lock:

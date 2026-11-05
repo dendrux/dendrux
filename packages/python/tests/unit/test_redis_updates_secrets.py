@@ -109,11 +109,11 @@ async def test_a_dying_listener_through_the_base_logs_kinds_only(
 ) -> None:
     updates = ru.RedisUpdates(URL, **{**FAST, "health_check_s": 30.0})
     with caplog.at_level(logging.DEBUG):
-        lease = await updates.acquire_listener()
+        lease = await updates._acquire_listener()
         await _until(lambda: updates.healthy)
         world.pubsubs[0].fail(FakeConnectionError(f"closed {URL}"))
         await _until(lambda: len(world.pubsubs) == 2 and updates.healthy)
-        await updates.release_listener(lease)
+        await updates._release_listener(lease)
         await updates.close()
     assert any(getattr(r, "code", "") == "live_updates_degraded" for r in caplog.records)
     scan_records(caplog.records)

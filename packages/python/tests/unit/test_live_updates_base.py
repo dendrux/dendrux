@@ -567,21 +567,21 @@ async def test_inbound_bound_drops_oldest_and_preserves_gap():
 async def test_hub_capacity_callbacks_and_isolation(caplog):
     bus = Bus()
     consumer = Consumer()
-    tokens = [bus.register(consumer) for _ in range(10_000)]
+    tokens = [bus._register(consumer) for _ in range(10_000)]
     with pytest.raises(errors.FollowCapacityError) as exc:
-        bus.register(consumer)
+        bus._register(consumer)
     assert exc.value.limit == 10_000
-    coordinator = bus.register(Consumer(), stream_events=False)
-    bus.unregister(tokens.pop())
-    bus.unregister(coordinator)
-    token = bus.register(consumer)
+    coordinator = bus._register(Consumer(), stream_events=False)
+    bus._unregister(tokens.pop())
+    bus._unregister(coordinator)
+    token = bus._register(consumer)
     bus._deliver('["a","b"]')
     assert len(consumer.hints) == 10_000
     assert consumer.hints[0] == ("a", "b")
     bus._deliver(bus.GAP)
     assert consumer.gaps == 10_000
-    bus.unregister(token)
-    bus.unregister(token)
+    bus._unregister(token)
+    bus._unregister(token)
     assert caplog.records[-1].code == "follow_capacity"
 
 
@@ -596,9 +596,9 @@ async def test_faulty_consumer_does_not_block_other_consumers():
         def on_gap(self):
             raise asyncio.CancelledError("VENDOR_SECRET")
 
-    bus.register(Broken())
+    bus._register(Broken())
     good = Consumer()
-    bus.register(good)
+    bus._register(good)
     bus._deliver('["a"]')
     bus._deliver("invalid")
     bus._deliver(bus.GAP)
@@ -611,22 +611,22 @@ async def test_faulty_consumer_does_not_block_other_consumers():
 async def test_two_leases_health_generation_and_idempotent_release(caplog):
     bus = ListeningBus()
     consumer = Consumer()
-    bus.register(consumer)
+    bus._register(consumer)
     assert not bus.healthy
-    one = await bus.acquire_listener()
-    two = await bus.acquire_listener()
+    one = await bus._acquire_listener()
+    two = await bus._acquire_listener()
     await until(lambda: bus.healthy)
     assert bus.starts == 1
-    assert bus.generation == 1
+    assert bus._generation == 1
     await bus.incoming.put('["a"]')
     await until(lambda: consumer.hints)
-    await bus.release_listener(one)
-    await bus.release_listener(one)
+    await bus._release_listener(one)
+    await bus._release_listener(one)
     assert bus.healthy and bus.stops == 0
-    await bus.release_listener(two)
+    await bus._release_listener(two)
     assert not bus.healthy and bus.stops == 1
     assert bus.aborts == 0
-    assert bus.generation == consumer.gaps == 2
+    assert bus._generation == consumer.gaps == 2
     assert bus.stats().gaps == 2
     await bus.close()
 
@@ -638,19 +638,19 @@ async def test_two_leases_health_generation_and_idempotent_release(caplog):
 async def test_listener_reconnect_closes_old_connection_and_surfaces_gap(failure, caplog):
     bus = ListeningBus(backoff_initial_s=0.001, backoff_max_s=0.002)
     consumer = Consumer()
-    bus.register(consumer)
-    lease = await bus.acquire_listener()
+    bus._register(consumer)
+    lease = await bus._acquire_listener()
     await until(lambda: bus.healthy)
     await bus.incoming.put(failure)
     await until(lambda: bus.starts == 2 and bus.healthy)
     assert bus.stops == 1
-    assert bus.generation == 3
+    assert bus._generation == 3
     await bus.incoming.put(bus.GAP)
-    await until(lambda: bus.generation == 4)
+    await until(lambda: bus._generation == 4)
     assert bus.healthy
     assert consumer.gaps == 4
     assert "VENDOR_SECRET" not in caplog.text + repr(bus.stats())
-    await bus.release_listener(lease)
+    await bus._release_listener(lease)
     await bus.close()
 
 
@@ -658,11 +658,11 @@ async def test_listener_reconnect_closes_old_connection_and_surfaces_gap(failure
 async def test_listener_setup_deadline_cleans_half_open_connection(caplog):
     bus = ListeningBus(send_timeout_s=0.005, backoff_initial_s=0.01)
     bus.ready = False
-    lease = await bus.acquire_listener()
+    lease = await bus._acquire_listener()
     await until(lambda: bus.stops >= 1)
     assert not bus.healthy
     assert any(r.code == "live_updates_degraded" for r in caplog.records)
-    await bus.release_listener(lease)
+    await bus._release_listener(lease)
     await bus.close()
 
 
@@ -672,31 +672,31 @@ async def test_listener_requires_subscription_ack(first):
     bus = ListeningBus(backoff_initial_s=0.001)
     bus.ready = False
     consumer = Consumer()
-    bus.register(consumer)
+    bus._register(consumer)
     await bus.incoming.put(first)
-    lease = await bus.acquire_listener()
+    lease = await bus._acquire_listener()
     await until(lambda: bus.stops >= 1)
     assert not bus.healthy
     assert consumer.hints == []
-    await bus.release_listener(lease)
+    await bus._release_listener(lease)
     await bus.close()
 
 
 @pytest.mark.asyncio
 async def test_wrong_loop_lease_raises_before_refcount_change():
     bus = ListeningBus()
-    lease = await bus.acquire_listener()
+    lease = await bus._acquire_listener()
     await until(lambda: bus.healthy)
 
     async def other():
         with pytest.raises(RuntimeError, match="event loop"):
-            await bus.acquire_listener()
+            await bus._acquire_listener()
         with pytest.raises(RuntimeError, match="event loop"):
-            await bus.release_listener(lease)
+            await bus._release_listener(lease)
 
     await asyncio.to_thread(asyncio.run, other())
     assert bus.starts == 1
-    await bus.release_listener(lease)
+    await bus._release_listener(lease)
     assert bus.stops == 1
     await bus.close()
 
@@ -704,29 +704,29 @@ async def test_wrong_loop_lease_raises_before_refcount_change():
 @pytest.mark.asyncio
 async def test_listener_start_stop_serialized():
     bus = ListeningBus()
-    lease = await bus.acquire_listener()
+    lease = await bus._acquire_listener()
     await until(lambda: bus.healthy)
     bus.stop_gate = asyncio.Event()
-    releasing = asyncio.create_task(bus.release_listener(lease))
+    releasing = asyncio.create_task(bus._release_listener(lease))
     await asyncio.sleep(0)
-    acquiring = asyncio.create_task(bus.acquire_listener())
+    acquiring = asyncio.create_task(bus._acquire_listener())
     await asyncio.sleep(0)
     assert bus.starts == 1 and not acquiring.done()
     bus.stop_gate.set()
     await releasing
     next_lease = await acquiring
     await until(lambda: bus.starts == 2)
-    await bus.release_listener(next_lease)
+    await bus._release_listener(next_lease)
     await bus.close()
 
 
 @pytest.mark.asyncio
 async def test_last_lease_forces_stalled_listener_stop(caplog):
     bus = ListeningBus(close_timeout_s=0.01)
-    lease = await bus.acquire_listener()
+    lease = await bus._acquire_listener()
     await until(lambda: bus.healthy)
     bus.stop_gate = asyncio.Event()
-    await asyncio.wait_for(bus.release_listener(lease), 1)
+    await asyncio.wait_for(bus._release_listener(lease), 1)
     assert bus.listen_aborts == 1
     assert bus.aborts == 0
     assert not bus.healthy
@@ -738,7 +738,7 @@ async def test_last_lease_forces_stalled_listener_stop(caplog):
 @pytest.mark.asyncio
 async def test_close_waits_inflight_final_flush_and_closes_once():
     bus = ListeningBus()
-    lease = await bus.acquire_listener()
+    lease = await bus._acquire_listener()
     await until(lambda: bus.healthy)
     started, finish = asyncio.Event(), asyncio.Event()
 
@@ -764,11 +764,11 @@ async def test_close_waits_inflight_final_flush_and_closes_once():
     assert bus.sender_closes == 1
     assert bus.stats().sent == 2
     assert bus.stops == 1
-    await bus.release_listener(lease)
+    await bus._release_listener(lease)
     await bus.close()
     assert bus.sender_closes == 1
     with pytest.raises(errors.LiveUpdatesUnavailableError):
-        await bus.acquire_listener()
+        await bus._acquire_listener()
 
 
 @pytest.mark.asyncio
@@ -799,7 +799,7 @@ async def test_close_flushes_stranded_hints_and_drops_backoff_remainder():
 @pytest.mark.parametrize("phase", ["inflight", "listener", "sender"])
 async def test_close_total_timeout_aborts_both_resources(phase, caplog):
     bus = ListeningBus(close_timeout_s=0.01)
-    await bus.acquire_listener()
+    await bus._acquire_listener()
     await until(lambda: bus.healthy)
     flush_task = None
     if phase == "inflight":
@@ -827,7 +827,7 @@ async def test_close_total_timeout_aborts_both_resources(phase, caplog):
 @pytest.mark.asyncio
 async def test_cancelled_closer_leaves_closing_and_can_retry():
     bus = ListeningBus()
-    await bus.acquire_listener()
+    await bus._acquire_listener()
     await until(lambda: bus.healthy)
     bus.close_gate = asyncio.Event()
     closing = asyncio.create_task(bus.close())
@@ -858,9 +858,9 @@ async def test_listener_cancellation_cleanup_error_never_reconnects():
                 raise RuntimeError("VENDOR_SECRET")
 
     bus = CleanupFailure(close_timeout_s=0.02, backoff_initial_s=0.001)
-    lease = await bus.acquire_listener()
+    lease = await bus._acquire_listener()
     await until(lambda: bus.healthy)
-    await bus.release_listener(lease)
+    await bus._release_listener(lease)
     try:
         assert bus.starts == 1
         assert bus._listener_task is None
@@ -871,13 +871,13 @@ async def test_listener_cancellation_cleanup_error_never_reconnects():
 @pytest.mark.asyncio
 async def test_acquire_racing_close_cannot_restart_after_waiting_for_stop():
     bus = ListeningBus(close_timeout_s=0.02)
-    lease = await bus.acquire_listener()
+    lease = await bus._acquire_listener()
     await until(lambda: bus.healthy)
     bus.stop_gate = asyncio.Event()
     # Simulate a transport whose synchronous abort cannot unblock its cleanup.
     bus.abort_listener = lambda: None
-    await bus.release_listener(lease)
-    acquiring = asyncio.create_task(bus.acquire_listener())
+    await bus._release_listener(lease)
+    acquiring = asyncio.create_task(bus._acquire_listener())
     await asyncio.sleep(0)
     closing = asyncio.create_task(bus.close())
     await asyncio.sleep(0)
@@ -912,7 +912,7 @@ async def test_reconnect_health_falls_before_slow_iterator_cleanup():
 
     bus = ListeningBus(backoff_initial_s=0.001)
     bus.receive = lambda: Iterator()
-    lease = await bus.acquire_listener()
+    lease = await bus._acquire_listener()
     await until(lambda: bus.healthy)
     fail.set()
     try:
@@ -920,7 +920,7 @@ async def test_reconnect_health_falls_before_slow_iterator_cleanup():
         assert not bus.healthy
     finally:
         cleanup.set()
-        await bus.release_listener(lease)
+        await bus._release_listener(lease)
         await bus.close()
 
 
@@ -1025,16 +1025,16 @@ async def test_send_backoff_resets_after_recovery(monkeypatch):
 @pytest.mark.asyncio
 async def test_acquire_refuses_overlap_with_listener_that_will_not_stop():
     bus = ListeningBus(close_timeout_s=0.01)
-    lease = await bus.acquire_listener()
+    lease = await bus._acquire_listener()
     await until(lambda: bus.healthy)
     bus.stop_gate = asyncio.Event()
     bus.abort_listener = lambda: None
     old_task = bus._listener_task
     try:
-        await bus.release_listener(lease)
+        await bus._release_listener(lease)
         with pytest.raises(errors.LiveUpdatesUnavailableError) as caught:
             async with asyncio.timeout(1):
-                await bus.acquire_listener()
+                await bus._acquire_listener()
         assert caught.value.reason == "timeout"
         assert bus._listener_task is old_task
         assert not old_task.done()
@@ -1059,9 +1059,9 @@ async def test_acquire_refuses_overlap_with_listener_that_will_not_stop():
 def test_published_strings_cannot_forge_a_gap(wire):
     bus = Bus()
     consumer = Consumer()
-    bus.register(consumer)
+    bus._register(consumer)
     bus._deliver(wire)
-    assert bus.generation == consumer.gaps == 0
+    assert bus._generation == consumer.gaps == 0
     if wire.startswith("["):
         assert consumer.hints == [tuple(json.loads(wire))]
     else:
@@ -1073,9 +1073,9 @@ def test_gap_marker_is_local_identity_not_wire_text():
     bus = Bus()
     assert not isinstance(bus.GAP, str)
     consumer = Consumer()
-    bus.register(consumer)
+    bus._register(consumer)
     bus._deliver(bus.GAP)
-    assert consumer.gaps == bus.generation == 1
+    assert consumer.gaps == bus._generation == 1
 
 
 @pytest.mark.asyncio
@@ -1103,19 +1103,19 @@ async def test_flapping_subscriptions_grow_backoff_until_stable(monkeypatch):
             raise OSError("VENDOR_SECRET")
 
     bus = FlappingBus(backoff_initial_s=0.5, backoff_max_s=2, health_check_s=15)
-    lease = await bus.acquire_listener()
+    lease = await bus._acquire_listener()
     try:
         await until(lambda: bus.starts >= 7)
         assert windows[:6] == [(0, 0.5), (0, 1), (0, 2), (0, 2), (0, 0.5), (0, 1)]
     finally:
-        await bus.release_listener(lease)
+        await bus._release_listener(lease)
         await bus.close()
 
 
 @pytest.mark.asyncio
 async def test_foreign_loop_close_refuses_without_mutation_and_logs_safely(caplog):
     bus = ListeningBus()
-    lease = await bus.acquire_listener()
+    lease = await bus._acquire_listener()
     await until(lambda: bus.healthy)
     bus.enqueue(["PRIVATE_RUN_SENTINEL"])
     snapshot = (
@@ -1147,7 +1147,7 @@ async def test_foreign_loop_close_refuses_without_mutation_and_logs_safely(caplo
         assert [r.code for r in caplog.records] == ["live_updates_wrong_loop"]
         assert "PRIVATE_RUN_SENTINEL" not in caplog.text
     finally:
-        await bus.release_listener(lease)
+        await bus._release_listener(lease)
         await bus.close()
 
 
@@ -1221,7 +1221,7 @@ async def test_overflow_diagnostic_reports_dropped_count_for_enqueue(caplog):
 @pytest.mark.asyncio
 async def test_close_timeout_is_logged_once_across_nested_shutdown_steps(monkeypatch, caplog):
     bus = ListeningBus(close_timeout_s=1)
-    await bus.acquire_listener()
+    await bus._acquire_listener()
     await until(lambda: bus.healthy)
     bus.stop_gate = asyncio.Event()
     now = [100.0]
@@ -1244,7 +1244,7 @@ async def test_close_timeout_is_logged_once_across_nested_shutdown_steps(monkeyp
 @pytest.mark.asyncio
 async def test_close_timeout_suppresses_late_listener_stop_diagnostic(monkeypatch, caplog):
     bus = ListeningBus(close_timeout_s=0.01)
-    lease = await bus.acquire_listener()
+    lease = await bus._acquire_listener()
     await until(lambda: bus.healthy)
     bus.stop_gate = asyncio.Event()
     bus.abort_listener = lambda: None
@@ -1257,7 +1257,7 @@ async def test_close_timeout_suppresses_late_listener_stop_diagnostic(monkeypatc
         return set(), tasks
 
     monkeypatch.setattr(live.asyncio, "wait", delayed_wait)
-    releasing = asyncio.create_task(bus.release_listener(lease))
+    releasing = asyncio.create_task(bus._release_listener(lease))
     try:
         await until(waiting.is_set)
         await bus.close()

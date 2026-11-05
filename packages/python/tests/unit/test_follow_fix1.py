@@ -25,8 +25,8 @@ async def test_short_request_burst_shares_listener_until_idle(monkeypatch, kind)
     monkeypatch.setattr(_follow, "IDLE_EXIT_S", 0.08)
     reader, state = make_reader()
     live = state.live_updates
-    acquire = AsyncMock(wraps=live.acquire_listener)
-    monkeypatch.setattr(live, "acquire_listener", acquire)
+    acquire = AsyncMock(wraps=live._acquire_listener)
+    monkeypatch.setattr(live, "_acquire_listener", acquire)
     state.statuses["r"] = "success"
     state.write("r", "run.completed")
     try:
@@ -81,13 +81,13 @@ async def test_stalled_idle_stop_does_not_block_join_or_polling(monkeypatch):
     reader, state = make_reader(live)
     feed = EventFeed(reader, poll_interval_s=0.01, poll_max_s=0.02)
     releasing = asyncio.Event()
-    original_release = live.release_listener
+    original_release = live._release_listener
 
     async def release(lease):
         releasing.set()
         await original_release(lease)
 
-    monkeypatch.setattr(live, "release_listener", release)
+    monkeypatch.setattr(live, "_release_listener", release)
     first = feed.follow("r", tenant_id=None)
     second = feed.follow("r", tenant_id=None)
     try:
@@ -119,14 +119,14 @@ async def test_request_cancel_does_not_cancel_owned_idle_release(monkeypatch):
     live = state.live_updates
     follow = reader.follow("r", tenant_id=None)
     entered, finish = asyncio.Event(), asyncio.Event()
-    original = live.release_listener
+    original = live._release_listener
 
     async def released_but_not_returned(lease):
         await original(lease)
         entered.set()
         await finish.wait()
 
-    monkeypatch.setattr(live, "release_listener", released_but_not_returned)
+    monkeypatch.setattr(live, "_release_listener", released_but_not_returned)
     await follow.start()
     await ticks(40)
     await follow.aclose()
@@ -324,7 +324,7 @@ async def test_transient_retirement_failure_recovers_with_active_follow(monkeypa
     monkeypatch.setattr(store_module, "_LEASE_RETRY_S", 0.02)
     reader, state = make_reader()
     live = state.live_updates
-    original = live.release_listener
+    original = live._release_listener
     failed = asyncio.Event()
     calls = 0
 
@@ -336,7 +336,7 @@ async def test_transient_retirement_failure_recovers_with_active_follow(monkeypa
             raise OSError("release temporarily unavailable")
         await original(lease)
 
-    monkeypatch.setattr(live, "release_listener", transient)
+    monkeypatch.setattr(live, "_release_listener", transient)
     first = reader.follow("r", tenant_id=None)
     second = reader.follow("r", tenant_id=None)
     try:

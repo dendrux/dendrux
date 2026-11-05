@@ -209,14 +209,14 @@ async def test_new_admission_during_unwanted_acquisition_release_gets_lease(monk
     starting.cancel()
     await asyncio.gather(starting, return_exceptions=True)
     entered, proceed = asyncio.Event(), asyncio.Event()
-    original = live.release_listener
+    original = live._release_listener
 
     async def release(lease):
         entered.set()
         await proceed.wait()
         await original(lease)
 
-    monkeypatch.setattr(live, "release_listener", release)
+    monkeypatch.setattr(live, "_release_listener", release)
     await asyncio.sleep(0.03)
     live._listener_lock.release()
     await asyncio.wait_for(entered.wait(), 1)

@@ -124,7 +124,7 @@ async def test_failed_stream_admission_never_keeps_a_hub_consumer(
     async def broken() -> object:
         raise OSError("listener setup failed")
 
-    monkeypatch.setattr(live, "acquire_listener", broken)
+    monkeypatch.setattr(live, "_acquire_listener", broken)
     with pytest.raises(OSError):
         await anext(reader.stream_events("r", tenant_id=None))
     assert live._stream_consumers == 0
@@ -143,9 +143,9 @@ async def test_cancelled_startup_after_close_never_strands_a_lease(close_first: 
     await ticks()
 
     async def peer() -> None:
-        lease = await live.acquire_listener()  # a second reader queued behind startup
+        lease = await live._acquire_listener()  # a second reader queued behind startup
         start.cancel()  # an independent cancellation while startup cleans up
-        await live.release_listener(lease)
+        await live._release_listener(lease)
 
     other = asyncio.create_task(peer())
     await ticks()

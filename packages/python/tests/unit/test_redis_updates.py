@@ -549,8 +549,8 @@ async def test_a_lost_connection_surfaces_a_gap_then_recovers_with_another(
 ) -> None:
     updates = make(health_check_s=30.0)
     consumer = Consumer()
-    updates.register(consumer, stream_events=False)
-    lease = await updates.acquire_listener()
+    updates._register(consumer, stream_events=False)
+    lease = await updates._acquire_listener()
     await eventually(lambda: updates.healthy)
     assert consumer.gaps == 1  # became healthy
     world.pubsubs[0].push('["R1"]')
@@ -562,7 +562,7 @@ async def test_a_lost_connection_surfaces_a_gap_then_recovers_with_another(
     await eventually(lambda: consumer.gaps == 3 and updates.healthy and len(world.pubsubs) == 2)
     world.pubsubs[1].push('["R2"]')
     await eventually(lambda: consumer.hints[-1] == ("R2",))
-    await updates.release_listener(lease)
+    await updates._release_listener(lease)
     await updates.close()
     assert all(pubsub.closed for pubsub in world.pubsubs)
 
@@ -572,12 +572,12 @@ async def test_the_base_drops_a_malformed_hint_without_ending_the_listener(
 ) -> None:
     updates = make(health_check_s=30.0)
     consumer = Consumer()
-    updates.register(consumer, stream_events=False)
-    lease = await updates.acquire_listener()
+    updates._register(consumer, stream_events=False)
+    lease = await updates._acquire_listener()
     await eventually(lambda: updates.healthy)
     world.pubsubs[0].push("not json")
     world.pubsubs[0].push('["R1"]')
     await eventually(lambda: consumer.hints == [("R1",)])
     assert updates.stats().bad_messages == 1 and updates.healthy
-    await updates.release_listener(lease)
+    await updates._release_listener(lease)
     await updates.close()

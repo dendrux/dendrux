@@ -45,7 +45,7 @@ def _assert_closed_loop_close(pg_test_url, kind, cancel_listener):
     async def open_connections():
         bus.enqueue(["r"])
         await bus.flush()
-        await bus.acquire_listener()
+        await bus._acquire_listener()
         async with asyncio.timeout(5):
             while not bus.healthy:
                 await asyncio.sleep(0.01)

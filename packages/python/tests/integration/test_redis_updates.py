@@ -103,8 +103,8 @@ async def numsub(admin: Any, channel: str) -> int:
 
 
 async def listening(updates: ru.RedisUpdates, consumer: Consumer) -> object:
-    updates.register(consumer, stream_events=False)
-    lease = await updates.acquire_listener()
+    updates._register(consumer, stream_events=False)
+    lease = await updates._acquire_listener()
     await eventually(lambda: updates.healthy)
     return lease
 
@@ -216,7 +216,7 @@ async def test_a_hint_sent_by_one_instance_reaches_the_consumer_of_another(chann
     await writer.flush()
     await eventually(lambda: consumer.hints == [("R1", "R2")])
     assert writer.stats().sent == 2
-    await reader.release_listener(lease)
+    await reader._release_listener(lease)
     await reader.close()
     await writer.close()
 
@@ -232,7 +232,7 @@ async def test_a_hint_burst_ten_times_the_inbound_bound_arrives_in_full(channel:
     await eventually(lambda: len(consumer.ids) == len(ids), timeout=30)
     assert consumer.ids == ids  # one sender, one channel: order is kept
     assert reader.stats().gaps == 1  # the first healthy transition only; nothing overflowed
-    await reader.release_listener(lease)
+    await reader._release_listener(lease)
     await reader.close()
     await writer.close()
 
@@ -261,15 +261,15 @@ async def test_healthy_is_not_reported_before_the_acknowledgement_arrives(
     proxy.hold_on_subscribe = True  # the server's reply to SUBSCRIBE is held back
     reader = make(proxied(proxy), channel=channel, send_timeout_s=3.0, flush_deadline_s=5.0)
     consumer = Consumer()
-    reader.register(consumer, stream_events=False)
-    lease = await reader.acquire_listener()
+    reader._register(consumer, stream_events=False)
+    lease = await reader._acquire_listener()
     await eventually(lambda: any(b"SUBSCRIBE" in bytes(link.up) for link in proxy.links))
     await asyncio.sleep(0.3)  # a negative claim: slowness can only make it pass vacuously
     assert reader.healthy is False
     assert consumer.gaps == 0
     proxy.release()
     await eventually(lambda: reader.healthy)
-    await reader.release_listener(lease)
+    await reader._release_listener(lease)
     await reader.close()
 
 
@@ -286,7 +286,7 @@ async def test_an_idle_listener_is_pinged_on_its_own_connection_with_fresh_token
     await eventually(lambda: len(tokens()) >= 3)  # idle: the listener keeps asking
     assert len(set(tokens())) == len(tokens())  # a new token each time
     assert reader.healthy  # and the server answered every one in time
-    await reader.release_listener(lease)
+    await reader._release_listener(lease)
     await reader.close()
 
 
@@ -305,7 +305,7 @@ async def test_a_listener_whose_pings_go_unanswered_degrades_then_recovers(
     writer.enqueue(["R1"])
     await writer.flush()
     await eventually(lambda: consumer.ids == ["R1"])
-    await reader.release_listener(lease)
+    await reader._release_listener(lease)
     await reader.close()
     await writer.close()
 
@@ -329,7 +329,7 @@ async def test_a_killed_listener_connection_surfaces_a_gap_and_resubscribes_once
     writer.enqueue(["R9"])
     await writer.flush()
     await eventually(lambda: consumer.ids == ["R9"])
-    await reader.release_listener(lease)
+    await reader._release_listener(lease)
     await reader.close()
     await writer.close()
 
@@ -350,7 +350,7 @@ async def test_an_oversized_message_is_dropped_without_a_connection_gap(
     writer.enqueue(["R1"])
     await writer.flush()
     await eventually(lambda: consumer.ids == ["R1"])
-    await reader.release_listener(lease)
+    await reader._release_listener(lease)
     await reader.close()
     await writer.close()
 
@@ -381,7 +381,7 @@ async def test_a_stalled_publish_is_aborted_and_the_next_send_uses_a_fresh_conne
     await writer.flush()
     await eventually(lambda: consumer.ids == ["R0", "R2"])
     assert len(proxy.links) == 2  # a fresh connection
-    await reader.release_listener(lease)
+    await reader._release_listener(lease)
     await reader.close()
     await writer.close()
 
@@ -418,7 +418,7 @@ async def test_abort_listener_drops_the_real_listen_socket_and_the_base_reconnec
     # one connection aborted, one new one made by the base: redis-py did not reconnect by itself
     await eventually(lambda: reader.healthy and consumer.gaps == 3)
     assert len(proxy.links) == 2
-    await reader.release_listener(lease)
+    await reader._release_listener(lease)
     await reader.close()
 
 
@@ -448,7 +448,7 @@ async def test_every_connection_is_closed_with_its_lease_and_with_the_instance(
     await eventually(lambda: consumer.ids == ["R1"])
     assert len(await clients(admin, name)) == 2  # the sender and the listener
 
-    await updates.release_listener(lease)
+    await updates._release_listener(lease)
     await eventually_async(lambda: _count(admin, name), 1)  # the sender stays
 
     await updates.close()
@@ -505,18 +505,18 @@ def test_the_real_client_refuses_a_bad_option_without_a_server_and_without_a_loo
 async def test_oversized_publications_keep_listener_and_count_whole_drops(admin, channel):
     updates = ru.RedisUpdates(REDIS_URL, channel=channel, **FAST)
     consumer = Consumer()
-    updates.register(consumer)
-    await updates.acquire_listener()
+    updates._register(consumer)
+    await updates._acquire_listener()
     try:
         await eventually(lambda: updates.healthy)
-        generation = updates.generation
+        generation = updates._generation
         connection = updates._wire.subscription.pubsub.connection
         for size in (7901, 9000, 1_000_000):
             await admin.publish(channel, b"x" * size)
         await admin.publish(channel, b'["good"]')
         await eventually(lambda: "good" in consumer.ids)
         assert updates.stats().dropped_oversize == 3
-        assert updates.generation == generation
+        assert updates._generation == generation
         assert updates._wire.subscription.pubsub.connection is connection
         assert updates.healthy
     finally:

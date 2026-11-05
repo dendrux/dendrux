@@ -3951,7 +3951,18 @@ class SQLStateStore(SQLBlobCatalog):
         return _group_events(rows)
 
     def events_for_runs_query(self, heads: Mapping[str, int], *, limit_per_run: int) -> Any:
-        """Build one portable bounded UNION ALL query for an authorized chunk."""
+        """Build an executable SQLAlchemy query for already-authorized event reads.
+
+        ``heads`` maps 1 to 200 run ids to their last-read sequence index; -1
+        includes sequence 0. ``limit_per_run`` is validated to be 1 to 100.
+        Return all ``run_events`` columns for at most that many earliest events
+        above each head, omitting missing runs. The base executes the query,
+        groups rows by run and sorts each group by sequence index.
+
+        Store authors may override this hook for their dialect. Without an
+        override, a portable UNION ALL combines one bounded subquery per run.
+        Empty inputs are handled by ``get_events_for_runs`` without this hook.
+        """
         from sqlalchemy import union_all
 
         from dendrux.db.models import RunEvent

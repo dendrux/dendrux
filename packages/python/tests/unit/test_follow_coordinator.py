@@ -974,7 +974,7 @@ async def test_unavailable_live_updates_mean_polling_never_a_failed_follow(clock
     state.create("r1")
     live = FakeLive()
     state.live_updates = live
-    await live.close()  # acquire_listener and register now raise LiveUpdatesUnavailableError
+    await live.close()  # _acquire_listener and _register now raise LiveUpdatesUnavailableError
     feed = _feed(_store(state))
     follow = await attach(feed, "r1")
     state.write("r1")

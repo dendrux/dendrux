@@ -81,14 +81,14 @@ async def test_the_recorder_has_roomy_default_timeouts_and_accepts_overrides() -
 
 async def test_the_recorder_listens_but_never_delivers() -> None:
     updates = RecordingLiveUpdates(health_check_s=30.0)
-    lease = await updates.acquire_listener()
+    lease = await updates._acquire_listener()
     await eventually(lambda: updates.healthy)
     updates.enqueue(["R1"])
     await updates.flush()
     await asyncio.sleep(0.05)  # a negative claim: slowness can only make it pass vacuously
     gaps = updates.stats().gaps
     assert gaps == 1  # only the healthy transition
-    await updates.release_listener(lease)
+    await updates._release_listener(lease)
     await updates.close()
 
 
