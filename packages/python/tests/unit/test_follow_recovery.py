@@ -645,7 +645,8 @@ async def test_per_run_retry_backoff_has_a_future_wake(clock):
         clock.advance(0.5)
         await coordinator._read_due(clock.now)
         assert not await coordinator._read_due(clock.now)
-        assert coordinator._next_wake(clock.now) > clock.now
+        wake = coordinator._next_wake(clock.now)
+        assert clock.now < wake <= run.events_retry_at
     finally:
         await reader.close()
 

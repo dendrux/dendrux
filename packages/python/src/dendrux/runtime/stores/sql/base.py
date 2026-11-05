@@ -83,6 +83,7 @@ if TYPE_CHECKING:
     from datetime import datetime, timedelta
 
     from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
+    from sqlalchemy.sql.base import Executable
 
     from dendrux.db._live_updates import LiveUpdates
     from dendrux.db.models import AgentRun
@@ -3952,7 +3953,7 @@ class SQLStateStore(SQLBlobCatalog):
             ).all()
         return _group_events(rows)
 
-    def events_for_runs_query(self, heads: Mapping[str, int], *, limit_per_run: int) -> Any:
+    def events_for_runs_query(self, heads: Mapping[str, int], *, limit_per_run: int) -> Executable:
         """Build an executable SQLAlchemy query for already-authorized event reads.
 
         ``heads`` maps 1 to 200 run ids to their last-read sequence index; -1

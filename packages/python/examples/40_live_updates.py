@@ -29,7 +29,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from dendrux import Agent, tool
 from dendrux.db.session import get_engine, reset_engine
@@ -52,16 +52,30 @@ class LoopbackUpdates(LiveUpdates):
 
     def __init__(self, **limits) -> None:
         super().__init__(**limits)
-        self._queue: asyncio.Queue[str] = asyncio.Queue()
+        self._queue: asyncio.Queue[str] = asyncio.Queue(maxsize=self.max_inbound)
+        self._ready = asyncio.Event()
+        self._gap_pending = False
 
     async def send(self, messages: Sequence[str]) -> None:
         for message in messages:
+            if self._queue.full():
+                self._queue.get_nowait()
+                self._gap_pending = True
             self._queue.put_nowait(message)
+            self._ready.set()
 
-    async def receive(self) -> AsyncIterator[str | None]:
+    async def receive(self) -> AsyncIterator[Any]:
         yield None  # the subscription is live
         while True:
-            yield await self._queue.get()
+            await self._ready.wait()
+            if self._gap_pending:
+                self._gap_pending = False
+                yield LiveUpdates.GAP
+                continue
+            message = self._queue.get_nowait()
+            if self._queue.empty():
+                self._ready.clear()
+            yield message
 
 
 async def follow_to_end(reads: RunStore, run_id: str, seen: list[str]) -> str:
