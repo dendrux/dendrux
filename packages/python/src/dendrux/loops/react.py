@@ -40,7 +40,7 @@ from dendrux._meta_keys import (
     NOT_EXECUTED_META_KEY,
 )
 from dendrux.errors import ImageError, ImagePersistenceUnsupportedError
-from dendrux.guardrails._engine import GuardrailEngine
+from dendrux.guardrails._engine import GuardrailEngine, _FindingCounts
 from dendrux.llm._calls import complete_call
 from dendrux.llm._evidence import (
     RejectedArguments,
@@ -2207,10 +2207,12 @@ def _run_guardrail_engine(
 
 async def _incoming_project(
     ctx: _RunContext, engine: GuardrailEngine, msg: Message, index: int
-) -> tuple[Message, list[Any], str | None]:
+) -> tuple[Message, list[Any], str | None, bool]:
     shared = getattr(ctx.recorder, "guardrail_engine", None) is engine
     project = engine.project_incoming_message if shared else engine.scan_incoming_message
-    return await project(msg, index=index)
+    cleaned, findings, blocked = await project(msg, index=index)
+    redacted = engine.projected_redaction(cleaned) if shared else cleaned is not msg
+    return cleaned, findings, blocked, redacted
 
 
 async def _incoming_blocked(
@@ -2254,10 +2256,11 @@ async def _incoming_events(
     iteration: int,
     all_findings: dict[str, Any],
     findings_count: int | None = None,
+    entity_kinds: list[str] | None = None,
 ) -> None:
     """``guardrail.detected`` and ``guardrail.redacted`` for the incoming scan."""
+    entities = entity_kinds if entity_kinds is not None else list({f.entity_type for f in findings})
     if findings:
-        entities = list({f.entity_type for f in findings})
         await _record_governance(
             ctx.recorder,
             ctx.run_id,
@@ -2285,7 +2288,7 @@ async def _incoming_events(
             {"entity_type": f.entity_type, "score": f.score} for f in findings
         ]
     if redacted:
-        red_entities = list({f.entity_type for f in findings})
+        red_entities = entities
         await _record_governance(
             ctx.recorder,
             ctx.run_id,
@@ -2318,22 +2321,26 @@ async def _scan_incoming(
     redacted = False
     findings_count = 0
     projected = getattr(ctx.recorder, "guardrail_engine", None) is engine
+    kinds = _FindingCounts(max_kinds=128 if projected else None)
     for index, msg in enumerate(messages):
         if not msg.content:
             continue
-        cleaned, findings, block_error = await _incoming_project(ctx, engine, msg, index)
+        cleaned, findings, block_error, changed = await _incoming_project(ctx, engine, msg, index)
         if findings:
             findings_count += getattr(findings, "total_count", len(findings))
+            kinds.include(findings)
             saved = findings[: max(0, 128 - len(all_in_findings))] if projected else findings
             all_in_findings.extend(saved)
         if block_error is not None:
             return await _incoming_blocked(ctx, block_error, findings, msg, index, iteration)
+        redacted |= changed
         if cleaned is not msg:
-            redacted = True
             # The engine's replace() preserves the origin envelope
             # (kind/placement/source) through redaction.
             messages[index] = cleaned
-    await _incoming_events(ctx, all_in_findings, redacted, iteration, all_findings, findings_count)
+    await _incoming_events(
+        ctx, all_in_findings, redacted, iteration, all_findings, findings_count, sorted(kinds)
+    )
     return None
 
 

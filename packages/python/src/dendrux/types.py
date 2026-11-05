@@ -350,7 +350,6 @@ class Message:
     reasoning: str | None = None
     reasoning_blocks: list[Any] | None = None
     parts: tuple[ContentPart, ...] | None = None
-    _guardrail_projection: Any = field(default=None, repr=False, compare=False)
 
     def __init__(
         self,
@@ -366,7 +365,6 @@ class Message:
         reasoning: str | None = None,
         reasoning_blocks: list[Any] | None = None,
         parts: tuple[ContentPart, ...] | None = None,
-        _guardrail_projection: Any = None,
     ) -> None:
         # Hand-written (dataclass init=False) so the frozen message is
         # built with one dict update instead of one object.__setattr__ per field.
@@ -383,7 +381,6 @@ class Message:
             reasoning=reasoning,
             reasoning_blocks=reasoning_blocks,
             parts=parts,
-            _guardrail_projection=_guardrail_projection,
         )
         self.__post_init__()
 

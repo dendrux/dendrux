@@ -62,7 +62,7 @@ async def test_redaction_evidence_survives_projection_cache_eviction():
             Message(Role.USER, f"person{i}@example.com")
         )
         messages.append(clean)
-    clean = replace(messages[0], meta={"kept": True})
+    clean, _, _ = await engine.project_incoming_message(messages[0])
     again, findings, _ = await engine.project_incoming_message(clean, index=1)
     assert again is not clean and len(findings) == 1
     assert "projection" not in str(_message_to_dict(again))
