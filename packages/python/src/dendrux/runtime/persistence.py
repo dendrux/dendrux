@@ -74,9 +74,10 @@ if TYPE_CHECKING:
 
     from dendrux.guardrails import GuardrailEngine
     from dendrux.media import BlobEdge
-    from dendrux.runtime.state import StateStore
+    from dendrux.runtime.state import StateStore, TraceWrite
     from dendrux.types import (
         AgentStep,
+        Limits,
         LLMResponse,
         Message,
         ToolCall,
@@ -445,8 +446,10 @@ class PersistenceRecorder(BaseRecorder):
         self._consumed_user_count = 0
         self._final_trace: Any = None
         self._resume_pause_data: dict[str, Any] | None = None
+        self._history_limits: Limits | None = None
 
     async def restore_history(self, *, limits: Any, records: Any = None) -> None:
+        self._history_limits = limits
         if not self._format2:
             return
         from dendrux.runtime.replay import conversation_records
@@ -774,8 +777,6 @@ class PersistenceRecorder(BaseRecorder):
         """Persist a changed prefix before its next model call, including edits."""
         if not self._format2:
             return
-        from dendrux.runtime.state import TraceWrite
-
         await self._snapshot(iteration - 1)
         view = [
             {"role": t.role, "content": t.content, "meta": t.meta}
@@ -784,23 +785,7 @@ class PersistenceRecorder(BaseRecorder):
         self._loop_state["phase"] = "model_next"
         digests = [_view_identity(entry) for entry in view]
         if digests != [digest for _, digest in self._known_history]:
-            from dendrux.runtime.replay import conversation_records
-
-            # Only a genuine edit needs the old evidence metadata. The normal
-            # boundary compares compact digests without reading history again.
-            previous = {
-                _view_identity({"role": t.role, "content": t.content, "meta": t.meta}): t.meta
-                for t in await conversation_records(self._store_calls, self._run_id)
-            }
-            for entry, digest in zip(view, digests, strict=True):
-                entry["meta"] = {**(previous.get(digest) or {}), **entry["meta"]}
-            trace = TraceWrite(
-                generate_ulid(),
-                "rewrite",
-                json.dumps(view, ensure_ascii=False),
-                self._order_index,
-                trace_kind="rewrite",
-            )
+            trace = await self._edited_view(view, digests)
             self._order_index += 1
             await self._checkpoint(trace)
             self._known_history = [
@@ -809,6 +794,28 @@ class PersistenceRecorder(BaseRecorder):
             self._system_messages = [m for m in messages if m.role.value == "system"]
         elif self._loop_state != self._durable_state:
             await self._checkpoint()
+
+    async def _edited_view(self, view: list[dict[str, Any]], digests: list[str]) -> TraceWrite:
+        from dendrux.runtime.replay import conversation_records
+        from dendrux.runtime.state import TraceWrite
+
+        # Only a genuine edit needs the old evidence metadata. The normal
+        # boundary compares compact digests without reading history again.
+        previous = {
+            _view_identity({"role": t.role, "content": t.content, "meta": t.meta}): t.meta
+            for t in await conversation_records(
+                self._store_calls, self._run_id, limits=self._history_limits
+            )
+        }
+        for entry, digest in zip(view, digests, strict=True):
+            entry["meta"] = {**(previous.get(digest) or {}), **entry["meta"]}
+        return TraceWrite(
+            generate_ulid(),
+            "rewrite",
+            json.dumps(view, ensure_ascii=False),
+            self._order_index,
+            trace_kind="rewrite",
+        )
 
     async def on_llm_call_started(
         self,

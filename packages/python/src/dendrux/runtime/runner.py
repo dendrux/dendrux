@@ -116,6 +116,7 @@ from dendrux.runtime.replay import (
     ReplayLast,
     ReplayPlan,
     ReplayRequest,
+    _load_replay_runs,
     _pair_tool_calls,
     build_seed,
     current_prefix,
@@ -124,13 +125,13 @@ from dendrux.runtime.replay import (
     image_slot_count,
     initial_image_view,
     load_image_sources,
-    load_replay_runs,
     parts_to_dicts,
     rebuild_messages,
     record_run_prefix,
     user_trace_message,
     validate_replay_args,
 )
+from dendrux.runtime.replay import load_replay_runs as load_replay_runs
 from dendrux.runtime.state import ClaimResult, _initial_loop_state, claimed_store, unclaimed_store
 from dendrux.runtime.stores._limits_fit import ensure_agent_limits_fit
 from dendrux.runtime.submit import (
@@ -199,6 +200,7 @@ if TYPE_CHECKING:
     from dendrux.types import (
         ContentPart,
         CreateRunResult,
+        Limits,
         RunEvent,
         RunResult,
         RunStream,
@@ -472,7 +474,7 @@ def _runtime_recorder(
     from dendrux.tool import get_tool_def
 
     definitions = [get_tool_def(fn) for fn in agent.tools]
-    return PersistenceRecorder(
+    recorder = PersistenceRecorder(
         store,
         run_id,
         model=provider.model,
@@ -482,6 +484,8 @@ def _runtime_recorder(
         guardrail_engine=guardrails,
         **_recorder_image_kwargs(tenant_id, provider),
     )
+    recorder._history_limits = agent._limits
+    return recorder
 
 
 async def _start_new_run(
@@ -2203,9 +2207,10 @@ async def _load_new_run_replay(
     tenant_id: str | None,
     loop: Loop,
     *,
+    limits: Limits,
     method: str = "run",
 ) -> list[Any]:
-    runs = await load_replay_runs(store, request, tenant_id=tenant_id)
+    runs = await _load_replay_runs(store, request, tenant_id=tenant_id, limits=limits)
     if _replay_has_images(runs):
         _require_image_loop(loop, method)
     return runs
@@ -2219,6 +2224,7 @@ async def _entry_replay(
     reasoning: bool,
     loop: Loop,
     context: Any,
+    limits: Limits,
 ) -> tuple[ReplayRequest | None, list[Any]]:
     request = validate_replay_args(runs, last, reasoning, loop=loop, context=context)
     validate_context(context)
@@ -2229,7 +2235,7 @@ async def _entry_replay(
             "runs= requires persistence (database_url or state_store): "
             "replay reads the earlier runs' traces."
         )
-    return request, await _load_new_run_replay(store, request, tenant_id, loop)
+    return request, await _load_new_run_replay(store, request, tenant_id, loop, limits=limits)
 
 
 async def _entry_media(
@@ -2451,7 +2457,14 @@ async def run(
             user_input, history, resolved_loop
         )
         replay_req, replay_runs = await _entry_replay(
-            state_store, tenant_id, runs, replay_last, replay_reasoning, resolved_loop, context
+            state_store,
+            tenant_id,
+            runs,
+            replay_last,
+            replay_reasoning,
+            resolved_loop,
+            context,
+            agent._limits,
         )
         replay_plan: ReplayPlan | None = None
 
@@ -3306,7 +3319,11 @@ def _refresh_retry_user(
 
 
 async def _retry_replay(
-    source_run: RunRecord, resolved_loop: Loop, state_store: StateStore, tenant_id: str | None
+    source_run: RunRecord,
+    resolved_loop: Loop,
+    state_store: StateStore,
+    tenant_id: str | None,
+    limits: Limits,
 ) -> tuple[ReplayRequest | None, list[Any]]:
     replay_req: ReplayRequest | None = None
     replay_runs: list[Any] = []
@@ -3320,7 +3337,9 @@ async def _retry_replay(
             context=None,
         )
         if replay_req is not None:
-            replay_runs = await load_replay_runs(state_store, replay_req, tenant_id=tenant_id)
+            replay_runs = await _load_replay_runs(
+                state_store, replay_req, tenant_id=tenant_id, limits=limits
+            )
 
     return replay_req, replay_runs
 
@@ -3505,7 +3524,7 @@ async def retry(
 
         # 4a. A source run that used runs= re-expands the same runs, same knobs.
         replay_req, replay_runs = await _retry_replay(
-            source_run, resolved_loop, state_store, tenant_id
+            source_run, resolved_loop, state_store, tenant_id, agent._limits
         )
 
         # 5. Create the retry run
@@ -3738,6 +3757,7 @@ async def _stream_replay_runs(
     tenant_id: str | None,
     loop: Loop,
     shared: dict[str, Any],
+    limits: Limits,
 ) -> list[Any]:
     if request is None:
         return []
@@ -3747,7 +3767,9 @@ async def _stream_replay_runs(
             "runs= requires persistence (database_url or state_store): "
             "replay reads the earlier runs' traces."
         )
-    runs = await _load_new_run_replay(store, request, tenant_id, loop, method="run_stream")
+    runs = await _load_new_run_replay(
+        store, request, tenant_id, loop, limits=limits, method="run_stream"
+    )
     shared["existing_run"] = False
     return runs
 
@@ -4008,7 +4030,7 @@ def run_stream(
             _require_idempotency_store(store, idempotency_key)
 
             replay_runs = await _stream_replay_runs(
-                replay_req, store, eff_tenant, resolved_loop, _shared
+                replay_req, store, eff_tenant, resolved_loop, _shared, agent._limits
             )
 
             if store is not None:
