@@ -39,7 +39,7 @@ T = TypeVar("T")
 
 
 async def _drain_cleanup(
-    coro: Coroutine[Any, Any, T], *, name: str | None = None
+    coro: Coroutine[Any, Any, T], *, name: str | None = None, run_id: str | None = None
 ) -> tuple[T, asyncio.CancelledError | None]:
     import anyio
 
@@ -52,10 +52,14 @@ async def _drain_cleanup(
             except asyncio.CancelledError as exc:
                 if cancellation is None:
                     cancellation = exc
+            except Exception:
+                pass  # task.result() resolves failures against the retained cancellation.
         try:
             result = task.result()
-        except BaseException:
+        except BaseException as error:
             if cancellation is not None:
+                if not isinstance(error, asyncio.CancelledError):
+                    _codes.log_code(logger, _codes.PERSISTENCE_ERROR, run_id=run_id)
                 raise cancellation from None
             raise
     return result, cancellation

@@ -312,18 +312,18 @@ async def test_twenty_public_reclaimers_one_continuation(store, engine):
 
     class Session(AsyncSession):
         async def execute(self, statement, *args, **kwargs):
-            task = asyncio.current_task()
-            if task not in entered:
-                entered.add(task)
+            contender = self.info["reclaim_contender"]
+            if contender not in entered:
+                entered.add(contender)
                 await self.connection()
                 await asyncio.wait_for(barrier.wait(), 20)
             return await super().execute(statement, *args, **kwargs)
 
     contenders = []
-    for _ in range(20):
+    for contender in range(20):
         contender_store = store_for_engine(pool)
         contender_store._session_factory = async_sessionmaker(
-            pool, class_=Session, expire_on_commit=False
+            pool, class_=Session, expire_on_commit=False, info={"reclaim_contender": contender}
         )
         contenders.append(make_agent(contender_store))
     try:
@@ -334,6 +334,7 @@ async def test_twenty_public_reclaimers_one_continuation(store, engine):
             ),
             30,
         )
+        assert len(entered) == 20
         assert sum(not isinstance(r, BaseException) for r in results) == 1
         assert sum(isinstance(r, RunNotReclaimableError) for r in results) == 19
         assert sum(a.provider.calls_made for a in contenders) == 1

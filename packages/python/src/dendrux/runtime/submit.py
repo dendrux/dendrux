@@ -403,6 +403,10 @@ async def _claim_submission(
     blob_refs: Sequence[BlobEdge] | None = None,
     blob_refs_scope: str | None = None,
 ) -> tuple[ClaimResult | int | bool, dict[str, Any] | None, dict[str, Any] | None]:
+    from functools import partial
+
+    from dendrux.runtime.durability import _ownership_handoff
+
     descriptor = None
     if (
         request.raw.get("schema_version") == 2
@@ -417,17 +421,35 @@ async def _claim_submission(
         )
         descriptor = submission_descriptor(request.raw, checkpoint, payload, status)
     if payload is None:
-        won = await claim_paused_validated(store, run_id, expected_status=status, validate=validate)
+        operation = claim_paused_validated(store, run_id, expected_status=status, validate=validate)
     else:
         kwargs: dict[str, Any] = {"validate": validate}
         if descriptor is not None:
             kwargs["submission"] = descriptor
         if blob_refs:
             kwargs.update(blob_refs=list(blob_refs), blob_refs_scope=blob_refs_scope)
-        won = await store.submit_and_claim(
+        operation = store.submit_and_claim(
             run_id, expected_status=status, submitted_data=payload, **kwargs
         )
+    won = await _ownership_handoff(
+        store, operation, partial(_cancel_claim, store, run_id), run_id=run_id
+    )
     return won, descriptor, payload
+
+
+async def _cancel_claim(store: StateStore, run_id: str, result: ClaimResult | int | bool) -> None:
+    from dendrux.runtime.runner import _persist_task_cancellation
+    from dendrux.runtime.state import claimed_store
+
+    if not result or isinstance(result, bool):
+        import logging
+
+        if result:
+            _codes.log_code(
+                logging.getLogger(__name__), _codes.CANCEL_PERSIST_FAILED, run_id=run_id
+            )
+        return
+    await _persist_task_cancellation(claimed_store(store, run_id, result), run_id)
 
 
 def _claimed_submission_view(
@@ -599,8 +621,13 @@ async def _release_claim_result(
     run_id: str,
     status: str,
     result: ClaimResult | int | bool,
-    failure: BaseException,
+    failure: BaseException | None,
 ) -> None:
+    if isinstance(failure, asyncio.CancelledError):
+        from dendrux.runtime.tasks import _drain_cleanup
+
+        await _drain_cleanup(_cancel_claim(store, run_id, result), run_id=run_id)
+        return
     epoch = result.claim_epoch if isinstance(result, ClaimResult) else result
     token = epoch if isinstance(epoch, int) and not isinstance(epoch, bool) else None
     await release_claim(store, run_id, status, claim_epoch=token, failure=failure)
@@ -609,8 +636,6 @@ async def _release_claim_result(
 def _resume_failure_kind(failure: BaseException | None) -> str:
     from dendrux.errors import PersistenceError
 
-    if isinstance(failure, asyncio.CancelledError):
-        return "cancelled"
     if isinstance(failure, PersistenceError):
         return "persistence_error"
     if isinstance(failure, (ValueError, KeyError, TypeError)):
@@ -685,7 +710,7 @@ async def release_claim(
             pass
         _codes.log_code(logging.getLogger(__name__), _codes.PERSISTENCE_ERROR, run_id=run_id)
 
-    _, cancelled = await _drain_cleanup(cleanup(), name=f"release-claim:{run_id}")
+    _, cancelled = await _drain_cleanup(cleanup(), name=f"release-claim:{run_id}", run_id=run_id)
     if cancelled is not None:
         raise cancelled
 

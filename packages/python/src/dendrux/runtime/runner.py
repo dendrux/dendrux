@@ -116,6 +116,7 @@ from dendrux.runtime.replay import (
     ReplayLast,
     ReplayPlan,
     ReplayRequest,
+    _load_replay_runs,
     _pair_tool_calls,
     build_seed,
     current_prefix,
@@ -124,13 +125,13 @@ from dendrux.runtime.replay import (
     image_slot_count,
     initial_image_view,
     load_image_sources,
-    load_replay_runs,
     parts_to_dicts,
     rebuild_messages,
     record_run_prefix,
     user_trace_message,
     validate_replay_args,
 )
+from dendrux.runtime.replay import load_replay_runs as load_replay_runs
 from dendrux.runtime.state import ClaimResult, _initial_loop_state, claimed_store, unclaimed_store
 from dendrux.runtime.stores._limits_fit import ensure_agent_limits_fit
 from dendrux.runtime.submit import (
@@ -199,6 +200,7 @@ if TYPE_CHECKING:
     from dendrux.types import (
         ContentPart,
         CreateRunResult,
+        Limits,
         RunEvent,
         RunResult,
         RunStream,
@@ -309,6 +311,7 @@ async def _drain_task_cancellation(
     result, _ = await _drain_cleanup(
         _persist_task_cancellation(store, run_id, interrupted=interrupted),
         name=f"cancel-run:{run_id}",
+        run_id=run_id,
     )
     return result
 
@@ -472,7 +475,7 @@ def _runtime_recorder(
     from dendrux.tool import get_tool_def
 
     definitions = [get_tool_def(fn) for fn in agent.tools]
-    return PersistenceRecorder(
+    recorder = PersistenceRecorder(
         store,
         run_id,
         model=provider.model,
@@ -482,6 +485,8 @@ def _runtime_recorder(
         guardrail_engine=guardrails,
         **_recorder_image_kwargs(tenant_id, provider),
     )
+    recorder._history_limits = agent._limits
+    return recorder
 
 
 async def _start_new_run(
@@ -2203,9 +2208,10 @@ async def _load_new_run_replay(
     tenant_id: str | None,
     loop: Loop,
     *,
+    limits: Limits,
     method: str = "run",
 ) -> list[Any]:
-    runs = await load_replay_runs(store, request, tenant_id=tenant_id)
+    runs = await _load_replay_runs(store, request, tenant_id=tenant_id, limits=limits)
     if _replay_has_images(runs):
         _require_image_loop(loop, method)
     return runs
@@ -2219,6 +2225,7 @@ async def _entry_replay(
     reasoning: bool,
     loop: Loop,
     context: Any,
+    limits: Limits,
 ) -> tuple[ReplayRequest | None, list[Any]]:
     request = validate_replay_args(runs, last, reasoning, loop=loop, context=context)
     validate_context(context)
@@ -2229,7 +2236,7 @@ async def _entry_replay(
             "runs= requires persistence (database_url or state_store): "
             "replay reads the earlier runs' traces."
         )
-    return request, await _load_new_run_replay(store, request, tenant_id, loop)
+    return request, await _load_new_run_replay(store, request, tenant_id, loop, limits=limits)
 
 
 async def _entry_media(
@@ -2451,7 +2458,14 @@ async def run(
             user_input, history, resolved_loop
         )
         replay_req, replay_runs = await _entry_replay(
-            state_store, tenant_id, runs, replay_last, replay_reasoning, resolved_loop, context
+            state_store,
+            tenant_id,
+            runs,
+            replay_last,
+            replay_reasoning,
+            resolved_loop,
+            context,
+            agent._limits,
         )
         replay_plan: ReplayPlan | None = None
 
@@ -2721,11 +2735,20 @@ def _recovery_loop_name(loop: Loop) -> str | None:
 async def _create_runtime_run(
     store: StateStore, loop: Loop, run_id: str, agent_name: str, **kwargs: Any
 ) -> CreateRunResult:
+    from dendrux.runtime.durability import _ownership_handoff
     from dendrux.runtime.state import _creation_loop_scope
+
+    async def cancel_created(created: CreateRunResult) -> None:
+        if created.outcome == "created":
+            await _persist_task_cancellation(
+                claimed_store(store, created.run_id, 0), created.run_id
+            )
 
     native_store = unclaimed_store(store)
     with _creation_loop_scope(native_store, run_id, _recovery_loop_name(loop)):
-        return await store.create_run(run_id, agent_name, **kwargs)
+        return await _ownership_handoff(
+            store, store.create_run(run_id, agent_name, **kwargs), cancel_created, run_id=run_id
+        )
 
 
 async def _runtime_seeds(
@@ -3297,7 +3320,11 @@ def _refresh_retry_user(
 
 
 async def _retry_replay(
-    source_run: RunRecord, resolved_loop: Loop, state_store: StateStore, tenant_id: str | None
+    source_run: RunRecord,
+    resolved_loop: Loop,
+    state_store: StateStore,
+    tenant_id: str | None,
+    limits: Limits,
 ) -> tuple[ReplayRequest | None, list[Any]]:
     replay_req: ReplayRequest | None = None
     replay_runs: list[Any] = []
@@ -3311,7 +3338,9 @@ async def _retry_replay(
             context=None,
         )
         if replay_req is not None:
-            replay_runs = await load_replay_runs(state_store, replay_req, tenant_id=tenant_id)
+            replay_runs = await _load_replay_runs(
+                state_store, replay_req, tenant_id=tenant_id, limits=limits
+            )
 
     return replay_req, replay_runs
 
@@ -3496,7 +3525,7 @@ async def retry(
 
         # 4a. A source run that used runs= re-expands the same runs, same knobs.
         replay_req, replay_runs = await _retry_replay(
-            source_run, resolved_loop, state_store, tenant_id
+            source_run, resolved_loop, state_store, tenant_id, agent._limits
         )
 
         # 5. Create the retry run
@@ -3729,6 +3758,7 @@ async def _stream_replay_runs(
     tenant_id: str | None,
     loop: Loop,
     shared: dict[str, Any],
+    limits: Limits,
 ) -> list[Any]:
     if request is None:
         return []
@@ -3738,7 +3768,9 @@ async def _stream_replay_runs(
             "runs= requires persistence (database_url or state_store): "
             "replay reads the earlier runs' traces."
         )
-    runs = await _load_new_run_replay(store, request, tenant_id, loop, method="run_stream")
+    runs = await _load_new_run_replay(
+        store, request, tenant_id, loop, limits=limits, method="run_stream"
+    )
     shared["existing_run"] = False
     return runs
 
@@ -3999,7 +4031,7 @@ def run_stream(
             _require_idempotency_store(store, idempotency_key)
 
             replay_runs = await _stream_replay_runs(
-                replay_req, store, eff_tenant, resolved_loop, _shared
+                replay_req, store, eff_tenant, resolved_loop, _shared, agent._limits
             )
 
             if store is not None:
@@ -4315,7 +4347,7 @@ def run_stream(
     stream = _RunStream(
         run_id=run_id,
         generator=stream_context.wrap(_generate()),
-        cleanup=lambda: _shielded_cleanup(_cleanup),
+        cleanup=lambda: _shielded_cleanup(_cleanup, run_id=run_id),
     )
     return stream
 
@@ -5672,25 +5704,26 @@ async def _claim_resume(
 async def _release_claim(store: StateStore, run_id: str, status: str) -> None:
     import sys
 
-    from dendrux.runtime.submit import release_claim
+    from dendrux.runtime.submit import _release_claim_result
 
-    await release_claim(store, run_id, status, failure=sys.exception())
+    epoch = getattr(store, "claim_epoch", True)
+    try:
+        await _release_claim_result(store, run_id, status, epoch, sys.exception())
+    except asyncio.CancelledError as cancellation:
+        await _release_claim_result(store, run_id, status, epoch, cancellation)
+        raise
 
 
-async def _shielded_cleanup(cleanup: Callable[[], Any]) -> Any:
+async def _shielded_cleanup(cleanup: Callable[[], Any], *, run_id: str | None = None) -> Any:
     import anyio
 
     from dendrux.runtime.tasks import _drain_cleanup
 
-    result, cancellation = await _drain_cleanup(cleanup())
+    result, cancellation = await _drain_cleanup(cleanup(), run_id=run_id)
     if cancellation is not None:
         raise cancellation
     await anyio.lowlevel.checkpoint_if_cancelled()
     return result
-
-
-def _release_setup_allowed(enabled: bool, exc: Exception) -> bool:
-    return enabled and not isinstance(exc, RunFencedError)
 
 
 @asynccontextmanager
@@ -5699,8 +5732,8 @@ async def _release_setup_failure(
 ) -> AsyncIterator[None]:
     try:
         yield
-    except Exception as exc:
-        if _release_setup_allowed(enabled, exc):
+    except BaseException as exc:
+        if enabled and not isinstance(exc, RunFencedError):
             await _release_claim(store, run_id, status)
         raise
 
@@ -6931,7 +6964,7 @@ def resume_stream(
     return _RunStream(
         run_id=run_id,
         generator=stream_context.wrap(_generate()),
-        cleanup=lambda: _shielded_cleanup(_cleanup),
+        cleanup=lambda: _shielded_cleanup(_cleanup, run_id=run_id),
     )
 
 
