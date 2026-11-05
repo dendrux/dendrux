@@ -1949,7 +1949,9 @@ class RunEventType(StrEnum):
         RUN_RESUMED: First event for resumed runs. Carries run_id.
         RUN_COMPLETED: Terminal. Run finished (success or max_iterations).
         RUN_PAUSED: Terminal. Run paused for client tool or human input.
-        RUN_ERROR: Terminal. Run failed. No exception is raised to the consumer.
+        RUN_ERROR: Ends this stream attempt without raising to the consumer.
+            The result can report a paused or running row after continuation
+            cleanup, rather than a terminal run failure.
         RUN_CANCELLED: Terminal. Run was cancelled cooperatively.
 
     LLM output events (translated from provider StreamEvent):

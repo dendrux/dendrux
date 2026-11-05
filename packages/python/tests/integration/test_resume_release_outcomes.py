@@ -49,7 +49,7 @@ def legacy_claims(store, monkeypatch):
 
 @pytest.mark.parametrize("entry", ENTRIES)
 @pytest.mark.parametrize("unsupported", ["method", "epoch"])
-async def test_unavailable_release_finalizes_setup_failure(
+async def test_unavailable_release_handles_setup_failure(
     store, engine, monkeypatch, entry, unsupported
 ):
     if unsupported == "epoch" and entry == "recovery":
@@ -69,7 +69,8 @@ async def test_unavailable_release_finalizes_setup_failure(
     else:
         with pytest.raises(PersistenceError):
             await case.invoke()
-    assert (await store.get_run(case.run_id)).status == "error"
+    expected = "running" if entry == "recovery" else "error"
+    assert (await store.get_run(case.run_id)).status == expected
     if unsupported == "epoch":
         release.assert_not_awaited()
 
@@ -175,7 +176,8 @@ async def test_unavailable_release_during_claimed_prelude(store, engine, monkeyp
     else:
         with pytest.raises(PersistenceError):
             await case.invoke()
-    assert (await store.get_run(case.run_id)).status == "error"
+    expected = "running" if entry == "recovery" else "error"
+    assert (await store.get_run(case.run_id)).status == expected
 
 
 @pytest.mark.parametrize("release_fails", [False, True])
@@ -244,3 +246,59 @@ async def test_release_observers_report_outcome(store, engine, monkeypatch, entr
         else:
             observer.on_run_finished.assert_not_awaited()
             observer.on_run_failed.assert_awaited_once()
+
+
+@pytest.mark.parametrize("read", ["get_next_trace_index", "get_pause_state"])
+async def test_reclaim_without_release_can_retry_setup_failure(store, engine, monkeypatch, read):
+    from tests._helpers.recovery_checkpoint import expire
+
+    provider = ProbeProvider()
+    case = await path_case(store, engine, "recovery", provider)
+    before = await store.get_run(case.run_id)
+    with monkeypatch.context() as patcher:
+        patcher.setattr(store, "release_run_claim", None)
+        patcher.setattr(store, read, AsyncMock(side_effect=PersistenceError()))
+        with pytest.raises(PersistenceError):
+            await case.invoke()
+    row = await store.get_run(case.run_id)
+    assert row.status == "running" and row.claim_epoch == before.claim_epoch + 1
+    assert provider.calls == 0
+    assert not any(e.event_type == "run.error" for e in await store.get_run_events(case.run_id))
+    item = await expire(store, engine, case.run_id)
+    result = await case.agent.reclaim(case.run_id, item=item, tenant_id="tenant")
+    assert result.status == RunStatus.SUCCESS and provider.calls == 1
+
+
+@pytest.mark.parametrize("kind", ["int", "view", "claim"])
+async def test_unsupported_cleanup_keeps_original_epoch(store, engine, monkeypatch, kind):
+    import asyncio
+
+    from dendrux.runtime.state import claimed_store
+    from dendrux.runtime.submit import _release_claim_result
+
+    case = await path_case(store, engine, "resume", ProbeProvider())
+    prior = await store.get_run(case.run_id)
+    first = await store.claim_paused_run(case.run_id, expected_status=prior.status)
+    assert await store.release_run_claim(
+        case.run_id, status=prior.status, claim_epoch=first.claim_epoch
+    )
+    if engine.dialect.name in {"postgresql", "mysql"}:
+        barrier = asyncio.Barrier(3)
+
+        async def compete():
+            await barrier.wait()
+            return await store.claim_paused_run(case.run_id, expected_status=prior.status)
+
+        winners = [claim for claim in await asyncio.gather(*(compete() for _ in range(3))) if claim]
+        assert len(winners) == 1
+        second = winners[0]
+    else:
+        second = await store.claim_paused_run(case.run_id, expected_status=prior.status)
+    assert second.claim_epoch > first.claim_epoch
+    monkeypatch.setattr(store, "release_run_claim", None)
+    target = claimed_store(store, case.run_id, first.claim_epoch) if kind == "view" else store
+    token = first if kind == "claim" else first.claim_epoch
+    await _release_claim_result(target, case.run_id, prior.status, token, PersistenceError())
+    row = await store.get_run(case.run_id)
+    assert row.status == "running" and row.claim_epoch == second.claim_epoch
+    assert not any(e.event_type == "run.error" for e in await store.get_run_events(case.run_id))

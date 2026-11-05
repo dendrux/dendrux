@@ -144,8 +144,9 @@ picked up automatically. Permanent setup failures will repeat until corrected;
 call `cancel_run` if you give up. Paused rows do not time out automatically.
 Reclaim releases to `running` for lease expiry and a new sweep.
 
-If the store has no release method or integer epoch, Dendrux falls back to
-persisting `error`. If a release is attempted but fails, the row can stay
+For a claimed pause, a store without a release method or integer epoch falls back
+to persisting `error`. Reclaim stays `running` for a later sweep even without a
+release method. If a release is attempted but fails, the row can stay
 `running`; use `sweep` and `reclaim`, or `sweep(on_stale="error")` for stores without
 recovery. A stale release cannot change a newer epoch. Started observers get
 `on_run_finished` after a confirmed release to an observed non-running status.

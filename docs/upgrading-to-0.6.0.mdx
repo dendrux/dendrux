@@ -130,8 +130,11 @@ Normalized SQL errors discard internal traceback frames that could retain driver
 
 ### Continuation setup failures
 
-In 0.5.0, post-claim setup failures in `resume` and `resume_stream` usually ended
-the run as `error`. In 0.6.0, continuations (`resume`, `resume_stream`, `submit_*`
+In 0.5.0, execution-setup failures such as a failed trace-index read ended
+`resume`, `resume_stream`, `submit_tool_results`, `submit_input`, `submit_approval`
+and `submit_resume` as `error` when failure persistence succeeded. Earlier
+owned-pause validation failures could already release the claim.
+In 0.6.0, continuations (`resume`, `resume_stream`, `submit_*`
 and `reclaim`) can release their exact claim when an ordinary exception occurs before
 submission consumption or work starts. This includes failed setup reads and writes
 such as `run.resumed`, `save_trace` and `consume_submission`, provided consumption
@@ -149,8 +152,9 @@ For a confirmed release to a non-running status, started observers receive
 `on_run_finished` with that observed status. A released reclaim still reports
 failure hooks because its row remains `running`. Failure hooks also run when
 release is unavailable, fails, or its status cannot be read.
-A store without a release method or an integer claim epoch falls back to terminal
-error persistence. An attempted release that fails leaves the last durable state
+For a claimed pause, a store without a release method or an integer claim epoch
+falls back to terminal error persistence. Reclaim remains `running` and retryable
+after lease expiry even without a release method. An attempted release that fails leaves the last durable state
 for `sweep`/`reclaim`; stores without recovery use `sweep(on_stale="error")`.
 
 `resume_stream` still emits `run_error` for the failed attempt, but its

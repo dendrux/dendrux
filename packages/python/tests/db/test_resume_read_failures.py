@@ -75,7 +75,7 @@ async def test_committed_pause(read_store, monkeypatch, caplog, entry, read):
 @pytest.mark.parametrize("entry", outcomes.ENTRIES)
 @pytest.mark.parametrize("unsupported", ["method", "epoch"])
 async def test_unavailable_release(read_store, monkeypatch, entry, unsupported):
-    await outcomes.test_unavailable_release_finalizes_setup_failure(
+    await outcomes.test_unavailable_release_handles_setup_failure(
         read_store, read_store._engine, monkeypatch, entry, unsupported
     )
 
@@ -132,4 +132,18 @@ async def test_cancel_signal_after_read_failure(read_store, monkeypatch, failure
 async def test_legacy_cascade_signals(read_store, monkeypatch):
     await cancellation.test_legacy_cascade_signals_completed_children_when_later_child_fails(
         read_store, monkeypatch
+    )
+
+
+@pytest.mark.parametrize("read", ["get_next_trace_index", "get_pause_state"])
+async def test_reclaim_without_release(read_store, monkeypatch, read):
+    await outcomes.test_reclaim_without_release_can_retry_setup_failure(
+        read_store, read_store._engine, monkeypatch, read
+    )
+
+
+@pytest.mark.parametrize("kind", ["int", "view", "claim"])
+async def test_unsupported_cleanup_epoch(read_store, monkeypatch, kind):
+    await outcomes.test_unsupported_cleanup_keeps_original_epoch(
+        read_store, read_store._engine, monkeypatch, kind
     )

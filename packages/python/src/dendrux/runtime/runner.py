@@ -140,6 +140,7 @@ from dendrux.runtime.submit import (
     _claim_request,
     _claim_submission,
     _claimed_submission_view,
+    _release_supported,
     governance_snapshot,
     legacy_approval_denial,
     prepare_resume_results,
@@ -5676,7 +5677,7 @@ async def _claim_resume(
     user_parts: tuple[ContentPart, ...] | None = None,
     decisions: list[tuple[str, ApprovalDecision]] | None = None,
     checkpoint: dict[str, Any] | None = None,
-    on_release: Callable[[StateStore, bool | None], None] | None = None,
+    on_release: Callable[[StateStore], None] | None = None,
 ) -> tuple[StateStore, str, dict[str, Any]]:
     request = _claim_request(
         raw,
@@ -5731,29 +5732,25 @@ async def _report_claim_governance(
     run_id: str,
     raw: dict[str, Any],
     status: str,
-    on_release: Callable[[StateStore, bool | None], None] | None,
+    on_release: Callable[[StateStore], None] | None,
 ) -> None:
     try:
         await report_governance_change(agent, store, run_id, raw)
     except BaseException as exc:
-        released = await _release_claim(store, run_id, status)
-        if on_release is not None and isinstance(exc, Exception):
-            on_release(store, released)
+        await _release_claim(store, run_id, status)
+        if on_release is not None and isinstance(exc, Exception) and _release_supported(store):
+            on_release(store)
         raise
 
 
-async def _release_claim(
-    store: StateStore, run_id: str, status: str, *, finalize_unsupported: bool = True
-) -> bool | None:
+async def _release_claim(store: StateStore, run_id: str, status: str) -> bool:
     import sys
 
     from dendrux.runtime.submit import _release_claim_result
 
     epoch = getattr(store, "claim_epoch", True)
     try:
-        return await _release_claim_result(
-            store, run_id, status, epoch, sys.exception(), finalize_unsupported=finalize_unsupported
-        )
+        return await _release_claim_result(store, run_id, status, epoch, sys.exception())
     except asyncio.CancelledError as cancellation:
         await _release_claim_result(store, run_id, status, epoch, cancellation)
         raise
@@ -6244,10 +6241,8 @@ async def _released_resume_hooks(
 
 async def _try_resume_release(
     store: StateStore, run_id: str, status: str, ctx: _ResumeContext | None, exc: Exception
-) -> RunStatus | None:
-    released = await _release_claim(store, run_id, status, finalize_unsupported=False)
-    if released is None:
-        return None
+) -> RunStatus:
+    released = await _release_claim(store, run_id, status)
     if released:
         return await _released_resume_hooks(store, run_id, ctx, exc)
     await _resume_failure_hooks(ctx, run_id, exc)
@@ -6263,10 +6258,10 @@ async def _handle_resume_failure(
     progress: _ResumeProgress,
     meta: dict[str, Any],
 ) -> None:
-    if (
-        progress._can_release(ctx, exc)
-        and await _try_resume_release(store, run_id, status, ctx, exc) is not None
+    if progress._can_release(ctx, exc) and (
+        status == RunStatus.RUNNING.value or _release_supported(store)
     ):
+        await _try_resume_release(store, run_id, status, ctx, exc)
         return
     _attach_run_error_meta(exc, run_id, meta)
     await _persist_run_failure(store, run_id, exc)
@@ -6668,10 +6663,13 @@ async def _stream_resume_failure(
     store = _shared.get("state_store")
     err_ctx = _shared.get("ctx")
     progress = _shared.get("progress")
-    if store is not None and progress is not None and progress._can_release(err_ctx, exc):
-        outcome = await _try_resume_release(store, run_id, _shared["expected_status"], err_ctx, exc)
-        if outcome is not None:
-            return outcome
+    if (
+        store is not None
+        and progress is not None
+        and progress._can_release(err_ctx, exc)
+        and (_shared["expected_status"] == RunStatus.RUNNING.value or _release_supported(store))
+    ):
+        return await _try_resume_release(store, run_id, _shared["expected_status"], err_ctx, exc)
     if store is not None and _stream_resume_started(_shared):
         await _persist_run_failure(store, run_id, exc, safe_event=True)
     try:
@@ -6690,15 +6688,13 @@ async def _stream_resume_failure(
             exc_info=safe_exception_info(),
         )
     prelude = _shared.get("released_prelude")
-    if prelude is not None and prelude[1] is not None:
-        return await _released_resume_status(prelude[0], run_id)
+    if prelude is not None:
+        return await _released_resume_status(prelude, run_id)
     return RunStatus.ERROR
 
 
-def _remember_stream_release(
-    shared: dict[str, Any], store: StateStore, released: bool | None
-) -> None:
-    shared["released_prelude"] = (store, released)
+def _remember_stream_release(shared: dict[str, Any], store: StateStore) -> None:
+    shared["released_prelude"] = store
 
 
 async def _finish_resume_stream_cleanup(
