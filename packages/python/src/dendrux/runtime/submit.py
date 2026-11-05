@@ -1289,9 +1289,6 @@ class _PauseIdRequiredError(InputValidationError):
         super().__init__(field, code)
         self.args = (str(self) + " Send the pause_id from get_pending as expected_pause_id.",)
 
-    def __reduce__(self) -> tuple[Any, tuple[str, str]]:
-        return (type(self), (self.field, self.code))
-
 
 def _pause_id_required() -> ValueError:
     return _PauseIdRequiredError("expected_pause_id", "pause_id_required")
