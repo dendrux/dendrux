@@ -14,6 +14,7 @@ from typing import Any
 import pytest
 
 from dendrux.db import _redis_updates as ru
+from tests._helpers.log_records import record_text, without_addresses
 from tests.unit.test_redis_updates_fakes import FakeConnectionError, FakeTimeoutError, FakeWorld
 
 SENTINELS = ("s3cret-sentinel", "sentinel-host", "6380")
@@ -36,14 +37,14 @@ def world(monkeypatch: pytest.MonkeyPatch) -> FakeWorld:
 
 
 def scan(text: str) -> None:
+    text = without_addresses(text)
     for sentinel in SENTINELS:
         assert sentinel not in text, f"{sentinel!r} leaked into {text[:200]!r}"
 
 
 def scan_records(records: list[logging.LogRecord]) -> None:
     for record in records:
-        scan(record.getMessage())
-        scan(repr(record.__dict__))
+        scan(record_text(record))
 
 
 def chain(error: BaseException | None) -> list[BaseException]:
@@ -52,6 +53,38 @@ def chain(error: BaseException | None) -> list[BaseException]:
         found.append(error)
         error = error.__cause__ or error.__context__
     return found
+
+
+def _record(**fields: Any) -> logging.LogRecord:
+    return logging.makeLogRecord({"name": "dendrux.db._live_updates", "msg": "x", **fields})
+
+
+def test_scan_ignores_the_clock_and_counter_digits_of_a_record() -> None:
+    # relativeCreated really was 454520.563806 in the CI run that failed at random on "6380".
+    scan_records([_record(relativeCreated=454520.563806, created=1793806380.5, thread=63801)])
+
+
+def test_scan_ignores_a_memory_address_but_not_a_port_next_to_one() -> None:
+    scan("<asyncio.locks.Event object at 0x107aa6380 [set]>")
+    with pytest.raises(AssertionError, match="leaked"):
+        scan("<Event object at 0x107aa6380> host:6380")
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"msg": "connect to host:6380"},
+        {"msg": "connect to %s", "args": ("host:6380",)},
+        {"pathname": "/srv/redis.sentinel-host.example/x.py"},
+        {"extra_port": 6380},
+        {"extra_text": "s3cret-sentinel"},
+        {"extra_nested": {"hosts": [("a", 6380)]}},
+        {"exc_text": "ConnectionError: 10.0.0.1:6380"},
+    ],
+)
+def test_scan_still_catches_a_real_leak_in_any_field(fields: dict[str, Any]) -> None:
+    with pytest.raises(AssertionError, match="leaked"):
+        scan_records([_record(**fields)])
 
 
 async def test_failed_sends_through_the_base_log_kinds_only(

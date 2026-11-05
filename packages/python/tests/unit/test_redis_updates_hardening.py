@@ -15,6 +15,7 @@ from typing import Any
 import pytest
 
 from dendrux.db import _redis_updates as ru
+from tests._helpers.log_records import without_addresses
 from tests.unit.test_redis_updates_fakes import FakeWorld
 
 HOST = "redis.sentinel-host.example"
@@ -310,6 +311,7 @@ def test_real_internal_clients_do_not_show_host_or_port_after_lazy_init() -> Non
     updates._sender()  # lazily builds redis-py's pool and client
     ru._Subscription(updates)  # and a listen pool and pub/sub object
     for text in (repr(vars(updates)), repr(updates.__dict__), repr(updates)):
+        text = without_addresses(text)
         for sentinel in ("sentinel", HOST, "6380"):
             assert sentinel not in text
 

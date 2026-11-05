@@ -20,6 +20,7 @@ from urllib.parse import urlsplit
 import pytest
 
 from dendrux.db import _redis_updates as ru
+from tests._helpers.log_records import record_text
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable
@@ -486,9 +487,9 @@ async def test_a_wrong_password_and_an_unreachable_host_leak_nothing(
                 assert sentinel not in f"{error!s} {error!r}"
             error = error.__cause__ or error.__context__
         for record in caplog.records:
+            text = record_text(record)
             for sentinel in sentinels:
-                assert sentinel not in record.getMessage()
-                assert sentinel not in repr(record.__dict__)
+                assert sentinel not in text
         assert sentinels[0] not in repr(updates)
         caplog.clear()
 
