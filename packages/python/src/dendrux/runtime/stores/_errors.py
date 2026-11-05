@@ -180,7 +180,7 @@ def _is_connection_reset(error: BaseException, code: int | None) -> bool:
 
 
 def _is_connection_type(error: BaseException) -> bool:
-    return isinstance(error, ConnectionError) and error.errno is None
+    return isinstance(error, (ConnectionError, TimeoutError)) and error.errno is None
 
 
 def _is_connection_errno(error: BaseException, code: int | None) -> bool:

@@ -42,10 +42,8 @@ def test_transport_errno_is_transient(code, depth):
 
 
 @pytest.mark.parametrize("depth", [0, 1, 2])
-def test_bare_timeout_without_commit_guard_remains_nonretryable(depth):
-    # asyncpg emits the same bare timeout from connect and COMMIT; no phase
-    # metadata proves that a timed-out write was not committed.
-    assert not is_transient_db_error(wrap(TimeoutError(), depth))
+def test_bare_timeout_is_transient_with_commit_guard(depth):
+    assert is_transient_db_error(wrap(TimeoutError(), depth))
 
 
 @pytest.mark.parametrize(

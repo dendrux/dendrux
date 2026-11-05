@@ -632,7 +632,7 @@ class SQLStateStore(SQLBlobCatalog):
             try:
                 commit_issued = True
                 await session.commit()
-            except SQLAlchemyError as error:
+            except Exception as error:
                 await _CommitReadback(self, session, operation).resolve(error)
             session.info.pop(COMMIT_PROOFS_SESSION_KEY, None)
             session.info.pop(FRESH_EVIDENCE_SESSION_KEY, None)
