@@ -7,15 +7,22 @@ description: The read-only facade over Dendrux's six tables. Constructors, every
 
 `RunStore` is the public, read-only way to query everything Dendrux persisted about a run. It is a plain Python object you can call from any code (routes, admin scripts, background jobs) it supports routes and inspection tools owned by your app.
 
-[//]: # "docs-test: skip - fragment: relies on `run_id`, defined by setup shown elsewhere"
+[//]: # "docs-test: skip - fragment: needs an existing database and a real run id"
 
 ```python
+import asyncio
+
 from dendrux.store import RunStore
 
-store = RunStore.from_database_url("sqlite+aiosqlite:///app.db")
-async with store:
-    run = await store.get_run(run_id)
-    events = await store.get_events(run_id, limit=100)   # one page; see Bounded list reads
+
+async def main(run_id: str) -> None:
+    async with RunStore.from_database_url("sqlite+aiosqlite:///app.db") as store:
+        run = await store.get_run(run_id)
+        events = await store.get_events(run_id, limit=100)   # one page; see Bounded list reads
+        print(run, len(events))
+
+
+asyncio.run(main("01J..."))   # the id of a run in app.db
 ```
 
 ## Constructors and lifecycle
@@ -26,15 +33,15 @@ async with store:
 RunStore(state_store: StateStore, *, blob_store: BlobStore | None = None)   # listens when the store has live updates
 @classmethod
 def from_database_url(database_url: str, *, blob_store: BlobStore | None = None,
-                      database_options: dict[str, Any] | None = None) -> RunStore   # RunStore owns the engine; polls
+                      database_options: dict[str, Any] | None = None) -> RunStore   # RunStore owns the engine; never listens
 @classmethod
-def from_engine(engine: AsyncEngine, *, blob_store: BlobStore | None = None) -> RunStore   # caller owns the engine; polls
+def from_engine(engine: AsyncEngine, *, blob_store: BlobStore | None = None) -> RunStore   # caller owns the engine; never listens
 async def close() -> None
 ```
 
-`RunStore(store)` wraps a store you built, such as `RunStore(PostgresStateStore(engine, live_updates=True))`. It takes any `StateStore`, including your own. The two class methods build a store for you and never enable live updates.
+`RunStore(store)` wraps a store you built, such as `RunStore(PostgresStateStore(engine, live_updates=True))`. It takes any `StateStore`, including your own. The two class methods build a store for you and never enable live updates, so a follower made by `RunStore.from_engine(engine)` polls even when your writers announce on a bus. If you meant to listen, replace it with `RunStore(store_for_engine(engine, live_updates=...))` or, better, the same store object your `Agent` uses.
 
-Every form takes `blob_store=` (a `BlobStore`) when the deployment keeps image bytes outside the database; use the same store as the `Agent`. `from_database_url` also takes `database_options=` (extra `create_async_engine` options; non-SQLite engines default to `pool_pre_ping=True` and `pool_recycle=1800`). It refuses `live_updates` and `notify_channel` in them with a `ValueError`, even with the value `None` or `False`: build the store yourself and pass it to `RunStore(store)`. Two members relate to images:
+Every form takes `blob_store=` (a `BlobStore`) when the deployment keeps image bytes outside the database; use the same store as the `Agent`. `from_database_url` also takes `database_options=` (extra `create_async_engine` options; non-SQLite engines default to `pool_pre_ping=True` and `pool_recycle=1800`). It refuses a `live_updates` key in them with a `ValueError`, even with the value `None` or `False`: build the store yourself and pass it to `RunStore(store)`. Two members relate to images:
 
 [//]: # "docs-test: skip - API signature listing, not runnable code"
 
@@ -47,7 +54,7 @@ async def read_image(run_id: str, sha256: str, *, tenant_id=...) -> bytes
 
 `from_database_url` creates and owns an engine; `close()` (or exiting the `async with`) disposes it. `from_engine` and `RunStore(store)` leave engine ownership with you. Closing any of them also stops its live feed. `RunStore` is an async context manager.
 
-**Live updates.** Only `RunStore(store)` listens, and only when `store.live_updates` is set (see [Scaling](/docs/guides/scaling#live-updates)). It takes a listener lease the first time you call `follow()` or `stream_events()`; `close()` releases that lease and never closes the store or its sender, so close the store yourself afterwards with `await store.close()`. Several `RunStore` objects over one store each hold their own lease. `from_engine` and `from_database_url` keep polling. A reader whose live updates are unavailable polls instead of failing. If it cannot take its lease, it asks again after 30 seconds; connection failures after that are retried by the transport itself with backoff. There is no `notifier=` or `listen_url=` argument: the listen URL is `PostgresUpdates(listen_url=...)`.
+**Live updates.** Only `RunStore(store)` listens, and only when `store.live_updates` is set (see [Scaling](/docs/guides/scaling#live-updates)). It takes a listener lease the first time you call `follow()` or `stream_events()`; `close()` releases that lease and never closes the store or its sender, so close the store yourself afterwards with `await store.close()`. Several `RunStore` objects over one store each hold their own lease. `from_engine` and `from_database_url` never listen, and nothing warns you: their followers poll. To listen, build the store yourself and wrap it with `RunStore(store)`. A reader whose live updates are unavailable polls instead of failing. If it cannot take its lease, it asks again after 30 seconds; connection failures after that are retried by the transport itself with backoff. The listen URL belongs to the transport: `PostgresUpdates(listen_url=...)`. One `RunStore` shares one lease between all its readers and gives it back after 60 seconds with nothing to watch; see [What a reader does](/docs/guides/scaling#what-a-reader-does). Use one long-lived `RunStore` where you can.
 
 **Shutdown order.** Close the reader before you dispose its engine, in `async with` or a `finally`. One coordinator task per `RunStore` serves every follower, and closing the last follower does not stop it: it ends on its own after about 60 seconds with nothing to watch, or at `close()`. If you dispose the engine first, the coordinator's next read can fail with a pool error (for example a `KeyError`) and log `follow_read_failed`. For a borrowed engine (`RunStore(store)`, `from_engine`), `await reader.close()` and only then `await engine.dispose()`. `async with RunStore.from_engine(engine) as reader:` closes the reader on exit; dispose the engine after the block. A reader from `from_database_url` owns its engine, and `close()` disposes it.
 
@@ -138,7 +145,7 @@ async def get_notes(run_id: str, *, undelivered_only: bool = False) -> list[RunN
 | `count_runs` | `int` | Same filters as `list_runs`, for pagination totals. |
 | `get_run` | `RunDetail` or `None` | One run's full anchor row. |
 | `get_events` | `StoredEvent` list | `after_sequence_index` is a strict `>` cursor (reconnect-safe). Pass `limit=` (1 to 1,000). See [Bounded list reads](#bounded-list-reads) and [Event ordering](/docs/architecture/event-ordering). |
-| `stream_events` | async iterator | Raw events, never ends on its own. Polls every `poll_interval_s` per caller; with live updates a hint for the run wakes it early. Without `tenant_id` it reads any tenant's run and prints a `DeprecationWarning`; prefer `follow`. |
+| `stream_events` | async iterator | Raw events, never ends on its own. Polls every `poll_interval_s` per caller; with live updates a hint for the run wakes it early. Each caller waits at least `poll_interval_s / 10` between idle polling reads, including reads woken by hints or gaps. Full pages are drained immediately without that wait. Each caller takes one slot in the hint hub (at most 10,000 per `LiveUpdates`; beyond that `FollowCapacityError`). Without `tenant_id` it reads any tenant's run and prints a `DeprecationWarning`; prefer `follow`. |
 | `get_pending` | `PendingPause` or `None` | What a paused run is waiting on. See [Pending and live reads](#pending-and-live-reads). |
 | `follow` | `Follow` (async iterator) | A hardened live feed. See [Pending and live reads](#pending-and-live-reads). |
 | `get_llm_calls` | `LLMCall` list | Per-LLM-call usage, cache, raw payloads. Pass `limit=`; page with `offset=`. |
@@ -173,7 +180,7 @@ def follow(run_id: str, *, tenant_id: TenantScope, after_sequence_index: int | N
 
 `get_pending` reports the run you ask about: for a run that delegated, list the tree with `get_subtree` and call `get_pending` for each waiting node.
 
-**`follow`** yields `StoredEvent` items, `FollowHeartbeat` when quiet, and a final `FollowEnd(reason, cursor)` where `reason` is `terminal`, `max_duration`, `lagging` or `error`. Use `async for` (after `await follow.start()` if you want to check the scope and capacity before sending response headers) and `await follow.aclose()` when done. `follow.drained_terminal` is `True` when the run is already finished and has nothing left to send; a route can answer 204 without iterating. One coordinator task per `RunStore` serves every follower in your process and reads the watched runs in batches, so database load grows with watched runs, not with open connections, and one follower costs a small constant number of statements however many pauses the run has. With healthy live updates a hint makes a run due at once and a safety poll runs every 10 seconds; without them an idle run is read every 0.5 seconds, backing off to 2 seconds (see [Scaling](/docs/guides/scaling#what-a-reader-does)). Events pass through the [redacted view](#redacted-views) unless `include_payloads=True`.
+**`follow`** yields `StoredEvent` items, `FollowHeartbeat` when quiet, and a final `FollowEnd(reason, cursor)` where `reason` is `terminal`, `max_duration`, `lagging` or `error`. Use `async for` (after `await follow.start()` if you want to check the scope and capacity before sending response headers) and `await follow.aclose()` when done. `follow.drained_terminal` is `True` when the run is already finished and has nothing left to send; a route can answer 204 without iterating (see [How a follow ends](#how-a-follow-ends)). One coordinator task per `RunStore` serves every follower in your process and reads the watched runs in batches, so database load grows with watched runs, not with open connections, and one follower costs a small constant number of statements however many pauses the run has. With healthy live updates a hint makes a run due at once and a safety poll runs every 10 seconds; without them an idle run is read every 0.5 seconds, backing off to 2 seconds (see [Scaling](/docs/guides/scaling#what-a-reader-does)). Events pass through the [redacted view](#redacted-views) unless `include_payloads=True`.
 
 Follower limits (`FollowCapacityError`, answer 503 with a short `Retry-After`):
 
@@ -198,6 +205,39 @@ feed = EventFeed(store, max_followers=2000, max_followers_per_tenant=None)
 **`redact_event(event, *, include_payloads=False, active_pause=False)`** is a conservative standalone filter with no database context. It cannot prove which names are declared tools, so it shows `<unknown_tool>` for them, and unverified active approval or input arguments are hidden (`params=None`, `args_hidden=True`); never replace them with empty args. All feed and pending types, `EventFeed`, `redact_event` and `RunStore` are importable from `dendrux.store`.
 
 The feed bounds iteration; your HTTP transport must bound blocked sends and call `aclose()` in `finally`, including if no generator iteration begins.
+
+**`EventFeed` arguments.** Pass these to `EventFeed(store, ...)`. `RunStore.follow` uses the defaults.
+
+| Argument | Default | Meaning |
+| --- | --- | --- |
+| `max_followers` | 500 | Followers in this feed |
+| `max_followers_per_tenant` | 100 | Followers per tenant scope; `None` turns the cap off |
+| `poll_interval_s`, `poll_max_s` | 0.5, 2.0 | With no healthy live updates, an idle run is read every `poll_interval_s`, doubling up to `poll_max_s`. A new event resets it. Both apply from the first read |
+| `poll_healthy_s` | 10.0 | The safety poll while live updates are healthy, with 20 % jitter either way. This is the only place to set it: `RunStore.follow` has no such argument |
+| `status_every` | 4 | With no healthy live updates, a status read rides with every Nth events read |
+| `batch` | 100 | Most events per run in one read, at most 1,000 |
+| `heartbeat_s` | 15.0 | Quiet time before a `FollowHeartbeat` |
+| `buffer` | 1,000 | Events held for one follower before it ends as `lagging` |
+| `stop_timeout_s` | 5.0 | How long `RunStore.close()` waits for the coordinator |
+
+A run followed through several feeds uses the tightest of their settings.
+
+### How a follow ends
+
+`FollowEnd(reason, cursor)` is the last item. Reconnect with `after_sequence_index=cursor` unless the reason is `terminal`.
+
+| Reason | Meaning |
+| --- | --- |
+| `terminal` | The run finished and every event was sent. |
+| `max_duration` | `max_duration_s` passed. The events still in the buffer are discarded, so reconnect from the last cursor you delivered. |
+| `lagging` | This follower fell more than `buffer` events behind. |
+| `error` | The reader could not continue. |
+
+**The final event is never lost.** The built-in SQL stores save the terminal status and the terminal event in one transaction, for success, a returned error, the iteration limit, a failure and cancellation, in both storage formats. A follow that sees the terminal status drains the event log, waits 100 ms, and drains once more before it sends `FollowEnd("terminal")`. With an atomic terminal write the last look finds nothing new. A custom store without one gets only that bounded 100 ms grace, which cannot catch an event written arbitrarily late. Custom stores should write status and event together: see [Terminal writes in a custom store](/docs/reference/state-store#terminal-writes-in-a-custom-store).
+
+**Starting on a finished run.** `follow()` first looks for events after your cursor. If there are any, it starts at once, without the 100 ms wait. If there are none, it waits 100 ms and looks once more before it reports `drained_terminal=True`. This keeps the protection against trailing events without delaying a start that already has data to send.
+
+**A lagging follower keeps its slot until you read it.** A follower that ends as `lagging` still holds its tenant and store slot while events remain in its buffer, including the last one in flight. Read the rest of the buffer, or close the follow, to give the slot back. At `max_duration_s` the coordinator drops the buffer and frees the slot and the watch even if you never read again.
 
 ### Redacted views
 
@@ -341,7 +381,7 @@ print(tree.usage.input_tokens, tree.usage.output_tokens, tree.usage.cost_usd)
 - **Tenancy.** Omit `tenant_id` (or pass `UNSCOPED`) for a trusted, unscoped read of all descendants. Pass a string to scope to that tenant, or an explicit `None` to scope to untenanted runs. The root must be in scope (otherwise it reads as missing) and so must every descendant; a run outside the scope is excluded together with everything below it.
 - Raises `RunNotFoundError` if the root does not exist or is out of scope.
 
-**Bounding the tree: `max_nodes`.** Pass a positive integer (not `bool`, at most `2**63 - 1`; anything else raises `ValueError` and logs `read_argument_invalid` before any store call). The root does not count. The read **refuses when the descendants reach `max_nodes`**: with `max_nodes=10_000`, 9,999 descendants pass and 10,000 refuse. Refusal raises `dendrux.errors.SubtreeTooLargeError` (a `ValueError`) carrying `run_id` and `max_nodes`, and logs the code `subtree_limit` with `run_id` and `limit`. Catch it to report the refusal, or retry with a larger bound you chose. The root and every returned descendant stay tenant scoped; foreign-tenant branches are excluded as before.
+**Bounding the tree: `max_nodes`.** Pass a positive integer (not `bool`, at most `2**63 - 1`; anything else raises `ValueError` and logs `read_argument_invalid` before any store call). The bound counts descendants only; the run you pass in is not counted, although `tree.nodes` lists it first. The read **refuses when the descendants reach `max_nodes`**: with `max_nodes=10_000`, 9,999 descendants pass (so `tree.nodes` holds up to 10,000 entries, the root included) and 10,000 descendants refuse. Refusal raises `dendrux.errors.SubtreeTooLargeError` (a `ValueError`) carrying `run_id` and `max_nodes`, and logs the code `subtree_limit` with `run_id` and `limit`. Catch it to report the refusal, or retry with a larger bound you chose. The root and every returned descendant stay tenant scoped; foreign-tenant branches are excluded as before.
 
 [//]: # "docs-test: skip - fragment: relies on `store`, `run_id` and `tenant`, defined by setup shown elsewhere"
 

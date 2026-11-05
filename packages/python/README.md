@@ -2,7 +2,7 @@
 
 > Python SDK for Dendrux — the framework for building agents with tools, persistence, and observability.
 
-**Version:** 0.5.0
+**Version:** 0.6.0
 
 ## Install
 
@@ -151,7 +151,7 @@ result.to_dict()       # versioned, allowlisted browser envelope (never meta, tr
 
 ## Upgrading
 
-See [Upgrading to 0.5.0](https://www.dendrux.dev/docs/upgrading-to-0.5.0) for every change from 0.4.1 with an action for each, the migration steps, and a map from the removed read router to `RunStore`.
+See [Upgrading to 0.6.0](https://www.dendrux.dev/docs/upgrading-to-0.6.0) for the migration order, storage-format activation and every changed default. See [Upgrading to 0.5.0](https://www.dendrux.dev/docs/upgrading-to-0.5.0) for every change from 0.4.1 with an action for each, and a map from the removed read router to `RunStore`.
 
 ## Full Documentation
 

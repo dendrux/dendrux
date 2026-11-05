@@ -58,7 +58,7 @@ async def main() -> int:
         pool_pre_ping=True,
     )
     state = MySQLStateStore(engine)
-    reads = RunStore.from_engine(engine)
+    reads = RunStore(state)  # RunStore.from_engine(engine) would never listen
     provider = MockLLM(
         [
             LLMResponse(tool_calls=[ToolCall("read_selection", {})]),
@@ -98,6 +98,7 @@ async def main() -> int:
         return 0
     finally:
         await reads.close()
+        await state.close()
         await engine.dispose()
     return 0
 

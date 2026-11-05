@@ -191,7 +191,7 @@ agent = Agent(provider=..., prompt=..., state_store=store)
 reads = RunStore(store)  # read primitives: get_pending, follow, get_event_view, and the rest
 ```
 
-`Agent(state_store=...)` and `RunStore(store)` accept any store. `store_for_engine(engine)`, `RunStore.from_engine(engine)` and `Agent(database_url=...)` pick one of the three built-in classes from the engine's dialect and know nothing about yours, so use the two lines above and keep the store object around. The application owns the engine and disposes it.
+`Agent(state_store=...)` and `RunStore(store)` accept any store. `store_for_engine(engine)`, `RunStore.from_engine(engine)` and `Agent(database_url=...)` pick one of the three built-in classes from the engine's dialect and know nothing about yours, so use the two lines above and keep the store object around. `RunStore.from_engine` also never listens for live updates; wrap your own store with `RunStore(store)`. The application owns the engine and disposes it.
 
 ## Create the schema
 
@@ -202,9 +202,13 @@ Create the tables once, at deploy time, from the models. A fresh schema made thi
 ```python
 from dendrux.db.models import Base
 
-async with engine.begin() as conn:
-    await conn.run_sync(Base.metadata.create_all)
+
+async def create_schema(engine) -> None:
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
 ```
+
+Call it once with `asyncio.run(create_schema(engine))`, or `await` it inside your setup code.
 
 `dendrux db migrate`, `check`, `status` and `activate` run Alembic migrations that Dendrux writes and tests for PostgreSQL, SQLite and MySQL/MariaDB only. For your own dialect you own the schema: create it with the snippet above, and when a later Dendrux release changes the models, apply the matching change to your database yourself. The kit builds its test schema the same way (see [Provide the fixtures](#provide-the-fixtures)); migrations are not part of certification.
 
