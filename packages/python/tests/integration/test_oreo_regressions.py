@@ -464,8 +464,9 @@ async def test_cancelled_cached_lookup_never_finalizes_existing_run(store, monke
         await asyncio.Event().wait()
 
     monkeypatch.setattr(runner, "_build_cached_result", blocked)
-    finalize = AsyncMock(wraps=store.finalize_run)
+    finalize = AsyncMock(wraps=store.finalize_with_event)
     monkeypatch.setattr(store, "finalize_run", finalize)
+    monkeypatch.setattr(store, "finalize_with_event", finalize)
     stream = agent.stream("hello", idempotency_key="request")
 
     async def consume():

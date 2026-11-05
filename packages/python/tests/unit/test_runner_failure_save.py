@@ -232,8 +232,9 @@ async def test_claim_failure_releases_before_failure_persistence(store, monkeypa
     monkeypatch.setattr(runner, "report_governance_change", AsyncMock(side_effect=original))
     release = AsyncMock(wraps=runner._release_claim)
     monkeypatch.setattr(runner, "_release_claim", release)
-    finalize = AsyncMock(wraps=store.finalize_run)
+    finalize = AsyncMock(wraps=store.finalize_with_event)
     monkeypatch.setattr(store, "finalize_run", finalize)
+    monkeypatch.setattr(store, "finalize_with_event", finalize)
     if entry == "resume_stream":
         async with invoke(notifier) as stream:
             events = [event async for event in stream]

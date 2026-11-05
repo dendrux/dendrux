@@ -80,6 +80,14 @@ async def test_stalled_idle_stop_does_not_block_join_or_polling(monkeypatch):
     live = SlowStopLive()
     reader, state = make_reader(live)
     feed = EventFeed(reader, poll_interval_s=0.01, poll_max_s=0.02)
+    releasing = asyncio.Event()
+    original_release = live.release_listener
+
+    async def release(lease):
+        releasing.set()
+        await original_release(lease)
+
+    monkeypatch.setattr(live, "release_listener", release)
     first = feed.follow("r", tenant_id=None)
     second = feed.follow("r", tenant_id=None)
     try:
@@ -87,7 +95,7 @@ async def test_stalled_idle_stop_does_not_block_join_or_polling(monkeypatch):
         await ticks(40)
         live.stopping.clear()
         await first.aclose()
-        await asyncio.sleep(0.05)
+        await asyncio.wait_for(releasing.wait(), 5)
         assert reader._retiring_lease is not None
         await asyncio.wait_for(second.start(), 0.2)
         await ticks(40)  # Let the join read finish before the event arrives.
@@ -266,7 +274,7 @@ async def test_missed_hint_diagnostic_is_one_per_generation(caplog):
         await reader.close()
 
 
-async def test_raw_stream_demand_does_not_spin_idle_coordinator(monkeypatch):
+async def test_raw_stream_demand_does_not_spin_idle_coordinator(monkeypatch, clock):
     monkeypatch.setattr(_follow, "IDLE_EXIT_S", 0.01)
     reader, state = make_reader()
     state.write("r")
@@ -285,8 +293,10 @@ async def test_raw_stream_demand_does_not_spin_idle_coordinator(monkeypatch):
     monkeypatch.setattr(coordinator, "_sleep", counted)
     try:
         await follow.aclose()
-        await asyncio.sleep(0.07)
-        assert len(sleeps) < 12
+        await ticks()
+        clock.advance(0.07)
+        await ticks()
+        assert sleeps == pytest.approx([_follow.IDLE_EXIT_S] * 2)
         assert reader._lease is not None
     finally:
         await stream.aclose()

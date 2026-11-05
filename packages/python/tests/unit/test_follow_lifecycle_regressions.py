@@ -7,6 +7,7 @@ import pytest
 
 from dendrux.store import EventFeed, FollowEnd, RunStore, _follow
 from tests.unit.test_follow_coordinator import BatchedState, FakeLive, ticks
+from tests.unit.test_follow_coordinator import clock as clock
 
 
 def reader_with_run(live=False):
@@ -172,7 +173,7 @@ async def test_second_loop_follow_polls_during_foreign_lease_acquisition():
         await live.close()
 
 
-async def test_idle_follow_keeps_live_lease_for_raw_stream(monkeypatch):
+async def test_idle_follow_keeps_live_lease_for_raw_stream(monkeypatch, clock):
     monkeypatch.setattr(_follow, "IDLE_EXIT_S", 0.01)
     reader, state = reader_with_run(True)
     state.write("r")
@@ -182,11 +183,15 @@ async def test_idle_follow_keeps_live_lease_for_raw_stream(monkeypatch):
     try:
         await follow.start()
         await follow.aclose()
-        await asyncio.sleep(0.04)
+        await ticks()
+        clock.advance(0.04)
+        await ticks()
         assert reader._lease is not None
         await stream.aclose()
         assert reader._lease is not None
-        await asyncio.sleep(0.04)
+        await ticks()
+        clock.advance(0.04)
+        await ticks()
         assert reader._lease is None
     finally:
         await reader.close()

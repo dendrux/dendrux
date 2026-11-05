@@ -107,6 +107,7 @@ async def test_unknown_claim_outcome_never_releases_or_finalizes(
     release, finalize = AsyncMock(), AsyncMock()
     monkeypatch.setattr(store, "release_run_claim", release)
     monkeypatch.setattr(store, "finalize_run", finalize)
+    monkeypatch.setattr(store, "finalize_with_event", finalize)
     try:
         if path == "resume_stream":
             await case.invoke()

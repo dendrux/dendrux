@@ -71,7 +71,9 @@ async def test_cancel_preserves_exception_despite_store_failure(store, path, fai
     assert str(secondary) not in caplog.text
 
 
-@pytest.mark.parametrize("failure", [None, "finalize_run", "save_run_event", "release_run_claim"])
+@pytest.mark.parametrize(
+    "failure", [None, "finalize_run", "finalize_with_event", "save_run_event", "release_run_claim"]
+)
 async def test_claimed_resume_prelude_preserves_error_and_releases(store, failure, caplog):
     # This fault injection / pause blob exercises the format-1 write path.
     from tests._fixtures.storage import pin_storage_format
@@ -111,7 +113,7 @@ async def test_claimed_resume_prelude_preserves_error_and_releases(store, failur
     assert (await store.get_run(run_id)).status == (
         "running" if failure == "release_run_claim" else "waiting_client_tool"
     )
-    if failure in {"finalize_run", "save_run_event"}:
+    if failure in {"finalize_run", "finalize_with_event", "save_run_event"}:
         forbidden_write.assert_not_awaited()
     if failure == "release_run_claim":
         assert any(getattr(r, "code", None) == "persistence_error" for r in caplog.records)

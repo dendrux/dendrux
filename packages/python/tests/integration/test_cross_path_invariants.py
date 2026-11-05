@@ -1077,6 +1077,7 @@ async def test_retry_failure_before_creation_finalizes_nothing(store, monkeypatc
     )
     finalize = AsyncMock()
     monkeypatch.setattr(store, "finalize_run", finalize)
+    monkeypatch.setattr(store, "finalize_with_event", finalize)
     monkeypatch.setattr(runner, "_create_runtime_run", AsyncMock(side_effect=failure))
     with pytest.raises(type(failure)) as caught:
         await a.retry(original.run_id)
