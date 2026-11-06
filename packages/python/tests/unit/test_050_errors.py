@@ -22,6 +22,7 @@ from dendrux.errors import (
     ProviderAuthError,
     ProviderError,
     ProviderRateLimitError,
+    ProviderResponseError,
     ProviderStreamIncompleteError,
     ProviderTimeoutError,
     ProviderUnavailableError,
@@ -114,6 +115,7 @@ class TestProviderErrorBase:
 _SUBCLASSES: list[tuple[type[ProviderError], str, bool, tuple[type[BaseException], ...]]] = [
     (ProviderAuthError, "auth", False, ()),
     (ProviderRateLimitError, "rate_limit", True, ()),
+    (ProviderResponseError, "rejected", False, ()),
     (ProviderTimeoutError, "timeout", False, (TimeoutError, OSError)),
     (ProviderUnavailableError, "unavailable", True, (ConnectionError, OSError)),
     (ProviderStreamIncompleteError, "stream_incomplete", False, ()),
@@ -398,3 +400,53 @@ class TestFixRoundErrors:
         assert (clone.run_id, clone.idempotency_key, str(clone)) == (None, "k1", str(exc))  # type: ignore[attr-defined]
         with_id = _roundtrip(IdempotencyConflictError(run_id="r1", idempotency_key="k1"))
         assert "for run r1" in str(with_id)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected"),
+    [
+        ({}, "Response refused by the local response contract."),
+        ({"message": "Explicit response explanation."}, "Explicit response explanation."),
+        ({"message": ""}, ""),
+        ({"message": "x" * 600}, "x" * 500),
+    ],
+)
+def test_response_message_defaults_and_explicit_values_survive_copy(
+    kwargs: dict[str, str], expected: str
+) -> None:
+    error = ProviderResponseError(provider="openai", provider_code="response_size_limit", **kwargs)
+    for clone in (error, _roundtrip(error), copy.copy(error), copy.deepcopy(error)):
+        assert isinstance(clone, ProviderResponseError)
+        assert clone.message == expected
+        assert clone.category == "rejected"
+        assert clone.retryable is False
+        assert clone.provider_code == "response_size_limit"
+        assert str(clone) == "Provider 'openai' error: " + expected
+        assert vars(clone) == vars(error)
+
+
+def test_response_constructor_forwards_explicit_fields() -> None:
+    error = ProviderResponseError(
+        provider="openai",
+        model="test-model",
+        status_code=400,
+        provider_code="response_encoding_unsupported",
+        error_type="response_contract",
+        message="Explicit response explanation.",
+        category="unknown",
+        retryable=True,
+        timeout_reason="call_deadline",
+    )
+    assert error.provider == "openai"
+    assert error.model == "test-model"
+    assert error.status_code == 400
+    assert error.provider_code_raw == "response_encoding_unsupported"
+    assert error.error_type == "response_contract"
+    assert error.message == "Explicit response explanation."
+    assert error.category == "unknown"
+    assert error.retryable is True
+    assert error.timeout_reason == "call_deadline"
+    for clone in (_roundtrip(error), copy.copy(error), copy.deepcopy(error)):
+        assert type(clone) is ProviderResponseError
+        assert vars(clone) == vars(error)
+        assert clone.args == error.args
