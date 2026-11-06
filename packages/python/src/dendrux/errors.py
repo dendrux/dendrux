@@ -867,6 +867,7 @@ class ProviderError(_KwargsReduceMixin, RuntimeError):
     )
     default_category: ClassVar[ProviderErrorCategory] = "unknown"
     default_retryable: ClassVar[bool] = False
+    default_message: ClassVar[str] = ""
 
     def __init__(
         self,
@@ -887,7 +888,7 @@ class ProviderError(_KwargsReduceMixin, RuntimeError):
             status_code=status_code,
             provider_code=provider_code,
             error_type=error_type,
-            message=message[:_ERROR_TEXT_CHARS],
+            message=(message or self.default_message)[:_ERROR_TEXT_CHARS],
             category=category,
             retryable=retryable,
             timeout_reason=timeout_reason,
@@ -1014,6 +1015,7 @@ class ProviderResponseError(ProviderError):
     """A provider response cannot be accepted within the local response contract."""
 
     default_category = "rejected"
+    default_message = "Response exceeds the local response contract."
 
 
 class ProviderStreamIncompleteError(ProviderError):
