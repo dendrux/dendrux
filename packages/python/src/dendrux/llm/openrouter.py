@@ -41,9 +41,12 @@ from dendrux.llm._helpers import normalize_effort
 from dendrux.llm._images import ANTHROPIC_MANY_IMAGE_RULE
 from dendrux.llm._openai_family import usage_extra_field
 from dendrux.llm._resilience import DEFAULT_MAX_RESPONSE_BYTES
+from dendrux.llm._transport import configure_request, deferred_client_type, guard_response
 from dendrux.llm.openai import OpenAIProvider
 
 _MODEL_LIST_TIMEOUT_S = 10.0
+# Allows a catalog of 10,000 models with several KiB of metadata per entry.
+_MODEL_CATALOG_MAX_BYTES = 32 * 1024 * 1024
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -255,8 +258,18 @@ _catalog_cache: dict[str, dict[str, OpenRouterModel] | None] = {}
 
 async def _fetch_catalog(models_url: str) -> dict[str, OpenRouterModel]:
     """Fetch {model_id -> OpenRouterModel} from OpenRouter. Raises on failure."""
-    async with httpx.AsyncClient(timeout=_MODEL_LIST_TIMEOUT_S) as client:
-        resp = await client.get(models_url)
+    client_type = deferred_client_type(httpx.AsyncClient)
+    async with client_type(
+        timeout=_MODEL_LIST_TIMEOUT_S, event_hooks={"response": [guard_response]}
+    ) as client:
+        request = client.build_request("GET", models_url)
+        configure_request(
+            request,
+            response_bytes=_MODEL_CATALOG_MAX_BYTES,
+            event_bytes=_MODEL_CATALOG_MAX_BYTES,
+            provider="openrouter",
+        )
+        resp = await client.send(request)
         resp.raise_for_status()
         payload = resp.json()
     catalog: dict[str, OpenRouterModel] = {}
