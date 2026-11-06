@@ -122,6 +122,9 @@ class _Budget:
         self.provider = provider
         self.used = 0
         self.tail = b""
+        self.wire_used = 0
+        # Allow ordinary compression overhead, including incompressible bodies.
+        self.wire_limit = limit + max(1024, limit // 100)
 
     def _charge(self, size: int) -> None:
         self.used += size
@@ -140,6 +143,7 @@ class _Budget:
             suffix = self.tail + line[-4:]
             if suffix.endswith((b"\r\r", b"\n\n", b"\r\n\r\n")):
                 self.used = 0
+                self.wire_used = 0
                 self.tail = b""
             else:
                 self.tail = suffix[-3:]
@@ -167,10 +171,15 @@ class _ResponseState:
                 provider=self.budget.provider, provider_code=self.code, retryable=False
             ) from None
 
-    def account(self, chunk: bytes) -> None:
+    def account(self, chunk: bytes | int) -> None:
         self.check()
         try:
-            self.budget.account(chunk)
+            if isinstance(chunk, int):
+                self.budget._charge(chunk)
+            else:
+                self.budget.account(chunk)
+            if self.budget.wire_used > self.budget.wire_limit:
+                self.budget._charge(self.budget.limit + 1)
         except ProviderResponseError as error:
             self.refuse(error)
         self.check()
@@ -182,14 +191,18 @@ class _Decoder:
         self.window = window
         self.prefix = b""
         self.first_attempt = True
+        self.finished = False
         self.decoder: Any = None
         if encoding == "gzip":
             self.decoder = zlib.decompressobj(zlib.MAX_WBITS | 16)
 
-    def decode(self, data: bytes) -> Iterator[bytes]:
+    def decode(self, data: bytes) -> Iterator[tuple[bytes, bool]]:
+        if self.finished:
+            yield data, True
+            return
         if self.encoding in ("", "identity"):
             for start in range(0, len(data), self.window):
-                yield data[start : start + self.window]
+                yield data[start : start + self.window], False
             return
         if self.decoder is None:
             data = self.prefix + data
@@ -202,11 +215,18 @@ class _Decoder:
             self.decoder = zlib.decompressobj(zlib.MAX_WBITS if wrapped else -zlib.MAX_WBITS)
         yield from self._inflate(data)
 
-    def _inflate(self, data: bytes) -> Iterator[bytes]:
+    def _inflate(self, data: bytes) -> Iterator[tuple[bytes, bool]]:
         while True:
             decoded = self._decompress(data)
             if decoded:
-                yield decoded
+                yield decoded, False
+            if self.decoder.eof:
+                trailing = self.decoder.unused_data
+                self.finished = True
+                self.decoder = None
+                if trailing:
+                    yield trailing, True
+                return
             data = self.decoder.unconsumed_tail
             if not data and len(decoded) < self.window:
                 return
@@ -241,10 +261,15 @@ class _BoundedStream(httpx.AsyncByteStream):
     def _pieces(self, chunk: bytes, *, raw: bool) -> Iterator[bytes]:
         for start in range(0, len(chunk), self.decoder.window):
             encoded = chunk[start : start + self.decoder.window]
-            for decoded in self.decoder.decode(encoded):
-                self.state.account(decoded)
-                if not raw:
+            if self.decoder.encoding not in ("", "identity"):
+                self.state.budget.wire_used += len(encoded)
+            for decoded, trailing in self.decoder.decode(encoded):
+                # Trailing wire bytes are charged, never parsed as SSE separators.
+                self.state.account(len(decoded) if trailing else decoded)
+                if not raw and not trailing:
                     yield decoded
+            # Empty stored blocks produce no decoded bytes to trigger a check.
+            self.state.account(0)
             if raw:
                 yield encoded
 
