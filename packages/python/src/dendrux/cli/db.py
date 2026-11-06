@@ -207,12 +207,20 @@ async def _activate_fresh_postgres(url: str) -> None:
 
 
 async def _postgres_activation_guidance(url: str) -> None:
-    _, storage_format, _, _ = await _read_activation_status(url)
-    if storage_format == "1":
+    if await _postgres_storage_format(url) == "1":
         console.print(
             "Run `dendrux db activate` once every worker and reader is upgraded.",
             markup=False,
         )
+
+
+async def _postgres_storage_format(url: str) -> str | None:
+    try:
+        _, storage_format, _, _ = await _read_activation_status(url)
+        return storage_format
+    except Exception:
+        console.print("Could not read database status. Run `dendrux db status`.", markup=False)
+        return None
 
 
 @app.command()

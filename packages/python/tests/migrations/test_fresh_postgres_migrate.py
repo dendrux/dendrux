@@ -235,3 +235,26 @@ async def test_cli_coordination_wait_is_bounded_and_releases_on_failure(fresh_pg
     result = await migrate()
     assert result.exit_code == 0, result.output
     await assert_active(fresh_pg)
+
+
+@pytest.mark.parametrize("existing", [False, True])
+async def test_status_read_failure_does_not_fail_migration(fresh_pg, monkeypatch, existing):
+    from dendrux.cli import db
+
+    if existing:
+        async with fresh_pg.begin() as conn:
+            await conn.run_sync(prior_schema)
+
+    async def fail_status(url):
+        raise RuntimeError(
+            "status-detail-sentinel postgresql+asyncpg://sentinel_user:sentinel_password@host/db"
+        )
+
+    monkeypatch.setattr(db, "_read_activation_status", fail_status)
+    result = await migrate()
+    values = await settings(fresh_pg)
+    assert values["storage_format"] == ("1" if existing else "2")
+    assert result.exit_code == 0, result.output
+    assert "Could not read database status. Run `dendrux db status`." in result.output
+    assert "Migrations complete" in result.output and "Migration failed" not in result.output
+    assert "sentinel" not in result.output
