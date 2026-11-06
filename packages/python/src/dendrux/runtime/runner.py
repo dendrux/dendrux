@@ -1174,10 +1174,14 @@ def _in_memory_pending(result: RunResult) -> Any:
 
 async def _recovery_info(store: StateStore, record: Any, *, best_effort: bool = True) -> Any:
     """Project recovery strictly for reads, or best effort after a durable outcome."""
-    from dendrux.types import RecoveryInfo
-
     if record is None or not getattr(record, "reclaim_attempts", 0):
         return None
+    return await _read_recovery_info(store, record, best_effort=best_effort)
+
+
+async def _read_recovery_info(store: StateStore, record: Any, *, best_effort: bool) -> Any:
+    from dendrux.types import RecoveryInfo
+
     try:
         ids, truncated = await store.get_replayed_tool_calls(
             record.id, limit=_CONTROL_EVENT_LIMIT, tenant_id=record.tenant_id
@@ -1193,18 +1197,22 @@ async def _recovery_info(store: StateStore, record: Any, *, best_effort: bool = 
 async def _attach_persisted_pending(store: StateStore, result: RunResult, record: Any) -> RunResult:
     result.recovery = await _recovery_info(store, record)
     if result.status in _PAUSE_STATUSES and record is not None:
-        from dendrux.runtime._pending import _PendingReader
-
-        result.pending = None
-        result.pause_id = None
-        try:
-            result.pending = await _PendingReader(store).get_pending(
-                result.run_id, tenant_id=getattr(record, "tenant_id", None)
-            )
-        except Exception:
-            _codes.log_code(logger, _codes.RESULT_READ_FAILED, run_id=result.run_id)
-        result.pause_id = result.pending.pause_id if result.pending else None
+        await _load_persisted_pending(store, result, record)
     return result
+
+
+async def _load_persisted_pending(store: StateStore, result: RunResult, record: Any) -> None:
+    from dendrux.runtime._pending import _PendingReader
+
+    result.pending = None
+    result.pause_id = None
+    try:
+        result.pending = await _PendingReader(store).get_pending(
+            result.run_id, tenant_id=getattr(record, "tenant_id", None)
+        )
+    except Exception:
+        _codes.log_code(logger, _codes.RESULT_READ_FAILED, run_id=result.run_id)
+    result.pause_id = result.pending.pause_id if result.pending else None
 
 
 async def _committed_pause_result(
