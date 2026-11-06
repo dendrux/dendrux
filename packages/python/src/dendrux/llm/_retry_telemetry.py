@@ -27,13 +27,13 @@ from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from typing import TYPE_CHECKING, Any, NamedTuple
 
-import httpx
-
 from dendrux._lifecycle import GovernanceEventType
 from dendrux.errors import safe_exception_info
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Iterable, Iterator
+
+    import httpx
 
     from dendrux.types import StreamEvent
 
@@ -267,28 +267,11 @@ def telemetry_stream(
     return TelemetryStream(stream, run_id=run_id, iteration=iteration, sinks=sinks)
 
 
-def make_telemetry_http_client(
-    timeout: httpx.Timeout,
-    retryable_statuses: Iterable[int],
-) -> httpx.AsyncClient:
-    """Build an ``httpx.AsyncClient`` with the dendrux retry hook attached.
-
-    Pass the returned client to the vendor SDK constructor via
-    ``http_client=`` so the hook fires on every request the SDK makes,
-    including its internal retries.
-    """
-    return httpx.AsyncClient(
-        timeout=timeout,
-        event_hooks=telemetry_event_hooks(retryable_statuses),
-    )
-
-
 __all__ = [
     "TelemetrySinks",
     "begin_call_attempt_tracking",
     "call_attempt_tracking",
     "end_call_attempt_tracking",
-    "make_telemetry_http_client",
     "telemetry_context",
     "telemetry_event_hooks",
     "telemetry_stream",

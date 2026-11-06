@@ -16,8 +16,8 @@ from dendrux.llm._resilience import RETRYABLE_HTTP_STATUSES
 from dendrux.llm._retry_telemetry import (
     TelemetrySinks,
     call_attempt_tracking,
-    make_telemetry_http_client,
     telemetry_context,
+    telemetry_event_hooks,
 )
 from dendrux.loops._helpers import governance_sinks
 from dendrux.loops.base import BaseNotifier, BaseRecorder
@@ -40,7 +40,10 @@ class _FailingNotifier(BaseNotifier):
 
 
 async def _one_retryable_response(recorder: Any, notifier: Any) -> None:
-    client = make_telemetry_http_client(httpx.Timeout(5.0), RETRYABLE_HTTP_STATUSES)
+    client = httpx.AsyncClient(
+        timeout=httpx.Timeout(5.0),
+        event_hooks=telemetry_event_hooks(RETRYABLE_HTTP_STATUSES),
+    )
     client._transport = httpx.MockTransport(lambda request: httpx.Response(503))  # type: ignore[attr-defined]
     try:
         with (
