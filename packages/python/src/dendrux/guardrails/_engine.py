@@ -499,6 +499,13 @@ class GuardrailEngine:
     ) -> tuple[Message, list[Finding], str | None]:
         """Project a format-2 boundary once; retain bounded digests, never history."""
         key = _message_digest(msg)
+        previous = self._previous_projection(msg, key)
+        if previous is not None:
+            return self._reuse_projection(msg, previous, index)
+        cleaned, findings, blocked = await self.scan_incoming_message(msg, index=index)
+        return self._remember_projection(msg, cleaned, findings, blocked, index)
+
+    def _previous_projection(self, msg: Message, key: bytes) -> _Projection | None:
         previous = getattr(msg, "_guardrail_projection", None)
         if (
             not isinstance(previous, _Projection)
@@ -506,18 +513,30 @@ class GuardrailEngine:
             or previous.digest != key
         ):
             previous = None if hasattr(msg, "_guardrail_projection") else self._projected.get(key)
-        if previous is not None:
-            blocked = previous.blocked
-            if blocked is not None:
-                blocked = blocked.replace(previous.location, _message_location(msg, index), 1)
-            if previous.findings or previous.redacted:
-                msg = _with_projection(
-                    msg,
-                    previous,
-                    copy=previous.redacted or not hasattr(msg, "_guardrail_projection"),
-                )
-            return msg, previous.findings, blocked
-        cleaned, findings, blocked = await self.scan_incoming_message(msg, index=index)
+        return previous
+
+    def _reuse_projection(
+        self, msg: Message, previous: _Projection, index: int | None
+    ) -> tuple[Message, list[Finding], str | None]:
+        blocked = previous.blocked
+        if blocked is not None:
+            blocked = blocked.replace(previous.location, _message_location(msg, index), 1)
+        if previous.findings or previous.redacted:
+            msg = _with_projection(
+                msg,
+                previous,
+                copy=previous.redacted or not hasattr(msg, "_guardrail_projection"),
+            )
+        return msg, previous.findings, blocked
+
+    def _remember_projection(
+        self,
+        msg: Message,
+        cleaned: Message,
+        findings: list[Finding],
+        blocked: str | None,
+        index: int | None,
+    ) -> tuple[Message, list[Finding], str | None]:
         evidence = _Projection(
             self._projection_owner,
             _message_digest(cleaned),
