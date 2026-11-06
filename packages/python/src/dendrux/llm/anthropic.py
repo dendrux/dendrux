@@ -74,6 +74,7 @@ from dendrux.llm._schema import (
     prepare_anthropic_strict,
 )
 from dendrux.llm._stop_reason import anthropic_stop_reason
+from dendrux.llm._transport import guard_sdk_client
 from dendrux.llm.base import LLMProvider
 from dendrux.types import (
     REPLAYED_META_KEY,
@@ -348,10 +349,12 @@ class AnthropicProvider(LLMProvider):
         def new_http() -> httpx.AsyncClient:
             return make_http_client(anthropic, deadlines, provider="anthropic")
 
-        self._client = anthropic.AsyncAnthropic(
-            api_key=api_key,
-            http_client=new_http(),
-            max_retries=max_retries,
+        self._client = guard_sdk_client(
+            anthropic.AsyncAnthropic(
+                api_key=api_key,
+                http_client=new_http(),
+                max_retries=max_retries,
+            )
         )
         self._clients: LoopClients[anthropic.AsyncAnthropic] = LoopClients(
             new_http, lambda client, http: client.copy(http_client=http)
