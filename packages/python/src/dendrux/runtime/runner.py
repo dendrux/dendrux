@@ -6257,6 +6257,10 @@ async def _try_resume_release(
     return await _released_resume_status(store, run_id)
 
 
+def _resume_release_supported(store: StateStore, status: str) -> bool:
+    return status == RunStatus.RUNNING.value or _release_supported(store)
+
+
 async def _handle_resume_failure(
     store: StateStore,
     run_id: str,
@@ -6266,9 +6270,7 @@ async def _handle_resume_failure(
     progress: _ResumeProgress,
     meta: dict[str, Any],
 ) -> None:
-    if progress._can_release(ctx, exc) and (
-        status == RunStatus.RUNNING.value or _release_supported(store)
-    ):
+    if progress._can_release(ctx, exc) and _resume_release_supported(store, status):
         await _try_resume_release(store, run_id, status, ctx, exc)
         return
     _attach_run_error_meta(exc, run_id, meta)
@@ -6675,9 +6677,20 @@ async def _stream_resume_failure(
         store is not None
         and progress is not None
         and progress._can_release(err_ctx, exc)
-        and (_shared["expected_status"] == RunStatus.RUNNING.value or _release_supported(store))
+        and _resume_release_supported(store, _shared["expected_status"])
     ):
         return await _try_resume_release(store, run_id, _shared["expected_status"], err_ctx, exc)
+    return await _finish_stream_resume_failure(_shared, store, err_ctx, extra_notifier, run_id, exc)
+
+
+async def _finish_stream_resume_failure(
+    _shared: dict[str, Any],
+    store: StateStore | None,
+    err_ctx: _ResumeContext | None,
+    extra_notifier: LoopNotifier | None,
+    run_id: str,
+    exc: Exception,
+) -> RunStatus:
     if store is not None and _stream_resume_started(_shared):
         await _persist_run_failure(store, run_id, exc, safe_event=True)
     try:
