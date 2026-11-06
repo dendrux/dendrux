@@ -1,20 +1,24 @@
 ---
 title: Upgrading to 0.6.0
-description: Migrate, roll every worker and reader, activate format 2, then enable recovery and event notifications. Includes every changed default and rollback rules.
+description: Migrate, roll every worker and reader, activate format 2, then enable recovery and live updates. Includes every changed default and rollback rules.
 ---
 
 # Upgrading to 0.6.0
 
-0.6.0 adds explicit recovery after a worker stops, durable execution checkpoints, optional Postgres event notifications and trace continuity across processes. Applications own their workers, maintenance jobs and read routes.
+0.6.0 adds explicit recovery after a worker stops, durable execution checkpoints, optional live updates for `follow` (Postgres or Redis hints), a batched follow reader and trace continuity across processes. Applications own their workers, maintenance jobs and read routes.
 
 > **Activation is one-way.** Take a database backup before activation. Once activation starts, rollback means restoring that backup. There is no deactivation or CLI downgrade command. Do not let a 0.5 worker or reader access an activated database.
+
+New PostgreSQL databases come up active at format 2 after `dendrux db migrate`. Here, new means there is no `alembic_version` table and none of Dendrux's tables before migration; unrelated application tables are allowed. Existing databases need the activate step below, even with zero runs or when already at the current revision.
+
+> **Provider SDKs.** Provider extras now require `anthropic>=0.77.0,<1.0` and `openai>=1.97.2,<3.0`. Older SDKs lack the required Responses API stream handling and Anthropic thinking/structured-output support. If you pin older SDKs, update those pins and reinstall the matching extras before upgrading to 0.6.0.
 
 ## Upgrade in order
 
 1. **Migrate.** Install `dendrux[postgres]==0.6.0` in the migration job environment. Back up the database, then run `dendrux db migrate` once over a direct Postgres connection, before starting 0.6 workers. From the 0.5 head `e8f9a0b1c2d3`, revision `f9a0b1c2d3e4` adds recovery columns and `dendrux_settings`. It leaves the global storage format at `1` and does not build the new unique indexes. Older workers can keep working during this additive step. If upgrading from an earlier release, complete the [0.5 upgrade](/docs/upgrading-to-0.5.0) first.
-2. **Roll every worker and reader to 0.6.** Include read-only services, scripts, scheduled jobs and dashboards built on `RunStore`. Keep recovery and notifications off during the roll. Apply the default changes below in your application. Check the schema with `dendrux db check` and inspect `dendrux db status`; migration alone does not activate format 2.
+2. **Roll every worker and reader to 0.6.** Include read-only services, scripts, scheduled jobs and dashboards built on `RunStore`. Keep recovery and live updates off during the roll. Apply the default changes below in your application. Check the schema with `dendrux db check` and inspect `dendrux db status`; migration alone does not activate format 2.
 3. **Back up again, then activate.** Confirm that no old worker or reader remains. Take the pre-activation backup, then run `dendrux db activate` once over a direct Postgres connection. The command checks the schema, removes identical duplicate rows, builds three unique indexes and sets the global format to `2`. It reads the whole `react_traces`, `tool_calls` and `run_events` tables, builds the indexes concurrently on Postgres and drops the old indexes; run it in a quiet period and check free disk for the builds first. It refuses conflicting duplicates rather than choosing between different contents. Progress is durable; fix the reported condition and rerun the command after a failure. `dendrux db status` should show `storage_format=2 activate_step=done`.
-4. **Enable recovery and notifications explicitly.** Call `sweep(on_stale="reclaim", ...)` from your own maintenance job and dispatch the returned items to `agent.reclaim(..., tenant_id=..., item=...)`. Use a `stale_running` threshold at least three times `Agent.lease_interval`. For Postgres notifications, set `database_options={"notify_channel": "dendrux_events"}` on every writer, and `listen_url=` or a started `notifier=` on readers. The listener must connect to the primary through a direct or session-pooled endpoint. See [Recovery](/docs/guides/recovery) and [Scaling workers](/docs/guides/scaling#event-notifications).
+4. **Enable recovery and live updates explicitly.** Call `sweep(on_stale="reclaim", ...)` from your own maintenance job and dispatch the returned items to `agent.reclaim(..., tenant_id=..., item=...)`. Use a `stale_running` threshold at least three times `Agent.lease_interval`. Live updates are optional and off by default; `follow` polls without them. To turn them on, build the store yourself with `live_updates=True` (Postgres) or `live_updates=RedisUpdates(...)` (any store; `pip install "dendrux[redis]"`) on every writer and reader, wrap the reader's store in `RunStore(store)`, and close the store with `await store.close()` at shutdown. They cannot be set through `Agent(database_url=...)`. See [Recovery](/docs/guides/recovery) and [Live updates](/docs/guides/scaling#live-updates).
 
 The CLI reads the database URL from `DENDRUX_DATABASE_URL`; keep using your deployment's credential injection for that variable.
 
@@ -33,13 +37,13 @@ An unstamped database with the complete expected schema can activate too. Use `d
 
 SQLite adds the new columns on first use, but an existing file stays at format 1 until explicit activation. **Stop every other process using the file before `dendrux db activate`.** The command takes an exclusive lock and refuses a live competing transaction. That lock cannot prove that no idle process will write later. Back up the file before activation and restart only 0.6 processes afterwards.
 
-A fresh database created by Dendrux's `create_all` path starts active at format 2. A migrated production database starts at format 1 until activation.
+A fresh database created by Dendrux's `create_all` path starts active at format 2. New PostgreSQL databases also start active after `dendrux db migrate`. Existing PostgreSQL databases and migrated SQLite files stay at format 1 until explicit activation.
 
 ## A run keeps its storage format
 
 `agent_runs.storage_format` is chosen when the run is created. Activation changes new runs only. A format-1 run stays format 1 across every pause and resume; there is no conversion job.
 
-Format-2 runs store conversation history in traces and execution state in a bounded checkpoint. Pause data uses `schema_version=2` and omits the growing history and step list. Readers must understand seed, turn, rewrite and state traces. `RunStore.get_traces` and `dendrux traces` expose the current conversation, including the latest replacement prefix after compaction, and omit state rows. They return the provider form, including PII placeholders; the reverse mapping remains a separate trusted read.
+Format-2 runs store conversation history in traces and execution state in a bounded checkpoint. Pause data uses `schema_version=2` and omits the growing history and step list. Readers must understand seed, turn, rewrite and state traces. `RunStore.get_traces` and `dendrux traces` expose the run's own user, assistant and tool rows in their original order, with dense positions and paging over those rows only. System prompts, seeded conversation prefixes, rewrites and state rows remain internal. Compaction does not remove earlier public audit rows. They return the provider form, including PII placeholders; the reverse mapping remains a separate trusted read.
 
 `reclaim()` refuses format-1 runs with `RunNotReclaimableError(reason="legacy_run")`. Under `sweep(on_stale="reclaim")`, stale legacy runs end as `error` with `failure_reason="stale_running_legacy"`. They appear in `SweepResult.stale_running`, not `reclaimable`.
 
@@ -76,6 +80,8 @@ Back up the existing file before upgrading.
 
 ## Other compatibility changes
 
+Until 1.0, minor releases can change behaviour directly. These changes have no warning cycle.
+
 | Setting or call | Earlier behavior | 0.6 behavior | Application action |
 | --- | --- | --- | --- |
 | Approving a pause recorded before 0.5, with no stored `pause_id` | 0.5 required an approval token even though the old pause had none | No token is required when the stored pause has no id, including for `submit_approval` | Continue such legacy pauses without inventing an id. Every pause written by 0.6, including a reclaim re-pause, has an id; send it back normally. |
@@ -83,10 +89,16 @@ Back up the existing file before upgrading.
 | `from dendrux.runtime.state import IdempotencyConflictError` | The error was importable from the state module | Removed from that module | Import it from the top-level package: `from dendrux import IdempotencyConflictError` |
 | Agent relying only on `DENDRUX_DATABASE_URL` for persistence | Resolved a store from the environment | Runs without persistence; a resulting pause cannot be submitted later; logs `database_url_env_ignored` once per process | Configure `state_store=` or `database_url=` explicitly before starting runs. Merely setting the variable raises no error; the CLI continues to use it. |
 | Resuming a 0.5 run with a cost-only `Budget` and explicit `count_cache_tokens=True` | The stored governance digest included that choice even without a token limit | The choice has no effect on cost-only accounting and no longer changes the digest; the old saved digest mismatches and default `on_governance_change="raise"` raises `GovernanceMismatchError` | Drain these runs before upgrading, or use `on_governance_change="warn"` while they drain. Setting `count_cache_tokens=False` on the new cost-only budget does not restore the old digest. |
+| `claim_paused_run` and `submit_and_claim` on built-in stores | Successful claims returned an integer epoch | Return `ClaimResult`; unsuccessful paused claims still return `False` | Read `result.claim_epoch` and the checkpoint fields. Do not use `int(result)` or compare success with `True`. |
+| `save_trace`, `save_tool_call`, `touch_progress` | Returned no value | Trace and tool writes return their row id as `str`; progress returns `bool` | Update custom-store signatures and return-value checks. Callers that ignore the return need no change. |
+| `heartbeat()` and `aheartbeat()` | Logged every store failure and never raised | `aheartbeat()` can raise a `RuntimeError` when the claim is stale. `heartbeat()` remembers a fence found in the background and raises it from the next heartbeat or step boundary; repeated lease-renewal failures instead raise `PersistenceError` with `code="lease_lost"` | Let the error end the tool; do not catch and continue or retry its side effects. The runner normally returns the current durable outcome after a fence; read it before deciding what to do next. See [Fencing and heartbeats](/docs/reference/errors#fencing-and-heartbeats). Other heartbeat write failures are still only logged. |
+| MCP `transport_detail` | Held redacted transport exception text | Contains the fixed diagnostic `mcp_transport_failed count=1`, or `None` | Stop parsing transport exception text. Handle typed errors and allow an absent detail. |
+| `mark_lease_expired(batch_size=...)` | Accepted batches up to 100,000 | Rejects batches above 1,000 with `ValueError` before issuing SQL | Split larger scans into pages of at most 1,000. |
+| `EventFeed(state_store)` | Could fail later when reader methods were used | Immediately raises an actionable `TypeError` | Construct `EventFeed(RunStore(state_store))` and close the reader before disposing its engine. |
 
 ## Store classes: `SQLAlchemyStateStore` is removed
 
-SQL persistence is now one base class and three concrete stores, all importable from `dendrux.store`. `notify_channel` is a `PostgresStateStore` option only; the other stores do not accept it. `SQLAlchemyStateStore` is removed in 0.6.0 with no alias: importing it raises `ImportError` and names the replacements. Applications that only use `Agent(database_url=)`, `RunStore` or the CLI need no change.
+SQL persistence is now one base class and three concrete stores, all importable from `dendrux.store`, and each takes an optional `live_updates=` argument. `SQLAlchemyStateStore` is removed in 0.6.0 with no alias: importing it raises `ImportError` and names the replacements. Applications that only use `Agent(database_url=)`, `RunStore` or the CLI need no change.
 
 | You wrote | Write instead |
 | --- | --- |
@@ -101,20 +113,77 @@ MySQL 8.4 and MariaDB 10.11 are new in 0.6.0 and need no migration from 0.5, sin
 
 ### Database retries
 
-Every store write that is safe to repeat is retried when the database fails in a way a fresh attempt may not hit. The rules are the same on PostgreSQL, SQLite, MySQL and MariaDB, except where a row says otherwise. If you ran 0.5 with a long `statement_timeout`, read the first rows: a failing write now takes longer to give up.
+Built-in SQL stores retry recognized database failures before `COMMIT` at their transaction boundaries. Each failed attempt rolls back before a retry. Raw driver retries apply only inside these guarded SQL scopes.
 
 | What happened | What Dendrux does |
 | --- | --- |
-| A deadlock or serialization failure | Retries the whole transaction |
-| A lock wait timeout | Retries the whole transaction |
-| The connection was lost before `COMMIT`, or the database was unavailable (a PostgreSQL connection error, a server shutting down, too many connections, or a driver `OperationalError`) | Retries the whole transaction on a fresh connection |
-| The connection was lost during `COMMIT`, so the outcome is unclear | For a write with a stable identity (a keyed or caller-id create, a trace, tool call, event or usage row), reads the rows back. If they prove the write did not land, retries; if they prove it landed, reports the result. A create without an idempotency key is proven by the run id you supplied plus the agent, tenant and input. On PostgreSQL the read-back waits for a concurrent writer for at most about five seconds, then answers `StoreOutcomeUnknown`. For a claim, a reclaim, `submit_and_claim` or a release, never guesses: it raises `StoreOutcomeUnknown` (see [Errors](/docs/reference/errors#when-a-commit-acknowledgement-is-lost)) |
-| A PostgreSQL `57P04` or `57P05` error wrapped as a generic DBAPI error (not an `OperationalError`) | **Not retried.** Only SQLSTATE class `08` and `57P01`–`57P03` count as a lost connection |
-| A PostgreSQL statement timeout or cancelled query (SQLSTATE `57014`), even when the driver wraps it as an operational error | **Not retried.** It fails at once with `PersistenceError`. 0.6 does not retry it, so a `statement_timeout` of 30 seconds fails after 30 seconds, not after four tries |
-| A statement too large for MySQL or MariaDB (`max_allowed_packet`) | **Not retried.** `StatementTooLargeError` after one attempt |
-| A MySQL integer outside 64 bits, a unique violation, a bad value or any other database error | **Not retried.** It fails at once with `PersistenceError` or the more specific error |
+| A deadlock, serialization failure or lock wait timeout | Retries the whole transaction |
+| A recognized connection or availability failure before `COMMIT`, including refused connections and PostgreSQL `53300` (too many connections) | Retries the whole transaction on a fresh connection. Refusal can be retried for multi-address hosts such as `localhost` too |
+| A bare driver timeout or DNS resolution error (`gaierror`) | Does not retry. A bare timeout cannot safely distinguish a connect timeout from a statement timeout. A numbered OS `ETIMEDOUT` is still classified by its errno |
+| A PostgreSQL statement timeout or cancelled query (`57014`), even wrapped as an operational error | Does not retry. Raises `PersistenceError` |
+| PostgreSQL `57P04` or `57P05` wrapped as a generic DBAPI error | Does not retry. SQLSTATE class `08` and `57P01`–`57P03` count as lost connections |
+| A MySQL or MariaDB packet limit, integer outside its supported range, unique violation or bad value | Does not retry. Raises `PersistenceError` or its more specific subclass |
 
-A retried transaction is attempted at most three more times after the first try, waiting 0.1, 0.2 and 0.4 seconds between tries. When the last try fails, `agent.run` raises `PersistenceError` with `retryable=True` and a stream ends with `run_error`; the run is saved as `error` if the database answers again in time, and otherwise keeps its last committed state. There is no retry loop around a whole run: your application decides whether to start it again, and `sweep` and `reclaim` recover a run left `running`. Each retry logs `Transient DB failure n/3` with the operation and run id, and no SQL or driver text.
+Eligibility requires a SQLAlchemy or typed persistence error, or native-driver provenance, plus transient classification. Provenance identifies a driver execution path. Application callbacks inside a driver and SQLAlchemy-wrapped serializer errors can qualify. SQLAlchemy pool timeouts retain their retry policy.
+
+A driver or OS failure during `COMMIT`, including a bare timeout, can leave the outcome unclear. A write with a stable identity reads back its rows. Proven success returns the result. Safe, proven absence permits a retry. Otherwise the store raises non-retryable `StoreOutcomeUnknown`. Claims, reclaims, `submit_and_claim` and releases never infer ownership from a later read. PostgreSQL readback waits for a concurrent writer for at most about five seconds. Do not replay an unknown outcome blindly. See [Errors](/docs/reference/errors#when-a-commit-acknowledgement-is-lost).
+
+At most three retries wait 0.1, 0.2 and 0.4 seconds. The 0.7 seconds covers backoff only; driver operations add their own duration. A short refused-connection window can be bridged. Longer outages can exhaust the budget. A failed write makes `agent.run` raise `PersistenceError`; a stream ends with `run_error`. After work starts, the run is saved as `error` if the database answers again in time. Otherwise it keeps its last committed state. Unconsumed continuations can instead release back to their pause; see [Continuation setup failures](#continuation-setup-failures). Restart terminal-error runs as appropriate. Use `sweep` and `reclaim` for runs left running. Each retry logs `Transient DB failure n/3` with the operation and run id, without SQL or driver text. This does not promise every reader or sweep survives a restart.
+
+Recorder and runner scopes keep their previous SQLAlchemy and typed-persistence retry policy. They do not newly retry raw driver failures from custom stores. A custom store must resolve an ambiguous `COMMIT` itself. Do not report it as retryable without proof or a safe stable-identity protocol. Wrapping a landed commit failure in SQLAlchemy `OperationalError` can still cause replay under the existing policy.
+
+Normalized SQL errors discard internal traceback frames that could retain driver text. Direct `PostgresUpdates` send, receive and sender-close failures use plain builtin exceptions with fixed text and no raw exception chain. TLS failures keep the `tls` kind. `last_error_type` keeps a validated original class name, rather than the original exception class. Native driver exception handlers therefore do not catch these normalized direct-hook failures. Missing drivers retain the installation hint for `dendrux[postgres]` or `dendrux[mysql]`.
+
+### Continuation setup failures
+
+In 0.5.0, execution-setup failures such as a failed trace-index read ended
+`resume`, `resume_stream`, `submit_tool_results`, `submit_input`, `submit_approval`
+and `submit_resume` as `error` when failure persistence succeeded. Earlier
+owned-pause validation failures could already release the claim.
+In 0.6.0, continuations (`resume`, `resume_stream`, `submit_*`
+and `reclaim`) can release their exact claim when an ordinary exception occurs before
+submission consumption or work starts. This includes failed setup reads and writes
+such as `run.resumed`, `save_trace` and `consume_submission`, provided consumption
+has not committed. `StoreOutcomeUnknown` during execution setup does not release.
+Cancellation keeps its existing precedence.
+
+A released continuation returns to its pause. Reclaim releases to `running`, for
+a later lease expiry and sweep. No automatic timeout or retry ends a released
+pause: resubmit the original input/results/decisions explicitly, or call
+`cancel_run` if you give up. Permanent setup failures will fail again until fixed.
+Monitor exceptions, `run_error` stream events and `run.resume_aborted` events;
+a monitor counting only rows with `status=error` will miss these attempts.
+
+For a confirmed release to a non-running status, started observers receive
+`on_run_finished` with that observed status. A released reclaim still reports
+failure hooks because its row remains `running`. Failure hooks also run when
+release is unavailable, fails, or its status cannot be read.
+For a claimed pause, a store without a release method or an integer claim epoch
+falls back to terminal error persistence. Reclaim remains `running` and retryable
+after lease expiry even without a release method. An attempted release that fails leaves the last durable state
+for `sweep`/`reclaim`; stores without recovery use `sweep(on_stale="error")`.
+
+`resume_stream` still emits `run_error` for the failed attempt, but its
+`run_result.status` (and `stream.result.status`) reflects the observed row after
+release, which can be a pause or `running`. If the cleanup status read fails,
+`running` is the conservative fallback, not proof of current ownership. Read the
+store before retrying. The error event keeps the failure information and does not
+supply a pending payload or pause token.
+
+After an outcome commits, an optional projection failure cannot hide it.
+A pause result may have `pending=None` and `pause_id=None`; reload with
+`RunStore.get_pending` before submitting, and handle a pause that has since changed.
+`recovery=None` can mean its projection failed on a committed-outcome or
+`cancel_run` response; `result_read_failed` logs that case. `get_result` remains a
+strict read and raises if recovery or pending cannot be read.
+
+### Cancellation during create or claim
+
+With built-in SQL stores, cancelling a continuation before its claim issues `COMMIT` leaves the original pause intact. The same request can be retried. Cancelling a new run before its create issues `COMMIT` leaves no new run. From `COMMIT` onward, cleanup uses the acquired epoch to end the run as `cancelled`, including cancellation during governance setup. It does not release that claim back to the pause. An ambiguous outcome or failed cleanup can leave the last committed state for recovery.
+
+Create, claim and reclaim store calls run in a joined child task. A custom store sees the caller's inherited `ContextVar` values, but writes to those variables do not reach the caller. Check task-scoped session handling too. Provider iteration and lifecycle callbacks stay in the caller's task.
+
+The private handoff deadline is about five seconds. It covers only the create or claim handoff, relies on store and driver cancellation, and can be exceeded by a network black hole at `COMMIT`. Later governance and provider cleanup are outside it. See [Cancelling while a run is created or claimed](/docs/architecture/cancellation#cancelling-while-a-run-is-created-or-claimed) for recovery and legacy-store limits.
 
 ### Paused runs with a token budget
 
@@ -122,20 +191,95 @@ A retried transaction is attempted at most three more times after the first try,
 
 Drain those runs before upgrading, or explicitly keep `Budget(..., count_cache_tokens=False)` for the upgrade window. If you intend to change the accounting while continuing existing runs, use `Agent(..., on_governance_change="warn")` while they drain and review the token limit. An existing token budget that already chose `count_cache_tokens=True` keeps that choice. Budget amounts remain outside the digest so raising a paused run's limit is still allowed.
 
+## Bounded reads
+
+Four `RunStore` list reads and `get_subtree` can return as much as a run holds. 0.6.0 keeps them working and warns, so you can fix your calls before 0.7 changes the defaults.
+
+| Call | 0.6.0 | 0.7 |
+| --- | --- | --- |
+| `get_events`, `get_traces`, `get_llm_calls`, `get_tool_invocations` without `limit` | Reads every row and emits a `FutureWarning` | `limit` defaults to 1,000 |
+| The same with `limit` above 1,000 | `FutureWarning`; SQL stores and the format-2 `get_traces` (any backend) clamp to 1,000; a custom store receives the limit unchanged on its format-1 reads | Raises |
+| `get_subtree` without `max_nodes` | Reads the whole tree and emits a `FutureWarning` | `max_nodes` defaults to 10,000 |
+
+What to do:
+
+- Pass `limit=` (1 to 1,000) on every list read. Page events with `after_sequence_index=` (the last `sequence_index` you got) and the other three with `offset=` (plus the rows you got). A full-history export loops until a page comes back empty; the loops are on the [RunStore reference](/docs/reference/run-store#bounded-list-reads).
+- Pass `max_nodes=` to `get_subtree` and handle `SubtreeTooLargeError`, raised when the descendants (root excluded) reach the bound. It bounds the node count, not memory.
+- `get_traces` pages the public audit rows directly. Reconstruction limits do not apply to public reads. During execution, rows beyond the first unfinished tool slot are withheld so returned positions stay stable; an empty page can mean that work is still pending. Once the run reaches success, error, cancelled or max_iterations, all committed public rows are visible even if unfinished reservations remain.
+- Find the calls that still warn with `python -W error::FutureWarning` over your tests. The `sweep()` warning about omitting `on_stale=` is separate.
+- Zero and negative limits now read one row on every SQL path, including the format-2 `get_traces`, which used to return an empty list.
+
+Close the reader before you dispose its engine, in `async with` or a `finally`. Closing the last follower leaves the shared coordinator running until it idles out after about 60 seconds or the reader closes; disposing the engine first can make its next read fail with a pool error and log `follow_read_failed`. See [Scaling workers](/docs/guides/scaling#build-the-store-once-at-startup).
+
 ## Other changes to check
 
 - `agent.reclaim()` always requires an explicit `tenant_id`, including when `strict_tenancy=False`. Prefer the `tenant_id` on the returned sweep item. Explicit `None` selects untenanted runs; trusted cross-tenant code can pass `UNSCOPED`.
 - Custom state stores declare capabilities. An undeclared store keeps the old signatures and format 1. Subclass overrides must accept and forward the new keyword parameters or narrow their declaration. A mismatch raises `StoreCapabilityError` at Agent construction. See the [capability matrix](/docs/reference/state-store).
-- Format-2 provider options must be JSON-only and fit 2 KiB. An assistant batch has at most 64 pending calls by default (`Limits.max_pending_calls`). Checkpoints fit 32 KiB; history rebuild defaults to 16 MiB and 20,000 rows. Over-limit history is refused rather than truncated.
+- Format-2 provider options must be JSON-only and fit 2 KiB. An assistant batch has at most 64 pending calls by default (`Limits.max_pending_calls`). Checkpoints fit 32 KiB; history rebuild defaults to 16 MiB and 20,000 rows. Over-limit history is refused rather than truncated. A stored conversation rewrite also has hard caps of 999 messages and 1 MiB of UTF-8 JSON. Exceeding either raises `PersistenceError(code="checkpoint_too_large")` before provider dispatch. Raising checkpoint or rebuild limits does not raise these rewrite caps.
 - Every approved tool execution on a format-2 run adds one checkpoint before dispatch. A decision authorizes one attempt; a second crash may require approval again. Mark a tool `idempotent=True` only when repeating its external effect is safe.
-- Dendrux now reports only a fixed list of provider error codes. Any other vendor code or unmapped custom-provider code is reported as `provider_unknown`. Package-issued codes retain their meaning. The raw vendor value remains only on the exception's `provider_code_raw`; do not export it to clients or telemetry.
+- Dendrux reports only a fixed list of provider error codes. A valid but unmapped vendor or custom-provider code maps to `provider_unknown`. A malformed code becomes `None` and is discarded from `provider_code_raw` too. Package-issued codes retain their meaning. Do not export `provider_code_raw` to clients or telemetry.
 - A non-streaming socket read timeout reports `timeout_reason=None`. `call_deadline` means Dendrux's own deadline, not a socket timeout.
-- `max_stream_bytes` also limits one SSE event's wire size. A low custom cap may now reject a final event that repeats a response. Compressed responses accept gzip or deflate; unsupported or stacked encodings raise `response_encoding_unsupported`.
+- Non-streaming provider responses have a 16 MiB byte limit before SDK parsing. Exceeding it raises non-retryable `ProviderResponseError(provider_code="response_size_limit")`. Set `max_response_bytes=` on the provider constructor to override the limit.
+- `max_stream_bytes` also limits one decoded SSE event, in addition to the cumulative retained stream budget. A low custom limit may now reject a final event that repeats a response. Compressed responses accept gzip or deflate; unsupported or stacked encodings raise `response_encoding_unsupported`.
+- The byte limits count decoded body or SSE event bytes, including any bytes after a compressed end marker. Compressed wire bytes are also bounded, with a small overhead allowance of the greater of 1 KiB or 1% of the configured limit, rounded down to whole bytes. Streaming wire accounting resets at decoded SSE event boundaries. A compressed response with heavy padding or frequent compression flushes can be refused even when its decoded bytes fit the limit.
 - Cascade cancellation stays inside the root run's tenant even when called unscoped. Traversal is capped by `Budget.max_subtree_nodes` (default 10,000); `cascade_truncated` means remaining branches need attention. Finished runs keep their `cancel_requested` value. On SQLite, delegated-child creation briefly acquires the write lock before checking the parent.
-- Postgres NOTIFY is off by default. Each notifying transaction takes a database-wide lock at commit. A 50-writer local probe saw about 45% lower write throughput with it enabled; this is a local measurement, not a capacity guarantee. A stuck listener can fill the notification queue and cause writes to fail. Monitor `pg_notification_queue_usage()` and the notifier [alert codes](/docs/recipes/observability#what-to-alert-on).
-- `EventNotifier`, `NotifierState`, `Subscription` and `PostgresEventNotifier` are public in `dendrux.store`.
+- Live updates are off by default and belong to the store: `live_updates=True` (Postgres only) or an instance such as `PostgresUpdates(...)` or `RedisUpdates(...)`. Only `RunStore(store)` listens; `RunStore.from_engine` and `RunStore.from_database_url` keep polling. `Agent(database_url=..., database_options=...)`, `sweep(database_url=...)`, `get_engine` and `RunStore.from_database_url` refuse a `live_updates` key with a `ValueError`. A reader built with `from_engine` or `from_database_url` polls without warning, so use `RunStore(store)` to listen. A hint is a lossy wake-up, never data: the database stays the truth. See [Live updates](/docs/guides/scaling#live-updates) for the transports, the failure behaviour and the alert codes.
+- Followers are served differently. One coordinator task per `RunStore` and event loop reads all watched runs in batches (up to 200 runs and 2,000 rows per query), using a token bucket that holds up to 20 reads and refills at 20 reads per second, so a full bucket can allow about 40 reads within a second; 0.5 ran one poller per watched run. The ordering, heartbeats, caps and redaction of `follow` are unchanged. With healthy live updates a safety poll runs every 10 seconds; without them an idle run is read every 0.5 seconds, backing off to 2 seconds. `stream_events` keeps its own per-caller polling; prefer `follow`.
+- `PostgresUpdates` uses connections outside your pool: one sender per store that announces and one listener per store whose readers follow. Count them against the database's connection limit.
 - Resumes, submissions and reclaim use the stored trace link to stay in one trace when an OpenTelemetry notifier is supplied. In a trace, a failed tool's stack shows where Dendrux reported the failure, rather than where the tool itself crashed.
 - Structured logs carry stable codes. Strict field checking is opt-in with `DENDRUX_STRICT_LOG_FIELDS=1`; normal operation drops invalid fields. See [Log codes](/docs/reference/log-codes).
+
+## Storage-format compatibility
+
+Fresh and activated databases create format-2 runs. `dendrux db migrate` activates new PostgreSQL databases automatically; existing PostgreSQL databases still need `dendrux db activate` after every worker and reader is upgraded. Existing format-1 runs retain their
+format. Human-input pauses expose the question and suggested options through
+`RunResult.pending`, `RunResult.to_dict()`, `Agent.get_result()` and
+`RunStore.get_pending()` in both formats. Re-pausing replaces the question and options
+with those for the new pause.
+
+Format 2 saves a bounded display copy in `pause_data.clarification`, without a schema
+migration. `Limits(max_pause_summary_bytes=65536)` sets the UTF-8 JSON byte budget (without ASCII escaping); the
+supported range is 128 bytes to 512 KiB. The question has priority, followed by options
+in order. Excess text ends with `[truncated]`; options that do not fit are omitted.
+The pause still succeeds and emits the `pause_summary_truncated` log code, with no
+question or option text in the log. Only when the question itself is cut is the clarification turn
+used for subsequent model calls and recovery also bounded and its duplicated
+raw-response step field omitted. Omitting excess options preserves the original model
+response. This display bound is excluded from governance: raising it does not invalidate
+an existing pause, and reclaim uses the configured bound.
+The original LLM interaction record is retained. This prevents a long question alone
+from making the pause unresumable. Saved questions follow the same model-text and PII
+rules as other saved model output.
+
+`RunStore.get_traces()` returns the run's own user, assistant and tool rows in both
+formats. It excludes system prompts, seeded conversation prefixes and recovery state.
+`order_index` is the zero-based position among these rows, and `limit` and `offset`
+count only these rows. Retry runs show their new turns, not the predecessor's seed.
+Compaction does not remove earlier audit rows. The system prompt remains stored for
+internal recovery and reconstruction. Public SQL reads push filtering, offset and limit into the database and load only the
+requested page. They have no recovery row or byte limit. Rows after the first unfinished
+tool slot remain hidden until its observation is committed, keeping offset cursors stable.
+
+These format-2 differences are intentional:
+
+| Surface | Change and application action |
+| --- | --- |
+| Stored events and `follow` | `tool.started` records a durable server-tool execution intent, with `call_id`, `tool_name` and `idempotent`. It precedes that attempt's completion. Accept this additional event type. It does not mean the external effect has completed. |
+| Terminal event iteration | `run.completed.iteration_index`, and loop-produced `run.error.iteration_index`, identify the final iteration rather than the format-1 placeholder zero. |
+| Event cursors and pause pairs | Added events consume sequence indexes, so exact indexes differ across formats. Use returned cursors and pause ids; do not calculate them from a fixed event count. Parallel tools can interleave their start and completion events, while each call retains its lifecycle order. |
+| PII in traces | Format-2 checkpoints retain the provider-ready placeholder form of incoming text. Public trace content can therefore contain placeholders where format 1 retained raw text. No raw PII is sent to the provider. |
+| Resumed guardrail accounting | After resume with no new PII, format 2 emits no incoming `guardrail.detected` or `guardrail.redacted` events: restored history already contains placeholders. Format 1 rescans raw history and emits them every iteration. New PII still produces stored and notified events. In an uninterrupted run, redaction evidence attached to an unchanged projected message survives cache eviction. Copied tool-result messages can lose that evidence: after more than 256 later message projections evict the cached entry, format 2 can emit fewer repeat events than format 1. Earlier recorded events remain and the tool text stays redacted; summaries retain up to 128 findings with the true total count and independent entity-kind counts. Up to 128 distinct kinds are retained; additional custom kinds share an `UNSCANNABLE` overflow count. |
+| Declined approvals with a mid-batch client call | With server `s`, client `c` and gated `g`, declining every approval can give provider order `s, c, g` in format 1 and `s, g, c` in format 2. Public trace order matches across formats. Format 2 preserves its reserved server/gated slots before client slots. |
+| Crash before a late rejection commits | Recovery can produce `S, invalid` instead of `invalid, S`. A rejection without a committed result can use `{"code":"rejected"}` instead of its original explanation. The provider request and public trace agree; no observation is lost or duplicated. Recovery uses durable slots and outcomes, since the original rejection text was not committed. |
+| Trace metadata | `meta.iteration` keeps its format-1 meaning. Internal `dendrux.message`, `dendrux.seed_prefix` and `dendrux.step` are excluded from public trace reads. In particular, `dendrux.step.raw_response` is recovery evidence, not a public trace field. Existing public phase, tool, image and reasoning metadata remains available. |
+| Independent executions | Timestamps, durations, generated ids and delivery or sweep times differ between runs. Compare their meaning rather than exact values across formats. |
+| Low-level persisted state | Format-2 `pause_data` has `schema_version=2`, `loop_state_ref` and `image_view_ref`; history, steps and image-view state are reconstructed from evidence instead of copied into each pause. Physical traces include system, seed, rewrite and state rows. Internal observation records and blob owner indexes refer to physical positions. Use public reads rather than interpreting these storage details. |
+
+`RunResult` also has an optional `recovery` attribute (normally `None`), and `ToolCall`
+has an optional `raw_length` attribute for malformed arguments. Their dataclass fields
+and representations have grown; the wire result omits recovery when none occurred.
+`RunAlreadyTerminalError` now also inherits from `RunControlError` and remains a
+`RuntimeError`. Avoid parsing exception or dataclass representations as a protocol.
 
 ## Rollback
 

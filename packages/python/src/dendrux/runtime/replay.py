@@ -81,7 +81,7 @@ if TYPE_CHECKING:
     from dendrux.loops.base import Loop
     from dendrux.runtime.state import RunEventRecord, RunRecord, StateStore, TraceRecord
     from dendrux.skills._session import SkillSession
-    from dendrux.types import ToolDef
+    from dendrux.types import Limits, ToolDef
 
 logger = logging.getLogger(__name__)
 
@@ -179,6 +179,12 @@ async def load_replay_runs(
     store: StateStore, request: ReplayRequest, *, tenant_id: str | None
 ) -> list[LoadedRun]:
     """Load and validate every run in ``request.runs``. Raises ``ReplayRunError``."""
+    return await _load_replay_runs(store, request, tenant_id=tenant_id, limits=None)
+
+
+async def _load_replay_runs(
+    store: StateStore, request: ReplayRequest, *, tenant_id: str | None, limits: Limits | None
+) -> list[LoadedRun]:
     from dendrux.errors import ReplayRunError
     from dendrux.runtime._capabilities import capabilities
 
@@ -194,7 +200,7 @@ async def load_replay_runs(
                 f"it is still '{record.status}'; only terminal runs can be replayed",
             )
         traces = (
-            await conversation_records(store, run_id)
+            await conversation_records(store, run_id, limits=limits)
             if record.storage_format == STORAGE_FORMAT_CHECKPOINTED
             and capabilities(store).checkpointing
             else await store.get_traces(run_id)

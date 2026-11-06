@@ -50,6 +50,7 @@ def _agent() -> Agent:
         tools=[get_population],
         budget=Budget(max_tokens=100_000),
         database_url=_DB_URL,
+        strict_tenancy=False,  # single-tenant demo (see Multi-tenancy docs)
     )
 
 
@@ -72,7 +73,7 @@ async def main() -> None:
     # --- read the persisted reasoning back via the public RunStore ---
     async with RunStore.from_database_url(_DB_URL) as store:
         run = await store.get_run(result.run_id)
-        calls = await store.get_llm_calls(result.run_id)
+        calls = await store.get_llm_calls(result.run_id, limit=100)  # one page: a short demo run
     print("\n=== persisted (RunStore) ===")
     print("run total_reasoning_tokens:", run.total_reasoning_tokens if run else None)
     print("per-call reasoning_tokens:", [c.reasoning_tokens for c in calls])

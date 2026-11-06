@@ -74,6 +74,7 @@ from dendrux.llm._schema import (
     prepare_anthropic_strict,
 )
 from dendrux.llm._stop_reason import anthropic_stop_reason
+from dendrux.llm._transport import guard_sdk_client
 from dendrux.llm.base import LLMProvider
 from dendrux.types import (
     REPLAYED_META_KEY,
@@ -320,10 +321,17 @@ class AnthropicProvider(LLMProvider):
             stream_idle_timeout: Maximum gap in seconds between meaningful
                 stream events (``ping`` does not count), and before the first
                 one. ``None`` turns it off.
-            max_response_bytes: Maximum decoded non-streaming body bytes (default 16 MiB).
-            max_stream_bytes: Per-SSE-event decoded wire bound and cumulative
-                UTF-8 and structural stream budget.
-                Default 16 MiB. Exceeding it closes the upstream response.
+            max_response_bytes: Non-streaming body budget (default 16 MiB). Counts
+                decoded bytes and bytes after a compressed end marker. Compressed
+                wire bytes are also bounded, with a small overhead allowance of
+                the greater of 1 KiB or 1% of the limit (rounded down). A response
+                can be refused even when its decoded body fits the limit.
+            max_stream_bytes: Per-SSE-event decoded byte bound, including bytes
+                after a compressed end marker, and cumulative UTF-8 and structural
+                stream budget (default 16 MiB). Compressed wire bytes use the same
+                allowance calculation with max_stream_bytes; wire accounting
+                resets at decoded SSE event boundaries. Exceeding a bound closes
+                upstream.
             max_stream_tool_calls: Maximum retained tool-call slots (default 1,000).
             stream_total_timeout: Wall-clock limit in seconds for a whole
                 stream. ``None`` (default) means no limit.
@@ -348,10 +356,12 @@ class AnthropicProvider(LLMProvider):
         def new_http() -> httpx.AsyncClient:
             return make_http_client(anthropic, deadlines, provider="anthropic")
 
-        self._client = anthropic.AsyncAnthropic(
-            api_key=api_key,
-            http_client=new_http(),
-            max_retries=max_retries,
+        self._client = guard_sdk_client(
+            anthropic.AsyncAnthropic(
+                api_key=api_key,
+                http_client=new_http(),
+                max_retries=max_retries,
+            )
         )
         self._clients: LoopClients[anthropic.AsyncAnthropic] = LoopClients(
             new_http, lambda client, http: client.copy(http_client=http)

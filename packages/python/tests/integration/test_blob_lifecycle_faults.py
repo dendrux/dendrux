@@ -648,14 +648,47 @@ async def test_injected_deadlock_retries_whole_transaction(engine, store, monkey
     assert runs == 1 and edges == 2
 
 
-@CONCURRENT
-async def test_concurrent_shared_image_edge_writes_never_deadlock(engine) -> None:
-    """P1-1: 16 workers x 20 shared blobs, multi-image create_run + save_trace edges."""
+# SQLite has one writer at a time, so with 16 workers most calls wait for the lock. How long a
+# wait lasts depends on the machine: on a slow shared CI runner two calls outlasted the 5 s
+# default and ended as lock timeouts, which is capacity and not a deadlock. This test is about
+# deadlocks, so it gives SQLite a wait far beyond any slow runner. A real deadlock still shows:
+# an upgrade deadlock fails at once whatever the timeout, a hang hits the wall deadline below,
+# and any other error is collected.
+SQLITE_BUSY_TIMEOUT_MS = 60_000
+WORKLOAD_DEADLINE_S = 120.0
+WORKERS = 16
+
+
+async def run_shared_edge_workload(
+    engine: Any,
+    *,
+    iterations: int,
+    deadline_s: float = WORKLOAD_DEADLINE_S,
+    patch_store: Any = None,
+) -> tuple[list[BaseException], list[str]]:
+    """16 workers x 20 shared blobs, multi-image create_run + save_trace edges.
+
+    Returns the errors the workers hit and the text of every retry the store made. The whole
+    run must finish within ``deadline_s``; a hang raises TimeoutError.
+    """
     import random
+
+    from sqlalchemy import event
 
     import dendrux.runtime.durability as durability
 
+    busy_listener = None
+    if engine.dialect.name == "sqlite":
+
+        def busy_listener(dbapi_conn: Any, _record: Any) -> None:
+            dbapi_conn.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
+
+        event.listen(engine.sync_engine, "connect", busy_listener)
+        await engine.dispose()  # connections made from here on carry the longer wait
+
     store = store_for_engine(engine)
+    if patch_store is not None:
+        patch_store(store)
     services = BlobServices.for_state_store(store)
     shas = [(await store_png(services, "t:acme", make_png(300 + i))).ref.sha256 for i in range(20)]
     retries: list[str] = []
@@ -667,7 +700,6 @@ async def test_concurrent_shared_image_edge_writes_never_deadlock(engine) -> Non
 
     durability._backoff = counting_backoff  # type: ignore[assignment]
     failures: list[BaseException] = []
-    iterations = 25 if engine.dialect.name == "postgresql" else 6
 
     async def worker(w: int) -> None:
         rng = random.Random(w)
@@ -694,18 +726,79 @@ async def test_concurrent_shared_image_edge_writes_never_deadlock(engine) -> Non
                     ],
                     blob_refs_scope="t:acme",
                 )
-            except BaseException as exc:  # noqa: BLE001 - collected for the assertion
+            except Exception as exc:  # noqa: BLE001 - collected for the assertion
                 failures.append(exc)
 
     try:
-        await asyncio.gather(*(worker(w) for w in range(16)))
+        async with asyncio.timeout(deadline_s):
+            await asyncio.gather(*(worker(w) for w in range(WORKERS)))
     finally:
         durability._backoff = real_backoff  # type: ignore[assignment]
+        if busy_listener is not None:
+            event.remove(engine.sync_engine, "connect", busy_listener)
+    return failures, retries
+
+
+@CONCURRENT
+async def test_concurrent_shared_image_edge_writes_never_deadlock(engine) -> None:
+    """P1-1: every worker finishes, no error, no deadlock retry, every edge written once."""
+    iterations = 25 if engine.dialect.name == "postgresql" else 6
+    failures, retries = await run_shared_edge_workload(engine, iterations=iterations)
     assert failures == []
     assert not any("40P01" in r or "deadlock" in r.lower() for r in retries)
     async with engine.connect() as conn:
         edges = (await conn.execute(text("SELECT count(*) FROM dendrux_blob_refs"))).scalar_one()
-    assert edges == 16 * iterations * 12
+    assert edges == WORKERS * iterations * 12
+
+
+class _DeadlockError(Exception):
+    sqlstate = "40P01"
+
+
+@pytest.mark.parametrize("engine", ["sqlite_file"], indirect=True)
+class TestSharedEdgeWorkloadStillCatchesRealProblems:
+    """The check above must fail on a hang, an unexpected error and a deadlock retry."""
+
+    async def test_a_hang_hits_the_wall_deadline(self, engine) -> None:
+        def hang(store: Any) -> None:
+            async def never(*_: Any, **__: Any) -> None:
+                await asyncio.Event().wait()
+
+            store.save_trace = never
+
+        with pytest.raises(TimeoutError):
+            await run_shared_edge_workload(engine, iterations=1, deadline_s=2.0, patch_store=hang)
+
+    async def test_an_unexpected_error_is_reported(self, engine) -> None:
+        def broken(store: Any) -> None:
+            async def boom(*_: Any, **__: Any) -> None:
+                raise RuntimeError("unexpected")
+
+            store.save_trace = boom
+
+        failures, _ = await run_shared_edge_workload(engine, iterations=1, patch_store=broken)
+        assert len(failures) == WORKERS
+        assert all(isinstance(f, RuntimeError) for f in failures)
+
+    async def test_a_deadlock_retry_is_reported(self, engine, monkeypatch) -> None:
+        from sqlalchemy.exc import DBAPIError
+
+        import dendrux.runtime.stores.sql.base as state_mod
+
+        monkeypatch.setattr("dendrux.runtime.durability.BASE_BACKOFF_S", 0.0)
+        real = state_mod.write_blob_refs
+        calls: list[int] = []
+
+        async def deadlock_once(*args: Any, **kwargs: Any) -> None:
+            await real(*args, **kwargs)
+            calls.append(1)
+            if len(calls) == 1:
+                raise DBAPIError("UPDATE dendrux_blobs", None, _DeadlockError("deadlock 40P01"))
+
+        monkeypatch.setattr(state_mod, "write_blob_refs", deadlock_once)
+        failures, retries = await run_shared_edge_workload(engine, iterations=1)
+        assert failures == []
+        assert any("40P01" in r or "deadlock" in r.lower() for r in retries)
 
 
 async def test_raised_put_error_leaves_no_row(engine) -> None:

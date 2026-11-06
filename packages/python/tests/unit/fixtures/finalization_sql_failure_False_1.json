@@ -1,5 +1,5 @@
 [
   "BEGIN",
-  "UPDATE agent_runs SET status_changed_at=CASE WHEN (agent_runs.status != ?) THEN ? ELSE agent_runs.status_changed_at END, status=?, error=?, pause_data=?, cancel_requested=?, pause_requested=?, updated_at=? WHERE agent_runs.id = ? AND agent_runs.status = ?",
-  "COMMIT"
+  "UPDATE agent_runs SET status_changed_at=CASE WHEN (agent_runs.status != ?) THEN ? ELSE agent_runs.status_changed_at END, status=?, pause_data=?, cancel_requested=?, pause_requested=?, loop_state=CASE WHEN (agent_runs.storage_format = ?) THEN json_set(coalesce(nullif(agent_runs.loop_state, ?), ?), ?, json(?)) ELSE agent_runs.loop_state END, error=?, updated_at=? WHERE agent_runs.id = ? AND agent_runs.status IN (?)",
+  "ROLLBACK"
 ]

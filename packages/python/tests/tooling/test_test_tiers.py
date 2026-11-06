@@ -34,7 +34,6 @@ PKG = Path(__file__).resolve().parents[2]
         ("unit/test_guardrails.py", "guardrails"),
         ("unit/test_media_fetch.py", "media"),
         ("unit/test_cli_commands.py", "cli"),
-        ("unit/test_notifier_writer.py", "notifiers"),
         ("unit/test_tool_pool.py", "tools"),
         ("unit/test_strategies.py", "strategies"),
         ("integration/test_cancellation.py", "runtime"),
@@ -529,16 +528,6 @@ def test_every_tight_wall_clock_assertion_is_a_benchmark_or_reviewed() -> None:
         "a measured time is compared with a small number in a test that runs in parallel; mark it "
         "benchmark (tests/_helpers/tier_lists/benchmark.txt) or, if the bound is a generous hang "
         "tripwire, review it into wallclock_reviewed.txt:\n" + "\n".join(unlisted)
-    )
-
-
-def test_the_notifier_latency_test_is_selected_as_a_benchmark() -> None:
-    target = "tests/integration/test_060_notifier_pg.py"
-    benchmarks = _collect(target, "-m", "benchmark")
-    assert any("test_n1_commit_wakes_under_50ms" in line for line in benchmarks)
-    assert not any(
-        "test_n1_commit_wakes_under_50ms" in line
-        for line in _collect(target, "-m", "not benchmark")
     )
 
 

@@ -96,7 +96,6 @@ class StoreCapabilities:
     checkpointing: bool = False
     atomic_completion: bool = False
     recovery: bool = False
-    notify: bool = False
     deployment: Literal["single_process", "single_host", "multi_server"] | None = None
 
 
@@ -374,6 +373,7 @@ PAUSE_SUMMARY_KEYS = (
     "pause_reason",
     "pause_message",
     "pause_id",
+    "clarification",
     FailureReason.BUDGET_EXCEEDED.value,
 )
 

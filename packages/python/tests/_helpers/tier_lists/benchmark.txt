@@ -4,11 +4,6 @@
 # Add a test here when it compares a measured time with a small number; or, if the bound is only
 # a generous hang tripwire, list it in wallclock_reviewed.txt instead (a tooling test enforces one
 # or the other). Tests with their own @pytest.mark.benchmark need no entry.
-tests/integration/test_060_notifier_pg.py::test_n1_commit_wakes_under_50ms_and_1000_subscriptions_one_connection | commit-to-wakeup latency under 250 ms with 1,000 subscriptions
-tests/integration/test_060_notifier_pg.py::test_n2_kill_listener_falls_back_and_recovers | recovery within two poll intervals plus 200 ms
-tests/integration/test_060_notifier_pg.py::test_stream_events_notify_wake_under_50ms_and_release | wake latency under 50 ms
-tests/integration/test_060_notifier_liveness.py::test_p1_3_ten_follows_poll_when_owned_listener_is_blackholed | herd delivery under 1 s against a 1 s reconnect backoff
-tests/unit/test_follow_notifier_fix1.py::test_p1_3_ten_owned_readers_share_failure_and_poll | ten readers deliver within 550 ms
 tests/unit/test_mcp_oauth_http.py::test_cancellation_during_close_returns_and_the_close_still_finishes | cancel returns within 200 ms
 tests/unit/test_mcp_runtime_live.py::TestReleaseOwnership::test_forced_connect_cancellation_uses_one_shared_grace_period | shared grace under 450 ms (sequential would be 600 ms)
 tests/unit/test_mcp_runtime_live.py::TestConnectionCapacity::test_zero_wait_timeout_fails_fast | fails within 50 ms

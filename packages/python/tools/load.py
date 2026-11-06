@@ -15,7 +15,7 @@ controller, a billing connection per worker); the report lists every connection 
 Scenarios: ``a`` (the 0.5 client-tool pause/submit run), ``iteration`` (statements per
 one-tool iteration), ``runs`` (concurrent runs), ``kill_checkpoint`` and ``kill_inflight``
 (worker processes killed with SIGKILL, then recovered), ``followers_on`` and
-``followers_off`` (notifier on and off), ``cancel`` (a large delegation tree),
+``followers_off`` (live updates on and off), ``cancel`` (a large delegation tree),
 ``pool`` (pool exhaustion), ``history`` (a near-16 MiB history resumed in a new process)
 and ``memory`` (repeated cycles in one process).
 
@@ -74,14 +74,18 @@ MONITOR_INTERVAL: ContextVar[float] = ContextVar("load_monitor_interval", defaul
 
 POOL = {"pool_size": 10, "max_overflow": 5, "pool_timeout": 120, "pool_pre_ping": True}
 POOL_CEILING = POOL["pool_size"] + POOL["max_overflow"]
-CHANNEL = "dendrux_events"
 SAMPLE_INTERVAL_S = 0.01
+LIVE_HINT_DELIVERY_P95_MS = 1_000
 BIG_CHARS = 985_000  # 17 results put the full history just below the 16 MiB rebuild bound
 V050_REFERENCE_A = 59.0  # recorded 2026-10-27, commit dca4f05e (owner-docs load-test-results.md)
 # Informational release comparison only (§12.53); baseline edits cannot change it.
 # Measured after 3d-trim (8a189402), 2026-10-31, 200 flows per mode / two workers.
 # Durable evidence: owner-docs/build-0.6.0/work/p3c-load/fix1-a-calibration.json.
-SCENARIO_A_BUDGETS = {"a_notify_off": 74, "a_notify_on": 83}
+# 2026-11-05 (owner): one read before each provider call checks for a cancel or pause, which costs
+# one statement per call. Live updates add no statements now. Measured at ee2fd2ef: about 75.2 per
+# flow and 19 per iteration (owner-docs/build-0.6.0/work/rfint/load/quick-ee2fd2ef.json).
+ITERATION_BUDGET = 19
+SCENARIO_A_BUDGETS = {"a_live_off": 76, "a_live_on": 76}
 
 LABEL: ContextVar[str] = ContextVar("load_label", default="other")
 OP: ContextVar[str] = ContextVar("load_op", default="-")
@@ -535,7 +539,8 @@ def agent_kwargs(**extra: Any) -> dict[str, Any]:
     return kwargs
 
 
-def make_store(engine: Any, *, notify: bool) -> Any:
+def make_store(engine: Any, *, live: bool) -> Any:
+    """Build the store; ``live`` turns on Postgres live updates (``live_updates=True``)."""
     try:
         from dendrux.runtime.stores._factory import store_for_engine
     except ImportError:  # historical 0.5 checkout only
@@ -543,8 +548,15 @@ def make_store(engine: Any, *, notify: bool) -> Any:
 
         return SQLAlchemyStateStore(engine)
 
-    options = {"notify_channel": CHANNEL} if notify and engine.dialect.name == "postgresql" else {}
+    options = {"live_updates": True} if live and engine.dialect.name == "postgresql" else {}
     return store_for_engine(engine, **options)
+
+
+async def close_store(store: Any) -> None:
+    """Close store-owned live updates when running against a current checkout."""
+    close = getattr(store, "close", None)
+    if close is not None:
+        await close()
 
 
 from sqlalchemy.pool import AsyncAdaptedQueuePool  # noqa: E402
@@ -651,7 +663,7 @@ async def w_a(ctx: Ctx) -> dict[str, Any]:
 
     engine = make_engine(ctx.url, f"dendrux_load_w{ctx.index}")
     meter = Meter(engine)
-    store = make_store(engine, notify=ctx.p.get("notify", False))
+    store = make_store(engine, live=ctx.p.get("live", False))
     tools = make_tools(ctx.state)
     keys = ctx.shard([key_of(i) for i in range(ctx.p["runs"])])
     lat_total: list[float] = []
@@ -715,6 +727,7 @@ async def w_a(ctx: Ctx) -> dict[str, Any]:
     }
     if shared is not None:
         await shared.close()
+    await close_store(store)
     await engine.dispose()
     return out
 
@@ -727,7 +740,7 @@ async def w_runs(ctx: Ctx) -> dict[str, Any]:
     doomed = ctx.role == "doomed"
     engine = make_engine(ctx.url, "dendrux_load_doomed" if doomed else f"dendrux_load_w{ctx.index}")
     meter = Meter(engine)
-    store = make_store(engine, notify=ctx.p.get("notify", False))
+    store = make_store(engine, live=ctx.p.get("live", False))
     kill = ctx.p.get("kill")  # None | "checkpoint" | "inflight"
     all_keys = [key_of(i) for i in ctx.p["keys"]]
     keys = all_keys if doomed else ctx.shard(all_keys)
@@ -793,6 +806,7 @@ async def w_runs(ctx: Ctx) -> dict[str, Any]:
     await agent.close()
     if billing is not None:
         await ctx.state["bill_engine"].dispose()
+    await close_store(store)
     await engine.dispose()
     return out
 
@@ -804,7 +818,7 @@ async def w_recover(ctx: Ctx) -> dict[str, Any]:
 
     engine = make_engine(ctx.url, f"dendrux_load_w{ctx.index}")
     meter = Meter(engine)
-    store = make_store(engine, notify=False)
+    store = make_store(engine, live=False)
     billing = await billing_hook(ctx)
     tools = make_tools(ctx.state)
     llm = make_llm("server", hook=billing, usage=True)
@@ -882,10 +896,10 @@ async def w_iteration(ctx: Ctx) -> dict[str, Any]:
     ]
     ctx.send("ready")
     ctx.pipe.recv()
-    for notify in (True, False) if engine.dialect.name == "postgresql" else (False,):
+    for live in (True, False) if engine.dialect.name == "postgresql" else (False,):
         for streaming in (False, True):
-            name = f"notify_{'on' if notify else 'off'}_{'stream' if streaming else 'batch'}"
-            store = make_store(engine, notify=notify)
+            name = f"live_{'on' if live else 'off'}_{'stream' if streaming else 'batch'}"
+            store = make_store(engine, live=live)
             phase = {"name": "startup", "iteration": 0}
 
             def wrap(method_name: str, method: Any, phase: dict = phase) -> Any:
@@ -966,6 +980,7 @@ async def w_iteration(ctx: Ctx) -> dict[str, Any]:
                 )
                 await agent.close()
             out["variants"][name] = results
+            await close_store(store)
     out["meter"] = meter.snapshot()
     await engine.dispose()
     return out
@@ -989,25 +1004,21 @@ async def followers_round(
     url: str,
     keys: list[str],
     followers: int,
-    notify: bool,
+    live: bool,
     idle_s: float,
 ) -> dict[str, Any]:
     import asyncpg
 
     from dendrux import Agent
-    from dendrux.store import EventFeed, FollowEnd, FollowHeartbeat, PostgresEventNotifier, RunStore
+    from dendrux.store import EventFeed, FollowEnd, FollowHeartbeat, RunStore
     from dendrux.types import RunStatus, ToolResult
 
-    store = make_store(engine, notify=notify)
-    notifier = PostgresEventNotifier(dsn_of(url), channel=CHANNEL) if notify else None
-    if notifier is not None:
-        await notifier.start()
-    reads = RunStore.from_engine(engine, notifier=notifier)
+    store = make_store(engine, live=live)
+    reads = RunStore(store)
     feed = EventFeed(
         reads,
         max_followers=max(10, len(keys) * followers + 10),
         max_followers_per_tenant=None,
-        notifier=notifier,
     )
     tools = make_tools(ctx.state)
     agent = Agent(
@@ -1181,8 +1192,8 @@ async def followers_round(
     await agent.close()
     await feed.aclose()
     result["followers_open_after_close"] = getattr(feed, "_open", None)
-    if notifier is not None:
-        await notifier.stop()
+    await reads.close()
+    await close_store(store)
     return result
 
 
@@ -1193,7 +1204,7 @@ async def w_followers(ctx: Ctx) -> dict[str, Any]:
     ctx.send("ready")
     ctx.pipe.recv()
     round_ = await followers_round(
-        ctx, engine, meter, ctx.url, keys, ctx.p["followers"], ctx.p["notify"], ctx.p["idle_s"]
+        ctx, engine, meter, ctx.url, keys, ctx.p["followers"], ctx.p["live"], ctx.p["idle_s"]
     )
     out = {
         "round": round_,
@@ -1236,7 +1247,7 @@ async def w_cancel(ctx: Ctx) -> dict[str, Any]:
 
     engine = make_engine(ctx.url, "dendrux_load_w0")
     meter = Meter(engine)
-    store = make_store(engine, notify=False)
+    store = make_store(engine, live=False)
     links = tree_links(ctx.p["nodes"])
     ids = [generate_ulid() for _ in links]
     LABEL.set("seed")
@@ -1353,7 +1364,7 @@ async def w_pool(ctx: Ctx) -> dict[str, Any]:
             },
         )
         meter = Meter(engine)
-        store = make_store(engine, notify=False)
+        store = make_store(engine, live=False)
         tools = make_tools(ctx.state)
         llm = make_llm("server", usage=True)
         agent = Agent(**agent_kwargs(tools=[tools["work"]], provider=llm, state_store=store))
@@ -1406,7 +1417,7 @@ async def w_history(ctx: Ctx) -> dict[str, Any]:
 
     engine = make_engine(ctx.url, "dendrux_load_w0")
     meter = Meter(engine)
-    store = make_store(engine, notify=False)
+    store = make_store(engine, live=False)
     tools = make_tools(ctx.state)
     calls = ctx.p["calls"]
     llm = make_llm("big", big_calls=calls)
@@ -1476,7 +1487,7 @@ async def _a_round(ctx: Ctx, engine: Any, keys: list[str]) -> int:
     from dendrux import Agent
     from dendrux.types import RunStatus, ToolResult
 
-    store = make_store(engine, notify=False)
+    store = make_store(engine, live=False)
     tools = make_tools(ctx.state)
     ok = 0
 
@@ -1636,7 +1647,6 @@ NEW_MARKERS = (
     "FOR SHARE",
     "cancel_requested = true",
     "parent_run_id = ANY",
-    "pg_notify",
     "dendrux_settings",
     "trace_kind",
     "reclaim",
@@ -2233,14 +2243,14 @@ def base_metrics(
 
 
 async def ctl_a(
-    url: str, cfg: dict[str, Any], workers: int, notify: bool, shared: bool = False
+    url: str, cfg: dict[str, Any], workers: int, live: bool, shared: bool = False
 ) -> Outcome:
     out = Outcome()
     n = cfg["a"]
     await reset_db(url)
     async with Measured(url) as m:
         handles = await run_workers(
-            url, "a", "main", workers, {"runs": n, "notify": notify, "shared": shared}, measured=m
+            url, "a", "main", workers, {"runs": n, "live": live, "shared": shared}, measured=m
         )
     results = [h.result for h in handles]
     merged = merge_meters([r["meter"] for r in results])
@@ -2255,7 +2265,7 @@ async def ctl_a(
         metrics["errors"].update(r["errors"])
     metrics["errors"] = dict(metrics["errors"])
     metrics["integrity"] = await integrity(url)
-    metrics["notify"] = notify
+    metrics["live"] = live
     out.metrics = metrics
     out.check("every run completed once", ok == n and metrics["integrity"]["success"] == n, ok, n)
     out.check(
@@ -2267,7 +2277,7 @@ async def ctl_a(
     out.check(
         "no run left open", metrics["integrity"]["open"] == 0, metrics["integrity"]["open"], 0
     )
-    gate = "a_shared_agent" if shared else f"a_notify_{'on' if notify else 'off'}"
+    gate = "a_shared_agent" if shared else f"a_live_{'on' if live else 'off'}"
     out.gates[f"{gate}.statements_per_run"] = metrics["statements_per_run"]
     if shared:
         calls = sum(r["provider_calls"] for r in results)
@@ -2320,7 +2330,7 @@ async def ctl_iteration(url: str, cfg: dict[str, Any], workers: int) -> Outcome:
         "app_bytes_sent": merged["bytes_sent"],
     }
     if check_private_url(url).get_backend_name() == "mysql":
-        out.notes.append("NOTIFY iteration variants skipped on MySQL/MariaDB")
+        out.notes.append("live-updates iteration variants skipped on MySQL/MariaDB (Postgres only)")
         for key, variant in variants.items():
             out.gates[f"iteration.{key}"] = variant["max_non_terminal"]
         return out
@@ -2331,10 +2341,13 @@ async def ctl_iteration(url: str, cfg: dict[str, Any], workers: int) -> Outcome:
 
 
 def iteration_budget_checks(variants: dict[str, Any]) -> list[dict[str, Any]]:
-    """Keep the spec's 21-notify-on/18-off PostgreSQL iteration ceilings fixed."""
+    """Keep the fixed per-iteration ceiling (19, owner 2026-11-05) for every variant.
+
+    The pre-call cancel/pause read costs one statement per provider call; live updates add none.
+    """
     checks = []
     for name, variant in variants.items():
-        budget = 21 if name.startswith("notify_on") else 18
+        budget = ITERATION_BUDGET
         value = variant["max_non_terminal"]
         checks.append(
             {
@@ -2353,7 +2366,7 @@ async def ctl_runs(url: str, cfg: dict[str, Any], workers: int) -> Outcome:
     await reset_db(url)
     async with Measured(url) as m:
         handles = await run_workers(
-            url, "runs", "main", workers, {"keys": list(range(n)), "notify": False}, measured=m
+            url, "runs", "main", workers, {"keys": list(range(n)), "live": False}, measured=m
         )
     results = [h.result for h in handles]
     merged = merge_meters([r["meter"] for r in results])
@@ -2405,7 +2418,7 @@ async def ctl_kill(url: str, cfg: dict[str, Any], workers: int, kill: str) -> Ou
         "runs",
         "doomed",
         1,
-        {"keys": doomed_keys, "kill": kill, "billing": True, "notify": False},
+        {"keys": doomed_keys, "kill": kill, "billing": True, "live": False},
     )
 
     def on_message(h: Handle, kind: str, payload: Any) -> None:
@@ -2418,7 +2431,7 @@ async def ctl_kill(url: str, cfg: dict[str, Any], workers: int, kill: str) -> Ou
 
     async with Measured(url) as m:
         normal = spawn(
-            url, "runs", "main", workers, {"keys": normal_keys, "billing": True, "notify": False}
+            url, "runs", "main", workers, {"keys": normal_keys, "billing": True, "live": False}
         )
         allh = normal + doomed
         try:
@@ -2509,7 +2522,27 @@ async def ctl_kill(url: str, cfg: dict[str, Any], workers: int, kill: str) -> Ou
     return out
 
 
-async def ctl_followers(url: str, cfg: dict[str, Any], workers: int, notify: bool) -> Outcome:
+def check_live_hint_delivery(out: Outcome, *, workers: int, enabled: bool) -> None:
+    """Require timely hints and bounded native transport connections when enabled."""
+    if not enabled:
+        return
+    p95 = out.metrics["trickle_delivery_lag_ms"].get("p95_ms", math.inf)
+    out.check(
+        "live-hint delivery trickle p95 within 1,000 ms",
+        p95 <= LIVE_HINT_DELIVERY_P95_MS,
+        p95,
+        LIVE_HINT_DELIVERY_P95_MS,
+    )
+    peak = out.metrics["server"]["peak_connections_by_role"].get("dendrux-live-updates", 0)
+    out.check(
+        "live-hint transport peak connections above zero and at most two per worker",
+        0 < peak <= 2 * workers,
+        peak,
+        2 * workers,
+    )
+
+
+async def ctl_followers(url: str, cfg: dict[str, Any], workers: int, live: bool) -> Outcome:
     out = Outcome()
     n = cfg["followers_runs"]
     f = cfg["followers_per_run"]
@@ -2520,7 +2553,7 @@ async def ctl_followers(url: str, cfg: dict[str, Any], workers: int, notify: boo
             "followers",
             "main",
             workers,
-            {"runs": n, "followers": f, "notify": notify, "idle_s": cfg["idle_s"]},
+            {"runs": n, "followers": f, "live": live, "idle_s": cfg["idle_s"]},
             timeout=3600,
             measured=m,
         )
@@ -2544,7 +2577,7 @@ async def ctl_followers(url: str, cfg: dict[str, Any], workers: int, notify: boo
         "runs": n,
         "followers": total_followers,
         "followers_per_run": f,
-        "notifier": notify,
+        "live_updates": live,
         "create_statements": create_stmts,
         "attach_statements": attach_stmts,
         "attach_statements_per_follower": round(attach_stmts / total_followers, 2),
@@ -2594,7 +2627,8 @@ async def ctl_followers(url: str, cfg: dict[str, Any], workers: int, notify: boo
         metrics["followers_open_after_close"],
         0,
     )
-    key = "followers_on" if notify else "followers_off"
+    check_live_hint_delivery(out, workers=workers, enabled=live)
+    key = "followers_on" if live else "followers_off"
     out.gates[f"{key}.attach_statements_per_follower"] = metrics["attach_statements_per_follower"]
     return out
 
@@ -2825,7 +2859,7 @@ async def ctl_memory(url: str, cfg: dict[str, Any], workers: int) -> Outcome:
         )[0]
     cycles = h.result["cycles"]
     if m.sampler.mysql:
-        out.notes.append("Postgres NOTIFY followers skipped in MySQL/MariaDB memory cycles")
+        out.notes.append("Postgres live-updates followers skipped in MySQL/MariaDB memory cycles")
     out.samples = {}
     warm = min(5, max(1, len(cycles) // 3))
     series = [c["rss_kb"] / 1024 for c in cycles]
@@ -3114,7 +3148,7 @@ def render(name: str, o: Outcome) -> list[str]:
         lines += fmt_table(
             ["variant", "startup", "iter 1", "iter 2", "terminal", "max non-terminal"], rows
         )
-        selected = "notify_on_batch" if "notify_on_batch" in m["variants"] else "notify_off_batch"
+        selected = "live_on_batch" if "live_on_batch" in m["variants"] else "live_off_batch"
         best = m["variants"][selected]["by_operation_iteration_2"]
         lines.append(f"statements by store operation, iteration 2, {selected}:")
         lines += ["  " + f"{k}: {v}" for k, v in sorted(best.items())]
@@ -3303,9 +3337,10 @@ def render(name: str, o: Outcome) -> list[str]:
 
 
 def load_baseline(path: Path | None) -> dict[str, Any]:
-    if path and path.exists():
-        return json.loads(path.read_text())
-    return {}
+    """Read a baseline using its recorded gate names."""
+    if not (path and path.exists()):
+        return {}
+    return json.loads(path.read_text())
 
 
 def compare_gates(
@@ -3378,19 +3413,19 @@ def scenario_jobs(
     for name in wanted:
         if mysql and name in {"followers_on", "followers_off"}:
             notes.append(
-                f"{name} skipped: Postgres NOTIFY/follower bookkeeping "
+                f"{name} skipped: Postgres live updates/follower bookkeeping "
                 "is unavailable on MySQL/MariaDB"
             )
             continue
         if name == "a":
-            jobs.append(("a_notify_off", lambda: ctl_a(url, cfg, workers, False)))
+            jobs.append(("a_live_off", lambda: ctl_a(url, cfg, workers, False)))
             jobs.append(("a_shared_agent", lambda: ctl_a(url, cfg, workers, False, True)))
             if not legacy and not mysql:
-                jobs.append(("a_notify_on", lambda: ctl_a(url, cfg, workers, True)))
+                jobs.append(("a_live_on", lambda: ctl_a(url, cfg, workers, True)))
         else:
             jobs.append((name, drivers[name]))
     if mysql and "a" in wanted:
-        notes.append("a_notify_on skipped: MySQL/MariaDB has no Postgres NOTIFY")
+        notes.append("a_live_on skipped: MySQL/MariaDB has no Postgres live updates")
     return jobs, notes
 
 
@@ -3426,8 +3461,8 @@ def mysql_budget_keys(scenarios: list[str]) -> set[str]:
     """List the statement gates emitted by supported MySQL workload variants."""
     keys: set[str] = set()
     mapping = {
-        "a": {"a_notify_off.statements_per_run", "a_shared_agent.statements_per_run"},
-        "iteration": {"iteration.notify_off_batch", "iteration.notify_off_stream"},
+        "a": {"a_live_off.statements_per_run", "a_shared_agent.statements_per_run"},
+        "iteration": {"iteration.live_off_batch", "iteration.live_off_stream"},
         "runs": {"runs.statements_per_run"},
         "kill_checkpoint": {"kill_checkpoint.statements_per_run_including_recovery"},
         "kill_inflight": {"kill_inflight.statements_per_run_including_recovery"},
@@ -3544,7 +3579,7 @@ async def run_all(args: argparse.Namespace) -> int:
     compare_gates({}, baseline, scale=args.scale)  # validate before resetting any database
     preflight = make_engine(url, "preflight")
     try:
-        make_store(preflight, notify=False)  # track B absence refuses before schema writes
+        make_store(preflight, live=False)  # track B absence refuses before schema writes
     finally:
         await preflight.dispose()
     await reset_db(url)  # creates the private database when it is missing
@@ -3577,7 +3612,7 @@ async def run_all(args: argparse.Namespace) -> int:
     log(f"database: {results['meta']['server']['version'][:60]}")
     outcomes: dict[str, Outcome] = {}
     explain_for = {
-        "a_notify_off",
+        "a_live_off",
         "iteration",
         "runs",
         "kill_checkpoint",
@@ -3674,7 +3709,7 @@ async def run_all(args: argparse.Namespace) -> int:
     for name, o in outcomes.items():
         results["checks"].extend({**c, "name": f"{name}: {c['name']}"} for c in o.checks)
     conn_ceiling = POOL_CEILING * args.workers
-    for name in ("a_notify_off", "runs"):
+    for name in ("a_live_off", "runs"):
         if name in outcomes:
             srv = outcomes[name].metrics["server"]
             by_role = srv["peak_connections_by_role"]

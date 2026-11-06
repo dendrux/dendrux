@@ -36,6 +36,7 @@ async def run_scrape(url: str) -> str:
         name="ScrapeAgent",
         provider=AnthropicProvider(model="claude-sonnet-4-6"),
         database_url=DB_URL,
+        strict_tenancy=False,  # single-tenant demo (see Multi-tenancy docs)
         prompt=SCRAPE_PROMPT,
         tools=[firecrawl_scrape],
     ) as agent:

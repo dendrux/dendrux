@@ -18,8 +18,8 @@ from dendrux.llm._retry_telemetry import (
     begin_call_attempt_tracking,
     call_attempt_tracking,
     end_call_attempt_tracking,
-    make_telemetry_http_client,
     telemetry_context,
+    telemetry_event_hooks,
 )
 from dendrux.loops._helpers import governance_sinks
 from dendrux.loops.base import BaseRecorder
@@ -67,7 +67,10 @@ async def test_hook_emits_retry_event_on_retryable_failure() -> None:
     recorder = _CapturingRecorder()
     notifier = _CapturingNotifier()
 
-    client = make_telemetry_http_client(httpx.Timeout(10.0), RETRYABLE_HTTP_STATUSES)
+    client = httpx.AsyncClient(
+        timeout=httpx.Timeout(10.0),
+        event_hooks=telemetry_event_hooks(RETRYABLE_HTTP_STATUSES),
+    )
     client._transport = _seq_transport(503)  # type: ignore[attr-defined]
 
     with (
@@ -100,7 +103,10 @@ async def test_hook_emits_retry_event_on_retryable_failure() -> None:
 async def test_hook_counts_attempts_within_one_logical_call() -> None:
     recorder = _CapturingRecorder()
 
-    client = make_telemetry_http_client(httpx.Timeout(10.0), RETRYABLE_HTTP_STATUSES)
+    client = httpx.AsyncClient(
+        timeout=httpx.Timeout(10.0),
+        event_hooks=telemetry_event_hooks(RETRYABLE_HTTP_STATUSES),
+    )
     client._transport = _seq_transport(503, 429, 200)  # type: ignore[attr-defined]
 
     with (
@@ -130,7 +136,10 @@ async def test_hook_counts_attempts_within_one_logical_call() -> None:
 async def test_attempt_counter_resets_between_calls() -> None:
     recorder = _CapturingRecorder()
 
-    client = make_telemetry_http_client(httpx.Timeout(10.0), RETRYABLE_HTTP_STATUSES)
+    client = httpx.AsyncClient(
+        timeout=httpx.Timeout(10.0),
+        event_hooks=telemetry_event_hooks(RETRYABLE_HTTP_STATUSES),
+    )
     client._transport = _seq_transport(503, 503, 503, 503)  # type: ignore[attr-defined]
 
     with telemetry_context(
@@ -155,7 +164,10 @@ async def test_attempt_counter_resets_between_calls() -> None:
 async def test_non_retryable_status_codes_do_not_emit() -> None:
     recorder = _CapturingRecorder()
 
-    client = make_telemetry_http_client(httpx.Timeout(10.0), RETRYABLE_HTTP_STATUSES)
+    client = httpx.AsyncClient(
+        timeout=httpx.Timeout(10.0),
+        event_hooks=telemetry_event_hooks(RETRYABLE_HTTP_STATUSES),
+    )
     # 401 is auth; 404 is wrong model — neither is a transient retryable.
     client._transport = _seq_transport(401, 404, 422)  # type: ignore[attr-defined]
 
@@ -177,7 +189,10 @@ async def test_non_retryable_status_codes_do_not_emit() -> None:
 @pytest.mark.asyncio
 async def test_hook_silent_when_no_telemetry_context() -> None:
     """Hook fires but skips emission — no recorder, no notifier."""
-    client = make_telemetry_http_client(httpx.Timeout(10.0), RETRYABLE_HTTP_STATUSES)
+    client = httpx.AsyncClient(
+        timeout=httpx.Timeout(10.0),
+        event_hooks=telemetry_event_hooks(RETRYABLE_HTTP_STATUSES),
+    )
     client._transport = _seq_transport(503)  # type: ignore[attr-defined]
 
     # No context manager around the call — contextvars are at default
@@ -204,7 +219,10 @@ async def test_recorder_failure_is_swallowed_not_propagated() -> None:
         async def on_llm_call_completed(self, *a: Any, **k: Any) -> None: ...
         async def on_tool_completed(self, *a: Any, **k: Any) -> None: ...
 
-    client = make_telemetry_http_client(httpx.Timeout(10.0), RETRYABLE_HTTP_STATUSES)
+    client = httpx.AsyncClient(
+        timeout=httpx.Timeout(10.0),
+        event_hooks=telemetry_event_hooks(RETRYABLE_HTTP_STATUSES),
+    )
     client._transport = _seq_transport(503)  # type: ignore[attr-defined]
 
     with (
@@ -224,7 +242,10 @@ async def test_recorder_failure_is_swallowed_not_propagated() -> None:
 async def test_token_based_call_tracking_resets_correctly() -> None:
     recorder = _CapturingRecorder()
 
-    client = make_telemetry_http_client(httpx.Timeout(10.0), RETRYABLE_HTTP_STATUSES)
+    client = httpx.AsyncClient(
+        timeout=httpx.Timeout(10.0),
+        event_hooks=telemetry_event_hooks(RETRYABLE_HTTP_STATUSES),
+    )
     client._transport = _seq_transport(503, 503)  # type: ignore[attr-defined]
 
     with telemetry_context(

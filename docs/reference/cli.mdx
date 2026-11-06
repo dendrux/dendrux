@@ -11,14 +11,18 @@ The commands run on PostgreSQL, SQLite, MySQL and MariaDB. The sections below sa
 
 | Command | Purpose |
 | --- | --- |
-| `dendrux db migrate` | Apply Alembic migrations through this package's head. On MySQL and MariaDB it builds the current schema on an empty database |
+| `dendrux db migrate` | Apply Alembic migrations through this package's head. New PostgreSQL databases come up active at format 2. On MySQL and MariaDB it builds an active schema on an empty database |
 | `dendrux db check` | Read-only revision and structure check: exit 0 current, 1 behind, 2 unknown or unstamped |
 | `dendrux db check --allow-unstamped` | Check the expected structure when no revision is stamped |
 | `dendrux db status` | Print `revision`, `storage_format` and `activate_step` |
 | `dendrux db activate` | Check, deduplicate, build uniqueness and enable format 2 for new runs |
 | `dendrux db dedupe` | Remove identical duplicates without enabling format 2 |
 
-## Migrate and activate are separate
+## Migrate and activate
+
+On PostgreSQL, `dendrux db migrate` activates a new database automatically using the same activation path as `dendrux db activate`. New means no `alembic_version` table and none of the Dendrux tables before upgrade; unrelated application tables are allowed. Existing databases stay at format 1 until explicit activation, even if there are zero runs or the schema is already at head. An already active database stays active.
+
+If migration succeeds but activation fails or the process stops between them, a rerun treats the schema as existing and leaves it at format 1. Whenever PostgreSQL migration finishes at format 1, the command tells you to run `dendrux db activate` once every worker and reader is upgraded.
 
 Run migration once per deployment, over a direct database connection (not through a transaction-mode pooler). The 0.6 migration adds storage but leaves a database migrated from 0.5 at format 1. Roll every worker and reader to 0.6 before activation. Take a pre-activation backup. Follow the full [upgrade procedure](/docs/upgrading-to-0.6.0).
 

@@ -26,8 +26,9 @@ pytestmark = pytest.mark.asyncio
 
 
 @pytest.fixture
-def run_store(engine: Any) -> RunStore:
-    return RunStore.from_engine(engine)
+async def run_store(engine: Any) -> Any:
+    async with RunStore.from_engine(engine) as reader:
+        yield reader
 
 
 # ---------------------------------------------------------------------------
@@ -149,7 +150,7 @@ async def test_client_tools_flow_with_defaults(store: Any, run_store: RunStore) 
     pending = await run_store.get_pending(paused.run_id, tenant_id=None)
     call = pending.tool_calls[0]
     assert call.params == {"sheet": "S1"}
-    events = await run_store.get_events(paused.run_id, tenant_id=None)
+    events = await run_store.get_events(paused.run_id, tenant_id=None, limit=1000)
     active = next(e for e in events if e.event_type == "run.paused")
     view = await run_store.get_event_view(paused.run_id, active, tenant_id=None)
     assert view.data["pending_tool_calls"][0]["params"] == {"sheet": "S1"}
@@ -163,7 +164,7 @@ async def test_client_tools_flow_with_defaults(store: Any, run_store: RunStore) 
         tenant_id=None,
     )
     assert result.status.value == "success"
-    events = await run_store.get_events(paused.run_id, tenant_id=None)
+    events = await run_store.get_events(paused.run_id, tenant_id=None, limit=1000)
     past = next(e for e in events if e.event_type == "run.paused")
     view = await run_store.get_event_view(paused.run_id, past, tenant_id=None)
     assert "params" not in view.data["pending_tool_calls"][0]
@@ -217,7 +218,7 @@ async def test_many_followers_one_poller(store: Any, run_store: RunStore, monkey
     n_followers, n_events = 60, 30
     release_head = asyncio.Event()
     slots_ready, registered, polled = asyncio.Event(), asyncio.Event(), asyncio.Event()
-    original_acquire, original_add = feed._acquire, _follow._RunFeed.add
+    original_acquire, original_add = feed._acquire, _follow._WatchedRun.add
 
     def acquire(*args: Any):
         original_acquire(*args)
@@ -231,7 +232,7 @@ async def test_many_followers_one_poller(store: Any, run_store: RunStore, monkey
         return head
 
     monkeypatch.setattr(feed, "_acquire", acquire)
-    monkeypatch.setattr(_follow._RunFeed, "add", add)
+    monkeypatch.setattr(_follow._WatchedRun, "add", add)
     original_head = _follow._current_head
 
     async def slow_head(*args):
@@ -248,6 +249,15 @@ async def test_many_followers_one_poller(store: Any, run_store: RunStore, monkey
         return await original(run_id, **kw)
 
     run_store.get_events = counting  # type: ignore[method-assign]
+    batched = getattr(run_store._state, "get_events_for_runs", None)
+    if batched is not None:  # a store with batched reads: the coordinator uses those
+
+        async def counting_batched(*args: Any, **kw: Any) -> Any:
+            polls["n"] += 1
+            polled.set()
+            return await batched(*args, **kw)
+
+        run_store._state.get_events_for_runs = counting_batched
 
     async def follower() -> list[Any]:
         async with feed.follow("r1", tenant_id="T") as f:
@@ -330,7 +340,7 @@ async def test_pii_approval_pause_never_shows_real_values(store: Any, run_store:
     assert (await store.get_pause_state(run_id))["pending_tool_calls"][0]["params"]["to"] == real
 
     # Developer-owned read route recipe: get_events -> redact_event(active_pause=True).
-    raw_events = await run_store.get_events(run_id, tenant_id="acme")
+    raw_events = await run_store.get_events(run_id, tenant_id="acme", limit=1000)
     raw_pause = next(event for event in raw_events if event.event_type == "run.paused")
     assert real in json.dumps(raw_pause.data)
     recipe_view = redact_event(raw_pause, active_pause=True)
@@ -448,7 +458,7 @@ async def test_pause_display_uses_recorded_args_on_every_path(
     assert pending.tool_calls[0].params == expected
     assert pending.tool_calls[0].args_hidden == (expected is None)
     for payloads in (False, True):
-        events = await run_store.get_events("display", tenant_id="T")
+        events = await run_store.get_events("display", tenant_id="T", limit=1000)
         view = await run_store.get_event_view(
             "display", events[-1], tenant_id="T", include_payloads=payloads
         )

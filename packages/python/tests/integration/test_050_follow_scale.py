@@ -115,14 +115,14 @@ def _counted_statements(engine: Any) -> Iterator[collections.Counter[str]]:
     """Statements the followers issue, by bucket.
 
     ``follower`` holds each follower's own work (scope check, event pages,
-    argument pages); every shared reader has its own bucket. The run's live
-    poller (a named task) is not counted: its work grows with elapsed time.
+    argument pages); every shared reader has its own bucket. The store's
+    coordinator (a named task) is not counted: its work grows with elapsed time.
     """
     counts: collections.Counter[str] = collections.Counter()
 
     def on_execute(*_a: Any) -> None:
         task = asyncio.current_task()
-        if task is not None and task.get_name().startswith("dendrux-run-feed:"):
+        if task is not None and task.get_name().startswith("dendrux-follow-coordinator"):
             return
         counts[_reader.get() or _FOLLOWER] += 1
 
@@ -161,8 +161,9 @@ async def _statements_for(
     return counts
 
 
-async def test_backfill_cost_per_follower_is_flat(store: Any, engine: Any) -> None:
-    run_store = RunStore.from_engine(engine)
+async def test_backfill_cost_per_follower_is_flat(
+    run_store: RunStore, store: Any, engine: Any
+) -> None:
     small = await _run_with_pauses(store, 1)
     large = await _run_with_pauses(store, 6)
     followers = 20
@@ -201,8 +202,9 @@ async def _paused_run(store: Any, tenant: str | None) -> str:
     return (await agent.run("go", tenant_id=tenant)).run_id
 
 
-async def test_one_tenant_cannot_take_every_slot(store: Any, engine: Any) -> None:
-    run_store = RunStore.from_engine(engine)
+async def test_one_tenant_cannot_take_every_slot(
+    run_store: RunStore, store: Any, engine: Any
+) -> None:
     run_a = await _paused_run(store, "A")
     run_b = await _paused_run(store, "B")
     feed = EventFeed(run_store, max_followers=10, max_followers_per_tenant=4)
@@ -239,11 +241,10 @@ async def test_default_cap_is_a_fifth_of_the_feed() -> None:
 
 @pytest.mark.parametrize("scope", [None, UNSCOPED], ids=["untenanted", "unscoped"])
 async def test_untenanted_and_unscoped_scopes_are_capped_like_a_tenant(
-    store: Any, engine: Any, scope: Any
+    run_store: RunStore, store: Any, engine: Any, scope: Any
 ) -> None:
     """The cap is per scope: ``None`` (every user of a single-tenant app) and
     ``UNSCOPED`` are each one scope, so they cannot take every slot either."""
-    run_store = RunStore.from_engine(engine)
     run_none = await _paused_run(store, None)
     run_b = await _paused_run(store, "B")
     feed = EventFeed(run_store, max_followers=10, max_followers_per_tenant=4)
@@ -265,9 +266,10 @@ async def test_untenanted_and_unscoped_scopes_are_capped_like_a_tenant(
     assert feed.followers == 0 and feed._by_scope == {}
 
 
-async def test_single_tenant_apps_keep_an_override(store: Any, engine: Any) -> None:
+async def test_single_tenant_apps_keep_an_override(
+    run_store: RunStore, store: Any, engine: Any
+) -> None:
     """``max_followers_per_tenant=None`` lets one scope use the whole feed again."""
-    run_store = RunStore.from_engine(engine)
     run_none = await _paused_run(store, None)
     feed = EventFeed(run_store, max_followers=6, max_followers_per_tenant=None)
     held = []
@@ -284,10 +286,11 @@ async def test_single_tenant_apps_keep_an_override(store: Any, engine: Any) -> N
             await f.aclose()
 
 
-async def test_concurrent_untenanted_flood_leaves_room_for_tenants(store: Any, engine: Any) -> None:
+async def test_concurrent_untenanted_flood_leaves_room_for_tenants(
+    run_store: RunStore, store: Any, engine: Any
+) -> None:
     """60 untenanted followers start at once: exactly the cap (20) get a slot,
     the rest fail with the per-scope error, and tenant B still gets in."""
-    run_store = RunStore.from_engine(engine)
     run_none = await _paused_run(store, None)
     run_b = await _paused_run(store, "B")
     feed = EventFeed(run_store, max_followers=100, max_followers_per_tenant=20)
@@ -335,10 +338,11 @@ async def _many_approval_pauses(store: Any, pauses: int) -> str:
     return run_id
 
 
-async def test_trusted_backfill_reads_past_arguments_in_pages(store: Any, engine: Any) -> None:
+async def test_trusted_backfill_reads_past_arguments_in_pages(
+    run_store: RunStore, store: Any, engine: Any
+) -> None:
     pauses, followers = 300, 5
     run_id = await _many_approval_pauses(store, pauses)
-    run_store = RunStore.from_engine(engine)
     feed = EventFeed(run_store, poll_interval_s=0.01, poll_max_s=0.02, heartbeat_s=5.0)
 
     async def one() -> dict[int, Any]:
@@ -380,8 +384,9 @@ def _counts(feed: EventFeed) -> tuple[int, dict[Any, int]]:
     return feed.followers, dict(feed._by_scope)
 
 
-async def test_concurrent_starts_on_one_follow_take_one_slot(store: Any, engine: Any) -> None:
-    run_store = RunStore.from_engine(engine)
+async def test_concurrent_starts_on_one_follow_take_one_slot(
+    run_store: RunStore, store: Any, engine: Any
+) -> None:
     run_none = await _paused_run(store, None)
     feed = EventFeed(run_store, max_followers=10, max_followers_per_tenant=5)
     follow = feed.follow(run_none, tenant_id=None)
@@ -391,8 +396,9 @@ async def test_concurrent_starts_on_one_follow_take_one_slot(store: Any, engine:
     assert _counts(feed) == (0, {})
 
 
-async def test_close_during_an_in_flight_start_takes_no_slot(store: Any, engine: Any) -> None:
-    run_store = RunStore.from_engine(engine)
+async def test_close_during_an_in_flight_start_takes_no_slot(
+    run_store: RunStore, store: Any, engine: Any
+) -> None:
     run_none = await _paused_run(store, None)
     feed = EventFeed(run_store, max_followers=10)
     gate, entered = asyncio.Event(), asyncio.Event()
@@ -415,8 +421,9 @@ async def test_close_during_an_in_flight_start_takes_no_slot(store: Any, engine:
     assert _counts(feed) == (0, {})
 
 
-async def test_close_after_start_releases_the_slot(store: Any, engine: Any) -> None:
-    run_store = RunStore.from_engine(engine)
+async def test_close_after_start_releases_the_slot(
+    run_store: RunStore, store: Any, engine: Any
+) -> None:
     run_t = await _paused_run(store, "T")
     feed = EventFeed(run_store, max_followers=10)
     follow = feed.follow(run_t, tenant_id="T")
@@ -426,12 +433,75 @@ async def test_close_after_start_releases_the_slot(store: Any, engine: Any) -> N
     assert _counts(feed) == (0, {})
 
 
-async def test_random_start_close_interleavings_never_leak(store: Any, engine: Any) -> None:
+@pytest.mark.parametrize("followers", [1, 8])
+async def test_reader_close_drains_read_after_last_follower_closes(
+    run_store: RunStore, store: Any, engine: Any, monkeypatch: pytest.MonkeyPatch, followers: int
+) -> None:
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    entered, cancelling, release, finished = (asyncio.Event() for _ in range(4))
+    execute = AsyncSession.execute
+
+    async def held_read(session: Any, *args: Any, **kwargs: Any) -> Any:
+        result = await execute(session, *args, **kwargs)
+        task = asyncio.current_task()
+        if task is not None and task.get_name() == "dendrux-follow-coordinator":
+            entered.set()  # a real query ran; the session still owns its connection
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelling.set()
+                await release.wait()
+                finished.set()
+        return result
+
+    run_id = await _paused_run(store, "T")
+    monkeypatch.setattr(AsyncSession, "execute", held_read)
+    ready = asyncio.Event()
+    main = run_store._follow_coordinator()._main
+
+    async def after_starts() -> None:
+        await ready.wait()
+        await main()
+
+    monkeypatch.setattr(run_store._follow_coordinator(), "_main", after_starts)
+    feed = EventFeed(run_store, max_followers_per_tenant=None)
+    follows = [feed.follow(run_id, tenant_id="T") for _ in range(followers)]
+    closing = None
+    try:
+        # All starts precede the gated read, including on single-connection SQLite.
+        await asyncio.gather(*(follow.start() for follow in follows))
+        ready.set()
+        await asyncio.wait_for(entered.wait(), 10)
+        coordinator = run_store._follow_coordinator()._task
+        assert coordinator is not None
+        await asyncio.gather(*(follow.aclose() for follow in follows))
+        assert feed.followers == 0
+        closing = asyncio.create_task(run_store.close())
+        await asyncio.wait_for(cancelling.wait(), 10)
+        assert not closing.done() and not finished.is_set()
+        release.set()
+        await asyncio.wait_for(closing, 10)
+        assert coordinator.done() and finished.is_set()
+        # The caller-owned engine remains usable, with no coordinator holding it.
+        async with engine.connect() as connection:
+            assert await connection.scalar(text("SELECT 1")) == 1
+    finally:
+        release.set()
+        await asyncio.gather(*(follow.aclose() for follow in follows))
+        await run_store.close()
+        if closing is not None:
+            await closing
+
+
+async def test_random_start_close_interleavings_never_leak(
+    run_store: RunStore, store: Any, engine: Any
+) -> None:
     """200 random start/aclose interleavings over shared Follow objects: the
     global and per-scope counters never exceed their caps and return to 0."""
     import random
 
-    run_store = RunStore.from_engine(engine)
     run_none = await _paused_run(store, None)
     run_t = await _paused_run(store, "T")
     rng = random.Random(1234)

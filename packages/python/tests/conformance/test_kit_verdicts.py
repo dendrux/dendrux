@@ -275,42 +275,6 @@ def test_a_missing_factory_prints_one_setup_message_not_one_failure_per_contract
     assert result.ret != 0
 
 
-# -- a store that declares notify ------------------------------------------------------------
-
-DECLARES_NOTIFY = """
-def mutate(store):
-    from dataclasses import replace
-    store.capabilities = replace(store.capabilities, notify=True)
-    return store
-"""
-IMPLEMENTS_NOTIFY = """
-def mutate(store):
-    from dataclasses import replace
-    base = type(store)
-
-    class Notifying(base):
-        async def _after_event_insert(self, session, run_id):
-            return None
-
-    store.__class__ = Notifying
-    store.capabilities = replace(store.capabilities, notify=True)
-    return store
-"""
-
-
-def test_a_store_that_declares_notify_without_implementing_it_fails(pytester: Pytester) -> None:
-    result = run_kit(pytester, mutation=DECLARES_NOTIFY, k="notify")
-    text = result.stdout.str()
-    assert failed_functions(result) == {"test_declared_notify_is_implemented"}, text[-2000:]
-    assert "_after_event_insert" in text and "notify=False" in text
-
-
-def test_a_store_that_implements_the_notify_hook_passes_that_check(pytester: Pytester) -> None:
-    result = run_kit(pytester, mutation=IMPLEMENTS_NOTIFY, k="notify")
-    assert failed_functions(result) == set(), result.stdout.str()[-2000:]
-    assert result.parseoutcomes().get("passed", 0) == 1
-
-
 # -- distinct implementations with one class name -------------------------------------------
 
 TWO_STORES_ONE_NAME = """

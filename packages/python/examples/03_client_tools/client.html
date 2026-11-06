@@ -70,7 +70,9 @@ el("submit").onclick = () => action(async () => {
   const results = currentPause.pending_tool_calls.map(call => ({
     tool_call_id: call.id, tool_name: call.name, payload: JSON.stringify(el("result").value),
   }));
-  await showResult(await api(`/runs/${encodeURIComponent(runId)}/tool-results`, {results}));
+  await showResult(await api(`/runs/${encodeURIComponent(runId)}/tool-results`, {
+    results, expected_pause_id: currentPause.pause_id,
+  }));
 });
 
 </script>

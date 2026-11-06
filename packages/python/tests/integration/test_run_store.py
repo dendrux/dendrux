@@ -262,7 +262,7 @@ class TestGetEvents:
         await internal_store.save_run_event("r1", event_type="llm.completed")
         await internal_store.save_run_event("r1", event_type="run.completed")
 
-        events = await store.get_events("r1")
+        events = await store.get_events("r1", limit=1000)
         assert len(events) == 3
         assert all(isinstance(e, StoredEvent) for e in events)
         assert [e.sequence_index for e in events] == [0, 1, 2]
@@ -273,11 +273,11 @@ class TestGetEvents:
         for _i in range(5):
             await internal_store.save_run_event("r1", event_type="tick")
 
-        rest = await store.get_events("r1", after_sequence_index=2)
+        rest = await store.get_events("r1", after_sequence_index=2, limit=1000)
         assert [e.sequence_index for e in rest] == [3, 4]
 
     async def test_unknown_run_returns_empty(self, store) -> None:
-        assert await store.get_events("missing") == []
+        assert await store.get_events("missing", limit=1000) == []
 
 
 # ------------------------------------------------------------------
@@ -296,10 +296,10 @@ class TestStreamEvents:
                 RunEvent(id="e1", agent_run_id="r1", event_type="run.completed", sequence_index=0)
             )
             await writer.flush()
-            assert await store.get_events("r1") == []
+            assert await store.get_events("r1", limit=1000) == []
             await writer.commit()
 
-        assert [e.event_type for e in await store.get_events("r1")] == ["run.completed"]
+        assert [e.event_type for e in await store.get_events("r1", limit=1000)] == ["run.completed"]
 
     async def test_yields_existing_then_new(self, store, internal_store) -> None:
         await internal_store.create_run("r1", "Agent")
@@ -390,7 +390,7 @@ class TestGetLLMCalls:
             duration_ms=250,
         )
 
-        calls = await store.get_llm_calls("r1")
+        calls = await store.get_llm_calls("r1", limit=1000)
         assert len(calls) == 1
         call = calls[0]
         assert isinstance(call, LLMCall)
@@ -411,7 +411,7 @@ class TestGetLLMCalls:
                 usage=UsageStats(input_tokens=1, output_tokens=1, total_tokens=2),
             )
 
-        only = await store.get_llm_calls("r1", iteration=1)
+        only = await store.get_llm_calls("r1", iteration=1, limit=1000)
         assert len(only) == 1
         assert only[0].iteration == 1
 
@@ -444,8 +444,8 @@ class TestGetLLMCalls:
             correlation_id="01JJOINKEYLLMINTERACTION00",
         )
 
-        call = (await store.get_llm_calls("r1"))[0]
-        events = await store.get_events("r1")
+        call = (await store.get_llm_calls("r1", limit=1000))[0]
+        events = await store.get_events("r1", limit=1000)
         completed = [e for e in events if e.event_type == "llm.completed"]
 
         assert call.id == "01JJOINKEYLLMINTERACTION00"
@@ -474,7 +474,7 @@ class TestGetToolInvocations:
             iteration_index=0,
         )
 
-        tools = await store.get_tool_invocations("r1")
+        tools = await store.get_tool_invocations("r1", limit=1000)
         assert len(tools) == 1
         tool = tools[0]
         assert isinstance(tool, ToolInvocation)
@@ -500,7 +500,7 @@ class TestGetToolInvocations:
                 iteration_index=i,
             )
 
-        only = await store.get_tool_invocations("r1", iteration=1)
+        only = await store.get_tool_invocations("r1", iteration=1, limit=1000)
         assert len(only) == 1
         assert only[0].iteration == 1
 
@@ -539,15 +539,15 @@ class TestGetTraces:
             "r1", "tool", '{"result": 42}', order_index=2, meta={"call_id": "c1"}
         )
 
-        traces = await store.get_traces("r1")
+        traces = await store.get_traces("r1", limit=1000)
         assert len(traces) == 3
         assert all(isinstance(t, TraceEntry) for t in traces)
         assert [t.role for t in traces] == ["user", "assistant", "tool"]
-        assert [t.order_index for t in traces] == [0, 1000, 2000]
+        assert [t.order_index for t in traces] == [0, 1, 2]
         assert traces[2].meta == {"call_id": "c1"}
 
     async def test_unknown_run_returns_empty(self, store) -> None:
-        assert await store.get_traces("missing") == []
+        assert await store.get_traces("missing", limit=1000) == []
 
     async def test_sql_pagination(self, store, internal_store) -> None:
         """limit/offset push to SQL — ordered by order_index."""
@@ -558,7 +558,7 @@ class TestGetTraces:
             )
 
         page = await store.get_traces("r1", limit=2, offset=1)
-        assert [t.order_index for t in page] == [1000, 2000]
+        assert [t.order_index for t in page] == [1, 2]
 
 
 # ------------------------------------------------------------------

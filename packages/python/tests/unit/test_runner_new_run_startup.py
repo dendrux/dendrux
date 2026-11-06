@@ -90,8 +90,8 @@ async def test_partial_startup_failure(store, monkeypatch, entry, site):
         return result
 
     monkeypatch.setattr(store, "create_run", creating)
-    finalize = AsyncMock(wraps=store.finalize_run)
-    monkeypatch.setattr(store, "finalize_run", finalize)
+    finalize = AsyncMock(wraps=store.finalize_with_event)
+    monkeypatch.setattr(store, "finalize_with_event", finalize)
     recorder_failed = AsyncMock()
     monkeypatch.setattr(PersistenceRecorder, "on_run_failed", recorder_failed)
     if site == "recorder":
@@ -124,7 +124,7 @@ async def test_partial_startup_failure(store, monkeypatch, entry, site):
         assert row.status == "running" and names == []
     else:
         finalize.assert_awaited_once()
-        assert finalize.await_args.kwargs["expected_current_status"] == "running"
+        assert finalize.await_args.kwargs["allowed_current_statuses"] == ["running"]
         assert finalize.await_args.kwargs["total_usage"] is None
         assert row.status == RunStatus.ERROR.value
         assert names == (["run.started", "run.error"] if site == "recorder_hook" else ["run.error"])

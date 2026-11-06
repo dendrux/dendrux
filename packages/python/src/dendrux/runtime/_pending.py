@@ -123,6 +123,23 @@ class PendingPause:
         }
 
 
+def _clarification_fields(
+    pause: dict[str, Any],
+    last_step: dict[str, Any] | None,
+    kind: PendingKind,
+) -> tuple[str | None, list[str]]:
+    question: str | None = None
+    options: list[str] = []
+    action = (
+        (pause.get("clarification") or (last_step or {}).get("action")) if kind == "input" else None
+    )
+    if isinstance(action, dict) and action.get("type", "clarification") == "clarification":
+        question = action.get("question") if isinstance(action.get("question"), str) else None
+        saved_options = action.get("options")
+        options = [str(o) for o in saved_options] if isinstance(saved_options, list) else []
+    return question, options
+
+
 def _pending_from(
     run_id: str,
     status: str,
@@ -147,12 +164,7 @@ def _pending_from(
                 approval=dict(gate) if isinstance(gate, dict) else None,
             )
         )
-    question: str | None = None
-    options: list[str] = []
-    action = (last_step or {}).get("action") if kind == "input" else None
-    if isinstance(action, dict) and action.get("type") == "clarification":
-        question = action.get("question")
-        options = [str(o) for o in action.get("options") or []]
+    question, options = _clarification_fields(pause, last_step, kind)
     exceeded = pause.get("budget_exceeded")
     return PendingPause(
         run_id=run_id,

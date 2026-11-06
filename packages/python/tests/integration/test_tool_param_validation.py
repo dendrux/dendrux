@@ -42,7 +42,7 @@ async def test_invalid_call_persisted_as_failed_invocation(store):
     result = await agent.run("refund")
 
     assert REFUNDS == []
-    (inv,) = await RunStore(store).get_tool_invocations(result.run_id)
+    (inv,) = await RunStore(store).get_tool_invocations(result.run_id, limit=1000)
     assert inv.success is False
     assert inv.error == "refund argument 'order_id' must be integer, got string."
     assert inv.result == {"error": inv.error, "code": "invalid_params"}
@@ -67,7 +67,7 @@ async def test_invalid_call_is_rejected_before_the_approval_pause(store):
         "argument(s): order_id. Valid arguments: order_id.",
         "code": "invalid_params",
     }
-    (inv,) = await RunStore(store).get_tool_invocations(result.run_id)
+    (inv,) = await RunStore(store).get_tool_invocations(result.run_id, limit=1000)
     assert inv.success is False
     events = [e.event_type for e in await store.get_run_events(result.run_id)]
     assert "tool.started" not in events
@@ -129,7 +129,7 @@ async def test_malformed_call_never_pauses_for_approval(store):
     assert REFUNDS == []
     events = [e.event_type for e in await store.get_run_events(result.run_id)]
     assert "approval.requested" not in events
-    (inv,) = await RunStore(store).get_tool_invocations(result.run_id)
+    (inv,) = await RunStore(store).get_tool_invocations(result.run_id, limit=1000)
     assert inv.result["code"] == "invalid_json"
 
 
@@ -249,7 +249,7 @@ async def test_approved_call_runs_with_objects_built_from_the_approved_json(stor
 
     assert result.status == RunStatus.SUCCESS
     assert [Order(id=7)] == ORDERS
-    (inv,) = await RunStore(store).get_tool_invocations(result.run_id)
+    (inv,) = await RunStore(store).get_tool_invocations(result.run_id, limit=1000)
     assert inv.params == {"order": {"id": 7}}
     assert inv.success is True
 

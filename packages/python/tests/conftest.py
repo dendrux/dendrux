@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import importlib
+import importlib.util
 import logging
 import os
+import pkgutil
+from functools import cache
 from typing import TYPE_CHECKING
 
 import pytest
@@ -14,10 +18,52 @@ from tests._helpers.xdist_pg import worker_scoped_pg_url
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+    from types import ModuleType
 
 os.environ["DENDRUX_STRICT_LOG_FIELDS"] = "1"
 
 _PG_URL_ENV = "DENDRUX_TEST_PG_URL"
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtest_setup(item: pytest.Item) -> None:
+    """Preload before fixtures, including pytester's sys.modules snapshot."""
+    if "pytester" in getattr(item, "fixturenames", ()):
+        _preload_dendrux()
+
+
+@cache
+def _preload_dendrux() -> None:
+    # Restoring sys.modules does not restore package attributes. A lazy import inside
+    # pytester can otherwise leave an old module there and create a second copy later.
+    _preload_package(importlib.import_module("dendrux"))
+
+
+_OPTIONAL_PRELOAD_DEPS = {
+    "dendrux.llm.anthropic": ("anthropic",),
+    "dendrux.llm.openai": ("openai",),
+    "dendrux.llm.openai_responses": ("openai",),
+    "dendrux.mcp": ("mcp", "httpx2", "httpcore2"),
+}
+
+
+def _preload_package(package: ModuleType) -> None:
+    # iter_modules lets us prune before importing a package; walk_packages imports
+    # packages itself, including Alembic's executable migration environment.
+    for info in pkgutil.iter_modules(package.__path__, package.__name__ + "."):
+        if info.name == "dendrux.db.migrations" or info.name.rsplit(".", 1)[-1] == "__main__":
+            continue
+        # Let the inner session register the kit's markers and collect/rewrite its tests.
+        if info.name == "dendrux.testing.store_kit.contracts":
+            continue
+        dependencies = _OPTIONAL_PRELOAD_DEPS.get(info.name, ())
+        if any(importlib.util.find_spec(name) is None for name in dependencies):
+            continue
+        # Only absent, declared optional dependencies are skipped. Broken imports,
+        # including incompatible installed SDKs, must fail the outer test loudly.
+        module = importlib.import_module(info.name)
+        if info.ispkg:
+            _preload_package(module)
 
 
 def pytest_configure(config: pytest.Config) -> None:

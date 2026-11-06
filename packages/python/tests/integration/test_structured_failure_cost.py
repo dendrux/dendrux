@@ -70,7 +70,7 @@ async def test_failed_structured_call_is_recorded_and_priced(store) -> None:
     assert "llm.failed" not in types
     assert types[-1] == "run.error"
 
-    usage = (await RunStore(store).get_subtree(run_id)).usage
+    usage = (await RunStore(store).get_subtree(run_id, max_nodes=10000)).usage
     assert usage.llm_calls == 1
     assert usage.input_tokens == 100
     assert usage.cost_usd == pytest.approx(err.usage.cost_usd)

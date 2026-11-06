@@ -45,7 +45,6 @@ def test_a0_capability_type_is_frozen_and_conservative():
             caps.checkpointing,
             caps.atomic_completion,
             caps.recovery,
-            caps.notify,
         )
     )
     with pytest.raises(FrozenInstanceError):

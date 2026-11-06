@@ -1,4 +1,4 @@
-.PHONY: dev-sync cov-mysql test test-fast test-area test-pg test-kit test-merge test-lists test-shard-proof test-model-check test-model-install test-dbs-up test-dbs-down test-mysql bench load load-quick load-pg load-mysql load-mariadb lint typecheck arch crap cognitive duplicates deadcode cycles semgrep quality quality-stamp api-check format package-smoke ci clean
+.PHONY: dev-sync cov-mysql test test-fast test-area test-pg test-kit test-merge test-lists test-shard-proof test-model-check test-model-install test-dbs-up test-dbs-down test-redis-up test-redis-down test-redis test-mysql bench load load-quick load-pg load-mysql load-mariadb lint typecheck arch crap cognitive duplicates deadcode cycles semgrep quality quality-stamp api-check format package-smoke ci clean
 .DEFAULT_GOAL := test
 
 # Match a fresh CI install: exact dev tools and the newest allowed runtime dependencies.
@@ -142,6 +142,20 @@ test-dbs-up:
 
 test-dbs-down:
 	$(TEST_DBS) down -v
+
+# Redis for the RedisUpdates tests (docker/test-redis.compose.yml, 127.0.0.1:56379). The tests
+# skip cleanly when DENDRUX_TEST_REDIS_URL is unset; GitHub CI runs them on a service container.
+TEST_REDIS = docker compose -f docker/test-redis.compose.yml
+REDIS_TEST_URL ?= redis://127.0.0.1:56379/0
+
+test-redis-up:
+	$(TEST_REDIS) up -d --wait
+
+test-redis-down:
+	$(TEST_REDIS) down -v
+
+test-redis: test-model-check
+	DENDRUX_TEST_REDIS_URL=$(REDIS_TEST_URL) pytest tests/unit/test_redis_updates*.py tests/integration/test_redis_updates*.py -n $(TEST_WORKERS) -rs --no-cov -q
 
 # GitHub CI only (owner decision 2026-11-01: local runs use SQLite and Postgres only).
 # Schema and maintenance suites on MySQL/MariaDB. Needs DENDRUX_TEST_MYSQL_URL and/or

@@ -181,6 +181,10 @@ async def test_message_decision_table(case):
             )
             for i, (c, p) in enumerate(zip(calls, phases, strict=True))
         ]
+        if case == "calls":
+            expected_pending[4], expected_pending[5] = expected_pending[5], expected_pending[4]
+            expected_pending[4]["order_index"] = 15
+            expected_pending[5]["order_index"] = 16
         expected_order, expected_phase = 17, "dispatch"
     elif case == "clarification":
         expected_order, expected_phase = 12, "awaiting_input"
@@ -373,3 +377,27 @@ async def test_loop_source_is_read_after_snapshot_effect_and_before_checkpoint()
     assert store.calls[1][1]["order_index"] == 12
     assert '"question":"after snapshot"' in store.calls[1][1]["content"]
     assert store.calls[2][1]["trace"].order_index == 11
+
+
+def test_observations_follow_durable_slots_after_reconstruction():
+    from dendrux.runtime.state import TraceRecord
+
+    r, _ = recorder()
+    for call_id, order in (("a", 10), ("b", 11), ("c", 12)):
+        r._remember(
+            TraceRecord(
+                id=call_id,
+                role="tool",
+                content=call_id,
+                order_index=order,
+                meta={"call_id": call_id},
+            )
+        )
+    assistant = Message(Role.ASSISTANT, "calls")
+    history = [
+        assistant,
+        *[Message(Role.TOOL, call, call_id=call, name="tool") for call in ("b", "c", "a")],
+    ]
+    r.order_observations(history)
+    assert history[0] is assistant
+    assert [m.call_id for m in history[1:]] == ["a", "b", "c"]

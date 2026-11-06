@@ -82,15 +82,15 @@ def test_rss_measurement_does_not_require_permission_to_spawn_ps(monkeypatch):
 def test_baseline_comparison_fails_only_on_a_regression_over_twenty_percent():
     baseline = {
         "scale": "quick",
-        "gates": {"a.statements_per_run": 100, "iteration.notify_on_batch": 20},
+        "gates": {"a.statements_per_run": 100, "iteration.live_on_batch": 20},
     }
     rows, failed = load.compare_gates(
-        {"a.statements_per_run": 119, "iteration.notify_on_batch": 20}, baseline, scale="quick"
+        {"a.statements_per_run": 119, "iteration.live_on_batch": 20}, baseline, scale="quick"
     )
     assert not failed
     assert [r[-1] for r in rows] == ["ok", "ok"]
     rows, failed = load.compare_gates(
-        {"a.statements_per_run": 121, "iteration.notify_on_batch": 20}, baseline, scale="quick"
+        {"a.statements_per_run": 121, "iteration.live_on_batch": 20}, baseline, scale="quick"
     )
     assert failed
     assert dict((r[0], r[-1]) for r in rows)["a.statements_per_run"] == "FAIL"
@@ -100,11 +100,30 @@ def test_baseline_comparison_fails_only_on_a_regression_over_twenty_percent():
     )[1]
 
 
+def test_baseline_gates_are_read_without_renaming(tmp_path):
+    path = tmp_path / "baseline.json"
+    baseline = {
+        "scale": "quick",
+        "gates": {
+            "a_notify_on.statements_per_run": 83.0,
+            "iteration.notify_off_batch": 18,
+            "a_live_on.statements_per_run": 76.0,
+            "iteration.live_off_batch": 19,
+        },
+    }
+    path.write_text(json.dumps(baseline))
+    assert load.load_baseline(path) == baseline
+    current = {"a_live_on.statements_per_run": 76.0, "iteration.live_off_batch": 19}
+    rows, failed = load.compare_gates(current, load.load_baseline(path), scale="quick")
+    assert not failed
+    assert {r[0] for r in rows} == set(current)
+
+
 def test_committed_baseline_carries_the_gates_and_the_machine():
-    baseline = json.loads((PKG / "tools" / "load_baseline.json").read_text())
+    baseline = load.load_baseline(PKG / "tools" / "load_baseline.json")
     assert baseline["scale"] == "quick"
-    assert "iteration.notify_on_batch" in baseline["gates"]
-    assert baseline["gates"]["iteration.notify_on_batch"] <= 25
+    assert "iteration.live_on_batch" in baseline["gates"]
+    assert baseline["gates"]["iteration.live_on_batch"] <= 25
     recorded = baseline["recorded"]
     assert recorded["machine"] and recorded["cores"] > 0
     # Sandboxed sysctl may be unavailable; keep the raw empty/null values honest.
@@ -192,14 +211,14 @@ def test_a_tiny_load_run_passes_its_checks_on_postgres(tmp_path):
     failed = [c["name"] for c in results["checks"] if not c["ok"]]
     assert not failed, failed
     gates = results["gates"]
-    assert gates["iteration.notify_on_batch"] <= 25
+    assert gates["iteration.live_on_batch"] <= 25
     kill = results["scenarios"]["kill_checkpoint"]["metrics"]
     assert kill["extra_billed_calls"] == 0 and kill["runs_in_killed_process"] >= 1
     assert kill["killed_worker_statements"] > 0
     assert kill["statements_including_recovery"] == (
         kill["statements"] + kill["recovery_statements"]
     )
-    assert results["scenarios"]["a_notify_off"]["metrics"]["statements_per_run"] > 0
+    assert results["scenarios"]["a_live_off"]["metrics"]["statements_per_run"] > 0
     assert proc.returncode == int(any(not c["ok"] for c in results["checks"]))
 
 
@@ -239,22 +258,22 @@ def test_baseline_scale_is_checked_before_comparing_counts():
         load.compare_gates({"x": 10}, {"scale": "quick", "gates": {"x": 10}}, scale="full")
 
 
-def test_scenario_a_uses_absolute_budgets_and_reports_the_release_comparison(monkeypatch):
-    monkeypatch.setattr(load, "SCENARIO_A_BUDGETS", {"a_notify_off": 74, "a_notify_on": 83})
+def test_scenario_a_uses_absolute_budgets_and_reports_the_release_comparison():
+    assert load.SCENARIO_A_BUDGETS == {"a_live_off": 76, "a_live_on": 76}
     outcomes = {
-        "a_notify_off": load.Outcome(metrics={"statements_per_run": 74}),
-        "a_notify_on": load.Outcome(metrics={"statements_per_run": 84}),
+        "a_live_off": load.Outcome(metrics={"statements_per_run": 76}),
+        "a_live_on": load.Outcome(metrics={"statements_per_run": 76}),
     }
     checks = load.scenario_a_checks(outcomes)
-    assert [(c["ok"], c["limit"]) for c in checks] == [(True, 74), (False, 83)]
+    assert [(c["ok"], c["limit"]) for c in checks] == [(True, 76), (True, 76)]
     assert all("0.6" in c["name"] for c in checks)
-    assert outcomes["a_notify_off"].metrics["vs_v050_percent"] == 25.4
+    assert outcomes["a_live_off"].metrics["vs_v050_percent"] == 28.8
 
 
-def test_post_trim_a_cost_above_budget_fails_before_twenty_percent_regression():
+def test_scenario_a_cost_one_statement_above_budget_fails_before_the_twenty_percent_gate():
     outcomes = {
-        "a_notify_off": load.Outcome(metrics={"statements_per_run": 75}),
-        "a_notify_on": load.Outcome(metrics={"statements_per_run": 84}),
+        "a_live_off": load.Outcome(metrics={"statements_per_run": 77}),
+        "a_live_on": load.Outcome(metrics={"statements_per_run": 77}),
     }
     assert not any(c["ok"] for c in load.scenario_a_checks(outcomes))
 
@@ -353,3 +372,55 @@ async def test_memory_admin_uses_the_guarded_engine_builder(monkeypatch):
     )
     await load.w_memory(ctx)
     assert apps == ["dendrux_load_w0", "dendrux_load_admin"]
+
+
+@pytest.mark.parametrize("has_close", [False, True])
+async def test_store_cleanup_supports_current_and_historical_stores(has_close):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    close = AsyncMock()
+    store = SimpleNamespace(close=close) if has_close else SimpleNamespace()
+    await load.close_store(store)
+    assert close.await_count == int(has_close)
+
+
+@pytest.mark.parametrize(
+    ("p95_ms", "connections", "expected"),
+    [
+        (105, {"dendrux-live-updates": 4}, [True, True]),
+        (1_000, {"dendrux-live-updates": 1}, [True, True]),
+        (8_400, {"dendrux-live-updates": 4}, [False, True]),
+        (105, {}, [True, False]),
+        (105, {"dendrux-live-updates": 0}, [True, False]),
+        (105, {"dendrux-live-updates": 5}, [True, False]),
+    ],
+)
+def test_live_hint_delivery_checks(p95_ms, connections, expected):
+    outcome = load.Outcome(
+        metrics={
+            "trickle_delivery_lag_ms": {"p95_ms": p95_ms},
+            "server": {"peak_connections_by_role": connections},
+        }
+    )
+    load.check_live_hint_delivery(outcome, workers=2, enabled=True)
+    assert [check["ok"] for check in outcome.checks] == expected
+    assert outcome.checks[0]["limit"] == 1_000
+    assert outcome.checks[1]["limit"] == 4
+
+
+def test_live_hint_delivery_checks_require_latency_samples():
+    outcome = load.Outcome(
+        metrics={
+            "trickle_delivery_lag_ms": {"n": 0},
+            "server": {"peak_connections_by_role": {"dendrux-live-updates": 4}},
+        }
+    )
+    load.check_live_hint_delivery(outcome, workers=2, enabled=True)
+    assert not outcome.checks[0]["ok"]
+
+
+def test_live_hint_delivery_checks_do_not_apply_to_polling():
+    outcome = load.Outcome()
+    load.check_live_hint_delivery(outcome, workers=2, enabled=False)
+    assert not outcome.checks

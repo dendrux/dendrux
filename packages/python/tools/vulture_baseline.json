@@ -1,6 +1,3 @@
 {
- "dendrux.runtime.submit:validate_result_names:variable:json_payload": 1,
- "dendrux.skills._fs:SkillDir.__exit__:variable:exc_type": 1,
- "dendrux.skills._fs:SkillDir.__exit__:variable:tb": 1,
  "dendrux.testing.store_kit.contracts.test_agent_flows:read_range:variable:sheet": 1
 }

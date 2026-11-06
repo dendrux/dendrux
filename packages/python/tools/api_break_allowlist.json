@@ -407,34 +407,6 @@
     {
       "kind": "parameter-added-optional",
       "paths": [
-        "dendrux.store.RunStore.from_engine",
-        "dendrux.store.RunStore.from_database_url"
-      ],
-      "b_item": "contracts:12.11",
-      "note": "Optional notifier provides event wakeups while polling remains the fallback.",
-      "param": "notifier"
-    },
-    {
-      "kind": "parameter-added-optional",
-      "paths": [
-        "dendrux.store.RunStore.from_database_url"
-      ],
-      "b_item": "contracts:12.11",
-      "note": "Optional direct listen URL supports Postgres notification connections.",
-      "param": "listen_url"
-    },
-    {
-      "kind": "parameter-added-optional",
-      "paths": [
-        "dendrux.runtime.state.SQLAlchemyStateStore.__init__"
-      ],
-      "b_item": "contracts:12.11",
-      "note": "Optional notification channel emits transaction-bound wakeups.",
-      "param": "notify_channel"
-    },
-    {
-      "kind": "parameter-added-optional",
-      "paths": [
         "dendrux.agent.Agent.__init__"
       ],
       "param": "lease_interval",

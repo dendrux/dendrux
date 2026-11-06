@@ -223,7 +223,7 @@ A budget pause is a `paused` run with `pause_reason="budget"`. It resumes the sa
 - **Resume is per run.** `submit_resume(child_id)` continues the child, but it never rewrites the tool result the parent already recorded. Dendrux does not re-inject the child's eventual answer into the parent.
 - If the parent's delegation tool needs the child's final answer, the tool or your application owns that correlation: resume the child, wait for it to finish, then supply the outcome to the parent however your design requires (a note via [`submit_note`](/docs/architecture/inbox) is one option).
 
-> Nested delegation is the case to plan for. A parent that delegates to a child, and a child that delegates to a grandchild, gives you three separate runs to resume. Use `RunStore.get_subtree(run_id)` to list them with their statuses, and resume them one by one.
+> Nested delegation is the case to plan for. A parent that delegates to a child, and a child that delegates to a grandchild, gives you three separate runs to resume. Use `RunStore.get_subtree(run_id, max_nodes=...)` to list them with their statuses, and resume them one by one.
 
 `tenant_id=` scopes the request: when given, `run_id` must belong to exactly that tenant (`None` means untenanted) or `RunNotFoundError` is raised, and the cascade only reaches descendants of the same tenant. Omit it for trusted, single-tenant use.
 

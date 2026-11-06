@@ -9,7 +9,6 @@ import logging
 import random
 import zlib
 from typing import TYPE_CHECKING, Any
-from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -41,7 +40,7 @@ async def test_p1_1_partial_body_transport_error_retries(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     p = provider(family)
-    monkeypatch.setattr(p._client, "_sleep_for_retry", AsyncMock())
+    monkeypatch.setattr(p._client, "_calculate_retry_timeout", lambda *a, **k: 0)
     requests = 0
     bodies: list[Body] = []
 
@@ -72,7 +71,7 @@ async def test_p1_1_exhausted_socket_timeout_is_not_a_call_deadline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     p = provider(family)
-    monkeypatch.setattr(p._client, "_sleep_for_retry", AsyncMock())
+    monkeypatch.setattr(p._client, "_calculate_retry_timeout", lambda *a, **k: 0)
     requests = 0
 
     class Broken(Body):
@@ -180,7 +179,7 @@ async def test_p1_3_unsupported_encoding_is_refused_before_any_read(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     p = provider(family)
-    monkeypatch.setattr(p._client, "_sleep_for_retry", AsyncMock())
+    monkeypatch.setattr(p._client, "_calculate_retry_timeout", lambda *a, **k: 0)
     requests = 0
     reads = 0
 
@@ -307,13 +306,6 @@ async def test_p2_explicit_chunk_size_is_exact(family: str, chunk_size: int) -> 
         await p.close()
 
 
-def _anthropic_at_least(version: tuple[int, int]) -> bool:
-    from importlib.metadata import version as installed
-
-    major, minor = (int(part) for part in installed("anthropic").split(".")[:2])
-    return (major, minor) >= version
-
-
 @pytest.mark.parametrize("status", [200, 400, 500])
 @pytest.mark.parametrize("buffered", [False, True])
 async def test_p1_1_limit_refusal_survives_cached_and_error_bodies(
@@ -322,10 +314,8 @@ async def test_p1_1_limit_refusal_survives_cached_and_error_bodies(
     buffered: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    if family == "anthropic" and status != 200 and _anthropic_at_least((0, 125)):
-        pytest.xfail("pending provider SDK compatibility update for error responses")
     p = provider(family, limit=1024)
-    monkeypatch.setattr(p._client, "_sleep_for_retry", AsyncMock())
+    monkeypatch.setattr(p._client, "_calculate_retry_timeout", lambda *a, **k: 0)
     requests = 0
 
     def respond(_: httpx.Request) -> httpx.Response:

@@ -91,6 +91,7 @@ async def main() -> None:
         tools=[process_refund],
         guardrails=[PII(engine="presidio")],
         database_url=DB_URL,
+        strict_tenancy=False,  # single-tenant demo (see Multi-tenancy docs)
     ) as agent:
         notifier = ConsoleNotifier()
         result = await agent.run(user_input, notifier=notifier)
@@ -100,8 +101,8 @@ async def main() -> None:
     # Re-open the public read facade. Everything below uses only public API —
     # no private imports, no underscore accessors.
     async with RunStore.from_database_url(DB_URL) as store:
-        traces = await store.get_traces(result.run_id)
-        tool_calls = await store.get_tool_invocations(result.run_id)
+        traces = await store.get_traces(result.run_id, limit=100)
+        tool_calls = await store.get_tool_invocations(result.run_id, limit=100)
         mapping = await store.get_pii_mapping(result.run_id)
 
     print("\n" + "=" * 60)

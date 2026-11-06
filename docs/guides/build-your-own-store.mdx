@@ -18,7 +18,7 @@ Dendrux keeps every run in a **state store**. We ship stores for PostgreSQL, SQL
 
 The base also refuses, on first use and before any claim, an engine or connection in `AUTOCOMMIT` mode (a `ValueError`): every write must be one real transaction. A hook never commits, retries or validates. It only returns SQL (or, for three of them, runs one statement inside the transaction the base already opened).
 
-Everything a hook takes or returns is importable from `dendrux.store`: `SQLStateStore`, `ConflictSpec`, `InsertPlan`, `SelectSource`, `ValuesSource`, `SetFields`, `AppendArray`, `PatchLoopState`, `JsonPatch`, `JsonPath`, `JsonReadType`, `JsonValue`, `ScalarKey`, `OrderedAssignments`, `RunLockScope`, `RunParentCursor`, `DialectFacts`, `DbError`, `DbErrorKind` and `TenantScope`. Names that start with an underscore are not part of the contract; the one exception is `_after_event_insert`, described under [Declare what you promise](#declare-what-you-promise).
+Everything a hook takes or returns is importable from `dendrux.store`: `SQLStateStore`, `ConflictSpec`, `InsertPlan`, `SelectSource`, `ValuesSource`, `SetFields`, `AppendArray`, `PatchLoopState`, `JsonPatch`, `JsonPath`, `JsonReadType`, `JsonValue`, `ScalarKey`, `OrderedAssignments`, `RunLockScope`, `RunParentCursor`, `DialectFacts`, `DbError`, `DbErrorKind` and `TenantScope`. Names that start with an underscore are not part of the contract.
 
 ## A complete store
 
@@ -44,11 +44,10 @@ class MiniStore(SQLStateStore):
     supports_row_locks = False  # SQLite has one writer and no SELECT ... FOR UPDATE
     ddl_transactional = True
 
-    def __init__(self, engine):
-        super().__init__(engine)
-        # Say how many processes may share the data, and turn notify off: this store
-        # sends no event hints (see "Declare what you promise").
-        self.capabilities = replace(self.capabilities, deployment="single_host", notify=False)
+    def __init__(self, engine, *, live_updates=None):
+        super().__init__(engine, live_updates=live_updates)  # optional: see "Live updates"
+        # Say how many processes may share the data.
+        self.capabilities = replace(self.capabilities, deployment="single_host")
 
     # -- writes -----------------------------------------------------------------------------
 
@@ -192,7 +191,7 @@ agent = Agent(provider=..., prompt=..., state_store=store)
 reads = RunStore(store)  # read primitives: get_pending, follow, get_event_view, and the rest
 ```
 
-`Agent(state_store=...)` and `RunStore(store)` accept any store. `store_for_engine(engine)`, `RunStore.from_engine(engine)` and `Agent(database_url=...)` pick one of the three built-in classes from the engine's dialect and know nothing about yours, so use the two lines above and keep the store object around. The application owns the engine and disposes it.
+`Agent(state_store=...)` and `RunStore(store)` accept any store. `store_for_engine(engine)`, `RunStore.from_engine(engine)` and `Agent(database_url=...)` pick one of the three built-in classes from the engine's dialect and know nothing about yours, so use the two lines above and keep the store object around. `RunStore.from_engine` also never listens for live updates; wrap your own store with `RunStore(store)`. The application owns the engine and disposes it.
 
 ## Create the schema
 
@@ -203,9 +202,13 @@ Create the tables once, at deploy time, from the models. A fresh schema made thi
 ```python
 from dendrux.db.models import Base
 
-async with engine.begin() as conn:
-    await conn.run_sync(Base.metadata.create_all)
+
+async def create_schema(engine) -> None:
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
 ```
+
+Call it once with `asyncio.run(create_schema(engine))`, or `await` it inside your setup code.
 
 `dendrux db migrate`, `check`, `status` and `activate` run Alembic migrations that Dendrux writes and tests for PostgreSQL, SQLite and MySQL/MariaDB only. For your own dialect you own the schema: create it with the snippet above, and when a later Dendrux release changes the models, apply the matching change to your database yourself. The kit builds its test schema the same way (see [Provide the fixtures](#provide-the-fixtures)); migrations are not part of certification.
 
@@ -265,6 +268,7 @@ These are `async` and receive the session of the transaction the base opened. Th
 
 | Hook and signature | What it must do |
 |---|---|
+| `events_for_runs_query(self, heads: Mapping[str, int], *, limit_per_run: int) -> Executable` | Public, optional hook for store authors. Receives 1 to 200 already-authorized run ids mapped to their last-read sequence index (`-1` includes sequence 0), and a validated `limit_per_run` from 1 to 100. Return one executable SQLAlchemy query with all columns of `run_events`, selecting at most the earliest `limit_per_run` events with `sequence_index` above each head; missing runs contribute no rows. The base executes it, groups rows by run and sorts each group, so overall row order does not matter. Without an override, the base supplies a portable `UNION ALL` of bounded, indexed per-run subqueries. Override it for a native form of the same read, as `PostgresStateStore` does with `LATERAL`. Empty input returns without calling the hook or querying |
 | `statement_capacity(self) -> int or None` (`async`, define it on the class) | The most bytes one SQL statement may carry, or `None` for no limit. Before an Agent first uses the store it compares the largest statement its `Limits` can produce with this number and refuses, naming both values. It is an early warning for the Agent's `Limits`, not a guarantee. A store without it is not checked. `MySQLStateStore` reports `max_allowed_packet` |
 
 Two rules hold for every hook:
@@ -284,7 +288,7 @@ from dataclasses import replace
 class MyStore(SQLStateStore):
     def __init__(self, engine):
         super().__init__(engine)
-        self.capabilities = replace(self.capabilities, deployment="multi_server", notify=False)
+        self.capabilities = replace(self.capabilities, deployment="multi_server")
 ```
 
 | Field | Meaning |
@@ -294,12 +298,45 @@ class MyStore(SQLStateStore):
 | `checkpointing` | Executable state and conversation reconstruction (format-2 runs) |
 | `atomic_completion` | A tool's intent, its result, and a run's end publish all-or-nothing |
 | `recovery` | Leases, marking, reclaim, paged cancel, and `get_replayed_tool_calls` (the recovery declaration is refused at Agent construction without it) |
-| `notify` | After an event insert the store sends a wake hint, from `async def _after_event_insert(self, session, run_id) -> None` |
 | `deployment` | `single_process` (one process), `single_host` (several processes sharing one file) or `multi_server` (any number of processes and hosts) |
 
-The base class declares everything it implements, **including `notify=True`**. Its `_after_event_insert` does nothing, so a subclass that keeps `notify=True` without writing that hook has promised hints it never sends. **Set `notify=False` unless you implement the hook.** The kit refuses a store that declares `notify` and still inherits the do-nothing hook; it cannot test that hints are delivered, so for a store that does implement `_after_event_insert` notification delivery is untested.
+The base class declares everything it implements. You set `deployment`. A store without a `deployment` cannot be certified. Live updates are not a capability: they are an optional argument of the store, covered in the next section.
 
-You set `deployment`. A store without a `deployment` cannot be certified.
+## Live updates in a custom store
+
+Live updates let other processes learn that a run changed, so their `follow()` wakes at once instead of at the next poll. They are optional: a store without them keeps working, and followers poll. The hints are lossy and the database stays the truth; see [Live updates](/docs/guides/scaling#live-updates) for what they do for a deployment and for the transports (`PostgresUpdates`, `RedisUpdates`, your own).
+
+**A `SQLStateStore` subclass** only has to pass the keyword through, as `MiniStore` above does:
+
+[//]: # "docs-test: skip - fragment: shows a constructor to complete with your dialect's hooks"
+
+```python
+class MyStore(SQLStateStore):
+    def __init__(self, engine, *, live_updates=None):
+        super().__init__(engine, live_updates=live_updates)
+```
+
+The base class binds the instance, marks the runs each write touches, hands their ids to it once the transaction's COMMIT was issued, flushes when the outermost store call returns, and closes it in `await store.close()` (which never disposes your engine). `live_updates=None` or `False` turns it off. `live_updates=True` is the store's own transport, and a subclass has none, so it raises `ValueError`; pass an instance such as `RedisUpdates("redis://...")`. A `LiveUpdates` instance belongs to one store.
+
+**A store that is not built on `SQLStateStore`** (any object that implements the `StateStore` protocol) can announce too. It must:
+
+1. Accept `live_updates` in its constructor, call `live_updates.bind(self)` and expose the instance as a `live_updates` attribute. `RunStore(store)` reads that attribute to decide whether to listen.
+2. Call `live_updates.enqueue(run_ids)` for every write that changes what a follower, a status read or a run list shows, once that write's commit was issued, even if the commit then fails: the write may have landed. Do not enqueue for a write that failed before its commit or was proved not to have applied.
+3. Call `await live_updates.flush()` at the end of each such public call, on the success path only. A call that raises should keep its original exception and leave its ids pending for the next successful call or for `close()`.
+4. Call `await live_updates.close()` from its own `close()`.
+
+`enqueue` takes an iterable of run-id strings and never blocks. It drops ids that are empty, too long or beyond its pending bound, and counts them, because a lost hint only costs a poll. A bare `str` is the one input it refuses: `enqueue("01J...")` raises `TypeError`, because an id passed by mistake would otherwise be split into single characters. `flush()` never raises except for the caller's own cancellation, waits at most `flush_deadline_s`, and does nothing while the transport is backing off after a failure.
+
+Followers read a store through two optional batched methods and fall back to one read per run, under the same query budget, when the store has none:
+
+| Method | Contract |
+|---|---|
+| `get_events_for_runs(heads: Mapping[str, int], *, limit_per_run: int) -> dict[str, list[RunEventRecord]]` | For each run id, the events with `sequence_index` above its head, ascending, at most `limit_per_run` (1 to 100) each. Head `-1` means no event was read yet, so sequence 0 is included. At most 200 run ids; an empty mapping returns `{}` without a query; a run that does not exist is missing from the result |
+| `get_run_statuses(run_ids: Sequence[str]) -> dict[str, str]` | The status of each run. At most 200 ids; empty input returns `{}`; missing runs are absent |
+
+Both take run ids that the caller has already authorized. They are reader building blocks, not authorization APIs, and `RunStore` does not expose them. `SQLStateStore` implements both.
+
+**Certify it.** Add the optional `dendrux_live_store_factory` fixture (see [Provide the fixtures](#provide-the-fixtures)). The kit then gives your store a recording `LiveUpdates` and checks that a committed write is announced only after a second connection can see it, that a write proved not to have applied announces nothing, and that a write whose COMMIT was issued is announced at the next flush even when the call failed or was cancelled. Without the fixture the report says "live updates: not tested" and the verdict carries that caveat.
 
 ## Provide the fixtures
 
@@ -312,6 +349,7 @@ The kit runs against fixtures you write in your own `conftest.py`. They return p
 | `dendrux_store_second_instance` | A function that takes a store and returns a **second, independent instance** (its own connections) over the same data, live next to the first | `deployment` is `single_host` or `multi_server` |
 | `dendrux_clock` | An object with `advance(delta)`: afterwards everything written earlier reads as `delta` older to sweeps and leases (optionally `now()`, see below) | `recovery` is declared. Missing then, the recovery contracts fail and the store is NOT CERTIFIED. When `recovery` is not declared the fixture is optional, and the few time-based contracts that remain (sweeps of stale runs) skip and are reported as unverified |
 | `dendrux_fault_injector` | An object that fails the next write transaction at a named point | Optional. Without it the report says "crash recovery: not certified" |
+| `dendrux_live_store_factory` | A function that takes a `LiveUpdates` and makes a new store over **empty** data that announces through it | Optional. Without it the report says "live updates: not tested". See [Live updates](#live-updates-in-a-custom-store) |
 
 Here is the `conftest.py` that goes with the store above. One small object keeps every engine the fixtures create, so they are all disposed at the end, and a second instance reuses the engine's URL object (a URL turned into a string hides the password). `Base.metadata.create_all` is all the schema setup the kit needs:
 
@@ -338,12 +376,12 @@ class World:
         self.engines.append(engine)
         return engine
 
-    async def fresh(self):
+    async def fresh(self, live_updates=None):
         url = f"sqlite+aiosqlite:///{self.directory / f'kit{len(self.engines)}.db'}"
         engine = self.engine(url)
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)  # tables, and a schema at format 2
-        return MiniStore(engine)
+        return MiniStore(engine, live_updates=live_updates)
 
     async def another(self, store):
         # store._engine.url is a URL object: it keeps the password. Do not use str(url).
@@ -361,6 +399,11 @@ async def world(tmp_path):
 @pytest.fixture
 def dendrux_store_factory(world):
     return world.fresh
+
+
+@pytest.fixture
+def dendrux_live_store_factory(world):
+    return world.fresh  # the kit passes the LiveUpdates the store must announce through
 
 
 @pytest.fixture
@@ -421,7 +464,7 @@ The kit reads the capabilities and the `deployment` your store declares:
 | No `dendrux_fault_injector` | Runs everything else; the report says "crash recovery: not certified" and the verdict carries the caveat |
 | Only part of the contracts ran (`-k`, one file) | **NOT CERTIFIED (incomplete run)**. Certification needs a complete run, and the fixtures a declaration obliges are checked even when the contracts that use them were not selected |
 | A check the protocol cannot observe | Reported as `unverified`, never as a pass, and the verdict becomes `CERTIFIED with caveats`. Today: `save_usage` rows (the protocol has no read of them), and the time-based contracts when there is no `dendrux_clock` |
-| `notify` | Checks only that you wrote the hook (see above). Notification delivery is not tested |
+| `dendrux_live_store_factory` | Present: runs the live-update contracts. Absent: they skip, the report says "live updates: not tested" and the verdict carries the caveat. The visibility checks need an independent reader (`dendrux_store_second_instance`); without one they skip as `unverified` and never pass |
 
 **Skips the store causes.** Some contracts skip because of something the store controls. The kit lists them in the summary, per capability, under "skipped by the store", and any declared capability they guard is NOT CERTIFIED:
 
@@ -440,7 +483,7 @@ At the end of the session the kit prints a summary per store. This is what a sto
 ```text
 =================== dendrux store kit: certification summary ===================
 MiniStore (deployment=single_host, capabilities=fenced_writes,retry_ids,checkpointing,atomic_completion,recovery)
-  declaration        3 passed, 1 skipped
+  declaration        3 passed
   basic              34 passed
   agent_flows        9 passed
   fenced_writes      22 passed
@@ -450,17 +493,18 @@ MiniStore (deployment=single_host, capabilities=fenced_writes,retry_ids,checkpoi
   recovery           13 passed
   concurrency        16 passed
   crash_recovery     54 passed, 16 skipped
+  live_updates       7 passed
   unverified: save_usage retry identity: usage rows cannot be read through the protocol, so a duplicate row is not detected
-  CERTIFIED with caveats: declaration, basic, agent_flows, fenced_writes, retry_ids, checkpointing, atomic_completion, recovery, concurrency, crash_recovery (caveats: unverified: save_usage retry identity: usage rows cannot be read through the protocol, so a duplicate row is not detected)
+  CERTIFIED with caveats: declaration, basic, agent_flows, fenced_writes, retry_ids, checkpointing, atomic_completion, recovery, concurrency, crash_recovery, live_updates (caveats: unverified: save_usage retry identity: usage rows cannot be read through the protocol, so a duplicate row is not detected)
 ```
 
-The numbers change as contracts are added; the shape does not. The one skipped `declaration` contract is the `notify` check (not declared), and the skipped `crash_recovery` contracts are the disconnect forms SQLite does not have.
+The numbers change as contracts are added; the shape does not. The skipped `crash_recovery` contracts are the disconnect forms SQLite does not have, and the skipped `retry_ids` contract is the one for a `save_usage` identity the protocol cannot read back.
 
 ## What each group checks
 
 | Group | Checks |
 |---|---|
-| declaration | `deployment` is declared and valid; each declared capability has the methods it needs and its fixtures; a declared `notify` is backed by a real `_after_event_insert` |
+| declaration | `deployment` is declared and valid; each declared capability has the methods it needs and its fixtures |
 | basic | Create, read, finalize, cancel, pause, claim, notes and the note cap, tenant scoping, listing and filters, delegation reads, sweeps, exact round trips of Unicode and large values. Protocol calls only: the kit never reads your tables |
 | agent_flows | A real `Agent` against your store: a run, a server tool, a client-tool pause and resume, approval, cancel, stream, and resume after a restart |
 | fenced_writes | Every writer refuses a stale claim epoch and leaves no trace |
@@ -470,6 +514,7 @@ The numbers change as contracts are added; the shape does not. The one skipped `
 | recovery | Lease marking, reclaim under a new epoch, the old owner fenced, partial sweeps by cursor, replayed tool calls listed (`get_replayed_tool_calls`: in order, bounded with a truncation flag, scoped to the tenant), everything surviving a reopen |
 | concurrency | Two live instances, many callers: exactly one winner for claims, finalizes and idempotent creates; gapless event sequences; the note cap never exceeded; blob races |
 | crash_recovery | With the fault injector: a failed or cancelled write at each point is repeated safely by its identity; atomic operations are all-or-nothing; claims after a lost commit acknowledgement raise `StoreOutcomeUnknown`; an interrupted sweep is finished by the next one |
+| live_updates | With `dendrux_live_store_factory`: a created run, a saved event and a status-only change are each announced, with exactly their run id, after a second connection can see them; a write proved not to have applied announces nothing; a write whose COMMIT was issued (a lost acknowledgement, an error or a cancellation after it) is announced at the next flush while the failing call itself returns without waiting |
 
 ## When a contract fails
 

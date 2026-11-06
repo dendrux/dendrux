@@ -53,3 +53,13 @@ def test_otel_docs_and_notifier_tests_pass_in_either_order(
     result = _run(*order)
     assert result.returncode == 0, result.stdout[-2000:] + result.stderr[-1000:]
     assert " failed" not in result.stdout
+
+
+def test_notifier_documents_persisted_cross_process_trace_links():
+    page = (PKG.parents[1] / "docs/architecture/notifier.mdx").read_text()
+    assert "persisted trace links" in page
+    assert "including across processes" in page
+    assert "Native metrics and log export remain application-owned" in page
+    assert (
+        "cross-process trace continuity, native metrics, and log signals are deferred" not in page
+    )

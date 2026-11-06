@@ -116,6 +116,7 @@ async def main() -> None:
             "filesystem__edit_file",
         ],
         database_url=f"sqlite+aiosqlite:///{db_path}",
+        strict_tenancy=False,  # single-tenant demo (see Multi-tenancy docs)
         max_iterations=10,
     ) as agent:
         # Task 1: the model activates the skill, reads its style guide, runs its script
@@ -170,7 +171,7 @@ async def main() -> None:
     store = RunStore.from_database_url(f"sqlite+aiosqlite:///{db_path}")
     async with store:
         for run_id in (result.run_id, result2.run_id, result3.run_id):
-            names = [e.event_type for e in await store.get_events(run_id)]
+            names = [e.event_type for e in await store.get_events(run_id, limit=500)]
             console.print(f"[dim]{run_id}: {[n for n in names if n.startswith('skill.')]}[/dim]")
 
     console.print()

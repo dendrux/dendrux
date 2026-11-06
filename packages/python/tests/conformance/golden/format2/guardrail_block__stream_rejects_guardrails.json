@@ -1,0 +1,8 @@
+{
+"id":"guardrail_block__stream_rejects_guardrails",
+"provider_calls":[],
+"runs":[],
+"scenario":"guardrail_block",
+"steps":[{"label":"stream with guardrails","path":"stream","raised":["ValueError","Exception"]}],
+"public_traces":[]
+}

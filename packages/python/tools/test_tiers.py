@@ -300,10 +300,7 @@ def _integration_io(function: ast.AST, relative: str) -> bool:
     return any(
         isinstance(node, ast.Call)
         and (
-            (
-                isinstance(node.func, ast.Name)
-                and node.func.id in {"create_async_engine", "PostgresEventNotifier"}
-            )
+            (isinstance(node.func, ast.Name) and node.func.id == "create_async_engine")
             or _asyncio_call(node, "start_server")
         )
         for node in ast.walk(function)

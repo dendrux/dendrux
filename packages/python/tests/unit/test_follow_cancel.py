@@ -1,16 +1,23 @@
-"""Follow cancellation wins over a simultaneous heartbeat wake."""
+"""Follow cancellation wins over a simultaneous wake, with or without live updates."""
 
 from __future__ import annotations
 
 import asyncio
-from typing import cast
 
 import pytest
 
 from dendrux.store import EventFeed, FollowHeartbeat, RunStore
 from tests._helpers.lost_cancel import simulate_lost_cancel
-from tests.unit.test_follow_notifier import Notifier
-from tests.unit.test_follow_wake import Store
+from tests.unit.test_follow_coordinator import BatchedState, FakeLive
+
+
+def _owner(*, live: bool, heartbeat_s: float = 15.0) -> tuple[RunStore, EventFeed]:
+    state = BatchedState()
+    state.create("run")
+    if live:
+        state.live_updates = FakeLive()
+    store = RunStore(state)  # type: ignore[arg-type]
+    return store, EventFeed(store, heartbeat_s=heartbeat_s)
 
 
 @pytest.mark.parametrize("lose_cancel", [False, True])
@@ -19,7 +26,7 @@ async def test_follow_cancel_survives_simultaneous_wake(
 ) -> None:
     if lose_cancel:
         simulate_lost_cancel(monkeypatch)
-    owner = EventFeed(cast("RunStore", Store()))
+    store, owner = _owner(live=False)
     follow = owner.follow("run", tenant_id=None, max_duration_s=None)
     task = asyncio.create_task(anext(follow))
     try:
@@ -39,16 +46,16 @@ async def test_follow_cancel_survives_simultaneous_wake(
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
         await follow.aclose()
-        await owner.aclose()
+        await store.close()
 
 
 @pytest.mark.parametrize("lose_cancel", [False, True])
-async def test_notified_follow_cancel_after_heartbeat(
+async def test_live_follow_cancel_after_heartbeat(
     monkeypatch: pytest.MonkeyPatch, lose_cancel: bool
 ) -> None:
     if lose_cancel:
         simulate_lost_cancel(monkeypatch)
-    owner = EventFeed(cast("RunStore", Store()), notifier=Notifier(), heartbeat_s=0.01)
+    store, owner = _owner(live=True, heartbeat_s=0.01)
     follow = owner.follow("run", tenant_id=None, max_duration_s=None)
     entered = asyncio.Event()
 
@@ -76,4 +83,4 @@ async def test_notified_follow_cancel_after_heartbeat(
             await asyncio.gather(task, return_exceptions=True)
     finally:
         await follow.aclose()
-        await owner.aclose()
+        await store.close()

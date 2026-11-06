@@ -49,6 +49,25 @@ if TYPE_CHECKING:
 
 load_dotenv(Path(__file__).resolve().parents[3] / ".env")
 
+
+async def read_all_events(store: RunStore, run_id: str) -> list[Any]:
+    """Every event of a run, one bounded page at a time (page with the last sequence index)."""
+    events: list[Any] = []
+    after = None
+    while page := await store.get_events(run_id, limit=500, after_sequence_index=after):
+        events.extend(page)
+        after = page[-1].sequence_index
+    return events
+
+
+async def read_all_rows(read: Any, run_id: str, *, page_size: int = 200) -> list[Any]:
+    """Every row of an offset-paged read (get_traces, get_llm_calls, get_tool_invocations)."""
+    rows: list[Any] = []
+    while page := await read(run_id, limit=page_size, offset=len(rows)):
+        rows.extend(page)
+    return rows
+
+
 console = Console()
 
 
@@ -306,6 +325,7 @@ async def main() -> None:
         ),
         tools=[lookup_weather, lookup_customer],
         database_url=db_url,
+        strict_tenancy=False,  # single-tenant demo (see Multi-tenancy docs)
         guardrails=[PII()],
         budget=Budget(max_tokens=20_000, warn_at=(0.5, 0.75, 0.9)),
     ) as agent:
@@ -335,10 +355,10 @@ async def main() -> None:
     async with RunStore.from_database_url(db_url) as store:
         detail = await store.get_run(result.run_id)
         assert detail is not None
-        events = await store.get_events(result.run_id)
-        llm_calls = await store.get_llm_calls(result.run_id)
-        tool_invocations = await store.get_tool_invocations(result.run_id)
-        traces = await store.get_traces(result.run_id)
+        events = await read_all_events(store, result.run_id)
+        llm_calls = await read_all_rows(store.get_llm_calls, result.run_id)
+        tool_invocations = await read_all_rows(store.get_tool_invocations, result.run_id)
+        traces = await read_all_rows(store.get_traces, result.run_id)
         pauses = await store.get_pauses(result.run_id)
 
     # ---- Report ----

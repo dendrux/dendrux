@@ -7,7 +7,7 @@ description: Run Dendrux on MySQL 8.4 or MariaDB 10.11 and newer: install the dr
 
 Dendrux stores every run in your database. MySQL 8.4 and MariaDB 10.11 (and newer) are supported next to PostgreSQL and SQLite, on the InnoDB engine. Use the same agents, the same pause and resume calls and the same `RunStore` reads; only the connection string and a few server rules differ.
 
-> **One notification difference.** Event notifications (`notify_channel`) are PostgreSQL-only. On MySQL and MariaDB, `follow` and `stream_events` poll the database. Everything else, including recovery with `sweep` and `reclaim`, works as on PostgreSQL.
+> **One live-update difference.** The built-in live-update transport (`live_updates=True`) is PostgreSQL-only, and `MySQLStateStore(engine, live_updates=True)` raises a `ValueError` that suggests `RedisUpdates`. By default `follow` and `stream_events` poll the database. To wake followers between polls, give the store a Redis bus (`pip install "dendrux[redis]"`, then `MySQLStateStore(engine, live_updates=RedisUpdates(url))`) or your own `LiveUpdates`; see [Scaling](/docs/guides/scaling#redis). Everything else, including recovery with `sweep` and `reclaim`, works as on PostgreSQL.
 
 ## Install and connect
 
@@ -57,7 +57,7 @@ engine = create_async_engine(
     pool_recycle=1800,
 )
 state = MySQLStateStore(engine)
-reads = RunStore.from_engine(engine)
+reads = RunStore(state)
 agent = Agent(name="worker", prompt="Help the user.", provider="openai:gpt-4o-mini", state_store=state)
 ```
 

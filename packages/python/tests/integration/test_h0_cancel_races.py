@@ -85,7 +85,7 @@ async def test_completion_beats_late_durable_cancel(
         gate.install(
             monkeypatch,
             store,
-            "finalize_with_event" if storage_format == 2 else "finalize_run",
+            "finalize_with_event",
             after=cut == "after_commit",
         )
     other, _ = peer
@@ -119,8 +119,7 @@ async def test_completion_beats_late_durable_cancel(
         (path, fmt, method)
         for path, fmt in PATH_FORMATS
         for method in (
-            "finalize_run",
-            "save_run_event",
+            "finalize_with_event",
             "get_notes",
             "record_run_finished",
             "notify_run_finished",

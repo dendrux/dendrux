@@ -13,12 +13,6 @@ from pathlib import Path
 
 import pytest
 
-# Imported before the in-process kit run so pytester's sys.modules restore keeps them: a
-# re-imported sqlalchemy.orm fails ("Type <class 'object'> is already registered") and
-# breaks every later test in the session.
-import dendrux.db.models  # noqa: F401
-import dendrux.store  # noqa: F401
-import dendrux.testing.store_kit.sql  # noqa: F401
 from dendrux.runtime.stores.sql.base import SQLStateStore
 from tests.docs._snippets import extract_snippets
 
@@ -95,7 +89,7 @@ def test_every_overridable_base_hook_is_documented() -> None:
         "idempotency_scope_predicate", "event_sequence_expr", "inserted_event_sequence",
         "lock_clause", "id_in", "child_page_query", "blob_now", "serialize_in_tx",
         "reserve_parent_writer", "connection_checks", "classify_db_error",
-        "json_conversion_error", "statement_capacity",
+        "json_conversion_error", "statement_capacity", "events_for_runs_query",
     }  # fmt: skip
     assert hooks <= documented, sorted(hooks - documented)
     for name in hooks - {"statement_capacity"}:

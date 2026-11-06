@@ -210,7 +210,7 @@ async def main() -> None:
 
     store = RunStore.from_database_url(url)
     async with store:
-        print([e.event_type for e in await store.get_events(result.run_id)])
+        print([e.event_type for e in await store.get_events(result.run_id, limit=100)])
         # ['run.started', 'tools.declared', 'guardrail.blocked', 'run.error']
 
 

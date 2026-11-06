@@ -243,6 +243,79 @@ async def test_json_contains_distinguishes_types(store, field, value, expected):
     assert actual is expected
 
 
+_STRUCTURED_META = {
+    "match": {
+        "obj": {"x": 1, "y": [1, 2]},
+        "lst": [1, "1", True, {"p": 1}],
+        "n": 1,
+        "s": "1",
+        "b": True,
+        "nested": {"w": {"x": 1}},
+        "empty": {},
+    },
+    "text-member": {"obj": {"x": "1", "y": [1, 2]}, "lst": ["1", "1", True, {"p": 1}]},
+    "bool-member": {"obj": {"x": True, "y": [1, 2]}, "lst": [True, "1", True, {"p": 1}]},
+    "int-member": {"obj": {"x": 1, "y": [1, 3]}, "lst": [1, 1, True, {"p": 1}], "n": "1"},
+    "other-leaf": {"obj": {"x": 2, "y": [1, 2]}, "lst": [1, "1", True, {"p": 2}], "s": 1},
+    "top-level": {"nested": {"x": 1}, "b": [True]},
+    "null-member": {"nul": {"x": None, "y": [None, 1]}, "nuls": [None]},
+}
+_NO_ROWS: list[str] = []
+
+
+@pytest.mark.parametrize("engine", ["sqlite_file"], indirect=True)
+@pytest.mark.parametrize(
+    "path,value,expected",
+    [
+        # an object or array equal to the stored one matches, and only the run that holds it
+        (("obj",), {"x": 1, "y": [1, 2]}, ["match"]),
+        (("lst",), [1, "1", True, {"p": 1}], ["match"]),
+        (("empty",), {}, ["match"]),
+        # JSON types are kept: 1, "1" and true never stand for one another, at any depth
+        (("obj",), {"x": "1", "y": [1, 2]}, ["text-member"]),
+        (("obj",), {"x": True, "y": [1, 2]}, ["bool-member"]),
+        (("obj",), {"x": 1, "y": [1, 3]}, ["int-member"]),
+        (("lst",), ["1", "1", True, {"p": 1}], ["text-member"]),
+        (("lst",), [True, "1", True, {"p": 1}], ["bool-member"]),
+        (("lst",), [1, 1, True, {"p": 1}], ["int-member"]),
+        # a nested member decides: same keys with another leaf is a different value
+        (("obj",), {"x": 2, "y": [1, 2]}, ["other-leaf"]),
+        (("lst",), [1, "1", True, {"p": 2}], ["other-leaf"]),
+        (("lst",), [1, "1", True, {"p": 3}], _NO_ROWS),
+        # null members are values like any other: they match null, not a missing or other value
+        (("nul",), {"x": None, "y": [None, 1]}, ["null-member"]),
+        (("nul",), {"x": 0, "y": [None, 1]}, _NO_ROWS),
+        (("nuls",), [None], ["null-member"]),
+        (("nuls",), [0], _NO_ROWS),
+        # a value found only deeper down does not match at the asked path
+        (("nested",), {"w": {"x": 1}}, ["match"]),
+        (("nested",), {"x": 1}, ["top-level"]),
+        # a missing path and a different kind of value at the path match nothing
+        (("missing",), {"x": 1}, _NO_ROWS),
+        (("missing",), [1], _NO_ROWS),
+        (("n",), {"x": 1}, _NO_ROWS),
+        (("s",), [1], _NO_ROWS),
+        (("b",), [True], ["top-level"]),
+        (("obj",), [1, 2], _NO_ROWS),
+        (("lst",), {"p": 1}, _NO_ROWS),
+        (("empty",), [], _NO_ROWS),
+    ],
+)
+async def test_sqlite_json_contains_object_and_array_values_select_the_right_rows(
+    store, path, value, expected
+):
+    for run_id, meta in _STRUCTURED_META.items():
+        await store.create_run(run_id, "agent", meta=meta)
+    await store.create_run("no-meta", "agent")
+    async with store._session_factory() as session:
+        rows = await session.scalars(
+            select(AgentRun.id)
+            .where(store.json_contains(AgentRun.meta, path, value))
+            .order_by(AgentRun.id)
+        )
+    assert sorted(rows) == sorted(expected)
+
+
 @pytest.mark.parametrize("field,expected", [("null", True), ("missing", False), ("bool", False)])
 async def test_json_null_is_explicit(store, field, expected):
     await store.create_run("explicit-null", "agent", meta={"null": None, "bool": True})

@@ -76,8 +76,8 @@ Agent(
 | `loop` | `ReActLoop()` (default) or `SingleCall()`. See [Loops](/docs/architecture/loops). |
 | `output_type` | A pydantic model for structured output. SingleCall only. |
 | `database_url` | SQLAlchemy async URL. Enables persistence. Matching URLs and options share an engine within the process and event loop; close every Agent to release its reference. Configure persistence with `database_url` or `state_store`; the Agent ignores `DENDRUX_DATABASE_URL`. If it is set with no effective store, the Agent stays without persistence and logs `database_url_env_ignored` once per process. The CLI still reads the variable. |
-| `database_options` | Engine options plus the store option `notify_channel` (default `None`, notifications off). Only engine options reach `create_async_engine`. See [Scaling](/docs/guides/scaling#event-notifications). |
-| `state_store` | An explicit `StateStore` instead of `database_url` (mutually exclusive). Create one per worker event loop and share it. See [StateStore capabilities](/docs/reference/state-store). |
+| `database_options` | Options for `create_async_engine`, only. A `live_updates` key is refused with a `ValueError` (even with the value `None` or `False`): live updates belong to the store, so build one with `live_updates=...` and pass it as `state_store=`. See [Scaling](/docs/guides/scaling#live-updates). |
+| `state_store` | An explicit `StateStore` instead of `database_url` (mutually exclusive). Create one per worker event loop and share it. It is the only way to enable live updates (`PostgresStateStore(engine, live_updates=True)`); you close it with `await store.close()`, because `Agent.close()` closes only a store the Agent built from `database_url=`. See [StateStore capabilities](/docs/reference/state-store) and [Scaling](/docs/guides/scaling#live-updates). |
 | `deny` | Tool names that can never execute. See [Access control](/docs/architecture/access-control). |
 | `require_approval` | Server-tool names that pause for approval. See [Approval](/docs/architecture/approval). |
 | `budget` | A `Budget(max_tokens=..., max_cost_usd=..., warn_at=..., on_exceed=..., include_children=...)`. Token and dollar limits with an optional pause or cancel. See [Budget](/docs/architecture/budget). |
@@ -110,7 +110,8 @@ An invalid `lease_interval` raises `ValueError`. Declared store capabilities are
 | `max_metadata_bytes` | 64 KiB | Run `metadata` | `ValueError` |
 | `max_notes_per_run` | 1000 | `submit_note` per run | `NoteLimitExceededError` (a `ValueError`) |
 | `max_pending_calls` | 64 | One format-2 assistant call batch, before dispatch | Run ends `error` with `failure_reason="pending_limit"` |
-| `max_rebuild_bytes` | 16 MiB | Format-2 conversation reconstruction | `reclaim()` refuses with `history_too_large`; `resume()` raises `InputValidationError` (field `history`, code `history_too_large`) before claiming, so the run stays paused |
+| `max_rebuild_bytes` | 16 MiB | Format-2 conversation reconstruction | `reclaim()` refuses with `history_too_large`; `resume()` raises `InputValidationError` (field `history`, code `history_too_large`) before claiming, so the run stays paused. A `submit_*` continuation has already claimed the run when it hits this limit: it releases the claim and restores the waiting status |
+| `max_pause_summary_bytes` | 64 KiB | Format-2 human-input display summary; UTF-8 JSON, supported range 128 bytes to 512 KiB | Question first, then options; excess text gets `[truncated]` and options that do not fit are omitted. Pause succeeds. Excluded from governance; reclaim uses the configured value |
 | `max_rebuild_rows` | 20,000 | Expanded conversation entries during reconstruction | Same refusal; history is never truncated to continue |
 
 [//]: # "docs-test: skip - fragment: relies on `provider`, defined by setup shown elsewhere"
@@ -213,6 +214,10 @@ in-flight model call or tool and makes `run()` *return*
 preserved. Stream cancellation has the partial-answer semantics described below.
 See [Cancellation](/docs/architecture/cancellation#interrupting-run).
 
+### Cancelling while a run is created or claimed
+
+Cancelling the task that awaits `run()`, `stream()`, `resume()`, a `submit_*` call or a reclaim while the run is being created or claimed has its own rules for built-in SQL stores. Before the `COMMIT` is issued, nothing changes and the request can be retried. From `COMMIT` onward the run ends `cancelled` at the epoch it acquired. A private bound of about five seconds covers only that handoff. If it expires, the run is left for `sweep`, and `sweep(on_stale="reclaim")` followed by `agent.reclaim()` can continue a run its caller cancelled. See [Cancelling while a run is created or claimed](/docs/architecture/cancellation#cancelling-while-a-run-is-created-or-claimed) for the bound, the recovery risk, custom stores and legacy boolean claims.
+
 A finished run's `RunResult.meta["undelivered_notes"]` lists inbox note ids it
 never delivered (present only when there are any); see
 [Inbox notes](/docs/architecture/inbox).
@@ -253,10 +258,10 @@ class RunResult:
 | `output` | The parsed `output_type` model on a `SingleCall` run; `None` otherwise. |
 | `stop_reason` / `truncated` | Why the call that produced the answer stopped; `truncated` is `True` for `max_tokens`. See [Truncated answers](#truncated-answers). |
 | `error` | A safe one-line description when the run ended `error`. It never carries provider text. |
-| `error_info` | An [`ErrorInfo`](/docs/reference/errors#provider-errors) when a provider failure ended the run (a database write that fails after the retries makes `agent.run` raise `PersistenceError` instead; a stream ends with a `run_error` event that carries the fixed message; see [When a write fails inside a run](/docs/reference/errors#when-a-write-fails-inside-a-run)): `category`, `retryable`, `safe_message`, `error_type`, `provider`, `model`, `status_code`, `provider_code` and `timeout_reason`. Every field is a code, number or name. A stale stream observing a live owner uses `category="run_fenced"` while preserving its current run status; otherwise `None` for other outcomes. |
+| `error_info` | An [`ErrorInfo`](/docs/reference/errors#provider-errors) when a provider failure ended the run (a database write that fails after the retries makes `agent.run` raise `PersistenceError` instead; a stream ends with a `run_error` event that carries the fixed message; see [When a write fails inside a run](/docs/reference/errors#when-a-write-fails-inside-a-run)): `category`, `retryable`, `safe_message`, `error_type`, `provider`, `model`, `status_code`, `provider_code` and `timeout_reason`. Every field is a code, number or name. A stale stream observing a live owner uses `category="run_fenced"` while preserving its current run status. A failed `resume_stream` attempt after claim release also carries failure information while preserving the observed pause or running status; otherwise `None` for other outcomes. |
 | `pause_id` | The id of the current pause of a paused run; pass it back as `expected_pause_id=`. |
 | `pending` | The active pause as a `PendingPause` (the same object `RunStore.get_pending` returns), or `None`. |
-| `recovery` | Reclaim count, last reclaim time and bounded replayed-call ids, or `None` for a run never reclaimed. See [Recovery](/docs/guides/recovery#inspect-a-recovered-run). |
+| `recovery` | Reclaim count, last reclaim time and bounded replayed-call ids. `None` means never reclaimed, or an optional projection failed on a committed-outcome or `cancel_run` response. `get_result` propagates projection failures. See [Recovery](/docs/guides/recovery#inspect-a-recovered-run). |
 | `meta` | Run metadata such as `meta["undelivered_notes"]`, `meta["interrupted"]` and `meta["mcp_skipped_sources"]`. A fresh result from `run()` includes `meta["pii_mapping"]` (placeholder to real value) when guardrails redacted anything; treat it as sensitive and never return `meta` wholesale. It never contains the internal pause state. |
 
 ### `to_dict()`: the browser envelope
@@ -485,7 +490,7 @@ Continue a marked format-2 ReAct run from its committed checkpoint. Call `sweep(
 
 Explicit tenant scope is mandatory even with `strict_tenancy=False`. `None` selects untenanted runs; `UNSCOPED` is for trusted cross-tenant use. A store without recovery capability raises `NotImplementedError`. An interrupted non-idempotent tool pauses for approval before another attempt. The result can be paused or terminal, just like `run`. See [Recovery](/docs/guides/recovery).
 
-`RunResult.recovery` is `None` until a run has been reclaimed. Otherwise it contains the reclaim count, last reclaim time and a bounded replayed-call list with a truncation flag. The additive `recovery` field is included in `to_dict()` and `get_result()` for reclaimed runs; unreclaimed envelopes omit it.
+`RunResult.recovery` contains the reclaim count, last reclaim time and a bounded replayed-call list with a truncation flag. It is `None` for an unreclaimed run, or if its optional projection fails while returning a committed outcome or `cancel_run` response. `to_dict()` omits the key whenever it is `None`; `result_read_failed` logs projection failure. `get_result()` is strict: it raises on recovery read failure, so a successful `get_result()` with `recovery=None` still means the run was never reclaimed.
 
 ## `cancel_run`
 

@@ -38,6 +38,7 @@ from dendrux.runtime._bounds import (
     SWEEP_MAX_RUNS_DEFAULT,
     SWEEP_MAX_RUNS_MAX,
 )
+from dendrux.runtime.durability import _live_updates_boundary
 from dendrux.runtime.state import SweepResult, _validate_sweep_age
 
 if TYPE_CHECKING:
@@ -136,72 +137,75 @@ async def sweep(
         assert state_store is not None
         store = state_store
 
-    try:
-        # Preserve legacy custom-store signatures at the default settings.
-        limits = {}
-        if batch_size != SWEEP_BATCH_DEFAULT:
-            limits["batch_size"] = batch_size
-        if max_runs != SWEEP_MAX_RUNS_DEFAULT:
-            limits["max_runs"] = max_runs
-        from dendrux.runtime._capabilities import capabilities, validate_capabilities
+    async with _live_updates_boundary(store, sweep=True):
+        try:
+            # Preserve legacy custom-store signatures at the default settings.
+            limits = {}
+            if batch_size != SWEEP_BATCH_DEFAULT:
+                limits["batch_size"] = batch_size
+            if max_runs != SWEEP_MAX_RUNS_DEFAULT:
+                limits["max_runs"] = max_runs
+            from dendrux.runtime._capabilities import capabilities, validate_capabilities
 
-        if on_stale == "reclaim":
-            validate_capabilities(store)
-        if on_stale == "reclaim" and not capabilities(store).recovery:
-            _codes.log_code(logging.getLogger(__name__), _codes.STORE_CAPABILITY, run_id=None)
-            raise NotImplementedError(
-                f"StateStore {type(store).__name__} does not declare the 'recovery' capability"
+            if on_stale == "reclaim":
+                validate_capabilities(store)
+            if on_stale == "reclaim" and not capabilities(store).recovery:
+                _codes.log_code(logging.getLogger(__name__), _codes.STORE_CAPABILITY, run_id=None)
+                raise NotImplementedError(
+                    f"StateStore {type(store).__name__} does not declare the 'recovery' capability"
+                )
+            reclaimable = []
+            next_cursor = None
+            stale = []
+            if stale_running is not None:
+                combined_scan = getattr(store, "_scan_expired_runs", None)
+                if getattr(store, "_uses_combined_sweep", False) is True and callable(
+                    combined_scan
+                ):
+                    page = await combined_scan(
+                        cutoff=datetime.now(UTC) - stale_running,
+                        batch_size=batch_size,
+                        max_runs=max_runs,
+                        max_returned=max_returned,
+                        reclaim_limit=max_reclaims,
+                        cursor=cursor,
+                        on_stale=on_stale or "error",
+                    )
+                    stale, reclaimable, next_cursor = page.finalised, page.reclaimable, page.cursor
+                elif on_stale == "reclaim":
+                    page = await store.mark_lease_expired(
+                        cutoff=datetime.now(UTC) - stale_running,
+                        batch_size=batch_size,
+                        max_runs=max_runs,
+                        max_returned=max_returned,
+                        reclaim_limit=max_reclaims,
+                        cursor=cursor,
+                        finalise_unrecoverable=True,
+                    )
+                    stale, reclaimable, next_cursor = page.finalised, page.reclaimable, page.cursor
+                else:
+                    stale = await store.sweep_stale_runs(older_than=stale_running, **limits)
+                if on_stale is None and stale:
+                    warnings.warn(
+                        'sweep() will default to on_stale="reclaim" in 0.7; '
+                        'pass on_stale="error" to keep finalising stale runs.',
+                        FutureWarning,
+                        stacklevel=2,
+                    )
+            abandoned = (
+                await store.sweep_abandoned_runs(older_than=abandoned_waiting, **limits)
+                if abandoned_waiting is not None
+                else []
             )
-        reclaimable = []
-        next_cursor = None
-        stale = []
-        if stale_running is not None:
-            combined_scan = getattr(store, "_scan_expired_runs", None)
-            if getattr(store, "_uses_combined_sweep", False) is True and callable(combined_scan):
-                page = await combined_scan(
-                    cutoff=datetime.now(UTC) - stale_running,
-                    batch_size=batch_size,
-                    max_runs=max_runs,
-                    max_returned=max_returned,
-                    reclaim_limit=max_reclaims,
-                    cursor=cursor,
-                    on_stale=on_stale or "error",
-                )
-                stale, reclaimable, next_cursor = page.finalised, page.reclaimable, page.cursor
-            elif on_stale == "reclaim":
-                page = await store.mark_lease_expired(
-                    cutoff=datetime.now(UTC) - stale_running,
-                    batch_size=batch_size,
-                    max_runs=max_runs,
-                    max_returned=max_returned,
-                    reclaim_limit=max_reclaims,
-                    cursor=cursor,
-                    finalise_unrecoverable=True,
-                )
-                stale, reclaimable, next_cursor = page.finalised, page.reclaimable, page.cursor
-            else:
-                stale = await store.sweep_stale_runs(older_than=stale_running, **limits)
-            if on_stale is None and stale:
-                warnings.warn(
-                    'sweep() will default to on_stale="reclaim" in 0.7; '
-                    'pass on_stale="error" to keep finalising stale runs.',
-                    FutureWarning,
-                    stacklevel=2,
-                )
-        abandoned = (
-            await store.sweep_abandoned_runs(older_than=abandoned_waiting, **limits)
-            if abandoned_waiting is not None
-            else []
-        )
-        return SweepResult(
-            stale_running=stale,
-            abandoned_waiting=abandoned,
-            reclaimable=reclaimable,
-            cursor=next_cursor,
-        )
-    finally:
-        if engine is not None:
-            await engine.dispose()
+            return SweepResult(
+                stale_running=stale,
+                abandoned_waiting=abandoned,
+                reclaimable=reclaimable,
+                cursor=next_cursor,
+            )
+        finally:
+            if engine is not None:
+                await engine.dispose()
 
 
 def _validate_thresholds(*thresholds: timedelta | None) -> None:
@@ -216,6 +220,9 @@ def _validate_source(
     database_options: dict[str, Any] | None,
 ) -> None:
     """Reject ambiguous persistence configuration before opening an engine."""
+    from dendrux.db._engine_options import split_database_options
+
+    split_database_options(database_options, replacement="use sweep(state_store=...)")
     if database_url is not None and state_store is not None:
         raise ValueError(
             "database_url and state_store are mutually exclusive. Pass one or the other."

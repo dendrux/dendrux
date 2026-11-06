@@ -23,7 +23,7 @@ async def test_format_one_committed_finalize_lost_ack_returns_success(
 ):
     await pin_storage_format(engine, 1)
     active = ContextVar("format_one_finalize", default=False)
-    finalize = store.finalize_run
+    finalize = store.finalize_with_event
     epochs = []
 
     @wraps(finalize)
@@ -35,7 +35,7 @@ async def test_format_one_committed_finalize_lost_ack_returns_success(
         finally:
             active.reset(token)
 
-    monkeypatch.setattr(store, "finalize_run", marked)
+    monkeypatch.setattr(store, "finalize_with_event", marked)
     commit = AsyncSession.commit
     cuts = 0
 
@@ -44,8 +44,8 @@ async def test_format_one_committed_finalize_lost_ack_returns_success(
         await commit(session)
         if active.get() and cuts == 0:
             cuts += 1
-            # Format 1 completion has no caller-unique evidence row.
-            assert not session.info.get("dendrux.fresh_evidence")
+            # Atomic format-1 completion includes a unique terminal event.
+            assert session.info.get("dendrux.fresh_evidence")
             raise OperationalError(None, None, LostConnectionError())
 
     monkeypatch.setattr(AsyncSession, "commit", commit_then_drop)
@@ -64,6 +64,8 @@ async def test_format_one_committed_finalize_lost_ack_returns_success(
         assert persisted.storage_format == 1
         assert persisted.status == "success"
         assert persisted.claim_epoch == 0
+        stored_events = await store.get_run_events(result.run_id, limit=100)
+        assert sum(event.event_type == "run.completed" for event in stored_events) == 1
     finally:
         await agent.close()
 

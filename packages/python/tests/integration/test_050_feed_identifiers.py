@@ -39,7 +39,9 @@ async def _follow(run_store: RunStore, run_id: str, **kw: Any) -> list[StoredEve
     return out
 
 
-async def test_unknown_tool_name_is_a_placeholder(store: Any, engine: Any) -> None:
+async def test_unknown_tool_name_is_a_placeholder(
+    run_store: RunStore, store: Any, engine: Any
+) -> None:
     llm = ScriptedLLM(
         [
             LLMResponse(
@@ -59,7 +61,6 @@ async def test_unknown_tool_name_is_a_placeholder(store: Any, engine: Any) -> No
     await store.save_run_event(
         result.run_id, event_type="tools.declared", data={"local_tool_names": ["flaky"]}
     )
-    run_store = RunStore.from_engine(engine)
     events = await _follow(run_store, result.run_id)
     completed = [e.data for e in events if e.event_type == "tool.completed"]
     names = sorted(d["tool_name"] for d in completed)
@@ -67,7 +68,7 @@ async def test_unknown_tool_name_is_a_placeholder(store: Any, engine: Any) -> No
     assert SECRET not in json.dumps([e.data for e in events])
     views = [
         await run_store.get_event_view(result.run_id, e, tenant_id="A")
-        for e in await run_store.get_events(result.run_id, tenant_id="A")
+        for e in await run_store.get_events(result.run_id, tenant_id="A", limit=1000)
     ]
     assert SECRET not in json.dumps([v.data for v in views])
     trusted = await _follow(run_store, result.run_id, include_payloads=True)

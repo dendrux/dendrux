@@ -102,6 +102,7 @@ def build_agent(provider: LLMProvider, url: str) -> Agent:
         prompt="Use take_screenshot when you need to see the user's screen, then answer.",
         tools=[take_screenshot],
         database_url=url,
+        strict_tenancy=False,  # single-tenant demo (see Multi-tenancy docs)
     )
 
 
@@ -146,9 +147,11 @@ async def main() -> None:
 
             # The blob is tenant-scoped and readable only through the run that references it.
             async with RunStore.from_database_url(url) as store:
-                events = await store.get_events(paused.run_id, event_types=["run.resumed"])
+                events = await store.get_events(
+                    paused.run_id, event_types=["run.resumed"], limit=100
+                )
                 print("run.resumed:", events[0].data)
-                traces = await store.get_traces(paused.run_id)
+                traces = await store.get_traces(paused.run_id, limit=100)
                 tool_trace = next(t for t in traces if t.role == "tool")
                 image_part = next(
                     p for p in (tool_trace.meta or {})["dendrux.parts"] if p["type"] == "image"

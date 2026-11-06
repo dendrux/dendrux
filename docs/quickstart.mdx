@@ -9,6 +9,8 @@ In five minutes you'll install dendrux, build an agent that pauses to wait for a
 
 The outputs below were captured from real runs on Dendrux 0.5.0 with claude-haiku-4-5. Ids and timestamps will differ on your machine, and so will the model's wording.
 
+> **Reading the snippets.** The quickstart scripts run as they are. Elsewhere in these docs a short snippet may show `await` on its own line: run it inside an `async def`, or in a shell started with `python -m asyncio`.
+
 ## 1. Install
 
 ```bash
@@ -100,7 +102,7 @@ Four things worth noticing:
 3. `database_url` is what makes the run survive a process exit. Three options:
    - **Omit it** → in-memory only. Fine for one-shot scripts and tests; the run dies with the process.
    - **SQLite** → `sqlite+aiosqlite:///./quickstart.db` writes to a single file. Zero setup — dendrux auto-creates tables on first connect. Ideal for local dev and small single-node apps. The `.db` file is what you back up.
-   - **Postgres** → `postgresql+asyncpg://user:pass@host/db` for multi-process or production. Same code path. Run `dendrux db migrate` once to apply the schema (Alembic) before first use.
+   - **Postgres** → `postgresql+asyncpg://user:pass@host/db` for multi-process or production. Same code path. Run `dendrux db migrate` once before first use. New PostgreSQL databases come up active at format 2. Existing databases need `dendrux db activate` after every worker and reader is upgraded; see [Upgrading to 0.6.0](/docs/upgrading-to-0.6.0).
 4. `strict_tenancy=False` says this is a single-tenant app, so calls need no `tenant_id`. In 0.6 strict tenancy defaults to `True` for agents with a database, including this example. An Agent without a state store can omit `tenant_id` without a warning. A multi-user app passes `tenant_id=` on every call instead; see [Multi-tenancy](/docs/architecture/multi-tenancy).
 
 ## 4. Start a run
@@ -198,3 +200,4 @@ This is the foundation everything else in dendrux is built on. From here:
 - Read [Runs and the lifecycle](/docs/architecture/runs) to understand the state machine.
 - Read [State persistence](/docs/architecture/state-persistence) to see what's actually stored on disk.
 - Read the [HITL approval recipe](/docs/recipes/hitl-approval) to wire this into a web app.
+- Serving live reads from your own routes? Read [Build your own read routes](/docs/recipes/build-your-own-read-routes) and close the `RunStore` before you dispose its engine ([lifecycle](/docs/reference/run-store#constructors-and-lifecycle)).

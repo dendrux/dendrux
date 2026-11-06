@@ -543,7 +543,9 @@ async def test_startup_write_failure_grid(store, engine, monkeypatch, path):
     monkeypatch.setattr(store, "save_run_event", fail_start)
     if path in {"run_stream", "resume_stream"}:
         result = await case.invoke()
-        assert result.status == RunStatus.ERROR
+        assert result.status == (
+            RunStatus(old_status) if path == "resume_stream" else RunStatus.ERROR
+        )
         assert case.events[-1].type == RunEventType.RUN_ERROR
     else:
         with pytest.raises(RuntimeError) as caught:
@@ -553,11 +555,8 @@ async def test_startup_write_failure_grid(store, engine, monkeypatch, path):
         new = [row for row in await store.list_runs() if row.id not in {r.id for r in before}]
         assert len(new) == 1 and new[0].status == "error"
     else:
-        # An unconsumed submit/reclaim startup is retryable by the explicit
-        # claim-release contract; direct resume owns ERROR finalization.
-        assert (await store.get_run(case.run_id)).status == (
-            old_status if path in SUBMIT_KINDS or path == "recovery" else "error"
-        )
+        # Every unconsumed continuation releases its exact claim on startup failure.
+        assert (await store.get_run(case.run_id)).status == old_status
     assert provider.calls == 0
 
 
@@ -934,7 +933,7 @@ async def test_released_submit_reports_abort_without_failure_hooks(
     try:
         raw = next(
             event
-            for event in await reader.get_events(run_id, tenant_id="tenant")
+            for event in await reader.get_events(run_id, tenant_id="tenant", limit=1000)
             if event.event_type == "run.resume_aborted"
         )
         assert (await reader.get_event_view(run_id, raw, tenant_id="tenant")).data == raw.data
@@ -1077,6 +1076,7 @@ async def test_retry_failure_before_creation_finalizes_nothing(store, monkeypatc
     )
     finalize = AsyncMock()
     monkeypatch.setattr(store, "finalize_run", finalize)
+    monkeypatch.setattr(store, "finalize_with_event", finalize)
     monkeypatch.setattr(runner, "_create_runtime_run", AsyncMock(side_effect=failure))
     with pytest.raises(type(failure)) as caught:
         await a.retry(original.run_id)
@@ -1218,7 +1218,7 @@ async def test_overlapping_same_agent_submit_preserves_new_owner_and_interrupts(
         with pytest.raises(RuntimeError) as caught:
             await first
         assert caught.value is original
-        notifier.on_run_failed.assert_not_awaited()
+        notifier.on_run_failed.assert_awaited_once_with(run_id, original, iteration=None)
         assert a._task_manager._tasks.get(run_id) is new_owner
         assert a._task_manager._owned.get(run_id) is new_owner
         assert not new_owner.done()

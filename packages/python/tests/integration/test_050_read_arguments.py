@@ -162,9 +162,9 @@ async def test_read_image_with_hostile_hash_reads_as_missing(engine: Any, paused
 
 async def test_valid_edge_values_still_work(engine: Any, paused: str) -> None:
     store = RunStore.from_engine(engine)
-    assert await store.get_events(paused, after_sequence_index=2**31 - 1) == []
-    assert len(await store.get_events(paused, after_sequence_index=-(2**31))) > 0
-    assert await store.get_events(paused, event_types=[]) == []
+    assert await store.get_events(paused, after_sequence_index=2**31 - 1, limit=1000) == []
+    assert len(await store.get_events(paused, after_sequence_index=-(2**31), limit=1000)) > 0
+    assert await store.get_events(paused, event_types=[], limit=1000) == []
     assert await store.get_run("a" * 255) is None
     assert await store.get_run(paused, tenant_id="t" * 255) is None
     assert len(await store.list_runs(limit=0)) == 1  # clamped, as before

@@ -98,7 +98,7 @@ async def main() -> None:
 
     store = RunStore.from_database_url(url)
     async with store:
-        for e in await store.get_events(result.run_id):
+        for e in await store.get_events(result.run_id, limit=100):
             print(e.sequence_index, e.event_type)
         # 0 run.started
         # 1 tools.declared

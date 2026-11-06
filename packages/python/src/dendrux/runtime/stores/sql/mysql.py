@@ -30,6 +30,7 @@ if TYPE_CHECKING:
 
     from sqlalchemy.ext.asyncio import AsyncEngine
 
+    from dendrux.db._live_updates import LiveUpdates
     from dendrux.runtime.state import ClaimResult, TenantScope
 
 _increment_site: ContextVar[tuple[Any, str] | None] = ContextVar(
@@ -131,9 +132,11 @@ class MySQLStateStore(SQLStateStore):
     supports_row_locks = True
     ddl_transactional = False
 
-    def __init__(self, engine: AsyncEngine) -> None:
-        super().__init__(engine)
-        self.capabilities = replace(self.capabilities, deployment="multi_server", notify=False)
+    def __init__(
+        self, engine: AsyncEngine, *, live_updates: LiveUpdates | bool | None = None
+    ) -> None:
+        super().__init__(engine, live_updates=live_updates)
+        self.capabilities = replace(self.capabilities, deployment="multi_server")
 
     def classify_db_error(self, exc: BaseException) -> Any:
         from dendrux.runtime.stores._errors import DbError
@@ -149,7 +152,9 @@ class MySQLStateStore(SQLStateStore):
         return classified
 
     @classmethod
-    def from_url(cls, url: str, **engine_options: Any) -> MySQLStateStore:
+    def from_url(
+        cls, url: str, *, live_updates: LiveUpdates | bool | None = None, **engine_options: Any
+    ) -> MySQLStateStore:
         """Create a shared engine with connection-time UTC and READ COMMITTED."""
         from sqlalchemy.ext.asyncio import create_async_engine
 
@@ -160,7 +165,10 @@ class MySQLStateStore(SQLStateStore):
         )
 
         options = mysql_engine_options(engine_options)
-        return cls(create_engine_with_hint(create_async_engine, normalized_url(url), **options))
+        return cls(
+            create_engine_with_hint(create_async_engine, normalized_url(url), **options),
+            live_updates=live_updates,
+        )
 
     @_safe_database_call
     async def connection_checks(self, conn: Any) -> Any:

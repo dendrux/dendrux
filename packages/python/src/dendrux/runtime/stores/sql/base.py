@@ -1,4 +1,9 @@
-"""Shared SQL persistence. Lock order: run, ordered children, ordered blobs, settings."""
+"""Shared SQL persistence. Lock order: run, ordered children, ordered blobs, settings.
+
+Live updates are lossy hints. If create_run commits but loses its acknowledgement
+and readback wrongly proves it absent, the retry may recover the created run from
+the unique conflict without sending a hint. Polling still observes that run.
+"""
 
 from __future__ import annotations
 
@@ -23,9 +28,9 @@ from dendrux._lifecycle import (
     StoredEventType,
 )
 from dendrux._meta_keys import (
+    ANNOUNCE_MARKS_SESSION_KEY,
     COMMIT_PROOFS_SESSION_KEY,
     ERROR_INFO_META_KEY,
-    EVENT_HOOK_SESSION_KEY,
     FRESH_EVIDENCE_SESSION_KEY,
     GOVERNANCE_KEY,
     LATEST_REWRITE_META_KEY,
@@ -56,6 +61,9 @@ from dendrux.runtime._bounds import (
 from dendrux.runtime._bounds import IN_CHUNK as _IN_CHUNK
 from dendrux.runtime.durability import (
     _CommitNotAppliedError,
+    _enqueue_live_updates,
+    _live_updates_page,
+    _mark_commit_issued,
     _safe_database_call,
     retry_transient_db,
     safe_database_operations,
@@ -71,11 +79,13 @@ from dendrux.types import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Callable, Sequence
+    from collections.abc import AsyncIterator, Callable, Mapping, Sequence
     from datetime import datetime, timedelta
 
     from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
+    from sqlalchemy.sql.base import Executable
 
+    from dendrux.db._live_updates import LiveUpdates
     from dendrux.db.models import AgentRun
     from dendrux.media import BlobEdge
     from dendrux.runtime.stores._errors import DbError
@@ -280,6 +290,21 @@ def _validate_checkpoint(run_id: str, value: dict[str, Any]) -> None:
         _checkpoint_error(run_id)
 
 
+def _validate_rewrite_entries(run_id: str, value: Any) -> None:
+    if not isinstance(value, list) or len(value) > _RECOVERY_MAX_MESSAGES:
+        _checkpoint_error(run_id)
+    if any(
+        not isinstance(m, dict)
+        or not isinstance(m.get("role"), str)
+        or not isinstance(m.get("content"), str)
+        for m in value
+    ):
+        raise ValueError("Rewrite entries require role and content")
+    if any(not isinstance(m.get("meta", {}), dict) for m in value):
+        _codes.log_code(logger, _codes.REWRITE_INVALID, run_id=run_id)
+        raise ValueError("Rewrite entry metadata must be an object")
+
+
 def _validate_trace_write(run_id: str, trace: TraceWrite) -> None:
     from dendrux.types import _validate_persistable
 
@@ -292,18 +317,7 @@ def _validate_trace_write(run_id: str, trace: TraceWrite) -> None:
             _checkpoint_error(run_id)
         value = json.loads(trace.content)
         if trace.trace_kind == "rewrite":
-            if not isinstance(value, list) or len(value) > _RECOVERY_MAX_MESSAGES:
-                _checkpoint_error(run_id)
-            if any(
-                not isinstance(m, dict)
-                or not isinstance(m.get("role"), str)
-                or not isinstance(m.get("content"), str)
-                for m in value
-            ):
-                raise ValueError("Rewrite entries require role and content")
-            if any(not isinstance(m.get("meta", {}), dict) for m in value):
-                _codes.log_code(logger, _codes.REWRITE_INVALID, run_id=run_id)
-                raise ValueError("Rewrite entry metadata must be an object")
+            _validate_rewrite_entries(run_id, value)
         elif not isinstance(value, dict) or value.get("kind") not in (
             "image_view",
             "skills_session",
@@ -422,7 +436,6 @@ class SQLStateStore(SQLBlobCatalog):
         retry_ids=True,
         checkpointing=True,
         atomic_completion=True,
-        notify=True,
         recovery=True,
     )
 
@@ -589,190 +602,53 @@ class SQLStateStore(SQLBlobCatalog):
         if expected:
             self._remember_write(session, AgentRun.__table__, AgentRun.id == run_id, expected)
 
-    async def _write_tx(self, session: AsyncSession, *, run_ids: Sequence[str] = ()) -> None:
-        """Commit once; prove identity after a lost acknowledgement or fail closed."""
-        from sqlalchemy import select
-        from sqlalchemy.exc import SQLAlchemyError
-
-        from dendrux.errors import PersistenceError
-        from dendrux.runtime.durability import (
-            StoreOutcomeUnknown,
-            _CommitNotAppliedError,
-            _database_operation,
-            is_transient_db_error,
-        )
+    def _commit_operation(self, session: AsyncSession, run_ids: Sequence[str]) -> Any:
+        from dendrux.runtime.durability import _database_operation
 
         operation = _database_operation.get()
-        owner, name, arguments = operation if operation is not None else (None, "", {})
-        run_id = arguments.get("run_id")
+        _, _, arguments = operation or (None, "", {})
         touched = session.info.setdefault(TOUCHED_RUNS_SESSION_KEY, set())
         touched.update(run_ids)
         touched.update(arguments.get("run_ids", ()))
+        run_id = arguments.get("run_id")
         if run_id is not None:
             touched.add(run_id)
+        return operation
 
-        def unknown() -> NoReturn:
-            _codes.log_code(logger, _codes.STORE_OUTCOME_UNKNOWN, run_id=run_id)
-            raise StoreOutcomeUnknown() from None
+    def _mark_announce(self, session: AsyncSession, run_ids: Sequence[str]) -> None:
+        session.info.setdefault(ANNOUNCE_MARKS_SESSION_KEY, set()).update(run_ids)
 
-        # ORM flush is pre-COMMIT: any failure here is safe to roll back and
-        # retry through the operation's whole-transaction boundary.
+    def _enqueue_committed(
+        self, session: AsyncSession, commit_issued: bool, succeeded: bool
+    ) -> None:
+        marks = session.info.pop(ANNOUNCE_MARKS_SESSION_KEY, ())
+        if commit_issued and marks and self._live_updates is not None:
+            _enqueue_live_updates(self, marks, succeeded)
+
+    async def _write_tx(self, session: AsyncSession, *, run_ids: Sequence[str] = ()) -> None:
+        """Commit once; prove identity after a lost acknowledgement or fail closed."""
+        from dendrux.runtime.stores.sql._commit import _CommitReadback
+
+        operation = self._commit_operation(session, run_ids)
+        # ORM flush remains pre-COMMIT and cannot publish hints on failure.
         await session.flush()
+        commit_issued = False
+        succeeded = False
         try:
-            await session.commit()
+            try:
+                commit_issued = True
+                _mark_commit_issued()
+                await session.commit()
+            except Exception as error:
+                await _CommitReadback(self, session, operation).resolve(error)
             session.info.pop(COMMIT_PROOFS_SESSION_KEY, None)
             session.info.pop(FRESH_EVIDENCE_SESSION_KEY, None)
-            return
-        except SQLAlchemyError as exc:
-            classified = self.classify_db_error(exc)
-            try:
-                await session.rollback()
-            except SQLAlchemyError:
-                _codes.log_code(logger, _codes.PERSISTENCE_ERROR, run_id=run_id)
-                if classified.kind == "connection_lost":
-                    unknown()
-                raise PersistenceError() from None
-            if classified.kind in ("deadlock_or_serialization", "lock_timeout") or not (
-                is_transient_db_error(exc, classify=self.classify_db_error)
-            ):
-                raise
-
-        # Claim identity cannot be reconstructed from a later epoch. This also
-        # covers submission claims and every other CAS without a retry identity.
-        if name in ("claim_paused_run", "submit_and_claim", "reclaim_run", "release_run_claim"):
-            unknown()
-        proofs = session.info.pop(COMMIT_PROOFS_SESSION_KEY, [])
-        fresh_evidence = session.info.pop(FRESH_EVIDENCE_SESSION_KEY, False)
-        transitions = {
-            "finalize_run",
-            "finalize_run_if_status_in",
-            "finalize_with_event",
-            "try_pause_run",
-            "pause_with_event",
-            "pause_run",
-            "consume_submission",
-        }
-        claim_epoch = arguments.get("claim_epoch")
-        prove_fence = name in transitions and claim_epoch is not None and not fresh_evidence
-        if name in (
-            "save_trace",
-            "save_tool_call",
-            "save_usage",
-            "save_llm_interaction",
-            "save_run_event",
-            "start_tool_call",
-            "complete_tool_call",
-            "consume_submission",
-        ):
-            evidence = [proof for proof in proofs if proof[0].name != "agent_runs"]
-            if evidence and not prove_fence:
-                # An immutable retry identity proves publication even after a
-                # sibling writer advances the run's mutable execution state.
-                proofs = evidence
-        if not proofs:
-            unknown()
-
-        async def lost(*, absent: bool = False) -> NoReturn:
-            from dendrux.db.models import AgentRun
-
-            retry_id = {
-                "save_trace": "trace_id",
-                "save_tool_call": "row_id",
-                "save_usage": "usage_id",
-                "save_llm_interaction": "interaction_id",
-                "save_run_event": "event_id",
-                "start_tool_call": "row_id",
-            }.get(name)
-            if absent and (
-                name == "create_run"
-                or (retry_id is not None and arguments.get(retry_id) is not None)
-            ):
-                raise _CommitNotAppliedError() from None
-            if name not in transitions or run_id is None:
-                unknown()
-            predicate = AgentRun.id == run_id
-            epoch = arguments.get("claim_epoch")
-            if epoch is not None:
-                predicate &= AgentRun.claim_epoch == epoch
-            statuses = arguments.get("allowed_current_statuses")
-            if statuses is not None:
-                predicate &= AgentRun.status.in_(statuses)
-            elif name == "finalize_run" and arguments.get("expected_current_status") is not None:
-                predicate &= AgentRun.status == arguments["expected_current_status"]
-            elif name in ("try_pause_run", "pause_with_event"):
-                predicate &= (
-                    AgentRun.status == RunStatus.RUNNING.value
-                ) & AgentRun.cancel_requested.is_(False)
-            elif name in ("pause_run", "consume_submission") and epoch is not None:
-                predicate &= AgentRun.status == RunStatus.RUNNING.value
-            if name == "consume_submission":
-                predicate &= (
-                    self.json_get(AgentRun.loop_state, ("submission", "submission_id"), "str")
-                    == arguments["submission_id"]
-                )
-            if await session.scalar(select(AgentRun.id).where(predicate)) is not None:
-                # Raise rather than return a CAS miss: callers such as the
-                # recorder discard return values, and the runner cancels on a miss.
-                raise _CommitNotAppliedError() from None
-            unknown()
-
-        try:
-            from decimal import ROUND_HALF_UP, Decimal
-
-            from dendrux.db.models import AgentRun
-
-            await self._prepare_commit_readback(session)
-            # Wait for an in-flight transaction before reading its evidence or
-            # precondition. Plain MVCC reads could observe the old row and cause
-            # a retry whose CAS loses against our original successful write.
-            for touched_run in sorted(touched):
-                if not self.supports_row_locks:
-                    await self.reserve_parent_writer(session, touched_run)
-                await session.execute(
-                    self.lock_clause(select(AgentRun.id).where(AgentRun.id == touched_run), "share")
-                )
-            fenced_run_proven = False
-            for table, predicate, expected in proofs:
-                check_epoch = prove_fence and table.name == "agent_runs"
-                if check_epoch:
-                    # A fenced transition's owner identity must match in the
-                    # same readback as its postcondition, including epoch zero.
-                    expected = {**expected, "claim_epoch": claim_epoch}
-                stored = (
-                    (
-                        await session.execute(
-                            self.lock_clause(
-                                select(*[table.c[key] for key in expected]).where(predicate),
-                                "share",
-                            )
-                        )
-                    )
-                    .mappings()
-                    .one_or_none()
-                )
-                if stored is None:
-                    await lost(absent=True)
-                for key, value in expected.items():
-                    actual = stored[key]
-                    if isinstance(actual, Decimal) and value is not None:
-                        value = Decimal(str(value)).quantize(
-                            Decimal("0.000001"), rounding=ROUND_HALF_UP
-                        )
-                    if isinstance(actual, _dt.datetime) and isinstance(value, _dt.datetime):
-                        actual, value = _to_aware_utc(actual), _to_aware_utc(value)
-                    if isinstance(actual, (dict, list)) or isinstance(value, (dict, list)):
-                        from dendrux.runtime._digest import content_digest
-
-                        actual, value = content_digest(actual), content_digest(value)
-                    if actual != value:
-                        await lost()
-                fenced_run_proven |= check_epoch
-            if name in transitions and not fresh_evidence and not fenced_run_proven:
-                unknown()
+            succeeded = True
         except _CommitNotAppliedError:
+            commit_issued = False
             raise
-        except (SQLAlchemyError, PersistenceError):
-            unknown()
+        finally:
+            self._enqueue_committed(session, commit_issued, succeeded)
 
     async def update_one(
         self,
@@ -975,7 +851,9 @@ class SQLStateStore(SQLBlobCatalog):
             .all()
         )
 
-    def __init__(self, engine: AsyncEngine) -> None:
+    def __init__(
+        self, engine: AsyncEngine, *, live_updates: LiveUpdates | bool | None = None
+    ) -> None:
         import asyncio
 
         if engine.dialect.name not in self.dialect_names:
@@ -998,9 +876,6 @@ class SQLStateStore(SQLBlobCatalog):
             expire_on_commit=False,
             info={
                 STORE_SESSION_KEY: self,
-                EVENT_HOOK_SESSION_KEY: lambda session, run_id: self._after_event_insert(
-                    session, run_id
-                ),
             },
         )
         if shares_one_connection(engine):
@@ -1009,6 +884,43 @@ class SQLStateStore(SQLBlobCatalog):
             warn_if_shared_connection(engine)
             self._session_factory = _SerializedSessionFactory(engine, self._session_factory)
         self._session_factory = _CheckedSessionFactory(self, self._session_factory)
+        self._live_updates = self._bind_live_updates(live_updates)
+
+    @property
+    def live_updates(self) -> LiveUpdates | None:
+        """The live update bus owned by this store, if enabled."""
+        return self._live_updates
+
+    def _native_live_updates(self) -> LiveUpdates | None:
+        return None
+
+    def _bind_live_updates(self, updates: LiveUpdates | bool | None) -> LiveUpdates | None:
+        if updates is None or updates is False:
+            return None
+        from dendrux.runtime.stores.sql._live_registry import register
+
+        updates = self._resolve_live_updates(updates)
+        updates.bind(self)
+        register(self)
+        return updates
+
+    def _resolve_live_updates(self, updates: LiveUpdates | bool) -> LiveUpdates:
+        from dendrux.db._live_updates import LiveUpdates
+
+        resolved = self._native_live_updates() if updates is True else updates
+        if not isinstance(resolved, LiveUpdates):
+            raise ValueError(
+                f"{type(self).__name__} requires a LiveUpdates instance; use RedisUpdates"
+            )
+        return resolved
+
+    async def close(self) -> None:
+        """Close store-owned live updates without disposing the engine."""
+        from dendrux.runtime.stores.sql._live_registry import deregister
+
+        if self._live_updates is not None:
+            await self._live_updates.close()
+            deregister(self)
 
     async def _check_connection(self, session: AsyncSession) -> None:
         if self._dialect_facts is not None:
@@ -1247,6 +1159,7 @@ class SQLStateStore(SQLBlobCatalog):
                             blob_refs_scope=blob_refs_scope,
                             run_tenant_id=tenant_id,
                         )
+                    self._mark_announce(session, (run_id,))
                     await self._write_tx(session)
                 except _CommitNotAppliedError:
                     absent_retry = True
@@ -1294,7 +1207,11 @@ class SQLStateStore(SQLBlobCatalog):
             )
 
         return await retry_transient_db(
-            _attempt, label="create_run", run_id=run_id, classify=self.classify_db_error
+            _attempt,
+            label="create_run",
+            run_id=run_id,
+            classify=self.classify_db_error,
+            _raw_driver_errors=True,
         )
 
     def idempotency_scope_predicate(self, tenant_id: str | None) -> Any:
@@ -1910,6 +1827,7 @@ class SQLStateStore(SQLBlobCatalog):
                     session, run_id=run_id, blob_refs=blob_refs, blob_refs_scope=blob_refs_scope
                 )
             await _write_event(session, run_id, event)
+            self._mark_announce(session, (run_id,))
             await self._write_tx(session)
 
     async def complete_tool_call(
@@ -2007,6 +1925,7 @@ class SQLStateStore(SQLBlobCatalog):
                     session, run_id=run_id, blob_refs=blob_refs, blob_refs_scope=blob_refs_scope
                 )
             await _write_event(session, run_id, event)
+            self._mark_announce(session, (run_id,))
             await self._write_tx(session)
 
     async def consume_submission(
@@ -2053,6 +1972,7 @@ class SQLStateStore(SQLBlobCatalog):
                 .where(AgentRun.id == run_id)
                 .values(loop_state=changed, pause_data=pause)
             )
+            self._mark_announce(session, (run_id,))
             await self._write_tx(session)
             return True
 
@@ -2102,6 +2022,7 @@ class SQLStateStore(SQLBlobCatalog):
                         tenant_id,
                     )
                 )
+                self._mark_announce(session, run_ids)
                 await self._write_tx(session)
                 return int(getattr(result, "rowcount", 0))
 
@@ -2110,6 +2031,7 @@ class SQLStateStore(SQLBlobCatalog):
             label="mark_cancel_requested",
             run_id=run_ids[0],
             classify=self.classify_db_error,
+            _raw_driver_errors=True,
         )
 
     async def get_children_page(
@@ -2139,6 +2061,7 @@ class SQLStateStore(SQLBlobCatalog):
             label="get_children_page",
             run_id=parent_ids[0],
             classify=self.classify_db_error,
+            _raw_driver_errors=True,
         )
 
     async def get_loop_state(self, run_id: str) -> dict[str, Any] | None:
@@ -2426,6 +2349,7 @@ class SQLStateStore(SQLBlobCatalog):
                         .where(AgentRun.id == run_id)
                         .values(meta={**(old_meta or {}), ERROR_INFO_META_KEY: error_info})
                     )
+                self._mark_announce(session, (run_id,))
                 await self._write_tx(session)
                 return (
                     bool(result.rowcount and result.rowcount > 0)
@@ -2434,7 +2358,11 @@ class SQLStateStore(SQLBlobCatalog):
                 )
 
         return await retry_transient_db(
-            _attempt, label="finalize_run", run_id=run_id, classify=self.classify_db_error
+            _attempt,
+            label="finalize_run",
+            run_id=run_id,
+            classify=self.classify_db_error,
+            _raw_driver_errors=True,
         )
 
     async def finalize_run_if_status_in(
@@ -2474,6 +2402,7 @@ class SQLStateStore(SQLBlobCatalog):
                     failure_reason=failure_reason,
                     claim_epoch=claim_epoch,
                 )
+                self._mark_announce(session, (run_id,))
                 await self._write_tx(session)
                 return won
 
@@ -2482,6 +2411,7 @@ class SQLStateStore(SQLBlobCatalog):
             label="finalize_run_if_status_in",
             run_id=run_id,
             classify=self.classify_db_error,
+            _raw_driver_errors=True,
         )
 
     async def finalize_with_event(
@@ -2528,6 +2458,7 @@ class SQLStateStore(SQLBlobCatalog):
                 if not won:
                     await session.rollback()
                     return None
+                await self._finalize_error_info(session, run_id, event_data)
                 if trace is not None:
                     await self._insert_trace(session, run_id, trace)
                 seq = (
@@ -2535,11 +2466,33 @@ class SQLStateStore(SQLBlobCatalog):
                     if event is not None
                     else await _insert_event_locked(session, run_id, event_type, event_data)
                 )
+                self._mark_announce(session, (run_id,))
                 await self._write_tx(session)
                 return seq
 
         return await retry_transient_db(
-            _attempt, label="finalize_with_event", run_id=run_id, classify=self.classify_db_error
+            _attempt,
+            label="finalize_with_event",
+            run_id=run_id,
+            classify=self.classify_db_error,
+            _raw_driver_errors=True,
+        )
+
+    async def _finalize_error_info(
+        self, session: AsyncSession, run_id: str, event_data: dict[str, Any] | None
+    ) -> None:
+        info = (event_data or {}).get("error_info")
+        if info is None:
+            return
+        from sqlalchemy import update
+
+        from dendrux.db.models import AgentRun
+
+        old_meta = await session.scalar(select(AgentRun.meta).where(AgentRun.id == run_id))
+        await session.execute(
+            update(AgentRun)
+            .where(AgentRun.id == run_id)
+            .values(meta={**(old_meta or {}), ERROR_INFO_META_KEY: info})
         )
 
     async def _cas_finalize(
@@ -2666,11 +2619,16 @@ class SQLStateStore(SQLBlobCatalog):
                     .values(cancel_requested=True)
                 )
                 result = await session.execute(stmt)
+                self._mark_announce(session, (run_id,))
                 await self._write_tx(session)
                 return bool(result.rowcount and result.rowcount > 0)
 
         return await retry_transient_db(
-            _attempt, label="request_cancel", run_id=run_id, classify=self.classify_db_error
+            _attempt,
+            label="request_cancel",
+            run_id=run_id,
+            classify=self.classify_db_error,
+            _raw_driver_errors=True,
         )
 
     async def update_run_meta(
@@ -2699,10 +2657,15 @@ class SQLStateStore(SQLBlobCatalog):
                 if row is None:
                     return
                 row.meta = {**(row.meta or {}), **patch}
+                self._mark_announce(session, (run_id,))
                 await self._write_tx(session)
 
         await retry_transient_db(
-            _attempt, label="update_run_meta", run_id=run_id, classify=self.classify_db_error
+            _attempt,
+            label="update_run_meta",
+            run_id=run_id,
+            classify=self.classify_db_error,
+            _raw_driver_errors=True,
         )
 
     async def is_cancel_requested(self, run_id: str) -> bool:
@@ -2719,7 +2682,11 @@ class SQLStateStore(SQLBlobCatalog):
                 return bool(row[0]) if row is not None else False
 
         return await retry_transient_db(
-            _attempt, label="is_cancel_requested", run_id=run_id, classify=self.classify_db_error
+            _attempt,
+            label="is_cancel_requested",
+            run_id=run_id,
+            classify=self.classify_db_error,
+            _raw_driver_errors=True,
         )
 
     async def get_run_control(self, run_id: str) -> RunControl:
@@ -2755,7 +2722,11 @@ class SQLStateStore(SQLBlobCatalog):
                 )
 
         return await retry_transient_db(
-            _attempt, label="get_run_control", run_id=run_id, classify=self.classify_db_error
+            _attempt,
+            label="get_run_control",
+            run_id=run_id,
+            classify=self.classify_db_error,
+            _raw_driver_errors=True,
         )
 
     async def request_pause(self, run_id: str, *, reason: str | None = None) -> bool:
@@ -2785,11 +2756,16 @@ class SQLStateStore(SQLBlobCatalog):
                         .where(AgentRun.id == run_id)
                         .values(meta={**meta, PAUSE_REQUEST_META_KEY: {"reason": reason}})
                     )
+                self._mark_announce(session, (run_id,))
                 await self._write_tx(session)
                 return True
 
         return await retry_transient_db(
-            _attempt, label="request_pause", run_id=run_id, classify=self.classify_db_error
+            _attempt,
+            label="request_pause",
+            run_id=run_id,
+            classify=self.classify_db_error,
+            _raw_driver_errors=True,
         )
 
     async def try_pause_run(
@@ -2832,11 +2808,16 @@ class SQLStateStore(SQLBlobCatalog):
                     )
                     .ordered_values(*self._ordered(AgentRun.__table__, dict(**values)))
                 )
+                self._mark_announce(session, (run_id,))
                 await self._write_tx(session)
                 return bool(result.rowcount and result.rowcount > 0)
 
         return await retry_transient_db(
-            _attempt, label="try_pause_run", run_id=run_id, classify=self.classify_db_error
+            _attempt,
+            label="try_pause_run",
+            run_id=run_id,
+            classify=self.classify_db_error,
+            _raw_driver_errors=True,
         )
 
     async def pause_with_event(
@@ -2896,11 +2877,16 @@ class SQLStateStore(SQLBlobCatalog):
                     event_data,
                     iteration_index=iteration_count or 0,
                 )
+                self._mark_announce(session, (run_id,))
                 await self._write_tx(session)
                 return seq
 
         return await retry_transient_db(
-            _attempt, label="pause_with_event", run_id=run_id, classify=self.classify_db_error
+            _attempt,
+            label="pause_with_event",
+            run_id=run_id,
+            classify=self.classify_db_error,
+            _raw_driver_errors=True,
         )
 
     async def add_note(
@@ -3004,7 +2990,11 @@ class SQLStateStore(SQLBlobCatalog):
                 return inserted
 
         return await retry_transient_db(
-            _attempt, label="add_note", run_id=run_id, classify=self.classify_db_error
+            _attempt,
+            label="add_note",
+            run_id=run_id,
+            classify=self.classify_db_error,
+            _raw_driver_errors=True,
         )
 
     async def get_notes(
@@ -3074,7 +3064,11 @@ class SQLStateStore(SQLBlobCatalog):
                 return int(result.rowcount or 0)
 
         return await retry_transient_db(
-            _attempt, label="mark_notes_delivered", run_id=run_id, classify=self.classify_db_error
+            _attempt,
+            label="mark_notes_delivered",
+            run_id=run_id,
+            classify=self.classify_db_error,
+            _raw_driver_errors=True,
         )
 
     async def get_next_event_sequence(self, run_id: str) -> int:
@@ -3098,6 +3092,7 @@ class SQLStateStore(SQLBlobCatalog):
             label="get_next_event_sequence",
             run_id=run_id,
             classify=self.classify_db_error,
+            _raw_driver_errors=True,
         )
 
     async def pause_run(
@@ -3144,10 +3139,15 @@ class SQLStateStore(SQLBlobCatalog):
                     )
                 self._remember_run_values(session, run_id, values)
                 await session.execute(stmt)
+                self._mark_announce(session, (run_id,))
                 await self._write_tx(session)
 
         await retry_transient_db(
-            _attempt, label="pause_run", run_id=run_id, classify=self.classify_db_error
+            _attempt,
+            label="pause_run",
+            run_id=run_id,
+            classify=self.classify_db_error,
+            _raw_driver_errors=True,
         )
 
     async def get_pause_state(self, run_id: str) -> dict[str, Any] | None:
@@ -3426,6 +3426,7 @@ class SQLStateStore(SQLBlobCatalog):
                         if validate is not None or expected_pause_id is not None
                         else None,
                     )
+                    self._mark_announce(session, (run_id,))
                     await self._write_tx(session)
                     return (
                         False
@@ -3494,11 +3495,16 @@ class SQLStateStore(SQLBlobCatalog):
                     except BaseException:
                         await session.rollback()
                         raise
+                self._mark_announce(session, (run_id,))
                 await self._write_tx(session)
                 return token if result.rowcount else False
 
         return await retry_transient_db(
-            _attempt, label="claim_paused_run", run_id=run_id, classify=self.classify_db_error
+            _attempt,
+            label="claim_paused_run",
+            run_id=run_id,
+            classify=self.classify_db_error,
+            _raw_driver_errors=True,
         )
 
     async def submit_and_claim(
@@ -3623,11 +3629,16 @@ class SQLStateStore(SQLBlobCatalog):
                     row.loop_state,
                     (row.loop_state or {}).get("submission"),
                 )
+                self._mark_announce(session, (run_id,))
                 await self._write_tx(session)
                 return token
 
         return await retry_transient_db(
-            _attempt, label="submit_and_claim", run_id=run_id, classify=self.classify_db_error
+            _attempt,
+            label="submit_and_claim",
+            run_id=run_id,
+            classify=self.classify_db_error,
+            _raw_driver_errors=True,
         )
 
     async def _finish_claim_release(
@@ -3707,11 +3718,16 @@ class SQLStateStore(SQLBlobCatalog):
                 won = await self._finish_claim_release(
                     session, run_id, claim_epoch, bool(result.rowcount), event
                 )
+                self._mark_announce(session, (run_id,))
                 await self._write_tx(session)
                 return won
 
         return await retry_transient_db(
-            attempt, label="release_run_claim", run_id=run_id, classify=self.classify_db_error
+            attempt,
+            label="release_run_claim",
+            run_id=run_id,
+            classify=self.classify_db_error,
+            _raw_driver_errors=True,
         )
 
     @_safe_database_call
@@ -3801,6 +3817,64 @@ class SQLStateStore(SQLBlobCatalog):
                 .limit(1)
             )
             return int(value) + 1 if value is not None else 0
+
+    async def get_public_traces(
+        self,
+        run_id: str,
+        *,
+        tenant_id: TenantScope = UNSCOPED,
+        limit: int | None = None,
+        offset: int = 0,
+        retry: bool = False,
+    ) -> list[TraceRecord]:
+        """Read one public page with its reservation cutoff from the same snapshot."""
+        from sqlalchemy import and_, case, false, func, or_, select
+
+        from dendrux._meta_keys import SEED_PREFIX_META_KEY
+        from dendrux.db.models import AgentRun, ReactTrace
+
+        visible_seed = (
+            and_(
+                ReactTrace.trace_kind == "seed",
+                func.coalesce(
+                    self.json_get(ReactTrace.meta, (SEED_PREFIX_META_KEY,), "bool"), false()
+                )
+                == false(),
+            )
+            if not retry
+            else false()
+        )
+        pending_projection = (
+            select(
+                case(
+                    (AgentRun.status.in_(_TERMINAL_STATUS_VALUES), None),
+                    else_=self.json_get(AgentRun.loop_state, ("pending",), "json"),
+                )
+            )
+            .where(AgentRun.id == run_id, _run_in_scope(run_id, tenant_id))
+            .correlate(None)
+            .scalar_subquery()
+        )
+        stmt = (
+            select(ReactTrace, pending_projection)
+            .where(
+                ReactTrace.agent_run_id == run_id,
+                _run_in_scope(run_id, tenant_id),
+                ReactTrace.role.in_(("user", "assistant", "tool")),
+                or_(ReactTrace.trace_kind == "turn", visible_seed),
+            )
+            .order_by(ReactTrace.order_index)
+            .offset(offset)
+        )
+        if limit is not None:
+            stmt = stmt.limit(limit)
+        async with self._session_factory() as session:
+            result = (await session.execute(stmt)).all()
+            # A separately fetched checkpoint could expose a late row after a reservation moves.
+            pending = (result[0][1] or []) if result else []
+            boundary = min((p["order_index"] for p in pending), default=None)
+            rows = [r for r, _ in result if boundary is None or r.order_index < boundary]
+            return [_trace_record(row) for row in rows]
 
     async def get_traces(
         self,
@@ -3895,9 +3969,6 @@ class SQLStateStore(SQLBlobCatalog):
                 for r in rows
             ]
 
-    async def _after_event_insert(self, session: AsyncSession, run_id: str) -> None:
-        return None
-
     async def save_run_event(
         self,
         run_id: str,
@@ -3923,8 +3994,71 @@ class SQLStateStore(SQLBlobCatalog):
                 event_id=event_id,
                 content_digest=content_digest,
             )
+            self._mark_announce(session, (run_id,))
             await self._write_tx(session)
             return seq
+
+    async def get_events_for_runs(
+        self, heads: Mapping[str, int], *, limit_per_run: int
+    ) -> dict[str, list[RunEventRecord]]:
+        """Read bounded events for already-authorized run ids."""
+        from dendrux.runtime.stores.sql._batched_reads import _group_events, _validate_event_batch
+
+        _validate_event_batch(heads, limit_per_run)
+        if not heads:
+            return {}
+        async with self._session_factory() as session:
+            rows = (
+                await session.execute(
+                    self.events_for_runs_query(heads, limit_per_run=limit_per_run)
+                )
+            ).all()
+        return _group_events(rows)
+
+    def events_for_runs_query(self, heads: Mapping[str, int], *, limit_per_run: int) -> Executable:
+        """Build an executable SQLAlchemy query for already-authorized event reads.
+
+        ``heads`` maps 1 to 200 run ids to their last-read sequence index; -1
+        includes sequence 0. ``limit_per_run`` is validated to be 1 to 100.
+        Return all ``run_events`` columns for at most that many earliest events
+        above each head, omitting missing runs. The base executes the query,
+        groups rows by run and sorts each group by sequence index.
+
+        Store authors may override this hook for their dialect. Without an
+        override, a portable UNION ALL combines one bounded subquery per run.
+        Empty inputs are handled by ``get_events_for_runs`` without this hook.
+        """
+        from sqlalchemy import union_all
+
+        from dendrux.db.models import RunEvent
+
+        queries = [
+            select(
+                select(RunEvent.__table__)
+                .where(RunEvent.agent_run_id == run_id, RunEvent.sequence_index > head)
+                .order_by(RunEvent.sequence_index)
+                .limit(limit_per_run)
+                .subquery()
+            )
+            for run_id, head in heads.items()
+        ]
+        return union_all(*queries)
+
+    async def get_run_statuses(self, run_ids: Sequence[str]) -> dict[str, str]:
+        """Read status projections for already-authorized run ids."""
+        from dendrux.db.models import AgentRun
+        from dendrux.runtime.stores.sql._batched_reads import _validate_run_count
+
+        _validate_run_count(run_ids)
+        if not run_ids:
+            return {}
+        async with self._session_factory() as session:
+            rows = (
+                await session.execute(
+                    select(AgentRun.id, AgentRun.status).where(self.id_in(AgentRun.id, run_ids))
+                )
+            ).all()
+        return dict(rows)
 
     async def get_run_events(
         self,
@@ -4008,7 +4142,11 @@ class SQLStateStore(SQLBlobCatalog):
                 return bool(result.rowcount)
 
         return await retry_transient_db(
-            _attempt, label="touch_progress", run_id=run_id, classify=self.classify_db_error
+            _attempt,
+            label="touch_progress",
+            run_id=run_id,
+            classify=self.classify_db_error,
+            _raw_driver_errors=True,
         )
 
     async def mark_lease_expired(
@@ -4111,51 +4249,137 @@ class SQLStateStore(SQLBlobCatalog):
                 return MarkResult(
                     result.reclaimable, result.finalised, result.legacy, inspected, None
                 )
-            for candidate in ids:
-                run_id = candidate.id
+            async with _live_updates_page(self):
+                for candidate in ids:
+                    run_id = candidate.id
 
-                async def attempt(
-                    row: Any = candidate, run_id: str = run_id
-                ) -> ReclaimableRun | SweptRun | None:
-                    async with self._session_factory() as session:
-                        age = _to_aware_utc(row.last_progress_at or row.created_at)
-                        if (on_stale == "error" or row.lease_expired_at is None) and age >= cutoff:
-                            return None
-                        if row.storage_format == STORAGE_FORMAT_CHECKPOINTED and row.loop not in (
-                            "react",
-                            "single_call",
-                        ):
-                            if on_stale != "error":
-                                _codes.log_code(logger, _codes.LOOP_UNKNOWN, run_id=run_id)
-                            if on_stale is None:
+                    async def attempt(
+                        row: Any = candidate, run_id: str = run_id
+                    ) -> ReclaimableRun | SweptRun | None:
+                        async with self._session_factory() as session:
+                            age = _to_aware_utc(row.last_progress_at or row.created_at)
+                            if (
+                                on_stale == "error" or row.lease_expired_at is None
+                            ) and age >= cutoff:
                                 return None
-                        limit = (
-                            row.reclaim_limit
-                            if row.lease_expired_at is not None and row.reclaim_limit is not None
-                            else reclaim_limit
-                        )
-                        legacy_reason = (
-                            FailureReason.STALE_RUNNING.value
-                            if row.started or on_stale is None
-                            else FailureReason.NEVER_STARTED.value
-                        )
-                        reason = (
-                            legacy_reason
-                            if on_stale == "error"
-                            else FailureReason.STALE_RUNNING_LEGACY.value
-                            if row.storage_format != STORAGE_FORMAT_CHECKPOINTED
-                            else FailureReason.RECLAIM_LIMIT.value
-                            if row.reclaim_attempts >= limit
-                            else legacy_reason
-                            if row.loop != "react"
-                            else None
-                        )
-                        if reason is not None or row.cancel_requested:
-                            flagged = AgentRun.cancel_requested.is_(True)
-                            status_expr = case(
-                                (flagged, RunStatus.CANCELLED.value), else_=RunStatus.ERROR.value
+                            if (
+                                row.storage_format == STORAGE_FORMAT_CHECKPOINTED
+                                and row.loop
+                                not in (
+                                    "react",
+                                    "single_call",
+                                )
+                            ):
+                                if on_stale != "error":
+                                    _codes.log_code(logger, _codes.LOOP_UNKNOWN, run_id=run_id)
+                                if on_stale is None:
+                                    return None
+                            limit = (
+                                row.reclaim_limit
+                                if row.lease_expired_at is not None
+                                and row.reclaim_limit is not None
+                                else reclaim_limit
                             )
-                            changed = (
+                            legacy_reason = (
+                                FailureReason.STALE_RUNNING.value
+                                if row.started or on_stale is None
+                                else FailureReason.NEVER_STARTED.value
+                            )
+                            reason = (
+                                legacy_reason
+                                if on_stale == "error"
+                                else FailureReason.STALE_RUNNING_LEGACY.value
+                                if row.storage_format != STORAGE_FORMAT_CHECKPOINTED
+                                else FailureReason.RECLAIM_LIMIT.value
+                                if row.reclaim_attempts >= limit
+                                else legacy_reason
+                                if row.loop != "react"
+                                else None
+                            )
+                            if reason is not None or row.cancel_requested:
+                                flagged = AgentRun.cancel_requested.is_(True)
+                                status_expr = case(
+                                    (flagged, RunStatus.CANCELLED.value),
+                                    else_=RunStatus.ERROR.value,
+                                )
+                                changed = (
+                                    await self._update_one_rows(
+                                        session,
+                                        table=AgentRun.__table__,
+                                        pk=(run_id,),
+                                        predicate=and_(
+                                            AgentRun.id == run_id,
+                                            AgentRun.status == RunStatus.RUNNING.value,
+                                            AgentRun.claim_epoch == row.claim_epoch,
+                                            or_(
+                                                AgentRun.lease_expired_at.is_not(None)
+                                                if on_stale != "error"
+                                                else False,
+                                                func.coalesce(
+                                                    AgentRun.last_progress_at, AgentRun.created_at
+                                                )
+                                                < cutoff,
+                                            ),
+                                        ),
+                                        values=dict(
+                                            **_status_values(status_expr),
+                                            claim_epoch=AgentRun.claim_epoch + 1,
+                                            failure_reason=reason,
+                                            error=case(
+                                                (flagged, None), else_=f"Run swept as {reason}"
+                                            ),
+                                            pause_data=None,
+                                            pause_requested=False,
+                                            cancel_requested=False,
+                                        ),
+                                        returning=[AgentRun.status],
+                                    )
+                                ).scalar_one_or_none()
+                                if changed is None:
+                                    return None
+                                status = changed
+                                await _insert_event_locked(
+                                    session,
+                                    run_id,
+                                    StoredEventType.RUN_CANCELLED.value
+                                    if status == RunStatus.CANCELLED.value
+                                    else StoredEventType.RUN_INTERRUPTED.value,
+                                    {
+                                        "failure_reason": reason,
+                                        **(
+                                            {"reason": CancelReason.CANCEL_REQUESTED.value}
+                                            if status == RunStatus.CANCELLED.value
+                                            else {}
+                                        ),
+                                    },
+                                    iteration_index=row.iteration_count or 0,
+                                )
+                                self._mark_announce(session, (run_id,))
+                                await self._write_tx(session)
+                                _codes.log_code(
+                                    logger,
+                                    _codes.REGISTRY[
+                                        "legacy_run_swept"
+                                        if reason == FailureReason.STALE_RUNNING_LEGACY.value
+                                        else reason or CancelReason.CANCEL_REQUESTED.value
+                                    ],
+                                    run_id=run_id,
+                                )
+                                return SweptRun(
+                                    run_id,
+                                    row.agent_name,
+                                    RunStatus.RUNNING.value,
+                                    reason or CancelReason.CANCEL_REQUESTED.value,
+                                    _to_aware_utc(row.last_progress_at),
+                                    _dt.datetime.now(_dt.UTC),
+                                    status,
+                                )
+                            if row.lease_expired_at is not None:
+                                return _reclaimable(row)
+                            now = _dt.datetime.now(_dt.UTC)
+                            # This session holds scalar projections, not ORM entities.
+                            # Avoid identity synchronization of the CAS's RETURNING row.
+                            marked = (
                                 await self._update_one_rows(
                                     session,
                                     table=AgentRun.__table__,
@@ -4163,141 +4387,71 @@ class SQLStateStore(SQLBlobCatalog):
                                     predicate=and_(
                                         AgentRun.id == run_id,
                                         AgentRun.status == RunStatus.RUNNING.value,
+                                        AgentRun.storage_format == STORAGE_FORMAT_CHECKPOINTED,
+                                        AgentRun.lease_expired_at.is_(None),
                                         AgentRun.claim_epoch == row.claim_epoch,
-                                        or_(
-                                            AgentRun.lease_expired_at.is_not(None)
-                                            if on_stale != "error"
-                                            else False,
-                                            func.coalesce(
-                                                AgentRun.last_progress_at, AgentRun.created_at
-                                            )
-                                            < cutoff,
-                                        ),
+                                        func.coalesce(
+                                            AgentRun.last_progress_at, AgentRun.created_at
+                                        )
+                                        < cutoff,
                                     ),
                                     values=dict(
-                                        **_status_values(status_expr),
                                         claim_epoch=AgentRun.claim_epoch + 1,
-                                        failure_reason=reason,
-                                        error=case((flagged, None), else_=f"Run swept as {reason}"),
-                                        pause_data=None,
-                                        pause_requested=False,
-                                        cancel_requested=False,
+                                        lease_expired_at=now,
+                                        reclaim_limit=limit,
                                     ),
-                                    returning=[AgentRun.status],
+                                    returning=[*fields],
                                 )
-                            ).scalar_one_or_none()
-                            if changed is None:
-                                return None
-                            status = changed
+                            ).first()
+                            if marked is None:
+                                current = (
+                                    await session.execute(
+                                        select(*fields).where(
+                                            AgentRun.id == run_id,
+                                            AgentRun.status == RunStatus.RUNNING.value,
+                                            AgentRun.lease_expired_at.is_not(None),
+                                        )
+                                    )
+                                ).first()
+                                return _reclaimable(current) if current is not None else None
                             await _insert_event_locked(
                                 session,
                                 run_id,
-                                StoredEventType.RUN_CANCELLED.value
-                                if status == RunStatus.CANCELLED.value
-                                else StoredEventType.RUN_INTERRUPTED.value,
-                                {
-                                    "failure_reason": reason,
-                                    **(
-                                        {"reason": CancelReason.CANCEL_REQUESTED.value}
-                                        if status == RunStatus.CANCELLED.value
-                                        else {}
-                                    ),
-                                },
-                                iteration_index=row.iteration_count or 0,
+                                StoredEventType.RUN_LEASE_EXPIRED.value,
+                                {"gap_s": max(0.0, (now - age).total_seconds())},
                             )
+                            item = _reclaimable(marked)
+                            self._mark_announce(session, (run_id,))
                             await self._write_tx(session)
+                            return item
+
+                    item = await retry_transient_db(
+                        attempt,
+                        label="mark_lease_expired",
+                        run_id=run_id,
+                        classify=self.classify_db_error,
+                        _raw_driver_errors=True,
+                    )
+                    inspected += 1
+                    after = run_id
+                    if isinstance(item, ReclaimableRun):
+                        result.reclaimable.append(item)
+                    elif isinstance(item, SweptRun):
+                        result.finalised.append(item)
+                        if item.failure_reason == FailureReason.STALE_RUNNING_LEGACY.value:
+                            result.legacy.append(item)
+                    if inspected >= max_runs or len(result.reclaimable) >= max_returned:
+                        if inspected >= max_runs:
                             _codes.log_code(
                                 logger,
-                                _codes.REGISTRY[
-                                    "legacy_run_swept"
-                                    if reason == FailureReason.STALE_RUNNING_LEGACY.value
-                                    else reason or CancelReason.CANCEL_REQUESTED.value
-                                ],
-                                run_id=run_id,
+                                _codes.SWEEP_CAP_REACHED,
+                                category=FailureReason.STALE_RUNNING.value,
+                                cap=max_runs,
+                                inspected=inspected,
                             )
-                            return SweptRun(
-                                run_id,
-                                row.agent_name,
-                                RunStatus.RUNNING.value,
-                                reason or CancelReason.CANCEL_REQUESTED.value,
-                                _to_aware_utc(row.last_progress_at),
-                                _dt.datetime.now(_dt.UTC),
-                                status,
-                            )
-                        if row.lease_expired_at is not None:
-                            return _reclaimable(row)
-                        now = _dt.datetime.now(_dt.UTC)
-                        # This session holds scalar projections, not ORM entities.
-                        # Avoid identity synchronization of the CAS's RETURNING row.
-                        marked = (
-                            await self._update_one_rows(
-                                session,
-                                table=AgentRun.__table__,
-                                pk=(run_id,),
-                                predicate=and_(
-                                    AgentRun.id == run_id,
-                                    AgentRun.status == RunStatus.RUNNING.value,
-                                    AgentRun.storage_format == STORAGE_FORMAT_CHECKPOINTED,
-                                    AgentRun.lease_expired_at.is_(None),
-                                    AgentRun.claim_epoch == row.claim_epoch,
-                                    func.coalesce(AgentRun.last_progress_at, AgentRun.created_at)
-                                    < cutoff,
-                                ),
-                                values=dict(
-                                    claim_epoch=AgentRun.claim_epoch + 1,
-                                    lease_expired_at=now,
-                                    reclaim_limit=limit,
-                                ),
-                                returning=[*fields],
-                            )
-                        ).first()
-                        if marked is None:
-                            current = (
-                                await session.execute(
-                                    select(*fields).where(
-                                        AgentRun.id == run_id,
-                                        AgentRun.status == RunStatus.RUNNING.value,
-                                        AgentRun.lease_expired_at.is_not(None),
-                                    )
-                                )
-                            ).first()
-                            return _reclaimable(current) if current is not None else None
-                        await _insert_event_locked(
-                            session,
-                            run_id,
-                            StoredEventType.RUN_LEASE_EXPIRED.value,
-                            {"gap_s": max(0.0, (now - age).total_seconds())},
+                        return MarkResult(
+                            result.reclaimable, result.finalised, result.legacy, inspected, after
                         )
-                        item = _reclaimable(marked)
-                        await self._write_tx(session)
-                        return item
-
-                item = await retry_transient_db(
-                    attempt,
-                    label="mark_lease_expired",
-                    run_id=run_id,
-                    classify=self.classify_db_error,
-                )
-                inspected += 1
-                after = run_id
-                if isinstance(item, ReclaimableRun):
-                    result.reclaimable.append(item)
-                elif isinstance(item, SweptRun):
-                    result.finalised.append(item)
-                    if item.failure_reason == FailureReason.STALE_RUNNING_LEGACY.value:
-                        result.legacy.append(item)
-                if inspected >= max_runs or len(result.reclaimable) >= max_returned:
-                    if inspected >= max_runs:
-                        _codes.log_code(
-                            logger,
-                            _codes.SWEEP_CAP_REACHED,
-                            category=FailureReason.STALE_RUNNING.value,
-                            cap=max_runs,
-                            inspected=inspected,
-                        )
-                    return MarkResult(
-                        result.reclaimable, result.finalised, result.legacy, inspected, after
-                    )
         return MarkResult(result.reclaimable, result.finalised, result.legacy, inspected, after)
 
     async def get_lease_expired(self, *, limit: int, cursor: str | None) -> list[ReclaimableRun]:
@@ -4484,6 +4638,7 @@ class SQLStateStore(SQLBlobCatalog):
                         StoredEventType.RUN_CANCELLED.value,
                         {"reason": CancelReason.CANCEL_REQUESTED.value},
                     )
+                    self._mark_announce(session, (run_id,))
                     await self._write_tx(session)
                     raise RunNotReclaimableError(run_id, "cancelled")
                 await _insert_event_locked(
@@ -4503,11 +4658,16 @@ class SQLStateStore(SQLBlobCatalog):
                     changed["loop_state"],
                     (changed["loop_state"] or {}).get("submission"),
                 )
+                self._mark_announce(session, (run_id,))
                 await self._write_tx(session)
                 return token
 
         return await retry_transient_db(
-            attempt, label="reclaim_run", run_id=run_id, classify=self.classify_db_error
+            attempt,
+            label="reclaim_run",
+            run_id=run_id,
+            classify=self.classify_db_error,
+            _raw_driver_errors=True,
         )
 
     async def get_replayed_tool_calls(
@@ -4547,8 +4707,11 @@ class SQLStateStore(SQLBlobCatalog):
         max_runs accepts 1..100,000. Fresh rows and losing CAS attempts count
         toward it; hitting the cap emits sweep_cap_reached.
         """
-        return await self._sweep_runs(
-            older_than, waiting=False, batch_size=batch_size, max_runs=max_runs
+        return cast(
+            "list[SweptRun]",
+            await self._sweep_runs(
+                older_than, waiting=False, batch_size=batch_size, max_runs=max_runs
+            ),
         )
 
     async def sweep_abandoned_runs(
@@ -4564,10 +4727,14 @@ class SQLStateStore(SQLBlobCatalog):
         requires both status_changed_at and updated_at to be stale. Losing CAS
         attempts count toward the cap; hitting it emits sweep_cap_reached.
         """
-        return await self._sweep_runs(
-            older_than, waiting=True, batch_size=batch_size, max_runs=max_runs
+        return cast(
+            "list[SweptRun]",
+            await self._sweep_runs(
+                older_than, waiting=True, batch_size=batch_size, max_runs=max_runs
+            ),
         )
 
+    @_safe_database_call
     async def _sweep_runs(
         self,
         older_than: timedelta,
@@ -4644,80 +4811,84 @@ class SQLStateStore(SQLBlobCatalog):
                     break
                 visited += len(rows)
                 after = (rows[-1].sweep_age, rows[-1].id) if waiting else rows[-1].id
-                for row in rows:
-                    # Running rows are bounded by live concurrency. Count every
-                    # inspected row against the work cap, including fresh ones.
-                    if not waiting and _to_aware_utc(row.sweep_age) >= cutoff:
-                        continue
-                    reason = (
-                        FailureReason.ABANDONED_WAITING.value
-                        if waiting
-                        else FailureReason.STALE_RUNNING.value
-                        if row.started
-                        else FailureReason.NEVER_STARTED.value
-                    )
-                    flagged = AgentRun.cancel_requested.is_(True)
-                    new_status = (
-                        RunStatus.ERROR.value
-                        if waiting
-                        else case((flagged, RunStatus.CANCELLED.value), else_=RunStatus.ERROR.value)
-                    )
-                    async with self._session_factory() as session:
-                        result = await self._update_one_rows(
-                            session,
-                            table=AgentRun.__table__,
-                            pk=(row.id,),
-                            predicate=and_(
-                                AgentRun.id == row.id,
-                                AgentRun.status == row.status,
-                                AgentRun.claim_epoch == row.claim_epoch,
-                                age < cutoff,
-                                AgentRun.updated_at < cutoff if waiting else true(),
-                            ),
-                            values=dict(
-                                **_status_values(new_status),
-                                claim_epoch=AgentRun.claim_epoch + 1,
-                                failure_reason=reason,
-                                pause_data=None,
-                                error=f"Run swept as {reason}"
-                                if waiting
-                                else case((flagged, None), else_=f"Run swept as {reason}"),
-                                cancel_requested=False,
-                                pause_requested=False,
-                            ),
-                            returning=[AgentRun.status],
-                        )
-                        status = result.scalar_one_or_none()
-                        if status is None:
+                async with _live_updates_page(self):
+                    for row in rows:
+                        # Running rows are bounded by live concurrency. Count every
+                        # inspected row against the work cap, including fresh ones.
+                        if not waiting and _to_aware_utc(row.sweep_age) >= cutoff:
                             continue
-                        event_type = (
-                            StoredEventType.RUN_ABANDONED.value
+                        reason = (
+                            FailureReason.ABANDONED_WAITING.value
                             if waiting
-                            else StoredEventType.RUN_INTERRUPTED.value
+                            else FailureReason.STALE_RUNNING.value
+                            if row.started
+                            else FailureReason.NEVER_STARTED.value
                         )
-                        data = {"failure_reason": reason}
-                        if status == RunStatus.CANCELLED.value:
-                            event_type = StoredEventType.RUN_CANCELLED.value
-                            data["reason"] = CancelReason.CANCEL_REQUESTED.value
-                        await _insert_event_locked(
-                            session,
-                            row.id,
-                            event_type,
-                            data,
-                            iteration_index=row.iteration_count or 0,
+                        flagged = AgentRun.cancel_requested.is_(True)
+                        new_status = (
+                            RunStatus.ERROR.value
+                            if waiting
+                            else case(
+                                (flagged, RunStatus.CANCELLED.value), else_=RunStatus.ERROR.value
+                            )
                         )
-                        await self._write_tx(session)
-                    swept.append(
-                        SweptRun(
-                            run_id=row.id,
-                            agent_name=row.agent_name,
-                            previous_status=row.status,
-                            failure_reason=reason,
-                            last_progress_at=_to_aware_utc(row.last_progress_at),
-                            swept_at=_to_aware_utc(now),
-                            status=status,
+                        async with self._session_factory() as session:
+                            result = await self._update_one_rows(
+                                session,
+                                table=AgentRun.__table__,
+                                pk=(row.id,),
+                                predicate=and_(
+                                    AgentRun.id == row.id,
+                                    AgentRun.status == row.status,
+                                    AgentRun.claim_epoch == row.claim_epoch,
+                                    age < cutoff,
+                                    AgentRun.updated_at < cutoff if waiting else true(),
+                                ),
+                                values=dict(
+                                    **_status_values(new_status),
+                                    claim_epoch=AgentRun.claim_epoch + 1,
+                                    failure_reason=reason,
+                                    pause_data=None,
+                                    error=f"Run swept as {reason}"
+                                    if waiting
+                                    else case((flagged, None), else_=f"Run swept as {reason}"),
+                                    cancel_requested=False,
+                                    pause_requested=False,
+                                ),
+                                returning=[AgentRun.status],
+                            )
+                            status = result.scalar_one_or_none()
+                            if status is None:
+                                continue
+                            event_type = (
+                                StoredEventType.RUN_ABANDONED.value
+                                if waiting
+                                else StoredEventType.RUN_INTERRUPTED.value
+                            )
+                            data = {"failure_reason": reason}
+                            if status == RunStatus.CANCELLED.value:
+                                event_type = StoredEventType.RUN_CANCELLED.value
+                                data["reason"] = CancelReason.CANCEL_REQUESTED.value
+                            await _insert_event_locked(
+                                session,
+                                row.id,
+                                event_type,
+                                data,
+                                iteration_index=row.iteration_count or 0,
+                            )
+                            self._mark_announce(session, (row.id,))
+                            await self._write_tx(session)
+                        swept.append(
+                            SweptRun(
+                                run_id=row.id,
+                                agent_name=row.agent_name,
+                                previous_status=row.status,
+                                failure_reason=reason,
+                                last_progress_at=_to_aware_utc(row.last_progress_at),
+                                swept_at=_to_aware_utc(now),
+                                status=status,
+                            )
                         )
-                    )
         if visited == max_runs:
             _codes.log_code(
                 logger,
@@ -4917,6 +5088,31 @@ class SQLStateStore(SQLBlobCatalog):
         ancestry.reverse()
         return ancestry, complete
 
+    async def _descendant_batch(
+        self,
+        session: AsyncSession,
+        root_id: str,
+        parent_ids: list[str],
+        *,
+        tenant_id: TenantScope,
+        light: bool,
+        max_nodes: int | None,
+        loaded: int,
+    ) -> list[AgentRun]:
+        from sqlalchemy.orm import load_only
+
+        from dendrux.db.models import AgentRun
+
+        stmt = _apply_tenant_scope(
+            select(AgentRun).where(AgentRun.parent_run_id.in_(parent_ids)), tenant_id
+        )
+        if light:
+            stmt = stmt.options(load_only(AgentRun.id, AgentRun.parent_run_id, AgentRun.tenant_id))
+        if max_nodes is not None:
+            stmt = stmt.where(AgentRun.id != root_id).limit(max_nodes - loaded)
+        result = await session.execute(stmt.order_by(AgentRun.created_at, AgentRun.id))
+        return list(result.scalars())
+
     async def _bfs_descendants(
         self,
         session: AsyncSession,
@@ -4933,11 +5129,6 @@ class SQLStateStore(SQLBlobCatalog):
         everything below them. ``light`` loads only id / parent / tenant so
         usage-only callers don't pull large JSON columns.
         """
-        from sqlalchemy import select
-        from sqlalchemy.orm import load_only
-
-        from dendrux.db.models import AgentRun
-
         seen: set[str] = {root_id}
         current_level = [root_id]
         found: list[tuple[AgentRun, int]] = []
@@ -4947,25 +5138,27 @@ class SQLStateStore(SQLBlobCatalog):
             depth += 1
             rows: list[AgentRun] = []
             for i in range(0, len(current_level), _IN_CHUNK):
-                stmt = select(AgentRun).where(
-                    AgentRun.parent_run_id.in_(current_level[i : i + _IN_CHUNK])
-                )
-                if light:
-                    stmt = stmt.options(
-                        load_only(AgentRun.id, AgentRun.parent_run_id, AgentRun.tenant_id)
+                rows.extend(
+                    await self._descendant_batch(
+                        session,
+                        root_id,
+                        current_level[i : i + _IN_CHUNK],
+                        tenant_id=tenant_id,
+                        light=light,
+                        max_nodes=max_nodes,
+                        loaded=len(found) + len(rows),
                     )
-                stmt = _apply_tenant_scope(stmt, tenant_id)
-                if max_nodes is not None:
-                    stmt = stmt.limit(max_nodes - len(found) - len(rows))
-                result = await session.execute(stmt.order_by(AgentRun.created_at, AgentRun.id))
-                rows.extend(result.scalars().all())
+                )
                 if max_nodes is not None and len(found) + len(rows) >= max_nodes:
                     import logging
 
                     from dendrux.errors import BudgetConfigurationError
 
                     _codes.log_code(
-                        logging.getLogger(__name__), _codes.SUBTREE_LIMIT, run_id=root_id
+                        logging.getLogger(__name__),
+                        _codes.SUBTREE_LIMIT,
+                        run_id=root_id,
+                        limit=max_nodes,
                     )
                     raise BudgetConfigurationError(reason="subtree_limit")
 
@@ -5077,7 +5270,7 @@ class SQLStateStore(SQLBlobCatalog):
         return out
 
     async def get_subtree(
-        self, run_id: str, *, tenant_id: TenantScope = UNSCOPED
+        self, run_id: str, *, tenant_id: TenantScope = UNSCOPED, max_nodes: int | None = None
     ) -> SubtreeRecord | None:
         from sqlalchemy import select
 
@@ -5089,7 +5282,12 @@ class SQLStateStore(SQLBlobCatalog):
             if root is None:
                 return None
 
-            rows = [(root, 0), *await self._bfs_descendants(session, root.id, tenant_id=tenant_id)]
+            rows = [
+                (root, 0),
+                *await self._bfs_descendants(
+                    session, root.id, tenant_id=tenant_id, max_nodes=max_nodes
+                ),
+            ]
             usage = await self._usage_by_run(session, [r.id for r, _ in rows])
             nodes = [
                 SubtreeNodeRecord(
@@ -5444,9 +5642,7 @@ class SQLStateStore(SQLBlobCatalog):
                 conflict()
             return int(row.sequence_index)
         session.info[FRESH_EVIDENCE_SESSION_KEY] = True
-        hook = session.info.get(EVENT_HOOK_SESSION_KEY)
-        if hook is not None:
-            await hook(session, run_id)
+        self._mark_announce(session, (run_id,))
         return int(seq)
 
 

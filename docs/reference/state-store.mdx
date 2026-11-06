@@ -22,15 +22,15 @@ Construct a store once per worker event loop and pass it as `Agent(state_store=s
 
 | Class | Database | `deployment` | Notes |
 | --- | --- | --- | --- |
-| `PostgresStateStore(engine, notify_channel=None)` | PostgreSQL with `asyncpg` | `multi_server` | The only store that accepts `notify_channel=` (event notifications). |
-| `SQLiteStateStore(engine)` | SQLite with `aiosqlite` | `single_process` for an in-memory database, `single_host` for a file | Does not create tables itself. `Agent(database_url=)`, `RunStore.from_database_url` and `dendrux.db.session.get_engine(url)` create them for you; with an engine you built yourself, get it from `get_engine(url)` instead, or the store raises `PersistenceError` on first use. |
-| `MySQLStateStore(engine)` | MySQL 8.4 or MariaDB 10.11 with `asyncmy` | `multi_server` | The engine must use `READ COMMITTED` and UTC. See [MySQL and MariaDB](/docs/guides/mysql). |
+| `PostgresStateStore(engine, *, live_updates=None)` | PostgreSQL with `asyncpg` | `multi_server` | The only store whose `live_updates=True` has a built-in transport (`PostgresUpdates`). |
+| `SQLiteStateStore(engine, *, live_updates=None)` | SQLite with `aiosqlite` | `single_process` for an in-memory database, `single_host` for a file | Does not create tables itself. `Agent(database_url=)`, `RunStore.from_database_url` and `dendrux.db.session.get_engine(url)` create them for you; with an engine you built yourself, get it from `get_engine(url)` instead, or the store raises `PersistenceError` on first use. |
+| `MySQLStateStore(engine, *, live_updates=None)` | MySQL 8.4 or MariaDB 10.11 with `asyncmy` | `multi_server` | The engine must use `READ COMMITTED` and UTC. See [MySQL and MariaDB](/docs/guides/mysql). |
 
 `store_for_engine(engine, **options)` picks the class from the engine's dialect name (`postgresql`, `sqlite`, `mysql`, or `mariadb` for a `mariadb+asyncmy` engine) and raises `ValueError`, naming the dialect it was given, for any other. It always returns one of the built-in classes; to use a store of your own, pass it to `Agent(state_store=...)` and `RunStore(store)` directly. `Agent(database_url=)`, `RunStore.from_database_url`, `RunStore.from_engine`, the CLI and `sweep` all go through it, so no call site names a concrete class. To support another SQLAlchemy database, see [Build your own store](/docs/guides/build-your-own-store).
 
 ## Capability matrix
 
-A custom store declares a class attribute `capabilities: StoreCapabilities`. This frozen dataclass has `version=1`, six flags that default to `False`, and a `deployment` field that defaults to `None`. Method names alone never enable a capability.
+A custom store declares a class attribute `capabilities: StoreCapabilities`. This frozen dataclass has `version=1`, five flags that default to `False`, and a `deployment` field that defaults to `None`. Method names alone never enable a capability.
 
 | Capability | Promise | Required methods and keyword parameters |
 | --- | --- | --- |
@@ -39,7 +39,6 @@ A custom store declares a class attribute `capabilities: StoreCapabilities`. Thi
 | `checkpointing` | Durable execution state and kind-aware conversation reconstruction | `create_run(seed_traces=, pii_mapping=)`, `save_trace(trace_kind=)`, `save_tool_call(outcome=)`, `complete_tool_call(pii_mapping=)`, `consume_submission(pii_mapping=)`, `checkpoint_step`, `get_traces_after`, `conversation_traces`, `claim_paused_run`, `submit_and_claim` |
 | `atomic_completion` | Tool intent and completion are durable; completion includes observation and event; finalization includes the final trace | `start_tool_call`, `complete_tool_call`, `finalize_with_event(trace=)` |
 | `recovery` | Bounded lease marking and atomic reclaim | `mark_lease_expired(finalise_unrecoverable=)`, `get_lease_expired`, `reclaim_run`, `get_replayed_tool_calls` |
-| `notify` | Event insertion can emit a transactional wake hint | `_after_event_insert(session, run_id)` |
 
 `deployment` is descriptive, not a feature switch: it says how many processes may share the store's data. It is one of:
 
@@ -53,7 +52,19 @@ A store with an explicit capability declaration but no `deployment` still runs, 
 
 The table lists the added requirements, not full method signatures. Implement the protocol in `dendrux.runtime.state`; do not copy a shortened table entry as a method definition. Signature validation requires the named keyword-only parameters. A forwarding subclass override should preserve those named parameters and pass them through; do not rely on a bare `**kwargs` declaration satisfying validation.
 
-The built-in SQL stores declare the first five capabilities. The Postgres notification hook is enabled separately with `notify_channel=` and defaults to off; advertising `notify=True` does not turn on Postgres NOTIFY, and the MySQL and SQLite stores declare `notify=False`. The base class `SQLStateStore` declares `notify=True` with a hook that does nothing, so a subclass must set `notify=False` unless it implements `_after_event_insert`; the [test kit](/docs/guides/build-your-own-store#declare-what-you-promise) refuses a store that declares it without the hook.
+The built-in SQL stores declare all five capabilities. Live updates are not a capability; see below.
+
+## Live updates
+
+Every `SQLStateStore` takes `live_updates=` in its constructor, and `MySQLStateStore.from_url(url, *, live_updates=None, **engine_options)` takes it as a named argument. `store_for_engine(engine, **options)` forwards it.
+
+| Value | Meaning |
+| --- | --- |
+| `None` or `False` (default) | Off. No announcing; followers poll. |
+| `True` | The store's built-in transport. `PostgresStateStore` builds `PostgresUpdates()` from its engine URL. Any other store raises `ValueError` naming the store and suggesting `RedisUpdates`. |
+| a `LiveUpdates` instance | `PostgresUpdates(...)`, `RedisUpdates(...)` or your own. One instance belongs to one store; binding it to a second store raises `ValueError`. |
+
+`store.live_updates` is the bound instance or `None`. `await store.close()` closes it (idempotent) and never disposes the engine; `Agent.close()` calls it only for a store the Agent created from `database_url=`. `RunStore(store)` listens for the instance's hints; `RunStore.from_engine` and `RunStore.from_database_url` do not. After a write's transaction issues COMMIT, the store hands the changed run ids to the instance and flushes them when the outermost store call returns. Hints are lossy: the database is the truth. The transports, the polling-only writes, the deadlines and the failure behaviour are on [Scaling workers](/docs/guides/scaling#live-updates). A custom store that is not built on `SQLStateStore` follows the contract in [Build your own store](/docs/guides/build-your-own-store#live-updates-in-a-custom-store).
 
 ## Optional: statement capacity
 
@@ -63,11 +74,38 @@ A SQL store class may define `async statement_capacity(self) -> int | None`: the
 
 If a connection fails during `COMMIT` and the store cannot prove whether the write happened, the operation raises `StoreOutcomeUnknown`, a subclass of `PersistenceError` with code `store_outcome_unknown`. Operations that carry a retry identity read their rows back and report the real outcome. Claims and reclaims always raise it, even when a later read shows the expected epoch: never run the claimed work or retry the claim blindly. The lease and `reclaim` recover the run. See [Errors](/docs/reference/errors).
 
+## Terminal writes in a custom store
+
+Give your store a `finalize_with_event` and make it atomic. The status change, the terminal event and, for a format-2 run, the final trace are one transaction, and a lost compare-and-swap changes nothing. The runtime calls it for success, a returned error, the iteration limit, a failure and cancellation whenever the store has the method. The built-in SQL stores do this in both storage formats.
+
+Followers depend on it. A follow ends once it has seen the terminal status and drained the event log, so a status that lands before its event can end a follow early. A store without `finalize_with_event` gets separate status and event writes. Its followers get a bounded 100 ms grace and one more drain, which cannot catch an event written arbitrarily late. See [How a follow ends](/docs/reference/run-store#how-a-follow-ends).
+
+**Typed provider errors.** `finalize_with_event` has no `error_info` keyword, and it does not need one. When a typed provider failure ends the run, the structured error information is in `event_data["error_info"]` of the terminal event. `RunStore.get_run` shows it as `RunDetail.error_info`, which it reads from the run's `meta` under the key `dendrux.error_info`. If your store keeps that projection, update it from the event payload in the same transaction that wins the status change. Do not rely on `finalize_run(error_info=...)`: the runtime picks `finalize_with_event` whenever your store has it. The built-in SQL stores do this for you. A lost compare-and-swap must change neither the event log nor the projection.
+
+## Events that do not pass through `save_run_event`
+
+`save_run_event` is not the only way an event reaches the log. Some events are written in the same transaction as the change they describe, by a combined method, and never call `save_run_event`:
+
+| Event | Written by |
+| --- | --- |
+| `run.paused` | `pause_with_event` |
+| `run.completed`, `run.error`, `run.cancelled` from the run loop | `finalize_with_event` |
+| `tool.started` and `tool.completed` of a server tool, on a format-2 run | `start_tool_call` and `complete_tool_call` |
+
+A 0.5 subclass that overrides only `save_run_event` to audit every event therefore sees fewer events than the log holds. In a check on SQLite, a format-2 run with one server tool and one client tool stored 12 events and the override saw 8. Marking an expired lease, reclaiming and sweeping write their events in their own transactions as well.
+
+What a custom writer must do:
+
+- **Audit from the log.** The event log is the truth and holds every event in order. Read it with `RunStore.get_events`, paging with `after_sequence_index` (see [Bounded list reads](/docs/reference/run-store#bounded-list-reads)), or write the audit trail from a store-level hook that you place on the combined methods too.
+- **If you override the combined methods, keep their full signatures.** Copy the base signature, call `super()`, and read the event from the `event` argument (an `EventWrite`) or from `event_type` and `event_data`. A bare `*args, **kwargs` override does not pass capability validation.
+- **If you write your own store, put every event in one log.** Whichever method wrote it, an event takes its sequence index inside the same insert and lands in the same transaction as the change it belongs to. Followers read that one log.
+- **Do not rely on narrowing to get the old behaviour back.** Declaring `atomic_completion=False` makes the runtime use plain `save_run_event` for the tool events, but new runs then start at format 1, and `run.paused` and the terminal events still use their combined methods.
+
 ## Format and recovery requirements
 
 Format 2 requires `fenced_writes`, `retry_ids`, `checkpointing` and `atomic_completion` together, plus an activated database setting. If any is missing, newly created runs use format 1. A run's format never changes on claim or resume.
 
-Recovery additionally requires `recovery=True` and a format-2 ReAct run. `notify` is independent of format and recovery. See [Recovery](/docs/guides/recovery) for sweep and dispatch semantics.
+Recovery additionally requires `recovery=True` and a format-2 ReAct run. Live updates are independent of format and recovery. See [Recovery](/docs/guides/recovery) for sweep and dispatch semantics.
 
 For usage rows, retry equality covers persisted `token_usage` columns, including cost rounded to six decimal places. It does not compare non-persisted `UsageStats` fields such as `cost_source`.
 
@@ -85,6 +123,35 @@ Every SQL store requires real transactions. On first use, before any claim, it r
 
 At Agent construction Dendrux validates declared capability versions, methods and required keyword parameters. A mismatch raises `StoreCapabilityError` (a `TypeError`) before a run starts. `sweep(on_stale="reclaim")` also validates its store before writes.
 
-`SQLAlchemyStateStore` is removed in 0.6.0. When moving a subclass to `PostgresStateStore`, `SQLiteStateStore` or `SQLStateStore`, audit every overridden write method against the current protocol. The subclass inherits the base declaration unless it explicitly narrows it. Keep the named parameters, forward the epoch and caller-minted ids, and preserve the transaction boundaries. Test races and retries against the database you deploy.
+### Fixing a `StoreCapabilityError`
 
-For an external notifier, the Redis [adapter recipe](/docs/recipes/redis-notifier) uses the private `_after_event_insert` hook. That publishing integration may change; the public `EventNotifier` protocol describes the reader side.
+The message names the capability, the method and the parameters it lacks, and tells you the repair. There are three kinds:
+
+| The message says | What is wrong | Fix |
+| --- | --- | --- |
+| `capability 'version'` | `capabilities` is not a `StoreCapabilities`, or its `version` is not 1 | Use a `StoreCapabilities` instance with `version=1`. To repair an instance you have: `self.capabilities = replace(self.capabilities, version=1)` |
+| `capability 'deployment'` | A non-`None` `deployment` is not one of `single_process`, `single_host`, `multi_server` | Set the one that matches your store: `self.capabilities = replace(self.capabilities, deployment="single_host")` |
+| a flag name, such as `capability 'fenced_writes'` | A method that flag requires lacks a named keyword parameter (for example `save_trace` lacks `claim_epoch`) | Copy the base method signature with its explicit keyword-only parameters and forward them. A `*args, **kwargs` signature does not count |
+
+Omitting `deployment` from a `StoreCapabilities` declaration, or setting it to `None`, is currently accepted with a `DeprecationWarning`.
+
+If your store does not support a capability, turn that one flag off and keep the rest of the declaration. Do it in `__init__`, after `super().__init__(...)`:
+
+[//]: # "docs-test: skip - fragment: shows a constructor to complete with your own store"
+
+```python
+from dataclasses import replace
+
+class MyStore(SQLStateStore):
+    def __init__(self, engine):
+        super().__init__(engine)
+        self.capabilities = replace(self.capabilities, fenced_writes=False)
+```
+
+Narrowing has costs, so choose it knowingly:
+
+- It removes the promise. Turning off `fenced_writes` on a `multi_server` store removes fencing: an old owner can then write to a run it lost.
+- It does not adapt your methods. The other flags are still checked, so implement the base signature wherever a flag you keep requires it.
+- Format 2 needs `fenced_writes`, `retry_ids`, `checkpointing` and `atomic_completion` together. Narrowing any of them makes new runs start at format 1.
+
+`SQLAlchemyStateStore` is removed in 0.6.0. When moving a subclass to `PostgresStateStore`, `SQLiteStateStore` or `SQLStateStore`, audit every overridden write method against the current protocol. The subclass inherits the base declaration unless it explicitly narrows it. Keep the named parameters, forward the epoch and caller-minted ids, and preserve the transaction boundaries. Test races and retries against the database you deploy.

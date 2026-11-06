@@ -19,8 +19,8 @@ The token represents one actor who owns the dedicated `demo-user` tenant.
 | Route | Library call |
 | --- | --- |
 | POST /chat | Agent.run(..., tenant_id=...) |
-| POST /runs/{id}/tool-results | Agent.submit_tool_results(..., tenant_id=...) |
-| POST /runs/{id}/approvals | Agent.submit_approval(..., tenant_id=...) |
+| POST /runs/{id}/tool-results | Agent.submit_tool_results(..., expected_pause_id=..., tenant_id=...) |
+| POST /runs/{id}/approvals | Agent.submit_approval(..., expected_pause_id=..., tenant_id=...) |
 | GET /runs/{id}/pending | RunStore.get_pending(..., tenant_id=...) |
 
 The start and submit requests wait until a pause or terminal result. The client

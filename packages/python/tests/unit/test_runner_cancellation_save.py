@@ -37,8 +37,14 @@ async def test_task_cancel_save(store, monkeypatch, caplog, entry, interrupted, 
 
     monkeypatch.setattr(agent._loop, "run", cancel_loop)
     monkeypatch.setattr(runner, "_take_task_interrupt", lambda *args: (interrupted, False))
-    save = AsyncMock(side_effect=RuntimeError("save_failed") if outcome == "raises" else finalize)
-    monkeypatch.setattr(store, "finalize_run", save)
+    method = "finalize_with_event"
+    if outcome == "event_raises":
+        monkeypatch.setattr(store, "finalize_with_event", None)  # Legacy split-write contract.
+        method = "finalize_run"
+    save = AsyncMock(
+        side_effect=RuntimeError("save_failed") if outcome == "raises" else getattr(store, method)
+    )
+    monkeypatch.setattr(store, method, save)
     emit = runner._emit_event
 
     async def event(*args, **kwargs):
@@ -55,7 +61,10 @@ async def test_task_cancel_save(store, monkeypatch, caplog, entry, interrupted, 
     run_id = run_ids[0]
     save.assert_awaited_once()
     assert save.await_args.kwargs["status"] == "cancelled"
-    assert save.await_args.kwargs["expected_current_status"] == "running"
+    if method == "finalize_run":
+        assert save.await_args.kwargs["expected_current_status"] == "running"
+    else:
+        assert save.await_args.kwargs["allowed_current_statuses"] == ["running"]
     assert "answer" not in save.await_args.kwargs
     finished.assert_awaited_once()
     notifier.on_run_finished.assert_awaited_once()
@@ -118,10 +127,14 @@ async def test_stream_close_save(store, monkeypatch, caplog, entry, outcome, par
             answer="winner",
             expected_current_status="running",
         )
+    method = "finalize_with_event"
+    if outcome == "event_raises":
+        monkeypatch.setattr(store, "finalize_with_event", None)  # Legacy split-write contract.
+        method = "finalize_run"
     save = AsyncMock(
-        side_effect=RuntimeError("save_failed") if outcome == "raises" else store.finalize_run
+        side_effect=RuntimeError("save_failed") if outcome == "raises" else getattr(store, method)
     )
-    monkeypatch.setattr(store, "finalize_run", save)
+    monkeypatch.setattr(store, method, save)
     emit = runner._emit_event
 
     async def event_write(*args, **kwargs):
@@ -139,7 +152,10 @@ async def test_stream_close_save(store, monkeypatch, caplog, entry, outcome, par
     save.assert_awaited_once()
     assert save.await_args.kwargs["answer"] == partial
     assert save.await_args.kwargs["status"] == "cancelled"
-    assert save.await_args.kwargs["expected_current_status"] == "running"
+    if method == "finalize_run":
+        assert save.await_args.kwargs["expected_current_status"] == "running"
+    else:
+        assert save.await_args.kwargs["allowed_current_statuses"] == ["running"]
     finished.assert_awaited_once()
     notifier.on_run_finished.assert_awaited_once()
     result = notifier.on_run_finished.await_args.args[1]

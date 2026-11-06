@@ -16,7 +16,6 @@ CAPABILITIES = (
     "checkpointing",
     "atomic_completion",
     "recovery",
-    "notify",
 )
 #: Flags that together make a store create format-2 runs (``state.py`` creation rule).
 FORMAT_2_FLAGS = ("fenced_writes", "retry_ids", "checkpointing", "atomic_completion")
@@ -27,6 +26,7 @@ REOPEN = "dendrux_store_reopen"
 SECOND_INSTANCE = "dendrux_store_second_instance"
 CLOCK = "dendrux_clock"
 FAULT_INJECTOR = "dendrux_fault_injector"
+LIVE_FACTORY = "dendrux_live_store_factory"
 
 
 def required_fixtures_for(declared: tuple[str, ...], deployment: str | None) -> dict[str, str]:

@@ -7,6 +7,7 @@ import pytest
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from dendrux import Agent, tool
+from dendrux._meta_keys import ERROR_INFO_META_KEY
 from dendrux.db._sqlite_sync import create_sqlite_schema
 from dendrux.errors import ProviderTimeoutError, RunFencedError
 from dendrux.llm.mock import MockLLM
@@ -109,8 +110,10 @@ async def test_failure_after_start(store, monkeypatch, caplog, entry, outcome):
     secondary = (
         RunFencedError("fenced") if outcome == "fenced_save" else RuntimeError("save_failed")
     )
-    save = AsyncMock(side_effect=secondary if outcome in {"raises", "fenced_save"} else finalize)
-    monkeypatch.setattr(store, "finalize_run", save)
+    save = AsyncMock(
+        side_effect=secondary if outcome in {"raises", "fenced_save"} else store.finalize_with_event
+    )
+    monkeypatch.setattr(store, "finalize_with_event", save)
     recorder_failed = AsyncMock()
     monkeypatch.setattr(PersistenceRecorder, "on_run_failed", recorder_failed)
     safe = AsyncMock(wraps=runner._emit_event_safe)
@@ -133,14 +136,16 @@ async def test_failure_after_start(store, monkeypatch, caplog, entry, outcome):
     assert notifier.on_run_failed.await_args.args[-1] is original
     notifier.on_run_finished.assert_not_awaited()
     save.assert_awaited_once()
-    assert save.await_args.kwargs["expected_current_status"] == "running"
+    assert save.await_args.kwargs["allowed_current_statuses"] == ["running"]
     assert save.await_args.kwargs["status"] == "error"
     assert save.await_args.kwargs["total_usage"] is None
-    assert save.await_args.kwargs["error_info"]["category"] == "timeout"
+    assert save.await_args.kwargs["event_data"]["error_info"]["category"] == "timeout"
     stored = [e for e in await store.get_run_events(run_id) if e.event_type == "run.error"]
     assert len(stored) == int(outcome == "won")
-    assert safe.await_count == int(outcome == "won" and entry.endswith("stream"))
+    assert safe.await_count == 0  # Lifecycle evidence is in the atomic finalize.
     row = await store.get_run(run_id)
+    if outcome == "won":
+        assert row.meta[ERROR_INFO_META_KEY]["category"] == "timeout"
     assert (
         row.status
         == {"won": "error", "lost": "success", "raises": "running", "fenced_save": "running"}[
@@ -227,8 +232,9 @@ async def test_claim_failure_releases_before_failure_persistence(store, monkeypa
     monkeypatch.setattr(runner, "report_governance_change", AsyncMock(side_effect=original))
     release = AsyncMock(wraps=runner._release_claim)
     monkeypatch.setattr(runner, "_release_claim", release)
-    finalize = AsyncMock(wraps=store.finalize_run)
+    finalize = AsyncMock(wraps=store.finalize_with_event)
     monkeypatch.setattr(store, "finalize_run", finalize)
+    monkeypatch.setattr(store, "finalize_with_event", finalize)
     if entry == "resume_stream":
         async with invoke(notifier) as stream:
             events = [event async for event in stream]

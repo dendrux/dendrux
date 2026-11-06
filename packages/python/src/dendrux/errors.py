@@ -109,6 +109,37 @@ class RunNotFoundError(_KwargsReduceMixin, LookupError):
         super().__init__(f"Run '{run_id}' not found.")
 
 
+def _capability_advice(capability: str) -> str:
+    specific = {
+        "version": (
+            "For an existing StoreCapabilities instance: from dataclasses import replace; "
+            "self.capabilities = replace(self.capabilities, version=1). Otherwise declare "
+            'StoreCapabilities(version=1, deployment="single_process") for a single-process '
+            "store; use single_host or multi_server for those implementations, and declare "
+            "only capabilities the store implements."
+        ),
+        "deployment": (
+            "Set a valid deployment matching the store: single_process, single_host, or "
+            "multi_server; for example, for a single-process store: from dataclasses import "
+            'replace; self.capabilities = replace(self.capabilities, deployment="single_process").'
+        ),
+    }
+    optional = {"fenced_writes", "retry_ids", "checkpointing", "atomic_completion", "recovery"}
+    if capability in specific:
+        return specific[capability]
+    advice = "Copy the base store method signature, including explicit keyword-only parameters."
+    if capability in optional:
+        advice += (
+            " If that capability is unsupported, narrow its StoreCapabilities declaration: "
+            "from dataclasses import replace; "
+            f"self.capabilities = replace(self.capabilities, {capability}=False). "
+            "Narrowing does not adapt incompatible method signatures."
+        )
+    if capability == "fenced_writes":
+        advice += " Disabling fenced_writes on a multi_server store removes fencing."
+    return advice
+
+
 class StoreCapabilityError(TypeError):
     """A declared store capability does not match the implementation."""
 
@@ -118,7 +149,8 @@ class StoreCapabilityError(TypeError):
         self.method = method
         self.missing = missing
         super().__init__(
-            f"StateStore {store} capability '{capability}': {method} lacks {missing!r}."
+            f"StateStore {store} capability '{capability}': {method} lacks {missing!r}. "
+            + _capability_advice(capability)
         )
 
 
@@ -174,13 +206,47 @@ class RunCancelledError(_KwargsReduceMixin, RunControlError):
         super().__init__(f"Run '{run_id}' cannot start under parent '{parent_run_id}'.")
 
 
-class NotifierUnavailableError(RuntimeError):
-    """The configured notifier could not become ready."""
+class FollowCapacityError(RuntimeError):
+    """The :class:`EventFeed` already serves ``max_followers`` followers, or
+    this tenant already holds ``max_followers_per_tenant`` of them.
 
-    def __init__(self, reason: str) -> None:
-        self.reason = reason
-        _codes.log_code(logging.getLogger(__name__), _codes.NOTIFIER_UNAVAILABLE, run_id=None)
-        super().__init__(f"Notifier unavailable ({reason}).")
+    Map it to HTTP 503 (retry shortly). ``limit`` is the cap that was hit;
+    ``per_tenant`` is True when it was the per-tenant cap.
+    """
+
+    def __init__(self, limit: int, *, per_tenant: bool = False) -> None:
+        self.limit = limit
+        self.per_tenant = per_tenant
+        scope = _CAPACITY_SCOPE[bool(per_tenant)]
+        super().__init__(f"This event feed already serves its maximum of {limit} {scope}.")
+
+    def __reduce__(self) -> Any:
+        return (_capacity_error, (self.limit, self.per_tenant))
+
+
+_CAPACITY_SCOPE = {False: "followers", True: "followers for one tenant scope"}
+
+
+def _capacity_error(limit: int, per_tenant: bool) -> FollowCapacityError:
+    return FollowCapacityError(limit, per_tenant=per_tenant)
+
+
+class LiveUpdatesUnavailableError(RuntimeError):
+    """The live-update listener could not become ready; polling remains available."""
+
+    def __init__(self, reason: str = "other") -> None:
+        self.reason = (
+            reason if reason in {"timeout", "connection", "cancelled", "closed"} else "other"
+        )
+        _codes.log_code(
+            logging.getLogger(__name__),
+            _codes.LIVE_UPDATES_UNAVAILABLE,
+            error_kind=self.reason,
+        )
+        super().__init__(f"Live updates unavailable ({self.reason}).")
+
+    def __reduce__(self) -> Any:
+        return _restore_logged_control_error, (type(self), self.args, self.__dict__)
 
 
 class RunNotPausedError(RunControlError):
@@ -949,6 +1015,31 @@ class ProviderResponseError(ProviderError):
 
     default_category = "rejected"
 
+    def __init__(
+        self,
+        *,
+        provider: str | None = None,
+        model: str | None = None,
+        status_code: int | None = None,
+        provider_code: str | None = None,
+        error_type: str | None = None,
+        message: str = "Response refused by the local response contract.",
+        category: ProviderErrorCategory | None = None,
+        retryable: bool | None = None,
+        timeout_reason: TimeoutReason | None = None,
+    ) -> None:
+        super().__init__(
+            provider=provider,
+            model=model,
+            status_code=status_code,
+            provider_code=provider_code,
+            error_type=error_type,
+            message=message,
+            category=category,
+            retryable=retryable,
+            timeout_reason=timeout_reason,
+        )
+
 
 class ProviderStreamIncompleteError(ProviderError):
     """A response stream ended without its terminal event."""
@@ -1135,6 +1226,23 @@ class BlobContentionError(_KwargsReduceMixin, RuntimeError):
 # ---------------------------------------------------------------------------
 
 
+class SubtreeTooLargeError(_KwargsReduceMixin, ValueError):
+    """A public subtree read reached its descendant bound (root excluded).
+
+    ``run_id`` identifies the root and ``max_nodes`` the refused threshold.
+    SQL traversal stops at the threshold; custom stores without a named
+    ``max_nodes`` keyword are checked after loading. This bounds node count,
+    not payload memory.
+    """
+
+    _init_fields = ("run_id", "max_nodes")
+
+    def __init__(self, run_id: str, max_nodes: int) -> None:
+        self.run_id = run_id
+        self.max_nodes = max_nodes
+        super().__init__(f"Subtree for run {run_id!r} reached max_nodes={max_nodes} descendants.")
+
+
 class BudgetConfigurationError(_KwargsReduceMixin, ValueError):
     """A budget cannot be safely evaluated from pricing or bounded live accounting.
 
@@ -1231,7 +1339,8 @@ __all__ = [
     "StoreOutcomeUnknown",
     "StatementTooLargeError",
     "JSONIntegerOutOfRangeError",
-    "NotifierUnavailableError",
+    "LiveUpdatesUnavailableError",
+    "FollowCapacityError",
     "StoreCapabilityError",
     "RunCancelledError",
     "RunNotReclaimableError",
@@ -1276,6 +1385,7 @@ __all__ = [
     "SkillMissingError",
     "SkillValidationError",
     "SqliteSchemaSyncError",
+    "SubtreeTooLargeError",
     "TIMEOUT_REASONS",
     "TenantScopeRequiredError",
     "TimeoutReason",

@@ -22,7 +22,8 @@ from dendrux.errors import (
     BudgetConfigurationError, TenantScopeRequiredError, GovernanceMismatchError,
     NoteLimitExceededError, PersistenceError, StoreOutcomeUnknown, StatementTooLargeError,
     JSONIntegerOutOfRangeError, RunControlError,
-    RunNotReclaimableError, RunCancelledError, StoreCapabilityError, NotifierUnavailableError,
+    RunNotReclaimableError, RunCancelledError, StoreCapabilityError, LiveUpdatesUnavailableError,
+    SubtreeTooLargeError,
 )
 from dendrux.types import InputValidationError   # also a ValueError
 from dendrux.store import FollowCapacityError
@@ -37,21 +38,22 @@ The most common ones are also re-exported from the top-level `dendrux` package.
 | Exception | Base | Raised when | Suggested HTTP |
 | --- | --- | --- | --- |
 | `RunControlError()` | `RuntimeError` | Shared base for run-control conflicts. Catch a more specific class when choosing a recovery action. | per subclass |
-| `RunNotReclaimableError(run_id, reason)` | `RunControlError` | Recovery preconditions fail, a mark was already claimed, or history reconstruction is refused. `reason` is a stable code. See [Recovery](/docs/guides/recovery). | 409 |
+| `RunNotReclaimableError(run_id, reason)` | `RunControlError` | Recovery preconditions fail, a mark was already claimed, or history reconstruction is refused. `RunStore.get_traces` on a format-2 run raises it with `reason="history_too_large"` when the conversation is above 20,000 expanded rows or 16 MiB; see [Bounded list reads](/docs/reference/run-store#bounded-list-reads). `reason` is a stable code. See [Recovery](/docs/guides/recovery). | 409 |
 | `RunCancelledError(run_id, parent_run_id)` | `RunControlError` | Delegated-child creation finds a terminal parent or a pending parent cancellation. | 409 |
-| `StoreCapabilityError(store, capability, method, missing)` | `TypeError` | A declared store capability has an incompatible method or keyword signature. Fix the store before accepting work. | 500 |
-| `NotifierUnavailableError(reason)` | `RuntimeError` | An explicitly managed event notifier cannot start. Owned RunStore listeners fall back to polling on unavailability. | 503 |
+| `StoreCapabilityError(store, capability, method, missing)` | `TypeError` | A declared store capability has an incompatible method or keyword signature, or its `version` or `deployment` is wrong. The message names the capability, the method and the missing parameters and gives the repair; see [Fixing a `StoreCapabilityError`](/docs/reference/state-store#fixing-a-storecapabilityerror). Fix the store before accepting work. | 500 |
+| `LiveUpdatesUnavailableError(reason)` | `RuntimeError` | `RunStore` cannot take its internal listener lease: the instance is closed, or an earlier listener did not stop within its deadline. `reason` is `timeout`, `connection`, `cancelled`, `closed` or `other`. Taking a lease starts the listener task at once; connection or subscription failures then degrade and retry inside that task, so check `updates.healthy` to know whether the subscription is live. Taking a lease from another event loop raises `RuntimeError`, a separate error. `RunStore` readers catch both, poll, and ask again after 30 seconds, so you rarely see either. | 503 |
 | `RunNotFoundError(run_id)` | `LookupError` | `run_id` does not exist, or belongs to a tenant other than the one you passed. The same error for both, from `Agent`, `retry` and `RunStore` alike (`dendrux.store.RunNotFoundError` is an alias of this class). | 404 |
 | `RunNotPausedError(run_id, current_status)` | `RuntimeError` | A submit method is called on a run that is not paused. | 409 |
 | `PauseStatusMismatchError(run_id, current_status, expected_status, *, expected_pause_id=, current_pause_id=, reason=)` | `RuntimeError` | `reason="status"` (the default): a submit for the wrong pause type (e.g. `submit_tool_results` on `waiting_human_input`). `reason="pause_id"`: the call carried an `expected_pause_id=` that is no longer the run's current pause, so it is a stale submit; nothing was claimed or written. See [Pause ids and stale submits](/docs/architecture/pause-resume#pause-ids-and-stale-submits). | 409 |
 | `RunAlreadyClaimedError(run_id)` | `RuntimeError` | A concurrent submit already won the CAS claim on this pause. | 409 |
 | `RunAlreadyTerminalError(run_id, current_status)` | `RuntimeError` | A submit method, or `submit_note`, targets a run that is already terminal; also a submit on a run whose cancellation was requested but not yet observed. (`cancel_run` and `request_pause` do not raise this.) | 409 |
 | `InvalidToolResultError(run_id, detail)` | `ValueError` | Submitted tool results do not match the pending set: an unknown, duplicate or missing call id, a tool name that differs from the pending call, a payload that is not valid, finite JSON or text, or an approval-path result that is not a failed denial. `detail` is a fixed description and never echoes a client id or payload. The run stays paused and unclaimed. | 400 |
-| `InputValidationError(field, code)` | `ValueError` | A client value cannot be accepted or stored: `field` names a fixed API field (never an input key or value) and `code` is `invalid_identifier`, `invalid_text` (NUL or a lone surrogate), `invalid_json`, `nonfinite_json`, `structure_limit` or `pause_id_required` (a pause with a stored id continued without `expected_pause_id` when approving or under strict tenancy). Raised before anything is written or claimed. Import it from `dendrux.types`. | 400 |
+| `InputValidationError(field, code)` | `ValueError` | A client value cannot be accepted or stored: `field` names a fixed API field (never an input key or value) and `code` is `invalid_identifier`, `invalid_text` (NUL or a lone surrogate), `invalid_json`, `nonfinite_json`, `structure_limit` or `pause_id_required` (a pause with a stored id continued without `expected_pause_id` when approving or under strict tenancy). These input checks run before writing or claiming. History reconstruction can also raise `InputValidationError(field="history", code="history_too_large")` after a submitted continuation claims the run. That postclaim failure releases the claim and restores the waiting status. Import it from `dendrux.types`. | 400 |
 | `PersistenceError()` | `RuntimeError` | A database operation failed. SQL, bound parameters and driver text are omitted (`safe_message`, `retryable`). A write that fails after the retries makes `agent.run` raise it and `agent.stream` end with `run_error`; see [When a write fails inside a run](#when-a-write-fails-inside-a-run). | 500 or 503 |
 | `StoreOutcomeUnknown()` | `PersistenceError` | A connection failed during `COMMIT` and the store cannot prove whether the write happened. `code` is `store_outcome_unknown`. Claims and reclaims always raise it after an ambiguous commit: do not run the claimed work, do not retry the claim, and do not read a later epoch as proof of ownership. The lease and `reclaim` recover the run. Writes that carry a retry identity are read back and report their true outcome instead. A blind retry of the same submit call gets `RunNotPausedError` when the first attempt did land. See [When a commit acknowledgement is lost](#when-a-commit-acknowledgement-is-lost). | 503 |
 | `StatementTooLargeError(limit=None, size=None)` | `PersistenceError` | MySQL or MariaDB answered a statement with its packet-too-large error (1153, or 1301 for an oversized function result). `code` is `statement_too_large`; `limit` is the server's `max_allowed_packet` in bytes when known; `size` is best effort and usually `None`; no value is in the message. Not retried, nothing persisted. Servers usually close the connection instead of answering: when a MySQL-family connection is lost and a value bound to the failed statement is larger than the store's `max_allowed_packet`, the store raises this error after one attempt. A lost connection with no oversized value is an ordinary transient failure. Shrink the payload or raise the server limit. See [MySQL and MariaDB](/docs/guides/mysql#payload-limits-and-max_allowed_packet). | 413 or 500 |
 | `JSONIntegerOutOfRangeError()` | `PersistenceError` | The MySQL store refused a JSON integer outside signed int64 / unsigned uint64 (-9223372036854775808 through 18446744073709551615), because MySQL would store it as an approximate decimal. `code` is `json_integer_out_of_range`; not retryable; nothing is written. The range applies to each JSON field you write (input, metadata, tool results, patches) on its own. Send larger integers as strings. MariaDB, PostgreSQL and SQLite keep large integers exactly and do not raise it. | 400 or 500 |
+| `SubtreeTooLargeError(run_id, max_nodes)` | `ValueError` | `RunStore.get_subtree(..., max_nodes=N)` found that the descendants of the root (the root itself is not counted) reached `N`. Nothing is returned. It carries `run_id` and `max_nodes`, and logs `subtree_limit` with `run_id` and `limit`. It bounds the node count, not memory. Catch it to report the refusal, or retry with a larger bound you chose. See [`get_subtree`](/docs/reference/run-store#get_subtree). | 422 |
 | `FollowCapacityError(limit, per_tenant=False)` | `RuntimeError` | `RunStore.follow` has no free follower slot: the store cap, or (`per_tenant=True`) the cap for that tenant scope. Safe to retry shortly. See [Build your own read routes](/docs/recipes/build-your-own-read-routes). | 503 |
 | `PersistenceNotConfiguredError()` | `RuntimeError` | A method needs persistence but no `database_url` / `state_store` is configured (the Agent ignores `DENDRUX_DATABASE_URL`; without a store its presence logs `database_url_env_ignored` once per process). | 500 |
 | `SchemaNotInitializedError()` | `RuntimeError` | The database has no Dendrux tables yet (non-SQLite needs `dendrux db migrate`). Also raised from any failing statement that names a missing table (MySQL 1146, PostgreSQL 42P01, SQLite "no such table"), on every store path including an engine you own, with the `dendrux db migrate` hint and no driver text. The tuples may be empty then, because the error comes from the statement, not from a catalog inventory. | 500 |
@@ -115,7 +117,7 @@ The 0.3.0 methods reuse the hierarchy above. These are the cases worth knowing:
 
 Dendrux writes a run's state as it goes: the run row, its events, traces, tool calls and usage. A failed write is retried where that is safe (see [Database retries](/docs/upgrading-to-0.6.0#database-retries)). What happens when it still fails after the retries depends on the write:
 
-- **Three writes are best effort and never fail the run.** The record of a model call (`save_llm_interaction`), the usage row of a call (`save_usage`) and the progress heartbeat of a legacy format-1 run (`touch_progress`). If one cannot be written the run carries on and can finish `success`; the missing row is logged as a warning.
+- **Four writes are best effort and never fail the run.** The record of a model call (`save_llm_interaction`), the usage row of a call (`save_usage`), the progress heartbeat of a legacy format-1 run (`touch_progress`) and the `guardrail.unmapped_placeholder` event, which notes a PII placeholder the run could not map back. If one cannot be written the run carries on and can finish `success`; the missing row is logged as a warning. The placeholder event is written just before the terminal write, and a failure to save it never discards a valid answer or leaves the run `running`. A write refused because the run lost its owner (fencing) is not best effort: it still stops the stale writer.
 - **The other writes are fatal:** the run row, its events, traces and tool calls, and the final `finalize_with_event`. A fatal failure ends the call:
   - `agent.run` **raises `PersistenceError`**. It does not return a `RunResult`. Catch it in your route and answer 503; `retryable` says whether trying again may help.
   - `agent.stream` does not raise once the stream has started. It ends with a `run_error` event whose `error` is the fixed message `Database operation failed (persistence_error).` (A configuration, schema or startup failure before the first event can still raise.)
@@ -123,8 +125,70 @@ Dendrux writes a run's state as it goes: the run row, its events, traces, tool c
 What the failed call leaves in the database depends on what the database can still do:
 
 - If the run could not be created, no run exists.
-- Dendrux then tries to record the failure. If the database answers again in time, the run is saved as `error` with the fixed message and a `run.error` event, even though the call raised: check the run's status before assuming it is still running.
+- After work starts, Dendrux tries to record the failure. If the database answers again in time, the run is saved as `error` with the fixed message and a `run.error` event. Unconsumed continuations can instead release to their pause as described below: check the run's status before deciding how to retry.
 - If the database still cannot be written, the run stays `running` at its last committed state: every event and row written before the failure is there, and nothing marks it `error`. Find it with `sweep` and move it on with `reclaim` (or finish it with `on_stale="error"`); see [Recovery](/docs/guides/recovery).
+
+## Fencing and heartbeats
+
+A stale claim stops further writes by that worker. Inside a tool, `aheartbeat()`
+can raise `RuntimeError`; `heartbeat()` retains a fence found in the background
+and raises it at the next heartbeat or step boundary. The concrete exception is
+currently the internal `dendrux.errors.RunFencedError`, a `RuntimeError` subclass.
+It is not exported in `__all__` or from `dendrux`, and its name and fields are not
+public API. Do not rely on importing it or matching its message.
+
+Let the exception leave the tool. If you catch `RuntimeError` to clean up, re-raise
+it; do not continue work or retry side effects after losing ownership. Repeated
+lease-renewal failures instead raise the public `PersistenceError` with
+`code="lease_lost"`; stop the tool for that error too.
+
+The runner normally handles a fence by reading and returning the durable winner's
+current outcome, without writing a new failure. A streaming caller receives the
+corresponding outcome event; if the winner is still running, its local feed ends
+with `RUN_ERROR` and `ErrorInfo(category="run_fenced", retryable=False)` while
+preserving the durable status. Read `Agent.get_result` or `RunStore` before
+choosing a next action. A fence is not a signal to start the same work again.
+
+## When continuation setup fails
+
+In 0.6.0, `resume`, `resume_stream`, `submit_*` and `reclaim` use the same
+execution-setup failure policy. Any ordinary exception before submission
+consumption or work starts can release the exact claim, including setup reads and
+writes (`run.resumed`, `save_trace`, or `consume_submission` before it commits).
+`StoreOutcomeUnknown` during execution setup is excluded from release.
+Cancellation retains its existing precedence. In 0.5.0 these post-claim failures
+ended direct resume attempts as `error`.
+
+A successful release restores the pause, but does not schedule a retry. Resubmit
+the input/results/decisions explicitly; do not rely on a saved submission being
+picked up automatically. Permanent setup failures will repeat until corrected;
+call `cancel_run` if you give up. Paused rows do not time out automatically.
+Reclaim releases to `running` for lease expiry and a new sweep.
+
+For a claimed pause, a store without a release method or integer epoch falls back
+to persisting `error`. Reclaim stays `running` for a later sweep even without a
+release method. If a release is attempted but fails, the row can stay
+`running`; use `sweep` and `reclaim`, or `sweep(on_stale="error")` for stores without
+recovery. A stale release cannot change a newer epoch. Started observers get
+`on_run_finished` after a confirmed release to an observed non-running status.
+Failure hooks run when no release is confirmed or the observed status remains
+`running` (including reclaim). An unavailable cleanup status read falls back to
+`running` and failure hooks rather than inventing a pause.
+
+The call raises; `resume_stream` emits `run_error` with the failure information.
+After release, that event's result preserves the observed durable status instead
+of claiming terminal `error`; `stream.result` can therefore be paused or running.
+It does not supply a pending payload or pause token. Monitors must count failed
+attempts as well as terminal-error rows.
+
+When execution returns a committed outcome, recovery and pending projections
+are best effort. A failed recovery projection returns `recovery=None`. A failed
+pending projection, or failed refresh after committing a pause, returns the known
+status with `pending=None` and `pause_id=None`. Reload with `RunStore.get_pending`
+before submitting. Each failure logs `result_read_failed` with `run_id`;
+`CancelledError` still propagates. `cancel_run` also treats recovery as optional,
+but `get_result` remains strict and raises on projection failure. Reads needed to
+determine an unknown winning outcome remain required.
 
 ## When a commit acknowledgement is lost
 

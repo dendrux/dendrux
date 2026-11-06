@@ -26,7 +26,7 @@ from dendrux.errors import (
     RunNotFoundError,
     RunNotPausedError,
 )
-from dendrux.store import RunStore
+from dendrux.store import RunStore, store_for_engine
 from dendrux.types import ToolResult
 
 Provider = Literal["anthropic", "openai"]
@@ -46,6 +46,9 @@ class ToolResultItem(BaseModel):
 
 class ToolResultsIn(BaseModel):
     results: list[ToolResultItem] = Field(min_length=1, max_length=100)
+    # The pause generation the browser reviewed (from /pending). Dendrux requires it
+    # under strict tenancy and refuses a stale one.
+    expected_pause_id: str | None = Field(default=None, max_length=26)
 
 
 def browser_result(result: Any) -> dict[str, Any]:
@@ -97,7 +100,11 @@ def create_demo_app(*, database_url: str | None = None) -> FastAPI:
         output.mkdir(exist_ok=True)
         database_url = f"sqlite+aiosqlite:///{output / 'demo.db'}"
     engine = create_async_engine(database_url)
-    store = RunStore.from_engine(engine)
+    # This demo polls. RunStore.from_engine(engine) can never listen. To wake followers
+    # early, build one store with live_updates=... (Postgres or Redis), pass it to the
+    # Agent as state_store= and wrap that same store with RunStore(state).
+    state = store_for_engine(engine)
+    store = RunStore(state)
     agents = build_agents(database_url)
     token = os.environ.get("DENDRUX_DEMO_TOKEN", "dev-secret-abc").encode()
     # App-owned identity/provider association. Persist it in your app DB for
@@ -114,6 +121,7 @@ def create_demo_app(*, database_url: str | None = None) -> FastAPI:
             for agent in agents.values():
                 await agent.close()
             await store.close()
+            await state.close()
             await engine.dispose()
 
     app = FastAPI(title="Dendrux developer routes demo", lifespan=lifespan)
@@ -181,7 +189,9 @@ def create_demo_app(*, database_url: str | None = None) -> FastAPI:
             ToolResult(name=r.tool_name, call_id=r.tool_call_id, payload=r.payload)
             for r in body.results
         ]
-        result = await agents[provider].submit_tool_results(run_id, results, tenant_id=tenant)
+        result = await agents[provider].submit_tool_results(
+            run_id, results, expected_pause_id=body.expected_pause_id, tenant_id=tenant
+        )
         return browser_result(result)
 
     return app

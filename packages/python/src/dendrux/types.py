@@ -366,7 +366,7 @@ class Message:
         reasoning_blocks: list[Any] | None = None,
         parts: tuple[ContentPart, ...] | None = None,
     ) -> None:
-        # Hand-written (dataclass init=False) so the 13-field frozen message is
+        # Hand-written (dataclass init=False) so the frozen message is
         # built with one dict update instead of one object.__setattr__ per field.
         self.__dict__.update(
             role=role,
@@ -1101,6 +1101,8 @@ class Limits:
         max_pending_calls: Most calls in one format-2 assistant batch. Default 64.
         max_rebuild_bytes: Largest recovered conversation, in UTF-8 JSON bytes.
             Default 16 MiB.
+        max_pause_summary_bytes: Maximum JSON bytes in a saved human-input display
+            summary. Default 64 KiB; 128 bytes to 512 KiB. Excess text is truncated.
         max_rebuild_rows: Most expanded entries in a recovered conversation.
             Default 20,000.
 
@@ -1115,8 +1117,10 @@ class Limits:
     max_pending_calls: int = 64
     max_rebuild_bytes: int = 16 * _MIB
     max_rebuild_rows: int = 20_000
+    max_pause_summary_bytes: int = 65536
 
     def __post_init__(self) -> None:
+        _validate_pause_summary_limit(self.max_pause_summary_bytes)
         for name in (
             "max_tool_result_bytes",
             "max_input_bytes",
@@ -1131,6 +1135,12 @@ class Limits:
                 if name in {"max_pending_calls", "max_rebuild_bytes", "max_rebuild_rows"}:
                     _codes.log_code(logger, _codes.INVALID_LIMIT, run_id=None)
                 raise ValueError(f"Limits {name} must be a positive int, got {value!r}.")
+
+
+def _validate_pause_summary_limit(value: int) -> None:
+    if type(value) is not int or not 128 <= value <= 524288:
+        _codes.log_code(logger, _codes.INVALID_LIMIT, run_id=None)
+        raise ValueError("max_pause_summary_bytes must be an integer from 128 to 524288")
 
 
 def _validate_provider_kwargs(value: dict[str, Any], *, run_id: str | None = None) -> None:
@@ -1251,7 +1261,7 @@ class ErrorInfo:
 
 @dataclass(frozen=True)
 class RecoveryInfo:
-    """Durable recovery summary, absent for runs that were never reclaimed."""
+    """Durable recovery summary, when requested recovery reads succeed."""
 
     reclaim_attempts: int
     last_reclaimed_at: datetime | None
@@ -1300,10 +1310,15 @@ class RunResult:
     (``stop_reason == "max_tokens"``): the run still ends SUCCESS, but the
     answer is cut off.
 
-    ``error_info`` describes a provider failure that ended the run (ERROR
-    only). ``pause_id`` identifies the current pause of a paused run.
+    ``error_info`` describes a failed attempt. Usually its status is ERROR;
+    a resumed stream can instead preserve a released pause or running status.
+    ``pause_id`` identifies the current pause of a paused run.
     ``recovery`` summarizes durable reclaims and replayed calls. It is None
-    for unreclaimed runs, whose wire DTO omits the additive recovery key.
+    for unreclaimed runs, or when optional reads fail while returning a
+    committed outcome or cancellation response. The wire DTO then omits the
+    recovery key. ``Agent.get_result`` is strict and propagates recovery read
+    failures. Committed pause results may lack ``pending`` and ``pause_id``
+    after a projection failure; reload pending before submitting.
     """
 
     run_id: str
@@ -1530,12 +1545,11 @@ class ImageViewState:
 class PauseState:
     """Everything needed to resume a paused agent run.
 
-    This is execution state, not observability state. It is persisted
-    raw in pause_data (JSON column) and cleared on finalize — the DB
-    is ground truth across traces, tool_calls, and pause_data alike.
-    Guardrail redaction (placeholders) applies only at the LLM-call
-    boundary; the bijection lives on agent_runs.pii_mapping for audit
-    replay.
+    Persisted in pause_data and cleared on finalize. Format 1 stores the
+    history and steps; format 2 stores recovery references and a bounded
+    clarification summary. The question and options retain model text,
+    including PII placeholders. The PII bijection lives on agent_runs.pii_mapping.
+    Format-2 conversation checkpoints retain the provider-ready message view.
     """
 
     agent_name: str
@@ -1578,6 +1592,7 @@ class PauseState:
     provider_kwargs: dict[str, Any] = field(default_factory=dict)
     image_view_ref: str | None = None
     loop_state_ref: bool = False
+    clarification: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to JSON-compatible dict for DB storage.
@@ -1627,11 +1642,7 @@ class PauseState:
             if k in {"model", "max_tokens", "temperature", "thinking", "effort"}
         }
         if self.schema_version == 2:
-            for key in ("history", "steps", "image_view"):
-                d.pop(key, None)
-            d["image_view_ref"] = self.image_view_ref
-            d["loop_state_ref"] = True
-            d["provider_kwargs"] = dict(self.provider_kwargs)
+            self._checkpoint_fields(d)
         # Validate JSON safety — catch non-serializable meta values early
         try:
             json.dumps(d)
@@ -1641,6 +1652,15 @@ class PauseState:
                 f"Ensure all Message.meta and AgentStep.meta values are JSON-safe."
             ) from e
         return d
+
+    def _checkpoint_fields(self, d: dict[str, Any]) -> None:
+        for key in ("history", "steps", "image_view"):
+            d.pop(key, None)
+        if self.clarification is not None:
+            d["clarification"] = self.clarification
+        d["image_view_ref"] = self.image_view_ref
+        d["loop_state_ref"] = True
+        d["provider_kwargs"] = dict(self.provider_kwargs)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> PauseState:
@@ -1683,6 +1703,7 @@ class PauseState:
             schema_version=data.get("schema_version") or 1,
             image_view_ref=data.get("image_view_ref"),
             loop_state_ref=bool(data.get("loop_state_ref", False)),
+            clarification=data.get("clarification"),
             provider_kwargs={
                 k: v
                 for k, v in (data.get("provider_kwargs") or {}).items()
@@ -1944,7 +1965,9 @@ class RunEventType(StrEnum):
         RUN_RESUMED: First event for resumed runs. Carries run_id.
         RUN_COMPLETED: Terminal. Run finished (success or max_iterations).
         RUN_PAUSED: Terminal. Run paused for client tool or human input.
-        RUN_ERROR: Terminal. Run failed. No exception is raised to the consumer.
+        RUN_ERROR: Ends this stream attempt without raising to the consumer.
+            The result can report a paused or running row after continuation
+            cleanup, rather than a terminal run failure.
         RUN_CANCELLED: Terminal. Run was cancelled cooperatively.
 
     LLM output events (translated from provider StreamEvent):

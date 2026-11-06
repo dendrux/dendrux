@@ -22,10 +22,22 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-green.svg" alt="License: Apache 2.0" /></a>
 </p>
 
-> `v0.5.0` - core API stabilizing, actively developed.
+> `v0.6.0` - core API stabilizing, actively developed.
 
 
 ---
+
+## What's new in 0.6.0
+
+0.6.0 ("Production") adds recovery after a worker stops and the tools to run Dendrux across many processes. Read the [upgrade guide](docs/upgrading-to-0.6.0.mdx) before you deploy: migrate, roll every worker and reader, take a backup, then activate storage format 2. Activation is one way.
+
+- **Recovery.** `sweep(on_stale="reclaim")` marks runs whose worker stopped, and `agent.reclaim(...)` continues them from their last committed state. You call both from your own jobs; Dendrux starts no background workers. See [Recovery](docs/guides/recovery.mdx).
+- **Durable checkpoints.** Storage format 2 keeps conversation history and execution state in bounded rows, so a run survives a restart between steps.
+- **Optional live updates.** Postgres or Redis hints wake `RunStore.follow` early. They are off by default and only a wake-up: the database stays the truth. Only `RunStore(store)` listens; `RunStore.from_engine` polls. See [Scaling workers](docs/guides/scaling.mdx#live-updates) and `examples/40_live_updates.py`.
+- **One reader coordinator.** `follow` is served by one coordinator per `RunStore`, which reads all watched runs in batches.
+- **MySQL and MariaDB.** `MySQLStateStore` and a store test kit for any other SQL database. See [MySQL and MariaDB](docs/guides/mysql.mdx) and [Build your own store](docs/guides/build-your-own-store.mdx).
+- **Bounded reads.** `get_events`, `get_traces`, `get_llm_calls`, `get_tool_invocations` and `get_subtree` take `limit=` or `max_nodes=`. Omitting it warns in 0.6 and defaults to a bound in 0.7.
+- **Defaults flip.** Strict tenancy, `on_governance_change="raise"` and cache-token budgets are on. The Agent ignores `DENDRUX_DATABASE_URL`. See [Every default change](docs/upgrading-to-0.6.0.mdx#every-default-change).
 
 ## What's new in 0.5.0
 
@@ -33,7 +45,7 @@
 
 - **Tenant-scoped reads.** Pass `tenant_id=` on every RunStore read and Agent write. A foreign run looks like a missing one. Your routes authenticate the actor and authorize user-level run ownership. See [Multi-tenancy](docs/architecture/multi-tenancy.mdx).
 - **Payloads hidden by default.** `RunStore.follow` and `get_event_view` show only enumerated codes, generated ids, numbers and declared names; free text, past tool call ids and tool names they cannot prove are hidden. This protects readers from untrusted data, not from hostile code in your own process. Active client calls remain actionable and may contain personal data; authorize the actor before returning them. `RunResult.to_dict()` is the versioned browser envelope; raw RunStore reads require your own response projection. See [RunStore](docs/reference/run-store.mdx#redacted-views).
-- **Build your own read routes.** `RunStore.get_pending` (what a run is waiting on) and `RunStore.follow` (a hardened live feed that closes when the run does, shares one poller per run and is bounded) are library calls for routes you own. The packaged read router (`make_read_router`) and the embedded dashboard are **removed**. See [Build your own read routes](docs/recipes/build-your-own-read-routes.mdx) and the endpoint map in the [upgrade guide](docs/upgrading-to-0.5.0.mdx#removed-in-050).
+- **Build your own read routes.** `RunStore.get_pending` (what a run is waiting on) and `RunStore.follow` (a hardened live feed that closes when the run does, is served by one coordinator per `RunStore`, and is bounded) are library calls for routes you own. The packaged read router (`make_read_router`) and the embedded dashboard are **removed**. See [Build your own read routes](docs/recipes/build-your-own-read-routes.mdx) and the endpoint map in the [upgrade guide](docs/upgrading-to-0.5.0.mdx#removed-in-050).
 - **No more silent provider failures.** Every failed request is a typed `ProviderError` (`.category`, `.retryable`, `.safe_message`); empty streams, refusals and failed Responses calls end the run `error` with `RunResult.error_info` instead of an empty `success`. Calls have deadlines (`call_timeout`, `stream_idle_timeout`). See [Handling provider errors](docs/recipes/handling-provider-errors.mdx).
 - **Dollar budgets must be priceable.** A `max_cost_usd` budget for a model with no price raises `BudgetConfigurationError` instead of never firing. `Budget(count_cache_tokens=True)` opts into counting cache tokens.
 - **Tools are validated and coerced.** Model-typed parameters arrive as model instances, `Field(...)` constraints are enforced, and what a person approves is exactly what runs. Sync tools run on a bounded thread pool, and results, inputs, metadata and notes have size caps (`Agent(limits=Limits(...))`).
@@ -61,7 +73,7 @@
 - **Run control**: `agent.request_pause(run_id)` parks a running run as `paused` and `agent.submit_resume(run_id)` continues it. `cancel_run(run_id, cascade=True)` stops delegated children too, and `cancel_run` now interrupts an in-flight `run()` in the same process.
 - **Inbox notes**: `agent.submit_note(run_id, "...")` tells a run something while it works; the model sees it at the next iteration.
 - **Dollar budgets**: `Budget(max_cost_usd=..., on_exceed="pause" | "cancel", include_children=True)` enforces token and dollar limits across a run and its children.
-- **Subtree reads**: `RunStore.get_subtree(run_id)` returns a delegation tree with live rolled-up usage, plus `get_notes`, `event_types=` and `before=` filters.
+- **Subtree reads**: `RunStore.get_subtree(run_id)` returns a delegation tree with live rolled-up usage, plus `get_notes`, `event_types=` and `before=` filters. (On 0.6+, pass `max_nodes=`: omitting it warns and the default becomes 10,000 in 0.7. See [bounded reads](docs/reference/run-store.mdx#get_subtree).)
 - **`MCPConnection.call_tool`** runs a server tool directly from your app (outside Agent governance).
 - **Gateway fixes** for OpenAI-compatible endpoints, including a typed `ContextLengthExceededError`.
 - **Migration**: run `dendrux db migrate` (new revision `b5c6d7e8f9a0`). See the [CHANGELOG](packages/python/CHANGELOG.md).
@@ -130,6 +142,8 @@ pip install "dendrux[openai]"         # OpenAI + core runtime
 pip install "dendrux[mcp]"            # managed MCP client runtime
 ```
 
+Provider extras require `anthropic>=0.77.0,<1.0` and `openai>=1.97.2,<3.0`. The `openrouter` extra uses the OpenAI requirement; `all` includes both.
+
 <details>
 <summary>Development install (from source)</summary>
 
@@ -184,7 +198,7 @@ results = await sweep(
 [//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
 
 ```python
-result = await agent.retry("01JR...")
+result = await agent.retry("01JR...", tenant_id=tenant)
 ```
 
 **Idempotency**: pass a key to prevent duplicate runs. Same key + same input returns the existing run. Same key + different input raises `IdempotencyConflictError`. Keys are unique per tenant.
@@ -195,6 +209,7 @@ result = await agent.retry("01JR...")
 result = await agent.run(
     "Analyze Q3 report",
     idempotency_key="q3-analysis-2026",
+    tenant_id=tenant,
 )
 ```
 
@@ -325,7 +340,7 @@ async def research(query: str) -> str:
         return result.answer
 ```
 
-The state store links parent and child runs. Read the delegation tree with `RunStore.get_subtree(..., tenant_id=...)` and render it in your app. Depth guards prevent runaway recursion.
+The state store links parent and child runs. Read the delegation tree with `RunStore.get_subtree(..., tenant_id=..., max_nodes=10_000)` (it raises `SubtreeTooLargeError` at the bound; see [bounded reads](docs/reference/run-store.mdx#get_subtree)) and render it in your app. Depth guards prevent runaway recursion.
 
 ### 📚 Skills
 
@@ -373,6 +388,7 @@ class ResultItem(BaseModel):
 
 class ResultsBody(BaseModel):
     results: list[ResultItem]
+    expected_pause_id: str | None = None  # the pause id the client reviewed, from /pending
 
 store = RunStore.from_database_url(db_url)
 
@@ -390,10 +406,14 @@ async def submit(run_id: str, body: ResultsBody, user=Depends(require_user)):
         ToolResult(name=r.tool_name, call_id=r.tool_call_id, payload=r.payload)
         for r in body.results
     ]
-    return await agent.submit_tool_results(run_id, results, tenant_id=user.org_id)
+    # Forward the id the client reviewed; do not look up the newest one here. Under the
+    # default strict tenancy a missing or stale id is refused.
+    return await agent.submit_tool_results(
+        run_id, results, expected_pause_id=body.expected_pause_id, tenant_id=user.org_id
+    )
 ```
 
-Pause/resume orchestration and the CAS-safe claim are Dendrux's job. Auth, schema, error shape, and framework choice are yours; for the client's side, build `GET /runs/{id}/pending` over `RunStore.get_pending`, and add live updates with `RunStore.follow` if you want them (see [Client-side tools](docs/recipes/client-tools.mdx)). Never pipe `agent.stream()` into a browser SSE response: closing the tab cancels the run.
+Pause/resume orchestration and the CAS-safe claim are Dendrux's job. Auth, schema, error shape, and framework choice are yours; for the client's side, build `GET /runs/{id}/pending` over `RunStore.get_pending`, and add a live feed with `RunStore.follow` if you want one (see [Client-side tools](docs/recipes/client-tools.mdx)). Never pipe `agent.stream()` into a browser SSE response: closing the tab cancels the run.
 
 ### 🔀 Streaming
 
@@ -548,15 +568,15 @@ ANTHROPIC_API_KEY=sk-... python 01_hello_world.py
 | Min coverage enforced | 80% |
 | Python versions tested | 3.11, 3.12, 3.13 |
 | CI checks | lint, format, types, architecture, tests, API-break check |
-| Alembic migrations | 17 |
-| Examples | 39 runnable scripts + 5 example apps |
+| Alembic migrations | 18 |
+| Examples | 40 runnable scripts + 5 example apps |
 | Development started | March 11, 2026 |
 
 ---
 
 ## Status
 
-Dendrux is in active development (`v0.5.0`). The core API is stabilizing. `Agent`, `tool`, `run`, `stream`, `retry`, `resume`, `submit_tool_results`, `submit_input`, `submit_approval`, `cancel_run`, `sweep`, `RunStore` are the public surface and unlikely to break. Internal modules may still change.
+Dendrux is in active development (`v0.6.0`). The core API is stabilizing. `Agent`, `tool`, `run`, `stream`, `retry`, `resume`, `submit_tool_results`, `submit_input`, `submit_approval`, `cancel_run`, `sweep`, `RunStore` are the public surface and unlikely to break. Internal modules may still change.
 
 | Layer | Status |
 |-------|--------|

@@ -136,7 +136,11 @@ Exceeding either closes upstream and raises `ProviderResponseError` with categor
 
 A final event may repeat instructions, tools and the full response, so a low custom `max_stream_bytes` can reject it even when generated text is short. This per-event cap does not limit total framing volume over the entire stream.
 
-Non-streaming responses are bounded before SDK parsing by `max_response_bytes` (16 MiB by default). Requests advertise gzip and deflate. Identity responses are accepted; unsupported or stacked content encodings close the response and raise non-retryable `ProviderResponseError` with `provider_code="response_encoding_unsupported"`.
+Non-streaming responses are bounded before SDK parsing by `max_response_bytes` (16 MiB by default).
+
+The byte limits count decoded body or SSE event bytes, including any bytes after a compressed end marker. Compressed wire bytes are also bounded, with a small overhead allowance of the greater of 1 KiB or 1% of the configured limit, rounded down to whole bytes. Streaming wire accounting resets at decoded SSE event boundaries. A compressed response with heavy padding or frequent compression flushes can be refused even when its decoded bytes fit the limit.
+
+Requests advertise gzip and deflate. Identity responses are accepted; unsupported or stacked content encodings close the response and raise non-retryable `ProviderResponseError` with `provider_code="response_encoding_unsupported"`.
 
 `call_deadline` identifies Dendrux's own non-streaming deadline. A socket read timeout alone has `timeout_reason=None`; do not count it as a call-deadline expiration.
 

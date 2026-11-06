@@ -30,6 +30,11 @@ _ULID = re.compile(r"[0-7][0-9A-HJKMNP-TV-Z]{25}")
 _PROVIDER_ID = re.compile(r"[A-Za-z0-9_.:\-]{1,128}")
 _TRACE_ID = re.compile(r"[0-9a-f]{32}")
 _SPAN_ID = re.compile(r"[0-9a-f]{16}")
+_DIGEST_FIELDS = {
+    "trace_id": _TRACE_ID,
+    "span_id": _SPAN_ID,
+    "database_key": re.compile(r"[0-9a-f]{64}"),
+}
 _NUMBERS = frozenset(
     {
         "attempt",
@@ -50,6 +55,7 @@ _NUMBERS = frozenset(
     }
 )
 _ENUMS = {
+    "error_kind": frozenset({"timeout", "connection", "cancelled", "closed", "other", "tls"}),
     "db_kind": frozenset(
         [
             "unique_violation",
@@ -185,6 +191,7 @@ _ENUMS = {
             "limit",
             "max_duration_s",
             "max_events",
+            "max_nodes",
             "max_runs",
             "metadata_filter",
             "offset",
@@ -622,7 +629,7 @@ SUBTREE_LIMIT = Code(
     logging.WARNING,
     "runtime",
     _BASE_FIELDS | frozenset(["limit"]),
-    "A descendant traversal reaches its bound.",
+    "A descendant traversal or public subtree read reaches its node bound.",
     "Inspect the subtree and raise its bound if appropriate.",
 )
 RUN_CANCEL_RECOVERED = Code(
@@ -913,6 +920,14 @@ HISTORY_TOO_LARGE = Code(
     "Conversation rebuild exceeds its bound.",
     "Reduce history or raise the documented rebuild bound.",
 )
+PAUSE_SUMMARY_TRUNCATED = Code(
+    "pause_summary_truncated",
+    logging.WARNING,
+    "recovery",
+    _BASE_FIELDS,
+    "A human-input display summary exceeded its byte bound.",
+    "Read the full model turn or raise max_pause_summary_bytes.",
+)
 PAUSE_FORMAT_UNSUPPORTED = Code(
     "pause_format_unsupported",
     logging.WARNING,
@@ -969,38 +984,146 @@ PENDING_LIMIT = Code(
     "A model produces too many pending calls.",
     "Reduce tool fanout or raise the pending call bound.",
 )
-NOTIFIER_DEGRADED = Code(
-    "notifier_degraded",
+LIVE_UPDATES_DEGRADED = Code(
+    "live_updates_degraded",
     logging.WARNING,
-    "observability",
-    _BASE_FIELDS | frozenset([]),
-    "The notification channel is unavailable and readers poll.",
-    "Check the listener connection; alert after one minute.",
+    "live_updates",
+    _BASE_FIELDS | frozenset(["error_kind", "error_type"]),
+    "The listener loses its subscription; readers poll.",
+    "Check bus connectivity; alert after one minute.",
 )
-NOTIFIER_RECOVERED = Code(
-    "notifier_recovered",
+
+LIVE_UPDATES_RECOVERED = Code(
+    "live_updates_recovered",
     logging.INFO,
-    "observability",
+    "live_updates",
     _BASE_FIELDS | frozenset([]),
-    "The notification channel reconnects.",
+    "The listener confirms its subscription.",
     "Confirm reader latency returns to normal.",
 )
-NOTIFIER_UNAVAILABLE = Code(
-    "notifier_unavailable",
+
+LIVE_UPDATES_UNAVAILABLE = Code(
+    "live_updates_unavailable",
     logging.WARNING,
-    "observability",
+    "live_updates",
+    _BASE_FIELDS | frozenset(["error_kind", "error_type"]),
+    "The listener cannot become ready.",
+    "Check the live-update transport; polling remains available.",
+)
+
+LIVE_UPDATES_MISSED_HINT = Code(
+    "live_updates_missed_hint",
+    logging.WARNING,
+    "live_updates",
+    _BASE_FIELDS | frozenset(["count"]),
+    (
+        "A healthy safety poll finds events no hint announced "
+        "(first discovery per coordinator and generation; heuristic)."
+    ),
+    "Check that writers and readers use the same bus channel.",
+)
+
+LIVE_UPDATES_SEND_FAILED = Code(
+    "live_updates_send_failed",
+    logging.WARNING,
+    "live_updates",
+    _BASE_FIELDS | frozenset(["error_kind", "error_type", "count"]),
+    "An announcement fails and sending enters backoff.",
+    "Check bus connectivity; the database commit is unaffected.",
+)
+
+LIVE_UPDATES_SEND_RECOVERED = Code(
+    "live_updates_send_recovered",
+    logging.INFO,
+    "live_updates",
     _BASE_FIELDS | frozenset([]),
-    "The notification channel cannot start.",
-    "Check its direct or session-pooled Postgres connection.",
+    "The first announcement succeeds after a send failure.",
+    "Confirm pending announcements drain.",
 )
-NOTIFIER_MISSED_HINT = Code(
-    "notifier_missed_hint",
+
+LIVE_UPDATES_OVERFLOW = Code(
+    "live_updates_overflow",
     logging.WARNING,
-    "notifier",
-    _BASE_FIELDS | frozenset({"count"}),
-    "A healthy feed finds new rows on reconciliation without a wake hint, once per feed.",
-    "Enable the channel on every writer and verify matching writer/listener channels.",
+    "live_updates",
+    _BASE_FIELDS | frozenset(["count", "limit"]),
+    "Pending announcements exceed their bound.",
+    "Share stores or raise the pending bound; readers recover by polling.",
 )
+
+LIVE_UPDATES_OVERSIZE = Code(
+    "live_updates_oversize",
+    logging.WARNING,
+    "live_updates",
+    _BASE_FIELDS | frozenset(["count", "limit"]),
+    "A live-update hint exceeded the message byte limit and was dropped.",
+    "Use channel isolation to exclude foreign publishers; for local hints, increase "
+    "max_message_bytes within the transport limit, or use shorter run ids.",
+)
+
+
+LIVE_UPDATES_WRONG_LOOP = Code(
+    "live_updates_wrong_loop",
+    logging.WARNING,
+    "live_updates",
+    _BASE_FIELDS | frozenset(["count"]),
+    "An instance is used from another event loop.",
+    "Use one instance per store and event loop.",
+)
+
+LIVE_UPDATES_BAD_MESSAGE = Code(
+    "live_updates_bad_message",
+    logging.WARNING,
+    "live_updates",
+    _BASE_FIELDS | frozenset(["count"]),
+    "A received message fails bounded wire validation.",
+    "Check channel isolation and sender limits.",
+)
+
+LIVE_UPDATES_CLOSE_TIMEOUT = Code(
+    "live_updates_close_timeout",
+    logging.WARNING,
+    "live_updates",
+    _BASE_FIELDS | frozenset(["timeout_s"]),
+    "Resource shutdown exhausts its deadline.",
+    "Check cancellation cooperation in the transport.",
+)
+
+LIVE_UPDATES_TLS_UNKNOWN = Code(
+    "live_updates_tls_unknown",
+    logging.WARNING,
+    "live_updates",
+    _BASE_FIELDS | frozenset([]),
+    "The live-update connection has no explicit TLS settings for a remote host.",
+    "Pass explicit connection TLS settings.",
+)
+
+LIVE_UPDATES_MANY_STORES = Code(
+    "live_updates_many_stores",
+    logging.WARNING,
+    "live_updates",
+    _BASE_FIELDS | frozenset(["count", "database_key"]),
+    "Many open stores announce to one database.",
+    "Share a store within each process and close unused stores.",
+)
+
+FOLLOW_READ_FAILED = Code(
+    "follow_read_failed",
+    logging.WARNING,
+    "live_updates",
+    _BASE_FIELDS | frozenset(["error_kind", "count"]),
+    "A coordinator chunk read fails.",
+    "Check store connectivity; other chunks continue.",
+)
+
+FOLLOW_COORDINATOR_RESTART = Code(
+    "follow_coordinator_restart",
+    logging.WARNING,
+    "live_updates",
+    _BASE_FIELDS | frozenset(["attempt"]),
+    "A follower restarts a stopped coordinator.",
+    "Inspect store connectivity and coordinator failures.",
+)
+
 PROVIDER_UNKNOWN = Code(
     "provider_unknown",
     logging.WARNING,
@@ -1032,6 +1155,14 @@ PERSISTENCE_ERROR = Code(
     _BASE_FIELDS | frozenset([]),
     "A durable operation fails.",
     "Restore store connectivity and inspect the run result.",
+)
+RESULT_READ_FAILED = Code(
+    "result_read_failed",
+    logging.WARNING,
+    "runtime",
+    _BASE_FIELDS,
+    "An optional read fails while returning a known durable outcome.",
+    "The outcome is preserved; reload missing recovery or pending information from the store.",
 )
 MCP_DISCOVERY_REPEATED_CURSOR = Code(
     "mcp_discovery_repeated_cursor",
@@ -1867,19 +1998,32 @@ REGISTRY = MappingProxyType(
             LEASE_LOST,
             HISTORY_TOO_LARGE,
             PAUSE_FORMAT_UNSUPPORTED,
+            PAUSE_SUMMARY_TRUNCATED,
             STORE_CAPABILITY,
             STORE_STATEMENT_LIMIT,
             SKILLS_SESSION_UNKNOWN,
             ACTIVATION_CONFLICT,
             RECLAIM_LIMIT,
             PENDING_LIMIT,
-            NOTIFIER_DEGRADED,
-            NOTIFIER_RECOVERED,
-            NOTIFIER_UNAVAILABLE,
-            NOTIFIER_MISSED_HINT,
+            LIVE_UPDATES_DEGRADED,
+            LIVE_UPDATES_RECOVERED,
+            LIVE_UPDATES_UNAVAILABLE,
+            LIVE_UPDATES_MISSED_HINT,
+            LIVE_UPDATES_SEND_FAILED,
+            LIVE_UPDATES_SEND_RECOVERED,
+            LIVE_UPDATES_OVERFLOW,
+            LIVE_UPDATES_OVERSIZE,
+            LIVE_UPDATES_WRONG_LOOP,
+            LIVE_UPDATES_BAD_MESSAGE,
+            LIVE_UPDATES_CLOSE_TIMEOUT,
+            LIVE_UPDATES_TLS_UNKNOWN,
+            LIVE_UPDATES_MANY_STORES,
+            FOLLOW_READ_FAILED,
+            FOLLOW_COORDINATOR_RESTART,
             PROVIDER_UNKNOWN,
             LOG_FIELD_DROPPED,
             PERSISTENCE_ERROR,
+            RESULT_READ_FAILED,
             STORE_OUTCOME_UNKNOWN,
             MCP_DISCOVERY_REPEATED_CURSOR,
             MCP_DISCOVERY_PAGE_CAP,
@@ -1897,8 +2041,8 @@ def _valid_field(name: str, value: Any) -> bool:
         return isinstance(value, str) and _ULID.fullmatch(value) is not None
     if name in {"call_id", "tool_call_id"}:
         return isinstance(value, str) and _PROVIDER_ID.fullmatch(value) is not None
-    if name in {"trace_id", "span_id"}:
-        shape = _TRACE_ID if name == "trace_id" else _SPAN_ID
+    if name in _DIGEST_FIELDS:
+        shape = _DIGEST_FIELDS[name]
         return isinstance(value, str) and shape.fullmatch(value) is not None and int(value, 16) != 0
     if name == "tenant_id":
         return (
@@ -1910,7 +2054,15 @@ def _valid_field(name: str, value: Any) -> bool:
         return type(value) in (int, float) and (type(value) is int or math.isfinite(value))
     if name in {"retryable", "truncated"}:
         return type(value) is bool
-    return isinstance(value, str) and value in _ENUMS.get(name, ())
+    return _valid_text_field(name, value)
+
+
+def _valid_text_field(name: str, value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    if name == "error_type":
+        return value.isascii() and value.isidentifier() and len(value) <= 128
+    return value in _ENUMS.get(name, ())
 
 
 def _message(code: Code) -> str:

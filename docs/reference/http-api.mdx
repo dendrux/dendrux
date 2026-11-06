@@ -56,7 +56,12 @@ Every `event_type` that can land on the stream. Lifecycle events come from the r
 | `llm.failed` | A provider call failed with a typed `ProviderError` (no billed usage is invented for it) | `{"error_info": {...}, "timeout_reason": str \| null, "duration_ms": int \| null}` |
 | `llm.completed` | `provider.complete()` returns | `{"input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "reasoning_tokens", "cost_usd", "cost_source", "usage_reported", "model", "has_tool_calls", "phase"}` |
 | `tools.declared` | Start of every run segment: `run`, `stream`, `retry`, `resume` and `resume_stream` | `{"local_tool_names": [str]}`: the sorted names of the tools declared in code (client tools included), at most 1,000, each a valid identifier of at most 64 characters. MCP-discovered and model-supplied names are never listed. Redacted readers use it to prove which tool names are developer-declared |
+| `tool.started` | Format-2 server-tool execution intent committed before dispatch | `{"call_id", "tool_name", "idempotent"}`; `correlation_id` = tool call id. This records an attempt, not a completed external effect. Parallel calls can interleave their lifecycle events |
 | `tool.completed` | Server tool or submitted client/approval tool finishes | `{"tool_name", "target", "success", "duration_ms"}`; plus `"code"` when the result carries one (`invalid_params`, `size_limit`, `timeout_not_started`, `timeout_outcome_unknown`, `tool_pool_saturated`, `unknown_tool`, `cancelled` and others) and `"zombie_threads"` after a sync-tool timeout; plus `"image_count"` when the result has images; malformed calls also add `"parse_error"` and `"raw_length"`. `correlation_id` = tool call id |
+
+Format-2 loop completion events carry the final iteration in `iteration_index`; format 1
+used zero for `run.completed` and loop-produced `run.error`. Additional stored events
+consume sequence indexes. Use returned cursors rather than fixed event counts.
 
 ### Governance events
 
@@ -223,12 +228,15 @@ All frozen dataclasses. Top-level fields are immutable; nested `dict`/`list` val
 [//]: # "docs-test: skip - placeholder: `...` stands for your other arguments"
 
 ```python
-# Store-owned engine (typical)
+# Store-owned engine (typical), inside an async function
 async with RunStore.from_database_url("postgresql+asyncpg://...") as store:
     ...
 
-# Caller-owned engine (when your app already has one)
+# Caller-owned engine (when your app already has one): followers poll
 store = RunStore.from_engine(engine)
+
+# To wake followers with live updates, wrap the store that announces: RunStore(state)
+# (see Scaling, "Live updates"). from_engine and from_database_url never listen.
 ```
 
 Use `follow` for redacted, bounded live events and always close the follower.

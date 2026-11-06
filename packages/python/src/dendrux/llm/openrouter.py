@@ -41,9 +41,12 @@ from dendrux.llm._helpers import normalize_effort
 from dendrux.llm._images import ANTHROPIC_MANY_IMAGE_RULE
 from dendrux.llm._openai_family import usage_extra_field
 from dendrux.llm._resilience import DEFAULT_MAX_RESPONSE_BYTES
+from dendrux.llm._transport import configure_request, deferred_client_type, guard_response
 from dendrux.llm.openai import OpenAIProvider
 
 _MODEL_LIST_TIMEOUT_S = 10.0
+# Allows a catalog of 10,000 models with several KiB of metadata per entry.
+_MODEL_CATALOG_MAX_BYTES = 32 * 1024 * 1024
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -255,8 +258,18 @@ _catalog_cache: dict[str, dict[str, OpenRouterModel] | None] = {}
 
 async def _fetch_catalog(models_url: str) -> dict[str, OpenRouterModel]:
     """Fetch {model_id -> OpenRouterModel} from OpenRouter. Raises on failure."""
-    async with httpx.AsyncClient(timeout=_MODEL_LIST_TIMEOUT_S) as client:
-        resp = await client.get(models_url)
+    client_type = deferred_client_type(httpx.AsyncClient)
+    async with client_type(
+        timeout=_MODEL_LIST_TIMEOUT_S, event_hooks={"response": [guard_response]}
+    ) as client:
+        request = client.build_request("GET", models_url)
+        configure_request(
+            request,
+            response_bytes=_MODEL_CATALOG_MAX_BYTES,
+            event_bytes=_MODEL_CATALOG_MAX_BYTES,
+            provider="openrouter",
+        )
+        resp = await client.send(request)
         resp.raise_for_status()
         payload = resp.json()
     catalog: dict[str, OpenRouterModel] = {}
@@ -358,7 +371,11 @@ class OpenRouterProvider(OpenAIProvider):
                 (``plugins=[{"id": "context-compression", "enabled": False}]``)
                 so OpenRouter never drops mid-prompt messages; a ``plugins``
                 entry of your own replaces that default entirely.
-            max_response_bytes: Maximum decoded non-streaming body bytes (default 16 MiB).
+            max_response_bytes: Non-streaming body budget (default 16 MiB). Counts
+                decoded bytes and bytes after a compressed end marker. Compressed
+                wire bytes are also bounded, with a small overhead allowance of
+                the greater of 1 KiB or 1% of the limit (rounded down). A response
+                can be refused even when its decoded body fits the limit.
             **kwargs: Passed through to :class:`OpenAIProvider` (max_tokens,
                 temperature, timeout, max_retries, ...).
         """

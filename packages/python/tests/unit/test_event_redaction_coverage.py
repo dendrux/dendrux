@@ -157,13 +157,14 @@ async def store(tmp_path: Any) -> Any:
     await state.create_run("r1", "a", tenant_id="T")
     await state.save_run_event("r1", event_type="run.resumed", data={"user_input": SECRET})
     await state.finalize_run("r1", status="success")
-    yield RunStore.from_engine(eng)
+    async with RunStore.from_engine(eng) as reader:
+        yield reader
     await eng.dispose()
 
 
 @pytest.mark.parametrize("bad", NOT_BOOLS)
 async def test_store_flags_must_be_bool(store: RunStore, bad: Any) -> None:
-    ev = (await store.get_events("r1", tenant_id="T"))[0]
+    ev = (await store.get_events("r1", tenant_id="T", limit=1000))[0]
     calls = [
         lambda: store.follow("r1", tenant_id="T", include_payloads=bad),
         lambda: store.follow("r1", tenant_id="T", until_terminal=bad),

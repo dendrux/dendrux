@@ -1,224 +1,321 @@
 # Changelog
 
-## 0.6.0
+## 0.6.0 - 2026-11-06
 
-- Runs on both storage formats check that this process still owns the run immediately before each
-  provider call (one primary-key read). A stale owner stops with the existing
-  `RunFencedError` outcome instead of making a model call whose result would be
-  discarded. A database read failure at that point now fails the run before the call.
-- Default local database resolution now uses `./dendrux.db` for runtime helpers,
-  every CLI command and migrations when `DENDRUX_DATABASE_URL` is unset.
-  If only `~/.dendrux/dendrux.db` exists, log `local_database_default_changed`;
-  set `DENDRUX_DATABASE_URL` explicitly to keep using that file.
-- `mark_lease_expired` refuses a batch above 1,000 (the sweep batch cap) with
-  `ValueError` before any SQL; it previously accepted up to 100,000.
-- Retry and error classification share one connection-loss rule: SQLSTATE class
-  `08` or `57P01`–`57P03`. PostgreSQL `57P04`/`57P05` behind a generic DBAPI error
-  are no longer retried; behind an `OperationalError` they still are.
-- The MCP transport result cap (1,000,000 bytes) and `Limits.max_tool_result_bytes`
-  (1,048,576 bytes) are documented as separate knobs; values unchanged. The MCP HTTP
-  read bound is four times the smaller of the two plus any image allowance.
+"Production". Recover interrupted runs from durable checkpoints, follow runs across
+processes with optional live updates, and use PostgreSQL, SQLite, MySQL or MariaDB
+stores. Several defaults change directly in this release. For PostgreSQL upgrades,
+run `dendrux db migrate`, roll every worker and reader, take a backup, then run
+`dendrux db activate`. Activation is one-way. See
+[Upgrading to 0.6.0](../../docs/upgrading-to-0.6.0.mdx) for every compatibility change,
+the deployment order and rollback rules.
 
-- Recover Python 3.11 cancellation lost during recorder store awaits at model/tool dispatch boundaries on the recorder's task, without treating handled provider/tool cancellation as a lost cancel; Python 3.12+ is unchanged.
+### Breaking changes
+
+- Require `anthropic>=0.77.0,<1.0` and `openai>=1.97.2,<3.0` in provider extras.
+  Older SDKs lack the required Responses API stream handling and Anthropic
+  thinking/structured-output support. Users pinning older SDKs must update their
+  pins and reinstall the matching extras before upgrading.
+- Change the defaults to `strict_tenancy=True`, `on_governance_change="raise"`
+  and `Budget.count_cache_tokens=True`. Until 1.0, new defaults may change behaviour
+  directly in a minor release. Strict tenancy applies to the effective store,
+  including one passed to a low-level runner. Calls without a store may omit tenant
+  scope. Stored delegated children require a deliberately chosen outer scope,
+  including explicit `tenant_id=None`. Explicit `strict_tenancy=False`,
+  `on_governance_change="warn"` and `count_cache_tokens=False` retain earlier choices;
+  explicit cache-token `None` also retains fresh-input-plus-output accounting.
+- Continuations under strict tenancy require `expected_pause_id` when the stored
+  pause has an id, including denials. Approval requires it in either tenancy mode.
+  Legacy pauses without an id can continue or be approved without one; every pause
+  written by 0.6, including reclaim re-pauses, has an id.
+- The Agent ignores `DENDRUX_DATABASE_URL`. Pass `state_store=` or `database_url=`
+  explicitly. Without an effective store, runs have no persistence and a returned
+  pause cannot be submitted later. An unused variable logs `database_url_env_ignored`
+  once per process; it does not raise. The CLI still reads the variable.
+- Runtime database helpers, CLI commands and migrations now use `./dendrux.db` when
+  `DENDRUX_DATABASE_URL` is unset. The runtime helper previously used
+  `~/.dendrux/dendrux.db`. If only the old file exists, resolution logs
+  `local_database_default_changed`; no data is moved. Set an explicit URL to retain it.
+- Review paused 0.5 budgets before rolling. A token budget using the old cache-token
+  count can raise `GovernanceMismatchError` under the new defaults. Drain it first,
+  retain `count_cache_tokens=False`, or intentionally use `on_governance_change="warn"`
+  while it drains. A 0.5 cost-only budget with explicit `count_cache_tokens=True` can
+  also mismatch its saved digest; use `"warn"` while those runs drain.
+- Remove `SQLAlchemyStateStore` with no alias. Import `PostgresStateStore`,
+  `SQLiteStateStore`, `MySQLStateStore` or `store_for_engine` from `dendrux.store`;
+  subclasses must change their base. Import `IdempotencyConflictError` from
+  `dendrux`, rather than `dendrux.runtime.state`. Remove `warning_location=` from
+  direct calls to `dendrux.runtime.runner.resume_stream`.
+- Built-in stores return `ClaimResult` for successful `claim_paused_run` and
+  `submit_and_claim` calls. Read `claim_epoch` instead of treating success as an
+  integer. `save_trace` and `save_tool_call` return row ids; `touch_progress` returns
+  `bool`. Custom stores must match their declared capabilities and signatures.
+- Heartbeats now stop stale owners. `aheartbeat()` can raise `RuntimeError` on a
+  stale claim; `heartbeat()` remembers the fence and raises at the next heartbeat
+  or step boundary. Repeated lease-renewal failures raise
+  `PersistenceError(code="lease_lost")`. Let the tool stop and inspect the durable
+  outcome before deciding what to do next.
+- Format-2 provider options must be JSON-only and fit 2 KiB. Pending assistant calls
+  default to 64 (`Limits.max_pending_calls`); checkpoints fit 32 KiB. Conversation
+  rebuild defaults to 16 MiB and 20,000 expanded rows and refuses excess instead of
+  truncating context. Stored rewrites also have hard caps of 999 messages and 1 MiB
+  of UTF-8 JSON. Public trace paging does not use these reconstruction limits.
+- Format-2 public traces contain the run's own user, assistant and tool rows in the
+  provider form, including PII placeholders. System prompts, seeded prefixes,
+  rewrites and state rows remain internal. `tool.started` adds durable execution-intent
+  events, and terminal iteration indexes and event cursors can differ from format 1.
+  Use returned cursors and pause ids. Approval and crash-recovery ordering differences
+  are listed in the upgrade guide.
+- `mark_lease_expired` rejects batches above 1,000 with `ValueError` before SQL;
+  the earlier maximum was 100,000. Split larger calls into pages.
+- PostgreSQL statement timeouts (`57014`) are no longer retried. Connection-loss
+  classification uses SQLSTATE class `08` or `57P01`–`57P03`; `57P04`/`57P05` behind
+  a generic DBAPI error are not retried, though an `OperationalError` still qualifies.
+  A lost claim or reclaim COMMIT acknowledgement raises `StoreOutcomeUnknown`
+  instead of inferring ownership from a later epoch. Do not execute that work or
+  blindly retry the submission: `RunNotPausedError` does not prove the first claim.
+- MCP `transport_detail` contains the fixed diagnostic `mcp_transport_failed count=1`
+  or `None`, rather than transport exception text. Direct `PostgresUpdates` failures
+  use builtin exceptions with fixed text and no raw chain; native driver exception
+  handlers must be updated. Validated class names remain in `last_error_type`.
+- `EventFeed` rejects a raw state store with an actionable `TypeError`. Wrap it with
+  `RunStore(state_store)` first.
+
+### Added
+
 - Add developer-called recovery for format-2 ReAct runs. `sweep(on_stale="reclaim")`
   marks bounded candidates; `agent.reclaim(..., tenant_id=..., item=...)` continues
-  from committed state. Reclaim always requires explicit tenant scope. Interrupted
-  tools replay without approval only when both saved and current definitions declare
+  from committed state and always requires explicit tenant scope. Interrupted tools
+  replay without approval only when saved and current definitions both declare
   idempotency. Otherwise they pause for approval; denial records an unknown outcome.
-  Each approved format-2 tool attempt adds one checkpoint before dispatch.
-- Add the additive storage migration `f9a0b1c2d3e4`, resumable `dendrux db activate`
-  and `db dedupe`, and storage-format/activation output in `db status`. Migrate,
-  roll every worker and reader, back up, then activate before enabling reclaim or
-  notifications. Activation is one-way; rollback requires the pre-activation backup.
-  Runs keep their creation format; stale format-1 runs cannot be reclaimed.
-- Declare and validate `StateStore` capabilities at Agent construction. Undeclared
-  custom stores retain legacy signatures and format 1. Subclass overrides must
-  accept and forward the named keyword-only parameters or narrow their capabilities.
-  Add fenced evidence writes, retry identities, atomic tool completion and submission
-  consumption. Declaring `recovery` requires `get_replayed_tool_calls` too. Incompatible declarations raise `StoreCapabilityError` before execution.
+  Every approved format-2 tool attempt adds a checkpoint before dispatch.
+- Add the additive migration `f9a0b1c2d3e4`, resumable `dendrux db activate` and
+  `db dedupe`, and storage-format/activation output in `db status`. Upgrade every
+  worker and reader, then back up existing databases before activation. Fresh
+  PostgreSQL databases start active at format 2 after `dendrux db migrate`; unrelated
+  application tables are allowed. Runs retain their creation format, and stale
+  format-1 runs cannot be reclaimed. Rollback after activation requires the backup.
+- Validate declared `StateStore` capabilities at Agent construction; incompatible
+  declarations raise `StoreCapabilityError` before execution. Undeclared custom stores
+  keep legacy signatures and format 1. Overrides must accept and forward named
+  keyword-only parameters or narrow their declaration. Add fenced evidence writes,
+  retry identities, atomic tool completion and submission consumption. Recovery
+  requires `get_replayed_tool_calls`. `StoreCapabilities.deployment` describes the
+  supported deployment; omitting it from a declaration warns. The protocol also gains
+  `update_run_meta`.
 - Add `Agent(lease_interval=timedelta(seconds=30))`, with a five-second minimum.
-  Size `stale_running` to at least three times the lease interval. Results from
-  reclaimed runs expose `RecoveryInfo` and an additive `recovery` wire field with
-  the reclaim count, last reclaim time and bounded replayed-call ids.
-- Format-2 pauses use schema version 2 and rebuild conversation from seed, turn
-  and rewrite traces; state traces are excluded from conversation reads. `RunStore.get_traces`
-  and `dendrux traces` return the provider form, including PII placeholders, with
-  the latest replacement prefix after compaction. The reverse mapping remains separate.
-  Format-2 options must be JSON-only and fit 2 KiB; pending assistant calls default
-  to 64 (`Limits.max_pending_calls`). Checkpoints fit 32 KiB. History rebuild defaults
-  to 16 MiB and 20,000 rows and refuses excess rather than truncating context.
-- Add opt-in `PostgresEventNotifier` hints for `follow` and `stream_events`. Writers
-  enable `notify_channel="dendrux_events"`; default-off writers issue no NOTIFY.
-  Readers use `listen_url=` on a primary direct or session-pool endpoint, or borrow
-  a started `notifier=`. LISTEN cannot use PgBouncer transaction pooling. Each notifying
-  transaction takes a database-wide commit lock; a 50-writer local probe saw about
-  45% lower write throughput. Monitor `pg_notification_queue_usage()` because a full
-  queue fails notifying writes. Every listener receives every hint on its channel.
-  Export `EventNotifier`, `NotifierState` and `Subscription` from `dendrux.store`.
-- Add coded diagnostics and the generated log-code reference. Strict field checks
-  require `DENDRUX_STRICT_LOG_FIELDS=1`. Alert on `notifier_degraded`,
-  `notifier_unavailable` and `notifier_missed_hint`; polling remains the fallback.
-  Provider-code projections use a closed set; unknown vendor or unmapped custom-provider
-  codes become `provider_unknown`, with raw values only on `provider_code_raw`.
-- Persist trace links across pause, resume, submissions and reclaim. Delegated OTel
-  spans use the active parent tool context where available. Error, cancelled and
-  max-iteration runs export ERROR status. Non-provider stacks contain frames only;
-  tool failures record the completion-callback stack rather than the original crash site.
-- Bound decoded non-streaming responses before SDK parsing (`max_response_bytes`,
-  default 16 MiB). `max_stream_bytes` also limits each SSE event's wire size, so low
-  custom limits may reject repeated final response envelopes. Compressed responses
-  accept gzip/deflate; unsupported or stacked encodings raise `response_encoding_unsupported`.
-  Non-streaming socket read timeouts have `timeout_reason=None`; `call_deadline`
-  is reserved for Dendrux's own deadline.
-- Cascade cancellation stays in the root tenant even for unscoped calls. Traversal
-  is bounded by `Budget.max_subtree_nodes` (default 10,000); `cascade_truncated`
-  identifies a cut. Finished runs retain their cancellation flags. SQLite delegated
-  creation briefly reserves the writer before checking its parent. Cancelling a nested
-  run on a shared task preserves its ancestors' ability to continue.
-- Add MySQL 8.4 and MariaDB 10.11 state stores. `MySQLStateStore` is exported from
-  `dendrux.store`; install `dendrux[mysql]` (the `asyncmy` driver and `cryptography`, which
-  MySQL 8.4's default `caching_sha2_password` login needs; not part of `dendrux[all]`).
-  `Agent(database_url="mysql+asyncmy://...")`, `RunStore.from_database_url`, `sweep` and the
-  CLI create their engines with `READ COMMITTED`, UTC at connect and `utf8mb4`;
-  `mysql`, `mariadb` and `aiomysql` URL spellings normalise to `asyncmy`. The store
-  checks InnoDB, server version, `READ COMMITTED`, autocommit off, strict `sql_mode` and
-  `utf8mb4` on first use (a `ValueError` before any write). Every SQL store refuses an
-  `AUTOCOMMIT` engine before any claim. A `mariadb+asyncmy` engine is accepted wherever
-  `mysql+asyncmy` is. A missing `asyncmy`, or `cryptography` at a `caching_sha2_password`
-  login, raises an `ImportError` naming `dendrux[mysql]`. Identifiers and long text use NO
-  PAD binary collations. Scalar metadata filters match by exact JSON type with one truth
-  table on all four databases (including integers up to the unsigned 64-bit maximum and
-  non-ASCII text). The MySQL store refuses a JSON integer outside signed int64 / unsigned
-  uint64 with the new `dendrux.errors.JSONIntegerOutOfRangeError` (code
-  `json_integer_out_of_range`, not retryable). A missing table or column raises
-  `SchemaNotInitializedError` or `SchemaOutOfDateError` on every store path, owned engines
-  included. `dendrux db migrate` builds the schema in resumable steps under a
-  server-wide named lock, is forward-only, may share a database with application tables
-  and refuses a database where the application keeps its own Alembic version table.
-  Event notifications stay PostgreSQL-only. See `docs/guides/mysql.mdx`.
-- Handle statements larger than the database accepts. When MySQL or MariaDB answers with
-  its packet-too-large error (1153, or 1301), the store raises the new
-  `StatementTooLargeError` (a `PersistenceError`, code `statement_too_large`, with the
-  server's `limit` and a best-effort `size`); the write is not retried and nothing is
-  persisted. Servers usually close the connection instead of answering: when a MySQL-family
-  connection is lost and a value bound to the failed statement is larger than the store's
-  `max_allowed_packet`, the store raises the same error after one attempt (the check runs
-  on the failure path only). As an early check, a store class may define
-  `async statement_capacity()` and the Agent compares a worst-case estimate of its `Limits`
-  with it before first use, in the Agent methods and in the runner functions (`run`, `retry`,
-  `run_stream`, `resume`, `resume_with_input`, `resume_stream`). The estimate reserves 12 times
-  the larger of `max_input_bytes` and `max_tool_result_bytes` plus `max_metadata_bytes`, plus
-  64 KiB, and refuses with a `ValueError` naming both numbers (log code
-  `store_statement_limit`). The default limits fit both servers' defaults.
-- Split SQL persistence into `SQLStateStore` and the concrete `PostgresStateStore`,
-  `SQLiteStateStore` and `MySQLStateStore`, exported from `dendrux.store`.
-  `store_for_engine(engine)` picks the class from the engine's dialect and is used by
-  `Agent`, `RunStore`, the CLI and `sweep`. **Breaking:** `SQLAlchemyStateStore` is removed
-  with no alias. Use the matching concrete store or `store_for_engine`; subclasses change
-  their base; `notify_channel` is accepted only by `PostgresStateStore`. The types the
-  dialect hooks take and return (`ConflictSpec`, `InsertPlan`, `SelectSource`, `SetFields`,
-  `AppendArray`, `RunLockScope`, `DialectFacts`, `DbError` and the rest) are exported from
-  `dendrux.store`, so a store for another database needs no private import; pass such a
-  store to `Agent(state_store=...)` and `RunStore(store)`. `IdempotencyConflictError` is
-  imported from `dendrux`, no longer from `dendrux.runtime.state`. See the migration note
-  in `docs/upgrading-to-0.6.0.mdx`.
-- A connection that fails while committing a claim or reclaim now raises
-  `StoreOutcomeUnknown` (a `PersistenceError`) instead of inferring ownership from a
-  later epoch; do not run the claimed work, and know that a blind retry of the same submit
-  call gets `RunNotPausedError` once the run is no longer paused, which does not prove the
-  first attempt claimed it. Other writes retry only
-  classified transient failures: up to three retries, waiting 0.1, 0.2 and 0.4 seconds, for
-  deadlocks, serialization failures, lock timeouts and connection or availability errors.
-  A PostgreSQL statement timeout (`57014`) is not retried, so a long `statement_timeout`
-  no longer multiplies the time to fail. Retry-identity writes read their rows back to
-  report the true outcome, and so does a create without an idempotency key (the supplied
-  run id, agent, tenant and input prove it); on PostgreSQL the read-back waits at most
-  about five seconds for a concurrent writer, then answers `StoreOutcomeUnknown`. A
-  write that still fails makes `agent.run` raise `PersistenceError` (a stream ends with
-  `run_error`). Three writes are best effort and never fail the run: the model-call
-  record, the usage row and a legacy run's progress heartbeat. After a fatal failure the
-  run is saved as `error` if the database answers again in time, and otherwise stays
-  `running` at its last committed state for `sweep` and `reclaim`.
-  `StoreCapabilities` gains `deployment` (descriptive; a declaration without it warns) and
-  the `StateStore` protocol gains `update_run_meta`.
-- Publish the store test kit, a pytest plugin that certifies a store against the
-  capabilities and deployment it declares: basic operations, fenced writes, retry
-  identities, checkpoints, atomic completion, recovery, two-instance concurrency and,
-  with a fault injector, crash recovery. Install `dendrux[testkit]` and run
-  `pytest -p dendrux.testing.store_kit`; SQLite fixtures ship as a worked example. The
-  plugin is registered with pytest when `dendrux` is installed, through a tiny module that
-  neither imports `dendrux` nor loads the kit until switched on; the kit then needs
-  `pytest-asyncio`. The kit never certifies a promise it did not test: a declared
-  capability whose contracts the store made skip (format-1 runs from a store that declares
-  the four format-2 flags, a fault injector with no disconnect forms, no
-  `release_run_claim`) is NOT CERTIFIED, and the summary lists those contracts per
-  capability. A session that prints NOT CERTIFIED, including an incomplete run, exits
-  non-zero; a pass with unverified checks prints `CERTIFIED with caveats` and exits zero.
-  A missing `dendrux_store_factory` fails one test with a setup message instead of every
-  contract. The kit also checks that a store declaring `notify` implements the hook (the
-  base class declares it with a hook that does nothing, so a subclass sets `notify=False`),
-  covers `get_replayed_tool_calls`, and keeps two store classes with one name apart in the
-  report. The guide now holds a complete public-import store that passes the kit, every
-  hook with its signature, and how to plug in and create the schema of a store of your own.
-  See `docs/guides/build-your-own-store.mdx`.
-- Extend the developer load harness to private MySQL and MariaDB databases, with bounded
-  resource sampling, repeated-cycle leak checks, cancellation-safe cleanup and a `_load_`
-  name rule for MySQL-family databases. Add `make load-pg`, `make load-mysql` and
-  `make load-mariadb`; the MySQL-family targets need declared statement ceilings.
-- Change defaults announced in 0.5: `strict_tenancy=True`,
-  `on_governance_change="raise"` and `Budget.count_cache_tokens=True`. Strict tenancy
-  checks the effective store, including one supplied to a low-level runner call.
-  Run/stream calls without a store may omit tenant scope silently. A stored delegated
-  child requires deliberately chosen outer scope, including explicit `tenant_id=None`.
-  Explicit `strict_tenancy=False`, `on_governance_change="warn"` and
-  `count_cache_tokens=False` retain the earlier choices; explicit cache-token `None`
-  also keeps fresh-input-plus-output accounting without a warning.
-- Continuations require `expected_pause_id` under strict tenancy only when the stored
-  pause has an id, including on denials. Approving such a pause requires it in either
-  tenancy mode. Legacy pauses without an id can continue or be approved without one;
-  every pause written by 0.6, including reclaim re-pauses, has an id.
-- The Agent ignores `DENDRUX_DATABASE_URL`; with no effective store its runs have no
-  persistence and a returned pause cannot be submitted later. The unused variable
-  logs `database_url_env_ignored` once per process and does not raise. Pass persistence
-  explicitly; the CLI continues to read the variable.
-- Review paused 0.5 budgets before rolling: a token budget using the old cache-token
-  count can raise `GovernanceMismatchError` under 0.6 defaults. Drain it first, retain
-  `count_cache_tokens=False` for the upgrade window, or intentionally use
-  `on_governance_change="warn"` while it drains. A 0.5 cost-only budget with explicit
-  `count_cache_tokens=True` can also mismatch its saved digest; use `"warn"` while
-  those runs drain, since the choice no longer changes a cost-only budget's digest.
-- Remove `warning_location=` from the low-level `runtime.runner.resume_stream`
-  function. Omitted `sweep(on_stale=)` still finalizes stale rows in 0.6 and warns;
-  pass `"error"` explicitly to retain that behavior when the default becomes
-  `"reclaim"` in 0.7.
-- Guardrails now also redact PII inside text that looks like a Dendrux placeholder
-  but was not issued by the run.
-- Add upgrade, recovery, capability, database CLI, MySQL and MariaDB, and build-your-own-store
-  guides; expand scaling, observability and tracing guidance. See `docs/upgrading-to-0.6.0.mdx`
-  for the rollout.
-
-### Deprecated
-
-- ConsoleNotifier warns when unused show_llm_text or max_text_length options are set to non-default values.
+  Set `stale_running` to at least three times the lease interval. Reclaimed results
+  expose `RecoveryInfo` and an additive `recovery` wire field with the reclaim count,
+  last reclaim time and bounded replayed-call ids. Format-2 pauses use schema version 2
+  and reconstruct history from traces and checkpoints.
+- Add optional store-owned live updates for `follow` and `stream_events`.
+  `live_updates=None` or `False` (default) keeps polling; `True` selects PostgreSQL
+  LISTEN/NOTIFY and raises on other stores with advice to use `RedisUpdates`.
+  Alternatively pass `PostgresUpdates`, `RedisUpdates` or a custom `LiveUpdates`
+  implementing `send` and `receive`, all exported from `dendrux.store`. Install
+  `dendrux[redis]` separately; it is not part of `dendrux[all]`.
+- Live hints carry run ids only; readers always reread the database. Announcements
+  follow an issued COMMIT at the outer store-call boundary and use a separate
+  connection. Sending is best effort, bounded by `flush_deadline_s` (one second),
+  then backs off. Defaults bound pending ids to 10,000, batches to 500 ids and messages
+  to 7,900 bytes. Failed sweep pages still flush earlier successes within the shared
+  deadline. Closing during backoff skips the final flush; polling recovers the changes.
+- Only `RunStore(store)` listens. `RunStore.from_engine` and `from_database_url` poll.
+  `Agent(database_options=)`, `sweep(database_url=)`, `get_engine` and
+  `RunStore.from_database_url` reject `live_updates` and `notify_channel` options:
+  build the store and pass `state_store=`. `await store.close()` closes its bus and
+  leaves your engine alone; `Agent.close()` closes only a store it built.
+- `PostgresUpdates` uses dedicated asyncpg sender and listener connections. Use
+  `listen_url=` for a direct listener with PgBouncer transaction pooling. Unsupported
+  SQLAlchemy URL options such as `?ssl=require` raise `ValueError`; pass an
+  asyncpg-readable `url=` or `connect_args={"ssl": ...}`. `RedisUpdates` fixes its
+  timeouts, retries and protocol and needs a distinct channel per application and
+  environment. PostgreSQL refuses ambiguous destination/TLS settings and engine
+  connection customizations it cannot inherit; Redis refuses protected URL overrides
+  and bounds oversized publications before parsing. Every listener receives every
+  hint on its channel. Monitor `pg_notification_queue_usage()`; a full queue fails
+  announcements, not saves.
+  More than 16 open live-update stores for one database warns once. Closing or
+  acquiring a listener from another event loop is refused.
+- Serve `follow()` through one coordinator per `RunStore` and event loop. Batched
+  stores read up to 200 runs and 2,000 event rows per query. A token bucket holds
+  20 reads and refills at 20 per second; a full bucket can permit about 40 reads
+  within a second. Hints have bounded priority between reserved oldest-due turns.
+  Healthy live updates use a 10-second safety poll with 20 percent jitter; without
+  them idle polling backs off from 0.5 to 2 seconds. Status becomes due within
+  30 seconds, subject to the shared budget; terminal runs drain with a 100 ms grace
+  before `FollowEnd`. Custom stores without batched reads are read one run at a time.
+  `stream_events`
+  retains per-caller polling with a minimum wait between idle reads.
+- Add `SQLStateStore.get_events_for_runs` and `get_run_statuses`, indexed batched
+  reads, plus the optional `events_for_runs_query` hook. Add live-update health and
+  drop counters, `LiveUpdatesUnavailableError` and `FollowCapacityError`; the latter
+  stays importable from `dendrux.store` as well as `dendrux.errors`.
+- Add coded diagnostics and a generated log-code reference. Strict field checking
+  requires `DENDRUX_STRICT_LOG_FIELDS=1`. Alert on `live_updates_degraded`,
+  `live_updates_unavailable` and `live_updates_missed_hint`; polling is the fallback.
+  Valid unknown provider codes project to `provider_unknown`; malformed codes are
+  discarded. Raw valid codes remain only on `provider_code_raw`.
+- Persist trace links across pause, resume, submissions and reclaim. Delegated
+  OpenTelemetry spans use the active parent tool context where available. Error,
+  cancelled and max-iteration runs export ERROR status. Non-provider stacks contain
+  frames only; failed tools show the completion-callback stack.
+- Add MySQL 8.4 and MariaDB 10.11 stores through `MySQLStateStore`. Install
+  `dendrux[mysql]` for `asyncmy` and `cryptography`; this extra is not in `dendrux[all]`.
+  Database URL helpers normalize MySQL-family URLs to `asyncmy`, use READ COMMITTED,
+  UTC and `utf8mb4`, and accept `mariadb+asyncmy`. First-use checks require InnoDB,
+  supported server versions, transactions, strict SQL mode and `utf8mb4`. All SQL
+  stores reject AUTOCOMMIT engines. Missing drivers retain installation guidance.
+- MySQL-family identifiers and long text use NO PAD binary collations. Scalar JSON
+  metadata filters match exact types across all four databases. Integers outside
+  signed int64 / unsigned uint64 raise `JSONIntegerOutOfRangeError`. Missing schema
+  raises `SchemaNotInitializedError` or `SchemaOutOfDateError`, including on owned
+  engines. MySQL-family migrations are resumable, forward-only, use a server-wide
+  named lock, allow application tables and refuse an application Alembic version table.
+  Live updates use Redis or a custom transport. See `docs/guides/mysql.mdx`.
+- Add `StatementTooLargeError` for MySQL-family packet errors, with the server limit
+  and best-effort size; these writes are not retried. Connection loss with a bound
+  value larger than `max_allowed_packet` uses the same outcome. Stores can expose
+  `statement_capacity()` for an early Agent/runner limit check. Its worst-case estimate
+  reserves 12 times the sum of the larger input/tool-result limit and the metadata
+  limit, plus 64 KiB; incompatible limits raise `ValueError` before use. Defaults
+  fit server defaults.
+- Export `SQLStateStore`, all concrete stores, `store_for_engine` and dialect hook
+  types from `dendrux.store`, so custom SQL stores need no private imports.
+- Publish `dendrux[testkit]` and `pytest -p dendrux.testing.store_kit` to check declared
+  store capabilities: basic operations, fencing, retry identities, checkpointing,
+  atomic completion, recovery, concurrency and fault-injected crash recovery. SQLite
+  fixtures ship as an example. Incomplete or skipped required contracts produce
+  NOT CERTIFIED and a nonzero exit; unverified checks can produce CERTIFIED with
+  caveats. Optional `dendrux_live_store_factory` checks committed hint visibility;
+  without it live updates are marked untested. Export `RecordingLiveUpdates`.
+  Close the live store and recorder even when required second-instance setup fails.
+- Expand recovery, database, custom-store, live-update, observability and tracing
+  guides and examples. Publish PostgreSQL load measurements with reproduction commands,
+  pool backpressure, follow latency, recovery, cancellation and laptop-run limits in
+  `docs/guides/scaling.mdx`. Document the separate unchanged MCP transport result cap
+  (1,000,000 bytes) and `Limits.max_tool_result_bytes` (1,048,576 bytes).
 
 ### Fixed
 
-- SingleCall stops before retrying a provider call when an image guardrail blocks the retry.
+- Check run ownership immediately before every provider call on both formats with
+  one primary-key read. Stale owners stop with `RunFencedError`; a failed ownership
+  read fails the run before dispatch.
+- Preserve Python 3.11 cancellation lost during recorder store awaits at model/tool
+  boundaries without treating handled provider/tool cancellation as a lost request.
+  Python 3.12+ is unchanged. Cancelling native SQL creates or claims before COMMIT
+  rolls them back; paused runs remain retryable and reclaim spends no attempt.
+  After COMMIT is issued, retain the acquired epoch for cancellation cleanup and
+  best-effort hint delivery. Unresolved ownership stays discoverable by sweep.
+  Cancellation still reaches callers, even when the store operation fails.
+- Post-claim governance/setup cancellation ends native owned runs as cancelled.
+  Automatic cleanup skips legacy boolean claims that provide no exact epoch.
+  Ownership-changing store calls run in a joined child task; custom task-scoped
+  sessions must account for that boundary. Provider and tool execution stay on the
+  caller's task. Carry configured history limits through retry and edited replay views.
+- Write terminal outcomes and lifecycle events atomically on stores that declare
+  atomic completion, on both formats. Guardrail-blocked runs also finish on custom
+  stores with an older `finalize_with_event` signature.
+- Keep cascade cancellation inside the root tenant, even for unscoped calls, and
+  bound traversal with `Budget.max_subtree_nodes` (default 10,000).
+  `cascade_truncated` identifies remaining branches. Finished runs retain their
+  cancellation flags. SQLite child admission reserves the writer before checking
+  its parent. Cancelling a nested run on a shared task lets its ancestors continue.
+- Isolate failed `follow()` batches so unreadable runs do not hold healthy readers
+  behind recursive retries. Suspects rejoin normal reads after successful probes;
+  batched stores recheck groups after outages, while other stores recover run by run.
+  Hints cannot bypass retry backoff or monopolize overdue turns, including across
+  tenants. Continuing hints to unreadable runs can still delay isolation; recovery
+  has no fixed latency guarantee. Idle readers with no resources keep no idle task,
+  and generators left open at loop exit close quietly.
+- Release unconsumed continuation claims after execution-setup failures. Released
+  pauses can be retried explicitly; reclaim stays running for later recovery. Stores
+  without release support finalize claimed pauses as errors, while reclaim remains
+  retryable. Failed releases leave durable state for sweep. Stream errors and
+  observer hooks reflect the observed status rather than assuming terminal error.
+- Preserve committed outcomes when optional recovery or pending projections fail;
+  log `result_read_failed`. A result can have `recovery=None`, or `pending=None`
+  and no pause token. Reload pending information before submitting. `get_result`
+  remains a strict read. Acknowledged cancellation still signals local work when
+  response reads fail.
+- Retry recognized pre-COMMIT availability failures only in guarded built-in SQL
+  scopes, including multi-address refusal and PostgreSQL `53300`. Ignore unrelated
+  handled-exception context; bare driver timeouts and DNS failures remain nonretryable.
+  Custom-store raw-driver retry behaviour is unchanged. Keep three retries with
+  0.1, 0.2 and 0.4 second backoffs; database work adds its own duration. Stable-identity
+  writes read back ambiguous commits; unprovable outcomes raise `StoreOutcomeUnknown`.
+  Fatal writes raise `PersistenceError` (or end streams with `run_error`); if failure
+  persistence also fails, the run keeps its last committed state for recovery.
+  Model-call records, usage rows and legacy progress heartbeats remain best effort.
+  SQL errors discard internal frames and raw readback chains; direct PostgreSQL
+  live-update failures retain useful TLS/type diagnostics and are picklable.
+- Preserve human-input questions and options across pause and reclaim. Format 2
+  saves a UTF-8 display summary bounded by `Limits.max_pause_summary_bytes` (64 KiB
+  default, 128 bytes to 512 KiB). Long questions are truncated instead of making a
+  pause unresumable; options-only overflow preserves the model response. Raising
+  this display bound does not change governance.
+- Keep public trace positions stable while parallel tools finish, including on
+  custom stores. Page public rows directly with indexed SQL or bounded keyset batches;
+  expose all committed rows once the run is terminal, even with unfinished slots.
+  Preserve public metadata, mixed rejected/server/approval/client results and CLI
+  trace display. Approval and crash-recovery ordering exceptions remain documented.
+- Preserve `Message` dataclass serialization and guardrail evidence after projection
+  cache eviction. Retain true finding totals and entity-kind counts with bounded
+  samples. Restore redaction notifications and current indexed block locations.
+  Redact PII inside placeholder-shaped text that the run did not issue.
+- Preserve client-tool per-run limits across pauses on both formats. Denied and
+  rejected calls no longer consume a tool's limit after resume; rejected messages
+  carry `dendrux.not_executed` metadata. Resumed loops prefer saved execution counts
+  and fall back to history. Approved tools use the resumed tool-calling strategy
+  and retain notifier warnings; recovered denials use the same structured result.
+- SingleCall stops before retrying a provider call when an image guardrail blocks it.
+  Streaming image failures release request holders and SDK streams from traceback
+  locals on failure paths. Provider retry telemetry omits SQL statements and
+  parameters from database errors.
+- Bound non-streaming responses before SDK parsing (`max_response_bytes`, default
+  16 MiB). `max_stream_bytes` also limits each decoded SSE event, so low custom
+  limits may reject repeated final response envelopes. Both bounds count decoded
+  bytes and bytes after a compressed end marker. Compressed wire bytes have an
+  additional bound with a small overhead allowance: the greater of 1 KiB or 1% of
+  the configured limit, rounded down to whole bytes. Streaming wire accounting
+  resets at decoded SSE event boundaries. Heavy padding or frequent compression
+  flushes can cause refusal even below the decoded limit. Compressed responses
+  accept gzip/deflate; unsupported or stacked encodings raise `response_encoding_unsupported`.
+- Keep provider response limits terminal across SDK status handling, cached bodies and
+  raw or decoded reads, on current and older supported SDKs, with bounded decompression
+  and client copies that keep the same limits.
+- Limit OpenRouter model-catalog responses to 32 MiB before parsing. An oversized catalog
+  raises a typed error from `list_models()` and uses the existing warning path during
+  native-tool checks.
+- OpenRouter tool-call warnings identify the adapter and selected model. OpenAI
+  Responses omits prompt cache keys and retention for non-OpenAI endpoints.
+  Non-streaming socket read timeouts report `timeout_reason=None`; `call_deadline`
+  is reserved for Dendrux's own deadline.
+- Release SQLite activation locks even when a caller retains the error. Dedupe
+  compares legacy content as canonical JSON and removes deleted rows' blob edges.
+  Existing PostgreSQL migrations remain interruptible and refuse concurrent migration
+  promptly; fresh bootstraps serialize migration and activation. Failed status reads
+  print guidance without failing a successful migration. Best-effort bootstrap unlock
+  preserves successful activation and original migration errors after session loss.
 
-- Client tool calls retain their per-run call limits across pauses on both storage formats.
+### Deprecated
 
-- Rejected tool calls no longer use up a tool's per-run call limit after a resume; rejected tool messages now carry `dendrux.not_executed` in saved metadata visible in traces.
-
-- Denied tool calls no longer use up a tool's per-run call limit after a resume.
-- Resumed loops start their tool call counts from the saved execution counts when available, falling back to history.
-- Approved tools use the resumed run's tool-calling strategy and keep notifier warnings in the run result.
-- Recovered approval denials return the same structured tool result as live and approved calls.
-- Streaming provider errors release image request holders on every failure path.
-- Provider retry telemetry warnings omit SQL statements and parameters from database failures.
-- OpenAI Chat, Responses and OpenRouter streaming image failures release request holders from tracebacks.
-- Anthropic image-bearing streaming failures drop the SDK stream from traceback locals.
-- OpenRouter tool-call warnings identify the adapter and the model selected for each call.
-- OpenAI Responses no longer sends prompt cache keys or retention to non-OpenAI endpoints.
+- `ConsoleNotifier` warns when unused `show_llm_text` or `max_text_length` options
+  have non-default values.
+- Omitting `sweep(on_stale=)` still finalizes stale rows in 0.6 and warns when such
+  rows are found. Pass `"error"` explicitly to keep that behaviour when the default
+  changes to `"reclaim"` in 0.7.
+- Reading all events, traces, LLM calls or tool invocations through `RunStore`
+  without `limit=` emits `FutureWarning`; the default becomes 1,000 in 0.7.
+  Page events with `after_sequence_index` and other reads with `offset`.
+- Limits above 1,000 warn. SQL stores and format-2 public trace reads clamp to 1,000;
+  custom stores receive the limit unchanged on format-1 reads. Oversized explicit
+  limits will raise in 0.7. Zero and negative limits read one row on SQL stores and
+  format-2 trace reads, which used to return nothing.
+- Unbounded `RunStore.get_subtree` emits `FutureWarning`; the 0.7 default becomes
+  `max_nodes=10_000`. Pass a positive bound and handle `SubtreeTooLargeError`, a
+  `ValueError` raised when descendants, root excluded, reach it. This bounds node
+  count, not memory.
 
 ## 0.5.0 - 2026-10-28
 

@@ -9,6 +9,7 @@ import weakref
 from typing import Any, NoReturn
 
 from dendrux import _codes
+from dendrux._warnings import _developer_stacklevel
 from dendrux.errors import StoreCapabilityError
 from dendrux.runtime.state import StoreCapabilities
 
@@ -57,7 +58,6 @@ _REQUIREMENTS: dict[str, dict[str, tuple[str, ...]]] = {
         "reclaim_run": (),
         "get_replayed_tool_calls": (),
     },
-    "notify": {"_after_event_insert": ()},
 }
 _CACHE: dict[int, tuple[weakref.ReferenceType[Any], StoreCapabilities]] = {}
 logger = logging.getLogger(__name__)
@@ -75,16 +75,10 @@ def validate_capabilities(store: Any) -> StoreCapabilities:
     if not isinstance(caps, StoreCapabilities) or caps.version != 1:
         _refuse(store, "version", "capabilities", ("version=1",))
     if caps.deployment is None:
-        frame = inspect.currentframe()
-        stacklevel = 1
-        while frame is not None and frame.f_globals.get("__name__", "").startswith("dendrux."):
-            stacklevel += 1
-            frame = frame.f_back
-        del frame
         warnings.warn(
             "StateStore capabilities should declare deployment; legacy declaration is undeclared.",
             DeprecationWarning,
-            stacklevel=stacklevel,
+            stacklevel=_developer_stacklevel(),
         )
     elif caps.deployment not in ("single_process", "single_host", "multi_server"):
         _refuse(store, "deployment", "capabilities", ("deployment",))

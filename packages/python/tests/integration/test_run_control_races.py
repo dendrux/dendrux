@@ -162,47 +162,61 @@ class TestPausePublication:
 
 
 class TestTerminalPrecedence:
-    async def test_cancel_after_last_checkpoint_completes_normally(self, store) -> None:
+    @pytest.mark.parametrize("storage_format", [1, 2])
+    async def test_cancel_after_last_checkpoint_completes_normally(
+        self, store, storage_format
+    ) -> None:
         """Documented: cooperative cancel does not undo a finished run."""
+        from tests._fixtures.storage import pin_storage_format
+
+        await pin_storage_format(store._engine, storage_format)
         agent = Agent(
             strict_tenancy=False,
             provider=ScriptedLLM([LLMResponse(text="done")]),
             prompt="P.",
             state_store=store,
         )
-        original = store.finalize_run
+        original = store.finalize_with_event
+        calls = 0
 
-        async def cancel_then_finalize(run_id: str, **kwargs: Any) -> bool:
+        async def cancel_then_finalize(run_id: str, **kwargs: Any) -> int | None:
+            nonlocal calls
+            calls += 1
             if kwargs.get("status") == "success":
                 await store.request_cancel(run_id)
             return await original(run_id, **kwargs)
 
-        store.finalize_run = cancel_then_finalize
+        store.finalize_with_event = cancel_then_finalize
         result = await agent.run("go")
+        assert calls == 1
         record = await store.get_run(result.run_id)
         assert result.status == RunStatus.SUCCESS and record.status == "success"
         assert record.cancel_requested is False
 
-    async def test_lost_terminal_cas_returns_persisted_state(self, store) -> None:
-        # This fault injection / pause blob exercises the format-1 write path.
+    @pytest.mark.parametrize("storage_format", [1, 2])
+    async def test_lost_terminal_cas_returns_persisted_state(self, store, storage_format) -> None:
         from tests._fixtures.storage import pin_storage_format
 
-        await pin_storage_format(store._engine, 1)
+        await pin_storage_format(store._engine, storage_format)
         agent = Agent(
             strict_tenancy=False,
             provider=ScriptedLLM([LLMResponse(text="done")]),
             prompt="P.",
             state_store=store,
         )
-        original = store.finalize_run
+        original = store.finalize_with_event
+        calls = 0
 
-        async def swept_first(run_id: str, **kwargs: Any) -> bool:
+        async def swept_first(run_id: str, **kwargs: Any) -> int | None:
+            nonlocal calls
+            calls += 1
             if kwargs.get("status") == "success":
                 await _set_row(store, run_id, status="error", failure_reason="stale_running")
             return await original(run_id, **kwargs)
 
-        store.finalize_run = swept_first
+        store.finalize_with_event = swept_first
         result = await agent.run("go")
+        assert calls == 1
         assert result.status == RunStatus.ERROR
         assert result.meta["_finalize_won"] is False
         events = [e.event_type for e in await store.get_run_events(result.run_id)]
@@ -564,6 +578,6 @@ class TestPre03Store:
         with pytest.raises(NotImplementedError, match="get_notes"):
             await RunStore(legacy).get_notes("r1")  # type: ignore[arg-type]
         with pytest.raises(NotImplementedError, match="get_subtree"):
-            await RunStore(legacy).get_subtree("r1")  # type: ignore[arg-type]
+            await RunStore(legacy).get_subtree("r1", max_nodes=10000)  # type: ignore[arg-type]
         with pytest.raises(NotImplementedError, match="get_subtree"):
             await agent.cancel_run("r1", cascade=True)

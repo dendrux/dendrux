@@ -33,7 +33,7 @@ async def test_secondary_persistence_failure_keeps_typed_provider_error_and_safe
     original = (
         await agent(store, [LLMResponse(text="prior")]).run("go") if entry == "retry" else None
     )
-    saved_finalize, saved_event = store.finalize_run, store.save_run_event
+    saved_finalize, saved_event = store.finalize_with_event, store.save_run_event
 
     async def finalize(*args, **kwargs):
         if fault == "finalize" and kwargs.get("status") == "error":
@@ -54,7 +54,7 @@ async def test_secondary_persistence_failure_keeps_typed_provider_error_and_safe
         raise error
 
     monkeypatch.setattr(llm, "complete", fail)
-    monkeypatch.setattr(store, "finalize_run", finalize)
+    monkeypatch.setattr(store, "finalize_with_event", finalize)
     monkeypatch.setattr(store, "save_run_event", event)
     if entry in {"stream", "resume_stream"}:
         result, _ = await consume(
@@ -119,7 +119,7 @@ async def test_cancel_result_discloses_failed_persistence(store, monkeypatch):
     async def fail(*args, **kwargs):
         raise RuntimeError("database unavailable")
 
-    monkeypatch.setattr(store, "finalize_run", fail)
+    monkeypatch.setattr(store, "finalize_with_event", fail)
     result = await _persist_task_cancellation(store, "00000000000000000000000103", interrupted=True)
     assert (await store.get_run("00000000000000000000000103")).status == "running"
     assert result.meta.get("dendrux.cancel_persisted") is False, (
@@ -280,14 +280,14 @@ async def test_public_cancel_reports_failed_durable_write(store, monkeypatch, en
     task = asyncio.create_task(action)
     await asyncio.wait_for(llm.entered.wait(), 5)
     rid = pause.run_id if pause else next(iter(a._task_manager._owned))
-    original = store.finalize_run
+    original = store.finalize_with_event
 
     async def fail(*args, **kwargs):
-        if kwargs.get("status") == "cancelled":
+        if kwargs.get("allowed_current_statuses") == ["running"]:
             raise RuntimeError("database unavailable")
         return await original(*args, **kwargs)
 
-    monkeypatch.setattr(store, "finalize_run", fail)
+    monkeypatch.setattr(store, "finalize_with_event", fail)
     await a.cancel_run(rid)
     result = await task
     assert (
@@ -295,7 +295,9 @@ async def test_public_cancel_reports_failed_durable_write(store, monkeypatch, en
         and result.meta.get("dendrux.cancel_persisted") is False
     )
     assert (await store.get_run(rid)).status == "running"
-    await original(rid, status="cancelled", expected_current_status="running")
+    await original(
+        rid, status="cancelled", allowed_current_statuses=["running"], event_type="run.cancelled"
+    )
 
 
 @pytest.mark.parametrize("resumed", [False, True])
@@ -316,7 +318,7 @@ async def test_stream_cancel_fallback_discloses_unknown_persistence(store, monke
     async def fail(*args, **kwargs):
         raise RuntimeError("database unavailable")
 
-    monkeypatch.setattr(store, "finalize_run", fail)
+    monkeypatch.setattr(store, "finalize_with_event", fail)
     monkeypatch.setattr(store, "get_run", fail)
     await stream.aclose()
     await iterator.aclose()

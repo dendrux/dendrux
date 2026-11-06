@@ -38,12 +38,12 @@ from dendrux.errors import (
     RunNotPausedError,
 )
 from dendrux.runtime._tenant_checks import _strict_tenancy_applies
-from dendrux.runtime.state import ClaimResult
 from dendrux.types import (
     ULID_CHARS,
     ApprovalDecision,
     ImagePart,
     ImageRef,
+    InputValidationError,
     PauseState,
     RunStatus,
     TextPart,
@@ -69,7 +69,7 @@ if TYPE_CHECKING:
     from dendrux.media._catalog import BlobEdge
     from dendrux.media._policy import ImagePolicy, Origin
     from dendrux.media._runtime import ImageRuntime
-    from dendrux.runtime.state import EventWrite, RunRecord, StateStore
+    from dendrux.runtime.state import ClaimResult, EventWrite, RunRecord, StateStore
     from dendrux.types import ContentPart
 
 __all__ = [
@@ -402,6 +402,10 @@ async def _claim_submission(
     blob_refs: Sequence[BlobEdge] | None = None,
     blob_refs_scope: str | None = None,
 ) -> tuple[ClaimResult | int | bool, dict[str, Any] | None, dict[str, Any] | None]:
+    from functools import partial
+
+    from dendrux.runtime.durability import _ownership_handoff
+
     descriptor = None
     if (
         request.raw.get("schema_version") == 2
@@ -416,17 +420,35 @@ async def _claim_submission(
         )
         descriptor = submission_descriptor(request.raw, checkpoint, payload, status)
     if payload is None:
-        won = await claim_paused_validated(store, run_id, expected_status=status, validate=validate)
+        operation = claim_paused_validated(store, run_id, expected_status=status, validate=validate)
     else:
         kwargs: dict[str, Any] = {"validate": validate}
         if descriptor is not None:
             kwargs["submission"] = descriptor
         if blob_refs:
             kwargs.update(blob_refs=list(blob_refs), blob_refs_scope=blob_refs_scope)
-        won = await store.submit_and_claim(
+        operation = store.submit_and_claim(
             run_id, expected_status=status, submitted_data=payload, **kwargs
         )
+    won = await _ownership_handoff(
+        store, operation, partial(_cancel_claim, store, run_id), run_id=run_id
+    )
     return won, descriptor, payload
+
+
+async def _cancel_claim(store: StateStore, run_id: str, result: ClaimResult | int | bool) -> None:
+    from dendrux.runtime.runner import _persist_task_cancellation
+    from dendrux.runtime.state import claimed_store
+
+    if not result or isinstance(result, bool):
+        import logging
+
+        if result:
+            _codes.log_code(
+                logging.getLogger(__name__), _codes.CANCEL_PERSIST_FAILED, run_id=run_id
+            )
+        return
+    await _persist_task_cancellation(claimed_store(store, run_id, result), run_id)
 
 
 def _claimed_submission_view(
@@ -593,23 +615,42 @@ async def claim_or_raise(
     _raise_submit_claim_failure(record, run_id, expected_status, after_preflight=True)
 
 
+def _release_supported(store: StateStore, *, claim_epoch: int | None = None) -> bool:
+    epoch = claim_epoch if claim_epoch is not None else getattr(store, "claim_epoch", None)
+    return (
+        isinstance(epoch, int)
+        and not isinstance(epoch, bool)
+        and callable(getattr(store, "release_run_claim", None))
+    )
+
+
 async def _release_claim_result(
     store: StateStore,
     run_id: str,
     status: str,
     result: ClaimResult | int | bool,
-    failure: BaseException,
-) -> None:
-    epoch = result.claim_epoch if isinstance(result, ClaimResult) else result
-    token = epoch if isinstance(epoch, int) and not isinstance(epoch, bool) else None
-    await release_claim(store, run_id, status, claim_epoch=token, failure=failure)
+    failure: BaseException | None,
+) -> bool:
+    if isinstance(failure, asyncio.CancelledError):
+        from dendrux.runtime.tasks import _drain_cleanup
+
+        await _drain_cleanup(_cancel_claim(store, run_id, result), run_id=run_id)
+        return False
+    from dendrux.runtime.state import claimed_store
+
+    view = claimed_store(store, run_id, result)
+    if _release_supported(view) or status == RunStatus.RUNNING.value:
+        return await release_claim(view, run_id, status, failure=failure)
+    if isinstance(failure, Exception):
+        from dendrux.runtime.runner import _persist_run_failure
+
+        await _persist_run_failure(view, run_id, failure)
+    return False
 
 
 def _resume_failure_kind(failure: BaseException | None) -> str:
     from dendrux.errors import PersistenceError
 
-    if isinstance(failure, asyncio.CancelledError):
-        return "cancelled"
     if isinstance(failure, PersistenceError):
         return "persistence_error"
     if isinstance(failure, (ValueError, KeyError, TypeError)):
@@ -663,30 +704,35 @@ async def release_claim(
     *,
     claim_epoch: int | None = None,
     failure: BaseException | None = None,
-) -> None:
-    """Drain claim release, preserving failures unless the caller cancels."""
+) -> bool:
+    """Drain claim release and report whether it succeeded."""
     import logging
 
     from dendrux.runtime.tasks import _drain_cleanup
 
     epoch = claim_epoch if claim_epoch is not None else getattr(store, "claim_epoch", None)
     release = getattr(store, "release_run_claim", None)
-    if epoch is None or release is None:
+    if not _release_supported(store, claim_epoch=epoch):
         _codes.log_code(logging.getLogger(__name__), _codes.PERSISTENCE_ERROR, run_id=run_id)
-        return
+        return False
+    assert isinstance(epoch, int)
     event = _resume_aborted_event(status, failure)
 
-    async def cleanup() -> None:
+    async def cleanup() -> bool:
         try:
             if await _release_with_event(store, release, run_id, status, epoch, event):
-                return
+                return True
         except (Exception, asyncio.CancelledError):
             pass
         _codes.log_code(logging.getLogger(__name__), _codes.PERSISTENCE_ERROR, run_id=run_id)
+        return False
 
-    _, cancelled = await _drain_cleanup(cleanup(), name=f"release-claim:{run_id}")
+    released, cancelled = await _drain_cleanup(
+        cleanup(), name=f"release-claim:{run_id}", run_id=run_id
+    )
     if cancelled is not None:
         raise cancelled
+    return released
 
 
 def build_rejection_results(
@@ -1130,6 +1176,24 @@ def _invalid_json_constant(value: str) -> NoReturn:
     raise ValueError("non-finite JSON number")
 
 
+def _governed_limits(limits: Any) -> dict[str, Any]:
+    from dendrux.types import Limits
+
+    defaults = Limits()
+    recovery_bounds = {
+        "max_pending_calls",
+        "max_rebuild_bytes",
+        "max_rebuild_rows",
+    }
+    # Default recovery bounds preserve older governance snapshots; overrides remain governed.
+    return {
+        key: value
+        for key, value in asdict(limits).items()
+        if key != "max_pause_summary_bytes"
+        and (key not in recovery_bounds or value != getattr(defaults, key))
+    }
+
+
 def governance_snapshot(agent: Agent) -> dict[str, Any]:
     """Versioned digests of stable governance configuration, never object reprs.
 
@@ -1172,17 +1236,7 @@ def governance_snapshot(agent: Agent) -> dict[str, Any]:
             }
         )
     budget = agent.budget
-    from dendrux.types import Limits
-
-    defaults = Limits()
-    recovery_bounds = {"max_pending_calls", "max_rebuild_bytes", "max_rebuild_rows"}
-    # Default recovery bounds must not invalidate pre-0.6 governance snapshots.
-    # Explicit overrides remain governed, so changing one still requires policy.
-    limits = {
-        key: value
-        for key, value in asdict(agent._limits).items()
-        if key not in recovery_bounds or value != getattr(defaults, key)
-    }
+    limits = _governed_limits(agent._limits)
     parts = {
         "guardrails": guards,
         "before_tool": qualified(agent.before_tool) if agent.before_tool else None,
@@ -1283,13 +1337,23 @@ async def report_governance_change(
     )
 
 
+class _PauseIdRequiredError(InputValidationError):
+    def __init__(self, field: str, code: str) -> None:
+        super().__init__(field, code)
+        self.args = (str(self) + " Send the pause_id from get_pending as expected_pause_id.",)
+
+
+def _pause_id_required() -> ValueError:
+    return _PauseIdRequiredError("expected_pause_id", "pause_id_required")
+
+
 def _require_approval_token(approval: bool, expected: str | None) -> None:
-    from dendrux.types import InputValidationError, _validate_identifier
+    from dendrux.types import _validate_identifier
 
     if expected is not None:
         _validate_identifier(expected, "expected_pause_id", maximum=ULID_CHARS)
     if approval and expected is None:
-        raise InputValidationError("expected_pause_id", "pause_id_required")
+        raise _pause_id_required()
 
 
 def require_pause_id(
@@ -1304,9 +1368,7 @@ def require_pause_id(
     """Require a token only when the stored pause has a durable generation."""
     _require_approval_token(approval and pause_id is not None, expected)
     if pause_id is not None and expected is None and _strict_tenancy_applies(agent, store):
-        from dendrux.types import InputValidationError
-
-        raise InputValidationError("expected_pause_id", "pause_id_required")
+        raise _pause_id_required()
     if run_id is not None:
         pause_validator(run_id, expected)({"pause_id": pause_id})
 

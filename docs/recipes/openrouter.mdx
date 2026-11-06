@@ -196,7 +196,7 @@ These are **separate** response data: `reasoning_tokens` counts internal reasoni
 [//]: # "docs-test: skip - fragment: relies on `store`, defined by setup shown elsewhere"
 
 ```python
-call = (await store.get_llm_calls(run_id))[-1]
+call = (await store.get_llm_calls(run_id, limit=1000))[-1]  # the last call of a short run
 call.reasoning_tokens   # e.g. 773  — reasoning happened
 call.reasoning          # None      — but no reasoning text was exposed
 ```

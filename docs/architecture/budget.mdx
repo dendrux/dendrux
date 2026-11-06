@@ -43,7 +43,7 @@ async def main() -> None:
 
     store = RunStore.from_database_url(url)
     async with store:
-        print([e.event_type for e in await store.get_events(result.run_id)])
+        print([e.event_type for e in await store.get_events(result.run_id, limit=100)])
         # ['run.started', 'tools.declared', 'llm.completed', 'budget.threshold', 'budget.threshold',
         #  'budget.threshold', 'budget.exceeded', 'run.completed']
     print(result.status.value)   # success  (on_exceed defaults to "warn")
@@ -174,7 +174,7 @@ Because the budget lives on the `Agent`, "raising the limit" means resuming with
 
 ## Children and roll-up
 
-With `include_children=True` the number being compared with the limit is the **root-inclusive subtree rollup**: the run's own usage plus every descendant's, read live from `llm_interactions`. There is no double counting. A parent waiting on a delegated child therefore sees the child's spend as it happens, not when the child finishes. This is the same figure `RunStore.get_subtree(run_id).usage` returns.
+With `include_children=True` the number being compared with the limit is the **root-inclusive subtree rollup**: the run's own usage plus every descendant's, read live from `llm_interactions`. There is no double counting. A parent waiting on a delegated child therefore sees the child's spend as it happens, not when the child finishes. This is the same figure `RunStore.get_subtree(run_id, max_nodes=...).usage` returns.
 
 `include_children=False` limits the run to its own calls.
 

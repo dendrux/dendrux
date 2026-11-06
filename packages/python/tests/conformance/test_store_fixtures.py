@@ -78,7 +78,7 @@ async def test_partial_fixture_declares_fenced_writes_and_retry_ids_only(sqlite_
     store = build("e_partial_fenced_retry", sqlite_engine)
     caps = store.capabilities
     assert (caps.fenced_writes, caps.retry_ids) == (True, True)
-    assert not any((caps.checkpointing, caps.atomic_completion, caps.recovery, caps.notify))
+    assert not any((caps.checkpointing, caps.atomic_completion, caps.recovery))
     for method, extra in (
         ("save_trace", "trace_id"),
         ("save_tool_call", "row_id"),

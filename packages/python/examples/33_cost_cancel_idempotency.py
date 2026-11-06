@@ -47,6 +47,16 @@ PRICING = PriceTable(
 )
 
 
+async def all_events(store: RunStore, run_id: str) -> list:
+    """Every event of a run, one bounded page at a time."""
+    events: list = []
+    after = None
+    while page := await store.get_events(run_id, limit=500, after_sequence_index=after):
+        events.extend(page)
+        after = page[-1].sequence_index
+    return events
+
+
 @tool()
 async def lookup_city(name: str) -> str:
     """Return a fact about a city."""
@@ -65,6 +75,7 @@ async def priced_run_and_final_answer(store: RunStore) -> None:
         prompt="Use lookup_city before answering. Keep the final answer to one sentence.",
         tools=[lookup_city],
         database_url=DB_URL,
+        strict_tenancy=False,  # single-tenant demo (see Multi-tenancy docs)
         pricing=PRICING,
     ) as agent:
         result = await agent.run(
@@ -75,20 +86,25 @@ async def priced_run_and_final_answer(store: RunStore) -> None:
     print(f"tokens       : {usage.input_tokens} in / {usage.output_tokens} out")
     print(f"cost_usd     : {usage.cost_usd:.6f}  (cost_source={usage.cost_source!r})")
 
-    calls = await store.get_llm_calls(result.run_id)
+    calls = await store.get_llm_calls(result.run_id, limit=100)  # one page: a short demo run
     for call in calls:
         print(f"  call {call.iteration}: {call.model}  ${call.cost_usd:.6f}")
 
     section("2. Answer contract: final turn only")
     print(f"result.answer: {result.answer!r}")
-    traces = await store.get_traces(result.run_id)
+    traces = await store.get_traces(result.run_id, limit=100)
     assistant_text = [t.content for t in traces if t.role == "assistant" and t.content]
     print(f"assistant turns recorded in traces: {len(assistant_text)}")
     for i, text in enumerate(assistant_text, 1):
         print(f"  turn {i}: {text[:70]!r}")
 
     section("1b. Same run without a table: cost is unknown, never 0")
-    async with Agent(provider=PROVIDER, prompt="One short sentence.", database_url=DB_URL) as plain:
+    async with Agent(
+        provider=PROVIDER,
+        prompt="One short sentence.",
+        database_url=DB_URL,
+        strict_tenancy=False,  # single-tenant demo (see Multi-tenancy docs)
+    ) as plain:
         r = await plain.run("What is 2 + 2?")
     print(f"cost_usd={r.usage.cost_usd!r}  cost_source={r.usage.cost_source!r}")
 
@@ -112,6 +128,7 @@ async def timeout_cancels_run(store: RunStore) -> None:
         provider=PROVIDER,
         prompt="Write a long essay, at least 800 words.",
         database_url=DB_URL,
+        strict_tenancy=False,  # single-tenant demo (see Multi-tenancy docs)
         pricing=PRICING,
     ) as agent:
         try:
@@ -123,7 +140,7 @@ async def timeout_cancels_run(store: RunStore) -> None:
 
     run_id = started[0]
     record = await store.get_run(run_id)
-    events = [e for e in await store.get_events(run_id)]
+    events = await all_events(store, run_id)
     cancelled = [e for e in events if e.event_type == "run.cancelled"]
     print(f"row status   : {record.status}")
     print(f"events       : {[e.event_type for e in events]}")
@@ -137,6 +154,7 @@ async def stream_idempotency(store: RunStore) -> None:
         provider=PROVIDER,
         prompt="Answer in one short sentence.",
         database_url=DB_URL,
+        strict_tenancy=False,  # single-tenant demo (see Multi-tenancy docs)
         pricing=PRICING,
     ) as agent:
         key = f"demo-{uuid.uuid4().hex[:8]}"
@@ -147,7 +165,7 @@ async def stream_idempotency(store: RunStore) -> None:
                 [e.text async for e in first if e.type == RunEventType.TEXT_DELTA and e.text]
             )
         print(f"first run    : {first.run_id}  answer={text!r}")
-        events_before = len(await store.get_events(first.run_id))
+        events_before = len(await all_events(store, first.run_id))
 
         replay = agent.stream("Name one primary colour.", idempotency_key=key)
         provisional_id = replay.run_id
@@ -159,7 +177,7 @@ async def stream_idempotency(store: RunStore) -> None:
         )
         print(
             f"replay answer: {replay.result.answer!r}  (no provider call, no new events: "
-            f"{len(await store.get_events(first.run_id)) == events_before})"
+            f"{len(await all_events(store, first.run_id)) == events_before})"
         )
 
         conflict = agent.stream("Name one secondary colour.", idempotency_key=key)
