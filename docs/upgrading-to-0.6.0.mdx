@@ -91,6 +91,8 @@ Until 1.0, minor releases can change behaviour directly. These changes have no w
 | `save_trace`, `save_tool_call`, `touch_progress` | Returned no value | Trace and tool writes return their row id as `str`; progress returns `bool` | Update custom-store signatures and return-value checks. Callers that ignore the return need no change. |
 | `heartbeat()` and `aheartbeat()` | Logged every store failure and never raised | `aheartbeat()` can raise a `RuntimeError` when the claim is stale. `heartbeat()` remembers a fence found in the background and raises it from the next heartbeat or step boundary; repeated lease-renewal failures instead raise `PersistenceError` with `code="lease_lost"` | Let the error end the tool; do not catch and continue or retry its side effects. The runner normally returns the current durable outcome after a fence; read it before deciding what to do next. See [Fencing and heartbeats](/docs/reference/errors#fencing-and-heartbeats). Other heartbeat write failures are still only logged. |
 | MCP `transport_detail` | Held redacted transport exception text | Contains the fixed diagnostic `mcp_transport_failed count=1`, or `None` | Stop parsing transport exception text. Handle typed errors and allow an absent detail. |
+| `mark_lease_expired(batch_size=...)` | Accepted batches up to 100,000 | Rejects batches above 1,000 with `ValueError` before issuing SQL | Split larger scans into pages of at most 1,000. |
+| `EventFeed(state_store)` | Could fail later when reader methods were used | Immediately raises an actionable `TypeError` | Construct `EventFeed(RunStore(state_store))` and close the reader before disposing its engine. |
 
 ## Store classes: `SQLAlchemyStateStore` is removed
 
