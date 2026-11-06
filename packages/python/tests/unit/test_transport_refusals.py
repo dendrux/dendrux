@@ -351,14 +351,17 @@ async def test_cancel_during_close_preserves_cancellation() -> None:
     install(p, lambda _: response)
     task = asyncio.create_task(p.complete(MESSAGES))
     try:
-        await closing.wait()
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        with pytest.raises(ProviderResponseError) as caught:
-            await response.aread()
-        assert_private(caught.value)
+        async with asyncio.timeout(5):
+            await closing.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            with pytest.raises(ProviderResponseError) as caught:
+                await response.aread()
+            assert_private(caught.value)
     finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
         await p.close()
 
 
