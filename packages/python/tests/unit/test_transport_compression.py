@@ -149,10 +149,13 @@ async def test_real_compressed_bodies_keep_padding_and_large_payloads(
 
 
 @pytest.mark.parametrize("encoding", ["gzip", "deflate", "raw-deflate"])
-async def test_incompressible_body_at_decoded_limit_is_accepted(encoding: str) -> None:
-    payload = random.Random(1).randbytes(10 * 64 * 1024)
+@pytest.mark.parametrize("size", [10 * 64 * 1024, 16 * 1024 * 1024])
+async def test_incompressible_body_at_decoded_limit_is_accepted(encoding: str, size: int) -> None:
+    payload = random.Random(1).randbytes(size)
     encoded = compressed(payload, encoding)
     assert len(encoded) > len(payload)
+    if size == 16 * 1024 * 1024:
+        assert 1024 < len(encoded) - size <= size // 100
     body = ObservedBody([encoded])
     p = provider("openai", limit=len(payload))
     install(

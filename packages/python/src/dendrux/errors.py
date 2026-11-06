@@ -1015,7 +1015,7 @@ class ProviderResponseError(ProviderError):
     """A provider response cannot be accepted within the local response contract."""
 
     default_category = "rejected"
-    default_message = "Response exceeds the local response contract."
+    default_message = "Response refused by the local response contract."
 
 
 class ProviderStreamIncompleteError(ProviderError):

@@ -268,9 +268,14 @@ the deployment order and rollback rules.
   Streaming image failures release request holders and SDK streams from traceback
   locals on failure paths. Provider retry telemetry omits SQL statements and
   parameters from database errors.
-- Bound decoded non-streaming responses before SDK parsing (`max_response_bytes`,
-  default 16 MiB). `max_stream_bytes` also limits each SSE event's wire size, so low
-  custom limits may reject repeated final response envelopes. Compressed responses
+- Bound non-streaming responses before SDK parsing (`max_response_bytes`, default
+  16 MiB). `max_stream_bytes` also limits each decoded SSE event, so low custom
+  limits may reject repeated final response envelopes. Both bounds count decoded
+  bytes and bytes after a compressed end marker. Compressed wire bytes have an
+  additional bound with a small overhead allowance: the greater of 1 KiB or 1% of
+  the configured limit, rounded down to whole bytes. Streaming wire accounting
+  resets at decoded SSE event boundaries. Heavy padding or frequent compression
+  flushes can cause refusal even below the decoded limit. Compressed responses
   accept gzip/deflate; unsupported or stacked encodings raise `response_encoding_unsupported`.
 - OpenRouter tool-call warnings identify the adapter and selected model. OpenAI
   Responses omits prompt cache keys and retention for non-OpenAI endpoints.

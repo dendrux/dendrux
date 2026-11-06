@@ -1,8 +1,13 @@
 """Request-local response policies, before SDK parsing or rendering.
 
-No over-limit decoded body/event reaches an SDK consumer. Decoder output and
-lookahead are bounded; refusal stops further upstream pulls. This cannot undo
-allocations a custom transport made before returning a chunk or cached body.
+Decoded body/event bytes and bytes after a compressed end marker count toward
+the configured limit. Compressed wire bytes have an additional bound: the limit
+plus a small overhead allowance of the greater of 1 KiB or 1% (rounded down to
+whole bytes). Streaming wire accounting resets at decoded SSE event boundaries.
+A compressed response can therefore be refused even below the decoded limit.
+Decoder output and lookahead are bounded; refusal stops further upstream pulls.
+This cannot undo allocations a custom transport made before returning a chunk
+or cached body.
 Unread streaming error bodies may be closed and retried by the SDK. A known
 refusal is terminal across status, cached-body and raw/decoded read surfaces.
 """

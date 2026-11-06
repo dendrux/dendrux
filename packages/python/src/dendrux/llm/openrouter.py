@@ -371,7 +371,11 @@ class OpenRouterProvider(OpenAIProvider):
                 (``plugins=[{"id": "context-compression", "enabled": False}]``)
                 so OpenRouter never drops mid-prompt messages; a ``plugins``
                 entry of your own replaces that default entirely.
-            max_response_bytes: Maximum decoded non-streaming body bytes (default 16 MiB).
+            max_response_bytes: Non-streaming body budget (default 16 MiB). Counts
+                decoded bytes and bytes after a compressed end marker. Compressed
+                wire bytes are also bounded, with a small overhead allowance of
+                the greater of 1 KiB or 1% of the limit (rounded down). A response
+                can be refused even when its decoded body fits the limit.
             **kwargs: Passed through to :class:`OpenAIProvider` (max_tokens,
                 temperature, timeout, max_retries, ...).
         """
