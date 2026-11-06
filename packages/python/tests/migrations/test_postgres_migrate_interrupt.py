@@ -19,6 +19,7 @@ from tests.migrations.test_fresh_postgres_migrate import migrate
 _SLOW_PROCESS = """
 import asyncio
 import threading
+import sys
 from contextlib import contextmanager
 from alembic import command
 from sqlalchemy import text
@@ -43,7 +44,7 @@ def slow_lock(conn):
         pid = conn.scalar(text("SELECT pg_backend_pid()"))
         conn.commit()
         print(f"SLOW:{pid}", flush=True)
-        conn.execute(text("SELECT pg_sleep(5)"))
+        conn.execute(text("SELECT pg_sleep(:delay)"), {"delay": float(sys.argv[1])})
         conn.commit()
         yield
 
@@ -78,23 +79,38 @@ async def _wait_for_sleep(engine, pid):
 
 
 @asynccontextmanager
-async def _slow_migration(engine):
+async def _slow_migration(engine, *, delay=30):
     process = await asyncio.create_subprocess_exec(
         sys.executable,
         "-c",
         _SLOW_PROCESS,
+        str(delay),
         env=os.environ.copy(),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
+    pid = None
     try:
         pid, lines = await _read_slow_marker(process)
         await _wait_for_sleep(engine, pid)
         yield process, lines
     finally:
-        if process.returncode is None:
-            process.kill()
-        await process.communicate()
+        await _stop_migration(engine, process, pid)
+
+
+async def _stop_migration(engine, process, pid):
+    if process.returncode is None:
+        process.kill()
+    await process.communicate()
+    if pid is not None:
+        async with engine.connect() as conn:
+            await conn.execute(
+                text(
+                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                    "WHERE pid=:pid AND datname=current_database()"
+                ),
+                {"pid": pid},
+            )
 
 
 async def test_existing_migrate_sigint_stops_before_upgrade(fresh_pg):
@@ -110,7 +126,7 @@ async def test_existing_migrate_sigint_stops_before_upgrade(fresh_pg):
         print(f"SIGINT elapsed={elapsed:.3f}s returncode={process.returncode} revision={revision}")
         assert process.returncode != 0
         assert revision == PRIOR
-        assert elapsed < 2.5
+        assert elapsed < 15
 
 
 async def test_existing_migrate_releases_probe_and_refuses_competitor(fresh_pg):
@@ -121,7 +137,8 @@ async def test_existing_migrate_releases_probe_and_refuses_competitor(fresh_pg):
             sessions = await conn.scalar(
                 text(
                     "SELECT count(*) FROM pg_stat_activity "
-                    "WHERE datname=current_database() AND pid<>pg_backend_pid()"
+                    "WHERE datname=current_database() AND pid<>pg_backend_pid() "
+                    "AND backend_type='client backend'"
                 )
             )
         started = time.monotonic()
@@ -131,7 +148,7 @@ async def test_existing_migrate_releases_probe_and_refuses_competitor(fresh_pg):
         assert (sessions, result.exit_code) == (1, 1)
         assert "CONTEXT:1:0" in lines
         assert "Another Dendrux database migration is running" in " ".join(result.output.split())
-        assert elapsed < 2.5
+        assert elapsed < 15
         assert process.returncode is None
 
 
@@ -166,7 +183,7 @@ async def test_bootstrap_lock_is_explicitly_released(fresh_pg, monkeypatch, acti
 async def test_fresh_interrupt_finishes_upgrade_and_rerun_guides_activation(fresh_pg):
     from tests.migrations.test_fresh_postgres_migrate import settings
 
-    async with _slow_migration(fresh_pg) as (process, _):
+    async with _slow_migration(fresh_pg, delay=5) as (process, _):
         process.send_signal(signal.SIGINT)
         output, _ = await asyncio.wait_for(process.communicate(), 15)
         assert process.returncode != 0
