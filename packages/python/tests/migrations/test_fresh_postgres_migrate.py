@@ -258,3 +258,15 @@ async def test_status_read_failure_does_not_fail_migration(fresh_pg, monkeypatch
     assert "Could not read database status. Run `dendrux db status`." in result.output
     assert "Migrations complete" in result.output and "Migration failed" not in result.output
     assert "sentinel" not in result.output
+
+
+async def test_percent_encoded_password_reaches_fresh_bootstrap(fresh_pg, monkeypatch):
+    password = fresh_pg.url.password
+    if not password:
+        pytest.skip("the selected PostgreSQL URL has no password to encode")
+    encoded = "".join(f"%{byte:02X}" for byte in password.encode("utf-8"))
+    url = render(fresh_pg.url.set(password="password_placeholder"))
+    monkeypatch.setenv("DENDRUX_DATABASE_URL", url.replace("password_placeholder", encoded))
+    result = await migrate()
+    assert result.exit_code == 0, result.output
+    await assert_active(fresh_pg)
