@@ -18093,8 +18093,8 @@
  },
  "src/dendrux/runtime/stores/sql/base.py::_UpdatedRows.scalar_one_or_none": {
   "complexity": 3,
-  "coverage": 0.75,
-  "crap": 3.14,
+  "coverage": 0.5,
+  "crap": 4.12,
   "digest": "ba68ddd79cc5"
  },
  "src/dendrux/runtime/stores/sql/base.py::_check_create_identifiers": {
