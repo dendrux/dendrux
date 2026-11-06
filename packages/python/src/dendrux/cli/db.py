@@ -13,7 +13,9 @@ from dendrux._redact import mask_database_url, mask_database_urls_in
 from dendrux.db._activate import ACTIVATION_BATCH_SIZE
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Callable, Iterable
+
+    from sqlalchemy.ext.asyncio import AsyncConnection
 
 app = typer.Typer(name="db", help="Database management commands.", no_args_is_help=True)
 console = Console()
@@ -86,6 +88,7 @@ def _maintenance_engine(url: str) -> Any:
 def migrate() -> None:
     """Run database migrations (alembic upgrade head).
 
+    New PostgreSQL databases are activated for format-2 writes.
     On MySQL/MariaDB an empty database is bootstrapped straight to the current schema
     (an interrupted bootstrap resumes); a database holding anything else is refused.
     Set DENDRUX_DATABASE_URL to override the default SQLite path.
@@ -100,12 +103,91 @@ def migrate() -> None:
 
     console.print("[bold]Running migrations...[/bold]")
     try:
-        command.upgrade(alembic_cfg, "head")
+        _upgrade_database(alembic_cfg, command.upgrade)
     except Exception as e:
         console.print(f"[red]Migration failed:[/red] {mask_database_urls_in(str(e))}")
         raise typer.Exit(1) from e
 
     console.print("[green]✓[/green] Migrations complete.")
+
+
+def _upgrade_database(config: Any, upgrade: Callable[..., Any]) -> None:
+    from sqlalchemy.engine import make_url
+
+    url = config.get_main_option("sqlalchemy.url")
+    if make_url(url).get_backend_name() == "postgresql":
+        asyncio.run(_migrate_postgres(url, config, upgrade))
+    else:
+        upgrade(config, "head")
+
+
+# Coordinate the CLI's separate migration and activation sessions. Their existing
+# advisory lock cannot also be held here: each operation acquires it on its own session.
+_POSTGRES_BOOTSTRAP_LOCK = 0x44454E44525842
+_POSTGRES_BOOTSTRAP_WAIT_SECONDS = 30.0
+
+
+async def _lock_postgres_bootstrap(conn: AsyncConnection) -> None:
+    from time import monotonic
+
+    from sqlalchemy import text
+
+    deadline = monotonic() + _POSTGRES_BOOTSTRAP_WAIT_SECONDS
+    while True:
+        acquired = await conn.scalar(
+            text("SELECT pg_try_advisory_lock(:key)"), {"key": _POSTGRES_BOOTSTRAP_LOCK}
+        )
+        await conn.commit()  # Never retain a waiting snapshot across concurrent index builds.
+        if acquired:
+            return
+        if monotonic() >= deadline:
+            raise RuntimeError("Another dendrux db migrate is running; retry when it finishes.")
+        await asyncio.sleep(0.1)
+
+
+async def _fresh_postgres(conn: AsyncConnection) -> bool:
+    from sqlalchemy import inspect
+
+    from dendrux.db.models import Base
+
+    names = ("alembic_version", *Base.metadata.tables)
+    return not await conn.run_sync(lambda c: any(inspect(c).has_table(name) for name in names))
+
+
+async def _migrate_postgres(url: str, config: Any, upgrade: Callable[..., Any]) -> None:
+    engine = _maintenance_engine(url)
+    try:
+        async with engine.connect() as conn:
+            await _lock_postgres_bootstrap(conn)
+            fresh = await _fresh_postgres(conn)
+            await conn.commit()
+            await asyncio.to_thread(upgrade, config, "head")
+            if fresh:
+                await _activate_fresh_postgres(url)
+            await _postgres_activation_guidance(url)
+        # NullPool closes the dedicated session, releasing the CLI coordination lock.
+    finally:
+        await engine.dispose()
+
+
+async def _activate_fresh_postgres(url: str) -> None:
+    try:
+        await _activate_database(url, ACTIVATION_BATCH_SIZE, False)
+    except Exception:
+        # Activation driver errors may include SQL parameters as well as credentials.
+        raise RuntimeError(
+            "PostgreSQL activation failed. Run `dendrux db activate` once every worker "
+            "and reader is upgraded."
+        ) from None
+
+
+async def _postgres_activation_guidance(url: str) -> None:
+    _, storage_format, _, _ = await _read_activation_status(url)
+    if storage_format == "1":
+        console.print(
+            "Run `dendrux db activate` once every worker and reader is upgraded.",
+            markup=False,
+        )
 
 
 @app.command()
