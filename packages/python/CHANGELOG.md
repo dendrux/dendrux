@@ -277,6 +277,12 @@ the deployment order and rollback rules.
   resets at decoded SSE event boundaries. Heavy padding or frequent compression
   flushes can cause refusal even below the decoded limit. Compressed responses
   accept gzip/deflate; unsupported or stacked encodings raise `response_encoding_unsupported`.
+- Keep provider response limits terminal across SDK status handling, cached bodies and
+  raw or decoded reads, on current and older supported SDKs, with bounded decompression
+  and client copies that keep the same limits.
+- Limit OpenRouter model-catalog responses to 32 MiB before parsing. An oversized catalog
+  raises a typed error from `list_models()` and uses the existing warning path during
+  native-tool checks.
 - OpenRouter tool-call warnings identify the adapter and selected model. OpenAI
   Responses omits prompt cache keys and retention for non-OpenAI endpoints.
   Non-streaming socket read timeouts report `timeout_reason=None`; `call_deadline`
