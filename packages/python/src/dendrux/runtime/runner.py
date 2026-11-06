@@ -1174,10 +1174,14 @@ def _in_memory_pending(result: RunResult) -> Any:
 
 async def _recovery_info(store: StateStore, record: Any, *, best_effort: bool = True) -> Any:
     """Project recovery strictly for reads, or best effort after a durable outcome."""
-    from dendrux.types import RecoveryInfo
-
     if record is None or not getattr(record, "reclaim_attempts", 0):
         return None
+    return await _read_recovery_info(store, record, best_effort=best_effort)
+
+
+async def _read_recovery_info(store: StateStore, record: Any, *, best_effort: bool) -> Any:
+    from dendrux.types import RecoveryInfo
+
     try:
         ids, truncated = await store.get_replayed_tool_calls(
             record.id, limit=_CONTROL_EVENT_LIMIT, tenant_id=record.tenant_id
@@ -1193,18 +1197,22 @@ async def _recovery_info(store: StateStore, record: Any, *, best_effort: bool = 
 async def _attach_persisted_pending(store: StateStore, result: RunResult, record: Any) -> RunResult:
     result.recovery = await _recovery_info(store, record)
     if result.status in _PAUSE_STATUSES and record is not None:
-        from dendrux.runtime._pending import _PendingReader
-
-        result.pending = None
-        result.pause_id = None
-        try:
-            result.pending = await _PendingReader(store).get_pending(
-                result.run_id, tenant_id=getattr(record, "tenant_id", None)
-            )
-        except Exception:
-            _codes.log_code(logger, _codes.RESULT_READ_FAILED, run_id=result.run_id)
-        result.pause_id = result.pending.pause_id if result.pending else None
+        await _load_persisted_pending(store, result, record)
     return result
+
+
+async def _load_persisted_pending(store: StateStore, result: RunResult, record: Any) -> None:
+    from dendrux.runtime._pending import _PendingReader
+
+    result.pending = None
+    result.pause_id = None
+    try:
+        result.pending = await _PendingReader(store).get_pending(
+            result.run_id, tenant_id=getattr(record, "tenant_id", None)
+        )
+    except Exception:
+        _codes.log_code(logger, _codes.RESULT_READ_FAILED, run_id=result.run_id)
+    result.pause_id = result.pending.pause_id if result.pending else None
 
 
 async def _committed_pause_result(
@@ -6249,6 +6257,10 @@ async def _try_resume_release(
     return await _released_resume_status(store, run_id)
 
 
+def _resume_release_supported(store: StateStore, status: str) -> bool:
+    return status == RunStatus.RUNNING.value or _release_supported(store)
+
+
 async def _handle_resume_failure(
     store: StateStore,
     run_id: str,
@@ -6258,9 +6270,7 @@ async def _handle_resume_failure(
     progress: _ResumeProgress,
     meta: dict[str, Any],
 ) -> None:
-    if progress._can_release(ctx, exc) and (
-        status == RunStatus.RUNNING.value or _release_supported(store)
-    ):
+    if progress._can_release(ctx, exc) and _resume_release_supported(store, status):
         await _try_resume_release(store, run_id, status, ctx, exc)
         return
     _attach_run_error_meta(exc, run_id, meta)
@@ -6667,9 +6677,20 @@ async def _stream_resume_failure(
         store is not None
         and progress is not None
         and progress._can_release(err_ctx, exc)
-        and (_shared["expected_status"] == RunStatus.RUNNING.value or _release_supported(store))
+        and _resume_release_supported(store, _shared["expected_status"])
     ):
         return await _try_resume_release(store, run_id, _shared["expected_status"], err_ctx, exc)
+    return await _finish_stream_resume_failure(_shared, store, err_ctx, extra_notifier, run_id, exc)
+
+
+async def _finish_stream_resume_failure(
+    _shared: dict[str, Any],
+    store: StateStore | None,
+    err_ctx: _ResumeContext | None,
+    extra_notifier: LoopNotifier | None,
+    run_id: str,
+    exc: Exception,
+) -> RunStatus:
     if store is not None and _stream_resume_started(_shared):
         await _persist_run_failure(store, run_id, exc, safe_event=True)
     try:
