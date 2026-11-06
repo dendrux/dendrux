@@ -614,3 +614,18 @@ async def test_large_accepted_event_keeps_sdk_chunk_count_bounded(
         assert body.closes == 1
     finally:
         await p.close()
+
+
+async def test_refused_cached_response_releases_materialized_body() -> None:
+    p = provider("openai", limit=1024)
+    response = httpx.Response(200, content=SENTINEL.encode() + b"x" * 2048)
+    assert SENTINEL in response.text
+    assert "_content" in response.__dict__ and "_text" in response.__dict__
+    install(p, lambda _: response)
+    try:
+        with pytest.raises(ProviderResponseError):
+            await p.complete(MESSAGES)
+        assert "_content" not in response.__dict__
+        assert "_text" not in response.__dict__
+    finally:
+        await p.close()
