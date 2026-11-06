@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -13,7 +14,7 @@ from dendrux._redact import mask_database_url, mask_database_urls_in
 from dendrux.db._activate import ACTIVATION_BATCH_SIZE
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable
+    from collections.abc import AsyncIterator, Callable, Iterable
 
     from sqlalchemy.ext.asyncio import AsyncConnection
 
@@ -116,7 +117,7 @@ def _upgrade_database(config: Any, upgrade: Callable[..., Any]) -> None:
 
     url = config.get_main_option("sqlalchemy.url")
     if make_url(url).get_backend_name() == "postgresql":
-        asyncio.run(_migrate_postgres(url, config, upgrade))
+        _upgrade_postgres(url, config, upgrade)
     else:
         upgrade(config, "head")
 
@@ -154,20 +155,44 @@ async def _fresh_postgres(conn: AsyncConnection) -> bool:
     return not await conn.run_sync(lambda c: any(inspect(c).has_table(name) for name in names))
 
 
-async def _migrate_postgres(url: str, config: Any, upgrade: Callable[..., Any]) -> None:
+def _upgrade_postgres(url: str, config: Any, upgrade: Callable[..., Any]) -> None:
+    if not asyncio.run(_migrate_postgres(url, config, upgrade)):
+        # The probe has closed: preserve Alembic's main-thread signal handling.
+        upgrade(config, "head")
+    asyncio.run(_postgres_activation_guidance(url))
+
+
+@asynccontextmanager
+async def _postgres_bootstrap_probe(url: str) -> AsyncIterator[AsyncConnection]:
     engine = _maintenance_engine(url)
     try:
         async with engine.connect() as conn:
             await _lock_postgres_bootstrap(conn)
-            fresh = await _fresh_postgres(conn)
-            await conn.commit()
-            await asyncio.to_thread(upgrade, config, "head")
-            if fresh:
-                await _activate_fresh_postgres(url)
-            await _postgres_activation_guidance(url)
-        # NullPool closes the dedicated session, releasing the CLI coordination lock.
+            try:
+                yield conn
+            finally:
+                await _unlock_postgres_bootstrap(conn)
     finally:
         await engine.dispose()
+
+
+async def _unlock_postgres_bootstrap(conn: AsyncConnection) -> None:
+    from sqlalchemy import text
+
+    await conn.rollback()
+    await conn.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": _POSTGRES_BOOTSTRAP_LOCK})
+    await conn.commit()
+
+
+async def _migrate_postgres(url: str, config: Any, upgrade: Callable[..., Any]) -> bool:
+    async with _postgres_bootstrap_probe(url) as conn:
+        fresh = await _fresh_postgres(conn)
+        await conn.commit()
+        if not fresh:
+            return False
+        await asyncio.to_thread(upgrade, config, "head")
+        await _activate_fresh_postgres(url)
+        return True
 
 
 async def _activate_fresh_postgres(url: str) -> None:

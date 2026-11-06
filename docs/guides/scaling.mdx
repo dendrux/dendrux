@@ -99,7 +99,7 @@ Pass these as `database_options=` (or as keyword arguments to `create_async_engi
 
 ## Migrations: one job, direct connection
 
-Run `dendrux db migrate` **once per deploy, as a single job**, over a **direct** Postgres connection (not through PgBouncer, and not from every pod at startup). Run it before starting the new workers. Concurrent CLI migration jobs serialize through schema creation and activation, waiting up to 30 seconds for the CLI lock before failing with a retry message. Alembic and explicit activation still refuse a competing maintenance operation.
+Run `dendrux db migrate` **once per deploy, as a single job**, over a **direct** Postgres connection (not through PgBouncer, and not from every pod at startup). Run it before starting the new workers. On an existing database, a second migration runner refuses at once through the migration lock. Only while a fresh bootstrap is in flight do CLI migrators wait, for up to 30 seconds, through schema creation and activation. Alembic and explicit activation still refuse a competing maintenance operation.
 
 - The migration uses session-level locks and `lock_timeout` settings, which is why it needs a direct session connection.
 - Short exclusive steps wait at most 5 seconds for each lock and then fail with a retry message. Finish the long-running transaction that blocked it and run the job again. The index builds run concurrently and a timed-out build is repaired on the retry. The 5 second budget is fixed; schedule the job in a quiet window.
