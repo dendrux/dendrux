@@ -12,6 +12,10 @@ the deployment order and rollback rules.
 
 ### Breaking changes
 
+- Require `anthropic>=0.77.0,<1.0` and `openai>=1.97.2,<3.0` in provider extras.
+  Older SDKs lack the required Responses API stream handling and Anthropic
+  thinking/structured-output support. Users pinning older SDKs must update their
+  pins and reinstall the matching extras before upgrading.
 - Change the defaults to `strict_tenancy=True`, `on_governance_change="raise"`
   and `Budget.count_cache_tokens=True`. Until 1.0, new defaults may change behaviour
   directly in a minor release. Strict tenancy applies to the effective store,

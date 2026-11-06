@@ -11,6 +11,8 @@ description: Migrate, roll every worker and reader, activate format 2, then enab
 
 New PostgreSQL databases come up active at format 2 after `dendrux db migrate`. Here, new means there is no `alembic_version` table and none of Dendrux's tables before migration; unrelated application tables are allowed. Existing databases need the activate step below, even with zero runs or when already at the current revision.
 
+> **Provider SDKs.** Provider extras now require `anthropic>=0.77.0,<1.0` and `openai>=1.97.2,<3.0`. Older SDKs lack the required Responses API stream handling and Anthropic thinking/structured-output support. If you pin older SDKs, update those pins and reinstall the matching extras before upgrading to 0.6.0.
+
 ## Upgrade in order
 
 1. **Migrate.** Install `dendrux[postgres]==0.6.0` in the migration job environment. Back up the database, then run `dendrux db migrate` once over a direct Postgres connection, before starting 0.6 workers. From the 0.5 head `e8f9a0b1c2d3`, revision `f9a0b1c2d3e4` adds recovery columns and `dendrux_settings`. It leaves the global storage format at `1` and does not build the new unique indexes. Older workers can keep working during this additive step. If upgrading from an earlier release, complete the [0.5 upgrade](/docs/upgrading-to-0.5.0) first.

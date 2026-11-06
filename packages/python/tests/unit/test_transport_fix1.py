@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any
 import httpx
 import pytest
 
-from dendrux.errors import ProviderResponseError, ProviderTimeoutError, ProviderUnavailableError
+from dendrux.errors import ProviderResponseError, ProviderTimeoutError
 from dendrux.llm._transport import _Budget, deferred_client_type
 from dendrux.llm.openai_responses import OpenAIResponsesProvider
 from dendrux.types import Message, Role
@@ -58,21 +58,9 @@ async def test_p1_1_partial_body_transport_error_retries(
 
     install(p, respond)
     try:
-        # OpenAI 1.50.0 checks retries_taken rather than remaining_retries for
-        # non-timeout send errors. Preserve that SDK's native first-attempt failure.
-        legacy_connection_error = (
-            family == "openai"
-            and importlib.import_module("openai").__version__ == "1.50.0"
-            and error_type is not httpx.ReadTimeout
-        )
-        if legacy_connection_error:
-            with pytest.raises(ProviderUnavailableError):
-                await p.complete(MESSAGES)
-            assert requests == 1
-        else:
-            result = await p.complete(MESSAGES)
-            assert result.text == "x" * 32
-            assert requests == 2
+        result = await p.complete(MESSAGES)
+        assert result.text == "x" * 32
+        assert requests == 2
         assert all(body.closed for body in bodies)
     finally:
         await p.close()
@@ -368,9 +356,6 @@ async def test_p1_3_allowed_encodings_parse_normally(family: str, encoding: str)
 @pytest.mark.parametrize("limit", [1024, 8192])
 async def test_p2_responses_completed_envelope_counts_in_wire_limit(limit: int) -> None:
     p = OpenAIResponsesProvider(model="test-model", api_key="test-key", max_stream_bytes=limit)
-    if not hasattr(p._client, "responses"):
-        await p.close()
-        pytest.skip("This SDK predates the Responses endpoint; Chat transport is tested separately")
     response = {
         "id": "r",
         "object": "response",

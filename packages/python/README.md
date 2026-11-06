@@ -13,6 +13,8 @@ pip install "dendrux[openai]"           # OpenAI + core runtime
 pip install "dendrux[mcp]"              # Managed MCP client runtime
 ```
 
+Provider extras require `anthropic>=0.77.0,<1.0` and `openai>=1.97.2,<3.0`. The `openrouter` extra uses the OpenAI requirement; `all` includes both.
+
 ## Quick Example
 
 ```python

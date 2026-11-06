@@ -44,6 +44,13 @@ upgrade is a deliberate change with checks on the supported Python/SQLAlchemy ma
 baseline decreases are stamped only by the coordinator. Never restamp a baseline to hide
 a regression.
 
+Provider SDK floors are Anthropic `0.77.0` and OpenAI `1.97.2`, with upper bounds `<1.0`
+and `<3.0`. `openrouter` inherits the OpenAI extra and `all` includes both SDKs.
+When changing these floors, run the transport and provider tests at the proposed
+versions, their preceding releases, installed versions and the newer SDK overlay.
+Use isolated pip target directories so the shared development environment stays
+unchanged.
+
 | Target | Script | Fails when |
 |---|---|---|
 | `make cognitive` | `tools/cognitive_ratchet.py` | A new function scores above 15 (complexipy cognitive complexity), or a function already above 15 scores higher. Baseline: `cognitive_baseline.json` (only functions above 15 are recorded; overloads and setters of one name count at their worst). |

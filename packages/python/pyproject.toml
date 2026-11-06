@@ -42,8 +42,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-anthropic = ["anthropic>=0.40,<1.0"]
-openai = ["openai>=1.50,<3.0"]
+anthropic = ["anthropic>=0.77.0,<1.0"]
+openai = ["openai>=1.97.2,<3.0"]
 # OpenRouter rides the OpenAI-compatible transport — alias for discoverability.
 openrouter = ["dendrux[openai]"]
 # `db` is kept as an empty alias for backwards compatibility with anyone
