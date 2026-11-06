@@ -193,10 +193,10 @@
   "digest": "cb7805c6f658"
  },
  "src/dendrux/agent.py::Agent._cancel_one": {
-  "complexity": 4,
-  "coverage": 0.875,
-  "crap": 4.03,
-  "digest": "b0e14f435a61"
+  "complexity": 5,
+  "coverage": 0.9259,
+  "crap": 5.01,
+  "digest": "f30102b6effe"
  },
  "src/dendrux/agent.py::Agent._configure_images": {
   "complexity": 6,
@@ -6143,10 +6143,10 @@
   "digest": "2fde00be0312"
  },
  "src/dendrux/loops/react.py::_blocked_data": {
-  "complexity": 2,
+  "complexity": 3,
   "coverage": 1.0,
-  "crap": 2.0,
-  "digest": "9655ae0defba"
+  "crap": 3.0,
+  "digest": "c07196a6153e"
  },
  "src/dendrux/loops/react.py::_budget_cancel_result": {
   "complexity": 1,
