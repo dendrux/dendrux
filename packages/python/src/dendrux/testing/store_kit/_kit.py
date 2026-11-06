@@ -204,15 +204,15 @@ class Kit:
             pytest.skip(f"{LIVE_FACTORY} not provided: live updates are not tested")
         updates = RecordingLiveUpdates()
         store = await maybe_await(factory(updates))
-        reader, independent = store, False
-        if self._provided.get(SECOND_INSTANCE) is not None:
-            try:
-                reader, independent = await self.second(store), True
-            except Exception:
-                if self.declaration.needs_second_instance:
-                    raise  # this store promised a second instance; failing to make one is a failure
-        updates.probe = lambda ids: _probe(reader, ids)
         try:
+            reader, independent = store, False
+            if self._provided.get(SECOND_INSTANCE) is not None:
+                try:
+                    reader, independent = await self.second(store), True
+                except Exception:
+                    if self.declaration.needs_second_instance:
+                        raise  # The declaration promises a second instance.
+            updates.probe = lambda ids: _probe(reader, ids)
             yield LiveStore(store, updates, reader, self, independent)
         finally:
             try:
