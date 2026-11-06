@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -179,9 +179,13 @@ async def _postgres_bootstrap_probe(url: str) -> AsyncIterator[AsyncConnection]:
 async def _unlock_postgres_bootstrap(conn: AsyncConnection) -> None:
     from sqlalchemy import text
 
-    await conn.rollback()
-    await conn.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": _POSTGRES_BOOTSTRAP_LOCK})
-    await conn.commit()
+    # Closing the dedicated session is the fallback; preserve the migration outcome.
+    with suppress(Exception):
+        await conn.rollback()
+        await conn.execute(
+            text("SELECT pg_advisory_unlock(:key)"), {"key": _POSTGRES_BOOTSTRAP_LOCK}
+        )
+        await conn.commit()
 
 
 async def _migrate_postgres(url: str, config: Any, upgrade: Callable[..., Any]) -> bool:

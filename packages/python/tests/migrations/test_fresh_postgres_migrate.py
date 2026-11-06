@@ -270,3 +270,75 @@ async def test_percent_encoded_password_reaches_fresh_bootstrap(fresh_pg, monkey
     result = await migrate()
     assert result.exit_code == 0, result.output
     await assert_active(fresh_pg)
+
+
+@pytest.mark.parametrize("outcome", ["success", "activation_failure", "upgrade_failure"])
+async def test_lost_bootstrap_session_preserves_migration_outcome(fresh_pg, monkeypatch, outcome):
+    from alembic import command
+
+    from dendrux.cli import db
+    from dendrux.db import _activate
+
+    unlock = db._unlock_postgres_bootstrap
+    upgrade = command.upgrade
+
+    async def lose_session_then_unlock(conn):
+        pid = await conn.scalar(text("SELECT pg_backend_pid()"))
+        await conn.commit()
+        driver = (await conn.get_raw_connection()).driver_connection
+        async with fresh_pg.connect() as killer:
+            terminated = await killer.scalar(
+                text(
+                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                    "WHERE pid=:pid AND datname=current_database()"
+                ),
+                {"pid": pid},
+            )
+        assert terminated is True
+        async with asyncio.timeout(5):
+            while not driver.is_closed():
+                await asyncio.sleep(0.01)
+        await unlock(conn)
+
+    async def fail_activation(*args, **kwargs):
+        raise RuntimeError("activation-detail-sentinel")
+
+    def fail_after_upgrade(*args, **kwargs):
+        upgrade(*args, **kwargs)
+        raise RuntimeError("original-upgrade-failure")
+
+    monkeypatch.setattr(db, "_unlock_postgres_bootstrap", lose_session_then_unlock)
+    if outcome == "activation_failure":
+        monkeypatch.setattr(_activate, "activate_database", fail_activation)
+    if outcome == "upgrade_failure":
+        monkeypatch.setattr(command, "upgrade", fail_after_upgrade)
+    result = await migrate()
+    if outcome == "success":
+        await assert_active(fresh_pg)
+        assert result.exit_code == 0, result.output
+    else:
+        assert result.exit_code == 1
+        assert await settings(fresh_pg) == {"storage_format": "1"}
+        expected = (
+            "PostgreSQL activation failed."
+            if outcome == "activation_failure"
+            else "original-upgrade-failure"
+        )
+        assert expected in result.output
+    assert "activation-detail-sentinel" not in result.output
+    assert "pg_advisory_unlock" not in result.output
+
+
+@pytest.mark.parametrize("error", [asyncio.CancelledError(), KeyboardInterrupt(), SystemExit()])
+async def test_unlock_preserves_base_exceptions(error):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from dendrux.cli import db
+
+    conn = SimpleNamespace(
+        rollback=AsyncMock(), execute=AsyncMock(side_effect=error), commit=AsyncMock()
+    )
+    with pytest.raises(type(error)) as caught:
+        await db._unlock_postgres_bootstrap(conn)
+    assert caught.value is error
