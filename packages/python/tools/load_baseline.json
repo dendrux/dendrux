@@ -3,16 +3,17 @@
   "scale": "quick",
   "workers": 2,
   "recorded": {
-    "date": "2026-10-31 10:52:07 +0530",
+    "date": "2026-11-06 17:40:05 +0530",
     "machine": "Darwin 25.6.0 arm64",
-    "cpu": "",
+    "cpu": "Apple M3 Pro",
     "cores": 11,
-    "memory_gb": null,
+    "memory_gb": 18.0,
     "python": "3.12.12",
     "sqlalchemy": "2.0.48",
     "asyncpg": "0.31.0",
-    "git_commit": "e8cea989"
+    "git_commit": "3d2a51ae"
   },
+  "backend": "postgresql",
   "postgres": {
     "version": "PostgreSQL 17.0 on x86_64-apple-darwin23.6.0, compiled by Apple clang version 16.0.0 (clang-1600.0.26.3), 64-bit",
     "shared_buffers": "128MB",
@@ -21,93 +22,94 @@
     "fsync": "on"
   },
   "gates": {
-    "a_notify_off.statements_per_run": 74.0,
-    "a_shared_agent.statements_per_run": 74.0,
-    "a_notify_on.statements_per_run": 83.0,
-    "iteration.notify_on_batch": 21,
-    "iteration.notify_on_stream": 21,
-    "iteration.notify_off_batch": 18,
-    "runs.statements_per_run": 42.0,
-    "kill_checkpoint.statements_per_run_including_recovery": 43.17,
-    "kill_inflight.statements_per_run_including_recovery": 43.07,
-    "followers_on.attach_statements_per_follower": 3.75,
-    "followers_off.attach_statements_per_follower": 3.73,
+    "a_live_off.statements_per_run": 75.15,
+    "a_shared_agent.statements_per_run": 75.26,
+    "a_live_on.statements_per_run": 75.14,
+    "iteration.live_on_batch": 19,
+    "iteration.live_on_stream": 19,
+    "iteration.live_off_batch": 19,
+    "iteration.live_off_stream": 19,
+    "runs.statements_per_run": 43.16,
+    "kill_checkpoint.statements_per_run_including_recovery": 44.34,
+    "kill_inflight.statements_per_run_including_recovery": 44.31,
+    "followers_on.attach_statements_per_follower": 3.36,
+    "followers_off.attach_statements_per_follower": 3.27,
     "cancel.statements_per_node": 3.028,
-    "history.resume_statements": 44
+    "history.resume_statements": 45
   },
   "informational": {
-    "a_notify_off": {
-      "runs_per_s": 47.92,
-      "statements_per_s": 3546.1,
+    "a_live_off": {
+      "runs_per_s": 39.81,
+      "statements_per_s": 2990.9,
       "latency_ms": {
         "n": 200,
-        "p50_ms": 3792.3,
-        "p95_ms": 4063.8,
-        "max_ms": 4098.3,
-        "mean_ms": 3669.5
+        "p50_ms": 4557.8,
+        "p95_ms": 4928.6,
+        "max_ms": 4968.7,
+        "mean_ms": 4455.2
       },
-      "wal_bytes_per_run": 59302
+      "wal_bytes_per_run": 59178
     },
     "a_shared_agent": {
-      "runs_per_s": 48.0,
-      "statements_per_s": 3552.2,
+      "runs_per_s": 39.29,
+      "statements_per_s": 2952.3,
       "latency_ms": {
         "n": 200,
-        "p50_ms": 3793.7,
-        "p95_ms": 4077.1,
-        "max_ms": 4118.4,
-        "mean_ms": 3677.5
+        "p50_ms": 4684.9,
+        "p95_ms": 4998.8,
+        "max_ms": 5027.3,
+        "mean_ms": 4546.3
       },
-      "wal_bytes_per_run": 59434
+      "wal_bytes_per_run": 58594
     },
-    "a_notify_on": {
-      "runs_per_s": 46.64,
-      "statements_per_s": 3871.5,
+    "a_live_on": {
+      "runs_per_s": 38.04,
+      "statements_per_s": 2857.9,
       "latency_ms": {
         "n": 200,
-        "p50_ms": 3861.0,
-        "p95_ms": 4169.1,
-        "max_ms": 4212.0,
-        "mean_ms": 3750.8
+        "p50_ms": 4826.6,
+        "p95_ms": 5139.5,
+        "max_ms": 5189.2,
+        "mean_ms": 4708.6
       },
-      "wal_bytes_per_run": 58713
+      "wal_bytes_per_run": 58780
     },
     "iteration": {},
     "runs": {
-      "runs_per_s": 75.23,
-      "statements_per_s": 3159.8,
+      "runs_per_s": 65.7,
+      "statements_per_s": 2835.9,
       "latency_ms": {
         "n": 200,
-        "p50_ms": 2373.3,
-        "p95_ms": 2575.4,
-        "max_ms": 2595.1,
-        "mean_ms": 2316.5
+        "p50_ms": 2754.3,
+        "p95_ms": 2960.1,
+        "max_ms": 2987.2,
+        "mean_ms": 2680.3
       },
-      "wal_bytes_per_run": 40248
+      "wal_bytes_per_run": 40223
     },
     "kill_checkpoint": {
-      "runs_per_s": 50.85,
-      "statements_per_s": 2092.5,
+      "runs_per_s": 57.49,
+      "statements_per_s": 2430.3,
       "latency_ms": {
         "n": 190,
-        "p50_ms": 3268.5,
-        "p95_ms": 3486.3,
-        "max_ms": 3535.7,
-        "mean_ms": 3168.2
+        "p50_ms": 2849.6,
+        "p95_ms": 3003.4,
+        "max_ms": 3033.8,
+        "mean_ms": 2759.9
       },
-      "wal_bytes_per_run": 41428
+      "wal_bytes_per_run": 41181
     },
     "kill_inflight": {
-      "runs_per_s": 56.1,
-      "statements_per_s": 2274.9,
+      "runs_per_s": 56.45,
+      "statements_per_s": 2353.5,
       "latency_ms": {
         "n": 190,
-        "p50_ms": 2891.1,
-        "p95_ms": 3067.3,
-        "max_ms": 3090.1,
-        "mean_ms": 2816.1
+        "p50_ms": 2883.2,
+        "p95_ms": 3058.1,
+        "max_ms": 3078.4,
+        "mean_ms": 2813.0
       },
-      "wal_bytes_per_run": 42919
+      "wal_bytes_per_run": 41056
     },
     "followers_on": {},
     "followers_off": {},

@@ -512,18 +512,143 @@ make load-mysql
 make load-mariadb
 ```
 
-`make load-quick` runs every scenario at small scale and fails on a statement-count regression against `tools/load_baseline.json` (Postgres only); `make load` is the full run. MySQL and MariaDB have no stored baseline, so the ceilings are declared before measuring: `tools/load_budgets_mysql.json` maps each gate to a number (`runs.statements_per_run` is 50; the 0.6 runs measured about 47). The targets use it by default; pass `LOAD_STATEMENT_BUDGETS=path` to use your own file. Results are written as JSON to `LOAD_JSON` (default: `dendrux-load-results.json` in your temporary directory) with a compact Markdown table. Workloads that need the Postgres live-update transport (the `notify` scenarios) are skipped on MySQL and MariaDB, with a note.
+`make load-quick` runs every scenario at small scale and fails on a statement-count regression against `tools/load_baseline.json` (Postgres only); `make load` is the full run. MySQL and MariaDB have no stored baseline, so the ceilings are declared before measuring: `tools/load_budgets_mysql.json` maps each gate to a number (`runs.statements_per_run` is 50; earlier 0.6 runs on those databases measured about 47). The targets use it by default; pass `LOAD_STATEMENT_BUDGETS=path` to use your own file. Results are written as JSON to `LOAD_JSON` (default: `dendrux-load-results.json` in your temporary directory) with a compact Markdown table. Workloads that need the Postgres live-update transport (the `notify` scenarios) are skipped on MySQL and MariaDB, with a note.
 
 ## Measured results
 
-> **Results pending.** The numbers from the 0.6 load run are not in this page yet. Until they are, this page makes no capacity claim: measure your own workload with the harness above. The headings below are where the results will go.
-
 ### Environment and workload
+
+Measured for the 0.6.0 release at commit `3d2a51ae` on 2026-11-06. The `runs` ranges below cover 4 cycles from `make load-pg`. The other results are from the last of the four cycles of `make load`.
+
+| Item | Setup |
+| --- | --- |
+| Machine | Apple M3 Pro, 11 cores, 18 GB RAM |
+| Database | PostgreSQL 17.0 on the same laptop, default tuning |
+| Durability | shared_buffers 128MB; fsync on; synchronous_commit on |
+| Runtime | Python 3.12.12, SQLAlchemy 2.0.48 |
+| Workers and write pools | 2 worker processes; 15 connections per worker, 30 total |
+
+The connection count covers write pools. Monitoring and live-update connections are extra. The laptop ran normal desktop software and was not a dedicated server. The provider is scripted with no model latency. These numbers measure the cost of Dendrux and the database, not a real agent's speed. This run used PostgreSQL only. MySQL and MariaDB were not part of this run.
 
 ### Write throughput and statement counts
 
+Scenario `runs` starts 1,000 runs together. Each run makes scripted model calls and finishes. Ranges are the lowest and highest cycle values, not a combined percentile.
+
+| Metric | Range across cycles |
+| --- | --- |
+| Throughput, runs/s | 60.22–63.62 |
+| Statements per run | 43.02–43.03 |
+| Run latency p50, s | 14.33–15.20 |
+| Run latency p95, s | 15.45–16.36 |
+| WAL per run, KiB | 40.0–40.4 |
+| Table growth per run, KiB | 20.0–20.6 |
+
+All 1,000 runs start at once on 30 connections. Latency here is mostly waiting for a connection. That is backpressure, not a failure. Each run asks for a connection about 23 times, and those waits add up to about 11 to 12 seconds of a typical 14 second run. Both worker processes also ran at full CPU, while the database spent most of its time waiting for them to send the next statement. This run does not measure what more workers would change. The `pool_acquisition` figures below show the range of each worker's sampled percentiles across the cycles. The peak covers every recorded acquisition, including those outside the retained sample window.
+
+| Pool acquisition metric | Measured value |
+| --- | --- |
+| Sampled acquisition p50, ms | 314.6–489.0 |
+| Sampled acquisition p95, ms | 1,802.9–1,952.8 |
+| Peak acquisition, ms | 7,946.1 |
+| Waits per cycle, both workers | 13,261–13,825 |
+| Acquisition attempts per cycle, both workers | 23,024–23,033 |
+
+Scenario `a_live_off` pauses for a client tool and then submits its result, with live updates off. It measured 200 runs.
+
+| Operation | Statements per run or operation |
+| --- | --- |
+| Whole pause-and-submit run | 75.12 |
+| Run to pause | 30.12 |
+| Submit and finish | 45.00 |
+
+The whole pause-and-submit run uses 27 percent more statements than it did in 0.5.0: 75 against 59.
+
+| Non-terminal iteration | Statements |
+| --- | --- |
+| live_on_batch | 19 |
+| live_on_stream | 19 |
+| live_off_batch | 19 |
+| live_off_stream | 19 |
+
+The near-16 MiB history resumed successfully in a new process:
+
+| History resume metric | Measured value |
+| --- | --- |
+| Stored history, MiB | 15.97 |
+| Resume statements | 45 |
+| Resume wall time, s | 0.76 |
+| Resume RSS growth, MiB | 86.8 |
+
+The separate `pool` scenario uses a pool of 10 connections with no overflow. With a 120 s pool timeout, 200 of 200 queued runs finish. With a 0.3 s timeout, 195 finish and 5 fail with a clear `PersistenceError`. No runs remain open after either variant.
+
 ### Follow latency and live-update cost
+
+Both `followers_on` and `followers_off` watch 1,000 runs with 10,000 followers. The idle window lasts 10 s.
+
+| Metric | followers_on | followers_off |
+| --- | --- | --- |
+| Attach statements per follower | 3.22 | 3.19 |
+| Idle statements/s | 1.4 | 6.7 |
+| Trickle lag p50, ms | 30.8 | 1,341.9 |
+| Trickle lag p95, ms | 88.8 | 2,101.9 |
+| Trickle lag max, ms | 103.6 | 3,132.2 |
+| Burst lag p50, ms | 1,692.9 | 1,739.4 |
+| Burst lag p95, ms | 5,155.2 | 5,111.2 |
+| Burst lag max, ms | 9,166.9 | 11,782.9 |
+| Streams not matching the database | 0 | 0 |
+
+Live updates cut quiet-time lag and idle polling. They do not help under a burst in this run: burst p50 and p95 are similar, and p95 is slightly higher with live updates. Both modes finish with all streams matching the database.
 
 ### Recovery and reclaim
 
+Each kill scenario starts 1,000 runs. Killing one process interrupts 50 runs. Sweep and reclaim finish all of them.
+
+The harness puts the interrupted runs in an extra process, then kills that process.
+
+| Metric | kill_checkpoint | kill_inflight |
+| --- | --- | --- |
+| Processes killed | 1 | 1 |
+| Runs interrupted | 50 | 50 |
+| Runs swept | 50 | 50 |
+| Runs reclaimed and finished | 50 | 50 |
+| Recovery wall time, s | 1.15 | 1.34 |
+| Recovery statements per reclaim, including sweep | 41.08 | 52.08 |
+| Extra model calls | 0 | 50 |
+| Final successful runs | 1,000 | 1,000 |
+| Final open runs | 0 | 0 |
+| Duplicate event indexes | 0 | 0 |
+
+There are exactly 0 extra model calls at a checkpoint kill and 50 for the 50 runs killed mid model call. A call in flight cannot be known to have finished. Developers should expect one repeated model call per run killed that way.
+
+Cancellation covers a tree of 2,000 nodes:
+
+| Cancellation workload | Wall time, s | Cancel statements per seeded node |
+| --- | --- | --- |
+| Alone | 10.50 | 3.010 |
+| With concurrent creators | 11.34 | 3.321 |
+
+Both variants mark every seeded node for cancellation. Statement counts cover cancellation; concurrent creators' own statements are separate.
+
+The `memory` scenario runs 50 cycles. After 5 warm-up cycles, its worker RSS slope is -0.075 MiB per cycle.
+
+| Resource | Measured growth |
+| --- | --- |
+| File descriptors growth across cycle endpoints | 0 |
+| Tasks growth across cycle endpoints | 0 |
+| Connections growth across cycle endpoints | 0 |
+
+These checks compare the start and end of each cycle, for the controlling process and for the long-lived worker in the memory scenario.
+
 ### Reproducing the run
+
+Run from `packages/python` with the development dependencies installed. Set `DENDRUX_LOAD_PG_URL` to your own private database ending in `_test`.
+
+> **Warning.** The harness drops and recreates the tables in that database.
+
+```bash
+export DENDRUX_LOAD_PG_URL=postgresql+asyncpg://user:password@localhost:5432/dendrux_load_test
+make load
+make load-pg
+```
+
+These numbers are one laptop run, not a capacity promise, so measure your own workload.

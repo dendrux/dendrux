@@ -3336,25 +3336,11 @@ def render(name: str, o: Outcome) -> list[str]:
     return lines
 
 
-def current_gate_name(key: str) -> str:
-    """Map a gate recorded before the live_* rename to its current name."""
-    for old, new in (("a_notify_", "a_live_"), ("iteration.notify_", "iteration.live_")):
-        if key.startswith(old):
-            return new + key[len(old) :]
-    return key
-
-
 def load_baseline(path: Path | None) -> dict[str, Any]:
-    """Read a baseline; gates recorded under the old ``notify_*`` names read as ``live_*``.
-
-    Drop the mapping once the committed baseline is re-stamped with the new names.
-    """
+    """Read a baseline using its recorded gate names."""
     if not (path and path.exists()):
         return {}
-    baseline = json.loads(path.read_text())
-    if isinstance(baseline.get("gates"), dict):
-        baseline["gates"] = {current_gate_name(k): v for k, v in baseline["gates"].items()}
-    return baseline
+    return json.loads(path.read_text())
 
 
 def compare_gates(

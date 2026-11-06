@@ -100,31 +100,19 @@ def test_baseline_comparison_fails_only_on_a_regression_over_twenty_percent():
     )[1]
 
 
-def test_baseline_gates_recorded_under_the_notify_names_are_read_under_the_live_names(tmp_path):
-    path = tmp_path / "old.json"
-    path.write_text(
-        json.dumps(
-            {
-                "scale": "quick",
-                "gates": {
-                    "a_notify_off.statements_per_run": 74.0,
-                    "a_notify_on.statements_per_run": 83.0,
-                    "a_shared_agent.statements_per_run": 74.0,
-                    "iteration.notify_on_stream": 21,
-                    "iteration.notify_off_batch": 18,
-                    "runs.statements_per_run": 42.0,
-                },
-            }
-        )
-    )
-    assert load.load_baseline(path)["gates"] == {
-        "a_live_off.statements_per_run": 74.0,
-        "a_live_on.statements_per_run": 83.0,
-        "a_shared_agent.statements_per_run": 74.0,
-        "iteration.live_on_stream": 21,
-        "iteration.live_off_batch": 18,
-        "runs.statements_per_run": 42.0,
+def test_baseline_gates_are_read_without_renaming(tmp_path):
+    path = tmp_path / "baseline.json"
+    baseline = {
+        "scale": "quick",
+        "gates": {
+            "a_notify_on.statements_per_run": 83.0,
+            "iteration.notify_off_batch": 18,
+            "a_live_on.statements_per_run": 76.0,
+            "iteration.live_off_batch": 19,
+        },
     }
+    path.write_text(json.dumps(baseline))
+    assert load.load_baseline(path) == baseline
     current = {"a_live_on.statements_per_run": 76.0, "iteration.live_off_batch": 19}
     rows, failed = load.compare_gates(current, load.load_baseline(path), scale="quick")
     assert not failed
@@ -132,7 +120,6 @@ def test_baseline_gates_recorded_under_the_notify_names_are_read_under_the_live_
 
 
 def test_committed_baseline_carries_the_gates_and_the_machine():
-    # load_baseline() reads a baseline recorded before the live_* rename under the new names
     baseline = load.load_baseline(PKG / "tools" / "load_baseline.json")
     assert baseline["scale"] == "quick"
     assert "iteration.live_on_batch" in baseline["gates"]
