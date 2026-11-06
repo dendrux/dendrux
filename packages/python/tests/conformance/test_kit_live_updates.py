@@ -376,3 +376,38 @@ async def test_a_store_that_announces_after_commit_passes_with_an_independent_re
 async def test_without_an_independent_reader_visibility_is_untested_not_passed(reader: str) -> None:
     outcomes = await run_visibility_contracts(early=True, reader=reader, needs_second=False)
     assert set(outcomes.values()) == {"skipped"}, outcomes
+
+
+@pytest.mark.parametrize("closer_raises", [False, True])
+async def test_required_second_failure_closes_store_and_recorder(monkeypatch, closer_raises):
+    from unittest.mock import AsyncMock
+
+    from dendrux.testing.store_kit import _kit
+    from dendrux.testing.store_kit._declaration import LIVE_FACTORY, SECOND_INSTANCE
+
+    original_error = RuntimeError("second instance failed")
+    close_error = RuntimeError("close failed")
+    updates = RecordingLiveUpdates()
+    close_updates = AsyncMock(wraps=updates.close)
+    monkeypatch.setattr(updates, "close", close_updates)
+    monkeypatch.setattr(_kit, "RecordingLiveUpdates", lambda: updates)
+    store = SimpleNamespace(close=AsyncMock(side_effect=close_error if closer_raises else None))
+    kit = _kit.Kit(
+        {
+            LIVE_FACTORY: lambda recorder: store,
+            SECOND_INSTANCE: AsyncMock(side_effect=original_error),
+        },
+        store,
+        SimpleNamespace(needs_second_instance=True),
+        needs_format_2=False,
+    )
+    with pytest.raises(RuntimeError) as caught:
+        async with kit.live_store():
+            pytest.fail("setup must fail")
+    store.close.assert_awaited_once()
+    close_updates.assert_awaited_once()
+    if closer_raises:
+        assert caught.value is close_error
+        assert caught.value.__context__ is original_error
+    else:
+        assert caught.value is original_error

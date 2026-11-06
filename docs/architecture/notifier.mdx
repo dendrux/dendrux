@@ -212,7 +212,7 @@ It overrides every hook. `on_run_started` prints a `▶ run` line with the short
 
 `CompositeNotifier` fans a single set of callbacks out to a list of inner notifiers. If you want both terminal output and a metrics sink, wrap them: `CompositeNotifier([console, metrics])`. It implements every hook by forwarding to each child, swallowing per-child exceptions so one broken notifier does not prevent the others from running.
 
-For OpenTelemetry, install `dendrux[otel]` and pass `OpenTelemetryNotifier()` from `dendrux.notifiers.otel`. It emits a GenAI-semconv span tree (`invoke_agent` → `chat` → `execute_tool`) on the host application's existing `TracerProvider`. This is a V1 integration. See [the OpenTelemetry recipe](/docs/recipes/opentelemetry) for setup, span shape, and what's left out for now (cross-process trace continuity, native metrics, and log signals are deferred until real usage validates the design).
+For OpenTelemetry, install `dendrux[otel]` and pass `OpenTelemetryNotifier()` from `dendrux.notifiers.otel`. It emits a GenAI-semconv span tree (`invoke_agent` → `chat` → `execute_tool`) on the host application's existing `TracerProvider`. In 0.6, persisted trace links keep a run in one trace across pause, resume, submit and reclaim, including across processes. Native metrics and log export remain application-owned. See [the OpenTelemetry recipe](/docs/recipes/opentelemetry) for setup and span shape.
 
 ## Fail-open semantics
 

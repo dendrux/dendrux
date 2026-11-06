@@ -99,7 +99,7 @@ Pass these as `database_options=` (or as keyword arguments to `create_async_engi
 
 ## Migrations: one job, direct connection
 
-Run `dendrux db migrate` **once per deploy, as a single job**, over a **direct** Postgres connection (not through PgBouncer, and not from every pod at startup). Run it before starting the new workers. A second concurrent runner refuses with a retry message instead of racing.
+Run `dendrux db migrate` **once per deploy, as a single job**, over a **direct** Postgres connection (not through PgBouncer, and not from every pod at startup). Run it before starting the new workers. On an existing database, a second migration runner refuses at once through the migration lock. Only while a fresh bootstrap is in flight do CLI migrators wait, for up to 30 seconds, through schema creation and activation. Alembic and explicit activation still refuse a competing maintenance operation.
 
 - The migration uses session-level locks and `lock_timeout` settings, which is why it needs a direct session connection.
 - Short exclusive steps wait at most 5 seconds for each lock and then fail with a retry message. Finish the long-running transaction that blocked it and run the job again. The index builds run concurrently and a timed-out build is repaired on the retry. The 5 second budget is fixed; schedule the job in a quiet window.
@@ -107,7 +107,7 @@ Run `dendrux db migrate` **once per deploy, as a single job**, over a **direct**
 - `dendrux db check` compares the database with this version's head without changing anything (exit 0 current, 1 behind, 2 unknown). A non-SQLite database that was not migrated fails at startup with `SchemaOutOfDateError`.
 - Do not start abandoned-waiting sweeps until the migration has finished.
 
-For 0.6, migration is additive and leaves format 1 enabled. Roll every worker and read-only consumer, take a pre-activation backup, then run `dendrux db activate` over a direct connection. Only then enable reclaim and live updates. Activation is one-way. See [Upgrading to 0.6.0](/docs/upgrading-to-0.6.0) and the [Database CLI](/docs/reference/cli).
+New PostgreSQL databases come up active at format 2 after `dendrux db migrate`. For existing PostgreSQL databases upgrading to 0.6, migration is additive and leaves format 1 enabled, even with zero runs. Roll every worker and read-only consumer, take a pre-activation backup, then run `dendrux db activate` over a direct connection. Only then enable reclaim and live updates. Activation is one-way. See [Upgrading to 0.6.0](/docs/upgrading-to-0.6.0) and the [Database CLI](/docs/reference/cli).
 
 ## MySQL and MariaDB
 
