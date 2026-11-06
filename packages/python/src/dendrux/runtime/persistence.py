@@ -548,13 +548,16 @@ class PersistenceRecorder(BaseRecorder):
                 _view_identity({"role": trace.role, "content": trace.content, "meta": trace.meta}),
             ),
         )
+        self._remember_observation(trace, position)
+        if trace.role == "system":
+            self._system_messages.append(Message(role=Role.SYSTEM, content=trace.content))
+
+    def _remember_observation(self, trace: Any, position: int | None) -> None:
         call_id = (trace.meta or {}).get("call_id")
         if call_id:
             self._observation_order[call_id] = (
                 trace.order_index * 1000 if position is None else position
             )
-        if trace.role == "system":
-            self._system_messages.append(Message(role=Role.SYSTEM, content=trace.content))
 
     def _mapping(self) -> dict[str, str] | None:
         if self.guardrail_engine is not None:
