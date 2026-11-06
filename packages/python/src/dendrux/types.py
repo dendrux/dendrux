@@ -1120,12 +1120,7 @@ class Limits:
     max_pause_summary_bytes: int = 65536
 
     def __post_init__(self) -> None:
-        if (
-            type(self.max_pause_summary_bytes) is not int
-            or not 128 <= self.max_pause_summary_bytes <= 524288
-        ):
-            _codes.log_code(logger, _codes.INVALID_LIMIT, run_id=None)
-            raise ValueError("max_pause_summary_bytes must be an integer from 128 to 524288")
+        _validate_pause_summary_limit(self.max_pause_summary_bytes)
         for name in (
             "max_tool_result_bytes",
             "max_input_bytes",
@@ -1140,6 +1135,12 @@ class Limits:
                 if name in {"max_pending_calls", "max_rebuild_bytes", "max_rebuild_rows"}:
                     _codes.log_code(logger, _codes.INVALID_LIMIT, run_id=None)
                 raise ValueError(f"Limits {name} must be a positive int, got {value!r}.")
+
+
+def _validate_pause_summary_limit(value: int) -> None:
+    if type(value) is not int or not 128 <= value <= 524288:
+        _codes.log_code(logger, _codes.INVALID_LIMIT, run_id=None)
+        raise ValueError("max_pause_summary_bytes must be an integer from 128 to 524288")
 
 
 def _validate_provider_kwargs(value: dict[str, Any], *, run_id: str | None = None) -> None:
