@@ -11,6 +11,7 @@ import pytest
 
 from dendrux import Agent, Budget
 from dendrux.guardrails import SecretDetection
+from dendrux.tool import get_tool_def
 from dendrux.types import Role, RunStatus
 from tests._helpers.sales_061 import SalesFixture, SalesProvider, sales_sheet
 
@@ -18,6 +19,11 @@ if TYPE_CHECKING:
     from dendrux.runtime.state import StateStore
 
 __all__ = ["sales_sheet"]
+
+
+def test_write_region_schema_enum(sales_sheet: SalesFixture) -> None:
+    schema = get_tool_def(sales_sheet.sheet.write_region).parameters
+    assert schema["properties"]["region"].get("enum") == ["NORTH", "SOUTH"]
 
 
 @pytest.mark.parametrize("engine", ["sqlite_file", "postgres"], indirect=True)
@@ -29,7 +35,8 @@ async def test_sales_cleanup(store: StateStore, sales_sheet: SalesFixture, appro
         name="SalesCleaner",
         provider=provider,
         state_store=store,
-        prompt="Read the sheet, normalize regions, then post a review notice. "
+        prompt="Read the sheet, trim and uppercase each region (NORTH or SOUTH), "
+        "then post a review notice. "
         "Stop if the batch is declined.",
         tools=sales_sheet.tools,
         require_approval=["write_region"],

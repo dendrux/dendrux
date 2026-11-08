@@ -27,7 +27,8 @@ async def main() -> None:
         name="SalesCleaner",
         database_url=db_url,
         provider=AnthropicProvider(model="claude-haiku-4-5", call_timeout=120),
-        prompt="Read the sheet, normalize regions, then post a review notice. "
+        prompt="Read the sheet, trim and uppercase each region (NORTH or SOUTH), "
+        "then post a review notice. "
         "Stop if the batch is declined.",
         tools=[sheet.read_sheet, sheet.write_region, sheet.post_review_notice],
         require_approval=["write_region"],

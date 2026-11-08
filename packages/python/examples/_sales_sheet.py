@@ -6,6 +6,7 @@ import csv
 import io
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+from typing import Literal
 
 from dendrux import tool
 
@@ -59,8 +60,8 @@ class SalesSheet:
         return self._read()
 
     @tool(parallel=False, max_calls_per_run=4)
-    async def write_region(self, row_number: int, region: str) -> str:
-        """Set a region cell after approval, preserving row order, order IDs and amounts."""
+    async def write_region(self, row_number: int, region: Literal["NORTH", "SOUTH"]) -> str:
+        """Set a trimmed, uppercased region after approval; preserve row order, IDs and amounts."""
         rows = self._read()
         if not 1 <= row_number <= len(rows) or region not in {"NORTH", "SOUTH"}:
             raise ValueError("demo_invalid_cell_write")
