@@ -2783,7 +2783,10 @@ async def _create_runtime_run(
     native_store = unclaimed_store(store)
     with _creation_loop_scope(native_store, run_id, _recovery_loop_name(loop)):
         return await _ownership_handoff(
-            store, store.create_run(run_id, agent_name, **kwargs), cancel_created, run_id=run_id
+            store,
+            lambda: store.create_run(run_id, agent_name, **kwargs),
+            cancel_created,
+            run_id=run_id,
         )
 
 

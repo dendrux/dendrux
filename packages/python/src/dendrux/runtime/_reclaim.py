@@ -73,7 +73,7 @@ async def reclaim(
     try:
         claim = await _ownership_handoff(
             store,
-            store.reclaim_run(
+            lambda: store.reclaim_run(
                 run_id,
                 tenant_id=tenant_id,
                 agent_name=agent.name,

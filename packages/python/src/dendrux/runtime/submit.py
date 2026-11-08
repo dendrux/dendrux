@@ -420,15 +420,17 @@ async def _claim_submission(
         )
         descriptor = submission_descriptor(request.raw, checkpoint, payload, status)
     if payload is None:
-        operation = claim_paused_validated(store, run_id, expected_status=status, validate=validate)
+        operation: Callable[[], Awaitable[ClaimResult | int | bool]] = partial(
+            claim_paused_validated, store, run_id, expected_status=status, validate=validate
+        )
     else:
         kwargs: dict[str, Any] = {"validate": validate}
         if descriptor is not None:
             kwargs["submission"] = descriptor
         if blob_refs:
             kwargs.update(blob_refs=list(blob_refs), blob_refs_scope=blob_refs_scope)
-        operation = store.submit_and_claim(
-            run_id, expected_status=status, submitted_data=payload, **kwargs
+        operation = partial(
+            store.submit_and_claim, run_id, expected_status=status, submitted_data=payload, **kwargs
         )
     won = await _ownership_handoff(
         store, operation, partial(_cancel_claim, store, run_id), run_id=run_id
