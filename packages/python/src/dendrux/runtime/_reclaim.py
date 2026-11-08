@@ -256,17 +256,33 @@ async def needs_resolution(
         return False
     calls = {tc.id for tc in pause.pending_tool_calls}
     if checkpoint is not None:
-        pending = {p["call_id"]: p for p in checkpoint.get("pending", [])}
-        # Client calls never write server intents. Missing/unknown entries
-        # retain the defensive evidence read, as do all server phases.
-        if all(pending.get(call_id, {}).get("target") == "client" for call_id in calls):
-            return False
+        resolution = _checkpoint_resolution(pause, calls, checkpoint)
+        if resolution is not None:
+            return resolution
     return any(
         row.tool_call_id in calls and row.outcome == "started"
         for row in await store.get_tool_calls(
             run_id, iteration_index=pause.iteration, limit=MAX_PAGE
         )
     )
+
+
+def _checkpoint_resolution(
+    pause: PauseState, calls: set[str], checkpoint: dict[str, Any]
+) -> bool | None:
+    pending = {p["call_id"]: p for p in checkpoint.get("pending", [])}
+    remaining = [pending.get(call_id, {}) for call_id in calls]
+    # Client calls never write server intents. Unknown entries still need
+    # the defensive evidence read.
+    if all(p.get("target") == "client" for p in remaining):
+        return False
+    # A requested pause is not an approval decision. The checkpoint retains
+    # unresolved gates even before an intent or approval pause exists.
+    if pause.pause_reason == PauseReason.REQUESTED.value and any(
+        p.get("target") == "server" and p.get("phase") == "gated" for p in remaining
+    ):
+        return True
+    return None
 
 
 def recovery_gate() -> dict[str, str | None]:
