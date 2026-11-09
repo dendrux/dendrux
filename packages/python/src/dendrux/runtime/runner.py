@@ -3308,7 +3308,12 @@ async def _retry_history(
         else await state_store.get_traces(source_run.id)
     )
     retry_model = (kwargs or {}).get("model") or provider.model
-    initial_history = _pair_tool_calls(rebuild_messages(traces, reasoning_for=retry_model))
+    initial_history = rebuild_messages(traces, reasoning_for=retry_model)
+    if source_run.status == RunStatus.SUCCESS.value and initial_history:
+        final = initial_history[-1]
+        if final.role == Role.ASSISTANT and not final.tool_calls:
+            initial_history.pop()
+    initial_history = _pair_tool_calls(initial_history)
     if source_run.storage_format == STORAGE_FORMAT_CHECKPOINTED:
         initial_history = [m for m in initial_history if m.role != Role.SYSTEM]
 

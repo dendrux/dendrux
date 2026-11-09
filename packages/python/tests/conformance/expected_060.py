@@ -3,6 +3,7 @@
 Rejected calls now carry ``dendrux.not_executed`` before persistence so they do not
 consume call limits after resume. Only the listed rejected messages/traces gain
 that marker; their golden digests are derived from the original recorded messages.
+Successful retry requests omit the source's final assistant answer.
 Actual output is never projected, and the 0.5 corpus and goldens remain untouched.
 """
 
@@ -20,6 +21,12 @@ REJECTED_POSITIONS = {
 
 def corpus(cell_id: str) -> dict:
     expected = h.read_json(h.corpus_path(cell_id))
+    if cell_id == "retry__after_success":
+        messages = expected["calls"][2]["messages"]
+        final = messages[-1]
+        assert final["role"] == "assistant" and not final["tool_calls"]
+        assert final["meta"]["phase"] == "final_answer"
+        messages.pop()
     if cell_id not in REJECTED_POSITIONS:
         return expected
     messages, traces = REJECTED_POSITIONS[cell_id]
@@ -45,4 +52,8 @@ def golden(cell_id: str, *, legacy: bool = False) -> dict:
         expected["provider_calls"][1]["messages_sha256"] = h.messages_digest(
             corpus(cell_id)["calls"][1]["messages"]
         )
+    if cell_id == "retry__after_success":
+        messages = corpus(cell_id)["calls"][2]["messages"]
+        expected["provider_calls"][2]["messages_sha256"] = h.messages_digest(messages)
+        expected["provider_calls"][2]["n_messages"] = len(messages)
     return expected
