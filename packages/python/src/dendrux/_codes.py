@@ -656,6 +656,14 @@ SWEEP_CAP_REACHED = Code(
     "A sweep reaches its inspection bound.",
     "Run another sweep or raise the bound.",
 )
+MIGRATION_VERSION_TABLE_CONFLICT = Code(
+    "migration_version_table_conflict",
+    logging.WARNING,
+    "migration",
+    _BASE_FIELDS,
+    "Dendrux migration history is ambiguous or incomplete.",
+    "Back up and inspect both version tables; preserve application rows during manual repair.",
+)
 MIGRATION_LOCK_TIMEOUT = Code(
     "migration_lock_timeout",
     logging.WARNING,
@@ -1965,6 +1973,7 @@ REGISTRY = MappingProxyType(
             RUN_CANCEL_RECOVERED,
             SWEEP_CAP_REACHED,
             MIGRATION_LOCK_TIMEOUT,
+            MIGRATION_VERSION_TABLE_CONFLICT,
             SHARED_ENGINE_LOOP_CLOSED,
             TOOL_ROW_MAY_BE_MISSING,
             OUTCOME_UNKNOWN,

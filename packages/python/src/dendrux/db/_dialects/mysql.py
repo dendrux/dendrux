@@ -46,6 +46,11 @@ from dendrux._lifecycle import STORAGE_FORMAT_CHECKPOINTED
 from dendrux.db._dialects import LockWaitTimeout
 from dendrux.db._dialects._mysql_types import nopad_collation
 from dendrux.db._storage_schema import ACTIVATION_INDEXES
+from dendrux.db._version_table import (
+    VERSION_TABLE,
+    MigrationVersionTableConflictError,
+    prepare_version_table,
+)
 from dendrux.db.models import Base, DendruxSetting
 
 if TYPE_CHECKING:
@@ -74,7 +79,6 @@ MYSQL_BASELINE_REVISION = "f9a0b1c2d3e4"
 
 BOOTSTRAP_MARKER = "bootstrap_in_progress"
 SETTINGS_TABLE = "dendrux_settings"
-VERSION_TABLE = "alembic_version"
 DUPLICATE_KEY = 1062
 LOCK_WAIT_TIMEOUT = 1205
 _LOCK_PREFIX = "dendrux_maint_"
@@ -782,6 +786,22 @@ def _refuse(reason: str) -> RuntimeError:
     return RuntimeError(f"Cannot migrate this MySQL/MariaDB database: {reason}")
 
 
+def _resumable_bootstrap(conn: Connection, present: Collection[str], head: str) -> bool:
+    if SETTINGS_TABLE in present:
+        try:
+            values = read_settings(conn)
+        except DBAPIError:
+            raise MigrationVersionTableConflictError from None
+        marker = values.get(BOOTSTRAP_MARKER)
+        if marker is not None:
+            if marker != head:
+                raise MigrationVersionTableConflictError
+            return True
+        if present == {SETTINGS_TABLE} and not values:
+            return True  # crashed between creating the table and writing the marker
+    return False
+
+
 def classify(conn: Connection, *, head: str, upgradeable: Collection[str]) -> str:
     """``bootstrap`` | ``current`` | ``upgrade``, or a refusal.
 
@@ -792,25 +812,11 @@ def classify(conn: Connection, *, head: str, upgradeable: Collection[str]) -> st
     present = base_tables(conn, owned_tables())
     if not present:
         return "bootstrap"
-    if SETTINGS_TABLE in present:
-        try:
-            values = read_settings(conn)
-        except DBAPIError:
-            raise _refuse(f"{SETTINGS_TABLE} is not a Dendrux settings table.") from None
-        marker = values.get(BOOTSTRAP_MARKER)
-        if marker is not None:
-            if marker != head:
-                raise _refuse(
-                    f"a bootstrap by another Dendrux version (revision {marker}) is "
-                    f"unfinished; this version bootstraps {head}. Finish it with that "
-                    "version, or drop the partial schema."
-                )
-            return "bootstrap"
-        if present == {SETTINGS_TABLE} and not values:
-            return "bootstrap"  # crashed between creating the table and writing the marker
+    if _resumable_bootstrap(conn, present, head):
+        return "bootstrap"
     if VERSION_TABLE in present:
         revisions = [
-            str(row[0]) for row in conn.execute(text("SELECT version_num FROM alembic_version"))
+            str(row[0]) for row in conn.execute(text(f"SELECT version_num FROM {VERSION_TABLE}"))
         ]
         if revisions == [head]:
             return "current"
@@ -834,9 +840,12 @@ def migrate(
     head: str,
     upgradeable: Collection[str],
     upgrade: Callable[[], None],
+    known: Collection[str] | None = None,
 ) -> str:
     """Bring the database to ``head`` under the maintenance lock; return what was done."""
     with maintenance_lock(conn):
+        resumable = _resumable_bootstrap(conn, base_tables(conn, owned_tables()), head)
+        prepare_version_table(conn, known or {head, *upgradeable}, resumable=resumable)
         state = classify(conn, head=head, upgradeable=upgradeable)
         conn.commit()
         if state == "bootstrap":
@@ -939,6 +948,14 @@ def _bootstrap(conn: Connection, head: str) -> None:
     ):
         raise _refuse("the settings table holds a different storage format.")
 
+    _stamp_bootstrap(conn, head, ddl)
+
+    _step("clear_marker")
+    conn.execute(delete(DendruxSetting).where(DendruxSetting.key == BOOTSTRAP_MARKER))
+    conn.commit()
+
+
+def _stamp_bootstrap(conn: Connection, head: str, ddl: Callable[[str, str], None]) -> None:
     _step("stamp")
     conn.commit()
     problems = check(conn, exact=True, settings=False).problems()
@@ -947,20 +964,16 @@ def _bootstrap(conn: Connection, head: str) -> None:
     if not base_tables(conn, [VERSION_TABLE]):
         ddl(
             f"CREATE TABLE {VERSION_TABLE} (version_num VARCHAR(32) NOT NULL, "
-            "CONSTRAINT alembic_version_pkc PRIMARY KEY (version_num)) ENGINE=InnoDB",
+            f"CONSTRAINT {VERSION_TABLE}_pkc PRIMARY KEY (version_num)) ENGINE=InnoDB",
             "stamp",
         )
     revisions = [
-        str(row[0]) for row in conn.execute(text("SELECT version_num FROM alembic_version"))
+        str(row[0]) for row in conn.execute(text(f"SELECT version_num FROM {VERSION_TABLE}"))
     ]
     if not revisions:
         conn.execute(
-            text("INSERT INTO alembic_version (version_num) VALUES (:head)"), {"head": head}
+            text(f"INSERT INTO {VERSION_TABLE} (version_num) VALUES (:head)"), {"head": head}
         )
     elif revisions != [head]:
         raise _refuse(f"it is stamped with {', '.join(revisions)} during bootstrap.")
-    conn.commit()
-
-    _step("clear_marker")
-    conn.execute(delete(DendruxSetting).where(DendruxSetting.key == BOOTSTRAP_MARKER))
     conn.commit()

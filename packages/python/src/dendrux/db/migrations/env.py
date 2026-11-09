@@ -13,6 +13,7 @@ from alembic import context
 from sqlalchemy import pool
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
+from dendrux.db._version_table import VERSION_TABLE, prepare_version_table
 from dendrux.db.models import Base
 from dendrux.db.session import DEFAULT_SQLITE_URL, get_database_url
 
@@ -43,6 +44,7 @@ def run_migrations_offline() -> None:
     context.configure(
         url=url,
         target_metadata=target_metadata,
+        version_table=VERSION_TABLE,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
     )
@@ -52,9 +54,18 @@ def run_migrations_offline() -> None:
 
 
 def _configure_and_run(connection):  # noqa: ANN001
+    try:
+        context.get_revision_argument()
+    except KeyError:
+        pass  # Read-only Alembic commands never adopt legacy history.
+    else:
+        prepare_version_table(
+            connection, {revision.revision for revision in context.script.walk_revisions()}
+        )
     context.configure(
         connection=connection,
         target_metadata=target_metadata,
+        version_table=VERSION_TABLE,
         render_as_batch=True,  # Required for SQLite ALTER TABLE support
     )
     with context.begin_transaction():
@@ -90,6 +101,7 @@ def _run_mysql(connection):  # noqa: ANN001
         head=head,
         upgradeable=upgradeable,
         upgrade=lambda: _configure_and_run(connection),
+        known={revision.revision for revision in script.walk_revisions()},
     )
 
 
@@ -105,7 +117,10 @@ def do_run_migrations(connection):  # noqa: ANN001
         with migration_lock(connection):
             _configure_and_run(connection)
         return
-    _configure_and_run(connection)
+    from dendrux.db._dialects.sqlite import maintenance_lock
+
+    with maintenance_lock(connection):
+        _configure_and_run(connection)
 
 
 async def run_async_migrations() -> None:
