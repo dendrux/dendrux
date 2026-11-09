@@ -17,6 +17,7 @@ from dendrux.runtime._tenant_checks import resolve_tenant
 from dendrux.runtime.submit import GOVERNANCE_KEY, require_pause_id, submission_validator
 from dendrux.runtime.sweep import sweep
 from dendrux.types import InputValidationError, UsageStats
+from tests._helpers.warnings import warnings_of
 
 
 def agent(**kwargs):
@@ -151,7 +152,7 @@ async def test_sweep_keeps_07_warning_only_for_omitted_policy_with_stale_rows(po
         warnings.simplefilter("always")
         result = await sweep(state_store=store, stale_running=timedelta(seconds=1), on_stale=policy)
     assert result.stale_running == stale
-    assert len([w for w in caught if w.category is FutureWarning]) == int(
+    assert len(warnings_of(caught, FutureWarning, r"sweep\(\) will default")) == int(
         policy is None and bool(stale)
     )
 
@@ -237,7 +238,7 @@ async def test_public_strict_submissions_refuse_missing_token_before_claim(entry
                     else:
                         await a.resume(paused.run_id, tool_results=payload, tenant_id=None)
                 assert error.value.code == "pause_id_required"
-        assert not caught
+        assert not warnings_of(caught, FutureWarning, "expected_pause_id")
         assert (await store.get_run(paused.run_id)).status == status
         assert (await store.get_run_control(paused.run_id)).claim_epoch == before
     finally:

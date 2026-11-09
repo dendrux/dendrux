@@ -15,6 +15,7 @@ from dendrux import Agent
 from dendrux.db import session
 from dendrux.llm.mock import MockLLM
 from dendrux.types import LLMResponse
+from tests._helpers.warnings import warnings_of
 
 
 async def test_reinitialize_error_masks_passwords(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -36,7 +37,7 @@ async def test_env_store_is_ignored_without_engine_acquisition(
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         assert (await agent.run("hi", tenant_id=None)).answer == "ok"
-    assert not caught
+    assert not warnings_of(caught, DeprecationWarning)
     assert session._engine is None
 
 
@@ -51,7 +52,7 @@ async def test_explicit_store_does_not_warn(tmp_path: Any) -> None:
         )
         await agent.run("hi", tenant_id=None)
         await agent.close()
-    assert not [w for w in caught if issubclass(w.category, DeprecationWarning)]
+    assert not warnings_of(caught, DeprecationWarning)
 
 
 async def test_sqlite_global_engine_is_not_loop_bound(tmp_path: Any) -> None:

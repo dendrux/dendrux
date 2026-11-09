@@ -11,6 +11,7 @@ from dendrux import sweep
 from dendrux.db.models import AgentRun
 from dendrux.runtime.stores._factory import store_for_engine
 from dendrux.types import generate_ulid
+from tests._helpers.warnings import warnings_of
 
 
 async def candidate(store, engine, *, fmt=2, marker="react", started=True, **values):
@@ -57,20 +58,21 @@ async def test_outcome_table(store, engine, caplog, policy, fmt, marker):
             getattr(r, "run_id", None) == run_id and getattr(r, "code", None)
             for r in caplog.records
         )
-    assert len([w for w in caught if w.category is FutureWarning]) == (policy is None)
+    matching = warnings_of(caught, FutureWarning, r"sweep\(\) will default")
+    assert len(matching) == (policy is None)
     if policy is None:
-        assert caught[0].filename == __file__
+        assert matching[0].filename == __file__
 
 
 async def test_warning_only_with_stale_rows_and_no_once_flag(store, engine):
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         await scan(store)
-        assert not [w for w in caught if w.category is FutureWarning]
+        assert not warnings_of(caught, FutureWarning, r"sweep\(\) will default")
         for _ in range(2):
             await candidate(store, engine)
             await scan(store)
-        assert len([w for w in caught if w.category is FutureWarning]) == 2
+        assert len(warnings_of(caught, FutureWarning, r"sweep\(\) will default")) == 2
 
 
 @pytest.mark.parametrize("policy", ["error", "reclaim"])

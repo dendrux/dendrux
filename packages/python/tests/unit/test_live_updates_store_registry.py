@@ -8,19 +8,8 @@ import pytest
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from dendrux.runtime.stores._factory import store_for_engine
+from tests._helpers.warnings import warnings_of
 from tests.unit.test_live_updates_store_lifecycle import RecordingUpdates
-
-
-def registry_warnings(captured):
-    """Only the registry's own warning: `catch_warnings` is process-wide, so a block that
-    collects garbage also records warnings other tests left behind (never-awaited
-    coroutines, unclosed resources)."""
-    return [
-        item
-        for item in captured
-        if issubclass(item.category, RuntimeWarning)
-        and "Open live-update stores" in str(item.message)
-    ]
 
 
 def texts(items):
@@ -37,7 +26,7 @@ async def test_many_stores_warn_once_with_counts_and_hash_only(caplog):
             warnings.simplefilter("always")
             for _ in range(160):  # ten times the realistic one-pool-per-worker threshold
                 stores.append(store_for_engine(engine, live_updates=RecordingUpdates()))
-        matching = registry_warnings(captured)
+        matching = warnings_of(captured, RuntimeWarning, "Open live-update stores")
         assert len(matching) == 1, texts(captured)
         records = [
             r for r in caplog.records if getattr(r, "code", None) == "live_updates_many_stores"
@@ -54,7 +43,7 @@ async def test_many_stores_warn_once_with_counts_and_hash_only(caplog):
             warnings.simplefilter("always")
             for _ in range(17):
                 stores.append(store_for_engine(engine, live_updates=RecordingUpdates()))
-        stray = registry_warnings(captured)
+        stray = warnings_of(captured, RuntimeWarning, "Open live-update stores")
         assert not stray, texts(stray)
     finally:
         for store in stores:
@@ -73,7 +62,7 @@ async def test_closed_and_collected_stores_do_not_count():
         for _ in range(160):
             store_for_engine(engine, live_updates=RecordingUpdates())
             gc.collect()
-    stray = registry_warnings(captured)
+    stray = warnings_of(captured, RuntimeWarning, "Open live-update stores")
     assert not stray, texts(stray)
     await engine.dispose()
 
@@ -120,7 +109,7 @@ async def test_many_stores_warning_points_to_developer_call(monkeypatch, dialect
             else:
                 line = inspect.currentframe().f_lineno + 1
                 store = classes[dialect](engine, live_updates=bus)
-        matching = registry_warnings(captured)
+        matching = warnings_of(captured, RuntimeWarning, "Open live-update stores")
         assert len(matching) == 1, texts(captured)
         assert (matching[0].filename, matching[0].lineno) == (__file__, line)
         await store.close()
