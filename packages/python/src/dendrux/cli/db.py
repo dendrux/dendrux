@@ -397,27 +397,9 @@ def check(
         raise typer.Exit(EXIT_UNKNOWN) from e
 
     history, missing = state
+    _check_history(url, history, missing, allow_unstamped=allow_unstamped)
     revision = history.revision
-    if history.needs_adoption:
-        console.print(
-            "Behind: Run `dendrux db migrate` to adopt verified legacy Dendrux history.",
-            markup=False,
-        )
-        raise typer.Exit(EXIT_BEHIND)
     target = mask_database_url(url)
-    if revision is None:
-        if not allow_unstamped:
-            console.print(
-                f"[yellow]Unknown:[/yellow] {target} has no dendrux_alembic_version table. "
-                "Run `dendrux db migrate`, or pass --allow-unstamped if the app builds "
-                "the schema with create_all."
-            )
-            raise typer.Exit(EXIT_UNKNOWN)
-        if missing:
-            console.print(f"[red]Behind:[/red] {target} is missing: {', '.join(missing)}")
-            raise typer.Exit(EXIT_BEHIND)
-        console.print(f"[green]✓[/green] {target} has every table, column and index (unstamped).")
-        raise typer.Exit(EXIT_CURRENT)
     if revision == head:
         if missing:
             # Stamped current by an earlier build of this revision that lacked some steps.
@@ -440,6 +422,32 @@ def check(
         "Run `dendrux db migrate`."
     )
     raise typer.Exit(EXIT_BEHIND)
+
+
+def _check_history(
+    url: str, history: MigrationHistory, missing: list[str], *, allow_unstamped: bool
+) -> None:
+    if history.needs_adoption:
+        console.print(
+            "Behind: Run `dendrux db migrate` to adopt verified legacy Dendrux history.",
+            markup=False,
+        )
+        raise typer.Exit(EXIT_BEHIND)
+    if history.revision is not None:
+        return
+    target = mask_database_url(url)
+    if not allow_unstamped:
+        console.print(
+            f"[yellow]Unknown:[/yellow] {target} has no dendrux_alembic_version table. "
+            "Run `dendrux db migrate`, or pass --allow-unstamped if the app builds "
+            "the schema with create_all."
+        )
+        raise typer.Exit(EXIT_UNKNOWN)
+    if missing:
+        console.print(f"[red]Behind:[/red] {target} is missing: {', '.join(missing)}")
+        raise typer.Exit(EXIT_BEHIND)
+    console.print(f"[green]✓[/green] {target} has every table, column and index (unstamped).")
+    raise typer.Exit(EXIT_CURRENT)
 
 
 async def _read_schema_state(url: str) -> tuple[MigrationHistory, list[str]]:
