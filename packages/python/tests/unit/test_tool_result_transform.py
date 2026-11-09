@@ -192,8 +192,7 @@ class TestExecuteTool:
             ToolCall(name="get_rows", params={"limit": 1}), lookups, transform=bad
         )
         assert tr.success is False
-        assert "tool_result_transform" in (tr.error or "")
-        assert "bad shape" in (tr.error or "")
+        assert tr.error == "Tool result transform failed."
         assert json.loads(tr.payload) == {"error": tr.error}
 
     async def test_async_transform_raises_fails_call(self) -> None:
@@ -206,7 +205,7 @@ class TestExecuteTool:
             ToolCall(name="get_rows", params={"limit": 1}), lookups, transform=bad
         )
         assert tr.success is False
-        assert "async bad" in (tr.error or "")
+        assert tr.error == "Tool result transform failed."
 
     async def test_transform_returning_non_json_fails_call(self) -> None:
         agent = Agent(prompt="t", tools=[get_rows])
@@ -292,7 +291,7 @@ class TestLoop:
         assert result.status == RunStatus.SUCCESS
         (msg,) = _tool_messages(llm, 1)
         assert msg.meta.get("is_error") is True
-        assert "tool_result_transform" in json.loads(msg.content)["error"]
+        assert json.loads(msg.content)["error"] == "Tool result transform failed."
 
     async def test_stream_applies_transform(self) -> None:
         llm, _ = _llm_for("get_rows", {"limit": 1})

@@ -224,7 +224,7 @@ async def _touch(store: Any, run_id: str) -> None:
     except RunFencedError:
         raise
     except Exception:
-        logger.warning("Heartbeat failed for run %s", run_id, exc_info=True)
+        logger.warning("Heartbeat failed", extra={"run_id": run_id})
 
 
 def _heartbeat_target() -> DelegationContext | None:

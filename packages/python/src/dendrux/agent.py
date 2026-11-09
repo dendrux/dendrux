@@ -3118,7 +3118,6 @@ class Agent:
                         _agent_logger.warning(
                             "Optional MCP source '%s' is unavailable; continuing without it",
                             source.name,
-                            exc_info=True,
                         )
                         skipped.append(_skipped_source_entry(source, exc))
                         continue
@@ -3167,7 +3166,6 @@ class Agent:
                         _agent_logger.warning(
                             "Failed to close MCP source '%s' during cleanup",
                             src.name,
-                            exc_info=True,
                         )
                 raise
 
@@ -3410,7 +3408,6 @@ class Agent:
                 _agent_logger.warning(
                     "Failed to close MCP source '%s' during refresh",
                     source.name,
-                    exc_info=True,
                 )
 
         # Clear all caches
@@ -3433,7 +3430,7 @@ class Agent:
             try:
                 await source.close()
             except Exception:
-                _agent_logger.warning("Failed to close MCP source '%s'", source.name, exc_info=True)
+                _agent_logger.warning("Failed to close MCP source '%s'", source.name)
         # Clear all caches so stale executors/skills are not reused.
         self._discovered_tool_defs = None
         self._mcp_executors = None

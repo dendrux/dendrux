@@ -3306,12 +3306,9 @@ async def _execute_tool(
         if transform is not None:
             try:
                 result = await _apply_result_transform(transform, tool_call, lookups, result)
-            except Exception as transform_err:
-                error_msg = (
-                    f"tool_result_transform failed for tool '{tool_call.name}': "
-                    f"{type(transform_err).__name__}: {transform_err}"
-                )
-                logger.warning("%s", error_msg)
+            except Exception:
+                error_msg = "Tool result transform failed."
+                logger.warning(error_msg, extra={"run_id": run_id})
                 return ToolResult(
                     name=tool_call.name,
                     call_id=tool_call.id,

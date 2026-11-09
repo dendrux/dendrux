@@ -818,7 +818,7 @@ async def record_run_prefix(
     try:
         await update(run_id, patch)
     except Exception:
-        logger.warning("Failed to record prefix descriptor for run %s", run_id, exc_info=True)
+        logger.warning("Failed to record prefix descriptor", extra={"run_id": run_id})
 
 
 # ---------------------------------------------------------------------------
