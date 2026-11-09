@@ -62,21 +62,32 @@ async def test_061_empty_or_recovery_marked_pause_needs_no_read(recovery_gate):
     store.get_tool_calls.assert_not_awaited()
 
 
-@pytest.mark.parametrize("decision_id,expected,reads", [(None, True, 0), ("decision", False, 1)])
-async def test_061_requested_dispatchable_decision_is_preserved(decision_id, expected, reads):
+@pytest.mark.parametrize(
+    "decisions,expected,reads",
+    [
+        (None, True, 0),
+        ({}, False, 0),
+        ({"denied": {"approved": False, "reason": "not today"}}, False, 0),
+    ],
+)
+async def test_061_requested_evaluated_batch_keeps_approval_path(decisions, expected, reads):
     call = ToolCall("write_region")
     pause = PauseState(
-        "agent", [call], [], [], 1, 0, UsageStats(), schema_version=2, pause_reason="requested"
+        "agent",
+        [call],
+        [],
+        [],
+        1,
+        0,
+        UsageStats(),
+        schema_version=2,
+        pause_reason="requested",
+        pending_decisions=decisions,
     )
     store = SimpleNamespace(get_tool_calls=AsyncMock(return_value=[]))
     checkpoint = {
         "pending": [
-            {
-                "call_id": call.id,
-                "phase": "dispatchable",
-                "target": "server",
-                "decision_id": decision_id,
-            }
+            {"call_id": call.id, "phase": "dispatchable", "target": "server", "decision_id": None}
         ]
     }
     assert await needs_resolution(store, "run", pause, checkpoint=checkpoint) is expected

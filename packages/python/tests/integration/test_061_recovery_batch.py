@@ -69,6 +69,7 @@ async def test_061_reclaim_gate_holds_ungated_first(store, engine, reverse, hook
     finally:
         event.remove(engine.sync_engine, "before_cursor_execute", capture)
         print("reclaim_statements", engine.dialect.name, reverse, hook, len(statements))
+    assert len(statements) <= {"sqlite": 31, "postgresql": 31}[engine.dialect.name]
     assert paused.status.value == "waiting_approval"
     assert effects == []
     assert await store.get_tool_calls(item.run_id) == []
@@ -125,6 +126,32 @@ async def test_061_reclaim_gate_holds_ungated_first(store, engine, reverse, hook
         expected.append("tool.completed")
     expected += ["approval.decided", "run.completed"]
     assert selected == expected
+    audit = next(e.data for e in events if e.event_type == "approval.decided")
+    assert {d["call_id"]: d["decision"] for d in audit["decisions"]} == {
+        write.id: "approved" if decision == "approve" else "denied",
+        notice.id: "denied" if decision == "decline" else "not_gated_executed",
+    }
+    if decision == "approve":
+        assert audit == {
+            "decision": "approved",
+            "run_id": item.run_id,
+            "decisions": [
+                {
+                    "call_id": c.id,
+                    "tool_name": c.name,
+                    "decision": "approved" if c == write else "not_gated_executed",
+                    "reason": None,
+                }
+                for c in calls
+            ],
+        }
+        requested = next(e.data for e in events if e.event_type == "approval.requested")
+        assert requested["call_id"] == write.id and requested["tool_name"] == write.name
+        assert requested["params"] == {}
+        paused_event = next(e.data for e in events if e.event_type == "run.paused")
+        assert paused_event["pause_id"] == paused.pause_id
+        assert paused_event["status"] == "waiting_approval"
+        assert [c["id"] for c in paused_event["pending_tool_calls"]] == [c.id for c in calls]
     await agent.close()
 
 

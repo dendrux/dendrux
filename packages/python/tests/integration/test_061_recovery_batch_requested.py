@@ -58,6 +58,7 @@ async def test_061_recovery_batch_requested_pause(
         print(
             "requested_continuation_statements", engine.dialect.name, entry, hook, len(statements)
         )
+    assert len(statements) <= (37 if entry == "resume_stream" else 38)
     assert pending.status.value == "waiting_approval" and effects == []
     assert pending.pause_id and pending.pause_id != paused.pause_id
     assert await store.get_tool_calls(paused.run_id) == []

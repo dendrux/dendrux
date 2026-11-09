@@ -1208,6 +1208,8 @@ async def _prepare_tool_calls(
     tenant_id: str | None = None,
     image_runtime: ImageRuntime | None = None,
     anticipated_skills: set[str] | None = None,
+    recorded_gates: dict[str, dict[str, str | None]] | None = None,
+    fallback_approval: frozenset[str] | None = None,
 ) -> tuple[list[ToolCall], dict[str, dict[str, str | None]]]:
     session = _bind_skill_session(lookups, batch.governance)
     calls = await _reject_invalid_json(all_calls, lookups, session, batch)
@@ -1225,6 +1227,8 @@ async def _prepare_tool_calls(
             calls, lookups, session, approved_skills, batch, anticipated=anticipated_skills
         )
     gates = _static_gates(calls, require_approval)
+    if recorded_gates is not None:
+        gates.update({tc.id: recorded_gates[tc.id] for tc in calls if tc.id in recorded_gates})
     if before_tool is not None:
         calls = await _apply_before_tool(
             before_tool,
@@ -1234,7 +1238,10 @@ async def _prepare_tool_calls(
             lookups=lookups,
             tenant_id=tenant_id,
             image_runtime=image_runtime,
+            fallback_approval=fallback_approval,
         )
+    if fallback_approval is not None:
+        gates = {**_static_gates(calls, fallback_approval), **gates}
     if gates:
         await _request_approvals(calls, gates, sent_params, pii_mapping, batch)
     return calls, gates
@@ -1389,6 +1396,7 @@ async def _apply_before_tool(
     lookups: ToolLookups,
     tenant_id: str | None,
     image_runtime: ImageRuntime | None = None,
+    fallback_approval: frozenset[str] | None = None,
 ) -> list[ToolCall]:
     """Evaluate ``before_tool`` per call; returns the calls that continue.
 
@@ -1408,6 +1416,8 @@ async def _apply_before_tool(
             tenant_id=tenant_id,
             images=_referenced_images(tc.params, run_images),
         )
+        if fallback_approval and (decision is None or decision.kind != "require_approval"):
+            gates.update({**_static_gates([tc], fallback_approval), **gates})
         if error_type is not None:
             await _hook_error(tc, error_type, gates, batch)
         elif await _apply_decision(decision, tc, gates, batch, lookups, image_runtime):
