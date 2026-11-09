@@ -241,3 +241,60 @@ def test_061_mysql_empty_history_bootstraps(connection, monkeypatch):
     monkeypatch.setattr(mysql, "base_tables", lambda *args: {DEDICATED})
     connection.execute.return_value = []
     assert mysql.classify(connection, head=HEAD, upgradeable=set()) == "bootstrap"
+
+
+@pytest.mark.parametrize(
+    "state,problems", [("current", []), ("current", ["missing index"]), ("upgrade", [])]
+)
+@pytest.mark.parametrize("known", [None, {HEAD, "other-known-revision"}])
+def test_061_mysql_migrate_current_and_upgrade_paths(
+    connection, monkeypatch, state, problems, known
+):
+    from unittest.mock import Mock
+
+    locked = False
+
+    @contextmanager
+    def lock(conn):
+        nonlocal locked
+        assert conn is connection
+        locked = True
+        try:
+            yield
+        finally:
+            locked = False
+
+    def prepare(conn, revisions, *, resumable):
+        assert locked and conn is connection
+        assert revisions == (known or {HEAD, "prior"})
+        assert not resumable
+
+    def check(conn, *, exact):
+        assert locked and exact and conn is connection
+        return mysql.SchemaReport(set(), [], problems, [])
+
+    upgrade = Mock(side_effect=lambda: pytest.fail("current schemas must not upgrade"))
+    if state == "upgrade":
+        upgrade.side_effect = lambda: None
+    monkeypatch.setattr(mysql, "maintenance_lock", lock)
+    monkeypatch.setattr(mysql, "base_tables", lambda *args: set())
+    monkeypatch.setattr(mysql, "prepare_version_table", prepare)
+    monkeypatch.setattr(mysql, "classify", lambda *args, **kw: state)
+    monkeypatch.setattr(mysql, "check", check)
+    monkeypatch.setattr(mysql, "_bootstrap", lambda *args: pytest.fail("must not bootstrap"))
+    if problems:
+        with pytest.raises(RuntimeError, match="missing index"):
+            mysql.migrate(
+                connection, head=HEAD, upgradeable={"prior"}, upgrade=upgrade, known=known
+            )
+        assert connection.commit.call_count == 1
+    else:
+        assert (
+            mysql.migrate(
+                connection, head=HEAD, upgradeable={"prior"}, upgrade=upgrade, known=known
+            )
+            == state
+        )
+        assert connection.commit.call_count == 2
+    assert upgrade.call_count == int(state == "upgrade")
+    assert not locked

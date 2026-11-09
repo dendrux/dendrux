@@ -250,10 +250,14 @@ def status() -> None:
     except Exception:
         console.print("[red]Could not read database status.[/red] Run `dendrux db check`.")
         raise typer.Exit(2) from None
+    console.print(_status_line(revision, storage_format, step, bootstrap), markup=False)
+
+
+def _status_line(revision: str, storage_format: str, step: str, bootstrap: str | None) -> str:
     line = f"revision={revision} storage_format={storage_format} activate_step={step}"
     if bootstrap is not None:
         line += f" bootstrap_in_progress={bootstrap}"
-    console.print(line, markup=False)
+    return line
 
 
 async def _read_activation_status(url: str) -> tuple[str, str, str, str | None]:

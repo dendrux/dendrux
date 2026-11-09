@@ -829,6 +829,12 @@ def classify(conn: Connection, *, head: str, upgradeable: Collection[str]) -> st
     )
 
 
+def _require_current_schema(conn: Connection, head: str) -> None:
+    problems = check(conn, exact=True).problems()
+    if problems:
+        raise _refuse(f"it is stamped {head} but differs from it: {'; '.join(problems[:10])}")
+
+
 def migrate(
     conn: Connection,
     *,
@@ -846,11 +852,7 @@ def migrate(
         if state == "bootstrap":
             _bootstrap(conn, head)
         elif state == "current":
-            problems = check(conn, exact=True).problems()
-            if problems:
-                raise _refuse(
-                    f"it is stamped {head} but differs from it: {'; '.join(problems[:10])}"
-                )
+            _require_current_schema(conn, head)
         else:
             upgrade()
         conn.commit()

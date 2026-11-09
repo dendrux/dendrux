@@ -197,10 +197,13 @@ def _resolve_database_url(url: str | None) -> str:
         return url
     if Path("dendrux.db").exists():
         return DEFAULT_SQLITE_URL
-    try:
-        legacy_exists = (Path.home() / ".dendrux/dendrux.db").exists()
-    except (OSError, RuntimeError):
-        legacy_exists = False
-    if legacy_exists:
+    if _legacy_database_exists():
         _codes.log_code(logger, _codes.LOCAL_DATABASE_DEFAULT_CHANGED)
     return DEFAULT_SQLITE_URL
+
+
+def _legacy_database_exists() -> bool:
+    try:
+        return (Path.home() / ".dendrux/dendrux.db").exists()
+    except (OSError, RuntimeError):
+        return False
