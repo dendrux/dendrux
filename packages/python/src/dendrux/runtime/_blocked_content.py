@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from typing import TYPE_CHECKING, cast
 
-from dendrux.errors import PersistenceError
+from dendrux.errors import PersistenceError, RunFencedError
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Sequence
+    from collections.abc import AsyncIterator, Iterator, Sequence
 
     from dendrux.runtime.state import StateStore
     from dendrux.runtime.stores.sql.base import SQLStateStore
@@ -45,3 +45,45 @@ async def _blocked_run_ids(
     return cast(
         "set[str]", await _native_store(store)._blocked_run_ids(run_ids, tenant_id=tenant_id)
     )
+
+
+@asynccontextmanager
+async def _blocked_evidence(store: StateStore, run_id: str) -> AsyncIterator[None]:
+    from dendrux._meta_keys import BLOCKED_META_KEY
+    from dendrux.runtime.state import unclaimed_store
+    from dendrux.runtime.stores.sql.base import SQLStateStore
+
+    if isinstance(unclaimed_store(store), SQLStateStore):
+        with _blocked_write(store, run_id):
+            yield
+        return
+    failed = False
+    try:
+        await store.update_run_meta(run_id, {BLOCKED_META_KEY: True})
+    except RunFencedError:
+        raise
+    except Exception:
+        failed = True
+    if failed:
+        raise PersistenceError()
+    await _require_block_mark(store, run_id)
+    yield
+
+
+async def _require_block_mark(store: StateStore, run_id: str) -> None:
+    from dendrux._meta_keys import BLOCKED_META_KEY
+
+    valid = False
+    try:
+        record = await store.get_run(run_id)
+        valid = (
+            record is not None
+            and record.id == run_id
+            and (record.meta or {}).get(BLOCKED_META_KEY) is True
+        )
+    except RunFencedError:
+        raise
+    except Exception:
+        pass
+    if not valid:
+        raise PersistenceError()

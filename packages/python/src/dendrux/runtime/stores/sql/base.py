@@ -29,6 +29,7 @@ from dendrux._lifecycle import (
 )
 from dendrux._meta_keys import (
     ANNOUNCE_MARKS_SESSION_KEY,
+    BLOCKED_INSERT_SESSION_KEY,
     BLOCKED_META_KEY,
     BLOCKED_RUNS_SESSION_KEY,
     COMMIT_PROOFS_SESSION_KEY,
@@ -329,6 +330,20 @@ async def _final_output_values(
     if failure_reason is not None:
         values["failure_reason"] = failure_reason
     return values
+
+
+def _creation_metadata(
+    session: AsyncSession, store: SQLStateStore, run_id: str, meta: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    from dendrux.runtime._blocked_content import _blocked_target
+
+    cleaned = (
+        {key: value for key, value in meta.items() if key != BLOCKED_META_KEY} if meta else meta
+    )
+    if _blocked_target.get() == (store, run_id):
+        session.info[BLOCKED_INSERT_SESSION_KEY] = run_id
+        return {**(cleaned or {}), BLOCKED_META_KEY: True}
+    return cleaned
 
 
 def _check_create_identifiers(
@@ -748,7 +763,8 @@ class SQLStateStore(SQLBlobCatalog):
             and target[1] in session.info.get(TOUCHED_RUNS_SESSION_KEY, ())
         ):
             marked.add(target[1])
-        for run_id in sorted(marked):
+        # The initial INSERT has the mark; retain it in the COMMIT readback proof.
+        for run_id in sorted(marked - {session.info.get(BLOCKED_INSERT_SESSION_KEY)}):
             changed = self.json_patch_expr(AgentRun.meta, SetFields({BLOCKED_META_KEY: True}))
             if changed is None:
                 from dendrux.errors import PersistenceError
@@ -1182,8 +1198,6 @@ class SQLStateStore(SQLBlobCatalog):
         _check_create_identifiers(run_id, agent_name, tenant_id, idempotency_key, model)
         _validate_persistable(meta, "metadata")
         _validate_persistable(input_data, "input")
-        if meta is not None:
-            meta = {key: value for key, value in meta.items() if key != BLOCKED_META_KEY}
         import datetime as _dt
 
         from sqlalchemy import select
@@ -1283,7 +1297,7 @@ class SQLStateStore(SQLBlobCatalog):
                     parent_run_id=parent_run_id,
                     delegation_level=delegation_level,
                     tenant_id=tenant_id,
-                    meta=meta,
+                    meta=_creation_metadata(session, self, run_id, meta),
                     last_progress_at=_dt.datetime.now(_dt.UTC),
                     idempotency_key=idempotency_key,
                     idempotency_fingerprint=idempotency_fingerprint,

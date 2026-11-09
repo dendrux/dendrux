@@ -21,7 +21,7 @@ import asyncio
 import inspect
 import json
 import logging
-from contextlib import aclosing, asynccontextmanager
+from contextlib import aclosing, asynccontextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from functools import partial
@@ -42,6 +42,7 @@ from dendrux._lifecycle import (
 )
 from dendrux._lifecycle import PAUSE_STATUSES as _PAUSE_STATUSES
 from dendrux._meta_keys import (
+    BLOCKED_META_KEY,
     CANCEL_PERSISTED_META_KEY,
     ERROR_INFO_META_KEY,
     LOOP_META_KEY,
@@ -2059,7 +2060,7 @@ async def _record_user_trace(
     Its image parts (``meta["dendrux.parts"]``) are edged by the recorder in
     the trace transaction (non-live blobs skipped there).
     """
-    await record_message(recorder, run_id, user_msg, 0)
+    user_msg = await record_message(recorder, run_id, user_msg, 0)
     await notify_message(notifier, run_id, user_msg, 0)
 
 
@@ -2140,7 +2141,11 @@ def _new_run_input(
     image_input = bool(items) or history_has_images(history)
     if image_input:
         _require_image_loop(loop)
-    return text, items, image_input, [] if image_input else normalize_chat_history(history)
+    return text, items, image_input, _text_history(history, image_input)
+
+
+def _text_history(history: list[ChatMessage] | None, images: bool) -> list[Message]:
+    return [] if images else normalize_chat_history(history)
 
 
 def _new_run_history(
@@ -2209,7 +2214,7 @@ def _new_run_metadata(
     retry_of: str | None = None,
     streaming: bool = False,
 ) -> tuple[dict[str, Any], str | None]:
-    result = dict(metadata) if metadata else {}
+    result = {key: value for key, value in (metadata or {}).items() if key != BLOCKED_META_KEY}
     result[LOOP_META_KEY] = type(loop).__name__
     result[GOVERNANCE_KEY] = governance_snapshot(agent)
     if session.configured:
@@ -2508,6 +2513,15 @@ async def run(
         provider_kwargs = dict(kwargs)
 
         run_id = generate_ulid()
+        from dendrux.runtime._entry_guardrails import _entry_projection
+
+        entry_projection = _entry_projection(agent, run_id)
+        history = await entry_projection.history(history)
+        context = await entry_projection.context(context)
+        user_input, input_items = await entry_projection.text_items(
+            user_input, input_items, Role.USER, len(history or []) + 1
+        )
+        normalized_history = _text_history(history, image_input)
 
         # Images: ingest before the first durable write (§5.2). Typed errors
         # raise here, before any run row or claim exists.
@@ -2548,7 +2562,20 @@ async def run(
 
         # Resolve system prompt BEFORE create_run() so skill loading
         # failures don't leave a DB row stuck in running.
-        _system_prompt = agent.get_system_prompt(loop=resolved_loop)
+        _system_prompt = (
+            await entry_projection.project(
+                Message(Role.SYSTEM, agent.get_system_prompt(loop=resolved_loop)), 0
+            )
+        ).content
+        (
+            seeded_history,
+            normalized_history,
+            context,
+            user_input,
+            user_parts,
+        ) = await entry_projection.rendered(
+            seeded_history, normalized_history, context, user_input, user_parts
+        )
 
         ctx_token = None
         mcp_meta: dict[str, Any] = {}
@@ -2556,7 +2583,7 @@ async def run(
         lifecycle = _RunLifecycle(run_id, state_store, getattr(agent, "_task_manager", None))
 
         seed_kwargs: dict[str, Any] = {}
-        run_guardrails = None
+        run_guardrails = entry_projection.engine
         try:
             try:
                 if state_store is not None:
@@ -2593,8 +2620,11 @@ async def run(
                         normalized_history=normalized_history,
                         context=context,
                         user_parts=user_parts,
+                        engine=run_guardrails,
+                        system_prompt=_system_prompt,
                     )
-                    create_result = await _create_runtime_run(
+                    create_result = await _create_projected_run(
+                        entry_projection.error is not None,
                         state_store,
                         resolved_loop,
                         run_id,
@@ -2622,6 +2652,9 @@ async def run(
 
                     run_id = create_result.run_id
                     state_store = lifecycle._claim(state_store, resolved_loop, create_result)
+                    await _verify_projected_creation(
+                        entry_projection.error is not None, state_store, run_id
+                    )
 
                 trace_link, extra_notifier = await _start_new_run(
                     lifecycle,
@@ -2674,6 +2707,7 @@ async def run(
                     user_input=user_input,
                     seeded_history=seeded_history,
                     user_parts=user_parts,
+                    system_prompt=_system_prompt,
                 )
                 await _register_memory_input(image_runtime, state_store, run_id, user_parts)
                 image_view = await _new_run_image_view(
@@ -2701,7 +2735,10 @@ async def run(
                     skill_session,
                 )
 
-                result = await resolved_loop.run(
+                result = await _run_projected_loop(
+                    entry_projection,
+                    resolved_loop,
+                    user_parts,
                     agent=agent,
                     provider=provider,
                     strategy=resolved_strategy,
@@ -2768,6 +2805,80 @@ def _recovery_loop_name(loop: Loop) -> str | None:
     return None
 
 
+async def _create_projected_run(
+    blocked: bool, store: StateStore, loop: Loop, run_id: str, agent_name: str, **kwargs: Any
+) -> CreateRunResult:
+    from dendrux._meta_keys import BLOCKED_META_KEY
+    from dendrux.runtime._blocked_content import _blocked_write
+    from dendrux.runtime.stores.sql.base import SQLStateStore
+
+    native = isinstance(unclaimed_store(store), SQLStateStore)
+    if blocked and not native:
+        kwargs["meta"] = {**(kwargs.get("meta") or {}), BLOCKED_META_KEY: True}
+    scope = _blocked_write(store, run_id) if blocked and native else nullcontext()
+    with scope:
+        return await _create_runtime_run(store, loop, run_id, agent_name, **kwargs)
+
+
+async def _verify_projected_creation(blocked: bool, store: StateStore, run_id: str) -> None:
+    from dendrux.runtime._blocked_content import _require_block_mark
+    from dendrux.runtime.stores.sql.base import SQLStateStore
+
+    if blocked and not isinstance(unclaimed_store(store), SQLStateStore):
+        await _require_block_mark(store, run_id)
+
+
+async def _run_projected_loop(
+    projection: Any, loop: Loop, parts: tuple[ContentPart, ...] | None, **kwargs: Any
+) -> RunResult:
+    if projection.error is not None:
+        return await _blocked_entry_result(
+            projection,
+            kwargs["recorder"],
+            kwargs["notifier"],
+            kwargs["run_id"],
+            kwargs["user_input"],
+            parts,
+            kwargs["initial_history"],
+        )
+    with projection.bind(kwargs["run_id"]):
+        return await loop.run(**kwargs)
+
+
+async def _blocked_entry_result(
+    projection: Any,
+    recorder: LoopRecorder | None,
+    notifier: LoopNotifier | None,
+    run_id: str,
+    user_input: str,
+    parts: tuple[ContentPart, ...] | None,
+    history: list[Message] | None,
+) -> RunResult:
+    from dendrux.loops._helpers import guardrail_meta, notify_governance, record_governance
+    from dendrux.loops.react import _blocked_data
+    from dendrux.types import RunResult
+
+    if history is None:
+        message = Message(Role.USER, user_input, parts=parts)
+        await _record_user_trace(recorder, notifier, run_id, message)
+    data = _blocked_data("incoming", projection.error, projection.findings, projection.location)
+    await record_governance(recorder, run_id, GovernanceEventType.GUARDRAIL_BLOCKED.value, 1, data)
+    warnings: list[str] = []
+    await notify_governance(
+        notifier, run_id, GovernanceEventType.GUARDRAIL_BLOCKED.value, 1, data, warnings=warnings
+    )
+    return RunResult(
+        run_id=run_id,
+        status=RunStatus.ERROR,
+        error=projection.error,
+        iteration_count=1,
+        meta={
+            **guardrail_meta(projection.engine, warnings),
+            "failure_reason": FailureReason.GUARDRAIL_BLOCKED.value,
+        },
+    )
+
+
 async def _create_runtime_run(
     store: StateStore, loop: Loop, run_id: str, agent_name: str, **kwargs: Any
 ) -> CreateRunResult:
@@ -2807,12 +2918,14 @@ async def _runtime_seeds(
     normalized_history: list[Message] | None = None,
     context: list[ContextBlock] | None = None,
     user_parts: tuple[ContentPart, ...] | None = None,
+    engine: Any = None,
+    system_prompt: str | None = None,
 ) -> tuple[dict[str, Any], Any]:
     from dendrux.runtime._capabilities import capabilities
     from dendrux.runtime.persistence import seed_trace_kwargs
 
     if not capabilities(store).checkpointing:
-        return {}, None
+        return {}, engine
     from dendrux.types import _validate_provider_kwargs
 
     native_store = unclaimed_store(store)
@@ -2842,7 +2955,12 @@ async def _runtime_seeds(
     from dendrux.media._runtime import tenant_scope_for
 
     messages = [
-        Message(role=Role.SYSTEM, content=agent.get_system_prompt(loop=loop)),
+        Message(
+            role=Role.SYSTEM,
+            content=(
+                agent.get_system_prompt(loop=loop) if system_prompt is None else system_prompt
+            ),
+        ),
         *(history or []),
     ]
     own_input = (
@@ -2858,7 +2976,20 @@ async def _runtime_seeds(
     )
     from dendrux.guardrails import GuardrailEngine
 
-    engine = GuardrailEngine(agent.guardrails, run_id=run_id) if agent.guardrails else None
+    if engine is None and agent.guardrails:
+        engine = GuardrailEngine(agent.guardrails, run_id=run_id)
+    messages, own_input = await _project_seed_messages(engine, messages, own_input)
+    return {
+        **seed_trace_kwargs(
+            store, messages, tenant_scope=tenant_scope_for(tenant_id), own_input=own_input
+        ),
+        "pii_mapping": engine.get_pii_mapping() if engine else None,
+    }, engine
+
+
+async def _project_seed_messages(
+    engine: Any, messages: list[Message], own_input: Message | None
+) -> tuple[list[Message], Message | None]:
     if engine is not None:
         messages = [
             (await engine.project_incoming_message(m, index=i))[0] for i, m in enumerate(messages)
@@ -2870,12 +3001,7 @@ async def _runtime_seeds(
             own_input = replace(
                 own_input, meta={**own_input.meta, "wire_content": messages[own_index].content}
             )
-    return {
-        **seed_trace_kwargs(
-            store, messages, tenant_scope=tenant_scope_for(tenant_id), own_input=own_input
-        ),
-        "pii_mapping": engine.get_pii_mapping() if engine else None,
-    }, engine
+    return messages, own_input
 
 
 async def _apply_replay(
@@ -2893,6 +3019,7 @@ async def _apply_replay(
     user_input: str,
     seeded_history: list[Message] | None,
     user_parts: tuple[ContentPart, ...] | None = None,
+    system_prompt: str | None = None,
 ) -> tuple[ReplayPlan | None, list[Message] | None]:
     """Expand ``runs=`` into the seeded history and record the prefix descriptor.
 
@@ -2902,6 +3029,10 @@ async def _apply_replay(
     if state_store is None:
         return None, seeded_history
     current = current_prefix(agent, provider, loop, provider_kwargs)
+    if system_prompt is not None:
+        from dendrux.runtime.replay import _hash
+
+        current = replace(current, system_hash=_hash(system_prompt))
     plan: ReplayPlan | None = None
     if replay_req is not None:
         plan = expand_replay(

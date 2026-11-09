@@ -3,6 +3,7 @@
 #: Provider failure ErrorInfo in agent_runs.meta.
 ERROR_INFO_META_KEY = "dendrux.error_info"
 BLOCKED_META_KEY = "dendrux.blocked"
+BLOCKED_INSERT_SESSION_KEY = "dendrux.blocked_insert"
 BLOCKED_RUNS_SESSION_KEY = "dendrux.blocked_runs"
 #: Final normalized stop reason on a successful run.
 STOP_REASON_META_KEY = "dendrux.stop_reason"

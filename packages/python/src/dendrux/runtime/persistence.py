@@ -517,6 +517,11 @@ class PersistenceRecorder(BaseRecorder):
         self._history_limits: Limits | None = None
         self._clarification: dict[str, Any] | None = None
 
+    def _blocked_evidence(self, run_id: str) -> AbstractAsyncContextManager[None]:
+        from dendrux.runtime._blocked_content import _blocked_evidence
+
+        return _blocked_evidence(self._store, run_id)
+
     @property
     def _pause_summary_bytes(self) -> int:
         return (

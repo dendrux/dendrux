@@ -63,6 +63,7 @@ from dendrux.loops._helpers import (
     notify_tool_started,
     order_observations,
     project_message,
+    project_response,
     record_governance,
     record_llm,
     record_llm_started,
@@ -2243,7 +2244,11 @@ def _run_guardrail_engine(
     agent: Agent, recorder: LoopRecorder | None, pii_mapping: dict[str, str] | None, run_id: str
 ) -> GuardrailEngine | None:
     """The recorder's engine (shared with persistence), else one for the agent's guardrails."""
-    shared: GuardrailEngine | None = getattr(recorder, "guardrail_engine", None)
+    from dendrux.guardrails._engine import _entry_engine
+
+    shared: GuardrailEngine | None = getattr(recorder, "guardrail_engine", None) or _entry_engine(
+        run_id
+    )
     if shared:
         return shared
     if not agent.guardrails:
@@ -2254,10 +2259,10 @@ def _run_guardrail_engine(
 async def _incoming_project(
     ctx: _RunContext, engine: GuardrailEngine, msg: Message, index: int
 ) -> tuple[Message, list[Any], str | None, bool]:
-    shared = getattr(ctx.recorder, "guardrail_engine", None) is engine
-    project = engine.project_incoming_message if shared else engine.scan_incoming_message
-    cleaned, findings, blocked = await project(msg, index=index)
-    redacted = engine.projected_redaction(cleaned) if shared else cleaned is not msg
+    if getattr(ctx.recorder, "guardrail_engine", None) is not engine:
+        engine._retain_allowed_findings = True
+    cleaned, findings, blocked = await engine.project_incoming_message(msg, index=index)
+    redacted = engine.projected_redaction(cleaned)
     return cleaned, findings, blocked, redacted
 
 
@@ -2425,18 +2430,7 @@ async def _outgoing_blocked(
     findings: list[Any],
 ) -> RunResult:
     """Record the scrubbed response, count it, then ``guardrail.blocked`` and ERROR."""
-    # Scrub before recording: a block means the original text/params
-    # contain the PII that triggered it.
-    blocked_response = LLMResponse(
-        text="[blocked by guardrail]",
-        tool_calls=None,
-        raw=response.raw,
-        usage=response.usage,
-        provider_request=response.provider_request,
-        provider_response=None,
-        stop_reason=response.stop_reason,
-        raw_stop_reason=response.raw_stop_reason,
-    )
+    blocked_response = response
     await _record_llm(
         ctx.recorder,
         ctx.run_id,
@@ -2446,6 +2440,7 @@ async def _outgoing_blocked(
         semantic_tools=tools,
         duration_ms=duration_ms,
         guardrail_findings=ctx.images.findings(prepared, all_findings),
+        blocked=True,
     )
     await _notify_llm(
         ctx.notifier,
@@ -2497,8 +2492,7 @@ async def _scan_outgoing(
     engine = ctx.g_engine
     if engine is None or not (response.text or response.tool_calls):
         return None
-    tc_params = [tc.params for tc in response.tool_calls] if response.tool_calls else None
-    out_findings, out_block = await engine.scan_outgoing(response.text or "", tc_params)
+    response, out_findings, out_block = await project_response(engine, response)
     if out_findings:
         await _outgoing_detected(ctx, out_findings, iteration, all_findings)
     if out_block is None:

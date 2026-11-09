@@ -295,7 +295,10 @@ async def record_message(
     """Project then record a message; callers retain the returned provider form."""
     message = await project_message(recorder, message)
     if recorder is not None:
-        await recorder.on_message_appended(run_id, message, iteration)
+        engine = getattr(recorder, "guardrail_engine", None)
+        blocked = engine is not None and engine._projected_block(message) is not None
+        async with _evidence_scope(recorder, run_id, blocked):
+            await recorder.on_message_appended(run_id, message, iteration)
     return message
 
 
@@ -369,6 +372,41 @@ def price_response(
     return replace(response, usage=priced)
 
 
+def _evidence_scope(
+    recorder: LoopRecorder, run_id: str, blocked: bool
+) -> AbstractAsyncContextManager[Any]:
+    scope = getattr(recorder, "_blocked_evidence", None)
+    return scope(run_id) if blocked and scope is not None else nullcontext()
+
+
+async def project_response(
+    engine: GuardrailEngine, response: LLMResponse
+) -> tuple[LLMResponse, list[Any], str | None]:
+    from dendrux.types import LLMResponse, Message, Role
+
+    projected, findings, blocked = await engine._project_outgoing_message(
+        Message(
+            Role.ASSISTANT,
+            response.text or "",
+            tool_calls=response.tool_calls,
+            reasoning=response.reasoning,
+            reasoning_blocks=response.reasoning_blocks,
+        )
+    )
+    if blocked is None:
+        return response, findings, None
+    return (
+        LLMResponse(
+            text=projected.content,
+            usage=response.usage,
+            model=response.model,
+            stop_reason=response.stop_reason,
+        ),
+        findings,
+        blocked,
+    )
+
+
 async def record_llm(
     recorder: LoopRecorder | None,
     run_id: str,
@@ -379,19 +417,21 @@ async def record_llm(
     semantic_tools: list[ToolDef] | None = None,
     duration_ms: int | None = None,
     guardrail_findings: dict[str, Any] | None = None,
+    blocked: bool = False,
 ) -> None:
     """Record LLM completion to authoritative persistence. Exceptions propagate."""
     if recorder is None:
         return
-    await recorder.on_llm_call_completed(
-        run_id,
-        response,
-        iteration,
-        semantic_messages=semantic_messages,
-        semantic_tools=semantic_tools,
-        duration_ms=duration_ms,
-        guardrail_findings=guardrail_findings,
-    )
+    async with _evidence_scope(recorder, run_id, blocked):
+        await recorder.on_llm_call_completed(
+            run_id,
+            response,
+            iteration,
+            semantic_messages=semantic_messages,
+            semantic_tools=semantic_tools,
+            duration_ms=duration_ms,
+            guardrail_findings=guardrail_findings,
+        )
 
 
 async def record_llm_failed(

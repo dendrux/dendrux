@@ -233,7 +233,7 @@ class TestPIIMappingPersistenceAllPaths:
     """
 
     async def test_incoming_block_returns_mapping_in_meta(self):
-        """Block on incoming still surfaces everything scanned so far."""
+        """A blocked message discards its new reversible mapping."""
         llm = MockLLM([_response("ok")])
         agent = Agent(
             prompt="Helper.",
@@ -253,10 +253,7 @@ class TestPIIMappingPersistenceAllPaths:
 
         assert result.status == RunStatus.ERROR
         mapping = result.meta.get("pii_mapping") or {}
-        # The email was redacted before the secret blocked the run; the
-        # mapping must carry the email entry so the raw trace is replayable.
-        assert "<<EMAIL_ADDRESS_1>>" in mapping
-        assert mapping["<<EMAIL_ADDRESS_1>>"] == "jane@example.com"
+        assert mapping == {}
 
     async def test_single_call_success_returns_mapping_in_meta(self):
         llm = MockLLM([_response("Classified.")])
@@ -297,7 +294,7 @@ class TestPIIMappingPersistenceAllPaths:
 
         assert result.status == RunStatus.ERROR
         mapping = result.meta.get("pii_mapping") or {}
-        assert mapping["<<EMAIL_ADDRESS_1>>"] == "jane@example.com"
+        assert mapping == {}
 
 
 # ------------------------------------------------------------------

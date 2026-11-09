@@ -28,6 +28,8 @@ def corpus(cell_id: str) -> dict:
         assert row["failure_reason"] == "guardrail_blocked"
         assert "dendrux.blocked" not in row["meta"]
         row["meta"]["dendrux.blocked"] = True
+        row["input_data"]["input"] = "[blocked: 1 finding]"
+        expected["rows"]["react_traces"][0]["content"] = "[blocked: 1 finding]"
     if cell_id == "retry__after_success":
         messages = expected["calls"][2]["messages"]
         final = messages[-1]
@@ -55,6 +57,17 @@ def golden(cell_id: str, *, legacy: bool = False) -> dict:
     if legacy and (variant := h.golden_path(cell_id, "legacy")).exists():
         path = variant
     expected = h.read_json(path)
+    if legacy and cell_id == "guardrail_block__run":
+        run = expected["runs"][0]
+        run["events"] = [["run.error", 0]]
+        run["trace_roles"] = []
+        run["record"].update(
+            error="Database operation failed (persistence_error).",
+            failure_reason=None,
+            iteration_count=0,
+        )
+        expected["steps"][0].pop("result")
+        expected["steps"][0]["raised"] = ["PersistenceError", "RuntimeError", "Exception"]
     if cell_id in REJECTED_POSITIONS:
         expected["provider_calls"][1]["messages_sha256"] = h.messages_digest(
             corpus(cell_id)["calls"][1]["messages"]
