@@ -25,7 +25,6 @@ from dendrux.runtime._bounds import MAX_PAGE
 from dendrux.runtime.persistence import PersistenceRecorder, resolve_pending
 from dendrux.runtime.state import claimed_store
 from dendrux.types import (
-    AgentStep,
     Message,
     PauseState,
     Role,
@@ -239,6 +238,12 @@ async def rebuild_pause(
     pause.steps = rebuilt.steps
     pause.pending_tool_calls = [calls[call_id] for call_id in pending]
     pause.pending_targets = {p["call_id"]: p["target"] for p in pending.values()}
+    # The checkpoint decision supersedes gates in an older approval snapshot.
+    pause.approval_gates = {
+        call_id: gate
+        for call_id, gate in (pause.approval_gates or {}).items()
+        if pending.get(call_id, {}).get("phase") not in {"approved", "rejected"}
+    } or None
     await _overlay_pause_checkpoint(
         pause, store, run_id, agent, state, rebuilt.steps, recovery=True
     )
@@ -277,9 +282,14 @@ def _checkpoint_resolution(
     if all(p.get("target") == "client" for p in remaining):
         return False
     # A requested pause is not an approval decision. The checkpoint retains
-    # unresolved gates even before an intent or approval pause exists.
+    # unresolved governance even before a hook, intent or approval pause exists.
     if pause.pause_reason == PauseReason.REQUESTED.value and any(
-        p.get("target") == "server" and p.get("phase") == "gated" for p in remaining
+        p.get("target") == "server"
+        and (
+            p.get("phase") == "gated"
+            or (p.get("phase") == "dispatchable" and p.get("decision_id") is None)
+        )
+        for p in remaining
     ):
         return True
     return None
@@ -344,6 +354,7 @@ async def _recovery_approval(
     lookups: Any,
     descriptor: dict[str, Any],
     payload: dict[str, Any],
+    pause: PauseState,
 ) -> list[Message]:
     from dendrux.runtime.runner import (
         _approval_outcomes,
@@ -351,8 +362,10 @@ async def _recovery_approval(
         _record_approval_decided,
     )
 
-    pause = ctx.pause_state
-    outcomes = _approval_outcomes(pause, lookups.target, _recovery_decisions(payload))
+    decisions = _recovery_decisions(payload)
+    outcomes = _approval_outcomes(pause, lookups.target, decisions)
+    if payload.get("approved") is False and "submitted_decisions" not in payload:
+        outcomes = [(tc, "denied", decisions[tc.id].reason) for tc in pause.pending_tool_calls]
     await _record_approval_decided(
         ctx.recorder,
         ctx.notifier,
@@ -362,12 +375,27 @@ async def _recovery_approval(
         event_id=descriptor["submission_id"],
     )
     rows = await store.get_tool_calls(run_id, iteration_index=pause.iteration, limit=MAX_PAGE)
-    started = {row.tool_call_id for row in rows if row.outcome == "started"}
-    return [
-        _recovery_denial(tc, reason)
-        for tc, outcome, reason in outcomes
-        if outcome == "denied" and tc.id not in started
-    ]
+    return await _recovery_denied_calls(ctx, run_id, outcomes, rows)
+
+
+async def _recovery_denied_calls(
+    ctx: _ResumeContext, run_id: str, outcomes: Any, rows: Any
+) -> list[Message]:
+    recorder = cast("PersistenceRecorder", ctx.recorder)
+    by_id = {row.tool_call_id: row for row in rows}
+    messages = []
+    for tc, outcome, reason in outcomes:
+        if outcome != "denied":
+            continue
+        row = by_id.get(tc.id)
+        if row is None:
+            messages.append(_recovery_denial(tc, reason))
+        elif row.outcome == "started" and tc.id not in (ctx.pause_state.approval_gates or {}):
+            # Consumption changes phases only for gated calls. Resolve a denied
+            # held intent first so a second crash cannot revive its old approval.
+            recorder._started_calls.add(tc.id)
+            await _observe_recovery_call(ctx, run_id, tc, row, "resolve")
+    return messages
 
 
 async def _consume_recovery_submission(
@@ -382,7 +410,9 @@ async def _consume_recovery_submission(
         payload = _submission_payload(raw)
         injected = _recovery_input(payload, descriptor["kind"])
         if descriptor["kind"] == "approval":
-            injected = await _recovery_approval(store, run_id, ctx, lookups, descriptor, payload)
+            injected = await _recovery_approval(
+                store, run_id, ctx, lookups, descriptor, payload, PauseState.from_dict(raw)
+            )
         injected = [await project_message(recorder, message) for message in injected]
         await recorder.consume_resume(injected)
         ctx.history.extend(injected)
@@ -523,9 +553,12 @@ async def _dispatch_recovery_call(
     image_runtime: Any,
     tenant_id: str | None,
     on_work: Callable[[], None] | None,
+    *,
+    prepare_only: bool = False,
+    anticipated_skills: set[str] | None = None,
 ) -> Any:
     from dendrux.loops._policy_context import dispatch_policy
-    from dendrux.loops.react import _process_tool_calls
+    from dendrux.loops.react import _prepare_tool_calls, _ToolCallOutcome
     from dendrux.runtime.runner import _mark_work
 
     recorder = cast("PersistenceRecorder", ctx.recorder)
@@ -539,28 +572,63 @@ async def _dispatch_recovery_call(
         before_tool=agent.before_tool,
     )
     _mark_work(on_work)
-    return await _process_tool_calls(
-        step=AgentStep(reasoning=None, action=tc),
+    batch = _recovery_batch(ctx, run_id)
+    ready, gates = await _prepare_tool_calls(
+        [tc],
+        batch=batch,
         call_counts=counts,
         lookups=lookups,
+        deny=agent.deny,
+        tenant_id=tenant_id,
+        guardrail_engine=recorder.guardrail_engine,
+        image_runtime=image_runtime,
+        anticipated_skills=anticipated_skills,
+        **policy,
+    )
+    if gates or prepare_only:
+        return _ToolCallOutcome(batch.all_results, ready, bool(gates), gates or None)
+    return await _execute_recovery_calls(agent, ready, lookups, counts, batch, image_runtime)
+
+
+def _recovery_batch(ctx: _ResumeContext, run_id: str) -> Any:
+    from dendrux.loops.react import _ToolBatch
+
+    return _ToolBatch(
         strategy=ctx.resolved_strategy,
-        recorder=recorder,
+        recorder=ctx.recorder,
         notifier=ctx.notifier,
         run_id=run_id,
         iteration=ctx.pause_state.iteration,
         history=ctx.history,
         warnings=[],
-        deny=agent.deny,
-        tenant_id=tenant_id,
-        guardrail_engine=recorder.guardrail_engine,
-        tool_result_transform=agent.tool_result_transform,
-        image_runtime=image_runtime,
-        **policy,
     )
 
 
+async def _execute_recovery_calls(
+    agent: Agent,
+    calls: list[ToolCall],
+    lookups: Any,
+    counts: dict[str, int],
+    batch: Any,
+    image_runtime: Any,
+) -> Any:
+    from dendrux.loops.react import (
+        _dispatch_server_calls,
+        _record_executed,
+        _split_targets,
+        _ToolCallOutcome,
+    )
+
+    server, client = _split_targets(calls, lookups)
+    executed = await _dispatch_server_calls(
+        server, lookups, batch, agent.tool_result_transform, image_runtime
+    )
+    await _record_executed(executed, counts, batch)
+    return _ToolCallOutcome(batch.all_results, client)
+
+
 def _hold_started_outcome(row: Any, outcome: Any, gates: dict[str, Any]) -> None:
-    if row is not None and row.outcome == "started":
+    if outcome.pending_approval and row is not None and row.outcome == "started":
         for call in outcome.pending_calls:
             gates[call.id] = recovery_gate()
 
@@ -605,6 +673,71 @@ async def _recovery_pause_result(
     )
 
 
+async def _dispatch_prepared_batch(
+    agent: Agent,
+    store: StateStore,
+    run_id: str,
+    ctx: _ResumeContext,
+    actions: Any,
+    held: list[ToolCall],
+    gates: dict[str, Any],
+    rows: dict[str, Any],
+    lookups: Any,
+    counts: dict[str, int],
+    image_runtime: Any,
+) -> tuple[list[ToolCall], RunResult | None]:
+    if gates:
+        return held, None
+    remaining = {tc.id: tc for tc in held}
+    dispatches = [a for a in actions if a.call_id in remaining]
+    held = []
+    for index, action in enumerate(dispatches):
+        assert action.call_id is not None
+        if action.kind == "wait_client":
+            held.append(remaining[action.call_id])
+            continue
+        barrier = await _recovery_barrier(
+            store,
+            run_id,
+            ctx.pause_state,
+            ctx.history,
+            dispatches,
+            index,
+            remaining,
+            held,
+            rows,
+            gates,
+        )
+        if barrier is not None:
+            return held, barrier
+        outcome = await _execute_recovery_calls(
+            agent,
+            [remaining[action.call_id]],
+            lookups,
+            counts,
+            _recovery_batch(ctx, run_id),
+            image_runtime,
+        )
+        held.extend(outcome.pending_calls)
+    return held, None
+
+
+async def _resolve_saved_call(
+    ctx: _ResumeContext,
+    run_id: str,
+    tc: ToolCall,
+    action: Any,
+    row: Any,
+    held: list[ToolCall],
+    gates: dict[str, Any],
+) -> bool:
+    if await _hold_recovery_call(ctx, run_id, tc, action, held, gates):
+        return True
+    if row is not None and row.outcome == "started":
+        cast("PersistenceRecorder", ctx.recorder)._started_calls.add(tc.id)
+    return await _observe_recovery_call(ctx, run_id, tc, row, action.kind)
+
+
 async def resolve(
     agent: Agent,
     store: StateStore,
@@ -635,6 +768,8 @@ async def resolve(
     held: list[ToolCall] = []
     gates: dict[str, Any] = {}
     phases = {p["call_id"]: p["phase"] for p in pending}
+    reserved_counts = counts.copy()
+    anticipated_skills: set[str] = set()
     for index, action in enumerate(actions):
         barrier = await _recovery_barrier(
             store, run_id, pause, ctx.history, actions, index, calls, held, by_id, gates
@@ -645,11 +780,7 @@ async def resolve(
             raise PersistenceError(code="recovery_submission_missing")
         tc = calls[action.call_id]
         row = by_id.get(tc.id)
-        if await _hold_recovery_call(ctx, run_id, tc, action, held, gates):
-            continue
-        if row is not None and row.outcome == "started":
-            recorder._started_calls.add(tc.id)
-        if await _observe_recovery_call(ctx, run_id, tc, row, action.kind):
+        if await _resolve_saved_call(ctx, run_id, tc, action, row, held, gates):
             continue
         outcome = await _dispatch_recovery_call(
             agent,
@@ -659,13 +790,22 @@ async def resolve(
             action.kind,
             phases[tc.id],
             lookups,
-            counts,
+            reserved_counts,
             image_runtime,
             tenant_id,
             on_work,
+            prepare_only=True,
+            anticipated_skills=anticipated_skills,
         )
         held.extend(outcome.pending_calls)
         gates.update(outcome.approval_gates or {})
         _hold_started_outcome(row, outcome, gates)
+        for ready in outcome.pending_calls:
+            reserved_counts[ready.name] = reserved_counts.get(ready.name, 0) + 1
+    held, barrier = await _dispatch_prepared_batch(
+        agent, store, run_id, ctx, actions, held, gates, by_id, lookups, counts, image_runtime
+    )
+    if barrier is not None:
+        return barrier
     order_observations(recorder, ctx.history)
     return await _recovery_pause_result(store, run_id, ctx, state, descriptor, held, gates)

@@ -1044,6 +1044,8 @@ async def _preflight_skills(
     session: SkillSession,
     approved: bool,
     batch: _ToolBatch,
+    *,
+    anticipated: set[str] | None = None,
 ) -> list[ToolCall]:
     """Stage 6b. Skill preflight before approval.
 
@@ -1051,7 +1053,8 @@ async def _preflight_skills(
     rechecks against the activations that actually succeed.
     """
     ready: list[ToolCall] = []
-    anticipated: set[str] = set()
+    if anticipated is None:
+        anticipated = set()
     for tc in calls:
         is_skill = isinstance(lookups.fn.get(tc.name), SkillTool)
         failure = (
@@ -1191,6 +1194,52 @@ def _pii_placeholders(engine: GuardrailEngine | None) -> dict[str, str]:
     return placeholder_mapping(engine.get_pii_mapping()) if engine is not None else {}
 
 
+async def _prepare_tool_calls(
+    all_calls: list[ToolCall],
+    *,
+    batch: _ToolBatch,
+    call_counts: dict[str, int],
+    lookups: ToolLookups,
+    deny: frozenset[str] | None = None,
+    require_approval: frozenset[str] | None = None,
+    guardrail_engine: GuardrailEngine | None = None,
+    approved_skills: bool = False,
+    before_tool: BeforeToolHook | None = None,
+    tenant_id: str | None = None,
+    image_runtime: ImageRuntime | None = None,
+    anticipated_skills: set[str] | None = None,
+) -> tuple[list[ToolCall], dict[str, dict[str, str | None]]]:
+    session = _bind_skill_session(lookups, batch.governance)
+    calls = await _reject_invalid_json(all_calls, lookups, session, batch)
+    calls = await _apply_static_deny(calls, deny or frozenset(), batch)
+    calls = await _reject_unknown(calls, lookups, batch)
+    pii_mapping = _pii_placeholders(guardrail_engine)
+    # The arguments as the model sent them (placeholder form, pre-restore and
+    # pre-coercion), per call id: the only form approval views ever show.
+    sent_params: dict[str, dict[str, Any]] = {tc.id: tc.params for tc in calls}
+    calls = await _restore_calls(guardrail_engine, calls, lookups, batch)
+    calls = await _validate_calls(calls, lookups, frozenset(pii_mapping), batch)
+    calls = await _enforce_limits(calls, lookups, call_counts, batch)
+    if session is not None:
+        calls = await _preflight_skills(
+            calls, lookups, session, approved_skills, batch, anticipated=anticipated_skills
+        )
+    gates = _static_gates(calls, require_approval)
+    if before_tool is not None:
+        calls = await _apply_before_tool(
+            before_tool,
+            calls,
+            gates,
+            batch,
+            lookups=lookups,
+            tenant_id=tenant_id,
+            image_runtime=image_runtime,
+        )
+    if gates:
+        await _request_approvals(calls, gates, sent_params, pii_mapping, batch)
+    return calls, gates
+
+
 async def _process_tool_calls(
     *,
     step: AgentStep,
@@ -1232,33 +1281,20 @@ async def _process_tool_calls(
         history=history,
         warnings=warnings,
     )
-    session = _bind_skill_session(lookups, batch.governance)
-    all_calls: list[ToolCall] = step.meta.get("all_tool_calls", [step.action])
-    calls = await _reject_invalid_json(all_calls, lookups, session, batch)
-    calls = await _apply_static_deny(calls, deny or frozenset(), batch)
-    calls = await _reject_unknown(calls, lookups, batch)
-    pii_mapping = _pii_placeholders(guardrail_engine)
-    # The arguments as the model sent them (placeholder form, pre-restore and
-    # pre-coercion), per call id: the only form approval views ever show.
-    sent_params: dict[str, dict[str, Any]] = {tc.id: tc.params for tc in calls}
-    calls = await _restore_calls(guardrail_engine, calls, lookups, batch)
-    calls = await _validate_calls(calls, lookups, frozenset(pii_mapping), batch)
-    calls = await _enforce_limits(calls, lookups, call_counts, batch)
-    if session is not None:
-        calls = await _preflight_skills(calls, lookups, session, approved_skills, batch)
-    gates = _static_gates(calls, require_approval)
-    if before_tool is not None:
-        calls = await _apply_before_tool(
-            before_tool,
-            calls,
-            gates,
-            batch,
-            lookups=lookups,
-            tenant_id=tenant_id,
-            image_runtime=image_runtime,
-        )
+    calls, gates = await _prepare_tool_calls(
+        step.meta.get("all_tool_calls", [step.action]),
+        batch=batch,
+        call_counts=call_counts,
+        lookups=lookups,
+        deny=deny,
+        require_approval=require_approval,
+        guardrail_engine=guardrail_engine,
+        approved_skills=approved_skills,
+        before_tool=before_tool,
+        tenant_id=tenant_id,
+        image_runtime=image_runtime,
+    )
     if gates:
-        await _request_approvals(calls, gates, sent_params, pii_mapping, batch)
         return _ToolCallOutcome(
             all_results=batch.all_results,
             pending_calls=calls,
