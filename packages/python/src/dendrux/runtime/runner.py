@@ -1174,7 +1174,7 @@ def _in_memory_pending(result: RunResult) -> Any:
 
 async def _recovery_info(store: StateStore, record: Any, *, best_effort: bool = True) -> Any:
     """Project recovery strictly for reads, or best effort after a durable outcome."""
-    if record is None or not getattr(record, "reclaim_attempts", 0):
+    if record is None or getattr(record, "last_reclaimed_at", None) is None:
         return None
     return await _read_recovery_info(store, record, best_effort=best_effort)
 

@@ -248,6 +248,87 @@ def _status_values(status: Any, *, initial: bool = False) -> dict[str, Any]:
     }
 
 
+def _advancing_turn(trace: TraceWrite | None) -> bool:
+    return (
+        trace is not None
+        and trace.advances_progress
+        and trace.trace_kind == "turn"
+        and trace.role in ("assistant", "tool")
+    )
+
+
+def _checkpoint_progress(trace: TraceWrite | None) -> dict[str, Any]:
+    from sqlalchemy import case, exists
+
+    from dendrux.db.models import AgentRun, ReactTrace
+
+    if not _advancing_turn(trace):
+        return {}
+    assert trace is not None
+    # The existing fence also checks freshness, so a retried trace cannot
+    # erase crashes accumulated since its original commit.
+    fresh = ~exists(select(ReactTrace.id).where(ReactTrace.id == trace.trace_id))
+    return {"reclaim_attempts": case((fresh, 0), else_=AgentRun.reclaim_attempts)}
+
+
+def _progress_values(advancing: bool) -> dict[str, Any]:
+    return {"reclaim_attempts": 0} if advancing else {}
+
+
+def _submission_progress(current: dict[str, Any], traces: Sequence[TraceWrite]) -> dict[str, Any]:
+    advancing = (current.get("submission") or {}).get("kind") == "tool_results" and any(
+        _advancing_turn(trace) for trace in traces
+    )
+    return _progress_values(advancing)
+
+
+def _final_progress(status: str, answer: str | None, claim_epoch: int | None) -> dict[str, Any]:
+    from sqlalchemy import case
+
+    from dendrux.db.models import AgentRun
+
+    if status != RunStatus.SUCCESS.value or answer is None or claim_epoch is None:
+        return {}
+    return {
+        "reclaim_attempts": case(
+            (
+                and_(
+                    AgentRun.storage_format == STORAGE_FORMAT_CHECKPOINTED,
+                    AgentRun.status.notin_(_TERMINAL_STATUS_VALUES),
+                ),
+                0,
+            ),
+            else_=AgentRun.reclaim_attempts,
+        )
+    }
+
+
+async def _final_output_values(
+    session: AsyncSession,
+    run_id: str,
+    answer: str | None,
+    error: str | None,
+    iteration_count: int | None,
+    total_usage: UsageStats | None,
+    pii_mapping: dict[str, str] | None,
+    failure_reason: str | None,
+) -> dict[str, Any]:
+    values: dict[str, Any] = {}
+    if iteration_count is not None:
+        values["iteration_count"] = iteration_count
+    if answer is not None or total_usage is not None:
+        values["output_data"] = await _finalized_output_data(session, run_id, answer, total_usage)
+    if error is not None:
+        values["error"] = error
+    if total_usage is not None:
+        values.update(_usage_totals(total_usage))
+    if pii_mapping is not None:
+        values["pii_mapping"] = pii_mapping
+    if failure_reason is not None:
+        values["failure_reason"] = failure_reason
+    return values
+
+
 def _check_create_identifiers(
     run_id: str,
     agent_name: str,
@@ -1696,7 +1777,7 @@ class SQLStateStore(SQLBlobCatalog):
     ) -> None:
         """Commit a bounded execution projection and optional trace under one fence."""
         _validate_checkpoint(run_id, loop_state)
-        values: dict[str, Any] = {"loop_state": loop_state}
+        values: dict[str, Any] = {"loop_state": loop_state, **_checkpoint_progress(trace)}
         if pii_mapping is not None:
             values["pii_mapping"] = pii_mapping
         async with self._session_factory() as session:
@@ -1714,6 +1795,7 @@ class SQLStateStore(SQLBlobCatalog):
         *,
         count_tool: str | None = None,
         pii_mapping: dict[str, str] | None = None,
+        progress: bool = False,
     ) -> None:
         from sqlalchemy import select, update
 
@@ -1723,6 +1805,7 @@ class SQLStateStore(SQLBlobCatalog):
         if "pending" in patch.set_fields:
             raise ValueError("A patch cannot replace pending; remove calls by identity")
         _validate_checkpoint(run_id, dict(patch.set_fields))
+        progress_values = _progress_values(progress)
         changed = self.json_patch_expr(AgentRun.loop_state, PatchLoopState(patch, count_tool))
         if changed is not None:
             result = await self._update_one_rows(
@@ -1734,6 +1817,7 @@ class SQLStateStore(SQLBlobCatalog):
                     updated_at=_dt.datetime.now(_dt.UTC),
                     last_progress_at=_dt.datetime.now(_dt.UTC),
                     loop_state=changed,
+                    **progress_values,
                     **{"pii_mapping": pii_mapping} if pii_mapping is not None else {},
                 ),
                 returning=[AgentRun.loop_state],
@@ -1743,7 +1827,9 @@ class SQLStateStore(SQLBlobCatalog):
                 # Same compact UTF-8 measure as checkpoint_step and SQLite.
                 # A failed bound rolls back the patch and the whole completion.
                 _validate_checkpoint(run_id, merged)
-                self._remember_run_values(session, run_id, {"loop_state": merged})
+                self._remember_run_values(
+                    session, run_id, {"loop_state": merged, **progress_values}
+                )
             else:
                 epoch = await session.scalar(
                     select(AgentRun.claim_epoch).where(AgentRun.id == run_id)
@@ -1757,6 +1843,7 @@ class SQLStateStore(SQLBlobCatalog):
                 session,
                 run_id,
                 claim_epoch,
+                **progress_values,
                 **({"pii_mapping": pii_mapping} if pii_mapping is not None else {}),
             )
             current = await session.scalar(select(AgentRun.loop_state).where(AgentRun.id == run_id))
@@ -1893,6 +1980,7 @@ class SQLStateStore(SQLBlobCatalog):
                 loop_state_patch,
                 count_tool=(observation.meta or {}).get("tool_name"),
                 pii_mapping=pii_mapping,
+                progress=_advancing_turn(observation),
             )
             row_id = (
                 await self._update_many_rows(
@@ -1961,16 +2049,15 @@ class SQLStateStore(SQLBlobCatalog):
                 return False
             changed = _apply_loop_patch(current, patch)
             changed["submission"] = None
-            self._remember_run_values(session, run_id, {"loop_state": changed})
+            values = {"loop_state": changed, **_submission_progress(current, traces)}
+            self._remember_run_values(session, run_id, values)
             _validate_checkpoint(run_id, changed)
             pause = dict(row.pause_data or {})
             pause.pop("submission", None)
             for trace in traces:
                 await self._insert_trace(session, run_id, trace)
             await session.execute(
-                update(AgentRun)
-                .where(AgentRun.id == run_id)
-                .values(loop_state=changed, pause_data=pause)
+                update(AgentRun).where(AgentRun.id == run_id).values(**values, pause_data=pause)
             )
             self._mark_announce(session, (run_id,))
             await self._write_tx(session)
@@ -2297,22 +2384,20 @@ class SQLStateStore(SQLBlobCatalog):
                 # updated_at is filled by the model's onupdate hook (Python aware-UTC).
                 values: dict[str, Any] = {
                     **_status_values(status),
+                    **_final_progress(status, answer, claim_epoch),
                 }
-                if iteration_count is not None:
-                    values["iteration_count"] = iteration_count
-                if answer is not None or total_usage is not None:
-                    values["output_data"] = await _finalized_output_data(
-                        session, run_id, answer, total_usage
+                values.update(
+                    await _final_output_values(
+                        session,
+                        run_id,
+                        answer,
+                        error,
+                        iteration_count,
+                        total_usage,
+                        pii_mapping,
+                        failure_reason,
                     )
-                if error is not None:
-                    values["error"] = error
-                if total_usage is not None:
-                    values.update(_usage_totals(total_usage))
-                if pii_mapping is not None:
-                    values["pii_mapping"] = pii_mapping
-
-                if failure_reason is not None:
-                    values["failure_reason"] = failure_reason
+                )
                 # Clear pause_data on finalize (D1: execution state cleaned up)
                 values["pause_data"] = None
                 # Clear cooperative cancel flag — terminal state is final;
@@ -2517,6 +2602,7 @@ class SQLStateStore(SQLBlobCatalog):
         # updated_at is filled by the model's onupdate hook (Python aware-UTC).
         values: dict[str, Any] = {
             **_status_values(status),
+            **_final_progress(status, answer, claim_epoch),
             "pause_data": None,
             "cancel_requested": False,
             "pause_requested": False,
@@ -2541,20 +2627,18 @@ class SQLStateStore(SQLBlobCatalog):
             (AgentRun.storage_format == STORAGE_FORMAT_CHECKPOINTED, finalized_state),
             else_=AgentRun.loop_state,
         )
-        if iteration_count is not None:
-            values["iteration_count"] = iteration_count
-        if answer is not None or total_usage is not None:
-            values["output_data"] = await _finalized_output_data(
-                session, run_id, answer, total_usage
+        values.update(
+            await _final_output_values(
+                session,
+                run_id,
+                answer,
+                error,
+                iteration_count,
+                total_usage,
+                pii_mapping,
+                failure_reason,
             )
-        if error is not None:
-            values["error"] = error
-        if total_usage is not None:
-            values.update(_usage_totals(total_usage))
-        if pii_mapping is not None:
-            values["pii_mapping"] = pii_mapping
-        if failure_reason is not None:
-            values["failure_reason"] = failure_reason
+        )
 
         self._remember_run_values(session, run_id, values)
         stmt = update(AgentRun).where(

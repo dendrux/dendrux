@@ -350,6 +350,8 @@ MUTANTS = {
             "test_an_oversized_checkpoint_is_refused_and_writes_nothing",
             "test_an_unpersistable_checkpoint_is_refused_before_any_write",
             "test_marking_is_repeatable_until_the_run_is_reclaimed",
+            "test_progress_resets_recovery_streak_in_its_checkpoint",
+            "test_reused_observation_and_duplicate_checkpoint_preserve_streak",
             "test_seeds_rewrites_and_conversation_pages",
         },
         PLAIN_INJECTOR,

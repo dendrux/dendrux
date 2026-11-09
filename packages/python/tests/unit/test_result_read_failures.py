@@ -1,6 +1,7 @@
 """Optional projections cannot hide a known durable outcome."""
 
 import asyncio
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -15,7 +16,12 @@ from dendrux.types import RunResult, RunStatus, generate_ulid
 @pytest.mark.parametrize("cancel", [False, True])
 async def test_result_projection_failure_is_isolated(monkeypatch, caplog, projection, cancel):
     run_id = generate_ulid()
-    record = SimpleNamespace(id=run_id, tenant_id=None, reclaim_attempts=1, last_reclaimed_at=None)
+    record = SimpleNamespace(
+        id=run_id,
+        tenant_id=None,
+        reclaim_attempts=1,
+        last_reclaimed_at=datetime(2026, 10, 29, tzinfo=UTC),
+    )
     pending = SimpleNamespace(pause_id=generate_ulid())
     store = SimpleNamespace(get_replayed_tool_calls=AsyncMock(return_value=(["call"], False)))
     read_pending = AsyncMock(return_value=pending)

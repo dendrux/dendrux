@@ -39,7 +39,8 @@ async def test_continue_seed_and_projection(store, engine):
     assert hasattr(agent, "reclaim"), "Agent must expose the explicit recovery entry"
     result = await agent.reclaim(item.run_id, tenant_id="tenant", item=item)
     assert result.status.value == "success" and result.answer == "done"
-    assert result.recovery.reclaim_attempts == 1
+    assert result.recovery.reclaim_attempts == 0
+    assert result.recovery.last_reclaimed_at is not None
     fresh = make_agent(store)
     loaded = await fresh.get_result(item.run_id, tenant_id="tenant")
     assert loaded.recovery == result.recovery
@@ -338,7 +339,9 @@ async def test_twenty_public_reclaimers_one_continuation(store, engine):
         assert sum(not isinstance(r, BaseException) for r in results) == 1
         assert sum(isinstance(r, RunNotReclaimableError) for r in results) == 19
         assert sum(a.provider.calls_made for a in contenders) == 1
-        assert (await store.get_run(item.run_id)).reclaim_attempts == 1
+        # The single winner completed, so the streak reset after its progress.
+        row = await store.get_run(item.run_id)
+        assert row.reclaim_attempts == 0 and row.last_reclaimed_at is not None
     finally:
         await pool.dispose()
 

@@ -1367,7 +1367,10 @@ class PersistenceRecorder(BaseRecorder):
         """Resolve a stored result at its reserved position without another effect."""
         pending = next(p for p in self._loop_state["pending"] if p["call_id"] == call_id)
         trace = (
-            message_trace(message, pending["order_index"], tenant_scope=self._tenant_scope)
+            replace(
+                message_trace(message, pending["order_index"], tenant_scope=self._tenant_scope),
+                advances_progress=False,
+            )
             if message is not None
             else None
         )
