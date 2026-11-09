@@ -408,7 +408,7 @@ def connected(dbapi, record):
     cursor.close()
     dbapi.autocommit = previous
 def before(conn, cursor, statement, parameters, context, executemany):
-    if 'alembic_version' in statement:
+    if 'dendrux_alembic_version' in statement:
         print('REVISION_READ', flush=True)
 def after(conn, cursor, statement, parameters, context, executemany):
     if hold == 'yes' and 'pg_try_advisory_lock(' in statement:
@@ -461,5 +461,5 @@ except RuntimeError as error:
         )
         async with target.connect() as conn:
             assert (
-                await conn.execute(text("SELECT version_num FROM alembic_version"))
+                await conn.execute(text("SELECT version_num FROM dendrux_alembic_version"))
             ).scalar_one() == "f9a0b1c2d3e4"

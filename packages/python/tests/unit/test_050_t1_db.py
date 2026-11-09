@@ -157,10 +157,11 @@ class TestDbCheckCli:
         eng = create_engine(f"sqlite:///{path}")
         with eng.begin() as conn:
             conn.exec_driver_sql(
-                "CREATE TABLE IF NOT EXISTS alembic_version (version_num VARCHAR(32) NOT NULL)"
+                "CREATE TABLE IF NOT EXISTS dendrux_alembic_version "
+                "(version_num VARCHAR(32) NOT NULL)"
             )
-            conn.exec_driver_sql("DELETE FROM alembic_version")
-            conn.exec_driver_sql(f"INSERT INTO alembic_version VALUES ('{revision}')")
+            conn.exec_driver_sql("DELETE FROM dendrux_alembic_version")
+            conn.exec_driver_sql(f"INSERT INTO dendrux_alembic_version VALUES ('{revision}')")
         eng.dispose()
 
     def _invoke(self, *args: str) -> Any:

@@ -67,7 +67,7 @@ def test_061_mysql_rename_sql(connection, monkeypatch):
 def test_061_mysql_inspects_all_rows_with_portable_sql(connection):
     from dendrux.db import _version_table
 
-    connection.execute.return_value.one.return_value = (10001, 1)
+    connection.execute.return_value.one.return_value = (10001, 1, HEAD)
     found = _version_table._read_stamp(connection, LEGACY, {HEAD})
     assert found.rows == 10001 and found.known == 1 and not found.valid
     statement = connection.execute.call_args.args[0]
@@ -135,3 +135,89 @@ def test_061_mysql_invalid_bootstrap_claim_refuses_safely(connection, monkeypatc
         mysql.migrate(connection, head=HEAD, upgradeable=set(), upgrade=lambda: None)
     assert "private-marker-sentinel" not in str(caught.value)
     connection.execute.assert_not_called()
+
+
+def test_061_mysql_readers_refuse_unknown_bootstrap_marker(connection, monkeypatch):
+    from dendrux.db import _version_table
+
+    monkeypatch.setattr(
+        _version_table, "_inspect_history", lambda *args: ({"dendrux_settings"}, None, None)
+    )
+    monkeypatch.setattr(
+        mysql, "read_settings", lambda conn: {"bootstrap_in_progress": "private-marker-sentinel"}
+    )
+    with pytest.raises(RuntimeError, match="migration_version_table_conflict") as caught:
+        _version_table.read_revision(connection)
+    assert "private-marker-sentinel" not in str(caught.value)
+    connection.commit.assert_not_called()
+
+
+@pytest.mark.parametrize("stamped", [False, True])
+def test_061_mysql_readers_preserve_interrupted_bootstrap(connection, monkeypatch, stamped):
+    from dendrux.db import _version_table
+
+    names = {"dendrux_settings", "agent_runs", DEDICATED}
+    revision = _version_table._Stamp(1, 1, HEAD) if stamped else _version_table._Stamp(0, 0)
+    monkeypatch.setattr(_version_table, "_inspect_history", lambda *args: (names, revision, None))
+    monkeypatch.setattr(mysql, "read_settings", lambda conn: {"bootstrap_in_progress": HEAD})
+    assert _version_table.read_revision(connection) == (HEAD if stamped else None)
+    connection.commit.assert_not_called()
+
+
+@pytest.mark.parametrize("legacy_claim", [False, True])
+def test_061_mysql_explicit_stamp_uses_locked_repair(connection, monkeypatch, legacy_claim):
+    from unittest.mock import AsyncMock
+
+    from alembic import command
+    from alembic.config import Config
+    from alembic.runtime.migration import MigrationContext
+
+    from dendrux.db import _version_table
+    from tests.migrations.test_060_activate import MIGRATIONS
+
+    locked = False
+    ran = []
+
+    @contextmanager
+    def lock(conn):
+        nonlocal locked
+        assert conn is connection
+        locked = True
+        try:
+            yield
+        finally:
+            locked = False
+
+    def history(conn, known):
+        assert locked
+        assert HEAD in known
+        legacy = _version_table._Stamp(1, 1, HEAD) if legacy_claim else None
+        return {"agent_runs"}, None, legacy
+
+    def run(migration_context, **kw):
+        assert locked
+        assert migration_context.opts["version_table"] == DEDICATED
+        ran.append(True)
+
+    engine = MagicMock()
+    async_connection = AsyncMock()
+    async_connection.run_sync.side_effect = lambda fn: fn(connection)
+    engine.connect.return_value.__aenter__.return_value = async_connection
+    engine.dispose = AsyncMock()
+    monkeypatch.setattr("sqlalchemy.ext.asyncio.async_engine_from_config", lambda *a, **kw: engine)
+    monkeypatch.setattr(mysql, "maintenance_lock", lock)
+    monkeypatch.setattr(mysql, "migrate", lambda *a, **kw: pytest.fail("stamp must not bootstrap"))
+    monkeypatch.setattr(_version_table, "_inspect_history", history)
+    monkeypatch.setattr(MigrationContext, "run_migrations", run)
+    cfg = Config()
+    cfg.set_main_option("script_location", str(MIGRATIONS))
+    cfg.set_main_option("sqlalchemy.url", "mysql+asyncmy://unused/unused")
+    if legacy_claim:
+        with pytest.raises(_version_table.MigrationVersionTableConflictError):
+            command.stamp(cfg, HEAD)
+        assert not ran
+    else:
+        command.stamp(cfg, HEAD)
+        assert ran == [True]
+    assert not locked
+    engine.dispose.assert_awaited_once()

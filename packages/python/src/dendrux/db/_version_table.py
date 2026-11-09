@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 from sqlalchemy import LargeBinary, case, cast, column, func, inspect, select, table
@@ -24,7 +25,7 @@ _GUIDANCE = (
     "migration_version_table_conflict: Cannot establish Dendrux migration history. "
     "Back up the database and inspect both version tables against the installed "
     "Dendrux and application migration graphs. Preserve application rows; repair "
-    "the stamps manually before retrying `dendrux db migrate`."
+    "the stamps manually if needed. Run `dendrux db migrate` to adopt verified legacy history."
 )
 logger = logging.getLogger(__name__)
 
@@ -41,6 +42,7 @@ class MigrationVersionTableConflictError(RuntimeError):
 class _Stamp:
     rows: int
     known: int
+    revision: str | None = None
 
     @property
     def valid(self) -> bool:
@@ -59,9 +61,10 @@ def _read_stamp(conn: Connection, name: str, known: Collection[str]) -> _Stamp:
         select(
             func.count(),
             func.count(case((match, 1))),
+            func.min(case((match, version.c.version_num))),
         ).select_from(version)
     ).one()
-    return _Stamp(int(row[0]), int(row[1]))
+    return _Stamp(int(row[0]), int(row[1]), str(row[2]) if row[2] is not None else None)
 
 
 def _classify(
@@ -88,14 +91,9 @@ def _classify(
     raise MigrationVersionTableConflictError
 
 
-def prepare_version_table(
-    conn: Connection, known: Collection[str], *, resumable: bool = False
-) -> str:
-    """Classify and, if verified, rename history while the caller holds maintenance lock.
-
-    ``resumable`` is only for a recognized MySQL-family bootstrap marker. Renaming
-    commits before Alembic starts so a later migration failure can safely be retried.
-    """
+def _inspect_history(
+    conn: Connection, known: Collection[str]
+) -> tuple[set[str], _Stamp | None, _Stamp | None]:
     inspector = inspect(conn)
     candidates = {*Base.metadata.tables, VERSION_TABLE, LEGACY_VERSION_TABLE}
     names = {name for name in candidates if inspector.has_table(name)}
@@ -108,10 +106,61 @@ def prepare_version_table(
         )
     except DBAPIError:
         raise MigrationVersionTableConflictError from None
+    return names, dedicated, legacy
+
+
+def read_revision(conn: Connection) -> str | None:
+    """Read dedicated history without adopting or stamping an existing schema.
+
+    Unstamped schemas remain available for structural checks. A legacy Dendrux claim
+    requires an explicit migrate before readers or activation can use the new history.
+    """
+    from alembic.script import ScriptDirectory
+
+    script = ScriptDirectory(str(Path(__file__).with_name("migrations")))
+    known = {revision.revision for revision in script.walk_revisions()}
+    names, dedicated, legacy = _inspect_history(conn, known)
+    legacy_claim = legacy is not None and legacy.known > 0
+    resumable = False
+    if is_mysql_family(conn.dialect):
+        from dendrux.db._dialects import mysql
+
+        head = script.get_current_head()
+        resumable = head is not None and mysql._resumable_bootstrap(conn, names, head)
+    if dedicated is None:
+        if legacy_claim:
+            raise MigrationVersionTableConflictError
+        return None
     action = _classify(
         dedicated,
         legacy,
         has_schema=bool(names.intersection(Base.metadata.tables)),
+        has_agent_runs="agent_runs" in names,
+        resumable=resumable,
+    )
+    return dedicated.revision if action == "dedicated" else None
+
+
+def prepare_version_table(
+    conn: Connection,
+    known: Collection[str],
+    *,
+    resumable: bool = False,
+    explicit_stamp: bool = False,
+) -> str:
+    """Classify and, if verified, rename history while the caller holds maintenance lock.
+
+    ``explicit_stamp`` permits operator repair of an unstamped schema, never legacy adoption.
+    ``resumable`` is only for a recognized MySQL-family bootstrap marker. Renaming
+    commits before Alembic starts so a later migration failure can safely be retried.
+    """
+    names, dedicated, legacy = _inspect_history(conn, known)
+    if explicit_stamp and legacy is not None and legacy.known:
+        raise MigrationVersionTableConflictError
+    action = _classify(
+        dedicated,
+        legacy,
+        has_schema=bool(names.intersection(Base.metadata.tables)) and not explicit_stamp,
         has_agent_runs="agent_runs" in names,
         resumable=resumable,
     )

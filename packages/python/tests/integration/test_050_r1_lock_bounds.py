@@ -64,7 +64,9 @@ async def pg(pg_test_url: str) -> Any:
 
 async def _version(engine: Any) -> str:
     async with engine.connect() as conn:
-        return (await conn.execute(text("SELECT version_num FROM alembic_version"))).scalar_one()
+        return (
+            await conn.execute(text("SELECT version_num FROM dendrux_alembic_version"))
+        ).scalar_one()
 
 
 async def _columns(engine: Any) -> set[str]:

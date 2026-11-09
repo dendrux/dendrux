@@ -147,12 +147,11 @@ def _require_current(conn: Connection) -> None:
     from alembic.script import ScriptDirectory
 
     head = ScriptDirectory(str(Path(__file__).parent / "migrations")).get_current_head()
-    if inspect(conn).has_table("alembic_version"):
-        revision = conn.execute(
-            text("SELECT version_num FROM alembic_version")
-        ).scalar_one_or_none()
-        if revision != head:
-            raise RuntimeError("Database check is not current. Run `dendrux db migrate` first.")
+    from dendrux.db._version_table import read_revision
+
+    revision = read_revision(conn)
+    if revision is not None and revision != head:
+        raise RuntimeError("Database check is not current. Run `dendrux db migrate` first.")
     problems = schema_problems(conn)
     if problems:
         raise RuntimeError("Database check is not current: " + ", ".join(problems))

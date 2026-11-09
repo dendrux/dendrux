@@ -158,6 +158,11 @@ async def test_061_fresh_postgres_ignores_app_stamp(fresh_pg, revisions):
             assert list(await conn.scalars(text(f"SELECT version_num FROM {LEGACY}"))) == revisions
         assert await conn.scalar(text(f"SELECT version_num FROM {DEDICATED}")) == HEAD
 
+        assert (
+            await conn.scalar(text("SELECT value FROM dendrux_settings WHERE key='storage_format'"))
+            == "2"
+        )
+
 
 _PROCESS = """
 import sys

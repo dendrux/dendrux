@@ -12,6 +12,11 @@ from rich.console import Console
 
 from dendrux._redact import mask_database_url, mask_database_urls_in
 from dendrux.db._activate import ACTIVATION_BATCH_SIZE
+from dendrux.db._version_table import (
+    VERSION_TABLE,
+    MigrationVersionTableConflictError,
+    read_revision,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable, Iterable
@@ -151,7 +156,7 @@ async def _fresh_postgres(conn: AsyncConnection) -> bool:
 
     from dendrux.db.models import Base
 
-    names = ("alembic_version", *Base.metadata.tables)
+    names = (VERSION_TABLE, *Base.metadata.tables)
     return not await conn.run_sync(lambda c: any(inspect(c).has_table(name) for name in names))
 
 
@@ -237,6 +242,9 @@ def status() -> None:
         revision, storage_format, step, bootstrap = asyncio.run(
             _read_activation_status(_database_url())
         )
+    except MigrationVersionTableConflictError as error:
+        console.print(str(error), markup=False)
+        raise typer.Exit(2) from None
     except Exception:
         console.print("[red]Could not read database status.[/red] Run `dendrux db check`.")
         raise typer.Exit(2) from None
@@ -247,19 +255,14 @@ def status() -> None:
 
 
 async def _read_activation_status(url: str) -> tuple[str, str, str, str | None]:
-    from sqlalchemy import inspect, select, text
+    from sqlalchemy import inspect, select
 
     from dendrux.db.models import DendruxSetting
 
     engine = _maintenance_engine(url)
     try:
         async with engine.connect() as conn:
-            revision = None
-            if await conn.run_sync(lambda c: inspect(c).has_table("alembic_version")):
-                revision = (
-                    await conn.execute(text("SELECT version_num FROM alembic_version"))
-                ).scalar_one_or_none()
-            revision = revision or "unstamped"
+            revision = await conn.run_sync(read_revision) or "unstamped"
             if not await conn.run_sync(lambda c: inspect(c).has_table("dendrux_settings")):
                 return revision, "1", "not-started", None
             keys = ("storage_format", "activate_step", "bootstrap_in_progress")
@@ -351,7 +354,7 @@ def check(
         False,
         "--allow-unstamped",
         help=(
-            "For schemas built with create_all (no alembic_version table): check the "
+            "For schemas built with create_all (no dendrux_alembic_version table): check the "
             "tables, columns and indexes instead of the revision."
         ),
     ),
@@ -360,7 +363,7 @@ def check(
 
     Compares the database's Alembic revision with this version's head. Exit
     codes: 0 current, 1 behind (run `dendrux db migrate`), 2 unknown (no
-    alembic_version table, or a revision this version does not know).
+    dendrux_alembic_version table, or a revision this version does not know).
     With --allow-unstamped, an unstamped database is checked by its tables,
     columns and (Postgres) indexes instead: 0 when complete, 1 when not.
 
@@ -377,6 +380,9 @@ def check(
     head = script.get_current_head()
     try:
         state = asyncio.run(_read_schema_state(url))
+    except MigrationVersionTableConflictError as error:
+        console.print(str(error), markup=False)
+        raise typer.Exit(EXIT_UNKNOWN) from None
     except Exception as e:
         console.print(
             f"[red]Could not read the schema of {mask_database_url(url)}:[/red] "
@@ -389,7 +395,7 @@ def check(
     if revision is None:
         if not allow_unstamped:
             console.print(
-                f"[yellow]Unknown:[/yellow] {target} has no alembic_version table. "
+                f"[yellow]Unknown:[/yellow] {target} has no dendrux_alembic_version table. "
                 "Run `dendrux db migrate`, or pass --allow-unstamped if the app builds "
                 "the schema with create_all."
             )
@@ -425,8 +431,6 @@ def check(
 
 async def _read_schema_state(url: str) -> tuple[str | None, list[str]]:
     """``(alembic revision or None, missing schema objects)`` for ``url``. Read-only."""
-    from sqlalchemy import inspect, text
-
     from dendrux.db._schema_check import (
         schema_problems,
     )
@@ -434,11 +438,7 @@ async def _read_schema_state(url: str) -> tuple[str | None, list[str]]:
     engine = _maintenance_engine(url)
     try:
         async with engine.connect() as conn:
-            stamped = await conn.run_sync(lambda c: inspect(c).has_table("alembic_version"))
-            revision = None
-            if stamped:
-                row = (await conn.execute(text("SELECT version_num FROM alembic_version"))).first()
-                revision = row[0] if row is not None else None
+            revision = await conn.run_sync(read_revision)
             missing = await conn.run_sync(schema_problems)
             return revision, missing
     finally:

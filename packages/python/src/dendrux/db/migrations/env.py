@@ -60,16 +60,17 @@ def _configure_and_run(connection):  # noqa: ANN001
         pass  # Read-only Alembic commands never adopt legacy history.
     else:
         prepare_version_table(
-            connection, {revision.revision for revision in context.script.walk_revisions()}
+            connection,
+            {revision.revision for revision in context.script.walk_revisions()},
+            explicit_stamp=_is_stamp(),
         )
-    context.configure(
-        connection=connection,
-        target_metadata=target_metadata,
-        version_table=VERSION_TABLE,
-        render_as_batch=True,  # Required for SQLite ALTER TABLE support
-    )
     with context.begin_transaction():
         context.run_migrations()
+
+
+def _is_stamp() -> bool:
+    # Alembic supplies purge (including False) only for the explicit stamp command.
+    return "purge" in context.get_context().opts
 
 
 def _run_mysql(connection):  # noqa: ANN001
@@ -77,11 +78,15 @@ def _run_mysql(connection):  # noqa: ANN001
 
     Upgrading to head bootstraps an empty database (or resumes one), upgrades a stamped
     Dendrux schema, and refuses anything else. Read-only commands (``current``) run
-    normally under the lock; other targets (downgrades, stamps) are refused because the
-    pre-baseline revisions do not apply to these servers.
+    normally under the lock. Explicit stamps permit operator repair; downgrade targets
+    remain refused because the pre-baseline revisions do not apply to these servers.
     """
     from dendrux.db._dialects import mysql
 
+    if _is_stamp():
+        with mysql.maintenance_lock(connection):
+            _configure_and_run(connection)
+        return
     script = context.script
     head = script.get_current_head()
     try:
@@ -110,6 +115,12 @@ def do_run_migrations(connection):  # noqa: ANN001
     from dendrux.db._dialects import is_mysql_family
     from dendrux.db._dialects.postgres import migration_lock
 
+    context.configure(
+        connection=connection,
+        target_metadata=target_metadata,
+        version_table=VERSION_TABLE,
+        render_as_batch=True,  # Required for SQLite ALTER TABLE support
+    )
     if is_mysql_family(connection.dialect):
         _run_mysql(connection)
         return

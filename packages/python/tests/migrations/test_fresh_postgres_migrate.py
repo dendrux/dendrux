@@ -60,8 +60,10 @@ async def assert_active(engine):
     assert values["activate_step"] == "done"
     async with engine.connect() as conn:
         tables = await conn.run_sync(lambda c: inspect(c).get_table_names())
-        assert set(tables) >= set(Base.metadata.tables) | {"alembic_version"}
-        assert (await conn.execute(text("SELECT count(*) FROM alembic_version"))).scalar_one() == 1
+        assert set(tables) >= set(Base.metadata.tables) | {"dendrux_alembic_version"}
+        assert (
+            await conn.execute(text("SELECT count(*) FROM dendrux_alembic_version"))
+        ).scalar_one() == 1
 
 
 @pytest.mark.parametrize("application_table", [False, True])
@@ -200,13 +202,14 @@ async def test_run_on_fresh_migrated_database_uses_format_two(fresh_pg):
         await store.close()
 
 
-async def test_empty_revision_table_prevents_auto_activation(fresh_pg):
+async def test_empty_app_revision_table_preserves_auto_activation(fresh_pg):
     async with fresh_pg.begin() as conn:
         await conn.execute(text("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)"))
     result = await migrate()
     assert result.exit_code == 0, result.output
-    assert await settings(fresh_pg) == {"storage_format": "1"}
-    assert "dendrux db activate" in " ".join(result.output.split())
+    values = await settings(fresh_pg)
+    assert values["storage_format"] == "2" and values["activate_step"] == "done"
+    assert "dendrux db activate" not in " ".join(result.output.split())
 
 
 @pytest.mark.parametrize("table", list(Base.metadata.tables))
