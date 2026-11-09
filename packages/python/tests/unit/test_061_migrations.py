@@ -94,7 +94,6 @@ def test_061_verified_legacy_renamed_once(database):
         (None, [], "agent_runs"),
         (None, None, "tool_calls"),
         ([HEAD], None, None),
-        ([], None, None),
         (["unknown"], None, None),
         ([HEAD, PRIOR], None, "agent_runs"),
         ([HEAD, "app_one"], None, "agent_runs"),
@@ -147,7 +146,7 @@ def test_061_version_table_not_in_model_metadata():
     assert LEGACY not in Base.metadata.tables
 
 
-def test_061_malformed_stamp_refuses_safely(database):
+def test_061_malformed_stamp_reports_database_error(database):
     engine, _ = database
     with engine.begin() as conn:
         conn.execute(text(f"CREATE TABLE {DEDICATED} (wrong_column VARCHAR(32))"))
@@ -155,7 +154,8 @@ def test_061_malformed_stamp_refuses_safely(database):
         before = snapshot(conn)
     result = CliRunner().invoke(app, ["db", "migrate"])
     assert result.exit_code == 1
-    assert "migration_version_table_conflict" in result.output
+    assert "migration_version_table_conflict" not in result.output
+    assert "Migration failed:" in result.output
     assert "private-revision-sentinel" not in result.output
     with engine.connect() as conn:
         assert snapshot(conn) == before

@@ -788,14 +788,11 @@ def _refuse(reason: str) -> RuntimeError:
 
 def _resumable_bootstrap(conn: Connection, present: Collection[str], head: str) -> bool:
     if SETTINGS_TABLE in present:
-        try:
-            values = read_settings(conn)
-        except DBAPIError:
-            raise MigrationVersionTableConflictError from None
+        values = read_settings(conn)
         marker = values.get(BOOTSTRAP_MARKER)
         if marker is not None:
             if marker != head:
-                raise MigrationVersionTableConflictError
+                raise MigrationVersionTableConflictError("bootstrap_version")
             return True
         if present == {SETTINGS_TABLE} and not values:
             return True  # crashed between creating the table and writing the marker
@@ -822,11 +819,9 @@ def classify(conn: Connection, *, head: str, upgradeable: Collection[str]) -> st
             return "current"
         if len(revisions) == 1 and revisions[0] in upgradeable:
             return "upgrade"
-        shown = ", ".join(revisions) or "none"
-        raise _refuse(
-            f"it is stamped with revision {shown}, which is not a Dendrux MySQL revision "
-            f"(MySQL history starts at {MYSQL_BASELINE_REVISION})."
-        )
+        if not revisions and present == {VERSION_TABLE}:
+            return "bootstrap"
+        raise MigrationVersionTableConflictError("mysql_baseline")
     raise _refuse(
         f"it holds Dendrux tables in an unrecognised state ({', '.join(sorted(present))}) "
         "with no bootstrap marker and no Dendrux revision. Drop them, or point Dendrux at "

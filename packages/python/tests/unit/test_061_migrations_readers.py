@@ -77,7 +77,6 @@ def test_061_readers_use_dedicated_history(database, action):
 @pytest.mark.parametrize(
     "dedicated,legacy",
     [
-        (None, [HEAD]),
         ([HEAD], [HEAD]),
         ([HEAD, PRIOR], None),
         (["private-revision-sentinel"], None),

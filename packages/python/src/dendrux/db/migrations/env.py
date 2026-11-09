@@ -130,7 +130,10 @@ def do_run_migrations(connection):  # noqa: ANN001
         return
     from dendrux.db._dialects.sqlite import maintenance_lock
 
-    with maintenance_lock(connection):
+    if "destination_rev" in context.get_context().opts:
+        with maintenance_lock(connection, operation="migrate"):
+            _configure_and_run(connection)
+    else:
         _configure_and_run(connection)
 
 

@@ -7,8 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
-from sqlalchemy import LargeBinary, case, cast, column, func, inspect, select, table
-from sqlalchemy.exc import DBAPIError
+from sqlalchemy import LargeBinary, case, cast, column, func, inspect, select, table, text
 
 from dendrux import _codes
 from dendrux.db._dialects import is_mysql_family
@@ -27,14 +26,45 @@ _GUIDANCE = (
     "Dendrux and application migration graphs. Preserve application rows; repair "
     "the stamps manually if needed. Run `dendrux db migrate` to adopt verified legacy history."
 )
+_REASONS = {
+    "unknown_revision": (
+        "The dedicated history contains a revision this Dendrux version does not know. "
+        "Upgrade Dendrux to the version that wrote this database, or restore a compatible backup. "
+        "Do not replace its stamps with older revisions."
+    ),
+    "unstamped_schema": (
+        "Dendrux tables are in an unrecognised state with no migration stamp. "
+        "Verify their schema and provenance before an explicit `alembic stamp <revision>`, "
+        "or restore a known backup or use a separate database."
+    ),
+    "bootstrap_version": (
+        "An unfinished MySQL/MariaDB bootstrap belongs to another Dendrux version. "
+        "Finish it with that version, or back up and remove only the partial Dendrux schema "
+        "before retrying. Preserve application tables."
+    ),
+    "mysql_baseline": (
+        "This revision is not in Dendrux's supported MySQL/MariaDB history. "
+        "Pre-baseline migrations cannot run on these servers. Restore a supported backup "
+        "or use a fresh database; do not relabel the old schema with a newer stamp."
+    ),
+}
 logger = logging.getLogger(__name__)
 
 
 class MigrationVersionTableConflictError(RuntimeError):
     """The database has ambiguous or incomplete Dendrux migration ownership."""
 
-    def __init__(self) -> None:
-        super().__init__(_GUIDANCE)
+    def __init__(
+        self,
+        reason: Literal[
+            "unknown_revision", "unstamped_schema", "bootstrap_version", "mysql_baseline"
+        ]
+        | None = None,
+    ) -> None:
+        guidance = (
+            _GUIDANCE if reason is None else "migration_version_table_conflict: " + _REASONS[reason]
+        )
+        super().__init__(guidance)
         _codes.log_code(logger, _codes.MIGRATION_VERSION_TABLE_CONFLICT)
 
 
@@ -76,11 +106,13 @@ def _classify(
     resumable: bool = False,
 ) -> Literal["dedicated", "rename", "bootstrap"]:
     legacy_claim = legacy is not None and legacy.known > 0
+    if dedicated is not None and dedicated.rows == 0 and not legacy_claim:
+        dedicated = None
     if dedicated is not None:
         if dedicated.valid and has_agent_runs and not legacy_claim:
             return "dedicated"
-        if resumable and dedicated.rows == 0 and not legacy_claim:
-            return "bootstrap"
+        if dedicated.known != dedicated.rows:
+            raise MigrationVersionTableConflictError("unknown_revision")
         raise MigrationVersionTableConflictError
     if legacy_claim:
         if legacy is not None and legacy.valid and has_agent_runs:
@@ -88,7 +120,7 @@ def _classify(
         raise MigrationVersionTableConflictError
     if not has_schema or resumable:
         return "bootstrap"
-    raise MigrationVersionTableConflictError
+    raise MigrationVersionTableConflictError("unstamped_schema")
 
 
 def _inspect_history(
@@ -97,24 +129,28 @@ def _inspect_history(
     inspector = inspect(conn)
     candidates = {*Base.metadata.tables, VERSION_TABLE, LEGACY_VERSION_TABLE}
     names = {name for name in candidates if inspector.has_table(name)}
-    try:
-        dedicated = _read_stamp(conn, VERSION_TABLE, known) if VERSION_TABLE in names else None
-        legacy = (
-            _read_stamp(conn, LEGACY_VERSION_TABLE, known)
-            if LEGACY_VERSION_TABLE in names
-            else None
-        )
-    except DBAPIError:
-        raise MigrationVersionTableConflictError from None
+    dedicated = _read_stamp(conn, VERSION_TABLE, known) if VERSION_TABLE in names else None
+    legacy = (
+        _read_stamp(conn, LEGACY_VERSION_TABLE, known) if LEGACY_VERSION_TABLE in names else None
+    )
     return names, dedicated, legacy
 
 
-def read_revision(conn: Connection) -> str | None:
-    """Read dedicated history without adopting or stamping an existing schema.
+@dataclass(frozen=True)
+class MigrationHistory:
+    """A known revision and whether its verified legacy table still needs adoption."""
 
-    Unstamped schemas remain available for structural checks. A legacy Dendrux claim
-    requires an explicit migrate before readers or activation can use the new history.
-    """
+    revision: str | None
+    needs_adoption: bool = False
+
+
+def read_revision(conn: Connection) -> str | None:
+    """Read verified history without renaming or stamping it."""
+    return read_history(conn).revision
+
+
+def read_history(conn: Connection) -> MigrationHistory:
+    """Read ownership and adoption state without changing either history table."""
     from alembic.script import ScriptDirectory
 
     script = ScriptDirectory(str(Path(__file__).with_name("migrations")))
@@ -127,10 +163,8 @@ def read_revision(conn: Connection) -> str | None:
 
         head = script.get_current_head()
         resumable = head is not None and mysql._resumable_bootstrap(conn, names, head)
-    if dedicated is None:
-        if legacy_claim:
-            raise MigrationVersionTableConflictError
-        return None
+    if not legacy_claim and (dedicated is None or dedicated.rows == 0):
+        return MigrationHistory(None)
     action = _classify(
         dedicated,
         legacy,
@@ -138,7 +172,10 @@ def read_revision(conn: Connection) -> str | None:
         has_agent_runs="agent_runs" in names,
         resumable=resumable,
     )
-    return dedicated.revision if action == "dedicated" else None
+    if action == "rename":
+        assert legacy is not None
+        return MigrationHistory(legacy.revision, needs_adoption=True)
+    return MigrationHistory(dedicated.revision if dedicated is not None else None)
 
 
 def prepare_version_table(
@@ -179,3 +216,26 @@ def _rename(conn: Connection) -> None:
         statement = f"ALTER TABLE {LEGACY_VERSION_TABLE} RENAME TO {VERSION_TABLE}"
     # A rename changes the stamp's location, so use the existing bounded stamp step.
     bounded_step(conn, statement, revision="", step="stamp", transactional=True)
+    if conn.dialect.name == "postgresql":
+        _rename_postgres_primary_key(conn)
+
+
+def _rename_postgres_primary_key(conn: Connection) -> None:
+    from dendrux.db._migration_ddl import bounded_step
+
+    found = conn.scalar(
+        text(
+            "SELECT 1 FROM pg_constraint WHERE conrelid = to_regclass(:table) "
+            "AND contype = 'p' AND conname = :constraint"
+        ),
+        {"table": VERSION_TABLE, "constraint": "alembic_version_pkc"},
+    )
+    if found:
+        bounded_step(
+            conn,
+            f"ALTER TABLE {VERSION_TABLE} RENAME CONSTRAINT alembic_version_pkc "
+            "TO dendrux_alembic_version_pkc",
+            revision="",
+            step="stamp",
+            transactional=True,
+        )

@@ -131,9 +131,14 @@ def test_061_mysql_invalid_bootstrap_claim_refuses_safely(connection, monkeypatc
     monkeypatch.setattr(mysql, "maintenance_lock", lambda conn: nullcontext())
     monkeypatch.setattr(mysql, "base_tables", lambda *args: {"dendrux_settings"})
     monkeypatch.setattr(mysql, "read_settings", settings)
-    with pytest.raises(RuntimeError, match="migration_version_table_conflict") as caught:
-        mysql.migrate(connection, head=HEAD, upgradeable=set(), upgrade=lambda: None)
-    assert "private-marker-sentinel" not in str(caught.value)
+    if malformed:
+        with pytest.raises(DBAPIError):
+            mysql.migrate(connection, head=HEAD, upgradeable=set(), upgrade=lambda: None)
+    else:
+        with pytest.raises(RuntimeError, match="migration_version_table_conflict") as caught:
+            mysql.migrate(connection, head=HEAD, upgradeable=set(), upgrade=lambda: None)
+        assert "Finish it with that version" in str(caught.value)
+        assert "private-marker-sentinel" not in str(caught.value)
     connection.execute.assert_not_called()
 
 
@@ -221,3 +226,18 @@ def test_061_mysql_explicit_stamp_uses_locked_repair(connection, monkeypatch, le
         assert ran == [True]
     assert not locked
     engine.dispose.assert_awaited_once()
+
+
+def test_061_mysql_prebaseline_stamp_has_specific_advice(connection, monkeypatch):
+    monkeypatch.setattr(mysql, "base_tables", lambda *args: {"agent_runs", DEDICATED})
+    connection.execute.return_value = [("2ce3bb57b0c5",)]
+    with pytest.raises(RuntimeError, match="Pre-baseline migrations") as caught:
+        mysql.classify(connection, head=HEAD, upgradeable=set())
+    assert "migration_version_table_conflict" in str(caught.value)
+    assert "repair the stamps" not in str(caught.value)
+
+
+def test_061_mysql_empty_history_bootstraps(connection, monkeypatch):
+    monkeypatch.setattr(mysql, "base_tables", lambda *args: {DEDICATED})
+    connection.execute.return_value = []
+    assert mysql.classify(connection, head=HEAD, upgradeable=set()) == "bootstrap"

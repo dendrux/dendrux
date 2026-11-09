@@ -310,8 +310,8 @@ def test_cli_status_and_dedupe_only(legacy):
 def test_status_on_legacy_and_unstamped_database(legacy):
     engine, _ = legacy
     result = runner.invoke(app, ["db", "status"])
-    assert result.exit_code == 2, result.output
-    assert "migration_version_table_conflict" in result.output
+    assert result.exit_code == 0, result.output
+    assert f"revision={PRIOR} storage_format=1 activate_step=not-started" in result.output
     with engine.begin() as conn:
         conn.execute(text("DROP TABLE alembic_version"))
     result = runner.invoke(app, ["db", "status"])

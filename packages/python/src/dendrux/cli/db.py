@@ -14,7 +14,9 @@ from dendrux._redact import mask_database_url, mask_database_urls_in
 from dendrux.db._activate import ACTIVATION_BATCH_SIZE
 from dendrux.db._version_table import (
     VERSION_TABLE,
+    MigrationHistory,
     MigrationVersionTableConflictError,
+    read_history,
     read_revision,
 )
 
@@ -390,7 +392,14 @@ def check(
         )
         raise typer.Exit(EXIT_UNKNOWN) from e
 
-    revision, missing = state
+    history, missing = state
+    revision = history.revision
+    if history.needs_adoption:
+        console.print(
+            "Behind: Run `dendrux db migrate` to adopt verified legacy Dendrux history.",
+            markup=False,
+        )
+        raise typer.Exit(EXIT_BEHIND)
     target = mask_database_url(url)
     if revision is None:
         if not allow_unstamped:
@@ -429,8 +438,8 @@ def check(
     raise typer.Exit(EXIT_BEHIND)
 
 
-async def _read_schema_state(url: str) -> tuple[str | None, list[str]]:
-    """``(alembic revision or None, missing schema objects)`` for ``url``. Read-only."""
+async def _read_schema_state(url: str) -> tuple[MigrationHistory, list[str]]:
+    """``(verified history, missing schema objects)`` for ``url``. Read-only."""
     from dendrux.db._schema_check import (
         schema_problems,
     )
@@ -438,9 +447,9 @@ async def _read_schema_state(url: str) -> tuple[str | None, list[str]]:
     engine = _maintenance_engine(url)
     try:
         async with engine.connect() as conn:
-            revision = await conn.run_sync(read_revision)
-            missing = await conn.run_sync(schema_problems)
-            return revision, missing
+            history = await conn.run_sync(read_history)
+            missing = [] if history.needs_adoption else await conn.run_sync(schema_problems)
+            return history, missing
     finally:
         await engine.dispose()
 

@@ -408,7 +408,7 @@ def connected(dbapi, record):
     cursor.close()
     dbapi.autocommit = previous
 def before(conn, cursor, statement, parameters, context, executemany):
-    if 'dendrux_alembic_version' in statement:
+    if 'alembic_version' in statement:
         print('REVISION_READ', flush=True)
 def after(conn, cursor, statement, parameters, context, executemany):
     if hold == 'yes' and 'pg_try_advisory_lock(' in statement:

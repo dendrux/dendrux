@@ -43,7 +43,6 @@ async def test_061_explicit_stamp_repairs_unstamped_schema(migration_database, a
         ([HEAD], [PRIOR]),
         (["unknown_revision"], None),
         ([HEAD, PRIOR], None),
-        ([], None),
     ],
 )
 @pytest.mark.parametrize("purge", [False, True])

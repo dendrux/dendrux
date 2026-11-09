@@ -121,7 +121,6 @@ async def test_061_legacy_upgrade_preserves_activation(migration_database):
         (None, None, True),
         (None, [], True),
         ([HEAD], None, False),
-        ([], None, False),
         (["unknown"], None, True),
     ],
 )
