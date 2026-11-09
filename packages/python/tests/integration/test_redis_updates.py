@@ -363,10 +363,13 @@ async def test_an_oversized_message_is_dropped_without_a_connection_gap(
     await writer.close()
 
 
+@pytest.mark.parametrize("engine", ["sqlite"], indirect=True)
 async def test_a_reconnect_gap_resyncs_events_whose_hint_was_lost(
     admin, channel, engine, monkeypatch
 ):
-    updates = make(channel=channel, health_check_s=30.0, send_timeout_s=3.0)
+    # The resync is a Redis behaviour; one store is enough, and the Redis-only
+    # CI job has no Postgres.
+    updates = make(channel=channel, health_check_s=30.0, send_timeout_s=3.0, flush_deadline_s=3.0)
     original_receive = updates.receive
     reconnecting = asyncio.Event()
     reconnect = asyncio.Event()

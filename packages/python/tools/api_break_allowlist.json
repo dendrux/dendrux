@@ -12,7 +12,8 @@
     "contracts:12.2",
     "contracts:12.51",
     "contracts:12.7",
-    "0.6:sql-store-removal"
+    "0.6:sql-store-removal",
+    "0.6:migration-table"
   ],
   "entries": [
     {
@@ -58,6 +59,15 @@
       ],
       "b_item": "0.6:sql-store-removal",
       "note": "Use PostgresStateStore, SQLiteStateStore, or the dialect factory; subclasses choose the matching concrete base."
+    },
+    {
+      "kind": "parameter-changed-default",
+      "paths": [
+        "dendrux.cli.db.check"
+      ],
+      "param": "allow_unstamped",
+      "b_item": "0.6:migration-table",
+      "note": "Help text names the dedicated dendrux_alembic_version table (0.6.1 upgrade note); typer keeps help inside the Option default, the flag's value is unchanged."
     }
   ],
   "documentary": [
