@@ -21,6 +21,13 @@ REJECTED_POSITIONS = {
 
 def corpus(cell_id: str) -> dict:
     expected = h.read_json(h.corpus_path(cell_id))
+    if cell_id == "guardrail_block__run":
+        rows = expected["rows"]["agent_runs"]
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["failure_reason"] == "guardrail_blocked"
+        assert "dendrux.blocked" not in row["meta"]
+        row["meta"]["dendrux.blocked"] = True
     if cell_id == "retry__after_success":
         messages = expected["calls"][2]["messages"]
         final = messages[-1]

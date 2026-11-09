@@ -29,6 +29,8 @@ from dendrux._lifecycle import (
 )
 from dendrux._meta_keys import (
     ANNOUNCE_MARKS_SESSION_KEY,
+    BLOCKED_META_KEY,
+    BLOCKED_RUNS_SESSION_KEY,
     COMMIT_PROOFS_SESSION_KEY,
     ERROR_INFO_META_KEY,
     FRESH_EVIDENCE_SESSION_KEY,
@@ -713,6 +715,7 @@ class SQLStateStore(SQLBlobCatalog):
         operation = self._commit_operation(session, run_ids)
         # ORM flush remains pre-COMMIT and cannot publish hints on failure.
         await session.flush()
+        await self._mark_blocked_writes(session)
         commit_issued = False
         succeeded = False
         try:
@@ -730,6 +733,75 @@ class SQLStateStore(SQLBlobCatalog):
             raise
         finally:
             self._enqueue_committed(session, commit_issued, succeeded)
+
+    async def _mark_blocked_writes(self, session: AsyncSession) -> None:
+        from sqlalchemy import update
+
+        from dendrux.db.models import AgentRun
+        from dendrux.runtime._blocked_content import _blocked_target
+
+        marked = session.info.setdefault(BLOCKED_RUNS_SESSION_KEY, set())
+        target = _blocked_target.get()
+        if (
+            target is not None
+            and target[0] is self
+            and target[1] in session.info.get(TOUCHED_RUNS_SESSION_KEY, ())
+        ):
+            marked.add(target[1])
+        for run_id in sorted(marked):
+            changed = self.json_patch_expr(AgentRun.meta, SetFields({BLOCKED_META_KEY: True}))
+            if changed is None:
+                from dendrux.errors import PersistenceError
+
+                raise PersistenceError()
+            await session.execute(
+                update(AgentRun).where(AgentRun.id == run_id).values(meta=changed)
+            )
+
+    def _blocked_runs_query(self, run_ids: Sequence[str], tenant_id: str | None) -> Any:
+        from sqlalchemy import func, or_
+
+        from dendrux.db.models import AgentRun, RunEvent
+
+        legacy_event = (
+            select(RunEvent.id)
+            .where(
+                RunEvent.agent_run_id == AgentRun.id,
+                RunEvent.event_type == GovernanceEventType.GUARDRAIL_BLOCKED.value,
+            )
+            .exists()
+        )
+        blocked = or_(
+            self.json_get(AgentRun.meta, (BLOCKED_META_KEY,), "bool").is_(True),
+            AgentRun.failure_reason == FailureReason.GUARDRAIL_BLOCKED.value,
+            legacy_event,
+        )
+        return _apply_tenant_scope(
+            select(AgentRun.id, func.coalesce(blocked, False)).where(
+                self.id_in(AgentRun.id, run_ids)
+            ),
+            tenant_id,
+        )
+
+    @_safe_database_call
+    async def _blocked_run_ids(self, run_ids: Sequence[str], *, tenant_id: str | None) -> set[str]:
+        from dendrux.errors import RunNotFoundError
+
+        if tenant_id is not None and (not isinstance(tenant_id, str) or not tenant_id):
+            raise ValueError("Blocked source lookup requires an explicit tenant scope")
+        result: set[str] = set()
+        async with self._session_factory() as session:
+            for offset in range(0, len(run_ids), _IN_CHUNK):
+                batch = run_ids[offset : offset + _IN_CHUNK]
+                rows = dict(
+                    (await session.execute(self._blocked_runs_query(batch, tenant_id))).all()
+                )
+                for run_id in batch:
+                    if run_id not in rows:
+                        raise RunNotFoundError(run_id)
+                    if rows[run_id]:
+                        result.add(run_id)
+        return result
 
     async def update_one(
         self,
@@ -1110,6 +1182,8 @@ class SQLStateStore(SQLBlobCatalog):
         _check_create_identifiers(run_id, agent_name, tenant_id, idempotency_key, model)
         _validate_persistable(meta, "metadata")
         _validate_persistable(input_data, "input")
+        if meta is not None:
+            meta = {key: value for key, value in meta.items() if key != BLOCKED_META_KEY}
         import datetime as _dt
 
         from sqlalchemy import select
@@ -1135,6 +1209,7 @@ class SQLStateStore(SQLBlobCatalog):
 
         async def _prove_creation(session: AsyncSession) -> CreateRunResult:
             from dendrux.errors import StoreOutcomeUnknown
+            from dendrux.runtime._blocked_content import _blocked_target
             from dendrux.runtime._digest import content_digest
 
             try:
@@ -1151,6 +1226,10 @@ class SQLStateStore(SQLBlobCatalog):
                     and content_digest(row.input_data) == content_digest(input_data)
                     and row.idempotency_fingerprint == idempotency_fingerprint
                     and row.idempotency_key == idempotency_key
+                    and (
+                        _blocked_target.get() != (self, run_id)
+                        or (row.meta or {}).get(BLOCKED_META_KEY) is True
+                    )
                 ):
                     return CreateRunResult(
                         run_id=run_id,
@@ -2740,7 +2819,10 @@ class SQLStateStore(SQLBlobCatalog):
                 ).scalar_one_or_none()
                 if row is None:
                     return
-                row.meta = {**(row.meta or {}), **patch}
+                row.meta = {
+                    **(row.meta or {}),
+                    **{key: value for key, value in patch.items() if key != BLOCKED_META_KEY},
+                }
                 self._mark_announce(session, (run_id,))
                 await self._write_tx(session)
 
@@ -5648,6 +5730,8 @@ class SQLStateStore(SQLBlobCatalog):
         from dendrux.runtime._digest import event_digest
 
         digest = event_digest(event_type, iteration_index, correlation_id, data)
+        if event_type == GovernanceEventType.GUARDRAIL_BLOCKED.value:
+            session.info.setdefault(BLOCKED_RUNS_SESSION_KEY, set()).add(run_id)
 
         def conflict() -> NoReturn:
             _codes.log_code(logger, _codes.WRITE_CONFLICT, run_id=run_id)
