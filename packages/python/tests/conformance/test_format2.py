@@ -18,6 +18,7 @@ async def test_format2_matches_golden_and_shared_contract(cell, backend_engine):
     actual = await format2.view(recording, store)
     format2.assert_shared_contract(cell.id, actual)
     expected = h.read_json(h.golden_path(cell.id, "format2"))
+    format2._blocked_trace_expected(cell.id, expected["public_traces"])
     assert h.diff(expected, actual) is None, f"{cell.id}: {h.diff(expected, actual)}"
     assert h.o.dumps_canonical(expected) == h.o.dumps_canonical(actual)
 
@@ -29,6 +30,11 @@ async def test_extended_format_contract(cell, storage_format, backend_engine):
     store = store_for_engine(backend_engine)
     actual = await format2.view(await h.run_cell(cell, backend_engine, store), store)
     version = "format2" if storage_format == 2 else "format1_additions"
-    assert h.diff(h.read_json(h.golden_path(cell.id, version)), actual) is None
+    expected = h.read_json(h.golden_path(cell.id, version))
+    if storage_format == 2:
+        format2._blocked_trace_expected(cell.id, expected["public_traces"])
+    assert h.diff(expected, actual) is None
     legacy = h.read_json(h.golden_path(cell.id, "format1_additions"))
+    if storage_format == 2:
+        format2._blocked_trace_expected(cell.id, legacy["public_traces"])
     assert h._norm(shared(actual)) == h._norm(shared(legacy))

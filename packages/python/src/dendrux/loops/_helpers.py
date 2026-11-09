@@ -280,6 +280,8 @@ async def project_message(recorder: LoopRecorder | None, message: Message) -> Me
     take = getattr(recorder, "take_observation", None)
     observation = take(message.call_id) if take is not None else None
     if observation is not None:
+        if engine._projected_block(observation) is not None:
+            return cast("Message", (await engine.project_incoming_message(observation))[0])
         return replace(cast("Message", observation), meta={**observation.meta, **message.meta})
     return cast("Message", (await engine.project_incoming_message(message))[0])
 

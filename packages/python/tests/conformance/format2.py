@@ -89,7 +89,22 @@ def assert_shared_contract(cell_id: str, actual: dict) -> None:
                 for placeholder, original in mapping.items():
                     if isinstance(original, str):
                         trace["content"] = trace["content"].replace(original, placeholder)
+    _blocked_trace_expected(cell_id, expected_traces)
     assert actual["public_traces"] == h._norm(expected_traces), (
         cell_id,
         h.diff(h._norm(expected_traces), actual["public_traces"]),
     )
+
+
+def _blocked_trace_expected(cell_id: str, traces: list) -> None:
+    positions = {
+        "guardrail_block__run": (0, "Mail jane.doe@example.com the report"),
+        "edge_indexed_block__run": (2, '\"person@example.com\"'),
+    }
+    if cell_id not in positions:
+        return
+    index, original = positions[cell_id]
+    assert len(traces) == 1
+    trace = traces[0][index]
+    assert trace["content"] == original
+    trace["content"] = "[blocked: 1 finding]"
