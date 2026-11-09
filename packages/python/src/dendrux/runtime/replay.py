@@ -109,6 +109,9 @@ class ReplayRequest:
     runs: tuple[str, ...]
     replay_last: ReplayLast
     replay_reasoning: bool
+    # Filled by the loader: requested runs omitted for blocked content, in request
+    # order. Not part of the fingerprint, which keeps the requested IDs.
+    omitted_blocked: list[str] = field(default_factory=list, compare=False, repr=False)
 
     def fingerprint(self) -> dict[str, Any]:
         """Knobs as they enter the idempotency fingerprint."""
@@ -188,7 +191,7 @@ async def _load_replay_runs(
     from dendrux.errors import ReplayRunError
     from dendrux.runtime._capabilities import capabilities
 
-    loaded: list[LoadedRun] = []
+    records: list[RunRecord] = []
     for run_id in request.runs:
         record = await store.get_run(run_id)
         if record is None or record.tenant_id != tenant_id:
@@ -199,6 +202,15 @@ async def _load_replay_runs(
                 "not_terminal",
                 f"it is still '{record.status}'; only terminal runs can be replayed",
             )
+        records.append(record)
+    # Identified blocked runs are dropped whole before any of their history is read.
+    blocked = await _blocked_source_ids(store, records, tenant_id)
+    request.omitted_blocked[:] = [record.id for record in records if record.id in blocked]
+    loaded: list[LoadedRun] = []
+    for record in records:
+        if record.id in blocked:
+            continue
+        run_id = record.id
         traces = (
             await conversation_records(store, run_id, limits=limits)
             if record.storage_format == STORAGE_FORMAT_CHECKPOINTED
@@ -208,6 +220,26 @@ async def _load_replay_runs(
         traces = [t for t in traces if not (t.meta or {}).get(SEED_PREFIX_META_KEY)]
         loaded.append(LoadedRun(record=record, traces=sorted(traces, key=lambda t: t.order_index)))
     return loaded
+
+
+async def _blocked_source_ids(
+    store: StateStore, records: list[RunRecord], tenant_id: str | None
+) -> set[str]:
+    from dendrux.errors import ReplayRunError, RunNotFoundError
+    from dendrux.runtime._blocked_content import _blocked_sources
+
+    try:
+        return await _blocked_sources(store, records, tenant_id=tenant_id)
+    except RunNotFoundError as exc:
+        # The row vanished or left scope after authorization: same answer as a missing run.
+        raise ReplayRunError(exc.run_id, "not_found", "run not found") from None
+
+
+def _omitted_warning(run_id: str) -> str:
+    return (
+        f"Run {run_id} omitted because it contains blocked content; "
+        "prior effects may have occurred."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -644,8 +676,12 @@ def expand_replay(
     current: CurrentPrefix,
     guardrails: bool = False,
 ) -> ReplayPlan:
-    """Expand ``loaded`` runs into messages per the window and the prefix rule."""
-    warnings: list[str] = []
+    """Expand ``loaded`` runs into messages per the window and the prefix rule.
+
+    ``loaded`` holds only the surviving runs: blocked runs were omitted by the
+    loader, so the window and prefix compatibility apply to the survivors.
+    """
+    warnings: list[str] = [_omitted_warning(run_id) for run_id in request.omitted_blocked]
     replay_reasoning = request.replay_reasoning
     if replay_reasoning and guardrails:
         replay_reasoning = False

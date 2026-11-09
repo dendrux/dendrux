@@ -176,11 +176,42 @@ async def _continuation_blocked(
 async def _adopted_run_blocked(store: StateStore, run_id: str, record: RunRecord | None) -> bool:
     from dendrux.runtime.state import unclaimed_store
     from dendrux.runtime.stores.sql.base import SQLStateStore
-    from dendrux.types import GovernanceEventType
 
     if isinstance(unclaimed_store(store), SQLStateStore):
         tenant = record.tenant_id if record is not None else None
-        return bool(await _blocked_run_ids(store, [run_id], tenant_id=tenant))
+        return bool(await _native_blocked(store, [run_id], tenant_id=tenant))
+    return await _custom_blocked_event(store, run_id)
+
+
+# Authorized source IDs per verdict SELECT (spec: at most ceil(N/200) added statements).
+_SOURCE_CHUNK = 200
+
+
+async def _native_blocked(
+    store: StateStore, run_ids: Sequence[str], *, tenant_id: str | None
+) -> set[str]:
+    """Scoped existence verdicts; a failed lookup is a safe persistence error."""
+    from dendrux.errors import RunNotFoundError
+
+    result: set[str] = set()
+    failed = False
+    try:
+        for offset in range(0, len(run_ids), _SOURCE_CHUNK):
+            chunk = list(run_ids[offset : offset + _SOURCE_CHUNK])
+            result |= await _blocked_run_ids(store, chunk, tenant_id=tenant_id)
+    except (RunNotFoundError, RunFencedError):
+        raise
+    except Exception:
+        failed = True
+    if failed:
+        raise PersistenceError()
+    return result
+
+
+async def _custom_blocked_event(store: StateStore, run_id: str) -> bool:
+    """Custom-store fallback: one filtered ``guardrail.blocked`` read, limit 1."""
+    from dendrux.types import GovernanceEventType
+
     blocked = GovernanceEventType.GUARDRAIL_BLOCKED.value
     events = None
     try:
@@ -194,6 +225,29 @@ async def _adopted_run_blocked(store: StateStore, run_id: str, record: RunRecord
     ):
         raise PersistenceError()
     return bool(events)
+
+
+async def _blocked_sources(
+    store: StateStore, records: Sequence[RunRecord], *, tenant_id: str | None
+) -> set[str]:
+    """IDs of already authorized source runs that carry blocked provenance (R1.10).
+
+    The run mark, a ``guardrail_blocked`` failure reason or any legacy blocked
+    event identifies a run. Native stores answer with batched scoped existence
+    queries; custom stores use the loaded row plus one filtered event read per run.
+    """
+    from dendrux.runtime.state import unclaimed_store
+    from dendrux.runtime.stores.sql.base import SQLStateStore
+
+    if not records:
+        return set()
+    if isinstance(unclaimed_store(store), SQLStateStore):
+        return await _native_blocked(store, [r.id for r in records], tenant_id=tenant_id)
+    found: set[str] = set()
+    for record in records:
+        if _row_blocked(store, record.id, record) or await _custom_blocked_event(store, record.id):
+            found.add(record.id)
+    return found
 
 
 def _row_blocked(store: StateStore, run_id: str, record: RunRecord | None) -> bool:

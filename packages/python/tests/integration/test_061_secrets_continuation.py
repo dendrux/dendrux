@@ -631,3 +631,47 @@ async def test_no_blocked_detail_outlives_the_call(store, engine, fmt, path):
         assert leftovers == []
     finally:
         await agent.close()
+
+
+@pytest.mark.parametrize("fmt", [1, 2])
+@pytest.mark.parametrize("path", ["submit", "resume", "input", "approve", "paused"])
+@pytest.mark.parametrize("blocked", [False, True])
+async def test_claim_scope_is_reset_after_every_public_continuation(
+    store, engine, fmt, path, blocked
+):
+    # Each public continuation call opens its claim scope and resets it on the way out.
+    from dendrux.runtime._blocked_content import _claim_call
+
+    agent, _, run_id, raw, _ = await paused_agent(
+        store, engine, fmt, guarded=True, approval=path == "approve"
+    )
+    text = json.dumps(SECRET) if blocked else '"okay"'
+    kwargs = {"tenant_id": "t", "expected_pause_id": raw["pause_id"]}
+    try:
+        if path in ("submit", "resume"):
+            results = [
+                ToolResult(
+                    name="client_read", call_id=raw["pending_tool_calls"][0]["id"], payload=text
+                )
+            ]
+            if path == "submit":
+                await agent.submit_tool_results(run_id, results, **kwargs)
+            else:
+                await agent.resume(run_id, tool_results=results, **kwargs)
+        elif path == "input":
+            raw["pending_tool_calls"] = []
+            await store.pause_run(run_id, status="waiting_human_input", pause_data=raw)
+            await agent.submit_input(run_id, SECRET if blocked else "fine", **kwargs)
+        elif path == "approve":
+            if blocked:
+                await agent.submit_approval(
+                    run_id, approved=False, rejection_reason=SECRET, **kwargs
+                )
+            else:
+                await agent.submit_approval(run_id, approved=True, **kwargs)
+        else:
+            await store.pause_run(run_id, status="paused", pause_data=raw)
+            await agent.submit_resume(run_id, **kwargs)
+        assert _claim_call.get() is None
+    finally:
+        await agent.close()
