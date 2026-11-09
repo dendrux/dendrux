@@ -7,20 +7,38 @@ description: Migrate, check, inspect and activate a Dendrux database with deploy
 
 The CLI reads `DENDRUX_DATABASE_URL`. It defaults to `sqlite+aiosqlite:///./dendrux.db` when the variable is absent. Supply the intended database through your deployment's credential configuration before running a command. There is no database URL flag, and no offline mode: every command works against the live database.
 
+The optional probe for an old `~/.dendrux/dendrux.db` file silently falls back to the local default if the home directory cannot be resolved or read. `local_database_default_changed` is logged only when the old file is positively found and the local file is absent. Explicit URLs bypass that probe. Errors opening the selected database still fail normally.
+
 The commands run on PostgreSQL, SQLite, MySQL and MariaDB. The sections below say where the databases differ.
 
 | Command | Purpose |
 | --- | --- |
 | `dendrux db migrate` | Apply Alembic migrations through this package's head. New PostgreSQL databases come up active at format 2. On MySQL and MariaDB it builds an active schema on an empty database |
-| `dendrux db check` | Read-only revision and structure check: exit 0 current, 1 behind, 2 unknown or unstamped |
-| `dendrux db check --allow-unstamped` | Check the expected structure when no revision is stamped |
+| `dendrux db check` | Read-only revision and structure check: exit 0 current, 1 behind or verified legacy history needing adoption, 2 unknown, unstamped or conflicting history |
+| `dendrux db check --allow-unstamped` | Read-only structure check when unstamped: exit 0 complete, 1 incomplete, 2 unreadable or conflicting history; verified legacy history still exits 1 until migration |
 | `dendrux db status` | Print `revision`, `storage_format` and `activate_step` |
 | `dendrux db activate` | Check, deduplicate, build uniqueness and enable format 2 for new runs |
 | `dendrux db dedupe` | Remove identical duplicates without enabling format 2 |
 
+## Migration history in 0.6.1
+
+Dendrux uses `dendrux_alembic_version` independently of your application's `alembic_version`. `dendrux db migrate` renames a verified legacy Dendrux table once under the maintenance lock; on PostgreSQL it also renames the old Alembic primary-key constraint/index when present. Verification means exactly one revision in the installed Dendrux graph and an existing `agent_runs` table, not a full schema comparison. App-only history does not prevent a fresh Dendrux bootstrap.
+
+Before adoption, `db check` exits 1, including with `--allow-unstamped`, and prints:
+
+```text
+Behind: Run `dendrux db migrate` to adopt verified legacy Dendrux history.
+```
+
+`db status` still exits 0 and reports the verified legacy revision and activation state. Neither command renames or stamps anything. Mixed or conflicting Dendrux claims produce `migration_version_table_conflict`: migration and activation exit 1; check and status exit 2. `--allow-unstamped` does not bypass a conflict or authorize stamping. Unknown/newer dedicated history requires the matching Dendrux version or a compatible backup; do not overwrite its stamp.
+
+Automatic SQLite schema creation/sync does not consult, create or stamp either history table. Keep that setup automatic unless you deliberately opt into migrations. See [Upgrading to 0.6.1](/docs/upgrading-to-0.6.1) for the setup table and explicit operator repair with `alembic stamp`. There is no `dendrux db stamp` command. Do not run old Dendrux migration tools after the rename.
+
+The CLI has no offline flag. Direct Alembic offline SQL for SQLite/PostgreSQL targets only the dedicated table and cannot discover or rename legacy history. Adopt verified legacy history online first, or manually move the verified table and PostgreSQL PK/index during an exclusive maintenance window before applying generated SQL. MySQL/MariaDB offline SQL remains unsupported.
+
 ## Migrate and activate
 
-On PostgreSQL, `dendrux db migrate` activates a new database automatically using the same activation path as `dendrux db activate`. New means no `alembic_version` table and none of the Dendrux tables before upgrade; unrelated application tables are allowed. Existing databases stay at format 1 until explicit activation, even if there are zero runs or the schema is already at head. An already active database stays active.
+On PostgreSQL, `dendrux db migrate` activates a new database automatically using the same activation path as `dendrux db activate`. New means no `dendrux_alembic_version` table and none of the Dendrux tables before upgrade; unrelated application tables and app-owned `alembic_version` history are allowed. Existing databases stay at format 1 until explicit activation, even if there are zero runs or the schema is already at head. An already active database stays active.
 
 If migration succeeds but activation fails or the process stops between them, a rerun treats the schema as existing and leaves it at format 1. Whenever PostgreSQL migration finishes at format 1, the command tells you to run `dendrux db activate` once every worker and reader is upgraded.
 
@@ -40,6 +58,8 @@ An active database reports `storage_format=2 activate_step=done`. A database wit
 
 Use a direct database connection for activation; on PostgreSQL the concurrent index builds and the maintenance lock require it. For SQLite, stop every other process using the file first. The exclusive lock refuses a live competing transaction, but cannot establish that every idle process has stopped.
 
+> **SQLite maintenance.** A competing live transaction makes migration refuse immediately: "Cannot migrate SQLite while another connection holds a live transaction. Stop other processes, finish the transaction and retry." Read-only Alembic commands do not take that SQLite maintenance lock.
+
 Activation reads the whole `react_traces`, `tool_calls` and `run_events` tables, builds three unique indexes concurrently on Postgres and then drops the old indexes. Run it in a quiet period and check free disk for the builds first.
 
 > **No downgrade command.** Once activation starts, rollback requires the pre-activation backup. Even an incomplete activation prevents Alembic downgrade of the 0.6 storage migration.
@@ -48,4 +68,4 @@ Activation reads the whole `react_traces`, `tool_calls` and `run_events` tables,
 
 ## MySQL and MariaDB
 
-`dendrux db migrate` on an **empty** MySQL or MariaDB database builds the current schema in resumable steps, under a named server lock (`GET_LOCK`), and records it as already active: `dendrux db status` then prints `storage_format=2 activate_step=done`. There is no 0.5 schema on these servers, so there is nothing to activate; `db activate` and `db dedupe` are for PostgreSQL and SQLite databases migrated from 0.5. An interrupted build shows as `bootstrap_in_progress=<step>` in `db status`; run `migrate` again and it resumes. A database that already holds tables Dendrux does not recognise is refused, and so is one where your application keeps its own `alembic_version` table. The migration is forward-only: there is no downgrade, so take a backup first. See [MySQL and MariaDB](/docs/guides/mysql).
+`dendrux db migrate` on an **empty** MySQL or MariaDB database builds the current schema in resumable steps, under a named server lock (`GET_LOCK`), and records it as already active: `dendrux db status` then prints `storage_format=2 activate_step=done`. There is no 0.5 schema on these servers, so there is nothing to activate; `db activate` and `db dedupe` are for PostgreSQL and SQLite databases migrated from 0.5. An interrupted build shows as `bootstrap_in_progress=<step>` in `db status`; run `migrate` again and it resumes. An unrecognised Dendrux schema or conflicting Dendrux migration claims are refused. An application-owned `alembic_version` table can coexist with Dendrux history in `dendrux_alembic_version`. The migration is forward-only: there is no downgrade, so take a backup first. See [MySQL and MariaDB](/docs/guides/mysql).

@@ -28,6 +28,10 @@ Pass the same authenticated `tenant_id` for the new run and for every run in `ru
 
 Dendrux rebuilds each run from its own `react_traces` (user message as it was sent, assistant text, tool calls, tool results, reasoning blocks) and puts them ahead of the new input. The exact prompt is in `llm_interactions.provider_request` as always. On a format-2 store the new run stores the messages it replayed again, as seed rows of its own, so storage grows with how much you replay; see [History storage grows with replay](/docs/guides/scaling#history-storage-grows-with-replay). `agent.stream()` takes the same three arguments.
 
+## Retry versus replay
+
+`agent.retry(run_id, tenant_id=tenant)` creates a new ReAct run with fresh iteration and usage counters, leaving the source unchanged. Since 0.6.1, retrying a successful run regenerates its final answer while preserving earlier user/tool context, valid call/result pairs and applicable reasoning. JSON-formatted answers follow the same rule. Ordinary `runs=` replay retains successful answers as conversation history. `SingleCall` retry remains unsupported. A provider returning no new text or tool calls still raises the existing non-retryable `empty_completion` error.
+
 ## The three knobs
 
 | Argument | Default | Meaning |

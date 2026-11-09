@@ -11,7 +11,7 @@ There is no knob to turn on. If you use the built-in `AnthropicProvider` or `Ope
 
 ## The cache-token columns
 
-Every LLM call records five token numbers. Four of them are about the prompt side:
+Each LLM call records the following input/cache and output token counts:
 
 | Column | Meaning |
 | --- | --- |
@@ -26,28 +26,14 @@ These land on `llm_interactions` per-call and on `token_usage` per-iteration, an
 
 Anthropic's cache is byte-prefix-keyed. You tell it where to cut the prefix with a `cache_control` marker on a content block; everything up to and including that block becomes a cache entry. The first call with a given prefix writes the entry (billed as `cache_creation`), subsequent calls with the same prefix read it (billed as `cache_read`).
 
-Dendrux applies two markers automatically. From `dendrux/llm/anthropic.py`:
+Dendrux applies **up to four markers**, depending on the messages present:
 
-```python
-def _apply_cache_control(self, system_prompt, api_messages):
-    """Apply cache_control to system block and last message's last block.
+1. **System block.** Marks the system prompt, including the skill catalogue or inlined SingleCall skill bodies. Tool definitions are earlier in the cached prefix, so tool changes also affect reuse.
+2. **Stable context head, when present.** Marks the selected stable message so the fixed context prefix can be reused across runs.
+3. **End of replayed history, when present.** Marks the last replayed message, keeping a long replayed region cacheable separately from fresh input.
+4. **Last message's last eligible content block.** Warms the conversation prefix for the next iteration. Thinking blocks are left unchanged; the marker goes on the last eligible non-thinking block.
 
-    The marker on the last message warms the next iteration's cache —
-    the call that writes it pays full creation; the next call reads it.
-    """
-    marker = self._cache_control_marker()   # {"type": "ephemeral"} (+ ttl if set)
-
-    if system_prompt:
-        system_blocks = [{"type": "text", "text": system_prompt, "cache_control": marker}]
-    ...
-    content[-1]["cache_control"] = marker
-    ...
-```
-
-Two breakpoints per call:
-
-1. **System block.** The whole system prompt (including the skill catalogue, or the inlined skill bodies on SingleCall) is marked. The skill tools are part of the tool definitions, which also belong to the cached prefix, so changing which skills are attached or which tools are offered invalidates it. This is the big, stable part that barely changes across calls.
-2. **Last message's last content block.** Dendrux marks the conversation-so-far up through whatever the model just saw. That marker "warms the next iteration's cache": the current call pays to write it, and the next call reads it.
+Coincident message positions share a marker, so a request can use fewer than four. With multiple stable message indices, the provider selects their first and last positions alongside the final message. See [Anthropic's prompt-caching guide](https://platform.claude.com/docs/en/build-with-claude/prompt-caching).
 
 Default TTL is Anthropic's default (5 minutes). Configure a longer one via the provider constructor if your agents pause for approval longer than that.
 
@@ -115,34 +101,24 @@ Per-iteration: only 3 to 6 tokens are billed at the full input rate. Everything 
 
 ## OpenAI: `prompt_cache_key` routing
 
-OpenAI's cache is not byte-prefix-based; it is key-based. Calls that carry the same `prompt_cache_key` end up on the same cache lane on OpenAI's infrastructure, which improves the odds that a long prefix is reused.
+OpenAI caching depends on matching prompt prefixes. `prompt_cache_key` is an additional routing hint that helps requests sharing a prefix reach the same cache; the key alone cannot make different prefixes hit. Keep stable instructions and tools before changing input. See [OpenAI's prompt-caching guide](https://developers.openai.com/api/docs/guides/prompt-caching).
 
-Dendrux derives the key automatically. From `dendrux/llm/openai.py`:
-
-[//]: # "docs-test: skip - fragment: relies on `self`, defined by setup shown elsewhere"
-
-```python
-# Cache routing — never keyed on run_id.
-if str(self._client.base_url) == _OPENAI_DEFAULT_BASE_URL:
-    cache_key_source = self._cache_key_prefix or cache_key_prefix
-    if cache_key_source:
-        api_kwargs["prompt_cache_key"] = f"dendrux:{cache_key_source}"
-    if self._prompt_cache_retention is not None:
-        api_kwargs["prompt_cache_retention"] = self._prompt_cache_retention
-```
+Dendrux derives the routing key automatically in both `OpenAIProvider` and `OpenAIResponsesProvider`.
 
 Three things to notice:
 
-1. **Only applied to the real OpenAI base URL.** Compatible providers (Groq, Together, vLLM, OpenRouter, etc.) reject or ignore OpenAI-specific fields. The check keeps dendrux portable to those endpoints without a flag. `OpenAIProvider` and `OpenAIResponsesProvider` apply the same check, so a Responses client pointed at another base URL (for example through `OPENAI_BASE_URL`) sends no cache key.
-2. **A key is sent only when a prefix is known.** The runner supplies `cache_key_prefix` as `{agent_name}:{model}` by default, so runs sharing an agent and model route to the same lane. With no prefix, no key is sent.
-3. **Never keyed on `run_id`.** A per-run key sends each run of one conversation to a potentially different cache lane, which defeats cross-run hits.
+1. **Only applied to the real OpenAI base URL.** Other compatible endpoints can reject or ignore OpenAI-specific fields. The check keeps dendrux portable to those endpoints without a flag. `OpenAIProvider` and `OpenAIResponsesProvider` apply the same check, so a Responses client pointed at another base URL (for example through `OPENAI_BASE_URL`) sends no OpenAI-specific cache key or retention field.
+2. **A key is sent only when a prefix is known.** The runner supplies `cache_key_prefix` as `{agent_name}:{model}` by default, so runs sharing an agent and model use the same routing hint. With no prefix, no key is sent.
+3. **Never keyed on `run_id`.** A per-run key changes the routing hint and can reduce cross-run reuse.
 
 OpenAI recommends one key per user or customer, not per request. For multi-tenant apps, set it per customer on the provider. This works on both `OpenAIProvider` and `OpenAIResponsesProvider`:
 
-[//]: # "docs-test: skip - fragment: relies on `OpenAIResponsesProvider`, defined by setup shown elsewhere"
+[//]: # "docs-test: skip - application supplies its authenticated customer_id"
 
 ```python
-OpenAIResponsesProvider(model="gpt-5.5", cache_key_prefix=f"customer:{customer_id}")
+from dendrux.llm.openai_responses import OpenAIResponsesProvider
+
+OpenAIResponsesProvider(model="gpt-5.5", cache_key_prefix="customer:" + customer_id)
 ```
 
 The constructor value wins over the runner's `{agent_name}:{model}` prefix. On GPT-5.6 and later the key is unnecessary: OpenAI routes for cache hits without it.
@@ -199,6 +175,6 @@ The first shows whether an agent is taking advantage of caching across runs; the
 ## Where this fits
 
 - Wired inside the built-in providers: `dendrux.llm.anthropic.AnthropicProvider`, `dendrux.llm.openai.OpenAIProvider`, `dendrux.llm.openai_responses.OpenAIResponsesProvider`.
-- Anthropic adds `cache_control` markers on the system block and the last message. OpenAI adds `prompt_cache_key` routing derived from the agent+model prefix.
+- Anthropic adds up to four `cache_control` markers across the system block, stable context, replayed history and final message. OpenAI adds `prompt_cache_key` routing derived from the agent+model prefix.
 - Telemetry is per-call on `llm_interactions`, per-iteration on `token_usage`, and per-run totals on `agent_runs`.
 - A `ConsoleNotifier` (see [Notifier](/docs/architecture/notifier)) renders cache counts live during dev runs for quick inspection.

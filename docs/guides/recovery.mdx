@@ -7,7 +7,7 @@ description: Use your own maintenance job to mark expired leases, reclaim a form
 
 A worker can stop between a model response, a tool call and a database commit. Format-2 ReAct runs keep a durable checkpoint so another worker can continue. Dendrux supplies `sweep()` and `agent.reclaim()`; your application calls them and owns dispatch, concurrency limits and scheduling. There is no recovery daemon.
 
-Complete the [0.6 upgrade and activation](/docs/upgrading-to-0.6.0) first. Format-1 runs and `SingleCall` runs cannot be reclaimed.
+Complete the [0.6 upgrade and activation](/docs/upgrading-to-0.6.0) first, then follow the [0.6.1 upgrade notes](/docs/upgrading-to-0.6.1) for migration history and recovery-count changes. Format-1 runs and `SingleCall` runs cannot be reclaimed.
 
 ## Size the lease window
 
@@ -68,7 +68,7 @@ This example dispatches serially and handles `RunNotReclaimableError` per item s
 | `max_returned` | 1,000 | 100,000 | Reclaimable items returned |
 | `max_reclaims` | 3 | 32,767 | Attempt limit written by each new mark |
 
-Rediscovering an existing mark preserves its stored limit. A successful reclaim increments the attempt count. Once the limit is exhausted, a later sweep finalizes the stale run as `error` with `failure_reason="reclaim_limit"`.
+Rediscovering an existing mark preserves its stored limit. Each successful claim increments `reclaim_attempts`. Since 0.6.1, it counts recovery attempts since the last newly committed progress, rather than lifetime attempts. A new advancing model step, server-tool observation, consumed client-tool observation or final answer resets it to zero in the same atomic write. Heartbeats, tool intents, reused observations, unchanged checkpoints and pause/approval cycling do not reset it. Once the limit is exhausted without progress, a later sweep finalizes the stale run as `error` with `failure_reason="reclaim_limit"`; a direct reclaim refuses with `RunNotReclaimableError(reason="reclaim_limit")`.
 
 In reclaim mode, stale format-1 runs are finalized with `stale_running_legacy`. Stale `SingleCall` runs or format-2 runs without a supported loop marker are finalized through the stale error path. They are not returned for reclaim. A pending cancellation wins and finalizes the run as cancelled. `abandoned_waiting=` independently reaps waiting or paused runs only when both `status_changed_at` and `updated_at` exceed the window; repeat sweeps to drain that category.
 
@@ -103,8 +103,10 @@ An uncertain non-idempotent call pauses with an approval gate whose source is `r
 
 Use the normal `submit_approval` method and the current `pause_id`. Approval permits one further attempt. Denial records `outcome="unknown"` and a failed observation with code `outcome_unknown`; it does not claim the original effect failed. A second crash during the approved attempt can require a new decision. Ordinary validation, deny rules and tool limits still apply.
 
+If recovery honors `request_pause`, the durable result is `paused`. Continue with `submit_resume`, `resume`, or an allowed `resume_stream`. Unresolved approval-gated calls then return `waiting_approval` with a fresh `pause_id`; use that current token for the approval decision. Repeated requested pauses preserve the unresolved calls, and cancellation wins over a pause. Resuming a requested pause does not grant approval.
+
 ## Inspect a recovered run
 
-`RunResult.recovery` contains `reclaim_attempts`, `last_reclaimed_at`, `replayed_tool_calls` and `replayed_truncated`. `agent.get_result(run_id, tenant_id=...)` includes the same recovery summary in its wire envelope for a reclaimed run. The replay list is bounded to 100 ids; check its truncation flag. Recovery emits `run.lease_expired`, `run.reclaimed` and, when applicable, `tool.replayed` events. See [Observability](/docs/recipes/observability#what-to-alert-on).
+`RunResult.recovery` contains `reclaim_attempts`, `last_reclaimed_at`, `replayed_tool_calls` and `replayed_truncated`. `agent.get_result(run_id, tenant_id=...)` includes the same recovery summary in its wire envelope for a reclaimed run. A recovered run that completes successfully reports `reclaim_attempts=0`; use `last_reclaimed_at` to recognize that recovery happened. Old counts remain until new qualifying progress, and terminal runs are not revived. Custom recovery-capable stores must reset the count atomically with qualifying evidence, preserve it for reused observations, and pass the updated [store-kit contracts](/docs/guides/build-your-own-store). Existing method signatures remain valid. The replay list is bounded to 100 ids; check its truncation flag. Recovery emits `run.lease_expired`, `run.reclaimed` and, when applicable, `tool.replayed` events. See [Observability](/docs/recipes/observability#what-to-alert-on).
 
 History rebuild refuses incomplete context. The defaults are `Limits.max_rebuild_bytes=16 MiB` and `Limits.max_rebuild_rows=20,000`. A rebuild failure after a claim ends the run as `error` and raises `RunNotReclaimableError`, including reasons such as `history_too_large` or `recovery_state_missing`. Inspect the durable state before trying again.

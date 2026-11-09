@@ -86,7 +86,7 @@ The guide is [Images](/docs/recipes/images).
 | `RunStore` | `from dendrux.store import RunStore` | Read-only facade over the six tables. See [RunStore](/docs/reference/run-store). |
 | `StateStore` / `SQLStateStore` / `PostgresStateStore` / `SQLiteStateStore` / `MySQLStateStore` / `StoreCapabilities` / `store_for_engine` | `from dendrux.store import StateStore, SQLStateStore, PostgresStateStore, SQLiteStateStore, MySQLStateStore, StoreCapabilities, store_for_engine` | Runtime persistence protocol, the SQL base class, the three built-in stores, the explicit capability declaration and the dialect-based factory. See [StateStore](/docs/reference/state-store). |
 | `ClaimResult` / `ReclaimableRun` / `SweepResult` | `from dendrux.runtime.state import ClaimResult, ReclaimableRun, SweepResult` | Claim epoch and pinned format, a marked recovery item, and the bounded sweep result. See [Recovery](/docs/guides/recovery). |
-| `RecoveryInfo` | `from dendrux.types import RecoveryInfo` | Reclaim count, last reclaim time and a bounded replayed-call summary on `RunResult.recovery`. |
+| `RecoveryInfo` | `from dendrux.types import RecoveryInfo` | Recovery attempts since last committed progress, last reclaim time and a bounded replayed-call summary on `RunResult.recovery`. Count 0 can still mean recovered; inspect `last_reclaimed_at`. |
 | `LiveUpdates` / `LiveUpdatesStats` / `PostgresUpdates` / `RedisUpdates` | `from dendrux.store import LiveUpdates, LiveUpdatesStats, PostgresUpdates, RedisUpdates` | Optional, lossy hints that wake `follow()` between polls: the base class to subclass for your own bus, its counters, and the Postgres LISTEN/NOTIFY and Redis Pub/Sub transports (`RedisUpdates` needs `pip install dendrux[redis]`). Pass an instance as `live_updates=` to a store. See [Scaling](/docs/guides/scaling#live-updates). |
 | `PendingPause` / `PendingToolCall` | `from dendrux.store import PendingPause, PendingToolCall` | What a paused run waits on, from `RunStore.get_pending`. See [Build your own read routes](/docs/recipes/build-your-own-read-routes). |
 | `Follow` / `FollowEnd` / `FollowHeartbeat` / `FollowCapacityError` / `EventFeed` | `from dendrux.store import ...` | The hardened live feed behind `RunStore.follow`. |
@@ -146,4 +146,5 @@ Run-control, skill-continuity, schema, and context-length exceptions live in `de
 - [HTTP integration](/docs/reference/http-api): the Python methods and application-owned HTTP boundary.
 - [Upgrading to 0.5.0](/docs/upgrading-to-0.5.0): every change from 0.4.1, with an action for each.
 - [Upgrading to 0.6.0](/docs/upgrading-to-0.6.0): activation, recovery and changed defaults.
+- [Upgrading to 0.6.1](/docs/upgrading-to-0.6.1): dedicated migration history, recovery-count semantics and successful-run retry.
 - [Database CLI](/docs/reference/cli): migration checks, format status and activation commands.

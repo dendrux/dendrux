@@ -100,9 +100,9 @@ dendrux db check
 
 ## A dedicated or a shared database
 
-Dendrux tables can live in a database of their own, or beside your application's tables. Only the Dendrux table names and `alembic_version` are ever considered; nothing else is touched.
+Dendrux tables can live in a database of their own, or beside your application's tables. Since 0.6.1, Dendrux keeps its migration history in `dendrux_alembic_version`; your application can keep its own `alembic_version` table in the same database. Application revision rows are left unchanged.
 
-> **Do not share the Alembic version table.** If your application keeps its own Alembic history in the same database, `alembic_version` already exists and `dendrux db migrate` refuses to run. Give Dendrux a separate database (the simplest fix), or keep the two histories in different databases. A Dendrux-owned version-table name is on the backlog.
+For an existing migrated Dendrux database, `dendrux db migrate` adopts verified legacy history once under the maintenance lock. Verification requires exactly one packaged Dendrux revision in the legacy table and an existing `agent_runs` table; it does not prove the full schema matches that revision. Mixed or conflicting Dendrux claims are refused with `migration_version_table_conflict`. Keep application migration configuration separate and follow [Upgrading to 0.6.1](/docs/upgrading-to-0.6.1) before repairing stamps manually. Do not run old Dendrux migration tools after adoption.
 
 ## Collations
 

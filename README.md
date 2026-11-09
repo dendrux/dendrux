@@ -544,6 +544,7 @@ Use RunStore reads plus your own tracing and inspection tools. See
 | [`37_images.py`](packages/python/examples/37_images.py) | A user image plus a tool that returns an image, stored and inspected (mock provider by default, no API key) |
 | [`38_images_client_tool.py`](packages/python/examples/38_images_client_tool.py) | Client-tool screenshot: pause, submit the image from a second Agent, resume (mock provider by default) |
 | [`39_mysql_store.py`](packages/python/examples/39_mysql_store.py) | `MySQLStateStore` on MySQL or MariaDB: pause on a client tool, resume, finish (mock provider; skips without `DENDRUX_MYSQL_URL`) |
+| [`41_clean_sales.py`](packages/python/examples/41_clean_sales.py) | Sales-region cleanup with a persisted run, approval decisions and explicit tenant/pause tokens (requires an Anthropic API key) |
 | **Governance** | |
 | [`governance/01_tool_deny.py`](packages/python/examples/governance/01_tool_deny.py) | Block tools deterministically (batch + streaming) |
 | [`governance/02_approval.py`](packages/python/examples/governance/02_approval.py) | Human-in-the-loop approval with approve/reject CLI |

@@ -44,7 +44,7 @@ Every error carries:
 
 Unknown vendor codes and unmapped custom-provider codes become `provider_unknown` in safe projections. Package-issued codes retain their meaning. The raw value is only on the exception's `provider_code_raw`; do not log or return it.
 
-The original SDK exception is on `__cause__`, and the vendor's own message text goes only into the debug trace and the stored provider evidence, which your app must keep behind operator authorization. A refusal's text is available in process as `ModelRefusalError.refusal_text`; it is never persisted or put on an event.
+The original SDK exception remains on `__cause__`. Dendrux diagnostics never include exception text, traceback chains or vendor response bodies; use the safe fields above. Stored provider evidence is a separate, sensitive surface that your app must keep behind operator authorization. A refusal's text is available in process as `ModelRefusalError.refusal_text`; it is never persisted or put on an event.
 
 ## Catching them
 
@@ -98,7 +98,7 @@ Use `retryable`, then add your own policy:
 - `refusal` and `content_filter`: the model or the vendor declined. Change the input; do not loop.
 - `context_length`: shorten the history or switch model.
 
-For a failed run, `agent.retry(run_id)` starts a fresh run with the earlier context.
+For a failed run, `agent.retry(run_id, tenant_id=tenant)` starts a fresh ReAct run with the earlier context. Retrying a successful ReAct run regenerates its final answer, retaining earlier user/tool context and leaving the source unchanged; ordinary `runs=` replay keeps successful answers. `SingleCall` retry is unsupported. A genuinely empty new completion remains a non-retryable `ProviderResponseError` with `provider_code="empty_completion"`.
 
 ## Deadlines
 

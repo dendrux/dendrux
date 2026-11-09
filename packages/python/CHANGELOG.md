@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.6.1 - Unreleased
+
+See [Upgrading to 0.6.1](../../docs/upgrading-to-0.6.1.mdx) for setup-specific
+steps and compatibility changes. Default automatic SQLite needs no migration command.
+
+### Changed
+
+- Change `reclaim_attempts` from a lifetime count to recovery attempts since the last
+  newly committed progress. Advancing model steps, server/client observations and
+  final answers reset it atomically. Reused evidence and pause/approval cycling do
+  not. A completed recovered run reports 0; use `last_reclaimed_at` to recognize
+  recovery. Custom recovery stores must implement the reset and pass the updated
+  store-kit contracts. Old counts remain until progress; terminal runs are not revived.
+- Retrying a successful ReAct run regenerates its final answer while retaining prior
+  user/tool context and applicable reasoning. The source stays unchanged; ordinary
+  `runs=` replay still retains successful answers. SingleCall retry stays unsupported.
+- Keep Dendrux migration history in `dendrux_alembic_version`, separate from application
+  Alembic history. Migration adopts verified legacy history once under a maintenance
+  lock, including the PostgreSQL primary-key constraint/index rename when needed.
+  Legacy `db check` exits 1 with migration guidance; read-only commands never adopt
+  history. Use 0.6.1 tools after adoption and explicit `alembic stamp` for verified
+  operator repair. Conflicting histories are refused without changing application rows.
+
+### Fixed
+
+- Continuing a requested pause during recovery reaches the required approval pause
+  with a fresh token. Cancellation still wins; resuming a pause does not grant approval.
+- Preserve committed ownership for cancellation cleanup when custom creation/claim
+  methods return Tasks as well as coroutines. Cleanup remains bounded and epoch-scoped.
+- Retain the local SQLite default silently when the optional legacy-home probe fails.
+  Explicit URLs bypass the probe; failures opening the selected database still fail.
+- Keep exception text out of Dendrux diagnostics. A failed server tool-result transform
+  returns the fixed message "Tool result transform failed."
+- Correct prompt-cache documentation: OpenAI uses matching prefixes with a routing-key
+  hint, and Anthropic requests can use up to four cache markers.
+
 ## 0.6.0 - 2026-11-06
 
 "Production". Recover interrupted runs from durable checkpoints, follow runs across

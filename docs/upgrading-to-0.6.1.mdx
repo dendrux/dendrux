@@ -1,0 +1,118 @@
+---
+title: Upgrading to 0.6.1
+description: Choose the migration steps for your setup, repair verified stamps, and update recovery-count and retry expectations.
+---
+
+# Upgrading to 0.6.1
+
+## Do I need to do anything?
+
+| Your setup | Action |
+| --- | --- |
+| Default/automatic SQLite, never ran Dendrux migrations | Upgrade Dendrux and start the app normally. Schema creation/sync stays automatic and unstamped; do not start running `db migrate` just for this release. Optional `dendrux db check --allow-unstamped` checks structure without changing it. |
+| PostgreSQL/MySQL/MariaDB, or SQLite already using Dendrux migrations | Back up, install the 0.6.1 migration tools, and select the target through `DENDRUX_DATABASE_URL` on a direct maintenance connection. Run `dendrux db migrate`, then `dendrux db check` and `dendrux db status`. Verified legacy Dendrux history is renamed once. |
+| App and Dendrux share a database with app Alembic | Keep application migration configuration separate. Use the same Dendrux commands for stamped Dendrux history or fresh bootstrap; app `alembic_version` rows stay unchanged. An existing unstamped Dendrux schema needs the manual repair below before opting into migrations. Automatic SQLite can stay automatic. |
+
+## Migration steps
+
+1. Back up the database. Install Dendrux 0.6.1 with your existing database extras in the migration-job environment before running commands. Select the intended database through deployment credential configuration in `DENDRUX_DATABASE_URL`. Use a direct maintenance connection, outside a transaction-mode pooler. For SQLite maintenance, stop other processes using the file.
+2. Run the following with the 0.6.1 tools:
+
+```bash
+dendrux db migrate
+dendrux db check
+dendrux db status
+```
+
+3. Upgrade the application's workers and readers. Migration preserves an existing database's format-1/format-2 activation state; it does not activate old runs or revive terminal runs. Fresh PostgreSQL databases still activate format 2 automatically, including when unrelated app Alembic history exists. Fresh MySQL/MariaDB bootstrap also starts active. For an old format-1 database, follow the separate [0.6 activation procedure](/docs/upgrading-to-0.6.0) after every worker and reader is upgraded. Activation rollback requires the pre-activation backup; restart every writer after a restore.
+
+Dendrux now uses `dendrux_alembic_version`. Under the maintenance lock, migration adopts legacy `alembic_version` only when it has exactly one row with a revision in the installed Dendrux graph and `agent_runs` exists. This verifies ownership, not every schema detail; actual migration/schema failures can still occur. On PostgreSQL, adoption also renames the old Alembic primary-key constraint/index when present, freeing that name for application history.
+
+Before adoption, an otherwise valid migrated 0.6.0 database makes `db check` exit **1**, even if its revision already equals head, with this guidance:
+
+```text
+Behind: Run `dendrux db migrate` to adopt verified legacy Dendrux history.
+```
+
+`db status` exits **0** and reports the verified legacy revision, `storage_format` and `activate_step` without modifying them. After migration, `db check` exits **0** for current revision and structure, **1** when behind, or **2** for unknown, unreadable or conflicting history. An unstamped database exits 2 unless `--allow-unstamped` requests the read-only structure check (0 complete, 1 incomplete). That flag still returns 1 for verified legacy history needing adoption.
+
+Mixed or competing Dendrux claims are refused with `migration_version_table_conflict`: migrate/activate exit 1, check/status exit 2. No app revision is automatically removed or merged. Unknown/newer dedicated revisions require the Dendrux version that wrote them or a compatible backup; never overwrite their stamps with an older revision. See [Database CLI](/docs/reference/cli).
+
+Direct Alembic offline SQL for SQLite/PostgreSQL targets only `dendrux_alembic_version`; it does not discover or rename live legacy history. Adopt verified history online first, or manually move the verified table and PostgreSQL PK/index in an exclusive maintenance window before applying generated SQL. MySQL/MariaDB still require live migration.
+
+## Manual repair of verified migration history
+
+Repair is an explicit operator action. Back up and suspend writers and migration tools first. Read every row in both version tables and compare it with the application's graph and the installed Dendrux graph. Preserve all app rows. Do not pick the first row or guess a revision. An empty dedicated table is treated as unstamped when no legacy Dendrux claim competes; it is not proof of schema provenance.
+
+### An unstamped Dendrux schema
+
+If legacy history is absent or purely application-owned, first run:
+
+```bash
+dendrux db check --allow-unstamped
+```
+
+If it fails, repair from known migrations/backup or rebuild in a separate database; do not stamp. A passing check is necessary but insufficient: establish that this is a current Dendrux-created schema or review its DDL against the installed head. SQLite/PostgreSQL structure checks do not verify every type, default or nullability.
+
+Once provenance and the actual schema revision are established, prefer **`alembic stamp`** using Dendrux's packaged migration graph, never your application's Alembic configuration. In a repository checkout, run from `packages/python` with its `alembic.ini`. For a pip installation, create a separate Dendrux-only configuration, for example `dendrux-alembic.ini`:
+
+```ini
+[alembic]
+script_location = dendrux.db:migrations
+
+[loggers]
+keys = root
+
+[handlers]
+keys =
+
+[formatters]
+keys =
+
+[logger_root]
+level = WARNING
+handlers =
+```
+
+The packaged environment reads `DENDRUX_DATABASE_URL`; keep it set to the same direct maintenance target. This release adds no migration revision: its packaged head is `f9a0b1c2d3e4`. Verify that head in your installed distribution and use it only for a proven current schema:
+
+```bash
+alembic -c dendrux-alembic.ini heads
+alembic -c dendrux-alembic.ini stamp f9a0b1c2d3e4
+dendrux db migrate
+dendrux db check
+dendrux db status
+```
+
+With the checkout's Dendrux `alembic.ini`, the stamp command is `alembic stamp f9a0b1c2d3e4`. For a proven older schema, stamp its actual revision instead, then migrate. `stamp` writes `dendrux_alembic_version`; it does not apply schema changes. There is no `dendrux db stamp` command. Neither `--allow-unstamped` nor `stamp --purge` bypasses conflicting Dendrux history.
+
+**SQL fallback only:** if the schema/revision is verified and the dedicated table is absent, an operator can create its stamp explicitly:
+
+```sql
+CREATE TABLE dendrux_alembic_version (version_num VARCHAR(32) NOT NULL PRIMARY KEY);
+INSERT INTO dendrux_alembic_version (version_num) VALUES ('f9a0b1c2d3e4');
+```
+
+Then run migrate/check/status. Do not drop or recreate an existing dedicated table blindly. MySQL-family DDL can commit independently; after interruption inspect the table and complete only the missing step, or use the supported explicit Alembic stamp for an empty dedicated table.
+
+### Mixed application and Dendrux legacy rows
+
+If `alembic_version` contains one proven Dendrux revision alongside app revisions, migration refuses automatic adoption. During the same maintenance window, separate that exact proven Dendrux row into the dedicated table, then delete only that row from the legacy table, preserving every app row. Match the verified revision exactly and assert exactly one row copied and deleted. Use a transaction where supported and account for MySQL DDL commits. Do not replace an older Dendrux revision with head.
+
+Once the legacy Dendrux claim has been separated, explicit Alembic stamp can repair a verified unstamped dedicated history. It refuses while a competing legacy Dendrux claim remains. Multiple Dendrux claims or uncertain provenance require investigation or restoration, not guessing. Rerun Dendrux check/status and the application's own migration check before restarting.
+
+## `reclaim_attempts` now counts attempts since progress
+
+This release changes the meaning of `RecoveryInfo.reclaim_attempts`: it is recovery attempts since the last newly committed progress, rather than a lifetime total. Each recovery claim increments it. A new advancing model step, server-tool observation, consumed client-tool observation or final answer resets it to zero atomically with that evidence. Heartbeats, tool intents, reused observations, unchanged checkpoints and pause/approval cycling do not reset it.
+
+A successfully completed recovered run therefore reports **0**. Its recovery summary remains available when metadata reads succeed; inspect **`last_reclaimed_at`** to recognize recovery. The replayed-tool IDs remain available and bounded to 100. Old counts remain until qualifying progress; exhausted stale runs may terminate before progress, and terminal runs are not revived. The default limit remains 3, maximum 32,767. No `FutureWarning` accompanies this change.
+
+Custom recovery-capable stores must implement these resets in the same atomic write as the qualifying evidence and preserve the streak for reused observations. Pass the updated [store-kit contracts](/docs/guides/build-your-own-store) before deploying; no new mandatory method signatures are required. See [Recovery](/docs/guides/recovery) for dispatch and inspection.
+
+## Retrying a successful run generates another answer
+
+`agent.retry` on a successful ReAct run now omits only the prior final answer, retaining earlier user/tool context, valid call/result pairs and applicable reasoning. JSON-formatted answers follow the same rule. It creates a new run with fresh iteration/usage counters and leaves the source unchanged. Ordinary `runs=` replay still retains successful answers. `SingleCall` retry remains unsupported, and a genuinely empty new completion still raises the existing non-retryable `empty_completion` error. See [Retry versus replay](/docs/recipes/run-replay#retry-versus-replay).
+
+## Do not run old Dendrux migration tools after the rename
+
+Once Dendrux history lives in `dendrux_alembic_version`, use the 0.6.1 migration environment for every Dendrux migration job and operator command. Older tools look for `alembic_version` and can mistake the database's history. Keep application Alembic configuration separate. Restore a compatible backup to roll back a migration; do not rename stamps back or run old Dendrux tools against the renamed history.
