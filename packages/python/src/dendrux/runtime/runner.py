@@ -2148,6 +2148,12 @@ def _text_history(history: list[ChatMessage] | None, images: bool) -> list[Messa
     return [] if images else normalize_chat_history(history)
 
 
+def _entry_seed_history(
+    replay: ReplayRequest | None, history: list[Message] | None
+) -> list[Message] | None:
+    return history if replay is None else None
+
+
 def _new_run_history(
     replay: ReplayRequest | None,
     history: list[Message],
@@ -2298,6 +2304,8 @@ async def _entry_media(
     context: Any,
     replay_req: ReplayRequest | None,
     skill_session: SkillSession,
+    *,
+    entry_projection: Any = None,
 ) -> tuple[ImageRuntime | None, tuple[ContentPart, ...] | None, Any, RunResult | None]:
     image_runtime: ImageRuntime | None = None
     user_parts: tuple[ContentPart, ...] | None = None
@@ -2327,6 +2335,8 @@ async def _entry_media(
                 context=context,
                 replay=replay_req.fingerprint() if replay_req else None,
                 skills=skill_session.fingerprint(),
+                entry_projection=entry_projection,
+                skill_session=skill_session,
             )
             if hit is None:
                 raise
@@ -2516,12 +2526,11 @@ async def run(
         from dendrux.runtime._entry_guardrails import _entry_projection
 
         entry_projection = _entry_projection(agent, run_id)
-        history = await entry_projection.history(history)
-        context = await entry_projection.context(context)
-        user_input, input_items = await entry_projection.text_items(
-            user_input, input_items, Role.USER, len(history or []) + 1
-        )
-        normalized_history = _text_history(history, image_input)
+        _system_prompt = (
+            await entry_projection.project(
+                Message(Role.SYSTEM, agent.get_system_prompt(loop=resolved_loop)), 0
+            )
+        ).content
 
         # Images: ingest before the first durable write (§5.2). Typed errors
         # raise here, before any run row or claim exists.
@@ -2543,6 +2552,7 @@ async def run(
             context,
             replay_req,
             skill_session,
+            entry_projection=entry_projection,
         )
         if cached is not None:
             return cached
@@ -2553,29 +2563,19 @@ async def run(
         # The runner will record the new user_input itself (after the recorder
         # is constructed) so seeded prior turns stay out of react_traces.
         # With runs=, the replayed prefix is folded in after expansion.
-        seeded_history = _new_run_history(
-            replay_req, normalized_history, context, user_input, skill_session, user_parts
-        )
-
-        # --- Delegation context ---
-        parent_run_id, delegation_level = resolve_parent_link(parent_ctx, state_store)
-
-        # Resolve system prompt BEFORE create_run() so skill loading
-        # failures don't leave a DB row stuck in running.
-        _system_prompt = (
-            await entry_projection.project(
-                Message(Role.SYSTEM, agent.get_system_prompt(loop=resolved_loop)), 0
-            )
-        ).content
         (
             seeded_history,
             normalized_history,
             context,
             user_input,
             user_parts,
-        ) = await entry_projection.rendered(
-            seeded_history, normalized_history, context, user_input, user_parts
+        ) = await entry_projection.prepare(
+            normalized_history, context, user_input, user_parts, skill_session
         )
+        seeded_history = _entry_seed_history(replay_req, seeded_history)
+
+        # --- Delegation context ---
+        parent_run_id, delegation_level = resolve_parent_link(parent_ctx, state_store)
 
         ctx_token = None
         mcp_meta: dict[str, Any] = {}
@@ -3111,6 +3111,8 @@ async def _idempotent_hit_after_image_error(
     context: list[ContextBlock] | None,
     replay: dict[str, Any] | None,
     skills: Any,
+    entry_projection: Any = None,
+    skill_session: SkillSession | None = None,
 ) -> Any:
     """The existing run of a keyed request whose image was purged or is gone since.
 
@@ -3148,12 +3150,49 @@ async def _idempotent_hit_after_image_error(
     stored = _stored_parts((record.input_data or {}).get(PARTS_KEY)) if record else None
     if stored is None or len(stored) != len(items):
         raise conflict
+    candidate = _image_retry_parts(items, stored, conflict)
+    normalized_history = normalize_chat_history(history)
+    if entry_projection is not None:
+        (
+            _,
+            normalized_history,
+            context,
+            user_input,
+            projected_parts,
+        ) = await entry_projection.prepare(
+            normalized_history, context, user_input, tuple(candidate), skill_session
+        )
+        assert projected_parts is not None
+        candidate = list(projected_parts)
+    if any(
+        isinstance(part, TextPart) and part != previous
+        for part, previous in zip(candidate, stored, strict=True)
+    ):
+        raise conflict
+    fingerprint = compute_idempotency_fingerprint(
+        agent_name,
+        user_input,
+        output_type_name=(
+            f"{output_type.__module__}.{output_type.__qualname__}" if output_type else None
+        ),
+        history=normalized_history or None,
+        context=context or None,
+        replay=replay,
+        skills=skills,
+        user_input_parts=candidate,
+    )
+    return await check(idempotency_key, fingerprint, tenant_id=tenant_id)
+
+
+def _image_retry_parts(
+    items: tuple[Any, ...], stored: tuple[ContentPart, ...], conflict: IdempotencyConflictError
+) -> list[ContentPart]:
     candidate: list[ContentPart] = []
     for item, part in zip(items, stored, strict=True):
         if isinstance(item, str):
-            if not isinstance(part, TextPart) or part.text != item:
+            if not isinstance(part, TextPart):
                 raise conflict
-            candidate.append(part)
+            candidate.append(TextPart(item))
             continue
         if not isinstance(part, ImagePart):
             raise conflict
@@ -3161,19 +3200,7 @@ async def _idempotent_hit_after_image_error(
         if isinstance(ref, ImageRef) and ref.sha256 != part.ref.sha256:
             raise conflict
         candidate.append(ImagePart(part.ref, detail=getattr(item, "detail", None)))
-    fingerprint = compute_idempotency_fingerprint(
-        agent_name,
-        user_input,
-        output_type_name=(
-            f"{output_type.__module__}.{output_type.__qualname__}" if output_type else None
-        ),
-        history=normalize_chat_history(history) or None,
-        context=context or None,
-        replay=replay,
-        skills=skills,
-        user_input_parts=candidate,
-    )
-    return await check(idempotency_key, fingerprint, tenant_id=tenant_id)
+    return candidate
 
 
 def _replay_sources(replay_runs: Sequence[Any]) -> list[tuple[str, str | None, Any]]:

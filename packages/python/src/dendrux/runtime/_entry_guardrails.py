@@ -6,7 +6,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
-from dendrux.context_blocks import ContextBlock
+from dendrux.context_blocks import ContextBlock, fold_context
 from dendrux.guardrails import GuardrailEngine
 from dendrux.guardrails._engine import _bind_entry_engine
 from dendrux.types import ContentPart, Message, Role, TextPart
@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 
     from dendrux.agent import Agent
     from dendrux.chat import ChatMessage
+    from dendrux.skills._session import SkillSession
 
 
 @dataclass
@@ -83,6 +84,45 @@ class _EntryProjection:
                 else ContextBlock(projected.content, placement=block.placement)
             )
         return result
+
+    async def prepare(
+        self,
+        history: list[Message],
+        context: list[ContextBlock] | None,
+        text: str,
+        parts: tuple[ContentPart, ...] | None,
+        session: SkillSession | None,
+    ) -> tuple[
+        list[Message] | None,
+        list[Message],
+        list[ContextBlock] | None,
+        str,
+        tuple[ContentPart, ...] | None,
+    ]:
+        folded = fold_context(history, context, text, session=session, user_parts=parts)
+        messages = folded if folded is not None else [Message(Role.USER, text)]
+        previous = self.error, self.findings, self.location
+        self.error = None
+        broad = await self.rendered(messages, list(history), context, text, parts)
+        if self.error is None:
+            self.error, self.findings, self.location = previous
+            return folded, history, context, text, parts
+        rejected = self.error, self.findings, self.location
+        self.error = None
+        history = [await self.project(message, i + 1) for i, message in enumerate(history)]
+        context = await self.context(context)
+        own = await self.project(Message(Role.USER, text, parts=parts), len(history) + 1)
+        if self.error is None:
+            # A wrapper-only rejection has no safe per-piece attribution.
+            self.error, self.findings, self.location = rejected
+            projected, history, context, text, parts = broad
+        else:
+            text, parts = own.content, own.parts
+            refolded = fold_context(history, context, text, session=session, user_parts=parts)
+            projected, history, context, text, parts = await self.rendered(
+                refolded, history, context, text, parts
+            )
+        return projected if folded is not None else None, history, context, text, parts
 
     async def rendered(
         self,
