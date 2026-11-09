@@ -195,6 +195,12 @@ async def get_session(engine: AsyncEngine | None = None) -> AsyncGenerator[Async
 def _resolve_database_url(url: str | None) -> str:
     if url is not None:
         return url
-    if not Path("dendrux.db").exists() and (Path.home() / ".dendrux/dendrux.db").exists():
+    if Path("dendrux.db").exists():
+        return DEFAULT_SQLITE_URL
+    try:
+        legacy_exists = (Path.home() / ".dendrux/dendrux.db").exists()
+    except (OSError, RuntimeError):
+        legacy_exists = False
+    if legacy_exists:
         _codes.log_code(logger, _codes.LOCAL_DATABASE_DEFAULT_CHANGED)
     return DEFAULT_SQLITE_URL
