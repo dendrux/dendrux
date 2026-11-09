@@ -1390,22 +1390,46 @@ class PersistenceRecorder(BaseRecorder):
 
     async def on_tool_started(self, run_id: str, tool_call: ToolCall, iteration: int) -> None:
         """Persist an execution intent before an actual server dispatch."""
-        if self._format2:
-            await self._start_checkpointed_tool(run_id, tool_call, iteration)
-        else:
-            try:
-                # Legacy progress writes remain cancellable; format-2 intent
-                # durability is handled by the fenced branch above.
-                await self._store_calls.touch_progress(self._run_id)
-            except RunFencedError:
-                raise
-            except Exception:
+        from dendrux.guardrails._engine import _entry_engine
+        from dendrux.loops._helpers import _check_blocked_run
+        from dendrux.runtime._blocked_content import _dispatch_write
+        from dendrux.runtime.state import unclaimed_store
+        from dendrux.runtime.stores.sql.base import SQLStateStore
+
+        native = isinstance(unclaimed_store(self._store), SQLStateStore)
+        guarded = self.guardrail_engine is not None or _entry_engine(run_id) is not None
+        if not native and guarded and hasattr(self._store, "add_note"):
+            # Custom stores have no mark predicate on the dispatch write: a guarded
+            # run reads the mark when notes are pending. Guardrail-free runs add no read.
+            control = await read_run_control(self._store_calls, run_id)
+            if control.has_pending_notes:
+                await _check_blocked_run(self._store, run_id)
+        with _dispatch_write(self._store, run_id):
+            if self._format2:
+                await self._start_checkpointed_tool(run_id, tool_call, iteration)
+            else:
+                await self._touch_tool_progress(run_id, required=native)
+            await self._cancel_guard.check(run_id)
+
+    async def _touch_tool_progress(self, run_id: str, *, required: bool) -> None:
+        from dendrux.errors import PersistenceError
+        from dendrux.loops._helpers import _BlockedObservationError
+
+        failed = False
+        try:
+            await self._store_calls.touch_progress(run_id)
+        except (RunFencedError, _BlockedObservationError):
+            raise
+        except Exception:
+            failed = required
+            if not required:
                 logger.warning(
                     "Failed to touch progress for run %s",
-                    self._run_id,
+                    run_id,
                     exc_info=safe_exception_info(),
                 )
-        await self._cancel_guard.check(run_id)
+        if failed:
+            raise PersistenceError()
 
     async def _start_checkpointed_tool(
         self, run_id: str, tool_call: ToolCall, iteration: int

@@ -404,8 +404,11 @@ async def _claim_submission(
 ) -> tuple[ClaimResult | int | bool, dict[str, Any] | None, dict[str, Any] | None]:
     from functools import partial
 
+    from dendrux.runtime._continuation_guardrails import _project_submission, _submission_evidence
     from dendrux.runtime.durability import _ownership_handoff
 
+    payload, block = await _project_submission(run_id, payload)
+    blocked = block is not None
     descriptor = None
     if (
         request.raw.get("schema_version") == 2
@@ -432,9 +435,14 @@ async def _claim_submission(
         operation = partial(
             store.submit_and_claim, run_id, expected_status=status, submitted_data=payload, **kwargs
         )
-    won = await _ownership_handoff(
-        store, operation, partial(_cancel_claim, store, run_id), run_id=run_id
-    )
+    async with _submission_evidence(store, run_id, blocked):
+        won = await _ownership_handoff(
+            store, operation, partial(_cancel_claim, store, run_id), run_id=run_id
+        )
+    if won and block is not None:
+        from dendrux.runtime._blocked_content import _remember_claimed_block
+
+        _remember_claimed_block(store, run_id, block)
     return won, descriptor, payload
 
 

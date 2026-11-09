@@ -50,6 +50,8 @@ from dendrux.llm._evidence import (
 from dendrux.llm._retry_telemetry import telemetry_context
 from dendrux.loops._budget import BudgetBreach, BudgetCarry, BudgetTracker, breach_payload
 from dendrux.loops._helpers import (
+    _BlockedObservationError,
+    _check_blocked_run,
     build_cache_key_prefix,
     final_stop_reason,
     governance_sinks,
@@ -1873,6 +1875,14 @@ async def _iteration_gate(ctx: _RunContext, iteration: int) -> RunResult | None:
         return budget_result
     if control is not None and control.has_pending_notes:
         assert ctx.state_store is not None
+        if ctx.agent.guardrails:
+            # Only a guarded run reads the mark a blocked note may have left.
+            try:
+                await _check_blocked_run(ctx.state_store, ctx.run_id)
+            except _BlockedObservationError as blocked:
+                return await _incoming_blocked(
+                    ctx, blocked.error, [], blocked.message, 0, iteration
+                )
         await _deliver_inbox(
             ctx.state_store,
             ctx.recorder,
@@ -2183,7 +2193,9 @@ async def _run_tool_step(
     await _append_turn(ctx, response, iteration, phase="commentary")
     if ctx.state_store is not None:
         # The provider may have returned after sweep revoked this worker.
-        await _read_control(ctx.state_store, ctx.run_id)
+        control = await _read_control(ctx.state_store, ctx.run_id)
+        if control.has_pending_notes and ctx.agent.guardrails:
+            await _check_blocked_run(ctx.state_store, ctx.run_id)
     tool_history_start = len(ctx.state.history)
     outcome = await _process_tool_calls(
         step=step,
@@ -2510,6 +2522,33 @@ async def _scan_outgoing(
     )
 
 
+async def _batch_action_result(
+    ctx: _RunContext, response: LLMResponse, step: AgentStep, iteration: int
+) -> RunResult | None:
+    if isinstance(step.action, Finish):
+        return await _finish_result(ctx, response, step.action, iteration)
+    if isinstance(step.action, Clarification):
+        return await _clarification_result(ctx, response, step.action, iteration)
+    if isinstance(step.action, ToolCall):
+        try:
+            outcome, tool_history_start = await _run_tool_step(ctx, response, step, iteration)
+        except _BlockedObservationError as blocked:
+            index = len(_build_messages(ctx)[0])
+            error = blocked.error
+            if ctx.g_engine is not None and blocked.findings:
+                _, _, located = await ctx.g_engine.project_incoming_message(
+                    blocked.message, index=index
+                )
+                error = located or error
+            return await _incoming_blocked(
+                ctx, error, blocked.findings, blocked.message, index, iteration
+            )
+        paused = _after_tools(ctx, outcome, tool_history_start, iteration)
+        if paused is not None:
+            return paused
+    return None
+
+
 class ReActLoop(Loop):
     """Think → act → observe → repeat.
 
@@ -2724,15 +2763,9 @@ class ReActLoop(Loop):
             )
             if limited is not None:
                 return limited
-            if isinstance(step.action, Finish):
-                return await _finish_result(ctx, response, step.action, iteration)
-            if isinstance(step.action, Clarification):
-                return await _clarification_result(ctx, response, step.action, iteration)
-            if isinstance(step.action, ToolCall):
-                outcome, tool_history_start = await _run_tool_step(ctx, response, step, iteration)
-                paused = _after_tools(ctx, outcome, tool_history_start, iteration)
-                if paused is not None:
-                    return paused
+            completed = await _batch_action_result(ctx, response, step, iteration)
+            if completed is not None:
+                return completed
 
         return _max_iterations_result(ctx)
 
@@ -2993,7 +3026,15 @@ async def _execute_record_notify(
         )
     if tracker is not None:
         tracker.result = result
-    await _record_tool(recorder, run_id, tool_call, result, iteration)
+    try:
+        await _record_tool(recorder, run_id, tool_call, result, iteration)
+    except _BlockedObservationError as blocked:
+        if tracker is not None:
+            tracker.result, tracker.recorded = blocked.result, True
+        await _notify_tool(
+            notifier, run_id, tool_call, blocked.result, iteration, notifier_warnings
+        )
+        raise
     if tracker is not None:
         tracker.recorded = True
     await _notify_tool(notifier, run_id, tool_call, result, iteration, notifier_warnings)

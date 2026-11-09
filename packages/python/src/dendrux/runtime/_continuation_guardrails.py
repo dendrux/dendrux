@@ -1,0 +1,147 @@
+"""Project submitted text before its claim and preserve continuation provenance."""
+
+from __future__ import annotations
+
+from contextlib import nullcontext
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
+
+from dendrux.guardrails._engine import _entry_engine
+from dendrux.runtime._entry_guardrails import _entry_projection
+from dendrux.types import Message, Role, content_part_to_dict
+
+if TYPE_CHECKING:
+    from contextlib import AbstractContextManager
+
+    from dendrux.agent import Agent
+    from dendrux.guardrails import GuardrailEngine
+    from dendrux.runtime.state import StateStore
+
+
+async def _continuation_projection(
+    agent: Agent, store: StateStore, run_id: str
+) -> AbstractContextManager[Any]:
+    if _entry_engine(run_id) is not None:
+        return nullcontext()
+    projection = _entry_projection(agent, run_id)
+    if projection.engine is not None:
+        from dendrux.guardrails import GuardrailEngine
+
+        projection.engine = GuardrailEngine(
+            agent.guardrails or [], pii_mapping=await store.get_pii_mapping(run_id), run_id=run_id
+        )
+        projection.engine._retain_allowed_findings = True
+    return projection.bind(run_id)
+
+
+@dataclass(frozen=True)
+class _SubmissionBlock:
+    """The first block found in a submission: safe error text, findings and where."""
+
+    error: str
+    findings: list[Any]
+    message: Message
+    offset: int
+
+
+async def _project_submission(
+    run_id: str, payload: dict[str, Any] | None
+) -> tuple[dict[str, Any] | None, _SubmissionBlock | None]:
+    engine = _entry_engine(run_id)
+    if engine is None or payload is None:
+        return payload, None
+    clean = dict(payload)
+    tool_block = await _project_submitted_tools(engine, clean)
+    input_block = await _project_submitted_input(engine, clean)
+    decision_block = await _project_submitted_decisions(engine, clean)
+    return clean, tool_block or input_block or decision_block
+
+
+async def _project_submitted_tools(
+    engine: GuardrailEngine, clean: dict[str, Any]
+) -> _SubmissionBlock | None:
+    from dataclasses import replace
+
+    from dendrux.loops._helpers import _project_tool_message
+    from dendrux.runtime.submit import deserialize_tool_results, serialize_tool_results
+    from dendrux.types import tool_result_message
+
+    if "submitted_tool_results" not in clean:
+        return None
+    results = deserialize_tool_results(clean["submitted_tool_results"])
+    block = None
+    for index, result in enumerate(results):
+        original = tool_result_message(result)
+        message, findings, error = await _project_tool_message(engine, result, original)
+        if error is not None:
+            results[index] = replace(result, payload=message.content, error=None, meta={}, notes=())
+            block = block or _SubmissionBlock(error, findings, original, index)
+    clean["submitted_tool_results"] = serialize_tool_results(results)
+    return block
+
+
+async def _project_submitted_input(
+    engine: GuardrailEngine, clean: dict[str, Any]
+) -> _SubmissionBlock | None:
+    from dendrux.runtime.runner import _stored_parts
+
+    if "submitted_user_input" not in clean:
+        return None
+    original = Message(
+        Role.USER,
+        clean["submitted_user_input"],
+        parts=_stored_parts(clean.get("submitted_user_parts")),
+    )
+    message, findings, error = await engine.project_incoming_message(original)
+    if error is None:
+        return None
+    clean["submitted_user_input"] = message.content
+    if message.parts is not None:
+        clean["submitted_user_parts"] = [content_part_to_dict(p) for p in message.parts]
+    # The reply follows any results submitted with it in the resumed history.
+    offset = len(clean.get("submitted_tool_results") or ())
+    return _SubmissionBlock(error, findings, original, offset)
+
+
+async def _project_submitted_decisions(
+    engine: GuardrailEngine, clean: dict[str, Any]
+) -> _SubmissionBlock | None:
+    if "submitted_decisions" not in clean:
+        return None
+    decisions = []
+    block = None
+    for index, decision in enumerate(clean["submitted_decisions"]):
+        copy = dict(decision)
+        if copy.get("reason") is not None:
+            original = Message(Role.USER, copy["reason"])
+            message, findings, error = await engine.project_incoming_message(original)
+            if error is not None:
+                copy["reason"] = message.content
+                block = block or _SubmissionBlock(error, findings, original, index)
+        decisions.append(copy)
+    clean["submitted_decisions"] = decisions
+    return block
+
+
+def _submission_evidence(store: StateStore, run_id: str, blocked: bool) -> Any:
+    from dendrux.runtime._blocked_content import _blocked_evidence
+
+    return _blocked_evidence(store, run_id) if blocked else nullcontext()
+
+
+async def _add_projected_note(
+    agent: Agent, store: StateStore, run_id: str, add_note: Any, **kwargs: Any
+) -> bool:
+    from dendrux.runtime._blocked_content import _blocked_evidence
+
+    projection = _entry_projection(agent, run_id)
+    message = await projection.project(Message(Role.USER, kwargs["text"]), 1)
+    if projection.error is not None:
+        kwargs.update(text=message.content, metadata=None)
+    async with _blocked_evidence(store, run_id) if projection.error is not None else nullcontext():
+        return bool(await add_note(run_id, **kwargs))
+
+
+async def _continuation_mapping(store: StateStore, run_id: str) -> dict[str, str] | None:
+    engine = _entry_engine(run_id)
+    return engine.get_pii_mapping() if engine is not None else await store.get_pii_mapping(run_id)

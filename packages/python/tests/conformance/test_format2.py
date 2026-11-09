@@ -33,8 +33,10 @@ async def test_extended_format_contract(cell, storage_format, backend_engine):
     expected = h.read_json(h.golden_path(cell.id, version))
     if storage_format == 2:
         format2._blocked_trace_expected(cell.id, expected["public_traces"])
+    format2._blocked_continuation_expected(cell.id, expected)
     assert h.diff(expected, actual) is None
     legacy = h.read_json(h.golden_path(cell.id, "format1_additions"))
     if storage_format == 2:
         format2._blocked_trace_expected(cell.id, legacy["public_traces"])
+    format2._blocked_continuation_expected(cell.id, legacy)
     assert h._norm(shared(actual)) == h._norm(shared(legacy))

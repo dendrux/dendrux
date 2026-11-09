@@ -196,6 +196,7 @@ if TYPE_CHECKING:
     from dendrux.media._catalog import BlobEdge
     from dendrux.media._image import UserContent
     from dendrux.media._runtime import ImageRuntime
+    from dendrux.runtime._entry_guardrails import _EntryProjection
     from dendrux.runtime.state import RunRecord, StateStore, TraceRecord
     from dendrux.runtime.tasks import RunTaskManager
     from dendrux.strategies.base import Strategy
@@ -2305,7 +2306,7 @@ async def _entry_media(
     replay_req: ReplayRequest | None,
     skill_session: SkillSession,
     *,
-    entry_projection: Any = None,
+    entry_projection: _EntryProjection | None = None,
 ) -> tuple[ImageRuntime | None, tuple[ContentPart, ...] | None, Any, RunResult | None]:
     image_runtime: ImageRuntime | None = None
     user_parts: tuple[ContentPart, ...] | None = None
@@ -3111,7 +3112,7 @@ async def _idempotent_hit_after_image_error(
     context: list[ContextBlock] | None,
     replay: dict[str, Any] | None,
     skills: Any,
-    entry_projection: Any = None,
+    entry_projection: _EntryProjection | None = None,
     skill_session: SkillSession | None = None,
 ) -> Any:
     """The existing run of a keyed request whose image was purged or is gone since.
@@ -3162,7 +3163,8 @@ async def _idempotent_hit_after_image_error(
         ) = await entry_projection.prepare(
             normalized_history, context, user_input, tuple(candidate), skill_session
         )
-        assert projected_parts is not None
+        if projected_parts is None:
+            raise conflict
         candidate = list(projected_parts)
     if any(
         isinstance(part, TextPart) and part != previous
@@ -4920,9 +4922,11 @@ async def _prepare_resume(
         td = get_tool_def(fn)
         target_lookup[td.name] = td.target
     from dendrux.guardrails import GuardrailEngine
+    from dendrux.guardrails._engine import _entry_engine
 
     run_guardrails = (
-        GuardrailEngine(agent.guardrails, pii_mapping=pii_mapping, run_id=run_id)
+        _entry_engine(run_id)
+        or GuardrailEngine(agent.guardrails, pii_mapping=pii_mapping, run_id=run_id)
         if pause_state.schema_version == 2 and agent.guardrails
         else None
     )
@@ -5814,6 +5818,7 @@ def _resume_claim_fallbacks(
 
 
 def _resume_claim_payload(
+    run_id: str,
     raw: dict[str, Any],
     status: str,
     results: list[ToolResult] | None,
@@ -5821,9 +5826,11 @@ def _resume_claim_payload(
     user_parts: tuple[ContentPart, ...] | None,
     decisions: list[tuple[str, ApprovalDecision]] | None,
 ) -> dict[str, Any] | None:
-    if raw.get("schema_version") != 2 or (
-        results is None and user_input is None and status != RunStatus.WAITING_APPROVAL.value
-    ):
+    from dendrux.guardrails._engine import _entry_engine
+
+    if raw.get("schema_version") != 2 and _entry_engine(run_id) is None:
+        return None
+    if results is None and user_input is None and status != RunStatus.WAITING_APPROVAL.value:
         return None
     from dendrux.runtime.submit import serialize_decisions, serialize_tool_results
     from dendrux.types import content_part_to_dict
@@ -5882,7 +5889,9 @@ async def _claim_resume(
     )
     for status in request.statuses:
         _canonicalize_legacy_denials(status, run_id, raw, results)
-        payload = _resume_claim_payload(raw, status, results, user_input, user_parts, decisions)
+        payload = _resume_claim_payload(
+            run_id, raw, status, results, user_input, user_parts, decisions
+        )
         epoch, descriptor, payload = await _claim_submission(
             store,
             run_id,
@@ -6065,7 +6074,9 @@ async def _read_resume_state(
     recovering = reclaimed is not None or await _reclaim.needs_resolution(
         store, run_id, pause, checkpoint=reads.checkpoint
     )
-    pii = None if streaming else await store.get_pii_mapping(run_id)
+    from dendrux.runtime._continuation_guardrails import _continuation_mapping
+
+    pii = None if streaming else await _continuation_mapping(store, run_id)
     _require_pause_agent(pause, agent, run_id, streaming)
     return reads.record, reads, raw, pause, recovering, pii
 
@@ -6273,19 +6284,32 @@ async def _resume_approval_work(
     image_runtime: ImageRuntime | None,
     on_work: Callable[[], None],
 ) -> RunResult | None:
-    approval, approving = await _resume_approval_batch(
-        agent,
-        store,
-        run_id,
-        ctx,
-        expected,
-        tool_results,
-        user_input,
-        image_runtime,
-        decisions=decisions,
-        on_work=on_work,
-    )
-    return await _finish_approval_batch(run_id, ctx, expected, tool_results, approval, approving)
+    from dendrux.loops._helpers import _BlockedObservationError
+
+    try:
+        approval, approving = await _resume_approval_batch(
+            agent,
+            store,
+            run_id,
+            ctx,
+            expected,
+            tool_results,
+            user_input,
+            image_runtime,
+            decisions=decisions,
+            on_work=on_work,
+        )
+        return await _finish_approval_batch(
+            run_id, ctx, expected, tool_results, approval, approving
+        )
+    except _BlockedObservationError as blocked:
+        from dendrux.guardrails._engine import _entry_engine
+        from dendrux.runtime._entry_guardrails import _EntryProjection
+
+        projection = _EntryProjection(_entry_engine(run_id), blocked.error, blocked.findings)
+        return await _blocked_entry_result(
+            projection, ctx.recorder, ctx.notifier, run_id, "", None, []
+        )
 
 
 def _initial_call_counts_kwargs(loop_method: Any, recorder: LoopRecorder) -> dict[str, Any]:
@@ -6457,6 +6481,96 @@ async def _fenced_resume_result(
     return result
 
 
+_CONTINUATION_BLOCKED = "Run stopped because it contains blocked content."
+
+
+def _continuation_block_error(
+    store: StateStore, run_id: str, pause: PauseState | None
+) -> tuple[str, list[Any], str, int | None]:
+    """Error, findings, location and iteration for a marked continuation stop.
+
+    A block found in this call keeps the guardrail's own safe text (name and finding
+    kinds, never matched text), located where the resumed history would have put
+    the message. A mark left by an earlier call gets the generic message.
+    """
+    from dendrux.guardrails._engine import _message_location
+    from dendrux.runtime._blocked_content import _claimed_block_detail
+
+    iteration = pause.iteration if pause is not None else None
+    block = _claimed_block_detail(store, run_id)
+    if block is None or pause is None:
+        return _CONTINUATION_BLOCKED, [], "continuation", iteration
+    # Request messages are the system prompt, the paused history, then the submission.
+    located = _message_location(block.message, 1 + len(pause.history) + block.offset)
+    error = block.error.replace(_message_location(block.message, None), located, 1)
+    return error, list(block.findings), located, pause.iteration + 1
+
+
+async def _stop_marked_continuation(
+    store: StateStore,
+    run_id: str,
+    record: RunRecord | None,
+    pause: PauseState | None = None,
+    *,
+    reclaiming: bool = False,
+    agent: Agent | None = None,
+) -> RunResult | None:
+    from dendrux.runtime._blocked_content import _continuation_blocked
+    from dendrux.types import RunResult
+
+    if reclaiming or not _continuation_blocked(store, run_id, record):
+        return None
+    from dendrux.runtime._continuation_guardrails import _continuation_mapping
+
+    mapping = await _continuation_mapping(store, run_id)
+    error, findings, location, iteration = _continuation_block_error(store, run_id, pause)
+    meta: dict[str, Any] = {
+        "failure_reason": FailureReason.GUARDRAIL_BLOCKED.value,
+        "pii_mapping": mapping or {},
+    }
+    if agent is not None and not agent._tool_sources:
+        # Same as any resumed result of an agent without tool sources.
+        meta.update(mcp_skipped_sources=[], mcp_skipped_tools=[])
+    result = RunResult(run_id=run_id, status=RunStatus.ERROR, error=error, meta=meta)
+    _codes.log_code(logger, _codes.GUARDRAIL_BLOCKED, run_id=run_id)
+    data = {"error": error, "failure_reason": FailureReason.GUARDRAIL_BLOCKED.value}
+    from dendrux.loops.react import _blocked_data
+
+    terminal: dict[str, Any] = {} if iteration is None else {"iteration_count": iteration}
+    try:
+        await _emit_event(
+            store,
+            run_id,
+            GovernanceEventType.GUARDRAIL_BLOCKED.value,
+            _blocked_data("incoming", error, findings, location),
+        )
+        won, needs_event = await _finalize_running_event(
+            store,
+            run_id,
+            RunStatus.ERROR.value,
+            StoredEventType.RUN_ERROR.value,
+            data,
+            error=error,
+            pii_mapping=mapping,
+            total_usage=pause.usage if pause is not None else None,
+            **terminal,
+            **_terminal_failure_kwargs(store, result),
+        )
+    except RunFencedError:
+        return await _build_cached_result(store, run_id)
+    if not won:
+        return await _build_cached_result(store, run_id)
+    if needs_event:
+        await _emit_event(store, run_id, StoredEventType.RUN_ERROR.value, data)
+    cached = await _build_cached_result(store, run_id)
+    if pause is not None:
+        cached.usage = pause.usage
+        cached.steps = list(pause.steps)
+    cached.meta.update(result.meta)
+    cached.meta["_finalize_won"] = True
+    return cached
+
+
 async def _resume_core(
     run_id: str,
     *,
@@ -6492,11 +6606,14 @@ async def _resume_core(
         user_parts: Already-ingested parts of a multimodal user input (the
             claimed path); ``user_input`` is then their text projection.
     """
+
     async with _release_setup_failure(state_store, run_id, expected_status, enabled=_skip_claim):
         skill_session, user_input, input_items = await _resume_session(
             agent, state_store, run_id, loop, user_input, tool_results, decisions, expected_status
         )
-    with skill_session.bind():
+    from dendrux.runtime._continuation_guardrails import _continuation_projection
+
+    with skill_session.bind(), await _continuation_projection(agent, state_store, run_id):
         async with _release_setup_failure(
             state_store, run_id, expected_status, enabled=_skip_claim
         ):
@@ -6553,6 +6670,17 @@ async def _resume_core(
         agent._task_manager.register_current(run_id)
 
         try:
+            stopped = await _stop_marked_continuation(
+                state_store,
+                run_id,
+                run_record,
+                pause_state,
+                reclaiming=_reclaim_pause is not None,
+                agent=agent,
+            )
+            if stopped is not None:
+                return stopped
+
             run_tenant = run_record.tenant_id if run_record else None
             # 4-8. Prepare history and notifier (shared with resume_stream).
             #      Does NOT fire any lifecycle hooks — that's the caller's job.
@@ -6931,6 +7059,23 @@ async def _finish_resume_stream_cleanup(
     return cancelled_result
 
 
+async def _initial_stream_images(
+    agent: Agent,
+    provider: LLMProvider,
+    store: StateStore | None,
+    resolver: Callable[[], Any] | None,
+    run_id: str,
+    expected_pause_id: str | None,
+    results: list[ToolResult] | None,
+    items: tuple[Any, ...],
+) -> tuple[StateStore | None, list[ToolResult] | None, tuple[ContentPart, ...] | None, bool]:
+    if items or any(result.images for result in results or ()):
+        return await _stream_resume_images(
+            agent, provider, store, resolver, run_id, expected_pause_id, results, items
+        )
+    return store, results, None, False
+
+
 def resume_stream(
     run_id: str,
     *,
@@ -6965,8 +7110,6 @@ def resume_stream(
     input_items: tuple[Any, ...] = ()
     if user_input is not None:
         user_input, input_items = split_user_content(user_input)
-    image_input = bool(input_items) or any(tr.images for tr in tool_results or ())
-
     _shared: dict[str, Any] = {"state_store": state_store, "ctx": None}
 
     mcp_meta: dict[str, Any] = {}
@@ -6978,18 +7121,16 @@ def resume_stream(
         stream_results = tool_results
         user_parts: tuple[ContentPart, ...] | None = None
 
-        results_prepared = False
-        if image_input:
-            store, stream_results, user_parts, results_prepared = await _stream_resume_images(
-                agent,
-                provider,
-                store,
-                state_store_resolver,
-                run_id,
-                expected_pause_id,
-                stream_results,
-                input_items,
-            )
+        store, stream_results, user_parts, results_prepared = await _initial_stream_images(
+            agent,
+            provider,
+            store,
+            state_store_resolver,
+            run_id,
+            expected_pause_id,
+            stream_results,
+            input_items,
+        )
 
         try:
             store = await _resolve_resume_stream_store(store, state_store_resolver)
@@ -7035,6 +7176,13 @@ def resume_stream(
             _shared["claimed"] = True
             _shared["expected_status"] = expected
             progress = _shared["progress"] = _ResumeProgress()
+
+            stopped = await _stop_marked_continuation(
+                store, run_id, run_record, pause_state, agent=agent
+            )
+            if stopped is not None:
+                yield _fenced_stream_event(run_id, stopped)
+                return
 
             # 5. Prepare (shared helper — history, notifier).
             #    Does NOT fire any lifecycle hooks; that's done below inside

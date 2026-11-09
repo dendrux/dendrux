@@ -45,6 +45,7 @@ from dendrux._sentinel import _OMITTED, _OmittedType, _UnsetType
 from dendrux.media._store import DEFAULT_GC_AGE, DEFAULT_GC_LIMIT
 from dendrux.runtime._blob_catalog import MIN_GC_AGE
 from dendrux.runtime._bounds import MAX_SMALL_PAGE
+from dendrux.runtime._continuation_guardrails import _continuation_projection
 from dendrux.runtime._entry_checks import entry_checks, require_boolean
 from dendrux.runtime._limit_checks import (
     MAX_NOTE_METADATA_BYTES,
@@ -153,6 +154,16 @@ _UNSET = _UnsetType()
 def _in_tenant_scope(record: Any, tenant_id: TenantScope) -> bool:
     """Omitted scope matches everything; otherwise the tenant must match exactly."""
     return tenant_id is UNSCOPED or record.tenant_id == tenant_id
+
+
+async def _require_note_target(store: StateStore, run_id: str, tenant_id: TenantScope) -> None:
+    from dendrux.errors import RunAlreadyTerminalError, RunNotFoundError
+
+    record = await store.get_run(run_id)
+    if record is None or not _in_tenant_scope(record, tenant_id):
+        raise RunNotFoundError(run_id)
+    if RunStatus(record.status) in _TERMINAL_STATUSES:
+        raise RunAlreadyTerminalError(run_id, RunStatus(record.status))
 
 
 async def _require_run_in_scope(store: StateStore, run_id: str, tenant_id: TenantScope) -> None:
@@ -1786,7 +1797,7 @@ class Agent:
 
         await _require_run_in_scope(store, run_id, tenant_id)
         skill_session = await continuation(self, store, run_id)
-        with skill_session.bind():
+        with skill_session.bind(), await _continuation_projection(self, store, run_id):
             pause = await validate_tool_results(store, run_id, results)
             from dendrux.runtime.submit import require_pause_id
 
@@ -1886,7 +1897,7 @@ class Agent:
         projection, items = split_user_content(text, owner="text")
         await _require_run_in_scope(store, run_id, tenant_id)
         skill_session = await continuation(self, store, run_id)
-        with skill_session.bind():
+        with skill_session.bind(), await _continuation_projection(self, store, run_id):
             from dendrux.runtime.submit import require_pause_id
 
             raw = await store.get_pause_state(run_id)
@@ -2038,7 +2049,7 @@ class Agent:
 
         await _require_run_in_scope(store, run_id, tenant_id)
         skill_session = await continuation(self, store, run_id)
-        with skill_session.bind():
+        with skill_session.bind(), await _continuation_projection(self, store, run_id):
             if pairs is not None:
                 await preflight_status(store, run_id, RunStatus.WAITING_APPROVAL)
                 raw_pause = await store.get_pause_state(run_id)
@@ -2638,7 +2649,7 @@ class Agent:
 
         await _require_run_in_scope(store, run_id, tenant_id)
         skill_session = await continuation(self, store, run_id)
-        with skill_session.bind():
+        with skill_session.bind(), await _continuation_projection(self, store, run_id):
             epoch = await claim_or_raise(
                 store,
                 run_id,
@@ -2742,6 +2753,10 @@ class Agent:
         if store is None:
             raise PersistenceNotConfiguredError()
 
+        if self.guardrails:
+            await _require_note_target(store, run_id, tenant_id)
+        from dendrux.runtime._continuation_guardrails import _add_projected_note
+
         add_note = require_store_method(store, "add_note")
         from dendrux.runtime.runner import _accepts_kwarg
 
@@ -2751,8 +2766,11 @@ class Agent:
         else:
             _codes.log_code(_agent_logger, _codes.NOTE_CAP_UNENFORCED, run_id=run_id)
         note_id = generate_ulid()
-        if await add_note(
+        if await _add_projected_note(
+            self,
+            store,
             run_id,
+            add_note,
             note_id=note_id,
             text=text,
             metadata=metadata,

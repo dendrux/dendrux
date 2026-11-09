@@ -1454,6 +1454,41 @@ class SQLStateStore(SQLBlobCatalog):
                 storage_format=row.storage_format,
             )
 
+    def _dispatch_filter(self, stmt: Any, run_id: str) -> Any:
+        from dendrux.runtime._blocked_content import _dispatch_guarded
+
+        if _dispatch_guarded(self, run_id):
+            from dendrux.db.models import AgentRun
+
+            return stmt.where(
+                self.json_get(AgentRun.meta, (BLOCKED_META_KEY,), "bool").is_not(True)
+            ).execution_options(synchronize_session=False)
+        return stmt
+
+    async def _check_dispatch_block(
+        self, session: AsyncSession, run_id: str, claim_epoch: int | None
+    ) -> None:
+        from dendrux.runtime._blocked_content import _dispatch_guarded
+
+        if not _dispatch_guarded(self, run_id):
+            return
+        from dendrux.db.models import AgentRun
+        from dendrux.loops._helpers import _BlockedObservationError
+        from dendrux.types import Message, Role, ToolResult
+
+        stmt = select(self.json_get(AgentRun.meta, (BLOCKED_META_KEY,), "bool")).where(
+            AgentRun.id == run_id
+        )
+        if claim_epoch is not None:
+            stmt = stmt.where(AgentRun.claim_epoch == claim_epoch)
+        if await session.scalar(stmt) is True:
+            raise _BlockedObservationError(
+                Message(Role.USER, "[blocked: 1 finding]"),
+                [],
+                "Run stopped because it contains blocked content.",
+                ToolResult(name="", call_id="", payload="[blocked: 1 finding]"),
+            )
+
     async def _fence(
         self, session: AsyncSession, run_id: str, claim_epoch: int | None, **values: Any
     ) -> None:
@@ -1467,6 +1502,7 @@ class SQLStateStore(SQLBlobCatalog):
         stmt = update(AgentRun).where(AgentRun.id == run_id)
         if claim_epoch is not None:
             stmt = stmt.where(AgentRun.claim_epoch == claim_epoch)
+        stmt = self._dispatch_filter(stmt, run_id)
         now = _dt.datetime.now(_dt.UTC)
         # Only the executing owner can renew via a fenced write. Administrative
         # events without a claim must not keep a crashed worker alive.
@@ -1482,6 +1518,8 @@ class SQLStateStore(SQLBlobCatalog):
         result = await session.execute(
             stmt.ordered_values(*self._ordered(AgentRun.__table__, dict(updated_at=now, **values)))
         )
+        if not getattr(result, "rowcount", 0):
+            await self._check_dispatch_block(session, run_id, claim_epoch)
         if claim_epoch is not None and not getattr(result, "rowcount", 0):
             _codes.log_code(logger, _codes.RUN_FENCED, run_id=run_id)
             raise RunFencedError(run_id, claim_epoch=claim_epoch)
@@ -3102,7 +3140,6 @@ class SQLStateStore(SQLBlobCatalog):
         )
 
         from dendrux.db.models import AgentRun, RunInbox
-        from dendrux.errors import NoteLimitExceededError
 
         if max_notes is not None and (isinstance(max_notes, bool) or max_notes < 1):
             raise ValueError("max_notes must be a positive int or None.")
@@ -3154,18 +3191,12 @@ class SQLStateStore(SQLBlobCatalog):
                     )
                 )
                 inserted = bool(result.rowcount and result.rowcount > 0)
-                if not inserted and max_notes is not None:
-                    # Still under the lock: tell "full" from missing/terminal/foreign.
-                    status = await session.scalar(
-                        _apply_tenant_scope(
-                            select(AgentRun.status).where(AgentRun.id == run_id), tenant_id
-                        )
+                if not inserted:
+                    await self._refuse_note_insert(
+                        session, run_id, tenant_id, max_notes, _note_count()
                     )
-                    full = (await session.scalar(_note_count()) or 0) >= max_notes
-                    if status is not None and status not in _TERMINAL_STATUS_VALUES and full:
-                        await session.rollback()
-                        _codes.log_code(logger, _codes.NOTE_LIMIT, run_id=run_id, limit=max_notes)
-                        raise NoteLimitExceededError(run_id, limit=max_notes)
+                    await session.rollback()
+                    return False
                 await self._write_tx(session)
                 return inserted
 
@@ -3176,6 +3207,30 @@ class SQLStateStore(SQLBlobCatalog):
             classify=self.classify_db_error,
             _raw_driver_errors=True,
         )
+
+    async def _refuse_note_insert(
+        self,
+        session: AsyncSession,
+        run_id: str,
+        tenant_id: TenantScope,
+        max_notes: int | None,
+        count_query: Any,
+    ) -> None:
+        from sqlalchemy import select
+
+        from dendrux.db.models import AgentRun
+        from dendrux.errors import NoteLimitExceededError
+
+        if max_notes is None:
+            return
+        status = await session.scalar(
+            _apply_tenant_scope(select(AgentRun.status).where(AgentRun.id == run_id), tenant_id)
+        )
+        full = (await session.scalar(count_query) or 0) >= max_notes
+        if status is not None and status not in _TERMINAL_STATUS_VALUES and full:
+            await session.rollback()
+            _codes.log_code(logger, _codes.NOTE_LIMIT, run_id=run_id, limit=max_notes)
+            raise NoteLimitExceededError(run_id, limit=max_notes)
 
     async def get_notes(
         self,
@@ -4315,9 +4370,12 @@ class SQLStateStore(SQLBlobCatalog):
                 )
                 if claim_epoch is not None:
                     stmt = stmt.where(AgentRun.claim_epoch == claim_epoch)
+                stmt = self._dispatch_filter(stmt, run_id)
                 result = await session.execute(
                     stmt.values(last_progress_at=_dt.datetime.now(_dt.UTC))
                 )
+                if not result.rowcount:
+                    await self._check_dispatch_block(session, run_id, claim_epoch)
                 await self._write_tx(session)
                 return bool(result.rowcount)
 

@@ -109,3 +109,32 @@ def _blocked_trace_expected(cell_id: str, traces: list) -> None:
     trace = traces[0][index]
     assert trace["content"] == original
     trace["content"] = "[blocked: 1 finding]"
+
+
+def _blocked_continuation_expected(cell_id: str, expected: dict) -> None:
+    """A blocked submission now stops right after its claim, before resumed work.
+
+    Only stored events and rows change: no resume/tool lifecycle events, no tool
+    row and no tool trace. The result, error text and run record stay as before.
+    """
+    if cell_id != "edge_indexed_block__run":
+        return
+    for run in expected.get("runs", []):
+        if "events" in run:
+            assert [name for name, _ in run["events"][4:]] == [
+                "run.resumed",
+                "tools.declared",
+                "tool.completed",
+                "guardrail.blocked",
+                "run.error",
+            ]
+            run["events"][4:] = [["guardrail.blocked", 0], ["run.error", 0]]
+        if "trace_roles" in run:
+            assert run["trace_roles"][-1] == "tool"
+            run["trace_roles"].pop()
+        assert [call["tool_name"] for call in run["tool_calls"]] == ["read_range"]
+        run["tool_calls"] = []
+    traces = expected["public_traces"][0]
+    assert traces[-1]["role"] == "tool"
+    assert traces[-1]["content"] in ('"person@example.com"', "[blocked: 1 finding]")
+    traces.pop()

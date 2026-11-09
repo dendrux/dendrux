@@ -11,7 +11,8 @@ from dendrux.errors import PersistenceError, RunFencedError
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterator, Sequence
 
-    from dendrux.runtime.state import StateStore
+    from dendrux.runtime._continuation_guardrails import _SubmissionBlock
+    from dendrux.runtime.state import RunRecord, StateStore
     from dendrux.runtime.stores.sql.base import SQLStateStore
 
 _blocked_target: ContextVar[tuple[object, str] | None] = ContextVar(
@@ -87,3 +88,83 @@ async def _require_block_mark(store: StateStore, run_id: str) -> None:
         pass
     if not valid:
         raise PersistenceError()
+
+
+_claimed_block: ContextVar[tuple[object, str, _SubmissionBlock] | None] = ContextVar(
+    "dendrux_claimed_block", default=None
+)
+
+
+def _remember_claimed_block(store: StateStore, run_id: str, block: _SubmissionBlock) -> None:
+    # Set only after a won claim that committed this call's blocked submission and
+    # its monotone mark, so the flag can never disagree with durable provenance.
+    from dendrux.runtime.state import unclaimed_store
+
+    _claimed_block.set((unclaimed_store(store), run_id, block))
+
+
+def _claimed_block_detail(store: StateStore, run_id: str) -> _SubmissionBlock | None:
+    """This call's own submission block (safe error and findings), if any."""
+    from dendrux.runtime.state import unclaimed_store
+
+    claimed = _claimed_block.get()
+    if claimed is None or claimed[:2] != (unclaimed_store(store), run_id):
+        return None
+    return claimed[2]
+
+
+def _continuation_blocked(store: StateStore, run_id: str, record: RunRecord | None) -> bool:
+    """Whether a validated continuation must stop for durable blocked provenance.
+
+    Reuses the run row the continuation already loaded, so a clean continuation
+    adds no statements. A blocked submission marks the run in its claim
+    transaction (a competing continuation then loses its claim) and this call's
+    own blocked claim is remembered locally. A note marked after the row was read
+    is handled exactly as during a running turn: guarded runs check the mark when
+    notes are pending, and native stores refuse tool dispatch on a marked run. Only the mark
+    and the terminal reason can describe a continuable run: every earlier blocked
+    event finalized its run as an error.
+    """
+    if _claimed_block_detail(store, run_id) is not None:
+        return True
+    return _row_blocked(store, run_id, record)
+
+
+def _row_blocked(store: StateStore, run_id: str, record: RunRecord | None) -> bool:
+    """Read the mark from an already loaded run row; malformed rows fail closed."""
+    from dendrux._meta_keys import BLOCKED_META_KEY
+    from dendrux.runtime.state import unclaimed_store
+    from dendrux.runtime.stores.sql.base import SQLStateStore
+
+    if record is None:
+        if isinstance(unclaimed_store(store), SQLStateStore):
+            raise PersistenceError()
+        # Custom blocked writes verify the mark through get_run before any related
+        # evidence, so a store without a readable run row never holds a mark.
+        return False
+    meta = getattr(record, "meta", None)
+    if getattr(record, "id", None) != run_id or (meta is not None and not isinstance(meta, dict)):
+        raise PersistenceError()
+    return (meta or {}).get(BLOCKED_META_KEY) is True or getattr(
+        record, "failure_reason", None
+    ) == "guardrail_blocked"
+
+
+_dispatch_target: ContextVar[tuple[object, str] | None] = ContextVar(
+    "dendrux_blocked_dispatch", default=None
+)
+
+
+@contextmanager
+def _dispatch_write(store: StateStore, run_id: str) -> Iterator[None]:
+    from dendrux.runtime.state import unclaimed_store
+
+    token = _dispatch_target.set((unclaimed_store(store), run_id))
+    try:
+        yield
+    finally:
+        _dispatch_target.reset(token)
+
+
+def _dispatch_guarded(store: object, run_id: str) -> bool:
+    return _dispatch_target.get() == (store, run_id)

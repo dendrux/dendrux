@@ -448,6 +448,35 @@ async def record_llm_failed(
     await recorder.on_llm_call_failed(run_id, iteration, error, duration_ms=duration_ms)
 
 
+async def _check_blocked_run(store: Any, run_id: str) -> None:
+    from dendrux._meta_keys import BLOCKED_META_KEY
+    from dendrux.errors import PersistenceError, RunFencedError
+    from dendrux.types import Message, Role, ToolResult
+
+    meta = None
+    try:
+        record = await store.get_run(run_id)
+        if (
+            record is not None
+            and record.id == run_id
+            and (record.meta is None or isinstance(record.meta, dict))
+        ):
+            meta = record.meta or {}
+    except RunFencedError:
+        raise
+    except Exception:
+        pass
+    if meta is None:
+        raise PersistenceError()
+    if meta.get(BLOCKED_META_KEY) is True:
+        raise _BlockedObservationError(
+            Message(Role.USER, "[blocked: 1 finding]"),
+            [],
+            "Run stopped because it contains blocked content.",
+            ToolResult(name="", call_id="", payload="[blocked: 1 finding]"),
+        )
+
+
 async def record_tool_started(
     recorder: LoopRecorder | None,
     run_id: str,
@@ -460,6 +489,30 @@ async def record_tool_started(
     await recorder.on_tool_started(run_id, tool_call, iteration)
 
 
+class _BlockedObservationError(Exception):
+    def __init__(
+        self, message: Message, findings: list[Any], error: str, result: ToolResult
+    ) -> None:
+        super().__init__(error)
+        self.message, self.findings, self.error, self.result = message, findings, error, result
+
+
+async def _project_tool_message(
+    engine: GuardrailEngine, result: ToolResult, message: Message
+) -> tuple[Message, list[Any], str | None]:
+    from dendrux.types import Message, Role
+
+    projected, findings, error = await engine.project_incoming_message(message)
+    if error is not None or not result.error or result.error in message.content:
+        return projected, findings, error
+    error_message, error_findings, error_block = await engine.project_incoming_message(
+        Message(Role.TOOL, result.error, name=result.name, call_id=result.call_id)
+    )
+    if error_block is not None:
+        return error_message, error_findings, error_block
+    return projected, findings, error
+
+
 async def record_tool(
     recorder: LoopRecorder | None,
     run_id: str,
@@ -467,20 +520,35 @@ async def record_tool(
     tool_result: ToolResult,
     iteration: int,
 ) -> None:
-    """Record tool completion to authoritative persistence. Exceptions propagate."""
-    if recorder is None:
-        return
-    projected = getattr(recorder, "on_projected_tool_completed", None)
-    if projected is not None and getattr(recorder, "guardrail_engine", None) is not None:
-        formatter = getattr(recorder, "format_observation", None)
-        assert formatter is not None
-        scope = getattr(recorder, "observation_scope", None)
-        assert scope is not None
-        async with scope():
-            message = await project_message(recorder, formatter(tool_result))
-            await projected(run_id, tool_call, tool_result, iteration, message)
-    else:
-        await recorder.on_tool_completed(run_id, tool_call, tool_result, iteration)
+    """Project and record tool completion before any content-bearing callback."""
+    from dendrux.guardrails._engine import _entry_engine
+    from dendrux.types import tool_result_message
+
+    engine = getattr(recorder, "guardrail_engine", None) or _entry_engine(run_id)
+    formatter = getattr(recorder, "format_observation", None) or tool_result_message
+    scope = getattr(recorder, "observation_scope", None)
+    async with scope() if scope is not None else nullcontext():
+        message = formatter(tool_result)
+        findings: list[Any] = []
+        error = None
+        if engine is not None:
+            message, findings, error = await _project_tool_message(engine, tool_result, message)
+        if error is not None:
+            tool_result = replace(
+                tool_result, payload=message.content, error=None, meta={}, notes=()
+            )
+        if recorder is not None:
+            async with _evidence_scope(recorder, run_id, error is not None):
+                projected = getattr(recorder, "on_projected_tool_completed", None)
+                if (
+                    projected is not None
+                    and getattr(recorder, "guardrail_engine", None) is not None
+                ):
+                    await projected(run_id, tool_call, tool_result, iteration, message)
+                else:
+                    await recorder.on_tool_completed(run_id, tool_call, tool_result, iteration)
+        if error is not None:
+            raise _BlockedObservationError(message, findings, error, tool_result)
 
 
 async def record_governance(
