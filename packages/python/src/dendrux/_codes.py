@@ -1859,20 +1859,10 @@ MCP_CLEANUP_FAILED = Code(
     "Inspect transport cleanup and repeated failure counts.",
 )
 
-GUARDRAIL_BLOCKED = Code(
-    "guardrail_blocked",
-    logging.WARNING,
-    "runtime",
-    _BASE_FIELDS,
-    "A continuation stops because its stored content is blocked.",
-    "Review the blocked run before submitting new work.",
-)
-
 REGISTRY = MappingProxyType(
     {
         code.name: code
         for code in (
-            GUARDRAIL_BLOCKED,
             MCP_TRANSPORT_FAILED,
             MCP_TRANSPORT_CLEANUP_FAILED,
             MCP_CREDENTIAL_RESOLUTION_FAILED,

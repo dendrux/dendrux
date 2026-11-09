@@ -103,10 +103,24 @@ async def test_061_marked_continuation_finalizes_error(store, engine, fmt, path)
 
 @pytest.mark.parametrize("fmt", [1, 2])
 @pytest.mark.parametrize("surface", ["client", "resume", "input", "rejection", "decision", "note"])
-async def test_submitted_text_is_projected_before_first_write(store, engine, fmt, surface):
+async def test_submitted_text_is_projected_before_first_write(
+    store, engine, fmt, surface, monkeypatch
+):
+    from dendrux.runtime import runner
+
     agent, provider, run_id, raw, effects = await paused_agent(
         store, engine, fmt, guarded=True, approval=surface in ("rejection", "decision")
     )
+    finalize = runner._finalize_running_event
+    snapshots = []
+
+    async def clean_before_terminal_commit(*args, **kwargs):
+        # Between the claim COMMIT and the terminal COMMIT (pause data still present).
+        await rows_are_clean(engine)
+        snapshots.append(True)
+        return await finalize(*args, **kwargs)
+
+    monkeypatch.setattr(runner, "_finalize_running_event", clean_before_terminal_commit)
     try:
         kwargs = {"tenant_id": "t", "expected_pause_id": raw["pause_id"]}
         call_id = raw["pending_tool_calls"][0]["id"]
@@ -144,7 +158,7 @@ async def test_submitted_text_is_projected_before_first_write(store, engine, fmt
                 **kwargs,
             )
         await rows_are_clean(engine)
-        assert result.status == RunStatus.ERROR
+        assert result.status == RunStatus.ERROR and snapshots
         assert provider._call_count == 1 and effects == []
         assert (await store.get_run(run_id)).meta["dendrux.blocked"] is True
     finally:
@@ -507,5 +521,113 @@ async def test_same_call_block_keeps_guardrail_error(store, engine, fmt, surface
         if surface in ("client", "resume"):
             assert result.error.endswith(f"at message 3 (role=tool, tool_call_id={call_id})")
             assert result.iteration_count == 2
+    finally:
+        await agent.close()
+
+
+@pytest.mark.parametrize("fmt", [1, 2])
+async def test_adopted_run_with_legacy_block_event_stops(store, engine, fmt, monkeypatch):
+    # 0.6.0 data: a crash after a blocked event committed but before finalize leaves an
+    # unmarked `running` run. Adoption without guardrails must still see that event.
+    from functools import wraps
+
+    from sqlalchemy import update
+
+    from dendrux.db.models import AgentRun
+    from dendrux.runtime.runner import resume_claimed
+
+    class Crash(BaseException):
+        pass
+
+    agent, provider, run_id, raw, _ = await paused_agent(store, engine, fmt)
+    original = store.submit_and_claim
+
+    @wraps(original)
+    async def crash_after_commit(*args, **kwargs):
+        result = await original(*args, **kwargs)
+        if result:
+            raise Crash()
+        return result
+
+    monkeypatch.setattr(store, "submit_and_claim", crash_after_commit)
+    adopter_provider = MockLLM([LLMResponse(text="unreachable")])
+    adopter = Agent(
+        on_governance_change="warn",
+        name="continuation",
+        prompt="Answer briefly.",
+        provider=adopter_provider,
+        state_store=store,
+        tools=[client_read],
+    )
+    try:
+        with pytest.raises(Crash):
+            await agent.submit_tool_results(
+                run_id,
+                [
+                    ToolResult(
+                        name="client_read",
+                        call_id=raw["pending_tool_calls"][0]["id"],
+                        payload=json.dumps("legacy"),
+                    )
+                ],
+                tenant_id="t",
+                expected_pause_id=raw["pause_id"],
+            )
+        await store.save_run_event(run_id, event_type="guardrail.blocked", data={})
+        record = await store.get_run(run_id)
+        meta = {k: v for k, v in record.meta.items() if k != "dendrux.blocked"}
+        async with engine.begin() as connection:
+            await connection.execute(
+                update(AgentRun).where(AgentRun.id == run_id).values(meta=meta)
+            )
+        record = await store.get_run(run_id)
+        assert record.status == "running" and "dendrux.blocked" not in record.meta
+        result = await resume_claimed(
+            run_id,
+            state_store=store,
+            agent=adopter,
+            provider=adopter._require_provider(),
+            pre_claim_status="waiting_client_tool",
+            claim_epoch=record.claim_epoch,
+        )
+        assert result.status == RunStatus.ERROR
+        assert adopter_provider._call_count == 0
+        assert (await store.get_run(run_id)).failure_reason == "guardrail_blocked"
+    finally:
+        await adopter.close()
+        await agent.close()
+
+
+@pytest.mark.parametrize("fmt", [1, 2])
+@pytest.mark.parametrize("path", ["submit", "resume"])
+async def test_no_blocked_detail_outlives_the_call(store, engine, fmt, path):
+    # Nothing from a blocked submission (raw message, findings) stays in the caller's
+    # context once the call returns.
+    from contextvars import copy_context
+
+    agent, _, run_id, raw, _ = await paused_agent(store, engine, fmt, guarded=True)
+    try:
+        results = [
+            ToolResult(
+                name="client_read",
+                call_id=raw["pending_tool_calls"][0]["id"],
+                payload=json.dumps(SECRET),
+            )
+        ]
+        kwargs = {"tenant_id": "t", "expected_pause_id": raw["pause_id"]}
+        if path == "submit":
+            result = await agent.submit_tool_results(run_id, results, **kwargs)
+        else:
+            result = await agent.resume(run_id, tool_results=results, **kwargs)
+        assert result.status == RunStatus.ERROR
+        leftovers = [
+            var.name
+            for var, value in copy_context().items()
+            if var.name.startswith("dendrux")
+            and value is not None
+            and not isinstance(value, bool)
+            and (SECRET in repr(value) or "Finding(" in repr(value))
+        ]
+        assert leftovers == []
     finally:
         await agent.close()

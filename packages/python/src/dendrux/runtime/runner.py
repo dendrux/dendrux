@@ -25,7 +25,7 @@ from contextlib import aclosing, asynccontextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from functools import partial
-from typing import TYPE_CHECKING, Any, NamedTuple, get_args, overload
+from typing import TYPE_CHECKING, Any, NamedTuple, NoReturn, get_args, overload
 
 from dendrux import _codes
 from dendrux._lifecycle import (
@@ -4996,11 +4996,58 @@ async def _replay_tool_result(
     if ctx.pause_state.schema_version != 2:
         await ctx.recorder.on_tool_started(run_id, tc, iteration)
     await _notify_tool_started(ctx.notifier, run_id, tc, iteration)
+    if await _replayed_result_blocked(ctx, run_id, tr):
+        # A claim made without projection: record only the projected evidence and stop,
+        # before the raw tool message reaches any trace or callback.
+        _mark_work(on_consumed)
+        await _record_blocked_replay(ctx, run_id, tc, tr, iteration)
     await ctx.recorder.on_message_appended(run_id, msg, iteration)
     _mark_work(on_consumed)
     await record_tool(ctx.recorder, run_id, tc, tr, iteration)
     await notify_message(ctx.notifier, run_id, msg, iteration)
     await _notify_tool(ctx.notifier, run_id, tc, tr, iteration)
+
+
+async def _replayed_result_blocked(ctx: _ResumeContext, run_id: str, tr: ToolResult) -> bool:
+    from dendrux.guardrails._engine import _entry_engine
+    from dendrux.loops._helpers import _project_tool_message
+    from dendrux.types import tool_result_message
+
+    engine = getattr(ctx.recorder, "guardrail_engine", None) or _entry_engine(run_id)
+    if engine is None:
+        return False
+    formatter = getattr(ctx.recorder, "format_observation", None) or tool_result_message
+    # The same projection record_tool reuses, so the result is still scanned once.
+    _, _, error = await _project_tool_message(engine, tr, formatter(tr))
+    return error is not None
+
+
+async def _record_blocked_replay(
+    ctx: _ResumeContext, run_id: str, tc: ToolCall, tr: ToolResult, iteration: int
+) -> NoReturn:
+    from dendrux.loops._helpers import _BlockedObservationError
+    from dendrux.loops._helpers import notify_tool as _notify_tool
+
+    try:
+        await record_tool(ctx.recorder, run_id, tc, tr, iteration)
+    except _BlockedObservationError as blocked:
+        await _notify_tool(ctx.notifier, run_id, tc, blocked.result, iteration)
+        raise
+    raise AssertionError("a blocked replayed result must stop")
+
+
+async def _resume_blocked_result(ctx: _ResumeContext, run_id: str, blocked: Any) -> RunResult:
+    """The normal guardrail outcome for a resumed submission stopped by blocked content."""
+    from dendrux.guardrails._engine import _entry_engine
+    from dendrux.runtime._entry_guardrails import _EntryProjection
+
+    projection = _EntryProjection(_entry_engine(run_id), blocked.error, blocked.findings)
+    result = await _blocked_entry_result(
+        projection, ctx.recorder, ctx.notifier, run_id, "", None, []
+    )
+    result.iteration_count = ctx.pause_state.iteration + 1
+    result.steps = list(ctx.pause_state.steps)
+    return result
 
 
 async def _replay_resume_injected_history(
@@ -6486,7 +6533,7 @@ _CONTINUATION_BLOCKED = "Run stopped because it contains blocked content."
 
 def _continuation_block_error(
     store: StateStore, run_id: str, pause: PauseState | None
-) -> tuple[str, list[Any], str, int | None]:
+) -> tuple[str, Any, str, int | None]:
     """Error, findings, location and iteration for a marked continuation stop.
 
     A block found in this call keeps the guardrail's own safe text (name and finding
@@ -6501,9 +6548,13 @@ def _continuation_block_error(
     if block is None or pause is None:
         return _CONTINUATION_BLOCKED, [], "continuation", iteration
     # Request messages are the system prompt, the paused history, then the submission.
-    located = _message_location(block.message, 1 + len(pause.history) + block.offset)
-    error = block.error.replace(_message_location(block.message, None), located, 1)
-    return error, list(block.findings), located, pause.iteration + 1
+    message = block.location_message()
+    located = _message_location(message, 1 + len(pause.history) + block.offset)
+    error = block.error.replace(_message_location(message, None), located, 1)
+    from types import SimpleNamespace
+
+    counted = SimpleNamespace(entity_counts=dict(block.counts))
+    return error, counted, located, pause.iteration + 1
 
 
 async def _stop_marked_continuation(
@@ -6514,11 +6565,14 @@ async def _stop_marked_continuation(
     *,
     reclaiming: bool = False,
     agent: Agent | None = None,
+    claimed_here: bool = False,
 ) -> RunResult | None:
     from dendrux.runtime._blocked_content import _continuation_blocked
     from dendrux.types import RunResult
 
-    if reclaiming or not _continuation_blocked(store, run_id, record):
+    if reclaiming or not await _continuation_blocked(
+        store, run_id, record, claimed_here=claimed_here
+    ):
         return None
     from dendrux.runtime._continuation_guardrails import _continuation_mapping
 
@@ -6532,7 +6586,6 @@ async def _stop_marked_continuation(
         # Same as any resumed result of an agent without tool sources.
         meta.update(mcp_skipped_sources=[], mcp_skipped_tools=[])
     result = RunResult(run_id=run_id, status=RunStatus.ERROR, error=error, meta=meta)
-    _codes.log_code(logger, _codes.GUARDRAIL_BLOCKED, run_id=run_id)
     data = {"error": error, "failure_reason": FailureReason.GUARDRAIL_BLOCKED.value}
     from dendrux.loops.react import _blocked_data
 
@@ -6670,6 +6723,8 @@ async def _resume_core(
         agent._task_manager.register_current(run_id)
 
         try:
+            from dendrux.runtime._blocked_content import _claimed_here
+
             stopped = await _stop_marked_continuation(
                 state_store,
                 run_id,
@@ -6677,6 +6732,7 @@ async def _resume_core(
                 pause_state,
                 reclaiming=_reclaim_pause is not None,
                 agent=agent,
+                claimed_here=not _skip_claim or _claimed_here(state_store, run_id),
             )
             if stopped is not None:
                 return stopped
@@ -6729,13 +6785,20 @@ async def _resume_core(
             # 8b. tool/user-input history. Inside the try so
             #     a recorder failure here fires on_run_failed.
             if not recovering:
-                await _replay_resume_injected_history(
-                    ctx,
-                    run_id,
-                    tool_results=tool_results,
-                    user_input=user_input,
-                    on_consumed=progress._start,
-                )
+                from dendrux.loops._helpers import _BlockedObservationError
+
+                try:
+                    await _replay_resume_injected_history(
+                        ctx,
+                        run_id,
+                        tool_results=tool_results,
+                        user_input=user_input,
+                        on_consumed=progress._start,
+                    )
+                except _BlockedObservationError as blocked:
+                    blocked_stop = await _resume_blocked_result(ctx, run_id, blocked)
+                    _attach_mcp_meta(blocked_stop, mcp_meta)
+                    return await _finish_resumed_result(state_store, run_id, ctx, blocked_stop)
 
             ctx_token = set_delegation_context(
                 _resume_delegation(
@@ -7178,7 +7241,7 @@ def resume_stream(
             progress = _shared["progress"] = _ResumeProgress()
 
             stopped = await _stop_marked_continuation(
-                store, run_id, run_record, pause_state, agent=agent
+                store, run_id, run_record, pause_state, agent=agent, claimed_here=True
             )
             if stopped is not None:
                 yield _fenced_stream_event(run_id, stopped)

@@ -439,10 +439,10 @@ async def _claim_submission(
         won = await _ownership_handoff(
             store, operation, partial(_cancel_claim, store, run_id), run_id=run_id
         )
-    if won and block is not None:
-        from dendrux.runtime._blocked_content import _remember_claimed_block
+    if won:
+        from dendrux.runtime._blocked_content import _remember_claim
 
-        _remember_claimed_block(store, run_id, block)
+        _remember_claim(store, run_id, block)
     return won, descriptor, payload
 
 

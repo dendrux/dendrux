@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
 
 from dendrux.errors import PersistenceError, RunFencedError
@@ -14,6 +15,11 @@ if TYPE_CHECKING:
     from dendrux.runtime._continuation_guardrails import _SubmissionBlock
     from dendrux.runtime.state import RunRecord, StateStore
     from dendrux.runtime.stores.sql.base import SQLStateStore
+
+
+class _DispatchUndecided(Exception):  # noqa: N818 - private signal, never surfaced
+    """A dispatch write was refused and the read that would explain why failed."""
+
 
 _blocked_target: ContextVar[tuple[object, str] | None] = ContextVar(
     "dendrux_blocked_target", default=None
@@ -90,44 +96,104 @@ async def _require_block_mark(store: StateStore, run_id: str) -> None:
         raise PersistenceError()
 
 
-_claimed_block: ContextVar[tuple[object, str, _SubmissionBlock] | None] = ContextVar(
-    "dendrux_claimed_block", default=None
-)
+@dataclass
+class _ClaimCall:
+    """One public continuation call: whether it won a claim, and its safe block."""
+
+    run_id: str
+    store: object | None = None
+    block: _SubmissionBlock | None = None
 
 
-def _remember_claimed_block(store: StateStore, run_id: str, block: _SubmissionBlock) -> None:
-    # Set only after a won claim that committed this call's blocked submission and
-    # its monotone mark, so the flag can never disagree with durable provenance.
+_claim_call: ContextVar[_ClaimCall | None] = ContextVar("dendrux_claim_call", default=None)
+
+
+@contextmanager
+def _claim_call_scope(run_id: str) -> Iterator[None]:
+    """Scope a continuation call; nested scopes for the same run share it."""
+    current = _claim_call.get()
+    if current is not None and current.run_id == run_id:
+        yield
+        return
+    token = _claim_call.set(_ClaimCall(run_id))
+    try:
+        yield
+    finally:
+        _claim_call.reset(token)
+
+
+def _remember_claim(store: StateStore, run_id: str, block: _SubmissionBlock | None) -> None:
+    # Called only after a won claim; a blocked submission committed its mark with it.
     from dendrux.runtime.state import unclaimed_store
 
-    _claimed_block.set((unclaimed_store(store), run_id, block))
+    current = _claim_call.get()
+    if current is not None and current.run_id == run_id:
+        current.store, current.block = unclaimed_store(store), block
+
+
+def _claimed_here(store: StateStore, run_id: str) -> bool:
+    """Whether this call won the claim it is continuing (as opposed to adopting one)."""
+    from dendrux.runtime.state import unclaimed_store
+
+    current = _claim_call.get()
+    return (
+        current is not None
+        and current.run_id == run_id
+        and current.store is not None
+        and current.store is unclaimed_store(store)
+    )
 
 
 def _claimed_block_detail(store: StateStore, run_id: str) -> _SubmissionBlock | None:
-    """This call's own submission block (safe error and findings), if any."""
-    from dendrux.runtime.state import unclaimed_store
-
-    claimed = _claimed_block.get()
-    if claimed is None or claimed[:2] != (unclaimed_store(store), run_id):
-        return None
-    return claimed[2]
+    """This call's own submission block (safe error text and kind counts), if any."""
+    current = _claim_call.get()
+    return current.block if current is not None and _claimed_here(store, run_id) else None
 
 
-def _continuation_blocked(store: StateStore, run_id: str, record: RunRecord | None) -> bool:
+async def _continuation_blocked(
+    store: StateStore, run_id: str, record: RunRecord | None, *, claimed_here: bool
+) -> bool:
     """Whether a validated continuation must stop for durable blocked provenance.
 
-    Reuses the run row the continuation already loaded, so a clean continuation
-    adds no statements. A blocked submission marks the run in its claim
-    transaction (a competing continuation then loses its claim) and this call's
-    own blocked claim is remembered locally. A note marked after the row was read
-    is handled exactly as during a running turn: guarded runs check the mark when
-    notes are pending, and native stores refuse tool dispatch on a marked run. Only the mark
-    and the terminal reason can describe a continuable run: every earlier blocked
-    event finalized its run as an error.
+    A continuation whose claim this call won reuses the run row it already loaded,
+    so a clean continuation adds no statements: a blocked submission marks the run
+    in its claim transaction (a competing continuation then loses its claim) and
+    this call's own blocked claim is remembered. A note marked after the row was
+    read is handled as during a running turn: guarded runs check the mark when
+    notes are pending, and native stores refuse tool dispatch on a marked run.
+    Adopting a claim made elsewhere (``resume_claimed`` after a crash, raw-store
+    callers) also runs the full scoped lookup, which sees a legacy blocked event.
     """
     if _claimed_block_detail(store, run_id) is not None:
         return True
-    return _row_blocked(store, run_id, record)
+    if _row_blocked(store, run_id, record):
+        return True
+    if claimed_here:
+        return False
+    return await _adopted_run_blocked(store, run_id, record)
+
+
+async def _adopted_run_blocked(store: StateStore, run_id: str, record: RunRecord | None) -> bool:
+    from dendrux.runtime.state import unclaimed_store
+    from dendrux.runtime.stores.sql.base import SQLStateStore
+    from dendrux.types import GovernanceEventType
+
+    if isinstance(unclaimed_store(store), SQLStateStore):
+        tenant = record.tenant_id if record is not None else None
+        return bool(await _blocked_run_ids(store, [run_id], tenant_id=tenant))
+    blocked = GovernanceEventType.GUARDRAIL_BLOCKED.value
+    events = None
+    try:
+        events = await store.get_run_events(run_id, event_types=[blocked], limit=1)
+    except RunFencedError:
+        raise
+    except Exception:
+        events = None
+    if not isinstance(events, (list, tuple)) or any(
+        getattr(event, "event_type", None) != blocked for event in events
+    ):
+        raise PersistenceError()
+    return bool(events)
 
 
 def _row_blocked(store: StateStore, run_id: str, record: RunRecord | None) -> bool:

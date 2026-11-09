@@ -24,7 +24,7 @@ async def test_malformed_continuation_row_is_safe(record):
             raise AssertionError(f"unexpected store call: {name}")
 
     with pytest.raises(PersistenceError) as caught:
-        await _stop_marked_continuation(Store(), "run", record)
+        await _stop_marked_continuation(Store(), "run", record, claimed_here=True)
     assert SECRET not in str(caught.value)
     assert caught.value.__context__ is None and caught.value.__cause__ is None
 
@@ -72,7 +72,7 @@ async def test_unmarked_continuation_reads_nothing_more(meta):
         def __getattr__(self, name):
             raise AssertionError(f"unexpected store call: {name}")
 
-    assert await _stop_marked_continuation(Store(), "run", record) is None
+    assert await _stop_marked_continuation(Store(), "run", record, claimed_here=True) is None
 
 
 async def test_custom_store_without_run_row_cannot_hold_a_mark():
@@ -82,7 +82,7 @@ async def test_custom_store_without_run_row_cannot_hold_a_mark():
         def __getattr__(self, name):
             raise AssertionError(f"unexpected store call: {name}")
 
-    assert await _stop_marked_continuation(Store(), "run", None) is None
+    assert await _stop_marked_continuation(Store(), "run", None, claimed_here=True) is None
 
 
 async def test_guardrail_free_custom_dispatch_adds_no_reads():
@@ -116,3 +116,42 @@ async def test_guardrail_free_custom_dispatch_adds_no_reads():
     recorder = PersistenceRecorder(Store(), "run")
     await recorder.on_tool_started("run", ToolCall(name="effect", params={}), 1)
     assert calls == ["touch_progress"]  # exactly the calls 91024ac3 made
+
+
+@pytest.mark.parametrize(
+    ("events", "expected"),
+    [([], False), ([SimpleNamespace(event_type="guardrail.blocked")], True)],
+)
+async def test_adopted_custom_run_reads_one_filtered_event(events, expected):
+    from dendrux.runtime._blocked_content import _continuation_blocked
+
+    record = SimpleNamespace(id="run", tenant_id=None, meta={}, failure_reason=None)
+    reads = []
+
+    class Store:
+        async def get_run_events(self, run_id, **kwargs):
+            reads.append(kwargs)
+            return events
+
+    assert await _continuation_blocked(Store(), "run", record, claimed_here=False) is expected
+    assert reads == [{"event_types": ["guardrail.blocked"], "limit": 1}]
+
+
+@pytest.mark.parametrize("failure", ["raise", "malformed", "other_event"])
+async def test_adopted_custom_lookup_failure_is_safe(failure):
+    from dendrux.runtime._blocked_content import _continuation_blocked
+
+    record = SimpleNamespace(id="run", tenant_id=None, meta={}, failure_reason=None)
+
+    class Store:
+        async def get_run_events(self, run_id, **kwargs):
+            if failure == "raise":
+                raise ValueError(SECRET)
+            if failure == "malformed":
+                return SECRET
+            return [SimpleNamespace(event_type="run.error", data=SECRET)]
+
+    with pytest.raises(PersistenceError) as caught:
+        await _continuation_blocked(Store(), "run", record, claimed_here=False)
+    assert SECRET not in str(caught.value)
+    assert caught.value.__context__ is None and caught.value.__cause__ is None

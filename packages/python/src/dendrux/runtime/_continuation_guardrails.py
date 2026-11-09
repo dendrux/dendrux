@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -11,6 +11,7 @@ from dendrux.runtime._entry_guardrails import _entry_projection
 from dendrux.types import Message, Role, content_part_to_dict
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
     from contextlib import AbstractContextManager
 
     from dendrux.agent import Agent
@@ -21,8 +22,10 @@ if TYPE_CHECKING:
 async def _continuation_projection(
     agent: Agent, store: StateStore, run_id: str
 ) -> AbstractContextManager[Any]:
+    from dendrux.runtime._blocked_content import _claim_call_scope
+
     if _entry_engine(run_id) is not None:
-        return nullcontext()
+        return _claim_call_scope(run_id)
     projection = _entry_projection(agent, run_id)
     if projection.engine is not None:
         from dendrux.guardrails import GuardrailEngine
@@ -31,17 +34,39 @@ async def _continuation_projection(
             agent.guardrails or [], pii_mapping=await store.get_pii_mapping(run_id), run_id=run_id
         )
         projection.engine._retain_allowed_findings = True
-    return projection.bind(run_id)
+    return _bound_call(projection, run_id)
+
+
+@contextmanager
+def _bound_call(projection: Any, run_id: str) -> Iterator[None]:
+    from dendrux.runtime._blocked_content import _claim_call_scope
+
+    with _claim_call_scope(run_id), projection.bind(run_id):
+        yield
 
 
 @dataclass(frozen=True)
 class _SubmissionBlock:
-    """The first block found in a submission: safe error text, findings and where."""
+    """The first block in a submission, kept as safe text only (no content, no matches)."""
 
     error: str
-    findings: list[Any]
-    message: Message
+    counts: dict[str, int]
+    role: Role
+    name: str | None
+    call_id: str | None
     offset: int
+
+    @classmethod
+    def of(cls, error: str, findings: Any, message: Message, offset: int) -> _SubmissionBlock:
+        from collections import Counter
+
+        counts = getattr(findings, "entity_counts", None)
+        if counts is None:
+            counts = Counter(finding.entity_type for finding in findings)
+        return cls(error, dict(counts), message.role, message.name, message.call_id, offset)
+
+    def location_message(self) -> Message:
+        return Message(self.role, "", name=self.name, call_id=self.call_id)
 
 
 async def _project_submission(
@@ -75,7 +100,7 @@ async def _project_submitted_tools(
         message, findings, error = await _project_tool_message(engine, result, original)
         if error is not None:
             results[index] = replace(result, payload=message.content, error=None, meta={}, notes=())
-            block = block or _SubmissionBlock(error, findings, original, index)
+            block = block or _SubmissionBlock.of(error, findings, original, index)
     clean["submitted_tool_results"] = serialize_tool_results(results)
     return block
 
@@ -100,7 +125,7 @@ async def _project_submitted_input(
         clean["submitted_user_parts"] = [content_part_to_dict(p) for p in message.parts]
     # The reply follows any results submitted with it in the resumed history.
     offset = len(clean.get("submitted_tool_results") or ())
-    return _SubmissionBlock(error, findings, original, offset)
+    return _SubmissionBlock.of(error, findings, original, offset)
 
 
 async def _project_submitted_decisions(
@@ -117,7 +142,7 @@ async def _project_submitted_decisions(
             message, findings, error = await engine.project_incoming_message(original)
             if error is not None:
                 copy["reason"] = message.content
-                block = block or _SubmissionBlock(error, findings, original, index)
+                block = block or _SubmissionBlock.of(error, findings, original, index)
         decisions.append(copy)
     clean["submitted_decisions"] = decisions
     return block

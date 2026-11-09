@@ -2522,6 +2522,18 @@ async def _scan_outgoing(
     )
 
 
+async def _blocked_tool_step(
+    ctx: _RunContext, blocked: _BlockedObservationError, iteration: int
+) -> RunResult:
+    """The normal guardrail outcome for a tool step stopped by blocked content."""
+    index = len(_build_messages(ctx)[0])
+    error = blocked.error
+    if ctx.g_engine is not None and blocked.findings:
+        _, _, located = await ctx.g_engine.project_incoming_message(blocked.message, index=index)
+        error = located or error
+    return await _incoming_blocked(ctx, error, blocked.findings, blocked.message, index, iteration)
+
+
 async def _batch_action_result(
     ctx: _RunContext, response: LLMResponse, step: AgentStep, iteration: int
 ) -> RunResult | None:
@@ -2533,16 +2545,7 @@ async def _batch_action_result(
         try:
             outcome, tool_history_start = await _run_tool_step(ctx, response, step, iteration)
         except _BlockedObservationError as blocked:
-            index = len(_build_messages(ctx)[0])
-            error = blocked.error
-            if ctx.g_engine is not None and blocked.findings:
-                _, _, located = await ctx.g_engine.project_incoming_message(
-                    blocked.message, index=index
-                )
-                error = located or error
-            return await _incoming_blocked(
-                ctx, error, blocked.findings, blocked.message, index, iteration
-            )
+            return await _blocked_tool_step(ctx, blocked, iteration)
         paused = _after_tools(ctx, outcome, tool_history_start, iteration)
         if paused is not None:
             return paused
@@ -2905,9 +2908,14 @@ class ReActLoop(Loop):
                 return
 
             if isinstance(step.action, ToolCall):
-                outcome, tool_history_start = await _run_tool_step(
-                    ctx, llm_response, step, iteration
-                )
+                try:
+                    outcome, tool_history_start = await _run_tool_step(
+                        ctx, llm_response, step, iteration
+                    )
+                except _BlockedObservationError as blocked:
+                    stopped = await _blocked_tool_step(ctx, blocked, iteration)
+                    yield RunEvent(type=RunEventType.RUN_ERROR, run_result=stopped)
+                    return
                 for tc, tool_result in outcome.all_results:
                     yield RunEvent(
                         type=RunEventType.TOOL_RESULT,

@@ -432,10 +432,41 @@ async def test_marked_stream_reports_terminal_winner(store, engine, fmt, monkeyp
         await agent.close()
 
 
+@pytest.mark.parametrize("fmt", [1, 2])
 @pytest.mark.parametrize("raw_error", [False, True])
-async def test_native_dispatch_lookup_failure_is_not_best_effort(
-    store, engine, monkeypatch, raw_error
+async def test_refused_dispatch_with_failed_diagnostic_fails_closed(
+    store, engine, monkeypatch, raw_error, fmt
 ):
+    # The progress UPDATE refused the write (0 rows) and the read that would explain why
+    # failed: governance cannot decide, so dispatch stops with the safe PersistenceError.
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from dendrux.runtime.persistence import PersistenceRecorder
+    from dendrux.types import generate_ulid
+
+    await pin_storage_format(engine, fmt)
+    run_id = generate_ulid()
+    await store.create_run(run_id, agent_name="dispatch", input_data={})
+    with _blocked_write(store, run_id):
+        await store.save_run_event(run_id, event_type="guardrail.detected", data={})
+
+    async def unavailable(self, *args, **kwargs):
+        if raw_error:
+            raise ValueError(SECRET)
+        raise PersistenceError()
+
+    recorder = PersistenceRecorder(store, run_id)
+    monkeypatch.setattr(AsyncSession, "scalar", unavailable)
+    with pytest.raises(PersistenceError) as caught:
+        await recorder.on_tool_started(run_id, ToolCall(name="effect", params={}), 1)
+    monkeypatch.undo()
+    assert SECRET not in str(caught.value)
+    assert caught.value.__context__ is None and caught.value.__cause__ is None
+    assert (await store.get_run(run_id)).meta["dendrux.blocked"] is True
+
+
+async def test_native_dispatch_stops_when_the_refused_write_proves_a_mark(store, engine):
+    from dendrux.loops._helpers import _BlockedObservationError
     from dendrux.runtime.persistence import PersistenceRecorder
     from dendrux.types import generate_ulid
 
@@ -444,18 +475,9 @@ async def test_native_dispatch_lookup_failure_is_not_best_effort(
     await store.create_run(run_id, agent_name="dispatch", input_data={})
     with _blocked_write(store, run_id):
         await store.save_run_event(run_id, event_type="guardrail.detected", data={})
-
-    async def unavailable(*args):
-        if raw_error:
-            raise ValueError(SECRET)
-        raise PersistenceError()
-
-    monkeypatch.setattr(store, "_check_dispatch_block", unavailable)
     recorder = PersistenceRecorder(store, run_id)
-    with pytest.raises(PersistenceError) as caught:
+    with pytest.raises(_BlockedObservationError):
         await recorder.on_tool_started(run_id, ToolCall(name="effect", params={}), 1)
-    assert (await store.get_run(run_id)).meta["dendrux.blocked"] is True
-    assert caught.value.__context__ is None and caught.value.__cause__ is None
 
 
 @pytest.mark.parametrize("fmt", [1, 2])
@@ -544,3 +566,300 @@ async def test_guardrail_free_note_delivery_adds_no_run_read(store, engine, fmt,
             await agent.close()
 
     assert await run_once(True) == await run_once(False)
+
+
+@pytest.mark.parametrize("fmt", [1, 2])
+async def test_adopted_unprojected_claim_ends_as_guardrail_block(store, engine, fmt, monkeypatch):
+    # A claim committed without projection (raw store, legacy client, guardrails added
+    # later) and adopted by a guarded agent ends as a normal guardrail block, and the
+    # adopted path writes no raw tool trace.
+    from functools import wraps
+
+    from dendrux.runtime.runner import resume_claimed
+
+    class Crash(BaseException):
+        pass
+
+    agent, _, run_id, raw, _ = await paused_agent(store, engine, fmt)
+    original = store.submit_and_claim
+
+    @wraps(original)
+    async def crash_after_commit(*args, **kwargs):
+        result = await original(*args, **kwargs)
+        if result:
+            raise Crash()
+        return result
+
+    monkeypatch.setattr(store, "submit_and_claim", crash_after_commit)
+    adopter_provider = MockLLM([LLMResponse(text="unreachable")])
+    adopter = Agent(
+        on_governance_change="warn",
+        name="continuation",
+        prompt="Answer briefly.",
+        provider=adopter_provider,
+        state_store=store,
+        tools=[client_read],
+        guardrails=[SecretDetection()],
+    )
+    try:
+        with pytest.raises(Crash):
+            await agent.submit_tool_results(
+                run_id,
+                [
+                    ToolResult(
+                        name="client_read",
+                        call_id=raw["pending_tool_calls"][0]["id"],
+                        payload=json.dumps(SECRET),
+                    )
+                ],
+                tenant_id="t",
+                expected_pause_id=raw["pause_id"],
+            )
+        record = await store.get_run(run_id)
+        result = await resume_claimed(
+            run_id,
+            state_store=store,
+            agent=adopter,
+            provider=adopter._require_provider(),
+            pre_claim_status="waiting_client_tool",
+            claim_epoch=record.claim_epoch,
+        )
+        assert result.status == RunStatus.ERROR and SECRET not in (result.error or "")
+        assert adopter_provider._call_count == 0
+        record = await store.get_run(run_id)
+        assert record.failure_reason == "guardrail_blocked" and record.meta["dendrux.blocked"]
+        assert await store.get_run_events(run_id, event_types=["guardrail.blocked"])
+        await rows_are_clean(engine)
+    finally:
+        await adopter.close()
+        await agent.close()
+
+
+@pytest.mark.parametrize("fmt", [1, 2])
+async def test_guardrail_free_stream_marked_mid_turn_ends_as_guardrail_block(store, engine, fmt):
+    # Another (guarded) agent's blocked note marks a guardrail-free stream mid-turn; the
+    # native dispatch refusal ends the stream as a normal guardrail block.
+    from dendrux.tool import tool
+    from dendrux.types import RunEventType
+
+    await pin_storage_format(engine, fmt)
+    entered, release = asyncio.Event(), asyncio.Event()
+    effects = []
+
+    @tool()
+    async def effect() -> str:
+        effects.append("effect")
+        return "done"
+
+    class WaitingProvider(MockLLM):
+        async def complete_stream(self, *args, **kwargs):
+            entered.set()
+            await release.wait()
+            async for event in super().complete_stream(*args, **kwargs):
+                yield event
+
+    provider = WaitingProvider(
+        [LLMResponse(tool_calls=[ToolCall(name="effect", params={})]), LLMResponse(text="done")]
+    )
+    agent = Agent(prompt="p", provider=provider, state_store=store, tools=[effect])
+    guarded = Agent(
+        prompt="p",
+        provider=MockLLM([]),
+        state_store=store,
+        tools=[effect],
+        guardrails=[SecretDetection()],
+    )
+
+    async def consume():
+        events = []
+        async for event in agent.stream("go", tenant_id="t"):
+            events.append(event)
+        return events
+
+    task = asyncio.create_task(consume())
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        async with engine.connect() as connection:
+            run_id = (await connection.execute(select(AgentRun.id))).scalar_one()
+        await guarded.submit_note(run_id, SECRET, tenant_id="t")
+        release.set()
+        events = await task
+        terminal = events[-1]
+        assert terminal.type == RunEventType.RUN_ERROR
+        assert terminal.run_result.meta.get("failure_reason") == "guardrail_blocked"
+        assert effects == []
+        record = await store.get_run(run_id)
+        assert record.failure_reason == "guardrail_blocked"
+        await rows_are_clean(engine)
+    finally:
+        release.set()
+        await task
+        await agent.close()
+        await guarded.close()
+
+
+async def test_failing_legacy_progress_touch_stays_best_effort(store, engine, monkeypatch, caplog):
+    # 0.6.0 behaviour for format 1: a failed progress touch before dispatch is a warning,
+    # not a stop. Only a write refused because the run is marked stops dispatch.
+    from dendrux.tool import tool
+
+    await pin_storage_format(engine, 1)
+    effects = []
+
+    @tool()
+    async def effect() -> str:
+        effects.append("effect")
+        return "done"
+
+    async def unavailable(run_id, *, claim_epoch=None):
+        raise ValueError("store unavailable")
+
+    monkeypatch.setattr(store, "touch_progress", unavailable)
+    provider = MockLLM(
+        [LLMResponse(tool_calls=[ToolCall(name="effect", params={})]), LLMResponse(text="done")]
+    )
+    agent = Agent(prompt="p", provider=provider, state_store=store, tools=[effect])
+    try:
+        with caplog.at_level("WARNING"):
+            result = await agent.run("go", tenant_id="t")
+        assert result.status == RunStatus.SUCCESS and effects == ["effect"]
+        assert "Failed to touch progress" in caplog.text
+    finally:
+        await agent.close()
+
+
+@pytest.mark.parametrize("fmt", [1, 2])
+async def test_blocked_note_at_gate_makes_no_further_provider_call(store, engine, fmt):
+    # A note blocked while a tool runs is caught at the next iteration gate, before the
+    # model sees anything more.
+    from dendrux.tool import tool
+
+    await pin_storage_format(engine, fmt)
+    holder = {}
+
+    @tool()
+    async def leave_note() -> str:
+        async with engine.connect() as connection:
+            run_id = (
+                await connection.execute(select(AgentRun.id).where(AgentRun.status == "running"))
+            ).scalar_one()
+        await holder["agent"].submit_note(run_id, SECRET, tenant_id="t")
+        return "ok"
+
+    provider = MockLLM(
+        [LLMResponse(tool_calls=[ToolCall(name="leave_note", params={})]), LLMResponse(text="x")]
+    )
+    agent = holder["agent"] = Agent(
+        prompt="p",
+        provider=provider,
+        state_store=store,
+        tools=[leave_note],
+        guardrails=[SecretDetection()],
+    )
+    try:
+        result = await agent.run("go", tenant_id="t")
+        assert result.status == RunStatus.ERROR
+        assert result.meta["failure_reason"] == "guardrail_blocked"
+        assert provider._call_count == 1
+        await rows_are_clean(engine)
+    finally:
+        await agent.close()
+
+
+@pytest.mark.parametrize("fmt", [1, 2])
+async def test_blocked_note_before_client_step_stops_instead_of_pausing(store, engine, fmt):
+    # A client-tool step dispatches nothing server-side, so only the tool-step check can
+    # stop a run marked by a note during the model call.
+    await pin_storage_format(engine, fmt)
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    class WaitingProvider(MockLLM):
+        async def complete(self, *args, **kwargs):
+            entered.set()
+            await release.wait()
+            return await super().complete(*args, **kwargs)
+
+    provider = WaitingProvider([LLMResponse(tool_calls=[ToolCall(name="client_read", params={})])])
+    agent = Agent(
+        prompt="p",
+        provider=provider,
+        state_store=store,
+        tools=[client_read],
+        guardrails=[SecretDetection()],
+    )
+    task = asyncio.create_task(agent.run("go", tenant_id="t"))
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        async with engine.connect() as connection:
+            run_id = (await connection.execute(select(AgentRun.id))).scalar_one()
+        await agent.submit_note(run_id, SECRET, tenant_id="t")
+        release.set()
+        result = await task
+        assert result.status == RunStatus.ERROR
+        assert result.meta["failure_reason"] == "guardrail_blocked"
+        await rows_are_clean(engine)
+    finally:
+        release.set()
+        await task
+        await agent.close()
+
+
+async def test_custom_store_dispatch_after_blocked_note_stops(store, engine):
+    # Custom stores have no native mark predicate: the guarded dispatch read is the stop.
+    from dendrux.tool import tool
+    from tests._fixtures.stores import UndeclaredSameMethodsStore
+
+    class MarkingStore(UndeclaredSameMethodsStore):
+        async def update_run_meta(self, run, meta, **kwargs):
+            with _blocked_write(self.wrapped, run):
+                return await self.wrapped.update_run_meta(run, meta, **kwargs)
+
+    custom = MarkingStore(store)
+    entered, release = asyncio.Event(), asyncio.Event()
+    effects = []
+
+    @tool(parallel=False)
+    async def first_effect() -> str:
+        effects.append("first")
+        entered.set()
+        await release.wait()
+        return "okay"
+
+    @tool(parallel=False)
+    async def second_effect() -> str:
+        effects.append("second")
+        return "okay"
+
+    provider = MockLLM(
+        [
+            LLMResponse(
+                tool_calls=[
+                    ToolCall(name="first_effect", params={}),
+                    ToolCall(name="second_effect", params={}),
+                ]
+            ),
+            LLMResponse(text="done"),
+        ]
+    )
+    agent = Agent(
+        prompt="p",
+        provider=provider,
+        state_store=custom,
+        tools=[first_effect, second_effect],
+        guardrails=[SecretDetection()],
+    )
+    task = asyncio.create_task(agent.run("go", tenant_id="t"))
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        async with engine.connect() as connection:
+            run_id = (await connection.execute(select(AgentRun.id))).scalar_one()
+        await agent.submit_note(run_id, SECRET, tenant_id="t")
+        release.set()
+        result = await task
+        assert result.status == RunStatus.ERROR
+        assert effects == ["first"] and provider._call_count == 1
+        await rows_are_clean(engine)
+    finally:
+        release.set()
+        await task
+        await agent.close()

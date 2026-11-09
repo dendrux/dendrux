@@ -1481,7 +1481,17 @@ class SQLStateStore(SQLBlobCatalog):
         )
         if claim_epoch is not None:
             stmt = stmt.where(AgentRun.claim_epoch == claim_epoch)
-        if await session.scalar(stmt) is True:
+        marked = failed = False
+        try:
+            marked = await session.scalar(stmt) is True
+        except Exception:
+            failed = True
+        if failed:
+            # The refused write cannot be explained: governance cannot decide, so refuse.
+            from dendrux.runtime._blocked_content import _DispatchUndecided
+
+            raise _DispatchUndecided()
+        if marked:
             raise _BlockedObservationError(
                 Message(Role.USER, "[blocked: 1 finding]"),
                 [],
