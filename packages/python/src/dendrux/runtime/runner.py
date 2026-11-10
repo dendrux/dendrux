@@ -262,18 +262,16 @@ async def _persist_run_failure(
     safe event data and terminal fields (a blocked-content stop) passes them and
     ``exc=None``; ``strict`` then lets a failed finalize propagate.
     """
-    if exc is not None:
-        payload = _error_payload(exc) if payload is None else payload
-        finalize = _failure_finalize_fields(store, exc) if finalize is None else finalize
-    payload = payload or {}
     try:
+        # Deriving text from ``exc`` can itself raise; it fails like the write does.
+        payload, finalize = _failure_fields(store, exc, payload, finalize)
         won, needs_event = await _finalize_running_event(
             store,
             run_id,
             RunStatus.ERROR.value,
             StoredEventType.RUN_ERROR.value,
             payload,
-            **(finalize or {}),
+            **finalize,
         )
     except Exception:
         if strict:
@@ -286,6 +284,18 @@ async def _persist_run_failure(
         emit = _emit_event_safe if safe_event else _emit_event
         await emit(store, run_id, StoredEventType.RUN_ERROR.value, payload)
     return bool(won)
+
+
+def _failure_fields(
+    store: StateStore,
+    exc: Exception | None,
+    payload: dict[str, Any] | None,
+    finalize: dict[str, Any] | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    if exc is not None:
+        payload = _error_payload(exc) if payload is None else payload
+        finalize = _failure_finalize_fields(store, exc) if finalize is None else finalize
+    return payload or {}, finalize or {}
 
 
 def _failure_finalize_fields(store: StateStore, exc: Exception) -> dict[str, Any]:
@@ -5099,8 +5109,50 @@ async def _record_blocked_replay(
     raise AssertionError("a blocked replayed result must stop")
 
 
+async def _project_adopted_input(
+    store: StateStore,
+    run_id: str,
+    user_input: str | None,
+    user_parts: tuple[ContentPart, ...] | None,
+    *,
+    skip_claim: bool,
+) -> tuple[str | None, tuple[ContentPart, ...] | None, Any]:
+    """Project input adopted from a claim this call did not make, before it is written.
+
+    A claim made in this call was projected already. Input claimed elsewhere without
+    projection (a raw-store claim, guardrails added later) is projected here, before the
+    ``run.resumed`` event, history, trace or callbacks; a block is returned to stop the
+    run after its placeholder is recorded.
+    """
+    from dendrux.guardrails._engine import _entry_engine
+    from dendrux.loops._helpers import _BlockedObservationError
+    from dendrux.types import ToolResult
+
+    engine = _entry_engine(run_id)
+    if (
+        engine is None
+        or user_input is None
+        or _claimed_in_call(store, run_id, skip_claim=skip_claim)
+    ):
+        return user_input, user_parts, None
+    original = (
+        Message.with_parts(Role.USER, user_parts)
+        if user_parts is not None
+        else Message(Role.USER, user_input)
+    )
+    projected, findings, error = await engine.project_incoming_message(original)
+    if error is None:
+        return user_input, user_parts, None
+    block = _BlockedObservationError(
+        projected, findings, error, ToolResult(name="", call_id="", payload=projected.content)
+    )
+    return projected.content, projected.parts, block
+
+
 def _claimed_in_call(store: StateStore, run_id: str, *, skip_claim: bool) -> bool:
-    """Whether this call won the claim it continues (its own claim, or one it made)."""
+    """Whether this call won the claim it continues (its own resume claim, or a submission
+    claim it made). Such a continuation checks only the already-loaded row; adoption and
+    reclaim also run the scoped lookup, which sees a legacy blocked event."""
     from dendrux.runtime._blocked_content import _claimed_here
 
     return not skip_claim or _claimed_here(store, run_id)
@@ -5114,6 +5166,7 @@ async def _replay_submission_or_stop(
     tool_results: list[ToolResult] | None,
     user_input: str | None,
     on_consumed: Callable[[], None] | None,
+    input_block: Any = None,
 ) -> RunResult | None:
     """Replay the submitted history (not when recovering); a blocked result stops."""
     from dendrux.loops._helpers import _BlockedObservationError
@@ -5122,7 +5175,12 @@ async def _replay_submission_or_stop(
         return None
     try:
         await _replay_resume_injected_history(
-            ctx, run_id, tool_results=tool_results, user_input=user_input, on_consumed=on_consumed
+            ctx,
+            run_id,
+            tool_results=tool_results,
+            user_input=user_input,
+            on_consumed=on_consumed,
+            input_block=input_block,
         )
     except _BlockedObservationError as blocked:
         return await _resume_blocked_result(ctx, run_id, blocked)
@@ -5150,6 +5208,7 @@ async def _replay_resume_injected_history(
     tool_results: list[ToolResult] | None,
     user_input: str | None,
     on_consumed: Callable[[], None] | None = None,
+    input_block: Any = None,
 ) -> None:
     await _consume_injected_history(ctx, on_consumed)
     if tool_results is not None:
@@ -5165,11 +5224,24 @@ async def _replay_resume_injected_history(
                 on_consumed,
             )
     elif user_input is not None:
-        msg = ctx.history[-1]
-        await ctx.recorder.on_message_appended(run_id, msg, ctx.pause_state.iteration)
-        _mark_work(on_consumed)
-        await notify_message(ctx.notifier, run_id, msg, ctx.pause_state.iteration)
+        await _replay_user_input(ctx, run_id, on_consumed, input_block)
     order_observations(ctx.recorder, ctx.history)
+
+
+async def _replay_user_input(
+    ctx: _ResumeContext, run_id: str, on_consumed: Callable[[], None] | None, input_block: Any
+) -> None:
+    """Record the resumed user turn; an adopted input that projected as blocked is
+    recorded as its placeholder together with the run mark, then stops the run."""
+    from dendrux.loops._helpers import _evidence_scope
+
+    msg = ctx.history[-1]
+    async with _evidence_scope(ctx.recorder, run_id, input_block is not None):
+        await ctx.recorder.on_message_appended(run_id, msg, ctx.pause_state.iteration)
+    _mark_work(on_consumed)
+    await notify_message(ctx.notifier, run_id, msg, ctx.pause_state.iteration)
+    if input_block is not None:
+        raise input_block
 
 
 class _ApprovalResume(NamedTuple):
@@ -6656,16 +6728,13 @@ async def _stop_marked_continuation(
     record: RunRecord | None,
     pause: PauseState | None = None,
     *,
-    reclaiming: bool = False,
     agent: Agent | None = None,
     claimed_here: bool = False,
 ) -> RunResult | None:
     from dendrux.runtime._blocked_content import _continuation_blocked
     from dendrux.types import RunResult
 
-    if reclaiming or not await _continuation_blocked(
-        store, run_id, record, claimed_here=claimed_here
-    ):
+    if not await _continuation_blocked(store, run_id, record, claimed_here=claimed_here):
         return None
     _codes.log_code(logger, _codes.BLOCKED_CONTENT, run_id=run_id)
     from dendrux.runtime._continuation_guardrails import _continuation_mapping
@@ -6822,12 +6891,14 @@ async def _resume_core(
                 run_id,
                 run_record,
                 pause_state,
-                reclaiming=_reclaim_pause is not None,
                 agent=agent,
                 claimed_here=_claimed_in_call(state_store, run_id, skip_claim=_skip_claim),
             )
             if stopped is not None:
                 return stopped
+            user_input, user_parts, input_block = await _project_adopted_input(
+                state_store, run_id, user_input, user_parts, skip_claim=_skip_claim
+            )
 
             run_tenant = run_record.tenant_id if run_record else None
             # 4-8. Prepare history and notifier (shared with resume_stream).
@@ -6883,6 +6954,7 @@ async def _resume_core(
                 tool_results=tool_results,
                 user_input=user_input,
                 on_consumed=progress._start,
+                input_block=input_block,
             )
             if blocked_stop is not None:
                 _attach_mcp_meta(blocked_stop, mcp_meta)

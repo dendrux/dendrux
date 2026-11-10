@@ -69,7 +69,8 @@ async def test_061_reclaim_gate_holds_ungated_first(store, engine, reverse, hook
     finally:
         event.remove(engine.sync_engine, "before_cursor_execute", capture)
         print("reclaim_statements", engine.dialect.name, reverse, hook, len(statements))
-    assert len(statements) <= {"sqlite": 31, "postgresql": 31}[engine.dialect.name]
+    # +1: reclaim's scoped blocked-content lookup (R1.10, task 7 ruling).
+    assert len(statements) <= {"sqlite": 32, "postgresql": 32}[engine.dialect.name]
     assert paused.status.value == "waiting_approval"
     assert effects == []
     assert await store.get_tool_calls(item.run_id) == []
