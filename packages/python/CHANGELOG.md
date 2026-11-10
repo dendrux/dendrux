@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.6.1 - Unreleased
+## 0.6.1 - 2026-11-10
 
 See [Upgrading to 0.6.1](../../docs/upgrading-to-0.6.1.mdx) for setup-specific
 steps and compatibility changes. Default automatic SQLite needs no migration command.
