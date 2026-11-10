@@ -19,20 +19,29 @@ Dendrux gives you both with two existing primitives. No new types, no chatbot su
 ```python
 from dendrux import Agent
 from dendrux.chat import ChatMessage
-from dendrux.llm.anthropic import AnthropicProvider
+from dendrux.types import RunStatus
 
 agent = Agent(
     name="ChatBot",
-    provider=AnthropicProvider(model="claude-sonnet-4-6"),
+    provider="anthropic:claude-haiku-4-5",
     database_url="postgresql+asyncpg://...",
     prompt="You are a friendly assistant. Reply briefly.",
 )
 
-history: list[ChatMessage] = []
-result = await agent.run(user_input="Hi", history=history)
-history.append(ChatMessage.user("Hi"))
-history.append(ChatMessage.assistant(result.answer))
+
+async def chat_turn(tenant: str, history: list[ChatMessage], user_text: str) -> str | None:
+    """Run one turn; record it in ``history`` only when it produced an answer."""
+    result = await agent.run(user_input=user_text, history=history, tenant_id=tenant)
+    if result.status != RunStatus.SUCCESS or not result.answer:
+        return None  # paused or failed: handle it, and keep this turn out of history
+    history.append(ChatMessage.user(user_text))
+    history.append(ChatMessage.assistant(result.answer))
+    return result.answer
 ```
+
+`tenant` is the tenant of the signed-in user, taken from your authenticated session, never from the request body. Agents enforce tenant scope by default (`strict_tenancy=True`), so a run on a database without `tenant_id=` raises `TenantScopeRequiredError`. An app with no tenants passes `tenant_id=None` explicitly; do not turn `strict_tenancy` off just to shorten the call.
+
+Create the agent once at startup and close it at shutdown with `await agent.close()` (or hold it in `async with Agent(...) as agent:` for the life of the app). It closes the provider and database engine it created.
 
 ### History is the previous transcript only
 
@@ -50,17 +59,18 @@ history.append(ChatMessage.assistant(result.answer))
 
 Pass `metadata={"thread_id": "..."}` on each turn:
 
-[//]: # "docs-test: skip - fragment: relies on `user_text`, defined by setup shown elsewhere"
+[//]: # "docs-test: skip - fragment: relies on `user_text` and `tenant`, defined by setup shown elsewhere"
 
 ```python
 result = await agent.run(
     user_input=user_text,
     history=history,
+    tenant_id=tenant,
     metadata={"thread_id": "thread_abc", "user_id": "u_123"},
 )
 ```
 
-`metadata` is an opaque JSON blob that lands on the run row. Dendrux stores it, never reads it during execution — it's purely for your dev-side queries. The recommended convention for chatbots is `thread_id`; add `user_id`, `tenant_id`, `channel`, whatever else your domain needs.
+`metadata` is an opaque JSON blob that lands on the run row. Dendrux stores it, never reads it during execution — it's purely for your dev-side queries. The recommended convention for chatbots is `thread_id`; add `user_id`, `channel`, whatever else your domain needs. A tenant written into `metadata` is only a label; the `tenant_id=` argument is what scopes the run.
 
 `thread_id` keys are restricted to `[A-Za-z0-9_-]+` for filter-safety reasons (see below). Use ULIDs, UUIDs, or your own ID format that fits.
 
@@ -73,12 +83,13 @@ result = await agent.run(
 ```python
 from dendrux.store import RunStore
 
-store = RunStore.from_database_url("postgresql+asyncpg://...")
-
-runs = await store.list_runs(metadata_filter={"thread_id": "thread_abc"})
-for r in runs:
-    print(r.run_id, r.status, r.total_cost_usd, r.created_at)
+async with RunStore.from_database_url("postgresql+asyncpg://...") as store:
+    runs = await store.list_runs(metadata_filter={"thread_id": "thread_abc"}, tenant_id=tenant)
+    for r in runs:
+        print(r.run_id, r.status, r.total_cost_usd, r.created_at)
 ```
+
+Every `RunStore` read takes `tenant_id=`. Pass the signed-in user's tenant in anything a user can reach. Leaving it out reads **every** tenant's runs, which is only for your own operator tools. As with the agent, open one store at startup and close it at shutdown in a real app.
 
 Combines with the existing filters:
 
@@ -89,12 +100,14 @@ Combines with the existing filters:
 failed = await store.list_runs(
     metadata_filter={"thread_id": "thread_abc"},
     status="error",
+    tenant_id=tenant,
 )
 
 # Total cost of one user's last 50 turns
 runs = await store.list_runs(
     metadata_filter={"user_id": "u_123"},
     limit=50,
+    tenant_id=tenant,
 )
 total = sum(r.total_cost_usd or 0 for r in runs)
 ```
@@ -108,11 +121,11 @@ Once you have a run from the listing, every other read API on `RunStore` is keye
 [//]: # "docs-test: skip - fragment: relies on `run`, defined by setup shown elsewhere"
 
 ```python
-events = await store.get_events(run.run_id, limit=100)            # first page of the event log
-llm_calls = await store.get_llm_calls(run.run_id, limit=100)      # prompts, responses, usage, cache
-tool_calls = await store.get_tool_invocations(run.run_id, limit=100)  # tool params + results
-traces = await store.get_traces(run.run_id, limit=100)            # ReAct thoughts/actions
-pauses = await store.get_pauses(run.run_id)            # HITL approval cycles
+events = await store.get_events(run.run_id, limit=100, tenant_id=tenant)  # event log, first page
+llm_calls = await store.get_llm_calls(run.run_id, limit=100, tenant_id=tenant)  # prompts, usage, cache
+tool_calls = await store.get_tool_invocations(run.run_id, limit=100, tenant_id=tenant)  # params, results
+traces = await store.get_traces(run.run_id, limit=100, tenant_id=tenant)  # ReAct thoughts/actions
+pauses = await store.get_pauses(run.run_id, tenant_id=tenant)  # HITL approval cycles
 ```
 
 The first four reads each return one page of at most 1,000 rows, starting from the oldest: page events with `after_sequence_index`, and traces, LLM calls and tool invocations with `offset` (see [RunStore](/docs/reference/run-store#bounded-list-reads)). `get_pauses` is different: it has no `offset` or cursor and returns its first bounded set of pairs (`limit` defaults to 100); `get_pause_page` returns the same set plus a flag that says whether more exist. Neither pages through a longer pause history. The full audit/tracing surface is available through RunStore; see [Build your own read routes](/docs/recipes/build-your-own-read-routes) — just call it from your own code if you want a custom thread inspector.
