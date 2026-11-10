@@ -160,13 +160,7 @@ class _CommitReadback:
         try:
             await self.store._prepare_commit_readback(self.session)
             await self._lock_touched()
-            for run_id in self.blocked:
-                await self._check_proof(
-                    AgentRun.__table__,
-                    (AgentRun.id == run_id)
-                    & self.store.json_get(AgentRun.meta, (BLOCKED_META_KEY,), "bool").is_(True),
-                    {"id": run_id},
-                )
+            await self._prove_block_marks()
             fenced = False
             for table, predicate, expected in self.proofs:
                 check_epoch = self.prove_fence and table.name == "agent_runs"
@@ -180,6 +174,15 @@ class _CommitReadback:
             raise
         except BaseException as error:
             self._readback_failed(error)
+
+    async def _prove_block_marks(self) -> None:
+        for run_id in self.blocked:
+            await self._check_proof(
+                AgentRun.__table__,
+                (AgentRun.id == run_id)
+                & self.store.json_get(AgentRun.meta, (BLOCKED_META_KEY,), "bool").is_(True),
+                {"id": run_id},
+            )
 
     def _readback_failed(self, error: BaseException) -> NoReturn:
         if self._database_error(error):

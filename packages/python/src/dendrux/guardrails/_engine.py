@@ -228,16 +228,12 @@ def _params_scan_key(
 
 
 def _message_digest(message: Message) -> bytes:
-    from dendrux.types import TextPart
-
     value = (
         message.role.value,
         message.name,
         message.call_id,
         message.content,
-        [p.text for p in message.parts if isinstance(p, TextPart)]
-        if message.parts is not None
-        else [message.content],
+        list(_projection_texts(message)),
         [_params_scan_key(call.params) for call in message.tool_calls]
         if message.tool_calls
         else None,
@@ -306,6 +302,42 @@ def _projection_texts(message: Message) -> tuple[str, ...]:
         if message.parts is not None
         else (message.content,)
     )
+
+
+def _restore_cached_projection(message: Message, evidence: _Projection) -> Message:
+    if evidence.content is not None and _message_digest(message) != evidence.digest:
+        return _restore_projection_text(message, evidence)
+    return message
+
+
+def _restore_blocked_projection(message: Message, evidence: _Projection) -> Message:
+    cleaned = _blocked_message(message, evidence.findings)
+    return _with_projection(cleaned, evidence, copy=False) if cleaned != message else message
+
+
+def _attach_projection(message: Message, evidence: _Projection, *, copy: bool) -> Message:
+    if evidence.findings or evidence.blocked is not None or evidence.redacted:
+        return _with_projection(message, evidence, copy=copy)
+    return message
+
+
+def _retain_projection_text(message: Message, evidence: _Projection) -> _Projection:
+    if evidence.redacted:
+        texts = _projection_texts(message)
+        size = evidence.text_bytes + sum(len(t.encode("utf-8")) for t in {message.content, *texts})
+        if size <= _PROJECTION_TEXT_BYTES:
+            return replace(evidence, content=message.content, texts=texts, text_bytes=size)
+    return evidence
+
+
+def _message_origin(message: Message) -> Origin:
+    from dendrux.types import Role
+
+    if message.role == Role.TOOL:
+        return tool_origin(message.name or "")
+    if message.role == Role.ASSISTANT:
+        return MODEL
+    return TRUSTED
 
 
 def _restore_projection_text(message: Message, evidence: _Projection) -> Message:
@@ -501,6 +533,12 @@ class GuardrailEngine:
             placeholder = self._next_placeholder(entity_type)
             self._pii_mapping[placeholder] = real_value
             self._reverse[real_value] = placeholder
+        self._remember_mapping_entry(placeholder, existed)
+        if self._allowlisted:
+            self._record_origin(placeholder, origin)
+        return placeholder
+
+    def _remember_mapping_entry(self, placeholder: str, existed: bool) -> None:
         if self._mapping_changes is not None:
             self._mapping_changes.entries.setdefault(
                 placeholder,
@@ -510,9 +548,6 @@ class GuardrailEngine:
                     set(self._tool_origins.get(placeholder, ())),
                 ),
             )
-        if self._allowlisted:
-            self._record_origin(placeholder, origin)
-        return placeholder
 
     def _record_origin(self, placeholder: str, origin: Origin) -> None:
         if origin.kind == "trusted":
@@ -755,15 +790,11 @@ class GuardrailEngine:
     def _reuse_projection(
         self, msg: Message, previous: _Projection, index: int | None
     ) -> tuple[Message, list[Finding], str | None]:
-        if previous.content is not None and _message_digest(msg) != previous.digest:
-            msg = _restore_projection_text(msg, previous)
+        msg = _restore_cached_projection(msg, previous)
         blocked = previous.blocked
         if blocked is not None:
             blocked = blocked.replace(previous.location, _message_location(msg, index), 1)
-        if blocked is not None:
-            cleaned = _blocked_message(msg, previous.findings)
-            if cleaned != msg:
-                msg = _with_projection(cleaned, previous, copy=False)
+            msg = _restore_blocked_projection(msg, previous)
         if previous.findings or previous.redacted:
             msg = _with_projection(
                 msg,
@@ -780,37 +811,39 @@ class GuardrailEngine:
         blocked: str | None,
         index: int | None,
     ) -> tuple[Message, list[Finding], str | None]:
+        evidence = self._projection_evidence(msg, cleaned, findings, blocked, index)
+        cleaned = _attach_projection(cleaned, evidence, copy=cleaned is msg)
+        self._cache_allowed_projection(msg, evidence)
+        return cleaned, evidence.findings, blocked
+
+    def _projection_evidence(
+        self,
+        msg: Message,
+        cleaned: Message,
+        findings: list[Finding],
+        blocked: str | None,
+        index: int | None,
+    ) -> _Projection:
+        retain = self._retain_allowed_findings and blocked is None
         evidence = _Projection(
             self._projection_owner,
             _message_digest(cleaned),
-            _ProjectionFindings(
-                findings,
-                limit=None
-                if self._retain_allowed_findings and blocked is None
-                else _PROJECTED_FINDINGS_LIMIT,
-            ),
+            _ProjectionFindings(findings, limit=None if retain else _PROJECTED_FINDINGS_LIMIT),
             blocked,
             cleaned is not msg and blocked is None,
             _message_location(msg, index),
         )
-        if self._retain_allowed_findings and blocked is None:
+        if retain:
             evidence = replace(
                 evidence, text_bytes=sum(64 + len(f.entity_type.encode("utf-8")) for f in findings)
             )
-        if evidence.redacted:
-            texts = _projection_texts(cleaned)
-            size = evidence.text_bytes + sum(
-                len(t.encode("utf-8")) for t in {cleaned.content, *texts}
-            )
-            if size <= _PROJECTION_TEXT_BYTES:
-                evidence = replace(evidence, content=cleaned.content, texts=texts, text_bytes=size)
-        if findings or blocked is not None or evidence.redacted:
-            cleaned = _with_projection(cleaned, evidence, copy=cleaned is msg)
-        if blocked is None:
+        return _retain_projection_text(cleaned, evidence)
+
+    def _cache_allowed_projection(self, msg: Message, evidence: _Projection) -> None:
+        if evidence.blocked is None:
             if evidence.content is not None:
                 self._cache_projection(_message_digest(msg), evidence)
             self._cache_projection(evidence.digest, evidence)
-        return cleaned, evidence.findings, blocked
 
     def _cache_projection(self, key: bytes, evidence: _Projection) -> None:
         old = self._projected.pop(key, None)
@@ -851,19 +884,12 @@ class GuardrailEngine:
         """
         from dataclasses import replace
 
-        from dendrux.types import Role
-
         if self._projected_block(msg) is not None:
             evidence = self._previous_projection(msg, _message_digest(msg))
             assert evidence is not None
             return self._reuse_projection(msg, evidence, index)
 
-        if msg.role == Role.TOOL:
-            origin = tool_origin(msg.name or "")
-        elif msg.role == Role.ASSISTANT:
-            origin = MODEL
-        else:
-            origin = TRUSTED
+        origin = _message_origin(msg)
         location = _message_location(msg, index)
 
         if msg.parts is None:

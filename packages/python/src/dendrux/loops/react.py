@@ -2227,11 +2227,7 @@ async def _run_tool_step(
     """Append the assistant turn and run its tool calls; returns the outcome and
     where this iteration's tool messages start in history."""
     await _append_turn(ctx, response, iteration, phase="commentary")
-    if ctx.state_store is not None:
-        # The provider may have returned after sweep revoked this worker.
-        control = await _read_control(ctx.state_store, ctx.run_id)
-        if control.has_pending_notes and ctx.agent.guardrails:
-            await _check_blocked_run(ctx.state_store, ctx.run_id)
+    await _check_tool_dispatch(ctx)
     tool_history_start = len(ctx.state.history)
     outcome = await _process_tool_calls(
         step=step,
@@ -2254,6 +2250,14 @@ async def _run_tool_step(
         image_runtime=ctx.image_runtime,
     )
     return outcome, tool_history_start
+
+
+async def _check_tool_dispatch(ctx: _RunContext) -> None:
+    if ctx.state_store is not None:
+        # The provider may have returned after sweep revoked this worker.
+        control = await _read_control(ctx.state_store, ctx.run_id)
+        if control.has_pending_notes and ctx.agent.guardrails:
+            await _check_blocked_run(ctx.state_store, ctx.run_id)
 
 
 def _after_tools(
@@ -3091,6 +3095,22 @@ async def _execute_record_notify(
         )
     if tracker is not None:
         tracker.result = result
+    await _record_completed_tool(
+        tool_call, result, recorder, notifier, run_id, iteration, notifier_warnings, tracker
+    )
+    return tool_call, result
+
+
+async def _record_completed_tool(
+    tool_call: ToolCall,
+    result: ToolResult,
+    recorder: LoopRecorder | None,
+    notifier: LoopNotifier | None,
+    run_id: str,
+    iteration: int,
+    notifier_warnings: list[str],
+    tracker: CallTracker | None,
+) -> None:
     try:
         await _record_tool(recorder, run_id, tool_call, result, iteration)
     except _BlockedObservationError as blocked:
@@ -3103,7 +3123,6 @@ async def _execute_record_notify(
     if tracker is not None:
         tracker.recorded = True
     await _notify_tool(notifier, run_id, tool_call, result, iteration, notifier_warnings)
-    return tool_call, result
 
 
 _SIBLING_CANCELLED = "cancelled: another tool call in the same batch failed"

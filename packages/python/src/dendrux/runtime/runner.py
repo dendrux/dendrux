@@ -2254,13 +2254,7 @@ def _new_run_metadata(
     retry_of: str | None = None,
     streaming: bool = False,
 ) -> tuple[dict[str, Any], str | None]:
-    result = {key: value for key, value in (metadata or {}).items() if key != BLOCKED_META_KEY}
-    result[LOOP_META_KEY] = type(loop).__name__
-    result[GOVERNANCE_KEY] = governance_snapshot(agent)
-    if session.configured:
-        result[META_KEY] = session.manifest()
-    if depth is not None:
-        result[MAX_DELEGATION_DEPTH_META_KEY] = depth
+    result = _base_run_metadata(agent, loop, session, metadata, depth)
     output_name = None
     if output_type is not None:
         output_name = f"{output_type.__module__}.{output_type.__qualname__}"
@@ -2281,6 +2275,23 @@ def _new_run_metadata(
             user_input_parts=parts,
         )
     return result, fingerprint
+
+
+def _base_run_metadata(
+    agent: Agent,
+    loop: Loop,
+    session: SkillSession,
+    metadata: dict[str, Any] | None,
+    depth: int | None,
+) -> dict[str, Any]:
+    result = {key: value for key, value in (metadata or {}).items() if key != BLOCKED_META_KEY}
+    result[LOOP_META_KEY] = type(loop).__name__
+    result[GOVERNANCE_KEY] = governance_snapshot(agent)
+    if session.configured:
+        result[META_KEY] = session.manifest()
+    if depth is not None:
+        result[MAX_DELEGATION_DEPTH_META_KEY] = depth
+    return result
 
 
 async def _load_new_run_replay(
@@ -3584,16 +3595,7 @@ async def _retry_replay(
     identified as blocked, after their scope/status checks and before any history
     is rebuilt or a run is created. One scoped verdict lookup covers all of them.
     """
-    replay_req: ReplayRequest | None = None
-    source_replay = (source_run.meta or {}).get(REPLAY_META_KEY)
-    if isinstance(source_replay, dict) and source_replay.get("runs"):
-        replay_req = validate_replay_args(
-            list(source_replay["runs"]),
-            source_replay.get("replay_last", 0),
-            bool(source_replay.get("replay_reasoning", True)),
-            loop=resolved_loop,
-            context=None,
-        )
+    replay_req = _retry_replay_request(source_run, resolved_loop)
     # The verdict and any refusal name the run the caller authorized and asked for.
     retried = replace(source_run, id=original_run_id)
     if replay_req is None:
@@ -3609,6 +3611,20 @@ async def _retry_replay(
     if identified:
         _refuse_blocked_retry(identified[0])
     return replay_req, loaded.runs
+
+
+def _retry_replay_request(source_run: RunRecord, resolved_loop: Loop) -> ReplayRequest | None:
+    replay_req: ReplayRequest | None = None
+    source_replay = (source_run.meta or {}).get(REPLAY_META_KEY)
+    if isinstance(source_replay, dict) and source_replay.get("runs"):
+        replay_req = validate_replay_args(
+            list(source_replay["runs"]),
+            source_replay.get("replay_last", 0),
+            bool(source_replay.get("replay_reasoning", True)),
+            loop=resolved_loop,
+            context=None,
+        )
+    return replay_req
 
 
 def _refuse_blocked_retry(run_id: str) -> NoReturn:
@@ -6890,6 +6906,12 @@ async def _stop_marked_continuation(
     return cached
 
 
+def _resume_history_inputs(
+    recovering: bool, tool_results: list[ToolResult] | None, user_input: str | None
+) -> tuple[list[ToolResult] | None, str | None]:
+    return (None, None) if recovering else (tool_results, user_input)
+
+
 async def _resume_core(
     run_id: str,
     *,
@@ -7026,6 +7048,9 @@ async def _resume_core(
             run_tenant = run_record.tenant_id if run_record else None
             # 4-8. Prepare history and notifier (shared with resume_stream).
             #      Does NOT fire any lifecycle hooks — that's the caller's job.
+            history_results, history_input = _resume_history_inputs(
+                recovering, tool_results, user_input
+            )
             ctx = await _prepare_resume(
                 run_id,
                 pause_state,
@@ -7035,8 +7060,8 @@ async def _resume_core(
                 strategy=strategy,
                 loop=loop,
                 expected_status=expected_status,
-                tool_results=None if recovering else tool_results,
-                user_input=None if recovering else user_input,
+                tool_results=history_results,
+                user_input=history_input,
                 extra_notifier=extra_notifier,
                 user_parts=user_parts,
                 tenant_id=run_tenant,

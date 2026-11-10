@@ -1391,13 +1391,25 @@ class PersistenceRecorder(BaseRecorder):
     async def on_tool_started(self, run_id: str, tool_call: ToolCall, iteration: int) -> None:
         """Persist an execution intent before an actual server dispatch."""
         from dendrux.errors import PersistenceError
+        from dendrux.runtime._blocked_content import _dispatch_write, _DispatchUndecided
+
+        await self._check_custom_dispatch(run_id)
+        undecided = False
+        with _dispatch_write(self._store, run_id):
+            try:
+                await self._write_tool_intent(run_id, tool_call, iteration)
+            except _DispatchUndecided:
+                # A refused dispatch write whose cause could not be read: refuse safely.
+                undecided = True
+            if not undecided:
+                await self._cancel_guard.check(run_id)
+        if undecided:
+            raise PersistenceError()
+
+    async def _check_custom_dispatch(self, run_id: str) -> None:
         from dendrux.guardrails._engine import _entry_engine
         from dendrux.loops._helpers import _check_blocked_run
-        from dendrux.runtime._blocked_content import (
-            _dispatch_write,
-            _DispatchUndecided,
-            _native_blocked_store,
-        )
+        from dendrux.runtime._blocked_content import _native_blocked_store
 
         native = _native_blocked_store(self._store) is not None
         guarded = self.guardrail_engine is not None or _entry_engine(run_id) is not None
@@ -1407,20 +1419,12 @@ class PersistenceRecorder(BaseRecorder):
             control = await read_run_control(self._store_calls, run_id)
             if control.has_pending_notes:
                 await _check_blocked_run(self._store, run_id)
-        undecided = False
-        with _dispatch_write(self._store, run_id):
-            try:
-                if self._format2:
-                    await self._start_checkpointed_tool(run_id, tool_call, iteration)
-                else:
-                    await self._touch_tool_progress(run_id)
-            except _DispatchUndecided:
-                # A refused dispatch write whose cause could not be read: refuse safely.
-                undecided = True
-            if not undecided:
-                await self._cancel_guard.check(run_id)
-        if undecided:
-            raise PersistenceError()
+
+    async def _write_tool_intent(self, run_id: str, tool_call: ToolCall, iteration: int) -> None:
+        if self._format2:
+            await self._start_checkpointed_tool(run_id, tool_call, iteration)
+        else:
+            await self._touch_tool_progress(run_id)
 
     async def _touch_tool_progress(self, run_id: str) -> None:
         from dendrux.loops._helpers import _BlockedObservationError

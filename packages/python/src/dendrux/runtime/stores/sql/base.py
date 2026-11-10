@@ -332,6 +332,13 @@ async def _final_output_values(
     return values
 
 
+def _merge_public_meta(meta: dict[str, Any] | None, patch: dict[str, Any]) -> dict[str, Any]:
+    return {
+        **(meta or {}),
+        **{key: value for key, value in patch.items() if key != BLOCKED_META_KEY},
+    }
+
+
 def _creation_mark_proven(store: SQLStateStore, run_id: str, meta: dict[str, Any] | None) -> bool:
     """A blocked creation's readback must also show the mark it committed with."""
     from dendrux.runtime._blocked_content import _blocked_target
@@ -2897,10 +2904,7 @@ class SQLStateStore(SQLBlobCatalog):
                 ).scalar_one_or_none()
                 if row is None:
                     return
-                row.meta = {
-                    **(row.meta or {}),
-                    **{key: value for key, value in patch.items() if key != BLOCKED_META_KEY},
-                }
+                row.meta = _merge_public_meta(row.meta, patch)
                 self._mark_announce(session, (run_id,))
                 await self._write_tx(session)
 
