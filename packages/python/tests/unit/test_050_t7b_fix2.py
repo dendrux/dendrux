@@ -59,6 +59,9 @@ def test_status_writer_inventory():
     assert not direct, f"status writes must use the transition helper: {direct}"
     assert writers == {
         "create_run": 1,
+        # Managed subagents (0.7): the atomic bind parks the parent and creates the child.
+        "_bind_park_parent": 1,
+        "_bind_child": 1,
         "finalize_run": 1,
         "_cas_finalize": 1,
         "try_pause_run": 1,
