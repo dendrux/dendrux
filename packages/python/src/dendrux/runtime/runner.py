@@ -6783,6 +6783,8 @@ async def _stop_marked_continuation(
     agent: Agent | None = None,
     claimed_here: bool = False,
     admitted: bool = False,
+    iteration: int | None = None,
+    usage: UsageStats | None = None,
 ) -> RunResult | None:
     from dendrux.runtime._blocked_content import _continuation_blocked
     from dendrux.types import RunResult
@@ -6795,7 +6797,9 @@ async def _stop_marked_continuation(
     from dendrux.runtime._continuation_guardrails import _continuation_mapping
 
     mapping = await _continuation_mapping(store, run_id)
-    error, findings, location, iteration = _continuation_block_error(store, run_id, pause)
+    error, findings, location, pause_iteration = _continuation_block_error(store, run_id, pause)
+    if pause is not None:
+        iteration, usage = pause_iteration, pause.usage
     meta: dict[str, Any] = {
         "failure_reason": FailureReason.GUARDRAIL_BLOCKED.value,
         "pii_mapping": mapping or {},
@@ -6823,7 +6827,7 @@ async def _stop_marked_continuation(
             finalize={
                 "error": error,
                 "pii_mapping": mapping,
-                "total_usage": pause.usage if pause is not None else None,
+                "total_usage": usage,
                 **terminal,
                 **_terminal_failure_kwargs(store, result),
             },
@@ -6834,8 +6838,9 @@ async def _stop_marked_continuation(
     if not won:
         return await _build_cached_result(store, run_id)
     cached = await _build_cached_result(store, run_id)
+    if usage is not None:
+        cached.usage = usage
     if pause is not None:
-        cached.usage = pause.usage
         cached.steps = list(pause.steps)
     cached.meta.update(result.meta)
     cached.meta["_finalize_won"] = True

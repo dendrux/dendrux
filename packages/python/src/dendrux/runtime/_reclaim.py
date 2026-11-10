@@ -102,11 +102,19 @@ async def reclaim(
         history_records: list[Any] = []
         async with _reclaim_setup(owned, run_id):
             record = await owned.get_run(run_id)
-            stopped = await _stop_marked_continuation(owned, run_id, record, agent=agent)
+            state = claim.loop_state or {}
+            stopped = await _stop_marked_continuation(
+                owned,
+                run_id,
+                record,
+                agent=agent,
+                iteration=state.get("iteration", 0),
+                usage=_usage_from_dict(state.get("usage", {})),
+            )
             if stopped is not None:
                 return _reclaimed_result(run_id, stopped)
             pause = await rebuild_pause(
-                agent, owned, run_id, claim.loop_state or {}, history_records=history_records
+                agent, owned, run_id, state, history_records=history_records
             )
             provider = agent._require_provider()
         result = await _resume_core(
