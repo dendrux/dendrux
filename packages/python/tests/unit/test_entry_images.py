@@ -934,6 +934,38 @@ class TestClientToolImages:
         state = agent2.loop.seen[-1]["state"]  # type: ignore[union-attr]
         assert state == ImageViewState(sent_through=0)
 
+    async def test_transform_rewrites_the_payload_and_keeps_the_images(
+        self, store: ImageStore
+    ) -> None:
+        seen: list[Any] = []
+
+        def relabel(ctx: Any) -> Any:
+            seen.append(ctx.result)
+            return {"label": "screen"}
+
+        agent = _agent(store, _screenshot_responses())
+        paused = await agent.run("Take a screenshot.", tenant_id="acme")
+        call_id = (await store.get_pause_state(paused.run_id))["pending_tool_calls"][0]["id"]
+
+        agent2 = _agent(store, [_screenshot_responses()[1]], tool_result_transform=relabel)
+        result = await agent2.submit_tool_results(
+            paused.run_id,
+            [
+                ToolResult(
+                    name="take_screenshot",
+                    call_id=call_id,
+                    payload=json.dumps("Captured."),
+                    images=(Image.from_bytes(PNG),),
+                )
+            ],
+        )
+
+        assert result.status == RunStatus.SUCCESS
+        assert seen == ["Captured."]
+        tool_msg = next(m for m in _llm_messages(agent2) if m.role == Role.TOOL)
+        assert tool_msg.content == '{"label": "screen"}'
+        assert tool_msg.images[0].ref.sha256 == _sha(PNG)
+
     async def test_submit_image_error_leaves_run_waiting(self, store: ImageStore) -> None:
         agent = _agent(store, _screenshot_responses())
         paused = await agent.run("shot", tenant_id="acme")

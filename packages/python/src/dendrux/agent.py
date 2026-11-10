@@ -816,20 +816,26 @@ class Agent:
 
     @property
     def tool_result_transform(self) -> ToolResultTransform | None:
-        """Hook that rewrites server tool results, or None.
+        """Hook that rewrites successful tool results, or None.
 
         Called with a :class:`~dendrux.types.ToolResultContext` after every
         successful server-executed tool call (local ``@tool`` and MCP alike,
-        including tools run on resume after ``submit_approval``) and before
-        the result is JSON-serialized. Its return value always replaces the
-        result — return ``ctx.result`` to keep it. The transformed value is
-        what gets persisted, notified and sent to the model.
+        including tools run on resume after ``submit_approval``), and on every
+        successful result a client submits through ``submit_tool_results`` or
+        ``resume``. It runs before the result is JSON-serialized. Its return
+        value always replaces the result — return ``ctx.result`` to keep it.
+        The transformed value is what gets persisted, notified and sent to the
+        model; there is no separate model-only view.
 
-        - Not applied to failed tool calls or to client-submitted results
-          (``submit_tool_results``). The built-in ``use_skill`` tool is a
-          server tool too; check ``ctx.tool_name`` to skip it.
-        - If the transform raises, the tool call fails (``success=False``)
-          with an error naming the transform.
+        - Not applied to failed tool calls. The built-in ``use_skill`` tool is
+          a server tool too; check ``ctx.tool_name`` to skip it, and
+          ``ctx.target`` to tell client results apart.
+        - On a client result, ``ctx.result`` is the parsed JSON payload;
+          submitted images pass through unchanged.
+        - If the transform raises on a server call, that tool call fails
+          (``success=False``) with an error naming the transform. On a client
+          submission it raises ``InvalidToolResultError`` and the run stays
+          paused, so the client can submit again.
         - Runs on the raw result; guardrail scans of tool messages happen
           afterwards, on the serialized content.
         - Sync transforms run inline on the event loop — keep them cheap.

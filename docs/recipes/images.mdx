@@ -116,7 +116,7 @@ result = await agent.submit_tool_results(
 )
 ```
 
-The images are checked and stored before the run is claimed, so a rejected image leaves the run paused and you can submit again. The pause snapshot and every row keep only references, so the submit can happen in a different process than the one that started the run; `examples/38_images_client_tool.py` does exactly that with two `Agent` instances over one database. `tool_result_transform` does not run on client results (unchanged).
+The images are checked and stored before the run is claimed, so a rejected image leaves the run paused and you can submit again. The pause snapshot and every row keep only references, so the submit can happen in a different process than the one that started the run; `examples/38_images_client_tool.py` does exactly that with two `Agent` instances over one database. `tool_result_transform` runs on a successful client result too: it sees the parsed JSON payload, and the submitted images pass through unchanged.
 
 `agent.submit_input(run_id, [...])` and `agent.resume(run_id, user_input=[...])` accept images the same way for human-input pauses.
 
