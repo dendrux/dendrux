@@ -120,7 +120,7 @@ A guardrail with `action="block"` (and any text a guardrail cannot scan under `b
 What this changes for a blocked message:
 
 - **Stored text.** Initial input, explicit `history=`, context blocks, tool results, human replies, rejection and per-call decision reasons and notes are stored as the placeholder, in the run row, traces, events and seed copies. Hashes, previews and request identities are computed from the placeholder, never from the rejected text. With `idempotency_key`, two blocked requests whose text differs but projects to the same placeholders can return the same blocked run. Unblocked requests keep their identity.
-- **`pii_mapping`.** A blocked message adds nothing to the mapping, so a blocked run returns an empty `pii_mapping` for that message. Reversible redaction of text that was not blocked is unchanged.
+- **`pii_mapping`.** A blocked message adds nothing to the mapping, so a blocked run returns an empty `pii_mapping` for that message. If the combined entry scan blocks while individual pieces are allowed, those discarded piece scans add no mapping. Mappings from earlier allowed messages remain, and ordinary reversible redaction is unchanged.
 - **SingleCall.** `SingleCall` runs now scan outgoing tool-call parameters, as ReAct runs do.
 - **Outgoing responses.** When a guardrail blocks the model's response, the stored copy keeps the placeholder only. The raw response, provider request and reasoning for that step are dropped from the stored evidence.
 - **Context blocks.** A blocked context block is stored as a plain placeholder block: its kind, source and metadata are removed, because they can hold a second copy of the text.
@@ -133,13 +133,19 @@ What this changes for a blocked message:
 - **Replay.** `runs=` omits the whole identified run, including its context, tools and reasoning, and keeps the rest. `ReplaySummary.warnings` gains `Run <run id> omitted because it contains blocked content; prior effects may have occurred.` Show it to users: omitting a run does not undo anything it did. If every run is omitted, the new run starts from the fresh input alone.
 - **Log code.** The new log code `blocked_content` carries the run ID only. It fires when a retry is refused, a replay omits a run or a continuation stops.
 
+When a continuation adopts a submission made by another call, it retains the first verdict and trusted placeholder through the first new event or trace. This covers tool results, human input, approval and rejection reasons, and pending notes. Rejected text is not rebuilt and rescanned. Native stores commit the mark atomically with that evidence; custom stores must establish and verify the mark before writing it, or raise `PersistenceError`. Previously stored unguarded rows are not erased.
+
+After normal validation and ownership claim, reclaim checks blocked provenance before history rebuild. A marked run or one identified by a legacy blocked event stops even when `max_rebuild_rows` would reject its history. Clean runs still enforce history limits.
+
 ### Recovery holds the whole tool batch for approval
 
 Reclaiming an interrupted run with an unresolved tool call now holds its unexecuted tool siblings behind the approval gate until the gate is decided. The run returns `waiting_approval` with every held call, and no held call starts before the decision. Declining the batch denies all held calls; denying one call still lets the ungated siblings run after the decision. Client-tool siblings go to the client pause, not to server dispatch.
 
 ### Cost
 
-Retry costs one extra lookup before the new run is created. Recovery runs one extra indexed lookup per reclaim. Neither lookup loads history. There is no new table, column, status or event.
+Native retry and replay checks batch provenance lookups in chunks of 200 source IDs, adding one indexed lookup per chunk beyond existing source authorization reads. Retry includes the retried run in that set, so a retry without `runs=` sources adds one lookup. Custom stores use the loaded row and, when it does not identify a block, one filtered `guardrail.blocked` event read with `limit=1` per source.
+
+Reclaim reuses the already-loaded run row when it identifies a block. Otherwise native reclaim adds one extra indexed lookup; custom reclaim uses the same filtered event fallback for its single run. These checks do not load history, and clean reclaim reuses the verdict during continuation. There is no new table, column, status or event.
 
 ### Custom stores
 

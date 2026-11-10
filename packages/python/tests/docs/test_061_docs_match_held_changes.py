@@ -13,6 +13,7 @@ import pytest
 from dendrux import _codes
 from dendrux._lifecycle import FailureReason
 from dendrux.errors import ReplayRunError
+from dendrux.runtime import _blocked_content
 from dendrux.runtime import replay as replay_module
 from dendrux.runtime import runner as runner_module
 from dendrux.types import GovernanceEventType, RunStatus
@@ -126,6 +127,38 @@ def test_changelog_lists_every_held_behaviour_change():
         "`blocked_content`",
     ):
         assert phrase in section, phrase
+
+
+_BLOCKED_PAGES = (
+    "architecture/guardrails.mdx",
+    "upgrading-to-0.6.1.mdx",
+    "../packages/python/CHANGELOG.md",
+)
+
+
+@pytest.mark.parametrize("page", _BLOCKED_PAGES)
+def test_source_lookup_costs_distinguish_native_and_custom_stores(page):
+    text = _doc(page)
+    assert f"chunks of {_blocked_content._SOURCE_CHUNK} source IDs" in text
+    assert "per source" in text
+    assert "`guardrail.blocked`" in text and "`limit=1`" in text
+
+
+@pytest.mark.parametrize("page", _BLOCKED_PAGES)
+def test_adoption_and_entry_mapping_contracts_are_documented(page):
+    text = _doc(page)
+    assert "first verdict" in text
+    assert "first new event or trace" in text
+    assert "verify the mark before" in text
+    assert "Mappings from earlier allowed messages" in text
+
+
+@pytest.mark.parametrize("page", (*_BLOCKED_PAGES, "guides/recovery.mdx"))
+def test_blocked_reclaim_admission_precedes_history_limits(page):
+    text = _doc(page)
+    assert "before history rebuild" in text
+    assert "`max_rebuild_rows`" in text
+    assert "already-loaded run row" in text
 
 
 def _sql_blocks(page: str) -> list[str]:

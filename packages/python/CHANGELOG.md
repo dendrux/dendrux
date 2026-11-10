@@ -29,7 +29,13 @@ steps and compatibility changes. Default automatic SQLite needs no migration com
   `SingleCall` agent now scans outgoing tool-call parameters. A blocked outgoing response
   stores the placeholder and drops its raw response, provider request and reasoning. A
   blocked context block loses its kind, source and metadata. Unblocked reversible
-  redaction is unchanged.
+  redaction is unchanged. Discarded entry-attribution scans contribute no reversible
+  mapping or cached projection. Mappings from earlier allowed messages remain.
+- Adopted tool results, input, approval and rejection reasons, and pending notes retain the
+  first verdict and trusted placeholder through the first new event or trace, without
+  rebuilding and rescanning rejected text. Native stores commit the mark with that evidence;
+  custom stores must establish and verify the mark before writing it, or raise
+  `PersistenceError`. Existing unguarded rows are not erased.
 - Refuse `agent.retry()` of a run whose history holds blocked content (the retried run or
   any `runs=` source): it raises `ReplayRunError` with `reason="blocked_content"` before a
   run is created. `runs=` replay omits the whole blocked run and adds a notice to
@@ -37,7 +43,14 @@ steps and compatibility changes. Default automatic SQLite needs no migration com
   log code `blocked_content` carries the run ID only.
 - Stop a marked run that is still unfinished when it is resumed, submitted to or reclaimed:
   it ends as `error` with `failure_reason="guardrail_blocked"` and makes no provider or tool
-  call. Retry costs one extra lookup and recovery runs one extra indexed lookup per reclaim.
+  call. Reclaim checks after validation and ownership claim, before history rebuild, so
+  `max_rebuild_rows` does not override a blocked outcome. It reuses the already-loaded run row
+  when that identifies a block; otherwise native stores add one extra indexed lookup and
+  custom stores use a filtered event read. Clean continuation reuses the verdict.
+- Native retry and replay provenance checks use chunks of 200 source IDs, adding one indexed
+  lookup per chunk beyond existing source authorization reads; retry includes the retried run.
+  Custom stores use the loaded row and, when it does not identify a block, one filtered
+  `guardrail.blocked` event read with `limit=1` per source. These checks do not load history.
 - Hold the unexecuted tool siblings of an unresolved approval gate behind the approval gate
   during recovery. The run returns `waiting_approval` with every held call, and none starts
   before the decision.

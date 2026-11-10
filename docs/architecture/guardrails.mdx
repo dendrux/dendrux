@@ -362,6 +362,10 @@ Since 0.6.1, text that a `block` guardrail rejects (and text a `block` or `redac
 
 The placeholder replaces the text everywhere Dendrux keeps a copy: the run input, traces, wire content, tool results, submitted replies, rejection reasons, notes, events, and the seed rows copied into later runs. Hashes, previews and request identities are computed from the placeholder, not from the rejected text. A rejected tool-call parameter set is stored as one parameter named `blocked` whose value is the placeholder, and this covers outgoing tool-call parameters for both ReAct and `SingleCall` agents. A blocked outgoing response also drops its raw response, provider request and reasoning, and a blocked context block loses its kind, source and metadata, because those can hold another copy of the text.
 
+If the combined entry scan blocks while individual pieces are allowed, the discarded piece scans contribute no mapping, reverse lookup, origin, counter or cached projection. Mappings from earlier allowed messages remain; ordinary reversible redaction is unchanged.
+
+When a continuation adopts work submitted by another call, it retains the first verdict and trusted placeholder through the first new event or trace, without rebuilding and rescanning rejected text. This applies to tool results, human input, approval and rejection reasons, and pending notes. Native stores commit the mark atomically with that evidence. Custom stores must establish and verify the mark before writing the evidence, or raise `PersistenceError`. Existing unguarded rows are not erased.
+
 The mark is stored on the run (not in the placeholder's spelling, which anyone can type), it is permanent, and callers cannot set or clear it through metadata. What it changes:
 
 | Entry point | Result |
@@ -372,6 +376,10 @@ The mark is stored on the run (not in the placeholder's spelling, which anyone c
 | `runs=` that includes a marked run | The whole run is left out and `ReplaySummary.warnings` says so; see [Run replay](/docs/recipes/run-replay#blocked-runs-are-not-replayed) |
 
 Each refusal, omission and stop logs the code `blocked_content` with the run ID only. See [Log codes](/docs/reference/log-codes).
+
+Reclaim checks blocked provenance after validation and ownership claim, before history rebuild. A marked run or one identified by a legacy blocked event stops even if `max_rebuild_rows` would reject its history. The already-loaded run row can identify a block without an added lookup; otherwise native reclaim adds one extra indexed lookup and custom reclaim uses a filtered event read. A clean continuation reuses that verdict and still enforces history limits.
+
+Native retry and replay checks use chunks of 200 source IDs, with one added indexed lookup per chunk beyond existing source authorization reads. Retry includes the retried run in that set. Custom stores use the loaded row and, when it does not identify a block, one filtered `guardrail.blocked` event read with `limit=1` per source. The provenance checks do not load history.
 
 A custom store must keep the mark together with the placeholder through its existing metadata and evidence methods. A store that cannot keep the blocked mark refuses the blocked write with `PersistenceError`, so the run keeps only its clean history and a later retry sends only that history.
 
