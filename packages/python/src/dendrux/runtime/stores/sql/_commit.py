@@ -249,24 +249,13 @@ class _CommitReadback:
         self.unknown()
 
     async def _bind_lost(self) -> NoReturn:
-        if await self._bind_not_applied():
-            raise _CommitNotAppliedError() from None
-        self.unknown()
+        """This invocation's own rows (incl. its private nonce) were not proven.
 
-    async def _bind_not_applied(self) -> bool:
-        """The bind is atomic: an unchanged running parent and no child prove it absent."""
-        request = self.bind
-        parent = await self.session.scalar(
-            select(AgentRun.id).where(
-                AgentRun.id == request.parent_run_id,
-                AgentRun.claim_epoch == request.parent_claim_epoch,
-                AgentRun.status == RunStatus.RUNNING.value,
-            )
-        )
-        child = await self.session.scalar(
-            select(AgentRun.id).where(AgentRun.id == request.child_run_id)
-        )
-        return parent is not None and child is None
+        Re-entering is safe: the attempt retakes the parent lock, reads an
+        existing binding back without a token, and only creates when the
+        parent still admits this invocation. Never grants authority here.
+        """
+        raise _CommitNotAppliedError() from None
 
     def _retry_predicate(self) -> Any:
         predicate = AgentRun.id == self.run_id

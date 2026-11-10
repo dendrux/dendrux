@@ -253,7 +253,10 @@ async def test_bind_is_atomic_before_child_effect(store, engine):
     # Intent: the unique managed tool row, started, with the binding.
     (tool,) = after["tools"]
     assert (tool.tool_call_id, tool.target, tool.outcome) == (call_id, "agent", "started")
-    assert tool.meta == {"managed": {"v": 1, "child_run_id": request.child_run_id}}
+    managed = tool.meta["managed"]
+    assert set(tool.meta) == {"managed"} and set(managed) == {"v", "child_run_id", "bind"}
+    assert (managed["v"], managed["child_run_id"]) == (1, request.child_run_id)
+    assert isinstance(managed["bind"], str) and len(managed["bind"]) == 26
     assert tool.params == {"task": BRIEF} and tool.id == request.row_id
     assert after["events"] == [StoredEventType.TOOL_STARTED.value]
     # Child: running, unowned beyond epoch 0, seeded, linked and tenant-pinned.
@@ -743,11 +746,9 @@ async def test_bind_contends_with_cancel_and_stale_writer(store, engine):
             assert late is None or isinstance(late, (RunFencedError, str))
 
 
-async def test_lost_ack_with_changed_rows_is_unknown(store, engine, monkeypatch):
-    """A lost acknowledgement whose readback finds neither our rows nor an untouched
-    parent cannot be proven either way: unknown, never a second attempt or token."""
-    from dendrux.errors import StoreOutcomeUnknown
-
+async def test_lost_ack_with_changed_rows_reads_back_without_a_token(store, engine, monkeypatch):
+    """A lost acknowledgement whose readback cannot prove this invocation's own rows
+    re-enters under the lock: the saved binding is read back, never with a token."""
     parent, call_id = await managed_parent(store)
     request = bind_request(parent, call_id)
     original = AsyncSession.commit
@@ -766,9 +767,10 @@ async def test_lost_ack_with_changed_rows_is_unknown(store, engine, monkeypatch)
         await original(self)
 
     monkeypatch.setattr(AsyncSession, "commit", commit)
-    with pytest.raises(StoreOutcomeUnknown):
-        await store.bind_managed_child(request)
+    result = await store.bind_managed_child(request)
     monkeypatch.undo()
+    assert result.outcome == "existing" and result.child_claim is None
+    assert result.child_run_id == request.child_run_id
     state = await snapshot(engine, parent)
     assert [c.id for c in state["children"]] == [request.child_run_id]
     assert len(state["tools"]) == 1
@@ -801,3 +803,229 @@ async def test_generic_continuations_refuse_a_managed_wait_before_claiming(store
             await attempt
         assert refused.value.code == "pause_format_unsupported"
     await _assert_unchanged(engine, parent, before)
+
+
+# ---------------------------------------------------------------------------
+# Fix round 1
+# ---------------------------------------------------------------------------
+
+
+async def _two_pools(engine: Any, tmp_path: Any) -> tuple[Any, Any, list[Any]]:
+    """Two independent engines on one database (two pools stand in for two processes)."""
+    if engine.dialect.name == "postgresql":
+        other = create_async_engine(_engine_url(engine))
+        return engine, other, [other]
+    from dendrux.db.models import Base
+
+    url = f"sqlite+aiosqlite:///{tmp_path / 'two_pools.db'}"
+    first = create_async_engine(url, connect_args={"check_same_thread": False})
+    second = create_async_engine(url, connect_args={"check_same_thread": False})
+    async with first.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    return first, second, [first, second]
+
+
+async def test_r1_competing_identical_request_during_lost_ack_gets_no_second_token(
+    store, engine, monkeypatch, tmp_path
+):
+    """Caller A's COMMIT fails unapplied; before A's readback, caller B (another pool)
+    commits the identical request. Only B may receive the child's execution token."""
+    engine_a, engine_b, owned = await _two_pools(engine, tmp_path)
+    try:
+        store_a, store_b = store_for_engine(engine_a), store_for_engine(engine_b)
+        parent, call_id = await managed_parent(store_a)
+        request = bind_request(parent, call_id)
+        original_commit = AsyncSession.commit
+        commits: list[int] = []
+
+        async def commit(self: AsyncSession) -> None:
+            commits.append(1)
+            if len(commits) == 1:
+                raise OSError("connection lost before COMMIT applied")
+            await original_commit(self)
+
+        competitor: list[Any] = []
+        original_prepare = store_a._prepare_commit_readback
+
+        async def prepare(session: Any) -> None:
+            if not competitor:
+                competitor.append(await store_b.bind_managed_child(request))
+            await original_prepare(session)
+
+        monkeypatch.setattr(AsyncSession, "commit", commit)
+        monkeypatch.setattr(store_a, "_prepare_commit_readback", prepare)
+        result_a = await store_a.bind_managed_child(request)
+        monkeypatch.undo()
+        result_b = competitor[0]
+
+        tokens = [r for r in (result_a, result_b) if r.child_claim is not None]
+        assert len(tokens) == 1
+        assert result_b.outcome == "created" and result_b.child_claim is not None
+        assert result_a.outcome == "existing" and result_a.child_claim is None
+        assert result_a.child_run_id == result_b.child_run_id == request.child_run_id
+        state = await snapshot(engine_a, parent)
+        assert len(state["children"]) == 1 and len(state["tools"]) == 1
+    finally:
+        for extra in owned:
+            await extra.dispose()
+
+
+async def test_r2_caller_mutation_during_bind_cannot_split_the_binding(store, engine, monkeypatch):
+    """The bind works from a detached snapshot taken before its first await."""
+    parent, call_id = await managed_parent(store)
+    request = bind_request(parent, call_id)
+    original_child, original_wait = request.child_run_id, request.parent_wait.pause_id
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = store._bind_parent
+
+    async def gated(*args: Any, **kwargs: Any) -> Any:
+        row = await original(*args, **kwargs)
+        entered.set()
+        await release.wait()
+        return row
+
+    monkeypatch.setattr(store, "_bind_parent", gated)
+    task = asyncio.create_task(store.bind_managed_child(request))
+    await entered.wait()
+    request.parent_wait.managed_wait = ManagedWait(call_id, generate_ulid())
+    request.parent_wait.pause_id = generate_ulid()
+    request.parent_patch.set_fields[MANAGED_BINDING_KEY] = {"tool_call_id": "x"}
+    request.child_loop_state[MANAGED_HEADER_KEY] = {"forged": True}
+    request.params["task"] = "forged"
+    request.child_seed_traces[0].meta["forged"] = True
+    release.set()
+    result = await task
+    monkeypatch.undo()
+
+    assert result.outcome == "created" and result.child_run_id == original_child
+    assert result.parent_wait_id == original_wait
+    state = await snapshot(engine, parent)
+    wait = PauseState.from_managed_dict(state["pause_data"])
+    assert wait.managed_wait == ManagedWait(call_id, original_child)
+    assert wait.pause_id == original_wait
+    assert state["loop_state"][MANAGED_BINDING_KEY] == {
+        "v": 1,
+        "tool_call_id": call_id,
+        "child_run_id": original_child,
+        "pause_id": original_wait,
+    }
+    (tool,) = state["tools"]
+    assert tool.params == {"task": BRIEF}
+    (child,) = state["children"]
+    assert child.loop_state[MANAGED_HEADER_KEY]["invocation"]["tool_call_id"] == call_id
+    async with AsyncSession(engine) as session:
+        seeds = (
+            (await session.execute(select(ReactTrace).where(ReactTrace.agent_run_id == child.id)))
+            .scalars()
+            .all()
+        )
+    assert all("forged" not in (trace.meta or {}) for trace in seeds)
+
+
+async def _edit_run(engine: Any, run_id: str, **changes: Any) -> None:
+    async with AsyncSession(engine) as session:
+        run = await session.get(AgentRun, run_id)
+        for key, change in changes.items():
+            setattr(run, key, change(getattr(run, key)))
+        await session.commit()
+
+
+@pytest.mark.parametrize("case", ["checkpoint_child", "generation", "pause_binding"])
+async def test_r3_active_binding_disagreement_is_invalid_state(store, engine, case):
+    parent, call_id = await managed_parent(store)
+    request = bind_request(parent, call_id)
+    await store.bind_managed_child(request)
+    other = generate_ulid()
+    if case == "checkpoint_child":
+        await _edit_run(
+            engine,
+            parent,
+            loop_state=lambda s: {
+                **s,
+                MANAGED_BINDING_KEY: {**s[MANAGED_BINDING_KEY], "child_run_id": other},
+            },
+        )
+    elif case == "generation":
+        await _edit_run(engine, parent, pause_data=lambda p: {**p, "pause_id": other})
+    else:
+        await _edit_run(
+            engine,
+            parent,
+            pause_data=lambda p: {
+                **p,
+                "managed_wait": {**p["managed_wait"], "child_run_id": other},
+            },
+        )
+    with pytest.raises(ManagedStateError) as refused:
+        await store.bind_managed_child(request)
+    assert refused.value.reason == "binding_conflict"
+
+
+async def test_r3_wrong_registered_path_is_child_mismatch(store, engine):
+    parent, call_id = await managed_parent(store)
+    request = bind_request(parent, call_id)
+    await store.bind_managed_child(request)
+    # A repeat naming another registration path is not this binding.
+    with pytest.raises(ManagedStateError) as other_path:
+        await store.bind_managed_child(bind_request(parent, call_id, path=("auditor",)))
+    assert other_path.value.reason == "child_mismatch"
+    # A stored child header with another path (same root and invocation) is refused.
+    await _edit_run(
+        engine,
+        request.child_run_id,
+        loop_state=lambda s: {
+            **s,
+            MANAGED_HEADER_KEY: {**s[MANAGED_HEADER_KEY], "path": ["auditor"]},
+        },
+    )
+    with pytest.raises(ManagedStateError) as stored_path:
+        await store.bind_managed_child(request)
+    assert stored_path.value.reason == "child_mismatch"
+
+
+async def test_r3_foreign_child_is_refused_before_its_header_is_read(store, engine, caplog):
+    parent, call_id = await managed_parent(store)
+    request = bind_request(parent, call_id)
+    await store.bind_managed_child(request)
+    await _edit_run(
+        engine,
+        request.child_run_id,
+        tenant_id=lambda _t: "t2",
+        loop_state=lambda s: {**s, MANAGED_HEADER_KEY: {"garbage": BRIEF}},
+    )
+    caplog.clear()
+    with pytest.raises(ManagedStateError) as refused:
+        await store.bind_managed_child(request)
+    assert refused.value.reason == "child_mismatch"
+    reasons = [getattr(r, "managed_reason", None) for r in caplog.records]
+    assert "header_invalid" not in reasons and BRIEF not in caplog.text
+
+
+async def test_r3_completed_invocation_still_reads_back(store, engine):
+    """After adoption cleared the outgoing binding and the parent bound a new call,
+    the older invocation reads back as existing; the new call binds normally."""
+    parent, first_call = await managed_parent(store)
+    first = await store.bind_managed_child(bind_request(parent, first_call))
+    second_call = generate_ulid()
+    pending = {
+        "call_id": second_call,
+        "tool": "reviewer",
+        "phase": "dispatchable",
+        "order_index": 9,
+        "target": "agent",
+    }
+    await _edit_run(
+        engine,
+        parent,
+        status=lambda _s: RunStatus.RUNNING.value,
+        claim_epoch=lambda e: e + 1,
+        loop_state=lambda s: {**s, MANAGED_BINDING_KEY: None, "pending": [pending]},
+    )
+    old = await store.bind_managed_child(bind_request(parent, first_call, epoch=2))
+    assert old.outcome == "existing" and old.child_claim is None
+    assert old.child_run_id == first.child_run_id and old.parent_wait_id is None
+    new = await store.bind_managed_child(bind_request(parent, second_call, epoch=2))
+    assert new.outcome == "created" and new.child_claim is not None
+    # The older invocation stays readable while the new one is active.
+    again = await store.bind_managed_child(bind_request(parent, first_call, epoch=3))
+    assert again.outcome == "existing" and again.child_run_id == first.child_run_id

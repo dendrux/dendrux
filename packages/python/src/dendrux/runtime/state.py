@@ -423,6 +423,46 @@ class BindManagedChildRequest:
         ):
             raise ValueError("max_delegation_depth must be a positive int or None")
 
+    def detached(self) -> BindManagedChildRequest:
+        """A validated copy sharing no mutable data with the caller (taken before any await).
+
+        The parent wait is re-decoded from its own stored form, so the persisted
+        pause, both binding copies and the returned generation come from one value.
+        """
+        from dataclasses import replace
+
+        wait = PauseState.from_managed_dict(
+            _json_copy(self.parent_wait.to_dict()), run_id=self.parent_run_id
+        )
+        patch = LoopStatePatch(
+            remove_pending=tuple(self.parent_patch.remove_pending),
+            set_phase=self.parent_patch.set_phase,
+            set_fields=_json_copy(dict(self.parent_patch.set_fields)),
+            set_call_phase=_json_copy(dict(self.parent_patch.set_call_phase)),
+        )
+        seeds = tuple(
+            replace(
+                trace,
+                meta=_json_copy(trace.meta),
+                blob_refs=tuple(trace.blob_refs) if trace.blob_refs is not None else None,
+            )
+            for trace in self.child_seed_traces
+        )
+        usage = self.parent_total_usage
+        return replace(
+            self,
+            params=_json_copy(self.params),
+            child_input_data=_json_copy(self.child_input_data),
+            child_loop_state=_json_copy(dict(self.child_loop_state)),
+            child_meta=_json_copy(self.child_meta),
+            child_pii_mapping=_json_copy(self.child_pii_mapping),
+            parent_wait=wait,
+            parent_patch=patch,
+            child_seed_traces=seeds,
+            intent_event=replace(self.intent_event, data=_json_copy(self.intent_event.data)),
+            parent_total_usage=replace(usage) if usage is not None else None,
+        )
+
     def _check_identity(self) -> None:
         from dendrux.types import _ULID_PATTERN
 
@@ -457,6 +497,13 @@ class BindManagedChildRequest:
             raise ValueError("The store writes the child's managed header")
         if any(not isinstance(trace, TraceWrite) for trace in self.child_seed_traces):
             raise ValueError("child_seed_traces must be TraceWrite values")
+
+
+def _json_copy(value: Any) -> Any:
+    """A detached JSON copy; persisted values are JSON already (validated by the store)."""
+    import json
+
+    return None if value is None else json.loads(json.dumps(value))
 
 
 @dataclass(frozen=True)

@@ -2189,60 +2189,65 @@ class SQLStateStore(SQLBlobCatalog):
     async def bind_managed_child(self, request: BindManagedChildRequest) -> BindManagedChildResult:
         """Atomically bind one managed invocation to a fresh running child (internal, 0.7).
 
-        One transaction under the parent's row lock: tenant, then an existing
-        binding (read back, never with execution authority), then the parent's
-        running status, claim epoch, cancellation, managed header, outstanding
-        binding, pending call and depth. It then parks the parent as a v3
-        managed wait with its epoch retired, inserts the unique managed tool
+        Works on a detached, validated snapshot of ``request`` taken before the
+        first await. One transaction under the parent's row lock: tenant, then an
+        existing binding (read back, never with execution authority), then the
+        parent's running status, claim epoch, cancellation, managed header,
+        outstanding binding, pending call and depth. It then parks the parent as a
+        v3 managed wait with its epoch retired, inserts the unique managed tool
         intent, creates the child running with its managed header and seed, and
-        writes the intent event. Only the confirmed creator receives the
-        child's execution token. No provider, hook or user code runs inside.
+        writes the intent event. Only the invocation that proves its own private
+        nonce on the intent row receives the child's execution token. No
+        provider, hook or user code runs inside.
         """
         from dendrux.runtime._capabilities import require_managed_subagents
         from dendrux.types import _validate_persistable
 
         require_managed_subagents(self)
+        for value, name in (
+            (request.child_meta, "metadata"),
+            (request.child_input_data, "input"),
+            (request.params, "params"),
+        ):
+            _validate_persistable(value, name)
+        plan = request.detached()
         _check_create_identifiers(
-            request.child_run_id,
-            request.child_agent_name,
-            request.tenant_id,
-            None,
-            request.child_model,
+            plan.child_run_id, plan.child_agent_name, plan.tenant_id, None, plan.child_model
         )
-        _validate_persistable(request.child_meta, "metadata")
-        _validate_persistable(request.child_input_data, "input")
-        _validate_persistable(request.params, "params")
-        wait = request.parent_wait.to_dict()
+        wait = plan.parent_wait.to_dict()
+        # Private to this method invocation and kept across its transient retries:
+        # a caller replaying an identical request cannot prove it.
+        nonce = generate_ulid()
 
         async def _attempt() -> BindManagedChildResult:
             async with self._session_factory() as session:
                 session.info[STORE_SESSION_KEY] = self
-                await self.reserve_parent_writer(session, request.parent_run_id)
-                parent = await self._bind_parent(session, request)
-                existing = await self._bind_existing(session, request, parent)
+                await self.reserve_parent_writer(session, plan.parent_run_id)
+                parent = await self._bind_parent(session, plan)
+                existing = await self._bind_existing(session, plan, parent)
                 if existing is not None:
                     await session.rollback()
                     return existing
-                header = self._bind_admit(request, parent)
-                child_state = {**request.child_loop_state, MANAGED_HEADER_KEY: header.to_dict()}
-                _validate_checkpoint(request.child_run_id, child_state)
-                await self._bind_park_parent(session, request, parent, wait)
-                await self._bind_intent(session, request)
-                await self._bind_child(session, request, parent, child_state)
-                await self._bind_seeds(session, request)
-                await self._bind_event(session, request)
-                await self._write_tx(session, run_ids=(request.parent_run_id, request.child_run_id))
+                header = self._bind_admit(plan, parent)
+                child_state = {**plan.child_loop_state, MANAGED_HEADER_KEY: header.to_dict()}
+                _validate_checkpoint(plan.child_run_id, child_state)
+                await self._bind_park_parent(session, plan, parent, wait)
+                await self._bind_intent(session, plan, nonce)
+                await self._bind_child(session, plan, parent, child_state)
+                await self._bind_seeds(session, plan)
+                await self._bind_event(session, plan)
+                await self._write_tx(session, run_ids=(plan.parent_run_id, plan.child_run_id))
             return BindManagedChildResult(
                 outcome="created",
-                child_run_id=request.child_run_id,
-                parent_wait_id=request.parent_wait.pause_id,
+                child_run_id=plan.child_run_id,
+                parent_wait_id=wait["pause_id"],
                 child_claim=ClaimResult(0, STORAGE_FORMAT_CHECKPOINTED, child_state, None),
             )
 
         return await retry_transient_db(
             _attempt,
             label="bind_managed_child",
-            run_id=request.parent_run_id,
+            run_id=plan.parent_run_id,
             classify=self.classify_db_error,
             _raw_driver_errors=True,
         )
@@ -2263,6 +2268,13 @@ class SQLStateStore(SQLBlobCatalog):
                         AgentRun.storage_format,
                         AgentRun.delegation_level,
                         AgentRun.loop_state,
+                        self.json_get(AgentRun.pause_data, ("schema_version",), "int").label(
+                            "wait_version"
+                        ),
+                        self.json_get(AgentRun.pause_data, ("pause_id",), "str").label("wait_id"),
+                        self.json_get(AgentRun.pause_data, ("managed_wait",), "json").label(
+                            "wait_binding"
+                        ),
                     ).where(AgentRun.id == request.parent_run_id),
                     "update",
                 )
@@ -2275,12 +2287,18 @@ class SQLStateStore(SQLBlobCatalog):
     async def _bind_existing(
         self, session: AsyncSession, request: BindManagedChildRequest, parent: Any
     ) -> BindManagedChildResult | None:
-        """Read back this invocation's saved binding; refuse a missing or conflicting one."""
+        """Read back this invocation's saved binding; refuse a missing or conflicting one.
+
+        The active invocation (the parent's outgoing binding) must agree across
+        intent, checkpoint, v3 pause generation and child; an older completed
+        invocation is read back from its intent and child only.
+        """
         from dendrux.db.models import AgentRun, ToolCallRecord
         from dendrux.errors import ManagedStateError
 
         parent_id, call_id = request.parent_run_id, request.tool_call_id
         outgoing = (parent.loop_state or {}).get(MANAGED_BINDING_KEY)
+        active = isinstance(outgoing, dict) and outgoing.get("tool_call_id") == call_id
         rows = (
             await session.execute(
                 select(ToolCallRecord.target, ToolCallRecord.meta)
@@ -2292,7 +2310,7 @@ class SQLStateStore(SQLBlobCatalog):
             )
         ).all()
         if not rows:
-            if isinstance(outgoing, dict) and outgoing.get("tool_call_id") == call_id:
+            if active:
                 raise ManagedStateError(reason="binding_missing", run_id=parent_id)
             return None
         child_id = _bound_child_id(rows)
@@ -2310,11 +2328,8 @@ class SQLStateStore(SQLBlobCatalog):
         if not _child_matches(child, child_id, request, parent.tenant_id):
             raise ManagedStateError(reason="child_mismatch", run_id=parent_id)
         wait_id = None
-        if isinstance(outgoing, dict) and (
-            outgoing.get("tool_call_id"),
-            outgoing.get("child_run_id"),
-        ) == (call_id, child_id):
-            wait_id = outgoing.get("pause_id")
+        if active and isinstance(outgoing, dict):
+            wait_id = _active_wait_id(parent, outgoing, request, child_id)
         return BindManagedChildResult(
             outcome="existing", child_run_id=child_id, parent_wait_id=wait_id, child_claim=None
         )
@@ -2370,10 +2385,9 @@ class SQLStateStore(SQLBlobCatalog):
         from dendrux.errors import RunFencedError
 
         parent_id, epoch = request.parent_run_id, request.parent_claim_epoch
-        binding = request.parent_wait.managed_wait
-        assert binding is not None
         state = _apply_loop_patch(dict(parent.loop_state or {}), request.parent_patch)
-        state[MANAGED_BINDING_KEY] = {**binding.to_dict(), "pause_id": request.parent_wait.pause_id}
+        # Both binding copies come from the one wait value that is persisted.
+        state[MANAGED_BINDING_KEY] = {**wait["managed_wait"], "pause_id": wait["pause_id"]}
         _validate_checkpoint(parent_id, state)
         values: dict[str, Any] = {
             **_status_values(RunStatus.PAUSED.value),
@@ -2405,8 +2419,10 @@ class SQLStateStore(SQLBlobCatalog):
             _codes.log_code(logger, _codes.RUN_FENCED, run_id=parent_id)
             raise RunFencedError(parent_id, claim_epoch=epoch)
 
-    async def _bind_intent(self, session: AsyncSession, request: BindManagedChildRequest) -> None:
-        """The unique managed tool intent, started, carrying the binding."""
+    async def _bind_intent(
+        self, session: AsyncSession, request: BindManagedChildRequest, nonce: str
+    ) -> None:
+        """The unique managed tool intent, started, carrying the binding and creator nonce."""
         from dendrux.db.models import ToolCallRecord
         from dendrux.runtime._digest import content_digest
 
@@ -2418,6 +2434,7 @@ class SQLStateStore(SQLBlobCatalog):
                 params=request.params,
             )
         )
+        meta = {"managed": {"v": 1, "child_run_id": request.child_run_id, "bind": nonce}}
         await self._insert_retry(
             session,
             ToolCallRecord,
@@ -2435,10 +2452,14 @@ class SQLStateStore(SQLBlobCatalog):
                 success=False,
                 duration_ms=0,
                 idempotent=False,
-                meta={"managed": {"v": 1, "child_run_id": request.child_run_id}},
+                meta=meta,
                 content_digest=digest,
             ),
             digest=digest,
+        )
+        # A lost acknowledgement grants the token only if this nonce is read back.
+        self._remember_write(
+            session, ToolCallRecord.__table__, ToolCallRecord.id == request.row_id, {"meta": meta}
         )
 
     async def _bind_child(
@@ -6255,9 +6276,14 @@ def _bound_child_id(rows: Sequence[Any]) -> str | None:
 def _child_matches(
     child: Any, child_id: str, request: BindManagedChildRequest, tenant_id: str | None
 ) -> bool:
-    """A bound child links back to exactly this invocation, root and tenant."""
+    """A bound child links back to exactly this invocation, root, path and tenant.
+
+    Tenant and parent link are compared before the child's header is parsed.
+    """
     from dendrux.errors import ManagedStateError
 
+    if child.tenant_id != tenant_id or child.parent_run_id != request.parent_run_id:
+        return False
     try:
         header = ManagedHeader.from_dict(
             (child.loop_state or {}).get(MANAGED_HEADER_KEY), run_id=child_id
@@ -6265,12 +6291,34 @@ def _child_matches(
     except ManagedStateError:
         return False
     return (
-        child.parent_run_id == request.parent_run_id
-        and child.tenant_id == tenant_id
-        and header.root_run_id == request.root_run_id
+        header.root_run_id == request.root_run_id
+        and header.path == request.child_path
         and (header.parent_run_id, header.tool_call_id)
         == (request.parent_run_id, request.tool_call_id)
     )
+
+
+def _active_wait_id(
+    parent: Any, outgoing: dict[str, Any], request: BindManagedChildRequest, child_id: str
+) -> str:
+    """The active binding must agree across checkpoint, v3 pause generation and intent."""
+    from dendrux.errors import ManagedStateError
+
+    envelope = parent.wait_binding
+    if isinstance(envelope, str):  # dialects that return projected JSON as text
+        envelope = json.loads(envelope)
+    pause_id = outgoing.get("pause_id")
+    if (
+        outgoing.get("child_run_id") != child_id
+        or parent.wait_version != 3
+        or not isinstance(pause_id, str)
+        or parent.wait_id != pause_id
+        or not isinstance(envelope, dict)
+        or (envelope.get("tool_call_id"), envelope.get("child_run_id"))
+        != (request.tool_call_id, child_id)
+    ):
+        raise ManagedStateError(reason="binding_conflict", run_id=request.parent_run_id)
+    return pause_id
 
 
 def _validate_lease_batch_size(*, batch_size: int, cap: int) -> None:
