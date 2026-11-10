@@ -131,8 +131,11 @@ What this changes for a blocked message:
 - **Continuation.** A run that carries the block mark and is not finished stops when you resume, submit to, or reclaim it. The result has status `error` and `failure_reason="guardrail_blocked"`, with the `run.error` event and no provider or tool calls. A block found during that call keeps the guardrail's own safe message; a mark left by an earlier call reports "Run stopped because it contains blocked content." A run another worker already finished is not overwritten.
 - **Retry.** `agent.retry()` raises `ReplayRunError` with `reason="blocked_content"` when the run, or any run it replayed with `runs=`, is identified as blocked. The detail is "Source history contains blocked content; start a new run with clean input." The error is raised before a run is created or a model is called, and carries the run ID of the identified history. Ask the user for clean input instead of retrying.
 - **Replay.** `runs=` omits the whole identified run, including its context, tools and reasoning, and keeps the rest. `ReplaySummary.warnings` gains `Run <run id> omitted because it contains blocked content; prior effects may have occurred.` Show it to users: omitting a run does not undo anything it did. If every run is omitted, the new run starts from the fresh input alone.
-- **Recovery.** Reclaiming an interrupted run with an unresolved tool call now holds its unexecuted tool siblings behind the approval gate until the gate is decided. The run returns `waiting_approval` with every held call, and no held call starts before the decision. Declining the batch denies all held calls; denying one call still lets the ungated siblings run after the decision. Client-tool siblings go to the client pause, not to server dispatch.
 - **Log code.** The new log code `blocked_content` carries the run ID only. It fires when a retry is refused, a replay omits a run or a continuation stops.
+
+### Recovery holds the whole tool batch for approval
+
+Reclaiming an interrupted run with an unresolved tool call now holds its unexecuted tool siblings behind the approval gate until the gate is decided. The run returns `waiting_approval` with every held call, and no held call starts before the decision. Declining the batch denies all held calls; denying one call still lets the ungated siblings run after the decision. Client-tool siblings go to the client pause, not to server dispatch.
 
 ### Cost
 
