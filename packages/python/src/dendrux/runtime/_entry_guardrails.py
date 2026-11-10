@@ -104,14 +104,16 @@ class _EntryProjection:
         previous = self.error, self.findings, self.location
         self.error = None
         broad = await self.rendered(messages, list(history), context, text, parts)
-        if self.error is None:
+        if self.error is None or self.engine is None:
             self.error, self.findings, self.location = previous
             return folded, history, context, text, parts
         rejected = self.error, self.findings, self.location
         self.error = None
-        history = [await self.project(message, i + 1) for i, message in enumerate(history)]
-        context = await self.context(context)
-        own = await self.project(Message(Role.USER, text, parts=parts), len(history) + 1)
+        with self.engine._projection_transaction() as attribution:
+            history = [await self.project(message, i + 1) for i, message in enumerate(history)]
+            context = await self.context(context)
+            own = await self.project(Message(Role.USER, text, parts=parts), len(history) + 1)
+            attribution.keep = self.error is not None
         if self.error is None:
             # A wrapper-only rejection has no safe per-piece attribution.
             self.error, self.findings, self.location = rejected

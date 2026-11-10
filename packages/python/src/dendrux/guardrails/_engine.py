@@ -369,6 +369,13 @@ def _blocked_message(message: Message, findings: list[Finding]) -> Message:
 class _MappingChanges:
     entries: dict[str, tuple[bool, bool, set[str]]] = field(default_factory=dict)
     counters: dict[str, int | None] = field(default_factory=dict)
+    keep: bool = False
+
+    def merge_into(self, parent: _MappingChanges) -> None:
+        for key, value in self.entries.items():
+            parent.entries.setdefault(key, value)
+        for kind, count in self.counters.items():
+            parent.counters.setdefault(kind, count)
 
     def rollback(self, engine: GuardrailEngine) -> None:
         for placeholder, (existed, trusted, tools) in self.entries.items():
@@ -657,26 +664,49 @@ class GuardrailEngine:
     async def _project_message(
         self, msg: Message, *, index: int | None = None, outgoing: bool = False
     ) -> tuple[Message, list[Finding], str | None]:
-        changes = _MappingChanges()
-        self._mapping_changes = changes
-        blocked = None
-        try:
+        with self._mapping_transaction() as changes:
             cleaned, findings, blocked = await self._scan_projection(msg, index, outgoing)
             if blocked is not None:
                 cleaned = _blocked_message(msg, findings)
-            if outgoing and blocked is None:
-                if not findings:
-                    return self._remember_projection(msg, cleaned, findings, None, index)
-                return cleaned, _ProjectionFindings(findings, limit=None), None
-            return self._remember_projection(msg, cleaned, findings, blocked, index)
+            result: tuple[Message, list[Finding], str | None]
+            if outgoing and blocked is None and findings:
+                result = cleaned, _ProjectionFindings(findings, limit=None), None
+            else:
+                result = self._remember_projection(msg, cleaned, findings, blocked, index)
+            changes.keep = blocked is None
+            return result
+
+    @contextmanager
+    def _mapping_transaction(self) -> Iterator[_MappingChanges]:
+        parent = self._mapping_changes
+        changes = _MappingChanges()
+        self._mapping_changes = changes
+        try:
+            yield changes
         except BaseException:
-            if blocked is None:
-                changes.rollback(self)
+            changes.keep = False
             raise
         finally:
-            if blocked is not None:
+            if not changes.keep:
                 changes.rollback(self)
-            self._mapping_changes = None
+            elif parent is not None:
+                changes.merge_into(parent)
+            self._mapping_changes = parent
+
+    @contextmanager
+    def _projection_transaction(self) -> Iterator[_MappingChanges]:
+        # Only speculative attribution needs a cache checkpoint. The cache is
+        # bounded; mapping changes are journaled without copying historical PII.
+        cached, size = self._projected.copy(), self._projection_text_bytes
+        with self._mapping_transaction() as changes:
+            try:
+                yield changes
+            except BaseException:
+                changes.keep = False
+                raise
+            finally:
+                if not changes.keep:
+                    self._projected, self._projection_text_bytes = cached, size
 
     async def _scan_projection(
         self, msg: Message, index: int | None, outgoing: bool
