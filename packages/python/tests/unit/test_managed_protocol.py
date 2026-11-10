@@ -615,3 +615,48 @@ def test_legacy_decoder_is_not_tightened():
     # Legacy semantics unchanged: v1/v2 values are read as stored.
     back = PauseState.from_dict(v2)
     assert back.iteration == "1" and back.trace_order_offset == -1
+
+
+# ---------------------------------------------------------------------------
+# Fix round 2, V3: money validation is a total predicate
+# ---------------------------------------------------------------------------
+
+HUGE = 10**400
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda d: d["usage"].__setitem__("cost_usd", HUGE),
+        lambda d: d.__setitem__("budget_known_cost_usd", HUGE),
+        lambda d: d.__setitem__("budget_fired", [["cost_usd", HUGE]]),
+        lambda d: d["usage"].__setitem__("cost_usd", -HUGE),
+    ],
+    ids=["cost_usd", "known_cost", "fired_threshold", "negative_cost"],
+)
+def test_v3_huge_integers_are_refused_not_raised(mutate):
+    stored = managed_wait_pause().to_dict()
+    mutate(stored)
+    with pytest.raises(ManagedStateError) as refused:
+        PauseState.from_managed_dict(stored)
+    assert refused.value.reason == "wait_invalid"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"usage": UsageStats(cost_usd=HUGE)},
+        {"budget_known_cost_usd": HUGE},
+        {"budget_fired": [("cost_usd", HUGE)]},
+    ],
+    ids=["cost_usd", "known_cost", "fired_threshold"],
+)
+def test_v3_encoder_refuses_huge_integers_with_value_error(overrides):
+    with pytest.raises(ValueError):
+        managed_wait_pause(**overrides).to_dict()
+
+
+def test_v3_large_finite_money_is_still_valid():
+    pause = managed_wait_pause(budget_known_cost_usd=10**300, budget_fired=[("cost_usd", 1)])
+    stored = pause.to_dict()
+    assert PauseState.from_managed_dict(stored).budget_known_cost_usd == 10**300

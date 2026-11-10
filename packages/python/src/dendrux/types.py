@@ -1906,9 +1906,15 @@ def _count(value: Any) -> bool:
 
 
 def _money(value: Any) -> bool:
+    """Total predicate: a finite, non-negative int or float; never raises."""
     import math
 
-    return type(value) in (int, float) and math.isfinite(value) and value >= 0
+    if type(value) is int:
+        try:
+            value = float(value)
+        except OverflowError:
+            return False
+    return type(value) is float and math.isfinite(value) and value >= 0
 
 
 def _optional_text(value: Any) -> bool:
