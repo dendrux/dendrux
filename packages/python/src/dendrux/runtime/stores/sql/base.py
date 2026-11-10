@@ -812,6 +812,13 @@ class SQLStateStore(SQLBlobCatalog):
             tenant_id,
         )
 
+    def _native_blocked_mark(self) -> object:
+        """Private capability: blocked writes and dispatches here commit the run mark, or
+        refuse, in the same transaction (the runtime then skips the custom-store path)."""
+        from dendrux.runtime._blocked_content import _NATIVE_BLOCKED_MARK
+
+        return _NATIVE_BLOCKED_MARK
+
     @_safe_database_call
     async def _blocked_run_ids(self, run_ids: Sequence[str], *, tenant_id: str | None) -> set[str]:
         from dendrux.errors import RunNotFoundError

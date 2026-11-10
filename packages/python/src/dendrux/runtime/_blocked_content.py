@@ -5,7 +5,7 @@ from __future__ import annotations
 from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Protocol, cast
 
 from dendrux._lifecycle import FailureReason
 from dendrux.errors import PersistenceError, RunFencedError
@@ -15,7 +15,6 @@ if TYPE_CHECKING:
 
     from dendrux.runtime._continuation_guardrails import _SubmissionBlock
     from dendrux.runtime.state import RunRecord, StateStore
-    from dendrux.runtime.stores.sql.base import SQLStateStore
 
 
 class _DispatchUndecided(Exception):  # noqa: N818 - private signal, never surfaced
@@ -27,12 +26,37 @@ _blocked_target: ContextVar[tuple[object, str] | None] = ContextVar(
 )
 
 
-def _native_store(store: StateStore) -> SQLStateStore:
+class _NativeBlockedStore(Protocol):
+    """A store whose writes honour the blocked-write and dispatch scopes in one transaction."""
+
+    async def _blocked_run_ids(
+        self, run_ids: Sequence[str], *, tenant_id: str | None
+    ) -> set[str]: ...
+
+
+# The private capability marker. A store is native only when its ``_native_blocked_mark()``
+# returns this object: setting the attribute, or returning anything else, is not trusted.
+_NATIVE_BLOCKED_MARK = object()
+
+
+def _native_blocked_store(store: StateStore | None) -> _NativeBlockedStore | None:
+    """The shared store when it marks blocked writes atomically, else ``None``.
+
+    The only seam for the native/custom decision: stores declare the capability, so
+    the runtime never names a backend class. Custom stores mark first or fail closed.
+    """
     from dendrux.runtime.state import unclaimed_store
-    from dendrux.runtime.stores.sql.base import SQLStateStore
 
     native = unclaimed_store(store)
-    if not isinstance(native, SQLStateStore):
+    capability = getattr(type(native), "_native_blocked_mark", None)
+    if not callable(capability) or capability(native) is not _NATIVE_BLOCKED_MARK:
+        return None
+    return cast("_NativeBlockedStore", native)
+
+
+def _native_store(store: StateStore) -> _NativeBlockedStore:
+    native = _native_blocked_store(store)
+    if native is None:
         raise PersistenceError()
     return native
 
@@ -50,18 +74,14 @@ def _blocked_write(store: StateStore, run_id: str) -> Iterator[None]:
 async def _blocked_run_ids(
     store: StateStore, run_ids: Sequence[str], *, tenant_id: str | None
 ) -> set[str]:
-    return cast(
-        "set[str]", await _native_store(store)._blocked_run_ids(run_ids, tenant_id=tenant_id)
-    )
+    return await _native_store(store)._blocked_run_ids(run_ids, tenant_id=tenant_id)
 
 
 @asynccontextmanager
 async def _blocked_evidence(store: StateStore, run_id: str) -> AsyncIterator[None]:
     from dendrux._meta_keys import BLOCKED_META_KEY
-    from dendrux.runtime.state import unclaimed_store
-    from dendrux.runtime.stores.sql.base import SQLStateStore
 
-    if isinstance(unclaimed_store(store), SQLStateStore):
+    if _native_blocked_store(store) is not None:
         with _blocked_write(store, run_id):
             yield
         return
@@ -175,10 +195,7 @@ async def _continuation_blocked(
 
 
 async def _adopted_run_blocked(store: StateStore, run_id: str, record: RunRecord | None) -> bool:
-    from dendrux.runtime.state import unclaimed_store
-    from dendrux.runtime.stores.sql.base import SQLStateStore
-
-    if isinstance(unclaimed_store(store), SQLStateStore):
+    if _native_blocked_store(store) is not None:
         tenant = record.tenant_id if record is not None else None
         return bool(await _native_blocked(store, [run_id], tenant_id=tenant))
     return await _custom_blocked_event(store, run_id)
@@ -237,12 +254,9 @@ async def _blocked_sources(
     event identifies a run. Native stores answer with batched scoped existence
     queries; custom stores use the loaded row plus one filtered event read per run.
     """
-    from dendrux.runtime.state import unclaimed_store
-    from dendrux.runtime.stores.sql.base import SQLStateStore
-
     if not records:
         return set()
-    if isinstance(unclaimed_store(store), SQLStateStore):
+    if _native_blocked_store(store) is not None:
         return await _native_blocked(store, [r.id for r in records], tenant_id=tenant_id)
     found: set[str] = set()
     for record in records:
@@ -254,11 +268,9 @@ async def _blocked_sources(
 def _row_blocked(store: StateStore, run_id: str, record: RunRecord | None) -> bool:
     """Read the mark from an already loaded run row; malformed rows fail closed."""
     from dendrux._meta_keys import BLOCKED_META_KEY
-    from dendrux.runtime.state import unclaimed_store
-    from dendrux.runtime.stores.sql.base import SQLStateStore
 
     if record is None:
-        if isinstance(unclaimed_store(store), SQLStateStore):
+        if _native_blocked_store(store) is not None:
             raise PersistenceError()
         # Custom blocked writes verify the mark through get_run before any related
         # evidence, so a store without a readable run row never holds a mark.

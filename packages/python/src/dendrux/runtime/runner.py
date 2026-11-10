@@ -2848,10 +2848,9 @@ async def _create_projected_run(
     blocked: bool, store: StateStore, loop: Loop, run_id: str, agent_name: str, **kwargs: Any
 ) -> CreateRunResult:
     from dendrux._meta_keys import BLOCKED_META_KEY
-    from dendrux.runtime._blocked_content import _blocked_write
-    from dendrux.runtime.stores.sql.base import SQLStateStore
+    from dendrux.runtime._blocked_content import _blocked_write, _native_blocked_store
 
-    native = isinstance(unclaimed_store(store), SQLStateStore)
+    native = _native_blocked_store(store) is not None
     if blocked and not native:
         kwargs["meta"] = {**(kwargs.get("meta") or {}), BLOCKED_META_KEY: True}
     scope = _blocked_write(store, run_id) if blocked and native else nullcontext()
@@ -2860,10 +2859,9 @@ async def _create_projected_run(
 
 
 async def _verify_projected_creation(blocked: bool, store: StateStore, run_id: str) -> None:
-    from dendrux.runtime._blocked_content import _require_block_mark
-    from dendrux.runtime.stores.sql.base import SQLStateStore
+    from dendrux.runtime._blocked_content import _native_blocked_store, _require_block_mark
 
-    if blocked and not isinstance(unclaimed_store(store), SQLStateStore):
+    if blocked and _native_blocked_store(store) is None:
         await _require_block_mark(store, run_id)
 
 

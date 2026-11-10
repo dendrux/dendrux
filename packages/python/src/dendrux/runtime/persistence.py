@@ -1393,11 +1393,13 @@ class PersistenceRecorder(BaseRecorder):
         from dendrux.errors import PersistenceError
         from dendrux.guardrails._engine import _entry_engine
         from dendrux.loops._helpers import _check_blocked_run
-        from dendrux.runtime._blocked_content import _dispatch_write, _DispatchUndecided
-        from dendrux.runtime.state import unclaimed_store
-        from dendrux.runtime.stores.sql.base import SQLStateStore
+        from dendrux.runtime._blocked_content import (
+            _dispatch_write,
+            _DispatchUndecided,
+            _native_blocked_store,
+        )
 
-        native = isinstance(unclaimed_store(self._store), SQLStateStore)
+        native = _native_blocked_store(self._store) is not None
         guarded = self.guardrail_engine is not None or _entry_engine(run_id) is not None
         if not native and guarded and hasattr(self._store, "add_note"):
             # Custom stores have no mark predicate on the dispatch write: a guarded
