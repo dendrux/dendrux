@@ -1027,6 +1027,7 @@ class Agent:
 
         Stages run in a fixed order and the first failure wins.
         """
+        self._validate_description()
         self._validate_basics()
 
         from dendrux.loops.single import SingleCall
@@ -1049,9 +1050,11 @@ class Agent:
         if self._require_approval:
             self._validate_require_approval(single_call, has_mcp, has_skills, known_tools)
 
-    def _validate_basics(self) -> None:
+    def _validate_description(self) -> None:
         if not isinstance(self.description, str):
             raise ValueError(f"Agent '{self.name}' description must be a string.")
+
+    def _validate_basics(self) -> None:
         if not self.prompt:
             raise ValueError(
                 f"Agent '{self.name}' requires a prompt. "
