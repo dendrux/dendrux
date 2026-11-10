@@ -372,12 +372,15 @@ class Agent:
 
     Attributes:
         name: Agent identifier. Auto-derived from class name if subclassed.
+        description: What the agent does. Required when it is used as a
+            subagent: the parent's model reads it to decide when to call it.
         prompt: System prompt for the agent.
         tools: List of @tool-decorated functions this agent can use.
         max_iterations: Maximum ReAct loop iterations before stopping.
     """
 
     name: str = ""
+    description: str = ""
     prompt: str = ""
     tools: list[Callable[..., Any]] = []
     max_iterations: int = DEFAULT_MAX_ITERATIONS
@@ -402,7 +405,9 @@ class Agent:
         provider: LLMProvider | str,
         prompt: str,
         name: str = ...,
+        description: str = ...,
         tools: list[Callable[..., Any]] = ...,
+        subagents: Sequence[Agent] | None = ...,
         tool_sources: list[MCPServer | MCPSource | MCPHost | MCPToolView] | None = ...,
         max_iterations: int = ...,
         max_delegation_depth: int | None = ...,
@@ -437,8 +442,10 @@ class Agent:
         *,
         provider: LLMProvider | str | None = ...,
         name: str = ...,
+        description: str = ...,
         prompt: str = ...,
         tools: list[Callable[..., Any]] = ...,
+        subagents: Sequence[Agent] | None = ...,
         tool_sources: list[MCPServer | MCPSource | MCPHost | MCPToolView] | None = ...,
         max_iterations: int = ...,
         max_delegation_depth: int | None = ...,
@@ -471,8 +478,10 @@ class Agent:
         self,
         *,
         name: str | _UnsetType = _UNSET,
+        description: str | _UnsetType = _UNSET,
         prompt: str | _UnsetType = _UNSET,
         tools: list[Callable[..., Any]] | _UnsetType = _UNSET,
+        subagents: Sequence[Agent] | None = None,
         tool_sources: list[MCPServer | MCPSource | MCPHost | MCPToolView] | None = None,
         max_iterations: int | _UnsetType = _UNSET,
         max_delegation_depth: int | None | _UnsetType = _UNSET,
@@ -518,23 +527,9 @@ class Agent:
             raise ValueError("lease_interval must be a timedelta of at least 5 seconds")
         self.lease_interval = lease_interval
 
-        # --- Identity ---
-        if not isinstance(name, _UnsetType):
-            self.name = name
-        elif not self.name:
-            self.name = type(self).__name__
-
-        if not isinstance(prompt, _UnsetType):
-            self.prompt = prompt
-        if not isinstance(tools, _UnsetType):
-            self.tools = list(tools)
-        else:
-            self.tools = list(self.__class__.tools)
-        if not isinstance(max_iterations, _UnsetType):
-            self.max_iterations = max_iterations
-        if not isinstance(max_delegation_depth, _UnsetType):
-            _validate_max_delegation_depth(max_delegation_depth)
-            self.max_delegation_depth = max_delegation_depth
+        self._configure_identity(
+            name, description, prompt, tools, max_iterations, max_delegation_depth
+        )
 
         # --- Loop ---
         self._loop: Loop | None = loop
@@ -608,10 +603,52 @@ class Agent:
         self._validate_skill_contents(self._explicit_skills or [])
 
         self._validate()
+        self._configure_subagents(subagents)
 
         from dendrux import pricing as _pricing
 
         _pricing.check_budget_config(self)
+
+    def _configure_identity(
+        self,
+        name: str | _UnsetType,
+        description: str | _UnsetType,
+        prompt: str | _UnsetType,
+        tools: list[Callable[..., Any]] | _UnsetType,
+        max_iterations: int | _UnsetType,
+        max_delegation_depth: int | None | _UnsetType,
+    ) -> None:
+        """Set identity fields; an unset argument keeps the class attribute."""
+        if not isinstance(name, _UnsetType):
+            self.name = name
+        elif not self.name:
+            self.name = type(self).__name__
+        if not isinstance(description, _UnsetType):
+            self.description = description
+        if not isinstance(prompt, _UnsetType):
+            self.prompt = prompt
+        self.tools = list(self.__class__.tools if isinstance(tools, _UnsetType) else tools)
+        if not isinstance(max_iterations, _UnsetType):
+            self.max_iterations = max_iterations
+        if not isinstance(max_delegation_depth, _UnsetType):
+            _validate_max_delegation_depth(max_delegation_depth)
+            self.max_delegation_depth = max_delegation_depth
+
+    def _configure_subagents(self, subagents: Sequence[Agent] | None) -> None:
+        """Store ``subagents`` (never mutating them) after the tree checks pass."""
+        from dendrux.runtime import _subagents
+
+        self._subagents: tuple[Agent, ...] = _subagents.normalize_subagents(self.name, subagents)
+        if not self._subagents:
+            return
+        from dendrux.loops.single import SingleCall
+
+        if isinstance(self._loop, SingleCall):
+            _subagents.refuse(
+                _subagents.SubagentDefinitionError(self.name, reason="single_call_parent")
+            )
+        _subagents.check_subagent_tree(self, agent_type=Agent)
+        _subagents.warn_fanout(self)
 
     def _configure_persistence(
         self,
@@ -778,6 +815,11 @@ class Agent:
         if self._provider is None:
             return ""
         return self._provider.model
+
+    @property
+    def subagents(self) -> tuple[Agent, ...]:
+        """Direct subagents, in registration order (empty when there are none)."""
+        return self._subagents
 
     @property
     def loop(self) -> Loop | None:
@@ -1008,6 +1050,8 @@ class Agent:
             self._validate_require_approval(single_call, has_mcp, has_skills, known_tools)
 
     def _validate_basics(self) -> None:
+        if not isinstance(self.description, str):
+            raise ValueError(f"Agent '{self.name}' description must be a string.")
         if not self.prompt:
             raise ValueError(
                 f"Agent '{self.name}' requires a prompt. "
