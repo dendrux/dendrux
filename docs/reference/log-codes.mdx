@@ -232,6 +232,7 @@ Missing or invalid codes remain unset. Category and HTTP status remain independe
 
 | Code | Level | Fields | Fires when | Do |
 | --- | --- | --- | --- | --- |
+| `managed_state_invalid` | WARNING | `code`, `kind`, `managed_reason`, `run_id`, `tenant_id` | Persisted managed-subagent state is malformed, missing or inconsistent. | Do not recreate the child; inspect the run's binding and resolve the workflow. |
 | `subagent_cycle` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | An Agent is built with a subagent that is its own ancestor. | Remove the cycle from the subagent tree. |
 | `subagent_fanout` | WARNING | `code`, `count`, `kind`, `limit`, `run_id`, `tenant_id` | An Agent is built with more than ten direct subagents. | Group related subagents under a lead; the model chooses less well among many. |
 | `subagent_invalid` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | An Agent is built with a subagents entry that is not a usable subagent. | Pass Agent instances with a valid name and a non-empty description. |

@@ -154,6 +154,20 @@ _ENUMS = {
             "store_capability",
         ]
     ),
+    "managed_reason": frozenset(
+        [
+            "binding_conflict",
+            "binding_missing",
+            "binding_outstanding",
+            "child_mismatch",
+            "child_missing",
+            "header_invalid",
+            "pending_missing",
+            "storage_format",
+            "wait_invalid",
+            "wait_too_large",
+        ]
+    ),
     "entry": frozenset(
         [
             "add_note",
@@ -863,6 +877,14 @@ SUBAGENT_FANOUT = Code(
     _BASE_FIELDS | frozenset(["count", "limit"]),
     "An Agent is built with more than ten direct subagents.",
     "Group related subagents under a lead; the model chooses less well among many.",
+)
+MANAGED_STATE_INVALID = Code(
+    "managed_state_invalid",
+    logging.WARNING,
+    "subagent",
+    _BASE_FIELDS | frozenset(["managed_reason"]),
+    "Persisted managed-subagent state is malformed, missing or inconsistent.",
+    "Do not recreate the child; inspect the run's binding and resolve the workflow.",
 )
 LEASE_INTERVAL = Code(
     "lease_interval",
@@ -2055,6 +2077,7 @@ REGISTRY = MappingProxyType(
             SUBAGENT_TOO_DEEP,
             SUBAGENT_TREE_TOO_LARGE,
             SUBAGENT_FANOUT,
+            MANAGED_STATE_INVALID,
             CHECKPOINT_TOO_LARGE,
             REWRITE_INVALID,
             WRITE_CONFLICT,

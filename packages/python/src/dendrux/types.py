@@ -1541,6 +1541,46 @@ class ImageViewState:
         )
 
 
+_ULID_PATTERN = re.compile(r"[0-7][0-9A-HJKMNP-TV-Z]{25}")
+MANAGED_PROTOCOL_VERSION = 1
+MANAGED_WAIT_REASON = "managed_wait"
+MANAGED_WAIT_SCHEMA_VERSION = 3
+
+
+@dataclass(frozen=True)
+class ManagedWait:
+    """Internal (0.7): a parent's one outgoing managed-subagent binding.
+
+    Saved inside a pause ``schema_version=3`` managed wait: the parent's
+    pending ``tool_call_id`` is bound to the fresh ``child_run_id``. Immutable;
+    never derived from model arguments.
+    """
+
+    tool_call_id: str
+    child_run_id: str
+    version: int = MANAGED_PROTOCOL_VERSION
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.tool_call_id, str)
+            or not self.tool_call_id
+            or len(self.tool_call_id) > ULID_CHARS
+        ):
+            raise ValueError("ManagedWait.tool_call_id must be a stable call id")
+        if not isinstance(self.child_run_id, str) or not _ULID_PATTERN.fullmatch(self.child_run_id):
+            raise ValueError("ManagedWait.child_run_id must be a run ULID")
+        if self.version != MANAGED_PROTOCOL_VERSION:
+            raise ValueError("Unsupported managed protocol version")
+
+    def to_dict(self) -> dict[str, Any]:
+        """The stored binding envelope."""
+        return {
+            "v": self.version,
+            "tool_call_id": self.tool_call_id,
+            "child_run_id": self.child_run_id,
+        }
+
+
 @dataclass
 class PauseState:
     """Everything needed to resume a paused agent run.
@@ -1593,15 +1633,23 @@ class PauseState:
     image_view_ref: str | None = None
     loop_state_ref: bool = False
     clarification: dict[str, Any] | None = None
+    # Internal (0.7): the outgoing binding of a v3 managed wait; None otherwise.
+    managed_wait: ManagedWait | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to JSON-compatible dict for DB storage.
 
         Validates that the output is JSON-serializable. Raises TypeError
-        if any field (e.g. custom meta values) cannot be serialized.
+        if any field (e.g. custom meta values) cannot be serialized. A pause
+        carrying a managed binding is always written as a v3 managed wait,
+        whatever ``schema_version`` says (internal, 0.7).
         """
         import json
 
+        if self.managed_wait is not None:
+            return self._managed_wait_dict()
+        if self.schema_version == MANAGED_WAIT_SCHEMA_VERSION:
+            raise ValueError("A v3 managed wait needs its managed binding")
         d = {
             "agent_name": self.agent_name,
             "pending_tool_calls": [_tool_call_to_dict(tc) for tc in self.pending_tool_calls],
@@ -1653,6 +1701,38 @@ class PauseState:
             ) from e
         return d
 
+    def _managed_wait_dict(self) -> dict[str, Any]:
+        """Format-2 references plus the binding; the brief stays on the tool row."""
+        from dataclasses import replace
+
+        binding = self.managed_wait
+        assert binding is not None
+        call_id = binding.tool_call_id
+        if (
+            [tc.id for tc in self.pending_tool_calls] != [call_id]
+            or self.pending_targets != {call_id: "agent"}
+            or self.pause_reason != MANAGED_WAIT_REASON
+            or not isinstance(self.pause_id, str)
+            or not _ULID_PATTERN.fullmatch(self.pause_id)
+            or self.approval_gates is not None
+            or self.pending_decisions is not None
+            or self.clarification is not None
+            or not self.loop_state_ref
+        ):
+            raise ValueError("Incomplete managed wait")
+        references = replace(
+            self,
+            managed_wait=None,
+            schema_version=2,
+            pending_tool_calls=[replace(self.pending_tool_calls[0], params={})],
+        )
+        d = references.to_dict()
+        d["schema_version"] = MANAGED_WAIT_SCHEMA_VERSION
+        d["managed_wait"] = binding.to_dict()
+        if _compact_json_bytes(d) > MANAGED_WAIT_MAX_BYTES:
+            raise ValueError("Managed wait exceeds its byte bound")
+        return d
+
     def _checkpoint_fields(self, d: dict[str, Any]) -> None:
         for key in ("history", "steps", "image_view"):
             d.pop(key, None)
@@ -1674,6 +1754,28 @@ class PauseState:
                 run_id=data.get("run_id"),
             )
             raise PersistenceError(code="pause_format_unsupported")
+        return cls._decode(data, references=data.get("schema_version") == 2)
+
+    @classmethod
+    def from_managed_dict(cls, data: dict[str, Any], *, run_id: str | None = None) -> PauseState:
+        """Strictly decode a v3 managed wait (internal, 0.7).
+
+        Requires the complete binding, exactly one pending managed call,
+        format-2 references (no copied history) and the byte bound. Anything
+        else raises ``ManagedStateError`` (``managed_state_invalid``).
+        """
+        from dendrux.errors import ManagedStateError
+
+        binding = _managed_wait_binding(data, run_id)
+        try:
+            pause = cls._decode(data, references=True)
+        except (KeyError, TypeError, ValueError, AttributeError):
+            raise ManagedStateError(reason="wait_invalid", run_id=run_id) from None
+        pause.managed_wait = binding
+        return pause
+
+    @classmethod
+    def _decode(cls, data: dict[str, Any], *, references: bool) -> PauseState:
         return cls(
             agent_name=data["agent_name"],
             pending_tool_calls=[
@@ -1707,10 +1809,71 @@ class PauseState:
             provider_kwargs={
                 k: v
                 for k, v in (data.get("provider_kwargs") or {}).items()
-                if data.get("schema_version") == 2
-                or k in {"model", "max_tokens", "temperature", "thinking", "effort"}
+                if references or k in {"model", "max_tokens", "temperature", "thinking", "effort"}
             },
         )
+
+
+MANAGED_WAIT_MAX_BYTES = 32 * 1024
+"""Upper bound of a stored v3 managed wait (references only, never history)."""
+_MANAGED_WAIT_ABSENT = ("history", "steps", "image_view")
+_MANAGED_WAIT_NONE = ("approval_gates", "pending_decisions", "clarification")
+
+
+def _compact_json_bytes(value: Any) -> int:
+    return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+
+def _managed_wait_binding(data: Any, run_id: str | None) -> ManagedWait:
+    """Validate a stored v3 managed wait's envelope; return its binding."""
+    from dendrux.errors import ManagedStateError
+
+    def invalid(reason: str = "wait_invalid") -> ManagedStateError:
+        return ManagedStateError(reason=reason, run_id=run_id)
+
+    if not isinstance(data, dict):
+        raise invalid()
+    try:
+        size = _compact_json_bytes(data)
+    except (TypeError, ValueError):
+        raise invalid() from None
+    if size > MANAGED_WAIT_MAX_BYTES:
+        raise invalid("wait_too_large")
+    envelope = data.get("managed_wait")
+    if (
+        data.get("schema_version") != MANAGED_WAIT_SCHEMA_VERSION
+        or data.get("pause_reason") != MANAGED_WAIT_REASON
+        or not isinstance(data.get("agent_name"), str)
+        or not data["agent_name"]
+        or not isinstance(data.get("pause_id"), str)
+        or not _ULID_PATTERN.fullmatch(data["pause_id"])
+        or data.get("loop_state_ref") is not True
+        or not isinstance(envelope, dict)
+        or set(envelope) != {"v", "tool_call_id", "child_run_id"}
+        or any(key in data for key in _MANAGED_WAIT_ABSENT)
+        or any(data.get(key) is not None for key in _MANAGED_WAIT_NONE)
+    ):
+        raise invalid()
+    try:
+        binding = ManagedWait(
+            tool_call_id=envelope["tool_call_id"],
+            child_run_id=envelope["child_run_id"],
+            version=envelope["v"],
+        )
+    except ValueError:
+        raise invalid() from None
+    calls = data.get("pending_tool_calls")
+    if (
+        not isinstance(calls, list)
+        or len(calls) != 1
+        or not isinstance(calls[0], dict)
+        or calls[0].get("id") != binding.tool_call_id
+        or not isinstance(calls[0].get("name"), str)
+        or calls[0].get("params") != {}
+        or data.get("pending_targets") != {binding.tool_call_id: "agent"}
+    ):
+        raise invalid()
+    return binding
 
 
 # ------------------------------------------------------------------

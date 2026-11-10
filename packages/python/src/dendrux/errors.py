@@ -125,7 +125,14 @@ def _capability_advice(capability: str) -> str:
             'replace; self.capabilities = replace(self.capabilities, deployment="single_process").'
         ),
     }
-    optional = {"fenced_writes", "retry_ids", "checkpointing", "atomic_completion", "recovery"}
+    optional = {
+        "fenced_writes",
+        "retry_ids",
+        "checkpointing",
+        "atomic_completion",
+        "recovery",
+        "managed_subagents",
+    }
     if capability in specific:
         return specific[capability]
     advice = "Copy the base store method signature, including explicit keyword-only parameters."
@@ -423,6 +430,47 @@ class StatementTooLargeError(PersistenceError):
         self.safe_message = (
             f"{sized} is larger than the server's max_allowed_packet{limit} (statement_too_large)."
         )
+        self.args = (self.safe_message,)
+
+
+class ManagedStateError(_KwargsReduceMixin, PersistenceError):
+    """Internal (0.7): persisted managed-subagent state cannot support a transition.
+
+    Raised for a malformed managed wait, a parent without its managed header,
+    a missing or conflicting binding, or a bound child run that is missing or
+    inconsistent. It never recreates or guesses state: the workflow needs
+    resolution. ``reason`` is a stable sub-code; the message carries run ids and
+    codes only, never stored text.
+    """
+
+    code = "managed_state_invalid"
+    _init_fields = ("reason", "run_id")
+    REASONS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "wait_invalid",
+            "wait_too_large",
+            "storage_format",
+            "header_invalid",
+            "pending_missing",
+            "binding_outstanding",
+            "binding_conflict",
+            "binding_missing",
+            "child_missing",
+            "child_mismatch",
+        }
+    )
+
+    def __init__(self, *, reason: str, run_id: str | None = None) -> None:
+        self.reason = reason if reason in self.REASONS else "wait_invalid"
+        self.run_id = run_id
+        _codes.log_code(
+            logging.getLogger(__name__),
+            _codes.MANAGED_STATE_INVALID,
+            run_id=run_id,
+            managed_reason=self.reason,
+        )
+        super().__init__(code=self.code)
+        self.safe_message = f"Managed subagent state is invalid ({self.reason})."
         self.args = (self.safe_message,)
 
 
