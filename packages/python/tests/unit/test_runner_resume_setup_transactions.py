@@ -129,4 +129,27 @@ async def test_resume_setup_transaction_bytes(store, monkeypatch, entry, storage
         + "\n"
     )
     expected = Path(__file__).with_name("fixtures") / f"resume_setup_{entry}_{storage_format}.json"
-    assert wire == expected.read_text()
+    expected_wire = expected.read_text()
+    if entry == "reclaim" and storage_format == 2:
+        expected_wire = _admission_before_rebuild(expected_wire)
+    assert wire == expected_wire
+
+
+def _admission_before_rebuild(recorded):
+    # Move only the existing row/verdict transactions ahead of history reads.
+    # Keep the recording and every statement/count/boundary otherwise unchanged.
+    expected = json.loads(recorded)
+    transactions = expected["transactions"]
+    assert transactions[15] == transactions[21] == "BEGIN"
+    assert transactions[17] == transactions[23] == "ROLLBACK"
+    assert transactions[16].startswith("SELECT agent_runs.id, agent_runs.tenant_id")
+    assert transactions[22].startswith("SELECT agent_runs.id, coalesce(")
+    expected["transactions"] = (
+        transactions[:5]
+        + transactions[15:18]
+        + transactions[21:24]
+        + transactions[5:15]
+        + transactions[18:21]
+        + transactions[24:]
+    )
+    return json.dumps(expected, indent=2) + "\n"

@@ -6302,8 +6302,12 @@ async def _read_resume_state(
     reclaimed: PauseState | None,
     *,
     streaming: bool = False,
+    reclaimed_record: RunRecord | None = None,
 ) -> tuple[RunRecord | None, _PauseReads, Any, PauseState, bool, Any]:
-    reads = _PauseReads(None if streaming else await store.get_run(run_id))
+    record = reclaimed_record
+    if record is None and not streaming:
+        record = await store.get_run(run_id)
+    reads = _PauseReads(record)
     raw = None if reclaimed is not None else supplied_raw
     if reclaimed is None and raw is None:
         raw = await store.get_pause_state(run_id)
@@ -6769,11 +6773,14 @@ async def _stop_marked_continuation(
     *,
     agent: Agent | None = None,
     claimed_here: bool = False,
+    admitted: bool = False,
 ) -> RunResult | None:
     from dendrux.runtime._blocked_content import _continuation_blocked
     from dendrux.types import RunResult
 
-    if not await _continuation_blocked(store, run_id, record, claimed_here=claimed_here):
+    if admitted or not await _continuation_blocked(
+        store, run_id, record, claimed_here=claimed_here
+    ):
         return None
     _codes.log_code(logger, _codes.BLOCKED_CONTENT, run_id=run_id)
     from dendrux.runtime._continuation_guardrails import _continuation_mapping
@@ -6844,6 +6851,7 @@ async def _resume_core(
     expected_pause_id: str | None = None,
     _reclaim_pause: PauseState | None = None,
     _reclaim_history: Any = None,
+    _reclaim_record: RunRecord | None = None,
     _tenant_explicit: bool | None = None,
     _raw_pause: dict[str, Any] | None = None,
 ) -> RunResult:
@@ -6888,6 +6896,7 @@ async def _resume_core(
                 expected_pause_id,
                 _raw_pause,
                 _reclaim_pause,
+                reclaimed_record=_reclaim_record,
             )
             (
                 state_store,
@@ -6932,6 +6941,7 @@ async def _resume_core(
                 pause_state,
                 agent=agent,
                 claimed_here=_claimed_in_call(state_store, run_id, skip_claim=_skip_claim),
+                admitted=_reclaim_record is not None,
             )
             if stopped is not None:
                 return stopped

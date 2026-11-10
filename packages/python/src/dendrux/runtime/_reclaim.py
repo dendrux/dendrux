@@ -58,7 +58,7 @@ async def reclaim(
     from dendrux.loops.react import ReActLoop
     from dendrux.runtime._capabilities import capabilities
     from dendrux.runtime.durability import _ownership_handoff
-    from dendrux.runtime.runner import _resume_core
+    from dendrux.runtime.runner import _resume_core, _stop_marked_continuation
     from dendrux.runtime.submit import _cancel_claim, governance_snapshot
     from dendrux.skills._session import SkillSession
 
@@ -101,6 +101,10 @@ async def reclaim(
     with session.bind():
         history_records: list[Any] = []
         async with _reclaim_setup(owned, run_id):
+            record = await owned.get_run(run_id)
+            stopped = await _stop_marked_continuation(owned, run_id, record, agent=agent)
+            if stopped is not None:
+                return _reclaimed_result(run_id, stopped)
             pause = await rebuild_pause(
                 agent, owned, run_id, claim.loop_state or {}, history_records=history_records
             )
@@ -115,10 +119,15 @@ async def reclaim(
             _skip_claim=True,
             _reclaim_pause=pause,
             _reclaim_history=history_records,
+            _reclaim_record=record,
         )
-        if result.status in TERMINAL_STATUSES:
-            _codes.log_code(logger, _codes.RUN_FINALIZED, run_id=run_id)
-        return result
+        return _reclaimed_result(run_id, result)
+
+
+def _reclaimed_result(run_id: str, result: RunResult) -> RunResult:
+    if result.status in TERMINAL_STATUSES:
+        _codes.log_code(logger, _codes.RUN_FINALIZED, run_id=run_id)
+    return result
 
 
 @asynccontextmanager
