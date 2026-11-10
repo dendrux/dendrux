@@ -492,7 +492,8 @@ async def _scan_single_incoming(
     all_in_findings: list[Any] = []
     if g_engine is None:
         return all_in_findings, None
-    if getattr(recorder, "guardrail_engine", None) is not g_engine:
+    recorder_engine: object = getattr(recorder, "guardrail_engine", None)
+    if recorder_engine is not g_engine:
         g_engine._retain_allowed_findings = True
     _in_was_redacted = False
     for msg_idx, msg in enumerate(messages):
