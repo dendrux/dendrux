@@ -58,7 +58,16 @@ _REQUIREMENTS: dict[str, dict[str, tuple[str, ...]]] = {
         "reclaim_run": (),
         "get_replayed_tool_calls": (),
     },
+    "managed_subagents": {"bind_managed_child": ()},
 }
+# Managed subagents need every durability promise the bind and adoption rely on.
+_MANAGED_PREREQUISITES = (
+    "fenced_writes",
+    "retry_ids",
+    "checkpointing",
+    "atomic_completion",
+    "recovery",
+)
 _CACHE: dict[int, tuple[weakref.ReferenceType[Any], StoreCapabilities]] = {}
 logger = logging.getLogger(__name__)
 
@@ -101,11 +110,23 @@ def validate_capabilities(store: Any) -> StoreCapabilities:
             )
             if missing:
                 _refuse(store, capability, method, missing)
+    if caps.managed_subagents:
+        absent = tuple(name for name in _MANAGED_PREREQUISITES if not getattr(caps, name))
+        if absent:
+            _refuse(store, "managed_subagents", "capabilities", absent)
     try:
         ref = weakref.ref(store, lambda _ref: _CACHE.pop(key, None))
     except TypeError:
         return caps
     _CACHE[key] = (ref, caps)
+    return caps
+
+
+def require_managed_subagents(store: Any) -> StoreCapabilities:
+    """Refuse before any managed write unless the store declares the bind capability."""
+    caps = validate_capabilities(store)
+    if not capabilities(store).managed_subagents:
+        _refuse(store, "managed_subagents", "bind_managed_child", ("bind_managed_child",))
     return caps
 
 

@@ -43,6 +43,7 @@ from dendrux.runtime._bounds import MAX_LIST_OFFSET as MAX_LIST_OFFSET
 from dendrux.types import (
     COST_DECIMALS,
     CreateRunResult,
+    PauseState,
     RunStatus,
     UsageStats,
     _usage_to_dict,
@@ -97,6 +98,8 @@ class StoreCapabilities:
     atomic_completion: bool = False
     recovery: bool = False
     deployment: Literal["single_process", "single_host", "multi_server"] | None = None
+    # Internal (0.7): atomic managed-subagent bind (``bind_managed_child``).
+    managed_subagents: bool = False
 
 
 @dataclass(frozen=True)
@@ -288,6 +291,183 @@ class EventWrite:
     data: dict[str, Any] | None
     correlation_id: str | None
     content_digest: str | None
+
+
+MANAGED_HEADER_KEY = "managed"
+"""Checkpoint key of a managed run's identity header (root, path, invocation)."""
+MANAGED_BINDING_KEY = "managed_wait"
+"""Checkpoint key of a waiting parent's one outgoing binding."""
+_MANAGED_RESERVED_KEYS = frozenset(
+    {MANAGED_HEADER_KEY, MANAGED_BINDING_KEY, "pending", "submission"}
+)
+
+
+@dataclass(frozen=True)
+class ManagedHeader:
+    """Internal (0.7): a managed run's persisted identity in its checkpoint."""
+
+    root_run_id: str
+    path: tuple[str, ...]
+    parent_run_id: str | None = None
+    tool_call_id: str | None = None
+    version: int = 1
+
+    def __post_init__(self) -> None:
+        from dendrux.types import _ULID_PATTERN
+
+        object.__setattr__(self, "path", tuple(self.path))
+        child = self.parent_run_id is not None or self.tool_call_id is not None
+        if (
+            self.version != 1
+            or not isinstance(self.root_run_id, str)
+            or not _ULID_PATTERN.fullmatch(self.root_run_id)
+            or any(not isinstance(p, str) or not p or len(p) > 255 for p in self.path)
+            or child != bool(self.path)
+            or (
+                child
+                and (
+                    not isinstance(self.parent_run_id, str)
+                    or not _ULID_PATTERN.fullmatch(self.parent_run_id)
+                    or not isinstance(self.tool_call_id, str)
+                    or not 0 < len(self.tool_call_id) <= 26
+                )
+            )
+        ):
+            raise ValueError("Invalid managed header")
+
+    def to_dict(self) -> dict[str, Any]:
+        """The stored header; a root has an empty path and no invocation."""
+        header: dict[str, Any] = {
+            "v": self.version,
+            "root_run_id": self.root_run_id,
+            "path": list(self.path),
+        }
+        if self.parent_run_id is not None:
+            header["invocation"] = {
+                "parent_run_id": self.parent_run_id,
+                "tool_call_id": self.tool_call_id,
+            }
+        return header
+
+    @classmethod
+    def from_dict(cls, value: Any, *, run_id: str) -> ManagedHeader:
+        """Strictly read the header of run ``run_id``; refuse ``header_invalid``."""
+        from dendrux.errors import ManagedStateError
+
+        try:
+            if not isinstance(value, dict) or not set(value) <= {
+                "v",
+                "root_run_id",
+                "path",
+                "invocation",
+            }:
+                raise ValueError
+            invocation = value.get("invocation")
+            if "invocation" in value and not isinstance(invocation, dict):
+                raise ValueError
+            if not isinstance(value.get("path"), list):
+                raise ValueError
+            header = cls(
+                root_run_id=value["root_run_id"],
+                path=tuple(value["path"]),
+                parent_run_id=invocation["parent_run_id"] if invocation else None,
+                tool_call_id=invocation["tool_call_id"] if invocation else None,
+                version=value["v"],
+            )
+            # A root header names its own run; a child never names itself root.
+            if (header.root_run_id == run_id) != (not header.path):
+                raise ValueError
+        except (KeyError, TypeError, ValueError):
+            raise ManagedStateError(reason="header_invalid", run_id=run_id) from None
+        return header
+
+
+@dataclass(frozen=True)
+class BindManagedChildRequest:
+    """Internal (0.7): one atomic managed-subagent bind, as typed data only."""
+
+    tenant_id: str | None
+    root_run_id: str
+    parent_run_id: str
+    parent_claim_epoch: int
+    tool_call_id: str
+    row_id: str
+    provider_tool_call_id: str | None
+    tool_name: str
+    params: dict[str, Any] | None
+    iteration_index: int
+    child_run_id: str
+    child_agent_name: str
+    child_path: tuple[str, ...]
+    child_input_data: dict[str, Any] | None
+    child_loop_state: Mapping[str, Any]
+    parent_wait: PauseState
+    parent_patch: LoopStatePatch
+    intent_event: EventWrite
+    child_seed_traces: tuple[TraceWrite, ...] = ()
+    child_model: str | None = None
+    child_strategy: str | None = None
+    child_meta: dict[str, Any] | None = None
+    child_pii_mapping: dict[str, str] | None = None
+    parent_iteration_count: int | None = None
+    parent_total_usage: UsageStats | None = None
+    max_delegation_depth: int | None = None
+
+    def __post_init__(self) -> None:
+        from dendrux.types import _ULID_PATTERN
+
+        object.__setattr__(self, "child_path", tuple(self.child_path))
+        object.__setattr__(self, "child_seed_traces", tuple(self.child_seed_traces))
+        for name in ("root_run_id", "parent_run_id", "child_run_id", "row_id"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not _ULID_PATTERN.fullmatch(value):
+                raise ValueError(f"{name} must be a run ULID")
+        if type(self.parent_claim_epoch) is not int or self.parent_claim_epoch < 0:
+            raise ValueError("parent_claim_epoch must be a non-negative int")
+        if self.tenant_id is not None and (
+            not isinstance(self.tenant_id, str) or not self.tenant_id
+        ):
+            raise ValueError("tenant_id must be a non-empty string or None")
+        if not self.child_path or any(
+            not isinstance(p, str) or not p or len(p) > 255 for p in self.child_path
+        ):
+            raise ValueError("child_path must name the registered child")
+        binding = getattr(self.parent_wait, "managed_wait", None)
+        if (
+            binding is None
+            or binding.tool_call_id != self.tool_call_id
+            or binding.child_run_id != self.child_run_id
+        ):
+            raise ValueError("parent_wait must carry this invocation's binding")
+        if _MANAGED_RESERVED_KEYS & set(self.parent_patch.set_fields) or (
+            self.tool_call_id in self.parent_patch.remove_pending
+        ):
+            raise ValueError("parent_patch must not change the binding or its pending call")
+        if MANAGED_HEADER_KEY in self.child_loop_state:
+            raise ValueError("The store writes the child's managed header")
+        if any(not isinstance(trace, TraceWrite) for trace in self.child_seed_traces):
+            raise ValueError("child_seed_traces must be TraceWrite values")
+        if self.max_delegation_depth is not None and (
+            type(self.max_delegation_depth) is not int or self.max_delegation_depth < 1
+        ):
+            raise ValueError("max_delegation_depth must be a positive int or None")
+
+
+@dataclass(frozen=True)
+class BindManagedChildResult:
+    """Internal (0.7): the bound child; ``child_claim`` only for the confirmed creator."""
+
+    outcome: Literal["created", "existing"]
+    child_run_id: str
+    parent_wait_id: str | None
+    child_claim: ClaimResult | None
+
+    def __post_init__(self) -> None:
+        # Execution authority goes to the confirmed creator only, never a read-back.
+        if (self.outcome == "created") != isinstance(self.child_claim, ClaimResult) or (
+            self.outcome not in ("created", "existing")
+        ):
+            raise ValueError("Only a created binding carries the child's execution token")
 
 
 @dataclass(frozen=True)

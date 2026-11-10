@@ -283,3 +283,192 @@ def test_managed_wait_binding_is_immutable_and_validated():
         ManagedWait(tool_call_id="c1", child_run_id="not-a-ulid")
     with pytest.raises(ValueError):
         ManagedWait(tool_call_id="", child_run_id=generate_ulid())
+
+
+# ---------------------------------------------------------------------------
+# Store protocol and the managed capability (T2a)
+# ---------------------------------------------------------------------------
+
+
+def _bind_request(**overrides):
+    from dendrux.runtime.state import BindManagedChildRequest, EventWrite, LoopStatePatch
+
+    root = overrides.pop("root_run_id", generate_ulid())
+    call_id = overrides.pop("tool_call_id", generate_ulid())
+    child = overrides.pop("child_run_id", generate_ulid())
+    fields = dict(
+        tenant_id="t1",
+        root_run_id=root,
+        parent_run_id=root,
+        parent_claim_epoch=0,
+        tool_call_id=call_id,
+        row_id=generate_ulid(),
+        provider_tool_call_id="p1",
+        tool_name="reviewer",
+        params={"task": "review"},
+        iteration_index=1,
+        child_run_id=child,
+        child_agent_name="reviewer",
+        child_path=("reviewer",),
+        child_input_data={"input": "review"},
+        child_loop_state={"v": 1, "loop": "react"},
+        parent_wait=managed_wait_pause(call_id=call_id, child_run_id=child),
+        parent_patch=LoopStatePatch(),
+        intent_event=EventWrite(
+            generate_ulid(), "tool.started", 1, {"tool": "reviewer"}, None, None
+        ),
+    )
+    fields.update(overrides)
+    return BindManagedChildRequest(**fields)
+
+
+def test_bind_request_and_result_are_typed_and_immutable():
+    from dataclasses import FrozenInstanceError
+
+    from dendrux.runtime.state import BindManagedChildResult, ClaimResult
+
+    request = _bind_request(child_path=["reviewer"], child_seed_traces=[])
+    assert request.child_path == ("reviewer",) and request.child_seed_traces == ()
+    with pytest.raises(FrozenInstanceError):
+        request.child_run_id = generate_ulid()  # type: ignore[misc]
+    result = BindManagedChildResult(
+        outcome="created",
+        child_run_id=request.child_run_id,
+        parent_wait_id=request.parent_wait.pause_id,
+        child_claim=ClaimResult(0, 2, {}, None),
+    )
+    with pytest.raises(FrozenInstanceError):
+        result.child_claim = None  # type: ignore[misc]
+    with pytest.raises(ValueError):
+        BindManagedChildResult(
+            outcome="existing",
+            child_run_id=request.child_run_id,
+            parent_wait_id=None,
+            child_claim=ClaimResult(0, 2, {}, None),
+        )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"child_run_id": "not-a-ulid"},
+        {"parent_run_id": "x"},
+        {"root_run_id": ""},
+        {"parent_claim_epoch": -1},
+        {"parent_claim_epoch": True},
+        {"tenant_id": ""},
+        {"child_path": ()},
+        {"child_path": ("",)},
+        {"row_id": "x"},
+        {"max_delegation_depth": 0},
+    ],
+    ids=lambda o: next(iter(o)),
+)
+def test_bind_request_refuses_invalid_identity(overrides):
+    with pytest.raises(ValueError):
+        _bind_request(**overrides)
+
+
+def test_bind_request_requires_the_wait_to_carry_this_binding():
+    other = managed_wait_pause()
+    with pytest.raises(ValueError):
+        _bind_request(parent_wait=other)
+    unbound = managed_wait_pause()
+    unbound.managed_wait = None
+    with pytest.raises(ValueError):
+        _bind_request(parent_wait=unbound)
+
+
+@pytest.mark.parametrize("key", ["managed", "managed_wait", "submission", "pending"])
+def test_bind_request_refuses_a_patch_of_reserved_checkpoint_keys(key):
+    from dendrux.runtime.state import LoopStatePatch
+
+    with pytest.raises(ValueError):
+        _bind_request(parent_patch=LoopStatePatch(set_fields={key: None}))
+
+
+def test_managed_header_round_trip_and_refusals():
+    from dendrux.runtime.state import ManagedHeader
+
+    root_id, child_id, call_id = generate_ulid(), generate_ulid(), generate_ulid()
+    root = ManagedHeader(root_run_id=root_id, path=())
+    assert ManagedHeader.from_dict(root.to_dict(), run_id=root_id) == root
+    child = ManagedHeader(root_id, ("reviewer",), parent_run_id=root_id, tool_call_id=call_id)
+    assert ManagedHeader.from_dict(child.to_dict(), run_id=child_id) == child
+    bad = [
+        None,
+        {},
+        {**root.to_dict(), "v": 2},
+        root.to_dict(),  # a root header read on a different run
+        {**child.to_dict(), "invocation": None},
+        {**child.to_dict(), "path": "reviewer"},
+        {**root.to_dict(), "invocation": {"parent_run_id": root_id, "tool_call_id": call_id}},
+    ]
+    for value in bad:
+        with pytest.raises(ManagedStateError) as refused:
+            ManagedHeader.from_dict(value, run_id=child_id)
+        assert refused.value.reason == "header_invalid"
+
+
+def test_capability_is_conservative():
+    from dendrux.runtime.state import StoreCapabilities
+
+    assert StoreCapabilities().managed_subagents is False
+
+
+class _DeclaredWithoutBind:
+    from dendrux.runtime.state import StoreCapabilities as _Caps
+
+    capabilities = _Caps(fenced_writes=False, managed_subagents=True, deployment="single_process")
+
+
+def test_misdeclared_managed_capability_is_refused():
+    from dendrux.errors import StoreCapabilityError
+    from dendrux.runtime._capabilities import validate_capabilities
+
+    with pytest.raises(StoreCapabilityError) as refused:
+        validate_capabilities(_DeclaredWithoutBind())
+    assert refused.value.capability == "managed_subagents"
+    assert refused.value.method == "bind_managed_child"
+
+
+async def test_prerequisites_are_required_for_the_managed_capability():
+    from dendrux.errors import StoreCapabilityError
+    from dendrux.runtime._capabilities import validate_capabilities
+    from dendrux.runtime.state import StoreCapabilities
+
+    class Partial:
+        capabilities = StoreCapabilities(managed_subagents=True, deployment="single_process")
+
+        async def bind_managed_child(self, request):
+            raise AssertionError("never called")
+
+    with pytest.raises(StoreCapabilityError) as refused:
+        validate_capabilities(Partial())
+    assert refused.value.capability == "managed_subagents"
+    assert set(refused.value.missing) == {
+        "fenced_writes",
+        "retry_ids",
+        "checkpointing",
+        "atomic_completion",
+        "recovery",
+    }
+
+
+async def test_store_without_capability_refuses_before_any_managed_write():
+    from dendrux.errors import StoreCapabilityError
+    from dendrux.runtime._capabilities import require_managed_subagents
+
+    calls = []
+
+    class Legacy:
+        async def bind_managed_child(self, request):
+            calls.append(request)
+
+        async def create_run(self, *args, **kwargs):
+            calls.append("create_run")
+
+    with pytest.raises(StoreCapabilityError) as refused:
+        require_managed_subagents(Legacy())
+    assert refused.value.capability == "managed_subagents"
+    assert calls == []
