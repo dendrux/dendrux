@@ -572,6 +572,8 @@ Start a fresh run that reuses an existing terminal run's input and approximate p
 
 Retrying a successful ReAct run omits its old final answer so the model generates another, while retaining earlier user/tool context, valid call/result pairs and applicable reasoning. JSON-formatted answers follow the same rule. Retry creates a new run with fresh iteration and usage counters and leaves the source unchanged. Ordinary `runs=` replay still includes successful answers. `SingleCall` retry is unsupported. A genuinely empty new completion still raises `ProviderResponseError(provider_code="empty_completion", retryable=False)`.
 
+Retry refuses blocked history. If the retried run, or any run it replayed with `runs=`, holds content that a guardrail blocked, `retry` raises `ReplayRunError` with `reason="blocked_content"` and the detail "Source history contains blocked content; start a new run with clean input." The check follows the scope and status checks and happens before a run is created or a model is called. It costs one extra lookup. The error carries the identified run's ID, and the code `blocked_content` is logged with that ID only. A retry copy that was made before 0.6.1 from a blocked run is not refused. A `runs=` list passed to `run` or `stream` omits blocked runs instead and adds a notice to `ReplaySummary.warnings`; see [Run replay](/docs/recipes/run-replay#blocked-runs-are-not-replayed).
+
 ## `close`
 
 [//]: # "docs-test: skip - API signature listing, not runnable code"

@@ -113,6 +113,75 @@ Custom recovery-capable stores must implement these resets in the same atomic wr
 
 `agent.retry` on a successful ReAct run now omits only the prior final answer, retaining earlier user/tool context, valid call/result pairs and applicable reasoning. JSON-formatted answers follow the same rule. It creates a new run with fresh iteration/usage counters and leaves the source unchanged. Ordinary `runs=` replay still retains successful answers. `SingleCall` retry remains unsupported, and a genuinely empty new completion still raises the existing non-retryable `empty_completion` error. See [Retry versus replay](/docs/recipes/run-replay#retry-versus-replay).
 
+## Blocked text is stored as a placeholder
+
+A guardrail with `action="block"` (and any text a guardrail cannot scan under `block` or `redact`) now stops the text before it is stored. Dendrux writes a placeholder such as `[blocked: 1 finding]` or `[blocked: 2 findings]` in its place. The placeholder has no matched value and no reversible mapping, and its spelling is not proof that a run was blocked: the proof is a permanent mark on the run.
+
+What this changes for a blocked message:
+
+- **Stored text.** Initial input, explicit `history=`, context blocks, tool results, human replies, rejection and per-call decision reasons and notes are stored as the placeholder, in the run row, traces, events and seed copies. Hashes, previews and request identities are computed from the placeholder, never from the rejected text. With `idempotency_key`, two blocked requests whose text differs but projects to the same placeholders can return the same blocked run. Unblocked requests keep their identity.
+- **`pii_mapping`.** A blocked message adds nothing to the mapping, so a blocked run returns an empty `pii_mapping` for that message. Reversible redaction of text that was not blocked is unchanged.
+- **SingleCall.** `SingleCall` runs now scan outgoing tool-call parameters, as ReAct runs do.
+- **Outgoing responses.** When a guardrail blocks the model's response, the stored copy keeps the placeholder only. The raw response, provider request and reasoning for that step are dropped from the stored evidence.
+- **Context blocks.** A blocked context block is stored as a plain placeholder block: its kind, source and metadata are removed, because they can hold a second copy of the text.
+- **Result.** An initial block still returns `status="error"` with `failure_reason="guardrail_blocked"`, a safe `error`, the `guardrail.blocked` and `run.error` events and zero provider calls.
+
+### Continuing, retrying and replaying blocked history
+
+- **Continuation.** A run that carries the block mark and is not finished stops when you resume, submit to, or reclaim it. The result has status `error` and `failure_reason="guardrail_blocked"`, with the `run.error` event and no provider or tool calls. A block found during that call keeps the guardrail's own safe message; a mark left by an earlier call reports "Run stopped because it contains blocked content." A run another worker already finished is not overwritten.
+- **Retry.** `agent.retry()` raises `ReplayRunError` with `reason="blocked_content"` when the run, or any run it replayed with `runs=`, is identified as blocked. The detail is "Source history contains blocked content; start a new run with clean input." The error is raised before a run is created or a model is called, and carries the run ID of the identified history. Ask the user for clean input instead of retrying.
+- **Replay.** `runs=` omits the whole identified run, including its context, tools and reasoning, and keeps the rest. `ReplaySummary.warnings` gains `Run <run id> omitted because it contains blocked content; prior effects may have occurred.` Show it to users: omitting a run does not undo anything it did. If every run is omitted, the new run starts from the fresh input alone.
+- **Recovery.** Reclaiming an interrupted run with an unresolved tool call now holds its unexecuted tool siblings behind the approval gate until the gate is decided. The run returns `waiting_approval` with every held call, and no held call starts before the decision. Declining the batch denies all held calls; denying one call still lets the ungated siblings run after the decision. Client-tool siblings go to the client pause, not to server dispatch.
+- **Log code.** The new log code `blocked_content` carries the run ID only. It fires when a retry is refused, a replay omits a run or a continuation stops.
+
+### Cost
+
+Retry costs one extra lookup before the new run is created. Recovery runs one extra indexed lookup per reclaim. Neither lookup loads history. There is no new table, column, status or event.
+
+### Custom stores
+
+A custom store must keep the block mark together with the placeholder it describes, through the existing run metadata and evidence methods. A store that cannot keep the blocked mark fails closed: the blocked write is refused with `PersistenceError`, so the run keeps only its clean history, and a later retry sends only that clean history. Native SQLAlchemy stores write the mark and the placeholder in one transaction.
+
+### Roll out writers before you accept protected content
+
+Finish or stop old writers before you accept protected content on 0.6.1, and upgrade readers before you reuse history. A mixed fleet still has 0.6.0 behaviour on every old process: it stores raw text and replays it. Installing 0.6.1 on one process does not protect the others.
+
+### Find known affected runs
+
+0.6.1 does not erase anything written earlier. Runs that 0.6.0 already blocked are recognizable by their failure reason or a `guardrail.blocked` event. This paged query lists them. Bind an authorized tenant, start `after_id` as the empty string, and pass the last ID of each page as the next `after_id`:
+
+```sql
+SELECT r.id FROM agent_runs AS r
+WHERE r.tenant_id = :tenant_id AND r.id > :after_id
+  AND (r.failure_reason = 'guardrail_blocked' OR EXISTS (
+    SELECT 1 FROM run_events AS e
+    WHERE e.agent_run_id = r.id AND e.event_type = 'guardrail.blocked'))
+ORDER BY r.id LIMIT 1000;
+```
+
+For explicitly untenanted data, use this form and bind only `after_id` (this avoids ambiguous null parameter typing; a MySQL adapter that intends to bind null can use the null-safe `<=>` operator instead):
+
+```sql
+SELECT r.id FROM agent_runs AS r
+WHERE r.tenant_id IS NULL AND r.id > :after_id
+  AND (r.failure_reason = 'guardrail_blocked' OR EXISTS (
+    SELECT 1 FROM run_events AS e
+    WHERE e.agent_run_id = r.id AND e.event_type = 'guardrail.blocked'))
+ORDER BY r.id LIMIT 1000;
+```
+
+The query is incomplete. Raw text committed before a verdict, and copies made by later retries and replays, can be missed, and absence from the list does not show that a run is safe.
+
+### Limits of this release
+
+- Model reasoning text is not scanned in 0.6.1. A secret that appears only in reasoning is stored as the model produced it. Scanning reasoning is planned for 0.7.
+- Histories copied before 0.6.1 are not cleaned. That includes retry copies made from a blocked run: only the retried run and its `runs=` sources are checked, so retrying such a copy is not refused.
+- Skill body digests (a sha256 of each skill body) stay in run metadata, events and spans. They identify the skill definition and are not removed.
+- A custom store that cannot keep the blocked mark fails closed with `PersistenceError`, as described above. It cannot offer the retry refusal or the replay omission for that run.
+- Installing 0.6.1 erases no old rows, raw-derived fingerprints, backups, exports or logs, and ships no cleanup command or trust-history flag. Review uncertain history before reusing it; scrub, delete or rebuild it as appropriate. Image bytes keep their existing blob-store retention.
+
+Tool effects are not exactly once without application idempotency, and a stopped run keeps the effects it already had.
+
 ## Do not run old Dendrux migration tools after the rename
 
 Once Dendrux history lives in `dendrux_alembic_version`, use the 0.6.1 migration environment for every Dendrux migration job and operator command. Older tools look for `alembic_version` and can mistake the database's history. Keep application Alembic configuration separate. Restore a compatible backup to roll back a migration; do not rename stamps back or run old Dendrux tools against the renamed history.

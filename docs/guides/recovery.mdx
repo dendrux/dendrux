@@ -103,6 +103,14 @@ An uncertain non-idempotent call pauses with an approval gate whose source is `r
 
 Use the normal `submit_approval` method and the current `pause_id`. Approval permits one further attempt. Denial records `outcome="unknown"` and a failed observation with code `outcome_unknown`; it does not claim the original effect failed. A second crash during the approved attempt can require a new decision. Ordinary validation, deny rules and tool limits still apply.
 
+### Unexecuted siblings wait for the decision
+
+A model step can request several tool calls at once, and one of them can need approval. When recovery finds such a batch with a gate that has no stored decision, it resolves the whole batch before it runs anything. Calls that already completed keep their stored observations. Every unexecuted sibling is held behind the approval gate, whether or not the sibling is gated itself, and none of them gets a started intent before the decision.
+
+The run returns durable `waiting_approval` with all held calls and a current `pause_id`. Only the genuinely gated calls are in the gate set, so approval prompts show what needs a decision. Declining the whole batch denies every held call. Denying one call still lets the ungated siblings run after the decision. A client-tool sibling goes to the `waiting_client_tool` pause, not to server dispatch. Approvals that were committed for calls that had not started before the crash are respected and are not asked for again. A second crash while the batch is held leaves the same result. The `recovery` gate source and `replay_after_crash` reason still describe uncertain non-idempotent calls.
+
+A run that carries the blocked-content mark does not reach any of this. Reclaiming it finalizes it as `error` with `failure_reason="guardrail_blocked"` and makes no provider or tool call; see [Blocked text is stored as a placeholder](/docs/architecture/guardrails#blocked-text-is-stored-as-a-placeholder). That check is one extra indexed lookup per reclaim.
+
 If recovery honors `request_pause`, the durable result is `paused`. Continue with `submit_resume`, `resume`, or an allowed `resume_stream`. Unresolved approval-gated calls then return `waiting_approval` with a fresh `pause_id`; use that current token for the approval decision. Repeated requested pauses preserve the unresolved calls, and cancellation wins over a pause. Resuming a requested pause does not grant approval.
 
 ## Inspect a recovered run

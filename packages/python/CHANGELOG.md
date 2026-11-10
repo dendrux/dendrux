@@ -23,6 +23,33 @@ steps and compatibility changes. Default automatic SQLite needs no migration com
   history. Use 0.6.1 tools after adoption and explicit `alembic stamp` for verified
   operator repair. Conflicting histories are refused without changing application rows.
 
+- Replace guardrail-blocked text with a placeholder such as `[blocked: 1 finding]` before it
+  is stored, including the request hashes and identities derived from it, and mark the run
+  permanently. A blocked run returns an empty `pii_mapping` for the blocked message. A
+  `SingleCall` agent now scans outgoing tool-call parameters. A blocked outgoing response
+  stores the placeholder and drops its raw response, provider request and reasoning. A
+  blocked context block loses its kind, source and metadata. Unblocked reversible
+  redaction is unchanged.
+- Refuse `agent.retry()` of a run whose history holds blocked content (the retried run or
+  any `runs=` source): it raises `ReplayRunError` with `reason="blocked_content"` before a
+  run is created. `runs=` replay omits the whole blocked run and adds a notice to
+  `ReplaySummary.warnings`. Show it: omission does not undo earlier tool effects. The new
+  log code `blocked_content` carries the run ID only.
+- Stop a marked run that is still unfinished when it is resumed, submitted to or reclaimed:
+  it ends as `error` with `failure_reason="guardrail_blocked"` and makes no provider or tool
+  call. Retry costs one extra lookup and recovery runs one extra indexed lookup per reclaim.
+- Hold the unexecuted tool siblings of an unresolved approval gate behind the approval gate
+  during recovery. The run returns `waiting_approval` with every held call, and none starts
+  before the decision.
+- A custom store that cannot keep the blocked mark fails closed with `PersistenceError`, so
+  the run keeps only its clean history and a later retry sends only that history.
+- Limits: model reasoning text is not scanned in 0.6.1 (planned for 0.7); histories copied
+  before 0.6.1 are not cleaned, including retry copies made from a blocked run, which a
+  retry does not refuse; skill body digests remain in metadata. Finish old writers before
+  accepting protected content and upgrade readers before reusing history: a mixed fleet
+  keeps 0.6.0 behaviour on its old processes. The upgrade guide has a paged query for known
+  affected runs and the full list of limits.
+
 ### Fixed
 
 - Continuing a requested pause during recovery reaches the required approval pause
