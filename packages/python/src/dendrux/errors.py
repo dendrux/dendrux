@@ -38,6 +38,7 @@ Suggested HTTP mappings:
     ContentFilteredError        -> 422
     BudgetConfigurationError    -> 500 (configuration)
     TenantScopeRequiredError    -> 500 (configuration: pass tenant_id)
+    SubagentConfigurationError  -> 500 (configuration: raised when an Agent is built)
     NoteLimitExceededError      -> 429 or 409 (too many notes on this run)
     GovernanceMismatchError     -> 409
     BlobNotFoundError           -> 404
@@ -1322,6 +1323,163 @@ class GovernanceMismatchError(_KwargsReduceMixin, RuntimeError):
         )
 
 
+# ---------------------------------------------------------------------------
+# Subagents (0.7)
+# ---------------------------------------------------------------------------
+
+
+class SubagentConfigurationError(_KwargsReduceMixin, ValueError):
+    """An ``Agent(subagents=...)`` configuration was refused when the Agent was built.
+
+    Base of the subagent configuration errors. Subclasses ``ValueError`` like the
+    other Agent configuration errors, so existing ``except ValueError`` keeps
+    working. ``code`` is a stable diagnostic code, also logged when raised.
+    ``agent_name`` names the agent whose ``subagents`` list was refused,
+    ``reason`` is a stable sub-code, ``subagent_name`` the offending subagent
+    when its name is valid, and ``index`` its position in the list when known.
+    Messages carry agent names only, never prompts or descriptions.
+    """
+
+    code: ClassVar[str] = "subagent_invalid"
+    _init_fields: tuple[str, ...] = ("agent_name", "reason", "subagent_name", "index")
+    _messages: ClassVar[dict[str, str]] = {}
+
+    def __init__(
+        self,
+        agent_name: str,
+        *,
+        reason: str,
+        subagent_name: str | None = None,
+        index: int | None = None,
+    ) -> None:
+        self.agent_name = agent_name
+        self.reason = reason
+        self.subagent_name = subagent_name
+        self.index = index
+        super().__init__(self._message())
+
+    def _message(self) -> str:
+        template = self._messages.get(
+            self.reason, "Agent '{agent}' has an invalid subagents configuration ({reason})."
+        )
+        return template.format(
+            agent=self.agent_name, name=self.subagent_name, index=self.index, reason=self.reason
+        )
+
+
+class SubagentDefinitionError(SubagentConfigurationError):
+    """A ``subagents`` entry is not a usable subagent definition.
+
+    ``reason``: ``"not_a_list"``, ``"not_agent"``, ``"invalid_name"`` (a subagent
+    name is 1 to 64 ASCII letters, digits or underscores and does not start with a
+    digit), ``"missing_description"`` or ``"single_call_parent"`` (a SingleCall
+    agent cannot call tools, so it cannot have subagents).
+    """
+
+    code: ClassVar[str] = "subagent_invalid"
+    _messages: ClassVar[dict[str, str]] = {
+        "not_a_list": "Agent '{agent}' subagents must be a list of Agent instances.",
+        "not_agent": "Agent '{agent}' subagents[{index}] is not an Agent instance.",
+        "invalid_name": (
+            "Agent '{agent}' subagents[{index}] has an invalid name. A subagent name is "
+            "1 to 64 ASCII letters, digits or underscores and does not start with a digit."
+        ),
+        "missing_description": (
+            "Agent '{agent}' subagent '{name}' needs a non-empty description: "
+            "it tells the model when to call it."
+        ),
+        "single_call_parent": (
+            "Agent '{agent}' uses SingleCall loop but has subagents. SingleCall agents "
+            "cannot call tools; use ReActLoop."
+        ),
+    }
+
+
+class SubagentNameConflictError(SubagentConfigurationError):
+    """Two of an agent's direct subagents share a name, or one shares a tool's name.
+
+    ``reason``: ``"duplicate_name"`` or ``"tool_name_clash"``. Names are unique per
+    parent only; the same name may appear under different parents.
+    """
+
+    code: ClassVar[str] = "subagent_name_conflict"
+    _messages: ClassVar[dict[str, str]] = {
+        "duplicate_name": "Agent '{agent}' has two subagents named '{name}'.",
+        "tool_name_clash": (
+            "Agent '{agent}' subagent '{name}' has the same name as one of the agent's tools."
+        ),
+    }
+
+
+class SubagentCycleError(SubagentConfigurationError):
+    """A subagent is its own ancestor on some path of the tree (object identity).
+
+    The same Agent may appear at several different paths; only a cycle is refused.
+    """
+
+    code: ClassVar[str] = "subagent_cycle"
+    _init_fields = ("agent_name", "subagent_name")
+    _messages: ClassVar[dict[str, str]] = {
+        "cycle": "Agent '{agent}' subagent '{name}' is already its own ancestor (a cycle).",
+    }
+
+    def __init__(self, agent_name: str, *, subagent_name: str | None) -> None:
+        super().__init__(agent_name, reason="cycle", subagent_name=subagent_name)
+
+
+class SubagentDepthError(SubagentConfigurationError):
+    """A subagent sits deeper than the effective ``max_delegation_depth`` (root = 0).
+
+    ``depth`` is the subagent's depth below the root and ``max_depth`` the
+    ceiling that applies there (a child's own limit can only tighten it).
+    """
+
+    code: ClassVar[str] = "subagent_too_deep"
+    _init_fields = ("agent_name", "subagent_name", "depth", "max_depth")
+    _messages: ClassVar[dict[str, str]] = {
+        "too_deep": (
+            "Agent '{agent}' subagent '{name}' is at delegation depth {depth}, above "
+            "max_delegation_depth={max_depth}."
+        ),
+    }
+
+    def __init__(
+        self, agent_name: str, *, subagent_name: str | None, depth: int, max_depth: int
+    ) -> None:
+        self.depth = depth
+        self.max_depth = max_depth
+        super().__init__(agent_name, reason="too_deep", subagent_name=subagent_name)
+
+    def _message(self) -> str:
+        return self._messages["too_deep"].format(
+            agent=self.agent_name,
+            name=self.subagent_name,
+            depth=self.depth,
+            max_depth=self.max_depth,
+        )
+
+
+class SubagentTreeTooLargeError(SubagentConfigurationError):
+    """The subagent tree has more nodes than ``max_nodes`` (counted per path).
+
+    The same Agent reused at several paths counts once per path, so a small set
+    of objects that fans out exponentially is refused instead of walked.
+    """
+
+    code: ClassVar[str] = "subagent_tree_too_large"
+    _init_fields = ("agent_name", "max_nodes")
+    _messages: ClassVar[dict[str, str]] = {
+        "too_large": "Agent '{agent}' subagent tree has more than {max_nodes} nodes.",
+    }
+
+    def __init__(self, agent_name: str, *, max_nodes: int) -> None:
+        self.max_nodes = max_nodes
+        super().__init__(agent_name, reason="too_large")
+
+    def _message(self) -> str:
+        return self._messages["too_large"].format(agent=self.agent_name, max_nodes=self.max_nodes)
+
+
 class RunFencedError(_KwargsReduceMixin, RuntimeError):
     """Internal: this worker lost its claim on the run (a newer claim epoch exists).
 
@@ -1386,6 +1544,12 @@ __all__ = [
     "SkillMissingError",
     "SkillValidationError",
     "SqliteSchemaSyncError",
+    "SubagentConfigurationError",
+    "SubagentCycleError",
+    "SubagentDefinitionError",
+    "SubagentDepthError",
+    "SubagentNameConflictError",
+    "SubagentTreeTooLargeError",
     "SubtreeTooLargeError",
     "TIMEOUT_REASONS",
     "TenantScopeRequiredError",

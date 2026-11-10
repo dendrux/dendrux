@@ -816,6 +816,54 @@ PROVIDER_KWARGS_TOO_LARGE = Code(
     "Provider options exceed the checkpoint byte bound.",
     "Reduce provider options.",
 )
+SUBAGENT_INVALID = Code(
+    "subagent_invalid",
+    logging.WARNING,
+    "subagent",
+    _BASE_FIELDS | frozenset([]),
+    "An Agent is built with a subagents entry that is not a usable subagent.",
+    "Pass Agent instances with a valid name and a non-empty description.",
+)
+SUBAGENT_NAME_CONFLICT = Code(
+    "subagent_name_conflict",
+    logging.WARNING,
+    "subagent",
+    _BASE_FIELDS | frozenset([]),
+    "An Agent is built with two subagents of one name, or a subagent named like a tool.",
+    "Rename the subagent or the tool.",
+)
+SUBAGENT_CYCLE = Code(
+    "subagent_cycle",
+    logging.WARNING,
+    "subagent",
+    _BASE_FIELDS | frozenset([]),
+    "An Agent is built with a subagent that is its own ancestor.",
+    "Remove the cycle from the subagent tree.",
+)
+SUBAGENT_TOO_DEEP = Code(
+    "subagent_too_deep",
+    logging.WARNING,
+    "subagent",
+    _BASE_FIELDS | frozenset(["count", "limit"]),
+    "An Agent is built with a subagent deeper than the delegation depth ceiling.",
+    "Flatten the tree or raise max_delegation_depth.",
+)
+SUBAGENT_TREE_TOO_LARGE = Code(
+    "subagent_tree_too_large",
+    logging.WARNING,
+    "subagent",
+    _BASE_FIELDS | frozenset(["limit"]),
+    "An Agent is built with a subagent tree over the node bound.",
+    "Reduce the subagent tree; a reused agent counts once per path.",
+)
+SUBAGENT_FANOUT = Code(
+    "subagent_fanout",
+    logging.WARNING,
+    "subagent",
+    _BASE_FIELDS | frozenset(["count", "limit"]),
+    "An Agent is built with more than ten direct subagents.",
+    "Group related subagents under a lead; the model chooses less well among many.",
+)
 LEASE_INTERVAL = Code(
     "lease_interval",
     logging.WARNING,
@@ -2001,6 +2049,12 @@ REGISTRY = MappingProxyType(
             PROVIDER_KWARGS_INVALID,
             PROVIDER_KWARGS_TOO_LARGE,
             LEASE_INTERVAL,
+            SUBAGENT_INVALID,
+            SUBAGENT_NAME_CONFLICT,
+            SUBAGENT_CYCLE,
+            SUBAGENT_TOO_DEEP,
+            SUBAGENT_TREE_TOO_LARGE,
+            SUBAGENT_FANOUT,
             CHECKPOINT_TOO_LARGE,
             REWRITE_INVALID,
             WRITE_CONFLICT,

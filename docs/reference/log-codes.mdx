@@ -228,6 +228,17 @@ Missing or invalid codes remain unset. Category and HTTP status remain independe
 | `store_statement_limit` | WARNING | `bytes`, `code`, `kind`, `limit`, `run_id`, `tenant_id` | A configured limit or a statement is larger than the database accepts. | Lower the Agent's Limits, shrink the payload or raise the server's max_allowed_packet. |
 | `write_conflict` | WARNING | `code`, `count`, `kind`, `run_id`, `table`, `tenant_id` | A retried identity has conflicting content. | Inspect writer consistency; do not retry blindly. |
 
+## Subagent
+
+| Code | Level | Fields | Fires when | Do |
+| --- | --- | --- | --- | --- |
+| `subagent_cycle` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | An Agent is built with a subagent that is its own ancestor. | Remove the cycle from the subagent tree. |
+| `subagent_fanout` | WARNING | `code`, `count`, `kind`, `limit`, `run_id`, `tenant_id` | An Agent is built with more than ten direct subagents. | Group related subagents under a lead; the model chooses less well among many. |
+| `subagent_invalid` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | An Agent is built with a subagents entry that is not a usable subagent. | Pass Agent instances with a valid name and a non-empty description. |
+| `subagent_name_conflict` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | An Agent is built with two subagents of one name, or a subagent named like a tool. | Rename the subagent or the tool. |
+| `subagent_too_deep` | WARNING | `code`, `count`, `kind`, `limit`, `run_id`, `tenant_id` | An Agent is built with a subagent deeper than the delegation depth ceiling. | Flatten the tree or raise max_delegation_depth. |
+| `subagent_tree_too_large` | WARNING | `code`, `kind`, `limit`, `run_id`, `tenant_id` | An Agent is built with a subagent tree over the node bound. | Reduce the subagent tree; a reused agent counts once per path. |
+
 ## Tool
 
 | Code | Level | Fields | Fires when | Do |
