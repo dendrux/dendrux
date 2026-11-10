@@ -144,18 +144,21 @@ def _mysql_active(conn: Connection) -> bool:
 
 
 def _require_current(conn: Connection) -> None:
-    from alembic.script import ScriptDirectory
-
-    head = ScriptDirectory(str(Path(__file__).parent / "migrations")).get_current_head()
-    if inspect(conn).has_table("alembic_version"):
-        revision = conn.execute(
-            text("SELECT version_num FROM alembic_version")
-        ).scalar_one_or_none()
-        if revision != head:
-            raise RuntimeError("Database check is not current. Run `dendrux db migrate` first.")
+    _require_current_history(conn)
     problems = schema_problems(conn)
     if problems:
         raise RuntimeError("Database check is not current: " + ", ".join(problems))
+
+
+def _require_current_history(conn: Connection) -> None:
+    from alembic.script import ScriptDirectory
+
+    head = ScriptDirectory(str(Path(__file__).parent / "migrations")).get_current_head()
+    from dendrux.db._version_table import read_history
+
+    history = read_history(conn)
+    if history.needs_adoption or (history.revision is not None and history.revision != head):
+        raise RuntimeError("Database check is not current. Run `dendrux db migrate` first.")
 
 
 def _checkpoint(conn: Connection, table: str, cursor: str) -> None:

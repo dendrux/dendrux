@@ -176,7 +176,7 @@ async def test_exclusive_migration_lock_timeout_is_retryable(engine, phase, reco
         async with target.connect() as conn:
             expected = "e8f9a0b1c2d3" if phase == "drop_column" else "d7e8f9a0b1c2"
             assert (
-                await conn.execute(text("SELECT version_num FROM alembic_version"))
+                await conn.execute(text("SELECT version_num FROM dendrux_alembic_version"))
             ).scalar_one() == expected
             assert (await conn.execute(text("SELECT count(*) FROM agent_runs"))).scalar_one() == 20
         # Resume precisely the failed operation, including committed earlier steps.
@@ -207,7 +207,7 @@ async def test_exclusive_migration_lock_timeout_is_retryable(engine, phase, reco
                 )
             ).scalar_one() == 0
             assert (
-                await conn.execute(text("SELECT version_num FROM alembic_version"))
+                await conn.execute(text("SELECT version_num FROM dendrux_alembic_version"))
             ).scalar_one() == "f9a0b1c2d3e4"
             assert (
                 await conn.execute(
@@ -253,7 +253,7 @@ async def test_later_downgrade_refusal_rolls_back_clock_removal(engine):
                 "a later downgrade refusal must roll back status-clock removal"
             )
             assert (
-                await conn.execute(text("SELECT version_num FROM alembic_version"))
+                await conn.execute(text("SELECT version_num FROM dendrux_alembic_version"))
             ).scalar_one() == "e8f9a0b1c2d3"
         async with target.begin() as conn:
             await conn.execute(

@@ -258,7 +258,13 @@ def _apply_loop_patch(current: dict[str, Any], patch: LoopStatePatch) -> dict[st
 
 @dataclass(frozen=True)
 class TraceWrite:
-    """Caller-owned trace identity for a transactional write."""
+    """Caller-owned trace identity for a transactional write.
+
+    ``advances_progress=False`` identifies reused evidence. Recovery stores reset
+    the streak only for newly committed advancing assistant/tool turns, never
+    for replayed observations, seed/rewrite traces or duplicate trace identities.
+    This hint is not part of the persisted trace or its content digest.
+    """
 
     trace_id: str
     role: str
@@ -269,6 +275,7 @@ class TraceWrite:
     blob_refs: Sequence[BlobEdge] | None = None
     blob_refs_scope: str | None = None
     content_digest: str | None = None
+    advances_progress: bool = True
 
 
 @dataclass(frozen=True)

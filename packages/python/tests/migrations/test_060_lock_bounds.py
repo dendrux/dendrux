@@ -92,7 +92,7 @@ async def test_060_each_step_is_lock_bounded(pg_test_url, action, table, column)
             event.remove(engine.sync_engine.__class__, "before_cursor_execute", capture)
         async with engine.connect() as conn:
             assert (
-                await conn.execute(text("SELECT version_num FROM alembic_version"))
+                await conn.execute(text("SELECT version_num FROM dendrux_alembic_version"))
             ).scalar_one() == (PRIOR if action == "upgrade" else HEAD)
         await asyncio.to_thread(
             alembic, pg_test_url, action, HEAD if action == "upgrade" else PRIOR

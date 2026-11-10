@@ -89,7 +89,52 @@ def assert_shared_contract(cell_id: str, actual: dict) -> None:
                 for placeholder, original in mapping.items():
                     if isinstance(original, str):
                         trace["content"] = trace["content"].replace(original, placeholder)
+    if cell_id != "guardrail_block__run":
+        _blocked_trace_expected(cell_id, expected_traces)
     assert actual["public_traces"] == h._norm(expected_traces), (
         cell_id,
         h.diff(h._norm(expected_traces), actual["public_traces"]),
     )
+
+
+def _blocked_trace_expected(cell_id: str, traces: list) -> None:
+    positions = {
+        "guardrail_block__run": (0, "Mail jane.doe@example.com the report"),
+        "edge_indexed_block__run": (2, '"person@example.com"'),
+    }
+    if cell_id not in positions:
+        return
+    index, original = positions[cell_id]
+    assert len(traces) == 1
+    trace = traces[0][index]
+    assert trace["content"] == original
+    trace["content"] = "[blocked: 1 finding]"
+
+
+def _blocked_continuation_expected(cell_id: str, expected: dict) -> None:
+    """A blocked submission now stops right after its claim, before resumed work.
+
+    Only stored events and rows change: no resume/tool lifecycle events, no tool
+    row and no tool trace. The result, error text and run record stay as before.
+    """
+    if cell_id != "edge_indexed_block__run":
+        return
+    for run in expected.get("runs", []):
+        if "events" in run:
+            assert [name for name, _ in run["events"][4:]] == [
+                "run.resumed",
+                "tools.declared",
+                "tool.completed",
+                "guardrail.blocked",
+                "run.error",
+            ]
+            run["events"][4:] = [["guardrail.blocked", 0], ["run.error", 0]]
+        if "trace_roles" in run:
+            assert run["trace_roles"][-1] == "tool"
+            run["trace_roles"].pop()
+        assert [call["tool_name"] for call in run["tool_calls"]] == ["read_range"]
+        run["tool_calls"] = []
+    traces = expected["public_traces"][0]
+    assert traces[-1]["role"] == "tool"
+    assert traces[-1]["content"] in ('"person@example.com"', "[blocked: 1 finding]")
+    traces.pop()

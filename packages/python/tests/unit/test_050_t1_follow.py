@@ -30,6 +30,7 @@ from dendrux.store import (
     StoredEvent,
     redact_event,
 )
+from tests._helpers.warnings import warnings_of
 
 if TYPE_CHECKING:
     from dendrux.runtime.stores.sql.base import SQLStateStore
@@ -427,7 +428,7 @@ class TestStreamEvents:
                 gen = store.stream_events("ra", poll_interval_s=0.01)
                 assert (await anext(gen)).event_type == "x"
                 await gen.aclose()
-        deprecations = [w for w in caught if issubclass(w.category, DeprecationWarning)]
+        deprecations = warnings_of(caught, DeprecationWarning, r"RunStore\.stream_events\(")
         assert len(deprecations) == 1  # deduplicated per location by `warnings`
         assert deprecations[0].filename == __file__
         assert "follow()" in str(deprecations[0].message)

@@ -13,6 +13,7 @@ from dendrux.loops.base import BaseNotifier
 from dendrux.runtime.persistence import PersistenceRecorder
 from dendrux.types import LLMResponse, RunStatus, ToolCall
 from tests._helpers.scripted_provider import ScriptedLLM, tool_call
+from tests._helpers.warnings import warnings_of
 from tests.integration.test_050_t7_integrity import (
     agent,
     client_read,
@@ -235,7 +236,7 @@ async def test_approval_tokens_are_required_only_for_pauses_with_generations(sto
         else:
             with pytest.raises(InputValidationError):
                 await submit()
-    assert not [w for w in caught if "expected_pause_id" in str(w.message)]
+    assert not warnings_of(caught, FutureWarning, "expected_pause_id")
     assert (await store.get_run(paused.run_id)).status == (
         "success" if legacy else "waiting_approval"
     )
@@ -379,7 +380,7 @@ async def test_fenced_approval_never_warns_at_repeated_call_site(store, entry):
                 await a.resume(paused.run_id, expected_pause_id=paused.pause_id)
             else:
                 await consume(a.resume_stream(paused.run_id, expected_pause_id=paused.pause_id))
-    token_warnings = [w for w in caught if "expected_pause_id" in str(w.message)]
+    token_warnings = warnings_of(caught, FutureWarning, "expected_pause_id")
     assert not token_warnings
 
 
@@ -534,5 +535,5 @@ async def test_explicit_governance_warn_has_no_future_warning(store, streaming):
             )
         else:
             await b.submit_tool_results(paused.run_id, [result_for(paused)])
-    changed = [w for w in caught if "Changed governance" in str(w.message)]
+    changed = warnings_of(caught, FutureWarning, "Changed governance")
     assert not changed

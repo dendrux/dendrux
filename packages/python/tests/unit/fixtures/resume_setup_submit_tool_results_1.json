@@ -60,7 +60,7 @@
     "INSERT INTO run_events (id, agent_run_id, event_type, sequence_index, iteration_index, correlation_id, data, created_at, content_digest) SELECT ? AS anon_1, ? AS anon_2, ? AS anon_3, (SELECT coalesce(max(run_events.sequence_index), ?) + ? AS anon_5 FROM run_events WHERE run_events.agent_run_id = ?) AS anon_4, ? AS anon_6, ? AS anon_7, ? AS anon_8, ? AS anon_9, ? AS anon_10 ON CONFLICT (id) DO NOTHING RETURNING sequence_index",
     "COMMIT",
     "BEGIN",
-    "UPDATE agent_runs SET last_progress_at=?, updated_at=? WHERE agent_runs.id = ? AND agent_runs.status = ? AND agent_runs.claim_epoch = ?",
+    "UPDATE agent_runs SET last_progress_at=?, updated_at=? WHERE agent_runs.id = ? AND agent_runs.status = ? AND agent_runs.claim_epoch = ? AND CASE WHEN (json_type(agent_runs.meta, ?) = ?) THEN ? WHEN (json_type(agent_runs.meta, ?) = ?) THEN ? END IS NOT 1",
     "COMMIT",
     "BEGIN",
     "UPDATE agent_runs SET updated_at=?, last_progress_at=CASE WHEN (agent_runs.storage_format = ?) THEN ? ELSE agent_runs.last_progress_at END WHERE agent_runs.id = ? AND agent_runs.claim_epoch = ?",

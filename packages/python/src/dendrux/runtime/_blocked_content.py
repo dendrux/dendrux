@@ -1,0 +1,303 @@
+"""Private provenance for projected blocked writes and scoped source reads."""
+
+from __future__ import annotations
+
+from contextlib import asynccontextmanager, contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Protocol, cast
+
+from dendrux._lifecycle import FailureReason
+from dendrux.errors import PersistenceError, RunFencedError
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator, Iterator, Sequence
+
+    from dendrux.runtime._continuation_guardrails import _SubmissionBlock
+    from dendrux.runtime.state import RunRecord, StateStore
+
+
+class _DispatchUndecided(Exception):  # noqa: N818 - private signal, never surfaced
+    """A dispatch write was refused and the read that would explain why failed."""
+
+
+_blocked_target: ContextVar[tuple[object, str] | None] = ContextVar(
+    "dendrux_blocked_target", default=None
+)
+
+
+class _NativeBlockedStore(Protocol):
+    """A store whose writes honour the blocked-write and dispatch scopes in one transaction."""
+
+    async def _blocked_run_ids(
+        self, run_ids: Sequence[str], *, tenant_id: str | None
+    ) -> set[str]: ...
+
+
+# The private capability marker. A store is native only when its ``_native_blocked_mark()``
+# returns this object: setting the attribute, or returning anything else, is not trusted.
+_NATIVE_BLOCKED_MARK = object()
+
+
+def _native_blocked_store(store: StateStore | None) -> _NativeBlockedStore | None:
+    """The shared store when it marks blocked writes atomically, else ``None``.
+
+    The only seam for the native/custom decision: stores declare the capability, so
+    the runtime never names a backend class. Custom stores mark first or fail closed.
+    """
+    from dendrux.runtime.state import unclaimed_store
+
+    native = unclaimed_store(store)
+    capability = getattr(type(native), "_native_blocked_mark", None)
+    if not callable(capability) or capability(native) is not _NATIVE_BLOCKED_MARK:
+        return None
+    return cast("_NativeBlockedStore", native)
+
+
+def _native_store(store: StateStore) -> _NativeBlockedStore:
+    native = _native_blocked_store(store)
+    if native is None:
+        raise PersistenceError()
+    return native
+
+
+@contextmanager
+def _blocked_write(store: StateStore, run_id: str) -> Iterator[None]:
+    # Call only around persistence of an already-projected blocked value.
+    token = _blocked_target.set((_native_store(store), run_id))
+    try:
+        yield
+    finally:
+        _blocked_target.reset(token)
+
+
+async def _blocked_run_ids(
+    store: StateStore, run_ids: Sequence[str], *, tenant_id: str | None
+) -> set[str]:
+    return await _native_store(store)._blocked_run_ids(run_ids, tenant_id=tenant_id)
+
+
+@asynccontextmanager
+async def _blocked_evidence(store: StateStore, run_id: str) -> AsyncIterator[None]:
+    from dendrux._meta_keys import BLOCKED_META_KEY
+
+    if _native_blocked_store(store) is not None:
+        with _blocked_write(store, run_id):
+            yield
+        return
+    failed = False
+    try:
+        await store.update_run_meta(run_id, {BLOCKED_META_KEY: True})
+    except RunFencedError:
+        raise
+    except Exception:
+        failed = True
+    if failed:
+        raise PersistenceError()
+    await _require_block_mark(store, run_id)
+    yield
+
+
+async def _require_block_mark(store: StateStore, run_id: str) -> None:
+    from dendrux._meta_keys import BLOCKED_META_KEY
+
+    valid = False
+    try:
+        record = await store.get_run(run_id)
+        valid = (
+            record is not None
+            and record.id == run_id
+            and (record.meta or {}).get(BLOCKED_META_KEY) is True
+        )
+    except RunFencedError:
+        raise
+    except Exception:
+        pass
+    if not valid:
+        raise PersistenceError()
+
+
+@dataclass
+class _ClaimCall:
+    """One public continuation call: whether it won a claim, and its safe block."""
+
+    run_id: str
+    store: object | None = None
+    block: _SubmissionBlock | None = None
+
+
+_claim_call: ContextVar[_ClaimCall | None] = ContextVar("dendrux_claim_call", default=None)
+
+
+@contextmanager
+def _claim_call_scope(run_id: str) -> Iterator[None]:
+    """Scope a continuation call; nested scopes for the same run share it."""
+    current = _claim_call.get()
+    if current is not None and current.run_id == run_id:
+        yield
+        return
+    token = _claim_call.set(_ClaimCall(run_id))
+    try:
+        yield
+    finally:
+        _claim_call.reset(token)
+
+
+def _remember_claim(store: StateStore, run_id: str, block: _SubmissionBlock | None) -> None:
+    # Called only after a won claim; a blocked submission committed its mark with it.
+    from dendrux.runtime.state import unclaimed_store
+
+    current = _claim_call.get()
+    if current is not None and current.run_id == run_id:
+        current.store, current.block = unclaimed_store(store), block
+
+
+def _claimed_here(store: StateStore, run_id: str) -> bool:
+    """Whether this call won the claim it is continuing (as opposed to adopting one)."""
+    from dendrux.runtime.state import unclaimed_store
+
+    current = _claim_call.get()
+    return (
+        current is not None
+        and current.run_id == run_id
+        and current.store is not None
+        and current.store is unclaimed_store(store)
+    )
+
+
+def _claimed_block_detail(store: StateStore, run_id: str) -> _SubmissionBlock | None:
+    """This call's own submission block (safe error text and kind counts), if any."""
+    current = _claim_call.get()
+    return current.block if current is not None and _claimed_here(store, run_id) else None
+
+
+async def _continuation_blocked(
+    store: StateStore, run_id: str, record: RunRecord | None, *, claimed_here: bool
+) -> bool:
+    """Whether a validated continuation must stop for durable blocked provenance.
+
+    A continuation whose claim this call won reuses the run row it already loaded,
+    so a clean continuation adds no statements: a blocked submission marks the run
+    in its claim transaction (a competing continuation then loses its claim) and
+    this call's own blocked claim is remembered. A note marked after the row was
+    read is handled as during a running turn: guarded runs check the mark when
+    notes are pending, and native stores refuse tool dispatch on a marked run.
+    Adopting a claim made elsewhere (``resume_claimed`` after a crash, raw-store
+    callers) also runs the full scoped lookup, which sees a legacy blocked event.
+    """
+    if _claimed_block_detail(store, run_id) is not None:
+        return True
+    if _row_blocked(store, run_id, record):
+        return True
+    if claimed_here:
+        return False
+    return await _adopted_run_blocked(store, run_id, record)
+
+
+async def _adopted_run_blocked(store: StateStore, run_id: str, record: RunRecord | None) -> bool:
+    if _native_blocked_store(store) is not None:
+        tenant = record.tenant_id if record is not None else None
+        return bool(await _native_blocked(store, [run_id], tenant_id=tenant))
+    return await _custom_blocked_event(store, run_id)
+
+
+# Authorized source IDs per verdict SELECT (spec: at most ceil(N/200) added statements).
+_SOURCE_CHUNK = 200
+
+
+async def _native_blocked(
+    store: StateStore, run_ids: Sequence[str], *, tenant_id: str | None
+) -> set[str]:
+    """Scoped existence verdicts; a failed lookup is a safe persistence error."""
+    from dendrux.errors import RunNotFoundError
+
+    result: set[str] = set()
+    failed = False
+    try:
+        for offset in range(0, len(run_ids), _SOURCE_CHUNK):
+            chunk = list(run_ids[offset : offset + _SOURCE_CHUNK])
+            result |= await _blocked_run_ids(store, chunk, tenant_id=tenant_id)
+    except (RunNotFoundError, RunFencedError):
+        raise
+    except Exception:
+        failed = True
+    if failed:
+        raise PersistenceError()
+    return result
+
+
+async def _custom_blocked_event(store: StateStore, run_id: str) -> bool:
+    """Custom-store fallback: one filtered ``guardrail.blocked`` read, limit 1."""
+    from dendrux.types import GovernanceEventType
+
+    blocked = GovernanceEventType.GUARDRAIL_BLOCKED.value
+    events = None
+    try:
+        events = await store.get_run_events(run_id, event_types=[blocked], limit=1)
+    except RunFencedError:
+        raise
+    except Exception:
+        events = None
+    if not isinstance(events, (list, tuple)) or any(
+        getattr(event, "event_type", None) != blocked for event in events
+    ):
+        raise PersistenceError()
+    return bool(events)
+
+
+async def _blocked_sources(
+    store: StateStore, records: Sequence[RunRecord], *, tenant_id: str | None
+) -> set[str]:
+    """IDs of already authorized source runs that carry blocked provenance (R1.10).
+
+    The run mark, a ``guardrail_blocked`` failure reason or any legacy blocked
+    event identifies a run. Native stores answer with batched scoped existence
+    queries; custom stores use the loaded row plus one filtered event read per run.
+    """
+    if not records:
+        return set()
+    if _native_blocked_store(store) is not None:
+        return await _native_blocked(store, [r.id for r in records], tenant_id=tenant_id)
+    found: set[str] = set()
+    for record in records:
+        if _row_blocked(store, record.id, record) or await _custom_blocked_event(store, record.id):
+            found.add(record.id)
+    return found
+
+
+def _row_blocked(store: StateStore, run_id: str, record: RunRecord | None) -> bool:
+    """Read the mark from an already loaded run row; malformed rows fail closed."""
+    from dendrux._meta_keys import BLOCKED_META_KEY
+
+    if record is None:
+        if _native_blocked_store(store) is not None:
+            raise PersistenceError()
+        # Custom blocked writes verify the mark through get_run before any related
+        # evidence, so a store without a readable run row never holds a mark.
+        return False
+    meta = getattr(record, "meta", None)
+    if getattr(record, "id", None) != run_id or (meta is not None and not isinstance(meta, dict)):
+        raise PersistenceError()
+    return (meta or {}).get(BLOCKED_META_KEY) is True or getattr(
+        record, "failure_reason", None
+    ) == FailureReason.GUARDRAIL_BLOCKED.value
+
+
+_dispatch_target: ContextVar[tuple[object, str] | None] = ContextVar(
+    "dendrux_blocked_dispatch", default=None
+)
+
+
+@contextmanager
+def _dispatch_write(store: StateStore, run_id: str) -> Iterator[None]:
+    from dendrux.runtime.state import unclaimed_store
+
+    token = _dispatch_target.set((unclaimed_store(store), run_id))
+    try:
+        yield
+    finally:
+        _dispatch_target.reset(token)
+
+
+def _dispatch_guarded(store: object, run_id: str) -> bool:
+    return _dispatch_target.get() == (store, run_id)

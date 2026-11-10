@@ -1699,7 +1699,7 @@ class CatalogBlobAccessor:
         try:
             stats.deleted_orphan_edges += await catalog.delete_orphan_edges(limit)
         except Exception:
-            logger.error("Blob GC: deleting orphan edges failed", exc_info=True)
+            logger.error("Blob GC: deleting orphan edges failed")
         # 3. Unreferenced blobs past the grace period.
         for info in await _call(
             catalog, "gc_candidates", cutoff, limit, include_external=has_store
@@ -1718,7 +1718,6 @@ class CatalogBlobAccessor:
                 _scope_of(info),
                 image_id(info.sha256),
                 info.state,
-                exc_info=True,
             )
 
     def _can_touch_object(self, info: BlobInfo) -> bool:

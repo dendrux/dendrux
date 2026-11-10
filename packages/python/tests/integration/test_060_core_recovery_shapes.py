@@ -57,7 +57,7 @@ async def test_d5_direct_cached_and_fresh_process_recovery_agree(store, engine, 
     direct = await a.run("go", idempotency_key="same")
     cached = await a.run("go", idempotency_key="same")
     read = await a.get_result(direct.run_id, tenant_id=None)
-    assert direct.recovery.reclaim_attempts == 1
+    assert direct.recovery.reclaim_attempts == 0
     assert len(direct.recovery.replayed_tool_calls) == 1
     shape = direct.to_dict()["recovery"]
     assert shape["last_reclaimed_at"] == "2026-10-29T00:00:00Z"

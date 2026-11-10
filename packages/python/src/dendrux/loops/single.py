@@ -36,6 +36,7 @@ from dendrux.loops._helpers import (
     notify_llm,
     notify_message,
     price_response,
+    project_response,
     record_governance,
     record_llm,
     record_message,
@@ -491,11 +492,16 @@ async def _scan_single_incoming(
     all_in_findings: list[Any] = []
     if g_engine is None:
         return all_in_findings, None
+    recorder_engine: object = getattr(recorder, "guardrail_engine", None)
+    if recorder_engine is not g_engine:
+        g_engine._retain_allowed_findings = True
     _in_was_redacted = False
     for msg_idx, msg in enumerate(messages):
         if not msg.content:
             continue
-        cleaned_msg, findings, block_err = await g_engine.scan_incoming_message(msg, index=msg_idx)
+        cleaned_msg, findings, block_err = await g_engine.project_incoming_message(
+            msg, index=msg_idx
+        )
         if findings:
             all_in_findings.extend(findings)
         if block_err is not None:
@@ -683,10 +689,16 @@ class SingleCall(Loop):
         control_reader = _cancel_reader(state_store, resolved_run_id)
 
         # Incoming guardrail — scan all messages
-        g_engine = getattr(recorder, "guardrail_engine", None) or (
-            GuardrailEngine(agent.guardrails, pii_mapping=initial_pii_mapping)
-            if agent.guardrails
-            else None
+        from dendrux.guardrails._engine import _entry_engine
+
+        g_engine = (
+            getattr(recorder, "guardrail_engine", None)
+            or _entry_engine(resolved_run_id)
+            or (
+                GuardrailEngine(agent.guardrails, pii_mapping=initial_pii_mapping)
+                if agent.guardrails
+                else None
+            )
         )
         checkpoint_state, checkpoint_budget = _single_checkpoint(
             recorder,
@@ -732,7 +744,7 @@ class SingleCall(Loop):
                 {"entity_type": f.entity_type, "score": f.score} for f in all_in_findings
             ]
         if g_engine is not None and (response.text or response.tool_calls):
-            out_findings, out_block = await g_engine.scan_outgoing(response.text or "")
+            response, out_findings, out_block = await project_response(g_engine, response)
             if out_findings:
                 _sc_findings["outgoing"] = [
                     {"entity_type": f.entity_type, "score": f.score} for f in out_findings
@@ -758,18 +770,7 @@ class SingleCall(Loop):
                     warnings=notifier_warnings,
                 )
             if out_block is not None:
-                # Scrub response before recording — block means the
-                # original text/params contain the PII that triggered it.
-                _blocked_resp = LLMResponse(
-                    text="[blocked by guardrail]",
-                    tool_calls=None,
-                    raw=response.raw,
-                    usage=response.usage,
-                    provider_request=response.provider_request,
-                    provider_response=None,
-                    stop_reason=response.stop_reason,
-                    raw_stop_reason=response.raw_stop_reason,
-                )
+                _blocked_resp = response
                 await record_llm(
                     recorder,
                     resolved_run_id,
@@ -779,6 +780,7 @@ class SingleCall(Loop):
                     semantic_tools=None,
                     duration_ms=llm_duration_ms,
                     guardrail_findings=images.findings(prepared, _sc_findings),
+                    blocked=True,
                 )
                 await notify_llm(
                     notifier,

@@ -35,7 +35,7 @@ class Clock:
 @pytest.fixture
 async def clock(monkeypatch: pytest.MonkeyPatch) -> Clock:
     loop = asyncio.get_running_loop()
-    fake = Clock(loop.time())
+    fake = Clock(1000.0)
     monkeypatch.setattr(loop, "time", lambda: fake.now)
     return fake
 

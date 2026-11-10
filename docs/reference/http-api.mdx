@@ -38,6 +38,10 @@ A request waiting on `agent.run` can time out before returning a run ID; cancell
 of that coroutine can cancel the run. Persist an app request ID and own execution
 and recovery outside the request lifecycle if your application requires it.
 
+When a resume call returns another pause, route its current `status` and `pause_id` back through your normal pending/approval flow. In particular, resuming a requested pause during recovery can return `waiting_approval`; use the new token for the decision. If you expose `RunResult.recovery`, label `reclaim_attempts` as attempts since last progress. Successful recovery can report zero; use `last_reclaimed_at` to show that recovery occurred.
+
+Dendrux diagnostics use fixed messages and safe identifiers/counts rather than exception text. A failed server `tool_result_transform` reports "Tool result transform failed." in the tool result. Keep your own diagnostic fields safe too.
+
 ## SSE event inventory
 
 Every `event_type` that can land on the stream. Lifecycle events come from the runner; governance events come from the loop and guardrail engine. Field shapes are extracted from `dendrux/runtime/runner.py`, `dendrux/runtime/persistence.py`, and `dendrux/loops/react.py`.

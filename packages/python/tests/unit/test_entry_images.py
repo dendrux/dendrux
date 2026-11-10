@@ -1730,7 +1730,7 @@ def _visible_tools(msgs: list[Message]) -> list[str]:
 
 
 class TestSeededSourceCarry:
-    """P1-1: a single-source carry is shifted by the source's own seeded slots."""
+    """a single-source carry is shifted by the source's own seeded slots."""
 
     async def _scenario(self, store: ImageStore, history: list[ChatMessage]) -> tuple[Any, Any]:
         policy = ImagePolicy(
@@ -1824,7 +1824,7 @@ class TestSeededSourceCarry:
 
 
 class TestOnePhaseOne:
-    """P2-2: every image is validated before any blob is written."""
+    """every image is validated before any blob is written."""
 
     async def test_second_tool_result_invalid_writes_nothing(self, store: ImageStore) -> None:
         responses = [
@@ -1882,7 +1882,7 @@ class TestOnePhaseOne:
 
 
 class TestResumeStreamValidatesFirst:
-    """P2-3: resume_stream checks the run before it ingests anything."""
+    """resume_stream checks the run before it ingests anything."""
 
     async def test_wrong_status_and_call_id_write_no_blob(self, store: ImageStore) -> None:
         agent = _agent(store, [LLMResponse(text="x")])
@@ -1942,7 +1942,7 @@ class TestResumeStreamValidatesFirst:
 
 
 class TestCustomLoopReplay:
-    """P2-4: a loop that cannot take image_runtime refuses an image prefix before create_run."""
+    """a loop that cannot take image_runtime refuses an image prefix before create_run."""
 
     async def test_runs_replay_of_image_run(self, store: ImageStore) -> None:
         source = await _agent(store, [LLMResponse(text="x")]).run(["look", Image.from_bytes(PNG)])
@@ -1965,7 +1965,7 @@ class TestCustomLoopReplay:
 
 
 class TestGarbageCollectionWiring:
-    """P2-5: a full blob store triggers one collect_garbage(older_than=1h) pass."""
+    """a full blob store triggers one collect_garbage(older_than=1h) pass."""
 
     async def test_runtime_gets_one_hour_gc_pass(self, store: ImageStore) -> None:
         from datetime import timedelta
@@ -1998,7 +1998,7 @@ class TestGarbageCollectionWiring:
 
 
 class TestIdempotencyAfterPurge:
-    """P2-7: a keyed retry whose image was purged returns the existing run."""
+    """a keyed retry whose image was purged returns the existing run."""
 
     async def test_keyed_retry_after_purge_returns_existing(self, store: ImageStore) -> None:
         agent = _agent(store, [LLMResponse(text="a")])
@@ -2020,7 +2020,7 @@ class TestIdempotencyAfterPurge:
 
 
 class TestSubmitEdgeKeyRace:
-    """P2-7: the claim re-checks the pause iteration that keyed the submission edges."""
+    """the claim re-checks the pause iteration that keyed the submission edges."""
 
     async def test_repaused_run_rejects_stale_submission(
         self, store: ImageStore, monkeypatch: pytest.MonkeyPatch

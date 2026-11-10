@@ -548,7 +548,9 @@ asyncio.run(main())
         s.context.trace_id == continued.context.trace_id for s in exporter.get_finished_spans()
     )
     row = await store.get_run(run_id)
-    assert row.trace_link == saved and row.reclaim_attempts == 1
+    # The completed run made progress after the reclaim, so the streak is reset.
+    assert row.trace_link == saved and row.reclaim_attempts == 0
+    assert row.last_reclaimed_at is not None
 
 
 @pytest.mark.parametrize(

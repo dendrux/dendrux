@@ -24,7 +24,7 @@ import inspect
 import json
 import logging
 import time
-from contextlib import aclosing
+from contextlib import aclosing, nullcontext
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
@@ -50,6 +50,9 @@ from dendrux.llm._evidence import (
 from dendrux.llm._retry_telemetry import telemetry_context
 from dendrux.loops._budget import BudgetBreach, BudgetCarry, BudgetTracker, breach_payload
 from dendrux.loops._helpers import (
+    _BlockedObservationError,
+    _check_blocked_run,
+    _evidence_scope,
     build_cache_key_prefix,
     final_stop_reason,
     governance_sinks,
@@ -63,6 +66,7 @@ from dendrux.loops._helpers import (
     notify_tool_started,
     order_observations,
     project_message,
+    project_response,
     record_governance,
     record_llm,
     record_llm_started,
@@ -604,6 +608,8 @@ async def _deliver_inbox(
     iteration: int,
     history: list[Message],
     warnings: list[str],
+    *,
+    guardrail_engine: GuardrailEngine | None = None,
 ) -> None:
     """Append undelivered inbox notes to history as USER messages, then mark them.
 
@@ -623,8 +629,9 @@ async def _deliver_inbox(
             source="run_inbox",
             meta={"note_id": note.id},
         )
-        history.append(msg)
-        await _commit_message(history, msg, recorder, notifier, run_id, iteration, warnings)
+        await _commit_inbox_message(
+            guardrail_engine, msg, history, recorder, notifier, run_id, iteration, warnings
+        )
     await state_store.mark_notes_delivered(run_id, [n.id for n in notes], iteration=iteration)
     for note in notes:
         data = {"note_id": note.id}
@@ -644,6 +651,32 @@ async def _deliver_inbox(
             data,
             correlation_id=note.id,
             warnings=warnings,
+        )
+
+
+async def _commit_inbox_message(
+    engine: GuardrailEngine | None,
+    message: Message,
+    history: list[Message],
+    recorder: LoopRecorder | None,
+    notifier: LoopNotifier | None,
+    run_id: str,
+    iteration: int,
+    warnings: list[str],
+) -> None:
+    findings: list[Any] = []
+    error = None
+    if engine is not None:
+        projected, findings, error = await engine.project_incoming_message(message)
+        if error is not None:
+            message = projected
+    history.append(message)
+    scope = _evidence_scope(recorder, run_id, error is not None) if recorder else nullcontext()
+    async with scope:
+        await _commit_message(history, message, recorder, notifier, run_id, iteration, warnings)
+    if error is not None:
+        raise _BlockedObservationError(
+            message, findings, error, ToolResult(name="", call_id="", payload=message.content)
         )
 
 
@@ -1044,6 +1077,8 @@ async def _preflight_skills(
     session: SkillSession,
     approved: bool,
     batch: _ToolBatch,
+    *,
+    anticipated: set[str] | None = None,
 ) -> list[ToolCall]:
     """Stage 6b. Skill preflight before approval.
 
@@ -1051,7 +1086,8 @@ async def _preflight_skills(
     rechecks against the activations that actually succeed.
     """
     ready: list[ToolCall] = []
-    anticipated: set[str] = set()
+    if anticipated is None:
+        anticipated = set()
     for tc in calls:
         is_skill = isinstance(lookups.fn.get(tc.name), SkillTool)
         failure = (
@@ -1191,6 +1227,59 @@ def _pii_placeholders(engine: GuardrailEngine | None) -> dict[str, str]:
     return placeholder_mapping(engine.get_pii_mapping()) if engine is not None else {}
 
 
+async def _prepare_tool_calls(
+    all_calls: list[ToolCall],
+    *,
+    batch: _ToolBatch,
+    call_counts: dict[str, int],
+    lookups: ToolLookups,
+    deny: frozenset[str] | None = None,
+    require_approval: frozenset[str] | None = None,
+    guardrail_engine: GuardrailEngine | None = None,
+    approved_skills: bool = False,
+    before_tool: BeforeToolHook | None = None,
+    tenant_id: str | None = None,
+    image_runtime: ImageRuntime | None = None,
+    anticipated_skills: set[str] | None = None,
+    recorded_gates: dict[str, dict[str, str | None]] | None = None,
+    fallback_approval: frozenset[str] | None = None,
+) -> tuple[list[ToolCall], dict[str, dict[str, str | None]]]:
+    session = _bind_skill_session(lookups, batch.governance)
+    calls = await _reject_invalid_json(all_calls, lookups, session, batch)
+    calls = await _apply_static_deny(calls, deny or frozenset(), batch)
+    calls = await _reject_unknown(calls, lookups, batch)
+    pii_mapping = _pii_placeholders(guardrail_engine)
+    # The arguments as the model sent them (placeholder form, pre-restore and
+    # pre-coercion), per call id: the only form approval views ever show.
+    sent_params: dict[str, dict[str, Any]] = {tc.id: tc.params for tc in calls}
+    calls = await _restore_calls(guardrail_engine, calls, lookups, batch)
+    calls = await _validate_calls(calls, lookups, frozenset(pii_mapping), batch)
+    calls = await _enforce_limits(calls, lookups, call_counts, batch)
+    if session is not None:
+        calls = await _preflight_skills(
+            calls, lookups, session, approved_skills, batch, anticipated=anticipated_skills
+        )
+    gates = _static_gates(calls, require_approval)
+    if recorded_gates is not None:
+        gates.update({tc.id: recorded_gates[tc.id] for tc in calls if tc.id in recorded_gates})
+    if before_tool is not None:
+        calls = await _apply_before_tool(
+            before_tool,
+            calls,
+            gates,
+            batch,
+            lookups=lookups,
+            tenant_id=tenant_id,
+            image_runtime=image_runtime,
+            fallback_approval=fallback_approval,
+        )
+    if fallback_approval is not None:
+        gates = {**_static_gates(calls, fallback_approval), **gates}
+    if gates:
+        await _request_approvals(calls, gates, sent_params, pii_mapping, batch)
+    return calls, gates
+
+
 async def _process_tool_calls(
     *,
     step: AgentStep,
@@ -1232,33 +1321,20 @@ async def _process_tool_calls(
         history=history,
         warnings=warnings,
     )
-    session = _bind_skill_session(lookups, batch.governance)
-    all_calls: list[ToolCall] = step.meta.get("all_tool_calls", [step.action])
-    calls = await _reject_invalid_json(all_calls, lookups, session, batch)
-    calls = await _apply_static_deny(calls, deny or frozenset(), batch)
-    calls = await _reject_unknown(calls, lookups, batch)
-    pii_mapping = _pii_placeholders(guardrail_engine)
-    # The arguments as the model sent them (placeholder form, pre-restore and
-    # pre-coercion), per call id: the only form approval views ever show.
-    sent_params: dict[str, dict[str, Any]] = {tc.id: tc.params for tc in calls}
-    calls = await _restore_calls(guardrail_engine, calls, lookups, batch)
-    calls = await _validate_calls(calls, lookups, frozenset(pii_mapping), batch)
-    calls = await _enforce_limits(calls, lookups, call_counts, batch)
-    if session is not None:
-        calls = await _preflight_skills(calls, lookups, session, approved_skills, batch)
-    gates = _static_gates(calls, require_approval)
-    if before_tool is not None:
-        calls = await _apply_before_tool(
-            before_tool,
-            calls,
-            gates,
-            batch,
-            lookups=lookups,
-            tenant_id=tenant_id,
-            image_runtime=image_runtime,
-        )
+    calls, gates = await _prepare_tool_calls(
+        step.meta.get("all_tool_calls", [step.action]),
+        batch=batch,
+        call_counts=call_counts,
+        lookups=lookups,
+        deny=deny,
+        require_approval=require_approval,
+        guardrail_engine=guardrail_engine,
+        approved_skills=approved_skills,
+        before_tool=before_tool,
+        tenant_id=tenant_id,
+        image_runtime=image_runtime,
+    )
     if gates:
-        await _request_approvals(calls, gates, sent_params, pii_mapping, batch)
         return _ToolCallOutcome(
             all_results=batch.all_results,
             pending_calls=calls,
@@ -1353,6 +1429,7 @@ async def _apply_before_tool(
     lookups: ToolLookups,
     tenant_id: str | None,
     image_runtime: ImageRuntime | None = None,
+    fallback_approval: frozenset[str] | None = None,
 ) -> list[ToolCall]:
     """Evaluate ``before_tool`` per call; returns the calls that continue.
 
@@ -1372,6 +1449,8 @@ async def _apply_before_tool(
             tenant_id=tenant_id,
             images=_referenced_images(tc.params, run_images),
         )
+        if fallback_approval and (decision is None or decision.kind != "require_approval"):
+            gates.update({**_static_gates([tc], fallback_approval), **gates})
         if error_type is not None:
             await _hook_error(tc, error_type, gates, batch)
         elif await _apply_decision(decision, tc, gates, batch, lookups, image_runtime):
@@ -1825,7 +1904,16 @@ async def _iteration_gate(ctx: _RunContext, iteration: int) -> RunResult | None:
     if budget_result is not None:
         return budget_result
     if control is not None and control.has_pending_notes:
-        assert ctx.state_store is not None
+        return await _inbox_gate(ctx, iteration)
+    return None
+
+
+async def _inbox_gate(ctx: _RunContext, iteration: int) -> RunResult | None:
+    assert ctx.state_store is not None
+    try:
+        if ctx.agent.guardrails:
+            # Only a guarded run reads the mark a blocked note may have left.
+            await _check_blocked_run(ctx.state_store, ctx.run_id)
         await _deliver_inbox(
             ctx.state_store,
             ctx.recorder,
@@ -1834,6 +1922,11 @@ async def _iteration_gate(ctx: _RunContext, iteration: int) -> RunResult | None:
             iteration,
             ctx.state.history,
             ctx.state.warnings,
+            guardrail_engine=ctx.g_engine,
+        )
+    except _BlockedObservationError as blocked:
+        return await _incoming_blocked(
+            ctx, blocked.error, blocked.findings, blocked.message, 0, iteration
         )
     return None
 
@@ -2134,9 +2227,7 @@ async def _run_tool_step(
     """Append the assistant turn and run its tool calls; returns the outcome and
     where this iteration's tool messages start in history."""
     await _append_turn(ctx, response, iteration, phase="commentary")
-    if ctx.state_store is not None:
-        # The provider may have returned after sweep revoked this worker.
-        await _read_control(ctx.state_store, ctx.run_id)
+    await _check_tool_dispatch(ctx)
     tool_history_start = len(ctx.state.history)
     outcome = await _process_tool_calls(
         step=step,
@@ -2159,6 +2250,14 @@ async def _run_tool_step(
         image_runtime=ctx.image_runtime,
     )
     return outcome, tool_history_start
+
+
+async def _check_tool_dispatch(ctx: _RunContext) -> None:
+    if ctx.state_store is not None:
+        # The provider may have returned after sweep revoked this worker.
+        control = await _read_control(ctx.state_store, ctx.run_id)
+        if control.has_pending_notes and ctx.agent.guardrails:
+            await _check_blocked_run(ctx.state_store, ctx.run_id)
 
 
 def _after_tools(
@@ -2197,7 +2296,11 @@ def _run_guardrail_engine(
     agent: Agent, recorder: LoopRecorder | None, pii_mapping: dict[str, str] | None, run_id: str
 ) -> GuardrailEngine | None:
     """The recorder's engine (shared with persistence), else one for the agent's guardrails."""
-    shared: GuardrailEngine | None = getattr(recorder, "guardrail_engine", None)
+    from dendrux.guardrails._engine import _entry_engine
+
+    shared: GuardrailEngine | None = getattr(recorder, "guardrail_engine", None) or _entry_engine(
+        run_id
+    )
     if shared:
         return shared
     if not agent.guardrails:
@@ -2208,10 +2311,10 @@ def _run_guardrail_engine(
 async def _incoming_project(
     ctx: _RunContext, engine: GuardrailEngine, msg: Message, index: int
 ) -> tuple[Message, list[Any], str | None, bool]:
-    shared = getattr(ctx.recorder, "guardrail_engine", None) is engine
-    project = engine.project_incoming_message if shared else engine.scan_incoming_message
-    cleaned, findings, blocked = await project(msg, index=index)
-    redacted = engine.projected_redaction(cleaned) if shared else cleaned is not msg
+    if getattr(ctx.recorder, "guardrail_engine", None) is not engine:
+        engine._retain_allowed_findings = True
+    cleaned, findings, blocked = await engine.project_incoming_message(msg, index=index)
+    redacted = engine.projected_redaction(cleaned)
     return cleaned, findings, blocked, redacted
 
 
@@ -2379,18 +2482,7 @@ async def _outgoing_blocked(
     findings: list[Any],
 ) -> RunResult:
     """Record the scrubbed response, count it, then ``guardrail.blocked`` and ERROR."""
-    # Scrub before recording: a block means the original text/params
-    # contain the PII that triggered it.
-    blocked_response = LLMResponse(
-        text="[blocked by guardrail]",
-        tool_calls=None,
-        raw=response.raw,
-        usage=response.usage,
-        provider_request=response.provider_request,
-        provider_response=None,
-        stop_reason=response.stop_reason,
-        raw_stop_reason=response.raw_stop_reason,
-    )
+    blocked_response = response
     await _record_llm(
         ctx.recorder,
         ctx.run_id,
@@ -2400,6 +2492,7 @@ async def _outgoing_blocked(
         semantic_tools=tools,
         duration_ms=duration_ms,
         guardrail_findings=ctx.images.findings(prepared, all_findings),
+        blocked=True,
     )
     await _notify_llm(
         ctx.notifier,
@@ -2451,8 +2544,7 @@ async def _scan_outgoing(
     engine = ctx.g_engine
     if engine is None or not (response.text or response.tool_calls):
         return None
-    tc_params = [tc.params for tc in response.tool_calls] if response.tool_calls else None
-    out_findings, out_block = await engine.scan_outgoing(response.text or "", tc_params)
+    response, out_findings, out_block = await project_response(engine, response)
     if out_findings:
         await _outgoing_detected(ctx, out_findings, iteration, all_findings)
     if out_block is None:
@@ -2468,6 +2560,62 @@ async def _scan_outgoing(
         error=out_block,
         findings=out_findings,
     )
+
+
+async def _blocked_tool_step(
+    ctx: _RunContext, blocked: _BlockedObservationError, iteration: int
+) -> RunResult:
+    """The normal guardrail outcome for a tool step stopped by blocked content."""
+    index = len(_build_messages(ctx)[0])
+    error = blocked.error
+    if ctx.g_engine is not None and blocked.findings:
+        _, _, located = await ctx.g_engine.project_incoming_message(blocked.message, index=index)
+        error = located or error
+    return await _incoming_blocked(ctx, error, blocked.findings, blocked.message, index, iteration)
+
+
+async def _stream_tool_step(
+    ctx: _RunContext, response: LLMResponse, step: AgentStep, iteration: int
+) -> tuple[_ToolCallOutcome, int, RunResult | None]:
+    """A stream tool step; blocked content ends it with the normal guardrail result."""
+    try:
+        outcome, tool_history_start = await _run_tool_step(ctx, response, step, iteration)
+    except _BlockedObservationError as blocked:
+        stopped = await _blocked_tool_step(ctx, blocked, iteration)
+        return _ToolCallOutcome(all_results=[], pending_calls=[]), 0, stopped
+    return outcome, tool_history_start, None
+
+
+def _stream_tool_stop(
+    ctx: _RunContext,
+    outcome: _ToolCallOutcome,
+    tool_history_start: int,
+    iteration: int,
+    blocked: RunResult | None,
+) -> RunEvent | None:
+    """The stream's terminal event after a tool step: a guardrail stop or a pause."""
+    if blocked is not None:
+        return RunEvent(type=RunEventType.RUN_ERROR, run_result=blocked)
+    paused = _after_tools(ctx, outcome, tool_history_start, iteration)
+    return None if paused is None else RunEvent(type=RunEventType.RUN_PAUSED, run_result=paused)
+
+
+async def _batch_action_result(
+    ctx: _RunContext, response: LLMResponse, step: AgentStep, iteration: int
+) -> RunResult | None:
+    if isinstance(step.action, Finish):
+        return await _finish_result(ctx, response, step.action, iteration)
+    if isinstance(step.action, Clarification):
+        return await _clarification_result(ctx, response, step.action, iteration)
+    if isinstance(step.action, ToolCall):
+        try:
+            outcome, tool_history_start = await _run_tool_step(ctx, response, step, iteration)
+        except _BlockedObservationError as blocked:
+            return await _blocked_tool_step(ctx, blocked, iteration)
+        paused = _after_tools(ctx, outcome, tool_history_start, iteration)
+        if paused is not None:
+            return paused
+    return None
 
 
 class ReActLoop(Loop):
@@ -2684,15 +2832,9 @@ class ReActLoop(Loop):
             )
             if limited is not None:
                 return limited
-            if isinstance(step.action, Finish):
-                return await _finish_result(ctx, response, step.action, iteration)
-            if isinstance(step.action, Clarification):
-                return await _clarification_result(ctx, response, step.action, iteration)
-            if isinstance(step.action, ToolCall):
-                outcome, tool_history_start = await _run_tool_step(ctx, response, step, iteration)
-                paused = _after_tools(ctx, outcome, tool_history_start, iteration)
-                if paused is not None:
-                    return paused
+            completed = await _batch_action_result(ctx, response, step, iteration)
+            if completed is not None:
+                return completed
 
         return _max_iterations_result(ctx)
 
@@ -2832,7 +2974,7 @@ class ReActLoop(Loop):
                 return
 
             if isinstance(step.action, ToolCall):
-                outcome, tool_history_start = await _run_tool_step(
+                outcome, tool_history_start, blocked = await _stream_tool_step(
                     ctx, llm_response, step, iteration
                 )
                 for tc, tool_result in outcome.all_results:
@@ -2843,9 +2985,9 @@ class ReActLoop(Loop):
                         iteration=iteration,
                         phase="commentary",
                     )
-                paused = _after_tools(ctx, outcome, tool_history_start, iteration)
-                if paused is not None:
-                    yield RunEvent(type=RunEventType.RUN_PAUSED, run_result=paused)
+                stop = _stream_tool_stop(ctx, outcome, tool_history_start, iteration, blocked)
+                if stop is not None:
+                    yield stop
                     return
 
         yield RunEvent(type=RunEventType.RUN_COMPLETED, run_result=_max_iterations_result(ctx))
@@ -2953,11 +3095,34 @@ async def _execute_record_notify(
         )
     if tracker is not None:
         tracker.result = result
-    await _record_tool(recorder, run_id, tool_call, result, iteration)
+    await _record_completed_tool(
+        tool_call, result, recorder, notifier, run_id, iteration, notifier_warnings, tracker
+    )
+    return tool_call, result
+
+
+async def _record_completed_tool(
+    tool_call: ToolCall,
+    result: ToolResult,
+    recorder: LoopRecorder | None,
+    notifier: LoopNotifier | None,
+    run_id: str,
+    iteration: int,
+    notifier_warnings: list[str],
+    tracker: CallTracker | None,
+) -> None:
+    try:
+        await _record_tool(recorder, run_id, tool_call, result, iteration)
+    except _BlockedObservationError as blocked:
+        if tracker is not None:
+            tracker.result, tracker.recorded = blocked.result, True
+        await _notify_tool(
+            notifier, run_id, tool_call, blocked.result, iteration, notifier_warnings
+        )
+        raise
     if tracker is not None:
         tracker.recorded = True
     await _notify_tool(notifier, run_id, tool_call, result, iteration, notifier_warnings)
-    return tool_call, result
 
 
 _SIBLING_CANCELLED = "cancelled: another tool call in the same batch failed"
@@ -3306,12 +3471,9 @@ async def _execute_tool(
         if transform is not None:
             try:
                 result = await _apply_result_transform(transform, tool_call, lookups, result)
-            except Exception as transform_err:
-                error_msg = (
-                    f"tool_result_transform failed for tool '{tool_call.name}': "
-                    f"{type(transform_err).__name__}: {transform_err}"
-                )
-                logger.warning("%s", error_msg)
+            except Exception:
+                error_msg = "Tool result transform failed."
+                logger.warning(error_msg, extra={"run_id": run_id})
                 return ToolResult(
                     name=tool_call.name,
                     call_id=tool_call.id,

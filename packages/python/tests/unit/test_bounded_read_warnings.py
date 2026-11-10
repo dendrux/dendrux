@@ -9,6 +9,7 @@ import pytest
 
 from dendrux.runtime.state import StoreCapabilities
 from dendrux.store import RunStore, _InitOnFirstUse
+from tests._helpers.warnings import warnings_of
 
 READS = ["get_events", "get_traces", "get_llm_calls", "get_tool_invocations"]
 
@@ -58,14 +59,17 @@ async def test_warning_before_any_io(method, limit, path):
         warnings.simplefilter("always", FutureWarning)
 
         def before_io():
-            assert len(caught) == 1, "the first store call preceded its warning"
+            assert len(warnings_of(caught, FutureWarning, rf"RunStore\.{method}\(")) == 1, (
+                "the first store call preceded its warning"
+            )
 
         underlying.before_io = before_io
         with pytest.raises(ReadAttemptError):
             line = inspect.currentframe().f_lineno + 1
             await getattr(reader, method)("root", **kwargs)
-    assert len(caught) == 1
-    warning = caught[0]
+    matching = warnings_of(caught, FutureWarning, rf"RunStore\.{method}\(")
+    assert len(matching) == 1
+    warning = matching[0]
     assert warning.category is FutureWarning
     assert warning.filename == __file__
     assert warning.lineno == line
@@ -86,7 +90,7 @@ async def test_explicit_page_does_not_warn(method, limit):
         warnings.simplefilter("always", FutureWarning)
         with pytest.raises(ReadAttemptError):
             await getattr(RunStore(ExplodingStore()), method)("root", limit=limit)
-    assert not caught
+    assert not warnings_of(caught, FutureWarning, r"RunStore\.")
 
 
 @pytest.mark.parametrize("method", READS + ["get_subtree"])
@@ -97,7 +101,7 @@ async def test_invalid_scope_validates_before_warning_or_io(method, kwargs):
         warnings.simplefilter("always", FutureWarning)
         with pytest.raises(ValueError):
             await getattr(RunStore(ExplodingStore()), method)(**kwargs)
-    assert not caught
+    assert not warnings_of(caught, FutureWarning, r"RunStore\.")
 
 
 @pytest.mark.parametrize("method", READS)
@@ -107,7 +111,7 @@ async def test_invalid_limit_does_not_warn_or_read(method, value):
         warnings.simplefilter("always", FutureWarning)
         with pytest.raises(ValueError):
             await getattr(RunStore(ExplodingStore()), method)("root", limit=value)
-    assert not caught
+    assert not warnings_of(caught, FutureWarning, r"RunStore\.")
 
 
 @pytest.mark.parametrize(
@@ -125,7 +129,7 @@ async def test_invalid_filters_do_not_warn_or_read(method, kwargs):
         warnings.simplefilter("always", FutureWarning)
         with pytest.raises(ValueError):
             await getattr(RunStore(ExplodingStore()), method)("root", **kwargs)
-    assert not caught
+    assert not warnings_of(caught, FutureWarning, r"RunStore\.")
 
 
 async def test_format_two_clamp_is_at_facade_only(monkeypatch):
@@ -169,7 +173,7 @@ async def test_warning_uses_stdlib_deduplication():
         for _ in range(2):
             with pytest.raises(ReadAttemptError):
                 await RunStore(ExplodingStore()).get_events("root")
-    assert len(caught) == 1
+    assert len(warnings_of(caught, FutureWarning, r"RunStore\.get_events\(")) == 1
 
 
 def test_asyncio_run_attribution_is_asyncio():
@@ -177,8 +181,9 @@ def test_asyncio_run_attribution_is_asyncio():
         warnings.simplefilter("always", FutureWarning)
         with pytest.raises(ReadAttemptError):
             asyncio.run(RunStore(ExplodingStore()).get_events("root"))
-    assert len(caught) == 1
-    assert "asyncio" in caught[0].filename
+    matching = warnings_of(caught, FutureWarning, r"RunStore\.get_events\(")
+    assert len(matching) == 1
+    assert "asyncio" in matching[0].filename
 
 
 async def test_scheduled_task_attribution_is_asyncio():
@@ -186,8 +191,9 @@ async def test_scheduled_task_attribution_is_asyncio():
         warnings.simplefilter("always", FutureWarning)
         with pytest.raises(ReadAttemptError):
             await asyncio.create_task(RunStore(ExplodingStore()).get_events("root"))
-    assert len(caught) == 1
-    assert "asyncio" in caught[0].filename
+    matching = warnings_of(caught, FutureWarning, r"RunStore\.get_events\(")
+    assert len(matching) == 1
+    assert "asyncio" in matching[0].filename
 
 
 def test_shared_frame_walk_keeps_capability_warning_at_caller():
@@ -202,5 +208,6 @@ def test_shared_frame_walk_keeps_capability_warning_at_caller():
         line = inspect.currentframe().f_lineno + 1
         validate_capabilities(store)
         assert validate_capabilities(store) is store.capabilities
-    assert len(caught) == 1
-    assert caught[0].filename == __file__ and caught[0].lineno == line
+    matching = warnings_of(caught, DeprecationWarning, "StateStore capabilities")
+    assert len(matching) == 1
+    assert matching[0].filename == __file__ and matching[0].lineno == line

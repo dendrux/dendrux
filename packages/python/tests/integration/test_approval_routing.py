@@ -1,5 +1,5 @@
-"""Approval resume: target routing (A-P0-1), per-call decisions (A1, A-P0-2,
-A-P1-4), the resume barrier, and before_tool persistence — SQLite + Postgres.
+"""Approval resume: target routing, per-call decisions, the resume barrier,
+and before_tool persistence — SQLite + Postgres.
 
 A batch holding an approval-gated server tool and a client-target tool
 pauses for approval as a whole. Resolving it must never run the client
@@ -105,7 +105,7 @@ async def _finish_client(agent: Agent, store: StateStore, run_id: str) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# A-P0-1 — batch form routes by persisted target
+# Batch form routes by persisted target
 # ---------------------------------------------------------------------------
 
 

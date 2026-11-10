@@ -2155,7 +2155,7 @@ class RunStream:
                 try:
                     self._result = await self._cleanup()
                 except Exception:
-                    logger.warning("RunStream cleanup failed", exc_info=True)
+                    logger.warning("RunStream cleanup failed", extra={"run_id": self.run_id})
         finally:
             await self._gen.aclose()
 

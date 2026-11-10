@@ -28,6 +28,24 @@ Pass the same authenticated `tenant_id` for the new run and for every run in `ru
 
 Dendrux rebuilds each run from its own `react_traces` (user message as it was sent, assistant text, tool calls, tool results, reasoning blocks) and puts them ahead of the new input. The exact prompt is in `llm_interactions.provider_request` as always. On a format-2 store the new run stores the messages it replayed again, as seed rows of its own, so storage grows with how much you replay; see [History storage grows with replay](/docs/guides/scaling#history-storage-grows-with-replay). `agent.stream()` takes the same three arguments.
 
+## Retry versus replay
+
+`agent.retry(run_id, tenant_id=tenant)` creates a new ReAct run with fresh iteration and usage counters, leaving the source unchanged. Since 0.6.1, retrying a successful run regenerates its final answer while preserving earlier user/tool context, valid call/result pairs and applicable reasoning. JSON-formatted answers follow the same rule. Ordinary `runs=` replay retains successful answers as conversation history. `SingleCall` retry remains unsupported. A provider returning no new text or tool calls still raises the existing non-retryable `empty_completion` error.
+
+## Blocked runs are not replayed
+
+A run that a guardrail blocked holds only a placeholder where the rejected text was (see [Blocked text is stored as a placeholder](/docs/architecture/guardrails#blocked-text-is-stored-as-a-placeholder)). Since 0.6.1, Dendrux does not send that history to a model again.
+
+- **`runs=` omits the whole run.** A blocked run is left out entirely, including its context, tools and reasoning. Other errored runs are still replayed. Prefix compatibility is recomputed without it, and reasoning that no longer fits is dropped. If every run is omitted, the new run uses the fresh input alone. The omitted ID stays out of `runs_full` and `runs_text`, and `ReplaySummary.warnings` gains one notice per run:
+
+  `Run <run id> omitted because it contains blocked content; prior effects may have occurred.`
+
+  Show the notice to your users. Leaving a run out does not undo tool calls it already made.
+- **`retry()` refuses.** `agent.retry(run_id)` raises `ReplayRunError` with `reason="blocked_content"` and the detail "Source history contains blocked content; start a new run with clean input." when the retried run, or any run it replayed with `runs=`, is blocked. The error names the run that was identified, raised before a run is created or a model is called. Route the user to a new run with clean input instead of retrying.
+- **Logging.** Both cases log the code `blocked_content` with the run ID only. Detection works with or without guardrails configured now, so removing a guardrail does not make an old blocked run replayable.
+
+Limits: a retry copy made before 0.6.1 from a blocked run carries that run's old text and is not refused, because only the retried run and its `runs=` sources are checked. Add the known affected runs from the [upgrade note](/docs/upgrading-to-0.6.1#find-known-affected-runs) to your own review. A retry of an ordinary errored run is unaffected.
+
 ## The three knobs
 
 | Argument | Default | Meaning |
@@ -38,7 +56,7 @@ Dendrux rebuilds each run from its own `react_traces` (user message as it was se
 
 `history=` still works alongside `runs=`: runs expand first, your `history` messages come after (useful for app-side markers), then the new input. `context=` dynamic blocks fold into the new input as usual; `placement="stable"` blocks are rejected with `runs=`, because the first replayed run already carries the stable band it was created with.
 
-Validation happens before anything is created: unknown run, another tenant's run, a run still running or paused, duplicates → `ReplayRunError` (a `ValueError`). On `stream()` those arrive as a `RUN_ERROR` event with `meta["error_type"] == "ReplayRunError"`. SingleCall agents accept only `replay_last=0`. `retry()` of a run that used `runs=` re-expands the same runs with the same knobs. The idempotency fingerprint includes all three knobs.
+Validation happens before anything is created: unknown run, another tenant's run, a run still running or paused, duplicates → `ReplayRunError` (a `ValueError`). A blocked run is omitted rather than refused when it is in `runs=`; see above. On `stream()` those arrive as a `RUN_ERROR` event with `meta["error_type"] == "ReplayRunError"`. SingleCall agents accept only `replay_last=0`. `retry()` of a run that used `runs=` re-expands the same runs with the same knobs. The idempotency fingerprint includes all three knobs.
 
 ## Which setting to pick
 

@@ -133,7 +133,7 @@ async def test_single_source_full_replay_keeps_drop_view(engine: Any) -> None:
     assert _visible_tools(fol) == _visible_tools(src)
     dropped = [m.content for m in src if "omitted from context" in m.content]
     assert dropped and [m.content for m in fol if "omitted from context" in m.content] == dropped
-    # ...also when the source had its own seeded image (P1-1: slots are shifted).
+    # ...also when the source had its own seeded image (slots are shifted).
     src_h, fol_h = await _drop_source_then_follow(
         engine, [ChatMessage.user(["old", Image.from_bytes(PNG)]), ChatMessage.assistant("ok")]
     )
@@ -197,7 +197,7 @@ async def test_approval_client_pause_resume_carries_view(engine: Any) -> None:
 
 
 async def test_explicit_skill_retry_after_purge_shows_placeholder(engine: Any) -> None:
-    """P2-1: the purged input image of an explicit-skills run degrades on retry."""
+    """the purged input image of an explicit-skills run degrades on retry."""
     from dendrux import Skill
 
     skill = Skill(name="demo", description="Demo", body="skill body")

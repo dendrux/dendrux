@@ -76,7 +76,7 @@
     "UPDATE agent_runs SET updated_at=?, last_progress_at=CASE WHEN (agent_runs.storage_format = ?) THEN ? ELSE agent_runs.last_progress_at END WHERE agent_runs.id = ? AND agent_runs.claim_epoch = ?",
     "SELECT agent_runs.loop_state, agent_runs.pause_data FROM agent_runs WHERE agent_runs.id = ?",
     "INSERT INTO react_traces (id, agent_run_id, role, content, trace_kind, content_digest, order_index, meta, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO NOTHING RETURNING id",
-    "UPDATE agent_runs SET pause_data=?, loop_state=?, updated_at=? WHERE agent_runs.id = ?",
+    "UPDATE agent_runs SET pause_data=?, reclaim_attempts=?, loop_state=?, updated_at=? WHERE agent_runs.id = ?",
     "COMMIT",
     "BEGIN",
     "UPDATE agent_runs SET updated_at=?, last_progress_at=CASE WHEN (agent_runs.storage_format = ?) THEN ? ELSE agent_runs.last_progress_at END WHERE agent_runs.id = ? AND agent_runs.claim_epoch = ?",

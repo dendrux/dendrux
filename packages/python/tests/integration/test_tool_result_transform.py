@@ -95,8 +95,7 @@ async def test_transform_failure_is_persisted_as_failed_call(db_store, run_store
 
     (inv,) = await run_store.get_tool_invocations(result.run_id, limit=1000)
     assert inv.success is False
-    assert "tool_result_transform" in (inv.error or "")
-    assert "bad shape" in (inv.error or "")
+    assert inv.error == "Tool result transform failed."
 
 
 async def test_not_applied_when_tool_raises(db_store, run_store) -> None:

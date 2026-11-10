@@ -26,7 +26,7 @@ import hashlib
 import json
 import logging
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
 from dendrux import _codes
 from dendrux._lifecycle import (
@@ -175,20 +175,58 @@ class LoadedRun:
     traces: list[TraceRecord]
 
 
+class LoadedReplay(NamedTuple):
+    """The loader's answer: surviving runs and the requested runs it omitted.
+
+    ``omitted`` lists requested runs identified as blocked, in request order.
+    ``extra_blocked`` lists identified runs among the caller's ``extra`` records
+    (a retried run); when it is non-empty no source history was read.
+    """
+
+    runs: list[LoadedRun]
+    omitted: tuple[str, ...] = ()
+    extra_blocked: tuple[str, ...] = ()
+
+
 async def load_replay_runs(
     store: StateStore, request: ReplayRequest, *, tenant_id: str | None
 ) -> list[LoadedRun]:
-    """Load and validate every run in ``request.runs``. Raises ``ReplayRunError``."""
-    return await _load_replay_runs(store, request, tenant_id=tenant_id, limits=None)
+    """Load and validate every run in ``request.runs``. Raises ``ReplayRunError``.
+
+    Runs identified as containing blocked content are left out of the result.
+    """
+    return (await _load_replay_runs(store, request, tenant_id=tenant_id, limits=None)).runs
 
 
 async def _load_replay_runs(
-    store: StateStore, request: ReplayRequest, *, tenant_id: str | None, limits: Limits | None
-) -> list[LoadedRun]:
-    from dendrux.errors import ReplayRunError
-    from dendrux.runtime._capabilities import capabilities
+    store: StateStore,
+    request: ReplayRequest,
+    *,
+    tenant_id: str | None,
+    limits: Limits | None,
+    extra: Sequence[RunRecord] = (),
+) -> LoadedReplay:
+    records = await _authorized_replay_records(store, request, tenant_id)
+    # Identified blocked runs are dropped whole before any of their history is read;
+    # ``extra`` records share the same verdict lookup.
+    blocked = await _blocked_source_ids(store, [*extra, *records], tenant_id)
+    omitted = tuple(record.id for record in records if record.id in blocked)
+    extra_blocked = tuple(record.id for record in extra if record.id in blocked)
+    if extra_blocked:
+        return LoadedReplay([], omitted, extra_blocked)
+    loaded = [
+        await _loaded_run(store, record, limits) for record in records if record.id not in blocked
+    ]
+    return LoadedReplay(loaded, omitted)
 
-    loaded: list[LoadedRun] = []
+
+async def _authorized_replay_records(
+    store: StateStore, request: ReplayRequest, tenant_id: str | None
+) -> list[RunRecord]:
+    """Each requested run, in order, after the scope and terminal-status checks."""
+    from dendrux.errors import ReplayRunError
+
+    records: list[RunRecord] = []
     for run_id in request.runs:
         record = await store.get_run(run_id)
         if record is None or record.tenant_id != tenant_id:
@@ -199,15 +237,46 @@ async def _load_replay_runs(
                 "not_terminal",
                 f"it is still '{record.status}'; only terminal runs can be replayed",
             )
-        traces = (
-            await conversation_records(store, run_id, limits=limits)
-            if record.storage_format == STORAGE_FORMAT_CHECKPOINTED
-            and capabilities(store).checkpointing
-            else await store.get_traces(run_id)
-        )
-        traces = [t for t in traces if not (t.meta or {}).get(SEED_PREFIX_META_KEY)]
-        loaded.append(LoadedRun(record=record, traces=sorted(traces, key=lambda t: t.order_index)))
-    return loaded
+        records.append(record)
+    return records
+
+
+async def _loaded_run(store: StateStore, record: RunRecord, limits: Limits | None) -> LoadedRun:
+    """One surviving run with its own persisted traces (seed-prefix copies excluded)."""
+    from dendrux.runtime._capabilities import capabilities
+
+    traces = (
+        await conversation_records(store, record.id, limits=limits)
+        if record.storage_format == STORAGE_FORMAT_CHECKPOINTED
+        and capabilities(store).checkpointing
+        else await store.get_traces(record.id)
+    )
+    traces = [t for t in traces if not (t.meta or {}).get(SEED_PREFIX_META_KEY)]
+    return LoadedRun(record=record, traces=sorted(traces, key=lambda t: t.order_index))
+
+
+async def _blocked_source_ids(
+    store: StateStore, records: list[RunRecord], tenant_id: str | None
+) -> set[str]:
+    from dendrux.errors import ReplayRunError, RunNotFoundError
+    from dendrux.runtime._blocked_content import _blocked_sources
+
+    try:
+        return await _blocked_sources(store, records, tenant_id=tenant_id)
+    except RunNotFoundError as exc:
+        # The row vanished or left scope after authorization: same answer as a missing run.
+        raise ReplayRunError(exc.run_id, "not_found", "run not found") from None
+
+
+def _omitted_warnings(omitted: Sequence[str]) -> list[str]:
+    return [_omitted_warning(run_id) for run_id in omitted]
+
+
+def _omitted_warning(run_id: str) -> str:
+    return (
+        f"Run {run_id} omitted because it contains blocked content; "
+        "prior effects may have occurred."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -643,8 +712,14 @@ def expand_replay(
     *,
     current: CurrentPrefix,
     guardrails: bool = False,
+    omitted: Sequence[str] = (),
 ) -> ReplayPlan:
-    """Expand ``loaded`` runs into messages per the window and the prefix rule."""
+    """Expand ``loaded`` runs into messages per the window and the prefix rule.
+
+    ``loaded`` holds only the surviving runs; ``omitted`` names the requested runs
+    the loader left out for blocked content (logged by the caller with their code),
+    so the window and prefix compatibility apply to the survivors.
+    """
     warnings: list[str] = []
     replay_reasoning = request.replay_reasoning
     if replay_reasoning and guardrails:
@@ -697,6 +772,7 @@ def expand_replay(
 
     for warning in warnings:
         logger.warning("Run replay: %s", warning)
+    warnings = [*_omitted_warnings(omitted), *warnings]
 
     summary = ReplaySummary(
         runs_full=runs_full,
@@ -818,7 +894,7 @@ async def record_run_prefix(
     try:
         await update(run_id, patch)
     except Exception:
-        logger.warning("Failed to record prefix descriptor for run %s", run_id, exc_info=True)
+        logger.warning("Failed to record prefix descriptor", extra={"run_id": run_id})
 
 
 # ---------------------------------------------------------------------------

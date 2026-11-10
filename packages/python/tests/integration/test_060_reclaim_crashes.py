@@ -190,7 +190,8 @@ async def test_resume_phase1_sigkill_cut(engine, store, tmp_path, cut):
             run, "chosen", tenant_id=None, expected_pause_id=result.pause_id
         )
     assert result.status.value == "success"
-    assert result.recovery.reclaim_attempts == (2 if second else 1)
+    assert result.recovery.reclaim_attempts == 0
+    assert result.recovery.last_reclaimed_at is not None
     rows = await store.get_tool_calls(run)
     if cut == "approval_replay":
         assert effects.read_text() == "effect\n"
@@ -319,5 +320,6 @@ async def test_a1_a1b_billed_calls(engine, store, tmp_path, cut, expected):
     result = await bill_agent(store, model).reclaim(run, tenant_id="tenant", item=item)
     assert result.status.value == "success"
     assert len(bills.read_text().splitlines()) == expected
-    assert result.recovery.reclaim_attempts == 1
+    assert result.recovery.reclaim_attempts == 0
+    assert result.recovery.last_reclaimed_at is not None
     assert result.usage.total_tokens == 10

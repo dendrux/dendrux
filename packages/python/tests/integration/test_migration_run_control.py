@@ -149,7 +149,7 @@ async def test_postgres_upgrade_downgrade_on_populated_db(pg_test_url: str) -> N
         async with engine.connect() as conn:
             assert "pause_requested" in await conn.run_sync(_columns, "agent_runs")
             version = (
-                await conn.execute(text("SELECT version_num FROM alembic_version"))
+                await conn.execute(text("SELECT version_num FROM dendrux_alembic_version"))
             ).scalar_one()
             assert version == HEAD
 

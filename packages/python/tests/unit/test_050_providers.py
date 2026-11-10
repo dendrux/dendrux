@@ -1355,7 +1355,7 @@ class TestTransport:
         assert seen["other"]._client is not provider._client._client
 
     def test_dead_loop_copies_evicted_and_sockets_released(self) -> None:
-        """P1-1: 20 threads each run ``asyncio.run`` against a real socket while the
+        """20 threads each run ``asyncio.run`` against a real socket while the
         owner loop stays alive; no copy, pool or socket outlives its loop."""
         server = _ChatServer()
         provider = OpenAIProvider(

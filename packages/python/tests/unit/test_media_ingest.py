@@ -754,7 +754,7 @@ async def test_contention_exhausted() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Determinism across processes (U-02) and leak scan (S-06)
+# Determinism across processes and raw-content checks
 # ---------------------------------------------------------------------------
 
 _DETERMINISM_SNIPPET = """
@@ -805,7 +805,7 @@ def test_two_process_determinism() -> None:
     }
 
 
-async def test_repr_and_error_leak_scan(tmp_path: Path) -> None:
+async def test_repr_and_errors_omit_raw_content(tmp_path: Path) -> None:
     from dendrux.media import ToolOutput
 
     secret_path = tmp_path / "secret-dir" / "z.png"
@@ -865,7 +865,7 @@ async def test_repr_and_error_leak_scan(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Fix round (review-A): P2-1 .. P2-8
+# Image validation and retention controls
 # ---------------------------------------------------------------------------
 
 

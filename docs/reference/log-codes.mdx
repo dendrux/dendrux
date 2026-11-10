@@ -19,6 +19,7 @@ Missing or invalid codes remain unset. Category and HTTP status remain independe
 
 | Code | Level | Fields | Fires when | Do |
 | --- | --- | --- | --- | --- |
+| `blocked_content` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | Stored history with blocked content is refused, omitted or stopped. | Start a new run with clean input; review the identified run's history. |
 | `governance_changed` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | Continuation detects changed governance in warning mode. | Review the change and use strict policy enforcement. |
 | `governance_legacy` | INFO | `code`, `kind`, `run_id`, `tenant_id` | A legacy run lacks governance pins. | Review the policy before continuing it. |
 | `governance_mismatch` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | A stored governance policy cannot be continued. | Restore the original policy or start a new run. |
@@ -71,6 +72,7 @@ Missing or invalid codes remain unset. Category and HTTP status remain independe
 | --- | --- | --- | --- | --- |
 | `activation_conflict` | WARNING | `code`, `index`, `kind`, `run_id`, `table`, `tenant_id` | Activation detects conflicting duplicate rows. | Resolve the bounded diagnostic before retrying activation. |
 | `migration_lock_timeout` | WARNING | `code`, `kind`, `revision`, `run_id`, `step`, `tenant_id`, `timeout_seconds` | A migration cannot acquire its lock in time. | Retry when the table is quiet. |
+| `migration_version_table_conflict` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | Dendrux migration history is ambiguous or incomplete. | Back up and inspect both version tables; preserve application rows during manual repair. |
 
 ## Observability
 

@@ -20,6 +20,8 @@ from urllib.parse import urlsplit
 import pytest
 
 from dendrux.db import _redis_updates as ru
+from dendrux.runtime.stores._factory import store_for_engine
+from dendrux.store import EventFeed, RunStore, _follow
 from tests._helpers.log_records import record_text
 
 if TYPE_CHECKING:
@@ -337,10 +339,12 @@ async def test_a_killed_listener_connection_surfaces_a_gap_and_resubscribes_once
 async def test_an_oversized_message_is_dropped_without_a_connection_gap(
     admin: Any, channel: str, name: str
 ) -> None:
-    reader = make(channel=channel, client_options={"client_name": name})
+    reader = make(channel=channel, client_options={"client_name": name}, health_check_s=30.0)
     consumer = Consumer()
     lease = await listening(reader, consumer)
     gaps = consumer.gaps
+    generation = reader._generation
+    (connection,) = await clients(admin, name)
     await admin.publish(channel, "x" * 1_000_000)  # 127x the 7,900-byte bound
     await eventually(lambda: reader.stats().dropped_oversize == 1)
     assert consumer.gaps == gaps and reader.healthy
@@ -350,9 +354,73 @@ async def test_an_oversized_message_is_dropped_without_a_connection_gap(
     writer.enqueue(["R1"])
     await writer.flush()
     await eventually(lambda: consumer.ids == ["R1"])
+    assert reader.healthy and consumer.gaps == gaps
+    assert reader._generation == generation
+    (survivor,) = await clients(admin, name)
+    assert survivor["id"] == connection["id"]
     await reader._release_listener(lease)
     await reader.close()
     await writer.close()
+
+
+@pytest.mark.parametrize("engine", ["sqlite"], indirect=True)
+async def test_a_reconnect_gap_resyncs_events_whose_hint_was_lost(
+    admin, channel, engine, monkeypatch
+):
+    # The resync is a Redis behaviour; one store is enough, and the Redis-only
+    # CI job has no Postgres.
+    updates = make(channel=channel, health_check_s=30.0, send_timeout_s=3.0, flush_deadline_s=3.0)
+    original_receive = updates.receive
+    reconnecting = asyncio.Event()
+    reconnect = asyncio.Event()
+    attempts = 0
+
+    async def receive():
+        nonlocal attempts
+        attempts += 1
+        if attempts > 1:
+            reconnecting.set()
+            await reconnect.wait()
+        iterator = original_receive()
+        try:
+            async for message in iterator:
+                yield message
+        finally:
+            await iterator.aclose()
+
+    monkeypatch.setattr(updates, "receive", receive)
+    # Polling is deliberately far away; gap-triggered resync has no random delay.
+    monkeypatch.setattr(_follow.random, "uniform", lambda low, high: 0.0)
+    state = store_for_engine(engine, live_updates=updates)
+    reader = RunStore(state)
+    follower = EventFeed(
+        reader, poll_interval_s=60.0, poll_max_s=60.0, poll_healthy_s=3600.0
+    ).follow("reconnect-run", tenant_id=None)
+    try:
+        await state.create_run("reconnect-run", "reconnect")
+        await state.save_run_event("reconnect-run", event_type="before")
+        await follower.start()
+        async with asyncio.timeout(10):
+            assert (await anext(follower)).event_type == "before"
+        await eventually(lambda: updates.healthy)
+        gaps = updates.stats().gaps
+        updates.abort_listener()
+        async with asyncio.timeout(10):
+            await reconnecting.wait()
+        await eventually_async(lambda: numsub(admin, channel), 0)
+        assert not updates.healthy and updates.stats().gaps > gaps
+        await state.save_run_event("reconnect-run", event_type="during-gap")
+        # The database commit survives; Pub/Sub has no subscriber and cannot replay this hint.
+        assert await admin.publish(channel, '["reconnect-run"]') == 0
+        reconnect.set()
+        await eventually(lambda: updates.healthy and updates.stats().gaps >= gaps + 2)
+        async with asyncio.timeout(10):
+            assert (await anext(follower)).event_type == "during-gap"
+    finally:
+        reconnect.set()
+        await follower.aclose()
+        await reader.close()
+        await state.close()
 
 
 async def test_a_stalled_publish_is_aborted_and_the_next_send_uses_a_fresh_connection(
@@ -503,7 +571,7 @@ def test_the_real_client_refuses_a_bad_option_without_a_server_and_without_a_loo
 
 
 async def test_oversized_publications_keep_listener_and_count_whole_drops(admin, channel):
-    updates = ru.RedisUpdates(REDIS_URL, channel=channel, **FAST)
+    updates = make(channel=channel, health_check_s=30.0)
     consumer = Consumer()
     updates._register(consumer)
     await updates._acquire_listener()

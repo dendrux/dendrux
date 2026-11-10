@@ -480,6 +480,8 @@ async def test_a_failed_group_is_only_an_outage_when_nothing_has_worked_for_a_wh
         assert not any(job.outage for job in early)
         late = suspects_.split(runs, False, clock.now + _follow_recovery.OUTAGE_AFTER_S)
         assert all(job.outage for job in late)
+        after = suspects_.split(runs, False, clock.now + _follow_recovery.OUTAGE_AFTER_S + 0.1)
+        assert all(job.outage for job in after)
         assert not suspects_.store_is_back(clock.now + _follow_recovery.OUTAGE_AFTER_S)
         suspects_.note_read(True, clock.now + 20)
         assert suspects_.store_is_back(clock.now + 20)

@@ -178,7 +178,7 @@ class _Store:
         self.notes = []
 
     async def get_run(self, run_id: str) -> Any:
-        return SimpleNamespace(tenant_id=None)
+        return SimpleNamespace(id=run_id, tenant_id=None, meta={})
 
 
 def _summary(result: RunResult) -> dict[str, Any]:

@@ -464,7 +464,7 @@ def _first_has_edges_true(cat: Any) -> None:
 
 
 async def test_lost_race_at_recheck_external_left_for_revive(engine) -> None:
-    """P2-1: an external row is never reverted (its object may already be gone)."""
+    """an external row is never reverted (its object may already be gone)."""
     blob_store, services, s, data = await live_external(engine, 18)
     await age(engine, "-", s, 7200)
     _first_has_edges_true(catalog(services))
@@ -530,7 +530,7 @@ async def test_lost_race_at_delete_row_leaves_row_for_revive(engine, caplog) -> 
 
 
 async def test_recovery_not_starved_by_referenced_deleting_rows(engine) -> None:
-    """P2-7: rows recovery always skips never fill the recovery page."""
+    """rows recovery always skips never fill the recovery page."""
     blob_store = InMemoryBlobStore()
     services = services_for(engine, blob_store)
     store = store_for_engine(engine)
@@ -575,7 +575,7 @@ async def test_external_rows_skipped_by_gc_without_store(engine) -> None:
 
 
 async def test_owner_key_collision_raises_and_rolls_back(engine, store) -> None:
-    """P2-3: a reused owner key naming another image is an error, never a silent no-op."""
+    """a reused owner key naming another image is an error, never a silent no-op."""
     services = BlobServices.for_state_store(store)
     a = (await store_png(services, "-", make_png(212))).ref.sha256
     b = (await store_png(services, "-", make_png(213))).ref.sha256
@@ -741,7 +741,7 @@ async def run_shared_edge_workload(
 
 @CONCURRENT
 async def test_concurrent_shared_image_edge_writes_never_deadlock(engine) -> None:
-    """P1-1: every worker finishes, no error, no deadlock retry, every edge written once."""
+    """every worker finishes, no error, no deadlock retry, every edge written once."""
     iterations = 25 if engine.dialect.name == "postgresql" else 6
     failures, retries = await run_shared_edge_workload(engine, iterations=iterations)
     assert failures == []

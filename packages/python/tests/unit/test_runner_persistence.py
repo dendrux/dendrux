@@ -67,7 +67,9 @@ class RecordingStateStore(CancellationStubsMixin):
     async def save_run_event(self, run_id: str, **kwargs: Any) -> None:
         self._events.setdefault(run_id, []).append(kwargs)
 
-    async def get_run_events(self, run_id: str) -> list[Any]:
+    async def get_run_events(
+        self, run_id: str, *, event_types: list[str] | None = None, limit: int | None = None
+    ) -> list[Any]:
         @dataclass
         class _Event:
             sequence_index: int
@@ -85,7 +87,8 @@ class RecordingStateStore(CancellationStubsMixin):
                 data=e.get("data"),
             )
             for e in self._events.get(run_id, [])
-        ]
+            if event_types is None or e.get("event_type") in event_types
+        ][:limit]
 
 
 # ------------------------------------------------------------------

@@ -29,6 +29,9 @@ from dendrux._lifecycle import (
 )
 from dendrux._meta_keys import (
     ANNOUNCE_MARKS_SESSION_KEY,
+    BLOCKED_INSERT_SESSION_KEY,
+    BLOCKED_META_KEY,
+    BLOCKED_RUNS_SESSION_KEY,
     COMMIT_PROOFS_SESSION_KEY,
     ERROR_INFO_META_KEY,
     FRESH_EVIDENCE_SESSION_KEY,
@@ -246,6 +249,121 @@ def _status_values(status: Any, *, initial: bool = False) -> dict[str, Any]:
         if initial
         else case((AgentRun.status != status, now), else_=AgentRun.status_changed_at),
     }
+
+
+def _advancing_turn(trace: TraceWrite | None) -> bool:
+    return (
+        trace is not None
+        and trace.advances_progress
+        and trace.trace_kind == "turn"
+        and trace.role in ("assistant", "tool")
+    )
+
+
+def _checkpoint_progress(trace: TraceWrite | None) -> dict[str, Any]:
+    from sqlalchemy import case, exists
+
+    from dendrux.db.models import AgentRun, ReactTrace
+
+    if not _advancing_turn(trace):
+        return {}
+    assert trace is not None
+    # The existing fence also checks freshness, so a retried trace cannot
+    # erase crashes accumulated since its original commit.
+    fresh = ~exists(select(ReactTrace.id).where(ReactTrace.id == trace.trace_id))
+    return {"reclaim_attempts": case((fresh, 0), else_=AgentRun.reclaim_attempts)}
+
+
+def _progress_values(advancing: bool) -> dict[str, Any]:
+    return {"reclaim_attempts": 0} if advancing else {}
+
+
+def _submission_progress(current: dict[str, Any], traces: Sequence[TraceWrite]) -> dict[str, Any]:
+    advancing = (current.get("submission") or {}).get("kind") == "tool_results" and any(
+        _advancing_turn(trace) for trace in traces
+    )
+    return _progress_values(advancing)
+
+
+def _final_progress(status: str, answer: str | None, claim_epoch: int | None) -> dict[str, Any]:
+    from sqlalchemy import case
+
+    from dendrux.db.models import AgentRun
+
+    if status != RunStatus.SUCCESS.value or answer is None or claim_epoch is None:
+        return {}
+    return {
+        "reclaim_attempts": case(
+            (
+                and_(
+                    AgentRun.storage_format == STORAGE_FORMAT_CHECKPOINTED,
+                    AgentRun.status.notin_(_TERMINAL_STATUS_VALUES),
+                ),
+                0,
+            ),
+            else_=AgentRun.reclaim_attempts,
+        )
+    }
+
+
+async def _final_output_values(
+    session: AsyncSession,
+    run_id: str,
+    answer: str | None,
+    error: str | None,
+    iteration_count: int | None,
+    total_usage: UsageStats | None,
+    pii_mapping: dict[str, str] | None,
+    failure_reason: str | None,
+) -> dict[str, Any]:
+    values: dict[str, Any] = {}
+    if iteration_count is not None:
+        values["iteration_count"] = iteration_count
+    if answer is not None or total_usage is not None:
+        values["output_data"] = await _finalized_output_data(session, run_id, answer, total_usage)
+    if error is not None:
+        values["error"] = error
+    if total_usage is not None:
+        values.update(_usage_totals(total_usage))
+    if pii_mapping is not None:
+        values["pii_mapping"] = pii_mapping
+    if failure_reason is not None:
+        values["failure_reason"] = failure_reason
+    return values
+
+
+def _merge_public_meta(meta: dict[str, Any] | None, patch: dict[str, Any]) -> dict[str, Any]:
+    return {
+        **(meta or {}),
+        **{key: value for key, value in patch.items() if key != BLOCKED_META_KEY},
+    }
+
+
+def _creation_mark_proven(store: SQLStateStore, run_id: str, meta: dict[str, Any] | None) -> bool:
+    """A blocked creation's readback must also show the mark it committed with."""
+    from dendrux.runtime._blocked_content import _blocked_target
+
+    return _blocked_target.get() != (store, run_id) or (meta or {}).get(BLOCKED_META_KEY) is True
+
+
+def _note_blocked_event(session: AsyncSession, run_id: str, event_type: str) -> None:
+    """A ``guardrail.blocked`` event marks its run in the same transaction."""
+    if event_type == GovernanceEventType.GUARDRAIL_BLOCKED.value:
+        session.info.setdefault(BLOCKED_RUNS_SESSION_KEY, set()).add(run_id)
+
+
+def _creation_metadata(
+    session: AsyncSession, store: SQLStateStore, run_id: str, meta: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    from dendrux.runtime._blocked_content import _blocked_target
+
+    cleaned = (
+        {key: value for key, value in meta.items() if key != BLOCKED_META_KEY} if meta else meta
+    )
+    if _blocked_target.get() == (store, run_id):
+        session.info[BLOCKED_INSERT_SESSION_KEY] = run_id
+        return {**(cleaned or {}), BLOCKED_META_KEY: True}
+    return cleaned
 
 
 def _check_create_identifiers(
@@ -632,6 +750,7 @@ class SQLStateStore(SQLBlobCatalog):
         operation = self._commit_operation(session, run_ids)
         # ORM flush remains pre-COMMIT and cannot publish hints on failure.
         await session.flush()
+        await self._mark_blocked_writes(session)
         commit_issued = False
         succeeded = False
         try:
@@ -649,6 +768,83 @@ class SQLStateStore(SQLBlobCatalog):
             raise
         finally:
             self._enqueue_committed(session, commit_issued, succeeded)
+
+    async def _mark_blocked_writes(self, session: AsyncSession) -> None:
+        from sqlalchemy import update
+
+        from dendrux.db.models import AgentRun
+        from dendrux.runtime._blocked_content import _blocked_target
+
+        marked = session.info.setdefault(BLOCKED_RUNS_SESSION_KEY, set())
+        target = _blocked_target.get()
+        if (
+            target is not None
+            and target[0] is self
+            and target[1] in session.info.get(TOUCHED_RUNS_SESSION_KEY, ())
+        ):
+            marked.add(target[1])
+        # The initial INSERT has the mark; retain it in the COMMIT readback proof.
+        for run_id in sorted(marked - {session.info.get(BLOCKED_INSERT_SESSION_KEY)}):
+            changed = self.json_patch_expr(AgentRun.meta, SetFields({BLOCKED_META_KEY: True}))
+            if changed is None:
+                from dendrux.errors import PersistenceError
+
+                raise PersistenceError()
+            await session.execute(
+                update(AgentRun).where(AgentRun.id == run_id).values(meta=changed)
+            )
+
+    def _blocked_runs_query(self, run_ids: Sequence[str], tenant_id: str | None) -> Any:
+        from sqlalchemy import func, or_
+
+        from dendrux.db.models import AgentRun, RunEvent
+
+        legacy_event = (
+            select(RunEvent.id)
+            .where(
+                RunEvent.agent_run_id == AgentRun.id,
+                RunEvent.event_type == GovernanceEventType.GUARDRAIL_BLOCKED.value,
+            )
+            .exists()
+        )
+        blocked = or_(
+            self.json_get(AgentRun.meta, (BLOCKED_META_KEY,), "bool").is_(True),
+            AgentRun.failure_reason == FailureReason.GUARDRAIL_BLOCKED.value,
+            legacy_event,
+        )
+        return _apply_tenant_scope(
+            select(AgentRun.id, func.coalesce(blocked, False)).where(
+                self.id_in(AgentRun.id, run_ids)
+            ),
+            tenant_id,
+        )
+
+    def _native_blocked_mark(self) -> object:
+        """Private capability: blocked writes and dispatches here commit the run mark, or
+        refuse, in the same transaction (the runtime then skips the custom-store path)."""
+        from dendrux.runtime._blocked_content import _NATIVE_BLOCKED_MARK
+
+        return _NATIVE_BLOCKED_MARK
+
+    @_safe_database_call
+    async def _blocked_run_ids(self, run_ids: Sequence[str], *, tenant_id: str | None) -> set[str]:
+        from dendrux.errors import RunNotFoundError
+
+        if tenant_id is not None and (not isinstance(tenant_id, str) or not tenant_id):
+            raise ValueError("Blocked source lookup requires an explicit tenant scope")
+        result: set[str] = set()
+        async with self._session_factory() as session:
+            for offset in range(0, len(run_ids), _IN_CHUNK):
+                batch = run_ids[offset : offset + _IN_CHUNK]
+                rows = dict(
+                    (await session.execute(self._blocked_runs_query(batch, tenant_id))).all()
+                )
+                for run_id in batch:
+                    if run_id not in rows:
+                        raise RunNotFoundError(run_id)
+                    if rows[run_id]:
+                        result.add(run_id)
+        return result
 
     async def update_one(
         self,
@@ -1070,6 +1266,7 @@ class SQLStateStore(SQLBlobCatalog):
                     and content_digest(row.input_data) == content_digest(input_data)
                     and row.idempotency_fingerprint == idempotency_fingerprint
                     and row.idempotency_key == idempotency_key
+                    and _creation_mark_proven(self, run_id, row.meta)
                 ):
                     return CreateRunResult(
                         run_id=run_id,
@@ -1123,7 +1320,7 @@ class SQLStateStore(SQLBlobCatalog):
                     parent_run_id=parent_run_id,
                     delegation_level=delegation_level,
                     tenant_id=tenant_id,
-                    meta=meta,
+                    meta=_creation_metadata(session, self, run_id, meta),
                     last_progress_at=_dt.datetime.now(_dt.UTC),
                     idempotency_key=idempotency_key,
                     idempotency_fingerprint=idempotency_fingerprint,
@@ -1280,6 +1477,51 @@ class SQLStateStore(SQLBlobCatalog):
                 storage_format=row.storage_format,
             )
 
+    def _dispatch_filter(self, stmt: Any, run_id: str) -> Any:
+        from dendrux.runtime._blocked_content import _dispatch_guarded
+
+        if _dispatch_guarded(self, run_id):
+            from dendrux.db.models import AgentRun
+
+            return stmt.where(
+                self.json_get(AgentRun.meta, (BLOCKED_META_KEY,), "bool").is_not(True)
+            ).execution_options(synchronize_session=False)
+        return stmt
+
+    async def _check_dispatch_block(
+        self, session: AsyncSession, run_id: str, claim_epoch: int | None
+    ) -> None:
+        from dendrux.runtime._blocked_content import _dispatch_guarded
+
+        if not _dispatch_guarded(self, run_id):
+            return
+        from dendrux.db.models import AgentRun
+        from dendrux.loops._helpers import _BlockedObservationError
+        from dendrux.types import Message, Role, ToolResult
+
+        stmt = select(self.json_get(AgentRun.meta, (BLOCKED_META_KEY,), "bool")).where(
+            AgentRun.id == run_id
+        )
+        if claim_epoch is not None:
+            stmt = stmt.where(AgentRun.claim_epoch == claim_epoch)
+        marked = failed = False
+        try:
+            marked = await session.scalar(stmt) is True
+        except Exception:
+            failed = True
+        if failed:
+            # The refused write cannot be explained: governance cannot decide, so refuse.
+            from dendrux.runtime._blocked_content import _DispatchUndecided
+
+            raise _DispatchUndecided()
+        if marked:
+            raise _BlockedObservationError(
+                Message(Role.USER, "[blocked: 1 finding]"),
+                [],
+                "Run stopped because it contains blocked content.",
+                ToolResult(name="", call_id="", payload="[blocked: 1 finding]"),
+            )
+
     async def _fence(
         self, session: AsyncSession, run_id: str, claim_epoch: int | None, **values: Any
     ) -> None:
@@ -1293,6 +1535,7 @@ class SQLStateStore(SQLBlobCatalog):
         stmt = update(AgentRun).where(AgentRun.id == run_id)
         if claim_epoch is not None:
             stmt = stmt.where(AgentRun.claim_epoch == claim_epoch)
+        stmt = self._dispatch_filter(stmt, run_id)
         now = _dt.datetime.now(_dt.UTC)
         # Only the executing owner can renew via a fenced write. Administrative
         # events without a claim must not keep a crashed worker alive.
@@ -1308,6 +1551,8 @@ class SQLStateStore(SQLBlobCatalog):
         result = await session.execute(
             stmt.ordered_values(*self._ordered(AgentRun.__table__, dict(updated_at=now, **values)))
         )
+        if not getattr(result, "rowcount", 0):
+            await self._check_dispatch_block(session, run_id, claim_epoch)
         if claim_epoch is not None and not getattr(result, "rowcount", 0):
             _codes.log_code(logger, _codes.RUN_FENCED, run_id=run_id)
             raise RunFencedError(run_id, claim_epoch=claim_epoch)
@@ -1696,7 +1941,7 @@ class SQLStateStore(SQLBlobCatalog):
     ) -> None:
         """Commit a bounded execution projection and optional trace under one fence."""
         _validate_checkpoint(run_id, loop_state)
-        values: dict[str, Any] = {"loop_state": loop_state}
+        values: dict[str, Any] = {"loop_state": loop_state, **_checkpoint_progress(trace)}
         if pii_mapping is not None:
             values["pii_mapping"] = pii_mapping
         async with self._session_factory() as session:
@@ -1714,6 +1959,7 @@ class SQLStateStore(SQLBlobCatalog):
         *,
         count_tool: str | None = None,
         pii_mapping: dict[str, str] | None = None,
+        progress: bool = False,
     ) -> None:
         from sqlalchemy import select, update
 
@@ -1723,6 +1969,7 @@ class SQLStateStore(SQLBlobCatalog):
         if "pending" in patch.set_fields:
             raise ValueError("A patch cannot replace pending; remove calls by identity")
         _validate_checkpoint(run_id, dict(patch.set_fields))
+        progress_values = _progress_values(progress)
         changed = self.json_patch_expr(AgentRun.loop_state, PatchLoopState(patch, count_tool))
         if changed is not None:
             result = await self._update_one_rows(
@@ -1734,6 +1981,7 @@ class SQLStateStore(SQLBlobCatalog):
                     updated_at=_dt.datetime.now(_dt.UTC),
                     last_progress_at=_dt.datetime.now(_dt.UTC),
                     loop_state=changed,
+                    **progress_values,
                     **{"pii_mapping": pii_mapping} if pii_mapping is not None else {},
                 ),
                 returning=[AgentRun.loop_state],
@@ -1743,7 +1991,9 @@ class SQLStateStore(SQLBlobCatalog):
                 # Same compact UTF-8 measure as checkpoint_step and SQLite.
                 # A failed bound rolls back the patch and the whole completion.
                 _validate_checkpoint(run_id, merged)
-                self._remember_run_values(session, run_id, {"loop_state": merged})
+                self._remember_run_values(
+                    session, run_id, {"loop_state": merged, **progress_values}
+                )
             else:
                 epoch = await session.scalar(
                     select(AgentRun.claim_epoch).where(AgentRun.id == run_id)
@@ -1757,6 +2007,7 @@ class SQLStateStore(SQLBlobCatalog):
                 session,
                 run_id,
                 claim_epoch,
+                **progress_values,
                 **({"pii_mapping": pii_mapping} if pii_mapping is not None else {}),
             )
             current = await session.scalar(select(AgentRun.loop_state).where(AgentRun.id == run_id))
@@ -1893,6 +2144,7 @@ class SQLStateStore(SQLBlobCatalog):
                 loop_state_patch,
                 count_tool=(observation.meta or {}).get("tool_name"),
                 pii_mapping=pii_mapping,
+                progress=_advancing_turn(observation),
             )
             row_id = (
                 await self._update_many_rows(
@@ -1961,16 +2213,15 @@ class SQLStateStore(SQLBlobCatalog):
                 return False
             changed = _apply_loop_patch(current, patch)
             changed["submission"] = None
-            self._remember_run_values(session, run_id, {"loop_state": changed})
+            values = {"loop_state": changed, **_submission_progress(current, traces)}
+            self._remember_run_values(session, run_id, values)
             _validate_checkpoint(run_id, changed)
             pause = dict(row.pause_data or {})
             pause.pop("submission", None)
             for trace in traces:
                 await self._insert_trace(session, run_id, trace)
             await session.execute(
-                update(AgentRun)
-                .where(AgentRun.id == run_id)
-                .values(loop_state=changed, pause_data=pause)
+                update(AgentRun).where(AgentRun.id == run_id).values(**values, pause_data=pause)
             )
             self._mark_announce(session, (run_id,))
             await self._write_tx(session)
@@ -2297,22 +2548,20 @@ class SQLStateStore(SQLBlobCatalog):
                 # updated_at is filled by the model's onupdate hook (Python aware-UTC).
                 values: dict[str, Any] = {
                     **_status_values(status),
+                    **_final_progress(status, answer, claim_epoch),
                 }
-                if iteration_count is not None:
-                    values["iteration_count"] = iteration_count
-                if answer is not None or total_usage is not None:
-                    values["output_data"] = await _finalized_output_data(
-                        session, run_id, answer, total_usage
+                values.update(
+                    await _final_output_values(
+                        session,
+                        run_id,
+                        answer,
+                        error,
+                        iteration_count,
+                        total_usage,
+                        pii_mapping,
+                        failure_reason,
                     )
-                if error is not None:
-                    values["error"] = error
-                if total_usage is not None:
-                    values.update(_usage_totals(total_usage))
-                if pii_mapping is not None:
-                    values["pii_mapping"] = pii_mapping
-
-                if failure_reason is not None:
-                    values["failure_reason"] = failure_reason
+                )
                 # Clear pause_data on finalize (D1: execution state cleaned up)
                 values["pause_data"] = None
                 # Clear cooperative cancel flag — terminal state is final;
@@ -2517,6 +2766,7 @@ class SQLStateStore(SQLBlobCatalog):
         # updated_at is filled by the model's onupdate hook (Python aware-UTC).
         values: dict[str, Any] = {
             **_status_values(status),
+            **_final_progress(status, answer, claim_epoch),
             "pause_data": None,
             "cancel_requested": False,
             "pause_requested": False,
@@ -2541,20 +2791,18 @@ class SQLStateStore(SQLBlobCatalog):
             (AgentRun.storage_format == STORAGE_FORMAT_CHECKPOINTED, finalized_state),
             else_=AgentRun.loop_state,
         )
-        if iteration_count is not None:
-            values["iteration_count"] = iteration_count
-        if answer is not None or total_usage is not None:
-            values["output_data"] = await _finalized_output_data(
-                session, run_id, answer, total_usage
+        values.update(
+            await _final_output_values(
+                session,
+                run_id,
+                answer,
+                error,
+                iteration_count,
+                total_usage,
+                pii_mapping,
+                failure_reason,
             )
-        if error is not None:
-            values["error"] = error
-        if total_usage is not None:
-            values.update(_usage_totals(total_usage))
-        if pii_mapping is not None:
-            values["pii_mapping"] = pii_mapping
-        if failure_reason is not None:
-            values["failure_reason"] = failure_reason
+        )
 
         self._remember_run_values(session, run_id, values)
         stmt = update(AgentRun).where(
@@ -2656,7 +2904,7 @@ class SQLStateStore(SQLBlobCatalog):
                 ).scalar_one_or_none()
                 if row is None:
                     return
-                row.meta = {**(row.meta or {}), **patch}
+                row.meta = _merge_public_meta(row.meta, patch)
                 self._mark_announce(session, (run_id,))
                 await self._write_tx(session)
 
@@ -2922,7 +3170,6 @@ class SQLStateStore(SQLBlobCatalog):
         )
 
         from dendrux.db.models import AgentRun, RunInbox
-        from dendrux.errors import NoteLimitExceededError
 
         if max_notes is not None and (isinstance(max_notes, bool) or max_notes < 1):
             raise ValueError("max_notes must be a positive int or None.")
@@ -2974,18 +3221,12 @@ class SQLStateStore(SQLBlobCatalog):
                     )
                 )
                 inserted = bool(result.rowcount and result.rowcount > 0)
-                if not inserted and max_notes is not None:
-                    # Still under the lock: tell "full" from missing/terminal/foreign.
-                    status = await session.scalar(
-                        _apply_tenant_scope(
-                            select(AgentRun.status).where(AgentRun.id == run_id), tenant_id
-                        )
+                if not inserted:
+                    await self._refuse_note_insert(
+                        session, run_id, tenant_id, max_notes, _note_count()
                     )
-                    full = (await session.scalar(_note_count()) or 0) >= max_notes
-                    if status is not None and status not in _TERMINAL_STATUS_VALUES and full:
-                        await session.rollback()
-                        _codes.log_code(logger, _codes.NOTE_LIMIT, run_id=run_id, limit=max_notes)
-                        raise NoteLimitExceededError(run_id, limit=max_notes)
+                    await session.rollback()
+                    return False
                 await self._write_tx(session)
                 return inserted
 
@@ -2996,6 +3237,30 @@ class SQLStateStore(SQLBlobCatalog):
             classify=self.classify_db_error,
             _raw_driver_errors=True,
         )
+
+    async def _refuse_note_insert(
+        self,
+        session: AsyncSession,
+        run_id: str,
+        tenant_id: TenantScope,
+        max_notes: int | None,
+        count_query: Any,
+    ) -> None:
+        from sqlalchemy import select
+
+        from dendrux.db.models import AgentRun
+        from dendrux.errors import NoteLimitExceededError
+
+        if max_notes is None:
+            return
+        status = await session.scalar(
+            _apply_tenant_scope(select(AgentRun.status).where(AgentRun.id == run_id), tenant_id)
+        )
+        full = (await session.scalar(count_query) or 0) >= max_notes
+        if status is not None and status not in _TERMINAL_STATUS_VALUES and full:
+            await session.rollback()
+            _codes.log_code(logger, _codes.NOTE_LIMIT, run_id=run_id, limit=max_notes)
+            raise NoteLimitExceededError(run_id, limit=max_notes)
 
     async def get_notes(
         self,
@@ -4135,9 +4400,12 @@ class SQLStateStore(SQLBlobCatalog):
                 )
                 if claim_epoch is not None:
                     stmt = stmt.where(AgentRun.claim_epoch == claim_epoch)
+                stmt = self._dispatch_filter(stmt, run_id)
                 result = await session.execute(
                     stmt.values(last_progress_at=_dt.datetime.now(_dt.UTC))
                 )
+                if not result.rowcount:
+                    await self._check_dispatch_block(session, run_id, claim_epoch)
                 await self._write_tx(session)
                 return bool(result.rowcount)
 
@@ -5564,6 +5832,7 @@ class SQLStateStore(SQLBlobCatalog):
         from dendrux.runtime._digest import event_digest
 
         digest = event_digest(event_type, iteration_index, correlation_id, data)
+        _note_blocked_event(session, run_id, event_type)
 
         def conflict() -> NoReturn:
             _codes.log_code(logger, _codes.WRITE_CONFLICT, run_id=run_id)

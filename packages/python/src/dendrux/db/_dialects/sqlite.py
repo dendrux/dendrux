@@ -6,7 +6,7 @@ Schema upgrades in place live in :mod:`dendrux.db._sqlite_sync`.
 from __future__ import annotations
 
 from contextlib import contextmanager
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from sqlalchemy import UniqueConstraint, inspect, text
 from sqlalchemy.exc import OperationalError
@@ -78,8 +78,10 @@ def matching_unique_constraints(conn: Connection, model_tables: list[Table]) -> 
 
 
 @contextmanager
-def maintenance_lock(conn: Connection) -> Iterator[None]:
-    """Activation: an exclusive file lock retained across committed batches."""
+def maintenance_lock(
+    conn: Connection, *, operation: Literal["activate", "migrate"] = "activate"
+) -> Iterator[None]:
+    """An exclusive file lock retained across committed maintenance batches."""
     timeout: int = conn.exec_driver_sql("PRAGMA busy_timeout").scalar_one()
     conn.exec_driver_sql("PRAGMA busy_timeout=0")
     conn.exec_driver_sql("PRAGMA locking_mode=EXCLUSIVE")
@@ -88,7 +90,7 @@ def maintenance_lock(conn: Connection) -> Iterator[None]:
             conn.exec_driver_sql("BEGIN EXCLUSIVE")
         except OperationalError:
             raise RuntimeError(
-                "Cannot activate SQLite while another connection holds a live transaction. "
+                f"Cannot {operation} SQLite while another connection holds a live transaction. "
                 "Stop other processes, finish the transaction and retry."
             ) from None
         yield

@@ -92,7 +92,7 @@ def lock_is_free(url: str) -> bool:
 
 
 def assert_at_head(url: str) -> None:
-    assert sql(url, "SELECT version_num FROM alembic_version") == [(HEAD,)]
+    assert sql(url, "SELECT version_num FROM dendrux_alembic_version") == [(HEAD,)]
     assert settings(url) == {"storage_format": "2", "activate_step": "done"}
     assert problems(url) == []
     assert lock_is_free(url)
@@ -104,7 +104,7 @@ def test_fresh_database_bootstraps_to_head_and_reruns_are_noops(
     result = migrate(mysql_url, monkeypatch)
     assert result.exit_code == 0, result.output
     assert_at_head(mysql_url)
-    assert tables(mysql_url) == set(Base.metadata.tables) | {"alembic_version"}
+    assert tables(mysql_url) == set(Base.metadata.tables) | {"dendrux_alembic_version"}
     again = migrate(mysql_url, monkeypatch)
     assert again.exit_code == 0, again.output
     assert_at_head(mysql_url)
@@ -165,7 +165,7 @@ def test_crash_between_settings_table_and_marker_resumes(
 def test_crash_before_stamp_resumes(mysql_url: str, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(mysql, "_before_step", _crash_at("stamp"))
     assert migrate(mysql_url, monkeypatch).exit_code == 1
-    assert "alembic_version" not in tables(mysql_url)
+    assert "dendrux_alembic_version" not in tables(mysql_url)
     assert settings(mysql_url)["bootstrap_in_progress"] == HEAD
     status = migrate(mysql_url, monkeypatch, "status")
     assert "bootstrap_in_progress=" + HEAD in status.output
@@ -190,7 +190,7 @@ def _crash_at(name: str):  # noqa: ANN202
         # A Dendrux-named table in a shape this version did not create, no marker.
         (
             [APP_TABLE, "CREATE TABLE agent_runs (id INT PRIMARY KEY)"],
-            "unrecognised",
+            "unrecognised state",
         ),
         (
             [
@@ -199,21 +199,22 @@ def _crash_at(name: str):  # noqa: ANN202
                 "value VARCHAR(255) NOT NULL, updated_at DATETIME(6) NOT NULL)",
                 "INSERT INTO dendrux_settings VALUES ('storage_format', '2', UTC_TIMESTAMP(6))",
             ],
-            "unrecognised",
+            "unrecognised state",
         ),
         (
             [
-                "CREATE TABLE alembic_version (version_num VARCHAR(32) PRIMARY KEY)",
-                "INSERT INTO alembic_version VALUES ('0123456789ab')",
+                "CREATE TABLE dendrux_alembic_version (version_num VARCHAR(32) PRIMARY KEY)",
+                "INSERT INTO dendrux_alembic_version VALUES ('0123456789ab')",
             ],
-            "0123456789ab",
+            "Upgrade Dendrux",
         ),
         (
             [
-                "CREATE TABLE alembic_version (version_num VARCHAR(32) PRIMARY KEY)",
-                "INSERT INTO alembic_version VALUES ('2ce3bb57b0c5')",
+                "CREATE TABLE dendrux_alembic_version (version_num VARCHAR(32) PRIMARY KEY)",
+                "INSERT INTO dendrux_alembic_version VALUES ('2ce3bb57b0c5')",
+                "CREATE TABLE agent_runs (id INT PRIMARY KEY)",
             ],
-            "2ce3bb57b0c5",
+            "Pre-baseline migrations",
         ),
     ],
 )
@@ -224,7 +225,7 @@ def test_foreign_or_unknown_schemas_are_refused(
     before = tables(mysql_url)
     result = migrate(mysql_url, monkeypatch)
     assert result.exit_code == 1
-    assert message in result.output
+    assert message in " ".join(result.output.split())
     assert tables(mysql_url) == before
     assert lock_is_free(mysql_url)
 
@@ -243,7 +244,7 @@ def test_existing_object_that_differs_is_refused_on_resume(
     result = migrate(mysql_url, monkeypatch)
     assert result.exit_code == 1
     assert "agent_runs" in result.output
-    assert "alembic_version" not in tables(mysql_url)
+    assert "dendrux_alembic_version" not in tables(mysql_url)
     assert lock_is_free(mysql_url)
 
 
@@ -259,7 +260,9 @@ def test_a_marker_from_another_revision_is_refused(
     monkeypatch.setattr(mysql, "_before_step", None)
     result = migrate(mysql_url, monkeypatch)
     assert result.exit_code == 1
-    assert "aaaaaaaaaaaa" in result.output
+    assert "migration_version_table_conflict" in result.output
+    assert "Finish it with that version" in " ".join(result.output.split())
+    assert "aaaaaaaaaaaa" not in result.output
 
 
 def test_a_held_maintenance_lock_refuses_and_the_holder_is_unaffected(
@@ -363,13 +366,14 @@ def test_create_all_and_bootstrap_build_the_same_catalog(
         catalog = (
             "SELECT table_name, column_name, column_type, is_nullable, column_default, "
             "collation_name, extra, generation_expression FROM information_schema.columns "
-            "WHERE table_schema = DATABASE() AND table_name <> 'alembic_version' "
+            "WHERE table_schema = DATABASE() AND table_name <> 'dendrux_alembic_version' "
             "ORDER BY table_name, ordinal_position"
         )
         indexes = (
             "SELECT table_name, index_name, non_unique, seq_in_index, column_name, collation "
             "FROM information_schema.statistics WHERE table_schema = DATABASE() "
-            "AND table_name <> 'alembic_version' ORDER BY table_name, index_name, seq_in_index"
+            "AND table_name <> 'dendrux_alembic_version' "
+            "ORDER BY table_name, index_name, seq_in_index"
         )
         assert sql(mysql_url, catalog) == sql(second, catalog)
         assert sql(mysql_url, indexes) == sql(second, indexes)
@@ -419,7 +423,7 @@ def test_shared_database_bootstraps_and_leaves_app_tables_untouched(
     result = migrate(mysql_url, monkeypatch)
     assert result.exit_code == 0, result.output
     assert_at_head(mysql_url)
-    assert tables(mysql_url) == set(Base.metadata.tables) | {"alembic_version", "customers"}
+    assert tables(mysql_url) == set(Base.metadata.tables) | {"dendrux_alembic_version", "customers"}
     assert app_snapshot(mysql_url) == before
     assert migrate(mysql_url, monkeypatch, "check").exit_code == 0
     assert migrate(mysql_url, monkeypatch).exit_code == 0  # rerun: still a no-op
@@ -449,7 +453,8 @@ def test_an_unrecognised_dendrux_table_is_refused_and_nothing_is_touched(
     sql(mysql_url, "CREATE TABLE run_events (id INT PRIMARY KEY)")
     result = migrate(mysql_url, monkeypatch)
     assert result.exit_code == 1
-    assert "run_events" in result.output
+    assert "migration_version_table_conflict" in result.output
+    assert "unrecognised state" in " ".join(result.output.split())
     assert tables(mysql_url) == {"customers", "run_events"}
     assert app_snapshot(mysql_url) == before
     assert lock_is_free(mysql_url)
@@ -537,7 +542,7 @@ def test_a_database_at_the_baseline_upgrades_to_a_later_revision(
     config.set_main_option("script_location", str(scripts))
     config.stdout = io.StringIO()
     command.upgrade(config, "head")
-    assert sql(mysql_url, "SELECT version_num FROM alembic_version") == [(LATER,)]
+    assert sql(mysql_url, "SELECT version_num FROM dendrux_alembic_version") == [(LATER,)]
     assert "dendrux_probe_later" in tables(mysql_url)
     assert lock_is_free(mysql_url)
 
@@ -603,3 +608,134 @@ def test_a_disconnect_classified_fault_after_the_lock_still_closes_the_session(
     state = run_sync(go())
     assert state["locked"] and state["broken"] and state["invalidated"]
     assert lock_is_free(mysql_url)  # the lock is free and no session is left attached
+
+
+@pytest.mark.parametrize("interrupted", [False, True])
+def test_061_legacy_head_rename_keeps_lock_and_resumes(
+    mysql_url: str, monkeypatch: pytest.MonkeyPatch, interrupted: bool
+) -> None:
+    if interrupted:
+        monkeypatch.setattr(mysql, "_before_step", _crash_at("clear_marker"))
+    first = migrate(mysql_url, monkeypatch)
+    assert first.exit_code == int(interrupted), first.output
+    sql(mysql_url, "RENAME TABLE dendrux_alembic_version TO alembic_version")
+    assert sql(mysql_url, "SHOW INDEX FROM alembic_version")[0][2] == "PRIMARY"
+    monkeypatch.setattr(mysql, "_before_step", None)
+    original = mysql.bounded_execute
+    renamed = []
+
+    def observe(conn, statement, **kw):
+        result = original(conn, statement, **kw)
+        if statement == "RENAME TABLE alembic_version TO dendrux_alembic_version":
+            # RENAME commits implicitly; the same connection must still own GET_LOCK.
+            assert (
+                conn.scalar(
+                    text(
+                        "SELECT IS_USED_LOCK(CONCAT('dendrux_maint_', SHA1(DATABASE()))) "
+                        "= CONNECTION_ID()"
+                    )
+                )
+                == 1
+            )
+            renamed.append(True)
+        return result
+
+    monkeypatch.setattr(mysql, "bounded_execute", observe)
+    result = migrate(mysql_url, monkeypatch)
+    assert result.exit_code == 0, result.output
+    assert renamed == [True]
+    assert "alembic_version" not in tables(mysql_url)
+    assert_at_head(mysql_url)
+    before = (
+        tables(mysql_url),
+        settings(mysql_url),
+        sql(mysql_url, "SHOW CREATE TABLE dendrux_alembic_version"),
+    )
+    for action in ("migrate", "check", "status"):
+        result = migrate(mysql_url, monkeypatch, action)
+        assert result.exit_code == 0, result.output
+    assert renamed == [True]
+    assert (
+        tables(mysql_url),
+        settings(mysql_url),
+        sql(mysql_url, "SHOW CREATE TABLE dendrux_alembic_version"),
+    ) == before
+    assert lock_is_free(mysql_url)
+
+
+@pytest.mark.parametrize("empty", [False, True])
+def test_061_app_alembic_history_survives_bootstrap_and_rerun(
+    mysql_url: str, monkeypatch: pytest.MonkeyPatch, empty: bool
+) -> None:
+    sql(
+        mysql_url,
+        "CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL, "
+        "CONSTRAINT alembic_version_pkc PRIMARY KEY (version_num))",
+    )
+    if not empty:
+        sql(mysql_url, "INSERT INTO alembic_version VALUES ('app_one'), ('app_two')")
+    before = (
+        sql(mysql_url, "SHOW CREATE TABLE alembic_version"),
+        sql(mysql_url, "SELECT version_num FROM alembic_version ORDER BY version_num"),
+    )
+    for action in ("migrate", "migrate", "check", "status"):
+        result = migrate(mysql_url, monkeypatch, action)
+        assert result.exit_code == 0, result.output
+        assert (
+            sql(mysql_url, "SHOW CREATE TABLE alembic_version"),
+            sql(mysql_url, "SELECT version_num FROM alembic_version ORDER BY version_num"),
+        ) == before
+    assert_at_head(mysql_url)
+
+
+@pytest.mark.parametrize("claim", ["both", "mixed", "unknown"])
+def test_061_conflicting_history_refuses_without_changes(
+    mysql_url: str, monkeypatch: pytest.MonkeyPatch, claim: str
+) -> None:
+    assert migrate(mysql_url, monkeypatch).exit_code == 0
+    if claim in {"both", "mixed"}:
+        sql(
+            mysql_url,
+            "CREATE TABLE alembic_version (version_num VARCHAR(32) PRIMARY KEY)",
+            f"INSERT INTO alembic_version VALUES ('{HEAD}')",
+        )
+        if claim == "mixed":
+            sql(
+                mysql_url,
+                "INSERT INTO alembic_version VALUES ('app_one')",
+                "DROP TABLE dendrux_alembic_version",
+            )
+    else:
+        sql(mysql_url, "UPDATE dendrux_alembic_version SET version_num='newer_version'")
+    before_tables = tables(mysql_url)
+    before_settings = settings(mysql_url)
+    before = {
+        name: sql(mysql_url, f"SELECT version_num FROM {name} ORDER BY version_num")
+        for name in before_tables
+        if name.endswith("alembic_version")
+    }
+    result = migrate(mysql_url, monkeypatch)
+    assert result.exit_code == 1 and "migration_version_table_conflict" in result.output
+    if claim == "unknown":
+        assert "Upgrade Dendrux" in " ".join(result.output.split())
+        assert "repair the stamps" not in result.output
+    assert tables(mysql_url) == before_tables
+    assert settings(mysql_url) == before_settings
+    assert {
+        name: sql(mysql_url, f"SELECT version_num FROM {name} ORDER BY version_num")
+        for name in before
+    } == before
+    assert lock_is_free(mysql_url)
+
+
+def test_061_empty_dedicated_history_bootstraps(
+    mysql_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sql(
+        mysql_url,
+        "CREATE TABLE dendrux_alembic_version (version_num VARCHAR(32) NOT NULL, "
+        "CONSTRAINT dendrux_alembic_version_pkc PRIMARY KEY (version_num))",
+    )
+    result = migrate(mysql_url, monkeypatch)
+    assert result.exit_code == 0, result.output
+    assert_at_head(mysql_url)

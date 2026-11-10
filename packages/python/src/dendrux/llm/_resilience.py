@@ -245,7 +245,7 @@ async def _on_response(response: httpx.Response) -> None:
             state.last_status = response.status_code
             state.retry_after = parse_retry_after(response.headers)
     except Exception:  # observability only; never break a call
-        logger.debug("provider call-state hook failed", exc_info=True)
+        logger.debug("provider call-state hook failed")
 
 
 def make_http_client(
@@ -1049,5 +1049,5 @@ async def close_quietly(resource: Any) -> None:
             if asyncio.iscoroutine(result) or isinstance(result, asyncio.Future):
                 await result
         except Exception:
-            logger.debug("closing a provider stream failed", exc_info=True)
+            logger.debug("closing a provider stream failed")
         return

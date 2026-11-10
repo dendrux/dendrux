@@ -129,4 +129,47 @@ async def test_resume_setup_transaction_bytes(store, monkeypatch, entry, storage
         + "\n"
     )
     expected = Path(__file__).with_name("fixtures") / f"resume_setup_{entry}_{storage_format}.json"
-    assert wire == expected.read_text()
+    expected_wire = expected.read_text()
+    if entry == "reclaim" and storage_format == 2:
+        expected_wire = _admission_before_rebuild(expected_wire)
+    assert wire == expected_wire
+
+
+def _admission_before_rebuild(recorded):
+    # Move only the existing row/verdict transactions ahead of history reads.
+    # Keep the recording and every statement/count/boundary otherwise unchanged.
+    expected = json.loads(recorded)
+    blocks = []
+    for statement in expected["transactions"]:
+        if statement == "BEGIN":
+            blocks.append([])
+        assert blocks, "Statement outside a transaction"
+        blocks[-1].append(statement)
+    assert all(block[-1] in ("COMMIT", "ROLLBACK") for block in blocks)
+    row = _transaction_with(blocks, "SELECT agent_runs.id, agent_runs.tenant_id")
+    verdict = _transaction_with(blocks, "SELECT agent_runs.id, coalesce(")
+    claim = _transaction_with(blocks, "UPDATE agent_runs SET claim_epoch=")
+    for block in (row, verdict):
+        assert len(block) == 3 and block[-1] == "ROLLBACK"
+        blocks.remove(block)
+    after_claim = blocks.index(claim) + 1
+    blocks[after_claim:after_claim] = [row, verdict]
+    expected["transactions"] = [statement for block in blocks for statement in block]
+    return json.dumps(expected, indent=2) + "\n"
+
+
+def _transaction_with(blocks, prefix):
+    matches = [block for block in blocks if any(s.startswith(prefix) for s in block)]
+    assert len(matches) == 1, f"Expected one transaction containing {prefix!r}"
+    return matches[0]
+
+
+def test_admission_adapter_locates_statements_after_an_unrelated_transaction():
+    path = Path(__file__).with_name("fixtures") / "resume_setup_reclaim_2.json"
+    recorded = path.read_text()
+    expected = json.loads(_admission_before_rebuild(recorded))
+    shifted = json.loads(recorded)
+    extra = ["BEGIN", "SELECT unrelated_setup", "ROLLBACK"]
+    shifted["transactions"] = extra + shifted["transactions"]
+    expected["transactions"] = extra + expected["transactions"]
+    assert json.loads(_admission_before_rebuild(json.dumps(shifted))) == expected

@@ -162,7 +162,7 @@ async def _cancel_handoff(
 
 async def _ownership_handoff(
     store: Any,
-    operation: Awaitable[T],
+    operation_factory: Callable[[], Awaitable[T]],
     on_cancel: Callable[[T], Coroutine[Any, Any, Any]],
     *,
     run_id: str,
@@ -172,6 +172,12 @@ async def _ownership_handoff(
 
     native = unclaimed_store(store)
     marker: dict[str, Any] = {}
+    token = _handoff_commit.set(marker)
+    try:
+        # Store-created Tasks copy this context at invocation, before their first step.
+        operation = operation_factory()
+    finally:
+        _handoff_commit.reset(token)
     task = asyncio.create_task(_without_live_flush(native, operation, marker))
     try:
         result = await asyncio.shield(task)

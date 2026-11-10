@@ -167,7 +167,7 @@ async def test_postgres_up_down_up_on_populated_db(pg_test_url: str) -> None:
         await asyncio.to_thread(_alembic, url, "upgrade", "head")
         async with engine.connect() as conn:
             version = (
-                await conn.execute(text("SELECT version_num FROM alembic_version"))
+                await conn.execute(text("SELECT version_num FROM dendrux_alembic_version"))
             ).scalar_one()
             assert version == HEAD
             blobs = (await conn.execute(text("SELECT count(*) FROM dendrux_blobs"))).scalar_one()

@@ -517,6 +517,11 @@ class PersistenceRecorder(BaseRecorder):
         self._history_limits: Limits | None = None
         self._clarification: dict[str, Any] | None = None
 
+    def _blocked_evidence(self, run_id: str) -> AbstractAsyncContextManager[None]:
+        from dendrux.runtime._blocked_content import _blocked_evidence
+
+        return _blocked_evidence(self._store, run_id)
+
     @property
     def _pause_summary_bytes(self) -> int:
         return (
@@ -1367,7 +1372,10 @@ class PersistenceRecorder(BaseRecorder):
         """Resolve a stored result at its reserved position without another effect."""
         pending = next(p for p in self._loop_state["pending"] if p["call_id"] == call_id)
         trace = (
-            message_trace(message, pending["order_index"], tenant_scope=self._tenant_scope)
+            replace(
+                message_trace(message, pending["order_index"], tenant_scope=self._tenant_scope),
+                advances_progress=False,
+            )
             if message is not None
             else None
         )
@@ -1382,22 +1390,58 @@ class PersistenceRecorder(BaseRecorder):
 
     async def on_tool_started(self, run_id: str, tool_call: ToolCall, iteration: int) -> None:
         """Persist an execution intent before an actual server dispatch."""
+        from dendrux.errors import PersistenceError
+        from dendrux.runtime._blocked_content import _dispatch_write, _DispatchUndecided
+
+        await self._check_custom_dispatch(run_id)
+        undecided = False
+        with _dispatch_write(self._store, run_id):
+            try:
+                await self._write_tool_intent(run_id, tool_call, iteration)
+            except _DispatchUndecided:
+                # A refused dispatch write whose cause could not be read: refuse safely.
+                undecided = True
+            if not undecided:
+                await self._cancel_guard.check(run_id)
+        if undecided:
+            raise PersistenceError()
+
+    async def _check_custom_dispatch(self, run_id: str) -> None:
+        from dendrux.guardrails._engine import _entry_engine
+        from dendrux.loops._helpers import _check_blocked_run
+        from dendrux.runtime._blocked_content import _native_blocked_store
+
+        native = _native_blocked_store(self._store) is not None
+        guarded = self.guardrail_engine is not None or _entry_engine(run_id) is not None
+        if not native and guarded and hasattr(self._store, "add_note"):
+            # Custom stores have no mark predicate on the dispatch write: a guarded
+            # run reads the mark when notes are pending. Guardrail-free runs add no read.
+            control = await read_run_control(self._store_calls, run_id)
+            if control.has_pending_notes:
+                await _check_blocked_run(self._store, run_id)
+
+    async def _write_tool_intent(self, run_id: str, tool_call: ToolCall, iteration: int) -> None:
         if self._format2:
             await self._start_checkpointed_tool(run_id, tool_call, iteration)
         else:
-            try:
-                # Legacy progress writes remain cancellable; format-2 intent
-                # durability is handled by the fenced branch above.
-                await self._store_calls.touch_progress(self._run_id)
-            except RunFencedError:
-                raise
-            except Exception:
-                logger.warning(
-                    "Failed to touch progress for run %s",
-                    self._run_id,
-                    exc_info=safe_exception_info(),
-                )
-        await self._cancel_guard.check(run_id)
+            await self._touch_tool_progress(run_id)
+
+    async def _touch_tool_progress(self, run_id: str) -> None:
+        from dendrux.loops._helpers import _BlockedObservationError
+        from dendrux.runtime._blocked_content import _DispatchUndecided
+
+        try:
+            # Legacy progress writes stay best-effort. A write the native mark predicate
+            # refused stops the dispatch: a proven mark, or an unexplained refusal.
+            await self._store_calls.touch_progress(run_id)
+        except (RunFencedError, _BlockedObservationError, _DispatchUndecided):
+            raise
+        except Exception:
+            logger.warning(
+                "Failed to touch progress for run %s",
+                run_id,
+                exc_info=safe_exception_info(),
+            )
 
     async def _start_checkpointed_tool(
         self, run_id: str, tool_call: ToolCall, iteration: int

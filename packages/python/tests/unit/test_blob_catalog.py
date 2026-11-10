@@ -389,7 +389,7 @@ async def test_in_memory_orphan_edges() -> None:
 
 
 async def test_gc_edge_after_mark_external_stays_deleting() -> None:
-    """P2-1: never revert an external row (an ingest may have deleted its object)."""
+    """never revert an external row (an ingest may have deleted its object)."""
     services = BlobServices.in_memory()
     memory = services.memory
     assert memory is not None

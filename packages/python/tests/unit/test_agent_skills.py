@@ -16,6 +16,7 @@ import pytest
 from dendrux.agent import Agent
 from dendrux.skills import Skill
 from dendrux.tool import tool
+from tests._helpers.warnings import warnings_of
 
 FIXTURES_DIR = Path(__file__).parent.parent / "fixtures" / "skills"
 
@@ -528,7 +529,7 @@ class TestSingleCallInlinedSkills:
             agent.get_system_prompt()
             agent.get_system_prompt()
 
-        inline_warnings = [r for r in records if "inlined skill mode" in str(r.message)]
+        inline_warnings = warnings_of(records, UserWarning, "inlined skill mode")
         assert len(inline_warnings) == 1
 
     def test_warning_includes_character_count(self) -> None:
@@ -703,7 +704,7 @@ class TestRefreshRearmsInlinedSkillWarning:
             warnings.simplefilter("always")
             agent.get_system_prompt()
             agent.get_system_prompt()
-        assert len([r for r in first_records if "inlined skill mode" in str(r.message)]) == 1
+        assert len(warnings_of(first_records, UserWarning, "inlined skill mode")) == 1
 
         # refresh() resets discovery + skill caches AND the warning flag.
         import asyncio
@@ -713,7 +714,7 @@ class TestRefreshRearmsInlinedSkillWarning:
         with warnings.catch_warnings(record=True) as second_records:
             warnings.simplefilter("always")
             agent.get_system_prompt()
-        assert len([r for r in second_records if "inlined skill mode" in str(r.message)]) == 1
+        assert len(warnings_of(second_records, UserWarning, "inlined skill mode")) == 1
 
 
 # ---------------------------------------------------------------------------

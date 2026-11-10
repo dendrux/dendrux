@@ -172,7 +172,7 @@ The two engines trade off detection recall against predictability. Pick based on
 **When Presidio earns its keep:**
 
 - Input is free-form natural language (chat, email bodies, support tickets, meeting transcripts) where names, places, and dates show up unpredictably.
-- Detection recall matters more than precision — you'd rather over-redact than leak.
+- Detection recall matters more than precision — prefer extra redaction over missed detections.
 - You want the fuller entity catalogue (`IBAN_CODE`, `MEDICAL_LICENSE`, `US_PASSPORT`, etc.) without writing regexes for each.
 
 ### The false-positive reality
@@ -195,7 +195,7 @@ Why the run still succeeded:
 
 1. The LLM gets tool names from the **tool schema** (the `tools=[...]` argument to the provider API), not from prompt text. The schema is not guardrail-scanned. So the LLM knew the tool was called `process_refund` and called it correctly.
 2. Within the prompt text, the LLM saw `"call <<PERSON_1>> with..."`. It ignored the placeholder because the schema was the source of truth.
-3. The `pii_mapping` gained one extra audit entry. No data leaked.
+3. The `pii_mapping` gained one extra audit entry. The original value stayed redacted.
 
 This is benign when the misclassified token is (a) not sensitive and (b) not something the LLM needs to reason about semantically in text. Those conditions fit most real prompts.
 
@@ -273,7 +273,7 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-`SecretDetection` ships with four patterns: `AWS_ACCESS_KEY`, `AWS_SECRET_KEY`, `GENERIC_API_KEY`, `PRIVATE_KEY`. Since 0.5.0 an AWS secret key is reported only next to an `AKIA...` access key or a context word such as `aws_secret_access_key`, so random 40-character strings no longer trigger it. The default action is `block`, not `redact`, because a secret that leaked into a prompt should stop the conversation rather than be silently replaced.
+`SecretDetection` ships with four patterns: `AWS_ACCESS_KEY`, `AWS_SECRET_KEY`, `GENERIC_API_KEY`, `PRIVATE_KEY`. Since 0.5.0 an AWS secret key is reported only next to an `AKIA...` access key or a context word such as `aws_secret_access_key`, so random 40-character strings no longer trigger it. The default action is `block`, not `redact`, because a secret found in a prompt should stop the conversation rather than be silently replaced.
 
 The captured governance rows from that run (Dendrux 0.5.0, claude-haiku-4-5):
 
@@ -350,11 +350,52 @@ Look closely at the `warn` run above. `seq=2` has `"direction": "incoming"`, `se
 
 The **incoming scan** happens before the messages list is handed to `provider.complete()`. Every message the strategy built gets scanned. `redact` replaces entities with placeholders at this point; this is the only place in the system where the content going to the LLM is mutated. If any guardrail decides to `block`, the LLM is never called.
 
-The **outgoing scan** happens after `provider.complete()` returns, on the assistant's response and any tool-call params. It is detection-only: findings are recorded, `guardrail.detected` is emitted, and a `block` action still terminates the run. It never mutates what gets persisted. The next iteration's incoming scan is where placeholders get applied for the following LLM call.
+The **outgoing scan** happens after `provider.complete()` returns, on the assistant's response and any tool-call params. Findings are recorded and `guardrail.detected` is emitted. A `redact` or `warn` finding does not change what gets persisted; the next iteration's incoming scan is where placeholders get applied for the following LLM call. A `block` action terminates the run and, since 0.6.1, replaces the blocked response with a placeholder before it is stored (see [Blocked text is stored as a placeholder](#blocked-text-is-stored-as-a-placeholder)).
 
-This split is deliberate: the DB is ground truth. inspection tools, traces, and the developer's own systems see the raw value; only the provider API wire carries placeholders.
+This split is deliberate for `redact` and `warn`: the DB is ground truth. Inspection tools, traces, and the developer's own systems see the raw value; only the provider API wire carries placeholders. Text that a `block` guardrail rejects is the exception: it is never stored.
 
 A run that enters `waiting_approval` and later resumes will scan again on the next iteration (the history being replayed is the raw transcript). The `pii_mapping` is stable across scans so the same replacement token is reused, and there is no double-redaction.
+
+## Blocked text is stored as a placeholder
+
+Since 0.6.1, text that a `block` guardrail rejects (and text a `block` or `redact` guardrail cannot scan) is replaced before it is stored, and the run is marked as holding blocked content. The stored form is `[blocked: 1 finding]`, or `[blocked: 2 findings]` for two, and so on. It carries a count and no matched value, and it adds nothing to `pii_mapping`.
+
+The placeholder replaces the text everywhere Dendrux keeps a copy: the run input, traces, wire content, tool results, submitted replies, rejection reasons, notes, events, and the seed rows copied into later runs. Hashes, previews and request identities are computed from the placeholder, not from the rejected text. A rejected tool-call parameter set is stored as one parameter named `blocked` whose value is the placeholder, and this covers outgoing tool-call parameters for both ReAct and `SingleCall` agents. A blocked outgoing response also drops its raw response, provider request and reasoning, and a blocked context block loses its kind, source and metadata, because those can hold another copy of the text.
+
+If the combined entry scan blocks while individual pieces are allowed, the discarded piece scans contribute no mapping, reverse lookup, origin, counter or cached projection. Mappings from earlier allowed messages remain; ordinary reversible redaction is unchanged.
+
+When a continuation adopts work submitted by another call, it retains the first verdict and trusted placeholder through the first new event or trace, without rebuilding and rescanning rejected text. This applies to tool results, human input, approval and rejection reasons, and pending notes. Native stores commit the mark atomically with that evidence. Custom stores must establish and verify the mark before writing the evidence, or raise `PersistenceError`. Existing unguarded rows are not erased.
+
+This includes recovering approval pauses: blocked approval and rejection reasons stop before recovery resolution or approval work. Clean adopted approval submissions keep the existing recovery history.
+
+Reclaim of a run whose crashed claim left a submission it never consumed scans that stored submission, with the same projection as other adopted submissions, before recovery resolution. Each text is scanned once in the form recovery sends (a denial as the call's tool result, with an empty denial reason replaced by the default reason), and recovery reuses that verdict. When JSON escaping changes a denial reason, its raw text is scanned once more. A block on a tool result, human input, a rejection reason or a per-call reason (approved or denied) stops the run as `error` with `failure_reason="guardrail_blocked"`: no `approval.decided` event, provider call or tool call, and no new row holding the text. If recovery projects a message it sends again and that projection is blocked, the run stops with the same failure reason before the submission is consumed and before any tool call, with the run mark committed together with its first blocked event. The result reports the turn that would have consumed the submission, with committed usage from its checkpoint. A clean stored submission is recovered as before, with no added statements.
+
+The mark is stored on the run (not in the placeholder's spelling, which anyone can type), it is permanent, and callers cannot set or clear it through metadata. What it changes:
+
+| Entry point | Result |
+| --- | --- |
+| Initial input, history or context blocked | `RunResult` with status `error`, `failure_reason="guardrail_blocked"`, a safe `error`, the `guardrail.blocked` and `run.error` events, and zero provider calls |
+| Resume, submit or reclaim of an unfinished marked run | Stops with status `error` and `failure_reason="guardrail_blocked"` and a `run.error` event, with no provider or tool calls. The error reads "Run stopped because it contains blocked content." when an earlier call left the mark. A run that another worker already finished is not changed |
+| `agent.retry()` of a marked run, or of a run whose `runs=` sources include one | `ReplayRunError` with `reason="blocked_content"` before any run is created |
+| `runs=` that includes a marked run | The whole run is left out and `ReplaySummary.warnings` says so; see [Run replay](/docs/recipes/run-replay#blocked-runs-are-not-replayed) |
+
+Each refusal, omission and stop logs the code `blocked_content` with the run ID only. See [Log codes](/docs/reference/log-codes).
+
+Reclaim checks blocked provenance after validation and ownership claim, before history rebuild. A marked run or one identified by a legacy blocked event stops even if `max_rebuild_rows` would reject its history. The already-loaded run row can identify a block without an added lookup; otherwise native reclaim adds one extra indexed lookup and custom reclaim uses a filtered event read. A clean continuation reuses that verdict and still enforces history limits.
+
+A blocked reclaim keeps committed iteration and usage from its checkpoint, without rebuilding history to recover those totals.
+
+Native retry and replay checks use chunks of 200 source IDs, with one added indexed lookup per chunk beyond existing source authorization reads. Retry includes the retried run in that set. Custom stores use the loaded row and, when it does not identify a block, one filtered `guardrail.blocked` event read with `limit=1` per source. The provenance checks do not load history.
+
+A custom store must keep the mark together with the placeholder through its existing metadata and evidence methods. A store that cannot keep the blocked mark refuses the blocked write with `PersistenceError`, so the run keeps only its clean history and a later retry sends only that history.
+
+### Limits
+
+- Model reasoning text is not scanned in 0.6.1. A secret that appears only in reasoning is stored as the model produced it. Scanning it is planned for 0.7.
+- Histories copied before 0.6.1 are not cleaned, and old raw rows and the hashes derived from them stay until you review or scrub them. That includes retry copies made from a blocked run: only the retried run and its `runs=` sources are checked, so retrying such a copy is not refused. Absence of the mark does not show that old history is safe.
+- Skill body digests (a sha256 of each skill body) remain in run metadata, events and spans; they identify the skill definition.
+- A custom store that cannot keep the blocked mark fails closed, as above, and cannot offer the retry refusal or replay omission for that run.
+- Placeholders do not erase application files, vendor-side data, backups or image bytes. Images keep their blob-store retention; the guardrail protects text that accompanies them.
 
 ## Content that cannot be scanned fails closed
 

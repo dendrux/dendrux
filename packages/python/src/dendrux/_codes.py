@@ -472,6 +472,14 @@ TENANT_SCOPE_REQUIRED = Code(
     "A strict tenancy entry has no explicit tenant scope.",
     "Pass the intended tenant scope.",
 )
+BLOCKED_CONTENT = Code(
+    "blocked_content",
+    logging.WARNING,
+    "governance",
+    _BASE_FIELDS,
+    "Stored history with blocked content is refused, omitted or stopped.",
+    "Start a new run with clean input; review the identified run's history.",
+)
 RESERVED_METADATA_KEY = Code(
     "reserved_metadata_key",
     logging.WARNING,
@@ -655,6 +663,14 @@ SWEEP_CAP_REACHED = Code(
     _BASE_FIELDS | frozenset(["category", "cap", "inspected"]),
     "A sweep reaches its inspection bound.",
     "Run another sweep or raise the bound.",
+)
+MIGRATION_VERSION_TABLE_CONFLICT = Code(
+    "migration_version_table_conflict",
+    logging.WARNING,
+    "migration",
+    _BASE_FIELDS,
+    "Dendrux migration history is ambiguous or incomplete.",
+    "Back up and inspect both version tables; preserve application rows during manual repair.",
 )
 MIGRATION_LOCK_TIMEOUT = Code(
     "migration_lock_timeout",
@@ -1940,6 +1956,7 @@ REGISTRY = MappingProxyType(
             USAGE_INVALID,
             LOCAL_DATABASE_DEFAULT_CHANGED,
             DATABASE_URL_ENV_IGNORED,
+            BLOCKED_CONTENT,
             TENANT_SCOPE_REQUIRED,
             RESERVED_METADATA_KEY,
             METADATA_TOO_LARGE,
@@ -1965,6 +1982,7 @@ REGISTRY = MappingProxyType(
             RUN_CANCEL_RECOVERED,
             SWEEP_CAP_REACHED,
             MIGRATION_LOCK_TIMEOUT,
+            MIGRATION_VERSION_TABLE_CONFLICT,
             SHARED_ENGINE_LOOP_CLOSED,
             TOOL_ROW_MAY_BE_MISSING,
             OUTCOME_UNKNOWN,

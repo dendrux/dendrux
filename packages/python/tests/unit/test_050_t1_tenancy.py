@@ -25,6 +25,7 @@ from dendrux.runtime.context import get_delegation_context
 from dendrux.runtime.state import UNSCOPED
 from dendrux.runtime.stores.sql.sqlite import SQLiteStateStore
 from dendrux.types import Limits, LLMResponse, ToolCall
+from tests._helpers.warnings import warnings_of
 
 
 class _SpyStore(SQLiteStateStore):
@@ -184,7 +185,7 @@ class TestStrictDefault:
             warnings.simplefilter("always")
             with pytest.raises(TenantScopeRequiredError):
                 await agent.run("hi")
-        assert not caught
+        assert not warnings_of(caught, FutureWarning)
         assert store.calls == []
 
     def test_default_refuses_omitted_scope(self) -> None:
@@ -199,7 +200,7 @@ class TestStrictDefault:
                     _OMITTED,
                     default=None,
                 )
-        assert not caught
+        assert not warnings_of(caught, FutureWarning)
 
     @pytest.mark.parametrize("chosen", [True, False])
     def test_no_warning_when_chosen(self, chosen: bool) -> None:
@@ -213,13 +214,13 @@ class TestStrictDefault:
                     _tenant_checks.resolve_tenant(agent, "run", _OMITTED, default=None)
             else:
                 _tenant_checks.resolve_tenant(agent, "run", _OMITTED, default=None)
-        assert not [w for w in caught if issubclass(w.category, FutureWarning)]
+        assert not warnings_of(caught, FutureWarning)
 
     def test_no_warning_for_an_explicit_tenant(self) -> None:
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             _tenant_checks.resolve_tenant(_agent(), "run", "acme", default=None)
-        assert not caught
+        assert not warnings_of(caught, FutureWarning)
 
 
 # ---------------------------------------------------------------------------

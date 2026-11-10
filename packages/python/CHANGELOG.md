@@ -1,5 +1,99 @@
 # Changelog
 
+## 0.6.1 - 2026-11-10
+
+See [Upgrading to 0.6.1](../../docs/upgrading-to-0.6.1.mdx) for setup-specific
+steps and compatibility changes. Default automatic SQLite needs no migration command.
+
+### Changed
+
+- Change `reclaim_attempts` from a lifetime count to recovery attempts since the last
+  newly committed progress. Advancing model steps, server/client observations and
+  final answers reset it atomically. Reused evidence and pause/approval cycling do
+  not. A completed recovered run reports 0; use `last_reclaimed_at` to recognize
+  recovery. Custom recovery stores must implement the reset and pass the updated
+  store-kit contracts. Old counts remain until progress; terminal runs are not revived.
+- Retrying a successful ReAct run regenerates its final answer while retaining prior
+  user/tool context and applicable reasoning. The source stays unchanged; ordinary
+  `runs=` replay still retains successful answers. SingleCall retry stays unsupported.
+- Keep Dendrux migration history in `dendrux_alembic_version`, separate from application
+  Alembic history. Migration adopts verified legacy history once under a maintenance
+  lock, including the PostgreSQL primary-key constraint/index rename when needed.
+  Legacy `db check` exits 1 with migration guidance; read-only commands never adopt
+  history. Use 0.6.1 tools after adoption and explicit `alembic stamp` for verified
+  operator repair. Conflicting histories are refused without changing application rows.
+
+- Replace guardrail-blocked text with a placeholder such as `[blocked: 1 finding]` before it
+  is stored, including the request hashes and identities derived from it, and mark the run
+  permanently. A blocked run returns an empty `pii_mapping` for the blocked message. A
+  `SingleCall` agent now scans outgoing tool-call parameters. A blocked outgoing response
+  stores the placeholder and drops its raw response, provider request and reasoning. A
+  blocked context block loses its kind, source and metadata. Unblocked reversible
+  redaction is unchanged. Discarded entry-attribution scans contribute no reversible
+  mapping or cached projection. Mappings from earlier allowed messages remain.
+- Adopted tool results, input, approval and rejection reasons, and pending notes retain the
+  first verdict and trusted placeholder through the first new event or trace, without
+  rebuilding and rescanning rejected text. Native stores commit the mark with that evidence;
+  custom stores must establish and verify the mark before writing it, or raise
+  `PersistenceError`. Existing unguarded rows are not erased.
+- Stop adopted blocks on recovering approval pauses before recovery resolution or approval work,
+  including approval and rejection reasons. Clean adopted approval submissions keep the existing
+  recovery history.
+- Reclaim of a run whose crashed claim left a submission it never consumed scans that stored
+  submission, with the same projection as other adopted submissions, before recovery resolution.
+  Each text is scanned once in the form recovery sends (a denial as the call's tool result, with
+  an empty denial reason replaced by the default reason), and recovery reuses that verdict. When
+  JSON escaping changes a denial reason, its raw text is scanned once more. A block on a tool
+  result, human input, a rejection reason or a per-call reason (approved or denied) stops the
+  run as `error` with `failure_reason="guardrail_blocked"`: no `approval.decided` event,
+  provider call or tool call, and no new row holding the text. If recovery projects a message it
+  sends again and that projection is blocked, the run stops with the same failure reason before
+  the submission is consumed and before any tool call, with the run mark committed together with
+  its first blocked event. The result reports the turn that would have consumed the submission,
+  with committed usage from its checkpoint. A clean stored submission is recovered as before,
+  with no added statements.
+- Refuse `agent.retry()` of a run whose history holds blocked content (the retried run or
+  any `runs=` source): it raises `ReplayRunError` with `reason="blocked_content"` before a
+  run is created. `runs=` replay omits the whole blocked run and adds a notice to
+  `ReplaySummary.warnings`. Show it: omission does not undo earlier tool effects. The new
+  log code `blocked_content` carries the run ID only.
+- Stop a marked run that is still unfinished when it is resumed, submitted to or reclaimed:
+  it ends as `error` with `failure_reason="guardrail_blocked"` and makes no provider or tool
+  call. Reclaim checks after validation and ownership claim, before history rebuild, so
+  `max_rebuild_rows` does not override a blocked outcome. It reuses the already-loaded run row
+  when that identifies a block; otherwise native stores add one extra indexed lookup and
+  custom stores use a filtered event read. Clean continuation reuses the verdict.
+  A blocked reclaim keeps committed iteration and usage from its checkpoint without rebuilding
+  history to recover those totals.
+- Native retry and replay provenance checks use chunks of 200 source IDs, adding one indexed
+  lookup per chunk beyond existing source authorization reads; retry includes the retried run.
+  Custom stores use the loaded row and, when it does not identify a block, one filtered
+  `guardrail.blocked` event read with `limit=1` per source. These checks do not load history.
+- Hold the unexecuted tool siblings of an unresolved approval gate behind the approval gate
+  during recovery. The run returns `waiting_approval` with every held call, and none starts
+  before the decision.
+- A custom store that cannot keep the blocked mark fails closed with `PersistenceError`, so
+  the run keeps only its clean history and a later retry sends only that history.
+- Limits: model reasoning text is not scanned in 0.6.1 (planned for 0.7); histories copied
+  before 0.6.1 are not cleaned, including retry copies made from a blocked run, which a
+  retry does not refuse; skill body digests remain in metadata. Finish old writers before
+  accepting protected content and upgrade readers before reusing history: a mixed fleet
+  keeps 0.6.0 behaviour on its old processes. The upgrade guide has a paged query for known
+  affected runs and the full list of limits.
+
+### Fixed
+
+- Continuing a requested pause during recovery reaches the required approval pause
+  with a fresh token. Cancellation still wins; resuming a pause does not grant approval.
+- Preserve committed ownership for cancellation cleanup when custom creation/claim
+  methods return Tasks as well as coroutines. Cleanup remains bounded and epoch-scoped.
+- Retain the local SQLite default silently when the optional legacy-home probe fails.
+  Explicit URLs bypass the probe; failures opening the selected database still fail.
+- Keep exception text out of Dendrux diagnostics. A failed server tool-result transform
+  returns the fixed message "Tool result transform failed."
+- Correct prompt-cache documentation: OpenAI uses matching prefixes with a routing-key
+  hint, and Anthropic requests can use up to four cache markers.
+
 ## 0.6.0 - 2026-11-06
 
 "Production". Recover interrupted runs from durable checkpoints, follow runs across
@@ -1055,7 +1149,7 @@ security fix (see Changed) and a database migration (see Migration): run
 
 ## 0.2.0a23 - 2026-10-15
 
-- Runs started from a stream consumer's own loop body are no longer linked as delegation children of the stream run; this previously happened because delegation context leaked between yields.
+- Runs started from a stream consumer's own loop body are no longer linked as delegation children of the stream run; this previously happened because delegation context persisted between yields.
 - Skills v2. A skill can now carry files and scripts, be built from code, and be
   activated per run. Dendrux still never executes skill code itself.
   - `Skill` is validated and immutable, and is exported from `dendrux`. Build it
@@ -1314,7 +1408,7 @@ security fix (see Changed) and a database migration (see Migration): run
   Approved numeric IPs are dialed directly while preserving TLS hostname
   verification. DNS changes, redirects, and reconnects cannot bypass the check.
 - MCP HTTP: `MCPDestinationDeniedError` distinguishes denied destinations during
-  connect/discovery. Policy exceptions fail closed without leaking callback text.
+  connect/discovery. Policy exceptions fail closed without including callback text.
   Policy-enabled connections disable environment proxies and TLS overrides.
 - MCP runtime: destination policy identity participates in connection configuration
   checks; use `rebind()` to replace policy and retire existing sockets.

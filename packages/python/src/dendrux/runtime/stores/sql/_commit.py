@@ -12,6 +12,8 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from dendrux import _codes
 from dendrux._meta_keys import (
+    BLOCKED_META_KEY,
+    BLOCKED_RUNS_SESSION_KEY,
     COMMIT_PROOFS_SESSION_KEY,
     FRESH_EVIDENCE_SESSION_KEY,
     TOUCHED_RUNS_SESSION_KEY,
@@ -90,6 +92,7 @@ class _CommitReadback:
         self.epoch = self.arguments.get("claim_epoch")
         self.prove_fence = self.name in _TRANSITIONS and self.epoch is not None and not self.fresh
         self.proofs = self._proofs(session.info.pop(COMMIT_PROOFS_SESSION_KEY, []))
+        self.blocked = session.info.pop(BLOCKED_RUNS_SESSION_KEY, ())
 
     def unknown(self) -> NoReturn:
         _codes.log_code(logger, _codes.STORE_OUTCOME_UNKNOWN, run_id=self.run_id)
@@ -157,6 +160,7 @@ class _CommitReadback:
         try:
             await self.store._prepare_commit_readback(self.session)
             await self._lock_touched()
+            await self._prove_block_marks()
             fenced = False
             for table, predicate, expected in self.proofs:
                 check_epoch = self.prove_fence and table.name == "agent_runs"
@@ -170,6 +174,15 @@ class _CommitReadback:
             raise
         except BaseException as error:
             self._readback_failed(error)
+
+    async def _prove_block_marks(self) -> None:
+        for run_id in self.blocked:
+            await self._check_proof(
+                AgentRun.__table__,
+                (AgentRun.id == run_id)
+                & self.store.json_get(AgentRun.meta, (BLOCKED_META_KEY,), "bool").is_(True),
+                {"id": run_id},
+            )
 
     def _readback_failed(self, error: BaseException) -> NoReturn:
         if self._database_error(error):

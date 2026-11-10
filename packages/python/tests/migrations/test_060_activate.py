@@ -311,8 +311,7 @@ def test_status_on_legacy_and_unstamped_database(legacy):
     engine, _ = legacy
     result = runner.invoke(app, ["db", "status"])
     assert result.exit_code == 0, result.output
-    assert f"revision={PRIOR}" in result.output
-    assert "storage_format=1 activate_step=not-started" in result.output
+    assert f"revision={PRIOR} storage_format=1 activate_step=not-started" in result.output
     with engine.begin() as conn:
         conn.execute(text("DROP TABLE alembic_version"))
     result = runner.invoke(app, ["db", "status"])
@@ -756,7 +755,7 @@ async def test_b4_pg_blocked_upgrade_retries(rollout_database, monkeypatch):
     await _migrate(engine)
     async with engine.connect() as conn:
         assert (
-            await conn.execute(text("SELECT version_num FROM alembic_version"))
+            await conn.execute(text("SELECT version_num FROM dendrux_alembic_version"))
         ).scalar_one() == HEAD
         assert (await conn.execute(text("SHOW lock_timeout"))).scalar_one() == "0"
     # Hold the first winner after its committed barrier while a second connection tries.
@@ -987,8 +986,9 @@ def test_additive_migration_only_uses_bounded_steps(legacy, monkeypatch):
 
     monkeypatch.setattr(_migration_ddl, "bounded_step", capture)
     alembic(legacy[1], "upgrade", "head")
-    assert len(statements) == sum(map(len, NEW_COLUMNS.values())) + 2
-    assert all(kwargs["revision"] == HEAD for _, kwargs in statements)
+    assert len(statements) == sum(map(len, NEW_COLUMNS.values())) + 3
+    assert statements[0][0] == "ALTER TABLE alembic_version RENAME TO dendrux_alembic_version"
+    assert all(kwargs["revision"] == HEAD for _, kwargs in statements[1:])
     assert not any("CREATE INDEX" in sql.upper() for sql, _ in statements)
 
 
@@ -1022,7 +1022,7 @@ async def test_additive_downgrade_barrier_on_both_backends(rollout_database):
         await asyncio.to_thread(alembic, url, "downgrade", PRIOR)
     async with engine.connect() as conn:
         assert (
-            await conn.execute(text("SELECT version_num FROM alembic_version"))
+            await conn.execute(text("SELECT version_num FROM dendrux_alembic_version"))
         ).scalar_one() == HEAD
         assert await conn.run_sync(lambda c: inspect(c).has_table("dendrux_settings"))
 

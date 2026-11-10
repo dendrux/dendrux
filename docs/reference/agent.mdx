@@ -149,7 +149,7 @@ agent = Agent(provider=provider, prompt="...", tools=[query_sales],
 `ToolResultContext` is frozen and carries `tool_name`, `call_id`, `params`, `result` (the raw Python return value), `target`, and `meta` (the tool's `ToolDef.meta`; for MCP tools it includes `source_name`, `namespace`, and `mcp_tool_name`). Sync and async callables are both accepted.
 
 - The return value always replaces the result. Return `ctx.result` to leave it unchanged — `None` is a real result, not "no change".
-- If the transform raises, the tool call fails (`success=False`) with an error naming `tool_result_transform`; the model sees it as a tool error.
+- If a server-result transform raises, the tool call fails (`success=False`) with the fixed payload/error message "Tool result transform failed." The model sees that tool error; Dendrux diagnostics do not include the exception text. If you need more context, record developer-owned safe fields inside your transform without logging credentials, raw results or exception messages.
 - It is not applied to failed tool calls or failed client results.
 - For a client result, `ctx.result` is the submitted payload parsed as JSON (plain text arrives as a string) and `ctx.target` is `"client"`; branch on `ctx.target` if the hook is meant for server tools only. The submitted result is validated and capped first, the transform runs, and the output is validated and capped again. If the transform raises or returns something that cannot be stored, the submission is rejected with `InvalidToolResultError`, the run stays paused and unclaimed, and the client can resubmit.
 - It also runs for tools executed on resume after `submit_approval`.
@@ -218,6 +218,8 @@ See [Cancellation](/docs/architecture/cancellation#interrupting-run).
 
 Cancelling the task that awaits `run()`, `stream()`, `resume()`, a `submit_*` call or a reclaim while the run is being created or claimed has its own rules for built-in SQL stores. Before the `COMMIT` is issued, nothing changes and the request can be retried. From `COMMIT` onward the run ends `cancelled` at the epoch it acquired. A private bound of about five seconds covers only that handoff. If it expires, the run is left for `sweep`, and `sweep(on_stale="reclaim")` followed by `agent.reclaim()` can continue a run its caller cancelled. See [Cancelling while a run is created or claimed](/docs/architecture/cancellation#cancelling-while-a-run-is-created-or-claimed) for the bound, the recovery risk, custom stores and legacy boolean claims.
 
+Custom creation and claim implementations may return coroutines or `asyncio.Task` objects. Both retain committed ownership for the same bounded cancellation cleanup, which targets only the acquired epoch and preserves `CancelledError`. An unavailable or noncooperative store can still leave recovery work when cleanup times out; no public method signature changes are required.
+
 A finished run's `RunResult.meta["undelivered_notes"]` lists inbox note ids it
 never delivered (present only when there are any); see
 [Inbox notes](/docs/architecture/inbox).
@@ -261,7 +263,7 @@ class RunResult:
 | `error_info` | An [`ErrorInfo`](/docs/reference/errors#provider-errors) when a provider failure ended the run (a database write that fails after the retries makes `agent.run` raise `PersistenceError` instead; a stream ends with a `run_error` event that carries the fixed message; see [When a write fails inside a run](/docs/reference/errors#when-a-write-fails-inside-a-run)): `category`, `retryable`, `safe_message`, `error_type`, `provider`, `model`, `status_code`, `provider_code` and `timeout_reason`. Every field is a code, number or name. A stale stream observing a live owner uses `category="run_fenced"` while preserving its current run status. A failed `resume_stream` attempt after claim release also carries failure information while preserving the observed pause or running status; otherwise `None` for other outcomes. |
 | `pause_id` | The id of the current pause of a paused run; pass it back as `expected_pause_id=`. |
 | `pending` | The active pause as a `PendingPause` (the same object `RunStore.get_pending` returns), or `None`. |
-| `recovery` | Reclaim count, last reclaim time and bounded replayed-call ids. `None` means never reclaimed, or an optional projection failed on a committed-outcome or `cancel_run` response. `get_result` propagates projection failures. See [Recovery](/docs/guides/recovery#inspect-a-recovered-run). |
+| `recovery` | Attempts since last progress, last reclaim time and bounded replayed-call ids. A successfully completed recovered run has count 0; `last_reclaimed_at` identifies recovery. `None` means never reclaimed, or an optional projection failed on a committed-outcome or `cancel_run` response. `get_result` propagates projection failures. See [Recovery](/docs/guides/recovery#inspect-a-recovered-run). |
 | `meta` | Run metadata such as `meta["undelivered_notes"]`, `meta["interrupted"]` and `meta["mcp_skipped_sources"]`. A fresh result from `run()` includes `meta["pii_mapping"]` (placeholder to real value) when guardrails redacted anything; treat it as sensitive and never return `meta` wholesale. It never contains the internal pause state. |
 
 ### `to_dict()`: the browser envelope
@@ -426,7 +428,7 @@ async def resume(
 ) -> RunResult
 ```
 
-Every method takes a keyword-only `tenant_id=`, like `cancel_run` and `submit_note`. Pass the tenant your request is authenticated for. The run must belong to exactly that tenant (`None` matches untenanted runs only), otherwise `RunNotFoundError` is raised, the same error as a missing run, so existence never leaks across tenants. The check runs before anything is written: no tool results, input, approval decisions, claim, status change or event. Omit it (or pass `UNSCOPED`) to skip the check; with `Agent(strict_tenancy=True)` and a state store, omitting it raises `TenantScopeRequiredError`. See [Multi-tenancy](/docs/architecture/multi-tenancy).
+Every method takes a keyword-only `tenant_id=`, like `cancel_run` and `submit_note`. Pass the tenant your request is authenticated for. The run must belong to exactly that tenant (`None` matches untenanted runs only), otherwise `RunNotFoundError` is raised, the same error as a missing run, so other tenants cannot distinguish it from a missing run. The check runs before anything is written: no tool results, input, approval decisions, claim, status change or event. Omit it (or pass `UNSCOPED`) to skip the check; with `Agent(strict_tenancy=True)` and a state store, omitting it raises `TenantScopeRequiredError`. See [Multi-tenancy](/docs/architecture/multi-tenancy).
 
 Each method also takes `expected_pause_id=`: the `pause_id` of the pause the caller was shown (`RunResult.pause_id`, `PendingPause.pause_id` or the `run.paused` event). A different current id raises `PauseStatusMismatchError` (`reason="pause_id"`) before writes. When the stored pause has an id, a call with a state store and the default `strict_tenancy=True` requires the token for every continuation, including denials; omission raises `InputValidationError` (field `expected_pause_id`, code `pause_id_required`). With `strict_tenancy=False` tokens for non-approving continuations stay optional. **Approval of a pause with a stored id requires the token in either mode**: `approved=True`, any approving `decisions=` entry, or `resume` of an approval pause. Legacy pauses without a stored id need no token, including for approval. Every pause written by 0.6, including reclaim re-pauses, has an id. Token checks precede image ingestion on input/resume paths. Control flags such as `approved` and `cascade` must be real `bool` values; `"false"` or `1` raises `ValueError`. See [Pause ids and stale submits](/docs/architecture/pause-resume#pause-ids-and-stale-submits).
 
@@ -490,7 +492,7 @@ Continue a marked format-2 ReAct run from its committed checkpoint. Call `sweep(
 
 Explicit tenant scope is mandatory even with `strict_tenancy=False`. `None` selects untenanted runs; `UNSCOPED` is for trusted cross-tenant use. A store without recovery capability raises `NotImplementedError`. An interrupted non-idempotent tool pauses for approval before another attempt. The result can be paused or terminal, just like `run`. See [Recovery](/docs/guides/recovery).
 
-`RunResult.recovery` contains the reclaim count, last reclaim time and a bounded replayed-call list with a truncation flag. It is `None` for an unreclaimed run, or if its optional projection fails while returning a committed outcome or `cancel_run` response. `to_dict()` omits the key whenever it is `None`; `result_read_failed` logs projection failure. `get_result()` is strict: it raises on recovery read failure, so a successful `get_result()` with `recovery=None` still means the run was never reclaimed.
+`RunResult.recovery` contains `reclaim_attempts` (attempts since last newly committed progress), `last_reclaimed_at` and a bounded replayed-call list with a truncation flag. Progress resets the count atomically; successful completion can report zero while retaining a recovery summary. Use `last_reclaimed_at` to recognize recovery. It is `None` for an unreclaimed run, or if its optional projection fails while returning a committed outcome or `cancel_run` response. `to_dict()` omits the key whenever it is `None`; `result_read_failed` logs projection failure. `get_result()` is strict: it raises on recovery read failure, so a successful `get_result()` with `recovery=None` still means the run was never reclaimed.
 
 ## `cancel_run`
 
@@ -524,6 +526,8 @@ async def request_pause(
 ```
 
 Ask a running run to pause durably at its next checkpoint (the top of its next iteration, or between the approved calls of a resumed batch). It never preempts a model call or tool. The run becomes `paused`, `run.paused` is written with `reason="requested"`, and the waiting `run()` or stream returns a paused result. Resume with `submit_resume`. A `waiting_*`, `paused` or terminal run is a no-op; cancellation wins over a pause. `cascade=True` (the default) flags every non-terminal descendant too, which is **flag propagation only, not a resumable call stack**: a paused child returns its paused result to the delegating tool, and resuming the child never rewrites what the parent recorded.
+
+A requested pause honored during recovery preserves unresolved approval-gated calls. Continuing it can return `waiting_approval` with a fresh `pause_id`; submit approval using that current token before those calls execute.
 
 `PauseOutcome` has `run_id`, `status_before`, `status_after` and `affected`, a list of `(run_id, outcome)` with outcome `requested`, `already_waiting`, `already_paused` or `terminal`, deepest descendants first and `run_id` last. Raises `RunNotFoundError`, `PersistenceNotConfiguredError` and `ValueError` (bad `reason`). See [Pause and resume](/docs/architecture/pause-resume#requesting-a-pause).
 
@@ -565,6 +569,10 @@ async def retry(run_id: str, *, tenant_id=..., metadata=None, notifier=None, **k
 ```
 
 Start a fresh run that reuses an existing terminal run's input and approximate prior context. Requires persistence. The source run must belong to `tenant_id`, otherwise `RunNotFoundError` is raised (the same error for a missing run and a foreign one; it was `ReplayRunError` or `ValueError` before 0.5.0). Skills the source run activated explicitly stay activated; if one is no longer attached, `retry` raises `ValueError` before creating a run.
+
+Retrying a successful ReAct run omits its old final answer so the model generates another, while retaining earlier user/tool context, valid call/result pairs and applicable reasoning. JSON-formatted answers follow the same rule. Retry creates a new run with fresh iteration and usage counters and leaves the source unchanged. Ordinary `runs=` replay still includes successful answers. `SingleCall` retry is unsupported. A genuinely empty new completion still raises `ProviderResponseError(provider_code="empty_completion", retryable=False)`.
+
+Retry refuses blocked history. If the retried run, or any run it replayed with `runs=`, holds content that a guardrail blocked, `retry` raises `ReplayRunError` with `reason="blocked_content"` and the detail "Source history contains blocked content; start a new run with clean input." The check follows the scope and status checks and happens before a run is created or a model is called. It costs one extra lookup. The error carries the identified run's ID, and the code `blocked_content` is logged with that ID only. A retry copy that was made before 0.6.1 from a blocked run is not refused. A `runs=` list passed to `run` or `stream` omits blocked runs instead and adds a notice to `ReplaySummary.warnings`; see [Run replay](/docs/recipes/run-replay#blocked-runs-are-not-replayed).
 
 ## `close`
 

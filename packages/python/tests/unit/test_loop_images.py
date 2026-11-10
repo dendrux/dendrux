@@ -440,7 +440,7 @@ async def prep(
     )
 
 
-def leak_free(obj: Any, raw: bytes) -> bool:
+def raw_content_absent(obj: Any, raw: bytes) -> bool:
     """No bytes, base64 prefix or data URL anywhere in ``obj``'s JSON/repr."""
     import base64
 
@@ -790,8 +790,8 @@ async def test_react_tool_image_reaches_wire_and_pause_carries_view() -> None:
     assert sem_tool.images[0].data is None
     pause = result.meta["pause_state"]
     assert pause.image_view is not None and pause.image_view.sent_through == 1
-    assert leak_free(pause.to_dict(), PNG_A)
-    assert leak_free(rec.events, PNG_A)
+    assert raw_content_absent(pause.to_dict(), PNG_A)
+    assert raw_content_absent(rec.events, PNG_A)
 
 
 async def test_text_only_pause_has_no_image_view() -> None:
@@ -1312,7 +1312,7 @@ async def test_release_wire_drops_bytes() -> None:
 
 
 async def test_no_wire_bytes_retained_after_multi_iteration_run() -> None:
-    """P1-1 regression (reviewer probe): no ImagePart with bytes survives the call."""
+    """No ImagePart with bytes survives the call."""
     import gc
 
     import dendrux.types as core_types
@@ -1371,7 +1371,7 @@ async def test_no_wire_bytes_retained_after_multi_iteration_run() -> None:
 
 
 async def test_identical_bytes_user_history_never_tombstoned() -> None:
-    """P2-1: a tool image with the same bytes as a user history image."""
+    """a tool image with the same bytes as a user history image."""
     rt = make_runtime()
     part = await store_image(rt, make_png(seed=5100))
     history = [user_msg("see", part), assistant(call_ids=["c"]), tool_msg("shot", "c", part)]
@@ -1389,7 +1389,7 @@ async def test_identical_bytes_user_history_never_tombstoned() -> None:
 
 
 async def test_stream_in_process_cancel_before_retry() -> None:
-    """P2-3: interrupt set while the rejected stream is in flight → no second call."""
+    """interrupt set while the rejected stream is in flight → no second call."""
     rt = make_runtime()
     history = await _history(rt, tools=1, users=0)
     llm = ImageLLM([StreamScript(error=rejected()), LLMResponse(text="never")])
@@ -1514,7 +1514,7 @@ async def test_single_stream_unsupported_history_retry() -> None:
 
 
 async def test_learned_no_for_unhashable_provider() -> None:
-    """P2-4: an eq-dataclass provider (unhashable) still learns "no"."""
+    """an eq-dataclass provider (unhashable) still learns "no"."""
     from dataclasses import dataclass
 
     @dataclass

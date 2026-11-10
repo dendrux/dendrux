@@ -545,7 +545,7 @@ class TestOpenRouterInherits:
 
 
 # ---------------------------------------------------------------------------
-# Codex review: P1-2 sanitized streaming message, P2-1 per-call model
+# Sanitized streaming messages and per-call model selection
 # ---------------------------------------------------------------------------
 class TestReviewFixRound:
     async def test_stream_unsupported_message_has_no_provider_text(

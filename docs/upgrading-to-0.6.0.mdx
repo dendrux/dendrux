@@ -9,7 +9,7 @@ description: Migrate, roll every worker and reader, activate format 2, then enab
 
 > **Activation is one-way.** Take a database backup before activation. Once activation starts, rollback means restoring that backup. There is no deactivation or CLI downgrade command. Do not let a 0.5 worker or reader access an activated database.
 
-New PostgreSQL databases come up active at format 2 after `dendrux db migrate`. Here, new means there is no `alembic_version` table and none of Dendrux's tables before migration; unrelated application tables are allowed. Existing databases need the activate step below, even with zero runs or when already at the current revision.
+New PostgreSQL databases come up active at format 2 after `dendrux db migrate`. With the 0.6.1 migration tools, new means there is no `dendrux_alembic_version` table and none of Dendrux's tables before migration; unrelated application tables and app-owned `alembic_version` history are allowed. See [Upgrading to 0.6.1](/docs/upgrading-to-0.6.1) for the history-table rename; do not use old Dendrux migration tools after it. Existing databases need the activate step below, even with zero runs or when already at the current revision.
 
 > **Provider SDKs.** Provider extras now require `anthropic>=0.77.0,<1.0` and `openai>=1.97.2,<3.0`. Older SDKs lack the required Responses API stream handling and Anthropic thinking/structured-output support. If you pin older SDKs, update those pins and reinstall the matching extras before upgrading to 0.6.0.
 
