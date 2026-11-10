@@ -41,9 +41,14 @@ steps and compatibility changes. Default automatic SQLite needs no migration com
   recovery history.
 - Reclaim of a run whose crashed claim left a submission it never consumed scans that stored
   submission once, with the same projection as other adopted submissions, before recovery
-  resolution. A block on a tool result, human input, a rejection reason or a per-call reason
-  (approved or denied) stops the run as `error` with `failure_reason="guardrail_blocked"`:
-  no `approval.decided` event, provider call or tool call, and no new row holding the text.
+  resolution. Each text is scanned in the form recovery sends (a denial as the call's tool
+  result), and recovery reuses that verdict. A block on a tool result, human input, a
+  rejection reason or a per-call reason (approved or denied) stops the run as `error` with
+  `failure_reason="guardrail_blocked"`: no `approval.decided` event, provider call or tool
+  call, and no new row holding the text. If recovery has to project a message again (after
+  the guardrail engine's bounded projection cache dropped it) and that projection is
+  blocked, the run stops with the same failure reason before the submission is consumed and
+  before any tool call, with the run mark committed together with its first blocked event.
   The result reports the turn that would have consumed the submission, with committed usage
   from its checkpoint. A clean stored submission is recovered as before, with no added
   statements.

@@ -177,6 +177,37 @@ def test_reclaim_scans_an_unconsumed_submission_once(page):
     assert "approved or denied" in text
     assert "no `approval.decided` event" in text
     assert "A clean stored submission is recovered as before, with no added statements" in text
+    assert "in the form recovery sends (a denial as the call's tool result)" in text
+    assert "recovery reuses that verdict" in text
+    assert "before the submission is consumed and before any tool call" in text
+
+
+class _CountingGuard:
+    action = "block"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def scan(self, text: str) -> list:
+        self.calls += 1
+        return []
+
+
+async def test_reclaim_denial_verdict_is_taken_once_in_the_form_recovery_sends():
+    """Behind "once": the denial reason is scanned in recovery's form, which then reuses it."""
+    from dendrux.guardrails import GuardrailEngine
+    from dendrux.runtime._continuation_guardrails import _project_reason
+    from dendrux.runtime._reclaim import _recovery_denial
+    from dendrux.types import ToolCall
+
+    guard = _CountingGuard()
+    engine = GuardrailEngine([guard])  # type: ignore[list-item]
+    call = ToolCall("write_value", id="call-1")
+    decision = {"call_id": call.id, "approved": False, "reason": "not this one"}
+    await _project_reason(engine, decision, {call.id: call})
+    assert guard.calls == 1
+    _, _, blocked = await engine.project_incoming_message(_recovery_denial(call, "not this one"))
+    assert blocked is None and guard.calls == 1
 
 
 @pytest.mark.parametrize("page", (*_BLOCKED_PAGES, "guides/recovery.mdx"))
