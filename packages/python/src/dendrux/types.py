@@ -1646,10 +1646,8 @@ class PauseState:
         """
         import json
 
-        if self.managed_wait is not None:
+        if self.managed_wait is not None or self.schema_version == MANAGED_WAIT_SCHEMA_VERSION:
             return self._managed_wait_dict()
-        if self.schema_version == MANAGED_WAIT_SCHEMA_VERSION:
-            raise ValueError("A v3 managed wait needs its managed binding")
         d = {
             "agent_name": self.agent_name,
             "pending_tool_calls": [_tool_call_to_dict(tc) for tc in self.pending_tool_calls],
@@ -1660,6 +1658,25 @@ class PauseState:
             "trace_order_offset": self.trace_order_offset,
             "usage": _usage_to_dict(self.usage),
         }
+        self._optional_fields(d)
+        d["provider_kwargs"] = {
+            k: v
+            for k, v in self.provider_kwargs.items()
+            if k in {"model", "max_tokens", "temperature", "thinking", "effort"}
+        }
+        if self.schema_version == 2:
+            self._checkpoint_fields(d)
+        # Validate JSON safety — catch non-serializable meta values early
+        try:
+            json.dumps(d)
+        except (TypeError, ValueError) as e:
+            raise TypeError(
+                f"PauseState contains non-JSON-serializable data: {e}. "
+                f"Ensure all Message.meta and AgentStep.meta values are JSON-safe."
+            ) from e
+        return d
+
+    def _optional_fields(self, d: dict[str, Any]) -> None:
         if self.approval_gates is not None:
             d["approval_gates"] = self.approval_gates
         if self.pause_reason is not None:
@@ -1684,29 +1701,14 @@ class PauseState:
             d["pause_id"] = self.pause_id
         if self.schema_version is not None:
             d["schema_version"] = self.schema_version
-        d["provider_kwargs"] = {
-            k: v
-            for k, v in self.provider_kwargs.items()
-            if k in {"model", "max_tokens", "temperature", "thinking", "effort"}
-        }
-        if self.schema_version == 2:
-            self._checkpoint_fields(d)
-        # Validate JSON safety — catch non-serializable meta values early
-        try:
-            json.dumps(d)
-        except (TypeError, ValueError) as e:
-            raise TypeError(
-                f"PauseState contains non-JSON-serializable data: {e}. "
-                f"Ensure all Message.meta and AgentStep.meta values are JSON-safe."
-            ) from e
-        return d
 
     def _managed_wait_dict(self) -> dict[str, Any]:
         """Format-2 references plus the binding; the brief stays on the tool row."""
         from dataclasses import replace
 
         binding = self.managed_wait
-        assert binding is not None
+        if binding is None:
+            raise ValueError("A v3 managed wait needs its managed binding")
         call_id = binding.tool_call_id
         if (
             [tc.id for tc in self.pending_tool_calls] != [call_id]
@@ -1828,52 +1830,59 @@ def _managed_wait_binding(data: Any, run_id: str | None) -> ManagedWait:
     """Validate a stored v3 managed wait's envelope; return its binding."""
     from dendrux.errors import ManagedStateError
 
-    def invalid(reason: str = "wait_invalid") -> ManagedStateError:
-        return ManagedStateError(reason=reason, run_id=run_id)
-
     if not isinstance(data, dict):
-        raise invalid()
+        raise ManagedStateError(reason="wait_invalid", run_id=run_id)
     try:
         size = _compact_json_bytes(data)
     except (TypeError, ValueError):
-        raise invalid() from None
+        raise ManagedStateError(reason="wait_invalid", run_id=run_id) from None
     if size > MANAGED_WAIT_MAX_BYTES:
-        raise invalid("wait_too_large")
+        raise ManagedStateError(reason="wait_too_large", run_id=run_id)
+    binding = _managed_wait_envelope(data) if _managed_wait_fields_ok(data) else None
+    if binding is None or not _managed_wait_call_ok(data, binding):
+        raise ManagedStateError(reason="wait_invalid", run_id=run_id)
+    return binding
+
+
+def _managed_wait_fields_ok(data: dict[str, Any]) -> bool:
+    return (
+        data.get("schema_version") == MANAGED_WAIT_SCHEMA_VERSION
+        and data.get("pause_reason") == MANAGED_WAIT_REASON
+        and isinstance(data.get("agent_name"), str)
+        and bool(data["agent_name"])
+        and isinstance(data.get("pause_id"), str)
+        and _ULID_PATTERN.fullmatch(data["pause_id"]) is not None
+        and data.get("loop_state_ref") is True
+        and not any(key in data for key in _MANAGED_WAIT_ABSENT)
+        and all(data.get(key) is None for key in _MANAGED_WAIT_NONE)
+    )
+
+
+def _managed_wait_envelope(data: dict[str, Any]) -> ManagedWait | None:
     envelope = data.get("managed_wait")
-    if (
-        data.get("schema_version") != MANAGED_WAIT_SCHEMA_VERSION
-        or data.get("pause_reason") != MANAGED_WAIT_REASON
-        or not isinstance(data.get("agent_name"), str)
-        or not data["agent_name"]
-        or not isinstance(data.get("pause_id"), str)
-        or not _ULID_PATTERN.fullmatch(data["pause_id"])
-        or data.get("loop_state_ref") is not True
-        or not isinstance(envelope, dict)
-        or set(envelope) != {"v", "tool_call_id", "child_run_id"}
-        or any(key in data for key in _MANAGED_WAIT_ABSENT)
-        or any(data.get(key) is not None for key in _MANAGED_WAIT_NONE)
-    ):
-        raise invalid()
+    if not isinstance(envelope, dict) or set(envelope) != {"v", "tool_call_id", "child_run_id"}:
+        return None
     try:
-        binding = ManagedWait(
+        return ManagedWait(
             tool_call_id=envelope["tool_call_id"],
             child_run_id=envelope["child_run_id"],
             version=envelope["v"],
         )
     except ValueError:
-        raise invalid() from None
+        return None
+
+
+def _managed_wait_call_ok(data: dict[str, Any], binding: ManagedWait) -> bool:
     calls = data.get("pending_tool_calls")
-    if (
-        not isinstance(calls, list)
-        or len(calls) != 1
-        or not isinstance(calls[0], dict)
-        or calls[0].get("id") != binding.tool_call_id
-        or not isinstance(calls[0].get("name"), str)
-        or calls[0].get("params") != {}
-        or data.get("pending_targets") != {binding.tool_call_id: "agent"}
-    ):
-        raise invalid()
-    return binding
+    return (
+        isinstance(calls, list)
+        and len(calls) == 1
+        and isinstance(calls[0], dict)
+        and calls[0].get("id") == binding.tool_call_id
+        and isinstance(calls[0].get("name"), str)
+        and calls[0].get("params") == {}
+        and data.get("pending_targets") == {binding.tool_call_id: "agent"}
+    )
 
 
 # ------------------------------------------------------------------

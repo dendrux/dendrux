@@ -92,34 +92,41 @@ def validate_capabilities(store: Any) -> StoreCapabilities:
     elif caps.deployment not in ("single_process", "single_host", "multi_server"):
         _refuse(store, "deployment", "capabilities", ("deployment",))
     for capability, methods in _REQUIREMENTS.items():
-        if not getattr(caps, capability):
-            continue
-        for method, keywords in methods.items():
-            # Signature inspection must not invoke application descriptors or spies.
-            target = inspect.getattr_static(store, method, None)
-            if not callable(target):
-                _refuse(store, capability, method, keywords or (method,))
-            try:
-                params = inspect.signature(target).parameters
-            except (TypeError, ValueError):
-                _refuse(store, capability, method, keywords or (method,))
-            missing = tuple(
-                k
-                for k in keywords
-                if k not in params or params[k].kind is not inspect.Parameter.KEYWORD_ONLY
-            )
-            if missing:
-                _refuse(store, capability, method, missing)
+        if getattr(caps, capability):
+            for method, keywords in methods.items():
+                _check_method(store, capability, method, keywords)
     if caps.managed_subagents:
-        absent = tuple(name for name in _MANAGED_PREREQUISITES if not getattr(caps, name))
-        if absent:
-            _refuse(store, "managed_subagents", "capabilities", absent)
+        _check_managed_prerequisites(store, caps)
     try:
         ref = weakref.ref(store, lambda _ref: _CACHE.pop(key, None))
     except TypeError:
         return caps
     _CACHE[key] = (ref, caps)
     return caps
+
+
+def _check_method(store: Any, capability: str, method: str, keywords: tuple[str, ...]) -> None:
+    # Signature inspection must not invoke application descriptors or spies.
+    target = inspect.getattr_static(store, method, None)
+    if not callable(target):
+        _refuse(store, capability, method, keywords or (method,))
+    try:
+        params = inspect.signature(target).parameters
+    except (TypeError, ValueError):
+        _refuse(store, capability, method, keywords or (method,))
+    missing = tuple(
+        k
+        for k in keywords
+        if k not in params or params[k].kind is not inspect.Parameter.KEYWORD_ONLY
+    )
+    if missing:
+        _refuse(store, capability, method, missing)
+
+
+def _check_managed_prerequisites(store: Any, caps: StoreCapabilities) -> None:
+    absent = tuple(name for name in _MANAGED_PREREQUISITES if not getattr(caps, name))
+    if absent:
+        _refuse(store, "managed_subagents", "capabilities", absent)
 
 
 def require_managed_subagents(store: Any) -> StoreCapabilities:

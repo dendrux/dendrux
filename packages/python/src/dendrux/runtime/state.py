@@ -414,10 +414,18 @@ class BindManagedChildRequest:
     max_delegation_depth: int | None = None
 
     def __post_init__(self) -> None:
-        from dendrux.types import _ULID_PATTERN
-
         object.__setattr__(self, "child_path", tuple(self.child_path))
         object.__setattr__(self, "child_seed_traces", tuple(self.child_seed_traces))
+        self._check_identity()
+        self._check_binding()
+        if self.max_delegation_depth is not None and (
+            type(self.max_delegation_depth) is not int or self.max_delegation_depth < 1
+        ):
+            raise ValueError("max_delegation_depth must be a positive int or None")
+
+    def _check_identity(self) -> None:
+        from dendrux.types import _ULID_PATTERN
+
         for name in ("root_run_id", "parent_run_id", "child_run_id", "row_id"):
             value = getattr(self, name)
             if not isinstance(value, str) or not _ULID_PATTERN.fullmatch(value):
@@ -432,6 +440,8 @@ class BindManagedChildRequest:
             not isinstance(p, str) or not p or len(p) > 255 for p in self.child_path
         ):
             raise ValueError("child_path must name the registered child")
+
+    def _check_binding(self) -> None:
         binding = getattr(self.parent_wait, "managed_wait", None)
         if (
             binding is None
@@ -447,10 +457,6 @@ class BindManagedChildRequest:
             raise ValueError("The store writes the child's managed header")
         if any(not isinstance(trace, TraceWrite) for trace in self.child_seed_traces):
             raise ValueError("child_seed_traces must be TraceWrite values")
-        if self.max_delegation_depth is not None and (
-            type(self.max_delegation_depth) is not int or self.max_delegation_depth < 1
-        ):
-            raise ValueError("max_delegation_depth must be a positive int or None")
 
 
 @dataclass(frozen=True)
