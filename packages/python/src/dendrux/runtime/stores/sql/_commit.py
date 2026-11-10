@@ -88,6 +88,12 @@ class _CommitReadback:
         self.name = context[1]
         self.arguments = dict(context[2])
         self.run_id = self.arguments.get("run_id")
+        # bind_managed_child names its runs in a typed request, not run_id/claim_epoch.
+        self.bind: Any = (
+            self.arguments.get("request") if self.name == "bind_managed_child" else None
+        )
+        if self.bind is not None:
+            self.run_id = self.bind.parent_run_id
         self.fresh = session.info.pop(FRESH_EVIDENCE_SESSION_KEY, False)
         self.epoch = self.arguments.get("claim_epoch")
         self.prove_fence = self.name in _TRANSITIONS and self.epoch is not None and not self.fresh
@@ -225,6 +231,8 @@ class _CommitReadback:
                 await self._lost()
 
     async def _lost(self, *, absent: bool = False) -> NoReturn:
+        if self.bind is not None:
+            await self._bind_lost()
         retry_id = _RETRY_IDS.get(self.name)
         if absent and (
             self.name == "create_run"
@@ -239,6 +247,26 @@ class _CommitReadback:
         ):
             raise _CommitNotAppliedError() from None
         self.unknown()
+
+    async def _bind_lost(self) -> NoReturn:
+        if await self._bind_not_applied():
+            raise _CommitNotAppliedError() from None
+        self.unknown()
+
+    async def _bind_not_applied(self) -> bool:
+        """The bind is atomic: an unchanged running parent and no child prove it absent."""
+        request = self.bind
+        parent = await self.session.scalar(
+            select(AgentRun.id).where(
+                AgentRun.id == request.parent_run_id,
+                AgentRun.claim_epoch == request.parent_claim_epoch,
+                AgentRun.status == RunStatus.RUNNING.value,
+            )
+        )
+        child = await self.session.scalar(
+            select(AgentRun.id).where(AgentRun.id == request.child_run_id)
+        )
+        return parent is not None and child is None
 
     def _retry_predicate(self) -> Any:
         predicate = AgentRun.id == self.run_id
