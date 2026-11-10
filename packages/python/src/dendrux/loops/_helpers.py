@@ -537,18 +537,31 @@ async def record_tool(
             tool_result = replace(
                 tool_result, payload=message.content, error=None, meta={}, notes=()
             )
-        if recorder is not None:
-            async with _evidence_scope(recorder, run_id, error is not None):
-                projected = getattr(recorder, "on_projected_tool_completed", None)
-                if (
-                    projected is not None
-                    and getattr(recorder, "guardrail_engine", None) is not None
-                ):
-                    await projected(run_id, tool_call, tool_result, iteration, message)
-                else:
-                    await recorder.on_tool_completed(run_id, tool_call, tool_result, iteration)
+        await _record_tool_projection(
+            recorder, run_id, tool_call, tool_result, iteration, message, blocked=error is not None
+        )
         if error is not None:
             raise _BlockedObservationError(message, findings, error, tool_result)
+
+
+async def _record_tool_projection(
+    recorder: LoopRecorder | None,
+    run_id: str,
+    tool_call: ToolCall,
+    tool_result: ToolResult,
+    iteration: int,
+    message: Message,
+    *,
+    blocked: bool,
+) -> None:
+    if recorder is None:
+        return
+    async with _evidence_scope(recorder, run_id, blocked):
+        projected = getattr(recorder, "on_projected_tool_completed", None)
+        if projected is not None and getattr(recorder, "guardrail_engine", None) is not None:
+            await projected(run_id, tool_call, tool_result, iteration, message)
+        else:
+            await recorder.on_tool_completed(run_id, tool_call, tool_result, iteration)
 
 
 async def record_governance(

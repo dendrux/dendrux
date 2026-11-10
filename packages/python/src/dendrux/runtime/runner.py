@@ -197,6 +197,7 @@ if TYPE_CHECKING:
     from dendrux.media._catalog import BlobEdge
     from dendrux.media._image import UserContent
     from dendrux.media._runtime import ImageRuntime
+    from dendrux.runtime._continuation_guardrails import _SubmissionProjection
     from dendrux.runtime._entry_guardrails import _EntryProjection
     from dendrux.runtime.state import RunRecord, StateStore, TraceRecord
     from dendrux.runtime.tasks import RunTaskManager
@@ -4921,6 +4922,27 @@ def _resumed_payload(
     return resume_data
 
 
+def _resume_history(
+    pause_state: PauseState,
+    tool_results: list[ToolResult] | None,
+    user_input: str | None,
+    user_parts: tuple[ContentPart, ...] | None,
+    submission_projection: _SubmissionProjection | None,
+) -> list[Message]:
+    history = list(pause_state.history)
+
+    if submission_projection is not None:
+        history.extend(submission_projection.messages)
+    elif tool_results is not None:
+        for tr in tool_results:
+            history.append(tool_result_message(tr))
+    elif user_parts is not None:
+        history.append(Message.with_parts(Role.USER, user_parts))
+    elif user_input is not None:
+        history.append(Message(role=Role.USER, content=user_input))
+    return history
+
+
 async def _prepare_resume(
     run_id: str,
     pause_state: PauseState,
@@ -4939,6 +4961,7 @@ async def _prepare_resume(
     pii_mapping: dict[str, str] | None = None,
     history_records: Any = None,
     pause_data: dict[str, Any] | None = None,
+    submission_projection: _SubmissionProjection | None = None,
 ) -> _ResumeContext:
     """Build everything needed to re-enter the loop after a resume.
 
@@ -4960,23 +4983,23 @@ async def _prepare_resume(
     resolved_loop = loop or agent.loop or ReActLoop()
     _validate_loop_skill_compat(agent, resolved_loop)
 
-    await _emit_event(
+    from dendrux.runtime._continuation_guardrails import _submission_evidence
+
+    async with _submission_evidence(
         state_store,
         run_id,
-        StoredEventType.RUN_RESUMED.value,
-        _resumed_payload(expected_status, tool_results, user_input, user_parts),
+        submission_projection is not None and submission_projection.block is not None,
+    ):
+        await _emit_event(
+            state_store,
+            run_id,
+            StoredEventType.RUN_RESUMED.value,
+            _resumed_payload(expected_status, tool_results, user_input, user_parts),
+        )
+
+    history = _resume_history(
+        pause_state, tool_results, user_input, user_parts, submission_projection
     )
-
-    # 3. Build resume history
-    history = list(pause_state.history)
-
-    if tool_results is not None:
-        for tr in tool_results:
-            history.append(tool_result_message(tr))
-    elif user_parts is not None:
-        history.append(Message.with_parts(Role.USER, user_parts))
-    elif user_input is not None:
-        history.append(Message(role=Role.USER, content=user_input))
 
     # 4. Create recorder with correct trace offset
     next_index = getattr(state_store, "get_next_trace_index", None)
@@ -5066,14 +5089,15 @@ async def _replay_tool_result(
     from dendrux.loops._helpers import notify_tool_started as _notify_tool_started
 
     iteration = ctx.pause_state.iteration
-    if ctx.pause_state.schema_version != 2:
-        await ctx.recorder.on_tool_started(run_id, tc, iteration)
-    await _notify_tool_started(ctx.notifier, run_id, tc, iteration)
-    if await _replayed_result_blocked(ctx, run_id, tr):
+    blocked = await _replayed_result_blocked(ctx, run_id, tr, msg)
+    if blocked is not None:
         # A claim made without projection: record only the projected evidence and stop,
         # before the raw tool message reaches any trace or callback.
         _mark_work(on_consumed)
-        await _record_blocked_replay(ctx, run_id, tc, tr, iteration)
+        await _record_blocked_replay(ctx, run_id, tc, blocked, iteration)
+    if ctx.pause_state.schema_version != 2:
+        await ctx.recorder.on_tool_started(run_id, tc, iteration)
+    await _notify_tool_started(ctx.notifier, run_id, tc, iteration)
     await ctx.recorder.on_message_appended(run_id, msg, iteration)
     _mark_work(on_consumed)
     await record_tool(ctx.recorder, run_id, tc, tr, iteration)
@@ -5081,72 +5105,85 @@ async def _replay_tool_result(
     await _notify_tool(ctx.notifier, run_id, tc, tr, iteration)
 
 
-async def _replayed_result_blocked(ctx: _ResumeContext, run_id: str, tr: ToolResult) -> bool:
+async def _replayed_result_blocked(
+    ctx: _ResumeContext, run_id: str, tr: ToolResult, message: Message
+) -> Any:
+    from dataclasses import replace
+
     from dendrux.guardrails._engine import _entry_engine
-    from dendrux.loops._helpers import _project_tool_message
-    from dendrux.types import tool_result_message
+    from dendrux.loops._helpers import _BlockedObservationError, _project_tool_message
 
     engine = getattr(ctx.recorder, "guardrail_engine", None) or _entry_engine(run_id)
     if engine is None:
-        return False
-    formatter = getattr(ctx.recorder, "format_observation", None) or tool_result_message
-    # The same projection record_tool reuses, so the result is still scanned once.
-    _, _, error = await _project_tool_message(engine, tr, formatter(tr))
-    return error is not None
+        return None
+    projected, findings, error = await _project_tool_message(engine, tr, message)
+    if error is None:
+        return None
+    clean = replace(tr, payload=projected.content, error=None, meta={}, notes=())
+    return _BlockedObservationError(projected, findings, error, clean)
 
 
 async def _record_blocked_replay(
-    ctx: _ResumeContext, run_id: str, tc: ToolCall, tr: ToolResult, iteration: int
+    ctx: _ResumeContext, run_id: str, tc: ToolCall, blocked: Any, iteration: int
 ) -> NoReturn:
-    from dendrux.loops._helpers import _BlockedObservationError
+    from contextlib import nullcontext
+
+    from dendrux.loops._helpers import _record_tool_projection
     from dendrux.loops._helpers import notify_tool as _notify_tool
 
-    try:
-        await record_tool(ctx.recorder, run_id, tc, tr, iteration)
-    except _BlockedObservationError as blocked:
-        await _notify_tool(ctx.notifier, run_id, tc, blocked.result, iteration)
-        raise
-    raise AssertionError("a blocked replayed result must stop")
+    scope = getattr(ctx.recorder, "observation_scope", None)
+    async with scope() if scope is not None else nullcontext():
+        await _record_tool_projection(
+            ctx.recorder, run_id, tc, blocked.result, iteration, blocked.message, blocked=True
+        )
+    await _notify_tool(ctx.notifier, run_id, tc, blocked.result, iteration)
+    raise blocked
 
 
-async def _project_adopted_input(
+async def _project_adopted_submission(
     store: StateStore,
     run_id: str,
+    raw: dict[str, Any] | None,
+    status: str,
+    tool_results: list[ToolResult] | None,
     user_input: str | None,
     user_parts: tuple[ContentPart, ...] | None,
+    decisions: list[tuple[str, ApprovalDecision]] | None,
     *,
     skip_claim: bool,
-) -> tuple[str | None, tuple[ContentPart, ...] | None, Any]:
-    """Project input adopted from a claim this call did not make, before it is written.
-
-    A claim made in this call was projected already. Input claimed elsewhere without
-    projection (a raw-store claim, guardrails added later) is projected here, before the
-    ``run.resumed`` event, history, trace or callbacks; a block is returned to stop the
-    run after its placeholder is recorded.
-    """
+) -> tuple[
+    list[ToolResult] | None,
+    str | None,
+    tuple[ContentPart, ...] | None,
+    list[tuple[str, ApprovalDecision]] | None,
+    _SubmissionProjection | None,
+]:
     from dendrux.guardrails._engine import _entry_engine
-    from dendrux.loops._helpers import _BlockedObservationError
-    from dendrux.types import ToolResult
+    from dendrux.runtime._continuation_guardrails import _project_submission, _SubmissionProjection
+    from dendrux.runtime.submit import deserialize_decisions, deserialize_tool_results
 
-    engine = _entry_engine(run_id)
     if (
-        engine is None
-        or user_input is None
+        _entry_engine(run_id) is None
+        or raw is None
         or _claimed_in_call(store, run_id, skip_claim=skip_claim)
     ):
-        return user_input, user_parts, None
-    original = (
-        Message.with_parts(Role.USER, user_parts)
-        if user_parts is not None
-        else Message(Role.USER, user_input)
+        return tool_results, user_input, user_parts, decisions, None
+    payload = _resume_claim_payload(
+        run_id, raw, status, tool_results, user_input, user_parts, decisions
     )
-    projected, findings, error = await engine.project_incoming_message(original)
-    if error is None:
-        return user_input, user_parts, None
-    block = _BlockedObservationError(
-        projected, findings, error, ToolResult(name="", call_id="", payload=projected.content)
+    projection = _SubmissionProjection()
+    clean, _ = await _project_submission(run_id, payload, projection=projection)
+    if clean is None:
+        return tool_results, user_input, user_parts, decisions, None
+    return (
+        deserialize_tool_results(clean["submitted_tool_results"])
+        if tool_results is not None
+        else None,
+        clean.get("submitted_user_input"),
+        _stored_parts(clean.get("submitted_user_parts")),
+        deserialize_decisions(clean["submitted_decisions"]) if decisions is not None else None,
+        projection,
     )
-    return projected.content, projected.parts, block
 
 
 def _claimed_in_call(store: StateStore, run_id: str, *, skip_claim: bool) -> bool:
@@ -5182,6 +5219,8 @@ async def _replay_submission_or_stop(
             on_consumed=on_consumed,
             input_block=input_block,
         )
+        if input_block is not None:
+            return await _resume_blocked_result(ctx, run_id, input_block)
     except _BlockedObservationError as blocked:
         return await _resume_blocked_result(ctx, run_id, blocked)
     return None
@@ -6896,8 +6935,22 @@ async def _resume_core(
             )
             if stopped is not None:
                 return stopped
-            user_input, user_parts, input_block = await _project_adopted_input(
-                state_store, run_id, user_input, user_parts, skip_claim=_skip_claim
+            (
+                tool_results,
+                user_input,
+                user_parts,
+                decisions,
+                adopted,
+            ) = await _project_adopted_submission(
+                state_store,
+                run_id,
+                raw_pause,
+                expected_status,
+                tool_results,
+                user_input,
+                user_parts,
+                decisions,
+                skip_claim=_skip_claim,
             )
 
             run_tenant = run_record.tenant_id if run_record else None
@@ -6922,6 +6975,7 @@ async def _resume_core(
                     _reclaim_history if _reclaim_history is not None else reads.history_records
                 ),
                 pause_data=raw_pause,
+                submission_projection=adopted,
             )
             progress.submission = getattr(ctx.recorder, "_loop_state", {}).get("submission")
             image_runtime = _image_runtime(agent, state_store, run_tenant, run_id)
@@ -6954,7 +7008,7 @@ async def _resume_core(
                 tool_results=tool_results,
                 user_input=user_input,
                 on_consumed=progress._start,
-                input_block=input_block,
+                input_block=adopted.block if adopted is not None else None,
             )
             if blocked_stop is not None:
                 _attach_mcp_meta(blocked_stop, mcp_meta)

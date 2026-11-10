@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from dendrux.guardrails._engine import _entry_engine
@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 
     from dendrux.agent import Agent
     from dendrux.guardrails import GuardrailEngine
+    from dendrux.loops._helpers import _BlockedObservationError
     from dendrux.runtime.state import StateStore
 
 
@@ -69,21 +70,54 @@ class _SubmissionBlock:
         return Message(self.role, "", name=self.name, call_id=self.call_id)
 
 
+@dataclass
+class _SubmissionProjection:
+    messages: list[Message] = field(default_factory=list)
+    block: _BlockedObservationError | None = None
+
+    def retain(
+        self,
+        original: Message,
+        message: Message,
+        findings: list[Any],
+        error: str | None,
+        *,
+        inject: bool = True,
+    ) -> None:
+        if inject:
+            self.messages.append(message if error is not None else original)
+        if error is not None and self.block is None:
+            from dendrux.loops._helpers import _BlockedObservationError
+            from dendrux.types import ToolResult
+
+            self.block = _BlockedObservationError(
+                message,
+                findings,
+                error,
+                ToolResult(
+                    name=message.name or "", call_id=message.call_id or "", payload=message.content
+                ),
+            )
+
+
 async def _project_submission(
-    run_id: str, payload: dict[str, Any] | None
+    run_id: str,
+    payload: dict[str, Any] | None,
+    *,
+    projection: _SubmissionProjection | None = None,
 ) -> tuple[dict[str, Any] | None, _SubmissionBlock | None]:
     engine = _entry_engine(run_id)
     if engine is None or payload is None:
         return payload, None
     clean = dict(payload)
-    tool_block = await _project_submitted_tools(engine, clean)
-    input_block = await _project_submitted_input(engine, clean)
-    decision_block = await _project_submitted_decisions(engine, clean)
+    tool_block = await _project_submitted_tools(engine, clean, projection)
+    input_block = await _project_submitted_input(engine, clean, projection)
+    decision_block = await _project_submitted_decisions(engine, clean, projection)
     return clean, tool_block or input_block or decision_block
 
 
 async def _project_submitted_tools(
-    engine: GuardrailEngine, clean: dict[str, Any]
+    engine: GuardrailEngine, clean: dict[str, Any], projection: _SubmissionProjection | None
 ) -> _SubmissionBlock | None:
     from dataclasses import replace
 
@@ -98,6 +132,8 @@ async def _project_submitted_tools(
     for index, result in enumerate(results):
         original = tool_result_message(result)
         message, findings, error = await _project_tool_message(engine, result, original)
+        if projection is not None:
+            projection.retain(original, message, findings, error)
         if error is not None:
             results[index] = replace(result, payload=message.content, error=None, meta={}, notes=())
             block = block or _SubmissionBlock.of(error, findings, original, index)
@@ -106,7 +142,7 @@ async def _project_submitted_tools(
 
 
 async def _project_submitted_input(
-    engine: GuardrailEngine, clean: dict[str, Any]
+    engine: GuardrailEngine, clean: dict[str, Any], projection: _SubmissionProjection | None
 ) -> _SubmissionBlock | None:
     from dendrux.runtime.runner import _stored_parts
 
@@ -118,6 +154,8 @@ async def _project_submitted_input(
         parts=_stored_parts(clean.get("submitted_user_parts")),
     )
     message, findings, error = await engine.project_incoming_message(original)
+    if projection is not None:
+        projection.retain(original, message, findings, error)
     if error is None:
         return None
     clean["submitted_user_input"] = message.content
@@ -129,7 +167,7 @@ async def _project_submitted_input(
 
 
 async def _project_submitted_decisions(
-    engine: GuardrailEngine, clean: dict[str, Any]
+    engine: GuardrailEngine, clean: dict[str, Any], projection: _SubmissionProjection | None
 ) -> _SubmissionBlock | None:
     if "submitted_decisions" not in clean:
         return None
@@ -140,6 +178,8 @@ async def _project_submitted_decisions(
         if copy.get("reason") is not None:
             original = Message(Role.USER, copy["reason"])
             message, findings, error = await engine.project_incoming_message(original)
+            if projection is not None:
+                projection.retain(original, message, findings, error, inject=False)
             if error is not None:
                 copy["reason"] = message.content
                 block = block or _SubmissionBlock.of(error, findings, original, index)

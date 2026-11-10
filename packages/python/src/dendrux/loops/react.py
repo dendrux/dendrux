@@ -24,7 +24,7 @@ import inspect
 import json
 import logging
 import time
-from contextlib import aclosing
+from contextlib import aclosing, nullcontext
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
@@ -52,6 +52,7 @@ from dendrux.loops._budget import BudgetBreach, BudgetCarry, BudgetTracker, brea
 from dendrux.loops._helpers import (
     _BlockedObservationError,
     _check_blocked_run,
+    _evidence_scope,
     build_cache_key_prefix,
     final_stop_reason,
     governance_sinks,
@@ -607,6 +608,8 @@ async def _deliver_inbox(
     iteration: int,
     history: list[Message],
     warnings: list[str],
+    *,
+    guardrail_engine: GuardrailEngine | None = None,
 ) -> None:
     """Append undelivered inbox notes to history as USER messages, then mark them.
 
@@ -626,8 +629,9 @@ async def _deliver_inbox(
             source="run_inbox",
             meta={"note_id": note.id},
         )
-        history.append(msg)
-        await _commit_message(history, msg, recorder, notifier, run_id, iteration, warnings)
+        await _commit_inbox_message(
+            guardrail_engine, msg, history, recorder, notifier, run_id, iteration, warnings
+        )
     await state_store.mark_notes_delivered(run_id, [n.id for n in notes], iteration=iteration)
     for note in notes:
         data = {"note_id": note.id}
@@ -647,6 +651,32 @@ async def _deliver_inbox(
             data,
             correlation_id=note.id,
             warnings=warnings,
+        )
+
+
+async def _commit_inbox_message(
+    engine: GuardrailEngine | None,
+    message: Message,
+    history: list[Message],
+    recorder: LoopRecorder | None,
+    notifier: LoopNotifier | None,
+    run_id: str,
+    iteration: int,
+    warnings: list[str],
+) -> None:
+    findings: list[Any] = []
+    error = None
+    if engine is not None:
+        projected, findings, error = await engine.project_incoming_message(message)
+        if error is not None:
+            message = projected
+    history.append(message)
+    scope = _evidence_scope(recorder, run_id, error is not None) if recorder else nullcontext()
+    async with scope:
+        await _commit_message(history, message, recorder, notifier, run_id, iteration, warnings)
+    if error is not None:
+        raise _BlockedObservationError(
+            message, findings, error, ToolResult(name="", call_id="", payload=message.content)
         )
 
 
@@ -1874,15 +1904,16 @@ async def _iteration_gate(ctx: _RunContext, iteration: int) -> RunResult | None:
     if budget_result is not None:
         return budget_result
     if control is not None and control.has_pending_notes:
-        assert ctx.state_store is not None
+        return await _inbox_gate(ctx, iteration)
+    return None
+
+
+async def _inbox_gate(ctx: _RunContext, iteration: int) -> RunResult | None:
+    assert ctx.state_store is not None
+    try:
         if ctx.agent.guardrails:
             # Only a guarded run reads the mark a blocked note may have left.
-            try:
-                await _check_blocked_run(ctx.state_store, ctx.run_id)
-            except _BlockedObservationError as blocked:
-                return await _incoming_blocked(
-                    ctx, blocked.error, [], blocked.message, 0, iteration
-                )
+            await _check_blocked_run(ctx.state_store, ctx.run_id)
         await _deliver_inbox(
             ctx.state_store,
             ctx.recorder,
@@ -1891,6 +1922,11 @@ async def _iteration_gate(ctx: _RunContext, iteration: int) -> RunResult | None:
             iteration,
             ctx.state.history,
             ctx.state.warnings,
+            guardrail_engine=ctx.g_engine,
+        )
+    except _BlockedObservationError as blocked:
+        return await _incoming_blocked(
+            ctx, blocked.error, blocked.findings, blocked.message, 0, iteration
         )
     return None
 
