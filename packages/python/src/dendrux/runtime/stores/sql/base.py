@@ -2198,11 +2198,10 @@ class SQLStateStore(SQLBlobCatalog):
         writes the intent event. Only the confirmed creator receives the
         child's execution token. No provider, hook or user code runs inside.
         """
-        from dendrux.runtime._capabilities import capabilities, require_managed_subagents
+        from dendrux.runtime._capabilities import require_managed_subagents
         from dendrux.types import _validate_persistable
 
-        if not capabilities(self).managed_subagents:
-            require_managed_subagents(self)
+        require_managed_subagents(self)
         _check_create_identifiers(
             request.child_run_id,
             request.child_agent_name,

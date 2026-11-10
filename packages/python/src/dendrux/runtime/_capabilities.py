@@ -95,8 +95,6 @@ def validate_capabilities(store: Any) -> StoreCapabilities:
         if getattr(caps, capability):
             for method, keywords in methods.items():
                 _check_method(store, capability, method, keywords)
-    if caps.managed_subagents:
-        _check_managed_prerequisites(store, caps)
     try:
         ref = weakref.ref(store, lambda _ref: _CACHE.pop(key, None))
     except TypeError:
@@ -123,17 +121,21 @@ def _check_method(store: Any, capability: str, method: str, keywords: tuple[str,
         _refuse(store, capability, method, missing)
 
 
-def _check_managed_prerequisites(store: Any, caps: StoreCapabilities) -> None:
+def require_managed_subagents(store: Any) -> StoreCapabilities:
+    """Refuse before any managed write unless the store can bind managed children.
+
+    The store must declare ``managed_subagents`` and every durability capability
+    the bind and adoption rely on. Narrowing one of those (for example
+    ``recovery=False``) keeps the store valid for ordinary runs and turns
+    managed use off; it is not a construction error.
+    """
+    validate_capabilities(store)
+    caps = capabilities(store)
+    if not caps.managed_subagents:
+        _refuse(store, "managed_subagents", "bind_managed_child", ("bind_managed_child",))
     absent = tuple(name for name in _MANAGED_PREREQUISITES if not getattr(caps, name))
     if absent:
         _refuse(store, "managed_subagents", "capabilities", absent)
-
-
-def require_managed_subagents(store: Any) -> StoreCapabilities:
-    """Refuse before any managed write unless the store declares the bind capability."""
-    caps = validate_capabilities(store)
-    if not capabilities(store).managed_subagents:
-        _refuse(store, "managed_subagents", "bind_managed_child", ("bind_managed_child",))
     return caps
 
 

@@ -433,8 +433,9 @@ def test_misdeclared_managed_capability_is_refused():
 
 
 async def test_prerequisites_are_required_for_the_managed_capability():
+    """Narrowing a prerequisite keeps the store valid but turns managed use off."""
     from dendrux.errors import StoreCapabilityError
-    from dendrux.runtime._capabilities import validate_capabilities
+    from dendrux.runtime._capabilities import require_managed_subagents, validate_capabilities
     from dendrux.runtime.state import StoreCapabilities
 
     class Partial:
@@ -443,8 +444,10 @@ async def test_prerequisites_are_required_for_the_managed_capability():
         async def bind_managed_child(self, request):
             raise AssertionError("never called")
 
+    store = Partial()
+    validate_capabilities(store)  # an existing narrowing must not break construction
     with pytest.raises(StoreCapabilityError) as refused:
-        validate_capabilities(Partial())
+        require_managed_subagents(store)
     assert refused.value.capability == "managed_subagents"
     assert set(refused.value.missing) == {
         "fenced_writes",
@@ -485,3 +488,23 @@ def test_managed_store_protocol_matches_the_sql_store():
     assert list(expected.parameters) == list(actual.parameters) == ["self", "request"]
     # A separate, capability-gated protocol: the base StateStore is unchanged.
     assert not hasattr(StateStore, "bind_managed_child")
+
+
+async def test_narrowing_recovery_on_a_sql_store_keeps_it_valid_but_unmanaged():
+    from dataclasses import replace
+
+    from dendrux.errors import StoreCapabilityError
+    from dendrux.runtime._capabilities import require_managed_subagents, validate_capabilities
+    from dendrux.runtime.stores._factory import store_for_engine
+    from tests._helpers.v030_oracle import create_sqlite_engine
+
+    engine = await create_sqlite_engine()
+    try:
+        store = store_for_engine(engine)
+        store.capabilities = replace(store.capabilities, recovery=False)
+        validate_capabilities(store)
+        with pytest.raises(StoreCapabilityError) as refused:
+            require_managed_subagents(store)
+        assert refused.value.missing == ("recovery",)
+    finally:
+        await engine.dispose()
