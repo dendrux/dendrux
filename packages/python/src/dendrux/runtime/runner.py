@@ -4962,6 +4962,7 @@ async def _prepare_resume(
     history_records: Any = None,
     pause_data: dict[str, Any] | None = None,
     submission_projection: _SubmissionProjection | None = None,
+    recovering: bool = False,
 ) -> _ResumeContext:
     """Build everything needed to re-enter the loop after a resume.
 
@@ -4997,8 +4998,12 @@ async def _prepare_resume(
             _resumed_payload(expected_status, tool_results, user_input, user_parts),
         )
 
-    history = _resume_history(
-        pause_state, tool_results, user_input, user_parts, submission_projection
+    history = (
+        list(pause_state.history)
+        if recovering
+        else _resume_history(
+            pause_state, tool_results, user_input, user_parts, submission_projection
+        )
     )
 
     # 4. Create recorder with correct trace offset
@@ -5209,7 +5214,11 @@ async def _replay_submission_or_stop(
     from dendrux.loops._helpers import _BlockedObservationError
 
     if recovering:
-        return None
+        return (
+            await _resume_blocked_result(ctx, run_id, input_block)
+            if input_block is not None
+            else None
+        )
     try:
         await _replay_resume_injected_history(
             ctx,
@@ -6986,6 +6995,7 @@ async def _resume_core(
                 ),
                 pause_data=raw_pause,
                 submission_projection=adopted,
+                recovering=recovering,
             )
             progress.submission = getattr(ctx.recorder, "_loop_state", {}).get("submission")
             image_runtime = _image_runtime(agent, state_store, run_tenant, run_id)
