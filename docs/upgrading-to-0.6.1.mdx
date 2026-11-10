@@ -135,7 +135,11 @@ What this changes for a blocked message:
 
 When a continuation adopts a submission made by another call, it retains the first verdict and trusted placeholder through the first new event or trace. This covers tool results, human input, approval and rejection reasons, and pending notes. Rejected text is not rebuilt and rescanned. Native stores commit the mark atomically with that evidence; custom stores must establish and verify the mark before writing it, or raise `PersistenceError`. Previously stored unguarded rows are not erased.
 
+This includes recovering approval pauses: blocked approval and rejection reasons stop before recovery resolution or approval work. Clean adopted approval submissions keep the existing recovery history.
+
 After normal validation and ownership claim, reclaim checks blocked provenance before history rebuild. A marked run or one identified by a legacy blocked event stops even when `max_rebuild_rows` would reject its history. Clean runs still enforce history limits.
+
+A blocked reclaim keeps committed iteration and usage from its checkpoint, without rebuilding history to recover those totals.
 
 ### Recovery holds the whole tool batch for approval
 

@@ -366,6 +366,8 @@ If the combined entry scan blocks while individual pieces are allowed, the disca
 
 When a continuation adopts work submitted by another call, it retains the first verdict and trusted placeholder through the first new event or trace, without rebuilding and rescanning rejected text. This applies to tool results, human input, approval and rejection reasons, and pending notes. Native stores commit the mark atomically with that evidence. Custom stores must establish and verify the mark before writing the evidence, or raise `PersistenceError`. Existing unguarded rows are not erased.
 
+This includes recovering approval pauses: blocked approval and rejection reasons stop before recovery resolution or approval work. Clean adopted approval submissions keep the existing recovery history.
+
 The mark is stored on the run (not in the placeholder's spelling, which anyone can type), it is permanent, and callers cannot set or clear it through metadata. What it changes:
 
 | Entry point | Result |
@@ -378,6 +380,8 @@ The mark is stored on the run (not in the placeholder's spelling, which anyone c
 Each refusal, omission and stop logs the code `blocked_content` with the run ID only. See [Log codes](/docs/reference/log-codes).
 
 Reclaim checks blocked provenance after validation and ownership claim, before history rebuild. A marked run or one identified by a legacy blocked event stops even if `max_rebuild_rows` would reject its history. The already-loaded run row can identify a block without an added lookup; otherwise native reclaim adds one extra indexed lookup and custom reclaim uses a filtered event read. A clean continuation reuses that verdict and still enforces history limits.
+
+A blocked reclaim keeps committed iteration and usage from its checkpoint, without rebuilding history to recover those totals.
 
 Native retry and replay checks use chunks of 200 source IDs, with one added indexed lookup per chunk beyond existing source authorization reads. Retry includes the retried run in that set. Custom stores use the loaded row and, when it does not identify a block, one filtered `guardrail.blocked` event read with `limit=1` per source. The provenance checks do not load history.
 

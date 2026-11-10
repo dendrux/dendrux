@@ -36,6 +36,9 @@ steps and compatibility changes. Default automatic SQLite needs no migration com
   rebuilding and rescanning rejected text. Native stores commit the mark with that evidence;
   custom stores must establish and verify the mark before writing it, or raise
   `PersistenceError`. Existing unguarded rows are not erased.
+- Stop adopted blocks on recovering approval pauses before recovery resolution or approval work,
+  including approval and rejection reasons. Clean adopted approval submissions keep the existing
+  recovery history.
 - Refuse `agent.retry()` of a run whose history holds blocked content (the retried run or
   any `runs=` source): it raises `ReplayRunError` with `reason="blocked_content"` before a
   run is created. `runs=` replay omits the whole blocked run and adds a notice to
@@ -47,6 +50,8 @@ steps and compatibility changes. Default automatic SQLite needs no migration com
   `max_rebuild_rows` does not override a blocked outcome. It reuses the already-loaded run row
   when that identifies a block; otherwise native stores add one extra indexed lookup and
   custom stores use a filtered event read. Clean continuation reuses the verdict.
+  A blocked reclaim keeps committed iteration and usage from its checkpoint without rebuilding
+  history to recover those totals.
 - Native retry and replay provenance checks use chunks of 200 source IDs, adding one indexed
   lookup per chunk beyond existing source authorization reads; retry includes the retried run.
   Custom stores use the loaded row and, when it does not identify a block, one filtered

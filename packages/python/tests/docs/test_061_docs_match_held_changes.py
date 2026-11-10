@@ -161,6 +161,19 @@ def test_blocked_reclaim_admission_precedes_history_limits(page):
     assert "already-loaded run row" in text
 
 
+@pytest.mark.parametrize("page", (*_BLOCKED_PAGES, "guides/recovery.mdx"))
+def test_recovering_approval_adoption_keeps_the_blocked_stop(page):
+    text = _doc(page)
+    assert "recovering approval pauses" in text
+    assert "before recovery resolution or approval work" in text
+    assert "Clean adopted approval submissions keep the existing recovery history" in text
+
+
+@pytest.mark.parametrize("page", (*_BLOCKED_PAGES, "guides/recovery.mdx"))
+def test_blocked_reclaim_keeps_checkpoint_accounting(page):
+    assert "committed iteration and usage" in _doc(page)
+
+
 def _sql_blocks(page: str) -> list[str]:
     text = (DOCS / page).read_text()
     return [b for b in re.findall(r"```sql\n(.*?)```", text, re.S) if "FROM agent_runs" in b]

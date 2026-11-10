@@ -113,6 +113,10 @@ A run that carries the blocked-content mark, or is identified by a legacy blocke
 
 Reclaim reuses the already-loaded run row when it identifies a block. Otherwise native stores add one extra indexed lookup; custom stores use one filtered `guardrail.blocked` event read with `limit=1`. The check does not load history. A clean continuation reuses the verdict, adds no second lookup, and still enforces history limits.
 
+A blocked reclaim keeps committed iteration and usage from its checkpoint, without rebuilding history to recover those totals.
+
+For recovering approval pauses, an adopted block on approval or rejection reasons stops before recovery resolution or approval work. Clean adopted approval submissions keep the existing recovery history.
+
 If recovery honors `request_pause`, the durable result is `paused`. Continue with `submit_resume`, `resume`, or an allowed `resume_stream`. Unresolved approval-gated calls then return `waiting_approval` with a fresh `pause_id`; use that current token for the approval decision. Repeated requested pauses preserve the unresolved calls, and cancellation wins over a pause. Resuming a requested pause does not grant approval.
 
 ## Inspect a recovered run
