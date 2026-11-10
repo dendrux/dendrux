@@ -422,19 +422,9 @@ async def _claim_submission(
             checkpoint if checkpoint is not None else await store.get_loop_state(run_id) or {}
         )
         descriptor = submission_descriptor(request.raw, checkpoint, payload, status)
-    if payload is None:
-        operation: Callable[[], Awaitable[ClaimResult | int | bool]] = partial(
-            claim_paused_validated, store, run_id, expected_status=status, validate=validate
-        )
-    else:
-        kwargs: dict[str, Any] = {"validate": validate}
-        if descriptor is not None:
-            kwargs["submission"] = descriptor
-        if blob_refs:
-            kwargs.update(blob_refs=list(blob_refs), blob_refs_scope=blob_refs_scope)
-        operation = partial(
-            store.submit_and_claim, run_id, expected_status=status, submitted_data=payload, **kwargs
-        )
+    operation = _claim_operation(
+        store, run_id, status, validate, payload, descriptor, blob_refs, blob_refs_scope
+    )
     async with _submission_evidence(store, run_id, blocked):
         won = await _ownership_handoff(
             store, operation, partial(_cancel_claim, store, run_id), run_id=run_id
@@ -444,6 +434,33 @@ async def _claim_submission(
 
         _remember_claim(store, run_id, block)
     return won, descriptor, payload
+
+
+def _claim_operation(
+    store: StateStore,
+    run_id: str,
+    status: str,
+    validate: Callable[[dict[str, Any]], None],
+    payload: dict[str, Any] | None,
+    descriptor: dict[str, Any] | None,
+    blob_refs: Sequence[BlobEdge] | None,
+    blob_refs_scope: str | None,
+) -> Callable[[], Awaitable[ClaimResult | int | bool]]:
+    """The claim the handoff runs: a plain validated claim, or submit-and-claim."""
+    from functools import partial
+
+    if payload is None:
+        return partial(
+            claim_paused_validated, store, run_id, expected_status=status, validate=validate
+        )
+    kwargs: dict[str, Any] = {"validate": validate}
+    if descriptor is not None:
+        kwargs["submission"] = descriptor
+    if blob_refs:
+        kwargs.update(blob_refs=list(blob_refs), blob_refs_scope=blob_refs_scope)
+    return partial(
+        store.submit_and_claim, run_id, expected_status=status, submitted_data=payload, **kwargs
+    )
 
 
 async def _cancel_claim(store: StateStore, run_id: str, result: ClaimResult | int | bool) -> None:

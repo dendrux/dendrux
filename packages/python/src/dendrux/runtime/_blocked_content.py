@@ -7,6 +7,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
 
+from dendrux._lifecycle import FailureReason
 from dendrux.errors import PersistenceError, RunFencedError
 
 if TYPE_CHECKING:
@@ -267,7 +268,7 @@ def _row_blocked(store: StateStore, run_id: str, record: RunRecord | None) -> bo
         raise PersistenceError()
     return (meta or {}).get(BLOCKED_META_KEY) is True or getattr(
         record, "failure_reason", None
-    ) == "guardrail_blocked"
+    ) == FailureReason.GUARDRAIL_BLOCKED.value
 
 
 _dispatch_target: ContextVar[tuple[object, str] | None] = ContextVar(

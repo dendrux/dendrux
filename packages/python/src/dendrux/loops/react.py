@@ -2534,6 +2534,32 @@ async def _blocked_tool_step(
     return await _incoming_blocked(ctx, error, blocked.findings, blocked.message, index, iteration)
 
 
+async def _stream_tool_step(
+    ctx: _RunContext, response: LLMResponse, step: AgentStep, iteration: int
+) -> tuple[_ToolCallOutcome, int, RunResult | None]:
+    """A stream tool step; blocked content ends it with the normal guardrail result."""
+    try:
+        outcome, tool_history_start = await _run_tool_step(ctx, response, step, iteration)
+    except _BlockedObservationError as blocked:
+        stopped = await _blocked_tool_step(ctx, blocked, iteration)
+        return _ToolCallOutcome(all_results=[], pending_calls=[]), 0, stopped
+    return outcome, tool_history_start, None
+
+
+def _stream_tool_stop(
+    ctx: _RunContext,
+    outcome: _ToolCallOutcome,
+    tool_history_start: int,
+    iteration: int,
+    blocked: RunResult | None,
+) -> RunEvent | None:
+    """The stream's terminal event after a tool step: a guardrail stop or a pause."""
+    if blocked is not None:
+        return RunEvent(type=RunEventType.RUN_ERROR, run_result=blocked)
+    paused = _after_tools(ctx, outcome, tool_history_start, iteration)
+    return None if paused is None else RunEvent(type=RunEventType.RUN_PAUSED, run_result=paused)
+
+
 async def _batch_action_result(
     ctx: _RunContext, response: LLMResponse, step: AgentStep, iteration: int
 ) -> RunResult | None:
@@ -2908,14 +2934,9 @@ class ReActLoop(Loop):
                 return
 
             if isinstance(step.action, ToolCall):
-                try:
-                    outcome, tool_history_start = await _run_tool_step(
-                        ctx, llm_response, step, iteration
-                    )
-                except _BlockedObservationError as blocked:
-                    stopped = await _blocked_tool_step(ctx, blocked, iteration)
-                    yield RunEvent(type=RunEventType.RUN_ERROR, run_result=stopped)
-                    return
+                outcome, tool_history_start, blocked = await _stream_tool_step(
+                    ctx, llm_response, step, iteration
+                )
                 for tc, tool_result in outcome.all_results:
                     yield RunEvent(
                         type=RunEventType.TOOL_RESULT,
@@ -2924,9 +2945,9 @@ class ReActLoop(Loop):
                         iteration=iteration,
                         phase="commentary",
                     )
-                paused = _after_tools(ctx, outcome, tool_history_start, iteration)
-                if paused is not None:
-                    yield RunEvent(type=RunEventType.RUN_PAUSED, run_result=paused)
+                stop = _stream_tool_stop(ctx, outcome, tool_history_start, iteration, blocked)
+                if stop is not None:
+                    yield stop
                     return
 
         yield RunEvent(type=RunEventType.RUN_COMPLETED, run_result=_max_iterations_result(ctx))

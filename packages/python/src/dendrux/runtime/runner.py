@@ -247,28 +247,49 @@ async def _finalize_running_event(
 
 
 async def _persist_run_failure(
-    store: StateStore, run_id: str, exc: Exception, *, safe_event: bool = False
+    store: StateStore,
+    run_id: str,
+    exc: Exception | None,
+    *,
+    safe_event: bool = False,
+    payload: dict[str, Any] | None = None,
+    finalize: dict[str, Any] | None = None,
+    strict: bool = False,
 ) -> bool:
+    """Finalize a running run as ERROR and write its ``run.error`` under one rule.
+
+    Without ``payload``/``finalize`` both derive from ``exc``. A caller with its own
+    safe event data and terminal fields (a blocked-content stop) passes them and
+    ``exc=None``; ``strict`` then lets a failed finalize propagate.
+    """
+    if exc is not None:
+        payload = _error_payload(exc) if payload is None else payload
+        finalize = _failure_finalize_fields(store, exc) if finalize is None else finalize
+    payload = payload or {}
     try:
         won, needs_event = await _finalize_running_event(
             store,
             run_id,
             RunStatus.ERROR.value,
             StoredEventType.RUN_ERROR.value,
-            _error_payload(exc),
-            error=_safe_error(exc),
-            **_error_store_kwargs(store, exc),
-            total_usage=None,
+            payload,
+            **(finalize or {}),
         )
     except Exception:
+        if strict:
+            raise
         logger.error(
             "Failed to persist ERROR status for run %s", run_id, exc_info=safe_exception_info()
         )
         return False
     if needs_event:
         emit = _emit_event_safe if safe_event else _emit_event
-        await emit(store, run_id, StoredEventType.RUN_ERROR.value, _error_payload(exc))
+        await emit(store, run_id, StoredEventType.RUN_ERROR.value, payload)
     return bool(won)
+
+
+def _failure_finalize_fields(store: StateStore, exc: Exception) -> dict[str, Any]:
+    return {"error": _safe_error(exc), **_error_store_kwargs(store, exc), "total_usage": None}
 
 
 async def _stream_run_failure(
@@ -5078,6 +5099,36 @@ async def _record_blocked_replay(
     raise AssertionError("a blocked replayed result must stop")
 
 
+def _claimed_in_call(store: StateStore, run_id: str, *, skip_claim: bool) -> bool:
+    """Whether this call won the claim it continues (its own claim, or one it made)."""
+    from dendrux.runtime._blocked_content import _claimed_here
+
+    return not skip_claim or _claimed_here(store, run_id)
+
+
+async def _replay_submission_or_stop(
+    ctx: _ResumeContext,
+    run_id: str,
+    *,
+    recovering: bool,
+    tool_results: list[ToolResult] | None,
+    user_input: str | None,
+    on_consumed: Callable[[], None] | None,
+) -> RunResult | None:
+    """Replay the submitted history (not when recovering); a blocked result stops."""
+    from dendrux.loops._helpers import _BlockedObservationError
+
+    if recovering:
+        return None
+    try:
+        await _replay_resume_injected_history(
+            ctx, run_id, tool_results=tool_results, user_input=user_input, on_consumed=on_consumed
+        )
+    except _BlockedObservationError as blocked:
+        return await _resume_blocked_result(ctx, run_id, blocked)
+    return None
+
+
 async def _resume_blocked_result(ctx: _ResumeContext, run_id: str, blocked: Any) -> RunResult:
     """The normal guardrail outcome for a resumed submission stopped by blocked content."""
     from dendrux.guardrails._engine import _entry_engine
@@ -6640,24 +6691,24 @@ async def _stop_marked_continuation(
             GovernanceEventType.GUARDRAIL_BLOCKED.value,
             _blocked_data("incoming", error, findings, location),
         )
-        won, needs_event = await _finalize_running_event(
+        won = await _persist_run_failure(
             store,
             run_id,
-            RunStatus.ERROR.value,
-            StoredEventType.RUN_ERROR.value,
-            data,
-            error=error,
-            pii_mapping=mapping,
-            total_usage=pause.usage if pause is not None else None,
-            **terminal,
-            **_terminal_failure_kwargs(store, result),
+            None,
+            payload=data,
+            finalize={
+                "error": error,
+                "pii_mapping": mapping,
+                "total_usage": pause.usage if pause is not None else None,
+                **terminal,
+                **_terminal_failure_kwargs(store, result),
+            },
+            strict=True,
         )
     except RunFencedError:
         return await _build_cached_result(store, run_id)
     if not won:
         return await _build_cached_result(store, run_id)
-    if needs_event:
-        await _emit_event(store, run_id, StoredEventType.RUN_ERROR.value, data)
     cached = await _build_cached_result(store, run_id)
     if pause is not None:
         cached.usage = pause.usage
@@ -6766,8 +6817,6 @@ async def _resume_core(
         agent._task_manager.register_current(run_id)
 
         try:
-            from dendrux.runtime._blocked_content import _claimed_here
-
             stopped = await _stop_marked_continuation(
                 state_store,
                 run_id,
@@ -6775,7 +6824,7 @@ async def _resume_core(
                 pause_state,
                 reclaiming=_reclaim_pause is not None,
                 agent=agent,
-                claimed_here=not _skip_claim or _claimed_here(state_store, run_id),
+                claimed_here=_claimed_in_call(state_store, run_id, skip_claim=_skip_claim),
             )
             if stopped is not None:
                 return stopped
@@ -6827,21 +6876,17 @@ async def _resume_core(
 
             # 8b. tool/user-input history. Inside the try so
             #     a recorder failure here fires on_run_failed.
-            if not recovering:
-                from dendrux.loops._helpers import _BlockedObservationError
-
-                try:
-                    await _replay_resume_injected_history(
-                        ctx,
-                        run_id,
-                        tool_results=tool_results,
-                        user_input=user_input,
-                        on_consumed=progress._start,
-                    )
-                except _BlockedObservationError as blocked:
-                    blocked_stop = await _resume_blocked_result(ctx, run_id, blocked)
-                    _attach_mcp_meta(blocked_stop, mcp_meta)
-                    return await _finish_resumed_result(state_store, run_id, ctx, blocked_stop)
+            blocked_stop = await _replay_submission_or_stop(
+                ctx,
+                run_id,
+                recovering=recovering,
+                tool_results=tool_results,
+                user_input=user_input,
+                on_consumed=progress._start,
+            )
+            if blocked_stop is not None:
+                _attach_mcp_meta(blocked_stop, mcp_meta)
+                return await _finish_resumed_result(state_store, run_id, ctx, blocked_stop)
 
             ctx_token = set_delegation_context(
                 _resume_delegation(

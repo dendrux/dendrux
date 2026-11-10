@@ -332,6 +332,19 @@ async def _final_output_values(
     return values
 
 
+def _creation_mark_proven(store: SQLStateStore, run_id: str, meta: dict[str, Any] | None) -> bool:
+    """A blocked creation's readback must also show the mark it committed with."""
+    from dendrux.runtime._blocked_content import _blocked_target
+
+    return _blocked_target.get() != (store, run_id) or (meta or {}).get(BLOCKED_META_KEY) is True
+
+
+def _note_blocked_event(session: AsyncSession, run_id: str, event_type: str) -> None:
+    """A ``guardrail.blocked`` event marks its run in the same transaction."""
+    if event_type == GovernanceEventType.GUARDRAIL_BLOCKED.value:
+        session.info.setdefault(BLOCKED_RUNS_SESSION_KEY, set()).add(run_id)
+
+
 def _creation_metadata(
     session: AsyncSession, store: SQLStateStore, run_id: str, meta: dict[str, Any] | None
 ) -> dict[str, Any] | None:
@@ -1223,7 +1236,6 @@ class SQLStateStore(SQLBlobCatalog):
 
         async def _prove_creation(session: AsyncSession) -> CreateRunResult:
             from dendrux.errors import StoreOutcomeUnknown
-            from dendrux.runtime._blocked_content import _blocked_target
             from dendrux.runtime._digest import content_digest
 
             try:
@@ -1240,10 +1252,7 @@ class SQLStateStore(SQLBlobCatalog):
                     and content_digest(row.input_data) == content_digest(input_data)
                     and row.idempotency_fingerprint == idempotency_fingerprint
                     and row.idempotency_key == idempotency_key
-                    and (
-                        _blocked_target.get() != (self, run_id)
-                        or (row.meta or {}).get(BLOCKED_META_KEY) is True
-                    )
+                    and _creation_mark_proven(self, run_id, row.meta)
                 ):
                     return CreateRunResult(
                         run_id=run_id,
@@ -5812,8 +5821,7 @@ class SQLStateStore(SQLBlobCatalog):
         from dendrux.runtime._digest import event_digest
 
         digest = event_digest(event_type, iteration_index, correlation_id, data)
-        if event_type == GovernanceEventType.GUARDRAIL_BLOCKED.value:
-            session.info.setdefault(BLOCKED_RUNS_SESSION_KEY, set()).add(run_id)
+        _note_blocked_event(session, run_id, event_type)
 
         def conflict() -> NoReturn:
             _codes.log_code(logger, _codes.WRITE_CONFLICT, run_id=run_id)
