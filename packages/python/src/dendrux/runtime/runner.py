@@ -5171,7 +5171,8 @@ async def _project_adopted_submission(
     is retained (recovery consumes the stored values itself), so a block stops the run
     before recovery resolution writes any decision, reason or trace. Its texts are
     projected in the forms recovery sends (a denial as the ``pending`` call's tool
-    result), so recovery reuses each verdict rather than scanning the text again.
+    result), so recovery reuses each verdict rather than scanning the text again; a denial
+    reason that JSON escaping changes is also scanned once as its raw text.
     """
     from dendrux.guardrails._engine import _entry_engine
     from dendrux.runtime._continuation_guardrails import _project_submission, _SubmissionProjection

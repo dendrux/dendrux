@@ -24,7 +24,7 @@ from tests.integration.test_061_secrets_adoption import (
     _raw_claim,
     _retained_values,
 )
-from tests.integration.test_061_secrets_continuation import SECRET
+from tests.integration.test_061_secrets_continuation import SECRET, paused_agent
 
 KINDS = ["tool", "input", "rejection", "approve", "deny"]
 
@@ -127,29 +127,31 @@ TRANSITIONS = ["unavailable", "finding"]
 
 
 class LaterVerdict:
-    """Allows its first scan of the text; any later scan blocks (unavailable or a finding)."""
+    """Counts scans of text holding ``needle``. Allows the first; a later scan blocks
+    (unavailable or a finding), or is allowed too when ``later`` is ``"allow"``."""
 
     action = "block"
 
-    def __init__(self, later):
+    def __init__(self, later, needle=SECRET):
         self.later = later
+        self.needle = needle
         self.calls = 0
 
     async def scan(self, text):
-        if SECRET not in text:
+        if self.needle not in text:
             return []
         self.calls += 1
-        if self.calls == 1:
+        if self.calls == 1 or self.later == "allow":
             return []
         if self.later == "unavailable":
             raise RuntimeError("Detector temporarily unavailable.")
-        start = text.index(SECRET)
-        return [Finding("SECRET", start, start + len(SECRET), 1.0, SECRET)]
+        start = text.index(self.needle)
+        return [Finding("SECRET", start, start + len(self.needle), 1.0, self.needle)]
 
 
 def _rescan_in_recovery(monkeypatch):
     """Keep nothing in the engine's bounded projection cache, so recovery projects the
-    submitted messages again (as it does once more than the cache holds came between)."""
+    submitted messages again: the path a second projection of a sent message takes."""
     import dendrux.guardrails._engine as guard_engine
 
     monkeypatch.setattr(guard_engine, "_PROJECTION_CACHE_LIMIT", 0)
@@ -309,3 +311,80 @@ async def test_later_recovery_block_never_consumes_an_unmarked_placeholder(
     finally:
         await restarted.close()
     assert restarted._require_provider()._call_count == 0
+
+
+async def _deny_claim(store, engine, monkeypatch, reason):
+    """A crashed per-call denial with ``reason``, left unconsumed for reclaim."""
+    agent, _, run_id, raw, _ = await paused_agent(store, engine, 2, approval=True)
+    call_id = raw["pending_tool_calls"][0]["id"]
+    submit = store.submit_and_claim
+
+    @wraps(submit)
+    async def cut(*args, **kwargs):
+        won = await submit(*args, **kwargs)
+        if won:
+            raise Crash()
+        return won
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(store, "submit_and_claim", cut)
+            with pytest.raises(Crash):
+                await agent.submit_approval(
+                    run_id,
+                    decisions={call_id: ApprovalDecision(False, reason)},
+                    tenant_id="t",
+                    expected_pause_id=raw["pause_id"],
+                )
+    finally:
+        await agent.close()
+    return agent, run_id
+
+
+async def _reclaim_with(store, engine, agent, run_id, guard):
+    item = await expire(store, engine, run_id)
+    marker = len(await _events(store, run_id))
+    adopter = _adopter(store, agent, guard)
+    provider = adopter._require_provider()
+    try:
+        result = await adopter.reclaim(run_id, tenant_id="t", item=item)
+    finally:
+        await adopter.close()
+    row = await store.get_run(run_id)
+    return result, row, (await _events(store, run_id))[marker:], provider._call_count
+
+
+# JSON escaping changes this reason (newline, quotes, non-ASCII), so its raw text is not
+# inside the tool-result form recovery sends.
+ESCAPED_REASON = f'line\n"{SECRET}" caf\u00e9'
+
+
+@pytest.mark.parametrize("later", ["allow", *TRANSITIONS])
+async def test_escaped_denial_reason_is_scanned_once_per_form(store, engine, monkeypatch, later):
+    agent, run_id = await _deny_claim(store, engine, monkeypatch, ESCAPED_REASON)
+    guard = LaterVerdict(later)
+    result, row, events, calls = await _reclaim_with(store, engine, agent, run_id, guard)
+    # Once in the form recovery sends, once as the raw reason; recovery reuses both.
+    assert guard.calls == 2
+    if later == "allow":
+        assert result.meta.get("failure_reason") != "guardrail_blocked"
+        assert "dendrux.blocked" not in (row.meta or {})
+        return
+    # The raw-reason verdict blocks before recovery writes the decision.
+    assert result.meta["failure_reason"] == "guardrail_blocked"
+    assert row.meta["dendrux.blocked"] is True
+    assert "approval.decided" not in events and calls == 0
+
+
+@pytest.mark.parametrize("later", ["allow", *TRANSITIONS])
+async def test_empty_denial_reason_is_scanned_once_as_recovery_sends_it(
+    store, engine, monkeypatch, later
+):
+    agent, run_id = await _deny_claim(store, engine, monkeypatch, "")
+    guard = LaterVerdict(later, needle='"denied"')
+    result, row, events, calls = await _reclaim_with(store, engine, agent, run_id, guard)
+    # Scanned with the default reason recovery substitutes, so recovery reuses the verdict.
+    assert guard.calls == 1
+    assert result.meta.get("failure_reason") != "guardrail_blocked"
+    assert "dendrux.blocked" not in (row.meta or {})
+    assert calls == 1

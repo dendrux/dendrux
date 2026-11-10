@@ -173,12 +173,17 @@ def test_recovering_approval_adoption_keeps_the_blocked_stop(page):
 def test_reclaim_scans_an_unconsumed_submission_once(page):
     text = _doc(page)
     assert "submission it never consumed" in text
-    assert "scans that stored submission once" in text
+    assert "scans that stored submission, with the same projection" in text
     assert "approved or denied" in text
     assert "no `approval.decided` event" in text
     assert "A clean stored submission is recovered as before, with no added statements" in text
-    assert "in the form recovery sends (a denial as the call's tool result)" in text
+    assert "Each text is scanned once in the form recovery sends" in text
+    assert "with an empty denial reason replaced by the default reason" in text
     assert "recovery reuses that verdict" in text
+    assert "When JSON escaping changes a denial reason, its raw text is scanned once more" in text
+    start = text.index("Reclaim of a run whose crashed claim")
+    paragraph = text[start : text.index("with no added statements", start)]
+    assert "cache" not in paragraph
     assert "before the submission is consumed and before any tool call" in text
 
 
@@ -193,21 +198,32 @@ class _CountingGuard:
         return []
 
 
-async def test_reclaim_denial_verdict_is_taken_once_in_the_form_recovery_sends():
-    """Behind "once": the denial reason is scanned in recovery's form, which then reuses it."""
+@pytest.mark.parametrize(
+    ("reason", "scans"),
+    [
+        ("not this one", 1),
+        ("", 1),
+        ('line\n"quoted" caf\u00e9', 2),
+    ],
+)
+async def test_reclaim_denial_verdict_is_taken_once_per_form(reason, scans):
+    """Behind "once": a denial is scanned in the form recovery sends (an empty reason as the
+    default), plus its raw text when JSON escaping changes it; recovery then reuses both."""
     from dendrux.guardrails import GuardrailEngine
     from dendrux.runtime._continuation_guardrails import _project_reason
     from dendrux.runtime._reclaim import _recovery_denial
+    from dendrux.runtime.submit import DEFAULT_DENIAL_REASON
     from dendrux.types import ToolCall
 
     guard = _CountingGuard()
     engine = GuardrailEngine([guard])  # type: ignore[list-item]
     call = ToolCall("write_value", id="call-1")
-    decision = {"call_id": call.id, "approved": False, "reason": "not this one"}
+    decision = {"call_id": call.id, "approved": False, "reason": reason}
     await _project_reason(engine, decision, {call.id: call})
-    assert guard.calls == 1
-    _, _, blocked = await engine.project_incoming_message(_recovery_denial(call, "not this one"))
-    assert blocked is None and guard.calls == 1
+    assert guard.calls == scans
+    sent = _recovery_denial(call, reason or DEFAULT_DENIAL_REASON)
+    _, _, blocked = await engine.project_incoming_message(sent)
+    assert blocked is None and guard.calls == scans
 
 
 @pytest.mark.parametrize("page", (*_BLOCKED_PAGES, "guides/recovery.mdx"))

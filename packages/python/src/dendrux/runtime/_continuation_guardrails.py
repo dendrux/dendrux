@@ -112,7 +112,7 @@ async def _project_submission(
 
     ``denied_calls`` (reclaim) maps pending call IDs to their calls: a denial's reason is
     then projected in the tool-result form recovery sends, so recovery's own projection of
-    that message reuses this verdict instead of scanning the reason a second time.
+    that message reuses this verdict (see :func:`_project_reason`).
     """
     engine = _entry_engine(run_id)
     if engine is None or payload is None:
@@ -204,19 +204,20 @@ async def _project_reason(
     engine: GuardrailEngine, decision: dict[str, Any], denied_calls: Mapping[str, ToolCall]
 ) -> tuple[Message, Message, list[Any], str | None]:
     """Project a decision reason; a denial of a known call in the tool-result form
-    recovery sends (its reason is also scanned on its own when that form escapes it)."""
+    recovery sends, with the default reason recovery substitutes for an empty one. When
+    JSON escaping changes the reason, its raw text is scanned as well."""
     denied = None if decision.get("approved", True) else denied_calls.get(decision["call_id"])
     if denied is None:
         original = Message(Role.USER, decision["reason"])
         return original, *(await engine.project_incoming_message(original))
     from dendrux.loops._helpers import _project_tool_message
     from dendrux.runtime._reclaim import _recovery_denial
+    from dendrux.runtime.submit import DEFAULT_DENIAL_REASON
     from dendrux.types import ToolResult
 
-    original = _recovery_denial(denied, decision["reason"])
-    result = ToolResult(
-        name=denied.name, call_id=denied.id, payload=original.content, error=decision["reason"]
-    )
+    reason = decision["reason"] or DEFAULT_DENIAL_REASON
+    original = _recovery_denial(denied, reason)
+    result = ToolResult(name=denied.name, call_id=denied.id, payload=original.content, error=reason)
     return original, *(await _project_tool_message(engine, result, original))
 
 
