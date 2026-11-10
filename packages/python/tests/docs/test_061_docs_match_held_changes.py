@@ -170,6 +170,16 @@ def test_recovering_approval_adoption_keeps_the_blocked_stop(page):
 
 
 @pytest.mark.parametrize("page", (*_BLOCKED_PAGES, "guides/recovery.mdx"))
+def test_reclaim_scans_an_unconsumed_submission_once(page):
+    text = _doc(page)
+    assert "submission it never consumed" in text
+    assert "scans that stored submission once" in text
+    assert "approved or denied" in text
+    assert "no `approval.decided` event" in text
+    assert "A clean stored submission is recovered as before, with no added statements" in text
+
+
+@pytest.mark.parametrize("page", (*_BLOCKED_PAGES, "guides/recovery.mdx"))
 def test_blocked_reclaim_keeps_checkpoint_accounting(page):
     assert "committed iteration and usage" in _doc(page)
 

@@ -39,6 +39,14 @@ steps and compatibility changes. Default automatic SQLite needs no migration com
 - Stop adopted blocks on recovering approval pauses before recovery resolution or approval work,
   including approval and rejection reasons. Clean adopted approval submissions keep the existing
   recovery history.
+- Reclaim of a run whose crashed claim left a submission it never consumed scans that stored
+  submission once, with the same projection as other adopted submissions, before recovery
+  resolution. A block on a tool result, human input, a rejection reason or a per-call reason
+  (approved or denied) stops the run as `error` with `failure_reason="guardrail_blocked"`:
+  no `approval.decided` event, provider call or tool call, and no new row holding the text.
+  The result reports the turn that would have consumed the submission, with committed usage
+  from its checkpoint. A clean stored submission is recovered as before, with no added
+  statements.
 - Refuse `agent.retry()` of a run whose history holds blocked content (the retried run or
   any `runs=` source): it raises `ReplayRunError` with `reason="blocked_content"` before a
   run is created. `runs=` replay omits the whole blocked run and adds a notice to
