@@ -9,7 +9,8 @@
   calls a decorated tool with the wrong arguments or uses its return value as the
   wrong type, mypy and pyright now report it. Reading the attribute
   `my_tool.__tool_def__` directly is now a type error (it still works at run
-  time); call `dendrux.tool.get_tool_def(my_tool)` instead, which is typed.
+  time); use the typed accessor instead:
+  `from dendrux.tool import get_tool_def`, then `get_tool_def(my_tool)`.
 
 ### Documentation
 
