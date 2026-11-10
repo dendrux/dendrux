@@ -508,3 +508,110 @@ async def test_narrowing_recovery_on_a_sql_store_keeps_it_valid_but_unmanaged():
         assert refused.value.missing == ("recovery",)
     finally:
         await engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# Fix round 1, R4: strict continuation fields of a v3 wait
+# ---------------------------------------------------------------------------
+
+
+def _continuation_mutations():
+    def set_(key, value):
+        return lambda d: d.__setitem__(key, value)
+
+    def usage(key, value):
+        return lambda d: d["usage"].__setitem__(key, value)
+
+    return {
+        "iteration_text": set_("iteration", SENTINEL),
+        "iteration_negative": set_("iteration", -1),
+        "iteration_bool": set_("iteration", True),
+        "iteration_float": set_("iteration", 1.5),
+        "offset_negative": set_("trace_order_offset", -42),
+        "offset_text": set_("trace_order_offset", SENTINEL),
+        "schema_version_float": set_("schema_version", 3.0),
+        "binding_version_bool": lambda d: d["managed_wait"].__setitem__("v", True),
+        "binding_version_float": lambda d: d["managed_wait"].__setitem__("v", 1.0),
+        "usage_not_object": set_("usage", [SENTINEL]),
+        "usage_tokens_text": usage("input_tokens", SENTINEL),
+        "usage_tokens_negative": usage("output_tokens", -5),
+        "usage_tokens_bool": usage("total_tokens", True),
+        "usage_cost_text": usage("cost_usd", SENTINEL),
+        "usage_cost_negative": usage("cost_usd", -1.0),
+        "usage_optional_text": usage("reasoning_tokens", SENTINEL),
+        "usage_flag_text": usage("usage_reported", SENTINEL),
+        "usage_source_number": usage("cost_source", 7),
+        "image_ref_number": set_("image_view_ref", 7),
+        "provider_kwargs_list": set_("provider_kwargs", [SENTINEL]),
+        "pause_message_number": set_("pause_message", 7),
+        "unpriced_calls_negative": set_("budget_unpriced_calls", -1),
+        "unpriced_calls_bool": set_("budget_unpriced_calls", True),
+        "known_cost_text": set_("budget_known_cost_usd", SENTINEL),
+        "budget_fired_text": set_("budget_fired", SENTINEL),
+        "budget_fired_bad_item": set_("budget_fired", [[SENTINEL]]),
+        "unpriced_reported_text": set_("budget_unpriced_reported", SENTINEL),
+        "budget_exceeded_text": set_("budget_exceeded", SENTINEL),
+        "provider_call_id_number": lambda d: d["pending_tool_calls"][0].__setitem__(
+            "provider_tool_call_id", 7
+        ),
+        "targets_not_object": set_("pending_targets", [SENTINEL]),
+    }
+
+
+@pytest.mark.parametrize("name", sorted(_continuation_mutations()))
+def test_strict_decoder_refuses_malformed_continuation_fields(name, caplog):
+    stored = managed_wait_pause(
+        budget_fired=[("cost_usd", 0.5)], budget_known_cost_usd=0.25, budget_unpriced_calls=1
+    ).to_dict()
+    _continuation_mutations()[name](stored)
+    with pytest.raises(ManagedStateError) as refused:
+        PauseState.from_managed_dict(stored)
+    assert refused.value.reason == "wait_invalid"
+    assert SENTINEL not in str(refused.value) and SENTINEL not in caplog.text
+
+
+def test_well_formed_optional_continuation_fields_round_trip():
+    pause = managed_wait_pause(
+        budget_fired=[("cost_usd", 0.5)],
+        budget_known_cost_usd=0.25,
+        budget_unpriced_calls=2,
+        budget_unpriced_reported=True,
+        budget_exceeded=[{"metric": "cost_usd", "used": 1.0, "max": 0.5}],
+        pause_message="note",
+        image_view_ref="ref-1",
+        usage=UsageStats(
+            input_tokens=1,
+            output_tokens=2,
+            total_tokens=3,
+            cost_usd=0.01,
+            reasoning_tokens=0,
+            cost_source="table",
+        ),
+    )
+    stored = pause.to_dict()
+    assert PauseState.from_managed_dict(stored).to_dict() == stored
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [{"agent_name": ""}, {"iteration": -1}, {"trace_order_offset": -3}, {"iteration": True}],
+    ids=["agent_name", "iteration", "offset", "iteration_bool"],
+)
+def test_encoder_shares_the_strict_continuation_rules(overrides):
+    with pytest.raises(ValueError):
+        managed_wait_pause(**overrides).to_dict()
+
+
+def test_binding_version_must_be_an_exact_int():
+    for version in (True, 1.0):
+        with pytest.raises(ValueError):
+            ManagedWait(tool_call_id="c1", child_run_id=generate_ulid(), version=version)
+
+
+def test_legacy_decoder_is_not_tightened():
+    v2 = managed_wait_pause().to_dict()
+    v2.pop("managed_wait")
+    v2.update(schema_version=2, pause_reason=None, iteration="1", trace_order_offset=-1)
+    # Legacy semantics unchanged: v1/v2 values are read as stored.
+    back = PauseState.from_dict(v2)
+    assert back.iteration == "1" and back.trace_order_offset == -1

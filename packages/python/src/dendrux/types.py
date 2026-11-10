@@ -1569,7 +1569,7 @@ class ManagedWait:
             raise ValueError("ManagedWait.tool_call_id must be a stable call id")
         if not isinstance(self.child_run_id, str) or not _ULID_PATTERN.fullmatch(self.child_run_id):
             raise ValueError("ManagedWait.child_run_id must be a run ULID")
-        if self.version != MANAGED_PROTOCOL_VERSION:
+        if type(self.version) is not int or self.version != MANAGED_PROTOCOL_VERSION:
             raise ValueError("Unsupported managed protocol version")
 
     def to_dict(self) -> dict[str, Any]:
@@ -1731,8 +1731,10 @@ class PauseState:
         d = references.to_dict()
         d["schema_version"] = MANAGED_WAIT_SCHEMA_VERSION
         d["managed_wait"] = binding.to_dict()
-        if _compact_json_bytes(d) > MANAGED_WAIT_MAX_BYTES:
-            raise ValueError("Managed wait exceeds its byte bound")
+        reason, _ = _managed_wait_check(d)
+        if reason is not None:
+            # The encoder never writes what the strict decoder would refuse.
+            raise ValueError(f"Invalid managed wait ({reason})")
         return d
 
     def _checkpoint_fields(self, d: dict[str, Any]) -> None:
@@ -1827,26 +1829,39 @@ def _compact_json_bytes(value: Any) -> int:
 
 
 def _managed_wait_binding(data: Any, run_id: str | None) -> ManagedWait:
-    """Validate a stored v3 managed wait's envelope; return its binding."""
+    """Validate a stored v3 managed wait; return its binding or refuse safely."""
     from dendrux.errors import ManagedStateError
 
+    reason, binding = _managed_wait_check(data)
+    if reason is not None or binding is None:
+        raise ManagedStateError(reason=reason or "wait_invalid", run_id=run_id)
+    return binding
+
+
+def _managed_wait_check(data: Any) -> tuple[str | None, ManagedWait | None]:
+    """Shared by the v3 encoder and decoder: ``(refusal reason, binding)``."""
     if not isinstance(data, dict):
-        raise ManagedStateError(reason="wait_invalid", run_id=run_id)
+        return "wait_invalid", None
     try:
         size = _compact_json_bytes(data)
     except (TypeError, ValueError):
-        raise ManagedStateError(reason="wait_invalid", run_id=run_id) from None
+        return "wait_invalid", None
     if size > MANAGED_WAIT_MAX_BYTES:
-        raise ManagedStateError(reason="wait_too_large", run_id=run_id)
+        return "wait_too_large", None
     binding = _managed_wait_envelope(data) if _managed_wait_fields_ok(data) else None
-    if binding is None or not _managed_wait_call_ok(data, binding):
-        raise ManagedStateError(reason="wait_invalid", run_id=run_id)
-    return binding
+    if (
+        binding is None
+        or not _managed_wait_call_ok(data, binding)
+        or not _managed_wait_continuation_ok(data)
+    ):
+        return "wait_invalid", None
+    return None, binding
 
 
 def _managed_wait_fields_ok(data: dict[str, Any]) -> bool:
     return (
-        data.get("schema_version") == MANAGED_WAIT_SCHEMA_VERSION
+        type(data.get("schema_version")) is int
+        and data["schema_version"] == MANAGED_WAIT_SCHEMA_VERSION
         and data.get("pause_reason") == MANAGED_WAIT_REASON
         and isinstance(data.get("agent_name"), str)
         and bool(data["agent_name"])
@@ -1881,7 +1896,74 @@ def _managed_wait_call_ok(data: dict[str, Any], binding: ManagedWait) -> bool:
         and calls[0].get("id") == binding.tool_call_id
         and isinstance(calls[0].get("name"), str)
         and calls[0].get("params") == {}
+        and _optional_text(calls[0].get("provider_tool_call_id"))
         and data.get("pending_targets") == {binding.tool_call_id: "agent"}
+    )
+
+
+def _count(value: Any) -> bool:
+    return type(value) is int and value >= 0
+
+
+def _money(value: Any) -> bool:
+    import math
+
+    return type(value) in (int, float) and math.isfinite(value) and value >= 0
+
+
+def _optional_text(value: Any) -> bool:
+    return value is None or isinstance(value, str)
+
+
+def _usage_ok(usage: Any) -> bool:
+    if not isinstance(usage, dict):
+        return False
+    counts = ("input_tokens", "output_tokens", "total_tokens")
+    optional = ("cache_read_input_tokens", "cache_creation_input_tokens", "reasoning_tokens")
+    return (
+        all(_count(usage.get(key, 0)) for key in counts)
+        and all(usage.get(key) is None or _count(usage[key]) for key in optional)
+        and (usage.get("cost_usd") is None or _money(usage["cost_usd"]))
+        and _optional_text(usage.get("cost_source"))
+        and type(usage.get("usage_reported", True)) is bool
+        and type(usage.get("cost_unknown", False)) is bool
+    )
+
+
+def _budget_ok(data: dict[str, Any]) -> bool:
+    fired = data.get("budget_fired")
+    exceeded = data.get("budget_exceeded")
+    known = data.get("budget_known_cost_usd")
+    return (
+        (
+            fired is None
+            or isinstance(fired, list)
+            and all(
+                isinstance(item, list)
+                and len(item) == 2
+                and isinstance(item[0], str)
+                and _money(item[1])
+                for item in fired
+            )
+        )
+        and (exceeded is None or isinstance(exceeded, list))
+        and all(isinstance(item, dict) for item in exceeded or ())
+        and (known is None or _money(known))
+        and _count(data.get("budget_unpriced_calls", 0))
+        and type(data.get("budget_unpriced_reported", False)) is bool
+    )
+
+
+def _managed_wait_continuation_ok(data: dict[str, Any]) -> bool:
+    """The continuation fields the managed protocol reads, with exact types."""
+    return (
+        _count(data.get("iteration"))
+        and _count(data.get("trace_order_offset"))
+        and _usage_ok(data.get("usage"))
+        and _optional_text(data.get("image_view_ref"))
+        and isinstance(data.get("provider_kwargs", {}), dict)
+        and _optional_text(data.get("pause_message"))
+        and _budget_ok(data)
     )
 
 
