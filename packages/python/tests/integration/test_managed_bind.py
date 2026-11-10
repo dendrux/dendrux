@@ -772,3 +772,32 @@ async def test_lost_ack_with_changed_rows_is_unknown(store, engine, monkeypatch)
     state = await snapshot(engine, parent)
     assert [c.id for c in state["children"]] == [request.child_run_id]
     assert len(state["tools"]) == 1
+
+
+async def test_generic_continuations_refuse_a_managed_wait_before_claiming(store, engine):
+    """Until the managed driver exists (T2b), every public continuation of a parked
+    parent refuses with the stable pause_format_unsupported code and claims nothing."""
+    from dendrux import Agent
+    from dendrux.llm.mock import MockLLM
+    from dendrux.types import ToolResult
+
+    parent, call_id = await managed_parent(store)
+    request = bind_request(parent, call_id)
+    bound = await store.bind_managed_child(request)
+    agent = Agent(name="lead", prompt="p", provider=MockLLM([]), state_store=store)
+    before = await snapshot(engine, parent)
+    attempts = [
+        agent.submit_resume(parent, tenant_id="t1", expected_pause_id=bound.parent_wait_id),
+        agent.resume(parent, tenant_id="t1", expected_pause_id=bound.parent_wait_id),
+        agent.submit_tool_results(
+            parent,
+            [ToolResult(name="reviewer", call_id=call_id, payload='"forged"')],
+            tenant_id="t1",
+            expected_pause_id=bound.parent_wait_id,
+        ),
+    ]
+    for attempt in attempts:
+        with pytest.raises(PersistenceError) as refused:
+            await attempt
+        assert refused.value.code == "pause_format_unsupported"
+    await _assert_unchanged(engine, parent, before)

@@ -1526,6 +1526,19 @@ class StateStore(Protocol):
     ) -> list[str]: ...
 
 
+class ManagedStateStore(Protocol):
+    """Internal (0.7): the managed-subagent extension of a store.
+
+    Declared by ``StoreCapabilities.managed_subagents``; callers check it with
+    ``require_managed_subagents`` before any managed write. Kept apart from
+    :class:`StateStore` so stores without the capability stay conforming.
+    """
+
+    async def bind_managed_child(
+        self, request: BindManagedChildRequest
+    ) -> BindManagedChildResult: ...
+
+
 _PERSISTED_VALUE_FIELDS = frozenset(
     {
         "content",

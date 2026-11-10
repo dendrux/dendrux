@@ -472,3 +472,16 @@ async def test_store_without_capability_refuses_before_any_managed_write():
         require_managed_subagents(Legacy())
     assert refused.value.capability == "managed_subagents"
     assert calls == []
+
+
+def test_managed_store_protocol_matches_the_sql_store():
+    import inspect
+
+    from dendrux.runtime.state import ManagedStateStore, StateStore
+    from dendrux.runtime.stores.sql.base import SQLStateStore
+
+    expected = inspect.signature(ManagedStateStore.bind_managed_child)
+    actual = inspect.signature(SQLStateStore.bind_managed_child)
+    assert list(expected.parameters) == list(actual.parameters) == ["self", "request"]
+    # A separate, capability-gated protocol: the base StateStore is unchanged.
+    assert not hasattr(StateStore, "bind_managed_child")
