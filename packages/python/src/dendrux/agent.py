@@ -827,9 +827,10 @@ class Agent:
         The transformed value is what gets persisted, notified and sent to the
         model; there is no separate model-only view.
 
-        - Not applied to failed tool calls. The built-in ``use_skill`` tool is
-          a server tool too; check ``ctx.tool_name`` to skip it, and
-          ``ctx.target`` to tell client results apart.
+        - Not applied to failed tool calls, or to the built-in skill tools
+          (``use_skill``, ``read_skill_resource``, ``run_skill_script``):
+          their output never reaches the transform. Check ``ctx.target`` to
+          tell client results apart.
         - On a client result, ``ctx.result`` is the parsed JSON payload;
           submitted images pass through unchanged.
         - If the transform raises on a server call, that tool call fails

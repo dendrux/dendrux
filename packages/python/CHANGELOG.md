@@ -7,7 +7,9 @@
 - `@tool(...)` now keeps the decorated function's signature for type checkers
   instead of turning it into `Any`. Runtime behaviour is unchanged. If your code
   calls a decorated tool with the wrong arguments or uses its return value as the
-  wrong type, mypy and pyright now report it.
+  wrong type, mypy and pyright now report it. Reading the attribute
+  `my_tool.__tool_def__` directly is now a type error (it still works at run
+  time); call `dendrux.tool.get_tool_def(my_tool)` instead, which is typed.
 
 ### Documentation
 

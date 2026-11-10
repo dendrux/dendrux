@@ -71,8 +71,13 @@ def test_decorated_tools_keep_their_signatures(tmp_path: Path) -> None:
         """
         from typing import assert_type
 
+        from dendrux.tool import get_tool_def
+        from dendrux.types import ToolDef
+
 
         async def use() -> None:
+            assert_type(get_tool_def(add), ToolDef)
+            assert_type(get_tool_def(Sheet.read).name, str)
             assert_type(await add(1, 2), int)
             assert_type(label("x"), str)
             assert_type(label("x", upper=True), str)

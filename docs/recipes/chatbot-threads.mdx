@@ -83,13 +83,16 @@ result = await agent.run(
 ```python
 from dendrux.store import RunStore
 
-async with RunStore.from_database_url("postgresql+asyncpg://...") as store:
-    runs = await store.list_runs(metadata_filter={"thread_id": "thread_abc"}, tenant_id=tenant)
-    for r in runs:
-        print(r.run_id, r.status, r.total_cost_usd, r.created_at)
+store = RunStore.from_database_url("postgresql+asyncpg://...")  # once, at startup
+
+runs = await store.list_runs(metadata_filter={"thread_id": "thread_abc"}, tenant_id=tenant)
+for r in runs:
+    print(r.run_id, r.status, r.total_cost_usd, r.created_at)
 ```
 
-Every `RunStore` read takes `tenant_id=`. Pass the signed-in user's tenant in anything a user can reach. Leaving it out reads **every** tenant's runs, which is only for your own operator tools. As with the agent, open one store at startup and close it at shutdown in a real app.
+Like the agent, the store lives as long as your app: create it at startup and `await store.close()` at shutdown. The examples below reuse it.
+
+Pass the signed-in user's tenant as `tenant_id=` in every read a user can reach. On the list and detail reads used on this page (`list_runs`, `count_runs`, `get_events`, `get_llm_calls`, `get_tool_invocations`, `get_traces`, `get_pauses`), leaving it out reads **every** tenant's runs, which is only for your own operator tools. Newer reads such as `get_pending`, `follow` and `get_event_view` have no default: pass a tenant, `None` for untenanted runs, or `UNSCOPED` (`from dendrux import UNSCOPED`) for an operator view.
 
 Combines with the existing filters:
 

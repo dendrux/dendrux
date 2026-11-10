@@ -116,7 +116,7 @@ async with Agent(
     tools=[add],
     database_url="sqlite+aiosqlite:///demo.db",
 ) as agent:
-    await agent.run("What is 15 + 27?", notifier=ConsoleNotifier())
+    await agent.run("What is 15 + 27?", tenant_id="acme", notifier=ConsoleNotifier())
 ```
 
 Per-call makes sense: a batch run wants metrics, a dev-loop invocation wants terminal output, and a production webhook wants Slack fanout. The same `Agent` can serve all three with different notifiers on different calls.
