@@ -89,6 +89,8 @@ def normalize_subagents(owner_name: str, subagents: Any) -> tuple[Any, ...]:
         return ()
     if not isinstance(subagents, (list, tuple)):
         refuse(SubagentDefinitionError(owner_name, reason="not_a_list"))
+    if len(subagents) > MAX_SUBAGENT_TREE_NODES:
+        refuse(SubagentTreeTooLargeError(owner_name, max_nodes=MAX_SUBAGENT_TREE_NODES))
     return tuple(subagents)
 
 
@@ -113,12 +115,14 @@ def check_subagent_tree(
 
     Checks every agent's direct subagents: each is an ``agent_type`` with a
     valid name and a non-empty description, names are unique per parent and do
-    not clash with that parent's tools (``extra_tool_names`` adds names for the
-    root, for example tools discovered later). Cycles are found on the current
+    not clash with that parent's tools (and its skill tools when it has skills;
+    ``extra_tool_names`` adds names for the root, for example tools discovered
+    later). Cycles are found on the current
     path by object identity, so one Agent may appear at several paths. Depth is
     checked against ``max_depth`` (default: the root's own setting, else 10;
     ``None`` is unbounded), tightened by each agent's own limit on its subtree.
-    At most ``max_nodes`` subagent nodes are walked (root excluded).
+    At most ``max_nodes`` subagent nodes are walked (root excluded): a list that
+    does not fit the remaining budget is refused before any entry is inspected.
     """
     limit = _root_limit(root) if isinstance(max_depth, _UnsetType) else max_depth
     root_names = _tool_names(root) | frozenset(extra_tool_names)
@@ -127,13 +131,13 @@ def check_subagent_tree(
     while stack:
         node, depth, node_limit, path = stack.pop()
         children = _children(node)
+        if walked + len(children) > max_nodes:
+            refuse(SubagentTreeTooLargeError(root.name, max_nodes=max_nodes))
         names = root_names if node is root else _tool_names(node)
         _check_siblings(node.name, children, agent_type, names)
+        walked += len(children)
         for child in children:
             _check_edge(node, child, depth + 1, node_limit, path)
-            walked += 1
-            if walked > max_nodes:
-                refuse(SubagentTreeTooLargeError(root.name, max_nodes=max_nodes))
             child_limit = _tighten(node_limit, child.max_delegation_depth)
             stack.append((child, depth + 1, child_limit, (*path, id(child))))
 
@@ -193,9 +197,11 @@ def _tighten(limit: int | None, own: Any) -> int | None:
 
 
 def _tool_names(agent: Any) -> frozenset[str]:
-    """Local tool names plus the generated skill tool names (always reserved)."""
-    local = (get_tool_def(fn).name for fn in agent.tools if is_tool(fn))
-    return frozenset(local) | _SKILL_TOOL_NAMES
+    """Local tool names, plus the generated skill tool names when skills are configured."""
+    names = frozenset(get_tool_def(fn).name for fn in agent.tools if is_tool(fn))
+    if getattr(agent, "_skills_dir", None) or getattr(agent, "_explicit_skills", None):
+        return names | _SKILL_TOOL_NAMES
+    return names
 
 
 def _check_siblings(

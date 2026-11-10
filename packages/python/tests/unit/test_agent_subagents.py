@@ -42,6 +42,21 @@ async def lookup(query: str) -> str:
     return query
 
 
+class _Tripwire:
+    """A subagent entry that counts every inspection of its definition."""
+
+    inspected = 0
+
+    def __getattr__(self, name: str) -> object:
+        type(self).inspected += 1
+        raise AssertionError(f"entry inspected: {name}")
+
+
+@pytest.fixture(autouse=True)
+def _reset_tripwire() -> None:
+    _Tripwire.inspected = 0
+
+
 def _provider() -> MockLLM:
     return MockLLM([])
 
@@ -248,11 +263,18 @@ class TestNameConflicts:
         assert info.value.reason == "tool_name_clash"
         assert info.value.subagent_name == "lookup"
 
-    @pytest.mark.parametrize("reserved", ["use_skill", "read_skill_resource", "run_skill_script"])
-    def test_clash_with_generated_skill_tools(self, reserved: str) -> None:
+    @pytest.mark.parametrize("generated", ["use_skill", "read_skill_resource", "run_skill_script"])
+    def test_skill_free_parent_accepts_generated_skill_names(self, generated: str) -> None:
+        assert _parent([_child(generated)]).subagents[0].name == generated
+
+    @pytest.mark.parametrize("generated", ["use_skill", "read_skill_resource", "run_skill_script"])
+    def test_parent_with_skills_refuses_generated_skill_names(
+        self, generated: str, tmp_path
+    ) -> None:
         with pytest.raises(SubagentNameConflictError) as info:
-            _parent([_child(reserved)])
+            _parent([_child(generated)], skills_dir=tmp_path)
         assert info.value.reason == "tool_name_clash"
+        assert info.value.subagent_name == generated
 
     def test_names_are_unique_per_parent_not_globally(self) -> None:
         nested_helper = _child("helper", description="Nested helper.")
@@ -383,6 +405,29 @@ class TestTreeSize:
         ]
         root = _parent(leads)
         assert len(root.subagents) == 10
+
+    def test_wide_direct_list_is_refused_before_any_entry_is_inspected(self) -> None:
+        tripwires = [_Tripwire() for _ in range(1_000)]
+        with pytest.raises(SubagentTreeTooLargeError) as info:
+            _parent(tripwires)
+        assert info.value.max_nodes == MAX_SUBAGENT_TREE_NODES
+        assert _Tripwire.inspected == 0
+
+    def test_wide_nested_list_is_refused_before_any_entry_is_inspected(self) -> None:
+        child = _child("lead_a")
+        root = _parent([child], description="Leads.")
+        child._subagents = tuple(_Tripwire() for _ in range(1_000))
+        with pytest.raises(SubagentTreeTooLargeError):
+            check_subagent_tree(root, agent_type=object)
+        assert _Tripwire.inspected == 0
+
+    def test_list_that_fits_the_remaining_budget_is_checked(self) -> None:
+        # Budget 3: root's two children use 2, the nested list of 2 does not fit.
+        inner = _child("inner", subagents=[_child("x"), _child("y")])
+        root = _parent([inner, _child("other")], description="Leads.")
+        check_subagent_tree(root, agent_type=Agent, max_nodes=4)
+        with pytest.raises(SubagentTreeTooLargeError):
+            check_subagent_tree(root, agent_type=Agent, max_nodes=3)
 
     def test_bound_is_overridable_on_the_check(self) -> None:
         root = _parent([_child("a"), _child("b")])
