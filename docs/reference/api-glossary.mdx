@@ -43,6 +43,8 @@ This is the full public surface of Dendrux: everything you import in normal use.
 | `OpenAIProvider` | `from dendrux.llm.openai import OpenAIProvider` | OpenAI Chat Completions provider. |
 | `OpenAIResponsesProvider` | `from dendrux.llm.openai_responses import OpenAIResponsesProvider` | OpenAI Responses API provider (built-in tools). |
 
+The shortest setup skips the import: `Agent(provider="anthropic:claude-haiku-4-5", ...)` builds the provider from a `"vendor:model"` string (`anthropic`, `openai`, `openai-responses` or `openrouter`) and reads the API key from the environment. Construct the provider yourself when you need its options.
+
 Caching is automatic for all built-in providers. See [Prompt cache](/docs/architecture/prompt-cache).
 
 ## Guardrails

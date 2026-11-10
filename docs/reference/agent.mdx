@@ -11,11 +11,10 @@ description: The Agent constructor and public runtime methods, including reclaim
 
 ```python
 from dendrux import Agent
-from dendrux.llm.anthropic import AnthropicProvider
 
 agent = Agent(
     name="Support",
-    provider=AnthropicProvider(model="claude-haiku-4-5"),
+    provider="anthropic:claude-haiku-4-5",
     prompt="You are a support agent.",
     tools=[...],
     database_url="sqlite+aiosqlite:///app.db",
@@ -31,7 +30,7 @@ agent = Agent(
 ```python
 Agent(
     *,
-    provider: LLMProvider,
+    provider: LLMProvider | str,
     prompt: str,
     name: str = ...,                       # defaults to the class name
     tools: list[Callable] = [],
@@ -66,7 +65,7 @@ Agent(
 
 | Parameter | Purpose |
 | --- | --- |
-| `provider` | The LLM provider. Required. See [providers in the glossary](/docs/reference/api-glossary#providers). |
+| `provider` | The LLM provider. Required. Either a `"vendor:model"` string, such as `"anthropic:claude-haiku-4-5"`, or a provider instance. The string builds the provider for you and reads the API key from the environment; supported vendors are `anthropic`, `openai`, `openai-responses` and `openrouter`. Pass an instance, such as `AnthropicProvider(...)`, to set timeouts and other provider options. See [providers in the glossary](/docs/reference/api-glossary#providers). |
 | `prompt` | The system prompt. Required (a subclass may set it as a class attribute instead). |
 | `name` | Used for the run's owner and `cache_key_prefix`. Defaults to the class name. |
 | `tools` | List of `@tool`-decorated functions. Empty for a pure chatbot. |
