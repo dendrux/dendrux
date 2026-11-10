@@ -172,7 +172,7 @@ The two engines trade off detection recall against predictability. Pick based on
 **When Presidio earns its keep:**
 
 - Input is free-form natural language (chat, email bodies, support tickets, meeting transcripts) where names, places, and dates show up unpredictably.
-- Detection recall matters more than precision — you'd rather over-redact than leak.
+- Detection recall matters more than precision — prefer extra redaction over missed detections.
 - You want the fuller entity catalogue (`IBAN_CODE`, `MEDICAL_LICENSE`, `US_PASSPORT`, etc.) without writing regexes for each.
 
 ### The false-positive reality
@@ -195,7 +195,7 @@ Why the run still succeeded:
 
 1. The LLM gets tool names from the **tool schema** (the `tools=[...]` argument to the provider API), not from prompt text. The schema is not guardrail-scanned. So the LLM knew the tool was called `process_refund` and called it correctly.
 2. Within the prompt text, the LLM saw `"call <<PERSON_1>> with..."`. It ignored the placeholder because the schema was the source of truth.
-3. The `pii_mapping` gained one extra audit entry. No data leaked.
+3. The `pii_mapping` gained one extra audit entry. The original value stayed redacted.
 
 This is benign when the misclassified token is (a) not sensitive and (b) not something the LLM needs to reason about semantically in text. Those conditions fit most real prompts.
 
@@ -273,7 +273,7 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-`SecretDetection` ships with four patterns: `AWS_ACCESS_KEY`, `AWS_SECRET_KEY`, `GENERIC_API_KEY`, `PRIVATE_KEY`. Since 0.5.0 an AWS secret key is reported only next to an `AKIA...` access key or a context word such as `aws_secret_access_key`, so random 40-character strings no longer trigger it. The default action is `block`, not `redact`, because a secret that leaked into a prompt should stop the conversation rather than be silently replaced.
+`SecretDetection` ships with four patterns: `AWS_ACCESS_KEY`, `AWS_SECRET_KEY`, `GENERIC_API_KEY`, `PRIVATE_KEY`. Since 0.5.0 an AWS secret key is reported only next to an `AKIA...` access key or a context word such as `aws_secret_access_key`, so random 40-character strings no longer trigger it. The default action is `block`, not `redact`, because a secret found in a prompt should stop the conversation rather than be silently replaced.
 
 The captured governance rows from that run (Dendrux 0.5.0, claude-haiku-4-5):
 

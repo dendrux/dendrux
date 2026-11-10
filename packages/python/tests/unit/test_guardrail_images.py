@@ -198,7 +198,7 @@ async def test_loop_parts_aware_redaction_reaches_wire() -> None:
 
 
 async def test_object_without_scan_methods_keeps_v030_failure() -> None:
-    """P2-2: a misnamed guardrail still fails loudly; only image-only guardrails are skipped."""
+    """a misnamed guardrail still fails loudly; only image-only guardrails are skipped."""
     import pytest
 
     class Misnamed:

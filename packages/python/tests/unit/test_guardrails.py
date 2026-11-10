@@ -143,7 +143,7 @@ class TestPIIEngineParameter:
 
 class TestRedactCallbackRemoved:
     """Guardrails replaced the redact= callback. PII is policy-driven
-    at the LLM boundary; redaction no longer leaks into persistence."""
+    at the LLM boundary; redaction is confined to that boundary."""
 
     def test_agent_init_rejects_redact_kwarg(self):
         with pytest.raises(TypeError, match="redact"):
@@ -775,7 +775,7 @@ class TestDeoverlap:
         assert block is None
         # Should produce one CREDIT_CARD, not PHONE + leftover digits
         assert "<<CREDIT_CARD_1>>" in text
-        assert "1111" not in text  # no leaked digits
+        assert "1111" not in text  # no original digits
 
     async def test_credit_card_in_tool_params_detected_not_mutated(self):
         """Overlapping findings detected; params stay raw (persisted as-is)."""
@@ -1662,14 +1662,14 @@ class TestMultiTurnGuardrail:
         second_call = llm.call_history[1]
         for msg in second_call["messages"]:
             assert "jane@example.com" not in msg.content, (
-                f"PII leaked in {msg.role.value} message: {msg.content}"
+                f"Unredacted PII in {msg.role.value} message: {msg.content}"
             )
 
     async def test_tool_call_only_output_scanned(self):
         """Output guardrail fires even when response.text is None."""
         tc = ToolCall(
             name="send_email",
-            params={"to": "leaked@real.com", "body": "hi"},
+            params={"to": "recipient@real.com", "body": "hi"},
             provider_tool_call_id="t1",
         )
         resp = LLMResponse(

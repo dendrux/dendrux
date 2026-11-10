@@ -1118,7 +1118,7 @@ security fix (see Changed) and a database migration (see Migration): run
 
 ## 0.2.0a23 - 2026-10-15
 
-- Runs started from a stream consumer's own loop body are no longer linked as delegation children of the stream run; this previously happened because delegation context leaked between yields.
+- Runs started from a stream consumer's own loop body are no longer linked as delegation children of the stream run; this previously happened because delegation context persisted between yields.
 - Skills v2. A skill can now carry files and scripts, be built from code, and be
   activated per run. Dendrux still never executes skill code itself.
   - `Skill` is validated and immutable, and is exported from `dendrux`. Build it
@@ -1377,7 +1377,7 @@ security fix (see Changed) and a database migration (see Migration): run
   Approved numeric IPs are dialed directly while preserving TLS hostname
   verification. DNS changes, redirects, and reconnects cannot bypass the check.
 - MCP HTTP: `MCPDestinationDeniedError` distinguishes denied destinations during
-  connect/discovery. Policy exceptions fail closed without leaking callback text.
+  connect/discovery. Policy exceptions fail closed without including callback text.
   Policy-enabled connections disable environment proxies and TLS overrides.
 - MCP runtime: destination policy identity participates in connection configuration
   checks; use `rebind()` to replace policy and retire existing sockets.

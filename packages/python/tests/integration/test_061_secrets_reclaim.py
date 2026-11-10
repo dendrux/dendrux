@@ -272,7 +272,7 @@ async def test_format1_stale_sweep_keeps_classification_and_mark(store, engine):
 async def test_adopted_unprojected_input_never_reaches_events_or_traces(
     store, engine, fmt, monkeypatch
 ):
-    # R1-P2-A: input claimed without projection (raw store, guardrails added later) is
+    # input claimed without projection (raw store, guardrails added later) is
     # projected before the run.resumed event and the user trace are written.
     from dendrux.runtime.runner import resume_claimed
 
@@ -332,7 +332,7 @@ async def test_adopted_unprojected_input_never_reaches_events_or_traces(
 
 @pytest.mark.parametrize("fmt", [1, 2])
 async def test_failure_handler_survives_an_exception_whose_str_raises(store, engine, fmt):
-    # E3h-Q review P2-1: deriving the failure payload must not escape the handler.
+    # deriving the failure payload must not escape the handler.
     from dendrux.runtime.runner import _persist_run_failure
 
     class BadStrError(Exception):

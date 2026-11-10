@@ -136,7 +136,7 @@ async def test_approved_non_skill_calls_match_main(policy):
         assert "denied" in json.loads(result.payload)
     else:
         assert result.meta["code"] == "max_calls"
-    # A client-target call is never executed server-side on approval (A-P0-1).
+    # A client-target call is never executed server-side on approval.
     assert [tc.name for tc in approval.client_pending] == ["cli"]
     assert order == (["srv-start", "srv-end"] if policy == "plain" else [])
     assert [m.name for m in state.history[-1:]] == ["srv"]

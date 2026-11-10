@@ -4548,7 +4548,7 @@ def run_stream(
           (2) If the lifecycle pair was opened locally (recorder/notifier
               stashed by ``_generate`` after ``run_started`` fired), close
               it with a ``run_finished`` event on the LOCAL notifier so
-              OTel root spans don't leak. This fires regardless of whether
+              OTel root spans close. This fires regardless of whether
               the CAS won — if some other caller already finalized the
               run, our local notifier still needs the close event.
 
@@ -7629,7 +7629,7 @@ def resume_stream(
         Mirrors run_stream._cleanup. The lifecycle close fires whether or
         not the CAS won — if some other caller already finalized the run,
         the local notifier still needs the close event so OTel root spans
-        don't leak. Status resolution: CAS won → CANCELLED, CAS lost →
+        are closed. Status resolution: CAS won → CANCELLED, CAS lost →
         query store for actual status (falling back to CANCELLED).
         """
         if not _shared.get("claimed"):

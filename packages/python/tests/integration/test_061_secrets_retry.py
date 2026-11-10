@@ -207,7 +207,7 @@ async def test_custom_store_retry_uses_filtered_event_fallback(store, engine, fa
 
 
 async def test_custom_store_that_drops_the_mark_retries_only_the_placeholder(store, engine):
-    # BL-9, initial input: a store that cannot keep the mark refuses the blocked write
+    # initial input: a store that cannot keep the mark refuses the blocked write
     # safely. The row exists, sanitized and unmarked, with no stored turn, so a later retry
     # stops with the existing "no persisted traces" error and calls no provider.
     from tests._fixtures.stores import UndeclaredSameMethodsStore
@@ -285,7 +285,7 @@ async def test_retry_of_identified_run_with_sources_reads_no_source_history(
 async def test_custom_store_that_drops_the_mark_after_a_stored_turn_retries_clean_history(
     store, engine, fmt
 ):
-    # BL-9, later block: the first turn is stored, then a tool result is blocked. The
+    # later block: the first turn is stored, then a tool result is blocked. The
     # store cannot keep the mark, so the blocked write is refused before any evidence:
     # the run ends unmarked with its clean turn only. A retry is not refused, reaches the
     # provider and sends exactly that stored clean history (no secret, nothing blocked).
@@ -294,15 +294,18 @@ async def test_custom_store_that_drops_the_mark_after_a_stored_turn_retries_clea
     await pin_storage_format(engine, fmt)
 
     @tool()
-    async def leak() -> str:
+    async def read_value() -> str:
         """Return a value."""
         return SECRET
 
     provider = MockLLM(
-        [LLMResponse(tool_calls=[ToolCall(name="leak", params={})]), LLMResponse(text="x")]
+        [LLMResponse(tool_calls=[ToolCall(name="read_value", params={})]), LLMResponse(text="x")]
     )
     agent = _agent(
-        UndeclaredSameMethodsStore(store), provider, tools=[leak], guardrails=[SecretDetection()]
+        UndeclaredSameMethodsStore(store),
+        provider,
+        tools=[read_value],
+        guardrails=[SecretDetection()],
     )
     try:
         with pytest.raises(PersistenceError):
@@ -316,7 +319,7 @@ async def test_custom_store_that_drops_the_mark_after_a_stored_turn_retries_clea
     stored = [(t.role, t.content) for t in await store.get_traces(row.id)]
     assert stored == [("user", "go"), ("assistant", "")]
     retry_provider = MockLLM([LLMResponse(text="again")])
-    agent = _agent(store, retry_provider, tools=[leak])
+    agent = _agent(store, retry_provider, tools=[read_value])
     try:
         result = await agent.retry(row.id)
     finally:
