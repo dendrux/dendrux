@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- `@tool(...)` now keeps the decorated function's signature for type checkers
+  instead of turning it into `Any`. Runtime behaviour is unchanged. If your code
+  calls a decorated tool with the wrong arguments or uses its return value as the
+  wrong type, mypy and pyright now report it. Reading the attribute
+  `my_tool.__tool_def__` directly is now a type error (it still works at run
+  time); use the typed accessor instead:
+  `from dendrux.tool import get_tool_def`, then `get_tool_def(my_tool)`.
+
+### Documentation
+
+- `tool_result_transform` docs now say it also runs on successful client results
+  from `submit_tool_results` and `resume` (true since 0.5.0), and that a raising
+  transform there refuses the submission and leaves the run paused.
+- The chatbot-threads recipe passes the authenticated tenant to `run()` and to every
+  `RunStore` read, and appends to history only after a successful answer.
+- The run-replay recipe describes `replay_last` as a full-detail window: older
+  questions and answers still replay, so it does not cap total prompt size.
+- The Agent reference documents the `"vendor:model"` provider string.
+
 ## 0.6.1 - 2026-11-10
 
 See [Upgrading to 0.6.1](../../docs/upgrading-to-0.6.1.mdx) for setup-specific

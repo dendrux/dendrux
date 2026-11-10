@@ -71,8 +71,8 @@ Measured on `claude-sonnet-4-6` with thinking on, a 5-turn database chat with a 
 
 OpenAI and OpenRouter (`google/gemma-4-31b-it`) show the same shape. Rules of thumb:
 
-- **Tool-heavy chat, short to medium threads:** `replay_last="all"`. Cheapest *and* smartest — every turn reads the whole earlier conversation from cache.
-- **Long threads:** a window (`replay_last=3`) keeps the prompt bounded. Older turns collapse to question + answer. Reasoning continuity is lost from the run where the window first moved (see below); tools and results inside the window still replay.
+- **Tool-heavy chat, short to medium threads:** `replay_last="all"`. The model remembers the most, and in the measurements above every turn reads the earlier conversation from cache. The prompt still grows with every turn.
+- **Long threads:** a window (`replay_last=3`) limits how many recent runs replay in full detail. Older runs collapse to question + answer, so the prompt grows much more slowly, but it still grows: every earlier question and answer is sent again. `replay_last` is a detail setting, not a limit on total prompt size. Reasoning continuity is lost from the run where the window first moved (see below); tools and results inside the window still replay.
 - **Plain Q&A without tools:** `history=` or `replay_last=0` is enough.
 
 ## Reasoning and the prefix rule

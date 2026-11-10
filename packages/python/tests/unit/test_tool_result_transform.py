@@ -345,3 +345,79 @@ class TestMCPTool:
         assert ctx.params == {"message": "hi"}
         assert ctx.result == {"result": "hi"}
         assert ctx.meta["source_name"] == "echo"
+
+
+class TestClientResults:
+    """The transform also rewrites successful results a client submits."""
+
+    @staticmethod
+    def _agent(tmp_path: Path, model: MockLLM, transform: Any) -> Agent:
+        @tool(target="client")
+        async def read_cells() -> str:
+            """Read cells in the client."""
+            raise AssertionError("client tools never run on the server")
+
+        return Agent(
+            provider=model,
+            prompt="Read",
+            tools=[read_cells],
+            tool_result_transform=transform,
+            database_url=f"sqlite+aiosqlite:///{tmp_path / 'client.sqlite'}",
+        )
+
+    @staticmethod
+    def _submission(paused: Any) -> list[Any]:
+        from dendrux.types import ToolResult
+
+        (call,) = paused.pending.tool_calls
+        payload = json.dumps({"rows": [20, 22], "marker": "LARGE_ORIGINAL"})
+        return [ToolResult(name=call.name, call_id=call.id, payload=payload)]
+
+    async def test_the_model_sees_the_transformed_client_result(self, tmp_path: Path) -> None:
+        seen: list[ToolResultContext] = []
+
+        def summarize(ctx: ToolResultContext) -> Any:
+            seen.append(ctx)
+            return {"total": sum(ctx.result["rows"])}
+
+        model = MockLLM(
+            [LLMResponse(tool_calls=[ToolCall("read_cells", {})]), LLMResponse(text="42")]
+        )
+        async with self._agent(tmp_path, model, summarize) as agent:
+            paused = await agent.run("Read", tenant_id="acme")
+            result = await agent.submit_tool_results(
+                paused.run_id,
+                self._submission(paused),
+                tenant_id="acme",
+                expected_pause_id=paused.pause_id,
+            )
+
+        assert result.status == RunStatus.SUCCESS
+        (ctx,) = seen
+        assert ctx.tool_name == "read_cells"
+        assert ctx.target == ToolTarget.CLIENT
+        wire = "\n".join(m.content or "" for m in model.wire_messages[-1])
+        assert '"total": 42' in wire
+        assert "LARGE_ORIGINAL" not in wire
+
+    async def test_a_raising_transform_refuses_the_submission(self, tmp_path: Path) -> None:
+        from dendrux.errors import InvalidToolResultError
+
+        def broken(ctx: ToolResultContext) -> Any:
+            raise RuntimeError("transform bug")
+
+        model = MockLLM([LLMResponse(tool_calls=[ToolCall("read_cells", {})])])
+        async with self._agent(tmp_path, model, broken) as agent:
+            paused = await agent.run("Read", tenant_id="acme")
+            with pytest.raises(InvalidToolResultError):
+                await agent.submit_tool_results(
+                    paused.run_id,
+                    self._submission(paused),
+                    tenant_id="acme",
+                    expected_pause_id=paused.pause_id,
+                )
+            after = await agent.get_result(paused.run_id, tenant_id="acme")
+
+        assert after.status == paused.status
+        assert after.pause_id == paused.pause_id
+        assert len(model.wire_messages) == 1

@@ -156,14 +156,14 @@ Current usage is read live, not from the pause snapshot, so spending by child ru
 
 ```python
 # The budget pause
-paused = await agent.run("Summarize the corpus.")
+paused = await agent.run("Summarize the corpus.", tenant_id="acme")
 assert paused.status.value == "paused"
 print(paused.meta["budget_exceeded"])      # [{'metric': 'tokens', 'used': 52310, 'max': 50000}]
 
 # An operator raises the limit. Build the Agent with the higher budget.
 bigger = Agent(provider=provider, prompt="...", tools=[...],
                budget=Budget(max_tokens=200_000, on_exceed="pause"), database_url=url)
-await bigger.submit_resume(paused.run_id)
+await bigger.submit_resume(paused.run_id, tenant_id="acme")
 ```
 
 Because the budget lives on the `Agent`, "raising the limit" means resuming with an `Agent` built with a higher `Budget`.
