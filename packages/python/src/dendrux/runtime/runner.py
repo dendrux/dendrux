@@ -5157,6 +5157,7 @@ async def _project_adopted_submission(
     *,
     skip_claim: bool,
     stored: dict[str, Any] | None = None,
+    pending: Sequence[ToolCall] = (),
 ) -> tuple[
     list[ToolResult] | None,
     str | None,
@@ -5168,7 +5169,9 @@ async def _project_adopted_submission(
 
     ``stored`` is the unconsumed payload reclaim found in the pause row: only its verdict
     is retained (recovery consumes the stored values itself), so a block stops the run
-    before recovery resolution writes any decision, reason or trace.
+    before recovery resolution writes any decision, reason or trace. Its texts are
+    projected in the forms recovery sends (a denial as the ``pending`` call's tool
+    result), so recovery reuses each verdict rather than scanning the text again.
     """
     from dendrux.guardrails._engine import _entry_engine
     from dendrux.runtime._continuation_guardrails import _project_submission, _SubmissionProjection
@@ -5186,7 +5189,12 @@ async def _project_adopted_submission(
         else None
     )
     projection = _SubmissionProjection()
-    clean, _ = await _project_submission(run_id, payload, projection=projection)
+    clean, _ = await _project_submission(
+        run_id,
+        payload,
+        projection=projection,
+        denied_calls={tc.id: tc for tc in pending} if stored is not None else None,
+    )
     if clean is None or stored is not None:
         kept = projection if stored is not None else None
         return tool_results, user_input, user_parts, decisions, kept
@@ -5243,6 +5251,32 @@ async def _replay_submission_or_stop(
     except _BlockedObservationError as blocked:
         return await _resume_blocked_result(ctx, run_id, blocked)
     return None
+
+
+async def _resolve_recovery(
+    agent: Agent,
+    store: StateStore,
+    run_id: str,
+    ctx: _ResumeContext,
+    *,
+    image_runtime: Any,
+    tenant_id: str | None,
+    on_work: Callable[[], None] | None,
+) -> RunResult | None:
+    """Recovery resolution; a submitted message it would send that projects as blocked
+    stops the run before consumption, with the mark committed with its first evidence."""
+    try:
+        return await _reclaim.resolve(
+            agent,
+            store,
+            run_id,
+            ctx,
+            image_runtime=image_runtime,
+            tenant_id=tenant_id,
+            on_work=on_work,
+        )
+    except _reclaim._RecoveryBlockedError as stopped:
+        return await _resume_blocked_result(ctx, run_id, stopped.blocked)
 
 
 async def _resume_blocked_result(ctx: _ResumeContext, run_id: str, blocked: Any) -> RunResult:
@@ -6987,6 +7021,7 @@ async def _resume_core(
                 decisions,
                 skip_claim=_skip_claim,
                 stored=_reclaim_submission,
+                pending=pause_state.pending_tool_calls,
             )
 
             run_tenant = run_record.tenant_id if run_record else None
@@ -7058,7 +7093,7 @@ async def _resume_core(
             )
 
             if recovering:
-                stop = await _reclaim.resolve(
+                stop = await _resolve_recovery(
                     agent,
                     state_store,
                     run_id,
@@ -7565,7 +7600,7 @@ def resume_stream(
             yield RunEvent(type=RunEventType.RUN_RESUMED, run_id=run_id)
 
             if recovering:
-                stop = await _reclaim.resolve(
+                stop = await _resolve_recovery(
                     agent,
                     store,
                     run_id,

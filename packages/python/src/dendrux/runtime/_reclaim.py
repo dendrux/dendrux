@@ -470,9 +470,39 @@ async def _consume_recovery_submission(
                 store, run_id, ctx, lookups, descriptor, payload, PauseState.from_dict(raw)
             )
         injected = [await project_message(recorder, message) for message in injected]
+        await _admit_recovery_block(recorder, injected)
         await recorder.consume_resume(injected)
         ctx.history.extend(injected)
     return recorder._loop_state, descriptor
+
+
+class _RecoveryBlockedError(Exception):
+    """A submitted message recovery would send projected as blocked; the run stops."""
+
+    def __init__(self, blocked: Any) -> None:
+        super().__init__(blocked.error)
+        self.blocked = blocked
+
+
+async def _admit_recovery_block(recorder: PersistenceRecorder, messages: list[Message]) -> None:
+    """Stop before consumption when a message recovery would send projected as blocked.
+
+    Raised before the submission is consumed, so no placeholder is committed without the
+    run mark and no sibling call runs; the caller stops the run with the mark committed
+    together with its first sanitized evidence.
+    """
+    from dendrux.loops._helpers import _BlockedObservationError
+
+    engine = getattr(recorder, "guardrail_engine", None)
+    for message in messages:
+        if engine is None or engine._projected_block(message) is None:
+            continue
+        # Reuses the attached verdict: the detector does not run again.
+        projected, findings, error = await engine.project_incoming_message(message)
+        result = ToolResult(
+            name=projected.name or "", call_id=projected.call_id or "", payload=projected.content
+        )
+        raise _RecoveryBlockedError(_BlockedObservationError(projected, findings, error, result))
 
 
 async def _recovery_barrier(

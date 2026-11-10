@@ -11,13 +11,14 @@ from dendrux.runtime._entry_guardrails import _entry_projection
 from dendrux.types import Message, Role, content_part_to_dict
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Iterator, Mapping
     from contextlib import AbstractContextManager
 
     from dendrux.agent import Agent
     from dendrux.guardrails import GuardrailEngine
     from dendrux.loops._helpers import _BlockedObservationError
     from dendrux.runtime.state import StateStore
+    from dendrux.types import ToolCall
 
 
 async def _continuation_projection(
@@ -105,14 +106,23 @@ async def _project_submission(
     payload: dict[str, Any] | None,
     *,
     projection: _SubmissionProjection | None = None,
+    denied_calls: Mapping[str, ToolCall] | None = None,
 ) -> tuple[dict[str, Any] | None, _SubmissionBlock | None]:
+    """Project each governed text in a submission once.
+
+    ``denied_calls`` (reclaim) maps pending call IDs to their calls: a denial's reason is
+    then projected in the tool-result form recovery sends, so recovery's own projection of
+    that message reuses this verdict instead of scanning the reason a second time.
+    """
     engine = _entry_engine(run_id)
     if engine is None or payload is None:
         return payload, None
     clean = dict(payload)
     tool_block = await _project_submitted_tools(engine, clean, projection)
     input_block = await _project_submitted_input(engine, clean, projection)
-    decision_block = await _project_submitted_decisions(engine, clean, projection)
+    decision_block = await _project_submitted_decisions(
+        engine, clean, projection, denied_calls or {}
+    )
     return clean, tool_block or input_block or decision_block
 
 
@@ -167,7 +177,10 @@ async def _project_submitted_input(
 
 
 async def _project_submitted_decisions(
-    engine: GuardrailEngine, clean: dict[str, Any], projection: _SubmissionProjection | None
+    engine: GuardrailEngine,
+    clean: dict[str, Any],
+    projection: _SubmissionProjection | None,
+    denied_calls: Mapping[str, ToolCall],
 ) -> _SubmissionBlock | None:
     if "submitted_decisions" not in clean:
         return None
@@ -176,8 +189,7 @@ async def _project_submitted_decisions(
     for index, decision in enumerate(clean["submitted_decisions"]):
         copy = dict(decision)
         if copy.get("reason") is not None:
-            original = Message(Role.USER, copy["reason"])
-            message, findings, error = await engine.project_incoming_message(original)
+            original, message, findings, error = await _project_reason(engine, copy, denied_calls)
             if projection is not None:
                 projection.retain(original, message, findings, error, inject=False)
             if error is not None:
@@ -186,6 +198,26 @@ async def _project_submitted_decisions(
         decisions.append(copy)
     clean["submitted_decisions"] = decisions
     return block
+
+
+async def _project_reason(
+    engine: GuardrailEngine, decision: dict[str, Any], denied_calls: Mapping[str, ToolCall]
+) -> tuple[Message, Message, list[Any], str | None]:
+    """Project a decision reason; a denial of a known call in the tool-result form
+    recovery sends (its reason is also scanned on its own when that form escapes it)."""
+    denied = None if decision.get("approved", True) else denied_calls.get(decision["call_id"])
+    if denied is None:
+        original = Message(Role.USER, decision["reason"])
+        return original, *(await engine.project_incoming_message(original))
+    from dendrux.loops._helpers import _project_tool_message
+    from dendrux.runtime._reclaim import _recovery_denial
+    from dendrux.types import ToolResult
+
+    original = _recovery_denial(denied, decision["reason"])
+    result = ToolResult(
+        name=denied.name, call_id=denied.id, payload=original.content, error=decision["reason"]
+    )
+    return original, *(await _project_tool_message(engine, result, original))
 
 
 def _submission_evidence(store: StateStore, run_id: str, blocked: bool) -> Any:
