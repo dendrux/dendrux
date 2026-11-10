@@ -113,8 +113,9 @@ async def reclaim(
             )
             if stopped is not None:
                 return _reclaimed_result(run_id, stopped)
+            reader = _PauseReadMemo(owned)
             pause = await rebuild_pause(
-                agent, owned, run_id, state, history_records=history_records
+                agent, cast("StateStore", reader), run_id, state, history_records=history_records
             )
             provider = agent._require_provider()
         result = await _resume_core(
@@ -128,8 +129,44 @@ async def reclaim(
             _reclaim_pause=pause,
             _reclaim_history=history_records,
             _reclaim_record=record,
+            _reclaim_submission=_unconsumed_submission(state, reader.raw),
         )
         return _reclaimed_result(run_id, result)
+
+
+class _PauseReadMemo:
+    """Forward to the claimed store, remembering the pause read the rebuild already makes.
+
+    The unconsumed submission is then available without another read of the row.
+    """
+
+    def __init__(self, store: StateStore) -> None:
+        self._store = store
+        self.raw: dict[str, Any] | None = None
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._store, name)
+
+    async def get_pause_state(self, run_id: str) -> dict[str, Any] | None:
+        self.raw = await self._store.get_pause_state(run_id)
+        return self.raw
+
+
+def _unconsumed_submission(
+    state: dict[str, Any], raw: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    """The stored payload of a claimed submission that recovery has not consumed yet.
+
+    An invalid envelope returns None here; recovery reports it as before.
+    """
+    from dendrux.runtime.submit import _submission_payload
+
+    if not state.get("submission") or not raw:
+        return None
+    try:
+        return _submission_payload(raw) or None
+    except ValueError:
+        return None
 
 
 def _reclaimed_result(run_id: str, result: RunResult) -> RunResult:

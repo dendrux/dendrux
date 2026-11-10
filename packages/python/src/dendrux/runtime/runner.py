@@ -5156,6 +5156,7 @@ async def _project_adopted_submission(
     decisions: list[tuple[str, ApprovalDecision]] | None,
     *,
     skip_claim: bool,
+    stored: dict[str, Any] | None = None,
 ) -> tuple[
     list[ToolResult] | None,
     str | None,
@@ -5163,23 +5164,32 @@ async def _project_adopted_submission(
     list[tuple[str, ApprovalDecision]] | None,
     _SubmissionProjection | None,
 ]:
+    """Project a submission this call did not claim, once, before anything stores it.
+
+    ``stored`` is the unconsumed payload reclaim found in the pause row: only its verdict
+    is retained (recovery consumes the stored values itself), so a block stops the run
+    before recovery resolution writes any decision, reason or trace.
+    """
     from dendrux.guardrails._engine import _entry_engine
     from dendrux.runtime._continuation_guardrails import _project_submission, _SubmissionProjection
     from dendrux.runtime.submit import deserialize_decisions, deserialize_tool_results
 
-    if (
-        _entry_engine(run_id) is None
-        or raw is None
-        or _claimed_in_call(store, run_id, skip_claim=skip_claim)
-    ):
+    if _entry_engine(run_id) is None or _claimed_in_call(store, run_id, skip_claim=skip_claim):
         return tool_results, user_input, user_parts, decisions, None
-    payload = _resume_claim_payload(
-        run_id, raw, status, tool_results, user_input, user_parts, decisions
+    payload = (
+        stored
+        if stored is not None
+        else _resume_claim_payload(
+            run_id, raw, status, tool_results, user_input, user_parts, decisions
+        )
+        if raw is not None
+        else None
     )
     projection = _SubmissionProjection()
     clean, _ = await _project_submission(run_id, payload, projection=projection)
-    if clean is None:
-        return tool_results, user_input, user_parts, decisions, None
+    if clean is None or stored is not None:
+        kept = projection if stored is not None else None
+        return tool_results, user_input, user_parts, decisions, kept
     return (
         deserialize_tool_results(clean["submitted_tool_results"])
         if tool_results is not None
@@ -6866,6 +6876,7 @@ async def _resume_core(
     _reclaim_pause: PauseState | None = None,
     _reclaim_history: Any = None,
     _reclaim_record: RunRecord | None = None,
+    _reclaim_submission: dict[str, Any] | None = None,
     _tenant_explicit: bool | None = None,
     _raw_pause: dict[str, Any] | None = None,
 ) -> RunResult:
@@ -6975,6 +6986,7 @@ async def _resume_core(
                 user_parts,
                 decisions,
                 skip_claim=_skip_claim,
+                stored=_reclaim_submission,
             )
 
             run_tenant = run_record.tenant_id if run_record else None
