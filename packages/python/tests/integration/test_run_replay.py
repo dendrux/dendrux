@@ -121,6 +121,26 @@ class TestFullReplay:
         sent = mock.call_history[0]["messages"]
         assert not any(m.reasoning_blocks for m in sent)
 
+    async def test_window_limits_detail_not_total_history(self, store):
+        """``replay_last`` trims tool detail; every earlier question and answer is still sent."""
+        run_ids = await _chat(store, 3)
+        mock = MockLLM([LLMResponse(text="final")])
+        await _agent(store, mock).run("question 3", runs=run_ids, replay_last=1)
+
+        sent = mock.call_history[0]["messages"]
+        assert [m.content for m in sent if m.role == Role.USER] == [
+            "question 0",
+            "question 1",
+            "question 2",
+            "question 3",
+        ]
+        assert [m.content for m in sent if m.role == Role.ASSISTANT and m.content] == [
+            "a0",
+            "a1",
+            "a2",
+        ]
+        assert len([m for m in sent if m.role == Role.TOOL]) == 1
+
     async def test_history_appended_after_runs(self, store):
         from dendrux.chat import ChatMessage
 
