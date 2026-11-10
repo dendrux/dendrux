@@ -193,11 +193,11 @@ The runner persists that outcome exactly like any other terminal result: status 
 [//]: # "docs-test: skip - placeholder: `...` stands for your other arguments"
 
 ```python
-async with agent.stream("Write me a long essay") as stream:
+async with agent.stream("Write me a long essay", tenant_id=None) as stream:
     consumer = asyncio.create_task(consume(stream))     # your code reads events
 
     ...
-    await agent.cancel_run(stream.run_id)               # from anywhere in this process
+    await agent.cancel_run(stream.run_id, tenant_id=None)               # from anywhere in this process
     events = await consumer                             # ends with RUN_CANCELLED
     partial = events[-1].run_result.answer              # partial text from the current turn
 ```
@@ -225,7 +225,7 @@ Delegated child runs have their own rows and their own cancel flags. `cancel_run
 [//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
 
 ```python
-result = await agent.cancel_run(run_id, cascade=True)
+result = await agent.cancel_run(run_id, cascade=True, tenant_id=None)
 print(result.meta["cascade"])
 # [{'run_id': 'child-2', 'outcome': 'cancelled'},
 #  {'run_id': 'child-1', 'outcome': 'cancel_requested'},

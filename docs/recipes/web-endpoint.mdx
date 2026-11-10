@@ -33,6 +33,7 @@ Building the `Agent` object is essentially free. The cost is in the resources it
 from dendrux.db.session import get_engine
 from dendrux.mcp import MCPRuntime, MCPSource
 from dendrux.store import store_for_engine
+from fastapi import Depends
 
 engine = await get_engine(os.environ["DATABASE_URL"])  # shared singleton
 STORE  = store_for_engine(engine)
@@ -54,12 +55,13 @@ class GitHubCredentials:
         return {"Authorization": f"Bearer {token}"}
 
 # ---- per request ----
+# current_tenant resolves the tenant from the authenticated session.
 @app.post("/chat")
-async def chat(req):
+async def chat(req, tenant: str = Depends(current_tenant)):
     views = [
         MCP_RUNTIME.bind(                       # synchronous, no I/O; cheap per request
             connection_key=m,
-            tenant_key=req.user_id,             # per-tenant connections and credentials
+            tenant_key=tenant,                  # per-tenant connections and credentials
             source=MCP_SOURCES[m],
             credentials=GitHubCredentials(req.user_id),
         ).tools()
@@ -74,7 +76,7 @@ async def chat(req):
     ) as agent:
         result = await agent.run(
             req.text,
-            tenant_id=req.user_id,
+            tenant_id=tenant,
             history=req.transcript,                           # your app owns this
             metadata={"thread_id": req.thread_id},
         )
@@ -123,7 +125,7 @@ For a "pick your model per message" chatbot:
   [//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
 
   ```python
-  await agent.run(req.text, history=req.transcript, model="claude-opus-4-1")
+  await agent.run(req.text, history=req.transcript, model="claude-opus-4-1", tenant_id=tenant)
   ```
 
   The model actually used is recorded per call, so [`RunStore.get_llm_calls`](/docs/reference/run-store) reflects the real model for billing and observability.
@@ -143,12 +145,12 @@ Both work with a freshly built Agent, possibly in a different process. One thing
 
 ```python
 # start
-await agent.run(text, metadata={"thread_id": tid, "config_id": cfg_id})
+await agent.run(text, metadata={"thread_id": tid, "config_id": cfg_id}, tenant_id=tenant)
 
 # later — resume with the SAME config the run started with
-run = await store.get_run(run_id)
+run = await store.get_run(run_id, tenant_id=tenant)
 agent = build_agent(load_config(run.meta["config_id"]))
-await agent.submit_tool_results(run_id, results)
+await agent.submit_tool_results(run_id, results, tenant_id=tenant)
 ```
 
 New *turns* can use the user's latest model/tool selection; an *in-flight* run should be resumed with its own config (especially if it paused waiting on a client tool the user may have since toggled off).

@@ -36,6 +36,7 @@ from dendrux.notifiers.otel import OpenTelemetryNotifier
 result = await agent.run(
     "summarize this PDF",
     notifier=OpenTelemetryNotifier(),
+    tenant_id=None,
 )
 ```
 
@@ -53,6 +54,7 @@ result = await agent.run(
         ConsoleNotifier(),
         OpenTelemetryNotifier(),
     ]),
+    tenant_id=None,
 )
 ```
 

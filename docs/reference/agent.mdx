@@ -192,7 +192,7 @@ A successful `RunResult` has `stop_reason`, why the call that produced the final
 [//]: # "docs-test: skip - placeholder: `...` stands for your other arguments"
 
 ```python
-result = await agent.run("Summarise this report")
+result = await agent.run("Summarise this report", tenant_id=current_tenant)
 if result.truncated:
     ...  # raise max_tokens, or ask the model to continue
 ```
@@ -352,7 +352,7 @@ phase of a delta is usually unknown when it arrives. Clients buffer instead:
 ```python
 buckets: dict[int, list[str]] = {}
 commentary: set[int] = set()
-async with agent.stream("...") as stream:
+async with agent.stream("...", tenant_id=current_tenant) as stream:
     async for event in stream:
         if event.type == RunEventType.TEXT_DELTA:
             buckets.setdefault(event.iteration, []).append(event.text)

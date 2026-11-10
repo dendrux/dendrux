@@ -136,9 +136,10 @@ The atomic claim guarantees one winner, but it cannot tell whether the winner wa
 [//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
 
 ```python
-paused = await agent.run("Refund order 42")
+paused = await agent.run("Refund order 42", tenant_id=None)
 await agent.submit_approval(
     paused.run_id, approved=True, expected_pause_id=paused.pause_id,
+    tenant_id=None,
 )
 ```
 
@@ -159,7 +160,7 @@ A waiting pause happens because the run needs input. A **requested pause** is fo
 [//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
 
 ```python
-outcome = await agent.request_pause(run_id, reason="deploy window")
+outcome = await agent.request_pause(run_id, reason="deploy window", tenant_id=None)
 print(outcome.status_before, "->", outcome.affected)   # running -> [('01M5...', 'requested')]
 ```
 
@@ -171,7 +172,7 @@ async def request_pause(
     run_id: str,
     *,
     cascade: bool = True,
-    tenant_id: str | None = ...,    # omitted = unscoped
+    tenant_id: str | None = ...,    # omitted = unscoped only with strict_tenancy=False
     reason: str | None = None,       # at most 1000 characters
 ) -> PauseOutcome
 ```
@@ -201,7 +202,7 @@ If the run reaches a waiting pause first (it asks for approval, say), that pause
 [//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
 
 ```python
-result = await agent.submit_resume(run_id)      # blocks to the next pause or terminal state
+result = await agent.submit_resume(run_id, tenant_id=None)      # blocks to the next pause or terminal state
 ```
 
 `submit_resume`, `agent.resume(run_id)` and `agent.resume_stream(run_id)` all continue a `paused` run when given no payload. The resumed loop starts the next iteration with the full recorded history. Claiming a `paused` run is a CAS like every other resume and also clears `pause_requested`, so the resumed run does not pause again straight away.
@@ -225,7 +226,7 @@ A budget pause is a `paused` run with `pause_reason="budget"`. It resumes the sa
 
 > Nested delegation is the case to plan for. A parent that delegates to a child, and a child that delegates to a grandchild, gives you three separate runs to resume. Use `RunStore.get_subtree(run_id, max_nodes=...)` to list them with their statuses, and resume them one by one.
 
-`tenant_id=` scopes the request: when given, `run_id` must belong to exactly that tenant (`None` means untenanted) or `RunNotFoundError` is raised, and the cascade only reaches descendants of the same tenant. Omit it for trusted, single-tenant use.
+`tenant_id=` scopes the request: when given, `run_id` must belong to exactly that tenant (`None` means untenanted) or `RunNotFoundError` is raised, and the cascade only reaches descendants of the same tenant. Omit it only with `strict_tenancy=False` for trusted, single-tenant use; with a state store and the default strict agent, omission raises `TenantScopeRequiredError`.
 
 External callers only set flags on running rows; they never write `run.paused` themselves. The event comes from the runner that wins the pause, so the log has one `run.paused` per pause.
 

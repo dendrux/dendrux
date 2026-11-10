@@ -247,12 +247,15 @@ from dendrux.errors import (
     RunNotFoundError, RunNotPausedError,
 )
 
+# current_tenant resolves the tenant from the authenticated session.
 @router.post("/runs/{run_id}/approval")
-async def approval_route(run_id: str, body: dict, _=Depends(authorize)):
+async def approval_route(run_id: str, body: dict, _=Depends(authorize),
+                         tenant: str = Depends(current_tenant)):
     try:
         result = await agent.submit_approval(
             run_id, approved=body["approved"], rejection_reason=body.get("rejection_reason"),
             expected_pause_id=body.get("pause_id"),    # required when approving a pause with an id
+            tenant_id=tenant,
         )
     except RunNotFoundError:
         raise HTTPException(404, "run not found")

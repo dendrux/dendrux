@@ -205,7 +205,7 @@ class StopOnBudget:
 
     async def on_governance_event(self, run_id, event_type, iteration, data, *, correlation_id=None):
         if event_type == "budget.exceeded":
-            await self.agent.request_pause(run_id)
+            await self.agent.request_pause(run_id, tenant_id="acme")
 
     # other callbacks are no-ops
     async def on_message_appended(self, *a, **k): pass

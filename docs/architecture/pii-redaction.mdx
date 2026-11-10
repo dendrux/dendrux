@@ -155,7 +155,7 @@ The LLM only ever sees placeholders, so its raw text response naturally contains
 [//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
 
 ```python
-result = await agent.run(user_input="my name is anmol")
+result = await agent.run(user_input="my name is anmol", tenant_id=None)
 result.answer            # "Nice to meet you, anmol!" — for the user
 ```
 

@@ -22,6 +22,10 @@
 - The run-replay recipe describes `replay_last` as a full-detail window: older
   questions and answers still replay, so it does not cap total prompt size.
 - The Agent reference documents the `"vendor:model"` provider string.
+- Examples for the default `strict_tenancy=True` now pass `tenant_id=` on every
+  run, continuation, cancel and pause call, so they work when copied. Web route
+  examples take the tenant from the authenticated session. A docs test keeps
+  new examples in line.
 
 ## 0.6.1 - 2026-11-10
 
