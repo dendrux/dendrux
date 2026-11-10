@@ -21,6 +21,7 @@ from typing import (
     Annotated,
     Any,
     Literal,
+    TypeVar,
     get_args,
     get_origin,
     get_type_hints,
@@ -36,6 +37,9 @@ if TYPE_CHECKING:
 from dendrux.types import ToolDef, ToolTarget
 
 _TOOL_DEF_ATTR = "__tool_def__"
+
+# The decorated function itself; ``@tool(...)`` returns it unchanged.
+_F = TypeVar("_F", bound="Callable[..., Any]")
 
 _TYPE_MAP: dict[type, str] = {
     int: "integer",
@@ -76,7 +80,7 @@ def tool(
     strict: bool = False,
     receives_pii: bool | Iterable[str] = False,
     idempotent: bool = False,
-) -> Callable[..., Any]:
+) -> Callable[[_F], _F]:
     """Decorator that registers a function as a Dendrux tool.
 
     Args:
@@ -109,7 +113,7 @@ def tool(
             return a + b
     """
 
-    def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
+    def decorator(fn: _F) -> _F:
         name = fn.__name__
         if not name.isidentifier():
             raise ValueError(
