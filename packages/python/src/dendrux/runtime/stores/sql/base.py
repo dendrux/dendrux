@@ -2289,19 +2289,17 @@ class SQLStateStore(SQLBlobCatalog):
     ) -> BindManagedChildResult | None:
         """Read back this invocation's saved binding; refuse a missing or conflicting one.
 
-        The active invocation (the parent's outgoing binding) must agree across
-        intent, checkpoint, v3 pause generation and child; an older completed
-        invocation is read back from its intent and child only.
+        The state is classified from the parent's lifecycle and the intent
+        outcome, never from one binding copy: see ``_existing_wait_id``.
         """
         from dendrux.db.models import AgentRun, ToolCallRecord
         from dendrux.errors import ManagedStateError
 
         parent_id, call_id = request.parent_run_id, request.tool_call_id
         outgoing = (parent.loop_state or {}).get(MANAGED_BINDING_KEY)
-        active = isinstance(outgoing, dict) and outgoing.get("tool_call_id") == call_id
         rows = (
             await session.execute(
-                select(ToolCallRecord.target, ToolCallRecord.meta)
+                select(ToolCallRecord.target, ToolCallRecord.meta, ToolCallRecord.outcome)
                 .where(
                     ToolCallRecord.agent_run_id == parent_id,
                     ToolCallRecord.tool_call_id == call_id,
@@ -2310,7 +2308,7 @@ class SQLStateStore(SQLBlobCatalog):
             )
         ).all()
         if not rows:
-            if active:
+            if isinstance(outgoing, dict) and outgoing.get("tool_call_id") == call_id:
                 raise ManagedStateError(reason="binding_missing", run_id=parent_id)
             return None
         child_id = _bound_child_id(rows)
@@ -2327,9 +2325,7 @@ class SQLStateStore(SQLBlobCatalog):
             raise ManagedStateError(reason="child_missing", run_id=parent_id)
         if not _child_matches(child, child_id, request, parent.tenant_id):
             raise ManagedStateError(reason="child_mismatch", run_id=parent_id)
-        wait_id = None
-        if active and isinstance(outgoing, dict):
-            wait_id = _active_wait_id(parent, outgoing, request, child_id)
+        wait_id = _existing_wait_id(parent, rows[0].outcome, outgoing, request, child_id)
         return BindManagedChildResult(
             outcome="existing", child_run_id=child_id, parent_wait_id=wait_id, child_claim=None
         )
@@ -6298,15 +6294,52 @@ def _child_matches(
     )
 
 
+def _existing_wait_id(
+    parent: Any, outcome: str, outgoing: Any, request: BindManagedChildRequest, child_id: str
+) -> str | None:
+    """Classify an established binding and check the evidence for that state.
+
+    * Terminal parent: finalization may clear the pause; the intent and child
+      binding stand. Read back, no generation.
+    * Completed (adopted) intent: historical. The checkpoint must no longer name
+      the call as outgoing or pending.
+    * Started intent on a live parent: active. Checkpoint binding, pending call,
+      v3 pause generation and envelope must all agree.
+    """
+    from dendrux.errors import ManagedStateError
+
+    parent_id, call_id = request.parent_run_id, request.tool_call_id
+    names_call = isinstance(outgoing, dict) and outgoing.get("tool_call_id") == call_id
+    pending = any(
+        isinstance(p, dict) and p.get("call_id") == call_id
+        for p in (parent.loop_state or {}).get("pending") or ()
+    )
+    if parent.status in _TERMINAL_STATUS_VALUES:
+        return None
+    if outcome != "started":
+        if names_call or pending:
+            raise ManagedStateError(reason="binding_conflict", run_id=parent_id)
+        return None
+    if outgoing is None:
+        raise ManagedStateError(reason="binding_missing", run_id=parent_id)
+    if not names_call:
+        raise ManagedStateError(reason="binding_conflict", run_id=parent_id)
+    if not pending:
+        raise ManagedStateError(reason="pending_missing", run_id=parent_id)
+    return _active_wait_id(parent, outgoing, request, child_id)
+
+
 def _active_wait_id(
     parent: Any, outgoing: dict[str, Any], request: BindManagedChildRequest, child_id: str
 ) -> str:
-    """The active binding must agree across checkpoint, v3 pause generation and intent."""
+    """The active binding must agree across checkpoint, v3 pause generation and intent.
+
+    The projected envelope must already be a JSON object; a stored scalar or
+    string (even one that encodes an object) is refused without parsing it.
+    """
     from dendrux.errors import ManagedStateError
 
     envelope = parent.wait_binding
-    if isinstance(envelope, str):  # dialects that return projected JSON as text
-        envelope = json.loads(envelope)
     pause_id = outgoing.get("pause_id")
     if (
         outgoing.get("child_run_id") != child_id

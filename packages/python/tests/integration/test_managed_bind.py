@@ -1001,12 +1001,37 @@ async def test_r3_foreign_child_is_refused_before_its_header_is_read(store, engi
     assert "header_invalid" not in reasons and BRIEF not in caplog.text
 
 
-async def test_r3_completed_invocation_still_reads_back(store, engine):
-    """After adoption cleared the outgoing binding and the parent bound a new call,
-    the older invocation reads back as existing; the new call binds normally."""
-    parent, first_call = await managed_parent(store)
-    first = await store.bind_managed_child(bind_request(parent, first_call))
+async def _adopt_first_and_queue(store: Any, parent: str, first_call: str, child: str) -> str:
+    """Complete a bound invocation through real store transitions (what T2b adoption does):
+    the child finishes, the parent is claimed, the started intent is completed with its
+    observation while the outgoing binding is cleared, and a new managed call is queued."""
+    from dendrux.runtime.state import TraceWrite
+
+    assert await store.finalize_run(child, status=RunStatus.SUCCESS.value, answer="done")
+    claim = await store.claim_paused_run(parent, expected_status=RunStatus.PAUSED.value)
+    assert claim and claim.claim_epoch == 2
+    await store.complete_tool_call(
+        parent,
+        claim_epoch=2,
+        tool_call_id=first_call,
+        outcome="completed",
+        result_payload='"done"',
+        success=True,
+        duration_ms=1,
+        error_message=None,
+        replayed=False,
+        observation=TraceWrite(
+            generate_ulid(), "tool", '"done"', 5, meta={"tool_name": "reviewer"}
+        ),
+        event=EventWrite(
+            generate_ulid(), StoredEventType.TOOL_COMPLETED.value, 1, None, first_call, None
+        ),
+        loop_state_patch=LoopStatePatch(
+            remove_pending=(first_call,), set_fields={MANAGED_BINDING_KEY: None}
+        ),
+    )
     second_call = generate_ulid()
+    state = await store.get_loop_state(parent)
     pending = {
         "call_id": second_call,
         "tool": "reviewer",
@@ -1014,13 +1039,25 @@ async def test_r3_completed_invocation_still_reads_back(store, engine):
         "order_index": 9,
         "target": "agent",
     }
-    await _edit_run(
-        engine,
+    await store.checkpoint_step(
         parent,
-        status=lambda _s: RunStatus.RUNNING.value,
-        claim_epoch=lambda e: e + 1,
-        loop_state=lambda s: {**s, MANAGED_BINDING_KEY: None, "pending": [pending]},
+        claim_epoch=2,
+        loop_state={**state, "pending": [pending]},
+        pii_mapping=None,
+        trace=None,
     )
+    return second_call
+
+
+async def test_r3_completed_invocation_still_reads_back(store, engine):
+    """A genuinely completed older invocation (intent completed, child terminal, binding
+    cleared by adoption) reads back without a token, also while a newer call is active."""
+    parent, first_call = await managed_parent(store)
+    first = await store.bind_managed_child(bind_request(parent, first_call))
+    second_call = await _adopt_first_and_queue(store, parent, first_call, first.child_run_id)
+    (intent,) = (await snapshot(engine, parent))["tools"]
+    assert intent.outcome == "completed"
+
     old = await store.bind_managed_child(bind_request(parent, first_call, epoch=2))
     assert old.outcome == "existing" and old.child_claim is None
     assert old.child_run_id == first.child_run_id and old.parent_wait_id is None
@@ -1029,3 +1066,101 @@ async def test_r3_completed_invocation_still_reads_back(store, engine):
     # The older invocation stays readable while the new one is active.
     again = await store.bind_managed_child(bind_request(parent, first_call, epoch=3))
     assert again.outcome == "existing" and again.child_run_id == first.child_run_id
+    assert again.child_claim is None and again.parent_wait_id is None
+
+
+# ---------------------------------------------------------------------------
+# Fix round 2
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "case,reason",
+    [("other_call", "binding_conflict"), ("cleared", "binding_missing")],
+)
+async def test_v1_active_invocation_with_a_rewritten_checkpoint_is_invalid(
+    store, engine, case, reason
+):
+    """Pending call, v3 pause and started intent still say this call is active: a
+    checkpoint naming another call, or none, is contradictory, not 'historical'."""
+    parent, call_id = await managed_parent(store)
+    request = bind_request(parent, call_id)
+    await store.bind_managed_child(request)
+    if case == "other_call":
+        change = {"tool_call_id": generate_ulid()}
+        await _edit_run(
+            engine,
+            parent,
+            loop_state=lambda s: {
+                **s,
+                MANAGED_BINDING_KEY: {**s[MANAGED_BINDING_KEY], **change},
+            },
+        )
+    else:
+        await _edit_run(engine, parent, loop_state=lambda s: {**s, MANAGED_BINDING_KEY: None})
+    with pytest.raises(ManagedStateError) as refused:
+        await store.bind_managed_child(request)
+    assert refused.value.reason == reason
+
+
+async def test_v1_active_invocation_without_its_pending_call_is_invalid(store, engine):
+    parent, call_id = await managed_parent(store)
+    request = bind_request(parent, call_id)
+    await store.bind_managed_child(request)
+    await _edit_run(engine, parent, loop_state=lambda s: {**s, "pending": []})
+    with pytest.raises(ManagedStateError) as refused:
+        await store.bind_managed_child(request)
+    assert refused.value.reason == "pending_missing"
+
+
+async def test_v1_cancelled_parent_reads_the_binding_back(store, engine):
+    """Finalizing the paused parent clears its pause; the permanent binding is not
+    corrupt: a repeat reads it back without a token."""
+    parent, call_id = await managed_parent(store)
+    request = bind_request(parent, call_id)
+    created = await store.bind_managed_child(request)
+    assert await store.finalize_run(
+        parent,
+        status=RunStatus.CANCELLED.value,
+        expected_current_status=RunStatus.PAUSED.value,
+        claim_epoch=1,
+    )
+    again = await store.bind_managed_child(request)
+    assert again.outcome == "existing" and again.child_claim is None
+    assert again.child_run_id == created.child_run_id and again.parent_wait_id is None
+
+
+async def test_v1_completed_intent_still_named_by_the_checkpoint_is_invalid(store, engine):
+    parent, call_id = await managed_parent(store)
+    request = bind_request(parent, call_id)
+    await store.bind_managed_child(request)
+    async with AsyncSession(engine) as session:
+        await session.execute(
+            update(ToolCallRecord)
+            .where(ToolCallRecord.agent_run_id == parent)
+            .values(outcome="completed")
+        )
+        await session.commit()
+    with pytest.raises(ManagedStateError) as refused:
+        await store.bind_managed_child(request)
+    assert refused.value.reason == "binding_conflict"
+
+
+@pytest.mark.parametrize(
+    "envelope",
+    [BRIEF, 42, '{"v": 1, "tool_call_id": "x", "child_run_id": "y"} ' + BRIEF],
+    ids=["text", "number", "encoded_object"],
+)
+async def test_v2_malformed_pause_envelope_is_a_safe_refusal(store, engine, caplog, envelope):
+    parent, call_id = await managed_parent(store)
+    request = bind_request(parent, call_id)
+    await store.bind_managed_child(request)
+    await _edit_run(engine, parent, pause_data=lambda p: {**p, "managed_wait": envelope})
+    caplog.clear()
+    with pytest.raises(ManagedStateError) as refused:
+        await store.bind_managed_child(request)
+    error = refused.value
+    assert error.reason == "binding_conflict"
+    assert error.__cause__ is None and error.__context__ is None
+    assert BRIEF not in repr(error.__dict__) and BRIEF not in str(error)
+    assert BRIEF not in caplog.text
