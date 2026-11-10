@@ -19,6 +19,7 @@ Missing or invalid codes remain unset. Category and HTTP status remain independe
 
 | Code | Level | Fields | Fires when | Do |
 | --- | --- | --- | --- | --- |
+| `blocked_content` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | Stored history with blocked content is refused, omitted or stopped. | Start a new run with clean input; review the identified run's history. |
 | `governance_changed` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | Continuation detects changed governance in warning mode. | Review the change and use strict policy enforcement. |
 | `governance_legacy` | INFO | `code`, `kind`, `run_id`, `tenant_id` | A legacy run lacks governance pins. | Review the policy before continuing it. |
 | `governance_mismatch` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | A stored governance policy cannot be continued. | Restore the original policy or start a new run. |

@@ -114,6 +114,7 @@ from dendrux.runtime.context import (
 from dendrux.runtime.replay import (
     PARTS_KEY,
     REPLAY_META_KEY,
+    LoadedReplay,
     ReplayLast,
     ReplayPlan,
     ReplayRequest,
@@ -2258,11 +2259,13 @@ async def _load_new_run_replay(
     *,
     limits: Limits,
     method: str = "run",
-) -> list[Any]:
-    runs = await _load_replay_runs(store, request, tenant_id=tenant_id, limits=limits)
-    if _replay_has_images(runs):
+) -> LoadedReplay:
+    loaded = await _load_replay_runs(store, request, tenant_id=tenant_id, limits=limits)
+    for omitted_id in loaded.omitted:
+        _codes.log_code(logger, _codes.BLOCKED_CONTENT, run_id=omitted_id)
+    if _replay_has_images(loaded.runs):
         _require_image_loop(loop, method)
-    return runs
+    return loaded
 
 
 async def _entry_replay(
@@ -2274,17 +2277,18 @@ async def _entry_replay(
     loop: Loop,
     context: Any,
     limits: Limits,
-) -> tuple[ReplayRequest | None, list[Any]]:
+) -> tuple[ReplayRequest | None, list[Any], tuple[str, ...]]:
     request = validate_replay_args(runs, last, reasoning, loop=loop, context=context)
     validate_context(context)
     if request is None:
-        return None, []
+        return None, [], ()
     if store is None:
         raise ValueError(
             "runs= requires persistence (database_url or state_store): "
             "replay reads the earlier runs' traces."
         )
-    return request, await _load_new_run_replay(store, request, tenant_id, loop, limits=limits)
+    loaded = await _load_new_run_replay(store, request, tenant_id, loop, limits=limits)
+    return request, loaded.runs, loaded.omitted
 
 
 async def _entry_media(
@@ -2509,7 +2513,7 @@ async def run(
         user_input, input_items, image_input, normalized_history = _new_run_input(
             user_input, history, resolved_loop
         )
-        replay_req, replay_runs = await _entry_replay(
+        replay_req, replay_runs, replay_omitted = await _entry_replay(
             state_store,
             tenant_id,
             runs,
@@ -2618,6 +2622,7 @@ async def run(
                         tenant_id=tenant_id,
                         replay_req=replay_req,
                         replay_runs=replay_runs,
+                        replay_omitted=replay_omitted,
                         normalized_history=normalized_history,
                         context=context,
                         user_parts=user_parts,
@@ -2703,6 +2708,7 @@ async def run(
                     run_id=run_id,
                     replay_req=replay_req,
                     replay_runs=replay_runs,
+                    replay_omitted=replay_omitted,
                     normalized_history=normalized_history,
                     context=context,
                     user_input=user_input,
@@ -2916,6 +2922,7 @@ async def _runtime_seeds(
     tenant_id: str | None = None,
     replay_req: ReplayRequest | None = None,
     replay_runs: list[Any] | None = None,
+    replay_omitted: Sequence[str] = (),
     normalized_history: list[Message] | None = None,
     context: list[ContextBlock] | None = None,
     user_parts: tuple[ContentPart, ...] | None = None,
@@ -2939,6 +2946,7 @@ async def _runtime_seeds(
             replay_req,
             current=current_prefix(agent, provider, loop, provider_kwargs),
             guardrails=bool(agent.guardrails),
+            omitted=replay_omitted,
         )
         history = fold_context(
             [*plan.messages, *(normalized_history or [])],
@@ -3019,6 +3027,7 @@ async def _apply_replay(
     context: list[ContextBlock] | None,
     user_input: str,
     seeded_history: list[Message] | None,
+    replay_omitted: Sequence[str] = (),
     user_parts: tuple[ContentPart, ...] | None = None,
     system_prompt: str | None = None,
 ) -> tuple[ReplayPlan | None, list[Message] | None]:
@@ -3037,7 +3046,11 @@ async def _apply_replay(
     plan: ReplayPlan | None = None
     if replay_req is not None:
         plan = expand_replay(
-            replay_runs, replay_req, current=current, guardrails=bool(agent.guardrails)
+            replay_runs,
+            replay_req,
+            current=current,
+            guardrails=bool(agent.guardrails),
+            omitted=replay_omitted,
         )
         seeded_history = fold_context(
             [*plan.messages, *normalized_history],
@@ -3533,9 +3546,15 @@ async def _retry_replay(
     state_store: StateStore,
     tenant_id: str | None,
     limits: Limits,
+    original_run_id: str,
 ) -> tuple[ReplayRequest | None, list[Any]]:
+    """The retried run's ``runs=`` sources, after the blocked-content admission.
+
+    Refuses (R1.8) when the retried run or any of its recorded sources is
+    identified as blocked, after their scope/status checks and before any history
+    is rebuilt or a run is created. One scoped verdict lookup covers all of them.
+    """
     replay_req: ReplayRequest | None = None
-    replay_runs: list[Any] = []
     source_replay = (source_run.meta or {}).get(REPLAY_META_KEY)
     if isinstance(source_replay, dict) and source_replay.get("runs"):
         replay_req = validate_replay_args(
@@ -3545,12 +3564,32 @@ async def _retry_replay(
             loop=resolved_loop,
             context=None,
         )
-        if replay_req is not None:
-            replay_runs = await _load_replay_runs(
-                state_store, replay_req, tenant_id=tenant_id, limits=limits
-            )
+    # The verdict and any refusal name the run the caller authorized and asked for.
+    retried = replace(source_run, id=original_run_id)
+    if replay_req is None:
+        from dendrux.runtime._blocked_content import _blocked_sources
 
-    return replay_req, replay_runs
+        if await _blocked_sources(state_store, [retried], tenant_id=tenant_id):
+            _refuse_blocked_retry(original_run_id)
+        return None, []
+    loaded = await _load_replay_runs(
+        state_store, replay_req, tenant_id=tenant_id, limits=limits, extra=(retried,)
+    )
+    identified = (*loaded.extra_blocked, *loaded.omitted)
+    if identified:
+        _refuse_blocked_retry(identified[0])
+    return replay_req, loaded.runs
+
+
+def _refuse_blocked_retry(run_id: str) -> NoReturn:
+    from dendrux.errors import ReplayRunError
+
+    _codes.log_code(logger, _codes.BLOCKED_CONTENT, run_id=run_id)
+    raise ReplayRunError(
+        run_id,
+        "blocked_content",
+        "Source history contains blocked content; start a new run with clean input.",
+    )
 
 
 def _retry_media(
@@ -3718,7 +3757,13 @@ async def retry(
         resolved_loop = _new_run_loop(agent, loop)
         _validate_loop_skill_compat(agent, resolved_loop)
 
-        # 3. Read traces and reconstruct approximate history. Reasoning replay
+        # 3. Blocked-content admission for the retried run and its runs= sources
+        #    (R1.8), then the same runs, same knobs, before any history is rebuilt.
+        replay_req, replay_runs = await _retry_replay(
+            source_run, resolved_loop, state_store, tenant_id, agent._limits, original_run_id
+        )
+
+        # 3a. Read traces and reconstruct approximate history. Reasoning replay
         #    blocks only seed a retry on the model that made them.
         traces, initial_history = await _retry_history(
             state_store, source_run, agent, provider, kwargs
@@ -3730,11 +3775,6 @@ async def retry(
             retry_context, retry_user = _refresh_retry_user(
                 initial_history, users, raw_user, user_input, source_parts, skill_session
             )
-
-        # 4a. A source run that used runs= re-expands the same runs, same knobs.
-        replay_req, replay_runs = await _retry_replay(
-            source_run, resolved_loop, state_store, tenant_id, agent._limits
-        )
 
         # 5. Create the retry run
         resolved_strategy = strategy or NativeToolCalling()
@@ -3967,20 +4007,20 @@ async def _stream_replay_runs(
     loop: Loop,
     shared: dict[str, Any],
     limits: Limits,
-) -> list[Any]:
+) -> tuple[list[Any], tuple[str, ...]]:
     if request is None:
-        return []
+        return [], ()
     shared["existing_run"] = True
     if store is None:
         raise ValueError(
             "runs= requires persistence (database_url or state_store): "
             "replay reads the earlier runs' traces."
         )
-    runs = await _load_new_run_replay(
+    loaded = await _load_new_run_replay(
         store, request, tenant_id, loop, limits=limits, method="run_stream"
     )
     shared["existing_run"] = False
-    return runs
+    return loaded.runs, loaded.omitted
 
 
 @overload
@@ -4238,7 +4278,7 @@ def run_stream(
 
             _require_idempotency_store(store, idempotency_key)
 
-            replay_runs = await _stream_replay_runs(
+            replay_runs, replay_omitted = await _stream_replay_runs(
                 replay_req, store, eff_tenant, resolved_loop, _shared, agent._limits
             )
 
@@ -4272,6 +4312,7 @@ def run_stream(
                         tenant_id=eff_tenant,
                         replay_req=replay_req,
                         replay_runs=replay_runs,
+                        replay_omitted=replay_omitted,
                         normalized_history=history_messages,
                         context=context,
                         user_parts=user_parts,
@@ -4373,6 +4414,7 @@ def run_stream(
                 run_id=run_id,
                 replay_req=replay_req,
                 replay_runs=replay_runs,
+                replay_omitted=replay_omitted,
                 normalized_history=history_messages,
                 context=context,
                 user_input=user_input,
@@ -6574,6 +6616,7 @@ async def _stop_marked_continuation(
         store, run_id, record, claimed_here=claimed_here
     ):
         return None
+    _codes.log_code(logger, _codes.BLOCKED_CONTENT, run_id=run_id)
     from dendrux.runtime._continuation_guardrails import _continuation_mapping
 
     mapping = await _continuation_mapping(store, run_id)

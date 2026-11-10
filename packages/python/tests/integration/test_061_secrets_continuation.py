@@ -675,3 +675,30 @@ async def test_claim_scope_is_reset_after_every_public_continuation(
         assert _claim_call.get() is None
     finally:
         await agent.close()
+
+
+@pytest.mark.parametrize("fmt", [1, 2])
+async def test_marked_continuation_logs_blocked_content_code(store, engine, fmt, caplog):
+    import logging
+
+    agent, _, run_id, raw, _ = await paused_agent(store, engine, fmt)
+    try:
+        with _blocked_write(store, run_id):
+            await store.save_run_event(run_id, event_type="guardrail.detected", data={})
+        with caplog.at_level(logging.WARNING):
+            await agent.submit_tool_results(
+                run_id,
+                [
+                    ToolResult(
+                        name="client_read",
+                        call_id=raw["pending_tool_calls"][0]["id"],
+                        payload='"okay"',
+                    )
+                ],
+                tenant_id="t",
+                expected_pause_id=raw["pause_id"],
+            )
+        coded = [r for r in caplog.records if getattr(r, "code", None) == "blocked_content"]
+        assert [r.run_id for r in coded] == [run_id]
+    finally:
+        await agent.close()

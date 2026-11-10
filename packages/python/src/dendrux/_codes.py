@@ -472,6 +472,14 @@ TENANT_SCOPE_REQUIRED = Code(
     "A strict tenancy entry has no explicit tenant scope.",
     "Pass the intended tenant scope.",
 )
+BLOCKED_CONTENT = Code(
+    "blocked_content",
+    logging.WARNING,
+    "governance",
+    _BASE_FIELDS,
+    "Stored history with blocked content is refused, omitted or stopped.",
+    "Start a new run with clean input; review the identified run's history.",
+)
 RESERVED_METADATA_KEY = Code(
     "reserved_metadata_key",
     logging.WARNING,
@@ -1948,6 +1956,7 @@ REGISTRY = MappingProxyType(
             USAGE_INVALID,
             LOCAL_DATABASE_DEFAULT_CHANGED,
             DATABASE_URL_ENV_IGNORED,
+            BLOCKED_CONTENT,
             TENANT_SCOPE_REQUIRED,
             RESERVED_METADATA_KEY,
             METADATA_TOO_LARGE,

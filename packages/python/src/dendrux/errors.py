@@ -464,7 +464,8 @@ class ReplayRunError(ValueError):
     """Raised when a run passed via ``agent.run(runs=...)`` cannot be replayed.
 
     ``reason`` is one of ``"not_found"``, ``"tenant_mismatch"``,
-    ``"not_terminal"``, ``"duplicate"``. Raised before any run is created
+    ``"not_terminal"``, ``"duplicate"``, or ``"blocked_content"`` when a retry
+    source history contains blocked content. Raised before any run is created
     or any model is called.
     """
 

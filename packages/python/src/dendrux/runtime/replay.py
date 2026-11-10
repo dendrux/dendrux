@@ -26,7 +26,7 @@ import hashlib
 import json
 import logging
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
 from dendrux import _codes
 from dendrux._lifecycle import (
@@ -109,9 +109,6 @@ class ReplayRequest:
     runs: tuple[str, ...]
     replay_last: ReplayLast
     replay_reasoning: bool
-    # Filled by the loader: requested runs omitted for blocked content, in request
-    # order. Not part of the fingerprint, which keeps the requested IDs.
-    omitted_blocked: list[str] = field(default_factory=list, compare=False, repr=False)
 
     def fingerprint(self) -> dict[str, Any]:
         """Knobs as they enter the idempotency fingerprint."""
@@ -178,16 +175,37 @@ class LoadedRun:
     traces: list[TraceRecord]
 
 
+class LoadedReplay(NamedTuple):
+    """The loader's answer: surviving runs and the requested runs it omitted.
+
+    ``omitted`` lists requested runs identified as blocked, in request order.
+    ``extra_blocked`` lists identified runs among the caller's ``extra`` records
+    (a retried run); when it is non-empty no source history was read.
+    """
+
+    runs: list[LoadedRun]
+    omitted: tuple[str, ...] = ()
+    extra_blocked: tuple[str, ...] = ()
+
+
 async def load_replay_runs(
     store: StateStore, request: ReplayRequest, *, tenant_id: str | None
 ) -> list[LoadedRun]:
-    """Load and validate every run in ``request.runs``. Raises ``ReplayRunError``."""
-    return await _load_replay_runs(store, request, tenant_id=tenant_id, limits=None)
+    """Load and validate every run in ``request.runs``. Raises ``ReplayRunError``.
+
+    Runs identified as containing blocked content are left out of the result.
+    """
+    return (await _load_replay_runs(store, request, tenant_id=tenant_id, limits=None)).runs
 
 
 async def _load_replay_runs(
-    store: StateStore, request: ReplayRequest, *, tenant_id: str | None, limits: Limits | None
-) -> list[LoadedRun]:
+    store: StateStore,
+    request: ReplayRequest,
+    *,
+    tenant_id: str | None,
+    limits: Limits | None,
+    extra: Sequence[RunRecord] = (),
+) -> LoadedReplay:
     from dendrux.errors import ReplayRunError
     from dendrux.runtime._capabilities import capabilities
 
@@ -203,9 +221,13 @@ async def _load_replay_runs(
                 f"it is still '{record.status}'; only terminal runs can be replayed",
             )
         records.append(record)
-    # Identified blocked runs are dropped whole before any of their history is read.
-    blocked = await _blocked_source_ids(store, records, tenant_id)
-    request.omitted_blocked[:] = [record.id for record in records if record.id in blocked]
+    # Identified blocked runs are dropped whole before any of their history is read;
+    # ``extra`` records share the same verdict lookup.
+    blocked = await _blocked_source_ids(store, [*extra, *records], tenant_id)
+    omitted = tuple(record.id for record in records if record.id in blocked)
+    extra_blocked = tuple(record.id for record in extra if record.id in blocked)
+    if extra_blocked:
+        return LoadedReplay([], omitted, extra_blocked)
     loaded: list[LoadedRun] = []
     for record in records:
         if record.id in blocked:
@@ -219,7 +241,7 @@ async def _load_replay_runs(
         )
         traces = [t for t in traces if not (t.meta or {}).get(SEED_PREFIX_META_KEY)]
         loaded.append(LoadedRun(record=record, traces=sorted(traces, key=lambda t: t.order_index)))
-    return loaded
+    return LoadedReplay(loaded, omitted)
 
 
 async def _blocked_source_ids(
@@ -675,13 +697,16 @@ def expand_replay(
     *,
     current: CurrentPrefix,
     guardrails: bool = False,
+    omitted: Sequence[str] = (),
 ) -> ReplayPlan:
     """Expand ``loaded`` runs into messages per the window and the prefix rule.
 
-    ``loaded`` holds only the surviving runs: blocked runs were omitted by the
-    loader, so the window and prefix compatibility apply to the survivors.
+    ``loaded`` holds only the surviving runs; ``omitted`` names the requested runs
+    the loader left out for blocked content (logged by the caller with their code),
+    so the window and prefix compatibility apply to the survivors.
     """
-    warnings: list[str] = [_omitted_warning(run_id) for run_id in request.omitted_blocked]
+    notices = [_omitted_warning(run_id) for run_id in omitted]
+    warnings: list[str] = []
     replay_reasoning = request.replay_reasoning
     if replay_reasoning and guardrails:
         replay_reasoning = False
@@ -733,6 +758,7 @@ def expand_replay(
 
     for warning in warnings:
         logger.warning("Run replay: %s", warning)
+    warnings = [*notices, *warnings]
 
     summary = ReplaySummary(
         runs_full=runs_full,

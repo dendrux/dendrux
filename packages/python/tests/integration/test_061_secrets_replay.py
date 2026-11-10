@@ -290,28 +290,80 @@ async def test_stream_replay_omits_blocked_sources(store, engine, fmt):
     assert "blocked" not in str([m.content for m in mock.call_history[0]["messages"]])
 
 
-@pytest.mark.parametrize("fmt", [1])
-async def test_retry_rebuilds_the_replay_without_a_later_identified_source(store, engine, fmt):
-    # Format 1 retry reloads the retried run's replay sources: one identified as blocked
-    # afterwards is omitted with the same notice. (Format 2 retry rebuilds from the
-    # retried run's own stored copy of that history: an earlier copy, see R1.11.)
+@pytest.mark.parametrize("fmt", [1, 2])
+async def test_replay_omission_logs_blocked_content_code(store, engine, fmt, caplog):
+    import logging
+
     await pin_storage_format(engine, fmt)
-    source = await _clean(store, f"question {LEGACY}")
+    blocked = await _blocked(store)
     clean = await _clean(store, "question F", "answer F")
-    first = MockLLM([LLMResponse(text="final")])
-    agent = _agent(store, first)
+    with caplog.at_level(logging.WARNING):
+        await _wire(store, [blocked, clean], "all")
+    coded = [r for r in caplog.records if getattr(r, "code", None) == "blocked_content"]
+    assert [r.run_id for r in coded] == [blocked]
+    assert "Run replay: Run" not in caplog.text
+
+
+async def test_loader_returns_omitted_ids_without_touching_the_request(store, engine):
+    import dataclasses
+
+    from dendrux.loops.react import ReActLoop
+    from dendrux.runtime.replay import _load_replay_runs, load_replay_runs, validate_replay_args
+
+    blocked = await _blocked(store)
+    clean = await _clean(store, "question F", "answer F")
+    request = validate_replay_args([blocked, clean], "all", True, loop=ReActLoop(), context=None)
+    before = dataclasses.astuple(request)
+    loaded = await _load_replay_runs(store, request, tenant_id=None, limits=None)
+    assert [run.record.id for run in loaded.runs] == [clean]
+    assert loaded.omitted == (blocked,)
+    assert dataclasses.astuple(request) == before
+    assert "omitted_blocked" not in {f.name for f in dataclasses.fields(request)}
+    # The public loader still drops the blocked run.
+    assert [run.record.id for run in await load_replay_runs(store, request, tenant_id=None)] == [
+        clean
+    ]
+
+
+def test_expand_replay_reports_explicitly_passed_omissions():
+    from dendrux.loops.react import ReActLoop
+    from dendrux.runtime.replay import CurrentPrefix, expand_replay, validate_replay_args
+
+    request = validate_replay_args(["a"], "all", False, loop=ReActLoop(), context=None)
+    current = CurrentPrefix(provider="p", model="m", system_hash="s", tools_hash="t")
+    plan = expand_replay([], request, current=current, omitted=("a",))
+    assert plan.summary.warnings == [omitted("a")]
+    assert expand_replay([], request, current=current).summary.warnings == []
+
+
+async def test_blocked_sources_with_no_records_reads_nothing():
+    from dendrux.runtime._blocked_content import _blocked_sources
+
+    class Store:
+        def __getattr__(self, name):
+            raise AssertionError(f"unexpected store call: {name}")
+
+    assert await _blocked_sources(Store(), [], tenant_id=None) == set()
+
+
+@pytest.mark.parametrize("fmt", [1, 2])
+async def test_source_vanishing_before_the_verdict_is_not_found(store, engine, fmt, monkeypatch):
+    from dendrux import ReplayRunError
+    from dendrux.errors import RunNotFoundError
+
+    await pin_storage_format(engine, fmt)
+    source = await _clean(store, "question A")
+
+    async def vanished(run_ids, *, tenant_id):
+        raise RunNotFoundError(run_ids[0])
+
+    monkeypatch.setattr(store, "_blocked_run_ids", vanished)
+    mock = MockLLM([LLMResponse(text="final")])
+    agent = _agent(store, mock)
     try:
-        replayed = await agent.run("next question", runs=[source, clean], replay_last="all")
+        with pytest.raises(ReplayRunError) as caught:
+            await agent.run("next", runs=[source])
     finally:
         await agent.close()
-    assert LEGACY in str(first.call_history[0]["messages"])
-    await _strip_mark(engine, store, source, failure_reason="guardrail_blocked")
-    retry_provider = MockLLM([LLMResponse(text="again")])
-    agent = _agent(store, retry_provider)
-    try:
-        retried = await agent.retry(replayed.run_id)
-    finally:
-        await agent.close()
-    assert retried.status == RunStatus.SUCCESS
-    assert LEGACY not in str(retry_provider.call_history[0]["messages"])
-    assert omitted(source) in retried.replay.warnings
+    assert caught.value.reason == "not_found" and caught.value.run_id == source
+    assert mock._call_count == 0
