@@ -165,6 +165,8 @@ Before 0.3.0 a child run with no `tenant_id` was stored untenanted, so tenant-sc
 
 The run-control and read APIs take a `tenant_id=` argument that makes a call behave as "this run, in this tenant, or not found":
 
+For Agent calls, the omitted column applies only with `strict_tenancy=False` (trusted single-tenant use). With a state store and the default `strict_tenancy=True`, omission raises `TenantScopeRequiredError`; pass `tenant_id=None` for untenanted runs.
+
 | API | With `tenant_id=` | Omitted |
 | --- | --- | --- |
 | `agent.cancel_run(run_id, cascade=True)` | Root must be in the tenant; the cascade only reaches descendants in the same tenant. | Unscoped (trusted single-tenant use). |

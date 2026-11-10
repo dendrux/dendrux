@@ -16,7 +16,7 @@ When you call `agent.run(...)`, dendrux assigns the run a **ULID**, a 26-charact
 [//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
 
 ```python
-result = await agent.run("What is 15 + 27?")
+result = await agent.run("What is 15 + 27?", tenant_id=None)
 print(result.run_id)
 ```
 
@@ -119,7 +119,7 @@ A model can stop in the middle of an answer because it hit its output-token limi
 [//]: # "docs-test: skip - placeholder: `...` stands for your other arguments"
 
 ```python
-result = await agent.run("Summarise this report")
+result = await agent.run("Summarise this report", tenant_id=None)
 if result.truncated:
     ...  # raise max_tokens, or ask the model to continue
 ```
@@ -234,7 +234,7 @@ You almost never write a state machine when working with dendrux. You just check
 [//]: # "docs-test: skip - fragment: the body of a function defined elsewhere"
 
 ```python
-result = await agent.run("...")
+result = await agent.run("...", tenant_id=None)
 match result.status:
     case RunStatus.SUCCESS:
         return result.answer

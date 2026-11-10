@@ -12,7 +12,7 @@ description: Stop a paused or in-flight run cleanly. The same call works for pau
 [//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
 
 ```python
-result = await agent.cancel_run(run_id)
+result = await agent.cancel_run(run_id, tenant_id=None)
 print(result.status.value)   # "cancelled" if cancel won, original terminal otherwise
 ```
 
@@ -108,9 +108,9 @@ Since 0.3.0 a batch `run()` is interruptible too. If `agent.run(...)` is executi
 [//]: # "docs-test: skip - placeholder: `...` stands for your other arguments"
 
 ```python
-task = asyncio.create_task(agent.run("Do the long thing"))
+task = asyncio.create_task(agent.run("Do the long thing", tenant_id=None))
 ...
-await agent.cancel_run(run_id)          # from a request handler in the same process
+await agent.cancel_run(run_id, tenant_id=None)          # from a request handler in the same process
 result = await task                      # RunResult(status=CANCELLED)
 assert result.meta["interrupted"] is True and result.meta["partial_output"] is False
 ```
@@ -124,11 +124,11 @@ If the run was started with `stream()` or `resume_stream()` on the same `Agent` 
 [//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
 
 ```python
-async with agent.stream("Draft the announcement") as stream:
+async with agent.stream("Draft the announcement", tenant_id=None) as stream:
     consumer = asyncio.create_task(read_events(stream))   # forwards TEXT_DELTA to the UI
 
     await user_pressed_stop.wait()
-    await agent.cancel_run(stream.run_id)
+    await agent.cancel_run(stream.run_id, tenant_id=None)
 
     events = await consumer
     final = events[-1]                       # RunEventType.RUN_CANCELLED
@@ -166,10 +166,12 @@ A minimal cancel endpoint:
 from fastapi import APIRouter, Depends, HTTPException
 from dendrux.errors import PersistenceNotConfiguredError, RunNotFoundError
 
+# current_tenant resolves the tenant from the authenticated session.
 @router.delete("/runs/{run_id}")
-async def cancel_route(run_id: str, _=Depends(authorize)):
+async def cancel_route(run_id: str, _=Depends(authorize),
+                       tenant: str = Depends(current_tenant)):
     try:
-        result = await agent.cancel_run(run_id)
+        result = await agent.cancel_run(run_id, tenant_id=tenant)
     except RunNotFoundError:
         raise HTTPException(404, "run not found")
     except PersistenceNotConfiguredError:
@@ -202,7 +204,7 @@ Delegated child runs have their own rows and cancel flags. Cancelling the parent
 [//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
 
 ```python
-result = await agent.cancel_run(run_id, cascade=True)
+result = await agent.cancel_run(run_id, cascade=True, tenant_id=None)
 print(result.meta["cascade"])    # [{'run_id': ..., 'outcome': 'cancelled' | 'cancel_requested' | 'terminal'}, ...]
 ```
 

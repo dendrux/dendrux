@@ -10,7 +10,7 @@ Sometimes a person has something to add while an agent is mid-run: "also skip an
 [//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
 
 ```python
-note_id = await agent.submit_note(run_id, "Skip anything older than 2023.")
+note_id = await agent.submit_note(run_id, "Skip anything older than 2023.", tenant_id=None)
 ```
 
 [//]: # "docs-test: skip - API signature listing, not runnable code"
@@ -22,7 +22,7 @@ async def submit_note(
     text: str,
     *,
     metadata: Any = None,
-    tenant_id: str | None = ...,    # omitted = unscoped
+    tenant_id: str | None = ...,    # omitted = unscoped only with strict_tenancy=False
 ) -> str                            # the note id
 ```
 
@@ -50,7 +50,7 @@ A note submitted while the run makes its last LLM call (or after its final itera
 [//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
 
 ```python
-result = await agent.run("...")
+result = await agent.run("...", tenant_id=None)
 print(result.meta.get("undelivered_notes"))   # ['01M5...'] or missing
 ```
 
@@ -86,7 +86,7 @@ A delivered note is an ordinary user message in the history, so incoming [guardr
 
 ## Tenants
 
-Pass `tenant_id=` to require that the run belongs to exactly that tenant (`None` means untenanted); a mismatch raises `RunNotFoundError`, the same as an unknown run. Omit it for trusted, single-tenant use (or pass `UNSCOPED`); with `Agent(strict_tenancy=True)` and a state store, omitting it raises `TenantScopeRequiredError`. `RunStore.get_notes(run_id, tenant_id=...)` applies the same rule and raises `RunNotFoundError` (since 0.5.0 the store and `dendrux.errors` use one class). Delegated child runs inherit deliberately chosen parent scope; a stored child under an outer run whose tenant was omitted requires explicit `tenant_id` on that outer run (see [Access control](/docs/architecture/access-control#tenants-and-delegated-runs)), so one tenant value covers a run and its children.
+Pass `tenant_id=` to require that the run belongs to exactly that tenant (`None` means untenanted); a mismatch raises `RunNotFoundError`, the same as an unknown run. Omit it only with `strict_tenancy=False` for trusted, single-tenant use (or pass `UNSCOPED`); with `Agent(strict_tenancy=True)` and a state store, omitting it raises `TenantScopeRequiredError`. `RunStore.get_notes(run_id, tenant_id=...)` applies the same rule and raises `RunNotFoundError` (since 0.5.0 the store and `dendrux.errors` use one class). Delegated child runs inherit deliberately chosen parent scope; a stored child under an outer run whose tenant was omitted requires explicit `tenant_id` on that outer run (see [Access control](/docs/architecture/access-control#tenants-and-delegated-runs)), so one tenant value covers a run and its children.
 
 ## Limits to know
 

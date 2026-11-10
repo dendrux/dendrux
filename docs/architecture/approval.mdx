@@ -83,13 +83,14 @@ Five things to notice:
 [//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
 
 ```python
-paused = await agent.run("Refund order 42 using the refund tool.")
+paused = await agent.run("Refund order 42 using the refund tool.", tenant_id=None)
 print(paused.status.value)   # waiting_approval
 
 done = await agent.submit_approval(
     paused.run_id,
     approved=False,
     rejection_reason="Manager declined: amount exceeds automatic threshold.",
+    tenant_id=None,
 )
 print(done.status.value)     # success  (the run finishes; the model handles the rejection)
 ```
@@ -168,7 +169,7 @@ A decision can arrive late, from a tab left open or a retried request. Every new
 [//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
 
 ```python
-await agent.submit_approval(run_id, approved=True, expected_pause_id=pause_id)
+await agent.submit_approval(run_id, approved=True, expected_pause_id=pause_id, tenant_id=None)
 ```
 
 - Get the id from `RunResult.pause_id`, `RunStore.get_pending(...).pause_id` or the `run.paused` event, send it to the client with the approval request, and send it back with the decision.
@@ -194,6 +195,7 @@ await agent.submit_approval(
         call_b: ApprovalDecision.deny("Order 2 is outside the refund window"),
     },
     expected_pause_id=pause_id,      # required: this batch approves call_a
+    tenant_id=None,
 )
 ```
 
@@ -257,6 +259,7 @@ The decision belongs to the pause. Once a run has moved on, there is no way to a
 await agent.submit_approval(
     run_id,
     decisions={call_id: ApprovalDecision.deny("Held for review: ticket 4412")},
+    tenant_id=None,
 )
 
 # 2. Later, after a reviewer approves, run the action yourself.
