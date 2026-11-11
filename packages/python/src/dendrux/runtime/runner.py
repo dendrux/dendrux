@@ -4215,6 +4215,30 @@ def _cached_stream_event(cached: RunResult, run_id: str) -> RunEvent:
     )
 
 
+def _stream_claim(
+    store: StateStore,
+    loop: Loop,
+    created: CreateRunResult,
+    child_claim: ClaimResult | None,
+    *,
+    managed_root: bool,
+) -> StateStore:
+    """The new run's owned store: a managed child's token comes from its bind."""
+    from dendrux.runtime import _managed
+
+    state = (
+        _initial_loop_state(_recovery_loop_name(loop))
+        if created.storage_format == STORAGE_FORMAT_CHECKPOINTED
+        else None
+    )
+    owned = claimed_store(
+        store, created.run_id, child_claim or ClaimResult(0, created.storage_format, state, None)
+    )
+    if managed_root:
+        _managed.stamp_root_header(owned, created.run_id)
+    return owned
+
+
 def _stream_entry_checks(
     agent: Agent, tenant_id: str | None, shared: dict[str, Any], parent_ctx: Any, **checks: Any
 ) -> None:
@@ -4606,22 +4630,9 @@ def run_stream(
                     return
                 if create_result.outcome == "existing_active":
                     raise RunAlreadyActiveError(run_id, create_result.status)
-                store = claimed_store(
-                    store,
-                    run_id,
-                    # A managed child's token comes from its bind and carries its header.
-                    child_claim
-                    or ClaimResult(
-                        0,
-                        create_result.storage_format,
-                        _initial_loop_state(_recovery_loop_name(resolved_loop))
-                        if create_result.storage_format == STORAGE_FORMAT_CHECKPOINTED
-                        else None,
-                        None,
-                    ),
+                store = _stream_claim(
+                    store, resolved_loop, create_result, child_claim, managed_root=managed_root
                 )
-                if managed_root:
-                    _managed.stamp_root_header(store, run_id)
                 _shared["state_store"] = store
                 _shared["claimed"] = True
 
@@ -4745,10 +4756,9 @@ def run_stream(
             yield _fenced_stream_event(run_id, result)
 
         except Exception as exc:
-            if invocation is not None and not _shared.get("claimed"):
-                # Before its bind a managed child is not a run: the driver decides
-                # for its parent, exactly as for run() (0.7).
-                raise
+            # Before its bind a managed child is not a run: the driver decides
+            # for its parent, exactly as for run() (0.7).
+            _managed.raise_unbound(invocation, _shared.get("claimed"))
             # Persist error, yield RUN_ERROR, return cleanly. No re-raise.
             # Covers both setup failures and loop execution errors.
             await _stream_run_failure(store, _shared, startup.recorder, extra_notifier, run_id, exc)
@@ -7493,6 +7503,85 @@ async def _stream_resume_state(
     return run_record, reads, raw_pause, pause_state, recovering, stream_results
 
 
+class _StreamClaim(NamedTuple):
+    store: StateStore
+    record: Any
+    reads: _PauseReads
+    raw_pause: Any
+    pause: Any
+    recovering: bool
+    results: list[ToolResult] | None
+    expected: str
+    stopped: RunResult | None = None
+
+
+async def _stream_resume_claim(
+    agent: Agent,
+    provider: LLMProvider,
+    store: StateStore,
+    run_id: str,
+    claimed: ClaimResult | None,
+    stream_context: StreamContext,
+    shared: dict[str, Any],
+    *,
+    expected_pause_id: str | None,
+    stream_results: list[ToolResult] | None,
+    results_prepared: bool,
+    user_input: str | None,
+    user_parts: tuple[ContentPart, ...] | None,
+) -> _StreamClaim:
+    """Own the run for a streamed resume: claim its pause, or take an owned continuation.
+
+    ``claimed`` (0.7): the run is already owned (a managed parent claimed for
+    adoption) and continues from its checkpoint. A continuation stopped by a
+    marked run carries its result in ``stopped``.
+    """
+    from dendrux.types import RunResult
+
+    if claimed is not None:
+        owned, record, reads, rebuilt = await _stream_claimed_state(
+            agent, store, run_id, claimed, stream_context
+        )
+        shared["state_store"], shared["claimed"] = owned, True
+        if isinstance(rebuilt, RunResult):
+            return _StreamClaim(owned, record, reads, None, None, True, None, "", rebuilt)
+        return _StreamClaim(
+            owned, record, reads, None, rebuilt, True, None, RunStatus.RUNNING.value
+        )
+    record, reads, raw_pause, pause, recovering, stream_results = await _stream_resume_state(
+        agent,
+        provider,
+        store,
+        run_id,
+        expected_pause_id,
+        stream_results,
+        results_prepared,
+        stream_context,
+    )
+    # 4. Determine expected status and claim
+    expected = _resume_expected_status(stream_results, user_input)
+    store, expected, raw_pause = await _claim_resume(
+        store,
+        run_id,
+        raw_pause,
+        agent,
+        expected,
+        expected_pause_id=expected_pause_id,
+        results=stream_results,
+        user_input=user_input,
+        user_parts=user_parts,
+        checkpoint=reads.checkpoint,
+        on_release=partial(_remember_stream_release, shared),
+    )
+    shared["state_store"], shared["claimed"] = store, True
+    stopped = await _stop_marked_continuation(
+        store, run_id, record, pause, agent=agent, claimed_here=True
+    )
+    return _StreamClaim(
+        store, record, reads, raw_pause, pause, recovering, stream_results, expected, stopped
+    )
+
+
 async def _stream_claimed_state(
     agent: Agent,
     store: StateStore,
@@ -7784,60 +7873,35 @@ def resume_stream(
 
             await ensure_agent_limits_fit(agent, store)
 
-            if _claimed is not None:
-                store, run_record, reads, rebuilt = await _stream_claimed_state(
-                    agent, store, run_id, _claimed, stream_context
-                )
-                _shared["state_store"] = store
-                _shared["claimed"] = True
-                if isinstance(rebuilt, RunResult):
-                    yield _fenced_stream_event(run_id, rebuilt)
-                    return
-                pause_state, raw_pause, recovering = rebuilt, None, True
-                expected = RunStatus.RUNNING.value
-            else:
-                (
-                    run_record,
-                    reads,
-                    raw_pause,
-                    pause_state,
-                    recovering,
-                    stream_results,
-                ) = await _stream_resume_state(
-                    agent,
-                    provider,
-                    store,
-                    run_id,
-                    expected_pause_id,
-                    stream_results,
-                    results_prepared,
-                    stream_context,
-                )
-
-                # 4. Determine expected status and claim
-                expected = _resume_expected_status(stream_results, user_input)
-
-                store, expected, raw_pause = await _claim_resume(
-                    store,
-                    run_id,
-                    raw_pause,
-                    agent,
-                    expected,
-                    expected_pause_id=expected_pause_id,
-                    results=stream_results,
-                    user_input=user_input,
-                    user_parts=user_parts,
-                    checkpoint=reads.checkpoint,
-                    on_release=partial(_remember_stream_release, _shared),
-                )
-                _shared["state_store"] = store
-                _shared["claimed"] = True
-                stopped = await _stop_marked_continuation(
-                    store, run_id, run_record, pause_state, agent=agent, claimed_here=True
-                )
-                if stopped is not None:
-                    yield _fenced_stream_event(run_id, stopped)
-                    return
+            claim = await _stream_resume_claim(
+                agent,
+                provider,
+                store,
+                run_id,
+                _claimed,
+                stream_context,
+                _shared,
+                expected_pause_id=expected_pause_id,
+                stream_results=stream_results,
+                results_prepared=results_prepared,
+                user_input=user_input,
+                user_parts=user_parts,
+            )
+            if claim.stopped is not None:
+                yield _fenced_stream_event(run_id, claim.stopped)
+                return
+            store, run_record, reads, raw_pause = (
+                claim.store,
+                claim.record,
+                claim.reads,
+                claim.raw_pause,
+            )
+            pause_state, recovering, stream_results, expected = (
+                claim.pause,
+                claim.recovering,
+                claim.results,
+                claim.expected,
+            )
             _shared["expected_status"] = expected
             progress = _shared["progress"] = _ResumeProgress()
 

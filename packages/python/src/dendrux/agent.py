@@ -2859,17 +2859,7 @@ class Agent:
         await _refuse_managed_child(store, record)
 
         store_request_pause = require_store_method(store, "request_pause")
-        order = [run_id]
-        if self._subagents:
-            # A managed root's request reaches its active branch, leaf first (0.7).
-            from dendrux.runtime._pending import managed_branch
-
-            hops, _, _ = await managed_branch(store, run_id, record.tenant_id)
-            order = [hop.run_id for hop in reversed(hops)]
-        elif cascade:
-            subtree = await require_store_method(store, "get_subtree")(run_id, tenant_id=tenant_id)
-            if subtree is not None:
-                order = _cascade_order(subtree)
+        order = await self._pause_order(store, record, cascade, tenant_id)
 
         affected: list[tuple[str, Any]] = []
         for rid in order:
@@ -2892,6 +2882,21 @@ class Agent:
             status_after=RunStatus(after.status if after is not None else record.status),
             affected=affected,
         )
+
+    async def _pause_order(
+        self, store: StateStore, record: Any, cascade: bool, tenant_id: TenantScope
+    ) -> list[str]:
+        """Runs a pause request flags, deepest first and ``record`` last."""
+        if self._subagents:
+            # A managed root's request reaches its active branch, leaf first (0.7).
+            from dendrux.runtime._pending import managed_branch
+
+            hops, _, _ = await managed_branch(store, record.id, record.tenant_id)
+            return [hop.run_id for hop in reversed(hops)]
+        if not cascade:
+            return [record.id]
+        subtree = await require_store_method(store, "get_subtree")(record.id, tenant_id=tenant_id)
+        return _cascade_order(subtree) if subtree is not None else [record.id]
 
     async def submit_resume(
         self,

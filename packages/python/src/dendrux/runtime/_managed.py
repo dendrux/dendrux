@@ -208,6 +208,12 @@ async def require_checkpointed_creation(store: Any) -> None:
         raise ManagedStateError(reason="storage_format")
 
 
+def raise_unbound(invocation: ManagedInvocation | None, claimed: Any) -> None:
+    """Re-raise the active exception for a managed child that never bound (stream path)."""
+    if invocation is not None and not claimed:
+        raise  # noqa: PLE0704 - called only from an ``except`` block
+
+
 def new_run_id(invocation: ManagedInvocation | None) -> str:
     """A managed child's id is its parent's bind candidate, minted at the handoff."""
     return invocation.child_run_id if invocation is not None else generate_ulid()
@@ -1045,6 +1051,46 @@ class _Terminal:
     event: Any
 
 
+@dataclass
+class _Leg:
+    """One run's stream inside the workflow: its outcome once drained."""
+
+    stream: Any
+    invocation: ManagedInvocation | None = None
+    terminal: Any = None
+    result: Any = None
+    bound: bool = False
+
+
+async def _run_leg(leg: _Leg, state: _StreamState, *, first: bool) -> Any:
+    """Forward one run's events and record its outcome on ``leg``.
+
+    A run is the root's own leg only when nothing waits and no child is
+    binding. Before its bind a child is not a run: its failure decides for its
+    parent, exactly as for ``run()``.
+    """
+    from contextlib import aclosing
+
+    root_level = not state.waiting and leg.invocation is None
+    state.current, state.root_active = leg.stream, root_level
+    try:
+        items = _drain(leg.stream, root_level=root_level, first=first)
+        async with aclosing(items):
+            async for item in items:
+                if isinstance(item, _Terminal):
+                    leg.terminal = item.event
+                else:
+                    yield item
+    except Exception as exc:
+        if leg.invocation is None:
+            raise
+        leg.result, leg.bound = await _after_child_error(leg.invocation, exc)
+        return
+    if leg.terminal is None:
+        raise ManagedStateError(reason="binding_conflict", run_id=state.root_run_id)
+    leg.result, leg.bound = leg.terminal.run_result, leg.invocation is not None
+
+
 async def _drive_stream(first: Any, state: _StreamState, *, notifier: Any) -> Any:
     """Advance each run of the branch in this task, adopting and unwinding to the root.
 
@@ -1053,59 +1099,40 @@ async def _drive_stream(first: Any, state: _StreamState, *, notifier: Any) -> An
     a terminal child is adopted and its parent's continuation is streamed.
     Only the root's own completion ends the stream as the root's result.
     """
-    from contextlib import aclosing
-
-    waiting = state.waiting if state.waiting is not None else []
-    state.waiting = waiting
-    stream, invocation, first_leg = first, None, True
-    for _ in range(_MAX_STEPS):
-        state.current = stream
-        terminal = None
-        try:
-            # A run is the root's own leg only when nothing waits and no child is binding.
-            root_level = not waiting and invocation is None
-            state.root_active = root_level
-            items = _drain(stream, root_level=root_level, first=first_leg)
-            async with aclosing(items):
-                async for item in items:
-                    if isinstance(item, _Terminal):
-                        terminal = item.event
-                    else:
-                        yield item
-        except Exception as exc:
-            if invocation is None:
-                raise
-            # Before its bind the child is not a run: decide for its parent.
-            result, bound = await _after_child_error(invocation, exc)
-        else:
-            if terminal is None:
-                raise ManagedStateError(reason="binding_conflict", run_id=state.root_run_id)
-            result, bound = terminal.run_result, invocation is not None
+    state.waiting = state.waiting if state.waiting is not None else []
+    leg = _Leg(first)
+    for step in range(_MAX_STEPS):
+        async for item in _run_leg(leg, state, first=step == 0):
+            yield item
         if state.root_run_id is None:
-            state.root_run_id = stream.run_id
-        if invocation is not None and bound:
-            waiting.append(_waiting_from(invocation))
-        invocation, first_leg = None, False
-        if (result.meta or {}).get(NOT_OWNER_KEY):
-            yield _event(await root_view(state.store, state.root_run_id))
+            state.root_run_id = leg.stream.run_id
+        if leg.invocation is not None and leg.bound:
+            state.waiting.append(_waiting_from(leg.invocation))
+        following = await _next_leg(leg, state, notifier)
+        if not isinstance(following, _Leg):
+            yield following
             return
-        if is_descend(result):
-            invocation = result.meta[DESCEND_KEY]
-            state.tenant_id = invocation.tenant_id
-            stream = _child_stream(invocation, notifier)
-            continue
-        if not waiting:
-            yield terminal if terminal is not None else _event(result)
-            return
-        if result.status not in TERMINAL_STATUSES:
-            yield _event(await _paused_or_failed(state, waiting, result, terminal))
-            return
-        claim = await claim_adoption(waiting[-1], state.store)
-        if claim is None:
-            yield _event(await root_view(state.store, state.root_run_id))
-            return
-        stream = _continuation_stream(waiting.pop(), state.store, claim, notifier)
+        leg = following
     raise ManagedStateError(reason="binding_conflict", run_id=state.root_run_id)
+
+
+async def _next_leg(leg: _Leg, state: _StreamState, notifier: Any) -> Any:
+    """The next run to stream, or the workflow stream's final event."""
+    result, waiting = leg.result, state.waiting or []
+    if (result.meta or {}).get(NOT_OWNER_KEY):
+        return _event(await root_view(state.store, str(state.root_run_id)))
+    if is_descend(result):
+        invocation = result.meta[DESCEND_KEY]
+        state.tenant_id = invocation.tenant_id
+        return _Leg(_child_stream(invocation, notifier), invocation)
+    if not waiting:
+        return leg.terminal if leg.terminal is not None else _event(result)
+    if result.status not in TERMINAL_STATUSES:
+        return _event(await _paused_or_failed(state, waiting, result, leg.terminal))
+    claim = await claim_adoption(waiting[-1], state.store)
+    if claim is None:
+        return _event(await root_view(state.store, str(state.root_run_id)))
+    return _Leg(_continuation_stream(waiting.pop(), state.store, claim, notifier))
 
 
 async def _paused_or_failed(
@@ -1143,7 +1170,6 @@ def workflow_stream(
     """
     from contextlib import aclosing
 
-    from dendrux.types import RunEvent, RunEventType
     from dendrux.types import RunStream as _RunStream
 
     state = _StreamState(root_agent)
@@ -1156,40 +1182,48 @@ def workflow_stream(
         try:
             async with aclosing(driven):
                 async for event in driven:
-                    if state.root_run_id is not None:
-                        stream.run_id = state.root_run_id
+                    stream.run_id = state.root_run_id or stream.run_id
                     yield event
         except Exception as exc:
-            yield await _stream_failure(state, exc)
-
-    async def _stream_failure(state: _StreamState, exc: Exception) -> Any:
-        from dendrux.runtime.runner import _safe_error
-
-        error = _safe_error(exc)
-        if state.root_run_id is None or state.store is None:
-            result = RunResult(run_id=stream.run_id, status=RunStatus.ERROR, error=error)
-        else:
-            result = await root_view(state.store, state.root_run_id)
-            result.error = error
-        result.meta["error_type"] = type(exc).__name__
-        state.root_active = True  # nothing to cancel: the failure is reported, not abandoned
-        return RunEvent(
-            type=RunEventType.RUN_ERROR, run_result=result, run_id=result.run_id, error=error
-        )
+            yield await _stream_failure(state, exc, stream.run_id)
 
     async def _cleanup() -> RunResult | None:
-        current = state.current
-        result = None
-        if current is not None:
-            await current.aclose()
-            result = current.result
-        if not state.root_active and state.root_run_id is not None:
-            await root_agent.cancel_run(state.root_run_id, cascade=True, tenant_id=state.tenant_id)
-            result = await root_view(state.store, state.root_run_id)
-        return result
+        return await _close_workflow(state)
 
     stream = _RunStream(run_id=run_id, generator=_generate(), cleanup=_cleanup)
     return stream
+
+
+async def _stream_failure(state: _StreamState, exc: Exception, run_id: str) -> Any:
+    """A failure while driving ends the workflow stream with a root-facing RUN_ERROR."""
+    from dendrux.runtime.runner import _safe_error
+    from dendrux.types import RunEvent, RunEventType
+
+    error = _safe_error(exc)
+    if state.root_run_id is None or state.store is None:
+        result = RunResult(run_id=run_id, status=RunStatus.ERROR, error=error)
+    else:
+        result = await root_view(state.store, state.root_run_id)
+        result.error = error
+    result.meta["error_type"] = type(exc).__name__
+    state.root_active = True  # nothing to cancel: the failure is reported, not abandoned
+    return RunEvent(
+        type=RunEventType.RUN_ERROR, run_result=result, run_id=result.run_id, error=error
+    )
+
+
+async def _close_workflow(state: _StreamState) -> RunResult | None:
+    """Abandoned stream: close the active run's stream, then cancel a waiting root."""
+    result = None
+    if state.current is not None:
+        await state.current.aclose()
+        result = state.current.result
+    if not state.root_active and state.root_run_id is not None:
+        await state.root_agent.cancel_run(
+            state.root_run_id, cascade=True, tenant_id=state.tenant_id
+        )
+        result = await root_view(state.store, state.root_run_id)
+    return result
 
 
 def start_stream(root_agent: Agent, root_stream: Any, *, notifier: Any) -> RunStream:
