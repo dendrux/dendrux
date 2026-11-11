@@ -1396,11 +1396,66 @@ def routed_stream(
             expected_pause_id=expected_pause_id,
             _tenant_explicit=tenant_explicit,
         )
-        state.waiting = list(found.waiting)
-        state.current, state.root_active = first, not found.routed
-        return first, (resumed if found.routed else None)
+        if not found.routed:
+            state.waiting = []
+            state.current, state.root_active = first, True
+            return first, None
+        return await _owned_leaf_stream(state, found, first, resumed)
 
     return workflow_stream(root_agent, open_first, run_id=run_id, notifier=notifier)
+
+
+async def _owned_leaf_stream(state: _StreamState, found: Route, first: Any, resumed: Any) -> Any:
+    """Validate and claim the leaf in this task before the workflow exposes anything.
+
+    The leaf stream's first step runs its generation check and claim. Only a
+    stream that now owns the leaf arms workflow cancellation and opens with the
+    root's RUN_RESUMED; a refused or lost claim ends with a root-facing
+    RUN_ERROR and changes nothing.
+    """
+    events = first.__aiter__()
+    head = await anext(events, None)
+    if head is None or getattr(head.type, "value", head.type) in _TERMINAL_EVENTS:
+        await events.aclose()
+        state.waiting = []
+        view = await root_view(state.store, found.root_run_id)
+        error = getattr(head, "error", None) if head is not None else None
+        view.error = error
+        return _Single(_event_with_error(view, error)), None
+    started = _Started(first, events, head)
+    state.waiting = list(found.waiting)
+    state.current, state.root_active = started, False
+    return started, resumed
+
+
+def _event_with_error(result: RunResult, error: str | None) -> Any:
+    from dendrux.types import RunEvent, RunEventType
+
+    return RunEvent(
+        type=RunEventType.RUN_ERROR, run_result=result, run_id=result.run_id, error=error
+    )
+
+
+class _Started:
+    """A run's stream whose first event was already taken in this task (its claim made)."""
+
+    def __init__(self, stream: Any, events: Any, head: Any) -> None:
+        self._stream = stream
+        self._events = events
+        self._head = head
+        self.run_id = stream.run_id
+
+    @property
+    def result(self) -> Any:
+        return self._stream.result
+
+    async def __aiter__(self) -> Any:
+        yield self._head
+        async for event in self._events:
+            yield event
+
+    async def aclose(self) -> None:
+        await self._events.aclose()  # runs the run's own close-time cleanup
 
 
 _TERMINAL_VALUES = frozenset(s.value for s in TERMINAL_STATUSES)

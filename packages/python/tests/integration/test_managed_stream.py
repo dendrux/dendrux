@@ -630,3 +630,80 @@ async def test_resume_stream_progress_carries_no_briefs_or_child_tool_content(
     )
     assert events[-1].run_result.status == RunStatus.SUCCESS
     _assert_structural(events, result.run_id)
+
+
+# ---------------------------------------------------------------------------
+# Fix round 2, R2: a continuation that never owned the leaf cancels nothing
+# ---------------------------------------------------------------------------
+
+
+async def _snapshot(engine: Any) -> dict[str, tuple[str, int, bool]]:
+    return {
+        r.id: (r.status, r.claim_epoch, bool(r.cancel_requested))
+        for r in await rows(engine, AgentRun)
+    }
+
+
+async def test_a_wrong_token_stream_closed_at_its_first_event_changes_nothing(
+    store: Any, engine: Any
+) -> None:
+    root = _depth_two(store)
+    paused = (await collect(root.stream("go", tenant_id=TENANT)))[-1].run_result
+    before = await _snapshot(engine)
+    restarted = _depth_two(store, restarted=True)
+
+    first = await _first_event_then_close(
+        restarted.resume_stream(
+            paused.run_id, tenant_id=TENANT, expected_pause_id="01ZZZZZZZZZZZZZZZZZZZZZZZZ"
+        )
+    )
+
+    assert first.type == RunEventType.RUN_ERROR and first.run_id == paused.run_id
+    assert first.run_result.status == RunStatus.WAITING_APPROVAL  # the root-facing view
+    assert await _snapshot(engine) == before
+    final = await root.submit_approval(
+        paused.run_id, approved=True, tenant_id=TENANT, expected_pause_id=paused.pause_id
+    )
+    assert final.status == RunStatus.SUCCESS  # the right token still works
+
+
+async def test_a_stream_that_loses_the_leaf_claim_cancels_nothing(
+    store: Any, engine: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Another root continuation wins between this stream's routing read and its claim."""
+    published.clear()
+    root = _depth_two(store)
+    paused = (await collect(root.stream("go", tenant_id=TENANT)))[-1].run_result
+    winner = _depth_two(store, restarted=True)
+    winning = winner.resume_stream(
+        paused.run_id, tenant_id=TENANT, expected_pause_id=paused.pause_id
+    )
+    winning_events = winning.__aiter__()
+    original = _managed.route
+    raced: list[Any] = []
+
+    async def win_first(*args: Any, **kwargs: Any) -> Any:
+        found = await original(*args, **kwargs)
+        if not raced:  # the loser read the leaf paused; the winner claims it now
+            raced.append(None)  # the winner routes through here too
+            raced[0] = await winning_events.__anext__()
+        return found
+
+    monkeypatch.setattr(_managed, "route", win_first)
+    loser = _depth_two(store, restarted=True)
+    first = await _first_event_then_close(
+        loser.resume_stream(paused.run_id, tenant_id=TENANT, expected_pause_id=paused.pause_id)
+    )
+    monkeypatch.setattr(_managed, "route", original)
+
+    assert raced and raced[0].type == RunEventType.RUN_RESUMED
+    assert first.type == RunEventType.RUN_ERROR
+    after_loss = {
+        r.agent_name: (r.status, bool(r.cancel_requested)) for r in await rows(engine, AgentRun)
+    }
+    assert after_loss["lead"] == ("paused", False)
+    assert after_loss["reviewer"] == ("paused", False)
+    assert after_loss["auditor"] == ("running", False)  # the winner's claim, untouched
+    rest = [event async for event in winning_events]
+    assert rest[-1].type == RunEventType.RUN_COMPLETED
+    assert published == ["g"]
