@@ -1147,6 +1147,77 @@ def _die_sync(*args: Any, **kwargs: Any) -> Any:
     raise ProcessDeathError
 
 
+async def test_r5_recovered_bind_refuses_a_newly_single_call_child(
+    store: Any, engine: Any, monkeypatch: Any
+) -> None:
+    from dendrux.errors import SubagentDefinitionError
+    from dendrux.loops.single import SingleCall
+
+    first = _recovery_root(
+        store,
+        ContextLLM([call("reviewer", {"task": BRIEF}, "r1")]),
+        _named("reviewer", ContextLLM([])),
+    )
+    await _crash_at(monkeypatch, _managed, "bind_child", lambda: first.run("go", tenant_id=TENANT))
+    root_id = await root_id_of(engine)
+    item = await expire(store, engine, root_id)
+    child_llm = ContextLLM([LLMResponse(text=REPORT)])
+    changed = Agent(
+        name="reviewer", description="r", prompt="c", provider=child_llm, loop=SingleCall()
+    )
+    fresh = _recovery_root(store, ContextLLM([]), changed)
+    with pytest.raises(SubagentDefinitionError) as info:
+        await fresh.reclaim(root_id, tenant_id=TENANT, item=item)
+    assert info.value.reason == "loop_unsupported" and child_llm.calls == 0
+    assert not await rows(engine, AgentRun, AgentRun.parent_run_id == root_id)
+
+
+async def test_r5_recovered_descendant_bind_refuses_a_single_call_grandchild(
+    store: Any, engine: Any, monkeypatch: Any
+) -> None:
+    from dendrux.errors import SubagentDefinitionError
+    from dendrux.loops.single import SingleCall
+
+    def reviewer(llm: Any, auditor: Agent) -> Agent:
+        return Agent(
+            name="reviewer", description="r", prompt="c", provider=llm, subagents=[auditor]
+        )
+
+    first = _recovery_root(
+        store,
+        ContextLLM([call("reviewer", {"task": BRIEF}, "r1")]),
+        reviewer(
+            ContextLLM([call("auditor", {"task": "check"}, "c1")]),
+            _named("auditor", ContextLLM([])),
+        ),
+    )
+    calls_seen = {"n": 0}
+    original = _managed.bind_child
+
+    async def die_second(*args: Any, **kwargs: Any) -> Any:
+        calls_seen["n"] += 1
+        if calls_seen["n"] == 2:
+            raise ProcessDeathError
+        return await original(*args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(_managed, "bind_child", die_second)
+        with pytest.raises(ProcessDeathError):
+            await first.run("go", tenant_id=TENANT)
+    root_id = await root_id_of(engine)
+    middle = await child_of(engine, root_id)
+    await expire(store, engine, middle.id)
+    grandchild_llm = ContextLLM([LLMResponse(text="leaf")])
+    changed = Agent(
+        name="auditor", description="a", prompt="c", provider=grandchild_llm, loop=SingleCall()
+    )
+    fresh = _recovery_root(store, ContextLLM([]), reviewer(ContextLLM([]), changed))
+    with pytest.raises(SubagentDefinitionError):
+        await fresh.reclaim(root_id, tenant_id=TENANT)
+    assert grandchild_llm.calls == 0
+    assert not await rows(engine, AgentRun, AgentRun.parent_run_id == middle.id)
+
+
 async def test_r6_reconnect_finds_the_intent_beyond_one_page_of_tool_rows(
     store: Any, engine: Any, monkeypatch: Any
 ) -> None:

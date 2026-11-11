@@ -246,6 +246,8 @@ async def prepare_handoff(
     from dendrux.runtime.context import DelegationDepthExceededError, get_delegation_context
 
     handoff = result.meta[MANAGED_HANDOFF_KEY]
+    # Every bind, live or recovered, admits only a ReAct child (before any effect).
+    _require_react(handoff.parent, handoff.child)
     control = await store.get_run_control(run_id)
     if control.cancel_requested:
         return None
