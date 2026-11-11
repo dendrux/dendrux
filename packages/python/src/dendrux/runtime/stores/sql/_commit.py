@@ -79,6 +79,12 @@ def _comparable(actual: Any, value: Any) -> tuple[Any, Any]:
     return actual, value
 
 
+def _bind_request(name: str, arguments: dict[str, Any]) -> tuple[Any, Any]:
+    """bind_managed_child names its runs in a typed request, not run_id/claim_epoch."""
+    bind = arguments.get("request") if name == "bind_managed_child" else None
+    return bind, (arguments.get("run_id") if bind is None else bind.parent_run_id)
+
+
 class _CommitReadback:
     def __init__(self, store: SQLStateStore, session: AsyncSession, operation: Any) -> None:
         self.store, self.session = store, session
@@ -87,13 +93,8 @@ class _CommitReadback:
         context = operation if operation is not None else (None, "", {})
         self.name = context[1]
         self.arguments = dict(context[2])
-        self.run_id = self.arguments.get("run_id")
-        # bind_managed_child names its runs in a typed request, not run_id/claim_epoch.
-        self.bind: Any = (
-            self.arguments.get("request") if self.name == "bind_managed_child" else None
-        )
-        if self.bind is not None:
-            self.run_id = self.bind.parent_run_id
+        self.bind: Any
+        self.bind, self.run_id = _bind_request(self.name, self.arguments)
         self.fresh = session.info.pop(FRESH_EVIDENCE_SESSION_KEY, False)
         self.epoch = self.arguments.get("claim_epoch")
         self.prove_fence = self.name in _TRANSITIONS and self.epoch is not None and not self.fresh
@@ -231,8 +232,7 @@ class _CommitReadback:
                 await self._lost()
 
     async def _lost(self, *, absent: bool = False) -> NoReturn:
-        if self.bind is not None:
-            await self._bind_lost()
+        await self._bind_lost()
         retry_id = _RETRY_IDS.get(self.name)
         if absent and (
             self.name == "create_run"
@@ -248,13 +248,15 @@ class _CommitReadback:
             raise _CommitNotAppliedError() from None
         self.unknown()
 
-    async def _bind_lost(self) -> NoReturn:
+    async def _bind_lost(self) -> None:
         """This invocation's own rows (incl. its private nonce) were not proven.
 
         Re-entering is safe: the attempt retakes the parent lock, reads an
         existing binding back without a token, and only creates when the
         parent still admits this invocation. Never grants authority here.
         """
+        if self.bind is None:
+            return
         raise _CommitNotAppliedError() from None
 
     def _retry_predicate(self) -> Any:
