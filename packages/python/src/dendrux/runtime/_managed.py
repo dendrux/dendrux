@@ -52,8 +52,6 @@ DESCEND_KEY = "managed_descend"
 """``RunResult.meta`` key: the parent exited at a managed handoff (in memory only)."""
 NOT_OWNER_KEY = "managed_not_owner"
 """``RunResult.meta`` key: this caller does not own the next managed step."""
-ORIGIN_KEY = "managed_origin"
-"""``RunResult.meta`` key of a projected root view: the leaf run and its path."""
 
 MANAGED_WAIT_REASON = "managed_wait"
 ADMITTED_KEY = "managed_admitted"
@@ -545,12 +543,13 @@ async def _fail_parent(invocation: ManagedInvocation, exc: Exception) -> None:
 
 
 async def root_view(store: Any, root_run_id: str) -> RunResult:
-    """The root's persisted state, for a caller that does not own the next step."""
+    """The root's persisted, root-facing state, for a caller that does not own the next step.
+
+    A root waiting on a subagent reports its active branch: the leaf's external
+    pause, or RUNNING while a subagent runs or awaits adoption.
+    """
     from dendrux.runtime.runner import _build_cached_result
 
-    record = await store.get_run(root_run_id)
-    if record is not None and record.status == RunStatus.PAUSED.value:
-        return _root_result(record, status=RunStatus.RUNNING)
     return await _build_cached_result(store, root_run_id)
 
 
@@ -577,18 +576,20 @@ async def _projected_pause(
     record = await store.get_run(root_run_id)
     if record is None:
         raise ManagedStateError(reason="child_missing", run_id=root_run_id)
+    pending = leaf.pending
+    if pending is not None:
+        pending = replace(
+            pending,
+            run_id=root_run_id,
+            agent_name=waiting[-1].child.name,
+            agent_path=[record.agent_name, *waiting[-1].child_path],
+            origin_run_id=leaf.run_id,
+        )
     return _root_result(
         record,
         status=leaf.status,
-        pause_id=leaf.pause_id,
-        pending=leaf.pending,
-        meta={
-            ORIGIN_KEY: {
-                "origin_run_id": leaf.run_id,
-                "agent_name": waiting[-1].child.name,
-                "agent_path": [record.agent_name, *waiting[-1].child_path],
-            }
-        },
+        pause_id=pending.pause_id if pending is not None else None,
+        pending=pending,
     )
 
 

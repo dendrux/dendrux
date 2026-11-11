@@ -1255,7 +1255,7 @@ async def _attach_persisted_pending(store: StateStore, result: RunResult, record
 
 
 async def _load_persisted_pending(store: StateStore, result: RunResult, record: Any) -> None:
-    from dendrux.runtime._pending import _PendingReader
+    from dendrux.runtime._pending import _PendingReader, facing_status
 
     result.pending = None
     result.pause_id = None
@@ -1265,6 +1265,9 @@ async def _load_persisted_pending(store: StateStore, result: RunResult, record: 
         )
     except Exception:
         _codes.log_code(logger, _codes.RESULT_READ_FAILED, run_id=result.run_id)
+        return
+    # A parent waiting on a subagent reports its active branch (0.7).
+    result.status = RunStatus(facing_status(result.status.value, result.pending))
     result.pause_id = result.pending.pause_id if result.pending else None
 
 

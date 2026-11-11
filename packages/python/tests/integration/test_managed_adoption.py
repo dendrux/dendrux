@@ -503,12 +503,12 @@ async def test_child_pause_is_saved_without_fake_parent_result(store: Any, engin
     child_row = await child_of(engine, root_id)
     assert result.status == RunStatus.WAITING_APPROVAL
     assert result.pause_id == child_row.pause_data["pause_id"]
-    origin = result.meta["managed_origin"]
-    assert origin == {
-        "origin_run_id": child_row.id,
-        "agent_name": "reviewer",
-        "agent_path": ["lead", "reviewer"],
-    }
+    pending = result.pending
+    assert (pending.origin_run_id, pending.agent_name, pending.agent_path) == (
+        child_row.id,
+        "reviewer",
+        ["lead", "reviewer"],
+    )
     assert child_row.status == "waiting_approval"
     root_row = (await rows(engine, AgentRun, AgentRun.id == root_id))[0]
     assert root_row.status == "paused" and root_row.pause_data["schema_version"] == 3
