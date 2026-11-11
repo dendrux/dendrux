@@ -746,3 +746,146 @@ async def test_pg_direct_child_reclaim_never_consumes_root_recovery(
         assert recovered.status == RunStatus.SUCCESS and child_llm.calls == 1
         async with engine.begin() as conn:
             await conn.execute(AgentRun.__table__.delete().where(AgentRun.agent_name == "lead"))
+
+
+# ---------------------------------------------------------------------------
+# R4: recovery of a pending managed batch never dispatches ordinarily
+# ---------------------------------------------------------------------------
+
+effects: list[str] = []
+
+
+@tool()
+async def fetch(x: int) -> str:
+    """Server effect."""
+    effects.append("fetch")
+    return "fetched"
+
+
+def _recovery_root(store: Any, root_llm: Any, *children: Agent, **kwargs: Any) -> Agent:
+    async def hook(ctx: Any) -> None:
+        effects.append(f"hook:{ctx.tool_name}")
+
+    return Agent(
+        name="lead",
+        prompt="You lead.",
+        provider=root_llm,
+        state_store=store,
+        tools=[fetch],
+        subagents=list(children),
+        before_tool=hook,
+        **kwargs,
+    )
+
+
+def _named(name: str, llm: Any) -> Agent:
+    return Agent(name=name, description=f"{name} child.", prompt="c", provider=llm)
+
+
+async def _crash_at(monkeypatch: Any, module: Any, name: str, run: Any) -> None:
+    async def die(*args: Any, **kwargs: Any) -> Any:
+        raise ProcessDeathError
+
+    with monkeypatch.context() as patch:
+        patch.setattr(module, name, die)
+        with pytest.raises(ProcessDeathError):
+            await run()
+
+
+async def test_recovered_unsupported_batch_is_refused_with_zero_effects(
+    store: Any, engine: Any, monkeypatch: Any
+) -> None:
+    """Crash at the assistant checkpoint (before live preflight), then recover."""
+    from dendrux.loops import react
+
+    batch = LLMResponse(
+        tool_calls=[
+            ToolCall(name="reviewer", params={"task": BRIEF}, provider_tool_call_id="p1"),
+            ToolCall(name="auditor", params={"task": BRIEF}, provider_tool_call_id="p2"),
+            ToolCall(name="fetch", params={"x": 1}, provider_tool_call_id="p3"),
+        ]
+    )
+    first = _recovery_root(
+        store,
+        ContextLLM([batch]),
+        _named("reviewer", ContextLLM([])),
+        _named("auditor", ContextLLM([])),
+    )
+    await _crash_at(
+        monkeypatch, react, "_refuse_managed_batch", lambda: first.run("go", tenant_id=TENANT)
+    )
+    root_id = await root_id_of(engine)
+    effects.clear()
+    item = await expire(store, engine, root_id)
+    reviewer_llm, auditor_llm = ContextLLM([]), ContextLLM([])
+    root_llm = ContextLLM([LLMResponse(text="regrouped")])
+    fresh = _recovery_root(
+        store, root_llm, _named("reviewer", reviewer_llm), _named("auditor", auditor_llm)
+    )
+    result = await fresh.reclaim(root_id, tenant_id=TENANT, item=item)
+
+    assert result.status == RunStatus.SUCCESS and result.answer == "regrouped"
+    assert effects == [] and reviewer_llm.calls == 0 and auditor_llm.calls == 0
+    assert not await rows(engine, AgentRun, AgentRun.parent_run_id == root_id)
+    seen = [json.loads(m.content) for m in root_llm.messages[0] if m.role.value == "tool"]
+    assert len(seen) == 3 and all("subagent" in o["error"] for o in seen)
+    tool_rows = await rows(engine, ToolCallRecord, ToolCallRecord.agent_run_id == root_id)
+    assert {r.meta.get("code") for r in tool_rows} == {"managed_batch_unsupported"}
+
+
+async def test_recovered_pre_bind_handoff_binds_once_not_a_client_pause(
+    store: Any, engine: Any, monkeypatch: Any
+) -> None:
+    """Crash after the handoff checkpoint, before the bind, then recover."""
+    first = _recovery_root(
+        store,
+        ContextLLM([call("reviewer", {"task": BRIEF}, "r1")]),
+        _named("reviewer", ContextLLM([])),
+    )
+    await _crash_at(monkeypatch, _managed, "bind_child", lambda: first.run("go", tenant_id=TENANT))
+    root_id = await root_id_of(engine)
+    row = (await rows(engine, AgentRun, AgentRun.id == root_id))[0]
+    assert row.status == "running" and row.loop_state.get("managed_wait") is None
+    assert [p["target"] for p in row.loop_state["pending"]] == ["agent"]
+    effects.clear()
+    item = await expire(store, engine, root_id)
+    child_llm = ContextLLM([LLMResponse(text=REPORT)])
+    root_llm = ContextLLM([LLMResponse(text="root done")])
+    fresh = _recovery_root(store, root_llm, _named("reviewer", child_llm))
+    result = await fresh.reclaim(root_id, tenant_id=TENANT, item=item)
+
+    assert result.status == RunStatus.SUCCESS and result.answer == "root done"
+    assert child_llm.calls == 1 and effects == []
+    assert len(await rows(engine, AgentRun, AgentRun.parent_run_id == root_id)) == 1
+    seen = [json.loads(m.content) for m in root_llm.messages[0] if m.role.value == "tool"]
+    assert seen == [REPORT]
+
+
+async def test_recovered_mixed_pending_batch_is_refused_before_effects(
+    store: Any, engine: Any, monkeypatch: Any
+) -> None:
+    """A managed call still pending beside an ordinary one: explicit staged refusal."""
+    from dendrux.loops import react
+
+    batch = LLMResponse(
+        tool_calls=[
+            ToolCall(name="reviewer", params={"task": BRIEF}, provider_tool_call_id="p1"),
+            ToolCall(name="fetch", params={"x": 1}, provider_tool_call_id="p2"),
+        ]
+    )
+    first = _recovery_root(store, ContextLLM([batch]), _named("reviewer", ContextLLM([])))
+    await _crash_at(
+        monkeypatch, react, "_prepare_tool_calls", lambda: first.run("go", tenant_id=TENANT)
+    )
+    root_id = await root_id_of(engine)
+    effects.clear()
+    item = await expire(store, engine, root_id)
+    child_llm, root_llm = ContextLLM([]), ContextLLM([])
+    fresh = _recovery_root(store, root_llm, _named("reviewer", child_llm))
+    with pytest.raises(ManagedUnsupportedError) as info:
+        await fresh.reclaim(root_id, tenant_id=TENANT, item=item)
+    assert info.value.operation == "recover_mixed_batch"
+    assert effects == [] and child_llm.calls == 0 and root_llm.calls == 0
+    assert not await rows(engine, AgentRun, AgentRun.parent_run_id == root_id)
+    row = (await rows(engine, AgentRun, AgentRun.id == root_id))[0]
+    assert row.status != "waiting_client_tool"

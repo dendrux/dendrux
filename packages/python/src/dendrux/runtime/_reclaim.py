@@ -961,6 +961,80 @@ async def _resolve_saved_call(
     return await _observe_recovery_call(ctx, run_id, tc, row, action.kind)
 
 
+_ORDINARY = object()
+
+
+async def _recover_managed_calls(
+    agent: Agent, ctx: _ResumeContext, run_id: str, lookups: Any
+) -> object:
+    """Pending generated subagent calls never reach ordinary recovery dispatch (0.7).
+
+    Before any hook or effect: an unsupported batch is refused per call, as the
+    live preflight would; a lone pending managed call is handed to the durable
+    bind; a managed call still pending beside other calls is refused explicitly.
+    Returns ``_ORDINARY`` when no generated call is pending.
+    """
+    from dendrux.errors import ManagedUnsupportedError
+    from dendrux.loops.react import (
+        MANAGED_HANDOFF_KEY,
+        ManagedHandoff,
+        SubagentTool,
+        _managed_batch_unsupported,
+    )
+
+    pending = ctx.pause_state.pending_tool_calls
+    managed = [tc for tc in pending if isinstance(lookups.fn.get(tc.name), SubagentTool)]
+    if not managed:
+        return _ORDINARY
+    recorder = cast("PersistenceRecorder", ctx.recorder)
+    if recorder._loop_state.get("submission"):
+        raise ManagedUnsupportedError("recover_managed_submission", run_id)
+    if _managed_batch_unsupported(pending, lookups):
+        await _refuse_recovered_batch(ctx, run_id, pending)
+        return None
+    if len(pending) != 1:
+        raise ManagedUnsupportedError("recover_mixed_batch", run_id)
+    call = managed[0]
+    pause = replace(
+        ctx.pause_state,
+        history=ctx.history,
+        pending_tool_calls=[call],
+        pending_targets={call.id: "agent"},
+        approval_gates=None,
+        pending_decisions=None,
+    )
+    return RunResult(
+        run_id=run_id,
+        status=RunStatus.RUNNING,
+        steps=pause.steps,
+        iteration_count=pause.iteration,
+        usage=pause.usage,
+        meta={
+            "pause_state": pause,
+            MANAGED_HANDOFF_KEY: ManagedHandoff(
+                call=call, child=lookups.fn[call.name].agent, parent=agent
+            ),
+        },
+    )
+
+
+async def _refuse_recovered_batch(ctx: _ResumeContext, run_id: str, calls: list[ToolCall]) -> None:
+    """One ``managed_batch_unsupported`` observation per pending call, no effects."""
+    from dendrux._meta_keys import NOT_EXECUTED_META_KEY
+    from dendrux.loops.react import _managed_batch_result
+    from dendrux.types import tool_result_message
+
+    recorder = cast("PersistenceRecorder", ctx.recorder)
+    iteration = ctx.pause_state.iteration
+    _codes.log_code(logger, _codes.MANAGED_BATCH_UNSUPPORTED, run_id=run_id, count=len(calls))
+    for tc in calls:
+        result = _managed_batch_result(tc)
+        await record_tool(recorder, run_id, tc, result, iteration)
+        message = tool_result_message(result)
+        message.meta[NOT_EXECUTED_META_KEY] = True
+        ctx.history.append(await record_message(recorder, run_id, message, iteration))
+
+
 async def resolve(
     agent: Agent,
     store: StateStore,
@@ -974,6 +1048,9 @@ async def resolve(
     recorder = cast("PersistenceRecorder", ctx.recorder)
     pause = ctx.pause_state
     lookups = await agent.get_tool_lookups(loop=ctx.resolved_loop)
+    managed = await _recover_managed_calls(agent, ctx, run_id, lookups)
+    if managed is not _ORDINARY:
+        return cast("RunResult | None", managed)
     state, descriptor = await _consume_recovery_submission(store, run_id, ctx, lookups)
     pending = state.get("pending", [])
     rows = (
