@@ -1154,7 +1154,8 @@ async def test_cancel_between_record_and_pending_reads_never_reads_as_running(
     loaded = await agent.get_result(run_id, tenant_id=TENANT)
 
     assert fired
-    assert loaded.status != RunStatus.RUNNING
-    assert loaded.status in (RunStatus.PAUSED, RunStatus.WAITING_APPROVAL, RunStatus.CANCELLED)
-    assert loaded.pending is None
+    # The fresher read saw the run terminal: the result is that coherent later view,
+    # never RUNNING and never a managed root's private PAUSED wait.
+    assert loaded.status == RunStatus.CANCELLED
+    assert loaded.pending is None and loaded.pause_id is None
     assert (await run_row(engine, run_id)).status == "cancelled"

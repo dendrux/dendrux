@@ -2472,16 +2472,29 @@ class Agent:
         access to this run. Pending arguments use RunStore.get_pending's view.
         Recovery and pending projection failures propagate from this read.
         """
-        from dendrux.errors import PersistenceNotConfiguredError, RunNotFoundError
-        from dendrux.guardrails._engine import deanonymize_text
-        from dendrux.runtime._pending import _PendingReader, facing_status
-        from dendrux.runtime.runner import _cached_output, _public_meta, _recovery_info
+        from dendrux.errors import PersistenceNotConfiguredError
 
         _check_result_read_arguments(run_id, tenant_id)
         require_boolean(include_pii, "include_pii")
         store = await self._resolve_state_store()
         if store is None:
             raise PersistenceNotConfiguredError()
+        result, moved = await self._read_result(store, run_id, tenant_id, include_pii)
+        if moved:
+            # The run changed between the record and pending reads: read once more so
+            # the result is one coherent view, never a stale status with fresh pending.
+            result, _ = await self._read_result(store, run_id, tenant_id, include_pii)
+        return result
+
+    async def _read_result(
+        self, store: StateStore, run_id: str, tenant_id: str | None, include_pii: bool
+    ) -> tuple[RunResult, bool]:
+        """One result read; ``moved`` when the pending read saw another public status."""
+        from dendrux.errors import RunNotFoundError
+        from dendrux.guardrails._engine import deanonymize_text
+        from dendrux.runtime._pending import _PendingReader, facing_status
+        from dendrux.runtime.runner import _cached_output, _public_meta, _recovery_info
+
         facade = _PendingReader(store)
         projected = getattr(store, "_get_result_record", None)
         record = (
@@ -2501,10 +2514,12 @@ class Agent:
         if result.status.value == RunStatus.SUCCESS.value:
             result.output = _cached_output(record.answer, self._output_type, run_id)
         result.pending = await facade.get_pending(run_id, tenant_id=tenant_id)
+        view = facade.last_view
         # A root waiting on a subagent reports its active branch (0.7).
-        result.status = RunStatus(facing_status(result.status.value, facade.last_view))
+        result.status = RunStatus(facing_status(result.status.value, view))
         result.pause_id = result.pending.pause_id if result.pending else None
-        return result
+        moved = view is not None and not view.managed and view.status != record.status
+        return result, moved
 
     async def cancel_run(
         self,
