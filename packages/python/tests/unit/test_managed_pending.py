@@ -227,3 +227,30 @@ async def test_root_reads_running_while_its_subagent_runs_or_awaits_adoption() -
         ids = chain(store, 2, leaf_status=leaf_status)
         view = await _PendingReader(store).facing(ids[0], tenant_id=TENANT)
         assert (view.status, view.pending, view.managed) == ("running", None, True)
+
+
+def test_wire_fallback_keeps_the_managed_origin(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Over the display budget the wire hides arguments but keeps the pause identity."""
+    from dendrux import _wire
+    from dendrux.runtime._pending import PendingToolCall
+
+    pending = PendingPause(
+        "R",
+        "waiting_approval",
+        "approval",
+        "P",
+        tool_calls=[PendingToolCall("c1", "publish", "server", {"text": "SENTINEL-arg"})],
+        agent_name="auditor",
+        agent_path=["lead", "reviewer", "auditor"],
+        origin_run_id="L",
+    )
+    monkeypatch.setattr(_wire, "_redacted", lambda data, mapping: None)  # budget exceeded
+    shown = _wire._pending_wire(pending, None)
+    assert (shown["run_id"], shown["pause_id"]) == ("R", "P")
+    assert shown["pending_tool_calls"][0]["params"] is None
+    assert "SENTINEL-arg" not in repr(shown)
+    assert shown["agent_name"] == "auditor"
+    assert shown["agent_path"] == ["lead", "reviewer", "auditor"]
+    assert shown["origin_run_id"] == "L"
+    own = PendingPause("R", "waiting_approval", "approval", "P")
+    assert "origin_run_id" not in _wire._pending_wire(own, None)
