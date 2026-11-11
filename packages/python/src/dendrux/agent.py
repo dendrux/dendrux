@@ -177,6 +177,16 @@ async def _require_run_in_scope(store: StateStore, run_id: str, tenant_id: Tenan
     record = await store.get_run(run_id)
     if record is None or not _in_tenant_scope(record, tenant_id):
         raise RunNotFoundError(run_id)
+    await _refuse_managed_child(store, record)
+
+
+async def _refuse_managed_child(store: StateStore, record: Any) -> None:
+    """Direct control of a managed subagent run is refused, after the tenant check (0.7)."""
+    from dendrux.errors import ManagedChildControlError
+    from dendrux.runtime._managed import managed_child_header
+
+    if await managed_child_header(store, record):
+        raise ManagedChildControlError(record.id)
 
 
 def _cascade_order(subtree: Any) -> list[str]:
@@ -998,6 +1008,13 @@ class Agent:
             raise ValueError("Agent requires a provider. Pass provider= to the constructor.")
         return self._provider
 
+    def _refuse_managed_entry(self, operation: str, run_id: str | None) -> None:
+        """This build runs managed workflows through run() and reclaim() only (T2b)."""
+        if self._subagents:
+            from dendrux.errors import ManagedUnsupportedError
+
+            raise ManagedUnsupportedError(operation, run_id)
+
     def _resolve_run_max_delegation_depth(
         self, requested: int | None | _UnsetType
     ) -> int | None | _UnsetType:
@@ -1605,6 +1622,7 @@ class Agent:
             context=kwargs.get("context"),
             provider_kwargs=kwargs,
         )
+        self._refuse_managed_entry("retry", run_id)
         provider = self._require_provider()
         store = await self._resolve_state_store()
 
@@ -1613,6 +1631,9 @@ class Agent:
                 "retry() requires persistence (database_url or state_store). "
                 "Retry reads traces from the original run."
             )
+        source = await store.get_run(run_id)
+        if source is not None and _in_tenant_scope(source, tenant_id):
+            await _refuse_managed_child(store, source)
 
         from dendrux.runtime.runner import retry as runner_retry
 
@@ -1656,6 +1677,14 @@ class Agent:
         store = await self._resolve_state_store()
         if store is None:
             raise PersistenceNotConfiguredError()
+        if self._subagents:
+            from dendrux.runtime import _managed
+
+            # A managed root reconnects through its persisted bindings (0.7).
+            await _require_run_in_scope(store, run_id, tenant_id)
+            return await _managed.reconnect(
+                self, store, run_id, tenant_id=tenant_id, item=item, notifier=notifier
+            )
         return await reclaim(self, store, run_id, tenant_id=tenant_id, item=item, notifier=notifier)
 
     async def resume(
@@ -1708,6 +1737,7 @@ class Agent:
             tool_results=tool_results,
             user_input=user_input,
         )
+        self._refuse_managed_entry("resume", run_id)
         # Validate args before any I/O
         provider = self._require_provider()
         if tool_results is not None and user_input is not None:
@@ -1834,6 +1864,7 @@ class Agent:
             run_id=run_id,
             tool_results=results,
         )
+        self._refuse_managed_entry("submit_tool_results", run_id)
         from dendrux.errors import PersistenceNotConfiguredError
         from dendrux.runtime.runner import resume_claimed
         from dendrux.runtime.submit import (
@@ -1936,6 +1967,7 @@ class Agent:
             run_id=run_id,
             user_input=text,
         )
+        self._refuse_managed_entry("submit_input", run_id)
         from dendrux.errors import PersistenceNotConfiguredError
         from dendrux.runtime.runner import resume_claimed
         from dendrux.runtime.submit import claim_or_raise
@@ -2070,6 +2102,7 @@ class Agent:
             rejection_reason=rejection_reason,
             decisions=decisions,
         )
+        self._refuse_managed_entry("submit_approval", run_id)
         from dendrux.errors import PersistenceNotConfiguredError
         from dendrux.runtime.runner import resume_approval_approved_claim, resume_claimed
         from dendrux.runtime.submit import (
@@ -2371,6 +2404,7 @@ class Agent:
         record = await store.get_run(run_id)
         if record is None or not _in_tenant_scope(record, tenant_id):
             raise RunNotFoundError(run_id)
+        await _refuse_managed_child(store, record)
 
         outcomes: list[dict[str, str]] = []
         cascade_count = 0
@@ -2606,6 +2640,7 @@ class Agent:
         tenant_id = entry_checks(
             self, "request_pause", tenant_id, default_tenant=UNSCOPED, run_id=run_id, reason=reason
         )
+        self._refuse_managed_entry("request_pause", run_id)
         from dendrux.errors import PersistenceNotConfiguredError, RunNotFoundError
         from dendrux.types import PauseOutcome, RunStatus
 
@@ -2622,6 +2657,7 @@ class Agent:
         record = await store.get_run(run_id)
         if record is None or not _in_tenant_scope(record, tenant_id):
             raise RunNotFoundError(run_id)
+        await _refuse_managed_child(store, record)
 
         store_request_pause = require_store_method(store, "request_pause")
         order = [run_id]
@@ -2691,6 +2727,7 @@ class Agent:
         tenant_id = entry_checks(
             self, "submit_resume", tenant_id, default_tenant=UNSCOPED, run_id=run_id
         )
+        self._refuse_managed_entry("submit_resume", run_id)
         from dendrux.errors import PersistenceNotConfiguredError
         from dendrux.runtime.runner import resume_paused_claim
         from dendrux.runtime.submit import claim_or_raise
@@ -2986,6 +3023,7 @@ class Agent:
             context=context,
             provider_kwargs=kwargs,
         )
+        self._refuse_managed_entry("stream", None)
         _validate_max_delegation_depth(max_delegation_depth)
 
         if self._guardrails:
@@ -3087,6 +3125,7 @@ class Agent:
             tool_results=tool_results,
             user_input=user_input,
         )
+        self._refuse_managed_entry("resume_stream", run_id)
         if self._guardrails:
             raise ValueError(
                 "guardrails are not supported with resume_stream() in this version. "
