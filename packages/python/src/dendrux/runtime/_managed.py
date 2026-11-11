@@ -15,7 +15,14 @@ For ``await root.run(task)`` on an Agent with ``subagents=``:
    then continues from its checkpoint, never from an old frame.
 
 :func:`reconnect` runs the same adoption and continuation after a restart; no
-step exists only in memory. Stream, resume and submit routing are T3.
+step exists only in memory.
+
+Root routing (T3): a root-id continuation (``submit_*``, ``resume``,
+``resume_stream``) reaches the active leaf through the persisted bindings
+(:func:`route`), is validated and claimed with the leaf's own definition, and
+:func:`unwind` adopts finished outcomes back up to the root.
+:func:`workflow_stream` drives the same transitions for ``stream`` and
+``resume_stream``, advancing each run's generator in the caller's task.
 """
 
 from __future__ import annotations
@@ -45,6 +52,7 @@ if TYPE_CHECKING:
     from dendrux.agent import Agent
     from dendrux.loops.base import LoopNotifier, LoopRecorder
     from dendrux.runtime.state import EventWrite, RunRecord, StateStore
+    from dendrux.types import RunStream
 
 logger = logging.getLogger(__name__)
 
@@ -155,6 +163,25 @@ def _check_definitions(root: Agent, store: Any) -> None:
         ):
             raise ValueError(f"Subagent '{child.name}' must use the root's store object or none.")
         stack.extend((child, grandchild) for grandchild in child.subagents)
+
+
+def require_streamable(root: Agent, entry: str) -> None:
+    """Streaming a workflow needs every subagent to be streamable (no guardrails).
+
+    The stream path never scans with guardrails, so a subagent that declares
+    them is refused before anything runs, as the root itself is.
+    """
+    stack = list(root.subagents)
+    seen = 0
+    while stack and seen < _MAX_WALK:
+        child = stack.pop()
+        seen += 1
+        if child.guardrails or getattr(child, "_output_type", None) is not None:
+            raise ValueError(
+                f"{entry}() cannot stream subagent '{child.name}': it declares guardrails "
+                "or output_type. Use run() for this workflow."
+            )
+        stack.extend(child.subagents)
 
 
 def _require_react(parent: Agent, child: Agent) -> None:
@@ -462,11 +489,9 @@ async def _run_child(
     parent as the result: cancelled when the parent's cancel won, else the
     parent records the failure and the error propagates.
     """
-    from dendrux.errors import RunCancelledError, RunFencedError
     from dendrux.runtime._subagents import _tighten
     from dendrux.runtime.context import managed_invocation_scope
     from dendrux.runtime.runner import _run_once
-    from dendrux.types import RunAlreadyActiveError
 
     child = invocation.child
     try:
@@ -474,7 +499,7 @@ async def _run_child(
             result = await _run_once(
                 child,
                 provider=child._require_provider(),
-                user_input=str((invocation.call.params or {}).get("task", "")),
+                user_input=_task(invocation),
                 state_store=invocation.store,
                 tenant_id=invocation.tenant_id,
                 extra_notifier=notifier,
@@ -482,23 +507,43 @@ async def _run_child(
                 max_delegation_depth=_tighten(invocation.max_depth, child.max_delegation_depth),
                 output_type=getattr(child, "_output_type", None),
             )
-    except RunAlreadyActiveError:
+    except Exception as exc:
+        return await _after_child_error(invocation, exc)
+    return result, not (result.meta or {}).get(NOT_OWNER_KEY)
+
+
+def _task(invocation: ManagedInvocation) -> str:
+    return str((invocation.call.params or {}).get("task", ""))
+
+
+async def _after_child_error(
+    invocation: ManagedInvocation, exc: Exception
+) -> tuple[RunResult, bool]:
+    """The child's run raised: ``(result, bound)``, or re-raise ``exc``.
+
+    Shared by the run and stream drivers. Bound by another caller: not the
+    owner. Never bound: the parent is cancelled when its cancel won, else it
+    records the failure and ``exc`` propagates. A bound child that ended
+    terminal is adopted like any terminal child.
+    """
+    from dendrux.errors import RunCancelledError, RunFencedError
+    from dendrux.types import RunAlreadyActiveError
+
+    if isinstance(exc, RunAlreadyActiveError):
         return not_owner_result(invocation.parent_run_id), False  # bound by another caller
-    except (RunCancelledError, RunFencedError) as exc:
-        if await invocation.store.get_run(invocation.child_run_id) is not None:
-            raise
+    record = await invocation.store.get_run(invocation.child_run_id)
+    if isinstance(exc, (RunCancelledError, RunFencedError)):
+        if record is not None:
+            raise exc
         if isinstance(exc, RunFencedError):
             return not_owner_result(invocation.parent_run_id), False
         return await _cancel_parent(invocation), False
-    except Exception as exc:
-        record = await invocation.store.get_run(invocation.child_run_id)
-        if record is None:
-            await _fail_parent(invocation, exc)
-            raise
-        if record.status not in {s.value for s in TERMINAL_STATUSES}:
-            raise
-        return await _terminal_child(invocation.store, record.id), True
-    return result, not (result.meta or {}).get(NOT_OWNER_KEY)
+    if record is None:
+        await _fail_parent(invocation, exc)
+        raise exc
+    if record.status not in {s.value for s in TERMINAL_STATUSES}:
+        raise exc
+    return await _terminal_child(invocation.store, record.id), True
 
 
 async def _terminal_child(store: Any, child_run_id: str) -> RunResult:
@@ -731,6 +776,21 @@ async def project_report(
 async def adopt(waiting: _Waiting, *, store: Any, notifier: LoopNotifier | None) -> RunResult:
     """Accept a terminal child's saved outcome into its parent, then continue the parent."""
     from dendrux.runtime import _reclaim
+
+    claimed = await claim_adoption(waiting, store)
+    if claimed is None:
+        return not_owner_result(waiting.parent_run_id)
+    return await _reclaim.continue_claimed(
+        waiting.parent_agent, store, waiting.parent_run_id, claimed, notifier=notifier
+    )
+
+
+async def claim_adoption(waiting: _Waiting, store: Any) -> Any:
+    """Durably adopt a terminal child into its parent; the parent's new claim, or None.
+
+    None when the child is not terminal or another caller won the parent's
+    claim. The returned claim owns the parent's continuation.
+    """
     from dendrux.runtime.state import ClaimResult, claimed_store
     from dendrux.runtime.submit import claim_managed_adoption
 
@@ -738,7 +798,7 @@ async def adopt(waiting: _Waiting, *, store: Any, notifier: LoopNotifier | None)
     if record is None:
         raise ManagedStateError(reason="child_missing", run_id=waiting.parent_run_id)
     if record.status not in {s.value for s in TERMINAL_STATUSES}:
-        return not_owner_result(waiting.parent_run_id)
+        return None
     accepted = await accept_report(waiting, record, store)
     claim = await claim_managed_adoption(
         store,
@@ -750,7 +810,7 @@ async def adopt(waiting: _Waiting, *, store: Any, notifier: LoopNotifier | None)
         blocked=accepted.blocked,
     )
     if not isinstance(claim, ClaimResult):
-        return not_owner_result(waiting.parent_run_id)
+        return None
     owned = claimed_store(store, waiting.parent_run_id, claim)
     state = await complete_adoption(
         owned,
@@ -760,13 +820,7 @@ async def adopt(waiting: _Waiting, *, store: Any, notifier: LoopNotifier | None)
         child_run_id=record.id,
         path=waiting.child_path,
     )
-    return await _reclaim.continue_claimed(
-        waiting.parent_agent,
-        store,
-        waiting.parent_run_id,
-        ClaimResult(claim.claim_epoch, claim.storage_format, state, None),
-        notifier=notifier,
-    )
+    return ClaimResult(claim.claim_epoch, claim.storage_format, state, None)
 
 
 async def complete_adoption(
@@ -885,6 +939,353 @@ async def adopt_terminal_leaf(found: Route, store: Any, *, notifier: Any) -> Run
     return await _trampoline(
         result, waiting, root_run_id=found.root_run_id, store=shared, notifier=notifier
     )
+
+
+# ---------------------------------------------------------------------------
+# Streaming: the same trampoline, advancing each run's generator in this task
+# ---------------------------------------------------------------------------
+
+_CHILD_HIDDEN = frozenset({"text_delta", "reasoning_delta", "run_started", "run_resumed"})
+"""Subagent events the workflow stream never forwards: text and lifecycle stay per run."""
+_LIFECYCLE_STARTS = frozenset({"run_started", "run_resumed"})
+_TERMINAL_EVENTS = frozenset({"run_completed", "run_paused", "run_error", "run_cancelled"})
+
+
+@dataclass
+class _StreamState:
+    """What the workflow stream's cleanup needs (mutable, one stream)."""
+
+    root_agent: Agent
+    store: Any = None
+    root_run_id: str | None = None
+    tenant_id: Any = None
+    current: Any = None
+    waiting: list[_Waiting] | None = None
+    root_active: bool = True
+    """The active leg is the root's own: closing it cancels the root by itself."""
+
+
+def _forwarded(event: Any, run_id: str | None, *, root_level: bool, first: bool) -> Any:
+    """A root event as is; a subagent's progress tagged with its run id, never its text."""
+    kind = getattr(event.type, "value", event.type)
+    if root_level:
+        return None if (not first and kind in _LIFECYCLE_STARTS) else event
+    if kind in _CHILD_HIDDEN:
+        return None
+    return replace(event, run_id=run_id)
+
+
+def _child_stream(invocation: ManagedInvocation, notifier: Any) -> Any:
+    """The bound child's own stream (created by the atomic bind on first step)."""
+    from dendrux.runtime._subagents import _tighten
+    from dendrux.runtime.runner import run_stream
+
+    child = invocation.child
+    return run_stream(
+        child,
+        provider=child._require_provider(),
+        user_input=_task(invocation),
+        state_store=invocation.store,
+        tenant_id=invocation.tenant_id,
+        extra_notifier=notifier,
+        max_delegation_depth=_tighten(invocation.max_depth, child.max_delegation_depth),
+        _managed_invocation=invocation,
+    )
+
+
+def _continuation_stream(waiting: _Waiting, store: Any, claim: Any, notifier: Any) -> Any:
+    """The adopting parent's continuation, streamed from its checkpoint under ``claim``."""
+    from dendrux.runtime.runner import resume_stream
+
+    parent = waiting.parent_agent
+    return resume_stream(
+        waiting.parent_run_id,
+        agent=parent,
+        provider=parent._require_provider(),
+        state_store=store,
+        extra_notifier=notifier,
+        _claimed=claim,
+    )
+
+
+def _event(result: RunResult) -> Any:
+    """The workflow stream's terminal event for a root-facing result."""
+    from dendrux.types import RunEvent, RunEventType
+
+    kind = {
+        RunStatus.SUCCESS: RunEventType.RUN_COMPLETED,
+        RunStatus.MAX_ITERATIONS: RunEventType.RUN_COMPLETED,
+        RunStatus.ERROR: RunEventType.RUN_ERROR,
+        RunStatus.CANCELLED: RunEventType.RUN_CANCELLED,
+    }.get(result.status, RunEventType.RUN_PAUSED)
+    return RunEvent(type=kind, run_result=result, run_id=result.run_id, error=result.error)
+
+
+async def _drain(stream: Any, *, root_level: bool, first: bool) -> Any:
+    """Yield one run's forwarded events; the last item is its terminal event (or None).
+
+    The run's own stream is closed here, in this task, however iteration ends.
+    """
+    from contextlib import aclosing
+
+    terminal = None
+    async with aclosing(stream.__aiter__()) as events:
+        async for event in events:
+            if getattr(event.type, "value", event.type) in _TERMINAL_EVENTS:
+                terminal = event
+                continue
+            out = _forwarded(event, stream.run_id, root_level=root_level, first=first)
+            if out is not None:
+                yield out
+    yield _Terminal(terminal)
+
+
+@dataclass(frozen=True)
+class _Terminal:
+    event: Any
+
+
+async def _drive_stream(first: Any, state: _StreamState, *, notifier: Any) -> Any:
+    """Advance each run of the branch in this task, adopting and unwinding to the root.
+
+    Same transitions as :func:`_trampoline`: a handoff streams the bound
+    child; an external leaf pause ends the stream with the root-facing pause;
+    a terminal child is adopted and its parent's continuation is streamed.
+    Only the root's own completion ends the stream as the root's result.
+    """
+    from contextlib import aclosing
+
+    waiting = state.waiting if state.waiting is not None else []
+    state.waiting = waiting
+    stream, invocation, first_leg = first, None, True
+    for _ in range(_MAX_STEPS):
+        state.current = stream
+        terminal = None
+        try:
+            # A run is the root's own leg only when nothing waits and no child is binding.
+            root_level = not waiting and invocation is None
+            state.root_active = root_level
+            items = _drain(stream, root_level=root_level, first=first_leg)
+            async with aclosing(items):
+                async for item in items:
+                    if isinstance(item, _Terminal):
+                        terminal = item.event
+                    else:
+                        yield item
+        except Exception as exc:
+            if invocation is None:
+                raise
+            # Before its bind the child is not a run: decide for its parent.
+            result, bound = await _after_child_error(invocation, exc)
+        else:
+            if terminal is None:
+                raise ManagedStateError(reason="binding_conflict", run_id=state.root_run_id)
+            result, bound = terminal.run_result, invocation is not None
+        if state.root_run_id is None:
+            state.root_run_id = stream.run_id
+        if invocation is not None and bound:
+            waiting.append(_waiting_from(invocation))
+        invocation, first_leg = None, False
+        if (result.meta or {}).get(NOT_OWNER_KEY):
+            yield _event(await root_view(state.store, state.root_run_id))
+            return
+        if is_descend(result):
+            invocation = result.meta[DESCEND_KEY]
+            state.tenant_id = invocation.tenant_id
+            stream = _child_stream(invocation, notifier)
+            continue
+        if not waiting:
+            yield terminal if terminal is not None else _event(result)
+            return
+        if result.status not in TERMINAL_STATUSES:
+            yield _event(await _paused_or_failed(state, waiting, result, terminal))
+            return
+        claim = await claim_adoption(waiting[-1], state.store)
+        if claim is None:
+            yield _event(await root_view(state.store, state.root_run_id))
+            return
+        stream = _continuation_stream(waiting.pop(), state.store, claim, notifier)
+    raise ManagedStateError(reason="binding_conflict", run_id=state.root_run_id)
+
+
+async def _paused_or_failed(
+    state: _StreamState, waiting: list[_Waiting], result: RunResult, terminal: Any
+) -> RunResult:
+    """A leaf that stopped short of terminal: its pause through the root, or a failed attempt.
+
+    A continuation attempt that failed and released its claim reports the
+    root-facing state with the attempt's error (the leaf keeps waiting).
+    """
+    root_run_id = str(state.root_run_id)
+    if getattr(getattr(terminal, "type", None), "value", None) == "run_error":
+        view = await root_view(state.store, root_run_id)
+        view.error = result.error
+        view.error_info = result.error_info
+        return view
+    return await _projected_pause(state.store, root_run_id, waiting, result)
+
+
+def workflow_stream(
+    root_agent: Agent,
+    open_first: Callable[[_StreamState], Any],
+    *,
+    run_id: str,
+    notifier: Any,
+) -> RunStream:
+    """A managed workflow's RunStream: one root-facing stream over every run it drives.
+
+    ``open_first`` resolves the store and routing lazily on first iteration and
+    returns ``(first stream, first event or None)``; it raises (before anything
+    is claimed) for not found, a child id or a missing token. Once driving, a
+    failure ends the stream with a root-facing ``RUN_ERROR``. Closing the stream
+    early cancels the active run through its own stream and, while the root
+    waits on a subagent, cancels the root with its descendants.
+    """
+    from contextlib import aclosing
+
+    from dendrux.types import RunEvent, RunEventType
+    from dendrux.types import RunStream as _RunStream
+
+    state = _StreamState(root_agent)
+
+    async def _generate() -> Any:
+        first, opening = await open_first(state)
+        if opening is not None:
+            yield opening
+        driven = _drive_stream(first, state, notifier=notifier)
+        try:
+            async with aclosing(driven):
+                async for event in driven:
+                    if state.root_run_id is not None:
+                        stream.run_id = state.root_run_id
+                    yield event
+        except Exception as exc:
+            yield await _stream_failure(state, exc)
+
+    async def _stream_failure(state: _StreamState, exc: Exception) -> Any:
+        from dendrux.runtime.runner import _safe_error
+
+        error = _safe_error(exc)
+        if state.root_run_id is None or state.store is None:
+            result = RunResult(run_id=stream.run_id, status=RunStatus.ERROR, error=error)
+        else:
+            result = await root_view(state.store, state.root_run_id)
+            result.error = error
+        result.meta["error_type"] = type(exc).__name__
+        state.root_active = True  # nothing to cancel: the failure is reported, not abandoned
+        return RunEvent(
+            type=RunEventType.RUN_ERROR, run_result=result, run_id=result.run_id, error=error
+        )
+
+    async def _cleanup() -> RunResult | None:
+        current = state.current
+        result = None
+        if current is not None:
+            await current.aclose()
+            result = current.result
+        if not state.root_active and state.root_run_id is not None:
+            await root_agent.cancel_run(state.root_run_id, cascade=True, tenant_id=state.tenant_id)
+            result = await root_view(state.store, state.root_run_id)
+        return result
+
+    stream = _RunStream(run_id=run_id, generator=_generate(), cleanup=_cleanup)
+    return stream
+
+
+def start_stream(root_agent: Agent, root_stream: Any, *, notifier: Any) -> RunStream:
+    """``Agent.stream`` on a managed root: the root's stream, then whatever it hands off."""
+
+    async def open_first(state: _StreamState) -> Any:
+        state.store = await root_agent._resolve_state_store()
+        return root_stream, None
+
+    return workflow_stream(root_agent, open_first, run_id=root_stream.run_id, notifier=notifier)
+
+
+def routed_stream(
+    root_agent: Agent,
+    run_id: str,
+    *,
+    tenant_id: Any,
+    tool_results: Any,
+    user_input: Any,
+    expected_pause_id: str | None,
+    notifier: Any,
+    tenant_explicit: bool,
+) -> RunStream:
+    """``Agent.resume_stream`` on a managed root, routed to the active leaf (0.7).
+
+    Routing errors (not found, a child id, a missing token) raise from the
+    first iteration before anything is claimed. A payload-free resume adopts a
+    finished subagent without a token.
+    """
+    from dendrux.runtime.runner import resume_stream
+    from dendrux.types import RunEvent, RunEventType
+
+    async def open_first(state: _StreamState) -> Any:
+        state.store = store = await root_agent._resolve_state_store()
+        found = await route(root_agent, store, run_id, tenant_id=tenant_id)
+        state.root_run_id, state.tenant_id = run_id, found.tenant_id
+        resumed = RunEvent(type=RunEventType.RUN_RESUMED, run_id=run_id)
+        no_payload = tool_results is None and user_input is None
+        if no_payload and found.routed and found.leaf.status in _TERMINAL_VALUES:
+            waiting = list(found.waiting)
+            claim = await claim_adoption(waiting[-1], store)
+            if claim is None:
+                state.waiting = []
+                return _Single(_event(await root_view(store, run_id))), None
+            first = _continuation_stream(waiting.pop(), store, claim, notifier)
+            state.waiting = waiting
+            # The root's own continuation opens with its RUN_RESUMED.
+            return first, (resumed if waiting else None)
+        require_leaf_pause(found, expected_pause_id)
+        leaf = found.leaf_agent
+        if found.routed:
+            from dendrux.runtime._entry_checks import entry_checks
+            from dendrux.runtime.state import UNSCOPED
+
+            entry_checks(
+                leaf,
+                "resume_stream",
+                found.tenant_id,
+                default_tenant=UNSCOPED,
+                run_id=found.leaf.id,
+                tool_results=tool_results,
+                user_input=user_input,
+            )
+        first = resume_stream(
+            found.leaf.id,
+            agent=leaf,
+            provider=leaf._require_provider(),
+            state_store=store,
+            tool_results=tool_results,
+            user_input=user_input,
+            extra_notifier=notifier,
+            expected_pause_id=expected_pause_id,
+            _tenant_explicit=tenant_explicit,
+        )
+        state.waiting = list(found.waiting)
+        return first, (resumed if found.routed else None)
+
+    return workflow_stream(root_agent, open_first, run_id=run_id, notifier=notifier)
+
+
+_TERMINAL_VALUES = frozenset(s.value for s in TERMINAL_STATUSES)
+
+
+class _Single:
+    """A one-event stream: the root-facing state when nothing can be continued."""
+
+    def __init__(self, event: Any) -> None:
+        self._event = event
+        self.run_id = event.run_id
+        self.result = event.run_result
+
+    async def __aiter__(self) -> Any:
+        yield self._event
+
+    async def aclose(self) -> None:
+        return None
 
 
 # ---------------------------------------------------------------------------

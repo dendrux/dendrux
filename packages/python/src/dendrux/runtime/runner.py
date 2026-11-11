@@ -1037,6 +1037,8 @@ async def _finish_stream_event(
             event = RunEvent(type=RunEventType.RUN_CANCELLED, run_result=result)
         else:
             event = RunEvent(type=event.type, run_result=result, phase=event.phase)
+        if MANAGED_DESCEND_KEY in result.meta:
+            return event  # Not finished: the parent continues after its child is adopted.
     await record_run_finished(recorder, run_id, result)
     await notify_run_finished(notifier, run_id, result)
     if state_store is None:
@@ -4214,10 +4216,10 @@ def _cached_stream_event(cached: RunResult, run_id: str) -> RunEvent:
 
 
 def _stream_entry_checks(
-    agent: Agent, tenant_id: str | None, shared: dict[str, Any], **checks: Any
+    agent: Agent, tenant_id: str | None, shared: dict[str, Any], parent_ctx: Any, **checks: Any
 ) -> None:
     try:
-        entry_tenant = resolve_child_tenant(get_delegation_context(), tenant_id)
+        entry_tenant = resolve_child_tenant(parent_ctx, tenant_id)
     except ValueError:
         return
     shared["existing_run"] = True
@@ -4332,6 +4334,7 @@ def run_stream(
     max_delegation_depth: int | None | _UnsetType = _UNSET_DEPTH,
     idempotency_key: str | None = None,
     output_type: type | None = None,
+    _managed_invocation: Any = None,
     **kwargs: Any,
 ) -> RunStream:
     """Stream an agent run as RunEvents, returning a RunStream.
@@ -4354,7 +4357,15 @@ def run_stream(
       - Loop yields execution outcomes (RUN_COMPLETED, RUN_PAUSED) and
         intermediate events (TEXT_DELTA, TOOL_USE_*, TOOL_RESULT).
       - Runner persists loop outcomes before forwarding them.
+
+    ``_managed_invocation`` (internal, 0.7): stream a managed child created by
+    its parent's atomic bind instead of ``create_run``. Its id, parent link,
+    tenant and depth come from the invocation; a failure before the bind
+    raises to the managed driver instead of yielding ``RUN_ERROR``.
     """
+    from dendrux.runtime import _managed
+
+    invocation = _managed_invocation
     # Validate depth early — synchronous, before generator starts.
     # Full resolution (parent context, clamping) happens inside _generate()
     # because parent_ctx requires async state_store resolution first.
@@ -4408,7 +4419,8 @@ def run_stream(
             initial_seeded = None
     provider_kwargs = dict(kwargs)
 
-    run_id = generate_ulid()
+    # A managed child's id is its parent's bind candidate, minted at the handoff.
+    run_id = _managed.new_run_id(invocation)
 
     # Shared mutable state — generator populates on first iteration,
     # cleanup reads if the consumer abandons after setup.
@@ -4442,10 +4454,13 @@ def run_stream(
         # setup they raise (no RUN_ERROR event, no run row, no hooks). A child
         # whose explicit tenant differs from its parent's still fails later, as
         # RUN_ERROR, exactly as before.
+        # A managed child never inherits the caller's delegation context.
+        entry_parent = _managed.parent_context(invocation, get_delegation_context)
         _stream_entry_checks(
             agent,
             tenant_id,
             _shared,
+            entry_parent,
             metadata=metadata,
             user_input=entry_user_input,
             history=history,
@@ -4502,10 +4517,11 @@ def run_stream(
             _shared["state_store"] = store
 
             # --- Delegation context ---
-            parent_ctx = get_delegation_context()
-            parent_run_id, delegation_level = resolve_parent_link(parent_ctx, store)
+            parent_ctx = _managed.parent_context(invocation, get_delegation_context)
+            parent_run_id, delegation_level = _managed.parent_link(invocation, parent_ctx, store)
             eff_max_depth = _resolve_max_delegation_depth(max_delegation_depth, parent_ctx)
             eff_tenant = resolve_child_tenant(parent_ctx, tenant_id)
+            managed_root = await _managed.enter(agent, invocation, store, resolved_loop)
             if image_runtime is None and _accepts_kwarg(resolved_loop.run_stream, "image_runtime"):
                 image_runtime = _image_runtime(agent, store, eff_tenant, run_id)
 
@@ -4554,7 +4570,8 @@ def run_stream(
                         context=context,
                         user_parts=user_parts,
                     )
-                    create_result = await _create_runtime_run(
+                    created = await _create_projected_run(
+                        False,
                         store,
                         resolved_loop,
                         run_id,
@@ -4570,7 +4587,10 @@ def run_stream(
                         idempotency_fingerprint=fingerprint,
                         **_input_edge_kwargs(image_runtime, user_parts),
                         **seed_kwargs,
+                        invocation=invocation,
                     )
+                    # A child bound by another caller reads as existing_active below.
+                    create_result, child_claim = _managed_creation(created)
                 except IdempotencyConflictError:
                     # No row was created and no lifecycle opened; the error
                     # handler must not fire failure hooks for a run that
@@ -4589,7 +4609,9 @@ def run_stream(
                 store = claimed_store(
                     store,
                     run_id,
-                    ClaimResult(
+                    # A managed child's token comes from its bind and carries its header.
+                    child_claim
+                    or ClaimResult(
                         0,
                         create_result.storage_format,
                         _initial_loop_state(_recovery_loop_name(resolved_loop))
@@ -4598,6 +4620,8 @@ def run_stream(
                         None,
                     ),
                 )
+                if managed_root:
+                    _managed.stamp_root_header(store, run_id)
                 _shared["state_store"] = store
                 _shared["claimed"] = True
 
@@ -4721,6 +4745,10 @@ def run_stream(
             yield _fenced_stream_event(run_id, result)
 
         except Exception as exc:
+            if invocation is not None and not _shared.get("claimed"):
+                # Before its bind a managed child is not a run: the driver decides
+                # for its parent, exactly as for run() (0.7).
+                raise
             # Persist error, yield RUN_ERROR, return cleanly. No re-raise.
             # Covers both setup failures and loop execution errors.
             await _stream_run_failure(store, _shared, startup.recorder, extra_notifier, run_id, exc)
@@ -7465,6 +7493,49 @@ async def _stream_resume_state(
     return run_record, reads, raw_pause, pause_state, recovering, stream_results
 
 
+async def _stream_claimed_state(
+    agent: Agent,
+    store: StateStore,
+    run_id: str,
+    claim: ClaimResult,
+    stream_context: StreamContext,
+) -> tuple[StateStore, Any, _PauseReads, PauseState | RunResult]:
+    """An owned run's continuation state, rebuilt from its checkpoint (0.7 adoption).
+
+    The same reads and stop checks as reclaim's continuation: a marked run stops
+    before any model call (its stop result is returned instead of a pause); a
+    rebuild failure is recorded like a reclaim's.
+    """
+    from dendrux.errors import ManagedStateError
+    from dendrux.skills._session import SkillSession
+
+    session = SkillSession.prepare(agent)
+    session.run_id = run_id
+    stream_context.set_session(session)
+    owned = claimed_store(store, run_id, claim)
+    state = claim.loop_state or {}
+    if state.get("submission"):
+        # Adoption completes its submission atomically; anything else is not ours.
+        raise ManagedStateError(reason="binding_outstanding", run_id=run_id)
+    history_records: list[Any] = []
+    async with _reclaim._reclaim_setup(owned, run_id):
+        record = await owned.get_run(run_id)
+        stopped = await _stop_marked_continuation(
+            owned,
+            run_id,
+            record,
+            agent=agent,
+            iteration=state.get("iteration", 0),
+            usage=_usage_from_dict(state.get("usage", {})),
+        )
+        if stopped is not None:
+            return owned, record, _PauseReads(record), stopped
+        pause = await _reclaim.rebuild_pause(
+            agent, owned, run_id, state, history_records=history_records
+        )
+    return owned, record, _PauseReads(record, history_records=history_records), pause
+
+
 def _stopped_stream_event(result: RunResult) -> RunEvent:
     from dendrux.types import RunEvent
 
@@ -7658,11 +7729,16 @@ def resume_stream(
     extra_notifier: LoopNotifier | None = None,
     expected_pause_id: str | None = None,
     _tenant_explicit: bool | None = None,
+    _claimed: ClaimResult | None = None,
 ) -> RunStream:
     """Stream a resumed run as RunEvents, returning a RunStream.
 
     Synchronous — returns immediately. All async setup (store resolution,
     pause state load, claim, history build) runs lazily on first iteration.
+
+    ``_claimed`` (internal, 0.7): continue a run this caller already owns
+    (a managed parent claimed for adoption) from its checkpoint, exactly as
+    reclaim's continuation does, instead of loading a pause and claiming it.
 
     Execution exceptions yield RUN_ERROR events. Before consumption or work,
     cleanup can release the claim; the result reports the observed status and
@@ -7708,51 +7784,62 @@ def resume_stream(
 
             await ensure_agent_limits_fit(agent, store)
 
-            (
-                run_record,
-                reads,
-                raw_pause,
-                pause_state,
-                recovering,
-                stream_results,
-            ) = await _stream_resume_state(
-                agent,
-                provider,
-                store,
-                run_id,
-                expected_pause_id,
-                stream_results,
-                results_prepared,
-                stream_context,
-            )
+            if _claimed is not None:
+                store, run_record, reads, rebuilt = await _stream_claimed_state(
+                    agent, store, run_id, _claimed, stream_context
+                )
+                _shared["state_store"] = store
+                _shared["claimed"] = True
+                if isinstance(rebuilt, RunResult):
+                    yield _fenced_stream_event(run_id, rebuilt)
+                    return
+                pause_state, raw_pause, recovering = rebuilt, None, True
+                expected = RunStatus.RUNNING.value
+            else:
+                (
+                    run_record,
+                    reads,
+                    raw_pause,
+                    pause_state,
+                    recovering,
+                    stream_results,
+                ) = await _stream_resume_state(
+                    agent,
+                    provider,
+                    store,
+                    run_id,
+                    expected_pause_id,
+                    stream_results,
+                    results_prepared,
+                    stream_context,
+                )
 
-            # 4. Determine expected status and claim
-            expected = _resume_expected_status(stream_results, user_input)
+                # 4. Determine expected status and claim
+                expected = _resume_expected_status(stream_results, user_input)
 
-            store, expected, raw_pause = await _claim_resume(
-                store,
-                run_id,
-                raw_pause,
-                agent,
-                expected,
-                expected_pause_id=expected_pause_id,
-                results=stream_results,
-                user_input=user_input,
-                user_parts=user_parts,
-                checkpoint=reads.checkpoint,
-                on_release=partial(_remember_stream_release, _shared),
-            )
-            _shared["state_store"] = store
-            _shared["claimed"] = True
+                store, expected, raw_pause = await _claim_resume(
+                    store,
+                    run_id,
+                    raw_pause,
+                    agent,
+                    expected,
+                    expected_pause_id=expected_pause_id,
+                    results=stream_results,
+                    user_input=user_input,
+                    user_parts=user_parts,
+                    checkpoint=reads.checkpoint,
+                    on_release=partial(_remember_stream_release, _shared),
+                )
+                _shared["state_store"] = store
+                _shared["claimed"] = True
+                stopped = await _stop_marked_continuation(
+                    store, run_id, run_record, pause_state, agent=agent, claimed_here=True
+                )
+                if stopped is not None:
+                    yield _fenced_stream_event(run_id, stopped)
+                    return
             _shared["expected_status"] = expected
             progress = _shared["progress"] = _ResumeProgress()
-
-            stopped = await _stop_marked_continuation(
-                store, run_id, run_record, pause_state, agent=agent, claimed_here=True
-            )
-            if stopped is not None:
-                yield _fenced_stream_event(run_id, stopped)
-                return
 
             # 5. Prepare (shared helper — history, notifier).
             #    Does NOT fire any lifecycle hooks; that's done below inside

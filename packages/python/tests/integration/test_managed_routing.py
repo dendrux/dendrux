@@ -11,6 +11,7 @@ and Postgres (``DENDRUX_TEST_PG_URL``, a private ``*_test`` database).
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
@@ -98,6 +99,11 @@ async def read_sheet(sheet: str) -> str:
 @pytest.fixture
 def ask_questions(monkeypatch: pytest.MonkeyPatch) -> None:
     """Managed runs use the native strategy: text ending in '?' asks the human."""
+    patch_questions(monkeypatch)
+
+
+def patch_questions(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the native strategy treat text ending in '?' as a clarification question."""
     native = NativeToolCalling.parse_response
 
     def parse_response(self: NativeToolCalling, response: LLMResponse) -> AgentStep:
@@ -760,3 +766,163 @@ async def test_unscoped_trusted_caller_claims_with_the_roots_actual_tenant(
     await assert_unwound(engine, paused.run_id, result)
     child = await child_of(engine, paused.run_id)
     assert child.tenant_id == TENANT and published == ["d"]
+
+
+# ---------------------------------------------------------------------------
+# 5. The spec §3 journey, notes, and the root-vs-child control race
+# ---------------------------------------------------------------------------
+
+
+def journey(store: Any, *, restarted: bool = False) -> tuple[Agent, list[ContextLLM]]:
+    """lead -> reviewer -> auditor (approval). ``restarted``: a fresh process whose
+    providers continue after each run's first turn."""
+    skip = 1 if restarted else 0
+    llms = [
+        ContextLLM([call("publish", {"text": "A1"}, "a1"), done("auditor report")][skip:]),
+        ContextLLM([call("auditor", {"task": "audit"}, "t2"), done(CHILD_TEXT)][skip:]),
+        ContextLLM([call("reviewer", {"task": BRIEF}, "t1"), done("root done")][skip:]),
+    ]
+    grand = auditor(llms[0], tools=[publish], require_approval=["publish"])
+    child = reviewer(llms[1], subagents=[grand])
+    return lead(store, llms[2], child), llms
+
+
+async def event_types(engine: Any, run_id: str) -> list[str]:
+    from dendrux.db.models import RunEvent
+
+    found = await rows(engine, RunEvent, RunEvent.agent_run_id == run_id)
+    return [e.event_type for e in sorted(found, key=lambda e: e.sequence_index)]
+
+
+async def test_depth_two_journey_root_to_grandchild_approval_and_back(
+    store: Any, engine: Any
+) -> None:
+    """Spec §3 sample journey: R -> C -> G approval, restart, root-id submit, unwind."""
+    from dendrux.runtime.stores._factory import store_for_engine
+
+    published.clear()
+    first, _ = journey(store)
+    paused = await first.run("go", tenant_id=TENANT)
+    root_id = paused.run_id
+    middle = await child_of(engine, root_id)
+    leaf = await child_of(engine, middle.id)
+    assert paused.status == RunStatus.WAITING_APPROVAL
+    assert paused.pause_id == leaf.pause_data["pause_id"]
+    for parent in (await run_row(engine, root_id), middle):  # private waits, never the token
+        assert parent.pause_data["pause_id"] != paused.pause_id
+
+    # -- process exits; the caller reloads pending through a fresh store and Agent --
+    fresh_store = store_for_engine(engine)
+    pending = await RunStore(fresh_store).get_pending(root_id, tenant_id=TENANT)
+    assert pending.pause_id == paused.pause_id and pending.origin_run_id == leaf.id
+    restarted, llms = journey(fresh_store, restarted=True)
+    result = await restarted.submit_approval(
+        root_id, approved=True, expected_pause_id=pending.pause_id, tenant_id=TENANT
+    )
+
+    assert (result.run_id, result.status, result.answer) == (
+        root_id,
+        RunStatus.SUCCESS,
+        "root done",
+    )
+    assert published == ["A1"]
+    assert [llm.calls for llm in llms] == [1, 1, 1]  # each run's final turn, once
+    for run_id in (leaf.id, middle.id, root_id):
+        assert (await run_row(engine, run_id)).status == "success"
+        assert (await event_types(engine, run_id)).count("tool.completed") == 1
+    for run_id, report in ((middle.id, "auditor report"), (root_id, CHILD_TEXT)):
+        adopted = await observations(engine, run_id)
+        assert [json.loads(o.content) for o in adopted] == [report]
+    for parent_id in (root_id, middle.id):
+        intent = (await rows(engine, ToolCallRecord, ToolCallRecord.agent_run_id == parent_id))[0]
+        assert intent.outcome == "completed"
+    assert (await RunStore(fresh_store).get_pending(root_id, tenant_id=TENANT)) is None
+
+
+async def test_root_note_is_delivered_when_the_root_runs_again(store: Any, engine: Any) -> None:
+    """§5a: addressed-run notes; a root note is never forwarded to the active child."""
+    note = "SENTINEL-root-note-55e1"
+    root = build(store, "approval")
+    paused = await root.run("go", tenant_id=TENANT)
+    await root.submit_note(paused.run_id, note, tenant_id=TENANT)
+
+    result = await root.submit_approval(
+        paused.run_id, approved=True, tenant_id=TENANT, expected_pause_id=paused.pause_id
+    )
+
+    assert result.status == RunStatus.SUCCESS
+    child_llm = root.subagents[0].provider
+    root_llm = root.provider
+    assert all(note not in str(m.content) for batch in child_llm.messages for m in batch)
+    assert note not in "".join(str(m.content) for m in root_llm.messages[0])
+    assert any(note in str(m.content) for m in root_llm.messages[-1])
+    notes = await RunStore(store).get_notes(paused.run_id, tenant_id=TENANT)
+    assert [n.delivered_at is not None for n in notes] == [True]
+
+
+def _postgres(engine: Any) -> None:
+    if engine.dialect.name != "postgresql":
+        pytest.skip("independent-session contenders run on Postgres")
+
+
+async def test_pg_root_versus_child_control_race(store: Any, engine: Any) -> None:
+    """Concurrent root-id approvals and direct child controls on independent engines:
+    exactly one leaf claim, one effect, one adoption per parent; child controls change
+    nothing."""
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from dendrux.errors import RunAlreadyClaimedError
+    from dendrux.runtime.stores._factory import store_for_engine
+
+    _postgres(engine)
+    for _ in range(3):
+        published.clear()
+        first, _ = journey(store)
+        paused = await first.run("go", tenant_id=TENANT)
+        root_id = paused.run_id
+        middle = await child_of(engine, root_id)
+        leaf = await child_of(engine, middle.id)
+        second = create_async_engine(engine.url, pool_size=8)
+        try:
+            other = store_for_engine(second)
+            roots = [journey(store if i % 2 else other, restarted=True) for i in range(6)]
+            direct = [
+                auditor(
+                    ContextLLM([]),
+                    tools=[publish],
+                    require_approval=["publish"],
+                    state_store=store if i % 2 else other,
+                )
+                for i in range(4)
+            ]
+            attempts = [
+                agent.submit_approval(
+                    root_id, approved=True, tenant_id=TENANT, expected_pause_id=paused.pause_id
+                )
+                for agent, _ in roots
+            ] + [
+                d.submit_approval(
+                    leaf.id, approved=True, tenant_id=TENANT, expected_pause_id=paused.pause_id
+                )
+                for d in direct
+            ]
+            outcomes = await asyncio.gather(*attempts, return_exceptions=True)
+        finally:
+            await second.dispose()
+
+        root_outcomes, child_outcomes = outcomes[:6], outcomes[6:]
+        assert all(isinstance(o, ManagedChildControlError) for o in child_outcomes)
+        winners = [o for o in root_outcomes if not isinstance(o, BaseException)]
+        assert len(winners) == 1 and winners[0].status == RunStatus.SUCCESS
+        for loser in root_outcomes:
+            if isinstance(loser, BaseException):
+                assert isinstance(
+                    loser, (RunAlreadyClaimedError, PauseStatusMismatchError, RunNotPausedError)
+                ), repr(loser)
+        assert published == ["A1"]
+        assert sum(llm.calls for _, llms in roots for llm in llms) == 3
+        for run_id in (leaf.id, middle.id, root_id):
+            assert (await run_row(engine, run_id)).status == "success"
+            assert (await event_types(engine, run_id)).count("tool.completed") == 1
+        for run_id in (middle.id, root_id):
+            assert len(await observations(engine, run_id)) == 1

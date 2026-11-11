@@ -1009,7 +1009,7 @@ class Agent:
         return self._provider
 
     def _refuse_managed_entry(self, operation: str, run_id: str | None) -> None:
-        """This build runs managed workflows through run() and reclaim() only (T2b)."""
+        """Entries a managed workflow does not route yet refuse before any I/O (0.7)."""
         if self._subagents:
             from dendrux.errors import ManagedUnsupportedError
 
@@ -3256,7 +3256,6 @@ class Agent:
             context=context,
             provider_kwargs=kwargs,
         )
-        self._refuse_managed_entry("stream", None)
         _validate_max_delegation_depth(max_delegation_depth)
 
         if self._guardrails:
@@ -3265,6 +3264,10 @@ class Agent:
                 "Guardrails require the full response before scanning. "
                 "Use agent.run() instead."
             )
+        if self._subagents:
+            from dendrux.runtime import _managed
+
+            _managed.require_streamable(self, "stream")
 
         provider = self._require_provider()
 
@@ -3282,7 +3285,7 @@ class Agent:
         if not isinstance(resolved_depth, _UnsetType):
             stream_kwargs["max_delegation_depth"] = resolved_depth
 
-        return runner_run_stream(
+        stream = runner_run_stream(
             self,
             provider=provider,
             user_input=user_input,
@@ -3300,6 +3303,10 @@ class Agent:
             **stream_kwargs,
             **kwargs,
         )
+        if self._subagents:
+            # Subagents run in this task as the root's stream reaches them (0.7).
+            return _managed.start_stream(self, stream, notifier=notifier)
+        return stream
 
     def resume_stream(
         self,
@@ -3358,7 +3365,6 @@ class Agent:
             tool_results=tool_results,
             user_input=user_input,
         )
-        self._refuse_managed_entry("resume_stream", run_id)
         if self._guardrails:
             raise ValueError(
                 "guardrails are not supported with resume_stream() in this version. "
@@ -3367,6 +3373,21 @@ class Agent:
         provider = self._require_provider()
         if tool_results is not None and user_input is not None:
             raise ValueError("Cannot provide both tool_results and user_input to resume_stream().")
+        if self._subagents:
+            from dendrux.runtime import _managed
+
+            _managed.require_streamable(self, "resume_stream")
+            # Routed to the active leaf on first iteration (0.7).
+            return _managed.routed_stream(
+                self,
+                run_id,
+                tenant_id=tenant_id,
+                tool_results=tool_results,
+                user_input=user_input,
+                expected_pause_id=expected_pause_id,
+                notifier=notifier,
+                tenant_explicit=tenant_explicit,
+            )
 
         from dendrux.runtime.runner import resume_stream as runner_resume_stream
 
