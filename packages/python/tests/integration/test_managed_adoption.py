@@ -889,3 +889,74 @@ async def test_recovered_mixed_pending_batch_is_refused_before_effects(
     assert not await rows(engine, AgentRun, AgentRun.parent_run_id == root_id)
     row = (await rows(engine, AgentRun, AgentRun.id == root_id))[0]
     assert row.status != "waiting_client_tool"
+
+
+# ---------------------------------------------------------------------------
+# R2: terminal-child adoption keeps governance and skill-continuity admission
+# ---------------------------------------------------------------------------
+
+
+async def _untouched(engine: Any, root_id: str) -> tuple[Any, ...]:
+    row = (await rows(engine, AgentRun, AgentRun.id == root_id))[0]
+    intent = (await rows(engine, ToolCallRecord, ToolCallRecord.agent_run_id == root_id))[0]
+    return (
+        row.status,
+        row.claim_epoch,
+        "submission" in (row.pause_data or {}),
+        intent.outcome,
+        len(await observations(engine, root_id)),
+    )
+
+
+@pytest.mark.parametrize("change", ["guardrails", "approval", "skills"])
+async def test_changed_parent_definition_is_refused_before_adoption(
+    store: Any, engine: Any, monkeypatch: Any, change: str
+) -> None:
+    from dendrux.errors import GovernanceMismatchError
+    from dendrux.guardrails import SecretDetection
+    from dendrux.skills import Skill
+
+    root_id, _ = await crash_before_adoption(store, engine, monkeypatch)
+    before = await _untouched(engine, root_id)
+    assert before == ("paused", 1, False, "started", 0)
+    extra: dict[str, Any] = {
+        "guardrails": {"guardrails": [SecretDetection(action="block")]},
+        "approval": {"tools": [publish], "require_approval": ["publish"]},
+        "skills": {"skills": [Skill(name="demo", description="d", body="b")]},
+    }[change]
+    child_llm = ContextLLM([])
+    root_llm = ContextLLM([LLMResponse(text="never")])
+    changed = root_agent(store, root_llm, child_agent(child_llm), **extra)
+    expected = RunNotReclaimableError if change == "skills" else GovernanceMismatchError
+    with pytest.raises(expected) as info:
+        await changed.reclaim(root_id, tenant_id=TENANT)
+    if change == "skills":
+        assert info.value.reason == "skill_mismatch"
+    assert await _untouched(engine, root_id) == before
+    assert root_llm.calls == 0 and child_llm.calls == 0
+
+    # The unchanged definition still adopts and finishes.
+    same, same_llm, _ = fresh_root(store, LLMResponse(text="root done"))
+    assert (await same.reclaim(root_id, tenant_id=TENANT)).status == RunStatus.SUCCESS
+    assert same_llm.calls == 1
+
+
+async def test_changed_governance_with_warn_policy_adopts_and_reports(
+    store: Any, engine: Any, monkeypatch: Any
+) -> None:
+    from dendrux.guardrails import SecretDetection
+
+    root_id, _ = await crash_before_adoption(store, engine, monkeypatch)
+    root_llm = ContextLLM([LLMResponse(text="root done")])
+    warned = Agent(
+        name="lead",
+        prompt="You lead.",
+        provider=root_llm,
+        state_store=store,
+        subagents=[child_agent(ContextLLM([]))],
+        guardrails=[SecretDetection(action="block")],
+        on_governance_change="warn",
+    )
+    assert (await warned.reclaim(root_id, tenant_id=TENANT)).status == RunStatus.SUCCESS
+    events = await rows(engine, RunEvent, RunEvent.agent_run_id == root_id)
+    assert "governance.changed" in [e.event_type for e in events]

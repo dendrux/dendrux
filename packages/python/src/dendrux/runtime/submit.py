@@ -582,10 +582,44 @@ def _managed_adoption_validator(
     return validate
 
 
+async def _admit_managed_parent(agent: Agent, store: StateStore, run_id: str) -> dict[str, Any]:
+    """The parent's current definition may accept the report: name, governance, skills.
+
+    The same admission an ordinary reclaim or submission applies, before any
+    claim or write. The saved evidence (run governance snapshot, checkpoint
+    skill pins) changes only under a claim, and the claim below is a CAS on the
+    wait generation read here, so no other claim can slip between check and use.
+    Returns the saved governance view for the ``warn`` report.
+    """
+    from dendrux.errors import GovernanceMismatchError, RunNotFoundError, RunNotReclaimableError
+    from dendrux.skills._session import SkillSession
+
+    record = await store.get_run(run_id)
+    if record is None:
+        raise RunNotFoundError(run_id)
+    if record.agent_name != agent.name:
+        raise RunNotReclaimableError(run_id, "agent_mismatch")
+    saved = {GOVERNANCE_KEY: (record.meta or {}).get(GOVERNANCE_KEY)}
+    if saved[GOVERNANCE_KEY] is None:
+        saved.pop(GOVERNANCE_KEY)
+    change = _governance_change(agent, saved)
+    if change is not None and agent._on_governance_change == "raise":
+        import logging
+
+        _codes.log_code(logging.getLogger(__name__), _codes.GOVERNANCE_MISMATCH, run_id=run_id)
+        raise GovernanceMismatchError(run_id, **change)
+    state = await store.get_loop_state(run_id) or {}
+    pins = {s.name: s.digest for s in SkillSession.prepare(agent).available.values()}
+    if ((state.get("skills") or {}).get("pins", {})) != pins:
+        raise RunNotReclaimableError(run_id, "skill_mismatch")
+    return saved
+
+
 async def claim_managed_adoption(
     store: StateStore,
     run_id: str,
     *,
+    agent: Agent,
     call_id: str,
     child_run_id: str,
     result: ToolResult,
@@ -605,6 +639,7 @@ async def claim_managed_adoption(
     raw = await store.get_pause_state(run_id)
     if raw is None or raw.get("schema_version") != 3:
         return False
+    governance = await _admit_managed_parent(agent, store, run_id)
     wait = PauseState.from_managed_dict(raw, run_id=run_id)
     assert wait.pause_id is not None
     descriptor = managed_submission_descriptor(wait, call_id)
@@ -616,9 +651,14 @@ async def claim_managed_adoption(
         submission=descriptor,
         validate=_managed_adoption_validator(run_id, wait.pause_id, call_id, child_run_id),
     )
-    return await _ownership_handoff(
+    won: ClaimResult | bool = await _ownership_handoff(
         store, operation, partial(_cancel_claim, store, run_id), run_id=run_id
     )
+    if won and not isinstance(won, bool):
+        from dendrux.runtime.state import claimed_store
+
+        await report_governance_change(agent, claimed_store(store, run_id, won), run_id, governance)
+    return won
 
 
 def submitted_view(raw: dict[str, Any]) -> dict[str, Any]:

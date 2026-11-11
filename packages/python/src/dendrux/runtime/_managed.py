@@ -657,7 +657,12 @@ async def adopt(waiting: _Waiting, *, store: Any, notifier: LoopNotifier | None)
     limit = waiting.parent_agent._limits.max_tool_result_bytes
     report = replace(child_report(record, waiting.child, limit=limit), call_id=waiting.call_id)
     claim = await claim_managed_adoption(
-        store, waiting.parent_run_id, call_id=waiting.call_id, child_run_id=record.id, result=report
+        store,
+        waiting.parent_run_id,
+        agent=waiting.parent_agent,
+        call_id=waiting.call_id,
+        child_run_id=record.id,
+        result=report,
     )
     if not isinstance(claim, ClaimResult):
         return not_owner_result(waiting.parent_run_id)
