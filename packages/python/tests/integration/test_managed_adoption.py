@@ -960,3 +960,156 @@ async def test_changed_governance_with_warn_policy_adopts_and_reports(
     assert (await warned.reclaim(root_id, tenant_id=TENANT)).status == RunStatus.SUCCESS
     events = await rows(engine, RunEvent, RunEvent.agent_run_id == root_id)
     assert "governance.changed" in [e.event_type for e in events]
+
+
+# ---------------------------------------------------------------------------
+# R1: the parent admits the report like any tool result before it is durable
+# ---------------------------------------------------------------------------
+
+CONFIDENTIAL = "SENTINEL-confidential-6a1f"
+EMAIL = "jane.sentinel@example.com"
+AWS_KEY = "AKIAIOSFODNN7EXAMPLE"
+
+
+async def _durable_text(engine: Any, root_id: str) -> str:
+    """Every parent row a report can reach: pause/submission, tool row, traces, events."""
+    run = (await rows(engine, AgentRun, AgentRun.id == root_id))[0]
+    tools = await rows(engine, ToolCallRecord, ToolCallRecord.agent_run_id == root_id)
+    traces = await rows(engine, ReactTrace, ReactTrace.agent_run_id == root_id)
+    events = await rows(engine, RunEvent, RunEvent.agent_run_id == root_id)
+    return json.dumps(
+        [
+            run.pause_data,
+            run.loop_state,
+            run.error,
+            [(t.result, t.error_message, t.meta) for t in tools],
+            [t.content for t in traces],
+            [e.data for e in events],
+        ],
+        default=str,
+    )
+
+
+def _provider_text(llm: ContextLLM) -> str:
+    return json.dumps([[m.content for m in call] for call in llm.messages])
+
+
+transform_calls: list[str] = []
+
+
+def _drop_confidential(ctx: Any) -> Any:
+    transform_calls.append(ctx.call_id)
+    assert ctx.tool_name == "reviewer" and ctx.params == {"task": BRIEF}
+    return {"summary": "kept", "len": len(ctx.result)}
+
+
+@pytest.mark.parametrize("cut", ["none", "after_claim", "after_completion"])
+async def test_parent_transform_shapes_the_accepted_report_once(
+    store: Any, engine: Any, monkeypatch: Any, cut: str
+) -> None:
+    from dendrux.runtime import persistence
+
+    transform_calls.clear()
+    child_llm = ContextLLM([LLMResponse(text=f"report {CONFIDENTIAL}")])
+    root_llm = ContextLLM([call("reviewer", {"task": BRIEF}, "r1"), LLMResponse(text="ok")])
+    root = root_agent(
+        store, root_llm, child_agent(child_llm), tool_result_transform=_drop_confidential
+    )
+    if cut == "none":
+        result = await root.run("go", tenant_id=TENANT)
+        final_llm = root_llm
+    else:
+        target, name = (
+            (persistence, "adopt_managed_result")
+            if cut == "after_claim"
+            else (_reclaim, "continue_claimed")
+        )
+        await _crash_at(monkeypatch, target, name, lambda: root.run("go", tenant_id=TENANT))
+        root_id = await root_id_of(engine)
+        item = await expire(store, engine, root_id)
+        final_llm = ContextLLM([LLMResponse(text="ok")])
+        again = root_agent(
+            store, final_llm, child_agent(ContextLLM([])), tool_result_transform=_drop_confidential
+        )
+        result = await again.reclaim(root_id, tenant_id=TENANT, item=item)
+    assert result.status == RunStatus.SUCCESS
+    assert len(transform_calls) == 1  # recovery uses the saved accepted report
+    assert CONFIDENTIAL not in await _durable_text(engine, result.run_id)
+    assert CONFIDENTIAL not in _provider_text(final_llm)
+    seen = [json.loads(m.content) for m in final_llm.messages[-1] if m.role.value == "tool"]
+    assert seen == [{"summary": "kept", "len": len(f"report {CONFIDENTIAL}")}]
+    assert child_llm.calls == 1
+
+
+async def test_transformed_oversize_report_is_refused_without_rerunning_the_child(
+    store: Any, engine: Any
+) -> None:
+    child_llm = ContextLLM([LLMResponse(text="short")])
+    root_llm = ContextLLM([call("reviewer", {"task": BRIEF}, "r1"), LLMResponse(text="ok")])
+    root = root_agent(
+        store,
+        root_llm,
+        child_agent(child_llm),
+        tool_result_transform=lambda ctx: "x" * 400,
+        limits=Limits(max_tool_result_bytes=256),
+    )
+    result = await root.run("go", tenant_id=TENANT)
+    assert result.status == RunStatus.SUCCESS and child_llm.calls == 1
+    seen = [json.loads(m.content) for m in root_llm.messages[1] if m.role.value == "tool"]
+    assert seen[0]["code"] == "managed_report_too_large" and seen[0]["limit"] == 256
+
+
+async def test_parent_pii_redaction_applies_to_the_adopted_observation(
+    store: Any, engine: Any
+) -> None:
+    from dendrux.guardrails import PII
+
+    child_llm = ContextLLM([LLMResponse(text=f"contact {EMAIL}")])
+    root_llm = ContextLLM([call("reviewer", {"task": BRIEF}, "r1"), LLMResponse(text="ok")])
+    root = root_agent(store, root_llm, child_agent(child_llm), guardrails=[PII(action="redact")])
+    result = await root.run("go", tenant_id=TENANT)
+    assert result.status == RunStatus.SUCCESS
+    assert EMAIL not in _provider_text(root_llm)
+    traces = await rows(engine, ReactTrace, ReactTrace.agent_run_id == result.run_id)
+    assert EMAIL not in json.dumps([t.content for t in traces])
+    mapping = await store.get_pii_mapping(result.run_id)
+    assert EMAIL in (mapping or {}).values()
+
+
+@pytest.mark.parametrize("cut", ["none", "after_claim", "after_completion"])
+async def test_parent_block_policy_stops_the_parent_and_keeps_no_blocked_text(
+    store: Any, engine: Any, monkeypatch: Any, cut: str
+) -> None:
+    from dendrux._meta_keys import BLOCKED_META_KEY
+    from dendrux.guardrails import SecretDetection
+    from dendrux.runtime import persistence
+
+    child_llm = ContextLLM([LLMResponse(text=f"key {AWS_KEY}")])
+    root_llm = ContextLLM([call("reviewer", {"task": BRIEF}, "r1"), LLMResponse(text="never")])
+
+    def make(llm: Any, child: Agent) -> Agent:
+        return root_agent(store, llm, child, guardrails=[SecretDetection(action="block")])
+
+    root = make(root_llm, child_agent(child_llm))
+    if cut == "none":
+        result = await root.run("go", tenant_id=TENANT)
+        root_id = result.run_id
+    else:
+        target, name = (
+            (persistence, "adopt_managed_result")
+            if cut == "after_claim"
+            else (_reclaim, "continue_claimed")
+        )
+        await _crash_at(monkeypatch, target, name, lambda: root.run("go", tenant_id=TENANT))
+        root_id = await root_id_of(engine)
+        item = await expire(store, engine, root_id)
+        result = await make(ContextLLM([]), child_agent(ContextLLM([]))).reclaim(
+            root_id, tenant_id=TENANT, item=item
+        )
+    assert result.status == RunStatus.ERROR
+    assert root_llm.calls == 1 and child_llm.calls == 1
+    row = (await rows(engine, AgentRun, AgentRun.id == root_id))[0]
+    assert row.failure_reason == "guardrail_blocked"
+    assert AWS_KEY not in await _durable_text(engine, root_id)
+    assert AWS_KEY not in (result.error or "")
+    assert (row.meta or {}).get(BLOCKED_META_KEY) is True or row.status == "error"

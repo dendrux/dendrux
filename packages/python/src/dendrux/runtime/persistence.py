@@ -1859,6 +1859,8 @@ async def adopt_managed_result(
     report: ToolResult,
     child_run_id: str,
     agent_path: Sequence[str],
+    observation: Message | None = None,
+    pii_mapping: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Complete a parent's managed tool intent with its accepted report (0.7).
 
@@ -1882,8 +1884,8 @@ async def adopt_managed_result(
     if pending is None:
         raise ManagedStateError(reason="pending_missing", run_id=run_id)
     iteration = int(state.get("iteration", 0))
-    observation = message_trace(tool_result_message(report), pending["order_index"])
-    observation.meta["iteration"] = iteration
+    trace = message_trace(observation or tool_result_message(report), pending["order_index"])
+    trace.meta["iteration"] = iteration
     outcome = "completed" if report.success else "failed"
     event = EventWrite(
         generate_ulid(),
@@ -1919,10 +1921,11 @@ async def adopt_managed_result(
             duration_ms=report.duration_ms,
             error_message=report.error,
             replayed=False,
-            observation=observation,
+            observation=trace,
             event=event,
             loop_state_patch=patch,
             meta=None,
+            pii_mapping=pii_mapping,
         )
 
     await retry_critical(complete, label="complete_tool_call", run_id=run_id)

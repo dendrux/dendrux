@@ -623,6 +623,7 @@ async def claim_managed_adoption(
     call_id: str,
     child_run_id: str,
     result: ToolResult,
+    blocked: str | None = None,
 ) -> ClaimResult | bool:
     """Durably accept a child's report into its waiting parent and claim the parent.
 
@@ -643,17 +644,25 @@ async def claim_managed_adoption(
     wait = PauseState.from_managed_dict(raw, run_id=run_id)
     assert wait.pause_id is not None
     descriptor = managed_submission_descriptor(wait, call_id)
+    submitted: dict[str, Any] = {"submitted_tool_results": serialize_tool_results([result])}
+    if blocked is not None:
+        # Safe guardrail text only; recovery reapplies the stop, never the policy.
+        submitted["managed_blocked"] = True
     operation = partial(
         store.submit_and_claim,
         run_id,
         expected_status=RunStatus.PAUSED.value,
-        submitted_data={"submitted_tool_results": serialize_tool_results([result])},
+        submitted_data=submitted,
         submission=descriptor,
         validate=_managed_adoption_validator(run_id, wait.pause_id, call_id, child_run_id),
     )
-    won: ClaimResult | bool = await _ownership_handoff(
-        store, operation, partial(_cancel_claim, store, run_id), run_id=run_id
-    )
+    from dendrux.runtime._continuation_guardrails import _submission_evidence
+
+    # A blocked report marks the parent in its claim transaction, as a blocked submission does.
+    async with _submission_evidence(store, run_id, blocked is not None):
+        won: ClaimResult | bool = await _ownership_handoff(
+            store, operation, partial(_cancel_claim, store, run_id), run_id=run_id
+        )
     if won and not isinstance(won, bool):
         from dendrux.runtime.state import claimed_store
 

@@ -103,8 +103,12 @@ class _Waiting:
     parent_run_id: str
     child: Agent
     child_path: tuple[str, ...]
-    call_id: str
+    call: ToolCall
     child_run_id: str
+
+    @property
+    def call_id(self) -> str:
+        return self.call.id
 
 
 def is_descend(result: RunResult | None) -> bool:
@@ -436,7 +440,7 @@ def _waiting_from(invocation: ManagedInvocation) -> _Waiting:
         parent_run_id=invocation.parent_run_id,
         child=invocation.child,
         child_path=invocation.child_path,
-        call_id=invocation.call.id,
+        call=invocation.call,
         child_run_id=invocation.child_run_id,
     )
 
@@ -588,19 +592,19 @@ def child_report(record: RunRecord, child: Agent, *, limit: int) -> ToolResult:
     """The parent's tool result for a terminal child; codes and counts only on failure."""
     status = record.status
     if status == RunStatus.CANCELLED.value:
-        return _failed_report(child, CHILD_CANCELLED, record.id)
+        return _failed_report(child.name, CHILD_CANCELLED, record.id)
     if status != RunStatus.SUCCESS.value:
-        return _failed_report(child, CHILD_FAILED, record.id)
+        return _failed_report(child.name, CHILD_FAILED, record.id)
     try:
         payload = _report_payload(record.answer, getattr(child, "_output_type", None))
     except (TypeError, ValueError):
-        return _failed_report(child, REPORT_INVALID, record.id)
+        return _failed_report(child.name, REPORT_INVALID, record.id)
     size = len(payload.encode("utf-8"))
     if size > limit:
         _codes.log_code(
             logger, _codes.MANAGED_REPORT_TOO_LARGE, run_id=record.id, bytes=size, limit=limit
         )
-        return _failed_report(child, REPORT_TOO_LARGE, record.id, bytes=size, limit=limit)
+        return _failed_report(child.name, REPORT_TOO_LARGE, record.id, bytes=size, limit=limit)
     return ToolResult(name=child.name, call_id="", payload=payload)
 
 
@@ -627,13 +631,13 @@ _FAILURE_CODES = {
 }
 
 
-def _failed_report(child: Agent, code: str, child_run_id: str, **counts: int) -> ToolResult:
+def _failed_report(name: str, code: str, child_run_id: str, **counts: int) -> ToolResult:
     message = _FAILURE_TEXT[code]
     if code in _FAILURE_CODES:
         _codes.log_code(logger, _FAILURE_CODES[code], run_id=child_run_id)
     body = {"error": message, "code": code, "child_run_id": child_run_id, **counts}
     return ToolResult(
-        name=child.name,
+        name=name,
         call_id="",
         payload=json.dumps(body),
         success=False,
@@ -642,10 +646,81 @@ def _failed_report(child: Agent, code: str, child_run_id: str, **counts: int) ->
     )
 
 
+@dataclass(frozen=True)
+class AcceptedReport:
+    """The parent-approved report: transformed, size-checked and projected (in memory)."""
+
+    result: ToolResult
+    observation: Any
+    pii_mapping: dict[str, str] | None
+    blocked: str | None
+
+
+async def accept_report(waiting: _Waiting, record: RunRecord, store: Any) -> AcceptedReport:
+    """Admit a child's saved outcome as the parent admits any tool result.
+
+    The parent's ``tool_result_transform`` runs once with the original call;
+    the size refusal applies to the transformed serialized payload; the
+    parent's guardrails project it (PII placeholders) or block it. Only this
+    representation becomes durable; recovery never repeats the transform.
+    """
+    parent = waiting.parent_agent
+    limit = parent._limits.max_tool_result_bytes
+    report = replace(child_report(record, waiting.child, limit=limit), call_id=waiting.call.id)
+    report = await _transformed(parent, waiting.call, report, limit, record.id)
+    return await project_report(parent, store, waiting.parent_run_id, report)
+
+
+async def _transformed(
+    parent: Agent, call: ToolCall, report: ToolResult, limit: int, child_run_id: str
+) -> ToolResult:
+    from dendrux.loops.react import _apply_result_transform
+
+    transform = parent.tool_result_transform
+    if transform is None or not report.success:
+        return report
+    try:
+        lookups = await parent.get_tool_lookups()
+        value = await _apply_result_transform(transform, call, lookups, json.loads(report.payload))
+        payload = json.dumps(value, ensure_ascii=False, allow_nan=False)
+    except Exception:
+        return replace(_failed_report(report.name, REPORT_INVALID, child_run_id), call_id=call.id)
+    size = len(payload.encode("utf-8"))
+    if size > limit:
+        _codes.log_code(
+            logger, _codes.MANAGED_REPORT_TOO_LARGE, run_id=child_run_id, bytes=size, limit=limit
+        )
+        failed = _failed_report(
+            report.name, REPORT_TOO_LARGE, child_run_id, bytes=size, limit=limit
+        )
+        return replace(failed, call_id=call.id)
+    return replace(report, payload=payload)
+
+
+async def project_report(
+    parent: Agent, store: Any, run_id: str, report: ToolResult
+) -> AcceptedReport:
+    """The parent's guardrail projection of ``report`` (also used by recovery)."""
+    from dendrux.loops._helpers import _project_tool_message
+    from dendrux.types import tool_result_message
+
+    message = tool_result_message(report)
+    if not parent.guardrails:
+        return AcceptedReport(report, message, None, None)
+    from dendrux.guardrails import GuardrailEngine
+
+    engine = GuardrailEngine(
+        parent.guardrails, pii_mapping=await store.get_pii_mapping(run_id), run_id=run_id
+    )
+    projected, _findings, blocked = await _project_tool_message(engine, report, message)
+    if blocked is not None:
+        report = replace(report, payload=projected.content, error=None, meta={}, notes=())
+    return AcceptedReport(report, projected, engine.get_pii_mapping(), blocked)
+
+
 async def adopt(waiting: _Waiting, *, store: Any, notifier: LoopNotifier | None) -> RunResult:
     """Accept a terminal child's saved outcome into its parent, then continue the parent."""
     from dendrux.runtime import _reclaim
-    from dendrux.runtime.persistence import adopt_managed_result
     from dendrux.runtime.state import ClaimResult, claimed_store
     from dendrux.runtime.submit import claim_managed_adoption
 
@@ -654,27 +729,26 @@ async def adopt(waiting: _Waiting, *, store: Any, notifier: LoopNotifier | None)
         raise ManagedStateError(reason="child_missing", run_id=waiting.parent_run_id)
     if record.status not in {s.value for s in TERMINAL_STATUSES}:
         return not_owner_result(waiting.parent_run_id)
-    limit = waiting.parent_agent._limits.max_tool_result_bytes
-    report = replace(child_report(record, waiting.child, limit=limit), call_id=waiting.call_id)
+    accepted = await accept_report(waiting, record, store)
     claim = await claim_managed_adoption(
         store,
         waiting.parent_run_id,
         agent=waiting.parent_agent,
         call_id=waiting.call_id,
         child_run_id=record.id,
-        result=report,
+        result=accepted.result,
+        blocked=accepted.blocked,
     )
     if not isinstance(claim, ClaimResult):
         return not_owner_result(waiting.parent_run_id)
     owned = claimed_store(store, waiting.parent_run_id, claim)
-    state = await adopt_managed_result(
+    state = await complete_adoption(
         owned,
         waiting.parent_run_id,
-        claim=claim,
-        call_id=waiting.call_id,
-        report=report,
+        claim,
+        accepted,
         child_run_id=record.id,
-        agent_path=waiting.child_path,
+        path=waiting.child_path,
     )
     return await _reclaim.continue_claimed(
         waiting.parent_agent,
@@ -683,6 +757,36 @@ async def adopt(waiting: _Waiting, *, store: Any, notifier: LoopNotifier | None)
         ClaimResult(claim.claim_epoch, claim.storage_format, state, None),
         notifier=notifier,
     )
+
+
+async def complete_adoption(
+    owned: Any,
+    run_id: str,
+    claim: Any,
+    accepted: AcceptedReport,
+    *,
+    child_run_id: str,
+    path: tuple[str, ...],
+) -> dict[str, Any]:
+    """The one completion transaction, under blocked provenance when the parent blocked it."""
+    from contextlib import nullcontext
+
+    from dendrux.runtime import persistence
+    from dendrux.runtime._blocked_content import _blocked_evidence
+
+    scope = _blocked_evidence(owned, run_id) if accepted.blocked is not None else nullcontext()
+    async with scope:
+        return await persistence.adopt_managed_result(
+            owned,
+            run_id,
+            claim=claim,
+            call_id=accepted.result.call_id,
+            report=accepted.result,
+            child_run_id=child_run_id,
+            agent_path=path,
+            observation=accepted.observation,
+            pii_mapping=accepted.pii_mapping,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -750,9 +854,8 @@ async def walk(root_agent: Agent, store: Any, root_run_id: str) -> tuple[list[_W
             return waiting, record
         child, path = await _bound_child(store, record, binding, root_run_id, path)
         child_agent = _registered(agent, path[-1], record.id)
-        waiting.append(
-            _Waiting(agent, record.id, child_agent, path, binding.tool_call_id, child.id)
-        )
+        intent = await _intent_call(store, record.id, binding.tool_call_id)
+        waiting.append(_Waiting(agent, record.id, child_agent, path, intent, child.id))
         agent, record = child_agent, child
     raise ManagedStateError(reason="binding_conflict", run_id=root_run_id)
 
@@ -786,6 +889,21 @@ async def _bound_child(
     ):
         raise ManagedStateError(reason="child_mismatch", run_id=parent.id)
     return child, header.path
+
+
+async def _intent_call(store: Any, parent_run_id: str, call_id: str) -> ToolCall:
+    """The bound call as the parent's model made it (its brief lives on the intent row)."""
+    from dendrux.runtime._bounds import MAX_PAGE
+
+    for row in await store.get_tool_calls(parent_run_id, limit=MAX_PAGE):
+        if row.tool_call_id == call_id and row.target == "agent":
+            return ToolCall(
+                name=row.tool_name,
+                params=dict(row.params or {}),
+                id=row.tool_call_id,
+                provider_tool_call_id=row.provider_tool_call_id,
+            )
+    raise ManagedStateError(reason="binding_missing", run_id=parent_run_id)
 
 
 def _registered(parent: Agent, name: str, parent_run_id: str) -> Agent:

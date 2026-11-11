@@ -108,7 +108,7 @@ async def reclaim(
     if _pending_adoption(claim.loop_state):
         # A managed parent claimed for adoption before its tool row completed:
         # finish that adoption from the saved report, then continue (0.7).
-        claim = await _finish_saved_adoption(owned, run_id, claim)
+        claim = await _finish_saved_adoption(agent, owned, run_id, claim)
     return await _continue_session(agent, store, run_id, claim, notifier, session)
 
 
@@ -200,10 +200,12 @@ def _pending_adoption(state: dict[str, Any] | None) -> bool:
     return state.get(MANAGED_BINDING_KEY) is not None and bool(state.get("submission"))
 
 
-async def _finish_saved_adoption(owned: StateStore, run_id: str, claim: ClaimResult) -> ClaimResult:
+async def _finish_saved_adoption(
+    agent: Agent, owned: StateStore, run_id: str, claim: ClaimResult
+) -> ClaimResult:
     """Complete the managed tool intent from the durably accepted report, once."""
     from dendrux.errors import ManagedStateError
-    from dendrux.runtime.persistence import adopt_managed_result
+    from dendrux.runtime._managed import complete_adoption, project_report
     from dendrux.runtime.state import ClaimResult, ManagedHeader
     from dendrux.runtime.submit import _submission_payload, deserialize_tool_results
 
@@ -211,7 +213,8 @@ async def _finish_saved_adoption(owned: StateStore, run_id: str, claim: ClaimRes
     binding = state[MANAGED_BINDING_KEY]
     raw = await owned.get_pause_state(run_id) or {}
     try:
-        results = deserialize_tool_results(_submission_payload(raw)["submitted_tool_results"])
+        payload = _submission_payload(raw)
+        results = deserialize_tool_results(payload["submitted_tool_results"])
     except (KeyError, TypeError, ValueError):
         raise ManagedStateError(reason="binding_conflict", run_id=run_id) from None
     if len(results) != 1 or results[0].call_id != binding.get("tool_call_id"):
@@ -221,14 +224,18 @@ async def _finish_saved_adoption(owned: StateStore, run_id: str, claim: ClaimRes
         (p.get("tool") for p in state.get("pending", []) if p.get("call_id") == results[0].call_id),
         results[0].name,
     )
-    after = await adopt_managed_result(
+    # The saved report is already transformed and admitted; only its projection
+    # into the conversation is redone, from the saved mapping.
+    accepted = await project_report(agent, owned, run_id, results[0])
+    if payload.get("managed_blocked"):
+        accepted = replace(accepted, blocked=accepted.blocked or "blocked")
+    after = await complete_adoption(
         owned,
         run_id,
-        claim=claim,
-        call_id=results[0].call_id,
-        report=results[0],
+        claim,
+        accepted,
         child_run_id=binding.get("child_run_id"),
-        agent_path=(*header.path, str(tool)),
+        path=(*header.path, str(tool)),
     )
     return ClaimResult(claim.claim_epoch, claim.storage_format, after, None)
 
