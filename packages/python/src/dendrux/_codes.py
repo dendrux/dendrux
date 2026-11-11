@@ -934,6 +934,14 @@ MANAGED_UNSUPPORTED = Code(
     "A managed workflow is used through an entry this build does not support yet.",
     "Use run() for managed workflows in this build; other entries come in a later step.",
 )
+MANAGED_PAUSE_ID_REQUIRED = Code(
+    "managed_pause_id_required",
+    logging.WARNING,
+    "subagent",
+    _BASE_FIELDS | frozenset([]),
+    "A managed workflow continuation omits the subagent's pause token.",
+    "Send the pause_id from the root's pending as expected_pause_id.",
+)
 MANAGED_STATE_INVALID = Code(
     "managed_state_invalid",
     logging.WARNING,
@@ -2140,6 +2148,7 @@ REGISTRY = MappingProxyType(
             MANAGED_REPORT_TOO_LARGE,
             MANAGED_ROOT_REQUIRED,
             MANAGED_UNSUPPORTED,
+            MANAGED_PAUSE_ID_REQUIRED,
             MANAGED_STATE_INVALID,
             CHECKPOINT_TOO_LARGE,
             REWRITE_INVALID,

@@ -11,6 +11,7 @@ and Postgres (``DENDRUX_TEST_PG_URL``, a private ``*_test`` database).
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import pytest
@@ -18,16 +19,27 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from dendrux import Agent, tool
-from dendrux.db.models import AgentRun
+from dendrux.db.models import AgentRun, ToolCallRecord
+from dendrux.errors import (
+    InvalidToolResultError,
+    ManagedChildControlError,
+    PauseStatusMismatchError,
+    RunNotFoundError,
+    RunNotPausedError,
+)
 from dendrux.runtime.context import get_delegation_context
 from dendrux.store import RunStore
 from dendrux.strategies.native import NativeToolCalling
 from dendrux.types import (
     AgentStep,
+    ApprovalDecision,
     Clarification,
+    InputValidationError,
+    Limits,
     LLMResponse,
     RunStatus,
     ToolCall,
+    ToolResult,
 )
 from tests._helpers.scripted_provider import ScriptedLLM
 
@@ -314,3 +326,437 @@ async def test_running_subagent_reads_as_running_root_without_pending(
 
     assert result.status == RunStatus.SUCCESS
     assert seen == [None, RunStatus.RUNNING]
+
+
+# ---------------------------------------------------------------------------
+# 2. Root-id continuations route to the leaf and unwind to the root
+# ---------------------------------------------------------------------------
+
+
+def done(text: str) -> LLMResponse:
+    return LLMResponse(text=text)
+
+
+def build(store: Any, case: str, **child_kwargs: Any) -> Agent:
+    """lead -> reviewer, where the reviewer pauses with ``case`` and then finishes."""
+    first = {
+        "approval": call("publish", {"text": "d"}, "c1"),
+        "client_tool": call("read_sheet", {"sheet": "S1"}, "c1"),
+        "input": LLMResponse(text="Which draft?"),
+        "paused": call("count_words", {"text": "a b"}, "c1"),
+    }[case]
+    on_call = None
+    if case == "paused":
+
+        async def on_call(index: int, run_id: str | None) -> None:
+            if index == 0:
+                await store.request_pause(run_id)
+
+    tools = {
+        "approval": [publish],
+        "client_tool": [read_sheet],
+        "input": [count_words],
+        "paused": [count_words],
+    }[case]
+    if case == "approval":
+        child_kwargs.setdefault("require_approval", ["publish"])
+    child = reviewer(
+        ContextLLM([first, done(CHILD_TEXT)], on_call=on_call), tools=tools, **child_kwargs
+    )
+    return lead(
+        store,
+        ContextLLM([call("reviewer", {"task": BRIEF}, "r1"), done("root done")]),
+        child,
+    )
+
+
+async def submit_family(root: Agent, case: str, paused: Any, **kwargs: Any) -> Any:
+    root_id, token = paused.run_id, paused.pause_id
+    kwargs.setdefault("tenant_id", TENANT)
+    kwargs.setdefault("expected_pause_id", token)
+    if case == "approval":
+        return await root.submit_approval(root_id, approved=True, **kwargs)
+    if case == "client_tool":
+        call_id = paused.pending.tool_calls[0].id
+        result = ToolResult(name="read_sheet", call_id=call_id, payload=json.dumps("cells"))
+        return await root.submit_tool_results(root_id, [result], **kwargs)
+    if case == "input":
+        return await root.submit_input(root_id, "the second draft", **kwargs)
+    return await root.submit_resume(root_id, **kwargs)
+
+
+async def assert_unwound(engine: Any, root_id: str, result: Any) -> None:
+    """Leaf finished, its report adopted once, root succeeded with its own answer."""
+    assert result.run_id == root_id
+    assert result.status == RunStatus.SUCCESS
+    assert result.answer == "root done" and CHILD_TEXT not in result.answer
+    assert result.pending is None
+    child = await child_of(engine, root_id)
+    assert child.status == "success"
+    adopted = await observations(engine, root_id)
+    assert len(adopted) == 1 and json.loads(adopted[0].content) == CHILD_TEXT
+    intent = (await rows(engine, ToolCallRecord, ToolCallRecord.agent_run_id == root_id))[0]
+    assert intent.outcome == "completed" and intent.target == "agent"
+
+
+@pytest.mark.parametrize("case", sorted(CASES))
+async def test_each_family_routes_through_the_root_and_unwinds(
+    store: Any, engine: Any, case: str, ask_questions: None
+) -> None:
+    published.clear()
+    root = build(store, case)
+    paused = await root.run("go", tenant_id=TENANT)
+    assert paused.pending.origin_run_id is not None
+
+    result = await submit_family(root, case, paused)
+
+    await assert_unwound(engine, paused.run_id, result)
+    if case == "approval":
+        assert published == ["d"]
+
+
+@pytest.mark.parametrize("case", sorted(CASES))
+async def test_managed_continuation_requires_the_pause_token(
+    store: Any, engine: Any, case: str, ask_questions: None
+) -> None:
+    """Even without strict tenancy: a missing token is refused before any claim."""
+    root = build(store, case)
+    root._strict_tenancy = False
+    paused = await root.run("go", tenant_id=TENANT)
+    child = await child_of(engine, paused.run_id)
+
+    with pytest.raises(InputValidationError) as caught:
+        await submit_family(root, case, paused, expected_pause_id=None)
+    assert caught.value.code == "pause_id_required"
+    with pytest.raises(PauseStatusMismatchError):
+        await submit_family(root, case, paused, expected_pause_id="01ZZZZZZZZZZZZZZZZZZZZZZZZ")
+
+    after = await run_row(engine, child.id)
+    assert (after.status, after.claim_epoch) == (child.status, child.claim_epoch)
+    assert (await run_row(engine, paused.run_id)).status == "paused"
+
+
+async def test_resume_routes_each_mode_to_the_leaf(store: Any, engine: Any) -> None:
+    published.clear()
+    root = build(store, "approval")
+    paused = await root.run("go", tenant_id=TENANT)
+    result = await root.resume(paused.run_id, tenant_id=TENANT, expected_pause_id=paused.pause_id)
+    await assert_unwound(engine, paused.run_id, result)
+    assert published == ["d"]
+
+
+async def test_resume_with_tool_results_routes_to_the_leaf(store: Any, engine: Any) -> None:
+    root = build(store, "client_tool")
+    paused = await root.run("go", tenant_id=TENANT)
+    call_id = paused.pending.tool_calls[0].id
+    result = await root.resume(
+        paused.run_id,
+        tool_results=[ToolResult(name="read_sheet", call_id=call_id, payload='"cells"')],
+        tenant_id=TENANT,
+        expected_pause_id=paused.pause_id,
+    )
+    await assert_unwound(engine, paused.run_id, result)
+
+
+async def test_resume_with_input_routes_to_the_leaf(
+    store: Any, engine: Any, ask_questions: None
+) -> None:
+    root = build(store, "input")
+    paused = await root.run("go", tenant_id=TENANT)
+    result = await root.resume(
+        paused.run_id, user_input="yes", tenant_id=TENANT, expected_pause_id=paused.pause_id
+    )
+    await assert_unwound(engine, paused.run_id, result)
+
+
+# ---------------------------------------------------------------------------
+# 3. Each family validates with the leaf's own definition
+# ---------------------------------------------------------------------------
+
+
+async def test_tool_results_use_the_leafs_transform_and_limits(store: Any, engine: Any) -> None:
+    seen: list[Any] = []
+
+    def leaf_transform(ctx: Any) -> Any:
+        seen.append(ctx.tool_name if hasattr(ctx, "tool_name") else ctx)
+        return {"leaf": "transformed"}
+
+    root = build(store, "client_tool", tool_result_transform=leaf_transform)
+    paused = await root.run("go", tenant_id=TENANT)
+    child = await child_of(engine, paused.run_id)
+    call_id = paused.pending.tool_calls[0].id
+
+    # Unknown call id: refused by the leaf's pending calls, nothing claimed.
+    with pytest.raises(InvalidToolResultError):
+        await root.submit_tool_results(
+            paused.run_id,
+            [ToolResult(name="read_sheet", call_id="other", payload='"x"')],
+            tenant_id=TENANT,
+            expected_pause_id=paused.pause_id,
+        )
+    assert (await run_row(engine, child.id)).status == "waiting_client_tool"
+
+    result = await root.submit_tool_results(
+        paused.run_id,
+        [ToolResult(name="read_sheet", call_id=call_id, payload='"cells"')],
+        tenant_id=TENANT,
+        expected_pause_id=paused.pause_id,
+    )
+    await assert_unwound(engine, paused.run_id, result)
+    assert len(seen) == 1
+    leaf_obs = await observations(engine, child.id)
+    assert [json.loads(o.content) for o in leaf_obs] == [{"leaf": "transformed"}]
+
+
+async def test_approval_decisions_use_the_leafs_tool_catalog(store: Any, engine: Any) -> None:
+    published.clear()
+    root = build(store, "approval")
+    paused = await root.run("go", tenant_id=TENANT)
+    leaf_call = paused.pending.tool_calls[0].id
+
+    with pytest.raises(ValueError):
+        await root.submit_approval(
+            paused.run_id,
+            decisions={"not-a-pending-call": ApprovalDecision.approve()},
+            tenant_id=TENANT,
+            expected_pause_id=paused.pause_id,
+        )
+    result = await root.submit_approval(
+        paused.run_id,
+        decisions={leaf_call: ApprovalDecision.deny("no")},
+        tenant_id=TENANT,
+        expected_pause_id=paused.pause_id,
+    )
+    await assert_unwound(engine, paused.run_id, result)
+    assert published == []  # denied with the leaf's own gate snapshot
+
+
+async def test_input_meets_the_leafs_input_limit(
+    store: Any, engine: Any, ask_questions: None
+) -> None:
+    root = build(store, "input", limits=Limits(max_input_bytes=40))  # the brief fits
+    paused = await root.run("go", tenant_id=TENANT)
+    assert paused.status == RunStatus.WAITING_HUMAN_INPUT
+    child = await child_of(engine, paused.run_id)
+    with pytest.raises(ValueError):
+        await root.submit_input(
+            paused.run_id, "x" * 64, tenant_id=TENANT, expected_pause_id=paused.pause_id
+        )
+    assert (await run_row(engine, child.id)).status == "waiting_human_input"
+    result = await root.submit_input(
+        paused.run_id, "short", tenant_id=TENANT, expected_pause_id=paused.pause_id
+    )
+    await assert_unwound(engine, paused.run_id, result)
+
+
+async def test_requested_pause_through_the_root_reaches_the_running_leaf(
+    store: Any, engine: Any
+) -> None:
+    holder: dict[str, Any] = {}
+
+    async def pause_root(index: int, run_id: str | None) -> None:
+        if index == 0:
+            outcome = await holder["root"].request_pause(holder["root_id"], tenant_id=TENANT)
+            holder["outcome"] = outcome
+
+    async def remember(index: int, run_id: str | None) -> None:
+        holder.setdefault("root_id", run_id)
+
+    child = reviewer(
+        ContextLLM(
+            [call("count_words", {"text": "a b"}, "c1"), done(CHILD_TEXT)], on_call=pause_root
+        ),
+        tools=[count_words],
+    )
+    root = lead(
+        store,
+        ContextLLM([call("reviewer", {"task": BRIEF}, "r1"), done("root done")], on_call=remember),
+        child,
+    )
+    holder["root"] = root
+    paused = await root.run("go", tenant_id=TENANT)
+
+    assert paused.status == RunStatus.PAUSED and paused.pending.kind == "paused"
+    child_row = await child_of(engine, paused.run_id)
+    assert paused.pending.origin_run_id == child_row.id
+    affected = dict(holder["outcome"].affected)
+    assert affected[child_row.id] == "requested"
+    result = await root.submit_resume(
+        paused.run_id, tenant_id=TENANT, expected_pause_id=paused.pause_id
+    )
+    await assert_unwound(engine, paused.run_id, result)
+
+
+# ---------------------------------------------------------------------------
+# 4. Stale tokens, running leaves, child ids and tenant scope
+# ---------------------------------------------------------------------------
+
+
+async def test_stale_token_after_the_same_leaf_pauses_again(store: Any, engine: Any) -> None:
+    published.clear()
+    child = reviewer(
+        ContextLLM(
+            [
+                call("publish", {"text": "one"}, "c1"),
+                call("publish", {"text": "two"}, "c2"),
+                done(CHILD_TEXT),
+            ]
+        ),
+        tools=[publish],
+        require_approval=["publish"],
+    )
+    root = lead(
+        store, ContextLLM([call("reviewer", {"task": BRIEF}, "r1"), done("root done")]), child
+    )
+    first = await root.run("go", tenant_id=TENANT)
+    second = await root.submit_approval(
+        first.run_id, approved=True, tenant_id=TENANT, expected_pause_id=first.pause_id
+    )
+    assert second.status == RunStatus.WAITING_APPROVAL and second.pause_id != first.pause_id
+    assert second.pending.origin_run_id == first.pending.origin_run_id
+
+    with pytest.raises(PauseStatusMismatchError):
+        await root.submit_approval(
+            first.run_id, approved=True, tenant_id=TENANT, expected_pause_id=first.pause_id
+        )
+    assert published == ["one"]
+    result = await root.submit_approval(
+        first.run_id, approved=True, tenant_id=TENANT, expected_pause_id=second.pause_id
+    )
+    await assert_unwound(engine, first.run_id, result)
+    assert published == ["one", "two"]
+
+
+async def test_stale_token_never_approves_a_later_sibling(store: Any, engine: Any) -> None:
+    published.clear()
+    writer = Agent(
+        name="writer",
+        description="Writes.",
+        prompt="You write.",
+        provider=ContextLLM([call("publish", {"text": "w"}, "w1"), done("written")]),
+        tools=[publish],
+        require_approval=["publish"],
+    )
+    child = reviewer(
+        ContextLLM([call("publish", {"text": "r"}, "c1"), done(CHILD_TEXT)]),
+        tools=[publish],
+        require_approval=["publish"],
+    )
+    root = lead(
+        store,
+        ContextLLM(
+            [
+                call("reviewer", {"task": BRIEF}, "r1"),
+                call("writer", {"task": "write"}, "r2"),
+                done("root done"),
+            ]
+        ),
+        child,
+        writer,
+    )
+    first = await root.run("go", tenant_id=TENANT)
+    second = await root.submit_approval(
+        first.run_id, approved=True, tenant_id=TENANT, expected_pause_id=first.pause_id
+    )
+    assert second.status == RunStatus.WAITING_APPROVAL
+    assert second.pending.agent_path == ["lead", "writer"]
+    sibling = second.pending.origin_run_id
+    before = await run_row(engine, sibling)
+
+    with pytest.raises(PauseStatusMismatchError):
+        await root.submit_approval(
+            first.run_id, approved=True, tenant_id=TENANT, expected_pause_id=first.pause_id
+        )
+    after = await run_row(engine, sibling)
+    assert (after.status, after.claim_epoch) == (before.status, before.claim_epoch)
+    assert published == ["r"]
+    result = await root.submit_approval(
+        first.run_id, approved=True, tenant_id=TENANT, expected_pause_id=second.pause_id
+    )
+    assert result.status == RunStatus.SUCCESS and published == ["r", "w"]
+
+
+async def test_submit_while_the_leaf_runs_reports_a_running_root(store: Any, engine: Any) -> None:
+    holder: dict[str, Any] = {}
+
+    async def try_submit(index: int, run_id: str | None) -> None:
+        with pytest.raises(RunNotPausedError) as caught:
+            await holder["root"].submit_approval(
+                holder["root_id"],
+                approved=True,
+                tenant_id=TENANT,
+                expected_pause_id="01ZZZZZZZZZZZZZZZZZZZZZZZZ",
+            )
+        holder["error"] = caught.value
+
+    async def remember(index: int, run_id: str | None) -> None:
+        holder.setdefault("root_id", run_id)
+
+    child = reviewer(ContextLLM([done(CHILD_TEXT)], on_call=try_submit), tools=[])
+    root = lead(
+        store,
+        ContextLLM([call("reviewer", {"task": BRIEF}, "r1"), done("root done")], on_call=remember),
+        child,
+    )
+    holder["root"] = root
+    result = await root.run("go", tenant_id=TENANT)
+    assert result.status == RunStatus.SUCCESS
+    error = holder["error"]
+    assert error.run_id == result.run_id and error.current_status == RunStatus.RUNNING
+
+
+async def test_child_ids_are_refused_through_the_root_agent(store: Any, engine: Any) -> None:
+    root = build(store, "approval")
+    paused = await root.run("go", tenant_id=TENANT)
+    child = await child_of(engine, paused.run_id)
+    for attempt in (
+        lambda: root.submit_approval(
+            child.id, approved=True, tenant_id=TENANT, expected_pause_id=paused.pause_id
+        ),
+        lambda: root.resume(child.id, tenant_id=TENANT, expected_pause_id=paused.pause_id),
+        lambda: root.request_pause(child.id, tenant_id=TENANT),
+    ):
+        with pytest.raises(ManagedChildControlError):
+            await attempt()
+    assert (await run_row(engine, child.id)).status == "waiting_approval"
+
+
+@pytest.mark.parametrize("scope", ["foreign", "none"])
+async def test_foreign_and_none_scopes_are_not_found(store: Any, engine: Any, scope: str) -> None:
+    root = build(store, "approval")
+    paused = await root.run("go", tenant_id=TENANT)
+    child = await child_of(engine, paused.run_id)
+    tenant = "other" if scope == "foreign" else None
+    with pytest.raises(RunNotFoundError):
+        await root.submit_approval(
+            paused.run_id, approved=True, tenant_id=tenant, expected_pause_id=paused.pause_id
+        )
+    with pytest.raises(RunNotFoundError):
+        await RunStore(store).get_pending(paused.run_id, tenant_id=tenant)
+    with pytest.raises(RunNotFoundError):
+        await root.get_result(paused.run_id, tenant_id=tenant)
+    assert (await run_row(engine, child.id)).claim_epoch == child.claim_epoch
+
+
+async def test_omitted_scope_under_strict_tenancy_is_refused(store: Any, engine: Any) -> None:
+    from dendrux.errors import TenantScopeRequiredError
+
+    root = build(store, "approval")
+    paused = await root.run("go", tenant_id=TENANT)
+    with pytest.raises(TenantScopeRequiredError):
+        await root.submit_approval(paused.run_id, approved=True, expected_pause_id=paused.pause_id)
+
+
+async def test_unscoped_trusted_caller_claims_with_the_roots_actual_tenant(
+    store: Any, engine: Any
+) -> None:
+    published.clear()
+    root = build(store, "approval")
+    root._strict_tenancy = False
+    paused = await root.run("go", tenant_id=TENANT)
+    result = await root.submit_approval(
+        paused.run_id, approved=True, expected_pause_id=paused.pause_id
+    )
+    await assert_unwound(engine, paused.run_id, result)
+    child = await child_of(engine, paused.run_id)
+    assert child.tenant_id == TENANT and published == ["d"]

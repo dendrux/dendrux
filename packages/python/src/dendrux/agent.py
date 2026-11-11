@@ -1737,9 +1737,8 @@ class Agent:
             tool_results=tool_results,
             user_input=user_input,
         )
-        self._refuse_managed_entry("resume", run_id)
         # Validate args before any I/O
-        provider = self._require_provider()
+        self._require_provider()
         if tool_results is not None and user_input is not None:
             raise ValueError("Cannot provide both tool_results and user_input to resume().")
 
@@ -1750,11 +1749,49 @@ class Agent:
                 "Pass database_url or state_store to the constructor."
             )
 
+        def submit(agent: Agent, target: str) -> Awaitable[RunResult]:
+            return agent._resume_on(
+                store,
+                target,
+                tool_results=tool_results,
+                user_input=user_input,
+                notifier=notifier,
+                expected_pause_id=expected_pause_id,
+                tenant_explicit=tenant_explicit,
+            )
+
+        if self._subagents:
+            return await self._routed(
+                "resume",
+                store,
+                run_id,
+                tenant_id,
+                expected_pause_id,
+                notifier,
+                submit,
+                adopt_terminal=tool_results is None and user_input is None,
+                tool_results=tool_results,
+                user_input=user_input,
+            )
+        await _require_run_in_scope(store, run_id, tenant_id)
+        return await submit(self, run_id)
+
+    async def _resume_on(
+        self,
+        store: StateStore,
+        run_id: str,
+        *,
+        tool_results: list[ToolResult] | None,
+        user_input: UserContent | None,
+        notifier: LoopNotifier | None,
+        expected_pause_id: str | None,
+        tenant_explicit: bool,
+    ) -> RunResult:
+        """Resume ``run_id`` with this Agent's definition (the three ``resume`` modes)."""
         from dendrux.runtime.runner import resume as runner_resume
         from dendrux.runtime.runner import resume_with_input
 
-        await _require_run_in_scope(store, run_id, tenant_id)
-
+        provider = self._require_provider()
         if tool_results is not None:
             return await runner_resume(
                 run_id,
@@ -1808,6 +1845,52 @@ class Agent:
                     continue
             cleanup.result()
             raise
+
+    async def _routed(
+        self,
+        operation: Any,
+        store: StateStore,
+        run_id: str,
+        tenant_id: TenantScope,
+        expected_pause_id: str | None,
+        notifier: LoopNotifier | None,
+        submit: Callable[[Agent, str], Awaitable[RunResult]],
+        *,
+        adopt_terminal: bool = False,
+        **fields: Any,
+    ) -> RunResult:
+        """Route a root-id continuation of a managed workflow to its active leaf (0.7).
+
+        With ``adopt_terminal`` (a payload-free ``resume``), a finished subagent's
+        saved outcome is adopted without a token instead.
+
+        Tenant scope is checked at the root; the leaf is reached through the
+        persisted bindings and validated, claimed and continued with the
+        leaf's own registered definition. Finished outcomes then unwind
+        through adoption to the root, which returns its result or the next
+        external pause.
+        """
+        from dendrux.runtime import _managed
+
+        found = await _managed.route(self, store, run_id, tenant_id=tenant_id)
+        if adopt_terminal:
+            adopted = await _managed.adopt_terminal_leaf(found, store, notifier=notifier)
+            if adopted is not None:
+                return adopted
+        _managed.require_leaf_pause(found, expected_pause_id)
+        leaf = found.leaf_agent
+        if found.routed:
+            # The payload meets the leaf's own entry rules and limits too.
+            entry_checks(
+                leaf,
+                operation,
+                found.tenant_id,
+                default_tenant=UNSCOPED,
+                run_id=found.leaf.id,
+                **fields,
+            )
+        result = await submit(leaf, found.leaf.id)
+        return await _managed.unwind(found, store, result, notifier=notifier)
 
     async def submit_tool_results(
         self,
@@ -1864,8 +1947,50 @@ class Agent:
             run_id=run_id,
             tool_results=results,
         )
-        self._refuse_managed_entry("submit_tool_results", run_id)
         from dendrux.errors import PersistenceNotConfiguredError
+
+        self._require_provider()
+        store = await self._resolve_state_store()
+        if store is None:
+            raise PersistenceNotConfiguredError()
+
+        def submit(agent: Agent, target: str) -> Awaitable[RunResult]:
+            return agent._submit_tool_results_to(
+                store,
+                target,
+                results,
+                notifier=notifier,
+                expected_pause_id=expected_pause_id,
+                tenant_explicit=tenant_explicit,
+                manager=self._task_manager,
+            )
+
+        if self._subagents:
+            return await self._routed(
+                "submit_tool_results",
+                store,
+                run_id,
+                tenant_id,
+                expected_pause_id,
+                notifier,
+                submit,
+                tool_results=results,
+            )
+        await _require_run_in_scope(store, run_id, tenant_id)
+        return await submit(self, run_id)
+
+    async def _submit_tool_results_to(
+        self,
+        store: StateStore,
+        run_id: str,
+        results: list[ToolResult],
+        *,
+        notifier: LoopNotifier | None,
+        expected_pause_id: str | None,
+        tenant_explicit: bool,
+        manager: Any,
+    ) -> RunResult:
+        """Validate with this Agent's definition, claim ``run_id`` and continue it."""
         from dendrux.runtime.runner import resume_claimed
         from dendrux.runtime.submit import (
             claim_or_raise,
@@ -1876,11 +2001,6 @@ class Agent:
         from dendrux.types import RunStatus
 
         provider = self._require_provider()
-        store = await self._resolve_state_store()
-        if store is None:
-            raise PersistenceNotConfiguredError()
-
-        await _require_run_in_scope(store, run_id, tenant_id)
         skill_session = await continuation(self, store, run_id)
         with skill_session.bind(), await _continuation_projection(self, store, run_id):
             pause = await validate_tool_results(store, run_id, results)
@@ -1911,7 +2031,7 @@ class Agent:
 
             store = claimed_store(store, run_id, epoch)
 
-            task = self._task_manager.spawn(
+            task = manager.spawn(
                 run_id,
                 resume_claimed(
                     run_id,
@@ -1967,21 +2087,57 @@ class Agent:
             run_id=run_id,
             user_input=text,
         )
-        self._refuse_managed_entry("submit_input", run_id)
         from dendrux.errors import PersistenceNotConfiguredError
+
+        self._require_provider()
+        store = await self._resolve_state_store()
+        if store is None:
+            raise PersistenceNotConfiguredError()
+
+        def submit(agent: Agent, target: str) -> Awaitable[RunResult]:
+            return agent._submit_input_to(
+                store,
+                target,
+                text,
+                notifier=notifier,
+                expected_pause_id=expected_pause_id,
+                tenant_explicit=tenant_explicit,
+                manager=self._task_manager,
+            )
+
+        if self._subagents:
+            return await self._routed(
+                "submit_input",
+                store,
+                run_id,
+                tenant_id,
+                expected_pause_id,
+                notifier,
+                submit,
+                user_input=text,
+            )
+        await _require_run_in_scope(store, run_id, tenant_id)
+        return await submit(self, run_id)
+
+    async def _submit_input_to(
+        self,
+        store: StateStore,
+        run_id: str,
+        text: UserContent,
+        *,
+        notifier: LoopNotifier | None,
+        expected_pause_id: str | None,
+        tenant_explicit: bool,
+        manager: Any,
+    ) -> RunResult:
+        """Validate with this Agent's definition, claim ``run_id`` and continue it."""
+        from dendrux.chat import split_user_content
         from dendrux.runtime.runner import resume_claimed
         from dendrux.runtime.submit import claim_or_raise
         from dendrux.types import RunStatus
 
         provider = self._require_provider()
-        store = await self._resolve_state_store()
-        if store is None:
-            raise PersistenceNotConfiguredError()
-
-        from dendrux.chat import split_user_content
-
         projection, items = split_user_content(text, owner="text")
-        await _require_run_in_scope(store, run_id, tenant_id)
         skill_session = await continuation(self, store, run_id)
         with skill_session.bind(), await _continuation_projection(self, store, run_id):
             from dendrux.runtime.submit import require_pause_id
@@ -2016,7 +2172,7 @@ class Agent:
 
             store = claimed_store(store, run_id, epoch)
 
-            task = self._task_manager.spawn(
+            task = manager.spawn(
                 run_id,
                 resume_claimed(
                     run_id,
@@ -2102,23 +2258,8 @@ class Agent:
             rejection_reason=rejection_reason,
             decisions=decisions,
         )
-        self._refuse_managed_entry("submit_approval", run_id)
         from dendrux.errors import PersistenceNotConfiguredError
-        from dendrux.runtime.runner import resume_approval_approved_claim, resume_claimed
-        from dendrux.runtime.submit import (
-            build_rejection_results,
-            claim_or_raise,
-            decision_denial_results,
-            normalize_decisions,
-            preflight_status,
-            raise_for_non_paused_status,
-            require_pause_id,
-            serialize_decisions,
-            serialize_tool_results,
-            validate_approval_decisions,
-            validate_denial_results,
-        )
-        from dendrux.types import PauseState, RunStatus
+        from dendrux.runtime.submit import normalize_decisions
 
         if (approved is None) == (decisions is None):
             raise ValueError("submit_approval() takes exactly one of approved= or decisions=.")
@@ -2129,12 +2270,69 @@ class Agent:
             )
         pairs = normalize_decisions(decisions) if decisions is not None else None
 
-        provider = self._require_provider()
+        self._require_provider()
         store = await self._resolve_state_store()
         if store is None:
             raise PersistenceNotConfiguredError()
 
+        def submit(agent: Agent, target: str) -> Awaitable[RunResult]:
+            return agent._submit_approval_to(
+                store,
+                target,
+                approved=approved,
+                pairs=pairs,
+                rejection_reason=rejection_reason,
+                notifier=notifier,
+                expected_pause_id=expected_pause_id,
+                tenant_explicit=tenant_explicit,
+                manager=self._task_manager,
+            )
+
+        if self._subagents:
+            return await self._routed(
+                "submit_approval",
+                store,
+                run_id,
+                tenant_id,
+                expected_pause_id,
+                notifier,
+                submit,
+                rejection_reason=rejection_reason,
+                decisions=decisions,
+            )
         await _require_run_in_scope(store, run_id, tenant_id)
+        return await submit(self, run_id)
+
+    async def _submit_approval_to(
+        self,
+        store: StateStore,
+        run_id: str,
+        *,
+        approved: bool | None,
+        pairs: list[tuple[str, ApprovalDecision]] | None,
+        rejection_reason: str | None,
+        notifier: LoopNotifier | None,
+        expected_pause_id: str | None,
+        tenant_explicit: bool,
+        manager: Any,
+    ) -> RunResult:
+        """Validate the decision with this Agent's tools, claim ``run_id`` and continue it."""
+        from dendrux.runtime.runner import resume_approval_approved_claim, resume_claimed
+        from dendrux.runtime.submit import (
+            build_rejection_results,
+            claim_or_raise,
+            decision_denial_results,
+            preflight_status,
+            raise_for_non_paused_status,
+            require_pause_id,
+            serialize_decisions,
+            serialize_tool_results,
+            validate_approval_decisions,
+            validate_denial_results,
+        )
+        from dendrux.types import PauseState, RunStatus
+
+        provider = self._require_provider()
         skill_session = await continuation(self, store, run_id)
         with skill_session.bind(), await _continuation_projection(self, store, run_id):
             if pairs is not None:
@@ -2185,7 +2383,7 @@ class Agent:
                 from dendrux.runtime.state import claimed_store
 
                 store = claimed_store(store, run_id, epoch)
-                task = self._task_manager.spawn(
+                task = manager.spawn(
                     run_id,
                     resume_claimed(
                         run_id,
@@ -2211,7 +2409,7 @@ class Agent:
                 from dendrux.runtime.state import claimed_store
 
                 store = claimed_store(store, run_id, epoch)
-                task = self._task_manager.spawn(
+                task = manager.spawn(
                     run_id,
                     resume_approval_approved_claim(
                         run_id,
@@ -2248,7 +2446,7 @@ class Agent:
             from dendrux.runtime.state import claimed_store
 
             store = claimed_store(store, run_id, epoch)
-            task = self._task_manager.spawn(
+            task = manager.spawn(
                 run_id,
                 resume_claimed(
                     run_id,
@@ -2642,7 +2840,6 @@ class Agent:
         tenant_id = entry_checks(
             self, "request_pause", tenant_id, default_tenant=UNSCOPED, run_id=run_id, reason=reason
         )
-        self._refuse_managed_entry("request_pause", run_id)
         from dendrux.errors import PersistenceNotConfiguredError, RunNotFoundError
         from dendrux.types import PauseOutcome, RunStatus
 
@@ -2663,7 +2860,13 @@ class Agent:
 
         store_request_pause = require_store_method(store, "request_pause")
         order = [run_id]
-        if cascade:
+        if self._subagents:
+            # A managed root's request reaches its active branch, leaf first (0.7).
+            from dendrux.runtime._pending import managed_branch
+
+            hops, _, _ = await managed_branch(store, run_id, record.tenant_id)
+            order = [hop.run_id for hop in reversed(hops)]
+        elif cascade:
             subtree = await require_store_method(store, "get_subtree")(run_id, tenant_id=tenant_id)
             if subtree is not None:
                 order = _cascade_order(subtree)
@@ -2729,18 +2932,46 @@ class Agent:
         tenant_id = entry_checks(
             self, "submit_resume", tenant_id, default_tenant=UNSCOPED, run_id=run_id
         )
-        self._refuse_managed_entry("submit_resume", run_id)
         from dendrux.errors import PersistenceNotConfiguredError
+
+        self._require_provider()
+        store = await self._resolve_state_store()
+        if store is None:
+            raise PersistenceNotConfiguredError()
+
+        def submit(agent: Agent, target: str) -> Awaitable[RunResult]:
+            return agent._submit_resume_to(
+                store,
+                target,
+                notifier=notifier,
+                expected_pause_id=expected_pause_id,
+                tenant_explicit=tenant_explicit,
+                manager=self._task_manager,
+            )
+
+        if self._subagents:
+            return await self._routed(
+                "submit_resume", store, run_id, tenant_id, expected_pause_id, notifier, submit
+            )
+        await _require_run_in_scope(store, run_id, tenant_id)
+        return await submit(self, run_id)
+
+    async def _submit_resume_to(
+        self,
+        store: StateStore,
+        run_id: str,
+        *,
+        notifier: LoopNotifier | None,
+        expected_pause_id: str | None,
+        tenant_explicit: bool,
+        manager: Any,
+    ) -> RunResult:
+        """Claim this Agent's PAUSED ``run_id`` and continue it."""
         from dendrux.runtime.runner import resume_paused_claim
         from dendrux.runtime.submit import claim_or_raise
         from dendrux.types import RunStatus
 
         provider = self._require_provider()
-        store = await self._resolve_state_store()
-        if store is None:
-            raise PersistenceNotConfiguredError()
-
-        await _require_run_in_scope(store, run_id, tenant_id)
         skill_session = await continuation(self, store, run_id)
         with skill_session.bind(), await _continuation_projection(self, store, run_id):
             epoch = await claim_or_raise(
@@ -2753,7 +2984,7 @@ class Agent:
             from dendrux.runtime.state import claimed_store
 
             store = claimed_store(store, run_id, epoch)
-            task = self._task_manager.spawn(
+            task = manager.spawn(
                 run_id,
                 resume_paused_claim(
                     run_id,

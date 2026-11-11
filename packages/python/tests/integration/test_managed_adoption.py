@@ -516,13 +516,7 @@ async def test_child_pause_is_saved_without_fake_parent_result(store: Any, engin
     assert intent.outcome == "started"
     assert not await observations(engine, root_id)
 
-    # Root-facing continuations are explicitly unsupported in this build (T3).
-    with pytest.raises(ManagedUnsupportedError):
-        await root.submit_approval(
-            root_id, approved=True, expected_pause_id=result.pause_id, tenant_id=TENANT
-        )
-    with pytest.raises(ManagedUnsupportedError):
-        root.stream("go", tenant_id=TENANT)
+    # Root-facing continuations route to the leaf (T3: test_managed_routing.py).
 
     # Direct control of the child is refused after the tenant check; reads work.
     direct = child_agent(ContextLLM([]), tools=[publish], state_store=store)

@@ -800,6 +800,94 @@ async def complete_adoption(
 
 
 # ---------------------------------------------------------------------------
+# Root routing: a root-id control reaches the active leaf (0.7, T3)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Route:
+    """A root-id control resolved to the workflow's active leaf (in memory).
+
+    ``tenant_id`` is the root's actual tenant; every hop carries it. ``waiting``
+    lists the parents from the root down to the leaf's parent; the leaf is the
+    root itself when nothing is waiting.
+    """
+
+    root_run_id: str
+    tenant_id: str | None
+    waiting: tuple[_Waiting, ...]
+    leaf: RunRecord
+    leaf_agent: Agent
+
+    @property
+    def routed(self) -> bool:
+        """The leaf is a subagent, not the root itself."""
+        return bool(self.waiting)
+
+
+async def route(root_agent: Agent, store: Any, run_id: str, *, tenant_id: Any) -> Route:
+    """Resolve a control on ``run_id`` to its active leaf; tenant and root checked first.
+
+    A missing or foreign run is not found before anything is disclosed; a
+    managed child id is refused (``managed_root_required``). The leaf's Agent
+    is resolved from the registered path in ``root_agent``; a missing path
+    refuses before any claim.
+    """
+    from dendrux.errors import ManagedChildControlError, RunNotFoundError
+    from dendrux.runtime.state import UNSCOPED
+
+    record = await store.get_run(run_id)
+    if record is None or (tenant_id is not UNSCOPED and record.tenant_id != tenant_id):
+        raise RunNotFoundError(run_id)
+    if await managed_child_header(store, record):
+        raise ManagedChildControlError(run_id)
+    waiting, leaf = await walk(root_agent, store, run_id)
+    leaf_agent = waiting[-1].child if waiting else root_agent
+    return Route(run_id, record.tenant_id, tuple(waiting), leaf, leaf_agent)
+
+
+def require_leaf_pause(found: Route, expected_pause_id: str | None) -> None:
+    """A routed continuation needs the leaf's external pause and its token.
+
+    A subagent that runs, or whose outcome awaits adoption, leaves the root
+    RUNNING: nothing external to continue. Every external managed pause needs
+    ``expected_pause_id`` (strict or not); the leaf's claim then checks it.
+    """
+    from dendrux.errors import RunNotPausedError
+    from dendrux.runtime._pending import PAUSE_STATUSES
+    from dendrux.runtime.submit import _pause_id_required
+
+    if found.routed and found.leaf.status not in {s.value for s in PAUSE_STATUSES}:
+        raise RunNotPausedError(found.root_run_id, RunStatus.RUNNING)
+    if expected_pause_id is None and found.leaf.status in {s.value for s in PAUSE_STATUSES}:
+        _codes.log_code(logger, _codes.MANAGED_PAUSE_ID_REQUIRED, run_id=found.root_run_id)
+        raise _pause_id_required()
+
+
+async def unwind(found: Route, store: Any, result: RunResult, *, notifier: Any) -> RunResult:
+    """Continue from the leaf's result: descend, adopt and continue up to the root."""
+    return await _trampoline(
+        result,
+        list(found.waiting),
+        root_run_id=found.root_run_id,
+        store=_shared(store),
+        notifier=notifier,
+    )
+
+
+async def adopt_terminal_leaf(found: Route, store: Any, *, notifier: Any) -> RunResult | None:
+    """Adopt a finished subagent's saved outcome (no token needed); None otherwise."""
+    if not found.routed or found.leaf.status not in {s.value for s in TERMINAL_STATUSES}:
+        return None
+    waiting = list(found.waiting)
+    shared = _shared(store)
+    result = await adopt(waiting.pop(), store=shared, notifier=notifier)
+    return await _trampoline(
+        result, waiting, root_run_id=found.root_run_id, store=shared, notifier=notifier
+    )
+
+
+# ---------------------------------------------------------------------------
 # Restart: the same adoption and continuation, rebuilt from storage
 # ---------------------------------------------------------------------------
 
