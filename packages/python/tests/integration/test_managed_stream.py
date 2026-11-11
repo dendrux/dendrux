@@ -517,3 +517,116 @@ async def test_close_after_opening_event_for_a_leaf_pause_cancels_the_workflow(
     statuses = {r.agent_name: r.status for r in await rows(engine, AgentRun)}
     assert statuses == {"lead": "cancelled", "reviewer": "cancelled", "auditor": "cancelled"}
     assert published == before  # the approved tool never ran
+
+
+# ---------------------------------------------------------------------------
+# Fix round 1, R3: root-facing progress is structural, never briefs or tool content
+# ---------------------------------------------------------------------------
+
+NESTED_BRIEF = "SENTINEL-nested-brief-3f81"
+CHILD_TOOL_INPUT = "SENTINEL-child-tool-input-c2d9"
+CHILD_TOOL_RESULT = "SENTINEL-child-tool-result-77ab"
+GRAND_TOOL_INPUT = "SENTINEL-grand-tool-input-1e54"
+
+private_reads: list[str] = []
+
+
+@tool()
+async def read_private(text: str) -> str:
+    """Read a private document."""
+    private_reads.append(text)
+    return CHILD_TOOL_RESULT
+
+
+def _sentinel_tree(store: Any, *, approval: bool) -> Agent:
+    auditor = agent(
+        "auditor",
+        TaskLLM(
+            [call("read_private", {"text": GRAND_TOOL_INPUT}, "g1"), LLMResponse(text=GRAND_TEXT)]
+        ),
+        tools=[read_private],
+        **({"require_approval": ["read_private"]} if approval else {}),
+    )
+    reviewer = agent(
+        "reviewer",
+        TaskLLM(
+            [
+                call("read_private", {"text": CHILD_TOOL_INPUT}, "c1"),
+                call("auditor", {"task": NESTED_BRIEF}, "c2"),
+                LLMResponse(text=CHILD_TEXT),
+            ]
+        ),
+        tools=[read_private],
+        subagents=[auditor],
+    )
+    return lead(
+        store,
+        TaskLLM([call("reviewer", {"task": BRIEF}, "r1"), LLMResponse(text=ROOT_DONE)]),
+        reviewer,
+    )
+
+
+SECRETS = (
+    BRIEF,
+    NESTED_BRIEF,
+    CHILD_TOOL_INPUT,
+    CHILD_TOOL_RESULT,
+    GRAND_TOOL_INPUT,
+    GRAND_TEXT,
+    CHILD_TEXT,
+)
+
+
+def _progress(events: list[Any]) -> list[Any]:
+    """Every root-facing event except the terminal result (the root's own RunResult)."""
+    terminal = {
+        RunEventType.RUN_COMPLETED,
+        RunEventType.RUN_PAUSED,
+        RunEventType.RUN_ERROR,
+        RunEventType.RUN_CANCELLED,
+    }
+    return [e for e in events if e.type not in terminal]
+
+
+def _assert_structural(events: list[Any], root_id: str) -> None:
+    for event in _progress(events):
+        shown = repr(event) + repr(getattr(event.tool_call, "raw_arguments", None))
+        for secret in SECRETS:
+            assert secret not in shown, (secret, event.type)
+    tool_events = [
+        e for e in events if e.type in (RunEventType.TOOL_USE_END, RunEventType.TOOL_RESULT)
+    ]
+    child_ids = {e.run_id for e in tool_events} - {None, root_id}
+    assert child_ids  # structural progress from subagents remains
+    for event in tool_events:
+        assert event.tool_name and event.tool_call_id
+
+
+async def test_stream_progress_carries_no_briefs_or_child_tool_content(
+    store: Any, engine: Any
+) -> None:
+    root = _sentinel_tree(store, approval=False)
+    events = await collect(root.stream("go", tenant_id=TENANT))
+    final = events[-1].run_result
+    assert final.status == RunStatus.SUCCESS
+    _assert_structural(events, final.run_id)
+    assert final.answer == ROOT_DONE
+    reviewer_tool = [
+        e for e in events if e.type == RunEventType.TOOL_RESULT and e.tool_name == "read_private"
+    ]
+    assert reviewer_tool and all(e.tool_result.success for e in reviewer_tool)
+
+
+async def test_resume_stream_progress_carries_no_briefs_or_child_tool_content(
+    store: Any, engine: Any
+) -> None:
+    root = _sentinel_tree(store, approval=True)
+    paused = (await collect(root.stream("go", tenant_id=TENANT)))[-1]
+    _assert_structural_before_pause = _progress([paused])
+    assert not _assert_structural_before_pause
+    result = paused.run_result
+    events = await collect(
+        root.resume_stream(result.run_id, tenant_id=TENANT, expected_pause_id=result.pause_id)
+    )
+    assert events[-1].run_result.status == RunStatus.SUCCESS
+    _assert_structural(events, result.run_id)

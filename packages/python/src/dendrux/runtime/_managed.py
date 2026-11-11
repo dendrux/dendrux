@@ -957,8 +957,6 @@ async def adopt_terminal_leaf(found: Route, store: Any, *, notifier: Any) -> Run
 # Streaming: the same trampoline, advancing each run's generator in this task
 # ---------------------------------------------------------------------------
 
-_CHILD_HIDDEN = frozenset({"text_delta", "reasoning_delta", "run_started", "run_resumed"})
-"""Subagent events the workflow stream never forwards: text and lifecycle stay per run."""
 _LIFECYCLE_STARTS = frozenset({"run_started", "run_resumed"})
 _TERMINAL_EVENTS = frozenset({"run_completed", "run_paused", "run_error", "run_cancelled"})
 
@@ -979,14 +977,64 @@ class _StreamState:
     """``(run_id, claim)`` of a claimed continuation whose stream has not started yet."""
 
 
-def _forwarded(event: Any, run_id: str | None, *, root_level: bool, first: bool) -> Any:
-    """A root event as is; a subagent's progress tagged with its run id, never its text."""
+_TOOL_EVENTS = frozenset({"tool_use_start", "tool_use_end", "tool_result"})
+
+
+def _forwarded(
+    event: Any,
+    run_id: str | None,
+    *,
+    root_level: bool,
+    first: bool,
+    managed_names: frozenset[str] = frozenset(),
+) -> Any:
+    """What the root-facing stream shows of one run's event.
+
+    The root's own events pass as they are, except that a generated subagent
+    call is shown structurally (no ``task`` brief, no report). A subagent's
+    events are reduced to structural tool progress tagged with its run id:
+    ids, tool name, iteration and outcome code, never arguments, results,
+    text or lifecycle events. Detail stays on ``RunStore.follow(child_id)``.
+    """
     kind = getattr(event.type, "value", event.type)
     if root_level:
-        return None if (not first and kind in _LIFECYCLE_STARTS) else event
-    if kind in _CHILD_HIDDEN:
+        if not first and kind in _LIFECYCLE_STARTS:
+            return None
+        name = event.tool_name or getattr(event.tool_call, "name", None)
+        return _structural(event, event.run_id) if name in managed_names else event
+    if kind not in _TOOL_EVENTS:
         return None
-    return replace(event, run_id=run_id)
+    return _structural(event, run_id)
+
+
+def _structural(event: Any, run_id: str | None) -> Any:
+    """A tool event with ids, name, iteration, phase and outcome code only."""
+    from dendrux.types import RunEvent, ToolCall, ToolResult
+
+    call = event.tool_call
+    result = event.tool_result
+    code = (result.meta or {}).get("code") if result is not None else None
+    return RunEvent(
+        type=event.type,
+        run_id=run_id,
+        tool_name=event.tool_name or (call.name if call is not None else None),
+        tool_call_id=event.tool_call_id or (call.id if call is not None else None),
+        iteration=event.iteration,
+        phase=event.phase,
+        tool_call=None
+        if call is None
+        else ToolCall(name=call.name, params={}, id=call.id, provider_tool_call_id=None),
+        tool_result=None
+        if result is None
+        else ToolResult(
+            name=result.name,
+            call_id=result.call_id,
+            payload="",
+            success=result.success,
+            duration_ms=result.duration_ms,
+            meta={"code": code} if isinstance(code, str) else {},
+        ),
+    )
 
 
 def _child_stream(invocation: ManagedInvocation, notifier: Any) -> Any:
@@ -1035,7 +1083,9 @@ def _event(result: RunResult) -> Any:
     return RunEvent(type=kind, run_result=result, run_id=result.run_id, error=result.error)
 
 
-async def _drain(stream: Any, *, root_level: bool, first: bool) -> Any:
+async def _drain(
+    stream: Any, *, root_level: bool, first: bool, managed_names: frozenset[str] = frozenset()
+) -> Any:
     """Yield one run's forwarded events; the last item is its terminal event (or None).
 
     The run's own stream is closed here, in this task, however iteration ends.
@@ -1048,7 +1098,13 @@ async def _drain(stream: Any, *, root_level: bool, first: bool) -> Any:
             if getattr(event.type, "value", event.type) in _TERMINAL_EVENTS:
                 terminal = event
                 continue
-            out = _forwarded(event, stream.run_id, root_level=root_level, first=first)
+            out = _forwarded(
+                event,
+                stream.run_id,
+                root_level=root_level,
+                first=first,
+                managed_names=managed_names,
+            )
             if out is not None:
                 yield out
     yield _Terminal(terminal)
@@ -1082,7 +1138,8 @@ async def _run_leg(leg: _Leg, state: _StreamState, *, first: bool) -> Any:
     root_level = not state.waiting and leg.invocation is None
     state.current, state.root_active = leg.stream, root_level
     try:
-        items = _drain(leg.stream, root_level=root_level, first=first)
+        names = frozenset(child.name for child in state.root_agent.subagents)
+        items = _drain(leg.stream, root_level=root_level, first=first, managed_names=names)
         async with aclosing(items):
             async for item in items:
                 state.unstarted = None  # the leg's own stream now owns its cleanup
