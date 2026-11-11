@@ -183,6 +183,26 @@ def managed_invocation_scope(invocation: Any) -> Any:
         _managed_invocation.reset(token)
 
 
+_managed_root_reclaim: ContextVar[str | None] = ContextVar(
+    "dendrux_managed_root_reclaim", default=None
+)
+
+
+@contextlib.contextmanager
+def managed_root_reclaim_scope(run_id: str) -> Any:
+    """Mark the reclaim of managed child ``run_id`` as driven by its root (internal)."""
+    token = _managed_root_reclaim.set(run_id)
+    try:
+        yield
+    finally:
+        _managed_root_reclaim.reset(token)
+
+
+def managed_root_reclaim(run_id: str) -> bool:
+    """True only inside the root's reclaim of this exact managed child."""
+    return _managed_root_reclaim.get() == run_id
+
+
 def take_managed_invocation() -> Any:
     """Return the bound invocation once, clearing it for the rest of this run."""
     invocation = _managed_invocation.get()

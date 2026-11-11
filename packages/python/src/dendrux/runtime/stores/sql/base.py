@@ -357,6 +357,16 @@ def _note_blocked_event(session: AsyncSession, run_id: str, event_type: str) -> 
         session.info.setdefault(BLOCKED_RUNS_SESSION_KEY, set()).add(run_id)
 
 
+def _refuse_direct_managed_child(run_id: str, loop_state: Any) -> None:
+    """Managed children are reclaimed through their root (0.7); refuse before the claim."""
+    from dendrux.errors import ManagedChildControlError
+    from dendrux.runtime.context import managed_root_reclaim
+
+    header = (loop_state or {}).get(MANAGED_HEADER_KEY)
+    if isinstance(header, dict) and "invocation" in header and not managed_root_reclaim(run_id):
+        raise ManagedChildControlError(run_id)
+
+
 def _creation_metadata(
     session: AsyncSession, store: SQLStateStore, run_id: str, meta: dict[str, Any] | None
 ) -> dict[str, Any] | None:
@@ -5152,6 +5162,7 @@ class SQLStateStore(SQLBlobCatalog):
             def validate(row_mapping: Any) -> None:
                 nonlocal previous_epoch, cancelled, governance_changed, gap
                 row = SimpleNamespace(**row_mapping)
+                _refuse_direct_managed_child(run_id, row.loop_state)
                 checks = [
                     (row.storage_format == STORAGE_FORMAT_CHECKPOINTED, "legacy_run"),
                     (self.capabilities.recovery, "store_capability"),

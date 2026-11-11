@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from dataclasses import replace
 from functools import partial
 from typing import TYPE_CHECKING, Any, cast
@@ -22,6 +22,7 @@ from dendrux._lifecycle import (
 from dendrux.errors import PersistenceError, RunNotFoundError, RunNotReclaimableError
 from dendrux.loops._helpers import order_observations, project_message, record_message, record_tool
 from dendrux.runtime._bounds import MAX_PAGE
+from dendrux.runtime.context import managed_root_reclaim_scope
 from dendrux.runtime.persistence import PersistenceRecorder, resolve_pending
 from dendrux.runtime.state import MANAGED_BINDING_KEY, claimed_store
 from dendrux.types import (
@@ -69,24 +70,26 @@ async def reclaim(
         )
     session = SkillSession.prepare(agent)
     session.run_id = run_id
+    scope = managed_root_reclaim_scope(run_id) if via_root else nullcontext()
     try:
-        claim = await _ownership_handoff(
-            store,
-            lambda: store.reclaim_run(
-                run_id,
-                tenant_id=tenant_id,
-                agent_name=agent.name,
-                expected_claim_epoch=item.claim_epoch if item else None,
-                governance=governance_snapshot(agent),
-                governance_policy=agent._on_governance_change,
-                skill_pins={s.name: s.digest for s in session.available.values()},
-                loop_type="react"
-                if isinstance(agent._effective_loop(None) or ReActLoop(), ReActLoop)
-                else "single_call",
-            ),
-            partial(_cancel_claim, store, run_id),
-            run_id=run_id,
-        )
+        with scope:
+            claim = await _ownership_handoff(
+                store,
+                lambda: store.reclaim_run(
+                    run_id,
+                    tenant_id=tenant_id,
+                    agent_name=agent.name,
+                    expected_claim_epoch=item.claim_epoch if item else None,
+                    governance=governance_snapshot(agent),
+                    governance_policy=agent._on_governance_change,
+                    skill_pins={s.name: s.digest for s in session.available.values()},
+                    loop_type="react"
+                    if isinstance(agent._effective_loop(None) or ReActLoop(), ReActLoop)
+                    else "single_call",
+                ),
+                partial(_cancel_claim, store, run_id),
+                run_id=run_id,
+            )
         if claim is False:
             raise RunNotReclaimableError(run_id, "already_reclaimed")
     except (RunNotFoundError, RunNotReclaimableError) as exc:
@@ -99,6 +102,8 @@ async def reclaim(
         raise
     owned = claimed_store(store, run_id, claim)
     if not via_root:
+        # Stores that refuse before their claim never reach this; a custom store
+        # without that check is still refused here, after its claim.
         _refuse_direct_child(run_id, claim.loop_state)
     if _pending_adoption(claim.loop_state):
         # A managed parent claimed for adoption before its tool row completed:

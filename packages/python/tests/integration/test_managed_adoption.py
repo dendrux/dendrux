@@ -602,12 +602,19 @@ async def test_running_child_is_reclaimed_only_through_its_root(store: Any, engi
     assert child.status == "running"
 
     item = await expire(store, engine, child.id)
+    # The child is on its last allowed reclaim attempt.
+    async with engine.begin() as conn:
+        await conn.execute(
+            AgentRun.__table__.update()
+            .where(AgentRun.id == child.id)
+            .values(reclaim_limit=AgentRun.reclaim_attempts + 1)
+        )
+    before = await _recovery_state(engine, child.id)
     direct = child_agent(ContextLLM([]), tools=[note], state_store=store)
     with pytest.raises(ManagedChildControlError):
         await direct.reclaim(child.id, tenant_id=TENANT, item=item)
-    # The refusal comes after the store's claim (no extra read on ordinary reclaims),
-    # so it used that recovery mark: the root reclaims after the next expiry.
-    await expire(store, engine, child.id)
+    # Refused before the claim: epoch, lease mark, attempts and events unchanged.
+    assert await _recovery_state(engine, child.id) == before
 
     child_llm2 = ContextLLM([LLMResponse(text=REPORT)])
     root_llm2 = ContextLLM([LLMResponse(text="root done")])
@@ -668,3 +675,74 @@ async def test_blocked_child_entry_keeps_the_native_block_mark(store: Any, engin
     seen = [json.loads(m.content) for m in root_llm.messages[1] if m.role.value == "tool"]
     assert seen[0]["code"] == "managed_child_failed"
     assert secret not in json.dumps(seen)
+
+
+async def _recovery_state(engine: Any, run_id: str) -> tuple[Any, ...]:
+    row = (await rows(engine, AgentRun, AgentRun.id == run_id))[0]
+    events = await count(engine, RunEvent, RunEvent.agent_run_id == run_id)
+    return (
+        row.claim_epoch,
+        row.reclaim_attempts,
+        row.lease_expired_at is not None,
+        row.status,
+        events,
+    )
+
+
+async def test_pg_direct_child_reclaim_never_consumes_root_recovery(
+    store: Any, engine: Any
+) -> None:
+    """Independent sessions: a direct child reclaim refuses; the root recovers at once."""
+    _postgres(engine)
+
+    @tool()
+    async def note(text: str) -> str:
+        """Note."""
+        return "noted"
+
+    for _ in range(3):
+
+        class DyingLLM(ContextLLM):
+            async def complete(self, messages: Any, tools: Any = None, **kw: Any) -> LLMResponse:
+                if self.calls == 1:
+                    self.calls += 1
+                    raise ProcessDeathError
+                return await super().complete(messages, tools, **kw)
+
+        root = root_agent(
+            store,
+            ContextLLM([call("reviewer", {"task": BRIEF}, "r1")]),
+            child_agent(DyingLLM([call("note", {"text": "x"}, "c1")]), tools=[note]),
+        )
+        with pytest.raises(ProcessDeathError):
+            await root.run("go", tenant_id=TENANT)
+        root_id = await root_id_of(engine)
+        child = await child_of(engine, root_id)
+        item = await expire(store, engine, child.id)
+        async with engine.begin() as conn:
+            await conn.execute(
+                AgentRun.__table__.update()
+                .where(AgentRun.id == child.id)
+                .values(reclaim_limit=AgentRun.reclaim_attempts + 1)
+            )
+        second = create_async_engine(engine.url, pool_size=4)
+        try:
+            direct = child_agent(ContextLLM([]), tools=[note], state_store=store_for_engine(second))
+            child_llm = ContextLLM([LLMResponse(text=REPORT)])
+            restarted = root_agent(
+                store,
+                ContextLLM([LLMResponse(text="root done")]),
+                child_agent(child_llm, tools=[note]),
+            )
+            refused, recovered = await asyncio.gather(
+                direct.reclaim(child.id, tenant_id=TENANT, item=item),
+                restarted.reclaim(root_id, tenant_id=TENANT),
+                return_exceptions=True,
+            )
+        finally:
+            await second.dispose()
+        assert isinstance(refused, ManagedChildControlError), refused
+        assert not isinstance(recovered, BaseException), recovered
+        assert recovered.status == RunStatus.SUCCESS and child_llm.calls == 1
+        async with engine.begin() as conn:
+            await conn.execute(AgentRun.__table__.delete().where(AgentRun.agent_name == "lead"))
