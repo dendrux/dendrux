@@ -124,7 +124,7 @@ async def continue_claimed(
 
     session = SkillSession.prepare(agent)
     session.run_id = run_id
-    return await _continue_session(agent, store, run_id, claim, notifier, session)
+    return await _continue_session(agent, store, run_id, claim, notifier, session, reclaimed=False)
 
 
 async def _continue_session(
@@ -134,6 +134,8 @@ async def _continue_session(
     claim: ClaimResult,
     notifier: LoopNotifier | None,
     session: Any,
+    *,
+    reclaimed: bool = True,
 ) -> RunResult:
     from dendrux.runtime.runner import _resume_core, _stop_marked_continuation
 
@@ -171,7 +173,7 @@ async def _continue_session(
             _reclaim_record=record,
             _reclaim_submission=_unconsumed_submission(state, reader.raw),
         )
-        return _reclaimed_result(run_id, result)
+        return _reclaimed_result(run_id, result) if reclaimed else result
 
 
 def _refuse_direct_child(run_id: str, state: dict[str, Any] | None) -> None:
