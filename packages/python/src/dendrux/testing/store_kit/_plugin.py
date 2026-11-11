@@ -54,6 +54,7 @@ CATEGORIES = (
     "checkpointing",
     "atomic_completion",
     "recovery",
+    "managed_subagents",
     "concurrency",
     "crash_recovery",
     "live_updates",

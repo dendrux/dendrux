@@ -350,6 +350,7 @@ MUTANTS = {
             "test_an_oversized_checkpoint_is_refused_and_writes_nothing",
             "test_an_unpersistable_checkpoint_is_refused_before_any_write",
             "test_marking_is_repeatable_until_the_run_is_reclaimed",
+            "test_managed_child_reclaim_refuses_before_any_mutation",
             "test_progress_resets_recovery_streak_in_its_checkpoint",
             "test_reused_observation_and_duplicate_checkpoint_preserve_streak",
             "test_seeds_rewrites_and_conversation_pages",
@@ -445,6 +446,7 @@ class Injector(SqlFaultInjector):
         super().arm(store, point, kind=kind, **kw)
 """
 CRASH_FUNCTIONS = {
+    "test_managed_bind_is_all_or_nothing",
     "test_a_failed_write_is_repeated_safely_with_the_same_identity",
     "test_a_one_shot_failure_is_absorbed_or_retried_into_exactly_one_write",
     "test_finalize_that_fails_around_commit_leaves_one_final_state",
