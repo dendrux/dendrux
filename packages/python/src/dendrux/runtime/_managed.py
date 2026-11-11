@@ -849,25 +849,26 @@ async def walk(root_agent: Agent, store: Any, root_run_id: str) -> tuple[list[_W
     agent: Agent = root_agent
     path: tuple[str, ...] = ()
     for _ in range(_MAX_WALK):
-        binding = await _outgoing(store, record)
-        if binding is None:
+        wait = await _outgoing(store, record)
+        if wait is None or wait.managed_wait is None:
             return waiting, record
+        binding = wait.managed_wait
         child, path = await _bound_child(store, record, binding, root_run_id, path)
         child_agent = _registered(agent, path[-1], record.id)
-        intent = await _intent_call(store, record.id, binding.tool_call_id)
+        intent = await _intent_call(store, record.id, binding.tool_call_id, wait.iteration)
         waiting.append(_Waiting(agent, record.id, child_agent, path, intent, child.id))
         agent, record = child_agent, child
     raise ManagedStateError(reason="binding_conflict", run_id=root_run_id)
 
 
-async def _outgoing(store: Any, record: RunRecord) -> Any:
-    """The binding of a parent parked at a v3 managed wait, else None."""
+async def _outgoing(store: Any, record: RunRecord) -> PauseState | None:
+    """The v3 managed wait of a parked parent, else None."""
     if record.status != RunStatus.PAUSED.value:
         return None
     raw = await store.get_pause_state(record.id)
     if not raw or raw.get("schema_version") != 3:
         return None
-    return PauseState.from_managed_dict(raw, run_id=record.id).managed_wait
+    return PauseState.from_managed_dict(raw, run_id=record.id)
 
 
 async def _bound_child(
@@ -891,19 +892,30 @@ async def _bound_child(
     return child, header.path
 
 
-async def _intent_call(store: Any, parent_run_id: str, call_id: str) -> ToolCall:
-    """The bound call as the parent's model made it (its brief lives on the intent row)."""
+async def _intent_call(store: Any, parent_run_id: str, call_id: str, iteration: int) -> ToolCall:
+    """The bound call as the parent's model made it (its brief lives on the intent row).
+
+    Read only the wait's own iteration: its rows are one model batch, bounded by
+    ``Limits.max_pending_calls``, so the paged read ends; earlier history is never read.
+    """
     from dendrux.runtime._bounds import MAX_PAGE
 
-    for row in await store.get_tool_calls(parent_run_id, limit=MAX_PAGE):
-        if row.tool_call_id == call_id and row.target == "agent":
-            return ToolCall(
-                name=row.tool_name,
-                params=dict(row.params or {}),
-                id=row.tool_call_id,
-                provider_tool_call_id=row.provider_tool_call_id,
-            )
-    raise ManagedStateError(reason="binding_missing", run_id=parent_run_id)
+    offset = 0
+    while True:
+        page = await store.get_tool_calls(
+            parent_run_id, iteration_index=iteration, limit=MAX_PAGE, offset=offset
+        )
+        for row in page:
+            if row.tool_call_id == call_id and row.target == "agent":
+                return ToolCall(
+                    name=row.tool_name,
+                    params=dict(row.params or {}),
+                    id=row.tool_call_id,
+                    provider_tool_call_id=row.provider_tool_call_id,
+                )
+        if len(page) < MAX_PAGE:
+            raise ManagedStateError(reason="binding_missing", run_id=parent_run_id)
+        offset += MAX_PAGE
 
 
 def _registered(parent: Agent, name: str, parent_run_id: str) -> Agent:

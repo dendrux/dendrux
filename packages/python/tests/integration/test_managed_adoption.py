@@ -1117,3 +1117,72 @@ async def test_parent_block_policy_stops_the_parent_and_keeps_no_blocked_text(
     assert AWS_KEY not in await _durable_text(engine, root_id)
     assert AWS_KEY not in (result.error or "")
     assert (row.meta or {}).get(BLOCKED_META_KEY) is True
+
+
+# ---------------------------------------------------------------------------
+# Fix round 2
+# ---------------------------------------------------------------------------
+
+
+def _hooked_root(store: Any, root_llm: Any, child: Agent, decision: str) -> Agent:
+    async def hook(ctx: Any) -> Any:
+        from dendrux.types import ToolDecision
+
+        effects.append(f"hook:{ctx.tool_name}")
+        if decision == "deny":
+            return ToolDecision.deny("not now")
+        return ToolDecision.require_approval("check")
+
+    return Agent(
+        name="lead",
+        prompt="You lead.",
+        provider=root_llm,
+        state_store=store,
+        subagents=[child],
+        before_tool=hook,
+    )
+
+
+def _die_sync(*args: Any, **kwargs: Any) -> Any:
+    raise ProcessDeathError
+
+
+async def test_r6_reconnect_finds_the_intent_beyond_one_page_of_tool_rows(
+    store: Any, engine: Any, monkeypatch: Any
+) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    from dendrux.types import generate_ulid
+
+    root_id, child_id = await crash_before_adoption(store, engine, monkeypatch)
+    intent = (await rows(engine, ToolCallRecord, ToolCallRecord.agent_run_id == root_id))[0]
+    older = datetime.now(UTC) - timedelta(hours=1)
+    async with engine.begin() as conn:
+        await conn.execute(
+            ToolCallRecord.__table__.insert(),
+            [
+                dict(
+                    id=generate_ulid(),
+                    agent_run_id=root_id,
+                    tool_call_id=generate_ulid(),
+                    tool_name="fetch",
+                    target="server",
+                    params={"x": i},
+                    result={"ok": i},
+                    success=True,
+                    duration_ms=0,
+                    iteration_index=intent.iteration_index,
+                    outcome="completed",
+                    idempotent=False,
+                    created_at=older,
+                    updated_at=older,
+                )
+                for i in range(1001)
+            ],
+        )
+    root, root_llm, child_llm = fresh_root(store, LLMResponse(text="root done"))
+    result = await root.reclaim(root_id, tenant_id=TENANT)
+    assert result.status == RunStatus.SUCCESS and root_llm.calls == 1 and child_llm.calls == 0
+    assert len(await observations(engine, root_id)) == 1
+    adopted = (await rows(engine, ToolCallRecord, ToolCallRecord.id == intent.id))[0]
+    assert adopted.outcome == "completed"
