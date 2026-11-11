@@ -2499,7 +2499,7 @@ class Agent:
             result.output = _cached_output(record.answer, self._output_type, run_id)
         result.pending = await facade.get_pending(run_id, tenant_id=tenant_id)
         # A root waiting on a subagent reports its active branch (0.7).
-        result.status = RunStatus(facing_status(result.status.value, result.pending))
+        result.status = RunStatus(facing_status(result.status.value, facade.last_view))
         result.pause_id = result.pending.pause_id if result.pending else None
         return result
 

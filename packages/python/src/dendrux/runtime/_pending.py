@@ -593,18 +593,16 @@ class FacingView:
     managed: bool = False
 
 
-def facing_status(status: str, pending: PendingPause | None) -> str:
-    """The status a caller sees, given the stored status and the read pending.
+def facing_status(status: str, view: FacingView | None) -> str:
+    """The status a caller sees: the stored one, unless this read classified a managed view.
 
-    A subagent's pause routed through its root reports the subagent's waiting
-    status. A PAUSED run with no pending is a parent waiting on a subagent that
-    runs or awaits adoption (an ordinary PAUSED run always has a pending), so
-    it reads as RUNNING.
+    A managed view (a root waiting on a subagent) carries the status the same
+    reads observed: the leaf's waiting status, or RUNNING while a subagent runs
+    or awaits adoption. Nothing is inferred from a missing pending: an ordinary
+    run keeps its stored status even when it moved on before its pending read.
     """
-    if pending is not None and getattr(pending, "origin_run_id", None) is not None:
-        return str(pending.status)
-    if pending is None and status == RunStatus.PAUSED.value:
-        return RunStatus.RUNNING.value
+    if view is not None and view.managed:
+        return view.status
     return status
 
 
@@ -757,6 +755,8 @@ class _PendingReader:
 
     def __init__(self, state: Any) -> None:
         self._state = state
+        self.last_view: FacingView | None = None
+        """The view behind the last ``get_pending`` (status, pending and classification)."""
 
     async def facing(self, run_id: str, *, tenant_id: TenantScope) -> FacingView:
         """The run's status and pending as its caller sees them.
@@ -819,7 +819,9 @@ class _PendingReader:
         Raises:
             RunNotFoundError: the run does not exist or is outside ``tenant_id``.
         """
-        return (await self.facing(run_id, tenant_id=tenant_id)).pending
+        self.last_view = None
+        self.last_view = view = await self.facing(run_id, tenant_id=tenant_id)
+        return view.pending
 
     async def _pending_of(
         self,

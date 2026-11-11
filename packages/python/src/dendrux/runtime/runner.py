@@ -1261,15 +1261,16 @@ async def _load_persisted_pending(store: StateStore, result: RunResult, record: 
 
     result.pending = None
     result.pause_id = None
+    reader = _PendingReader(store)
     try:
-        result.pending = await _PendingReader(store).get_pending(
+        result.pending = await reader.get_pending(
             result.run_id, tenant_id=getattr(record, "tenant_id", None)
         )
     except Exception:
         _codes.log_code(logger, _codes.RESULT_READ_FAILED, run_id=result.run_id)
         return
     # A parent waiting on a subagent reports its active branch (0.7).
-    result.status = RunStatus(facing_status(result.status.value, result.pending))
+    result.status = RunStatus(facing_status(result.status.value, reader.last_view))
     result.pause_id = result.pending.pause_id if result.pending else None
 
 

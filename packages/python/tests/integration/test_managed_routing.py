@@ -1049,3 +1049,53 @@ async def test_an_agent_without_registrations_still_needs_the_token_for_a_manage
         after = await run_row(engine, run_id)
         assert (after.status, after.claim_epoch) == (before.status, before.claim_epoch)
     assert (await run_row(engine, paused.run_id)).status == root_row.status
+
+
+# ---------------------------------------------------------------------------
+# Fix round 1, R4: a result read never fabricates RUNNING
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("kind", ["legacy_requested", "managed_root"])
+async def test_cancel_between_record_and_pending_reads_never_reads_as_running(
+    store: Any, engine: Any, kind: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from dendrux.runtime._pending import _PendingReader
+
+    if kind == "legacy_requested":
+
+        async def pause_me(index: int, run_id: str | None) -> None:
+            if index == 0:
+                await store.request_pause(run_id)
+
+        agent = Agent(
+            name="solo",
+            prompt="p",
+            provider=ContextLLM([call("count_words", {"text": "a"}, "w1")], on_call=pause_me),
+            tools=[count_words],
+            state_store=store,
+        )
+        paused = await agent.run("go", tenant_id=TENANT)
+        assert paused.status == RunStatus.PAUSED and paused.pending.kind == "paused"
+    else:
+        agent = build(store, "approval")
+        paused = await agent.run("go", tenant_id=TENANT)
+        assert paused.status == RunStatus.WAITING_APPROVAL
+    run_id = paused.run_id
+    original = _PendingReader._summary
+    fired: list[bool] = []
+
+    async def cancel_first(self: Any, target: str, tenant_id: Any) -> Any:
+        if not fired:  # between the result-record read and the pending read
+            fired.append(True)
+            await agent.cancel_run(run_id, tenant_id=TENANT, cascade=True)
+        return await original(self, target, tenant_id)
+
+    monkeypatch.setattr(_PendingReader, "_summary", cancel_first)
+    loaded = await agent.get_result(run_id, tenant_id=TENANT)
+
+    assert fired
+    assert loaded.status != RunStatus.RUNNING
+    assert loaded.status in (RunStatus.PAUSED, RunStatus.WAITING_APPROVAL, RunStatus.CANCELLED)
+    assert loaded.pending is None
+    assert (await run_row(engine, run_id)).status == "cancelled"
