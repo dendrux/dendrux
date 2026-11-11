@@ -40,6 +40,8 @@ from dendrux.types import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from dendrux.agent import Agent
     from dendrux.loops.base import LoopNotifier, LoopRecorder
     from dendrux.runtime.state import EventWrite, RunRecord, StateStore
@@ -164,11 +166,9 @@ def new_run_id(invocation: ManagedInvocation | None) -> str:
     return invocation.child_run_id if invocation is not None else generate_ulid()
 
 
-def parent_context(invocation: ManagedInvocation | None) -> Any:
+def parent_context(invocation: ManagedInvocation | None, current: Callable[[], Any]) -> Any:
     """A managed child never inherits the caller's delegation context."""
-    from dendrux.runtime.context import get_delegation_context
-
-    return None if invocation is not None else get_delegation_context()
+    return None if invocation is not None else current()
 
 
 def parent_link(

@@ -2656,7 +2656,7 @@ async def _run_once(
         # is limited to dedup warning state on parent_ctx.warned_mismatches.
         # A managed child never inherits the caller's delegation context: its
         # parent link, level and depth come from its bound invocation.
-        parent_ctx = _managed.parent_context(invocation)
+        parent_ctx = _managed.parent_context(invocation, get_delegation_context)
         effective_max_depth = _resolve_max_delegation_depth(max_delegation_depth, parent_ctx)
         tenant_id = resolve_child_tenant(parent_ctx, tenant_id)
         runner_entry_checks(
