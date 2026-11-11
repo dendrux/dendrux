@@ -448,3 +448,72 @@ async def test_a_continued_parent_streams_its_next_subagent(store: Any, engine: 
     assert sorted(adopted) == sorted([CHILD_TEXT, "written"])
     tasks = {task for _, task in root_llm.served + reviewer.provider.served}
     assert len(tasks) == 1
+
+
+# ---------------------------------------------------------------------------
+# Fix round 1, R2: closing right after the opening event never strands a claim
+# ---------------------------------------------------------------------------
+
+
+async def _first_event_then_close(stream: Any) -> Any:
+    async with stream:
+        async for event in stream:
+            return event
+    return None
+
+
+async def test_close_after_opening_event_with_a_claimed_adoption_cancels_the_workflow(
+    store: Any, engine: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R -> C -> terminal G not yet adopted. resume_stream(R) adopts G into C (C now
+    claimed), yields RUN_RESUMED(R); the consumer closes: C is not left RUNNING."""
+    original = _managed.claim_adoption
+    crashed: list[bool] = []
+
+    async def crash_once(*args: Any, **kwargs: Any) -> Any:
+        if not crashed:
+            crashed.append(True)
+            raise CrashError
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(_managed, "claim_adoption", crash_once)
+    auditor = agent("auditor", TaskLLM([LLMResponse(text=GRAND_TEXT)]), tools=[])
+    reviewer = agent(
+        "reviewer",
+        TaskLLM([call("auditor", {"task": "audit"}, "c1"), LLMResponse(text=CHILD_TEXT)]),
+        subagents=[auditor],
+    )
+    root = lead(store, TaskLLM([call("reviewer", {"task": BRIEF}, "r1")]), reviewer)
+    with pytest.raises(CrashError):
+        await root.run("go", tenant_id=TENANT)
+    root_row = (await rows(engine, AgentRun, AgentRun.parent_run_id.is_(None)))[0]
+    middle = await child_of(engine, root_row.id)
+    leaf = await child_of(engine, middle.id)
+    assert (root_row.status, middle.status, leaf.status) == ("paused", "paused", "success")
+
+    first = await _first_event_then_close(root.resume_stream(root_row.id, tenant_id=TENANT))
+
+    assert first.type == RunEventType.RUN_RESUMED and first.run_id == root_row.id
+    after = {r.id: r for r in await rows(engine, AgentRun)}
+    assert after[middle.id].status == "cancelled"  # no live claim left without an owner
+    assert after[root_row.id].status == "cancelled"
+    assert len(await observations(engine, middle.id)) == 1  # the adoption itself stays
+    assert reviewer.provider.calls == 1  # the claimed continuation never ran
+
+
+async def test_close_after_opening_event_for_a_leaf_pause_cancels_the_workflow(
+    store: Any, engine: Any
+) -> None:
+    root = _depth_two(store)
+    paused = (await collect(root.stream("go", tenant_id=TENANT)))[-1].run_result
+    restarted = _depth_two(store, restarted=True)
+    before = list(published)
+
+    first = await _first_event_then_close(
+        restarted.resume_stream(paused.run_id, tenant_id=TENANT, expected_pause_id=paused.pause_id)
+    )
+
+    assert first.type == RunEventType.RUN_RESUMED
+    statuses = {r.agent_name: r.status for r in await rows(engine, AgentRun)}
+    assert statuses == {"lead": "cancelled", "reviewer": "cancelled", "auditor": "cancelled"}
+    assert published == before  # the approved tool never ran

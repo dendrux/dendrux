@@ -975,6 +975,8 @@ class _StreamState:
     waiting: list[_Waiting] | None = None
     root_active: bool = True
     """The active leg is the root's own: closing it cancels the root by itself."""
+    unstarted: tuple[str, Any] | None = None
+    """``(run_id, claim)`` of a claimed continuation whose stream has not started yet."""
 
 
 def _forwarded(event: Any, run_id: str | None, *, root_level: bool, first: bool) -> Any:
@@ -1083,11 +1085,13 @@ async def _run_leg(leg: _Leg, state: _StreamState, *, first: bool) -> Any:
         items = _drain(leg.stream, root_level=root_level, first=first)
         async with aclosing(items):
             async for item in items:
+                state.unstarted = None  # the leg's own stream now owns its cleanup
                 if isinstance(item, _Terminal):
                     leg.terminal = item.event
                 else:
                     yield item
     except Exception as exc:
+        state.unstarted = None
         if leg.invocation is None:
             raise
         leg.result, leg.bound = await _after_child_error(leg.invocation, exc)
@@ -1138,7 +1142,9 @@ async def _next_leg(leg: _Leg, state: _StreamState, notifier: Any) -> Any:
     claim = await claim_adoption(waiting[-1], state.store)
     if claim is None:
         return _event(await root_view(state.store, str(state.root_run_id)))
-    return _Leg(_continuation_stream(waiting.pop(), state.store, claim, notifier))
+    parent = waiting.pop()
+    state.unstarted = (parent.parent_run_id, claim)
+    return _Leg(_continuation_stream(parent, state.store, claim, notifier))
 
 
 async def _paused_or_failed(
@@ -1219,8 +1225,11 @@ async def _stream_failure(state: _StreamState, exc: Exception, run_id: str) -> A
 
 
 async def _close_workflow(state: _StreamState) -> RunResult | None:
-    """Abandoned stream: close the active run's stream, then cancel a waiting root."""
+    """Abandoned stream: release a claimed but unstarted continuation, close the active
+    run's stream, then cancel a waiting root with its descendants."""
     result = None
+    if state.unstarted is not None:
+        await _cancel_unstarted(state)
     if state.current is not None:
         await state.current.aclose()
         result = state.current.result
@@ -1230,6 +1239,29 @@ async def _close_workflow(state: _StreamState) -> RunResult | None:
         )
         result = await root_view(state.store, state.root_run_id)
     return result
+
+
+async def _cancel_unstarted(state: _StreamState) -> None:
+    """Finalize a continuation this stream claimed but never started, under its epoch.
+
+    Its own stream never ran, so its ordinary close-time cleanup has nothing to
+    finalize; without this the claimed run would stay RUNNING with no owner.
+    """
+    from dendrux._lifecycle import CancelReason
+    from dendrux.runtime.runner import _persist_run_cancellation
+    from dendrux.runtime.state import claimed_store
+
+    assert state.unstarted is not None
+    run_id, claim = state.unstarted
+    state.unstarted = None
+    owned = claimed_store(state.store, run_id, claim)
+    await _persist_run_cancellation(
+        owned,
+        run_id,
+        {"reason": CancelReason.STREAM_CLOSED.value, "partial_output": False},
+        on_won=lambda: None,
+        emit_event=True,
+    )
 
 
 def start_stream(root_agent: Agent, root_stream: Any, *, notifier: Any) -> RunStream:
@@ -1274,8 +1306,11 @@ def routed_stream(
             if claim is None:
                 state.waiting = []
                 return _Single(_event(await root_view(store, run_id))), None
-            first = _continuation_stream(waiting.pop(), store, claim, notifier)
-            state.waiting = waiting
+            parent = waiting.pop()
+            first = _continuation_stream(parent, store, claim, notifier)
+            # Cleanup ownership is in place before any event or the claim escapes.
+            state.waiting, state.unstarted = waiting, (parent.parent_run_id, claim)
+            state.current, state.root_active = first, not waiting
             # The root's own continuation opens with its RUN_RESUMED.
             return first, (resumed if waiting else None)
         require_leaf_pause(found, expected_pause_id)
@@ -1305,6 +1340,7 @@ def routed_stream(
             _tenant_explicit=tenant_explicit,
         )
         state.waiting = list(found.waiting)
+        state.current, state.root_active = first, not found.routed
         return first, (resumed if found.routed else None)
 
     return workflow_stream(root_agent, open_first, run_id=run_id, notifier=notifier)
