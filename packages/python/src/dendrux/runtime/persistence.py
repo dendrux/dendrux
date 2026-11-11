@@ -1918,7 +1918,7 @@ async def adopt_managed_result(
     patch = LoopStatePatch(
         remove_pending=(call_id,),
         set_phase="model_next",
-        set_fields={"managed_wait": None, "submission": None},
+        set_fields={"managed_wait": None, "submission": None, "managed_admitted": None},
     )
 
     async def complete() -> None:

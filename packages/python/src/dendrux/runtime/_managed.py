@@ -56,6 +56,8 @@ ORIGIN_KEY = "managed_origin"
 """``RunResult.meta`` key of a projected root view: the leaf run and its path."""
 
 MANAGED_WAIT_REASON = "managed_wait"
+ADMITTED_KEY = "managed_admitted"
+"""Checkpoint key: the pending managed call the live batch admitted before its handoff."""
 _MAX_WALK = 257
 """Bound on a root-to-leaf walk: the definition-node cap plus the root."""
 
@@ -263,10 +265,15 @@ async def prepare_handoff(
         raise DelegationDepthExceededError(level + 1, max_depth)
     pause: PauseState = result.meta["pause_state"]
     pause.history[:] = [await project_message(recorder, m) for m in pause.history]
+    state = getattr(recorder, "_loop_state", None)
+    if isinstance(state, dict):
+        # Durable admission evidence: this call passed validation, policy and
+        # approval in a live batch; recovery binds a pending call only with it.
+        state[ADMITTED_KEY] = handoff.call.id
     checkpoint = getattr(recorder, "checkpoint_outcome", None)
     if checkpoint is not None:
         await checkpoint(result, provider_kwargs)
-    state = getattr(recorder, "_loop_state", None) or {}
+    state = state or {}
     wait = replace(
         pause,
         pending_tool_calls=[handoff.call],

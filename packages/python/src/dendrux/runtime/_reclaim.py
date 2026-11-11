@@ -988,6 +988,7 @@ async def _recover_managed_calls(
         SubagentTool,
         _managed_batch_unsupported,
     )
+    from dendrux.runtime._managed import ADMITTED_KEY
 
     pending = ctx.pause_state.pending_tool_calls
     recorder = cast("PersistenceRecorder", ctx.recorder)
@@ -1008,6 +1009,9 @@ async def _recover_managed_calls(
     if len(pending) != 1:
         raise ManagedUnsupportedError("recover_mixed_batch", run_id)
     call = managed[0]
+    if state.get(ADMITTED_KEY) != call.id:
+        # No durable proof that validation, policy and approval admitted it.
+        raise ManagedUnsupportedError("recover_unadmitted_call", run_id)
     pause = replace(
         ctx.pause_state,
         history=ctx.history,

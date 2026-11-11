@@ -1147,6 +1147,100 @@ def _die_sync(*args: Any, **kwargs: Any) -> Any:
     raise ProcessDeathError
 
 
+@pytest.mark.parametrize("decision", ["deny", "approval"])
+async def test_r4a_unadmitted_pending_call_is_refused_before_policy_or_child(
+    store: Any, engine: Any, monkeypatch: Any, decision: str
+) -> None:
+    """Crash before preparation: no admission evidence, so no bind and no hook."""
+    from dendrux.loops import react
+
+    first = _hooked_root(
+        store,
+        ContextLLM([call("reviewer", {"task": BRIEF}, "r1")]),
+        child_agent(ContextLLM([])),
+        decision,
+    )
+    await _crash_at(
+        monkeypatch, react, "_prepare_tool_calls", lambda: first.run("go", tenant_id=TENANT)
+    )
+    root_id = await root_id_of(engine)
+    effects.clear()
+    item = await expire(store, engine, root_id)
+    child_llm = ContextLLM([LLMResponse(text=REPORT)])
+    fresh = _hooked_root(store, ContextLLM([]), child_agent(child_llm), decision)
+    with pytest.raises(ManagedUnsupportedError) as info:
+        await fresh.reclaim(root_id, tenant_id=TENANT, item=item)
+    assert info.value.operation == "recover_unadmitted_call"
+    assert effects == [] and child_llm.calls == 0
+    assert not await rows(engine, AgentRun, AgentRun.parent_run_id == root_id)
+
+
+async def test_r4a_recorded_denial_is_kept_and_no_child_runs(
+    store: Any, engine: Any, monkeypatch: Any
+) -> None:
+    from dendrux.loops import react
+
+    first = _hooked_root(
+        store,
+        ContextLLM([call("reviewer", {"task": BRIEF}, "r1")]),
+        child_agent(ContextLLM([])),
+        "deny",
+    )
+    with monkeypatch.context() as patch:
+        patch.setattr(react, "_split_targets", _die_sync)
+        with pytest.raises(ProcessDeathError):
+            await first.run("go", tenant_id=TENANT)
+    root_id = await root_id_of(engine)
+    effects.clear()
+    item = await expire(store, engine, root_id)
+    child_llm = ContextLLM([LLMResponse(text=REPORT)])
+    root_llm = ContextLLM([LLMResponse(text="ok")])
+    fresh = _hooked_root(store, root_llm, child_agent(child_llm), "deny")
+    result = await fresh.reclaim(root_id, tenant_id=TENANT, item=item)
+    assert result.status == RunStatus.SUCCESS
+    assert child_llm.calls == 0 and effects == []
+    assert not await rows(engine, AgentRun, AgentRun.parent_run_id == root_id)
+    seen = [m for m in root_llm.messages[0] if m.role.value == "tool"]
+    assert len(seen) == 1 and REPORT not in seen[0].content
+
+
+async def test_r4a_recorded_approval_gate_is_not_bound_on_recovery(
+    store: Any, engine: Any, monkeypatch: Any
+) -> None:
+    """A gate recorded for the batch (here on the server sibling; an approval hook on a
+    managed call is an ordinary denial, as for client targets) is never bypassed."""
+    from dendrux.loops import react
+
+    batch = LLMResponse(
+        tool_calls=[
+            ToolCall(name="reviewer", params={"task": BRIEF}, provider_tool_call_id="p1"),
+            ToolCall(name="fetch", params={"x": 1}, provider_tool_call_id="p2"),
+        ]
+    )
+    first = _recovery_root(
+        store, ContextLLM([batch]), _named("reviewer", ContextLLM([])), require_approval=["fetch"]
+    )
+    with monkeypatch.context() as patch:
+        patch.setattr(react, "_pause_result", _die_sync)
+        with pytest.raises(ProcessDeathError):
+            await first.run("go", tenant_id=TENANT)
+    root_id = await root_id_of(engine)
+    row = (await rows(engine, AgentRun, AgentRun.id == root_id))[0]
+    assert sorted(p["phase"] for p in row.loop_state["pending"]) == ["dispatchable", "gated"]
+    effects.clear()
+    item = await expire(store, engine, root_id)
+    child_llm = ContextLLM([LLMResponse(text=REPORT)])
+    fresh = _recovery_root(
+        store, ContextLLM([]), _named("reviewer", child_llm), require_approval=["fetch"]
+    )
+    with pytest.raises(ManagedUnsupportedError):
+        await fresh.reclaim(root_id, tenant_id=TENANT, item=item)
+    assert child_llm.calls == 0 and effects == []
+    assert not await rows(engine, AgentRun, AgentRun.parent_run_id == root_id)
+    gated = (await rows(engine, AgentRun, AgentRun.id == root_id))[0].loop_state["pending"]
+    assert "gated" in [p["phase"] for p in gated]  # the saved gate is preserved
+
+
 @pytest.mark.parametrize("refused_before_crash", [1, 2])
 async def test_r4b_partial_batch_refusal_refuses_the_rest_on_recovery(
     store: Any, engine: Any, monkeypatch: Any, refused_before_crash: int
