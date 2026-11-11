@@ -853,6 +853,17 @@ class PersistenceRecorder(BaseRecorder):
             self._remember(trace)
         self._durable_state = deepcopy(self._loop_state)
 
+    async def mark_managed_refusal(self, call_ids: list[str]) -> None:
+        """Durably refuse a whole unsupported managed batch before any single refusal (0.7).
+
+        Recovery refuses every listed call still pending, even when no managed
+        call remains, so a partial refusal never lets a sibling's effect run.
+        """
+        if not self._format2:
+            return
+        self._loop_state["managed_refused"] = list(call_ids)
+        await self._checkpoint()
+
     def order_observations(self, history: list[Message]) -> None:
         """Use the durable observation slots, including decisions made after resume."""
         if not self._format2:

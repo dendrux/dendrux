@@ -990,11 +990,17 @@ async def _recover_managed_calls(
     )
 
     pending = ctx.pause_state.pending_tool_calls
+    recorder = cast("PersistenceRecorder", ctx.recorder)
+    state = recorder._loop_state
+    refused = set(state.get("managed_refused") or ())
+    if refused and any(tc.id in refused for tc in pending):
+        # The whole batch was refused durably; finish refusing what is left.
+        await _refuse_recovered_batch(ctx, run_id, pending)
+        return None
     managed = [tc for tc in pending if isinstance(lookups.fn.get(tc.name), SubagentTool)]
     if not managed:
         return _ORDINARY
-    recorder = cast("PersistenceRecorder", ctx.recorder)
-    if recorder._loop_state.get("submission"):
+    if state.get("submission"):
         raise ManagedUnsupportedError("recover_managed_submission", run_id)
     if _managed_batch_unsupported(pending, lookups):
         await _refuse_recovered_batch(ctx, run_id, pending)
@@ -1034,6 +1040,8 @@ async def _refuse_recovered_batch(ctx: _ResumeContext, run_id: str, calls: list[
     recorder = cast("PersistenceRecorder", ctx.recorder)
     iteration = ctx.pause_state.iteration
     _codes.log_code(logger, _codes.MANAGED_BATCH_UNSUPPORTED, run_id=run_id, count=len(calls))
+    if not set(recorder._loop_state.get("managed_refused") or ()) >= {tc.id for tc in calls}:
+        await recorder.mark_managed_refusal([tc.id for tc in calls])
     for tc in calls:
         result = _managed_batch_result(tc)
         await record_tool(recorder, run_id, tc, result, iteration)

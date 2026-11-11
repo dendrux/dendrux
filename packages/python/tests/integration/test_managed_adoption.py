@@ -1147,6 +1147,54 @@ def _die_sync(*args: Any, **kwargs: Any) -> Any:
     raise ProcessDeathError
 
 
+@pytest.mark.parametrize("refused_before_crash", [1, 2])
+async def test_r4b_partial_batch_refusal_refuses_the_rest_on_recovery(
+    store: Any, engine: Any, monkeypatch: Any, refused_before_crash: int
+) -> None:
+    """Crash after each refusal, incl. the last managed one before the server call."""
+    from dendrux.loops import react
+
+    batch = LLMResponse(
+        tool_calls=[
+            ToolCall(name="reviewer", params={"task": BRIEF}, provider_tool_call_id="p1"),
+            ToolCall(name="auditor", params={"task": BRIEF}, provider_tool_call_id="p2"),
+            ToolCall(name="fetch", params={"x": 1}, provider_tool_call_id="p3"),
+        ]
+    )
+    first = _recovery_root(
+        store,
+        ContextLLM([batch]),
+        _named("reviewer", ContextLLM([])),
+        _named("auditor", ContextLLM([])),
+    )
+    original = react._ToolBatch.reject
+    done = {"n": 0}
+
+    async def reject(self: Any, tc: Any, result: Any) -> None:
+        await original(self, tc, result)
+        done["n"] += 1
+        if done["n"] == refused_before_crash:
+            raise ProcessDeathError
+
+    with monkeypatch.context() as patch:
+        patch.setattr(react._ToolBatch, "reject", reject)
+        with pytest.raises(ProcessDeathError):
+            await first.run("go", tenant_id=TENANT)
+    root_id = await root_id_of(engine)
+    effects.clear()
+    item = await expire(store, engine, root_id)
+    root_llm = ContextLLM([LLMResponse(text="regrouped")])
+    fresh = _recovery_root(
+        store, root_llm, _named("reviewer", ContextLLM([])), _named("auditor", ContextLLM([]))
+    )
+    result = await fresh.reclaim(root_id, tenant_id=TENANT, item=item)
+    assert result.status == RunStatus.SUCCESS and effects == []
+    tool_rows = await rows(engine, ToolCallRecord, ToolCallRecord.agent_run_id == root_id)
+    assert len(tool_rows) == 3
+    assert {r.meta.get("code") for r in tool_rows} == {"managed_batch_unsupported"}
+    assert not await rows(engine, AgentRun, AgentRun.parent_run_id == root_id)
+
+
 async def test_r5_recovered_bind_refuses_a_newly_single_call_child(
     store: Any, engine: Any, monkeypatch: Any
 ) -> None:

@@ -294,6 +294,9 @@ def _managed_batch_result(tc: ToolCall) -> ToolResult:
 async def _refuse_managed_batch(calls: Sequence[ToolCall], batch: _ToolBatch) -> None:
     """Answer every call of an unsupported batch before any hook, approval or effect."""
     _codes.log_code(logger, _codes.MANAGED_BATCH_UNSUPPORTED, run_id=batch.run_id, count=len(calls))
+    mark = getattr(batch.recorder, "mark_managed_refusal", None)
+    if mark is not None:
+        await mark([tc.id for tc in calls])  # durable for the whole batch, before any refusal
     for tc in calls:
         await batch.reject(tc, _managed_batch_result(tc))
 
