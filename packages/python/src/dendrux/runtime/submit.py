@@ -383,12 +383,16 @@ def _claim_request(
     expected_pause_id: str | None,
     *,
     fallbacks: tuple[str, ...] = (),
+    caller_token: bool | None = None,
 ) -> _ClaimRequest:
+    """``caller_token``: whether the caller supplied the token (default: it was given
+    when one is passed). A token the runtime pinned from the validated pause is not
+    the caller's."""
     return _ClaimRequest(
         raw,
         (expected_status, *fallbacks),
         _pause_generation(raw, expected_pause_id),
-        explicit=expected_pause_id is not None,
+        explicit=expected_pause_id is not None if caller_token is None else caller_token,
     )
 
 
@@ -693,8 +697,13 @@ async def claim_or_raise(
     validate: Callable[[dict[str, Any]], None] | None = None,
     blob_refs: Sequence[BlobEdge] | None = None,
     blob_refs_scope: str | None = None,
+    caller_token: bool | None = None,
 ) -> ClaimResult | int:
     """Perform a status preflight, then persist-first handoff + CAS claim.
+
+    ``caller_token=False`` marks an ``expected_pause_id`` the runtime pinned from
+    the pause it validated (not supplied by the caller): the claim still compares
+    it, and a managed run then refuses the claim for its missing token.
 
     The preflight reads the current status before attempting the CAS so
     that a never-paused running row does not get misclassified as a
@@ -733,7 +742,9 @@ async def claim_or_raise(
             store=store,
             run_id=run_id,
         )
-    request = _claim_request(raw, expected_status.value, expected_pause_id)
+    request = _claim_request(
+        raw, expected_status.value, expected_pause_id, caller_token=caller_token
+    )
     validate = submission_validator(
         run_id,
         raw,

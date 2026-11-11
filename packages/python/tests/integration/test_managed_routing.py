@@ -996,6 +996,7 @@ async def test_pg_tokenless_continuation_cannot_cross_root_running_to_its_own_pa
         assert found.leaf.status == "running"  # the routing snapshot
         llm.gate.set()
         holder["paused"] = await running  # the root persists its own pause now
+        holder["epoch"] = (await run_row(engine, root_id)).claim_epoch
         return found
 
     monkeypatch.setattr(_managed, "route", barrier)
@@ -1011,7 +1012,7 @@ async def test_pg_tokenless_continuation_cannot_cross_root_running_to_its_own_pa
     assert paused.status in (RunStatus.WAITING_HUMAN_INPUT, RunStatus.PAUSED)
     row = await run_row(engine, root_id)
     assert row.status == paused.status.value
-    assert row.claim_epoch == (await run_row(engine, root_id)).claim_epoch
+    assert row.claim_epoch == holder["epoch"]  # before vs after the refused attempt
     assert not any(k.startswith("submitted") for k in (row.pause_data or {}))
     assert llm.calls == 1  # the root never continued
 
@@ -1049,6 +1050,64 @@ async def test_an_agent_without_registrations_still_needs_the_token_for_a_manage
         after = await run_row(engine, run_id)
         assert (after.status, after.claim_epoch) == (before.status, before.claim_epoch)
     assert (await run_row(engine, paused.run_id)).status == root_row.status
+
+
+@pytest.mark.parametrize("entry", ["submit_tool_results", "deny_decisions", "reject"])
+@pytest.mark.parametrize("managed", [True, False])
+async def test_a_runtime_pinned_token_is_not_a_caller_token(
+    store: Any, engine: Any, entry: str, managed: bool
+) -> None:
+    """The client-result and denial paths pin the validated pause's token for their CAS;
+    that pin is not the caller's token. A rebuilt Agent without registrations must
+    still send it for a managed run; an ordinary run keeps the tokenless rule."""
+    client = entry == "submit_tool_results"
+    first = (
+        call("read_sheet", {"sheet": "S1"}, "x1")
+        if client
+        else call("publish", {"text": "x"}, "x1")
+    )
+    kwargs: dict[str, Any] = {
+        "tools": [read_sheet] if client else [publish],
+        "strict_tenancy": False,
+    }
+    if not client:
+        kwargs["require_approval"] = ["publish"]
+    llm = ContextLLM([first, done("own done")])
+    if managed:
+        owner = lead(store, llm, reviewer(ContextLLM([])), **kwargs)
+    else:
+        owner = Agent(name="lead", prompt="You lead.", provider=llm, state_store=store, **kwargs)
+    paused = await owner.run("go", tenant_id=TENANT)
+    assert paused.pending.origin_run_id is None
+    call_id = paused.pending.tool_calls[0].id
+    plain = Agent(
+        name="lead",
+        prompt="You lead.",
+        provider=ContextLLM([done("plain done")]),
+        state_store=store,
+        **kwargs,
+    )
+    before = await run_row(engine, paused.run_id)
+
+    async def attempt() -> Any:
+        if client:
+            result = ToolResult(name="read_sheet", call_id=call_id, payload='"cells"')
+            return await plain.submit_tool_results(paused.run_id, [result])
+        if entry == "deny_decisions":
+            return await plain.submit_approval(
+                paused.run_id, decisions={call_id: ApprovalDecision.deny("no")}
+            )
+        return await plain.submit_approval(paused.run_id, approved=False)
+
+    if managed:
+        with pytest.raises(InputValidationError) as caught:
+            await attempt()
+        assert caught.value.code == "pause_id_required"
+        after = await run_row(engine, paused.run_id)
+        assert (after.status, after.claim_epoch) == (before.status, before.claim_epoch)
+    else:
+        result = await attempt()  # ordinary omission rules are unchanged
+        assert result.status == RunStatus.SUCCESS
 
 
 # ---------------------------------------------------------------------------

@@ -2024,6 +2024,7 @@ class Agent:
                 expected_pause_id=(
                     expected_pause_id if expected_pause_id is not None else pause.pause_id
                 ),
+                caller_token=expected_pause_id is not None,
                 call_results=results,
                 **claim_kwargs,
             )
@@ -2379,6 +2380,7 @@ class Agent:
                     expected_pause_id=(
                         expected_pause_id if expected_pause_id is not None else pause_state.pause_id
                     ),
+                    caller_token=expected_pause_id is not None,
                 )
                 from dendrux.runtime.state import claimed_store
 
@@ -2442,6 +2444,7 @@ class Agent:
                 expected_pause_id=(
                     expected_pause_id if expected_pause_id is not None else pause_state.pause_id
                 ),
+                caller_token=expected_pause_id is not None,
             )
             from dendrux.runtime.state import claimed_store
 
