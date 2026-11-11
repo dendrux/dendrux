@@ -297,3 +297,70 @@ async def test_managed_root_refuses_unsupported_configuration(
         with pytest.raises(ValueError, match="store"):
             await root.run(ROOT_INPUT, tenant_id=TENANT)
     assert root_llm.calls == 0
+
+
+class HookCounter(BaseNotifier):
+    """Counts every hook per run and per call; a second delivery route would double them."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, Any]] = []
+
+    async def on_run_started(self, run_id: str, **kwargs: Any) -> None:
+        self.calls.append(("run_started", run_id, None))
+
+    async def on_llm_call_completed(
+        self, run_id: str, response: Any, iteration: int, **kw: Any
+    ) -> None:
+        self.calls.append(("llm", run_id, iteration))
+
+    async def on_tool_completed(self, run_id: str, call: Any, result: Any, iteration: int) -> None:
+        self.calls.append(("tool", run_id, call.id))
+
+    async def on_run_finished(self, run_id: str, *args: Any, **kwargs: Any) -> None:
+        self.calls.append(("finished", run_id, None))
+
+
+async def test_one_observer_is_never_delivered_twice_through_nested_routes(
+    store: Any, engine: Any
+) -> None:
+    """§5a: one notifier reaches root, child and grandchild once per hook.
+
+    Agents have no notifier configuration of their own, so the routes an observer can
+    reach a run by are the call-level notifier, its inheritance through each managed
+    level, and the parent's continuation after adoption.
+    """
+    word_calls.clear()
+    grandchild = child_agent(
+        store, ContextLLM([LLMResponse(text="leaf")]), name="auditor", tools=[]
+    )
+    child = Agent(
+        name="reviewer",
+        description="Reviews.",
+        prompt="r",
+        provider=ContextLLM(
+            [
+                call("count_words", {"text": "a b"}, "c1"),
+                call("auditor", {"task": "check"}, "c2"),
+                LLMResponse(text=REPORT),
+            ]
+        ),
+        tools=[count_words],
+        subagents=[grandchild],
+    )
+    root_llm = ContextLLM([call("reviewer", {"task": BRIEF}, "r1"), LLMResponse(text="ok")])
+    observer = HookCounter()
+    result = await root_agent(store, root_llm, child).run(
+        ROOT_INPUT, tenant_id=TENANT, notifier=observer
+    )
+    assert result.status.value == "success"
+    runs = await rows(engine, AgentRun)
+    assert len(runs) == 3
+    duplicates = {c for c in observer.calls if observer.calls.count(c) > 1}
+    # Starts repeat only for a parent's continuation segment, never within one segment.
+    assert {c for c in duplicates if c[0] != "run_started"} == set()
+    for run in runs:
+        assert observer.calls.count(("finished", run.id, None)) == 1
+    started = [c[1] for c in observer.calls if c[0] == "run_started"]
+    leaf = next(r.id for r in runs if r.agent_name == "auditor")
+    assert started.count(leaf) == 1
+    assert started.count(result.run_id) == 2  # initial segment + continuation after adoption

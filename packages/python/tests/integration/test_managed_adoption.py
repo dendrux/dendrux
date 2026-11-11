@@ -29,9 +29,8 @@ from dendrux.errors import (
 )
 from dendrux.runtime import _managed, _reclaim
 from dendrux.runtime.context import get_delegation_context
-from dendrux.runtime.persistence import message_trace
 from dendrux.runtime.stores._factory import store_for_engine
-from dendrux.types import Limits, LLMResponse, Message, Role, RunStatus, ToolCall
+from dendrux.types import Limits, LLMResponse, RunStatus, ToolCall
 from tests._helpers.recovery_checkpoint import expire
 from tests._helpers.scripted_provider import ScriptedLLM
 
@@ -333,11 +332,15 @@ async def test_pg_cancel_versus_adoption_claim_never_revives_the_root(
         root_id, _ = await crash_before_adoption(store, engine, monkeypatch)
         root, root_llm, child_llm = fresh_root(store, LLMResponse(text="root done"))
         canceller, _, _ = fresh_root(store)
-        await asyncio.gather(
+        results = await asyncio.gather(
             root.reclaim(root_id, tenant_id=TENANT),
             canceller.cancel_run(root_id, tenant_id=TENANT),
             return_exceptions=True,
         )
+        for r in results:  # only the ordinary live-owner refusal is acceptable
+            if isinstance(r, BaseException):
+                assert isinstance(r, RunNotReclaimableError), r
+                assert r.reason in {"lease_fresh", "cancelled", "not_running"}, r.reason
         final = (await rows(engine, AgentRun, AgentRun.id == root_id))[0]
         intent = (await rows(engine, ToolCallRecord, ToolCallRecord.agent_run_id == root_id))[0]
         assert final.status in {"cancelled", "success"}
@@ -570,11 +573,6 @@ async def test_shared_template_across_tenants_does_not_leak(store: Any, engine: 
     assert (template.name, template.tools, template.provider, template._state_store) == before
 
 
-async def test_seeded_trace_helper_is_importable() -> None:
-    # Keeps message_trace / Message imports honest for the store-kit helpers.
-    assert message_trace(Message(role=Role.USER, content="x"), 0).role == "user"
-
-
 class ProcessDeathError(BaseException):
     """Ends the caller like a killed process: no runner cleanup finalizes the run."""
 
@@ -648,3 +646,25 @@ async def test_duplicate_bind_never_drives_a_second_child(
     ((repeat, bound),) = repeats
     assert bound is False and repeat.meta.get(_managed.NOT_OWNER_KEY)
     assert len(await rows(engine, AgentRun, AgentRun.parent_run_id == result.run_id)) == 1
+
+
+async def test_blocked_child_entry_keeps_the_native_block_mark(store: Any, engine: Any) -> None:
+    """A brief the child's guardrail blocks: the bound child carries the store's block mark."""
+    from dendrux._meta_keys import BLOCKED_META_KEY
+    from dendrux.guardrails import SecretDetection
+
+    secret = "AKIAIOSFODNN7EXAMPLE"
+    child_llm = ContextLLM([LLMResponse(text="never")])
+    child = child_agent(child_llm, guardrails=[SecretDetection(action="block")])
+    root_llm = ContextLLM(
+        [call("reviewer", {"task": f"use {secret}"}, "r1"), LLMResponse(text="handled")]
+    )
+    result = await root_agent(store, root_llm, child).run("go", tenant_id=TENANT)
+
+    assert result.status == RunStatus.SUCCESS and child_llm.calls == 0
+    child_row = await child_of(engine, result.run_id)
+    assert child_row.status == "error"
+    assert child_row.meta.get(BLOCKED_META_KEY) is True
+    seen = [json.loads(m.content) for m in root_llm.messages[1] if m.role.value == "tool"]
+    assert seen[0]["code"] == "managed_child_failed"
+    assert secret not in json.dumps(seen)
