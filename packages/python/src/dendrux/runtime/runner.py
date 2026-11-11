@@ -25,7 +25,7 @@ from contextlib import aclosing, asynccontextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from functools import partial
-from typing import TYPE_CHECKING, Any, NamedTuple, NoReturn, get_args, overload
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, NoReturn, get_args, overload
 
 from dendrux import _codes
 from dendrux._lifecycle import (
@@ -96,9 +96,10 @@ from dendrux.loops._helpers import (
     record_tool,
 )
 from dendrux.loops._policy_context import dispatch_policy, history_call_counts, static_denial
-from dendrux.loops.react import ReActLoop
+from dendrux.loops.react import MANAGED_HANDOFF_KEY, ReActLoop
 from dendrux.runtime import _reclaim
 from dendrux.runtime._entry_checks import resolve_runner_tenant, runner_entry_checks
+from dendrux.runtime._managed import DESCEND_KEY as MANAGED_DESCEND_KEY
 from dendrux.runtime._tenant_checks import _tenant_scope_chosen
 from dendrux.runtime._tracelink import validate_trace_link
 from dendrux.runtime.context import (
@@ -110,6 +111,7 @@ from dendrux.runtime.context import (
     resolve_child_tenant,
     resolve_parent_link,
     set_delegation_context,
+    take_managed_invocation,
 )
 from dendrux.runtime.replay import (
     PARTS_KEY,
@@ -364,16 +366,28 @@ class _RunLifecycle:
     notifier_closed: bool = False
     recorder: LoopRecorder | None = None
 
-    def _claim(self, store: StateStore, loop: Loop, created: CreateRunResult) -> StateStore:
+    def _claim(
+        self,
+        store: StateStore,
+        loop: Loop,
+        created: CreateRunResult,
+        claim: ClaimResult | None = None,
+        managed_root: bool = False,
+    ) -> StateStore:
         self.run_id = created.run_id
         state = (
             _initial_loop_state(_recovery_loop_name(loop))
             if created.storage_format == STORAGE_FORMAT_CHECKPOINTED
             else None
         )
+        # A managed child's token comes from its bind and carries its header.
         self.store = claimed_store(
-            store, self.run_id, ClaimResult(0, created.storage_format, state, None)
+            store, self.run_id, claim or ClaimResult(0, created.storage_format, state, None)
         )
+        if managed_root:
+            from dendrux.runtime import _managed
+
+            _managed.stamp_root_header(self.store, self.run_id)
         self.owned = True
         if self.manager is not None:
             self.manager.register_current(self.run_id)
@@ -383,6 +397,8 @@ class _RunLifecycle:
     async def _finish(
         self, recorder: LoopRecorder | None, notifier: LoopNotifier | None, result: RunResult
     ) -> None:
+        if MANAGED_DESCEND_KEY in result.meta:
+            return  # Not finished: the parent continues after its child is adopted.
         self.recorder_closed = True
         await record_run_finished(recorder, self.run_id, result)
         self.notifier_closed = True
@@ -507,10 +523,12 @@ def _runtime_recorder(
     seeds: dict[str, Any],
     guardrails: Any,
 ) -> LoopRecorder:
+    from dendrux.runtime._subagents import subagent_tool_def
     from dendrux.runtime.persistence import PersistenceRecorder
     from dendrux.tool import get_tool_def
 
     definitions = [get_tool_def(fn) for fn in agent.tools]
+    definitions.extend(subagent_tool_def(child) for child in agent.subagents)
     recorder = PersistenceRecorder(
         store,
         run_id,
@@ -1555,62 +1573,21 @@ async def _persist_loop_outcome(
     if cancel_request is not None:
         return await _finalize_cancelled(*cancel_request)
 
+    if result.meta.get(MANAGED_HANDOFF_KEY) is not None:
+        return await _persist_managed_handoff(
+            state_store, run_id, result, recorder, provider_kwargs, _finalize_cancelled
+        )
+
     if result.status in _PAUSE_STATUSES:
-        # Pre-pause checkpoint as one CAS: the pause persists only while the
-        # row is RUNNING with no pending cancel. Cancellation wins over pause;
-        # any durable pause (incl. WAITING_*) satisfies a pause request. The
-        # pause and its run.paused event commit together, so a finalizer of
-        # paused runs (cancel_run, sweep) always acts after the event.
-        await _check_claim(state_store, run_id)
-        _ensure_pause_generation(result, provider_kwargs)
-        pause_state: PauseState = result.meta["pause_state"]
-        # A pause generation belongs to this transition, never to the prior
-        # pause from which this execution was resumed.
-        pause_state = replace(pause_state, pause_id=generate_ulid())
-        result.meta["pause_state"] = pause_state
-        if (
-            pause_state.pause_reason == PauseReason.REQUESTED.value
-            and pause_state.pause_message is None
-        ):
-            pause_state = replace(
-                pause_state, pause_message=await _pause_request_message(state_store, run_id)
-            )
-            result.meta["pause_state"] = pause_state
-        paused_data = _pause_event_data(result, pause_state)
-        record = await state_store.get_run(run_id)
-        checkpoint = getattr(recorder, "checkpoint_outcome", None)
-        if checkpoint is not None:
-            pause_state.history[:] = [
-                await project_message(recorder, m) for m in pause_state.history
-            ]
-            await checkpoint(result, provider_kwargs)
-        pause_data = {**pause_state.to_dict(), "status": result.status.value}
-        if record is not None and GOVERNANCE_KEY in (getattr(record, "meta", None) or {}):
-            pause_data[GOVERNANCE_KEY] = (record.meta or {})[GOVERNANCE_KEY]
-        paused = await _pause_with_event(
+        return await _persist_pause(
             state_store,
             run_id,
-            status=result.status.value,
-            pause_data=pause_data,
-            event_data=paused_data,
-            iteration_count=result.iteration_count,
-            pii_mapping=result.meta.get("pii_mapping"),
-            total_usage=result.usage,
-        )
-        if not paused:
-            # CAS lost: honor the winner. On a still-RUNNING row only a
-            # pending cancel makes the CAS miss, so finalize cancelled.
-            record = await state_store.get_run(run_id)
-            if record is not None and record.status != RunStatus.RUNNING.value:
-                return await _persisted(RunStatus(record.status))
-            return await _finalize_cancelled(
-                [RunStatus.RUNNING.value], {"reason": CancelReason.CANCEL_REQUESTED.value}
-            )
-        result.pause_id = pause_state.pause_id
-        # Return the persisted state: a finalizer may already have acted on
-        # the durable pause (e.g. cancel_run right after it committed).
-        return await _committed_pause_result(
-            state_store, _wrap(status=result.status, won=True), _persisted
+            result,
+            provider_kwargs,
+            recorder,
+            _wrap,
+            _persisted,
+            _finalize_cancelled,
         )
 
     # Terminal: success / max_iterations / error. Cooperative cancellation:
@@ -1669,6 +1646,98 @@ async def _persist_loop_outcome(
     finished = _wrap(status=result.status, won=True, recovery=recovery)
     await _attach_undelivered_notes(state_store, run_id, finished)
     return finished
+
+
+async def _persist_pause(
+    state_store: StateStore,
+    run_id: str,
+    result: RunResult,
+    provider_kwargs: dict[str, Any] | None,
+    recorder: LoopRecorder | None,
+    _wrap: Callable[..., RunResult],
+    _persisted: Callable[..., Awaitable[RunResult]],
+    _finalize_cancelled: Callable[..., Awaitable[RunResult]],
+) -> RunResult:
+    """Persist a pause and its event as one CAS; cancellation wins over pause."""
+
+    # Pre-pause checkpoint as one CAS: the pause persists only while the
+    # row is RUNNING with no pending cancel. Cancellation wins over pause;
+    # any durable pause (incl. WAITING_*) satisfies a pause request. The
+    # pause and its run.paused event commit together, so a finalizer of
+    # paused runs (cancel_run, sweep) always acts after the event.
+    await _check_claim(state_store, run_id)
+    _ensure_pause_generation(result, provider_kwargs)
+    pause_state: PauseState = result.meta["pause_state"]
+    # A pause generation belongs to this transition, never to the prior
+    # pause from which this execution was resumed.
+    pause_state = replace(pause_state, pause_id=generate_ulid())
+    result.meta["pause_state"] = pause_state
+    if (
+        pause_state.pause_reason == PauseReason.REQUESTED.value
+        and pause_state.pause_message is None
+    ):
+        pause_state = replace(
+            pause_state, pause_message=await _pause_request_message(state_store, run_id)
+        )
+        result.meta["pause_state"] = pause_state
+    paused_data = _pause_event_data(result, pause_state)
+    record = await state_store.get_run(run_id)
+    checkpoint = getattr(recorder, "checkpoint_outcome", None)
+    if checkpoint is not None:
+        pause_state.history[:] = [await project_message(recorder, m) for m in pause_state.history]
+        await checkpoint(result, provider_kwargs)
+    pause_data = {**pause_state.to_dict(), "status": result.status.value}
+    if record is not None and GOVERNANCE_KEY in (getattr(record, "meta", None) or {}):
+        pause_data[GOVERNANCE_KEY] = (record.meta or {})[GOVERNANCE_KEY]
+    paused = await _pause_with_event(
+        state_store,
+        run_id,
+        status=result.status.value,
+        pause_data=pause_data,
+        event_data=paused_data,
+        iteration_count=result.iteration_count,
+        pii_mapping=result.meta.get("pii_mapping"),
+        total_usage=result.usage,
+    )
+    if not paused:
+        # CAS lost: honor the winner. On a still-RUNNING row only a
+        # pending cancel makes the CAS miss, so finalize cancelled.
+        record = await state_store.get_run(run_id)
+        if record is not None and record.status != RunStatus.RUNNING.value:
+            return await _persisted(RunStatus(record.status))
+        return await _finalize_cancelled(
+            [RunStatus.RUNNING.value], {"reason": CancelReason.CANCEL_REQUESTED.value}
+        )
+    result.pause_id = pause_state.pause_id
+    # Return the persisted state: a finalizer may already have acted on
+    # the durable pause (e.g. cancel_run right after it committed).
+    return await _committed_pause_result(
+        state_store, _wrap(status=result.status, won=True), _persisted
+    )
+
+
+async def _persist_managed_handoff(
+    state_store: StateStore,
+    run_id: str,
+    result: RunResult,
+    recorder: LoopRecorder | None,
+    provider_kwargs: dict[str, Any] | None,
+    finalize_cancelled: Callable[..., Awaitable[RunResult]],
+) -> RunResult:
+    """A managed handoff: a durable checkpoint and the descend marker (0.7).
+
+    No pause is written; the child's atomic bind parks this run. A cancel
+    requested during the iteration finalizes it as for any pause.
+    """
+    from dendrux.runtime import _managed
+
+    await _check_claim(state_store, run_id)
+    descend = await _managed.prepare_handoff(state_store, run_id, result, recorder, provider_kwargs)
+    if descend is not None:
+        return descend
+    return await finalize_cancelled(
+        [RunStatus.RUNNING.value], {"reason": CancelReason.CANCEL_REQUESTED.value}
+    )
 
 
 async def _record_stop_reason(state_store: StateStore, run_id: str, stop_reason: str) -> None:
@@ -2520,6 +2589,60 @@ async def run(
         result = await run(agent, provider=provider, user_input="What is 15 + 27?")
         print(result.answer)
     """
+    from dendrux.runtime import _managed
+
+    result = await _run_once(
+        agent,
+        provider=provider,
+        user_input=user_input,
+        history=history,
+        context=context,
+        activate_skills=activate_skills,
+        runs=runs,
+        replay_last=replay_last,
+        replay_reasoning=replay_reasoning,
+        strategy=strategy,
+        loop=loop,
+        state_store=state_store,
+        tenant_id=tenant_id,
+        metadata=metadata,
+        extra_notifier=extra_notifier,
+        max_delegation_depth=max_delegation_depth,
+        idempotency_key=idempotency_key,
+        output_type=output_type,
+        **kwargs,
+    )
+    # A managed parent exits at its handoff; the driver runs the child in this
+    # same task and unwinds terminal outcomes back to the root (0.7).
+    return await _managed.drive(result, notifier=extra_notifier)
+
+
+async def _run_once(
+    agent: Agent,
+    *,
+    provider: LLMProvider,
+    user_input: UserContent,
+    history: list[ChatMessage] | None = None,
+    context: list[ContextBlock] | None = None,
+    activate_skills: Sequence[str] | None = None,
+    runs: list[str] | None = None,
+    replay_last: ReplayLast = 0,
+    replay_reasoning: bool = True,
+    strategy: Strategy | None = None,
+    loop: Loop | None = None,
+    state_store: StateStore | None = None,
+    tenant_id: str | None | _OmittedType = _OMITTED,
+    metadata: dict[str, Any] | None = None,
+    extra_notifier: LoopNotifier | None = None,
+    max_delegation_depth: int | None | _UnsetType = _UNSET_DEPTH,
+    idempotency_key: str | None = None,
+    output_type: type | None = None,
+    **kwargs: Any,
+) -> RunResult:
+    """One run frame: a new run, or a managed child created by its atomic bind."""
+    from dendrux.runtime import _managed
+
+    invocation = take_managed_invocation()
     tenant_explicit = _tenant_scope_chosen(tenant_id)
     tenant_id = resolve_runner_tenant(agent, "run", tenant_id, state_store=state_store)
     _require_idempotency_store(state_store, idempotency_key)
@@ -2531,7 +2654,9 @@ async def run(
         # Validate + resolve depth early — before any side effects.
         # _resolve_max_delegation_depth is a pure policy helper; side effect
         # is limited to dedup warning state on parent_ctx.warned_mismatches.
-        parent_ctx = get_delegation_context()
+        # A managed child never inherits the caller's delegation context: its
+        # parent link, level and depth come from its bound invocation.
+        parent_ctx = _managed.parent_context(invocation)
         effective_max_depth = _resolve_max_delegation_depth(max_delegation_depth, parent_ctx)
         tenant_id = resolve_child_tenant(parent_ctx, tenant_id)
         runner_entry_checks(
@@ -2550,6 +2675,7 @@ async def run(
         resolved_strategy = strategy or NativeToolCalling()
         resolved_loop = _new_run_loop(agent, loop)
         _validate_loop_skill_compat(agent, resolved_loop)
+        managed_root = await _managed.enter(agent, invocation, state_store, resolved_loop)
 
         # Validate input + chat history before any side effects. Raises
         # TypeError / ValueError on bad input so no DB row is created.
@@ -2570,7 +2696,8 @@ async def run(
 
         provider_kwargs = dict(kwargs)
 
-        run_id = generate_ulid()
+        # A managed child's id is its parent's bind candidate, minted at the handoff.
+        run_id = _managed.new_run_id(invocation)
         from dendrux.runtime._entry_guardrails import _entry_projection
 
         entry_projection = _entry_projection(agent, run_id)
@@ -2623,7 +2750,7 @@ async def run(
         seeded_history = _entry_seed_history(replay_req, seeded_history)
 
         # --- Delegation context ---
-        parent_run_id, delegation_level = resolve_parent_link(parent_ctx, state_store)
+        parent_run_id, delegation_level = _managed.parent_link(invocation, parent_ctx, state_store)
 
         ctx_token = None
         mcp_meta: dict[str, Any] = {}
@@ -2672,7 +2799,7 @@ async def run(
                         engine=run_guardrails,
                         system_prompt=_system_prompt,
                     )
-                    create_result = await _create_projected_run(
+                    created = await _create_projected_run(
                         entry_projection.error is not None,
                         state_store,
                         resolved_loop,
@@ -2689,7 +2816,10 @@ async def run(
                         idempotency_fingerprint=idem_fingerprint,
                         **_input_edge_kwargs(image_runtime, user_parts),
                         **seed_kwargs,
+                        invocation=invocation,
                     )
+                    # A child bound by another caller reads as existing_active below.
+                    create_result, child_claim = _managed_creation(created)
 
                     # Handle idempotency outcomes
                     if create_result.outcome == "existing_terminal":
@@ -2700,7 +2830,9 @@ async def run(
                         raise RunAlreadyActiveError(create_result.run_id, create_result.status)
 
                     run_id = create_result.run_id
-                    state_store = lifecycle._claim(state_store, resolved_loop, create_result)
+                    state_store = lifecycle._claim(
+                        state_store, resolved_loop, create_result, child_claim, managed_root
+                    )
                     await _verify_projected_creation(
                         entry_projection.error is not None, state_store, run_id
                     )
@@ -2815,7 +2947,7 @@ async def run(
                         run_id=run_id,
                         result=result,
                     )
-
+                # A parent at a managed handoff exits here without finishing.
                 await lifecycle._finish(lifecycle.recorder, extra_notifier, result)
 
                 result.meta = _public_meta(result.meta)
@@ -2856,8 +2988,15 @@ def _recovery_loop_name(loop: Loop) -> str | None:
 
 
 async def _create_projected_run(
-    blocked: bool, store: StateStore, loop: Loop, run_id: str, agent_name: str, **kwargs: Any
-) -> CreateRunResult:
+    blocked: bool,
+    store: StateStore,
+    loop: Loop,
+    run_id: str,
+    agent_name: str,
+    *,
+    invocation: Any = None,
+    **kwargs: Any,
+) -> Any:
     from dendrux._meta_keys import BLOCKED_META_KEY
     from dendrux.runtime._blocked_content import _blocked_write, _native_blocked_store
 
@@ -2866,7 +3005,56 @@ async def _create_projected_run(
         kwargs["meta"] = {**(kwargs.get("meta") or {}), BLOCKED_META_KEY: True}
     scope = _blocked_write(store, run_id) if blocked and native else nullcontext()
     with scope:
+        if invocation is not None:
+            return await _bind_runtime_run(store, loop, run_id, agent_name, invocation, **kwargs)
         return await _create_runtime_run(store, loop, run_id, agent_name, **kwargs)
+
+
+def _managed_creation(created: Any) -> tuple[CreateRunResult, ClaimResult | None]:
+    """A bind result as a creation outcome plus the confirmed creator's token."""
+    from dendrux.runtime.state import BindManagedChildResult
+    from dendrux.types import CreateRunResult
+
+    if not isinstance(created, BindManagedChildResult):
+        return created, None
+    outcome: Literal["created", "existing_active"] = (
+        "created" if created.child_claim is not None else "existing_active"
+    )
+    return (
+        CreateRunResult(
+            created.child_run_id, outcome, RunStatus.RUNNING, STORAGE_FORMAT_CHECKPOINTED
+        ),
+        created.child_claim,
+    )
+
+
+async def _bind_runtime_run(
+    store: StateStore, loop: Loop, run_id: str, agent_name: str, invocation: Any, **kwargs: Any
+) -> Any:
+    """Create a managed child through the atomic bind, with ordinary ownership handoff."""
+    from dendrux.runtime import _managed
+    from dendrux.runtime.durability import _ownership_handoff
+    from dendrux.runtime.state import _initial_loop_state
+
+    async def cancel_bound(bound: Any) -> None:
+        if bound.child_claim is not None:
+            await _persist_task_cancellation(
+                claimed_store(store, bound.child_run_id, bound.child_claim), bound.child_run_id
+            )
+
+    return await _ownership_handoff(
+        store,
+        lambda: _managed.bind_child(
+            invocation,
+            unclaimed_store(store),
+            run_id,
+            agent_name,
+            loop_state=_initial_loop_state(_recovery_loop_name(loop)),
+            **kwargs,
+        ),
+        cancel_bound,
+        run_id=run_id,
+    )
 
 
 async def _verify_projected_creation(blocked: bool, store: StateStore, run_id: str) -> None:
@@ -5032,10 +5220,14 @@ async def _prepare_resume(
     if pause_state.schema_version == 2:
         trace_order_offset = max(trace_order_offset, pause_state.trace_order_offset)
 
+    from dendrux.runtime._subagents import subagent_tool_def
+
     target_lookup = {}
     for fn in agent.tools:
         td = get_tool_def(fn)
         target_lookup[td.name] = td.target
+    for child in agent.subagents:
+        target_lookup[child.name] = subagent_tool_def(child).target
     from dendrux.guardrails import GuardrailEngine
     from dendrux.guardrails._engine import _entry_engine
 
@@ -6523,6 +6715,8 @@ async def _finish_resumed_result(
         run_id=run_id,
         result=result,
     )
+    if MANAGED_DESCEND_KEY in result.meta:
+        return result  # The parent exits at a managed handoff (0.7 driver).
     await record_run_finished(ctx.recorder, run_id, result)
     await notify_run_finished(ctx.notifier, run_id, result)
     return result

@@ -214,6 +214,44 @@ class RunCancelledError(_KwargsReduceMixin, RunControlError):
         super().__init__(f"Run '{run_id}' cannot start under parent '{parent_run_id}'.")
 
 
+class ManagedChildControlError(_KwargsReduceMixin, RunControlError):
+    """A managed subagent run was controlled directly (0.7).
+
+    Resume, submit, reclaim, cancel and retry of a managed child go through the
+    workflow's root run id. Reading the child is allowed. ``code`` is
+    ``managed_root_required``; the message carries the run id only.
+    """
+
+    code = "managed_root_required"
+    _init_fields = ("run_id",)
+
+    def __reduce__(self) -> Any:
+        return _restore_logged_control_error, (type(self), self.args, self.__dict__)
+
+    def __init__(self, run_id: str) -> None:
+        self.run_id = run_id
+        _codes.log_code(logging.getLogger(__name__), _codes.MANAGED_ROOT_REQUIRED, run_id=run_id)
+        super().__init__(f"Run '{run_id}' is a managed subagent; control its root run instead.")
+
+
+class ManagedUnsupportedError(_KwargsReduceMixin, NotImplementedError):
+    """Internal (0.7, unreleased): a managed workflow entry this build does not route yet.
+
+    ``operation`` names the entry (for example ``stream`` or ``submit_approval``).
+    ``code`` is ``managed_unsupported``. Streaming and continuation routing land in
+    a later step; until then they refuse before any write instead of guessing.
+    """
+
+    code = "managed_unsupported"
+    _init_fields = ("operation", "run_id")
+
+    def __init__(self, operation: str, run_id: str | None = None) -> None:
+        self.operation = operation
+        self.run_id = run_id
+        _codes.log_code(logging.getLogger(__name__), _codes.MANAGED_UNSUPPORTED, run_id=run_id)
+        super().__init__(f"Managed subagent workflows do not support {operation} yet.")
+
+
 class FollowCapacityError(RuntimeError):
     """The :class:`EventFeed` already serves ``max_followers`` followers, or
     this tenant already holds ``max_followers_per_tenant`` of them.
@@ -457,6 +495,7 @@ class ManagedStateError(_KwargsReduceMixin, PersistenceError):
             "binding_missing",
             "child_missing",
             "child_mismatch",
+            "path_missing",
         }
     )
 
@@ -1552,6 +1591,7 @@ __all__ = [
     "RunCancelledError",
     "RunNotReclaimableError",
     "RunControlError",
+    "ManagedChildControlError",
     "BlobContentionError",
     "BlobIntegrityError",
     "BlobNotFoundError",

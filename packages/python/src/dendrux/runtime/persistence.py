@@ -1848,3 +1848,82 @@ def resolve_pending(
             raise ValueError("Unsupported tool-call outcome")
         actions.append(ResolutionAction(kind, call_id, pending["order_index"]))
     return actions
+
+
+async def adopt_managed_result(
+    store: StateStore,
+    run_id: str,
+    *,
+    claim: Any,
+    call_id: str,
+    report: ToolResult,
+    child_run_id: str,
+    agent_path: Sequence[str],
+) -> dict[str, Any]:
+    """Complete a parent's managed tool intent with its accepted report (0.7).
+
+    One ``complete_tool_call`` transaction under the adoption claim's epoch:
+    started intent to completed or failed (its binding metadata kept), the
+    reserved observation, the outcome event, the call removed from pending and
+    the outgoing binding and submission marker cleared. Ordinary
+    ``consume_submission`` is never also called for this observation. A retry
+    after a lost acknowledgement finds the completed intent and adds nothing.
+    Returns the checkpoint after the change.
+    """
+    from dendrux.errors import ManagedStateError
+    from dendrux.runtime.state import EventWrite, LoopStatePatch, _apply_loop_patch
+    from dendrux.types import tool_result_message
+
+    state = dict(claim.loop_state or {})
+    binding = state.get("managed_wait") or {}
+    pending = next((p for p in state.get("pending", []) if p.get("call_id") == call_id), None)
+    if binding.get("tool_call_id") != call_id or binding.get("child_run_id") != child_run_id:
+        raise ManagedStateError(reason="binding_conflict", run_id=run_id)
+    if pending is None:
+        raise ManagedStateError(reason="pending_missing", run_id=run_id)
+    iteration = int(state.get("iteration", 0))
+    observation = message_trace(tool_result_message(report), pending["order_index"])
+    observation.meta["iteration"] = iteration
+    outcome = "completed" if report.success else "failed"
+    event = EventWrite(
+        generate_ulid(),
+        StoredEventType.TOOL_COMPLETED.value,
+        iteration,
+        {
+            "tool_name": report.name,
+            "target": "agent",
+            "success": report.success,
+            "duration_ms": report.duration_ms,
+            "child_run_id": child_run_id,
+            "agent_path": list(agent_path),
+            "managed_outcome": "succeeded" if report.success else "failed",
+            **({"code": report.meta["code"]} if "code" in report.meta else {}),
+        },
+        call_id,
+        None,
+    )
+    patch = LoopStatePatch(
+        remove_pending=(call_id,),
+        set_phase="model_next",
+        set_fields={"managed_wait": None, "submission": None},
+    )
+
+    async def complete() -> None:
+        await store.complete_tool_call(
+            run_id,
+            claim_epoch=claim.claim_epoch,
+            tool_call_id=call_id,
+            outcome=outcome,
+            result_payload=report.payload,
+            success=report.success,
+            duration_ms=report.duration_ms,
+            error_message=report.error,
+            replayed=False,
+            observation=observation,
+            event=event,
+            loop_state_patch=patch,
+            meta=None,
+        )
+
+    await retry_critical(complete, label="complete_tool_call", run_id=run_id)
+    return _apply_loop_patch(state, patch)

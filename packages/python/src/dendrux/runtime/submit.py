@@ -544,6 +544,83 @@ def _submission_payload(raw: dict[str, Any]) -> dict[str, Any]:
     return envelope["payload"]
 
 
+def managed_submission_descriptor(wait: PauseState, call_id: str) -> dict[str, Any]:
+    """The format-2 submission descriptor of a managed adoption (0.7).
+
+    A v3 managed wait still uses the closed format-2 envelope: kind
+    ``tool_results`` for exactly the bound call, at the wait's private generation.
+    """
+    from dendrux.types import generate_ulid
+
+    return {
+        "submission_id": generate_ulid(),
+        "kind": "tool_results",
+        "pause_id": wait.pause_id,
+        "payload_ref": {"pause_data_key": "submission"},
+        "call_ids": [call_id],
+        "reserved_order_index": wait.trace_order_offset,
+    }
+
+
+def _managed_adoption_validator(
+    run_id: str, pause_id: str, call_id: str, child_run_id: str
+) -> Callable[[dict[str, Any]], None]:
+    """Inside the claim: the same v3 generation, still bound to this call and child."""
+    from dendrux.errors import ManagedStateError
+
+    def validate(current: dict[str, Any]) -> None:
+        wait = PauseState.from_managed_dict(current, run_id=run_id)
+        binding = wait.managed_wait
+        if (
+            wait.pause_id != pause_id
+            or binding is None
+            or binding.tool_call_id != call_id
+            or binding.child_run_id != child_run_id
+        ):
+            raise ManagedStateError(reason="binding_conflict", run_id=run_id)
+
+    return validate
+
+
+async def claim_managed_adoption(
+    store: StateStore,
+    run_id: str,
+    *,
+    call_id: str,
+    child_run_id: str,
+    result: ToolResult,
+) -> ClaimResult | bool:
+    """Durably accept a child's report into its waiting parent and claim the parent.
+
+    ``submit_and_claim`` on the parent's private managed-wait generation: the
+    report and the parent's new epoch commit together. Returns False when the
+    parent is no longer at that wait (another caller adopted, or it moved on).
+    The report is consumed only by the managed adoption, never by
+    ``consume_submission``.
+    """
+    from functools import partial
+
+    from dendrux.runtime.durability import _ownership_handoff
+
+    raw = await store.get_pause_state(run_id)
+    if raw is None or raw.get("schema_version") != 3:
+        return False
+    wait = PauseState.from_managed_dict(raw, run_id=run_id)
+    assert wait.pause_id is not None
+    descriptor = managed_submission_descriptor(wait, call_id)
+    operation = partial(
+        store.submit_and_claim,
+        run_id,
+        expected_status=RunStatus.PAUSED.value,
+        submitted_data={"submitted_tool_results": serialize_tool_results([result])},
+        submission=descriptor,
+        validate=_managed_adoption_validator(run_id, wait.pause_id, call_id, child_run_id),
+    )
+    return await _ownership_handoff(
+        store, operation, partial(_cancel_claim, store, run_id), run_id=run_id
+    )
+
+
 def submitted_view(raw: dict[str, Any]) -> dict[str, Any]:
     """Project a validated v2 envelope for legacy parsers without mutating storage."""
     return {**raw, **_submission_payload(raw)} if raw.get("schema_version") == 2 else raw

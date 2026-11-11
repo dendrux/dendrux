@@ -23,7 +23,7 @@ from dendrux.errors import PersistenceError, RunNotFoundError, RunNotReclaimable
 from dendrux.loops._helpers import order_observations, project_message, record_message, record_tool
 from dendrux.runtime._bounds import MAX_PAGE
 from dendrux.runtime.persistence import PersistenceRecorder, resolve_pending
-from dendrux.runtime.state import claimed_store
+from dendrux.runtime.state import MANAGED_BINDING_KEY, claimed_store
 from dendrux.types import (
     Message,
     PauseState,
@@ -41,7 +41,7 @@ if TYPE_CHECKING:
     from dendrux.agent import Agent
     from dendrux.loops.base import LoopNotifier
     from dendrux.runtime.runner import _ResumeContext
-    from dendrux.runtime.state import ReclaimableRun, StateStore, TenantScope
+    from dendrux.runtime.state import ClaimResult, ReclaimableRun, StateStore, TenantScope
 
 logger = logging.getLogger(__name__)
 
@@ -54,11 +54,11 @@ async def reclaim(
     tenant_id: TenantScope,
     item: ReclaimableRun | None,
     notifier: LoopNotifier | None,
+    via_root: bool = False,
 ) -> RunResult:
     from dendrux.loops.react import ReActLoop
     from dendrux.runtime._capabilities import capabilities
     from dendrux.runtime.durability import _ownership_handoff
-    from dendrux.runtime.runner import _resume_core, _stop_marked_continuation
     from dendrux.runtime.submit import _cancel_claim, governance_snapshot
     from dendrux.skills._session import SkillSession
 
@@ -98,6 +98,46 @@ async def reclaim(
             return await _build_cached_result(store, run_id)
         raise
     owned = claimed_store(store, run_id, claim)
+    if not via_root:
+        _refuse_direct_child(run_id, claim.loop_state)
+    if _pending_adoption(claim.loop_state):
+        # A managed parent claimed for adoption before its tool row completed:
+        # finish that adoption from the saved report, then continue (0.7).
+        claim = await _finish_saved_adoption(owned, run_id, claim)
+    return await _continue_session(agent, store, run_id, claim, notifier, session)
+
+
+async def continue_claimed(
+    agent: Agent,
+    store: StateStore,
+    run_id: str,
+    claim: ClaimResult,
+    *,
+    notifier: LoopNotifier | None,
+) -> RunResult:
+    """Continue an owned format-2 run from its checkpoint (managed adoption, 0.7).
+
+    The same continuation reclaim uses after its claim: rebuild from durable
+    history and the checkpoint, never from an old in-memory frame.
+    """
+    from dendrux.skills._session import SkillSession
+
+    session = SkillSession.prepare(agent)
+    session.run_id = run_id
+    return await _continue_session(agent, store, run_id, claim, notifier, session)
+
+
+async def _continue_session(
+    agent: Agent,
+    store: StateStore,
+    run_id: str,
+    claim: ClaimResult,
+    notifier: LoopNotifier | None,
+    session: Any,
+) -> RunResult:
+    from dendrux.runtime.runner import _resume_core, _stop_marked_continuation
+
+    owned = claimed_store(store, run_id, claim)
     with session.bind():
         history_records: list[Any] = []
         async with _reclaim_setup(owned, run_id):
@@ -132,6 +172,58 @@ async def reclaim(
             _reclaim_submission=_unconsumed_submission(state, reader.raw),
         )
         return _reclaimed_result(run_id, result)
+
+
+def _refuse_direct_child(run_id: str, state: dict[str, Any] | None) -> None:
+    """A managed child is reclaimed only through its root (0.7).
+
+    Checked on the claimed checkpoint so ordinary reclaims add no read; the
+    refused claim runs nothing and the root's reconnect reclaims it later.
+    """
+    from dendrux.errors import ManagedChildControlError
+
+    header = (state or {}).get("managed")
+    if isinstance(header, dict) and "invocation" in header:
+        raise ManagedChildControlError(run_id)
+
+
+def _pending_adoption(state: dict[str, Any] | None) -> bool:
+    """A running parent whose checkpoint still holds a claimed managed adoption."""
+    state = state or {}
+    return state.get(MANAGED_BINDING_KEY) is not None and bool(state.get("submission"))
+
+
+async def _finish_saved_adoption(owned: StateStore, run_id: str, claim: ClaimResult) -> ClaimResult:
+    """Complete the managed tool intent from the durably accepted report, once."""
+    from dendrux.errors import ManagedStateError
+    from dendrux.runtime.persistence import adopt_managed_result
+    from dendrux.runtime.state import ClaimResult, ManagedHeader
+    from dendrux.runtime.submit import _submission_payload, deserialize_tool_results
+
+    state = claim.loop_state or {}
+    binding = state[MANAGED_BINDING_KEY]
+    raw = await owned.get_pause_state(run_id) or {}
+    try:
+        results = deserialize_tool_results(_submission_payload(raw)["submitted_tool_results"])
+    except (KeyError, TypeError, ValueError):
+        raise ManagedStateError(reason="binding_conflict", run_id=run_id) from None
+    if len(results) != 1 or results[0].call_id != binding.get("tool_call_id"):
+        raise ManagedStateError(reason="binding_conflict", run_id=run_id)
+    header = ManagedHeader.from_dict(state.get("managed"), run_id=run_id)
+    tool = next(
+        (p.get("tool") for p in state.get("pending", []) if p.get("call_id") == results[0].call_id),
+        results[0].name,
+    )
+    after = await adopt_managed_result(
+        owned,
+        run_id,
+        claim=claim,
+        call_id=results[0].call_id,
+        report=results[0],
+        child_run_id=binding.get("child_run_id"),
+        agent_path=(*header.path, str(tool)),
+    )
+    return ClaimResult(claim.claim_epoch, claim.storage_format, after, None)
 
 
 class _PauseReadMemo:
@@ -273,7 +365,7 @@ async def rebuild_pause(
         raise PersistenceError(code=FailureReason.RECOVERY_CALL_MISSING.value)
     raw = await store.get_pause_state(run_id)
     pause = (
-        PauseState.from_dict(raw)
+        _continuation_base(raw, run_id)
         if raw
         else PauseState(
             agent.name,
@@ -302,6 +394,26 @@ async def rebuild_pause(
         pause, store, run_id, agent, state, rebuilt.steps, recovery=True
     )
     return pause
+
+
+def _continuation_base(raw: dict[str, Any], run_id: str) -> PauseState:
+    """The pause a continuation starts from; a stale v3 wait is read strictly (0.7).
+
+    After adoption the parent's raw pause data may still hold its old managed
+    wait. The checkpoint is authoritative: only the wait's continuation fields
+    are used, never its binding or a saved submission.
+    """
+    if raw.get("schema_version") != 3:
+        return PauseState.from_dict(raw)
+    wait = PauseState.from_managed_dict(raw, run_id=run_id)
+    return replace(
+        wait,
+        managed_wait=None,
+        schema_version=2,
+        pause_reason=None,
+        pending_tool_calls=[],
+        pending_targets={},
+    )
 
 
 async def needs_resolution(

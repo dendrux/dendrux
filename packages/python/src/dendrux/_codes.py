@@ -886,6 +886,54 @@ MANAGED_BATCH_UNSUPPORTED = Code(
     "A model turn asks for two subagents, or a subagent together with a client tool.",
     "Nothing in the batch ran; the model sees one error per call and may call them one by one.",
 )
+MANAGED_CHILD_FAILED = Code(
+    "managed_child_failed",
+    logging.WARNING,
+    "subagent",
+    _BASE_FIELDS | frozenset([]),
+    "A subagent run ended with an error or at its iteration limit.",
+    "The parent sees a failed tool result; read the child run for detail.",
+)
+MANAGED_CHILD_CANCELLED = Code(
+    "managed_child_cancelled",
+    logging.WARNING,
+    "subagent",
+    _BASE_FIELDS | frozenset([]),
+    "A subagent run was cancelled on its own while its parent waited.",
+    "The parent sees a failed tool result; read the child run for detail.",
+)
+MANAGED_REPORT_INVALID = Code(
+    "managed_report_invalid",
+    logging.WARNING,
+    "subagent",
+    _BASE_FIELDS | frozenset([]),
+    "A subagent's saved answer does not match its declared output type.",
+    "The parent sees a failed tool result; check the child's output_type.",
+)
+MANAGED_REPORT_TOO_LARGE = Code(
+    "managed_report_too_large",
+    logging.WARNING,
+    "subagent",
+    _BASE_FIELDS | frozenset(["bytes", "limit"]),
+    "A subagent's report is larger than the parent's max_tool_result_bytes.",
+    "Ask for a shorter report or raise the parent's Limits.max_tool_result_bytes.",
+)
+MANAGED_ROOT_REQUIRED = Code(
+    "managed_root_required",
+    logging.WARNING,
+    "subagent",
+    _BASE_FIELDS | frozenset([]),
+    "An application controls a managed subagent run directly.",
+    "Control the workflow through its root run id; reading the child is allowed.",
+)
+MANAGED_UNSUPPORTED = Code(
+    "managed_unsupported",
+    logging.WARNING,
+    "subagent",
+    _BASE_FIELDS | frozenset([]),
+    "A managed workflow is used through an entry this build does not support yet.",
+    "Use run() for managed workflows in this build; other entries come in a later step.",
+)
 MANAGED_STATE_INVALID = Code(
     "managed_state_invalid",
     logging.WARNING,
@@ -2086,6 +2134,12 @@ REGISTRY = MappingProxyType(
             SUBAGENT_TREE_TOO_LARGE,
             SUBAGENT_FANOUT,
             MANAGED_BATCH_UNSUPPORTED,
+            MANAGED_CHILD_FAILED,
+            MANAGED_CHILD_CANCELLED,
+            MANAGED_REPORT_INVALID,
+            MANAGED_REPORT_TOO_LARGE,
+            MANAGED_ROOT_REQUIRED,
+            MANAGED_UNSUPPORTED,
             MANAGED_STATE_INVALID,
             CHECKPOINT_TOO_LARGE,
             REWRITE_INVALID,

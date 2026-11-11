@@ -261,6 +261,7 @@ class ManagedHandoff:
 
     call: ToolCall
     child: Agent
+    parent: Agent
 
 
 def _is_managed(name: str, lookups: ToolLookups) -> bool:
@@ -295,6 +296,41 @@ async def _refuse_managed_batch(calls: Sequence[ToolCall], batch: _ToolBatch) ->
     _codes.log_code(logger, _codes.MANAGED_BATCH_UNSUPPORTED, run_id=batch.run_id, count=len(calls))
     for tc in calls:
         await batch.reject(tc, _managed_batch_result(tc))
+
+
+MANAGED_BRIEF_TOO_LARGE = "managed_brief_too_large"
+
+
+async def _admit_managed_briefs(
+    pending: list[ToolCall], lookups: ToolLookups, batch: _ToolBatch
+) -> list[ToolCall]:
+    """Refuse a brief over the child's ``Limits.max_input_bytes`` before any bind."""
+    kept: list[ToolCall] = []
+    for tc in pending:
+        entry = lookups.fn.get(tc.name)
+        if isinstance(entry, SubagentTool):
+            size = len(str((tc.params or {}).get("task", "")).encode("utf-8"))
+            limit = entry.agent._limits.max_input_bytes
+            if size > limit:
+                _codes.log_code(
+                    logger, _codes.INPUT_SIZE_LIMIT, run_id=batch.run_id, bytes=size, limit=limit
+                )
+                await batch.reject(tc, _brief_too_large(tc, size, limit))
+                continue
+        kept.append(tc)
+    return kept
+
+
+def _brief_too_large(tc: ToolCall, size: int, limit: int) -> ToolResult:
+    message = "The task for this subagent is larger than its input limit."
+    return ToolResult(
+        name=tc.name,
+        call_id=tc.id,
+        payload=json.dumps({"error": message, "bytes": size, "limit": limit}),
+        success=False,
+        error=message,
+        meta={"code": MANAGED_BRIEF_TOO_LARGE},
+    )
 
 
 def managed_tool_defs(lookups: ToolLookups) -> list[ToolDef]:
@@ -1420,6 +1456,7 @@ async def _process_tool_calls(
             approval_gates=gates,
         )
     server_calls, pending_calls = _split_targets(calls, lookups)
+    pending_calls = await _admit_managed_briefs(pending_calls, lookups, batch)
     executed = await _dispatch_server_calls(
         server_calls, lookups, batch, tool_result_transform, image_runtime
     )
@@ -2378,7 +2415,9 @@ def _managed_handoff(
     if not isinstance(entry, SubagentTool):
         return None
     result = _pause_result(ctx, RunStatus.RUNNING, iteration, pending_calls=pending)
-    result.meta[MANAGED_HANDOFF_KEY] = ManagedHandoff(call=pending[0], child=entry.agent)
+    result.meta[MANAGED_HANDOFF_KEY] = ManagedHandoff(
+        call=pending[0], child=entry.agent, parent=ctx.agent
+    )
     return result
 
 
