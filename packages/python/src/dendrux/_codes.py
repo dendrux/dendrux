@@ -878,6 +878,14 @@ SUBAGENT_FANOUT = Code(
     "An Agent is built with more than ten direct subagents.",
     "Group related subagents under a lead; the model chooses less well among many.",
 )
+MANAGED_BATCH_UNSUPPORTED = Code(
+    "managed_batch_unsupported",
+    logging.WARNING,
+    "subagent",
+    _BASE_FIELDS | frozenset(["count"]),
+    "A model turn asks for two subagents, or a subagent together with a client tool.",
+    "Nothing in the batch ran; the model sees one error per call and may call them one by one.",
+)
 MANAGED_STATE_INVALID = Code(
     "managed_state_invalid",
     logging.WARNING,
@@ -2077,6 +2085,7 @@ REGISTRY = MappingProxyType(
             SUBAGENT_TOO_DEEP,
             SUBAGENT_TREE_TOO_LARGE,
             SUBAGENT_FANOUT,
+            MANAGED_BATCH_UNSUPPORTED,
             MANAGED_STATE_INVALID,
             CHECKPOINT_TOO_LARGE,
             REWRITE_INVALID,

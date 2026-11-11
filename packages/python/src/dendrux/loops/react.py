@@ -228,6 +228,80 @@ class _ToolCallOutcome(NamedTuple):
     approval_gates: dict[str, dict[str, str | None]] | None = None
 
 
+# --- Managed subagents (0.7) -------------------------------------------------
+
+MANAGED_HANDOFF_KEY = "managed_handoff"
+"""``RunResult.meta`` key of an in-memory managed handoff (never persisted)."""
+MANAGED_BATCH_UNSUPPORTED = "managed_batch_unsupported"
+_MANAGED_BATCH_MESSAGE = (
+    "Call one subagent per turn, and not together with client tools. "
+    "No tool in this batch ran; call them again in separate turns."
+)
+
+
+class SubagentTool:
+    """The lookup entry of a generated subagent call: a marker, never executed.
+
+    Only these entries make an ``agent``-target call managed; a call is never
+    inferred to be managed from its target or name alone.
+    """
+
+    __slots__ = ("agent",)
+
+    def __init__(self, agent: Agent) -> None:
+        self.agent = agent
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("A subagent call is never executed as a tool")
+
+
+@dataclass(frozen=True)
+class ManagedHandoff:
+    """In-memory loop outcome: one admitted subagent call for the runner to bind."""
+
+    call: ToolCall
+    child: Agent
+
+
+def _is_managed(name: str, lookups: ToolLookups) -> bool:
+    return isinstance(lookups.fn.get(name), SubagentTool)
+
+
+def _managed_batch_unsupported(calls: Sequence[ToolCall], lookups: ToolLookups) -> bool:
+    """Two managed calls, or one with another non-server pending target, in one batch."""
+    managed = sum(1 for tc in calls if _is_managed(tc.name, lookups))
+    if managed == 0:
+        return False
+    return managed > 1 or any(
+        not _is_managed(tc.name, lookups)
+        and lookups.target.get(tc.name, ToolTarget.SERVER) != ToolTarget.SERVER
+        for tc in calls
+    )
+
+
+def _managed_batch_result(tc: ToolCall) -> ToolResult:
+    return ToolResult(
+        name=tc.name,
+        call_id=tc.id,
+        payload=json.dumps({"error": _MANAGED_BATCH_MESSAGE}),
+        success=False,
+        error=_MANAGED_BATCH_MESSAGE,
+        meta={"code": MANAGED_BATCH_UNSUPPORTED},
+    )
+
+
+async def _refuse_managed_batch(calls: Sequence[ToolCall], batch: _ToolBatch) -> None:
+    """Answer every call of an unsupported batch before any hook, approval or effect."""
+    _codes.log_code(logger, _codes.MANAGED_BATCH_UNSUPPORTED, run_id=batch.run_id, count=len(calls))
+    for tc in calls:
+        await batch.reject(tc, _managed_batch_result(tc))
+
+
+def managed_tool_defs(lookups: ToolLookups) -> list[ToolDef]:
+    """The generated subagent tool definitions in ``lookups`` (offered to the model)."""
+    return [lookups.defs[name] for name, fn in lookups.fn.items() if isinstance(fn, SubagentTool)]
+
+
 def _accumulate_usage(total: UsageStats, step_usage: UsageStats) -> None:
     """Add per-call usage to running total. Mutates total in place.
 
@@ -1321,8 +1395,12 @@ async def _process_tool_calls(
         history=history,
         warnings=warnings,
     )
+    all_calls = step.meta.get("all_tool_calls", [step.action])
+    if _managed_batch_unsupported(all_calls, lookups):
+        await _refuse_managed_batch(all_calls, batch)
+        return _ToolCallOutcome(all_results=batch.all_results, pending_calls=[])
     calls, gates = await _prepare_tool_calls(
-        step.meta.get("all_tool_calls", [step.action]),
+        all_calls,
         batch=batch,
         call_counts=call_counts,
         lookups=lookups,
@@ -1758,7 +1836,9 @@ async def _start_run(
     pkw = provider_kwargs or {}
     cache_key_prefix = build_cache_key_prefix(agent)
     lookups = await agent.get_tool_lookups(loop=loop)
-    tool_defs = agent.get_all_tool_defs(loop=loop)
+    tool_defs = sorted(
+        [*agent.get_all_tool_defs(loop=loop), *managed_tool_defs(lookups)], key=lambda td: td.name
+    )
     state = await _init_loop_state(
         user_input=user_input,
         recorder=recorder,
@@ -2268,6 +2348,9 @@ def _after_tools(
     order_observations(ctx.recorder, ctx.state.history)
     if not outcome.pending_calls:
         return None
+    handoff = _managed_handoff(ctx, outcome, iteration)
+    if handoff is not None:
+        return handoff
     status = (
         RunStatus.WAITING_APPROVAL if outcome.pending_approval else RunStatus.WAITING_CLIENT_TOOL
     )
@@ -2278,6 +2361,25 @@ def _after_tools(
         pending_calls=outcome.pending_calls,
         approval_gates=outcome.approval_gates,
     )
+
+
+def _managed_handoff(
+    ctx: _RunContext, outcome: _ToolCallOutcome, iteration: int
+) -> RunResult | None:
+    """The single admitted managed call, handed to the runner instead of a client pause.
+
+    Server calls of the batch have already finished and are durable. The result
+    stays RUNNING: only the runner's atomic bind parks this run.
+    """
+    pending = outcome.pending_calls
+    if outcome.pending_approval or len(pending) != 1:
+        return None
+    entry = ctx.lookups.fn.get(pending[0].name)
+    if not isinstance(entry, SubagentTool):
+        return None
+    result = _pause_result(ctx, RunStatus.RUNNING, iteration, pending_calls=pending)
+    result.meta[MANAGED_HANDOFF_KEY] = ManagedHandoff(call=pending[0], child=entry.agent)
+    return result
 
 
 def _max_iterations_result(ctx: _RunContext) -> RunResult:

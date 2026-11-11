@@ -3288,7 +3288,24 @@ class Agent:
             lookups.meta[td.name] = td.meta
             lookups.defs[td.name] = td
 
+        self._add_subagent_lookups(lookups)
         return lookups
+
+    def _add_subagent_lookups(self, lookups: ToolLookups) -> None:
+        """Offer each registered subagent as a generated ``agent``-target call (0.7)."""
+        from dendrux.loops.react import SubagentTool
+        from dendrux.runtime._subagents import subagent_tool_def
+
+        for child in self._subagents:
+            td = subagent_tool_def(child)
+            lookups.fn[td.name] = SubagentTool(child)
+            lookups.target[td.name] = td.target
+            lookups.timeout[td.name] = td.timeout_seconds
+            lookups.explicit_timeout[td.name] = False
+            lookups.max_calls[td.name] = None
+            lookups.parallel[td.name] = False
+            lookups.meta[td.name] = td.meta
+            lookups.defs[td.name] = td
 
     def get_all_tool_defs(self, loop: Loop | None = None) -> list[ToolDef]:
         """Local + discovered MCP + use_skill tool defs, sorted by name.
