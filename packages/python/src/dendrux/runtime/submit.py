@@ -369,6 +369,8 @@ class _ClaimRequest:
     raw: dict[str, Any]
     statuses: tuple[str, ...]
     generation: str | None
+    explicit: bool = True
+    """The caller named the generation; False when it was taken from the read pause."""
 
 
 def _pause_generation(raw: dict[str, Any], expected_pause_id: str | None) -> str | None:
@@ -383,7 +385,10 @@ def _claim_request(
     fallbacks: tuple[str, ...] = (),
 ) -> _ClaimRequest:
     return _ClaimRequest(
-        raw, (expected_status, *fallbacks), _pause_generation(raw, expected_pause_id)
+        raw,
+        (expected_status, *fallbacks),
+        _pause_generation(raw, expected_pause_id),
+        explicit=expected_pause_id is not None,
     )
 
 
@@ -410,18 +415,18 @@ async def _claim_submission(
     payload, block = await _project_submission(run_id, payload)
     blocked = block is not None
     descriptor = None
-    if (
-        request.raw.get("schema_version") == 2
-        and checkpointing
-        and (payload is not None or submit_empty)
-    ):
+    format_two = request.raw.get("schema_version") == 2 and checkpointing
+    described = format_two and (payload is not None or submit_empty)
+    tokenless = format_two and not request.explicit and request.raw.get("pause_id") is not None
+    if (described or tokenless) and checkpoint is None:
+        checkpoint = await store.get_loop_state(run_id) or {}
+    if tokenless:
+        _refuse_tokenless_managed(run_id, checkpoint)
+    if described:
         payload = dict(payload or {})
         if approval is not None:
             payload["approved"] = approval
-        checkpoint = (
-            checkpoint if checkpoint is not None else await store.get_loop_state(run_id) or {}
-        )
-        descriptor = submission_descriptor(request.raw, checkpoint, payload, status)
+        descriptor = submission_descriptor(request.raw, checkpoint or {}, payload, status)
     operation = _claim_operation(
         store, run_id, status, validate, payload, descriptor, blob_refs, blob_refs_scope
     )
@@ -1524,6 +1529,24 @@ def require_pause_id(
         raise _pause_id_required()
     if run_id is not None:
         pause_validator(run_id, expected)({"pause_id": pause_id})
+
+
+def _refuse_tokenless_managed(run_id: str, checkpoint: dict[str, Any] | None) -> None:
+    """A managed run's pause is claimed only with its explicit token (0.7).
+
+    Decided at claim admission from the run's persisted managed identity, not
+    the caller's Agent: an Agent rebuilt without registrations cannot apply
+    the ordinary token rule to a managed root or child.
+    """
+    from dendrux.runtime.state import MANAGED_HEADER_KEY
+
+    if (checkpoint or {}).get(MANAGED_HEADER_KEY) is not None:
+        import logging
+
+        _codes.log_code(
+            logging.getLogger(__name__), _codes.MANAGED_PAUSE_ID_REQUIRED, run_id=run_id
+        )
+        raise _pause_id_required()
 
 
 def _client_json_payload(payload: str) -> str:

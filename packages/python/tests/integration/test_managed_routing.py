@@ -929,3 +929,123 @@ async def test_pg_root_versus_child_control_race(store: Any, engine: Any) -> Non
             assert (await event_types(engine, run_id)).count("tool.completed") == 1
         for run_id in (middle.id, root_id):
             assert len(await observations(engine, run_id)) == 1
+
+
+# ---------------------------------------------------------------------------
+# Fix round 1, R1: a tokenless continuation never crosses RUNNING -> pause
+# ---------------------------------------------------------------------------
+
+
+def _own_pause_root(store: Any, entry: str, holder: dict[str, Any]) -> tuple[Agent, ContextLLM]:
+    """A managed root that pauses itself: for input (a question) or a requested pause."""
+    if entry == "submit_resume":
+        first = call("count_words", {"text": "a b"}, "w1")
+    else:
+        first = LLMResponse(text="Which draft?")
+    llm = ContextLLM([first, done("root done")])
+    llm.gate_at = 0
+
+    async def remember(index: int, run_id: str | None) -> None:
+        holder.setdefault("root_id", run_id)
+
+    llm.on_call = remember
+    root = lead(store, llm, reviewer(ContextLLM([]), tools=[]), tools=[count_words])
+    root._strict_tenancy = False
+    return root, llm
+
+
+async def _tokenless(agent: Agent, entry: str, root_id: str) -> Any:
+    if entry == "submit_input":
+        return await agent.submit_input(root_id, "late answer")
+    if entry == "submit_resume":
+        return await agent.submit_resume(root_id)
+    if entry == "resume":
+        return await agent.resume(root_id, user_input="late answer")
+    stream = agent.resume_stream(root_id, user_input="late answer")
+    async with stream:
+        return [event async for event in stream]
+
+
+@pytest.mark.parametrize("entry", ["submit_input", "submit_resume", "resume", "resume_stream"])
+async def test_pg_tokenless_continuation_cannot_cross_root_running_to_its_own_pause(
+    store: Any, engine: Any, entry: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Routing reads the root RUNNING; the root then persists its own pause before the
+    caller's ordinary preflight. The tokenless caller is refused; nothing is claimed."""
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from dendrux.runtime import _managed
+    from dendrux.runtime.stores._factory import store_for_engine
+
+    _postgres(engine)
+    patch_questions(monkeypatch)
+    holder: dict[str, Any] = {}
+    root, llm = _own_pause_root(store, entry, holder)
+    running = asyncio.create_task(root.run("go", tenant_id=TENANT))
+    entered = asyncio.create_task(llm.entered.wait())
+    await asyncio.wait({running, entered}, return_when=asyncio.FIRST_COMPLETED)
+    if running.done():
+        running.result()  # surface a setup failure instead of waiting forever
+    root_id = holder["root_id"]
+    if entry == "submit_resume":
+        await store.request_pause(root_id)
+    original = _managed.route
+
+    async def barrier(*args: Any, **kwargs: Any) -> Any:
+        found = await original(*args, **kwargs)
+        assert found.leaf.status == "running"  # the routing snapshot
+        llm.gate.set()
+        holder["paused"] = await running  # the root persists its own pause now
+        return found
+
+    monkeypatch.setattr(_managed, "route", barrier)
+    second = create_async_engine(engine.url, pool_size=2)
+    try:
+        other, other_llm = _own_pause_root(store_for_engine(second), entry, {})
+        other_llm.gate_at = None  # if wrongly admitted, the continuation runs to completion
+        with pytest.raises((InputValidationError, RunNotPausedError)):
+            await _tokenless(other, entry, root_id)
+    finally:
+        await second.dispose()
+    paused = holder["paused"]
+    assert paused.status in (RunStatus.WAITING_HUMAN_INPUT, RunStatus.PAUSED)
+    row = await run_row(engine, root_id)
+    assert row.status == paused.status.value
+    assert row.claim_epoch == (await run_row(engine, root_id)).claim_epoch
+    assert not any(k.startswith("submitted") for k in (row.pause_data or {}))
+    assert llm.calls == 1  # the root never continued
+
+
+@pytest.mark.parametrize("entry", ["submit_input", "resume", "resume_stream"])
+async def test_an_agent_without_registrations_still_needs_the_token_for_a_managed_run(
+    store: Any, engine: Any, entry: str, ask_questions: None
+) -> None:
+    """Claim admission reads the persisted managed identity, not the caller's Agent."""
+    root = build(store, "input")
+    paused = await root.run("go", tenant_id=TENANT)
+    root_row = await run_row(engine, paused.run_id)
+    # A root that paused for its own question: rebuilt without subagents, non-strict.
+    own = lead(store, ContextLLM([LLMResponse(text="Which one?")]), reviewer(ContextLLM([])))
+    own._strict_tenancy = False
+    mine = await own.run("go", tenant_id=TENANT)
+    assert mine.status == RunStatus.WAITING_HUMAN_INPUT and mine.pending.origin_run_id is None
+    plain = Agent(
+        name="lead",
+        prompt="You lead.",
+        provider=ContextLLM([done("x")]),
+        state_store=store,
+        strict_tenancy=False,
+    )
+    for run_id in (mine.run_id,):
+        before = await run_row(engine, run_id)
+        if entry == "resume_stream":  # the ordinary stream reports setup errors as RUN_ERROR
+            events = await _tokenless(plain, entry, run_id)
+            assert events[-1].type.value == "run_error"
+            assert "pause_id_required" in (events[-1].error or "")
+        else:
+            with pytest.raises(InputValidationError) as caught:
+                await _tokenless(plain, entry, run_id)
+            assert caught.value.code == "pause_id_required"
+        after = await run_row(engine, run_id)
+        assert (after.status, after.claim_epoch) == (before.status, before.claim_epoch)
+    assert (await run_row(engine, paused.run_id)).status == root_row.status

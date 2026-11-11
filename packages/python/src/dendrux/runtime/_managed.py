@@ -909,17 +909,23 @@ async def route(root_agent: Agent, store: Any, run_id: str, *, tenant_id: Any) -
 def require_leaf_pause(found: Route, expected_pause_id: str | None) -> None:
     """A routed continuation needs the leaf's external pause and its token.
 
-    A subagent that runs, or whose outcome awaits adoption, leaves the root
-    RUNNING: nothing external to continue. Every external managed pause needs
-    ``expected_pause_id`` (strict or not); the leaf's claim then checks it.
+    A running target (the root's own leg, a running subagent, or one whose
+    outcome awaits adoption) has nothing external to continue. Every managed
+    continuation needs an explicit ``expected_pause_id`` (strict or not), which
+    the leaf's locked claim compares exactly; it is never taken from a later read.
     """
     from dendrux.errors import RunNotPausedError
     from dendrux.runtime._pending import PAUSE_STATUSES
     from dendrux.runtime.submit import _pause_id_required
 
-    if found.routed and found.leaf.status not in {s.value for s in PAUSE_STATUSES}:
+    status = found.leaf.status
+    if not found.routed and status in _TERMINAL_VALUES:
+        return  # a finished root: the ordinary path reports it (nothing can be claimed)
+    if status not in {s.value for s in PAUSE_STATUSES}:
+        # A running target, the root itself included: nothing external to continue.
+        # Refusing here keeps a later pause from being taken without its token.
         raise RunNotPausedError(found.root_run_id, RunStatus.RUNNING)
-    if expected_pause_id is None and found.leaf.status in {s.value for s in PAUSE_STATUSES}:
+    if expected_pause_id is None:
         _codes.log_code(logger, _codes.MANAGED_PAUSE_ID_REQUIRED, run_id=found.root_run_id)
         raise _pause_id_required()
 
