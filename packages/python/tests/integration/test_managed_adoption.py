@@ -1102,6 +1102,10 @@ async def test_parent_block_policy_stops_the_parent_and_keeps_no_blocked_text(
         )
         await _crash_at(monkeypatch, target, name, lambda: root.run("go", tenant_id=TENANT))
         root_id = await root_id_of(engine)
+        # The blocked report marked the parent in its claim transaction already.
+        marked = (await rows(engine, AgentRun, AgentRun.id == root_id))[0]
+        assert (marked.meta or {}).get(BLOCKED_META_KEY) is True
+        assert AWS_KEY not in await _durable_text(engine, root_id)
         item = await expire(store, engine, root_id)
         result = await make(ContextLLM([]), child_agent(ContextLLM([]))).reclaim(
             root_id, tenant_id=TENANT, item=item
@@ -1112,4 +1116,4 @@ async def test_parent_block_policy_stops_the_parent_and_keeps_no_blocked_text(
     assert row.failure_reason == "guardrail_blocked"
     assert AWS_KEY not in await _durable_text(engine, root_id)
     assert AWS_KEY not in (result.error or "")
-    assert (row.meta or {}).get(BLOCKED_META_KEY) is True or row.status == "error"
+    assert (row.meta or {}).get(BLOCKED_META_KEY) is True
