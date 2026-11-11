@@ -428,6 +428,7 @@ async def test_managed_continuation_requires_the_pause_token(
     """Even without strict tenancy: a missing token is refused before any claim."""
     root = build(store, case)
     root._strict_tenancy = False
+    root.subagents[0]._strict_tenancy = False  # the root's rule alone requires the token
     paused = await root.run("go", tenant_id=TENANT)
     child = await child_of(engine, paused.run_id)
 
@@ -562,7 +563,9 @@ async def test_requested_pause_through_the_root_reaches_the_running_leaf(
 
     async def pause_root(index: int, run_id: str | None) -> None:
         if index == 0:
-            outcome = await holder["root"].request_pause(holder["root_id"], tenant_id=TENANT)
+            outcome = await holder["root"].request_pause(
+                holder["root_id"], tenant_id=TENANT, cascade=False
+            )
             holder["outcome"] = outcome
 
     async def remember(index: int, run_id: str | None) -> None:
