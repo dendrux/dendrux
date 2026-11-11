@@ -186,7 +186,10 @@ class StructuredLLM(ContextLLM):
     )
 
 
-async def test_structured_child_report(store: Any, engine: Any) -> None:
+async def test_non_react_child_is_refused_at_entry(store: Any, engine: Any) -> None:
+    """Managed participants are ReAct only (owner 2026-11-12): refused before any write."""
+    from dendrux.errors import SubagentDefinitionError
+
     child_llm = StructuredLLM([LLMResponse(text='{"verdict": "ok", "score": 3}')])
     child = Agent(
         name="scorer",
@@ -198,10 +201,13 @@ async def test_structured_child_report(store: Any, engine: Any) -> None:
     )
     root_llm = ContextLLM([call("scorer", {"task": BRIEF}, "r1"), LLMResponse(text="ok")])
     root = root_agent(store, root_llm, child)
-    result = await root.run(ROOT_INPUT, tenant_id=TENANT)
-    assert result.status.value == "success"
-    observation = next(m for m in root_llm.messages[1] if m.role.value == "tool")
-    assert json.loads(observation.content) == {"verdict": "ok", "score": 3}
+    with pytest.raises(SubagentDefinitionError) as info:
+        await root.run(ROOT_INPUT, tenant_id=TENANT)
+    assert info.value.reason == "loop_unsupported"
+    assert info.value.code == "subagent_invalid"
+    assert info.value.subagent_name == "scorer"
+    assert root_llm.calls == 0 and child_llm.calls == 0
+    assert await rows(engine, AgentRun) == []
 
 
 async def test_root_usage_is_local_and_subtree_usage_includes_children(

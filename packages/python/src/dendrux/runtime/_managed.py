@@ -137,11 +137,12 @@ def require_root_entry(agent: Agent, store: StateStore | None, loop: Any) -> Non
 
 def _check_definitions(root: Agent, store: Any) -> None:
     """Every registered child has a provider and shares the root's store object."""
-    stack = list(root.subagents)
+    stack = [(root, child) for child in root.subagents]
     seen = 0
     while stack and seen < _MAX_WALK:
-        child = stack.pop()
+        parent, child = stack.pop()
         seen += 1
+        _require_react(parent, child)
         if child.provider is None:
             raise ValueError(f"Subagent '{child.name}' needs a provider.")
         own = getattr(child, "_state_store", None)
@@ -149,7 +150,22 @@ def _check_definitions(root: Agent, store: Any) -> None:
             own is None and getattr(child, "_database_url", None) is not None
         ):
             raise ValueError(f"Subagent '{child.name}' must use the root's store object or none.")
-        stack.extend(child.subagents)
+        stack.extend((child, grandchild) for grandchild in child.subagents)
+
+
+def _require_react(parent: Agent, child: Agent) -> None:
+    """Managed participants are durable ReAct runs only (owner 2026-11-12)."""
+    from dendrux.errors import SubagentDefinitionError
+    from dendrux.loops.react import ReActLoop
+    from dendrux.runtime._subagents import refuse
+
+    loop = child._effective_loop(None)
+    if loop is not None and not isinstance(loop, ReActLoop):
+        refuse(
+            SubagentDefinitionError(
+                parent.name, reason="loop_unsupported", subagent_name=child.name
+            )
+        )
 
 
 async def require_checkpointed_creation(store: Any) -> None:
