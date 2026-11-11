@@ -620,3 +620,31 @@ async def test_running_child_is_reclaimed_only_through_its_root(store: Any, engi
     assert set(child_llm2.served) == {child.id}
     seen = [json.loads(m.content) for m in root_llm2.messages[0] if m.role.value == "tool"]
     assert seen == [REPORT]
+
+
+async def test_duplicate_bind_never_drives_a_second_child(
+    store: Any, engine: Any, monkeypatch: Any
+) -> None:
+    """Spec test 3 at the driver: a repeat bind reads back and never runs a child."""
+    from dataclasses import replace
+
+    from dendrux.types import generate_ulid
+
+    repeats: list[Any] = []
+    original = _managed._run_child
+
+    async def twice(invocation: Any, notifier: Any) -> Any:
+        first = await original(invocation, notifier)
+        repeats.append(await original(replace(invocation, child_run_id=generate_ulid()), notifier))
+        return first
+
+    monkeypatch.setattr(_managed, "_run_child", twice)
+    child_llm = ContextLLM([LLMResponse(text=REPORT)])
+    root_llm = ContextLLM([call("reviewer", {"task": BRIEF}, "r1"), LLMResponse(text="ok")])
+    result = await root_agent(store, root_llm, child_agent(child_llm)).run("go", tenant_id=TENANT)
+
+    assert result.status == RunStatus.SUCCESS
+    assert child_llm.calls == 1
+    ((repeat, bound),) = repeats
+    assert bound is False and repeat.meta.get(_managed.NOT_OWNER_KEY)
+    assert len(await rows(engine, AgentRun, AgentRun.parent_run_id == result.run_id)) == 1
