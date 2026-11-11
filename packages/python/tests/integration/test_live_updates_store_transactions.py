@@ -232,13 +232,28 @@ async def test_two_stores_publish_after_second_connection_visibility(live_store,
     store, bus = live_store
     other_bus = RecordingUpdates()
     other = store_for_engine(engine, live_updates=other_bus)
+    original_send, original_other_send = bus.send, other_bus.send
     ids = [generate_ulid() for _ in range(20)]
     statements = []
+    flushed = {}
+    committed = set()
+    published_before_commit = []
+
+    # Record ordering synchronously: a delayed read must not conceal an early publication.
+    def after_flush(session, context):
+        flushed.setdefault(session, set()).update(
+            row.id for row in session.new if isinstance(row, AgentRun) and row.id in ids
+        )
+
+    def after_commit(session):
+        committed.update(flushed.pop(session, set()))
 
     def capture(conn, cursor, statement, parameters, context, executemany):
         statements.append(statement)
 
     event.listen(engine.sync_engine, "before_cursor_execute", capture)
+    event.listen(AsyncSession.sync_session_class, "after_flush", after_flush)
+    event.listen(AsyncSession.sync_session_class, "after_commit", after_commit)
 
     async def verify(messages):
         async with engine.connect() as conn:
@@ -248,23 +263,44 @@ async def test_two_stores_publish_after_second_connection_visibility(live_store,
                         await conn.scalar(select(AgentRun.id).where(AgentRun.id == run_id))
                         == run_id
                     )
-        bus.messages.extend(messages)
 
-    bus.send = verify
     try:
-        await asyncio.gather(
-            *(
-                store.create_run(rid, "peer") if i % 2 == 0 else other.create_run(rid, "peer")
-                for i, rid in enumerate(ids)
+        async with asyncio.TaskGroup() as checks:
+
+            def checked_send(target):
+                async def send(messages):
+                    # Database assertions belong to the test, outside the lossy send budget.
+                    published_before_commit.extend(
+                        run_id
+                        for message in messages
+                        for run_id in json.loads(message)
+                        if run_id not in committed
+                    )
+                    target.messages.extend(messages)
+                    checks.create_task(verify(tuple(messages)))
+
+                return send
+
+            bus.send = checked_send(bus)
+            other_bus.send = checked_send(other_bus)
+            await asyncio.gather(
+                *(
+                    store.create_run(rid, "peer") if i % 2 == 0 else other.create_run(rid, "peer")
+                    for i, rid in enumerate(ids)
+                )
             )
-        )
-        await bus.flush()
-        await other_bus.flush()
+            await bus.flush()
+            await other_bus.flush()
+        assert published_before_commit == []
         assert set(sent(bus)) == set(ids[::2])
         assert set(sent(other_bus)) == set(ids[1::2])
         assert len(sent(bus)) + len(sent(other_bus)) == 20
         assert not any("pg_notify" in sql for sql in statements)
     finally:
+        bus.send, other_bus.send = original_send, original_other_send
+        event.remove(AsyncSession.sync_session_class, "after_commit", after_commit)
+        event.remove(AsyncSession.sync_session_class, "after_flush", after_flush)
+        event.remove(engine.sync_engine, "before_cursor_execute", capture)
         await other.close()
 
 

@@ -321,23 +321,44 @@ async def test_a_stalled_response_close_never_holds_send_past_its_bound(
 ) -> None:
     from dendrux.mcp._http import _ResponseStream
 
+    closing = asyncio.Event()
+    release = asyncio.Event()
+
     async def never_closes(self: _ResponseStream) -> None:
-        await asyncio.sleep(3600)
+        closing.set()
+        await release.wait()
 
     monkeypatch.setattr(_ResponseStream, "aclose", never_closes)
     async with RawHTTPServer(_handler(_oversized())) as server:
-        client = OAuthHTTP(policy=None, timeout=0.3)
-        loop = asyncio.get_running_loop()
-        started = loop.time()
-        with pytest.raises(OAuthTransportError):
-            await client.send("GET", server.url + "/x")
-        assert loop.time() - started < 1.5
-        assert len(client._closing) == 1
-        started = loop.time()
-        await client.aclose()
-        assert loop.time() - started < 1.0
-        for task in list(client._closing):
-            task.cancel()
+        client = OAuthHTTP(policy=None, timeout=30.0)
+        wait = asyncio.wait
+        waits = []
+
+        async def expire_close_wait(tasks, *, timeout=None):
+            assert timeout == client._timeout
+            assert set(tasks) == client._closing
+            await closing.wait()
+            waits.append(set(tasks))
+            # Expire only the close wait, after the response has reached aclose.
+            return await wait(tasks, timeout=0)
+
+        monkeypatch.setattr(asyncio, "wait", expire_close_wait)
+        try:
+            async with asyncio.timeout(30):  # watchdog, not a performance assertion
+                with pytest.raises(OAuthTransportError) as caught:
+                    await client.send("GET", server.url + "/x")
+                assert caught.value.cause == "BodyTooLarge"
+                assert closing.is_set()
+                assert len(client._closing) == 1
+                pending = set(client._closing)
+                assert all(not task.done() for task in pending)
+                await client.aclose()
+                assert waits == [pending, pending]
+                assert all(not task.done() for task in pending)
+        finally:
+            release.set()
+            await asyncio.gather(*client._closing)
+            await client.aclose()
 
 
 async def test_cancellation_during_close_returns_and_the_close_still_finishes(

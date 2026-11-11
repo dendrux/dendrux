@@ -224,19 +224,45 @@ async def test_a_hint_sent_by_one_instance_reaches_the_consumer_of_another(chann
 
 
 async def test_a_hint_burst_ten_times_the_inbound_bound_arrives_in_full(channel: str) -> None:
-    writer, reader = make(channel=channel, flush_deadline_s=10.0), make(channel=channel)
-    consumer = Consumer()
-    lease = await listening(reader, consumer)
     ids = [f"run-{i:05d}" for i in range(10_000)]
-    for start in range(0, len(ids), 500):
-        writer.enqueue(ids[start : start + 500])
-        await writer.flush()
-    await eventually(lambda: len(consumer.ids) == len(ids), timeout=30)
-    assert consumer.ids == ids  # one sender, one channel: order is kept
-    assert reader.stats().gaps == 1  # the first healthy transition only; nothing overflowed
-    await reader._release_listener(lease)
-    await reader.close()
-    await writer.close()
+    ready, received = asyncio.Event(), asyncio.Event()
+
+    class BurstConsumer(Consumer):
+        def on_gap(self) -> None:
+            super().on_gap()
+            ready.set()
+
+        def on_hints(self, run_ids: Any) -> None:
+            super().on_hints(run_ids)
+            if len(self.ids) >= len(ids):
+                received.set()
+
+    # This is a delivery test. The watchdog must fire before sender/liveness deadlines;
+    # FAST's 200 ms health checks can disconnect a healthy subscriber on a busy runner.
+    options = dict(send_timeout_s=30.0, flush_deadline_s=30.0, health_check_s=30.0)
+    writer, reader = make(channel=channel, **options), make(channel=channel, **options)
+    consumer = BurstConsumer()
+    reader._register(consumer, stream_events=False)
+    lease = None
+    try:
+        async with asyncio.timeout(30):
+            lease = await reader._acquire_listener()
+            await ready.wait()
+            assert reader.healthy
+            for start in range(0, len(ids), 500):
+                writer.enqueue(ids[start : start + 500])
+                await writer.flush()
+            await received.wait()
+        assert consumer.ids == ids  # one sender, one channel: order is kept
+        assert writer.stats().sent == len(ids)
+        assert writer.stats().dropped_failed == 0
+        assert reader.stats().gaps == 1  # the first healthy transition only
+        assert reader.stats().dropped_inbound == 0
+    finally:
+        if lease is not None:
+            await reader._release_listener(lease)
+        await reader.close()
+        await writer.close()
 
 
 async def test_the_subscription_is_in_place_when_the_listener_reports_ready(
