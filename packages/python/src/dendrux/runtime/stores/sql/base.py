@@ -372,12 +372,14 @@ def _refuse_direct_managed_child(run_id: str, loop_state: Any) -> None:
 class _SweepScan:
     """One sweep category: projected candidate pages and each row's final CAS.
 
-    Waiting pages also project a parent's managed-wait marks from ``pause_data``
+    Waiting pages also read a parent's managed-wait marks from ``pause_data``
     (schema version, pause reason, bound child id; no history, no JSON index). A
     v3 managed wait is never abandoned (0.7): it waits on a subagent, or holds a
-    finished subagent's adoption. The final CAS rechecks that exemption. A row
-    carrying only part of the marks is a corrupt managed wait: reported, never
-    swept and never recreated.
+    finished subagent's adoption. The PAUSED page filters complete managed waits
+    out inside the existing index scan, so they never use the page or work cap
+    ahead of ordinary pauses; the final CAS rechecks the exemption. A row
+    carrying only part of the marks is a corrupt managed wait: a candidate that
+    is reported, never swept and never recreated.
     """
 
     def __init__(self, store: SQLStateStore, *, waiting: bool, older_than: timedelta) -> None:
@@ -424,6 +426,19 @@ class _SweepScan:
             or_(reason.is_(None), reason != MANAGED_WAIT_REASON),
         )
 
+    def _not_valid_managed_wait(self) -> Any:
+        """Not a complete v3 managed wait; NULL-safe (any missing mark qualifies)."""
+        from sqlalchemy import or_
+
+        version, reason, child = self._wait_marks()
+        return or_(
+            version.is_(None),
+            version != MANAGED_WAIT_SCHEMA_VERSION,
+            reason.is_(None),
+            reason != MANAGED_WAIT_REASON,
+            child.is_(None),
+        )
+
     def page(self, status_filter: str, after: Any, limit: int) -> Any:
         from sqlalchemy import tuple_
 
@@ -449,6 +464,11 @@ class _SweepScan:
             statement = statement.where(
                 AgentRun.status == status_filter, self.age < self.cutoff
             ).order_by(self.age, AgentRun.id)
+            if status_filter == RunStatus.PAUSED.value:
+                # Valid managed waits are never candidates: they cannot use up the
+                # page or the work cap ahead of ordinary pauses. Partial marks stay
+                # candidates so a corrupt wait is still reported.
+                statement = statement.where(self._not_valid_managed_wait())
             if after is not None:
                 statement = statement.where(tuple_(self.age, AgentRun.id) > after)
             return statement

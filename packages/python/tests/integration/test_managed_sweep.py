@@ -288,9 +288,9 @@ async def test_skipped_managed_waits_cost_no_per_row_statement_and_no_history_re
     assert not any(ReactTrace.__tablename__ in s for s in lowered)
     assert not any(s.lstrip().startswith("update") for s in lowered)
     selects = [s for s in lowered if s.lstrip().startswith("select")]
-    # Only candidate pages: one per waiting status plus the page after the skipped row.
+    # Only candidate pages: one per waiting status; the valid wait is never a candidate.
     assert all("as sweep_age" in s for s in selects)
-    assert len(selects) == len(PAUSE_STATUS_VALUES) + 1
+    assert len(selects) == len(PAUSE_STATUS_VALUES)
     # pause_data is read only through JSON path projections, never loaded whole.
     for statement in selects:
         bare = re.sub(r"(json_type|json_extract|cast)\(agent_runs\.pause_data", "", statement)
@@ -423,3 +423,62 @@ async def test_a_stale_running_child_marked_by_sweep_is_reclaimed_through_its_ro
     assert result.status == RunStatus.SUCCESS
     assert child_llm.calls == 1 and set(child_llm.served) == {child.id}
     assert len(await rows(engine, AgentRun, AgentRun.parent_run_id == root_id)) == 1
+
+
+# ---------------------------------------------------------------------------
+# Fix round 1, R1: exempt managed waits never starve ordinary abandoned pauses
+# ---------------------------------------------------------------------------
+
+
+async def _another_terminal_wait(store: Any, engine: Any, monkeypatch: Any) -> str:
+    before = {r.id for r in await rows(engine, AgentRun, AgentRun.agent_name == "lead")}
+    await _terminal_child_waiting_any(store, monkeypatch)
+    after = {r.id for r in await rows(engine, AgentRun, AgentRun.agent_name == "lead")}
+    [root_id] = after - before
+    return root_id
+
+
+async def _terminal_child_waiting_any(store: Any, monkeypatch: Any) -> None:
+    async def die(*args: Any, **kwargs: Any) -> Any:
+        raise ProcessDeathError
+
+    root = lead(
+        store,
+        ContextLLM([call("reviewer", {"task": BRIEF}, "r1")]),
+        reviewer(ContextLLM([LLMResponse(text=REPORT)])),
+    )
+    with monkeypatch.context() as patch:
+        patch.setattr(_managed, "adopt", die)
+        with pytest.raises(ProcessDeathError):
+            await root.run("go", tenant_id=TENANT)
+
+
+async def test_bounded_sweeps_reach_an_ordinary_pause_behind_more_than_a_cap_of_waits(
+    store: Any, engine: Any, monkeypatch: Any
+) -> None:
+    """Three old managed waits ahead of an ordinary requested pause, cap two rows per
+    sweep: repeated bounded sweeps still abandon the ordinary pause."""
+    from dendrux.types import generate_ulid
+
+    waits = [await _another_terminal_wait(store, engine, monkeypatch) for _ in range(3)]
+    ordinary = generate_ulid()
+    await store.create_run(ordinary, "legacy", tenant_id=TENANT)
+    async with engine.begin() as conn:
+        await conn.execute(
+            update(AgentRun)
+            .where(AgentRun.id == ordinary)
+            .values(status="paused", pause_data={"schema_version": 2, "pause_reason": "requested"})
+        )
+    await age(engine, *waits, by=timedelta(hours=4))
+    await age(engine, ordinary, by=timedelta(hours=3))
+
+    swept: list[str] = []
+    for _ in range(3):
+        result = await sweep(
+            state_store=store, abandoned_waiting=THRESHOLD, max_runs=2, batch_size=1
+        )
+        swept.extend(r.run_id for r in result.abandoned_waiting)
+    assert swept == [ordinary]
+    for run_id in waits:
+        row = await run_row(engine, run_id)
+        assert row.status == "paused" and row.pause_data["schema_version"] == 3
