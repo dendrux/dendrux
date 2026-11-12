@@ -29,6 +29,7 @@ from dendrux.runtime import _managed
 from dendrux.runtime.context import get_delegation_context
 from dendrux.runtime.stores._factory import store_for_engine
 from dendrux.types import LLMResponse, RunStatus, ToolCall
+from tests._helpers.recovery_checkpoint import expire
 from tests._helpers.scripted_provider import ScriptedLLM
 
 BRIEF = "SENTINEL-recover-brief-5a1d"
@@ -236,3 +237,71 @@ async def test_cached_view_of_a_stable_wait_reads_once(
     assert cached.status == RunStatus.WAITING_APPROVAL
     assert cached.pause_id == paused.pause_id
     assert reads.count(paused.run_id) == 1
+
+
+# ---------------------------------------------------------------------------
+# B6: a custom store without the pre-claim child refusal still refuses safely
+# ---------------------------------------------------------------------------
+
+
+def _nonconforming(store: Any) -> Any:
+    """A custom store whose reclaim_run lacks the kit's pre-claim managed-child refusal."""
+    from dendrux.runtime.context import managed_root_reclaim_scope
+
+    base = type(store)
+
+    class NonconformingStore(base):  # type: ignore[misc, valid-type]
+        async def reclaim_run(self, run_id: str, **kwargs: Any) -> Any:
+            with managed_root_reclaim_scope(run_id):  # skips the native refusal
+                return await base.reclaim_run(self, run_id, **kwargs)
+
+    custom = store_for_engine(store._engine)
+    custom.__class__ = NonconformingStore
+    return custom
+
+
+async def _dead_child(store: Any, engine: Any) -> tuple[str, Any]:
+    class DyingLLM(ContextLLM):
+        async def complete(self, messages: Any, tools: Any = None, **kw: Any) -> LLMResponse:
+            raise ProcessDeathError
+
+    first = ContextLLM([call("reviewer", {"task": BRIEF}, "r1")])
+    root = lead(store, first, reviewer(DyingLLM([])))
+    with pytest.raises(ProcessDeathError):
+        await root.run("go", tenant_id=TENANT)
+    root_id = await root_id_of(engine)
+    [child] = await children_of(engine, root_id)
+    assert child.status == "running"
+    return root_id, child
+
+
+async def _recovery_marks(engine: Any, run_id: str) -> tuple[Any, ...]:
+    row = await run_row(engine, run_id)
+    events = await count(engine, RunEvent, RunEvent.agent_run_id == run_id)
+    return (row.status, row.claim_epoch, row.reclaim_attempts, row.lease_expired_at, events)
+
+
+async def test_custom_store_without_pre_claim_refusal_refuses_a_direct_child_reclaim(
+    store: Any, engine: Any
+) -> None:
+    """B6: the runtime refuses a direct child reclaim before such a store's claim."""
+    from dendrux.errors import ManagedChildControlError, RunNotFoundError
+
+    root_id, child = await _dead_child(store, engine)
+    item = await expire(store, engine, child.id)
+    before = await _recovery_marks(engine, child.id)
+    custom = _nonconforming(store)
+    direct = reviewer(ContextLLM([]), state_store=custom)
+    with pytest.raises(RunNotFoundError):  # another tenant learns nothing
+        await direct.reclaim(child.id, tenant_id="other", item=item)
+    assert await _recovery_marks(engine, child.id) == before
+    for _ in range(2):
+        with pytest.raises(ManagedChildControlError):
+            await direct.reclaim(child.id, tenant_id=TENANT, item=item)
+        assert await _recovery_marks(engine, child.id) == before
+
+    child_llm = ContextLLM([LLMResponse(text=REPORT)])
+    root_llm = ContextLLM([LLMResponse(text="root done")])
+    result = await lead(custom, root_llm, reviewer(child_llm)).reclaim(root_id, tenant_id=TENANT)
+    assert result.status == RunStatus.SUCCESS and child_llm.calls == 1
+    assert len(await children_of(engine, root_id)) == 1

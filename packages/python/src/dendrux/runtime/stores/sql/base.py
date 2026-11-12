@@ -744,6 +744,11 @@ class SQLStateStore(SQLBlobCatalog):
     _requires_persisted_claim = True
 
     @property
+    def _refuses_managed_child_reclaim(self) -> bool:
+        """This store's own claim refuses a direct managed-child reclaim (0.7)."""
+        return type(self).reclaim_run is SQLStateStore.reclaim_run
+
+    @property
     def _uses_combined_sweep(self) -> bool:
         return (
             type(self).sweep_stale_runs is SQLStateStore.sweep_stale_runs

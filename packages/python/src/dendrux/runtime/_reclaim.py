@@ -70,6 +70,8 @@ async def reclaim(
         )
     session = SkillSession.prepare(agent)
     session.run_id = run_id
+    if not via_root:
+        await _refuse_child_before_claim(store, run_id, tenant_id)
     scope = managed_root_reclaim_scope(run_id) if via_root else nullcontext()
     try:
         with scope:
@@ -102,8 +104,8 @@ async def reclaim(
         raise
     owned = claimed_store(store, run_id, claim)
     if not via_root:
-        # Stores that refuse before their claim never reach this; a custom store
-        # without that check is still refused here, after its claim.
+        # Last resort: unreachable when the store and its reads agree. The claim
+        # cost one recovery attempt; nothing runs and the root reclaims later.
         _refuse_direct_child(run_id, claim.loop_state)
     if _pending_adoption(claim.loop_state):
         # A managed parent claimed for adoption before its tool row completed:
@@ -179,6 +181,26 @@ async def _continue_session(
             _reclaim_submission=_unconsumed_submission(state, reader.raw),
         )
         return _reclaimed_result(run_id, result) if reclaimed else result
+
+
+async def _refuse_child_before_claim(store: StateStore, run_id: str, tenant_id: Any) -> None:
+    """Refuse a direct managed-child reclaim before a custom store's claim (0.7).
+
+    The built-in SQL store refuses inside its claim without an extra read. A
+    custom store may not (the store kit requires it), so the runtime reads the
+    run and, for a child, its header first: a refusal then changes nothing. A
+    run outside ``tenant_id`` is left to the store's own not-found answer.
+    """
+    from dendrux.runtime.state import UNSCOPED, unclaimed_store
+
+    if getattr(unclaimed_store(store), "_refuses_managed_child_reclaim", False) is True:
+        return
+    record = await store.get_run(run_id)
+    if record is None or record.parent_run_id is None:
+        return
+    if tenant_id is not UNSCOPED and record.tenant_id != tenant_id:
+        return
+    _refuse_direct_child(run_id, await store.get_loop_state(run_id))
 
 
 def _refuse_direct_child(run_id: str, state: dict[str, Any] | None) -> None:
