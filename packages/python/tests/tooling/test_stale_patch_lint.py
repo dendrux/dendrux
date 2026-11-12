@@ -174,3 +174,134 @@ def test_a_clean_tree_needs_no_baseline_file(tmp_path: Path) -> None:
     src, tests = build(tmp_path, RUNNER, "def test_x():\n    pass\n")
     args = ["--tests", str(tests), "--src", str(src), "--baseline", str(tmp_path / "none.json")]
     assert sp.main(["check", *args]) == 0
+
+
+# ---- patch calls are recognised by what they resolve to --------------------------------------
+
+
+def test_aliased_patch_imports_and_keyword_targets_are_found(tmp_path: Path) -> None:
+    found = stale(
+        tmp_path,
+        """\
+        from unittest.mock import patch as p
+        from dendrux.runtime import runner
+
+        p("dendrux.runtime.runner._emit_event")
+        p.object(runner, "_emit_event")
+        p(target="dendrux.runtime.runner._emit_event")
+        """,
+    )
+    assert found == ["dendrux.runtime.runner._emit_event"] * 3
+
+
+def test_unrelated_patch_methods_are_not_patch_sites(tmp_path: Path) -> None:
+    assert (
+        stale(
+            tmp_path,
+            """\
+            def test_x(client, registry):
+                client.patch("dendrux.runtime.runner._emit_event")
+                registry.setattr("dendrux.runtime.runner._emit_event", 1)
+            """,
+        )
+        == []
+    )
+
+
+# ---- a shadowing name is not the library module ----------------------------------------------
+
+
+def test_a_fixture_that_shadows_the_module_alias_is_not_a_library_patch(tmp_path: Path) -> None:
+    assert (
+        stale(
+            tmp_path,
+            """\
+            from dendrux.runtime import runner
+
+
+            def test_a(runner, monkeypatch):
+                monkeypatch.setattr(runner, "_emit_event", 1)
+            """,
+        )
+        == []
+    )
+
+
+# ---- use is judged per binding, at call time -------------------------------------------------
+
+SHADOWED = """\
+from dendrux.runtime.events import emit as X
+
+
+def unrelated(X):
+    return X
+"""
+
+COPIED = """\
+from dendrux.runtime.events import emit as X
+
+Y = X
+
+
+def use():
+    return Y()
+"""
+
+READ_AT_CALL_TIME = """\
+from dendrux.runtime.events import emit as X
+
+
+def use():
+    return X()
+"""
+
+DEFAULT_ARG = """\
+from dendrux.runtime.events import emit as X
+
+
+def use(callback=X):
+    return callback()
+"""
+
+
+def test_a_shadowing_parameter_is_not_a_use_of_the_import(tmp_path: Path) -> None:
+    assert stale(tmp_path, patching("dendrux.runtime.runner.X"), SHADOWED) == [
+        "dendrux.runtime.runner.X"
+    ]
+
+
+def test_an_import_time_copy_is_not_a_use_of_the_import(tmp_path: Path) -> None:
+    assert stale(tmp_path, patching("dendrux.runtime.runner.X"), COPIED) == [
+        "dendrux.runtime.runner.X"
+    ]
+
+
+def test_a_default_argument_is_an_import_time_copy(tmp_path: Path) -> None:
+    assert stale(tmp_path, patching("dendrux.runtime.runner.X"), DEFAULT_ARG) == [
+        "dendrux.runtime.runner.X"
+    ]
+
+
+def test_a_read_inside_a_function_is_a_use(tmp_path: Path) -> None:
+    assert stale(tmp_path, patching("dendrux.runtime.runner.X"), READ_AT_CALL_TIME) == []
+
+
+def test_a_read_in_a_method_is_a_use(tmp_path: Path) -> None:
+    module = (
+        "from dendrux.runtime.events import emit as X\n\n\n"
+        "class C:\n    def m(self):\n        return X()\n"
+    )
+    assert stale(tmp_path, patching("dendrux.runtime.runner.X"), module) == []
+
+
+# ---- patching below a re-exported object is not a stale facade patch -------------------------
+
+
+def test_patching_an_attribute_below_a_re_export_is_fine(tmp_path: Path) -> None:
+    assert stale(tmp_path, patching("dendrux.runtime.runner._emit_event.attr")) == []
+
+
+def test_patching_the_re_export_itself_is_stale(tmp_path: Path) -> None:
+    assert stale(tmp_path, patching("dendrux.runtime.runner._emit_event")) == [
+        "dendrux.runtime.runner._emit_event"
+    ]

@@ -28,21 +28,22 @@ if TYPE_CHECKING:
 
 try:
     from tools import _patch_sites as ps
+    from tools import _scopes as sc
 except ImportError:  # run as a script from packages/python/tools
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from tools import _patch_sites as ps
+    from tools import _scopes as sc
 
 
 @dataclass
 class Rewrite:
     source: str
     notes: list[str] = field(default_factory=list)
+    edits: int = 0
 
     @property
     def changed(self) -> bool:
         return bool(self.edits)
-
-    edits: int = 0
 
 
 class _Text:
@@ -59,7 +60,8 @@ class _Text:
         return self.starts[lineno - 1] + len(line.encode()[:col].decode(errors="ignore"))
 
     def span(self, node: ast.expr) -> tuple[int, int]:
-        assert node.end_lineno is not None and node.end_col_offset is not None  # noqa: S101
+        if node.end_lineno is None or node.end_col_offset is None:
+            raise ValueError("node has no end position")
         return (
             self.offset(node.lineno, node.col_offset),
             self.offset(node.end_lineno, node.end_col_offset),
@@ -78,90 +80,133 @@ def _new_module_for(
     return None
 
 
-def _last_import_end(tree: ast.Module) -> int:
-    """Line after which a new top-level import goes (0 = top of the file)."""
+def _is_type_checking_block(node: ast.stmt) -> bool:
+    return (
+        isinstance(node, ast.If)
+        and not node.orelse
+        and (sc.dotted(node.test) or "").split(".")[-1] == "TYPE_CHECKING"
+        and all(isinstance(n, ast.Import | ast.ImportFrom) for n in node.body)
+    )
+
+
+def _import_insert_line(tree: ast.Module) -> int:
+    """Line after which a new import goes: the end of the leading docstring and import block.
+
+    Everything after that block (decorators included) runs later, so a name imported here is
+    bound before any rewritten patch target can use it.
+    """
     last = 0
     for i, node in enumerate(tree.body):
-        if isinstance(node, ast.Import | ast.ImportFrom) or (
+        is_docstring = (
             i == 0
             and isinstance(node, ast.Expr)
             and isinstance(node.value, ast.Constant)
             and isinstance(node.value.value, str)
+        )
+        if not (
+            is_docstring
+            or isinstance(node, ast.Import | ast.ImportFrom)
+            or _is_type_checking_block(node)
         ):
-            last = node.end_lineno or node.lineno
+            break
+        last = node.end_lineno or node.lineno
     return last
 
 
-def _names_in_use(tree: ast.AST) -> set[str]:
-    used = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
-    for n in ast.walk(tree):
-        if isinstance(n, ast.alias):
-            used.add(n.asname or n.name.split(".")[0])
-        elif isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
-            used.add(n.name)
-    return used
+class _Rewriter:
+    def __init__(self, source: str, mapping: Mapping[str, Mapping[str, str]]) -> None:
+        self.source = source
+        self.mapping = mapping
+        self.tree = ast.parse(source)
+        self.index = sc.ScopeIndex(self.tree)
+        self.text = _Text(source)
+        self.taken = self.index.all_names()
+        self.new_imports: dict[str, str] = {}  # new module -> fresh module-level name
+        self.edits: list[tuple[int, int, str]] = []
+        self.notes: list[str] = []
+
+    def _fresh(self, leaf: str) -> str:
+        for candidate in (leaf, f"{leaf}_mod", *(f"{leaf}_mod{n}" for n in range(2, 100))):
+            if candidate not in self.taken:
+                self.taken.add(candidate)
+                return candidate
+        raise ValueError(f"no free name for {leaf}")
+
+    def _reference(self, module: str, scope: sc.Scope) -> str:
+        """A name that is bound to ``module`` at this scope."""
+        seen: set[str] = set()
+        s: sc.Scope | None = scope
+        while s is not None:
+            for name in s.bindings:
+                binding = scope.resolve(name)
+                if (
+                    name not in seen
+                    and binding is not None
+                    and binding == sc.Binding("import", module)
+                ):
+                    return name
+                seen.add(name)
+            s = s.parent
+        if module not in self.new_imports:
+            self.new_imports[module] = self._fresh(module.rpartition(".")[2])
+        return self.new_imports[module]
+
+    def _string(self, site: ps.PatchSite) -> None:
+        hit = _new_module_for(site.dotted, self.mapping)
+        if hit is None:
+            return
+        old, _name, new = hit
+        start, end = self.text.span(site.node)
+        segment = self.source[start:end]
+        if site.dotted not in segment:
+            self.notes.append(f"line {site.lineno}: target is not one plain literal; left")
+            return
+        tail = site.dotted[len(old) + 1 :]
+        self.edits.append((start, end, segment.replace(site.dotted, f"{new}.{tail}", 1)))
+
+    def _alias(self, site: ps.PatchSite) -> None:
+        hit = _new_module_for(f"{site.dotted}.{site.attr}", self.mapping)
+        if hit is None or hit[0] != site.dotted:
+            return
+        start, end = self.text.span(site.node)
+        self.edits.append((start, end, self._reference(hit[2], site.scope)))
+
+    def run(self) -> Rewrite:
+        for site in ps.find_sites(self.index):
+            if site.kind == "string":
+                self._string(site)
+            elif site.kind == "alias":
+                self._alias(site)
+            else:
+                self.notes.append(site.note)
+        result = Rewrite(self.source, self.notes)
+        if not self.edits:
+            return result
+        line = _import_insert_line(self.tree)
+        at = self.text.starts[line] if line < len(self.text.starts) else len(self.source)
+        prefix = (
+            "\n"
+            if at == len(self.source) and self.source and not self.source.endswith("\n")
+            else ""
+        )
+        for module, name in self.new_imports.items():
+            parent, _, leaf = module.rpartition(".")
+            suffix = "" if name == leaf else f" as {name}"
+            self.edits.append((at, at, f"{prefix}from {parent} import {leaf}{suffix}\n"))
+        out = self.source
+        order = sorted(enumerate(self.edits), key=lambda e: (e[1][0], e[1][1], -e[0]), reverse=True)
+        for _, (start, end, new_text) in order:
+            out = out[:start] + new_text + out[end:]
+        result.source, result.edits = out, len(self.edits)
+        return result
 
 
 def rewrite_source(source: str, mapping: Mapping[str, Mapping[str, str]]) -> Rewrite:
     """Return the rewritten source and notes about sites that were left alone."""
-    result = Rewrite(source)
     try:
-        tree = ast.parse(source)
+        return _Rewriter(source, mapping).run()
     except SyntaxError as exc:
-        result.notes.append(f"skipped: syntax error at line {exc.lineno}")
-        return result
-    text = _Text(source)
-    aliases = ps.import_aliases(tree)
-    in_use = _names_in_use(tree)
-    new_imports: dict[str, str] = {}  # new module -> local name
-    edits: list[tuple[int, int, str]] = []
-
-    def local_name(module: str) -> str:
-        for local, target in aliases.items():
-            if target == module:
-                return local
-        if module in new_imports:
-            return new_imports[module]
-        parent, _, leaf = module.rpartition(".")
-        name = leaf if leaf not in in_use else f"{leaf}_mod"
-        in_use.add(name)
-        new_imports[module] = name
-        return name
-
-    for site in ps.find_sites(tree):
-        if site.kind == "string":
-            hit = _new_module_for(site.dotted, mapping)
-            if hit is None:
-                continue
-            old, _name, new = hit
-            start, end = text.span(site.node)
-            segment = source[start:end]
-            if site.dotted not in segment:
-                result.notes.append(f"line {site.lineno}: target is not one plain literal; left")
-                continue
-            tail = site.dotted[len(old) + 1 :]
-            edits.append((start, end, segment.replace(site.dotted, f"{new}.{tail}", 1)))
-        else:
-            hit = _new_module_for(f"{site.dotted}.{site.attr}", mapping)
-            if hit is None or hit[0] != site.dotted:
-                continue
-            start, end = text.span(site.node)
-            edits.append((start, end, local_name(hit[2])))
-    if not edits:
-        return result
-    for module, name in new_imports.items():
-        parent, _, leaf = module.rpartition(".")
-        suffix = "" if name == leaf else f" as {name}"
-        line = _last_import_end(tree)
-        at = text.starts[line] if line < len(text.starts) else len(source)
-        prefix = "\n" if at == len(source) and source and not source.endswith("\n") else ""
-        edits.append((at, at, f"{prefix}from {parent} import {leaf}{suffix}\n"))
-    out = source
-    for start, end, new_text in sorted(edits, key=lambda e: (e[0], e[1]), reverse=True):
-        out = out[:start] + new_text + out[end:]
-    result.source = out
-    result.edits = len(edits)
-    return result
+        return Rewrite(source, [f"skipped: syntax error at line {exc.lineno}"])
 
 
 def _load_mapping(path: Path) -> dict[str, dict[str, str]]:

@@ -26,10 +26,12 @@ if TYPE_CHECKING:
 try:
     from tools import _patch_sites as ps
     from tools import _ratchet as r
+    from tools import _scopes as sc
 except ImportError:  # run as a script from packages/python/tools
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from tools import _patch_sites as ps
     from tools import _ratchet as r
+    from tools import _scopes as sc
 
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 BASELINE = Path(__file__).resolve().parent / "stale_patch_baseline.json"
@@ -58,51 +60,23 @@ def _module_file(src: Path, module: str) -> Path | None:
     return None
 
 
-def _top_level(body: Sequence[ast.stmt]) -> list[ast.stmt]:
-    out: list[ast.stmt] = []
-    for node in body:
-        out.append(node)
-        if isinstance(node, ast.If | ast.Try):
-            out.extend(_top_level(node.body))
-            out.extend(_top_level(node.orelse))
-            if isinstance(node, ast.Try):
-                out.extend(_top_level(node.finalbody))
-                for handler in node.handlers:
-                    out.extend(_top_level(handler.body))
-    return out
-
-
-def _targets(node: ast.stmt) -> list[str]:
-    raw: list[ast.expr] = []
-    if isinstance(node, ast.Assign):
-        raw = list(node.targets)
-    elif isinstance(node, ast.AnnAssign):
-        raw = [node.target]
-    names: list[str] = []
-    while raw:
-        t = raw.pop()
-        if isinstance(t, ast.Name):
-            names.append(t.id)
-        elif isinstance(t, ast.Tuple | ast.List):
-            raw.extend(t.elts)
-    return names
-
-
 def analyse(source: str) -> _Module:
-    tree = ast.parse(source)
-    defined: set[str] = set()
-    imported: set[str] = set()
-    for node in _top_level(tree.body):
-        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
-            defined.add(node.name)
-        elif isinstance(node, ast.Import):
-            imported.update(a.asname or a.name.split(".")[0] for a in node.names)
-        elif isinstance(node, ast.ImportFrom):
-            imported.update(a.asname or a.name for a in node.names)
-        else:
-            defined.update(_targets(node))
-    used = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
-    return _Module(frozenset(defined), frozenset(imported - defined - used))
+    """Names the module only imports, and none of its code reads when it runs.
+
+    A read counts when it sits inside a function (so it happens at call time) and resolves to
+    the module-level binding, not to a parameter or local of the same spelling. An import-time
+    copy (``Y = X``, a decorator, a default argument, a base class) is not a read of ``X``
+    later, so replacing ``X`` afterwards reaches nothing.
+    """
+    index = sc.ScopeIndex(ast.parse(source))
+    module = index.module
+    imported = {n for n, b in module.bindings.items() if all(x.kind == "import" for x in b)}
+    used = {
+        node.id
+        for node, scope in index.names
+        if isinstance(node.ctx, ast.Load) and scope.deferred() and scope.find(node.id) is module
+    }
+    return _Module(frozenset(module.bindings) - imported, frozenset(imported - used))
 
 
 class _Modules:
@@ -116,15 +90,15 @@ class _Modules:
             self._cache[module] = analyse(path.read_text(encoding="utf-8")) if path else None
         return self._cache[module]
 
-    def split(self, dotted: str) -> tuple[str, str] | None:
-        """Longest library module prefix of ``dotted`` and the next component (the attribute)."""
+    def split(self, dotted: str) -> tuple[str, str, str] | None:
+        """Longest library module prefix of ``dotted``, the next component, and what follows."""
         parts = dotted.split(".")
         if parts[0] != LIBRARY:
             return None
         for cut in range(len(parts) - 1, 0, -1):
             module = ".".join(parts[:cut])
             if self.get(module) is not None:
-                return module, parts[cut]
+                return module, parts[cut], ".".join(parts[cut + 1 :])
         return None
 
 
@@ -134,12 +108,18 @@ def find_stale(tests: Path, src: Path) -> list[StaleSite]:
     found: list[StaleSite] = []
     for path in sorted(tests.rglob("*.py")):
         try:
-            tree = ast.parse(path.read_text(encoding="utf-8"))
+            index = sc.ScopeIndex(ast.parse(path.read_text(encoding="utf-8")))
         except SyntaxError:
             continue
-        for site in ps.find_sites(tree):
-            hit = modules.split(site.dotted) if site.kind == "string" else None
-            if site.kind == "alias" and modules.get(site.dotted) is not None:
+        for site in ps.find_sites(index):
+            hit: tuple[str, str] | None = None
+            if site.kind == "string":
+                split = modules.split(site.dotted)
+                # A tail means an attribute *below* the name is patched: that mutates the shared
+                # object, which the defining module sees, so it is not a stale facade patch.
+                if split and not split[2]:
+                    hit = split[:2]
+            elif site.kind == "alias" and modules.get(site.dotted) is not None:
                 hit = (site.dotted, site.attr)  # only a module alias; a class alias is not
             info = modules.get(hit[0]) if hit else None
             if hit and info and hit[1] in info.reexported:
