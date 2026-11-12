@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import tomllib
 from pathlib import Path
 
@@ -34,7 +35,7 @@ def test_the_make_targets_exist() -> None:
     assert "tools/move_check.py" in makefile
     assert "\nstale-patches:" in makefile
     assert "tools/stale_patch_lint.py check" in makefile
-    assert "stale-patches" in makefile.split("\nci:")[1].splitlines()[0]
+    assert "stale-patches" in makefile.split("\nlint:")[1].split("\n\n")[0]
 
 
 @pytest.mark.skipif(not WORKFLOW.is_file(), reason="repository checkout only")
@@ -42,3 +43,19 @@ def test_the_quality_job_runs_the_stale_patch_guard() -> None:
     steps = yaml.safe_load(WORKFLOW.read_text())["jobs"]["quality"]["steps"]
     runs = [step.get("run", "") for step in steps]
     assert "python tools/stale_patch_lint.py check" in runs
+
+
+@pytest.mark.skipif(not WORKFLOW.is_file(), reason="repository checkout only")
+def test_make_bench_and_the_ci_benchmarks_job_share_one_timeout() -> None:
+    makefile = (PKG / "Makefile").read_text()
+    recipe = makefile.split("\nbench:", 1)[1].split("\n\n", 1)[0]
+    make_flags = re.findall(r"--timeout=(\d+)", recipe)
+    job = yaml.safe_load(WORKFLOW.read_text())["jobs"]["benchmarks"]
+    ci_flags = [
+        flag
+        for step in job["steps"]
+        for flag in re.findall(r"--timeout=(\d+)", step.get("run", ""))
+    ]
+    assert make_flags and make_flags == ci_flags
+    assert int(make_flags[0]) > 300  # the benchmark policy is explicit, not the default
+    assert int(make_flags[0]) * 2 <= job["timeout-minutes"] * 60  # one rerun still fits the job

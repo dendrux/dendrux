@@ -90,6 +90,7 @@ test-shard-proof:
 lint:
 	ruff check .
 	ruff format --check .
+	$(MAKE) stale-patches
 
 typecheck:
 	mypy src/dendrux/
@@ -129,7 +130,7 @@ semgrep:
 	python tools/semgrep_ratchet.py check
 
 # Stale-patch guard: fails when a test patches a re-export that its module never uses (the patch
-# would silently do nothing). Part of `make ci`.
+# would silently do nothing). Part of `make lint`.
 stale-patches:
 	python tools/stale_patch_lint.py check
 
@@ -188,7 +189,7 @@ test-mysql:
 # run on a quiet machine (nothing else using Postgres) and record the numbers in the load-test
 # results doc. Needs DENDRUX_TEST_PG_URL.
 bench:
-	pytest tests/ -v -rs -n 0 -m benchmark -p no:randomly --timeout=1800
+	pytest tests/ -v -rs -n 0 -m benchmark -p no:randomly --timeout=600
 
 # Scale evidence. Needs a private Postgres database whose name ends in _test (the script drops
 # its tables), given as DENDRUX_LOAD_PG_URL. `load` is the full run (tens of minutes, run it on a
@@ -241,7 +242,7 @@ format:
 package-smoke:
 	python scripts/mcp_distribution_smoke.py
 
-ci: lint typecheck arch test crap quality stale-patches api-check
+ci: lint typecheck arch test crap quality api-check
 
 clean:
 	rm -rf dist/ build/ *.egg-info .pytest_cache .mypy_cache .ruff_cache htmlcov .coverage coverage.json coverage.json.sources.json
