@@ -16,6 +16,8 @@ contender races run on Postgres only.
 
 from __future__ import annotations
 
+import asyncio
+import json
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -24,7 +26,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 from dendrux import Agent, tool
-from dendrux.db.models import AgentRun, ReactTrace, RunEvent
+from dendrux.db.models import AgentRun, ReactTrace, RunEvent, TokenUsage, ToolCallRecord
 from dendrux.runtime import _managed
 from dendrux.runtime.context import get_delegation_context
 from dendrux.runtime.stores._factory import store_for_engine
@@ -305,3 +307,478 @@ async def test_custom_store_without_pre_claim_refusal_refuses_a_direct_child_rec
     result = await lead(custom, root_llm, reviewer(child_llm)).reclaim(root_id, tenant_id=TENANT)
     assert result.status == RunStatus.SUCCESS and child_llm.calls == 1
     assert len(await children_of(engine, root_id)) == 1
+
+
+# ---------------------------------------------------------------------------
+# The crash matrix (spec v2 §3, §8 T4): phase one runs in a child process that
+# dies with ``os._exit`` at the cut (no cleanup, no finally); phase two recovers
+# through the root id with new Agents, providers and a new engine.
+# ---------------------------------------------------------------------------
+
+CRASHED = 17
+"""Exit code of a phase-one process that reached its crash cut."""
+_CRASH_IN_TOOL = False
+
+
+def _usage() -> Any:
+    from dendrux.types import UsageStats
+
+    return UsageStats(input_tokens=10, output_tokens=1, total_tokens=11)
+
+
+def _said(text: str) -> LLMResponse:
+    return LLMResponse(text=text, usage=_usage())
+
+
+def _asked(name: str, params: dict[str, Any], pid: str) -> LLMResponse:
+    return LLMResponse(
+        tool_calls=[ToolCall(name=name, params=params, provider_tool_call_id=pid)], usage=_usage()
+    )
+
+
+@tool()
+async def send(text: str) -> str:
+    """Send a message (non-idempotent external effect)."""
+    if _CRASH_IN_TOOL:
+        import os
+
+        os._exit(CRASHED)  # the effect started; its outcome is unknown
+    effects.append(f"send:{text}")
+    return "sent"
+
+
+def _child(llm: Any, cut: str) -> Agent:
+    if cut == "leaf_submitted":
+        return reviewer(llm, tools=[publish], require_approval=["publish"])
+    if cut == "unknown_effect":
+        return reviewer(llm, tools=[send])
+    return reviewer(llm)
+
+
+def _child_script(cut: str) -> list[LLMResponse]:
+    if cut == "leaf_submitted":
+        return [_asked("publish", {"text": "d"}, "c1"), _said(REPORT)]
+    if cut == "unknown_effect":
+        return [_asked("send", {"text": "d"}, "c1"), _said(REPORT)]
+    return [_said(REPORT)]
+
+
+def _crash_now(*args: Any, **kwargs: Any) -> Any:
+    import os
+
+    os._exit(CRASHED)
+
+
+async def _crash_async(*args: Any, **kwargs: Any) -> Any:
+    _crash_now()
+
+
+def _install_cut(cut: str) -> None:
+    """Make the phase-one process die exactly at ``cut``."""
+    global _CRASH_IN_TOOL
+    from dendrux.runtime import _reclaim, persistence
+
+    if cut == "pre_bind":
+        _managed.bind_child = _crash_async
+    elif cut == "bind_committed":
+        original = _managed.bind_child
+
+        async def bound_then_die(*args: Any, **kwargs: Any) -> Any:
+            await original(*args, **kwargs)
+            _crash_now()
+
+        _managed.bind_child = bound_then_die
+    elif cut == "child_terminal":
+        _managed.adopt = _crash_async
+    elif cut == "adoption_claimed":
+        persistence.adopt_managed_result = _crash_async
+    elif cut == "adoption_complete":
+        _reclaim.continue_claimed = _crash_async
+    elif cut == "unknown_effect":
+        _CRASH_IN_TOOL = True
+
+
+async def _phase_one(cut: str, url: str) -> None:
+    """The first process: run until the cut, where it dies."""
+    from dendrux.runtime.persistence import PersistenceRecorder
+
+    engine = create_async_engine(url)
+    store = store_for_engine(engine)
+    child_llm = ContextLLM(
+        _child_script(cut),
+        on_call=(lambda i, r: _crash_async()) if cut == "child_started" else None,
+    )
+    root = lead(
+        store, ContextLLM([_asked("reviewer", {"task": BRIEF}, "r1")]), _child(child_llm, cut)
+    )
+    if cut != "leaf_submitted":
+        _install_cut(cut)
+        await root.run("go", tenant_id=TENANT)
+        raise SystemExit(3)  # the cut was never reached
+    paused = await root.run("go", tenant_id=TENANT)
+    assert paused.status == RunStatus.WAITING_APPROVAL, paused.status
+    PersistenceRecorder.consume_resume = _crash_async  # type: ignore[method-assign]
+    await root.submit_approval(
+        paused.run_id, approved=True, expected_pause_id=paused.pause_id, tenant_id=TENANT
+    )
+    raise SystemExit(3)
+
+
+def _crash_in_new_process(cut: str, engine: Any) -> None:
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    here = Path(__file__).resolve()
+    package = here.parents[2]
+    env = {
+        **os.environ,
+        "PYTHONPATH": os.pathsep.join([str(package / "src"), str(package)]),
+        "T4_CRASH_URL": engine.url.render_as_string(hide_password=False),
+    }
+    env.pop("DENDRUX_TEST_PG_URL", None)
+    done = subprocess.run(
+        [sys.executable, "-m", "tests.integration.test_managed_recovery", cut],
+        cwd=package,
+        env=env,
+        capture_output=True,
+        timeout=120,
+        check=False,
+    )
+    assert done.returncode == CRASHED, done.stderr.decode()[-2000:]
+
+
+@asynccontextmanager
+async def _fresh_process(engine: Any) -> Any:
+    """Phase two's store: a new engine and pool on the same database."""
+    other = create_async_engine(engine.url.render_as_string(hide_password=False))
+    try:
+        yield store_for_engine(other)
+    finally:
+        await other.dispose()
+
+
+async def _snapshot(engine: Any, root_id: str) -> dict[str, Any]:
+    root = await run_row(engine, root_id)
+    children = await children_of(engine, root_id)
+    return {
+        "root": (root.status, root.claim_epoch),
+        "wait": (root.pause_data or {}).get("pause_id"),
+        "children": [(c.id, c.status, c.claim_epoch) for c in children],
+    }
+
+
+async def _usage_rows(engine: Any, run_id: str) -> int:
+    return await count(engine, TokenUsage, TokenUsage.agent_run_id == run_id)
+
+
+async def _assert_adopted_once(
+    engine: Any, store: Any, root_id: str, child_id: str, *, root_calls: int, child_calls: int
+) -> None:
+    """One child, one adoption, one observation; usage counted once per provider call."""
+    from dendrux.store import RunStore
+
+    [child] = await children_of(engine, root_id)
+    assert child.id == child_id and child.status == "success"
+    [intent] = await rows(engine, ToolCallRecord, ToolCallRecord.agent_run_id == root_id)
+    assert intent.outcome == "completed"
+    assert intent.meta["managed"]["child_run_id"] == child_id
+    observed = await observations(engine, root_id)
+    assert len(observed) == 1 and json.loads(observed[0].content) == REPORT
+    assert await tool_events(engine, root_id, "tool.completed") == 1
+    assert await _usage_rows(engine, root_id) == root_calls
+    assert await _usage_rows(engine, child_id) == child_calls
+    root = await run_row(engine, root_id)
+    assert root.status == "success" and root.total_input_tokens == 10 * root_calls
+    assert (await run_row(engine, child_id)).total_input_tokens == 10 * child_calls
+    async with RunStore.from_engine(engine) as reader:
+        subtree = await reader.get_subtree(root_id, tenant_id=TENANT, max_nodes=16)
+    assert subtree.usage.input_tokens == 10 * (root_calls + child_calls)
+
+
+def _restarted(store: Any, cut: str, child_script: list[LLMResponse]) -> tuple[Agent, Any, Any]:
+    child_llm = ContextLLM(child_script)
+    root_llm = ContextLLM([_said("root done")])
+    return lead(store, root_llm, _child(child_llm, cut)), root_llm, child_llm
+
+
+crash_engines = pytest.mark.parametrize("engine", ["sqlite_file", "postgres"], indirect=True)
+
+
+@crash_engines
+async def test_crash_after_bind_before_the_child_starts(engine: Any) -> None:
+    """Cut: bind committed, child never started. No stealing; after expiry the same child."""
+    from dendrux.errors import RunNotReclaimableError
+
+    _crash_in_new_process("bind_committed", engine)
+    root_id = await root_id_of(engine)
+    before = await _snapshot(engine, root_id)
+    [(child_id, status, epoch)] = before["children"]
+    assert before["root"] == ("paused", 1) and (status, epoch) == ("running", 0)
+    assert before["wait"] is not None
+
+    async with _fresh_process(engine) as store:
+        root, root_llm, child_llm = _restarted(store, "bind_committed", [_said(REPORT)])
+        with pytest.raises(RunNotReclaimableError):  # a healthy owner is never stolen from
+            await root.reclaim(root_id, tenant_id=TENANT)
+        assert await _snapshot(engine, root_id) == before
+        await expire(store, engine, child_id)
+        result = await root.reclaim(root_id, tenant_id=TENANT)
+        assert result.status == RunStatus.SUCCESS and result.run_id == root_id
+        assert child_llm.served == [child_id] and root_llm.calls == 1
+        first = [m for m in child_llm.messages[0] if m.role.value == "user"]
+        assert [m.content for m in first] == [BRIEF]  # the bound brief, not new state
+        await _assert_adopted_once(engine, store, root_id, child_id, root_calls=2, child_calls=1)
+
+
+@crash_engines
+async def test_crash_in_a_started_child_before_its_first_effect(engine: Any) -> None:
+    _crash_in_new_process("child_started", engine)
+    root_id = await root_id_of(engine)
+    [(child_id, status, _)] = (await _snapshot(engine, root_id))["children"]
+    assert status == "running" and await _usage_rows(engine, child_id) == 0
+
+    async with _fresh_process(engine) as store:
+        root, root_llm, child_llm = _restarted(store, "child_started", [_said(REPORT)])
+        await expire(store, engine, child_id)
+        result = await root.reclaim(root_id, tenant_id=TENANT)
+        assert result.status == RunStatus.SUCCESS
+        assert child_llm.served == [child_id] and root_llm.calls == 1
+        await _assert_adopted_once(engine, store, root_id, child_id, root_calls=2, child_calls=1)
+
+
+@crash_engines
+async def test_crash_after_a_leaf_submission_is_claimed_before_it_is_consumed(
+    engine: Any,
+) -> None:
+    """Cut: the root-id approval claimed the leaf; recovery consumes it once."""
+    effects.clear()
+    _crash_in_new_process("leaf_submitted", engine)
+    root_id = await root_id_of(engine)
+    [(child_id, status, epoch)] = (await _snapshot(engine, root_id))["children"]
+    leaf = await run_row(engine, child_id)
+    assert status == "running" and leaf.loop_state["submission"] is not None
+    assert effects == []
+
+    async with _fresh_process(engine) as store:
+        root, root_llm, child_llm = _restarted(store, "leaf_submitted", [_said(REPORT)])
+        await expire(store, engine, child_id)
+        result = await root.reclaim(root_id, tenant_id=TENANT)
+        assert result.status == RunStatus.SUCCESS
+        assert effects == ["publish:d"]  # the approved effect ran once
+        assert child_llm.served == [child_id] and root_llm.calls == 1
+        decided = await tool_events(engine, child_id, "approval.decided")
+        assert decided == 1
+        assert (await run_row(engine, child_id)).claim_epoch > epoch
+        await _assert_adopted_once(engine, store, root_id, child_id, root_calls=2, child_calls=2)
+
+
+@crash_engines
+async def test_crash_after_the_child_finished_before_its_parent_accepted(engine: Any) -> None:
+    _crash_in_new_process("child_terminal", engine)
+    root_id = await root_id_of(engine)
+    before = await _snapshot(engine, root_id)
+    [(child_id, status, _)] = before["children"]
+    assert before["root"] == ("paused", 1) and status == "success"
+
+    async with _fresh_process(engine) as store:
+        root, root_llm, child_llm = _restarted(store, "child_terminal", [])
+        result = await root.reclaim(root_id, tenant_id=TENANT)
+        assert result.status == RunStatus.SUCCESS
+        assert child_llm.calls == 0 and root_llm.calls == 1
+        assert (await run_row(engine, root_id)).claim_epoch == 2  # one adoption claim
+        await _assert_adopted_once(engine, store, root_id, child_id, root_calls=2, child_calls=1)
+
+
+@crash_engines
+async def test_crash_after_the_parent_accepted_before_its_tool_row_completed(
+    engine: Any,
+) -> None:
+    """Cut: submit_and_claim done, complete_tool_call not. A live claim is not stolen."""
+    from dendrux.errors import RunNotReclaimableError
+
+    _crash_in_new_process("adoption_claimed", engine)
+    root_id = await root_id_of(engine)
+    root_row = await run_row(engine, root_id)
+    [child] = await children_of(engine, root_id)
+    assert (root_row.status, root_row.claim_epoch) == ("running", 2)
+    assert root_row.loop_state["submission"] is not None
+    [intent] = await rows(engine, ToolCallRecord, ToolCallRecord.agent_run_id == root_id)
+    assert intent.outcome == "started"
+
+    async with _fresh_process(engine) as store:
+        root, root_llm, child_llm = _restarted(store, "adoption_claimed", [])
+        with pytest.raises(RunNotReclaimableError):
+            await root.reclaim(root_id, tenant_id=TENANT)
+        assert (await run_row(engine, root_id)).claim_epoch == 2
+        await expire(store, engine, root_id)
+        result = await root.reclaim(root_id, tenant_id=TENANT)
+        assert result.status == RunStatus.SUCCESS
+        assert child_llm.calls == 0 and root_llm.calls == 1
+        await _assert_adopted_once(engine, store, root_id, child.id, root_calls=2, child_calls=1)
+
+
+@crash_engines
+async def test_crash_after_adoption_completed_before_the_parent_continued(
+    engine: Any,
+) -> None:
+    _crash_in_new_process("adoption_complete", engine)
+    root_id = await root_id_of(engine)
+    root_row = await run_row(engine, root_id)
+    [child] = await children_of(engine, root_id)
+    assert root_row.status == "running" and root_row.loop_state.get("submission") is None
+    assert root_row.loop_state.get("managed_wait") is None
+
+    async with _fresh_process(engine) as store:
+        root, root_llm, child_llm = _restarted(store, "adoption_complete", [])
+        await expire(store, engine, root_id)
+        result = await root.reclaim(root_id, tenant_id=TENANT)
+        assert result.status == RunStatus.SUCCESS
+        assert child_llm.calls == 0 and root_llm.calls == 1
+        await _assert_adopted_once(engine, store, root_id, child.id, root_calls=2, child_calls=1)
+
+
+@crash_engines
+async def test_an_unknown_child_effect_follows_the_uncertain_outcome_policy(engine: Any) -> None:
+    """A non-idempotent effect started before the crash is never replayed silently:
+    recovery asks for approval through the root, and only that decision replays it."""
+    effects.clear()
+    _crash_in_new_process("unknown_effect", engine)
+    root_id = await root_id_of(engine)
+    [(child_id, status, _)] = (await _snapshot(engine, root_id))["children"]
+    [started] = await rows(engine, ToolCallRecord, ToolCallRecord.agent_run_id == child_id)
+    assert status == "running" and started.outcome == "started"
+
+    async with _fresh_process(engine) as store:
+        root, root_llm, child_llm = _restarted(store, "unknown_effect", [_said(REPORT)])
+        await expire(store, engine, child_id)
+        waiting = await root.reclaim(root_id, tenant_id=TENANT)
+        assert waiting.status == RunStatus.WAITING_APPROVAL and waiting.run_id == root_id
+        assert waiting.pending.origin_run_id == child_id and effects == []
+        assert child_llm.calls == 0
+        result = await root.submit_approval(
+            root_id, approved=True, expected_pause_id=waiting.pause_id, tenant_id=TENANT
+        )
+        assert result.status == RunStatus.SUCCESS
+        assert effects == ["send:d"] and child_llm.served == [child_id]
+        await _assert_adopted_once(engine, store, root_id, child_id, root_calls=2, child_calls=2)
+
+
+@crash_engines
+async def test_crash_between_handoff_and_bind_binds_the_same_invocation_once(
+    engine: Any,
+) -> None:
+    """B5: the parent stays running until bind; recovery binds the saved call once."""
+    _crash_in_new_process("pre_bind", engine)
+    root_id = await root_id_of(engine)
+    row = await run_row(engine, root_id)
+    assert row.status == "running" and not await children_of(engine, root_id)
+    [pending] = row.loop_state["pending"]
+    assert pending["target"] == "agent" and row.loop_state["managed_admitted"] == pending["call_id"]
+    assert not await rows(engine, ToolCallRecord, ToolCallRecord.agent_run_id == root_id)
+
+    async with _fresh_process(engine) as store:
+        root, root_llm, child_llm = _restarted(store, "pre_bind", [_said(REPORT)])
+        await expire(store, engine, root_id)
+        result = await root.reclaim(root_id, tenant_id=TENANT)
+        assert result.status == RunStatus.SUCCESS
+        [child] = await children_of(engine, root_id)
+        [intent] = await rows(engine, ToolCallRecord, ToolCallRecord.agent_run_id == root_id)
+        assert intent.tool_call_id == pending["call_id"]  # the same invocation
+        assert intent.params == {"task": BRIEF}
+        header = (await run_row(engine, child.id)).loop_state["managed"]
+        assert header["invocation"]["tool_call_id"] == pending["call_id"]
+        assert child_llm.served == [child.id] and root_llm.calls == 1
+        await _assert_adopted_once(engine, store, root_id, child.id, root_calls=2, child_calls=1)
+
+
+# ---------------------------------------------------------------------------
+# Stale owner conflicts on Postgres (independent engines and pools)
+# ---------------------------------------------------------------------------
+
+
+async def test_pg_root_controls_never_steal_a_healthy_running_child(engine: Any) -> None:
+    """While a child runs under its live owner, root reclaim/resume refuse and change
+    nothing; the owner then finishes the workflow with one child."""
+    from dendrux.errors import RunNotPausedError, RunNotReclaimableError
+
+    _postgres(engine)
+    gated = ScriptedLLM([_said(REPORT)], gate_at=0)
+    root_llm = ContextLLM([_asked("reviewer", {"task": BRIEF}, "r1"), _said("root done")])
+    store = store_for_engine(engine)
+    workflow = lead(store, root_llm, reviewer(gated))
+    owner = asyncio.create_task(workflow.run("go", tenant_id=TENANT))
+    await asyncio.wait_for(gated.entered.wait(), 30)
+    root_id = await root_id_of(engine)
+    before = await _snapshot(engine, root_id)
+    try:
+        async with _fresh_process(engine) as other:
+            stranger_llm = ContextLLM([])
+            stranger = lead(other, ContextLLM([]), reviewer(stranger_llm))
+            with pytest.raises(RunNotReclaimableError):
+                await stranger.reclaim(root_id, tenant_id=TENANT)
+            with pytest.raises(RunNotPausedError):
+                await stranger.resume(root_id, tenant_id=TENANT, expected_pause_id="stale")
+            seen = await stranger.get_result(root_id, tenant_id=TENANT)
+            assert seen.status == RunStatus.RUNNING and seen.pending is None
+            assert stranger_llm.calls == 0
+        assert await _snapshot(engine, root_id) == before
+    finally:
+        gated.gate.set()
+    result = await asyncio.wait_for(owner, 30)
+    assert result.status == RunStatus.SUCCESS and result.answer == "root done"
+    assert gated.calls == 1 and len(await children_of(engine, root_id)) == 1
+
+
+@pytest.mark.parametrize("cut", ["child_started", "pre_bind"])
+@pytest.mark.parametrize("round_", [1, 2, 3])
+async def test_pg_concurrent_root_recoveries_drive_one_child_once(
+    engine: Any, cut: str, round_: int
+) -> None:
+    """After lease expiry, contending root reclaims on two pools: the exact bound child
+    (or, before the bind, one new child) runs once; never a second child."""
+    _postgres(engine)
+    _crash_in_new_process(cut, engine)
+    root_id = await root_id_of(engine)
+    if cut == "child_started":
+        [child] = await children_of(engine, root_id)
+        expired = child.id
+    else:
+        expired = root_id
+    await expire(store_for_engine(engine), engine, expired)
+    child_llms = [ContextLLM([_said(REPORT)]) for _ in range(4)]
+    root_llms = [ContextLLM([_said("root done")]) for _ in range(4)]
+    async with _fresh_process(engine) as other:
+        stores = [store_for_engine(engine), other]
+        outcomes = await asyncio.gather(
+            *(
+                lead(stores[i % 2], root_llms[i], reviewer(child_llms[i])).reclaim(
+                    root_id, tenant_id=TENANT
+                )
+                for i in range(4)
+            ),
+            return_exceptions=True,
+        )
+    from dendrux.errors import RunNotReclaimableError
+
+    for outcome in outcomes:
+        assert not isinstance(outcome, BaseException) or isinstance(
+            outcome, RunNotReclaimableError
+        ), outcome
+    [child] = await children_of(engine, root_id)
+    assert sum(llm.calls for llm in child_llms) == 1
+    assert sum(llm.calls for llm in root_llms) == 1
+    assert {s for llm in child_llms for s in llm.served} == {child.id}
+    assert any(not isinstance(o, BaseException) and o.status == RunStatus.SUCCESS for o in outcomes)
+    await _assert_adopted_once(
+        engine, store_for_engine(engine), root_id, child.id, root_calls=2, child_calls=1
+    )
+
+
+if __name__ == "__main__":
+    import asyncio
+    import os
+    import sys
+
+    asyncio.run(_phase_one(sys.argv[1], os.environ["T4_CRASH_URL"]))
