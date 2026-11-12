@@ -6541,12 +6541,7 @@ async def _claim_resume(
         fallbacks=_resume_claim_fallbacks(expected, results, user_input),
     )
     validate = submission_validator(
-        run_id,
-        raw,
-        agent=agent,
-        expected_pause_id=request.generation,
-        call_results=results,
-        client_results=expected == RunStatus.WAITING_CLIENT_TOOL.value,
+        run_id, raw, agent=agent, expected_pause_id=request.generation, call_results=results
     )
     record = await store.get_run(run_id)
     require_pause_id(
@@ -6572,7 +6567,7 @@ async def _claim_resume(
             run_id,
             request,
             status,
-            validate=validate,
+            validate=_attempt_validator(validate, run_id, status, results),
             payload=payload,
             checkpointing=True,
             approval=False
@@ -6586,6 +6581,31 @@ async def _claim_resume(
             return view, status, _claimed_submission_view(raw, descriptor, payload)
     await _raise_resume_claim_failure(store, run_id, expected)
     raise AssertionError("unreachable")
+
+
+def _attempt_validator(
+    validate: Callable[[dict[str, Any]], None],
+    run_id: str,
+    status: str,
+    results: list[ToolResult] | None,
+) -> Callable[[dict[str, Any]], None]:
+    """The claim attempt's locked validator (0.7).
+
+    Results claimed for a client pause are the caller's: none may answer a
+    generated subagent call. The approval attempt claims canonical runtime
+    denials (``legacy_approval_denial``) for that exact generation, which stay
+    valid. The status CAS precedes this check, so it sees the claimed pause.
+    """
+    from dendrux.runtime.submit import refuse_managed_results
+
+    if results is None or status != RunStatus.WAITING_CLIENT_TOOL.value:
+        return validate
+
+    def client_attempt(current: dict[str, Any]) -> None:
+        validate(current)
+        refuse_managed_results(run_id, current.get("pending_targets"), results)
+
+    return client_attempt
 
 
 async def _report_claim_governance(
