@@ -187,6 +187,41 @@ async def test_streamed_approval_binds_the_subagent(store: Any, engine: Any) -> 
     await _assert_child_reported(engine, paused.run_id, root_llm, child_llm)
 
 
+async def test_approved_subagent_brief_over_the_child_limit_is_refused_not_bound(
+    store: Any, engine: Any
+) -> None:
+    """The child's brief limit applies on the approved continuation, as in a live batch."""
+    from dendrux.types import Limits
+
+    effects.clear()
+    child_llm = _ChildLLM([LLMResponse(text=REPORT)])
+    child = Agent(
+        name="reviewer",
+        description="Reviews.",
+        prompt="r",
+        provider=child_llm,
+        limits=Limits(max_input_bytes=8),
+    )
+    root_llm = ContextLLM([_batch("reviewer", "fetch"), LLMResponse(text="done")])
+    root = Agent(
+        name="lead",
+        prompt="l",
+        provider=root_llm,
+        state_store=store,
+        tools=[fetch, send],
+        subagents=[child],
+        require_approval=["fetch"],
+    )
+    paused = await root.run("go", tenant_id=TENANT)
+    result = await root.submit_approval(
+        paused.run_id, approved=True, expected_pause_id=paused.pause_id, tenant_id=TENANT
+    )
+    assert result.status == RunStatus.SUCCESS
+    assert effects == ["fetch:1"] and child_llm.calls == 0
+    assert await child_rows(engine, paused.run_id) == 0
+    assert "input limit" in tool_messages(root_llm)["reviewer"]
+
+
 # ---------------------------------------------------------------------------
 # 2. Externally supplied results for a subagent call are refused
 # ---------------------------------------------------------------------------
