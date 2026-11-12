@@ -6066,8 +6066,6 @@ def _approval_stop_result(
             iteration_count=pause_state.iteration,
             usage=pause_state.usage,
         )
-    if approval.handoff is not None:
-        return _approved_handoff(run_id, pause_state, history, approval.handoff)
     if not approval.client_pending:
         return None
     client_pause = PauseState(
@@ -6095,6 +6093,15 @@ def _approval_stop_result(
         usage=pause_state.usage,
         meta={"pause_state": client_pause},
     )
+
+
+def _approval_stop(
+    run_id: str, pause_state: PauseState, history: list[Message], approval: _ApprovalResume
+) -> RunResult | None:
+    """The approved subagent call's handoff, else the ordinary approval stop (0.7)."""
+    if approval.handoff is not None:
+        return _approved_handoff(run_id, pause_state, history, approval.handoff)
+    return _approval_stop_result(run_id, pause_state, history, approval)
 
 
 def _approved_handoff(
@@ -6941,7 +6948,7 @@ async def _finish_approval_batch(
             await _record_approval_decided(
                 ctx.recorder, ctx.notifier, run_id, pause.iteration, approval.decided
             )
-        stop = _approval_stop_result(run_id, pause, ctx.history, approval)
+        stop = _approval_stop(run_id, pause, ctx.history, approval)
         if stop is not None:
             return stop
     if results is not None and expected == RunStatus.WAITING_APPROVAL.value:

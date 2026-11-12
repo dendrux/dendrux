@@ -229,17 +229,24 @@ def pause_validator(
         if agent_name is not None and current.get("agent_name") not in (None, agent_name):
             raise ValueError("Agent name mismatch on resume")
         if call_results is not None:
-            pending = {call["id"]: call["name"] for call in current.get("pending_tool_calls", [])}
-            if (
-                len(pending) != len(call_results)
-                or len({r.call_id for r in call_results}) != len(call_results)
-                or any(pending.get(result.call_id) != result.name for result in call_results)
-            ):
-                raise _invalid_tool_result(run_id, "tool results do not match pending calls")
-            if client_results:
-                refuse_managed_results(run_id, current.get("pending_targets"), call_results)
+            _check_call_results(run_id, current, call_results, client_results=client_results)
 
     return validate
+
+
+def _check_call_results(
+    run_id: str, current: dict[str, Any], call_results: list[ToolResult], *, client_results: bool
+) -> None:
+    """Results answer exactly the pending calls; caller results never a subagent call."""
+    pending = {call["id"]: call["name"] for call in current.get("pending_tool_calls", [])}
+    if (
+        len(pending) != len(call_results)
+        or len({r.call_id for r in call_results}) != len(call_results)
+        or any(pending.get(result.call_id) != result.name for result in call_results)
+    ):
+        raise _invalid_tool_result(run_id, "tool results do not match pending calls")
+    if client_results:
+        refuse_managed_results(run_id, current.get("pending_targets"), call_results)
 
 
 _RESUME_CLAIM_MESSAGE = (
