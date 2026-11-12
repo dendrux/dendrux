@@ -168,7 +168,31 @@ select = [
     "B",    # flake8-bugbear
     "SIM",  # flake8-simplify
     "TCH",  # flake8-type-checking
+    "RUF100", # unused noqa directives
+    "RET",  # flake8-return
+    "ERA",  # eradicate (commented-out code)
+    "PTH",  # flake8-use-pathlib
+    "PERF", # perflint
+    "PLW",  # pylint warnings
+    "TRY201", # verbose exception re-raise
+    "TRY400", # logging an exception without exception info
+    "S",    # flake8-bandit
+    "PLE",  # pylint errors
 ]
+ignore = [
+    "PERF203", # try/except inside loops can be clearer
+    "PLW2901", # rebinding a loop variable can be clearer
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Apply the new hard rules only to the library; retain the existing rules elsewhere.
+# This also covers tests, examples, tools, scripts and the test-kit bootstrap module.
+"!src/dendrux/**" = ["RUF100", "RET", "ERA", "PTH", "PERF", "PLW", "TRY201", "TRY400", "S", "PLE"]
+"src/dendrux/**" = ["S101"] # R4 converts these
+# Pytest contracts and test/example assertions remain allowed after R4.
+"src/dendrux/testing/store_kit/contracts/**" = ["S101"]
+"tests/**" = ["S101"]
+"examples/**" = ["S101"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["dendrux"]

@@ -5256,7 +5256,7 @@ def _resume_history(
         history.extend(submission_projection.messages)
     elif tool_results is not None:
         for tr in tool_results:
-            history.append(tool_result_message(tr))
+            history.append(tool_result_message(tr))  # noqa: PERF401 - validation can raise; keep incremental appends
     elif user_parts is not None:
         history.append(Message.with_parts(Role.USER, user_parts))
     elif user_input is not None:

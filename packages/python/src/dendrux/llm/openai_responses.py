@@ -187,7 +187,7 @@ def _refusal_text(response: Any) -> str | None:
             continue
         for content in getattr(item, "content", None) or []:
             if getattr(content, "type", None) == "refusal":
-                parts.append(getattr(content, "refusal", "") or "")
+                parts.append(getattr(content, "refusal", "") or "")  # noqa: PERF401 - keep nested SDK attribute reads clear
     return "".join(parts) if parts else None
 
 

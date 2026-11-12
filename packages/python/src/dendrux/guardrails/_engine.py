@@ -150,7 +150,7 @@ def _entity_of(placeholder: str) -> str:
 
 def _note_restore_default(guardrails: Iterable[object]) -> None:
     """Log once per process that PII placeholders are restored into every tool."""
-    global _restore_notice_logged
+    global _restore_notice_logged  # noqa: PLW0603 - preserve the locked once-per-process notice
     from dendrux.guardrails._pii import PII
 
     if _restore_notice_logged:

@@ -1309,7 +1309,7 @@ async def _dispatch_server_calls(
             )
             continue
         for tc in group:
-            executed.append(
+            executed.append(  # noqa: PERF401 - append immediately after each sequential tool await
                 await _execute_record_notify(
                     tc,
                     lookups,

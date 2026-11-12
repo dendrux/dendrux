@@ -111,7 +111,7 @@ _env_url_lock = threading.Lock()
 
 
 def _log_env_url_ignored() -> None:
-    global _env_url_ignored
+    global _env_url_ignored  # noqa: PLW0603 - preserve the locked once-per-process notice
     with _env_url_lock:
         if not _env_url_ignored:
             _codes.log_code(_agent_logger, _codes.DATABASE_URL_ENV_IGNORED)

@@ -224,7 +224,7 @@ def _check_max_waiters(value: object) -> None:
 
 def get_pool() -> _ToolPool:
     """The process-wide pool, created on first use."""
-    global _pool
+    global _pool  # noqa: PLW0603 - preserve lazy creation of the locked process pool
     pool = _pool
     if pool is not None:
         return pool
@@ -247,7 +247,7 @@ _limiters: weakref.WeakSet[ToolCallLimiter] = weakref.WeakSet()
 def _reset_after_fork() -> None:
     # Worker threads do not survive fork; the child builds its own pool, and
     # slots held by the parent's in-flight calls would never come back.
-    global _pool, _pool_lock
+    global _pool, _pool_lock  # noqa: PLW0603 - the forked child must reset the inherited pool and lock
     _pool = None
     _pool_lock = threading.Lock()
     for limiter in list(_limiters):
