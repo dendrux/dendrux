@@ -317,7 +317,7 @@ async def test_custom_store_without_pre_claim_refusal_refuses_a_direct_child_rec
 
 CRASHED = 17
 """Exit code of a phase-one process that reached its crash cut."""
-_CRASH_IN_TOOL = False
+_CRASH_IN_TOOL: bool | str = False
 
 
 def _usage() -> Any:
@@ -339,6 +339,8 @@ def _asked(name: str, params: dict[str, Any], pid: str) -> LLMResponse:
 @tool()
 async def send(text: str) -> str:
     """Send a message (non-idempotent external effect)."""
+    if _CRASH_IN_TOOL == "raise":
+        raise ProcessDeathError  # in-process crash; the started intent stays unresolved
     if _CRASH_IN_TOOL:
         import os
 
@@ -774,6 +776,263 @@ async def test_pg_concurrent_root_recoveries_drive_one_child_once(
     await _assert_adopted_once(
         engine, store_for_engine(engine), root_id, child.id, root_calls=2, child_calls=1
     )
+
+
+# ---------------------------------------------------------------------------
+# B4: recovery completes a pending managed call (mixed batch, unadmitted call)
+# ---------------------------------------------------------------------------
+
+
+def _hooked(
+    store: Any, root_llm: Any, child: Agent, *, deny: str | None = None, hook: Any = None, **kw: Any
+) -> Agent:
+    async def deny_hook(ctx: Any) -> Any:
+        from dendrux.types import ToolDecision
+
+        effects.append(f"hook:{ctx.tool_name}")
+        return ToolDecision.deny("not now") if ctx.tool_name == deny else None
+
+    return Agent(
+        name="lead",
+        prompt="You lead.",
+        provider=root_llm,
+        state_store=store,
+        tools=[fetch, send],
+        subagents=[child],
+        before_tool=hook or deny_hook,
+        **kw,
+    )
+
+
+def _mixed(*names: str) -> LLMResponse:
+    params = {"reviewer": {"task": BRIEF}, "fetch": {"x": 1}, "send": {"text": "s"}}
+    return LLMResponse(
+        tool_calls=[
+            ToolCall(name=n, params=params[n], provider_tool_call_id=f"p{i}")
+            for i, n in enumerate(names)
+        ],
+        usage=_usage(),
+    )
+
+
+async def _die_at(
+    monkeypatch: Any, target: Any, name: str, run: Any, *, after: bool = False
+) -> None:
+    import inspect
+
+    original = getattr(target, name)
+
+    async def die(*args: Any, **kwargs: Any) -> Any:
+        if after:
+            await original(*args, **kwargs)
+        raise ProcessDeathError
+
+    def die_sync(*args: Any, **kwargs: Any) -> Any:
+        raise ProcessDeathError
+
+    with monkeypatch.context() as patch:
+        patch.setattr(target, name, die if inspect.iscoroutinefunction(original) else die_sync)
+        with pytest.raises(ProcessDeathError):
+            await run()
+
+
+class _ChildLLM(ContextLLM):
+    """Records the child's first call in the shared effect log (order evidence)."""
+
+    async def complete(self, messages: Any, tools: Any = None, **kwargs: Any) -> LLMResponse:
+        effects.append("child")
+        return await super().complete(messages, tools, **kwargs)
+
+
+@pytest.mark.parametrize("order", [("reviewer", "fetch"), ("fetch", "reviewer")])
+async def test_recovered_mixed_batch_runs_the_server_call_then_binds_once(
+    store: Any, engine: Any, monkeypatch: Any, order: tuple[str, str]
+) -> None:
+    """Crash before the batch was prepared: recovery prepares both calls (hooks once each),
+    runs the server call, then binds the managed call once. No refusal."""
+    from dendrux.loops import react
+
+    first = _hooked(store, ContextLLM([_mixed(*order)]), reviewer(ContextLLM([])))
+    await _die_at(
+        monkeypatch, react, "_prepare_tool_calls", lambda: first.run("go", tenant_id=TENANT)
+    )
+    root_id = await root_id_of(engine)
+    effects.clear()
+    item = await expire(store, engine, root_id)
+    child_llm = _ChildLLM([_said(REPORT)])
+    root_llm = ContextLLM([_said("root done")])
+    result = await _hooked(store, root_llm, reviewer(child_llm)).reclaim(
+        root_id, tenant_id=TENANT, item=item
+    )
+
+    assert result.status == RunStatus.SUCCESS and result.answer == "root done"
+    assert sorted(effects[:2]) == ["hook:fetch", "hook:reviewer"]
+    assert effects[2:] == ["fetch:1", "child"]  # the server call finished before the bind
+    [child] = await children_of(engine, root_id)
+    assert child_llm.served == [child.id]
+    seen = {m.name: m.content for m in root_llm.messages[0] if m.role.value == "tool"}
+    assert json.loads(seen["reviewer"]) == REPORT and json.loads(seen["fetch"]) == "fetched"
+    intents = await rows(engine, ToolCallRecord, ToolCallRecord.agent_run_id == root_id)
+    assert sorted((r.tool_name, r.outcome) for r in intents) == [
+        ("fetch", "completed"),
+        ("reviewer", "completed"),
+    ]
+
+
+async def test_recovered_unadmitted_call_after_its_sibling_finished_binds_without_repeat(
+    store: Any, engine: Any, monkeypatch: Any
+) -> None:
+    """Crash after the server sibling completed, before the handoff wrote admission:
+    the lone managed call is admitted again by its own hook, the sibling never repeats."""
+    first = _hooked(store, ContextLLM([_mixed("reviewer", "fetch")]), reviewer(ContextLLM([])))
+    await _die_at(
+        monkeypatch, _managed, "prepare_handoff", lambda: first.run("go", tenant_id=TENANT)
+    )
+    root_id = await root_id_of(engine)
+    row = await run_row(engine, root_id)
+    assert [p["tool"] for p in row.loop_state["pending"]] == ["reviewer"]
+    assert row.loop_state.get("managed_admitted") is None
+    effects.clear()
+    item = await expire(store, engine, root_id)
+    child_llm = _ChildLLM([_said(REPORT)])
+    root_llm = ContextLLM([_said("root done")])
+    result = await _hooked(store, root_llm, reviewer(child_llm)).reclaim(
+        root_id, tenant_id=TENANT, item=item
+    )
+    assert result.status == RunStatus.SUCCESS
+    assert effects == ["hook:reviewer", "child"]  # no second fetch
+    assert len(await children_of(engine, root_id)) == 1
+
+
+@pytest.mark.parametrize("decision", ["deny", "approval_hook"])
+async def test_recovered_unadmitted_call_denied_by_policy_runs_no_child(
+    store: Any, engine: Any, monkeypatch: Any, decision: str
+) -> None:
+    """The recovered admission applies the parent's policy: a denial is an ordinary
+    observation and no child exists."""
+    from dendrux.loops import react
+    from dendrux.types import ToolDecision
+
+    async def approval_hook(ctx: Any) -> Any:
+        effects.append(f"hook:{ctx.tool_name}")
+        return ToolDecision.require_approval("check")
+
+    def build(llm: Any, child: Agent) -> Agent:
+        if decision == "deny":
+            return _hooked(store, llm, child, deny="reviewer")
+        return _hooked(store, llm, child, hook=approval_hook)
+
+    first = build(ContextLLM([_asked("reviewer", {"task": BRIEF}, "r1")]), reviewer(ContextLLM([])))
+    await _die_at(
+        monkeypatch, react, "_prepare_tool_calls", lambda: first.run("go", tenant_id=TENANT)
+    )
+    root_id = await root_id_of(engine)
+    effects.clear()
+    item = await expire(store, engine, root_id)
+    child_llm = ContextLLM([_said(REPORT)])
+    root_llm = ContextLLM([_said("handled")])
+    result = await build(root_llm, reviewer(child_llm)).reclaim(
+        root_id, tenant_id=TENANT, item=item
+    )
+    assert result.status == RunStatus.SUCCESS and result.answer == "handled"
+    assert effects == ["hook:reviewer"] and child_llm.calls == 0
+    assert not await children_of(engine, root_id)
+    [seen] = [m for m in root_llm.messages[0] if m.role.value == "tool"]
+    assert REPORT not in seen.content
+
+
+async def test_recovered_unadmitted_oversize_brief_is_refused_before_bind(
+    store: Any, engine: Any, monkeypatch: Any
+) -> None:
+    from dendrux.loops import react
+    from dendrux.types import Limits
+
+    def child(llm: Any) -> Agent:
+        return reviewer(llm, limits=Limits(max_input_bytes=8))
+
+    first = _hooked(
+        store, ContextLLM([_asked("reviewer", {"task": BRIEF}, "r1")]), child(ContextLLM([]))
+    )
+    await _die_at(
+        monkeypatch, react, "_prepare_tool_calls", lambda: first.run("go", tenant_id=TENANT)
+    )
+    root_id = await root_id_of(engine)
+    item = await expire(store, engine, root_id)
+    child_llm = ContextLLM([])
+    root_llm = ContextLLM([_said("handled")])
+    result = await _hooked(store, root_llm, child(child_llm)).reclaim(
+        root_id, tenant_id=TENANT, item=item
+    )
+    assert result.status == RunStatus.SUCCESS and child_llm.calls == 0
+    assert not await children_of(engine, root_id)
+    [seen] = [m for m in root_llm.messages[0] if m.role.value == "tool"]
+    assert "input limit" in seen.content
+
+
+@pytest.mark.parametrize("gate", ["gated_sibling", "unknown_sibling"])
+async def test_recovered_managed_call_needing_approval_is_refused_before_effects(
+    store: Any, engine: Any, monkeypatch: Any, gate: str
+) -> None:
+    """Kept refusal: a recovered approval pause holding a managed call would continue
+    through today's approval path, which pauses that call for a client (see report)."""
+    global _CRASH_IN_TOOL
+    from dendrux.errors import ManagedUnsupportedError
+    from dendrux.loops import react
+
+    kw: dict[str, Any] = {"require_approval": ["fetch"]} if gate == "gated_sibling" else {}
+    names = ("reviewer", "fetch") if gate == "gated_sibling" else ("send", "reviewer")
+    first = _hooked(store, ContextLLM([_mixed(*names)]), reviewer(ContextLLM([])), **kw)
+    if gate == "gated_sibling":  # the gate is recorded; the approval pause is not
+        await _die_at(
+            monkeypatch, react, "_pause_result", lambda: first.run("go", tenant_id=TENANT)
+        )
+    else:  # the non-idempotent sibling started; its outcome is unknown
+        _CRASH_IN_TOOL = "raise"
+        try:
+            with pytest.raises(ProcessDeathError):
+                await first.run("go", tenant_id=TENANT)
+        finally:
+            _CRASH_IN_TOOL = False
+    root_id = await root_id_of(engine)
+    effects.clear()
+    item = await expire(store, engine, root_id)
+    before = await _snapshot(engine, root_id)
+    child_llm = ContextLLM([_said(REPORT)])
+    fresh = _hooked(store, ContextLLM([]), reviewer(child_llm), **kw)
+    with pytest.raises(ManagedUnsupportedError) as info:
+        await fresh.reclaim(root_id, tenant_id=TENANT, item=item)
+    assert info.value.operation == "recover_managed_approval"
+    assert effects == [] and child_llm.calls == 0
+    assert not await children_of(engine, root_id)
+    assert (await _snapshot(engine, root_id))["children"] == before["children"]
+
+
+async def test_recovered_mixed_batch_honours_a_requested_pause_then_binds_on_resume(
+    store: Any, engine: Any, monkeypatch: Any
+) -> None:
+    """A pause requested before recovery stops before any effect; the root-id resume
+    then prepares, runs the server call and binds the managed call once."""
+    from dendrux.loops import react
+
+    first = _hooked(store, ContextLLM([_mixed("reviewer", "fetch")]), reviewer(ContextLLM([])))
+    await _die_at(
+        monkeypatch, react, "_prepare_tool_calls", lambda: first.run("go", tenant_id=TENANT)
+    )
+    root_id = await root_id_of(engine)
+    effects.clear()
+    item = await expire(store, engine, root_id)
+    await store.request_pause(root_id)
+    child_llm = ContextLLM([_said(REPORT)])
+    agent = _hooked(store, ContextLLM([_said("root done")]), reviewer(child_llm))
+    paused = await agent.reclaim(root_id, tenant_id=TENANT, item=item)
+    assert paused.status == RunStatus.PAUSED and effects == []
+    assert sorted(c.name for c in paused.pending.tool_calls) == ["fetch", "reviewer"]
+    assert not await children_of(engine, root_id)
+    result = await agent.resume(root_id, tenant_id=TENANT, expected_pause_id=paused.pause_id)
+    assert result.status == RunStatus.SUCCESS
+    assert sorted(effects) == ["fetch:1", "hook:fetch", "hook:reviewer"]
+    [child] = await children_of(engine, root_id)
+    assert child_llm.served == [child.id]
 
 
 if __name__ == "__main__":
