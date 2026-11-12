@@ -1251,9 +1251,13 @@ async def _read_recovery_info(store: StateStore, record: Any, *, best_effort: bo
 
 async def _attach_persisted_pending(store: StateStore, result: RunResult, record: Any) -> RunResult:
     result.recovery = await _recovery_info(store, record)
-    if result.status in _PAUSE_STATUSES and record is not None:
-        if await _load_persisted_pending(store, result, record):
-            await _reread_moved(store, result)
+    moved = (
+        result.status in _PAUSE_STATUSES
+        and record is not None
+        and await _load_persisted_pending(store, result, record)
+    )
+    if moved:
+        await _reread_moved(store, result)
     return result
 
 
@@ -1298,7 +1302,8 @@ async def _load_persisted_pending(store: StateStore, result: RunResult, record: 
     view = reader.last_view
     moved = view is not None and not view.managed and view.status != record.status
     # A parent waiting on a subagent reports its active branch (0.7).
-    result.status = RunStatus(view.status if moved else facing_status(result.status.value, view))
+    later = view.status if view is not None and moved else None
+    result.status = RunStatus(later or facing_status(result.status.value, view))
     result.pause_id = result.pending.pause_id if result.pending else None
     return moved
 
