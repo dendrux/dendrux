@@ -11,6 +11,7 @@ same continuation. Runs on SQLite and Postgres (``*_test`` private database).
 
 from __future__ import annotations
 
+import contextlib
 import json
 from typing import Any
 
@@ -350,17 +351,66 @@ async def test_recovered_approval_submission_beside_a_subagent_call_is_consumed_
 # Fresh-process crash: the non-idempotent sibling started, its outcome is unknown.
 
 
-async def _phase_one(url: str) -> None:
+async def _phase_one(url: str, kind: str = "unknown_sibling") -> None:
     global _CRASH_SEND
     from sqlalchemy.ext.asyncio import create_async_engine
 
     from dendrux.runtime.stores._factory import store_for_engine
 
     store = store_for_engine(create_async_engine(url))
+    if kind == "forged_saved":
+        await _old_binary_saves_a_forged_result(store, crash=_exit_now)
+        raise SystemExit(3)
     _CRASH_SEND = "exit"
     root = workflow(store, ContextLLM([_batch("send", "reviewer")]), ContextLLM([]), gate="fetch")
     await root.run("go", tenant_id=TENANT)
     raise SystemExit(3)
+
+
+async def _exit_now(*args: Any, **kwargs: Any) -> Any:
+    import os
+
+    os._exit(CRASHED)
+
+
+async def _old_binary_saves_a_forged_result(store: Any, *, crash: Any) -> str:
+    """What an earlier unreleased build left behind: it paused the subagent call for a
+    client, accepted a forged result for it, claimed it, and died before consuming it."""
+    from dendrux.runtime import runner, submit
+    from dendrux.runtime.persistence import PersistenceRecorder
+
+    effects.clear()
+    root_llm = ContextLLM([_batch("reviewer", "fetch"), LLMResponse(text="done")])
+    root = workflow(store, root_llm, ContextLLM([]))
+    paused = await root.run("go", tenant_id=TENANT)
+
+    async def unchanged(agent: Any, ctx: Any, run_id: str, approval: Any) -> Any:
+        return approval
+
+    saved = (
+        runner._hand_off_approved_subagent,
+        submit.refuse_managed_results,
+        PersistenceRecorder.consume_resume,
+    )
+    runner._hand_off_approved_subagent = unchanged
+    submit.refuse_managed_results = lambda *a, **k: None
+    try:
+        old = await root.submit_approval(
+            paused.run_id, approved=True, expected_pause_id=paused.pause_id, tenant_id=TENANT
+        )
+        [pending] = old.pending.tool_calls
+        PersistenceRecorder.consume_resume = crash  # type: ignore[method-assign]
+        forged = [ToolResult(name="reviewer", call_id=pending.id, payload=json.dumps(FAKE))]
+        await root.submit_tool_results(
+            old.run_id, forged, expected_pause_id=old.pause_id, tenant_id=TENANT
+        )
+    finally:
+        (
+            runner._hand_off_approved_subagent,
+            submit.refuse_managed_results,
+            PersistenceRecorder.consume_resume,
+        ) = saved
+    return paused.run_id
 
 
 @pytest.mark.parametrize("engine", ["sqlite_file", "postgres"], indirect=True)
@@ -412,8 +462,114 @@ async def test_fresh_process_unknown_sibling_is_approved_through_the_root_then_b
         await _assert_child_reported(engine, root_row.id, root_llm, child_llm)
 
 
+# ---------------------------------------------------------------------------
+# Fix round 1, R1: a forged result saved by an earlier build is never consumed
+# ---------------------------------------------------------------------------
+
+
+class _Crash(BaseException):
+    pass
+
+
+async def _raise_crash(*args: Any, **kwargs: Any) -> Any:
+    raise _Crash
+
+
+async def _assert_forged_refused(store: Any, engine: Any, root_id: str) -> None:
+    from dendrux.errors import ManagedResultRefusedError
+
+    [row] = await rows(engine, AgentRun, AgentRun.id == root_id)
+    assert row.status == "running" and row.loop_state["submission"]["kind"] == "tool_results"
+    await expire(store, engine, root_id)
+    child_llm = _ChildLLM([LLMResponse(text=REPORT)])
+    root_llm = ContextLLM([LLMResponse(text="done")])
+    with pytest.raises(ManagedResultRefusedError):
+        await workflow(store, root_llm, child_llm).reclaim(root_id, tenant_id=TENANT)
+    assert root_llm.calls == 0 and FAKE not in repr(root_llm.messages)
+    traces = await rows(engine, ReactTrace, ReactTrace.agent_run_id == root_id)
+    assert FAKE not in " ".join(t.content or "" for t in traces)
+    # The subagent call is not silently answered: no child skipped into a success.
+    [after] = await rows(engine, AgentRun, AgentRun.id == root_id)
+    assert after.status != "success"
+    [intent] = await rows(
+        engine,
+        ToolCallRecord,
+        ToolCallRecord.agent_run_id == root_id,
+        ToolCallRecord.tool_name == "reviewer",
+    ) or [None]
+    assert intent is None or intent.outcome != "completed"
+
+
+async def test_recovery_refuses_a_saved_forged_result_for_a_subagent_call(
+    store: Any, engine: Any
+) -> None:
+    with contextlib.suppress(_Crash):
+        await _old_binary_saves_a_forged_result(store, crash=_raise_crash)
+    [root_row] = await rows(engine, AgentRun, AgentRun.agent_name == "lead")
+    await _assert_forged_refused(store, engine, root_row.id)
+
+
+@pytest.mark.parametrize("engine", ["sqlite_file", "postgres"], indirect=True)
+async def test_fresh_process_saved_forged_result_is_refused(engine: Any) -> None:
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    package = Path(__file__).resolve().parents[2]
+    done = subprocess.run(
+        [sys.executable, "-m", "tests.integration.test_managed_approval"],
+        cwd=package,
+        env={
+            **os.environ,
+            "PYTHONPATH": os.pathsep.join([str(package / "src"), str(package)]),
+            "T4C_CRASH_URL": engine.url.render_as_string(hide_password=False),
+            "T4C_CRASH_KIND": "forged_saved",
+        },
+        capture_output=True,
+        timeout=120,
+        check=False,
+    )
+    assert done.returncode == CRASHED, done.stderr.decode()[-2000:]
+    [root_row] = await rows(engine, AgentRun, AgentRun.agent_name == "lead")
+    async with _fresh_process(engine) as store:
+        await _assert_forged_refused(store, engine, root_row.id)
+
+
+# ---------------------------------------------------------------------------
+# Fix round 1, R2: legacy whole-batch rejection through resume(tool_results)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("entry", ["resume", "resume_stream"])
+async def test_legacy_rejection_by_failed_results_denies_a_subagent_batch(
+    store: Any, engine: Any, entry: str
+) -> None:
+    root, paused, (root_llm, child_llm) = await _waiting(store, "reviewer", "fetch")
+    failed = [
+        ToolResult(name=c.name, call_id=c.id, payload='{"denied":"no"}', success=False)
+        for c in paused.pending.tool_calls
+    ]
+    if entry == "resume":
+        result = await root.resume(
+            paused.run_id, tool_results=failed, expected_pause_id=paused.pause_id, tenant_id=TENANT
+        )
+    else:
+        stream = root.resume_stream(
+            paused.run_id, tool_results=failed, expected_pause_id=paused.pause_id, tenant_id=TENANT
+        )
+        result = [event async for event in stream][-1].run_result
+    assert result.status == RunStatus.SUCCESS
+    assert effects == [] and child_llm.calls == 0
+    assert await child_rows(engine, paused.run_id) == 0
+    seen = tool_messages(root_llm)
+    assert all("declined" in seen[name] for name in ("reviewer", "fetch"))
+
+
 if __name__ == "__main__":
     import asyncio
     import os
 
-    asyncio.run(_phase_one(os.environ["T4C_CRASH_URL"]))
+    asyncio.run(
+        _phase_one(os.environ["T4C_CRASH_URL"], os.environ.get("T4C_CRASH_KIND", "unknown_sibling"))
+    )

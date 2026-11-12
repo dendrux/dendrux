@@ -645,6 +645,9 @@ async def _consume_recovery_submission(
     if descriptor:
         raw = await store.get_pause_state(run_id) or {}
         payload = _submission_payload(raw)
+        _refuse_recovered_managed_results(
+            run_id, descriptor, raw, recorder._loop_state, payload, lookups
+        )
         injected = _recovery_input(payload, descriptor["kind"])
         if descriptor["kind"] == "approval":
             injected = await _recovery_approval(
@@ -655,6 +658,36 @@ async def _consume_recovery_submission(
         await recorder.consume_resume(injected)
         ctx.history.extend(injected)
     return recorder._loop_state, descriptor
+
+
+def _refuse_recovered_managed_results(
+    run_id: str,
+    descriptor: dict[str, Any],
+    raw: dict[str, Any],
+    state: dict[str, Any],
+    payload: dict[str, Any],
+    lookups: Any,
+) -> None:
+    """A saved caller result never answers a generated subagent call (0.7).
+
+    Earlier unreleased builds could pause a subagent call for a client and claim
+    a submitted result for it. Recovery checks the saved results against the
+    durable pending targets (pause and checkpoint) and the generated calls before
+    projecting or consuming anything. Approval submissions are runtime denials
+    and are not checked here.
+    """
+    from dendrux.loops.react import SubagentTool
+    from dendrux.runtime.submit import deserialize_tool_results, refuse_managed_results
+
+    if descriptor["kind"] != "tool_results":
+        return
+    results = deserialize_tool_results(payload.get("submitted_tool_results") or [])
+    targets = {
+        **(raw.get("pending_targets") or {}),
+        **{p["call_id"]: p.get("target") for p in state.get("pending", [])},
+        **{r.call_id: "agent" for r in results if isinstance(lookups.fn.get(r.name), SubagentTool)},
+    }
+    refuse_managed_results(run_id, targets, results)
 
 
 class _RecoveryBlockedError(Exception):
