@@ -15,6 +15,7 @@ from dendrux.types import (
     ToolResult,
 )
 from tests._fixtures.storage import pin_storage_format
+from tests._helpers.gates import wait_for_gate
 from tests._helpers.lost_cancel import LostCancel
 from tests._helpers.scripted_provider import ScriptedLLM, tool_call
 
@@ -73,7 +74,7 @@ async def test_lost_cancel_before_provider(
 
         task = asyncio.create_task(run())
         try:
-            await asyncio.wait_for(gate.entered.wait(), 5)
+            await wait_for_gate(gate.entered, task=task)
             if source == "caller":
                 task.cancel()
             else:
@@ -116,7 +117,7 @@ async def test_lost_cancel_before_tool(store, engine, monkeypatch, storage_forma
     ) as agent:
         task = asyncio.create_task(agent.run("go"))
         try:
-            await asyncio.wait_for(gate.entered.wait(), 5)
+            await wait_for_gate(gate.entered, task=task)
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
@@ -141,7 +142,7 @@ async def test_existing_cancellation_semantics(store, engine, monkeypatch, swall
     ) as agent:
         task = asyncio.create_task(agent.run("go"))
         try:
-            await asyncio.wait_for(gate.entered.wait(), 5)
+            await wait_for_gate(gate.entered, task=task)
             if source == "manager":
                 await agent.cancel_run(gate.run_id)
                 assert (await task).status.value == "cancelled"
@@ -175,7 +176,7 @@ async def test_nested_child_interrupt_leaves_parent_running(store):
         holder["agent"] = agent
         task = asyncio.create_task(agent.run("parent"))
         try:
-            await asyncio.wait_for(provider.entered.wait(), 5)
+            await wait_for_gate(provider.entered, task=task)
             runs = await store.list_runs()
             child = next(run for run in runs if run.parent_run_id is not None)
             await agent.cancel_run(child.id)
@@ -211,7 +212,7 @@ async def test_gate_off_does_not_recover_lost_cancel(store, engine, monkeypatch,
     ) as agent:
         task = asyncio.create_task(agent.run("go"))
         try:
-            await asyncio.wait_for(gate.entered.wait(), 5)
+            await wait_for_gate(gate.entered, task=task)
             task.cancel()
             assert (await task).status.value == "success"
             assert gate.dropped
@@ -297,7 +298,7 @@ async def test_continuation_recorder_observes_its_run_task(store, engine, monkey
 
         task = asyncio.create_task(resume())
         try:
-            await asyncio.wait_for(gate.entered.wait(), 5)
+            await wait_for_gate(gate.entered, task=task)
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
@@ -331,7 +332,7 @@ async def test_parent_store_loss_stops_before_same_task_child(store, engine, mon
         holder["agent"] = agent
         task = asyncio.create_task(agent.run("go"))
         try:
-            await asyncio.wait_for(gate.entered.wait(), 5)
+            await wait_for_gate(gate.entered, task=task)
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task

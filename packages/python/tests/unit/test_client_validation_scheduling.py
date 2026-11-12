@@ -11,6 +11,7 @@ import pytest
 from dendrux import Agent, tool
 from dendrux.runtime.submit import prepare_client_results
 from dendrux.types import ToolCall, ToolResult
+from tests._helpers.gates import wait_for_gate
 
 
 @tool(target="client")
@@ -226,7 +227,7 @@ async def test_cancelled_validation_waits_for_cpu_job_before_releasing_slot(
             submit._validate_client_results(agent, "00000000000000000000000102", [result])
         )
         try:
-            await asyncio.wait_for(entered.wait(), timeout=10)
+            await wait_for_gate(entered, task=caller)
             caller.cancel()
             await asyncio.sleep(0)
             await asyncio.sleep(0)

@@ -9,6 +9,7 @@ import pytest
 from dendrux.agent import Agent
 from dendrux.tool import tool
 from dendrux.types import LLMResponse, RunStatus
+from tests._helpers.gates import wait_for_gate
 from tests._helpers.scripted_provider import ScriptedLLM, tool_call
 
 pytestmark = pytest.mark.asyncio
@@ -44,7 +45,7 @@ async def test_cancel_child_leaves_same_task_parent_running(store, cascade):
     )
     holder["agent"] = agent
     task = asyncio.create_task(agent.run("go"))
-    await asyncio.wait_for(llm.entered.wait(), 5)
+    await wait_for_gate(llm.entered, task=task)
     parent_id = await _only(store)
     child_id = await _only(store, parent=parent_id)
     await agent.cancel_run(child_id, cascade=cascade)

@@ -14,6 +14,7 @@ from dendrux.db.models import AgentRun
 from dendrux.errors import RunCancelledError
 from dendrux.runtime.stores._factory import store_for_engine
 from dendrux.types import Budget, generate_ulid
+from tests._helpers.gates import wait_for_gate
 
 pytestmark = pytest.mark.parametrize("engine", ["sqlite", "sqlite_file", "postgres"], indirect=True)
 
@@ -266,7 +267,7 @@ async def test_creator_checked_parent_before_mark_is_seen_after_commit(
     creation = asyncio.create_task(
         creator.create_run(child, "child", parent_run_id=root, tenant_id="t")
     )
-    await asyncio.wait_for(checked.wait(), 5)
+    await wait_for_gate(checked, task=creation)
     cancellation = asyncio.create_task(agent.cancel_run(root, cascade=True, tenant_id="t"))
     try:
         # Prove the database is waiting on a lock, without an elapsed-time threshold.
@@ -366,7 +367,7 @@ async def test_sqlite_creator_checked_parent_is_seen_after_serialized_commit(
     creation = asyncio.create_task(
         creator.create_run(child, "child", parent_run_id=root, tenant_id="t")
     )
-    await asyncio.wait_for(checked.wait(), 5)
+    await wait_for_gate(checked, task=creation)
 
     async def cancel():
         cancel_started.set()
@@ -374,7 +375,7 @@ async def test_sqlite_creator_checked_parent_is_seen_after_serialized_commit(
 
     cancellation = asyncio.create_task(cancel())
     try:
-        await asyncio.wait_for(cancel_started.wait(), 5)
+        await wait_for_gate(cancel_started, task=cancellation)
         await asyncio.sleep(0)
         assert not cancellation.done()
         release.set()

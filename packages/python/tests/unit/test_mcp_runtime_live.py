@@ -68,6 +68,7 @@ from dendrux.mcp._runtime import (
     _ViewToolSource,
 )
 from dendrux.mcp._source import MCPSource
+from tests._helpers.gates import wait_for_gate
 from tests._helpers.lost_cancel import simulate_lost_cancel
 
 
@@ -3976,7 +3977,7 @@ class TestCallConcurrency:
         task = asyncio.create_task(caller())
         await _wait_until(lambda: runtime._in_flight_calls == 1)
         await runtime.evict(connection_key="github-1", mode="force")
-        await asyncio.wait_for(converted.wait(), timeout=1.0)
+        await wait_for_gate(converted, task=task)
 
         assert observed == {"before": 0, "after": 0}
         with pytest.raises(TimeoutError):
@@ -4021,7 +4022,7 @@ class TestCallConcurrency:
 
         evicting = asyncio.create_task(runtime.evict(connection_key="github-1", mode="force"))
         assert _InstrumentedAdapter.call_cancel_seen is not None
-        await asyncio.wait_for(_InstrumentedAdapter.call_cancel_seen.wait(), timeout=1.0)
+        await wait_for_gate(_InstrumentedAdapter.call_cancel_seen, task=task)
         task.cancel()  # application cancellation, independent of the runtime's
 
         with pytest.raises(asyncio.CancelledError):
@@ -4054,7 +4055,7 @@ class TestCallConcurrency:
         task = asyncio.create_task(caller())
         await _wait_until(lambda: runtime._in_flight_calls == 1)
         await runtime.evict(connection_key="github-1", mode="force")
-        await asyncio.wait_for(converted.wait(), timeout=1.0)
+        await wait_for_gate(converted, task=task)
 
         assert not task.done()
         assert task.cancelling() == 0
@@ -4419,7 +4420,7 @@ class TestBrokenConnectionRecovery:
             await _SiblingAdapter.sibling_started.wait()
             with pytest.raises(MCPOutcomeUnknownError):
                 await call(value="dies")
-            await asyncio.wait_for(converted.wait(), timeout=1.0)
+            await wait_for_gate(converted, task=sibling)
 
             assert observed == {"before": 0, "after": 0}
             finish.set()
@@ -4462,7 +4463,7 @@ class TestBrokenConnectionRecovery:
 
             with pytest.raises(MCPOutcomeUnknownError):
                 await call(value="dies")
-            await asyncio.wait_for(_SiblingAdapter.runtime_cancel_seen.wait(), timeout=1.0)
+            await wait_for_gate(_SiblingAdapter.runtime_cancel_seen, task=sibling)
             sibling.cancel()
 
             with pytest.raises(asyncio.CancelledError):

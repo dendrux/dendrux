@@ -10,6 +10,7 @@ from dendrux.errors import PersistenceError, RunFencedError
 from dendrux.llm.mock import MockLLM
 from dendrux.runtime import context
 from dendrux.runtime.state import StoreCapabilities
+from tests._helpers.gates import wait_for_gate
 
 
 @pytest.mark.parametrize("seconds", [0, 4.999])
@@ -163,7 +164,7 @@ async def test_a23_external_cancellation_cancels_outstanding_renewal():
 
     task = asyncio.create_task(call())
     try:
-        await asyncio.wait_for(store.started.wait(), timeout=1)
+        await wait_for_gate(store.started, task=task)
         before = asyncio.get_running_loop().time()
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -247,7 +248,7 @@ async def test_parallel_scopes_share_one_renewal_clock(monkeypatch):
 
     tasks = [asyncio.create_task(call()) for _ in range(20)]
     try:
-        await asyncio.wait_for(ready.wait(), 10)
+        await wait_for_gate(ready)
         assert store.count == 1
         assert ctx._lease_users[0] == 20
         ticker = ctx._lease_ticker[0]
@@ -256,7 +257,7 @@ async def test_parallel_scopes_share_one_renewal_clock(monkeypatch):
         for expected in range(2, 5):
             renewed.clear()
             ticks.put_nowait(None)
-            await asyncio.wait_for(renewed.wait(), 10)
+            await wait_for_gate(renewed, task=ticker)
             assert store.count == expected
             assert ctx._lease_ticker[0] is ticker
     finally:

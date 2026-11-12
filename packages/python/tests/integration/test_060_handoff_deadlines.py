@@ -11,6 +11,7 @@ from dendrux.db.models import AgentRun
 from dendrux.runtime import durability
 from dendrux.runtime.submit import _cancel_claim
 from dendrux.runtime.tasks import _drain_cleanup
+from tests._helpers.gates import wait_for_gate
 from tests.integration.test_060_ownership_cancellation import (
     ENTRIES,
     GateBus,
@@ -69,7 +70,7 @@ async def test_precommit_cancellation_preserves_state(store, engine, monkeypatch
     monkeypatch.setattr(store, "_write_tx", blocked)
     task = asyncio.create_task(call)
     try:
-        await asyncio.wait_for(gate.wait(), 5)
+        await wait_for_gate(gate, task=task)
         task.cancel()
         done, _ = await asyncio.wait({task}, timeout=CANCEL_TRIPWIRE_S)
         assert done, "pre-COMMIT cancellation did not return promptly"
@@ -133,7 +134,7 @@ async def test_commit_cancel_deadline(store, engine, monkeypatch, caplog, slow):
 
     monkeypatch.setattr(AsyncSession, "commit", commit)
     task = asyncio.create_task(call)
-    await asyncio.wait_for(entered.wait(), 5)
+    await wait_for_gate(entered, task=task)
     started = time.monotonic()
     task.cancel()
     try:
@@ -293,10 +294,10 @@ async def test_cleanup_deadline_and_hint_deadline_are_joined(store, engine, monk
     bus.enabled = True
     task = asyncio.create_task(call)
     try:
-        await asyncio.wait_for(bus.entered.wait(), 5)
+        await wait_for_gate(bus.entered, task=task)
         started = time.monotonic()
         task.cancel()
-        await asyncio.wait_for(entered.wait(), 5)
+        await wait_for_gate(entered, task=task)
         task.cancel()
         done, _ = await asyncio.wait({task}, timeout=CANCEL_TRIPWIRE_S)
         elapsed = time.monotonic() - started
@@ -349,7 +350,7 @@ async def test_legacy_governance_cancel_has_no_epoch_authority(
         submit if entry == "submit_tool_results" else runner, "report_governance_change", governance
     )
     task = asyncio.create_task(call)
-    await asyncio.wait_for(entered.wait(), 5)
+    await wait_for_gate(entered, task=task)
     if superseded:
         async with engine.begin() as conn:
             await conn.execute(
@@ -441,7 +442,7 @@ async def test_precommit_cancel_is_fast_on_a_quiet_machine(store, engine, monkey
     monkeypatch.setattr(store, "_write_tx", before_commit)
     task = asyncio.create_task(call)
     try:
-        await asyncio.wait_for(entered.wait(), 5)
+        await wait_for_gate(entered, task=task)
         bus.enabled = True
         bus.enqueue([run_id])
         started = time.monotonic()

@@ -23,6 +23,7 @@ from dendrux.runtime.context import (
     set_delegation_context,
 )
 from dendrux.types import LLMResponse, RunEventType, RunStatus, ToolCall, ToolDecision
+from tests._helpers.gates import wait_for_gate
 from tests._helpers.recovery_checkpoint import checkpoint as checkpoint
 from tests._helpers.recovery_checkpoint import expire
 from tests._helpers.runtime_paths import (
@@ -247,7 +248,7 @@ async def test_cancellation_interrupts_tool_and_pairs_hooks_once(store, entry, c
         else a.run("go", notifier=notifier)
     )
     try:
-        await asyncio.wait_for(entered.wait(), 5)
+        await wait_for_gate(entered, task=task)
         run_id = identity[0]
         if cancel == "caller":
             task.cancel("caller_cancel")
@@ -434,7 +435,7 @@ async def test_caller_cancellation_grid_persists_once(store, engine, path):
     case = await path_case(store, engine, path, provider)
     task = asyncio.create_task(case.invoke())
     try:
-        await asyncio.wait_for(provider.entered.wait(), 5)
+        await wait_for_gate(provider.entered, task=task)
         task.cancel("grid_cancellation")
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -608,7 +609,7 @@ async def test_concurrent_submit_failure_releases_only_winning_epoch(
             patcher.setattr(backend, "get_pii_mapping", fail_after_claim)
         tasks = [asyncio.create_task(invoke(agent=owner)) for owner in [first, second]]
         try:
-            await asyncio.wait_for(entered.wait(), 5)
+            await wait_for_gate(entered)
             done, _ = await asyncio.wait(tasks, timeout=5, return_when=asyncio.FIRST_COMPLETED)
             assert len(done) == 1
             assert isinstance(next(iter(done)).exception(), RunAlreadyClaimedError)
@@ -877,7 +878,7 @@ async def test_caller_cancellation_during_claim_release_propagates_after_cleanup
     monkeypatch.setattr(store, "release_run_claim", released)
     task = asyncio.create_task(invoke())
     try:
-        await asyncio.wait_for(entered.wait(), 5)
+        await wait_for_gate(entered, task=task)
         task.cancel()
         await asyncio.sleep(0)
         assert not task.done(), "caller cancellation must drain the fenced release"
@@ -1150,7 +1151,7 @@ async def test_completion_beats_caller_cancellation_during_finish(store, entry):
         else a.run("go", notifier=notifier)
     )
     try:
-        await asyncio.wait_for(finishing.wait(), 5)
+        await wait_for_gate(finishing, task=task)
         task.cancel("late_cancellation")
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -1206,12 +1207,12 @@ async def test_overlapping_same_agent_submit_preserves_new_owner_and_interrupts(
     first = asyncio.create_task(invoke(notifier=notifier))
     second = None
     try:
-        await asyncio.wait_for(failed.wait(), 5)
+        await wait_for_gate(failed, task=first)
         released = await store.get_run(run_id)
         assert released.status == before.status
         assert released.claim_epoch == before.claim_epoch + 1
         second = asyncio.create_task(invoke())
-        await asyncio.wait_for(provider.entered.wait(), 5)
+        await wait_for_gate(provider.entered, task=second)
         new_owner = a._task_manager._owned[run_id]
         assert a._task_manager._tasks[run_id] is new_owner
         finish_failure.set()

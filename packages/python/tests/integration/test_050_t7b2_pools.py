@@ -14,6 +14,7 @@ from dendrux.db import session
 from dendrux.llm.mock import MockLLM
 from dendrux.store import RunStore
 from dendrux.types import LLMResponse
+from tests._helpers.gates import wait_for_gate
 from tests._helpers.pg_wait import wait_pg_count
 
 
@@ -193,7 +194,7 @@ async def test_run_recovers_after_its_idle_backends_are_terminated(engine, recor
     )
     task = asyncio.create_task(a.run("go", tenant_id=None))
     try:
-        await asyncio.wait_for(llm.entered.wait(), 20)
+        await wait_for_gate(llm.entered, task=task)
         async with engine.connect() as conn:
             pids = (
                 (
@@ -248,10 +249,10 @@ async def test_cancelled_initializer_does_not_cancel_another_holder(tmp_path, mo
     url = f"sqlite+aiosqlite:///{tmp_path}/cancel.db"
     a, b = agent(url), agent(url)
     first = asyncio.create_task(a._resolve_state_store())
-    await asyncio.wait_for(entered.wait(), 20)
+    await wait_for_gate(entered, task=first)
     other = asyncio.create_task(b._resolve_state_store())
     try:
-        await asyncio.wait_for(second.wait(), 20)
+        await wait_for_gate(second, task=other)
         first.cancel()
         with pytest.raises(asyncio.CancelledError):
             await first
@@ -351,7 +352,7 @@ async def test_pooled_runtime_has_no_session_level_sql(engine):
     event.listen(engine.sync_engine.__class__, "before_cursor_execute", capture)
     task = asyncio.create_task(a.run("go", tenant_id=None))
     try:
-        await asyncio.wait_for(llm.entered.wait(), 20)
+        await wait_for_gate(llm.entered, task=task)
         async with engine.connect() as conn:
             run_id = (
                 await conn.execute(text("SELECT id FROM agent_runs WHERE agent_name='sql-audit'"))

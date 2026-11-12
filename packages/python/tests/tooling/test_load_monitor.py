@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests._helpers.gates import wait_for_gate
 from tools import load
 
 MYSQL = "mysql+asyncmy://root:dendrux_test@127.0.0.1:53306/dendrux_p5_l_load_test"
@@ -615,6 +616,6 @@ async def test_stop_finishes_even_if_a_cancel_is_lost(monkeypatch):
             lost.append(label)
 
     monkeypatch.setattr(sampler, "_safe_sample", swallow_one_cancel)
-    await asyncio.wait_for(entered.wait(), 10)
+    await wait_for_gate(entered)
     await asyncio.wait_for(sampler.stop(1), 5)
     assert lost == ["sampling"]

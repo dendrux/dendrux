@@ -8,6 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from dendrux.db.models import AgentRun
+from tests._helpers.gates import wait_for_gate
 from tests.integration import test_060_handoff_deadlines as deadlines
 from tests.integration import test_060_ownership_cancellation as ownership
 
@@ -80,10 +81,10 @@ async def test_task_store_repeated_cleanup_cancellation(task_store, engine, monk
     monkeypatch.setattr(task_store, "finalize_with_event", finalize)
     caller = asyncio.create_task(call)
     try:
-        await asyncio.wait_for(committed.wait(), 5)
+        await wait_for_gate(committed, task=caller)
         caller.cancel()
         release.set()
-        await asyncio.wait_for(cleaning.wait(), 5)
+        await wait_for_gate(cleaning, task=caller)
         for _ in range(3):
             caller.cancel()
             await asyncio.sleep(0)
@@ -131,7 +132,7 @@ async def test_postcommit_cancel_races_with_another_claim(task_store, engine, mo
     caller = asyncio.create_task(call)
     next_owner = None
     try:
-        await asyncio.wait_for(committed.wait(), 5)
+        await wait_for_gate(committed, task=caller)
         caller.cancel()
         await asyncio.sleep(0)
 

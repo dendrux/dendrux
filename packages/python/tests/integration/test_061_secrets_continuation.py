@@ -13,6 +13,7 @@ from dendrux.runtime._blocked_content import _blocked_write
 from dendrux.tool import tool
 from dendrux.types import ApprovalDecision, LLMResponse, RunStatus, ToolCall, ToolResult
 from tests._fixtures.storage import pin_storage_format
+from tests._helpers.gates import wait_for_gate
 
 SECRET = "AKIAIOSFODNN7EXAMPLE"
 
@@ -249,7 +250,7 @@ async def test_note_block_during_provider_stops_subsequent_tool(store, engine, f
     )
     task = asyncio.create_task(agent.run("go", tenant_id="t"))
     try:
-        await asyncio.wait_for(entered.wait(), 5)
+        await wait_for_gate(entered, task=task)
         from dendrux.db.models import AgentRun
 
         async with engine.connect() as connection:

@@ -14,6 +14,7 @@ from dendrux.runtime import runner
 from dendrux.runtime.persistence import PersistenceRecorder
 from dendrux.types import LLMResponse, RunStatus
 from tests._fixtures.storage import pin_storage_format
+from tests._helpers.gates import wait_for_gate
 from tests.integration.test_060_reclaim_agent import checkpoint
 from tests.integration.test_cross_path_invariants import SUBMIT_KINDS, make_agent, submission_case
 
@@ -55,7 +56,7 @@ async def test_post_trace_release_closes_observers(
     monkeypatch.setattr(runner, "_snapshot_mcp_meta", Mock(side_effect=failure))
     task = asyncio.create_task(invoke(notifier=notifier))
     try:
-        await asyncio.wait_for(entered.wait(), 10)
+        await wait_for_gate(entered, task=task)
         if cancel:
             await make_agent(store, []).cancel_run(run_id, tenant_id="tenant")
         proceed.set()

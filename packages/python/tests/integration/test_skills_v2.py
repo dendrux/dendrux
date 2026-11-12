@@ -13,6 +13,7 @@ from dendrux.context_blocks import ContextBlock
 from dendrux.errors import SkillMismatchError, SkillMissingError
 from dendrux.llm.mock import MockLLM
 from dendrux.types import LLMResponse, Role, RunStatus, ToolCall, ToolResult
+from tests._helpers.gates import wait_for_gate
 
 
 class Executor(SkillExecutor):
@@ -308,7 +309,7 @@ async def test_script_cancellation_finalizes_cancelled(store, path):
         task = asyncio.create_task(consume())
     else:
         task = asyncio.create_task(a.run("input", activate_skills=["demo"]))
-    await asyncio.wait_for(executor.started.wait(), 5)
+    await wait_for_gate(executor.started, task=task)
     if path == "batch":
         run_id = a._provider.call_history[0]["run_id"]
     task.cancel()

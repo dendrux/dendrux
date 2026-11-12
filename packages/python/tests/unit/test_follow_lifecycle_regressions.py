@@ -6,6 +6,7 @@ import logging
 import pytest
 
 from dendrux.store import EventFeed, FollowEnd, RunStore, _follow
+from tests._helpers.gates import wait_for_gate
 from tests.unit.test_follow_coordinator import BatchedState, FakeLive, ticks
 from tests.unit.test_follow_coordinator import clock as clock
 
@@ -219,7 +220,7 @@ async def test_new_admission_during_unwanted_acquisition_release_gets_lease(monk
     monkeypatch.setattr(live, "_release_listener", release)
     await asyncio.sleep(0.03)
     live._listener_lock.release()
-    await asyncio.wait_for(entered.wait(), 1)
+    await wait_for_gate(entered)
     second = reader.follow("r", tenant_id=None)
     joining = asyncio.create_task(second.start())
     await ticks()
@@ -301,7 +302,7 @@ async def test_join_during_idle_release_restores_hub(monkeypatch):
     try:
         await first.start()
         await first.aclose()
-        await asyncio.wait_for(entered.wait(), 1)
+        await wait_for_gate(entered)
         await second.start()
         released.set()
         await ticks(40)

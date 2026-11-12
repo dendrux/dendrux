@@ -15,6 +15,7 @@ from dendrux.llm.mock import MockLLM
 from dendrux.runtime._blocked_content import _blocked_write
 from dendrux.types import LLMResponse, RunStatus, ToolCall, ToolResult
 from tests._fixtures.storage import pin_storage_format
+from tests._helpers.gates import wait_for_gate
 from tests.integration.test_061_secrets_continuation import (
     SECRET,
     client_read,
@@ -216,7 +217,7 @@ async def test_blocked_note_between_serial_tools_stops_remaining_effect(store, e
     )
     task = asyncio.create_task(agent.run("go", tenant_id="t"))
     try:
-        await asyncio.wait_for(entered.wait(), 5)
+        await wait_for_gate(entered, task=task)
         from sqlalchemy import select
 
         async with engine.connect() as connection:
@@ -678,7 +679,7 @@ async def test_guardrail_free_stream_marked_mid_turn_ends_as_guardrail_block(sto
 
     task = asyncio.create_task(consume())
     try:
-        await asyncio.wait_for(entered.wait(), 5)
+        await wait_for_gate(entered, task=task)
         async with engine.connect() as connection:
             run_id = (await connection.execute(select(AgentRun.id))).scalar_one()
         await guarded.submit_note(run_id, SECRET, tenant_id="t")
@@ -789,7 +790,7 @@ async def test_blocked_note_before_client_step_stops_instead_of_pausing(store, e
     )
     task = asyncio.create_task(agent.run("go", tenant_id="t"))
     try:
-        await asyncio.wait_for(entered.wait(), 5)
+        await wait_for_gate(entered, task=task)
         async with engine.connect() as connection:
             run_id = (await connection.execute(select(AgentRun.id))).scalar_one()
         await agent.submit_note(run_id, SECRET, tenant_id="t")
@@ -850,7 +851,7 @@ async def test_custom_store_dispatch_after_blocked_note_stops(store, engine):
     )
     task = asyncio.create_task(agent.run("go", tenant_id="t"))
     try:
-        await asyncio.wait_for(entered.wait(), 5)
+        await wait_for_gate(entered, task=task)
         async with engine.connect() as connection:
             run_id = (await connection.execute(select(AgentRun.id))).scalar_one()
         await agent.submit_note(run_id, SECRET, tenant_id="t")

@@ -13,6 +13,7 @@ from typer.testing import CliRunner
 
 from dendrux.cli.main import app
 from dendrux.db.models import Base
+from tests._helpers.gates import wait_for_gate
 
 HEAD = "f9a0b1c2d3e4"
 PRIOR = "e8f9a0b1c2d3"
@@ -774,7 +775,7 @@ async def test_b4_pg_blocked_upgrade_retries(rollout_database, monkeypatch):
     monkeypatch.setattr(_activate, "_preflight", hold)
     winner = asyncio.create_task(_activate.activate_database(engine))
     try:
-        await asyncio.wait_for(ready.wait(), 10)
+        await wait_for_gate(ready, task=winner)
         with pytest.raises(RuntimeError, match="Another Dendrux"):
             await _activate.activate_database(engine)
     finally:

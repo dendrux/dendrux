@@ -16,6 +16,7 @@ from dendrux.runtime.state import EventWrite, claimed_store
 from dendrux.store import RunStore
 from dendrux.types import LLMResponse, RunStatus, ToolCall, generate_ulid
 from tests._fixtures.storage import pin_storage_format
+from tests._helpers.gates import wait_for_gate
 from tests.integration.test_060_reclaim_agent import checkpoint
 from tests.integration.test_cross_path_invariants import make_agent, submission_case
 
@@ -88,7 +89,7 @@ async def test_cancel_during_claimed_setup_wins_release(
     monkeypatch.setattr(store, "get_pii_mapping", fail_setup)
     task = asyncio.create_task(invoke())
     try:
-        await asyncio.wait_for(entered.wait(), 10)
+        await wait_for_gate(entered, task=task)
         # A separate Agent has no local task to interrupt. Its cancel commits
         # through another DB session while the claimed submit is suspended.
         remote = make_agent(store, [])

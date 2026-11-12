@@ -12,6 +12,7 @@ from dendrux.llm.mock import MockLLM
 from dendrux.runtime.context import get_delegation_context
 from dendrux.skills._session import current
 from dendrux.types import LLMResponse, RunStatus, ToolCall, ToolResult
+from tests._helpers.gates import wait_for_gate
 from tests.integration.test_skills_v2 import agent, client
 from tests.unit.test_skill_runtime_fix1 import Reads
 
@@ -80,7 +81,7 @@ async def test_non_skill_cancel_during_resume_preparation_sequences_event(store,
             if path == "resume"
             else a.submit_tool_results(paused.run_id, results)
         )
-        await asyncio.wait_for(entered.wait(), 5)
+        await wait_for_gate(entered, task=task)
         if path == "submit":
             await a.cancel_run(paused.run_id)
         else:

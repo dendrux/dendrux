@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from dendrux.runtime.durability import retry_transient_db
 from dendrux.types import generate_ulid
 from tests._helpers.db_errors import LostConnectionError
+from tests._helpers.gates import wait_for_gate
 
 
 @pytest.fixture
@@ -76,7 +77,7 @@ async def test_inflight_commit_readback_waits_for_writer(backend_engine, store, 
         )
     )
     try:
-        await asyncio.wait_for(pending.wait(), 5)
+        await wait_for_gate(pending, task=task)
         await asyncio.sleep(0.15)
         assert not task.done()
         await commit(held)

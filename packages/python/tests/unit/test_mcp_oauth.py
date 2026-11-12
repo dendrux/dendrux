@@ -14,6 +14,7 @@ from dendrux.mcp import MCPAuthenticationError, MCPConnectionError, MCPError, MC
 from dendrux.mcp._client import MCPClientAdapter
 from dendrux.mcp._runtime import _ViewToolSource
 from dendrux.mcp._server import create_mcp_executor
+from tests._helpers.gates import wait_for_gate
 from tests.unit.test_mcp_streamable_http_auth import _serve
 
 
@@ -1098,7 +1099,7 @@ async def test_runtime_close_during_connect_recovery_aborts_cleanly(adapters, mo
     runtime = MCPRuntime(observer=recorder, shutdown_timeout=1.0)
     connection = _bind(runtime, provider)
     discover = asyncio.create_task(connection.discover())
-    await asyncio.wait_for(provider.entered.wait(), timeout=2)
+    await wait_for_gate(provider.entered, task=discover)
     await runtime.close()
     # Shutdown cancels the shared connect task; its waiter sees that cancellation.
     with pytest.raises(asyncio.CancelledError):
@@ -1118,7 +1119,7 @@ async def test_cancelled_waiter_does_not_cancel_shared_connect_recovery(adapters
         connection = _bind(runtime, provider)
         first = asyncio.create_task(connection.discover())
         second = asyncio.create_task(connection.discover())
-        await asyncio.wait_for(provider.entered.wait(), timeout=2)
+        await wait_for_gate(provider.entered, task=second)
         first.cancel()
         with pytest.raises(asyncio.CancelledError):
             await first
@@ -1138,7 +1139,7 @@ async def test_eviction_during_connect_recovery_never_publishes(adapters, monkey
     async with MCPRuntime(observer=recorder) as runtime:
         connection = _bind(runtime, provider)
         discover = asyncio.create_task(connection.discover())
-        await asyncio.wait_for(provider.entered.wait(), timeout=2)
+        await wait_for_gate(provider.entered, task=discover)
         evict = asyncio.create_task(runtime.evict(connection_key="demo", timeout=1.0))
         await asyncio.sleep(0)
         provider.release.set()
@@ -1210,7 +1211,7 @@ async def test_cancel_while_closing_rejected_adapter_hands_close_to_background(
     try:
         connection = _bind(runtime, provider)
         discover = asyncio.create_task(connection.discover())
-        await asyncio.wait_for(closing.wait(), timeout=2)
+        await wait_for_gate(closing, task=discover)
         open_task = runtime._entries[connection.identity].task
         open_task.cancel()
         await asyncio.gather(open_task, return_exceptions=True)
@@ -1245,12 +1246,12 @@ async def test_hanging_unpublished_adapter_close_is_bounded(adapters, monkeypatc
     try:
         connection = _bind(runtime, provider)
         discover = asyncio.create_task(connection.discover())
-        await asyncio.wait_for(provider.entered.wait(), timeout=2)
+        await wait_for_gate(provider.entered, task=discover)
         open_task = runtime._entries[connection.identity].task
         evict = asyncio.create_task(runtime.evict(connection_key="demo", timeout=1.0))
         await asyncio.sleep(0)
         provider.release.set()
-        await asyncio.wait_for(closing.wait(), timeout=2)
+        await wait_for_gate(closing, task=evict)
         # The open task finishes within close_timeout although close never returns.
         results = await asyncio.wait_for(
             asyncio.gather(open_task, return_exceptions=True), timeout=1
@@ -1284,13 +1285,13 @@ async def test_cancel_during_unpublished_adapter_close_emits_one_terminal(adapte
     try:
         connection = _bind(runtime, provider)
         discover = asyncio.create_task(connection.discover())
-        await asyncio.wait_for(provider.entered.wait(), timeout=2)
+        await wait_for_gate(provider.entered, task=discover)
         open_task = runtime._entries[connection.identity].task
         evict = asyncio.create_task(runtime.evict(connection_key="demo", timeout=1.0))
         await asyncio.sleep(0)
         provider.release.set()
         # The retry succeeds for the fenced entry and is closed unpublished.
-        await asyncio.wait_for(closing.wait(), timeout=2)
+        await wait_for_gate(closing, task=evict)
         open_task.cancel()
         await asyncio.gather(open_task, return_exceptions=True)
         assert _opening_events(recorder) == (1, ["MCPConnectionAborted"])

@@ -8,6 +8,7 @@ import pytest
 from dendrux import Agent, tool
 from dendrux.errors import PersistenceError
 from dendrux.types import LLMResponse, RunStatus
+from tests._helpers.gates import wait_for_gate
 from tests._helpers.scripted_provider import ScriptedLLM, tool_call
 
 
@@ -36,7 +37,7 @@ async def test_cancel_response_failure_still_interrupts_tool(store, monkeypatch,
     )
     task = asyncio.create_task(agent.run("go", tenant_id="tenant"))
     try:
-        await asyncio.wait_for(entered.wait(), 10)
+        await wait_for_gate(entered, task=task)
         run_id = (await store.list_runs())[0].id
         signal = Mock(wraps=agent._task_manager.cancel)
         requested = []
@@ -64,7 +65,7 @@ async def test_cancel_response_failure_still_interrupts_tool(store, monkeypatch,
         if failure != "frontier":
             assert requested == [True]
         signal.assert_called_once_with(run_id)
-        await asyncio.wait_for(cancelled.wait(), 10)
+        await wait_for_gate(cancelled, task=task)
         assert (await asyncio.wait_for(task, 10)).status == RunStatus.CANCELLED
     finally:
         gate.set()

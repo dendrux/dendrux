@@ -13,6 +13,7 @@ from dendrux.loops.base import BaseNotifier
 from dendrux.runtime.runner import resume_claimed
 from dendrux.runtime.submit import serialize_tool_results
 from dendrux.types import LLMResponse, ToolCall, ToolResult
+from tests._helpers.gates import wait_for_gate
 from tests.integration.test_skills_v2 import client
 
 
@@ -57,7 +58,7 @@ async def test_cancel_preserves_exception_despite_store_failure(store, path, fai
             if path == "resume"
             else a.submit_tool_results(run_id, results)
         )
-        await asyncio.wait_for(entered.wait(), 5)
+        await wait_for_gate(entered, task=task)
         task.cancel("original cancellation")
         with pytest.raises(asyncio.CancelledError) as caught:
             await task

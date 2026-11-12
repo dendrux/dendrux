@@ -10,6 +10,7 @@ from dendrux.loops.react import ReActLoop
 from dendrux.runtime import runner
 from dendrux.runtime.runner import _create_runtime_run
 from dendrux.types import ToolResult, generate_ulid
+from tests._helpers.gates import wait_for_gate
 from tests.integration.test_060_ownership_cancellation import invocation
 
 
@@ -33,7 +34,7 @@ async def test_task_returning_store_preserves_cancel(store, engine, monkeypatch)
     agent, call, _, _, calls = await invocation("run", store, engine)
     task = asyncio.create_task(call)
     try:
-        await asyncio.wait_for(entered.wait(), 5)
+        await wait_for_gate(entered, task=task)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(task, 5)
@@ -70,7 +71,7 @@ async def test_precommit_unwind_failure_has_identity(store, engine, monkeypatch,
     monkeypatch.setattr(store, "_write_tx", fail_unwind)
     task = asyncio.create_task(call)
     try:
-        await asyncio.wait_for(entered.wait(), 5)
+        await wait_for_gate(entered, task=task)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(task, 5)
@@ -96,7 +97,7 @@ async def test_cancel_drain_passes_known_run_id(monkeypatch, caplog):
 
     monkeypatch.setattr(runner, "_persist_task_cancellation", failing)
     task = asyncio.create_task(runner._drain_task_cancellation(None, run_id, False))
-    await asyncio.wait_for(entered.wait(), 5)
+    await wait_for_gate(entered, task=task)
     task.cancel()
     await asyncio.sleep(0)
     release.set()
@@ -189,9 +190,9 @@ async def test_handoff_second_cancel_failure_carries_run_id(store, monkeypatch, 
     monkeypatch.setattr(durability, "_flush_live_updates", flush)
     task = asyncio.create_task(_create_runtime_run(store, ReActLoop(), run_id, "second-cancel"))
     try:
-        await asyncio.wait_for(parked.wait(), 5)
+        await wait_for_gate(parked, task=task)
         task.cancel()
-        await asyncio.wait_for(cleanup_flush.wait(), 5)
+        await wait_for_gate(cleanup_flush, task=task)
         task.cancel()
         release.set()
         with pytest.raises(asyncio.CancelledError):

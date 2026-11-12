@@ -8,6 +8,7 @@ import pytest
 
 from dendrux import Agent, tool
 from dendrux.types import LLMResponse, RunStatus, ToolCall
+from tests._helpers.gates import wait_for_gate
 from tests._helpers.scripted_provider import ScriptedLLM
 from tests.integration.test_tenant_run_control import _pause
 
@@ -44,7 +45,7 @@ async def test_fenced_stream_yields_persisted_outcome(store, monkeypatch, resume
 
     task = asyncio.create_task(consume())
     try:
-        await asyncio.wait_for(provider.entered.wait(), 5)
+        await wait_for_gate(provider.entered, task=task)
         assert await store.sweep_stale_runs(dt.timedelta(0))
         provider.gate.set()
         events = await asyncio.wait_for(task, 5)
@@ -94,7 +95,7 @@ async def test_fenced_stream_preserves_live_winner_status(
 
     task = asyncio.create_task(consume())
     try:
-        await asyncio.wait_for(provider.entered.wait(), 5)
+        await wait_for_gate(provider.entered, task=task)
         run_id = stream.run_id
         old = (await store.get_run_control(run_id)).claim_epoch
         assert await store.try_pause_run(

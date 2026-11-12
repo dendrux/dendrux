@@ -11,6 +11,7 @@ from dendrux.errors import PersistenceError, RunFencedError
 from dendrux.runtime.persistence import PersistenceRecorder
 from dendrux.runtime.stores._factory import store_for_engine
 from dendrux.types import LLMResponse, Message, Role, ToolCall, ToolResult, generate_ulid
+from tests._helpers.gates import wait_for_gate
 from tests._helpers.v030_oracle import create_sqlite_engine
 
 
@@ -110,7 +111,7 @@ async def test_format1_tool_start_cancels_the_progress_write(store, monkeypatch)
     task.cancel()
     try:
         # The write must observe cancellation without waiting for release.
-        await asyncio.wait_for(cancelled.wait(), timeout=1)
+        await wait_for_gate(cancelled, task=task)
         with pytest.raises(asyncio.CancelledError):
             await task
         assert not completed

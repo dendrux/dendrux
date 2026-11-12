@@ -9,6 +9,7 @@ from dendrux import Agent, tool
 from dendrux.llm.mock import MockLLM
 from dendrux.runtime.context import get_delegation_context
 from dendrux.types import LLMResponse, ToolCall
+from tests._helpers.gates import wait_for_gate
 
 
 async def test_a10_intent_precedes_execution_and_completion_is_atomic(store, monkeypatch):
@@ -67,7 +68,7 @@ async def test_a20_completion_commits_while_sibling_is_running(store):
     async def slow() -> str:
         """Wait for a sibling's committed completion."""
         slow_started.set()
-        await asyncio.wait_for(fast_done.wait(), 5)
+        await wait_for_gate(fast_done)
         run = get_delegation_context().run_id
         async with asyncio.timeout(10):
             while True:
@@ -127,7 +128,7 @@ async def test_stream_lease_survives_consumer_yield_without_cancellation(store, 
             if event.type == RunEventType.TEXT_DELTA:
                 count = len(touches)
                 renewed.clear()
-                await asyncio.wait_for(renewed.wait(), 30)
+                await wait_for_gate(renewed)
                 assert len(touches) > count
                 assert asyncio.current_task().cancelling() == 0
                 break

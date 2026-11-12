@@ -11,6 +11,7 @@ from dendrux.llm.mock import MockLLM
 from dendrux.runtime.context import get_delegation_context
 from dendrux.runtime.replay import rebuild_history
 from dendrux.types import Limits, LLMResponse, ToolCall, ToolResult
+from tests._helpers.gates import wait_for_gate
 
 
 async def test_large_parallel_history_never_rewrites(store):
@@ -403,7 +404,7 @@ async def test_parallel_tool_projection_serializes_the_shared_engine(store, monk
         try:
             # Large-text detectors/redaction yield to worker threads. The
             # engine's mapping/counters must not be mutated by sibling scans.
-            await asyncio.wait_for(all_tools.wait(), timeout=5)
+            await wait_for_gate(all_tools)
             await asyncio.sleep(0)
             return await scan(self, message, **kwargs)
         finally:

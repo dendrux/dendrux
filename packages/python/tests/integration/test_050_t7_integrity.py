@@ -24,6 +24,7 @@ from dendrux.runtime.runner import resume_claimed
 from dendrux.runtime.state import claimed_store
 from dendrux.runtime.submit import GOVERNANCE_KEY, governance_snapshot
 from dendrux.types import Budget, LLMResponse, RunStatus, ToolCall, ToolResult
+from tests._helpers.gates import wait_for_gate
 from tests._helpers.scripted_provider import ScriptedLLM, tool_call
 
 
@@ -77,7 +78,7 @@ async def test_duplicate_resume_stream_cannot_finalize_owner(store):
         )
     )
     try:
-        await asyncio.wait_for(llm.entered.wait(), 5)
+        await wait_for_gate(llm.entered, task=owner)
         losers = await asyncio.gather(
             *[
                 consume(
@@ -146,7 +147,7 @@ async def test_swept_worker_stops_before_next_llm_or_tool(store, entry):
         action = a.run("go") if entry == "run" else consume(a.stream("go"))
     task = asyncio.create_task(action)
     try:
-        await asyncio.wait_for(entered.wait(), 5)
+        await wait_for_gate(entered, task=task)
         if not entry.startswith("resume"):
             rid = (await store.list_runs())[0].id
         before = await epoch_of(store, rid)
@@ -197,7 +198,7 @@ async def test_fresh_pause_id_wins_over_stale_submissions(store):
         a.submit_tool_results(first.run_id, [result_for(second)], expected_pause_id=second.pause_id)
     )
     try:
-        await asyncio.wait_for(llm.entered.wait(), 5)
+        await wait_for_gate(llm.entered, task=fresh)
         stale = await asyncio.gather(
             *[
                 a.submit_tool_results(

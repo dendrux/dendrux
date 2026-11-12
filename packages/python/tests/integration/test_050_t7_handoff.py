@@ -6,6 +6,7 @@ import pytest
 
 from dendrux import Agent, tool
 from dendrux.types import LLMResponse, PauseState, RunStatus, UsageStats
+from tests._helpers.gates import wait_for_gate
 from tests._helpers.scripted_provider import ScriptedLLM, tool_call
 from tests.integration.test_050_t7_integrity import client_read, result_for
 
@@ -120,7 +121,7 @@ async def test_sweep_during_llm_stops_the_returned_tool_before_execution(store, 
         action = a.run("go") if entry == "run" else consume(a.stream("go"))
     task = asyncio.create_task(action)
     try:
-        await asyncio.wait_for(provider.entered.wait(), 5)
+        await wait_for_gate(provider.entered, task=task)
         assert await store.sweep_stale_runs(dt.timedelta(0))
     finally:
         provider.gate.set()

@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests._helpers.gates import wait_for_gate
 from tools import load
 from tools import load_monitor as monitor
 
@@ -44,7 +45,7 @@ async def test_cancelling_stop_propagates_after_connection_cleanup(monkeypatch, 
     monkeypatch.setattr(sampler, "sample", sample)
     task = asyncio.create_task(sampler.stop(1))
     try:
-        await asyncio.wait_for(entered.wait(), 1)
+        await wait_for_gate(entered, task=task)
         task.cancel()
         if phase == "close":
             await asyncio.sleep(0.01)

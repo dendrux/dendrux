@@ -9,6 +9,7 @@ from dendrux.errors import PersistenceError, StoreOutcomeUnknown
 from dendrux.runtime import runner
 from dendrux.types import RunStatus
 from tests._fixtures.storage import pin_storage_format
+from tests._helpers.gates import wait_for_gate
 from tests._helpers.recovery_checkpoint import expire
 from tests._helpers.runtime_paths import ProbeProvider, path_case
 from tests._helpers.scripted_provider import tool_call
@@ -75,7 +76,7 @@ async def test_stale_setup_release_cannot_change_new_claim(
         patcher.setattr(store, "get_next_trace_index", fail_read)
         task = asyncio.create_task(invoke_failure(case, entry))
         try:
-            await asyncio.wait_for(entered.wait(), 10)
+            await wait_for_gate(entered, task=task)
             old = await store.get_run(case.run_id)
             if entry == "recovery":
                 item = await expire(store, engine, case.run_id)
@@ -166,7 +167,7 @@ async def test_cancel_request_wins_setup_release(store, engine, monkeypatch, ent
     monkeypatch.setattr(store, "get_next_trace_index", fail_read)
     task = asyncio.create_task(invoke_failure(case, entry))
     try:
-        await asyncio.wait_for(entered.wait(), 10)
+        await wait_for_gate(entered, task=task)
         await store.request_cancel(case.run_id)
         proceed.set()
         await asyncio.wait_for(task, 10)

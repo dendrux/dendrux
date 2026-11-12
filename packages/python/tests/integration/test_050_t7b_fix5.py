@@ -9,6 +9,7 @@ from sqlalchemy.sql.selectable import Select
 
 from dendrux import sweep
 from dendrux.db.models import AgentRun
+from tests._helpers.gates import wait_for_gate
 
 
 async def test_legacy_pause_requires_both_clocks_to_be_stale(store, engine):
@@ -148,7 +149,7 @@ async def test_exclusive_migration_lock_timeout_is_retryable(engine, phase, reco
             event.listen(target.sync_engine.__class__, "before_cursor_execute", before)
             task = asyncio.create_task(asyncio.to_thread(migrate))
             try:
-                await asyncio.wait_for(reached.wait(), 20)
+                await wait_for_gate(reached, task=task)
                 # ACCESS SHARE permits writers, but blocks the short exclusive DDL.
                 await blocker.execute(text("SELECT id FROM agent_runs LIMIT 1"))
                 started = time.perf_counter()

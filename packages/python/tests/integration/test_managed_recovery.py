@@ -31,6 +31,7 @@ from dendrux.runtime import _managed
 from dendrux.runtime.context import get_delegation_context
 from dendrux.runtime.stores._factory import store_for_engine
 from dendrux.types import LLMResponse, RunStatus, ToolCall
+from tests._helpers.gates import wait_for_gate
 from tests._helpers.recovery_checkpoint import expire
 from tests._helpers.scripted_provider import ScriptedLLM
 
@@ -710,7 +711,7 @@ async def test_pg_root_controls_never_steal_a_healthy_running_child(engine: Any)
     store = store_for_engine(engine)
     workflow = lead(store, root_llm, reviewer(gated))
     owner = asyncio.create_task(workflow.run("go", tenant_id=TENANT))
-    await asyncio.wait_for(gated.entered.wait(), 30)
+    await wait_for_gate(gated.entered, task=owner)
     root_id = await root_id_of(engine)
     before = await _snapshot(engine, root_id)
     try:

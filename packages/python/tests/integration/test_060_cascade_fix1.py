@@ -18,6 +18,7 @@ from dendrux.runtime import durability
 from dendrux.runtime.stores._factory import store_for_engine
 from dendrux.types import generate_ulid
 from tests._helpers.db_errors import locked_error
+from tests._helpers.gates import wait_for_gate
 
 
 @asynccontextmanager
@@ -90,7 +91,7 @@ async def test_sqlite_file_creator_lock_closes_admission(
         )
         cancellation = retry_seen = None
         try:
-            await asyncio.wait_for(checked.wait(), 10)
+            await wait_for_gate(checked, task=creation)
             started = time.perf_counter()
             cancellation = asyncio.create_task(agent.cancel_run(root, cascade=True, tenant_id="t"))
             retry_seen = asyncio.create_task(retried.wait())

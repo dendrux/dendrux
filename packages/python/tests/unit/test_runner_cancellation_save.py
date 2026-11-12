@@ -10,6 +10,7 @@ from dendrux._meta_keys import CANCEL_PERSISTED_META_KEY
 from dendrux.runtime import runner
 from dendrux.runtime.persistence import PersistenceRecorder
 from dendrux.types import RunEvent, RunEventType, RunStatus
+from tests._helpers.gates import wait_for_gate
 from tests.unit.test_runner_failure_save import entry_case, observer
 from tests.unit.test_runner_failure_save import store as store  # noqa: F401
 
@@ -188,7 +189,7 @@ async def test_resume_close_before_context_does_not_emit_or_finish(store, monkey
     stream = invoke(notifier)
     iterator = aiter(stream)
     pulling = asyncio.create_task(anext(iterator))
-    await asyncio.wait_for(entered.wait(), 5)
+    await wait_for_gate(entered, task=pulling)
     if not won:
         await store.finalize_run(stream.run_id, status="success", expected_current_status="running")
     read = AsyncMock(wraps=store.get_run)

@@ -12,6 +12,7 @@ import contextlib
 import pytest
 
 from dendrux.runtime.tasks import RunTaskManager
+from tests._helpers.gates import wait_for_gate
 
 
 async def test_take_interrupt_without_a_current_task_is_a_noop() -> None:
@@ -232,8 +233,8 @@ async def test_owned_task_interrupt_follows_registration_order(target_index):
     other = manager.spawn("other", unrelated())
     task = manager.spawn(runs[0], work())
     try:
-        await asyncio.wait_for(other_ready.wait(), 5)
-        await asyncio.wait_for(ready.wait(), 5)
+        await wait_for_gate(other_ready, task=other)
+        await wait_for_gate(ready, task=task)
         assert manager.cancel(runs[target_index])
         assert manager.cancel(runs[target_index]), "repeated signal must remain idempotent"
         assert await asyncio.wait_for(task, 5) == 1
@@ -276,11 +277,11 @@ async def test_replaced_owner_cleans_only_its_own_pending_interrupt(observe):
     old = manager.spawn(run_id, work(old_ready, finish_old, old=True))
     new = None
     try:
-        await asyncio.wait_for(old_ready.wait(), 5)
+        await wait_for_gate(old_ready, task=old)
         assert manager.cancel(run_id)
-        await asyncio.wait_for(old_cancelled.wait(), 5)
+        await wait_for_gate(old_cancelled, task=old)
         new = manager.spawn(run_id, work(new_ready, finish_new, old=False))
-        await asyncio.wait_for(new_ready.wait(), 5)
+        await wait_for_gate(new_ready, task=new)
         assert manager.cancel(run_id)
         await asyncio.sleep(0)
         finish_old.set()

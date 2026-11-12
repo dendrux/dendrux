@@ -34,6 +34,7 @@ from dendrux.types import (
     ToolCall,
 )
 from tests._helpers.gated_provider import GatedStreamLLM
+from tests._helpers.gates import wait_for_gate
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -105,7 +106,7 @@ async def _drive(
     events: list[RunEvent] = []
 
     async def _fire() -> None:
-        await asyncio.wait_for(provider.first_sent.wait(), timeout=5)
+        await wait_for_gate(provider.first_sent)
         interrupt.set()
 
     firer = asyncio.create_task(_fire())

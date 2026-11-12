@@ -5,6 +5,7 @@ import pytest
 from dendrux import Agent, run
 from dendrux.runtime.runner import run_stream
 from dendrux.types import LLMResponse, RunEventType
+from tests._helpers.gates import wait_for_gate
 from tests._helpers.scripted_provider import ScriptedLLM
 
 
@@ -198,7 +199,7 @@ async def test_cleanup_failure_cannot_replace_the_callers_cancellation():
 
     task = asyncio.create_task(_shielded_cleanup(cleanup))
     try:
-        await asyncio.wait_for(entered.wait(), 5)
+        await wait_for_gate(entered, task=task)
         task.cancel("caller cancellation")
         await asyncio.sleep(0)
         assert not task.done()

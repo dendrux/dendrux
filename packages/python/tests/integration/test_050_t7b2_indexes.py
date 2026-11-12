@@ -7,6 +7,7 @@ import time
 import pytest
 from sqlalchemy import event, text
 
+from tests._helpers.gates import wait_for_gate
 from tests.integration._migration_schema import migration_schema
 from tests.integration._migration_schema import test_database_url as pg_url
 from tests.integration.test_050_t7b_fix3 import _prior_schema
@@ -53,7 +54,7 @@ async def test_concurrent_index_wait_is_bounded_and_retry_repairs(engine, action
             event.listen(target.sync_engine.__class__, "before_cursor_execute", before)
             task = asyncio.create_task(asyncio.to_thread(migrate))
             try:
-                await asyncio.wait_for(reached.wait(), 20)
+                await wait_for_gate(reached, task=task)
                 await blocker.execute(
                     text("UPDATE agent_runs SET iteration_count=1 WHERE id='run-000001'")
                 )
