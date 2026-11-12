@@ -82,6 +82,8 @@ dev = [
     # Fast loop (make test-fast) and the flaky quarantine. See tools/QUALITY.md, "Test tiers".
     "pytest-testmon==2.2.0",
     "pytest-rerunfailures==16.7",
+    # Per-test time limit (timeout = 300 below); see tools/QUALITY.md, "Test timeout".
+    "pytest-timeout==2.4.0",
     # Quality gates (see tools/ and .importlinter).
     "radon==6.0.1",
     # Quality ratchets compare against committed baselines. Tool upgrades are deliberate;
@@ -250,7 +252,9 @@ disallow_untyped_defs = false
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# faulthandler dumps all thread stacks at 240 s; pytest-timeout fails the test at 300 s.
 faulthandler_timeout = 240
+timeout = 300
 testpaths = ["tests"]
 markers = [
     "benchmark: environment-dependent Postgres measurements (HOT statistics, writer stall during a 300k-row migration); excluded from make test, make ci and CI, run with make bench on a quiet machine",

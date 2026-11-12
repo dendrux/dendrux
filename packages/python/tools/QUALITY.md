@@ -61,6 +61,7 @@ unchanged.
 | `make cycles` | `tools/import_cycles.py` | A module import cycle appears, a module joins a baselined cycle, or two cycles merge. Only top-level runtime imports count: `if TYPE_CHECKING:` blocks and imports inside functions are ignored. `python tools/import_cycles.py report` also lists the cycles that function-level imports hide (information only). Baseline: `import_cycles_baseline.json`. |
 | `make semgrep` | `tools/semgrep_ratchet.py` | A rule in `.semgrep/dendrux.yml` has a new match, or more matches in a function that already had some; or a rule stops passing its fixture. Baseline: `semgrep_baseline.json` (rule, module, function). |
 | `make crap` | `tools/crap_ratchet.py` | A new function scores above 30; complexity rises and the function scores above 30; or edited code exceeds its own recorded CRAP baseline. An edited function may remain above 30 when neither complexity nor CRAP rises. Unchanged code retains the 0.5-point noise band and the warning allowance for rises up to 25 percent. Backend-only local coverage is handled explicitly below. Needs `coverage.json` from `make test`. Baseline: `crap_baseline.json`. |
+| `make stale-patches` | `tools/stale_patch_lint.py` | A test patches a name that its module only re-exports (imports and never uses), so the patch silently does nothing. Zero allowed; a missing `stale_patch_baseline.json` means none allowed. |
 
 ### Size and Ruff counts
 
@@ -353,6 +354,42 @@ balanced by the per-file seconds in `tests/_helpers/tier_lists/file_weights.json
 `python-coverage` job combines the four files of a leg, applies the 80 percent floor and runs the
 CRAP ratchet on the whole. Lint, types and architecture run once per leg, on shard 1.
 `make test-shard-proof` checks the shards are a disjoint cover of the test files.
+
+## Split tooling (moving code between modules)
+
+Three tools prove a split changed nothing but where code lives. All are pure AST work and
+need no database.
+
+| Tool | Use |
+|---|---|
+| `tools/move_check.py` | Compares the old module at a git ref with the old and new modules now. Passes only when every top-level function, class, constant and statement is in exactly one module afterwards with an identical `ast.dump` (docstrings and defaults included). Import statements, the module docstring and `__all__` are ignored. A method may move to a new mixin class that is a direct base of the original class (the method body must be identical). Anything missing, duplicated, extra or changed fails with a diff of the first mismatch. |
+| `tools/patch_codemod.py` | Rewrites `monkeypatch.setattr`, `patch(...)` and `patch.object` targets in `tests/` from the old module to the module that now defines the name. String targets and module aliases only. Dry run prints a diff; `--write` applies it. |
+| `tools/stale_patch_lint.py` | `make stale-patches`, part of `make quality`: fails when a test patches a pure re-export (see the table above). It turns the silent no-op after a split into a red check. |
+
+To prove a move PR (run from `packages/python`; `BASE` is the ref before the move):
+
+```sh
+make move-check BASE=<ref> OLD=src/dendrux/runtime/runner.py \
+  NEW="src/dendrux/runtime/a.py src/dendrux/runtime/b.py" \
+  MOVE_ARGS="--require-reexports --emit-map /abs/path/map.json"
+python tools/patch_codemod.py --map /abs/path/map.json tests          # read the diff
+python tools/patch_codemod.py --map /abs/path/map.json --write tests
+ruff check --select F401 --fix tests && ruff format tests
+make stale-patches
+```
+
+`--allow-new NAME...` admits a named new definition (for example a shared attribute base) and
+the output lists it, so a reviewer reads it by hand. `--require-reexports` also fails when a
+moved public name is no longer importable from the old module.
+
+## Test timeout
+
+`pytest-timeout` (dev extra, exact pin) stops any test that runs longer than `timeout = 300`
+seconds and fails it with the stack. It sits above `faulthandler_timeout = 240`, which dumps
+every thread's stack at 240 s, so a hang shows where it is stuck before the test is failed.
+Both are in `pyproject.toml`. `make bench` runs the benchmarks serially with `--timeout=1800`
+because the migration benchmark legitimately runs longer than a unit test. To give one test
+more time, mark it `@pytest.mark.timeout(<seconds>)` and say why.
 
 ## Notes
 

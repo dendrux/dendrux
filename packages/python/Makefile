@@ -1,4 +1,4 @@
-.PHONY: dev-sync cov-mysql test test-fast test-area test-pg test-kit test-merge test-lists test-shard-proof test-model-check test-model-install test-dbs-up test-dbs-down test-redis-up test-redis-down test-redis test-mysql bench load load-quick load-pg load-mysql load-mariadb lint typecheck arch crap cognitive size ruff-ratchet duplicates deadcode cycles semgrep quality quality-stamp api-check format package-smoke ci clean
+.PHONY: dev-sync cov-mysql test test-fast test-area test-pg test-kit test-merge test-lists test-shard-proof test-model-check test-model-install test-dbs-up test-dbs-down test-redis-up test-redis-down test-redis test-mysql bench load load-quick load-pg load-mysql load-mariadb lint typecheck arch crap cognitive size ruff-ratchet duplicates deadcode cycles semgrep stale-patches move-check quality quality-stamp api-check format package-smoke ci clean
 .DEFAULT_GOAL := test
 
 # Match a fresh CI install: exact dev tools and the newest allowed runtime dependencies.
@@ -128,7 +128,20 @@ semgrep:
 	python tools/semgrep_ratchet.py test
 	python tools/semgrep_ratchet.py check
 
-quality: cognitive duplicates deadcode cycles semgrep crap size ruff-ratchet
+# Stale-patch guard: fails when a test patches a re-export that its module never uses (the patch
+# would silently do nothing). Part of `make quality`.
+stale-patches:
+	python tools/stale_patch_lint.py check
+
+# Prove a refactor only moved code (tools/move_check.py). Usage:
+#   make move-check BASE=<git ref> OLD=src/dendrux/x/old.py NEW="src/dendrux/x/a.py src/dendrux/x/b.py"
+# Add MOVE_ARGS="--allow-new _StoreAttrs --require-reexports --emit-map /path/map.json" as needed.
+# Then rewrite the tests' patch targets with tools/patch_codemod.py (dry run by default).
+move-check:
+	@test -n "$(BASE)" -a -n "$(OLD)" -a -n "$(NEW)" || { echo "usage: make move-check BASE=<ref> OLD=<path> NEW=\"<paths>\""; exit 2; }
+	python tools/move_check.py --base "$(BASE)" --old "$(OLD)" --new $(NEW) $(MOVE_ARGS)
+
+quality: cognitive duplicates deadcode cycles semgrep crap size ruff-ratchet stale-patches
 
 quality-stamp:
 	python tools/size_ratchet.py stamp
@@ -175,7 +188,7 @@ test-mysql:
 # run on a quiet machine (nothing else using Postgres) and record the numbers in the load-test
 # results doc. Needs DENDRUX_TEST_PG_URL.
 bench:
-	pytest tests/ -v -rs -n 0 -m benchmark -p no:randomly
+	pytest tests/ -v -rs -n 0 -m benchmark -p no:randomly --timeout=1800
 
 # Scale evidence. Needs a private Postgres database whose name ends in _test (the script drops
 # its tables), given as DENDRUX_LOAD_PG_URL. `load` is the full run (tens of minutes, run it on a

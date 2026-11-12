@@ -466,6 +466,9 @@ jobs:
       - name: Dead code
         run: python tools/vulture_ratchet.py check
 
+      - name: Stale test patches
+        run: python tools/stale_patch_lint.py check
+
       - name: Import cycles
         run: python tools/import_cycles.py check
 
