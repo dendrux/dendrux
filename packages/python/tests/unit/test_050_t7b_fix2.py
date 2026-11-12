@@ -70,7 +70,8 @@ def test_status_writer_inventory():
         "claim_paused_run": 2,
         "submit_and_claim": 1,
         "release_run_claim": 1,
-        "_sweep_runs": 1,
+        # Sweep CAS per row (0.7: split out of _sweep_runs with the managed-wait recheck).
+        "sweep_row": 1,
         "_scan_expired_runs": 1,
         "reclaim_run": 1,
     }, f"audit every status writer: {writers}"
