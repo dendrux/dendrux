@@ -855,10 +855,11 @@ async def test_recovered_pre_bind_handoff_binds_once_not_a_client_pause(
     assert seen == [REPORT]
 
 
-async def test_recovered_mixed_pending_batch_is_refused_before_effects(
+async def test_recovered_mixed_pending_batch_runs_the_server_call_then_binds(
     store: Any, engine: Any, monkeypatch: Any
 ) -> None:
-    """A managed call still pending beside an ordinary one: explicit staged refusal."""
+    """A managed call still pending beside an ordinary one (T4, B4): recovery prepares
+    both, runs the server call, then binds the managed call once."""
     from dendrux.loops import react
 
     batch = LLMResponse(
@@ -874,15 +875,14 @@ async def test_recovered_mixed_pending_batch_is_refused_before_effects(
     root_id = await root_id_of(engine)
     effects.clear()
     item = await expire(store, engine, root_id)
-    child_llm, root_llm = ContextLLM([]), ContextLLM([])
+    child_llm = ContextLLM([LLMResponse(text=REPORT)])
+    root_llm = ContextLLM([LLMResponse(text="root done")])
     fresh = _recovery_root(store, root_llm, _named("reviewer", child_llm))
-    with pytest.raises(ManagedUnsupportedError) as info:
-        await fresh.reclaim(root_id, tenant_id=TENANT, item=item)
-    assert info.value.operation == "recover_mixed_batch"
-    assert effects == [] and child_llm.calls == 0 and root_llm.calls == 0
-    assert not await rows(engine, AgentRun, AgentRun.parent_run_id == root_id)
-    row = (await rows(engine, AgentRun, AgentRun.id == root_id))[0]
-    assert row.status != "waiting_client_tool"
+    result = await fresh.reclaim(root_id, tenant_id=TENANT, item=item)
+    assert result.status == RunStatus.SUCCESS
+    assert sorted(effects) == ["fetch", "hook:fetch", "hook:reviewer"]
+    assert child_llm.calls == 1 and root_llm.calls == 1
+    assert len(await rows(engine, AgentRun, AgentRun.parent_run_id == root_id)) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1142,10 +1142,11 @@ def _die_sync(*args: Any, **kwargs: Any) -> Any:
 
 
 @pytest.mark.parametrize("decision", ["deny", "approval"])
-async def test_r4a_unadmitted_pending_call_is_refused_before_policy_or_child(
+async def test_r4a_unadmitted_pending_call_is_admitted_by_the_recovered_policy(
     store: Any, engine: Any, monkeypatch: Any, decision: str
 ) -> None:
-    """Crash before preparation: no admission evidence, so no bind and no hook."""
+    """Crash before preparation (T4, B4): recovery runs the parent's policy once; this
+    hook denies (an approval decision on a managed call is a denial), so no child."""
     from dendrux.loops import react
 
     first = _hooked_root(
@@ -1161,11 +1162,11 @@ async def test_r4a_unadmitted_pending_call_is_refused_before_policy_or_child(
     effects.clear()
     item = await expire(store, engine, root_id)
     child_llm = ContextLLM([LLMResponse(text=REPORT)])
-    fresh = _hooked_root(store, ContextLLM([]), child_agent(child_llm), decision)
-    with pytest.raises(ManagedUnsupportedError) as info:
-        await fresh.reclaim(root_id, tenant_id=TENANT, item=item)
-    assert info.value.operation == "recover_unadmitted_call"
-    assert effects == [] and child_llm.calls == 0
+    root_llm = ContextLLM([LLMResponse(text="ok")])
+    fresh = _hooked_root(store, root_llm, child_agent(child_llm), decision)
+    result = await fresh.reclaim(root_id, tenant_id=TENANT, item=item)
+    assert result.status == RunStatus.SUCCESS
+    assert effects == ["hook:reviewer"] and child_llm.calls == 0
     assert not await rows(engine, AgentRun, AgentRun.parent_run_id == root_id)
 
 
