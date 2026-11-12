@@ -23,6 +23,7 @@ from dendrux import Agent, tool
 from dendrux.db.models import AgentRun, ReactTrace, RunEvent, TokenUsage, ToolCallRecord
 from dendrux.errors import (
     ManagedChildControlError,
+    RunCancelledError,
     RunFencedError,
     RunNotReclaimableError,
 )
@@ -336,10 +337,13 @@ async def test_pg_cancel_versus_adoption_claim_never_revives_the_root(
             canceller.cancel_run(root_id, tenant_id=TENANT),
             return_exceptions=True,
         )
-        for r in results:  # only the ordinary live-owner refusal is acceptable
+        for r in results:
             if isinstance(r, BaseException):
-                assert isinstance(r, RunNotReclaimableError), r
-                assert r.reason in {"lease_fresh", "cancelled", "not_running"}, r.reason
+                assert isinstance(r, (RunNotReclaimableError, RunCancelledError)), r
+                if isinstance(r, RunNotReclaimableError):
+                    assert r.reason in {"lease_fresh", "cancelled", "not_running"}, r.reason
+                else:
+                    assert r.run_id == root_id and r.parent_run_id == root_id
         final = (await rows(engine, AgentRun, AgentRun.id == root_id))[0]
         intent = (await rows(engine, ToolCallRecord, ToolCallRecord.agent_run_id == root_id))[0]
         assert final.status in {"cancelled", "success"}
@@ -439,7 +443,9 @@ async def test_child_failure_and_oversize_preserve_outcome(
         for e in await rows(engine, RunEvent, RunEvent.agent_run_id == result.run_id)
         if e.event_type == "tool.completed"
     ]
-    assert completed[0].data["managed_outcome"] == "failed"
+    assert completed[0].data["managed_outcome"] == (
+        "cancelled" if kind == "cancelled" else "failed"
+    )
     assert completed[0].data["code"] == code
     calls_before = child_llm.calls
     # Reconnecting a finished workflow never reruns the child to fix delivery.

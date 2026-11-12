@@ -42,6 +42,7 @@ from dendrux._meta_keys import (
     STORE_SESSION_KEY,
     TOUCHED_RUNS_SESSION_KEY,
 )
+from dendrux.db.models import AgentRun
 from dendrux.runtime._blob_catalog import SQLBlobCatalog, write_blob_refs
 from dendrux.runtime._bounds import (
     DEFAULT_EVENT_LIMIT,
@@ -91,7 +92,6 @@ if TYPE_CHECKING:
     from sqlalchemy.sql.base import Executable
 
     from dendrux.db._live_updates import LiveUpdates
-    from dendrux.db.models import AgentRun
     from dendrux.media import BlobEdge
     from dendrux.runtime.stores._errors import DbError
     from dendrux.runtime.stores.sql._types import DialectFacts, InsertPlan
@@ -2415,18 +2415,8 @@ class SQLStateStore(SQLBlobCatalog):
             await self._write_tx(session)
 
     async def bind_managed_child(self, request: BindManagedChildRequest) -> BindManagedChildResult:
-        """Atomically bind one managed invocation to a fresh running child (internal, 0.7).
-
-        Works on a detached, validated snapshot of ``request`` taken before the
-        first await. One transaction under the parent's row lock: tenant, then an
-        existing binding (read back, never with execution authority), then the
-        parent's running status, claim epoch, cancellation, managed header,
-        outstanding binding, pending call and depth. It then parks the parent as a
-        v3 managed wait with its epoch retired, inserts the unique managed tool
-        intent, creates the child running with its managed header and seed, and
-        writes the intent event. Only the invocation that proves its own private
-        nonce on the intent row receives the child's execution token. No
-        provider, hook or user code runs inside.
+        """Validate/fence/bind under the parent's writer lock, without user code.
+        Only a proven creation winner executes; read-back resolves ambiguous commits.
         """
         from dendrux.runtime._capabilities import require_managed_subagents
         from dendrux.types import _validate_persistable
@@ -2493,6 +2483,7 @@ class SQLStateStore(SQLBlobCatalog):
                         AgentRun.status,
                         AgentRun.claim_epoch,
                         AgentRun.cancel_requested,
+                        self._managed_stop_predicate().label("root_stopped"),
                         AgentRun.storage_format,
                         AgentRun.delegation_level,
                         AgentRun.loop_state,
@@ -2515,11 +2506,7 @@ class SQLStateStore(SQLBlobCatalog):
     async def _bind_existing(
         self, session: AsyncSession, request: BindManagedChildRequest, parent: Any
     ) -> BindManagedChildResult | None:
-        """Read back this invocation's saved binding; refuse a missing or conflicting one.
-
-        The state is classified from the parent's lifecycle and the intent
-        outcome, never from one binding copy: see ``_existing_wait_id``.
-        """
+        """Read back an existing invocation without granting execution authority."""
         from dendrux.db.models import AgentRun, ToolCallRecord
         from dendrux.errors import ManagedStateError
 
@@ -2564,7 +2551,8 @@ class SQLStateStore(SQLBlobCatalog):
         from dendrux.runtime.context import DelegationDepthExceededError
 
         parent_id = request.parent_run_id
-        if parent.cancel_requested or parent.status in _TERMINAL_STATUS_VALUES:
+        cancelled = parent.cancel_requested or parent.root_stopped
+        if cancelled or parent.status in _TERMINAL_STATUS_VALUES:
             raise RunCancelledError(request.child_run_id, parent_id)
         if (
             parent.status != RunStatus.RUNNING.value
@@ -2818,7 +2806,7 @@ class SQLStateStore(SQLBlobCatalog):
         return statement.where(AgentRun.tenant_id.is_not_distinct_from(tenant_id))
 
     async def mark_cancel_requested(self, run_ids: Sequence[str], *, tenant_id: TenantScope) -> int:
-        """Mark a frontier in one statement before scanning its children."""
+        """Mark a same-tenant frontier before scanning committed children."""
         from sqlalchemy import update
 
         from dendrux.db.models import AgentRun
@@ -2855,8 +2843,7 @@ class SQLStateStore(SQLBlobCatalog):
     async def get_children_page(
         self, parent_ids: Sequence[str], *, after: str | None, limit: int, tenant_id: TenantScope
     ) -> list[str]:
-        """Read a tenant-scoped keyset page, capped at 500 children of a marked frontier."""
-
+        """Read at most 500 same-tenant child IDs using the indexed keyset seam."""
         from dendrux.db.models import AgentRun
 
         _positive_page(limit)
@@ -2882,10 +2869,33 @@ class SQLStateStore(SQLBlobCatalog):
             _raw_driver_errors=True,
         )
 
+    @_safe_database_call
+    async def _get_cancel_children_page(
+        self, parent_ids: Sequence[str], *, after: str | None, limit: int, tenant_id: TenantScope
+    ) -> list[Any]:
+        _positive_page(limit)
+        if not parent_ids:
+            return []
+        page = self.child_page_query(
+            runs=AgentRun.__table__,
+            parents=[RunParentCursor(parent, after) for parent in sorted(set(parent_ids))],
+            tenant_scope=tenant_id,
+            page_size=min(limit, MAX_SMALL_PAGE),
+        ).subquery("cancel_children")
+        statement = (
+            select(
+                AgentRun.id,
+                AgentRun.parent_run_id,
+                self.json_get(AgentRun.loop_state, (MANAGED_HEADER_KEY,), "json"),
+            )
+            .join(page, AgentRun.id == page.c.id)
+            .order_by(AgentRun.id)
+        )
+        async with self._session_factory() as session:
+            return list((await session.execute(statement)).all())
+
     async def get_loop_state(self, run_id: str) -> dict[str, Any] | None:
         """Read the authoritative execution projection."""
-        from sqlalchemy import select
-
         from dendrux.db.models import AgentRun
 
         async with self._session_factory() as session:
@@ -3097,22 +3107,13 @@ class SQLStateStore(SQLBlobCatalog):
         error_info: dict[str, Any] | None = None,
         failure_reason: str | None = None,
     ) -> bool:
-        """Finalize a run. Returns True if the update was applied.
-
-        Args:
-            expected_current_status: If provided, only updates the row if the
-                current DB status matches. Returns False if status has changed
-                (e.g. already cancelled). This prevents cancel/finalize races.
-            pii_mapping: Final guardrail PII mapping. Persists past finalize
-                (audit-first — framework never auto-clears).
-        """
+        """Finalize with monotonic status guards; an optional epoch fences writes."""
         from sqlalchemy import update
 
         from dendrux.db.models import AgentRun
 
         async def _attempt() -> bool:
             async with self._session_factory() as session:
-                # updated_at is filled by the model's onupdate hook (Python aware-UTC).
                 values: dict[str, Any] = {
                     **_status_values(status),
                     **_final_progress(status, answer, claim_epoch),
@@ -3129,15 +3130,10 @@ class SQLStateStore(SQLBlobCatalog):
                         failure_reason,
                     )
                 )
-                # Clear pause_data on finalize (D1: execution state cleaned up)
                 values["pause_data"] = None
-                # Clear cooperative cancel flag — terminal state is final;
-                # a stale True here would confuse later audits.
                 values["cancel_requested"] = False
                 values["pause_requested"] = False
 
-                # Conditional finalize: only update if status is still 'running'
-                # (or expected_status if provided). Prevents cancel/finalize races.
                 if expected_current_status is not None:
                     stmt = (
                         update(AgentRun)
@@ -3195,13 +3191,7 @@ class SQLStateStore(SQLBlobCatalog):
         failure_reason: str | None = None,
         claim_epoch: int | None = None,
     ) -> bool:
-        """Atomic CAS finalize over multiple acceptable current statuses.
-
-        One SQL ``UPDATE ... WHERE status IN (...)`` — collapses what
-        used to be N sequential CAS attempts into a single round-trip.
-        Mirrors :meth:`finalize_run`'s side-effects: clears ``pause_data``
-        and ``cancel_requested``.
-        """
+        """CAS-finalize eligible statuses, clearing pause and cancellation flags."""
 
         async def _attempt() -> bool:
             async with self._session_factory() as session:
@@ -3248,13 +3238,7 @@ class SQLStateStore(SQLBlobCatalog):
         trace: TraceWrite | None = None,
         event: EventWrite | None = None,
     ) -> int | None:
-        """:meth:`finalize_run_if_status_in` plus its lifecycle event, in one transaction.
-
-        The event's sequence index is allocated after the CAS took the row
-        lock, so nothing can observe the new status before the event is
-        durable and no two transition events share an index. Returns the
-        event's sequence index, or None when the CAS lost (nothing written).
-        """
+        """Atomically finalize eligible statuses and append the matching terminal event."""
 
         async def _attempt() -> int | None:
             async with self._session_factory() as session:
@@ -3330,7 +3314,6 @@ class SQLStateStore(SQLBlobCatalog):
 
         from dendrux.db.models import AgentRun
 
-        # updated_at is filled by the model's onupdate hook (Python aware-UTC).
         values: dict[str, Any] = {
             **_status_values(status),
             **_final_progress(status, answer, claim_epoch),
@@ -3413,18 +3396,13 @@ class SQLStateStore(SQLBlobCatalog):
         return bool(result.rowcount and result.rowcount > 0)
 
     async def request_cancel(self, run_id: str) -> bool:
-        """Set ``cancel_requested=True`` on a non-terminal run.
-
-        The terminal-status guard is part of the SQL UPDATE — no race
-        window between read and write.
-        """
+        """Flag nonterminal runs; return False for missing or terminal rows."""
         from sqlalchemy import update
 
         from dendrux.db.models import AgentRun
 
         async def _attempt() -> bool:
             async with self._session_factory() as session:
-                # updated_at is filled by the model's onupdate hook (Python aware-UTC).
                 stmt = (
                     update(AgentRun)
                     .where(
@@ -3484,17 +3462,13 @@ class SQLStateStore(SQLBlobCatalog):
         )
 
     async def is_cancel_requested(self, run_id: str) -> bool:
-        """Read ``cancel_requested`` flag. False for missing runs."""
-        from sqlalchemy import select
-
+        """Read the local flag; False for missing runs."""
         from dendrux.db.models import AgentRun
 
         async def _attempt() -> bool:
             async with self._session_factory() as session:
                 stmt = select(AgentRun.cancel_requested).where(AgentRun.id == run_id)
-                result = await session.execute(stmt)
-                row = result.first()
-                return bool(row[0]) if row is not None else False
+                return bool(await session.scalar(stmt))
 
         return await retry_transient_db(
             _attempt,
@@ -3504,9 +3478,37 @@ class SQLStateStore(SQLBlobCatalog):
             _raw_driver_errors=True,
         )
 
+    def _managed_root_key(self, column: Any) -> Any:
+        return self.json_get(column, (MANAGED_HEADER_KEY, "root_run_id"), "str")
+
+    def _managed_stop_predicate(self) -> Any:
+        root = AgentRun.__table__.alias("managed_root")
+        root_id = self._managed_root_key(AgentRun.loop_state)
+        live = (
+            select(root.c.id)
+            .where(
+                root.c.id == root_id,
+                root.c.tenant_id.is_not_distinct_from(AgentRun.tenant_id),
+                root.c.cancel_requested.is_(False),
+                root.c.status.notin_(_TERMINAL_STATUS_VALUES),
+            )
+            .exists()
+        )
+        return and_(root_id.is_not(None), ~live)
+
+    @_safe_database_call
+    async def _managed_root_stopped(self, run_id: str) -> bool:
+        """Read root eligibility without loading either run's history/checkpoint."""
+        async with self._session_factory() as session:
+            return bool(
+                await session.scalar(
+                    select(self._managed_stop_predicate()).where(AgentRun.id == run_id)
+                )
+            )
+
     async def get_run_control(self, run_id: str) -> RunControl:
         """One read of cancel / pause flags plus an EXISTS over undelivered notes."""
-        from sqlalchemy import literal, select
+        from sqlalchemy import literal
 
         from dendrux.db.models import AgentRun, RunInbox
 
@@ -3948,7 +3950,6 @@ class SQLStateStore(SQLBlobCatalog):
 
         async def _attempt() -> None:
             async with self._session_factory() as session:
-                # updated_at is filled by the model's onupdate hook (Python aware-UTC).
                 values: dict[str, Any] = {
                     **_status_values(status),
                     "pause_data": pause_data,
@@ -4270,7 +4271,6 @@ class SQLStateStore(SQLBlobCatalog):
                             (row["loop_state"] or {}).get("submission"),
                         )
                     )
-                # updated_at is filled by the model's onupdate hook (Python aware-UTC).
                 stmt = (
                     update(AgentRun)
                     .where(AgentRun.id == run_id, AgentRun.status == expected_status)

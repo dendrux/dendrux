@@ -1,29 +1,4 @@
-"""Managed subagents (0.7): the inline driver, the bind handoff and durable adoption.
-
-For ``await root.run(task)`` on an Agent with ``subagents=``:
-
-1. The parent's loop returns an in-memory handoff for one admitted subagent call.
-   :func:`prepare_handoff` makes the parent's checkpoint durable and returns a
-   descend marker; the parent's run frame then exits without pausing.
-2. :func:`drive` runs the child in the same caller task. The child's run entry
-   takes the invocation and creates the child through the store's atomic
-   ``bind_managed_child`` (parent parked as a v3 managed wait, its epoch
-   retired). Only the confirmed creator executes the child.
-3. When the child is terminal, :func:`adopt` turns its saved outcome into the
-   parent's tool observation: ``submit_and_claim`` on the parent's private wait
-   generation, then ``complete_tool_call`` with the binding cleared. The parent
-   then continues from its checkpoint, never from an old frame.
-
-:func:`reconnect` runs the same adoption and continuation after a restart; no
-step exists only in memory.
-
-Root routing (T3): a root-id continuation (``submit_*``, ``resume``,
-``resume_stream``) reaches the active leaf through the persisted bindings
-(:func:`route`), is validated and claimed with the leaf's own definition, and
-:func:`unwind` adopts finished outcomes back up to the root.
-:func:`workflow_stream` drives the same transitions for ``stream`` and
-``resume_stream``, advancing each run's generator in the caller's task.
-"""
+"""Managed subagents: same-task drive, atomic bind, durable adoption and root control."""
 
 from __future__ import annotations
 
@@ -33,9 +8,21 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 from dendrux import _codes
-from dendrux._lifecycle import TERMINAL_STATUSES, StoredEventType
-from dendrux.errors import ManagedStateError
-from dendrux.runtime.state import MANAGED_HEADER_KEY, ManagedHeader
+from dendrux._lifecycle import (
+    STORAGE_FORMAT_CHECKPOINTED,
+    TERMINAL_STATUSES,
+    CancelReason,
+    StoredEventType,
+)
+from dendrux.errors import (
+    ManagedChildControlError,
+    ManagedRootStoppedError,
+    ManagedStateError,
+    ManagedUnsupportedError,
+    RunCancelledError,
+    RunNotFoundError,
+)
+from dendrux.runtime.state import MANAGED_HEADER_KEY, ManagedHeader, require_store_method
 from dendrux.types import (
     PauseState,
     RunResult,
@@ -43,6 +30,7 @@ from dendrux.types import (
     ToolCall,
     ToolResult,
     UsageStats,
+    _usage_from_dict,
     generate_ulid,
 )
 
@@ -55,6 +43,37 @@ if TYPE_CHECKING:
     from dendrux.types import RunStream
 
 logger = logging.getLogger(__name__)
+
+
+async def cancel_scope(store: Any, record: RunRecord, *, cascade: bool) -> tuple[bool, str | None]:
+    """Force managed traversal; legacy inclusion is still caller-selected."""
+    if record.storage_format != STORAGE_FORMAT_CHECKPOINTED:
+        return cascade, None
+    getter = getattr(store, "get_loop_state", None)
+    value = (await getter(record.id) or {}).get(MANAGED_HEADER_KEY) if getter else None
+    if value is None:
+        return cascade, None
+    header = ManagedHeader.from_dict(value, run_id=record.id)
+    if header.parent_run_id is not None:
+        raise ManagedChildControlError(record.id)
+    if header.root_run_id != record.id:
+        raise ManagedStateError(reason="header_invalid", run_id=record.id)
+    require_cancellation(store, record.id)
+    return True, None if cascade else record.id
+
+
+def cancel_child_id(item: Any, root_run_id: str | None) -> str | None:
+    """Filter an explicit managed edge from a bounded projected child page."""
+    if root_run_id is None:
+        return str(item)
+    run_id, parent_id, value = item
+    if value is None:
+        return None
+    header = ManagedHeader.from_dict(value, run_id=run_id)
+    if header.root_run_id != root_run_id or header.parent_run_id != parent_id:
+        return None
+    return str(run_id)
+
 
 DESCEND_KEY = "managed_descend"
 """``RunResult.meta`` key: the parent exited at a managed handoff (in memory only)."""
@@ -73,18 +92,9 @@ CHILD_CANCELLED = "managed_child_cancelled"
 REPORT_INVALID = "managed_report_invalid"
 
 
-# ---------------------------------------------------------------------------
-# Data handed between the parent frame, the child entry and the driver
-# ---------------------------------------------------------------------------
-
-
 @dataclass(frozen=True)
 class ManagedInvocation:
-    """One admitted managed call of a parent at its claim epoch (in memory, typed).
-
-    The parent's run frame builds it after its checkpoint is durable; the
-    child's run entry turns it into a ``BindManagedChildRequest``.
-    """
+    """One admitted parent call, handed to the child entry for atomic binding."""
 
     store: Any
     tenant_id: str | None
@@ -105,7 +115,7 @@ class ManagedInvocation:
 
 @dataclass(frozen=True)
 class _Waiting:
-    """A parent waiting on one bound child (rebuilt from storage after a restart)."""
+    """A waiting parent rebuilt from storage."""
 
     parent_agent: Agent
     parent_run_id: str
@@ -127,11 +137,6 @@ def is_managed_root(agent: Agent) -> bool:
     return bool(getattr(agent, "_subagents", ()))
 
 
-# ---------------------------------------------------------------------------
-# Root entry
-# ---------------------------------------------------------------------------
-
-
 def require_root_entry(agent: Agent, store: StateStore | None, loop: Any) -> None:
     """Refuse a managed root that cannot run durably, before any write."""
     from dendrux.errors import PersistenceNotConfiguredError
@@ -142,6 +147,7 @@ def require_root_entry(agent: Agent, store: StateStore | None, loop: Any) -> Non
     if store is None:
         raise PersistenceNotConfiguredError()
     require_managed_subagents(store)
+    require_cancellation(store)
     if not isinstance(loop, ReActLoop):
         raise ValueError("Managed subagents need a ReAct parent loop.")
     _check_definitions(agent, unclaimed_store(store))
@@ -237,7 +243,11 @@ def parent_link(
 
 async def enter(agent: Agent, invocation: ManagedInvocation | None, store: Any, loop: Any) -> bool:
     """True for a managed root run; refuse one that cannot run durably."""
-    if invocation is not None or not is_managed_root(agent):
+    if invocation is not None:
+        if await cancellation_requested(store, invocation.parent_run_id):
+            raise RunCancelledError(invocation.child_run_id, invocation.root_run_id)
+        return False
+    if not is_managed_root(agent):
         return False
     require_root_entry(agent, store, loop)
     await require_checkpointed_creation(store)
@@ -256,11 +266,6 @@ def stamp_root_header(store: Any, run_id: str) -> None:
     state[MANAGED_HEADER_KEY] = ManagedHeader(root_run_id=run_id, path=()).to_dict()
 
 
-# ---------------------------------------------------------------------------
-# The parent's handoff (inside its run frame, before it exits)
-# ---------------------------------------------------------------------------
-
-
 async def prepare_handoff(
     store: StateStore,
     run_id: str,
@@ -268,12 +273,9 @@ async def prepare_handoff(
     recorder: LoopRecorder | None,
     provider_kwargs: dict[str, Any] | None,
 ) -> RunResult | None:
-    """Make the parent's checkpoint durable and return the descend marker.
+    """Checkpoint an admitted call and return its descend marker.
 
-    Returns None when cancellation was requested: the caller finalizes as for
-    any pause. The parent stays RUNNING at its epoch until the child's atomic
-    bind parks it.
-    """
+    None means cancellation won; the parent stays RUNNING until bind parks it."""
     from dendrux.loops._helpers import project_message
     from dendrux.loops.react import MANAGED_HANDOFF_KEY
     from dendrux.runtime.context import DelegationDepthExceededError, get_delegation_context
@@ -281,8 +283,7 @@ async def prepare_handoff(
     handoff = result.meta[MANAGED_HANDOFF_KEY]
     # Every bind, live or recovered, admits only a ReAct child (before any effect).
     _require_react(handoff.parent, handoff.child)
-    control = await store.get_run_control(run_id)
-    if control.cancel_requested:
+    if await cancellation_requested(store, run_id):
         return None
     header = ManagedHeader.from_dict(
         (getattr(store, "loop_state", None) or {}).get(MANAGED_HEADER_KEY), run_id=run_id
@@ -350,11 +351,6 @@ def _shared(store: Any) -> Any:
     from dendrux.runtime.state import unclaimed_store
 
     return unclaimed_store(store)
-
-
-# ---------------------------------------------------------------------------
-# The child's entry: the atomic bind instead of create_run
-# ---------------------------------------------------------------------------
 
 
 def intent_event(invocation: ManagedInvocation, child_run_id: str) -> EventWrite:
@@ -430,11 +426,6 @@ def not_owner_result(run_id: str) -> RunResult:
     return RunResult(run_id=run_id, status=RunStatus.RUNNING, meta={NOT_OWNER_KEY: True})
 
 
-# ---------------------------------------------------------------------------
-# The driver (same caller task, explicit trampoline)
-# ---------------------------------------------------------------------------
-
-
 async def drive(result: RunResult, *, notifier: LoopNotifier | None) -> RunResult:
     """Run descended children inline and unwind their outcomes to the root."""
     if not is_descend(result):
@@ -488,13 +479,10 @@ def _waiting_from(invocation: ManagedInvocation) -> _Waiting:
 async def _run_child(
     invocation: ManagedInvocation, notifier: LoopNotifier | None
 ) -> tuple[RunResult, bool]:
-    """Run the bound child in this task: ``(result, bound)``.
+    """Run a bound child in this task and return (result, bound).
 
-    A child that fails after its bind is adopted as a failed tool result (its
-    error stays on the child run). A bind that never happened leaves the
-    parent as the result: cancelled when the parent's cancel won, else the
-    parent records the failure and the error propagates.
-    """
+    Terminal failures are adopted; unbound cancellation stops the parent.
+    Other unbound failures are recorded and propagated."""
     from dendrux.runtime._subagents import _tighten
     from dendrux.runtime.context import managed_invocation_scope
     from dendrux.runtime.runner import _run_once
@@ -525,13 +513,10 @@ def _task(invocation: ManagedInvocation) -> str:
 async def _after_child_error(
     invocation: ManagedInvocation, exc: Exception
 ) -> tuple[RunResult, bool]:
-    """The child's run raised: ``(result, bound)``, or re-raise ``exc``.
+    """Resolve a child-entry failure for run and stream.
 
-    Shared by the run and stream drivers. Bound by another caller: not the
-    owner. Never bound: the parent is cancelled when its cancel won, else it
-    records the failure and ``exc`` propagates. A bound child that ended
-    terminal is adopted like any terminal child.
-    """
+    Existing bindings never grant new authority. Unbound cancellations stop
+    the parent; other unbound failures propagate after recording."""
     from dendrux.errors import RunCancelledError, RunFencedError
     from dendrux.types import RunAlreadyActiveError
 
@@ -642,11 +627,6 @@ async def _projected_pause(
         pause_id=pending.pause_id if pending is not None else None,
         pending=pending,
     )
-
-
-# ---------------------------------------------------------------------------
-# Adoption: one saved child outcome becomes one parent observation
-# ---------------------------------------------------------------------------
 
 
 def child_report(record: RunRecord, child: Agent, *, limit: int) -> ToolResult:
@@ -792,14 +772,14 @@ async def adopt(waiting: _Waiting, *, store: Any, notifier: LoopNotifier | None)
 
 
 async def claim_adoption(waiting: _Waiting, store: Any) -> Any:
-    """Durably adopt a terminal child into its parent; the parent's new claim, or None.
+    """Adopt a terminal child under a new parent claim.
 
-    None when the child is not terminal or another caller won the parent's
-    claim. The returned claim owns the parent's continuation.
-    """
+    None means ineligible or another owner; a returned claim owns continuation."""
     from dendrux.runtime.state import ClaimResult, claimed_store
     from dendrux.runtime.submit import claim_managed_adoption
 
+    if await cancellation_requested(store, waiting.parent_run_id):
+        return None
     record = await store.get_run(waiting.child_run_id)
     if record is None:
         raise ManagedStateError(reason="child_missing", run_id=waiting.parent_run_id)
@@ -859,19 +839,9 @@ async def complete_adoption(
         )
 
 
-# ---------------------------------------------------------------------------
-# Root routing: a root-id control reaches the active leaf (0.7, T3)
-# ---------------------------------------------------------------------------
-
-
 @dataclass(frozen=True)
 class Route:
-    """A root-id control resolved to the workflow's active leaf (in memory).
-
-    ``tenant_id`` is the root's actual tenant; every hop carries it. ``waiting``
-    lists the parents from the root down to the leaf's parent; the leaf is the
-    root itself when nothing is waiting.
-    """
+    """A root-to-leaf route pinned to the root tenant, with outer-to-inner waits."""
 
     root_run_id: str
     tenant_id: str | None
@@ -888,12 +858,9 @@ class Route:
 async def route(root_agent: Agent, store: Any, run_id: str, *, tenant_id: Any) -> Route:
     """Resolve a control on ``run_id`` to its active leaf; tenant and root checked first.
 
-    A missing or foreign run is not found before anything is disclosed; a
-    managed child id is refused (``managed_root_required``). The leaf's Agent
-    is resolved from the registered path in ``root_agent``; a missing path
-    refuses before any claim.
+    Missing/foreign runs are not found; child controls require the root.
+    The stored registration path resolves the leaf Agent before any claim.
     """
-    from dendrux.errors import ManagedChildControlError, RunNotFoundError
     from dendrux.runtime.state import UNSCOPED
 
     record = await store.get_run(run_id)
@@ -901,19 +868,17 @@ async def route(root_agent: Agent, store: Any, run_id: str, *, tenant_id: Any) -
         raise RunNotFoundError(run_id)
     if await managed_child_header(store, record):
         raise ManagedChildControlError(run_id)
+    if record.status not in _TERMINAL_VALUES and await cancellation_requested(store, run_id):
+        raise RunCancelledError(run_id, run_id)
     waiting, leaf = await walk(root_agent, store, run_id)
     leaf_agent = waiting[-1].child if waiting else root_agent
     return Route(run_id, record.tenant_id, tuple(waiting), leaf, leaf_agent)
 
 
 def require_leaf_pause(found: Route, expected_pause_id: str | None) -> None:
-    """A routed continuation needs the leaf's external pause and its token.
+    """Require a leaf external pause and explicit managed pause token.
 
-    A running target (the root's own leg, a running subagent, or one whose
-    outcome awaits adoption) has nothing external to continue. Every managed
-    continuation needs an explicit ``expected_pause_id`` (strict or not), which
-    the leaf's locked claim compares exactly; it is never taken from a later read.
-    """
+    Running targets have no external action; terminal roots use ordinary replay."""
     from dendrux.errors import RunNotPausedError
     from dendrux.runtime._pending import PAUSE_STATUSES
     from dendrux.runtime.submit import _pause_id_required
@@ -953,10 +918,6 @@ async def adopt_terminal_leaf(found: Route, store: Any, *, notifier: Any) -> Run
     )
 
 
-# ---------------------------------------------------------------------------
-# Streaming: the same trampoline, advancing each run's generator in this task
-# ---------------------------------------------------------------------------
-
 _LIFECYCLE_STARTS = frozenset({"run_started", "run_resumed"})
 _TERMINAL_EVENTS = frozenset({"run_completed", "run_paused", "run_error", "run_cancelled"})
 
@@ -988,14 +949,7 @@ def _forwarded(
     first: bool,
     managed_names: frozenset[str] = frozenset(),
 ) -> Any:
-    """What the root-facing stream shows of one run's event.
-
-    The root's own events pass as they are, except that a generated subagent
-    call is shown structurally (no ``task`` brief, no report). A subagent's
-    events are reduced to structural tool progress tagged with its run id:
-    ids, tool name, iteration and outcome code, never arguments, results,
-    text or lifecycle events. Detail stays on ``RunStore.follow(child_id)``.
-    """
+    """Forward structural child progress while keeping child text in its own feed."""
     kind = getattr(event.type, "value", event.type)
     if root_level:
         if not first and kind in _LIFECYCLE_STARTS:
@@ -1086,10 +1040,7 @@ def _event(result: RunResult) -> Any:
 async def _drain(
     stream: Any, *, root_level: bool, first: bool, managed_names: frozenset[str] = frozenset()
 ) -> Any:
-    """Yield one run's forwarded events; the last item is its terminal event (or None).
-
-    The run's own stream is closed here, in this task, however iteration ends.
-    """
+    """Forward a run stream and finish with its terminal event (or None)."""
     from contextlib import aclosing
 
     terminal = None
@@ -1127,12 +1078,7 @@ class _Leg:
 
 
 async def _run_leg(leg: _Leg, state: _StreamState, *, first: bool) -> Any:
-    """Forward one run's events and record its outcome on ``leg``.
-
-    A run is the root's own leg only when nothing waits and no child is
-    binding. Before its bind a child is not a run: its failure decides for its
-    parent, exactly as for ``run()``.
-    """
+    """Forward one leg, retaining its terminal outcome or resolved child-entry failure."""
     from contextlib import aclosing
 
     root_level = not state.waiting and leg.invocation is None
@@ -1159,13 +1105,7 @@ async def _run_leg(leg: _Leg, state: _StreamState, *, first: bool) -> Any:
 
 
 async def _drive_stream(first: Any, state: _StreamState, *, notifier: Any) -> Any:
-    """Advance each run of the branch in this task, adopting and unwinding to the root.
-
-    Same transitions as :func:`_trampoline`: a handoff streams the bound
-    child; an external leaf pause ends the stream with the root-facing pause;
-    a terminal child is adopted and its parent's continuation is streamed.
-    Only the root's own completion ends the stream as the root's result.
-    """
+    """Drive and unwind the branch in this task; only root completion ends the workflow."""
     state.waiting = state.waiting if state.waiting is not None else []
     leg = _Leg(first)
     for step in range(_MAX_STEPS):
@@ -1228,14 +1168,10 @@ def workflow_stream(
     run_id: str,
     notifier: Any,
 ) -> RunStream:
-    """A managed workflow's RunStream: one root-facing stream over every run it drives.
+    """Drive one root-facing stream; resolve/claim lazily on first iteration.
 
-    ``open_first`` resolves the store and routing lazily on first iteration and
-    returns ``(first stream, first event or None)``; it raises (before anything
-    is claimed) for not found, a child id or a missing token. Once driving, a
-    failure ends the stream with a root-facing ``RUN_ERROR``. Closing the stream
-    early cancels the active run through its own stream and, while the root
-    waits on a subagent, cancels the root with its descendants.
+    Routing refusals precede claims. Driving failures yield RUN_ERROR; closing
+    early closes the active run stream and cancels the waiting root/descendants.
     """
     from contextlib import aclosing
 
@@ -1299,11 +1235,7 @@ async def _close_workflow(state: _StreamState) -> RunResult | None:
 
 
 async def _cancel_unstarted(state: _StreamState) -> None:
-    """Finalize a continuation this stream claimed but never started, under its epoch.
-
-    Its own stream never ran, so its ordinary close-time cleanup has nothing to
-    finalize; without this the claimed run would stay RUNNING with no owner.
-    """
+    """Finalize an unstarted continuation only under this stream's claim epoch."""
     from dendrux._lifecycle import CancelReason
     from dendrux.runtime.runner import _persist_run_cancellation
     from dendrux.runtime.state import claimed_store
@@ -1342,12 +1274,7 @@ def routed_stream(
     notifier: Any,
     tenant_explicit: bool,
 ) -> RunStream:
-    """``Agent.resume_stream`` on a managed root, routed to the active leaf (0.7).
-
-    Routing errors (not found, a child id, a missing token) raise from the
-    first iteration before anything is claimed. A payload-free resume adopts a
-    finished subagent without a token.
-    """
+    """Route and claim lazily; payload-free resumes may adopt a terminal child."""
     from dendrux.runtime.runner import resume_stream
     from dendrux.types import RunEvent, RunEventType
 
@@ -1406,13 +1333,7 @@ def routed_stream(
 
 
 async def _owned_leaf_stream(state: _StreamState, found: Route, first: Any, resumed: Any) -> Any:
-    """Validate and claim the leaf in this task before the workflow exposes anything.
-
-    The leaf stream's first step runs its generation check and claim. Only a
-    stream that now owns the leaf arms workflow cancellation and opens with the
-    root's RUN_RESUMED; a refused or lost claim ends with a root-facing
-    RUN_ERROR and changes nothing.
-    """
+    """Claim the leaf before exposing events; cleanup owns any unstarted claim."""
     events = first.__aiter__()
     head = await anext(events, None)
     if head is None or getattr(head.type, "value", head.type) in _TERMINAL_EVENTS:
@@ -1476,11 +1397,6 @@ class _Single:
         return None
 
 
-# ---------------------------------------------------------------------------
-# Restart: the same adoption and continuation, rebuilt from storage
-# ---------------------------------------------------------------------------
-
-
 async def reconnect(
     root_agent: Agent,
     store: Any,
@@ -1490,17 +1406,15 @@ async def reconnect(
     item: Any,
     notifier: LoopNotifier | None,
 ) -> RunResult:
-    """Continue a managed workflow from its root id after a restart (narrow, T2b).
+    """Recover a workflow from its persisted bindings and root id.
 
-    Walks the persisted bindings root to leaf. A terminal child is adopted into
-    its waiting parent without running it again; a running leaf is reclaimed
-    under ordinary lease rules (a live owner is never stolen from). A leaf's
-    external pause is returned as a root view. Full crash and sweep coverage is T4.
-    """
+    Adopt terminal children, reclaim stale owners, or return the leaf pause.
+    Healthy ownership is never stolen."""
     from dendrux.runtime import _reclaim
     from dendrux.runtime.runner import _build_cached_result
 
-    waiting, leaf = await walk(root_agent, store, root_run_id)
+    found = await route(root_agent, store, root_run_id, tenant_id=tenant_id)
+    waiting, leaf = list(found.waiting), found.leaf
     if leaf.status in {s.value for s in TERMINAL_STATUSES}:
         if not waiting:
             return await _build_cached_result(store, root_run_id)
@@ -1586,11 +1500,7 @@ async def _bound_child(
 
 
 async def _intent_call(store: Any, parent_run_id: str, call_id: str, iteration: int) -> ToolCall:
-    """The bound call as the parent's model made it (its brief lives on the intent row).
-
-    Read only the wait's own iteration: its rows are one model batch, bounded by
-    ``Limits.max_pending_calls``, so the paged read ends; earlier history is never read.
-    """
+    """Read only the bound call's iteration, in bounded pages, never its full history."""
     from dendrux.runtime._bounds import MAX_PAGE
 
     offset = 0
@@ -1625,3 +1535,87 @@ async def managed_child_header(store: Any, record: RunRecord) -> bool:
         return False
     header = (await store.get_loop_state(record.id) or {}).get(MANAGED_HEADER_KEY)
     return isinstance(header, dict) and "invocation" in header
+
+
+async def checkpoint(store: Any, run_id: str, state: dict[str, Any]) -> None:
+    """Stop before managed provider/tool admission while retaining completed evidence."""
+    if MANAGED_HEADER_KEY not in state:
+        return
+    header = ManagedHeader.from_dict(state[MANAGED_HEADER_KEY], run_id=run_id)
+    if await cancellation_requested(store, run_id):
+        raise ManagedRootStoppedError(run_id, header.root_run_id)
+
+
+async def cancellation_requested(store: Any, run_id: str) -> bool:
+    control = await store.get_run_control(run_id)
+    return bool(
+        control.cancel_requested
+        or await require_store_method(store, "_managed_root_stopped")(run_id)
+    )
+
+
+async def cancelled_result(store: Any, run_id: str, recorder: Any, notifier: Any) -> RunResult:
+    # Cycle: runner drives _managed; T5a shares the runner's existing finalization seam.
+    from dendrux.runtime.runner import (
+        _finalize_loop_cancelled,
+        _finish_fenced_lifecycle,
+    )
+
+    source = getattr(recorder, "_loop_source", None)
+    data = source() if source is not None else {}
+    state = getattr(recorder, "_loop_state", None) or getattr(store, "loop_state", None) or {}
+    result = RunResult(
+        run_id=run_id,
+        status=RunStatus.CANCELLED,
+        steps=list(data.get("steps", ())),
+        iteration_count=int(state.get("iteration", 0)),
+        usage=replace(data["usage"])
+        if "usage" in data
+        else _usage_from_dict(state.get("usage") or {}),
+    )
+    result = await _finalize_loop_cancelled(
+        store,
+        run_id,
+        result,
+        None,
+        {},
+        [RunStatus.RUNNING.value],
+        {"reason": CancelReason.CANCEL_REQUESTED.value},
+    )
+    await _finish_fenced_lifecycle(run_id, result, recorder, notifier)
+    return result
+
+
+def require_cancellation(store: Any, run_id: str | None = None) -> None:
+    for name in (
+        "get_run_control",
+        "mark_cancel_requested",
+        "get_children_page",
+        "_get_cancel_children_page",
+        "_managed_root_stopped",
+    ):
+        if not callable(getattr(store, name, None)):
+            raise ManagedUnsupportedError("cancel_store", run_id)
+
+
+def outcome_code(report: ToolResult) -> str:
+    if report.meta.get("code") == CHILD_CANCELLED:
+        return "cancelled"
+    return "succeeded" if report.success else "failed"
+
+
+async def legacy_cancel_levels(
+    store: Any, run_id: str, tenant_id: str | None, limit: int
+) -> tuple[list[list[str]], bool]:
+    subtree = await require_store_method(store, "get_subtree")(run_id, tenant_id=tenant_id)
+    nodes = (
+        sorted(
+            (node for node in subtree.nodes if node.run.id != run_id), key=lambda node: node.depth
+        )
+        if subtree is not None
+        else []
+    )
+    by_depth = {0: [run_id]}
+    for node in nodes[: limit - 1]:
+        by_depth.setdefault(node.depth, []).append(node.run.id)
+    return [by_depth[depth] for depth in sorted(by_depth)], len(nodes) + 1 > limit

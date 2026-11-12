@@ -119,6 +119,10 @@ class PostgresStateStore(SQLStateStore):
             )
         )
 
+    def _managed_root_key(self, column: Any) -> Any:
+        # Validated ULIDs use the primary key's collation, not JSON text's C collation.
+        return super()._managed_root_key(column).collate("default")
+
     def json_get(self, col: Any, path: Any, as_type: Any) -> Any:
         from sqlalchemy import Boolean, Integer, case, cast, func
         from sqlalchemy.dialects.postgresql import JSONB
