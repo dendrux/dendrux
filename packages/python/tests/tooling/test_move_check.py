@@ -44,6 +44,9 @@ class Thing(Base):
 '''
 
 
+FUT = "from __future__ import annotations\n"
+
+
 def d(text: str) -> str:
     return textwrap.dedent(text)
 
@@ -55,6 +58,7 @@ def check(after: dict[str, str], old: str = OLD, allow_new: tuple[str, ...] = ()
 def test_a_pure_move_passes() -> None:
     old_stays = d('''\
         """Old module."""
+        from __future__ import annotations
         from new_a import helper, fetch
         from new_b import LIMIT, NAME
         import os
@@ -81,7 +85,7 @@ def test_a_pure_move_passes() -> None:
         async def fetch(url: str, *, retries: int = 3) -> str:
             return url * retries
         ''')
-    new_b = "LIMIT = 10\nNAME: str = 'x'\n"
+    new_b = "from __future__ import annotations\nLIMIT = 10\nNAME: str = 'x'\n"
     report = check({"old": old_stays, "new_a": new_a, "new_b": new_b})
     assert report.problems == []
     assert report.moved == {"helper": "new_a", "fetch": "new_a", "LIMIT": "new_b", "NAME": "new_b"}
@@ -90,6 +94,7 @@ def test_a_pure_move_passes() -> None:
 def test_a_method_moved_into_a_mixin_class_passes() -> None:
     old_after = d('''\
         """Old module."""
+        from __future__ import annotations
         class Thing(_Beta, Base):
             """A thing."""
 
@@ -99,11 +104,13 @@ def test_a_method_moved_into_a_mixin_class_passes() -> None:
                 return os.getcwd()
         ''')
     mixin = d("""\
+        from __future__ import annotations
         class _Beta:
             def beta(self, x=2):
                 return x
         """)
     rest = d('''\
+        from __future__ import annotations
         LIMIT = 10
         NAME: str = "x"
 
@@ -139,10 +146,10 @@ def test_a_changed_default_fails() -> None:
 
 def test_a_changed_method_default_in_a_mixin_fails() -> None:
     old_after = (
-        "class Thing(_Beta, Base):\n    size = 3\n\n"
+        FUT + "class Thing(_Beta, Base):\n    size = 3\n\n"
         "    def alpha(self):\n        return os.getcwd()\n"
     )
-    mixin = "class _Beta:\n    def beta(self, x=3):\n        return x\n"
+    mixin = FUT + "class _Beta:\n    def beta(self, x=3):\n        return x\n"
     rest = OLD.split("class Thing")[0]
     report = check({"old": old_after, "mixin": mixin, "rest": rest})
     assert any("Thing.beta" in p for p in report.problems)
@@ -155,13 +162,13 @@ def test_a_dropped_function_fails() -> None:
 
 
 def test_a_duplicated_function_fails() -> None:
-    copy = 'def helper(a, b=1):\n    """Add."""\n    return a + b\n'
+    copy = FUT + 'def helper(a, b=1):\n    """Add."""\n    return a + b\n'
     problems = check({"old": OLD, "other": copy}).problems
     assert any("duplicated" in p and "helper" in p for p in problems)
 
 
 def test_an_extra_definition_fails_unless_allowed() -> None:
-    extra = "def brand_new():\n    return 1\n"
+    extra = FUT + "def brand_new():\n    return 1\n"
     problems = check({"old": OLD, "other": extra}).problems
     assert any("extra" in p and "brand_new" in p for p in problems)
     assert check({"old": OLD, "other": extra}, allow_new=("brand_new",)).problems == []
@@ -172,16 +179,25 @@ def test_imports_may_change_freely() -> None:
     assert check({"old": after}).problems == []
 
 
-def test_the_module_docstring_and_dunder_all_are_not_compared() -> None:
-    after = OLD.replace('"""Old module."""', '"""Rewritten."""') + '\n__all__ = ["helper"]\n'
+def test_the_module_docstring_is_not_compared_but_a_new_dunder_all_in_the_old_module_fails() -> (
+    None
+):
+    after = OLD.replace('"""Old module."""', '"""Rewritten."""')
     assert check({"old": after}).problems == []
+    assert any("__all__" in p for p in check({"old": after + '\n__all__ = ["helper"]\n'}).problems)
+
+
+def test_a_literal_dunder_all_in_a_new_module_is_not_compared() -> None:
+    old_after = OLD.replace('def helper(a, b=1):\n    """Add."""\n    return a + b\n', "")
+    new = FUT + 'def helper(a, b=1):\n    """Add."""\n    return a + b\n__all__ = ["helper"]\n'
+    assert check({"old": old_after, "new": new}).problems == []
 
 
 def test_a_mixin_that_is_not_a_base_of_the_class_fails() -> None:
     old_after = (
         "class Thing(Base):\n    size = 3\n\n    def alpha(self):\n        return os.getcwd()\n"
     )
-    mixin = "class _Beta:\n    def beta(self, x=2):\n        return x\n"
+    mixin = FUT + "class _Beta:\n    def beta(self, x=2):\n        return x\n"
     rest = OLD.split("class Thing")[0]
     report = check({"old": old_after, "mixin": mixin, "rest": rest})
     assert any("_Beta" in p and "base" in p for p in report.problems)
@@ -193,7 +209,7 @@ def test_a_changed_base_list_fails() -> None:
 
 def test_require_reexports_flags_a_moved_public_name_the_old_module_lost() -> None:
     old_after = OLD.replace('def helper(a, b=1):\n    """Add."""\n    return a + b\n', "")
-    new = 'def helper(a, b=1):\n    """Add."""\n    return a + b\n'
+    new = FUT + 'def helper(a, b=1):\n    """Add."""\n    return a + b\n'
     report = mc.check_move(OLD, {"old": old_after, "new": new}, require_reexports=True)
     assert any("re-export" in p and "helper" in p for p in report.problems)
     reexported = old_after + "\nfrom new import helper\n"
@@ -212,7 +228,9 @@ def test_the_cli_compares_against_a_git_base_ref(tmp_path: Path, capsys) -> None
     (tmp_path / "old.py").write_text(OLD)
     git("add", ".")
     git("commit", "-q", "-m", "base")
-    (tmp_path / "new.py").write_text('def helper(a, b=1):\n    """Add."""\n    return a + b\n')
+    (tmp_path / "new.py").write_text(
+        FUT + 'def helper(a, b=1):\n    """Add."""\n    return a + b\n'
+    )
     (tmp_path / "old.py").write_text(
         OLD.replace('def helper(a, b=1):\n    """Add."""\n    return a + b\n', "")
     )
@@ -222,7 +240,7 @@ def test_the_cli_compares_against_a_git_base_ref(tmp_path: Path, capsys) -> None
     os.chdir(tmp_path)
     try:
         ok = mc.main(["--base", "HEAD", "--old", "old.py", "--new", "new.py"])
-        (tmp_path / "new.py").write_text("def helper(a, b=1):\n    return a\n")
+        (tmp_path / "new.py").write_text(FUT + "def helper(a, b=1):\n    return a\n")
         bad = mc.main(["--base", "HEAD", "--old", "old.py", "--new", "new.py"])
     finally:
         os.chdir(cwd)
