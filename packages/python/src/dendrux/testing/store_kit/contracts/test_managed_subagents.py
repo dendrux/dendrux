@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
-from dendrux._lifecycle import StoredEventType
+from dendrux._lifecycle import CancelReason, StoredEventType
 from dendrux.errors import (
     ManagedChildControlError,
     PersistenceError,
@@ -174,7 +174,11 @@ async def _bound(store: Any, request: BindManagedChildRequest) -> None:
     assert events[-1].data == request.intent_event.data
     [child] = await store.list_runs(parent_run_id=parent, tenant_id=request.tenant_id, limit=10)
     assert child.id == child_id
-    assert (child.status, child.claim_epoch, child.storage_format) == ("running", 0, 2)
+    assert (child.status, child.claim_epoch, child.storage_format) == (
+        RunStatus.RUNNING.value,
+        0,
+        2,
+    )
     assert (child.parent_run_id, child.tenant_id) == (parent, request.tenant_id)
     assert child.input_data == request.child_input_data
     child_state = await store.get_loop_state(child_id)
@@ -297,7 +301,15 @@ async def test_managed_bind_lost_ack_grants_only_creator_authority(dendrux_kit: 
 
 @managed
 @pytest.mark.parametrize(
-    "case", ["stale_epoch", "cancel_requested", "cancelled", "tenant", "unscoped", "null_tenant"]
+    "case",
+    [
+        "stale_epoch",
+        CancelReason.CANCEL_REQUESTED.value,
+        RunStatus.CANCELLED.value,
+        "tenant",
+        "unscoped",
+        "null_tenant",
+    ],
 )
 async def test_managed_bind_refuses_parent_without_writes(dendrux_kit: Kit, case: str) -> None:
     store = dendrux_kit.store
@@ -315,8 +327,8 @@ async def test_managed_bind_refuses_parent_without_writes(dendrux_kit: Kit, case
         )
         assert claim is not False and claim.claim_epoch > request.parent_claim_epoch
         expected = RunFencedError
-    elif case in ("cancel_requested", "cancelled"):
-        if case == "cancel_requested":
+    elif case in (CancelReason.CANCEL_REQUESTED.value, RunStatus.CANCELLED.value):
+        if case == CancelReason.CANCEL_REQUESTED.value:
             await store.request_cancel(request.parent_run_id)
         else:
             assert await store.finalize_run(
@@ -366,7 +378,7 @@ async def test_managed_child_reclaim_refuses_before_any_mutation(dendrux_kit: Ki
         claim = await store.reclaim_run(child.run_id, **kwargs)
     assert claim is not False and claim.claim_epoch > child.claim_epoch
     reclaimed = await store.get_run(child.run_id)
-    assert (reclaimed.status, reclaimed.reclaim_attempts) == ("running", 1)
+    assert (reclaimed.status, reclaimed.reclaim_attempts) == (RunStatus.RUNNING.value, 1)
     assert reclaimed.lease_expired_at is None
     parent_after = await _snapshot(store, request.parent_run_id)
     assert {k: v for k, v in parent_after.items() if k != "children"} == {

@@ -205,6 +205,15 @@ ADDITIVE_060_RESULT_FIELDS = {"SweepResult": {"reclaimable", "cursor"}}
 ADDITIVE_060_EXCEPTION_BASES = {"RunControlError"}
 
 
+def _pending_excluded_fields(obj: Any) -> set[str]:
+    origin_fields = {"agent_name", "agent_path", "origin_run_id"}
+    if type(obj).__name__ == "PendingPause" and all(
+        getattr(obj, name, None) is None for name in origin_fields
+    ):
+        return origin_fields
+    return set()
+
+
 def raw(obj: Any) -> Any:
     """Plain-JSON snapshot keeping real values (ids, ISO timestamps); bytes as base64."""
     if obj is None or isinstance(obj, bool | int | str):
@@ -225,9 +234,11 @@ def raw(obj: Any) -> Any:
         items = sorted(obj, key=repr) if isinstance(obj, set | frozenset) else obj
         return [raw(v) for v in items]
     if hasattr(obj, "__dataclass_fields__") and not isinstance(obj, type):
-        excluded = ADDITIVE_060_RECORD_FIELDS.get(
-            type(obj).__name__, set()
-        ) | ADDITIVE_060_RESULT_FIELDS.get(type(obj).__name__, set())
+        excluded = (
+            ADDITIVE_060_RECORD_FIELDS.get(type(obj).__name__, set())
+            | ADDITIVE_060_RESULT_FIELDS.get(type(obj).__name__, set())
+            | _pending_excluded_fields(obj)
+        )
         return {
             name: raw(getattr(obj, name))
             for name in obj.__dataclass_fields__
