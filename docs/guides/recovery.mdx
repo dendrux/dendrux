@@ -59,18 +59,22 @@ This example dispatches serially and handles `RunNotReclaimableError` per item s
 
 ## Bounded scans and attempt limits
 
-`SweepResult` has `stale_running`, `abandoned_waiting`, `reclaimable` and `cursor`. Finalized rows are separate from marked rows. Advance with the returned opaque cursor until it is `None`; the running scan never wraps within one call. Start a later sweep from `None` to revisit earlier ids. A short reclaimable list alone does not prove that the backlog is empty.
+`SweepResult` has `stale_running`, `abandoned_waiting`, `reclaimable` and `cursor`. Finalized rows are separate from marked rows. For native SQL stores, pass `cursor=result.cursor` from the previous `sweep()` result with the same thresholds until it is `None`; the cursor continues both running and waiting scans, and neither scan wraps within one call. Waiting-only calls can return a cursor too. Treat the token as opaque, not as a run ID. Start a later maintenance pass with `cursor=None` to revisit earlier rows. A short reclaimable list alone does not prove that the backlog is empty.
 
 | Option | Default | Maximum | Meaning |
 | --- | --- | --- | --- |
 | `batch_size` | 100 | 1,000 | Candidate rows per page |
-| `max_runs` | 10,000 | 100,000 | Candidates inspected per category; fresh rows and lost races count |
+| `max_runs` | 10,000 | 100,000 | Candidates inspected per category; fresh rows, exempt or corrupt waits, and lost races count |
 | `max_returned` | 1,000 | 100,000 | Reclaimable items returned |
 | `max_reclaims` | 3 | 32,767 | Attempt limit written by each new mark |
 
 Rediscovering an existing mark preserves its stored limit. Each successful claim increments `reclaim_attempts`. Since 0.6.1, it counts recovery attempts since the last newly committed progress, rather than lifetime attempts. A new advancing model step, server-tool observation, consumed client-tool observation or final answer resets it to zero in the same atomic write. Heartbeats, tool intents, reused observations, unchanged checkpoints and pause/approval cycling do not reset it. Once the limit is exhausted without progress, a later sweep finalizes the stale run as `error` with `failure_reason="reclaim_limit"`; a direct reclaim refuses with `RunNotReclaimableError(reason="reclaim_limit")`.
 
-In reclaim mode, stale format-1 runs are finalized with `stale_running_legacy`. Stale `SingleCall` runs or format-2 runs without a supported loop marker are finalized through the stale error path. They are not returned for reclaim. A pending cancellation wins and finalizes the run as cancelled. `abandoned_waiting=` independently reaps waiting or paused runs only when both `status_changed_at` and `updated_at` exceed the window; repeat sweeps to drain that category.
+In reclaim mode, stale format-1 runs are finalized with `stale_running_legacy`. Stale `SingleCall` runs or format-2 runs without a supported loop marker are finalized through the stale error path. They are not returned for reclaim. A pending cancellation wins and finalizes the run as cancelled. `abandoned_waiting=` independently reaps waiting or paused runs only when both `status_changed_at` and `updated_at` exceed the window. Managed parents waiting on a subagent are exempt; corrupt managed waits are reported and left unchanged. Both count toward `max_runs`.
+
+Calls without a cursor restart at the oldest waiting row. With more than `max_runs` exempt or corrupt waits, repeated cursorless calls can stall before later ordinary pauses. Pass `result.cursor` to continue the scan.
+
+Custom stores and `SQLStateStore` subclasses overriding `sweep_abandoned_runs` get no waiting continuation and must bound their own exempt-wait handling.
 
 ## What happens to an interrupted tool
 
