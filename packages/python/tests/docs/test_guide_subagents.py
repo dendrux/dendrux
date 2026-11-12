@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 from pathlib import Path
@@ -9,6 +10,7 @@ from typing import Any
 
 import pytest
 
+from dendrux import Agent
 from dendrux.llm.mock import MockLLM
 from dendrux.store import PendingPause, RunStore
 from dendrux.types import LLMResponse, RunStatus, ToolCall, UsageStats
@@ -20,9 +22,18 @@ def _example() -> Any:
     assert GUIDE.is_file(), "the subagents guide must exist"
     match = re.search(r"^```python\n(.*?)^```", GUIDE.read_text(), re.S | re.M)
     assert match, "the subagents guide must include its main Python example"
+    assert "async def review_report(" in match[1], "the first example must define review_report"
     namespace: dict[str, Any] = {}
     exec(compile(match[1], str(GUIDE), "exec"), namespace)
     return namespace["review_report"]
+
+
+def _fragment_code(marker: str) -> Any:
+    blocks = re.findall(r"^```python\n(.*?)^```", GUIDE.read_text(), re.S | re.M)
+    matches = [block for block in blocks if marker in block]
+    assert len(matches) == 1, f"the guide must have one fragment containing {marker}"
+    # Keep top-level await in the caller's task, as required by workflow streaming.
+    return compile(matches[0], str(GUIDE), "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
 
 
 def _response(*, text: str | None = None, calls: list[ToolCall] | None = None) -> LLMResponse:
@@ -64,7 +75,13 @@ async def test_main_example_routes_approval_and_counts_subtree_usage(
         assert [call.name for call in pending.tool_calls] == ["count_words"]
         # A restart/read route can recover the same root-facing pause without an Agent.
         async with RunStore.from_database_url(url) as store:
-            reloaded = await store.get_pending(pending.run_id, tenant_id="acme")
+            namespace: dict[str, Any] = {
+                "store": store,
+                "root_run_id": pending.run_id,
+                "tenant_id": "acme",
+            }
+            await eval(_fragment_code("pending = await store.get_pending("), namespace)
+            reloaded = namespace["pending"]
             assert reloaded is not None
             assert reloaded.to_dict() == pending.to_dict()
         return approved
@@ -102,3 +119,43 @@ async def test_main_example_routes_approval_and_counts_subtree_usage(
         assert json.loads(child_observations[0].content) == 2
     else:
         assert "declined" in child_observations[0].content.lower()
+
+
+async def test_stream_example_yields_root_text_and_root_result(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code = _fragment_code("async with lead.stream(")
+    lead_model = MockLLM(
+        [
+            _response(calls=[ToolCall("reviewer", {"task": "Review: Sales rose."})]),
+            _response(text="Report reviewed."),
+        ]
+    )
+    child_model = MockLLM([_response(text="Child assessment stays out of root text.")])
+    url = f"sqlite+aiosqlite:///{tmp_path / 'subagents-stream.sqlite'}"
+    async with (
+        Agent(
+            name="reviewer", description="Review one draft.", provider=child_model, prompt="Review."
+        ) as reviewer,
+        Agent(
+            name="lead",
+            provider=lead_model,
+            prompt="Delegate the review, then summarize it.",
+            subagents=[reviewer],
+            database_url=url,
+        ) as lead,
+    ):
+        namespace: dict[str, Any] = {"lead": lead, "tenant_id": "acme"}
+        await eval(code, namespace)
+        result = namespace["result"]
+        assert result is namespace["stream"].result
+        assert result.status is RunStatus.SUCCESS
+        assert result.run_id == namespace["stream"].run_id
+        assert result.answer == "Report reviewed."
+        assert capsys.readouterr().out == "Report reviewed."
+        async with RunStore.from_database_url(url) as store:
+            tree = await store.get_subtree(result.run_id, tenant_id="acme", max_nodes=10)
+            assert len(tree.nodes) == 2
+            assert all(node.run.status == "success" for node in tree.nodes)
+    assert child_model.calls_made == 1
+    assert lead_model.calls_made == 2

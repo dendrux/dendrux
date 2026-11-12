@@ -1,6 +1,6 @@
 ---
 title: StateStore capabilities
-description: Explicit capability declarations for custom state stores, format-2 requirements, legacy compatibility and validation at Agent construction.
+description: Explicit capability declarations for custom state stores, format-2 and managed-subagent requirements, legacy compatibility and validation timing.
 ---
 
 # StateStore capabilities
@@ -30,7 +30,7 @@ Construct a store once per worker event loop and pass it as `Agent(state_store=s
 
 ## Capability matrix
 
-A custom store declares a class attribute `capabilities: StoreCapabilities`. This frozen dataclass has `version=1`, five flags that default to `False`, and a `deployment` field that defaults to `None`. Method names alone never enable a capability.
+A custom store declares a class attribute `capabilities: StoreCapabilities`. This frozen dataclass has `version=1`, six flags that default to `False`, and a `deployment` field that defaults to `None`. Method names alone never enable a capability.
 
 | Capability | Promise | Required methods and keyword parameters |
 | --- | --- | --- |
@@ -39,6 +39,7 @@ A custom store declares a class attribute `capabilities: StoreCapabilities`. Thi
 | `checkpointing` | Durable execution state and kind-aware conversation reconstruction | `create_run(seed_traces=, pii_mapping=)`, `save_trace(trace_kind=)`, `save_tool_call(outcome=)`, `complete_tool_call(pii_mapping=)`, `consume_submission(pii_mapping=)`, `checkpoint_step`, `get_traces_after`, `conversation_traces`, `claim_paused_run`, `submit_and_claim` |
 | `atomic_completion` | Tool intent and completion are durable; completion includes observation and event; finalization includes the final trace | `start_tool_call`, `complete_tool_call`, `finalize_with_event(trace=)` |
 | `recovery` | Bounded lease marking and atomic reclaim | `mark_lease_expired(finalise_unrecoverable=)`, `get_lease_expired`, `reclaim_run`, `get_replayed_tool_calls` |
+| `managed_subagents` | Bind one child atomically while parking its parent; requires all five durability flags above | `bind_managed_child(request)`; see [Managed subagent stores](#managed-subagent-stores) |
 
 `deployment` is descriptive, not a feature switch: it says how many processes may share the store's data. It is one of:
 
@@ -52,7 +53,15 @@ A store with an explicit capability declaration but no `deployment` still runs, 
 
 The table lists the added requirements, not full method signatures. Implement the protocol in `dendrux.runtime.state`; do not copy a shortened table entry as a method definition. Signature validation requires the named keyword-only parameters. A forwarding subclass override should preserve those named parameters and pass them through; do not rely on a bare `**kwargs` declaration satisfying validation.
 
-The built-in SQL stores declare all five capabilities. Live updates are not a capability; see below.
+The built-in `SQLiteStateStore`, `PostgresStateStore` and `MySQLStateStore` declare all six capabilities through `SQLStateStore`. Live updates are not a capability; see below.
+
+### Managed subagent stores
+
+A custom store must declare `managed_subagents=True` together with `fenced_writes`, `retry_ids`, `checkpointing`, `atomic_completion` and `recovery`. It must implement the `ManagedStateStore` extension in `dendrux.runtime.state`, including `bind_managed_child(request)`.
+
+The bind must validate the parent's tenant, current claim epoch, cancellation state and outstanding child binding. In one transaction, it parks and fences the parent, records the tool intent and wait, creates the child with its initial state, and records the delegation event. Retrying a bound invocation must return its existing child without granting execution ownership again. Follow the full extension contract and the [store test kit](/docs/guides/build-your-own-store); a method with the right name alone is not enough.
+
+At Agent construction, a declared capability with a missing or invalid required method raises `StoreCapabilityError`. A missing `managed_subagents` flag, or a missing prerequisite flag, is checked when managed execution begins, before managed writes. It raises `StoreCapabilityError` then, even if construction and ordinary runs succeeded. Managed runs also require format-2 storage; the capability flags do not activate an existing database by themselves. See [Format and recovery requirements](#format-and-recovery-requirements).
 
 ## Live updates
 
