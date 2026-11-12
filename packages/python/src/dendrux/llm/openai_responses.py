@@ -927,11 +927,8 @@ class OpenAIResponsesProvider(OpenAIFamilyProvider):
 
     def _build_tools(self, dendrux_tools: list[ToolDef] | None) -> list[dict[str, Any]]:
         """Build the tools array: built-in tools + Dendrux function tools."""
-        api_tools: list[dict[str, Any]] = []
-
         # Add built-in tools (web_search, code_interpreter, etc.)
-        for builtin in self._builtin_tools:
-            api_tools.append({"type": builtin})
+        api_tools: list[dict[str, Any]] = [{"type": builtin} for builtin in self._builtin_tools]
 
         # Add Dendrux function tools (flatter format than Chat Completions)
         if dendrux_tools:

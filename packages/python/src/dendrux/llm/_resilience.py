@@ -257,7 +257,7 @@ def make_http_client(
     (1000 / 100 keep-alive) and TCP keep-alive. Redirects stay off, as before.
     """
     client_type = deferred_client_type(sdk.DefaultAsyncHttpxClient)
-    client = client_type(
+    return client_type(
         timeout=httpx.Timeout(deadlines.read_timeout, connect=CONNECT_TIMEOUT),
         follow_redirects=False,
         event_hooks={
@@ -272,7 +272,6 @@ def make_http_client(
             ],
         },
     )
-    return client
 
 
 # Live loops other than the owner that may hold their own client copy at once.

@@ -387,7 +387,7 @@ class OpenAIFamilyProvider(LLMProvider):
     # _build_api_kwargs(messages, tools, kwargs, *, run_id, cache_key_prefix,
     #     registry) -> (api_kwargs, captured_request)
     _build_api_kwargs: Callable[..., tuple[dict[str, Any], dict[str, Any]]]
-    # _inject_structured_output(api_kwargs, captured_request, output_schema)
+    # Inject structured output into the SDK kwargs and the captured request.
     _inject_structured_output: Callable[[dict[str, Any], dict[str, Any], dict[str, Any]], None]
     # _create(client, request): one SDK create call (SDK retries included)
     _create: Callable[[Any, WireRequest], Awaitable[Any]]

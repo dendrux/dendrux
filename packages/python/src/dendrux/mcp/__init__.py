@@ -41,14 +41,14 @@ except ModuleNotFoundError as err:
         ) from None
     raise  # Real import error from within the mcp package
 
-from dendrux.mcp._credentials import (  # noqa: E402
+from dendrux.mcp._credentials import (
     MCPAuthKey,
     MCPCredentialProvider,
     MCPRefreshingCredentialProvider,
 )
-from dendrux.mcp._destination import MCPDestination, MCPDestinationPolicy  # noqa: E402
-from dendrux.mcp._discovery import MCPDiscovery, MCPToolInfo  # noqa: E402
-from dendrux.mcp._errors import (  # noqa: E402
+from dendrux.mcp._destination import MCPDestination, MCPDestinationPolicy
+from dendrux.mcp._discovery import MCPDiscovery, MCPToolInfo
+from dendrux.mcp._errors import (
     MCPAuthChallenge,
     MCPAuthenticationError,
     MCPAuthorizationRequired,
@@ -80,8 +80,8 @@ from dendrux.mcp._errors import (  # noqa: E402
     MCPToolNotFoundError,
     error_code_for,
 )
-from dendrux.mcp._host import MCPHost  # noqa: E402
-from dendrux.mcp._oauth import (  # noqa: E402
+from dendrux.mcp._host import MCPHost
+from dendrux.mcp._oauth import (
     MCPOAuth,
     MCPOAuthClaim,
     MCPOAuthClient,
@@ -96,7 +96,7 @@ from dendrux.mcp._oauth import (  # noqa: E402
     MCPOAuthVersion,
     check_oauth_store,
 )
-from dendrux.mcp._observability import (  # noqa: E402
+from dendrux.mcp._observability import (
     MCPCallCapacityRejected,
     MCPCircuitClosed,
     MCPCircuitOpened,
@@ -130,15 +130,15 @@ from dendrux.mcp._observability import (  # noqa: E402
     MCPToolCallOutcomeUnknown,
     MCPToolCallStarted,
 )
-from dendrux.mcp._runtime import (  # noqa: E402
+from dendrux.mcp._runtime import (
     MCPConnection,
     MCPEvictionMode,
     MCPRuntime,
     MCPToolPolicy,
     MCPToolView,
 )
-from dendrux.mcp._server import MCPServer, MCPSkippedTool, MCPSkipReason  # noqa: E402
-from dendrux.mcp._source import MCPFailureMode, MCPSource  # noqa: E402
+from dendrux.mcp._server import MCPServer, MCPSkippedTool, MCPSkipReason
+from dendrux.mcp._source import MCPFailureMode, MCPSource
 
 __all__ = [
     "MCPAuthChallenge",

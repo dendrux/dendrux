@@ -1064,15 +1064,15 @@ class AnthropicProvider(LLMProvider):
                     content: list[dict[str, Any]] = list(thinking)
                     if msg.content:
                         content.append({"type": "text", "text": msg.content})
-                    for tc in msg.tool_calls:
-                        content.append(
-                            {
-                                "type": "tool_use",
-                                "id": tc.provider_tool_call_id or tc.id,
-                                "name": tc.name,
-                                "input": tc.params,
-                            }
-                        )
+                    content.extend(
+                        {
+                            "type": "tool_use",
+                            "id": tc.provider_tool_call_id or tc.id,
+                            "name": tc.name,
+                            "input": tc.params,
+                        }
+                        for tc in msg.tool_calls
+                    )
                     api_messages.append({"role": "assistant", "content": content})
                 elif thinking:
                     if msg.content:
