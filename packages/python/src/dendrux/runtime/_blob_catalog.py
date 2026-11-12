@@ -1542,7 +1542,7 @@ class CachingBlobResolver:
 
 
 # ---------------------------------------------------------------------------
-# Accessor: read / info / references / purge / collect_garbage
+# Accessors for reads, metadata, references, purge and garbage collection.
 # ---------------------------------------------------------------------------
 
 

@@ -363,13 +363,12 @@ class PostgresStateStore(SQLStateStore):
         if after is not None:
             per_parent = per_parent.where(scoped.c.id > after)
         children = per_parent.order_by(scoped.c.id).limit(size).lateral("children")
-        statement = (
+        return (
             select(children.c.id)
             .select_from(parents.join(children, true()))
             .order_by(children.c.id)
             .limit(size)
         )
-        return statement
 
 
 def _jsonb_or_null(column: Any) -> Any:

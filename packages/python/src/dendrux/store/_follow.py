@@ -171,7 +171,7 @@ class FollowEnd:
     cursor: int | None
 
 
-FollowItem: TypeAlias = Union["StoredEvent", FollowHeartbeat, FollowEnd]  # noqa: UP007
+FollowItem: TypeAlias = Union["StoredEvent", FollowHeartbeat, FollowEnd]
 
 
 @dataclass(frozen=True, slots=True)
@@ -925,8 +925,8 @@ class _Coordinator:
     async def _read_events(
         self, runs: list[_WatchedRun], snapshots: dict[_WatchedRun, _Snapshot]
     ) -> None:
-        limit = max(1, min(min(r.params.batch for r in runs), MAX_LIMIT_PER_RUN))
-        limit = max(1, min(limit, MAX_ROWS_PER_READ // len(runs)))
+        limit = min(r.params.batch for r in runs)
+        limit = max(1, min(limit, MAX_LIMIT_PER_RUN, MAX_ROWS_PER_READ // len(runs)))
         rows, failed = await self._fetch_events(runs, limit)
         self._suspects.note_read(bool(rows), self._now())
         self._read_failure(failed, status=False)

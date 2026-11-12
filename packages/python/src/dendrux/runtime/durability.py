@@ -198,7 +198,7 @@ async def _ownership_handoff(
                 if inspect.iscoroutine(operation):
                     operation.close()  # The child may have been cancelled before its first step.
             finally:
-                raise cancellation
+                raise cancellation  # noqa: TRY201 - cleanup failures must not replace cancellation
 
 
 @asynccontextmanager

@@ -211,7 +211,7 @@ async def require_checkpointed_creation(store: Any) -> None:
 def raise_unbound(invocation: ManagedInvocation | None, claimed: Any) -> None:
     """Re-raise the active exception for a managed child that never bound (stream path)."""
     if invocation is not None and not claimed:
-        raise  # noqa: PLE0704 - called only from an ``except`` block
+        raise  # Called only from an ``except`` block.
 
 
 def new_run_id(invocation: ManagedInvocation | None) -> str:

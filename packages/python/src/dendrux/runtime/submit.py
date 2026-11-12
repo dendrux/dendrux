@@ -281,9 +281,7 @@ _CLAIM_FAILURES: dict[str | tuple[str, str], _ClaimFailureMapping] = {
     "claimed": _ClaimFailureMapping(
         lambda run_id, current, expected: RunAlreadyClaimedError(run_id)
     ),
-    "pause": _ClaimFailureMapping(
-        lambda run_id, current, expected: PauseStatusMismatchError(run_id, current, expected)
-    ),
+    "pause": _ClaimFailureMapping(PauseStatusMismatchError),
     "not_paused": _ClaimFailureMapping(
         lambda run_id, current, expected: RunNotPausedError(run_id, current)
     ),
