@@ -250,6 +250,7 @@ disallow_untyped_defs = false
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+faulthandler_timeout = 240
 testpaths = ["tests"]
 markers = [
     "benchmark: environment-dependent Postgres measurements (HOT statistics, writer stall during a 300k-row migration); excluded from make test, make ci and CI, run with make bench on a quiet machine",
