@@ -1251,14 +1251,16 @@ async def _read_recovery_info(store: StateStore, record: Any, *, best_effort: bo
 
 async def _attach_persisted_pending(store: StateStore, result: RunResult, record: Any) -> RunResult:
     result.recovery = await _recovery_info(store, record)
-    moved = (
-        result.status in _PAUSE_STATUSES
-        and record is not None
-        and await _load_persisted_pending(store, result, record)
-    )
-    if moved:
+    if await _pending_moved(store, result, record):
         await _reread_moved(store, result)
     return result
+
+
+async def _pending_moved(store: StateStore, result: RunResult, record: Any) -> bool:
+    """Attach a paused run's pending; True when that read saw the run move on (0.7)."""
+    if result.status not in _PAUSE_STATUSES or record is None:
+        return False
+    return await _load_persisted_pending(store, result, record)
 
 
 async def _reread_moved(store: StateStore, result: RunResult) -> None:
@@ -1287,7 +1289,7 @@ async def _load_persisted_pending(store: StateStore, result: RunResult, record: 
     A moved read keeps the later view's status: it is never a private managed
     wait, and it is coherent with the pending it came with.
     """
-    from dendrux.runtime._pending import _PendingReader, facing_status
+    from dendrux.runtime._pending import _PendingReader
 
     result.pending = None
     result.pause_id = None
@@ -1299,13 +1301,22 @@ async def _load_persisted_pending(store: StateStore, result: RunResult, record: 
     except Exception:
         _codes.log_code(logger, _codes.RESULT_READ_FAILED, run_id=result.run_id)
         return False
-    view = reader.last_view
-    moved = view is not None and not view.managed and view.status != record.status
-    # A parent waiting on a subagent reports its active branch (0.7).
-    later = view.status if view is not None and moved else None
-    result.status = RunStatus(later or facing_status(result.status.value, view))
+    status, moved = _read_status(result.status.value, record.status, reader.last_view)
+    result.status = RunStatus(status)
     result.pause_id = result.pending.pause_id if result.pending else None
     return moved
+
+
+def _read_status(status: str, record_status: str, view: Any) -> tuple[str, bool]:
+    """The status a pending read shows, and whether the run moved since its record.
+
+    A parent waiting on a subagent reports its active branch; a run that moved
+    to another public status between the reads keeps that later status (0.7).
+    """
+    from dendrux.runtime._pending import facing_status
+
+    moved = view is not None and not view.managed and view.status != record_status
+    return (view.status if moved else facing_status(status, view)), moved
 
 
 async def _committed_pause_result(
