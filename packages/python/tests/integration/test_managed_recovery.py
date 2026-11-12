@@ -439,7 +439,6 @@ def _crash_in_new_process(cut: str, engine: Any) -> None:
         "PYTHONPATH": os.pathsep.join([str(package / "src"), str(package)]),
         "T4_CRASH_URL": engine.url.render_as_string(hide_password=False),
     }
-    env.pop("DENDRUX_TEST_PG_URL", None)
     done = subprocess.run(
         [sys.executable, "-m", "tests.integration.test_managed_recovery", cut],
         cwd=package,
