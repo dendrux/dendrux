@@ -51,20 +51,35 @@ async def test_many_stores_warn_once_with_counts_and_hash_only(caplog):
         await engine.dispose()
 
 
-async def test_closed_and_collected_stores_do_not_count():
-    engine = create_async_engine("postgresql+asyncpg:///registry_collection_test")
-    with warnings.catch_warnings(record=True) as captured:
-        warnings.simplefilter("always")
-        for _ in range(160):
-            store = store_for_engine(engine, live_updates=RecordingUpdates())
-            await store.close()
-        del store
-        for _ in range(160):
-            store_for_engine(engine, live_updates=RecordingUpdates())
-            gc.collect()
-    stray = warnings_of(captured, RuntimeWarning, "Open live-update stores")
-    assert not stray, texts(stray)
-    await engine.dispose()
+async def test_closed_and_collected_stores_do_not_count(monkeypatch):
+    from dendrux.runtime.stores.sql import _live_registry
+
+    collections = []
+    real_collect = gc.collect
+    monkeypatch.setattr(gc, "collect", lambda *a: collections.append(1) or real_collect(*a))
+    batch = _live_registry.MANY_STORES_THRESHOLD // 2  # live at once: well below the warning
+    # Freeze the heap built so far: a full collection then walks only what this test creates,
+    # so the cost does not depend on how large the worker's heap has grown.
+    gc.freeze()
+    try:
+        engine = create_async_engine("postgresql+asyncpg:///registry_collection_test")
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always")
+            for _ in range(160):
+                store = store_for_engine(engine, live_updates=RecordingUpdates())
+                await store.close()
+            del store
+            for _ in range(160 // batch):  # 160 stores in all, never more than `batch` alive
+                for _ in range(batch):
+                    store_for_engine(engine, live_updates=RecordingUpdates())
+                gc.collect()
+        stray = warnings_of(captured, RuntimeWarning, "Open live-update stores")
+        assert not stray, texts(stray)
+        assert not any(_live_registry._open_stores.values())
+        assert len(collections) <= 160 // batch + 1  # bounded: one collection per batch
+        await engine.dispose()
+    finally:
+        gc.unfreeze()
 
 
 @pytest.mark.parametrize(
