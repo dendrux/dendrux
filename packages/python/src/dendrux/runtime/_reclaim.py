@@ -1055,6 +1055,25 @@ def _refuse_managed_approval(
         raise ManagedUnsupportedError("recover_managed_approval", run_id)
 
 
+async def _admitted_arguments(
+    ctx: _ResumeContext, run_id: str, tc: ToolCall, lookups: Any
+) -> list[ToolCall]:
+    """An admitted call's execution arguments, rebuilt without its policy callbacks.
+
+    History keeps the model's placeholder form; the live batch admitted the
+    restored, validated arguments. Only those two stages run again (the PII
+    guardrail's restore from the saved mapping, then validation), so the child
+    receives exactly the brief its admission saw and no raw value is written to
+    model-visible evidence.
+    """
+    from dendrux.loops.react import _pii_placeholders, _restore_calls, _validate_calls
+
+    engine = cast("PersistenceRecorder", ctx.recorder).guardrail_engine
+    batch = _recovery_batch(ctx, run_id)
+    calls = await _restore_calls(engine, [tc], lookups, batch)
+    return await _validate_calls(calls, lookups, frozenset(_pii_placeholders(engine)), batch)
+
+
 async def _admit_recovered_call(
     ctx: _ResumeContext, run_id: str, found: _ManagedPending, outcome: Any, lookups: Any
 ) -> list[ToolCall]:
@@ -1152,7 +1171,7 @@ class _Prepared:
             return
         managed = run.found is not None and tc.id == run.found.call.id
         if managed and run.found is not None and run.found.admitted:
-            self.held.append(tc)
+            self.held.extend(await _admitted_arguments(run.ctx, run.run_id, tc, run.lookups))
             return
         outcome = await _dispatch_recovery_call(
             run.agent,
@@ -1238,5 +1257,5 @@ async def resolve(
         return barrier
     order_observations(recorder, ctx.history)
     if found is not None and [tc.id for tc in held] == [found.call.id]:
-        return _managed_handoff(agent, ctx, run_id, found.call, lookups)
+        return _managed_handoff(agent, ctx, run_id, held[0], lookups)
     return await _recovery_pause_result(store, run_id, ctx, state, descriptor, held, gates)

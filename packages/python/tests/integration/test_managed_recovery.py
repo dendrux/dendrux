@@ -1034,6 +1034,74 @@ async def test_recovered_mixed_batch_honours_a_requested_pause_then_binds_on_res
     assert child_llm.served == [child.id]
 
 
+# ---------------------------------------------------------------------------
+# Fix round 1, R3: the bound child receives exactly the admitted brief
+# ---------------------------------------------------------------------------
+
+EMAIL = "review@example.com"
+RESTORED = f"Contact {EMAIL}"
+
+
+@pytest.mark.parametrize("cut", ["live", "unprepared", "pre_handoff", "pre_bind"])
+async def test_recovered_child_gets_the_brief_its_admission_saw(
+    store: Any, engine: Any, monkeypatch: Any, cut: str
+) -> None:
+    """With PII restore, the hook, the brief limit and the child see the restored
+    brief, live and after a crash at each pre-bind cut; the limit is exactly its size,
+    so a different brief could not pass. No raw value reaches the root's model."""
+    from dendrux.guardrails import PII
+    from dendrux.loops import react
+    from dendrux.types import Limits
+
+    hooked: list[Any] = []
+
+    async def hook(ctx: Any) -> None:
+        hooked.append(dict(ctx.params))
+
+    def root(llm: Any, child_llm: Any) -> Agent:
+        child = reviewer(child_llm, limits=Limits(max_input_bytes=len(RESTORED.encode())))
+        return Agent(
+            name="lead",
+            prompt="You lead.",
+            provider=llm,
+            state_store=store,
+            subagents=[child],
+            before_tool=hook,
+            guardrails=[PII(action="redact", restore="all")],
+        )
+
+    asked = _asked("reviewer", {"task": "Contact <<EMAIL_ADDRESS_1>>"}, "r1")
+    child_llm = ContextLLM([_said(REPORT)])
+    root_llm = ContextLLM([asked, _said("root done")])
+    first = root(root_llm, child_llm)
+    if cut == "live":
+        result = await first.run(f"Contact {EMAIL}", tenant_id=TENANT)
+        model_calls = root_llm.messages
+    else:
+        target, name = {
+            "unprepared": (react, "_prepare_tool_calls"),
+            "pre_handoff": (_managed, "prepare_handoff"),
+            "pre_bind": (_managed, "bind_child"),
+        }[cut]
+        await _die_at(
+            monkeypatch, target, name, lambda: first.run(f"Contact {EMAIL}", tenant_id=TENANT)
+        )
+        root_id = await root_id_of(engine)
+        item = await expire(store, engine, root_id)
+        fresh_root_llm = ContextLLM([_said("root done")])
+        result = await root(fresh_root_llm, child_llm).reclaim(root_id, tenant_id=TENANT, item=item)
+        model_calls = root_llm.messages + fresh_root_llm.messages
+    assert result.status == RunStatus.SUCCESS
+    assert hooked and all(h == {"task": RESTORED} for h in hooked)
+    [child] = await children_of(engine, result.run_id)
+    assert child_llm.served == [child.id]
+    briefs = [m.content for m in child_llm.messages[0] if m.role.value == "user"]
+    assert briefs == [RESTORED]
+    assert EMAIL not in repr(model_calls)
+    traces = await rows(engine, ReactTrace, ReactTrace.agent_run_id == result.run_id)
+    assert EMAIL not in " ".join(t.content or "" for t in traces)
+
+
 if __name__ == "__main__":
     import asyncio
     import os
