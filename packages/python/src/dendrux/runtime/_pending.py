@@ -113,15 +113,7 @@ class PendingPause:
         A managed subagent's pause adds ``agent_name``, ``agent_path`` and
         ``origin_run_id``; a run's own pause keeps the original shape.
         """
-        origin = (
-            {
-                "agent_name": self.agent_name,
-                "agent_path": list(self.agent_path or ()),
-                "origin_run_id": self.origin_run_id,
-            }
-            if self.origin_run_id is not None
-            else {}
-        )
+        origin = _pending_origin(self)
         return {
             "run_id": self.run_id,
             "status": self.status,
@@ -145,6 +137,16 @@ class PendingPause:
             "exceeded": self.budget_exceeded,
             **origin,
         }
+
+
+def _pending_origin(pause: PendingPause) -> dict[str, Any]:
+    if pause.origin_run_id is None:
+        return {}
+    return {
+        "agent_name": pause.agent_name,
+        "agent_path": list(pause.agent_path or ()),
+        "origin_run_id": pause.origin_run_id,
+    }
 
 
 def _clarification_fields(

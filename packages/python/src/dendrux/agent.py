@@ -189,6 +189,25 @@ async def _refuse_managed_child(store: StateStore, record: Any) -> None:
         raise ManagedChildControlError(record.id)
 
 
+async def _check_retry_source(store: StateStore, run_id: str, tenant_id: TenantScope) -> None:
+    source = await store.get_run(run_id)
+    if source is not None and _in_tenant_scope(source, tenant_id):
+        await _refuse_managed_child(store, source)
+
+
+def _check_reclaim_arguments(
+    run_id: str, item: ReclaimableRun | None, tenant_id: TenantScope | _OmittedType
+) -> TenantScope:
+    from dendrux.errors import TenantScopeRequiredError
+
+    if item is not None and item.run_id != run_id:
+        raise ValueError("run_id must equal item.run_id")
+    if isinstance(tenant_id, _OmittedType):
+        _codes.log_code(_agent_logger, _codes.TENANT_SCOPE_REQUIRED, run_id=run_id)
+        raise TenantScopeRequiredError("reclaim")
+    return tenant_id
+
+
 def _cascade_order(subtree: Any) -> list[str]:
     """Run ids of a subtree snapshot: deepest descendants first, root last."""
     descendants = sorted((node for node in subtree.nodes if node.depth > 0), key=lambda n: -n.depth)
@@ -1287,6 +1306,14 @@ class Agent:
         await ensure_agent_limits_fit(self, store)
         return store
 
+    async def _require_state_store(self) -> StateStore:
+        from dendrux.errors import PersistenceNotConfiguredError
+
+        store = await self._resolve_state_store()
+        if store is None:
+            raise PersistenceNotConfiguredError()
+        return store
+
     async def _open_state_store(self) -> StateStore | None:
         """Lazily resolve the state store from config.
 
@@ -1631,9 +1658,7 @@ class Agent:
                 "retry() requires persistence (database_url or state_store). "
                 "Retry reads traces from the original run."
             )
-        source = await store.get_run(run_id)
-        if source is not None and _in_tenant_scope(source, tenant_id):
-            await _refuse_managed_child(store, source)
+        await _check_retry_source(store, run_id, tenant_id)
 
         from dendrux.runtime.runner import retry as runner_retry
 
@@ -1664,19 +1689,12 @@ class Agent:
         RunNotFoundError without changing the run.
         Interrupted non-idempotent tools pause for approval before replay.
         """
-        from dendrux.errors import PersistenceNotConfiguredError, TenantScopeRequiredError
         from dendrux.runtime._reclaim import reclaim
 
-        if item is not None and item.run_id != run_id:
-            raise ValueError("run_id must equal item.run_id")
-        if isinstance(tenant_id, _OmittedType):
-            _codes.log_code(_agent_logger, _codes.TENANT_SCOPE_REQUIRED, run_id=run_id)
-            raise TenantScopeRequiredError("reclaim")
+        tenant_id = _check_reclaim_arguments(run_id, item, tenant_id)
         tenant_id = entry_checks(self, "resume", tenant_id, default_tenant=UNSCOPED, run_id=run_id)
         self._require_provider()
-        store = await self._resolve_state_store()
-        if store is None:
-            raise PersistenceNotConfiguredError()
+        store = await self._require_state_store()
         if self._subagents:
             from dendrux.runtime import _managed
 
@@ -2955,12 +2973,9 @@ class Agent:
         tenant_id = entry_checks(
             self, "submit_resume", tenant_id, default_tenant=UNSCOPED, run_id=run_id
         )
-        from dendrux.errors import PersistenceNotConfiguredError
 
         self._require_provider()
-        store = await self._resolve_state_store()
-        if store is None:
-            raise PersistenceNotConfiguredError()
+        store = await self._require_state_store()
 
         def submit(agent: Agent, target: str) -> Awaitable[RunResult]:
             return agent._submit_resume_to(
@@ -3281,25 +3296,7 @@ class Agent:
         )
         _validate_max_delegation_depth(max_delegation_depth)
 
-        if self._guardrails:
-            raise ValueError(
-                "guardrails are not supported with stream() in this version. "
-                "Guardrails require the full response before scanning. "
-                "Use agent.run() instead."
-            )
-        if self._subagents:
-            from dendrux.runtime import _managed
-
-            _managed.require_streamable(self, "stream")
-
-        provider = self._require_provider()
-
-        if self._output_type is not None:
-            raise NotImplementedError(
-                "Structured output streaming is not supported in this version. "
-                "Use agent.run() for structured output, or create a separate "
-                "Agent without output_type for streaming."
-            )
+        provider = self._stream_provider()
 
         from dendrux.runtime.runner import run_stream as runner_run_stream
 
@@ -3327,9 +3324,34 @@ class Agent:
             **kwargs,
         )
         if self._subagents:
+            from dendrux.runtime import _managed
+
             # Subagents run in this task as the root's stream reaches them (0.7).
             return _managed.start_stream(self, stream, notifier=notifier)
         return stream
+
+    def _stream_provider(self) -> LLMProvider:
+        if self._guardrails:
+            raise ValueError(
+                "guardrails are not supported with stream() in this version. "
+                "Guardrails require the full response before scanning. "
+                "Use agent.run() instead."
+            )
+        if self._subagents:
+            from dendrux.runtime import _managed
+
+            _managed.require_streamable(self, "stream")
+
+        provider = self._require_provider()
+
+        if self._output_type is not None:
+            raise NotImplementedError(
+                "Structured output streaming is not supported in this version. "
+                "Use agent.run() for structured output, or create a separate "
+                "Agent without output_type for streaming."
+            )
+
+        return provider
 
     def resume_stream(
         self,
@@ -3388,14 +3410,7 @@ class Agent:
             tool_results=tool_results,
             user_input=user_input,
         )
-        if self._guardrails:
-            raise ValueError(
-                "guardrails are not supported with resume_stream() in this version. "
-                "Use agent.resume() instead."
-            )
-        provider = self._require_provider()
-        if tool_results is not None and user_input is not None:
-            raise ValueError("Cannot provide both tool_results and user_input to resume_stream().")
+        provider = self._resume_stream_provider(tool_results, user_input)
         if self._subagents:
             from dendrux.runtime import _managed
 
@@ -3426,6 +3441,19 @@ class Agent:
             _tenant_explicit=tenant_explicit,
         )
         return self._tenant_checked_stream(stream, run_id, tenant_id)
+
+    def _resume_stream_provider(
+        self, tool_results: list[ToolResult] | None, user_input: UserContent | None
+    ) -> LLMProvider:
+        if self._guardrails:
+            raise ValueError(
+                "guardrails are not supported with resume_stream() in this version. "
+                "Use agent.resume() instead."
+            )
+        provider = self._require_provider()
+        if tool_results is not None and user_input is not None:
+            raise ValueError("Cannot provide both tool_results and user_input to resume_stream().")
+        return provider
 
     def _tenant_checked_stream(
         self, inner: RunStream, run_id: str, tenant_id: TenantScope

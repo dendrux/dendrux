@@ -2388,6 +2388,10 @@ def _after_tools(
     order_observations(ctx.recorder, ctx.state.history)
     if not outcome.pending_calls:
         return None
+    return _pending_tools_result(ctx, outcome, iteration)
+
+
+def _pending_tools_result(ctx: _RunContext, outcome: _ToolCallOutcome, iteration: int) -> RunResult:
     handoff = _managed_handoff(ctx, outcome, iteration)
     if handoff is not None:
         return handoff
