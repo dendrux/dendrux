@@ -5646,6 +5646,8 @@ class _ApprovalResume(NamedTuple):
     # Calls not yet resolved when the barrier hit (client calls excluded),
     # as (call, outcome, denial reason) in pending order.
     remaining: tuple[tuple[ToolCall, str, str | None], ...] = ()
+    # The admitted generated subagent call, handed to the bind (0.7).
+    handoff: Any = None
 
 
 async def _resume_pause_barrier(state_store: StateStore, run_id: str) -> RunStatus | None:
@@ -6064,6 +6066,8 @@ def _approval_stop_result(
             iteration_count=pause_state.iteration,
             usage=pause_state.usage,
         )
+    if approval.handoff is not None:
+        return _approved_handoff(run_id, pause_state, history, approval.handoff)
     if not approval.client_pending:
         return None
     client_pause = PauseState(
@@ -6090,6 +6094,35 @@ def _approval_stop_result(
         iteration_count=pause_state.iteration,
         usage=pause_state.usage,
         meta={"pause_state": client_pause},
+    )
+
+
+def _approved_handoff(
+    run_id: str, pause_state: PauseState, history: list[Message], handoff: Any
+) -> RunResult:
+    """The approved batch's subagent call, handed to the durable bind (0.7)."""
+    from dataclasses import replace as _replace
+
+    from dendrux.loops.react import MANAGED_HANDOFF_KEY
+    from dendrux.types import RunResult
+
+    call = handoff.call
+    pause = _replace(
+        pause_state,
+        history=list(history),
+        pending_tool_calls=[call],
+        pending_targets={call.id: "agent"},
+        approval_gates=None,
+        pending_decisions=None,
+        pause_reason=None,
+    )
+    return RunResult(
+        run_id=run_id,
+        status=RunStatus.RUNNING,
+        steps=pause.steps,
+        iteration_count=pause.iteration,
+        usage=pause.usage,
+        meta={"pause_state": pause, MANAGED_HANDOFF_KEY: handoff},
     )
 
 
@@ -6852,7 +6885,41 @@ async def _resume_approval_batch(
         image_runtime=image_runtime,
         on_work=on_work,
     )
-    return approval, approving
+    return await _hand_off_approved_subagent(agent, ctx, run_id, approval), approving
+
+
+async def _hand_off_approved_subagent(
+    agent: Agent, ctx: _ResumeContext, run_id: str, approval: _ApprovalResume
+) -> _ApprovalResume:
+    """A held generated subagent call goes to the bind, never to a client pause (0.7).
+
+    The approved batch's server outcomes are already recorded. The subagent
+    call (never gated: an approval decision on it is a denial) passes the
+    child's brief limit, as in a live batch, and is handed off.
+    """
+    from dendrux.loops.react import ManagedHandoff, SubagentTool, _admit_managed_briefs
+
+    if approval.barrier is not None or not approval.client_pending:
+        return approval
+    lookups = await agent.get_tool_lookups(loop=ctx.resolved_loop)
+    managed = [
+        tc for tc in approval.client_pending if isinstance(lookups.fn.get(tc.name), SubagentTool)
+    ]
+    if not managed:
+        return approval
+    if len(approval.client_pending) != 1:
+        from dendrux.errors import ManagedUnsupportedError
+
+        raise ManagedUnsupportedError("approval_mixed_batch", run_id)
+    from dendrux.runtime._reclaim import _recovery_batch
+
+    admitted = await _admit_managed_briefs(managed, lookups, _recovery_batch(ctx, run_id))
+    entry = lookups.fn[managed[0].name]
+    assert isinstance(entry, SubagentTool)
+    handoff = (
+        ManagedHandoff(call=admitted[0], child=entry.agent, parent=agent) if admitted else None
+    )
+    return approval._replace(client_pending=[], handoff=handoff)
 
 
 async def _finish_approval_batch(
