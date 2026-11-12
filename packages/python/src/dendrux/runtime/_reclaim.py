@@ -1043,12 +1043,11 @@ async def _recover_managed_calls(
     supported batch (one managed call, other calls server-side) returns a
     :class:`_ManagedPending`: ordinary recovery then resolves the server calls
     and admits the managed call, which is bound afterwards, never dispatched.
-    Kept refusals: a saved submission beside a pending managed call
-    (``recover_managed_submission``) and a batch that needs an approval
-    decision (``recover_managed_approval``). Returns ``_ORDINARY`` when no
+    A saved approval submission is consumed first, as for any batch; a batch
+    that needs an approval decision pauses for it, and the approved
+    continuation binds the managed call. Returns ``_ORDINARY`` when no
     generated call is pending, None after a durable refusal.
     """
-    from dendrux.errors import ManagedUnsupportedError
     from dendrux.loops.react import SubagentTool, _managed_batch_unsupported
     from dendrux.runtime._managed import ADMITTED_KEY
 
@@ -1062,30 +1061,21 @@ async def _recover_managed_calls(
     managed = [tc for tc in pending if isinstance(lookups.fn.get(tc.name), SubagentTool)]
     if not managed:
         return _ORDINARY
-    if state.get("submission"):
-        raise ManagedUnsupportedError("recover_managed_submission", run_id)
     if _managed_batch_unsupported(pending, lookups):
         await _refuse_recovered_batch(ctx, run_id, pending)
         return None
     return _ManagedPending(managed[0], admitted=state.get(ADMITTED_KEY) == managed[0].id)
 
 
-def _refuse_managed_approval(
-    found: _ManagedPending | None, run_id: str, actions: Any, rows: dict[str, Any], gates: Any
-) -> None:
-    """A recovered batch with a managed call that needs an approval decision (0.7).
+def _refuse_bound_pending(found: _ManagedPending | None, run_id: str, rows: dict[str, Any]) -> None:
+    """A pending managed call that already has a tool row is invalid state (0.7).
 
-    Refused, not paused: today's approval continuation would treat the pending
-    managed call as a client call. A bound managed intent here is invalid state.
+    A bound call's parent is parked, never reclaimed with it pending.
     """
-    from dendrux.errors import ManagedStateError, ManagedUnsupportedError
+    from dendrux.errors import ManagedStateError
 
-    if found is None:
-        return
-    if found.call.id in rows:
+    if found is not None and found.call.id in rows:
         raise ManagedStateError(reason="binding_outstanding", run_id=run_id)
-    if gates or any(a.kind in ("approval", "approval_replay") for a in actions):
-        raise ManagedUnsupportedError("recover_managed_approval", run_id)
 
 
 async def _admitted_arguments(
@@ -1292,11 +1282,10 @@ async def resolve(
         phases={p["call_id"]: p["phase"] for p in pending},
         reserved=counts.copy(),
     )
-    _refuse_managed_approval(found, run_id, actions, by_id, None)
+    _refuse_bound_pending(found, run_id, by_id)
     barrier = await prep.prepare_all(store, actions, by_id)
     if barrier is not None:
         return barrier
-    _refuse_managed_approval(found, run_id, (), by_id, prep.gates)
     held, barrier = await _dispatch_prepared_batch(
         agent,
         store,

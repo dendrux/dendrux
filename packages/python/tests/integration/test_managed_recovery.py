@@ -969,13 +969,12 @@ async def test_recovered_unadmitted_oversize_brief_is_refused_before_bind(
 
 
 @pytest.mark.parametrize("gate", ["gated_sibling", "unknown_sibling"])
-async def test_recovered_managed_call_needing_approval_is_refused_before_effects(
+async def test_recovered_managed_call_needing_approval_pauses_then_binds_once_approved(
     store: Any, engine: Any, monkeypatch: Any, gate: str
 ) -> None:
-    """Kept refusal: a recovered approval pause holding a managed call would continue
-    through today's approval path, which pauses that call for a client (see report)."""
+    """T4c: recovery pauses for the approval before any effect; the approved
+    continuation runs the sibling and binds the managed call once."""
     global _CRASH_IN_TOOL
-    from dendrux.errors import ManagedUnsupportedError
     from dendrux.loops import react
 
     kw: dict[str, Any] = {"require_approval": ["fetch"]} if gate == "gated_sibling" else {}
@@ -997,13 +996,20 @@ async def test_recovered_managed_call_needing_approval_is_refused_before_effects
     item = await expire(store, engine, root_id)
     before = await _snapshot(engine, root_id)
     child_llm = ContextLLM([_said(REPORT)])
-    fresh = _hooked(store, ContextLLM([]), reviewer(child_llm), **kw)
-    with pytest.raises(ManagedUnsupportedError) as info:
-        await fresh.reclaim(root_id, tenant_id=TENANT, item=item)
-    assert info.value.operation == "recover_managed_approval"
-    assert effects == [] and child_llm.calls == 0
-    assert not await children_of(engine, root_id)
-    assert (await _snapshot(engine, root_id))["children"] == before["children"]
+    fresh = _hooked(store, ContextLLM([_said("root done")]), reviewer(child_llm), **kw)
+    waiting = await fresh.reclaim(root_id, tenant_id=TENANT, item=item)
+    assert waiting.status == RunStatus.WAITING_APPROVAL
+    # Policy callbacks run again as in ordinary recovery; no tool or child effect.
+    assert [e for e in effects if not e.startswith("hook:")] == [] and child_llm.calls == 0
+    assert (await _snapshot(engine, root_id))["children"] == before["children"] == []
+    result = await fresh.submit_approval(
+        root_id, approved=True, expected_pause_id=waiting.pause_id, tenant_id=TENANT
+    )
+    assert result.status == RunStatus.SUCCESS
+    [child] = await children_of(engine, root_id)
+    assert child_llm.served == [child.id]
+    sibling = "fetch:1" if gate == "gated_sibling" else "send:s"
+    assert effects.count(sibling) == 1
 
 
 async def test_recovered_mixed_batch_honours_a_requested_pause_then_binds_on_resume(

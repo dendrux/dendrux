@@ -23,7 +23,6 @@ from dendrux import Agent, tool
 from dendrux.db.models import AgentRun, ReactTrace, RunEvent, TokenUsage, ToolCallRecord
 from dendrux.errors import (
     ManagedChildControlError,
-    ManagedUnsupportedError,
     RunFencedError,
     RunNotReclaimableError,
 )
@@ -1228,9 +1227,11 @@ async def test_r4a_recorded_approval_gate_is_not_bound_on_recovery(
     fresh = _recovery_root(
         store, ContextLLM([]), _named("reviewer", child_llm), require_approval=["fetch"]
     )
-    with pytest.raises(ManagedUnsupportedError):
-        await fresh.reclaim(root_id, tenant_id=TENANT, item=item)
-    assert child_llm.calls == 0 and effects == []
+    # T4c: the saved gate is honoured as an approval pause, never bypassed.
+    waiting = await fresh.reclaim(root_id, tenant_id=TENANT, item=item)
+    assert waiting.status == RunStatus.WAITING_APPROVAL
+    # Policy callbacks run again as in ordinary recovery; no tool or child effect.
+    assert child_llm.calls == 0 and "fetch" not in effects
     assert not await rows(engine, AgentRun, AgentRun.parent_run_id == root_id)
     gated = (await rows(engine, AgentRun, AgentRun.id == root_id))[0].loop_state["pending"]
     assert "gated" in [p["phase"] for p in gated]  # the saved gate is preserved

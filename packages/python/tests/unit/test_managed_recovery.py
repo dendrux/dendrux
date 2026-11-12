@@ -1,4 +1,4 @@
-"""Managed subagents (0.7, T4): pure recovery and sweep decisions, no database."""
+"""Managed subagents (0.7, T4/T4c): pure recovery, sweep and submit decisions, no database."""
 
 from __future__ import annotations
 
@@ -9,8 +9,8 @@ from typing import Any
 
 import pytest
 
-from dendrux.errors import ManagedStateError, ManagedUnsupportedError
-from dendrux.runtime._reclaim import _ManagedPending, _refuse_managed_approval
+from dendrux.errors import ManagedStateError
+from dendrux.runtime._reclaim import _ManagedPending, _refuse_bound_pending
 from dendrux.runtime.stores.sql.base import _SweepScan
 from dendrux.types import ToolCall, generate_ulid
 
@@ -18,36 +18,45 @@ CALL = ToolCall(name="reviewer", params={"task": "t"}, id="m1")
 RUN = generate_ulid()
 
 
-def _action(kind: str, call_id: str = "s1") -> Any:
-    return SimpleNamespace(kind=kind, call_id=call_id)
-
-
-@pytest.mark.parametrize("kind", ["dispatch", "observe", "replay", "resolve"])
-def test_a_managed_batch_without_an_approval_decision_is_completed(kind: str) -> None:
-    _refuse_managed_approval(_ManagedPending(CALL, False), RUN, [_action(kind)], {}, None)
-    _refuse_managed_approval(_ManagedPending(CALL, True), RUN, [], {}, {})
-
-
-@pytest.mark.parametrize("kind", ["approval", "approval_replay"])
-def test_a_recorded_approval_decision_keeps_the_refusal(kind: str) -> None:
-    with pytest.raises(ManagedUnsupportedError) as info:
-        _refuse_managed_approval(_ManagedPending(CALL, False), RUN, [_action(kind)], {}, None)
-    assert info.value.operation == "recover_managed_approval"
-
-
-def test_a_gate_raised_during_recovery_keeps_the_refusal() -> None:
-    with pytest.raises(ManagedUnsupportedError):
-        _refuse_managed_approval(_ManagedPending(CALL, False), RUN, (), {}, {"s1": {}})
+def test_a_pending_managed_call_without_a_tool_row_is_recovered() -> None:
+    _refuse_bound_pending(_ManagedPending(CALL, False), RUN, {})
+    _refuse_bound_pending(_ManagedPending(CALL, True), RUN, {"s1": object()})
 
 
 def test_a_bound_intent_for_a_pending_call_is_invalid_state() -> None:
     with pytest.raises(ManagedStateError) as info:
-        _refuse_managed_approval(_ManagedPending(CALL, True), RUN, [], {"m1": object()}, None)
+        _refuse_bound_pending(_ManagedPending(CALL, True), RUN, {"m1": object()})
     assert info.value.reason == "binding_outstanding"
 
 
 def test_no_pending_managed_call_is_never_refused() -> None:
-    _refuse_managed_approval(None, RUN, [_action("approval")], {"m1": object()}, {"x": {}})
+    _refuse_bound_pending(None, RUN, {"m1": object()})
+
+
+def test_only_external_results_for_a_subagent_call_are_refused() -> None:
+    """T4c: a caller-supplied result for an ``agent`` target is refused, typed."""
+    from dendrux.errors import InvalidToolResultError, ManagedResultRefusedError
+    from dendrux.runtime.submit import pause_validator, refuse_managed_results
+    from dendrux.types import ToolResult
+
+    forged = [ToolResult(name="reviewer", call_id="m1", payload='"x"')]
+    other = [ToolResult(name="fetch", call_id="s1", payload='"x"')]
+    targets = {"m1": "agent", "s1": "client"}
+    refuse_managed_results(RUN, targets, other)
+    refuse_managed_results(RUN, None, forged)
+    with pytest.raises(ManagedResultRefusedError) as info:
+        refuse_managed_results(RUN, targets, forged)
+    assert isinstance(info.value, InvalidToolResultError)
+    assert info.value.code == "managed_result_refused" and RUN in str(info.value)
+    current = {
+        "pause_id": None,
+        "pending_tool_calls": [{"id": "m1", "name": "reviewer"}],
+        "pending_targets": {"m1": "agent"},
+    }
+    # Runtime denials (approved=False) answer the same call and stay accepted.
+    pause_validator(RUN, None, call_results=forged)(current)
+    with pytest.raises(ManagedResultRefusedError):
+        pause_validator(RUN, None, call_results=forged, client_results=True)(current)
 
 
 class _Store:
