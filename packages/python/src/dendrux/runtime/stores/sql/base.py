@@ -73,6 +73,8 @@ from dendrux.runtime.durability import (
 )
 from dendrux.types import (
     _PROVIDER_KWARGS_MAX_BYTES,
+    MANAGED_WAIT_REASON,
+    MANAGED_WAIT_SCHEMA_VERSION,
     ULID_CHARS,
     CreateRunResult,
     IdempotencyConflictError,
@@ -365,6 +367,196 @@ def _refuse_direct_managed_child(run_id: str, loop_state: Any) -> None:
     header = (loop_state or {}).get(MANAGED_HEADER_KEY)
     if isinstance(header, dict) and "invocation" in header and not managed_root_reclaim(run_id):
         raise ManagedChildControlError(run_id)
+
+
+class _SweepScan:
+    """One sweep category: projected candidate pages and each row's final CAS.
+
+    Waiting pages also project a parent's managed-wait marks from ``pause_data``
+    (schema version, pause reason, bound child id; no history, no JSON index). A
+    v3 managed wait is never abandoned (0.7): it waits on a subagent, or holds a
+    finished subagent's adoption. The final CAS rechecks that exemption. A row
+    carrying only part of the marks is a corrupt managed wait: reported, never
+    swept and never recreated.
+    """
+
+    def __init__(self, store: SQLStateStore, *, waiting: bool, older_than: timedelta) -> None:
+        from sqlalchemy import func, literal_column
+
+        from dendrux.db.models import AgentRun, RunEvent
+
+        self.store, self.waiting = store, waiting
+        self.now = _dt.datetime.now(_dt.UTC)
+        self.cutoff = self.now - older_than
+        self.age = (
+            AgentRun.status_changed_at
+            if waiting
+            else func.coalesce(AgentRun.last_progress_at, AgentRun.created_at)
+        )
+        # A scalar LIMIT subquery prevents a hashed scan of every started event.
+        self.started = (
+            select(RunEvent.id)
+            .where(
+                RunEvent.agent_run_id == AgentRun.id,
+                RunEvent.event_type == literal_column(f"'{StoredEventType.RUN_STARTED.value}'"),
+            )
+            .limit(1)
+            .correlate(AgentRun)
+            .scalar_subquery()
+        )
+
+    def _wait_marks(self) -> tuple[Any, Any, Any]:
+        from dendrux.db.models import AgentRun
+
+        col = AgentRun.pause_data
+        return (
+            self.store.json_get(col, ("schema_version",), "int"),
+            self.store.json_get(col, ("pause_reason",), "str"),
+            self.store.json_get(col, (MANAGED_BINDING_KEY, "child_run_id"), "str"),
+        )
+
+    def _not_managed_wait(self) -> Any:
+        from sqlalchemy import or_
+
+        version, reason, _child = self._wait_marks()
+        return and_(
+            or_(version.is_(None), version != MANAGED_WAIT_SCHEMA_VERSION),
+            or_(reason.is_(None), reason != MANAGED_WAIT_REASON),
+        )
+
+    def page(self, status_filter: str, after: Any, limit: int) -> Any:
+        from sqlalchemy import tuple_
+
+        from dendrux.db.models import AgentRun
+
+        marks = (
+            [m.label(n) for m, n in zip(self._wait_marks(), _WAIT_MARK_LABELS, strict=True)]
+            if self.waiting
+            else []
+        )
+        statement = select(
+            AgentRun.id,
+            AgentRun.agent_name,
+            AgentRun.status,
+            AgentRun.last_progress_at,
+            AgentRun.iteration_count,
+            AgentRun.claim_epoch,
+            self.started.label("started"),
+            self.age.label("sweep_age"),
+            *marks,
+        ).limit(limit)
+        if self.waiting:
+            statement = statement.where(
+                AgentRun.status == status_filter, self.age < self.cutoff
+            ).order_by(self.age, AgentRun.id)
+            if after is not None:
+                statement = statement.where(tuple_(self.age, AgentRun.id) > after)
+            return statement
+        # Equal range bounds preserve the (status, id) ordering in the planner.
+        # Equality alone lets it prefer the primary key and filter through
+        # terminal history on every page.
+        statement = statement.where(AgentRun.status.between(status_filter, status_filter)).order_by(
+            AgentRun.status, AgentRun.id
+        )
+        if after is not None:
+            statement = statement.where(
+                tuple_(AgentRun.status, AgentRun.id) > (status_filter, after)
+            )
+        return statement
+
+    def skipped(self, row: Any) -> bool:
+        """A fresh running row (counted, not swept) or any managed wait."""
+        if not self.waiting:
+            # Running rows are bounded by live concurrency. Count every inspected
+            # row against the work cap, including fresh ones.
+            return bool(_to_aware_utc(row.sweep_age) >= self.cutoff)
+        version = row.wait_version == MANAGED_WAIT_SCHEMA_VERSION
+        reason = row.wait_reason == MANAGED_WAIT_REASON
+        if not (version or reason):
+            return False
+        if not (version and reason and row.wait_child):
+            _codes.log_code(
+                logger, _codes.MANAGED_STATE_INVALID, run_id=row.id, managed_reason="wait_invalid"
+            )
+        return True
+
+    def _reason(self, row: Any) -> str:
+        if self.waiting:
+            return FailureReason.ABANDONED_WAITING.value
+        if row.started:
+            return FailureReason.STALE_RUNNING.value
+        return FailureReason.NEVER_STARTED.value
+
+    async def sweep_row(self, row: Any) -> SweptRun | None:
+        """The row's final CAS and its lifecycle event; None when another writer won."""
+        from sqlalchemy import case
+
+        from dendrux.db.models import AgentRun
+
+        reason = self._reason(row)
+        flagged = AgentRun.cancel_requested.is_(True)
+        waiting = self.waiting
+        new_status = (
+            RunStatus.ERROR.value
+            if waiting
+            else case((flagged, RunStatus.CANCELLED.value), else_=RunStatus.ERROR.value)
+        )
+        async with self.store._session_factory() as session:
+            result = await self.store._update_one_rows(
+                session,
+                table=AgentRun.__table__,
+                pk=(row.id,),
+                predicate=and_(
+                    AgentRun.id == row.id,
+                    AgentRun.status == row.status,
+                    AgentRun.claim_epoch == row.claim_epoch,
+                    self.age < self.cutoff,
+                    and_(AgentRun.updated_at < self.cutoff, self._not_managed_wait())
+                    if waiting
+                    else true(),
+                ),
+                values=dict(
+                    **_status_values(new_status),
+                    claim_epoch=AgentRun.claim_epoch + 1,
+                    failure_reason=reason,
+                    pause_data=None,
+                    error=f"Run swept as {reason}"
+                    if waiting
+                    else case((flagged, None), else_=f"Run swept as {reason}"),
+                    cancel_requested=False,
+                    pause_requested=False,
+                ),
+                returning=[AgentRun.status],
+            )
+            status = result.scalar_one_or_none()
+            if status is None:
+                return None
+            event_type = (
+                StoredEventType.RUN_ABANDONED.value
+                if waiting
+                else StoredEventType.RUN_INTERRUPTED.value
+            )
+            data = {"failure_reason": reason}
+            if status == RunStatus.CANCELLED.value:
+                event_type = StoredEventType.RUN_CANCELLED.value
+                data["reason"] = CancelReason.CANCEL_REQUESTED.value
+            await _insert_event_locked(
+                session, row.id, event_type, data, iteration_index=row.iteration_count or 0
+            )
+            self.store._mark_announce(session, (row.id,))
+            await self.store._write_tx(session)
+        return SweptRun(
+            run_id=row.id,
+            agent_name=row.agent_name,
+            previous_status=row.status,
+            failure_reason=reason,
+            last_progress_at=_to_aware_utc(row.last_progress_at),
+            swept_at=_to_aware_utc(self.now),
+            status=status,
+        )
+
+
+_WAIT_MARK_LABELS = ("wait_version", "wait_reason", "wait_child")
 
 
 def _creation_metadata(
@@ -5361,10 +5553,6 @@ class SQLStateStore(SQLBlobCatalog):
         batch_size: int,
         max_runs: int,
     ) -> list[SweptRun]:
-        from sqlalchemy import case, func, literal_column, select, true, tuple_
-
-        from dendrux.db.models import AgentRun, RunEvent
-
         for name, value, ceiling in (
             ("batch_size", batch_size, SWEEP_BATCH_MAX),
             ("max_runs", max_runs, SWEEP_MAX_RUNS_MAX),
@@ -5372,57 +5560,13 @@ class SQLStateStore(SQLBlobCatalog):
             if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= ceiling:
                 raise ValueError(f"{name} must be between 1 and {ceiling}")
         _validate_sweep_age(older_than)
-        now = _dt.datetime.now(_dt.UTC)
-        cutoff = now - older_than
-        age = (
-            AgentRun.status_changed_at
-            if waiting
-            else func.coalesce(AgentRun.last_progress_at, AgentRun.created_at)
-        )
-        statuses = PAUSE_STATUS_VALUES if waiting else [RunStatus.RUNNING.value]
-        # A scalar LIMIT subquery prevents a hashed scan of every started event.
-        started = (
-            select(RunEvent.id)
-            .where(
-                RunEvent.agent_run_id == AgentRun.id,
-                RunEvent.event_type == literal_column(f"'{StoredEventType.RUN_STARTED.value}'"),
-            )
-            .limit(1)
-            .correlate(AgentRun)
-            .scalar_subquery()
-        )
+        scan = _SweepScan(self, waiting=waiting, older_than=older_than)
         swept: list[SweptRun] = []
         visited = 0
-        for status_filter in statuses:
+        for status_filter in PAUSE_STATUS_VALUES if waiting else [RunStatus.RUNNING.value]:
             after: tuple[_dt.datetime, str] | str | None = None
             while visited < max_runs:
-                statement = select(
-                    AgentRun.id,
-                    AgentRun.agent_name,
-                    AgentRun.status,
-                    AgentRun.last_progress_at,
-                    AgentRun.iteration_count,
-                    AgentRun.claim_epoch,
-                    started.label("started"),
-                    age.label("sweep_age"),
-                ).limit(min(batch_size, max_runs - visited))
-                if waiting:
-                    statement = statement.where(
-                        AgentRun.status == status_filter, age < cutoff
-                    ).order_by(age, AgentRun.id)
-                    if after is not None:
-                        statement = statement.where(tuple_(age, AgentRun.id) > after)
-                else:
-                    # Equal range bounds preserve the (status, id) ordering in
-                    # the planner. Equality alone lets it prefer the primary key
-                    # and filter through terminal history on every page.
-                    statement = statement.where(
-                        AgentRun.status.between(status_filter, status_filter)
-                    ).order_by(AgentRun.status, AgentRun.id)
-                    if after is not None:
-                        statement = statement.where(
-                            tuple_(AgentRun.status, AgentRun.id) > (status_filter, after)
-                        )
+                statement = scan.page(status_filter, after, min(batch_size, max_runs - visited))
                 async with self._session_factory() as session:
                     rows = (await session.execute(statement)).all()
                 if not rows:
@@ -5431,82 +5575,9 @@ class SQLStateStore(SQLBlobCatalog):
                 after = (rows[-1].sweep_age, rows[-1].id) if waiting else rows[-1].id
                 async with _live_updates_page(self):
                     for row in rows:
-                        # Running rows are bounded by live concurrency. Count every
-                        # inspected row against the work cap, including fresh ones.
-                        if not waiting and _to_aware_utc(row.sweep_age) >= cutoff:
-                            continue
-                        reason = (
-                            FailureReason.ABANDONED_WAITING.value
-                            if waiting
-                            else FailureReason.STALE_RUNNING.value
-                            if row.started
-                            else FailureReason.NEVER_STARTED.value
-                        )
-                        flagged = AgentRun.cancel_requested.is_(True)
-                        new_status = (
-                            RunStatus.ERROR.value
-                            if waiting
-                            else case(
-                                (flagged, RunStatus.CANCELLED.value), else_=RunStatus.ERROR.value
-                            )
-                        )
-                        async with self._session_factory() as session:
-                            result = await self._update_one_rows(
-                                session,
-                                table=AgentRun.__table__,
-                                pk=(row.id,),
-                                predicate=and_(
-                                    AgentRun.id == row.id,
-                                    AgentRun.status == row.status,
-                                    AgentRun.claim_epoch == row.claim_epoch,
-                                    age < cutoff,
-                                    AgentRun.updated_at < cutoff if waiting else true(),
-                                ),
-                                values=dict(
-                                    **_status_values(new_status),
-                                    claim_epoch=AgentRun.claim_epoch + 1,
-                                    failure_reason=reason,
-                                    pause_data=None,
-                                    error=f"Run swept as {reason}"
-                                    if waiting
-                                    else case((flagged, None), else_=f"Run swept as {reason}"),
-                                    cancel_requested=False,
-                                    pause_requested=False,
-                                ),
-                                returning=[AgentRun.status],
-                            )
-                            status = result.scalar_one_or_none()
-                            if status is None:
-                                continue
-                            event_type = (
-                                StoredEventType.RUN_ABANDONED.value
-                                if waiting
-                                else StoredEventType.RUN_INTERRUPTED.value
-                            )
-                            data = {"failure_reason": reason}
-                            if status == RunStatus.CANCELLED.value:
-                                event_type = StoredEventType.RUN_CANCELLED.value
-                                data["reason"] = CancelReason.CANCEL_REQUESTED.value
-                            await _insert_event_locked(
-                                session,
-                                row.id,
-                                event_type,
-                                data,
-                                iteration_index=row.iteration_count or 0,
-                            )
-                            self._mark_announce(session, (row.id,))
-                            await self._write_tx(session)
-                        swept.append(
-                            SweptRun(
-                                run_id=row.id,
-                                agent_name=row.agent_name,
-                                previous_status=row.status,
-                                failure_reason=reason,
-                                last_progress_at=_to_aware_utc(row.last_progress_at),
-                                swept_at=_to_aware_utc(now),
-                                status=status,
-                            )
-                        )
+                        done = None if scan.skipped(row) else await scan.sweep_row(row)
+                        if done is not None:
+                            swept.append(done)
         if visited == max_runs:
             _codes.log_code(
                 logger,

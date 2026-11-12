@@ -1549,11 +1549,17 @@ async def walk(root_agent: Agent, store: Any, root_run_id: str) -> tuple[list[_W
 
 
 async def _outgoing(store: Any, record: RunRecord) -> PauseState | None:
-    """The v3 managed wait of a parked parent, else None."""
+    """The v3 managed wait of a parked parent, else None.
+
+    A pause carrying either managed-wait mark is decoded strictly, so a corrupt
+    wait is invalid state, never read as the root's own ordinary pause.
+    """
     if record.status != RunStatus.PAUSED.value:
         return None
     raw = await store.get_pause_state(record.id)
-    if not raw or raw.get("schema_version") != 3:
+    if not raw or (
+        raw.get("schema_version") != 3 and raw.get("pause_reason") != MANAGED_WAIT_REASON
+    ):
         return None
     return PauseState.from_managed_dict(raw, run_id=record.id)
 
