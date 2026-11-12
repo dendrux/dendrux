@@ -659,12 +659,17 @@ def _engine_url(engine: Any) -> str:
     return engine.url.render_as_string(hide_password=False)
 
 
-async def test_bind_race_stale_epoch_cancel_and_tenant(store, engine):
+@pytest.mark.parametrize(
+    "order", ["mixed", "real-first", "unknown-first"], ids=["mixed", "real-first", "unknown-first"]
+)
+async def test_bind_race_stale_epoch_cancel_and_tenant(store, engine, order):
     """N independent contenders for one parent: exactly one child and intent, no orphan.
 
-    Half the contenders bind the same invocation with different candidate child ids,
-    the rest bind other invocations of the same parent epoch. On Postgres they use two
-    engines (separate pools stand in for separate processes) and real row locks.
+    Eight contenders bind the same invocation with different candidate child ids,
+    four use unknown call ids at the same parent epoch. Each group races on Postgres
+    using two engines (separate pools stand in for separate processes) and real row
+    locks. ``mixed`` races everyone at once; the ordered variants guarantee unknown
+    calls lock before or after the winner.
     """
     contenders = 8
     engines = [engine]
@@ -677,10 +682,22 @@ async def test_bind_race_stale_epoch_cancel_and_tenant(store, engine):
             requests = [
                 bind_request(parent, call_id, child_id=generate_ulid()) for _ in range(contenders)
             ] + [bind_request(parent, generate_ulid()) for _ in range(contenders // 2)]
-            results = await asyncio.gather(
-                *(stores[i % len(stores)].bind_managed_child(r) for i, r in enumerate(requests)),
-                return_exceptions=True,
+            first_count = {"mixed": len(requests), "real-first": contenders}.get(
+                order, contenders // 2
             )
+            if order == "unknown-first":
+                requests.reverse()
+            results = []
+            for batch in (requests[:first_count], requests[first_count:]):
+                results.extend(
+                    await asyncio.gather(
+                        *(
+                            stores[i % len(stores)].bind_managed_child(r)
+                            for i, r in enumerate(batch)
+                        ),
+                        return_exceptions=True,
+                    )
+                )
             await _assert_one_binding(engine, parent, requests, results)
     finally:
         for extra in engines[1:]:
@@ -701,9 +718,12 @@ async def _assert_one_binding(
         if outcome is result:
             continue
         if isinstance(outcome, BaseException):
-            # Another invocation found the parent parked with its epoch retired.
-            assert isinstance(outcome, RunFencedError), outcome
             assert request.tool_call_id != won.tool_call_id
+            # An unknown call locks either before the bind or after the epoch retires.
+            if isinstance(outcome, ManagedStateError):
+                assert outcome.reason == "pending_missing", outcome
+            else:
+                assert isinstance(outcome, RunFencedError), outcome
         else:
             # The same invocation reads the binding back, never with ownership.
             assert outcome.outcome == "existing" and outcome.child_claim is None
