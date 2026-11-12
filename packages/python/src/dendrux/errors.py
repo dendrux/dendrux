@@ -402,6 +402,22 @@ class InvalidToolResultError(ValueError):
         super().__init__(f"Invalid tool results for run '{run_id}': {detail}")
 
 
+class ManagedResultRefusedError(InvalidToolResultError):
+    """A tool result was submitted for a generated subagent call (0.7).
+
+    Only the bound child run reports a subagent call; the parent adopts its
+    saved outcome. ``code`` is ``managed_result_refused``; the message carries
+    the run id only. Subclasses :class:`InvalidToolResultError`, so existing
+    handlers keep working.
+    """
+
+    code = "managed_result_refused"
+
+    def __init__(self, run_id: str) -> None:
+        _codes.log_code(logging.getLogger(__name__), _codes.MANAGED_RESULT_REFUSED, run_id=run_id)
+        super().__init__(run_id, "a subagent call is reported by its child run")
+
+
 class PersistenceError(RuntimeError):
     """A database operation failed; SQL, parameters and driver text are omitted."""
 

@@ -156,7 +156,23 @@ async def validate_tool_results(
     if parts:
         raise _invalid_tool_result(run_id, "; ".join(parts))
     validate_result_names(run_id, pause_state, results)
+    refuse_managed_results(run_id, pause_state.pending_targets, results)
     return pause_state
+
+
+def refuse_managed_results(
+    run_id: str, pending_targets: Mapping[str, Any] | None, results: list[ToolResult]
+) -> None:
+    """Refuse an external result for a generated subagent call (0.7).
+
+    Only the bound child run reports a subagent call. This holds even for a
+    client pause older code persisted for it (its target stays ``agent``).
+    """
+    from dendrux.errors import ManagedResultRefusedError
+
+    targets = pending_targets or {}
+    if any(targets.get(result.call_id) == ToolTarget.AGENT.value for result in results):
+        raise ManagedResultRefusedError(run_id)
 
 
 def validate_result_names(run_id: str, pause: PauseState, results: list[ToolResult]) -> None:
@@ -183,8 +199,13 @@ def pause_validator(
     *,
     agent_name: str | None = None,
     call_results: list[ToolResult] | None = None,
+    client_results: bool = False,
 ) -> Callable[[dict[str, Any]], None]:
-    """Validation performed while the claim transaction holds the run row."""
+    """Validation performed while the claim transaction holds the run row.
+
+    ``client_results``: ``call_results`` were supplied by the caller (not runtime
+    denials), so none may answer a generated subagent call.
+    """
 
     from dendrux.types import _validate_identifier
 
@@ -215,6 +236,8 @@ def pause_validator(
                 or any(pending.get(result.call_id) != result.name for result in call_results)
             ):
                 raise _invalid_tool_result(run_id, "tool results do not match pending calls")
+            if client_results:
+                refuse_managed_results(run_id, current.get("pending_targets"), call_results)
 
     return validate
 
@@ -752,6 +775,7 @@ async def claim_or_raise(
         expected_pause_id=request.generation,
         call_results=call_results,
         extra=validate,
+        client_results=expected_status == RunStatus.WAITING_CLIENT_TOOL,
     )
 
     from dendrux.runtime._capabilities import capabilities
@@ -1453,6 +1477,7 @@ def submission_validator(
     expected_pause_id: str | None = None,
     call_results: list[ToolResult] | None = None,
     extra: Callable[[dict[str, Any]], None] | None = None,
+    client_results: bool = False,
 ) -> Callable[[dict[str, Any]], None]:
     """Validate before claiming, then repeat under the claim transaction's lock."""
     from dendrux.errors import GovernanceMismatchError
@@ -1460,7 +1485,11 @@ def submission_validator(
     # Even an optional-token client is bound to the generation we observed.
     generation = _pause_generation(raw, expected_pause_id)
     base = pause_validator(
-        run_id, generation, agent_name=agent.name if agent else None, call_results=call_results
+        run_id,
+        generation,
+        agent_name=agent.name if agent else None,
+        call_results=call_results,
+        client_results=client_results,
     )
 
     def validate(current: dict[str, Any]) -> None:

@@ -6504,7 +6504,12 @@ async def _claim_resume(
         fallbacks=_resume_claim_fallbacks(expected, results, user_input),
     )
     validate = submission_validator(
-        run_id, raw, agent=agent, expected_pause_id=request.generation, call_results=results
+        run_id,
+        raw,
+        agent=agent,
+        expected_pause_id=request.generation,
+        call_results=results,
+        client_results=expected == RunStatus.WAITING_CLIENT_TOOL.value,
     )
     record = await store.get_run(run_id)
     require_pause_id(
