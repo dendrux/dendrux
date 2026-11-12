@@ -69,6 +69,7 @@ def _row(version: Any, reason: Any, child: Any) -> Any:
         (None, None, None, False, False),
         (3, "managed_wait", "c1", True, False),
         (3, "managed_wait", None, True, True),
+        (3, "managed_wait", "", True, True),
         (2, "managed_wait", "c1", True, True),
         (3, "requested", "c1", True, True),
     ],
@@ -81,3 +82,59 @@ def test_waiting_rows_are_classified_from_their_projected_marks(
         assert scan.skipped(_row(version, reason, child)) is skipped
     codes = [getattr(r, "code", None) for r in caplog.records]
     assert ("managed_state_invalid" in codes) is reported
+
+
+@pytest.mark.parametrize("cursor", [None, "01OLD_RUNNING_ID"])
+def test_sweep_cursor_accepts_legacy_running_positions(cursor: str | None) -> None:
+    from dendrux.runtime.sweep import _SweepCursor
+
+    progress = _SweepCursor.decode(cursor)
+    assert progress.running == cursor and progress.waiting is None
+    assert not progress.running_done and not progress.waiting_done
+    assert progress.encode(with_waiting=False) == cursor
+
+
+@pytest.mark.parametrize("done", [(True, False), (False, True), (False, False)])
+def test_sweep_cursor_preserves_both_positions_and_completed_categories(done: Any) -> None:
+    from datetime import UTC, datetime
+
+    from dendrux.runtime.sweep import _SweepCursor
+
+    position = ("paused", datetime(2026, 1, 1, 1, 2, 3, 456789, tzinfo=UTC), "wait-id")
+    progress = _SweepCursor("running-id", position, *done)
+    encoded = progress.encode(with_waiting=True)
+    assert encoded is not None
+    assert _SweepCursor.decode(encoded) == progress
+    progress.running_done = progress.waiting_done = True
+    assert progress.encode(with_waiting=True) is None
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "bad-json",
+        "[]",
+        "[123,null,false,false]",
+        "[null,null,1,false]",
+        '[null,["running","2026-01-01","id"],false,false]',
+        '[null,["paused","invalid-date","id"],false,false]',
+        '[null,["paused","2026-01-01",1],false,false]',
+    ],
+)
+def test_sweep_rejects_malformed_composite_cursors(payload: str) -> None:
+    from dendrux.runtime.sweep import _SweepCursor
+
+    with pytest.raises(ValueError, match="Invalid sweep cursor"):
+        _SweepCursor.decode("sweep:v1:" + payload)
+
+
+async def test_custom_waiting_sweep_keeps_its_legacy_call_signature() -> None:
+    from unittest.mock import AsyncMock
+
+    from dendrux.runtime.sweep import _sweep_waiting, _SweepCursor
+
+    method = AsyncMock(return_value=[])
+    custom = SimpleNamespace(sweep_abandoned_runs=method)
+    progress = _SweepCursor(waiting_done=True)
+    assert await _sweep_waiting(custom, timedelta(hours=1), {}, progress) == []
+    method.assert_awaited_once_with(older_than=timedelta(hours=1))

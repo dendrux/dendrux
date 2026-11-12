@@ -236,7 +236,9 @@ async def test_sweep_rechecks_the_managed_exemption_at_the_final_cas(
     assert root.status == "paused" and root.pause_data == wait
 
 
-@pytest.mark.parametrize("corruption", ["no_binding", "reason_only", "version_only"])
+@pytest.mark.parametrize(
+    "corruption", ["no_binding", "reason_only", "version_only", "empty_child", "null_child"]
+)
 async def test_a_corrupt_managed_wait_is_reported_never_swept_or_recreated(
     store: Any, engine: Any, monkeypatch: Any, caplog: Any, corruption: str
 ) -> None:
@@ -244,6 +246,11 @@ async def test_a_corrupt_managed_wait_is_reported_never_swept_or_recreated(
     wait = dict((await run_row(engine, root_id)).pause_data)
     if corruption == "no_binding":
         wait.pop("managed_wait")
+    elif corruption in {"empty_child", "null_child"}:
+        wait["managed_wait"] = {
+            **wait["managed_wait"],
+            "child_run_id": "" if corruption == "empty_child" else None,
+        }
     elif corruption == "reason_only":
         wait["schema_version"] = 2
     else:
@@ -288,7 +295,7 @@ async def test_skipped_managed_waits_cost_no_per_row_statement_and_no_history_re
     assert not any(ReactTrace.__tablename__ in s for s in lowered)
     assert not any(s.lstrip().startswith("update") for s in lowered)
     selects = [s for s in lowered if s.lstrip().startswith("select")]
-    # Only candidate pages: one per waiting status; the valid wait is never a candidate.
+    # One bounded page per status; a short page needs no empty follow-up read.
     assert all("as sweep_age" in s for s in selects)
     assert len(selects) == len(PAUSE_STATUS_VALUES)
     # pause_data is read only through JSON path projections, never loaded whole.
@@ -473,12 +480,266 @@ async def test_bounded_sweeps_reach_an_ordinary_pause_behind_more_than_a_cap_of_
     await age(engine, ordinary, by=timedelta(hours=3))
 
     swept: list[str] = []
+    cursor = None
     for _ in range(3):
         result = await sweep(
-            state_store=store, abandoned_waiting=THRESHOLD, max_runs=2, batch_size=1
+            state_store=store, abandoned_waiting=THRESHOLD, max_runs=2, batch_size=1, cursor=cursor
         )
+        cursor = result.cursor
         swept.extend(r.run_id for r in result.abandoned_waiting)
     assert swept == [ordinary]
     for run_id in waits:
         row = await run_row(engine, run_id)
         assert row.status == "paused" and row.pause_data["schema_version"] == 3
+
+
+async def _seed_wait_prefix(engine: Any, count: int, *, corrupt: bool = False) -> list[str]:
+    old = datetime.now(UTC) - OLD
+    ids = [f"{i:026d}" for i in range(count)]
+    wait = {"schema_version": 3, "pause_reason": "managed_wait"}
+    if not corrupt:
+        wait["managed_wait"] = {"child_run_id": "child"}
+    async with engine.begin() as conn:
+        await conn.execute(
+            AgentRun.__table__.insert(),
+            [
+                dict(
+                    id=run_id,
+                    agent_name="wait",
+                    status="paused",
+                    claim_epoch=1,
+                    storage_format=2,
+                    updated_at=old,
+                    status_changed_at=old,
+                    pause_data=wait,
+                )
+                for run_id in ids
+            ],
+        )
+    return ids
+
+
+@pytest.mark.parametrize("population", [100, 1000, 10000])
+async def test_all_exempt_scan_bounds_examined_work_and_continues(
+    store: Any, engine: Any, monkeypatch: Any, population: int
+) -> None:
+    if engine.dialect.name != "sqlite":
+        pytest.skip("SQLite VM instruction measurement")
+    from dendrux.runtime.stores.sql.base import _SweepScan
+
+    ids = await _seed_wait_prefix(engine, population)
+    visited: list[str] = []
+    original = _SweepScan.skipped
+
+    def observe(self: Any, row: Any) -> bool:
+        visited.append(row.id)
+        return original(self, row)
+
+    monkeypatch.setattr(_SweepScan, "skipped", observe)
+    instructions = [0]
+
+    def tick() -> int:
+        instructions[0] += 1
+        return 0
+
+    cap = 37
+    cursor = None
+    costs = []
+    async with engine.connect() as conn:
+        raw = await conn.get_raw_connection()
+        driver = raw.driver_connection
+    for _ in range((population + cap - 1) // cap + 1):
+        start = len(visited)
+        instructions[0] = 0
+        await driver.set_progress_handler(tick, 1)
+        try:
+            result = await sweep(
+                state_store=store,
+                abandoned_waiting=THRESHOLD,
+                max_runs=cap,
+                batch_size=cap,
+                cursor=cursor,
+            )
+        finally:
+            await driver.set_progress_handler(None, 1)
+        costs.append(instructions[0])
+        assert instructions[0] < 10000, costs
+        assert len(visited) - start <= cap
+        assert not result.abandoned_waiting
+        cursor = result.cursor
+        if cursor is None:
+            break
+    assert visited == ids
+    assert cursor is None
+    print(
+        f"population={population} cap={cap} calls={len(costs)} "
+        f"max_vm={max(costs)} examined={len(visited)}"
+    )
+
+
+@pytest.mark.parametrize("prefix_status", PAUSE_STATUS_VALUES)
+async def test_corrupt_prefix_continues_without_repeating_reports(
+    store: Any, engine: Any, caplog: Any, prefix_status: str
+) -> None:
+    from dendrux.types import generate_ulid
+
+    ids = await _seed_wait_prefix(engine, 7, corrupt=True)
+    async with engine.begin() as conn:
+        await conn.execute(
+            update(AgentRun).where(AgentRun.id.in_(ids)).values(status=prefix_status)
+        )
+    ordinary = generate_ulid()
+    await store.create_run(ordinary, "ordinary")
+    async with engine.begin() as conn:
+        await conn.execute(
+            update(AgentRun)
+            .where(AgentRun.id == ordinary)
+            .values(status="paused", pause_data={"schema_version": 2})
+        )
+    await age(engine, ordinary, by=timedelta(hours=2))
+    before = [(await run_row(engine, rid)).pause_data for rid in ids]
+    cursor = None
+    swept = []
+    reported = []
+    with caplog.at_level(logging.WARNING):
+        for _ in range(5):  # ceil(7 / 2) + 1
+            caplog.clear()
+            result = await sweep(
+                state_store=store,
+                abandoned_waiting=THRESHOLD,
+                max_runs=2,
+                batch_size=1,
+                cursor=cursor,
+            )
+            reports = [
+                r.run_id
+                for r in caplog.records
+                if getattr(r, "code", None) == "managed_state_invalid"
+            ]
+            reported.extend(reports)
+            assert len(reports) <= 2
+            swept.extend(r.run_id for r in result.abandoned_waiting)
+            cursor = result.cursor
+            if cursor is None:
+                break
+    assert swept == [ordinary]
+    assert reported == ids
+    for rid, wait in zip(ids, before, strict=True):
+        row = await run_row(engine, rid)
+        assert (row.status, row.claim_epoch, row.pause_data) == (prefix_status, 1, wait)
+
+
+async def test_old_running_cursor_can_begin_waiting_continuation(store: Any, engine: Any) -> None:
+    ids = await _seed_wait_prefix(engine, 3)
+    cursor = "0" * 26  # pre-composite cursors were raw running IDs
+    for _ in range(4):
+        result = await sweep(
+            state_store=store,
+            stale_running=THRESHOLD,
+            abandoned_waiting=THRESHOLD,
+            on_stale="error",
+            max_runs=1,
+            cursor=cursor,
+        )
+        assert not result.stale_running and not result.abandoned_waiting
+        cursor = result.cursor
+        if cursor is None:
+            break
+    assert _ == 3 and cursor is None
+    for rid in ids:
+        assert (await run_row(engine, rid)).status == "paused"
+
+
+@pytest.mark.parametrize(("running_count", "waiting_count"), [(1, 5), (5, 1)])
+async def test_combined_cursor_does_not_restart_a_completed_category(
+    store: Any, engine: Any, monkeypatch: Any, running_count: int, waiting_count: int
+) -> None:
+    from dendrux.runtime.stores._factory import store_for_engine
+    from dendrux.runtime.stores.sql.base import _SweepScan
+    from dendrux.types import generate_ulid
+
+    ids = await _seed_wait_prefix(engine, waiting_count)
+    for _ in range(running_count):
+        await store.create_run(generate_ulid(), "fresh-running")
+    visited = []
+    original = _SweepScan.skipped
+
+    def observe(self: Any, row: Any) -> bool:
+        visited.append(row.id)
+        return original(self, row)
+
+    monkeypatch.setattr(_SweepScan, "skipped", observe)
+    running_calls = []
+    original_running = type(store)._scan_expired_runs
+
+    async def running(self: Any, **kwargs: Any) -> Any:
+        running_calls.append(kwargs["cursor"])
+        return await original_running(self, **kwargs)
+
+    monkeypatch.setattr(type(store), "_scan_expired_runs", running)
+    cursor = None
+    for _ in range(7):
+        result = await sweep(
+            state_store=store_for_engine(engine),
+            stale_running=THRESHOLD,
+            abandoned_waiting=THRESHOLD,
+            on_stale="error",
+            max_runs=1,
+            cursor=cursor,
+        )
+        assert not result.stale_running and not result.abandoned_waiting
+        cursor = result.cursor
+        if cursor is None:
+            break
+    assert cursor is None
+    assert visited == ids
+    assert len(running_calls) == running_count + 1
+
+
+async def test_waiting_cursor_contenders_finalise_an_ordinary_pause_once(
+    store: Any, engine: Any
+) -> None:
+    if engine.dialect.name != "postgresql":
+        pytest.skip("Independent pools require PostgreSQL")
+    import asyncio
+
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from dendrux.runtime.stores._factory import store_for_engine
+    from dendrux.types import generate_ulid
+
+    await _seed_wait_prefix(engine, 3)
+    ordinary = generate_ulid()
+    await store.create_run(ordinary, "ordinary")
+    async with engine.begin() as conn:
+        await conn.execute(
+            update(AgentRun)
+            .where(AgentRun.id == ordinary)
+            .values(status="paused", pause_data={"schema_version": 2})
+        )
+    await age(engine, ordinary, by=timedelta(hours=2))
+    before_epoch = (await run_row(engine, ordinary)).claim_epoch
+    first = await sweep(state_store=store, abandoned_waiting=THRESHOLD, max_runs=2)
+    assert first.cursor is not None and not first.abandoned_waiting
+    pools = [create_async_engine(engine.url) for _ in range(4)]
+    try:
+        results = await asyncio.gather(
+            *(
+                sweep(
+                    state_store=store_for_engine(pool),
+                    abandoned_waiting=THRESHOLD,
+                    max_runs=2,
+                    cursor=first.cursor,
+                )
+                for pool in pools
+            )
+        )
+    finally:
+        for pool in pools:
+            await pool.dispose()
+    assert [r.run_id for result in results for r in result.abandoned_waiting] == [ordinary]
+    events = await rows(
+        engine, RunEvent, RunEvent.agent_run_id == ordinary, RunEvent.event_type == "run.abandoned"
+    )
+    assert len(events) == 1
+    assert (await run_row(engine, ordinary)).claim_epoch == before_epoch + 1

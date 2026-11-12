@@ -375,11 +375,9 @@ class _SweepScan:
     Waiting pages also read a parent's managed-wait marks from ``pause_data``
     (schema version, pause reason, bound child id; no history, no JSON index). A
     v3 managed wait is never abandoned (0.7): it waits on a subagent, or holds a
-    finished subagent's adoption. The PAUSED page filters complete managed waits
-    out inside the existing index scan, so they never use the page or work cap
-    ahead of ordinary pauses; the final CAS rechecks the exemption. A row
-    carrying only part of the marks is a corrupt managed wait: a candidate that
-    is reported, never swept and never recreated.
+    finished subagent's adoption. The indexed window is bounded before managed
+    classification, so exempt and corrupt rows count toward the work cap. The
+    final CAS rechecks the exemption. Partial marks are reported, never swept.
     """
 
     def __init__(self, store: SQLStateStore, *, waiting: bool, older_than: timedelta) -> None:
@@ -426,19 +424,6 @@ class _SweepScan:
             or_(reason.is_(None), reason != MANAGED_WAIT_REASON),
         )
 
-    def _not_valid_managed_wait(self) -> Any:
-        """Not a complete v3 managed wait; NULL-safe (any missing mark qualifies)."""
-        from sqlalchemy import or_
-
-        version, reason, child = self._wait_marks()
-        return or_(
-            version.is_(None),
-            version != MANAGED_WAIT_SCHEMA_VERSION,
-            reason.is_(None),
-            reason != MANAGED_WAIT_REASON,
-            child.is_(None),
-        )
-
     def page(self, status_filter: str, after: Any, limit: int) -> Any:
         from sqlalchemy import tuple_
 
@@ -464,11 +449,6 @@ class _SweepScan:
             statement = statement.where(
                 AgentRun.status == status_filter, self.age < self.cutoff
             ).order_by(self.age, AgentRun.id)
-            if status_filter == RunStatus.PAUSED.value:
-                # Valid managed waits are never candidates: they cannot use up the
-                # page or the work cap ahead of ordinary pauses. Partial marks stay
-                # candidates so a corrupt wait is still reported.
-                statement = statement.where(self._not_valid_managed_wait())
             if after is not None:
                 statement = statement.where(tuple_(self.age, AgentRun.id) > after)
             return statement
@@ -499,6 +479,29 @@ class _SweepScan:
                 logger, _codes.MANAGED_STATE_INVALID, run_id=row.id, managed_reason="wait_invalid"
             )
         return True
+
+    async def collect(
+        self, status: str, after: Any, batch_size: int, budget: int
+    ) -> tuple[list[SweptRun], int, Any]:
+        swept: list[SweptRun] = []
+        visited = 0
+        while visited < budget:
+            limit = min(batch_size, budget - visited)
+            statement = self.page(status, after, limit)
+            async with self.store._session_factory() as session:
+                rows = (await session.execute(statement)).all()
+            if not rows:
+                return swept, visited, None
+            visited += len(rows)
+            after = (rows[-1].sweep_age, rows[-1].id) if self.waiting else rows[-1].id
+            async with _live_updates_page(self.store):
+                for row in rows:
+                    done = None if self.skipped(row) else await self.sweep_row(row)
+                    if done is not None:
+                        swept.append(done)
+            if len(rows) < limit:
+                return swept, visited, None
+        return swept, visited, after
 
     def _reason(self, row: Any) -> str:
         if self.waiting:
@@ -5544,9 +5547,11 @@ class SQLStateStore(SQLBlobCatalog):
         """
         return cast(
             "list[SweptRun]",
-            await self._sweep_runs(
-                older_than, waiting=False, batch_size=batch_size, max_runs=max_runs
-            ),
+            (
+                await self._sweep_runs(
+                    older_than, waiting=False, batch_size=batch_size, max_runs=max_runs
+                )
+            )[0],
         )
 
     async def sweep_abandoned_runs(
@@ -5564,8 +5569,29 @@ class SQLStateStore(SQLBlobCatalog):
         """
         return cast(
             "list[SweptRun]",
+            (
+                await self._sweep_runs(
+                    older_than, waiting=True, batch_size=batch_size, max_runs=max_runs
+                )
+            )[0],
+        )
+
+    @property
+    def _uses_waiting_sweep_cursor(self) -> bool:
+        return type(self).sweep_abandoned_runs is SQLStateStore.sweep_abandoned_runs
+
+    async def _scan_abandoned_runs(
+        self,
+        older_than: timedelta,
+        *,
+        batch_size: int,
+        max_runs: int,
+        cursor: tuple[str, datetime, str] | None,
+    ) -> tuple[list[SweptRun], tuple[str, datetime, str] | None]:
+        return cast(
+            "tuple[list[SweptRun], tuple[str, datetime, str] | None]",
             await self._sweep_runs(
-                older_than, waiting=True, batch_size=batch_size, max_runs=max_runs
+                older_than, waiting=True, batch_size=batch_size, max_runs=max_runs, cursor=cursor
             ),
         )
 
@@ -5577,7 +5603,8 @@ class SQLStateStore(SQLBlobCatalog):
         waiting: bool,
         batch_size: int,
         max_runs: int,
-    ) -> list[SweptRun]:
+        cursor: tuple[str, datetime, str] | None = None,
+    ) -> tuple[list[SweptRun], tuple[str, datetime, str] | None]:
         for name, value, ceiling in (
             ("batch_size", batch_size, SWEEP_BATCH_MAX),
             ("max_runs", max_runs, SWEEP_MAX_RUNS_MAX),
@@ -5588,32 +5615,30 @@ class SQLStateStore(SQLBlobCatalog):
         scan = _SweepScan(self, waiting=waiting, older_than=older_than)
         swept: list[SweptRun] = []
         visited = 0
-        for status_filter in PAUSE_STATUS_VALUES if waiting else [RunStatus.RUNNING.value]:
-            after: tuple[_dt.datetime, str] | str | None = None
-            while visited < max_runs:
-                statement = scan.page(status_filter, after, min(batch_size, max_runs - visited))
-                async with self._session_factory() as session:
-                    rows = (await session.execute(statement)).all()
-                if not rows:
-                    break
-                visited += len(rows)
-                after = (rows[-1].sweep_age, rows[-1].id) if waiting else rows[-1].id
-                async with _live_updates_page(self):
-                    for row in rows:
-                        done = None if scan.skipped(row) else await scan.sweep_row(row)
-                        if done is not None:
-                            swept.append(done)
-        if visited == max_runs:
-            _codes.log_code(
-                logger,
-                _codes.SWEEP_CAP_REACHED,
-                category=FailureReason.ABANDONED_WAITING.value
-                if waiting
-                else FailureReason.STALE_RUNNING.value,
-                cap=max_runs,
-                inspected=visited,
+        statuses = list(PAUSE_STATUS_VALUES) if waiting else [RunStatus.RUNNING.value]
+        after = None
+        if cursor is not None:
+            statuses = statuses[statuses.index(cursor[0]) :]
+            after = cursor[1:]
+        for status_filter in statuses:
+            done, count, end = await scan.collect(
+                status_filter, after, batch_size, max_runs - visited
             )
-        return swept
+            swept.extend(done)
+            visited += count
+            if visited == max_runs:
+                _codes.log_code(
+                    logger,
+                    _codes.SWEEP_CAP_REACHED,
+                    category=FailureReason.ABANDONED_WAITING.value
+                    if waiting
+                    else FailureReason.STALE_RUNNING.value,
+                    cap=max_runs,
+                    inspected=visited,
+                )
+                return swept, (status_filter, *end) if waiting else None
+            after = None
+        return swept, None
 
     # ------------------------------------------------------------------
     # Delegation queries
