@@ -454,6 +454,12 @@ jobs:
       - name: Cognitive complexity
         run: python tools/cognitive_ratchet.py check
 
+      - name: Physical file and function size
+        run: python tools/size_ratchet.py check
+
+      - name: Ruff per-file rule counts
+        run: python tools/ruff_ratchet.py check
+
       - name: Duplicate code
         run: python tools/duplicate_ratchet.py check
 

@@ -54,11 +54,118 @@ unchanged.
 | Target | Script | Fails when |
 |---|---|---|
 | `make cognitive` | `tools/cognitive_ratchet.py` | A new function scores above 15 (complexipy cognitive complexity), or a function already above 15 scores higher. Baseline: `cognitive_baseline.json` (only functions above 15 are recorded; overloads and setters of one name count at their worst). |
+| `make size` | `tools/size_ratchet.py` | A new module exceeds 1,000 physical lines, a new function exceeds 80, or an existing offender grows. Baseline: `size_baseline.json`, measured lengths keyed by `module` and `module:qualname`. |
+| `make ruff-ratchet` | `tools/ruff_ratchet.py` | A file gains a finding for a new rule, a new file has findings, or a file/rule count increases. Rules: PLC0415, PLR0911, PLR0912, PLR0915, BLE001. Baseline: `ruff_baseline.json`, counts keyed by `module:RULE`. |
 | `make duplicates` | `tools/duplicate_ratchet.py` | A new block of 10 or more near-identical lines appears across two files (pylint's similarity engine; imports, signatures, comments and docstrings ignored), or a known block grows. Baseline: `duplicate_baseline.json`, block sizes per file pair; a block matches within 15 percent (at least 2 lines). |
 | `make deadcode` | `tools/vulture_ratchet.py` | vulture (confidence 80 or more) finds a new unused name. Intentional public API and hooks go in `vulture_whitelist.py` with a comment. Baseline: `vulture_baseline.json`. |
 | `make cycles` | `tools/import_cycles.py` | A module import cycle appears, a module joins a baselined cycle, or two cycles merge. Only top-level runtime imports count: `if TYPE_CHECKING:` blocks and imports inside functions are ignored. `python tools/import_cycles.py report` also lists the cycles that function-level imports hide (information only). Baseline: `import_cycles_baseline.json`. |
 | `make semgrep` | `tools/semgrep_ratchet.py` | A rule in `.semgrep/dendrux.yml` has a new match, or more matches in a function that already had some; or a rule stops passing its fixture. Baseline: `semgrep_baseline.json` (rule, module, function). |
 | `make crap` | `tools/crap_ratchet.py` | A new function scores above 30; complexity rises and the function scores above 30; or edited code exceeds its own recorded CRAP baseline. An edited function may remain above 30 when neither complexity nor CRAP rises. Unchanged code retains the 0.5-point noise band and the warning allowance for rises up to 25 percent. Backend-only local coverage is handled explicitly below. Needs `coverage.json` from `make test`. Baseline: `crap_baseline.json`. |
+
+### Size and Ruff counts
+
+Both gates scan only `src/dendrux` (including `testing`) and exclude migration
+directories. Run from `packages/python`:
+
+```sh
+python tools/size_ratchet.py report
+python tools/ruff_ratchet.py report
+```
+
+Each script accepts `check`, `stamp`, `report`, and `move`, plus `--src` and `--baseline`.
+`report` prints measurements without reading or writing a baseline. `check` exits 0
+on success, 1 on regressions, and 2 when its baseline is missing. Tool/configuration
+errors also fail. Each invocation prints measured totals; reports also list individual
+offenders. No coverage file is needed.
+
+Size counts every physical file line, including comments and blank lines. A function
+spans its first decorator (or `def` / `async def`) through its last AST line, inclusive;
+comments and blank lines within that span count. Nested functions are included in the
+outer span and measured independently as `outer.<locals>.inner`. Classes qualify
+methods as `Class.method`. Overload definitions from `typing` or `typing_extensions`
+(including import aliases) are excluded; implementations count. Repeated qualified
+names, such as property getters/setters, keep the longest implementation. The exact
+data-module allow list is `dendrux._codes`, `dendrux.types`; those modules are exempt
+from size measurement. Other modules with those basenames are still checked.
+
+Only sizes above the hard limits are recorded. Below-limit code can grow up to its
+limit. Existing offenders may stay the same or shrink. Keys use names, not line
+numbers. An implicit rename of an over-limit file/function fails as a new offender,
+even if unchanged. For a reviewed pure move, the coordinator can explicitly transfer
+its allowance with `move`, as described below. Do not delete or increase a baseline
+entry to make the rename pass.
+
+Ruff uses the pinned interpreter's `python -m ruff`, the project's `pyproject.toml`
+and `--extend-select` for the five rules. Existing selections, ignores, per-file
+ignores, thresholds and `noqa` remain in effect. Other diagnostics are left to
+`make lint`. Only the five rules enter the baseline. Counts cannot move between
+files or rules to offset a regression. Ruff's defaults are 6 returns, 12 branches
+and 50 statements unless the project config overrides them.
+
+Suppressions of those five rules must include a reason after the code list on the
+same line, or in a standalone comment immediately above. For example,
+`# noqa: BLE001 - notifier fan-out isolation` or an immediately preceding
+`# Optional extra stays lazy to keep the base install importable.` Blank/punctuation-only
+comments, another noqa directive, and code names alone are not reasons. The check
+examines Python comment tokens, including blanket and file-level noqa, and ignores
+string literals and migrations. Reviewers still judge whether the reason is valid
+under AGENTS §6.2/§6.3; the tool checks its presence.
+
+`check` reports unreasoned suppressions as `file:line: CODE noqa lacks reason`.
+Reason debt is a separate shrink-only count per module/rule in `ruff_baseline.json`,
+under `noqa-reason|module|RULE` keys. Counts cannot be offset across modules/rules;
+new/increased debt fails, and `stamp` refuses it. Initial coordinator stamping may
+record existing debt; subsequent fixes remove/lower those entries. Report prints the
+exact locations even for existing debt. Today's source has zero unreasoned suppressions,
+so no reason-debt entries are needed. Reason debt cannot be transferred with `move`.
+
+The coordinator initializes the missing baselines with `stamp` (R5 of the rollout)
+and stamps decreases once per merge (AGENTS §0 item 7). Builders leave generated
+worktree baselines uncommitted. After initialization these two scripts refuse every
+new/increased offender, including during `stamp`; there is no `--allow-regress`
+override. `make quality-stamp` includes both scripts. Never commit baseline values
+from a builder task.
+
+#### Explicit allowance transfers (coordinator only)
+
+`move` is for pure code moves and file splits. Reviewers check both the code move and
+the explicit move list in the PR; the tools validate allowances and current tree
+presence, not semantic equivalence. Ordinary `check` and `stamp` still fail on implicit
+renames. Run with an existing baseline, using one or more `OLD_KEY NEW_KEY` pairs:
+
+```sh
+python tools/size_ratchet.py move dendrux.old:Box.run dendrux.new:Box.run
+python tools/size_ratchet.py move dendrux.old dendrux.new_a dendrux.old dendrux.new_b
+python tools/ruff_ratchet.py move dendrux.old:PLC0415 dendrux.new_a:PLC0415 dendrux.old:PLC0415 dendrux.new_b:PLC0415
+```
+
+Size keys are exactly the baseline's module or `module:qualname`; Ruff keys are
+`module:RULE`, with a separate pair for each rule being transferred. Supply any
+`--src` / `--baseline` options after the pairs. The operation:
+
+- Requires the old key's allowance to exist. Function sources must be absent from
+  the tree, including overload stubs. A moved function can leave its old module in
+  place. File sources may be deleted or retained with a smaller measured value.
+- Requires every destination to be a current offender of the same kind (file or
+  function for size; the same ratcheted rule for Ruff). Destinations already in the
+  baseline, duplicate destinations and source/destination cycles are refused.
+- Allows functions to move one-to-one. A file's allowance may split across several
+  destination files by repeating its old key. Every destination gets its measured
+  value. Their sum plus the retained old file's current size must not exceed the
+  recorded allowance. A retained old file records its measured size, even if now
+  below the limit. Ruff applies the same budget to finding counts separately for
+  each rule (including a zero retained count), without pooling rules or source files.
+  An unchanged/grown source or insufficient remaining allowance refuses the batch.
+- Validates the entire batch before writing. Any invalid pair refuses the whole
+  batch without changing the baseline. Missing baselines and malformed command
+  arguments exit 2; invalid transfers exit 1; successful transfers exit 0 and print
+  each transferred key/value.
+
+On success deleted sources' entries are removed; retained sources and destinations
+record current measurements. Unrelated entries stay unchanged. `move` does not stamp other improvements
+or waive unrelated regressions. Finish all reviewed transfers, then run both checks;
+unlisted offenders still fail. Final baseline diffs and the move list belong to the
+coordinator's PR. Builders do not run transfers against the rollout baselines.
 
 ### Semgrep rules that stop a shared definition being copied
 

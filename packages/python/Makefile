@@ -1,4 +1,4 @@
-.PHONY: dev-sync cov-mysql test test-fast test-area test-pg test-kit test-merge test-lists test-shard-proof test-model-check test-model-install test-dbs-up test-dbs-down test-redis-up test-redis-down test-redis test-mysql bench load load-quick load-pg load-mysql load-mariadb lint typecheck arch crap cognitive duplicates deadcode cycles semgrep quality quality-stamp api-check format package-smoke ci clean
+.PHONY: dev-sync cov-mysql test test-fast test-area test-pg test-kit test-merge test-lists test-shard-proof test-model-check test-model-install test-dbs-up test-dbs-down test-redis-up test-redis-down test-redis test-mysql bench load load-quick load-pg load-mysql load-mariadb lint typecheck arch crap cognitive size ruff-ratchet duplicates deadcode cycles semgrep quality quality-stamp api-check format package-smoke ci clean
 .DEFAULT_GOAL := test
 
 # Match a fresh CI install: exact dev tools and the newest allowed runtime dependencies.
@@ -107,6 +107,12 @@ crap:
 cognitive:
 	python tools/cognitive_ratchet.py check
 
+size:
+	python tools/size_ratchet.py check
+
+ruff-ratchet:
+	python tools/ruff_ratchet.py check
+
 duplicates:
 	python tools/duplicate_ratchet.py check
 
@@ -122,9 +128,11 @@ semgrep:
 	python tools/semgrep_ratchet.py test
 	python tools/semgrep_ratchet.py check
 
-quality: cognitive duplicates deadcode cycles semgrep crap
+quality: cognitive duplicates deadcode cycles semgrep crap size ruff-ratchet
 
 quality-stamp:
+	python tools/size_ratchet.py stamp
+	python tools/ruff_ratchet.py stamp
 	python tools/cognitive_ratchet.py stamp
 	python tools/duplicate_ratchet.py stamp
 	python tools/vulture_ratchet.py stamp
