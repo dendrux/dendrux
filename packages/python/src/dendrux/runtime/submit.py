@@ -422,8 +422,13 @@ def _claim_request(
         raw,
         (expected_status, *fallbacks),
         _pause_generation(raw, expected_pause_id),
-        explicit=expected_pause_id is not None if caller_token is None else caller_token,
+        explicit=_caller_supplied(expected_pause_id, caller_token),
     )
+
+
+def _caller_supplied(expected_pause_id: str | None, caller_token: bool | None) -> bool:
+    """Whether the caller gave the token (default: one was passed)."""
+    return expected_pause_id is not None if caller_token is None else caller_token
 
 
 async def _claim_submission(
@@ -448,19 +453,17 @@ async def _claim_submission(
 
     payload, block = await _project_submission(run_id, payload)
     blocked = block is not None
-    descriptor = None
-    format_two = request.raw.get("schema_version") == 2 and checkpointing
-    described = format_two and (payload is not None or submit_empty)
-    tokenless = format_two and not request.explicit and request.raw.get("pause_id") is not None
-    if (described or tokenless) and checkpoint is None:
-        checkpoint = await store.get_loop_state(run_id) or {}
-    if tokenless:
-        _refuse_tokenless_managed(run_id, checkpoint)
-    if described:
-        payload = dict(payload or {})
-        if approval is not None:
-            payload["approved"] = approval
-        descriptor = submission_descriptor(request.raw, checkpoint or {}, payload, status)
+    descriptor, payload = await _described_submission(
+        store,
+        run_id,
+        request,
+        status,
+        payload,
+        checkpointing=checkpointing,
+        submit_empty=submit_empty,
+        approval=approval,
+        checkpoint=checkpoint,
+    )
     operation = _claim_operation(
         store, run_id, status, validate, payload, descriptor, blob_refs, blob_refs_scope
     )
@@ -473,6 +476,35 @@ async def _claim_submission(
 
         _remember_claim(store, run_id, block)
     return won, descriptor, payload
+
+
+async def _described_submission(
+    store: StateStore,
+    run_id: str,
+    request: _ClaimRequest,
+    status: str,
+    payload: dict[str, Any] | None,
+    *,
+    checkpointing: bool,
+    submit_empty: bool,
+    approval: bool | None,
+    checkpoint: dict[str, Any] | None,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """A format-2 claim's submission descriptor and payload; refuses a tokenless
+    continuation of a managed run (0.7)."""
+    format_two = request.raw.get("schema_version") == 2 and checkpointing
+    described = format_two and (payload is not None or submit_empty)
+    tokenless = format_two and not request.explicit and request.raw.get("pause_id") is not None
+    if (described or tokenless) and checkpoint is None:
+        checkpoint = await store.get_loop_state(run_id) or {}
+    if tokenless:
+        _refuse_tokenless_managed(run_id, checkpoint)
+    if not described:
+        return None, payload
+    payload = dict(payload or {})
+    if approval is not None:
+        payload["approved"] = approval
+    return submission_descriptor(request.raw, checkpoint or {}, payload, status), payload
 
 
 def _claim_operation(

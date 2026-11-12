@@ -354,6 +354,46 @@ async def _drain_task_cancellation(
     return result
 
 
+def _creation_claim(loop: Loop, created: CreateRunResult) -> ClaimResult:
+    """The creator's epoch-0 claim, with a fresh checkpoint for a format-2 run."""
+    state = (
+        _initial_loop_state(_recovery_loop_name(loop))
+        if created.storage_format == STORAGE_FORMAT_CHECKPOINTED
+        else None
+    )
+    return ClaimResult(0, created.storage_format, state, None)
+
+
+def _stamp_managed_root(store: StateStore, run_id: str, *, managed_root: bool) -> None:
+    """A managed root carries its header from its first checkpoint (0.7)."""
+    if managed_root:
+        from dendrux.runtime import _managed
+
+        _managed.stamp_root_header(store, run_id)
+
+
+async def _finish_lifecycle(
+    lifecycle: Any, recorder: LoopRecorder | None, notifier: LoopNotifier | None, result: RunResult
+) -> None:
+    """Close the run's sinks unless it exits at a managed handoff (0.7)."""
+    if MANAGED_DESCEND_KEY in result.meta:
+        return  # Not finished: the parent continues after its child is adopted.
+    lifecycle.recorder_closed = True
+    await record_run_finished(recorder, lifecycle.run_id, result)
+    lifecycle.notifier_closed = True
+    await notify_run_finished(notifier, lifecycle.run_id, result)
+
+
+async def _record_finished(
+    recorder: LoopRecorder | None, notifier: LoopNotifier | None, run_id: str, result: RunResult
+) -> None:
+    """Record and notify a finished run; a managed handoff is not finished (0.7)."""
+    if MANAGED_DESCEND_KEY in result.meta:
+        return  # The parent exits at a managed handoff (0.7 driver).
+    await record_run_finished(recorder, run_id, result)
+    await notify_run_finished(notifier, run_id, result)
+
+
 @dataclass
 class _RunLifecycle:
     run_id: str
@@ -375,19 +415,9 @@ class _RunLifecycle:
         managed_root: bool = False,
     ) -> StateStore:
         self.run_id = created.run_id
-        state = (
-            _initial_loop_state(_recovery_loop_name(loop))
-            if created.storage_format == STORAGE_FORMAT_CHECKPOINTED
-            else None
-        )
         # A managed child's token comes from its bind and carries its header.
-        self.store = claimed_store(
-            store, self.run_id, claim or ClaimResult(0, created.storage_format, state, None)
-        )
-        if managed_root:
-            from dendrux.runtime import _managed
-
-            _managed.stamp_root_header(self.store, self.run_id)
+        self.store = claimed_store(store, self.run_id, claim or _creation_claim(loop, created))
+        _stamp_managed_root(self.store, self.run_id, managed_root=managed_root)
         self.owned = True
         if self.manager is not None:
             self.manager.register_current(self.run_id)
@@ -397,12 +427,7 @@ class _RunLifecycle:
     async def _finish(
         self, recorder: LoopRecorder | None, notifier: LoopNotifier | None, result: RunResult
     ) -> None:
-        if MANAGED_DESCEND_KEY in result.meta:
-            return  # Not finished: the parent continues after its child is adopted.
-        self.recorder_closed = True
-        await record_run_finished(recorder, self.run_id, result)
-        self.notifier_closed = True
-        await notify_run_finished(notifier, self.run_id, result)
+        await _finish_lifecycle(self, recorder, notifier, result)
 
     async def _failed(
         self,
@@ -514,6 +539,16 @@ async def _discover_runtime_tools(
         raise mcp_exc.__cause__ or mcp_exc from mcp_exc.__cause__
 
 
+def _recorder_tool_defs(agent: Agent) -> list[Any]:
+    """The run's tool definitions, generated subagent calls included (0.7)."""
+    from dendrux.runtime._subagents import subagent_tool_def
+    from dendrux.tool import get_tool_def
+
+    definitions = [get_tool_def(fn) for fn in agent.tools]
+    definitions.extend(subagent_tool_def(child) for child in agent.subagents)
+    return definitions
+
+
 def _runtime_recorder(
     store: StateStore,
     agent: Agent,
@@ -523,12 +558,9 @@ def _runtime_recorder(
     seeds: dict[str, Any],
     guardrails: Any,
 ) -> LoopRecorder:
-    from dendrux.runtime._subagents import subagent_tool_def
     from dendrux.runtime.persistence import PersistenceRecorder
-    from dendrux.tool import get_tool_def
 
-    definitions = [get_tool_def(fn) for fn in agent.tools]
-    definitions.extend(subagent_tool_def(child) for child in agent.subagents)
+    definitions = _recorder_tool_defs(agent)
     recorder = PersistenceRecorder(
         store,
         run_id,
@@ -1037,10 +1069,8 @@ async def _finish_stream_event(
             event = RunEvent(type=RunEventType.RUN_CANCELLED, run_result=result)
         else:
             event = RunEvent(type=event.type, run_result=result, phase=event.phase)
-        if MANAGED_DESCEND_KEY in result.meta:
-            return event  # Not finished: the parent continues after its child is adopted.
-    await record_run_finished(recorder, run_id, result)
-    await notify_run_finished(notifier, run_id, result)
+    # A managed handoff is not finished: the parent continues after adoption.
+    await _record_finished(recorder, notifier, run_id, result)
     if state_store is None:
         result.meta = _public_meta(result.meta)
     return event
@@ -6849,10 +6879,7 @@ async def _finish_resumed_result(
         run_id=run_id,
         result=result,
     )
-    if MANAGED_DESCEND_KEY in result.meta:
-        return result  # The parent exits at a managed handoff (0.7 driver).
-    await record_run_finished(ctx.recorder, run_id, result)
-    await notify_run_finished(ctx.notifier, run_id, result)
+    await _record_finished(ctx.recorder, ctx.notifier, run_id, result)
     return result
 
 
