@@ -33,10 +33,12 @@ Agent(
     provider: LLMProvider | str,
     prompt: str,
     name: str = ...,                       # defaults to the class name
+    description: str = "",
     tools: list[Callable] = [],
+    subagents: Sequence[Agent] | None = None,
     tool_sources: list[MCPToolView | MCPSource | MCPServer | MCPHost] | None = None,
     max_iterations: int = 10,
-    max_delegation_depth: int | None = None,
+    max_delegation_depth: int | None = ...,  # omitted: ceiling 10; None: no ceiling
     loop: Loop | None = None,              # defaults to ReActLoop
     output_type: type[BaseModel] | None = None,
     database_url: str | None = None,
@@ -68,10 +70,12 @@ Agent(
 | `provider` | The LLM provider. Required. Either a `"vendor:model"` string, such as `"anthropic:claude-haiku-4-5"`, or a provider instance. The string builds the provider for you and reads the API key from the environment; supported vendors are `anthropic`, `openai`, `openai-responses` and `openrouter`. Pass an instance, such as `AnthropicProvider(...)`, to set timeouts and other provider options. See [providers in the glossary](/docs/reference/api-glossary#providers). |
 | `prompt` | The system prompt. Required (a subclass may set it as a class attribute instead). |
 | `name` | Used for the run's owner and `cache_key_prefix`. Defaults to the class name. |
+| `description` | What this Agent does. Required and non-empty when registered as a subagent; shown to the parent's model as the tool description. Defaults to an empty string for standalone Agents. |
 | `tools` | List of `@tool`-decorated functions. Empty for a pure chatbot. |
+| `subagents` | Child Agent definitions exposed as blocking tools with one `task: str` argument. Each call starts a fresh child run. Requires managed-capable persistence and ReAct participants. One subagent call is allowed per model turn; ordinary server tools can run beside it. See [Managed subagents](/docs/guides/subagents) for store inheritance, root-id pause routing, streaming and current limits. |
 | `tool_sources` | MCP source declarations, compatibility servers, or shared hosts. See [MCP](/docs/architecture/mcp). |
 | `max_iterations` | ReAct safety cap on LLM turns. Default 10. |
-| `max_delegation_depth` | Max sub-agent nesting depth. |
+| `max_delegation_depth` | Delegation depth ceiling. The root is depth zero; omission uses 10, zero allows no children, and explicit `None` removes the ceiling. See [Managed subagents](/docs/guides/subagents#store-tenant-and-depth). |
 | `loop` | `ReActLoop()` (default) or `SingleCall()`. See [Loops](/docs/architecture/loops). |
 | `output_type` | A pydantic model for structured output. SingleCall only. |
 | `database_url` | SQLAlchemy async URL. Enables persistence. Matching URLs and options share an engine within the process and event loop; close every Agent to release its reference. Configure persistence with `database_url` or `state_store`; the Agent ignores `DENDRUX_DATABASE_URL`. If it is set with no effective store, the Agent stays without persistence and logs `database_url_env_ignored` once per process. The CLI still reads the variable. |

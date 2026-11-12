@@ -1,0 +1,164 @@
+---
+title: Managed subagents
+description: Register child agents as tools, answer their pauses through the root run, and read workflow usage and events.
+---
+
+# Managed subagents
+
+A subagent is a tool backed by a fresh child run. The parent's model calls it by name with one required string argument, `task`. The child uses its own provider, prompt, tools and conversation. It sees the task brief, not the parent's conversation. Its answer becomes a tool result for the parent.
+
+The call is blocking. The parent waits durably while the child runs in the caller's task. The parent takes its next model turn after the child finishes. Each call starts a new child run. There are no parallel or background subagent branches.
+
+## Register and run
+
+Pass child Agents in `subagents=[...]`. Each child needs a provider, a valid tool name and a non-empty `description`. The description tells the parent's model when to use that child. Sibling names must be unique and must not clash with the parent's tools. Registration cycles are refused.
+
+This example asks a reviewer to check a draft. Its word-count tool needs approval. Your application supplies `decide(pending)`: an async function that authorizes the actor, displays the pending action, and returns their decision. A web service can return the pause to the client and submit the decision in a later request instead.
+
+[//]: # "docs-test: skip - exercised by test_guide_subagents.py with SQLite, mock providers and an application decision callback"
+
+```python
+from dendrux import Agent, tool
+from dendrux.store import RunStore
+
+
+@tool()
+async def count_words(text: str) -> int:
+    """Count the words in a draft."""
+    return len(text.split())
+
+
+async def review_report(
+    database_url,
+    tenant_id,
+    decide,
+    *,
+    lead_provider="anthropic:claude-haiku-4-5",
+    reviewer_provider="anthropic:claude-haiku-4-5",
+):
+    async with Agent(
+        name="reviewer",
+        description="Review one draft and return a short assessment.",
+        provider=reviewer_provider,
+        prompt="Check the draft. Use count_words before reporting.",
+        tools=[count_words],
+        require_approval=["count_words"],
+    ) as reviewer, Agent(
+        name="lead",
+        provider=lead_provider,
+        prompt="Ask reviewer to check the draft, then summarize its assessment.",
+        subagents=[reviewer],
+        database_url=database_url,
+    ) as lead:
+        result = await lead.run("Review this draft: Sales rose.", tenant_id=tenant_id)
+        pending = result.pending
+        if pending is not None and pending.kind == "approval":
+            approved = await decide(pending)
+            result = await lead.submit_approval(
+                result.run_id,
+                approved=approved,
+                expected_pause_id=pending.pause_id,
+                tenant_id=tenant_id,
+            )
+
+        async with RunStore.from_database_url(database_url) as store:
+            tree = await store.get_subtree(
+                result.run_id, tenant_id=tenant_id, max_nodes=1000,
+            )
+        return result, tree
+```
+
+Call `review_report` with your database URL, the authenticated tenant and your decision function. It returns the root result and a subtree usage snapshot. A model can ask for more work or another approval; if `result.pending` is set again, handle that next pause through the same root id.
+
+Managed runs need persistence with format-2 checkpoints and managed-subagent store capabilities. SQLite supports this example. For production storage, follow the [store activation guide](/docs/upgrading-to-0.6.0) and the [StateStore reference](/docs/reference/state-store).
+
+## One subagent call per turn
+
+A model response may contain one subagent call and ordinary server-tool calls. After the usual approval checks, all server calls finish before the child starts, even if the model listed the child first. The parent then waits for the child.
+
+Two subagent calls in one response are refused before effects. A subagent call beside a client-tool or human-input target is also refused before effects. These batches produce error observations with code `managed_batch_unsupported`. The model can try a supported batch in a later turn.
+
+The parent's deny rules, approval rules and tool hook apply to the delegation call. The child's own rules govern its work. Registering a child does not copy the parent's prompt, tools or guardrails. Configure each child's data policies explicitly. Treat its report as tool data.
+
+## Store, tenant and depth
+
+A child without a store borrows the root's resolved store for that invocation. The Agent template is not changed. If a child has an explicit `state_store=`, it must be the same store object as the root's. Matching database URLs are not enough. Leave `database_url=` off registered children, as in the example, or build one shared store and pass it to every Agent.
+
+Every child inherits the root run's actual tenant. Pass `tenant_id=` on every run, continuation and read. Rebuild the same named registrations and shared store configuration after a restart so the root Agent can resolve the saved child path.
+
+The root is depth zero. The default `max_delegation_depth` is 10. Set it on the root Agent to change the ceiling; zero allows no child calls and explicit `None` removes the depth ceiling. A child's own numeric limit can tighten the ceiling for its subtree. Definitions and runtime calls are both checked. More than 10 direct children logs a warning; the current definition-tree cap is 256 nodes counted per registration path.
+
+## Answer a child pause through the root
+
+Approval, client-tool, human-input and requested pauses inside a child surface on the root. The result keeps the root's `run_id` and reports the child's waiting status. For example, an approval returns `waiting_approval`, not the parent's internal managed wait.
+
+The root-facing `pending` includes:
+
+| Field | Meaning |
+| --- | --- |
+| `run_id` | The root id to use for continuation |
+| `pause_id` | The active child's pause token |
+| `agent_name` | The child that needs an answer |
+| `agent_path` | Names from the root to that child, such as `["lead", "reviewer"]` |
+| `origin_run_id` | The child's run id, for reads and diagnostics |
+
+After a restart, reload the pause before displaying the action:
+
+[//]: # "docs-test: skip - fragment: application supplies store, root_run_id and tenant_id"
+
+```python
+pending = await store.get_pending(root_run_id, tenant_id=tenant_id)
+```
+
+Authorize the actor for the displayed action in your own route. Submit to the root id with `expected_pause_id=pending.pause_id`. Managed continuations always require the token, including when strict tenancy is disabled. A stale token is refused; do not silently replace it with a newer token and retry the old decision.
+
+| Pending kind | Root Agent method |
+| --- | --- |
+| `approval` | `submit_approval` |
+| `client_tool` | `submit_tool_results` with the child's displayed call ids |
+| `input` | `submit_input` |
+| `paused` | `submit_resume` or an allowed `resume` / `resume_stream` |
+
+The child validates the submission using its own tools and limits. When it finishes, the saved answer returns to its parent and execution continues up to the root. The call returns the root's result or the next pause. A failed child becomes a failed tool result; it does not count as root success. `resume` can adopt an already terminal child without a pause token when no external answer is needed.
+
+Direct child control is refused with `managed_root_required`. Child reads are allowed. `request_pause` on the root reaches the active branch. A note submitted to the root waits until the root next executes; it is not forwarded to the child.
+
+## Streaming and events
+
+Use `stream` to drive the same workflow while reading the root's text:
+
+[//]: # "docs-test: skip - fragment: application supplies a configured lead Agent and tenant_id"
+
+```python
+async with lead.stream("Review this draft: Sales rose.", tenant_id=tenant_id) as stream:
+    async for text in stream.text():
+        print(text, end="")
+    result = stream.result
+```
+
+Only root text appears in answer deltas. Subagent tool progress carries its own `run_id`, tool name, call id and outcome information. It omits child arguments, tool results and text. Generated subagent calls on the root are also shown structurally. The terminal root result retains the root's own steps. `resume_stream` accepts the root id and current `expected_pause_id`. Closing a workflow stream early requests cancellation with cascade.
+
+Each run keeps its own durable event log. The parent's `tool.started` event records the delegation's `child_run_id` and `agent_path`. At adoption, `tool.completed` includes `managed_outcome="succeeded"` or `"failed"`. Completion alone does not mean success. These delegation lifecycle payloads contain ids, paths and outcome information, without task or report text.
+
+Use `RunStore.follow(root_run_id, tenant_id=tenant_id)` for a client event feed. Follow the `child_run_id` separately for child detail. There is no combined subtree feed. See [read routes](/docs/recipes/build-your-own-read-routes) for cursors and feed handling.
+
+A call-level `notifier=` also receives child callbacks with each child's `run_id`, on initial and continuation calls. Delivery is best effort. Supply the notifier again after a restart. Durable integrations consume saved events and deduplicate them; callbacks have no exactly-once guarantee.
+
+## Usage and release work
+
+`result.usage` is local to the root run. In the example, `tree.usage` totals the root and its descendants. Each `tree.nodes` entry has that run's own `usage`. Reading the tree while paused gives usage recorded so far. Pass a finite `max_nodes=` bound when calling `RunStore.get_subtree`; reaching that descendant bound raises `SubtreeTooLargeError`.
+
+> **Coming in this release.** Cancelling a managed root will cascade to managed descendants regardless of `cascade=`. Cancellation is cooperative; it cannot undo effects. Delegation lifecycle outcomes will distinguish cancellation.
+
+> **Coming in this release.** The root budget will account for the root and all descendants together. A child will not receive a fresh spending allowance.
+
+> **Coming in this release.** A registered child's own `budget=` will be refused.
+
+> **Coming in this release.** `Limits.max_managed_runs` will bound admitted managed runs, with a default of 128.
+
+## Current limits
+
+- Managed parents and children must use ReAct. `SingleCall` children are refused before execution.
+- Streaming refuses registered subagents with guardrails or `output_type`. Use `run()` for a workflow with child guardrails. `output_type` requires `SingleCall`, which is also refused for managed children.
+- `retry` on an Agent with managed subagents is refused. Continue paused work through the root's resume or submit methods.
+- Parallel branches, background children and follow-up conversations with an existing child are not supported.
