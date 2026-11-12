@@ -57,38 +57,80 @@ async def reclaim(
     notifier: LoopNotifier | None,
     via_root: bool = False,
 ) -> RunResult:
-    from dendrux.loops.react import ReActLoop
-    from dendrux.runtime._capabilities import capabilities
-    from dendrux.runtime.durability import _ownership_handoff
-    from dendrux.runtime.submit import _cancel_claim, governance_snapshot
     from dendrux.skills._session import SkillSession
+
+    _require_recovery(store, run_id)
+    session = SkillSession.prepare(agent)
+    session.run_id = run_id
+    if not via_root:
+        await _refuse_child_before_claim(store, run_id, tenant_id)
+    claim = await _recovery_claim(
+        agent, store, run_id, tenant_id=tenant_id, item=item, session=session, via_root=via_root
+    )
+    if isinstance(claim, RunResult):
+        return claim
+    owned = claimed_store(store, run_id, claim)
+    if not via_root:
+        # Last resort: unreachable when the store and its reads agree. The claim
+        # cost one recovery attempt; nothing runs and the root reclaims later.
+        _refuse_direct_child(run_id, claim.loop_state)
+    if _pending_adoption(claim.loop_state):
+        # A managed parent claimed for adoption before its tool row completed:
+        # finish that adoption from the saved report, then continue (0.7).
+        claim = await _finish_saved_adoption(agent, owned, run_id, claim)
+    return await _continue_session(agent, store, run_id, claim, notifier, session)
+
+
+def _require_recovery(store: StateStore, run_id: str) -> None:
+    from dendrux.runtime._capabilities import capabilities
 
     if not capabilities(store).recovery:
         _codes.log_code(logger, _codes.STORE_CAPABILITY, run_id=run_id)
         raise NotImplementedError(
             f"StateStore {type(store).__name__} does not declare the 'recovery' capability"
         )
-    session = SkillSession.prepare(agent)
-    session.run_id = run_id
-    if not via_root:
-        await _refuse_child_before_claim(store, run_id, tenant_id)
+
+
+def _reclaim_arguments(
+    agent: Agent, session: Any, tenant_id: TenantScope, item: ReclaimableRun | None
+) -> dict[str, Any]:
+    """The store's ``reclaim_run`` keywords: the caller's definition and observed epoch."""
+    from dendrux.loops.react import ReActLoop
+    from dendrux.runtime.submit import governance_snapshot
+
+    react = isinstance(agent._effective_loop(None) or ReActLoop(), ReActLoop)
+    return {
+        "tenant_id": tenant_id,
+        "agent_name": agent.name,
+        "expected_claim_epoch": item.claim_epoch if item else None,
+        "governance": governance_snapshot(agent),
+        "governance_policy": agent._on_governance_change,
+        "skill_pins": {s.name: s.digest for s in session.available.values()},
+        "loop_type": "react" if react else "single_call",
+    }
+
+
+async def _recovery_claim(
+    agent: Agent,
+    store: StateStore,
+    run_id: str,
+    *,
+    tenant_id: TenantScope,
+    item: ReclaimableRun | None,
+    session: Any,
+    via_root: bool,
+) -> ClaimResult | RunResult:
+    """The recovery claim, or the cached result of a run that was cancelled."""
+    from dendrux.runtime.durability import _ownership_handoff
+    from dendrux.runtime.submit import _cancel_claim
+
+    arguments = _reclaim_arguments(agent, session, tenant_id, item)
     scope = managed_root_reclaim_scope(run_id) if via_root else nullcontext()
     try:
         with scope:
             claim = await _ownership_handoff(
                 store,
-                lambda: store.reclaim_run(
-                    run_id,
-                    tenant_id=tenant_id,
-                    agent_name=agent.name,
-                    expected_claim_epoch=item.claim_epoch if item else None,
-                    governance=governance_snapshot(agent),
-                    governance_policy=agent._on_governance_change,
-                    skill_pins={s.name: s.digest for s in session.available.values()},
-                    loop_type="react"
-                    if isinstance(agent._effective_loop(None) or ReActLoop(), ReActLoop)
-                    else "single_call",
-                ),
+                lambda: store.reclaim_run(run_id, **arguments),
                 partial(_cancel_claim, store, run_id),
                 run_id=run_id,
             )
@@ -102,16 +144,7 @@ async def reclaim(
 
             return await _build_cached_result(store, run_id)
         raise
-    owned = claimed_store(store, run_id, claim)
-    if not via_root:
-        # Last resort: unreachable when the store and its reads agree. The claim
-        # cost one recovery attempt; nothing runs and the root reclaims later.
-        _refuse_direct_child(run_id, claim.loop_state)
-    if _pending_adoption(claim.loop_state):
-        # A managed parent claimed for adoption before its tool row completed:
-        # finish that adoption from the saved report, then continue (0.7).
-        claim = await _finish_saved_adoption(agent, owned, run_id, claim)
-    return await _continue_session(agent, store, run_id, claim, notifier, session)
+    return cast("ClaimResult", claim)
 
 
 async def continue_claimed(
@@ -1159,6 +1192,33 @@ class _Prepared:
     gates: dict[str, Any] = field(default_factory=dict)
     skills: set[str] = field(default_factory=set)
 
+    async def prepare_all(
+        self, store: StateStore, actions: Any, by_id: dict[str, Any]
+    ) -> RunResult | None:
+        """Prepare every pending call in order; a cancel or pause barrier stops early."""
+        run, pause = self.run, self.run.ctx.pause_state
+        calls = {tc.id: tc for tc in pause.pending_tool_calls}
+        for index, action in enumerate(actions):
+            barrier = await _recovery_barrier(
+                store,
+                run.run_id,
+                pause,
+                run.ctx.history,
+                actions,
+                index,
+                calls,
+                self.held,
+                by_id,
+                self.gates,
+            )
+            if barrier is not None:
+                return barrier
+            if action.call_id is None:
+                raise PersistenceError(code="recovery_submission_missing")
+            tc = calls[action.call_id]
+            await self.prepare(tc, action, by_id.get(tc.id))
+        return None
+
     async def prepare(self, tc: ToolCall, action: Any, row: Any) -> None:
         """Resolve a saved outcome, or prepare the call without dispatching it.
 
@@ -1220,13 +1280,8 @@ async def resolve(
     found = managed if isinstance(managed, _ManagedPending) else None
     state, descriptor = await _consume_recovery_submission(store, run_id, ctx, lookups)
     pending = state.get("pending", [])
-    rows = (
-        await store.get_tool_calls(run_id, iteration_index=pause.iteration, limit=MAX_PAGE)
-        if pending
-        else []
-    )
+    rows = await _pending_rows(store, run_id, pause.iteration, pending)
     by_id = {row.tool_call_id: row for row in rows}
-    calls = {tc.id: tc for tc in pause.pending_tool_calls}
     actions = resolve_pending(
         state, rows, current_idempotent={name: td.idempotent for name, td in lookups.defs.items()}
     )
@@ -1237,25 +1292,41 @@ async def resolve(
         phases={p["call_id"]: p["phase"] for p in pending},
         reserved=counts.copy(),
     )
-    held, gates = prep.held, prep.gates
     _refuse_managed_approval(found, run_id, actions, by_id, None)
-    for index, action in enumerate(actions):
-        barrier = await _recovery_barrier(
-            store, run_id, pause, ctx.history, actions, index, calls, held, by_id, gates
-        )
-        if barrier is not None:
-            return barrier
-        if action.call_id is None:
-            raise PersistenceError(code="recovery_submission_missing")
-        tc = calls[action.call_id]
-        await prep.prepare(tc, action, by_id.get(tc.id))
-    _refuse_managed_approval(found, run_id, (), by_id, gates)
+    barrier = await prep.prepare_all(store, actions, by_id)
+    if barrier is not None:
+        return barrier
+    _refuse_managed_approval(found, run_id, (), by_id, prep.gates)
     held, barrier = await _dispatch_prepared_batch(
-        agent, store, run_id, ctx, actions, held, gates, by_id, lookups, counts, image_runtime
+        agent,
+        store,
+        run_id,
+        ctx,
+        actions,
+        prep.held,
+        prep.gates,
+        by_id,
+        lookups,
+        counts,
+        image_runtime,
     )
     if barrier is not None:
         return barrier
     order_observations(recorder, ctx.history)
-    if found is not None and [tc.id for tc in held] == [found.call.id]:
+    if _handed_off(found, held):
         return _managed_handoff(agent, ctx, run_id, held[0], lookups)
-    return await _recovery_pause_result(store, run_id, ctx, state, descriptor, held, gates)
+    return await _recovery_pause_result(store, run_id, ctx, state, descriptor, held, prep.gates)
+
+
+async def _pending_rows(
+    store: StateStore, run_id: str, iteration: int, pending: list[Any]
+) -> list[Any]:
+    """The iteration's tool rows, read only when calls are pending."""
+    if not pending:
+        return []
+    return list(await store.get_tool_calls(run_id, iteration_index=iteration, limit=MAX_PAGE))
+
+
+def _handed_off(found: _ManagedPending | None, held: list[ToolCall]) -> bool:
+    """Only the admitted managed call is left: it goes to the bind (0.7)."""
+    return found is not None and [tc.id for tc in held] == [found.call.id]
