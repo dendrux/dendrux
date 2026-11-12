@@ -217,7 +217,7 @@ class MySQLStateStore(SQLStateStore):
         facts = (
             await conn.execute(
                 text(
-                    f"SELECT @@max_allowed_packet, @@session.{isolation_variable}, "
+                    f"SELECT @@max_allowed_packet, @@session.{isolation_variable}, "  # noqa: S608 - Allow-list: isolation_variable is tx_isolation or transaction_isolation; tables are bound.
                     "(SELECT count(*) FROM information_schema.TABLES "
                     "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN :tables "
                     "AND (ENGINE IS NULL OR ENGINE <> 'InnoDB')), "

@@ -810,7 +810,8 @@ def classify(conn: Connection, *, head: str, upgradeable: Collection[str]) -> st
         return "bootstrap"
     if VERSION_TABLE in present:
         revisions = [
-            str(row[0]) for row in conn.execute(text(f"SELECT version_num FROM {VERSION_TABLE}"))
+            str(row[0])
+            for row in conn.execute(text(f"SELECT version_num FROM {VERSION_TABLE}"))  # noqa: S608 - Allow-list: VERSION_TABLE constant; no caller-supplied identifier.
         ]
         if revisions == [head]:
             return "current"
@@ -962,11 +963,13 @@ def _stamp_bootstrap(conn: Connection, head: str, ddl: Callable[[str, str], None
             "stamp",
         )
     revisions = [
-        str(row[0]) for row in conn.execute(text(f"SELECT version_num FROM {VERSION_TABLE}"))
+        str(row[0])
+        for row in conn.execute(text(f"SELECT version_num FROM {VERSION_TABLE}"))  # noqa: S608 - Allow-list: VERSION_TABLE constant; no caller-supplied identifier.
     ]
     if not revisions:
         conn.execute(
-            text(f"INSERT INTO {VERSION_TABLE} (version_num) VALUES (:head)"), {"head": head}
+            text(f"INSERT INTO {VERSION_TABLE} (version_num) VALUES (:head)"),  # noqa: S608 - Allow-list: VERSION_TABLE constant; head is bound separately.
+            {"head": head},
         )
     elif revisions != [head]:
         raise _refuse(f"it is stamped with {', '.join(revisions)} during bootstrap.")

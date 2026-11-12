@@ -464,7 +464,7 @@ async def _check_blocked_run(store: Any, run_id: str) -> None:
             meta = record.meta or {}
     except RunFencedError:
         raise
-    except Exception:
+    except Exception:  # noqa: S110 - Metadata read failure becomes PersistenceError below; fail closed without vendor text.
         pass
     if meta is None:
         raise PersistenceError()

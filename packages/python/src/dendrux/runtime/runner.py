@@ -279,7 +279,7 @@ async def _persist_run_failure(
     except Exception:
         if strict:
             raise
-        logger.error(
+        logger.error(  # noqa: TRY400 - Keep safe_exception_info() to exclude vendor text and exception chains.
             "Failed to persist ERROR status for run %s", run_id, exc_info=safe_exception_info()
         )
         return False
@@ -4906,7 +4906,7 @@ def run_stream(
                     safe_read=True,
                 )
             except Exception:
-                logger.error(
+                logger.error(  # noqa: TRY400 - Keep safe_exception_info() to exclude vendor text and exception chains.
                     "Failed to cancel run %s during stream cleanup",
                     run_id,
                     exc_info=safe_exception_info(),
@@ -4927,7 +4927,7 @@ def run_stream(
                     if run_record is not None:
                         terminal_status = RunStatus(run_record.status)
                         cancel_persisted = terminal_status == RunStatus.CANCELLED
-                except Exception:
+                except Exception:  # noqa: S110 - Cleanup retains CANCELLED fallback when persisted status is unavailable.
                     pass  # CANCELLED is a safe fallback
             cancelled_result = RunResult(
                 run_id=run_id,
@@ -7943,7 +7943,7 @@ async def _finish_resume_stream_cleanup(
             if run_record is not None:
                 terminal_status = RunStatus(run_record.status)
                 cancel_persisted = terminal_status == RunStatus.CANCELLED
-        except Exception:
+        except Exception:  # noqa: S110 - Cleanup retains CANCELLED fallback when persisted status is unavailable.
             pass  # CANCELLED is a safe fallback
     cancelled_result = RunResult(
         run_id=run_id,
@@ -8270,7 +8270,7 @@ def resume_stream(
                     safe_read=True,
                 )
             except Exception:
-                logger.error(
+                logger.error(  # noqa: TRY400 - Keep safe_exception_info() to exclude vendor text and exception chains.
                     "Failed to cancel run %s during resume stream cleanup",
                     run_id,
                     exc_info=safe_exception_info(),

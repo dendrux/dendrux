@@ -952,7 +952,7 @@ async def release_claim(
         try:
             if await _release_with_event(store, release, run_id, status, epoch, event):
                 return True
-        except (Exception, asyncio.CancelledError):
+        except (Exception, asyncio.CancelledError):  # noqa: S110 - Claim-release failure logs PERSISTENCE_ERROR immediately below.
             pass
         _codes.log_code(logging.getLogger(__name__), _codes.PERSISTENCE_ERROR, run_id=run_id)
         return False

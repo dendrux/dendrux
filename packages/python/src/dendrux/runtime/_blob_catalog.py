@@ -1699,7 +1699,7 @@ class CatalogBlobAccessor:
         try:
             stats.deleted_orphan_edges += await catalog.delete_orphan_edges(limit)
         except Exception:
-            logger.error("Blob GC: deleting orphan edges failed")
+            logger.error("Blob GC: deleting orphan edges failed")  # noqa: TRY400 - Static message only; exception diagnostics require safe_exception_info().
         # 3. Unreferenced blobs past the grace period.
         for info in await _call(
             catalog, "gc_candidates", cutoff, limit, include_external=has_store
@@ -1713,7 +1713,7 @@ class CatalogBlobAccessor:
         try:
             await step(catalog, info, cutoff, stats)
         except Exception:
-            logger.error(
+            logger.error(  # noqa: TRY400 - Approved fields only; exception diagnostics require safe_exception_info().
                 "Blob GC: step failed (scope=%s image=%s state=%s)",
                 _scope_of(info),
                 image_id(info.sha256),

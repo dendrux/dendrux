@@ -474,7 +474,7 @@ class _Coordinator:
     def on_gap(self) -> None:
         now = self._now()
         for run in self.runs.values():
-            self.request(run, "gap", now + random.uniform(0, run.params.poll_interval_s))
+            self.request(run, "gap", now + random.uniform(0, run.params.poll_interval_s))  # noqa: S311 - Non-security gap recovery polling jitter.
 
     def _healthy(self) -> bool:
         live = self._listening_live()
@@ -1136,7 +1136,7 @@ class _Coordinator:
         earliest = now + interval * (1 - HEALTHY_JITTER)
         latest = now + interval * (1 + HEALTHY_JITTER)
         if not earliest <= deadline <= latest:
-            deadline = random.uniform(earliest, latest)
+            deadline = random.uniform(earliest, latest)  # noqa: S311 - Non-security healthy polling jitter.
             self._remember_window(interval, deadline)
         return deadline
 

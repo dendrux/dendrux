@@ -111,7 +111,7 @@ async def _require_block_mark(store: StateStore, run_id: str) -> None:
         )
     except RunFencedError:
         raise
-    except Exception:
+    except Exception:  # noqa: S110 - Block-mark read failure becomes PersistenceError below; fail closed without vendor text.
         pass
     if not valid:
         raise PersistenceError()

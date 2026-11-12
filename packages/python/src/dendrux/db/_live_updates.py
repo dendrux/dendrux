@@ -726,7 +726,7 @@ class LiveUpdates(ABC):
         try:
             while self._state == "open":
                 await self._listen_attempt()
-                delay = random.uniform(0, self._listener_backoff)
+                delay = random.uniform(0, self._listener_backoff)  # noqa: S311 - Non-security listener reconnect jitter.
                 self._listener_backoff = min(self._listener_backoff * 2, self.backoff_max_s)
                 await asyncio.sleep(delay)
         finally:

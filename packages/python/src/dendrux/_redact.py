@@ -21,7 +21,7 @@ __all__ = ["mask_database_url", "mask_database_urls_in"]
 UNPARSEABLE_URL = "<unparseable database url>"
 
 # The userinfo password renders as ``***``; ``*`` would be percent-encoded in a query.
-_SECRET_QUERY_VALUE = "redacted"
+_SECRET_QUERY_VALUE = "redacted"  # noqa: S105 - Redaction placeholder, never a credential.
 _SECRET_QUERY_KEYS = frozenset(
     {
         "password",

@@ -367,7 +367,7 @@ def _add_column(conn: Connection, table: Table, column: Column[Any]) -> None:
         conn.exec_driver_sql(f"ALTER TABLE {_quote(conn, table.name)} ADD COLUMN {spec}")
         if status_clock:
             conn.exec_driver_sql(
-                "UPDATE agent_runs SET status_changed_at = "
+                "UPDATE agent_runs SET status_changed_at = "  # noqa: S608 - Allow-list: agent_runs clock columns; clock_default is a compiled internal timestamp.
                 f"COALESCE(updated_at, created_at, {clock_default})"
             )
     except OperationalError:
