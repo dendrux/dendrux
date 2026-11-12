@@ -16,22 +16,19 @@ contender races run on Postgres only.
 
 from __future__ import annotations
 
-import asyncio
-import json
 from contextlib import asynccontextmanager
 from typing import Any
 
 import pytest
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 from dendrux import Agent, tool
-from dendrux.db.models import AgentRun, ReactTrace, RunEvent, TokenUsage, ToolCallRecord
+from dendrux.db.models import AgentRun, ReactTrace, RunEvent
 from dendrux.runtime import _managed
 from dendrux.runtime.context import get_delegation_context
 from dendrux.runtime.stores._factory import store_for_engine
 from dendrux.types import LLMResponse, RunStatus, ToolCall
-from tests._helpers.recovery_checkpoint import expire
 from tests._helpers.scripted_provider import ScriptedLLM
 
 BRIEF = "SENTINEL-recover-brief-5a1d"
