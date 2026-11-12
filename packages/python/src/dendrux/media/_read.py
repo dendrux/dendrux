@@ -41,7 +41,7 @@ def _read_path_sync(path: str, max_source_bytes: int) -> tuple[bytes | None, str
     path swapped for a FIFO or device after the ``stat`` can never block.
     """
     try:
-        st = os.stat(path)
+        st = os.stat(path)  # noqa: PTH116 - preserve raw paths, including trailing slashes
     except OSError:
         return None, "path", 0
     if not stat.S_ISREG(st.st_mode):

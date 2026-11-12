@@ -339,7 +339,7 @@ def _activate(conn: Connection, batch_size: int, dedupe_only: bool) -> None:
                     require_valid=False,
                 )
         conn.commit()
-        for _, (_, _, old) in ACTIVATION_INDEXES.items():
+        for _, _, old in ACTIVATION_INDEXES.values():
             if not old:
                 continue
             put_setting(conn, "activate_step", f"drop:{old}")

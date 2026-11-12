@@ -509,7 +509,7 @@ async def test_time_filters_need_aware_datetimes(dendrux_kit: Kit) -> None:
     assert [r.id for r in await store.list_runs(started_before=future)] == [run_id]
     assert await store.list_runs(started_before=past) == []
     with pytest.raises(ValueError):
-        await store.list_runs(started_after=datetime.now())  # noqa: DTZ005 - naive on purpose
+        await store.list_runs(started_after=datetime.now())  # naive on purpose
 
 
 @basic()

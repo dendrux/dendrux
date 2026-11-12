@@ -134,7 +134,7 @@ async def reset_engine() -> None:
     Releases the lock before awaiting dispose() to avoid holding a
     synchronous lock across an async suspension point.
     """
-    global _engine, _engine_url, _session_factory, _generation, _engine_options_key  # noqa: PLW0603
+    global _engine, _engine_url, _session_factory, _generation, _engine_options_key
     with _engine_lock:
         _generation += 1
         engine = _engine

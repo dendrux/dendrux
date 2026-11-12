@@ -2240,7 +2240,7 @@ class RunEventType(StrEnum):
         TOOL_RESULT: A tool has been executed and its result is available.
     """
 
-    # Lifecycle (runner-owned)
+    # Lifecycle events are owned by the runner.
     RUN_STARTED = "run_started"
     RUN_RESUMED = "run_resumed"
     RUN_COMPLETED = "run_completed"
@@ -2254,7 +2254,7 @@ class RunEventType(StrEnum):
     TOOL_USE_START = "tool_use_start"
     TOOL_USE_END = "tool_use_end"
 
-    # Execution (loop-owned)
+    # Execution events are owned by the loop.
     TOOL_RESULT = "tool_result"
 
 

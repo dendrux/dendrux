@@ -3729,10 +3729,7 @@ class Agent:
             seen.add(s.name)
 
         # Apply deny_skills filter
-        loaded: list[Skill] = []
-        for s in all_skills:
-            if s.name not in self._deny_skills:
-                loaded.append(s)
+        loaded = [s for s in all_skills if s.name not in self._deny_skills]
 
         self._loaded_skills = loaded
 
@@ -3773,8 +3770,7 @@ class Agent:
         if session.delivery == "inlined":
             # Inlined skill mode: render bodies verbatim into the prompt.
             parts = [self.prompt, "\n\n## Skills"]
-            for skill in sorted_skills:
-                parts.append(f"\n### Skill: {skill.name}\n\n{skill.body}")
+            parts.extend(f"\n### Skill: {skill.name}\n\n{skill.body}" for skill in sorted_skills)
             rendered = "\n".join(parts)
             self._maybe_warn_inlined_skill_size(rendered)
             return rendered
@@ -3786,8 +3782,7 @@ class Agent:
             "call the `use_skill` tool with the skill name. The skill's "
             "detailed instructions will be returned to you.\n",
         ]
-        for skill in sorted_skills:
-            parts.append(f"- **{skill.name}**: {skill.description}")
+        parts.extend(f"- **{skill.name}**: {skill.description}" for skill in sorted_skills)
 
         return "\n".join(parts)
 

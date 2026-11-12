@@ -1427,7 +1427,7 @@ class GovernanceMismatchError(_KwargsReduceMixin, RuntimeError):
 
 
 # ---------------------------------------------------------------------------
-# Subagents (0.7)
+# Subagent errors introduced in 0.7.
 # ---------------------------------------------------------------------------
 
 

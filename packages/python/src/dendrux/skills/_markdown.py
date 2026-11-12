@@ -90,7 +90,7 @@ def parse_frontmatter(markdown: str) -> tuple[dict[str, Any], str]:
     """
     fm_text, body = split_frontmatter(markdown)
     try:
-        data = yaml.load(fm_text, Loader=_StrictLoader)  # noqa: S506 - SafeLoader subclass
+        data = yaml.load(fm_text, Loader=_StrictLoader)  # SafeLoader subclass
     except yaml.YAMLError as exc:
         raise SkillValidationError(
             f"Invalid YAML in frontmatter: {exc}", field="frontmatter"

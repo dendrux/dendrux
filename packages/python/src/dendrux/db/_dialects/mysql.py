@@ -479,16 +479,11 @@ def table_problems(
             if not (scope_optional and column == TENANT_SCOPE_COLUMN):
                 problems.append(f"{name}.{column}")
             continue
-        for attribute in ("data_type", "length", "precision", "nullable", "default"):
-            if getattr(have, attribute) != getattr(want, attribute):
-                problems.append(
-                    f"{name}.{column} ({attribute} {getattr(have, attribute)}, "
-                    f"expected {getattr(want, attribute)})"
-                )
-        if have.collation != want.collation:
-            problems.append(
-                f"{name}.{column} (collation {have.collation}, expected {want.collation})"
-            )
+        problems.extend(
+            f"{name}.{column} ({attr} {getattr(have, attr)}, expected {getattr(want, attr)})"
+            for attr in ("data_type", "length", "precision", "nullable", "default", "collation")
+            if getattr(have, attr) != getattr(want, attr)
+        )
         if have.generated != want.generated:
             problems.append(f"{name}.{column} (generated column differs)")
     if exact:
@@ -501,12 +496,14 @@ def table_problems(
         problems.append(
             f"{name} (primary key {actual.primary_key}, expected {expected.primary_key})"
         )
-    for key in sorted(expected.foreign_keys - actual.foreign_keys):
-        problems.append(
-            f"{name} (foreign key {', '.join(key[0])} -> {key[1]} missing or different)"
-        )
-    for key in sorted(actual.foreign_keys - expected.foreign_keys):
-        problems.append(f"{name} (unexpected foreign key {', '.join(key[0])} -> {key[1]})")
+    problems.extend(
+        f"{name} (foreign key {', '.join(key[0])} -> {key[1]} missing or different)"
+        for key in sorted(expected.foreign_keys - actual.foreign_keys)
+    )
+    problems.extend(
+        f"{name} (unexpected foreign key {', '.join(key[0])} -> {key[1]})"
+        for key in sorted(actual.foreign_keys - expected.foreign_keys)
+    )
     return problems
 
 

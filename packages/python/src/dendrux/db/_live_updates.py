@@ -525,15 +525,15 @@ class LiveUpdates(ABC):
 
     def abort_sender(self) -> None:
         """Synchronously drop the sender connection, including after cancellation."""
-        return None
+        return
 
     def abort_listener(self) -> None:
         """Synchronously drop the listener connection on forced shutdown."""
-        return None
+        return
 
     async def aclose_sender(self) -> None:
         """Close the sender connection at instance shutdown."""
-        return None
+        return
 
     def _init_listener(self) -> None:
         self._healthy = False
