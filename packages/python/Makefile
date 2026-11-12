@@ -129,7 +129,7 @@ semgrep:
 	python tools/semgrep_ratchet.py check
 
 # Stale-patch guard: fails when a test patches a re-export that its module never uses (the patch
-# would silently do nothing). Part of `make quality`.
+# would silently do nothing). Part of `make ci`.
 stale-patches:
 	python tools/stale_patch_lint.py check
 
@@ -141,7 +141,7 @@ move-check:
 	@test -n "$(BASE)" -a -n "$(OLD)" -a -n "$(NEW)" || { echo "usage: make move-check BASE=<ref> OLD=<path> NEW=\"<paths>\""; exit 2; }
 	python tools/move_check.py --base "$(BASE)" --old "$(OLD)" --new $(NEW) $(MOVE_ARGS)
 
-quality: cognitive duplicates deadcode cycles semgrep crap size ruff-ratchet stale-patches
+quality: cognitive duplicates deadcode cycles semgrep crap size ruff-ratchet
 
 quality-stamp:
 	python tools/size_ratchet.py stamp
@@ -241,7 +241,7 @@ format:
 package-smoke:
 	python scripts/mcp_distribution_smoke.py
 
-ci: lint typecheck arch test crap quality api-check
+ci: lint typecheck arch test crap quality stale-patches api-check
 
 clean:
 	rm -rf dist/ build/ *.egg-info .pytest_cache .mypy_cache .ruff_cache htmlcov .coverage coverage.json coverage.json.sources.json

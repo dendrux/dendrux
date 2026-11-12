@@ -34,7 +34,7 @@ def test_the_make_targets_exist() -> None:
     assert "tools/move_check.py" in makefile
     assert "\nstale-patches:" in makefile
     assert "tools/stale_patch_lint.py check" in makefile
-    assert "stale-patches" in makefile.split("\nquality:")[1].splitlines()[0]
+    assert "stale-patches" in makefile.split("\nci:")[1].splitlines()[0]
 
 
 @pytest.mark.skipif(not WORKFLOW.is_file(), reason="repository checkout only")

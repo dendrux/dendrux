@@ -364,7 +364,7 @@ need no database.
 |---|---|
 | `tools/move_check.py` | Compares the old module at a git ref with the old and new modules now. Passes only when every top-level function, class, constant and statement is in exactly one module afterwards with an identical `ast.dump` (docstrings and defaults included). Import statements, the module docstring and `__all__` are ignored. A method may move to a new mixin class that is a direct base of the original class (the method body must be identical). Anything missing, duplicated, extra or changed fails with a diff of the first mismatch. |
 | `tools/patch_codemod.py` | Rewrites `monkeypatch.setattr`, `patch(...)` and `patch.object` targets in `tests/` from the old module to the module that now defines the name. String targets and module aliases only. Dry run prints a diff; `--write` applies it. |
-| `tools/stale_patch_lint.py` | `make stale-patches`, part of `make quality`: fails when a test patches a pure re-export (see the table above). It turns the silent no-op after a split into a red check. |
+| `tools/stale_patch_lint.py` | `make stale-patches`, part of `make ci` and the CI quality job: fails when a test patches a pure re-export (see the table above). It turns the silent no-op after a split into a red check. |
 
 To prove a move PR (run from `packages/python`; `BASE` is the ref before the move):
 
