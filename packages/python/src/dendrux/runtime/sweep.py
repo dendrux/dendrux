@@ -177,8 +177,12 @@ async def sweep(
         cursor: Continue after the previous page's opaque cursor. A call never
             wraps; None in the result means both scans reached their end. Continue
             with the same thresholds; omit the cursor to start a new scan. Native
-            SQL stores continue waiting scans; custom stores retain their own
-            sweep behavior.
+            SQL stores continue waiting scans. Repeats without a cursor restart
+            at the oldest waiting row and can stall behind more than max_runs
+            exempt or corrupt waits; pass result.cursor to reach later rows.
+            Custom stores and SQLStateStore subclasses overriding
+            sweep_abandoned_runs get no waiting continuation and must bound
+            their own exempt-wait handling.
 
     Returns:
         SweepResult with lists of swept runs by category.

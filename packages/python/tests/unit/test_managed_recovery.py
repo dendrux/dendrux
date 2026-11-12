@@ -138,3 +138,34 @@ async def test_custom_waiting_sweep_keeps_its_legacy_call_signature() -> None:
     progress = _SweepCursor(waiting_done=True)
     assert await _sweep_waiting(custom, timedelta(hours=1), {}, progress) == []
     method.assert_awaited_once_with(older_than=timedelta(hours=1))
+
+
+@pytest.mark.parametrize("family", ["mysql", "mariadb", "sqlite", "postgresql"])
+def test_waiting_continuation_uses_the_dialect_range_form(family: str) -> None:
+    from datetime import UTC, datetime
+
+    from sqlalchemy.dialects import mysql, postgresql, sqlite
+    from sqlalchemy.dialects.mysql.mariadb import MariaDBDialect
+
+    from dendrux.runtime.stores.sql.mysql import MySQLStateStore
+    from dendrux.runtime.stores.sql.postgres import PostgresStateStore
+    from dendrux.runtime.stores.sql.sqlite import SQLiteStateStore
+
+    store_class, dialect = {
+        "mysql": (MySQLStateStore, mysql.dialect()),
+        "mariadb": (MySQLStateStore, MariaDBDialect()),
+        "sqlite": (SQLiteStateStore, sqlite.dialect()),
+        "postgresql": (PostgresStateStore, postgresql.dialect()),
+    }[family]
+    scan = _SweepScan(object.__new__(store_class), waiting=True, older_than=timedelta(hours=1))
+    page = scan.page("paused", (datetime(2026, 1, 1, tzinfo=UTC), "middle"), 37)
+    clause = str(page.whereclause.compile(dialect=dialect))
+    assert "agent_runs.status =" in clause
+    assert "agent_runs.status_changed_at <" in clause
+    if family in {"mysql", "mariadb"}:
+        assert " OR " in clause
+        assert "agent_runs.status_changed_at =" in clause
+        assert "agent_runs.id >" in clause
+        assert "(agent_runs.status_changed_at, agent_runs.id)" not in clause
+    else:
+        assert "(agent_runs.status_changed_at, agent_runs.id) >" in clause

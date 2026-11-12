@@ -743,3 +743,145 @@ async def test_waiting_cursor_contenders_finalise_an_ordinary_pause_once(
     )
     assert len(events) == 1
     assert (await run_row(engine, ordinary)).claim_epoch == before_epoch + 1
+
+
+async def test_expanded_waiting_range_preserves_ties_and_time_order_on_sqlite(
+    engine: Any,
+) -> None:
+    if engine.dialect.name != "sqlite":
+        pytest.skip("Execute the MySQL-family predicate on SQLite without MySQL")
+    from dendrux.runtime.stores.sql.base import _SweepScan
+    from dendrux.runtime.stores.sql.mysql import MySQLStateStore
+
+    ids = await _seed_wait_prefix(engine, 7)
+    old = (await run_row(engine, ids[0])).status_changed_at
+    async with engine.begin() as conn:
+        # A smaller ID at a later time must follow the same-time ID tail.
+        await conn.execute(
+            update(AgentRun)
+            .where(AgentRun.id == ids[0])
+            .values(status_changed_at=old + timedelta(seconds=1))
+        )
+        await conn.execute(
+            update(AgentRun)
+            .where(AgentRun.id == ids[-1])
+            .values(status_changed_at=old - timedelta(seconds=1))
+        )
+        await conn.execute(
+            update(AgentRun).where(AgentRun.id == ids[-2]).values(status="waiting_approval")
+        )
+    scan = _SweepScan(object.__new__(MySQLStateStore), waiting=True, older_than=THRESHOLD)
+    # Execute the actual page WHERE, using SQLite projections instead of MySQL JSON functions.
+    seen = []
+    after = (old, ids[2])
+    async with engine.connect() as conn:
+        for _ in range(4):
+            page = scan.page("paused", after, 1)
+            statement = (
+                select(AgentRun.id, AgentRun.status_changed_at)
+                .where(page.whereclause)
+                .order_by(AgentRun.status_changed_at, AgentRun.id)
+                .limit(1)
+            )
+            row = (await conn.execute(statement)).first()
+            if row is None:
+                break
+            seen.append(row.id)
+            after = (row.status_changed_at, row.id)
+    assert seen == [ids[3], ids[4], ids[0]]
+
+
+@pytest.fixture(params=["mysql", "mariadb"])
+def sweep_mysql_url(request: Any) -> Any:
+    from tests.db.conftest import mysql_database
+
+    yield from mysql_database(request.param)
+
+
+def _explain_run_tables(node: Any) -> list[dict[str, Any]]:
+    if isinstance(node, list):
+        return [table for value in node for table in _explain_run_tables(value)]
+    if not isinstance(node, dict):
+        return []
+    if node.get("table_name") == "agent_runs":
+        return [node]
+    return [table for value in node.values() for table in _explain_run_tables(value)]
+
+
+async def test_mysql_waiting_pages_use_bounded_index_ranges(
+    sweep_mysql_url: str, record_property: Any
+) -> None:
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from dendrux.db.models import Base
+    from dendrux.runtime.stores._factory import store_for_engine
+    from dendrux.runtime.stores.sql.base import _SweepScan
+
+    engine = create_async_engine(
+        sweep_mysql_url,
+        isolation_level="READ COMMITTED",
+        connect_args={"init_command": "SET time_zone='+00:00'", "charset": "utf8mb4"},
+    )
+    population, cap = 10000, 50
+    now = datetime.now(UTC)
+    old = now - OLD
+    wait = {
+        "schema_version": 3,
+        "pause_reason": "managed_wait",
+        "managed_wait": {"child_run_id": "child"},
+    }
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+            # 10k eligible waits, 10k fresh waits, 20k terminal rows. All eligible
+            # waits tie on time: deep continuation must also range on the ID.
+            for start in range(0, 4 * population, 500):
+                await conn.execute(
+                    AgentRun.__table__.insert(),
+                    [
+                        dict(
+                            id=f"{i:026d}",
+                            agent_name="wait",
+                            status="paused" if i < 2 * population else "success",
+                            claim_epoch=1,
+                            storage_format=2,
+                            status_changed_at=old if i < population else now,
+                            updated_at=old if i < population else now,
+                            pause_data=wait,
+                        )
+                        for i in range(start, start + 500)
+                    ],
+                )
+        scan = _SweepScan(store_for_engine(engine), waiting=True, older_than=THRESHOLD)
+        positions = {"first": None, "deep": (old, f"{population - cap - 1:026d}")}
+        async with engine.connect() as conn:
+            (await conn.execute(text("ANALYZE TABLE agent_runs"))).all()
+            for name, after in positions.items():
+                statement = scan.page("paused", after, cap)
+                sql = str(
+                    statement.compile(
+                        dialect=engine.dialect, compile_kwargs={"literal_binds": True}
+                    )
+                )
+                raw = (await conn.execute(text("EXPLAIN FORMAT=JSON " + sql))).scalar_one()
+                plan = json.loads(raw) if isinstance(raw, str) else raw
+                record_property(f"waiting_range_{name}", json.dumps(plan))
+                [table] = _explain_run_tables(plan)
+                assert table["key"] == "ix_agent_runs_sweep_waiting", plan
+                assert table["access_type"] == "range", plan
+                estimate = table.get("rows_examined_per_scan", table.get("rows"))
+                assert estimate is not None, plan
+                # EXPLAIN estimates the matching range, not LIMIT rows. Allow
+                # statistics noise; a deep page must exclude the 9,950-row prefix.
+                ceiling = 2 * population if after is None else 4 * cap
+                assert 0 < int(estimate) <= ceiling, plan
+                required = {"status", "status_changed_at"}
+                if after is not None:
+                    required.add("id")
+                assert required <= set(table["used_key_parts"]), plan
+                page = (await conn.execute(statement)).all()
+                first = 0 if after is None else population - cap
+                assert [row.id for row in page] == [f"{i:026d}" for i in range(first, first + cap)]
+    finally:
+        await engine.dispose()

@@ -450,7 +450,7 @@ class _SweepScan:
                 AgentRun.status == status_filter, self.age < self.cutoff
             ).order_by(self.age, AgentRun.id)
             if after is not None:
-                statement = statement.where(tuple_(self.age, AgentRun.id) > after)
+                statement = statement.where(self.store._waiting_sweep_after(after))
             return statement
         # Equal range bounds preserve the (status, id) ordering in the planner.
         # Equality alone lets it prefer the primary key and filter through
@@ -5532,6 +5532,13 @@ class SQLStateStore(SQLBlobCatalog):
                 )
             ).all()
             return list(rows[:limit]), len(rows) > limit
+
+    def _waiting_sweep_after(self, after: tuple[datetime, str]) -> Any:
+        from sqlalchemy import tuple_
+
+        from dendrux.db.models import AgentRun
+
+        return tuple_(AgentRun.status_changed_at, AgentRun.id) > after
 
     async def sweep_stale_runs(
         self,

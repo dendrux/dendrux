@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Sequence
+    from datetime import datetime
 
     from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -137,6 +138,19 @@ class MySQLStateStore(SQLStateStore):
     ) -> None:
         super().__init__(engine, live_updates=live_updates)
         self.capabilities = replace(self.capabilities, deployment="multi_server")
+
+    def _waiting_sweep_after(self, after: tuple[datetime, str]) -> Any:
+        from sqlalchemy import and_, or_
+
+        from dendrux.db.models import AgentRun
+
+        age, run_id = after
+        # The status equality is supplied by the page. Expanding the remaining
+        # key lets MySQL-family optimizers range on all three index columns.
+        return or_(
+            AgentRun.status_changed_at > age,
+            and_(AgentRun.status_changed_at == age, AgentRun.id > run_id),
+        )
 
     def classify_db_error(self, exc: BaseException) -> Any:
         from dendrux.runtime.stores._errors import DbError
