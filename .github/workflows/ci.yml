@@ -526,6 +526,7 @@ jobs:
             tests/unit/test_sql_store_contract.py \
             tests/unit/test_sql_store_rx_errors.py \
             tests/integration/test_mysql_store_errors.py \
+            tests/integration/test_managed_sweep.py \
             -v -rs -n 4 -m "not benchmark" --cov=src/dendrux --cov-report= | tee pytest.log
           if grep -q '${{ matrix.env_name }} not set' pytest.log; then
             echo "::error::${{ matrix.server }} tests were skipped (${{ matrix.env_name }} not set)."
