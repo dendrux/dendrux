@@ -1301,13 +1301,15 @@ async def _load_persisted_pending(store: StateStore, result: RunResult, record: 
     except Exception:
         _codes.log_code(logger, _codes.RESULT_READ_FAILED, run_id=result.run_id)
         return False
-    status, moved = _read_status(result.status.value, record.status, reader.last_view)
+    status, moved = _read_status(
+        result.status.value, getattr(record, "status", None), reader.last_view
+    )
     result.status = RunStatus(status)
     result.pause_id = result.pending.pause_id if result.pending else None
     return moved
 
 
-def _read_status(status: str, record_status: str, view: Any) -> tuple[str, bool]:
+def _read_status(status: str, record_status: str | None, view: Any) -> tuple[str, bool]:
     """The status a pending read shows, and whether the run moved since its record.
 
     A parent waiting on a subagent reports its active branch; a run that moved
