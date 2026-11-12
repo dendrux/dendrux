@@ -449,9 +449,7 @@ class _SweepScan:
             statement = statement.where(
                 AgentRun.status == status_filter, self.age < self.cutoff
             ).order_by(self.age, AgentRun.id)
-            if after is not None:
-                statement = statement.where(self.store._waiting_sweep_after(after))
-            return statement
+            return self.store._waiting_sweep_page(statement, after, limit)
         # Equal range bounds preserve the (status, id) ordering in the planner.
         # Equality alone lets it prefer the primary key and filter through
         # terminal history on every page.
@@ -5533,12 +5531,16 @@ class SQLStateStore(SQLBlobCatalog):
             ).all()
             return list(rows[:limit]), len(rows) > limit
 
-    def _waiting_sweep_after(self, after: tuple[datetime, str]) -> Any:
+    def _waiting_sweep_page(
+        self, statement: Any, after: tuple[datetime, str] | None, limit: int
+    ) -> Any:
         from sqlalchemy import tuple_
 
         from dendrux.db.models import AgentRun
 
-        return tuple_(AgentRun.status_changed_at, AgentRun.id) > after
+        if after is not None:
+            statement = statement.where(tuple_(AgentRun.status_changed_at, AgentRun.id) > after)
+        return statement
 
     async def sweep_stale_runs(
         self,

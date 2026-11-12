@@ -168,13 +168,63 @@ def test_waiting_continuation_uses_the_dialect_range_form(family: str) -> None:
     }[family]
     scan = _SweepScan(object.__new__(store_class), waiting=True, older_than=timedelta(hours=1))
     page = scan.page("paused", (datetime(2026, 1, 1, tzinfo=UTC), "middle"), 37)
-    clause = str(page.whereclause.compile(dialect=dialect))
-    assert "agent_runs.status =" in clause
-    assert "agent_runs.status_changed_at <" in clause
+    sql = str(page.compile(dialect=dialect, compile_kwargs={"literal_binds": True}))
+    assert "agent_runs.status =" in sql
+    assert "agent_runs.status_changed_at <" in sql
     if family in {"mysql", "mariadb"}:
-        assert " OR " in clause
-        assert "agent_runs.status_changed_at =" in clause
-        assert "agent_runs.id >" in clause
-        assert "(agent_runs.status_changed_at, agent_runs.id)" not in clause
+        assert "UNION ALL" in sql
+        assert "run_events" not in sql
+        assert sql.count("LIMIT 37") == 3  # both branches and their merged page
+        assert "agent_runs.status_changed_at =" in sql
+        assert "agent_runs.id >" in sql
+        assert "(agent_runs.status_changed_at, agent_runs.id)" not in sql
     else:
-        assert "(agent_runs.status_changed_at, agent_runs.id) >" in clause
+        assert "UNION ALL" not in sql
+        assert "(agent_runs.status_changed_at, agent_runs.id) >" in sql
+
+
+@pytest.mark.parametrize("kind", ["bounded_ref", "prefix_ref", "icp_prefix"])
+async def test_waiting_page_read_gate_uses_measured_work_instead_of_plan_estimates(
+    kind: str,
+) -> None:
+    import json
+    from unittest.mock import AsyncMock
+
+    from sqlalchemy import select
+    from sqlalchemy.dialects import mysql
+
+    from dendrux.db.models import AgentRun
+    from tests.integration.test_managed_sweep import _assert_waiting_page_reads
+
+    plan = {
+        "query_block": {
+            "table": {
+                "table_name": "agent_runs",
+                "key": "ix_agent_runs_sweep_waiting",
+                "access_type": "ref",
+                "rows": 100000,
+            }
+        }
+    }
+    keys = ["Handler_read_next", "Handler_read_rnd_next", "Handler_icp_attempts"]
+    measured = [2, 0, 0]
+    if kind == "prefix_ref":
+        measured[0] = 9950
+    elif kind == "icp_prefix":
+        measured[2] = 9950
+    replies = [
+        SimpleNamespace(scalar_one=lambda: json.dumps(plan)),
+        SimpleNamespace(all=lambda: [(key, "0") for key in keys]),
+        SimpleNamespace(all=lambda: [SimpleNamespace(id=f"{i:026d}") for i in range(2)]),
+        SimpleNamespace(all=lambda: list(zip(keys, map(str, measured), strict=True))),
+    ]
+    conn = SimpleNamespace(dialect=mysql.dialect(), execute=AsyncMock(side_effect=replies))
+    recorded = []
+    args = (conn, select(AgentRun.id), 2, 0, kind, lambda *entry: recorded.append(entry))
+    if kind == "bounded_ref":
+        await _assert_waiting_page_reads(*args)
+    else:
+        with pytest.raises(AssertionError) as info:
+            await _assert_waiting_page_reads(*args)
+        assert "'reads'" in str(info.value)
+    assert len(recorded) == 1

@@ -139,18 +139,35 @@ class MySQLStateStore(SQLStateStore):
         super().__init__(engine, live_updates=live_updates)
         self.capabilities = replace(self.capabilities, deployment="multi_server")
 
-    def _waiting_sweep_after(self, after: tuple[datetime, str]) -> Any:
-        from sqlalchemy import and_, or_
+    def _waiting_sweep_page(
+        self, statement: Any, after: tuple[datetime, str] | None, limit: int
+    ) -> Any:
+        from sqlalchemy import literal, select, union_all
 
         from dendrux.db.models import AgentRun
 
-        age, run_id = after
-        # The status equality is supplied by the page. Expanding the remaining
-        # key lets MySQL-family optimizers range on all three index columns.
-        return or_(
-            AgentRun.status_changed_at > age,
-            and_(AgentRun.status_changed_at == age, AgentRun.id > run_id),
+        # Waiting classification never uses the started-event lookup. Avoid
+        # its correlated probe (and MariaDB expression cache) for each row.
+        statement = statement.with_only_columns(
+            *[
+                literal(None).label("started") if c.key == "started" else c
+                for c in statement.selected_columns
+            ]
         )
+        if after is None:
+            return statement
+        age, run_id = after
+        same_time = (
+            statement.where(AgentRun.status_changed_at == age, AgentRun.id > run_id)
+            .order_by(None)
+            .order_by(AgentRun.id)
+            .subquery("same_time")
+        )
+        later_time = statement.where(AgentRun.status_changed_at > age).subquery("later_time")
+        # LIMIT inside each derived table prevents merging it into an unbounded
+        # status-prefix scan. The outer sort sees at most two bounded pages.
+        window = union_all(select(same_time), select(later_time)).subquery("waiting_window")
+        return select(window).order_by(window.c.sweep_age, window.c.id).limit(limit)
 
     def classify_db_error(self, exc: BaseException) -> Any:
         from dendrux.runtime.stores._errors import DbError
