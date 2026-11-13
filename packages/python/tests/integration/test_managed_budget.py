@@ -1106,6 +1106,84 @@ async def test_acknowledged_baseline_survives_a_crash_before_adoption(store, eng
         assert result.status == RunStatus.SUCCESS and llm.calls == 1
 
 
+@pytest.mark.parametrize("action", ["pause", "cancel"])
+@pytest.mark.parametrize("contenders", [1, 4])
+async def test_reclaim_after_bind_preserves_accepted_unpriced_baseline(
+    store, engine, monkeypatch, action, contenders, capsys
+):
+    import asyncio
+    from collections import Counter
+
+    from sqlalchemy import event
+
+    from dendrux.errors import RunNotReclaimableError
+    from dendrux.runtime._managed_budget import UNPRICED_ACCEPTED
+    from tests.integration.test_managed_recovery import ProcessDeathError, expire, fresh_store
+
+    if contenders > 1 and engine.dialect.name != "postgresql":
+        pytest.skip("independent-session reclaim race: Postgres only")
+    budget = Budget(max_cost_usd=10, on_exceed=action)
+    first = response(None) if action == "pause" else unknown_response()
+    root, _, _, _ = agents(store, [response(1, "child")], [first], budget)
+    paused = await root.run("go")
+    assert paused.status == RunStatus.PAUSED
+    again, _, template, child_llm = agents(store, [response(1, "child")], [response()], budget)
+    original = store.bind_managed_child
+    statements = Counter()
+
+    def count(_conn, _cursor, statement, _parameters, _context, _many):
+        statements[statement.split()[0].upper()] += 1
+
+    async def die(request):
+        event.listen(engine.sync_engine, "before_cursor_execute", count)
+        try:
+            await original(request)
+        finally:
+            event.remove(engine.sync_engine, "before_cursor_execute", count)
+        raise ProcessDeathError
+
+    with monkeypatch.context() as patch:
+        patch.setattr(store, "bind_managed_child", die)
+        with pytest.raises(ProcessDeathError):
+            await resume_unknown(again, store, paused)
+    assert child_llm.calls == 0 and template.budget is None
+    tree = await store.get_subtree(paused.run_id)
+    active = next(node.run for node in tree.nodes if node.run.status == "running")
+    initial = await store.get_loop_state(active.id)
+    parent = await store.get_loop_state(paused.run_id)
+    assert parent[UNPRICED_ACCEPTED] == 1
+    assert not initial.get("iteration")
+    await expire(store, engine, active.id)
+    async with fresh_store(engine) as restarted:
+        recovering = [
+            agents(restarted if i % 2 == 0 else store, [response()], [response()], budget)
+            for i in range(contenders)
+        ]
+        outcomes = await asyncio.gather(
+            *(root.reclaim(paused.run_id, tenant_id=None) for root, *_ in recovering),
+            return_exceptions=True,
+        )
+        with capsys.disabled():
+            print(f"bind_statements {engine.dialect.name} {action}: {dict(statements)}")
+        assert all(
+            not isinstance(outcome, BaseException) or isinstance(outcome, RunNotReclaimableError)
+            for outcome in outcomes
+        ), outcomes
+        assert sum(child_llm.calls for _, _, _, child_llm in recovering) == 1
+        assert sum(root_llm.calls for _, root_llm, _, _ in recovering) == 1
+        assert any(
+            not isinstance(outcome, BaseException) and outcome.status == RunStatus.SUCCESS
+            for outcome in outcomes
+        )
+        assert (await restarted.get_run(active.id)).status == "success"
+        assert initial[UNPRICED_ACCEPTED] == 1
+        assert await exceeded_reasons(restarted, active.id) == []
+        assert (await restarted.subtree_usage(paused.run_id)).unpriced_calls == 1
+        after = await restarted.get_subtree(paused.run_id)
+        assert {node.run.id for node in after.nodes} == {node.run.id for node in tree.nodes}
+        assert (await restarted.get_loop_state(active.id))[UNPRICED_ACCEPTED] == 1
+
+
 @pytest.mark.parametrize("streaming", [False, True])
 async def test_cancel_action_cancels_on_child_unpriced_call(store, streaming):
     root, root_llm, _, _ = agents(

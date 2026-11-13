@@ -299,35 +299,39 @@ def tracker_for(budget):
     )
 
 
-def test_baseline_is_the_highest_of_tracker_checkpoint_and_parent_hand_off():
+@pytest.mark.parametrize("tracked,saved,expected", [(2, 4, 4), (5, 4, 5), (0, None, 0)])
+def test_baseline_is_the_highest_of_tracker_and_durable_checkpoint(tracked, saved, expected):
     from types import SimpleNamespace
 
     from dendrux.runtime._managed_budget import UNPRICED_ACCEPTED, carry_unpriced_baseline
 
     tracker = tracker_for(Budget(max_cost_usd=10))
-    tracker.accept_unpriced(2)
-    recorder = SimpleNamespace(_loop_state={UNPRICED_ACCEPTED: 4}, _managed_unpriced_baseline=3)
+    tracker.accept_unpriced(tracked)
+    recorder = SimpleNamespace(_loop_state={UNPRICED_ACCEPTED: saved})
     carry_unpriced_baseline(recorder, tracker)
-    assert tracker.unpriced_baseline == 4 and recorder._loop_state[UNPRICED_ACCEPTED] == 4
-    tracker.accept_unpriced(1)  # never lowers
-    assert tracker.unpriced_baseline == 4
-    fresh = SimpleNamespace(_loop_state={}, _managed_unpriced_baseline=3)
-    other = tracker_for(Budget(max_cost_usd=10))
-    carry_unpriced_baseline(fresh, other)
-    assert other.unpriced_baseline == 3 and fresh._loop_state[UNPRICED_ACCEPTED] == 3
+    assert tracker.unpriced_baseline == expected
+    assert recorder._loop_state[UNPRICED_ACCEPTED] == expected
+    tracker.accept_unpriced(0)  # never lowers
+    assert tracker.unpriced_baseline == expected
 
 
-def test_hand_baseline_marks_only_the_spawned_execution_copy():
-    from types import SimpleNamespace
+@pytest.mark.parametrize(
+    "parent,saved,expected", [(5, 2, 5), (2, 5, 5), (True, -1, 0), ("5", 3, 3), (4, None, 4)]
+)
+def test_child_seed_copies_checkpoint_and_max_merges_valid_counts(parent, saved, expected):
+    from dendrux.runtime._managed_budget import UNPRICED_ACCEPTED, child_state
 
-    from dendrux.runtime._managed_budget import UNPRICED_ACCEPTED, hand_baseline
+    state = {"v": 1, "loop": "react", UNPRICED_ACCEPTED: saved}
+    seeded = child_state(state, parent)
+    assert seeded[UNPRICED_ACCEPTED] == expected
+    assert seeded is not state and state[UNPRICED_ACCEPTED] == saved
 
-    template = child()
-    execution = SimpleNamespace()
-    descend = SimpleNamespace(meta={"managed_descend": SimpleNamespace(child=execution)})
-    hand_baseline(descend, SimpleNamespace(_loop_state={UNPRICED_ACCEPTED: 5}))
-    assert execution._managed_unpriced_baseline == 5
-    assert not hasattr(template, "_managed_unpriced_baseline")
+
+@pytest.mark.parametrize("state", [None, {}])
+def test_child_seed_preserves_default_loop_header(state):
+    from dendrux.runtime._managed_budget import UNPRICED_ACCEPTED, child_state
+
+    assert child_state(state, 3) == {"v": 1, "loop": "react", UNPRICED_ACCEPTED: 3}
 
 
 @pytest.mark.parametrize("action,reason", [("pause", "unpriced_call"), ("warn", None)])

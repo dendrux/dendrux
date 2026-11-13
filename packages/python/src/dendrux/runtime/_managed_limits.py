@@ -21,7 +21,7 @@ class ManagedRunLimitError(ManagedStateError):
     code = "managed_run_limit"
 
     def __init__(self, *, run_id: str | None = None, reason: str = "run_limit") -> None:
-        self.run_id, self.reason = run_id, "run_limit"
+        self.run_id, self.reason = run_id, reason
         # ManagedStateError normalizes persisted-state reasons and logs that code;
         # admission has its own stable reason, message and log code.
         PersistenceError.__init__(self, code=self.code)

@@ -6,12 +6,13 @@ from unittest.mock import AsyncMock
 import pytest
 
 from dendrux.agent import Agent
-from dendrux.errors import SubagentTreeTooLargeError
+from dendrux.errors import ManagedStateError, SubagentTreeTooLargeError
 from dendrux.guardrails import PII
 from dendrux.llm.mock import MockLLM
 from dendrux.runtime import _managed
 from dendrux.runtime._capabilities import _REQUIREMENTS
 from dendrux.runtime._managed_cancel import ManagedStoreCapability
+from dendrux.runtime._managed_limits import ManagedRunLimitError
 from dendrux.runtime._subagents import check_subagent_tree
 from dendrux.runtime.state import RunRecord
 from dendrux.types import InputValidationError, Limits, generate_ulid
@@ -32,6 +33,20 @@ def test_public_defaults():
     limits = Limits()
     assert getattr(limits, "max_managed_runs", None) == 128
     assert getattr(limits, "max_subagent_definitions", None) == 256
+
+
+@pytest.mark.parametrize("fields,reason", [({}, "run_limit"), ({"reason": "SENTINEL"}, "SENTINEL")])
+def test_managed_run_limit_error_preserves_reason_and_contract(fields, reason, caplog):
+    run_id = generate_ulid()
+    error = ManagedRunLimitError(run_id=run_id, **fields)
+    assert isinstance(error, ManagedStateError)
+    assert error.reason == reason and error.run_id == run_id
+    assert error.code == "managed_run_limit"
+    assert "SENTINEL" not in str(error) and "SENTINEL" not in caplog.text
+    assert any(
+        getattr(record, "code", None) == "managed_run_limit" and record.run_id == run_id
+        for record in caplog.records
+    )
 
 
 def test_managed_capability_requires_only_runtime_reads():

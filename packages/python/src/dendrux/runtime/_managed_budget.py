@@ -28,7 +28,7 @@ from dendrux.loops._budget import BudgetTracker, breach_payload
 from dendrux.loops.react import MANAGED_HANDOFF_KEY
 from dendrux.runtime import _managed_cancel, _subagents
 from dendrux.runtime.durability import retry_transient_db
-from dendrux.runtime.state import LoopStatePatch
+from dendrux.runtime.state import LoopStatePatch, _initial_loop_state
 from dendrux.runtime.submit import _governance_change
 from dendrux.types import RunResult, RunStatus
 
@@ -98,7 +98,6 @@ def configure_recorder(recorder: Any, agent: Agent) -> None:
     """Pass execution policy through the recorder without changing Agent budget semantics."""
     recorder._history_limits = agent._limits
     recorder._managed_policy = getattr(agent, "_managed_budget_policy", agent.budget)
-    recorder._managed_unpriced_baseline = getattr(agent, "_managed_unpriced_baseline", 0)
 
 
 async def restore_recorder(
@@ -136,20 +135,24 @@ def accepted_count(value: Any) -> int:
     return value if ok else 0
 
 
+def child_state(state: dict[str, Any] | None, accepted: int) -> dict[str, Any]:
+    """Seed a detached child checkpoint for atomic bind, retaining any higher count."""
+    seeded = dict(state or _initial_loop_state("ReActLoop") or {})
+    seeded[UNPRICED_ACCEPTED] = max(
+        accepted_count(seeded.get(UNPRICED_ACCEPTED)), accepted_count(accepted)
+    )
+    return seeded
+
+
 def carry_unpriced_baseline(recorder: Any, tracker: BudgetTracker) -> None:
     """Keep the root budget's accepted unpriced count with this execution's checkpoint.
 
     The baseline is the highest of the tracker's own (a budget resume of this very
-    pause), the one persisted in this run's checkpoint (restart, reclaim, adoption)
-    and the one the spawning parent handed this child.
+    pause) and the one persisted in this run's checkpoint (atomic child bind,
+    restart, reclaim, adoption).
     """
     state = recorder._loop_state
-    tracker.accept_unpriced(
-        max(
-            accepted_count(state.get(UNPRICED_ACCEPTED)),
-            accepted_count(getattr(recorder, "_managed_unpriced_baseline", 0)),
-        )
-    )
+    tracker.accept_unpriced(accepted_count(state.get(UNPRICED_ACCEPTED)))
     state[UNPRICED_ACCEPTED] = tracker.unpriced_baseline
 
 
@@ -378,21 +381,6 @@ async def admission(recorder: Any, result: RunResult) -> RunResult | None:
     return replace(result, status=RunStatus.PAUSED, meta=meta)
 
 
-def hand_baseline(descend: RunResult, recorder: Any) -> None:
-    """Give the child's execution copy the accepted unpriced count its parent holds.
-
-    The descend marker carries exactly one value, the invocation, whose ``child`` is
-    this spawn's own execution copy. A lost hand-off (the copy rebuilt after a crash
-    before the child's first checkpoint) only lowers the baseline, which stops the
-    child early rather than letting spend through.
-    """
-    count = accepted_count(recorder._loop_state.get(UNPRICED_ACCEPTED))
-    for invocation in descend.meta.values():
-        child = getattr(invocation, "child", None)
-        if child is not None:
-            cast("Any", child)._managed_unpriced_baseline = count
-
-
 async def finish(
     descend: RunResult,
     result: RunResult,
@@ -409,5 +397,4 @@ async def finish(
             recorder=recorder,
             provider_kwargs=result.meta["pause_state"].provider_kwargs,
         )
-    hand_baseline(descend, recorder)
     return descend

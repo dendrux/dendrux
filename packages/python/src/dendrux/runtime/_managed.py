@@ -36,6 +36,7 @@ from dendrux import _codes
 from dendrux._lifecycle import TERMINAL_STATUSES, StoredEventType
 from dendrux.errors import ManagedStateError
 from dendrux.runtime import _managed_budget, _managed_cancel
+from dendrux.runtime._managed_budget import UNPRICED_ACCEPTED, accepted_count
 from dendrux.runtime._managed_definitions import (
     _check_definitions,
     _require_react,
@@ -114,6 +115,7 @@ class ManagedInvocation:
     parent_usage: UsageStats
     max_depth: int | None
     child_run_id: str
+    unpriced_accepted: int = 0
 
 
 @dataclass(frozen=True)
@@ -240,8 +242,7 @@ async def prepare_handoff(
     header = ManagedHeader.from_dict(
         (getattr(store, "loop_state", None) or {}).get(MANAGED_HEADER_KEY), run_id=run_id
     )
-    ctx = get_delegation_context()
-    if ctx is None or ctx.run_id != run_id:
+    if (ctx := get_delegation_context()) is None or ctx.run_id != run_id:
         # The runner sets this run's own context for every execution; fail closed.
         raise ManagedStateError(reason="header_invalid", run_id=run_id)
     level, max_depth = ctx.delegation_level, ctx.max_delegation_depth
@@ -289,6 +290,7 @@ async def prepare_handoff(
         parent_usage=result.usage,
         max_depth=max_depth,
         child_run_id=generate_ulid(),
+        unpriced_accepted=accepted_count(state.get(UNPRICED_ACCEPTED)),
     )
     return RunResult(
         run_id=run_id,
@@ -342,28 +344,26 @@ async def bind_child(
     **create: Any,
 ) -> Any:
     """Bind ``run_id`` as the invocation's child in one store transaction."""
-    from dendrux.runtime.state import BindManagedChildRequest, LoopStatePatch, _initial_loop_state
+    from dendrux.runtime.state import BindManagedChildRequest, LoopStatePatch
     from dendrux.types import ManagedWait
 
-    call = invocation.call
-    wait = replace(invocation.wait, managed_wait=ManagedWait(call.id, run_id))
     request = BindManagedChildRequest(
         tenant_id=invocation.tenant_id,
         root_run_id=invocation.root_run_id,
         parent_run_id=invocation.parent_run_id,
         parent_claim_epoch=invocation.parent_epoch,
-        tool_call_id=call.id,
+        tool_call_id=invocation.call.id,
         row_id=generate_ulid(),
-        provider_tool_call_id=call.provider_tool_call_id,
-        tool_name=call.name,
-        params=call.params or None,
+        provider_tool_call_id=invocation.call.provider_tool_call_id,
+        tool_name=invocation.call.name,
+        params=invocation.call.params or None,
         iteration_index=invocation.iteration,
         child_run_id=run_id,
         child_agent_name=agent_name,
         child_path=invocation.child_path,
         child_input_data=create.get("input_data"),
-        child_loop_state=loop_state or _initial_loop_state("ReActLoop") or {},
-        parent_wait=wait,
+        child_loop_state=_managed_budget.child_state(loop_state, invocation.unpriced_accepted),
+        parent_wait=replace(invocation.wait, managed_wait=ManagedWait(invocation.call.id, run_id)),
         parent_patch=LoopStatePatch(set_phase="dispatch"),
         intent_event=intent_event(invocation, run_id),
         child_seed_traces=tuple(create.get("seed_traces") or ()),
