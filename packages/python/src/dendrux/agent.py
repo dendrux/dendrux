@@ -43,7 +43,7 @@ from dendrux._lifecycle import TERMINAL_STATUSES as _TERMINAL_STATUSES
 from dendrux._lifecycle import WAITING_STATUSES as _WAITING_STATUS_VALUES
 from dendrux._sentinel import _OMITTED, _OmittedType, _UnsetType
 from dendrux.media._store import DEFAULT_GC_AGE, DEFAULT_GC_LIMIT
-from dendrux.runtime import _managed, _managed_cancel
+from dendrux.runtime import _managed, _managed_budget, _managed_cancel
 from dendrux.runtime._blob_catalog import MIN_GC_AGE
 from dendrux.runtime._continuation_guardrails import _continuation_projection
 from dendrux.runtime._entry_checks import entry_checks, require_boolean
@@ -673,7 +673,7 @@ class Agent:
             _subagents.refuse(
                 _subagents.SubagentDefinitionError(self.name, reason="single_call_parent")
             )
-        _subagents.check_subagent_tree(self, agent_type=Agent)
+        _managed_budget.validate_definitions(self, agent_type=Agent)
         _subagents.warn_fanout(self)
 
     def _configure_persistence(

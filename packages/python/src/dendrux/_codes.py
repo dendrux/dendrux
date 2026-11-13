@@ -1946,6 +1946,31 @@ TOOL_REPLAYED = Code(
     "Monitor repeated worker crashes and tool idempotence.",
 )
 
+MANAGED_BUDGET_EXCEEDED = Code(
+    "managed_budget_exceeded",
+    logging.WARNING,
+    "runtime",
+    _BASE_FIELDS,
+    "Managed execution or child admission reaches the aggregate root budget.",
+    "Raise the root allowance and resume through the root under the configured policy.",
+)
+MANAGED_BUDGET_INVALID = Code(
+    "managed_budget_invalid",
+    logging.WARNING,
+    "runtime",
+    _BASE_FIELDS,
+    "Managed definitions declare a child budget or a non-aggregate root budget.",
+    "Configure one aggregate budget on the root Agent.",
+)
+MANAGED_USAGE_UNKNOWN = Code(
+    "managed_usage_unknown",
+    logging.WARNING,
+    "runtime",
+    _BASE_FIELDS,
+    "Managed budget accounting is unavailable, invalid or incomplete.",
+    "Restore complete usage reads and resume through the root.",
+)
+
 CASCADE_CHILD_SKIPPED = Code(
     "cascade_child_skipped",
     logging.WARNING,
@@ -2029,6 +2054,9 @@ REGISTRY = MappingProxyType(
             MCP_OAUTH_CLOSE_FAILED,
             MCP_CLEANUP_FAILED,
             CASCADE_CHILD_SKIPPED,
+            MANAGED_BUDGET_EXCEEDED,
+            MANAGED_BUDGET_INVALID,
+            MANAGED_USAGE_UNKNOWN,
             CASCADE_TRUNCATED,
             LEGACY_RUN,
             NOT_RUNNING,

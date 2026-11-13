@@ -55,7 +55,7 @@ from dendrux._meta_keys import (
 )
 from dendrux.errors import ImagePersistenceUnsupportedError, RunFencedError, safe_exception_info
 from dendrux.loops.base import BaseRecorder
-from dendrux.runtime import _managed_cancel
+from dendrux.runtime import _managed_budget, _managed_cancel
 from dendrux.runtime._blob_catalog import edges_for_parts, scrub_inline_images
 from dendrux.runtime._cancel_guard import capture
 from dendrux.runtime._capabilities import capabilities
@@ -603,6 +603,7 @@ class PersistenceRecorder(_managed_cancel.CancelAdmission, BaseRecorder):
                 else:
                     target.clear()
                     target.update(saved_value)
+        _managed_budget.bind(self, budget)
         self._restore_budget(budget)
 
     def _restore_budget(self, budget: Any) -> None:
@@ -1292,9 +1293,7 @@ class PersistenceRecorder(_managed_cancel.CancelAdmission, BaseRecorder):
                     interaction_id=interaction_id,
                 )
 
-            await retry_transient_db(
-                _write_interaction, label="save_llm_interaction", run_id=self._run_id
-            )
+            await _managed_budget.record_interaction(self, _write_interaction)
         except RunFencedError:
             raise
         except Exception:

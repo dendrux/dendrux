@@ -198,6 +198,9 @@ Missing or invalid codes remain unset. Category and HTTP status remain independe
 | `invalid_limit` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | A recovery limit is invalid. | Use a positive limit within the documented bound. |
 | `legacy_claim_validation` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | A legacy store needs claim-time validation. | Implement the current store capabilities when upgrading. |
 | `local_database_default_changed` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | ./dendrux.db is absent; ~/.dendrux/dendrux.db exists and is no longer the default. | Set DENDRUX_DATABASE_URL to use ~/.dendrux/dendrux.db, or start with ./dendrux.db. |
+| `managed_budget_exceeded` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | Managed execution or child admission reaches the aggregate root budget. | Raise the root allowance and resume through the root under the configured policy. |
+| `managed_budget_invalid` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | Managed definitions declare a child budget or a non-aggregate root budget. | Configure one aggregate budget on the root Agent. |
+| `managed_usage_unknown` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | Managed budget accounting is unavailable, invalid or incomplete. | Restore complete usage reads and resume through the root. |
 | `pause_data_not_jsonb` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | A stored pause is not a JSON object. | Inspect the stored pause format and writer versions. |
 | `pause_id_mismatch` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | A submission targets another pause generation. | Reload the pending pause and resubmit. |
 | `pending_limit` | WARNING | `code`, `count`, `kind`, `limit`, `run_id`, `tenant_id` | A model produces too many pending calls. | Reduce tool fanout or raise the pending call bound. |

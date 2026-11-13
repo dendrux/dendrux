@@ -97,7 +97,7 @@ from dendrux.loops._helpers import (
 )
 from dendrux.loops._policy_context import dispatch_policy, history_call_counts, static_denial
 from dendrux.loops.react import MANAGED_HANDOFF_KEY, ReActLoop
-from dendrux.runtime import _managed, _reclaim
+from dendrux.runtime import _managed, _managed_budget, _reclaim
 from dendrux.runtime._entry_checks import resolve_runner_tenant, runner_entry_checks
 from dendrux.runtime._managed import DESCEND_KEY as MANAGED_DESCEND_KEY
 from dendrux.runtime._managed_cancel import (
@@ -581,7 +581,7 @@ def _runtime_recorder(
         guardrail_engine=guardrails,
         **_recorder_image_kwargs(tenant_id, provider),
     )
-    recorder._history_limits = agent._limits
+    _managed_budget.configure_recorder(recorder, agent)
     return recorder
 
 
@@ -1827,7 +1827,7 @@ async def _persist_managed_handoff(
     await _check_claim(state_store, run_id)
     descend = await _managed.prepare_handoff(state_store, run_id, result, recorder, provider_kwargs)
     if descend is not None:
-        return descend
+        return await _managed_budget.finish(descend, result, recorder, _persist_loop_outcome)
     return await finalize_cancelled(
         [RunStatus.RUNNING.value], {"reason": CancelReason.CANCEL_REQUESTED.value}
     )
@@ -5367,7 +5367,7 @@ async def _prepare_resume(
         **_recorder_image_kwargs(tenant_id, provider),
     )
 
-    await recorder.restore_history(limits=agent._limits, records=history_records)
+    await _managed_budget.restore_recorder(recorder, agent, history_records)
     recorder._resume_pause_data = pause_data
 
     # NOTE: lifecycle hooks (record_run_started/notify_run_started) and

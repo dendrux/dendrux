@@ -41,14 +41,17 @@ normally caught earlier by ``pricing.check_budget_config``.
 
 from __future__ import annotations
 
+import inspect
 import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from dendrux import _codes
 from dendrux._lifecycle import (
     FailureReason,
     PauseReason,
 )
+from dendrux.errors import BudgetConfigurationError
 from dendrux.loops._helpers import notify_governance, record_governance
 from dendrux.types import COST_DECIMALS as _COST_DECIMALS
 from dendrux.types import GovernanceEventType
@@ -248,6 +251,8 @@ class BudgetTracker:
         else:
             self._known_cost = 0.0
             self._unpriced = 1 if usage.cost_unknown or usage.total_tokens else 0
+        self._shared_reader: Any = None
+        self._shared_unknown = False
         self._store_reader = self._pick_reader(budget, state_store, recorder)
         self._own_reader = (
             getattr(state_store, "run_usage", None)
@@ -258,6 +263,11 @@ class BudgetTracker:
     @property
     def action(self) -> str:
         """The effective ``on_exceed`` action (``"warn"`` when not enforced)."""
+        if self._shared_unknown:
+            return "pause"
+        return self._configured_action()
+
+    def _configured_action(self) -> str:
         if self.budget is None or not self._enforce:
             return "warn"
         return self.budget.on_exceed
@@ -346,12 +356,16 @@ class BudgetTracker:
             "budget_fired": list(self.fired) or None,
             "budget_unpriced_reported": self.unpriced_reported,
         }
+        fields.update(self._shared_pause_fields())
         if self._unpriced:
             fields["budget_known_cost_usd"] = self._known_cost
         unpriced = max(self._unpriced, self._seen_unpriced)
         if unpriced:
             fields["budget_unpriced_calls"] = unpriced
         return fields
+
+    def _shared_pause_fields(self) -> dict[str, Any]:
+        return {"pause_message": "managed_usage_unknown"} if self._shared_unknown else {}
 
     async def _emit(self, event_type: str, iteration: int, data: dict[str, Any]) -> None:
         await record_governance(self._recorder, self._run_id, event_type, iteration, data)
@@ -371,15 +385,32 @@ class BudgetTracker:
             )
         return int(tokens)
 
+    def bind_shared(self, reader: Any) -> None:
+        """Use one authoritative, flushed shared scope supplied by the runtime."""
+        self._shared_reader = reader
+
+    async def _measure_shared(self) -> _Usage:
+        rollup = await self._shared_reader()
+        self._shared_unknown = rollup is None or self._invalid_usage
+        if self._shared_unknown:
+            return _Usage(0, 0.0, 0)
+        self._seen_unpriced = max(self._seen_unpriced, rollup.unpriced_calls)
+        return _Usage(
+            self._tokens(rollup, rollup=True), rollup.known_cost_usd, rollup.unpriced_calls
+        )
+
     async def _measure(self) -> _Usage:
+        if self._shared_reader is not None:
+            return await self._measure_shared()
+        return await self._measure_local()
+
+    async def _measure_local(self) -> _Usage:
         # Persisted own usage is a lower bound, never a replacement for spend
         # already observed in this execution. Descendants remain DB-coordinated.
         local = _Usage(self._tokens(self._usage), self._known_cost or 0.0, self._unpriced)
         measured = local
         if self._store_reader is not None:
             try:
-                import inspect
-
                 if (
                     self.budget
                     and self.budget.include_children
@@ -400,8 +431,6 @@ class BudgetTracker:
                     + max(0, rollup.unpriced_calls - own.unpriced_calls),
                 )
             except Exception as exc:
-                from dendrux.errors import BudgetConfigurationError
-
                 if isinstance(exc, BudgetConfigurationError):
                     raise
                 logger.warning(
@@ -419,6 +448,16 @@ class BudgetTracker:
         if budget is None:
             return []
         usage = await self._measure()
+        if self._shared_unknown:
+            _codes.log_code(logger, _codes.MANAGED_USAGE_UNKNOWN, run_id=self._run_id)
+            self._last = [
+                BudgetBreach(
+                    TOKENS if budget.max_tokens else COST_USD,
+                    0,
+                    budget.max_tokens or budget.max_cost_usd or 0,
+                )
+            ]
+            return self._last
         breaches: list[BudgetBreach] = []
         limits: list[tuple[str, float | None, float]] = [
             (TOKENS, budget.max_tokens, usage.tokens),
@@ -427,35 +466,8 @@ class BudgetTracker:
         for metric, limit, used in limits:
             if limit is None:
                 continue
-            if metric == COST_USD and usage.unpriced_calls and not self.unpriced_reported:
-                self.unpriced_reported = True
-                self._unpriced_warned = True
-                await self._emit(
-                    GovernanceEventType.BUDGET_UNPRICED,
-                    iteration,
-                    {
-                        "metric": COST_USD,
-                        "used": used,
-                        "max": limit,
-                        "unpriced_calls": usage.unpriced_calls,
-                        "known_cost_usd": usage.known_cost_usd,
-                    },
-                )
-            fraction = used / limit
-            for threshold in budget.warn_at:
-                if fraction >= threshold and (metric, threshold) not in self.fired:
-                    self.fired.append((metric, threshold))
-                    await self._emit(
-                        GovernanceEventType.BUDGET_THRESHOLD,
-                        iteration,
-                        {
-                            "metric": metric,
-                            "fraction": threshold,
-                            "used": used,
-                            "max": limit,
-                            "reason": "threshold_crossed",
-                        },
-                    )
+            await self._report_unpriced(metric, used, limit, usage, iteration)
+            await self._thresholds(metric, used, limit, iteration)
             reached = used >= limit
             # An unpriced call hides spend: when the run is told to stop on
             # exceeding the cost limit it must stop here too (fail closed).
@@ -478,12 +490,57 @@ class BudgetTracker:
         self._last = breaches
         return breaches
 
+    async def _report_unpriced(
+        self, metric: str, used: float, limit: float, usage: _Usage, iteration: int
+    ) -> None:
+        if metric == COST_USD and usage.unpriced_calls and not self.unpriced_reported:
+            self.unpriced_reported = True
+            self._unpriced_warned = True
+            await self._emit(
+                GovernanceEventType.BUDGET_UNPRICED,
+                iteration,
+                {
+                    "metric": COST_USD,
+                    "used": used,
+                    "max": limit,
+                    "unpriced_calls": usage.unpriced_calls,
+                    "known_cost_usd": usage.known_cost_usd,
+                },
+            )
+
+    async def _thresholds(self, metric: str, used: float, limit: float, iteration: int) -> None:
+        budget = self.budget
+        if budget is None:
+            return
+        fraction = used / limit
+        for threshold in budget.warn_at:
+            if fraction >= threshold and (metric, threshold) not in self.fired:
+                self.fired.append((metric, threshold))
+                await self._emit(
+                    GovernanceEventType.BUDGET_THRESHOLD,
+                    iteration,
+                    {
+                        "metric": metric,
+                        "fraction": threshold,
+                        "used": used,
+                        "max": limit,
+                        "reason": "threshold_crossed",
+                    },
+                )
+
     def _unknown_reason(self, metric: str, usage: _Usage) -> str | None:
         if self.action == "warn":
             return None
         if self._invalid_usage:
             return "usage_invalid"
-        if metric == COST_USD and usage.unpriced_calls > self._ack_unpriced:
+        return self._unpriced_reason(metric, usage)
+
+    def _unpriced_reason(self, metric: str, usage: _Usage) -> str | None:
+        if (
+            self._shared_reader is None
+            and metric == COST_USD
+            and usage.unpriced_calls > self._ack_unpriced
+        ):
             return UNPRICED_CALL
         return None
 
@@ -498,6 +555,13 @@ class BudgetTracker:
         post-response evaluation unless descendants can have spent since.
         """
         first, self._first_checkpoint = self._first_checkpoint, False
+        if self._shared_reader is not None:
+            return await self._shared_checkpoint(iteration, first=first)
+        return await self._local_checkpoint(iteration, first=first)
+
+    async def _local_checkpoint(
+        self, iteration: int, *, first: bool
+    ) -> tuple[str, list[BudgetBreach]]:
         if first and self._gate:
             return "pause", await self._resume_gate()
         budget = self.budget
@@ -507,10 +571,24 @@ class BudgetTracker:
         if self._last is None:
             if first and self._fresh:
                 return action, []  # nothing has been spent yet
-            return action, await self.evaluate(iteration)
-        if budget.include_children and self._store_reader is not None:
-            return action, await self.evaluate(iteration)
+            self._last = await self.evaluate(iteration)
+        elif budget.include_children and self._store_reader is not None:
+            self._last = await self.evaluate(iteration)
         return action, self._last
+
+    async def _shared_checkpoint(
+        self, iteration: int, *, first: bool
+    ) -> tuple[str, list[BudgetBreach]]:
+        breaches = await self.evaluate(iteration)
+        action = self.action
+        if first and self._gate and not self._shared_unknown:
+            action, breaches = (
+                "pause",
+                [breach for breach in breaches if breach.metric in self._gate],
+            )
+        if breaches and action != "warn" and not self._shared_unknown:
+            _codes.log_code(logger, _codes.MANAGED_BUDGET_EXCEEDED, run_id=self._run_id)
+        return action, breaches if action != "warn" else []
 
     async def _resume_gate(self) -> list[BudgetBreach]:
         limits = {

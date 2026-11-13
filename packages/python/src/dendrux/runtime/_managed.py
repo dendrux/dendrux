@@ -35,7 +35,7 @@ from typing import TYPE_CHECKING, Any
 from dendrux import _codes
 from dendrux._lifecycle import TERMINAL_STATUSES, StoredEventType
 from dendrux.errors import ManagedStateError
-from dendrux.runtime import _managed_cancel
+from dendrux.runtime import _managed_budget, _managed_cancel
 from dendrux.runtime.state import MANAGED_HEADER_KEY, ManagedHeader
 from dendrux.types import (
     PauseState,
@@ -331,7 +331,7 @@ async def prepare_handoff(
         parent_level=level,
         parent_agent=handoff.parent,
         call=handoff.call,
-        child=handoff.child,
+        child=_managed_budget.inherit(handoff.child, handoff.parent),
         child_path=(*header.path, handoff.child.name),
         wait=wait,
         iteration=result.iteration_count,
@@ -905,7 +905,7 @@ async def route(root_agent: Agent, store: Any, run_id: str, *, tenant_id: Any) -
         raise RunNotFoundError(run_id)
     if await _managed_cancel.managed_child_header(store, record):
         raise ManagedChildControlError(run_id)
-    await _managed_cancel.route_checkpoint(store, record)
+    await _managed_budget.route_checkpoint(root_agent, store, record)
     waiting, leaf = await walk(root_agent, store, run_id)
     leaf_agent = waiting[-1].child if waiting else root_agent
     return Route(run_id, record.tenant_id, tuple(waiting), leaf, leaf_agent)
@@ -1547,7 +1547,7 @@ async def walk(root_agent: Agent, store: Any, root_run_id: str) -> tuple[list[_W
             return waiting, record
         binding = wait.managed_wait
         child, path = await _bound_child(store, record, binding, root_run_id, path)
-        child_agent = _registered(agent, path[-1], record.id)
+        child_agent = _managed_budget.inherit(_registered(agent, path[-1], record.id), root_agent)
         intent = await _intent_call(store, record.id, binding.tool_call_id, wait.iteration)
         waiting.append(_Waiting(agent, record.id, child_agent, path, intent, child.id))
         agent, record = child_agent, child
