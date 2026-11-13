@@ -371,12 +371,6 @@ def _creation_claim(loop: Loop, created: CreateRunResult) -> ClaimResult:
     return ClaimResult(0, created.storage_format, state, None)
 
 
-def _stamp_managed_root(store: StateStore, run_id: str, *, managed_root: bool) -> None:
-    """A managed root carries its header from its first checkpoint (0.7)."""
-    if managed_root:
-        _managed.stamp_root_header(store, run_id)
-
-
 async def _finish_lifecycle(
     lifecycle: Any, recorder: LoopRecorder | None, notifier: LoopNotifier | None, result: RunResult
 ) -> None:
@@ -422,12 +416,12 @@ class _RunLifecycle(ManagedStopLifecycle):
         loop: Loop,
         created: CreateRunResult,
         claim: ClaimResult | None = None,
-        managed_root: bool = False,
+        root_limits: Limits | None = None,
     ) -> StateStore:
         self.run_id = created.run_id
         # A managed child's token comes from its bind and carries its header.
         self.store = claimed_store(store, self.run_id, claim or _creation_claim(loop, created))
-        _stamp_managed_root(self.store, self.run_id, managed_root=managed_root)
+        _managed.stamp_root_header(self.store, self.run_id, limits=root_limits)
         self.owned = True
         if self.manager is not None:
             self.manager.register_current(self.run_id)
@@ -2764,7 +2758,7 @@ async def _run_once(
         resolved_strategy = strategy or NativeToolCalling()
         resolved_loop = _new_run_loop(agent, loop)
         _validate_loop_skill_compat(agent, resolved_loop)
-        managed_root = await _managed.enter(agent, invocation, state_store, resolved_loop)
+        root_limits = await _managed.enter(agent, invocation, state_store, resolved_loop)
 
         # Validate input + chat history before any side effects. Raises
         # TypeError / ValueError on bad input so no DB row is created.
@@ -2920,7 +2914,7 @@ async def _run_once(
 
                     run_id = create_result.run_id
                     state_store = lifecycle._claim(
-                        state_store, resolved_loop, create_result, child_claim, managed_root
+                        state_store, resolved_loop, create_result, child_claim, root_limits
                     )
                     await _verify_projected_creation(
                         entry_projection.error is not None, state_store, run_id
@@ -4305,19 +4299,11 @@ def _stream_claim(
     created: CreateRunResult,
     child_claim: ClaimResult | None,
     *,
-    managed_root: bool,
+    root_limits: Limits | None,
 ) -> StateStore:
     """The new run's owned store: a managed child's token comes from its bind."""
-    state = (
-        _initial_loop_state(_recovery_loop_name(loop))
-        if created.storage_format == STORAGE_FORMAT_CHECKPOINTED
-        else None
-    )
-    owned = claimed_store(
-        store, created.run_id, child_claim or ClaimResult(0, created.storage_format, state, None)
-    )
-    if managed_root:
-        _managed.stamp_root_header(owned, created.run_id)
+    owned = claimed_store(store, created.run_id, child_claim or _creation_claim(loop, created))
+    _managed.stamp_root_header(owned, created.run_id, limits=root_limits)
     return owned
 
 
@@ -4625,7 +4611,7 @@ def run_stream(
             parent_run_id, delegation_level = _managed.parent_link(invocation, parent_ctx, store)
             eff_max_depth = _resolve_max_delegation_depth(max_delegation_depth, parent_ctx)
             eff_tenant = resolve_child_tenant(parent_ctx, tenant_id)
-            managed_root = await _managed.enter(agent, invocation, store, resolved_loop)
+            root_limits = await _managed.enter(agent, invocation, store, resolved_loop)
             if image_runtime is None and _accepts_kwarg(resolved_loop.run_stream, "image_runtime"):
                 image_runtime = _image_runtime(agent, store, eff_tenant, run_id)
 
@@ -4711,7 +4697,7 @@ def run_stream(
                 if create_result.outcome == "existing_active":
                     raise RunAlreadyActiveError(run_id, create_result.status)
                 store = _stream_claim(
-                    store, resolved_loop, create_result, child_claim, managed_root=managed_root
+                    store, resolved_loop, create_result, child_claim, root_limits=root_limits
                 )
                 _shared["state_store"] = store
                 _shared["claimed"] = True

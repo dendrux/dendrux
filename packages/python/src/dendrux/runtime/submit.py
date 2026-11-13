@@ -44,6 +44,7 @@ from dendrux.types import (
     ImagePart,
     ImageRef,
     InputValidationError,
+    Limits,
     PauseState,
     RunStatus,
     TextPart,
@@ -1407,20 +1408,19 @@ def _invalid_json_constant(value: str) -> NoReturn:
 
 
 def _governed_limits(limits: Any) -> dict[str, Any]:
-    from dendrux.types import Limits
-
     defaults = Limits()
-    recovery_bounds = {
+    defaulted_bounds = {
         "max_pending_calls",
         "max_rebuild_bytes",
         "max_rebuild_rows",
+        "max_managed_runs",
+        "max_subagent_definitions",
     }
-    # Default recovery bounds preserve older governance snapshots; overrides remain governed.
     return {
         key: value
         for key, value in asdict(limits).items()
         if key != "max_pause_summary_bytes"
-        and (key not in recovery_bounds or value != getattr(defaults, key))
+        and (key not in defaulted_bounds or value != getattr(defaults, key))
     }
 
 
