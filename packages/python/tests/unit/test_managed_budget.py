@@ -272,3 +272,72 @@ async def test_fault_is_logged_even_when_its_checkpoint_fails(caplog):
         await hold_fault(recorder)
     records = [r for r in caplog.records if getattr(r, "code", None) == "managed_usage_unknown"]
     assert len(records) == 1 and records[0].run_id == run_id
+
+
+@pytest.mark.parametrize("value", [-1, True, 1.5, "2", None, [3]])
+def test_malformed_persisted_unpriced_baseline_falls_back_to_zero(value):
+    from dendrux.runtime._managed_budget import accepted_count
+
+    assert accepted_count(value) == 0
+    assert accepted_count(7) == 7
+
+
+def tracker_for(budget):
+    from dendrux.loops._budget import BudgetTracker
+    from dendrux.types import UsageStats
+
+    return BudgetTracker(
+        budget,
+        run_id="run",
+        usage=UsageStats(),
+        recorder=None,
+        notifier=None,
+        warnings=[],
+    )
+
+
+def test_baseline_is_the_highest_of_tracker_checkpoint_and_parent_hand_off():
+    from types import SimpleNamespace
+
+    from dendrux.runtime._managed_budget import UNPRICED_ACCEPTED, carry_unpriced_baseline
+
+    tracker = tracker_for(Budget(max_cost_usd=10))
+    tracker.accept_unpriced(2)
+    recorder = SimpleNamespace(_loop_state={UNPRICED_ACCEPTED: 4}, _managed_unpriced_baseline=3)
+    carry_unpriced_baseline(recorder, tracker)
+    assert tracker.unpriced_baseline == 4 and recorder._loop_state[UNPRICED_ACCEPTED] == 4
+    tracker.accept_unpriced(1)  # never lowers
+    assert tracker.unpriced_baseline == 4
+    fresh = SimpleNamespace(_loop_state={}, _managed_unpriced_baseline=3)
+    other = tracker_for(Budget(max_cost_usd=10))
+    carry_unpriced_baseline(fresh, other)
+    assert other.unpriced_baseline == 3 and fresh._loop_state[UNPRICED_ACCEPTED] == 3
+
+
+def test_hand_baseline_marks_only_the_spawned_execution_copy():
+    from types import SimpleNamespace
+
+    from dendrux.runtime._managed_budget import UNPRICED_ACCEPTED, hand_baseline
+
+    template = child()
+    execution = SimpleNamespace()
+    descend = SimpleNamespace(meta={"managed_descend": SimpleNamespace(child=execution)})
+    hand_baseline(descend, SimpleNamespace(_loop_state={UNPRICED_ACCEPTED: 5}))
+    assert execution._managed_unpriced_baseline == 5
+    assert not hasattr(template, "_managed_unpriced_baseline")
+
+
+@pytest.mark.parametrize("action,reason", [("pause", "unpriced_call"), ("warn", None)])
+def test_unpriced_reason_applies_to_a_shared_reader_like_an_ordinary_run(action, reason):
+    from dendrux.loops._budget import _Usage
+
+    tracker = tracker_for(Budget(max_cost_usd=10, on_exceed=action))
+
+    async def reader():
+        return None
+
+    tracker.bind_shared(reader)
+    usage = _Usage(0, 0.0, 2)
+    assert tracker._unknown_reason("cost_usd", usage) == reason
+    tracker.accept_unpriced(2)
+    assert tracker._unknown_reason("cost_usd", usage) is None

@@ -149,7 +149,7 @@ async def test_known_unpriced_child_warns_and_adoption_adds_no_charge(store: Any
         store,
         [response(1, "child"), response()],
         [response(None, "work"), response()],
-        Budget(max_cost_usd=10, on_exceed="pause"),
+        Budget(max_cost_usd=10, on_exceed="warn"),
     )
     result = await root.run("go")
     assert result.status == RunStatus.SUCCESS
@@ -577,8 +577,12 @@ async def test_finished_child_usage_fault_is_adopted_but_known_unpriced_is_not(
         result = await root.run("go")
     assert child_llm.calls == 1
     if known_unpriced:
-        assert result.status == RunStatus.SUCCESS and root_llm.calls == 2
+        # Known unpriced spend is not a usage fault: it takes the ordinary
+        # unpriced_call stop, never the managed_usage_unknown path.
+        assert result.status == RunStatus.PAUSED and root_llm.calls == 1
         assert (await store.subtree_usage(result.run_id)).unpriced_calls == 1
+        assert "managed_usage_unknown" not in (await store.get_loop_state(result.run_id))
+        assert (await store.get_pause_state(result.run_id)).get("pause_message") is None
         return
     assert result.status == RunStatus.PAUSED and root_llm.calls == 1
     tree = await store.get_subtree(result.run_id)
@@ -972,3 +976,214 @@ async def test_unknown_usage_obeys_root_enforcement_policy(
     assert logs == observations
     assert observations[result.run_id] > 0
     assert "SENTINEL" not in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Unpriced calls stop a managed tree like an ordinary run (T5b-u)
+# ---------------------------------------------------------------------------
+
+
+async def run_root(root, streaming):
+    if streaming:
+        async with root.stream("go") as stream:
+            _ = [event async for event in stream]
+        return stream.result
+    return await root.run("go")
+
+
+async def exceeded_reasons(store, run_id):
+    return [
+        e.data["reason"]
+        for e in await store.get_run_events(run_id)
+        if e.event_type == "budget.exceeded"
+    ]
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_child_unpriced_call_pauses_parent_and_root_resume_acknowledges(store, streaming):
+    budget = Budget(max_cost_usd=10, on_exceed="pause")
+    root, root_llm, _, child_llm = agents(
+        store, [response(9, "child"), response()], [response(None)], budget
+    )
+    paused = await run_root(root, streaming)
+    assert paused.status == RunStatus.PAUSED
+    assert root_llm.calls == 1 and child_llm.calls == 1
+    assert await exceeded_reasons(store, paused.run_id) == ["unpriced_call"]
+    state = await store.get_pause_state(paused.run_id)
+    assert state["pause_reason"] == "budget" and state.get("pause_message") is None
+    assert state["budget_exceeded"][0]["metric"] == "cost_usd"
+    same, same_llm, _, _ = agents(store, [response()], [], budget)
+    resumed = await resume_unknown(same, store, paused, streaming=streaming)
+    assert resumed.status == RunStatus.SUCCESS and same_llm.calls == 1
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_second_unpriced_call_in_a_sibling_pauses_again(store, streaming):
+    budget = Budget(max_cost_usd=10, on_exceed="pause")
+    root, root_llm, _, child_llm = agents(
+        store, [response(1, "child"), response(1, "child"), response()], [response(None)], budget
+    )
+    paused = await run_root(root, streaming)
+    assert paused.status == RunStatus.PAUSED and root_llm.calls == 1
+    again, again_llm, _, again_child = agents(
+        store, [response(1, "child"), response()], [response(None)], budget
+    )
+    second = await resume_unknown(again, store, paused, streaming=streaming)
+    # The sibling inherited the acknowledged baseline: it ran its own call (not
+    # stopped at admission), and only its new unpriced call stops the tree.
+    assert second.status == RunStatus.PAUSED
+    assert again_child.calls == 1 and again_llm.calls == 1
+    final, final_llm, _, _ = agents(store, [response()], [], budget)
+    done = await resume_unknown(final, store, second, streaming=streaming)
+    assert done.status == RunStatus.SUCCESS and final_llm.calls == 1
+
+
+async def test_restart_between_pause_and_resume_keeps_the_acknowledged_baseline(store, engine):
+    from tests.integration.test_managed_recovery import fresh_store
+
+    budget = Budget(max_cost_usd=10, on_exceed="pause")
+    root, _, _, _ = agents(store, [response(1, "child")], [response(None)], budget)
+    paused = await root.run("go")
+    assert paused.status == RunStatus.PAUSED
+    async with fresh_store(engine) as restarted:
+        again, again_llm, _, again_child = agents(
+            restarted, [response(1, "child"), response()], [response(None)], budget
+        )
+        second = await resume_unknown(again, restarted, paused)
+        # A lost baseline would stop the new child at its own first checkpoint.
+        assert again_child.calls == 1
+        assert second.status == RunStatus.PAUSED and again_llm.calls == 1
+        state = await restarted.get_pause_state(paused.run_id)
+        assert state["budget_unpriced_calls"] == 2 and state.get("pause_message") is None
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_leaf_pause_resume_carries_its_baseline_up_to_ancestors(store, streaming):
+    budget = Budget(max_cost_usd=10, on_exceed="pause")
+    root, root_llm, _, child_llm = agents(
+        store, [response(1, "child"), response()], [response(None, "work"), response()], budget
+    )
+    paused = await run_root(root, streaming)
+    assert paused.status == RunStatus.PAUSED and root_llm.calls == 1 and child_llm.calls == 1
+    tree = await store.get_subtree(paused.run_id)
+    assert tree.nodes[1].run.status == "paused"
+    same, same_llm, _, same_child = agents(store, [response()], [response()], budget)
+    resumed = await resume_unknown(same, store, paused, streaming=streaming)
+    # The child's acknowledgement reaches the root with its report.
+    assert resumed.status == RunStatus.SUCCESS
+    assert same_child.calls == 1 and same_llm.calls == 1
+
+
+async def test_acknowledged_baseline_survives_a_crash_before_adoption(store, engine, monkeypatch):
+    from sqlalchemy import select
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from dendrux.db.models import AgentRun
+    from dendrux.runtime import _managed
+    from tests.integration.test_managed_recovery import ProcessDeathError, fresh_store
+
+    budget = Budget(max_cost_usd=10, on_exceed="pause")
+    root, _, _, _ = agents(
+        store, [response(1, "child"), response()], [response(None, "work"), response()], budget
+    )
+    paused = await root.run("go")
+    assert paused.status == RunStatus.PAUSED
+    again, _, _, _ = agents(store, [response()], [response()], budget)
+    original = _managed.adopt
+
+    async def die(*args, **kwargs):
+        raise ProcessDeathError
+
+    monkeypatch.setattr(_managed, "adopt", die)
+    with pytest.raises(ProcessDeathError):
+        await resume_unknown(again, store, paused)
+    monkeypatch.setattr(_managed, "adopt", original)
+    async with AsyncSession(engine) as session:
+        root_id = await session.scalar(select(AgentRun.id).where(AgentRun.parent_run_id.is_(None)))
+    async with fresh_store(engine) as restarted:
+        recovered, llm, _, _ = agents(restarted, [response()], [], budget)
+        result = await recovered.reclaim(root_id, tenant_id=None)
+        assert result.status == RunStatus.SUCCESS and llm.calls == 1
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_cancel_action_cancels_on_child_unpriced_call(store, streaming):
+    root, root_llm, _, _ = agents(
+        store,
+        [response(9, "child"), response()],
+        [response(None)],
+        Budget(max_cost_usd=10, on_exceed="cancel"),
+    )
+    result = await run_root(root, streaming)
+    assert result.status == RunStatus.CANCELLED and root_llm.calls == 1
+    assert await exceeded_reasons(store, result.run_id) == ["unpriced_call"]
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize(
+    "budget",
+    [
+        Budget(max_cost_usd=10, on_exceed="warn"),
+        Budget(max_tokens=100000, on_exceed="pause"),
+    ],
+    ids=["warn", "no_cost_limit"],
+)
+async def test_warn_and_costless_budgets_do_not_stop_on_unpriced_calls(store, streaming, budget):
+    root, root_llm, _, _ = agents(
+        store, [response(9, "child"), response()], [response(None)], budget
+    )
+    result = await run_root(root, streaming)
+    assert result.status == RunStatus.SUCCESS and root_llm.calls == 2
+    assert await exceeded_reasons(store, result.run_id) == []
+
+
+@pytest.mark.parametrize("action", ["warn", "pause"])
+async def test_unpriced_checkpoint_query_cost_is_unchanged(
+    store, engine, monkeypatch, capsys, action
+):
+    import json
+    from collections import Counter
+
+    from sqlalchemy import event
+
+    from dendrux.loops._budget import BudgetTracker
+
+    measurements = []
+    original = BudgetTracker._measure
+
+    async def measured(tracker):
+        statements = []
+
+        def capture(connection, cursor, statement, parameters, context, many):
+            statements.append(statement.split()[0])
+
+        event.listen(engine.sync_engine, "before_cursor_execute", capture)
+        try:
+            result = await original(tracker)
+        finally:
+            event.remove(engine.sync_engine, "before_cursor_execute", capture)
+        measurements.append(dict(Counter(statements)))
+        return result
+
+    monkeypatch.setattr(BudgetTracker, "_measure", measured)
+    root, _, _, _ = agents(
+        store,
+        [response(9, "child"), response()],
+        [response(None)],
+        Budget(max_cost_usd=10, on_exceed=action),
+    )
+    result = await root.run("go")
+    assert result.status == (RunStatus.PAUSED if action == "pause" else RunStatus.SUCCESS)
+    # One read transaction per checkpoint: depth + 2 SELECTs at depth 0 and 1.
+    assert measurements and all(m in ({"SELECT": 2}, {"SELECT": 3}) for m in measurements)
+    with capsys.disabled():
+        print(
+            json.dumps(
+                {
+                    "operation": "unpriced_checkpoint_measurements",
+                    "backend": engine.dialect.name,
+                    "action": action,
+                    "measurements": measurements,
+                }
+            )
+        )

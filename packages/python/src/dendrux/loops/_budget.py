@@ -35,8 +35,9 @@ because the spend is unknown; with ``"warn"`` they only emit
 a policy change: the unpriced calls counted at the pause are accepted, and only a
 new one stops the run again. With ``include_children`` the count covers delegated
 descendants too, so an unpriced child call stops the parent (child agents are not
-checked by the parent's ``check_budget_config``). Misconfigured agents are
-normally caught earlier by ``pricing.check_budget_config``.
+checked by the parent's ``check_budget_config``). A managed tree follows the same rule
+tree-wide: the accepted count belongs to the root budget and travels with the tree.
+Misconfigured agents are normally caught earlier by ``pricing.check_budget_config``.
 """
 
 from __future__ import annotations
@@ -385,6 +386,15 @@ class BudgetTracker:
             )
         return int(tokens)
 
+    @property
+    def unpriced_baseline(self) -> int:
+        """Unpriced calls already accepted: only a count above it stops the run."""
+        return self._ack_unpriced
+
+    def accept_unpriced(self, count: int) -> None:
+        """Raise the accepted unpriced-call baseline (never lowers it)."""
+        self._ack_unpriced = max(self._ack_unpriced, count)
+
     def bind_shared(self, reader: Any) -> None:
         """Use one authoritative, flushed shared scope supplied by the runtime."""
         self._shared_reader = reader
@@ -535,11 +545,7 @@ class BudgetTracker:
         return self._unpriced_reason(metric, usage)
 
     def _unpriced_reason(self, metric: str, usage: _Usage) -> str | None:
-        if (
-            self._shared_reader is None
-            and metric == COST_USD
-            and usage.unpriced_calls > self._ack_unpriced
-        ):
+        if metric == COST_USD and usage.unpriced_calls > self._ack_unpriced:
             return UNPRICED_CALL
         return None
 

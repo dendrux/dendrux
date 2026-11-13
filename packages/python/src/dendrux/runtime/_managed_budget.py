@@ -40,6 +40,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 UNKNOWN = "managed_usage_unknown"
 ACCEPTED = "managed_usage_accepted"
+UNPRICED_ACCEPTED = "managed_unpriced_accepted"
 _RUN_ID = re.compile(r"[0-7][0-9A-HJKMNP-TV-Z]{25}")
 
 
@@ -97,6 +98,7 @@ def configure_recorder(recorder: Any, agent: Agent) -> None:
     """Pass execution policy through the recorder without changing Agent budget semantics."""
     recorder._history_limits = agent._limits
     recorder._managed_policy = getattr(agent, "_managed_budget_policy", agent.budget)
+    recorder._managed_unpriced_baseline = getattr(agent, "_managed_unpriced_baseline", 0)
 
 
 async def restore_recorder(
@@ -120,11 +122,35 @@ def bind(recorder: Any, tracker: BudgetTracker) -> None:
     recorder._managed_budget_tracker = tracker
 
     accept_paused_fault(recorder, tracker)
+    carry_unpriced_baseline(recorder, tracker)
 
     async def measure() -> Any:
         return await measure_shared(recorder, tracker, root_id, policy)
 
     tracker.bind_shared(measure)
+
+
+def accepted_count(value: Any) -> int:
+    """A persisted accepted-unpriced count; anything malformed falls back to zero (fail closed)."""
+    ok = isinstance(value, int) and not isinstance(value, bool) and value >= 0
+    return value if ok else 0
+
+
+def carry_unpriced_baseline(recorder: Any, tracker: BudgetTracker) -> None:
+    """Keep the root budget's accepted unpriced count with this execution's checkpoint.
+
+    The baseline is the highest of the tracker's own (a budget resume of this very
+    pause), the one persisted in this run's checkpoint (restart, reclaim, adoption)
+    and the one the spawning parent handed this child.
+    """
+    state = recorder._loop_state
+    tracker.accept_unpriced(
+        max(
+            accepted_count(state.get(UNPRICED_ACCEPTED)),
+            accepted_count(getattr(recorder, "_managed_unpriced_baseline", 0)),
+        )
+    )
+    state[UNPRICED_ACCEPTED] = tracker.unpriced_baseline
 
 
 def usage_fault(value: Any, run_id: str) -> dict[str, str]:
@@ -161,6 +187,11 @@ async def measure_shared(recorder: Any, tracker: BudgetTracker, root_id: str, po
     if not valid_usage(usage):
         await hold_fault(recorder)
         return None
+    if getattr(recorder, "_managed_accept_unpriced", False):
+        # Resuming a usage-unknown pause accepts the spend it could not measure.
+        recorder._managed_accept_unpriced = False
+        tracker.accept_unpriced(usage.unpriced_calls)
+        recorder._loop_state[UNPRICED_ACCEPTED] = tracker.unpriced_baseline
     return usage
 
 
@@ -178,6 +209,7 @@ def accept_paused_fault(recorder: Any, tracker: BudgetTracker) -> None:
             and state.get(UNKNOWN)
         ):
             state[ACCEPTED] = usage_fault(state.pop(UNKNOWN), recorder._run_id)
+            recorder._managed_accept_unpriced = True
     if state.get(ACCEPTED) and not state.get(UNKNOWN):
         tracker._invalid_usage = False
 
@@ -188,18 +220,23 @@ class _AdoptionClaim:
     loop_state: dict[str, Any]
 
 
-async def completed_fault(store: Any, run_id: str, child_id: str, report: Any) -> Any:
-    """Recover provenance even when its checkpoint failed but the error outcome committed."""
+async def completed_fault(store: Any, run_id: str, child_id: str, report: Any) -> tuple[Any, int]:
+    """Read the child's fault provenance and accepted unpriced count in one checkpoint read.
+
+    Provenance is recovered even when its checkpoint failed but the error outcome committed.
+    """
     state = await store.get_loop_state(child_id)
     if state is None:
         raise ManagedStateError(reason="child_missing", run_id=run_id)
+    accepted = accepted_count(state.get(UNPRICED_ACCEPTED))
     if state.get(UNKNOWN) or report.success:
-        return state.get(UNKNOWN)
+        return state.get(UNKNOWN), accepted
     child = await store.get_run(child_id)
     if child is None:
         raise ManagedStateError(reason="child_missing", run_id=run_id)
     info = (child.meta or {}).get(ERROR_INFO_META_KEY) or {}
-    return usage_fault(True, child_id) if info.get("category") == "persistence_error" else None
+    persistence_error = info.get("category") == "persistence_error"
+    return (usage_fault(True, child_id) if persistence_error else None), accepted
 
 
 def propagate_fault(
@@ -210,9 +247,10 @@ def propagate_fault(
     @wraps(complete)
     async def adopt(store: Any, run_id: str, **fields: Any) -> dict[str, Any]:
         child_id = fields["child_run_id"]
-        fault = await completed_fault(store, run_id, child_id, fields["report"])
+        fault, accepted = await completed_fault(store, run_id, child_id, fields["report"])
         claim = fields["claim"]
         state = dict(claim.loop_state or {})
+        state[UNPRICED_ACCEPTED] = max(accepted_count(state.get(UNPRICED_ACCEPTED)), accepted)
         if fault:
             state[UNKNOWN] = usage_fault(fault, child_id)
             state.pop(ACCEPTED, None)
@@ -232,6 +270,8 @@ def adoption_patch(state: dict[str, Any], call_id: str) -> LoopStatePatch:
 def adoption_fields(state: dict[str, Any]) -> dict[str, Any]:
     """Preserve fault provenance when clearing the consumed managed binding."""
     fields: dict[str, Any] = {"managed_wait": None, "submission": None, "managed_admitted": None}
+    if UNPRICED_ACCEPTED in state:
+        fields[UNPRICED_ACCEPTED] = state[UNPRICED_ACCEPTED]
     if state.get(UNKNOWN):
         fields.update({UNKNOWN: state[UNKNOWN], ACCEPTED: None})
     return fields
@@ -330,6 +370,21 @@ async def admission(recorder: Any, result: RunResult) -> RunResult | None:
     return replace(result, status=RunStatus.PAUSED, meta=meta)
 
 
+def hand_baseline(descend: RunResult, recorder: Any) -> None:
+    """Give the child's execution copy the accepted unpriced count its parent holds.
+
+    The descend marker carries exactly one value, the invocation, whose ``child`` is
+    this spawn's own execution copy. A lost hand-off (the copy rebuilt after a crash
+    before the child's first checkpoint) only lowers the baseline, which stops the
+    child early rather than letting spend through.
+    """
+    count = accepted_count(recorder._loop_state.get(UNPRICED_ACCEPTED))
+    for invocation in descend.meta.values():
+        child = getattr(invocation, "child", None)
+        if child is not None:
+            cast("Any", child)._managed_unpriced_baseline = count
+
+
 async def finish(
     descend: RunResult,
     result: RunResult,
@@ -346,4 +401,5 @@ async def finish(
             recorder=recorder,
             provider_kwargs=result.meta["pause_state"].provider_kwargs,
         )
+    hand_baseline(descend, recorder)
     return descend
