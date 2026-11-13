@@ -404,6 +404,11 @@ class _RunLifecycle:
     recorder_closed: bool = False
     notifier_closed: bool = False
     recorder: LoopRecorder | None = None
+    recorder_started: bool = False
+    notifier_started: bool = False
+
+    def _mark_notifier_started(self) -> None:
+        self.notifier_started = True
 
     def _claim(
         self,
@@ -472,7 +477,14 @@ class _RunLifecycle:
         notifier: LoopNotifier | None,
     ) -> RunResult:
         if isinstance(stop, ManagedRootStoppedError):
-            return await _managed.cancelled_result(self.store, self.run_id, recorder, notifier)
+            return await _managed.cancelled_result(
+                self.store,
+                self.run_id,
+                recorder,
+                notifier,
+                recorder_started=self.recorder_started,
+                notifier_started=self.notifier_started,
+            )
         return await self._fenced(recorder, notifier)
 
     async def _cancel_finish(
@@ -610,6 +622,7 @@ async def _start_new_run(
     await record_run_started(
         lifecycle.recorder, lifecycle.run_id, agent_name=agent.name, agent_model=provider.model
     )
+    lifecycle.recorder_started = True
     return await _start_trace(
         notifier,
         lifecycle.store,
@@ -617,6 +630,7 @@ async def _start_new_run(
         agent_name=agent.name,
         agent_model=provider.model,
         parent=parent,
+        on_started=lifecycle._mark_notifier_started,
     )
 
 
@@ -2737,6 +2751,11 @@ async def _run_once(
         agent, loop=_new_run_loop(agent, loop), explicit=activate_skills
     )
     with skill_session.bind():
+        # Validate + resolve depth early — before any side effects.
+        # _resolve_max_delegation_depth is a pure policy helper; side effect
+        # is limited to dedup warning state on parent_ctx.warned_mismatches.
+        # A managed child never inherits the caller's delegation context: its
+        # parent link, level and depth come from its bound invocation.
         parent_ctx = _managed.parent_context(invocation, get_delegation_context)
         effective_max_depth = _resolve_max_delegation_depth(max_delegation_depth, parent_ctx)
         tenant_id = resolve_child_tenant(parent_ctx, tenant_id)
@@ -2758,7 +2777,8 @@ async def _run_once(
         _validate_loop_skill_compat(agent, resolved_loop)
         managed_root = await _managed.enter(agent, invocation, state_store, resolved_loop)
 
-        # Invalid input must fail before creating a run row.
+        # Validate input + chat history before any side effects. Raises
+        # TypeError / ValueError on bad input so no DB row is created.
         user_input, input_items, image_input, normalized_history = _new_run_input(
             user_input, history, resolved_loop
         )
@@ -4532,6 +4552,8 @@ def run_stream(
         (state_store_resolver, create_run, notifier init) are also caught
         and yielded as RUN_ERROR — honoring the "no exception to consumer" contract.
         """
+        # store is captured in the closure for the error handler.
+        # Starts as the pre-provided value (often None for the lazy path).
         nonlocal run_id, extra_notifier
         store = state_store
         startup = _RunLifecycle(run_id, store, None)
@@ -4543,6 +4565,11 @@ def run_stream(
         user_parts: tuple[ContentPart, ...] | None = None
         history_messages = normalized_history
 
+        # Entry checks after tenant inheritance, before any I/O. Like image
+        # setup they raise (no RUN_ERROR event, no run row, no hooks). A child
+        # whose explicit tenant differs from its parent's still fails later, as
+        # RUN_ERROR, exactly as before.
+        # A managed child never inherits the caller's delegation context.
         entry_parent = _managed.parent_context(invocation, get_delegation_context)
         _stream_entry_checks(
             agent,
@@ -4559,6 +4586,7 @@ def run_stream(
         )
 
         if image_input:
+            # Image setup raises (no RUN_ERROR event, no run row, no hooks).
             _shared["existing_run"] = True
             store = await _resolve_stream_store(
                 store, state_store_resolver, agent, requested_tenant_id
@@ -4596,12 +4624,14 @@ def run_stream(
             _shared["existing_run"] = False
 
         try:
+            # 1. Resolve state store lazily (may create DB engine)
             store = await _resolve_stream_store(
                 store, state_store_resolver, agent, requested_tenant_id
             )
             await ensure_agent_limits_fit(agent, store)
             _shared["state_store"] = store
 
+            # --- Delegation context ---
             parent_ctx = _managed.parent_context(invocation, get_delegation_context)
             parent_run_id, delegation_level = _managed.parent_link(invocation, parent_ctx, store)
             eff_max_depth = _resolve_max_delegation_depth(max_delegation_depth, parent_ctx)
@@ -4727,7 +4757,8 @@ def run_stream(
             this_ctx = replace(this_ctx, trace_link=trace_link)
             stream_context.set_delegation(this_ctx)
             # Lifecycle pair is now open. Stash recorder/notifier so the
-            # Cleanup closes these sinks if the consumer abandons the stream.
+            # cleanup callback can close it with a CANCELLED finish if the
+            # consumer abandons the stream before a terminal event.
             _shared["recorder"] = startup.recorder
             _shared["notifier"] = extra_notifier
 
@@ -7202,7 +7233,14 @@ async def _stopped_resume_result(
     if not isinstance(stop, ManagedRootStoppedError):
         return await _fenced_resume_result(store, run_id, ctx)
     recorder, notifier = (ctx.recorder, ctx.notifier) if ctx is not None else (None, None)
-    return await _managed.cancelled_result(store, run_id, recorder, notifier)
+    return await _managed.cancelled_result(
+        store,
+        run_id,
+        recorder,
+        notifier,
+        recorder_started=ctx is not None and ctx.recorder_started,
+        notifier_started=ctx is not None and ctx.notifier_started,
+    )
 
 
 _CONTINUATION_BLOCKED = "Run stopped because it contains blocked content."
@@ -7404,6 +7442,9 @@ async def _resume_core(
                 decisions,
             )
 
+        # 4-10. Everything that runs after on_run_started fires must live
+        #       inside the try block so a closing hook can balance the lifecycle
+        #       pair on any failure (including injected-history replay errors).
         ctx: _ResumeContext | None = None
         ctx_token = None
         mcp_meta: dict[str, Any] = {}
@@ -7444,7 +7485,8 @@ async def _resume_core(
             )
 
             run_tenant = run_record.tenant_id if run_record else None
-            # History preparation leaves lifecycle hooks to this caller.
+            # 4-8. Prepare history and notifier (shared with resume_stream).
+            #      Does NOT fire any lifecycle hooks — that's the caller's job.
             history_results, history_input = _resume_history_inputs(
                 recovering, tool_results, user_input
             )
@@ -8067,6 +8109,10 @@ def resume_stream(
             _shared["expected_status"] = expected
             progress = _shared["progress"] = _ResumeProgress()
 
+            # 5. Prepare (shared helper — history, notifier).
+            #    Does NOT fire any lifecycle hooks; that's done below inside
+            #    the same try block so failure or released-finish hooks pair
+            #    with on_run_started.
             run_tenant = run_record.tenant_id if run_record else None
             ctx = await _prepare_resume(
                 run_id,
@@ -8087,6 +8133,8 @@ def resume_stream(
             _shared["ctx"] = ctx
             progress.submission = getattr(ctx.recorder, "_loop_state", {}).get("submission")
 
+            # 5a. Fire run-level lifecycle hooks. The exception handler closes
+            #     the pair with failure or the observed released status.
             await record_run_started(
                 ctx.recorder, run_id, agent_name=agent.name, agent_model=provider.model
             )
@@ -8100,7 +8148,9 @@ def resume_stream(
                 saved=getattr(run_record, "trace_link", None),
                 on_started=ctx._mark_notifier_started,
             )
-            # Cleanup closes these sinks if the consumer abandons the stream.
+            # Lifecycle pair is now open. Stash recorder/notifier so the
+            # cleanup callback can close it with a CANCELLED finish if the
+            # consumer abandons the stream before a terminal event.
             _shared["recorder"] = ctx.recorder
             _shared["notifier"] = ctx.notifier
 

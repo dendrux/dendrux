@@ -175,12 +175,14 @@ def _restore_logged_control_error(cls: Any, args: tuple[Any, ...], state: dict[s
 
 
 class RunNotReclaimableError(_KwargsReduceMixin, RunControlError):
-    """A run fails recovery preconditions. Reasons: ``legacy_run``, ``store_capability``,
-    ``not_running``, ``lease_fresh``, ``already_reclaimed``, ``reclaim_limit``, ``agent_mismatch``,
+    """A run does not satisfy the ordered recovery preconditions.
+
+    ``reason`` is one of ``legacy_run``, ``store_capability``, ``not_running``,
+    ``lease_fresh``, ``already_reclaimed``, ``reclaim_limit``, ``agent_mismatch``,
     ``skill_mismatch``, ``loop_unsupported``, ``history_too_large``, ``cancelled``
     (cancellation won), ``loop_unknown`` (missing or unrecognized checkpoint loop),
     ``recovery_call_missing``, ``recovery_state_missing``, ``recovery_state_invalid``,
-    or ``governance_changed`` (governance fingerprint differs).
+    or ``governance_changed`` (the recovery governance fingerprint differs).
     """
 
     _init_fields = ("run_id", "reason")
@@ -217,7 +219,12 @@ class ManagedRootStoppedError(RunCancelledError):
 
 
 class ManagedChildControlError(_KwargsReduceMixin, RunControlError):
-    """Direct controls require the root id (``managed_root_required``); reads are allowed."""
+    """A managed subagent run was controlled directly (0.7).
+
+    Resume, submit, reclaim, cancel and retry of a managed child go through the
+    workflow's root run id. Reading the child is allowed. ``code`` is
+    ``managed_root_required``; the message carries the run id only.
+    """
 
     code = "managed_root_required"
     _init_fields = ("run_id",)

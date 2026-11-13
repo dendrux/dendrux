@@ -61,7 +61,7 @@ from dendrux.runtime._cancel_guard import capture
 from dendrux.runtime._capabilities import capabilities
 from dendrux.runtime._clarification import DEFAULT_PAUSE_SUMMARY_BYTES, clarification_summary
 from dendrux.runtime.durability import retry_critical, retry_transient_db
-from dendrux.runtime.state import read_run_control
+from dendrux.runtime.state import RunControl, read_run_control
 from dendrux.types import (
     ImagePart,
     ImageRef,
@@ -442,12 +442,25 @@ def _view_identity(entry: dict[str, Any]) -> str:
 
 
 class PersistenceRecorder(BaseRecorder):
-    """Record authoritative execution evidence on a borrowed StateStore.
+    """Authoritative evidence recorder — writes loop events to StateStore.
 
-    Trace, tool and lifecycle writes fail closed. Usage, LLM forensics and
-    freshness writes are best effort. Loops propagate authoritative failures.
-    ``tenant_scope`` scopes blob edges; None is valid only without images.
-    ``provider`` supplies the image capability key for token estimates.
+    Fail-closed writes (exceptions propagate to caller):
+      - save_trace: what the agent saw and said
+      - save_tool_call: proof of side effects
+      - save_run_event: lifecycle audit trail
+
+    Best-effort writes (exceptions swallowed):
+      - save_usage: cost tracking
+      - save_llm_interaction: full forensics
+      - touch_progress: operational freshness for sweep
+
+    The loop calls record_* helpers which let exceptions from this class
+    propagate. If a fail-closed write fails, the run stops.
+
+    ``tenant_scope`` (0.4.0) scopes every blob edge this recorder writes;
+    ``None`` is valid only for runs without images. ``provider`` (the run's
+    LLM provider) lets ``semantic_request.image_stats`` estimate image tokens
+    from its ``image_capability_key``; without it the estimate is ``None``.
     """
 
     def __init__(
@@ -925,7 +938,7 @@ class PersistenceRecorder(BaseRecorder):
         self, run_id: str, *, agent_name: str | None = None, agent_model: str | None = None
     ) -> None:
         """Check managed root control after creation or continuation claims."""
-        await _managed.checkpoint(self._store_calls, run_id, self._loop_state)
+        await self._managed_checkpoint(run_id)
 
     async def on_llm_call_started(
         self,
@@ -939,8 +952,8 @@ class PersistenceRecorder(BaseRecorder):
             await self._snapshot(iteration - 1)
             if self._loop_state != self._durable_state:
                 await self._checkpoint()
-        await _managed.checkpoint(self._store_calls, run_id, self._loop_state)
-        await read_run_control(self._store_calls, run_id)
+        # Ownership can still change between this read and the network send.
+        await self._admission_control(run_id)
         await self._cancel_guard.check(run_id)
 
     async def checkpoint_outcome(self, result: Any, provider_kwargs: Any) -> None:
@@ -1398,20 +1411,35 @@ class PersistenceRecorder(BaseRecorder):
         from dendrux.errors import PersistenceError
         from dendrux.runtime._blocked_content import _dispatch_write, _DispatchUndecided
 
-        await _managed.checkpoint(self._store_calls, run_id, self._loop_state)
-        await self._check_custom_dispatch(run_id)
+        control = await self._managed_checkpoint(run_id)
+        await self._check_custom_dispatch(run_id, control)
         undecided = False
         with _dispatch_write(self._store, run_id):
             try:
                 await self._write_tool_intent(run_id, tool_call, iteration)
             except _DispatchUndecided:
+                # A refused dispatch write whose cause could not be read: refuse safely.
                 undecided = True
             if not undecided:
                 await self._cancel_guard.check(run_id)
         if undecided:
             raise PersistenceError()
 
-    async def _check_custom_dispatch(self, run_id: str) -> None:
+    async def _managed_checkpoint(self, run_id: str) -> RunControl | None:
+        return await _managed.checkpoint(
+            self._store_calls,
+            run_id,
+            self._loop_state,
+            claim_epoch=getattr(self._store, "claim_epoch", None),
+        )
+
+    async def _admission_control(self, run_id: str) -> RunControl:
+        control = await self._managed_checkpoint(run_id)
+        if control is None:
+            control = await read_run_control(self._store_calls, run_id)
+        return control
+
+    async def _check_custom_dispatch(self, run_id: str, control: RunControl | None = None) -> None:
         from dendrux.guardrails._engine import _entry_engine
         from dendrux.loops._helpers import _check_blocked_run
         from dendrux.runtime._blocked_content import _native_blocked_store
@@ -1421,7 +1449,8 @@ class PersistenceRecorder(BaseRecorder):
         if not native and guarded and hasattr(self._store, "add_note"):
             # Custom stores have no mark predicate on the dispatch write: a guarded
             # run reads the mark when notes are pending. Guardrail-free runs add no read.
-            control = await read_run_control(self._store_calls, run_id)
+            if control is None:
+                control = await self._admission_control(run_id)
             if control.has_pending_notes:
                 await _check_blocked_run(self._store, run_id)
 
@@ -1867,8 +1896,15 @@ async def adopt_managed_result(
     observation: Message | None = None,
     pii_mapping: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Atomically adopt intent/observation/event and clear the binding/submission.
-    Retries never append twice; ordinary consumption must not also write the observation.
+    """Complete a parent's managed tool intent with its accepted report (0.7).
+
+    One ``complete_tool_call`` transaction under the adoption claim's epoch:
+    started intent to completed or failed (its binding metadata kept), the
+    reserved observation, the outcome event, the call removed from pending and
+    the outgoing binding and submission marker cleared. Ordinary
+    ``consume_submission`` is never also called for this observation. A retry
+    after a lost acknowledgement finds the completed intent and adds nothing.
+    Returns the checkpoint after the change.
     """
     from dendrux.errors import ManagedStateError
     from dendrux.runtime.state import EventWrite, LoopStatePatch, _apply_loop_patch

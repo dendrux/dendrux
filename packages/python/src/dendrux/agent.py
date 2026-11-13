@@ -2579,14 +2579,20 @@ class Agent:
           (``meta["interrupted"]`` / ``meta["partial_output"]``). Once the
           provider's final event has been received, completion wins and
           the run finishes as ``success``.
-        - **In-process submit/resume:** interrupts after entering the ownership
-          guard; before that, the runner observes the durable request.
-        - **Terminal run:** returns persisted state; a cascade rewalks descendants.
+        - **In-process submit/resume task on this Agent instance:** the
+          asyncio task spawned by :meth:`submit_tool_results`,
+          :meth:`submit_input`, :meth:`submit_approval` or
+          :meth:`submit_resume` is cancelled after entering the runner's
+          ownership guard. Before that guard, it stays alive to observe the
+          durable DB cancellation request and finalize its claim.
+        - **Terminal run:** no-op; returns the current persisted state.
+          Does not raise.
         - **Non-persisted runs:** unsupported. ``cancel_run`` requires a
           configured DB. Raises ``PersistenceNotConfiguredError``.
 
-        Managed roots always cancel their managed descendants; ``cascade=True``
-        also includes legacy descendants. Legacy roots keep the False default.
+        Managed roots always include managed descendants, regardless of ``cascade``.
+        ``cascade=True`` additionally includes legacy descendants; legacy roots keep
+        the False default. A cascade rewalks descendants even when the root is terminal.
         Descendants settle deepest first and ``run_id`` last. Each frontier
         is durably marked before its children are scanned in pages of 500. A
         child already being created commits before the mark and is included;
@@ -2611,7 +2617,12 @@ class Agent:
         (``RUN_CANCELLED`` on the stream, ``run.cancelled`` in the event
         log, ``status == "cancelled"`` in the store) confirms it.
 
-        Returns the persisted RunResult, including any undelivered notes.
+        Returns:
+            :class:`RunResult` reflecting the persisted state of ``run_id``
+            after the cancel attempt. When that state is terminal,
+            ``meta["undelivered_notes"]`` lists inbox notes the run never
+            delivered (only when there are any).
+
         Raises:
             PersistenceNotConfiguredError: Agent has no DB.
             RunNotFoundError: ``run_id`` does not exist (or is outside
@@ -2627,18 +2638,16 @@ class Agent:
         if store is None:
             raise PersistenceNotConfiguredError()
 
+        # Preflight: distinguish missing from terminal so callers get
+        # specific errors / no-op behavior without ambiguity.
         record = await store.get_run(run_id)
         if record is None or not _in_tenant_scope(record, tenant_id):
             raise RunNotFoundError(run_id)
-        cascade, managed_root = await _managed.cancel_scope(store, record, cascade=cascade)
+        cascade, pages = await _managed.cancel_scope(store, record, cascade=cascade)
         outcomes: list[dict[str, str]] = []
         cascade_count = 0
         to_signal: list[str] = []
-        frontier_signals = (
-            cascade
-            and callable(getattr(store, "mark_cancel_requested", None))
-            and callable(getattr(store, "get_children_page", None))
-        )
+        frontier_signals = cascade and _managed.can_mark_cancel(store)
         try:
             traversal_truncated = False
             if cascade:
@@ -2649,25 +2658,21 @@ class Agent:
                     frontier_signals,
                     outcomes,
                     to_signal,
-                    managed_root,
+                    pages,
                 )
 
             if record.status in _TERMINAL_STATUSES:
-                if cascade:
-                    record = await store.get_run(run_id)
-                    if record is None:  # pragma: no cover — concurrent deletion
-                        raise RunNotFoundError(run_id)
-                result = _record_to_run_result(record)
                 outcomes.append({"run_id": run_id, "outcome": "terminal"})
             else:
                 outcome = await self._cancel_one(store, run_id, signal=False)
                 if outcome != "terminal" and not frontier_signals:
                     to_signal.append(run_id)
                 outcomes.append({"run_id": run_id, "outcome": outcome})
+            if cascade or record.status not in _TERMINAL_STATUSES:
                 record = await store.get_run(run_id)
-                if record is None:  # pragma: no cover — we just preflight-checked
+                if record is None:  # pragma: no cover — concurrent deletion
                     raise RunNotFoundError(run_id)
-                result = _record_to_run_result(record)
+            result = _record_to_run_result(record)
             from dendrux.runtime.runner import _recovery_info
 
             result.recovery = await _recovery_info(store, record)
@@ -2694,10 +2699,10 @@ class Agent:
         frontier_signals: bool,
         outcomes: list[dict[str, str]],
         to_signal: list[str],
-        managed_root: str | None = None,
+        pages: _managed.CancelPageReader | None = None,
     ) -> tuple[int, bool]:
         levels, truncated = await self._mark_cancel_subtree(
-            store, run_id, tenant_id=tenant_id, managed_root=managed_root
+            store, run_id, tenant_id=tenant_id, pages=pages
         )
         count = 0
         descendants = (rid for level in reversed(levels) for rid in level if rid != run_id)
@@ -2716,24 +2721,23 @@ class Agent:
         run_id: str,
         *,
         tenant_id: str | None,
-        managed_root: str | None = None,
+        pages: _managed.CancelPageReader | None = None,
     ) -> tuple[list[list[str]], bool]:
         from dendrux.types import Budget
 
         limit = self._budget.max_subtree_nodes if self._budget else Budget.max_subtree_nodes
-        mark = getattr(store, "mark_cancel_requested", None)
-        children = getattr(store, "get_children_page", None)
-        if managed_root is not None:
-            children = require_store_method(store, "_get_cancel_children_page")
-        if not callable(mark) or not callable(children):
+        if not _managed.can_mark_cancel(store):
             # Legacy custom stores retain their snapshot API and admission semantics.
             levels, truncated = await _managed.legacy_cancel_levels(store, run_id, tenant_id, limit)
         else:
+            mark = require_store_method(store, "mark_cancel_requested")
+            pages = pages or _managed.LegacyCancelPages(store)
             levels = [[run_id]]
             visited = {run_id}
             frontier = levels[0]
             truncated = False
             while frontier:
+                # Wait for creators holding parent FOR SHARE before scanning committed children.
                 marked = await mark(frontier, tenant_id=tenant_id)
                 if marked:
                     for rid in frontier:
@@ -2743,21 +2747,20 @@ class Agent:
                 following: list[str] = []
                 after = None
                 while True:
-                    page = await children(
+                    page = await pages.read(
                         frontier, after=after, limit=MAX_SMALL_PAGE, tenant_id=tenant_id
                     )
-                    for item in page:
-                        child = _managed.cancel_child_id(item, managed_root)
-                        if child is None or child in visited:
+                    for child in page.run_ids:
+                        if child in visited:
                             continue
                         if len(visited) >= limit:
                             truncated = True
                             break
                         visited.add(child)
                         following.append(child)
-                    if truncated or len(page) < MAX_SMALL_PAGE:
+                    if truncated or not page.has_more:
                         break
-                    after = page[-1][0] if managed_root is not None else page[-1]
+                    after = page.after
                 if following:
                     levels.append(following)
                 frontier = following

@@ -9,7 +9,13 @@ from unittest.mock import AsyncMock
 import pytest
 
 from dendrux.errors import ManagedStateError
-from dendrux.runtime._managed import cancel_child_id, legacy_cancel_levels, outcome_code
+from dendrux.runtime._managed import (
+    LegacyCancelPages,
+    ManagedCancelPages,
+    cancel_child_id,
+    legacy_cancel_levels,
+    outcome_code,
+)
 from dendrux.runtime.state import ManagedHeader
 from dendrux.types import ToolResult, generate_ulid
 
@@ -33,8 +39,22 @@ def test_only_explicit_same_root_parent_edges_are_cancelled(membership: str) -> 
     )
 
 
-def test_legacy_traversal_does_not_require_a_managed_header() -> None:
-    assert cancel_child_id(CHILD, None) == CHILD
+@pytest.mark.parametrize(("count", "has_more"), [(0, False), (1, False), (500, True), (501, True)])
+async def test_legacy_traversal_does_not_require_a_managed_header(
+    count: int, has_more: bool
+) -> None:
+    store = SimpleNamespace(get_children_page=AsyncMock(return_value=[CHILD] * count))
+    page = await LegacyCancelPages(store).read([ROOT], after=None, limit=500, tenant_id=None)
+    assert page.run_ids == (CHILD,) * count
+    assert page.after == (CHILD if count else None)
+    assert page.has_more is has_more
+    store.get_children_page.assert_awaited_once_with([ROOT], after=None, limit=500, tenant_id=None)
+
+
+async def test_filtered_page_keeps_raw_continuation_without_any_managed_ids() -> None:
+    store = SimpleNamespace(_get_cancel_children_page=AsyncMock(return_value=[(CHILD, ROOT, None)]))
+    page = await ManagedCancelPages(store, ROOT).read([ROOT], after=None, limit=1, tenant_id=None)
+    assert page.run_ids == () and page.after == CHILD and page.has_more
 
 
 @pytest.mark.parametrize("value", [{}, {"v": 2}, "SENTINEL-untrusted-header"])

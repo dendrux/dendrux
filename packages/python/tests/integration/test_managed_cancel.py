@@ -604,7 +604,7 @@ async def test_already_admitted_effect_finishes_and_provider_checkpoint_stops(
     assert len(await rows(engine, TokenUsage, TokenUsage.agent_run_id == children[0].id)) == 1
 
 
-@pytest.mark.parametrize("read", ["root", "children"])
+@pytest.mark.parametrize("read", ["root", "children", "combined_control"])
 async def test_cancel_projection_database_errors_are_safe(
     store: Any, engine: Any, read: str, caplog: Any
 ) -> None:
@@ -624,6 +624,8 @@ async def test_cancel_projection_database_errors_are_safe(
         with pytest.raises(PersistenceError) as info:
             if read == "root":
                 await store._managed_root_stopped(leaf)
+            elif read == "combined_control":
+                await store._get_managed_run_control(leaf)
             else:
                 await store._get_cancel_children_page(
                     [root], after=None, limit=500, tenant_id=TENANT
@@ -703,7 +705,8 @@ async def test_format_one_cancel_never_reads_a_checkpoint(
     assert result.status == RunStatus.CANCELLED
 
 
-async def test_pg_root_stop_reads_at_most_one_root_row(store: Any, engine: Any) -> None:
+@pytest.mark.parametrize("read", ["root", "combined_control"])
+async def test_pg_root_stop_reads_at_most_one_root_row(store: Any, engine: Any, read: str) -> None:
     import json
 
     from sqlalchemy import event
@@ -733,7 +736,10 @@ async def test_pg_root_stop_reads_at_most_one_root_row(store: Any, engine: Any) 
 
     event.listen(engine.sync_engine, "before_cursor_execute", capture)
     try:
-        assert await store._managed_root_stopped(bound.child_run_id)
+        if read == "root":
+            assert await store._managed_root_stopped(bound.child_run_id)
+        else:
+            assert (await store._get_managed_run_control(bound.child_run_id)).cancel_requested
     finally:
         event.remove(engine.sync_engine, "before_cursor_execute", capture)
     assert len(statements) == 1
@@ -753,3 +759,154 @@ async def test_pg_root_stop_reads_at_most_one_root_row(store: Any, engine: Any) 
         pending.extend(node.get("Plans", []))
     assert len(probes) == 1
     assert probes[0]["Actual Rows"] + probes[0].get("Rows Removed by Filter", 0) <= 1, probes[0]
+
+
+@pytest.mark.parametrize("admission", ["provider", "tool"])
+async def test_fix1_managed_admission_has_one_control_select(
+    store: Any, engine: Any, monkeypatch: Any, admission: str
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from sqlalchemy import event
+
+    root, call_id = await managed_parent(store)
+    bound = await store.bind_managed_child(bind_request(root, call_id))
+    owned = claimed_store(store, bound.child_run_id, bound.child_claim)
+    recorder = PersistenceRecorder(owned, bound.child_run_id)
+    monkeypatch.setattr(recorder, "_write_tool_intent", AsyncMock())
+    statements = []
+
+    def capture(conn, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().upper().startswith("SELECT"):
+            statements.append(statement)
+
+    event.listen(engine.sync_engine, "before_cursor_execute", capture)
+    try:
+        for _ in range(3):
+            if admission == "provider":
+                await recorder.on_llm_call_started(bound.child_run_id, 1)
+            else:
+                await recorder.on_tool_started(
+                    bound.child_run_id, ToolCall(name="work", id="w1"), 1
+                )
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", capture)
+    assert len(statements) == 3, statements
+
+
+@pytest.mark.parametrize("changed", ["epoch", "status"])
+@pytest.mark.parametrize("admission", ["started", "provider", "tool"])
+async def test_fix1_combined_control_keeps_claim_fencing(
+    store: Any, engine: Any, changed: str, admission: str
+) -> None:
+    from dendrux.errors import RunFencedError
+
+    root, call_id = await managed_parent(store)
+    bound = await store.bind_managed_child(bind_request(root, call_id))
+    recorder = PersistenceRecorder(
+        claimed_store(store, bound.child_run_id, bound.child_claim), bound.child_run_id
+    )
+    async with engine.begin() as conn:
+        await conn.execute(
+            update(AgentRun)
+            .where(AgentRun.id == bound.child_run_id)
+            .values(**({"claim_epoch": 1} if changed == "epoch" else {"status": "paused"}))
+        )
+    with pytest.raises(RunFencedError):
+        if admission == "started":
+            await recorder.on_run_started(bound.child_run_id)
+        elif admission == "provider":
+            await recorder.on_llm_call_started(bound.child_run_id, 1)
+        else:
+            await recorder.on_tool_started(bound.child_run_id, ToolCall(name="work", id="w1"), 1)
+
+
+@pytest.mark.parametrize("stop_at", ["after_bind", "after_provider"])
+async def test_fix1_cancel_closes_only_a_started_notifier(
+    store: Any, monkeypatch: Any, stop_at: str
+) -> None:
+    from collections import Counter
+
+    from dendrux import tool
+    from dendrux.loops.base import BaseNotifier
+
+    starts, finishes = Counter(), Counter()
+
+    class Observer(BaseNotifier):
+        async def on_run_started(self, run_id: str, **kwargs: Any) -> None:
+            starts[run_id] += 1
+
+        async def on_run_finished(self, run_id: str, result: Any) -> None:
+            finishes[run_id] += 1
+
+    @tool()
+    async def effect() -> str:
+        """Perform an operation."""
+        raise RuntimeError("effect must not run")
+
+    async def cancel(root_id: str) -> None:
+        await controller(store, budget=Budget(max_tokens=10000, max_subtree_nodes=1)).cancel_run(
+            root_id
+        )
+
+    bound_ids = []
+    original = store.bind_managed_child
+
+    async def bind(request: Any) -> Any:
+        result = await original(request)
+        bound_ids.append(result.child_run_id)
+        if stop_at == "after_bind":
+            await cancel(request.root_run_id)
+        return result
+
+    async def provider_cancel(index: int, run_id: str) -> None:
+        if stop_at == "after_provider":
+            await cancel((await store.get_loop_state(run_id))["managed"]["root_run_id"])
+
+    monkeypatch.setattr(store, "bind_managed_child", bind)
+    child = child_agent(
+        ContextLLM([call("effect", {}, "e1")], on_call=provider_cancel), tools=[effect]
+    )
+    root = Agent(
+        name="lead",
+        prompt="Lead.",
+        state_store=store,
+        subagents=[child],
+        provider=ContextLLM([call("reviewer", {"task": "go"}, "c1")]),
+    )
+    result = await root.run("go", tenant_id=TENANT, notifier=Observer())
+    assert result.status == RunStatus.CANCELLED
+    assert len(bound_ids) == 1
+    child_id = bound_ids[0]
+    expected = 0 if stop_at == "after_bind" else 1
+    assert starts[child_id] == expected
+    assert finishes[child_id] == expected
+
+
+@pytest.mark.parametrize("recorder_started", [False, True])
+@pytest.mark.parametrize("notifier_started", [False, True])
+async def test_fix1_resume_stop_closes_started_sinks(
+    store: Any, recorder_started: bool, notifier_started: bool
+) -> None:
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from dendrux.errors import ManagedRootStoppedError
+    from dendrux.runtime.runner import _stopped_resume_result
+    from dendrux.runtime.state import ClaimResult
+
+    root, _ = await managed_parent(store)
+    state = await store.get_loop_state(root)
+    owned = claimed_store(store, root, ClaimResult(0, 2, state, None))
+    recorder = SimpleNamespace(_loop_source=None, _loop_state=state, on_run_finished=AsyncMock())
+    notifier = SimpleNamespace(on_run_finished=AsyncMock())
+    ctx = SimpleNamespace(
+        recorder=recorder,
+        notifier=notifier,
+        recorder_started=recorder_started,
+        notifier_started=notifier_started,
+    )
+    result = await _stopped_resume_result(ManagedRootStoppedError(root, root), owned, root, ctx)
+    assert result.status == RunStatus.CANCELLED
+    assert recorder.on_run_finished.await_count == int(recorder_started)
+    assert notifier.on_run_finished.await_count == int(notifier_started)
