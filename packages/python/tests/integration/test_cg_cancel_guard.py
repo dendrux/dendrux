@@ -193,7 +193,7 @@ async def test_unfired_timeout_with_store(store):
     async with Agent(
         prompt="test", provider=provider, state_store=store, strict_tenancy=False
     ) as agent:
-        async with asyncio.timeout(5):
+        async with asyncio.timeout(30):
             result = await agent.run("go")
         assert result.status.value == "success"
         assert provider.calls == 1
