@@ -68,6 +68,7 @@ def test_shared_usage_accepts_known_unpriced_and_large_totals():
 
 async def test_failed_provider_recording_cannot_be_treated_as_zero_usage():
     from types import SimpleNamespace
+    from unittest.mock import AsyncMock
 
     from dendrux.runtime._managed_budget import record_interaction
 
@@ -75,6 +76,7 @@ async def test_failed_provider_recording_cannot_be_treated_as_zero_usage():
         _run_id="01ARZ3NDEKTSV4RRFFQ69G5FAV",
         _loop_state={"managed": {}},
         _managed_policy=Budget(max_tokens=100),
+        _checkpoint=AsyncMock(),
     )
 
     async def failed():
@@ -83,3 +85,64 @@ async def test_failed_provider_recording_cannot_be_treated_as_zero_usage():
     with pytest.raises(RuntimeError):
         await record_interaction(recorder, failed)
     assert recorder._managed_usage_failed
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        True,
+        {"origin_run_id": "SENTINEL-private", "text": "SENTINEL"},
+        {"origin_run_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV"},
+    ],
+)
+def test_fault_provenance_contains_only_safe_code_and_ids(raw):
+    from dendrux.runtime._managed_budget import usage_fault
+
+    marker = usage_fault(raw, "01ARZ3NDEKTSV4RRFFQ69G5FAV")
+    assert marker == {
+        "code": "managed_usage_unknown",
+        "origin_run_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+    }
+
+
+async def test_resume_ack_is_durable_but_does_not_accept_a_new_fault_twice():
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from dendrux.runtime._managed_budget import accept_paused_fault, hold_fault
+
+    marker = {"code": "managed_usage_unknown", "origin_run_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV"}
+    recorder = SimpleNamespace(
+        _run_id=marker["origin_run_id"],
+        _loop_state={"managed_usage_unknown": marker},
+        _resume_pause_data={"pause_reason": "budget", "pause_message": "managed_usage_unknown"},
+        _managed_budget_resuming=True,
+        _checkpoint=AsyncMock(),
+    )
+    tracker = SimpleNamespace(_invalid_usage=True)
+    accept_paused_fault(recorder, tracker)
+    assert not tracker._invalid_usage
+    assert recorder._loop_state == {"managed_usage_accepted": marker}
+    tracker._invalid_usage = True
+    await hold_fault(recorder)
+    accept_paused_fault(recorder, tracker)
+    assert tracker._invalid_usage
+    assert recorder._loop_state == {"managed_usage_unknown": marker}
+    recorder._checkpoint.assert_awaited_once()
+
+
+def test_reclaim_is_not_an_acknowledgement():
+    from types import SimpleNamespace
+
+    from dendrux.runtime._managed_budget import accept_paused_fault
+
+    marker = {"code": "managed_usage_unknown", "origin_run_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV"}
+    recorder = SimpleNamespace(
+        _run_id=marker["origin_run_id"],
+        _loop_state={"managed_usage_unknown": marker},
+        _resume_pause_data={"pause_reason": "budget", "pause_message": "managed_usage_unknown"},
+        _managed_budget_resuming=False,
+    )
+    tracker = SimpleNamespace(_invalid_usage=True)
+    accept_paused_fault(recorder, tracker)
+    assert tracker._invalid_usage and recorder._loop_state["managed_usage_unknown"] == marker

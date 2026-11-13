@@ -603,8 +603,8 @@ class PersistenceRecorder(_managed_cancel.CancelAdmission, BaseRecorder):
                 else:
                     target.clear()
                     target.update(saved_value)
-        _managed_budget.bind(self, budget)
         self._restore_budget(budget)
+        _managed_budget.bind(self, budget)
 
     def _restore_budget(self, budget: Any) -> None:
         saved = self._loop_state.get("budget")
@@ -1860,6 +1860,7 @@ def resolve_pending(
     return actions
 
 
+@_managed_budget.propagate_fault
 async def adopt_managed_result(
     store: StateStore,
     run_id: str,
@@ -1883,7 +1884,7 @@ async def adopt_managed_result(
     Returns the checkpoint after the change.
     """
     from dendrux.errors import ManagedStateError
-    from dendrux.runtime.state import EventWrite, LoopStatePatch, _apply_loop_patch
+    from dendrux.runtime.state import EventWrite, _apply_loop_patch
     from dendrux.types import tool_result_message
 
     state = dict(claim.loop_state or {})
@@ -1909,16 +1910,12 @@ async def adopt_managed_result(
             "child_run_id": child_run_id,
             "agent_path": list(agent_path),
             "managed_outcome": _managed_cancel.outcome_code(report),
-            **({"code": report.meta["code"]} if "code" in report.meta else {}),
+            **_managed_budget.adoption_event(report, state),
         },
         call_id,
         None,
     )
-    patch = LoopStatePatch(
-        remove_pending=(call_id,),
-        set_phase="model_next",
-        set_fields={"managed_wait": None, "submission": None, "managed_admitted": None},
-    )
+    patch = _managed_budget.adoption_patch(state, call_id)
 
     async def complete() -> None:
         await store.complete_tool_call(

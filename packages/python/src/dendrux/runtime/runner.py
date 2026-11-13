@@ -5367,7 +5367,7 @@ async def _prepare_resume(
         **_recorder_image_kwargs(tenant_id, provider),
     )
 
-    await _managed_budget.restore_recorder(recorder, agent, history_records)
+    await _managed_budget.restore_recorder(recorder, agent, history_records, recovering)
     recorder._resume_pause_data = pause_data
 
     # NOTE: lifecycle hooks (record_run_started/notify_run_started) and

@@ -535,3 +535,369 @@ async def test_bound_child_shared_read_failure_never_uses_its_empty_local_meter(
     child = tree.nodes[1].run
     pause = await store.get_pause_state(child.id)
     assert child.status == "paused" and pause["pause_message"] == "managed_usage_unknown"
+
+
+def unknown_response():
+    result = response(None)
+    result.usage.usage_reported = False
+    result.usage.cost_unknown = True
+    return result
+
+
+async def resume_unknown(root, store, result, *, streaming=False):
+    pending = await RunStore(store).get_pending(result.run_id, tenant_id=None)
+    if streaming:
+        async with root.resume_stream(
+            result.run_id, tenant_id=None, expected_pause_id=pending.pause_id
+        ) as stream:
+            _ = [event async for event in stream]
+        return stream.result
+    return await root.submit_resume(
+        result.run_id, tenant_id=None, expected_pause_id=pending.pause_id
+    )
+
+
+@pytest.mark.parametrize("known_unpriced", [False, True])
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_finished_child_usage_fault_is_adopted_but_known_unpriced_is_not(
+    store, known_unpriced, streaming
+):
+    child_response = response(None) if known_unpriced else unknown_response()
+    root, root_llm, _, child_llm = agents(
+        store,
+        [response(9, "child"), response()],
+        [child_response],
+        Budget(max_cost_usd=10, on_exceed="pause"),
+    )
+    if streaming:
+        async with root.stream("go") as stream:
+            _ = [event async for event in stream]
+        result = stream.result
+    else:
+        result = await root.run("go")
+    assert child_llm.calls == 1
+    if known_unpriced:
+        assert result.status == RunStatus.SUCCESS and root_llm.calls == 2
+        assert (await store.subtree_usage(result.run_id)).unpriced_calls == 1
+        return
+    assert result.status == RunStatus.PAUSED and root_llm.calls == 1
+    tree = await store.get_subtree(result.run_id)
+    child = tree.nodes[1].run
+    assert child.status == "success"
+    for run_id in (child.id, result.run_id):
+        fault = (await store.get_loop_state(run_id))["managed_usage_unknown"]
+        assert fault == {"code": "managed_usage_unknown", "origin_run_id": child.id}
+    assert (await store.get_pause_state(result.run_id))["pause_message"] == "managed_usage_unknown"
+    raised, raised_llm, _, replay_child = agents(
+        store, [response()], [], Budget(max_cost_usd=20, on_exceed="pause")
+    )
+    resumed = await resume_unknown(raised, store, result, streaming=streaming)
+    assert resumed.status == RunStatus.SUCCESS
+    assert raised_llm.calls == 1 and replay_child.calls == 0
+
+
+@pytest.mark.parametrize("cut", ["before_adoption", "after_claim", "after_completion"])
+async def test_unknown_child_outcome_survives_adoption_crashes(store, engine, monkeypatch, cut):
+    from sqlalchemy import select
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from dendrux.db.models import AgentRun
+    from dendrux.runtime import _managed
+    from tests.integration.test_managed_recovery import ProcessDeathError, fresh_store
+
+    root, _, _, _ = agents(
+        store,
+        [response(9, "child")],
+        [unknown_response()],
+        Budget(max_cost_usd=10, on_exceed="pause"),
+    )
+    target = "adopt" if cut == "before_adoption" else "complete_adoption"
+    original = getattr(_managed, target)
+
+    async def die(*args, **kwargs):
+        if cut == "after_completion":
+            await original(*args, **kwargs)
+        raise ProcessDeathError
+
+    monkeypatch.setattr(_managed, target, die)
+    with pytest.raises(ProcessDeathError):
+        await root.run("go")
+    monkeypatch.setattr(_managed, target, original)
+    async with AsyncSession(engine) as session:
+        root_id = await session.scalar(select(AgentRun.id).where(AgentRun.parent_run_id.is_(None)))
+    if cut != "before_adoption":
+        from tests._helpers.recovery_checkpoint import expire
+
+        await expire(store, engine, root_id)
+    async with fresh_store(engine) as restarted:
+        recovered, llm, _, child_llm = agents(
+            restarted, [response()], [], Budget(max_cost_usd=10, on_exceed="pause")
+        )
+        paused = await recovered.reclaim(root_id, tenant_id=None)
+        assert paused.status == RunStatus.PAUSED and llm.calls == child_llm.calls == 0
+        assert (await restarted.get_pause_state(root_id))[
+            "pause_message"
+        ] == "managed_usage_unknown"
+        raised, raised_llm, _, child_llm = agents(
+            restarted, [response()], [], Budget(max_cost_usd=20, on_exceed="pause")
+        )
+        resumed = await resume_unknown(raised, restarted, paused)
+        assert resumed.status == RunStatus.SUCCESS
+        assert raised_llm.calls == 1 and child_llm.calls == 0
+        assert (await restarted.subtree_usage(root_id)).llm_calls == 3
+
+
+@pytest.mark.parametrize("exhausted", [False, True])
+async def test_grandchild_fault_propagates_through_intermediate_outcome(store, exhausted):
+    def build(limit, root_responses, child_responses, grand_responses):
+        grand = Agent(
+            name="grand",
+            description="Grandchild",
+            prompt="Work",
+            provider=_CostReportingLLM(grand_responses),
+        )
+        child = Agent(
+            name="child",
+            description="Child",
+            prompt="Work",
+            provider=_CostReportingLLM(child_responses),
+            subagents=[grand],
+            max_iterations=1 if exhausted else 10,
+        )
+        return Agent(
+            name="root",
+            prompt="Lead",
+            provider=_CostReportingLLM(root_responses),
+            subagents=[child],
+            state_store=store,
+            strict_tenancy=False,
+            budget=Budget(max_cost_usd=limit, on_exceed="pause"),
+        )
+
+    to_grand = LLMResponse(
+        tool_calls=[ToolCall(name="grand", params={"task": "work"})], usage=response().usage
+    )
+    root = build(
+        10, [response(9, "child"), response()], [to_grand, response()], [unknown_response()]
+    )
+    paused = await root.run("go")
+    assert paused.status == RunStatus.PAUSED and root.provider.calls == 1
+    tree = await store.get_subtree(paused.run_id)
+    child, grand = tree.nodes[1].run, tree.nodes[2].run
+    assert grand.status == "success"
+    active = paused.run_id if exhausted else child.id
+    fault = (await store.get_loop_state(active))["managed_usage_unknown"]
+    assert fault == {"code": "managed_usage_unknown", "origin_run_id": grand.id}
+    raised = build(20, [response()], [response()], [])
+    resumed = await resume_unknown(raised, store, paused)
+    assert resumed.status == RunStatus.SUCCESS
+
+
+@pytest.mark.parametrize("fault", ["write", "read"])
+async def test_observed_final_child_fault_is_sticky_even_if_parent_read_is_healthy(
+    store, monkeypatch, fault
+):
+    from dendrux.errors import PersistenceError
+    from dendrux.runtime.context import get_delegation_context
+
+    root, root_llm, _, child_llm = agents(
+        store,
+        [response(9, "child"), response()],
+        [response()],
+        Budget(max_cost_usd=10, on_exceed="pause"),
+    )
+    original_write, original_read = store.save_llm_interaction, store.subtree_usage
+
+    async def write(*args, **kwargs):
+        ctx = get_delegation_context()
+        if fault == "write" and ctx and ctx.delegation_level == 1:
+            raise PersistenceError()
+        return await original_write(*args, **kwargs)
+
+    async def read(*args, **kwargs):
+        ctx = get_delegation_context()
+        if fault == "read" and child_llm.calls and ctx and ctx.delegation_level == 1:
+            raise PersistenceError()
+        return await original_read(*args, **kwargs)
+
+    monkeypatch.setattr(store, "save_llm_interaction", write)
+    monkeypatch.setattr(store, "subtree_usage", read)
+    result = await root.run("go")
+    assert result.status == RunStatus.PAUSED and root_llm.calls == 1
+    assert (await store.get_pause_state(result.run_id))["pause_message"] == "managed_usage_unknown"
+
+
+@pytest.mark.parametrize("faulty", [False, True])
+async def test_adoption_fault_read_query_cost(store, engine, monkeypatch, capsys, faulty):
+    import json
+
+    from sqlalchemy import event
+
+    from dendrux.db.models import AgentRun
+    from dendrux.types import generate_ulid
+
+    if engine.dialect.name == "postgresql":
+        async with engine.begin() as connection:
+            await connection.execute(
+                AgentRun.__table__.insert(),
+                [{"id": generate_ulid(), "agent_name": "history"} for _ in range(10000)],
+            )
+    original = store.get_loop_state
+    reads = []
+
+    async def read(run_id):
+        statements = []
+
+        def capture(connection, cursor, statement, parameters, context, many):
+            statements.append((statement, parameters))
+
+        event.listen(engine.sync_engine, "before_cursor_execute", capture)
+        try:
+            result = await original(run_id)
+        finally:
+            event.remove(engine.sync_engine, "before_cursor_execute", capture)
+        reads.append((run_id, statements))
+        return result
+
+    monkeypatch.setattr(store, "get_loop_state", read)
+    root, _, _, _ = agents(
+        store,
+        [response(9, "child"), response()],
+        [unknown_response() if faulty else response()],
+        Budget(max_cost_usd=10, on_exceed="pause"),
+    )
+    result = await root.run("go")
+    child = (await store.get_subtree(result.run_id)).nodes[1].run
+    adoption_reads = [statements for run_id, statements in reads if run_id == child.id]
+    assert len(adoption_reads) == 1 and len(adoption_reads[0]) == 1
+    plans = []
+    if engine.dialect.name == "postgresql":
+        async with engine.connect() as connection:
+            for statement, parameters in adoption_reads[0]:
+                plan = await connection.exec_driver_sql(
+                    "EXPLAIN (ANALYZE, BUFFERS) " + statement, parameters
+                )
+                plans = [row[0] for row in plan]
+    with capsys.disabled():
+        print(
+            json.dumps(
+                {
+                    "operation": "adoption_fault_read",
+                    "backend": engine.dialect.name,
+                    "faulty": faulty,
+                    "extra_selects": 1,
+                    "plan": plans,
+                }
+            )
+        )
+
+
+async def test_fault_measurement_query_cost(store, engine, monkeypatch, capsys):
+    import json
+    from collections import Counter
+
+    from sqlalchemy import event
+
+    from dendrux.loops._budget import BudgetTracker
+
+    measurements = []
+    original = BudgetTracker._measure
+
+    async def measured(tracker):
+        statements = []
+
+        def capture(connection, cursor, statement, parameters, context, many):
+            statements.append(statement.split()[0])
+
+        event.listen(engine.sync_engine, "before_cursor_execute", capture)
+        try:
+            result = await original(tracker)
+        finally:
+            event.remove(engine.sync_engine, "before_cursor_execute", capture)
+        measurements.append(
+            {"unknown": tracker._shared_unknown, "statements": dict(Counter(statements))}
+        )
+        return result
+
+    monkeypatch.setattr(BudgetTracker, "_measure", measured)
+    root, _, _, _ = agents(
+        store,
+        [response(9, "child"), response()],
+        [unknown_response()],
+        Budget(max_cost_usd=10, on_exceed="pause"),
+    )
+    result = await root.run("go")
+    assert result.status == RunStatus.PAUSED
+    assert any(m["unknown"] for m in measurements)
+    with capsys.disabled():
+        print(
+            json.dumps(
+                {
+                    "operation": "fault_measurements",
+                    "backend": engine.dialect.name,
+                    "measurements": measurements,
+                }
+            )
+        )
+
+
+async def test_failed_fault_checkpoint_cannot_let_parent_continue_on_a_partial_total(
+    store, engine, monkeypatch, capsys
+):
+    import json
+
+    from sqlalchemy import event
+
+    from dendrux.errors import PersistenceError
+    from dendrux.runtime import _managed_budget
+    from dendrux.runtime.context import get_delegation_context
+
+    observations = []
+    original_fault = _managed_budget.completed_fault
+
+    async def observed_fault(*args, **kwargs):
+        statements = []
+
+        def capture(connection, cursor, statement, parameters, context, many):
+            statements.append(statement.split()[0])
+
+        event.listen(engine.sync_engine, "before_cursor_execute", capture)
+        try:
+            result = await original_fault(*args, **kwargs)
+        finally:
+            event.remove(engine.sync_engine, "before_cursor_execute", capture)
+        observations.append(statements)
+        return result
+
+    monkeypatch.setattr(_managed_budget, "completed_fault", observed_fault)
+    original = store.checkpoint_step
+
+    async def checkpoint(run_id, **kwargs):
+        ctx = get_delegation_context()
+        if ctx and ctx.delegation_level == 1 and kwargs["loop_state"].get("managed_usage_unknown"):
+            raise PersistenceError()
+        return await original(run_id, **kwargs)
+
+    monkeypatch.setattr(store, "checkpoint_step", checkpoint)
+    root, llm, _, _ = agents(
+        store,
+        [response(9, "child"), response()],
+        [unknown_response()],
+        Budget(max_cost_usd=10, on_exceed="pause"),
+    )
+    result = await root.run("go")
+    assert result.status == RunStatus.PAUSED and llm.calls == 1
+    assert (await store.get_pause_state(result.run_id))["pause_message"] == "managed_usage_unknown"
+    assert observations == [["SELECT", "SELECT"]]
+    with capsys.disabled():
+        print(
+            json.dumps(
+                {
+                    "operation": "failed_marker_adoption",
+                    "backend": engine.dialect.name,
+                    "extra_selects": 2,
+                }
+            )
+        )
+    raised, _, _, _ = agents(store, [response()], [], Budget(max_cost_usd=20, on_exceed="pause"))
+    assert (await resume_unknown(raised, store, result)).status == RunStatus.SUCCESS
