@@ -42,6 +42,8 @@ class Scope:
     kind: Literal["module", "function", "class", "comprehension"]
     parent: Scope | None = None
     bindings: dict[str, set[Binding]] = field(default_factory=dict)
+    global_names: set[str] = field(default_factory=set)
+    nonlocal_names: set[str] = field(default_factory=set)
 
     def add(self, name: str, binding: Binding) -> None:
         self.bindings.setdefault(name, set()).add(binding)
@@ -57,7 +59,27 @@ class Scope:
 
     def find(self, name: str) -> Scope | None:
         """The scope whose binding of ``name`` is visible here (None if unbound)."""
-        return next((s for s in self._chain() if name in s.bindings), None)
+        chain = self._chain()
+        for i, scope in enumerate(chain):
+            if name in scope.global_names:
+                return chain[-1] if name in chain[-1].bindings else None
+            if name in scope.nonlocal_names:
+                return next(
+                    (s for s in chain[i + 1 :] if s.kind == "function" and name in s.bindings),
+                    None,
+                )
+            if name in scope.bindings:
+                return scope
+        return None
+
+    def declared(self, name: str) -> bool:
+        """Whether lookup of ``name`` follows a global or nonlocal declaration."""
+        for scope in self._chain():
+            if name in scope.global_names or name in scope.nonlocal_names:
+                return True
+            if name in scope.bindings:
+                break
+        return False
 
     def resolve(self, name: str) -> Binding | None:
         """The one binding of ``name`` visible here; None when unbound or ambiguous."""
@@ -169,8 +191,8 @@ class _Collector(ast.NodeVisitor):
         self.module = module
         self.package = package
         self.direct = {id(stmt) for stmt in body}
-        self.global_names: set[str] = set()
-        self.nonlocal_names: set[str] = set()
+        self.global_names = scope.global_names
+        self.nonlocal_names = scope.nonlocal_names
 
     def _bind(self, name: str, binding: Binding) -> None:
         """Bind ``name`` where Python does: here, or the module / enclosing function it declares."""

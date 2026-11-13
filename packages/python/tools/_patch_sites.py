@@ -87,7 +87,7 @@ def _api(call: ast.Call, scope: Scope) -> str | None:
         return _AMBIGUOUS if hit else None
     (binding,) = candidates
     api = _binding_api(head, tail, binding)
-    helper = binding.kind == "import" and binding.relative and bool(call.args)
+    helper = binding.kind == "import" and binding.relative
     if api is None and helper and text.rsplit(".", 1)[-1] in _PATCH_NAMES:
         return _AMBIGUOUS  # a project helper that may wrap a patch API: cannot be resolved
     return api
@@ -115,6 +115,9 @@ def _alias_site(call: ast.Call, target: ast.expr, attr: str, scope: Scope) -> Pa
     head, _, tail = text.partition(".")
     found = scope.find(head)
     if found is None:
+        if scope.declared(head):
+            note = f"line {call.lineno}: declared target {head!r} is unbound; review it"
+            return PatchSite("unresolved", text, attr, target, call.lineno, scope, note)
         return None  # not a name of this file at all
     binding = scope.resolve(head)
     if binding is None:
@@ -125,6 +128,11 @@ def _alias_site(call: ast.Call, target: ast.expr, attr: str, scope: Scope) -> Pa
     if binding.kind != "import":
         if not scope.hides_import(head):
             return None  # an object patch (a class, a local), not a module alias
+        if scope.declared(head):
+            note = (
+                f"line {call.lineno}: declared target {head!r} is not a resolved import; review it"
+            )
+            return PatchSite("unresolved", text, attr, target, call.lineno, scope, note)
         note = f"line {call.lineno}: target {head!r} is shadowed by a local name; left"
         return PatchSite("shadowed", text, attr, target, call.lineno, scope, note)
     if not binding.value:

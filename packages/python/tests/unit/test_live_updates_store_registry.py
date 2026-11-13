@@ -3,6 +3,7 @@
 import gc
 import inspect
 import warnings
+from unittest.mock import Mock
 
 import pytest
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -57,8 +58,11 @@ async def test_closed_and_collected_stores_do_not_count(monkeypatch):
     collections = []
     real_collect = gc.collect
     monkeypatch.setattr(gc, "collect", lambda *a: collections.append(1) or real_collect(*a))
+    freeze = Mock()
+    unfreeze = Mock()
+    monkeypatch.setattr(gc, "freeze", freeze)
+    monkeypatch.setattr(gc, "unfreeze", unfreeze)
     batch = _live_registry.MANY_STORES_THRESHOLD // 2  # live at once: well below the warning
-    frozen_before = gc.get_freeze_count()
     # One full collection per batch (a handful in all), not one per store: the cost stays
     # bounded without changing any process-wide collector state.
     engine = create_async_engine("postgresql+asyncpg:///registry_collection_test")
@@ -76,8 +80,9 @@ async def test_closed_and_collected_stores_do_not_count(monkeypatch):
     assert not stray, texts(stray)
     assert not any(_live_registry._open_stores.values())
     assert len(collections) <= 160 // batch + 1  # bounded: one collection per batch
-    assert gc.get_freeze_count() == frozen_before  # process-wide collector state untouched
     await engine.dispose()
+    freeze.assert_not_called()
+    unfreeze.assert_not_called()
 
 
 @pytest.mark.parametrize(
