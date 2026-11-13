@@ -263,7 +263,7 @@ class BudgetTracker:
     @property
     def action(self) -> str:
         """The effective ``on_exceed`` action (``"warn"`` when not enforced)."""
-        if self._shared_unknown:
+        if self._shared_unknown and self._configured_action() != "warn":
             return "pause"
         return self._configured_action()
 
@@ -449,7 +449,6 @@ class BudgetTracker:
             return []
         usage = await self._measure()
         if self._shared_unknown:
-            _codes.log_code(logger, _codes.MANAGED_USAGE_UNKNOWN, run_id=self._run_id)
             self._last = [
                 BudgetBreach(
                     TOKENS if budget.max_tokens else COST_USD,

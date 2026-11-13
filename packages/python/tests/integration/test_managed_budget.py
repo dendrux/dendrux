@@ -901,3 +901,74 @@ async def test_failed_fault_checkpoint_cannot_let_parent_continue_on_a_partial_t
         )
     raised, _, _, _ = agents(store, [response()], [], Budget(max_cost_usd=20, on_exceed="pause"))
     assert (await resume_unknown(raised, store, result)).status == RunStatus.SUCCESS
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("action", ["warn", "pause", "cancel"])
+@pytest.mark.parametrize("fault", ["read", "invalid_rollup", "invalid_usage", "propagated"])
+async def test_unknown_usage_obeys_root_enforcement_policy(
+    store, monkeypatch, caplog, streaming, action, fault
+):
+    from collections import Counter
+
+    from dendrux.loops._budget import BudgetTracker
+    from dendrux.runtime.state import UsageRollup
+
+    first = response(9, "child")
+    if fault == "invalid_usage":
+        first.usage = unknown_response().usage
+    root, root_llm, _, child_llm = agents(
+        store,
+        [first, response()],
+        [unknown_response() if fault == "propagated" else response()],
+        Budget(max_cost_usd=10, on_exceed=action),
+    )
+    observations = Counter()
+    original_evaluate = BudgetTracker.evaluate
+    original_read = store.subtree_usage
+    failed_read = False
+
+    async def evaluate(tracker, iteration):
+        result = await original_evaluate(tracker, iteration)
+        if tracker._shared_unknown:
+            observations[tracker._run_id] += 1
+        return result
+
+    async def unknown(*args, **kwargs):
+        nonlocal failed_read
+        if failed_read:
+            return await original_read(*args, **kwargs)
+        failed_read = True
+        if fault == "read":
+            raise RuntimeError("SENTINEL-shared-read")
+        return UsageRollup(known_cost_usd=float("nan"))
+
+    monkeypatch.setattr(BudgetTracker, "evaluate", evaluate)
+    if fault in {"read", "invalid_rollup"}:
+        monkeypatch.setattr(store, "subtree_usage", unknown)
+    if streaming:
+        async with root.stream("go") as stream:
+            _ = [event async for event in stream]
+        result = stream.result
+    else:
+        result = await root.run("go")
+    if action == "warn":
+        assert result.status == RunStatus.SUCCESS
+        assert root_llm.calls == 2 and child_llm.calls == 1
+    else:
+        assert result.status == RunStatus.PAUSED
+        assert (await store.get_pause_state(result.run_id))[
+            "pause_message"
+        ] == "managed_usage_unknown"
+        assert root_llm.calls == (fault in {"invalid_usage", "propagated"})
+        assert child_llm.calls == (fault == "propagated")
+    marker = (await store.get_loop_state(result.run_id))["managed_usage_unknown"]
+    tree = await store.get_subtree(result.run_id)
+    origin = tree.nodes[1].run.id if fault == "propagated" else result.run_id
+    assert marker == {"code": "managed_usage_unknown", "origin_run_id": origin}
+    logs = Counter(
+        r.run_id for r in caplog.records if getattr(r, "code", None) == "managed_usage_unknown"
+    )
+    assert logs == observations
+    assert observations[result.run_id] > 0
+    assert "SENTINEL" not in caplog.text

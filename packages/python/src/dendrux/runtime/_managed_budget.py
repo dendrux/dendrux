@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 import math
 import re
+import sys
+from asyncio import CancelledError
 from copy import copy
 from dataclasses import dataclass, replace
 from functools import wraps
@@ -20,6 +22,7 @@ from dendrux.errors import (
     GovernanceMismatchError,
     ManagedStateError,
     PersistenceError,
+    RunFencedError,
 )
 from dendrux.loops._budget import BudgetTracker, breach_payload
 from dendrux.loops.react import MANAGED_HANDOFF_KEY
@@ -136,11 +139,11 @@ async def hold_fault(recorder: Any, fault: Any = None) -> None:
     """Fence the first observed fault before a terminal outcome can become adoptable."""
     state = recorder._loop_state
     marker = usage_fault(fault or state.get(UNKNOWN), recorder._run_id)
+    _codes.log_code(logger, _codes.MANAGED_USAGE_UNKNOWN, run_id=recorder._run_id)
     if state.get(UNKNOWN) == marker:
         return
     state[UNKNOWN] = marker
     state.pop(ACCEPTED, None)
-    _codes.log_code(logger, _codes.MANAGED_USAGE_UNKNOWN, run_id=recorder._run_id)
     await recorder._checkpoint()
 
 
@@ -274,10 +277,24 @@ async def record_interaction(recorder: Any, write: Callable[[], Coroutine[Any, A
         await retry_transient_db(write, label="save_llm_interaction", run_id=recorder._run_id)
         completed = True
     finally:
+        failure = sys.exception()
         managed = "managed" in recorder._loop_state
-        if not completed and managed and getattr(recorder, "_managed_policy", None) is not None:
+        if (
+            not completed
+            and not isinstance(failure, (CancelledError, RunFencedError))
+            and managed
+            and getattr(recorder, "_managed_policy", None) is not None
+        ):
             recorder._managed_usage_failed = True
-            await hold_fault(recorder)
+            try:
+                await hold_fault(recorder)
+            except CancelledError:
+                failure = None
+                raise
+            finally:
+                # A secondary checkpoint error must not replace the failed evidence write.
+                if failure is not None:
+                    raise failure
 
 
 async def admission(recorder: Any, result: RunResult) -> RunResult | None:

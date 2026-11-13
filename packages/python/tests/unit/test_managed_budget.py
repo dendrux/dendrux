@@ -146,3 +146,129 @@ def test_reclaim_is_not_an_acknowledgement():
     tracker = SimpleNamespace(_invalid_usage=True)
     accept_paused_fault(recorder, tracker)
     assert tracker._invalid_usage and recorder._loop_state["managed_usage_unknown"] == marker
+
+
+@pytest.mark.parametrize("failure_kind", ["write", "fenced", "cancelled"])
+@pytest.mark.parametrize("secondary", [RuntimeError, OSError])
+async def test_record_failure_preserves_original_and_skips_checkpoint_on_cancellation(
+    failure_kind, secondary
+):
+    import asyncio
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from dendrux.errors import PersistenceError, RunFencedError
+    from dendrux.runtime._managed_budget import record_interaction
+
+    failure = {
+        "write": PersistenceError(),
+        "fenced": RunFencedError("01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+        "cancelled": asyncio.CancelledError(),
+    }[failure_kind]
+    recorder = SimpleNamespace(
+        _run_id="01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        _loop_state={"managed": {}},
+        _managed_policy=Budget(max_tokens=100),
+        _checkpoint=AsyncMock(side_effect=secondary("SENTINEL-secondary-checkpoint")),
+    )
+
+    async def failed():
+        raise failure
+
+    with pytest.raises(type(failure)) as caught:
+        await record_interaction(recorder, failed)
+    assert caught.value is failure
+    if failure_kind != "write":
+        recorder._checkpoint.assert_not_awaited()
+    else:
+        recorder._checkpoint.assert_awaited_once()
+        assert recorder._managed_usage_failed
+
+
+@pytest.mark.parametrize("phase", ["write", "checkpoint"])
+async def test_task_cancellation_propagates_without_starting_another_write(phase):
+    import asyncio
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from dendrux.errors import PersistenceError
+    from dendrux.runtime._managed_budget import record_interaction
+
+    started = asyncio.Event()
+
+    async def wait_for_cancellation():
+        started.set()
+        await asyncio.Event().wait()
+
+    recorder = SimpleNamespace(
+        _run_id="01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        _loop_state={"managed": {}},
+        _managed_policy=Budget(max_tokens=100),
+        _checkpoint=AsyncMock(
+            side_effect=wait_for_cancellation
+            if phase == "checkpoint"
+            else RuntimeError("SENTINEL-cancelled-checkpoint")
+        ),
+    )
+
+    async def write():
+        if phase == "checkpoint":
+            raise PersistenceError()
+        await wait_for_cancellation()
+
+    task = asyncio.create_task(record_interaction(recorder, write))
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert recorder._checkpoint.await_count == (phase == "checkpoint")
+
+
+async def test_warn_fault_remains_enforced_after_binding_a_new_policy():
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from dendrux.loops._budget import BudgetTracker
+    from dendrux.runtime._managed_budget import bind
+    from dendrux.types import UsageStats
+
+    run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+    marker = {"code": "managed_usage_unknown", "origin_run_id": run_id}
+    recorder = SimpleNamespace(
+        _run_id=run_id,
+        _loop_state={"managed": {"root_run_id": run_id}, "managed_usage_unknown": marker},
+        _managed_policy=Budget(max_tokens=100, on_exceed="warn"),
+        _checkpoint=AsyncMock(),
+    )
+    for action in ("warn", "pause"):
+        recorder._managed_policy = Budget(max_tokens=100, on_exceed=action)
+        tracker = BudgetTracker(
+            recorder._managed_policy,
+            run_id=run_id,
+            usage=UsageStats(),
+            recorder=None,
+            notifier=None,
+            warnings=[],
+        )
+        bind(recorder, tracker)
+        actual, breaches = await tracker.checkpoint(1)
+        assert actual == action
+        assert bool(breaches) == (action == "pause")
+        assert recorder._loop_state["managed_usage_unknown"] == marker
+
+
+async def test_fault_is_logged_even_when_its_checkpoint_fails(caplog):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from dendrux.errors import PersistenceError
+    from dendrux.runtime._managed_budget import hold_fault
+
+    run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+    recorder = SimpleNamespace(
+        _run_id=run_id, _loop_state={}, _checkpoint=AsyncMock(side_effect=PersistenceError())
+    )
+    with pytest.raises(PersistenceError):
+        await hold_fault(recorder)
+    records = [r for r in caplog.records if getattr(r, "code", None) == "managed_usage_unknown"]
+    assert len(records) == 1 and records[0].run_id == run_id
