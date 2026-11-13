@@ -334,25 +334,28 @@ def _header(node: ast.ClassDef) -> list[str]:
     ]
 
 
+def _identifier_of(n: ast.AST) -> list[str | None]:
+    """The identifiers one node binds or names (Python may mangle any of them)."""
+    if isinstance(n, ast.Name):
+        return [n.id]
+    if isinstance(n, ast.Attribute):
+        return [n.attr]
+    if isinstance(n, ast.arg):
+        return [n.arg]
+    if isinstance(n, ast.keyword):
+        return [n.arg]
+    if isinstance(n, ast.alias):
+        return [n.asname or n.name.split(".")[0]]
+    if isinstance(n, (*_FUNCTIONS, ast.ClassDef, ast.ExceptHandler, ast.MatchAs, ast.MatchStar)):
+        return [n.name]
+    if isinstance(n, ast.Global | ast.Nonlocal):
+        return list(n.names)
+    return []
+
+
 def _identifiers(node: ast.AST) -> list[str]:
     """Every identifier Python may mangle or bind inside ``node``."""
-    out: list[str] = []
-    for n in ast.walk(node):
-        if isinstance(n, ast.Name):
-            out.append(n.id)
-        elif isinstance(n, ast.Attribute):
-            out.append(n.attr)
-        elif isinstance(n, ast.arg) or isinstance(n, ast.keyword) and n.arg:
-            out.append(n.arg)
-        elif isinstance(n, ast.alias):
-            out.append(n.asname or n.name.split(".")[0])
-        elif isinstance(n, (*_FUNCTIONS, ast.ClassDef)):
-            out.append(n.name)
-        elif isinstance(n, ast.ExceptHandler | ast.MatchAs | ast.MatchStar) and n.name:
-            out.append(n.name)
-        elif isinstance(n, ast.Global | ast.Nonlocal):
-            out.extend(n.names)
-    return out
+    return [i for n in ast.walk(node) for i in _identifier_of(n) if i]
 
 
 def _class_scope_names(cls: ast.ClassDef) -> set[str]:
