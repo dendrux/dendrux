@@ -24,6 +24,7 @@ import pytest
 from dendrux._lifecycle import CancelReason, StoredEventType
 from dendrux.errors import (
     ManagedChildControlError,
+    ManagedStateError,
     PersistenceError,
     RunCancelledError,
     RunFencedError,
@@ -66,6 +67,38 @@ managed = contract("managed_subagents", needs=("managed_subagents",), format2=Tr
 managed_crash = contract(
     "managed_subagents", needs=("managed_subagents",), uses=("injector",), format2=True
 )
+
+
+@managed
+async def test_managed_root_cap_and_saturating_count(dendrux_kit: Kit) -> None:
+    kit = dendrux_kit
+    request = await _parent(kit)
+    root = request.root_run_id
+    assert await kit.store.get_managed_run_count(root, limit=128, tenant_id="t") == 1
+    assert await kit.store.get_managed_run_count(root, limit=128, tenant_id=None) is None
+    state = await kit.store.get_loop_state(root)
+    state["managed_limits"] = {"max_managed_runs": 1}
+    await kit.store.checkpoint_step(
+        root, claim_epoch=0, loop_state=state, pii_mapping=None, trace=None
+    )
+    before = await _snapshot(kit.store, root)
+    with pytest.raises(ManagedStateError) as error:
+        await kit.store.bind_managed_child(request)
+    assert error.value.code == "managed_run_limit"
+    assert await _snapshot(kit.store, root) == before
+
+
+@managed
+async def test_managed_count_replay_and_legacy_exclusion(dendrux_kit: Kit) -> None:
+    kit = dendrux_kit
+    request = await _parent(kit)
+    root = request.root_run_id
+    await kit.store.create_run(ulid(), "legacy", tenant_id="t", parent_run_id=root)
+    await kit.store.bind_managed_child(request)
+    assert await kit.store.get_managed_run_count(root, limit=128, tenant_id="t") == 2
+    assert await kit.store.get_managed_run_count(root, limit=1, tenant_id="t") == 1
+    assert (await kit.store.bind_managed_child(request)).outcome == "existing"
+    assert await kit.store.get_managed_run_count(root, limit=128, tenant_id="t") == 2
 
 
 async def _parent(kit: Kit, tenant: str | None = "t") -> BindManagedChildRequest:

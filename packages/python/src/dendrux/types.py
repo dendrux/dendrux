@@ -1103,6 +1103,10 @@ class Limits:
             Default 16 MiB.
         max_pause_summary_bytes: Maximum JSON bytes in a saved human-input display
             summary. Default 64 KiB; 128 bytes to 512 KiB. Excess text is truncated.
+        max_managed_runs: Most managed runs per root, including the root and
+            completed children. Default 128; positive integers only.
+        max_subagent_definitions: Most expanded definition nodes, including the
+            root and repeated paths. Default 256; positive integers only.
         max_rebuild_rows: Most expanded entries in a recovered conversation.
             Default 20,000.
 
@@ -1118,9 +1122,13 @@ class Limits:
     max_rebuild_bytes: int = 16 * _MIB
     max_rebuild_rows: int = 20_000
     max_pause_summary_bytes: int = 65536
+    max_managed_runs: int = field(default=128, kw_only=True)
+    max_subagent_definitions: int = field(default=256, kw_only=True)
 
     def __post_init__(self) -> None:
         _validate_pause_summary_limit(self.max_pause_summary_bytes)
+        _validate_managed_limit(self.max_managed_runs, "max_managed_runs")
+        _validate_managed_limit(self.max_subagent_definitions, "max_subagent_definitions")
         for name in (
             "max_tool_result_bytes",
             "max_input_bytes",
@@ -1135,6 +1143,12 @@ class Limits:
                 if name in {"max_pending_calls", "max_rebuild_bytes", "max_rebuild_rows"}:
                     _codes.log_code(logger, _codes.INVALID_LIMIT, run_id=None)
                 raise ValueError(f"Limits {name} must be a positive int, got {value!r}.")
+
+
+def _validate_managed_limit(value: int, name: str) -> None:
+    if type(value) is not int or value < 1:
+        _codes.log_code(logger, _codes.INVALID_LIMIT, run_id=None)
+        raise InputValidationError(name, "invalid_limit")
 
 
 def _validate_pause_summary_limit(value: int) -> None:

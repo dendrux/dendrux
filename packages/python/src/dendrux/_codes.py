@@ -958,6 +958,14 @@ MANAGED_STATE_INVALID = Code(
     "Persisted managed-subagent state is malformed, missing or inconsistent.",
     "Do not recreate the child; inspect the run's binding and resolve the workflow.",
 )
+MANAGED_RUN_LIMIT = Code(
+    "managed_run_limit",
+    logging.WARNING,
+    "subagent",
+    _BASE_FIELDS | frozenset([]),
+    "Managed run admission reached its root cap or could not establish its scope.",
+    "Use a positive root max_managed_runs cap and resolve inconsistent membership.",
+)
 LEASE_INTERVAL = Code(
     "lease_interval",
     logging.WARNING,
@@ -2197,6 +2205,7 @@ REGISTRY = MappingProxyType(
             MANAGED_PAUSE_ID_REQUIRED,
             MANAGED_RESULT_REFUSED,
             MANAGED_STATE_INVALID,
+            MANAGED_RUN_LIMIT,
             CHECKPOINT_TOO_LARGE,
             REWRITE_INVALID,
             WRITE_CONFLICT,
