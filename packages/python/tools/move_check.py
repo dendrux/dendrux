@@ -103,15 +103,55 @@ def _is_docstring(node: ast.stmt) -> bool:
     )
 
 
-def _is_type_checking_imports(node: ast.stmt) -> bool:
-    """``if TYPE_CHECKING:`` whose body only imports; the only guard ignored."""
+def _bindings_of(tree: ast.AST, name: str) -> int:
+    """How many times ``name`` is bound anywhere in the tree (any scope; conservative)."""
+    count = 0
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            count += node.id == name and not isinstance(node.ctx, ast.Load)
+        elif isinstance(node, ast.alias):
+            count += (node.asname or node.name.split(".")[0]) == name
+        elif isinstance(node, (*_FUNCTIONS, ast.ClassDef)):
+            count += node.name == name
+        elif isinstance(node, ast.arg):
+            count += node.arg == name
+        elif isinstance(node, ast.ExceptHandler | ast.MatchAs | ast.MatchStar):
+            count += node.name == name
+        elif isinstance(node, ast.Global | ast.Nonlocal):
+            count += name in node.names
+    return count
+
+
+def _typing_guards(tree: ast.Module) -> frozenset[str]:
+    """Spellings of ``typing.TYPE_CHECKING`` in this module: bound once, from ``typing``."""
+    out: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, ast.ImportFrom) and node.module == "typing" and not node.level:
+            for a in node.names:
+                if a.name == "TYPE_CHECKING" and _bindings_of(tree, a.asname or a.name) == 1:
+                    out.add(a.asname or a.name)
+        elif isinstance(node, ast.Import):
+            for a in node.names:
+                local = a.asname or a.name
+                if a.name == "typing" and _bindings_of(tree, local) == 1:
+                    out.add(f"{local}.TYPE_CHECKING")
+    return frozenset(out)
+
+
+def _dotted_name(node: ast.expr) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+        return f"{node.value.id}.{node.attr}"
+    return None
+
+
+def _is_type_checking_imports(node: ast.stmt, guards: Collection[str]) -> bool:
+    """``if TYPE_CHECKING:`` (the real ``typing`` one) whose body only imports; the only
+    guard ignored. Any other test is executable code and is compared."""
     if not isinstance(node, ast.If) or node.orelse:
         return False
-    test = node.test
-    named = (isinstance(test, ast.Name) and test.id == "TYPE_CHECKING") or (
-        isinstance(test, ast.Attribute) and test.attr == "TYPE_CHECKING"
-    )
-    return named and all(isinstance(n, _IMPORTS) for n in node.body)
+    return _dotted_name(node.test) in guards and all(isinstance(n, _IMPORTS) for n in node.body)
 
 
 def _target_names(node: ast.stmt) -> list[str] | None:
@@ -134,11 +174,28 @@ def _target_names(node: ast.stmt) -> list[str] | None:
     return names
 
 
-def _has_effect(expr: ast.expr | None) -> bool:
-    return expr is not None and any(
-        isinstance(n, ast.Call | ast.Await | ast.Yield | ast.YieldFrom | ast.NamedExpr)
-        for n in ast.walk(expr)
-    )
+def _is_plain(expr: ast.expr | None) -> bool:
+    """A literal, a name, a dotted name, or a tuple/list/set/dict of those: no user code runs."""
+    if expr is None or isinstance(expr, ast.Constant | ast.Name):
+        return True
+    if isinstance(expr, ast.Attribute):
+        base: ast.expr = expr
+        while isinstance(base, ast.Attribute):
+            base = base.value
+        return isinstance(base, ast.Name)
+    if isinstance(expr, ast.UnaryOp):
+        return (
+            isinstance(expr.op, ast.USub | ast.UAdd)
+            and isinstance(expr.operand, ast.Constant)
+            and isinstance(expr.operand.value, int | float | complex)
+        )
+    if isinstance(expr, ast.Tuple | ast.List | ast.Set):
+        return all(_is_plain(e) for e in expr.elts)
+    if isinstance(expr, ast.Dict):
+        return all(k is not None and _is_plain(k) for k in expr.keys) and all(
+            _is_plain(v) for v in expr.values
+        )
+    return False
 
 
 def _literal_strings(expr: ast.expr | None) -> list[str] | None:
@@ -151,8 +208,9 @@ def _literal_strings(expr: ast.expr | None) -> list[str] | None:
 
 def _module_items(tree: ast.Module, *, is_old: bool, allow_effects: Collection[str]) -> list[_Item]:
     items: list[_Item] = []
+    guards = _typing_guards(tree)
     for i, node in enumerate(tree.body):
-        if isinstance(node, _IMPORTS) or _is_type_checking_imports(node):
+        if isinstance(node, _IMPORTS) or _is_type_checking_imports(node, guards):
             continue
         if i == 0 and _is_docstring(node):
             continue
@@ -165,7 +223,9 @@ def _module_items(tree: ast.Module, *, is_old: bool, allow_effects: Collection[s
             value = getattr(node, "value", None)
             if key == "__all__" and not is_old and _literal_strings(value) is not None:
                 continue  # a destination module's own export list is its business
-            safe = not _has_effect(value) or set(names) <= set(allow_effects)
+            annotation = getattr(node, "annotation", None)
+            plain = _is_plain(value) and _is_plain(annotation)
+            safe = plain or set(names) <= set(allow_effects)
             items.append(_Item(key, _dump(node), node, safe and key != "__all__"))
         else:
             items.append(_Item(f"<{type(node).__name__}>", _dump(node), node, False))
@@ -222,7 +282,12 @@ def _place(
             )
             continue
         for (_, o), n in zip(olds, news, strict=True):
-            if o.dump is not None and o.dump != n.dump:
+            if type(o.node) is not type(n.node):
+                report.problems.append(
+                    f"changed: {label}{key} in {name} was {type(o.node).__name__} at base, "
+                    f"is {type(n.node).__name__} now (statement kind changed)"
+                )
+            elif o.dump is not None and o.dump != n.dump:
                 report.problems.append(
                     f"changed: {label}{key} in {name}\n"
                     + _unified(label + key, o.dump, n.dump or "")
@@ -269,6 +334,99 @@ def _header(node: ast.ClassDef) -> list[str]:
     ]
 
 
+def _identifiers(node: ast.AST) -> list[str]:
+    """Every identifier Python may mangle or bind inside ``node``."""
+    out: list[str] = []
+    for n in ast.walk(node):
+        if isinstance(n, ast.Name):
+            out.append(n.id)
+        elif isinstance(n, ast.Attribute):
+            out.append(n.attr)
+        elif isinstance(n, ast.arg) or isinstance(n, ast.keyword) and n.arg:
+            out.append(n.arg)
+        elif isinstance(n, ast.alias):
+            out.append(n.asname or n.name.split(".")[0])
+        elif isinstance(n, (*_FUNCTIONS, ast.ClassDef)):
+            out.append(n.name)
+        elif isinstance(n, ast.ExceptHandler | ast.MatchAs | ast.MatchStar) and n.name:
+            out.append(n.name)
+        elif isinstance(n, ast.Global | ast.Nonlocal):
+            out.extend(n.names)
+    return out
+
+
+def _class_scope_names(cls: ast.ClassDef) -> set[str]:
+    """Names bound directly in a class body (not inside methods)."""
+    names: set[str] = set()
+    stack: list[ast.AST] = list(cls.body)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (*_FUNCTIONS, ast.ClassDef)):
+            names.add(node.name)
+            continue
+        if isinstance(node, ast.Lambda):
+            continue
+        if isinstance(node, ast.Name) and not isinstance(node.ctx, ast.Load):
+            names.add(node.id)
+        elif isinstance(node, ast.alias):
+            names.add(node.asname or node.name.split(".")[0])
+        elif isinstance(node, ast.ExceptHandler | ast.MatchAs | ast.MatchStar) and node.name:
+            names.add(node.name)
+        stack.extend(ast.iter_child_nodes(node))
+    return names
+
+
+def _header_reads(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
+    """Names read when ``def`` runs in the class body: decorators, defaults, annotations."""
+    exprs: list[ast.expr | None] = [*fn.decorator_list, *fn.args.defaults, *fn.args.kw_defaults]
+    every = [*fn.args.posonlyargs, *fn.args.args, *fn.args.kwonlyargs]
+    every += [a for a in (fn.args.vararg, fn.args.kwarg) if a is not None]
+    exprs += [a.annotation for a in every]
+    exprs.append(fn.returns)
+    return {
+        n.id
+        for e in exprs
+        if e is not None
+        for n in ast.walk(e)
+        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)
+    }
+
+
+def _class_dependence(
+    fn: ast.FunctionDef | ast.AsyncFunctionDef, class_names: Collection[str], host: Collection[str]
+) -> str | None:
+    """Why moving ``fn`` out of its class could change what it does (None: nothing found).
+
+    Python compiles a method against its class: the ``__class__`` cell (zero-argument ``super()``),
+    name mangling of ``__private`` identifiers, and class-body names read by decorators,
+    defaults and annotations. Moving it to another class changes all three, so such a method
+    needs manual review. ``host`` is what the mixin body binds before the method.
+    """
+    for n in ast.walk(fn):
+        if (
+            isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Name)
+            and n.func.id == "super"
+            and not n.args
+            and not n.keywords
+        ):
+            return "zero-argument super()"
+    names = _identifiers(fn)
+    if "__class__" in names:
+        return "__class__"
+    mangled = next((n for n in names if n.startswith("__") and not n.endswith("__")), None)
+    if mangled:
+        return f"private name {mangled} (Python mangles it per class)"
+    read = sorted(_header_reads(fn) & set(class_names) - set(host))
+    if read:
+        return f"decorator, default or annotation reads class-body name {read[0]}"
+    return None
+
+
+def _class_scope_names_of_item(node: ast.stmt) -> set[str]:
+    return _class_scope_names(ast.ClassDef("_", [], [], [node], []))
+
+
 def _compare_class(
     old: ast.ClassDef,
     new: ast.ClassDef,
@@ -313,6 +471,20 @@ def _compare_class(
     for key, name in where.items():
         if name != "<class>":
             report.moved[f"{old.name}.{key}"] = owner[name]
+    class_names = _class_scope_names(old)
+    for name, items in containers.items():
+        if name == "<class>":
+            continue
+        bound: set[str] = set()
+        for it in items:
+            if isinstance(it.node, _FUNCTIONS) and where.get(it.key) == name:
+                why = _class_dependence(it.node, class_names, bound)
+                if why:
+                    report.problems.append(
+                        f"unsafe: {old.name}.{it.key} moved to mixin {name} but depends on its "
+                        f"class ({why}); manual review is needed"
+                    )
+            bound |= _class_scope_names_of_item(it.node)
 
 
 def _find_hosts(
@@ -470,10 +642,9 @@ def check_move(
         for old_node, new_node in zip(olds, news, strict=False):
             if isinstance(old_node, ast.ClassDef) and isinstance(new_node, ast.ClassDef):
                 _compare_class(old_node, new_node, where[key], hosts, used, report)
-    if old_key in trees:
-        _check_exports(
-            report, old_tree, trees[old_key], report.moved, modules or {}, require_reexports
-        )
+    if old_key in trees or require_reexports:  # a deleted old module has no facade at all
+        now = trees.get(old_key) or ast.Module(body=[], type_ignores=[])
+        _check_exports(report, old_tree, now, report.moved, modules or {}, require_reexports)
     return report
 
 
