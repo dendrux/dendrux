@@ -402,3 +402,97 @@ async def test_managed_bind_contenders_have_one_creator(dendrux_kit: Kit) -> Non
     loser = candidate if winner is request else request
     assert await store.get_run(loser.child_run_id) is None
     await _bound(store, winner)
+
+
+@managed
+async def test_managed_cancel_projection_is_scoped_ordered_and_bounded(dendrux_kit: Kit) -> None:
+    store = dendrux_kit.store
+    getter = getattr(store, "get_managed_cancel_children_page", None)
+    assert callable(getter), "managed stores must expose the public projected cancel page"
+    request = await _parent(dendrux_kit)
+    await store.bind_managed_child(request)
+    legacy = ulid()
+    await store.create_run(legacy, "legacy", parent_run_id=request.parent_run_id, tenant_id="t")
+    page = await getter([request.parent_run_id] * 2, after=None, limit=1, tenant_id="t")
+    assert len(page) == 1
+    following = await getter([request.parent_run_id], after=page[-1][0], limit=1, tenant_id="t")
+    complete = page + following
+    assert [row[0] for row in complete] == sorted([request.child_run_id, legacy])
+    assert all(row[1] == request.parent_run_id for row in complete)
+    values = {row[0]: row[2] for row in complete}
+    header = ManagedHeader.from_dict(values[request.child_run_id], run_id=request.child_run_id)
+    assert header.root_run_id == request.root_run_id
+    assert values[legacy] is None
+    assert await getter([request.parent_run_id], after=None, limit=500, tenant_id="foreign") == []
+    assert await getter([request.parent_run_id], after=None, limit=500, tenant_id=None) == []
+    assert await getter([], after=None, limit=500, tenant_id="t") == []
+    with pytest.raises(ValueError):
+        await getter([request.parent_run_id], after=None, limit=0, tenant_id="t")
+
+
+@managed
+async def test_managed_cancel_controls_stop_on_root_and_missing_own(dendrux_kit: Kit) -> None:
+    store = dendrux_kit.store
+    stopped = getattr(store, "is_managed_root_stopped", None)
+    control = getattr(store, "get_managed_run_control", None)
+    assert callable(stopped) and callable(control), (
+        "managed stores must expose public control reads"
+    )
+    request = await _parent(dendrux_kit)
+    await store.bind_managed_child(request)
+    child, root = request.child_run_id, request.root_run_id
+    assert not await stopped(child)
+    own = await store.get_run_control(child)
+    assert await control(child) == own
+    assert await store.request_pause(child)
+    await store.add_note(child, text="kit note", note_id=ulid(), tenant_id="t", claim_epoch=0)
+    own = await store.get_run_control(child)
+    combined = await control(child)
+    assert combined == own and combined.pause_requested and combined.has_pending_notes
+    await store.mark_cancel_requested([root], tenant_id=request.tenant_id)
+    assert await stopped(child)
+    assert (await control(child)).cancel_requested
+    assert not (await store.get_run_control(child)).cancel_requested
+    assert await store.finalize_run_if_status_in(
+        root, status=RunStatus.CANCELLED.value, allowed_current_statuses=[RunStatus.PAUSED.value]
+    )
+    assert not (await store.get_run(root)).cancel_requested
+    assert await stopped(child) and (await control(child)).cancel_requested
+    missing = ulid()
+    assert await stopped(missing), "missing own row must fail closed"
+    assert (await control(missing)).cancel_requested
+    foreign = await _parent(dendrux_kit, "foreign")
+    state = await store.get_loop_state(child)
+    for root_id in (foreign.root_run_id, ulid()):
+        state[MANAGED_HEADER_KEY] = ManagedHeader(
+            root_id, ("reviewer",), root, request.tool_call_id
+        ).to_dict()
+        await store.checkpoint_step(
+            child, claim_epoch=0, loop_state=state, pii_mapping=None, trace=None
+        )
+        assert await stopped(child)
+        assert await control(child) == replace(own, cancel_requested=True)
+    live = await _parent(dendrux_kit)
+    await store.bind_managed_child(live)
+    assert await store.request_cancel(live.child_run_id)
+    assert not await stopped(live.child_run_id)
+    assert (await control(live.child_run_id)).cancel_requested
+
+
+@managed
+async def test_managed_cancel_page_caps_a_large_requested_limit(dendrux_kit: Kit) -> None:
+    store = dendrux_kit.store
+    root = await started_run(dendrux_kit)
+    children = []
+    for _ in range(501):
+        child = ulid()
+        await store.create_run(child, "legacy", parent_run_id=root, tenant_id="t")
+        children.append(child)
+    page = await store.get_managed_cancel_children_page(
+        [root], after=None, limit=5000, tenant_id="t"
+    )
+    assert [row[0] for row in page] == sorted(children)[:500]
+    tail = await store.get_managed_cancel_children_page(
+        [root], after=page[-1][0], limit=5000, tenant_id="t"
+    )
+    assert [row[0] for row in tail] == sorted(children)[500:]

@@ -140,7 +140,7 @@ def test_managed_contract_rejects_broken_store(pytester: Pytester, name: str) ->
 
 def test_managed_contract_slice_passes_on_intact_store(pytester: Pytester) -> None:
     intact = run_slice(pytester, NONE, "managed_")
-    intact.assert_outcomes(passed=16)
+    intact.assert_outcomes(passed=19)
     assert "managed_subagents" in intact.stdout.str()
 
 
@@ -174,7 +174,7 @@ def mutate(store):
     return store
 """.replace("PREREQUISITE", repr(prerequisite))
     result = run_slice(pytester, mutation, "managed_")
-    result.assert_outcomes(passed=1, skipped=15)
+    result.assert_outcomes(passed=1, skipped=18)
     assert "managed_subagents" not in result.stdout.str().split("capabilities=")[1].split(")")[0]
 
 
@@ -195,11 +195,11 @@ def mutate(store):
     return store
 """
     result = run_slice(pytester, mutation, "managed_")
-    result.assert_outcomes(passed=1, skipped=15)
+    result.assert_outcomes(passed=1, skipped=18)
     assert "managed_subagents" not in result.stdout.str().split("capabilities=")[1].split(")")[0]
 
 
 def test_managed_fault_cuts_are_reported_uncertified_without_injector(pytester: Pytester) -> None:
     result = run_kit(pytester, injector=None, k="managed_")
-    result.assert_outcomes(passed=11, skipped=5)
+    result.assert_outcomes(passed=14, skipped=5)
     assert "crash recovery: not certified" in result.stdout.str()

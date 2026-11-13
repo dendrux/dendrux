@@ -74,7 +74,6 @@ from dendrux.context_blocks import (
 from dendrux.errors import (
     BlobNotFoundError,
     InvalidImageError,
-    ManagedRootStoppedError,
     RunFencedError,
     RunNotFoundError,
     StoreOutcomeUnknown,
@@ -101,6 +100,13 @@ from dendrux.loops.react import MANAGED_HANDOFF_KEY, ReActLoop
 from dendrux.runtime import _managed, _reclaim
 from dendrux.runtime._entry_checks import resolve_runner_tenant, runner_entry_checks
 from dendrux.runtime._managed import DESCEND_KEY as MANAGED_DESCEND_KEY
+from dendrux.runtime._managed_cancel import (
+    ManagedRootStoppedError,
+    ManagedStopLifecycle,
+)
+from dendrux.runtime._managed_cancel import (
+    stopped_resume_result as _stopped_resume_result,
+)
 from dendrux.runtime._tenant_checks import _tenant_scope_chosen
 from dendrux.runtime._tracelink import validate_trace_link
 from dendrux.runtime.context import (
@@ -394,7 +400,7 @@ async def _record_finished(
 
 
 @dataclass
-class _RunLifecycle:
+class _RunLifecycle(ManagedStopLifecycle):
     run_id: str
     store: StateStore | None
     manager: RunTaskManager | None
@@ -469,23 +475,6 @@ class _RunLifecycle:
             self.recorder_closed = self.notifier_closed = True
             await _finish_fenced_lifecycle(self.run_id, result, open_recorder, open_notifier)
         return result
-
-    async def _stopped(
-        self,
-        stop: ManagedRootStoppedError | RunFencedError,
-        recorder: LoopRecorder | None,
-        notifier: LoopNotifier | None,
-    ) -> RunResult:
-        if isinstance(stop, ManagedRootStoppedError):
-            return await _managed.cancelled_result(
-                self.store,
-                self.run_id,
-                recorder,
-                notifier,
-                recorder_started=self.recorder_started,
-                notifier_started=self.notifier_started,
-            )
-        return await self._fenced(recorder, notifier)
 
     async def _cancel_finish(
         self, recorder: LoopRecorder | None, notifier: LoopNotifier | None, result: RunResult
@@ -7222,25 +7211,6 @@ async def _fenced_resume_result(
     if ctx is not None:
         await _finish_fenced_lifecycle(run_id, result, ctx.recorder, ctx.notifier)
     return result
-
-
-async def _stopped_resume_result(
-    stop: ManagedRootStoppedError | RunFencedError,
-    store: StateStore,
-    run_id: str,
-    ctx: _ResumeContext | None,
-) -> RunResult:
-    if not isinstance(stop, ManagedRootStoppedError):
-        return await _fenced_resume_result(store, run_id, ctx)
-    recorder, notifier = (ctx.recorder, ctx.notifier) if ctx is not None else (None, None)
-    return await _managed.cancelled_result(
-        store,
-        run_id,
-        recorder,
-        notifier,
-        recorder_started=ctx is not None and ctx.recorder_started,
-        notifier_started=ctx is not None and ctx.notifier_started,
-    )
 
 
 _CONTINUATION_BLOCKED = "Run stopped because it contains blocked content."

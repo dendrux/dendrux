@@ -55,13 +55,12 @@ from dendrux._meta_keys import (
 )
 from dendrux.errors import ImagePersistenceUnsupportedError, RunFencedError, safe_exception_info
 from dendrux.loops.base import BaseRecorder
-from dendrux.runtime import _managed
+from dendrux.runtime import _managed_cancel
 from dendrux.runtime._blob_catalog import edges_for_parts, scrub_inline_images
 from dendrux.runtime._cancel_guard import capture
 from dendrux.runtime._capabilities import capabilities
 from dendrux.runtime._clarification import DEFAULT_PAUSE_SUMMARY_BYTES, clarification_summary
 from dendrux.runtime.durability import retry_critical, retry_transient_db
-from dendrux.runtime.state import RunControl, read_run_control
 from dendrux.types import (
     ImagePart,
     ImageRef,
@@ -77,7 +76,7 @@ if TYPE_CHECKING:
 
     from dendrux.guardrails import GuardrailEngine
     from dendrux.media import BlobEdge
-    from dendrux.runtime.state import StateStore, TraceWrite
+    from dendrux.runtime.state import RunControl, StateStore, TraceWrite
     from dendrux.types import (
         AgentStep,
         Limits,
@@ -441,7 +440,7 @@ def _view_identity(entry: dict[str, Any]) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
-class PersistenceRecorder(BaseRecorder):
+class PersistenceRecorder(_managed_cancel.CancelAdmission, BaseRecorder):
     """Authoritative evidence recorder — writes loop events to StateStore.
 
     Fail-closed writes (exceptions propagate to caller):
@@ -934,12 +933,6 @@ class PersistenceRecorder(BaseRecorder):
             trace_kind="rewrite",
         )
 
-    async def on_run_started(
-        self, run_id: str, *, agent_name: str | None = None, agent_model: str | None = None
-    ) -> None:
-        """Check managed root control after creation or continuation claims."""
-        await self._managed_checkpoint(run_id)
-
     async def on_llm_call_started(
         self,
         run_id: str,
@@ -1411,8 +1404,7 @@ class PersistenceRecorder(BaseRecorder):
         from dendrux.errors import PersistenceError
         from dendrux.runtime._blocked_content import _dispatch_write, _DispatchUndecided
 
-        control = await self._managed_checkpoint(run_id)
-        await self._check_custom_dispatch(run_id, control)
+        await self._check_custom_dispatch(run_id, await self._managed_checkpoint(run_id))
         undecided = False
         with _dispatch_write(self._store, run_id):
             try:
@@ -1425,20 +1417,6 @@ class PersistenceRecorder(BaseRecorder):
         if undecided:
             raise PersistenceError()
 
-    async def _managed_checkpoint(self, run_id: str) -> RunControl | None:
-        return await _managed.checkpoint(
-            self._store_calls,
-            run_id,
-            self._loop_state,
-            claim_epoch=getattr(self._store, "claim_epoch", None),
-        )
-
-    async def _admission_control(self, run_id: str) -> RunControl:
-        control = await self._managed_checkpoint(run_id)
-        if control is None:
-            control = await read_run_control(self._store_calls, run_id)
-        return control
-
     async def _check_custom_dispatch(self, run_id: str, control: RunControl | None = None) -> None:
         from dendrux.guardrails._engine import _entry_engine
         from dendrux.loops._helpers import _check_blocked_run
@@ -1449,8 +1427,7 @@ class PersistenceRecorder(BaseRecorder):
         if not native and guarded and hasattr(self._store, "add_note"):
             # Custom stores have no mark predicate on the dispatch write: a guarded
             # run reads the mark when notes are pending. Guardrail-free runs add no read.
-            if control is None:
-                control = await self._admission_control(run_id)
+            control = await self._admission_control(run_id, control)
             if control.has_pending_notes:
                 await _check_blocked_run(self._store, run_id)
 
@@ -1932,7 +1909,7 @@ async def adopt_managed_result(
             "duration_ms": report.duration_ms,
             "child_run_id": child_run_id,
             "agent_path": list(agent_path),
-            "managed_outcome": _managed.outcome_code(report),
+            "managed_outcome": _managed_cancel.outcome_code(report),
             **({"code": report.meta["code"]} if "code" in report.meta else {}),
         },
         call_id,

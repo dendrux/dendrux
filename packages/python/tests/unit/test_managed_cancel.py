@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from dendrux.errors import ManagedStateError
-from dendrux.runtime._managed import (
+from dendrux.runtime._managed_cancel import (
     LegacyCancelPages,
     ManagedCancelPages,
     cancel_child_id,
@@ -52,7 +52,9 @@ async def test_legacy_traversal_does_not_require_a_managed_header(
 
 
 async def test_filtered_page_keeps_raw_continuation_without_any_managed_ids() -> None:
-    store = SimpleNamespace(_get_cancel_children_page=AsyncMock(return_value=[(CHILD, ROOT, None)]))
+    store = SimpleNamespace(
+        get_managed_cancel_children_page=AsyncMock(return_value=[(CHILD, ROOT, None)])
+    )
     page = await ManagedCancelPages(store, ROOT).read([ROOT], after=None, limit=1, tenant_id=None)
     assert page.run_ids == () and page.after == CHILD and page.has_more
 
@@ -113,3 +115,52 @@ async def test_legacy_snapshot_cancel_preserves_depth_order_and_bound(case: str)
     assert levels == expected
     assert truncated is (case == "truncated")
     store.get_subtree.assert_awaited_once_with(ROOT, tenant_id=None)
+
+
+async def test_fenced_lifecycle_keeps_ordinary_fenced_settlement() -> None:
+    from dendrux.errors import RunFencedError
+    from dendrux.runtime._managed_cancel import ManagedStopLifecycle
+    from dendrux.types import RunResult, RunStatus
+
+    expected = RunResult(run_id=ROOT, status=RunStatus.CANCELLED)
+    lifecycle = SimpleNamespace(_fenced=AsyncMock(return_value=expected))
+    recorder, notifier = object(), object()
+    result = await ManagedStopLifecycle._stopped(
+        lifecycle, RunFencedError(ROOT, claim_epoch=1), recorder, notifier
+    )
+    assert result is expected
+    lifecycle._fenced.assert_awaited_once_with(recorder, notifier)
+
+
+@pytest.mark.parametrize(
+    ("header", "expected"),
+    [(None, False), ({"v": 1}, False), ({"invocation": {"parent_run_id": PARENT}}, True)],
+)
+async def test_child_control_detection_keeps_legacy_children_distinct(
+    header: Any, expected: bool
+) -> None:
+    from dendrux.runtime._managed_cancel import managed_child_header
+
+    store = SimpleNamespace(get_loop_state=AsyncMock(return_value={"managed": header}))
+    found = await managed_child_header(store, SimpleNamespace(id=CHILD, parent_run_id=PARENT))
+    assert found is expected
+
+
+@pytest.mark.parametrize("stopped", [False, True])
+async def test_child_entry_uses_persisted_stop_before_binding(stopped: bool) -> None:
+    from dendrux.errors import RunCancelledError
+    from dendrux.runtime._managed_cancel import enter_child
+    from dendrux.runtime.state import RunControl
+
+    store = SimpleNamespace(
+        get_managed_run_control=AsyncMock(return_value=RunControl(cancel_requested=stopped))
+    )
+    invocation = SimpleNamespace(parent_run_id=PARENT, child_run_id=CHILD, root_run_id=ROOT)
+    if stopped:
+        with pytest.raises(RunCancelledError) as refused:
+            await enter_child(invocation, store)
+        assert refused.value.run_id == CHILD
+        assert refused.value.parent_run_id == ROOT
+    else:
+        assert await enter_child(invocation, store) is False
+    store.get_managed_run_control.assert_awaited_once_with(PARENT)

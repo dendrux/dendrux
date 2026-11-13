@@ -1946,6 +1946,15 @@ TOOL_REPLAYED = Code(
     "Monitor repeated worker crashes and tool idempotence.",
 )
 
+CASCADE_CHILD_SKIPPED = Code(
+    "cascade_child_skipped",
+    logging.WARNING,
+    "runtime",
+    _BASE_FIELDS,
+    "Cancellation skips a child whose managed header is malformed.",
+    "Repair the child's managed state and repeat cancellation from the root.",
+)
+
 CASCADE_TRUNCATED = Code(
     "cascade_truncated",
     logging.WARNING,
@@ -2019,6 +2028,7 @@ REGISTRY = MappingProxyType(
             MCP_OBSERVER_DISPOSE_FAILED,
             MCP_OAUTH_CLOSE_FAILED,
             MCP_CLEANUP_FAILED,
+            CASCADE_CHILD_SKIPPED,
             CASCADE_TRUNCATED,
             LEGACY_RUN,
             NOT_RUNNING,

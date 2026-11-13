@@ -214,10 +214,6 @@ class RunCancelledError(_KwargsReduceMixin, RunControlError):
         super().__init__(f"Run '{run_id}' cannot start under parent '{parent_run_id}'.")
 
 
-class ManagedRootStoppedError(RunCancelledError):
-    """Managed execution reached a checkpoint after its root stopped."""
-
-
 class ManagedChildControlError(_KwargsReduceMixin, RunControlError):
     """A managed subagent run was controlled directly (0.7).
 

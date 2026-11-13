@@ -43,9 +43,8 @@ from dendrux._lifecycle import TERMINAL_STATUSES as _TERMINAL_STATUSES
 from dendrux._lifecycle import WAITING_STATUSES as _WAITING_STATUS_VALUES
 from dendrux._sentinel import _OMITTED, _OmittedType, _UnsetType
 from dendrux.media._store import DEFAULT_GC_AGE, DEFAULT_GC_LIMIT
-from dendrux.runtime import _managed
+from dendrux.runtime import _managed, _managed_cancel
 from dendrux.runtime._blob_catalog import MIN_GC_AGE
-from dendrux.runtime._bounds import MAX_SMALL_PAGE
 from dendrux.runtime._continuation_guardrails import _continuation_projection
 from dendrux.runtime._entry_checks import entry_checks, require_boolean
 from dendrux.runtime._limit_checks import (
@@ -60,8 +59,6 @@ from dendrux.skills._internal import is_script, validate_executor
 from dendrux.skills._session import NAMES, SkillSession, continuation, current
 from dendrux.tool import get_tool_def, is_tool
 from dendrux.types import ULID_CHARS, RunStatus
-
-_CANCEL_OUTCOME_LIMIT = 999
 
 DEFAULT_MAX_ITERATIONS = 10
 DEFAULT_TOOL_THREADS_PER_AGENT = 8
@@ -184,9 +181,8 @@ async def _require_run_in_scope(store: StateStore, run_id: str, tenant_id: Tenan
 async def _refuse_managed_child(store: StateStore, record: Any) -> None:
     """Direct control of a managed subagent run is refused, after the tenant check (0.7)."""
     from dendrux.errors import ManagedChildControlError
-    from dendrux.runtime._managed import managed_child_header
 
-    if await managed_child_header(store, record):
+    if await _managed_cancel.managed_child_header(store, record):
         raise ManagedChildControlError(record.id)
 
 
@@ -1889,7 +1885,6 @@ class Agent:
         through adoption to the root, which returns its result or the next
         external pause.
         """
-        from dendrux.runtime import _managed
 
         found = await _managed.route(self, store, run_id, tenant_id=tenant_id)
         if adopt_terminal:
@@ -2602,8 +2597,9 @@ class Agent:
         ``cascade_truncated``. Legacy custom stores without frontier methods
         retain snapshot semantics. Per-run outcomes are listed in
         ``meta["cascade"]`` as ``{"run_id", "outcome"}`` with outcome
-        ``cancelled`` (finalized now), ``cancel_requested`` (running;
-        stops at its next checkpoint) or ``terminal``.
+        ``cancelled`` (finalized now), ``cancel_requested`` (running; stops at its
+        next checkpoint), ``terminal``, or ``skipped`` (corrupt header, also setting
+        ``meta["cascade_truncated"]``).
 
         ``tenant_id``: when given, ``run_id`` must belong to exactly that
         tenant (``None`` = untenanted) or ``RunNotFoundError`` is raised,
@@ -2643,11 +2639,11 @@ class Agent:
         record = await store.get_run(run_id)
         if record is None or not _in_tenant_scope(record, tenant_id):
             raise RunNotFoundError(run_id)
-        cascade, pages = await _managed.cancel_scope(store, record, cascade=cascade)
+        cascade, pages = await _managed_cancel.cancel_scope(store, record, cascade=cascade)
         outcomes: list[dict[str, str]] = []
         cascade_count = 0
         to_signal: list[str] = []
-        frontier_signals = cascade and _managed.can_mark_cancel(store)
+        frontier_signals = cascade and _managed_cancel.can_mark_cancel(store)
         try:
             traversal_truncated = False
             if cascade:
@@ -2699,21 +2695,11 @@ class Agent:
         frontier_signals: bool,
         outcomes: list[dict[str, str]],
         to_signal: list[str],
-        pages: _managed.CancelPageReader | None = None,
+        pages: _managed_cancel.CancelPageReader | None = None,
     ) -> tuple[int, bool]:
-        levels, truncated = await self._mark_cancel_subtree(
-            store, run_id, tenant_id=tenant_id, pages=pages
+        return await _managed_cancel.cancel_descendants(
+            self, store, run_id, tenant_id, frontier_signals, outcomes, to_signal, pages
         )
-        count = 0
-        descendants = (rid for level in reversed(levels) for rid in level if rid != run_id)
-        for rid in descendants:
-            outcome = await self._cancel_one(store, rid, signal=False)
-            if outcome != "terminal" and not frontier_signals:
-                to_signal.append(rid)
-            count += 1
-            if len(outcomes) < _CANCEL_OUTCOME_LIMIT:
-                outcomes.append({"run_id": rid, "outcome": outcome})
-        return count, truncated
 
     async def _mark_cancel_subtree(
         self,
@@ -2721,58 +2707,11 @@ class Agent:
         run_id: str,
         *,
         tenant_id: str | None,
-        pages: _managed.CancelPageReader | None = None,
+        pages: _managed_cancel.CancelPageReader | None = None,
     ) -> tuple[list[list[str]], bool]:
-        from dendrux.types import Budget
-
-        limit = self._budget.max_subtree_nodes if self._budget else Budget.max_subtree_nodes
-        if not _managed.can_mark_cancel(store):
-            # Legacy custom stores retain their snapshot API and admission semantics.
-            levels, truncated = await _managed.legacy_cancel_levels(store, run_id, tenant_id, limit)
-        else:
-            mark = require_store_method(store, "mark_cancel_requested")
-            pages = pages or _managed.LegacyCancelPages(store)
-            levels = [[run_id]]
-            visited = {run_id}
-            frontier = levels[0]
-            truncated = False
-            while frontier:
-                # Wait for creators holding parent FOR SHARE before scanning committed children.
-                marked = await mark(frontier, tenant_id=tenant_id)
-                if marked:
-                    for rid in frontier:
-                        self._task_manager.cancel(rid)
-                if truncated:
-                    break
-                following: list[str] = []
-                after = None
-                while True:
-                    page = await pages.read(
-                        frontier, after=after, limit=MAX_SMALL_PAGE, tenant_id=tenant_id
-                    )
-                    for child in page.run_ids:
-                        if child in visited:
-                            continue
-                        if len(visited) >= limit:
-                            truncated = True
-                            break
-                        visited.add(child)
-                        following.append(child)
-                    if truncated or not page.has_more:
-                        break
-                    after = page.after
-                if following:
-                    levels.append(following)
-                frontier = following
-        if truncated:
-            _codes.log_code(
-                _agent_logger,
-                _codes.CASCADE_TRUNCATED,
-                run_id=run_id,
-                limit=limit,
-                count=sum(len(level) for level in levels),
-            )
-        return levels, truncated
+        return await _managed_cancel.mark_subtree(
+            self, store, run_id, tenant_id=tenant_id, pages=pages
+        )
 
     async def _cancel_one(self, store: StateStore, run_id: str, *, signal: bool = True) -> str:
         """Cancel one run: set the flag, CAS-finalize it if paused, signal in-process."""

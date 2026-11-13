@@ -444,6 +444,24 @@ async def test_prerequisites_are_required_for_the_managed_capability():
         async def bind_managed_child(self, request):
             raise AssertionError("never called")
 
+        async def get_managed_cancel_children_page(self, parents, *, after, limit, tenant_id):
+            raise AssertionError("never called")
+
+        async def is_managed_root_stopped(self, run_id):
+            raise AssertionError("never called")
+
+        async def get_managed_run_control(self, run_id):
+            raise AssertionError("never called")
+
+        async def get_run_control(self, run_id):
+            raise AssertionError("never called")
+
+        async def mark_cancel_requested(self, parents, *, tenant_id):
+            raise AssertionError("never called")
+
+        async def get_children_page(self, parents, *, after, limit, tenant_id):
+            raise AssertionError("never called")
+
     store = Partial()
     validate_capabilities(store)  # an existing narrowing must not break construction
     with pytest.raises(StoreCapabilityError) as refused:

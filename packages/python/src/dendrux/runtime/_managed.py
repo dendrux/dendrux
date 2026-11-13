@@ -30,30 +30,13 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any
 
 from dendrux import _codes
-from dendrux._lifecycle import (
-    STORAGE_FORMAT_CHECKPOINTED,
-    TERMINAL_STATUSES,
-    CancelReason,
-    StoredEventType,
-)
-from dendrux.errors import (
-    ManagedChildControlError,
-    ManagedRootStoppedError,
-    ManagedStateError,
-    ManagedUnsupportedError,
-    RunCancelledError,
-    RunFencedError,
-    RunNotFoundError,
-)
-from dendrux.runtime.state import (
-    MANAGED_HEADER_KEY,
-    ManagedHeader,
-    RunControl,
-    require_store_method,
-)
+from dendrux._lifecycle import TERMINAL_STATUSES, StoredEventType
+from dendrux.errors import ManagedStateError
+from dendrux.runtime import _managed_cancel
+from dendrux.runtime.state import MANAGED_HEADER_KEY, ManagedHeader
 from dendrux.types import (
     PauseState,
     RunResult,
@@ -61,12 +44,11 @@ from dendrux.types import (
     ToolCall,
     ToolResult,
     UsageStats,
-    _usage_from_dict,
     generate_ulid,
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import Callable
 
     from dendrux.agent import Agent
     from dendrux.loops.base import LoopNotifier, LoopRecorder
@@ -74,112 +56,6 @@ if TYPE_CHECKING:
     from dendrux.types import RunStream
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass(frozen=True)
-class CancelPage:
-    """One normalized frontier page; the cursor advances across filtered-out rows too."""
-
-    run_ids: tuple[str, ...]
-    after: str | None
-    has_more: bool
-
-
-class CancelPageReader(Protocol):
-    """Read bounded child IDs while preserving the underlying keyset cursor."""
-
-    async def read(
-        self,
-        parent_ids: Sequence[str],
-        *,
-        after: str | None,
-        limit: int,
-        tenant_id: str | None,
-    ) -> CancelPage: ...
-
-
-@dataclass(frozen=True)
-class LegacyCancelPages:
-    """Adapt the existing legacy ID page without changing its query or membership."""
-
-    store: Any
-
-    async def read(
-        self,
-        parent_ids: Sequence[str],
-        *,
-        after: str | None,
-        limit: int,
-        tenant_id: str | None,
-    ) -> CancelPage:
-        rows = await self.store.get_children_page(
-            parent_ids, after=after, limit=limit, tenant_id=tenant_id
-        )
-        return CancelPage(tuple(rows), rows[-1] if rows else after, len(rows) >= limit)
-
-
-@dataclass(frozen=True)
-class ManagedCancelPages:
-    """Filter explicit managed edges, retaining the projected page's raw cursor."""
-
-    store: Any
-    root_run_id: str
-
-    async def read(
-        self,
-        parent_ids: Sequence[str],
-        *,
-        after: str | None,
-        limit: int,
-        tenant_id: str | None,
-    ) -> CancelPage:
-        rows = await self.store._get_cancel_children_page(
-            parent_ids, after=after, limit=limit, tenant_id=tenant_id
-        )
-        ids = tuple(child for row in rows if (child := cancel_child_id(row, self.root_run_id)))
-        return CancelPage(ids, rows[-1][0] if rows else after, len(rows) >= limit)
-
-
-def can_mark_cancel(store: Any) -> bool:
-    """Whether cancellation can mark each frontier before scanning its child pages."""
-    return all(
-        callable(getattr(store, name, None))
-        for name in ("mark_cancel_requested", "get_children_page")
-    )
-
-
-async def cancel_scope(
-    store: Any, record: RunRecord, *, cascade: bool
-) -> tuple[bool, CancelPageReader | None]:
-    """Force managed traversal; legacy inclusion is still caller-selected."""
-    if record.storage_format != STORAGE_FORMAT_CHECKPOINTED:
-        return cascade, None
-    getter = getattr(store, "get_loop_state", None)
-    value = (await getter(record.id) or {}).get(MANAGED_HEADER_KEY) if getter else None
-    if value is None:
-        return cascade, None
-    header = ManagedHeader.from_dict(value, run_id=record.id)
-    if header.parent_run_id is not None:
-        raise ManagedChildControlError(record.id)
-    if header.root_run_id != record.id:
-        raise ManagedStateError(reason="header_invalid", run_id=record.id)
-    require_cancellation(store, record.id)
-    pages: CancelPageReader = (
-        LegacyCancelPages(store) if cascade else ManagedCancelPages(store, record.id)
-    )
-    return True, pages
-
-
-def cancel_child_id(item: Any, root_run_id: str) -> str | None:
-    """Filter an explicit managed edge from a bounded projected child page."""
-    run_id, parent_id, value = item
-    if value is None:
-        return None
-    header = ManagedHeader.from_dict(value, run_id=run_id)
-    if header.root_run_id != root_run_id or header.parent_run_id != parent_id:
-        return None
-    return str(run_id)
-
 
 DESCEND_KEY = "managed_descend"
 """``RunResult.meta`` key: the parent exited at a managed handoff (in memory only)."""
@@ -267,7 +143,6 @@ def require_root_entry(agent: Agent, store: StateStore | None, loop: Any) -> Non
     if store is None:
         raise PersistenceNotConfiguredError()
     require_managed_subagents(store)
-    require_cancellation(store)
     if not isinstance(loop, ReActLoop):
         raise ValueError("Managed subagents need a ReAct parent loop.")
     _check_definitions(agent, unclaimed_store(store))
@@ -364,9 +239,7 @@ def parent_link(
 async def enter(agent: Agent, invocation: ManagedInvocation | None, store: Any, loop: Any) -> bool:
     """True for a managed root run; refuse one that cannot run durably."""
     if invocation is not None:
-        if await cancellation_requested(store, invocation.parent_run_id):
-            raise RunCancelledError(invocation.child_run_id, invocation.root_run_id)
-        return False
+        return await _managed_cancel.enter_child(invocation, store)
     if not is_managed_root(agent):
         return False
     require_root_entry(agent, store, loop)
@@ -411,7 +284,7 @@ async def prepare_handoff(
     handoff = result.meta[MANAGED_HANDOFF_KEY]
     # Every bind, live or recovered, admits only a ReAct child (before any effect).
     _require_react(handoff.parent, handoff.child)
-    if await cancellation_requested(store, run_id):
+    if await _managed_cancel.cancellation_requested(store, run_id):
         return None
     header = ManagedHeader.from_dict(
         (getattr(store, "loop_state", None) or {}).get(MANAGED_HEADER_KEY), run_id=run_id
@@ -929,7 +802,7 @@ async def claim_adoption(waiting: _Waiting, store: Any) -> Any:
     from dendrux.runtime.state import ClaimResult, claimed_store
     from dendrux.runtime.submit import claim_managed_adoption
 
-    if await cancellation_requested(store, waiting.parent_run_id):
+    if await _managed_cancel.cancellation_requested(store, waiting.parent_run_id):
         return None
     record = await store.get_run(waiting.child_run_id)
     if record is None:
@@ -1024,15 +897,15 @@ async def route(root_agent: Agent, store: Any, run_id: str, *, tenant_id: Any) -
     is resolved from the registered path in ``root_agent``; a missing path
     refuses before any claim.
     """
+    from dendrux.errors import ManagedChildControlError, RunNotFoundError
     from dendrux.runtime.state import UNSCOPED
 
     record = await store.get_run(run_id)
     if record is None or (tenant_id is not UNSCOPED and record.tenant_id != tenant_id):
         raise RunNotFoundError(run_id)
-    if await managed_child_header(store, record):
+    if await _managed_cancel.managed_child_header(store, record):
         raise ManagedChildControlError(run_id)
-    if record.status not in _TERMINAL_VALUES and await cancellation_requested(store, run_id):
-        raise RunCancelledError(run_id, run_id)
+    await _managed_cancel.route_checkpoint(store, record)
     waiting, leaf = await walk(root_agent, store, run_id)
     leaf_agent = waiting[-1].child if waiting else root_agent
     return Route(run_id, record.tenant_id, tuple(waiting), leaf, leaf_agent)
@@ -1750,124 +1623,3 @@ def _registered(parent: Agent, name: str, parent_run_id: str) -> Agent:
         if child.name == name:
             return child
     raise ManagedStateError(reason="path_missing", run_id=parent_run_id)
-
-
-async def managed_child_header(store: Any, record: RunRecord) -> bool:
-    """True when ``record`` is a managed child (its header names an invocation)."""
-    if getattr(record, "parent_run_id", None) is None:
-        return False
-    header = (await store.get_loop_state(record.id) or {}).get(MANAGED_HEADER_KEY)
-    return isinstance(header, dict) and "invocation" in header
-
-
-async def checkpoint(
-    store: Any, run_id: str, state: dict[str, Any], *, claim_epoch: int | None = None
-) -> RunControl | None:
-    """One managed admission read; None preserves ordinary legacy control reads."""
-    if MANAGED_HEADER_KEY not in state:
-        return None
-    header = ManagedHeader.from_dict(state[MANAGED_HEADER_KEY], run_id=run_id)
-    control = await _managed_control(store, run_id, claim_epoch=claim_epoch)
-    if control.cancel_requested:
-        raise ManagedRootStoppedError(run_id, header.root_run_id)
-    return control
-
-
-async def _managed_control(
-    store: Any, run_id: str, *, claim_epoch: int | None = None
-) -> RunControl:
-    control: RunControl = await require_store_method(store, "_get_managed_run_control")(run_id)
-    if claim_epoch is not None and (
-        control.claim_epoch != claim_epoch or control.status != RunStatus.RUNNING.value
-    ):
-        _codes.log_code(logger, _codes.RUN_FENCED, run_id=run_id)
-        raise RunFencedError(run_id, claim_epoch=claim_epoch)
-    return control
-
-
-async def cancellation_requested(store: Any, run_id: str) -> bool:
-    return (
-        await _managed_control(store, run_id, claim_epoch=getattr(store, "claim_epoch", None))
-    ).cancel_requested
-
-
-async def cancelled_result(
-    store: Any,
-    run_id: str,
-    recorder: Any,
-    notifier: Any,
-    *,
-    recorder_started: bool = False,
-    notifier_started: bool = False,
-) -> RunResult:
-    # Cycle: runner -> _managed -> runner; finalization is defined after runner's imports.
-    # TODO(T5a-F6): move shared terminal-result finalization below both modules to lift this import.
-    from dendrux.runtime.runner import (
-        _finalize_loop_cancelled,
-        _finish_fenced_lifecycle,
-    )
-
-    source = getattr(recorder, "_loop_source", None)
-    data = source() if source is not None else {}
-    state = getattr(recorder, "_loop_state", None) or getattr(store, "loop_state", None) or {}
-    result = RunResult(
-        run_id=run_id,
-        status=RunStatus.CANCELLED,
-        steps=list(data.get("steps", ())),
-        iteration_count=int(state.get("iteration", 0)),
-        usage=replace(data["usage"])
-        if "usage" in data
-        else _usage_from_dict(state.get("usage") or {}),
-    )
-    result = await _finalize_loop_cancelled(
-        store,
-        run_id,
-        result,
-        None,
-        {},
-        [RunStatus.RUNNING.value],
-        {"reason": CancelReason.CANCEL_REQUESTED.value},
-    )
-    await _finish_fenced_lifecycle(
-        run_id,
-        result,
-        recorder if recorder_started else None,
-        notifier if notifier_started else None,
-    )
-    return result
-
-
-def require_cancellation(store: Any, run_id: str | None = None) -> None:
-    for name in (
-        "get_run_control",
-        "mark_cancel_requested",
-        "get_children_page",
-        "_get_cancel_children_page",
-        "_managed_root_stopped",
-        "_get_managed_run_control",
-    ):
-        if not callable(getattr(store, name, None)):
-            raise ManagedUnsupportedError("cancel_store", run_id)
-
-
-def outcome_code(report: ToolResult) -> str:
-    if report.meta.get("code") == CHILD_CANCELLED:
-        return "cancelled"
-    return "succeeded" if report.success else "failed"
-
-
-async def legacy_cancel_levels(
-    store: Any, run_id: str, tenant_id: str | None, limit: int
-) -> tuple[list[list[str]], bool]:
-    subtree = await require_store_method(store, "get_subtree")(run_id, tenant_id=tenant_id)
-    nodes = (
-        sorted(
-            (node for node in subtree.nodes if node.run.id != run_id), key=lambda node: node.depth
-        )
-        if subtree is not None
-        else []
-    )
-    by_depth = {0: [run_id]}
-    for node in nodes[: limit - 1]:
-        by_depth.setdefault(node.depth, []).append(node.run.id)
-    return [by_depth[depth] for depth in sorted(by_depth)], len(nodes) + 1 > limit

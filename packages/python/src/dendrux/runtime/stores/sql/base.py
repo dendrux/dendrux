@@ -42,7 +42,6 @@ from dendrux._meta_keys import (
     STORE_SESSION_KEY,
     TOUCHED_RUNS_SESSION_KEY,
 )
-from dendrux.db.models import AgentRun
 from dendrux.runtime._blob_catalog import SQLBlobCatalog, write_blob_refs
 from dendrux.runtime._bounds import (
     DEFAULT_EVENT_LIMIT,
@@ -92,6 +91,7 @@ if TYPE_CHECKING:
     from sqlalchemy.sql.base import Executable
 
     from dendrux.db._live_updates import LiveUpdates
+    from dendrux.db.models import AgentRun
     from dendrux.media import BlobEdge
     from dendrux.runtime.stores._errors import DbError
     from dendrux.runtime.stores.sql._types import DialectFacts, InsertPlan
@@ -156,6 +156,7 @@ from dendrux.runtime.state import (
     _validate_sweep_age,
     _write_event,
 )
+from dendrux.runtime.stores.sql._managed_reads import ManagedReads
 from dendrux.runtime.stores.sql._types import (
     ConflictSpec,
     PatchLoopState,
@@ -743,7 +744,7 @@ def _validated_store_writes(cls: Any) -> Any:
 
 @safe_database_operations
 @_validated_store_writes
-class SQLStateStore(SQLBlobCatalog):
+class SQLStateStore(ManagedReads, SQLBlobCatalog):
     """Default StateStore implementation using SQLAlchemy async.
 
     Works with SQLite (zero-config) and Postgres (via an explicit engine).
@@ -2884,31 +2885,6 @@ class SQLStateStore(SQLBlobCatalog):
             _raw_driver_errors=True,
         )
 
-    @_safe_database_call
-    async def _get_cancel_children_page(
-        self, parent_ids: Sequence[str], *, after: str | None, limit: int, tenant_id: TenantScope
-    ) -> list[Any]:
-        _positive_page(limit)
-        if not parent_ids:
-            return []
-        page = self.child_page_query(
-            runs=AgentRun.__table__,
-            parents=[RunParentCursor(parent, after) for parent in sorted(set(parent_ids))],
-            tenant_scope=tenant_id,
-            page_size=min(limit, MAX_SMALL_PAGE),
-        ).subquery("cancel_children")
-        statement = (
-            select(
-                AgentRun.id,
-                AgentRun.parent_run_id,
-                self.json_get(AgentRun.loop_state, (MANAGED_HEADER_KEY,), "json"),
-            )
-            .join(page, AgentRun.id == page.c.id)
-            .order_by(AgentRun.id)
-        )
-        async with self._session_factory() as session:
-            return list((await session.execute(statement)).all())
-
     async def get_loop_state(self, run_id: str) -> dict[str, Any] | None:
         """Read the authoritative execution projection."""
         from dendrux.db.models import AgentRun
@@ -3525,87 +3501,9 @@ class SQLStateStore(SQLBlobCatalog):
             _raw_driver_errors=True,
         )
 
-    def _managed_root_key(self, column: Any) -> Any:
-        return self.json_get(column, (MANAGED_HEADER_KEY, "root_run_id"), "str")
-
-    def _managed_stop_predicate(self) -> Any:
-        root = AgentRun.__table__.alias("managed_root")
-        root_id = self._managed_root_key(AgentRun.loop_state)
-        live = (
-            select(root.c.id)
-            .where(
-                root.c.id == root_id,
-                root.c.tenant_id.is_not_distinct_from(AgentRun.tenant_id),
-                root.c.cancel_requested.is_(False),
-                root.c.status.notin_(_TERMINAL_STATUS_VALUES),
-            )
-            .exists()
-        )
-        return and_(root_id.is_not(None), ~live)
-
-    @_safe_database_call
-    async def _managed_root_stopped(self, run_id: str) -> bool:
-        """Read root eligibility without loading either run's history/checkpoint."""
-        async with self._session_factory() as session:
-            return bool(
-                await session.scalar(
-                    select(self._managed_stop_predicate()).where(AgentRun.id == run_id)
-                )
-            )
-
-    def _control_query(self) -> Any:
-        from sqlalchemy import literal
-
-        from dendrux.db.models import RunInbox
-
-        pending = (
-            select(literal(1))
-            .where(RunInbox.run_id == AgentRun.id, RunInbox.delivered_at.is_(None))
-            .exists()
-        )
-        return select(
-            AgentRun.cancel_requested,
-            AgentRun.pause_requested,
-            pending,
-            AgentRun.claim_epoch,
-            AgentRun.status,
-        )
-
     async def get_run_control(self, run_id: str) -> RunControl:
         """One read of cancel / pause flags plus an EXISTS over undelivered notes."""
         return await self._read_control(run_id, self._control_query(), RunControl())
-
-    @_safe_database_call
-    async def _get_managed_run_control(self, run_id: str) -> RunControl:
-        """Read local ownership/control and the same-tenant root stop in one statement."""
-        statement = self._control_query()
-        statement = statement.with_only_columns(
-            AgentRun.cancel_requested | self._managed_stop_predicate(),
-            *tuple(statement.selected_columns)[1:],
-        )
-        return await self._read_control(run_id, statement, RunControl(cancel_requested=True))
-
-    async def _read_control(self, run_id: str, statement: Any, missing: RunControl) -> RunControl:
-        async def _attempt() -> RunControl:
-            async with self._session_factory() as session:
-                row = (await session.execute(statement.where(AgentRun.id == run_id))).first()
-                if row is None:
-                    return missing
-                return RunControl(
-                    cancel_requested=bool(row[0]),
-                    pause_requested=bool(row[1]),
-                    has_pending_notes=bool(row[2]),
-                    claim_epoch=row[3],
-                    status=row[4],
-                )
-
-        return await retry_transient_db(
-            _attempt,
-            label="get_run_control",
-            run_id=run_id,
-            classify=self.classify_db_error,
-            _raw_driver_errors=True,
-        )
 
     async def request_pause(self, run_id: str, *, reason: str | None = None) -> bool:
         """Set ``pause_requested`` on a RUNNING row; status guard in the UPDATE."""

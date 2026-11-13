@@ -40,6 +40,7 @@ from dendrux.runtime._bounds import (
     SWEEP_MAX_RUNS_DEFAULT,
 )
 from dendrux.runtime._bounds import MAX_LIST_OFFSET as MAX_LIST_OFFSET
+from dendrux.runtime._managed_cancel import ManagedStoreCapability
 from dendrux.types import (
     COST_DECIMALS,
     CreateRunResult,
@@ -1573,17 +1574,13 @@ class StateStore(Protocol):
     ) -> list[str]: ...
 
 
-class ManagedStateStore(Protocol):
+class ManagedStateStore(ManagedStoreCapability, Protocol):
     """Internal (0.7): the managed-subagent extension of a store.
 
     Declared by ``StoreCapabilities.managed_subagents``; callers check it with
     ``require_managed_subagents`` before any managed write. Kept apart from
     :class:`StateStore` so stores without the capability stay conforming.
     """
-
-    async def bind_managed_child(
-        self, request: BindManagedChildRequest
-    ) -> BindManagedChildResult: ...
 
 
 _PERSISTED_VALUE_FIELDS = frozenset(

@@ -58,7 +58,15 @@ _REQUIREMENTS: dict[str, dict[str, tuple[str, ...]]] = {
         "reclaim_run": (),
         "get_replayed_tool_calls": (),
     },
-    "managed_subagents": {"bind_managed_child": ()},
+    "managed_subagents": {
+        "bind_managed_child": (),
+        "get_managed_cancel_children_page": ("after", "limit", "tenant_id"),
+        "is_managed_root_stopped": (),
+        "get_managed_run_control": (),
+        "get_run_control": (),
+        "mark_cancel_requested": (),
+        "get_children_page": (),
+    },
 }
 # Managed subagents need every durability promise the bind and adoption rely on.
 _MANAGED_PREREQUISITES = (

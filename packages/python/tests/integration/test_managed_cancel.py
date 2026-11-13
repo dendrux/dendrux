@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from dendrux import Agent
 from dendrux.db.models import AgentRun, TokenUsage, ToolCallRecord
 from dendrux.errors import ManagedChildControlError, RunCancelledError, RunControlError
-from dendrux.runtime import _managed
+from dendrux.runtime import _managed, _managed_cancel
 from dendrux.runtime.persistence import PersistenceRecorder
 from dendrux.runtime.state import claimed_store
 from dendrux.runtime.stores._factory import store_for_engine
@@ -151,8 +151,8 @@ async def test_descendant_checkpoint_reads_persisted_root_stop(store: Any, termi
     if terminal:
         await store.finalize_run(root, status="cancelled")
     assert not (await store.get_run(leaf)).cancel_requested
-    assert await _managed.cancellation_requested(store, leaf)
-    assert await _managed.cancellation_requested(store, child)
+    assert await _managed_cancel.cancellation_requested(store, leaf)
+    assert await _managed_cancel.cancellation_requested(store, child)
 
 
 async def test_marked_parent_refuses_bind_without_orphans(store: Any, engine: Any) -> None:
@@ -531,12 +531,13 @@ async def test_cancelled_root_stops_child_before_tool_admission(
 async def test_managed_store_without_cancel_projection_refuses_before_creation(
     store: Any, engine: Any, monkeypatch: Any
 ) -> None:
-    from dendrux.errors import ManagedUnsupportedError
+    from dendrux.errors import StoreCapabilityError
+    from dendrux.runtime._capabilities import _CACHE
 
-    monkeypatch.setattr(store, "_get_cancel_children_page", None)
-    root = submission_root(store)
-    with pytest.raises(ManagedUnsupportedError):
-        await root.run("go", tenant_id=TENANT)
+    monkeypatch.setattr(store, "get_managed_cancel_children_page", None)
+    _CACHE.pop(id(store), None)
+    with pytest.raises(StoreCapabilityError):
+        await submission_root(store).run("go", tenant_id=TENANT)
     assert await rows(engine, AgentRun) == []
 
 
@@ -623,11 +624,11 @@ async def test_cancel_projection_database_errors_are_safe(
     try:
         with pytest.raises(PersistenceError) as info:
             if read == "root":
-                await store._managed_root_stopped(leaf)
+                await store.is_managed_root_stopped(leaf)
             elif read == "combined_control":
-                await store._get_managed_run_control(leaf)
+                await store.get_managed_run_control(leaf)
             else:
-                await store._get_cancel_children_page(
+                await store.get_managed_cancel_children_page(
                     [root], after=None, limit=500, tenant_id=TENANT
                 )
         assert sentinel not in str(info.value)
@@ -737,9 +738,9 @@ async def test_pg_root_stop_reads_at_most_one_root_row(store: Any, engine: Any, 
     event.listen(engine.sync_engine, "before_cursor_execute", capture)
     try:
         if read == "root":
-            assert await store._managed_root_stopped(bound.child_run_id)
+            assert await store.is_managed_root_stopped(bound.child_run_id)
         else:
-            assert (await store._get_managed_run_control(bound.child_run_id)).cancel_requested
+            assert (await store.get_managed_run_control(bound.child_run_id)).cancel_requested
     finally:
         event.remove(engine.sync_engine, "before_cursor_execute", capture)
     assert len(statements) == 1
@@ -891,7 +892,7 @@ async def test_fix1_resume_stop_closes_started_sinks(
     from types import SimpleNamespace
     from unittest.mock import AsyncMock
 
-    from dendrux.errors import ManagedRootStoppedError
+    from dendrux.runtime._managed_cancel import ManagedRootStoppedError
     from dendrux.runtime.runner import _stopped_resume_result
     from dendrux.runtime.state import ClaimResult
 
@@ -910,3 +911,123 @@ async def test_fix1_resume_stop_closes_started_sinks(
     assert result.status == RunStatus.CANCELLED
     assert recorder.on_run_finished.await_count == int(recorder_started)
     assert notifier.on_run_finished.await_count == int(notifier_started)
+
+
+@pytest.mark.parametrize(
+    "method",
+    [
+        "get_managed_cancel_children_page",
+        "is_managed_root_stopped",
+        "get_managed_run_control",
+        "get_run_control",
+        "mark_cancel_requested",
+        "get_children_page",
+    ],
+)
+async def test_fix2_missing_public_cancel_capability_refuses_before_writes(
+    store: Any, engine: Any, monkeypatch: Any, method: str
+) -> None:
+    from dendrux.errors import StoreCapabilityError
+    from dendrux.runtime._capabilities import _CACHE
+
+    monkeypatch.setattr(store, method, None, raising=False)
+    _CACHE.pop(id(store), None)
+    with pytest.raises(StoreCapabilityError) as refused:
+        await submission_root(store).run("go", tenant_id=TENANT)
+    assert refused.value.capability == "managed_subagents"
+    assert refused.value.method == method
+    assert await rows(engine, AgentRun) == []
+
+
+@pytest.mark.parametrize("cascade", [False, True])
+async def test_fix2_corrupt_sibling_is_skipped_and_reported_on_repeat(
+    store: Any, engine: Any, caplog: Any, cascade: bool
+) -> None:
+    import logging
+
+    root, child, leaf = await chain(store)
+    bad = generate_ulid()
+    sentinel = "SENTINEL-corrupt-managed-header"
+    await store.create_run(bad, "corrupt", parent_run_id=root, tenant_id=TENANT)
+    await store.pause_run(bad, status="paused", pause_data={})
+    async with engine.begin() as conn:
+        await conn.execute(
+            update(AgentRun)
+            .where(AgentRun.id == bad)
+            .values(loop_state={"managed": {"v": 99, "untrusted": sentinel}})
+        )
+    caplog.set_level(logging.WARNING)
+    for _ in range(2):
+        caplog.clear()
+        result = await controller(store).cancel_run(root, cascade=cascade)
+        assert [(await store.get_run(rid)).status for rid in (root, child, leaf)] == [
+            "cancelled",
+            "cancelled",
+            "cancelled",
+        ]
+        assert (await store.get_run(bad)).status == "paused"
+        assert not (await store.get_run(bad)).cancel_requested
+        assert {"run_id": bad, "outcome": "skipped"} in result.meta["cascade"]
+        assert result.meta["cascade_truncated"] is True
+        skipped = [r for r in caplog.records if r.getMessage() == "cascade_child_skipped"]
+        assert len(skipped) == 1 and skipped[0].run_id == bad
+        assert skipped[0].code == "cascade_child_skipped"
+        assert not hasattr(skipped[0], "managed_reason")
+        assert sentinel not in caplog.text and sentinel not in str(result.meta)
+
+
+@pytest.mark.parametrize("bad_count", [1, 10])
+async def test_fix2_skipped_diagnostics_share_the_existing_traversal_bound(
+    store: Any, engine: Any, bad_count: int
+) -> None:
+    root, _, _ = await chain(store)
+    async with engine.begin() as conn:
+        await conn.execute(
+            AgentRun.__table__.insert(),
+            [
+                {
+                    "id": f"{index:026d}",
+                    "agent_name": "corrupt",
+                    "tenant_id": TENANT,
+                    "parent_run_id": root,
+                    "status": "paused",
+                    "loop_state": {"managed": {"v": 99}},
+                }
+                for index in range(1, bad_count + 1)
+            ],
+        )
+    result = await controller(
+        store, budget=Budget(max_tokens=10000, max_subtree_nodes=3)
+    ).cancel_run(root)
+    skipped = [item for item in result.meta["cascade"] if item["outcome"] == "skipped"]
+    assert len(skipped) == min(bad_count, 2)
+    assert result.meta["cascade_count"] + len(skipped) <= 3
+    assert result.meta["cascade_truncated"]
+
+
+async def test_fix2_skipped_outcomes_keep_existing_metadata_cap(store: Any, engine: Any) -> None:
+    root, child, leaf = await chain(store)
+    async with engine.begin() as conn:
+        await conn.execute(
+            AgentRun.__table__.insert(),
+            [
+                {
+                    "id": f"{index:026d}",
+                    "agent_name": "corrupt",
+                    "tenant_id": TENANT,
+                    "parent_run_id": root,
+                    "status": "paused",
+                    "loop_state": {"managed": {"v": 99}},
+                }
+                for index in range(1, 1001)
+            ],
+        )
+    result = await controller(store).cancel_run(root)
+    assert len(result.meta["cascade"]) <= 1000
+    assert len([item for item in result.meta["cascade"] if item["outcome"] == "skipped"]) == 999
+    assert result.meta["cascade_truncated"] is True
+    assert [(await store.get_run(rid)).status for rid in (root, child, leaf)] == [
+        "cancelled",
+        "cancelled",
+        "cancelled",
+    ]
