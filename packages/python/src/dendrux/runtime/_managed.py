@@ -250,12 +250,12 @@ async def enter(agent: Agent, invocation: ManagedInvocation | None, store: Any, 
 def stamp_root_header(store: Any, run_id: str) -> None:
     """Put the root's managed header into the claimed checkpoint before any bind.
 
-    The recorder copies this state, so the header is written with the root's
-    first fenced checkpoint and kept by every later one.
+    The recorder persists this header with the first fenced checkpoint.
     """
     state = getattr(store, "loop_state", None)
     if not isinstance(state, dict):
         raise ManagedStateError(reason="storage_format", run_id=run_id)
+    # TODO(T5c): the root-creation hook must pass Limits for the first checkpoint.
     state[MANAGED_HEADER_KEY] = ManagedHeader(root_run_id=run_id, path=()).to_dict()
 
 
@@ -271,18 +271,12 @@ async def prepare_handoff(
     recorder: LoopRecorder | None,
     provider_kwargs: dict[str, Any] | None,
 ) -> RunResult | None:
-    """Make the parent's checkpoint durable and return the descend marker.
-
-    Returns None when cancellation was requested: the caller finalizes as for
-    any pause. The parent stays RUNNING at its epoch until the child's atomic
-    bind parks it.
-    """
+    """Checkpoint bind admission; return None on cancellation, otherwise the descend marker."""
     from dendrux.loops._helpers import project_message
     from dendrux.loops.react import MANAGED_HANDOFF_KEY
     from dendrux.runtime.context import DelegationDepthExceededError, get_delegation_context
 
     handoff = result.meta[MANAGED_HANDOFF_KEY]
-    # Every bind, live or recovered, admits only a ReAct child (before any effect).
     _require_react(handoff.parent, handoff.child)
     if await _managed_cancel.cancellation_requested(store, run_id):
         return None
@@ -303,6 +297,10 @@ async def prepare_handoff(
         # Durable admission evidence: this call passed validation, policy and
         # approval in a live batch; recovery binds a pending call only with it.
         state[ADMITTED_KEY] = handoff.call.id
+        if header.parent_run_id is None:
+            state.setdefault(
+                "managed_limits", {"max_managed_runs": handoff.parent._limits.max_managed_runs}
+            )
     checkpoint = getattr(recorder, "checkpoint_outcome", None)
     if checkpoint is not None:
         await checkpoint(result, provider_kwargs)

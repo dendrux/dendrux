@@ -51,6 +51,21 @@ class ManagedStoreCapability(Protocol):
         self, request: BindManagedChildRequest
     ) -> BindManagedChildResult: ...
 
+    async def get_managed_run_count(
+        self, root_run_id: str, *, limit: int, tenant_id: str | None
+    ) -> int | None:
+        """Count explicit reachable managed membership, including root and completed runs.
+
+        Return min(count, limit), or None if scope validation is inconclusive.
+        Never infer membership from parent_run_id alone or load histories.
+        Bound child candidates, including legacy rows, to limit+1; exhaustion
+        without a conclusive count returns None.
+        Bind must perform the same bounded count in its root-serialized transaction,
+        after replay detection and before writes. The standalone read is advisory
+        during concurrent binds.
+        """
+        ...
+
     async def get_managed_cancel_children_page(
         self, parent_ids: Sequence[str], *, after: str | None, limit: int, tenant_id: TenantScope
     ) -> list[tuple[str, str | None, Any]]:

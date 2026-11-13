@@ -1,25 +1,182 @@
-"""Read bounded cancellation projections and combined managed control through shared SQL."""
+"""Read bounded managed scope/control and enforce atomic run admission through shared SQL."""
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, cast
+import logging
+from collections import deque
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from sqlalchemy import and_, literal, select
 
+from dendrux import _codes
 from dendrux.db.models import AgentRun, RunInbox
+from dendrux.errors import ManagedStateError, PersistenceError
 from dendrux.runtime._bounds import MAX_SMALL_PAGE
 from dendrux.runtime.durability import _safe_database_call, retry_transient_db
-from dendrux.runtime.state import _TERMINAL_STATUS_VALUES, MANAGED_HEADER_KEY, RunControl
+from dendrux.runtime.state import (
+    _TERMINAL_STATUS_VALUES,
+    MANAGED_HEADER_KEY,
+    ManagedHeader,
+    RunControl,
+)
 from dendrux.runtime.stores.sql._types import RunParentCursor
+from dendrux.types import InputValidationError
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from dendrux.runtime.state import TenantScope
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from dendrux.runtime.state import BindManagedChildRequest, TenantScope
+
+
+def _counted_member(
+    row: Any, root_run_id: str, visited: set[str]
+) -> Literal["member", "other", "invalid"]:
+    if not isinstance(row.header, dict) or row.header.get("root_run_id") != root_run_id:
+        return "other"
+    try:
+        header = ManagedHeader.from_dict(row.header, run_id=row.id)
+    except ManagedStateError:
+        return "invalid"
+    if row.id in visited or header.parent_run_id != row.parent_run_id:
+        return "invalid"
+    return "member"
+
+
+class ManagedRunLimitError(ManagedStateError):
+    """The root cap is exhausted, or bounded membership cannot certify admission."""
+
+    code = "managed_run_limit"
+
+    def __init__(self, *, run_id: str | None = None, reason: str = "wait_invalid") -> None:
+        self.run_id, self.reason = run_id, reason
+        PersistenceError.__init__(self, code=self.code)
+        self.safe_message = "Managed run admission refused by the root run cap."
+        self.args = (self.safe_message,)
+        _codes.log_code(logging.getLogger(__name__), _codes.MANAGED_RUN_LIMIT, run_id=run_id)
+
+
+def _managed_members(rows: Sequence[Any], root_run_id: str, visited: set[str]) -> list[str] | None:
+    members: list[str] = []
+    for row in rows:
+        membership = _counted_member(row, root_run_id, visited)
+        if membership == "invalid":
+            return None
+        if membership == "member":
+            members.append(row.id)
+    return members
 
 
 class ManagedReads:
-    """Supply managed cancellation reads using each concrete store's SQL dialect hooks."""
+    """Supply managed scope/control reads and bind admission through SQL dialect hooks."""
+
+    async def _lock_managed_root(
+        self: Any, session: AsyncSession, request: BindManagedChildRequest
+    ) -> None:
+        """Serialize all binders root-first, including those with different parents."""
+        await self.reserve_parent_writer(session, request.root_run_id)
+        await session.execute(
+            self.lock_clause(
+                select(AgentRun.id).where(
+                    AgentRun.id == request.root_run_id,
+                    AgentRun.tenant_id.is_not_distinct_from(request.tenant_id),
+                ),
+                "update",
+            )
+        )
+
+    async def _admit_managed_limit(
+        self: Any, session: AsyncSession, request: BindManagedChildRequest, parent: Any
+    ) -> ManagedHeader:
+        """Keep replay free; certify admission after ordinary bind eligibility checks."""
+        header = self._bind_admit(request, parent)
+        root_state = (
+            parent.loop_state
+            if request.root_run_id == request.parent_run_id
+            else await session.scalar(
+                select(AgentRun.loop_state).where(AgentRun.id == request.root_run_id)
+            )
+        )
+        config = (root_state or {}).get("managed_limits", {"max_managed_runs": 128})
+        cap = config.get("max_managed_runs") if isinstance(config, dict) else None
+        if type(cap) is not int or cap < 1:
+            raise ManagedRunLimitError(run_id=request.parent_run_id)
+        count = await self._managed_run_count(session, request.root_run_id, cap, request.tenant_id)
+        if count is None or count >= cap:
+            raise ManagedRunLimitError(run_id=request.parent_run_id)
+        # The dynamic mixin self resolves SQLStateStore._bind_admit's typed header.
+        return cast("ManagedHeader", header)
+
+    @_safe_database_call
+    async def get_managed_run_count(
+        self: Any, root_run_id: str, *, limit: int, tenant_id: str | None
+    ) -> int | None:
+        """Saturating explicit membership count, root included; None is inconclusive.
+
+        Completed members count. Legacy parent links do not. Only ancestry reachable
+        through matching managed headers is membership. No histories are loaded.
+        Inspect at most limit+1 child candidates, including legacy rows; exhaustion
+        before a conclusive count returns None rather than scanning unlimited siblings.
+        Bind uses this same enumeration inside its root-locked transaction.
+        """
+        if type(limit) is not int or limit < 1:
+            _codes.log_code(logging.getLogger(__name__), _codes.INVALID_LIMIT, run_id=root_run_id)
+            raise InputValidationError("limit", "invalid_limit")
+        async with self._session_factory() as session:
+            # Dialect mixin methods are dispatched through dynamic self.
+            return cast(
+                "int | None", await self._managed_run_count(session, root_run_id, limit, tenant_id)
+            )
+
+    async def _managed_run_count(
+        self: Any, session: AsyncSession, root_run_id: str, limit: int, tenant_id: str | None
+    ) -> int | None:
+        root = await session.scalar(
+            select(self.json_get(AgentRun.loop_state, (MANAGED_HEADER_KEY,), "json")).where(
+                AgentRun.id == root_run_id, AgentRun.tenant_id.is_not_distinct_from(tenant_id)
+            )
+        )
+        try:
+            header = ManagedHeader.from_dict(root, run_id=root_run_id)
+        except ManagedStateError:
+            return None
+        if header.root_run_id != root_run_id or header.parent_run_id is not None:
+            return None
+        visited, frontier = {root_run_id}, deque([root_run_id])
+        remaining = limit + 1
+        while frontier and len(visited) < limit:
+            parents = [frontier.popleft() for _ in range(min(len(frontier), MAX_SMALL_PAGE))]
+            rows = (
+                await session.execute(self._managed_count_query(parents, remaining, tenant_id))
+            ).all()
+            members = _managed_members(rows, root_run_id, visited)
+            if members is None:
+                return None
+            visited.update(members)
+            frontier.extend(members)
+            if len(visited) >= limit:
+                return limit
+            remaining -= len(rows)
+            if not remaining:
+                return None
+        return len(visited)
+
+    def _managed_count_query(
+        self: Any, parents: list[str], limit: int, tenant_id: str | None
+    ) -> Any:
+        return (
+            select(
+                AgentRun.id,
+                AgentRun.parent_run_id,
+                self.json_get(AgentRun.loop_state, (MANAGED_HEADER_KEY,), "json").label("header"),
+            )
+            .where(
+                AgentRun.parent_run_id.in_(parents),
+                AgentRun.tenant_id.is_not_distinct_from(tenant_id),
+            )
+            .limit(limit)
+        )
 
     @_safe_database_call
     async def get_managed_cancel_children_page(

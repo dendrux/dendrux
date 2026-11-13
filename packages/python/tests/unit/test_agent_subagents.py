@@ -25,13 +25,12 @@ from dendrux.loops.single import SingleCall
 from dendrux.runtime import _subagents
 from dendrux.runtime._subagents import (
     MAX_DIRECT_SUBAGENTS_WARNING,
-    MAX_SUBAGENT_TREE_NODES,
     SUBAGENT_TASK_FIELD,
     check_subagent_tree,
     subagent_tool_def,
 )
 from dendrux.tool import tool
-from dendrux.types import ToolDef, ToolTarget
+from dendrux.types import Limits, ToolDef, ToolTarget
 
 SECRET_DESCRIPTION = "SENTINEL-DESCRIPTION-TEXT-7f3a"
 
@@ -382,7 +381,7 @@ class TestDepth:
 
 class TestTreeSize:
     def test_default_bound(self) -> None:
-        assert MAX_SUBAGENT_TREE_NODES == 256
+        assert Limits().max_subagent_definitions == 256
 
     def test_hostile_reused_template_tree_is_refused_quickly(self) -> None:
         # Each level reaches the level below twice, so paths double per level while
@@ -394,7 +393,7 @@ class TestTreeSize:
             for level in range(1, 31):  # noqa: B007
                 mid = _child(f"m{level}", subagents=[node], max_delegation_depth=None)
                 node = _child(f"n{level}", subagents=[node, mid], max_delegation_depth=None)
-        assert info.value.max_nodes == MAX_SUBAGENT_TREE_NODES
+        assert info.value.max_nodes == Limits().max_subagent_definitions
         assert level == 7
 
     def test_ten_times_a_realistic_tree_passes(self) -> None:
@@ -410,7 +409,7 @@ class TestTreeSize:
         tripwires = [_Tripwire() for _ in range(1_000)]
         with pytest.raises(SubagentTreeTooLargeError) as info:
             _parent(tripwires)
-        assert info.value.max_nodes == MAX_SUBAGENT_TREE_NODES
+        assert info.value.max_nodes == Limits().max_subagent_definitions
         assert _Tripwire.inspected == 0
 
     def test_wide_nested_list_is_refused_before_any_entry_is_inspected(self) -> None:
@@ -425,15 +424,15 @@ class TestTreeSize:
         # Budget 3: root's two children use 2, the nested list of 2 does not fit.
         inner = _child("inner", subagents=[_child("x"), _child("y")])
         root = _parent([inner, _child("other")], description="Leads.")
-        check_subagent_tree(root, agent_type=Agent, max_nodes=4)
+        check_subagent_tree(root, agent_type=Agent, max_nodes=5)
         with pytest.raises(SubagentTreeTooLargeError):
-            check_subagent_tree(root, agent_type=Agent, max_nodes=3)
+            check_subagent_tree(root, agent_type=Agent, max_nodes=4)
 
     def test_bound_is_overridable_on_the_check(self) -> None:
         root = _parent([_child("a"), _child("b")])
-        check_subagent_tree(root, agent_type=Agent, max_nodes=2)
+        check_subagent_tree(root, agent_type=Agent, max_nodes=3)
         with pytest.raises(SubagentTreeTooLargeError):
-            check_subagent_tree(root, agent_type=Agent, max_nodes=1)
+            check_subagent_tree(root, agent_type=Agent, max_nodes=2)
 
 
 class TestFanoutWarning:

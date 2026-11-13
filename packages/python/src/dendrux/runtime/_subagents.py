@@ -24,7 +24,7 @@ from dendrux.errors import (
 )
 from dendrux.skills._session import NAMES as _SKILL_TOOL_NAMES
 from dendrux.tool import get_tool_def, is_tool
-from dendrux.types import ToolDef, ToolTarget
+from dendrux.types import Limits, ToolDef, ToolTarget
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
@@ -32,7 +32,6 @@ if TYPE_CHECKING:
 __all__ = [
     "DEFAULT_MAX_DELEGATION_DEPTH",
     "MAX_DIRECT_SUBAGENTS_WARNING",
-    "MAX_SUBAGENT_TREE_NODES",
     "SUBAGENT_TASK_FIELD",
     "SubagentDefinitionError",
     "check_subagent_tree",
@@ -46,9 +45,6 @@ logger = logging.getLogger(__name__)
 
 MAX_DIRECT_SUBAGENTS_WARNING = 10
 """More direct subagents than this logs ``subagent_fanout`` (a hint, never a refusal)."""
-
-MAX_SUBAGENT_TREE_NODES = 256
-"""Bound on subagent definition nodes below one root (root excluded), counted per path."""
 
 DEFAULT_MAX_DELEGATION_DEPTH = 10
 """The runner's default ceiling for a root run (``runtime/runner.py``); a test keeps them equal."""
@@ -89,8 +85,6 @@ def normalize_subagents(owner_name: str, subagents: Any) -> tuple[Any, ...]:
         return ()
     if not isinstance(subagents, (list, tuple)):
         refuse(SubagentDefinitionError(owner_name, reason="not_a_list"))
-    if len(subagents) > MAX_SUBAGENT_TREE_NODES:
-        refuse(SubagentTreeTooLargeError(owner_name, max_nodes=MAX_SUBAGENT_TREE_NODES))
     return tuple(subagents)
 
 
@@ -109,7 +103,7 @@ def check_subagent_tree(
     agent_type: type[Any],
     extra_tool_names: Iterable[str] = (),
     max_depth: int | None | _UnsetType = _FROM_ROOT,
-    max_nodes: int = MAX_SUBAGENT_TREE_NODES,
+    max_nodes: int | None = None,
 ) -> None:
     """Refuse an invalid subagent tree below ``root`` with a typed error.
 
@@ -121,13 +115,16 @@ def check_subagent_tree(
     path by object identity, so one Agent may appear at several paths. Depth is
     checked against ``max_depth`` (default: the root's own setting, else 10;
     ``None`` is unbounded), tightened by each agent's own limit on its subtree.
-    At most ``max_nodes`` subagent nodes are walked (root excluded): a list that
+    At most the root's definition cap (or ``max_nodes``) nodes are walked,
+    root included: a list that
     does not fit the remaining budget is refused before any entry is inspected.
     """
+    max_nodes = root._limits.max_subagent_definitions if max_nodes is None else max_nodes
+    Limits(max_subagent_definitions=max_nodes)
     limit = _root_limit(root) if isinstance(max_depth, _UnsetType) else max_depth
     root_names = _tool_names(root) | frozenset(extra_tool_names)
     stack: list[tuple[Any, int, int | None, tuple[int, ...]]] = [(root, 0, limit, (id(root),))]
-    walked = 0
+    walked = 1
     while stack:
         node, depth, node_limit, path = stack.pop()
         children = _children(node)

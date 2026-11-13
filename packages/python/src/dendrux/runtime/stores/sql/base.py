@@ -2451,13 +2451,13 @@ class SQLStateStore(ManagedReads, SQLBlobCatalog):
         async def _attempt() -> BindManagedChildResult:
             async with self._session_factory() as session:
                 session.info[STORE_SESSION_KEY] = self
-                await self.reserve_parent_writer(session, plan.parent_run_id)
+                await self._lock_managed_root(session, plan)
                 parent = await self._bind_parent(session, plan)
                 existing = await self._bind_existing(session, plan, parent)
                 if existing is not None:
                     await session.rollback()
                     return existing
-                header = self._bind_admit(plan, parent)
+                header = await self._admit_managed_limit(session, plan, parent)
                 child_state = {**plan.child_loop_state, MANAGED_HEADER_KEY: header.to_dict()}
                 _validate_checkpoint(plan.child_run_id, child_state)
                 await self._bind_park_parent(session, plan, parent, wait)
