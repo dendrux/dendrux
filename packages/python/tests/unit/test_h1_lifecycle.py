@@ -188,23 +188,59 @@ def test_reason_enums_are_the_redaction_allowlists():
     assert lifecycle.DenialReason.USER_DECLINED.value == DEFAULT_DENIAL_REASON
 
 
+def _format_literal_comparison_lines(source: str) -> list[int]:
+    """Line numbers of comparisons that mention storage_format and a literal 2."""
+    if "storage_format" not in source:
+        return []
+    lines = source.splitlines()
+
+    def segment(node: ast.AST) -> str:
+        first, last = node.lineno - 1, node.end_lineno - 1
+        if first == last:
+            return lines[first][node.col_offset : node.end_col_offset]
+        # ast offsets are UTF-8 byte offsets, as ast.get_source_segment treats them.
+        head = lines[first].encode()[node.col_offset :].decode()
+        tail = lines[last].encode()[: node.end_col_offset].decode()
+        return "\n".join([head, *lines[first + 1 : last], tail])
+
+    return [
+        node.lineno
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Compare)
+        and "storage_format" in segment(node)
+        and any(
+            isinstance(child, ast.Constant) and child.value in (2, "2")
+            for child in ast.iter_child_nodes(node)
+        )
+    ]
+
+
 def test_checkpointed_format_comparisons_use_the_home():
     copies = []
     for path in ROOT.rglob("*.py"):
         if "migrations" in path.parts:
             continue
-        source = path.read_text()
-        for node in ast.walk(ast.parse(source)):
-            if (
-                isinstance(node, ast.Compare)
-                and "storage_format" in ast.get_source_segment(source, node)
-                and any(
-                    isinstance(child, ast.Constant) and child.value in (2, "2")
-                    for child in ast.iter_child_nodes(node)
-                )
-            ):
-                copies.append(f"{path.relative_to(ROOT)}:{node.lineno}")
+        copies.extend(
+            f"{path.relative_to(ROOT)}:{lineno}"
+            for lineno in _format_literal_comparison_lines(path.read_text())
+        )
     assert not copies, "Checkpoint format literals outside lifecycle home: " + ", ".join(copies)
+
+
+def test_format_comparison_scan_flags_literals_and_ignores_clean_code():
+    assert _format_literal_comparison_lines(
+        "def f(record):\n    if record.storage_format == 2:\n        return 1\n"
+    ) == [2]
+    multiline = (
+        "def f(record):\n    if (\n        record.storage_format\n        == '2'\n"
+        "    ):\n        pass\n"
+    )
+    assert _format_literal_comparison_lines(multiline) == [3]
+    assert _format_literal_comparison_lines("x = 1\nif x == 2:\n    pass\n") == []
+    assert (
+        _format_literal_comparison_lines("def f(r):\n    return r.storage_format == CURRENT\n")
+        == []
+    )
 
 
 def test_compatibility_literals_and_log_enums_match_lifecycle():
