@@ -1,12 +1,18 @@
 """Root-inclusive structural caps for managed definitions."""
 
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
 import pytest
 
 from dendrux.agent import Agent
 from dendrux.errors import SubagentTreeTooLargeError
+from dendrux.guardrails import PII
 from dendrux.llm.mock import MockLLM
+from dendrux.runtime import _managed
 from dendrux.runtime._subagents import check_subagent_tree
-from dendrux.types import InputValidationError, Limits
+from dendrux.runtime.state import RunRecord
+from dendrux.types import InputValidationError, Limits, generate_ulid
 
 
 def node(name, *, children=(), limits=None):
@@ -69,3 +75,53 @@ def test_override_above_old_constant():
         limits=Limits(max_subagent_definitions=301),
     )
     assert len(root.subagents) == 300
+
+
+@pytest.mark.parametrize("check", ["stream", "provider", "store"])
+def test_large_override_preflight_visits_every_child(check):
+    children = [node(f"n{i}") for i in range(300)]
+    if check == "stream":
+        children[0]._guardrails = [PII()]
+    elif check == "provider":
+        children[0]._provider = None
+    else:
+        children[0]._state_store = object()
+    root = node("root", children=children, limits=Limits(max_subagent_definitions=301))
+    with pytest.raises(ValueError):
+        if check == "stream":
+            _managed.require_streamable(root, "stream")
+        else:
+            _managed._check_definitions(root, object())
+
+
+@pytest.mark.parametrize("check", ["stream", "provider"])
+@pytest.mark.parametrize("location", ["root", "nested"])
+def test_mutated_tree_preflight_refuses_at_root_inclusive_cap(check, location):
+    root = node("root", children=[node("one")], limits=Limits(max_subagent_definitions=2))
+    if location == "root":
+        root._subagents = (node("one"), node("two"))
+    else:
+        root.subagents[0]._subagents = (node("two"),)
+    with pytest.raises(SubagentTreeTooLargeError):
+        if check == "stream":
+            _managed.require_streamable(root, "stream")
+        else:
+            _managed._check_definitions(root, None)
+
+
+async def test_format_one_walk_does_not_read_a_checkpoint():
+    record = RunRecord(id=generate_ulid(), agent_name="root", status="running", storage_format=1)
+    store = SimpleNamespace(
+        get_run=AsyncMock(return_value=record),
+        get_loop_state=AsyncMock(side_effect=NotImplementedError),
+    )
+    waiting, leaf = await _managed.walk(node("root"), store, record.id)
+    assert not waiting
+    assert leaf is record
+    store.get_loop_state.assert_not_awaited()
+
+
+async def test_older_checkpoint_without_cap_keeps_original_default():
+    record = RunRecord(id=generate_ulid(), agent_name="root", status="running", storage_format=2)
+    store = SimpleNamespace(get_loop_state=AsyncMock(return_value={}))
+    assert await _managed._saved_walk_limit(store, record) == 128

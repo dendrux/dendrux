@@ -1,28 +1,9 @@
-"""Managed subagents (0.7): the inline driver, the bind handoff and durable adoption.
+"""Drive managed subagents inline through atomic binding and durable adoption.
 
-For ``await root.run(task)`` on an Agent with ``subagents=``:
-
-1. The parent's loop returns an in-memory handoff for one admitted subagent call.
-   :func:`prepare_handoff` makes the parent's checkpoint durable and returns a
-   descend marker; the parent's run frame then exits without pausing.
-2. :func:`drive` runs the child in the same caller task. The child's run entry
-   takes the invocation and creates the child through the store's atomic
-   ``bind_managed_child`` (parent parked as a v3 managed wait, its epoch
-   retired). Only the confirmed creator executes the child.
-3. When the child is terminal, :func:`adopt` turns its saved outcome into the
-   parent's tool observation: ``submit_and_claim`` on the parent's private wait
-   generation, then ``complete_tool_call`` with the binding cleared. The parent
-   then continues from its checkpoint, never from an old frame.
-
-:func:`reconnect` runs the same adoption and continuation after a restart; no
-step exists only in memory.
-
-Root routing (T3): a root-id continuation (``submit_*``, ``resume``,
-``resume_stream``) reaches the active leaf through the persisted bindings
-(:func:`route`), is validated and claimed with the leaf's own definition, and
-:func:`unwind` adopts finished outcomes back up to the root.
-:func:`workflow_stream` drives the same transitions for ``stream`` and
-``resume_stream``, advancing each run's generator in the caller's task.
+Parents checkpoint handoffs and release ownership. Confirmed creators run children
+in the caller's task; durable adoption also handles restart. Root controls follow
+saved bindings and leaf generations for batch and streaming continuations.
+Provider generators always advance in their caller's task.
 """
 
 from __future__ import annotations
@@ -33,11 +14,12 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 from dendrux import _codes
-from dendrux._lifecycle import TERMINAL_STATUSES, StoredEventType
-from dendrux.errors import ManagedStateError
-from dendrux.runtime import _managed_budget, _managed_cancel
+from dendrux._lifecycle import STORAGE_FORMAT_CHECKPOINTED, TERMINAL_STATUSES, StoredEventType
+from dendrux.errors import ManagedStateError, SubagentTreeTooLargeError
+from dendrux.runtime import _managed_budget, _managed_cancel, _subagents
 from dendrux.runtime.state import MANAGED_HEADER_KEY, ManagedHeader
 from dendrux.types import (
+    Limits,
     PauseState,
     RunResult,
     RunStatus,
@@ -48,7 +30,7 @@ from dendrux.types import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
 
     from dendrux.agent import Agent
     from dendrux.loops.base import LoopNotifier, LoopRecorder
@@ -65,8 +47,6 @@ NOT_OWNER_KEY = "managed_not_owner"
 MANAGED_WAIT_REASON = "managed_wait"
 ADMITTED_KEY = "managed_admitted"
 """Checkpoint key: the pending managed call the live batch admitted before its handoff."""
-_MAX_WALK = 257
-"""Bound on a root-to-leaf walk: the definition-node cap plus the root."""
 
 REPORT_TOO_LARGE = "managed_report_too_large"
 CHILD_FAILED = "managed_child_failed"
@@ -150,11 +130,7 @@ def require_root_entry(agent: Agent, store: StateStore | None, loop: Any) -> Non
 
 def _check_definitions(root: Agent, store: Any) -> None:
     """Every registered child has a provider and shares the root's store object."""
-    stack = [(root, child) for child in root.subagents]
-    seen = 0
-    while stack and seen < _MAX_WALK:
-        parent, child = stack.pop()
-        seen += 1
+    for parent, child in _definition_edges(root):
         _require_react(parent, child)
         if child.provider is None:
             raise ValueError(f"Subagent '{child.name}' needs a provider.")
@@ -163,7 +139,6 @@ def _check_definitions(root: Agent, store: Any) -> None:
             own is None and getattr(child, "_database_url", None) is not None
         ):
             raise ValueError(f"Subagent '{child.name}' must use the root's store object or none.")
-        stack.extend((child, grandchild) for grandchild in child.subagents)
 
 
 def require_streamable(root: Agent, entry: str) -> None:
@@ -172,17 +147,30 @@ def require_streamable(root: Agent, entry: str) -> None:
     The stream path never scans with guardrails, so a subagent that declares
     them is refused before anything runs, as the root itself is.
     """
-    stack = list(root.subagents)
-    seen = 0
-    while stack and seen < _MAX_WALK:
-        child = stack.pop()
-        seen += 1
+    for _, child in _definition_edges(root):
         if child.guardrails or getattr(child, "_output_type", None) is not None:
             raise ValueError(
                 f"{entry}() cannot stream subagent '{child.name}': it declares guardrails "
                 "or output_type. Use run() for this workflow."
             )
-        stack.extend(child.subagents)
+
+
+def _definition_edges(root: Agent) -> Iterator[tuple[Agent, Agent]]:
+    remaining = root._limits.max_subagent_definitions - 1
+    if len(root.subagents) > remaining:
+        _subagents.refuse(SubagentTreeTooLargeError(root.name, max_nodes=remaining + 1))
+    stack = [(root, child) for child in root.subagents]
+    while stack:
+        parent, child = stack.pop()
+        remaining -= 1
+        yield parent, child
+        if len(stack) + len(child.subagents) > remaining:
+            _subagents.refuse(
+                SubagentTreeTooLargeError(
+                    root.name, max_nodes=root._limits.max_subagent_definitions
+                )
+            )
+        stack.extend((child, grandchild) for grandchild in child.subagents)
 
 
 def _require_react(parent: Agent, child: Agent) -> None:
@@ -236,27 +224,29 @@ def parent_link(
     return invocation.parent_run_id, invocation.parent_level + 1
 
 
-async def enter(agent: Agent, invocation: ManagedInvocation | None, store: Any, loop: Any) -> bool:
-    """True for a managed root run; refuse one that cannot run durably."""
+async def enter(
+    agent: Agent, invocation: ManagedInvocation | None, store: Any, loop: Any
+) -> Limits | None:
+    """Capture a managed root's limits after admission; None for ordinary or child runs."""
     if invocation is not None:
-        return await _managed_cancel.enter_child(invocation, store)
+        await _managed_cancel.enter_child(invocation, store)
+        return None
     if not is_managed_root(agent):
-        return False
+        return None
     require_root_entry(agent, store, loop)
     await require_checkpointed_creation(store)
-    return True
+    return agent._limits
 
 
-def stamp_root_header(store: Any, run_id: str) -> None:
-    """Put the root's managed header into the claimed checkpoint before any bind.
-
-    The recorder persists this header with the first fenced checkpoint.
-    """
+def stamp_root_header(store: Any, run_id: str, *, limits: Limits | None) -> None:
+    """Stamp managed creation state; absent limits leave ordinary/child claims unchanged."""
+    if limits is None:
+        return
     state = getattr(store, "loop_state", None)
     if not isinstance(state, dict):
         raise ManagedStateError(reason="storage_format", run_id=run_id)
-    # TODO(T5c): the root-creation hook must pass Limits for the first checkpoint.
     state[MANAGED_HEADER_KEY] = ManagedHeader(root_run_id=run_id, path=()).to_dict()
+    state["managed_limits"] = {"max_managed_runs": limits.max_managed_runs}
 
 
 # ---------------------------------------------------------------------------
@@ -297,10 +287,6 @@ async def prepare_handoff(
         # Durable admission evidence: this call passed validation, policy and
         # approval in a live batch; recovery binds a pending call only with it.
         state[ADMITTED_KEY] = handoff.call.id
-        if header.parent_run_id is None:
-            state.setdefault(
-                "managed_limits", {"max_managed_runs": handoff.parent._limits.max_managed_runs}
-            )
     checkpoint = getattr(recorder, "checkpoint_outcome", None)
     if checkpoint is not None:
         await checkpoint(result, provider_kwargs)
@@ -1539,10 +1525,13 @@ async def walk(root_agent: Agent, store: Any, root_run_id: str) -> tuple[list[_W
     waiting: list[_Waiting] = []
     agent: Agent = root_agent
     path: tuple[str, ...] = ()
-    for _ in range(_MAX_WALK):
+    limit = await _saved_walk_limit(store, record)
+    for index in range(limit):
         wait = await _outgoing(store, record)
         if wait is None or wait.managed_wait is None:
             return waiting, record
+        if index + 1 == limit:
+            break
         binding = wait.managed_wait
         child, path = await _bound_child(store, record, binding, root_run_id, path)
         child_agent = _managed_budget.inherit(_registered(agent, path[-1], record.id), root_agent)
@@ -1550,6 +1539,17 @@ async def walk(root_agent: Agent, store: Any, root_run_id: str) -> tuple[list[_W
         waiting.append(_Waiting(agent, record.id, child_agent, path, intent, child.id))
         agent, record = child_agent, child
     raise ManagedStateError(reason="binding_conflict", run_id=root_run_id)
+
+
+async def _saved_walk_limit(store: Any, root: RunRecord) -> int:
+    if root.storage_format != STORAGE_FORMAT_CHECKPOINTED:
+        return Limits.max_managed_runs
+    state = await store.get_loop_state(root.id) or {}
+    config = state.get("managed_limits", {"max_managed_runs": Limits.max_managed_runs})
+    limit = config.get("max_managed_runs") if isinstance(config, dict) else None
+    if type(limit) is not int or limit < 1:
+        raise ManagedStateError(reason="header_invalid", run_id=root.id)
+    return limit
 
 
 async def _outgoing(store: Any, record: RunRecord) -> PauseState | None:
