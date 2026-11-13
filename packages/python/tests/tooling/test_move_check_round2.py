@@ -1,4 +1,4 @@
-"""tools/move_check.py fix round 2: each case was a reproduced false pass (second review)."""
+"""tools/move_check.py: each case was a reproduced false pass (class scope, guards, facades)."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ def check(old: str, after: dict[str, str], **kw: Any) -> mc.MoveReport:
     return mc.check_move(src(old), {k: src(v) for k, v in after.items()}, **kw)
 
 
-# ---- V1-P1-1: a statement may not change kind --------------------------------------------------
+# ---- a statement may not change kind --------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -48,7 +48,7 @@ def test_a_class_that_moves_unchanged_still_passes() -> None:
     assert report.problems == []
 
 
-# ---- V1-P1-2: class-sensitive methods may not move into a mixin ---------------------------------
+# ---- class-sensitive methods may not move into a mixin ---------------------------------
 
 BASE_CLASS = "class C:\n    def f(self):\n        {body}\n    def g(self):\n        return 1\n"
 
@@ -138,7 +138,7 @@ def test_a_property_pair_moves_together() -> None:
     assert check(old, after).problems == []
 
 
-# ---- V1-P1-3: only typing.TYPE_CHECKING is a type-only guard ------------------------------------
+# ---- only typing.TYPE_CHECKING is a type-only guard ------------------------------------
 
 
 def test_an_attribute_named_type_checking_on_a_call_is_executable() -> None:
@@ -171,7 +171,7 @@ def test_the_real_typing_guard_is_still_ignored(head: str, test: str) -> None:
     assert check(old, {"old": head}).problems == []
 
 
-# ---- V1-P1-4: a deleted old module still needs its facade ---------------------------------------
+# ---- a deleted old module still needs its facade ---------------------------------------
 
 
 def test_deleting_the_old_module_fails_when_a_public_name_needs_a_facade() -> None:
@@ -195,7 +195,7 @@ def test_deleting_the_old_module_is_fine_without_the_option() -> None:
     assert report.problems == []
 
 
-# ---- V1-P1-5: a movable constant is a literal ---------------------------------------------------
+# ---- a movable constant is a literal ---------------------------------------------------
 
 
 @pytest.mark.parametrize(
