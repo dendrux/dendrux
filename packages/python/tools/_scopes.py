@@ -11,23 +11,35 @@ from __future__ import annotations
 import ast
 import builtins
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 _FUNCTIONS = (ast.FunctionDef, ast.AsyncFunctionDef)
 
 
 @dataclass(frozen=True)
 class Binding:
-    """``import``: value is the dotted target. ``param``: value is the annotation text.
-    ``mp``: a ``pytest.MonkeyPatch`` object. ``other``: any other binding (def, class, ...)."""
+    """``import``: value is the dotted target ("" when a relative import cannot be resolved).
+    ``param``: value is the resolved annotation (dotted, "" when unknown).
+    ``mp``: a ``pytest.MonkeyPatch`` object. ``other``: any other binding (def, class, ...).
+
+    ``relative`` and ``direct`` describe an import statement: written with dots, and a direct
+    child of its scope's body (not under ``if``/``try``/``with``). ``line`` is where it ends.
+    None of them takes part in equality: two imports of one target are one binding.
+    """
 
     kind: Literal["import", "param", "mp", "other"]
     value: str = ""
+    relative: bool = field(default=False, compare=False)
+    direct: bool = field(default=False, compare=False)
+    line: int = field(default=0, compare=False)
 
 
 @dataclass
 class Scope:
-    kind: Literal["module", "function", "class"]
+    kind: Literal["module", "function", "class", "comprehension"]
     parent: Scope | None = None
     bindings: dict[str, set[Binding]] = field(default_factory=dict)
 
@@ -90,42 +102,122 @@ def dotted(node: ast.AST) -> str | None:
     return ".".join(reversed(parts))
 
 
-def _is_monkeypatch_factory(node: ast.expr | None) -> bool:
+MONKEYPATCH = frozenset({"pytest.MonkeyPatch", "_pytest.monkeypatch.MonkeyPatch"})
+
+
+def resolve_dotted(text: str, scope: Scope) -> str | None:
+    """``text`` with its first name replaced by what that name imports, if it is an import."""
+    head, _, tail = text.partition(".")
+    binding = scope.resolve(head)
+    if binding is None or binding.kind != "import" or not binding.value:
+        return None
+    return f"{binding.value}.{tail}" if tail else binding.value
+
+
+def is_fixture_param(name: str, binding: Binding) -> bool:
+    """A parameter that is the pytest ``monkeypatch`` fixture (by name or by annotation)."""
+    return binding.kind == "param" and (name == "monkeypatch" or binding.value in MONKEYPATCH)
+
+
+def _is_monkeypatch_factory(node: ast.expr | None, scope: Scope) -> bool:
+    """A call that makes a ``pytest.MonkeyPatch``: the class, its ``context()``, or the
+    fixture's ``context()``; resolved through imports, never guessed from spelling."""
     if not isinstance(node, ast.Call):
         return False
-    text = dotted(node.func) or ""
-    return (
-        text.endswith("MonkeyPatch")
-        or text.endswith("MonkeyPatch.context")
-        or (text.startswith("monkeypatch.") and text.endswith(".context"))
-    )
+    text = dotted(node.func)
+    if text is None:
+        return False
+    full = resolve_dotted(text, scope)
+    if full is not None:
+        return full in MONKEYPATCH or full.removesuffix(".context") in MONKEYPATCH
+    head, _, tail = text.partition(".")
+    binding = scope.resolve(head)
+    return binding is not None and is_fixture_param(head, binding) and tail == "context"
+
+
+def _annotation_text(annotation: ast.expr | None) -> str:
+    if isinstance(annotation, ast.Constant) and isinstance(annotation.value, str):
+        try:
+            annotation = ast.parse(annotation.value, mode="eval").body
+        except SyntaxError:
+            return ""
+    return (dotted(annotation) or "") if annotation is not None else ""
+
+
+def resolve_package(package: str | None, level: int, module: str | None) -> str | None:
+    """The absolute dotted name of ``from <dots><module> import``; None when it cannot be known."""
+    if not level:
+        return module
+    if package is None:
+        return None
+    parts = package.split(".") if package else []
+    if level - 1 > len(parts):
+        return None
+    base = parts[: len(parts) - (level - 1)]
+    if module:
+        base.append(module)
+    return ".".join(base)
 
 
 class _Collector(ast.NodeVisitor):
     """Names bound directly in one scope; does not enter nested scopes."""
 
-    def __init__(self, scope: Scope, module: Scope) -> None:
+    def __init__(
+        self, scope: Scope, module: Scope, body: Sequence[ast.stmt] = (), package: str | None = None
+    ) -> None:
         self.scope = scope
         self.module = module
+        self.package = package
+        self.direct = {id(stmt) for stmt in body}
+        self.global_names: set[str] = set()
+        self.nonlocal_names: set[str] = set()
+
+    def _bind(self, name: str, binding: Binding) -> None:
+        """Bind ``name`` where Python does: here, or the module / enclosing function it declares."""
+        if name in self.global_names:
+            self.module.add(name, binding)
+            return
+        if name in self.nonlocal_names:
+            outer = self.scope.parent
+            while outer is not None:
+                if outer.kind != "class" and name in outer.bindings:
+                    outer.add(name, binding)
+                    return
+                outer = outer.parent
+        self.scope.add(name, binding)
 
     def _other(self, name: str) -> None:
-        self.scope.add(name, Binding("other"))
+        self._bind(name, Binding("other"))
+
+    def _import(self, local: str, target: str, node: ast.stmt, *, relative: bool = False) -> None:
+        binding = Binding(
+            "import",
+            target,
+            relative=relative,
+            direct=id(node) in self.direct,
+            line=node.end_lineno or node.lineno,
+        )
+        self._bind(local, binding)
 
     def visit_Import(self, node: ast.Import) -> None:
         for a in node.names:
             if a.asname:
-                self.scope.add(a.asname, Binding("import", a.name))
+                self._import(a.asname, a.name, node)
             else:
                 head = a.name.split(".")[0]
-                self.scope.add(head, Binding("import", head))
+                self._import(head, head, node)
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        base = resolve_package(self.package, node.level, node.module)
         for a in node.names:
             local = a.asname or a.name
-            if node.module and not node.level and a.name != "*":
-                self.scope.add(local, Binding("import", f"{node.module}.{a.name}"))
-            else:
+            if a.name == "*":
                 self._other(local)
+            elif base is None:
+                self._import(local, "", node, relative=bool(node.level))
+            else:
+                target = f"{base}.{a.name}" if base else a.name
+                self._import(local, target, node, relative=bool(node.level))
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         self._other(node.name)
@@ -138,14 +230,22 @@ class _Collector(ast.NodeVisitor):
     def visit_Lambda(self, node: ast.Lambda) -> None:
         return None
 
+    def _comprehension(self, node: ast.expr) -> None:
+        """Targets stay inside; an assignment expression binds in the enclosing scope."""
+        for n in ast.walk(node):
+            if isinstance(n, ast.NamedExpr) and isinstance(n.target, ast.Name):
+                self._other(n.target.id)
+
+    visit_ListComp = _comprehension  # noqa: N815 - ast visitor name
+    visit_SetComp = _comprehension  # noqa: N815 - ast visitor name
+    visit_DictComp = _comprehension  # noqa: N815 - ast visitor name
+    visit_GeneratorExp = _comprehension  # noqa: N815 - ast visitor name
+
     def visit_Global(self, node: ast.Global) -> None:
-        for name in node.names:
-            self._other(name)
-            self.module.add(name, Binding("other"))
+        self.global_names.update(node.names)
 
     def visit_Nonlocal(self, node: ast.Nonlocal) -> None:
-        for name in node.names:
-            self._other(name)
+        self.nonlocal_names.update(node.names)
 
     def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:
         if node.name:
@@ -161,15 +261,20 @@ class _Collector(ast.NodeVisitor):
         if node.name:
             self._other(node.name)
 
+    def visit_MatchMapping(self, node: ast.MatchMapping) -> None:
+        if node.rest:
+            self._other(node.rest)
+        self.generic_visit(node)
+
     def visit_Name(self, node: ast.Name) -> None:
         if isinstance(node.ctx, ast.Store | ast.Del):
             self._other(node.id)
 
     def visit_Assign(self, node: ast.Assign) -> None:
-        if _is_monkeypatch_factory(node.value):
+        if _is_monkeypatch_factory(node.value, self.scope):
             for target in node.targets:
                 if isinstance(target, ast.Name):
-                    self.scope.add(target.id, Binding("mp"))
+                    self._bind(target.id, Binding("mp"))
                 else:
                     self.visit(target)
             self.visit(node.value)
@@ -179,9 +284,9 @@ class _Collector(ast.NodeVisitor):
     def visit_With(self, node: ast.With) -> None:
         for item in node.items:
             if isinstance(item.optional_vars, ast.Name) and _is_monkeypatch_factory(
-                item.context_expr
+                item.context_expr, self.scope
             ):
-                self.scope.add(item.optional_vars.id, Binding("mp"))
+                self._bind(item.optional_vars.id, Binding("mp"))
                 self.visit(item.context_expr)
             else:
                 self.visit(item)
@@ -200,13 +305,16 @@ def _params(args: ast.arguments) -> list[ast.arg]:
 class ScopeIndex:
     """Scopes of a parsed module, and the scope each ``Name`` and ``Call`` is evaluated in."""
 
-    def __init__(self, tree: ast.Module) -> None:
+    def __init__(self, tree: ast.Module, package: str | None = None) -> None:
+        """``package`` is the dotted package the module sits in (for relative imports);
+        None leaves a relative import unresolved (its binding value is empty)."""
+        self.package = package
         self.module = Scope("module")
         self.scopes: list[Scope] = [self.module]
         self._at: dict[int, Scope] = {}
         self.names: list[tuple[ast.Name, Scope]] = []
         self.calls: list[tuple[ast.Call, Scope]] = []
-        collector = _Collector(self.module, self.module)
+        collector = _Collector(self.module, self.module, tree.body, package)
         for stmt in tree.body:
             collector.visit(stmt)
         for stmt in tree.body:
@@ -223,7 +331,7 @@ class ScopeIndex:
         used.update(n.id for n, _ in self.names)
         return used
 
-    def _enter(self, kind: Literal["function", "class"], parent: Scope) -> Scope:
+    def _enter(self, kind: Literal["function", "class", "comprehension"], parent: Scope) -> Scope:
         scope = Scope(kind, parent)
         self.scopes.append(scope)
         return scope
@@ -239,9 +347,11 @@ class ScopeIndex:
             self._visit(node.returns, outer)
         inner = self._enter("function", outer)
         for arg in _params(node.args):
-            annotation = (dotted(arg.annotation) or "") if arg.annotation else ""
-            inner.add(arg.arg, Binding("param", annotation))
-        collector = _Collector(inner, self.module)
+            text = _annotation_text(arg.annotation)
+            inner.add(
+                arg.arg, Binding("param", (resolve_dotted(text, outer) or "") if text else "")
+            )
+        collector = _Collector(inner, self.module, node.body, self.package)
         for stmt in node.body:
             collector.visit(stmt)
         for stmt in node.body:
@@ -251,7 +361,7 @@ class ScopeIndex:
         for expr in [*node.decorator_list, *node.bases, *(k.value for k in node.keywords)]:
             self._visit(expr, outer)
         inner = self._enter("class", outer)
-        collector = _Collector(inner, self.module)
+        collector = _Collector(inner, self.module, node.body, self.package)
         for stmt in node.body:
             collector.visit(stmt)
         for stmt in node.body:
@@ -266,7 +376,30 @@ class ScopeIndex:
             inner.add(arg.arg, Binding("param", ""))
         self._visit(node.body, inner)
 
+    def _comprehension(
+        self, node: ast.ListComp | ast.SetComp | ast.DictComp | ast.GeneratorExp, outer: Scope
+    ) -> None:
+        """Targets live in a scope of their own; only the first iterable is read outside."""
+        self._at[id(node)] = outer
+        self._visit(node.generators[0].iter, outer)
+        inner = self._enter("comprehension", outer)
+        collector = _Collector(inner, self.module, (), self.package)
+        for gen in node.generators:
+            collector.visit(gen.target)
+        for i, gen in enumerate(node.generators):
+            if i:
+                self._visit(gen.iter, inner)
+            self._visit(gen.target, inner)
+            for cond in gen.ifs:
+                self._visit(cond, inner)
+        elements = [node.key, node.value] if isinstance(node, ast.DictComp) else [node.elt]
+        for element in elements:
+            self._visit(element, inner)
+
     def _visit(self, node: ast.AST, scope: Scope) -> None:
+        if isinstance(node, ast.ListComp | ast.SetComp | ast.DictComp | ast.GeneratorExp):
+            self._comprehension(node, scope)
+            return
         if isinstance(node, _FUNCTIONS):
             self._function(node, scope)
             return

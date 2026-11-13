@@ -114,11 +114,13 @@ def _import_insert_line(tree: ast.Module) -> int:
 
 
 class _Rewriter:
-    def __init__(self, source: str, mapping: Mapping[str, Mapping[str, str]]) -> None:
+    def __init__(
+        self, source: str, mapping: Mapping[str, Mapping[str, str]], package: str | None = None
+    ) -> None:
         self.source = source
         self.mapping = mapping
         self.tree = ast.parse(source)
-        self.index = sc.ScopeIndex(self.tree)
+        self.index = sc.ScopeIndex(self.tree, package)
         self.text = _Text(source)
         self.taken = self.index.all_names()
         self.new_imports: dict[str, str] = {}  # new module -> fresh module-level name
@@ -132,21 +134,21 @@ class _Rewriter:
                 return candidate
         raise ValueError(f"no free name for {leaf}")
 
-    def _reference(self, module: str, scope: sc.Scope) -> str:
-        """A name that is bound to ``module`` at this scope."""
-        seen: set[str] = set()
-        s: sc.Scope | None = scope
-        while s is not None:
-            for name in s.bindings:
-                binding = scope.resolve(name)
-                if (
-                    name not in seen
-                    and binding is not None
-                    and binding == sc.Binding("import", module)
-                ):
-                    return name
-                seen.add(name)
-            s = s.parent
+    def _reference(self, module: str, scope: sc.Scope, use_line: int) -> str:
+        """A name bound to ``module`` at this use: an existing module-level import that is
+        unconditional and ends before the use, else a fresh import in the leading block."""
+        top = self.index.module
+        for name, bindings in top.bindings.items():
+            (binding,) = bindings if len(bindings) == 1 else (None,)
+            if (
+                binding is not None
+                and binding.kind == "import"
+                and binding.value == module
+                and binding.direct
+                and binding.line < use_line
+                and scope.find(name) is top
+            ):
+                return name
         if module not in self.new_imports:
             self.new_imports[module] = self._fresh(module.rpartition(".")[2])
         return self.new_imports[module]
@@ -169,7 +171,7 @@ class _Rewriter:
         if hit is None or hit[0] != site.dotted:
             return
         start, end = self.text.span(site.node)
-        self.edits.append((start, end, self._reference(hit[2], site.scope)))
+        self.edits.append((start, end, self._reference(hit[2], site.scope, site.lineno)))
 
     def run(self) -> Rewrite:
         for site in ps.find_sites(self.index):
@@ -201,10 +203,14 @@ class _Rewriter:
         return result
 
 
-def rewrite_source(source: str, mapping: Mapping[str, Mapping[str, str]]) -> Rewrite:
-    """Return the rewritten source and notes about sites that were left alone."""
+def rewrite_source(
+    source: str, mapping: Mapping[str, Mapping[str, str]], package: str | None = None
+) -> Rewrite:
+    """Return the rewritten source and notes about sites that were left alone.
+
+    ``package`` is the dotted package of the file, for its relative imports."""
     try:
-        return _Rewriter(source, mapping).run()
+        return _Rewriter(source, mapping, package).run()
     except SyntaxError as exc:
         return Rewrite(source, [f"skipped: syntax error at line {exc.lineno}"])
 
@@ -218,6 +224,15 @@ def _load_mapping(path: Path) -> dict[str, dict[str, str]]:
     if not ok:
         raise SystemExit(f"patch_codemod: {path} must map old module -> {{name: new module}}")
     return cast("dict[str, dict[str, str]]", data)
+
+
+def _package_of(path: Path) -> str | None:
+    parts: list[str] = []
+    folder = path.resolve().parent
+    while (folder / "__init__.py").is_file():
+        parts.append(folder.name)
+        folder = folder.parent
+    return ".".join(reversed(parts)) or None
 
 
 def _files(paths: Sequence[Path]) -> list[Path]:
@@ -239,7 +254,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     changed = 0
     for path in _files(args.paths):
         source = path.read_text(encoding="utf-8")
-        rewritten = rewrite_source(source, mapping)
+        rewritten = rewrite_source(source, mapping, _package_of(path))
         for note in rewritten.notes:
             print(f"{path}: {note}")
         if rewritten.source == source:

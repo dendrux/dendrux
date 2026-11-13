@@ -47,6 +47,12 @@ class StaleSite:
 
 
 @dataclass(frozen=True)
+class Scan:
+    stale: list[StaleSite]
+    unresolved: list[tuple[Path, int, str]]  # path, line, note: a human must look at these
+
+
+@dataclass(frozen=True)
 class _Module:
     defined: frozenset[str]
     reexported: frozenset[str]  # imported, not defined, never used in code
@@ -60,7 +66,7 @@ def _module_file(src: Path, module: str) -> Path | None:
     return None
 
 
-def analyse(source: str) -> _Module:
+def analyse(source: str, package: str | None = None) -> _Module:
     """Names the module only imports, and none of its code reads when it runs.
 
     A read counts when it sits inside a function (so it happens at call time) and resolves to
@@ -68,7 +74,7 @@ def analyse(source: str) -> _Module:
     copy (``Y = X``, a decorator, a default argument, a base class) is not a read of ``X``
     later, so replacing ``X`` afterwards reaches nothing.
     """
-    index = sc.ScopeIndex(ast.parse(source))
+    index = sc.ScopeIndex(ast.parse(source), package)
     module = index.module
     imported = {n for n, b in module.bindings.items() if all(x.kind == "import" for x in b)}
     used = {
@@ -87,7 +93,10 @@ class _Modules:
     def get(self, module: str) -> _Module | None:
         if module not in self._cache:
             path = _module_file(self.src, module)
-            self._cache[module] = analyse(path.read_text(encoding="utf-8")) if path else None
+            package = module if path and path.name == "__init__.py" else module.rpartition(".")[0]
+            self._cache[module] = (
+                analyse(path.read_text(encoding="utf-8"), package) if path else None
+            )
         return self._cache[module]
 
     def split(self, dotted: str) -> tuple[str, str, str] | None:
@@ -102,16 +111,30 @@ class _Modules:
         return None
 
 
-def find_stale(tests: Path, src: Path) -> list[StaleSite]:
-    """Every patch site under ``tests`` whose target is a re-export in ``src``."""
+def _package_of(path: Path) -> str | None:
+    """Dotted package of a test file: the directories above it that hold an ``__init__.py``."""
+    parts: list[str] = []
+    folder = path.resolve().parent
+    while (folder / "__init__.py").is_file():
+        parts.append(folder.name)
+        folder = folder.parent
+    return ".".join(reversed(parts)) or None
+
+
+def scan(tests: Path, src: Path) -> Scan:
+    """Every stale patch site under ``tests`` (target is a re-export in ``src``), and every
+    site the model cannot resolve."""
     modules = _Modules(src)
     found: list[StaleSite] = []
+    unresolved: list[tuple[Path, int, str]] = []
     for path in sorted(tests.rglob("*.py")):
         try:
-            index = sc.ScopeIndex(ast.parse(path.read_text(encoding="utf-8")))
+            index = sc.ScopeIndex(ast.parse(path.read_text(encoding="utf-8")), _package_of(path))
         except SyntaxError:
             continue
         for site in ps.find_sites(index):
+            if site.kind == "unresolved":
+                unresolved.append((path, site.lineno, site.note))
             hit: tuple[str, str] | None = None
             if site.kind == "string":
                 split = modules.split(site.dotted)
@@ -124,7 +147,12 @@ def find_stale(tests: Path, src: Path) -> list[StaleSite]:
             info = modules.get(hit[0]) if hit else None
             if hit and info and hit[1] in info.reexported:
                 found.append(StaleSite(path, site.lineno, hit[0], hit[1]))
-    return found
+    return Scan(found, unresolved)
+
+
+def find_stale(tests: Path, src: Path) -> list[StaleSite]:
+    """Every patch site under ``tests`` whose target is a re-export in ``src``."""
+    return scan(tests, src).stale
 
 
 def _key(site: StaleSite, root: Path) -> str:
@@ -150,7 +178,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--src", type=Path, default=PACKAGE_ROOT / "src")
     parser.add_argument("--baseline", type=Path, default=BASELINE)
     args = parser.parse_args(argv)
-    sites = find_stale(args.tests, args.src)
+    result = scan(args.tests, args.src)
+    sites = result.stale
     root = args.tests.resolve().parent
     counts = _counts(sites, root)
     print(f"stale patches: {len(sites)} site(s) in {len(counts)} file/target pair(s)")
@@ -159,8 +188,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"{_key(site, root).split('::')[0]}:{site.lineno}: patches {site.module}.{site.attr}, "
             "a re-export the module never uses; patch the defining module instead"
         )
+    for path, lineno, note in result.unresolved:
+        print(f"{path}:{lineno}: unresolved patch site, manual review needed: {note}")
     if args.command == "report":
         return 0
+    if result.unresolved:
+        print(f"stale-patch: FAILED, {len(result.unresolved)} site(s) could not be resolved")
+        return 1
     # A missing baseline file means "none allowed": today's tree is clean, so none is committed.
     old = r.baseline_or_none(args.baseline) or {}
     comparison = r.compare_counts(counts, old)
