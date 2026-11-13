@@ -34,6 +34,16 @@ async def stale(store, engine, count, *, waiting=False):
     return ids
 
 
+@pytest.fixture
+def frozen_clock(monkeypatch):
+    """Freeze the flush-budget clock so results do not depend on runner speed."""
+    from dendrux.db import _live_updates
+    from dendrux.runtime import durability
+
+    monkeypatch.setattr(durability, "monotonic", lambda: 100.0)
+    monkeypatch.setattr(_live_updates, "monotonic", lambda: 100.0)
+
+
 async def invoke(store, entry):
     if entry == "sweep":
         return await sweep(
@@ -106,7 +116,7 @@ async def test_all_sweep_boundaries_share_deadline_and_flush_between_sessions(
 @pytest.mark.parametrize("failed_write", [2, 4])
 @pytest.mark.parametrize("entry", ["sweep", "_scan_expired_runs", "_sweep_runs"])
 async def test_partial_failure_flushes_committed_runs_preserves_error(
-    live_store, engine, monkeypatch, entry, failed_write
+    live_store, engine, monkeypatch, frozen_clock, entry, failed_write
 ):
     store, bus = live_store
     ids = await stale(store, engine, 4)
@@ -203,7 +213,7 @@ async def test_sweep_sends_one_batched_message_per_page(live_store, engine, monk
 
 @pytest.mark.parametrize("entry", ["_scan_expired_runs", "_sweep_runs"])
 async def test_failed_commit_in_page_stays_pending_after_earlier_success_flush(
-    live_store, engine, monkeypatch, entry
+    live_store, engine, monkeypatch, frozen_clock, entry
 ):
     from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -235,7 +245,7 @@ async def test_failed_commit_in_page_stays_pending_after_earlier_success_flush(
 
 
 async def test_successful_retry_in_page_does_not_leave_a_duplicate_hint(
-    live_store, engine, monkeypatch
+    live_store, engine, monkeypatch, frozen_clock
 ):
     from sqlalchemy.exc import OperationalError
     from sqlalchemy.ext.asyncio import AsyncSession
