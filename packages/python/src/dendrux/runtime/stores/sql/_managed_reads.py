@@ -2,16 +2,15 @@
 
 from __future__ import annotations
 
-import logging
 from collections import deque
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from sqlalchemy import and_, literal, select
 
-from dendrux import _codes
 from dendrux.db.models import AgentRun, RunInbox
-from dendrux.errors import ManagedStateError, PersistenceError
+from dendrux.errors import ManagedStateError
 from dendrux.runtime._bounds import MAX_SMALL_PAGE
+from dendrux.runtime._managed_limits import ManagedRunLimitError
 from dendrux.runtime.durability import _safe_database_call, retry_transient_db
 from dendrux.runtime.state import (
     _TERMINAL_STATUS_VALUES,
@@ -20,7 +19,7 @@ from dendrux.runtime.state import (
     RunControl,
 )
 from dendrux.runtime.stores.sql._types import RunParentCursor
-from dendrux.types import InputValidationError
+from dendrux.types import Limits
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -42,19 +41,6 @@ def _counted_member(
     if row.id in visited or header.parent_run_id != row.parent_run_id:
         return "invalid"
     return "member"
-
-
-class ManagedRunLimitError(ManagedStateError):
-    """The root cap is exhausted, or bounded membership cannot certify admission."""
-
-    code = "managed_run_limit"
-
-    def __init__(self, *, run_id: str | None = None, reason: str = "wait_invalid") -> None:
-        self.run_id, self.reason = run_id, reason
-        PersistenceError.__init__(self, code=self.code)
-        self.safe_message = "Managed run admission refused by the root run cap."
-        self.args = (self.safe_message,)
-        _codes.log_code(logging.getLogger(__name__), _codes.MANAGED_RUN_LIMIT, run_id=run_id)
 
 
 def _managed_members(rows: Sequence[Any], root_run_id: str, visited: set[str]) -> list[str] | None:
@@ -98,7 +84,9 @@ class ManagedReads:
                 select(AgentRun.loop_state).where(AgentRun.id == request.root_run_id)
             )
         )
-        config = (root_state or {}).get("managed_limits", {"max_managed_runs": 128})
+        config = (root_state or {}).get(
+            "managed_limits", {"max_managed_runs": Limits.max_managed_runs}
+        )
         cap = config.get("max_managed_runs") if isinstance(config, dict) else None
         if type(cap) is not int or cap < 1:
             raise ManagedRunLimitError(run_id=request.parent_run_id)
@@ -108,9 +96,8 @@ class ManagedReads:
         # The dynamic mixin self resolves SQLStateStore._bind_admit's typed header.
         return cast("ManagedHeader", header)
 
-    @_safe_database_call
-    async def get_managed_run_count(
-        self: Any, root_run_id: str, *, limit: int, tenant_id: str | None
+    async def _managed_run_count(
+        self: Any, session: AsyncSession, root_run_id: str, limit: int, tenant_id: str | None
     ) -> int | None:
         """Saturating explicit membership count, root included; None is inconclusive.
 
@@ -120,18 +107,6 @@ class ManagedReads:
         before a conclusive count returns None rather than scanning unlimited siblings.
         Bind uses this same enumeration inside its root-locked transaction.
         """
-        if type(limit) is not int or limit < 1:
-            _codes.log_code(logging.getLogger(__name__), _codes.INVALID_LIMIT, run_id=root_run_id)
-            raise InputValidationError("limit", "invalid_limit")
-        async with self._session_factory() as session:
-            # Dialect mixin methods are dispatched through dynamic self.
-            return cast(
-                "int | None", await self._managed_run_count(session, root_run_id, limit, tenant_id)
-            )
-
-    async def _managed_run_count(
-        self: Any, session: AsyncSession, root_run_id: str, limit: int, tenant_id: str | None
-    ) -> int | None:
         root = await session.scalar(
             select(self.json_get(AgentRun.loop_state, (MANAGED_HEADER_KEY,), "json")).where(
                 AgentRun.id == root_run_id, AgentRun.tenant_id.is_not_distinct_from(tenant_id)

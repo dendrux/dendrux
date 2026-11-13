@@ -60,7 +60,6 @@ _REQUIREMENTS: dict[str, dict[str, tuple[str, ...]]] = {
     },
     "managed_subagents": {
         "bind_managed_child": (),
-        "get_managed_run_count": ("limit", "tenant_id"),
         "get_managed_cancel_children_page": ("after", "limit", "tenant_id"),
         "is_managed_root_stopped": (),
         "get_managed_run_control": (),

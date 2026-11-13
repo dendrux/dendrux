@@ -10,6 +10,8 @@ from dendrux.errors import SubagentTreeTooLargeError
 from dendrux.guardrails import PII
 from dendrux.llm.mock import MockLLM
 from dendrux.runtime import _managed
+from dendrux.runtime._capabilities import _REQUIREMENTS
+from dendrux.runtime._managed_cancel import ManagedStoreCapability
 from dendrux.runtime._subagents import check_subagent_tree
 from dendrux.runtime.state import RunRecord
 from dendrux.types import InputValidationError, Limits, generate_ulid
@@ -30,6 +32,11 @@ def test_public_defaults():
     limits = Limits()
     assert getattr(limits, "max_managed_runs", None) == 128
     assert getattr(limits, "max_subagent_definitions", None) == 256
+
+
+def test_managed_capability_requires_only_runtime_reads():
+    assert "get_managed_run_count" not in _REQUIREMENTS["managed_subagents"]
+    assert not hasattr(ManagedStoreCapability, "get_managed_run_count")
 
 
 @pytest.mark.parametrize("field", ["max_managed_runs", "max_subagent_definitions"])

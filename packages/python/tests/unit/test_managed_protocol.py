@@ -444,9 +444,6 @@ async def test_prerequisites_are_required_for_the_managed_capability():
         async def bind_managed_child(self, request):
             raise AssertionError("never called")
 
-        async def get_managed_run_count(self, root_run_id, *, limit, tenant_id):
-            raise AssertionError("never called")
-
         async def get_managed_cancel_children_page(self, parents, *, after, limit, tenant_id):
             raise AssertionError("never called")
 

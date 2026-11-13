@@ -19,7 +19,6 @@ from dendrux.runtime.state import MANAGED_HEADER_KEY, ManagedHeader
 from dendrux.runtime.stores._factory import store_for_engine
 from dendrux.runtime.submit import GOVERNANCE_KEY, governance_snapshot
 from dendrux.types import (
-    InputValidationError,
     Limits,
     LLMResponse,
     RunStatus,
@@ -326,6 +325,19 @@ async def test_cap_refusal_writes_nothing(store, engine):
         await store.bind_managed_child(bind_request(root, call))
     assert error.value.code == "managed_run_limit"
     assert error.value.run_id == root
+    assert type(error.value).__module__ == "dendrux.runtime._managed_limits"
+    assert error.value.reason == "run_limit"
+    assert await snapshot(engine, root) == before
+
+
+async def test_legacy_root_admission_uses_limits_default(store, engine, monkeypatch):
+    root, call = await managed_parent(store)
+    await member(store, root, completed=True)
+    monkeypatch.setattr(Limits, "max_managed_runs", 2)
+    before = await snapshot(engine, root)
+    with pytest.raises(ManagedStateError) as error:
+        await store.bind_managed_child(bind_request(root, call))
+    assert error.value.code == "managed_run_limit"
     assert await snapshot(engine, root) == before
 
 
@@ -370,8 +382,7 @@ async def test_legacy_and_foreign_members_do_not_count(store, engine):
         await store.create_run(child, "legacy", tenant_id=tenant, parent_run_id=root)
     result = await store.bind_managed_child(bind_request(root, call))
     assert result.outcome == "created"
-    assert await store.get_managed_run_count(root, limit=128, tenant_id="t1") == 2
-    assert await store.get_managed_run_count(root, limit=128, tenant_id="foreign") is None
+    assert len((await snapshot(engine, root))["children"]) == 3
 
 
 async def test_inconclusive_header_refuses_without_writes(store, engine):
@@ -431,15 +442,6 @@ async def test_restart_keeps_root_cap(store, engine):
     with pytest.raises(ManagedStateError) as error:
         await fresh.bind_managed_child(bind_request(root, call))
     assert error.value.code == "managed_run_limit"
-
-
-@pytest.mark.parametrize("limit", [0, -1, True, "SENTINEL"])
-async def test_count_invalid_limit_is_safe(store, limit):
-    root, _ = await managed_parent(store)
-    with pytest.raises(InputValidationError) as error:
-        await store.get_managed_run_count(root, limit=limit, tenant_id="t1")
-    assert error.value.code == "invalid_limit"
-    assert "SENTINEL" not in str(error.value)
 
 
 async def test_pg_populated_count_plan_and_query_counts(store, engine, monkeypatch):
@@ -522,7 +524,7 @@ async def test_pg_populated_count_plan_and_query_counts(store, engine, monkeypat
     )
 
 
-async def test_ten_runs_pass_and_replay_is_free(store):
+async def test_ten_runs_pass_and_replay_is_free(store, engine):
     root, call = await managed_parent(store)
     for i in range(8):
         await member(store, root, name=f"worker{i}", completed=True)
@@ -531,18 +533,17 @@ async def test_ten_runs_pass_and_replay_is_free(store):
     replay = await store.bind_managed_child(request)
     assert created.outcome == "created"
     assert replay.outcome == "existing"
-    count = getattr(store, "get_managed_run_count", None)
-    assert callable(count), "managed count capability missing"
-    assert await count(root, limit=128, tenant_id="t1") == 10
+    async with AsyncSession(engine) as session:
+        assert await session.scalar(select(func.count()).select_from(AgentRun)) == 10
 
 
-async def test_replay_at_full_cap_is_free(store):
+async def test_replay_at_full_cap_is_free(store, engine):
     root, call = await managed_parent(store)
     await cap_root(store, root, 2)
     request = bind_request(root, call)
     assert (await store.bind_managed_child(request)).outcome == "created"
     assert (await store.bind_managed_child(request)).outcome == "existing"
-    assert await store.get_managed_run_count(root, limit=128, tenant_id="t1") == 2
+    assert len((await snapshot(engine, root))["children"]) == 1
 
 
 @pytest.mark.parametrize("round_number", range(3))

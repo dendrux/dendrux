@@ -70,12 +70,10 @@ managed_crash = contract(
 
 
 @managed
-async def test_managed_root_cap_and_saturating_count(dendrux_kit: Kit) -> None:
+async def test_managed_root_cap_refuses_without_writes(dendrux_kit: Kit) -> None:
     kit = dendrux_kit
     request = await _parent(kit)
     root = request.root_run_id
-    assert await kit.store.get_managed_run_count(root, limit=128, tenant_id="t") == 1
-    assert await kit.store.get_managed_run_count(root, limit=128, tenant_id=None) is None
     state = await kit.store.get_loop_state(root)
     state["managed_limits"] = {"max_managed_runs": 1}
     await kit.store.checkpoint_step(
@@ -89,16 +87,18 @@ async def test_managed_root_cap_and_saturating_count(dendrux_kit: Kit) -> None:
 
 
 @managed
-async def test_managed_count_replay_and_legacy_exclusion(dendrux_kit: Kit) -> None:
+async def test_managed_cap_replay_and_legacy_exclusion(dendrux_kit: Kit) -> None:
     kit = dendrux_kit
     request = await _parent(kit)
     root = request.root_run_id
+    state = await kit.store.get_loop_state(root)
+    state["managed_limits"] = {"max_managed_runs": 2}
+    await kit.store.checkpoint_step(
+        root, claim_epoch=0, loop_state=state, pii_mapping=None, trace=None
+    )
     await kit.store.create_run(ulid(), "legacy", tenant_id="t", parent_run_id=root)
     await kit.store.bind_managed_child(request)
-    assert await kit.store.get_managed_run_count(root, limit=128, tenant_id="t") == 2
-    assert await kit.store.get_managed_run_count(root, limit=1, tenant_id="t") == 1
     assert (await kit.store.bind_managed_child(request)).outcome == "existing"
-    assert await kit.store.get_managed_run_count(root, limit=128, tenant_id="t") == 2
 
 
 async def _parent(kit: Kit, tenant: str | None = "t") -> BindManagedChildRequest:
