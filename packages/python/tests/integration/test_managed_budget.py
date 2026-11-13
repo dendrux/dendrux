@@ -1223,3 +1223,89 @@ async def test_unknown_resume_does_not_accept_a_descendant_call_made_after_the_p
     final, final_llm, _, _ = agents(store, [response()], [], budget)
     done = await resume_unknown(final, store, result, streaming=streaming)
     assert done.status == RunStatus.SUCCESS and final_llm.calls == 1
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize(
+    "limits,late_pauses",
+    [
+        ({"max_tokens": 100000, "max_cost_usd": 10}, True),
+        ({"max_cost_usd": 10}, True),
+        ({"max_tokens": 100000}, False),
+    ],
+    ids=["tokens_and_cost", "cost_only", "tokens_only"],
+)
+async def test_unknown_resume_enforces_a_late_real_descendant_unpriced_call(
+    store, monkeypatch, streaming, limits, late_pauses
+):
+    import asyncio
+
+    from tests.integration.test_budget import _CostReportingLLM
+
+    budget = Budget(on_exceed="pause", **limits)
+    late_llm = _CostReportingLLM([response(None)], gate_at=0)
+    late = Agent(
+        name="late", prompt="Work", provider=late_llm, state_store=store, strict_tenancy=False
+    )
+    task = None
+    unavailable = False
+    original = store.subtree_usage
+
+    @tool()
+    async def launch_helper() -> str:
+        """Start developer-owned work on the same store."""
+        nonlocal task, unavailable
+        task = asyncio.create_task(late.run("go"))
+        await asyncio.wait_for(late_llm.entered.wait(), 5)
+        unavailable = True
+        return "started"
+
+    async def read(*args, **kwargs):
+        if unavailable:
+            raise RuntimeError("usage temporarily unavailable")
+        return await original(*args, **kwargs)
+
+    def build(root_responses):
+        template = Agent(
+            name="child",
+            description="Worker",
+            prompt="Work",
+            provider=_CostReportingLLM([]),
+        )
+        llm = _CostReportingLLM(root_responses)
+        agent = Agent(
+            name="root",
+            prompt="Lead",
+            provider=llm,
+            tools=[launch_helper],
+            subagents=[template],
+            state_store=store,
+            strict_tenancy=False,
+            budget=budget,
+        )
+        return agent, llm
+
+    root, root_llm = build([response(1, "launch_helper"), response()])
+    monkeypatch.setattr(store, "subtree_usage", read)
+    try:
+        paused = await run_root(root, streaming)
+        pause = await store.get_pause_state(paused.run_id)
+        assert pause["pause_message"] == "managed_usage_unknown"
+    finally:
+        monkeypatch.setattr(store, "subtree_usage", original)
+        late_llm.gate.set()
+        late_result = await task
+    assert (await store.get_run(late_result.run_id)).parent_run_id == paused.run_id
+    assert (await store.subtree_usage(paused.run_id)).unpriced_calls == 1
+    again, again_llm = build([response()])
+    resumed = await resume_unknown(again, store, paused, streaming=streaming)
+    if not late_pauses:
+        # Tokens-only: the ordinary gate (no cost limit) is unchanged.
+        assert resumed.status == RunStatus.SUCCESS and again_llm.calls == 1
+        return
+    assert resumed.status == RunStatus.PAUSED and again_llm.calls == 0
+    state = await store.get_pause_state(paused.run_id)
+    assert state["pause_reason"] == "budget" and state.get("pause_message") is None
+    final, final_llm = build([response()])
+    done = await resume_unknown(final, store, resumed, streaming=streaming)
+    assert done.status == RunStatus.SUCCESS and final_llm.calls == 1

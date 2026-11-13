@@ -119,7 +119,8 @@ async def test_resume_ack_is_durable_but_does_not_accept_a_new_fault_twice():
         _managed_budget_resuming=True,
         _checkpoint=AsyncMock(),
     )
-    tracker = SimpleNamespace(_invalid_usage=True)
+    tracker = tracker_for(Budget(max_cost_usd=10))
+    tracker._invalid_usage = True
     accept_paused_fault(recorder, tracker)
     assert not tracker._invalid_usage
     assert recorder._loop_state == {"managed_usage_accepted": marker}
@@ -143,7 +144,8 @@ def test_reclaim_is_not_an_acknowledgement():
         _resume_pause_data={"pause_reason": "budget", "pause_message": "managed_usage_unknown"},
         _managed_budget_resuming=False,
     )
-    tracker = SimpleNamespace(_invalid_usage=True)
+    tracker = tracker_for(Budget(max_cost_usd=10))
+    tracker._invalid_usage = True
     accept_paused_fault(recorder, tracker)
     assert tracker._invalid_usage and recorder._loop_state["managed_usage_unknown"] == marker
 

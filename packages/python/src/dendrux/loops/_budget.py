@@ -395,6 +395,10 @@ class BudgetTracker:
         """Raise the accepted unpriced-call baseline (never lowers it)."""
         self._ack_unpriced = max(self._ack_unpriced, count)
 
+    def lift_resume_gate(self) -> None:
+        """Enforce every current limit at the first checkpoint, not just the paused metrics."""
+        self._gate = ()
+
     def record_unpriced_seen(self, count: int) -> None:
         """Remember a valid measured count so a pause carries it for its resume."""
         self._seen_unpriced = max(self._seen_unpriced, count)

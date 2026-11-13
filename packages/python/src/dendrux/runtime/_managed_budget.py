@@ -214,6 +214,10 @@ def accept_paused_fault(recorder: Any, tracker: BudgetTracker) -> None:
             and state.get(UNKNOWN)
         ):
             state[ACCEPTED] = usage_fault(state.pop(UNKNOWN), recorder._run_id)
+            # The pause may have saved only some metrics; the unknown-usage resume
+            # enforces all of them, accepting only the unpriced count it recorded.
+            tracker.lift_resume_gate()
+            tracker.accept_unpriced(accepted_count(pause.get("budget_unpriced_calls")))
     if state.get(ACCEPTED) and not state.get(UNKNOWN):
         tracker._invalid_usage = False
 
