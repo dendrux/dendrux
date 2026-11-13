@@ -239,6 +239,7 @@ async def test_warn_fault_remains_enforced_after_binding_a_new_policy():
         _loop_state={"managed": {"root_run_id": run_id}, "managed_usage_unknown": marker},
         _managed_policy=Budget(max_tokens=100, on_exceed="warn"),
         _checkpoint=AsyncMock(),
+        _store=SimpleNamespace(subtree_usage=AsyncMock(side_effect=RuntimeError)),
     )
     for action in ("warn", "pause"):
         recorder._managed_policy = Budget(max_tokens=100, on_exceed=action)

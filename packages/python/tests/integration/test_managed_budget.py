@@ -1187,3 +1187,39 @@ async def test_unpriced_checkpoint_query_cost_is_unchanged(
                 }
             )
         )
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_unknown_resume_does_not_accept_a_descendant_call_made_after_the_pause(
+    store, monkeypatch, streaming
+):
+    from dendrux.types import generate_ulid
+
+    budget = Budget(max_cost_usd=10, on_exceed="pause")
+    root, llm, _, _ = agents(store, [response()], [], budget)
+    original = store.subtree_usage
+
+    async def unavailable(*args, **kwargs):
+        raise RuntimeError("usage temporarily unavailable")
+
+    monkeypatch.setattr(store, "subtree_usage", unavailable)
+    paused = await run_root(root, streaming)
+    pause = await store.get_pause_state(paused.run_id)
+    assert pause["pause_message"] == "managed_usage_unknown" and llm.calls == 0
+    assert not pause.get("budget_unpriced_calls")
+    monkeypatch.setattr(store, "subtree_usage", original)
+    # A descendant commits an unpriced call after the unknown pause was written.
+    late = generate_ulid()
+    await store.create_run(late, "late-descendant", parent_run_id=paused.run_id)
+    await store.save_llm_interaction(
+        late, iteration_index=1, usage=response(None).usage, interaction_id=generate_ulid()
+    )
+    again, again_llm, _, _ = agents(store, [response()], [], budget)
+    result = await resume_unknown(again, store, paused, streaming=streaming)
+    assert result.status == RunStatus.PAUSED and again_llm.calls == 0
+    # The next pause is the ordinary one, which the operator then resumes normally.
+    state = await store.get_pause_state(paused.run_id)
+    assert state["pause_reason"] == "budget" and state.get("pause_message") is None
+    final, final_llm, _, _ = agents(store, [response()], [], budget)
+    done = await resume_unknown(final, store, result, streaming=streaming)
+    assert done.status == RunStatus.SUCCESS and final_llm.calls == 1

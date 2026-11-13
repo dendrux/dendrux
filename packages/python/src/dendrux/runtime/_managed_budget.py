@@ -173,25 +173,30 @@ async def hold_fault(recorder: Any, fault: Any = None) -> None:
     await recorder._checkpoint()
 
 
-async def measure_shared(recorder: Any, tracker: BudgetTracker, root_id: str, policy: Any) -> Any:
-    """Read once, keeping every observed invalid/shared fault sticky until explicit resume."""
-    if tracker._invalid_usage or recorder._loop_state.get(UNKNOWN):
-        await hold_fault(recorder)
-        return None
+async def read_usage(recorder: Any, root_id: str, policy: Any) -> Any:
+    """One shared read; None when unavailable or invalid."""
     try:
         usage = await recorder._store.subtree_usage(
             root_id, max_nodes=policy.max_subtree_nodes if policy is not None else 10000
         )
     except (PersistenceError, SQLAlchemyError, ValueError, TypeError, RuntimeError):
-        usage = None
-    if not valid_usage(usage):
+        return None
+    return usage if valid_usage(usage) else None
+
+
+async def measure_shared(recorder: Any, tracker: BudgetTracker, root_id: str, policy: Any) -> Any:
+    """Read once, keeping every observed invalid/shared fault sticky until explicit resume.
+
+    A fault checkpoint makes one best-effort read so the pause records the unpriced
+    count that was valid when it was written; a resume accepts at most that count.
+    """
+    faulted = tracker._invalid_usage or recorder._loop_state.get(UNKNOWN)
+    usage = await read_usage(recorder, root_id, policy)
+    if faulted or usage is None:
+        if usage is not None:
+            tracker.record_unpriced_seen(usage.unpriced_calls)
         await hold_fault(recorder)
         return None
-    if getattr(recorder, "_managed_accept_unpriced", False):
-        # Resuming a usage-unknown pause accepts the spend it could not measure.
-        recorder._managed_accept_unpriced = False
-        tracker.accept_unpriced(usage.unpriced_calls)
-        recorder._loop_state[UNPRICED_ACCEPTED] = tracker.unpriced_baseline
     return usage
 
 
@@ -209,7 +214,6 @@ def accept_paused_fault(recorder: Any, tracker: BudgetTracker) -> None:
             and state.get(UNKNOWN)
         ):
             state[ACCEPTED] = usage_fault(state.pop(UNKNOWN), recorder._run_id)
-            recorder._managed_accept_unpriced = True
     if state.get(ACCEPTED) and not state.get(UNKNOWN):
         tracker._invalid_usage = False
 

@@ -395,6 +395,10 @@ class BudgetTracker:
         """Raise the accepted unpriced-call baseline (never lowers it)."""
         self._ack_unpriced = max(self._ack_unpriced, count)
 
+    def record_unpriced_seen(self, count: int) -> None:
+        """Remember a valid measured count so a pause carries it for its resume."""
+        self._seen_unpriced = max(self._seen_unpriced, count)
+
     def bind_shared(self, reader: Any) -> None:
         """Use one authoritative, flushed shared scope supplied by the runtime."""
         self._shared_reader = reader
