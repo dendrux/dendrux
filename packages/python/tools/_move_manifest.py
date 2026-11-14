@@ -347,7 +347,7 @@ def metadata(
     if len(found) != 1:
         raise ValueError("metadata pin missing/duplicated/mismatched")
     definitions = roots(tree, root)
-    if len(definitions) != 1 or tree.body.index(found[0]) <= tree.body.index(definitions[0]):
+    if not definitions or tree.body.index(found[0]) <= max(tree.body.index(n) for n in definitions):
         raise ValueError(f"metadata pin must follow its definition: {root}")
     tree.body.remove(found[0])
 
