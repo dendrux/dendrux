@@ -409,3 +409,61 @@ more time, mark it `@pytest.mark.timeout(<seconds>)` and say why.
   package `__init__` execution, but not conditional or `importlib` imports); the Semgrep
   `str-exc-in-log` rule looks for `str(exc)` and f-strings inside log calls and `error_info`,
   not for `%s` with the exception.
+
+### Reviewed split manifests and conserved keys
+
+`make move-check ... MOVE_ARGS="--move-manifest tools/moves/pr1.json ..."` enables
+only the reviewed lexical, import-hoist, annotation and metadata normalizations, plus the named shared logger's original
+module-name literal.
+Without a manifest the ordinary checker retains its previous strict behavior.
+The schema, exact PR1 command and temporary CI lifecycle are in
+[`moves/README.md`](moves/README.md). `make move-proof` verifies tracked cumulative
+sources and maps from their immutable original bases. Private owner-docs files are
+never CI inputs.
+
+Use the reviewed v4 `baseline-key-map.json` as input to `tools/move_keys.py`. This
+command prints a proposed baseline to stdout and never stamps a file:
+
+```sh
+python -m tools.move_keys size --map /reviewed/baseline-key-map.json \
+  --baseline tools/size_baseline.json --scores /fresh/size-scores.json \
+  --present /fresh/present-keys.json
+```
+
+Run independently for `size`, `cognitive`, `crap`, `ruff`, `vulture` and `semgrep`.
+Scores use each existing collector's native JSON key/value format. `present` is a
+JSON list of measured lexical identities (Ruff also accepts present module names).
+Supply fresh measurements from the same checkout; CRAP still needs ordinary fresh
+CI coverage and its source-hash validation. Do not feed metadata-pinned names into
+metric keys: SQL methods use their real lexical `_SqlWrites` and peer class names.
+
+Future destinations are inactive while their old identity remains. Activated
+function transfers require the old identity to disappear, one destination, exact
+reviewed source allowance and a current measurement no larger than that allowance.
+Size transfers never create file allowances and drop functions at or below 80.
+Cognitive debt at or below 15 is removed. CRAP caps both complexity and CRAP while
+recording the fresh lexical digest. Ruff conserves each source/rule independently
+across the residual module and its created owners, including small functions found
+in the CRAP map. Empty vulture/semgrep mappings grant no new allowance.
+
+`move_keys.exemption_transfers(map, allow_in_keys)` resolves semgrep exemptions
+through the same exact lexical owner map. The SQL write task moves the exemption to
+`dendrux.runtime.stores.sql._sql_writes:_SqlWrites._write_tx` atomically; entry,
+start, images, events and outcome exemptions follow their individual function
+owners. No committed baseline or rule exemption changes as part of tooling setup.
+The coordinator reviews/stamps the proposed changes and runs ordinary shrink-only
+checks. The existing size-ratchet move-pair interface remains available unchanged.
+
+Limits: manifests are reviewed evidence, not a proof of the completeness of a manual
+imported-seam inventory or of custom/dynamic patch interception. The existing patch
+codemod's supported static subset is unchanged; the 13 dynamic cases need their
+listed runtime fault assertions in the relevant move task. Hoists are deliberately
+restricted to leading unconditional imports with conserved comments. Beyond the
+small inert stdlib set, an import must already load through original unconditional
+imports; intermediate eager-dependency snapshots are hash-verified. Other imports
+require a separately reviewed prerequisite. Provider snapshots support the
+base-free ManagedReads/SQLBlobCatalog shape; unknown bases and ambiguous/C3-invalid
+composition fail closed. No new decorators, wrappers, runtime contract methods or
+arbitrary executable edits are normalized. Original physical spans are measured
+before AST normalization, so whitespace cannot grow an inherited >80-line function,
+including one remaining in the facade.
