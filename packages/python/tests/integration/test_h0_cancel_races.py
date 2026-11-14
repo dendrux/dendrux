@@ -7,7 +7,7 @@ import pytest
 
 from dendrux import tool
 from dendrux.loops import _helpers
-from dendrux.runtime import runner
+from dendrux.runtime import _run_outcome
 from dendrux.runtime.persistence import PersistenceRecorder
 from dendrux.types import LLMResponse, RunStatus
 from tests._fixtures.storage import pin_storage_format
@@ -43,7 +43,7 @@ async def test_cancel_committed_before_pause_wins(
     case.agent.tools.append(wait_on_client)
     gate = Gate()
     owner, method = {
-        "outcome": (runner, "_persist_loop_outcome"),
+        "outcome": (_run_outcome, "_persist_loop_outcome"),
         "checkpoint": (PersistenceRecorder, "checkpoint_outcome"),
         "pause_cas": (store, "pause_with_event"),
     }[cut]
@@ -52,6 +52,7 @@ async def test_cancel_committed_before_pause_wins(
     try:
         async with running(case.invoke(), gate) as task:
             await gate.entered.wait()
+            assert gate.args is not None
             run_id = provider.run_id
             before = await event_counts(other, run_id)
             assert await other.request_cancel(run_id)

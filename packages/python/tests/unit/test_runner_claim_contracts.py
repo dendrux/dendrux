@@ -14,7 +14,7 @@ from sqlalchemy import event, update
 
 from dendrux.db.models import AgentRun
 from dendrux.errors import RunAlreadyTerminalError, StoreOutcomeUnknown
-from dendrux.runtime import runner, submit
+from dendrux.runtime import runner, state, submit
 from dendrux.types import ApprovalDecision, LLMResponse, RunStatus, TextPart
 from tests._fixtures.storage import pin_storage_format
 from tests._helpers.runtime_paths import SUBMIT_KINDS, path_case
@@ -335,7 +335,7 @@ async def test_resume_status_fallbacks_and_release_status(monkeypatch, results, 
         return await claim(store, run_id, expected_status=expected_status, validate=validate)
 
     store.claim_paused_run = method
-    monkeypatch.setattr(runner, "claimed_store", lambda *a: view)
+    monkeypatch.setattr(state, "claimed_store", lambda *a: view)
     monkeypatch.setattr(runner, "report_governance_change", AsyncMock(side_effect=original))
     release = AsyncMock()
     monkeypatch.setattr(runner, "_release_claim", release)
@@ -463,7 +463,7 @@ async def test_resume_payload_priority(store, monkeypatch, decisions, results, u
         return 3
 
     monkeypatch.setattr(store, "submit_and_claim", claim)
-    monkeypatch.setattr(runner, "claimed_store", lambda *a: store)
+    monkeypatch.setattr(state, "claimed_store", lambda *a: store)
     monkeypatch.setattr(runner, "report_governance_change", AsyncMock())
     try:
         await runner._claim_resume(
@@ -504,7 +504,7 @@ async def test_descriptor_capability_gate_is_caller_specific(monkeypatch, path):
     if path == "resume":
         monkeypatch.setattr(runner, "submission_validator", lambda *a, **kw: lambda raw: None)
         monkeypatch.setattr(runner, "require_pause_id", lambda *a, **kw: None)
-        monkeypatch.setattr(runner, "claimed_store", lambda *a: store)
+        monkeypatch.setattr(state, "claimed_store", lambda *a: store)
         monkeypatch.setattr(runner, "report_governance_change", AsyncMock())
         await runner._claim_resume(
             store, "run", raw, object(), "waiting_client_tool", expected_pause_id=None, results=[]

@@ -16,12 +16,11 @@ from tests.integration.test_tenant_run_control import _pause
 
 @pytest.mark.parametrize("resume", [False, True])
 async def test_fenced_stream_yields_persisted_outcome(store, monkeypatch, resume):
-    import dendrux.runtime.runner as runner
 
     finished = AsyncMock()
     failed = AsyncMock()
     monkeypatch.setattr(_helpers, "record_run_finished", finished)
-    monkeypatch.setattr(runner, "record_run_failed", failed)
+    monkeypatch.setattr(_helpers, "record_run_failed", failed)
 
     @tool()
     async def never() -> str:
@@ -69,11 +68,10 @@ async def test_fenced_stream_yields_persisted_outcome(store, monkeypatch, resume
 async def test_fenced_stream_preserves_live_winner_status(
     store, monkeypatch, resume, winner_status
 ):
-    from dendrux.runtime import runner
     from dendrux.types import RunEventType
 
     failed = AsyncMock()
-    monkeypatch.setattr(runner, "record_run_failed", failed)
+    monkeypatch.setattr(_helpers, "record_run_failed", failed)
 
     @tool()
     async def never() -> str:

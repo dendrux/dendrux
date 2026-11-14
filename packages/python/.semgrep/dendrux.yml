@@ -303,7 +303,7 @@ rules:
     metadata:
       include: ["runtime/", "agent.py", "loops/"]
       allow_in:
-        - "dendrux.runtime.runner:_new_run_metadata"
+        - "dendrux.runtime._run_entry:_new_run_metadata"
         # A real copy (image-error idempotent hit); the H5/H6 runner work removes it.
         - "dendrux.runtime._run_images:_idempotent_hit_after_image_error"
     pattern-either:
@@ -317,7 +317,7 @@ rules:
     languages: [python]
     metadata:
       exclude: ["runtime/stores/", "runtime/state.py", "testing/", "db/"]
-      allow_in: ["dendrux.runtime.runner:_start_new_run"]
+      allow_in: ["dendrux.runtime._run_start:_start_new_run"]
     pattern-either:
       - patterns:
           - pattern-either:
@@ -354,7 +354,7 @@ rules:
     metadata:
       exclude: ["runtime/stores/", "runtime/state.py", "testing/", "db/"]
       allow_in:
-        - "dendrux.runtime.runner:_persist_run_failure"
+        - "dendrux.runtime._run_start:_persist_run_failure"
         - "dendrux.runtime._reclaim:_handle_rebuild_failure"
     pattern-either:
       - patterns:
@@ -401,7 +401,7 @@ rules:
       exclude: ["runtime/stores/", "runtime/state.py", "testing/", "db/"]
       allow_in:
         - "dendrux.runtime._run_events:_persist_run_cancellation"
-        - "dendrux.runtime.runner:_finalize_loop_cancelled"
+        - "dendrux.runtime._run_outcome:_finalize_loop_cancelled"
         - "dendrux.runtime._run_events:_pause_with_event"
         - "dendrux.agent:Agent._cancel_one"
     patterns:

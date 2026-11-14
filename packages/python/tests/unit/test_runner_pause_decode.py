@@ -9,7 +9,7 @@ import pytest
 from dendrux import Agent
 from dendrux.errors import PersistenceError, RunNotReclaimableError
 from dendrux.llm.mock import MockLLM
-from dendrux.runtime import _reclaim, replay, runner
+from dendrux.runtime import _reclaim, _run_entry, replay, runner
 from dendrux.skills import _session
 from dendrux.types import (
     ImageViewState,
@@ -117,7 +117,7 @@ async def test_checkpoint_fields_refs_and_reasoning_source(monkeypatch, entry, s
         content=json.dumps(payloads[ref])
     )
     session = Mock() if session_present else None
-    monkeypatch.setattr(runner, "current_skill_session", lambda agent: session)
+    monkeypatch.setattr(_run_entry, "current_skill_session", lambda agent: session)
     monkeypatch.setattr(_session, "current", lambda agent: session)
     if entry == "resume":
         reads = runner._PauseReads(store.get_run.return_value)
