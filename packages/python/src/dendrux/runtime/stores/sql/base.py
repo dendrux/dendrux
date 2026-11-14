@@ -12,6 +12,7 @@ import json
 import logging
 import re
 from contextlib import asynccontextmanager
+from inspect import getmembers, iscoroutinefunction
 from typing import TYPE_CHECKING, Any, Literal, NoReturn, cast
 
 from sqlalchemy import and_, select, true
@@ -717,10 +718,8 @@ def _validated_store_write(method: Any) -> Any:
 
 
 def _validated_store_writes(cls: Any) -> Any:
-    from inspect import iscoroutinefunction
-
-    for name, method in list(vars(cls).items()):
-        if iscoroutinefunction(method) and name.startswith(
+    for name, method in getmembers(cls, iscoroutinefunction):
+        if name.startswith(
             (
                 "save_",
                 "create_",
