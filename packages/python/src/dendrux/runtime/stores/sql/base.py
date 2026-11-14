@@ -158,6 +158,7 @@ from dendrux.runtime.state import (
     _write_event,
 )
 from dendrux.runtime.stores.sql._managed_reads import ManagedReads
+from dendrux.runtime.stores.sql._sql_host import _StoreHost
 from dendrux.runtime.stores.sql._types import (
     ConflictSpec,
     PatchLoopState,
@@ -743,7 +744,7 @@ def _validated_store_writes(cls: Any) -> Any:
 
 @safe_database_operations
 @_validated_store_writes
-class SQLStateStore(ManagedReads, SQLBlobCatalog):
+class SQLStateStore(_StoreHost, ManagedReads, SQLBlobCatalog):
     """Default StateStore implementation using SQLAlchemy async.
 
     Works with SQLite (zero-config) and Postgres (via an explicit engine).

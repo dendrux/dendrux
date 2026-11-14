@@ -70,19 +70,55 @@ def _snapshot(cls):
     return {"mro": [base.__name__ for base in cls.__mro__], "members": members}
 
 
-# Captured from c2e31697 before changing the decorator. Readable snapshots are
-# retained in the task evidence; the test has no dependency on private files.
+EXPECTED_MRO = {
+    "SQLStateStore": [
+        "SQLStateStore",
+        "_StoreHost",
+        "ManagedReads",
+        "SQLBlobCatalog",
+        "object",
+    ],
+    "SQLiteStateStore": [
+        "SQLiteStateStore",
+        "SQLStateStore",
+        "_StoreHost",
+        "ManagedReads",
+        "SQLBlobCatalog",
+        "object",
+    ],
+    "PostgresStateStore": [
+        "PostgresStateStore",
+        "SQLStateStore",
+        "_StoreHost",
+        "ManagedReads",
+        "SQLBlobCatalog",
+        "object",
+    ],
+    "MySQLStateStore": [
+        "MySQLStateStore",
+        "SQLStateStore",
+        "_StoreHost",
+        "ManagedReads",
+        "SQLBlobCatalog",
+        "object",
+    ],
+}
+
+# Member snapshots remain those captured from c2e31697 before changing the
+# decorator. Only the exact MRO above changes for the reviewed host insertion.
+# Readable snapshots are retained in the task evidence, not loaded by this test.
 BASELINE = {
-    "SQLStateStore": (104, "3911714a5552c503ca99a9052a2197efd166fec0389b7192348f8a1c5378ea49"),
-    "SQLiteStateStore": (103, "6fd4323ce3ff6eb9b17f527628519968ed609dd9858adc2cb7a71040cfd6ba9b"),
-    "PostgresStateStore": (104, "1e7cbd76b9f31a63490dac7f41a231b9bd6ea2b3764de98bfd401540d172dbab"),
-    "MySQLStateStore": (103, "eb0c1fd4ea37eea09b42875cfe8de3045871708af4316fd1b128f568daea3be4"),
+    "SQLStateStore": (104, "b0a520f53656d915615c5df22df2741a1158048b116abc51c44cf2e4210564c6"),
+    "SQLiteStateStore": (103, "7a9d65aa650e021e7da72054758c63e5f80758c53b1fae6337007fae05471e6a"),
+    "PostgresStateStore": (104, "9b9b3772b9c579d5153306f052def2c3a5b7d3872d39a3633523db2a42325f9f"),
+    "MySQLStateStore": (103, "4c70921e7059ade1a1e505d318889ea43a836ba2aed33e2ca4bc2ee17186de8e"),
 }
 
 
 @pytest.mark.parametrize("cls", STORES)
 def test_exact_wrapper_signature_kind_and_mro_snapshot(cls):
     snapshot = _snapshot(cls)
+    assert snapshot["mro"] == EXPECTED_MRO[cls.__name__]
     digest = hashlib.sha256(json.dumps(snapshot, sort_keys=True).encode()).hexdigest()
     wrapped = sum(len(member["layers"]) > 1 for member in snapshot["members"].values())
     assert (wrapped, digest) == BASELINE[cls.__name__]
