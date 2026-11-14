@@ -13,7 +13,7 @@ from dendrux.errors import ProviderTimeoutError, RunFencedError
 from dendrux.llm.mock import MockLLM
 from dendrux.loops.base import BaseNotifier
 from dendrux.loops.react import ReActLoop
-from dendrux.runtime import _run_events, _run_images, runner
+from dendrux.runtime import _run_events, _run_images, replay, runner
 from dendrux.runtime.persistence import PersistenceRecorder
 from dendrux.store import SQLiteStateStore
 from dendrux.types import LLMResponse, RunEventType, RunStatus, ToolCall, ToolResult
@@ -191,7 +191,7 @@ async def test_retry_seed_uses_requested_id_when_source_id_is_normalized(store, 
     monkeypatch.setattr(runner, "_retry_source", normalized_source)
     prefix = AsyncMock(wraps=runner.record_run_prefix)
     images = AsyncMock(return_value=None)
-    monkeypatch.setattr(runner, "record_run_prefix", prefix)
+    monkeypatch.setattr(replay, "record_run_prefix", prefix)
     monkeypatch.setattr(_run_images, "_start_image_view", images)
     await invoke(observer())
     assert prefix.await_args.kwargs["seed"] == {"retry_of": requested_ids[0]}

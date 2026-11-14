@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from dendrux.loops import _helpers
-from dendrux.runtime import runner
+from dendrux.runtime import runner, state
 from dendrux.runtime._managed import DESCEND_KEY as MANAGED_DESCEND_KEY
 from dendrux.types import RunEvent, RunEventType, RunResult, RunStatus, generate_ulid
 from tests.unit.test_runner_move_contract import store as store
@@ -162,8 +162,8 @@ async def test_managed_handoff_keeps_lifecycle_sinks_open(monkeypatch):
 async def test_failure_unwind_attempts_each_sink_once(monkeypatch):
     record = AsyncMock()
     notify = AsyncMock()
-    monkeypatch.setattr(runner, "record_run_failed", record)
-    monkeypatch.setattr(runner, "notify_run_failed", notify)
+    monkeypatch.setattr(_helpers, "record_run_failed", record)
+    monkeypatch.setattr(_helpers, "notify_run_failed", notify)
     lifecycle = runner._RunLifecycle(generate_ulid(), None, None)
     await lifecycle._fail_sinks(RuntimeError("failure"), None, None)
     await lifecycle._fail_sinks(RuntimeError("failure again"), None, None)
@@ -181,7 +181,7 @@ async def test_claimed_store_fault_reaches_fresh_and_resumed_consumers(store, mo
     case = await path_case(store, None, path, ScriptedLLM([LLMResponse(text="done")]))
     failure = RuntimeError("claimed store fault")
     fault = Mock(side_effect=failure)
-    monkeypatch.setattr(runner, "claimed_store", fault)
+    monkeypatch.setattr(state, "claimed_store", fault)
     try:
         if path in {"run", "resume"}:
             with pytest.raises(RuntimeError) as caught:

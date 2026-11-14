@@ -15,7 +15,7 @@ import pytest
 from dendrux import Agent, tool
 from dendrux.errors import ProviderTimeoutError
 from dendrux.loops.base import BaseNotifier
-from dendrux.runtime import _run_observers
+from dendrux.runtime import _run_entry, _run_observers
 from dendrux.runtime.context import (
     DelegationContext,
     DelegationDepthExceededError,
@@ -1072,7 +1072,6 @@ async def test_stale_resume_release_cannot_publish_abort(store):
 
 @pytest.mark.parametrize("failure_kind", ["error", "cancellation"])
 async def test_retry_failure_before_creation_finalizes_nothing(store, monkeypatch, failure_kind):
-    from dendrux.runtime import runner
 
     a = make_agent(store, [LLMResponse(text="prior")])
     original = await a.run("go")
@@ -1084,7 +1083,7 @@ async def test_retry_failure_before_creation_finalizes_nothing(store, monkeypatc
     finalize = AsyncMock()
     monkeypatch.setattr(store, "finalize_run", finalize)
     monkeypatch.setattr(store, "finalize_with_event", finalize)
-    monkeypatch.setattr(runner, "_create_runtime_run", AsyncMock(side_effect=failure))
+    monkeypatch.setattr(_run_entry, "_create_runtime_run", AsyncMock(side_effect=failure))
     with pytest.raises(type(failure)) as caught:
         await a.retry(original.run_id)
     assert caught.value is failure

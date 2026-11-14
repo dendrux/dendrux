@@ -7,6 +7,7 @@ import pytest
 from dendrux import Agent, tool
 from dendrux.errors import RunNotReclaimableError
 from dendrux.llm.mock import MockLLM
+from dendrux.runtime import replay as replay_mod
 from dendrux.strategies.native import NativeToolCalling
 from dendrux.types import Limits, LLMResponse, RunStatus, ToolCall, ToolResult
 
@@ -184,7 +185,7 @@ async def test_retry_replay_keeps_configured_limits(store, engine, monkeypatch):
             observed.append(kwargs.get("limits"))
             return await original(*args, **kwargs)
 
-        monkeypatch.setattr(runner, "_load_replay_runs", capture)
+        monkeypatch.setattr(replay_mod, "_load_replay_runs", capture)
         result = await agent.retry(source.run_id, tenant_id="tenant")
         assert result.status == RunStatus.SUCCESS
         assert observed == [limits]

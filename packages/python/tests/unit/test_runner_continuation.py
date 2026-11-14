@@ -6,11 +6,11 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from dendrux import Agent
+from dendrux import Agent, chat
 from dendrux.llm.mock import MockLLM
 from dendrux.loops import _helpers
 from dendrux.loops.react import ReActLoop
-from dendrux.runtime import _reclaim, _run_events, _run_images, runner
+from dendrux.runtime import _reclaim, _run_events, _run_images, _run_outcome, runner
 from dendrux.types import (
     ImagePart,
     ImageRef,
@@ -96,7 +96,7 @@ async def test_resumed_payload_on_both_entries(store, monkeypatch, entry, kind):
         ),
     )
     if kind == "input":
-        monkeypatch.setattr(runner, "split_user_content", lambda value: ("answer", (object(),)))
+        monkeypatch.setattr(chat, "split_user_content", lambda value: ("answer", (object(),)))
     monkeypatch.setattr(runner, "validate_result_names", Mock())
     monkeypatch.setattr(
         runner, "prepare_resume_results", AsyncMock(side_effect=lambda a, s, r, p, trs: trs)
@@ -278,7 +278,7 @@ async def test_recovering_stream_stop_matches_helpers(store, monkeypatch, status
     async def notifier(*args):
         calls.append(("notifier", args[-1]))
 
-    monkeypatch.setattr(runner, "_persist_loop_outcome", persist)
+    monkeypatch.setattr(_run_outcome, "_persist_loop_outcome", persist)
     monkeypatch.setattr(_helpers, "record_run_finished", recorder)
     monkeypatch.setattr(_helpers, "notify_run_finished", notifier)
     events = [

@@ -13,6 +13,7 @@ from dendrux.db.models import AgentRun
 from dendrux.errors import RunNotReclaimableError
 from dendrux.guardrails import SecretDetection
 from dendrux.llm.mock import MockLLM
+from dendrux.runtime import _run_start
 from dendrux.runtime._blocked_content import _blocked_write
 from dendrux.types import LLMResponse, RunStatus, ToolCall, ToolResult
 from tests._fixtures.storage import pin_storage_format
@@ -162,13 +163,13 @@ async def test_reclaim_finishes_a_crash_inside_the_stop(store, engine, monkeypat
     async def crash(*args, **kwargs):
         raise Crash()
 
-    monkeypatch.setattr(runner, "_persist_run_failure", crash)
+    monkeypatch.setattr(_run_start, "_persist_run_failure", crash)
     try:
         with pytest.raises(Crash):
             await agent.reclaim(item.run_id, tenant_id="tenant", item=item)
     finally:
         await agent.close()
-    monkeypatch.setattr(runner, "_persist_run_failure", original)
+    monkeypatch.setattr(_run_start, "_persist_run_failure", original)
     assert (await store.get_run(item.run_id)).status == "running"
     again = await expire(store, engine, item.run_id)
     provider = MockLLM([LLMResponse(text="unreachable")])
@@ -203,7 +204,7 @@ async def test_reclaim_never_overwrites_a_terminal_winner(store, engine, monkeyp
             )
         return await terminal_write(store_view, run_id, *args, **kwargs)
 
-    monkeypatch.setattr(runner, "_persist_run_failure", winner_first)
+    monkeypatch.setattr(_run_start, "_persist_run_failure", winner_first)
     try:
         result = await agent.reclaim(item.run_id, tenant_id="tenant", item=item)
     finally:
