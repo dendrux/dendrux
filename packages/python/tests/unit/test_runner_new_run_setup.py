@@ -13,7 +13,7 @@ from dendrux import Agent
 from dendrux.chat import ChatMessage, normalize_chat_history
 from dendrux.context_blocks import ContextBlock
 from dendrux.llm.mock import MockLLM
-from dendrux.runtime import runner
+from dendrux.runtime import context, runner
 from dendrux.runtime.context import DelegationContext, get_store_identity
 from dendrux.runtime.replay import PARTS_KEY, parts_to_dicts
 from dendrux.runtime.state import RunRecord, TraceRecord
@@ -73,7 +73,7 @@ async def test_entry_creation_bytes(monkeypatch, case):
             tenant_id=tenant,
             max_delegation_depth=10,
         )
-        monkeypatch.setattr(runner, "get_delegation_context", lambda: parent)
+        monkeypatch.setattr(context, "get_delegation_context", lambda: parent)
     captures = {}
 
     async def capture(store, loop, run_id, name, **kwargs):

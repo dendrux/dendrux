@@ -9,7 +9,7 @@ import pytest
 
 from dendrux import tool
 from dendrux.errors import RunFencedError
-from dendrux.runtime import runner
+from dendrux.runtime import _run_observers, runner
 from dendrux.runtime._pending import _PendingReader
 from dendrux.runtime.persistence import PersistenceRecorder
 from dendrux.runtime.state import EventWrite, claimed_store
@@ -31,7 +31,7 @@ async def test_aborted_resume_keeps_approval_pause_active(store, engine, monkeyp
         # Repeated attempts must still pair the real resume with the original pause.
         for _ in range(2):
             with monkeypatch.context() as patcher:
-                patcher.setattr(runner, "_start_trace", AsyncMock(side_effect=failure))
+                patcher.setattr(_run_observers, "_start_trace", AsyncMock(side_effect=failure))
                 with pytest.raises(RuntimeError) as caught:
                     await invoke()
                 assert caught.value is failure

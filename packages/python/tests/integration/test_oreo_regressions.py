@@ -15,6 +15,7 @@ from dendrux import Agent, tool
 from dendrux.chat import ChatMessage
 from dendrux.context_blocks import ContextBlock
 from dendrux.llm.mock import MockLLM
+from dendrux.runtime import _run_pending
 from dendrux.runtime.context import get_delegation_context
 from dendrux.store import RunStore
 from dendrux.types import LLMResponse, RunEventType, RunStatus, ToolCall
@@ -449,7 +450,6 @@ async def test_duplicate_stream_preserves_owners_interrupt(store):
 
 
 async def test_cancelled_cached_lookup_never_finalizes_existing_run(store, monkeypatch):
-    from dendrux.runtime import runner
 
     agent = Agent(
         strict_tenancy=False,
@@ -464,7 +464,7 @@ async def test_cancelled_cached_lookup_never_finalizes_existing_run(store, monke
         entered.set()
         await asyncio.Event().wait()
 
-    monkeypatch.setattr(runner, "_build_cached_result", blocked)
+    monkeypatch.setattr(_run_pending, "_build_cached_result", blocked)
     finalize = AsyncMock(wraps=store.finalize_with_event)
     monkeypatch.setattr(store, "finalize_run", finalize)
     monkeypatch.setattr(store, "finalize_with_event", finalize)

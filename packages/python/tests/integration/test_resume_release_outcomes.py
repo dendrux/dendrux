@@ -8,7 +8,7 @@ import pytest
 
 from dendrux.errors import PersistenceError
 from dendrux.loops.base import BaseNotifier
-from dendrux.runtime import runner
+from dendrux.runtime import _run_observers, runner
 from dendrux.runtime.persistence import PersistenceRecorder
 from dendrux.types import RunEventType, RunStatus
 from tests._fixtures.storage import pin_storage_format
@@ -212,7 +212,7 @@ async def test_release_observers_report_outcome(store, engine, monkeypatch, entr
     async def traced(_notifier, *args, **kwargs):
         return await trace(notifier, *args, **kwargs)
 
-    monkeypatch.setattr(runner, "_start_trace", traced)
+    monkeypatch.setattr(_run_observers, "_start_trace", traced)
     monkeypatch.setattr(
         runner, "_replay_resume_injected_history", AsyncMock(side_effect=PersistenceError())
     )

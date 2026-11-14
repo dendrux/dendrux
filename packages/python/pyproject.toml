@@ -161,6 +161,7 @@ target-version = "py311"
 extend-exclude = ["src/dendrux/db/migrations", ".semgrep"]
 
 [tool.ruff.lint]
+logger-objects = ["dendrux.runtime._run_errors.logger"]
 select = [
     "E",    # pycodestyle errors
     "F",    # pyflakes

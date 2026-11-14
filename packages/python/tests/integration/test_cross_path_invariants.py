@@ -15,6 +15,7 @@ import pytest
 from dendrux import Agent, tool
 from dendrux.errors import ProviderTimeoutError
 from dendrux.loops.base import BaseNotifier
+from dendrux.runtime import _run_observers
 from dendrux.runtime.context import (
     DelegationContext,
     DelegationDepthExceededError,
@@ -406,7 +407,6 @@ async def test_reclaim_setup_failure_releases_same_epoch(store, engine, monkeypa
 
 
 async def test_reclaim_transient_setup_failure_preserves_failure_hooks(store, engine, monkeypatch):
-    from dendrux.runtime import runner
     from dendrux.runtime.persistence import PersistenceRecorder
 
     agent = make_agent(store, [LLMResponse(text="done")])
@@ -416,7 +416,7 @@ async def test_reclaim_transient_setup_failure_preserves_failure_hooks(store, en
     notifier = BaseNotifier()
     notifier.on_run_failed = AsyncMock()
     monkeypatch.setattr(PersistenceRecorder, "on_run_failed", failed)
-    monkeypatch.setattr(runner, "_start_trace", AsyncMock(side_effect=original))
+    monkeypatch.setattr(_run_observers, "_start_trace", AsyncMock(side_effect=original))
     with pytest.raises(RuntimeError) as caught:
         await agent.reclaim(item.run_id, tenant_id="tenant", item=item, notifier=notifier)
     assert caught.value is original
@@ -900,7 +900,7 @@ async def test_caller_cancellation_during_claim_release_propagates_after_cleanup
 async def test_released_submit_reports_abort_without_failure_hooks(
     store, engine, monkeypatch, kind, storage_format, failure_site
 ):
-    from dendrux.runtime import runner
+    from dendrux.runtime import _run_observers
     from dendrux.runtime.persistence import PersistenceRecorder
     from dendrux.store import RunStore
     from tests._fixtures.storage import pin_storage_format
@@ -913,11 +913,15 @@ async def test_released_submit_reports_abort_without_failure_hooks(
     notifier = BaseNotifier()
     notifier.on_run_failed = AsyncMock()
     monkeypatch.setattr(PersistenceRecorder, "on_run_failed", recorder_failed)
-    target = store if failure_site == "get_pii_mapping" else runner
+    fault = AsyncMock(side_effect=original)
     with monkeypatch.context() as patcher:
-        patcher.setattr(target, failure_site, AsyncMock(side_effect=original))
+        if failure_site == "get_pii_mapping":
+            patcher.setattr(store, "get_pii_mapping", fault)
+        else:
+            patcher.setattr(_run_observers, "_start_trace", fault)
         with pytest.raises(RuntimeError) as caught:
             await invoke(notifier=notifier)
+    fault.assert_awaited_once()
     assert caught.value is original and original.__dict__ == {}
     recorder_failed.assert_not_awaited()
     notifier.on_run_failed.assert_not_awaited()
@@ -1012,7 +1016,6 @@ async def test_recovery_approval_abort_follows_decision_and_skips_failure_hooks(
 
 
 async def test_resume_abort_event_and_release_roll_back_together(store, monkeypatch, caplog):
-    from dendrux.runtime import runner
     from dendrux.runtime.stores.sql import base
 
     _, run_id, invoke = await submission_case(store, "input")
@@ -1024,7 +1027,7 @@ async def test_resume_abort_event_and_release_roll_back_together(store, monkeypa
             raise RuntimeError("abort_transaction_write_failure")
         return await write(session, event_run_id, event)
 
-    monkeypatch.setattr(runner, "_start_trace", AsyncMock(side_effect=original))
+    monkeypatch.setattr(_run_observers, "_start_trace", AsyncMock(side_effect=original))
     monkeypatch.setattr(base, "_write_event", reject_abort)
     with pytest.raises(RuntimeError) as caught:
         await invoke()
@@ -1201,7 +1204,7 @@ async def test_overlapping_same_agent_submit_preserves_new_owner_and_interrupts(
         return await start_trace(*args, **kwargs)
 
     notifier.on_run_failed = AsyncMock()
-    monkeypatch.setattr(runner, "_start_trace", fail_first_trace)
+    monkeypatch.setattr(_run_observers, "_start_trace", fail_first_trace)
     monkeypatch.setattr(store, "release_run_claim", delay_release)
     before = await store.get_run(run_id)
     first = asyncio.create_task(invoke(notifier=notifier))

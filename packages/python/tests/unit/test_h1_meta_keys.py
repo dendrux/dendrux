@@ -33,6 +33,16 @@ def test_namespaced_metadata_keys_have_one_definition():
             ):
                 continue
             parent = parents.get(node)
+            if (
+                isinstance(parent, ast.Call)
+                and isinstance(parent.func, ast.Attribute)
+                and isinstance(parent.func.value, ast.Name)
+                and parent.func.value.id == "logging"
+                and parent.func.attr == "getLogger"
+                and parent.args == [node]
+                and not parent.keywords
+            ):
+                continue
             if isinstance(parent, ast.Assign) and any(
                 isinstance(target, ast.Attribute) and target.attr == "__module__"
                 for target in parent.targets
