@@ -1,0 +1,32 @@
+{
+ "dendrux.runtime.stores.sql.base": {
+  "PAUSE_INVALIDATION_EVENT_TYPES": "dendrux.runtime.stores.sql._sql_support",
+  "_CheckedSessionFactory": "dendrux.runtime.stores.sql._sql_sessions",
+  "_RECOVERY_DESCRIPTOR_BYTES": "dendrux.runtime.stores.sql._sql_support",
+  "_RECOVERY_MAX_MESSAGES": "dendrux.runtime.stores.sql._sql_support",
+  "_RECOVERY_TRACE_BYTES": "dendrux.runtime.stores.sql._sql_support",
+  "_SerializedSessionFactory": "dendrux.runtime.stores.sql._sql_sessions",
+  "_advancing_turn": "dendrux.runtime.stores.sql._sql_support",
+  "_check_create_identifiers": "dendrux.runtime.stores.sql._sql_support",
+  "_checkpoint_error": "dendrux.runtime.stores.sql._sql_support",
+  "_checkpoint_progress": "dendrux.runtime.stores.sql._sql_support",
+  "_creation_mark_proven": "dendrux.runtime.stores.sql._sql_support",
+  "_creation_metadata": "dendrux.runtime.stores.sql._sql_support",
+  "_final_output_values": "dendrux.runtime.stores.sql._sql_support",
+  "_final_progress": "dendrux.runtime.stores.sql._sql_support",
+  "_json_bytes": "dendrux.runtime.stores.sql._sql_support",
+  "_merge_public_meta": "dendrux.runtime.stores.sql._sql_support",
+  "_note_blocked_event": "dendrux.runtime.stores.sql._sql_support",
+  "_positive_page": "dendrux.runtime.stores.sql._sql_support",
+  "_progress_values": "dendrux.runtime.stores.sql._sql_support",
+  "_refuse_direct_managed_child": "dendrux.runtime.stores.sql._sql_support",
+  "_status_values": "dendrux.runtime.stores.sql._sql_support",
+  "_submission_progress": "dendrux.runtime.stores.sql._sql_support",
+  "_trace_record": "dendrux.runtime.stores.sql._sql_support",
+  "_validate_checkpoint": "dendrux.runtime.stores.sql._sql_support",
+  "_validate_lease_batch_size": "dendrux.runtime.stores.sql._sql_support",
+  "_validate_rewrite_entries": "dendrux.runtime.stores.sql._sql_support",
+  "_validate_trace_write": "dendrux.runtime.stores.sql._sql_support",
+  "logger": "dendrux.runtime.stores.sql._sql_support"
+ }
+}

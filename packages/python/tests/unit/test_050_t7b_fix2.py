@@ -25,10 +25,11 @@ PRIVATE = "CHAIN-PRIVATE-SENTINEL-765"
 
 
 def test_status_writer_inventory():
-    tree = ast.parse(inspect.getsource(sql_base))
+    modules = dict.fromkeys((sql_base, inspect.getmodule(sql_base._status_values)))
+    trees = [ast.parse(inspect.getsource(module)) for module in modules]
     writers = {}
     direct = []
-    for function in ast.walk(tree):
+    for function in (node for tree in trees for node in ast.walk(tree)):
         if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
         # Nested retry closures belong to the surrounding public operation.
@@ -36,7 +37,14 @@ def test_status_writer_inventory():
             continue
         for node in ast.walk(function):
             if isinstance(node, ast.Call):
-                if isinstance(node.func, ast.Name) and node.func.id == "_status_values":
+                if (
+                    isinstance(node.func, ast.Name)
+                    and node.func.id == "_status_values"
+                    or isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "_sql_support"
+                    and node.func.attr == "_status_values"
+                ):
                     writers[function.name] = writers.get(function.name, 0) + 1
                 if (
                     isinstance(node.func, ast.Attribute)

@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
-import logging
 import re
 from inspect import getmembers, iscoroutinefunction
 from typing import TYPE_CHECKING, Any, Literal, NoReturn, cast
@@ -72,10 +71,8 @@ from dendrux.runtime.durability import (
     safe_database_operations,
 )
 from dendrux.types import (
-    _PROVIDER_KWARGS_MAX_BYTES,
     MANAGED_WAIT_REASON,
     MANAGED_WAIT_SCHEMA_VERSION,
-    ULID_CHARS,
     CreateRunResult,
     IdempotencyConflictError,
     RunStatus,
@@ -139,7 +136,6 @@ from dendrux.runtime.state import (
     _approval_event_object,
     _check_offset,
     _extract_status,
-    _finalized_output_data,
     _finalized_run_read,
     _FinalizedRunRead,
     _finite_json_float,
@@ -156,7 +152,7 @@ from dendrux.runtime.state import (
     _validate_sweep_age,
     _write_event,
 )
-from dendrux.runtime.stores.sql import _sql_sessions
+from dendrux.runtime.stores.sql import _sql_sessions, _sql_support
 from dendrux.runtime.stores.sql._managed_reads import ManagedReads
 from dendrux.runtime.stores.sql._sql_host import _StoreHost
 from dendrux.runtime.stores.sql._sql_sessions import (
@@ -165,6 +161,44 @@ from dendrux.runtime.stores.sql._sql_sessions import (
 from dendrux.runtime.stores.sql._sql_sessions import (
     _SerializedSessionFactory as _SerializedSessionFactory,
 )
+from dendrux.runtime.stores.sql._sql_support import (
+    _RECOVERY_DESCRIPTOR_BYTES as _RECOVERY_DESCRIPTOR_BYTES,
+)
+from dendrux.runtime.stores.sql._sql_support import _RECOVERY_MAX_MESSAGES as _RECOVERY_MAX_MESSAGES
+from dendrux.runtime.stores.sql._sql_support import _RECOVERY_TRACE_BYTES as _RECOVERY_TRACE_BYTES
+from dendrux.runtime.stores.sql._sql_support import (
+    PAUSE_INVALIDATION_EVENT_TYPES as PAUSE_INVALIDATION_EVENT_TYPES,
+)
+from dendrux.runtime.stores.sql._sql_support import _advancing_turn as _advancing_turn
+from dendrux.runtime.stores.sql._sql_support import (
+    _check_create_identifiers as _check_create_identifiers,
+)
+from dendrux.runtime.stores.sql._sql_support import _checkpoint_error as _checkpoint_error
+from dendrux.runtime.stores.sql._sql_support import _checkpoint_progress as _checkpoint_progress
+from dendrux.runtime.stores.sql._sql_support import _creation_mark_proven as _creation_mark_proven
+from dendrux.runtime.stores.sql._sql_support import _creation_metadata as _creation_metadata
+from dendrux.runtime.stores.sql._sql_support import _final_output_values as _final_output_values
+from dendrux.runtime.stores.sql._sql_support import _final_progress as _final_progress
+from dendrux.runtime.stores.sql._sql_support import _json_bytes as _json_bytes
+from dendrux.runtime.stores.sql._sql_support import _merge_public_meta as _merge_public_meta
+from dendrux.runtime.stores.sql._sql_support import _note_blocked_event as _note_blocked_event
+from dendrux.runtime.stores.sql._sql_support import _positive_page as _positive_page
+from dendrux.runtime.stores.sql._sql_support import _progress_values as _progress_values
+from dendrux.runtime.stores.sql._sql_support import (
+    _refuse_direct_managed_child as _refuse_direct_managed_child,
+)
+from dendrux.runtime.stores.sql._sql_support import _status_values as _status_values
+from dendrux.runtime.stores.sql._sql_support import _submission_progress as _submission_progress
+from dendrux.runtime.stores.sql._sql_support import _trace_record as _trace_record
+from dendrux.runtime.stores.sql._sql_support import _validate_checkpoint as _validate_checkpoint
+from dendrux.runtime.stores.sql._sql_support import (
+    _validate_lease_batch_size as _validate_lease_batch_size,
+)
+from dendrux.runtime.stores.sql._sql_support import (
+    _validate_rewrite_entries as _validate_rewrite_entries,
+)
+from dendrux.runtime.stores.sql._sql_support import _validate_trace_write as _validate_trace_write
+from dendrux.runtime.stores.sql._sql_support import logger as logger
 from dendrux.runtime.stores.sql._types import (
     ConflictSpec,
     PatchLoopState,
@@ -174,20 +208,8 @@ from dendrux.runtime.stores.sql._types import (
     SetFields,
 )
 
-_RECOVERY_DESCRIPTOR_BYTES = 32768
-_RECOVERY_TRACE_BYTES = 1024 * 1024
-_RECOVERY_MAX_MESSAGES = 999
 _TRACE_POSITION_STRIDE = 1000
 
-
-PAUSE_INVALIDATION_EVENT_TYPES = (
-    StoredEventType.RUN_RESUMED.value,
-    StoredEventType.RUN_COMPLETED.value,
-    StoredEventType.RUN_ERROR.value,
-    StoredEventType.RUN_CANCELLED.value,
-)
-
-logger = logging.getLogger(__name__)
 
 _COMMIT_READBACK_LOCK_TIMEOUT_MS = 5000
 
@@ -214,131 +236,6 @@ class _UpdatedRows:
 
             raise MultipleResultsFound()
         return next(iter(self._rows[0].values())) if self._rows else None
-
-
-def _status_values(status: Any, *, initial: bool = False) -> dict[str, Any]:
-    from sqlalchemy import case
-
-    from dendrux.db.models import AgentRun
-
-    now = _dt.datetime.now(_dt.UTC)
-    return {
-        "status": status,
-        "status_changed_at": now
-        if initial
-        else case((AgentRun.status != status, now), else_=AgentRun.status_changed_at),
-    }
-
-
-def _advancing_turn(trace: TraceWrite | None) -> bool:
-    return (
-        trace is not None
-        and trace.advances_progress
-        and trace.trace_kind == "turn"
-        and trace.role in ("assistant", "tool")
-    )
-
-
-def _checkpoint_progress(trace: TraceWrite | None) -> dict[str, Any]:
-    from sqlalchemy import case, exists
-
-    from dendrux.db.models import AgentRun, ReactTrace
-
-    if not _advancing_turn(trace):
-        return {}
-    assert trace is not None
-    # The existing fence also checks freshness, so a retried trace cannot
-    # erase crashes accumulated since its original commit.
-    fresh = ~exists(select(ReactTrace.id).where(ReactTrace.id == trace.trace_id))
-    return {"reclaim_attempts": case((fresh, 0), else_=AgentRun.reclaim_attempts)}
-
-
-def _progress_values(advancing: bool) -> dict[str, Any]:
-    return {"reclaim_attempts": 0} if advancing else {}
-
-
-def _submission_progress(current: dict[str, Any], traces: Sequence[TraceWrite]) -> dict[str, Any]:
-    advancing = (current.get("submission") or {}).get("kind") == "tool_results" and any(
-        _advancing_turn(trace) for trace in traces
-    )
-    return _progress_values(advancing)
-
-
-def _final_progress(status: str, answer: str | None, claim_epoch: int | None) -> dict[str, Any]:
-    from sqlalchemy import case
-
-    from dendrux.db.models import AgentRun
-
-    if status != RunStatus.SUCCESS.value or answer is None or claim_epoch is None:
-        return {}
-    return {
-        "reclaim_attempts": case(
-            (
-                and_(
-                    AgentRun.storage_format == STORAGE_FORMAT_CHECKPOINTED,
-                    AgentRun.status.notin_(_TERMINAL_STATUS_VALUES),
-                ),
-                0,
-            ),
-            else_=AgentRun.reclaim_attempts,
-        )
-    }
-
-
-async def _final_output_values(
-    session: AsyncSession,
-    run_id: str,
-    answer: str | None,
-    error: str | None,
-    iteration_count: int | None,
-    total_usage: UsageStats | None,
-    pii_mapping: dict[str, str] | None,
-    failure_reason: str | None,
-) -> dict[str, Any]:
-    values: dict[str, Any] = {}
-    if iteration_count is not None:
-        values["iteration_count"] = iteration_count
-    if answer is not None or total_usage is not None:
-        values["output_data"] = await _finalized_output_data(session, run_id, answer, total_usage)
-    if error is not None:
-        values["error"] = error
-    if total_usage is not None:
-        values.update(_usage_totals(total_usage))
-    if pii_mapping is not None:
-        values["pii_mapping"] = pii_mapping
-    if failure_reason is not None:
-        values["failure_reason"] = failure_reason
-    return values
-
-
-def _merge_public_meta(meta: dict[str, Any] | None, patch: dict[str, Any]) -> dict[str, Any]:
-    return {
-        **(meta or {}),
-        **{key: value for key, value in patch.items() if key != BLOCKED_META_KEY},
-    }
-
-
-def _creation_mark_proven(store: SQLStateStore, run_id: str, meta: dict[str, Any] | None) -> bool:
-    """A blocked creation's readback must also show the mark it committed with."""
-    from dendrux.runtime._blocked_content import _blocked_target
-
-    return _blocked_target.get() != (store, run_id) or (meta or {}).get(BLOCKED_META_KEY) is True
-
-
-def _note_blocked_event(session: AsyncSession, run_id: str, event_type: str) -> None:
-    """A ``guardrail.blocked`` event marks its run in the same transaction."""
-    if event_type == GovernanceEventType.GUARDRAIL_BLOCKED.value:
-        session.info.setdefault(BLOCKED_RUNS_SESSION_KEY, set()).add(run_id)
-
-
-def _refuse_direct_managed_child(run_id: str, loop_state: Any) -> None:
-    """Managed children are reclaimed through their root (0.7); refuse before the claim."""
-    from dendrux.errors import ManagedChildControlError
-    from dendrux.runtime.context import managed_root_reclaim
-
-    header = (loop_state or {}).get(MANAGED_HEADER_KEY)
-    if isinstance(header, dict) and "invocation" in header and not managed_root_reclaim(run_id):
-        raise ManagedChildControlError(run_id)
 
 
 class _SweepScan:
@@ -509,7 +406,7 @@ class _SweepScan:
                     else true(),
                 ),
                 values=dict(
-                    **_status_values(new_status),
+                    **_sql_support._status_values(new_status),
                     claim_epoch=AgentRun.claim_epoch + 1,
                     failure_reason=reason,
                     pause_data=None,
@@ -550,115 +447,6 @@ class _SweepScan:
 
 
 _WAIT_MARK_LABELS = ("wait_version", "wait_reason", "wait_child")
-
-
-def _creation_metadata(
-    session: AsyncSession, store: SQLStateStore, run_id: str, meta: dict[str, Any] | None
-) -> dict[str, Any] | None:
-    from dendrux.runtime._blocked_content import _blocked_target
-
-    cleaned = (
-        {key: value for key, value in meta.items() if key != BLOCKED_META_KEY} if meta else meta
-    )
-    if _blocked_target.get() == (store, run_id):
-        session.info[BLOCKED_INSERT_SESSION_KEY] = run_id
-        return {**(cleaned or {}), BLOCKED_META_KEY: True}
-    return cleaned
-
-
-def _check_create_identifiers(
-    run_id: str,
-    agent_name: str,
-    tenant_id: str | None,
-    idempotency_key: str | None,
-    model: str | None,
-) -> None:
-    from dendrux.types import _validate_identifier
-
-    _validate_identifier(run_id, "run_id", maximum=ULID_CHARS)
-    _validate_identifier(agent_name, "agent_name")
-    for name, optional in (
-        ("tenant_id", tenant_id),
-        ("idempotency_key", idempotency_key),
-        ("model", model),
-    ):
-        if optional is not None:
-            _validate_identifier(optional, name)
-
-
-def _checkpoint_error(run_id: str) -> NoReturn:
-    from dendrux.errors import PersistenceError
-
-    _codes.log_code(logger, _codes.CHECKPOINT_TOO_LARGE, run_id=run_id)
-    raise PersistenceError(code="checkpoint_too_large")
-
-
-def _json_bytes(value: Any) -> int:
-    return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
-
-
-def _validate_checkpoint(run_id: str, value: dict[str, Any]) -> None:
-    from dendrux.types import _validate_persistable
-
-    _validate_persistable(value, "loop_state")
-    if (
-        _json_bytes(value) > _RECOVERY_DESCRIPTOR_BYTES
-        or _json_bytes(value.get("provider_kwargs", {})) > _PROVIDER_KWARGS_MAX_BYTES
-    ):
-        _checkpoint_error(run_id)
-
-
-def _validate_rewrite_entries(run_id: str, value: Any) -> None:
-    if not isinstance(value, list) or len(value) > _RECOVERY_MAX_MESSAGES:
-        _checkpoint_error(run_id)
-    if any(
-        not isinstance(m, dict)
-        or not isinstance(m.get("role"), str)
-        or not isinstance(m.get("content"), str)
-        for m in value
-    ):
-        raise ValueError("Rewrite entries require role and content")
-    if any(not isinstance(m.get("meta", {}), dict) for m in value):
-        _codes.log_code(logger, _codes.REWRITE_INVALID, run_id=run_id)
-        raise ValueError("Rewrite entry metadata must be an object")
-
-
-def _validate_trace_write(run_id: str, trace: TraceWrite) -> None:
-    from dendrux.types import _validate_persistable
-
-    _validate_persistable(trace.content, "content")
-    _validate_persistable(trace.meta, "meta")
-    if trace.trace_kind not in ("seed", "turn", "rewrite", "state"):
-        raise ValueError("Unsupported trace kind")
-    if trace.trace_kind in ("rewrite", "state"):
-        if len(trace.content.encode("utf-8")) > _RECOVERY_TRACE_BYTES:
-            _checkpoint_error(run_id)
-        value = json.loads(trace.content)
-        if trace.trace_kind == "rewrite":
-            _validate_rewrite_entries(run_id, value)
-        elif not isinstance(value, dict) or value.get("kind") not in (
-            "image_view",
-            "skills_session",
-            "clarification",
-        ):
-            raise ValueError("State traces require a versioned state payload")
-
-
-def _positive_page(limit: int) -> None:
-    if type(limit) is not int or limit < 1:
-        raise ValueError("limit must be a positive integer")
-
-
-def _trace_record(row: Any) -> TraceRecord:
-    return TraceRecord(
-        id=row.id,
-        role=row.role,
-        content=row.content,
-        order_index=row.order_index,
-        meta=row.meta,
-        created_at=_to_aware_utc(row.created_at),
-        trace_kind=row.trace_kind,
-    )
 
 
 def _validated_store_write(method: Any) -> Any:
@@ -858,7 +646,7 @@ class SQLStateStore(_StoreHost, ManagedReads, SQLBlobCatalog):
     ) -> Any:
         from sqlalchemy import and_, or_, select
 
-        _positive_page(page_size)
+        _sql_support._positive_page(page_size)
         groups: dict[str | None, list[str]] = {}
         for parent in parents:
             groups.setdefault(parent.after, []).append(parent.run_id)
@@ -1212,7 +1000,7 @@ class SQLStateStore(_StoreHost, ManagedReads, SQLBlobCatalog):
         """Lock a bounded, ordered PK set and update/read back exactly that set."""
         from sqlalchemy import false, select, tuple_, update
 
-        _positive_page(page_size)
+        _sql_support._positive_page(page_size)
         if page_size > MAX_PAGE:
             raise ValueError("page_size must not exceed 1000")
         session.info[STORE_SESSION_KEY] = self
@@ -1428,7 +1216,9 @@ class SQLStateStore(_StoreHost, ManagedReads, SQLBlobCatalog):
         """
         from dendrux.types import _validate_persistable
 
-        _check_create_identifiers(run_id, agent_name, tenant_id, idempotency_key, model)
+        _sql_support._check_create_identifiers(
+            run_id, agent_name, tenant_id, idempotency_key, model
+        )
         _validate_persistable(meta, "metadata")
         _validate_persistable(input_data, "input")
         import datetime as _dt
@@ -1451,7 +1241,6 @@ class SQLStateStore(_StoreHost, ManagedReads, SQLBlobCatalog):
             )
             if existing is not None:
                 return existing
-
         absent_retry = False
 
         async def _prove_creation(session: AsyncSession) -> CreateRunResult:
@@ -1472,7 +1261,7 @@ class SQLStateStore(_StoreHost, ManagedReads, SQLBlobCatalog):
                     and content_digest(row.input_data) == content_digest(input_data)
                     and row.idempotency_fingerprint == idempotency_fingerprint
                     and row.idempotency_key == idempotency_key
-                    and _creation_mark_proven(self, run_id, row.meta)
+                    and _sql_support._creation_mark_proven(self, run_id, row.meta)
                 ):
                     return CreateRunResult(
                         run_id=run_id,
@@ -1519,14 +1308,14 @@ class SQLStateStore(_StoreHost, ManagedReads, SQLBlobCatalog):
                     else None,
                     id=run_id,
                     agent_name=agent_name,
-                    **_status_values(AgentRunStatus.RUNNING, initial=True),
+                    **_sql_support._status_values(AgentRunStatus.RUNNING, initial=True),
                     input_data=input_data,
                     model=model,
                     strategy=strategy,
                     parent_run_id=parent_run_id,
                     delegation_level=delegation_level,
                     tenant_id=tenant_id,
-                    meta=_creation_metadata(session, self, run_id, meta),
+                    meta=_sql_support._creation_metadata(session, self, run_id, meta),
                     last_progress_at=_dt.datetime.now(_dt.UTC),
                     idempotency_key=idempotency_key,
                     idempotency_fingerprint=idempotency_fingerprint,
@@ -1601,7 +1390,6 @@ class SQLStateStore(_StoreHost, ManagedReads, SQLBlobCatalog):
                     raise IdempotencyConflictError(
                         run_id=None, idempotency_key=idempotency_key
                     ) from None
-
             return CreateRunResult(
                 run_id=run_id,
                 outcome="created",
@@ -2079,7 +1867,7 @@ class SQLStateStore(_StoreHost, ManagedReads, SQLBlobCatalog):
         from dendrux.db.models import ReactTrace
         from dendrux.runtime._digest import trace_digest
 
-        _validate_trace_write(run_id, trace)
+        _sql_support._validate_trace_write(run_id, trace)
         digest = trace_digest(
             trace.role, trace.content, trace.order_index, trace.trace_kind, trace.meta
         )
@@ -2146,8 +1934,11 @@ class SQLStateStore(_StoreHost, ManagedReads, SQLBlobCatalog):
         trace: TraceWrite | None,
     ) -> None:
         """Commit a bounded execution projection and optional trace under one fence."""
-        _validate_checkpoint(run_id, loop_state)
-        values: dict[str, Any] = {"loop_state": loop_state, **_checkpoint_progress(trace)}
+        _sql_support._validate_checkpoint(run_id, loop_state)
+        values: dict[str, Any] = {
+            "loop_state": loop_state,
+            **_sql_support._checkpoint_progress(trace),
+        }
         if pii_mapping is not None:
             values["pii_mapping"] = pii_mapping
         async with self._session_factory() as session:
@@ -2174,8 +1965,8 @@ class SQLStateStore(_StoreHost, ManagedReads, SQLBlobCatalog):
 
         if "pending" in patch.set_fields:
             raise ValueError("A patch cannot replace pending; remove calls by identity")
-        _validate_checkpoint(run_id, dict(patch.set_fields))
-        progress_values = _progress_values(progress)
+        _sql_support._validate_checkpoint(run_id, dict(patch.set_fields))
+        progress_values = _sql_support._progress_values(progress)
         changed = self.json_patch_expr(AgentRun.loop_state, PatchLoopState(patch, count_tool))
         if changed is not None:
             result = await self._update_one_rows(
@@ -2196,7 +1987,7 @@ class SQLStateStore(_StoreHost, ManagedReads, SQLBlobCatalog):
             if merged is not None:
                 # Same compact UTF-8 measure as checkpoint_step and SQLite.
                 # A failed bound rolls back the patch and the whole completion.
-                _validate_checkpoint(run_id, merged)
+                _sql_support._validate_checkpoint(run_id, merged)
                 self._remember_run_values(
                     session, run_id, {"loop_state": merged, **progress_values}
                 )
@@ -2205,7 +1996,7 @@ class SQLStateStore(_StoreHost, ManagedReads, SQLBlobCatalog):
                     select(AgentRun.claim_epoch).where(AgentRun.id == run_id)
                 )
                 if epoch == claim_epoch:
-                    _checkpoint_error(run_id)
+                    _sql_support._checkpoint_error(run_id)
                 _codes.log_code(logger, _codes.RUN_FENCED, run_id=run_id)
                 raise RunFencedError(run_id, claim_epoch=claim_epoch)
         else:
@@ -2222,7 +2013,7 @@ class SQLStateStore(_StoreHost, ManagedReads, SQLBlobCatalog):
                 counts = dict(changed.get("tool_counts", {}))
                 counts[count_tool] = counts.get(count_tool, 0) + 1
                 changed["tool_counts"] = counts
-            _validate_checkpoint(run_id, changed)
+            _sql_support._validate_checkpoint(run_id, changed)
             self._remember_run_values(session, run_id, {"loop_state": changed})
             await session.execute(
                 update(AgentRun).where(AgentRun.id == run_id).values(loop_state=changed)
@@ -2350,7 +2141,7 @@ class SQLStateStore(_StoreHost, ManagedReads, SQLBlobCatalog):
                 loop_state_patch,
                 count_tool=(observation.meta or {}).get("tool_name"),
                 pii_mapping=pii_mapping,
-                progress=_advancing_turn(observation),
+                progress=_sql_support._advancing_turn(observation),
             )
             row_id = (
                 await self._update_many_rows(
@@ -2411,7 +2202,7 @@ class SQLStateStore(_StoreHost, ManagedReads, SQLBlobCatalog):
         ):
             _validate_persistable(value, name)
         plan = request.detached()
-        _check_create_identifiers(
+        _sql_support._check_create_identifiers(
             plan.child_run_id, plan.child_agent_name, plan.tenant_id, None, plan.child_model
         )
         wait = plan.parent_wait.to_dict()
@@ -2430,7 +2221,7 @@ class SQLStateStore(_StoreHost, ManagedReads, SQLBlobCatalog):
                     return existing
                 header = await self._admit_managed_limit(session, plan, parent)
                 child_state = {**plan.child_loop_state, MANAGED_HEADER_KEY: header.to_dict()}
-                _validate_checkpoint(plan.child_run_id, child_state)
+                _sql_support._validate_checkpoint(plan.child_run_id, child_state)
                 await self._bind_park_parent(session, plan, parent, wait)
                 await self._bind_intent(session, plan, nonce)
                 await self._bind_child(session, plan, parent, child_state)
@@ -2586,9 +2377,9 @@ class SQLStateStore(_StoreHost, ManagedReads, SQLBlobCatalog):
         state = _apply_loop_patch(dict(parent.loop_state or {}), request.parent_patch)
         # Both binding copies come from the one wait value that is persisted.
         state[MANAGED_BINDING_KEY] = {**wait["managed_wait"], "pause_id": wait["pause_id"]}
-        _validate_checkpoint(parent_id, state)
+        _sql_support._validate_checkpoint(parent_id, state)
         values: dict[str, Any] = {
-            **_status_values(RunStatus.PAUSED.value),
+            **_sql_support._status_values(RunStatus.PAUSED.value),
             "pause_data": wait,
             "pause_requested": False,
             "claim_epoch": epoch + 1,
@@ -2681,14 +2472,14 @@ class SQLStateStore(_StoreHost, ManagedReads, SQLBlobCatalog):
                 loop_state=child_state,
                 id=child_id,
                 agent_name=request.child_agent_name,
-                **_status_values(AgentRunStatus.RUNNING, initial=True),
+                **_sql_support._status_values(AgentRunStatus.RUNNING, initial=True),
                 input_data=request.child_input_data,
                 model=request.child_model,
                 strategy=request.child_strategy,
                 parent_run_id=request.parent_run_id,
                 delegation_level=int(parent.delegation_level or 0) + 1,
                 tenant_id=parent.tenant_id,
-                meta=_creation_metadata(session, self, child_id, request.child_meta),
+                meta=_sql_support._creation_metadata(session, self, child_id, request.child_meta),
                 last_progress_at=_dt.datetime.now(_dt.UTC),
                 claim_epoch=0,
             )
@@ -2754,9 +2545,9 @@ class SQLStateStore(_StoreHost, ManagedReads, SQLBlobCatalog):
                 return False
             changed = _apply_loop_patch(current, patch)
             changed["submission"] = None
-            values = {"loop_state": changed, **_submission_progress(current, traces)}
+            values = {"loop_state": changed, **_sql_support._submission_progress(current, traces)}
             self._remember_run_values(session, run_id, values)
-            _validate_checkpoint(run_id, changed)
+            _sql_support._validate_checkpoint(run_id, changed)
             pause = dict(row.pause_data or {})
             pause.pop("submission", None)
             for trace in traces:
@@ -2833,7 +2624,7 @@ class SQLStateStore(_StoreHost, ManagedReads, SQLBlobCatalog):
 
         from dendrux.db.models import AgentRun
 
-        _positive_page(limit)
+        _sql_support._positive_page(limit)
         if not parent_ids:
             return []
         size = min(limit, MAX_SMALL_PAGE)
@@ -2880,7 +2671,7 @@ class SQLStateStore(_StoreHost, ManagedReads, SQLBlobCatalog):
                     _run_in_scope(run_id, tenant_id),
                 )
             )
-            return _trace_record(row) if row is not None else None
+            return _sql_support._trace_record(row) if row is not None else None
 
     async def get_traces_after(
         self,
@@ -2896,7 +2687,7 @@ class SQLStateStore(_StoreHost, ManagedReads, SQLBlobCatalog):
 
         from dendrux.db.models import ReactTrace
 
-        _positive_page(limit)
+        _sql_support._positive_page(limit)
         async with self._session_factory() as session:
             stmt = select(ReactTrace).where(
                 ReactTrace.agent_run_id == run_id,
@@ -2910,7 +2701,7 @@ class SQLStateStore(_StoreHost, ManagedReads, SQLBlobCatalog):
                     stmt.order_by(ReactTrace.order_index).limit(min(limit, MAX_PAGE))
                 )
             ).all()
-            return [_trace_record(row) for row in rows]
+            return [_sql_support._trace_record(row) for row in rows]
 
     async def conversation_traces(
         self,
@@ -2926,7 +2717,7 @@ class SQLStateStore(_StoreHost, ManagedReads, SQLBlobCatalog):
 
         from dendrux.db.models import AgentRun, ReactTrace
 
-        _positive_page(limit)
+        _sql_support._positive_page(limit)
         limit = min(limit, MAX_PAGE)
         after = -1 if after_position is None else after_position
         entries: list[ConversationEntry] = []
@@ -3086,11 +2877,11 @@ class SQLStateStore(_StoreHost, ManagedReads, SQLBlobCatalog):
             async with self._session_factory() as session:
                 # updated_at is filled by the model's onupdate hook (Python aware-UTC).
                 values: dict[str, Any] = {
-                    **_status_values(status),
-                    **_final_progress(status, answer, claim_epoch),
+                    **_sql_support._status_values(status),
+                    **_sql_support._final_progress(status, answer, claim_epoch),
                 }
                 values.update(
-                    await _final_output_values(
+                    await _sql_support._final_output_values(
                         session,
                         run_id,
                         answer,
@@ -3304,8 +3095,8 @@ class SQLStateStore(_StoreHost, ManagedReads, SQLBlobCatalog):
 
         # updated_at is filled by the model's onupdate hook (Python aware-UTC).
         values: dict[str, Any] = {
-            **_status_values(status),
-            **_final_progress(status, answer, claim_epoch),
+            **_sql_support._status_values(status),
+            **_sql_support._final_progress(status, answer, claim_epoch),
             "pause_data": None,
             "cancel_requested": False,
             "pause_requested": False,
@@ -3331,7 +3122,7 @@ class SQLStateStore(_StoreHost, ManagedReads, SQLBlobCatalog):
             else_=AgentRun.loop_state,
         )
         values.update(
-            await _final_output_values(
+            await _sql_support._final_output_values(
                 session,
                 run_id,
                 answer,
@@ -3443,7 +3234,7 @@ class SQLStateStore(_StoreHost, ManagedReads, SQLBlobCatalog):
                 ).scalar_one_or_none()
                 if row is None:
                     return
-                row.meta = _merge_public_meta(row.meta, patch)
+                row.meta = _sql_support._merge_public_meta(row.meta, patch)
                 self._mark_announce(session, (run_id,))
                 await self._write_tx(session)
 
@@ -3534,7 +3325,7 @@ class SQLStateStore(_StoreHost, ManagedReads, SQLBlobCatalog):
         async def _attempt() -> bool:
             async with self._session_factory() as session:
                 values: dict[str, Any] = {
-                    **_status_values(status),
+                    **_sql_support._status_values(status),
                     "pause_data": pause_data,
                     "pause_requested": False,
                 }
@@ -3593,7 +3384,7 @@ class SQLStateStore(_StoreHost, ManagedReads, SQLBlobCatalog):
         async def _attempt() -> int | None:
             async with self._session_factory() as session:
                 values: dict[str, Any] = {
-                    **_status_values(status),
+                    **_sql_support._status_values(status),
                     "pause_data": pause_data,
                     "pause_requested": False,
                 }
@@ -3882,7 +3673,7 @@ class SQLStateStore(_StoreHost, ManagedReads, SQLBlobCatalog):
             async with self._session_factory() as session:
                 # updated_at is filled by the model's onupdate hook (Python aware-UTC).
                 values: dict[str, Any] = {
-                    **_status_values(status),
+                    **_sql_support._status_values(status),
                     "pause_data": pause_data,
                 }
                 if iteration_count is not None:
@@ -4172,7 +3963,7 @@ class SQLStateStore(_StoreHost, ManagedReads, SQLBlobCatalog):
                         values=self._ordered(
                             AgentRun.__table__,
                             {
-                                **_status_values(RunStatus.RUNNING.value),
+                                **_sql_support._status_values(RunStatus.RUNNING.value),
                                 "last_progress_at": _dt.datetime.now(_dt.UTC),
                                 "pause_requested": False,
                                 "claim_epoch": AgentRun.claim_epoch + 1,
@@ -4210,7 +4001,7 @@ class SQLStateStore(_StoreHost, ManagedReads, SQLBlobCatalog):
                         *self._ordered(
                             AgentRun.__table__,
                             dict(
-                                **_status_values(RunStatus.RUNNING.value),
+                                **_sql_support._status_values(RunStatus.RUNNING.value),
                                 last_progress_at=_dt.datetime.now(_dt.UTC),
                                 pause_requested=False,
                                 claim_epoch=AgentRun.claim_epoch + 1,
@@ -4311,7 +4102,7 @@ class SQLStateStore(_StoreHost, ManagedReads, SQLBlobCatalog):
                         *self._ordered(
                             AgentRun.__table__,
                             dict(
-                                **_status_values(RunStatus.RUNNING.value),
+                                **_sql_support._status_values(RunStatus.RUNNING.value),
                                 last_progress_at=_dt.datetime.now(_dt.UTC),
                                 pause_requested=False,
                                 claim_epoch=AgentRun.claim_epoch + 1,
@@ -4362,7 +4153,7 @@ class SQLStateStore(_StoreHost, ManagedReads, SQLBlobCatalog):
                     loop_state["submission"] = {
                         k: v for k, v in submission.items() if k != "payload"
                     }
-                    _validate_checkpoint(run_id, loop_state)
+                    _sql_support._validate_checkpoint(run_id, loop_state)
                     values["loop_state"] = loop_state
                 else:
                     merged.update(submitted_data)
@@ -4476,7 +4267,9 @@ class SQLStateStore(_StoreHost, ManagedReads, SQLBlobCatalog):
                         AgentRun.cancel_requested.is_(False),
                     )
                     .ordered_values(
-                        *self._ordered(AgentRun.__table__, dict(**_status_values(status)))
+                        *self._ordered(
+                            AgentRun.__table__, dict(**_sql_support._status_values(status))
+                        )
                     )
                 )
                 won = await self._finish_claim_release(
@@ -4638,7 +4431,7 @@ class SQLStateStore(_StoreHost, ManagedReads, SQLBlobCatalog):
             pending = (result[0][1] or []) if result else []
             boundary = min((p["order_index"] for p in pending), default=None)
             rows = [r for r, _ in result if boundary is None or r.order_index < boundary]
-            return [_trace_record(row) for row in rows]
+            return [_sql_support._trace_record(row) for row in rows]
 
     async def get_traces(
         self,
@@ -4928,7 +4721,7 @@ class SQLStateStore(_StoreHost, ManagedReads, SQLBlobCatalog):
         finalise_unrecoverable: bool = False,
     ) -> MarkResult:
         """Scan running rows once by id, atomically fencing each expired lease."""
-        _validate_lease_batch_size(
+        _sql_support._validate_lease_batch_size(
             batch_size=batch_size,
             cap=SWEEP_BATCH_MAX,
         )
@@ -4963,7 +4756,7 @@ class SQLStateStore(_StoreHost, ManagedReads, SQLBlobCatalog):
 
         _require_aware_utc("cutoff", cutoff)
         for bound in (batch_size, max_runs, max_returned, reclaim_limit):
-            _positive_page(bound)
+            _sql_support._positive_page(bound)
         if max(batch_size, max_runs, max_returned) > RECOVERY_SCAN_MAX:
             _codes.log_code(logger, _codes.RECOVERY_SCAN_LIMIT, run_id=None)
             raise ValueError("Recovery scan bounds must not exceed 100000")
@@ -5089,7 +4882,7 @@ class SQLStateStore(_StoreHost, ManagedReads, SQLBlobCatalog):
                                             ),
                                         ),
                                         values=dict(
-                                            **_status_values(status_expr),
+                                            **_sql_support._status_values(status_expr),
                                             claim_epoch=AgentRun.claim_epoch + 1,
                                             failure_reason=reason,
                                             error=case(
@@ -5227,7 +5020,7 @@ class SQLStateStore(_StoreHost, ManagedReads, SQLBlobCatalog):
 
         from dendrux.db.models import AgentRun
 
-        _positive_page(limit)
+        _sql_support._positive_page(limit)
         stmt = select(
             AgentRun.id,
             AgentRun.tenant_id,
@@ -5312,7 +5105,7 @@ class SQLStateStore(_StoreHost, ManagedReads, SQLBlobCatalog):
             def validate(row_mapping: Any) -> None:
                 nonlocal previous_epoch, cancelled, governance_changed, gap
                 row = SimpleNamespace(**row_mapping)
-                _refuse_direct_managed_child(run_id, row.loop_state)
+                _sql_support._refuse_direct_managed_child(run_id, row.loop_state)
                 checks = [
                     (row.storage_format == STORAGE_FORMAT_CHECKPOINTED, "legacy_run"),
                     (self.capabilities.recovery, "store_capability"),
@@ -5337,7 +5130,7 @@ class SQLStateStore(_StoreHost, ManagedReads, SQLBlobCatalog):
                         self._ordered(
                             table,
                             {
-                                **_status_values(RunStatus.CANCELLED.value),
+                                **_sql_support._status_values(RunStatus.CANCELLED.value),
                                 "claim_epoch": table.c.claim_epoch + 1,
                                 "pause_data": None,
                                 "cancel_requested": False,
@@ -5446,7 +5239,7 @@ class SQLStateStore(_StoreHost, ManagedReads, SQLBlobCatalog):
 
         from dendrux.db.models import ToolCallRecord
 
-        _positive_page(limit)
+        _sql_support._positive_page(limit)
         limit = min(limit, MAX_PAGE)
         async with self._session_factory() as session:
             rows = (
@@ -6244,7 +6037,7 @@ class SQLStateStore(_StoreHost, ManagedReads, SQLBlobCatalog):
         from dendrux.runtime._digest import event_digest
 
         digest = event_digest(event_type, iteration_index, correlation_id, data)
-        _note_blocked_event(session, run_id, event_type)
+        _sql_support._note_blocked_event(session, run_id, event_type)
 
         def conflict() -> NoReturn:
             _codes.log_code(logger, _codes.WRITE_CONFLICT, run_id=run_id)
@@ -6425,10 +6218,3 @@ def _active_wait_id(
     ):
         raise ManagedStateError(reason="binding_conflict", run_id=request.parent_run_id)
     return pause_id
-
-
-def _validate_lease_batch_size(*, batch_size: int, cap: int) -> None:
-    _positive_page(batch_size)
-    if batch_size > cap:
-        _codes.log_code(logger, _codes.RECOVERY_SCAN_LIMIT, run_id=None)
-        raise ValueError(f"batch_size must not exceed {cap}")

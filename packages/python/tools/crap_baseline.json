@@ -16927,6 +16927,66 @@
   "crap": 1.0,
   "digest": "3ea5cf70e838"
  },
+ "src/dendrux/runtime/stores/sql/_sql_support.py::_check_create_identifiers": {
+  "complexity": 3,
+  "coverage": 1.0,
+  "crap": 3.0,
+  "digest": "5a7d78e56eae"
+ },
+ "src/dendrux/runtime/stores/sql/_sql_support.py::_checkpoint_error": {
+  "complexity": 1,
+  "coverage": 1.0,
+  "crap": 1.0,
+  "digest": "9d74e1efcfe7"
+ },
+ "src/dendrux/runtime/stores/sql/_sql_support.py::_json_bytes": {
+  "complexity": 1,
+  "coverage": 1.0,
+  "crap": 1.0,
+  "digest": "36422828f0a9"
+ },
+ "src/dendrux/runtime/stores/sql/_sql_support.py::_positive_page": {
+  "complexity": 3,
+  "coverage": 1.0,
+  "crap": 3.0,
+  "digest": "339017961767"
+ },
+ "src/dendrux/runtime/stores/sql/_sql_support.py::_status_values": {
+  "complexity": 2,
+  "coverage": 1.0,
+  "crap": 2.0,
+  "digest": "d5ed7e90ca09"
+ },
+ "src/dendrux/runtime/stores/sql/_sql_support.py::_trace_record": {
+  "complexity": 1,
+  "coverage": 1.0,
+  "crap": 1.0,
+  "digest": "f6c8353a1d06"
+ },
+ "src/dendrux/runtime/stores/sql/_sql_support.py::_validate_checkpoint": {
+  "complexity": 3,
+  "coverage": 1.0,
+  "crap": 3.0,
+  "digest": "72439b3a8341"
+ },
+ "src/dendrux/runtime/stores/sql/_sql_support.py::_validate_lease_batch_size": {
+  "complexity": 2,
+  "coverage": 1.0,
+  "crap": 2.0,
+  "digest": "3ff6ff6aecd7"
+ },
+ "src/dendrux/runtime/stores/sql/_sql_support.py::_validate_rewrite_entries": {
+  "complexity": 9,
+  "coverage": 1.0,
+  "crap": 9.0,
+  "digest": "3a3858057190"
+ },
+ "src/dendrux/runtime/stores/sql/_sql_support.py::_validate_trace_write": {
+  "complexity": 7,
+  "coverage": 1.0,
+  "crap": 7.0,
+  "digest": "50577816e14f"
+ },
  "src/dendrux/runtime/stores/sql/base.py::SQLStateStore.__init__": {
   "complexity": 3,
   "coverage": 1.0,
@@ -18006,66 +18066,6 @@
   "coverage": 0.5,
   "crap": 4.12,
   "digest": "ba68ddd79cc5"
- },
- "src/dendrux/runtime/stores/sql/base.py::_check_create_identifiers": {
-  "complexity": 3,
-  "coverage": 1.0,
-  "crap": 3.0,
-  "digest": "5a7d78e56eae"
- },
- "src/dendrux/runtime/stores/sql/base.py::_checkpoint_error": {
-  "complexity": 1,
-  "coverage": 1.0,
-  "crap": 1.0,
-  "digest": "9d74e1efcfe7"
- },
- "src/dendrux/runtime/stores/sql/base.py::_json_bytes": {
-  "complexity": 1,
-  "coverage": 1.0,
-  "crap": 1.0,
-  "digest": "36422828f0a9"
- },
- "src/dendrux/runtime/stores/sql/base.py::_positive_page": {
-  "complexity": 3,
-  "coverage": 1.0,
-  "crap": 3.0,
-  "digest": "339017961767"
- },
- "src/dendrux/runtime/stores/sql/base.py::_status_values": {
-  "complexity": 2,
-  "coverage": 1.0,
-  "crap": 2.0,
-  "digest": "d5ed7e90ca09"
- },
- "src/dendrux/runtime/stores/sql/base.py::_trace_record": {
-  "complexity": 1,
-  "coverage": 1.0,
-  "crap": 1.0,
-  "digest": "f6c8353a1d06"
- },
- "src/dendrux/runtime/stores/sql/base.py::_validate_checkpoint": {
-  "complexity": 3,
-  "coverage": 1.0,
-  "crap": 3.0,
-  "digest": "72439b3a8341"
- },
- "src/dendrux/runtime/stores/sql/base.py::_validate_lease_batch_size": {
-  "complexity": 2,
-  "coverage": 1.0,
-  "crap": 2.0,
-  "digest": "3ff6ff6aecd7"
- },
- "src/dendrux/runtime/stores/sql/base.py::_validate_rewrite_entries": {
-  "complexity": 9,
-  "coverage": 1.0,
-  "crap": 9.0,
-  "digest": "3a3858057190"
- },
- "src/dendrux/runtime/stores/sql/base.py::_validate_trace_write": {
-  "complexity": 7,
-  "coverage": 1.0,
-  "crap": 7.0,
-  "digest": "50577816e14f"
  },
  "src/dendrux/runtime/stores/sql/base.py::_validated_store_write": {
   "complexity": 1,
