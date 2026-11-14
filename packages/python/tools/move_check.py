@@ -189,6 +189,11 @@ def _is_plain(expr: ast.expr | None) -> bool:
         while isinstance(base, ast.Attribute):
             base = base.value
         return isinstance(base, ast.Name)
+    if isinstance(expr, ast.BinOp) and isinstance(expr.op, ast.Mult):
+        return all(
+            isinstance(operand, ast.Constant) and type(operand.value) is int
+            for operand in (expr.left, expr.right)
+        )
     if isinstance(expr, ast.UnaryOp):
         return (
             isinstance(expr.op, ast.USub | ast.UAdd)
