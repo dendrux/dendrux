@@ -1,4 +1,4 @@
-.PHONY: dev-sync cov-mysql test test-fast test-area test-pg test-kit test-merge test-lists test-shard-proof test-model-check test-model-install test-dbs-up test-dbs-down test-redis-up test-redis-down test-redis test-mysql bench load load-quick load-pg load-mysql load-mariadb lint typecheck arch crap cognitive size ruff-ratchet duplicates deadcode cycles semgrep stale-patches move-check quality quality-stamp api-check format package-smoke ci clean
+.PHONY: dev-sync cov-mysql test test-fast test-area test-pg test-kit test-merge test-lists test-shard-proof test-model-check test-model-install test-dbs-up test-dbs-down test-redis-up test-redis-down test-redis test-mysql bench load load-quick load-pg load-mysql load-mariadb lint typecheck arch crap cognitive size ruff-ratchet duplicates deadcode cycles semgrep stale-patches move-check move-proof quality quality-stamp api-check format package-smoke ci clean
 .DEFAULT_GOAL := test
 
 # Match a fresh CI install: exact dev tools and the newest allowed runtime dependencies.
@@ -136,11 +136,16 @@ stale-patches:
 
 # Prove a refactor only moved code (tools/move_check.py). Usage:
 #   make move-check BASE=<git ref> OLD=src/dendrux/x/old.py NEW="src/dendrux/x/a.py src/dendrux/x/b.py"
-# Add MOVE_ARGS="--allow-new _StoreAttrs --require-reexports --emit-map /path/map.json" as needed.
+# For reviewed split moves add --move-manifest tools/moves/pr1.json to MOVE_ARGS.
+# Schema, lifecycle and exact PR1 invocation: tools/moves/README.md.
 # Then rewrite the tests' patch targets with tools/patch_codemod.py (dry run by default).
 move-check:
 	@test -n "$(BASE)" -a -n "$(OLD)" -a -n "$(NEW)" || { echo "usage: make move-check BASE=<ref> OLD=<path> NEW=\"<paths>\""; exit 2; }
 	python tools/move_check.py --base "$(BASE)" --old "$(OLD)" --new $(NEW) $(MOVE_ARGS)
+
+# All tracked cumulative move evidence (full history required; absent manifests fail).
+move-proof:
+	python tools/move_ci.py
 
 quality: cognitive duplicates deadcode cycles semgrep crap size ruff-ratchet
 

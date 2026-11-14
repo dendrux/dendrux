@@ -604,3 +604,39 @@ jobs:
 
       - name: Compare the public API with v0.5.0
         run: python packages/python/tools/api_breaks.py --against v0.5.0
+
+  move-manifests:
+    name: Detect active split manifests
+    runs-on: ubuntu-latest
+    outputs:
+      active: ${{ steps.detect.outputs.active }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: detect
+        working-directory: packages/python
+        run: |
+          active=$(python tools/move_ci.py --discover)
+          echo "active=$active" >> "$GITHUB_OUTPUT"
+        shell: bash
+
+  move-proof:
+    name: Prove cumulative split moves
+    needs: [move-manifests]
+    if: needs.move-manifests.outputs.active == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: packages/python
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.11"
+      - name: Check tracked manifests, source pins and maps
+        run: python tools/move_ci.py

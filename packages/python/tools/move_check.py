@@ -39,7 +39,7 @@ import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from collections.abc import Collection, Mapping, Sequence
@@ -49,6 +49,10 @@ try:
 except ImportError:  # run as a script from packages/python/tools
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from tools import _ratchet as r
+
+from tools import _move_manifest as m
+from tools._move_providers import validate_providers
+from tools.owner_bindings import check_bindings, check_globals
 
 _IMPORTS = (ast.Import, ast.ImportFrom)
 _FUNCTIONS = (ast.FunctionDef, ast.AsyncFunctionDef)
@@ -437,6 +441,8 @@ def _compare_class(
     hosts: Mapping[str, _Host],
     used: dict[str, str],
     report: MoveReport,
+    *,
+    provider_hosts: bool = False,
 ) -> None:
     leading: list[str] = []
     for base in new.bases:
@@ -452,6 +458,12 @@ def _compare_class(
         )
     if _header(old) != _header(new):
         report.problems.append(f"changed: class {old.name} decorators/keywords in {module}")
+    if provider_hosts:
+        for name in leading:
+            for base in hosts[name].node.bases:
+                provider = _name_of(base)
+                if provider is not None and provider in hosts and provider not in leading:
+                    leading.append(provider)
     here, base_items = _class_items(new), _class_items(old)
     if (
         leading
@@ -495,13 +507,15 @@ def _find_hosts(
     modules: Mapping[str, list[_Item]],
     allow_new: Collection[str],
     report: MoveReport,
+    *,
+    provider_bases: Collection[str] | None = None,
 ) -> dict[str, _Host]:
     """New top-level classes that an old class names as a base are mixin hosts."""
     base_names = {
         n
         for items in modules.values()
         for it in items
-        if it.key in old_keys and isinstance(it.node, ast.ClassDef)
+        if (it.key in old_keys or provider_bases is not None) and isinstance(it.node, ast.ClassDef)
         for b in it.node.bases
         if (n := _name_of(b))
     }
@@ -525,7 +539,11 @@ def _find_hosts(
             )
             continue
         node = found[0].node
-        stray = [b for b in node.bases if _name_of(b) not in allow_new]
+        permitted = set(allow_new)
+        if provider_bases is not None:
+            permitted.update(defined)
+            permitted.update(provider_bases)
+        stray = [b for b in node.bases if _name_of(b) not in permitted]
         if node.decorator_list or node.keywords or stray or getattr(node, "type_params", []):
             report.problems.append(
                 f"extra: mixin {name} in {found[0].module} has decorators, keywords or bases "
@@ -613,6 +631,7 @@ def check_move(
     allow_effects: Collection[str] = (),
     require_reexports: bool = False,
     modules: Mapping[str, str] | None = None,
+    move_manifest: Mapping[str, Any] | None = None,
 ) -> MoveReport:
     """Compare the base source of one module with its pieces now (module key -> source).
 
@@ -620,6 +639,14 @@ def check_move(
     ``modules`` maps a key to its dotted module name (default: the key).
     """
     report = MoveReport()
+    if move_manifest is not None:
+        return _manifest_move(
+            old_source,
+            after,
+            old_key=old_key,
+            manifest=move_manifest,
+            modules=modules or {key: key for key in after},
+        )
     old_tree = ast.parse(old_source)
     trees = {name: ast.parse(src) for name, src in after.items()}
     old_items = _module_items(old_tree, is_old=True, allow_effects=allow_effects)
@@ -651,6 +678,149 @@ def check_move(
     return report
 
 
+def _manifest_inventory(
+    old_items: Sequence[_Item],
+    new_items: Mapping[str, list[_Item]],
+    hosts: Mapping[str, _Host],
+    where: Mapping[str, str],
+    report: MoveReport,
+    old_key: str,
+) -> dict[str, str]:
+    used: dict[str, str] = {}
+    for item in old_items:
+        if isinstance(item.node, ast.ClassDef) and item.key in where:
+            news = [
+                it.node
+                for it in new_items[where[item.key]]
+                if it.key == item.key and isinstance(it.node, ast.ClassDef)
+            ]
+            if len(news) == 1:
+                _compare_class(
+                    item.node, news[0], where[item.key], hosts, used, report, provider_hosts=True
+                )
+    if set(hosts) != set(used):
+        report.problems.append("provider: unused operation host")
+    actual_owners = dict(where) | report.moved
+    # Retained members also need explicit destinations in the reviewed map.
+    for item in old_items:
+        if isinstance(item.node, ast.ClassDef):
+            for member in _class_items(item.node):
+                if isinstance(member.node, _FUNCTIONS):
+                    actual_owners.setdefault(
+                        f"{item.key}.{member.key}", where.get(item.key, old_key)
+                    )
+    return actual_owners
+
+
+def _manifest_move(
+    old_source: str,
+    after: Mapping[str, str],
+    *,
+    old_key: str,
+    manifest: Mapping[str, Any],
+    modules: Mapping[str, str],
+) -> MoveReport:
+    report = MoveReport()
+    try:
+        before, normalized = m.normalize(old_source, after, manifest, old_key, modules)
+        old_tree = ast.parse(before)
+        trees = {key: ast.parse(source) for key, source in normalized.items()}
+        old_items = _module_items(old_tree, is_old=True, allow_effects=manifest["effects"])
+        new_items = {
+            key: _module_items(tree, is_old=key == old_key, allow_effects=manifest["effects"])
+            for key, tree in trees.items()
+        }
+        for key, tree in trees.items():
+            if _future(tree) != _future(old_tree):
+                report.problems.append(f"changed: `from __future__` imports differ in {key}")
+        external = {
+            b.id
+            for n in old_tree.body
+            if isinstance(n, ast.ClassDef)
+            for b in n.bases
+            if isinstance(b, ast.Name)
+        }
+        hosts = _find_hosts(
+            {it.key for it in old_items},
+            new_items,
+            manifest["scaffolding"],
+            report,
+            provider_bases=external,
+        )
+        where = _place(
+            "", old_items, new_items, old_key, report, {*hosts, *manifest["scaffolding"]}
+        )
+        report.moved.update({key: module for key, module in where.items() if module != old_key})
+        actual_owners = _manifest_inventory(old_items, new_items, hosts, where, report, old_key)
+        report.problems.extend(
+            validate_providers(
+                old_tree,
+                trees,
+                modules,
+                {key: (host.module, host.node) for key, host in hosts.items()},
+                manifest["providers"],
+                old_key,
+            )
+        )
+        if manifest["owners"] != actual_owners:
+            report.problems.append("manifest owner inventory missing/unused/mismatched entries")
+        _manifest_aliases(
+            ast.parse(old_source),
+            ast.parse(after.get(old_key, "")),
+            where,
+            old_key,
+            modules,
+            report,
+        )
+        targets = {
+            key: f"{modules[manifest['owners'][key]]}.{key}"
+            for key in manifest["owners"]
+            if "." not in key
+            and any(isinstance(n, _FUNCTIONS) and n.name == key for n in ast.parse(old_source).body)
+        }
+        targets.update(manifest["seams"])
+        for key, source in after.items():
+            report.problems.extend(check_bindings(source, modules[key], targets))
+        report.problems.extend(
+            check_globals(old_source, after, modules[old_key], modules, manifest["owners"])
+        )
+        report.problems.extend(m.check_spans(old_source, after, manifest["owners"]))
+        if any(name not in report.moved for name in manifest["effects"]):
+            report.problems.append("manifest named effect is unused")
+    except (ValueError, TypeError, KeyError, SyntaxError, AttributeError) as exc:
+        report.problems.append(f"manifest: {exc}")
+    return report
+
+
+def _manifest_aliases(
+    old: ast.Module,
+    facade: ast.Module,
+    owners: Mapping[str, str],
+    old_key: str,
+    modules: Mapping[str, str],
+    report: MoveReport,
+) -> None:
+    bound = _runtime_bindings(facade)
+    _check_exports(report, old, facade, owners, modules, False)
+    for key, owner in owners.items():
+        if owner == old_key:
+            continue
+        for name in key.split(","):
+            if bound.get(name) != (modules[owner], name) or _bindings_of(facade, name) != 1:
+                report.problems.append(
+                    f"re-export: exact public/private alias {name} -> {modules[owner]} required"
+                )
+    if modules[old_key] == "dendrux.runtime.runner" and len(owners) != 281:
+        report.problems.append("re-export: runner must conserve all 281 original roots")
+    if modules[old_key] == "dendrux.runtime.runner":
+        original = _runtime_bindings(old)
+        for name, identity in original.items():
+            if identity is not None and bound.get(name) != identity:
+                report.problems.append(
+                    f"re-export: original imported compatibility binding {name} changed"
+                )
+
+
 def _git_show(base: str, path: str) -> str:
     proc = subprocess.run(  # noqa: S603 - argument list, fixed git subcommand
         ["git", "show", f"{base}:./{path}"],  # noqa: S607
@@ -677,6 +847,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         help="assignments whose value calls something may move only if their target is listed",
     )
     parser.add_argument("--require-reexports", action="store_true")
+    parser.add_argument("--move-manifest", type=Path, help="reviewed cumulative move evidence")
     parser.add_argument("--emit-map", type=Path, help="write {old_module: {name: new_module}} JSON")
     return parser.parse_args(argv)
 
@@ -693,6 +864,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     after: dict[str, str] = {str(p): p.read_text(encoding="utf-8") for p in args.new}
     if args.old.is_file():
         after[old_key] = args.old.read_text(encoding="utf-8")
+    manifest = None
+    if args.move_manifest:
+        try:
+            manifest = json.loads(args.move_manifest.read_text(encoding="utf-8"))
+            if manifest["base"] != args.base:
+                raise ValueError("manifest base differs from --base (use the immutable SHA)")
+            m.verify_provider_sources(
+                manifest,
+                lambda path: _git_show(args.base, path),
+                lambda path: Path(path).read_text(),
+            )
+            if args.allow_effects and set(args.allow_effects) != set(manifest["effects"]):
+                raise ValueError("--allow-effects differs from manifest")
+            if args.allow_new and set(args.allow_new) != set(manifest["scaffolding"]):
+                raise ValueError("--allow-new differs from reviewed contracts")
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            print(f"move_check: manifest refused: {exc}")
+            return 1
     report = check_move(
         _git_show(args.base, old_key),
         after,
@@ -701,6 +890,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         allow_effects=args.allow_effects,
         require_reexports=args.require_reexports,
         modules={str(p): r.module_name(p) for p in [args.old, *args.new]},
+        move_manifest=manifest,
     )
     for key, module in sorted(report.moved.items()):
         print(f"moved: {key} -> {module}")

@@ -8,6 +8,8 @@
 # joined by `:` may import each other; packages joined by `|` may not.
 # SQL implementations and the engine factory live in runtime.stores, below agent/store.
 [importlinter]
+contract_types =
+    forbidden: tools.split_imports.PresentForbiddenContract
 root_package = dendrux
 include_external_packages = True
 exclude_type_checking_imports = True
@@ -99,3 +101,48 @@ forbidden_modules =
 allow_indirect_imports = True
 ignore_imports =
     dendrux.notifiers.otel -> opentelemetry
+
+[importlinter:contract:split-no-facade-backedge]
+name = Split operation modules cannot import compatibility facades
+type = forbidden
+source_modules =
+    dendrux.runtime._run_errors
+    dendrux.runtime._run_pending
+    dendrux.runtime._run_contracts
+    dendrux.runtime._run_observers
+    dendrux.runtime._run_events
+    dendrux.runtime._run_tools
+    dendrux.runtime._run_images
+    dendrux.runtime._run_entry
+    dendrux.runtime._run_start
+    dendrux.runtime._run_outcome
+    dendrux.runtime._run_execute
+    dendrux.runtime._run_retry
+    dendrux.runtime._run_stream
+    dendrux.runtime._run_resume_prep
+    dendrux.runtime._run_resume_replay
+    dendrux.runtime._run_approval
+    dendrux.runtime._run_resume_loop
+    dendrux.runtime._run_resume
+    dendrux.runtime._run_resume_stream
+    dendrux.runtime.stores.sql._sql_host
+    dendrux.runtime.stores.sql._sql_sessions
+    dendrux.runtime.stores.sql._sql_support
+    dendrux.runtime.stores.sql._sql_sweep_scan
+    dendrux.runtime.stores.sql._sql_writes
+    dendrux.runtime.stores.sql._sql_runs
+    dendrux.runtime.stores.sql._sql_evidence
+    dendrux.runtime.stores.sql._sql_managed
+    dendrux.runtime.stores.sql._sql_tree
+    dendrux.runtime.stores.sql._sql_lifecycle
+    dendrux.runtime.stores.sql._sql_pause
+    dendrux.runtime.stores.sql._sql_reads
+    dendrux.runtime.stores.sql._sql_events
+    dendrux.runtime.stores.sql._sql_claims
+    dendrux.runtime.stores.sql._sql_leases
+    dendrux.runtime.stores.sql._sql_sweep
+forbidden_modules =
+    dendrux.runtime.runner
+    dendrux.runtime.stores.sql.base
+allow_indirect_imports = True
+as_packages = False
