@@ -73,6 +73,7 @@ def _snapshot(cls):
 EXPECTED_MRO = {
     "SQLStateStore": [
         "SQLStateStore",
+        "_SqlEvidence",
         "_SqlWrites",
         "_StoreHost",
         "ManagedReads",
@@ -82,6 +83,7 @@ EXPECTED_MRO = {
     "SQLiteStateStore": [
         "SQLiteStateStore",
         "SQLStateStore",
+        "_SqlEvidence",
         "_SqlWrites",
         "_StoreHost",
         "ManagedReads",
@@ -91,6 +93,7 @@ EXPECTED_MRO = {
     "PostgresStateStore": [
         "PostgresStateStore",
         "SQLStateStore",
+        "_SqlEvidence",
         "_SqlWrites",
         "_StoreHost",
         "ManagedReads",
@@ -100,6 +103,7 @@ EXPECTED_MRO = {
     "MySQLStateStore": [
         "MySQLStateStore",
         "SQLStateStore",
+        "_SqlEvidence",
         "_SqlWrites",
         "_StoreHost",
         "ManagedReads",
@@ -220,6 +224,82 @@ WRITES_RELOCATIONS = {
 }
 
 
+EVIDENCE_RELOCATIONS = {
+    "MySQLStateStore": {
+        "_insert_trace": ("SQLStateStore", "_SqlEvidence", "base.py", "_sql_evidence.py"),
+        "_patch_fence": ("SQLStateStore", "_SqlEvidence", "base.py", "_sql_evidence.py"),
+        "checkpoint_step": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_evidence.py"),
+        "complete_tool_call": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_evidence.py"),
+        "get_replayed_tool_calls": (
+            "SQLStateStore",
+            "SQLStateStore",
+            "base.py",
+            "_sql_evidence.py",
+        ),
+        "save_llm_interaction": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_evidence.py"),
+        "save_tool_call": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_evidence.py"),
+        "save_trace": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_evidence.py"),
+        "save_usage": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_evidence.py"),
+        "set_trace_link": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_evidence.py"),
+        "start_tool_call": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_evidence.py"),
+    },
+    "PostgresStateStore": {
+        "_insert_trace": ("SQLStateStore", "_SqlEvidence", "base.py", "_sql_evidence.py"),
+        "_patch_fence": ("SQLStateStore", "_SqlEvidence", "base.py", "_sql_evidence.py"),
+        "checkpoint_step": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_evidence.py"),
+        "complete_tool_call": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_evidence.py"),
+        "get_replayed_tool_calls": (
+            "SQLStateStore",
+            "SQLStateStore",
+            "base.py",
+            "_sql_evidence.py",
+        ),
+        "save_llm_interaction": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_evidence.py"),
+        "save_tool_call": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_evidence.py"),
+        "save_trace": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_evidence.py"),
+        "save_usage": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_evidence.py"),
+        "set_trace_link": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_evidence.py"),
+        "start_tool_call": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_evidence.py"),
+    },
+    "SQLStateStore": {
+        "_insert_trace": ("SQLStateStore", "_SqlEvidence", "base.py", "_sql_evidence.py"),
+        "_patch_fence": ("SQLStateStore", "_SqlEvidence", "base.py", "_sql_evidence.py"),
+        "checkpoint_step": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_evidence.py"),
+        "complete_tool_call": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_evidence.py"),
+        "get_replayed_tool_calls": (
+            "SQLStateStore",
+            "SQLStateStore",
+            "base.py",
+            "_sql_evidence.py",
+        ),
+        "save_llm_interaction": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_evidence.py"),
+        "save_tool_call": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_evidence.py"),
+        "save_trace": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_evidence.py"),
+        "save_usage": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_evidence.py"),
+        "set_trace_link": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_evidence.py"),
+        "start_tool_call": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_evidence.py"),
+    },
+    "SQLiteStateStore": {
+        "_insert_trace": ("SQLStateStore", "_SqlEvidence", "base.py", "_sql_evidence.py"),
+        "_patch_fence": ("SQLStateStore", "_SqlEvidence", "base.py", "_sql_evidence.py"),
+        "checkpoint_step": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_evidence.py"),
+        "complete_tool_call": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_evidence.py"),
+        "get_replayed_tool_calls": (
+            "SQLStateStore",
+            "SQLStateStore",
+            "base.py",
+            "_sql_evidence.py",
+        ),
+        "save_llm_interaction": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_evidence.py"),
+        "save_tool_call": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_evidence.py"),
+        "save_trace": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_evidence.py"),
+        "save_usage": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_evidence.py"),
+        "set_trace_link": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_evidence.py"),
+        "start_tool_call": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_evidence.py"),
+    },
+}
+
+
 def _canonical_writes_snapshot(snapshot, cls):
     import copy
 
@@ -232,6 +312,16 @@ def _canonical_writes_snapshot(snapshot, cls):
         assert member["layers"][-1] == ("_sql_writes.py", name), name
         member["owner"] = old_owner
         member["layers"][-1] = ("base.py", name)
+    for name, (old_owner, new_owner, old_file, new_file) in EVIDENCE_RELOCATIONS[
+        cls.__name__
+    ].items():
+        assert name in result["members"]
+        member = result["members"][name]
+        assert member["owner"] == new_owner, name
+        assert member["layers"][-1] == (new_file, name), name
+        member["owner"] = old_owner
+        member["layers"][-1] = (old_file, name)
+    result["mro"].remove("_SqlEvidence")
     result["mro"].remove("_SqlWrites")
     return result
 
@@ -391,6 +481,8 @@ async def test_explicit_private_wrapper_and_sanitized_database_failures(cls, nam
         "moved-owner",
         "unlisted-owner",
         "moved-file",
+        "evidence-owner",
+        "evidence-file",
         "unlisted-file",
         "wrapper-count",
         "wrapper-order",
@@ -417,6 +509,10 @@ def test_proposed_exact_write_relocation_still_refuses_unplanned_snapshot_change
         raw["members"]["_insert"]["owner"] = "_SqlWrites"
     elif change == "moved-file":
         raw["members"]["_write_tx"]["layers"][-1] = ("_other.py", "_write_tx")
+    elif change == "evidence-owner":
+        raw["members"]["_patch_fence"]["owner"] = "SQLStateStore"
+    elif change == "evidence-file":
+        raw["members"]["_insert_trace"]["layers"][-1] = ("_other.py", "_insert_trace")
     elif change == "unlisted-file":
         raw["members"]["_insert"]["layers"][-1] = ("_sql_writes.py", "_insert")
     elif change == "wrapper-count":

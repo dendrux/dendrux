@@ -5,8 +5,8 @@ from sqlalchemy import text
 
 from dendrux.errors import PersistenceError
 from dendrux.media import BlobEdge
+from dendrux.runtime import state
 from dendrux.runtime._blob_catalog import BlobServices
-from dendrux.runtime.stores.sql import base as sql_base
 from dendrux.testing.store_kit.contracts._support import (
     complete_call_kwargs,
     start_call_kwargs,
@@ -27,7 +27,7 @@ async def test_event_failure_rolls_back_tool_evidence_and_checkpoint(store, monk
     )
     if operation == "complete":
         await store.start_tool_call(run_id, claim_epoch=0, **start_call_kwargs("a"))
-    original = sql_base._write_event
+    original = state._write_event
     calls = []
 
     async def fail_after_event(session, event_run_id, event):
@@ -35,7 +35,7 @@ async def test_event_failure_rolls_back_tool_evidence_and_checkpoint(store, monk
         await original(session, event_run_id, event)
         raise ValueError("forced event boundary")
 
-    monkeypatch.setattr(sql_base, "_write_event", fail_after_event)
+    monkeypatch.setattr(state, "_write_event", fail_after_event)
     with pytest.raises(ValueError, match="forced event boundary"):
         if operation == "start":
             await store.start_tool_call(run_id, claim_epoch=0, **start_call_kwargs("a"))

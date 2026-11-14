@@ -4,12 +4,13 @@
   "old": "src/dendrux/runtime/stores/sql/base.py",
   "source_sha256": "4f96e1585590cce34bc27517c946c901c2fad4f9337db8468b6d89c9f77c4258",
   "sources": {
-    "src/dendrux/runtime/stores/sql/base.py": "4f7089d180d35e2b62ba5bfca89547574d3492856ecfd50e7e3961e71d137073",
+    "src/dendrux/runtime/stores/sql/base.py": "53f25efa0dc52e4f1950ed747f9acb3db2b74f9d1b3e2f5ca16a5a24a24b4578",
     "src/dendrux/runtime/stores/sql/_sql_host.py": "f3a1be68f99d6afea8d845e95fea3277a2e730967f6fc4811a38b6804a2b0a5b",
     "src/dendrux/runtime/stores/sql/_sql_sessions.py": "5ad0ed7a3b27acded5ccfb6ac3ca816712272c144e7492ba6d44d315acd9a5c4",
     "src/dendrux/runtime/stores/sql/_sql_support.py": "e57aaa22c139089f2a771c23ff20f51e88c248ea8e41011277b4bb51c5715fab",
     "src/dendrux/runtime/stores/sql/_sql_sweep_scan.py": "75ae229330b4a3f2a1b9c9fc54611cdfc9c1604a74fff76aa39c89e56cae883f",
-    "src/dendrux/runtime/stores/sql/_sql_writes.py": "b2b448e7fa0668337664acb1844d61aab142e8edc544315172be59621e2edb4a"
+    "src/dendrux/runtime/stores/sql/_sql_writes.py": "b2b448e7fa0668337664acb1844d61aab142e8edc544315172be59621e2edb4a",
+    "src/dendrux/runtime/stores/sql/_sql_evidence.py": "1f2aaecf6eb45b7dcd13a409593a1213a77c96cc177dbe24a690a91ef5eff5c0"
   },
   "owners": {
     "_RECOVERY_DESCRIPTOR_BYTES": "src/dendrux/runtime/stores/sql/_sql_support.py",
@@ -120,15 +121,15 @@
     "SQLStateStore._fence": "src/dendrux/runtime/stores/sql/_sql_writes.py",
     "SQLStateStore._insert_retry": "src/dendrux/runtime/stores/sql/_sql_writes.py",
     "SQLStateStore._write_conflict": "src/dendrux/runtime/stores/sql/_sql_writes.py",
-    "SQLStateStore.save_trace": "src/dendrux/runtime/stores/sql/base.py",
-    "SQLStateStore.save_tool_call": "src/dendrux/runtime/stores/sql/base.py",
-    "SQLStateStore.save_usage": "src/dendrux/runtime/stores/sql/base.py",
-    "SQLStateStore.save_llm_interaction": "src/dendrux/runtime/stores/sql/base.py",
-    "SQLStateStore._insert_trace": "src/dendrux/runtime/stores/sql/base.py",
-    "SQLStateStore.checkpoint_step": "src/dendrux/runtime/stores/sql/base.py",
-    "SQLStateStore._patch_fence": "src/dendrux/runtime/stores/sql/base.py",
-    "SQLStateStore.start_tool_call": "src/dendrux/runtime/stores/sql/base.py",
-    "SQLStateStore.complete_tool_call": "src/dendrux/runtime/stores/sql/base.py",
+    "SQLStateStore.save_trace": "src/dendrux/runtime/stores/sql/_sql_evidence.py",
+    "SQLStateStore.save_tool_call": "src/dendrux/runtime/stores/sql/_sql_evidence.py",
+    "SQLStateStore.save_usage": "src/dendrux/runtime/stores/sql/_sql_evidence.py",
+    "SQLStateStore.save_llm_interaction": "src/dendrux/runtime/stores/sql/_sql_evidence.py",
+    "SQLStateStore._insert_trace": "src/dendrux/runtime/stores/sql/_sql_evidence.py",
+    "SQLStateStore.checkpoint_step": "src/dendrux/runtime/stores/sql/_sql_evidence.py",
+    "SQLStateStore._patch_fence": "src/dendrux/runtime/stores/sql/_sql_evidence.py",
+    "SQLStateStore.start_tool_call": "src/dendrux/runtime/stores/sql/_sql_evidence.py",
+    "SQLStateStore.complete_tool_call": "src/dendrux/runtime/stores/sql/_sql_evidence.py",
     "SQLStateStore.bind_managed_child": "src/dendrux/runtime/stores/sql/base.py",
     "SQLStateStore._bind_parent": "src/dendrux/runtime/stores/sql/base.py",
     "SQLStateStore._bind_existing": "src/dendrux/runtime/stores/sql/base.py",
@@ -139,7 +140,7 @@
     "SQLStateStore._bind_seeds": "src/dendrux/runtime/stores/sql/base.py",
     "SQLStateStore._bind_event": "src/dendrux/runtime/stores/sql/base.py",
     "SQLStateStore.consume_submission": "src/dendrux/runtime/stores/sql/base.py",
-    "SQLStateStore.set_trace_link": "src/dendrux/runtime/stores/sql/base.py",
+    "SQLStateStore.set_trace_link": "src/dendrux/runtime/stores/sql/_sql_evidence.py",
     "SQLStateStore._frontier_predicate": "src/dendrux/runtime/stores/sql/base.py",
     "SQLStateStore._frontier_scope": "src/dendrux/runtime/stores/sql/base.py",
     "SQLStateStore.mark_cancel_requested": "src/dendrux/runtime/stores/sql/base.py",
@@ -197,7 +198,7 @@
     "SQLStateStore._scan_expired_runs": "src/dendrux/runtime/stores/sql/base.py",
     "SQLStateStore.get_lease_expired": "src/dendrux/runtime/stores/sql/base.py",
     "SQLStateStore.reclaim_run": "src/dendrux/runtime/stores/sql/base.py",
-    "SQLStateStore.get_replayed_tool_calls": "src/dendrux/runtime/stores/sql/base.py",
+    "SQLStateStore.get_replayed_tool_calls": "src/dendrux/runtime/stores/sql/_sql_evidence.py",
     "SQLStateStore._waiting_sweep_page": "src/dendrux/runtime/stores/sql/base.py",
     "SQLStateStore.sweep_stale_runs": "src/dendrux/runtime/stores/sql/base.py",
     "SQLStateStore.sweep_abandoned_runs": "src/dendrux/runtime/stores/sql/base.py",
@@ -295,49 +296,49 @@
     },
     {
       "root": "SQLStateStore._insert_trace",
-      "module": "src/dendrux/runtime/stores/sql/base.py",
+      "module": "src/dendrux/runtime/stores/sql/_sql_evidence.py",
       "name": "_validate_trace_write",
       "target": "dendrux.runtime.stores.sql._sql_support._validate_trace_write",
       "count": 1
     },
     {
       "root": "SQLStateStore.checkpoint_step",
-      "module": "src/dendrux/runtime/stores/sql/base.py",
+      "module": "src/dendrux/runtime/stores/sql/_sql_evidence.py",
       "name": "_validate_checkpoint",
       "target": "dendrux.runtime.stores.sql._sql_support._validate_checkpoint",
       "count": 1
     },
     {
       "root": "SQLStateStore.checkpoint_step",
-      "module": "src/dendrux/runtime/stores/sql/base.py",
+      "module": "src/dendrux/runtime/stores/sql/_sql_evidence.py",
       "name": "_checkpoint_progress",
       "target": "dendrux.runtime.stores.sql._sql_support._checkpoint_progress",
       "count": 1
     },
     {
       "root": "SQLStateStore._patch_fence",
-      "module": "src/dendrux/runtime/stores/sql/base.py",
+      "module": "src/dendrux/runtime/stores/sql/_sql_evidence.py",
       "name": "_validate_checkpoint",
       "target": "dendrux.runtime.stores.sql._sql_support._validate_checkpoint",
       "count": 3
     },
     {
       "root": "SQLStateStore._patch_fence",
-      "module": "src/dendrux/runtime/stores/sql/base.py",
+      "module": "src/dendrux/runtime/stores/sql/_sql_evidence.py",
       "name": "_progress_values",
       "target": "dendrux.runtime.stores.sql._sql_support._progress_values",
       "count": 1
     },
     {
       "root": "SQLStateStore._patch_fence",
-      "module": "src/dendrux/runtime/stores/sql/base.py",
+      "module": "src/dendrux/runtime/stores/sql/_sql_evidence.py",
       "name": "_checkpoint_error",
       "target": "dendrux.runtime.stores.sql._sql_support._checkpoint_error",
       "count": 1
     },
     {
       "root": "SQLStateStore.complete_tool_call",
-      "module": "src/dendrux/runtime/stores/sql/base.py",
+      "module": "src/dendrux/runtime/stores/sql/_sql_evidence.py",
       "name": "_advancing_turn",
       "target": "dendrux.runtime.stores.sql._sql_support._advancing_turn",
       "count": 1
@@ -582,7 +583,7 @@
     },
     {
       "root": "SQLStateStore.get_replayed_tool_calls",
-      "module": "src/dendrux/runtime/stores/sql/base.py",
+      "module": "src/dendrux/runtime/stores/sql/_sql_evidence.py",
       "name": "_positive_page",
       "target": "dendrux.runtime.stores.sql._sql_support._positive_page",
       "count": 1
@@ -641,6 +642,83 @@
       "module": "src/dendrux/runtime/stores/sql/base.py",
       "name": "_SweepScan",
       "target": "dendrux.runtime.stores.sql._sql_sweep_scan._SweepScan",
+      "count": 1
+    },
+    {
+      "root": "_write_release_event",
+      "module": "src/dendrux/runtime/stores/sql/base.py",
+      "name": "_write_event",
+      "target": "dendrux.runtime.state._write_event",
+      "count": 1
+    },
+    {
+      "root": "SQLStateStore.create_run",
+      "module": "src/dendrux/runtime/stores/sql/base.py",
+      "name": "write_blob_refs",
+      "target": "dendrux.runtime._blob_catalog.write_blob_refs",
+      "count": 1
+    },
+    {
+      "root": "SQLStateStore._bind_event",
+      "module": "src/dendrux/runtime/stores/sql/base.py",
+      "name": "_write_event",
+      "target": "dendrux.runtime.state._write_event",
+      "count": 1
+    },
+    {
+      "root": "SQLStateStore.finalize_with_event",
+      "module": "src/dendrux/runtime/stores/sql/base.py",
+      "name": "_write_event",
+      "target": "dendrux.runtime.state._write_event",
+      "count": 1
+    },
+    {
+      "root": "SQLStateStore.submit_and_claim",
+      "module": "src/dendrux/runtime/stores/sql/base.py",
+      "name": "write_blob_refs",
+      "target": "dendrux.runtime._blob_catalog.write_blob_refs",
+      "count": 1
+    },
+    {
+      "root": "SQLStateStore.save_tool_call",
+      "module": "src/dendrux/runtime/stores/sql/_sql_evidence.py",
+      "name": "write_blob_refs",
+      "target": "dendrux.runtime._blob_catalog.write_blob_refs",
+      "count": 1
+    },
+    {
+      "root": "SQLStateStore._insert_trace",
+      "module": "src/dendrux/runtime/stores/sql/_sql_evidence.py",
+      "name": "write_blob_refs",
+      "target": "dendrux.runtime._blob_catalog.write_blob_refs",
+      "count": 1
+    },
+    {
+      "root": "SQLStateStore.start_tool_call",
+      "module": "src/dendrux/runtime/stores/sql/_sql_evidence.py",
+      "name": "write_blob_refs",
+      "target": "dendrux.runtime._blob_catalog.write_blob_refs",
+      "count": 1
+    },
+    {
+      "root": "SQLStateStore.start_tool_call",
+      "module": "src/dendrux/runtime/stores/sql/_sql_evidence.py",
+      "name": "_write_event",
+      "target": "dendrux.runtime.state._write_event",
+      "count": 1
+    },
+    {
+      "root": "SQLStateStore.complete_tool_call",
+      "module": "src/dendrux/runtime/stores/sql/_sql_evidence.py",
+      "name": "write_blob_refs",
+      "target": "dendrux.runtime._blob_catalog.write_blob_refs",
+      "count": 1
+    },
+    {
+      "root": "SQLStateStore.complete_tool_call",
+      "module": "src/dendrux/runtime/stores/sql/_sql_evidence.py",
+      "name": "_write_event",
+      "target": "dendrux.runtime.state._write_event",
       "count": 1
     }
   ],
@@ -712,7 +790,9 @@
     "_WAIT_MARK_LABELS"
   ],
   "seams": {
-    "_insert_event_locked": "dendrux.runtime.state._insert_event_locked"
+    "_insert_event_locked": "dendrux.runtime.state._insert_event_locked",
+    "write_blob_refs": "dendrux.runtime._blob_catalog.write_blob_refs",
+    "_write_event": "dendrux.runtime.state._write_event"
   },
   "providers": {
     "dendrux.runtime.stores.sql._managed_reads.ManagedReads": {

@@ -15,7 +15,7 @@ import pytest
 from dendrux import Agent, tool
 from dendrux.errors import ProviderTimeoutError
 from dendrux.loops.base import BaseNotifier
-from dendrux.runtime import _run_entry, _run_observers, _run_resume_loop, _run_resume_replay
+from dendrux.runtime import _run_entry, _run_observers, _run_resume_loop, _run_resume_replay, state
 from dendrux.runtime.context import (
     DelegationContext,
     DelegationDepthExceededError,
@@ -1031,7 +1031,7 @@ async def test_resume_abort_event_and_release_roll_back_together(store, monkeypa
         return await write(session, event_run_id, event)
 
     monkeypatch.setattr(_run_observers, "_start_trace", AsyncMock(side_effect=original))
-    monkeypatch.setattr(base, "_write_event", reject_abort)
+    monkeypatch.setattr(state, "_write_event", reject_abort)
     with pytest.raises(RuntimeError) as caught:
         await invoke()
     assert caught.value is original

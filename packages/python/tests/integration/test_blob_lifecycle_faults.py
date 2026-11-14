@@ -19,6 +19,7 @@ from sqlalchemy import text
 
 from dendrux.errors import BlobNotFoundError, InvalidImageError
 from dendrux.media import BlobEdge, BlobKey, InMemoryBlobStore
+from dendrux.runtime import _blob_catalog
 from dendrux.runtime._blob_catalog import BlobServices, write_blob_refs
 from dendrux.runtime.stores._factory import store_for_engine
 from tests.unit.test_blob_catalog import make_png, store_png
@@ -625,7 +626,7 @@ async def test_injected_deadlock_retries_whole_transaction(engine, store, monkey
         if len(calls) == 1:
             raise DBAPIError("UPDATE dendrux_blobs", None, _DeadlockError())
 
-    monkeypatch.setattr(state_mod, "write_blob_refs", deadlock_once)
+    monkeypatch.setattr(_blob_catalog, "write_blob_refs", deadlock_once)
     services = BlobServices.for_state_store(store)
     s = (await store_png(services, "-", make_png(214))).ref.sha256
     edge = [BlobEdge("-", s, "input", "input", 0)]
@@ -795,7 +796,7 @@ class TestSharedEdgeWorkloadStillCatchesRealProblems:
             if len(calls) == 1:
                 raise DBAPIError("UPDATE dendrux_blobs", None, _DeadlockError("deadlock 40P01"))
 
-        monkeypatch.setattr(state_mod, "write_blob_refs", deadlock_once)
+        monkeypatch.setattr(_blob_catalog, "write_blob_refs", deadlock_once)
         failures, retries = await run_shared_edge_workload(engine, iterations=1)
         assert failures == []
         assert any("40P01" in r or "deadlock" in r.lower() for r in retries)
