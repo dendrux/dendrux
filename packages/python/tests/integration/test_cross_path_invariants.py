@@ -641,19 +641,22 @@ async def test_concurrent_submit_failure_releases_only_winning_epoch(
 
 @pytest.mark.parametrize("failure_site", ["_budget_carry_kwargs", "_resume_image_view"])
 async def test_unconsumed_resume_argument_failure_releases(store, monkeypatch, failure_site):
-    from dendrux.runtime import runner
+    from unittest.mock import Mock
+
+    from dendrux.runtime import _run_images, runner
 
     _, run_id, invoke = await submission_case(store, "submit_resume")
     original = RuntimeError("resume_argument_failure")
     with monkeypatch.context() as patcher:
-
-        def fail(*args, **kwargs):
-            raise original
-
-        patcher.setattr(runner, failure_site, fail)
+        fail = Mock(side_effect=original)
+        if failure_site == "_resume_image_view":
+            patcher.setattr(_run_images, "_resume_image_view", fail)
+        else:
+            patcher.setattr(runner, "_budget_carry_kwargs", fail)
         with pytest.raises(RuntimeError) as caught:
             await invoke()
     assert caught.value is original
+    fail.assert_called_once()
     assert (await store.get_run(run_id)).status == "paused"
     assert (await invoke()).status == RunStatus.SUCCESS
 

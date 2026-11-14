@@ -1571,7 +1571,7 @@ class TestGovernanceEvents:
             )
 
             with patch(
-                "dendrux.runtime.runner._emit_init_governance_event",
+                "dendrux.runtime._run_tools._emit_init_governance_event",
                 new_callable=AsyncMock,
             ) as emitted:
                 await _emit_init_events(agent, None, None, "run-1")
@@ -6394,7 +6394,7 @@ class TestSkippedSourceVisibility:
             agent = Agent(prompt="test", tool_sources=[optional.tools(namespace="gh")])
 
             with patch(
-                "dendrux.runtime.runner._emit_init_governance_event",
+                "dendrux.runtime._run_tools._emit_init_governance_event",
                 new_callable=AsyncMock,
             ) as emitted:
                 await _emit_init_events(agent, None, None, "run-1")

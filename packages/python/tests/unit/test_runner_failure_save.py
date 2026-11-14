@@ -13,7 +13,7 @@ from dendrux.errors import ProviderTimeoutError, RunFencedError
 from dendrux.llm.mock import MockLLM
 from dendrux.loops.base import BaseNotifier
 from dendrux.loops.react import ReActLoop
-from dendrux.runtime import runner
+from dendrux.runtime import _run_events, _run_images, runner
 from dendrux.runtime.persistence import PersistenceRecorder
 from dendrux.store import SQLiteStateStore
 from dendrux.types import LLMResponse, RunEventType, RunStatus, ToolCall, ToolResult
@@ -117,7 +117,7 @@ async def test_failure_after_start(store, monkeypatch, caplog, entry, outcome):
     recorder_failed = AsyncMock()
     monkeypatch.setattr(PersistenceRecorder, "on_run_failed", recorder_failed)
     safe = AsyncMock(wraps=runner._emit_event_safe)
-    monkeypatch.setattr(runner, "_emit_event_safe", safe)
+    monkeypatch.setattr(_run_events, "_emit_event_safe", safe)
     if entry.endswith("stream"):
         async with invoke(notifier) as stream:
             events = [event async for event in stream]
@@ -192,7 +192,7 @@ async def test_retry_seed_uses_requested_id_when_source_id_is_normalized(store, 
     prefix = AsyncMock(wraps=runner.record_run_prefix)
     images = AsyncMock(return_value=None)
     monkeypatch.setattr(runner, "record_run_prefix", prefix)
-    monkeypatch.setattr(runner, "_start_image_view", images)
+    monkeypatch.setattr(_run_images, "_start_image_view", images)
     await invoke(observer())
     assert prefix.await_args.kwargs["seed"] == {"retry_of": requested_ids[0]}
     assert images.await_args.kwargs["sources"][-1][0] == requested_ids[0]
@@ -204,7 +204,7 @@ async def test_failure_operation_returns_cas_result(monkeypatch, won):
 
     store = SimpleNamespace(finalize_run=AsyncMock(return_value=won))
     emit = AsyncMock()
-    monkeypatch.setattr(runner, "_emit_event", emit)
+    monkeypatch.setattr(_run_events, "_emit_event", emit)
     assert await runner._persist_run_failure(store, "run", RuntimeError("failure")) is won
     assert emit.await_count == int(won)
 
@@ -215,7 +215,7 @@ async def test_failure_event_write_policy(monkeypatch, safe):
 
     store = SimpleNamespace(finalize_run=AsyncMock(return_value=True))
     original = RuntimeError("event_failed")
-    monkeypatch.setattr(runner, "_emit_event", AsyncMock(side_effect=original))
+    monkeypatch.setattr(_run_events, "_emit_event", AsyncMock(side_effect=original))
     if safe:
         await runner._persist_run_failure(store, "run", RuntimeError("failure"), safe_event=True)
     else:

@@ -305,7 +305,7 @@ rules:
       allow_in:
         - "dendrux.runtime.runner:_new_run_metadata"
         # A real copy (image-error idempotent hit); the H5/H6 runner work removes it.
-        - "dendrux.runtime.runner:_idempotent_hit_after_image_error"
+        - "dendrux.runtime._run_images:_idempotent_hit_after_image_error"
     pattern-either:
       - pattern: compute_idempotency_fingerprint(...)
       - pattern: f"{$A.__module__}.{$B.__qualname__}"
@@ -400,9 +400,9 @@ rules:
     metadata:
       exclude: ["runtime/stores/", "runtime/state.py", "testing/", "db/"]
       allow_in:
-        - "dendrux.runtime.runner:_persist_run_cancellation"
+        - "dendrux.runtime._run_events:_persist_run_cancellation"
         - "dendrux.runtime.runner:_finalize_loop_cancelled"
-        - "dendrux.runtime.runner:_pause_with_event"
+        - "dendrux.runtime._run_events:_pause_with_event"
         - "dendrux.agent:Agent._cancel_one"
     patterns:
       - pattern: $F(..., status=$V, ...)

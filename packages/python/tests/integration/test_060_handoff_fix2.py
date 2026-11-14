@@ -7,7 +7,7 @@ from functools import wraps
 import pytest
 
 from dendrux.loops.react import ReActLoop
-from dendrux.runtime import runner
+from dendrux.runtime import _run_events, runner
 from dendrux.runtime.runner import _create_runtime_run
 from dendrux.types import ToolResult, generate_ulid
 from tests._helpers.gates import wait_for_gate
@@ -95,7 +95,7 @@ async def test_cancel_drain_passes_known_run_id(monkeypatch, caplog):
         await release.wait()
         raise ValueError("private_cleanup_sentinel")
 
-    monkeypatch.setattr(runner, "_persist_task_cancellation", failing)
+    monkeypatch.setattr(_run_events, "_persist_task_cancellation", failing)
     task = asyncio.create_task(runner._drain_task_cancellation(None, run_id, False))
     await wait_for_gate(entered, task=task)
     task.cancel()
@@ -132,7 +132,7 @@ async def test_stream_cleanup_supplies_run_id(store, engine, monkeypatch, entry)
         observed.append(kwargs.get("run_id"))
         return await original(cleanup, **kwargs)
 
-    monkeypatch.setattr(runner, "_shielded_cleanup", capture)
+    monkeypatch.setattr(_run_events, "_shielded_cleanup", capture)
     try:
         await asyncio.wait_for(stream.__aiter__().__anext__(), 5)
         await asyncio.wait_for(stream.aclose(), 5)

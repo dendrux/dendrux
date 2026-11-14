@@ -4,28 +4,31 @@
   "old": "src/dendrux/runtime/runner.py",
   "source_sha256": "caa9e5a0ece127686a4c83a403ea00d98670287f35af2a4dc2565fe66df3fd68",
   "sources": {
-    "src/dendrux/runtime/runner.py": "3491756c985d63c8b1190cf8114693dda6977a68a8f08e5332d9f384797ef1c7",
+    "src/dendrux/runtime/runner.py": "56d862a3e665f3c6e3545cf64e50d9a1ad3130e5b868ca13d2ae19a7a61a3685",
     "src/dendrux/runtime/_run_pending.py": "654b7323b5d56304afc9e2f3e55bee75880390b5e9aa55f200e423caefa63c3e",
     "src/dendrux/runtime/_run_errors.py": "15093d29994a1ee3ba46a4548bc55de3ec76f48941a782bfe462861389594ac1",
     "src/dendrux/runtime/_run_observers.py": "926fc6b2f41b78829b0ac15d6930d027254e739eca333827dfbce63ab5ccadf2",
-    "src/dendrux/runtime/_run_contracts.py": "9435f7ede58926f2c060a11529fe9d60908db7c94b238f1898cacde5386bd31a"
+    "src/dendrux/runtime/_run_contracts.py": "9435f7ede58926f2c060a11529fe9d60908db7c94b238f1898cacde5386bd31a",
+    "src/dendrux/runtime/_run_tools.py": "752cb7429a9e399f30c23ef46c5360f9a926ac9894c1db598172f85a90048cec",
+    "src/dendrux/runtime/_run_events.py": "c02c72008fa64381125a1601fb8bf143405744a19262585cce5dfc597b2797eb",
+    "src/dendrux/runtime/_run_images.py": "bc1c1b220d7cadbce310b261769bc7280b75c0f13c46199a5110dcb6a78b5f0c"
   },
   "owners": {
     "_CONTROL_EVENT_LIMIT": "src/dendrux/runtime/_run_pending.py",
     "ERROR_TEXT_CHARS": "src/dendrux/runtime/_run_errors.py",
-    "_TOOL_NAME_SCAN_LIMIT": "src/dendrux/runtime/runner.py",
-    "_TOOL_NAME_CHARS": "src/dendrux/runtime/runner.py",
+    "_TOOL_NAME_SCAN_LIMIT": "src/dendrux/runtime/_run_tools.py",
+    "_TOOL_NAME_CHARS": "src/dendrux/runtime/_run_tools.py",
     "_DEFAULT_RECOVERY_ITERATIONS": "src/dendrux/runtime/runner.py",
     "logger": "src/dendrux/runtime/_run_errors.py",
     "_STOP_REASONS": "src/dendrux/runtime/_run_pending.py",
-    "_finalize_running_event": "src/dendrux/runtime/runner.py",
+    "_finalize_running_event": "src/dendrux/runtime/_run_events.py",
     "_persist_run_failure": "src/dendrux/runtime/runner.py",
     "_failure_fields": "src/dendrux/runtime/runner.py",
     "_failure_finalize_fields": "src/dendrux/runtime/runner.py",
     "_stream_run_failure": "src/dendrux/runtime/runner.py",
-    "_take_task_interrupt": "src/dendrux/runtime/runner.py",
-    "_may_swallow_cancellation": "src/dendrux/runtime/runner.py",
-    "_drain_task_cancellation": "src/dendrux/runtime/runner.py",
+    "_take_task_interrupt": "src/dendrux/runtime/_run_events.py",
+    "_may_swallow_cancellation": "src/dendrux/runtime/_run_events.py",
+    "_drain_task_cancellation": "src/dendrux/runtime/_run_events.py",
     "_creation_claim": "src/dendrux/runtime/runner.py",
     "_finish_lifecycle": "src/dendrux/runtime/runner.py",
     "_record_finished": "src/dendrux/runtime/runner.py",
@@ -39,7 +42,7 @@
     "_RunLifecycle._cancel_finish": "src/dendrux/runtime/runner.py",
     "_RunLifecycle._cancelled": "src/dendrux/runtime/runner.py",
     "_RunLifecycle._release": "src/dendrux/runtime/runner.py",
-    "_discover_runtime_tools": "src/dendrux/runtime/runner.py",
+    "_discover_runtime_tools": "src/dendrux/runtime/_run_tools.py",
     "_recorder_tool_defs": "src/dendrux/runtime/runner.py",
     "_runtime_recorder": "src/dendrux/runtime/runner.py",
     "_start_new_run": "src/dendrux/runtime/runner.py",
@@ -49,21 +52,21 @@
     "_TraceNotifier.on_tool_started": "src/dendrux/runtime/_run_observers.py",
     "_TraceNotifier.on_tool_completed": "src/dendrux/runtime/_run_observers.py",
     "_start_trace": "src/dendrux/runtime/_run_observers.py",
-    "_validate_loop_skill_compat": "src/dendrux/runtime/runner.py",
+    "_validate_loop_skill_compat": "src/dendrux/runtime/_run_tools.py",
     "_cause_type": "src/dendrux/runtime/_run_observers.py",
-    "_mcp_error_payload": "src/dendrux/runtime/runner.py",
-    "_snapshot_mcp_meta": "src/dendrux/runtime/runner.py",
+    "_mcp_error_payload": "src/dendrux/runtime/_run_tools.py",
+    "_snapshot_mcp_meta": "src/dendrux/runtime/_run_tools.py",
     "_attach_mcp_meta": "src/dendrux/runtime/_run_observers.py",
     "_attach_run_error_meta": "src/dendrux/runtime/_run_observers.py",
-    "_MCPDiscoveryError": "src/dendrux/runtime/runner.py",
-    "_emit_init_governance_event": "src/dendrux/runtime/runner.py",
-    "_local_tool_names": "src/dendrux/runtime/runner.py",
-    "_emit_declared_tools": "src/dendrux/runtime/runner.py",
-    "_emit_init_events": "src/dendrux/runtime/runner.py",
-    "_emit_event": "src/dendrux/runtime/runner.py",
-    "_emit_event_safe": "src/dendrux/runtime/runner.py",
-    "_attach_undelivered_notes": "src/dendrux/runtime/runner.py",
-    "_pause_request_message": "src/dendrux/runtime/runner.py",
+    "_MCPDiscoveryError": "src/dendrux/runtime/_run_tools.py",
+    "_emit_init_governance_event": "src/dendrux/runtime/_run_tools.py",
+    "_local_tool_names": "src/dendrux/runtime/_run_tools.py",
+    "_emit_declared_tools": "src/dendrux/runtime/_run_tools.py",
+    "_emit_init_events": "src/dendrux/runtime/_run_tools.py",
+    "_emit_event": "src/dendrux/runtime/_run_events.py",
+    "_emit_event_safe": "src/dendrux/runtime/_run_events.py",
+    "_attach_undelivered_notes": "src/dendrux/runtime/_run_events.py",
+    "_pause_request_message": "src/dendrux/runtime/_run_events.py",
     "_closing_loop_stream": "src/dendrux/runtime/runner.py",
     "_terminal_stream_result": "src/dendrux/runtime/runner.py",
     "_finish_stream_event": "src/dendrux/runtime/runner.py",
@@ -107,29 +110,29 @@
     "_persist_pause": "src/dendrux/runtime/runner.py",
     "_persist_managed_handoff": "src/dendrux/runtime/runner.py",
     "_record_stop_reason": "src/dendrux/runtime/runner.py",
-    "_transition_with_event": "src/dendrux/runtime/runner.py",
-    "_pause_with_event": "src/dendrux/runtime/runner.py",
+    "_transition_with_event": "src/dendrux/runtime/_run_events.py",
+    "_pause_with_event": "src/dendrux/runtime/_run_events.py",
     "_signature_params": "src/dendrux/runtime/_run_contracts.py",
     "_accepts_kwarg": "src/dendrux/runtime/_run_contracts.py",
     "_budget_carry_kwargs": "src/dendrux/runtime/runner.py",
     "_carry_budget_fields": "src/dendrux/runtime/runner.py",
-    "_carry_image_view": "src/dendrux/runtime/runner.py",
-    "_image_runtime": "src/dendrux/runtime/runner.py",
-    "_recorder_image_kwargs": "src/dendrux/runtime/runner.py",
-    "_image_loop_kwargs": "src/dendrux/runtime/runner.py",
-    "_require_image_loop": "src/dendrux/runtime/runner.py",
-    "_tool_image_kwargs": "src/dendrux/runtime/runner.py",
-    "_resume_image_view": "src/dendrux/runtime/runner.py",
-    "_write_edges": "src/dendrux/runtime/runner.py",
-    "_live_edges": "src/dendrux/runtime/runner.py",
-    "_seed_edges": "src/dendrux/runtime/runner.py",
-    "_start_image_view": "src/dendrux/runtime/runner.py",
-    "_memory_catalog": "src/dendrux/runtime/runner.py",
-    "_register_memory_input": "src/dendrux/runtime/runner.py",
-    "_release_memory_edges": "src/dendrux/runtime/runner.py",
-    "_EntryImages": "src/dendrux/runtime/runner.py",
-    "_ingest_entry_images": "src/dendrux/runtime/runner.py",
-    "_record_user_trace": "src/dendrux/runtime/runner.py",
+    "_carry_image_view": "src/dendrux/runtime/_run_images.py",
+    "_image_runtime": "src/dendrux/runtime/_run_images.py",
+    "_recorder_image_kwargs": "src/dendrux/runtime/_run_images.py",
+    "_image_loop_kwargs": "src/dendrux/runtime/_run_images.py",
+    "_require_image_loop": "src/dendrux/runtime/_run_images.py",
+    "_tool_image_kwargs": "src/dendrux/runtime/_run_images.py",
+    "_resume_image_view": "src/dendrux/runtime/_run_images.py",
+    "_write_edges": "src/dendrux/runtime/_run_images.py",
+    "_live_edges": "src/dendrux/runtime/_run_images.py",
+    "_seed_edges": "src/dendrux/runtime/_run_images.py",
+    "_start_image_view": "src/dendrux/runtime/_run_images.py",
+    "_memory_catalog": "src/dendrux/runtime/_run_images.py",
+    "_register_memory_input": "src/dendrux/runtime/_run_images.py",
+    "_release_memory_edges": "src/dendrux/runtime/_run_images.py",
+    "_EntryImages": "src/dendrux/runtime/_run_images.py",
+    "_ingest_entry_images": "src/dendrux/runtime/_run_images.py",
+    "_record_user_trace": "src/dendrux/runtime/_run_images.py",
     "_UNSET_DEPTH": "src/dendrux/runtime/_run_contracts.py",
     "_resolve_max_delegation_depth": "src/dendrux/runtime/runner.py",
     "_require_idempotency_store": "src/dendrux/runtime/runner.py",
@@ -144,7 +147,7 @@
     "_base_run_metadata": "src/dendrux/runtime/runner.py",
     "_load_new_run_replay": "src/dendrux/runtime/runner.py",
     "_entry_replay": "src/dendrux/runtime/runner.py",
-    "_entry_media": "src/dendrux/runtime/runner.py",
+    "_entry_media": "src/dendrux/runtime/_run_images.py",
     "run": "src/dendrux/runtime/runner.py",
     "_run_once": "src/dendrux/runtime/runner.py",
     "_recovery_loop_name": "src/dendrux/runtime/runner.py",
@@ -159,17 +162,17 @@
     "_project_seed_messages": "src/dendrux/runtime/runner.py",
     "_apply_replay": "src/dendrux/runtime/runner.py",
     "_stream_error_meta": "src/dendrux/runtime/runner.py",
-    "_input_data": "src/dendrux/runtime/runner.py",
-    "_input_edge_kwargs": "src/dendrux/runtime/runner.py",
-    "_stored_parts": "src/dendrux/runtime/runner.py",
-    "_idempotent_hit_after_image_error": "src/dendrux/runtime/runner.py",
-    "_image_retry_parts": "src/dendrux/runtime/runner.py",
-    "_replay_sources": "src/dendrux/runtime/runner.py",
-    "_replay_has_images": "src/dendrux/runtime/runner.py",
-    "_single_full_source": "src/dendrux/runtime/runner.py",
-    "_read_cancel_winner": "src/dendrux/runtime/runner.py",
-    "_persist_run_cancellation": "src/dendrux/runtime/runner.py",
-    "_persist_task_cancellation": "src/dendrux/runtime/runner.py",
+    "_input_data": "src/dendrux/runtime/_run_images.py",
+    "_input_edge_kwargs": "src/dendrux/runtime/_run_images.py",
+    "_stored_parts": "src/dendrux/runtime/_run_images.py",
+    "_idempotent_hit_after_image_error": "src/dendrux/runtime/_run_images.py",
+    "_image_retry_parts": "src/dendrux/runtime/_run_images.py",
+    "_replay_sources": "src/dendrux/runtime/_run_images.py",
+    "_replay_has_images": "src/dendrux/runtime/_run_images.py",
+    "_single_full_source": "src/dendrux/runtime/_run_images.py",
+    "_read_cancel_winner": "src/dendrux/runtime/_run_events.py",
+    "_persist_run_cancellation": "src/dendrux/runtime/_run_events.py",
+    "_persist_task_cancellation": "src/dendrux/runtime/_run_events.py",
     "_raise_resume_claim_failure": "src/dendrux/runtime/_run_pending.py",
     "_cached_output": "src/dendrux/runtime/_run_pending.py",
     "_build_cached_result": "src/dendrux/runtime/_run_pending.py",
@@ -237,14 +240,14 @@
     "_approved_handoff": "src/dendrux/runtime/runner.py",
     "_barrier_pause_result": "src/dendrux/runtime/runner.py",
     "_pending_decision_map": "src/dendrux/runtime/runner.py",
-    "_ingest_resume_images": "src/dendrux/runtime/runner.py",
-    "_submit_image_runtime": "src/dendrux/runtime/runner.py",
-    "ingest_submitted_tool_images": "src/dendrux/runtime/runner.py",
-    "_same_pause": "src/dendrux/runtime/runner.py",
-    "ingest_submitted_user_parts": "src/dendrux/runtime/runner.py",
-    "_fenced_stream_event": "src/dendrux/runtime/runner.py",
-    "_finish_fenced_lifecycle": "src/dendrux/runtime/runner.py",
-    "_check_claim": "src/dendrux/runtime/runner.py",
+    "_ingest_resume_images": "src/dendrux/runtime/_run_images.py",
+    "_submit_image_runtime": "src/dendrux/runtime/_run_images.py",
+    "ingest_submitted_tool_images": "src/dendrux/runtime/_run_images.py",
+    "_same_pause": "src/dendrux/runtime/_run_images.py",
+    "ingest_submitted_user_parts": "src/dendrux/runtime/_run_images.py",
+    "_fenced_stream_event": "src/dendrux/runtime/_run_events.py",
+    "_finish_fenced_lifecycle": "src/dendrux/runtime/_run_events.py",
+    "_check_claim": "src/dendrux/runtime/_run_events.py",
     "_canonicalize_legacy_denials": "src/dendrux/runtime/runner.py",
     "_resume_claim_fallbacks": "src/dendrux/runtime/runner.py",
     "_resume_claim_payload": "src/dendrux/runtime/runner.py",
@@ -252,7 +255,7 @@
     "_attempt_validator": "src/dendrux/runtime/runner.py",
     "_report_claim_governance": "src/dendrux/runtime/runner.py",
     "_release_claim": "src/dendrux/runtime/runner.py",
-    "_shielded_cleanup": "src/dendrux/runtime/runner.py",
+    "_shielded_cleanup": "src/dendrux/runtime/_run_events.py",
     "_release_setup_failure": "src/dendrux/runtime/runner.py",
     "_resume_session": "src/dendrux/runtime/runner.py",
     "_read_resume_pause": "src/dendrux/runtime/runner.py",
@@ -312,6 +315,27 @@
   },
   "lexical": [
     {
+      "root": "_persist_run_failure",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_emit_event_safe",
+      "target": "dendrux.runtime._run_events._emit_event_safe",
+      "count": 1
+    },
+    {
+      "root": "_persist_run_failure",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_emit_event",
+      "target": "dendrux.runtime._run_events._emit_event",
+      "count": 1
+    },
+    {
+      "root": "_persist_run_failure",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_finalize_running_event",
+      "target": "dendrux.runtime._run_events._finalize_running_event",
+      "count": 1
+    },
+    {
       "root": "_failure_fields",
       "module": "src/dendrux/runtime/runner.py",
       "name": "_error_payload",
@@ -333,10 +357,45 @@
       "count": 1
     },
     {
+      "root": "_finish_lifecycle",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "record_run_finished",
+      "target": "dendrux.loops._helpers.record_run_finished",
+      "count": 1
+    },
+    {
+      "root": "_finish_lifecycle",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "notify_run_finished",
+      "target": "dendrux.loops._helpers.notify_run_finished",
+      "count": 1
+    },
+    {
+      "root": "_record_finished",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "record_run_finished",
+      "target": "dendrux.loops._helpers.record_run_finished",
+      "count": 1
+    },
+    {
+      "root": "_record_finished",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "notify_run_finished",
+      "target": "dendrux.loops._helpers.notify_run_finished",
+      "count": 1
+    },
+    {
       "root": "_RunLifecycle",
       "module": "src/dendrux/runtime/runner.py",
       "name": "_attach_run_error_meta",
       "target": "dendrux.runtime._run_observers._attach_run_error_meta",
+      "count": 1
+    },
+    {
+      "root": "_RunLifecycle",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_take_task_interrupt",
+      "target": "dendrux.runtime._run_events._take_task_interrupt",
       "count": 1
     },
     {
@@ -351,6 +410,55 @@
       "module": "src/dendrux/runtime/runner.py",
       "name": "_build_cached_result",
       "target": "dendrux.runtime._run_pending._build_cached_result",
+      "count": 1
+    },
+    {
+      "root": "_RunLifecycle",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_drain_task_cancellation",
+      "target": "dendrux.runtime._run_events._drain_task_cancellation",
+      "count": 1
+    },
+    {
+      "root": "_RunLifecycle",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_may_swallow_cancellation",
+      "target": "dendrux.runtime._run_events._may_swallow_cancellation",
+      "count": 1
+    },
+    {
+      "root": "_RunLifecycle",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_finish_fenced_lifecycle",
+      "target": "dendrux.runtime._run_events._finish_fenced_lifecycle",
+      "count": 1
+    },
+    {
+      "root": "_RunLifecycle",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "notify_run_finished",
+      "target": "dendrux.loops._helpers.notify_run_finished",
+      "count": 1
+    },
+    {
+      "root": "_RunLifecycle",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "record_run_finished",
+      "target": "dendrux.loops._helpers.record_run_finished",
+      "count": 1
+    },
+    {
+      "root": "_runtime_recorder",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_recorder_image_kwargs",
+      "target": "dendrux.runtime._run_images._recorder_image_kwargs",
+      "count": 1
+    },
+    {
+      "root": "_start_new_run",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_emit_event",
+      "target": "dendrux.runtime._run_events._emit_event",
       "count": 1
     },
     {
@@ -369,14 +477,14 @@
     },
     {
       "root": "_mcp_error_payload",
-      "module": "src/dendrux/runtime/runner.py",
+      "module": "src/dendrux/runtime/_run_tools.py",
       "name": "_cause_type",
       "target": "dendrux.runtime._run_observers._cause_type",
       "count": 1
     },
     {
       "root": "_mcp_error_payload",
-      "module": "src/dendrux/runtime/runner.py",
+      "module": "src/dendrux/runtime/_run_tools.py",
       "name": "ERROR_TEXT_CHARS",
       "target": "dendrux.runtime._run_errors.ERROR_TEXT_CHARS",
       "count": 1
@@ -452,7 +560,35 @@
       "count": 1
     },
     {
+      "root": "_persisted_loop_result",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_attach_undelivered_notes",
+      "target": "dendrux.runtime._run_events._attach_undelivered_notes",
+      "count": 1
+    },
+    {
       "root": "_finalize_loop_cancelled",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_final_run_recovery",
+      "target": "dendrux.runtime._run_pending._final_run_recovery",
+      "count": 1
+    },
+    {
+      "root": "_finalize_loop_cancelled",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_attach_undelivered_notes",
+      "target": "dendrux.runtime._run_events._attach_undelivered_notes",
+      "count": 1
+    },
+    {
+      "root": "_finalize_loop_cancelled",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_transition_with_event",
+      "target": "dendrux.runtime._run_events._transition_with_event",
+      "count": 1
+    },
+    {
+      "root": "_persist_loop_outcome",
       "module": "src/dendrux/runtime/runner.py",
       "name": "_final_run_recovery",
       "target": "dendrux.runtime._run_pending._final_run_recovery",
@@ -461,8 +597,22 @@
     {
       "root": "_persist_loop_outcome",
       "module": "src/dendrux/runtime/runner.py",
-      "name": "_final_run_recovery",
-      "target": "dendrux.runtime._run_pending._final_run_recovery",
+      "name": "_attach_undelivered_notes",
+      "target": "dendrux.runtime._run_events._attach_undelivered_notes",
+      "count": 1
+    },
+    {
+      "root": "_persist_loop_outcome",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_emit_event_safe",
+      "target": "dendrux.runtime._run_events._emit_event_safe",
+      "count": 1
+    },
+    {
+      "root": "_persist_loop_outcome",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_emit_event",
+      "target": "dendrux.runtime._run_events._emit_event",
       "count": 1
     },
     {
@@ -482,20 +632,48 @@
     {
       "root": "_persist_pause",
       "module": "src/dendrux/runtime/runner.py",
+      "name": "_check_claim",
+      "target": "dendrux.runtime._run_events._check_claim",
+      "count": 1
+    },
+    {
+      "root": "_persist_pause",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_pause_with_event",
+      "target": "dendrux.runtime._run_events._pause_with_event",
+      "count": 1
+    },
+    {
+      "root": "_persist_pause",
+      "module": "src/dendrux/runtime/runner.py",
       "name": "_committed_pause_result",
       "target": "dendrux.runtime._run_pending._committed_pause_result",
       "count": 1
     },
     {
-      "root": "_transition_with_event",
+      "root": "_persist_pause",
       "module": "src/dendrux/runtime/runner.py",
+      "name": "_pause_request_message",
+      "target": "dendrux.runtime._run_events._pause_request_message",
+      "count": 1
+    },
+    {
+      "root": "_persist_managed_handoff",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_check_claim",
+      "target": "dendrux.runtime._run_events._check_claim",
+      "count": 1
+    },
+    {
+      "root": "_transition_with_event",
+      "module": "src/dendrux/runtime/_run_events.py",
       "name": "_accepts_kwarg",
       "target": "dendrux.runtime._run_contracts._accepts_kwarg",
       "count": 1
     },
     {
       "root": "_pause_with_event",
-      "module": "src/dendrux/runtime/runner.py",
+      "module": "src/dendrux/runtime/_run_events.py",
       "name": "_accepts_kwarg",
       "target": "dendrux.runtime._run_contracts._accepts_kwarg",
       "count": 1
@@ -509,42 +687,91 @@
     },
     {
       "root": "_recorder_image_kwargs",
-      "module": "src/dendrux/runtime/runner.py",
+      "module": "src/dendrux/runtime/_run_images.py",
       "name": "_accepts_kwarg",
       "target": "dendrux.runtime._run_contracts._accepts_kwarg",
       "count": 2
     },
     {
       "root": "_image_loop_kwargs",
-      "module": "src/dendrux/runtime/runner.py",
+      "module": "src/dendrux/runtime/_run_images.py",
       "name": "_accepts_kwarg",
       "target": "dendrux.runtime._run_contracts._accepts_kwarg",
       "count": 2
     },
     {
       "root": "_require_image_loop",
-      "module": "src/dendrux/runtime/runner.py",
+      "module": "src/dendrux/runtime/_run_images.py",
       "name": "_accepts_kwarg",
       "target": "dendrux.runtime._run_contracts._accepts_kwarg",
       "count": 1
     },
     {
       "root": "_tool_image_kwargs",
+      "module": "src/dendrux/runtime/_run_images.py",
+      "name": "_accepts_kwarg",
+      "target": "dendrux.runtime._run_contracts._accepts_kwarg",
+      "count": 1
+    },
+    {
+      "root": "_new_run_input",
       "module": "src/dendrux/runtime/runner.py",
+      "name": "_require_image_loop",
+      "target": "dendrux.runtime._run_images._require_image_loop",
+      "count": 1
+    },
+    {
+      "root": "_record_seeded_user",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_record_user_trace",
+      "target": "dendrux.runtime._run_images._record_user_trace",
+      "count": 1
+    },
+    {
+      "root": "_new_run_image_view",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_start_image_view",
+      "target": "dendrux.runtime._run_images._start_image_view",
+      "count": 1
+    },
+    {
+      "root": "_new_run_image_view",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_replay_sources",
+      "target": "dendrux.runtime._run_images._replay_sources",
+      "count": 1
+    },
+    {
+      "root": "_new_run_image_view",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_single_full_source",
+      "target": "dendrux.runtime._run_images._single_full_source",
+      "count": 1
+    },
+    {
+      "root": "_load_new_run_replay",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_replay_has_images",
+      "target": "dendrux.runtime._run_images._replay_has_images",
+      "count": 1
+    },
+    {
+      "root": "_load_new_run_replay",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_require_image_loop",
+      "target": "dendrux.runtime._run_images._require_image_loop",
+      "count": 1
+    },
+    {
+      "root": "_entry_media",
+      "module": "src/dendrux/runtime/_run_images.py",
       "name": "_accepts_kwarg",
       "target": "dendrux.runtime._run_contracts._accepts_kwarg",
       "count": 1
     },
     {
       "root": "_entry_media",
-      "module": "src/dendrux/runtime/runner.py",
-      "name": "_accepts_kwarg",
-      "target": "dendrux.runtime._run_contracts._accepts_kwarg",
-      "count": 1
-    },
-    {
-      "root": "_entry_media",
-      "module": "src/dendrux/runtime/runner.py",
+      "module": "src/dendrux/runtime/_run_images.py",
       "name": "_build_cached_result",
       "target": "dendrux.runtime._run_pending._build_cached_result",
       "count": 1
@@ -566,6 +793,27 @@
     {
       "root": "_run_once",
       "module": "src/dendrux/runtime/runner.py",
+      "name": "_validate_loop_skill_compat",
+      "target": "dendrux.runtime._run_tools._validate_loop_skill_compat",
+      "count": 1
+    },
+    {
+      "root": "_run_once",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_entry_media",
+      "target": "dendrux.runtime._run_images._entry_media",
+      "count": 1
+    },
+    {
+      "root": "_run_once",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_release_memory_edges",
+      "target": "dendrux.runtime._run_images._release_memory_edges",
+      "count": 1
+    },
+    {
+      "root": "_run_once",
+      "module": "src/dendrux/runtime/runner.py",
       "name": "_attach_mcp_meta",
       "target": "dendrux.runtime._run_observers._attach_mcp_meta",
       "count": 1
@@ -587,13 +835,69 @@
     {
       "root": "_run_once",
       "module": "src/dendrux/runtime/runner.py",
+      "name": "_discover_runtime_tools",
+      "target": "dendrux.runtime._run_tools._discover_runtime_tools",
+      "count": 1
+    },
+    {
+      "root": "_run_once",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_register_memory_input",
+      "target": "dendrux.runtime._run_images._register_memory_input",
+      "count": 1
+    },
+    {
+      "root": "_run_once",
+      "module": "src/dendrux/runtime/runner.py",
       "name": "_build_cached_result",
       "target": "dendrux.runtime._run_pending._build_cached_result",
       "count": 1
     },
     {
-      "root": "_persist_task_cancellation",
+      "root": "_run_once",
       "module": "src/dendrux/runtime/runner.py",
+      "name": "_image_loop_kwargs",
+      "target": "dendrux.runtime._run_images._image_loop_kwargs",
+      "count": 1
+    },
+    {
+      "root": "_run_once",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_input_data",
+      "target": "dendrux.runtime._run_images._input_data",
+      "count": 1
+    },
+    {
+      "root": "_run_once",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_input_edge_kwargs",
+      "target": "dendrux.runtime._run_images._input_edge_kwargs",
+      "count": 1
+    },
+    {
+      "root": "_bind_runtime_run",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_persist_task_cancellation",
+      "target": "dendrux.runtime._run_events._persist_task_cancellation",
+      "count": 1
+    },
+    {
+      "root": "_blocked_entry_result",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_record_user_trace",
+      "target": "dendrux.runtime._run_images._record_user_trace",
+      "count": 1
+    },
+    {
+      "root": "_create_runtime_run",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_persist_task_cancellation",
+      "target": "dendrux.runtime._run_events._persist_task_cancellation",
+      "count": 1
+    },
+    {
+      "root": "_persist_task_cancellation",
+      "module": "src/dendrux/runtime/_run_events.py",
       "name": "_build_cached_result",
       "target": "dendrux.runtime._run_pending._build_cached_result",
       "count": 1
@@ -613,10 +917,66 @@
       "count": 1
     },
     {
+      "root": "_retry_source_input",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_stored_parts",
+      "target": "dendrux.runtime._run_images._stored_parts",
+      "count": 1
+    },
+    {
+      "root": "_retry_media",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_image_runtime",
+      "target": "dendrux.runtime._run_images._image_runtime",
+      "count": 1
+    },
+    {
+      "root": "_retry_media",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_replay_has_images",
+      "target": "dendrux.runtime._run_images._replay_has_images",
+      "count": 1
+    },
+    {
+      "root": "_retry_media",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_require_image_loop",
+      "target": "dendrux.runtime._run_images._require_image_loop",
+      "count": 1
+    },
+    {
       "root": "_retry_media",
       "module": "src/dendrux/runtime/runner.py",
       "name": "_accepts_kwarg",
       "target": "dendrux.runtime._run_contracts._accepts_kwarg",
+      "count": 1
+    },
+    {
+      "root": "_retry_edges",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_live_edges",
+      "target": "dendrux.runtime._run_images._live_edges",
+      "count": 1
+    },
+    {
+      "root": "_retry_edges",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_input_edge_kwargs",
+      "target": "dendrux.runtime._run_images._input_edge_kwargs",
+      "count": 1
+    },
+    {
+      "root": "_start_retry_history",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_start_image_view",
+      "target": "dendrux.runtime._run_images._start_image_view",
+      "count": 1
+    },
+    {
+      "root": "_start_retry_history",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_replay_sources",
+      "target": "dendrux.runtime._run_images._replay_sources",
       "count": 1
     },
     {
@@ -629,8 +989,64 @@
     {
       "root": "retry",
       "module": "src/dendrux/runtime/runner.py",
+      "name": "_validate_loop_skill_compat",
+      "target": "dendrux.runtime._run_tools._validate_loop_skill_compat",
+      "count": 1
+    },
+    {
+      "root": "retry",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_release_memory_edges",
+      "target": "dendrux.runtime._run_images._release_memory_edges",
+      "count": 1
+    },
+    {
+      "root": "retry",
+      "module": "src/dendrux/runtime/runner.py",
       "name": "_attach_mcp_meta",
       "target": "dendrux.runtime._run_observers._attach_mcp_meta",
+      "count": 1
+    },
+    {
+      "root": "retry",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_discover_runtime_tools",
+      "target": "dendrux.runtime._run_tools._discover_runtime_tools",
+      "count": 1
+    },
+    {
+      "root": "retry",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_record_user_trace",
+      "target": "dendrux.runtime._run_images._record_user_trace",
+      "count": 1
+    },
+    {
+      "root": "retry",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_input_data",
+      "target": "dendrux.runtime._run_images._input_data",
+      "count": 1
+    },
+    {
+      "root": "retry",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_image_loop_kwargs",
+      "target": "dendrux.runtime._run_images._image_loop_kwargs",
+      "count": 1
+    },
+    {
+      "root": "run_stream",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_validate_loop_skill_compat",
+      "target": "dendrux.runtime._run_tools._validate_loop_skill_compat",
+      "count": 1
+    },
+    {
+      "root": "run_stream",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_require_image_loop",
+      "target": "dendrux.runtime._run_images._require_image_loop",
       "count": 1
     },
     {
@@ -643,8 +1059,85 @@
     {
       "root": "run_stream",
       "module": "src/dendrux/runtime/runner.py",
+      "name": "_release_memory_edges",
+      "target": "dendrux.runtime._run_images._release_memory_edges",
+      "count": 1
+    },
+    {
+      "root": "run_stream",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_entry_media",
+      "target": "dendrux.runtime._run_images._entry_media",
+      "count": 1
+    },
+    {
+      "root": "run_stream",
+      "module": "src/dendrux/runtime/runner.py",
       "name": "_accepts_kwarg",
       "target": "dendrux.runtime._run_contracts._accepts_kwarg",
+      "count": 1
+    },
+    {
+      "root": "run_stream",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_image_runtime",
+      "target": "dendrux.runtime._run_images._image_runtime",
+      "count": 1
+    },
+    {
+      "root": "run_stream",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_discover_runtime_tools",
+      "target": "dendrux.runtime._run_tools._discover_runtime_tools",
+      "count": 1
+    },
+    {
+      "root": "run_stream",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_register_memory_input",
+      "target": "dendrux.runtime._run_images._register_memory_input",
+      "count": 1
+    },
+    {
+      "root": "run_stream",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_shielded_cleanup",
+      "target": "dendrux.runtime._run_events._shielded_cleanup",
+      "count": 1
+    },
+    {
+      "root": "run_stream",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_image_loop_kwargs",
+      "target": "dendrux.runtime._run_images._image_loop_kwargs",
+      "count": 1
+    },
+    {
+      "root": "run_stream",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_fenced_stream_event",
+      "target": "dendrux.runtime._run_events._fenced_stream_event",
+      "count": 1
+    },
+    {
+      "root": "run_stream",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_persist_run_cancellation",
+      "target": "dendrux.runtime._run_events._persist_run_cancellation",
+      "count": 1
+    },
+    {
+      "root": "run_stream",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "record_run_finished",
+      "target": "dendrux.loops._helpers.record_run_finished",
+      "count": 1
+    },
+    {
+      "root": "run_stream",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "notify_run_finished",
+      "target": "dendrux.loops._helpers.notify_run_finished",
       "count": 1
     },
     {
@@ -660,6 +1153,20 @@
       "name": "_safe_error",
       "target": "dendrux.runtime._run_errors._safe_error",
       "count": 2
+    },
+    {
+      "root": "run_stream",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_input_data",
+      "target": "dendrux.runtime._run_images._input_data",
+      "count": 1
+    },
+    {
+      "root": "run_stream",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_input_edge_kwargs",
+      "target": "dendrux.runtime._run_images._input_edge_kwargs",
+      "count": 1
     },
     {
       "root": "run_stream",
@@ -681,6 +1188,34 @@
       "name": "_ResumeContext",
       "target": "dendrux.runtime._run_contracts._ResumeContext",
       "count": 2
+    },
+    {
+      "root": "_prepare_resume",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_validate_loop_skill_compat",
+      "target": "dendrux.runtime._run_tools._validate_loop_skill_compat",
+      "count": 1
+    },
+    {
+      "root": "_prepare_resume",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_emit_declared_tools",
+      "target": "dendrux.runtime._run_tools._emit_declared_tools",
+      "count": 1
+    },
+    {
+      "root": "_prepare_resume",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_emit_event",
+      "target": "dendrux.runtime._run_events._emit_event",
+      "count": 1
+    },
+    {
+      "root": "_prepare_resume",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_recorder_image_kwargs",
+      "target": "dendrux.runtime._run_images._recorder_image_kwargs",
+      "count": 1
     },
     {
       "root": "_consume_injected_history",
@@ -708,6 +1243,13 @@
       "module": "src/dendrux/runtime/runner.py",
       "name": "_ResumeContext",
       "target": "dendrux.runtime._run_contracts._ResumeContext",
+      "count": 1
+    },
+    {
+      "root": "_project_adopted_submission",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_stored_parts",
+      "target": "dendrux.runtime._run_images._stored_parts",
       "count": 1
     },
     {
@@ -753,6 +1295,13 @@
       "count": 3
     },
     {
+      "root": "_execute_approved_tools",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_tool_image_kwargs",
+      "target": "dendrux.runtime._run_images._tool_image_kwargs",
+      "count": 2
+    },
+    {
       "root": "_validated_decisions",
       "module": "src/dendrux/runtime/runner.py",
       "name": "_ResumeContext",
@@ -764,6 +1313,13 @@
       "module": "src/dendrux/runtime/runner.py",
       "name": "_ApprovalResume",
       "target": "dendrux.runtime._run_contracts._ApprovalResume",
+      "count": 1
+    },
+    {
+      "root": "_approval_stop_result",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_carry_image_view",
+      "target": "dendrux.runtime._run_images._carry_image_view",
       "count": 1
     },
     {
@@ -781,10 +1337,31 @@
       "count": 1
     },
     {
-      "root": "_ingest_resume_images",
+      "root": "_barrier_pause_result",
       "module": "src/dendrux/runtime/runner.py",
+      "name": "_carry_image_view",
+      "target": "dendrux.runtime._run_images._carry_image_view",
+      "count": 1
+    },
+    {
+      "root": "_ingest_resume_images",
+      "module": "src/dendrux/runtime/_run_images.py",
       "name": "_raise_resume_claim_failure",
       "target": "dendrux.runtime._run_pending._raise_resume_claim_failure",
+      "count": 1
+    },
+    {
+      "root": "_finish_fenced_lifecycle",
+      "module": "src/dendrux/runtime/_run_events.py",
+      "name": "notify_run_finished",
+      "target": "dendrux.loops._helpers.notify_run_finished",
+      "count": 1
+    },
+    {
+      "root": "_finish_fenced_lifecycle",
+      "module": "src/dendrux/runtime/_run_events.py",
+      "name": "record_run_finished",
+      "target": "dendrux.loops._helpers.record_run_finished",
       "count": 1
     },
     {
@@ -820,6 +1397,13 @@
       "module": "src/dendrux/runtime/runner.py",
       "name": "_PauseReads",
       "target": "dendrux.runtime._run_contracts._PauseReads",
+      "count": 1
+    },
+    {
+      "root": "_resume_submission",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_ingest_resume_images",
+      "target": "dendrux.runtime._run_images._ingest_resume_images",
       "count": 1
     },
     {
@@ -907,6 +1491,20 @@
       "count": 1
     },
     {
+      "root": "_resumed_loop_kwargs",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_image_loop_kwargs",
+      "target": "dendrux.runtime._run_images._image_loop_kwargs",
+      "count": 1
+    },
+    {
+      "root": "_resumed_loop_kwargs",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_resume_image_view",
+      "target": "dendrux.runtime._run_images._resume_image_view",
+      "count": 1
+    },
+    {
       "root": "_run_resumed_loop",
       "module": "src/dendrux/runtime/runner.py",
       "name": "_ResumeContext",
@@ -916,8 +1514,43 @@
     {
       "root": "_cancel_resumed_run",
       "module": "src/dendrux/runtime/runner.py",
+      "name": "_take_task_interrupt",
+      "target": "dendrux.runtime._run_events._take_task_interrupt",
+      "count": 1
+    },
+    {
+      "root": "_cancel_resumed_run",
+      "module": "src/dendrux/runtime/runner.py",
       "name": "_ResumeContext",
       "target": "dendrux.runtime._run_contracts._ResumeContext",
+      "count": 1
+    },
+    {
+      "root": "_cancel_resumed_run",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_drain_task_cancellation",
+      "target": "dendrux.runtime._run_events._drain_task_cancellation",
+      "count": 1
+    },
+    {
+      "root": "_cancel_resumed_run",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_may_swallow_cancellation",
+      "target": "dendrux.runtime._run_events._may_swallow_cancellation",
+      "count": 1
+    },
+    {
+      "root": "_cancel_resumed_run",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "notify_run_finished",
+      "target": "dendrux.loops._helpers.notify_run_finished",
+      "count": 1
+    },
+    {
+      "root": "_cancel_resumed_run",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "record_run_finished",
+      "target": "dendrux.loops._helpers.record_run_finished",
       "count": 1
     },
     {
@@ -932,6 +1565,20 @@
       "module": "src/dendrux/runtime/runner.py",
       "name": "_ResumeContext",
       "target": "dendrux.runtime._run_contracts._ResumeContext",
+      "count": 1
+    },
+    {
+      "root": "_released_resume_hooks",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "notify_run_finished",
+      "target": "dendrux.loops._helpers.notify_run_finished",
+      "count": 1
+    },
+    {
+      "root": "_released_resume_hooks",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "record_run_finished",
+      "target": "dendrux.loops._helpers.record_run_finished",
       "count": 1
     },
     {
@@ -977,11 +1624,25 @@
       "count": 1
     },
     {
+      "root": "_fenced_resume_result",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_finish_fenced_lifecycle",
+      "target": "dendrux.runtime._run_events._finish_fenced_lifecycle",
+      "count": 1
+    },
+    {
       "root": "_stop_marked_continuation",
       "module": "src/dendrux/runtime/runner.py",
       "name": "_build_cached_result",
       "target": "dendrux.runtime._run_pending._build_cached_result",
       "count": 3
+    },
+    {
+      "root": "_stop_marked_continuation",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_emit_event",
+      "target": "dendrux.runtime._run_events._emit_event",
+      "count": 1
     },
     {
       "root": "_resume_core",
@@ -1000,6 +1661,13 @@
     {
       "root": "_resume_core",
       "module": "src/dendrux/runtime/runner.py",
+      "name": "_image_runtime",
+      "target": "dendrux.runtime._run_images._image_runtime",
+      "count": 1
+    },
+    {
+      "root": "_resume_core",
+      "module": "src/dendrux/runtime/runner.py",
       "name": "_attach_mcp_meta",
       "target": "dendrux.runtime._run_observers._attach_mcp_meta",
       "count": 3
@@ -1009,6 +1677,20 @@
       "module": "src/dendrux/runtime/runner.py",
       "name": "_start_trace",
       "target": "dendrux.runtime._run_observers._start_trace",
+      "count": 1
+    },
+    {
+      "root": "_resume_core",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_snapshot_mcp_meta",
+      "target": "dendrux.runtime._run_tools._snapshot_mcp_meta",
+      "count": 1
+    },
+    {
+      "root": "_stream_resume_images",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_ingest_resume_images",
+      "target": "dendrux.runtime._run_images._ingest_resume_images",
       "count": 1
     },
     {
@@ -1054,6 +1736,20 @@
       "count": 1
     },
     {
+      "root": "_finish_resume_stream_cleanup",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "record_run_finished",
+      "target": "dendrux.loops._helpers.record_run_finished",
+      "count": 1
+    },
+    {
+      "root": "_finish_resume_stream_cleanup",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "notify_run_finished",
+      "target": "dendrux.loops._helpers.notify_run_finished",
+      "count": 1
+    },
+    {
       "root": "resume_stream",
       "module": "src/dendrux/runtime/runner.py",
       "name": "_ResumeProgress",
@@ -1063,8 +1759,43 @@
     {
       "root": "resume_stream",
       "module": "src/dendrux/runtime/runner.py",
+      "name": "_image_runtime",
+      "target": "dendrux.runtime._run_images._image_runtime",
+      "count": 1
+    },
+    {
+      "root": "resume_stream",
+      "module": "src/dendrux/runtime/runner.py",
       "name": "_start_trace",
       "target": "dendrux.runtime._run_observers._start_trace",
+      "count": 1
+    },
+    {
+      "root": "resume_stream",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_snapshot_mcp_meta",
+      "target": "dendrux.runtime._run_tools._snapshot_mcp_meta",
+      "count": 1
+    },
+    {
+      "root": "resume_stream",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_shielded_cleanup",
+      "target": "dendrux.runtime._run_events._shielded_cleanup",
+      "count": 1
+    },
+    {
+      "root": "resume_stream",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_fenced_stream_event",
+      "target": "dendrux.runtime._run_events._fenced_stream_event",
+      "count": 2
+    },
+    {
+      "root": "resume_stream",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_persist_run_cancellation",
+      "target": "dendrux.runtime._run_events._persist_run_cancellation",
       "count": 1
     },
     {
@@ -1082,10 +1813,24 @@
       "count": 1
     },
     {
+      "root": "_validate_owned_pause",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_check_claim",
+      "target": "dendrux.runtime._run_events._check_claim",
+      "count": 1
+    },
+    {
       "root": "resume_claimed",
       "module": "src/dendrux/runtime/runner.py",
       "name": "_build_cached_result",
       "target": "dendrux.runtime._run_pending._build_cached_result",
+      "count": 1
+    },
+    {
+      "root": "resume_claimed",
+      "module": "src/dendrux/runtime/runner.py",
+      "name": "_stored_parts",
+      "target": "dendrux.runtime._run_images._stored_parts",
       "count": 1
     },
     {
@@ -1113,6 +1858,18 @@
       "value": "dendrux.runtime.runner"
     },
     {
+      "root": "_MCPDiscoveryError",
+      "module": "src/dendrux/runtime/_run_tools.py",
+      "attribute": "__module__",
+      "value": "dendrux.runtime.runner"
+    },
+    {
+      "root": "_EntryImages",
+      "module": "src/dendrux/runtime/_run_images.py",
+      "attribute": "__module__",
+      "value": "dendrux.runtime.runner"
+    },
+    {
       "root": "_ResumeContext",
       "module": "src/dendrux/runtime/_run_contracts.py",
       "attribute": "__module__",
@@ -1131,6 +1888,18 @@
       "value": "dendrux.runtime.runner"
     },
     {
+      "root": "ingest_submitted_tool_images",
+      "module": "src/dendrux/runtime/_run_images.py",
+      "attribute": "__module__",
+      "value": "dendrux.runtime.runner"
+    },
+    {
+      "root": "ingest_submitted_user_parts",
+      "module": "src/dendrux/runtime/_run_images.py",
+      "attribute": "__module__",
+      "value": "dendrux.runtime.runner"
+    },
+    {
       "root": "_ResumeProgress",
       "module": "src/dendrux/runtime/_run_contracts.py",
       "attribute": "__module__",
@@ -1144,7 +1913,9 @@
     "_UNSET_DEPTH"
   ],
   "seams": {
-    "get_delegation_context": "dendrux.runtime.context.get_delegation_context"
+    "get_delegation_context": "dendrux.runtime.context.get_delegation_context",
+    "notify_run_finished": "dendrux.loops._helpers.notify_run_finished",
+    "record_run_finished": "dendrux.loops._helpers.record_run_finished"
   },
   "providers": {}
 }

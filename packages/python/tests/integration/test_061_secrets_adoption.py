@@ -11,7 +11,7 @@ from dendrux import Agent
 from dendrux.db.models import Base
 from dendrux.guardrails._protocol import Finding
 from dendrux.llm.mock import MockLLM
-from dendrux.runtime import runner
+from dendrux.runtime import _run_events, runner
 from dendrux.strategies.native import NativeToolCalling
 from dendrux.types import (
     AgentStep,
@@ -204,7 +204,7 @@ async def test_adopted_verdict_survives_first_event_commit(
     record = await store.get_run(run_id)
     try:
         with monkeypatch.context() as patch:
-            patch.setattr(runner, "_emit_event", cut)
+            patch.setattr(_run_events, "_emit_event", cut)
             with pytest.raises(Crash):
                 await runner.resume_claimed(
                     run_id,
@@ -273,7 +273,7 @@ async def test_custom_adoption_marks_before_first_event(
             resumed.append(True)
         return await emit(view, rid, event_type, data, **kwargs)
 
-    monkeypatch.setattr(runner, "_emit_event", inspect)
+    monkeypatch.setattr(_run_events, "_emit_event", inspect)
     try:
         call = runner.resume_claimed(
             run_id,

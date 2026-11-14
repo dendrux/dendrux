@@ -518,7 +518,7 @@ class TestSurfacing:
             view = _connection(runtime, failure_mode="best_effort").tools(namespace="gh")
             agent = Agent(prompt="test", tool_sources=[view])
             with patch(
-                "dendrux.runtime.runner._emit_init_governance_event",
+                "dendrux.runtime._run_tools._emit_init_governance_event",
                 new_callable=AsyncMock,
             ) as emitted:
                 await _emit_init_events(agent, None, None, "run-1")

@@ -7,7 +7,7 @@ import anyio
 import pytest
 
 from dendrux import Limits
-from dendrux.runtime import runner
+from dendrux.runtime import _run_images, runner
 from dendrux.store import RunStore
 from dendrux.types import LLMResponse, RunStatus
 from tests._helpers.scripted_provider import ScriptedLLM, tool_call
@@ -35,7 +35,7 @@ async def test_disconnect_between_events_closes_generator_without_gc(store, monk
         released.append(run_id)
         release_edges(runtime, state_store, run_id)
 
-    monkeypatch.setattr(runner, "_release_memory_edges", tracked_release)
+    monkeypatch.setattr(_run_images, "_release_memory_edges", tracked_release)
     cleanup = stream._cleanup
     cleaned = []
 

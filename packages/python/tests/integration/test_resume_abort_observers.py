@@ -10,7 +10,7 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 
 from dendrux.loops.base import BaseNotifier
 from dendrux.notifiers.otel import OpenTelemetryNotifier
-from dendrux.runtime import _run_observers, runner
+from dendrux.runtime import _run_observers, _run_tools, runner
 from dendrux.runtime.persistence import PersistenceRecorder
 from dendrux.types import LLMResponse, RunStatus
 from tests._fixtures.storage import pin_storage_format
@@ -53,7 +53,7 @@ async def test_post_trace_release_closes_observers(
         return result
 
     monkeypatch.setattr(_run_observers, "_start_trace", traced)
-    monkeypatch.setattr(runner, "_snapshot_mcp_meta", Mock(side_effect=failure))
+    monkeypatch.setattr(_run_tools, "_snapshot_mcp_meta", Mock(side_effect=failure))
     task = asyncio.create_task(invoke(notifier=notifier))
     try:
         await wait_for_gate(entered, task=task)
@@ -97,7 +97,7 @@ async def test_aborted_trace_ends_and_exports(store, monkeypatch, cancel):
 
     start_trace = runner._start_trace
     monkeypatch.setattr(_run_observers, "_start_trace", fail_after_trace)
-    monkeypatch.setattr(runner, "_snapshot_mcp_meta", Mock(side_effect=RuntimeError("setup")))
+    monkeypatch.setattr(_run_tools, "_snapshot_mcp_meta", Mock(side_effect=RuntimeError("setup")))
     try:
         with pytest.raises(RuntimeError, match="setup"):
             await invoke(notifier=notifier)
@@ -109,7 +109,7 @@ async def test_aborted_trace_ends_and_exports(store, monkeypatch, cancel):
         )
         assert run_id not in notifier._run_spans
         if not cancel:
-            monkeypatch.setattr(runner, "_snapshot_mcp_meta", snapshot)
+            monkeypatch.setattr(_run_tools, "_snapshot_mcp_meta", snapshot)
             assert (await invoke(notifier=notifier)).status == RunStatus.SUCCESS
             assert (
                 len([s for s in exporter.get_finished_spans() if s.name.startswith("invoke_agent")])
@@ -156,7 +156,7 @@ async def test_partial_start_and_recorder_failure_balance_observers(
     elif failure_site == "trace_link":
         monkeypatch.setattr(store, "set_trace_link", AsyncMock(side_effect=failure))
     else:
-        monkeypatch.setattr(runner, "_snapshot_mcp_meta", Mock(side_effect=failure))
+        monkeypatch.setattr(_run_tools, "_snapshot_mcp_meta", Mock(side_effect=failure))
         recorder_finished.side_effect = RuntimeError("recorder_failure")
     try:
         with pytest.raises(RuntimeError) as caught:

@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from dendrux.loops import ReActLoop
-from dendrux.runtime import _run_pending, runner
+from dendrux.runtime import _run_images, _run_pending, runner
 from dendrux.types import RunStatus
 
 RESULTS_STATUSES = {RunStatus.WAITING_CLIENT_TOOL.value, RunStatus.WAITING_APPROVAL.value}
@@ -42,7 +42,7 @@ def patched(monkeypatch):
         raise _AllowedError
 
     monkeypatch.setattr(_run_pending, "_raise_resume_claim_failure", refuse)
-    monkeypatch.setattr(runner, "_image_runtime", allow)
+    monkeypatch.setattr(_run_images, "_image_runtime", allow)
 
 
 async def _ingest(status: str, *, results: bool) -> None:

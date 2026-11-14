@@ -7,7 +7,8 @@ import pytest
 
 from dendrux import _codes
 from dendrux._meta_keys import CANCEL_PERSISTED_META_KEY
-from dendrux.runtime import runner
+from dendrux.loops import _helpers
+from dendrux.runtime import _run_events, runner
 from dendrux.runtime.persistence import PersistenceRecorder
 from dendrux.types import RunEvent, RunEventType, RunStatus
 from tests._helpers.gates import wait_for_gate
@@ -37,7 +38,7 @@ async def test_task_cancel_save(store, monkeypatch, caplog, entry, interrupted, 
         raise original
 
     monkeypatch.setattr(agent._loop, "run", cancel_loop)
-    monkeypatch.setattr(runner, "_take_task_interrupt", lambda *args: (interrupted, False))
+    monkeypatch.setattr(_run_events, "_take_task_interrupt", lambda *args: (interrupted, False))
     method = "finalize_with_event"
     if outcome == "event_raises":
         monkeypatch.setattr(store, "finalize_with_event", None)  # Legacy split-write contract.
@@ -53,7 +54,7 @@ async def test_task_cancel_save(store, monkeypatch, caplog, entry, interrupted, 
             raise RuntimeError("event_failed")
         return await emit(*args, **kwargs)
 
-    monkeypatch.setattr(runner, "_emit_event", event)
+    monkeypatch.setattr(_run_events, "_emit_event", event)
     finished = AsyncMock()
     monkeypatch.setattr(PersistenceRecorder, "on_run_finished", finished)
     with pytest.raises(asyncio.CancelledError) as caught:
@@ -143,7 +144,7 @@ async def test_stream_close_save(store, monkeypatch, caplog, entry, outcome, par
             raise RuntimeError("event_failed")
         return await emit(*args, **kwargs)
 
-    monkeypatch.setattr(runner, "_emit_event", event_write)
+    monkeypatch.setattr(_run_events, "_emit_event", event_write)
     read = AsyncMock(
         side_effect=RuntimeError("read_failed") if outcome == "read_raises" else store.get_run
     )
@@ -296,9 +297,9 @@ async def test_cancel_hook_error_boundaries(monkeypatch, caplog, entry, notifier
     notifier_error = RuntimeError("notifier_finish_failed")
     recorded = AsyncMock(side_effect=recorder_error)
     notified = AsyncMock(side_effect=notifier_error if notifier_fails else None)
-    monkeypatch.setattr(runner, "record_run_finished", recorded)
-    monkeypatch.setattr(runner, "notify_run_finished", notified)
-    monkeypatch.setattr(runner, "_drain_task_cancellation", AsyncMock(return_value=result))
+    monkeypatch.setattr(_helpers, "record_run_finished", recorded)
+    monkeypatch.setattr(_helpers, "notify_run_finished", notified)
+    monkeypatch.setattr(_run_events, "_drain_task_cancellation", AsyncMock(return_value=result))
     ctx = SimpleNamespace(recorder=object(), notifier=object())
     if entry == "batch":
         action = runner._RunLifecycle("run", None, None)._cancel_finish(
@@ -327,8 +328,8 @@ async def test_loop_cancel_allowed_statuses(monkeypatch, budget):
     from dendrux.types import RunResult
 
     transition = AsyncMock(return_value=True)
-    monkeypatch.setattr(runner, "_transition_with_event", transition)
-    monkeypatch.setattr(runner, "_attach_undelivered_notes", AsyncMock())
+    monkeypatch.setattr(_run_events, "_transition_with_event", transition)
+    monkeypatch.setattr(_run_events, "_attach_undelivered_notes", AsyncMock())
     proposal = RunResult(
         run_id="run",
         status=RunStatus.CANCELLED,

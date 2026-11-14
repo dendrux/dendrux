@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from dendrux import Agent, tool
+from dendrux.loops import _helpers
 from dendrux.types import LLMResponse, RunStatus, ToolCall
 from tests._helpers.gates import wait_for_gate
 from tests._helpers.scripted_provider import ScriptedLLM
@@ -19,7 +20,7 @@ async def test_fenced_stream_yields_persisted_outcome(store, monkeypatch, resume
 
     finished = AsyncMock()
     failed = AsyncMock()
-    monkeypatch.setattr(runner, "record_run_finished", finished)
+    monkeypatch.setattr(_helpers, "record_run_finished", finished)
     monkeypatch.setattr(runner, "record_run_failed", failed)
 
     @tool()

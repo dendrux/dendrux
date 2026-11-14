@@ -17,7 +17,7 @@ from dendrux.errors import ProviderAuthError, StoreOutcomeUnknown
 from dendrux.llm.mock import MockLLM
 from dendrux.loops.base import BaseNotifier
 from dendrux.loops.react import ReActLoop
-from dendrux.runtime import _run_observers, _run_pending, runner
+from dendrux.runtime import _run_images, _run_observers, _run_pending, runner
 from dendrux.runtime import context as context_mod
 from dendrux.runtime.context import DelegationContext
 from dendrux.runtime.persistence import PersistenceRecorder
@@ -118,7 +118,7 @@ async def test_claim_refusal_owner_fault_fires_before_image_work(monkeypatch, re
     refusing = AsyncMock(side_effect=fault)
     monkeypatch.setattr(_run_pending, "_raise_resume_claim_failure", refusing)
     image = Mock(side_effect=AssertionError("image work ran before refusal"))
-    monkeypatch.setattr(runner, "_image_runtime", image)
+    monkeypatch.setattr(_run_images, "_image_runtime", image)
     store = SimpleNamespace(get_run=AsyncMock(return_value=SimpleNamespace(status="success")))
     with pytest.raises(RuntimeError) as caught:
         await runner._ingest_resume_images(

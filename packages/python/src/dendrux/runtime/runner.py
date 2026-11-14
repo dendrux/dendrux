@@ -26,12 +26,11 @@ from functools import partial
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple, NoReturn, overload
 from typing import get_args as get_args
 
+import dendrux.loops._helpers as _hooks
 import dendrux.runtime.context as _context
 from dendrux import _codes
 from dendrux._lifecycle import (
     CANCEL_FINALIZE_STATUS_VALUES,
-    RESUME_INPUT_STATUS_VALUES,
-    RESUME_RESULTS_STATUS_VALUES,
     STORAGE_FORMAT_CHECKPOINTED,
     TERMINAL_STATUSES,
     CancelReason,
@@ -41,6 +40,12 @@ from dendrux._lifecycle import (
     StoredEventType,
 )
 from dendrux._lifecycle import PAUSE_STATUSES as _PAUSE_STATUSES
+from dendrux._lifecycle import (
+    RESUME_INPUT_STATUS_VALUES as RESUME_INPUT_STATUS_VALUES,
+)
+from dendrux._lifecycle import (
+    RESUME_RESULTS_STATUS_VALUES as RESUME_RESULTS_STATUS_VALUES,
+)
 from dendrux._meta_keys import (
     BLOCKED_META_KEY,
     CANCEL_PERSISTED_META_KEY,
@@ -72,8 +77,12 @@ from dendrux.context_blocks import (
     wire_user_parts,
 )
 from dendrux.errors import (
-    BlobNotFoundError,
-    InvalidImageError,
+    BlobNotFoundError as BlobNotFoundError,
+)
+from dendrux.errors import (
+    InvalidImageError as InvalidImageError,
+)
+from dendrux.errors import (
     RunFencedError,
     RunNotFoundError,
     safe_exception_info,
@@ -85,16 +94,20 @@ from dendrux.loops._helpers import notifier_trace_link as notifier_trace_link
 from dendrux.loops._helpers import (
     notify_message,
     notify_run_failed,
-    notify_run_finished,
     order_observations,
     project_message,
     record_message,
     record_run_failed,
-    record_run_finished,
     record_run_started,
     record_tool,
 )
+from dendrux.loops._helpers import (
+    notify_run_finished as notify_run_finished,
+)
 from dendrux.loops._helpers import notify_run_started as notify_run_started
+from dendrux.loops._helpers import (
+    record_run_finished as record_run_finished,
+)
 from dendrux.loops._policy_context import (
     dispatch_policy,
     history_call_counts,
@@ -107,8 +120,11 @@ from dendrux.runtime import (
     _reclaim,
     _run_contracts,
     _run_errors,
+    _run_events,
+    _run_images,
     _run_observers,
     _run_pending,
+    _run_tools,
 )
 from dendrux.runtime._entry_checks import resolve_runner_tenant, runner_entry_checks
 from dendrux.runtime._managed import DESCEND_KEY as MANAGED_DESCEND_KEY
@@ -137,6 +153,56 @@ from dendrux.runtime._run_errors import _provider_error_info as _provider_error_
 from dendrux.runtime._run_errors import _public_meta as _public_meta
 from dendrux.runtime._run_errors import _safe_error as _safe_error
 from dendrux.runtime._run_errors import logger as logger
+from dendrux.runtime._run_events import _attach_undelivered_notes as _attach_undelivered_notes
+from dendrux.runtime._run_events import _check_claim as _check_claim
+from dendrux.runtime._run_events import _drain_task_cancellation as _drain_task_cancellation
+from dendrux.runtime._run_events import _emit_event as _emit_event
+from dendrux.runtime._run_events import _emit_event_safe as _emit_event_safe
+from dendrux.runtime._run_events import _fenced_stream_event as _fenced_stream_event
+from dendrux.runtime._run_events import _finalize_running_event as _finalize_running_event
+from dendrux.runtime._run_events import _finish_fenced_lifecycle as _finish_fenced_lifecycle
+from dendrux.runtime._run_events import _may_swallow_cancellation as _may_swallow_cancellation
+from dendrux.runtime._run_events import _pause_request_message as _pause_request_message
+from dendrux.runtime._run_events import _pause_with_event as _pause_with_event
+from dendrux.runtime._run_events import _persist_run_cancellation as _persist_run_cancellation
+from dendrux.runtime._run_events import _persist_task_cancellation as _persist_task_cancellation
+from dendrux.runtime._run_events import _read_cancel_winner as _read_cancel_winner
+from dendrux.runtime._run_events import _shielded_cleanup as _shielded_cleanup
+from dendrux.runtime._run_events import _take_task_interrupt as _take_task_interrupt
+from dendrux.runtime._run_events import _transition_with_event as _transition_with_event
+from dendrux.runtime._run_images import _carry_image_view as _carry_image_view
+from dendrux.runtime._run_images import _entry_media as _entry_media
+from dendrux.runtime._run_images import _EntryImages as _EntryImages
+from dendrux.runtime._run_images import (
+    _idempotent_hit_after_image_error as _idempotent_hit_after_image_error,
+)
+from dendrux.runtime._run_images import _image_loop_kwargs as _image_loop_kwargs
+from dendrux.runtime._run_images import _image_retry_parts as _image_retry_parts
+from dendrux.runtime._run_images import _image_runtime as _image_runtime
+from dendrux.runtime._run_images import _ingest_entry_images as _ingest_entry_images
+from dendrux.runtime._run_images import _ingest_resume_images as _ingest_resume_images
+from dendrux.runtime._run_images import _input_data as _input_data
+from dendrux.runtime._run_images import _input_edge_kwargs as _input_edge_kwargs
+from dendrux.runtime._run_images import _live_edges as _live_edges
+from dendrux.runtime._run_images import _memory_catalog as _memory_catalog
+from dendrux.runtime._run_images import _record_user_trace as _record_user_trace
+from dendrux.runtime._run_images import _recorder_image_kwargs as _recorder_image_kwargs
+from dendrux.runtime._run_images import _register_memory_input as _register_memory_input
+from dendrux.runtime._run_images import _release_memory_edges as _release_memory_edges
+from dendrux.runtime._run_images import _replay_has_images as _replay_has_images
+from dendrux.runtime._run_images import _replay_sources as _replay_sources
+from dendrux.runtime._run_images import _require_image_loop as _require_image_loop
+from dendrux.runtime._run_images import _resume_image_view as _resume_image_view
+from dendrux.runtime._run_images import _same_pause as _same_pause
+from dendrux.runtime._run_images import _seed_edges as _seed_edges
+from dendrux.runtime._run_images import _single_full_source as _single_full_source
+from dendrux.runtime._run_images import _start_image_view as _start_image_view
+from dendrux.runtime._run_images import _stored_parts as _stored_parts
+from dendrux.runtime._run_images import _submit_image_runtime as _submit_image_runtime
+from dendrux.runtime._run_images import _tool_image_kwargs as _tool_image_kwargs
+from dendrux.runtime._run_images import _write_edges as _write_edges
+from dendrux.runtime._run_images import ingest_submitted_tool_images as ingest_submitted_tool_images
+from dendrux.runtime._run_images import ingest_submitted_user_parts as ingest_submitted_user_parts
 from dendrux.runtime._run_observers import _attach_mcp_meta as _attach_mcp_meta
 from dendrux.runtime._run_observers import (
     _attach_run_error_meta as _attach_run_error_meta,
@@ -175,6 +241,17 @@ from dendrux.runtime._run_pending import _reread_moved as _reread_moved
 from dendrux.runtime._run_pending import (
     _stop_reason_from_meta as _stop_reason_from_meta,
 )
+from dendrux.runtime._run_tools import _TOOL_NAME_CHARS as _TOOL_NAME_CHARS
+from dendrux.runtime._run_tools import _TOOL_NAME_SCAN_LIMIT as _TOOL_NAME_SCAN_LIMIT
+from dendrux.runtime._run_tools import _discover_runtime_tools as _discover_runtime_tools
+from dendrux.runtime._run_tools import _emit_declared_tools as _emit_declared_tools
+from dendrux.runtime._run_tools import _emit_init_events as _emit_init_events
+from dendrux.runtime._run_tools import _emit_init_governance_event as _emit_init_governance_event
+from dendrux.runtime._run_tools import _local_tool_names as _local_tool_names
+from dendrux.runtime._run_tools import _mcp_error_payload as _mcp_error_payload
+from dendrux.runtime._run_tools import _MCPDiscoveryError as _MCPDiscoveryError
+from dendrux.runtime._run_tools import _snapshot_mcp_meta as _snapshot_mcp_meta
+from dendrux.runtime._run_tools import _validate_loop_skill_compat as _validate_loop_skill_compat
 from dendrux.runtime._tenant_checks import _tenant_scope_chosen
 from dendrux.runtime._tracelink import validate_trace_link as validate_trace_link
 from dendrux.runtime.context import (
@@ -202,15 +279,21 @@ from dendrux.runtime.replay import (
     expand_replay,
     has_images,
     image_slot_count,
-    initial_image_view,
-    load_image_sources,
-    parts_to_dicts,
     rebuild_messages,
     record_run_prefix,
     user_trace_message,
     validate_replay_args,
 )
+from dendrux.runtime.replay import (
+    initial_image_view as initial_image_view,
+)
+from dendrux.runtime.replay import (
+    load_image_sources as load_image_sources,
+)
 from dendrux.runtime.replay import load_replay_runs as load_replay_runs
+from dendrux.runtime.replay import (
+    parts_to_dicts as parts_to_dicts,
+)
 from dendrux.runtime.state import (
     ClaimResult,
     _initial_loop_state,
@@ -239,11 +322,9 @@ from dendrux.strategies.native import NativeToolCalling
 from dendrux.types import (
     AgentStep,
     ApprovalDecision,
-    ErrorInfo,
     GovernanceEventType,
     IdempotencyConflictError,
     ImagePart,
-    ImageRef,
     ImageViewState,
     Message,
     PauseState,
@@ -252,19 +333,25 @@ from dendrux.types import (
     RunEventType,
     RunStatus,
     StopReason,
-    TextPart,
     UsageStats,
     _usage_from_dict,
     compute_idempotency_fingerprint,
-    content_part_from_dict,
     generate_ulid,
     tool_result_message,
 )
+from dendrux.types import (
+    ErrorInfo as ErrorInfo,
+)
+from dendrux.types import (
+    ImageRef as ImageRef,
+)
 from dendrux.types import ReplaySummary as ReplaySummary
-
-_TOOL_NAME_SCAN_LIMIT = 1000
-
-_TOOL_NAME_CHARS = 64
+from dendrux.types import (
+    TextPart as TextPart,
+)
+from dendrux.types import (
+    content_part_from_dict as content_part_from_dict,
+)
 
 _DEFAULT_RECOVERY_ITERATIONS = 10
 
@@ -281,11 +368,11 @@ if TYPE_CHECKING:
     from dendrux.chat import ChatMessage
     from dendrux.llm.base import LLMProvider
     from dendrux.loops.base import Loop, LoopNotifier, LoopRecorder
-    from dendrux.media._catalog import BlobEdge
+    from dendrux.media._catalog import BlobEdge as BlobEdge
     from dendrux.media._image import UserContent
     from dendrux.media._runtime import ImageRuntime
     from dendrux.runtime._continuation_guardrails import _SubmissionProjection
-    from dendrux.runtime._entry_guardrails import _EntryProjection
+    from dendrux.runtime._entry_guardrails import _EntryProjection as _EntryProjection
     from dendrux.runtime.state import RunRecord, StateStore
     from dendrux.runtime.tasks import RunTaskManager
     from dendrux.strategies.base import Strategy
@@ -299,34 +386,6 @@ if TYPE_CHECKING:
         ToolCall,
         ToolResult,
     )
-
-
-async def _finalize_running_event(
-    store: StateStore,
-    run_id: str,
-    status: str,
-    event_type: str,
-    event_data: dict[str, Any],
-    *,
-    emit_event: bool = True,
-    **kwargs: Any,
-) -> tuple[bool, bool]:
-    atomic = getattr(store, "finalize_with_event", None)
-    if atomic is not None and emit_event:
-        kwargs.pop("error_info", None)  # Carried by the atomic lifecycle event.
-        seq = await atomic(
-            run_id,
-            status=status,
-            allowed_current_statuses=[RunStatus.RUNNING.value],
-            event_type=event_type,
-            event_data=event_data,
-            **kwargs,
-        )
-        return seq is not None, False
-    won = await store.finalize_run(
-        run_id, status=status, expected_current_status=RunStatus.RUNNING.value, **kwargs
-    )
-    return bool(won), bool(won and emit_event)
 
 
 async def _persist_run_failure(
@@ -348,7 +407,7 @@ async def _persist_run_failure(
     try:
         # Deriving text from ``exc`` can itself raise; it fails like the write does.
         payload, finalize = _failure_fields(store, exc, payload, finalize)
-        won, needs_event = await _finalize_running_event(
+        won, needs_event = await _run_events._finalize_running_event(
             store,
             run_id,
             RunStatus.ERROR.value,
@@ -364,7 +423,7 @@ async def _persist_run_failure(
         )
         return False
     if needs_event:
-        emit = _emit_event_safe if safe_event else _emit_event
+        emit = _run_events._emit_event_safe if safe_event else _run_events._emit_event
         await emit(store, run_id, StoredEventType.RUN_ERROR.value, payload)
     return bool(won)
 
@@ -411,33 +470,6 @@ async def _stream_run_failure(
             )
 
 
-def _take_task_interrupt(manager: RunTaskManager | None, run_id: str) -> tuple[bool, bool]:
-    if manager is None:
-        return False, False
-    interrupted, others = manager.take_interrupt(run_id)
-    task = asyncio.current_task()
-    swallow = interrupted and not others and task is not None and task.uncancel() == 0
-    return interrupted, swallow
-
-
-def _may_swallow_cancellation(swallow: bool) -> bool:
-    task = asyncio.current_task()
-    return swallow and (task is None or task.cancelling() == 0)
-
-
-async def _drain_task_cancellation(
-    store: StateStore | None, run_id: str, interrupted: bool
-) -> RunResult:
-    from dendrux.runtime.tasks import _drain_cleanup
-
-    result, _ = await _drain_cleanup(
-        _persist_task_cancellation(store, run_id, interrupted=interrupted),
-        name=f"cancel-run:{run_id}",
-        run_id=run_id,
-    )
-    return result
-
-
 def _creation_claim(loop: Loop, created: CreateRunResult) -> ClaimResult:
     """The creator's epoch-0 claim, with a fresh checkpoint for a format-2 run."""
     state = (
@@ -455,9 +487,9 @@ async def _finish_lifecycle(
     if MANAGED_DESCEND_KEY in result.meta:
         return  # Not finished: the parent continues after its child is adopted.
     lifecycle.recorder_closed = True
-    await record_run_finished(recorder, lifecycle.run_id, result)
+    await _hooks.record_run_finished(recorder, lifecycle.run_id, result)
     lifecycle.notifier_closed = True
-    await notify_run_finished(notifier, lifecycle.run_id, result)
+    await _hooks.notify_run_finished(notifier, lifecycle.run_id, result)
 
 
 async def _record_finished(
@@ -466,8 +498,8 @@ async def _record_finished(
     """Record and notify a finished run; a managed handoff is not finished (0.7)."""
     if MANAGED_DESCEND_KEY in result.meta:
         return  # The parent exits at a managed handoff (0.7 driver).
-    await record_run_finished(recorder, run_id, result)
-    await notify_run_finished(notifier, run_id, result)
+    await _hooks.record_run_finished(recorder, run_id, result)
+    await _hooks.notify_run_finished(notifier, run_id, result)
 
 
 @dataclass
@@ -544,7 +576,9 @@ class _RunLifecycle(ManagedStopLifecycle):
             open_recorder = None if self.recorder_closed else recorder
             open_notifier = None if self.notifier_closed else notifier
             self.recorder_closed = self.notifier_closed = True
-            await _finish_fenced_lifecycle(self.run_id, result, open_recorder, open_notifier)
+            await _run_events._finish_fenced_lifecycle(
+                self.run_id, result, open_recorder, open_notifier
+            )
         return result
 
     async def _cancel_finish(
@@ -553,14 +587,14 @@ class _RunLifecycle(ManagedStopLifecycle):
         if not self.recorder_closed:
             self.recorder_closed = True
             try:
-                await record_run_finished(recorder, self.run_id, result)
+                await _hooks.record_run_finished(recorder, self.run_id, result)
             except Exception:
                 logger.warning(
                     "Recorder finish failed for run %s", self.run_id, exc_info=safe_exception_info()
                 )
         if not self.notifier_closed:
             self.notifier_closed = True
-            await notify_run_finished(notifier, self.run_id, result)
+            await _hooks.notify_run_finished(notifier, self.run_id, result)
 
     async def _cancelled(
         self,
@@ -570,8 +604,8 @@ class _RunLifecycle(ManagedStopLifecycle):
         notifier: LoopNotifier | None,
     ) -> tuple[RunResult, bool]:
         manager = self.manager if self.registered else None
-        interrupted, swallow = _take_task_interrupt(manager, self.run_id)
-        cancelled = await _drain_task_cancellation(
+        interrupted, swallow = _run_events._take_task_interrupt(manager, self.run_id)
+        cancelled = await _run_events._drain_task_cancellation(
             self.store if self.owned else None, self.run_id, interrupted
         )
         if result is not None and (
@@ -582,42 +616,11 @@ class _RunLifecycle(ManagedStopLifecycle):
         _run_observers._attach_mcp_meta(cancelled, meta)
         if self.started:
             await self._cancel_finish(recorder, notifier, cancelled)
-        return cancelled, _may_swallow_cancellation(swallow)
+        return cancelled, _run_events._may_swallow_cancellation(swallow)
 
     def _release(self) -> None:
         if self.registered and self.manager is not None:
             self.manager.release_current(self.run_id)
-
-
-async def _discover_runtime_tools(
-    agent: Agent,
-    recorder: LoopRecorder | None,
-    extra_notifier: LoopNotifier | None,
-    run_id: str,
-    resolved_loop: Loop,
-    mcp_meta: dict[str, Any],
-) -> None:
-    try:
-        await _emit_init_events(
-            agent,
-            recorder,
-            extra_notifier,
-            run_id,
-            resolved_loop=resolved_loop,
-            mcp_meta=mcp_meta,
-        )
-    except _MCPDiscoveryError as mcp_exc:
-        try:
-            await _emit_init_governance_event(
-                recorder,
-                extra_notifier,
-                run_id,
-                GovernanceEventType.MCP_ERROR,
-                _mcp_error_payload(mcp_exc),
-            )
-        except Exception:
-            logger.warning("Failed to emit mcp.error event", exc_info=safe_exception_info())
-        raise mcp_exc.__cause__ or mcp_exc from mcp_exc.__cause__
 
 
 def _recorder_tool_defs(agent: Agent) -> list[Any]:
@@ -650,7 +653,7 @@ def _runtime_recorder(
         target_lookup={td.name: td.target for td in definitions},
         seed_traces=seeds.get("seed_traces"),
         guardrail_engine=guardrails,
-        **_recorder_image_kwargs(tenant_id, provider),
+        **_run_images._recorder_image_kwargs(tenant_id, provider),
     )
     _managed_budget.configure_recorder(recorder, agent)
     return recorder
@@ -675,7 +678,7 @@ async def _start_new_run(
         )
     if before_event is not None:
         before_event()
-    await _emit_event(
+    await _run_events._emit_event(
         lifecycle.store, lifecycle.run_id, StoredEventType.RUN_STARTED.value, event_data
     )
     lifecycle.started = True
@@ -692,315 +695,6 @@ async def _start_new_run(
         parent=parent,
         on_started=lifecycle._mark_notifier_started,
     )
-
-
-def _validate_loop_skill_compat(agent: Agent, resolved_loop: Loop) -> None:
-    """Reject SingleCall + tools/tool_sources when loop is overridden at run time.
-
-    Skills are allowed on SingleCall — they're delivered inline by
-    ``Agent.get_system_prompt`` (inlined skill mode). Tools and tool
-    sources are rejected because tool execution is inherently multi-turn
-    (the LLM emits a call, the loop runs it, the LLM sees the result),
-    and SingleCall is one LLM call by definition. Mirrors the
-    construction-time checks in ``Agent._validate``.
-    """
-    from dendrux.loops.single import SingleCall
-
-    if isinstance(resolved_loop, SingleCall) and agent.tools:
-        tool_names = [getattr(fn, "__name__", str(fn)) for fn in agent.tools]
-        raise ValueError(
-            f"Agent '{agent.name}' has {len(agent.tools)} tool(s) {tool_names} "
-            f"but is being run with SingleCall loop. SingleCall agents cannot "
-            f"have tools — tool execution requires multi-turn iteration. "
-            f"Skills are still supported on SingleCall (delivered inline)."
-        )
-
-    if isinstance(resolved_loop, SingleCall) and agent._tool_sources:
-        raise ValueError(
-            f"Agent '{agent.name}' has MCP tool_sources but is being run with "
-            f"SingleCall loop. SingleCall does not support MCP tool discovery."
-        )
-
-
-def _mcp_error_payload(error: _MCPDiscoveryError) -> dict[str, Any]:
-    """Payload of the run-fatal mcp.error event, with a stable ``code``."""
-    # Deferred: dendrux.mcp needs the optional mcp extra, and discovery only
-    # fails when the Agent has MCP tool sources.
-    from dendrux.mcp._errors import MCPAuthorizationRequired, error_code_for
-
-    cause = error.__cause__ or error
-    payload: dict[str, Any] = {
-        "error": str(error)[: _run_errors.ERROR_TEXT_CHARS],
-        "error_type": _run_observers._cause_type(error),
-        "code": error_code_for(cause),
-    }
-    if isinstance(cause, MCPAuthorizationRequired):
-        payload["reason"] = cause.reason
-    return payload
-
-
-def _snapshot_mcp_meta(agent: Agent) -> dict[str, Any]:
-    return {
-        "mcp_skipped_sources": deepcopy(agent._mcp_skipped_sources),
-        "mcp_skipped_tools": deepcopy(agent._mcp_skipped_tools),
-    }
-
-
-class _MCPDiscoveryError(Exception):
-    """Wrapper raised only when MCP discovery fails inside _emit_init_events.
-
-    Lets callers distinguish MCP discovery failures from skill emission
-    failures so mcp.error is emitted only for actual discovery problems.
-    """
-
-
-async def _emit_init_governance_event(
-    recorder: LoopRecorder | None,
-    notifier: LoopNotifier | None,
-    run_id: str,
-    event_type: str,
-    data: dict[str, Any],
-) -> None:
-    """Emit a single init governance event to recorder + notifier."""
-    from dendrux.loops._helpers import notify_governance, record_governance
-
-    await record_governance(recorder, run_id, event_type, 0, data)
-    await notify_governance(notifier, run_id, event_type, 0, data)
-
-
-def _local_tool_names(agent: Agent) -> list[str]:
-    """Bound code-declared names; discovery/provider catalogs are never authority."""
-    from itertools import islice
-
-    from dendrux.tool import get_tool_def
-
-    names = (get_tool_def(fn).name for fn in islice(agent.tools, _TOOL_NAME_SCAN_LIMIT))
-    return sorted({name for name in names if len(name) <= _TOOL_NAME_CHARS and name.isidentifier()})
-
-
-async def _emit_declared_tools(
-    agent: Agent,
-    recorder: LoopRecorder | None,
-    notifier: LoopNotifier | None,
-    run_id: str,
-) -> None:
-    await _emit_init_governance_event(
-        recorder,
-        notifier,
-        run_id,
-        StoredEventType.TOOLS_DECLARED.value,
-        {"local_tool_names": _local_tool_names(agent)},
-    )
-
-
-async def _emit_init_events(
-    agent: Agent,
-    recorder: LoopRecorder | None,
-    notifier: LoopNotifier | None,
-    run_id: str,
-    *,
-    resolved_loop: Loop | None = None,
-    mcp_meta: dict[str, Any] | None = None,
-) -> None:
-    """Emit skill and MCP init governance events.
-
-    Called inside the runner try block after run.started and delegation
-    context is set.
-
-    ``resolved_loop`` is forwarded to ``agent.get_tool_lookups()`` so
-    MCP discovery + use_skill injection respect a runtime loop override.
-
-    Skills: reads the bound run session, established before prompt resolution.
-
-    MCP: if agent._tool_sources is non-empty, forces discovery via
-    get_tool_lookups(), then groups discovered tools by their
-    Agent-visible namespace (falling back to source_name).
-    Discovery failures are wrapped in _MCPDiscoveryError so callers
-    can distinguish them from skill emission failures.
-    """
-    await _emit_declared_tools(agent, recorder, notifier, run_id)
-    session = current(agent) or SkillSession.prepare(agent, loop=resolved_loop)
-    session.run_id = run_id
-
-    async def skill_sink(event: str, data: dict[str, Any], call_id: str | None) -> None:
-        await _emit_init_governance_event(recorder, notifier, run_id, event, data)
-
-    session.sink = skill_sink
-    await session.start()
-
-    if not agent._tool_sources and mcp_meta is not None:
-        mcp_meta["mcp_skipped_sources"] = []
-        mcp_meta["mcp_skipped_tools"] = []
-
-    # MCP events — only when tool_sources exist
-    if agent._tool_sources:
-        try:
-            await agent.get_tool_lookups(loop=resolved_loop)  # force discovery
-        except Exception as exc:
-            raise _MCPDiscoveryError(str(exc)) from exc
-
-        if mcp_meta is not None:
-            mcp_meta.update(_snapshot_mcp_meta(agent))
-
-        # Initialize from all sources so zero-tool and failed optional sources
-        # still produce explicit, auditable events. Tools are grouped by the
-        # Agent-visible namespace (== each tool source's name); an aliased
-        # runtime view namespaces its tools differently from its MCP source.
-        source_tools: dict[str, list[str]] = {src.name: [] for src in agent._tool_sources}
-        for td in agent._discovered_tool_defs or []:
-            group = td.meta.get("namespace") or td.meta.get("source_name", "unknown")
-            source_tools.setdefault(group, []).append(td.name)
-
-        skipped_sources = {entry["namespace"]: entry for entry in agent._mcp_skipped_sources}
-        for source in agent._tool_sources:
-            configured_name = getattr(getattr(source, "source", None), "name", None)
-            source_name = configured_name if isinstance(configured_name, str) else source.name
-            source_error = getattr(source, "last_error", None)
-            if isinstance(source_error, str) and source_error:
-                skipped_source = skipped_sources.get(source.name, {})
-                payload: dict[str, Any] = {
-                    "source_name": source_name,
-                    "namespace": source.name,
-                    "error": source_error,
-                    "error_type": skipped_source.get("error_type"),
-                    "code": skipped_source.get("code", "unknown"),
-                    "failure_mode": getattr(source, "failure_mode", "strict"),
-                }
-                if "reason" in skipped_source:
-                    payload["reason"] = skipped_source["reason"]
-                await _emit_init_governance_event(
-                    recorder,
-                    notifier,
-                    run_id,
-                    GovernanceEventType.MCP_ERROR,
-                    payload,
-                )
-                continue
-
-            tool_names = source_tools[source.name]
-            await _emit_init_governance_event(
-                recorder,
-                notifier,
-                run_id,
-                GovernanceEventType.MCP_CONNECTED,
-                {
-                    "source_name": source_name,
-                    "namespace": source.name,
-                    "tool_count": len(tool_names),
-                    "tool_names": tool_names,
-                },
-            )
-
-        if agent._mcp_skipped_tools:
-            await _emit_init_governance_event(
-                recorder,
-                notifier,
-                run_id,
-                GovernanceEventType.MCP_TOOLS_SKIPPED,
-                {"skipped": deepcopy(agent._mcp_skipped_tools)},
-            )
-
-
-async def _emit_event(
-    state_store: StateStore | None,
-    run_id: str,
-    event_type: str,
-    data: dict[str, Any] | None = None,
-    correlation_id: str | None = None,
-) -> None:
-    """Record a durable run-level lifecycle event. Fail-closed with retry.
-
-    Runner lifecycle events (run.started, run.paused, run.completed,
-    run.error, run.resumed, run.cancelled) are authoritative truth —
-    they get the same retry/propagate contract as PersistenceRecorder's
-    fail-closed writes. The store allocates the event's sequence index in
-    the insert, so every writer of a run (runner, recorder, ``cancel_run``,
-    another process) gets the next index in commit order.
-    """
-    if state_store is None:
-        return
-
-    from dendrux.runtime._capabilities import capabilities
-    from dendrux.runtime.durability import retry_critical
-
-    identity: dict[str, Any] = (
-        {"event_id": generate_ulid()} if capabilities(state_store).retry_ids else {}
-    )
-
-    async def _write() -> None:
-        from dendrux.runtime.state import validate_event_index, validate_event_writer
-
-        validate_event_writer(state_store)
-        index = await state_store.save_run_event(
-            run_id,
-            event_type=event_type,
-            correlation_id=correlation_id,
-            data=data,
-            **identity,
-        )
-        validate_event_index(index)
-
-    await retry_critical(_write, label=f"emit_{event_type}", run_id=run_id)
-
-
-async def _emit_event_safe(
-    state_store: StateStore | None,
-    run_id: str,
-    event_type: str,
-    data: dict[str, Any] | None = None,
-    correlation_id: str | None = None,
-) -> None:
-    """Best-effort evidence or failure event; ownership fencing still propagates."""
-    if state_store is None:
-        return
-    try:
-        await _emit_event(state_store, run_id, event_type, data, correlation_id)
-    except RunFencedError:
-        raise
-    except Exception:
-        logger.warning(
-            "Failed to record %s for run %s",
-            event_type,
-            run_id,
-            exc_info=safe_exception_info(),
-        )
-
-
-async def _attach_undelivered_notes(
-    state_store: StateStore, run_id: str, result: RunResult
-) -> None:
-    """List inbox notes the run ended without delivering in ``meta["undelivered_notes"]``.
-
-    Only set when there are any, so runs that never get notes are unchanged.
-    """
-    get_notes = getattr(state_store, "get_notes", None)
-    if get_notes is None:  # pre-0.3 store: no inbox
-        return
-    try:
-        notes = await get_notes(run_id, undelivered_only=True)
-    except Exception:
-        logger.warning(
-            "Failed to read undelivered notes for run %s", run_id, exc_info=safe_exception_info()
-        )
-        return
-    if notes:
-        result.meta["undelivered_notes"] = [n.id for n in notes]
-
-
-async def _pause_request_message(state_store: StateStore, run_id: str) -> str | None:
-    """The ``reason=`` text of the latest ``request_pause`` on this run, if any."""
-    from dendrux.runtime.state import PAUSE_REQUEST_META_KEY
-
-    try:
-        record = await state_store.get_run(run_id)
-    except Exception:
-        logger.warning(
-            "Failed to read pause request for run %s", run_id, exc_info=safe_exception_info()
-        )
-        return None
-    request = ((record.meta if record else None) or {}).get(PAUSE_REQUEST_META_KEY)
-    reason = request.get("reason") if isinstance(request, dict) else None
-    return reason if isinstance(reason, str) else None
 
 
 @asynccontextmanager
@@ -1235,7 +929,7 @@ async def _persisted_loop_result(
         persisted.error_info = _run_errors._error_info_from_meta(record.meta)
     if status not in _PAUSE_STATUSES:
         persisted.meta.pop("pause_state", None)
-        await _attach_undelivered_notes(state_store, run_id, persisted)
+        await _run_events._attach_undelivered_notes(state_store, run_id, persisted)
     return await _run_pending._attach_persisted_pending(state_store, persisted, record)
 
 
@@ -1252,7 +946,7 @@ async def _finalize_loop_cancelled(
     from dendrux.runtime.state import _capture_finalized_run
 
     with _capture_finalized_run(unclaimed_store(state_store), run_id) as records:
-        won = await _transition_with_event(
+        won = await _run_events._transition_with_event(
             state_store,
             run_id,
             status=RunStatus.CANCELLED.value,
@@ -1280,7 +974,7 @@ async def _finalize_loop_cancelled(
         recovery=recovery,
     )
     cancelled.meta.pop("pause_state", None)
-    await _attach_undelivered_notes(state_store, run_id, cancelled)
+    await _run_events._attach_undelivered_notes(state_store, run_id, cancelled)
     return cancelled
 
 
@@ -1408,7 +1102,7 @@ async def _persist_loop_outcome(
     event_data.update(_unstored_failure_reason(result, failure_kwargs))
     atomic_final = getattr(state_store, "finalize_with_event", None) is not None
     if unmapped_placeholders:
-        await _emit_event_safe(
+        await _run_events._emit_event_safe(
             state_store,
             run_id,
             GovernanceEventType.GUARDRAIL_UNMAPPED_PLACEHOLDER.value,
@@ -1451,9 +1145,9 @@ async def _persist_loop_outcome(
     if stop_reason is not None:
         await _record_stop_reason(state_store, run_id, stop_reason)
     if not atomic_final:
-        await _emit_event(state_store, run_id, event_type, event_data)
+        await _run_events._emit_event(state_store, run_id, event_type, event_data)
     finished = _wrap(status=result.status, won=True, recovery=recovery)
-    await _attach_undelivered_notes(state_store, run_id, finished)
+    await _run_events._attach_undelivered_notes(state_store, run_id, finished)
     return finished
 
 
@@ -1474,7 +1168,7 @@ async def _persist_pause(
     # any durable pause (incl. WAITING_*) satisfies a pause request. The
     # pause and its run.paused event commit together, so a finalizer of
     # paused runs (cancel_run, sweep) always acts after the event.
-    await _check_claim(state_store, run_id)
+    await _run_events._check_claim(state_store, run_id)
     _run_pending._ensure_pause_generation(result, provider_kwargs)
     pause_state: PauseState = result.meta["pause_state"]
     # A pause generation belongs to this transition, never to the prior
@@ -1486,7 +1180,7 @@ async def _persist_pause(
         and pause_state.pause_message is None
     ):
         pause_state = replace(
-            pause_state, pause_message=await _pause_request_message(state_store, run_id)
+            pause_state, pause_message=await _run_events._pause_request_message(state_store, run_id)
         )
         result.meta["pause_state"] = pause_state
     paused_data = _run_pending._pause_event_data(result, pause_state)
@@ -1498,7 +1192,7 @@ async def _persist_pause(
     pause_data = {**pause_state.to_dict(), "status": result.status.value}
     if record is not None and GOVERNANCE_KEY in (getattr(record, "meta", None) or {}):
         pause_data[GOVERNANCE_KEY] = (record.meta or {})[GOVERNANCE_KEY]
-    paused = await _pause_with_event(
+    paused = await _run_events._pause_with_event(
         state_store,
         run_id,
         status=result.status.value,
@@ -1538,7 +1232,7 @@ async def _persist_managed_handoff(
     No pause is written; the child's atomic bind parks this run. A cancel
     requested during the iteration finalizes it as for any pause.
     """
-    await _check_claim(state_store, run_id)
+    await _run_events._check_claim(state_store, run_id)
     descend = await _managed.prepare_handoff(state_store, run_id, result, recorder, provider_kwargs)
     if descend is not None:
         return await _managed_budget.finish(descend, result, recorder, _persist_loop_outcome)
@@ -1564,109 +1258,6 @@ async def _record_stop_reason(state_store: StateStore, run_id: str, stop_reason:
         )
 
 
-async def _transition_with_event(
-    state_store: StateStore,
-    run_id: str,
-    *,
-    status: str,
-    allowed_current_statuses: list[str],
-    event_type: str,
-    event_data: dict[str, Any],
-    **finalize_kwargs: Any,
-) -> bool:
-    """CAS-finalize and record the transition event atomically when the store can.
-
-    Pre-0.3 stores lack ``finalize_with_event``: fall back to the CAS
-    followed by a separate event write. Their CAS cannot store a
-    ``failure_reason``; the transition event still carries the reason.
-    """
-    atomic = getattr(state_store, "finalize_with_event", None)
-    # Stores predating a keyword (e.g. failure_reason) cannot persist it;
-    # the transition and its event (which carries the reason) still happen.
-    if finalize_kwargs.get("failure_reason") is None or not _run_contracts._accepts_kwarg(
-        atomic or state_store.finalize_run_if_status_in, "failure_reason"
-    ):
-        finalize_kwargs.pop("failure_reason", None)
-    if atomic is not None:
-        seq = await atomic(
-            run_id,
-            status=status,
-            allowed_current_statuses=allowed_current_statuses,
-            event_type=event_type,
-            event_data=event_data,
-            **finalize_kwargs,
-        )
-        return seq is not None
-    won = await state_store.finalize_run_if_status_in(
-        run_id,
-        status=status,
-        allowed_current_statuses=allowed_current_statuses,
-        **finalize_kwargs,
-    )
-    if won:
-        await _emit_event(state_store, run_id, event_type, event_data)
-    return bool(won)
-
-
-async def _pause_with_event(
-    state_store: StateStore,
-    run_id: str,
-    *,
-    status: str,
-    pause_data: dict[str, Any],
-    event_data: dict[str, Any],
-    iteration_count: int | None,
-    pii_mapping: dict[str, str] | None,
-    total_usage: UsageStats | None = None,
-) -> bool:
-    """Persist a pause and its ``run.paused`` event; False when cancellation won.
-
-    ``total_usage`` is written as the run's running totals so a paused run
-    does not read as zero spend. Pre-0.3 stores lack ``pause_with_event``:
-    fall back to the legacy cancel read, unconditional ``pause_run`` (with
-    totals only when it accepts them) and a separate event write.
-    """
-    usage_kwargs: dict[str, Any] = {"total_usage": total_usage} if total_usage else {}
-    atomic = getattr(state_store, "pause_with_event", None)
-    if not _run_contracts._accepts_kwarg(atomic or state_store.pause_run, "total_usage"):
-        usage_kwargs = {}
-    if atomic is not None:
-        seq = await atomic(
-            run_id,
-            status=status,
-            pause_data=pause_data,
-            event_data=event_data,
-            iteration_count=iteration_count,
-            pii_mapping=pii_mapping,
-            **usage_kwargs,
-        )
-        return seq is not None
-    if await state_store.is_cancel_requested(run_id):
-        return False
-    await state_store.pause_run(
-        run_id,
-        status=status,
-        pause_data=pause_data,
-        iteration_count=iteration_count,
-        pii_mapping=pii_mapping,
-        **usage_kwargs,
-    )
-    await _emit_event(state_store, run_id, StoredEventType.RUN_PAUSED.value, event_data)
-    # The read and the pause are separate here: a cancel committed in between
-    # left a paused row with cancel_requested set. Finish it now; the caller
-    # reloads and returns the persisted winner.
-    if await state_store.is_cancel_requested(run_id):
-        await _transition_with_event(
-            state_store,
-            run_id,
-            status=RunStatus.CANCELLED.value,
-            allowed_current_statuses=[status],
-            event_type=StoredEventType.RUN_CANCELLED.value,
-            event_data={"reason": CancelReason.CANCEL_REQUESTED.value},
-        )
-    return True
-
-
 def _budget_carry_kwargs(loop_method: Any, pause_state: PauseState) -> dict[str, Any]:
     """``budget_carry=`` for a loop that accepts it (built-in loops); else nothing.
 
@@ -1688,275 +1279,6 @@ def _carry_budget_fields(new: PauseState, old: PauseState) -> PauseState:
         budget_known_cost_usd=old.budget_known_cost_usd,
         budget_unpriced_calls=old.budget_unpriced_calls,
     )
-
-
-def _carry_image_view(new: PauseState, old: PauseState) -> PauseState:
-    """Carry the image view of the pause being resumed onto a runner-built pause.
-
-    A runner-built pause is created between requests, so the view is
-    unchanged. A pause predating any image (``image_view is None``) whose new
-    history gained images (approved server tools) starts a view in which
-    the old history's slots count as sent.
-    """
-    view = old.image_view
-    if view is None:
-        if not has_images(new.history):
-            return new
-        view = ImageViewState(sent_through=image_slot_count(old.history))
-    return replace(new, image_view=ImageViewState.from_dict(view.to_dict()))
-
-
-def _image_runtime(
-    agent: Agent, state_store: StateStore | None, tenant_id: str | None, run_id: str | None
-) -> ImageRuntime:
-    """The per-run :class:`ImageRuntime` (explicit; never a ContextVar)."""
-    from dendrux.media._policy import ImagePolicy
-    from dendrux.media._runtime import ImageRuntime, tenant_scope_for
-
-    state_store = unclaimed_store(state_store)
-    backend = getattr(agent, "_image_backend", None)
-    catalog, blob_store, resolver = backend(state_store) if backend else (None, None, None)
-    gc = getattr(agent, "_image_gc", None)
-    return ImageRuntime(
-        collect_garbage=gc(state_store) if gc else None,
-        policy=getattr(agent, "image_policy", None) or ImagePolicy(),
-        catalog=catalog,
-        blob_store=blob_store,
-        resolver=resolver,
-        tenant_scope=tenant_scope_for(tenant_id),
-        run_id=run_id,
-    )
-
-
-def _recorder_image_kwargs(tenant_id: str | None, provider: LLMProvider) -> dict[str, Any]:
-    """``tenant_scope=`` (edge scope) and ``provider=`` (image token estimates) for
-    ``PersistenceRecorder`` when it takes them (§8)."""
-    from dendrux.media._runtime import tenant_scope_for
-    from dendrux.runtime.persistence import PersistenceRecorder
-
-    init = PersistenceRecorder.__init__
-    out: dict[str, Any] = {}
-    if _run_contracts._accepts_kwarg(init, "tenant_scope"):
-        out["tenant_scope"] = tenant_scope_for(tenant_id)
-    if _run_contracts._accepts_kwarg(init, "provider"):
-        out["provider"] = provider
-    return out
-
-
-def _image_loop_kwargs(
-    loop_method: Any, runtime: ImageRuntime | None, state: ImageViewState | None
-) -> dict[str, Any]:
-    """``image_runtime=`` / ``image_view_state=`` for a loop method that accepts them."""
-    out: dict[str, Any] = {}
-    if runtime is not None and _run_contracts._accepts_kwarg(loop_method, "image_runtime"):
-        out["image_runtime"] = runtime
-        if state is not None and _run_contracts._accepts_kwarg(loop_method, "image_view_state"):
-            out["image_view_state"] = state
-    return out
-
-
-def _require_image_loop(loop: Loop, method: str = "run") -> None:
-    """A loop that cannot take ``image_runtime`` cannot run image input."""
-    if not _run_contracts._accepts_kwarg(getattr(loop, method, None), "image_runtime"):
-        raise TypeError(
-            f"{type(loop).__name__}.{method}() does not accept image_runtime, so it "
-            "cannot run image input; use ReActLoop or SingleCall, or add the parameter."
-        )
-
-
-def _tool_image_kwargs(fn: Any, runtime: ImageRuntime | None) -> dict[str, Any]:
-    if runtime is None or not _run_contracts._accepts_kwarg(fn, "image_runtime"):
-        return {}
-    return {"image_runtime": runtime}
-
-
-def _resume_image_view(pause_state: PauseState, history: list[Message]) -> ImageViewState | None:
-    """The view a resumed run continues with; fresh (old history = sent) for older pauses."""
-    if pause_state.image_view is not None:
-        return pause_state.image_view
-    if not has_images(history):
-        return None
-    return ImageViewState(sent_through=image_slot_count(pause_state.history))
-
-
-async def _write_edges(
-    runtime: ImageRuntime | None, run_id: str, edges: Sequence[BlobEdge]
-) -> None:
-    """Seed / user-trace edges via the catalog (idempotent per owner key)."""
-    if not edges:
-        return
-    if runtime is None or runtime.catalog is None:
-        from dendrux.errors import ImagePersistenceUnsupportedError
-
-        raise ImagePersistenceUnsupportedError("state_store")
-    await runtime.catalog.add_blob_refs(run_id, runtime.tenant_scope, list(edges))
-
-
-async def _live_edges(runtime: ImageRuntime | None, edges: list[BlobEdge]) -> list[BlobEdge]:
-    """Keep edges whose blob row is ``live`` (purged/missing refs degrade at request time)."""
-    if not edges or runtime is None or runtime.catalog is None:
-        return edges
-    rows = await runtime.catalog.get_current(
-        runtime.tenant_scope, list(dict.fromkeys(e.sha256 for e in edges))
-    )
-    return [e for e in edges if (row := rows.get(e.sha256)) is not None and row.state == "live"]
-
-
-def _seed_edges(runtime: ImageRuntime, seeded: Sequence[Message]) -> list[BlobEdge]:
-    """``seed`` edges: one per image slot of the seeded prefix (ordinal = slot)."""
-    from dendrux.media._catalog import BlobEdge
-
-    edges: list[BlobEdge] = []
-    slot = 0
-    for msg in seeded:
-        if msg.role == Role.SYSTEM:
-            continue
-        for part in msg.images:
-            edges.append(BlobEdge(runtime.tenant_scope, part.ref.sha256, "seed", "seed", slot))
-            slot += 1
-    return edges
-
-
-async def _start_image_view(
-    runtime: ImageRuntime | None,
-    store: StateStore | None,
-    run_id: str,
-    *,
-    seeded: Sequence[Message],
-    sources: Sequence[tuple[str, str | None, dict[str, Any] | None]],
-    single_full: bool,
-    input_images: bool,
-) -> ImageViewState | None:
-    """New-run image view (§5.14) plus seed edges; None for a run without images.
-
-    ``seeded`` is the prefix the run starts with (history=, replayed runs,
-    retry rebuild); its slots all count as sent. ``sources`` are the replayed
-    / retried runs whose image decisions carry over, in order.
-    """
-    if not has_images(seeded):
-        return ImageViewState() if input_images else None
-    if runtime is None:
-        raise TypeError(
-            "the loop does not accept image_runtime, so it cannot run a seeded prefix with images"
-        )
-    image_sources = (
-        await load_image_sources(store, sources) if store is not None and sources else []
-    )
-    state = initial_image_view(
-        sent_through=image_slot_count(seeded),
-        sources=image_sources,
-        tenant_scope=runtime.tenant_scope,
-        single_full=single_full,
-    )
-    if store is not None or _memory_catalog(runtime, store) is not None:
-        await _write_edges(
-            runtime, run_id, await _live_edges(runtime, _seed_edges(runtime, seeded))
-        )
-    return state
-
-
-def _memory_catalog(runtime: ImageRuntime | None, store: StateStore | None) -> Any:
-    """The in-memory catalog of a run without a database (it tracks run edges)."""
-    if store is not None or runtime is None or runtime.catalog is None:
-        return None
-    return runtime.catalog if hasattr(runtime.catalog, "release_run") else None
-
-
-async def _register_memory_input(
-    runtime: ImageRuntime | None,
-    store: StateStore | None,
-    run_id: str,
-    user_parts: tuple[ContentPart, ...] | None,
-) -> None:
-    """No database: register the input's edges with the in-memory catalog (GC safety)."""
-    if _memory_catalog(runtime, store) is None:
-        return
-    edges = _input_edge_kwargs(runtime, user_parts).get("blob_refs")
-    if edges:
-        await _write_edges(runtime, run_id, edges)
-
-
-def _release_memory_edges(
-    runtime: ImageRuntime | None, store: StateStore | None, run_id: str
-) -> None:
-    """No database: drop the run's in-memory edges once it ends (it cannot pause)."""
-    catalog = _memory_catalog(runtime, store)
-    if catalog is not None:
-        try:
-            catalog.release_run(run_id)
-        except Exception:
-            logger.warning(
-                "Failed to release in-memory blob edges of run %s",
-                run_id,
-                exc_info=safe_exception_info(),
-            )
-
-
-class _EntryImages(NamedTuple):
-    """Ingested image input of a new run (before ``create_run``)."""
-
-    runtime: ImageRuntime
-    user_parts: tuple[ContentPart, ...] | None
-    history: list[Message]
-
-
-async def _ingest_entry_images(
-    agent: Agent,
-    provider: LLMProvider,
-    model: str,
-    *,
-    state_store: StateStore | None,
-    tenant_id: str | None,
-    run_id: str,
-    items: tuple[Any, ...],
-    history: list[ChatMessage] | None,
-) -> _EntryImages:
-    """Ingest run input + ``history=`` images before any run row exists (§5.2).
-
-    The input's capability check runs between ingest phase 1 and phase 2, so a
-    non-vision model rejects new images before any blob row is written.
-    History images are seeded (already sent) and never capability-checked.
-    """
-    from dendrux.runtime.submit import (
-        check_new_image_capability,
-        ingest_groups,
-        merge_user_items,
-        user_items_group,
-    )
-
-    runtime = _image_runtime(agent, state_store, tenant_id, run_id)
-    turns = [(i, msg.parts) for i, msg in enumerate(history or []) if msg.parts]
-    image_count = sum(1 for item in items if not isinstance(item, str))
-
-    async def _capability() -> None:
-        await check_new_image_capability(
-            provider, model, runtime.policy, image_count=image_count, origin="user"
-        )
-
-    # One phase 1 over the input and every history turn before any blob write.
-    ingested = await ingest_groups(
-        [user_items_group(items), *(user_items_group(parts) for _, parts in turns)],
-        runtime=runtime,
-        before_store=_capability,
-    )
-    user_parts = merge_user_items(items, ingested[0]) if items else None
-    parts_for = {
-        i: merge_user_items(parts, images)
-        for (i, parts), images in zip(turns, ingested[1:], strict=True)
-    }
-    return _EntryImages(runtime, user_parts, normalize_chat_history(history, parts_for))
-
-
-async def _record_user_trace(
-    recorder: LoopRecorder | None, notifier: LoopNotifier | None, run_id: str, user_msg: Message
-) -> None:
-    """Record the run's own user message (order 0).
-
-    Its image parts (``meta["dendrux.parts"]``) are edged by the recorder in
-    the trace transaction (non-live blobs skipped there).
-    """
-    user_msg = await record_message(recorder, run_id, user_msg, 0)
-    await notify_message(notifier, run_id, user_msg, 0)
 
 
 def _resolve_max_delegation_depth(
@@ -2032,7 +1354,7 @@ def _new_run_input(
     validate_chat_history(history)
     image_input = bool(items) or history_has_images(history)
     if image_input:
-        _require_image_loop(loop)
+        _run_images._require_image_loop(loop)
     return text, items, image_input, _text_history(history, image_input)
 
 
@@ -2072,7 +1394,7 @@ async def _record_seeded_user(
         message = user_trace_message(
             user_input, history, render_band(context, "stable"), context, session=session
         )
-        await _record_user_trace(recorder, notifier, run_id, message)
+        await _run_images._record_user_trace(recorder, notifier, run_id, message)
 
 
 async def _new_run_image_view(
@@ -2084,13 +1406,13 @@ async def _new_run_image_view(
     replay_plan: ReplayPlan | None,
     parts: tuple[ContentPart, ...] | None,
 ) -> ImageViewState | None:
-    return await _start_image_view(
+    return await _run_images._start_image_view(
         runtime,
         store,
         run_id,
         seeded=(history or [])[:-1],
-        sources=_replay_sources(replay_runs),
-        single_full=_single_full_source(replay_plan),
+        sources=_run_images._replay_sources(replay_runs),
+        single_full=_run_images._single_full_source(replay_plan),
         input_images=parts is not None,
     )
 
@@ -2164,8 +1486,8 @@ async def _load_new_run_replay(
     loaded = await _load_replay_runs(store, request, tenant_id=tenant_id, limits=limits)
     for omitted_id in loaded.omitted:
         _codes.log_code(logger, _codes.BLOCKED_CONTENT, run_id=omitted_id)
-    if _replay_has_images(loaded.runs):
-        _require_image_loop(loop, method)
+    if _run_images._replay_has_images(loaded.runs):
+        _run_images._require_image_loop(loop, method)
     return loaded
 
 
@@ -2190,76 +1512,6 @@ async def _entry_replay(
         )
     loaded = await _load_new_run_replay(store, request, tenant_id, loop, limits=limits)
     return request, loaded.runs, loaded.omitted
-
-
-async def _entry_media(
-    agent: Agent,
-    provider: LLMProvider,
-    resolved_loop: Loop,
-    state_store: StateStore | None,
-    tenant_id: str | None,
-    run_id: str,
-    image_input: bool,
-    user_input: str,
-    input_items: Any,
-    history: Any,
-    normalized_history: Any,
-    provider_kwargs: dict[str, Any],
-    idempotency_key: str | None,
-    output_type: type | None,
-    context: Any,
-    replay_req: ReplayRequest | None,
-    skill_session: SkillSession,
-    *,
-    entry_projection: _EntryProjection | None = None,
-) -> tuple[ImageRuntime | None, tuple[ContentPart, ...] | None, Any, RunResult | None]:
-    image_runtime: ImageRuntime | None = None
-    user_parts: tuple[ContentPart, ...] | None = None
-    if image_input:
-        try:
-            entry = await _ingest_entry_images(
-                agent,
-                provider,
-                provider_kwargs.get("model") or provider.model,
-                state_store=state_store,
-                tenant_id=tenant_id,
-                run_id=run_id,
-                items=input_items,
-                history=history,
-            )
-        except (InvalidImageError, BlobNotFoundError) as exc:
-            hit = await _idempotent_hit_after_image_error(
-                exc,
-                state_store,
-                idempotency_key,
-                tenant_id=tenant_id,
-                agent_name=agent.name,
-                user_input=user_input,
-                items=input_items,
-                history=history,
-                output_type=output_type,
-                context=context,
-                replay=replay_req.fingerprint() if replay_req else None,
-                skills=skill_session.fingerprint(),
-                entry_projection=entry_projection,
-                skill_session=skill_session,
-            )
-            if hit is None:
-                raise
-            if hit.outcome == "existing_terminal":
-                assert state_store is not None  # a hit implies a store
-                return (
-                    image_runtime,
-                    user_parts,
-                    normalized_history,
-                    await _run_pending._build_cached_result(state_store, hit.run_id, output_type),
-                )
-            raise RunAlreadyActiveError(hit.run_id, hit.status) from None
-        image_runtime, user_parts, normalized_history = entry
-    elif _run_contracts._accepts_kwarg(resolved_loop.run, "image_runtime"):
-        image_runtime = _image_runtime(agent, state_store, tenant_id, run_id)
-
-    return image_runtime, user_parts, normalized_history, None
 
 
 @overload
@@ -2456,12 +1708,10 @@ async def _run_once(
             idempotency_key=idempotency_key,
             provider=provider,
         )
-
         resolved_strategy = strategy or NativeToolCalling()
         resolved_loop = _new_run_loop(agent, loop)
-        _validate_loop_skill_compat(agent, resolved_loop)
+        _run_tools._validate_loop_skill_compat(agent, resolved_loop)
         root_limits = await _managed.enter(agent, invocation, state_store, resolved_loop)
-
         # Validate input + chat history before any side effects. Raises
         # TypeError / ValueError on bad input so no DB row is created.
         user_input, input_items, image_input, normalized_history = _new_run_input(
@@ -2494,7 +1744,7 @@ async def _run_once(
 
         # Images: ingest before the first durable write (§5.2). Typed errors
         # raise here, before any run row or claim exists.
-        image_runtime, user_parts, normalized_history, cached = await _entry_media(
+        image_runtime, user_parts, normalized_history, cached = await _run_images._entry_media(
             agent,
             provider,
             resolved_loop,
@@ -2590,7 +1840,7 @@ async def _run_once(
                         resolved_loop,
                         run_id,
                         agent.name,
-                        input_data=_input_data(user_input, user_parts),
+                        input_data=_run_images._input_data(user_input, user_parts),
                         model=provider.model,
                         strategy=type(resolved_strategy).__name__,
                         parent_run_id=parent_run_id,
@@ -2599,7 +1849,7 @@ async def _run_once(
                         meta=run_meta,
                         idempotency_key=idempotency_key,
                         idempotency_fingerprint=idem_fingerprint,
-                        **_input_edge_kwargs(image_runtime, user_parts),
+                        **_run_images._input_edge_kwargs(image_runtime, user_parts),
                         **seed_kwargs,
                         invocation=invocation,
                     )
@@ -2655,7 +1905,7 @@ async def _run_once(
                 # so discovery failures flow through the error cleanup path.
                 # _MCPDiscoveryError is caught here, mcp.error emitted, then the
                 # original cause is re-raised for the outer except Exception.
-                await _discover_runtime_tools(
+                await _run_tools._discover_runtime_tools(
                     agent, lifecycle.recorder, extra_notifier, run_id, resolved_loop, mcp_meta
                 )
 
@@ -2676,7 +1926,9 @@ async def _run_once(
                     user_parts=user_parts,
                     system_prompt=_system_prompt,
                 )
-                await _register_memory_input(image_runtime, state_store, run_id, user_parts)
+                await _run_images._register_memory_input(
+                    image_runtime, state_store, run_id, user_parts
+                )
                 image_view = await _new_run_image_view(
                     image_runtime,
                     state_store,
@@ -2717,7 +1969,7 @@ async def _run_once(
                     provider_kwargs=provider_kwargs or None,
                     output_type=output_type,
                     state_store=state_store,
-                    **_image_loop_kwargs(resolved_loop.run, image_runtime, image_view),
+                    **_run_images._image_loop_kwargs(resolved_loop.run, image_runtime, image_view),
                 )
 
                 if replay_plan is not None:
@@ -2755,7 +2007,7 @@ async def _run_once(
             raise
 
         finally:
-            _release_memory_edges(image_runtime, state_store, run_id)
+            _run_images._release_memory_edges(image_runtime, state_store, run_id)
             lifecycle._release()
             if ctx_token is not None:
                 reset_delegation_context(ctx_token)
@@ -2823,7 +2075,7 @@ async def _bind_runtime_run(
 
     async def cancel_bound(bound: Any) -> None:
         if bound.child_claim is not None:
-            await _persist_task_cancellation(
+            await _run_events._persist_task_cancellation(
                 claimed_store(store, bound.child_run_id, bound.child_claim), bound.child_run_id
             )
 
@@ -2888,7 +2140,7 @@ async def _blocked_entry_result(
 
     if history is None:
         message = Message(Role.USER, user_input, parts=parts)
-        await _record_user_trace(recorder, notifier, run_id, message)
+        await _run_images._record_user_trace(recorder, notifier, run_id, message)
     data = _blocked_data("incoming", projection.error, projection.findings, projection.location)
     await record_governance(recorder, run_id, GovernanceEventType.GUARDRAIL_BLOCKED.value, 1, data)
     warnings: list[str] = []
@@ -2915,7 +2167,7 @@ async def _create_runtime_run(
 
     async def cancel_created(created: CreateRunResult) -> None:
         if created.outcome == "created":
-            await _persist_task_cancellation(
+            await _run_events._persist_task_cancellation(
                 claimed_store(store, created.run_id, 0), created.run_id
             )
 
@@ -3101,252 +2353,6 @@ def _stream_error_meta(mcp_meta: dict[str, Any], exc: BaseException) -> dict[str
     return meta
 
 
-def _input_data(user_input: str, user_parts: tuple[ContentPart, ...] | None) -> dict[str, Any]:
-    """``agent_runs.input_data``: the text, plus raw parts for a multimodal input."""
-    if user_parts is None:
-        return {"input": user_input}
-    return {"input": user_input, PARTS_KEY: parts_to_dicts(user_parts)}
-
-
-def _input_edge_kwargs(
-    runtime: ImageRuntime | None, user_parts: tuple[ContentPart, ...] | None
-) -> dict[str, Any]:
-    """``blob_refs`` for ``create_run`` (``input`` edges), only when there are images."""
-    if runtime is None or not user_parts:
-        return {}
-    from dendrux.runtime.submit import parts_edges
-
-    edges = parts_edges(
-        user_parts, tenant_scope=runtime.tenant_scope, owner_kind="input", owner_id="input"
-    )
-    if not edges:
-        return {}
-    return {"blob_refs": edges, "blob_refs_scope": runtime.tenant_scope}
-
-
-def _stored_parts(raw: Any) -> tuple[ContentPart, ...] | None:
-    """Parts persisted as dicts, or None when absent or text-only."""
-    if not isinstance(raw, list) or not raw:
-        return None
-    parts = tuple(content_part_from_dict(d) for d in raw)
-    return parts if any(isinstance(p, ImagePart) for p in parts) else None
-
-
-async def _idempotent_hit_after_image_error(
-    exc: Exception,
-    store: StateStore | None,
-    idempotency_key: str | None,
-    *,
-    tenant_id: str | None,
-    agent_name: str,
-    user_input: str,
-    items: tuple[Any, ...],
-    history: list[ChatMessage] | None,
-    output_type: type | None,
-    context: list[ContextBlock] | None,
-    replay: dict[str, Any] | None,
-    skills: Any,
-    entry_projection: _EntryProjection | None = None,
-    skill_session: SkillSession | None = None,
-) -> Any:
-    """The existing run of a keyed request whose image was purged or is gone since.
-
-    Ingest runs before the idempotency lookup, so a retried keyed request whose
-    image has since been purged cannot be re-validated. When the key's run
-    stored the same input (same text items, same image positions, same
-    caller-given refs), the fingerprint is rebuilt from that run's stored
-    descriptors and the store's normal idempotency check decides (cached
-    terminal result / active / conflict). Image bytes that can no longer be
-    read cannot be compared, so a request differing only in which purged
-    image it sends is treated as the same request (documented).
-    """
-    purged = isinstance(exc, InvalidImageError) and exc.reason == "purged"
-    if (
-        idempotency_key is None
-        or store is None
-        or not (purged or isinstance(exc, BlobNotFoundError))
-    ):
-        return None
-    if history_has_images(history) or not items:
-        return None
-    check = getattr(store, "_check_idempotency", None)
-    if check is None:
-        return None
-    try:
-        existing = await check(idempotency_key, "", tenant_id=tenant_id)
-    except IdempotencyConflictError as found:
-        existing_id = found.run_id
-    else:
-        return existing
-    conflict = IdempotencyConflictError(run_id=existing_id, idempotency_key=idempotency_key)
-    if existing_id is None:  # the existing run is not disclosed (another tenant)
-        raise conflict
-    record = await store.get_run(existing_id)
-    stored = _stored_parts((record.input_data or {}).get(PARTS_KEY)) if record else None
-    if stored is None or len(stored) != len(items):
-        raise conflict
-    candidate = _image_retry_parts(items, stored, conflict)
-    normalized_history = normalize_chat_history(history)
-    if entry_projection is not None:
-        (
-            _,
-            normalized_history,
-            context,
-            user_input,
-            projected_parts,
-        ) = await entry_projection.prepare(
-            normalized_history, context, user_input, tuple(candidate), skill_session
-        )
-        if projected_parts is None:
-            raise conflict
-        candidate = list(projected_parts)
-    if any(
-        isinstance(part, TextPart) and part != previous
-        for part, previous in zip(candidate, stored, strict=True)
-    ):
-        raise conflict
-    fingerprint = compute_idempotency_fingerprint(
-        agent_name,
-        user_input,
-        output_type_name=(
-            f"{output_type.__module__}.{output_type.__qualname__}" if output_type else None
-        ),
-        history=normalized_history or None,
-        context=context or None,
-        replay=replay,
-        skills=skills,
-        user_input_parts=candidate,
-    )
-    return await check(idempotency_key, fingerprint, tenant_id=tenant_id)
-
-
-def _image_retry_parts(
-    items: tuple[Any, ...], stored: tuple[ContentPart, ...], conflict: IdempotencyConflictError
-) -> list[ContentPart]:
-    candidate: list[ContentPart] = []
-    for item, part in zip(items, stored, strict=True):
-        if isinstance(item, str):
-            if not isinstance(part, TextPart):
-                raise conflict
-            candidate.append(TextPart(item))
-            continue
-        if not isinstance(part, ImagePart):
-            raise conflict
-        ref = getattr(item, "ref", item)
-        if isinstance(ref, ImageRef) and ref.sha256 != part.ref.sha256:
-            raise conflict
-        candidate.append(ImagePart(part.ref, detail=getattr(item, "detail", None)))
-    return candidate
-
-
-def _replay_sources(replay_runs: Sequence[Any]) -> list[tuple[str, str | None, Any]]:
-    """``(run_id, tenant_id, meta)`` of each replayed run, in order."""
-    return [(r.record.id, r.record.tenant_id, r.record.meta) for r in replay_runs]
-
-
-def _replay_has_images(replay_runs: Sequence[Any]) -> bool:
-    """Whether any replayed run's input or traces carry image parts."""
-    for run in replay_runs:
-        if _stored_parts((run.record.input_data or {}).get(PARTS_KEY)) is not None:
-            return True
-        if any(_stored_parts((t.meta or {}).get(PARTS_KEY)) is not None for t in run.traces):
-            return True
-    return False
-
-
-def _single_full_source(plan: ReplayPlan | None) -> bool:
-    """Exactly one replayed run, seeded in full (its slots map 1:1)."""
-    return plan is not None and len(plan.summary.runs_full) == 1 and not plan.summary.runs_text
-
-
-async def _read_cancel_winner(
-    store: StateStore, run_id: str, *, safe: bool = False
-) -> RunRecord | None:
-    try:
-        return await store.get_run(run_id)
-    except Exception:
-        if not safe:
-            raise
-        return None
-
-
-async def _persist_run_cancellation(
-    store: StateStore,
-    run_id: str,
-    payload: dict[str, Any],
-    *,
-    on_won: Callable[[], None],
-    answer: str | None | _OmittedType = _OMITTED,
-    emit_event: bool = True,
-    read_on_loss: Callable[[], bool] | None = None,
-    safe_read: bool = False,
-) -> tuple[bool, RunRecord | None]:
-    kwargs: dict[str, Any] = {} if isinstance(answer, _OmittedType) else {"answer": answer}
-    won, needs_event = await _finalize_running_event(
-        store,
-        run_id,
-        RunStatus.CANCELLED.value,
-        StoredEventType.RUN_CANCELLED.value,
-        payload,
-        emit_event=emit_event,
-        **kwargs,
-    )
-    if won:
-        # Remember the committed CAS even if the separate event write raises.
-        on_won()
-        if needs_event:
-            await _emit_event(store, run_id, StoredEventType.RUN_CANCELLED.value, payload)
-        return True, None
-    record = None
-    if read_on_loss is None or read_on_loss():
-        record = await _read_cancel_winner(store, run_id, safe=safe_read)
-    return False, record
-
-
-async def _persist_task_cancellation(
-    state_store: StateStore | None,
-    run_id: str,
-    *,
-    interrupted: bool = False,
-) -> RunResult:
-    """Finalize a still-RUNNING run as CANCELLED after its task was cancelled.
-
-    ``interrupted`` marks a ``cancel_run`` interrupt of a batch ``run()``:
-    the result and the ``run.cancelled`` event carry ``interrupted=True`` and
-    ``partial_output=False`` (a batch provider call has no partial text).
-    """
-    from dendrux.types import RunResult
-
-    interrupt_meta = {"interrupted": True, "partial_output": False} if interrupted else {}
-    result = RunResult(
-        run_id=run_id,
-        status=RunStatus.CANCELLED,
-        meta={**interrupt_meta, CANCEL_PERSISTED_META_KEY: False},
-    )
-    if state_store is None:
-        return result
-    try:
-        won, record = await _persist_run_cancellation(
-            state_store,
-            run_id,
-            {"reason": CancelReason.CANCEL_REQUESTED.value, **interrupt_meta}
-            if interrupted
-            else {"reason": CancelReason.TASK_CANCELLED.value},
-            on_won=lambda: result.meta.update({CANCEL_PERSISTED_META_KEY: True}),
-        )
-        if won:
-            await _attach_undelivered_notes(state_store, run_id, result)
-        elif record is not None:
-            result = await _run_pending._build_cached_result(state_store, run_id)
-            if result.status == RunStatus.CANCELLED:
-                result.meta[CANCEL_PERSISTED_META_KEY] = True
-        # No row: cancelled before create_run committed, or while resolving an
-        # idempotent hit under the provisional id. Nothing to finalize.
-    except Exception:
-        _codes.log_code(logger, _codes.CANCEL_PERSIST_FAILED, run_id=run_id)
-    return result
-
-
 async def _check_retry_source(
     state_store: StateStore, source_run: RunRecord, original_run_id: str
 ) -> None:
@@ -3416,7 +2422,7 @@ def _retry_source_input(source_run: RunRecord, traces: Any) -> tuple[Any, Any, A
     users = [t for t in traces if t.role == "user"]
     raw_user = next((t for t in users if not (t.meta or {}).get(SEED_PREFIX_META_KEY)), users[0])
     user_input = (source_run.input_data or {}).get("input", raw_user.content)
-    source_parts = _stored_parts((source_run.input_data or {}).get(PARTS_KEY))
+    source_parts = _run_images._stored_parts((source_run.input_data or {}).get(PARTS_KEY))
 
     return user_input, source_parts, raw_user, users
 
@@ -3517,11 +2523,11 @@ def _retry_media(
     history: list[Message],
     replay: list[Any],
 ) -> ImageRuntime | None:
-    if parts is not None or has_images(history) or _replay_has_images(replay):
-        _require_image_loop(loop)
+    if parts is not None or has_images(history) or _run_images._replay_has_images(replay):
+        _run_images._require_image_loop(loop)
     elif not _run_contracts._accepts_kwarg(loop.run, "image_runtime"):
         return None
-    return _image_runtime(agent, store, tenant, run_id)
+    return _run_images._image_runtime(agent, store, tenant, run_id)
 
 
 async def _retry_edges(
@@ -3529,7 +2535,9 @@ async def _retry_edges(
 ) -> dict[str, Any]:
     if parts is None or runtime is None:
         return {}
-    live = await _live_edges(runtime, _input_edge_kwargs(runtime, parts).get("blob_refs", []))
+    live = await _run_images._live_edges(
+        runtime, _run_images._input_edge_kwargs(runtime, parts).get("blob_refs", [])
+    )
     return {"blob_refs": live, "blob_refs_scope": runtime.tenant_scope} if live else {}
 
 
@@ -3584,13 +2592,13 @@ async def _start_retry_history(
         seeded_image_slots=None if explicit and seeded_slots else seeded_slots,
     )
     # A retry has no new input: every seeded slot counts as sent.
-    image_view = await _start_image_view(
+    image_view = await _run_images._start_image_view(
         image_runtime,
         store,
         run_id,
         seeded=history,
         sources=[
-            *_replay_sources(replay_runs),
+            *_run_images._replay_sources(replay_runs),
             (original_run_id, source.tenant_id, source.meta),
         ],
         single_full=replay_plan is None,
@@ -3652,7 +2660,6 @@ async def retry(
     tenant_explicit = _tenant_scope_chosen(tenant_id)
     tenant_id = resolve_runner_tenant(agent, "retry", tenant_id, state_store=state_store)
     await ensure_agent_limits_fit(agent, state_store)
-
     tenant_id = resolve_child_tenant(_context.get_delegation_context(), tenant_id)
     runner_entry_checks(
         agent,
@@ -3668,9 +2675,8 @@ async def retry(
     skill_session = SkillSession.prepare(agent, loop=_new_run_loop(agent, loop), explicit=explicit)
     with skill_session.bind():
         await _check_retry_source(state_store, source_run, original_run_id)
-
         resolved_loop = _new_run_loop(agent, loop)
-        _validate_loop_skill_compat(agent, resolved_loop)
+        _run_tools._validate_loop_skill_compat(agent, resolved_loop)
 
         # 3. Blocked-content admission for the retried run and its runs= sources
         #    (R1.8), then the same runs, same knobs, before any history is rebuilt.
@@ -3750,7 +2756,7 @@ async def retry(
                     resolved_loop,
                     run_id,
                     agent.name,
-                    input_data=_input_data(user_input, source_parts),
+                    input_data=_run_images._input_data(user_input, source_parts),
                     model=provider.model,
                     strategy=type(resolved_strategy).__name__,
                     parent_run_id=parent_run_id,
@@ -3794,7 +2800,7 @@ async def retry(
                 )
                 ctx_token = set_delegation_context(this_ctx)
 
-                await _discover_runtime_tools(
+                await _run_tools._discover_runtime_tools(
                     agent, lifecycle.recorder, extra_notifier, run_id, resolved_loop, mcp_meta
                 )
 
@@ -3822,7 +2828,9 @@ async def retry(
                         retry_context,
                         session=skill_session,
                     )
-                    await _record_user_trace(lifecycle.recorder, extra_notifier, run_id, trace_user)
+                    await _run_images._record_user_trace(
+                        lifecycle.recorder, extra_notifier, run_id, trace_user
+                    )
 
                 result = await resolved_loop.run(
                     agent=agent,
@@ -3835,7 +2843,7 @@ async def retry(
                     initial_history=initial_history,
                     provider_kwargs=provider_kwargs or None,
                     state_store=state_store,
-                    **_image_loop_kwargs(resolved_loop.run, image_runtime, image_view),
+                    **_run_images._image_loop_kwargs(resolved_loop.run, image_runtime, image_view),
                 )
 
                 if replay_plan is not None:
@@ -3869,7 +2877,7 @@ async def retry(
             raise
 
         finally:
-            _release_memory_edges(image_runtime, state_store, run_id)
+            _run_images._release_memory_edges(image_runtime, state_store, run_id)
             lifecycle._release()
             if ctx_token is not None:
                 reset_delegation_context(ctx_token)
@@ -4085,9 +3093,9 @@ def run_stream(
     normalized_history = [] if image_input else normalize_chat_history(history)
     resolved_strategy = strategy or NativeToolCalling()
     resolved_loop = _new_run_loop(agent, loop)
-    _validate_loop_skill_compat(agent, resolved_loop)
+    _run_tools._validate_loop_skill_compat(agent, resolved_loop)
     if image_input:
-        _require_image_loop(resolved_loop, "run_stream")
+        _run_images._require_image_loop(resolved_loop, "run_stream")
     replay_req = validate_replay_args(
         runs, replay_last, replay_reasoning, loop=resolved_loop, context=context
     )
@@ -4137,7 +3145,6 @@ def run_stream(
         image_runtime: ImageRuntime | None = None
         user_parts: tuple[ContentPart, ...] | None = None
         history_messages = normalized_history
-
         # Entry checks after tenant inheritance, before any I/O. Like image
         # setup they raise (no RUN_ERROR event, no run row, no hooks). A child
         # whose explicit tenant differs from its parent's still fails later, as
@@ -4157,7 +3164,6 @@ def run_stream(
             idempotency_key=idempotency_key,
             provider=provider,
         )
-
         if image_input:
             # Image setup raises (no RUN_ERROR event, no run row, no hooks).
             _shared["existing_run"] = True
@@ -4166,7 +3172,7 @@ def run_stream(
             )
             await ensure_agent_limits_fit(agent, store)
             _shared["state_store"] = store
-            image_runtime, user_parts, history_messages, cached = await _entry_media(
+            image_runtime, user_parts, history_messages, cached = await _run_images._entry_media(
                 agent,
                 provider,
                 resolved_loop,
@@ -4213,7 +3219,7 @@ def run_stream(
             if image_runtime is None and _run_contracts._accepts_kwarg(
                 resolved_loop.run_stream, "image_runtime"
             ):
-                image_runtime = _image_runtime(agent, store, eff_tenant, run_id)
+                image_runtime = _run_images._image_runtime(agent, store, eff_tenant, run_id)
 
             # Resolve system prompt BEFORE create_run() so skill loading
             # failures don't leave a DB row stuck in running.
@@ -4266,7 +3272,7 @@ def run_stream(
                         resolved_loop,
                         run_id,
                         agent.name,
-                        input_data=_input_data(user_input, user_parts),
+                        input_data=_run_images._input_data(user_input, user_parts),
                         model=provider.model,
                         strategy=type(resolved_strategy).__name__,
                         parent_run_id=parent_run_id,
@@ -4275,7 +3281,7 @@ def run_stream(
                         meta=run_meta,
                         idempotency_key=idempotency_key,
                         idempotency_fingerprint=fingerprint,
-                        **_input_edge_kwargs(image_runtime, user_parts),
+                        **_run_images._input_edge_kwargs(image_runtime, user_parts),
                         **seed_kwargs,
                         invocation=invocation,
                     )
@@ -4339,7 +3345,7 @@ def run_stream(
 
             yield RunEvent(type=RunEventType.RUN_STARTED, run_id=run_id)
 
-            await _discover_runtime_tools(
+            await _run_tools._discover_runtime_tools(
                 agent, startup.recorder, extra_notifier, run_id, resolved_loop, mcp_meta
             )
 
@@ -4359,7 +3365,7 @@ def run_stream(
                 seeded_history=seeded_history,
                 user_parts=user_parts,
             )
-            await _register_memory_input(image_runtime, store, run_id, user_parts)
+            await _run_images._register_memory_input(image_runtime, store, run_id, user_parts)
             image_view = await _new_run_image_view(
                 image_runtime, store, run_id, seeded_history, replay_runs, replay_plan, user_parts
             )
@@ -4396,7 +3402,9 @@ def run_stream(
                 output_type=output_type,
                 state_store=store,
                 interrupt=interrupt,
-                **_image_loop_kwargs(resolved_loop.run_stream, image_runtime, image_view),
+                **_run_images._image_loop_kwargs(
+                    resolved_loop.run_stream, image_runtime, image_view
+                ),
             )
             async with aclosing(
                 _stream_loop_events(
@@ -4417,7 +3425,7 @@ def run_stream(
 
         except (ManagedRootStoppedError, RunFencedError) as stop:
             result = await startup._stopped(stop, startup.recorder, extra_notifier)
-            yield _fenced_stream_event(run_id, result)
+            yield _run_events._fenced_stream_event(run_id, result)
 
         except Exception as exc:
             # Before its bind a managed child is not a run: the driver decides
@@ -4439,7 +3447,7 @@ def run_stream(
                 error=_run_errors._safe_error(exc),
             )
         finally:
-            _release_memory_edges(image_runtime, store, run_id)
+            _run_images._release_memory_edges(image_runtime, store, run_id)
             if not _shared.get("existing_run"):
                 agent._task_manager.release_interrupt(run_id)
 
@@ -4476,7 +3484,7 @@ def run_stream(
         partial_answer = _partial_answer(_shared)
         if store is not None:
             try:
-                cancel_won, persisted_row = await _persist_run_cancellation(
+                cancel_won, persisted_row = await _run_events._persist_run_cancellation(
                     store,
                     run_id,
                     {
@@ -4519,8 +3527,8 @@ def run_stream(
                 meta={**deepcopy(mcp_meta), CANCEL_PERSISTED_META_KEY: cancel_persisted},
             )
             try:
-                await record_run_finished(cleanup_recorder, run_id, cancelled_result)
-                await notify_run_finished(_shared.get("notifier"), run_id, cancelled_result)
+                await _hooks.record_run_finished(cleanup_recorder, run_id, cancelled_result)
+                await _hooks.notify_run_finished(_shared.get("notifier"), run_id, cancelled_result)
             except Exception:
                 logger.warning(
                     "Lifecycle finish hooks failed during stream cleanup for run %s",
@@ -4534,7 +3542,7 @@ def run_stream(
     stream = _RunStream(
         run_id=run_id,
         generator=stream_context.wrap(_generate()),
-        cleanup=lambda: _shielded_cleanup(_cleanup, run_id=run_id),
+        cleanup=lambda: _run_events._shielded_cleanup(_cleanup, run_id=run_id),
     )
     return stream
 
@@ -4836,7 +3844,7 @@ async def _prepare_resume(
 
     resolved_strategy = strategy or NativeToolCalling()
     resolved_loop = loop or agent.loop or ReActLoop()
-    _validate_loop_skill_compat(agent, resolved_loop)
+    _run_tools._validate_loop_skill_compat(agent, resolved_loop)
 
     from dendrux.runtime._continuation_guardrails import _submission_evidence
 
@@ -4845,7 +3853,7 @@ async def _prepare_resume(
         run_id,
         submission_projection is not None and submission_projection.block is not None,
     ):
-        await _emit_event(
+        await _run_events._emit_event(
             state_store,
             run_id,
             StoredEventType.RUN_RESUMED.value,
@@ -4897,7 +3905,7 @@ async def _prepare_resume(
         target_lookup=target_lookup,
         initial_order_index=trace_order_offset,
         guardrail_engine=run_guardrails,
-        **_recorder_image_kwargs(tenant_id, provider),
+        **_run_images._recorder_image_kwargs(tenant_id, provider),
     )
 
     await _managed_budget.restore_recorder(recorder, agent, history_records, recovering)
@@ -4908,7 +3916,7 @@ async def _prepare_resume(
     # fires them inside its own try/except so a failure during replay still
     # pairs with on_run_failed. See _replay_resume_injected_history below.
 
-    await _emit_declared_tools(agent, recorder, extra_notifier, run_id)
+    await _run_tools._emit_declared_tools(agent, recorder, extra_notifier, run_id)
     return _run_contracts._ResumeContext(
         history=history,
         recorder=recorder,
@@ -5065,7 +4073,7 @@ async def _project_adopted_submission(
         if tool_results is not None
         else None,
         clean.get("submitted_user_input"),
-        _stored_parts(clean.get("submitted_user_parts")),
+        _run_images._stored_parts(clean.get("submitted_user_parts")),
         deserialize_decisions(clean["submitted_decisions"]) if decisions is not None else None,
         projection,
     )
@@ -5545,7 +4553,7 @@ async def _execute_approved_tools(
                 tool_result_transform=agent.tool_result_transform,
                 tenant_id=None,
                 **dispatch_policy(name=tc.name, phase="approved"),
-                **_tool_image_kwargs(_process_tool_calls, image_runtime),
+                **_run_images._tool_image_kwargs(_process_tool_calls, image_runtime),
             )
             results.extend(outcome_s.all_results)
             continue
@@ -5573,7 +4581,7 @@ async def _execute_approved_tools(
                     lookups,
                     agent.tool_result_transform,
                     run_id=run_id,
-                    **_tool_image_kwargs(_execute_tool, image_runtime),
+                    **_run_images._tool_image_kwargs(_execute_tool, image_runtime),
                 )
         else:
             tr = invalid_result
@@ -5640,7 +4648,7 @@ def _approval_stop_result(
         image_view=pause_state.image_view,
     )
     client_pause = _carry_budget_fields(client_pause, pause_state)
-    client_pause = _carry_image_view(client_pause, pause_state)
+    client_pause = _run_images._carry_image_view(client_pause, pause_state)
     return RunResult(
         run_id=run_id,
         status=RunStatus.WAITING_CLIENT_TOOL,
@@ -5740,7 +4748,7 @@ def _barrier_pause_result(
         image_view=pause_state.image_view,
     )
     pause = _carry_budget_fields(pause, pause_state)
-    pause = _carry_image_view(pause, pause_state)
+    pause = _run_images._carry_image_view(pause, pause_state)
     return RunResult(
         run_id=run_id,
         status=RunStatus.PAUSED,
@@ -5763,241 +4771,6 @@ def _pending_decision_map(pause_state: PauseState) -> dict[str, ApprovalDecision
         )
         for call_id, d in pause_state.pending_decisions.items()
     }
-
-
-async def _ingest_resume_images(
-    agent: Agent,
-    provider: LLMProvider,
-    state_store: StateStore,
-    run_id: str,
-    *,
-    loop: Loop | None,
-    tool_results: list[ToolResult] | None,
-    input_items: tuple[Any, ...],
-    loop_method: str = "run",
-) -> tuple[list[ToolResult] | None, tuple[ContentPart, ...] | None]:
-    """Ingest resume-time images (direct ``resume`` / ``resume_stream``) before the claim.
-
-    The run, its pause status and the submitted call ids are checked first,
-    so a resume that cannot claim writes no blob.
-    """
-    from dendrux.errors import RunNotFoundError
-    from dendrux.runtime.submit import (
-        check_new_image_capability,
-        ingest_tool_result_images,
-        ingest_user_items,
-    )
-
-    _require_image_loop(loop or agent.loop or ReActLoop(), loop_method)
-    record = await state_store.get_run(run_id)
-    if record is None:
-        raise RunNotFoundError(run_id)
-    allowed = (
-        RESUME_RESULTS_STATUS_VALUES if tool_results is not None else RESUME_INPUT_STATUS_VALUES
-    )
-    if record.status not in allowed:
-        await _run_pending._raise_resume_claim_failure(state_store, run_id, allowed[0])
-    if tool_results is not None:
-        raw_pause = await state_store.get_pause_state(run_id)
-        if raw_pause is None:
-            raise ValueError(f"Run '{run_id}' has no pause state — cannot resume.")
-        pending_ids = {tc["id"] for tc in raw_pause.get("pending_tool_calls", [])}
-        provided_ids = {tr.call_id for tr in tool_results}
-        if provided_ids != pending_ids:
-            raise ValueError(
-                f"Tool result call_ids {provided_ids} do not match "
-                f"pending tool call_ids {pending_ids}."
-            )
-    runtime = _image_runtime(agent, state_store, record.tenant_id, run_id)
-    if input_items:
-        count = sum(1 for item in input_items if not isinstance(item, str))
-
-        async def _user_capability() -> None:
-            await check_new_image_capability(
-                provider, provider.model, runtime.policy, image_count=count, origin="user"
-            )
-
-        return tool_results, await ingest_user_items(
-            input_items, runtime=runtime, before_store=_user_capability
-        )
-    assert tool_results is not None
-    count = sum(len(tr.images) for tr in tool_results)
-
-    async def _tool_capability() -> None:
-        await check_new_image_capability(
-            provider, provider.model, runtime.policy, image_count=count, origin="client_tool"
-        )
-
-    return (
-        await ingest_tool_result_images(
-            tool_results, runtime=runtime, before_store=_tool_capability
-        ),
-        None,
-    )
-
-
-async def _submit_image_runtime(
-    agent: Agent, store: StateStore, run_id: str, expected_status: RunStatus
-) -> ImageRuntime:
-    """Runtime for a submit: status preflight first, so a bad run stores nothing."""
-    from dendrux.runtime.submit import preflight_status
-
-    await preflight_status(store, run_id, expected_status)
-    record = await store.get_run(run_id)
-    return _image_runtime(agent, store, record.tenant_id if record else None, run_id)
-
-
-async def ingest_submitted_tool_images(
-    agent: Agent,
-    provider: LLMProvider,
-    store: StateStore,
-    run_id: str,
-    pause: PauseState,
-    results: list[ToolResult],
-) -> tuple[list[ToolResult], dict[str, Any]]:
-    """Ingest client-tool images before the claim; return results + claim edge kwargs.
-
-    Internal helper for :meth:`Agent.submit_tool_results`. Submission edges
-    (``f"{pause.iteration}:{call_id}"``) are written in the claim transaction.
-    """
-    from dendrux.runtime.submit import (
-        check_new_image_capability,
-        ingest_tool_result_images,
-        tool_result_edges,
-    )
-
-    runtime = await _submit_image_runtime(agent, store, run_id, RunStatus.WAITING_CLIENT_TOOL)
-    count = sum(len(r.images) for r in results)
-
-    async def _capability() -> None:
-        await check_new_image_capability(
-            provider, provider.model, runtime.policy, image_count=count, origin="client_tool"
-        )
-
-    ingested = await ingest_tool_result_images(results, runtime=runtime, before_store=_capability)
-    edges = tool_result_edges(
-        ingested, tenant_scope=runtime.tenant_scope, iteration=pause.iteration
-    )
-    return ingested, {
-        "blob_refs": edges,
-        "blob_refs_scope": runtime.tenant_scope,
-        "validate": _same_pause(run_id, pause.iteration),
-    }
-
-
-def _same_pause(run_id: str, iteration: int) -> Callable[[dict[str, Any]], None]:
-    """Claim-time check that the pause is the one whose iteration keyed the submission edges."""
-
-    def _check(pause_data: dict[str, Any]) -> None:
-        if pause_data.get("iteration") != iteration:
-            from dendrux.errors import RunAlreadyClaimedError
-
-            raise RunAlreadyClaimedError(run_id)
-
-    return _check
-
-
-async def ingest_submitted_user_parts(
-    agent: Agent,
-    provider: LLMProvider,
-    store: StateStore,
-    run_id: str,
-    projection: str,
-    items: tuple[Any, ...],
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Ingest ``submit_input`` images before the claim; return submitted data + edge kwargs.
-
-    ``submitted_user_input`` keeps the text projection; the parts go to
-    ``submitted_user_parts`` with ``f"{pause.iteration}:input"`` edges.
-    """
-    from dendrux.runtime.submit import (
-        check_new_image_capability,
-        ingest_user_items,
-        parts_edges,
-        raise_for_non_paused_status,
-    )
-
-    runtime = await _submit_image_runtime(agent, store, run_id, RunStatus.WAITING_HUMAN_INPUT)
-    raw_pause = await store.get_pause_state(run_id)
-    if raw_pause is None:
-        await raise_for_non_paused_status(store, run_id)
-    iteration = int(raw_pause.get("iteration") or 0)
-    count = sum(1 for item in items if not isinstance(item, str))
-
-    async def _capability() -> None:
-        await check_new_image_capability(
-            provider, provider.model, runtime.policy, image_count=count, origin="user"
-        )
-
-    parts = await ingest_user_items(items, runtime=runtime, before_store=_capability)
-    edges = parts_edges(
-        parts,
-        tenant_scope=runtime.tenant_scope,
-        owner_kind="submission",
-        owner_id=f"{iteration}:input",
-    )
-    submitted = {"submitted_user_input": projection, "submitted_user_parts": parts_to_dicts(parts)}
-    return submitted, {
-        "blob_refs": edges,
-        "blob_refs_scope": runtime.tenant_scope,
-        "validate": _same_pause(run_id, iteration),
-    }
-
-
-def _fenced_stream_event(run_id: str, result: RunResult) -> RunEvent:
-    from dataclasses import replace
-
-    from dendrux.types import RunEvent, RunEventType
-
-    types = {
-        RunStatus.ERROR: RunEventType.RUN_ERROR,
-        RunStatus.CANCELLED: RunEventType.RUN_CANCELLED,
-        RunStatus.SUCCESS: RunEventType.RUN_COMPLETED,
-        RunStatus.MAX_ITERATIONS: RunEventType.RUN_COMPLETED,
-        RunStatus.PAUSED: RunEventType.RUN_PAUSED,
-        RunStatus.WAITING_CLIENT_TOOL: RunEventType.RUN_PAUSED,
-        RunStatus.WAITING_APPROVAL: RunEventType.RUN_PAUSED,
-        RunStatus.WAITING_HUMAN_INPUT: RunEventType.RUN_PAUSED,
-    }
-    if result.status not in types:
-        info = ErrorInfo(
-            category="run_fenced",
-            retryable=False,
-            safe_message="Execution ownership changed; read the run's current state.",
-            error_type="RunFencedError",
-        )
-        return RunEvent(
-            type=RunEventType.RUN_ERROR,
-            run_id=run_id,
-            run_result=replace(result, error_info=info),
-            error=info.safe_message,
-        )
-    return RunEvent(
-        type=types[result.status],
-        run_id=run_id,
-        run_result=result,
-        error=result.error if result.status == RunStatus.ERROR else None,
-    )
-
-
-async def _finish_fenced_lifecycle(
-    run_id: str,
-    result: RunResult,
-    recorder: LoopRecorder | None,
-    notifier: LoopNotifier | None,
-) -> None:
-    """Close local lifecycle sinks with the persisted winner, without a status write."""
-    try:
-        await record_run_finished(recorder, run_id, result)
-    except Exception:
-        _codes.log_code(logger, _codes.FENCED_FINISH_FAILED, run_id=run_id)
-    await notify_run_finished(notifier, run_id, result)
-
-
-async def _check_claim(store: StateStore, run_id: str) -> None:
-    getter = getattr(store, "get_run_control", None)
-    if getter is not None:
-        await getter(run_id)
 
 
 def _canonicalize_legacy_denials(
@@ -6168,18 +4941,6 @@ async def _release_claim(store: StateStore, run_id: str, status: str) -> bool:
         raise
 
 
-async def _shielded_cleanup(cleanup: Callable[[], Any], *, run_id: str | None = None) -> Any:
-    import anyio
-
-    from dendrux.runtime.tasks import _drain_cleanup
-
-    result, cancellation = await _drain_cleanup(cleanup(), run_id=run_id)
-    if cancellation is not None:
-        raise cancellation
-    await anyio.lowlevel.checkpoint_if_cancelled()
-    return result
-
-
 @asynccontextmanager
 async def _release_setup_failure(
     store: StateStore, run_id: str, status: str, *, enabled: bool = True
@@ -6333,7 +5094,7 @@ async def _resume_submission(
         if not skip_claim:
             tool_results = await prepare_resume_results(agent, store, run_id, pause, tool_results)
     if not skip_claim and (input_items or any(tr.images for tr in tool_results or ())):
-        tool_results, user_parts = await _ingest_resume_images(
+        tool_results, user_parts = await _run_images._ingest_resume_images(
             agent,
             provider,
             store,
@@ -6579,8 +5340,8 @@ def _resumed_loop_kwargs(
     loop_method: Any,
 ) -> dict[str, Any]:
     carry = _budget_carry_kwargs(loop_method, ctx.pause_state)
-    images = _image_loop_kwargs(
-        loop_method, image_runtime, _resume_image_view(ctx.pause_state, ctx.history)
+    images = _run_images._image_loop_kwargs(
+        loop_method, image_runtime, _run_images._resume_image_view(ctx.pause_state, ctx.history)
     )
     return dict(
         agent=agent,
@@ -6622,17 +5383,17 @@ async def _run_resumed_loop(
 async def _cancel_resumed_run(
     agent: Agent, store: StateStore, run_id: str, ctx: _run_contracts._ResumeContext | None
 ) -> tuple[RunResult, bool]:
-    interrupted, swallow = _take_task_interrupt(agent._task_manager, run_id)
-    result = await _drain_task_cancellation(store, run_id, interrupted)
+    interrupted, swallow = _run_events._take_task_interrupt(agent._task_manager, run_id)
+    result = await _run_events._drain_task_cancellation(store, run_id, interrupted)
     if ctx is not None:
         try:
-            await record_run_finished(ctx.recorder, run_id, result)
+            await _hooks.record_run_finished(ctx.recorder, run_id, result)
         except Exception:
             logger.warning(
                 "Recorder finish failed for run %s", run_id, exc_info=safe_exception_info()
             )
-        await notify_run_finished(ctx.notifier, run_id, result)
-    return result, _may_swallow_cancellation(swallow)
+        await _hooks.notify_run_finished(ctx.notifier, run_id, result)
+    return result, _run_events._may_swallow_cancellation(swallow)
 
 
 async def _resume_failure_hooks(
@@ -6683,13 +5444,13 @@ async def _released_resume_hooks(
     )
     if ctx.recorder_started:
         try:
-            await record_run_finished(ctx.recorder, run_id, result)
+            await _hooks.record_run_finished(ctx.recorder, run_id, result)
         except Exception:
             logger.warning(
                 "Recorder finish failed for run %s", run_id, exc_info=safe_exception_info()
             )
     if ctx.notifier_started:
-        await notify_run_finished(ctx.notifier, run_id, result)
+        await _hooks.notify_run_finished(ctx.notifier, run_id, result)
     return outcome
 
 
@@ -6733,7 +5494,7 @@ async def _fenced_resume_result(
 ) -> RunResult:
     result = await _run_pending._build_cached_result(store, run_id)
     if ctx is not None:
-        await _finish_fenced_lifecycle(run_id, result, ctx.recorder, ctx.notifier)
+        await _run_events._finish_fenced_lifecycle(run_id, result, ctx.recorder, ctx.notifier)
     return result
 
 
@@ -6805,7 +5566,7 @@ async def _stop_marked_continuation(
 
     terminal: dict[str, Any] = {} if iteration is None else {"iteration_count": iteration}
     try:
-        await _emit_event(
+        await _run_events._emit_event(
             store,
             run_id,
             GovernanceEventType.GUARDRAIL_BLOCKED.value,
@@ -7007,7 +5768,7 @@ async def _resume_core(
                 recovering=recovering,
             )
             progress.submission = getattr(ctx.recorder, "_loop_state", {}).get("submission")
-            image_runtime = _image_runtime(agent, state_store, run_tenant, run_id)
+            image_runtime = _run_images._image_runtime(agent, state_store, run_tenant, run_id)
 
             # 8a. Fire run-level lifecycle hooks. AFTER this point, any failure
             #     must close the lifecycle pair in the except handler.
@@ -7026,7 +5787,7 @@ async def _resume_core(
             )
 
             await agent.get_tool_lookups(loop=ctx.resolved_loop)
-            mcp_meta.update(_snapshot_mcp_meta(agent))
+            mcp_meta.update(_run_tools._snapshot_mcp_meta(agent))
 
             # 8b. tool/user-input history. Inside the try so
             #     a recorder failure here fires on_run_failed.
@@ -7153,7 +5914,7 @@ async def _stream_resume_images(
             agent, store, run_id, media_pause, stream_results
         )
         results_prepared = True
-    stream_results, user_parts = await _ingest_resume_images(
+    stream_results, user_parts = await _run_images._ingest_resume_images(
         agent,
         provider,
         store,
@@ -7475,8 +6236,8 @@ async def _finish_resume_stream_cleanup(
         meta={**deepcopy(mcp_meta), CANCEL_PERSISTED_META_KEY: cancel_persisted},
     )
     try:
-        await record_run_finished(cleanup_recorder, run_id, cancelled_result)
-        await notify_run_finished(_shared.get("notifier"), run_id, cancelled_result)
+        await _hooks.record_run_finished(cleanup_recorder, run_id, cancelled_result)
+        await _hooks.notify_run_finished(_shared.get("notifier"), run_id, cancelled_result)
     except Exception:
         logger.warning(
             "Lifecycle finish hooks failed during resume stream cleanup for run %s",
@@ -7586,7 +6347,7 @@ def resume_stream(
                 user_parts=user_parts,
             )
             if claim.stopped is not None:
-                yield _fenced_stream_event(run_id, claim.stopped)
+                yield _run_events._fenced_stream_event(run_id, claim.stopped)
                 return
             store, run_record, reads, raw_pause = (
                 claim.store,
@@ -7623,7 +6384,7 @@ def resume_stream(
                 history_records=reads.history_records,
                 pause_data=raw_pause,
             )
-            image_runtime = _image_runtime(agent, store, run_tenant, run_id)
+            image_runtime = _run_images._image_runtime(agent, store, run_tenant, run_id)
             _shared["ctx"] = ctx
             progress.submission = getattr(ctx.recorder, "_loop_state", {}).get("submission")
 
@@ -7649,7 +6410,7 @@ def resume_stream(
             _shared["notifier"] = ctx.notifier
 
             await agent.get_tool_lookups(loop=ctx.resolved_loop)
-            mcp_meta.update(_snapshot_mcp_meta(agent))
+            mcp_meta.update(_run_tools._snapshot_mcp_meta(agent))
 
             # 5b. tool/user-input history. Inside the try
             #     so a recorder failure here fires on_run_failed.
@@ -7732,7 +6493,7 @@ def resume_stream(
         except (ManagedRootStoppedError, RunFencedError) as stop:
             store = _shared["state_store"]
             result = await _stopped_resume_result(stop, store, run_id, _shared.get("ctx"))
-            yield _fenced_stream_event(run_id, result)
+            yield _run_events._fenced_stream_event(run_id, result)
 
         except Exception as exc:
             failure_status = await _stream_resume_failure(_shared, extra_notifier, run_id, exc)
@@ -7780,7 +6541,7 @@ def resume_stream(
         partial_answer = _partial_answer(_shared)
         if store is not None:
             try:
-                cancel_won, persisted_row = await _persist_run_cancellation(
+                cancel_won, persisted_row = await _run_events._persist_run_cancellation(
                     store,
                     run_id,
                     {
@@ -7809,7 +6570,7 @@ def resume_stream(
     return _RunStream(
         run_id=run_id,
         generator=stream_context.wrap(_generate()),
-        cleanup=lambda: _shielded_cleanup(_cleanup, run_id=run_id),
+        cleanup=lambda: _run_events._shielded_cleanup(_cleanup, run_id=run_id),
     )
 
 
@@ -7843,7 +6604,7 @@ async def _validate_owned_pause(
     )
 
     async with _release_setup_failure(store, run_id, status):
-        await _check_claim(store, run_id)
+        await _run_events._check_claim(store, run_id)
         raw = await store.get_pause_state(run_id)
         if raw is None:
             raise ValueError("Claimed run has no pause state")
@@ -7993,7 +6754,7 @@ async def resume_claimed(
         user_input=submitted_input,
         extra_notifier=extra_notifier,
         _skip_claim=True,
-        user_parts=_stored_parts(raw_pause.get("submitted_user_parts")),
+        user_parts=_run_images._stored_parts(raw_pause.get("submitted_user_parts")),
         _raw_pause=raw_pause,
         _tenant_explicit=_tenant_explicit,
     )

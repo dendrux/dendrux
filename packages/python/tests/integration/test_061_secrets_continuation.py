@@ -9,6 +9,7 @@ from dendrux import Agent
 from dendrux.db.models import Base
 from dendrux.guardrails import SecretDetection
 from dendrux.llm.mock import MockLLM
+from dendrux.runtime import _run_events
 from dendrux.runtime._blocked_content import _blocked_write
 from dendrux.tool import tool
 from dendrux.types import ApprovalDecision, LLMResponse, RunStatus, ToolCall, ToolResult
@@ -121,7 +122,7 @@ async def test_submitted_text_is_projected_before_first_write(
         snapshots.append(True)
         return await finalize(*args, **kwargs)
 
-    monkeypatch.setattr(runner, "_finalize_running_event", clean_before_terminal_commit)
+    monkeypatch.setattr(_run_events, "_finalize_running_event", clean_before_terminal_commit)
     try:
         kwargs = {"tenant_id": "t", "expected_pause_id": raw["pause_id"]}
         call_id = raw["pending_tool_calls"][0]["id"]

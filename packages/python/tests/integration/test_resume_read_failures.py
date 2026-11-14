@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from dendrux.errors import PersistenceError, StoreOutcomeUnknown
-from dendrux.runtime import runner
+from dendrux.runtime import _run_events, runner
 from dendrux.types import RunStatus
 from tests._fixtures.storage import pin_storage_format
 from tests._helpers.gates import wait_for_gate
@@ -258,7 +258,7 @@ async def test_committed_pause_survives_projection_failure(
         return await get_run(*args, **kwargs)
 
     with monkeypatch.context() as patcher:
-        patcher.setattr(runner, "_pause_with_event", commit_pause)
+        patcher.setattr(_run_events, "_pause_with_event", commit_pause)
         if read == "pending":
             patcher.setattr(
                 "dendrux.runtime._pending._PendingReader.get_pending",

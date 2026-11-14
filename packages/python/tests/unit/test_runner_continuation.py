@@ -8,8 +8,9 @@ import pytest
 
 from dendrux import Agent
 from dendrux.llm.mock import MockLLM
+from dendrux.loops import _helpers
 from dendrux.loops.react import ReActLoop
-from dendrux.runtime import _reclaim, runner
+from dendrux.runtime import _reclaim, _run_events, _run_images, runner
 from dendrux.types import (
     ImagePart,
     ImageRef,
@@ -109,7 +110,7 @@ async def test_resumed_payload_on_both_entries(store, monkeypatch, entry, kind):
             captured.append(data)
         return await original(store, run, event, data, **kwargs)
 
-    monkeypatch.setattr(runner, "_emit_event", emit)
+    monkeypatch.setattr(_run_events, "_emit_event", emit)
 
     async def run(**kwargs):
         return RunResult(status=RunStatus.SUCCESS, answer="done", run_id=kwargs["run_id"])
@@ -198,9 +199,9 @@ async def test_resume_loop_kwargs_match_stream(store, monkeypatch):
             strict_tenancy=False,
             loop=ReActLoop(),
         )
-        monkeypatch.setattr(runner, "_image_runtime", original_images)
+        monkeypatch.setattr(_run_images, "_image_runtime", original_images)
         paused = await agent.run("go", tenant_id=None)
-        monkeypatch.setattr(runner, "_image_runtime", lambda *args: image_runtime)
+        monkeypatch.setattr(_run_images, "_image_runtime", lambda *args: image_runtime)
 
         async def run(*, budget_carry=None, _entry=current, **kwargs):
             captured[_entry] = dict(kwargs, budget_carry=budget_carry)
@@ -278,8 +279,8 @@ async def test_recovering_stream_stop_matches_helpers(store, monkeypatch, status
         calls.append(("notifier", args[-1]))
 
     monkeypatch.setattr(runner, "_persist_loop_outcome", persist)
-    monkeypatch.setattr(runner, "record_run_finished", recorder)
-    monkeypatch.setattr(runner, "notify_run_finished", notifier)
+    monkeypatch.setattr(_helpers, "record_run_finished", recorder)
+    monkeypatch.setattr(_helpers, "notify_run_finished", notifier)
     events = [
         e
         async for e in agent.resume_stream(

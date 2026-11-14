@@ -13,7 +13,7 @@ from dendrux import Agent
 from dendrux.chat import ChatMessage, normalize_chat_history
 from dendrux.context_blocks import ContextBlock
 from dendrux.llm.mock import MockLLM
-from dendrux.runtime import context, runner
+from dendrux.runtime import _run_images, context, runner
 from dendrux.runtime.context import DelegationContext, get_store_identity
 from dendrux.runtime.replay import PARTS_KEY, parts_to_dicts
 from dendrux.runtime.state import RunRecord, TraceRecord
@@ -57,10 +57,10 @@ async def test_entry_creation_bytes(monkeypatch, case):
     store.get_run = AsyncMock(return_value=source)
     store.get_traces = AsyncMock(return_value=[TraceRecord("trace", "user", "hello", 0)])
     monkeypatch.setattr(runner, "_runtime_seeds", AsyncMock(return_value=({}, None)))
-    monkeypatch.setattr(runner, "_image_runtime", lambda *args: None)
+    monkeypatch.setattr(_run_images, "_image_runtime", lambda *args: None)
     history = [ChatMessage.user("before"), ChatMessage.assistant("reply")] if rich else None
     monkeypatch.setattr(
-        runner,
+        _run_images,
         "_ingest_entry_images",
         AsyncMock(return_value=runner._EntryImages(None, parts, normalize_chat_history(history))),
     )
