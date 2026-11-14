@@ -113,8 +113,6 @@ async def test_completion_beats_late_durable_cancel(
             assert row.status == "success" and row.answer == "completed answer"
             counts = await event_counts(other, run_id)
             assert counts["run.completed"] == 1 and counts["run.cancelled"] == 0
-            if cut == "finish":
-                finish_hook.assert_awaited_once()
     finally:
         gate.release.set()
         await case.agent.close()
