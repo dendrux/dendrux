@@ -86,15 +86,31 @@ def _ruff(
     destinations: set[str] = set()
     for old, row in mapping.get("ruff", {}).items():
         if (
-            set(row) != {"baseline", "action"}
+            set(row)
+            != {"baseline", "action"} | ({"new_modules"} if "new_modules" in row else set())
             or row["action"] != RUFF_ACTION
             or baseline.get(old) != row["baseline"]
         ):
             raise ValueError("ruff source/action/baseline mismatch")
         source, rule = old.rsplit(":", 1)
+        explicit = row.get("new_modules", [])
+        if (
+            not isinstance(explicit, list)
+            or "new_modules" in row
+            and not explicit
+            or any(
+                not isinstance(module, str)
+                or not all(part.isidentifier() for part in module.split("."))
+                or module == source
+                or not (module in present or f"{module}:{rule}" in present)
+                for module in explicit
+            )
+            or len(explicit) != len(set(explicit))
+        ):
+            raise ValueError("explicit Ruff owners must be unique present modules")
         keys = {
             f"{module}:{rule}"
-            for module in modules.get(source, set())
+            for module in modules.get(source, set()) | set(explicit)
             if module in present or f"{module}:{rule}" in present
         }
         keys.add(old)
