@@ -133,9 +133,9 @@ def test_ruff_includes_small_owners_from_the_crap_map() -> None:
             }
         },
     }
-    assert apply_key_map("ruff", {"a:PLC0415": 1}, {"b:PLC0415": 1}, mapping, {"b"}) == {
-        "b:PLC0415": 1
-    }
+    assert apply_key_map(
+        "ruff", {"a:PLC0415": 1}, {"a:PLC0415": 0, "b:PLC0415": 1}, mapping, {"b"}
+    ) == {"b:PLC0415": 1}
 
 
 def test_non_finite_crap_allowance_is_refused() -> None:

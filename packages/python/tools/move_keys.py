@@ -98,7 +98,10 @@ def _ruff(
             if module in present or f"{module}:{rule}" in present
         }
         keys.add(old)
-        claims = {key: scores.get(key, 0) for key in keys}
+        missing = sorted(key for key in keys if key not in scores)
+        if missing:
+            raise ValueError(f"missing ruff score: {', '.join(missing)}; supply explicit zeros")
+        claims = {key: scores[key] for key in keys}
         if (
             any(not isinstance(v, int) or v < 0 for v in claims.values())
             or sum(claims.values()) > baseline[old]
