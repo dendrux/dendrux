@@ -1,0 +1,6 @@
+{
+ "dendrux.runtime.stores.sql.base": {
+  "_CheckedSessionFactory": "dendrux.runtime.stores.sql._sql_sessions",
+  "_SerializedSessionFactory": "dendrux.runtime.stores.sql._sql_sessions"
+ }
+}

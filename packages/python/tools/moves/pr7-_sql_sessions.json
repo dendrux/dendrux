@@ -1,11 +1,12 @@
 {
   "version": 1,
-  "base": "9c2678e2cf3f0aa18e60edf969bfb4bb76b84e02",
+  "base": "ebd85f9343cf49b074f6426cf8a7eb5c78b59879",
   "old": "src/dendrux/runtime/stores/sql/base.py",
-  "source_sha256": "14c1b33cc60b5270fea3694f350fbfe53e8c5f37e1b6d55fca4a677c52ebc169",
+  "source_sha256": "4f96e1585590cce34bc27517c946c901c2fad4f9337db8468b6d89c9f77c4258",
   "sources": {
-    "src/dendrux/runtime/stores/sql/base.py": "14c1b33cc60b5270fea3694f350fbfe53e8c5f37e1b6d55fca4a677c52ebc169",
-    "src/dendrux/runtime/stores/sql/_sql_host.py": "f3a1be68f99d6afea8d845e95fea3277a2e730967f6fc4811a38b6804a2b0a5b"
+    "src/dendrux/runtime/stores/sql/base.py": "d6eeae28dbc1ef49312f4ee27ce5a7edb8b75c02d05037790726f38a60568de6",
+    "src/dendrux/runtime/stores/sql/_sql_host.py": "f3a1be68f99d6afea8d845e95fea3277a2e730967f6fc4811a38b6804a2b0a5b",
+    "src/dendrux/runtime/stores/sql/_sql_sessions.py": "5ad0ed7a3b27acded5ccfb6ac3ca816712272c144e7492ba6d44d315acd9a5c4"
   },
   "owners": {
     "_RECOVERY_DESCRIPTOR_BYTES": "src/dendrux/runtime/stores/sql/base.py",
@@ -20,12 +21,12 @@
     "_UpdatedRows.__init__": "src/dendrux/runtime/stores/sql/base.py",
     "_UpdatedRows.first": "src/dendrux/runtime/stores/sql/base.py",
     "_UpdatedRows.scalar_one_or_none": "src/dendrux/runtime/stores/sql/base.py",
-    "_SerializedSessionFactory": "src/dendrux/runtime/stores/sql/base.py",
-    "_SerializedSessionFactory.__init__": "src/dendrux/runtime/stores/sql/base.py",
-    "_SerializedSessionFactory.__call__": "src/dendrux/runtime/stores/sql/base.py",
-    "_CheckedSessionFactory": "src/dendrux/runtime/stores/sql/base.py",
-    "_CheckedSessionFactory.__init__": "src/dendrux/runtime/stores/sql/base.py",
-    "_CheckedSessionFactory.__call__": "src/dendrux/runtime/stores/sql/base.py",
+    "_SerializedSessionFactory": "src/dendrux/runtime/stores/sql/_sql_sessions.py",
+    "_SerializedSessionFactory.__init__": "src/dendrux/runtime/stores/sql/_sql_sessions.py",
+    "_SerializedSessionFactory.__call__": "src/dendrux/runtime/stores/sql/_sql_sessions.py",
+    "_CheckedSessionFactory": "src/dendrux/runtime/stores/sql/_sql_sessions.py",
+    "_CheckedSessionFactory.__init__": "src/dendrux/runtime/stores/sql/_sql_sessions.py",
+    "_CheckedSessionFactory.__call__": "src/dendrux/runtime/stores/sql/_sql_sessions.py",
     "_status_values": "src/dendrux/runtime/stores/sql/base.py",
     "_advancing_turn": "src/dendrux/runtime/stores/sql/base.py",
     "_checkpoint_progress": "src/dendrux/runtime/stores/sql/base.py",
@@ -225,10 +226,45 @@
     "_active_wait_id": "src/dendrux/runtime/stores/sql/base.py",
     "_validate_lease_batch_size": "src/dendrux/runtime/stores/sql/base.py"
   },
-  "lexical": [],
+  "lexical": [
+    {
+      "root": "SQLStateStore.__init__",
+      "module": "src/dendrux/runtime/stores/sql/base.py",
+      "name": "_SerializedSessionFactory",
+      "target": "dendrux.runtime.stores.sql._sql_sessions._SerializedSessionFactory",
+      "count": 1
+    },
+    {
+      "root": "SQLStateStore.__init__",
+      "module": "src/dendrux/runtime/stores/sql/base.py",
+      "name": "_CheckedSessionFactory",
+      "target": "dendrux.runtime.stores.sql._sql_sessions._CheckedSessionFactory",
+      "count": 1
+    }
+  ],
   "hoists": [],
-  "annotations": [],
-  "metadata": [],
+  "annotations": [
+    {
+      "root": "_CheckedSessionFactory",
+      "module": "src/dendrux/runtime/stores/sql/_sql_sessions.py",
+      "host": "_StoreHost",
+      "count": 1
+    }
+  ],
+  "metadata": [
+    {
+      "root": "_SerializedSessionFactory",
+      "module": "src/dendrux/runtime/stores/sql/_sql_sessions.py",
+      "attribute": "__module__",
+      "value": "dendrux.runtime.stores.sql.base"
+    },
+    {
+      "root": "_CheckedSessionFactory",
+      "module": "src/dendrux/runtime/stores/sql/_sql_sessions.py",
+      "attribute": "__module__",
+      "value": "dendrux.runtime.stores.sql.base"
+    }
+  ],
   "scaffolding": {
     "_StoreHost": {
       "module": "src/dendrux/runtime/stores/sql/_sql_host.py",
