@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from datetime import timedelta
 from types import SimpleNamespace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
@@ -13,6 +13,12 @@ from dendrux.errors import ManagedStateError
 from dendrux.runtime._reclaim import _ManagedPending, _refuse_bound_pending
 from dendrux.runtime.stores.sql.base import _SweepScan
 from dendrux.types import ToolCall, generate_ulid
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+    from datetime import datetime
+
+    from sqlalchemy.ext.asyncio import AsyncSession
 
 CALL = ToolCall(name="reviewer", params={"task": "t"}, id="m1")
 RUN = generate_ulid()
@@ -60,8 +66,33 @@ def test_only_external_results_for_a_subagent_call_are_refused() -> None:
 
 
 class _Store:
+    _session_factory: Any = None
+
     def json_get(self, col: Any, path: Any, as_type: Any) -> Any:
         return None
+
+    def _mark_announce(self, session: AsyncSession, run_ids: Sequence[str]) -> None:
+        raise AssertionError("classification fake must not write")
+
+    async def _update_one_rows(
+        self,
+        session: AsyncSession,
+        *,
+        table: Any,
+        pk: tuple[Any, ...],
+        predicate: Any,
+        values: dict[str, Any],
+        returning: Sequence[Any],
+    ) -> Any:
+        raise AssertionError("classification fake must not write")
+
+    def _waiting_sweep_page(
+        self, statement: Any, after: tuple[datetime, str] | None, limit: int
+    ) -> Any:
+        raise AssertionError("classification fake must not page")
+
+    async def _write_tx(self, session: AsyncSession, *, run_ids: Sequence[str] = ()) -> None:
+        raise AssertionError("classification fake must not write")
 
 
 def _row(version: Any, reason: Any, child: Any) -> Any:

@@ -25,7 +25,13 @@ PRIVATE = "CHAIN-PRIVATE-SENTINEL-765"
 
 
 def test_status_writer_inventory():
-    modules = dict.fromkeys((sql_base, inspect.getmodule(sql_base._status_values)))
+    modules = dict.fromkeys(
+        (
+            sql_base,
+            inspect.getmodule(sql_base._status_values),
+            inspect.getmodule(sql_base._SweepScan.collect),
+        )
+    )
     trees = [ast.parse(inspect.getsource(module)) for module in modules]
     writers = {}
     direct = []

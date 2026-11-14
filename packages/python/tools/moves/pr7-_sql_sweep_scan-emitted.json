@@ -6,6 +6,8 @@
   "_RECOVERY_MAX_MESSAGES": "dendrux.runtime.stores.sql._sql_support",
   "_RECOVERY_TRACE_BYTES": "dendrux.runtime.stores.sql._sql_support",
   "_SerializedSessionFactory": "dendrux.runtime.stores.sql._sql_sessions",
+  "_SweepScan": "dendrux.runtime.stores.sql._sql_sweep_scan",
+  "_WAIT_MARK_LABELS": "dendrux.runtime.stores.sql._sql_sweep_scan",
   "_advancing_turn": "dendrux.runtime.stores.sql._sql_support",
   "_check_create_identifiers": "dendrux.runtime.stores.sql._sql_support",
   "_checkpoint_error": "dendrux.runtime.stores.sql._sql_support",

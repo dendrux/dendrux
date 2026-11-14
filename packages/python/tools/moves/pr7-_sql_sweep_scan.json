@@ -4,10 +4,11 @@
   "old": "src/dendrux/runtime/stores/sql/base.py",
   "source_sha256": "4f96e1585590cce34bc27517c946c901c2fad4f9337db8468b6d89c9f77c4258",
   "sources": {
-    "src/dendrux/runtime/stores/sql/base.py": "0b799d2f8efb61f1f01e1ae8c37a5dfb199c18b1b2631030e611c3a83d834fa6",
+    "src/dendrux/runtime/stores/sql/base.py": "9f7f5ffdfb0c338e4df818dc620cc22cdc3ee33066054edb0c828b6862576969",
     "src/dendrux/runtime/stores/sql/_sql_host.py": "f3a1be68f99d6afea8d845e95fea3277a2e730967f6fc4811a38b6804a2b0a5b",
     "src/dendrux/runtime/stores/sql/_sql_sessions.py": "5ad0ed7a3b27acded5ccfb6ac3ca816712272c144e7492ba6d44d315acd9a5c4",
-    "src/dendrux/runtime/stores/sql/_sql_support.py": "e57aaa22c139089f2a771c23ff20f51e88c248ea8e41011277b4bb51c5715fab"
+    "src/dendrux/runtime/stores/sql/_sql_support.py": "e57aaa22c139089f2a771c23ff20f51e88c248ea8e41011277b4bb51c5715fab",
+    "src/dendrux/runtime/stores/sql/_sql_sweep_scan.py": "75ae229330b4a3f2a1b9c9fc54611cdfc9c1604a74fff76aa39c89e56cae883f"
   },
   "owners": {
     "_RECOVERY_DESCRIPTOR_BYTES": "src/dendrux/runtime/stores/sql/_sql_support.py",
@@ -39,16 +40,16 @@
     "_creation_mark_proven": "src/dendrux/runtime/stores/sql/_sql_support.py",
     "_note_blocked_event": "src/dendrux/runtime/stores/sql/_sql_support.py",
     "_refuse_direct_managed_child": "src/dendrux/runtime/stores/sql/_sql_support.py",
-    "_SweepScan": "src/dendrux/runtime/stores/sql/base.py",
-    "_SweepScan.__init__": "src/dendrux/runtime/stores/sql/base.py",
-    "_SweepScan._wait_marks": "src/dendrux/runtime/stores/sql/base.py",
-    "_SweepScan._not_managed_wait": "src/dendrux/runtime/stores/sql/base.py",
-    "_SweepScan.page": "src/dendrux/runtime/stores/sql/base.py",
-    "_SweepScan.skipped": "src/dendrux/runtime/stores/sql/base.py",
-    "_SweepScan.collect": "src/dendrux/runtime/stores/sql/base.py",
-    "_SweepScan._reason": "src/dendrux/runtime/stores/sql/base.py",
-    "_SweepScan.sweep_row": "src/dendrux/runtime/stores/sql/base.py",
-    "_WAIT_MARK_LABELS": "src/dendrux/runtime/stores/sql/base.py",
+    "_SweepScan": "src/dendrux/runtime/stores/sql/_sql_sweep_scan.py",
+    "_SweepScan.__init__": "src/dendrux/runtime/stores/sql/_sql_sweep_scan.py",
+    "_SweepScan._wait_marks": "src/dendrux/runtime/stores/sql/_sql_sweep_scan.py",
+    "_SweepScan._not_managed_wait": "src/dendrux/runtime/stores/sql/_sql_sweep_scan.py",
+    "_SweepScan.page": "src/dendrux/runtime/stores/sql/_sql_sweep_scan.py",
+    "_SweepScan.skipped": "src/dendrux/runtime/stores/sql/_sql_sweep_scan.py",
+    "_SweepScan.collect": "src/dendrux/runtime/stores/sql/_sql_sweep_scan.py",
+    "_SweepScan._reason": "src/dendrux/runtime/stores/sql/_sql_sweep_scan.py",
+    "_SweepScan.sweep_row": "src/dendrux/runtime/stores/sql/_sql_sweep_scan.py",
+    "_WAIT_MARK_LABELS": "src/dendrux/runtime/stores/sql/_sql_sweep_scan.py",
     "_creation_metadata": "src/dendrux/runtime/stores/sql/_sql_support.py",
     "_check_create_identifiers": "src/dendrux/runtime/stores/sql/_sql_support.py",
     "_checkpoint_error": "src/dendrux/runtime/stores/sql/_sql_support.py",
@@ -244,7 +245,7 @@
     },
     {
       "root": "_SweepScan.sweep_row",
-      "module": "src/dendrux/runtime/stores/sql/base.py",
+      "module": "src/dendrux/runtime/stores/sql/_sql_sweep_scan.py",
       "name": "_status_values",
       "target": "dendrux.runtime.stores.sql._sql_support._status_values",
       "count": 1
@@ -591,6 +592,55 @@
       "name": "_note_blocked_event",
       "target": "dendrux.runtime.stores.sql._sql_support._note_blocked_event",
       "count": 1
+    },
+    {
+      "root": "_SweepScan.sweep_row",
+      "module": "src/dendrux/runtime/stores/sql/_sql_sweep_scan.py",
+      "name": "_insert_event_locked",
+      "target": "dendrux.runtime.state._insert_event_locked",
+      "count": 1
+    },
+    {
+      "root": "SQLStateStore.finalize_with_event",
+      "module": "src/dendrux/runtime/stores/sql/base.py",
+      "name": "_insert_event_locked",
+      "target": "dendrux.runtime.state._insert_event_locked",
+      "count": 1
+    },
+    {
+      "root": "SQLStateStore.pause_with_event",
+      "module": "src/dendrux/runtime/stores/sql/base.py",
+      "name": "_insert_event_locked",
+      "target": "dendrux.runtime.state._insert_event_locked",
+      "count": 1
+    },
+    {
+      "root": "SQLStateStore._cancel_claim_release",
+      "module": "src/dendrux/runtime/stores/sql/base.py",
+      "name": "_insert_event_locked",
+      "target": "dendrux.runtime.state._insert_event_locked",
+      "count": 1
+    },
+    {
+      "root": "SQLStateStore._scan_expired_runs",
+      "module": "src/dendrux/runtime/stores/sql/base.py",
+      "name": "_insert_event_locked",
+      "target": "dendrux.runtime.state._insert_event_locked",
+      "count": 2
+    },
+    {
+      "root": "SQLStateStore.reclaim_run",
+      "module": "src/dendrux/runtime/stores/sql/base.py",
+      "name": "_insert_event_locked",
+      "target": "dendrux.runtime.state._insert_event_locked",
+      "count": 2
+    },
+    {
+      "root": "SQLStateStore._sweep_runs",
+      "module": "src/dendrux/runtime/stores/sql/base.py",
+      "name": "_SweepScan",
+      "target": "dendrux.runtime.stores.sql._sql_sweep_scan._SweepScan",
+      "count": 1
     }
   ],
   "hoists": [],
@@ -612,6 +662,12 @@
       "module": "src/dendrux/runtime/stores/sql/_sql_support.py",
       "host": "_StoreHost",
       "count": 1
+    },
+    {
+      "root": "_SweepScan",
+      "module": "src/dendrux/runtime/stores/sql/_sql_sweep_scan.py",
+      "host": "_SweepStore",
+      "count": 1
     }
   ],
   "metadata": [
@@ -624,6 +680,12 @@
     {
       "root": "_CheckedSessionFactory",
       "module": "src/dendrux/runtime/stores/sql/_sql_sessions.py",
+      "attribute": "__module__",
+      "value": "dendrux.runtime.stores.sql.base"
+    },
+    {
+      "root": "_SweepScan",
+      "module": "src/dendrux/runtime/stores/sql/_sql_sweep_scan.py",
       "attribute": "__module__",
       "value": "dendrux.runtime.stores.sql.base"
     }
@@ -639,8 +701,11 @@
     }
   },
   "effects": [
-    "logger"
+    "logger",
+    "_WAIT_MARK_LABELS"
   ],
-  "seams": {},
+  "seams": {
+    "_insert_event_locked": "dendrux.runtime.state._insert_event_locked"
+  },
   "providers": {}
 }
