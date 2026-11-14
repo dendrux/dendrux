@@ -100,6 +100,9 @@ def check_imports(
         for local in name.split(","):
             if local.isidentifier():
                 owned[local] = f"{modules[key]}.{local}"
+    for name, entry in evidence.get("scaffolding", {}).items():
+        if name in {"_StoreHost", "_SweepStore"}:
+            owned[name] = f"{modules[entry['module']]}.{name}"
     problems = []
     for key, tree in trees.items():
         for node in ast.walk(tree):
