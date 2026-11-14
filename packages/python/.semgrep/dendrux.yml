@@ -18,7 +18,7 @@ rules:
       # method of this class" for a nested node, so tools/semgrep_ratchet.py applies it
       # exactly; a same-named method elsewhere, a module function or a nested helper of
       # another method is still a match.
-      allow_in: ["dendrux.runtime.stores.sql.base:SQLStateStore._write_tx"]
+      allow_in: ["dendrux.runtime.stores.sql._sql_writes:_SqlWrites._write_tx"]
     patterns:
       - pattern-either:
           - pattern: $S.commit()

@@ -16987,6 +16987,138 @@
   "crap": 7.0,
   "digest": "50577816e14f"
  },
+ "src/dendrux/runtime/stores/sql/_sql_writes.py::_SqlWrites._commit_operation": {
+  "complexity": 3,
+  "coverage": 1.0,
+  "crap": 3.0,
+  "digest": "345cffef316a"
+ },
+ "src/dendrux/runtime/stores/sql/_sql_writes.py::_SqlWrites._conflict": {
+  "complexity": 6,
+  "coverage": 1.0,
+  "crap": 6.0,
+  "digest": "fb50b24798e6"
+ },
+ "src/dendrux/runtime/stores/sql/_sql_writes.py::_SqlWrites._enqueue_committed": {
+  "complexity": 4,
+  "coverage": 1.0,
+  "crap": 4.0,
+  "digest": "fded6809747c"
+ },
+ "src/dendrux/runtime/stores/sql/_sql_writes.py::_SqlWrites._execute_insert_plan": {
+  "complexity": 5,
+  "coverage": 0.5455,
+  "crap": 7.35,
+  "digest": "870f78ad2227"
+ },
+ "src/dendrux/runtime/stores/sql/_sql_writes.py::_SqlWrites._fence": {
+  "complexity": 6,
+  "coverage": 1.0,
+  "crap": 6.0,
+  "digest": "187651066fce"
+ },
+ "src/dendrux/runtime/stores/sql/_sql_writes.py::_SqlWrites._insert_retry": {
+  "complexity": 16,
+  "coverage": 1.0,
+  "crap": 16.0,
+  "digest": "657abfd697ca"
+ },
+ "src/dendrux/runtime/stores/sql/_sql_writes.py::_SqlWrites._insert_retry.<locals>.field_value": {
+  "complexity": 3,
+  "coverage": 1.0,
+  "crap": 3.0,
+  "digest": "83bd9b68f20d"
+ },
+ "src/dendrux/runtime/stores/sql/_sql_writes.py::_SqlWrites._insert_retry.<locals>.normalize": {
+  "complexity": 2,
+  "coverage": 1.0,
+  "crap": 2.0,
+  "digest": "2ee207a154c4"
+ },
+ "src/dendrux/runtime/stores/sql/_sql_writes.py::_SqlWrites._mark_announce": {
+  "complexity": 1,
+  "coverage": 1.0,
+  "crap": 1.0,
+  "digest": "f56c9bb12214"
+ },
+ "src/dendrux/runtime/stores/sql/_sql_writes.py::_SqlWrites._ordered": {
+  "complexity": 14,
+  "coverage": 1.0,
+  "crap": 14.0,
+  "digest": "a60cb5a0d7da"
+ },
+ "src/dendrux/runtime/stores/sql/_sql_writes.py::_SqlWrites._remember_run_values": {
+  "complexity": 4,
+  "coverage": 1.0,
+  "crap": 4.0,
+  "digest": "39c6302ed31e"
+ },
+ "src/dendrux/runtime/stores/sql/_sql_writes.py::_SqlWrites._remember_write": {
+  "complexity": 2,
+  "coverage": 1.0,
+  "crap": 2.0,
+  "digest": "b94a1622f997"
+ },
+ "src/dendrux/runtime/stores/sql/_sql_writes.py::_SqlWrites._reservation_values": {
+  "complexity": 5,
+  "coverage": 1.0,
+  "crap": 5.0,
+  "digest": "a332b94043de"
+ },
+ "src/dendrux/runtime/stores/sql/_sql_writes.py::_SqlWrites._update_many_rows": {
+  "complexity": 2,
+  "coverage": 1.0,
+  "crap": 2.0,
+  "digest": "e659deea778f"
+ },
+ "src/dendrux/runtime/stores/sql/_sql_writes.py::_SqlWrites._update_one_rows": {
+  "complexity": 3,
+  "coverage": 1.0,
+  "crap": 3.0,
+  "digest": "b5a403ba9163"
+ },
+ "src/dendrux/runtime/stores/sql/_sql_writes.py::_SqlWrites._write_conflict": {
+  "complexity": 1,
+  "coverage": 1.0,
+  "crap": 1.0,
+  "digest": "4701eb2fd244"
+ },
+ "src/dendrux/runtime/stores/sql/_sql_writes.py::_SqlWrites._write_tx": {
+  "complexity": 3,
+  "coverage": 1.0,
+  "crap": 3.0,
+  "digest": "899fb2fa18a0"
+ },
+ "src/dendrux/runtime/stores/sql/_sql_writes.py::_SqlWrites.update_many": {
+  "complexity": 12,
+  "coverage": 1.0,
+  "crap": 12.0,
+  "digest": "050359791399"
+ },
+ "src/dendrux/runtime/stores/sql/_sql_writes.py::_SqlWrites.update_one": {
+  "complexity": 20,
+  "coverage": 1.0,
+  "crap": 20.0,
+  "digest": "1fef592c6c07"
+ },
+ "src/dendrux/runtime/stores/sql/_sql_writes.py::_UpdatedRows.__init__": {
+  "complexity": 1,
+  "coverage": 1.0,
+  "crap": 1.0,
+  "digest": "e25bf847874b"
+ },
+ "src/dendrux/runtime/stores/sql/_sql_writes.py::_UpdatedRows.first": {
+  "complexity": 2,
+  "coverage": 1.0,
+  "crap": 2.0,
+  "digest": "af55604cf76b"
+ },
+ "src/dendrux/runtime/stores/sql/_sql_writes.py::_UpdatedRows.scalar_one_or_none": {
+  "complexity": 3,
+  "coverage": 1.0,
+  "crap": 3.0,
+  "digest": "ba68ddd79cc5"
+ },
  "src/dendrux/runtime/stores/sql/base.py::SQLStateStore.__init__": {
   "complexity": 3,
   "coverage": 1.0,
@@ -17047,23 +17179,11 @@
   "crap": 5.0,
   "digest": "b855fc93f283"
  },
- "src/dendrux/runtime/stores/sql/base.py::SQLStateStore._commit_operation": {
-  "complexity": 3,
-  "coverage": 1.0,
-  "crap": 3.0,
-  "digest": "345cffef316a"
- },
  "src/dendrux/runtime/stores/sql/base.py::SQLStateStore._complete_run_control": {
   "complexity": 1,
   "coverage": 1.0,
   "crap": 1.0,
   "digest": "612e2c0049b3"
- },
- "src/dendrux/runtime/stores/sql/base.py::SQLStateStore._conflict": {
-  "complexity": 6,
-  "coverage": 1.0,
-  "crap": 6.0,
-  "digest": "fb50b24798e6"
  },
  "src/dendrux/runtime/stores/sql/base.py::SQLStateStore._creation_storage_format": {
   "complexity": 6,
@@ -17076,29 +17196,6 @@
   "coverage": 1.0,
   "crap": 3.0,
   "digest": "af5a04f4e5eb"
- },
- "src/dendrux/runtime/stores/sql/base.py::SQLStateStore._enqueue_committed": {
-  "complexity": 4,
-  "coverage": 1.0,
-  "crap": 4.0,
-  "digest": "fded6809747c"
- },
- "src/dendrux/runtime/stores/sql/base.py::SQLStateStore._execute_insert_plan": {
-  "complexity": 5,
-  "coverage": 0.5455,
-  "crap": 7.35,
-  "digest": "870f78ad2227",
-  "waived": {
-   "date": "2026-11-02",
-   "reason": "Owner approved 2026-11-02: re-save from GitHub CI coverage; speed tests stopped counting toward coverage on 2026-11-01",
-   "rule": "worse"
-  }
- },
- "src/dendrux/runtime/stores/sql/base.py::SQLStateStore._fence": {
-  "complexity": 6,
-  "coverage": 1.0,
-  "crap": 6.0,
-  "digest": "187651066fce"
  },
  "src/dendrux/runtime/stores/sql/base.py::SQLStateStore._finalize_error_info": {
   "complexity": 4,
@@ -17159,24 +17256,6 @@
   "crap": 1.0,
   "digest": "8da14de2123f"
  },
- "src/dendrux/runtime/stores/sql/base.py::SQLStateStore._insert_retry": {
-  "complexity": 16,
-  "coverage": 1.0,
-  "crap": 16.0,
-  "digest": "657abfd697ca"
- },
- "src/dendrux/runtime/stores/sql/base.py::SQLStateStore._insert_retry.<locals>.field_value": {
-  "complexity": 3,
-  "coverage": 1.0,
-  "crap": 3.0,
-  "digest": "83bd9b68f20d"
- },
- "src/dendrux/runtime/stores/sql/base.py::SQLStateStore._insert_retry.<locals>.normalize": {
-  "complexity": 2,
-  "coverage": 1.0,
-  "crap": 2.0,
-  "digest": "2ee207a154c4"
- },
  "src/dendrux/runtime/stores/sql/base.py::SQLStateStore._insert_trace": {
   "complexity": 7,
   "coverage": 0.95,
@@ -17188,23 +17267,11 @@
    "rule": "worse"
   }
  },
- "src/dendrux/runtime/stores/sql/base.py::SQLStateStore._mark_announce": {
-  "complexity": 1,
-  "coverage": 1.0,
-  "crap": 1.0,
-  "digest": "f56c9bb12214"
- },
  "src/dendrux/runtime/stores/sql/base.py::SQLStateStore._native_live_updates": {
   "complexity": 1,
   "coverage": 1.0,
   "crap": 1.0,
   "digest": "3949a45e7788"
- },
- "src/dendrux/runtime/stores/sql/base.py::SQLStateStore._ordered": {
-  "complexity": 14,
-  "coverage": 1.0,
-  "crap": 14.0,
-  "digest": "a60cb5a0d7da"
  },
  "src/dendrux/runtime/stores/sql/base.py::SQLStateStore._patch_fence": {
   "complexity": 9,
@@ -17223,24 +17290,6 @@
   "coverage": 1.0,
   "crap": 8.0,
   "digest": "933e1604f18a"
- },
- "src/dendrux/runtime/stores/sql/base.py::SQLStateStore._remember_run_values": {
-  "complexity": 4,
-  "coverage": 1.0,
-  "crap": 4.0,
-  "digest": "39c6302ed31e"
- },
- "src/dendrux/runtime/stores/sql/base.py::SQLStateStore._remember_write": {
-  "complexity": 2,
-  "coverage": 1.0,
-  "crap": 2.0,
-  "digest": "b94a1622f997"
- },
- "src/dendrux/runtime/stores/sql/base.py::SQLStateStore._reservation_values": {
-  "complexity": 5,
-  "coverage": 1.0,
-  "crap": 5.0,
-  "digest": "a332b94043de"
  },
  "src/dendrux/runtime/stores/sql/base.py::SQLStateStore._resolve_live_updates": {
   "complexity": 3,
@@ -17272,18 +17321,6 @@
   "crap": 13.01,
   "digest": "a962dfdfde5c"
  },
- "src/dendrux/runtime/stores/sql/base.py::SQLStateStore._update_many_rows": {
-  "complexity": 2,
-  "coverage": 1.0,
-  "crap": 2.0,
-  "digest": "e659deea778f"
- },
- "src/dendrux/runtime/stores/sql/base.py::SQLStateStore._update_one_rows": {
-  "complexity": 3,
-  "coverage": 1.0,
-  "crap": 3.0,
-  "digest": "b5a403ba9163"
- },
  "src/dendrux/runtime/stores/sql/base.py::SQLStateStore._usage_by_run": {
   "complexity": 3,
   "coverage": 1.0,
@@ -17301,23 +17338,6 @@
   "coverage": 1.0,
   "crap": 6.0,
   "digest": "0d501b529e4b"
- },
- "src/dendrux/runtime/stores/sql/base.py::SQLStateStore._write_conflict": {
-  "complexity": 1,
-  "coverage": 1.0,
-  "crap": 1.0,
-  "digest": "4701eb2fd244"
- },
- "src/dendrux/runtime/stores/sql/base.py::SQLStateStore._write_tx": {
-  "complexity": 3,
-  "coverage": 1.0,
-  "crap": 3.0,
-  "digest": "9241856e6710",
-  "waived": {
-   "date": "2026-11-01",
-   "reason": "Adopt enforcement: re-recorded at feat/0.6.0 62f99e8a with CI-grade coverage (Postgres run). The baseline predates the 0.6 work and MySQL-only code is uncovered in the python job; coordinator to approve.",
-   "rule": "new-over-threshold"
-  }
  },
  "src/dendrux/runtime/stores/sql/base.py::SQLStateStore.add_note": {
   "complexity": 4,
@@ -18014,23 +18034,6 @@
   "crap": 6.02,
   "digest": "0fd47c9ea34f"
  },
- "src/dendrux/runtime/stores/sql/base.py::SQLStateStore.update_many": {
-  "complexity": 12,
-  "coverage": 0.96,
-  "crap": 12.01,
-  "digest": "0c6f3031ee46",
-  "waived": {
-   "date": "2026-11-02",
-   "reason": "Owner approved 2026-11-02: re-save from GitHub CI coverage; speed tests stopped counting toward coverage on 2026-11-01",
-   "rule": "worse"
-  }
- },
- "src/dendrux/runtime/stores/sql/base.py::SQLStateStore.update_one": {
-  "complexity": 20,
-  "coverage": 0.9375,
-  "crap": 20.1,
-  "digest": "1fef592c6c07"
- },
  "src/dendrux/runtime/stores/sql/base.py::SQLStateStore.update_run_meta": {
   "complexity": 1,
   "coverage": 1.0,
@@ -18048,24 +18051,6 @@
   "coverage": 1.0,
   "crap": 1.0,
   "digest": "8bad0b83d244"
- },
- "src/dendrux/runtime/stores/sql/base.py::_UpdatedRows.__init__": {
-  "complexity": 1,
-  "coverage": 1.0,
-  "crap": 1.0,
-  "digest": "e25bf847874b"
- },
- "src/dendrux/runtime/stores/sql/base.py::_UpdatedRows.first": {
-  "complexity": 2,
-  "coverage": 1.0,
-  "crap": 2.0,
-  "digest": "af55604cf76b"
- },
- "src/dendrux/runtime/stores/sql/base.py::_UpdatedRows.scalar_one_or_none": {
-  "complexity": 3,
-  "coverage": 0.5,
-  "crap": 4.12,
-  "digest": "ba68ddd79cc5"
  },
  "src/dendrux/runtime/stores/sql/base.py::_validated_store_write": {
   "complexity": 1,

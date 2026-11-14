@@ -73,6 +73,7 @@ def _snapshot(cls):
 EXPECTED_MRO = {
     "SQLStateStore": [
         "SQLStateStore",
+        "_SqlWrites",
         "_StoreHost",
         "ManagedReads",
         "SQLBlobCatalog",
@@ -81,6 +82,7 @@ EXPECTED_MRO = {
     "SQLiteStateStore": [
         "SQLiteStateStore",
         "SQLStateStore",
+        "_SqlWrites",
         "_StoreHost",
         "ManagedReads",
         "SQLBlobCatalog",
@@ -89,6 +91,7 @@ EXPECTED_MRO = {
     "PostgresStateStore": [
         "PostgresStateStore",
         "SQLStateStore",
+        "_SqlWrites",
         "_StoreHost",
         "ManagedReads",
         "SQLBlobCatalog",
@@ -97,6 +100,7 @@ EXPECTED_MRO = {
     "MySQLStateStore": [
         "MySQLStateStore",
         "SQLStateStore",
+        "_SqlWrites",
         "_StoreHost",
         "ManagedReads",
         "SQLBlobCatalog",
@@ -115,10 +119,128 @@ BASELINE = {
 }
 
 
+WRITES_RELOCATIONS = {
+    "MySQLStateStore": {
+        "_blocked_run_ids": ("SQLStateStore", "_SqlWrites"),
+        "_blocked_runs_query": ("SQLStateStore", "_SqlWrites"),
+        "_check_dispatch_block": ("SQLStateStore", "_SqlWrites"),
+        "_commit_operation": ("SQLStateStore", "_SqlWrites"),
+        "_dispatch_filter": ("SQLStateStore", "_SqlWrites"),
+        "_enqueue_committed": ("SQLStateStore", "_SqlWrites"),
+        "_fence": ("SQLStateStore", "_SqlWrites"),
+        "_insert_retry": ("SQLStateStore", "_SqlWrites"),
+        "_mark_announce": ("SQLStateStore", "_SqlWrites"),
+        "_mark_blocked_writes": ("SQLStateStore", "_SqlWrites"),
+        "_native_blocked_mark": ("SQLStateStore", "_SqlWrites"),
+        "_ordered": ("SQLStateStore", "_SqlWrites"),
+        "_remember_run_values": ("SQLStateStore", "_SqlWrites"),
+        "_remember_write": ("SQLStateStore", "_SqlWrites"),
+        "_reservation_values": ("SQLStateStore", "_SqlWrites"),
+        "_update_many_rows": ("SQLStateStore", "_SqlWrites"),
+        "_update_one_rows": ("SQLStateStore", "_SqlWrites"),
+        "_write_conflict": ("SQLStateStore", "_SqlWrites"),
+        "_write_tx": ("SQLStateStore", "_SqlWrites"),
+        "update_many": ("SQLStateStore", "SQLStateStore"),
+    },
+    "PostgresStateStore": {
+        "_blocked_run_ids": ("SQLStateStore", "_SqlWrites"),
+        "_blocked_runs_query": ("SQLStateStore", "_SqlWrites"),
+        "_check_dispatch_block": ("SQLStateStore", "_SqlWrites"),
+        "_commit_operation": ("SQLStateStore", "_SqlWrites"),
+        "_conflict": ("SQLStateStore", "_SqlWrites"),
+        "_dispatch_filter": ("SQLStateStore", "_SqlWrites"),
+        "_enqueue_committed": ("SQLStateStore", "_SqlWrites"),
+        "_execute_insert_plan": ("SQLStateStore", "_SqlWrites"),
+        "_fence": ("SQLStateStore", "_SqlWrites"),
+        "_insert_retry": ("SQLStateStore", "_SqlWrites"),
+        "_mark_announce": ("SQLStateStore", "_SqlWrites"),
+        "_mark_blocked_writes": ("SQLStateStore", "_SqlWrites"),
+        "_native_blocked_mark": ("SQLStateStore", "_SqlWrites"),
+        "_ordered": ("SQLStateStore", "_SqlWrites"),
+        "_remember_run_values": ("SQLStateStore", "_SqlWrites"),
+        "_remember_write": ("SQLStateStore", "_SqlWrites"),
+        "_reservation_values": ("SQLStateStore", "_SqlWrites"),
+        "_update_many_rows": ("SQLStateStore", "_SqlWrites"),
+        "_update_one_rows": ("SQLStateStore", "_SqlWrites"),
+        "_write_conflict": ("SQLStateStore", "_SqlWrites"),
+        "_write_tx": ("SQLStateStore", "_SqlWrites"),
+        "update_many": ("SQLStateStore", "SQLStateStore"),
+        "update_one": ("SQLStateStore", "SQLStateStore"),
+    },
+    "SQLStateStore": {
+        "_blocked_run_ids": ("SQLStateStore", "_SqlWrites"),
+        "_blocked_runs_query": ("SQLStateStore", "_SqlWrites"),
+        "_check_dispatch_block": ("SQLStateStore", "_SqlWrites"),
+        "_commit_operation": ("SQLStateStore", "_SqlWrites"),
+        "_conflict": ("SQLStateStore", "_SqlWrites"),
+        "_dispatch_filter": ("SQLStateStore", "_SqlWrites"),
+        "_enqueue_committed": ("SQLStateStore", "_SqlWrites"),
+        "_execute_insert_plan": ("SQLStateStore", "_SqlWrites"),
+        "_fence": ("SQLStateStore", "_SqlWrites"),
+        "_insert_retry": ("SQLStateStore", "_SqlWrites"),
+        "_mark_announce": ("SQLStateStore", "_SqlWrites"),
+        "_mark_blocked_writes": ("SQLStateStore", "_SqlWrites"),
+        "_native_blocked_mark": ("SQLStateStore", "_SqlWrites"),
+        "_ordered": ("SQLStateStore", "_SqlWrites"),
+        "_remember_run_values": ("SQLStateStore", "_SqlWrites"),
+        "_remember_write": ("SQLStateStore", "_SqlWrites"),
+        "_reservation_values": ("SQLStateStore", "_SqlWrites"),
+        "_update_many_rows": ("SQLStateStore", "_SqlWrites"),
+        "_update_one_rows": ("SQLStateStore", "_SqlWrites"),
+        "_write_conflict": ("SQLStateStore", "_SqlWrites"),
+        "_write_tx": ("SQLStateStore", "_SqlWrites"),
+        "update_many": ("SQLStateStore", "SQLStateStore"),
+        "update_one": ("SQLStateStore", "SQLStateStore"),
+    },
+    "SQLiteStateStore": {
+        "_blocked_run_ids": ("SQLStateStore", "_SqlWrites"),
+        "_blocked_runs_query": ("SQLStateStore", "_SqlWrites"),
+        "_check_dispatch_block": ("SQLStateStore", "_SqlWrites"),
+        "_commit_operation": ("SQLStateStore", "_SqlWrites"),
+        "_conflict": ("SQLStateStore", "_SqlWrites"),
+        "_dispatch_filter": ("SQLStateStore", "_SqlWrites"),
+        "_enqueue_committed": ("SQLStateStore", "_SqlWrites"),
+        "_execute_insert_plan": ("SQLStateStore", "_SqlWrites"),
+        "_fence": ("SQLStateStore", "_SqlWrites"),
+        "_insert_retry": ("SQLStateStore", "_SqlWrites"),
+        "_mark_announce": ("SQLStateStore", "_SqlWrites"),
+        "_mark_blocked_writes": ("SQLStateStore", "_SqlWrites"),
+        "_native_blocked_mark": ("SQLStateStore", "_SqlWrites"),
+        "_ordered": ("SQLStateStore", "_SqlWrites"),
+        "_remember_run_values": ("SQLStateStore", "_SqlWrites"),
+        "_remember_write": ("SQLStateStore", "_SqlWrites"),
+        "_reservation_values": ("SQLStateStore", "_SqlWrites"),
+        "_update_many_rows": ("SQLStateStore", "_SqlWrites"),
+        "_update_one_rows": ("SQLStateStore", "_SqlWrites"),
+        "_write_conflict": ("SQLStateStore", "_SqlWrites"),
+        "_write_tx": ("SQLStateStore", "_SqlWrites"),
+        "update_many": ("SQLStateStore", "SQLStateStore"),
+        "update_one": ("SQLStateStore", "SQLStateStore"),
+    },
+}
+
+
+def _canonical_writes_snapshot(snapshot, cls):
+    import copy
+
+    assert snapshot["mro"] == EXPECTED_MRO[cls.__name__]
+    result = copy.deepcopy(snapshot)
+    for name, (old_owner, new_owner) in WRITES_RELOCATIONS[cls.__name__].items():
+        assert name in result["members"]
+        member = result["members"][name]
+        assert member["owner"] == new_owner, name
+        assert member["layers"][-1] == ("_sql_writes.py", name), name
+        member["owner"] = old_owner
+        member["layers"][-1] = ("base.py", name)
+    result["mro"].remove("_SqlWrites")
+    return result
+
+
 @pytest.mark.parametrize("cls", STORES)
 def test_exact_wrapper_signature_kind_and_mro_snapshot(cls):
     snapshot = _snapshot(cls)
     assert snapshot["mro"] == EXPECTED_MRO[cls.__name__]
+    snapshot = _canonical_writes_snapshot(snapshot, cls)
     digest = hashlib.sha256(json.dumps(snapshot, sort_keys=True).encode()).hexdigest()
     wrapped = sum(len(member["layers"]) > 1 for member in snapshot["members"].values())
     assert (wrapped, digest) == BASELINE[cls.__name__]
@@ -257,3 +379,61 @@ async def test_explicit_private_wrapper_and_sanitized_database_failures(cls, nam
     assert "private_sentinel" not in repr(caught.value)
     assert caught.value.__cause__ is None
     assert caught.value.__context__ is None
+
+
+@pytest.mark.parametrize("cls", STORES)
+@pytest.mark.parametrize(
+    "change",
+    [
+        "unexpected-base",
+        "duplicate-base",
+        "base-order",
+        "moved-owner",
+        "unlisted-owner",
+        "moved-file",
+        "unlisted-file",
+        "wrapper-count",
+        "wrapper-order",
+        "signature",
+        "kind",
+        "missing-member",
+        "extra-member",
+    ],
+)
+def test_proposed_exact_write_relocation_still_refuses_unplanned_snapshot_changes(cls, change):
+    import copy
+
+    raw = _snapshot(cls)
+    if change == "unexpected-base":
+        raw["mro"].insert(1, "UnexpectedAnnotationBase")
+    elif change == "duplicate-base":
+        raw["mro"].insert(1, "_SqlWrites")
+    elif change == "base-order":
+        pos = raw["mro"].index("_SqlWrites")
+        raw["mro"][pos : pos + 2] = reversed(raw["mro"][pos : pos + 2])
+    elif change == "moved-owner":
+        raw["members"]["_write_tx"]["owner"] = "SQLStateStore"
+    elif change == "unlisted-owner":
+        raw["members"]["_insert"]["owner"] = "_SqlWrites"
+    elif change == "moved-file":
+        raw["members"]["_write_tx"]["layers"][-1] = ("_other.py", "_write_tx")
+    elif change == "unlisted-file":
+        raw["members"]["_insert"]["layers"][-1] = ("_sql_writes.py", "_insert")
+    elif change == "wrapper-count":
+        raw["members"]["update_many"]["layers"].insert(0, ("durability.py", "call"))
+    elif change == "wrapper-order":
+        layers = raw["members"]["save_trace"]["layers"]
+        layers[0], layers[-2] = layers[-2], layers[0]
+    elif change == "signature":
+        raw["members"]["update_many"]["signature"] += " changed"
+    elif change == "kind":
+        raw["members"]["update_many"]["kind"] = "staticmethod"
+    elif change == "missing-member":
+        del raw["members"]["_write_tx"]
+    else:
+        raw["members"]["extra_method"] = copy.deepcopy(raw["members"]["_write_tx"])
+    with pytest.raises(AssertionError):
+        canonical = _canonical_writes_snapshot(raw, cls)
+        digest = hashlib.sha256(json.dumps(canonical, sort_keys=True).encode()).hexdigest()
+        wrapped = sum(len(member["layers"]) > 1 for member in canonical["members"].values())
+        assert (wrapped, digest) == BASELINE[cls.__name__]
