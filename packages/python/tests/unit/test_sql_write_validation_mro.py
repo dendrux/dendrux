@@ -73,6 +73,7 @@ def _snapshot(cls):
 EXPECTED_MRO = {
     "SQLStateStore": [
         "SQLStateStore",
+        "_SqlRuns",
         "_SqlEvidence",
         "_SqlWrites",
         "_StoreHost",
@@ -83,6 +84,7 @@ EXPECTED_MRO = {
     "SQLiteStateStore": [
         "SQLiteStateStore",
         "SQLStateStore",
+        "_SqlRuns",
         "_SqlEvidence",
         "_SqlWrites",
         "_StoreHost",
@@ -93,6 +95,7 @@ EXPECTED_MRO = {
     "PostgresStateStore": [
         "PostgresStateStore",
         "SQLStateStore",
+        "_SqlRuns",
         "_SqlEvidence",
         "_SqlWrites",
         "_StoreHost",
@@ -103,6 +106,7 @@ EXPECTED_MRO = {
     "MySQLStateStore": [
         "MySQLStateStore",
         "SQLStateStore",
+        "_SqlRuns",
         "_SqlEvidence",
         "_SqlWrites",
         "_StoreHost",
@@ -300,6 +304,32 @@ EVIDENCE_RELOCATIONS = {
 }
 
 
+RUNS_RELOCATIONS = {
+    "MySQLStateStore": {
+        "_creation_storage_format": ("SQLStateStore", "_SqlRuns", "base.py", "_sql_runs.py"),
+        "create_run": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_runs.py"),
+    },
+    "PostgresStateStore": {
+        "_check_idempotency": ("SQLStateStore", "_SqlRuns", "base.py", "_sql_runs.py"),
+        "_creation_storage_format": ("SQLStateStore", "_SqlRuns", "base.py", "_sql_runs.py"),
+        "create_run": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_runs.py"),
+        "idempotency_scope_predicate": ("SQLStateStore", "_SqlRuns", "base.py", "_sql_runs.py"),
+    },
+    "SQLStateStore": {
+        "_check_idempotency": ("SQLStateStore", "_SqlRuns", "base.py", "_sql_runs.py"),
+        "_creation_storage_format": ("SQLStateStore", "_SqlRuns", "base.py", "_sql_runs.py"),
+        "create_run": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_runs.py"),
+        "idempotency_scope_predicate": ("SQLStateStore", "_SqlRuns", "base.py", "_sql_runs.py"),
+    },
+    "SQLiteStateStore": {
+        "_check_idempotency": ("SQLStateStore", "_SqlRuns", "base.py", "_sql_runs.py"),
+        "_creation_storage_format": ("SQLStateStore", "_SqlRuns", "base.py", "_sql_runs.py"),
+        "create_run": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_runs.py"),
+        "idempotency_scope_predicate": ("SQLStateStore", "_SqlRuns", "base.py", "_sql_runs.py"),
+    },
+}
+
+
 def _canonical_writes_snapshot(snapshot, cls):
     import copy
 
@@ -321,6 +351,14 @@ def _canonical_writes_snapshot(snapshot, cls):
         assert member["layers"][-1] == (new_file, name), name
         member["owner"] = old_owner
         member["layers"][-1] = (old_file, name)
+    for name, (old_owner, new_owner, old_file, new_file) in RUNS_RELOCATIONS[cls.__name__].items():
+        assert name in result["members"]
+        member = result["members"][name]
+        assert member["owner"] == new_owner, name
+        assert member["layers"][-1] == (new_file, name), name
+        member["owner"] = old_owner
+        member["layers"][-1] = (old_file, name)
+    result["mro"].remove("_SqlRuns")
     result["mro"].remove("_SqlEvidence")
     result["mro"].remove("_SqlWrites")
     return result
@@ -483,6 +521,8 @@ async def test_explicit_private_wrapper_and_sanitized_database_failures(cls, nam
         "moved-file",
         "evidence-owner",
         "evidence-file",
+        "runs-owner",
+        "runs-file",
         "unlisted-file",
         "wrapper-count",
         "wrapper-order",
@@ -513,6 +553,13 @@ def test_proposed_exact_write_relocation_still_refuses_unplanned_snapshot_change
         raw["members"]["_patch_fence"]["owner"] = "SQLStateStore"
     elif change == "evidence-file":
         raw["members"]["_insert_trace"]["layers"][-1] = ("_other.py", "_insert_trace")
+    elif change == "runs-owner":
+        raw["members"]["_check_idempotency"]["owner"] = "SQLStateStore"
+    elif change == "runs-file":
+        raw["members"]["_creation_storage_format"]["layers"][-1] = (
+            "_other.py",
+            "_creation_storage_format",
+        )
     elif change == "unlisted-file":
         raw["members"]["_insert"]["layers"][-1] = ("_sql_writes.py", "_insert")
     elif change == "wrapper-count":

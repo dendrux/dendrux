@@ -16969,6 +16969,42 @@
   "crap": 3.03,
   "digest": "2fe6d2d6b44f"
  },
+ "src/dendrux/runtime/stores/sql/_sql_runs.py::_SqlRuns._check_idempotency": {
+  "complexity": 5,
+  "coverage": 1.0,
+  "crap": 5.0,
+  "digest": "b855fc93f283"
+ },
+ "src/dendrux/runtime/stores/sql/_sql_runs.py::_SqlRuns._creation_storage_format": {
+  "complexity": 6,
+  "coverage": 1.0,
+  "crap": 6.0,
+  "digest": "1deeb2933f6b"
+ },
+ "src/dendrux/runtime/stores/sql/_sql_runs.py::_SqlRuns.create_run": {
+  "complexity": 7,
+  "coverage": 0.9524,
+  "crap": 7.01,
+  "digest": "6b1867f598f1"
+ },
+ "src/dendrux/runtime/stores/sql/_sql_runs.py::_SqlRuns.create_run.<locals>._attempt": {
+  "complexity": 26,
+  "coverage": 0.98,
+  "crap": 26.01,
+  "digest": "38daa73f43be"
+ },
+ "src/dendrux/runtime/stores/sql/_sql_runs.py::_SqlRuns.create_run.<locals>._prove_creation": {
+  "complexity": 9,
+  "coverage": 1.0,
+  "crap": 9.0,
+  "digest": "de6b2ffb8704"
+ },
+ "src/dendrux/runtime/stores/sql/_sql_runs.py::_SqlRuns.idempotency_scope_predicate": {
+  "complexity": 2,
+  "coverage": 1.0,
+  "crap": 2.0,
+  "digest": "314505e191d5"
+ },
  "src/dendrux/runtime/stores/sql/_sql_sessions.py::_CheckedSessionFactory.__call__": {
   "complexity": 1,
   "coverage": 1.0,
@@ -17239,23 +17275,11 @@
   "crap": 4.0,
   "digest": "64b46b899ceb"
  },
- "src/dendrux/runtime/stores/sql/base.py::SQLStateStore._check_idempotency": {
-  "complexity": 5,
-  "coverage": 1.0,
-  "crap": 5.0,
-  "digest": "b855fc93f283"
- },
  "src/dendrux/runtime/stores/sql/base.py::SQLStateStore._complete_run_control": {
   "complexity": 1,
   "coverage": 1.0,
   "crap": 1.0,
   "digest": "612e2c0049b3"
- },
- "src/dendrux/runtime/stores/sql/base.py::SQLStateStore._creation_storage_format": {
-  "complexity": 6,
-  "coverage": 1.0,
-  "crap": 6.0,
-  "digest": "1deeb2933f6b"
  },
  "src/dendrux/runtime/stores/sql/base.py::SQLStateStore._descendant_batch": {
   "complexity": 3,
@@ -17477,29 +17501,6 @@
   "coverage": 1.0,
   "crap": 1.0,
   "digest": "da2bea5d3b50"
- },
- "src/dendrux/runtime/stores/sql/base.py::SQLStateStore.create_run": {
-  "complexity": 7,
-  "coverage": 0.9524,
-  "crap": 7.01,
-  "digest": "bc581ede28e1"
- },
- "src/dendrux/runtime/stores/sql/base.py::SQLStateStore.create_run.<locals>._attempt": {
-  "complexity": 26,
-  "coverage": 0.98,
-  "crap": 26.01,
-  "digest": "b22faf3680fe",
-  "waived": {
-   "date": "2026-11-02",
-   "reason": "Owner approved 2026-11-02: re-save from GitHub CI coverage; speed tests stopped counting toward coverage on 2026-11-01",
-   "rule": "worse"
-  }
- },
- "src/dendrux/runtime/stores/sql/base.py::SQLStateStore.create_run.<locals>._prove_creation": {
-  "complexity": 9,
-  "coverage": 0.9091,
-  "crap": 9.06,
-  "digest": "d80e15b6ee84"
  },
  "src/dendrux/runtime/stores/sql/base.py::SQLStateStore.event_sequence_expr": {
   "complexity": 1,
@@ -17740,12 +17741,6 @@
   "coverage": 1.0,
   "crap": 1.0,
   "digest": "46621a87df0c"
- },
- "src/dendrux/runtime/stores/sql/base.py::SQLStateStore.idempotency_scope_predicate": {
-  "complexity": 2,
-  "coverage": 1.0,
-  "crap": 2.0,
-  "digest": "314505e191d5"
  },
  "src/dendrux/runtime/stores/sql/base.py::SQLStateStore.insert_if_absent_stmt": {
   "complexity": 5,

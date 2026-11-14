@@ -4,13 +4,14 @@
   "old": "src/dendrux/runtime/stores/sql/base.py",
   "source_sha256": "4f96e1585590cce34bc27517c946c901c2fad4f9337db8468b6d89c9f77c4258",
   "sources": {
-    "src/dendrux/runtime/stores/sql/base.py": "53f25efa0dc52e4f1950ed747f9acb3db2b74f9d1b3e2f5ca16a5a24a24b4578",
+    "src/dendrux/runtime/stores/sql/base.py": "e53038c59b2930eef3b89d5f6c2d2397315e2d909ad390227631f7282cda81e6",
     "src/dendrux/runtime/stores/sql/_sql_host.py": "f3a1be68f99d6afea8d845e95fea3277a2e730967f6fc4811a38b6804a2b0a5b",
     "src/dendrux/runtime/stores/sql/_sql_sessions.py": "5ad0ed7a3b27acded5ccfb6ac3ca816712272c144e7492ba6d44d315acd9a5c4",
     "src/dendrux/runtime/stores/sql/_sql_support.py": "e57aaa22c139089f2a771c23ff20f51e88c248ea8e41011277b4bb51c5715fab",
     "src/dendrux/runtime/stores/sql/_sql_sweep_scan.py": "75ae229330b4a3f2a1b9c9fc54611cdfc9c1604a74fff76aa39c89e56cae883f",
     "src/dendrux/runtime/stores/sql/_sql_writes.py": "b2b448e7fa0668337664acb1844d61aab142e8edc544315172be59621e2edb4a",
-    "src/dendrux/runtime/stores/sql/_sql_evidence.py": "1f2aaecf6eb45b7dcd13a409593a1213a77c96cc177dbe24a690a91ef5eff5c0"
+    "src/dendrux/runtime/stores/sql/_sql_evidence.py": "1f2aaecf6eb45b7dcd13a409593a1213a77c96cc177dbe24a690a91ef5eff5c0",
+    "src/dendrux/runtime/stores/sql/_sql_runs.py": "5f39494a0f67f8dff15798ef2ae97895114747831d9624a854f974e41b9fcf12"
   },
   "owners": {
     "_RECOVERY_DESCRIPTOR_BYTES": "src/dendrux/runtime/stores/sql/_sql_support.py",
@@ -112,10 +113,10 @@
     "SQLStateStore.close": "src/dendrux/runtime/stores/sql/base.py",
     "SQLStateStore._check_connection": "src/dendrux/runtime/stores/sql/base.py",
     "SQLStateStore.store_identity": "src/dendrux/runtime/stores/sql/base.py",
-    "SQLStateStore._creation_storage_format": "src/dendrux/runtime/stores/sql/base.py",
-    "SQLStateStore.create_run": "src/dendrux/runtime/stores/sql/base.py",
-    "SQLStateStore.idempotency_scope_predicate": "src/dendrux/runtime/stores/sql/base.py",
-    "SQLStateStore._check_idempotency": "src/dendrux/runtime/stores/sql/base.py",
+    "SQLStateStore._creation_storage_format": "src/dendrux/runtime/stores/sql/_sql_runs.py",
+    "SQLStateStore.create_run": "src/dendrux/runtime/stores/sql/_sql_runs.py",
+    "SQLStateStore.idempotency_scope_predicate": "src/dendrux/runtime/stores/sql/_sql_runs.py",
+    "SQLStateStore._check_idempotency": "src/dendrux/runtime/stores/sql/_sql_runs.py",
     "SQLStateStore._dispatch_filter": "src/dendrux/runtime/stores/sql/_sql_writes.py",
     "SQLStateStore._check_dispatch_block": "src/dendrux/runtime/stores/sql/_sql_writes.py",
     "SQLStateStore._fence": "src/dendrux/runtime/stores/sql/_sql_writes.py",
@@ -268,28 +269,28 @@
     },
     {
       "root": "SQLStateStore.create_run",
-      "module": "src/dendrux/runtime/stores/sql/base.py",
+      "module": "src/dendrux/runtime/stores/sql/_sql_runs.py",
       "name": "_check_create_identifiers",
       "target": "dendrux.runtime.stores.sql._sql_support._check_create_identifiers",
       "count": 1
     },
     {
       "root": "SQLStateStore.create_run",
-      "module": "src/dendrux/runtime/stores/sql/base.py",
+      "module": "src/dendrux/runtime/stores/sql/_sql_runs.py",
       "name": "_creation_mark_proven",
       "target": "dendrux.runtime.stores.sql._sql_support._creation_mark_proven",
       "count": 1
     },
     {
       "root": "SQLStateStore.create_run",
-      "module": "src/dendrux/runtime/stores/sql/base.py",
+      "module": "src/dendrux/runtime/stores/sql/_sql_runs.py",
       "name": "_status_values",
       "target": "dendrux.runtime.stores.sql._sql_support._status_values",
       "count": 1
     },
     {
       "root": "SQLStateStore.create_run",
-      "module": "src/dendrux/runtime/stores/sql/base.py",
+      "module": "src/dendrux/runtime/stores/sql/_sql_runs.py",
       "name": "_creation_metadata",
       "target": "dendrux.runtime.stores.sql._sql_support._creation_metadata",
       "count": 1
@@ -653,7 +654,7 @@
     },
     {
       "root": "SQLStateStore.create_run",
-      "module": "src/dendrux/runtime/stores/sql/base.py",
+      "module": "src/dendrux/runtime/stores/sql/_sql_runs.py",
       "name": "write_blob_refs",
       "target": "dendrux.runtime._blob_catalog.write_blob_refs",
       "count": 1
