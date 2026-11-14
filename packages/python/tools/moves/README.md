@@ -55,3 +55,14 @@ base, provider snapshot or cumulative map fails the proof.
 After PR10, archive evidence outside code and remove the manifests/maps/receipt and
 the two temporary workflow jobs. Keep the reusable checkers, fixtures, owner guards,
 architecture contract and key-transfer tool. Remove discovery wiring with the jobs.
+
+Review hardening: `seams` entries must have an original imported binding and at least
+one matching lexical edit; unused entries fail. Metadata pins must follow their
+class/function definition. Both checker modes reject all star imports and unexplained
+unconditional top-level imports. Imports must preserve original runtime bindings or
+be explained by exact hoists, lexical owners/seams, re-exports, provider bases or
+scaffold typing; arbitrary additions beside an allowed import still fail.
+
+Use only the move-check CLI or `make move-proof` as proof gates. The in-memory
+`check_move` API deliberately trusts its snapshots for comparison/fixtures; the two
+supported gates verify immutable/current provider sources before invoking it.

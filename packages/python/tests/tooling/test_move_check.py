@@ -174,9 +174,11 @@ def test_an_extra_definition_fails_unless_allowed() -> None:
     assert check({"old": OLD, "other": extra}, allow_new=("brand_new",)).problems == []
 
 
-def test_imports_may_change_freely() -> None:
+def test_unexplained_imports_are_not_ignored() -> None:
     after = OLD.replace("import os\n", "import os\nimport sys\nfrom a import b\n")
-    assert check({"old": after}).problems == []
+    problems = check({"old": after}).problems
+    assert any("extra-import" in p and "import sys" in p for p in problems)
+    assert any("extra-import" in p and "from a import b" in p for p in problems)
 
 
 def test_the_module_docstring_is_not_compared_but_a_new_dunder_all_in_the_old_module_fails() -> (

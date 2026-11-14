@@ -18,8 +18,9 @@ nothing changed:
   class (so method resolution keeps its order). The remaining class body must equal the
   base body minus the moved methods, in order.
 
-Allowed edits (everything else is a mismatch): import statements and ``if TYPE_CHECKING:``
-blocks that only import; the module docstring; a literal ``__all__`` list in a *new* module
+Allowed edits (everything else is a mismatch): explained import bindings and
+``if TYPE_CHECKING:`` blocks that only import (star imports are always rejected);
+the module docstring; a literal ``__all__`` list in a *new* module
 (the old module's ``__all__`` must stay identical and every name in it must still be bound
 at module scope). ``--require-reexports`` also checks that each moved public name is imported
 by an unconditional, absolute, module-level ``from <new module> import name`` in the old module.
@@ -51,6 +52,7 @@ except ImportError:  # run as a script from packages/python/tools
     from tools import _ratchet as r
 
 from tools import _move_manifest as m
+from tools._move_imports import check_imports
 from tools._move_providers import validate_providers
 from tools.owner_bindings import check_bindings, check_globals
 
@@ -637,6 +639,10 @@ def check_move(
 
     ``old_key`` names the entry of ``after`` that is the old module itself (it may be absent).
     ``modules`` maps a key to its dotted module name (default: the key).
+
+    This is an in-memory comparison API, not a supported proof gate: it trusts
+    supplied provider snapshots. Only this module's CLI and ``move_ci`` are
+    supported gates; both call ``verify_provider_sources`` before comparison.
     """
     report = MoveReport()
     if move_manifest is not None:
@@ -675,6 +681,16 @@ def check_move(
     if old_key in trees or require_reexports:  # a deleted old module has no facade at all
         now = trees.get(old_key) or ast.Module(body=[], type_ignores=[])
         _check_exports(report, old_tree, now, report.moved, modules or {}, require_reexports)
+    report.problems.extend(
+        check_imports(
+            old_tree,
+            trees,
+            old_key=old_key,
+            modules=modules or {key: key for key in [old_key, *after]},
+            owners=where,
+            hosts={name: host.module for name, host in hosts.items()},
+        )
+    )
     return report
 
 
@@ -785,6 +801,17 @@ def _manifest_move(
             check_globals(old_source, after, modules[old_key], modules, manifest["owners"])
         )
         report.problems.extend(m.check_spans(old_source, after, manifest["owners"]))
+        report.problems.extend(
+            check_imports(
+                ast.parse(old_source),
+                {key: ast.parse(source) for key, source in after.items()},
+                old_key=old_key,
+                modules=modules,
+                owners=where,
+                hosts={name: host.module for name, host in hosts.items()},
+                manifest=manifest,
+            )
+        )
         if any(name not in report.moved for name in manifest["effects"]):
             report.problems.append("manifest named effect is unused")
     except (ValueError, TypeError, KeyError, SyntaxError, AttributeError) as exc:

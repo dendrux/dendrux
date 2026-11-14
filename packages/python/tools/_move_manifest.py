@@ -142,14 +142,18 @@ def lexical(
 ) -> None:
     entry_fields(entry, {"root", "module", "name", "target", "count"})
     root, module, name, target = (entry[k] for k in ("root", "module", "name", "target"))
+    if module not in trees:
+        raise ValueError(f"lexical module unknown: {module} (root {root})")
     if entry["count"] < 1:
         raise ValueError("lexical count must be positive")
     old_roots, new_roots = roots(old_tree, root), roots(trees[module], root)
     if len(old_roots) != len(new_roots) or not old_roots:
-        raise ValueError("lexical root missing or ambiguous")
+        raise ValueError(f"lexical root unknown or ambiguous: {root} in {module}")
     before = ScopeIndex(old_tree, old_module.rpartition(".")[0])
     now = ScopeIndex(trees[module], modules[module].rpartition(".")[0])
-    expected = seams.get(name) or f"{modules[owners.get(name, '')]}.{name}"
+    if name not in seams and (name not in owners or owners[name] not in modules):
+        raise ValueError(f"lexical binding owner unknown: {name} (root {root})")
+    expected = seams.get(name) or f"{modules[owners[name]]}.{name}"
     if target != expected:
         raise ValueError("lexical target is not the declared owner")
     old_reads = [
@@ -342,6 +346,9 @@ def metadata(
     found = [n for n in tree.body if ast.dump(n) == wanted]
     if len(found) != 1:
         raise ValueError("metadata pin missing/duplicated/mismatched")
+    definitions = roots(tree, root)
+    if len(definitions) != 1 or tree.body.index(found[0]) <= tree.body.index(definitions[0]):
+        raise ValueError(f"metadata pin must follow its definition: {root}")
     tree.body.remove(found[0])
 
 
@@ -424,6 +431,7 @@ def normalize(
     trees = {key: ast.parse(source) for key, source in after.items()}
     scaffolding(old_tree, trees, manifest["scaffolding"])
     original = copy.deepcopy(old_tree)
+    _validate_seams(original, manifest)
     _pin_logger(old_tree, manifest, old_key, modules[old_key])
     for node in old_tree.body:
         name = getattr(node, "name", None)
@@ -461,6 +469,19 @@ def normalize(
     for entry in manifest["metadata"]:
         metadata(original, trees, entry, modules[old_key])
     return ast.unparse(old_tree), {key: ast.unparse(tree) for key, tree in trees.items()}
+
+
+def _validate_seams(old: ast.Module, manifest: Mapping[str, Any]) -> None:
+    index = ScopeIndex(old)
+    for name, target in manifest["seams"].items():
+        binding = index.module.resolve(name)
+        consumed = any(
+            e.get("name") == name and e.get("target") == target for e in manifest["lexical"]
+        )
+        if binding is None or binding.kind != "import" or not consumed:
+            raise ValueError(
+                f"unused seam: {name}; require an original import and lexical consumer"
+            )
 
 
 def check_spans(old: str, after: Mapping[str, str], owners: Mapping[str, str]) -> list[str]:

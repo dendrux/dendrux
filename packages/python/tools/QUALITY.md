@@ -467,3 +467,21 @@ composition fail closed. No new decorators, wrappers, runtime contract methods o
 arbitrary executable edits are normalized. Original physical spans are measured
 before AST normalization, so whitespace cannot grow an inherited >80-line function,
 including one remaining in the facade.
+
+Review hardening: both comparison modes reject star imports anywhere in the residual
+or destination modules. Each unconditional top-level import must recreate an exact
+original runtime binding or be explained by a reviewed hoist, named lexical owner or
+seam, exact facade/member-owner re-export, provider base, or required scaffold typing
+binding. New annotation-only imports stay under a real `typing.TYPE_CHECKING` guard.
+An unexplained binding is reported as `extra-import` with its module, line and import.
+Seams require both an original import and a lexical consumer; metadata pins follow
+their definitions. Ruff proposals require explicit measurements, including zero for
+retained or removed source keys and zero-finding destination keys; omitted scores
+fail instead of removing an allowance.
+
+The only supported proof entry points are `tools/move_check.py` (CLI) and
+`tools/move_ci.py`. Both verify provider snapshots against immutable/current source
+before calling `check_move`. The in-memory `check_move` API trusts its supplied
+snapshots and is for comparison/fixtures; do not invoke it directly as a proof gate.
+Regression tests assert forged snapshots are refused before either gate reaches
+comparison.
