@@ -50,7 +50,7 @@ async def test_cancel_preserves_exception_despite_store_failure(store, path, fai
         failure = "finalize_with_event"
     secondary = RuntimeError("injected cancellation persistence failure")
     with (
-        patch("dendrux.runtime.runner._prepare_resume", preparing),
+        patch("dendrux.runtime._run_resume_prep._prepare_resume", preparing),
         patch.object(store, failure, AsyncMock(side_effect=secondary)),
     ):
         task = asyncio.create_task(
@@ -92,7 +92,7 @@ async def test_claimed_resume_prelude_preserves_error_and_releases(store, failur
     failed_hook = AsyncMock()
     forbidden_write = AsyncMock(side_effect=secondary)
     with (
-        patch("dendrux.runtime.runner.continuation", AsyncMock(side_effect=original)),
+        patch("dendrux.skills._session.continuation", AsyncMock(side_effect=original)),
         patch.object(notifier, "on_run_failed", failed_hook),
     ):
         action = resume_claimed(

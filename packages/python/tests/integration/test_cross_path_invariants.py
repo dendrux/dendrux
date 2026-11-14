@@ -15,7 +15,7 @@ import pytest
 from dendrux import Agent, tool
 from dendrux.errors import ProviderTimeoutError
 from dendrux.loops.base import BaseNotifier
-from dendrux.runtime import _run_entry, _run_observers
+from dendrux.runtime import _run_entry, _run_observers, _run_resume_replay
 from dendrux.runtime.context import (
     DelegationContext,
     DelegationDepthExceededError,
@@ -674,7 +674,7 @@ async def test_consumed_submission_keeps_error_handling(store, monkeypatch, kind
         await replay(*args, **kwargs)
         raise original
 
-    monkeypatch.setattr(runner, "_replay_resume_injected_history", after_replay)
+    monkeypatch.setattr(_run_resume_replay, "_replay_resume_injected_history", after_replay)
     with pytest.raises(RuntimeError) as caught:
         await invoke()
     assert caught.value is original
@@ -719,7 +719,7 @@ async def test_submission_failure_after_durable_work_never_releases(
             await replay(*args, **kwargs)
             raise original
 
-        monkeypatch.setattr(runner, "_replay_resume_injected_history", after_replay)
+        monkeypatch.setattr(_run_resume_replay, "_replay_resume_injected_history", after_replay)
     else:
         from dendrux.loops import react as execute
 

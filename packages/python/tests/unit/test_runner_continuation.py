@@ -10,7 +10,16 @@ from dendrux import Agent, chat
 from dendrux.llm.mock import MockLLM
 from dendrux.loops import _helpers
 from dendrux.loops.react import ReActLoop
-from dendrux.runtime import _reclaim, _run_events, _run_images, _run_outcome, runner
+from dendrux.runtime import (
+    _reclaim,
+    _run_events,
+    _run_images,
+    _run_outcome,
+    _run_resume_prep,
+    _run_resume_replay,
+    runner,
+    submit,
+)
 from dendrux.types import (
     ImagePart,
     ImageRef,
@@ -48,13 +57,13 @@ async def test_resumed_payload_on_both_entries(store, monkeypatch, entry, kind):
     paused = await agent.run("go", tenant_id=None)
     # Isolate caller arguments and the real builder from claim/media/replay machinery.
     monkeypatch.setattr(
-        runner,
+        _run_resume_prep,
         "_claim_resume",
         AsyncMock(
             side_effect=lambda store, run, raw, agent, expected, **kw: (store, expected, raw)
         ),
     )
-    monkeypatch.setattr(runner, "_replay_resume_injected_history", AsyncMock())
+    monkeypatch.setattr(_run_resume_replay, "_replay_resume_injected_history", AsyncMock())
     monkeypatch.setattr(_reclaim, "needs_resolution", AsyncMock(return_value=kind == "recovering"))
     monkeypatch.setattr(_reclaim, "resolve", AsyncMock(return_value=None))
     image = ImageRef("a" * 64, "image/png", 1, 1, 1)
@@ -85,7 +94,7 @@ async def test_resumed_payload_on_both_entries(store, monkeypatch, entry, kind):
     ):
         return store, expected, raw, trs, parts if text is not None else None
 
-    monkeypatch.setattr(runner, "_resume_submission", submission)
+    monkeypatch.setattr(_run_resume_prep, "_resume_submission", submission)
     monkeypatch.setattr(
         runner,
         "_stream_resume_images",
@@ -97,9 +106,9 @@ async def test_resumed_payload_on_both_entries(store, monkeypatch, entry, kind):
     )
     if kind == "input":
         monkeypatch.setattr(chat, "split_user_content", lambda value: ("answer", (object(),)))
-    monkeypatch.setattr(runner, "validate_result_names", Mock())
+    monkeypatch.setattr(submit, "validate_result_names", Mock())
     monkeypatch.setattr(
-        runner, "prepare_resume_results", AsyncMock(side_effect=lambda a, s, r, p, trs: trs)
+        submit, "prepare_resume_results", AsyncMock(side_effect=lambda a, s, r, p, trs: trs)
     )
     # Text input's image count is pinned directly below; public input media still uses its own seam.
     captured = []
@@ -187,7 +196,7 @@ async def test_resume_loop_kwargs_match_stream(store, monkeypatch):
         contexts[current] = ctx
         return ctx
 
-    monkeypatch.setattr(runner, "_prepare_resume", prepare)
+    monkeypatch.setattr(_run_resume_prep, "_prepare_resume", prepare)
     for current in ("resume", "resume_stream"):
         provider = MockLLM([LLMResponse(tool_calls=[ToolCall("client_read", id="call")])])
         agent = Agent(

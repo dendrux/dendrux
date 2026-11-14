@@ -13,7 +13,15 @@ from dendrux.errors import ProviderTimeoutError, RunFencedError
 from dendrux.llm.mock import MockLLM
 from dendrux.loops.base import BaseNotifier
 from dendrux.loops.react import ReActLoop
-from dendrux.runtime import _run_events, _run_images, _run_retry, replay, runner
+from dendrux.runtime import (
+    _run_events,
+    _run_images,
+    _run_resume_prep,
+    _run_retry,
+    replay,
+    runner,
+    submit,
+)
 from dendrux.runtime.persistence import PersistenceRecorder
 from dendrux.store import SQLiteStateStore
 from dendrux.types import LLMResponse, RunEventType, RunStatus, ToolCall, ToolResult
@@ -229,9 +237,9 @@ async def test_claim_failure_releases_before_failure_persistence(store, monkeypa
     agent, invoke = await entry_case(store, entry)
     notifier = observer()
     original = RuntimeError("governance_report_failed")
-    monkeypatch.setattr(runner, "report_governance_change", AsyncMock(side_effect=original))
+    monkeypatch.setattr(submit, "report_governance_change", AsyncMock(side_effect=original))
     release = AsyncMock(wraps=runner._release_claim)
-    monkeypatch.setattr(runner, "_release_claim", release)
+    monkeypatch.setattr(_run_resume_prep, "_release_claim", release)
     finalize = AsyncMock(wraps=store.finalize_with_event)
     monkeypatch.setattr(store, "finalize_run", finalize)
     monkeypatch.setattr(store, "finalize_with_event", finalize)

@@ -14,7 +14,7 @@ from sqlalchemy import event, update
 
 from dendrux.db.models import AgentRun
 from dendrux.errors import RunAlreadyTerminalError, StoreOutcomeUnknown
-from dendrux.runtime import runner, state, submit
+from dendrux.runtime import _run_resume_prep, runner, state, submit
 from dendrux.types import ApprovalDecision, LLMResponse, RunStatus, TextPart
 from tests._fixtures.storage import pin_storage_format
 from tests._helpers.runtime_paths import SUBMIT_KINDS, path_case
@@ -138,9 +138,7 @@ async def test_governance_claim_target_and_release(store, monkeypatch, path, fai
         if fails:
             raise original
 
-    monkeypatch.setattr(
-        submit if path == "tool_results" else runner, "report_governance_change", report
-    )
+    monkeypatch.setattr(submit, "report_governance_change", report)
     try:
         if fails and path != "resume_stream":
             with pytest.raises(RuntimeError) as caught:
@@ -180,7 +178,9 @@ async def test_claim_transaction_bytes(store, monkeypatch, path, storage_format)
         if not name.startswith("_") and inspect.iscoroutinefunction(method):
             monkeypatch.setattr(store, name, instrument(name, method))
     module, name = (
-        (runner, "_claim_resume") if path.startswith("resume") else (submit, "claim_or_raise")
+        (_run_resume_prep, "_claim_resume")
+        if path.startswith("resume")
+        else (submit, "claim_or_raise")
     )
     claim = getattr(module, name)
 
@@ -193,6 +193,7 @@ async def test_claim_transaction_bytes(store, monkeypatch, path, storage_format)
         finally:
             active = False
 
+    capture = AsyncMock(wraps=capture)
     monkeypatch.setattr(module, name, capture)
 
     def boundary(name):
@@ -217,6 +218,7 @@ async def test_claim_transaction_bytes(store, monkeypatch, path, storage_format)
         for name, listener in listeners:
             event.remove(engine, name, listener)
         await case.agent.close()
+    capture.assert_awaited_once()
     assert counts
     wire = (
         json.dumps({"calls": dict(sorted(counts.items())), "transactions": statements}, indent=2)
@@ -326,9 +328,9 @@ async def test_resume_status_fallbacks_and_release_status(monkeypatch, results, 
         calls.append(expected_status)
         return 3 if len(calls) == len(statuses) else False
 
-    monkeypatch.setattr(runner, "submission_validator", lambda *a, **kw: lambda raw: None)
-    monkeypatch.setattr(runner, "require_pause_id", lambda *a, **kw: None)
-    monkeypatch.setattr(runner, "_canonicalize_legacy_denials", lambda *a: None)
+    monkeypatch.setattr(submit, "submission_validator", lambda *a, **kw: lambda raw: None)
+    monkeypatch.setattr(submit, "require_pause_id", lambda *a, **kw: None)
+    monkeypatch.setattr(_run_resume_prep, "_canonicalize_legacy_denials", lambda *a: None)
     # The legacy store seam is exercised without depending on helper placement.
 
     async def method(run_id, *, expected_status, validate):
@@ -336,9 +338,9 @@ async def test_resume_status_fallbacks_and_release_status(monkeypatch, results, 
 
     store.claim_paused_run = method
     monkeypatch.setattr(state, "claimed_store", lambda *a: view)
-    monkeypatch.setattr(runner, "report_governance_change", AsyncMock(side_effect=original))
+    monkeypatch.setattr(submit, "report_governance_change", AsyncMock(side_effect=original))
     release = AsyncMock()
-    monkeypatch.setattr(runner, "_release_claim", release)
+    monkeypatch.setattr(_run_resume_prep, "_release_claim", release)
     with pytest.raises(RuntimeError) as caught:
         await runner._claim_resume(
             store, "run", raw, object(), expected, expected_pause_id=None, results=results
@@ -368,7 +370,7 @@ async def test_token_validation_order_is_preserved(monkeypatch, path):
         order.append("token")
         raise ValueError("token required")
 
-    module = runner if path == "resume" else submit
+    module = submit
     monkeypatch.setattr(module, "submission_validator", validator)
     monkeypatch.setattr(module, "require_pause_id", token)
     with pytest.raises(ValueError, match="token required"):
@@ -454,8 +456,8 @@ async def test_resume_payload_priority(store, monkeypatch, decisions, results, u
     case = await path_case(store, store._engine, "approve", ScriptedLLM([]))
     raw = await store.get_pause_state(case.run_id)
     checkpoint = await store.get_loop_state(case.run_id)
-    monkeypatch.setattr(runner, "submission_validator", lambda *a, **kw: lambda raw: None)
-    monkeypatch.setattr(runner, "_canonicalize_legacy_denials", lambda *a: None)
+    monkeypatch.setattr(submit, "submission_validator", lambda *a, **kw: lambda raw: None)
+    monkeypatch.setattr(_run_resume_prep, "_canonicalize_legacy_denials", lambda *a: None)
     payloads = []
 
     async def claim(run_id, **kwargs):
@@ -464,7 +466,7 @@ async def test_resume_payload_priority(store, monkeypatch, decisions, results, u
 
     monkeypatch.setattr(store, "submit_and_claim", claim)
     monkeypatch.setattr(state, "claimed_store", lambda *a: store)
-    monkeypatch.setattr(runner, "report_governance_change", AsyncMock())
+    monkeypatch.setattr(submit, "report_governance_change", AsyncMock())
     try:
         await runner._claim_resume(
             store,
@@ -502,10 +504,10 @@ async def test_descriptor_capability_gate_is_caller_specific(monkeypatch, path):
         submit_and_claim=AsyncMock(return_value=3),
     )
     if path == "resume":
-        monkeypatch.setattr(runner, "submission_validator", lambda *a, **kw: lambda raw: None)
-        monkeypatch.setattr(runner, "require_pause_id", lambda *a, **kw: None)
+        monkeypatch.setattr(submit, "submission_validator", lambda *a, **kw: lambda raw: None)
+        monkeypatch.setattr(submit, "require_pause_id", lambda *a, **kw: None)
         monkeypatch.setattr(state, "claimed_store", lambda *a: store)
-        monkeypatch.setattr(runner, "report_governance_change", AsyncMock())
+        monkeypatch.setattr(submit, "report_governance_change", AsyncMock())
         await runner._claim_resume(
             store, "run", raw, object(), "waiting_client_tool", expected_pause_id=None, results=[]
         )

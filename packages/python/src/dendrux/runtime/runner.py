@@ -18,21 +18,27 @@ Sprint 2 adds optional state_store for persistence. When provided:
 from __future__ import annotations
 
 import asyncio
-import json
-from contextlib import aclosing, asynccontextmanager
+import json as json
+from contextlib import aclosing as aclosing
+from contextlib import asynccontextmanager as asynccontextmanager
 from contextlib import nullcontext as nullcontext
 from copy import deepcopy
 from dataclasses import dataclass as dataclass
 from dataclasses import replace
 from functools import partial
-from typing import TYPE_CHECKING, Any, NamedTuple, NoReturn
+from typing import TYPE_CHECKING as TYPE_CHECKING
+from typing import Any as Any
 from typing import Literal as Literal
+from typing import NamedTuple as NamedTuple
+from typing import NoReturn as NoReturn
 from typing import get_args as get_args
 from typing import overload as overload
 
 import dendrux.chat as _chat
 import dendrux.loops._helpers as _hooks
 import dendrux.runtime.state as _state
+import dendrux.runtime.submit as _submit
+import dendrux.skills._session as _skills
 import dendrux.strategies.native as _native
 from dendrux import _codes
 from dendrux._lifecycle import CANCEL_FINALIZE_STATUS_VALUES as CANCEL_FINALIZE_STATUS_VALUES
@@ -51,9 +57,11 @@ from dendrux._lifecycle import (
     DenialReason,
     FailureReason,
     PauseReason,
-    StoredEventType,
 )
 from dendrux._lifecycle import TERMINAL_STATUSES as TERMINAL_STATUSES
+from dendrux._lifecycle import (
+    StoredEventType as StoredEventType,
+)
 from dendrux._meta_keys import BLOCKED_META_KEY as BLOCKED_META_KEY
 from dendrux._meta_keys import (
     CANCEL_PERSISTED_META_KEY,
@@ -98,18 +106,22 @@ from dendrux.loops._budget import BudgetCarry
 from dendrux.loops._helpers import notifier_span_link as notifier_span_link
 from dendrux.loops._helpers import notifier_trace_link as notifier_trace_link
 from dendrux.loops._helpers import (
-    notify_message,
-    order_observations,
-    project_message,
-    record_message,
-    record_run_started,
-    record_tool,
+    notify_message as notify_message,
 )
 from dendrux.loops._helpers import notify_run_failed as notify_run_failed
 from dendrux.loops._helpers import (
     notify_run_finished as notify_run_finished,
 )
 from dendrux.loops._helpers import notify_run_started as notify_run_started
+from dendrux.loops._helpers import (
+    order_observations,
+    record_message,
+    record_run_started,
+    record_tool,
+)
+from dendrux.loops._helpers import (
+    project_message as project_message,
+)
 from dendrux.loops._helpers import record_run_failed as record_run_failed
 from dendrux.loops._helpers import (
     record_run_finished as record_run_finished,
@@ -120,10 +132,12 @@ from dendrux.loops._policy_context import (
     static_denial,
 )
 from dendrux.loops.react import MANAGED_HANDOFF_KEY as MANAGED_HANDOFF_KEY
-from dendrux.loops.react import ReActLoop
+from dendrux.loops.react import ReActLoop as ReActLoop
 from dendrux.runtime import _managed as _managed
 from dendrux.runtime import (
-    _managed_budget,
+    _managed_budget as _managed_budget,
+)
+from dendrux.runtime import (
     _reclaim,
     _run_contracts,
     _run_entry,
@@ -133,6 +147,8 @@ from dendrux.runtime import (
     _run_observers,
     _run_outcome,
     _run_pending,
+    _run_resume_prep,
+    _run_resume_replay,
     _run_start,
     _run_tools,
 )
@@ -305,6 +321,51 @@ from dendrux.runtime._run_pending import _reread_moved as _reread_moved
 from dendrux.runtime._run_pending import (
     _stop_reason_from_meta as _stop_reason_from_meta,
 )
+from dendrux.runtime._run_resume_prep import _attempt_validator as _attempt_validator
+from dendrux.runtime._run_resume_prep import (
+    _canonicalize_legacy_denials as _canonicalize_legacy_denials,
+)
+from dendrux.runtime._run_resume_prep import _claim_resume as _claim_resume
+from dendrux.runtime._run_resume_prep import _load_pause_state as _load_pause_state
+from dendrux.runtime._run_resume_prep import _load_resume_pause as _load_resume_pause
+from dendrux.runtime._run_resume_prep import _overlay_pause_checkpoint as _overlay_pause_checkpoint
+from dendrux.runtime._run_resume_prep import _prepare_resume as _prepare_resume
+from dendrux.runtime._run_resume_prep import _read_resume_pause as _read_resume_pause
+from dendrux.runtime._run_resume_prep import _read_resume_state as _read_resume_state
+from dendrux.runtime._run_resume_prep import _release_claim as _release_claim
+from dendrux.runtime._run_resume_prep import _release_setup_failure as _release_setup_failure
+from dendrux.runtime._run_resume_prep import _report_claim_governance as _report_claim_governance
+from dendrux.runtime._run_resume_prep import _require_pause_agent as _require_pause_agent
+from dendrux.runtime._run_resume_prep import (
+    _resolve_resume_stream_store as _resolve_resume_stream_store,
+)
+from dendrux.runtime._run_resume_prep import _restore_pause_refs as _restore_pause_refs
+from dendrux.runtime._run_resume_prep import _resume_claim_fallbacks as _resume_claim_fallbacks
+from dendrux.runtime._run_resume_prep import _resume_claim_payload as _resume_claim_payload
+from dendrux.runtime._run_resume_prep import _resume_history as _resume_history
+from dendrux.runtime._run_resume_prep import _resume_session as _resume_session
+from dendrux.runtime._run_resume_prep import _resume_submission as _resume_submission
+from dendrux.runtime._run_resume_prep import _resumed_payload as _resumed_payload
+from dendrux.runtime._run_resume_replay import _claimed_in_call as _claimed_in_call
+from dendrux.runtime._run_resume_replay import (
+    _consume_injected_history as _consume_injected_history,
+)
+from dendrux.runtime._run_resume_replay import _mark_work as _mark_work
+from dendrux.runtime._run_resume_replay import (
+    _project_adopted_submission as _project_adopted_submission,
+)
+from dendrux.runtime._run_resume_replay import _record_blocked_replay as _record_blocked_replay
+from dendrux.runtime._run_resume_replay import (
+    _replay_resume_injected_history as _replay_resume_injected_history,
+)
+from dendrux.runtime._run_resume_replay import (
+    _replay_submission_or_stop as _replay_submission_or_stop,
+)
+from dendrux.runtime._run_resume_replay import _replay_tool_result as _replay_tool_result
+from dendrux.runtime._run_resume_replay import _replay_user_input as _replay_user_input
+from dendrux.runtime._run_resume_replay import _replayed_result_blocked as _replayed_result_blocked
+from dendrux.runtime._run_resume_replay import _resolve_recovery as _resolve_recovery
+from dendrux.runtime._run_resume_replay import _resume_blocked_result as _resume_blocked_result
 from dendrux.runtime._run_retry import _check_retry_source as _check_retry_source
 from dendrux.runtime._run_retry import _refresh_retry_user as _refresh_retry_user
 from dendrux.runtime._run_retry import _refuse_blocked_retry as _refuse_blocked_retry
@@ -394,47 +455,74 @@ from dendrux.runtime.stores._limits_fit import ensure_agent_limits_fit
 from dendrux.runtime.submit import GOVERNANCE_KEY as GOVERNANCE_KEY
 from dendrux.runtime.submit import _claim_failure_mapping as _claim_failure_mapping
 from dendrux.runtime.submit import (
-    _claim_request,
-    _claim_submission,
-    _claimed_submission_view,
+    _claim_request as _claim_request,
+)
+from dendrux.runtime.submit import (
+    _claim_submission as _claim_submission,
+)
+from dendrux.runtime.submit import (
+    _claimed_submission_view as _claimed_submission_view,
+)
+from dendrux.runtime.submit import (
     _release_supported,
-    legacy_approval_denial,
-    prepare_resume_results,
-    report_governance_change,
-    require_pause_id,
-    submission_validator,
-    validate_result_names,
 )
 from dendrux.runtime.submit import governance_snapshot as governance_snapshot
+from dendrux.runtime.submit import (
+    legacy_approval_denial as legacy_approval_denial,
+)
+from dendrux.runtime.submit import (
+    prepare_resume_results as prepare_resume_results,
+)
+from dendrux.runtime.submit import (
+    report_governance_change as report_governance_change,
+)
+from dendrux.runtime.submit import (
+    require_pause_id as require_pause_id,
+)
+from dendrux.runtime.submit import (
+    submission_validator as submission_validator,
+)
+from dendrux.runtime.submit import (
+    validate_result_names as validate_result_names,
+)
 from dendrux.skills._session import META_KEY as META_KEY
-from dendrux.skills._session import SkillSession, continuation, current
+from dendrux.skills._session import SkillSession as SkillSession
+from dendrux.skills._session import continuation as continuation
+from dendrux.skills._session import current as current
 from dendrux.skills._session import (
     current as current_skill_session,  # noqa: F401 - Frozen compatibility alias.
 )
 from dendrux.strategies.native import NativeToolCalling as NativeToolCalling
 from dendrux.types import (
-    AgentStep,
+    AgentStep as AgentStep,
+)
+from dendrux.types import (
     ApprovalDecision,
     GovernanceEventType,
-    ImagePart,
-    ImageViewState,
     Message,
     PauseState,
-    Role,
     RunEventType,
     RunStatus,
     UsageStats,
     _usage_from_dict,
-    tool_result_message,
 )
 from dendrux.types import (
     ErrorInfo as ErrorInfo,
 )
 from dendrux.types import IdempotencyConflictError as IdempotencyConflictError
 from dendrux.types import (
+    ImagePart as ImagePart,
+)
+from dendrux.types import (
     ImageRef as ImageRef,
 )
+from dendrux.types import (
+    ImageViewState as ImageViewState,
+)
 from dendrux.types import ReplaySummary as ReplaySummary
+from dendrux.types import (
+    Role as Role,
+)
 from dendrux.types import RunAlreadyActiveError as RunAlreadyActiveError
 from dendrux.types import StopReason as StopReason
 from dendrux.types import (
@@ -445,13 +533,20 @@ from dendrux.types import (
     content_part_from_dict as content_part_from_dict,
 )
 from dendrux.types import generate_ulid as generate_ulid
+from dendrux.types import (
+    tool_result_message as tool_result_message,
+)
 
 if TYPE_CHECKING:
     from collections.abc import (
         AsyncGenerator,
-        AsyncIterator,
         Callable,
-        Sequence,
+    )
+    from collections.abc import (
+        AsyncIterator as AsyncIterator,
+    )
+    from collections.abc import (
+        Sequence as Sequence,
     )
 
     from dendrux.agent import Agent
@@ -460,7 +555,9 @@ if TYPE_CHECKING:
     from dendrux.media._catalog import BlobEdge as BlobEdge
     from dendrux.media._image import UserContent
     from dendrux.media._runtime import ImageRuntime
-    from dendrux.runtime._continuation_guardrails import _SubmissionProjection
+    from dendrux.runtime._continuation_guardrails import (
+        _SubmissionProjection as _SubmissionProjection,
+    )
     from dendrux.runtime._entry_guardrails import _EntryProjection as _EntryProjection
     from dendrux.runtime.state import ClaimResult, RunRecord, StateStore
     from dendrux.strategies.base import Strategy
@@ -472,18 +569,6 @@ if TYPE_CHECKING:
         ToolCall,
         ToolResult,
     )
-
-
-async def _resolve_resume_stream_store(
-    store: StateStore | None, resolver: Callable[[], Any] | None
-) -> StateStore:
-    if store is None and resolver is not None:
-        store = await resolver()
-    if store is None:
-        raise ValueError(
-            "resume_stream() requires persistence. Pass database_url or state_store to the agent."
-        )
-    return store
 
 
 def _budget_carry_kwargs(loop_method: Any, pause_state: PauseState) -> dict[str, Any]:
@@ -606,572 +691,6 @@ async def resume_with_input(
         expected_pause_id=expected_pause_id,
         _tenant_explicit=_tenant_explicit,
     )
-
-
-async def _load_pause_state(
-    store: StateStore,
-    run_id: str,
-    raw: dict[str, Any],
-    agent: Agent,
-    provider: LLMProvider,
-    *,
-    reads: _run_contracts._PauseReads | None = None,
-) -> PauseState:
-    from dendrux.errors import PersistenceError, RunNotReclaimableError
-    from dendrux.runtime.replay import rebuild_history
-    from dendrux.types import InputValidationError
-
-    pause = PauseState.from_dict(raw)
-    if pause.schema_version != 2:
-        return pause
-    record = reads.record if reads is not None else await store.get_run(run_id)
-    if record is None or record.storage_format != STORAGE_FORMAT_CHECKPOINTED:
-        _codes.log_code(logger, _codes.PAUSE_FORMAT_UNSUPPORTED, run_id=run_id)
-        raise PersistenceError(code="pause_format_unsupported")
-    checkpoint = (
-        getattr(store, "loop_state", None)
-        if getattr(store, "storage_format", None) == STORAGE_FORMAT_CHECKPOINTED
-        else None
-    )
-    if checkpoint is None:
-        checkpoint = await store.get_loop_state(run_id)
-    if not checkpoint:
-        _codes.log_code(logger, _codes.PAUSE_FORMAT_UNSUPPORTED, run_id=run_id)
-        raise PersistenceError(code="pause_format_unsupported")
-    try:
-        messages = await rebuild_history(
-            store,
-            run_id,
-            limits=agent._limits,
-            reasoning_for=pause.provider_kwargs.get("model") or provider.model,
-        )
-    except RunNotReclaimableError as exc:
-        raise InputValidationError("history", FailureReason.HISTORY_TOO_LARGE.value) from exc
-    # Strategy owns the system prompt; seeds retain it for audit/reconstruction.
-    pause.history = [m for m in messages.messages if m.role != Role.SYSTEM]
-    if reads is not None:
-        reads.history_records = messages.records
-        reads.checkpoint = checkpoint
-    await _overlay_pause_checkpoint(pause, store, run_id, agent, checkpoint, messages.steps)
-    return pause
-
-
-async def _overlay_pause_checkpoint(
-    pause: PauseState,
-    store: StateStore,
-    run_id: str,
-    agent: Agent,
-    checkpoint: dict[str, Any],
-    steps: list[AgentStep],
-    *,
-    recovery: bool = False,
-) -> None:
-    from dendrux.types import _usage_from_dict
-
-    pause.steps = steps
-    # Reclaim tolerates absent counters; resume rejects incomplete checkpoints.
-    if recovery:
-        pause.iteration = checkpoint.get("iteration", 0)
-        pause.trace_order_offset = checkpoint.get("trace_order_offset", 0)
-        pause.usage = _usage_from_dict(checkpoint.get("usage", {}))
-        pause.provider_kwargs = dict(checkpoint.get("provider_kwargs", {}))
-    else:
-        pause.usage = _usage_from_dict(checkpoint["usage"])
-        pause.iteration = checkpoint["iteration"]
-        pause.trace_order_offset = checkpoint["trace_order_offset"]
-        pause.provider_kwargs = dict(checkpoint["provider_kwargs"])
-    await _restore_pause_refs(
-        pause,
-        store,
-        run_id,
-        agent,
-        checkpoint,
-        missing_code=FailureReason.RECOVERY_STATE_MISSING.value
-        if recovery
-        else "pause_format_unsupported",
-    )
-
-
-async def _restore_pause_refs(
-    pause: PauseState,
-    store: StateStore,
-    run_id: str,
-    agent: Agent,
-    checkpoint: dict[str, Any],
-    *,
-    missing_code: str,
-) -> None:
-    from dendrux.errors import PersistenceError
-
-    for kind, ref in (
-        ("image_view", checkpoint.get("image_view_ref")),
-        ("skills_session", checkpoint.get("skills", {}).get("session_ref")),
-        ("clarification", checkpoint.get("clarification_ref")),
-    ):
-        if ref is None:
-            continue
-        state_trace = await store.get_trace(run_id, ref)
-        if state_trace is None:
-            raise PersistenceError(code=missing_code)
-        payload = json.loads(state_trace.content)
-        if kind == "image_view":
-            pause.image_view = ImageViewState.from_dict(payload)
-        elif kind == "skills_session":
-            session = _run_entry.current_skill_session(agent)
-            if session is not None:
-                session.restore_snapshot(payload)
-        else:
-            pause.pause_message = payload.get("pause_message")
-
-
-def _resumed_payload(
-    expected_status: str,
-    tool_results: list[ToolResult] | None,
-    user_input: str | None,
-    user_parts: tuple[ContentPart, ...] | None,
-) -> dict[str, Any]:
-    resume_data: dict[str, Any] = {"resumed_from": expected_status}
-    if tool_results is not None:
-        submitted: list[dict[str, Any]] = []
-        for tr in tool_results:
-            entry: dict[str, Any] = {"call_id": tr.call_id, "name": tr.name, "success": tr.success}
-            if tr.images:
-                entry["image_count"] = len(tr.images)
-            submitted.append(entry)
-        resume_data["submitted_results"] = submitted
-    elif user_input is not None:
-        resume_data["user_input"] = user_input
-        if user_parts is not None:
-            resume_data["image_count"] = sum(1 for p in user_parts if isinstance(p, ImagePart))
-    return resume_data
-
-
-def _resume_history(
-    pause_state: PauseState,
-    tool_results: list[ToolResult] | None,
-    user_input: str | None,
-    user_parts: tuple[ContentPart, ...] | None,
-    submission_projection: _SubmissionProjection | None,
-) -> list[Message]:
-    history = list(pause_state.history)
-
-    if submission_projection is not None:
-        history.extend(submission_projection.messages)
-    elif tool_results is not None:
-        for tr in tool_results:
-            history.append(tool_result_message(tr))  # noqa: PERF401 - validation can raise; keep incremental appends
-    elif user_parts is not None:
-        history.append(Message.with_parts(Role.USER, user_parts))
-    elif user_input is not None:
-        history.append(Message(role=Role.USER, content=user_input))
-    return history
-
-
-async def _prepare_resume(
-    run_id: str,
-    pause_state: PauseState,
-    *,
-    state_store: StateStore,
-    agent: Agent,
-    provider: LLMProvider,
-    strategy: Strategy | None = None,
-    loop: Loop | None = None,
-    expected_status: str,
-    tool_results: list[ToolResult] | None = None,
-    user_input: str | None = None,
-    extra_notifier: LoopNotifier | None = None,
-    user_parts: tuple[ContentPart, ...] | None = None,
-    tenant_id: str | None = None,
-    pii_mapping: dict[str, str] | None = None,
-    history_records: Any = None,
-    pause_data: dict[str, Any] | None = None,
-    submission_projection: _SubmissionProjection | None = None,
-    recovering: bool = False,
-) -> _run_contracts._ResumeContext:
-    """Build everything needed to re-enter the loop after a resume.
-
-    Receives an already-loaded PauseState — does NOT load pause data or
-    claim the run. Those steps are owned by the caller (_resume_core for
-    direct resume, resume_stream for streaming, resume_claimed for
-    post-submit_and_claim resume).
-
-    Steps performed:
-      1. Record durable run.resumed event (the store allocates its index)
-      2. Build resume history (inject tool results or user input)
-      3. Create recorder with correct trace offset
-      4. Notify recorder of injected messages
-    """
-    from dendrux.runtime.persistence import PersistenceRecorder
-    from dendrux.tool import get_tool_def
-
-    resolved_strategy = strategy or _native.NativeToolCalling()
-    resolved_loop = loop or agent.loop or ReActLoop()
-    _run_tools._validate_loop_skill_compat(agent, resolved_loop)
-
-    from dendrux.runtime._continuation_guardrails import _submission_evidence
-
-    async with _submission_evidence(
-        state_store,
-        run_id,
-        submission_projection is not None and submission_projection.block is not None,
-    ):
-        await _run_events._emit_event(
-            state_store,
-            run_id,
-            StoredEventType.RUN_RESUMED.value,
-            _resumed_payload(expected_status, tool_results, user_input, user_parts),
-        )
-
-    history = (
-        list(pause_state.history)
-        if recovering
-        else _resume_history(
-            pause_state, tool_results, user_input, user_parts, submission_projection
-        )
-    )
-
-    # 4. Create recorder with correct trace offset
-    next_index = getattr(state_store, "get_next_trace_index", None)
-    if next_index is not None:
-        trace_order_offset = await next_index(run_id)
-    else:
-        # Compatibility for custom stores predating the scalar index read.
-        traces = await state_store.get_traces(run_id)
-        trace_order_offset = max((t.order_index for t in traces), default=-1) + 1
-
-    if pause_state.schema_version == 2:
-        trace_order_offset = max(trace_order_offset, pause_state.trace_order_offset)
-
-    from dendrux.runtime._subagents import subagent_tool_def
-
-    target_lookup = {}
-    for fn in agent.tools:
-        td = get_tool_def(fn)
-        target_lookup[td.name] = td.target
-    for child in agent.subagents:
-        target_lookup[child.name] = subagent_tool_def(child).target
-    from dendrux.guardrails import GuardrailEngine
-    from dendrux.guardrails._engine import _entry_engine
-
-    run_guardrails = (
-        _entry_engine(run_id)
-        or GuardrailEngine(agent.guardrails, pii_mapping=pii_mapping, run_id=run_id)
-        if pause_state.schema_version == 2 and agent.guardrails
-        else None
-    )
-    recorder = PersistenceRecorder(
-        state_store,
-        run_id,
-        model=provider.model,
-        provider_name=type(provider).__name__,
-        target_lookup=target_lookup,
-        initial_order_index=trace_order_offset,
-        guardrail_engine=run_guardrails,
-        **_run_images._recorder_image_kwargs(tenant_id, provider),
-    )
-
-    await _managed_budget.restore_recorder(recorder, agent, history_records, recovering)
-    recorder._resume_pause_data = pause_data
-
-    # NOTE: lifecycle hooks (record_run_started/notify_run_started) and
-    # injected-history replay are intentionally NOT done here. The caller
-    # fires them inside its own try/except so a failure during replay still
-    # pairs with on_run_failed. See _replay_resume_injected_history below.
-
-    await _run_tools._emit_declared_tools(agent, recorder, extra_notifier, run_id)
-    return _run_contracts._ResumeContext(
-        history=history,
-        recorder=recorder,
-        notifier=extra_notifier,
-        pause_state=pause_state,
-        resolved_loop=resolved_loop,
-        resolved_strategy=resolved_strategy,
-    )
-
-
-def _mark_work(callback: Callable[[], None] | None) -> None:
-    if callback is not None:
-        callback()
-
-
-async def _consume_injected_history(
-    ctx: _run_contracts._ResumeContext, on_consumed: Callable[[], None] | None
-) -> None:
-    consume = getattr(ctx.recorder, "consume_resume", None)
-    if consume is None:
-        return
-    state = getattr(ctx.recorder, "_loop_state", {})
-    had_submission = state.get("submission") is not None
-    start = len(ctx.pause_state.history)
-    for index in range(start, len(ctx.history)):
-        ctx.history[index] = await project_message(ctx.recorder, ctx.history[index])
-    await consume(ctx.history[start:])
-    if had_submission and getattr(ctx.recorder, "_loop_state", {}).get("submission") is None:
-        _mark_work(on_consumed)
-
-
-async def _replay_tool_result(
-    ctx: _run_contracts._ResumeContext,
-    run_id: str,
-    tc: ToolCall,
-    tr: ToolResult,
-    msg: Message,
-    on_consumed: Callable[[], None] | None,
-) -> None:
-    from dendrux.loops._helpers import notify_tool as _notify_tool
-    from dendrux.loops._helpers import notify_tool_started as _notify_tool_started
-
-    iteration = ctx.pause_state.iteration
-    blocked = await _replayed_result_blocked(ctx, run_id, tr, msg)
-    if blocked is not None:
-        # A claim made without projection: record only the projected evidence and stop,
-        # before the raw tool message reaches any trace or callback.
-        _mark_work(on_consumed)
-        await _record_blocked_replay(ctx, run_id, tc, blocked, iteration)
-    if ctx.pause_state.schema_version != 2:
-        await ctx.recorder.on_tool_started(run_id, tc, iteration)
-    await _notify_tool_started(ctx.notifier, run_id, tc, iteration)
-    await ctx.recorder.on_message_appended(run_id, msg, iteration)
-    _mark_work(on_consumed)
-    await record_tool(ctx.recorder, run_id, tc, tr, iteration)
-    await notify_message(ctx.notifier, run_id, msg, iteration)
-    await _notify_tool(ctx.notifier, run_id, tc, tr, iteration)
-
-
-async def _replayed_result_blocked(
-    ctx: _run_contracts._ResumeContext, run_id: str, tr: ToolResult, message: Message
-) -> Any:
-    from dataclasses import replace
-
-    from dendrux.guardrails._engine import _entry_engine
-    from dendrux.loops._helpers import _BlockedObservationError, _project_tool_message
-
-    engine = getattr(ctx.recorder, "guardrail_engine", None) or _entry_engine(run_id)
-    if engine is None:
-        return None
-    projected, findings, error = await _project_tool_message(engine, tr, message)
-    if error is None:
-        return None
-    clean = replace(tr, payload=projected.content, error=None, meta={}, notes=())
-    return _BlockedObservationError(projected, findings, error, clean)
-
-
-async def _record_blocked_replay(
-    ctx: _run_contracts._ResumeContext, run_id: str, tc: ToolCall, blocked: Any, iteration: int
-) -> NoReturn:
-
-    from contextlib import nullcontext
-
-    from dendrux.loops._helpers import _record_tool_projection
-    from dendrux.loops._helpers import notify_tool as _notify_tool
-
-    scope = getattr(ctx.recorder, "observation_scope", None)
-    async with scope() if scope is not None else nullcontext():
-        await _record_tool_projection(
-            ctx.recorder, run_id, tc, blocked.result, iteration, blocked.message, blocked=True
-        )
-    await _notify_tool(ctx.notifier, run_id, tc, blocked.result, iteration)
-    raise blocked
-
-
-async def _project_adopted_submission(
-    store: StateStore,
-    run_id: str,
-    raw: dict[str, Any] | None,
-    status: str,
-    tool_results: list[ToolResult] | None,
-    user_input: str | None,
-    user_parts: tuple[ContentPart, ...] | None,
-    decisions: list[tuple[str, ApprovalDecision]] | None,
-    *,
-    skip_claim: bool,
-    stored: dict[str, Any] | None = None,
-    pending: Sequence[ToolCall] = (),
-) -> tuple[
-    list[ToolResult] | None,
-    str | None,
-    tuple[ContentPart, ...] | None,
-    list[tuple[str, ApprovalDecision]] | None,
-    _SubmissionProjection | None,
-]:
-    """Project a submission this call did not claim, once, before anything stores it.
-
-    ``stored`` is the unconsumed payload reclaim found in the pause row: only its verdict
-    is retained (recovery consumes the stored values itself), so a block stops the run
-    before recovery resolution writes any decision, reason or trace. Its texts are
-    projected in the forms recovery sends (a denial as the ``pending`` call's tool
-    result), so recovery reuses each verdict rather than scanning the text again; a denial
-    reason that JSON escaping changes is also scanned once as its raw text.
-    """
-    from dendrux.guardrails._engine import _entry_engine
-    from dendrux.runtime._continuation_guardrails import (
-        _project_submission,
-        _SubmissionProjection,
-    )
-    from dendrux.runtime.submit import deserialize_decisions, deserialize_tool_results
-
-    if _entry_engine(run_id) is None or _claimed_in_call(store, run_id, skip_claim=skip_claim):
-        return tool_results, user_input, user_parts, decisions, None
-    payload = (
-        stored
-        if stored is not None
-        else _resume_claim_payload(
-            run_id, raw, status, tool_results, user_input, user_parts, decisions
-        )
-        if raw is not None
-        else None
-    )
-    projection = _SubmissionProjection()
-    clean, _ = await _project_submission(
-        run_id,
-        payload,
-        projection=projection,
-        denied_calls={tc.id: tc for tc in pending} if stored is not None else None,
-    )
-    if clean is None or stored is not None:
-        kept = projection if stored is not None else None
-        return tool_results, user_input, user_parts, decisions, kept
-    return (
-        deserialize_tool_results(clean["submitted_tool_results"])
-        if tool_results is not None
-        else None,
-        clean.get("submitted_user_input"),
-        _run_images._stored_parts(clean.get("submitted_user_parts")),
-        deserialize_decisions(clean["submitted_decisions"]) if decisions is not None else None,
-        projection,
-    )
-
-
-def _claimed_in_call(store: StateStore, run_id: str, *, skip_claim: bool) -> bool:
-    """Whether this call won the claim it continues (its own resume claim, or a submission
-    claim it made). Such a continuation checks only the already-loaded row; adoption and
-    reclaim also run the scoped lookup, which sees a legacy blocked event."""
-    from dendrux.runtime._blocked_content import _claimed_here
-
-    return not skip_claim or _claimed_here(store, run_id)
-
-
-async def _replay_submission_or_stop(
-    ctx: _run_contracts._ResumeContext,
-    run_id: str,
-    *,
-    recovering: bool,
-    tool_results: list[ToolResult] | None,
-    user_input: str | None,
-    on_consumed: Callable[[], None] | None,
-    input_block: Any = None,
-) -> RunResult | None:
-    """Replay the submitted history (not when recovering); a blocked result stops."""
-    from dendrux.loops._helpers import _BlockedObservationError
-
-    if recovering:
-        return (
-            await _resume_blocked_result(ctx, run_id, input_block)
-            if input_block is not None
-            else None
-        )
-    try:
-        await _replay_resume_injected_history(
-            ctx,
-            run_id,
-            tool_results=tool_results,
-            user_input=user_input,
-            on_consumed=on_consumed,
-            input_block=input_block,
-        )
-        if input_block is not None:
-            return await _resume_blocked_result(ctx, run_id, input_block)
-    except _BlockedObservationError as blocked:
-        return await _resume_blocked_result(ctx, run_id, blocked)
-    return None
-
-
-async def _resolve_recovery(
-    agent: Agent,
-    store: StateStore,
-    run_id: str,
-    ctx: _run_contracts._ResumeContext,
-    *,
-    image_runtime: Any,
-    tenant_id: str | None,
-    on_work: Callable[[], None] | None,
-) -> RunResult | None:
-    """Recovery resolution; a submitted message it would send that projects as blocked
-    stops the run before consumption, with the mark committed with its first evidence."""
-    try:
-        return await _reclaim.resolve(
-            agent,
-            store,
-            run_id,
-            ctx,
-            image_runtime=image_runtime,
-            tenant_id=tenant_id,
-            on_work=on_work,
-        )
-    except _reclaim._RecoveryBlockedError as stopped:
-        return await _resume_blocked_result(ctx, run_id, stopped.blocked)
-
-
-async def _resume_blocked_result(
-    ctx: _run_contracts._ResumeContext, run_id: str, blocked: Any
-) -> RunResult:
-    """The normal guardrail outcome for a resumed submission stopped by blocked content."""
-    from dendrux.guardrails._engine import _entry_engine
-    from dendrux.runtime._entry_guardrails import _EntryProjection
-
-    projection = _EntryProjection(_entry_engine(run_id), blocked.error, blocked.findings)
-    result = await _run_entry._blocked_entry_result(
-        projection, ctx.recorder, ctx.notifier, run_id, "", None, []
-    )
-    result.iteration_count = ctx.pause_state.iteration + 1
-    result.steps = list(ctx.pause_state.steps)
-    return result
-
-
-async def _replay_resume_injected_history(
-    ctx: _run_contracts._ResumeContext,
-    run_id: str,
-    *,
-    tool_results: list[ToolResult] | None,
-    user_input: str | None,
-    on_consumed: Callable[[], None] | None = None,
-    input_block: Any = None,
-) -> None:
-    await _consume_injected_history(ctx, on_consumed)
-    if tool_results is not None:
-        pending = {tc.id: tc for tc in ctx.pause_state.pending_tool_calls}
-        start = len(ctx.pause_state.history)
-        for index, result in enumerate(tool_results):
-            await _replay_tool_result(
-                ctx,
-                run_id,
-                pending[result.call_id],
-                result,
-                ctx.history[start + index],
-                on_consumed,
-            )
-    elif user_input is not None:
-        await _replay_user_input(ctx, run_id, on_consumed, input_block)
-    order_observations(ctx.recorder, ctx.history)
-
-
-async def _replay_user_input(
-    ctx: _run_contracts._ResumeContext,
-    run_id: str,
-    on_consumed: Callable[[], None] | None,
-    input_block: Any,
-) -> None:
-    """Record the resumed user turn; an adopted input that projected as blocked is
-    recorded as its placeholder together with the run mark, then stops the run."""
-    from dendrux.loops._helpers import _evidence_scope
-
-    msg = ctx.history[-1]
-    async with _evidence_scope(ctx.recorder, run_id, input_block is not None):
-        await ctx.recorder.on_message_appended(run_id, msg, ctx.pause_state.iteration)
-    _mark_work(on_consumed)
-    await notify_message(ctx.notifier, run_id, msg, ctx.pause_state.iteration)
-    if input_block is not None:
-        raise input_block
 
 
 async def _resume_pause_barrier(state_store: StateStore, run_id: str) -> RunStatus | None:
@@ -1355,7 +874,7 @@ async def _approval_policy_denial(
         data,
         correlation_id=tc.id,
     )
-    _mark_work(on_work)
+    _run_resume_replay._mark_work(on_work)
     await notify_governance(
         notifier,
         run_id,
@@ -1452,14 +971,14 @@ async def _execute_approved_tools(
     async def _append(tc: ToolCall, tr: ToolResult, *, executed: bool = True) -> None:
         if executed:
             await record_tool(recorder, run_id, tc, tr, iteration)
-            _mark_work(on_work)
+            _run_resume_replay._mark_work(on_work)
             await _ntfy_tool(notifier, run_id, tc, tr, iteration, warnings=notifier_warnings)
         result_msg = _format_result(strategy, tr)
         if not executed or tr.meta.get("code") == "max_calls":
             result_msg.meta[NOT_EXECUTED_META_KEY] = True
         target_history.append(result_msg)
         result_msg = await record_message(recorder, run_id, result_msg, iteration)
-        _mark_work(on_work)
+        _run_resume_replay._mark_work(on_work)
         target_history[-1] = result_msg
         await _ntfy_msg(notifier, run_id, result_msg, iteration, warnings=notifier_warnings)
         results.append((tc, tr))
@@ -1500,7 +1019,7 @@ async def _execute_approved_tools(
             )
 
         if isinstance(lookups.fn.get(tc.name), SkillTool):
-            _mark_work(on_work)
+            _run_resume_replay._mark_work(on_work)
             outcome_s = await _process_tool_calls(
                 step=AgentStep(reasoning=None, action=tc),
                 call_counts=counts,
@@ -1534,7 +1053,7 @@ async def _execute_approved_tools(
         invalid_result = check_tool_call(tc, lookups.defs.get(tc.name))
         if invalid_result is None:
             await _rec_tool_started(recorder, run_id, tc, iteration)
-            _mark_work(on_work)
+            _run_resume_replay._mark_work(on_work)
             await _ntfy_tool_started(notifier, run_id, tc, iteration, warnings=notifier_warnings)
             from dendrux.loops._helpers import lease_scope
 
@@ -1734,354 +1253,6 @@ def _pending_decision_map(pause_state: PauseState) -> dict[str, ApprovalDecision
         )
         for call_id, d in pause_state.pending_decisions.items()
     }
-
-
-def _canonicalize_legacy_denials(
-    status: str, run_id: str, raw: dict[str, Any], results: list[ToolResult] | None
-) -> None:
-    if status == RunStatus.WAITING_APPROVAL.value and results is not None:
-        results[:] = legacy_approval_denial(run_id, PauseState.from_dict(raw), results)
-
-
-def _resume_claim_fallbacks(
-    expected: str, results: list[ToolResult] | None, user_input: Any
-) -> tuple[str, ...]:
-    if results is not None and expected != RunStatus.WAITING_APPROVAL.value:
-        return (RunStatus.WAITING_APPROVAL.value,)
-    if results is None and user_input is None and expected == RunStatus.WAITING_APPROVAL.value:
-        return (RunStatus.PAUSED.value,)
-    return ()
-
-
-def _resume_claim_payload(
-    run_id: str,
-    raw: dict[str, Any],
-    status: str,
-    results: list[ToolResult] | None,
-    user_input: Any,
-    user_parts: tuple[ContentPart, ...] | None,
-    decisions: list[tuple[str, ApprovalDecision]] | None,
-) -> dict[str, Any] | None:
-    from dendrux.guardrails._engine import _entry_engine
-
-    if raw.get("schema_version") != 2 and _entry_engine(run_id) is None:
-        return None
-    if results is None and user_input is None and status != RunStatus.WAITING_APPROVAL.value:
-        return None
-    from dendrux.runtime.submit import serialize_decisions, serialize_tool_results
-    from dendrux.types import content_part_to_dict
-
-    payload: dict[str, Any] = (
-        {"submitted_decisions": serialize_decisions(PauseState.from_dict(raw), dict(decisions))}
-        if decisions is not None
-        else {"submitted_tool_results": serialize_tool_results(results)}
-        if results is not None
-        else {"submitted_user_input": user_input}
-        if user_input is not None
-        else {"approved": True}
-    )
-    if user_parts is not None:
-        payload["submitted_user_parts"] = [content_part_to_dict(p) for p in user_parts]
-    return payload
-
-
-async def _claim_resume(
-    store: StateStore,
-    run_id: str,
-    raw: dict[str, Any],
-    agent: Agent,
-    expected: str,
-    *,
-    expected_pause_id: str | None,
-    results: list[ToolResult] | None,
-    user_input: Any = None,
-    user_parts: tuple[ContentPart, ...] | None = None,
-    decisions: list[tuple[str, ApprovalDecision]] | None = None,
-    checkpoint: dict[str, Any] | None = None,
-    on_release: Callable[[StateStore], None] | None = None,
-) -> tuple[StateStore, str, dict[str, Any]]:
-    request = _claim_request(
-        raw,
-        expected,
-        expected_pause_id,
-        fallbacks=_resume_claim_fallbacks(expected, results, user_input),
-    )
-    validate = submission_validator(
-        run_id, raw, agent=agent, expected_pause_id=request.generation, call_results=results
-    )
-    record = await store.get_run(run_id)
-    require_pause_id(
-        agent,
-        expected_pause_id,
-        pause_id=raw.get("pause_id"),
-        store=store,
-        approval=(
-            results is None
-            and user_input is None
-            and record is not None
-            and record.status == RunStatus.WAITING_APPROVAL.value
-        ),
-        run_id=run_id,
-    )
-    for status in request.statuses:
-        _canonicalize_legacy_denials(status, run_id, raw, results)
-        payload = _resume_claim_payload(
-            run_id, raw, status, results, user_input, user_parts, decisions
-        )
-        epoch, descriptor, payload = await _claim_submission(
-            store,
-            run_id,
-            request,
-            status,
-            validate=_attempt_validator(validate, run_id, status, results),
-            payload=payload,
-            checkpointing=True,
-            approval=False
-            if status == RunStatus.WAITING_APPROVAL.value and results is not None
-            else None,
-            checkpoint=checkpoint,
-        )
-        if epoch:
-            view = _state.claimed_store(store, run_id, epoch)
-            await _report_claim_governance(agent, view, run_id, raw, status, on_release)
-            return view, status, _claimed_submission_view(raw, descriptor, payload)
-    await _run_pending._raise_resume_claim_failure(store, run_id, expected)
-    raise AssertionError("unreachable")
-
-
-def _attempt_validator(
-    validate: Callable[[dict[str, Any]], None],
-    run_id: str,
-    status: str,
-    results: list[ToolResult] | None,
-) -> Callable[[dict[str, Any]], None]:
-    """The claim attempt's locked validator (0.7).
-
-    Results claimed for a client pause are the caller's: none may answer a
-    generated subagent call. The approval attempt claims canonical runtime
-    denials (``legacy_approval_denial``) for that exact generation, which stay
-    valid. The status CAS precedes this check, so it sees the claimed pause.
-    """
-    from dendrux.runtime.submit import refuse_managed_results
-
-    if results is None or status != RunStatus.WAITING_CLIENT_TOOL.value:
-        return validate
-
-    def client_attempt(current: dict[str, Any]) -> None:
-        validate(current)
-        refuse_managed_results(run_id, current.get("pending_targets"), results)
-
-    return client_attempt
-
-
-async def _report_claim_governance(
-    agent: Agent,
-    store: StateStore,
-    run_id: str,
-    raw: dict[str, Any],
-    status: str,
-    on_release: Callable[[StateStore], None] | None,
-) -> None:
-    try:
-        await report_governance_change(agent, store, run_id, raw)
-    except BaseException as exc:
-        await _release_claim(store, run_id, status)
-        if on_release is not None and isinstance(exc, Exception) and _release_supported(store):
-            on_release(store)
-        raise
-
-
-async def _release_claim(store: StateStore, run_id: str, status: str) -> bool:
-    import sys
-
-    from dendrux.runtime.submit import _release_claim_result
-
-    epoch = getattr(store, "claim_epoch", True)
-    try:
-        return await _release_claim_result(store, run_id, status, epoch, sys.exception())
-    except asyncio.CancelledError as cancellation:
-        await _release_claim_result(store, run_id, status, epoch, cancellation)
-        raise
-
-
-@asynccontextmanager
-async def _release_setup_failure(
-    store: StateStore, run_id: str, status: str, *, enabled: bool = True
-) -> AsyncIterator[None]:
-    try:
-        yield
-    except BaseException as exc:
-        if enabled and not isinstance(exc, RunFencedError):
-            await _release_claim(store, run_id, status)
-        raise
-
-
-async def _resume_session(
-    agent: Agent,
-    store: StateStore,
-    run_id: str,
-    loop: Loop | None,
-    user_input: UserContent | None,
-    tool_results: list[ToolResult] | None,
-    decisions: Any,
-    expected_status: str,
-) -> tuple[SkillSession, str | None, tuple[Any, ...]]:
-    await ensure_agent_limits_fit(agent, store)
-    items: tuple[Any, ...] = ()
-    if user_input is not None:
-        user_input, items = _chat.split_user_content(user_input)
-    if decisions is not None and (
-        tool_results is not None
-        or user_input is not None
-        or expected_status != RunStatus.WAITING_APPROVAL.value
-    ):
-        raise ValueError("Approval decisions only resume a run awaiting approval.")
-    session = current(agent)
-    if session is None or session.run_id != run_id:
-        session = await continuation(agent, store, run_id, loop=loop)
-    return session, user_input, items
-
-
-async def _read_resume_pause(
-    store: StateStore,
-    agent: Agent,
-    provider: LLMProvider,
-    run_id: str,
-    raw: dict[str, Any] | None,
-    reads: _run_contracts._PauseReads,
-    skip_claim: bool,
-    expected_pause_id: str | None,
-    *,
-    read_record: bool = False,
-) -> PauseState:
-    if raw is None:
-        raise ValueError(f"Run '{run_id}' has no pause state — cannot resume.")
-    if not skip_claim:
-        require_pause_id(
-            agent, expected_pause_id, pause_id=raw.get("pause_id"), store=store, run_id=run_id
-        )
-    return await _load_resume_pause(
-        store, agent, provider, run_id, raw, reads, read_record=read_record
-    )
-
-
-async def _load_resume_pause(
-    store: StateStore,
-    agent: Agent,
-    provider: LLMProvider,
-    run_id: str,
-    raw: dict[str, Any],
-    reads: _run_contracts._PauseReads,
-    *,
-    read_record: bool,
-) -> PauseState:
-    if read_record:
-        reads.record = await store.get_run(run_id)
-    return await _load_pause_state(store, run_id, raw, agent, provider, reads=reads)
-
-
-def _require_pause_agent(pause: PauseState, agent: Agent, run_id: str, streaming: bool) -> None:
-    if pause.agent_name and pause.agent_name != agent.name:
-        raise ValueError(
-            f"Agent name mismatch: run '{run_id}' was paused by "
-            f"'{pause.agent_name}', but resume called with '{agent.name}'."
-            + ("" if streaming else " This can cause state corruption.")
-        )
-
-
-async def _read_resume_state(
-    store: StateStore,
-    agent: Agent,
-    provider: LLMProvider,
-    run_id: str,
-    skip_claim: bool,
-    expected_pause_id: str | None,
-    supplied_raw: dict[str, Any] | None,
-    reclaimed: PauseState | None,
-    *,
-    streaming: bool = False,
-    reclaimed_record: RunRecord | None = None,
-) -> tuple[RunRecord | None, _run_contracts._PauseReads, Any, PauseState, bool, Any]:
-    record = reclaimed_record
-    if record is None and not streaming:
-        record = await store.get_run(run_id)
-    reads = _run_contracts._PauseReads(record)
-    raw = None if reclaimed is not None else supplied_raw
-    if reclaimed is None and raw is None:
-        raw = await store.get_pause_state(run_id)
-    pause = (
-        reclaimed
-        if reclaimed is not None
-        else await _read_resume_pause(
-            store,
-            agent,
-            provider,
-            run_id,
-            raw,
-            reads,
-            skip_claim,
-            expected_pause_id,
-            read_record=streaming,
-        )
-    )
-    recovering = reclaimed is not None or await _reclaim.needs_resolution(
-        store, run_id, pause, checkpoint=reads.checkpoint
-    )
-    from dendrux.runtime._continuation_guardrails import _continuation_mapping
-
-    pii = None if streaming else await _continuation_mapping(store, run_id)
-    _require_pause_agent(pause, agent, run_id, streaming)
-    return reads.record, reads, raw, pause, recovering, pii
-
-
-async def _resume_submission(
-    store: StateStore,
-    agent: Agent,
-    provider: LLMProvider,
-    run_id: str,
-    pause: PauseState,
-    raw: Any,
-    reads: _run_contracts._PauseReads,
-    loop: Loop | None,
-    skip_claim: bool,
-    expected_status: str,
-    expected_pause_id: str | None,
-    tool_results: list[ToolResult] | None,
-    user_input: str | None,
-    user_parts: tuple[ContentPart, ...] | None,
-    input_items: tuple[Any, ...],
-    decisions: Any,
-) -> tuple[StateStore, str, Any, list[ToolResult] | None, tuple[ContentPart, ...] | None]:
-    if tool_results is not None:
-        validate_result_names(run_id, pause, tool_results)
-        if not skip_claim:
-            tool_results = await prepare_resume_results(agent, store, run_id, pause, tool_results)
-    if not skip_claim and (input_items or any(tr.images for tr in tool_results or ())):
-        tool_results, user_parts = await _run_images._ingest_resume_images(
-            agent,
-            provider,
-            store,
-            run_id,
-            loop=loop,
-            tool_results=tool_results,
-            input_items=input_items,
-        )
-    if not skip_claim:
-        assert raw is not None
-        store, expected_status, raw = await _claim_resume(
-            store,
-            run_id,
-            raw,
-            agent,
-            expected_status,
-            expected_pause_id=expected_pause_id,
-            results=tool_results,
-            user_input=user_input,
-            user_parts=user_parts,
-            decisions=decisions,
-            checkpoint=reads.checkpoint,
-        )
-    return store, expected_status, raw, tool_results, user_parts
 
 
 def _resume_delegation(
@@ -2424,7 +1595,7 @@ async def _try_resume_release(
     ctx: _run_contracts._ResumeContext | None,
     exc: Exception,
 ) -> RunStatus:
-    released = await _release_claim(store, run_id, status)
+    released = await _run_resume_prep._release_claim(store, run_id, status)
     if released:
         return await _released_resume_hooks(store, run_id, ctx, exc)
     await _resume_failure_hooks(ctx, run_id, exc)
@@ -2607,14 +1778,16 @@ async def _resume_core(
             claimed path); ``user_input`` is then their text projection.
     """
 
-    async with _release_setup_failure(state_store, run_id, expected_status, enabled=_skip_claim):
-        skill_session, user_input, input_items = await _resume_session(
+    async with _run_resume_prep._release_setup_failure(
+        state_store, run_id, expected_status, enabled=_skip_claim
+    ):
+        skill_session, user_input, input_items = await _run_resume_prep._resume_session(
             agent, state_store, run_id, loop, user_input, tool_results, decisions, expected_status
         )
     from dendrux.runtime._continuation_guardrails import _continuation_projection
 
     with skill_session.bind(), await _continuation_projection(agent, state_store, run_id):
-        async with _release_setup_failure(
+        async with _run_resume_prep._release_setup_failure(
             state_store, run_id, expected_status, enabled=_skip_claim
         ):
             (
@@ -2624,7 +1797,7 @@ async def _resume_core(
                 pause_state,
                 recovering,
                 _saved_pii_mapping,
-            ) = await _read_resume_state(
+            ) = await _run_resume_prep._read_resume_state(
                 state_store,
                 agent,
                 provider,
@@ -2641,7 +1814,7 @@ async def _resume_core(
                 raw_pause,
                 tool_results,
                 user_parts,
-            ) = await _resume_submission(
+            ) = await _run_resume_prep._resume_submission(
                 state_store,
                 agent,
                 provider,
@@ -2677,7 +1850,9 @@ async def _resume_core(
                 run_record,
                 pause_state,
                 agent=agent,
-                claimed_here=_claimed_in_call(state_store, run_id, skip_claim=_skip_claim),
+                claimed_here=_run_resume_replay._claimed_in_call(
+                    state_store, run_id, skip_claim=_skip_claim
+                ),
                 admitted=_reclaim_record is not None,
             )
             if stopped is not None:
@@ -2688,7 +1863,7 @@ async def _resume_core(
                 user_parts,
                 decisions,
                 adopted,
-            ) = await _project_adopted_submission(
+            ) = await _run_resume_replay._project_adopted_submission(
                 state_store,
                 run_id,
                 raw_pause,
@@ -2708,7 +1883,7 @@ async def _resume_core(
             history_results, history_input = _resume_history_inputs(
                 recovering, tool_results, user_input
             )
-            ctx = await _prepare_resume(
+            ctx = await _run_resume_prep._prepare_resume(
                 run_id,
                 pause_state,
                 state_store=state_store,
@@ -2754,7 +1929,7 @@ async def _resume_core(
 
             # 8b. tool/user-input history. Inside the try so
             #     a recorder failure here fires on_run_failed.
-            blocked_stop = await _replay_submission_or_stop(
+            blocked_stop = await _run_resume_replay._replay_submission_or_stop(
                 ctx,
                 run_id,
                 recovering=recovering,
@@ -2774,7 +1949,7 @@ async def _resume_core(
             )
 
             if recovering:
-                stop = await _resolve_recovery(
+                stop = await _run_resume_replay._resolve_recovery(
                     agent,
                     state_store,
                     run_id,
@@ -2815,16 +1990,13 @@ async def _resume_core(
             )
             _run_observers._attach_mcp_meta(result, mcp_meta)
             return await _finish_resumed_result(state_store, run_id, ctx, result)
-
         except asyncio.CancelledError:
             cancelled_result, swallow = await _cancel_resumed_run(agent, state_store, run_id, ctx)
             if swallow:
                 return cancelled_result
             raise
-
         except (ManagedRootStoppedError, RunFencedError) as stop:
             return await _stopped_resume_result(stop, state_store, run_id, ctx)
-
         except Exception as exc:
             await _handle_resume_failure(
                 state_store,
@@ -2836,7 +2008,6 @@ async def _resume_core(
                 _resume_warning_meta(ctx, mcp_meta),
             )
             raise
-
         finally:
             agent._task_manager.release_current(run_id)
             if ctx_token is not None:
@@ -2865,15 +2036,15 @@ async def _stream_resume_images(
     raw = await store.get_pause_state(run_id)
     if raw is None:
         raise ValueError("Run has no pause state")
-    require_pause_id(
+    _submit.require_pause_id(
         agent, expected_pause_id, pause_id=raw.get("pause_id"), store=store, run_id=run_id
     )
     media_pause = PauseState.from_dict(raw)
     if media_pause.agent_name and media_pause.agent_name != agent.name:
         raise ValueError("Agent name mismatch on resume")
     if stream_results is not None:
-        validate_result_names(run_id, media_pause, stream_results)
-        stream_results = await prepare_resume_results(
+        _submit.validate_result_names(run_id, media_pause, stream_results)
+        stream_results = await _submit.prepare_resume_results(
             agent, store, run_id, media_pause, stream_results
         )
         results_prepared = True
@@ -2900,10 +2071,17 @@ async def _stream_resume_state(
     results_prepared: bool,
     stream_context: StreamContext,
 ) -> tuple[Any, _run_contracts._PauseReads, Any, PauseState, bool, list[ToolResult] | None]:
-    skill_session = await continuation(agent, store, run_id)
+    skill_session = await _skills.continuation(agent, store, run_id)
     stream_context.set_session(skill_session)
 
-    run_record, reads, raw_pause, pause_state, recovering, _ = await _read_resume_state(
+    (
+        run_record,
+        reads,
+        raw_pause,
+        pause_state,
+        recovering,
+        _,
+    ) = await _run_resume_prep._read_resume_state(
         store,
         agent,
         provider,
@@ -2916,9 +2094,9 @@ async def _stream_resume_state(
     )
 
     if stream_results is not None:
-        validate_result_names(run_id, pause_state, stream_results)
+        _submit.validate_result_names(run_id, pause_state, stream_results)
         if not results_prepared:
-            stream_results = await prepare_resume_results(
+            stream_results = await _submit.prepare_resume_results(
                 agent, store, run_id, pause_state, stream_results
             )
 
@@ -2982,7 +2160,7 @@ async def _stream_resume_claim(
     )
     # 4. Determine expected status and claim
     expected = _resume_expected_status(stream_results, user_input)
-    store, expected, raw_pause = await _claim_resume(
+    store, expected, raw_pause = await _run_resume_prep._claim_resume(
         store,
         run_id,
         raw_pause,
@@ -3290,7 +2468,7 @@ def resume_stream(
         )
 
         try:
-            store = await _resolve_resume_stream_store(store, state_store_resolver)
+            store = await _run_resume_prep._resolve_resume_stream_store(store, state_store_resolver)
             _shared["state_store"] = store
 
             await ensure_agent_limits_fit(agent, store)
@@ -3332,7 +2510,7 @@ def resume_stream(
             #    the same try block so failure or released-finish hooks pair
             #    with on_run_started.
             run_tenant = run_record.tenant_id if run_record else None
-            ctx = await _prepare_resume(
+            ctx = await _run_resume_prep._prepare_resume(
                 run_id,
                 pause_state,
                 state_store=store,
@@ -3378,7 +2556,7 @@ def resume_stream(
             # 5b. tool/user-input history. Inside the try
             #     so a recorder failure here fires on_run_failed.
             if not recovering:
-                await _replay_resume_injected_history(
+                await _run_resume_replay._replay_resume_injected_history(
                     ctx,
                     run_id,
                     tool_results=stream_results,
@@ -3394,7 +2572,7 @@ def resume_stream(
             yield RunEvent(type=RunEventType.RUN_RESUMED, run_id=run_id)
 
             if recovering:
-                stop = await _resolve_recovery(
+                stop = await _run_resume_replay._resolve_recovery(
                     agent,
                     store,
                     run_id,
@@ -3566,18 +2744,18 @@ async def _validate_owned_pause(
         validate_approval_decisions,
     )
 
-    async with _release_setup_failure(store, run_id, status):
+    async with _run_resume_prep._release_setup_failure(store, run_id, status):
         await _run_events._check_claim(store, run_id)
         raw = await store.get_pause_state(run_id)
         if raw is None:
             raise ValueError("Claimed run has no pause state")
-        submission_validator(run_id, raw, agent=agent)
+        _submit.submission_validator(run_id, raw, agent=agent)
         from dendrux.runtime.submit import submitted_view
 
         raw = submitted_view(raw)
         submitted = raw.get("submitted_tool_results")
         if submitted is not None:
-            validate_result_names(
+            _submit.validate_result_names(
                 run_id, PauseState.from_dict(raw), deserialize_tool_results(submitted)
             )
         elif raw.get("submitted_decisions") is not None:

@@ -4,6 +4,7 @@ import pytest
 
 from dendrux import tool
 from dendrux.loops.base import BaseNotifier
+from dendrux.runtime import _run_resume_prep
 from dendrux.strategies.base import Strategy
 from dendrux.strategies.native import NativeToolCalling
 from dendrux.types import (
@@ -73,7 +74,7 @@ async def test_approved_results_use_resolved_strategy(store, entry, kind, monkey
         kwargs["strategy"] = ObservationStrategy()
         return await prepare(*args, **kwargs)
 
-    monkeypatch.setattr(runner, "_prepare_resume", with_strategy)
+    monkeypatch.setattr(_run_resume_prep, "_prepare_resume", with_strategy)
     b = agent(store, [LLMResponse(text="done")], tools=[work])
     scope = {"expected_pause_id": paused.pause_id}
     if kind == "denied":

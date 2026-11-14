@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from dendrux.errors import PersistenceError, StoreOutcomeUnknown
-from dendrux.runtime import _run_events, runner
+from dendrux.runtime import _run_events, _run_resume_replay, runner
 from dendrux.types import RunStatus
 from tests._fixtures.storage import pin_storage_format
 from tests._helpers.gates import wait_for_gate
@@ -196,7 +196,7 @@ async def test_consumed_history_is_never_released(
 
     release = AsyncMock(wraps=store.release_run_claim)
     monkeypatch.setattr(store, "release_run_claim", release)
-    monkeypatch.setattr(runner, "_replay_resume_injected_history", consumed_then_fail)
+    monkeypatch.setattr(_run_resume_replay, "_replay_resume_injected_history", consumed_then_fail)
     await invoke_failure(case, entry)
     release.assert_not_awaited()
     assert (await store.get_run(case.run_id)).status == "error"

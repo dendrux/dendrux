@@ -17,7 +17,7 @@ from dendrux.errors import ProviderAuthError, StoreOutcomeUnknown
 from dendrux.llm.mock import MockLLM
 from dendrux.loops.base import BaseNotifier
 from dendrux.loops.react import ReActLoop
-from dendrux.runtime import _run_images, _run_observers, _run_pending, runner
+from dendrux.runtime import _run_images, _run_observers, _run_pending, _run_resume_prep, runner
 from dendrux.runtime import context as context_mod
 from dendrux.runtime.context import DelegationContext
 from dendrux.runtime.persistence import PersistenceRecorder
@@ -133,7 +133,9 @@ async def test_claim_refusal_owner_fault_fires_before_image_work(monkeypatch, re
     assert caught.value is fault
     refusing.assert_awaited_once()
     image.assert_not_called()
-    monkeypatch.setattr(runner, "_claim_submission", AsyncMock(return_value=(0, None, None)))
+    monkeypatch.setattr(
+        _run_resume_prep, "_claim_submission", AsyncMock(return_value=(0, None, None))
+    )
     with pytest.raises(RuntimeError) as caught:
         await runner._claim_resume(
             store,

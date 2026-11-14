@@ -6,7 +6,8 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from dendrux.errors import RunFencedError
-from dendrux.runtime import runner
+from dendrux.runtime import _run_resume_prep, _run_resume_replay, runner, submit
+from dendrux.skills import _session
 from dendrux.types import Message, Role, RunEventType, RunStatus
 from tests._helpers.runtime_paths import path_case
 from tests._helpers.scripted_provider import ScriptedLLM
@@ -23,7 +24,7 @@ async def test_setup_fault_fires_before_provider_and_releases_claim(store, monke
     before = await store.get_run(case.run_id)
     failure = ValueError("pr5_setup_fault")
     fault = AsyncMock(side_effect=failure)
-    monkeypatch.setattr(runner, site, fault)
+    monkeypatch.setattr(_session if site == "continuation" else _run_resume_prep, site, fault)
     try:
         if path == "resume_stream":
             await case.invoke()
@@ -69,9 +70,11 @@ async def test_replay_consumes_projected_history_before_any_user_effect(monkeypa
     ctx = SimpleNamespace(
         recorder=recorder, pause_state=SimpleNamespace(history=[old]), history=[old, injected]
     )
-    monkeypatch.setattr(runner, "project_message", project)
-    monkeypatch.setattr(runner, "_replay_user_input", replay)
-    monkeypatch.setattr(runner, "order_observations", lambda *args: order.append("order"))
+    monkeypatch.setattr(_run_resume_replay, "project_message", project)
+    monkeypatch.setattr(_run_resume_replay, "_replay_user_input", replay)
+    monkeypatch.setattr(
+        _run_resume_replay, "order_observations", lambda *args: order.append("order")
+    )
     await runner._replay_resume_injected_history(
         ctx,
         "run",
@@ -90,7 +93,7 @@ async def test_failed_consumption_does_not_mark_work_or_replay(monkeypatch):
     ctx = SimpleNamespace(recorder=recorder, pause_state=SimpleNamespace(history=[]), history=[])
     replay = AsyncMock()
     work = Mock()
-    monkeypatch.setattr(runner, "_replay_user_input", replay)
+    monkeypatch.setattr(_run_resume_replay, "_replay_user_input", replay)
     with pytest.raises(RuntimeError) as caught:
         await runner._replay_resume_injected_history(
             ctx, "run", tool_results=None, user_input="injected", on_consumed=work
@@ -106,7 +109,7 @@ async def test_failed_consumption_does_not_mark_work_or_replay(monkeypatch):
 async def test_setup_failure_preserves_exception_and_release_boundary(monkeypatch, enabled, fenced):
     failure = RunFencedError("run") if fenced else RuntimeError("pr5_setup_cleanup")
     release = AsyncMock()
-    monkeypatch.setattr(runner, "_release_claim", release)
+    monkeypatch.setattr(_run_resume_prep, "_release_claim", release)
     store = object()
     with pytest.raises(type(failure)) as caught:
         async with runner._release_setup_failure(
@@ -129,7 +132,7 @@ async def test_validation_fault_fires_before_claim_in_both_resume_modes(
     before = await store.get_run(case.run_id)
     failure = ValueError("pr5_validation_fault")
     fault = Mock(side_effect=failure)
-    monkeypatch.setattr(runner, site, fault)
+    monkeypatch.setattr(submit, site, fault)
     try:
         if path == "resume_stream":
             await case.invoke()

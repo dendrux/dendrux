@@ -75,7 +75,7 @@ async def test_non_skill_cancel_during_resume_preparation_sequences_event(store,
         entered.set()
         await asyncio.Event().wait()
 
-    with patch("dendrux.runtime.runner._prepare_resume", preparing):
+    with patch("dendrux.runtime._run_resume_prep._prepare_resume", preparing):
         task = asyncio.create_task(
             a.resume(paused.run_id, tool_results=results)
             if path == "resume"

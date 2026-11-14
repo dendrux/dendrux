@@ -9,7 +9,7 @@ import pytest
 from dendrux import Agent
 from dendrux.errors import PersistenceError, RunNotReclaimableError
 from dendrux.llm.mock import MockLLM
-from dendrux.runtime import _reclaim, _run_entry, replay, runner
+from dendrux.runtime import _reclaim, _run_entry, replay, runner, submit
 from dendrux.skills import _session
 from dendrux.types import (
     ImageViewState,
@@ -162,14 +162,14 @@ async def test_decode_error_text_and_read_order(monkeypatch, entry, problem):
             return _value
 
         method.side_effect = read
-    monkeypatch.setattr(runner, "continuation", AsyncMock(return_value=Mock()))
+    monkeypatch.setattr(_session, "continuation", AsyncMock(return_value=Mock()))
 
     def require(*args, **kwargs):
         calls.append("require_pause_id")
         if problem == "pause_id":
             raise ValueError("pause sentinel")
 
-    monkeypatch.setattr(runner, "require_pause_id", require)
+    monkeypatch.setattr(submit, "require_pause_id", require)
     with pytest.raises(ValueError) as caught:
         if entry == "resume":
             await runner._read_resume_state(

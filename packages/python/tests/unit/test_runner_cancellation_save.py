@@ -8,7 +8,7 @@ import pytest
 from dendrux import _codes
 from dendrux._meta_keys import CANCEL_PERSISTED_META_KEY
 from dendrux.loops import _helpers
-from dendrux.runtime import _run_events, runner
+from dendrux.runtime import _run_events, _run_resume_prep, runner
 from dendrux.runtime.persistence import PersistenceRecorder
 from dendrux.types import RunEvent, RunEventType, RunStatus
 from tests._helpers.gates import wait_for_gate
@@ -186,7 +186,7 @@ async def test_resume_close_before_context_does_not_emit_or_finish(store, monkey
         entered.set()
         await asyncio.Event().wait()
 
-    monkeypatch.setattr(runner, "_prepare_resume", preparing)
+    monkeypatch.setattr(_run_resume_prep, "_prepare_resume", preparing)
     stream = invoke(notifier)
     iterator = aiter(stream)
     pulling = asyncio.create_task(anext(iterator))

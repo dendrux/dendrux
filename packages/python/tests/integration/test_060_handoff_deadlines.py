@@ -331,7 +331,7 @@ async def test_legacy_governance_cancel_has_no_epoch_authority(
 ):
     from sqlalchemy import update
 
-    from dendrux.runtime import runner, submit
+    from dendrux.runtime import submit
 
     agent, call, run_id, epoch, _ = await invocation(entry, store, engine)
     original = store.submit_and_claim
@@ -346,9 +346,7 @@ async def test_legacy_governance_cancel_has_no_epoch_authority(
         entered.set()
         await asyncio.Event().wait()
 
-    monkeypatch.setattr(
-        submit if entry == "submit_tool_results" else runner, "report_governance_change", governance
-    )
+    monkeypatch.setattr(submit, "report_governance_change", governance)
     task = asyncio.create_task(call)
     await wait_for_gate(entered, task=task)
     if superseded:
