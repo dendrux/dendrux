@@ -12,11 +12,13 @@ from dendrux.loops import _helpers
 from dendrux.loops.react import ReActLoop
 from dendrux.runtime import (
     _reclaim,
+    _run_approval,
     _run_events,
     _run_images,
     _run_outcome,
     _run_resume_prep,
     _run_resume_replay,
+    _run_resume_stream,
     runner,
     submit,
 )
@@ -96,7 +98,7 @@ async def test_resumed_payload_on_both_entries(store, monkeypatch, entry, kind):
 
     monkeypatch.setattr(_run_resume_prep, "_resume_submission", submission)
     monkeypatch.setattr(
-        runner,
+        _run_resume_stream,
         "_stream_resume_images",
         AsyncMock(
             return_value=(store, None, parts, False)
@@ -345,7 +347,7 @@ async def test_approval_batch_order_and_decisions(monkeypatch, entry, mode):
         calls.append("validate")
         return decision_map
 
-    monkeypatch.setattr(runner, "_validated_decisions", validate)
+    monkeypatch.setattr(_run_approval, "_validated_decisions", validate)
     tool_result = ToolResult("tool", "call", '"ok"')
     approval = runner._ApprovalResume(
         [(pause.pending_tool_calls[0], tool_result)], [], {"decision": "approved"}, None
@@ -361,18 +363,18 @@ async def test_approval_batch_order_and_decisions(monkeypatch, entry, mode):
             kwargs["on_work"]()
         return approval
 
-    monkeypatch.setattr(runner, "_execute_approved_tools", execute)
+    monkeypatch.setattr(_run_approval, "_execute_approved_tools", execute)
 
     async def record(*args):
         calls.append("decided")
 
-    monkeypatch.setattr(runner, "_record_approval_decided", record)
+    monkeypatch.setattr(_run_approval, "_record_approval_decided", record)
 
     def stop(*args):
         calls.append("stop")
         return None
 
-    monkeypatch.setattr(runner, "_approval_stop_result", stop)
+    monkeypatch.setattr(_run_approval, "_approval_stop_result", stop)
     expected = "paused" if mode == "paused" else "waiting_approval"
     results = [tool_result] if mode == "reject" else None
     text = "input" if mode == "irrelevant" else None
@@ -418,9 +420,9 @@ async def test_closing_approval_results_does_not_record_decision(monkeypatch):
         resolved_strategy=Mock(),
     )
     approval = runner._ApprovalResume([(tc, ToolResult("tool", "call", '"ok"'))], [], {}, None)
-    monkeypatch.setattr(runner, "_execute_approved_tools", AsyncMock(return_value=approval))
+    monkeypatch.setattr(_run_approval, "_execute_approved_tools", AsyncMock(return_value=approval))
     decided = AsyncMock()
-    monkeypatch.setattr(runner, "_record_approval_decided", decided)
+    monkeypatch.setattr(_run_approval, "_record_approval_decided", decided)
     events = runner._stream_approval_events(
         Mock(), Mock(), "run", ctx, "waiting_approval", None, None, None, {}
     )

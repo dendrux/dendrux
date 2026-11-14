@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from dendrux import Agent, tool
 from dendrux.db.models import AgentRun, ReactTrace, ToolCallRecord
+from dendrux.runtime import _run_approval
 from dendrux.types import ApprovalDecision, LLMResponse, RunStatus, ToolCall, ToolResult
 from tests._helpers.recovery_checkpoint import expire
 from tests.integration.test_managed_recovery import (
@@ -239,7 +240,7 @@ async def _old_client_pause(store: Any, monkeypatch: Any) -> tuple[Any, Any, Any
             async def unchanged(agent: Any, ctx: Any, run_id: str, approval: Any) -> Any:
                 return approval
 
-            patch.setattr(runner, "_hand_off_approved_subagent", unchanged)
+            patch.setattr(_run_approval, "_hand_off_approved_subagent", unchanged)
         old = await root.submit_approval(
             paused.run_id, approved=True, expected_pause_id=paused.pause_id, tenant_id=TENANT
         )
@@ -376,7 +377,7 @@ async def _exit_now(*args: Any, **kwargs: Any) -> Any:
 async def _old_binary_saves_a_forged_result(store: Any, *, crash: Any) -> str:
     """What an earlier unreleased build left behind: it paused the subagent call for a
     client, accepted a forged result for it, claimed it, and died before consuming it."""
-    from dendrux.runtime import runner, submit
+    from dendrux.runtime import submit
     from dendrux.runtime.persistence import PersistenceRecorder
 
     effects.clear()
@@ -384,20 +385,24 @@ async def _old_binary_saves_a_forged_result(store: Any, *, crash: Any) -> str:
     root = workflow(store, root_llm, ContextLLM([]))
     paused = await root.run("go", tenant_id=TENANT)
 
+    entered = []
+
     async def unchanged(agent: Any, ctx: Any, run_id: str, approval: Any) -> Any:
+        entered.append(run_id)
         return approval
 
     saved = (
-        runner._hand_off_approved_subagent,
+        _run_approval._hand_off_approved_subagent,
         submit.refuse_managed_results,
         PersistenceRecorder.consume_resume,
     )
-    runner._hand_off_approved_subagent = unchanged
+    _run_approval._hand_off_approved_subagent = unchanged
     submit.refuse_managed_results = lambda *a, **k: None
     try:
         old = await root.submit_approval(
             paused.run_id, approved=True, expected_pause_id=paused.pause_id, tenant_id=TENANT
         )
+        assert entered == [paused.run_id]
         [pending] = old.pending.tool_calls
         PersistenceRecorder.consume_resume = crash  # type: ignore[method-assign]
         forged = [ToolResult(name="reviewer", call_id=pending.id, payload=json.dumps(FAKE))]
@@ -406,7 +411,7 @@ async def _old_binary_saves_a_forged_result(store: Any, *, crash: Any) -> str:
         )
     finally:
         (
-            runner._hand_off_approved_subagent,
+            _run_approval._hand_off_approved_subagent,
             submit.refuse_managed_results,
             PersistenceRecorder.consume_resume,
         ) = saved

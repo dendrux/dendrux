@@ -13352,6 +13352,132 @@
    "rule": "new-over-threshold"
   }
  },
+ "src/dendrux/runtime/_run_approval.py::_approval_call_counts": {
+  "complexity": 2,
+  "coverage": 1.0,
+  "crap": 2.0,
+  "digest": "c6c43b4600ec"
+ },
+ "src/dendrux/runtime/_run_approval.py::_approval_dispatch_inputs": {
+  "complexity": 3,
+  "coverage": 1.0,
+  "crap": 3.0,
+  "digest": "172a02b950ac"
+ },
+ "src/dendrux/runtime/_run_approval.py::_approval_outcomes": {
+  "complexity": 8,
+  "coverage": 1.0,
+  "crap": 8.0,
+  "digest": "3848f6d1d40b"
+ },
+ "src/dendrux/runtime/_run_approval.py::_approval_policy_denial": {
+  "complexity": 1,
+  "coverage": 1.0,
+  "crap": 1.0,
+  "digest": "19cd8912cbc2"
+ },
+ "src/dendrux/runtime/_run_approval.py::_approval_stop_result": {
+  "complexity": 6,
+  "coverage": 1.0,
+  "crap": 6.0,
+  "digest": "2b58ca224974"
+ },
+ "src/dendrux/runtime/_run_approval.py::_barrier_pause_result": {
+  "complexity": 13,
+  "coverage": 0.9565,
+  "crap": 13.01,
+  "digest": "af3f5c18a643"
+ },
+ "src/dendrux/runtime/_run_approval.py::_carry_budget_fields": {
+  "complexity": 1,
+  "coverage": 1.0,
+  "crap": 1.0,
+  "digest": "f512902b422e"
+ },
+ "src/dendrux/runtime/_run_approval.py::_decided_payload": {
+  "complexity": 9,
+  "coverage": 1.0,
+  "crap": 9.0,
+  "digest": "bd1011cd7f87"
+ },
+ "src/dendrux/runtime/_run_approval.py::_execute_approved_tools": {
+  "complexity": 22,
+  "coverage": 1.0,
+  "crap": 22.0,
+  "digest": "0e0847f1ea8b"
+ },
+ "src/dendrux/runtime/_run_approval.py::_execute_approved_tools.<locals>._append": {
+  "complexity": 4,
+  "coverage": 1.0,
+  "crap": 4.0,
+  "digest": "fba639724c6d"
+ },
+ "src/dendrux/runtime/_run_approval.py::_finish_approval_batch": {
+  "complexity": 6,
+  "coverage": 1.0,
+  "crap": 6.0,
+  "digest": "820d3c3dce25"
+ },
+ "src/dendrux/runtime/_run_approval.py::_inject_approved_skill": {
+  "complexity": 7,
+  "coverage": 1.0,
+  "crap": 7.0,
+  "digest": "b16bff1048a4"
+ },
+ "src/dendrux/runtime/_run_approval.py::_limit_approval_clients": {
+  "complexity": 9,
+  "coverage": 1.0,
+  "crap": 9.0,
+  "digest": "5d70fa41603e"
+ },
+ "src/dendrux/runtime/_run_approval.py::_pending_decision_map": {
+  "complexity": 4,
+  "coverage": 1.0,
+  "crap": 4.0,
+  "digest": "ce99045b247e"
+ },
+ "src/dendrux/runtime/_run_approval.py::_record_approval_decided": {
+  "complexity": 3,
+  "coverage": 1.0,
+  "crap": 3.0,
+  "digest": "94af452ea335"
+ },
+ "src/dendrux/runtime/_run_approval.py::_rejection_decided_payload": {
+  "complexity": 3,
+  "coverage": 1.0,
+  "crap": 3.0,
+  "digest": "899b1ccc62d3"
+ },
+ "src/dendrux/runtime/_run_approval.py::_resume_approval_batch": {
+  "complexity": 8,
+  "coverage": 1.0,
+  "crap": 8.0,
+  "digest": "006b11e6dd93"
+ },
+ "src/dendrux/runtime/_run_approval.py::_resume_approval_work": {
+  "complexity": 2,
+  "coverage": 1.0,
+  "crap": 2.0,
+  "digest": "450088e3349b"
+ },
+ "src/dendrux/runtime/_run_approval.py::_resume_barrier": {
+  "complexity": 2,
+  "coverage": 1.0,
+  "crap": 2.0,
+  "digest": "3807991fe3e5"
+ },
+ "src/dendrux/runtime/_run_approval.py::_resume_pause_barrier": {
+  "complexity": 3,
+  "coverage": 1.0,
+  "crap": 3.0,
+  "digest": "bc11786a93e8"
+ },
+ "src/dendrux/runtime/_run_approval.py::_validated_decisions": {
+  "complexity": 2,
+  "coverage": 1.0,
+  "crap": 2.0,
+  "digest": "b16a1d6abdb8"
+ },
  "src/dendrux/runtime/_run_contracts.py::_ResumeContext.__init__": {
   "complexity": 1,
   "coverage": 1.0,
@@ -14108,6 +14234,156 @@
   "crap": 3.0,
   "digest": "49eba1a511e5"
  },
+ "src/dendrux/runtime/_run_resume.py::_owned_claim_view": {
+  "complexity": 5,
+  "coverage": 1.0,
+  "crap": 5.0,
+  "digest": "6f229897a260"
+ },
+ "src/dendrux/runtime/_run_resume.py::_resume_claim_status": {
+  "complexity": 3,
+  "coverage": 0.8333,
+  "crap": 3.04,
+  "digest": "3ffb56912d1f"
+ },
+ "src/dendrux/runtime/_run_resume.py::_resume_core": {
+  "complexity": 15,
+  "coverage": 1.0,
+  "crap": 15.0,
+  "digest": "29db955a30ab"
+ },
+ "src/dendrux/runtime/_run_resume.py::_validate_owned_pause": {
+  "complexity": 6,
+  "coverage": 0.9444,
+  "crap": 6.01,
+  "digest": "10c88c3c28d0"
+ },
+ "src/dendrux/runtime/_run_resume.py::resume": {
+  "complexity": 2,
+  "coverage": 1.0,
+  "crap": 2.0,
+  "digest": "7c2c6ff2b379"
+ },
+ "src/dendrux/runtime/_run_resume.py::resume_approval_approved_claim": {
+  "complexity": 2,
+  "coverage": 1.0,
+  "crap": 2.0,
+  "digest": "3d2f0842ce7a"
+ },
+ "src/dendrux/runtime/_run_resume.py::resume_claimed": {
+  "complexity": 4,
+  "coverage": 1.0,
+  "crap": 4.0,
+  "digest": "902528f2b035"
+ },
+ "src/dendrux/runtime/_run_resume.py::resume_paused_claim": {
+  "complexity": 2,
+  "coverage": 1.0,
+  "crap": 2.0,
+  "digest": "5a25624ad71c"
+ },
+ "src/dendrux/runtime/_run_resume.py::resume_with_input": {
+  "complexity": 1,
+  "coverage": 1.0,
+  "crap": 1.0,
+  "digest": "c43428458621"
+ },
+ "src/dendrux/runtime/_run_resume_loop.py::_budget_carry_kwargs": {
+  "complexity": 3,
+  "coverage": 1.0,
+  "crap": 3.0,
+  "digest": "2b52eb0ef907"
+ },
+ "src/dendrux/runtime/_run_resume_loop.py::_cancel_resumed_run": {
+  "complexity": 3,
+  "coverage": 1.0,
+  "crap": 3.0,
+  "digest": "1a33ba13a2a6"
+ },
+ "src/dendrux/runtime/_run_resume_loop.py::_fenced_resume_result": {
+  "complexity": 2,
+  "coverage": 1.0,
+  "crap": 2.0,
+  "digest": "6b3ae091b92a"
+ },
+ "src/dendrux/runtime/_run_resume_loop.py::_finish_resumed_result": {
+  "complexity": 1,
+  "coverage": 1.0,
+  "crap": 1.0,
+  "digest": "96216d86fb7b"
+ },
+ "src/dendrux/runtime/_run_resume_loop.py::_handle_resume_failure": {
+  "complexity": 3,
+  "coverage": 1.0,
+  "crap": 3.0,
+  "digest": "2d90ca330f4a"
+ },
+ "src/dendrux/runtime/_run_resume_loop.py::_initial_call_counts_kwargs": {
+  "complexity": 2,
+  "coverage": 1.0,
+  "crap": 2.0,
+  "digest": "2d2673776ce1"
+ },
+ "src/dendrux/runtime/_run_resume_loop.py::_released_resume_hooks": {
+  "complexity": 6,
+  "coverage": 1.0,
+  "crap": 6.0,
+  "digest": "c43d995c7313"
+ },
+ "src/dendrux/runtime/_run_resume_loop.py::_released_resume_status": {
+  "complexity": 3,
+  "coverage": 0.5714,
+  "crap": 3.71,
+  "digest": "db2765b691cb"
+ },
+ "src/dendrux/runtime/_run_resume_loop.py::_resume_delegation": {
+  "complexity": 7,
+  "coverage": 1.0,
+  "crap": 7.0,
+  "digest": "953f982b8bee"
+ },
+ "src/dendrux/runtime/_run_resume_loop.py::_resume_failure_hooks": {
+  "complexity": 3,
+  "coverage": 0.7143,
+  "crap": 3.21,
+  "digest": "c52a0171c4a6"
+ },
+ "src/dendrux/runtime/_run_resume_loop.py::_resume_loop_stream": {
+  "complexity": 3,
+  "coverage": 1.0,
+  "crap": 3.0,
+  "digest": "1c14941242d6"
+ },
+ "src/dendrux/runtime/_run_resume_loop.py::_resume_release_supported": {
+  "complexity": 2,
+  "coverage": 1.0,
+  "crap": 2.0,
+  "digest": "c09fcd5f1c00"
+ },
+ "src/dendrux/runtime/_run_resume_loop.py::_resume_warning_meta": {
+  "complexity": 2,
+  "coverage": 1.0,
+  "crap": 2.0,
+  "digest": "962c1a0a0305"
+ },
+ "src/dendrux/runtime/_run_resume_loop.py::_resumed_loop_kwargs": {
+  "complexity": 2,
+  "coverage": 1.0,
+  "crap": 2.0,
+  "digest": "39445f105a37"
+ },
+ "src/dendrux/runtime/_run_resume_loop.py::_run_resumed_loop": {
+  "complexity": 1,
+  "coverage": 1.0,
+  "crap": 1.0,
+  "digest": "9a505a86bfa3"
+ },
+ "src/dendrux/runtime/_run_resume_loop.py::_try_resume_release": {
+  "complexity": 2,
+  "coverage": 1.0,
+  "crap": 2.0,
+  "digest": "99688576067a"
+ },
  "src/dendrux/runtime/_run_resume_prep.py::_canonicalize_legacy_denials": {
   "complexity": 3,
   "coverage": 1.0,
@@ -14245,6 +14521,96 @@
   "coverage": 1.0,
   "crap": 3.0,
   "digest": "dc42647b9062"
+ },
+ "src/dendrux/runtime/_run_resume_stream.py::_finish_resume_stream_cleanup": {
+  "complexity": 7,
+  "coverage": 0.9474,
+  "crap": 7.01,
+  "digest": "b31ac9d6d9ae"
+ },
+ "src/dendrux/runtime/_run_resume_stream.py::_finish_stream_resume_failure": {
+  "complexity": 6,
+  "coverage": 1.0,
+  "crap": 6.0,
+  "digest": "07e6ee6bba5d"
+ },
+ "src/dendrux/runtime/_run_resume_stream.py::_mark_stream_recovery_work": {
+  "complexity": 1,
+  "coverage": 1.0,
+  "crap": 1.0,
+  "digest": "2696f1ea1f57"
+ },
+ "src/dendrux/runtime/_run_resume_stream.py::_remember_stream_release": {
+  "complexity": 1,
+  "coverage": 1.0,
+  "crap": 1.0,
+  "digest": "b5c469358006"
+ },
+ "src/dendrux/runtime/_run_resume_stream.py::_resume_expected_status": {
+  "complexity": 3,
+  "coverage": 1.0,
+  "crap": 3.0,
+  "digest": "101d17aa3ebc"
+ },
+ "src/dendrux/runtime/_run_resume_stream.py::_stopped_stream_event": {
+  "complexity": 2,
+  "coverage": 1.0,
+  "crap": 2.0,
+  "digest": "f46809823180"
+ },
+ "src/dendrux/runtime/_run_resume_stream.py::_stream_approval_events": {
+  "complexity": 4,
+  "coverage": 1.0,
+  "crap": 4.0,
+  "digest": "de7c06ada1ca"
+ },
+ "src/dendrux/runtime/_run_resume_stream.py::_stream_resume_failure": {
+  "complexity": 5,
+  "coverage": 1.0,
+  "crap": 5.0,
+  "digest": "60071bbc17c1"
+ },
+ "src/dendrux/runtime/_run_resume_stream.py::_stream_resume_images": {
+  "complexity": 8,
+  "coverage": 0.8,
+  "crap": 8.51,
+  "digest": "972fed7b5a15"
+ },
+ "src/dendrux/runtime/_run_resume_stream.py::_stream_resume_started": {
+  "complexity": 2,
+  "coverage": 1.0,
+  "crap": 2.0,
+  "digest": "ab3b00753552"
+ },
+ "src/dendrux/runtime/_run_resume_stream.py::_stream_resume_state": {
+  "complexity": 3,
+  "coverage": 1.0,
+  "crap": 3.0,
+  "digest": "455a14500ea8"
+ },
+ "src/dendrux/runtime/_run_resume_stream.py::resume_stream": {
+  "complexity": 2,
+  "coverage": 1.0,
+  "crap": 2.0,
+  "digest": "d7450a3b6891"
+ },
+ "src/dendrux/runtime/_run_resume_stream.py::resume_stream.<locals>._cleanup": {
+  "complexity": 5,
+  "coverage": 1.0,
+  "crap": 5.0,
+  "digest": "b6fea26544bd"
+ },
+ "src/dendrux/runtime/_run_resume_stream.py::resume_stream.<locals>._cleanup.<locals>.mark_cancelled": {
+  "complexity": 1,
+  "coverage": 1.0,
+  "crap": 1.0,
+  "digest": "b628bed336b4"
+ },
+ "src/dendrux/runtime/_run_resume_stream.py::resume_stream.<locals>._generate": {
+  "complexity": 16,
+  "coverage": 1.0,
+  "crap": 16.0,
+  "digest": "68b409724499"
  },
  "src/dendrux/runtime/_run_retry.py::_check_retry_source": {
   "complexity": 7,
@@ -15648,387 +16014,6 @@
   "coverage": 1.0,
   "crap": 18.0,
   "digest": "11ba31ae4288"
- },
- "src/dendrux/runtime/runner.py::_approval_call_counts": {
-  "complexity": 2,
-  "coverage": 1.0,
-  "crap": 2.0,
-  "digest": "c6c43b4600ec"
- },
- "src/dendrux/runtime/runner.py::_approval_dispatch_inputs": {
-  "complexity": 3,
-  "coverage": 1.0,
-  "crap": 3.0,
-  "digest": "960059313cd2"
- },
- "src/dendrux/runtime/runner.py::_approval_outcomes": {
-  "complexity": 8,
-  "coverage": 1.0,
-  "crap": 8.0,
-  "digest": "3848f6d1d40b"
- },
- "src/dendrux/runtime/runner.py::_approval_policy_denial": {
-  "complexity": 1,
-  "coverage": 1.0,
-  "crap": 1.0,
-  "digest": "cbabfe147c46"
- },
- "src/dendrux/runtime/runner.py::_approval_stop_result": {
-  "complexity": 6,
-  "coverage": 1.0,
-  "crap": 6.0,
-  "digest": "ed64e21b486c"
- },
- "src/dendrux/runtime/runner.py::_barrier_pause_result": {
-  "complexity": 13,
-  "coverage": 0.9565,
-  "crap": 13.01,
-  "digest": "4b9ced763f21"
- },
- "src/dendrux/runtime/runner.py::_budget_carry_kwargs": {
-  "complexity": 3,
-  "coverage": 1.0,
-  "crap": 3.0,
-  "digest": "0adfaeed2e22"
- },
- "src/dendrux/runtime/runner.py::_cancel_resumed_run": {
-  "complexity": 3,
-  "coverage": 1.0,
-  "crap": 3.0,
-  "digest": "30b86b2f8fe3"
- },
- "src/dendrux/runtime/runner.py::_carry_budget_fields": {
-  "complexity": 1,
-  "coverage": 1.0,
-  "crap": 1.0,
-  "digest": "f512902b422e"
- },
- "src/dendrux/runtime/runner.py::_decided_payload": {
-  "complexity": 9,
-  "coverage": 1.0,
-  "crap": 9.0,
-  "digest": "bd1011cd7f87"
- },
- "src/dendrux/runtime/runner.py::_execute_approved_tools": {
-  "complexity": 22,
-  "coverage": 1.0,
-  "crap": 22.0,
-  "digest": "3c3e372e411d",
-  "waived": {
-   "date": "2026-11-01",
-   "reason": "Adopt enforcement: re-recorded at feat/0.6.0 62f99e8a with CI-grade coverage (Postgres run). The baseline predates the 0.6 work and MySQL-only code is uncovered in the python job; coordinator to approve.",
-   "rule": "worse"
-  }
- },
- "src/dendrux/runtime/runner.py::_execute_approved_tools.<locals>._append": {
-  "complexity": 4,
-  "coverage": 1.0,
-  "crap": 4.0,
-  "digest": "0c69a304a758"
- },
- "src/dendrux/runtime/runner.py::_fenced_resume_result": {
-  "complexity": 2,
-  "coverage": 1.0,
-  "crap": 2.0,
-  "digest": "c98e427978ec"
- },
- "src/dendrux/runtime/runner.py::_finish_approval_batch": {
-  "complexity": 6,
-  "coverage": 1.0,
-  "crap": 6.0,
-  "digest": "f2df081ac25b"
- },
- "src/dendrux/runtime/runner.py::_finish_resume_stream_cleanup": {
-  "complexity": 7,
-  "coverage": 0.8947,
-  "crap": 7.06,
-  "digest": "26c6ae301c0f"
- },
- "src/dendrux/runtime/runner.py::_finish_resumed_result": {
-  "complexity": 1,
-  "coverage": 1.0,
-  "crap": 1.0,
-  "digest": "28635a19fae3"
- },
- "src/dendrux/runtime/runner.py::_finish_stream_resume_failure": {
-  "complexity": 6,
-  "coverage": 1.0,
-  "crap": 6.0,
-  "digest": "827ca288f4b4"
- },
- "src/dendrux/runtime/runner.py::_handle_resume_failure": {
-  "complexity": 3,
-  "coverage": 1.0,
-  "crap": 3.0,
-  "digest": "c0a21c62d2b8"
- },
- "src/dendrux/runtime/runner.py::_initial_call_counts_kwargs": {
-  "complexity": 2,
-  "coverage": 1.0,
-  "crap": 2.0,
-  "digest": "79c4131760bb"
- },
- "src/dendrux/runtime/runner.py::_inject_approved_skill": {
-  "complexity": 7,
-  "coverage": 1.0,
-  "crap": 7.0,
-  "digest": "b16bff1048a4"
- },
- "src/dendrux/runtime/runner.py::_limit_approval_clients": {
-  "complexity": 9,
-  "coverage": 1.0,
-  "crap": 9.0,
-  "digest": "5d70fa41603e"
- },
- "src/dendrux/runtime/runner.py::_mark_stream_recovery_work": {
-  "complexity": 1,
-  "coverage": 1.0,
-  "crap": 1.0,
-  "digest": "2696f1ea1f57"
- },
- "src/dendrux/runtime/runner.py::_owned_claim_view": {
-  "complexity": 5,
-  "coverage": 1.0,
-  "crap": 5.0,
-  "digest": "1a318fc60624"
- },
- "src/dendrux/runtime/runner.py::_pending_decision_map": {
-  "complexity": 4,
-  "coverage": 1.0,
-  "crap": 4.0,
-  "digest": "ce99045b247e"
- },
- "src/dendrux/runtime/runner.py::_record_approval_decided": {
-  "complexity": 3,
-  "coverage": 1.0,
-  "crap": 3.0,
-  "digest": "94af452ea335"
- },
- "src/dendrux/runtime/runner.py::_rejection_decided_payload": {
-  "complexity": 3,
-  "coverage": 1.0,
-  "crap": 3.0,
-  "digest": "899b1ccc62d3"
- },
- "src/dendrux/runtime/runner.py::_released_resume_hooks": {
-  "complexity": 6,
-  "coverage": 1.0,
-  "crap": 6.0,
-  "digest": "a1ca2291b68a"
- },
- "src/dendrux/runtime/runner.py::_released_resume_status": {
-  "complexity": 3,
-  "coverage": 0.5714,
-  "crap": 3.71,
-  "digest": "db2765b691cb"
- },
- "src/dendrux/runtime/runner.py::_remember_stream_release": {
-  "complexity": 1,
-  "coverage": 1.0,
-  "crap": 1.0,
-  "digest": "b5c469358006"
- },
- "src/dendrux/runtime/runner.py::_resume_approval_batch": {
-  "complexity": 8,
-  "coverage": 1.0,
-  "crap": 8.0,
-  "digest": "68a9d7a1b2a2"
- },
- "src/dendrux/runtime/runner.py::_resume_approval_work": {
-  "complexity": 2,
-  "coverage": 1.0,
-  "crap": 2.0,
-  "digest": "782d0e3d8589"
- },
- "src/dendrux/runtime/runner.py::_resume_barrier": {
-  "complexity": 2,
-  "coverage": 1.0,
-  "crap": 2.0,
-  "digest": "3807991fe3e5"
- },
- "src/dendrux/runtime/runner.py::_resume_claim_status": {
-  "complexity": 3,
-  "coverage": 0.8333,
-  "crap": 3.04,
-  "digest": "3ffb56912d1f"
- },
- "src/dendrux/runtime/runner.py::_resume_core": {
-  "complexity": 15,
-  "coverage": 1.0,
-  "crap": 15.0,
-  "digest": "b01447983a1f",
-  "waived": {
-   "date": "2026-11-01",
-   "reason": "Adopt enforcement: re-recorded at feat/0.6.0 62f99e8a with CI-grade coverage (Postgres run). The baseline predates the 0.6 work and MySQL-only code is uncovered in the python job; coordinator to approve.",
-   "rule": "worse"
-  }
- },
- "src/dendrux/runtime/runner.py::_resume_delegation": {
-  "complexity": 7,
-  "coverage": 1.0,
-  "crap": 7.0,
-  "digest": "953f982b8bee"
- },
- "src/dendrux/runtime/runner.py::_resume_expected_status": {
-  "complexity": 3,
-  "coverage": 1.0,
-  "crap": 3.0,
-  "digest": "101d17aa3ebc"
- },
- "src/dendrux/runtime/runner.py::_resume_failure_hooks": {
-  "complexity": 3,
-  "coverage": 0.7143,
-  "crap": 3.21,
-  "digest": "81bf7fee399b"
- },
- "src/dendrux/runtime/runner.py::_resume_loop_stream": {
-  "complexity": 3,
-  "coverage": 1.0,
-  "crap": 3.0,
-  "digest": "bcfd092736b3"
- },
- "src/dendrux/runtime/runner.py::_resume_pause_barrier": {
-  "complexity": 3,
-  "coverage": 1.0,
-  "crap": 3.0,
-  "digest": "bc11786a93e8"
- },
- "src/dendrux/runtime/runner.py::_resume_release_supported": {
-  "complexity": 2,
-  "coverage": 1.0,
-  "crap": 2.0,
-  "digest": "c09fcd5f1c00"
- },
- "src/dendrux/runtime/runner.py::_resume_warning_meta": {
-  "complexity": 2,
-  "coverage": 1.0,
-  "crap": 2.0,
-  "digest": "9cf870636f2c"
- },
- "src/dendrux/runtime/runner.py::_resumed_loop_kwargs": {
-  "complexity": 2,
-  "coverage": 1.0,
-  "crap": 2.0,
-  "digest": "ef3d9f244c62"
- },
- "src/dendrux/runtime/runner.py::_run_resumed_loop": {
-  "complexity": 1,
-  "coverage": 1.0,
-  "crap": 1.0,
-  "digest": "fc0049e577e3"
- },
- "src/dendrux/runtime/runner.py::_stopped_stream_event": {
-  "complexity": 2,
-  "coverage": 1.0,
-  "crap": 2.0,
-  "digest": "f46809823180"
- },
- "src/dendrux/runtime/runner.py::_stream_approval_events": {
-  "complexity": 4,
-  "coverage": 1.0,
-  "crap": 4.0,
-  "digest": "5b7577e11ae4"
- },
- "src/dendrux/runtime/runner.py::_stream_resume_failure": {
-  "complexity": 5,
-  "coverage": 1.0,
-  "crap": 5.0,
-  "digest": "1f25d3bcdbe8"
- },
- "src/dendrux/runtime/runner.py::_stream_resume_images": {
-  "complexity": 8,
-  "coverage": 0.8,
-  "crap": 8.51,
-  "digest": "bc49a6f46b47"
- },
- "src/dendrux/runtime/runner.py::_stream_resume_started": {
-  "complexity": 2,
-  "coverage": 1.0,
-  "crap": 2.0,
-  "digest": "ab3b00753552"
- },
- "src/dendrux/runtime/runner.py::_stream_resume_state": {
-  "complexity": 3,
-  "coverage": 1.0,
-  "crap": 3.0,
-  "digest": "233d77293298"
- },
- "src/dendrux/runtime/runner.py::_try_resume_release": {
-  "complexity": 2,
-  "coverage": 1.0,
-  "crap": 2.0,
-  "digest": "e9078df06664"
- },
- "src/dendrux/runtime/runner.py::_validate_owned_pause": {
-  "complexity": 6,
-  "coverage": 0.9444,
-  "crap": 6.01,
-  "digest": "c653a09dadc2"
- },
- "src/dendrux/runtime/runner.py::_validated_decisions": {
-  "complexity": 2,
-  "coverage": 1.0,
-  "crap": 2.0,
-  "digest": "3a110f2bced4"
- },
- "src/dendrux/runtime/runner.py::resume": {
-  "complexity": 2,
-  "coverage": 1.0,
-  "crap": 2.0,
-  "digest": "7c2c6ff2b379"
- },
- "src/dendrux/runtime/runner.py::resume_approval_approved_claim": {
-  "complexity": 2,
-  "coverage": 1.0,
-  "crap": 2.0,
-  "digest": "732bce3f89e5"
- },
- "src/dendrux/runtime/runner.py::resume_claimed": {
-  "complexity": 4,
-  "coverage": 1.0,
-  "crap": 4.0,
-  "digest": "93459c9950a5"
- },
- "src/dendrux/runtime/runner.py::resume_paused_claim": {
-  "complexity": 2,
-  "coverage": 1.0,
-  "crap": 2.0,
-  "digest": "bd83e9a668ac"
- },
- "src/dendrux/runtime/runner.py::resume_stream": {
-  "complexity": 5,
-  "coverage": 1.0,
-  "crap": 5.0,
-  "digest": "727e25a15b4f"
- },
- "src/dendrux/runtime/runner.py::resume_stream.<locals>._cleanup": {
-  "complexity": 5,
-  "coverage": 1.0,
-  "crap": 5.0,
-  "digest": "143b167fa783"
- },
- "src/dendrux/runtime/runner.py::resume_stream.<locals>._cleanup.<locals>.mark_cancelled": {
-  "complexity": 1,
-  "coverage": 1.0,
-  "crap": 1.0,
-  "digest": "b628bed336b4"
- },
- "src/dendrux/runtime/runner.py::resume_stream.<locals>._generate": {
-  "complexity": 16,
-  "coverage": 1.0,
-  "crap": 16.0,
-  "digest": "2f7ab9c4cb78",
-  "waived": {
-   "date": "2026-11-01",
-   "reason": "Adopt enforcement: re-recorded at feat/0.6.0 62f99e8a with CI-grade coverage (Postgres run). The baseline predates the 0.6 work and MySQL-only code is uncovered in the python job; coordinator to approve.",
-   "rule": "worse"
-  }
- },
- "src/dendrux/runtime/runner.py::resume_with_input": {
-  "complexity": 1,
-  "coverage": 1.0,
-  "crap": 1.0,
-  "digest": "c43428458621"
  },
  "src/dendrux/runtime/state.py::StateStore.add_note": {
   "complexity": 1,

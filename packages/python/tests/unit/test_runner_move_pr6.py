@@ -8,7 +8,7 @@ import pytest
 
 from dendrux import Agent
 from dendrux.llm.mock import MockLLM
-from dendrux.runtime import runner
+from dendrux.runtime import _run_approval, runner
 from dendrux.types import LLMResponse, RunEventType, RunStatus, StreamEvent, StreamEventType
 from tests._fixtures.storage import pin_storage_format
 from tests._helpers.paused_runs import _pause
@@ -140,7 +140,7 @@ async def test_approval_fault_preserves_consumption_boundary_and_retry_behavior(
 
     try:
         with monkeypatch.context() as patcher:
-            patcher.setattr(runner, "_execute_approved_tools", execute)
+            patcher.setattr(_run_approval, "_execute_approved_tools", execute)
             if streaming:
                 result, events = await invoke()
                 assert result.status == (

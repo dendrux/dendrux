@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from dendrux.errors import PersistenceError, StoreOutcomeUnknown
-from dendrux.runtime import _run_events, _run_resume_replay, runner
+from dendrux.runtime import _run_approval, _run_events, _run_resume_replay, runner
 from dendrux.types import RunStatus
 from tests._fixtures.storage import pin_storage_format
 from tests._helpers.gates import wait_for_gate
@@ -215,7 +215,7 @@ async def test_stream_approval_work_is_never_released(store, engine, monkeypatch
 
     release = AsyncMock(wraps=store.release_run_claim)
     monkeypatch.setattr(store, "release_run_claim", release)
-    monkeypatch.setattr(runner, "_resume_approval_batch", executed_then_fail)
+    monkeypatch.setattr(_run_approval, "_resume_approval_batch", executed_then_fail)
     async with case.agent.resume_stream(
         case.run_id, tenant_id="tenant", expected_pause_id=raw["pause_id"]
     ) as stream:

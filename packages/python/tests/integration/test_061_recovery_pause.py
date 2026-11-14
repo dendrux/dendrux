@@ -6,6 +6,7 @@ import pytest
 from sqlalchemy import event
 
 from dendrux import tool
+from dendrux.runtime import _run_approval
 from dendrux.types import ToolCall, ToolDecision
 from tests._helpers.recovery_checkpoint import checkpoint
 from tests.integration.test_060_reclaim_agent import make_agent
@@ -134,7 +135,7 @@ async def test_061_recovery_pause_can_repeat(store, engine, monkeypatch, entry):
     effects = []
     agent = _agent(store, effects)
     paused, calls = await _requested_pause(agent, store, engine, monkeypatch)
-    original = runner._resume_barrier
+    original = runner._resume_pause_barrier
 
     async def request_again(owned, run_id):
         assert await store.request_pause(run_id)
@@ -142,7 +143,7 @@ async def test_061_recovery_pause_can_repeat(store, engine, monkeypatch, entry):
 
     for _ in range(2):
         with monkeypatch.context() as patch:
-            patch.setattr(runner, "_resume_barrier", request_again)
+            patch.setattr(_run_approval, "_resume_pause_barrier", request_again)
             again = await _continue(agent, paused.run_id, paused.pause_id, entry)
         assert again.status.value == "paused"
         assert again.pause_id != paused.pause_id

@@ -15,7 +15,7 @@ import pytest
 from dendrux import Agent, tool
 from dendrux.errors import ProviderTimeoutError
 from dendrux.loops.base import BaseNotifier
-from dendrux.runtime import _run_entry, _run_observers, _run_resume_replay
+from dendrux.runtime import _run_entry, _run_observers, _run_resume_loop, _run_resume_replay
 from dendrux.runtime.context import (
     DelegationContext,
     DelegationDepthExceededError,
@@ -643,7 +643,7 @@ async def test_concurrent_submit_failure_releases_only_winning_epoch(
 async def test_unconsumed_resume_argument_failure_releases(store, monkeypatch, failure_site):
     from unittest.mock import Mock
 
-    from dendrux.runtime import _run_images, runner
+    from dendrux.runtime import _run_images
 
     _, run_id, invoke = await submission_case(store, "submit_resume")
     original = RuntimeError("resume_argument_failure")
@@ -652,7 +652,7 @@ async def test_unconsumed_resume_argument_failure_releases(store, monkeypatch, f
         if failure_site == "_resume_image_view":
             patcher.setattr(_run_images, "_resume_image_view", fail)
         else:
-            patcher.setattr(runner, "_budget_carry_kwargs", fail)
+            patcher.setattr(_run_resume_loop, "_budget_carry_kwargs", fail)
         with pytest.raises(RuntimeError) as caught:
             await invoke()
     assert caught.value is original

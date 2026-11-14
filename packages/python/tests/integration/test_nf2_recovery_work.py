@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from dendrux.runtime import _reclaim, runner
+from dendrux.runtime import _reclaim, _run_resume_stream, runner
 from dendrux.types import RunEventType
 from tests.integration.test_cross_path_invariants import paused_recovery
 
@@ -41,7 +41,7 @@ async def test_recovery_work_is_marked_before_dispatch_and_never_released(
         return await failed(shared, *args)
 
     monkeypatch.setattr(_reclaim, "resolve", dispatch_then_fail)
-    monkeypatch.setattr(runner, "_stream_resume_failure", capture_failure)
+    monkeypatch.setattr(_run_resume_stream, "_stream_resume_failure", capture_failure)
     monkeypatch.setattr(store, "release_run_claim", release)
     scope = {"tenant_id": "tenant", "expected_pause_id": paused.pause_id}
     if entry == "resume_stream":
