@@ -6,22 +6,56 @@ import ast
 from typing import TYPE_CHECKING
 
 from tools._move_manifest import roots
-from tools._scopes import ScopeIndex
+from tools._scopes import ScopeIndex, dotted, resolve_dotted
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Iterator, Mapping
+
+
+def _assignment_values(value: ast.expr | None) -> Iterator[ast.Name | ast.Attribute]:
+    if isinstance(value, ast.Name | ast.Attribute):
+        yield value
+    elif isinstance(value, ast.Tuple | ast.List):
+        for item in value.elts:
+            yield from _assignment_values(item)
+    elif isinstance(value, ast.Starred):
+        yield from _assignment_values(value.value)
+
+
+def _assignment_copies(
+    tree: ast.Module, index: ScopeIndex, module: str, forbidden: set[str], retained_alias: bool
+) -> dict[ast.expr, str]:
+    copies: dict[ast.expr, str] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign | ast.AnnAssign):
+            continue
+        for value in _assignment_values(node.value):
+            spelling = dotted(value)
+            target = resolve_dotted(spelling, index.scope_of(value)) if spelling else None
+            if target is not None and (
+                target in forbidden
+                and target.rpartition(".")[0] != module
+                or retained_alias
+                and target == "dendrux.skills._session.current"
+            ):
+                copies[value] = target
+    return copies
 
 
 def check_bindings(source: str, module: str, targets: Mapping[str, str]) -> list[str]:
-    """Bare imported callables must be read through their defining owner module."""
+    """Read imported callables through their owner; reject frozen assignment copies."""
     tree = ast.parse(source)
     index = ScopeIndex(tree, module.rpartition(".")[0])
     forbidden = set(targets.values())
     retained = "dendrux.runtime._run_entry.current_skill_session"
     retained_alias = retained in forbidden and module != "dendrux.runtime._run_entry"
-    problems = []
+    copies = _assignment_copies(tree, index, module, forbidden, retained_alias)
+    problems = [
+        f"owner-binding: {module}:{node.lineno} copies {target}; qualify its owner"
+        for node, target in copies.items()
+    ]
     for node, scope in index.names:
-        if not isinstance(node.ctx, ast.Load):
+        if not isinstance(node.ctx, ast.Load) or node in copies:
             continue
         binding = scope.resolve(node.id)
         copied_alias = (
