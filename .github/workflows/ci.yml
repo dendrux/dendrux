@@ -608,6 +608,7 @@ jobs:
   move-manifests:
     name: Detect active split manifests
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
       active: ${{ steps.detect.outputs.active }}
     steps:

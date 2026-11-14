@@ -178,14 +178,12 @@ def test_a_try_import_guard_is_compared() -> None:
     assert check(old, {"old": "import fast\n"}).problems
 
 
-def test_type_checking_import_blocks_may_change_but_other_guards_may_not() -> None:
+def test_type_checking_imports_need_explanations_and_other_guards_stay_strict() -> None:
     old = "from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n    import a\n"
-    assert (
-        check(
-            old, {"old": "from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n    import b\n"}
-        ).problems
-        == []
+    report = check(
+        old, {"old": "from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n    import b\n"}
     )
+    assert any("extra-import" in problem and "import b" in problem for problem in report.problems)
     assert check(
         old, {"old": "from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n    X = 1\n"}
     ).problems

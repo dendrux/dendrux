@@ -182,7 +182,10 @@ def test_supported_gates_verify_provider_snapshots_before_comparison(
 
 @pytest.mark.parametrize("manifest_mode", [False, True])
 def test_original_bindings_and_type_only_imports_still_pass(manifest_mode: bool) -> None:
-    old = "import os\ndef f(): return os.getcwd()\n"
+    old = (
+        "import os\nfrom typing import TYPE_CHECKING\nif TYPE_CHECKING:\n"
+        " from annotation_only import Shape\ndef f(): return os.getcwd()\n"
+    )
     after = {
         "old": "from new import f\n",
         "new": (

@@ -485,3 +485,15 @@ before calling `check_move`. The in-memory `check_move` API trusts its supplied
 snapshots and is for comparison/fixtures; do not invoke it directly as a proof gate.
 Regression tests assert forged snapshots are refused before either gate reaches
 comparison.
+
+TYPE_CHECKING guards do not exempt imports from explanation. Guarded imports must
+preserve original runtime/type-only bindings or match the same reviewed owner,
+hoist and scaffold sources; unknown guarded imports fail as `extra-import`.
+Original type-only bindings explain guarded copies only, not new runtime imports.
+A guarded import read outside an annotation must have a real binding in the same
+lexical scope at runtime. Otherwise the checker reports `type-only-runtime` with
+the name and location. Defaults, decorators and nested functions count as runtime
+reads; annotations do not. A parameter can legitimately shadow a module type import,
+and an outer import cannot satisfy a function's unbound local import. Annotation-only
+variable declarations do not create runtime bindings. These checks apply to both
+checker modes and to residual modules as well as destinations.

@@ -66,3 +66,9 @@ scaffold typing; arbitrary additions beside an allowed import still fail.
 Use only the move-check CLI or `make move-proof` as proof gates. The in-memory
 `check_move` API deliberately trusts its snapshots for comparison/fixtures; the two
 supported gates verify immutable/current provider sources before invoking it.
+
+Guarded imports are inspected too: preserve an original binding or provide an exact
+existing import explanation. A TYPE_CHECKING-only name cannot be used by executable
+code, defaults or decorators unless a runtime binding exists in its lexical scope.
+Annotation references and genuine local shadowing remain valid. Moving a runtime
+import under TYPE_CHECKING cannot silently remove the binding a moved function needs.

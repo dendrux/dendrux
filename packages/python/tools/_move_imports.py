@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 from typing import TYPE_CHECKING, Any
 
+from tools._move_typechecking import check_runtime_imports, guarded_imports
 from tools._scopes import ScopeIndex, dotted, resolve_dotted, resolve_package
 
 if TYPE_CHECKING:
@@ -83,11 +84,16 @@ def check_imports(
     hosts: Mapping[str, str],
     manifest: Mapping[str, Any] | None = None,
 ) -> list[str]:
-    """Reject all stars and require an exact explanation for each runtime top-level import."""
+    """Reject stars and explain runtime and TYPE_CHECKING imports without hiding runtime reads."""
     modules = {key: modules.get(key, key) for key in [old_key, *trees]}
     evidence = manifest or {}
     original = {
         b for n in old.body if isinstance(n, _IMPORTS) for b in _bindings(n, modules[old_key])
+    }
+    original_typed = {
+        binding
+        for node in guarded_imports(old, modules[old_key])
+        for binding in _bindings(node, modules[old_key])
     }
     owned = {}
     for name, key in dict(owners, **hosts).items():
@@ -114,13 +120,22 @@ def check_imports(
             for name, target in owned.items()
             if target.rpartition(".")[0] != modules[key]
         }
-        for node in tree.body:
-            if not isinstance(node, _IMPORTS):
-                continue
+        guarded = guarded_imports(tree, modules[key])
+        runtime_nodes = [node for node in tree.body if isinstance(node, _IMPORTS)]
+        for node in [*runtime_nodes, *guarded]:
+            explained_original = original | original_typed if node in guarded else original
             for binding in _bindings(node, modules[key]):
-                if not _explained(binding, original, peer_owned, targets, hoisted, typing_names):
+                scaffold_abstract = (
+                    node in guarded
+                    and binding == ("from", "abc.abstractmethod", "abstractmethod")
+                    and binding[2] in _scaffold_names(evidence, key)
+                )
+                if not scaffold_abstract and not _explained(
+                    binding, explained_original, peer_owned, targets, hoisted, typing_names
+                ):
                     problems.append(
                         f"extra-import: {key}:{node.lineno}: {ast.unparse(node)} "
                         f"(unexplained {binding[1]})"
                     )
+        problems.extend(check_runtime_imports(tree, modules[key], key))
     return problems
