@@ -5,7 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 from decimal import ROUND_HALF_UP, Decimal
-from typing import TYPE_CHECKING, Any, NoReturn
+from typing import TYPE_CHECKING, Any, Literal, NoReturn, Protocol
 
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
@@ -31,7 +31,7 @@ from dendrux.types import RunStatus
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
-    from dendrux.runtime.stores.sql.base import SQLStateStore
+    from dendrux.runtime.stores._errors import DbError
 
 logger = logging.getLogger(__name__)
 _TRANSITIONS = frozenset(
@@ -85,8 +85,24 @@ def _bind_request(name: str, arguments: dict[str, Any]) -> tuple[Any, Any]:
     return bind, (arguments.get("run_id") if bind is None else bind.parent_run_id)
 
 
+class _CommitHost(Protocol):
+    supports_row_locks: bool
+
+    def classify_db_error(self, exc: BaseException) -> DbError: ...
+
+    async def _prepare_commit_readback(self, session: AsyncSession) -> None: ...
+
+    def json_get(self, col: Any, path: Any, as_type: Any) -> Any: ...
+
+    async def reserve_parent_writer(self, session: AsyncSession, run_id: str) -> None: ...
+
+    def lock_clause(
+        self, stmt: Any, intent: Literal["share", "update", "update_no_key"]
+    ) -> Any: ...
+
+
 class _CommitReadback:
-    def __init__(self, store: SQLStateStore, session: AsyncSession, operation: Any) -> None:
+    def __init__(self, store: _CommitHost, session: AsyncSession, operation: Any) -> None:
         self.store, self.session = store, session
         self.name: str
         self.arguments: dict[str, Any]
