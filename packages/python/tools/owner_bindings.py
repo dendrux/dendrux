@@ -18,14 +18,20 @@ def check_bindings(source: str, module: str, targets: Mapping[str, str]) -> list
     index = ScopeIndex(tree, module.rpartition(".")[0])
     forbidden = set(targets.values())
     retained = "dendrux.runtime._run_entry.current_skill_session"
-    if retained in forbidden and module != "dendrux.runtime._run_entry":
-        forbidden.add("dendrux.skills._session.current")
+    retained_alias = retained in forbidden and module != "dendrux.runtime._run_entry"
     problems = []
     for node, scope in index.names:
         if not isinstance(node.ctx, ast.Load):
             continue
         binding = scope.resolve(node.id)
-        if binding and binding.kind == "import" and binding.value in forbidden:
+        copied_alias = (
+            retained_alias
+            and node.id != "current"
+            and binding is not None
+            and binding.kind == "import"
+            and binding.value == "dendrux.skills._session.current"
+        )
+        if binding and binding.kind == "import" and (binding.value in forbidden or copied_alias):
             owner = binding.value.rpartition(".")[0]
             if owner != module:
                 problems.append(
@@ -33,7 +39,13 @@ def check_bindings(source: str, module: str, targets: Mapping[str, str]) -> list
                     "qualify its owner"
                 )
         elif scope.hides_import(node.id) and any(
-            b.kind == "import" and b.value in forbidden
+            b.kind == "import"
+            and (
+                b.value in forbidden
+                or retained_alias
+                and node.id != "current"
+                and b.value == "dendrux.skills._session.current"
+            )
             for s in index.scopes
             for b in s.bindings.get(node.id, ())
         ):
