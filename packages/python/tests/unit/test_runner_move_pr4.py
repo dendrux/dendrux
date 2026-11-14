@@ -10,6 +10,7 @@ from dendrux import Agent
 from dendrux.llm.mock import MockLLM
 from dendrux.loops import ReActLoop, SingleCall
 from dendrux.runtime import runner
+from dendrux.strategies import native
 from dendrux.types import LLMResponse, RunEventType, RunStatus, StreamEvent, StreamEventType
 from tests._helpers.runtime_paths import path_case
 from tests._helpers.scripted_provider import ScriptedLLM
@@ -109,7 +110,7 @@ async def test_default_strategy_fault_fires_across_fresh_retry_and_resume(store,
     case = await path_case(store, None, path, ScriptedLLM([LLMResponse(text="done")]))
     fault = RuntimeError("pr4_default_strategy_fault")
     constructor = Mock(side_effect=fault)
-    monkeypatch.setattr(runner, "NativeToolCalling", constructor)
+    monkeypatch.setattr(native, "NativeToolCalling", constructor)
     try:
         if path == "resume_stream":
             result = await case.invoke()
@@ -128,7 +129,7 @@ async def test_default_strategy_fault_fires_across_fresh_retry_and_resume(store,
 def test_default_strategy_fault_also_reaches_approval_dispatch(monkeypatch):
     fault = RuntimeError("pr4_approval_strategy_fault")
     constructor = Mock(side_effect=fault)
-    monkeypatch.setattr(runner, "NativeToolCalling", constructor)
+    monkeypatch.setattr(native, "NativeToolCalling", constructor)
     with pytest.raises(RuntimeError) as caught:
         runner._approval_dispatch_inputs(None, None)
     assert caught.value is fault

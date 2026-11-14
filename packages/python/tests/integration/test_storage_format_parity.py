@@ -50,7 +50,7 @@ async def test_question_survives_every_pause_read(
     store, engine, fmt, entry, continuation, monkeypatch
 ):
     await pin_storage_format(engine, fmt)
-    monkeypatch.setattr("dendrux.runtime.runner.NativeToolCalling", Questions)
+    monkeypatch.setattr("dendrux.strategies.native.NativeToolCalling", Questions)
     agent = Agent(
         prompt="system",
         provider=MockLLM(

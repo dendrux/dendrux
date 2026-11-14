@@ -25,15 +25,15 @@ from copy import deepcopy
 from dataclasses import dataclass as dataclass
 from dataclasses import replace
 from functools import partial
-from typing import TYPE_CHECKING, Any, NamedTuple, NoReturn, overload
+from typing import TYPE_CHECKING, Any, NamedTuple, NoReturn
 from typing import Literal as Literal
 from typing import get_args as get_args
+from typing import overload as overload
 
 import dendrux.chat as _chat
 import dendrux.loops._helpers as _hooks
-import dendrux.runtime.context as _context
-import dendrux.runtime.replay as _replay
 import dendrux.runtime.state as _state
+import dendrux.strategies.native as _native
 from dendrux import _codes
 from dendrux._lifecycle import CANCEL_FINALIZE_STATUS_VALUES as CANCEL_FINALIZE_STATUS_VALUES
 from dendrux._lifecycle import (
@@ -47,43 +47,40 @@ from dendrux._lifecycle import (
 )
 from dendrux._lifecycle import (
     STORAGE_FORMAT_CHECKPOINTED,
-    TERMINAL_STATUSES,
     CancelReason,
     DenialReason,
     FailureReason,
     PauseReason,
     StoredEventType,
 )
+from dendrux._lifecycle import TERMINAL_STATUSES as TERMINAL_STATUSES
 from dendrux._meta_keys import BLOCKED_META_KEY as BLOCKED_META_KEY
 from dendrux._meta_keys import (
     CANCEL_PERSISTED_META_KEY,
-    LOOP_META_KEY,
     MAX_DELEGATION_DEPTH_META_KEY,
     NOT_EXECUTED_META_KEY,
-    SEED_PREFIX_META_KEY,
-    SKILLS_CONTEXT_META_KEY,
 )
 from dendrux._meta_keys import ERROR_INFO_META_KEY as ERROR_INFO_META_KEY
+from dendrux._meta_keys import LOOP_META_KEY as LOOP_META_KEY
 from dendrux._meta_keys import OUTPUT_TYPE_META_KEY as OUTPUT_TYPE_META_KEY
 from dendrux._meta_keys import RETRY_OF_META_KEY as RETRY_OF_META_KEY
+from dendrux._meta_keys import SEED_PREFIX_META_KEY as SEED_PREFIX_META_KEY
+from dendrux._meta_keys import SKILLS_CONTEXT_META_KEY as SKILLS_CONTEXT_META_KEY
 from dendrux._meta_keys import (
     STOP_REASON_META_KEY as STOP_REASON_META_KEY,
 )
-from dendrux._sentinel import _OMITTED, _OmittedType, _UnsetType
-from dendrux.chat import (
-    history_has_images,
-    normalize_chat_history,
-    validate_chat_history,
-)
+from dendrux._sentinel import _OMITTED, _OmittedType
+from dendrux._sentinel import _UnsetType as _UnsetType
+from dendrux.chat import history_has_images as history_has_images
+from dendrux.chat import normalize_chat_history as normalize_chat_history
 from dendrux.chat import split_user_content as split_user_content
-from dendrux.context_blocks import (
-    ContextBlock,
-    fold_context,
-    render_band,
-    validate_context,
-    wire_user_input,
-    wire_user_parts,
-)
+from dendrux.chat import validate_chat_history as validate_chat_history
+from dendrux.context_blocks import ContextBlock as ContextBlock
+from dendrux.context_blocks import fold_context as fold_context
+from dendrux.context_blocks import render_band as render_band
+from dendrux.context_blocks import validate_context as validate_context
+from dendrux.context_blocks import wire_user_input as wire_user_input
+from dendrux.context_blocks import wire_user_parts as wire_user_parts
 from dendrux.errors import (
     BlobNotFoundError as BlobNotFoundError,
 )
@@ -124,8 +121,8 @@ from dendrux.loops._policy_context import (
 )
 from dendrux.loops.react import MANAGED_HANDOFF_KEY as MANAGED_HANDOFF_KEY
 from dendrux.loops.react import ReActLoop
+from dendrux.runtime import _managed as _managed
 from dendrux.runtime import (
-    _managed,
     _managed_budget,
     _reclaim,
     _run_contracts,
@@ -139,7 +136,8 @@ from dendrux.runtime import (
     _run_start,
     _run_tools,
 )
-from dendrux.runtime._entry_checks import resolve_runner_tenant, runner_entry_checks
+from dendrux.runtime._entry_checks import resolve_runner_tenant as resolve_runner_tenant
+from dendrux.runtime._entry_checks import runner_entry_checks as runner_entry_checks
 from dendrux.runtime._managed import (
     DESCEND_KEY as MANAGED_DESCEND_KEY,  # noqa: F401 - Frozen compatibility alias.
 )
@@ -212,6 +210,8 @@ from dendrux.runtime._run_events import _read_cancel_winner as _read_cancel_winn
 from dendrux.runtime._run_events import _shielded_cleanup as _shielded_cleanup
 from dendrux.runtime._run_events import _take_task_interrupt as _take_task_interrupt
 from dendrux.runtime._run_events import _transition_with_event as _transition_with_event
+from dendrux.runtime._run_execute import _run_once as _run_once
+from dendrux.runtime._run_execute import run as run
 from dendrux.runtime._run_images import _carry_image_view as _carry_image_view
 from dendrux.runtime._run_images import _entry_media as _entry_media
 from dendrux.runtime._run_images import _EntryImages as _EntryImages
@@ -305,6 +305,19 @@ from dendrux.runtime._run_pending import _reread_moved as _reread_moved
 from dendrux.runtime._run_pending import (
     _stop_reason_from_meta as _stop_reason_from_meta,
 )
+from dendrux.runtime._run_retry import _check_retry_source as _check_retry_source
+from dendrux.runtime._run_retry import _refresh_retry_user as _refresh_retry_user
+from dendrux.runtime._run_retry import _refuse_blocked_retry as _refuse_blocked_retry
+from dendrux.runtime._run_retry import _retry_edges as _retry_edges
+from dendrux.runtime._run_retry import _retry_history as _retry_history
+from dendrux.runtime._run_retry import _retry_media as _retry_media
+from dendrux.runtime._run_retry import _retry_replay as _retry_replay
+from dendrux.runtime._run_retry import _retry_replay_request as _retry_replay_request
+from dendrux.runtime._run_retry import _retry_source as _retry_source
+from dendrux.runtime._run_retry import _retry_source_input as _retry_source_input
+from dendrux.runtime._run_retry import _start_retry_history as _start_retry_history
+from dendrux.runtime._run_retry import _trim_retry_answer as _trim_retry_answer
+from dendrux.runtime._run_retry import retry as retry
 from dendrux.runtime._run_start import _creation_claim as _creation_claim
 from dendrux.runtime._run_start import _failure_fields as _failure_fields
 from dendrux.runtime._run_start import _failure_finalize_fields as _failure_finalize_fields
@@ -316,6 +329,12 @@ from dendrux.runtime._run_start import _RunLifecycle as _RunLifecycle
 from dendrux.runtime._run_start import _runtime_recorder as _runtime_recorder
 from dendrux.runtime._run_start import _start_new_run as _start_new_run
 from dendrux.runtime._run_start import _stream_run_failure as _stream_run_failure
+from dendrux.runtime._run_stream import _cached_stream_event as _cached_stream_event
+from dendrux.runtime._run_stream import _resolve_stream_store as _resolve_stream_store
+from dendrux.runtime._run_stream import _stream_claim as _stream_claim
+from dendrux.runtime._run_stream import _stream_entry_checks as _stream_entry_checks
+from dendrux.runtime._run_stream import _stream_replay_runs as _stream_replay_runs
+from dendrux.runtime._run_stream import run_stream as run_stream
 from dendrux.runtime._run_tools import _TOOL_NAME_CHARS as _TOOL_NAME_CHARS
 from dendrux.runtime._run_tools import _TOOL_NAME_SCAN_LIMIT as _TOOL_NAME_SCAN_LIMIT
 from dendrux.runtime._run_tools import _discover_runtime_tools as _discover_runtime_tools
@@ -327,37 +346,32 @@ from dendrux.runtime._run_tools import _mcp_error_payload as _mcp_error_payload
 from dendrux.runtime._run_tools import _MCPDiscoveryError as _MCPDiscoveryError
 from dendrux.runtime._run_tools import _snapshot_mcp_meta as _snapshot_mcp_meta
 from dendrux.runtime._run_tools import _validate_loop_skill_compat as _validate_loop_skill_compat
-from dendrux.runtime._tenant_checks import _tenant_scope_chosen
+from dendrux.runtime._tenant_checks import _tenant_scope_chosen as _tenant_scope_chosen
 from dendrux.runtime._tracelink import validate_trace_link as validate_trace_link
 from dendrux.runtime.context import (
     DelegationContext,
     StreamContext,
     get_store_identity,
     reset_delegation_context,
-    resolve_child_tenant,
-    resolve_parent_link,
     set_delegation_context,
-    take_managed_invocation,
 )
 from dendrux.runtime.context import get_delegation_context as get_delegation_context
-from dendrux.runtime.replay import (
-    PARTS_KEY,
-    REPLAY_META_KEY,
-    ReplayLast,
-    ReplayPlan,
-    ReplayRequest,
-    _pair_tool_calls,
-    current_prefix,
-    expand_replay,
-    has_images,
-    image_slot_count,
-    rebuild_messages,
-    user_trace_message,
-    validate_replay_args,
-)
+from dendrux.runtime.context import resolve_child_tenant as resolve_child_tenant
+from dendrux.runtime.context import resolve_parent_link as resolve_parent_link
+from dendrux.runtime.context import take_managed_invocation as take_managed_invocation
+from dendrux.runtime.replay import PARTS_KEY as PARTS_KEY
+from dendrux.runtime.replay import REPLAY_META_KEY as REPLAY_META_KEY
 from dendrux.runtime.replay import LoadedReplay as LoadedReplay
+from dendrux.runtime.replay import ReplayLast as ReplayLast
+from dendrux.runtime.replay import ReplayPlan as ReplayPlan
+from dendrux.runtime.replay import ReplayRequest as ReplayRequest
 from dendrux.runtime.replay import _load_replay_runs as _load_replay_runs
+from dendrux.runtime.replay import _pair_tool_calls as _pair_tool_calls
 from dendrux.runtime.replay import build_seed as build_seed
+from dendrux.runtime.replay import current_prefix as current_prefix
+from dendrux.runtime.replay import expand_replay as expand_replay
+from dendrux.runtime.replay import has_images as has_images
+from dendrux.runtime.replay import image_slot_count as image_slot_count
 from dendrux.runtime.replay import (
     initial_image_view as initial_image_view,
 )
@@ -368,7 +382,10 @@ from dendrux.runtime.replay import load_replay_runs as load_replay_runs
 from dendrux.runtime.replay import (
     parts_to_dicts as parts_to_dicts,
 )
+from dendrux.runtime.replay import rebuild_messages as rebuild_messages
 from dendrux.runtime.replay import record_run_prefix as record_run_prefix
+from dendrux.runtime.replay import user_trace_message as user_trace_message
+from dendrux.runtime.replay import validate_replay_args as validate_replay_args
 from dendrux.runtime.state import ClaimResult as ClaimResult
 from dendrux.runtime.state import _initial_loop_state as _initial_loop_state
 from dendrux.runtime.state import claimed_store as claimed_store
@@ -389,36 +406,36 @@ from dendrux.runtime.submit import (
     validate_result_names,
 )
 from dendrux.runtime.submit import governance_snapshot as governance_snapshot
-from dendrux.skills._session import META_KEY, SkillSession, continuation, current
+from dendrux.skills._session import META_KEY as META_KEY
+from dendrux.skills._session import SkillSession, continuation, current
 from dendrux.skills._session import (
     current as current_skill_session,  # noqa: F401 - Frozen compatibility alias.
 )
-from dendrux.strategies.native import NativeToolCalling
+from dendrux.strategies.native import NativeToolCalling as NativeToolCalling
 from dendrux.types import (
     AgentStep,
     ApprovalDecision,
     GovernanceEventType,
-    IdempotencyConflictError,
     ImagePart,
     ImageViewState,
     Message,
     PauseState,
     Role,
-    RunAlreadyActiveError,
     RunEventType,
     RunStatus,
     UsageStats,
     _usage_from_dict,
-    generate_ulid,
     tool_result_message,
 )
 from dendrux.types import (
     ErrorInfo as ErrorInfo,
 )
+from dendrux.types import IdempotencyConflictError as IdempotencyConflictError
 from dendrux.types import (
     ImageRef as ImageRef,
 )
 from dendrux.types import ReplaySummary as ReplaySummary
+from dendrux.types import RunAlreadyActiveError as RunAlreadyActiveError
 from dendrux.types import StopReason as StopReason
 from dendrux.types import (
     TextPart as TextPart,
@@ -427,6 +444,7 @@ from dendrux.types import compute_idempotency_fingerprint as compute_idempotency
 from dendrux.types import (
     content_part_from_dict as content_part_from_dict,
 )
+from dendrux.types import generate_ulid as generate_ulid
 
 if TYPE_CHECKING:
     from collections.abc import (
@@ -437,7 +455,6 @@ if TYPE_CHECKING:
     )
 
     from dendrux.agent import Agent
-    from dendrux.chat import ChatMessage
     from dendrux.llm.base import LLMProvider
     from dendrux.loops.base import Loop, LoopNotifier, LoopRecorder
     from dendrux.media._catalog import BlobEdge as BlobEdge
@@ -449,8 +466,6 @@ if TYPE_CHECKING:
     from dendrux.strategies.base import Strategy
     from dendrux.types import (
         ContentPart,
-        CreateRunResult,
-        Limits,
         RunEvent,
         RunResult,
         RunStream,
@@ -492,1701 +507,6 @@ def _carry_budget_fields(new: PauseState, old: PauseState) -> PauseState:
         budget_known_cost_usd=old.budget_known_cost_usd,
         budget_unpriced_calls=old.budget_unpriced_calls,
     )
-
-
-@overload
-async def run(
-    agent: Agent,
-    *,
-    provider: LLMProvider,
-    user_input: UserContent,
-    history: list[ChatMessage] | None = ...,
-    context: list[ContextBlock] | None = ...,
-    activate_skills: Sequence[str] | None = ...,
-    runs: list[str] | None = ...,
-    replay_last: ReplayLast = ...,
-    replay_reasoning: bool = ...,
-    strategy: Strategy | None = ...,
-    loop: Loop | None = ...,
-    state_store: StateStore | None = ...,
-    tenant_id: str | None | _OmittedType = ...,
-    metadata: dict[str, Any] | None = ...,
-    extra_notifier: LoopNotifier | None = ...,
-    max_delegation_depth: int | None,
-    idempotency_key: str | None = ...,
-    output_type: type | None = ...,
-    **kwargs: Any,
-) -> RunResult: ...
-
-
-@overload
-async def run(
-    agent: Agent,
-    *,
-    provider: LLMProvider,
-    user_input: UserContent,
-    history: list[ChatMessage] | None = ...,
-    context: list[ContextBlock] | None = ...,
-    activate_skills: Sequence[str] | None = ...,
-    runs: list[str] | None = ...,
-    replay_last: ReplayLast = ...,
-    replay_reasoning: bool = ...,
-    strategy: Strategy | None = ...,
-    loop: Loop | None = ...,
-    state_store: StateStore | None = ...,
-    tenant_id: str | None | _OmittedType = ...,
-    metadata: dict[str, Any] | None = ...,
-    extra_notifier: LoopNotifier | None = ...,
-    idempotency_key: str | None = ...,
-    output_type: type | None = ...,
-    **kwargs: Any,
-) -> RunResult: ...
-
-
-async def run(
-    agent: Agent,
-    *,
-    provider: LLMProvider,
-    user_input: UserContent,
-    history: list[ChatMessage] | None = None,
-    context: list[ContextBlock] | None = None,
-    activate_skills: Sequence[str] | None = None,
-    runs: list[str] | None = None,
-    replay_last: ReplayLast = 0,
-    replay_reasoning: bool = True,
-    strategy: Strategy | None = None,
-    loop: Loop | None = None,
-    state_store: StateStore | None = None,
-    tenant_id: str | None | _OmittedType = _OMITTED,
-    metadata: dict[str, Any] | None = None,
-    extra_notifier: LoopNotifier | None = None,
-    max_delegation_depth: int | None | _UnsetType = _UNSET_DEPTH,
-    idempotency_key: str | None = None,
-    output_type: type | None = None,
-    **kwargs: Any,
-) -> RunResult:
-    """Run an agent to completion.
-
-    This is the primary API for executing a Dendrux agent. It wires
-    together the agent definition, LLM provider, strategy, and loop,
-    then executes the loop until completion.
-
-    Args:
-        agent: Agent definition (model, tools, prompt, limits).
-        provider: LLM provider to use for this run.
-        user_input: The user's input to process.
-        strategy: Communication strategy. Defaults to NativeToolCalling.
-        loop: Execution loop. Defaults to ReActLoop.
-        state_store: Optional persistence backend. If provided, the run
-            is persisted to the database with full traces.
-        tenant_id: Optional tenant ID for multi-tenant isolation.
-        metadata: Optional developer linking data (thread_id, user_id, etc.).
-            Stored in agent_runs.meta — Dendrux stores it, never reads it.
-        extra_notifier: Optional additional LoopNotifier for best-effort
-            notifications (e.g. ConsoleNotifier).
-        max_delegation_depth: Maximum allowed delegation depth for the
-            run tree. Default 10. None means unbounded. Propagated to
-            all child runs via contextvar. Raises DelegationDepthExceededError
-            if a child run would exceed this depth.
-        **kwargs: Reserved for future use.
-
-    Returns:
-        RunResult with status, answer, steps, and usage stats.
-
-    Usage:
-        from dendrux import Agent, tool, run
-        from dendrux.llm import AnthropicProvider
-
-        @tool()
-        async def add(a: int, b: int) -> int:
-            return a + b
-
-        agent = Agent(
-            model="claude-sonnet-4-6",
-            tools=[add],
-            prompt="You are a calculator.",
-        )
-        provider = AnthropicProvider(api_key="sk-...", model="claude-sonnet-4-6")
-        result = await run(agent, provider=provider, user_input="What is 15 + 27?")
-        print(result.answer)
-    """
-    result = await _run_once(
-        agent,
-        provider=provider,
-        user_input=user_input,
-        history=history,
-        context=context,
-        activate_skills=activate_skills,
-        runs=runs,
-        replay_last=replay_last,
-        replay_reasoning=replay_reasoning,
-        strategy=strategy,
-        loop=loop,
-        state_store=state_store,
-        tenant_id=tenant_id,
-        metadata=metadata,
-        extra_notifier=extra_notifier,
-        max_delegation_depth=max_delegation_depth,
-        idempotency_key=idempotency_key,
-        output_type=output_type,
-        **kwargs,
-    )
-    # A managed parent exits at its handoff; the driver runs the child in this
-    # same task and unwinds terminal outcomes back to the root (0.7).
-    return await _managed.drive(result, notifier=extra_notifier)
-
-
-async def _run_once(
-    agent: Agent,
-    *,
-    provider: LLMProvider,
-    user_input: UserContent,
-    history: list[ChatMessage] | None = None,
-    context: list[ContextBlock] | None = None,
-    activate_skills: Sequence[str] | None = None,
-    runs: list[str] | None = None,
-    replay_last: ReplayLast = 0,
-    replay_reasoning: bool = True,
-    strategy: Strategy | None = None,
-    loop: Loop | None = None,
-    state_store: StateStore | None = None,
-    tenant_id: str | None | _OmittedType = _OMITTED,
-    metadata: dict[str, Any] | None = None,
-    extra_notifier: LoopNotifier | None = None,
-    max_delegation_depth: int | None | _UnsetType = _run_contracts._UNSET_DEPTH,
-    idempotency_key: str | None = None,
-    output_type: type | None = None,
-    **kwargs: Any,
-) -> RunResult:
-    """One run frame: a new run, or a managed child created by its atomic bind."""
-    invocation = take_managed_invocation()
-    tenant_explicit = _tenant_scope_chosen(tenant_id)
-    tenant_id = resolve_runner_tenant(agent, "run", tenant_id, state_store=state_store)
-    _run_entry._require_idempotency_store(state_store, idempotency_key)
-    await ensure_agent_limits_fit(agent, state_store)
-    skill_session = SkillSession.prepare(
-        agent, loop=_run_entry._new_run_loop(agent, loop), explicit=activate_skills
-    )
-    with skill_session.bind():
-        # Validate + resolve depth early — before any side effects.
-        # _resolve_max_delegation_depth is a pure policy helper; side effect
-        # is limited to dedup warning state on parent_ctx.warned_mismatches.
-        # A managed child never inherits the caller's delegation context: its
-        # parent link, level and depth come from its bound invocation.
-        parent_ctx = _managed.parent_context(invocation, _context.get_delegation_context)
-        effective_max_depth = _run_entry._resolve_max_delegation_depth(
-            max_delegation_depth, parent_ctx
-        )
-        tenant_id = resolve_child_tenant(parent_ctx, tenant_id)
-        runner_entry_checks(
-            agent,
-            "run",
-            tenant_id=tenant_id,
-            metadata=metadata,
-            user_input=user_input,
-            history=history,
-            context=context,
-            provider_kwargs=kwargs,
-            idempotency_key=idempotency_key,
-            provider=provider,
-        )
-        resolved_strategy = strategy or NativeToolCalling()
-        resolved_loop = _run_entry._new_run_loop(agent, loop)
-        _run_tools._validate_loop_skill_compat(agent, resolved_loop)
-        root_limits = await _managed.enter(agent, invocation, state_store, resolved_loop)
-        # Validate input + chat history before any side effects. Raises
-        # TypeError / ValueError on bad input so no DB row is created.
-        user_input, input_items, image_input, normalized_history = _run_entry._new_run_input(
-            user_input, history, resolved_loop
-        )
-        replay_req, replay_runs, replay_omitted = await _run_entry._entry_replay(
-            state_store,
-            tenant_id,
-            runs,
-            replay_last,
-            replay_reasoning,
-            resolved_loop,
-            context,
-            agent._limits,
-        )
-        replay_plan: ReplayPlan | None = None
-        provider_kwargs = dict(kwargs)
-        # A managed child's id is its parent's bind candidate, minted at the handoff.
-        run_id = _managed.new_run_id(invocation)
-        from dendrux.runtime._entry_guardrails import _entry_projection
-
-        entry_projection = _entry_projection(agent, run_id)
-        _system_prompt = (
-            await entry_projection.project(
-                Message(Role.SYSTEM, agent.get_system_prompt(loop=resolved_loop)), 0
-            )
-        ).content
-        # Images: ingest before the first durable write (§5.2). Typed errors
-        # raise here, before any run row or claim exists.
-        image_runtime, user_parts, normalized_history, cached = await _run_images._entry_media(
-            agent,
-            provider,
-            resolved_loop,
-            state_store,
-            tenant_id,
-            run_id,
-            image_input,
-            user_input,
-            input_items,
-            history,
-            normalized_history,
-            provider_kwargs,
-            idempotency_key,
-            output_type,
-            context,
-            replay_req,
-            skill_session,
-            entry_projection=entry_projection,
-        )
-        if cached is not None:
-            return cached
-        # When chat history is provided, the loop expects initial_history to
-        # be the COMPLETE message list (loops use initial_history as-is and
-        # do not separately append user_input — same contract as resume).
-        # The runner will record the new user_input itself (after the recorder
-        # is constructed) so seeded prior turns stay out of react_traces.
-        # With runs=, the replayed prefix is folded in after expansion.
-        (
-            seeded_history,
-            normalized_history,
-            context,
-            user_input,
-            user_parts,
-        ) = await entry_projection.prepare(
-            normalized_history, context, user_input, user_parts, skill_session
-        )
-        seeded_history = _run_entry._entry_seed_history(replay_req, seeded_history)
-
-        # --- Delegation context ---
-        parent_run_id, delegation_level = _managed.parent_link(invocation, parent_ctx, state_store)
-
-        ctx_token = None
-        mcp_meta: dict[str, Any] = {}
-        result: RunResult | None = None
-        lifecycle = _run_start._RunLifecycle(
-            run_id, state_store, getattr(agent, "_task_manager", None)
-        )
-
-        seed_kwargs: dict[str, Any] = {}
-        run_guardrails = entry_projection.engine
-        try:
-            try:
-                if state_store is not None:
-                    # Create the run record before the loop starts
-                    # Merge loop type + depth limit into developer metadata
-                    run_meta, idem_fingerprint = _run_entry._new_run_metadata(
-                        agent,
-                        resolved_loop,
-                        skill_session,
-                        metadata,
-                        effective_max_depth,
-                        user_input=user_input,
-                        idempotency_key=idempotency_key,
-                        output_type=output_type,
-                        history=normalized_history,
-                        context=context,
-                        replay=replay_req,
-                        parts=user_parts,
-                    )
-
-                    seed_kwargs, run_guardrails = await _run_entry._runtime_seeds(
-                        state_store,
-                        agent,
-                        provider,
-                        resolved_loop,
-                        resolved_strategy,
-                        provider_kwargs,
-                        seeded_history,
-                        user_input=user_input,
-                        run_id=run_id,
-                        tenant_id=tenant_id,
-                        replay_req=replay_req,
-                        replay_runs=replay_runs,
-                        replay_omitted=replay_omitted,
-                        normalized_history=normalized_history,
-                        context=context,
-                        user_parts=user_parts,
-                        engine=run_guardrails,
-                        system_prompt=_system_prompt,
-                    )
-                    created = await _run_entry._create_projected_run(
-                        entry_projection.error is not None,
-                        state_store,
-                        resolved_loop,
-                        run_id,
-                        agent.name,
-                        input_data=_run_images._input_data(user_input, user_parts),
-                        model=provider.model,
-                        strategy=type(resolved_strategy).__name__,
-                        parent_run_id=parent_run_id,
-                        delegation_level=delegation_level,
-                        tenant_id=tenant_id,
-                        meta=run_meta,
-                        idempotency_key=idempotency_key,
-                        idempotency_fingerprint=idem_fingerprint,
-                        **_run_images._input_edge_kwargs(image_runtime, user_parts),
-                        **seed_kwargs,
-                        invocation=invocation,
-                    )
-                    # A child bound by another caller reads as existing_active below.
-                    create_result, child_claim = _run_entry._managed_creation(created)
-
-                    # Handle idempotency outcomes
-                    if create_result.outcome == "existing_terminal":
-                        return await _run_pending._build_cached_result(
-                            state_store, create_result.run_id, output_type
-                        )
-                    if create_result.outcome == "existing_active":
-                        raise RunAlreadyActiveError(create_result.run_id, create_result.status)
-
-                    run_id = create_result.run_id
-                    state_store = lifecycle._claim(
-                        state_store, resolved_loop, create_result, child_claim, root_limits
-                    )
-                    await _run_entry._verify_projected_creation(
-                        entry_projection.error is not None, state_store, run_id
-                    )
-
-                trace_link, extra_notifier = await _run_start._start_new_run(
-                    lifecycle,
-                    agent,
-                    provider,
-                    tenant_id,
-                    seed_kwargs,
-                    run_guardrails,
-                    extra_notifier,
-                    parent_ctx,
-                    {"agent_name": agent.name, "system_prompt": _system_prompt},
-                )
-
-                # Set delegation context for the duration of this run so nested
-                # agent.run() calls inside tools inherit the parent link.
-                this_ctx = DelegationContext(
-                    run_id=run_id,
-                    trace_link=trace_link,
-                    delegation_level=delegation_level,
-                    persisted=state_store is not None,
-                    store_identity=get_store_identity(state_store),
-                    max_delegation_depth=effective_max_depth,
-                    tenant_id=tenant_id,
-                    tenant_explicit=tenant_explicit,
-                    state_store=state_store,
-                    lease_interval_s=agent.lease_interval.total_seconds(),
-                    loop=asyncio.get_running_loop(),
-                )
-                ctx_token = set_delegation_context(this_ctx)
-
-                # Emit init governance events (skills + MCP) inside the try block
-                # so discovery failures flow through the error cleanup path.
-                # _MCPDiscoveryError is caught here, mcp.error emitted, then the
-                # original cause is re-raised for the outer except Exception.
-                await _run_tools._discover_runtime_tools(
-                    agent, lifecycle.recorder, extra_notifier, run_id, resolved_loop, mcp_meta
-                )
-
-                replay_plan, seeded_history = await _run_entry._apply_replay(
-                    agent,
-                    provider,
-                    resolved_loop,
-                    provider_kwargs,
-                    state_store=state_store,
-                    run_id=run_id,
-                    replay_req=replay_req,
-                    replay_runs=replay_runs,
-                    replay_omitted=replay_omitted,
-                    normalized_history=normalized_history,
-                    context=context,
-                    user_input=user_input,
-                    seeded_history=seeded_history,
-                    user_parts=user_parts,
-                    system_prompt=_system_prompt,
-                )
-                await _run_images._register_memory_input(
-                    image_runtime, state_store, run_id, user_parts
-                )
-                image_view = await _run_entry._new_run_image_view(
-                    image_runtime,
-                    state_store,
-                    run_id,
-                    seeded_history,
-                    replay_runs,
-                    replay_plan,
-                    user_parts,
-                )
-
-                # When chat history was provided, the loop receives a complete
-                # message list as initial_history and skips its own user-message
-                # recording. The runner records the new user_input itself so it
-                # still lands in react_traces (seeded prior turns are NOT recorded
-                # — they live in the dev's chat DB).
-                await _run_entry._record_seeded_user(
-                    lifecycle.recorder,
-                    extra_notifier,
-                    run_id,
-                    user_input,
-                    seeded_history,
-                    context,
-                    skill_session,
-                )
-
-                result = await _run_entry._run_projected_loop(
-                    entry_projection,
-                    resolved_loop,
-                    user_parts,
-                    agent=agent,
-                    provider=provider,
-                    strategy=resolved_strategy,
-                    user_input=user_input,
-                    run_id=run_id,
-                    recorder=lifecycle.recorder,
-                    notifier=extra_notifier,
-                    initial_history=seeded_history,
-                    provider_kwargs=provider_kwargs or None,
-                    output_type=output_type,
-                    state_store=state_store,
-                    **_run_images._image_loop_kwargs(resolved_loop.run, image_runtime, image_view),
-                )
-
-                if replay_plan is not None:
-                    result.replay = replay_plan.summary
-                _run_observers._attach_mcp_meta(result, mcp_meta)
-                _run_pending._ensure_pause_generation(result, provider_kwargs)
-                if state_store is not None:
-                    result = await _run_outcome._persist_loop_outcome(
-                        recorder=lifecycle.recorder,
-                        provider_kwargs=provider_kwargs,
-                        state_store=state_store,
-                        run_id=run_id,
-                        result=result,
-                    )
-                # A parent at a managed handoff exits here without finishing.
-                await lifecycle._finish(lifecycle.recorder, extra_notifier, result)
-
-                result.meta = _run_errors._public_meta(result.meta)
-
-                return result
-
-            except (ManagedRootStoppedError, RunFencedError) as stop:
-                return await lifecycle._stopped(stop, lifecycle.recorder, extra_notifier)
-
-            except Exception as exc:
-                await lifecycle._failed(exc, mcp_meta, lifecycle.recorder, extra_notifier)
-                raise
-
-        except asyncio.CancelledError:
-            cancelled_result, swallow = await lifecycle._cancelled(
-                result, mcp_meta, lifecycle.recorder, extra_notifier
-            )
-            if swallow:
-                return cancelled_result
-            raise
-
-        finally:
-            _run_images._release_memory_edges(image_runtime, state_store, run_id)
-            lifecycle._release()
-            if ctx_token is not None:
-                reset_delegation_context(ctx_token)
-
-
-async def _check_retry_source(
-    state_store: StateStore, source_run: RunRecord, original_run_id: str
-) -> None:
-
-    if source_run.status not in TERMINAL_STATUSES:
-        raise ValueError(
-            f"Run '{original_run_id}' is in status '{source_run.status}' — "
-            f"only terminal runs (error, cancelled, max_iterations, success) can be retried."
-        )
-
-    # 2. Validate source run was not SingleCall (no iterative history to seed)
-    from dendrux.runtime._capabilities import capabilities
-
-    source_loop = (source_run.meta or {}).get(LOOP_META_KEY, "")
-    if (
-        source_run.storage_format == STORAGE_FORMAT_CHECKPOINTED
-        and capabilities(state_store).checkpointing
-    ):
-        source_state = await state_store.get_loop_state(original_run_id)
-        source_loop = (source_state or {}).get("loop")
-    if source_loop in ("SingleCall", "single_call"):
-        raise ValueError(
-            "SingleCall runs cannot be retried with context — "
-            "they have no iterative history to seed. Call agent.run() instead."
-        )
-
-
-async def _retry_history(
-    state_store: StateStore,
-    source_run: RunRecord,
-    agent: Agent,
-    provider: LLMProvider,
-    kwargs: dict[str, Any],
-) -> tuple[Any, list[Message]]:
-    from dendrux.runtime._capabilities import capabilities
-    from dendrux.runtime.replay import conversation_records
-
-    traces = (
-        await conversation_records(state_store, source_run.id, limits=agent._limits)
-        if source_run.storage_format == STORAGE_FORMAT_CHECKPOINTED
-        and capabilities(state_store).checkpointing
-        else await state_store.get_traces(source_run.id)
-    )
-    retry_model = (kwargs or {}).get("model") or provider.model
-    initial_history = rebuild_messages(traces, reasoning_for=retry_model)
-    _trim_retry_answer(source_run, initial_history)
-    initial_history = _pair_tool_calls(initial_history)
-    if source_run.storage_format == STORAGE_FORMAT_CHECKPOINTED:
-        initial_history = [m for m in initial_history if m.role != Role.SYSTEM]
-
-    if not initial_history:
-        raise ValueError(
-            f"Run '{source_run.id}' has no persisted traces. Cannot retry without prior context."
-        )
-
-    return traces, initial_history
-
-
-def _trim_retry_answer(source_run: RunRecord, history: list[Message]) -> None:
-    if source_run.status == RunStatus.SUCCESS.value and history:
-        final = history[-1]
-        if final.role == Role.ASSISTANT and not final.tool_calls:
-            history.pop()
-
-
-def _retry_source_input(source_run: RunRecord, traces: Any) -> tuple[Any, Any, Any, Any]:
-    users = [t for t in traces if t.role == "user"]
-    raw_user = next((t for t in users if not (t.meta or {}).get(SEED_PREFIX_META_KEY)), users[0])
-    user_input = (source_run.input_data or {}).get("input", raw_user.content)
-    source_parts = _run_images._stored_parts((source_run.input_data or {}).get(PARTS_KEY))
-
-    return user_input, source_parts, raw_user, users
-
-
-def _refresh_retry_user(
-    initial_history: list[Message],
-    users: Any,
-    raw_user: Any,
-    user_input: str,
-    source_parts: tuple[ContentPart, ...] | None,
-    skill_session: SkillSession,
-) -> tuple[list[ContextBlock], Message]:
-    own_ordinal = users.index(raw_user)
-    first_user = [i for i, m in enumerate(initial_history) if m.role == Role.USER][own_ordinal]
-    retry_context = [
-        ContextBlock(**b) for b in (raw_user.meta or {}).get(SKILLS_CONTEXT_META_KEY, [])
-    ]
-    first_msg = initial_history[first_user]
-    if first_msg.parts is not None and source_parts is not None:
-        retry_user = initial_history[first_user] = Message.with_parts(
-            Role.USER,
-            wire_user_parts(source_parts, skill_session.envelopes(), retry_context),
-            placement=first_msg.placement,
-        )
-    else:
-        retry_user = initial_history[first_user] = replace(
-            first_msg,
-            content=wire_user_input(user_input, skill_session.envelopes(), retry_context),
-        )
-
-    return retry_context, retry_user
-
-
-async def _retry_replay(
-    source_run: RunRecord,
-    resolved_loop: Loop,
-    state_store: StateStore,
-    tenant_id: str | None,
-    limits: Limits,
-    original_run_id: str,
-) -> tuple[ReplayRequest | None, list[Any]]:
-    """The retried run's ``runs=`` sources, after the blocked-content admission.
-
-    Refuses (R1.8) when the retried run or any of its recorded sources is
-    identified as blocked, after their scope/status checks and before any history
-    is rebuilt or a run is created. One scoped verdict lookup covers all of them.
-    """
-    replay_req = _retry_replay_request(source_run, resolved_loop)
-    # The verdict and any refusal name the run the caller authorized and asked for.
-    retried = replace(source_run, id=original_run_id)
-    if replay_req is None:
-        from dendrux.runtime._blocked_content import _blocked_sources
-
-        if await _blocked_sources(state_store, [retried], tenant_id=tenant_id):
-            _refuse_blocked_retry(original_run_id)
-        return None, []
-    loaded = await _replay._load_replay_runs(
-        state_store, replay_req, tenant_id=tenant_id, limits=limits, extra=(retried,)
-    )
-    identified = (*loaded.extra_blocked, *loaded.omitted)
-    if identified:
-        _refuse_blocked_retry(identified[0])
-    return replay_req, loaded.runs
-
-
-def _retry_replay_request(source_run: RunRecord, resolved_loop: Loop) -> ReplayRequest | None:
-    replay_req: ReplayRequest | None = None
-    source_replay = (source_run.meta or {}).get(REPLAY_META_KEY)
-    if isinstance(source_replay, dict) and source_replay.get("runs"):
-        replay_req = validate_replay_args(
-            list(source_replay["runs"]),
-            source_replay.get("replay_last", 0),
-            bool(source_replay.get("replay_reasoning", True)),
-            loop=resolved_loop,
-            context=None,
-        )
-    return replay_req
-
-
-def _refuse_blocked_retry(run_id: str) -> NoReturn:
-    from dendrux.errors import ReplayRunError
-
-    _codes.log_code(logger, _codes.BLOCKED_CONTENT, run_id=run_id)
-    raise ReplayRunError(
-        run_id,
-        "blocked_content",
-        "Source history contains blocked content; start a new run with clean input.",
-    )
-
-
-def _retry_media(
-    agent: Agent,
-    store: StateStore,
-    loop: Loop,
-    tenant: str | None,
-    run_id: str,
-    parts: tuple[ContentPart, ...] | None,
-    history: list[Message],
-    replay: list[Any],
-) -> ImageRuntime | None:
-    if parts is not None or has_images(history) or _run_images._replay_has_images(replay):
-        _run_images._require_image_loop(loop)
-    elif not _run_contracts._accepts_kwarg(loop.run, "image_runtime"):
-        return None
-    return _run_images._image_runtime(agent, store, tenant, run_id)
-
-
-async def _retry_edges(
-    runtime: ImageRuntime | None, parts: tuple[ContentPart, ...] | None
-) -> dict[str, Any]:
-    if parts is None or runtime is None:
-        return {}
-    live = await _run_images._live_edges(
-        runtime, _run_images._input_edge_kwargs(runtime, parts).get("blob_refs", [])
-    )
-    return {"blob_refs": live, "blob_refs_scope": runtime.tenant_scope} if live else {}
-
-
-async def _retry_source(
-    store: StateStore, run_id: str, tenant_id: str | None
-) -> tuple[RunRecord, Any]:
-    source = await store.get_run(run_id)
-    if source is None:
-        raise RunNotFoundError(run_id)
-    if source.tenant_id != tenant_id:
-        raise RunNotFoundError(run_id)
-    return source, (source.meta or {}).get(META_KEY, {}).get("explicit", [])
-
-
-async def _start_retry_history(
-    agent: Agent,
-    provider: LLMProvider,
-    loop: Loop,
-    provider_kwargs: dict[str, Any],
-    store: StateStore,
-    run_id: str,
-    original_run_id: str,
-    source: RunRecord,
-    replay_req: ReplayRequest | None,
-    replay_runs: list[Any],
-    history: list[Message],
-    image_runtime: ImageRuntime | None,
-    explicit: Any,
-) -> tuple[ReplayPlan | None, list[Message], ImageViewState | None]:
-    from dendrux.runtime._capabilities import capabilities
-
-    current = current_prefix(agent, provider, loop, provider_kwargs)
-    replay_plan: ReplayPlan | None = None
-    if replay_req is not None:
-        replay_plan = expand_replay(
-            replay_runs, replay_req, current=current, guardrails=bool(agent.guardrails)
-        )
-        if (
-            source.storage_format != STORAGE_FORMAT_CHECKPOINTED
-            or not capabilities(store).checkpointing
-        ):
-            history = [*replay_plan.messages, *history]
-    seeded_slots = image_slot_count(history)
-    await _replay.record_run_prefix(
-        store,
-        run_id,
-        current=current,
-        seed={"retry_of": original_run_id},
-        plan=replay_plan,
-        # An explicit-skills retry also traces its rebuilt first user
-        # message, so its slot mapping is not a plain offset: unknown.
-        seeded_image_slots=None if explicit and seeded_slots else seeded_slots,
-    )
-    # A retry has no new input: every seeded slot counts as sent.
-    image_view = await _run_images._start_image_view(
-        image_runtime,
-        store,
-        run_id,
-        seeded=history,
-        sources=[
-            *_run_images._replay_sources(replay_runs),
-            (original_run_id, source.tenant_id, source.meta),
-        ],
-        single_full=replay_plan is None,
-        input_images=False,
-    )
-    return replay_plan, history, image_view
-
-
-async def retry(
-    original_run_id: str,
-    *,
-    agent: Agent,
-    provider: LLMProvider,
-    state_store: StateStore,
-    strategy: Strategy | None = None,
-    loop: Loop | None = None,
-    tenant_id: str | None | _OmittedType = _OMITTED,
-    metadata: dict[str, Any] | None = None,
-    extra_notifier: LoopNotifier | None = None,
-    **kwargs: Any,
-) -> RunResult:
-    """Retry a terminal run with approximate prior context.
-
-    Creates a fresh run seeded with the original run's conversation history
-    from persisted traces. The LLM sees the prior conversation and can
-    continue from context. This is NOT resume (no pause_data, no exact
-    state reconstruction) — it's a new run with approximate context.
-
-    Works for any terminal run (error, cancelled, max_iterations, success).
-    Source run must have been executed with a retry-capable loop (not
-    SingleCall). The retry agent can differ from the original — different
-    model, different tools — the only requirement is that the source run
-    has persisted traces to seed from.
-
-    Args:
-        original_run_id: The terminal run to retry from.
-        agent: Agent definition for the retry run. Can differ from the
-            original agent (different model, tools, prompt).
-        provider: LLM provider for the retry run.
-        state_store: Persistence backend (required — retry needs traces).
-        strategy: Communication strategy. Defaults to NativeToolCalling.
-        loop: Execution loop for the retry. Defaults to ReActLoop.
-        tenant_id: Optional tenant ID.
-        metadata: Optional developer metadata for the retry run.
-        extra_notifier: Optional notifier.
-        **kwargs: Forwarded to the LLM provider.
-
-    Returns:
-        RunResult from the retry run.
-
-    Raises:
-        RunNotFoundError: The source run does not exist or belongs to
-            another tenant.
-        ValueError: If the source run is not terminal, if the source
-            run was SingleCall, or if no traces exist.
-    """
-    # 1. Validate source run is terminal. A missing run and another tenant's
-    # run raise the same RunNotFoundError (B13), so retry is no existence oracle.
-    tenant_explicit = _tenant_scope_chosen(tenant_id)
-    tenant_id = resolve_runner_tenant(agent, "retry", tenant_id, state_store=state_store)
-    await ensure_agent_limits_fit(agent, state_store)
-    tenant_id = resolve_child_tenant(_context.get_delegation_context(), tenant_id)
-    runner_entry_checks(
-        agent,
-        "retry",
-        tenant_id=tenant_id,
-        metadata=metadata,
-        history=kwargs.get("history"),
-        context=kwargs.get("context"),
-        provider_kwargs=kwargs,
-        provider=provider,
-    )
-    source_run, explicit = await _retry_source(state_store, original_run_id, tenant_id)
-    skill_session = SkillSession.prepare(
-        agent, loop=_run_entry._new_run_loop(agent, loop), explicit=explicit
-    )
-    with skill_session.bind():
-        await _check_retry_source(state_store, source_run, original_run_id)
-        resolved_loop = _run_entry._new_run_loop(agent, loop)
-        _run_tools._validate_loop_skill_compat(agent, resolved_loop)
-        # 3. Blocked-content admission for the retried run and its runs= sources
-        #    (R1.8), then the same runs, same knobs, before any history is rebuilt.
-        replay_req, replay_runs = await _retry_replay(
-            source_run, resolved_loop, state_store, tenant_id, agent._limits, original_run_id
-        )
-        # 3a. Read traces and reconstruct approximate history. Reasoning replay
-        #    blocks only seed a retry on the model that made them.
-        traces, initial_history = await _retry_history(
-            state_store, source_run, agent, provider, kwargs
-        )
-        # The source's own input follows its persisted seed prefix.
-        user_input, source_parts, raw_user, users = _retry_source_input(source_run, traces)
-        if explicit:
-            retry_context, retry_user = _refresh_retry_user(
-                initial_history, users, raw_user, user_input, source_parts, skill_session
-            )
-        # 5. Create the retry run
-        resolved_strategy = strategy or NativeToolCalling()
-        provider_kwargs = dict(kwargs)
-        run_id = generate_ulid()
-        parent_ctx = _context.get_delegation_context()
-        parent_run_id, delegation_level = resolve_parent_link(parent_ctx, state_store)
-        effective_max_depth = _run_entry._resolve_max_delegation_depth(
-            agent.max_delegation_depth, parent_ctx
-        )
-
-        _system_prompt = agent.get_system_prompt(loop=resolved_loop)
-
-        run_meta, _ = _run_entry._new_run_metadata(
-            agent,
-            resolved_loop,
-            skill_session,
-            metadata,
-            effective_max_depth,
-            retry_of=original_run_id,
-            user_input=user_input,
-        )
-
-        image_runtime = _retry_media(
-            agent,
-            state_store,
-            resolved_loop,
-            tenant_id,
-            run_id,
-            source_parts,
-            initial_history,
-            replay_runs,
-        )
-        input_edges = await _retry_edges(image_runtime, source_parts)
-        ctx_token = None
-        mcp_meta: dict[str, Any] = {}
-        result: RunResult | None = None
-        lifecycle = _run_start._RunLifecycle(
-            run_id, state_store, getattr(agent, "_task_manager", None)
-        )
-
-        seed_kwargs: dict[str, Any] = {}
-        run_guardrails = None
-        try:
-            try:
-                seed_kwargs, run_guardrails = await _run_entry._runtime_seeds(
-                    state_store,
-                    agent,
-                    provider,
-                    resolved_loop,
-                    resolved_strategy,
-                    provider_kwargs,
-                    initial_history,
-                    user_input=user_input,
-                    run_id=run_id,
-                    tenant_id=tenant_id,
-                )
-                create_result = await _run_entry._create_runtime_run(
-                    state_store,
-                    resolved_loop,
-                    run_id,
-                    agent.name,
-                    input_data=_run_images._input_data(user_input, source_parts),
-                    model=provider.model,
-                    strategy=type(resolved_strategy).__name__,
-                    parent_run_id=parent_run_id,
-                    delegation_level=delegation_level,
-                    tenant_id=tenant_id,
-                    meta=run_meta,
-                    retry_of_run_id=original_run_id,
-                    **seed_kwargs,
-                    **input_edges,
-                )
-                run_id = create_result.run_id
-                state_store = lifecycle._claim(state_store, resolved_loop, create_result)
-
-                trace_link, extra_notifier = await _run_start._start_new_run(
-                    lifecycle,
-                    agent,
-                    provider,
-                    tenant_id,
-                    seed_kwargs,
-                    run_guardrails,
-                    extra_notifier,
-                    parent_ctx,
-                    {
-                        "agent_name": agent.name,
-                        "system_prompt": _system_prompt,
-                        "retry_of": original_run_id,
-                    },
-                )
-                this_ctx = DelegationContext(
-                    run_id=run_id,
-                    trace_link=trace_link,
-                    delegation_level=delegation_level,
-                    persisted=True,
-                    store_identity=get_store_identity(state_store),
-                    max_delegation_depth=effective_max_depth,
-                    tenant_id=tenant_id,
-                    tenant_explicit=tenant_explicit,
-                    state_store=state_store,
-                    lease_interval_s=agent.lease_interval.total_seconds(),
-                    loop=asyncio.get_running_loop(),
-                )
-                ctx_token = set_delegation_context(this_ctx)
-
-                await _run_tools._discover_runtime_tools(
-                    agent, lifecycle.recorder, extra_notifier, run_id, resolved_loop, mcp_meta
-                )
-
-                replay_plan, initial_history, image_view = await _start_retry_history(
-                    agent,
-                    provider,
-                    resolved_loop,
-                    provider_kwargs,
-                    state_store,
-                    run_id,
-                    original_run_id,
-                    source_run,
-                    replay_req,
-                    replay_runs,
-                    initial_history,
-                    image_runtime,
-                    explicit,
-                )
-
-                if explicit:
-                    trace_user = user_trace_message(
-                        user_input,
-                        [retry_user],
-                        render_band(retry_context, "stable"),
-                        retry_context,
-                        session=skill_session,
-                    )
-                    await _run_images._record_user_trace(
-                        lifecycle.recorder, extra_notifier, run_id, trace_user
-                    )
-
-                result = await resolved_loop.run(
-                    agent=agent,
-                    provider=provider,
-                    strategy=resolved_strategy,
-                    user_input=user_input,
-                    run_id=run_id,
-                    recorder=lifecycle.recorder,
-                    notifier=extra_notifier,
-                    initial_history=initial_history,
-                    provider_kwargs=provider_kwargs or None,
-                    state_store=state_store,
-                    **_run_images._image_loop_kwargs(resolved_loop.run, image_runtime, image_view),
-                )
-
-                if replay_plan is not None:
-                    result.replay = replay_plan.summary
-                _run_observers._attach_mcp_meta(result, mcp_meta)
-                result = await _run_outcome._persist_loop_outcome(
-                    recorder=lifecycle.recorder,
-                    provider_kwargs=provider_kwargs,
-                    state_store=state_store,
-                    run_id=run_id,
-                    result=result,
-                )
-
-                await lifecycle._finish(lifecycle.recorder, extra_notifier, result)
-
-                return result
-
-            except RunFencedError:
-                return await lifecycle._fenced(lifecycle.recorder, extra_notifier)
-
-            except Exception as exc:
-                await lifecycle._failed(exc, mcp_meta, lifecycle.recorder, extra_notifier)
-                raise
-
-        except asyncio.CancelledError:
-            cancelled_result, swallow = await lifecycle._cancelled(
-                result, mcp_meta, lifecycle.recorder, extra_notifier
-            )
-            if swallow:
-                return cancelled_result
-            raise
-
-        finally:
-            _run_images._release_memory_edges(image_runtime, state_store, run_id)
-            lifecycle._release()
-            if ctx_token is not None:
-                reset_delegation_context(ctx_token)
-
-
-def _cached_stream_event(cached: RunResult, run_id: str) -> RunEvent:
-    from dendrux.types import RunEvent
-
-    event_type = {
-        RunStatus.ERROR: RunEventType.RUN_ERROR,
-        RunStatus.CANCELLED: RunEventType.RUN_CANCELLED,
-    }.get(cached.status, RunEventType.RUN_COMPLETED)
-    return RunEvent(
-        type=event_type,
-        run_id=run_id,
-        run_result=cached,
-        error=cached.error if event_type == RunEventType.RUN_ERROR else None,
-        phase="final_answer" if cached.status == RunStatus.SUCCESS else None,
-    )
-
-
-def _stream_claim(
-    store: StateStore,
-    loop: Loop,
-    created: CreateRunResult,
-    child_claim: ClaimResult | None,
-    *,
-    root_limits: Limits | None,
-) -> StateStore:
-    """The new run's owned store: a managed child's token comes from its bind."""
-    owned = _state.claimed_store(
-        store, created.run_id, child_claim or _run_start._creation_claim(loop, created)
-    )
-    _managed.stamp_root_header(owned, created.run_id, limits=root_limits)
-    return owned
-
-
-def _stream_entry_checks(
-    agent: Agent, tenant_id: str | None, shared: dict[str, Any], parent_ctx: Any, **checks: Any
-) -> None:
-    try:
-        entry_tenant = resolve_child_tenant(parent_ctx, tenant_id)
-    except ValueError:
-        return
-    shared["existing_run"] = True
-    runner_entry_checks(agent, "stream", tenant_id=entry_tenant, **checks)
-    shared["existing_run"] = False
-
-
-async def _resolve_stream_store(
-    store: StateStore | None,
-    resolver: Callable[[], Any] | None,
-    agent: Agent,
-    tenant_id: str | None | _OmittedType,
-) -> StateStore | None:
-    if store is None and resolver is not None:
-        store = await resolver()
-        resolve_runner_tenant(agent, "stream", tenant_id, state_store=store)
-    return store
-
-
-async def _stream_replay_runs(
-    request: ReplayRequest | None,
-    store: StateStore | None,
-    tenant_id: str | None,
-    loop: Loop,
-    shared: dict[str, Any],
-    limits: Limits,
-) -> tuple[list[Any], tuple[str, ...]]:
-    if request is None:
-        return [], ()
-    shared["existing_run"] = True
-    if store is None:
-        raise ValueError(
-            "runs= requires persistence (database_url or state_store): "
-            "replay reads the earlier runs' traces."
-        )
-    loaded = await _run_entry._load_new_run_replay(
-        store, request, tenant_id, loop, limits=limits, method="run_stream"
-    )
-    shared["existing_run"] = False
-    return loaded.runs, loaded.omitted
-
-
-@overload
-def run_stream(
-    agent: Agent,
-    *,
-    provider: LLMProvider,
-    user_input: UserContent,
-    history: list[ChatMessage] | None = ...,
-    context: list[ContextBlock] | None = ...,
-    activate_skills: Sequence[str] | None = ...,
-    runs: list[str] | None = ...,
-    replay_last: ReplayLast = ...,
-    replay_reasoning: bool = ...,
-    strategy: Strategy | None = ...,
-    loop: Loop | None = ...,
-    state_store: StateStore | None = ...,
-    state_store_resolver: Callable[[], Any] | None = ...,
-    tenant_id: str | None | _OmittedType = ...,
-    metadata: dict[str, Any] | None = ...,
-    extra_notifier: LoopNotifier | None = ...,
-    max_delegation_depth: int | None,
-    idempotency_key: str | None = ...,
-    output_type: type | None = ...,
-    **kwargs: Any,
-) -> RunStream: ...
-
-
-@overload
-def run_stream(
-    agent: Agent,
-    *,
-    provider: LLMProvider,
-    user_input: UserContent,
-    history: list[ChatMessage] | None = ...,
-    context: list[ContextBlock] | None = ...,
-    activate_skills: Sequence[str] | None = ...,
-    runs: list[str] | None = ...,
-    replay_last: ReplayLast = ...,
-    replay_reasoning: bool = ...,
-    strategy: Strategy | None = ...,
-    loop: Loop | None = ...,
-    state_store: StateStore | None = ...,
-    state_store_resolver: Callable[[], Any] | None = ...,
-    tenant_id: str | None | _OmittedType = ...,
-    metadata: dict[str, Any] | None = ...,
-    extra_notifier: LoopNotifier | None = ...,
-    idempotency_key: str | None = ...,
-    output_type: type | None = ...,
-    **kwargs: Any,
-) -> RunStream: ...
-
-
-def run_stream(
-    agent: Agent,
-    *,
-    provider: LLMProvider,
-    user_input: UserContent,
-    history: list[ChatMessage] | None = None,
-    context: list[ContextBlock] | None = None,
-    activate_skills: Sequence[str] | None = None,
-    runs: list[str] | None = None,
-    replay_last: ReplayLast = 0,
-    replay_reasoning: bool = True,
-    strategy: Strategy | None = None,
-    loop: Loop | None = None,
-    state_store: StateStore | None = None,
-    state_store_resolver: Callable[[], Any] | None = None,
-    tenant_id: str | None | _OmittedType = _OMITTED,
-    metadata: dict[str, Any] | None = None,
-    extra_notifier: LoopNotifier | None = None,
-    max_delegation_depth: int | None | _UnsetType = _UNSET_DEPTH,
-    idempotency_key: str | None = None,
-    output_type: type | None = None,
-    _managed_invocation: Any = None,
-    **kwargs: Any,
-) -> RunStream:
-    """Stream an agent run as RunEvents, returning a RunStream.
-
-    Synchronous — returns immediately with run_id available. All async
-    setup (DB row, notifiers) runs lazily on first iteration. With
-    ``idempotency_key``, the initial run_id is provisional until that setup
-    resolves the key. A cached outcome yields one terminal event, without
-    replaying text or tool events. Read its answer from ``stream.result``.
-
-    Accepts either an already-resolved ``state_store`` or an async
-    ``state_store_resolver`` callable. The resolver is called once in
-    the generator preamble.
-
-    Error semantics: exceptions are caught, persisted, and yielded as
-    RUN_ERROR events. No exception is raised to the consumer.
-
-    Lifecycle ownership:
-      - Runner emits RUN_STARTED, RUN_ERROR, and handles cancellation cleanup.
-      - Loop yields execution outcomes (RUN_COMPLETED, RUN_PAUSED) and
-        intermediate events (TEXT_DELTA, TOOL_USE_*, TOOL_RESULT).
-      - Runner persists loop outcomes before forwarding them.
-
-    ``_managed_invocation`` (internal, 0.7): stream a managed child created by
-    its parent's atomic bind instead of ``create_run``. Its id, parent link,
-    tenant and depth come from the invocation; a failure before the bind
-    raises to the managed driver instead of yielding ``RUN_ERROR``.
-    """
-    invocation = _managed_invocation
-    # Validate depth early — synchronous, before generator starts.
-    # Full resolution (parent context, clamping) happens inside _generate()
-    # because parent_ctx requires async state_store resolution first.
-    # But validation of the raw input can fail fast here.
-    requested_tenant_id = tenant_id
-    tenant_explicit = _tenant_scope_chosen(tenant_id)
-    tenant_id = resolve_runner_tenant(agent, "stream", tenant_id, state_store=state_store)
-    if (
-        not isinstance(max_delegation_depth, _UnsetType)
-        and max_delegation_depth is not None
-        and (not isinstance(max_delegation_depth, int) or max_delegation_depth < 0)
-    ):
-        raise ValueError(
-            f"max_delegation_depth must be a non-negative integer or None, "
-            f"got {max_delegation_depth!r}"
-        )
-
-    from dendrux.types import RunEvent, RunResult
-    from dendrux.types import RunStream as _RunStream
-
-    # Validate input + chat history synchronously so TypeError / ValueError
-    # surfaces to the caller immediately, not as a RUN_ERROR event. Image
-    # ingest is async: it runs on first iteration, before create_run, and
-    # its errors are raised from the first ``__anext__`` (no run row).
-    entry_user_input = user_input  # as passed, for the runner entry checks
-    user_input, input_items = _chat.split_user_content(user_input)
-    validate_chat_history(history)
-    image_input = bool(input_items) or history_has_images(history)
-    normalized_history = [] if image_input else normalize_chat_history(history)
-    resolved_strategy = strategy or NativeToolCalling()
-    resolved_loop = _run_entry._new_run_loop(agent, loop)
-    _run_tools._validate_loop_skill_compat(agent, resolved_loop)
-    if image_input:
-        _run_images._require_image_loop(resolved_loop, "run_stream")
-    replay_req = validate_replay_args(
-        runs, replay_last, replay_reasoning, loop=resolved_loop, context=context
-    )
-    # When chat history is provided, build the complete starting message list
-    # (loops use initial_history as-is and do not separately append user_input).
-    # The new user_input is recorded by the runner itself inside _generate()
-    # so seeded prior turns stay out of react_traces. With runs=, the replayed
-    # prefix is folded in after expansion.
-    skill_session = SkillSession.prepare(agent, loop=resolved_loop, explicit=activate_skills)
-    with skill_session.bind():
-        if replay_req is None and not image_input:
-            initial_seeded = fold_context(
-                normalized_history, context, user_input, session=skill_session
-            )
-        else:
-            validate_context(context)
-            initial_seeded = None
-    provider_kwargs = dict(kwargs)
-
-    # A managed child's id is its parent's bind candidate, minted at the handoff.
-    run_id = _managed.new_run_id(invocation)
-
-    # Shared mutable state — generator populates on first iteration,
-    # cleanup reads if the consumer abandons after setup.
-    _shared: dict[str, Any] = {"state_store": state_store}
-
-    mcp_meta: dict[str, Any] = {}
-
-    stream_context = StreamContext(skill_session)
-
-    async def _generate() -> AsyncGenerator[RunEvent, None]:
-        """Inner generator — lazy async setup, then loop stream with lifecycle.
-
-        The entire body is wrapped in try/except so that setup failures
-        (state_store_resolver, create_run, notifier init) are also caught
-        and yielded as RUN_ERROR — honoring the "no exception to consumer" contract.
-        """
-        # store is captured in the closure for the error handler.
-        # Starts as the pre-provided value (often None for the lazy path).
-        nonlocal run_id, extra_notifier
-        store = state_store
-        startup = _run_start._RunLifecycle(run_id, store, None)
-        seed_kwargs: dict[str, Any] = {}
-        run_guardrails = None
-        seeded_history = initial_seeded
-        replay_plan: ReplayPlan | None = None
-        image_runtime: ImageRuntime | None = None
-        user_parts: tuple[ContentPart, ...] | None = None
-        history_messages = normalized_history
-        # Entry checks after tenant inheritance, before any I/O. Like image
-        # setup they raise (no RUN_ERROR event, no run row, no hooks). A child
-        # whose explicit tenant differs from its parent's still fails later, as
-        # RUN_ERROR, exactly as before.
-        # A managed child never inherits the caller's delegation context.
-        entry_parent = _managed.parent_context(invocation, _context.get_delegation_context)
-        _stream_entry_checks(
-            agent,
-            tenant_id,
-            _shared,
-            entry_parent,
-            metadata=metadata,
-            user_input=entry_user_input,
-            history=history,
-            context=context,
-            provider_kwargs=provider_kwargs,
-            idempotency_key=idempotency_key,
-            provider=provider,
-        )
-        if image_input:
-            # Image setup raises (no RUN_ERROR event, no run row, no hooks).
-            _shared["existing_run"] = True
-            store = await _resolve_stream_store(
-                store, state_store_resolver, agent, requested_tenant_id
-            )
-            await ensure_agent_limits_fit(agent, store)
-            _shared["state_store"] = store
-            image_runtime, user_parts, history_messages, cached = await _run_images._entry_media(
-                agent,
-                provider,
-                resolved_loop,
-                store,
-                resolve_child_tenant(_context.get_delegation_context(), tenant_id),
-                run_id,
-                True,
-                user_input,
-                input_items,
-                history,
-                history_messages,
-                provider_kwargs,
-                idempotency_key,
-                output_type,
-                context,
-                replay_req,
-                skill_session,
-            )
-            if cached is not None:
-                run_id = cached.run_id
-                stream.run_id = run_id
-                yield _cached_stream_event(cached, run_id)
-                return
-            with skill_session.bind():
-                seeded_history = _run_entry._new_run_history(
-                    replay_req, history_messages, context, user_input, skill_session, user_parts
-                )
-            _shared["existing_run"] = False
-        try:
-            # 1. Resolve state store lazily (may create DB engine)
-            store = await _resolve_stream_store(
-                store, state_store_resolver, agent, requested_tenant_id
-            )
-            await ensure_agent_limits_fit(agent, store)
-            _shared["state_store"] = store
-            # --- Delegation context ---
-            parent_ctx = _managed.parent_context(invocation, _context.get_delegation_context)
-            parent_run_id, delegation_level = _managed.parent_link(invocation, parent_ctx, store)
-            eff_max_depth = _run_entry._resolve_max_delegation_depth(
-                max_delegation_depth, parent_ctx
-            )
-            eff_tenant = resolve_child_tenant(parent_ctx, tenant_id)
-            root_limits = await _managed.enter(agent, invocation, store, resolved_loop)
-            if image_runtime is None and _run_contracts._accepts_kwarg(
-                resolved_loop.run_stream, "image_runtime"
-            ):
-                image_runtime = _run_images._image_runtime(agent, store, eff_tenant, run_id)
-            # Resolve system prompt BEFORE create_run() so skill loading
-            # failures don't leave a DB row stuck in running.
-            _system_prompt = agent.get_system_prompt(loop=resolved_loop)
-            _run_entry._require_idempotency_store(store, idempotency_key)
-
-            replay_runs, replay_omitted = await _stream_replay_runs(
-                replay_req, store, eff_tenant, resolved_loop, _shared, agent._limits
-            )
-
-            if store is not None:
-                run_meta, fingerprint = _run_entry._new_run_metadata(
-                    agent,
-                    resolved_loop,
-                    skill_session,
-                    metadata,
-                    eff_max_depth,
-                    user_input=user_input,
-                    idempotency_key=idempotency_key,
-                    output_type=output_type,
-                    history=history_messages,
-                    context=context,
-                    replay=replay_req,
-                    parts=user_parts,
-                    streaming=True,
-                )
-                try:
-                    seed_kwargs, run_guardrails = await _run_entry._runtime_seeds(
-                        store,
-                        agent,
-                        provider,
-                        resolved_loop,
-                        resolved_strategy,
-                        provider_kwargs,
-                        seeded_history,
-                        user_input=user_input,
-                        run_id=run_id,
-                        tenant_id=eff_tenant,
-                        replay_req=replay_req,
-                        replay_runs=replay_runs,
-                        replay_omitted=replay_omitted,
-                        normalized_history=history_messages,
-                        context=context,
-                        user_parts=user_parts,
-                    )
-                    created = await _run_entry._create_projected_run(
-                        False,
-                        store,
-                        resolved_loop,
-                        run_id,
-                        agent.name,
-                        input_data=_run_images._input_data(user_input, user_parts),
-                        model=provider.model,
-                        strategy=type(resolved_strategy).__name__,
-                        parent_run_id=parent_run_id,
-                        delegation_level=delegation_level,
-                        tenant_id=eff_tenant,
-                        meta=run_meta,
-                        idempotency_key=idempotency_key,
-                        idempotency_fingerprint=fingerprint,
-                        **_run_images._input_edge_kwargs(image_runtime, user_parts),
-                        **seed_kwargs,
-                        invocation=invocation,
-                    )
-                    # A child bound by another caller reads as existing_active below.
-                    create_result, child_claim = _run_entry._managed_creation(created)
-                except IdempotencyConflictError:
-                    # No row was created and no lifecycle opened; the error
-                    # handler must not fire failure hooks for a run that
-                    # never started (mirrors run(), which re-raises bare).
-                    _shared["existing_run"] = True
-                    raise
-                _shared["existing_run"] = create_result.outcome != "created"
-                run_id = create_result.run_id
-                stream.run_id = run_id
-                if create_result.outcome == "existing_terminal":
-                    cached = await _run_pending._build_cached_result(store, run_id, output_type)
-                    yield _cached_stream_event(cached, run_id)
-                    return
-                if create_result.outcome == "existing_active":
-                    raise RunAlreadyActiveError(run_id, create_result.status)
-                store = _stream_claim(
-                    store, resolved_loop, create_result, child_claim, root_limits=root_limits
-                )
-                _shared["state_store"] = store
-                _shared["claimed"] = True
-
-            # 2. Set delegation context for the generator lifetime
-            this_ctx = DelegationContext(
-                run_id=run_id,
-                delegation_level=delegation_level,
-                persisted=store is not None,
-                store_identity=get_store_identity(store),
-                max_delegation_depth=eff_max_depth,
-                tenant_id=eff_tenant,
-                tenant_explicit=tenant_explicit,
-                state_store=store,
-                lease_interval_s=agent.lease_interval.total_seconds(),
-                loop=asyncio.get_running_loop(),
-            )
-            startup.run_id = run_id
-            startup.store = store
-            trace_link, extra_notifier = await _run_start._start_new_run(
-                startup,
-                agent,
-                provider,
-                eff_tenant,
-                seed_kwargs,
-                run_guardrails,
-                extra_notifier,
-                parent_ctx,
-                {"agent_name": agent.name, "system_prompt": _system_prompt},
-                before_event=lambda: stream_context.set_delegation(this_ctx),
-            )
-            this_ctx = replace(this_ctx, trace_link=trace_link)
-            stream_context.set_delegation(this_ctx)
-            # Lifecycle pair is now open. Stash recorder/notifier so the
-            # cleanup callback can close it with a CANCELLED finish if the
-            # consumer abandons the stream before a terminal event.
-            _shared["recorder"] = startup.recorder
-            _shared["notifier"] = extra_notifier
-
-            yield RunEvent(type=RunEventType.RUN_STARTED, run_id=run_id)
-
-            await _run_tools._discover_runtime_tools(
-                agent, startup.recorder, extra_notifier, run_id, resolved_loop, mcp_meta
-            )
-
-            replay_plan, seeded_history = await _run_entry._apply_replay(
-                agent,
-                provider,
-                resolved_loop,
-                provider_kwargs,
-                state_store=store,
-                run_id=run_id,
-                replay_req=replay_req,
-                replay_runs=replay_runs,
-                replay_omitted=replay_omitted,
-                normalized_history=history_messages,
-                context=context,
-                user_input=user_input,
-                seeded_history=seeded_history,
-                user_parts=user_parts,
-            )
-            await _run_images._register_memory_input(image_runtime, store, run_id, user_parts)
-            image_view = await _run_entry._new_run_image_view(
-                image_runtime, store, run_id, seeded_history, replay_runs, replay_plan, user_parts
-            )
-
-            # When chat history was provided, the loop receives a complete
-            # message list as initial_history and skips its own user-message
-            # recording. Record the new user_input here so it still lands in
-            # react_traces (seeded prior turns are NOT recorded).
-            await _run_entry._record_seeded_user(
-                startup.recorder,
-                extra_notifier,
-                run_id,
-                user_input,
-                seeded_history,
-                context,
-                skill_session,
-            )
-
-            # 3. Stream the loop. The interrupt signal lets cancel_run reach
-            # an in-flight provider stream owned by this process; the closing
-            # wrapper guarantees the loop generator is finalized in this task
-            # when the consumer abandons the stream.
-            interrupt = agent._task_manager.register_interrupt(run_id)
-            loop_stream = resolved_loop.run_stream(
-                agent=agent,
-                provider=provider,
-                strategy=resolved_strategy,
-                user_input=user_input,
-                run_id=run_id,
-                recorder=startup.recorder,
-                notifier=extra_notifier,
-                initial_history=seeded_history,
-                provider_kwargs=provider_kwargs or None,
-                output_type=output_type,
-                state_store=store,
-                interrupt=interrupt,
-                **_run_images._image_loop_kwargs(
-                    resolved_loop.run_stream, image_runtime, image_view
-                ),
-            )
-            async with aclosing(
-                _run_outcome._stream_loop_events(
-                    loop_stream,
-                    state_store=store,
-                    recorder=startup.recorder,
-                    notifier=extra_notifier,
-                    run_id=run_id,
-                    provider_kwargs=provider_kwargs,
-                    shared=_shared,
-                    mcp_meta=mcp_meta,
-                    replay_plan=replay_plan,
-                    new_run=True,
-                )
-            ) as events:
-                async for event in events:
-                    yield event
-
-        except (ManagedRootStoppedError, RunFencedError) as stop:
-            result = await startup._stopped(stop, startup.recorder, extra_notifier)
-            yield _run_events._fenced_stream_event(run_id, result)
-
-        except Exception as exc:
-            # Before its bind a managed child is not a run: the driver decides
-            # for its parent, exactly as for run() (0.7).
-            _managed.raise_unbound(invocation, _shared.get("claimed"))
-            # Persist error, yield RUN_ERROR, return cleanly. No re-raise.
-            # Covers both setup failures and loop execution errors.
-            await _run_start._stream_run_failure(
-                store, _shared, startup.recorder, extra_notifier, run_id, exc
-            )
-            yield RunEvent(
-                type=RunEventType.RUN_ERROR,
-                run_result=RunResult(
-                    run_id=run_id,
-                    status=RunStatus.ERROR,
-                    error=_run_errors._safe_error(exc),
-                    error_info=_run_errors._provider_error_info(exc),
-                    meta=_run_outcome._stream_error_meta(mcp_meta, exc),
-                ),
-                run_id=run_id,
-                error=_run_errors._safe_error(exc),
-            )
-        finally:
-            _run_images._release_memory_edges(image_runtime, store, run_id)
-            if not _shared.get("existing_run"):
-                agent._task_manager.release_interrupt(run_id)
-
-    async def _cleanup() -> RunResult | None:
-        """CAS-guarded cancellation + local lifecycle close.
-
-        Two responsibilities:
-          (1) If the run is still RUNNING in the store, finalize it as
-              CANCELLED (CAS-guarded so we don't clobber a concurrent
-              terminal status set elsewhere).
-          (2) If the lifecycle pair was opened locally (recorder/notifier
-              stashed by ``_generate`` after ``run_started`` fired), close
-              it with a ``run_finished`` event on the LOCAL notifier so
-              OTel root spans close. This fires regardless of whether
-              the CAS won — if some other caller already finalized the
-              run, our local notifier still needs the close event.
-
-        Status resolution for the close event:
-          - CAS won → CANCELLED.
-          - CAS lost + store available → query store for actual status.
-          - No store → CANCELLED (best-effort fallback).
-        """
-        if not _shared.get("claimed") and _shared.get("state_store") is not None:
-            return None
-        store = _shared.get("state_store")
-
-        cancel_won = False
-        persisted_row: RunRecord | None | _OmittedType = _OMITTED
-
-        def mark_cancelled() -> None:
-            nonlocal cancel_won
-            cancel_won = True
-
-        partial_answer = _run_outcome._partial_answer(_shared)
-        if store is not None:
-            try:
-                cancel_won, persisted_row = await _run_events._persist_run_cancellation(
-                    store,
-                    run_id,
-                    {
-                        "reason": CancelReason.STREAM_CLOSED.value,
-                        "partial_output": partial_answer is not None,
-                    },
-                    on_won=mark_cancelled,
-                    answer=partial_answer,
-                    emit_event=True,
-                    read_on_loss=lambda: "notifier" in _shared,
-                    safe_read=True,
-                )
-            except Exception:
-                logger.error(  # noqa: TRY400 - Keep safe_exception_info() to exclude vendor text and exception chains.
-                    "Failed to cancel run %s during stream cleanup",
-                    run_id,
-                    exc_info=safe_exception_info(),
-                )
-
-        # Close the lifecycle pair if it was opened.
-        if "notifier" in _shared:
-            cleanup_recorder = _shared.get("recorder")
-            terminal_status = RunStatus.CANCELLED
-            cancel_persisted = cancel_won
-            if store is not None and not cancel_won:
-                try:
-                    run_record = (
-                        await store.get_run(run_id)
-                        if isinstance(persisted_row, _OmittedType)
-                        else persisted_row
-                    )
-                    if run_record is not None:
-                        terminal_status = RunStatus(run_record.status)
-                        cancel_persisted = terminal_status == RunStatus.CANCELLED
-                except Exception:  # noqa: S110 - Cleanup retains CANCELLED fallback when persisted status is unavailable.
-                    pass  # CANCELLED is a safe fallback
-            cancelled_result = RunResult(
-                run_id=run_id,
-                status=terminal_status,
-                meta={**deepcopy(mcp_meta), CANCEL_PERSISTED_META_KEY: cancel_persisted},
-            )
-            try:
-                await _hooks.record_run_finished(cleanup_recorder, run_id, cancelled_result)
-                await _hooks.notify_run_finished(_shared.get("notifier"), run_id, cancelled_result)
-            except Exception:
-                logger.warning(
-                    "Lifecycle finish hooks failed during stream cleanup for run %s",
-                    run_id,
-                    exc_info=safe_exception_info(),
-                )
-
-            return cancelled_result
-        return None
-
-    stream = _RunStream(
-        run_id=run_id,
-        generator=stream_context.wrap(_generate()),
-        cleanup=lambda: _run_events._shielded_cleanup(_cleanup, run_id=run_id),
-    )
-    return stream
 
 
 async def resume(
@@ -2484,7 +804,7 @@ async def _prepare_resume(
     from dendrux.runtime.persistence import PersistenceRecorder
     from dendrux.tool import get_tool_def
 
-    resolved_strategy = strategy or NativeToolCalling()
+    resolved_strategy = strategy or _native.NativeToolCalling()
     resolved_loop = loop or agent.loop or ReActLoop()
     _run_tools._validate_loop_skill_compat(agent, resolved_loop)
 
@@ -3051,7 +1371,7 @@ def _approval_dispatch_inputs(
     strategy: Strategy | None, warnings: list[str] | None
 ) -> tuple[Strategy, list[str]]:
     return (
-        strategy if strategy is not None else NativeToolCalling(),
+        strategy if strategy is not None else _native.NativeToolCalling(),
         warnings if warnings is not None else [],
     )
 

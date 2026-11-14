@@ -8,6 +8,7 @@ from dendrux import Agent, tool
 from dendrux.errors import RunNotReclaimableError
 from dendrux.llm.mock import MockLLM
 from dendrux.runtime import replay as replay_mod
+from dendrux.strategies import native
 from dendrux.strategies.native import NativeToolCalling
 from dendrux.types import Limits, LLMResponse, RunStatus, ToolCall, ToolResult
 
@@ -24,10 +25,8 @@ class EditingStrategy(NativeToolCalling):
 
 
 def install_editing_strategy(monkeypatch):
-    from dendrux.runtime import runner
-
     strategy = EditingStrategy()
-    monkeypatch.setattr(runner, "NativeToolCalling", lambda: strategy)
+    monkeypatch.setattr(native, "NativeToolCalling", lambda: strategy)
 
 
 async def finish(call, streaming):
