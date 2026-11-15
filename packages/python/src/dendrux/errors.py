@@ -14,6 +14,7 @@ Suggested HTTP mappings:
     RunAlreadyClaimedError      -> 409
     RunAlreadyTerminalError     -> 409
     InvalidToolResultError      -> 400
+    ManagedResultRefusedError   -> 400 (an InvalidToolResultError)
     ReplayRunError              -> 400 (404 when reason == "not_found")
     PersistenceNotConfiguredError -> 500
     SchemaNotInitializedError   -> 500
@@ -1627,6 +1628,7 @@ __all__ = [
     "ImageRejectedError",
     "InvalidImageError",
     "InvalidToolResultError",
+    "ManagedResultRefusedError",
     "ModelRefusalError",
     "NoteLimitExceededError",
     "PROVIDER_ERROR_CATEGORIES",
