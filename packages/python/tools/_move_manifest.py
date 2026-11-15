@@ -66,7 +66,7 @@ def digest(source: str) -> str:
 
 def evidence(manifest: Mapping[str, Any], old: str, after: Mapping[str, str], old_key: str) -> None:
     """Refuse incomplete, stale or unrecognized evidence before any normalization."""
-    if set(manifest) != FIELDS or manifest["version"] != 1:
+    if set(manifest) not in (FIELDS, FIELDS | {"logger_calls"}) or manifest["version"] != 1:
         raise ValueError("manifest schema/version mismatch")
     if not re.fullmatch("[0-9a-f]{40}", manifest["base"]):
         raise ValueError("manifest requires immutable 40-character base SHA")
@@ -81,6 +81,10 @@ def evidence(manifest: Mapping[str, Any], old: str, after: Mapping[str, str], ol
     for field in ("lexical", "hoists", "annotations", "metadata"):
         if not isinstance(manifest[field], list):
             raise ValueError(f"manifest {field} must be a list")
+    if "logger_calls" in manifest and (
+        not isinstance(manifest["logger_calls"], list) or not manifest["logger_calls"]
+    ):
+        raise ValueError("logger_calls must be a nonempty list when declared")
     for field in ("owners", "sources", "seams", "scaffolding", "providers"):
         if not isinstance(manifest[field], dict):
             raise ValueError(f"manifest {field} must be an object")
@@ -432,6 +436,7 @@ def normalize(
     scaffolding(old_tree, trees, manifest["scaffolding"])
     original = copy.deepcopy(old_tree)
     _validate_seams(original, manifest)
+    _inline_loggers(old_tree, trees, manifest, old_key, modules, old, after)
     _pin_logger(old_tree, manifest, old_key, modules[old_key])
     for node in old_tree.body:
         name = getattr(node, "name", None)
@@ -605,3 +610,248 @@ def _pin_logger(
         call.args[0] = ast.Constant(old_module)
     elif not isinstance(call.args[0], ast.Constant) or not isinstance(call.args[0].value, str):
         raise ValueError("logger requires the original literal module name")
+
+
+def _logger_import_dominates(root: ast.AST, call: ast.Call, line: int) -> bool:
+    for parent in ast.walk(root):
+        for _, block in ast.iter_fields(parent):
+            if not isinstance(block, list):
+                continue
+            for i, statement in enumerate(block):
+                if not isinstance(statement, ast.stmt) or call not in ast.walk(statement):
+                    continue
+                if any(
+                    isinstance(previous, ast.Import | ast.ImportFrom)
+                    and previous.end_lineno == line
+                    for previous in block[:i]
+                ):
+                    return True
+    return False
+
+
+def _stdlib_logger_call(node: ast.AST, index: ScopeIndex, root: ast.AST | None = None) -> bool:
+    if not isinstance(node, ast.Call) or len(node.args) != 1 or node.keywords:
+        return False
+    spelling = dotted(node.func)
+    if not spelling:
+        return False
+    scope = index.scope_of(node.func)
+    binding = scope.resolve(spelling.split(".")[0])
+    return bool(
+        binding
+        and binding.kind == "import"
+        and (
+            binding.direct
+            and scope.find(spelling.split(".")[0]) is index.module
+            or root is not None
+            and _logger_import_dominates(root, node, binding.line)
+        )
+        and resolve_dotted(spelling, scope) == "logging.getLogger"
+    )
+
+
+def _module_logger_calls(root: ast.AST, index: ScopeIndex) -> list[ast.Call]:
+    calls = []
+    for node in ast.walk(root):
+        if (
+            not isinstance(node, ast.Call)
+            or len(node.args) != 1
+            or node.keywords
+            or not isinstance(node.args[0], ast.Name)
+            or node.args[0].id != "__name__"
+            or index.scope_of(node.args[0]).find("__name__") is not None
+            or resolve_dotted(dotted(node.func) or "", index.scope_of(node.func))
+            != "logging.getLogger"
+        ):
+            continue
+        if not _stdlib_logger_call(node, index, root):
+            raise ValueError("inline logger import does not dominate its call")
+        calls.append(node)
+    return calls
+
+
+def _shared_logger(
+    old: ast.Module,
+    trees: Mapping[str, ast.Module],
+    manifest: Mapping[str, Any],
+    old_key: str,
+    modules: Mapping[str, str],
+) -> str:
+    owner = manifest["owners"].get("logger")
+    if "logger" not in manifest["effects"] or owner not in trees or owner == old_key:
+        raise ValueError("inline logger requires the moved shared logger effect")
+    for tree, original in ((old, True), (trees[owner], False)):
+        found = roots(tree, "logger")
+        index = ScopeIndex(tree)
+        if len(found) != 1 or not isinstance(found[0], ast.Assign):
+            raise ValueError("inline logger requires one authenticated shared assignment")
+        call = found[0].value
+        if not isinstance(call, ast.Call) or not _stdlib_logger_call(call, index):
+            raise ValueError("shared logger must use stdlib logging.getLogger")
+        if original and _module_logger_calls(call, index):
+            continue
+        if not isinstance(call.args[0], ast.Constant) or call.args[0].value != modules[old_key]:
+            raise ValueError("shared logger must keep the original module name")
+    return f"{modules[owner]}.logger"
+
+
+def _inline_logger_binding(root: ast.AST, index: ScopeIndex, target: str, count: int) -> None:
+    reads = [
+        node
+        for node in ast.walk(root)
+        if isinstance(node, ast.Name) and node.id == "logger" and isinstance(node.ctx, ast.Load)
+    ]
+    if len(reads) < count:
+        raise ValueError("declared inline logger substitution is missing")
+    for node in reads:
+        scope = index.scope_of(node)
+        binding = scope.resolve("logger")
+        if (
+            scope.find("logger") is not index.module
+            or not binding
+            or binding.kind != "import"
+            or not binding.direct
+            or binding.value != target
+        ):
+            raise ValueError("inline logger is not the authenticated module binding")
+
+
+class _InlineLoggerCalls(ast.NodeTransformer):
+    def __init__(self, calls: list[ast.Call]) -> None:
+        self.calls = {id(call) for call in calls}
+
+    def visit_Call(self, node: ast.Call) -> ast.AST:
+        if id(node) in self.calls:
+            return ast.copy_location(ast.Name(id="logger", ctx=ast.Load()), node)
+        return self.generic_visit(node)
+
+
+def _inline_loggers(
+    old: ast.Module,
+    trees: Mapping[str, ast.Module],
+    manifest: Mapping[str, Any],
+    old_key: str,
+    modules: Mapping[str, str],
+    old_source: str,
+    after: Mapping[str, str],
+) -> None:
+    entries = {}
+    for entry in manifest.get("logger_calls", []):
+        entry_fields(
+            entry,
+            {"root", "module", "count"} | ({"drop_import"} if "drop_import" in entry else set()),
+        )
+        root, module, count = entry["root"], entry["module"], entry["count"]
+        if (
+            not isinstance(root, str)
+            or not isinstance(module, str)
+            or type(count) is not int
+            or count < 1
+            or root in entries
+            or module == old_key
+            or module not in trees
+            or manifest["owners"].get(root) != module
+        ):
+            raise ValueError("inline logger root/module/count is invalid or duplicated")
+        entries[root] = entry
+    index = ScopeIndex(old)
+    used = set()
+    replacements = []
+    drops = []
+    for root, module in manifest["owners"].items():
+        found = roots(old, root)
+        if module == old_key or len(found) != 1 or not isinstance(found[0], FUNCTIONS):
+            continue
+        calls = _module_logger_calls(found[0], index)
+        if not calls:
+            continue
+        entry = entries.get(root)
+        if entry is None or entry["count"] != len(calls):
+            raise ValueError("moved inline logger requires exact declared evidence")
+        target = _shared_logger(old, trees, manifest, old_key, modules)
+        destination = roots(trees[module], root)
+        if len(destination) != 1 or not isinstance(destination[0], FUNCTIONS):
+            raise ValueError("inline logger destination root is missing or ambiguous")
+        _inline_logger_binding(destination[0], ScopeIndex(trees[module]), target, len(calls))
+        if "drop_import" in entry:
+            drops.append((found[0], destination[0], calls, entry["drop_import"], module))
+        used.add(root)
+        replacements.extend(calls)
+    if used != set(entries):
+        raise ValueError("unused inline logger evidence")
+    _InlineLoggerCalls(replacements).visit(old)
+    for root_node, new_root, calls, drop, module in drops:
+        _drop_logger_import(root_node, new_root, calls, drop, index, old_source, after[module])
+
+
+def _logger_comments(source: str, root: ast.stmt) -> list[str]:
+    return [
+        token.line
+        for token in tokenize.generate_tokens(io.StringIO(source).readline)
+        if token.type == tokenize.COMMENT
+        and root.lineno <= token.start[0] <= (root.end_lineno or root.lineno)
+    ]
+
+
+def _drop_logger_import(
+    root: ast.stmt,
+    destination: ast.stmt,
+    calls: list[ast.Call],
+    entry: Mapping[str, Any],
+    index: ScopeIndex,
+    old: str,
+    new: str,
+) -> None:
+    if not isinstance(entry, dict):
+        raise ValueError("logger import removal must be an exact evidence object")
+    entry_fields(entry, {"statement", "count", "comment"})
+    if (
+        entry["statement"] != "import logging"
+        or type(entry["count"]) is not int
+        or entry["count"] != 1
+        or entry["comment"] != ""
+    ):
+        raise ValueError("logger import removal requires exactly one uncommented import logging")
+    imports = [
+        node
+        for node in ast.walk(root)
+        if isinstance(node, ast.Import) and any(alias.name == "logging" for alias in node.names)
+    ]
+    if len(imports) != 1 or ast.dump(imports[0]) != ast.dump(ast.parse("import logging").body[0]):
+        raise ValueError("logger import removal requires exactly the original local import")
+    statement = imports[0]
+    if ast.get_source_segment(old, statement) != entry["statement"]:
+        raise ValueError("logger import statement spelling differs from its declaration")
+    scope = index.scope_of(statement)
+    if scope is index.module or any(
+        index.scope_of(call.func).find("logging") is not scope
+        or (binding := index.scope_of(call.func).resolve("logging")) is None
+        or binding.line != statement.end_lineno
+        for call in calls
+    ):
+        raise ValueError("removed import is not the authenticated substituted binding")
+    if _comments(
+        old, statement.lineno, statement.end_lineno or statement.lineno
+    ) or _logger_comments(old, root) != _logger_comments(new, destination):
+        raise ValueError("logger import removal must preserve all neighboring comments/noqa")
+    if any(
+        isinstance(node, ast.Import) and any(alias.name == "logging" for alias in node.names)
+        for node in ast.walk(destination)
+    ):
+        raise ValueError("unused logger import removal evidence")
+    if any(
+        isinstance(node, ast.Name)
+        and node.id == "logging"
+        and isinstance(node.ctx, ast.Load)
+        or isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and re.search(r"\blogging\b", node.value)
+        for node in ast.walk(root)
+    ):
+        raise ValueError("removed logger binding still has reads after substitution")
+    for parent in ast.walk(root):
+        for _, block in ast.iter_fields(parent):
+            if isinstance(block, list) and statement in block:
+                block.remove(statement)
+                return
+    raise ValueError("logger import removal did not identify a statement")
