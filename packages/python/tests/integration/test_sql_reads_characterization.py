@@ -262,3 +262,128 @@ async def test_batch_status_and_pause_count_budgets(store, engine, record_proper
     with _reads(engine, record_property, 2) as (sql, _):
         assert await store.count_pauses_per_run(ids) == {RUN: 2}
     assert all("GROUP BY run_events.agent_run_id" in statement for statement in sql)
+
+
+async def test_physical_trace_keyset_refuses_foreign_and_untenanted_scope(
+    store, engine, record_property
+):
+    await _seed(store, engine)
+    with _reads(engine, record_property):
+        own = await store.get_traces_after(
+            RUN, after_order_index=0, kinds=("turn",), tenant_id="t1"
+        )
+    assert [row.order_index for row in own] == [1, 4]
+    for tenant in ("t2", None):
+        with _reads(engine, record_property):
+            assert (
+                await store.get_traces_after(
+                    RUN, after_order_index=0, kinds=("turn",), tenant_id=tenant
+                )
+                == []
+            )
+
+
+async def test_conversation_page_cap_and_strict_continuation(store, engine, record_property):
+    await store.create_run(RUN, "reads", tenant_id="t1")
+    async with engine.begin() as conn:
+        await conn.execute(
+            insert(ReactTrace),
+            [
+                dict(
+                    id=f"{index + 100:026d}",
+                    agent_run_id=RUN,
+                    order_index=index,
+                    role="assistant",
+                    trace_kind="turn",
+                    content=f"message-{index}",
+                    created_at=STAMP,
+                )
+                for index in range(MAX_PAGE + 2)
+            ],
+        )
+    with _reads(engine, record_property):
+        first = await store.conversation_traces(
+            RUN,
+            after_position=None,
+            limit=MAX_PAGE + 1,
+            include_superseded=True,
+            tenant_id="t1",
+        )
+    assert len(first.entries) == MAX_PAGE
+    assert [entry.content for entry in first.entries] == [
+        f"message-{index}" for index in range(MAX_PAGE)
+    ]
+    assert first.next_position == first.entries[-1].position
+    with _reads(engine, record_property):
+        second = await store.conversation_traces(
+            RUN,
+            after_position=first.next_position,
+            limit=MAX_PAGE + 1,
+            include_superseded=True,
+            tenant_id="t1",
+        )
+    assert [entry.content for entry in second.entries] == [
+        f"message-{MAX_PAGE}",
+        f"message-{MAX_PAGE + 1}",
+    ]
+    assert second.entries[0].position > first.next_position
+    assert second.next_position is None
+
+
+async def test_rewrite_prefix_is_excluded_by_a_strict_physical_boundary(
+    store, engine, record_property
+):
+    await _seed(store, engine)
+    async with engine.begin() as conn:
+        await conn.execute(
+            update(AgentRun)
+            .where(AgentRun.id == RUN)
+            .values(meta={LATEST_REWRITE_META_KEY: {"order_index": 2, "trace_id": f"{12:026d}"}})
+        )
+    with _reads(engine, record_property, 3) as (sql, _):
+        page = await store.conversation_traces(RUN, after_position=None, limit=10, tenant_id="t1")
+    assert [(entry.position, entry.content) for entry in page.entries] == [
+        (2001, "replacement"),
+        (4000, "message-4"),
+    ]
+    assert page.next_position is None
+    # Both the continuation cursor and rewrite cutoff are strict index lower bounds.
+    assert sql[-1].count("react_traces.order_index > ") == 2
+    assert "react_traces.order_index >= " not in sql[-1]
+
+
+@pytest.mark.parametrize("run_tenant", ["t1", None])
+@pytest.mark.parametrize("tenant", ["t1", "t2", None, UNSCOPED])
+@pytest.mark.parametrize("status", ["running", "success"])
+async def test_public_trace_scope_covers_the_pending_projection(
+    store, engine, record_property, run_tenant, tenant, status
+):
+    await _seed(store, engine)
+    async with engine.begin() as conn:
+        await conn.execute(
+            update(AgentRun)
+            .where(AgentRun.id == RUN)
+            .values(
+                tenant_id=run_tenant,
+                status=status,
+            )
+        )
+        await conn.execute(
+            update(AgentRun)
+            .where(AgentRun.id == OTHER)
+            .values(loop_state={"pending": [{"order_index": 0}]})
+        )
+    with _reads(engine, record_property):
+        rows = await store.get_public_traces(RUN, tenant_id=tenant)
+    authorized = tenant is UNSCOPED or tenant == run_tenant
+    expected = ([0, 1, 4] if status == "success" else [0, 1]) if authorized else []
+    assert [row.order_index for row in rows] == expected
+    record_property("public_trace_result", json.dumps([row.order_index for row in rows]))
+
+
+@pytest.mark.parametrize("tenant", ["", False, 123])
+async def test_public_trace_invalid_scope_refuses_before_query(
+    store, engine, record_property, tenant
+):
+    with _reads(engine, record_property, 0), pytest.raises(ValueError):
+        await store.get_public_traces(RUN, tenant_id=tenant)
