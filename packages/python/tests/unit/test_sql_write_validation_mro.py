@@ -83,6 +83,7 @@ EXPECTED_MRO = {
         "_SqlLifecycle",
         "_SqlEvidence",
         "_SqlLeases",
+        "_SqlSweep",
         "_SqlWrites",
         "_StoreHost",
         "ManagedReads",
@@ -102,6 +103,7 @@ EXPECTED_MRO = {
         "_SqlLifecycle",
         "_SqlEvidence",
         "_SqlLeases",
+        "_SqlSweep",
         "_SqlWrites",
         "_StoreHost",
         "ManagedReads",
@@ -121,6 +123,7 @@ EXPECTED_MRO = {
         "_SqlLifecycle",
         "_SqlEvidence",
         "_SqlLeases",
+        "_SqlSweep",
         "_SqlWrites",
         "_StoreHost",
         "ManagedReads",
@@ -140,6 +143,7 @@ EXPECTED_MRO = {
         "_SqlLifecycle",
         "_SqlEvidence",
         "_SqlLeases",
+        "_SqlSweep",
         "_SqlWrites",
         "_StoreHost",
         "ManagedReads",
@@ -807,6 +811,38 @@ LEASES_RELOCATIONS = {
 }
 
 
+# MySQL keeps its own _waiting_sweep_page override (its super() target relocates).
+SWEEP_RELOCATIONS = {
+    "MySQLStateStore": {
+        "_scan_abandoned_runs": ("SQLStateStore", "_SqlSweep", "base.py", "_sql_sweep.py"),
+        "_sweep_runs": ("SQLStateStore", "_SqlSweep", "base.py", "_sql_sweep.py"),
+        "sweep_abandoned_runs": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_sweep.py"),
+        "sweep_stale_runs": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_sweep.py"),
+    },
+    "PostgresStateStore": {
+        "_scan_abandoned_runs": ("SQLStateStore", "_SqlSweep", "base.py", "_sql_sweep.py"),
+        "_sweep_runs": ("SQLStateStore", "_SqlSweep", "base.py", "_sql_sweep.py"),
+        "_waiting_sweep_page": ("SQLStateStore", "_SqlSweep", "base.py", "_sql_sweep.py"),
+        "sweep_abandoned_runs": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_sweep.py"),
+        "sweep_stale_runs": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_sweep.py"),
+    },
+    "SQLStateStore": {
+        "_scan_abandoned_runs": ("SQLStateStore", "_SqlSweep", "base.py", "_sql_sweep.py"),
+        "_sweep_runs": ("SQLStateStore", "_SqlSweep", "base.py", "_sql_sweep.py"),
+        "_waiting_sweep_page": ("SQLStateStore", "_SqlSweep", "base.py", "_sql_sweep.py"),
+        "sweep_abandoned_runs": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_sweep.py"),
+        "sweep_stale_runs": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_sweep.py"),
+    },
+    "SQLiteStateStore": {
+        "_scan_abandoned_runs": ("SQLStateStore", "_SqlSweep", "base.py", "_sql_sweep.py"),
+        "_sweep_runs": ("SQLStateStore", "_SqlSweep", "base.py", "_sql_sweep.py"),
+        "_waiting_sweep_page": ("SQLStateStore", "_SqlSweep", "base.py", "_sql_sweep.py"),
+        "sweep_abandoned_runs": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_sweep.py"),
+        "sweep_stale_runs": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_sweep.py"),
+    },
+}
+
+
 def _canonical_writes_snapshot(snapshot, cls):
     import copy
 
@@ -901,6 +937,14 @@ def _canonical_writes_snapshot(snapshot, cls):
         assert member["layers"][-1] == (new_file, name), name
         member["owner"] = old_owner
         member["layers"][-1] = (old_file, name)
+    for name, (old_owner, new_owner, old_file, new_file) in SWEEP_RELOCATIONS[cls.__name__].items():
+        assert name in result["members"]
+        member = result["members"][name]
+        assert member["owner"] == new_owner, name
+        assert member["layers"][-1] == (new_file, name), name
+        member["owner"] = old_owner
+        member["layers"][-1] = (old_file, name)
+    result["mro"].remove("_SqlSweep")
     result["mro"].remove("_SqlLeases")
     result["mro"].remove("_SqlClaims")
     result["mro"].remove("_SqlEvents")
@@ -1084,6 +1128,8 @@ async def test_explicit_private_wrapper_and_sanitized_database_failures(cls, nam
         "claims-file",
         "leases-owner",
         "leases-file",
+        "sweep-owner",
+        "sweep-file",
         "unlisted-file",
         "wrapper-count",
         "wrapper-order",
@@ -1141,6 +1187,10 @@ def test_proposed_exact_write_relocation_still_refuses_unplanned_snapshot_change
         raw["members"]["_scan_expired_runs"]["owner"] = "SQLStateStore"
     elif change == "leases-file":
         raw["members"]["get_lease_expired"]["layers"][-1] = ("_other.py", "get_lease_expired")
+    elif change == "sweep-owner":
+        raw["members"]["_sweep_runs"]["owner"] = "SQLStateStore"
+    elif change == "sweep-file":
+        raw["members"]["sweep_stale_runs"]["layers"][-1] = ("_other.py", "sweep_stale_runs")
     elif change == "unlisted-file":
         raw["members"]["_insert"]["layers"][-1] = ("_sql_writes.py", "_insert")
     elif change == "wrapper-count":

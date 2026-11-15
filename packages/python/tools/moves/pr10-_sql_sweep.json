@@ -4,7 +4,7 @@
   "old": "src/dendrux/runtime/stores/sql/base.py",
   "source_sha256": "4f96e1585590cce34bc27517c946c901c2fad4f9337db8468b6d89c9f77c4258",
   "sources": {
-    "src/dendrux/runtime/stores/sql/base.py": "8faa2474fb130ebfe3e92d98ed69ed6e6cd119c2362370310c8a65fb027a0ce9",
+    "src/dendrux/runtime/stores/sql/base.py": "5bfadebd266eb3f2f8893a52515c6d3e05b748ddd034f70907f5e39b2a50b628",
     "src/dendrux/runtime/stores/sql/_sql_host.py": "f3a1be68f99d6afea8d845e95fea3277a2e730967f6fc4811a38b6804a2b0a5b",
     "src/dendrux/runtime/stores/sql/_sql_sessions.py": "5ad0ed7a3b27acded5ccfb6ac3ca816712272c144e7492ba6d44d315acd9a5c4",
     "src/dendrux/runtime/stores/sql/_sql_support.py": "e57aaa22c139089f2a771c23ff20f51e88c248ea8e41011277b4bb51c5715fab",
@@ -19,7 +19,8 @@
     "src/dendrux/runtime/stores/sql/_sql_reads.py": "d824ca9fee14b9ff4fbd5c3c9b554182296824bf26bcbef9782f08f971d39fd3",
     "src/dendrux/runtime/stores/sql/_sql_events.py": "aa4555a7ff670a4e780a958f88ad066813fd694b52d1a3b38fd2f355baf583da",
     "src/dendrux/runtime/stores/sql/_sql_claims.py": "6465cb0297df62b07e910b805cfb9538135f9e3e6e38af8edee43f2c67ada4d8",
-    "src/dendrux/runtime/stores/sql/_sql_leases.py": "e96ff240807799e68fceec13b37a874aa72d60ff7e0efa0839891874271da476"
+    "src/dendrux/runtime/stores/sql/_sql_leases.py": "e96ff240807799e68fceec13b37a874aa72d60ff7e0efa0839891874271da476",
+    "src/dendrux/runtime/stores/sql/_sql_sweep.py": "f18d5f3270b02dcf0ca2b03d593d431782f9fecf1bffd43eb930fa8b7050d95f"
   },
   "owners": {
     "_RECOVERY_DESCRIPTOR_BYTES": "src/dendrux/runtime/stores/sql/_sql_support.py",
@@ -208,12 +209,12 @@
     "SQLStateStore.get_lease_expired": "src/dendrux/runtime/stores/sql/_sql_leases.py",
     "SQLStateStore.reclaim_run": "src/dendrux/runtime/stores/sql/_sql_leases.py",
     "SQLStateStore.get_replayed_tool_calls": "src/dendrux/runtime/stores/sql/_sql_evidence.py",
-    "SQLStateStore._waiting_sweep_page": "src/dendrux/runtime/stores/sql/base.py",
-    "SQLStateStore.sweep_stale_runs": "src/dendrux/runtime/stores/sql/base.py",
-    "SQLStateStore.sweep_abandoned_runs": "src/dendrux/runtime/stores/sql/base.py",
+    "SQLStateStore._waiting_sweep_page": "src/dendrux/runtime/stores/sql/_sql_sweep.py",
+    "SQLStateStore.sweep_stale_runs": "src/dendrux/runtime/stores/sql/_sql_sweep.py",
+    "SQLStateStore.sweep_abandoned_runs": "src/dendrux/runtime/stores/sql/_sql_sweep.py",
     "SQLStateStore._uses_waiting_sweep_cursor": "src/dendrux/runtime/stores/sql/base.py",
-    "SQLStateStore._scan_abandoned_runs": "src/dendrux/runtime/stores/sql/base.py",
-    "SQLStateStore._sweep_runs": "src/dendrux/runtime/stores/sql/base.py",
+    "SQLStateStore._scan_abandoned_runs": "src/dendrux/runtime/stores/sql/_sql_sweep.py",
+    "SQLStateStore._sweep_runs": "src/dendrux/runtime/stores/sql/_sql_sweep.py",
     "SQLStateStore.get_delegation_info": "src/dendrux/runtime/stores/sql/_sql_tree.py",
     "SQLStateStore._walk_ancestry": "src/dendrux/runtime/stores/sql/_sql_tree.py",
     "SQLStateStore._descendant_batch": "src/dendrux/runtime/stores/sql/_sql_tree.py",
@@ -648,7 +649,7 @@
     },
     {
       "root": "SQLStateStore._sweep_runs",
-      "module": "src/dendrux/runtime/stores/sql/base.py",
+      "module": "src/dendrux/runtime/stores/sql/_sql_sweep.py",
       "name": "_SweepScan",
       "target": "dendrux.runtime.stores.sql._sql_sweep_scan._SweepScan",
       "count": 1
