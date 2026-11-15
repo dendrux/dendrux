@@ -75,6 +75,7 @@ EXPECTED_MRO = {
         "SQLStateStore",
         "_SqlRuns",
         "_SqlManaged",
+        "_SqlTree",
         "_SqlEvidence",
         "_SqlWrites",
         "_StoreHost",
@@ -87,6 +88,7 @@ EXPECTED_MRO = {
         "SQLStateStore",
         "_SqlRuns",
         "_SqlManaged",
+        "_SqlTree",
         "_SqlEvidence",
         "_SqlWrites",
         "_StoreHost",
@@ -99,6 +101,7 @@ EXPECTED_MRO = {
         "SQLStateStore",
         "_SqlRuns",
         "_SqlManaged",
+        "_SqlTree",
         "_SqlEvidence",
         "_SqlWrites",
         "_StoreHost",
@@ -111,6 +114,7 @@ EXPECTED_MRO = {
         "SQLStateStore",
         "_SqlRuns",
         "_SqlManaged",
+        "_SqlTree",
         "_SqlEvidence",
         "_SqlWrites",
         "_StoreHost",
@@ -382,6 +386,62 @@ MANAGED_RELOCATIONS = {
 }
 
 
+TREE_RELOCATIONS = {
+    "MySQLStateStore": {
+        "_bfs_descendants": ("SQLStateStore", "_SqlTree", "base.py", "_sql_tree.py"),
+        "_descendant_batch": ("SQLStateStore", "_SqlTree", "base.py", "_sql_tree.py"),
+        "_traverse_subtree_bfs": ("SQLStateStore", "_SqlTree", "base.py", "_sql_tree.py"),
+        "_usage_by_run": ("SQLStateStore", "_SqlTree", "base.py", "_sql_tree.py"),
+        "_walk_ancestry": ("SQLStateStore", "_SqlTree", "base.py", "_sql_tree.py"),
+        "get_children_page": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_tree.py"),
+        "get_delegation_info": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_tree.py"),
+        "get_descendant_page": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_tree.py"),
+        "get_subtree": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_tree.py"),
+        "run_usage": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_tree.py"),
+        "subtree_usage": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_tree.py"),
+    },
+    "PostgresStateStore": {
+        "_bfs_descendants": ("SQLStateStore", "_SqlTree", "base.py", "_sql_tree.py"),
+        "_descendant_batch": ("SQLStateStore", "_SqlTree", "base.py", "_sql_tree.py"),
+        "_traverse_subtree_bfs": ("SQLStateStore", "_SqlTree", "base.py", "_sql_tree.py"),
+        "_usage_by_run": ("SQLStateStore", "_SqlTree", "base.py", "_sql_tree.py"),
+        "_walk_ancestry": ("SQLStateStore", "_SqlTree", "base.py", "_sql_tree.py"),
+        "get_children_page": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_tree.py"),
+        "get_delegation_info": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_tree.py"),
+        "get_descendant_page": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_tree.py"),
+        "get_subtree": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_tree.py"),
+        "run_usage": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_tree.py"),
+        "subtree_usage": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_tree.py"),
+    },
+    "SQLStateStore": {
+        "_bfs_descendants": ("SQLStateStore", "_SqlTree", "base.py", "_sql_tree.py"),
+        "_descendant_batch": ("SQLStateStore", "_SqlTree", "base.py", "_sql_tree.py"),
+        "_traverse_subtree_bfs": ("SQLStateStore", "_SqlTree", "base.py", "_sql_tree.py"),
+        "_usage_by_run": ("SQLStateStore", "_SqlTree", "base.py", "_sql_tree.py"),
+        "_walk_ancestry": ("SQLStateStore", "_SqlTree", "base.py", "_sql_tree.py"),
+        "get_children_page": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_tree.py"),
+        "get_delegation_info": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_tree.py"),
+        "get_descendant_page": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_tree.py"),
+        "get_subtree": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_tree.py"),
+        "run_usage": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_tree.py"),
+        "subtree_usage": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_tree.py"),
+    },
+    "SQLiteStateStore": {
+        "_bfs_descendants": ("SQLStateStore", "_SqlTree", "base.py", "_sql_tree.py"),
+        "_descendant_batch": ("SQLStateStore", "_SqlTree", "base.py", "_sql_tree.py"),
+        "_traverse_subtree_bfs": ("SQLStateStore", "_SqlTree", "base.py", "_sql_tree.py"),
+        "_usage_by_run": ("SQLStateStore", "_SqlTree", "base.py", "_sql_tree.py"),
+        "_walk_ancestry": ("SQLStateStore", "_SqlTree", "base.py", "_sql_tree.py"),
+        "get_children_page": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_tree.py"),
+        "get_delegation_info": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_tree.py"),
+        "get_descendant_page": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_tree.py"),
+        "get_subtree": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_tree.py"),
+        "run_usage": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_tree.py"),
+        "subtree_usage": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_tree.py"),
+    },
+}
+
+
 def _canonical_writes_snapshot(snapshot, cls):
     import copy
 
@@ -419,6 +479,14 @@ def _canonical_writes_snapshot(snapshot, cls):
         assert member["layers"][-1] == (new_file, name), name
         member["owner"] = old_owner
         member["layers"][-1] = (old_file, name)
+    for name, (old_owner, new_owner, old_file, new_file) in TREE_RELOCATIONS[cls.__name__].items():
+        assert name in result["members"]
+        member = result["members"][name]
+        assert member["owner"] == new_owner, name
+        assert member["layers"][-1] == (new_file, name), name
+        member["owner"] = old_owner
+        member["layers"][-1] = (old_file, name)
+    result["mro"].remove("_SqlTree")
     result["mro"].remove("_SqlManaged")
     result["mro"].remove("_SqlRuns")
     result["mro"].remove("_SqlEvidence")

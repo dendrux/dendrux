@@ -17089,6 +17089,84 @@
   "crap": 7.0,
   "digest": "50577816e14f"
  },
+ "src/dendrux/runtime/stores/sql/_sql_tree.py::_SqlTree._bfs_descendants": {
+  "complexity": 7,
+  "coverage": 1.0,
+  "crap": 7.0,
+  "digest": "9057517746a5"
+ },
+ "src/dendrux/runtime/stores/sql/_sql_tree.py::_SqlTree._descendant_batch": {
+  "complexity": 3,
+  "coverage": 1.0,
+  "crap": 3.0,
+  "digest": "af5a04f4e5eb"
+ },
+ "src/dendrux/runtime/stores/sql/_sql_tree.py::_SqlTree._traverse_subtree_bfs": {
+  "complexity": 13,
+  "coverage": 0.9565,
+  "crap": 13.01,
+  "digest": "a962dfdfde5c"
+ },
+ "src/dendrux/runtime/stores/sql/_sql_tree.py::_SqlTree._usage_by_run": {
+  "complexity": 3,
+  "coverage": 1.0,
+  "crap": 3.0,
+  "digest": "789551d2a946"
+ },
+ "src/dendrux/runtime/stores/sql/_sql_tree.py::_SqlTree._walk_ancestry": {
+  "complexity": 6,
+  "coverage": 1.0,
+  "crap": 6.0,
+  "digest": "0d501b529e4b"
+ },
+ "src/dendrux/runtime/stores/sql/_sql_tree.py::_SqlTree.get_children_page": {
+  "complexity": 3,
+  "coverage": 1.0,
+  "crap": 3.0,
+  "digest": "a4c7a8c3c847"
+ },
+ "src/dendrux/runtime/stores/sql/_sql_tree.py::_SqlTree.get_children_page.<locals>._attempt": {
+  "complexity": 1,
+  "coverage": 1.0,
+  "crap": 1.0,
+  "digest": "680070f5690e"
+ },
+ "src/dendrux/runtime/stores/sql/_sql_tree.py::_SqlTree.get_delegation_info": {
+  "complexity": 22,
+  "coverage": 1.0,
+  "crap": 22.0,
+  "digest": "373202ceae22"
+ },
+ "src/dendrux/runtime/stores/sql/_sql_tree.py::_SqlTree.get_delegation_info.<locals>.brief": {
+  "complexity": 1,
+  "coverage": 1.0,
+  "crap": 1.0,
+  "digest": "1fa6803ad961"
+ },
+ "src/dendrux/runtime/stores/sql/_sql_tree.py::_SqlTree.get_descendant_page": {
+  "complexity": 2,
+  "coverage": 1.0,
+  "crap": 2.0,
+  "digest": "c9461f2d13ac"
+ },
+ "src/dendrux/runtime/stores/sql/_sql_tree.py::_SqlTree.get_subtree": {
+  "complexity": 5,
+  "coverage": 1.0,
+  "crap": 5.0,
+  "digest": "6e871e0ec795"
+ },
+ "src/dendrux/runtime/stores/sql/_sql_tree.py::_SqlTree.run_usage": {
+  "complexity": 1,
+  "coverage": 1.0,
+  "crap": 1.0,
+  "digest": "b30dd2185317"
+ },
+ "src/dendrux/runtime/stores/sql/_sql_tree.py::_SqlTree.subtree_usage": {
+  "complexity": 5,
+  "coverage": 1.0,
+  "crap": 5.0,
+  "digest": "6347cdc7d31c"
+ },
  "src/dendrux/runtime/stores/sql/_sql_writes.py::_SqlWrites._commit_operation": {
   "complexity": 3,
   "coverage": 1.0,
@@ -17239,12 +17317,6 @@
   "crap": 9.0,
   "digest": "f41116be2ab4"
  },
- "src/dendrux/runtime/stores/sql/base.py::SQLStateStore._bfs_descendants": {
-  "complexity": 7,
-  "coverage": 1.0,
-  "crap": 7.0,
-  "digest": "2d71ef1919ca"
- },
  "src/dendrux/runtime/stores/sql/base.py::SQLStateStore._bind_live_updates": {
   "complexity": 3,
   "coverage": 1.0,
@@ -17280,12 +17352,6 @@
   "coverage": 1.0,
   "crap": 1.0,
   "digest": "612e2c0049b3"
- },
- "src/dendrux/runtime/stores/sql/base.py::SQLStateStore._descendant_batch": {
-  "complexity": 3,
-  "coverage": 1.0,
-  "crap": 3.0,
-  "digest": "af5a04f4e5eb"
  },
  "src/dendrux/runtime/stores/sql/base.py::SQLStateStore._finalize_error_info": {
   "complexity": 4,
@@ -17388,29 +17454,11 @@
   "crap": 28.0,
   "digest": "450e88be56fd"
  },
- "src/dendrux/runtime/stores/sql/base.py::SQLStateStore._traverse_subtree_bfs": {
-  "complexity": 13,
-  "coverage": 0.9565,
-  "crap": 13.01,
-  "digest": "a962dfdfde5c"
- },
- "src/dendrux/runtime/stores/sql/base.py::SQLStateStore._usage_by_run": {
-  "complexity": 3,
-  "coverage": 1.0,
-  "crap": 3.0,
-  "digest": "789551d2a946"
- },
  "src/dendrux/runtime/stores/sql/base.py::SQLStateStore._uses_combined_sweep": {
   "complexity": 2,
   "coverage": 1.0,
   "crap": 2.0,
   "digest": "70d2842c9091"
- },
- "src/dendrux/runtime/stores/sql/base.py::SQLStateStore._walk_ancestry": {
-  "complexity": 6,
-  "coverage": 1.0,
-  "crap": 6.0,
-  "digest": "0d501b529e4b"
  },
  "src/dendrux/runtime/stores/sql/base.py::SQLStateStore.add_note": {
   "complexity": 4,
@@ -17562,36 +17610,6 @@
   "crap": 5.0,
   "digest": "2796fa9fbe88"
  },
- "src/dendrux/runtime/stores/sql/base.py::SQLStateStore.get_children_page": {
-  "complexity": 3,
-  "coverage": 0.875,
-  "crap": 3.02,
-  "digest": "b39b605896cc"
- },
- "src/dendrux/runtime/stores/sql/base.py::SQLStateStore.get_children_page.<locals>._attempt": {
-  "complexity": 1,
-  "coverage": 1.0,
-  "crap": 1.0,
-  "digest": "680070f5690e"
- },
- "src/dendrux/runtime/stores/sql/base.py::SQLStateStore.get_delegation_info": {
-  "complexity": 22,
-  "coverage": 1.0,
-  "crap": 22.0,
-  "digest": "373202ceae22"
- },
- "src/dendrux/runtime/stores/sql/base.py::SQLStateStore.get_delegation_info.<locals>.brief": {
-  "complexity": 1,
-  "coverage": 1.0,
-  "crap": 1.0,
-  "digest": "1fa6803ad961"
- },
- "src/dendrux/runtime/stores/sql/base.py::SQLStateStore.get_descendant_page": {
-  "complexity": 2,
-  "coverage": 0.0,
-  "crap": 6.0,
-  "digest": "c9461f2d13ac"
- },
  "src/dendrux/runtime/stores/sql/base.py::SQLStateStore.get_events_for_runs": {
   "complexity": 2,
   "coverage": 1.0,
@@ -17705,12 +17723,6 @@
   "coverage": 1.0,
   "crap": 2.0,
   "digest": "110b932039b2"
- },
- "src/dendrux/runtime/stores/sql/base.py::SQLStateStore.get_subtree": {
-  "complexity": 5,
-  "coverage": 1.0,
-  "crap": 5.0,
-  "digest": "6e871e0ec795"
  },
  "src/dendrux/runtime/stores/sql/base.py::SQLStateStore.get_tool_calls": {
   "complexity": 7,
@@ -17946,12 +17958,6 @@
   "crap": 1.0,
   "digest": "7cb400fdc09e"
  },
- "src/dendrux/runtime/stores/sql/base.py::SQLStateStore.run_usage": {
-  "complexity": 1,
-  "coverage": 1.0,
-  "crap": 1.0,
-  "digest": "b30dd2185317"
- },
  "src/dendrux/runtime/stores/sql/base.py::SQLStateStore.save_run_event": {
   "complexity": 1,
   "coverage": 1.0,
@@ -17981,12 +17987,6 @@
   "coverage": 1.0,
   "crap": 13.0,
   "digest": "992539508b3f"
- },
- "src/dendrux/runtime/stores/sql/base.py::SQLStateStore.subtree_usage": {
-  "complexity": 5,
-  "coverage": 0.8333,
-  "crap": 5.12,
-  "digest": "6347cdc7d31c"
  },
  "src/dendrux/runtime/stores/sql/base.py::SQLStateStore.sweep_abandoned_runs": {
   "complexity": 1,
