@@ -217,6 +217,7 @@ Missing or invalid codes remain unset. Category and HTTP status remain independe
 
 | Code | Level | Fields | Fires when | Do |
 | --- | --- | --- | --- | --- |
+| `db_close_abandoned` | WARNING | `code`, `kind`, `run_id`, `tenant_id`, `timeout_s` | A database close is still running a bounded time after its caller was cancelled. | Inspect the database driver; the close keeps running in the background. |
 | `follow_capacity` | WARNING | `code`, `kind`, `limit`, `run_id`, `tenant_id` | The process follower cap is reached. | Reduce followers or raise the configured cap. |
 | `follow_feed_error` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | A live event feed fails. | Check store connectivity and retry the feed. |
 | `follow_shutdown_pending` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | A feed is still stopping after its cleanup deadline. | Inspect slow store operations. |
