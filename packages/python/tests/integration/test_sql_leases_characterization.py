@@ -376,8 +376,10 @@ async def test_mark_fences_each_expired_lease_once_and_skips_the_rest(
     )
     phases, sessions = _observe(store, monkeypatch)
     before, events_before = await _rows(engine), await _events(engine)
+    called = _now()
     with _trace(engine, record_property) as (sql, _params, boundaries, _connections):
         result = await _mark(store, finalise_unrecoverable=finalise)
+    returned = _now()
     after = await _rows(engine)
     assert [_plain(item) for item in result.reclaimable] == [
         _reclaimable(r1, after[r1]),
@@ -385,10 +387,13 @@ async def test_mark_fences_each_expired_lease_once_and_skips_the_rest(
         _reclaimable(created_only, after[created_only]),
     ]
     assert (result.finalised, result.legacy, result.inspected, result.cursor) == ([], [], 5, None)
+    for item in (result.reclaimable[0], result.reclaimable[2]):
+        assert _naive(called) <= _naive(item.lease_expired_at) <= _naive(returned)
     for run_id in (r1, created_only):
         row = after[run_id]
         assert (row["status"], row["claim_epoch"], row["reclaim_limit"]) == ("running", 4, 3)
-        assert row["lease_expired_at"] is not None
+        # The mark records the store's clock at the CAS, not the (hour-old) cutoff.
+        assert _naive(called) <= _naive(row["lease_expired_at"]) <= _naive(returned)
         keep = set(COLUMNS) - {"claim_epoch", "lease_expired_at", "reclaim_limit", "updated_at"}
         assert {k: row[k] for k in keep} == {k: before[run_id][k] for k in keep}
     _untouched(before, after, fresh, marked, waiting, renewed)
@@ -574,6 +579,10 @@ async def test_scan_categories_follow_storage_format_loop_limit_and_cancel(
         *(["UPDATE agent_runs", "INSERT run_events"] * len(writes)),
         "SELECT agent_runs",
     ]
+    finalise = [s for s in sql if s.startswith("UPDATE agent_runs") and "failure_reason=" in s]
+    assert len(finalise) == sum(kind == "finalised" for kind, *_rest in outcomes.values())
+    for statement in finalise:
+        assert "coalesce(agent_runs.last_progress_at, agent_runs.created_at) < " in statement
     started = sql[0]
     assert "run_events.agent_run_id = agent_runs.id" in started
     assert "run_events.event_type = 'run.started'" in started
@@ -613,6 +622,16 @@ async def test_mark_keeps_a_stored_reclaim_limit_and_uses_the_argument_only_for_
     await _set(engine, new, reclaim_attempts=3)
     final = await _mark(store, reclaim_limit=9, finalise_unrecoverable=True)
     assert [(s.run_id, s.failure_reason) for s in final.finalised] == [(new, "reclaim_limit")]
+
+
+async def test_a_mark_without_a_stored_limit_uses_the_argument(store, engine):
+    unlimited = _ids(1)[0]
+    await _seed(store, engine, {unlimited: _marked(reclaim_limit=None, reclaim_attempts=3)})
+    kept = await _mark(store, reclaim_limit=9, finalise_unrecoverable=True)
+    assert [(i.run_id, i.reclaim_limit) for i in kept.reclaimable] == [(unlimited, None)]
+    assert kept.finalised == []
+    final = await _mark(store, reclaim_limit=3, finalise_unrecoverable=True)
+    assert [(s.run_id, s.failure_reason) for s in final.finalised] == [(unlimited, "reclaim_limit")]
 
 
 async def test_mark_pages_by_id_stops_at_its_caps_and_continues_from_the_cursor(
@@ -794,6 +813,10 @@ RACES = {
     "error-paused": ("error", {}, {"status": "waiting_client_tool"}, "none"),
     "limit-claimed": ("reclaim", {"reclaim_attempts": 3}, {"claim_epoch": 4}, "none"),
     "limit-heartbeat": ("reclaim", {"reclaim_attempts": 3}, {"last_progress_at": "now"}, "none"),
+    # A renewal stamped exactly at the cutoff is fresh for the finalise CAS too.
+    "error-at-cutoff": ("error", {}, {"last_progress_at": "cutoff"}, "none"),
+    "limit-at-cutoff": ("reclaim", {"reclaim_attempts": 3}, {"last_progress_at": "cutoff"}, "none"),
+    "mark-at-cutoff": (None, {}, {"last_progress_at": "cutoff"}, "none"),
     "limit-marked-heartbeat": (
         "reclaim",
         {"reclaim_attempts": 3, "lease_expired_at": "old", "reclaim_limit": 3},
@@ -803,8 +826,8 @@ RACES = {
 }
 
 
-def _when(values):
-    times = {"now": _now(), "old": _ago(minutes=30)}
+def _when(values, cutoff=None):
+    times = {"now": _now(), "old": _ago(minutes=30), "cutoff": cutoff}
     return {k: times.get(v, v) if isinstance(v, str) else v for k, v in values.items()}
 
 
@@ -816,6 +839,7 @@ async def test_cas_loses_to_a_change_between_the_scan_and_the_write(
     # The marked sibling sorts first and is skipped by the cursor; the foreign run
     # sorts after the target and is outside max_runs. Neither may be touched.
     marked_sibling, target = _ids(1, 2)
+    cutoff = _ago(hours=1).replace(microsecond=0)
     await _seed(store, engine, {marked_sibling: {}, target: _when(seed), OTHER: {"tenant": "t2"}})
     await _set(engine, marked_sibling, **_marked(claim_epoch=7))
     before, events_before = await _rows(engine), await _events(engine)
@@ -823,7 +847,7 @@ async def test_cas_loses_to_a_change_between_the_scan_and_the_write(
     applied = {}
 
     async def change_then_open():
-        applied.update(_when(change))
+        applied.update(_when(change, cutoff))
         await _set(engine, target, **applied)
 
     def hooked():
@@ -832,7 +856,9 @@ async def test_cas_loses_to_a_change_between_the_scan_and_the_write(
 
     monkeypatch.setattr(store, "_session_factory", hooked)
     with _trace(engine, record_property) as (sql, _params, boundaries, _connections):
-        result = await _scan(store, on_stale=on_stale, cursor=marked_sibling, max_runs=1)
+        result = await _scan(
+            store, on_stale=on_stale, cutoff=cutoff, cursor=marked_sibling, max_runs=1
+        )
     assert opened == [0, 1]
     after = await _rows(engine)
     if outcome == "current":
@@ -1090,6 +1116,11 @@ REFUSALS = {
     "store_capability": ({}, {}, "store_capability"),
     "not_running": ({"status": "waiting_client_tool"}, {}, "not_running"),
     "lease_fresh": ({"lease_expired_at": None}, {}, "lease_fresh"),
+    "lease_fresh_no_progress": (
+        {"lease_expired_at": None, "last_progress_at": None},
+        {},
+        "lease_fresh",
+    ),
     "already_reclaimed": ({}, {"expected_claim_epoch": 3}, "already_reclaimed"),
     "reclaim_limit": ({"reclaim_attempts": 3}, {}, "reclaim_limit"),
     "reclaim_limit_below": ({"reclaim_attempts": 2, "reclaim_limit": 2}, {}, "reclaim_limit"),
