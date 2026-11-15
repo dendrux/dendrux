@@ -317,7 +317,15 @@ async def test_claim_wins_once_increments_epoch_and_touches_only_its_run(
 
 @pytest.mark.parametrize("path", ["returning", "locked"])
 @pytest.mark.parametrize(
-    "case", ["wrong-status", "terminal", "missing-run", "pause-id-mismatch", "validate-raises"]
+    "case",
+    [
+        "wrong-status",
+        "terminal",
+        "missing-run",
+        "pause-id-mismatch",
+        "validate-raises",
+        "lost-with-failing-checks",
+    ],
 )
 async def test_claim_refusals_change_nothing(
     store, engine, monkeypatch, record_property, caplog, path, case
@@ -325,6 +333,9 @@ async def test_claim_refusals_change_nothing(
     await _seed(store, engine)
     if case == "terminal":
         await _set(engine, RUN, status="success")
+    elif case == "lost-with-failing-checks":
+        # Another worker already owns the run; this caller's checks would also fail.
+        await _set(engine, RUN, status="running", claim_epoch=4)
     if path == "locked":
         store.supports_update_returning = False
     caplog.set_level("WARNING", logger=STORE_LOGGER)
@@ -340,9 +351,14 @@ async def test_claim_refusals_change_nothing(
         "missing-run": {"expected_status": WAITING},
         "pause-id-mismatch": {"expected_status": WAITING, "expected_pause_id": "p0"},
         "validate-raises": {"expected_status": WAITING, "validate": refuse},
+        "lost-with-failing-checks": {
+            "expected_status": WAITING,
+            "expected_pause_id": "p0",
+            "validate": refuse,
+        },
     }[case]
     target = MISSING if case == "missing-run" else RUN
-    with _trace(engine, record_property) as (_sql, _params, boundaries, _connections):
+    with _trace(engine, record_property) as (sql, _params, boundaries, _connections):
         if case == "pause-id-mismatch":
             with pytest.raises(PauseStatusMismatchError) as raised:
                 await store.claim_paused_run(target, **kwargs)
@@ -358,6 +374,14 @@ async def test_claim_refusals_change_nothing(
     assert boundaries == (["begin", "rollback"] if raised_case else ["begin", "commit"])
     assert phases == ([] if raised_case else [("announce", (target,)), "commit"])
     assert _codes(caplog, "pause_id_mismatch") == ([RUN] if case == "pause-id-mismatch" else [])
+    if case == "lost-with-failing-checks":
+        # A lost CAS returns False at once: no pause read, no pause-id or validator check.
+        assert len(sql) == (1 if path == "returning" else 1 + (not _pg(engine)))
+        if path == "returning":
+            assert all("agent_runs.pause_data" not in statement for statement in sql)
+        else:
+            # The locked path projects pause_data only in its status-guarded locking read.
+            assert "agent_runs.status = " in _where(sql[-1])
 
 
 async def test_claim_release_cycle_fences_every_stale_epoch(store, engine, record_property):
@@ -460,6 +484,7 @@ async def test_submit_and_claim_legacy_merges_payload_into_the_pause(
         "no-pause",
         "validate-raises",
         "submission-missing",
+        "oversize-checkpoint",
         "foreign-blob-scope",
     ],
 )
@@ -486,7 +511,10 @@ async def test_submit_and_claim_refusals_roll_back_the_claim(
     kwargs = {
         "expected_status": "waiting_approval" if case == "wrong-status" else WAITING,
         "submitted_data": {"c1": "new"},
-        "submission": None if case == "submission-missing" else SUB,
+        "submission": {
+            "submission-missing": None,
+            "oversize-checkpoint": {**SUB, "descriptor": "x" * 40_000},
+        }.get(case, SUB),
         "validate": refuse if case == "validate-raises" else None,
         "blob_refs": [edge] if case == "foreign-blob-scope" else None,
         "blob_refs_scope": "t:t2" if case == "foreign-blob-scope" else None,
@@ -496,10 +524,16 @@ async def test_submit_and_claim_refusals_roll_back_the_claim(
         if case == "validate-raises":
             with pytest.raises(ValueError, match="refused"):
                 await store.submit_and_claim(target, **kwargs)
-        elif case == "submission-missing":
+        elif case in ("submission-missing", "oversize-checkpoint"):
             with pytest.raises(PersistenceError) as raised:
                 await store.submit_and_claim(target, **kwargs)
-            assert raised.value.code == "submission_missing"
+            assert (
+                raised.value.code
+                == {
+                    "submission-missing": "submission_missing",
+                    "oversize-checkpoint": "checkpoint_too_large",
+                }[case]
+            )
         elif case == "foreign-blob-scope":
             with pytest.raises(BlobNotFoundError):
                 await store.submit_and_claim(target, **kwargs)
@@ -513,10 +547,17 @@ async def test_submit_and_claim_refusals_roll_back_the_claim(
         len(sql)
         == {
             True: 1,
-            False: {"no-pause": 2, "validate-raises": 2, "submission-missing": 2}.get(case, 4),
+            False: {
+                "no-pause": 2,
+                "validate-raises": 2,
+                "submission-missing": 2,
+                "oversize-checkpoint": 2,
+            }.get(case, 4),
         }[lost]
     )
     assert _codes(caplog, "submission_missing") == ([RUN] if case == "submission-missing" else [])
+    oversize = case == "oversize-checkpoint"
+    assert _codes(caplog, "checkpoint_too_large") == ([RUN] if oversize else [])
 
 
 @pytest.mark.parametrize("refs", ["edges", "empty"])
