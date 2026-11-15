@@ -82,6 +82,7 @@ EXPECTED_MRO = {
         "_SqlClaims",
         "_SqlLifecycle",
         "_SqlEvidence",
+        "_SqlLeases",
         "_SqlWrites",
         "_StoreHost",
         "ManagedReads",
@@ -100,6 +101,7 @@ EXPECTED_MRO = {
         "_SqlClaims",
         "_SqlLifecycle",
         "_SqlEvidence",
+        "_SqlLeases",
         "_SqlWrites",
         "_StoreHost",
         "ManagedReads",
@@ -118,6 +120,7 @@ EXPECTED_MRO = {
         "_SqlClaims",
         "_SqlLifecycle",
         "_SqlEvidence",
+        "_SqlLeases",
         "_SqlWrites",
         "_StoreHost",
         "ManagedReads",
@@ -136,6 +139,7 @@ EXPECTED_MRO = {
         "_SqlClaims",
         "_SqlLifecycle",
         "_SqlEvidence",
+        "_SqlLeases",
         "_SqlWrites",
         "_StoreHost",
         "ManagedReads",
@@ -775,6 +779,34 @@ CLAIMS_RELOCATIONS = {
 }
 
 
+# MySQL keeps its own reclaim_run override (its super() target relocates).
+LEASES_RELOCATIONS = {
+    "MySQLStateStore": {
+        "_scan_expired_runs": ("SQLStateStore", "_SqlLeases", "base.py", "_sql_leases.py"),
+        "get_lease_expired": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_leases.py"),
+        "mark_lease_expired": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_leases.py"),
+    },
+    "PostgresStateStore": {
+        "_scan_expired_runs": ("SQLStateStore", "_SqlLeases", "base.py", "_sql_leases.py"),
+        "get_lease_expired": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_leases.py"),
+        "mark_lease_expired": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_leases.py"),
+        "reclaim_run": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_leases.py"),
+    },
+    "SQLStateStore": {
+        "_scan_expired_runs": ("SQLStateStore", "_SqlLeases", "base.py", "_sql_leases.py"),
+        "get_lease_expired": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_leases.py"),
+        "mark_lease_expired": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_leases.py"),
+        "reclaim_run": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_leases.py"),
+    },
+    "SQLiteStateStore": {
+        "_scan_expired_runs": ("SQLStateStore", "_SqlLeases", "base.py", "_sql_leases.py"),
+        "get_lease_expired": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_leases.py"),
+        "mark_lease_expired": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_leases.py"),
+        "reclaim_run": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_leases.py"),
+    },
+}
+
+
 def _canonical_writes_snapshot(snapshot, cls):
     import copy
 
@@ -860,6 +892,16 @@ def _canonical_writes_snapshot(snapshot, cls):
         assert member["layers"][-1] == (new_file, name), name
         member["owner"] = old_owner
         member["layers"][-1] = (old_file, name)
+    for name, (old_owner, new_owner, old_file, new_file) in LEASES_RELOCATIONS[
+        cls.__name__
+    ].items():
+        assert name in result["members"]
+        member = result["members"][name]
+        assert member["owner"] == new_owner, name
+        assert member["layers"][-1] == (new_file, name), name
+        member["owner"] = old_owner
+        member["layers"][-1] = (old_file, name)
+    result["mro"].remove("_SqlLeases")
     result["mro"].remove("_SqlClaims")
     result["mro"].remove("_SqlEvents")
     result["mro"].remove("_SqlReads")
@@ -1040,6 +1082,8 @@ async def test_explicit_private_wrapper_and_sanitized_database_failures(cls, nam
         "events-file",
         "claims-owner",
         "claims-file",
+        "leases-owner",
+        "leases-file",
         "unlisted-file",
         "wrapper-count",
         "wrapper-order",
@@ -1093,6 +1137,10 @@ def test_proposed_exact_write_relocation_still_refuses_unplanned_snapshot_change
         raw["members"]["_cancel_claim_release"]["owner"] = "SQLStateStore"
     elif change == "claims-file":
         raw["members"]["release_run_claim"]["layers"][-1] = ("_other.py", "release_run_claim")
+    elif change == "leases-owner":
+        raw["members"]["_scan_expired_runs"]["owner"] = "SQLStateStore"
+    elif change == "leases-file":
+        raw["members"]["get_lease_expired"]["layers"][-1] = ("_other.py", "get_lease_expired")
     elif change == "unlisted-file":
         raw["members"]["_insert"]["layers"][-1] = ("_sql_writes.py", "_insert")
     elif change == "wrapper-count":
