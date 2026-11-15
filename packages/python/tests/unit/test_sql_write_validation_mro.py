@@ -77,6 +77,7 @@ EXPECTED_MRO = {
         "_SqlManaged",
         "_SqlTree",
         "_SqlPause",
+        "_SqlReads",
         "_SqlLifecycle",
         "_SqlEvidence",
         "_SqlWrites",
@@ -92,6 +93,7 @@ EXPECTED_MRO = {
         "_SqlManaged",
         "_SqlTree",
         "_SqlPause",
+        "_SqlReads",
         "_SqlLifecycle",
         "_SqlEvidence",
         "_SqlWrites",
@@ -107,6 +109,7 @@ EXPECTED_MRO = {
         "_SqlManaged",
         "_SqlTree",
         "_SqlPause",
+        "_SqlReads",
         "_SqlLifecycle",
         "_SqlEvidence",
         "_SqlWrites",
@@ -122,6 +125,7 @@ EXPECTED_MRO = {
         "_SqlManaged",
         "_SqlTree",
         "_SqlPause",
+        "_SqlReads",
         "_SqlLifecycle",
         "_SqlEvidence",
         "_SqlWrites",
@@ -588,6 +592,94 @@ PAUSE_RELOCATIONS = {
 }
 
 
+READS_RELOCATIONS = {
+    "MySQLStateStore": {
+        "_apply_metadata_filter": ("SQLStateStore", "_SqlReads", "base.py", "_sql_reads.py"),
+        "_apply_run_filters": ("SQLStateStore", "_SqlReads", "base.py", "_sql_reads.py"),
+        "_get_result_record": ("SQLStateStore", "_SqlReads", "base.py", "_sql_reads.py"),
+        "conversation_traces": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+        "count_pauses_per_run": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+        "count_runs": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+        "get_llm_interactions": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+        "get_loop_state": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+        "get_next_trace_index": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+        "get_pii_mapping": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+        "get_public_traces": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+        "get_run": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+        "get_run_status": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+        "get_run_statuses": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+        "get_tool_calls": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+        "get_trace": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+        "get_traces": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+        "get_traces_after": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+        "list_runs": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+    },
+    "PostgresStateStore": {
+        "_apply_metadata_filter": ("SQLStateStore", "_SqlReads", "base.py", "_sql_reads.py"),
+        "_apply_run_filters": ("SQLStateStore", "_SqlReads", "base.py", "_sql_reads.py"),
+        "_get_result_record": ("SQLStateStore", "_SqlReads", "base.py", "_sql_reads.py"),
+        "conversation_traces": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+        "count_pauses_per_run": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+        "count_runs": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+        "get_llm_interactions": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+        "get_loop_state": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+        "get_next_trace_index": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+        "get_pii_mapping": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+        "get_public_traces": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+        "get_run": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+        "get_run_status": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+        "get_run_statuses": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+        "get_tool_calls": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+        "get_trace": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+        "get_traces": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+        "get_traces_after": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+        "list_runs": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+    },
+    "SQLStateStore": {
+        "_apply_metadata_filter": ("SQLStateStore", "_SqlReads", "base.py", "_sql_reads.py"),
+        "_apply_run_filters": ("SQLStateStore", "_SqlReads", "base.py", "_sql_reads.py"),
+        "_get_result_record": ("SQLStateStore", "_SqlReads", "base.py", "_sql_reads.py"),
+        "conversation_traces": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+        "count_pauses_per_run": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+        "count_runs": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+        "get_llm_interactions": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+        "get_loop_state": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+        "get_next_trace_index": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+        "get_pii_mapping": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+        "get_public_traces": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+        "get_run": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+        "get_run_status": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+        "get_run_statuses": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+        "get_tool_calls": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+        "get_trace": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+        "get_traces": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+        "get_traces_after": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+        "list_runs": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+    },
+    "SQLiteStateStore": {
+        "_apply_metadata_filter": ("SQLStateStore", "_SqlReads", "base.py", "_sql_reads.py"),
+        "_apply_run_filters": ("SQLStateStore", "_SqlReads", "base.py", "_sql_reads.py"),
+        "_get_result_record": ("SQLStateStore", "_SqlReads", "base.py", "_sql_reads.py"),
+        "conversation_traces": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+        "count_pauses_per_run": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+        "count_runs": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+        "get_llm_interactions": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+        "get_loop_state": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+        "get_next_trace_index": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+        "get_pii_mapping": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+        "get_public_traces": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+        "get_run": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+        "get_run_status": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+        "get_run_statuses": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+        "get_tool_calls": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+        "get_trace": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+        "get_traces": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+        "get_traces_after": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+        "list_runs": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_reads.py"),
+    },
+}
+
+
 def _canonical_writes_snapshot(snapshot, cls):
     import copy
 
@@ -648,6 +740,14 @@ def _canonical_writes_snapshot(snapshot, cls):
         assert member["layers"][-1] == (new_file, name), name
         member["owner"] = old_owner
         member["layers"][-1] = (old_file, name)
+    for name, (old_owner, new_owner, old_file, new_file) in READS_RELOCATIONS[cls.__name__].items():
+        assert name in result["members"]
+        member = result["members"][name]
+        assert member["owner"] == new_owner, name
+        assert member["layers"][-1] == (new_file, name), name
+        member["owner"] = old_owner
+        member["layers"][-1] = (old_file, name)
+    result["mro"].remove("_SqlReads")
     result["mro"].remove("_SqlPause")
     result["mro"].remove("_SqlLifecycle")
     result["mro"].remove("_SqlTree")
@@ -819,6 +919,8 @@ async def test_explicit_private_wrapper_and_sanitized_database_failures(cls, nam
         "runs-file",
         "managed-owner",
         "managed-file",
+        "reads-owner",
+        "reads-file",
         "unlisted-file",
         "wrapper-count",
         "wrapper-order",
@@ -860,6 +962,10 @@ def test_proposed_exact_write_relocation_still_refuses_unplanned_snapshot_change
         raw["members"]["_bind_parent"]["owner"] = "SQLStateStore"
     elif change == "managed-file":
         raw["members"]["bind_managed_child"]["layers"][-1] = ("_other.py", "bind_managed_child")
+    elif change == "reads-owner":
+        raw["members"]["_apply_run_filters"]["owner"] = "UnplannedOwner"
+    elif change == "reads-file":
+        raw["members"]["get_trace"]["layers"][-1] = ("_other.py", "get_trace")
     elif change == "unlisted-file":
         raw["members"]["_insert"]["layers"][-1] = ("_sql_writes.py", "_insert")
     elif change == "wrapper-count":

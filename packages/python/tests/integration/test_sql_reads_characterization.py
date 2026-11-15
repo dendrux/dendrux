@@ -7,11 +7,11 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from sqlalchemy import event, insert, update
 
-import dendrux.runtime.stores.sql.base as sql_base
 from dendrux._meta_keys import LATEST_REWRITE_META_KEY
 from dendrux.db.models import AgentRun, LLMInteraction, ReactTrace, RunEvent, ToolCallRecord
 from dendrux.runtime._bounds import MAX_PAGE
 from dendrux.runtime.state import UNSCOPED
+from dendrux.runtime.stores.sql import _sql_reads
 
 RUN = "00000000000000000000000001"
 OTHER = "00000000000000000000000002"
@@ -183,7 +183,7 @@ async def test_rewrite_conversation_cursor_and_owner_constant(
     store, engine, monkeypatch, record_property
 ):
     await _seed(store, engine)
-    monkeypatch.setattr(sql_base, "_TRACE_POSITION_STRIDE", 100)
+    monkeypatch.setattr(_sql_reads, "_TRACE_POSITION_STRIDE", 100)
     async with engine.begin() as conn:
         await conn.execute(
             update(AgentRun)
