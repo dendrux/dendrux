@@ -339,6 +339,37 @@ async def test_next_sequence_follows_the_maximum_in_one_read(store, engine, reco
     assert await store.save_run_event(RUN, event_type="tool.completed") == 6
 
 
+@pytest.mark.parametrize("busier", [OTHER, RUN], ids=["other-busier", "run-busier"])
+async def test_next_sequence_and_allocation_ignore_other_runs(
+    store, engine, record_property, busier
+):
+    """Each run reads and allocates from its own maximum, never a global one."""
+    await _seed(store, engine)
+    quieter = RUN if busier == OTHER else OTHER
+    await _insert_events(engine, busier, [(i, "run.started", i) for i in range(8)])
+    await _insert_events(engine, quieter, [(0, "run.started", 0), (1, "run.paused", 1)])
+    with _trace(engine, record_property) as (sql, _, _boundaries, _connections):
+        assert await store.get_next_event_sequence(quieter) == 2
+        assert await store.get_next_event_sequence(busier) == 8
+    assert all("run_events.agent_run_id =" in s.split(" WHERE ")[-1] for s in sql)
+    async with engine.begin() as conn:
+        await conn.execute(update(AgentRun).where(AgentRun.id == quieter).values(claim_epoch=7))
+    with _trace(engine, record_property) as (inserts, _, _boundaries, _connections):
+        assert await store.save_run_event(quieter, event_type="tool.completed") == 2
+    assert "WHERE run_events.agent_run_id =" in inserts[1]
+    assert await store.save_run_event(busier, event_type="tool.completed") == 8
+    assert [row["sequence_index"] for row in await _events(engine, quieter)] == [0, 1, 2]
+    assert [row["sequence_index"] for row in await _events(engine, busier)] == list(range(9))
+
+
+async def test_first_event_of_a_run_starts_at_zero_beside_a_busy_run(store, engine):
+    await _seed(store, engine)
+    await _insert_events(engine, OTHER, [(i, "run.started", i) for i in range(5)])
+    assert await store.get_next_event_sequence(RUN) == 0
+    assert await store.save_run_event(RUN, event_type="run.started") == 0
+    assert await store.get_next_event_sequence(RUN) == 1
+
+
 @pytest.mark.parametrize("tenant", ["t1", "t2", None, UNSCOPED])
 async def test_run_events_are_scoped_ordered_and_read_once(store, engine, record_property, tenant):
     await _seed(store, engine)
