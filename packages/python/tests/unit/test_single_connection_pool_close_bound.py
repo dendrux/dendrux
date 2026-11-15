@@ -9,8 +9,11 @@ is left running in the background and the caller's cancellation is re-raised.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import gc
 import logging
+import time
+import weakref
 from typing import TYPE_CHECKING
 
 import aiosqlite
@@ -73,9 +76,13 @@ class _Gate:
         self.release = asyncio.Event()
         self.cancelled = False
         self.finished = False
+        self.task: weakref.ref[asyncio.Task[object]] | None = None
         self._fail_with = fail_with
 
     async def close(self) -> None:
+        current = asyncio.current_task()
+        if current is not None:
+            self.task = weakref.ref(current)
         self.started.set()
         try:
             await self.release.wait()
@@ -167,6 +174,28 @@ async def test_real_aiosqlite_close_after_stop_no_longer_traps_the_caller(
     assert caller.cancelled()
 
 
+def _close_errors_surfaced(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [
+        r
+        for r in caplog.records
+        if "never retrieved" in r.getMessage()
+        or SENTINEL in r.getMessage()
+        or SENTINEL in repr(r.__dict__)
+    ]
+
+
+async def _collect(gate: _Gate) -> None:
+    """Collect the finished close task, as asyncio does when nothing references it."""
+    await _settle()
+    gc.collect()
+    await _settle()
+
+
+def _assert_collected(gate: _Gate) -> None:
+    assert gate.task is not None
+    assert gate.task() is None, "close task still referenced; the leak scan proves nothing"
+
+
 async def test_bound_expiry_logs_one_stable_code_without_exception_text(
     short_bound: float, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -177,13 +206,15 @@ async def test_bound_expiry_logs_one_stable_code_without_exception_text(
     with caplog.at_level(logging.DEBUG):
         await _cancel_twice(caller)
         await asyncio.wait({caller}, timeout=FINISH_WITHIN_S)
+        was_cancelled = caller.cancelled()
+        # The caller's CancelledError traceback holds close_fully's frame and with it
+        # the close task: drop it so the task can be collected like in production.
+        del caller
         # The abandoned close later fails; nobody may surface its text.
         gate.release.set()
-        await _settle()
-        gc.collect()
-        await _settle()
+        await _collect(gate)
 
-    assert caller.cancelled()
+    assert was_cancelled
     coded = [r for r in caplog.records if getattr(r, "code", None) == "db_close_abandoned"]
     assert len(coded) == 1
     record = coded[0]
@@ -193,8 +224,134 @@ async def test_bound_expiry_logs_one_stable_code_without_exception_text(
     assert record.timeout_s == short_bound
     assert record.exc_info is None
     assert SENTINEL not in caplog.text
-    assert SENTINEL not in repr([r.__dict__ for r in caplog.records])
-    assert not [r for r in caplog.records if "never retrieved" in r.getMessage()]
+    assert not _close_errors_surfaced(caplog)
+    _assert_collected(gate)
+
+
+async def test_close_failing_as_the_cancel_lands_is_not_surfaced(
+    short_bound: float, caplog: pytest.LogCaptureFixture
+) -> None:
+    gate = _Gate(fail_with=SENTINEL)
+    caller = asyncio.create_task(close_fully(gate.close))
+    await gate.started.wait()
+
+    with caplog.at_level(logging.DEBUG):
+        # Same step: the close fails first, then the caller wakes with the cancellation.
+        gate.release.set()
+        caller.cancel()
+        await asyncio.wait({caller}, timeout=FINISH_WITHIN_S)
+        was_cancelled = caller.cancelled()
+        del caller
+        await _collect(gate)
+
+    assert gate.finished
+    assert was_cancelled, "a close error replaced the caller's cancellation"
+    assert SENTINEL not in caplog.text
+    assert not _close_errors_surfaced(caplog)
+    _assert_collected(gate)
+
+
+async def test_close_failing_while_a_cancellation_unwinds_keeps_the_cancellation(
+    short_bound: float, caplog: pytest.LogCaptureFixture
+) -> None:
+    gate = _Gate(fail_with=SENTINEL)
+    gate.release.set()
+    entered = asyncio.Event()
+
+    async def session_exit() -> None:
+        try:
+            entered.set()
+            await asyncio.sleep(3600)
+        finally:
+            await close_fully(gate.close)
+
+    caller = asyncio.create_task(session_exit())
+    await entered.wait()
+    with caplog.at_level(logging.DEBUG):
+        caller.cancel()
+        await asyncio.wait({caller}, timeout=FINISH_WITHIN_S)
+        was_cancelled = caller.cancelled()
+        del caller
+        await _collect(gate)
+
+    assert gate.finished
+    assert was_cancelled, "a close error replaced the in-flight cancellation"
+    assert not _close_errors_surfaced(caplog)
+    _assert_collected(gate)
+
+
+async def test_later_cancels_do_not_restart_the_bound(short_bound: float) -> None:
+    gate = _Gate()
+    caller = asyncio.create_task(close_fully(gate.close))
+    await gate.started.wait()
+
+    first = time.monotonic()
+    while not caller.done() and time.monotonic() - first < short_bound * 4:
+        caller.cancel()
+        await asyncio.sleep(short_bound / 4)
+    elapsed = time.monotonic() - first
+
+    assert caller.cancelled()
+    # Restarting at each cancel would end a bound after the last one (about 4 bounds).
+    assert elapsed < short_bound * 2.5, f"bound restarted by later cancels: {elapsed:.2f}s"
+
+
+async def _swallow_one_cancel() -> None:
+    """Leave ``cancelling()`` raised with nothing in flight (a stale counter)."""
+    task = asyncio.current_task()
+    assert task is not None
+    task.cancel()
+    # Handled without uncancel(), as user code or a 3.11/3.12 TaskGroup can do.
+    with contextlib.suppress(asyncio.CancelledError):
+        await asyncio.sleep(0)
+    assert task.cancelling() == 1
+
+
+async def test_stale_cancelling_counter_does_not_bound_a_slow_close(
+    short_bound: float, caplog: pytest.LogCaptureFixture
+) -> None:
+    gate = _Gate()
+
+    async def caller_with_stale_counter() -> None:
+        await _swallow_one_cancel()
+        await close_fully(gate.close)
+
+    caller = asyncio.create_task(caller_with_stale_counter())
+    await gate.started.wait()
+    with caplog.at_level(logging.DEBUG, logger=_GUARD_LOGGER):
+        await asyncio.sleep(short_bound * 3)
+        assert not caller.done(), "a caller that is not being cancelled was abandoned"
+        gate.release.set()
+        await asyncio.wait_for(caller, timeout=FINISH_WITHIN_S)
+
+    assert gate.finished
+    assert not [r for r in caplog.records if getattr(r, "code", None) == "db_close_abandoned"]
+
+
+async def test_converted_cancellation_in_flight_still_bounds_the_close(
+    short_bound: float,
+) -> None:
+    gate = _Gate()
+    entered = asyncio.Event()
+
+    async def converting_exit() -> None:
+        try:
+            try:
+                entered.set()
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                raise RuntimeError("store failure") from None  # context still set
+        finally:
+            await close_fully(gate.close)
+
+    caller = asyncio.create_task(converting_exit())
+    await entered.wait()
+    caller.cancel()
+    done, _ = await asyncio.wait({caller}, timeout=FINISH_WITHIN_S)
+
+    assert caller in done, "cleanup after a converted cancellation waited forever"
+    assert isinstance(caller.exception(), RuntimeError)
+    assert not gate.cancelled
 
 
 async def test_close_finishing_within_the_bound_is_waited_for(
