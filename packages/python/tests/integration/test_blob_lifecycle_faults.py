@@ -657,6 +657,7 @@ async def test_injected_deadlock_retries_whole_transaction(engine, store, monkey
 # and any other error is collected.
 SQLITE_BUSY_TIMEOUT_MS = 60_000
 WORKLOAD_DEADLINE_S = 120.0
+WORKER_CLEANUP_DEADLINE_S = 5.0
 WORKERS = 16
 
 
@@ -730,13 +731,29 @@ async def run_shared_edge_workload(
             except Exception as exc:  # noqa: BLE001 - collected for the assertion
                 failures.append(exc)
 
+    tasks = [asyncio.create_task(worker(w), name=f"shared-edge-{w}") for w in range(WORKERS)]
     try:
         async with asyncio.timeout(deadline_s):
-            await asyncio.gather(*(worker(w) for w in range(WORKERS)))
+            await asyncio.wait(tasks)
+        for task in tasks:
+            task.result()
     finally:
-        durability._backoff = real_backoff  # type: ignore[assignment]
-        if busy_listener is not None:
-            event.remove(engine.sync_engine, "connect", busy_listener)
+        try:
+            # wait() leaves cancellation to this owner: each unfinished worker gets one cancel.
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            done, pending = await asyncio.wait(tasks, timeout=WORKER_CLEANUP_DEADLINE_S)
+            for task in done:
+                if not task.cancelled():
+                    task.exception()
+            assert not pending, (
+                f"shared-edge cleanup stalled: {[task.get_name() for task in pending]}"
+            )
+        finally:
+            durability._backoff = real_backoff  # type: ignore[assignment]
+            if busy_listener is not None:
+                event.remove(engine.sync_engine, "connect", busy_listener)
     return failures, retries
 
 
@@ -760,15 +777,25 @@ class _DeadlockError(Exception):
 class TestSharedEdgeWorkloadStillCatchesRealProblems:
     """The check above must fail on a hang, an unexpected error and a deadlock retry."""
 
-    async def test_a_hang_hits_the_wall_deadline(self, engine) -> None:
+    @pytest.mark.parametrize("deadline_s", [0.05, 2.0])
+    async def test_a_hang_hits_the_wall_deadline(self, engine, deadline_s: float) -> None:
+        cancelled: list[bool] = []
+
         def hang(store: Any) -> None:
             async def never(*_: Any, **__: Any) -> None:
-                await asyncio.Event().wait()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    cancelled.append(True)
 
-            store.save_trace = never
+            # Park before a write starts; cancelling an in-flight SQLite write is a separate bug.
+            store.create_run = never
 
         with pytest.raises(TimeoutError):
-            await run_shared_edge_workload(engine, iterations=1, deadline_s=2.0, patch_store=hang)
+            await run_shared_edge_workload(
+                engine, iterations=1, deadline_s=deadline_s, patch_store=hang
+            )
+        assert len(cancelled) == WORKERS
 
     async def test_an_unexpected_error_is_reported(self, engine) -> None:
         def broken(store: Any) -> None:
