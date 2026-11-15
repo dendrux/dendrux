@@ -74,6 +74,7 @@ EXPECTED_MRO = {
     "SQLStateStore": [
         "SQLStateStore",
         "_SqlRuns",
+        "_SqlManaged",
         "_SqlEvidence",
         "_SqlWrites",
         "_StoreHost",
@@ -85,6 +86,7 @@ EXPECTED_MRO = {
         "SQLiteStateStore",
         "SQLStateStore",
         "_SqlRuns",
+        "_SqlManaged",
         "_SqlEvidence",
         "_SqlWrites",
         "_StoreHost",
@@ -96,6 +98,7 @@ EXPECTED_MRO = {
         "PostgresStateStore",
         "SQLStateStore",
         "_SqlRuns",
+        "_SqlManaged",
         "_SqlEvidence",
         "_SqlWrites",
         "_StoreHost",
@@ -107,6 +110,7 @@ EXPECTED_MRO = {
         "MySQLStateStore",
         "SQLStateStore",
         "_SqlRuns",
+        "_SqlManaged",
         "_SqlEvidence",
         "_SqlWrites",
         "_StoreHost",
@@ -330,6 +334,54 @@ RUNS_RELOCATIONS = {
 }
 
 
+MANAGED_RELOCATIONS = {
+    "MySQLStateStore": {
+        "_bind_admit": ("SQLStateStore", "_SqlManaged", "base.py", "_sql_managed.py"),
+        "_bind_child": ("SQLStateStore", "_SqlManaged", "base.py", "_sql_managed.py"),
+        "_bind_event": ("SQLStateStore", "_SqlManaged", "base.py", "_sql_managed.py"),
+        "_bind_existing": ("SQLStateStore", "_SqlManaged", "base.py", "_sql_managed.py"),
+        "_bind_intent": ("SQLStateStore", "_SqlManaged", "base.py", "_sql_managed.py"),
+        "_bind_parent": ("SQLStateStore", "_SqlManaged", "base.py", "_sql_managed.py"),
+        "_bind_park_parent": ("SQLStateStore", "_SqlManaged", "base.py", "_sql_managed.py"),
+        "_bind_seeds": ("SQLStateStore", "_SqlManaged", "base.py", "_sql_managed.py"),
+        "bind_managed_child": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_managed.py"),
+    },
+    "PostgresStateStore": {
+        "_bind_admit": ("SQLStateStore", "_SqlManaged", "base.py", "_sql_managed.py"),
+        "_bind_child": ("SQLStateStore", "_SqlManaged", "base.py", "_sql_managed.py"),
+        "_bind_event": ("SQLStateStore", "_SqlManaged", "base.py", "_sql_managed.py"),
+        "_bind_existing": ("SQLStateStore", "_SqlManaged", "base.py", "_sql_managed.py"),
+        "_bind_intent": ("SQLStateStore", "_SqlManaged", "base.py", "_sql_managed.py"),
+        "_bind_parent": ("SQLStateStore", "_SqlManaged", "base.py", "_sql_managed.py"),
+        "_bind_park_parent": ("SQLStateStore", "_SqlManaged", "base.py", "_sql_managed.py"),
+        "_bind_seeds": ("SQLStateStore", "_SqlManaged", "base.py", "_sql_managed.py"),
+        "bind_managed_child": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_managed.py"),
+    },
+    "SQLStateStore": {
+        "_bind_admit": ("SQLStateStore", "_SqlManaged", "base.py", "_sql_managed.py"),
+        "_bind_child": ("SQLStateStore", "_SqlManaged", "base.py", "_sql_managed.py"),
+        "_bind_event": ("SQLStateStore", "_SqlManaged", "base.py", "_sql_managed.py"),
+        "_bind_existing": ("SQLStateStore", "_SqlManaged", "base.py", "_sql_managed.py"),
+        "_bind_intent": ("SQLStateStore", "_SqlManaged", "base.py", "_sql_managed.py"),
+        "_bind_parent": ("SQLStateStore", "_SqlManaged", "base.py", "_sql_managed.py"),
+        "_bind_park_parent": ("SQLStateStore", "_SqlManaged", "base.py", "_sql_managed.py"),
+        "_bind_seeds": ("SQLStateStore", "_SqlManaged", "base.py", "_sql_managed.py"),
+        "bind_managed_child": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_managed.py"),
+    },
+    "SQLiteStateStore": {
+        "_bind_admit": ("SQLStateStore", "_SqlManaged", "base.py", "_sql_managed.py"),
+        "_bind_child": ("SQLStateStore", "_SqlManaged", "base.py", "_sql_managed.py"),
+        "_bind_event": ("SQLStateStore", "_SqlManaged", "base.py", "_sql_managed.py"),
+        "_bind_existing": ("SQLStateStore", "_SqlManaged", "base.py", "_sql_managed.py"),
+        "_bind_intent": ("SQLStateStore", "_SqlManaged", "base.py", "_sql_managed.py"),
+        "_bind_parent": ("SQLStateStore", "_SqlManaged", "base.py", "_sql_managed.py"),
+        "_bind_park_parent": ("SQLStateStore", "_SqlManaged", "base.py", "_sql_managed.py"),
+        "_bind_seeds": ("SQLStateStore", "_SqlManaged", "base.py", "_sql_managed.py"),
+        "bind_managed_child": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_managed.py"),
+    },
+}
+
+
 def _canonical_writes_snapshot(snapshot, cls):
     import copy
 
@@ -358,6 +410,16 @@ def _canonical_writes_snapshot(snapshot, cls):
         assert member["layers"][-1] == (new_file, name), name
         member["owner"] = old_owner
         member["layers"][-1] = (old_file, name)
+    for name, (old_owner, new_owner, old_file, new_file) in MANAGED_RELOCATIONS[
+        cls.__name__
+    ].items():
+        assert name in result["members"]
+        member = result["members"][name]
+        assert member["owner"] == new_owner, name
+        assert member["layers"][-1] == (new_file, name), name
+        member["owner"] = old_owner
+        member["layers"][-1] = (old_file, name)
+    result["mro"].remove("_SqlManaged")
     result["mro"].remove("_SqlRuns")
     result["mro"].remove("_SqlEvidence")
     result["mro"].remove("_SqlWrites")
@@ -523,6 +585,8 @@ async def test_explicit_private_wrapper_and_sanitized_database_failures(cls, nam
         "evidence-file",
         "runs-owner",
         "runs-file",
+        "managed-owner",
+        "managed-file",
         "unlisted-file",
         "wrapper-count",
         "wrapper-order",
@@ -560,6 +624,10 @@ def test_proposed_exact_write_relocation_still_refuses_unplanned_snapshot_change
             "_other.py",
             "_creation_storage_format",
         )
+    elif change == "managed-owner":
+        raw["members"]["_bind_parent"]["owner"] = "SQLStateStore"
+    elif change == "managed-file":
+        raw["members"]["bind_managed_child"]["layers"][-1] = ("_other.py", "bind_managed_child")
     elif change == "unlisted-file":
         raw["members"]["_insert"]["layers"][-1] = ("_sql_writes.py", "_insert")
     elif change == "wrapper-count":

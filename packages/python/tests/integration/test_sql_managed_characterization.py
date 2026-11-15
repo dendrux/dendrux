@@ -9,7 +9,7 @@ from sqlalchemy import event
 
 import dendrux.runtime.state as state
 from dendrux.errors import ManagedStateError
-from dendrux.runtime.stores.sql import base as sql_base
+from dendrux.runtime.stores.sql import _sql_managed
 from dendrux.types import generate_ulid
 from tests.integration.test_managed_bind import bind_request, managed_parent, snapshot
 
@@ -191,16 +191,16 @@ async def test_replay_consults_the_live_binding_helper_and_grants_no_new_claim(s
     parent, call = await managed_parent(store)
     request = bind_request(parent, call)
     await store.bind_managed_child(request)
-    helper = Mock(wraps=sql_base._bound_child_id)
+    helper = Mock(wraps=_sql_managed._bound_child_id)
     with monkeypatch.context() as patch:
-        patch.setattr(sql_base, "_bound_child_id", helper)
+        patch.setattr(_sql_managed, "_bound_child_id", helper)
         result = await store.bind_managed_child(request)
     helper.assert_called_once()
     assert len(helper.call_args.args[0]) == 1
     assert result.outcome == "existing" and result.child_claim is None
     conflict = Mock(return_value=None)
     with monkeypatch.context() as patch:
-        patch.setattr(sql_base, "_bound_child_id", conflict)
+        patch.setattr(_sql_managed, "_bound_child_id", conflict)
         with pytest.raises(ManagedStateError) as caught:
             await store.bind_managed_child(request)
     conflict.assert_called_once()
