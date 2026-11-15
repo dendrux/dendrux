@@ -37,6 +37,7 @@
     "_validate_rewrite_entries": "dendrux.runtime.stores.sql._sql_support",
     "_validate_trace_write": "dendrux.runtime.stores.sql._sql_support",
     "_write_event": "dendrux.runtime.state",
+    "_write_release_event": "dendrux.runtime.stores.sql._sql_claims",
     "logger": "dendrux.runtime.stores.sql._sql_support",
     "write_blob_refs": "dendrux.runtime._blob_catalog"
   }

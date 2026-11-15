@@ -79,6 +79,7 @@ EXPECTED_MRO = {
         "_SqlPause",
         "_SqlReads",
         "_SqlEvents",
+        "_SqlClaims",
         "_SqlLifecycle",
         "_SqlEvidence",
         "_SqlWrites",
@@ -96,6 +97,7 @@ EXPECTED_MRO = {
         "_SqlPause",
         "_SqlReads",
         "_SqlEvents",
+        "_SqlClaims",
         "_SqlLifecycle",
         "_SqlEvidence",
         "_SqlWrites",
@@ -113,6 +115,7 @@ EXPECTED_MRO = {
         "_SqlPause",
         "_SqlReads",
         "_SqlEvents",
+        "_SqlClaims",
         "_SqlLifecycle",
         "_SqlEvidence",
         "_SqlWrites",
@@ -130,6 +133,7 @@ EXPECTED_MRO = {
         "_SqlPause",
         "_SqlReads",
         "_SqlEvents",
+        "_SqlClaims",
         "_SqlLifecycle",
         "_SqlEvidence",
         "_SqlWrites",
@@ -735,6 +739,42 @@ EVENTS_RELOCATIONS = {
 }
 
 
+# MySQL keeps its own claim_paused_run override (its super() target relocates).
+CLAIMS_RELOCATIONS = {
+    "MySQLStateStore": {
+        "_cancel_claim_release": ("SQLStateStore", "_SqlClaims", "base.py", "_sql_claims.py"),
+        "_finish_claim_release": ("SQLStateStore", "_SqlClaims", "base.py", "_sql_claims.py"),
+        "consume_submission": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_claims.py"),
+        "release_run_claim": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_claims.py"),
+        "submit_and_claim": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_claims.py"),
+    },
+    "PostgresStateStore": {
+        "_cancel_claim_release": ("SQLStateStore", "_SqlClaims", "base.py", "_sql_claims.py"),
+        "_finish_claim_release": ("SQLStateStore", "_SqlClaims", "base.py", "_sql_claims.py"),
+        "claim_paused_run": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_claims.py"),
+        "consume_submission": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_claims.py"),
+        "release_run_claim": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_claims.py"),
+        "submit_and_claim": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_claims.py"),
+    },
+    "SQLStateStore": {
+        "_cancel_claim_release": ("SQLStateStore", "_SqlClaims", "base.py", "_sql_claims.py"),
+        "_finish_claim_release": ("SQLStateStore", "_SqlClaims", "base.py", "_sql_claims.py"),
+        "claim_paused_run": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_claims.py"),
+        "consume_submission": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_claims.py"),
+        "release_run_claim": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_claims.py"),
+        "submit_and_claim": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_claims.py"),
+    },
+    "SQLiteStateStore": {
+        "_cancel_claim_release": ("SQLStateStore", "_SqlClaims", "base.py", "_sql_claims.py"),
+        "_finish_claim_release": ("SQLStateStore", "_SqlClaims", "base.py", "_sql_claims.py"),
+        "claim_paused_run": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_claims.py"),
+        "consume_submission": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_claims.py"),
+        "release_run_claim": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_claims.py"),
+        "submit_and_claim": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_claims.py"),
+    },
+}
+
+
 def _canonical_writes_snapshot(snapshot, cls):
     import copy
 
@@ -811,6 +851,16 @@ def _canonical_writes_snapshot(snapshot, cls):
         assert member["layers"][-1] == (new_file, name), name
         member["owner"] = old_owner
         member["layers"][-1] = (old_file, name)
+    for name, (old_owner, new_owner, old_file, new_file) in CLAIMS_RELOCATIONS[
+        cls.__name__
+    ].items():
+        assert name in result["members"]
+        member = result["members"][name]
+        assert member["owner"] == new_owner, name
+        assert member["layers"][-1] == (new_file, name), name
+        member["owner"] = old_owner
+        member["layers"][-1] = (old_file, name)
+    result["mro"].remove("_SqlClaims")
     result["mro"].remove("_SqlEvents")
     result["mro"].remove("_SqlReads")
     result["mro"].remove("_SqlPause")
@@ -988,6 +1038,8 @@ async def test_explicit_private_wrapper_and_sanitized_database_failures(cls, nam
         "reads-file",
         "events-owner",
         "events-file",
+        "claims-owner",
+        "claims-file",
         "unlisted-file",
         "wrapper-count",
         "wrapper-order",
@@ -1037,6 +1089,10 @@ def test_proposed_exact_write_relocation_still_refuses_unplanned_snapshot_change
         raw["members"]["_insert_event"]["owner"] = "SQLStateStore"
     elif change == "events-file":
         raw["members"]["save_run_event"]["layers"][-1] = ("_other.py", "save_run_event")
+    elif change == "claims-owner":
+        raw["members"]["_cancel_claim_release"]["owner"] = "SQLStateStore"
+    elif change == "claims-file":
+        raw["members"]["release_run_claim"]["layers"][-1] = ("_other.py", "release_run_claim")
     elif change == "unlisted-file":
         raw["members"]["_insert"]["layers"][-1] = ("_sql_writes.py", "_insert")
     elif change == "wrapper-count":
