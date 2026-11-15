@@ -4,6 +4,10 @@ Runs on the backend matrix (in-memory SQLite, Postgres). Each round starts 16
 ``create_run`` calls, cancels every one twice 10 ms apart while they are touching
 the database, and requires every task to finish within a bound well above the
 post-cancel close wait (``CLOSE_AFTER_CANCEL_S``).
+
+This is a no-regression guard, not proof of the bounded close: it also passes on
+the code before that change, because these backends did not reproduce the hang.
+The bound itself is proven in ``tests/unit/test_single_connection_pool_close_bound.py``.
 """
 
 from __future__ import annotations
