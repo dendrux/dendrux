@@ -76,6 +76,7 @@ EXPECTED_MRO = {
         "_SqlRuns",
         "_SqlManaged",
         "_SqlTree",
+        "_SqlPause",
         "_SqlLifecycle",
         "_SqlEvidence",
         "_SqlWrites",
@@ -90,6 +91,7 @@ EXPECTED_MRO = {
         "_SqlRuns",
         "_SqlManaged",
         "_SqlTree",
+        "_SqlPause",
         "_SqlLifecycle",
         "_SqlEvidence",
         "_SqlWrites",
@@ -104,6 +106,7 @@ EXPECTED_MRO = {
         "_SqlRuns",
         "_SqlManaged",
         "_SqlTree",
+        "_SqlPause",
         "_SqlLifecycle",
         "_SqlEvidence",
         "_SqlWrites",
@@ -118,6 +121,7 @@ EXPECTED_MRO = {
         "_SqlRuns",
         "_SqlManaged",
         "_SqlTree",
+        "_SqlPause",
         "_SqlLifecycle",
         "_SqlEvidence",
         "_SqlWrites",
@@ -529,6 +533,61 @@ LIFECYCLE_RELOCATIONS = {
 }
 
 
+PAUSE_RELOCATIONS = {
+    "MySQLStateStore": {
+        "_read_pause_summary": ("SQLStateStore", "_SqlPause", "base.py", "_sql_pause.py"),
+        "get_active_pause_sequence": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_pause.py"),
+        "get_approval_params": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_pause.py"),
+        "get_pause_state": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_pause.py"),
+        "get_pause_summary": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_pause.py"),
+        "get_pending_pause_summary": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_pause.py"),
+        "pause_run": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_pause.py"),
+        "pause_summary_query": ("SQLStateStore", "_SqlPause", "base.py", "_sql_pause.py"),
+        "pause_with_event": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_pause.py"),
+        "request_pause": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_pause.py"),
+        "try_pause_run": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_pause.py"),
+    },
+    "PostgresStateStore": {
+        "_read_pause_summary": ("SQLStateStore", "_SqlPause", "base.py", "_sql_pause.py"),
+        "get_active_pause_sequence": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_pause.py"),
+        "get_approval_params": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_pause.py"),
+        "get_pause_state": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_pause.py"),
+        "get_pause_summary": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_pause.py"),
+        "get_pending_pause_summary": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_pause.py"),
+        "pause_run": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_pause.py"),
+        "pause_with_event": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_pause.py"),
+        "request_pause": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_pause.py"),
+        "try_pause_run": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_pause.py"),
+    },
+    "SQLStateStore": {
+        "_read_pause_summary": ("SQLStateStore", "_SqlPause", "base.py", "_sql_pause.py"),
+        "get_active_pause_sequence": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_pause.py"),
+        "get_approval_params": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_pause.py"),
+        "get_pause_state": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_pause.py"),
+        "get_pause_summary": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_pause.py"),
+        "get_pending_pause_summary": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_pause.py"),
+        "pause_run": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_pause.py"),
+        "pause_summary_query": ("SQLStateStore", "_SqlPause", "base.py", "_sql_pause.py"),
+        "pause_with_event": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_pause.py"),
+        "request_pause": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_pause.py"),
+        "try_pause_run": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_pause.py"),
+    },
+    "SQLiteStateStore": {
+        "_read_pause_summary": ("SQLStateStore", "_SqlPause", "base.py", "_sql_pause.py"),
+        "get_active_pause_sequence": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_pause.py"),
+        "get_approval_params": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_pause.py"),
+        "get_pause_state": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_pause.py"),
+        "get_pause_summary": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_pause.py"),
+        "get_pending_pause_summary": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_pause.py"),
+        "pause_run": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_pause.py"),
+        "pause_summary_query": ("SQLStateStore", "_SqlPause", "base.py", "_sql_pause.py"),
+        "pause_with_event": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_pause.py"),
+        "request_pause": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_pause.py"),
+        "try_pause_run": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_pause.py"),
+    },
+}
+
+
 def _canonical_writes_snapshot(snapshot, cls):
     import copy
 
@@ -582,6 +641,14 @@ def _canonical_writes_snapshot(snapshot, cls):
         assert member["layers"][-1] == (new_file, name), name
         member["owner"] = old_owner
         member["layers"][-1] = (old_file, name)
+    for name, (old_owner, new_owner, old_file, new_file) in PAUSE_RELOCATIONS[cls.__name__].items():
+        assert name in result["members"]
+        member = result["members"][name]
+        assert member["owner"] == new_owner, name
+        assert member["layers"][-1] == (new_file, name), name
+        member["owner"] = old_owner
+        member["layers"][-1] = (old_file, name)
+    result["mro"].remove("_SqlPause")
     result["mro"].remove("_SqlLifecycle")
     result["mro"].remove("_SqlTree")
     result["mro"].remove("_SqlManaged")

@@ -35,6 +35,7 @@ def test_status_writer_inventory():
             inspect.getmodule(sql_base.SQLStateStore.create_run),
             inspect.getmodule(sql_base.SQLStateStore._bind_admit),
             inspect.getmodule(sql_base.SQLStateStore._cas_finalize),
+            inspect.getmodule(sql_base.SQLStateStore.try_pause_run),
         )
     )
     trees = [ast.parse(inspect.getsource(module)) for module in modules]
