@@ -78,6 +78,7 @@ EXPECTED_MRO = {
         "_SqlTree",
         "_SqlPause",
         "_SqlReads",
+        "_SqlEvents",
         "_SqlLifecycle",
         "_SqlEvidence",
         "_SqlWrites",
@@ -94,6 +95,7 @@ EXPECTED_MRO = {
         "_SqlTree",
         "_SqlPause",
         "_SqlReads",
+        "_SqlEvents",
         "_SqlLifecycle",
         "_SqlEvidence",
         "_SqlWrites",
@@ -110,6 +112,7 @@ EXPECTED_MRO = {
         "_SqlTree",
         "_SqlPause",
         "_SqlReads",
+        "_SqlEvents",
         "_SqlLifecycle",
         "_SqlEvidence",
         "_SqlWrites",
@@ -126,6 +129,7 @@ EXPECTED_MRO = {
         "_SqlTree",
         "_SqlPause",
         "_SqlReads",
+        "_SqlEvents",
         "_SqlLifecycle",
         "_SqlEvidence",
         "_SqlWrites",
@@ -680,6 +684,57 @@ READS_RELOCATIONS = {
 }
 
 
+EVENTS_RELOCATIONS = {
+    "MySQLStateStore": {
+        "_insert_event": ("SQLStateStore", "_SqlEvents", "base.py", "_sql_events.py"),
+        "_refuse_note_insert": ("SQLStateStore", "_SqlEvents", "base.py", "_sql_events.py"),
+        "add_note": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_events.py"),
+        "events_for_runs_query": ("SQLStateStore", "_SqlEvents", "base.py", "_sql_events.py"),
+        "get_events_for_runs": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_events.py"),
+        "get_next_event_sequence": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_events.py"),
+        "get_notes": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_events.py"),
+        "get_run_events": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_events.py"),
+        "mark_notes_delivered": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_events.py"),
+        "save_run_event": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_events.py"),
+    },
+    "PostgresStateStore": {
+        "_insert_event": ("SQLStateStore", "_SqlEvents", "base.py", "_sql_events.py"),
+        "_refuse_note_insert": ("SQLStateStore", "_SqlEvents", "base.py", "_sql_events.py"),
+        "add_note": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_events.py"),
+        "get_events_for_runs": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_events.py"),
+        "get_next_event_sequence": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_events.py"),
+        "get_notes": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_events.py"),
+        "get_run_events": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_events.py"),
+        "mark_notes_delivered": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_events.py"),
+        "save_run_event": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_events.py"),
+    },
+    "SQLStateStore": {
+        "_insert_event": ("SQLStateStore", "_SqlEvents", "base.py", "_sql_events.py"),
+        "_refuse_note_insert": ("SQLStateStore", "_SqlEvents", "base.py", "_sql_events.py"),
+        "add_note": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_events.py"),
+        "events_for_runs_query": ("SQLStateStore", "_SqlEvents", "base.py", "_sql_events.py"),
+        "get_events_for_runs": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_events.py"),
+        "get_next_event_sequence": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_events.py"),
+        "get_notes": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_events.py"),
+        "get_run_events": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_events.py"),
+        "mark_notes_delivered": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_events.py"),
+        "save_run_event": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_events.py"),
+    },
+    "SQLiteStateStore": {
+        "_insert_event": ("SQLStateStore", "_SqlEvents", "base.py", "_sql_events.py"),
+        "_refuse_note_insert": ("SQLStateStore", "_SqlEvents", "base.py", "_sql_events.py"),
+        "add_note": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_events.py"),
+        "events_for_runs_query": ("SQLStateStore", "_SqlEvents", "base.py", "_sql_events.py"),
+        "get_events_for_runs": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_events.py"),
+        "get_next_event_sequence": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_events.py"),
+        "get_notes": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_events.py"),
+        "get_run_events": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_events.py"),
+        "mark_notes_delivered": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_events.py"),
+        "save_run_event": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_events.py"),
+    },
+}
+
+
 def _canonical_writes_snapshot(snapshot, cls):
     import copy
 
@@ -747,6 +802,16 @@ def _canonical_writes_snapshot(snapshot, cls):
         assert member["layers"][-1] == (new_file, name), name
         member["owner"] = old_owner
         member["layers"][-1] = (old_file, name)
+    for name, (old_owner, new_owner, old_file, new_file) in EVENTS_RELOCATIONS[
+        cls.__name__
+    ].items():
+        assert name in result["members"]
+        member = result["members"][name]
+        assert member["owner"] == new_owner, name
+        assert member["layers"][-1] == (new_file, name), name
+        member["owner"] = old_owner
+        member["layers"][-1] = (old_file, name)
+    result["mro"].remove("_SqlEvents")
     result["mro"].remove("_SqlReads")
     result["mro"].remove("_SqlPause")
     result["mro"].remove("_SqlLifecycle")
@@ -921,6 +986,8 @@ async def test_explicit_private_wrapper_and_sanitized_database_failures(cls, nam
         "managed-file",
         "reads-owner",
         "reads-file",
+        "events-owner",
+        "events-file",
         "unlisted-file",
         "wrapper-count",
         "wrapper-order",
@@ -966,6 +1033,10 @@ def test_proposed_exact_write_relocation_still_refuses_unplanned_snapshot_change
         raw["members"]["_apply_run_filters"]["owner"] = "UnplannedOwner"
     elif change == "reads-file":
         raw["members"]["get_trace"]["layers"][-1] = ("_other.py", "get_trace")
+    elif change == "events-owner":
+        raw["members"]["_insert_event"]["owner"] = "SQLStateStore"
+    elif change == "events-file":
+        raw["members"]["save_run_event"]["layers"][-1] = ("_other.py", "save_run_event")
     elif change == "unlisted-file":
         raw["members"]["_insert"]["layers"][-1] = ("_sql_writes.py", "_insert")
     elif change == "wrapper-count":

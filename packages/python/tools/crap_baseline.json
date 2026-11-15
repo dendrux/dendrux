@@ -16903,6 +16903,90 @@
   "crap": 3.0,
   "digest": "d3e36b31ec58"
  },
+ "src/dendrux/runtime/stores/sql/_sql_events.py::_SqlEvents._insert_event": {
+  "complexity": 16,
+  "coverage": 0.9722,
+  "crap": 16.01,
+  "digest": "77ad96bdd7d1"
+ },
+ "src/dendrux/runtime/stores/sql/_sql_events.py::_SqlEvents._insert_event.<locals>.conflict": {
+  "complexity": 1,
+  "coverage": 1.0,
+  "crap": 1.0,
+  "digest": "8da14de2123f"
+ },
+ "src/dendrux/runtime/stores/sql/_sql_events.py::_SqlEvents.add_note": {
+  "complexity": 4,
+  "coverage": 1.0,
+  "crap": 4.0,
+  "digest": "552c4e480dd3"
+ },
+ "src/dendrux/runtime/stores/sql/_sql_events.py::_SqlEvents.add_note.<locals>._attempt": {
+  "complexity": 9,
+  "coverage": 0.9474,
+  "crap": 9.01,
+  "digest": "49dfc452b0a2"
+ },
+ "src/dendrux/runtime/stores/sql/_sql_events.py::_SqlEvents.add_note.<locals>._note_count": {
+  "complexity": 1,
+  "coverage": 1.0,
+  "crap": 1.0,
+  "digest": "89be5e0ba06d"
+ },
+ "src/dendrux/runtime/stores/sql/_sql_events.py::_SqlEvents.events_for_runs_query": {
+  "complexity": 2,
+  "coverage": 1.0,
+  "crap": 2.0,
+  "digest": "ddeaa73ffb9e"
+ },
+ "src/dendrux/runtime/stores/sql/_sql_events.py::_SqlEvents.get_events_for_runs": {
+  "complexity": 2,
+  "coverage": 1.0,
+  "crap": 2.0,
+  "digest": "da0b468ee6c8"
+ },
+ "src/dendrux/runtime/stores/sql/_sql_events.py::_SqlEvents.get_next_event_sequence": {
+  "complexity": 1,
+  "coverage": 1.0,
+  "crap": 1.0,
+  "digest": "77666e223969"
+ },
+ "src/dendrux/runtime/stores/sql/_sql_events.py::_SqlEvents.get_next_event_sequence.<locals>._attempt": {
+  "complexity": 3,
+  "coverage": 1.0,
+  "crap": 3.0,
+  "digest": "760baddbcfa6"
+ },
+ "src/dendrux/runtime/stores/sql/_sql_events.py::_SqlEvents.get_notes": {
+  "complexity": 4,
+  "coverage": 1.0,
+  "crap": 4.0,
+  "digest": "cc7746c6ce94"
+ },
+ "src/dendrux/runtime/stores/sql/_sql_events.py::_SqlEvents.get_run_events": {
+  "complexity": 8,
+  "coverage": 1.0,
+  "crap": 8.0,
+  "digest": "c88dfaacb6bc"
+ },
+ "src/dendrux/runtime/stores/sql/_sql_events.py::_SqlEvents.mark_notes_delivered": {
+  "complexity": 1,
+  "coverage": 1.0,
+  "crap": 1.0,
+  "digest": "0e9f1d4e3154"
+ },
+ "src/dendrux/runtime/stores/sql/_sql_events.py::_SqlEvents.mark_notes_delivered.<locals>._attempt": {
+  "complexity": 3,
+  "coverage": 1.0,
+  "crap": 3.0,
+  "digest": "36c2bd71605f"
+ },
+ "src/dendrux/runtime/stores/sql/_sql_events.py::_SqlEvents.save_run_event": {
+  "complexity": 1,
+  "coverage": 1.0,
+  "crap": 1.0,
+  "digest": "c4743825d2cc"
+ },
  "src/dendrux/runtime/stores/sql/_sql_evidence.py::_SqlEvidence._insert_trace": {
   "complexity": 7,
   "coverage": 0.95,
@@ -17683,23 +17767,6 @@
   "crap": 1.0,
   "digest": "c129439fc2a7"
  },
- "src/dendrux/runtime/stores/sql/base.py::SQLStateStore._insert_event": {
-  "complexity": 16,
-  "coverage": 0.8,
-  "crap": 18.05,
-  "digest": "28e715c88dd4",
-  "waived": {
-   "date": "2026-11-02",
-   "reason": "Owner approved 2026-11-02: re-save from GitHub CI coverage; speed tests stopped counting toward coverage on 2026-11-01",
-   "rule": "worse"
-  }
- },
- "src/dendrux/runtime/stores/sql/base.py::SQLStateStore._insert_event.<locals>.conflict": {
-  "complexity": 1,
-  "coverage": 1.0,
-  "crap": 1.0,
-  "digest": "8da14de2123f"
- },
  "src/dendrux/runtime/stores/sql/base.py::SQLStateStore._native_live_updates": {
   "complexity": 1,
   "coverage": 1.0,
@@ -17741,24 +17808,6 @@
   "coverage": 1.0,
   "crap": 2.0,
   "digest": "70d2842c9091"
- },
- "src/dendrux/runtime/stores/sql/base.py::SQLStateStore.add_note": {
-  "complexity": 4,
-  "coverage": 1.0,
-  "crap": 4.0,
-  "digest": "d93d6c99f0b2"
- },
- "src/dendrux/runtime/stores/sql/base.py::SQLStateStore.add_note.<locals>._attempt": {
-  "complexity": 14,
-  "coverage": 1.0,
-  "crap": 14.0,
-  "digest": "d6811dd658d2"
- },
- "src/dendrux/runtime/stores/sql/base.py::SQLStateStore.add_note.<locals>._note_count": {
-  "complexity": 1,
-  "coverage": 1.0,
-  "crap": 1.0,
-  "digest": "89be5e0ba06d"
  },
  "src/dendrux/runtime/stores/sql/base.py::SQLStateStore.blob_now": {
   "complexity": 1,
@@ -17820,47 +17869,11 @@
   "crap": 1.0,
   "digest": "adb33908fcec"
  },
- "src/dendrux/runtime/stores/sql/base.py::SQLStateStore.events_for_runs_query": {
-  "complexity": 2,
-  "coverage": 1.0,
-  "crap": 2.0,
-  "digest": "ddeaa73ffb9e"
- },
- "src/dendrux/runtime/stores/sql/base.py::SQLStateStore.get_events_for_runs": {
-  "complexity": 2,
-  "coverage": 1.0,
-  "crap": 2.0,
-  "digest": "da0b468ee6c8"
- },
  "src/dendrux/runtime/stores/sql/base.py::SQLStateStore.get_lease_expired": {
   "complexity": 3,
   "coverage": 1.0,
   "crap": 3.0,
   "digest": "d2a4928d7226"
- },
- "src/dendrux/runtime/stores/sql/base.py::SQLStateStore.get_next_event_sequence": {
-  "complexity": 1,
-  "coverage": 1.0,
-  "crap": 1.0,
-  "digest": "77666e223969"
- },
- "src/dendrux/runtime/stores/sql/base.py::SQLStateStore.get_next_event_sequence.<locals>._attempt": {
-  "complexity": 3,
-  "coverage": 1.0,
-  "crap": 3.0,
-  "digest": "760baddbcfa6"
- },
- "src/dendrux/runtime/stores/sql/base.py::SQLStateStore.get_notes": {
-  "complexity": 4,
-  "coverage": 1.0,
-  "crap": 4.0,
-  "digest": "cc7746c6ce94"
- },
- "src/dendrux/runtime/stores/sql/base.py::SQLStateStore.get_run_events": {
-  "complexity": 8,
-  "coverage": 1.0,
-  "crap": 8.0,
-  "digest": "c88dfaacb6bc"
  },
  "src/dendrux/runtime/stores/sql/base.py::SQLStateStore.id_in": {
   "complexity": 1,
@@ -17928,18 +17941,6 @@
   "crap": 2.0,
   "digest": "b682390ad2ed"
  },
- "src/dendrux/runtime/stores/sql/base.py::SQLStateStore.mark_notes_delivered": {
-  "complexity": 1,
-  "coverage": 1.0,
-  "crap": 1.0,
-  "digest": "0e9f1d4e3154"
- },
- "src/dendrux/runtime/stores/sql/base.py::SQLStateStore.mark_notes_delivered.<locals>._attempt": {
-  "complexity": 3,
-  "coverage": 1.0,
-  "crap": 3.0,
-  "digest": "36c2bd71605f"
- },
  "src/dendrux/runtime/stores/sql/base.py::SQLStateStore.metadata_filter_predicate": {
   "complexity": 2,
   "coverage": 1.0,
@@ -17987,12 +17988,6 @@
   "coverage": 1.0,
   "crap": 1.0,
   "digest": "7cb400fdc09e"
- },
- "src/dendrux/runtime/stores/sql/base.py::SQLStateStore.save_run_event": {
-  "complexity": 1,
-  "coverage": 1.0,
-  "crap": 1.0,
-  "digest": "c4743825d2cc"
  },
  "src/dendrux/runtime/stores/sql/base.py::SQLStateStore.serialize_in_tx": {
   "complexity": 1,
