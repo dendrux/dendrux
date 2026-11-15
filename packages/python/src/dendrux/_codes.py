@@ -702,6 +702,14 @@ SHARED_ENGINE_LOOP_CLOSED = Code(
     "A pooled engine belongs to a closed event loop.",
     "Use an engine owned by the current loop.",
 )
+DB_CLOSE_ABANDONED = Code(
+    "db_close_abandoned",
+    logging.WARNING,
+    "store",
+    _BASE_FIELDS | frozenset(["timeout_s"]),
+    "A database close is still running a bounded time after its caller was cancelled.",
+    "Inspect the database driver; the close keeps running in the background.",
+)
 TOOL_ROW_MAY_BE_MISSING = Code(
     "tool_row_may_be_missing",
     logging.WARNING,
@@ -2172,6 +2180,7 @@ REGISTRY = MappingProxyType(
             MIGRATION_LOCK_TIMEOUT,
             MIGRATION_VERSION_TABLE_CONFLICT,
             SHARED_ENGINE_LOOP_CLOSED,
+            DB_CLOSE_ABANDONED,
             TOOL_ROW_MAY_BE_MISSING,
             OUTCOME_UNKNOWN,
             CANCELLED,
