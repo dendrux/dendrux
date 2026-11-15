@@ -76,6 +76,7 @@ EXPECTED_MRO = {
         "_SqlRuns",
         "_SqlManaged",
         "_SqlTree",
+        "_SqlLifecycle",
         "_SqlEvidence",
         "_SqlWrites",
         "_StoreHost",
@@ -89,6 +90,7 @@ EXPECTED_MRO = {
         "_SqlRuns",
         "_SqlManaged",
         "_SqlTree",
+        "_SqlLifecycle",
         "_SqlEvidence",
         "_SqlWrites",
         "_StoreHost",
@@ -102,6 +104,7 @@ EXPECTED_MRO = {
         "_SqlRuns",
         "_SqlManaged",
         "_SqlTree",
+        "_SqlLifecycle",
         "_SqlEvidence",
         "_SqlWrites",
         "_StoreHost",
@@ -115,6 +118,7 @@ EXPECTED_MRO = {
         "_SqlRuns",
         "_SqlManaged",
         "_SqlTree",
+        "_SqlLifecycle",
         "_SqlEvidence",
         "_SqlWrites",
         "_StoreHost",
@@ -442,6 +446,89 @@ TREE_RELOCATIONS = {
 }
 
 
+LIFECYCLE_RELOCATIONS = {
+    "MySQLStateStore": {
+        "_cas_finalize": ("SQLStateStore", "_SqlLifecycle", "base.py", "_sql_lifecycle.py"),
+        "_finalize_error_info": ("SQLStateStore", "_SqlLifecycle", "base.py", "_sql_lifecycle.py"),
+        "_frontier_predicate": ("SQLStateStore", "_SqlLifecycle", "base.py", "_sql_lifecycle.py"),
+        "_frontier_scope": ("SQLStateStore", "_SqlLifecycle", "base.py", "_sql_lifecycle.py"),
+        "finalize_run": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_lifecycle.py"),
+        "finalize_run_if_status_in": (
+            "SQLStateStore",
+            "SQLStateStore",
+            "base.py",
+            "_sql_lifecycle.py",
+        ),
+        "finalize_with_event": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_lifecycle.py"),
+        "get_run_control": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_lifecycle.py"),
+        "is_cancel_requested": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_lifecycle.py"),
+        "mark_cancel_requested": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_lifecycle.py"),
+        "request_cancel": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_lifecycle.py"),
+        "touch_progress": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_lifecycle.py"),
+        "update_run_meta": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_lifecycle.py"),
+    },
+    "PostgresStateStore": {
+        "_cas_finalize": ("SQLStateStore", "_SqlLifecycle", "base.py", "_sql_lifecycle.py"),
+        "_finalize_error_info": ("SQLStateStore", "_SqlLifecycle", "base.py", "_sql_lifecycle.py"),
+        "_frontier_predicate": ("SQLStateStore", "_SqlLifecycle", "base.py", "_sql_lifecycle.py"),
+        "_frontier_scope": ("SQLStateStore", "_SqlLifecycle", "base.py", "_sql_lifecycle.py"),
+        "finalize_run": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_lifecycle.py"),
+        "finalize_run_if_status_in": (
+            "SQLStateStore",
+            "SQLStateStore",
+            "base.py",
+            "_sql_lifecycle.py",
+        ),
+        "finalize_with_event": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_lifecycle.py"),
+        "get_run_control": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_lifecycle.py"),
+        "is_cancel_requested": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_lifecycle.py"),
+        "mark_cancel_requested": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_lifecycle.py"),
+        "request_cancel": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_lifecycle.py"),
+        "touch_progress": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_lifecycle.py"),
+        "update_run_meta": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_lifecycle.py"),
+    },
+    "SQLStateStore": {
+        "_cas_finalize": ("SQLStateStore", "_SqlLifecycle", "base.py", "_sql_lifecycle.py"),
+        "_finalize_error_info": ("SQLStateStore", "_SqlLifecycle", "base.py", "_sql_lifecycle.py"),
+        "_frontier_predicate": ("SQLStateStore", "_SqlLifecycle", "base.py", "_sql_lifecycle.py"),
+        "_frontier_scope": ("SQLStateStore", "_SqlLifecycle", "base.py", "_sql_lifecycle.py"),
+        "finalize_run": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_lifecycle.py"),
+        "finalize_run_if_status_in": (
+            "SQLStateStore",
+            "SQLStateStore",
+            "base.py",
+            "_sql_lifecycle.py",
+        ),
+        "finalize_with_event": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_lifecycle.py"),
+        "get_run_control": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_lifecycle.py"),
+        "is_cancel_requested": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_lifecycle.py"),
+        "mark_cancel_requested": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_lifecycle.py"),
+        "request_cancel": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_lifecycle.py"),
+        "touch_progress": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_lifecycle.py"),
+        "update_run_meta": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_lifecycle.py"),
+    },
+    "SQLiteStateStore": {
+        "_cas_finalize": ("SQLStateStore", "_SqlLifecycle", "base.py", "_sql_lifecycle.py"),
+        "_finalize_error_info": ("SQLStateStore", "_SqlLifecycle", "base.py", "_sql_lifecycle.py"),
+        "_frontier_predicate": ("SQLStateStore", "_SqlLifecycle", "base.py", "_sql_lifecycle.py"),
+        "finalize_run": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_lifecycle.py"),
+        "finalize_run_if_status_in": (
+            "SQLStateStore",
+            "SQLStateStore",
+            "base.py",
+            "_sql_lifecycle.py",
+        ),
+        "finalize_with_event": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_lifecycle.py"),
+        "get_run_control": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_lifecycle.py"),
+        "is_cancel_requested": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_lifecycle.py"),
+        "mark_cancel_requested": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_lifecycle.py"),
+        "request_cancel": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_lifecycle.py"),
+        "touch_progress": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_lifecycle.py"),
+        "update_run_meta": ("SQLStateStore", "SQLStateStore", "base.py", "_sql_lifecycle.py"),
+    },
+}
+
+
 def _canonical_writes_snapshot(snapshot, cls):
     import copy
 
@@ -486,6 +573,16 @@ def _canonical_writes_snapshot(snapshot, cls):
         assert member["layers"][-1] == (new_file, name), name
         member["owner"] = old_owner
         member["layers"][-1] = (old_file, name)
+    for name, (old_owner, new_owner, old_file, new_file) in LIFECYCLE_RELOCATIONS[
+        cls.__name__
+    ].items():
+        assert name in result["members"]
+        member = result["members"][name]
+        assert member["owner"] == new_owner, name
+        assert member["layers"][-1] == (new_file, name), name
+        member["owner"] = old_owner
+        member["layers"][-1] = (old_file, name)
+    result["mro"].remove("_SqlLifecycle")
     result["mro"].remove("_SqlTree")
     result["mro"].remove("_SqlManaged")
     result["mro"].remove("_SqlRuns")
