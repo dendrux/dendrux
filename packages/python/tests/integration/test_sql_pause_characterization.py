@@ -1,11 +1,16 @@
 """Pause generations retain CAS predicates, transaction cuts and bounded reads."""
 
 import pytest
-from sqlalchemy import text, update
+from sqlalchemy import select, text, update
 from sqlalchemy.exc import DBAPIError
 
 import dendrux.runtime.state as state
-from dendrux.db.models import AgentRun
+from dendrux._meta_keys import (
+    ANNOUNCE_MARKS_SESSION_KEY,
+    COMMIT_PROOFS_SESSION_KEY,
+    TOUCHED_RUNS_SESSION_KEY,
+)
+from dendrux.db.models import AgentRun, RunEvent
 from dendrux.errors import PauseStatusMismatchError
 from dendrux.types import UsageStats
 from tests.integration.test_sql_lifecycle_characterization import (
@@ -348,3 +353,101 @@ async def test_summary_propagates_database_fault_outside_json_fallback(
     assert classified == [caught.value] and not original(caught.value)
     assert len(sql) == 1 and sql[0].startswith("SELECT pause_characterization_missing_column")
     _pin(record_property, sql, boundaries, connections, commit=False)
+
+
+async def test_pause_with_event_stamps_the_event_with_the_iteration_count(store, engine):
+    await _seed(store, engine, status="running", cancel_requested=False)
+    await store.pause_with_event(
+        RUN, status="paused", pause_data=PAUSE, iteration_count=4, claim_epoch=7
+    )
+    async with engine.connect() as conn:
+        stamped = (
+            (
+                await conn.execute(
+                    select(RunEvent.iteration_index).where(RunEvent.agent_run_id == RUN)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert stamped == [4]
+
+
+async def test_pause_with_event_without_iteration_count_stamps_zero(store, engine):
+    await _seed(store, engine, status="running", cancel_requested=False)
+    await store.pause_with_event(RUN, status="paused", pause_data=PAUSE)
+    async with engine.connect() as conn:
+        stamped = (
+            (
+                await conn.execute(
+                    select(RunEvent.iteration_index).where(RunEvent.agent_run_id == RUN)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert stamped == [0]
+
+
+async def test_approval_interval_starts_after_the_latest_resume(store, engine):
+    await _seed(store, engine, status="waiting_approval")
+    events = [
+        ("approval.requested", {"call_id": "before-resume", "params": {"x": 0}}),
+        ("run.resumed", {}),
+        ("approval.requested", {"call_id": "after-resume", "params": {"x": 1}}),
+        ("run.paused", {}),
+    ]
+    for kind, data in events:
+        await store.save_run_event(RUN, event_type=kind, data=data)
+    assert await store.get_approval_params(RUN, 3, tenant_id="t1") == {"after-resume": {"x": 1}}
+
+
+async def test_get_pause_state_is_none_for_a_missing_run_and_a_run_without_pause(store, engine):
+    assert await store.get_pause_state(RUN) is None
+    await _seed(store, engine, status="running")
+    assert await store.get_pause_state(RUN) is None
+
+
+@pytest.fixture
+def commit_marks(store, monkeypatch):
+    """Session bookkeeping each pause write holds at the moment it commits."""
+    seen = []
+    original = store._write_tx
+
+    async def commit(session, **kwargs):
+        seen.append(
+            (
+                set(session.info.get(ANNOUNCE_MARKS_SESSION_KEY, ())),
+                set(session.info.get(TOUCHED_RUNS_SESSION_KEY, ())),
+                [expected for *_, expected in session.info.get(COMMIT_PROOFS_SESSION_KEY, ())],
+            )
+        )
+        return await original(session, **kwargs)
+
+    monkeypatch.setattr(store, "_write_tx", commit)
+    return seen
+
+
+@pytest.mark.parametrize(
+    ("operation", "extra", "remembers"),
+    [
+        ("request_pause", {}, False),
+        ("try_pause_run", {"status": "paused", "pause_data": PAUSE}, True),
+        ("pause_with_event", {"status": "paused", "pause_data": PAUSE}, True),
+        ("pause_run", {"status": "paused", "pause_data": PAUSE}, True),
+    ],
+)
+async def test_pause_writes_announce_the_run_and_remember_their_values(
+    store, engine, commit_marks, operation, extra, remembers
+):
+    await _seed(store, engine, status="running", cancel_requested=False)
+    commit_marks.clear()
+    await getattr(store, operation)(RUN, **extra)
+    assert len(commit_marks) == 1
+    announced, touched, proofs = commit_marks[0]
+    assert announced == {RUN}
+    assert touched == ({RUN} if remembers else set())
+    run_proofs = [p for p in proofs if "pause_data" in p]
+    assert [(p["status"], p["pause_data"]) for p in run_proofs] == (
+        [("paused", PAUSE)] if remembers else []
+    )

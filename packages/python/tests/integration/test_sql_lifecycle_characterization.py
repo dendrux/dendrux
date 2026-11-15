@@ -10,8 +10,10 @@ from sqlalchemy import event, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import dendrux.runtime.state as state
+from dendrux._meta_keys import BLOCKED_META_KEY
 from dendrux.db.models import AgentRun, ReactTrace, RunEvent
 from dendrux.errors import RunFencedError
+from dendrux.runtime._blocked_content import _dispatch_write
 from dendrux.runtime.state import EventWrite, TraceWrite
 from tests.integration.test_sql_managed_characterization import _transaction_trace as _sql_trace
 
@@ -397,3 +399,47 @@ async def test_control_reads_keep_one_projected_select(store, engine, record_pro
     else:
         assert result is True and await store.is_cancel_requested("missing") is False
     _pin(record_property, sql, boundaries, connections, commit=False)
+
+
+async def _last_progress(engine):
+    async with AsyncSession(engine) as session:
+        return await session.scalar(select(AgentRun.last_progress_at).where(AgentRun.id == RUN))
+
+
+async def test_touch_progress_is_scoped_by_dispatch_to_an_unblocked_run(store, engine):
+    await _seed(store, engine)
+    async with engine.begin() as conn:
+        await conn.execute(update(AgentRun).where(AgentRun.id == RUN).values(status="running"))
+    with _dispatch_write(store, RUN):
+        assert await store.touch_progress(RUN, claim_epoch=7) is True
+    assert await _last_progress(engine) is not None
+
+
+async def test_touch_progress_in_dispatch_refuses_a_blocked_run_and_leaves_it_untouched(
+    store, engine
+):
+    from dendrux.loops._helpers import _BlockedObservationError
+
+    await _seed(store, engine)
+    async with engine.begin() as conn:
+        await conn.execute(
+            update(AgentRun)
+            .where(AgentRun.id == RUN)
+            .values(status="running", meta={"keep": 1, BLOCKED_META_KEY: True})
+        )
+    before = await _last_progress(engine)
+    with _dispatch_write(store, RUN), pytest.raises(_BlockedObservationError):
+        await store.touch_progress(RUN, claim_epoch=7)
+    assert await _last_progress(engine) == before
+
+
+async def test_touch_progress_outside_dispatch_still_renews_a_blocked_run(store, engine):
+    await _seed(store, engine)
+    async with engine.begin() as conn:
+        await conn.execute(
+            update(AgentRun)
+            .where(AgentRun.id == RUN)
+            .values(status="running", meta={BLOCKED_META_KEY: True})
+        )
+    assert await store.touch_progress(RUN, claim_epoch=7) is True
+    assert await _last_progress(engine) is not None
