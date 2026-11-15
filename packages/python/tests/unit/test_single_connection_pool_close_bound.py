@@ -286,14 +286,15 @@ async def test_later_cancels_do_not_restart_the_bound(short_bound: float) -> Non
     await gate.started.wait()
 
     first = time.monotonic()
-    while not caller.done() and time.monotonic() - first < short_bound * 4:
+    while not caller.done() and time.monotonic() - first < short_bound * 6:
         caller.cancel()
         await asyncio.sleep(short_bound / 4)
     elapsed = time.monotonic() - first
 
-    assert caller.cancelled()
-    # Restarting at each cancel would end a bound after the last one (about 4 bounds).
-    assert elapsed < short_bound * 2.5, f"bound restarted by later cancels: {elapsed:.2f}s"
+    # Restarting at each cancel would keep the caller waiting while cancels keep
+    # coming (6 bounds here); the limit leaves room for a loaded runner.
+    assert caller.cancelled(), "bound restarted by later cancels"
+    assert elapsed < short_bound * 3.5, f"bound restarted by later cancels: {elapsed:.2f}s"
 
 
 async def _swallow_one_cancel() -> None:
@@ -305,6 +306,35 @@ async def _swallow_one_cancel() -> None:
     with contextlib.suppress(asyncio.CancelledError):
         await asyncio.sleep(0)
     assert task.cancelling() == 1
+
+
+async def test_handled_cancel_that_was_uncancelled_does_not_bound_a_slow_close(
+    short_bound: float, caplog: pytest.LogCaptureFixture
+) -> None:
+    gate = _Gate()
+
+    async def caller_that_recovered() -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        task.cancel()
+        try:
+            await asyncio.sleep(0)
+        except asyncio.CancelledError:
+            task.uncancel()  # fully handled: cancelling() is back to 0
+            assert task.cancelling() == 0
+            # Still inside the handler, so a CancelledError is the handled exception.
+            await close_fully(gate.close)
+
+    caller = asyncio.create_task(caller_that_recovered())
+    await gate.started.wait()
+    with caplog.at_level(logging.DEBUG, logger=_GUARD_LOGGER):
+        await asyncio.sleep(short_bound * 3)
+        assert not caller.done(), "an uncancelled caller was abandoned"
+        gate.release.set()
+        await asyncio.wait_for(caller, timeout=FINISH_WITHIN_S)
+
+    assert gate.finished
+    assert not [r for r in caplog.records if getattr(r, "code", None) == "db_close_abandoned"]
 
 
 async def test_stale_cancelling_counter_does_not_bound_a_slow_close(
