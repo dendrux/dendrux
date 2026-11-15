@@ -920,7 +920,6 @@ ProviderErrorCategory: TypeAlias = Literal[
     "unknown",
 ]
 PROVIDER_ERROR_CATEGORIES: tuple[str, ...] = get_args(ProviderErrorCategory)
-
 TimeoutReason: TypeAlias = Literal[
     "connect",
     "call_deadline",
@@ -929,7 +928,6 @@ TimeoutReason: TypeAlias = Literal[
     "deadline_during_backoff",
 ]
 TIMEOUT_REASONS: tuple[str, ...] = get_args(TimeoutReason)
-
 # A provider code is echoed into ``safe_message`` only when it looks like a code.
 _SAFE_PROVIDER_CODE = re.compile(r"^[A-Za-z0-9_.:\-]{1,64}$")
 

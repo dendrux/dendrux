@@ -13,6 +13,7 @@ import dendrux.runtime.state as state
 from dendrux._meta_keys import BLOCKED_META_KEY
 from dendrux.db.models import AgentRun, ReactTrace, RunEvent
 from dendrux.errors import RunFencedError
+from dendrux.loops._helpers import _BlockedObservationError
 from dendrux.runtime._blocked_content import _dispatch_write
 from dendrux.runtime.state import EventWrite, TraceWrite
 from tests.integration.test_sql_managed_characterization import _transaction_trace as _sql_trace
@@ -410,16 +411,15 @@ async def test_touch_progress_is_scoped_by_dispatch_to_an_unblocked_run(store, e
     await _seed(store, engine)
     async with engine.begin() as conn:
         await conn.execute(update(AgentRun).where(AgentRun.id == RUN).values(status="running"))
+    before = await _last_progress(engine)
     with _dispatch_write(store, RUN):
         assert await store.touch_progress(RUN, claim_epoch=7) is True
-    assert await _last_progress(engine) is not None
+    assert await _last_progress(engine) > before
 
 
 async def test_touch_progress_in_dispatch_refuses_a_blocked_run_and_leaves_it_untouched(
     store, engine
 ):
-    from dendrux.loops._helpers import _BlockedObservationError
-
     await _seed(store, engine)
     async with engine.begin() as conn:
         await conn.execute(
@@ -441,5 +441,6 @@ async def test_touch_progress_outside_dispatch_still_renews_a_blocked_run(store,
             .where(AgentRun.id == RUN)
             .values(status="running", meta={BLOCKED_META_KEY: True})
         )
+    before = await _last_progress(engine)
     assert await store.touch_progress(RUN, claim_epoch=7) is True
-    assert await _last_progress(engine) is not None
+    assert await _last_progress(engine) > before
