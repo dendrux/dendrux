@@ -276,6 +276,9 @@ async def close_fully(close: Callable[[], Awaitable[None]]) -> None:
     The cancellation always wins over a close error: a cancellation received here
     is re-raised, and on entry during an unwinding cancellation this returns so
     the in-flight exception carries on. The close error is then dropped unlogged.
+    This also holds inside a handler that caught a converted cancellation and
+    carries on without ``uncancel()``: store calls there still count as unwinding
+    (the 5 s bound applies and close errors are dropped).
     """
     caller = asyncio.current_task()
     unwinding = _cancellation_unwinding(caller)
