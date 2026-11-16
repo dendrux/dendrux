@@ -39,7 +39,7 @@ from dendrux.runtime import _managed_budget, _managed_cancel
 from dendrux.runtime._managed_budget import UNPRICED_ACCEPTED, accepted_count
 from dendrux.runtime._managed_definitions import (
     _check_definitions,
-    _require_react,
+    _require_supported_loop,
 )
 from dendrux.runtime._managed_definitions import (
     require_streamable as require_streamable,
@@ -235,8 +235,8 @@ async def prepare_handoff(
     from dendrux.runtime.context import DelegationDepthExceededError, get_delegation_context
 
     handoff = result.meta[MANAGED_HANDOFF_KEY]
-    # Every bind, live or recovered, admits only a ReAct child (before any effect).
-    _require_react(handoff.parent, handoff.child)
+    # Every bind, live or recovered, admits only a ReAct or SingleCall child (before any effect).
+    _require_supported_loop(handoff.parent, handoff.child)
     if await _managed_cancel.cancellation_requested(store, run_id):
         return None
     header = ManagedHeader.from_dict(

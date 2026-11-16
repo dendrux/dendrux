@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any
 
 from dendrux.errors import SubagentDefinitionError, SubagentTreeTooLargeError
 from dendrux.loops.react import ReActLoop
+from dendrux.loops.single import SingleCall
 from dendrux.runtime import _subagents
 
 if TYPE_CHECKING:
@@ -15,11 +16,15 @@ if TYPE_CHECKING:
 
 
 def _check_definitions(root: Agent, store: Any) -> None:
-    """Every registered child has a provider and shares the root's store object."""
+    """Every registered child has a supported loop, a provider and the root's store object."""
     for parent, child in _definition_edges(root):
-        _require_react(parent, child)
+        _require_supported_loop(parent, child)
         if child.provider is None:
             raise ValueError(f"Subagent '{child.name}' needs a provider.")
+        if child.guardrails and getattr(child, "_output_type", None) is not None:
+            # SingleCall refuses this pair only inside its run, after the bind; refuse it
+            # here so the parent's model cannot retry a call that can never work.
+            raise ValueError(f"Subagent '{child.name}' cannot combine guardrails with output_type.")
         own = getattr(child, "_state_store", None)
         if (own is not None and own is not store) or (
             own is None and getattr(child, "_database_url", None) is not None
@@ -59,10 +64,10 @@ def _definition_edges(root: Agent) -> Iterator[tuple[Agent, Agent]]:
         stack.extend((child, grandchild) for grandchild in child.subagents)
 
 
-def _require_react(parent: Agent, child: Agent) -> None:
-    """Managed participants are durable ReAct runs only (owner 2026-11-12)."""
+def _require_supported_loop(parent: Agent, child: Agent) -> None:
+    """A managed child runs as ReAct or SingleCall (owner 2026-11-15); others are refused."""
     loop = child._effective_loop(None)
-    if loop is not None and not isinstance(loop, ReActLoop):
+    if loop is not None and not isinstance(loop, (ReActLoop, SingleCall)):
         _subagents.refuse(
             SubagentDefinitionError(
                 parent.name, reason="loop_unsupported", subagent_name=child.name

@@ -1476,7 +1476,7 @@ class SubagentDefinitionError(SubagentConfigurationError):
     name is 1 to 64 ASCII letters, digits or underscores and does not start with a
     digit), ``"missing_description"``, ``"single_call_parent"`` (a SingleCall
     agent cannot call tools, so it cannot have subagents) or ``"loop_unsupported"``
-    (raised when a managed run starts: a subagent must run as a ReAct loop).
+    (raised when a managed run starts: a subagent must use ReActLoop or SingleCall).
     """
 
     code: ClassVar[str] = "subagent_invalid"
@@ -1496,8 +1496,8 @@ class SubagentDefinitionError(SubagentConfigurationError):
             "cannot call tools; use ReActLoop."
         ),
         "loop_unsupported": (
-            "Agent '{agent}' subagent '{name}' does not use ReActLoop; managed subagents "
-            "run as durable ReAct runs only."
+            "Agent '{agent}' subagent '{name}' does not use ReActLoop or SingleCall; "
+            "managed subagents run only on those loops."
         ),
     }
 

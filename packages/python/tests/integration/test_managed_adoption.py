@@ -27,10 +27,11 @@ from dendrux.errors import (
     RunFencedError,
     RunNotReclaimableError,
 )
+from dendrux.loops.base import Loop
 from dendrux.runtime import _managed, _reclaim
 from dendrux.runtime.context import get_delegation_context
 from dendrux.runtime.stores._factory import store_for_engine
-from dendrux.types import Limits, LLMResponse, RunStatus, ToolCall
+from dendrux.types import Limits, LLMResponse, RunResult, RunStatus, ToolCall
 from tests._helpers.recovery_checkpoint import expire
 from tests._helpers.scripted_provider import ScriptedLLM
 
@@ -1291,11 +1292,17 @@ async def test_r4b_partial_batch_refusal_refuses_the_rest_on_recovery(
     assert not await rows(engine, AgentRun, AgentRun.parent_run_id == root_id)
 
 
-async def test_r5_recovered_bind_refuses_a_newly_single_call_child(
+class _CustomLoop(Loop):
+    """Neither ReAct nor SingleCall: a managed bind refuses it."""
+
+    async def run(self, *args: Any, run_id: str | None = None, **kwargs: Any) -> RunResult:
+        return RunResult(run_id=run_id or "", status=RunStatus.SUCCESS, answer="done")
+
+
+async def test_r5_recovered_bind_refuses_a_newly_custom_loop_child(
     store: Any, engine: Any, monkeypatch: Any
 ) -> None:
     from dendrux.errors import SubagentDefinitionError
-    from dendrux.loops.single import SingleCall
 
     first = _recovery_root(
         store,
@@ -1307,7 +1314,7 @@ async def test_r5_recovered_bind_refuses_a_newly_single_call_child(
     item = await expire(store, engine, root_id)
     child_llm = ContextLLM([LLMResponse(text=REPORT)])
     changed = Agent(
-        name="reviewer", description="r", prompt="c", provider=child_llm, loop=SingleCall()
+        name="reviewer", description="r", prompt="c", provider=child_llm, loop=_CustomLoop()
     )
     fresh = _recovery_root(store, ContextLLM([]), changed)
     with pytest.raises(SubagentDefinitionError) as info:
@@ -1316,11 +1323,10 @@ async def test_r5_recovered_bind_refuses_a_newly_single_call_child(
     assert not await rows(engine, AgentRun, AgentRun.parent_run_id == root_id)
 
 
-async def test_r5_recovered_descendant_bind_refuses_a_single_call_grandchild(
+async def test_r5_recovered_descendant_bind_refuses_a_custom_loop_grandchild(
     store: Any, engine: Any, monkeypatch: Any
 ) -> None:
     from dendrux.errors import SubagentDefinitionError
-    from dendrux.loops.single import SingleCall
 
     def reviewer(llm: Any, auditor: Agent) -> Agent:
         return Agent(
@@ -1353,7 +1359,7 @@ async def test_r5_recovered_descendant_bind_refuses_a_single_call_grandchild(
     await expire(store, engine, middle.id)
     grandchild_llm = ContextLLM([LLMResponse(text="leaf")])
     changed = Agent(
-        name="auditor", description="a", prompt="c", provider=grandchild_llm, loop=SingleCall()
+        name="auditor", description="a", prompt="c", provider=grandchild_llm, loop=_CustomLoop()
     )
     fresh = _recovery_root(store, ContextLLM([]), reviewer(ContextLLM([]), changed))
     with pytest.raises(SubagentDefinitionError):
