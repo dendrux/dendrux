@@ -630,3 +630,59 @@ async def test_root_cancel_from_another_process_during_the_call_is_never_adopted
     assert root_row.status == "cancelled"
     [intent] = await rows(engine, ToolCallRecord, ToolCallRecord.agent_run_id == row.id)
     assert intent.outcome != "completed", "a cancelled root never adopts the report"
+
+
+# ---------------------------------------------------------------------------
+# Definition drift on a paused leaf (P2-5): ReAct when it paused, SingleCall now
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("entry", ["submit_tool_results", "resume", "resume_stream"])
+async def test_a_paused_react_leaf_now_registered_as_single_call_is_refused_unchanged(
+    store: Any, engine: Any, entry: str
+) -> None:
+    """A SingleCall agent cannot continue a paused run: refused before the leaf's claim."""
+    from dendrux.errors import SubagentDefinitionError
+    from dendrux.types import ToolResult
+    from tests.integration.test_managed_routing import read_sheet
+
+    paused_child = Agent(
+        name="scorer",
+        description="d",
+        prompt="p",
+        provider=ContextLLM([call("read_sheet", {"sheet": "a"}, "s1")]),
+        tools=[read_sheet],
+    )
+    root_llm = ContextLLM([call("scorer", {"task": BRIEF}, "r1")])
+    paused = await lead(store, root_llm, paused_child).run("go", tenant_id=TENANT)
+    assert paused.status == RunStatus.WAITING_CLIENT_TOOL
+    [child] = await rows(engine, AgentRun, AgentRun.parent_run_id == paused.run_id)
+    assert child.loop_state["loop"] == "react"
+    before = await marks(engine, paused.run_id, child.id)
+    child_llm = ContextLLM([LLMResponse(text=REPORT)])
+    drifted = lead(store, ContextLLM([LLMResponse(text="root done")]), scorer(child_llm))
+    report = ToolResult(name="read_sheet", call_id=paused.pending.tool_calls[0].id, payload='"a"')
+    with pytest.raises(SubagentDefinitionError) as refused:
+        if entry == "submit_tool_results":
+            await drifted.submit_tool_results(
+                paused.run_id, [report], tenant_id=TENANT, expected_pause_id=paused.pause_id
+            )
+        elif entry == "resume":
+            await drifted.resume(
+                paused.run_id,
+                tool_results=[report],
+                tenant_id=TENANT,
+                expected_pause_id=paused.pause_id,
+            )
+        else:
+            async with drifted.resume_stream(
+                paused.run_id,
+                tool_results=[report],
+                tenant_id=TENANT,
+                expected_pause_id=paused.pause_id,
+            ) as stream:
+                async for _ in stream:
+                    pass
+    assert (refused.value.reason, refused.value.subagent_name) == ("loop_unsupported", "scorer")
+    assert child_llm.calls == 0
+    assert await marks(engine, paused.run_id, child.id) == before

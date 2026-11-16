@@ -885,6 +885,7 @@ def require_leaf_pause(found: Route, expected_pause_id: str | None) -> None:
     if expected_pause_id is None:
         _codes.log_code(logger, _codes.MANAGED_PAUSE_ID_REQUIRED, run_id=found.root_run_id)
         raise _pause_id_required()
+    _managed_definitions.require_resumable_leaf(found)
 
 
 async def unwind(found: Route, store: Any, result: RunResult, *, notifier: Any) -> RunResult:

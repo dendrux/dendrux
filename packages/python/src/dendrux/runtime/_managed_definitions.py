@@ -72,15 +72,28 @@ def _definition_edges(root: Agent) -> Iterator[tuple[Agent, Agent]]:
         stack.extend((child, grandchild) for grandchild in child.subagents)
 
 
-def _require_supported_loop(parent: Agent, child: Agent) -> None:
-    """A managed child runs as ReAct or SingleCall (owner 2026-11-15); others are refused."""
+def _require_supported_loop(parent: Agent, child: Agent, *, paused: bool = False) -> None:
+    """A managed child runs as ReAct or SingleCall (owner 2026-11-15); others are refused.
+
+    ``paused``: the child continues a paused run, which only ReAct can do.
+    """
     loop = child._effective_loop(None)
-    if loop is not None and not isinstance(loop, (ReActLoop, SingleCall)):
+    allowed = ReActLoop if paused else (ReActLoop, SingleCall)
+    if loop is not None and not isinstance(loop, allowed):
         _subagents.refuse(
             SubagentDefinitionError(
                 parent.name, reason="loop_unsupported", subagent_name=child.name
             )
         )
+
+
+def require_resumable_leaf(found: Any) -> None:
+    """A paused subagent is continued by ReAct only: a SingleCall agent never pauses.
+
+    Refuses a definition that changed loop since the leaf paused, before its claim.
+    """
+    if found.routed and not isinstance(found.leaf_agent._effective_loop(None), ReActLoop):
+        _require_supported_loop(found.waiting[-1].parent_agent, found.leaf_agent, paused=True)
 
 
 def require_claimable(leaf_id: str, saved_loop: str | None) -> None:
