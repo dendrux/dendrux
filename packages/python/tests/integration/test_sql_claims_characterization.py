@@ -79,16 +79,17 @@ def _stable(value):
 @contextmanager
 def _trace(engine, record_property):
     """Capture statements, compiled parameters, transaction boundaries and connections."""
-    statements, parameters, boundaries, connections = [], [], [], set()
+    # Observed connections stay alive: id() is unique only among live objects.
+    statements, parameters, boundaries, connections = [], [], [], {}
 
     def statement(conn, cursor, sql, values, context, many):
-        connections.add(id(conn))
+        connections[id(conn)] = conn
         statements.append(" ".join(sql.split()))
         parameters.append(_stable(context.compiled_parameters))
 
     def boundary(kind):
         def observe(conn):
-            connections.add(id(conn))
+            connections[id(conn)] = conn
             boundaries.append(kind)
 
         return observe

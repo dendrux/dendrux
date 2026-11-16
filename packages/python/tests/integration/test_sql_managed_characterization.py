@@ -16,15 +16,16 @@ from tests.integration.test_managed_bind import bind_request, managed_parent, sn
 
 @contextmanager
 def _transaction_trace(engine):
-    statements, boundaries, connections = [], [], set()
+    # Observed connections stay alive: id() is unique only among live objects.
+    statements, boundaries, connections = [], [], {}
 
     def statement(conn, cursor, sql, parameters, context, many):
-        connections.add(id(conn))
+        connections[id(conn)] = conn
         statements.append(" ".join(sql.split()))
 
     def boundary(kind):
         def observe(conn):
-            connections.add(id(conn))
+            connections[id(conn)] = conn
             boundaries.append(kind)
 
         return observe

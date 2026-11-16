@@ -281,20 +281,24 @@ def _finalised(before, after, run_id, *, status, reason, error):
 
 
 def _observe(store, monkeypatch):
-    """Record each row's CAS, announce and commit, with the session each one used."""
+    """Record each row's CAS, announce and commit, with the session each one used.
+
+    The phases hold the session objects themselves: an ``id()`` is unique only among
+    live objects, and each row's session is closed (and may be freed) before the next.
+    """
     phases = []
     one_rows, announce, commit = store._update_one_rows, store._mark_announce, store._write_tx
 
     async def wrote(session, **kwargs):
-        phases.append(("update", kwargs["pk"], id(session)))
+        phases.append(("update", kwargs["pk"], session))
         return await one_rows(session, **kwargs)
 
     def announced(session, run_ids):
-        phases.append(("announce", tuple(run_ids), id(session)))
+        phases.append(("announce", tuple(run_ids), session))
         return announce(session, run_ids)
 
     async def committed(session, **kwargs):
-        phases.append(("commit", kwargs, id(session)))
+        phases.append(("commit", kwargs, session))
         return await commit(session, **kwargs)
 
     monkeypatch.setattr(store, "_update_one_rows", wrote)
@@ -390,7 +394,8 @@ async def test_stale_sweep_finalises_each_stale_running_category(
     assert clock.pages == [("running", None, 100)]
     assert _logged(caplog) == []
     sessions = _expected_phases(phases, [(run_id, "swept") for run_id in expected])
-    assert len(set(sessions)) == len(sessions)
+    # One session per row: no two rows share a session object.
+    assert all(a is not b for i, a in enumerate(sessions) for b in sessions[i + 1 :])
     shapes, cuts = _expected_io(["page"] + ["swept"] * len(expected))
     assert (_shape(sql), boundaries) == (shapes, cuts)
     page, cas = sql[0], sql[1]
