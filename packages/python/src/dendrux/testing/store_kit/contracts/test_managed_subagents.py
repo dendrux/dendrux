@@ -256,6 +256,20 @@ async def test_managed_bind_publishes_wait_intent_child_and_event(dendrux_kit: K
 
 
 @managed
+async def test_managed_bind_keeps_the_child_loop_marker(dendrux_kit: Kit) -> None:
+    """The child's checkpoint is stored as given: sweep keys on its ``loop`` marker, and a
+    SingleCall child saved as ``react`` would be marked reclaimable and run twice."""
+    store = dendrux_kit.store
+    request = await _parent(dendrux_kit)
+    seeded = {"v": 1, "loop": "single_call", "managed_unpriced_accepted": 2}
+    created = await store.bind_managed_child(replace(request, child_loop_state=seeded))
+    assert created.outcome == "created"
+    saved = await store.get_loop_state(request.child_run_id)
+    assert {k: saved[k] for k in seeded} == seeded
+    assert created.child_claim is not None and created.child_claim.loop_state == saved
+
+
+@managed
 async def test_managed_bind_readback_never_grants_another_token(dendrux_kit: Kit) -> None:
     store = dendrux_kit.store
     request = await _parent(dendrux_kit)
