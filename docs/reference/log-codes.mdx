@@ -162,7 +162,7 @@ Missing or invalid codes remain unset. Category and HTTP status remain independe
 | `legacy_run` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | The run uses a storage format that cannot be reclaimed. | Allow the legacy run to finish or start a new run. |
 | `legacy_run_swept` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | A stale format-1 run is finalised. | Inspect the stopped run; format-1 runs cannot be reclaimed. |
 | `loop_unknown` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | A recovery marker has an unknown loop. | Use a supported recovery loop and inspect worker versions. |
-| `loop_unsupported` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | The saved loop does not support recovery. | Use a supported loop for new recoverable runs. |
+| `loop_unsupported` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | The saved or current loop cannot continue the run (SingleCall never resumes). | For a SingleCall subagent, run sweep() and reclaim the root; else use ReActLoop. |
 | `never_started` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | Sweep finalizes a stale run that never started. | Inspect worker startup and retry with a new run. |
 | `not_running` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | Reclaim targets a run that is no longer running. | Read the current result before retrying recovery. |
 | `pause_format_unsupported` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | A stored pause format is unsupported. | Upgrade every worker before continuing the run. |

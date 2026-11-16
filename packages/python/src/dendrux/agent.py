@@ -1680,11 +1680,11 @@ class Agent:
     ) -> RunResult:
         """Continue a marked ReAct run from its last committed checkpoint.
 
-        Call ``sweep(on_stale="reclaim")`` first. Passing its ``item`` fences
-        this attempt to that exact mark. Omitting tenant scope raises
-        TenantScopeRequiredError. A missing or foreign run raises
-        RunNotFoundError without changing the run.
-        Interrupted non-idempotent tools pause for approval before replay.
+        Call ``sweep(on_stale="reclaim")`` first; its ``item`` fences this attempt to
+        that exact mark. Omitted tenant scope raises TenantScopeRequiredError; a missing
+        or foreign run raises RunNotFoundError unchanged. Interrupted non-idempotent
+        tools pause for approval before replay. A running SingleCall subagent refuses
+        with ``loop_unsupported``: run ``sweep()``, then reclaim the root again.
         """
         from dendrux.runtime._reclaim import reclaim
 

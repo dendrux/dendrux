@@ -686,3 +686,24 @@ async def test_a_paused_react_leaf_now_registered_as_single_call_is_refused_unch
     assert (refused.value.reason, refused.value.subagent_name) == ("loop_unsupported", "scorer")
     assert child_llm.calls == 0
     assert await marks(engine, paused.run_id, child.id) == before
+
+
+async def test_a_root_pause_request_during_the_child_call_is_lost(store: Any, engine: Any) -> None:
+    """Known limit (Q1, documented): the request lands on the running SingleCall leaf,
+    which never pauses and clears it on finish; the parent then continues."""
+    child_llm = ContextLLM([LLMResponse(text=REPORT)], gate_at=0)
+    root_llm = ContextLLM([call("scorer", {"task": BRIEF}, "r1"), LLMResponse(text="root done")])
+    root = lead(store, root_llm, scorer(child_llm))
+    owner = asyncio.create_task(root.run("go", tenant_id=TENANT))
+    await wait_for_gate(child_llm.entered, task=owner)
+    [row] = await rows(engine, AgentRun, AgentRun.agent_name == "lead")
+    [child] = await rows(engine, AgentRun, AgentRun.parent_run_id == row.id)
+    try:
+        outcome = await root.request_pause(row.id, tenant_id=TENANT)
+    finally:
+        child_llm.gate.set()
+    assert (child.id, "requested") in outcome.affected
+    result = await asyncio.wait_for(owner, 30)
+    assert result.status == RunStatus.SUCCESS and result.answer == "root done"
+    [after] = await rows(engine, AgentRun, AgentRun.id == child.id)
+    assert after.status == "success" and not after.pause_requested

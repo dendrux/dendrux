@@ -91,6 +91,48 @@ The root is depth zero. The default `max_delegation_depth` is 10. Set it on the 
 
 More than 10 direct children logs a warning. You can register at most 256 subagent definitions below one root. An Agent used in two places counts twice.
 
+## SingleCall subagents
+
+A child can use `loop=SingleCall()`. It makes exactly one model call and never pauses, so it has no tools and no subagents of its own. Its answer is the report the parent sees. A parent must use ReAct; a `SingleCall` agent with subagents raises `SubagentDefinitionError(reason="single_call_parent")`.
+
+With `output_type=`, the report is the validated value as compact JSON. Use `run()` for such a workflow; streaming refuses a child with `output_type`. A value that fails validation fails the child, and the parent sees `managed_child_failed`. A child that sets both `guardrails` and `output_type` is refused with `ValueError` when the root run starts, before anything is written.
+
+### An interrupted SingleCall child fails
+
+Dendrux never runs a `SingleCall` child's call twice. If the process dies during the call, the child stays `running` until you call `sweep()`. The sweep finalizes it as `error` with `failure_reason="stale_running"`, or `"never_started"` if it died before it started. This happens with every `on_stale` setting, and the child is never listed in `reclaimable`. A provider error fails the child too.
+
+The parent sees an ordinary failed tool result with code `managed_child_failed`, the same code as a model or provider error. Read the child run's `failure_reason` to tell a crash from a model error. The parent's model may choose to delegate again; that starts a new child run.
+
+`SweptRun` names the child, not the root. Walk `parent_run_id` up to the root and reclaim the root, which adopts the failure and continues the parent:
+
+[//]: # "docs-test: skip - exercised by test_guide_subagents.py with a crashed SingleCall child on SQLite"
+
+```python
+from datetime import timedelta
+
+from dendrux import sweep
+
+swept = await sweep(
+    database_url=database_url, stale_running=timedelta(minutes=5), on_stale="reclaim"
+)
+async with RunStore.from_database_url(database_url) as runs:
+    for item in swept.stale_running:
+        run = await runs.get_run(item.run_id)
+        while run is not None and run.parent_run_id is not None:
+            run = await runs.get_run(run.parent_run_id)  # bounded by the delegation depth
+        if run is not None and run.run_id != item.run_id and run.agent_name == lead.name:
+            await lead.reclaim(run.run_id, tenant_id=run.tenant_id)
+```
+
+A token-less `resume` on the root adopts the failure the same way. Before the sweep, `reclaim` on the root raises `RunNotReclaimableError(reason="loop_unsupported")` with the child's run id: it means "run `sweep()` first, then reclaim the root again", not that the workflow is lost. Submit and token-bearing resume calls raise `RunNotPausedError` while the child is running.
+
+### Known limits
+
+- A sweep cannot tell a dead process from a live one that lost its database connection. If a child's call is cut off from the database, the sweep fails the child and its writes are fenced. The call itself can still complete and be billed by the provider, but its usage is never recorded, so the root budget can undercount by that one call. The same applies to a ReAct child's in-flight call. Keep `stale_running` well above the lease interval.
+- A root `request_pause` sent while a `SingleCall` child's call is in flight has no effect: the child finishes and clears the request, and the parent continues. `PauseOutcome.affected` still lists the child as `requested`. Cancel instead, or request the pause again. A ReAct child's final model call has the same gap.
+- The child's call counts toward the root budget. The child's own `budget.*` events are advisory (`action="warn"`); the parent enforces the root budget at its next checkpoint, after it adopts the report. The overshoot is at most the child's one run, which can be two provider attempts when an image retry fires.
+- Cancelling the root while the child's call is in flight is cooperative, even in the process that owns the run: the call finishes, its report is not adopted, and the root ends cancelled. Cancelling the task that awaits `run()` interrupts the call instead; the child ends `cancelled`, and the root later adopts `managed_child_cancelled`.
+
 ## Answer a child pause through the root
 
 Approval, client-tool, human-input and requested pauses inside a child surface on the root. The result keeps the root's `run_id` and reports the child's waiting status. For example, an approval returns `waiting_approval`, not the parent's internal managed wait.
@@ -163,7 +205,7 @@ A call-level `notifier=` also receives child callbacks with each child's `run_id
 
 ## Current limits
 
-- Managed parents and children must use ReAct. `SingleCall` children are refused before execution.
-- Streaming refuses registered subagents with guardrails or `output_type`. Use `run()` for a workflow with child guardrails. `output_type` requires `SingleCall`, which is also refused for managed children.
+- Managed parents must use ReAct. Children use ReAct or `SingleCall`; any other loop is refused with `SubagentDefinitionError(reason="loop_unsupported")` before execution. A paused child continues only on ReAct, so re-registering it as `SingleCall` while it waits is refused the same way.
+- Streaming refuses registered subagents with guardrails or `output_type`. Use `run()` for a workflow with child guardrails or a structured `SingleCall` child.
 - `retry` on an Agent with managed subagents is refused. Continue paused work through the root's resume or submit methods.
 - Parallel branches, background children and follow-up conversations with an existing child are not supported.
