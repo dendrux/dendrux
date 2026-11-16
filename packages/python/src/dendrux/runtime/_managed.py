@@ -34,8 +34,8 @@ from typing import TYPE_CHECKING, Any
 
 from dendrux import _codes
 from dendrux._lifecycle import TERMINAL_STATUSES, StoredEventType
-from dendrux.errors import ManagedStateError
-from dendrux.runtime import _managed_budget, _managed_cancel
+from dendrux.errors import ManagedStateError, RunNotFoundError
+from dendrux.runtime import _managed_budget, _managed_cancel, _managed_definitions
 from dendrux.runtime._managed_budget import UNPRICED_ACCEPTED, accepted_count
 from dendrux.runtime._managed_definitions import (
     _check_definitions,
@@ -128,6 +128,7 @@ class _Waiting:
     child_path: tuple[str, ...]
     call: ToolCall
     child_run_id: str
+    child_loop: str | None = None  # the bound child's saved loop marker (restart only)
 
     @property
     def call_id(self) -> str:
@@ -848,7 +849,7 @@ async def route(root_agent: Agent, store: Any, run_id: str, *, tenant_id: Any) -
     is resolved from the registered path in ``root_agent``; a missing path
     refuses before any claim.
     """
-    from dendrux.errors import ManagedChildControlError, RunNotFoundError
+    from dendrux.errors import ManagedChildControlError
     from dendrux.runtime.state import UNSCOPED
 
     record = await store.get_run(run_id)
@@ -1446,12 +1447,12 @@ async def reconnect(
     item: Any,
     notifier: LoopNotifier | None,
 ) -> RunResult:
-    """Continue a managed workflow from its root id after a restart (narrow, T2b).
+    """Continue a managed workflow from its root id after a restart.
 
-    Walks the persisted bindings root to leaf. A terminal child is adopted into
-    its waiting parent without running it again; a running leaf is reclaimed
-    under ordinary lease rules (a live owner is never stolen from). A leaf's
-    external pause is returned as a root view. Full crash and sweep coverage is T4.
+    Walks the persisted bindings root to leaf. A terminal child is adopted into its
+    waiting parent without running it again. A running leaf is reclaimed under lease
+    rules (a live owner is never stolen from); a SingleCall leaf never is, on any
+    store: ``sweep()`` fails it first. A leaf's external pause is a root view.
     """
     from dendrux.runtime import _reclaim
     from dendrux.runtime.runner import _build_cached_result
@@ -1463,6 +1464,7 @@ async def reconnect(
             return await _build_cached_result(store, root_run_id)
         result = await adopt(waiting.pop(), store=store, notifier=notifier)
     elif leaf.status == RunStatus.RUNNING.value:
+        _managed_definitions.require_claimable(leaf.id, waiting[-1].child_loop if waiting else None)
         leaf_agent = waiting[-1].child if waiting else root_agent
         result = await _reclaim.reclaim(
             leaf_agent,
@@ -1486,8 +1488,6 @@ async def walk(root_agent: Agent, store: Any, root_run_id: str) -> tuple[list[_W
     """Follow each v3 wait's exact child id, validating every hop; bounded."""
     record = await store.get_run(root_run_id)
     if record is None:
-        from dendrux.errors import RunNotFoundError
-
         raise RunNotFoundError(root_run_id)
     waiting: list[_Waiting] = []
     agent: Agent = root_agent
@@ -1500,10 +1500,10 @@ async def walk(root_agent: Agent, store: Any, root_run_id: str) -> tuple[list[_W
         if index + 1 == limit:
             break
         binding = wait.managed_wait
-        child, path = await _bound_child(store, record, binding, root_run_id, path)
+        child, path, loop = await _bound_child(store, record, binding, root_run_id, path)
         child_agent = _managed_budget.inherit(_registered(agent, path[-1], record.id), root_agent)
         intent = await _intent_call(store, record.id, binding.tool_call_id, wait.iteration)
-        waiting.append(_Waiting(agent, record.id, child_agent, path, intent, child.id))
+        waiting.append(_Waiting(agent, record.id, child_agent, path, intent, child.id, loop))
         agent, record = child_agent, child
     raise ManagedStateError(reason="binding_conflict", run_id=root_run_id)
 
@@ -1526,15 +1526,14 @@ async def _outgoing(store: Any, record: RunRecord) -> PauseState | None:
 
 async def _bound_child(
     store: Any, parent: RunRecord, binding: Any, root_run_id: str, path: tuple[str, ...]
-) -> tuple[RunRecord, tuple[str, ...]]:
+) -> tuple[RunRecord, tuple[str, ...], Any]:
     child = await store.get_run(binding.child_run_id)
     if child is None:
         raise ManagedStateError(reason="child_missing", run_id=parent.id)
     if child.parent_run_id != parent.id or child.tenant_id != parent.tenant_id:
         raise ManagedStateError(reason="child_mismatch", run_id=parent.id)
-    header = ManagedHeader.from_dict(
-        (await store.get_loop_state(child.id) or {}).get(MANAGED_HEADER_KEY), run_id=child.id
-    )
+    state = await store.get_loop_state(child.id) or {}
+    header = ManagedHeader.from_dict(state.get(MANAGED_HEADER_KEY), run_id=child.id)
     if (
         header.root_run_id != root_run_id
         or header.parent_run_id != parent.id
@@ -1542,7 +1541,7 @@ async def _bound_child(
         or header.path[:-1] != path
     ):
         raise ManagedStateError(reason="child_mismatch", run_id=parent.id)
-    return child, header.path
+    return child, header.path, state.get("loop")
 
 
 async def _intent_call(store: Any, parent_run_id: str, call_id: str, iteration: int) -> ToolCall:

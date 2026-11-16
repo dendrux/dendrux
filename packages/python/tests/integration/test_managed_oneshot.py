@@ -248,7 +248,9 @@ def test_single_call_parent_and_child_budget_stay_refused() -> None:
 
     child = scorer(ContextLLM([]))
     with pytest.raises(SubagentDefinitionError) as info:
-        Agent(name="lead", prompt="p", provider=ContextLLM([]), loop=SingleCall(), subagents=[child])
+        Agent(
+            name="lead", prompt="p", provider=ContextLLM([]), loop=SingleCall(), subagents=[child]
+        )
     assert info.value.reason == "single_call_parent"
     budgeted = scorer(ContextLLM([]), budget=Budget(max_tokens=100))
     with pytest.raises(ValueError, match="child budget"):
@@ -258,11 +260,143 @@ def test_single_call_parent_and_child_budget_stay_refused() -> None:
         )
 
 
-async def test_streaming_a_structured_single_call_child_is_refused(
-    store: Any, engine: Any
-) -> None:
+async def test_streaming_a_structured_single_call_child_is_refused(store: Any, engine: Any) -> None:
     root = lead(store, ContextLLM([]), scorer(ContextLLM([]), output_type=Summary))
     with pytest.raises(ValueError, match="cannot stream subagent 'scorer'"):
         async for _ in root.stream("go", tenant_id=TENANT):
             pass
     assert await rows(engine, AgentRun) == []
+
+
+# ---------------------------------------------------------------------------
+# The pre-claim guard: a running SingleCall run is never claimed, on any store
+# ---------------------------------------------------------------------------
+
+
+class ProcessDeathError(BaseException):
+    """Ends the caller like a killed process: no runner cleanup finalises the run."""
+
+
+class DyingLLM(ContextLLM):
+    async def complete(self, messages: Any, tools: Any = None, **kwargs: Any) -> LLMResponse:
+        self.calls += 1
+        raise ProcessDeathError
+
+
+def claiming_store(store: Any, claims: list[str]) -> Any:
+    """A custom store whose ``reclaim_run`` is a spy that would claim anything it is asked."""
+    from dendrux.runtime.stores._factory import store_for_engine
+
+    base = type(store)
+
+    class ClaimingStore(base):  # type: ignore[misc, valid-type]
+        async def reclaim_run(self, run_id: str, **kwargs: Any) -> Any:
+            claims.append(run_id)
+            return await base.reclaim_run(self, run_id, **kwargs)
+
+    custom = store_for_engine(store._engine)
+    custom.__class__ = ClaimingStore
+    return custom
+
+
+async def dead_single_call_child(store: Any, engine: Any) -> tuple[str, str]:
+    """A root parked on a SingleCall child whose process died during its model call."""
+    root_llm = ContextLLM([call("scorer", {"task": BRIEF}, "r1")])
+    with pytest.raises(ProcessDeathError):
+        await lead(store, root_llm, scorer(DyingLLM([]))).run("go", tenant_id=TENANT)
+    [root] = await rows(engine, AgentRun, AgentRun.agent_name == "lead")
+    [child] = await rows(engine, AgentRun, AgentRun.parent_run_id == root.id)
+    assert (root.status, child.status, child.loop_state["loop"]) == (
+        "paused",
+        "running",
+        "single_call",
+    )
+    return root.id, child.id
+
+
+async def marks(engine: Any, *run_ids: str) -> list[tuple[Any, ...]]:
+    found = []
+    for run_id in run_ids:
+        [row] = await rows(engine, AgentRun, AgentRun.id == run_id)
+        events = await count(engine, RunEvent, RunEvent.agent_run_id == run_id)
+        found.append(
+            (row.status, row.claim_epoch, row.reclaim_attempts, row.lease_expired_at, events)
+        )
+    return found
+
+
+@pytest.mark.parametrize("registered", ["single_call", "react"])
+async def test_root_reclaim_never_claims_a_running_single_call_leaf_on_any_store(
+    store: Any, engine: Any, registered: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The saved ``single_call`` marker refuses before the store is asked, even when the
+    registered child has since become ReAct (definition drift) and the store would claim."""
+    from dendrux.errors import RunNotReclaimableError
+
+    root_id, child_id = await dead_single_call_child(store, engine)
+    before = await marks(engine, root_id, child_id)
+    claims: list[str] = []
+    child_llm = ContextLLM([LLMResponse(text=REPORT)])
+    child = (
+        scorer(child_llm)
+        if registered == "single_call"
+        else Agent(name="scorer", description="d", prompt="p", provider=child_llm)
+    )
+    root = lead(claiming_store(store, claims), ContextLLM([]), child)
+    with pytest.raises(RunNotReclaimableError) as refused:
+        await root.reclaim(root_id, tenant_id=TENANT)
+    assert (refused.value.run_id, refused.value.reason) == (child_id, "loop_unsupported")
+    assert claims == [] and child_llm.calls == 0
+    assert await marks(engine, root_id, child_id) == before
+    assert any(
+        getattr(r, "code", None) == "loop_unsupported" and getattr(r, "run_id", None) == child_id
+        for r in caplog.records
+    )
+
+
+async def test_a_single_call_agent_never_claims_on_any_store(store: Any, engine: Any) -> None:
+    """The agent half (P2-2): a SingleCall agent refuses before ``reclaim_run``, standalone
+    or as a managed leaf whose saved marker says ``react``."""
+    from dendrux.errors import RunNotReclaimableError
+    from tests._helpers.recovery_checkpoint import checkpoint
+
+    claims: list[str] = []
+    custom = claiming_store(store, claims)
+    react = Agent(name="solo", prompt="p", provider=ContextLLM([]), state_store=custom)
+    item = await checkpoint(react, store, engine)
+    before = await marks(engine, item.run_id)
+    llm = ContextLLM([LLMResponse(text=REPORT)])
+    solo = Agent(name="solo", prompt="p", provider=llm, state_store=custom, loop=SingleCall())
+    with pytest.raises(RunNotReclaimableError) as refused:
+        await solo.reclaim(item.run_id, tenant_id="tenant", item=item)
+    assert refused.value.reason == "loop_unsupported"
+    assert claims == [] and llm.calls == 0
+    assert await marks(engine, item.run_id) == before
+
+
+async def test_a_react_leaf_now_registered_as_single_call_is_never_claimed(
+    store: Any, engine: Any
+) -> None:
+    """Definition drift the other way: the saved marker is ``react`` but the registered
+    child is now SingleCall. The agent half refuses through the root before any claim."""
+    from dendrux.errors import RunNotReclaimableError
+    from tests._helpers.recovery_checkpoint import expire
+
+    react_child = Agent(name="scorer", description="d", prompt="p", provider=DyingLLM([]))
+    with pytest.raises(ProcessDeathError):
+        await lead(store, ContextLLM([call("scorer", {"task": BRIEF}, "r1")]), react_child).run(
+            "go", tenant_id=TENANT
+        )
+    [root] = await rows(engine, AgentRun, AgentRun.agent_name == "lead")
+    [child] = await rows(engine, AgentRun, AgentRun.parent_run_id == root.id)
+    assert child.loop_state["loop"] == "react"
+    await expire(store, engine, child.id)
+    before = await marks(engine, root.id, child.id)
+    claims: list[str] = []
+    child_llm = ContextLLM([LLMResponse(text=REPORT)])
+    drifted = lead(claiming_store(store, claims), ContextLLM([]), scorer(child_llm))
+    with pytest.raises(RunNotReclaimableError) as refused:
+        await drifted.reclaim(root.id, tenant_id=TENANT)
+    assert (refused.value.run_id, refused.value.reason) == (child.id, "loop_unsupported")
+    assert claims == [] and child_llm.calls == 0
+    assert await marks(engine, root.id, child.id) == before

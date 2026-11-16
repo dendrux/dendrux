@@ -127,6 +127,8 @@ async def _recovery_claim(
     arguments = _reclaim_arguments(agent, session, tenant_id, item)
     scope = managed_root_reclaim_scope(run_id) if via_root else nullcontext()
     try:
+        if arguments["loop_type"] != "react":  # never claim for a loop that cannot continue
+            raise RunNotReclaimableError(run_id, "loop_unsupported")
         with scope:
             claim = await _ownership_handoff(
                 store,
@@ -157,8 +159,7 @@ async def continue_claimed(
 ) -> RunResult:
     """Continue an owned format-2 run from its checkpoint (managed adoption, 0.7).
 
-    The same continuation reclaim uses after its claim: rebuild from durable
-    history and the checkpoint, never from an old in-memory frame.
+    As reclaim does after its claim: from durable history, never an in-memory frame.
     """
     from dendrux.skills._session import SkillSession
 
@@ -239,8 +240,7 @@ async def _refuse_child_before_claim(store: StateStore, run_id: str, tenant_id: 
 def _refuse_direct_child(run_id: str, state: dict[str, Any] | None) -> None:
     """A managed child is reclaimed only through its root (0.7).
 
-    Checked on the claimed checkpoint so ordinary reclaims add no read; the
-    refused claim runs nothing and the root's reconnect reclaims it later.
+    Checked on the claimed checkpoint (no extra read); the refused claim runs nothing.
     """
     from dendrux.errors import ManagedChildControlError
 
