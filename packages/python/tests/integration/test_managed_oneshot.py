@@ -22,11 +22,24 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from dendrux import Agent
 from dendrux.db.models import AgentRun, RunEvent, TokenUsage, ToolCallRecord
+from dendrux.errors import PersistenceError
 from dendrux.loops.single import SingleCall
 from dendrux.runtime.context import get_delegation_context
+from dendrux.runtime.stores._factory import store_for_engine
 from dendrux.store import RunStore
-from dendrux.types import LLMResponse, ProviderCapabilities, RunStatus, ToolCall, UsageStats
+from dendrux.types import (
+    Budget,
+    LLMResponse,
+    ProviderCapabilities,
+    RunStatus,
+    ToolCall,
+    UsageStats,
+)
+from tests._helpers.gates import wait_for_gate
 from tests._helpers.scripted_provider import ScriptedLLM
+from tests.integration.test_budget import _CostReportingLLM
+from tests.integration.test_managed_budget import response, unknown_response
+from tests.integration.test_managed_recovery import fresh_store
 
 BRIEF = "SENTINEL-oneshot-brief-41c2"
 REPORT = "SENTINEL-oneshot-report-9b07"
@@ -244,7 +257,6 @@ async def test_guardrails_with_output_type_child_is_refused_before_any_write(
 def test_single_call_parent_and_child_budget_stay_refused() -> None:
     from dendrux.errors import SubagentDefinitionError
     from dendrux.runtime import _managed_budget
-    from dendrux.types import Budget
 
     child = scorer(ContextLLM([]))
     with pytest.raises(SubagentDefinitionError) as info:
@@ -285,7 +297,6 @@ class DyingLLM(ContextLLM):
 
 def claiming_store(store: Any, claims: list[str]) -> Any:
     """A custom store whose ``reclaim_run`` is a spy that would claim anything it is asked."""
-    from dendrux.runtime.stores._factory import store_for_engine
 
     base = type(store)
 
@@ -400,3 +411,222 @@ async def test_a_react_leaf_now_registered_as_single_call_is_never_claimed(
     assert (refused.value.run_id, refused.value.reason) == (child.id, "loop_unsupported")
     assert claims == [] and child_llm.calls == 0
     assert await marks(engine, root.id, child.id) == before
+
+
+# ---------------------------------------------------------------------------
+# Root aggregate budget: the child's one call counts toward the root
+# ---------------------------------------------------------------------------
+
+
+def budgeted(store: Any, root_responses: list[Any], child_responses: list[Any], budget: Any) -> Any:
+    child_llm = _CostReportingLLM(child_responses)
+    child = Agent(
+        name="child", description="Worker", prompt="Work", provider=child_llm, loop=SingleCall()
+    )
+    root_llm = _CostReportingLLM(root_responses)
+    root = Agent(
+        name="root",
+        prompt="Lead",
+        provider=root_llm,
+        subagents=[child],
+        state_store=store,
+        budget=budget,
+        strict_tenancy=False,
+    )
+    return root, root_llm, child_llm
+
+
+async def test_root_budget_counts_the_child_and_refuses_admission_when_spent(
+    store: Any,
+) -> None:
+
+    root, root_llm, child_llm = budgeted(
+        store,
+        [response(3, "child"), response()],
+        [response(2)],
+        Budget(max_cost_usd=10, on_exceed="pause"),
+    )
+    result = await root.run("go")
+    assert result.status == RunStatus.SUCCESS and child_llm.calls == 1
+    usage = await store.subtree_usage(result.run_id)
+    assert usage.known_cost_usd == 5 and usage.llm_calls == 3
+
+    spent, spent_llm, spent_child = budgeted(
+        store, [response(10, "child")], [response()], Budget(max_cost_usd=10, on_exceed="pause")
+    )
+    paused = await spent.run("go")
+    assert paused.status == RunStatus.PAUSED and spent_llm.calls == 1
+    assert spent_child.calls == 0, "admission measures the root before the bind"
+    assert len((await store.get_subtree(paused.run_id)).nodes) == 1
+
+
+@pytest.mark.parametrize("on_exceed", ["pause", "cancel"])
+async def test_a_child_call_crossing_the_limit_stops_the_root_at_its_next_checkpoint(
+    store: Any, on_exceed: str
+) -> None:
+    """The child's own budget events are advisory (``warn``); the parent enforces (Q3)."""
+
+    root, root_llm, child_llm = budgeted(
+        store,
+        [response(9, "child"), response()],
+        [response(2)],
+        Budget(max_cost_usd=10, on_exceed=on_exceed),
+    )
+    result = await root.run("go")
+    expected = RunStatus.PAUSED if on_exceed == "pause" else RunStatus.CANCELLED
+    assert result.status == expected and root_llm.calls == 1 and child_llm.calls == 1
+    tree = await store.get_subtree(result.run_id)
+    child = tree.nodes[1].run
+    assert child.status == "success"
+    assert (await store.subtree_usage(result.run_id)).known_cost_usd == 11
+    child_actions = [
+        e.data.get("action")
+        for e in await store.get_run_events(child.id)
+        if e.event_type == "budget.exceeded"
+    ]
+    assert set(child_actions) <= {"warn"}
+    root_exceeded = [
+        e for e in await store.get_run_events(result.run_id) if e.event_type == "budget.exceeded"
+    ]
+    assert root_exceeded
+
+
+@pytest.mark.parametrize("fault", ["unpriced", "unknown", "write"])
+async def test_unpriced_or_unknown_child_usage_stops_an_enforcing_root(
+    store: Any, monkeypatch: pytest.MonkeyPatch, fault: str
+) -> None:
+
+    child_response = {"unpriced": response(None), "unknown": unknown_response()}.get(
+        fault, response()
+    )
+    root, root_llm, child_llm = budgeted(
+        store,
+        [response(1, "child"), response()],
+        [child_response],
+        Budget(max_cost_usd=10, on_exceed="pause"),
+    )
+    if fault == "write":
+        original = store.save_llm_interaction
+
+        async def write(*args: Any, **kwargs: Any) -> Any:
+            ctx = get_delegation_context()
+            if ctx and ctx.delegation_level == 1:
+                raise PersistenceError()
+            return await original(*args, **kwargs)
+
+        monkeypatch.setattr(store, "save_llm_interaction", write)
+    result = await root.run("go")
+    assert result.status == RunStatus.PAUSED and root_llm.calls == 1 and child_llm.calls == 1
+    pause = await store.get_pause_state(result.run_id)
+    if fault == "unpriced":
+        assert pause.get("pause_message") is None
+        assert (await store.subtree_usage(result.run_id)).unpriced_calls == 1
+    else:
+        assert pause["pause_message"] == "managed_usage_unknown"
+
+
+# ---------------------------------------------------------------------------
+# Cancel cascade reaching a SingleCall child
+# ---------------------------------------------------------------------------
+
+
+async def test_root_cancel_before_the_child_call_makes_no_provider_call(
+    store: Any, engine: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from dendrux.runtime import _managed
+
+    original = _managed.bind_child
+
+    async def bind_then_cancel(invocation: Any, *args: Any, **kwargs: Any) -> Any:
+        bound = await original(invocation, *args, **kwargs)
+        await lead(store, ContextLLM([])).cancel_run(invocation.root_run_id, tenant_id=TENANT)
+        return bound
+
+    monkeypatch.setattr(_managed, "bind_child", bind_then_cancel)
+    child_llm = ContextLLM([LLMResponse(text=REPORT)])
+    root_llm = ContextLLM([call("scorer", {"task": BRIEF}, "r1"), LLMResponse(text="root done")])
+    result = await lead(store, root_llm, scorer(child_llm)).run("go", tenant_id=TENANT)
+    assert result.status == RunStatus.CANCELLED
+    [child] = await rows(engine, AgentRun, AgentRun.parent_run_id == result.run_id)
+    assert child.status == "cancelled" and child_llm.calls == 0 and root_llm.calls == 1
+
+
+@pytest.mark.parametrize("entry", ["run", "stream"])
+async def test_root_cancel_during_the_child_call_in_process_is_cooperative(
+    store: Any, engine: Any, entry: str
+) -> None:
+    """``cancel_run`` on the root does not interrupt a subagent's in-flight provider call,
+    even in the owning process (the child's task is not tracked by the root's Agent; the
+    same holds for a ReAct child). The call finishes, adoption refuses under the cancel,
+    and the root ends cancelled without another model call."""
+    child_llm = ContextLLM([LLMResponse(text=REPORT)], gate_at=0)
+    root_llm = ContextLLM([call("scorer", {"task": BRIEF}, "r1"), LLMResponse(text="root done")])
+    root = lead(store, root_llm, scorer(child_llm))
+    owner = asyncio.create_task(drive(root, entry))
+    await wait_for_gate(child_llm.entered, task=owner)
+    [row] = await rows(engine, AgentRun, AgentRun.agent_name == "lead")
+    try:
+        await root.cancel_run(row.id, tenant_id=TENANT)
+        await asyncio.sleep(0.05)
+        assert not owner.done() and not child_llm.cancelled
+    finally:
+        child_llm.gate.set()
+    result = await asyncio.wait_for(owner, 30)
+    assert result.status == RunStatus.CANCELLED and root_llm.calls == 1
+    [child] = await rows(engine, AgentRun, AgentRun.parent_run_id == row.id)
+    assert child.status == "success" and child_llm.calls == 1
+    [intent] = await rows(engine, ToolCallRecord, ToolCallRecord.agent_run_id == row.id)
+    assert intent.outcome != "completed", "a cancelled root never adopts the report"
+
+
+async def test_caller_task_cancel_during_the_child_call_cancels_the_child(
+    store: Any, engine: Any
+) -> None:
+    """A cancelled caller task is not a crash: the child ends ``cancelled`` (as a ReAct
+    child does) and the root later adopts ``managed_child_cancelled``."""
+    child_llm = ContextLLM([LLMResponse(text=REPORT)], gate_at=0)
+    root_llm = ContextLLM([call("scorer", {"task": BRIEF}, "r1")])
+    owner = asyncio.create_task(
+        lead(store, root_llm, scorer(child_llm)).run("go", tenant_id=TENANT)
+    )
+    await wait_for_gate(child_llm.entered, task=owner)
+    owner.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await owner
+    assert child_llm.cancelled
+    [row] = await rows(engine, AgentRun, AgentRun.agent_name == "lead")
+    [child] = await rows(engine, AgentRun, AgentRun.parent_run_id == row.id)
+    assert (row.status, child.status) == ("paused", "cancelled")
+    later_llm = ContextLLM([LLMResponse(text="root done")])
+    again = ContextLLM([])
+    result = await lead(store, later_llm, scorer(again)).resume(row.id, tenant_id=TENANT)
+    assert result.status == RunStatus.SUCCESS and again.calls == 0
+    [observation] = await observed(later_llm, 0)
+    assert json.loads(observation.content)["code"] == "managed_child_cancelled"
+
+
+@pytest.mark.parametrize("engine", ["sqlite_file", "postgres"], indirect=True)
+async def test_root_cancel_from_another_process_during_the_call_is_never_adopted(
+    engine: Any,
+) -> None:
+    """Cooperative: the in-flight call finishes, but adoption refuses under the root's
+    cancel, so the root ends cancelled and the parent's model is not called again."""
+
+    child_llm = ContextLLM([LLMResponse(text=REPORT)], gate_at=0)
+    root_llm = ContextLLM([call("scorer", {"task": BRIEF}, "r1"), LLMResponse(text="root done")])
+    owner_root = lead(store_for_engine(engine), root_llm, scorer(child_llm))
+    owner = asyncio.create_task(owner_root.run("go", tenant_id=TENANT))
+    await wait_for_gate(child_llm.entered, task=owner)
+    [row] = await rows(engine, AgentRun, AgentRun.agent_name == "lead")
+    try:
+        async with fresh_store(engine) as other:
+            await lead(other, ContextLLM([])).cancel_run(row.id, tenant_id=TENANT)
+    finally:
+        child_llm.gate.set()
+    result = await asyncio.wait_for(owner, 30)
+    assert result.status == RunStatus.CANCELLED and root_llm.calls == 1
+    assert child_llm.calls == 1 and not child_llm.cancelled
+    [root_row] = await rows(engine, AgentRun, AgentRun.id == row.id)
+    assert root_row.status == "cancelled"
+    [intent] = await rows(engine, ToolCallRecord, ToolCallRecord.agent_run_id == row.id)
+    assert intent.outcome != "completed", "a cancelled root never adopts the report"
