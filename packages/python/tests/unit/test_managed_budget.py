@@ -327,11 +327,21 @@ def test_child_seed_copies_checkpoint_and_max_merges_valid_counts(parent, saved,
     assert seeded is not state and state[UNPRICED_ACCEPTED] == saved
 
 
-@pytest.mark.parametrize("state", [None, {}])
-def test_child_seed_preserves_default_loop_header(state):
+@pytest.mark.parametrize("loop", ["react", "single_call"])
+def test_child_seed_keeps_the_saved_loop_marker(loop):
     from dendrux.runtime._managed_budget import UNPRICED_ACCEPTED, child_state
 
-    assert child_state(state, 3) == {"v": 1, "loop": "react", UNPRICED_ACCEPTED: 3}
+    assert child_state({"v": 1, "loop": loop}, 3) == {"v": 1, "loop": loop, UNPRICED_ACCEPTED: 3}
+
+
+@pytest.mark.parametrize("state", [None, {}, {"v": 1, "loop": "custom"}])
+def test_child_seed_never_defaults_a_missing_loop_marker_to_react(state):
+    """P2-3: sweep keys on the saved marker; a defaulted ``react`` would make a
+    non-ReAct child reclaimable. Unreachable through definitions, so internal."""
+    from dendrux.runtime._managed_budget import child_state
+
+    with pytest.raises(RuntimeError, match="loop marker"):
+        child_state(state, 3)
 
 
 @pytest.mark.parametrize("action,reason", [("pause", "unpriced_call"), ("warn", None)])
