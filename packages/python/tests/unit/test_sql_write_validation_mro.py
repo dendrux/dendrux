@@ -152,14 +152,14 @@ EXPECTED_MRO = {
     ],
 }
 
-# Member snapshots remain those captured from c2e31697 before changing the
-# decorator. Only the exact MRO above changes for the reviewed host insertion.
+# Original member snapshots plus the reviewed _parent_run_query hook: inherited
+# from SQLStateStore on SQLite/Postgres, overridden on MySQL. No other member changed.
 # Readable snapshots are retained in the task evidence, not loaded by this test.
 BASELINE = {
-    "SQLStateStore": (104, "b0a520f53656d915615c5df22df2741a1158048b116abc51c44cf2e4210564c6"),
-    "SQLiteStateStore": (103, "7a9d65aa650e021e7da72054758c63e5f80758c53b1fae6337007fae05471e6a"),
-    "PostgresStateStore": (104, "9b9b3772b9c579d5153306f052def2c3a5b7d3872d39a3633523db2a42325f9f"),
-    "MySQLStateStore": (103, "4c70921e7059ade1a1e505d318889ea43a836ba2aed33e2ca4bc2ee17186de8e"),
+    "SQLStateStore": (104, "cbc48d017b771b4f6ad88c4a9237b5e43652bf833a86d9c133f4fb186cb73f8a"),
+    "SQLiteStateStore": (103, "ecdff91bc8169e0df0e724377b6768354916274e231b00e2f34b003065acf695"),
+    "PostgresStateStore": (104, "19ec2821b54cee9bc7b0b28a88d18fbd3351a8e7619de104935bd032cdca975f"),
+    "MySQLStateStore": (103, "87e8210e771e1fbb60532363c3171d57200b87c4563662e96539b40e84cb92b0"),
 }
 
 
