@@ -194,7 +194,7 @@ class CustomLoop(Loop):
 
 
 async def test_custom_loop_child_is_refused_at_entry(store: Any, engine: Any) -> None:
-    """Managed participants are ReAct or SingleCall only (owner 2026-11-15): refused before
+    """Managed participants are ReAct or SingleCall only: any other loop is refused before
     any write."""
     from dendrux.errors import SubagentDefinitionError
 

@@ -1,4 +1,4 @@
-"""Managed subagents (0.7, B9): a SingleCall child interrupted mid-call ends failed.
+"""Managed subagents (0.7): a SingleCall child interrupted mid-call ends failed.
 
 Phase one runs in a child process that dies with ``os._exit`` at the cut (no cleanup,
 no finally). Phase two is a fresh process view: new Agents, providers and a new engine
@@ -410,7 +410,7 @@ async def test_pg_four_concurrent_root_reclaims_adopt_the_failed_child_once(
 
 
 # ---------------------------------------------------------------------------
-# A live process cut off from the database (P2-4): the documented limit
+# A live process cut off from the database: the documented limit
 # ---------------------------------------------------------------------------
 
 

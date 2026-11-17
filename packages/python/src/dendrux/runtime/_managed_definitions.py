@@ -81,7 +81,7 @@ def require_bindable(parent: Agent, child: Agent) -> None:
 
 
 def _require_supported_loop(parent: Agent, child: Agent, *, paused: bool = False) -> None:
-    """A managed child runs as ReAct or SingleCall (owner 2026-11-15); others are refused.
+    """A managed child runs as ReAct or SingleCall; any other loop is refused.
 
     ``paused``: the child continues a paused run, which only ReAct can do.
     """
@@ -105,7 +105,7 @@ def require_resumable_leaf(found: Any) -> None:
 
 
 def require_claimable(leaf_id: str, saved_loop: str | None) -> None:
-    """A running SingleCall leaf is never claimed, on any store (B9, owner 2026-11-15).
+    """A running SingleCall leaf is never claimed, on any store.
 
     It cannot continue from a checkpoint: ``sweep()`` fails it, then the root's reclaim
     adopts that failure. Refused before the store is asked, so nothing changes; for

@@ -336,7 +336,7 @@ def test_child_seed_keeps_the_saved_loop_marker(loop):
 
 @pytest.mark.parametrize("state", [None, {}, {"v": 1, "loop": "custom"}])
 def test_child_seed_never_defaults_a_missing_loop_marker_to_react(state):
-    """P2-3: sweep keys on the saved marker; a defaulted ``react`` would make a
+    """Sweep keys on the saved marker; a defaulted ``react`` would make a
     non-ReAct child reclaimable. Unreachable through definitions, so internal."""
     from dendrux.runtime._managed_budget import child_state
 

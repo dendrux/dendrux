@@ -1,4 +1,4 @@
-"""Managed subagents (0.7, B9): a SingleCall agent as a managed child.
+"""Managed subagents (0.7): a SingleCall agent as a managed child.
 
 A SingleCall child makes exactly one model call. It succeeds, fails, or (when its
 process dies mid-call) ends failed through ``sweep()`` and is never run again; the
@@ -150,7 +150,7 @@ async def test_single_call_child_report_reaches_the_parent(
     assert result.status == RunStatus.SUCCESS and result.answer == "root done"
     [child] = await rows(engine, AgentRun, AgentRun.parent_run_id == result.run_id)
     assert child.status == "success" and child.delegation_level == 1
-    assert child.loop_state["loop"] == "single_call"  # the marker sweep keys on (P2-3)
+    assert child.loop_state["loop"] == "single_call"  # the marker sweep keys on
     assert child_llm.calls == 1 and child_llm.served == [child.id]
     assert [m.content for m in child_llm.messages[0] if m.role.value == "user"] == [BRIEF]
     [observation] = await observed(root_llm, 1)
@@ -236,7 +236,7 @@ async def test_a_single_call_child_runs_in_the_callers_task(store: Any, engine: 
 async def test_guardrails_with_output_type_child_is_refused_before_any_write(
     store: Any, engine: Any, entry: str
 ) -> None:
-    """P1-2: SingleCall refuses this pair only inside its run (after the bind); the root
+    """SingleCall refuses this pair only inside its run (after the bind); the root
     refuses it at entry instead, so no child row exists and no model is called."""
     from dendrux.guardrails import SecretDetection
 
@@ -258,7 +258,7 @@ async def test_guardrails_with_output_type_child_is_refused_before_any_write(
 async def test_guardrails_with_output_type_child_is_refused_on_a_continuation(
     store: Any, engine: Any, entry: str
 ) -> None:
-    """Review P2-1: the root paused on its own client tool, then the child was
+    """The root paused on its own client tool, then the child was
     re-registered with the pair. The continuation's bind refuses before any child row,
     so the parent's model cannot retry a delegation that can never work."""
     from dendrux.guardrails import SecretDetection
@@ -403,7 +403,7 @@ async def test_root_reclaim_never_claims_a_running_single_call_leaf_on_any_store
 
 
 async def test_a_single_call_agent_never_claims_on_any_store(store: Any, engine: Any) -> None:
-    """The agent half (P2-2): a SingleCall agent refuses before ``reclaim_run``, standalone
+    """The agent half of the guard: a SingleCall agent refuses before ``reclaim_run``, standalone
     or as a managed leaf whose saved marker says ``react``."""
     from dendrux.errors import RunNotReclaimableError
     from tests._helpers.recovery_checkpoint import checkpoint
@@ -501,7 +501,7 @@ async def test_root_budget_counts_the_child_and_refuses_admission_when_spent(
 async def test_a_child_call_crossing_the_limit_stops_the_root_at_its_next_checkpoint(
     store: Any, on_exceed: str
 ) -> None:
-    """The child's own budget events are advisory (``warn``); the parent enforces (Q3)."""
+    """The child's own budget events are advisory (``warn``); the parent enforces."""
 
     root, root_llm, child_llm = budgeted(
         store,
@@ -604,12 +604,14 @@ async def test_root_cancel_during_the_child_call_in_process_is_cooperative(
     [row] = await rows(engine, AgentRun, AgentRun.agent_name == "lead")
     try:
         await root.cancel_run(row.id, tenant_id=TENANT)
-        await asyncio.sleep(0.05)
-        assert not owner.done() and not child_llm.cancelled
+        # A task cancel would already be pending on the owner when cancel_run returns.
+        assert owner.cancelling() == 0
     finally:
         child_llm.gate.set()
     result = await asyncio.wait_for(owner, 30)
     assert result.status == RunStatus.CANCELLED and root_llm.calls == 1
+    # The gated call ran to its end: an interrupt would have cancelled the gate wait.
+    assert not child_llm.cancelled
     [child] = await rows(engine, AgentRun, AgentRun.parent_run_id == row.id)
     assert child.status == "success" and child_llm.calls == 1
     [intent] = await rows(engine, ToolCallRecord, ToolCallRecord.agent_run_id == row.id)
@@ -670,7 +672,7 @@ async def test_root_cancel_from_another_process_during_the_call_is_never_adopted
 
 
 # ---------------------------------------------------------------------------
-# Definition drift on a paused leaf (P2-5): ReAct when it paused, SingleCall now
+# Definition drift on a paused leaf: ReAct when it paused, SingleCall now
 # ---------------------------------------------------------------------------
 
 
@@ -726,7 +728,7 @@ async def test_a_paused_react_leaf_now_registered_as_single_call_is_refused_unch
 
 
 async def test_a_root_pause_request_during_the_child_call_is_lost(store: Any, engine: Any) -> None:
-    """Known limit (Q1, documented): the request lands on the running SingleCall leaf,
+    """Documented known limit: the request lands on the running SingleCall leaf,
     which never pauses and clears it on finish; the parent then continues."""
     child_llm = ContextLLM([LLMResponse(text=REPORT)], gate_at=0)
     root_llm = ContextLLM([call("scorer", {"task": BRIEF}, "r1"), LLMResponse(text="root done")])
