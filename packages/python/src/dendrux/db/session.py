@@ -18,6 +18,7 @@ import logging
 import os
 import threading
 from contextlib import asynccontextmanager
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -170,16 +171,28 @@ async def get_session(engine: AsyncEngine | None = None) -> AsyncGenerator[Async
         factory = sessionmaker(  # type: ignore[call-overload]
             resolved_engine, class_=AsyncSession, expire_on_commit=False
         )
-    # serialized() takes no lock on multi-connection pools. On error the close rolls
-    # back: an explicit rollback() there could wait forever on a connection the driver
-    # stopped after a cancellation, while close_fully bounds that wait.
+    # serialized() takes no lock on multi-connection pools. On an error, the ORM
+    # rollback and the close run as one cleanup through close_fully, so a rollback
+    # stuck in the driver shares the close's bounded wait once the caller is cancelled.
     async with serialized(resolved_engine):
         session = factory()
+        cleanup = session.close
         try:
             yield session
             await session.commit()
+        except Exception:
+            cleanup = partial(_rollback_then_close, session)
+            raise
         finally:
-            await close_fully(session.close)
+            await close_fully(cleanup)
+
+
+async def _rollback_then_close(session: AsyncSession) -> None:
+    """Restore ORM state (and fire the rollback events), then close the session once."""
+    try:
+        await session.rollback()
+    finally:
+        await session.close()
 
 
 def _resolve_database_url(url: str | None) -> str:

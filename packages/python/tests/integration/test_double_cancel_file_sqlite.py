@@ -23,7 +23,8 @@ of its way rather than asserting on:
   lock for a while, so new writes are not asserted here.
 - The driver's own close tasks can need two cancellations, and ``dispose()`` can
   hang on a pooled connection the driver already stopped, so teardown bounds
-  dispose and cancels what is left until it is gone and the event loop can close.
+  dispose, cancels the tasks the test started (up to three rounds) and fails if
+  any is still pending.
 """
 
 from __future__ import annotations
@@ -54,6 +55,7 @@ BUSY_TIMEOUT_S = 1.0
 @pytest.fixture
 async def file_engine(tmp_path, monkeypatch) -> AsyncIterator[AsyncEngine]:
     monkeypatch.setattr(_pool_guard, "CLOSE_AFTER_CANCEL_S", CLOSE_BOUND_S)
+    before = asyncio.all_tasks()
     engine = create_async_engine(
         f"sqlite+aiosqlite:///{tmp_path / 'cancel.db'}",
         connect_args={"check_same_thread": False, "timeout": BUSY_TIMEOUT_S},
@@ -67,19 +69,28 @@ async def file_engine(tmp_path, monkeypatch) -> AsyncIterator[AsyncEngine]:
         # dispose() can hang closing a pooled connection the driver already stopped.
         dispose = asyncio.ensure_future(engine.dispose())
         await asyncio.wait({dispose}, timeout=5)
-        await _cancel_leftover_tasks()
+        left = await _cancel_tasks_started_since(before)
+        if dispose.done() and not dispose.cancelled():
+            dispose.result()
+        assert not left, f"{left} tasks were still pending after teardown"
 
 
-async def _cancel_leftover_tasks() -> None:
-    """Cancel abandoned closes (and a stuck dispose) until none is left."""
+async def _cancel_tasks_started_since(before: set[asyncio.Task[object]]) -> int:
+    """Cancel tasks this fixture's test started (abandoned closes, a stuck dispose).
+
+    Returns how many are still pending after three cancel rounds.
+    """
     current = asyncio.current_task()
+    left: list[asyncio.Task[object]] = []
     for _ in range(3):
-        left = [task for task in asyncio.all_tasks() if task is not current]
+        left = [t for t in asyncio.all_tasks() if t is not current and t not in before]
         if not left:
-            return
+            return 0
         for task in left:
             task.cancel()
-        await asyncio.wait(left, timeout=5)
+        _, pending = await asyncio.wait(left, timeout=5)
+        left = list(pending)
+    return len(left)
 
 
 async def _stuck_after_double_cancels(write: Callable[[int, int], Awaitable[object]]) -> int:
