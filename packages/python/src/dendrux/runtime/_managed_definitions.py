@@ -26,13 +26,9 @@ logger = logging.getLogger(__name__)
 def _check_definitions(root: Agent, store: Any) -> None:
     """Every registered child has a supported loop, a provider and the root's store object."""
     for parent, child in _definition_edges(root):
-        _require_supported_loop(parent, child)
+        require_bindable(parent, child)
         if child.provider is None:
             raise ValueError(f"Subagent '{child.name}' needs a provider.")
-        if child.guardrails and getattr(child, "_output_type", None) is not None:
-            # SingleCall refuses this pair only inside its run, after the bind; refuse it
-            # here so the parent's model cannot retry a call that can never work.
-            raise ValueError(f"Subagent '{child.name}' cannot combine guardrails with output_type.")
         own = getattr(child, "_state_store", None)
         if (own is not None and own is not store) or (
             own is None and getattr(child, "_database_url", None) is not None
@@ -70,6 +66,18 @@ def _definition_edges(root: Agent) -> Iterator[tuple[Agent, Agent]]:
                 )
             )
         stack.extend((child, grandchild) for grandchild in child.subagents)
+
+
+def require_bindable(parent: Agent, child: Agent) -> None:
+    """A child may be bound: a supported loop, and not guardrails with output_type.
+
+    Checked at root entry and again at every bind, live or recovered (resume, submit,
+    reclaim), before any write. SingleCall refuses the pair only inside its run, after
+    the bind, so the parent's model could otherwise retry a call that can never work.
+    """
+    _require_supported_loop(parent, child)
+    if child.guardrails and getattr(child, "_output_type", None) is not None:
+        raise ValueError(f"Subagent '{child.name}' cannot combine guardrails with output_type.")
 
 
 def _require_supported_loop(parent: Agent, child: Agent, *, paused: bool = False) -> None:

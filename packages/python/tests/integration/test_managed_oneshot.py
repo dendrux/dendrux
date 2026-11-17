@@ -254,6 +254,43 @@ async def test_guardrails_with_output_type_child_is_refused_before_any_write(
     assert await rows(engine, AgentRun) == []
 
 
+@pytest.mark.parametrize("entry", ["submit_tool_results", "resume"])
+async def test_guardrails_with_output_type_child_is_refused_on_a_continuation(
+    store: Any, engine: Any, entry: str
+) -> None:
+    """Review P2-1: the root paused on its own client tool, then the child was
+    re-registered with the pair. The continuation's bind refuses before any child row,
+    so the parent's model cannot retry a delegation that can never work."""
+    from dendrux.guardrails import SecretDetection
+    from dendrux.types import ToolResult
+    from tests.integration.test_managed_routing import read_sheet
+
+    first = ContextLLM([call("read_sheet", {"sheet": "a"}, "s1")])
+    paused = await lead(store, first, scorer(ContextLLM([])), tools=[read_sheet]).run(
+        "go", tenant_id=TENANT
+    )
+    assert paused.status == RunStatus.WAITING_CLIENT_TOOL
+    child_llm = ContextLLM([LLMResponse(text='{"verdict": "ok", "score": 3}')])
+    root_llm = ContextLLM([call("scorer", {"task": BRIEF}, "r1"), LLMResponse(text="root done")])
+    child = scorer(child_llm, output_type=Summary, guardrails=[SecretDetection(action="block")])
+    changed = lead(store, root_llm, child, tools=[read_sheet])
+    report = ToolResult(name="read_sheet", call_id=paused.pending.tool_calls[0].id, payload='"a"')
+    with pytest.raises(ValueError, match="cannot combine guardrails with output_type"):
+        if entry == "submit_tool_results":
+            await changed.submit_tool_results(
+                paused.run_id, [report], tenant_id=TENANT, expected_pause_id=paused.pause_id
+            )
+        else:
+            await changed.resume(
+                paused.run_id,
+                tool_results=[report],
+                tenant_id=TENANT,
+                expected_pause_id=paused.pause_id,
+            )
+    assert root_llm.calls == 1 and child_llm.calls == 0
+    assert await rows(engine, AgentRun, AgentRun.parent_run_id == paused.run_id) == []
+
+
 def test_single_call_parent_and_child_budget_stay_refused() -> None:
     from dendrux.errors import SubagentDefinitionError
     from dendrux.runtime import _managed_budget
