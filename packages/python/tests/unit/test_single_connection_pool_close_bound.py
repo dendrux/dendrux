@@ -175,17 +175,40 @@ async def test_real_aiosqlite_close_after_stop_no_longer_traps_the_caller(
 
 
 def _close_errors_surfaced(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    """Records that carry the close's own error: its text, or asyncio's report of it.
+
+    Only the close's error counts. asyncio's "never retrieved" report for the close
+    names its coroutine and repeats the error (with the sentinel); a report about
+    another test's leftover future is not this code's leak.
+    """
     return [
         r
         for r in caplog.records
-        if "never retrieved" in r.getMessage()
-        or SENTINEL in r.getMessage()
+        if SENTINEL in r.getMessage()
         or SENTINEL in repr(r.__dict__)
+        or ("never retrieved" in r.getMessage() and "_Gate.close" in r.getMessage())
     ]
 
 
+class _ForeignGarbage:
+    """An unrelated failed future that only the cycle collector can free."""
+
+    def __init__(self) -> None:
+        self.future = asyncio.get_running_loop().create_future()
+        self.future.set_exception(ConnectionError("unexpected connection_lost() call"))
+        self.cycle = self
+
+
 async def _collect(gate: _Gate) -> None:
-    """Collect the finished close task, as asyncio does when nothing references it."""
+    """Collect the finished close task, as asyncio does when nothing references it.
+
+    The collection also frees unrelated garbage. In a shared xdist worker an earlier
+    test can leave a failed future in a reference cycle (CI saw asyncpg's TLS probe
+    future, ``ConnectionError('unexpected connection_lost() call')``); asyncio then
+    logs "Future exception was never retrieved" here. Plant one so the leak scan
+    must tell that apart from the close's own error.
+    """
+    _ForeignGarbage()
     await _settle()
     gc.collect()
     await _settle()
