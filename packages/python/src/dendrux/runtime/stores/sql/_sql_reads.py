@@ -679,7 +679,7 @@ class _SqlReads(_StoreHost):
         if agent_name is not None:
             stmt = stmt.where(AgentRun.agent_name == agent_name)
         if parent_run_id is not None:
-            stmt = stmt.where(AgentRun.parent_run_id == parent_run_id)
+            stmt = self._parent_run_query(stmt.where(AgentRun.parent_run_id == parent_run_id))
         # Normalized to UTC: SQLite stores UTC wall-clock text, so a non-UTC
         # offset would otherwise compare against the wrong instant.
         if started_after is not None:

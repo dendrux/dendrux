@@ -193,7 +193,7 @@ class _SqlTree(_StoreHost):
                         .order_by(AgentRun.created_at, AgentRun.id)
                         .limit(allowance + 1)
                     )
-                    rows = list((await session.execute(stmt)).scalars())
+                    rows = list((await session.execute(self._parent_run_query(stmt))).scalars())
                     if len(rows) > allowance:
                         truncated = True
                         stop = True
@@ -281,7 +281,9 @@ class _SqlTree(_StoreHost):
             stmt = stmt.options(load_only(AgentRun.id, AgentRun.parent_run_id, AgentRun.tenant_id))
         if max_nodes is not None:
             stmt = stmt.where(AgentRun.id != root_id).limit(max_nodes - loaded)
-        result = await session.execute(stmt.order_by(AgentRun.created_at, AgentRun.id))
+        result = await session.execute(
+            self._parent_run_query(stmt.order_by(AgentRun.created_at, AgentRun.id))
+        )
         return list(result.scalars())
 
     async def _bfs_descendants(

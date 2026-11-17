@@ -13,7 +13,7 @@ import re
 from inspect import getmembers, iscoroutinefunction
 from typing import TYPE_CHECKING, Any, Literal
 
-from sqlalchemy import true
+from sqlalchemy import Select, true
 from sqlalchemy.exc import SQLAlchemyError as SQLAlchemyError
 
 from dendrux._lifecycle import (
@@ -467,11 +467,14 @@ class SQLStateStore(
             )
             for after, ids in groups.items()
         ]
-        return (
+        return self._parent_run_query(
             self._frontier_scope(select(runs.c.id).where(or_(*predicates)), tenant_scope)
             .order_by(runs.c.id)
             .limit(page_size)
         )
+
+    def _parent_run_query(self, statement: Select[Any]) -> Select[Any]:
+        return statement
 
     def __init__(
         self, engine: AsyncEngine, *, live_updates: LiveUpdates | bool | None = None

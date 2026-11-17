@@ -73,11 +73,13 @@ EXPECTED: dict[str, set[tuple[str, str]]] = {
     "control_stopped": {("agent_runs", PK)},
     "children_page": {("agent_runs", PARENT)},
     "children_page_after": {("agent_runs", PARENT)},
+    "list_children": {("agent_runs", PARENT)},
     "cancel_children_page": {("agent_runs", PARENT), ("agent_runs", PK)},
     "cancel_children_page_after": {("agent_runs", PARENT), ("agent_runs", PK)},
     "descendant_page": {("agent_runs", PK), ("agent_runs", PARENT)},
     "descendant_page_after": {("agent_runs", PK), ("agent_runs", PARENT)},
     "subtree": {("agent_runs", PK), ("agent_runs", PARENT), ("llm_interactions", USAGE)},
+    "subtree_bounded": {("agent_runs", PK), ("agent_runs", PARENT), ("llm_interactions", USAGE)},
     "subtree_usage": {("agent_runs", PARENT), ("llm_interactions", USAGE)},
     "run_usage": {("llm_interactions", USAGE)},
     "delegation_ancestry": {("agent_runs", PK), ("agent_runs", PARENT)},
@@ -351,6 +353,9 @@ async def exercise(store: Any, fx: Seeded) -> dict[str, list[tuple[str, Any]]]:
             [target.root], after=first[-1], limit=2, tenant_id=tenant
         )
     assert rest == sorted(level1)[2:]
+    with captured(engine) as out["list_children"]:
+        listed = await store.list_runs(parent_run_id=target.root, limit=2, tenant_id=tenant)
+    assert [row.id for row in listed] == list(reversed(level1))[:2]
     with captured(engine) as out["cancel_children_page"]:
         page = await store.get_managed_cancel_children_page(
             level1, after=None, limit=500, tenant_id=tenant
@@ -376,6 +381,9 @@ async def exercise(store: Any, fx: Seeded) -> dict[str, list[tuple[str, Any]]]:
     with captured(engine) as out["subtree"]:
         subtree = await store.get_subtree(target.root, tenant_id=tenant)
     assert subtree is not None and len(subtree.nodes) == members
+    with captured(engine) as out["subtree_bounded"]:
+        bounded = await store.get_subtree(target.root, tenant_id=tenant, max_nodes=members + 1)
+    assert bounded is not None and len(bounded.nodes) == members
     with captured(engine) as out["subtree_usage"]:
         usage = await store.subtree_usage(target.root)
     assert usage.llm_calls == 2 * members
