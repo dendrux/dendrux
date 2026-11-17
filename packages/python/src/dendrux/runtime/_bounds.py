@@ -22,3 +22,5 @@ DEFAULT_SUBTREE_ROWS = 1000
 DEFAULT_SUBTREE_DEPTH = 32
 MAX_SUBTREE_ROWS = 10_000
 MAX_SUBTREE_DEPTH = 100
+# RunStore.get_subtree() descendant bound when max_nodes is omitted (since 0.7.0).
+SUBTREE_MAX_NODES_DEFAULT = 10_000

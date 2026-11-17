@@ -1,53 +1,43 @@
-"""Migration warnings and compatibility adapters for public read bounds."""
+"""Default bounds and compatibility adapters for public RunStore reads."""
 
 from __future__ import annotations
 
 import inspect
 import logging
-import warnings
 from typing import Any
 
 from dendrux import _codes
-from dendrux._warnings import _developer_stacklevel
 from dendrux.errors import BudgetConfigurationError, SubtreeTooLargeError
-from dendrux.runtime._bounds import MAX_PAGE
+from dendrux.runtime._bounds import MAX_PAGE, SUBTREE_MAX_NODES_DEFAULT
 from dendrux.runtime._pending import check_read_int
 
 logger = logging.getLogger(__name__)
 
 
-def _warn(message: str) -> None:
-    warnings.warn(message, FutureWarning, stacklevel=_developer_stacklevel())
+def _page_limit(method: str, limit: int | None, cursor: str) -> int:
+    """The page a list read uses: 1,000 when omitted or None; above 1,000 refuses.
 
-
-def _warn_page(method: str, limit: int | None, cursor: str) -> None:
+    Zero and negative limits pass unchanged; SQL stores read one row for them.
+    """
     if limit is None:
-        _warn(
-            f"RunStore.{method}() reads every row; pass limit= (at most 1,000) "
-            f"and page with {cursor}=. In 0.7 the default becomes 1,000."
+        return MAX_PAGE
+    if limit > MAX_PAGE:
+        _codes.log_code(logger, _codes.READ_ARGUMENT_INVALID, argument="limit")
+        raise ValueError(
+            f"RunStore.{method}() limit must be at most {MAX_PAGE}; page with {cursor}=."
         )
-    elif limit > MAX_PAGE:
-        _warn(
-            f"RunStore.{method}() result is clamped to 1,000 now; "
-            f"pass limit= (at most 1,000) and page with {cursor}=. "
-            "A limit above 1,000 will raise in 0.7."
-        )
+    return limit
 
 
-def _trace_page_limit(limit: int | None) -> int | None:
-    return None if limit is None else max(1, min(limit, MAX_PAGE))
-
-
-def _check_subtree_bound(max_nodes: int | None) -> None:
+def _subtree_bound(max_nodes: int | None) -> int:
+    """The descendant bound a subtree read uses: 10,000 when omitted or None."""
     check_read_int("max_nodes", max_nodes, wide=True)
     if max_nodes is None:
-        _warn(
-            "RunStore.get_subtree() reads every descendant; pass max_nodes=. "
-            "In 0.7 the default max_nodes becomes 10,000."
-        )
-    elif max_nodes < 1:
+        return SUBTREE_MAX_NODES_DEFAULT
+    if max_nodes < 1:
         _codes.log_code(logger, _codes.READ_ARGUMENT_INVALID, argument="max_nodes")
         raise ValueError("max_nodes must be a positive integer or None")
+    return max_nodes
 
 
 def _accepts_max_nodes(method: Any) -> bool:
@@ -66,14 +56,14 @@ def _limit_error(run_id: str, max_nodes: int) -> SubtreeTooLargeError:
     return SubtreeTooLargeError(run_id, max_nodes)
 
 
-async def _read_subtree(method: Any, run_id: str, tenant_id: Any, max_nodes: int | None) -> Any:
+async def _read_subtree(method: Any, run_id: str, tenant_id: Any, max_nodes: int) -> Any:
     kwargs = {"max_nodes": max_nodes} if _accepts_max_nodes(method) else {}
     try:
         record = await method(run_id, tenant_id=tenant_id, **kwargs)
     except BudgetConfigurationError as exc:
-        if exc.reason != "subtree_limit" or max_nodes is None:
+        if exc.reason != "subtree_limit":
             raise
         raise SubtreeTooLargeError(run_id, max_nodes) from exc
-    if record is not None and max_nodes is not None and len(record.nodes) - 1 >= max_nodes:
+    if record is not None and len(record.nodes) - 1 >= max_nodes:
         raise _limit_error(run_id, max_nodes)
     return record

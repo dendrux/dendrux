@@ -36,7 +36,7 @@
 - **Optional live updates.** Postgres or Redis hints wake `RunStore.follow` early. They are off by default and only a wake-up: the database stays the truth. Only `RunStore(store)` listens; `RunStore.from_engine` polls. See [Scaling workers](docs/guides/scaling.mdx#live-updates) and `examples/40_live_updates.py`.
 - **One reader coordinator.** `follow` is served by one coordinator per `RunStore`, which reads all watched runs in batches.
 - **MySQL and MariaDB.** `MySQLStateStore` and a store test kit for any other SQL database. See [MySQL and MariaDB](docs/guides/mysql.mdx) and [Build your own store](docs/guides/build-your-own-store.mdx).
-- **Bounded reads.** `get_events`, `get_traces`, `get_llm_calls`, `get_tool_invocations` and `get_subtree` take `limit=` or `max_nodes=`. Omitting it warns in 0.6 and defaults to a bound in 0.7.
+- **Bounded reads.** `get_events`, `get_traces`, `get_llm_calls`, `get_tool_invocations` and `get_subtree` take `limit=` or `max_nodes=`. Since 0.7.0 omitting it reads at most 1,000 rows (or 10,000 subtree descendants), and a `limit` above 1,000 raises.
 - **Defaults flip.** Strict tenancy, `on_governance_change="raise"` and cache-token budgets are on. The Agent ignores `DENDRUX_DATABASE_URL`. See [Every default change](docs/upgrading-to-0.6.0.mdx#every-default-change).
 
 ## What's new in 0.5.0
@@ -73,7 +73,7 @@
 - **Run control**: `agent.request_pause(run_id)` parks a running run as `paused` and `agent.submit_resume(run_id)` continues it. `cancel_run(run_id, cascade=True)` stops delegated children too, and `cancel_run` now interrupts an in-flight `run()` in the same process.
 - **Inbox notes**: `agent.submit_note(run_id, "...")` tells a run something while it works; the model sees it at the next iteration.
 - **Dollar budgets**: `Budget(max_cost_usd=..., on_exceed="pause" | "cancel", include_children=True)` enforces token and dollar limits across a run and its children.
-- **Subtree reads**: `RunStore.get_subtree(run_id)` returns a delegation tree with live rolled-up usage, plus `get_notes`, `event_types=` and `before=` filters. (On 0.6+, pass `max_nodes=`: omitting it warns and the default becomes 10,000 in 0.7. See [bounded reads](docs/reference/run-store.mdx#get_subtree).)
+- **Subtree reads**: `RunStore.get_subtree(run_id)` returns a delegation tree with live rolled-up usage, plus `get_notes`, `event_types=` and `before=` filters. (Since 0.7.0 `max_nodes` defaults to 10,000; a larger tree raises `SubtreeTooLargeError`. See [bounded reads](docs/reference/run-store.mdx#get_subtree).)
 - **`MCPConnection.call_tool`** runs a server tool directly from your app (outside Agent governance).
 - **Gateway fixes** for OpenAI-compatible endpoints, including a typed `ContextLengthExceededError`.
 - **Migration**: run `dendrux db migrate` (new revision `b5c6d7e8f9a0`). See the [CHANGELOG](packages/python/CHANGELOG.md).

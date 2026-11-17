@@ -123,19 +123,19 @@ async def count_runs(*, status=..., agent_name=..., parent_run_id=...,
 # every method below also takes tenant_id: TenantScope = UNSCOPED
 async def get_run(run_id: str) -> RunDetail | None
 async def get_events(run_id: str, *, after_sequence_index: int | None = None,
-                     limit: int | None = None, event_types: list[str] | None = None,
+                     limit: int | None = 1000, event_types: list[str] | None = None,
                      before: datetime | None = None) -> list[StoredEvent]
 async def stream_events(run_id: str, *, after_sequence_index: int | None = None,
                         poll_interval_s: float = 0.5) -> AsyncIterator[StoredEvent]
-async def get_llm_calls(run_id: str, *, iteration=None, limit=None, offset=0,
+async def get_llm_calls(run_id: str, *, iteration=None, limit=1000, offset=0,
                         before: datetime | None = None) -> list[LLMCall]
-async def get_tool_invocations(run_id: str, *, iteration=None, limit=None, offset=0,
+async def get_tool_invocations(run_id: str, *, iteration=None, limit=1000, offset=0,
                                before: datetime | None = None) -> list[ToolInvocation]
-async def get_traces(run_id: str, *, limit=None, offset=0) -> list[TraceEntry]
+async def get_traces(run_id: str, *, limit=1000, offset=0) -> list[TraceEntry]
 async def get_pauses(run_id: str, *, limit: int = 100, include_payloads: bool = False) -> list[PausePair]
 async def get_pause_page(run_id: str, *, limit: int = 100, include_payloads: bool = False) -> tuple[list[PausePair], bool]
 async def get_pii_mapping(run_id: str) -> dict[str, str]
-async def get_subtree(run_id: str, *, max_nodes: int | None = None) -> RunSubtree
+async def get_subtree(run_id: str, *, max_nodes: int | None = 10_000) -> RunSubtree
 async def get_notes(run_id: str, *, undelivered_only: bool = False) -> list[RunNote]
 ```
 
@@ -270,11 +270,9 @@ Everything else is hidden or replaced with a placeholder: text written by a mode
 
 `get_events`, `get_traces`, `get_llm_calls` and `get_tool_invocations` return lists that grow with the run. Pass `limit=`, a page size from 1 to 1,000, and page through the rest.
 
-- **In 0.6.0, omitting `limit` still requests every matching row and emits a `FutureWarning`.** The warning names the method and the paging argument. In 0.7 the default becomes 1,000 and a `limit` above 1,000 raises.
-- **A `limit` above 1,000 also emits a `FutureWarning` and is clamped to 1,000 now.** `SQLStateStore` stores clamp it, and so does the format-2 branch of `get_traces`. A custom store receives the limit unchanged on its format-1 reads and on the event, LLM-call and tool-call reads: `RunStore` warns but does not clamp them. The format-2 public `get_traces` is normalized by `RunStore` whatever the backend, custom checkpointing stores included: an explicit limit is clamped to 1 to 1,000. Internal conversation reconstruction is not given this page clamp.
-- **A `limit` of zero or less reads one row** on the SQL stores and the format-2 `get_traces`. (Before this release the format-2 branch returned an empty list.) A custom store receives it unchanged on its format-1 reads.
-- Arguments are validated first, then the warning is emitted, before any store call. It uses Python's normal warning filtering and de-duplication. Awaited directly, it points at your line; passed straight to `asyncio.run` or scheduled as a task, it points into asyncio, so await the read from a small wrapper coroutine if you want your own location.
-- To find every call that still warns, run your tests or a script with `python -W error::FutureWarning`. `sweep()` raises its own, unrelated `FutureWarning` when it finds stale rows without `on_stale=`.
+- **Since 0.7.0, omitting `limit` (or passing `None`) reads one page of 1,000.** A custom store receives `limit=1000`. Before 0.7.0 it read every matching row and emitted a `FutureWarning`.
+- **Since 0.7.0, a `limit` above 1,000 raises `ValueError`** and logs `read_argument_invalid` with `argument="limit"`, after the other arguments are validated and before any store call. Before 0.7.0 it emitted a `FutureWarning` and SQL stores clamped it to 1,000. To read more, page as below.
+- **A `limit` of zero or less reads one row** on the SQL stores and the format-2 `get_traces`. A custom store receives it unchanged on its format-1 reads.
 
 **How to page.** Keep the tenant scope and every filter identical on each page.
 
@@ -384,7 +382,7 @@ except SubtreeTooLargeError as exc:
 
 This is a **node bound, not a memory bound**: a SQL store can load the root and up to the threshold's worth of descendant rows before it refuses, and the accepted nodes can hold large payloads. A custom store receives `max_nodes` only when its `get_subtree` declares a named parameter that takes a keyword (`**kwargs` alone, positional-only parameters and signatures that cannot be inspected do not qualify). Without it, the store loads its whole tree first and `RunStore` counts the descendants afterwards; a store may also ignore the parameter, so the count is checked after loading in every case.
 
-**In 0.6.0, omitting `max_nodes` (or passing `None`) still reads the whole tree and emits a `FutureWarning`. In 0.7 the default becomes `max_nodes=10_000`.**
+**Since 0.7.0, omitting `max_nodes` (or passing `None`) means `max_nodes=10_000`,** so a tree with 10,000 or more descendants raises `SubtreeTooLargeError`. Pass a larger `max_nodes` if you mean to read a bigger tree. Before 0.7.0 omission read the whole tree and emitted a `FutureWarning`.
 ### `get_notes`
 
 [//]: # "docs-test: skip - fragment: relies on `run_id`, defined by setup shown elsewhere"
