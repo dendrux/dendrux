@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Final, Literal, Protocol
 
 from dendrux._lifecycle import TERMINAL_STATUSES
 from dendrux.errors import ManagedStateError
-from dendrux.runtime._fanout_adoption_state import FanoutBinding
+from dendrux.runtime._fanout_adoption_state import MAX_FANOUT, MIN_FANOUT, FanoutBinding
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
@@ -27,9 +27,6 @@ if TYPE_CHECKING:
     from dendrux.runtime._pending import PendingPause
     from dendrux.runtime.state import ClaimResult, StateStore, TenantScope
     from dendrux.types import PauseState, RunResult, ToolCall, UsageStats
-
-MAX_FANOUT: Final = 32
-"""Hard ceiling on the children of one fan-out wait (the v4 wait format's bound)."""
 
 _TERMINAL = frozenset(status.value for status in TERMINAL_STATUSES)
 _CONFLICT = "binding_conflict"
@@ -77,12 +74,20 @@ class WaitNode:
     the batch's call order and each carries the call it answers. ``version`` is
     the persisted wait format: 3 binds exactly one child, 4 binds 2..32.
 
+    ``root_run_id`` and ``tenant_id`` are the workflow root and the root's
+    resolved tenant, as the walk (or the live driver) validated them. A step
+    handed only this node scopes its child read with ``tenant_id`` and checks
+    each child's header against ``root_run_id``; it never takes either from a
+    child's own row.
+
     Raises:
         ManagedStateError: ``binding_conflict`` when the children do not fit
             the version, repeat a run or a call, or lack their call.
     """
 
     run_id: str
+    root_run_id: str
+    tenant_id: str | None
     agent: Agent
     agent_path: tuple[str, ...]
     pause_id: str
@@ -94,7 +99,11 @@ class WaitNode:
     def __post_init__(self) -> None:
         object.__setattr__(self, "children", tuple(self.children))
         count = len(self.children)
-        fits = count == 1 if self.version == 3 else self.version == 4 and 2 <= count <= MAX_FANOUT
+        fits = (
+            count == 1
+            if self.version == 3
+            else self.version == 4 and MIN_FANOUT <= count <= MAX_FANOUT
+        )
         calls = {child.call.id for child in self.children if child.call is not None}
         runs = {child.run_id for child in self.children}
         if not fits or len(calls) != count or len(runs) != count:
@@ -116,7 +125,8 @@ class WorkflowTree:
 
     Raises:
         ManagedStateError: ``binding_conflict`` when the root node is not the
-            root run, answers a call, or a run appears twice in the tree.
+            root run, answers a call, a run appears twice in the tree, or a
+            wait carries another root or tenant than the tree's.
     """
 
     root_run_id: str
@@ -124,9 +134,16 @@ class WorkflowTree:
     root: WaitNode | LeafNode
 
     def __post_init__(self) -> None:
-        runs = [node.run_id for node, _ in _descend(self.root)]
+        nodes = [node for node, _ in _descend(self.root)]
+        runs = {node.run_id for node in nodes}
+        scope = (self.root_run_id, self.tenant_id)
         rooted = self.root.run_id == self.root_run_id and self.root.call is None
-        if not rooted or len(set(runs)) != len(runs):
+        scoped = all(
+            (node.root_run_id, node.tenant_id) == scope
+            for node in nodes
+            if isinstance(node, WaitNode)
+        )
+        if not rooted or not scoped or len(runs) != len(nodes):
             raise ManagedStateError(reason=_CONFLICT, run_id=self.root_run_id)
 
     def leaves(self) -> tuple[LeafNode, ...]:
@@ -208,7 +225,7 @@ class FanoutInvocation:
     def __post_init__(self) -> None:
         object.__setattr__(self, "branches", tuple(self.branches))
         count = len(self.branches)
-        if not 2 <= count <= MAX_FANOUT:
+        if not MIN_FANOUT <= count <= MAX_FANOUT:
             raise ValueError(f"a fan-out needs 2..{MAX_FANOUT} branches, got {count}")
         if (
             len(set(self.call_ids)) != count

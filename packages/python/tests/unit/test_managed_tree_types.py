@@ -49,9 +49,18 @@ def _leaf(run_id: str, *, status: str = "running", pause_id: str | None = None) 
     )
 
 
-def _wait(run_id: str, *children: Any, version: int = 4, root: bool = False) -> WaitNode:
+def _wait(
+    run_id: str,
+    *children: Any,
+    version: int = 4,
+    root: bool = False,
+    root_run_id: str = ROOT,
+    tenant_id: str | None = "t1",
+) -> WaitNode:
     return WaitNode(
         run_id=run_id,
+        root_run_id=root_run_id,
+        tenant_id=tenant_id,
         agent=AGENT,
         agent_path=() if root else (run_id,),
         pause_id=f"gen-{run_id}",
@@ -144,6 +153,8 @@ def test_wait_children_are_copied_into_a_tuple() -> None:
     children = [_leaf("a"), _leaf("b")]
     wait = WaitNode(
         run_id="w",
+        root_run_id=ROOT,
+        tenant_id=None,
         agent=AGENT,
         agent_path=(),
         pause_id="g",
@@ -243,21 +254,42 @@ def test_a_deep_chain_does_not_recurse() -> None:
     for depth in range(3000):
         node = _wait(f"w{depth}", node, version=3)
     node = dataclasses.replace(node, run_id=ROOT, call=None)
-    tree = WorkflowTree(root_run_id=ROOT, tenant_id=None, root=node)
+    tree = WorkflowTree(root_run_id=ROOT, tenant_id="t1", root=node)
     assert [leaf.run_id for leaf in tree.leaves()] == ["leaf"]
     assert len(tree.ancestors("leaf")) == 3000
 
 
 BAD_TREES = {
     "root id differs from the root node": lambda: WorkflowTree(
-        root_run_id=OTHER, tenant_id=None, root=_wait(ROOT, _leaf("a"), _leaf("b"), root=True)
+        root_run_id=OTHER,
+        tenant_id="t1",
+        root=_wait(ROOT, _leaf("a"), _leaf("b"), root=True, root_run_id=OTHER),
     ),
     "root node answers a call": lambda: WorkflowTree(
         root_run_id=OTHER, tenant_id=None, root=_leaf(OTHER)
     ),
+    "a nested wait trusting another root": lambda: WorkflowTree(
+        root_run_id=ROOT,
+        tenant_id="t1",
+        root=_wait(
+            ROOT, _leaf("a"), _wait("w2", _leaf("b"), _leaf("c"), root_run_id=OTHER), root=True
+        ),
+    ),
+    "a nested wait in another tenant": lambda: WorkflowTree(
+        root_run_id=ROOT,
+        tenant_id="t1",
+        root=_wait(
+            ROOT, _leaf("a"), _wait("w2", _leaf("b"), _leaf("c"), tenant_id="t2"), root=True
+        ),
+    ),
+    "an untenanted wait in a tenant's tree": lambda: WorkflowTree(
+        root_run_id=ROOT,
+        tenant_id="t1",
+        root=_wait(ROOT, _leaf("a"), _leaf("b"), root=True, tenant_id=None),
+    ),
     "one run in two places": lambda: WorkflowTree(
         root_run_id=ROOT,
-        tenant_id=None,
+        tenant_id="t1",
         root=_wait(ROOT, _leaf("a"), _wait("w2", _leaf("a"), _leaf("b")), root=True),
     ),
 }
@@ -380,6 +412,59 @@ async def test_a_fake_settle_parent_can_stand_in_for_the_protocol() -> None:
     for wait in tree.ancestors("b"):
         assert await settle(object(), wait) is None  # type: ignore[arg-type]
     assert seen == ["w2", ROOT]
+
+
+class _ChildStore:
+    """A store stand-in holding child rows under (parent, tenant), as §5.4 scopes them."""
+
+    def __init__(self, rows: dict[tuple[str, str | None], dict[str, dict[str, str]]]) -> None:
+        self.rows = rows
+        self.reads: list[tuple[str, tuple[str, ...], str | None]] = []
+
+    async def get_managed_children(
+        self, parent_run_id: str, child_run_ids: list[str], *, tenant_id: str | None
+    ) -> list[dict[str, str]]:
+        self.reads.append((parent_run_id, tuple(child_run_ids), tenant_id))
+        scoped = self.rows.get((parent_run_id, tenant_id), {})
+        return [scoped[run_id] for run_id in child_run_ids if run_id in scoped]
+
+
+async def _settle(store: Any, node: WaitNode) -> None:
+    """Module-level, as the real one is: everything it trusts comes from its arguments."""
+    ids = [binding.child_run_id for binding in node.bindings]
+    rows = await store.get_managed_children(node.run_id, ids, tenant_id=node.tenant_id)
+    if len(rows) != len(ids):
+        raise ManagedStateError(reason="child_missing", run_id=node.run_id)
+    if any(row["root_run_id"] != node.root_run_id for row in rows):
+        raise ManagedStateError(reason="child_mismatch", run_id=node.run_id)
+
+
+def _nested_wait() -> WaitNode:
+    tree = _nested()
+    (inner,) = (w for w in tree.ancestors("b") if w.run_id == "w2")
+    assert (inner.root_run_id, inner.tenant_id) == (ROOT, "t1")
+    return dataclasses.replace(inner, run_id=W)
+
+
+async def test_a_nested_wait_carries_the_tenant_scope_for_its_child_read() -> None:
+    settle: SettleParent = _settle
+    node = _nested_wait()
+    rows = {"b": {"root_run_id": ROOT}, "c": {"root_run_id": ROOT}}
+    store = _ChildStore({(W, "t1"): rows})
+    assert await settle(cast("Any", store), node) is None
+    assert store.reads == [(W, ("b", "c"), "t1")]
+    other_tenant = _ChildStore({(W, "t2"): rows})
+    with pytest.raises(ManagedStateError) as raised:
+        await settle(cast("Any", other_tenant), node)
+    assert raised.value.reason == "child_missing"
+
+
+async def test_a_nested_wait_carries_the_expected_root_for_its_children() -> None:
+    settle: SettleParent = _settle
+    rows = {"b": {"root_run_id": ROOT}, "c": {"root_run_id": OTHER}}
+    with pytest.raises(ManagedStateError) as raised:
+        await settle(cast("Any", _ChildStore({(W, "t1"): rows})), _nested_wait())
+    assert raised.value.reason == "child_mismatch"
 
 
 # --- the interface module stays off the live path ---------------------------------
