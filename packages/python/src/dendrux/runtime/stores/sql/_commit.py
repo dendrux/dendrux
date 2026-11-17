@@ -23,6 +23,8 @@ from dendrux.errors import PersistenceError, StoreOutcomeUnknown
 from dendrux.runtime.durability import (
     _CommitNotAppliedError,
     _is_driver_failure,
+    _raise_if_cancelled,
+    _rollback_unless_cancelled,
     is_transient_db_error,
 )
 from dendrux.runtime.state import _to_aware_utc
@@ -150,8 +152,9 @@ class _CommitReadback:
 
     async def _rollback(self, *, ambiguous: bool) -> None:
         try:
-            await self.session.rollback()
+            await _rollback_unless_cancelled(self.session)
         except BaseException as error:
+            _raise_if_cancelled(error)
             if not self._database_error(error):
                 self._reraise_clean(error)
             _codes.log_code(logger, _codes.PERSISTENCE_ERROR, run_id=self.run_id)
@@ -160,6 +163,7 @@ class _CommitReadback:
             raise PersistenceError() from None
 
     async def resolve(self, error: Exception) -> None:
+        _raise_if_cancelled(error)
         if isinstance(error, PersistenceError) or not self._database_error(error):
             raise error
         classified = self.store.classify_db_error(error)

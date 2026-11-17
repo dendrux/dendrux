@@ -12,6 +12,7 @@ from dendrux._lifecycle import STORAGE_FORMAT_CHECKPOINTED, TERMINAL_STATUSES
 from dendrux._meta_keys import STORE_SESSION_KEY
 from dendrux.runtime.durability import (
     _CommitNotAppliedError,
+    _raise_if_cancelled,
     _safe_database_call,
     retry_transient_db,
 )
@@ -232,6 +233,7 @@ class _SqlRuns(_SqlEvidence):
                     absent_retry = True
                     raise
                 except IntegrityError as exc:
+                    _raise_if_cancelled(exc)
                     await session.rollback()
                     error = self.classify_db_error(exc)
                     identity_conflict = self._idempotency_violation(exc) or (
@@ -251,8 +253,7 @@ class _SqlRuns(_SqlEvidence):
                             if not absent_retry:
                                 raise
                     if absent_retry:
-                        # An invisible in-flight INSERT can win the unique check
-                        # after an absent readback. Re-prove our full identity.
+                        # Re-prove identity: an invisible INSERT can win after an absent readback.
                         return await _prove_creation(session)
                     if existing is not None:
                         return existing

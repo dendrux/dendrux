@@ -11,7 +11,7 @@ import dendrux.runtime._blob_catalog as _blobs
 from dendrux import _codes
 from dendrux._lifecycle import STORAGE_FORMAT_CHECKPOINTED, CancelReason, StoredEventType
 from dendrux.runtime import state as _state
-from dendrux.runtime.durability import retry_transient_db
+from dendrux.runtime.durability import _rollback_unless_cancelled, retry_transient_db
 from dendrux.runtime.state import (
     ClaimResult,
     EventWrite,
@@ -223,8 +223,8 @@ class _SqlClaims(_SqlLifecycle):
                                 )
                         if validate is not None:
                             validate(pause or {})
-                    except BaseException:
-                        await session.rollback()
+                    except BaseException as error:
+                        await _rollback_unless_cancelled(session, error)
                         raise
                 self._mark_announce(session, (run_id,))
                 await self._write_tx(session)
@@ -305,8 +305,8 @@ class _SqlClaims(_SqlLifecycle):
                 if validate is not None:
                     try:
                         validate(current_pause_data)
-                    except BaseException:
-                        await session.rollback()
+                    except BaseException as error:
+                        await _rollback_unless_cancelled(session, error)
                         raise
 
                 # 3. Merge submitted_data into pause_data.
