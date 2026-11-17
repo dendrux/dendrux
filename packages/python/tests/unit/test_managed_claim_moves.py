@@ -13,6 +13,9 @@ CLAIM_NAMES = [
     "managed_submission_descriptor",
     "refuse_managed_results",
     "_managed_adoption_validator",
+    "claim_managed_adoption",
+    "_admit_managed_parent",
+    "_refuse_tokenless_managed",
 ]
 RECLAIM_NAMES = [
     "_pending_adoption",
@@ -38,3 +41,66 @@ def test_reclaim_imports_moved_name(name: str) -> None:
 def test_core_flow_stays_in_reclaim() -> None:
     assert _reclaim._check_before_claim.__module__ == _reclaim.__name__
     assert _reclaim.reclaim.__module__ == _reclaim.__name__
+
+
+async def test_moved_claim_flow_honours_submit_patch_seams(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Patching ``submit.<helper>`` still takes effect on the moved adoption claim."""
+    from contextlib import asynccontextmanager
+    from types import SimpleNamespace
+    from typing import Any
+
+    from dendrux.runtime import _continuation_guardrails, durability, state
+    from dendrux.skills import _session
+    from dendrux.types import PauseState, ToolResult
+
+    calls: list[str] = []
+    won = SimpleNamespace(claim_epoch=1)
+
+    class Store:
+        async def get_pause_state(self, run_id: str) -> dict[str, Any]:
+            return {"schema_version": 3}
+
+        async def get_run(self, run_id: str) -> Any:
+            return SimpleNamespace(agent_name="a", meta={})
+
+        async def get_loop_state(self, run_id: str) -> dict[str, Any]:
+            return {}
+
+        async def submit_and_claim(self, run_id: str, **kwargs: Any) -> Any:
+            return won
+
+    async def operation_runner(store: Any, operation: Any, cancel: Any, *, run_id: str) -> Any:
+        return await operation()
+
+    @asynccontextmanager
+    async def no_evidence(*args: Any):
+        yield
+
+    async def report(agent: Any, store: Any, run_id: str, governance: Any) -> None:
+        calls.append("report_governance_change")
+
+    wait = SimpleNamespace(pause_id="p", trace_order_offset=0)
+    monkeypatch.setattr(PauseState, "from_managed_dict", lambda *a, **k: wait)
+    monkeypatch.setattr(
+        _session.SkillSession, "prepare", lambda agent: SimpleNamespace(available={})
+    )
+    monkeypatch.setattr(durability, "_ownership_handoff", operation_runner)
+    monkeypatch.setattr(_continuation_guardrails, "_submission_evidence", no_evidence)
+    monkeypatch.setattr(state, "claimed_store", lambda *a: object())
+    monkeypatch.setattr(submit, "_governance_change", lambda agent, saved: calls.append("change"))
+    monkeypatch.setattr(submit, "serialize_tool_results", lambda r: calls.append("serialize") or [])
+    monkeypatch.setattr(submit, "report_governance_change", report)
+
+    agent = SimpleNamespace(name="a", _on_governance_change="warn")
+    result = await _managed_claim.claim_managed_adoption(
+        Store(),  # type: ignore[arg-type]
+        "run",
+        agent=agent,  # type: ignore[arg-type]
+        call_id="c",
+        child_run_id="child",
+        result=ToolResult(call_id="c", name="n", payload="p"),
+    )
+    assert result is won
+    assert calls == ["change", "serialize", "report_governance_change"]
