@@ -93,7 +93,7 @@ class ManagedReads:
         count = await self._managed_run_count(session, request.root_run_id, cap, request.tenant_id)
         if count is None or count >= cap:
             raise ManagedRunLimitError(run_id=request.parent_run_id)
-        # The dynamic mixin self resolves SQLStateStore._bind_admit's typed header.
+        # The dynamic mixin self resolves _SqlManaged._bind_admit's typed header.
         return cast("ManagedHeader", header)
 
     async def _managed_run_count(
