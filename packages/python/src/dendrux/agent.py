@@ -1680,11 +1680,11 @@ class Agent:
     ) -> RunResult:
         """Continue a marked ReAct run from its last committed checkpoint.
 
-        Call ``sweep(on_stale="reclaim")`` first; its ``item`` fences this attempt to
-        that exact mark. Omitted tenant scope raises TenantScopeRequiredError; a missing
-        or foreign run raises RunNotFoundError unchanged. Interrupted non-idempotent
-        tools pause for approval before replay. A running SingleCall subagent refuses
-        with ``loop_unsupported``: run ``sweep()``, then reclaim the root again.
+        Call ``sweep(on_stale="reclaim")`` first; its ``item`` fences this attempt. No tenant
+        scope raises TenantScopeRequiredError; a missing or foreign run raises RunNotFoundError
+        unchanged, but a non-ReAct (e.g. SingleCall) agent raises ``loop_unsupported`` before
+        looking the run up. Uncertain non-idempotent tools pause for approval. A running
+        SingleCall subagent also gives ``loop_unsupported``: sweep, then reclaim the root.
         """
         from dendrux.runtime._reclaim import reclaim
 
@@ -2558,13 +2558,13 @@ class Agent:
           returned a final answer) completes normally — its work and side
           effects happened — and the request is cleared. A stale RUNNING
           row swept with the request pending is finalized ``CANCELLED``.
-        - **Batch** :meth:`run` **executing in this process on this Agent
-          instance:** additionally cancels the task awaiting it, so an
-          in-flight provider call or tool is interrupted. That ``run()``
-          call returns ``RunResult(status=CANCELLED)`` with
-          ``meta["interrupted"] = True`` and ``meta["partial_output"] =
-          False`` (a batch call has no partial text). A caller cancelling
-          its own task still gets ``CancelledError``.
+        - **Batch** :meth:`run` **executing in this process on this Agent instance:** additionally
+          cancels the task awaiting it, so an in-flight provider call or tool is interrupted. That
+          ``run()`` call returns ``RunResult(status=CANCELLED)`` with ``meta["interrupted"] = True``
+          and ``meta["partial_output"] = False`` (a batch call has no partial text). A caller
+          cancelling its own task still gets ``CancelledError``. While a managed subagent is
+          running, cancellation is cooperative even here: the child's in-flight call finishes, its
+          report is not adopted, and the root ends ``CANCELLED``.
         - **Streamed run owned by this Agent instance** (``stream()`` /
           ``resume_stream()``): additionally sets an in-process interrupt
           signal. The loop races every provider pull against it, so an

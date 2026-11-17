@@ -93,13 +93,13 @@ More than 10 direct children logs a warning. You can register at most 256 subage
 
 ## SingleCall subagents
 
-A child can use `loop=SingleCall()`. It makes exactly one model call and never pauses, so it has no tools and no subagents of its own. Its answer is the report the parent sees. A parent must use ReAct; a `SingleCall` agent with subagents raises `SubagentDefinitionError(reason="single_call_parent")`.
+A child can use `loop=SingleCall()`. It runs one model step and never pauses, so it has no tools and no subagents of its own. Normally that step is one provider call; an image retry may make a second provider attempt. Its answer is the report the parent sees. A parent must use ReAct; a `SingleCall` agent with subagents raises `SubagentDefinitionError(reason="single_call_parent")`.
 
-With `output_type=`, the report is the validated value as compact JSON. Use `run()` for such a workflow; streaming refuses a child with `output_type`. A value that fails validation fails the child, and the parent sees `managed_child_failed`. A child that sets both `guardrails` and `output_type` is refused with `ValueError` when the root run starts, before anything is written.
+With `output_type=`, the report is the validated value as compact JSON. Use `run()` for such a workflow; streaming refuses a child with `output_type`. A value that fails validation fails the child, and the parent sees `managed_child_failed`. A child that sets both `guardrails` and `output_type` is refused with `ValueError` when the root run starts, before anything is written, and again before any later delegation binds it (for example after a redeploy while the root was paused).
 
 ### An interrupted SingleCall child fails
 
-Dendrux never runs a `SingleCall` child's call twice. If the process dies during the call, the child stays `running` until you call `sweep()`. The sweep finalizes it as `error` with `failure_reason="stale_running"`, or `"never_started"` if it died before it started. This happens with every `on_stale` setting, and the child is never listed in `reclaimable`. A provider error fails the child too.
+Dendrux never runs an interrupted `SingleCall` child again. If the process dies during its model step, the child stays `running` until you call `sweep()`. The sweep finalizes it as `error` with `failure_reason="stale_running"`, or `"never_started"` if it died before it started. This happens with every `on_stale` setting, and the child is never listed in `reclaimable`. A provider error fails the child too.
 
 The parent sees an ordinary failed tool result with code `managed_child_failed`, the same code as a model or provider error. Read the child run's `failure_reason` to tell a crash from a model error. The parent's model may choose to delegate again; that starts a new child run.
 
