@@ -15,6 +15,8 @@ Phase 1 must keep these results: a store with no declaration is a legacy store.
 
 from __future__ import annotations
 
+from datetime import timedelta
+
 import pytest
 
 from dendrux.runtime.stores._factory import store_for_engine
@@ -117,3 +119,28 @@ async def test_subtree_limit_keeps_legacy_keyword_set(fixture, sqlite_engine):
     assert len(result.nodes) == 1
     expected_keys = ("run_id", "tenant_id") if fixture == "a_legacy_in_memory" else ("tenant_id",)
     assert legacy.calls == [("get_subtree", expected_keys)]
+
+
+@pytest.mark.parametrize("fixture", sorted(STORES))
+@pytest.mark.parametrize(
+    "thresholds",
+    [
+        {"stale_running": timedelta(minutes=20), "abandoned_waiting": timedelta(minutes=30)},
+        {"abandoned_waiting": timedelta(minutes=30)},
+        {},
+    ],
+    ids=["both", "waiting_only", "none"],
+)
+async def test_bare_sweep_needs_recovery_and_error_policy_keeps_working(
+    fixture, thresholds, sqlite_engine
+):
+    """Since 0.7.0 a bare ``sweep()`` reclaims, which a store without recovery refuses
+    before any store call; ``on_stale="error"`` keeps the 0.6 finalising sweep."""
+    from dendrux import sweep
+
+    legacy = STORES[fixture](store_for_engine(sqlite_engine))
+    with pytest.raises(NotImplementedError, match="'recovery' capability"):
+        await sweep(state_store=legacy, **thresholds)
+    assert legacy.calls == []
+    result = await sweep(state_store=legacy, on_stale="error", **thresholds)
+    assert (result.stale_running, result.abandoned_waiting, result.reclaimable) == ([], [], [])
