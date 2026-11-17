@@ -1,9 +1,80 @@
 # Changelog
 
-## Unreleased
+## 0.7.0 - 2026-11-17
+
+See [Upgrading to 0.7.0](../../docs/upgrading-to-0.7.0.mdx) for the steps that custom-store
+authors and sweep callers must take. No schema migration is needed.
+
+### Added
+
+- **Managed subagents.** `Agent(subagents=[...], description=...)` registers other agents as
+  blocking tools. A child runs its own loop with only the task text, in the same store and
+  tenant, and its answer becomes the parent's tool result. One subagent call per model turn;
+  server tools can run beside it. See the [Managed subagents guide](../../docs/guides/subagents.mdx).
+  - A child's pause (approval, client tool, answer, resume) surfaces on the root. Answer it
+    with the root run id and `expected_pause_id`. `PendingPause` gains `agent_name`,
+    `agent_path` and `origin_run_id`.
+  - Crash recovery goes through the root: `reclaim(root_id)` adopts a finished child,
+    reclaims a dead child's run, or returns the child's pause. A child never runs twice.
+  - `cancel_run(root_id)` always cancels managed descendants, with or without `cascade=`.
+    Lifecycle events tell cancelled, failed and succeeded children apart. A corrupt child
+    header is skipped, reported in `result.meta["cascade"]` and logged
+    (`cascade_child_skipped`).
+  - One aggregate budget for the whole workflow, set on the root. Unavailable or invalid
+    shared usage pauses the tree with `managed_usage_unknown`.
+  - `Limits.max_managed_runs` (default 128, includes the root and completed children) and
+    `Limits.max_subagent_definitions` (default 256, includes the root). Both are keyword-only
+    positive integers. Hitting the run cap refuses admission with `managed_run_limit`.
+  - Public managed store methods: `bind_managed_child`, `get_managed_cancel_children_page`,
+    `is_managed_root_stopped` and `get_managed_run_control`, certified by the store kit
+    under the `managed_subagents` capability.
+  - `stream()` works for agents with subagents; child tool progress carries the child's
+    `run_id`.
+  - `RunStore.get_subtree(root_id)` gives whole-workflow usage; `result.usage` is the root only.
+- **SingleCall children.** A managed subagent can use `SingleCall`: one model step, never pauses.
+  With `output_type` its report is the validated value (`run()` only). If its process dies
+  mid-call, `sweep()` finalises it as `error` (`stale_running` or `never_started`) in every
+  `on_stale` mode and it is never rerun; the root adopts the failure as `managed_child_failed`.
+- `ManagedResultRefusedError` is exported from `dendrux.errors` (subclass of
+  `InvalidToolResultError`, code `managed_result_refused`). It is raised when a tool result is
+  submitted for a generated subagent call. Existing `except InvalidToolResultError` handlers
+  keep working.
+- New stable log codes for managed runs, budgets, cancellation and limits (see
+  [Log codes](../../docs/reference/log-codes.mdx)).
+- `get_tool_def` in `dendrux.tool` (see Changed).
 
 ### Changed
 
+- **Unpriced calls stop managed trees.** With `max_cost_usd` and `on_exceed` of `pause` or
+  `cancel`, a new unpriced call by any child, sibling or grandchild pauses (or cancels) the
+  tree at the next budget checkpoint with `unpriced_call`. A resume through the root accepts
+  the calls so far. `warn` budgets and budgets without `max_cost_usd` still only warn.
+- **Child `budget=` is refused.** A registered child's own `budget=` and a root
+  `include_children=False` are refused. Set one `Budget` on the root. A child's own budget
+  events are advisory; the root enforces.
+- **Definition cap counts the root.** The old private limit allowed 256 descendants (257 nodes).
+  The default now allows 256 nodes in total (255 descendants). Raise
+  `Limits.max_subagent_definitions` if you need more.
+- **Sweep.** `sweep(abandoned_waiting=...)` never abandons a parent that waits on a subagent.
+  On native SQL stores a waiting-only call can now return a non-`None` cursor: a composite
+  `sweep:v1:` token you pass back unchanged with the same thresholds. Do not hand a saved
+  0.7 cursor to 0.6.x; start with `cursor=None`. Exempt and corrupt waits count toward
+  `max_runs`. A call without a cursor restarts at the oldest waiting row and can stall once
+  `max_runs` exempt or corrupt waits sit in front of it.
+- `mark_lease_expired(finalise_unrecoverable=False)` spares only stale rows with no loop
+  marker. Every other stale row that cannot be reclaimed, including `single_call`, is
+  finalised as `error`/`stale_running`.
+- Guardrails and `output_type` together on a subagent are refused with `ValueError` at root
+  entry and before any later bind. Continuing a paused subagent whose loop is no longer ReAct
+  raises `SubagentDefinitionError(reason="loop_unsupported")`. `reclaim()` on an Agent whose
+  loop is not ReAct raises `RunNotReclaimableError(reason="loop_unsupported")` before the run
+  is looked up.
+- A tool result submitted for a subagent call is refused. Approving a batch that holds a
+  subagent call runs the approved tools, then starts the subagent.
+- Internal: `runtime/runner.py` and `runtime/stores/sql/base.py` were split into smaller
+  modules. Old import paths and names keep working through re-exports for this release; they
+  will be removed later with a migration note. Import from `dendrux`, `dendrux.errors` and
+  `dendrux.testing` where you can.
 - `@tool(...)` now keeps the decorated function's signature for type checkers
   instead of turning it into `Any`. Runtime behaviour is unchanged. If your code
   calls a decorated tool with the wrong arguments or uses its return value as the
@@ -11,6 +82,30 @@
   `my_tool.__tool_def__` directly is now a type error (it still works at run
   time); use the typed accessor instead:
   `from dendrux.tool import get_tool_def`, then `get_tool_def(my_tool)`.
+
+### Fixed
+
+- A database write that is cancelled, and whose session cleanup then stalls in the driver, no
+  longer keeps the cancelled task alive forever on the paths that close through Dendrux's
+  guarded close: in-memory SQLite (single-connection pools), `get_session` on such pools,
+  SQLite schema sync and shared-pool release. Once a cancellation is in flight, Dendrux waits
+  at most `CLOSE_AFTER_CANCEL_S` (5 seconds) for the close, lets it finish in the background,
+  logs `db_close_abandoned`, and lets the cancellation continue. A task that is not being
+  cancelled is never cut short. If the close fails while a cancellation is in flight, the
+  cancellation wins. If a close never finishes (a driver deadlock), that in-memory engine
+  stays blocked for other sessions.
+- FILE_SQLITE_CLOSE_FIX_PLACEHOLDER: coordinator fills in the file-SQLite close fix here.
+- A cached result read while the run was cancelled now reports the cancelled status, never the
+  parent's internal wait.
+- A child's accepted unpriced-call count survives a crash between its bind and its first
+  checkpoint, so recovery no longer causes a false budget pause or a cancelled child.
+- `ManagedRunLimitError` keeps an explicitly supplied reason.
+- A direct `reclaim` of a subagent run on a custom store is refused before the store's claim.
+
+### Deprecated
+
+- The re-exported names in `dendrux.runtime.runner` and `dendrux.runtime.stores.sql.base`
+  (internal modules) are kept for this release only.
 
 ### Documentation
 
@@ -26,6 +121,25 @@
   run, continuation, cancel and pause call, so they work when copied. Web route
   examples take the tenant from the authenticated session. A docs test keeps
   new examples in line.
+- New [Managed subagents](../../docs/guides/subagents.mdx) guide and
+  [Upgrading to 0.7.0](../../docs/upgrading-to-0.7.0.mdx).
+- Recovery, scaling and state-store pages state that sweeps are store-wide (not
+  tenant-scoped), that a waiting run with a pending cancel is swept as `error`
+  (`run.abandoned`), what `finalise_unrecoverable=False` spares, the sweep stall bound,
+  and that sweeper and worker clocks should agree.
+
+### Known limits
+
+- `cancel_run` on a managed root, even in the owning process, is cooperative while a
+  subagent's provider call is in flight: the call finishes, its report is not adopted, and
+  the root ends cancelled. A real interrupt is planned for 0.7.1.
+- A root `request_pause` during a SingleCall child's call has no effect.
+- A live child cut off from the database can be swept while its call completes. The call is
+  billed but not recorded, so the root budget can undercount by one call (ReAct children too).
+- A SingleCall child's budget events are advisory.
+- Model reasoning text is still not scanned by guardrails.
+- The 0.6 `FutureWarning`s are unchanged in 0.7.0: `sweep()` without `on_stale=` and the
+  unbounded `RunStore` reads still warn rather than switching defaults.
 
 ## 0.6.1 - 2026-11-10
 
