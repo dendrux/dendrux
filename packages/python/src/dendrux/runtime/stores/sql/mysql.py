@@ -8,13 +8,14 @@ from contextvars import ContextVar
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Literal
 
-from sqlalchemy import String
+from sqlalchemy import Select, String
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.sql.functions import FunctionElement
 
 from dendrux._meta_keys import (
     STORE_SESSION_KEY,
 )
+from dendrux.db.models import AgentRun
 from dendrux.runtime.durability import _safe_database_call
 from dendrux.runtime.state import _TERMINAL_STATUS_VALUES
 from dendrux.runtime.stores.sql.base import SQLStateStore
@@ -27,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Sequence
+    from datetime import datetime
 
     from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -138,6 +140,43 @@ class MySQLStateStore(SQLStateStore):
         super().__init__(engine, live_updates=live_updates)
         self.capabilities = replace(self.capabilities, deployment="multi_server")
 
+    def _parent_run_query(self, statement: Select[Any]) -> Select[Any]:
+        # ORDER BY + LIMIT can prefer a history-wide ordering-index scan over
+        # the parent lookup. Sort only the matching parents' children instead.
+        return statement.with_hint(
+            AgentRun.__table__, "FORCE INDEX (ix_agent_runs_parent_run_id)", dialect_name="mysql"
+        )
+
+    def _waiting_sweep_page(
+        self, statement: Any, after: tuple[datetime, str] | None, limit: int
+    ) -> Any:
+        from sqlalchemy import literal, select, union_all
+
+        from dendrux.db.models import AgentRun
+
+        # Waiting classification never uses the started-event lookup. Avoid
+        # its correlated probe (and MariaDB expression cache) for each row.
+        statement = statement.with_only_columns(
+            *[
+                literal(None).label("started") if c.key == "started" else c
+                for c in statement.selected_columns
+            ]
+        )
+        if after is None:
+            return statement
+        age, run_id = after
+        same_time = (
+            statement.where(AgentRun.status_changed_at == age, AgentRun.id > run_id)
+            .order_by(None)
+            .order_by(AgentRun.id)
+            .subquery("same_time")
+        )
+        later_time = statement.where(AgentRun.status_changed_at > age).subquery("later_time")
+        # LIMIT inside each derived table prevents merging it into an unbounded
+        # status-prefix scan. The outer sort sees at most two bounded pages.
+        window = union_all(select(same_time), select(later_time)).subquery("waiting_window")
+        return select(window).order_by(window.c.sweep_age, window.c.id).limit(limit)
+
     def classify_db_error(self, exc: BaseException) -> Any:
         from dendrux.runtime.stores._errors import DbError
 
@@ -186,7 +225,7 @@ class MySQLStateStore(SQLStateStore):
         facts = (
             await conn.execute(
                 text(
-                    f"SELECT @@max_allowed_packet, @@session.{isolation_variable}, "
+                    f"SELECT @@max_allowed_packet, @@session.{isolation_variable}, "  # noqa: S608 - Allow-list: isolation_variable is tx_isolation or transaction_isolation; tables are bound.
                     "(SELECT count(*) FROM information_schema.TABLES "
                     "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN :tables "
                     "AND (ENGINE IS NULL OR ENGINE <> 'InnoDB')), "

@@ -469,3 +469,44 @@ class TestPauseStateSerialization:
         d = ps.to_dict()
         # object() should be coerced to its str representation
         assert isinstance(d["history"][0]["meta"]["obj"], str)
+
+
+# ------------------------------------------------------------------
+# Managed-wait serializer integration (0.7)
+# ------------------------------------------------------------------
+
+
+class TestManagedWaitSerialization:
+    async def test_loop_pause_stays_v2_and_a_binding_makes_it_a_v3_wait(self) -> None:
+        """A real loop pause is unaffected; adding a binding writes references only."""
+        import pytest
+
+        from dendrux.errors import PersistenceError
+        from dendrux.types import ManagedWait, generate_ulid
+
+        tc = ToolCall(name="read_range", params={"sheet": "Sheet1"}, provider_tool_call_id="t1")
+        result = await ReActLoop().run(
+            agent=_make_agent(),
+            provider=MockLLM([LLMResponse(tool_calls=[tc])]),
+            strategy=NativeToolCalling(),
+            user_input="Read the sheet",
+        )
+        pause = result.meta["pause_state"]
+        pause.schema_version = 2
+        pause.loop_state_ref = True
+        ordinary = pause.to_dict()
+        assert ordinary["schema_version"] == 2 and "managed_wait" not in ordinary
+        assert PauseState.from_dict(ordinary).managed_wait is None
+
+        call_id = pause.pending_tool_calls[0].id
+        pause.pending_targets = {call_id: "agent"}
+        pause.pause_reason = "managed_wait"
+        pause.pause_id = generate_ulid()
+        pause.managed_wait = ManagedWait(tool_call_id=call_id, child_run_id=generate_ulid())
+        wait = pause.to_dict()
+        assert wait["schema_version"] == 3
+        assert "history" not in wait and "steps" not in wait
+        assert wait["pending_tool_calls"][0]["params"] == {}
+        with pytest.raises(PersistenceError):
+            PauseState.from_dict(wait)
+        assert PauseState.from_managed_dict(wait).managed_wait == pause.managed_wait

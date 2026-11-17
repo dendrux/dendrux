@@ -184,7 +184,7 @@ class MCPOAuthCredential:
 
     access_token: str
     refresh_token: str | None
-    token_type: str = "Bearer"
+    token_type: str = "Bearer"  # noqa: S105 - Bearer is a token type, never a credential.
     expires_at: float | None
     scope: str | None
     issuer: str
@@ -391,7 +391,7 @@ def _conformance(condition: bool, check: str) -> None:
 def _sample_record(generation: str, revision: int, marker: str) -> MCPOAuthRecord:
     client = MCPOAuthClientRecord(
         client_id=f"conformance-{marker}",
-        token_endpoint_auth_method="none",
+        token_endpoint_auth_method="none",  # noqa: S106 - none is an OAuth authentication method, never a credential.
         source="preregistered",
         issuer="https://issuer.invalid",
     )
@@ -402,7 +402,7 @@ def _sample_record(generation: str, revision: int, marker: str) -> MCPOAuthRecor
         scope="conformance",
         issuer="https://issuer.invalid",
         resource="https://resource.invalid/mcp",
-        token_endpoint="https://issuer.invalid/token",
+        token_endpoint="https://issuer.invalid/token",  # noqa: S106 - Reserved .invalid endpoint for store conformance, never a credential.
         revocation_endpoint=None,
         client=client,
         publication_id=_new_id(),
@@ -430,7 +430,7 @@ def _sample_flow(key: MCPAuthKey, *, expired: bool) -> MCPOAuthFlow:
         scope=None,
         issuer="https://issuer.invalid",
         authorization_endpoint="https://issuer.invalid/authorize",
-        token_endpoint="https://issuer.invalid/token",
+        token_endpoint="https://issuer.invalid/token",  # noqa: S106 - Reserved .invalid endpoint for store conformance, never a credential.
         revocation_endpoint=None,
         client=record.credential.client,
         iss_required=False,
@@ -566,7 +566,7 @@ class MCPOAuthClient:
     client_id: str | None = None
     client_secret: str | None = None
     issuer: str | None = None
-    token_endpoint_auth_method: AuthMethod = "none"
+    token_endpoint_auth_method: AuthMethod = "none"  # noqa: S105 - none is an OAuth authentication method, never a credential.
     client_name: str | None = None
     redirect_uris: tuple[str, ...] = ()
     cimd_url: str | None = None
@@ -627,7 +627,7 @@ class MCPOAuthClient:
         redirect_uris: Sequence[str],
         cimd_url: str | None = None,
         application_type: Literal["web", "native"] = "web",
-        token_endpoint_auth_method: AuthMethod = "none",
+        token_endpoint_auth_method: AuthMethod = "none",  # noqa: S107 - none is an OAuth authentication method, never a credential.
         client_uri: str | None = None,
         logo_uri: str | None = None,
         contacts: Sequence[str] = (),
@@ -1319,7 +1319,7 @@ class MCPOAuth:
         if client.cimd_url is not None and discovery.cimd_supported:
             return MCPOAuthClientRecord(
                 client_id=client.cimd_url,
-                token_endpoint_auth_method="none",
+                token_endpoint_auth_method="none",  # noqa: S106 - none is an OAuth authentication method, never a credential.
                 source="cimd",
                 issuer=discovery.issuer,
             )

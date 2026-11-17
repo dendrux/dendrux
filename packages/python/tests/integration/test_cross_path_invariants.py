@@ -15,6 +15,7 @@ import pytest
 from dendrux import Agent, tool
 from dendrux.errors import ProviderTimeoutError
 from dendrux.loops.base import BaseNotifier
+from dendrux.runtime import _run_entry, _run_observers, _run_resume_loop, _run_resume_replay, state
 from dendrux.runtime.context import (
     DelegationContext,
     DelegationDepthExceededError,
@@ -23,6 +24,7 @@ from dendrux.runtime.context import (
     set_delegation_context,
 )
 from dendrux.types import LLMResponse, RunEventType, RunStatus, ToolCall, ToolDecision
+from tests._helpers.gates import wait_for_gate
 from tests._helpers.recovery_checkpoint import checkpoint as checkpoint
 from tests._helpers.recovery_checkpoint import expire
 from tests._helpers.runtime_paths import (
@@ -247,7 +249,7 @@ async def test_cancellation_interrupts_tool_and_pairs_hooks_once(store, entry, c
         else a.run("go", notifier=notifier)
     )
     try:
-        await asyncio.wait_for(entered.wait(), 5)
+        await wait_for_gate(entered, task=task)
         run_id = identity[0]
         if cancel == "caller":
             task.cancel("caller_cancel")
@@ -405,7 +407,6 @@ async def test_reclaim_setup_failure_releases_same_epoch(store, engine, monkeypa
 
 
 async def test_reclaim_transient_setup_failure_preserves_failure_hooks(store, engine, monkeypatch):
-    from dendrux.runtime import runner
     from dendrux.runtime.persistence import PersistenceRecorder
 
     agent = make_agent(store, [LLMResponse(text="done")])
@@ -415,7 +416,7 @@ async def test_reclaim_transient_setup_failure_preserves_failure_hooks(store, en
     notifier = BaseNotifier()
     notifier.on_run_failed = AsyncMock()
     monkeypatch.setattr(PersistenceRecorder, "on_run_failed", failed)
-    monkeypatch.setattr(runner, "_start_trace", AsyncMock(side_effect=original))
+    monkeypatch.setattr(_run_observers, "_start_trace", AsyncMock(side_effect=original))
     with pytest.raises(RuntimeError) as caught:
         await agent.reclaim(item.run_id, tenant_id="tenant", item=item, notifier=notifier)
     assert caught.value is original
@@ -434,7 +435,7 @@ async def test_caller_cancellation_grid_persists_once(store, engine, path):
     case = await path_case(store, engine, path, provider)
     task = asyncio.create_task(case.invoke())
     try:
-        await asyncio.wait_for(provider.entered.wait(), 5)
+        await wait_for_gate(provider.entered, task=task)
         task.cancel("grid_cancellation")
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -608,7 +609,7 @@ async def test_concurrent_submit_failure_releases_only_winning_epoch(
             patcher.setattr(backend, "get_pii_mapping", fail_after_claim)
         tasks = [asyncio.create_task(invoke(agent=owner)) for owner in [first, second]]
         try:
-            await asyncio.wait_for(entered.wait(), 5)
+            await wait_for_gate(entered)
             done, _ = await asyncio.wait(tasks, timeout=5, return_when=asyncio.FIRST_COMPLETED)
             assert len(done) == 1
             assert isinstance(next(iter(done)).exception(), RunAlreadyClaimedError)
@@ -640,19 +641,22 @@ async def test_concurrent_submit_failure_releases_only_winning_epoch(
 
 @pytest.mark.parametrize("failure_site", ["_budget_carry_kwargs", "_resume_image_view"])
 async def test_unconsumed_resume_argument_failure_releases(store, monkeypatch, failure_site):
-    from dendrux.runtime import runner
+    from unittest.mock import Mock
+
+    from dendrux.runtime import _run_images
 
     _, run_id, invoke = await submission_case(store, "submit_resume")
     original = RuntimeError("resume_argument_failure")
     with monkeypatch.context() as patcher:
-
-        def fail(*args, **kwargs):
-            raise original
-
-        patcher.setattr(runner, failure_site, fail)
+        fail = Mock(side_effect=original)
+        if failure_site == "_resume_image_view":
+            patcher.setattr(_run_images, "_resume_image_view", fail)
+        else:
+            patcher.setattr(_run_resume_loop, "_budget_carry_kwargs", fail)
         with pytest.raises(RuntimeError) as caught:
             await invoke()
     assert caught.value is original
+    fail.assert_called_once()
     assert (await store.get_run(run_id)).status == "paused"
     assert (await invoke()).status == RunStatus.SUCCESS
 
@@ -670,7 +674,7 @@ async def test_consumed_submission_keeps_error_handling(store, monkeypatch, kind
         await replay(*args, **kwargs)
         raise original
 
-    monkeypatch.setattr(runner, "_replay_resume_injected_history", after_replay)
+    monkeypatch.setattr(_run_resume_replay, "_replay_resume_injected_history", after_replay)
     with pytest.raises(RuntimeError) as caught:
         await invoke()
     assert caught.value is original
@@ -715,7 +719,7 @@ async def test_submission_failure_after_durable_work_never_releases(
             await replay(*args, **kwargs)
             raise original
 
-        monkeypatch.setattr(runner, "_replay_resume_injected_history", after_replay)
+        monkeypatch.setattr(_run_resume_replay, "_replay_resume_injected_history", after_replay)
     else:
         from dendrux.loops import react as execute
 
@@ -877,7 +881,7 @@ async def test_caller_cancellation_during_claim_release_propagates_after_cleanup
     monkeypatch.setattr(store, "release_run_claim", released)
     task = asyncio.create_task(invoke())
     try:
-        await asyncio.wait_for(entered.wait(), 5)
+        await wait_for_gate(entered, task=task)
         task.cancel()
         await asyncio.sleep(0)
         assert not task.done(), "caller cancellation must drain the fenced release"
@@ -899,7 +903,7 @@ async def test_caller_cancellation_during_claim_release_propagates_after_cleanup
 async def test_released_submit_reports_abort_without_failure_hooks(
     store, engine, monkeypatch, kind, storage_format, failure_site
 ):
-    from dendrux.runtime import runner
+    from dendrux.runtime import _run_observers
     from dendrux.runtime.persistence import PersistenceRecorder
     from dendrux.store import RunStore
     from tests._fixtures.storage import pin_storage_format
@@ -912,11 +916,15 @@ async def test_released_submit_reports_abort_without_failure_hooks(
     notifier = BaseNotifier()
     notifier.on_run_failed = AsyncMock()
     monkeypatch.setattr(PersistenceRecorder, "on_run_failed", recorder_failed)
-    target = store if failure_site == "get_pii_mapping" else runner
+    fault = AsyncMock(side_effect=original)
     with monkeypatch.context() as patcher:
-        patcher.setattr(target, failure_site, AsyncMock(side_effect=original))
+        if failure_site == "get_pii_mapping":
+            patcher.setattr(store, "get_pii_mapping", fault)
+        else:
+            patcher.setattr(_run_observers, "_start_trace", fault)
         with pytest.raises(RuntimeError) as caught:
             await invoke(notifier=notifier)
+    fault.assert_awaited_once()
     assert caught.value is original and original.__dict__ == {}
     recorder_failed.assert_not_awaited()
     notifier.on_run_failed.assert_not_awaited()
@@ -1011,7 +1019,6 @@ async def test_recovery_approval_abort_follows_decision_and_skips_failure_hooks(
 
 
 async def test_resume_abort_event_and_release_roll_back_together(store, monkeypatch, caplog):
-    from dendrux.runtime import runner
     from dendrux.runtime.stores.sql import base
 
     _, run_id, invoke = await submission_case(store, "input")
@@ -1023,8 +1030,8 @@ async def test_resume_abort_event_and_release_roll_back_together(store, monkeypa
             raise RuntimeError("abort_transaction_write_failure")
         return await write(session, event_run_id, event)
 
-    monkeypatch.setattr(runner, "_start_trace", AsyncMock(side_effect=original))
-    monkeypatch.setattr(base, "_write_event", reject_abort)
+    monkeypatch.setattr(_run_observers, "_start_trace", AsyncMock(side_effect=original))
+    monkeypatch.setattr(state, "_write_event", reject_abort)
     with pytest.raises(RuntimeError) as caught:
         await invoke()
     assert caught.value is original
@@ -1065,7 +1072,6 @@ async def test_stale_resume_release_cannot_publish_abort(store):
 
 @pytest.mark.parametrize("failure_kind", ["error", "cancellation"])
 async def test_retry_failure_before_creation_finalizes_nothing(store, monkeypatch, failure_kind):
-    from dendrux.runtime import runner
 
     a = make_agent(store, [LLMResponse(text="prior")])
     original = await a.run("go")
@@ -1077,7 +1083,7 @@ async def test_retry_failure_before_creation_finalizes_nothing(store, monkeypatc
     finalize = AsyncMock()
     monkeypatch.setattr(store, "finalize_run", finalize)
     monkeypatch.setattr(store, "finalize_with_event", finalize)
-    monkeypatch.setattr(runner, "_create_runtime_run", AsyncMock(side_effect=failure))
+    monkeypatch.setattr(_run_entry, "_create_runtime_run", AsyncMock(side_effect=failure))
     with pytest.raises(type(failure)) as caught:
         await a.retry(original.run_id)
     assert caught.value is failure
@@ -1150,7 +1156,7 @@ async def test_completion_beats_caller_cancellation_during_finish(store, entry):
         else a.run("go", notifier=notifier)
     )
     try:
-        await asyncio.wait_for(finishing.wait(), 5)
+        await wait_for_gate(finishing, task=task)
         task.cancel("late_cancellation")
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -1200,18 +1206,18 @@ async def test_overlapping_same_agent_submit_preserves_new_owner_and_interrupts(
         return await start_trace(*args, **kwargs)
 
     notifier.on_run_failed = AsyncMock()
-    monkeypatch.setattr(runner, "_start_trace", fail_first_trace)
+    monkeypatch.setattr(_run_observers, "_start_trace", fail_first_trace)
     monkeypatch.setattr(store, "release_run_claim", delay_release)
     before = await store.get_run(run_id)
     first = asyncio.create_task(invoke(notifier=notifier))
     second = None
     try:
-        await asyncio.wait_for(failed.wait(), 5)
+        await wait_for_gate(failed, task=first)
         released = await store.get_run(run_id)
         assert released.status == before.status
         assert released.claim_epoch == before.claim_epoch + 1
         second = asyncio.create_task(invoke())
-        await asyncio.wait_for(provider.entered.wait(), 5)
+        await wait_for_gate(provider.entered, task=second)
         new_owner = a._task_manager._owned[run_id]
         assert a._task_manager._tasks[run_id] is new_owner
         finish_failure.set()

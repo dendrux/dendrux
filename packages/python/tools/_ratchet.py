@@ -7,6 +7,7 @@ problem or an existing one getting worse. Baselines are small, sorted JSON keyed
 
 from __future__ import annotations
 
+import argparse
 import ast
 import json
 from dataclasses import dataclass, field
@@ -14,7 +15,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Callable, Collection, Mapping, Sequence
 
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 SRC = PACKAGE_ROOT / "src" / "dendrux"
@@ -142,6 +143,98 @@ def baseline_or_none(path: Path) -> dict[str, Any] | None:
         return read_baseline(path)
     except BaselineMissingError:
         return None
+
+
+def transfer_args(
+    argv: list[str] | None, *, description: str | None, baseline: Path
+) -> argparse.Namespace:
+    """Parse the shrink-only tools' check/stamp/report/move interface."""
+    parser = argparse.ArgumentParser(description=description)
+    parser.add_argument("command", choices=["check", "stamp", "report", "move"])
+    parser.add_argument(
+        "keys", nargs="*", metavar="KEY", help="move: repeated OLD_KEY NEW_KEY pairs"
+    )
+    parser.add_argument("--src", type=Path, default=SRC)
+    parser.add_argument("--baseline", type=Path, default=baseline)
+    args = parser.parse_args(argv)
+    if args.command == "move" and (not args.keys or len(args.keys) % 2):
+        parser.error("move requires complete OLD_KEY NEW_KEY pairs")
+    if args.command != "move" and args.keys:
+        parser.error("only move accepts key pairs")
+    return args
+
+
+def transfer_counts(
+    scores: Mapping[str, int],
+    baseline: Mapping[str, int],
+    pairs: Sequence[tuple[str, str]],
+    *,
+    present: Collection[str],
+    retained: Mapping[str, int],
+    minimum: Callable[[str], int],
+    indivisible: Collection[str] = (),
+) -> dict[str, int]:
+    """Validate a move batch and return a new mapping, conserving each source budget.
+
+    Tool-specific wrappers validate key kinds. Present sources must have a smaller
+    retained measurement; that measurement consumes their allowance before transfers.
+    """
+    if not pairs:
+        raise ValueError("move requires at least one OLD_KEY NEW_KEY pair")
+    destinations: set[str] = set()
+    groups: dict[str, list[str]] = {}
+    for old, new in pairs:
+        if old not in baseline or baseline[old] <= minimum(old):
+            raise ValueError(f"{old}: source has no offender allowance")
+        if old in present:
+            if old not in retained:
+                raise ValueError(f"{old}: source still exists in the tree")
+            if retained[old] >= baseline[old]:
+                raise ValueError(f"{old}: retained source did not shrink")
+        if new in baseline or new in destinations:
+            raise ValueError(f"{new}: destination already has or claims an allowance")
+        if scores.get(new, 0) <= minimum(new):
+            raise ValueError(f"{new}: destination is not a current offender")
+        destinations.add(new)
+        groups.setdefault(old, []).append(new)
+    for old, news in groups.items():
+        if old in indivisible and len(news) != 1:
+            raise ValueError(f"{old}: function allowances cannot split")
+        if sum(scores[new] for new in news) + retained.get(old, 0) > baseline[old]:
+            raise ValueError(f"{old}: destination total plus retained value exceeds the allowance")
+    updated = dict(baseline)
+    for old, news in groups.items():
+        if old in retained:
+            updated[old] = retained[old]
+        else:
+            del updated[old]
+        updated.update({new: scores[new] for new in news})
+    return updated
+
+
+def finish_transfer(
+    keys: Sequence[str],
+    *,
+    label: str,
+    scores: Mapping[str, int],
+    baseline: Mapping[str, int] | None,
+    path: Path,
+    prepare: Callable[[Mapping[str, int], Sequence[tuple[str, str]]], Mapping[str, int]],
+) -> int:
+    """Prepare the whole transfer before writing, then log each moved allowance."""
+    if baseline is None:
+        print(f"{label}: move requires an existing baseline: {path}")
+        return 2
+    pairs = list(zip(keys[::2], keys[1::2], strict=True))
+    try:
+        updated = prepare(baseline, pairs)
+    except ValueError as exc:
+        print(f"{label}: refusing move: {exc}")
+        return 1
+    write_baseline(path, updated)
+    for old, new in pairs:
+        print(f"{label} MOVED: {old} -> {new}: {baseline[old]} -> {scores[new]}")
+    return 0
 
 
 def function_spans(source: str) -> list[tuple[int, int, str]]:

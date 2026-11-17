@@ -11,6 +11,8 @@ from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
+from tests._helpers.gates import wait_for_gate
+
 pytest.importorskip("uvicorn")
 
 from dendrux.mcp import MCPSource
@@ -972,7 +974,7 @@ async def test_caller_cancelled_during_remote_revoke_keeps_the_tombstone() -> No
         harness.revocation_gate = asyncio.Event()
         task = asyncio.create_task(oauth.revoke(KEY))
         try:
-            await asyncio.wait_for(harness.revocation_entered.wait(), 10)
+            await wait_for_gate(harness.revocation_entered, task=task)
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task

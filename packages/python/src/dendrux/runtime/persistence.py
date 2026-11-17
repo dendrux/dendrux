@@ -55,12 +55,12 @@ from dendrux._meta_keys import (
 )
 from dendrux.errors import ImagePersistenceUnsupportedError, RunFencedError, safe_exception_info
 from dendrux.loops.base import BaseRecorder
+from dendrux.runtime import _managed_budget, _managed_cancel
 from dendrux.runtime._blob_catalog import edges_for_parts, scrub_inline_images
 from dendrux.runtime._cancel_guard import capture
 from dendrux.runtime._capabilities import capabilities
 from dendrux.runtime._clarification import DEFAULT_PAUSE_SUMMARY_BYTES, clarification_summary
 from dendrux.runtime.durability import retry_critical, retry_transient_db
-from dendrux.runtime.state import read_run_control
 from dendrux.types import (
     ImagePart,
     ImageRef,
@@ -76,7 +76,7 @@ if TYPE_CHECKING:
 
     from dendrux.guardrails import GuardrailEngine
     from dendrux.media import BlobEdge
-    from dendrux.runtime.state import StateStore, TraceWrite
+    from dendrux.runtime.state import RunControl, StateStore, TraceWrite
     from dendrux.types import (
         AgentStep,
         Limits,
@@ -440,7 +440,7 @@ def _view_identity(entry: dict[str, Any]) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
-class PersistenceRecorder(BaseRecorder):
+class PersistenceRecorder(_managed_cancel.CancelAdmission, BaseRecorder):
     """Authoritative evidence recorder — writes loop events to StateStore.
 
     Fail-closed writes (exceptions propagate to caller):
@@ -604,6 +604,7 @@ class PersistenceRecorder(BaseRecorder):
                     target.clear()
                     target.update(saved_value)
         self._restore_budget(budget)
+        _managed_budget.bind(self, budget)
 
     def _restore_budget(self, budget: Any) -> None:
         saved = self._loop_state.get("budget")
@@ -853,6 +854,17 @@ class PersistenceRecorder(BaseRecorder):
             self._remember(trace)
         self._durable_state = deepcopy(self._loop_state)
 
+    async def mark_managed_refusal(self, call_ids: list[str]) -> None:
+        """Durably refuse a whole unsupported managed batch before any single refusal (0.7).
+
+        Recovery refuses every listed call still pending, even when no managed
+        call remains, so a partial refusal never lets a sibling's effect run.
+        """
+        if not self._format2:
+            return
+        self._loop_state["managed_refused"] = list(call_ids)
+        await self._checkpoint()
+
     def order_observations(self, history: list[Message]) -> None:
         """Use the durable observation slots, including decisions made after resume."""
         if not self._format2:
@@ -935,7 +947,7 @@ class PersistenceRecorder(BaseRecorder):
             if self._loop_state != self._durable_state:
                 await self._checkpoint()
         # Ownership can still change between this read and the network send.
-        await read_run_control(self._store_calls, run_id)
+        await self._admission_control(run_id)
         await self._cancel_guard.check(run_id)
 
     async def checkpoint_outcome(self, result: Any, provider_kwargs: Any) -> None:
@@ -1281,9 +1293,7 @@ class PersistenceRecorder(BaseRecorder):
                     interaction_id=interaction_id,
                 )
 
-            await retry_transient_db(
-                _write_interaction, label="save_llm_interaction", run_id=self._run_id
-            )
+            await _managed_budget.record_interaction(self, _write_interaction)
         except RunFencedError:
             raise
         except Exception:
@@ -1393,7 +1403,7 @@ class PersistenceRecorder(BaseRecorder):
         from dendrux.errors import PersistenceError
         from dendrux.runtime._blocked_content import _dispatch_write, _DispatchUndecided
 
-        await self._check_custom_dispatch(run_id)
+        await self._check_custom_dispatch(run_id, await self._managed_checkpoint(run_id))
         undecided = False
         with _dispatch_write(self._store, run_id):
             try:
@@ -1406,7 +1416,7 @@ class PersistenceRecorder(BaseRecorder):
         if undecided:
             raise PersistenceError()
 
-    async def _check_custom_dispatch(self, run_id: str) -> None:
+    async def _check_custom_dispatch(self, run_id: str, control: RunControl | None = None) -> None:
         from dendrux.guardrails._engine import _entry_engine
         from dendrux.loops._helpers import _check_blocked_run
         from dendrux.runtime._blocked_content import _native_blocked_store
@@ -1416,7 +1426,7 @@ class PersistenceRecorder(BaseRecorder):
         if not native and guarded and hasattr(self._store, "add_note"):
             # Custom stores have no mark predicate on the dispatch write: a guarded
             # run reads the mark when notes are pending. Guardrail-free runs add no read.
-            control = await read_run_control(self._store_calls, run_id)
+            control = await self._admission_control(run_id, control)
             if control.has_pending_notes:
                 await _check_blocked_run(self._store, run_id)
 
@@ -1848,3 +1858,82 @@ def resolve_pending(
             raise ValueError("Unsupported tool-call outcome")
         actions.append(ResolutionAction(kind, call_id, pending["order_index"]))
     return actions
+
+
+@_managed_budget.propagate_fault
+async def adopt_managed_result(
+    store: StateStore,
+    run_id: str,
+    *,
+    claim: Any,
+    call_id: str,
+    report: ToolResult,
+    child_run_id: str,
+    agent_path: Sequence[str],
+    observation: Message | None = None,
+    pii_mapping: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Complete a parent's managed tool intent with its accepted report (0.7).
+
+    One ``complete_tool_call`` transaction under the adoption claim's epoch:
+    started intent to completed or failed (its binding metadata kept), the
+    reserved observation, the outcome event, the call removed from pending and
+    the outgoing binding and submission marker cleared. Ordinary
+    ``consume_submission`` is never also called for this observation. A retry
+    after a lost acknowledgement finds the completed intent and adds nothing.
+    Returns the checkpoint after the change.
+    """
+    from dendrux.errors import ManagedStateError
+    from dendrux.runtime.state import EventWrite, _apply_loop_patch
+    from dendrux.types import tool_result_message
+
+    state = dict(claim.loop_state or {})
+    binding = state.get("managed_wait") or {}
+    pending = next((p for p in state.get("pending", []) if p.get("call_id") == call_id), None)
+    if binding.get("tool_call_id") != call_id or binding.get("child_run_id") != child_run_id:
+        raise ManagedStateError(reason="binding_conflict", run_id=run_id)
+    if pending is None:
+        raise ManagedStateError(reason="pending_missing", run_id=run_id)
+    iteration = int(state.get("iteration", 0))
+    trace = message_trace(observation or tool_result_message(report), pending["order_index"])
+    trace.meta["iteration"] = iteration
+    outcome = "completed" if report.success else "failed"
+    event = EventWrite(
+        generate_ulid(),
+        StoredEventType.TOOL_COMPLETED.value,
+        iteration,
+        {
+            "tool_name": report.name,
+            "target": "agent",
+            "success": report.success,
+            "duration_ms": report.duration_ms,
+            "child_run_id": child_run_id,
+            "agent_path": list(agent_path),
+            "managed_outcome": _managed_cancel.outcome_code(report),
+            **_managed_budget.adoption_event(report, state),
+        },
+        call_id,
+        None,
+    )
+    patch = _managed_budget.adoption_patch(state, call_id)
+
+    async def complete() -> None:
+        await store.complete_tool_call(
+            run_id,
+            claim_epoch=claim.claim_epoch,
+            tool_call_id=call_id,
+            outcome=outcome,
+            result_payload=report.payload,
+            success=report.success,
+            duration_ms=report.duration_ms,
+            error_message=report.error,
+            replayed=False,
+            observation=trace,
+            event=event,
+            loop_state_patch=patch,
+            meta=None,
+            pii_mapping=pii_mapping,
+        )
+
+    await retry_critical(complete, label="complete_tool_call", run_id=run_id)
+    return _apply_loop_patch(state, patch)

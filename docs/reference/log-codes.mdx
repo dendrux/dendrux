@@ -162,7 +162,7 @@ Missing or invalid codes remain unset. Category and HTTP status remain independe
 | `legacy_run` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | The run uses a storage format that cannot be reclaimed. | Allow the legacy run to finish or start a new run. |
 | `legacy_run_swept` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | A stale format-1 run is finalised. | Inspect the stopped run; format-1 runs cannot be reclaimed. |
 | `loop_unknown` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | A recovery marker has an unknown loop. | Use a supported recovery loop and inspect worker versions. |
-| `loop_unsupported` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | The saved loop does not support recovery. | Use a supported loop for new recoverable runs. |
+| `loop_unsupported` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | The saved or current loop cannot continue the run (SingleCall never resumes). | For a SingleCall subagent, run sweep() and reclaim the root; else use ReActLoop. |
 | `never_started` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | Sweep finalizes a stale run that never started. | Inspect worker startup and retry with a new run. |
 | `not_running` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | Reclaim targets a run that is no longer running. | Read the current result before retrying recovery. |
 | `pause_format_unsupported` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | A stored pause format is unsupported. | Upgrade every worker before continuing the run. |
@@ -191,12 +191,16 @@ Missing or invalid codes remain unset. Category and HTTP status remain independe
 | --- | --- | --- | --- | --- |
 | `cancel_persist_failed` | ERROR | `code`, `kind`, `run_id`, `tenant_id` | Cancellation cannot be persisted. | Retry cancellation after restoring the store. |
 | `cancel_requested` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | A stale run has a durable cancellation request. | No action unless cancellation is unexpected. |
+| `cascade_child_skipped` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | Cancellation skips a child whose managed header is malformed. | Repair the child's managed state and repeat cancellation from the root. |
 | `cascade_truncated` | WARNING | `code`, `count`, `kind`, `limit`, `run_id`, `tenant_id` | Cancellation discovers more descendants than the subtree traversal bound. | Inspect the bounded subtree and cancel remaining subtrees or raise the bound. |
 | `database_url_env_ignored` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | An Agent without persistence ignores DENDRUX_DATABASE_URL. | Pass state_store or database_url explicitly to persist Agent runs. |
 | `input_size_limit` | WARNING | `bytes`, `code`, `entry`, `field`, `kind`, `limit`, `run_id`, `tenant_id` | An input exceeds its configured bound. | Reduce the input or raise the bound deliberately. |
 | `invalid_limit` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | A recovery limit is invalid. | Use a positive limit within the documented bound. |
 | `legacy_claim_validation` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | A legacy store needs claim-time validation. | Implement the current store capabilities when upgrading. |
 | `local_database_default_changed` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | ./dendrux.db is absent; ~/.dendrux/dendrux.db exists and is no longer the default. | Set DENDRUX_DATABASE_URL to use ~/.dendrux/dendrux.db, or start with ./dendrux.db. |
+| `managed_budget_exceeded` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | Managed execution or child admission reaches the aggregate root budget. | Raise the root allowance and resume through the root under the configured policy. |
+| `managed_budget_invalid` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | Managed definitions declare a child budget or a non-aggregate root budget. | Configure one aggregate budget on the root Agent. |
+| `managed_usage_unknown` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | Managed budget accounting is unavailable, invalid or incomplete. | Restore complete usage reads and resume through the root. |
 | `pause_data_not_jsonb` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | A stored pause is not a JSON object. | Inspect the stored pause format and writer versions. |
 | `pause_id_mismatch` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | A submission targets another pause generation. | Reload the pending pause and resubmit. |
 | `pending_limit` | WARNING | `code`, `count`, `kind`, `limit`, `run_id`, `tenant_id` | A model produces too many pending calls. | Reduce tool fanout or raise the pending call bound. |
@@ -213,6 +217,8 @@ Missing or invalid codes remain unset. Category and HTTP status remain independe
 
 | Code | Level | Fields | Fires when | Do |
 | --- | --- | --- | --- | --- |
+| `db_cancel_converted` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | A database driver replaces a cancellation requested during the current operation. | Cancellation continues; session cleanup owns rollback and close. |
+| `db_close_abandoned` | WARNING | `code`, `kind`, `run_id`, `tenant_id`, `timeout_s` | A database close is still running a bounded time after its caller was cancelled. | Inspect the database driver; the close keeps running in the background. |
 | `follow_capacity` | WARNING | `code`, `kind`, `limit`, `run_id`, `tenant_id` | The process follower cap is reached. | Reduce followers or raise the configured cap. |
 | `follow_feed_error` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | A live event feed fails. | Check store connectivity and retry the feed. |
 | `follow_shutdown_pending` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | A feed is still stopping after its cleanup deadline. | Inspect slow store operations. |
@@ -227,6 +233,28 @@ Missing or invalid codes remain unset. Category and HTTP status remain independe
 | `store_outcome_unknown` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | A commit acknowledgement is lost and the operation outcome cannot be proven. | Inspect persisted state before attempting the operation again. |
 | `store_statement_limit` | WARNING | `bytes`, `code`, `kind`, `limit`, `run_id`, `tenant_id` | A configured limit or a statement is larger than the database accepts. | Lower the Agent's Limits, shrink the payload or raise the server's max_allowed_packet. |
 | `write_conflict` | WARNING | `code`, `count`, `kind`, `run_id`, `table`, `tenant_id` | A retried identity has conflicting content. | Inspect writer consistency; do not retry blindly. |
+
+## Subagent
+
+| Code | Level | Fields | Fires when | Do |
+| --- | --- | --- | --- | --- |
+| `managed_batch_unsupported` | WARNING | `code`, `count`, `kind`, `run_id`, `tenant_id` | A model turn asks for two subagents, or a subagent together with a client tool. | Nothing in the batch ran; the model sees one error per call and may call them one by one. |
+| `managed_child_cancelled` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | A subagent run was cancelled on its own while its parent waited. | The parent sees a failed tool result; read the child run for detail. |
+| `managed_child_failed` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | A subagent run ended with an error or at its iteration limit. | The parent sees a failed tool result; read the child run for detail. |
+| `managed_pause_id_required` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | A managed workflow continuation omits the subagent's pause token. | Send the pause_id from the root's pending as expected_pause_id. |
+| `managed_report_invalid` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | A subagent's saved answer does not match its declared output type. | The parent sees a failed tool result; check the child's output_type. |
+| `managed_report_too_large` | WARNING | `bytes`, `code`, `kind`, `limit`, `run_id`, `tenant_id` | A subagent's report is larger than the parent's max_tool_result_bytes. | Ask for a shorter report or raise the parent's Limits.max_tool_result_bytes. |
+| `managed_result_refused` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | A tool result was submitted for a subagent call; only its child run reports it. | Continue the workflow through its root; the subagent's report is adopted automatically. |
+| `managed_root_required` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | An application controls a managed subagent run directly. | Control the workflow through its root run id; reading the child is allowed. |
+| `managed_run_limit` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | Managed run admission reached its root cap or could not establish its scope. | Use a positive root max_managed_runs cap and resolve inconsistent membership. |
+| `managed_state_invalid` | WARNING | `code`, `kind`, `managed_reason`, `run_id`, `tenant_id` | Persisted managed-subagent state is malformed, missing or inconsistent. | Do not recreate the child; inspect the run's binding and resolve the workflow. |
+| `managed_unsupported` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | A managed workflow is used through an entry this build does not support yet. | Use run() for managed workflows in this build; other entries come in a later step. |
+| `subagent_cycle` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | An Agent is built with a subagent that is its own ancestor. | Remove the cycle from the subagent tree. |
+| `subagent_fanout` | WARNING | `code`, `count`, `kind`, `limit`, `run_id`, `tenant_id` | An Agent is built with more than ten direct subagents. | Group related subagents under a lead; the model chooses less well among many. |
+| `subagent_invalid` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | An Agent is built with a subagents entry that is not a usable subagent. | Pass Agent instances with a valid name and a non-empty description. |
+| `subagent_name_conflict` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | An Agent is built with two subagents of one name, or a subagent named like a tool. | Rename the subagent or the tool. |
+| `subagent_too_deep` | WARNING | `code`, `count`, `kind`, `limit`, `run_id`, `tenant_id` | An Agent is built with a subagent deeper than the delegation depth ceiling. | Flatten the tree or raise max_delegation_depth. |
+| `subagent_tree_too_large` | WARNING | `code`, `kind`, `limit`, `run_id`, `tenant_id` | An Agent is built with a subagent tree over the node bound. | Reduce the subagent tree; a reused agent counts once per path. |
 
 ## Tool
 

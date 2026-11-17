@@ -8,7 +8,8 @@ import pytest
 
 from dendrux.errors import PersistenceError
 from dendrux.loops.base import BaseNotifier
-from dendrux.runtime import runner
+from dendrux.runtime import _run_observers, _run_resume_replay, runner
+from dendrux.runtime import submit as submit_mod
 from dendrux.runtime.persistence import PersistenceRecorder
 from dendrux.types import RunEventType, RunStatus
 from tests._fixtures.storage import pin_storage_format
@@ -167,7 +168,7 @@ async def test_unavailable_release_during_claimed_prelude(store, engine, monkeyp
 
     if entry in {"resume", "resume_stream"}:
         monkeypatch.setattr(
-            runner, "report_governance_change", AsyncMock(side_effect=PersistenceError())
+            submit_mod, "report_governance_change", AsyncMock(side_effect=PersistenceError())
         )
     else:
         monkeypatch.setattr(store, "get_pause_state", owned_read)
@@ -190,7 +191,7 @@ async def test_stream_governance_cleanup_reports_its_row(store, engine, monkeypa
     )
     monkeypatch.setattr(store, "release_run_claim", release)
     monkeypatch.setattr(
-        runner, "report_governance_change", AsyncMock(side_effect=PersistenceError())
+        submit_mod, "report_governance_change", AsyncMock(side_effect=PersistenceError())
     )
     result = await case.invoke()
     expected = "running" if release_fails else "waiting_client_tool"
@@ -212,9 +213,11 @@ async def test_release_observers_report_outcome(store, engine, monkeypatch, entr
     async def traced(_notifier, *args, **kwargs):
         return await trace(notifier, *args, **kwargs)
 
-    monkeypatch.setattr(runner, "_start_trace", traced)
+    monkeypatch.setattr(_run_observers, "_start_trace", traced)
     monkeypatch.setattr(
-        runner, "_replay_resume_injected_history", AsyncMock(side_effect=PersistenceError())
+        _run_resume_replay,
+        "_replay_resume_injected_history",
+        AsyncMock(side_effect=PersistenceError()),
     )
     if release_result == "failure":
         monkeypatch.setattr(store, "release_run_claim", AsyncMock(side_effect=PersistenceError()))
@@ -261,7 +264,12 @@ async def test_reclaim_without_release_can_retry_setup_failure(store, engine, mo
         with pytest.raises(PersistenceError):
             await case.invoke()
     row = await store.get_run(case.run_id)
-    assert row.status == "running" and row.claim_epoch == before.claim_epoch + 1
+    assert row.status == "running"
+    # The pre-claim format check must fail closed if its pause read fails.
+    if read == "get_pause_state":
+        assert row == before
+    else:
+        assert row.claim_epoch == before.claim_epoch + 1
     assert provider.calls == 0
     assert not any(e.event_type == "run.error" for e in await store.get_run_events(case.run_id))
     item = await expire(store, engine, case.run_id)

@@ -145,6 +145,7 @@ _ENUMS = {
             "loop_unknown",
             "loop_unsupported",
             "not_running",
+            "pause_format_unsupported",
             "reclaim_limit",
             "recovery_call_missing",
             "recovery_state_missing",
@@ -152,6 +153,20 @@ _ENUMS = {
             "sibling_failed",
             "skill_mismatch",
             "store_capability",
+        ]
+    ),
+    "managed_reason": frozenset(
+        [
+            "binding_conflict",
+            "binding_missing",
+            "binding_outstanding",
+            "child_mismatch",
+            "child_missing",
+            "header_invalid",
+            "pending_missing",
+            "storage_format",
+            "wait_invalid",
+            "wait_too_large",
         ]
     ),
     "entry": frozenset(
@@ -688,6 +703,22 @@ SHARED_ENGINE_LOOP_CLOSED = Code(
     "A pooled engine belongs to a closed event loop.",
     "Use an engine owned by the current loop.",
 )
+DB_CANCEL_CONVERTED = Code(
+    "db_cancel_converted",
+    logging.WARNING,
+    "store",
+    _BASE_FIELDS,
+    "A database driver replaces a cancellation requested during the current operation.",
+    "Cancellation continues; session cleanup owns rollback and close.",
+)
+DB_CLOSE_ABANDONED = Code(
+    "db_close_abandoned",
+    logging.WARNING,
+    "store",
+    _BASE_FIELDS | frozenset(["timeout_s"]),
+    "A database close is still running a bounded time after its caller was cancelled.",
+    "Inspect the database driver; the close keeps running in the background.",
+)
 TOOL_ROW_MAY_BE_MISSING = Code(
     "tool_row_may_be_missing",
     logging.WARNING,
@@ -815,6 +846,142 @@ PROVIDER_KWARGS_TOO_LARGE = Code(
     _BASE_FIELDS | frozenset(["bytes", "limit"]),
     "Provider options exceed the checkpoint byte bound.",
     "Reduce provider options.",
+)
+SUBAGENT_INVALID = Code(
+    "subagent_invalid",
+    logging.WARNING,
+    "subagent",
+    _BASE_FIELDS | frozenset([]),
+    "An Agent is built with a subagents entry that is not a usable subagent.",
+    "Pass Agent instances with a valid name and a non-empty description.",
+)
+SUBAGENT_NAME_CONFLICT = Code(
+    "subagent_name_conflict",
+    logging.WARNING,
+    "subagent",
+    _BASE_FIELDS | frozenset([]),
+    "An Agent is built with two subagents of one name, or a subagent named like a tool.",
+    "Rename the subagent or the tool.",
+)
+SUBAGENT_CYCLE = Code(
+    "subagent_cycle",
+    logging.WARNING,
+    "subagent",
+    _BASE_FIELDS | frozenset([]),
+    "An Agent is built with a subagent that is its own ancestor.",
+    "Remove the cycle from the subagent tree.",
+)
+SUBAGENT_TOO_DEEP = Code(
+    "subagent_too_deep",
+    logging.WARNING,
+    "subagent",
+    _BASE_FIELDS | frozenset(["count", "limit"]),
+    "An Agent is built with a subagent deeper than the delegation depth ceiling.",
+    "Flatten the tree or raise max_delegation_depth.",
+)
+SUBAGENT_TREE_TOO_LARGE = Code(
+    "subagent_tree_too_large",
+    logging.WARNING,
+    "subagent",
+    _BASE_FIELDS | frozenset(["limit"]),
+    "An Agent is built with a subagent tree over the node bound.",
+    "Reduce the subagent tree; a reused agent counts once per path.",
+)
+SUBAGENT_FANOUT = Code(
+    "subagent_fanout",
+    logging.WARNING,
+    "subagent",
+    _BASE_FIELDS | frozenset(["count", "limit"]),
+    "An Agent is built with more than ten direct subagents.",
+    "Group related subagents under a lead; the model chooses less well among many.",
+)
+MANAGED_BATCH_UNSUPPORTED = Code(
+    "managed_batch_unsupported",
+    logging.WARNING,
+    "subagent",
+    _BASE_FIELDS | frozenset(["count"]),
+    "A model turn asks for two subagents, or a subagent together with a client tool.",
+    "Nothing in the batch ran; the model sees one error per call and may call them one by one.",
+)
+MANAGED_CHILD_FAILED = Code(
+    "managed_child_failed",
+    logging.WARNING,
+    "subagent",
+    _BASE_FIELDS | frozenset([]),
+    "A subagent run ended with an error or at its iteration limit.",
+    "The parent sees a failed tool result; read the child run for detail.",
+)
+MANAGED_CHILD_CANCELLED = Code(
+    "managed_child_cancelled",
+    logging.WARNING,
+    "subagent",
+    _BASE_FIELDS | frozenset([]),
+    "A subagent run was cancelled on its own while its parent waited.",
+    "The parent sees a failed tool result; read the child run for detail.",
+)
+MANAGED_REPORT_INVALID = Code(
+    "managed_report_invalid",
+    logging.WARNING,
+    "subagent",
+    _BASE_FIELDS | frozenset([]),
+    "A subagent's saved answer does not match its declared output type.",
+    "The parent sees a failed tool result; check the child's output_type.",
+)
+MANAGED_REPORT_TOO_LARGE = Code(
+    "managed_report_too_large",
+    logging.WARNING,
+    "subagent",
+    _BASE_FIELDS | frozenset(["bytes", "limit"]),
+    "A subagent's report is larger than the parent's max_tool_result_bytes.",
+    "Ask for a shorter report or raise the parent's Limits.max_tool_result_bytes.",
+)
+MANAGED_ROOT_REQUIRED = Code(
+    "managed_root_required",
+    logging.WARNING,
+    "subagent",
+    _BASE_FIELDS | frozenset([]),
+    "An application controls a managed subagent run directly.",
+    "Control the workflow through its root run id; reading the child is allowed.",
+)
+MANAGED_UNSUPPORTED = Code(
+    "managed_unsupported",
+    logging.WARNING,
+    "subagent",
+    _BASE_FIELDS | frozenset([]),
+    "A managed workflow is used through an entry this build does not support yet.",
+    "Use run() for managed workflows in this build; other entries come in a later step.",
+)
+MANAGED_RESULT_REFUSED = Code(
+    "managed_result_refused",
+    logging.WARNING,
+    "subagent",
+    _BASE_FIELDS | frozenset([]),
+    "A tool result was submitted for a subagent call; only its child run reports it.",
+    "Continue the workflow through its root; the subagent's report is adopted automatically.",
+)
+MANAGED_PAUSE_ID_REQUIRED = Code(
+    "managed_pause_id_required",
+    logging.WARNING,
+    "subagent",
+    _BASE_FIELDS | frozenset([]),
+    "A managed workflow continuation omits the subagent's pause token.",
+    "Send the pause_id from the root's pending as expected_pause_id.",
+)
+MANAGED_STATE_INVALID = Code(
+    "managed_state_invalid",
+    logging.WARNING,
+    "subagent",
+    _BASE_FIELDS | frozenset(["managed_reason"]),
+    "Persisted managed-subagent state is malformed, missing or inconsistent.",
+    "Do not recreate the child; inspect the run's binding and resolve the workflow.",
+)
+MANAGED_RUN_LIMIT = Code(
+    "managed_run_limit",
+    logging.WARNING,
+    "subagent",
+    _BASE_FIELDS | frozenset([]),
+    "Managed run admission reached its root cap or could not establish its scope.",
+    "Use a positive root max_managed_runs cap and resolve inconsistent membership.",
 )
 LEASE_INTERVAL = Code(
     "lease_interval",
@@ -1744,8 +1911,8 @@ LOOP_UNSUPPORTED = Code(
     logging.WARNING,
     "recovery",
     _BASE_FIELDS,
-    "The saved loop does not support recovery.",
-    "Use a supported loop for new recoverable runs.",
+    "The saved or current loop cannot continue the run (SingleCall never resumes).",
+    "For a SingleCall subagent, run sweep() and reclaim the root; else use ReActLoop.",
 )
 RECOVERY_CALL_MISSING = Code(
     "recovery_call_missing",
@@ -1802,6 +1969,40 @@ TOOL_REPLAYED = Code(
     _BASE_FIELDS,
     "Recovery replays an interrupted idempotent tool.",
     "Monitor repeated worker crashes and tool idempotence.",
+)
+
+MANAGED_BUDGET_EXCEEDED = Code(
+    "managed_budget_exceeded",
+    logging.WARNING,
+    "runtime",
+    _BASE_FIELDS,
+    "Managed execution or child admission reaches the aggregate root budget.",
+    "Raise the root allowance and resume through the root under the configured policy.",
+)
+MANAGED_BUDGET_INVALID = Code(
+    "managed_budget_invalid",
+    logging.WARNING,
+    "runtime",
+    _BASE_FIELDS,
+    "Managed definitions declare a child budget or a non-aggregate root budget.",
+    "Configure one aggregate budget on the root Agent.",
+)
+MANAGED_USAGE_UNKNOWN = Code(
+    "managed_usage_unknown",
+    logging.WARNING,
+    "runtime",
+    _BASE_FIELDS,
+    "Managed budget accounting is unavailable, invalid or incomplete.",
+    "Restore complete usage reads and resume through the root.",
+)
+
+CASCADE_CHILD_SKIPPED = Code(
+    "cascade_child_skipped",
+    logging.WARNING,
+    "runtime",
+    _BASE_FIELDS,
+    "Cancellation skips a child whose managed header is malformed.",
+    "Repair the child's managed state and repeat cancellation from the root.",
 )
 
 CASCADE_TRUNCATED = Code(
@@ -1877,6 +2078,10 @@ REGISTRY = MappingProxyType(
             MCP_OBSERVER_DISPOSE_FAILED,
             MCP_OAUTH_CLOSE_FAILED,
             MCP_CLEANUP_FAILED,
+            CASCADE_CHILD_SKIPPED,
+            MANAGED_BUDGET_EXCEEDED,
+            MANAGED_BUDGET_INVALID,
+            MANAGED_USAGE_UNKNOWN,
             CASCADE_TRUNCATED,
             LEGACY_RUN,
             NOT_RUNNING,
@@ -1984,6 +2189,8 @@ REGISTRY = MappingProxyType(
             MIGRATION_LOCK_TIMEOUT,
             MIGRATION_VERSION_TABLE_CONFLICT,
             SHARED_ENGINE_LOOP_CLOSED,
+            DB_CLOSE_ABANDONED,
+            DB_CANCEL_CONVERTED,
             TOOL_ROW_MAY_BE_MISSING,
             OUTCOME_UNKNOWN,
             CANCELLED,
@@ -2001,6 +2208,23 @@ REGISTRY = MappingProxyType(
             PROVIDER_KWARGS_INVALID,
             PROVIDER_KWARGS_TOO_LARGE,
             LEASE_INTERVAL,
+            SUBAGENT_INVALID,
+            SUBAGENT_NAME_CONFLICT,
+            SUBAGENT_CYCLE,
+            SUBAGENT_TOO_DEEP,
+            SUBAGENT_TREE_TOO_LARGE,
+            SUBAGENT_FANOUT,
+            MANAGED_BATCH_UNSUPPORTED,
+            MANAGED_CHILD_FAILED,
+            MANAGED_CHILD_CANCELLED,
+            MANAGED_REPORT_INVALID,
+            MANAGED_REPORT_TOO_LARGE,
+            MANAGED_ROOT_REQUIRED,
+            MANAGED_UNSUPPORTED,
+            MANAGED_PAUSE_ID_REQUIRED,
+            MANAGED_RESULT_REFUSED,
+            MANAGED_STATE_INVALID,
+            MANAGED_RUN_LIMIT,
             CHECKPOINT_TOO_LARGE,
             REWRITE_INVALID,
             WRITE_CONFLICT,

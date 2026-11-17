@@ -285,7 +285,8 @@ async def _get_catalog(models_url: str) -> dict[str, OpenRouterModel] | None:
     if models_url not in _catalog_cache:
         try:
             _catalog_cache[models_url] = await _fetch_catalog(models_url)
-        except Exception as exc:  # noqa: BLE001 — degrade path, never break runs
+        # BLE001 is enabled by the ratchet; catalog failures must not break runs.
+        except Exception as exc:  # noqa: BLE001, RUF100
             logger.warning(
                 "Could not fetch OpenRouter model catalog from %s (%s). "
                 "Native-tool support cannot be verified; proceeding without the check.",

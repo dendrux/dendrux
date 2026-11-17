@@ -24,6 +24,7 @@ from dendrux.loops.base import BaseNotifier
 from dendrux.runtime.context import get_delegation_context
 from dendrux.tool import tool
 from dendrux.types import LLMResponse, RunStatus
+from tests._helpers.gates import wait_for_gate
 from tests._helpers.scripted_provider import ScriptedLLM, tool_call
 
 pytestmark = pytest.mark.asyncio
@@ -73,7 +74,7 @@ class TestRunInterrupt:
         llm = ScriptedLLM([LLMResponse(text="unreached")], gate_at=0)
         agent = Agent(strict_tenancy=False, provider=llm, prompt="Test.", state_store=store)
         task = asyncio.create_task(agent.run("go"))
-        await asyncio.wait_for(llm.entered.wait(), 5)
+        await wait_for_gate(llm.entered, task=task)
         run_id = await _only_run_id(store)
 
         requested = await agent.cancel_run(run_id)
@@ -117,7 +118,7 @@ class TestRunInterrupt:
             strict_tenancy=False, provider=llm, prompt="Test.", tools=[slow], state_store=store
         )
         task = asyncio.create_task(agent.run("go"))
-        await asyncio.wait_for(entered.wait(), 5)
+        await wait_for_gate(entered, task=task)
         run_id = await _only_run_id(store)
 
         await agent.cancel_run(run_id)
@@ -142,7 +143,7 @@ class TestRunInterrupt:
         llm = ScriptedLLM([LLMResponse(text="final")])
         agent = Agent(strict_tenancy=False, provider=llm, prompt="Test.", state_store=store)
         task = asyncio.create_task(agent.run("go", notifier=Blocking()))
-        await asyncio.wait_for(entered.wait(), 5)
+        await wait_for_gate(entered, task=task)
         run_id = await _only_run_id(store)
 
         await agent.cancel_run(run_id)
@@ -164,7 +165,7 @@ class TestRunInterrupt:
         llm = ScriptedLLM([LLMResponse(text="unreached")], gate_at=0)
         agent = Agent(strict_tenancy=False, provider=llm, prompt="Test.", state_store=store)
         task = asyncio.create_task(agent.run("go"))
-        await asyncio.wait_for(llm.entered.wait(), 5)
+        await wait_for_gate(llm.entered, task=task)
         run_id = await _only_run_id(store)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -182,7 +183,7 @@ class TestRunInterrupt:
             strict_tenancy=False, provider=ScriptedLLM([]), prompt="Test.", state_store=store
         )
         task = asyncio.create_task(owner.run("go"))
-        await asyncio.wait_for(llm.entered.wait(), 5)
+        await wait_for_gate(llm.entered, task=task)
         run_id = await _only_run_id(store)
 
         await other.cancel_run(run_id)
@@ -249,7 +250,7 @@ class TestCascade:
     async def test_nested_cascade_pause_is_flag_propagation_only(self, store) -> None:
         d = _delegation(store)
         task = asyncio.create_task(d["parent"].run("go"))
-        await asyncio.wait_for(d["child_llm"].entered.wait(), 5)
+        await wait_for_gate(d["child_llm"].entered, task=task)
         parent_id = await _only_run_id(store)
         child_id = await _only_run_id(store, parent=parent_id)
 
@@ -337,7 +338,7 @@ class TestCascade:
     async def test_cascade_cancel_interrupts_nested_running_child_in_process(self, store) -> None:
         d = _delegation(store)
         task = asyncio.create_task(d["parent"].run("go"))
-        await asyncio.wait_for(d["child_llm"].entered.wait(), 5)
+        await wait_for_gate(d["child_llm"].entered, task=task)
         parent_id = await _only_run_id(store)
         child_id = await _only_run_id(store, parent=parent_id)
 
@@ -370,7 +371,7 @@ class TestCascade:
         )
         holder["agent"] = agent
         task = asyncio.create_task(agent.run("go"))
-        await asyncio.wait_for(llm.entered.wait(), 5)
+        await wait_for_gate(llm.entered, task=task)
         parent_id = await _only_run_id(store)
         child_id = await _only_run_id(store, parent=parent_id)
 
@@ -401,7 +402,7 @@ class TestCascade:
         )
         holder["agent"] = agent
         task = asyncio.create_task(agent.run("go"))
-        await asyncio.wait_for(llm.entered.wait(), 5)
+        await wait_for_gate(llm.entered, task=task)
         parent_id = await _only_run_id(store)
         child_id = await _only_run_id(store, parent=parent_id)
 
@@ -590,7 +591,7 @@ class TestHeartbeat:
             strict_tenancy=False, provider=llm, prompt="T.", tools=[slow], state_store=store
         )
         task = asyncio.create_task(agent.run("go", notifier=BackdateBeforeTool()))
-        await asyncio.wait_for(entered.wait(), 5)
+        await wait_for_gate(entered, task=task)
         run_id = await _only_run_id(store)
         record = await store.get_run(run_id)
         assert record.last_progress_at > dt.datetime(2000, 1, 2, tzinfo=dt.UTC)

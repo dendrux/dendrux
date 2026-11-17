@@ -46,14 +46,24 @@ def _reused(q: str) -> LLMResponse:
 
 
 async def _follow(run_store: RunStore, run_id: str) -> list[StoredEvent]:
+    """Follow until every event stored so far has been delivered.
+
+    The stop condition is the stored event count, never a short deadline, so a
+    slow runner cannot end the follow before the last event arrives.
+    """
+    expected = len(await run_store.get_events(run_id, tenant_id="A", limit=1000))
     out: list[StoredEvent] = []
+    if expected == 0:
+        return out
     async with run_store.follow(
-        run_id, tenant_id="A", until_terminal=False, max_duration_s=1.0
+        run_id, tenant_id="A", until_terminal=False, max_duration_s=60.0
     ) as f:
         async for item in f:
             if isinstance(item, (FollowEnd, FollowHeartbeat)):
                 break
             out.append(item)
+            if len(out) >= expected:
+                break
     return out
 
 
@@ -246,4 +256,5 @@ async def test_mcp_tool_with_a_reserved_name_is_still_an_mcp_tool(
     run_id = "rs".ljust(26, "0")
     await _tool_run(store, run_id, "use_skill", connected=True)
     events = await _follow(run_store, run_id)
-    assert events[-1].data["tool_name"] == "<mcp_tool>"
+    completed = [e for e in events if e.event_type == "tool.completed"]
+    assert [e.data["tool_name"] for e in completed] == ["<mcp_tool>"]

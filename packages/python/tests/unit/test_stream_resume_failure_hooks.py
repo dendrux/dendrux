@@ -5,7 +5,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from dendrux.runtime import runner
+from dendrux.loops import _helpers
+from dendrux.runtime import _run_resume_loop, _run_start, runner
 from dendrux.types import RunStatus
 
 
@@ -46,10 +47,10 @@ async def test_stream_failure_hook_error_scope(monkeypatch, caplog, failure_site
         calls.append("released_status")
         return RunStatus.WAITING_APPROVAL
 
-    monkeypatch.setattr(runner, "_persist_run_failure", persist)
-    monkeypatch.setattr(runner, "record_run_failed", record)
-    monkeypatch.setattr(runner, "notify_run_failed", notify)
-    monkeypatch.setattr(runner, "_released_resume_status", released_status)
+    monkeypatch.setattr(_run_start, "_persist_run_failure", persist)
+    monkeypatch.setattr(_helpers, "record_run_failed", record)
+    monkeypatch.setattr(_helpers, "notify_run_failed", notify)
+    monkeypatch.setattr(_run_resume_loop, "_released_resume_status", released_status)
     shared = {"claimed": True, "released_prelude": store}
     pending = runner._finish_stream_resume_failure(
         shared, store, ctx, extra_notifier, "run", original_error

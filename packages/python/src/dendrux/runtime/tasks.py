@@ -65,7 +65,7 @@ async def _drain_cleanup(
             except asyncio.CancelledError as exc:
                 if cancellation is None:
                     cancellation = exc
-            except Exception:
+            except Exception:  # noqa: S110 - task.result() below rethrows failures or preserves retained cancellation.
                 pass  # task.result() resolves failures against the retained cancellation.
         result = _resolve_drained(task, cancellation, run_id)
     return result, cancellation

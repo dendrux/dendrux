@@ -167,7 +167,6 @@ class ConsoleNotifier(BaseNotifier):
         """Called when an LLM call begins. We don't print here to keep the
         trace tight — the matching on_llm_call_completed prints duration
         and tokens. Subclasses can override for live-latency displays."""
-        return None
 
     async def on_llm_call_failed(
         self,

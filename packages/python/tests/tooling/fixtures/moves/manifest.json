@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "base": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "old": "old",
+  "source_sha256": "f3480430ea161d917a45d1475b153c95d105b764f589bedf108cf0b1572b702e",
+  "sources": {
+    "old": "54362387bfc6ed997a00dddc8abcd7d56bdabe8dd542458aca2bd179141fb1af",
+    "new": "5bdd1496e410831079d57688ed04125ae01494e294a870bb34c3dcb7f60680d2"
+  },
+  "owners": {
+    "helper": "new",
+    "use": "old"
+  },
+  "lexical": [
+    {
+      "root": "use",
+      "module": "old",
+      "name": "helper",
+      "target": "new.helper",
+      "count": 2
+    }
+  ],
+  "hoists": [],
+  "annotations": [],
+  "metadata": [],
+  "scaffolding": {},
+  "effects": [],
+  "seams": {},
+  "providers": {}
+}

@@ -6,7 +6,7 @@ import pytest
 from sqlalchemy import text
 
 from dendrux.errors import RunFencedError
-from dendrux.runtime import runner
+from dendrux.runtime import _run_events, runner
 from dendrux.runtime.state import _ClaimedStateStore
 from dendrux.types import RunResult, RunStatus, generate_ulid
 from tests._fixtures.storage import pin_storage_format
@@ -47,7 +47,7 @@ async def test_failed_placeholder_observation_still_persists_answer(store, monke
             raise RuntimeError("evidence unavailable")
         return await emit(state, run_id, event_type, *args, **kwargs)
 
-    monkeypatch.setattr(runner, "_emit_event", fail_observation)
+    monkeypatch.setattr(_run_events, "_emit_event", fail_observation)
     result = await runner._persist_loop_outcome(
         state_store=store,
         run_id="r",

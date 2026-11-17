@@ -27,6 +27,8 @@ from typing import Any
 
 import pytest
 
+from tests._helpers.gates import wait_for_gate
+
 httpx = pytest.importorskip("httpx")
 anthropic = pytest.importorskip("anthropic")
 openai = pytest.importorskip("openai")
@@ -952,7 +954,7 @@ async def _expire_during_backoff(provider, controlled_deadlines):
     provider._client._client.event_hooks["response"].append(observed_response)
     call = asyncio.create_task(provider.complete(USER))
     try:
-        await asyncio.wait_for(received.wait(), 10)
+        await wait_for_gate(received, task=call)
         controlled_deadlines[-1].reschedule(asyncio.get_running_loop().time())
         return await asyncio.wait_for(call, 10)
     finally:
@@ -976,7 +978,7 @@ class TestDeadlines:
         w = wire(provider, slow)
         call = asyncio.create_task(provider.complete(USER))
         try:
-            await asyncio.wait_for(entered.wait(), 20)
+            await wait_for_gate(entered, task=call)
             assert deadline_arms, "fixture must record when the real deadline was armed"
             armed_at, requested_when = deadline_arms[0]
             assert requested_when - armed_at == pytest.approx(0.2, abs=0.02)
@@ -1230,7 +1232,7 @@ class TestDeadlines:
         w = wire(provider, lambda request: httpx.Response(200, stream=WaitingBody()))
         consumer = asyncio.create_task(drain(provider.complete_stream(USER)))
         try:
-            await asyncio.wait_for(reading.wait(), 20)
+            await wait_for_gate(reading, task=consumer)
             assert deadline_arms, "fixture must record when the real deadline was armed"
             armed_at, requested_when = deadline_arms[0]
             assert requested_when - armed_at == pytest.approx(0.2, abs=0.02)

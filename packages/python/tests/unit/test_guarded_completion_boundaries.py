@@ -7,7 +7,7 @@ import pytest
 
 from dendrux.loops import react
 from dendrux.loops._helpers import _BlockedObservationError
-from dendrux.runtime import runner
+from dendrux.runtime import _run_events, runner
 from dendrux.types import Message, Role, ToolCall, ToolResult
 
 
@@ -15,8 +15,8 @@ from dendrux.types import Message, Role, ToolCall, ToolResult
 async def test_failure_persistence_preserves_strict_write_error(monkeypatch, strict):
     error = RuntimeError("write_failed")
     emit = AsyncMock()
-    monkeypatch.setattr(runner, "_finalize_running_event", AsyncMock(side_effect=error))
-    monkeypatch.setattr(runner, "_emit_event", emit)
+    monkeypatch.setattr(_run_events, "_finalize_running_event", AsyncMock(side_effect=error))
+    monkeypatch.setattr(_run_events, "_emit_event", emit)
     if strict:
         with pytest.raises(RuntimeError) as caught:
             await runner._persist_run_failure(

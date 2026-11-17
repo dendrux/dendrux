@@ -8,6 +8,7 @@ import pytest
 
 from dendrux.errors import FollowCapacityError, RunNotFoundError
 from dendrux.store import EventFeed, FollowEnd, RunStore, _follow
+from tests._helpers.gates import wait_for_gate
 from tests.unit.test_follow_coordinator import BatchedState, FakeLive, ticks
 from tests.unit.test_follow_coordinator import clock as clock
 from tests.unit.test_follow_lease_lifecycle import SlowStopLive
@@ -95,7 +96,7 @@ async def test_stalled_idle_stop_does_not_block_join_or_polling(monkeypatch):
         await ticks(40)
         live.stopping.clear()
         await first.aclose()
-        await asyncio.wait_for(releasing.wait(), 5)
+        await wait_for_gate(releasing)
         assert reader._retiring_lease is not None
         await asyncio.wait_for(second.start(), 0.2)
         await ticks(40)  # Let the join read finish before the event arrives.
@@ -132,7 +133,7 @@ async def test_request_cancel_does_not_cancel_owned_idle_release(monkeypatch):
     await follow.aclose()
     pending = asyncio.create_task(reader.follow("missing", tenant_id=None).start())
     try:
-        await asyncio.wait_for(entered.wait(), 1)
+        await wait_for_gate(entered)
         pending.cancel()
         await asyncio.gather(pending, return_exceptions=True)
         assert reader._lease is None
@@ -343,7 +344,7 @@ async def test_transient_retirement_failure_recovers_with_active_follow(monkeypa
         await first.start()
         await ticks()
         await first.aclose()
-        await asyncio.wait_for(failed.wait(), 1)
+        await wait_for_gate(failed)
         await second.start()
         async with asyncio.timeout(0.3):
             while reader._lease is None or not live.healthy:

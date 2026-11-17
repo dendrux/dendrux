@@ -57,6 +57,7 @@ except ImportError:  # pragma: no cover - import guard
     Tracer = Any  # type: ignore[assignment,misc]
 
 
+# BLE001 is enabled by the ratchet, not base lint; RUF100 keeps these fail-open suppressions.
 _LOG = logging.getLogger(__name__)
 
 _FRAMEWORK = "dendrux"
@@ -143,7 +144,7 @@ class OpenTelemetryNotifier(BaseNotifier):
                 carrier, context=trace.set_span_in_context(span, Context())
             )
             return validate_trace_link(carrier.get("traceparent"))
-        except Exception as exc:  # noqa: BLE001 - fail open
+        except Exception as exc:  # noqa: BLE001, RUF100 - fail open; ratchet-only rule
             _LOG.warning("OpenTelemetryNotifier span link failed: %s", type(exc).__name__)
             return None
 
@@ -177,7 +178,7 @@ class OpenTelemetryNotifier(BaseNotifier):
             )
             span = self._tracer.start_span(span_name, context=parent, attributes=attributes)
             self._run_spans[run_id] = span
-        except Exception as exc:  # noqa: BLE001 - fail open
+        except Exception as exc:  # noqa: BLE001, RUF100 - fail open; ratchet-only rule
             _LOG.warning("OpenTelemetryNotifier.on_run_started failed: %s", type(exc).__name__)
 
     async def on_run_finished(self, run_id: str, result: RunResult) -> None:
@@ -201,7 +202,7 @@ class OpenTelemetryNotifier(BaseNotifier):
             else:
                 span.set_status(Status(StatusCode.OK))
             span.end()
-        except Exception as exc:  # noqa: BLE001 - fail open
+        except Exception as exc:  # noqa: BLE001, RUF100 - fail open; ratchet-only rule
             _LOG.warning("OpenTelemetryNotifier.on_run_finished failed: %s", type(exc).__name__)
 
     async def on_run_failed(
@@ -223,7 +224,7 @@ class OpenTelemetryNotifier(BaseNotifier):
             if iteration is not None:
                 span.set_attribute("dendrux.run.iteration", int(iteration))
             span.end()
-        except Exception as exc:  # noqa: BLE001 - fail open
+        except Exception as exc:  # noqa: BLE001, RUF100 - fail open; ratchet-only rule
             _LOG.warning("OpenTelemetryNotifier.on_run_failed failed: %s", type(exc).__name__)
 
     # ------------------------------------------------------------------
@@ -255,7 +256,7 @@ class OpenTelemetryNotifier(BaseNotifier):
                 attributes=attributes,
             )
             self._llm_spans[(run_id, iteration)] = span
-        except Exception as exc:  # noqa: BLE001 - fail open
+        except Exception as exc:  # noqa: BLE001, RUF100 - fail open; ratchet-only rule
             _LOG.warning("OpenTelemetryNotifier.on_llm_call_started failed: %s", type(exc).__name__)
 
     async def on_llm_call_completed(
@@ -290,7 +291,7 @@ class OpenTelemetryNotifier(BaseNotifier):
 
             span.set_status(Status(StatusCode.OK))
             span.end()
-        except Exception as exc:  # noqa: BLE001 - fail open
+        except Exception as exc:  # noqa: BLE001, RUF100 - fail open; ratchet-only rule
             _LOG.warning(
                 "OpenTelemetryNotifier.on_llm_call_completed failed: %s", type(exc).__name__
             )
@@ -333,7 +334,7 @@ class OpenTelemetryNotifier(BaseNotifier):
             if duration_ms is not None:
                 span.set_attribute("dendrux.llm.duration_ms", int(duration_ms))
             span.end()
-        except Exception as exc:  # noqa: BLE001 - fail open
+        except Exception as exc:  # noqa: BLE001, RUF100 - fail open; ratchet-only rule
             _LOG.warning("OpenTelemetryNotifier.on_llm_call_failed failed: %s", type(exc).__name__)
 
     # ------------------------------------------------------------------
@@ -359,7 +360,7 @@ class OpenTelemetryNotifier(BaseNotifier):
                 attributes=attributes,
             )
             self._tool_spans[(run_id, tool_call.id)] = span
-        except Exception as exc:  # noqa: BLE001 - fail open
+        except Exception as exc:  # noqa: BLE001, RUF100 - fail open; ratchet-only rule
             _LOG.warning("OpenTelemetryNotifier.on_tool_started failed: %s", type(exc).__name__)
 
     async def on_tool_completed(
@@ -388,7 +389,7 @@ class OpenTelemetryNotifier(BaseNotifier):
                     },
                 )
             span.end()
-        except Exception as exc:  # noqa: BLE001 - fail open
+        except Exception as exc:  # noqa: BLE001, RUF100 - fail open; ratchet-only rule
             _LOG.warning("OpenTelemetryNotifier.on_tool_completed failed: %s", type(exc).__name__)
 
     # ------------------------------------------------------------------
@@ -414,7 +415,7 @@ class OpenTelemetryNotifier(BaseNotifier):
             for k, v in data.items():
                 attrs[f"dendrux.governance.{k}"] = _to_attr_value(v)
             span.add_event(f"governance.{event_type}", attributes=attrs)
-        except Exception as exc:  # noqa: BLE001 - fail open
+        except Exception as exc:  # noqa: BLE001, RUF100 - fail open; ratchet-only rule
             _LOG.warning("OpenTelemetryNotifier.on_governance_event failed: %s", type(exc).__name__)
 
     # ------------------------------------------------------------------
@@ -459,7 +460,7 @@ class OpenTelemetryNotifier(BaseNotifier):
                 else:
                     span.set_status(Status(StatusCode.ERROR, reason))
                 span.end()
-            except Exception as exc:  # noqa: BLE001 - fail open
+            except Exception as exc:  # noqa: BLE001, RUF100 - fail open; ratchet-only rule
                 _LOG.warning("orphan chat span close failed: %s", type(exc).__name__)
 
         for tool_key in orphan_keys_tool:
@@ -474,7 +475,7 @@ class OpenTelemetryNotifier(BaseNotifier):
                 else:
                     span.set_status(Status(StatusCode.ERROR, reason))
                 span.end()
-            except Exception as exc:  # noqa: BLE001 - fail open
+            except Exception as exc:  # noqa: BLE001, RUF100 - fail open; ratchet-only rule
                 _LOG.warning("orphan tool span close failed: %s", type(exc).__name__)
 
     def _child_context(self, run_id: str) -> Any:

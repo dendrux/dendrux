@@ -12,7 +12,7 @@ from collections import Counter, deque
 
 # Public method annotations are resolved at runtime by documentation and
 # dependency-injection tooling.
-from collections.abc import Callable, Collection, Mapping  # noqa: TC003
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass, field, replace
 from threading import Lock
 from types import MappingProxyType

@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from dendrux.db.models import AgentRun, RunEvent
 from dendrux.runtime.durability import retry_transient_db
 from dendrux.types import generate_ulid
+from tests._helpers.gates import wait_for_gate
 
 
 @pytest.mark.parametrize("stable_id", [False, True])
@@ -89,7 +90,7 @@ async def test_raw_failure_while_commit_is_in_flight(
                     run_id=run_id,
                 )
             )
-            await asyncio.wait_for(pending.wait(), 5)
+            await wait_for_gate(pending, task=task)
             assert committing is not None
             # Observation window only: the advisory gate holds COMMIT, so a slow machine
             # can only miss a regression here, never fail a correct build.

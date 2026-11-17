@@ -5,7 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 from decimal import ROUND_HALF_UP, Decimal
-from typing import TYPE_CHECKING, Any, NoReturn
+from typing import TYPE_CHECKING, Any, Literal, NoReturn, Protocol
 
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
@@ -23,6 +23,8 @@ from dendrux.errors import PersistenceError, StoreOutcomeUnknown
 from dendrux.runtime.durability import (
     _CommitNotAppliedError,
     _is_driver_failure,
+    _raise_if_cancelled,
+    _rollback_unless_cancelled,
     is_transient_db_error,
 )
 from dendrux.runtime.state import _to_aware_utc
@@ -31,7 +33,7 @@ from dendrux.types import RunStatus
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
-    from dendrux.runtime.stores.sql.base import SQLStateStore
+    from dendrux.runtime.stores._errors import DbError
 
 logger = logging.getLogger(__name__)
 _TRANSITIONS = frozenset(
@@ -79,15 +81,38 @@ def _comparable(actual: Any, value: Any) -> tuple[Any, Any]:
     return actual, value
 
 
+def _bind_request(name: str, arguments: dict[str, Any]) -> tuple[Any, Any]:
+    """bind_managed_child names its runs in a typed request, not run_id/claim_epoch."""
+    bind = arguments.get("request") if name == "bind_managed_child" else None
+    return bind, (arguments.get("run_id") if bind is None else bind.parent_run_id)
+
+
+class _CommitHost(Protocol):
+    supports_row_locks: bool
+
+    def classify_db_error(self, exc: BaseException) -> DbError: ...
+
+    async def _prepare_commit_readback(self, session: AsyncSession) -> None: ...
+
+    def json_get(self, col: Any, path: Any, as_type: Any) -> Any: ...
+
+    async def reserve_parent_writer(self, session: AsyncSession, run_id: str) -> None: ...
+
+    def lock_clause(
+        self, stmt: Any, intent: Literal["share", "update", "update_no_key"]
+    ) -> Any: ...
+
+
 class _CommitReadback:
-    def __init__(self, store: SQLStateStore, session: AsyncSession, operation: Any) -> None:
+    def __init__(self, store: _CommitHost, session: AsyncSession, operation: Any) -> None:
         self.store, self.session = store, session
         self.name: str
         self.arguments: dict[str, Any]
         context = operation if operation is not None else (None, "", {})
         self.name = context[1]
         self.arguments = dict(context[2])
-        self.run_id = self.arguments.get("run_id")
+        self.bind: Any
+        self.bind, self.run_id = _bind_request(self.name, self.arguments)
         self.fresh = session.info.pop(FRESH_EVIDENCE_SESSION_KEY, False)
         self.epoch = self.arguments.get("claim_epoch")
         self.prove_fence = self.name in _TRANSITIONS and self.epoch is not None and not self.fresh
@@ -127,8 +152,9 @@ class _CommitReadback:
 
     async def _rollback(self, *, ambiguous: bool) -> None:
         try:
-            await self.session.rollback()
+            await _rollback_unless_cancelled(self.session)
         except BaseException as error:
+            _raise_if_cancelled(error)
             if not self._database_error(error):
                 self._reraise_clean(error)
             _codes.log_code(logger, _codes.PERSISTENCE_ERROR, run_id=self.run_id)
@@ -137,6 +163,7 @@ class _CommitReadback:
             raise PersistenceError() from None
 
     async def resolve(self, error: Exception) -> None:
+        _raise_if_cancelled(error)
         if isinstance(error, PersistenceError) or not self._database_error(error):
             raise error
         classified = self.store.classify_db_error(error)
@@ -225,6 +252,7 @@ class _CommitReadback:
                 await self._lost()
 
     async def _lost(self, *, absent: bool = False) -> NoReturn:
+        await self._bind_lost()
         retry_id = _RETRY_IDS.get(self.name)
         if absent and (
             self.name == "create_run"
@@ -239,6 +267,17 @@ class _CommitReadback:
         ):
             raise _CommitNotAppliedError() from None
         self.unknown()
+
+    async def _bind_lost(self) -> None:
+        """This invocation's own rows (incl. its private nonce) were not proven.
+
+        Re-entering is safe: the attempt retakes the parent lock, reads an
+        existing binding back without a token, and only creates when the
+        parent still admits this invocation. Never grants authority here.
+        """
+        if self.bind is None:
+            return
+        raise _CommitNotAppliedError() from None
 
     def _retry_predicate(self) -> Any:
         predicate = AgentRun.id == self.run_id

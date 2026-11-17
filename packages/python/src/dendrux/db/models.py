@@ -21,7 +21,7 @@ Deferred tables (added via migration in their sprint):
 
 from __future__ import annotations
 
-import datetime  # noqa: TC003 — needed at runtime for SQLAlchemy Mapped[] resolution
+import datetime  # Needed at runtime for SQLAlchemy Mapped[] resolution.
 from typing import Any
 
 from sqlalchemy import (

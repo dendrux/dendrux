@@ -8,6 +8,7 @@ import pytest
 from dendrux import Agent, tool
 from dendrux.errors import InvalidToolResultError, RunAlreadyClaimedError
 from dendrux.types import ApprovalDecision, Limits, LLMResponse, ToolCall, ToolResult
+from tests._helpers.gates import wait_for_gate
 from tests._helpers.scripted_provider import ScriptedLLM
 
 
@@ -114,7 +115,7 @@ async def test_parallel_denials_claim_once(store):
             )
             for _ in range(8)
         ]
-        await asyncio.wait_for(agent.provider.entered.wait(), 5)
+        await wait_for_gate(agent.provider.entered)
         pending = set(tasks)
         while len(pending) > 1:
             done, pending = await asyncio.wait(

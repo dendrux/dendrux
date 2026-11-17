@@ -5,7 +5,7 @@ from functools import wraps
 import pytest
 
 from dendrux.llm.mock import MockLLM
-from dendrux.runtime import _reclaim, runner
+from dendrux.runtime import _reclaim, _run_approval, runner
 from dendrux.types import ApprovalDecision, LLMResponse, RunStatus, ToolCall
 from tests._fixtures.storage import pin_storage_format
 from tests._helpers.recovery_checkpoint import checkpoint
@@ -88,7 +88,7 @@ async def test_adopted_approval_block_precedes_resolution(
         raise AssertionError("Blocked adoption reached approval resolution.")
 
     monkeypatch.setattr(_reclaim, "resolve", forbidden)
-    monkeypatch.setattr(runner, "_resume_approval_work", forbidden)
+    monkeypatch.setattr(_run_approval, "_resume_approval_work", forbidden)
     try:
         result = await runner.resume_claimed(
             run_id,

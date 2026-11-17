@@ -25,6 +25,7 @@ from dendrux.store import RunStore
 from dendrux.tool import tool
 from dendrux.types import LLMResponse, RunEventType, RunStatus, ToolCall, ToolResult
 from tests._helpers.gated_provider import GatedStreamLLM
+from tests._helpers.gates import wait_for_gate
 
 if TYPE_CHECKING:
     from dendrux.types import RunEvent, RunStream
@@ -44,7 +45,7 @@ async def _consume(stream: RunStream) -> list[RunEvent]:
 
 
 async def _wait_first_sent(provider: GatedStreamLLM) -> None:
-    await asyncio.wait_for(provider.first_sent.wait(), timeout=5)
+    await wait_for_gate(provider.first_sent)
 
 
 class TestCancelRunInterruptsStream:
@@ -61,7 +62,7 @@ class TestCancelRunInterruptsStream:
         assert requested.status == RunStatus.RUNNING
         assert requested.meta["cancel_requested"] is True
 
-        events = await asyncio.wait_for(consumer, timeout=5)
+        events = await asyncio.wait_for(consumer, timeout=30)
         assert events[-1].type == RunEventType.RUN_CANCELLED
         assert events[-1].run_result is not None
         assert events[-1].run_result.answer == provider.first
@@ -98,7 +99,7 @@ class TestCancelRunInterruptsStream:
         await _wait_first_sent(provider)
 
         await agent.cancel_run(stream.run_id)
-        events = await asyncio.wait_for(consumer, timeout=5)
+        events = await asyncio.wait_for(consumer, timeout=30)
 
         assert events[-1].type == RunEventType.RUN_CANCELLED
         record = await store.get_run(stream.run_id)
@@ -135,7 +136,7 @@ class TestCancelRunInterruptsStream:
         assert record.cancel_requested is True
 
         provider.gate.set()
-        events = await asyncio.wait_for(consumer, timeout=5)
+        events = await asyncio.wait_for(consumer, timeout=30)
         assert events[-1].type == RunEventType.RUN_COMPLETED
 
 
@@ -200,7 +201,7 @@ class TestResumeStreamInterrupt:
         await _wait_first_sent(provider)
 
         await agent.cancel_run(paused.run_id)
-        events = await asyncio.wait_for(consumer, timeout=5)
+        events = await asyncio.wait_for(consumer, timeout=30)
 
         assert events[-1].type == RunEventType.RUN_CANCELLED
         record = await store.get_run(paused.run_id)

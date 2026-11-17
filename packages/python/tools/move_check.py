@@ -1,0 +1,941 @@
+"""AST pure-move checker: prove a refactor only moved code. It fails closed.
+
+Compares the old module at a base git ref with the old module as it is now plus the new
+modules. It passes only when, apart from the small explicit list of allowed edits below,
+nothing changed:
+
+* every top-level statement of the old module is present exactly once afterwards, in
+  exactly one module, with an identical ``ast.dump`` (docstrings, decorators, defaults);
+* the statements of each module keep the relative order they had at base, and repeated
+  names (overloads, property setters, redefinitions) keep their count and order;
+* only function and class definitions, and constant assignments, may move. Any other
+  statement (calls, ``if``/``try``/``for``/``with``, augmented assignments, ``__all__``) must
+  stay in the old module, unchanged. An assignment whose value calls something is such a
+  statement unless its target is named in ``--allow-effects``;
+* ``from __future__`` imports are the same in every module;
+* methods may leave a class for a *mixin*: a new top-level class with no decorator, keyword
+  or base other than ``--allow-new`` names, listed **before** the original bases of the
+  class (so method resolution keeps its order). The remaining class body must equal the
+  base body minus the moved methods, in order.
+
+Allowed edits (everything else is a mismatch): explained import bindings and
+``if TYPE_CHECKING:`` blocks that only import (star imports are always rejected);
+the module docstring; a literal ``__all__`` list in a *new* module
+(the old module's ``__all__`` must stay identical and every name in it must still be bound
+at module scope). ``--require-reexports`` also checks that each moved public name is imported
+by an unconditional, absolute, module-level ``from <new module> import name`` in the old module.
+
+Not proved: import order and cycles (see ``make arch`` / ``make cycles``), the effect of
+decorators that register things, and the contents of ``--allow-new`` definitions (review them).
+"""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import difflib
+import json
+import subprocess
+import sys
+from collections import defaultdict
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Collection, Mapping, Sequence
+
+try:
+    from tools import _ratchet as r
+except ImportError:  # run as a script from packages/python/tools
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from tools import _ratchet as r
+
+from tools import _move_manifest as m
+from tools._move_imports import check_imports
+from tools._move_providers import validate_providers
+from tools.owner_bindings import check_bindings, check_globals
+
+_IMPORTS = (ast.Import, ast.ImportFrom)
+_FUNCTIONS = (ast.FunctionDef, ast.AsyncFunctionDef)
+
+
+@dataclass
+class MoveReport:
+    """``problems`` is empty when the refactor is a pure move; ``moved`` maps name -> module."""
+
+    problems: list[str] = field(default_factory=list)
+    moved: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def ok(self) -> bool:
+        return not self.problems
+
+
+@dataclass(frozen=True)
+class _Item:
+    key: str
+    dump: str | None  # None: compared separately (classes at module level)
+    node: ast.stmt
+    movable: bool
+
+
+@dataclass(frozen=True)
+class _Host:
+    module: str
+    node: ast.ClassDef
+
+
+def _dump(node: ast.AST) -> str:
+    return ast.dump(node, indent=1)
+
+
+def _unified(label: str, old: str, new: str) -> str:
+    lines = difflib.unified_diff(
+        old.splitlines(), new.splitlines(), f"{label} (base)", f"{label} (now)", lineterm="", n=2
+    )
+    return "\n".join(lines)
+
+
+def _name_of(base: ast.expr) -> str | None:
+    return base.id if isinstance(base, ast.Name) else None
+
+
+def _is_docstring(node: ast.stmt) -> bool:
+    return (
+        isinstance(node, ast.Expr)
+        and isinstance(node.value, ast.Constant)
+        and isinstance(node.value.value, str)
+    )
+
+
+def _bindings_of(tree: ast.AST, name: str) -> int:
+    """How many times ``name`` is bound anywhere in the tree (any scope; conservative)."""
+    count = 0
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            count += node.id == name and not isinstance(node.ctx, ast.Load)
+        elif isinstance(node, ast.alias):
+            count += (node.asname or node.name.split(".")[0]) == name
+        elif isinstance(node, (*_FUNCTIONS, ast.ClassDef)):
+            count += node.name == name
+        elif isinstance(node, ast.arg):
+            count += node.arg == name
+        elif isinstance(node, ast.ExceptHandler | ast.MatchAs | ast.MatchStar):
+            count += node.name == name
+        elif isinstance(node, ast.Global | ast.Nonlocal):
+            count += name in node.names
+    return count
+
+
+def _typing_guards(tree: ast.Module) -> frozenset[str]:
+    """Spellings of ``typing.TYPE_CHECKING`` in this module: bound once, from ``typing``."""
+    out: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, ast.ImportFrom) and node.module == "typing" and not node.level:
+            for a in node.names:
+                if a.name == "TYPE_CHECKING" and _bindings_of(tree, a.asname or a.name) == 1:
+                    out.add(a.asname or a.name)
+        elif isinstance(node, ast.Import):
+            for a in node.names:
+                local = a.asname or a.name
+                if a.name == "typing" and _bindings_of(tree, local) == 1:
+                    out.add(f"{local}.TYPE_CHECKING")
+    return frozenset(out)
+
+
+def _dotted_name(node: ast.expr) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+        return f"{node.value.id}.{node.attr}"
+    return None
+
+
+def _is_type_checking_imports(node: ast.stmt, guards: Collection[str]) -> bool:
+    """``if TYPE_CHECKING:`` (the real ``typing`` one) whose body only imports; the only
+    guard ignored. Any other test is executable code and is compared."""
+    if not isinstance(node, ast.If) or node.orelse:
+        return False
+    return _dotted_name(node.test) in guards and all(isinstance(n, _IMPORTS) for n in node.body)
+
+
+def _target_names(node: ast.stmt) -> list[str] | None:
+    """Names assigned by a plain assignment; None when it is not one (or targets more)."""
+    if isinstance(node, ast.Assign):
+        targets = list(node.targets)
+    elif isinstance(node, ast.AnnAssign):
+        targets = [node.target]
+    else:
+        return None
+    names: list[str] = []
+    while targets:
+        t = targets.pop(0)
+        if isinstance(t, ast.Name):
+            names.append(t.id)
+        elif isinstance(t, ast.Tuple | ast.List):
+            targets.extend(t.elts)
+        else:
+            return None
+    return names
+
+
+def _is_plain(expr: ast.expr | None) -> bool:
+    """A literal, a name, a dotted name, or a tuple/list/set/dict of those: no user code runs."""
+    if expr is None or isinstance(expr, ast.Constant | ast.Name):
+        return True
+    if isinstance(expr, ast.Attribute):
+        base: ast.expr = expr
+        while isinstance(base, ast.Attribute):
+            base = base.value
+        return isinstance(base, ast.Name)
+    if isinstance(expr, ast.BinOp) and isinstance(expr.op, ast.Mult):
+        return all(
+            isinstance(operand, ast.Constant) and type(operand.value) is int
+            for operand in (expr.left, expr.right)
+        )
+    if isinstance(expr, ast.UnaryOp):
+        return (
+            isinstance(expr.op, ast.USub | ast.UAdd)
+            and isinstance(expr.operand, ast.Constant)
+            and isinstance(expr.operand.value, int | float | complex)
+        )
+    if isinstance(expr, ast.Tuple | ast.List | ast.Set):
+        return all(_is_plain(e) for e in expr.elts)
+    if isinstance(expr, ast.Dict):
+        return all(k is not None and _is_plain(k) for k in expr.keys) and all(
+            _is_plain(v) for v in expr.values
+        )
+    return False
+
+
+def _literal_strings(expr: ast.expr | None) -> list[str] | None:
+    if isinstance(expr, ast.List | ast.Tuple) and all(
+        isinstance(e, ast.Constant) and isinstance(e.value, str) for e in expr.elts
+    ):
+        return [str(e.value) for e in expr.elts if isinstance(e, ast.Constant)]
+    return None
+
+
+def _module_items(tree: ast.Module, *, is_old: bool, allow_effects: Collection[str]) -> list[_Item]:
+    items: list[_Item] = []
+    guards = _typing_guards(tree)
+    for i, node in enumerate(tree.body):
+        if isinstance(node, _IMPORTS) or _is_type_checking_imports(node, guards):
+            continue
+        if i == 0 and _is_docstring(node):
+            continue
+        if isinstance(node, _FUNCTIONS):
+            items.append(_Item(node.name, _dump(node), node, True))
+        elif isinstance(node, ast.ClassDef):
+            items.append(_Item(node.name, None, node, True))
+        elif (names := _target_names(node)) is not None:
+            key = ",".join(names)
+            value = getattr(node, "value", None)
+            if key == "__all__" and not is_old and _literal_strings(value) is not None:
+                continue  # a destination module's own export list is its business
+            annotation = getattr(node, "annotation", None)
+            plain = _is_plain(value) and _is_plain(annotation)
+            safe = plain or set(names) <= set(allow_effects)
+            items.append(_Item(key, _dump(node), node, safe and key != "__all__"))
+        else:
+            items.append(_Item(f"<{type(node).__name__}>", _dump(node), node, False))
+    return items
+
+
+def _class_items(cls: ast.ClassDef) -> list[_Item]:
+    items: list[_Item] = []
+    for i, node in enumerate(cls.body):
+        if i == 0 and _is_docstring(node):
+            items.append(_Item("<docstring>", _dump(node), node, False))
+        elif isinstance(node, _FUNCTIONS):
+            items.append(_Item(node.name, _dump(node), node, True))
+        elif isinstance(node, ast.ClassDef):
+            items.append(_Item(node.name, _dump(node), node, False))
+        elif (names := _target_names(node)) is not None:
+            items.append(_Item(",".join(names), _dump(node), node, False))
+        else:
+            items.append(_Item(f"<{type(node).__name__}>", _dump(node), node, False))
+    return items
+
+
+def _place(
+    label: str,
+    old: Sequence[_Item],
+    containers: Mapping[str, Sequence[_Item]],
+    home: str,
+    report: MoveReport,
+    allowed_extra: Collection[str] = (),
+) -> dict[str, str]:
+    """Match base items to their new containers; returns key -> container.
+
+    Reports dropped, duplicated, changed, extra, immovable-but-moved and reordered items.
+    """
+    old_at: dict[str, list[tuple[int, _Item]]] = defaultdict(list)
+    for i, it in enumerate(old):
+        old_at[it.key].append((i, it))
+    new_at: dict[str, dict[str, list[_Item]]] = defaultdict(dict)
+    for name, items in containers.items():
+        for it in items:
+            new_at[it.key].setdefault(name, []).append(it)
+    where: dict[str, str] = {}
+    for key, olds in old_at.items():
+        homes = new_at.get(key, {})
+        if len(homes) != 1:
+            word = "dropped" if not homes else "duplicated"
+            places = ", ".join(sorted(homes)) or "no module"
+            report.problems.append(f"{word}: {label}{key} is in {places} after the change")
+            continue
+        name, news = next(iter(homes.items()))
+        if len(news) != len(olds):
+            report.problems.append(
+                f"changed: {label}{key} has {len(olds)} definition(s) at base, {len(news)} now"
+            )
+            continue
+        for (_, o), n in zip(olds, news, strict=True):
+            if type(o.node) is not type(n.node):
+                report.problems.append(
+                    f"changed: {label}{key} in {name} was {type(o.node).__name__} at base, "
+                    f"is {type(n.node).__name__} now (statement kind changed)"
+                )
+            elif o.dump is not None and o.dump != n.dump:
+                report.problems.append(
+                    f"changed: {label}{key} in {name}\n"
+                    + _unified(label + key, o.dump, n.dump or "")
+                )
+        if name != home and not all(o.movable for _, o in olds):
+            report.problems.append(f"immovable: {label}{key} must stay in {home}, found in {name}")
+        where[key] = name
+    for key, homes in new_at.items():
+        if key not in old_at and key not in allowed_extra:
+            report.problems.extend(f"extra: {label}{key} in {n} is not in the base" for n in homes)
+    _check_order(label, old_at, containers, where, report)
+    return where
+
+
+def _check_order(
+    label: str,
+    old_at: Mapping[str, Sequence[tuple[int, _Item]]],
+    containers: Mapping[str, Sequence[_Item]],
+    where: Mapping[str, str],
+    report: MoveReport,
+) -> None:
+    for name, items in containers.items():
+        seen: dict[str, int] = defaultdict(int)
+        last = -1
+        for it in items:
+            if where.get(it.key) != name:
+                continue
+            index = old_at[it.key][seen[it.key]][0]
+            seen[it.key] += 1
+            if index < last:
+                report.problems.append(
+                    f"reordered: {label}{it.key} in {name} now comes before a statement "
+                    "that preceded it at base"
+                )
+                break
+            last = index
+
+
+def _header(node: ast.ClassDef) -> list[str]:
+    return [
+        *(_dump(d) for d in node.decorator_list),
+        *(_dump(k) for k in node.keywords),
+        *(_dump(t) for t in getattr(node, "type_params", [])),
+    ]
+
+
+def _identifier_of(n: ast.AST) -> list[str | None]:
+    """The identifiers one node binds or names (Python may mangle any of them)."""
+    if isinstance(n, ast.Name):
+        return [n.id]
+    if isinstance(n, ast.Attribute):
+        return [n.attr]
+    if isinstance(n, ast.arg):
+        return [n.arg]
+    if isinstance(n, ast.keyword):
+        return [n.arg]
+    if isinstance(n, ast.alias):
+        return [n.asname or n.name.split(".")[0]]
+    if isinstance(n, (*_FUNCTIONS, ast.ClassDef, ast.ExceptHandler, ast.MatchAs, ast.MatchStar)):
+        return [n.name]
+    if isinstance(n, ast.Global | ast.Nonlocal):
+        return list(n.names)
+    return []
+
+
+def _identifiers(node: ast.AST) -> list[str]:
+    """Every identifier Python may mangle or bind inside ``node``."""
+    return [i for n in ast.walk(node) for i in _identifier_of(n) if i]
+
+
+def _class_scope_names(cls: ast.ClassDef) -> set[str]:
+    """Names bound directly in a class body (not inside methods)."""
+    names: set[str] = set()
+    stack: list[ast.AST] = list(cls.body)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (*_FUNCTIONS, ast.ClassDef)):
+            names.add(node.name)
+            continue
+        if isinstance(node, ast.Lambda):
+            continue
+        if isinstance(node, ast.Name) and not isinstance(node.ctx, ast.Load):
+            names.add(node.id)
+        elif isinstance(node, ast.alias):
+            names.add(node.asname or node.name.split(".")[0])
+        elif isinstance(node, ast.ExceptHandler | ast.MatchAs | ast.MatchStar) and node.name:
+            names.add(node.name)
+        stack.extend(ast.iter_child_nodes(node))
+    return names
+
+
+def _header_reads(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
+    """Names read when ``def`` runs in the class body: decorators, defaults, annotations."""
+    exprs: list[ast.expr | None] = [*fn.decorator_list, *fn.args.defaults, *fn.args.kw_defaults]
+    every = [*fn.args.posonlyargs, *fn.args.args, *fn.args.kwonlyargs]
+    every += [a for a in (fn.args.vararg, fn.args.kwarg) if a is not None]
+    exprs += [a.annotation for a in every]
+    exprs.append(fn.returns)
+    return {
+        n.id
+        for e in exprs
+        if e is not None
+        for n in ast.walk(e)
+        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)
+    }
+
+
+def _class_dependence(
+    fn: ast.FunctionDef | ast.AsyncFunctionDef, class_names: Collection[str], host: Collection[str]
+) -> str | None:
+    """Why moving ``fn`` out of its class could change what it does (None: nothing found).
+
+    Python compiles a method against its class: the ``__class__`` cell (zero-argument ``super()``),
+    name mangling of ``__private`` identifiers, and class-body names read by decorators,
+    defaults and annotations. Moving it to another class changes all three, so such a method
+    needs manual review. ``host`` is what the mixin body binds before the method.
+    """
+    for n in ast.walk(fn):
+        if (
+            isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Name)
+            and n.func.id == "super"
+            and not n.args
+            and not n.keywords
+        ):
+            return "zero-argument super()"
+    names = _identifiers(fn)
+    if "__class__" in names:
+        return "__class__"
+    mangled = next((n for n in names if n.startswith("__") and not n.endswith("__")), None)
+    if mangled:
+        return f"private name {mangled} (Python mangles it per class)"
+    read = sorted(_header_reads(fn) & set(class_names) - set(host))
+    if read:
+        return f"decorator, default or annotation reads class-body name {read[0]}"
+    return None
+
+
+def _class_scope_names_of_item(node: ast.stmt) -> set[str]:
+    return _class_scope_names(ast.ClassDef("_", [], [], [node], []))
+
+
+def _compare_class(
+    old: ast.ClassDef,
+    new: ast.ClassDef,
+    module: str,
+    hosts: Mapping[str, _Host],
+    used: dict[str, str],
+    report: MoveReport,
+    *,
+    provider_hosts: bool = False,
+) -> None:
+    leading: list[str] = []
+    for base in new.bases:
+        name = _name_of(base)
+        if name is None or name not in hosts:
+            break
+        leading.append(name)
+    rest = [_dump(b) for b in new.bases[len(leading) :]]
+    if rest != [_dump(b) for b in old.bases] or len(set(leading)) != len(leading):
+        report.problems.append(
+            f"changed: class {old.name} bases in {module}: mixins must come first, once each, "
+            "and the original bases stay unchanged"
+        )
+    if _header(old) != _header(new):
+        report.problems.append(f"changed: class {old.name} decorators/keywords in {module}")
+    if provider_hosts:
+        for name in leading:
+            for base in hosts[name].node.bases:
+                provider = _name_of(base)
+                if provider is not None and provider in hosts and provider not in leading:
+                    leading.append(provider)
+    here, base_items = _class_items(new), _class_items(old)
+    if (
+        leading
+        and [it.key for it in here] == ["<Pass>"]
+        and "<Pass>" not in {it.key for it in base_items}
+    ):
+        here = []  # the `pass` that keeps a class whose methods all moved syntactically valid
+    containers: dict[str, list[_Item]] = {"<class>": here}
+    owner = {"<class>": module}
+    for name in leading:
+        if name in used and used[name] != old.name:
+            report.problems.append(f"extra: mixin {name} is a base of {used[name]} and {old.name}")
+        used[name] = old.name
+        host_items = _class_items(hosts[name].node)
+        if host_items and host_items[0].key == "<docstring>":
+            host_items = host_items[1:]
+        containers[name] = host_items
+        owner[name] = hosts[name].module
+    where = _place(f"{old.name}.", base_items, containers, "<class>", report)
+    for key, name in where.items():
+        if name != "<class>":
+            report.moved[f"{old.name}.{key}"] = owner[name]
+    class_names = _class_scope_names(old)
+    for name, items in containers.items():
+        if name == "<class>":
+            continue
+        bound: set[str] = set()
+        for it in items:
+            if isinstance(it.node, _FUNCTIONS) and where.get(it.key) == name:
+                why = _class_dependence(it.node, class_names, bound)
+                if why:
+                    report.problems.append(
+                        f"unsafe: {old.name}.{it.key} moved to mixin {name} but depends on its "
+                        f"class ({why}); manual review is needed"
+                    )
+            bound |= _class_scope_names_of_item(it.node)
+
+
+def _find_hosts(
+    old_keys: Collection[str],
+    modules: Mapping[str, list[_Item]],
+    allow_new: Collection[str],
+    report: MoveReport,
+    *,
+    provider_bases: Collection[str] | None = None,
+) -> dict[str, _Host]:
+    """New top-level classes that an old class names as a base are mixin hosts."""
+    base_names = {
+        n
+        for items in modules.values()
+        for it in items
+        if (it.key in old_keys or provider_bases is not None) and isinstance(it.node, ast.ClassDef)
+        for b in it.node.bases
+        if (n := _name_of(b))
+    }
+    defined: dict[str, list[_Host]] = defaultdict(list)
+    for module, items in modules.items():
+        for it in items:
+            node = it.node
+            if (
+                isinstance(node, ast.ClassDef)
+                and it.key not in old_keys
+                and it.key in base_names
+                and it.key not in allow_new
+            ):
+                defined[it.key].append(_Host(module, node))
+    hosts: dict[str, _Host] = {}
+    for name, found in defined.items():
+        if len(found) > 1:
+            places = ", ".join(sorted(h.module for h in found))
+            report.problems.append(
+                f"extra: mixin {name} is defined in {places}; the owner is ambiguous"
+            )
+            continue
+        node = found[0].node
+        permitted = set(allow_new)
+        if provider_bases is not None:
+            permitted.update(defined)
+            permitted.update(provider_bases)
+        stray = [b for b in node.bases if _name_of(b) not in permitted]
+        if node.decorator_list or node.keywords or stray or getattr(node, "type_params", []):
+            report.problems.append(
+                f"extra: mixin {name} in {found[0].module} has decorators, keywords or bases "
+                "(list a plain base with --allow-new)"
+            )
+            continue
+        hosts[name] = found[0]
+    return hosts
+
+
+def _future(tree: ast.Module) -> frozenset[str]:
+    return frozenset(
+        a.name
+        for n in tree.body
+        if isinstance(n, ast.ImportFrom) and n.module == "__future__"
+        for a in n.names
+    )
+
+
+def _runtime_bindings(tree: ast.Module) -> dict[str, tuple[str, str] | None]:
+    """Unconditional module-scope bindings: name -> (source module, name) for imports."""
+    out: dict[str, tuple[str, str] | None] = {}
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                out[a.asname or a.name.split(".")[0]] = None
+        elif isinstance(node, ast.ImportFrom):
+            for a in node.names:
+                src = f"{'.' * node.level}{node.module or ''}"
+                out[a.asname or a.name] = (src, a.name)
+        elif isinstance(node, (*_FUNCTIONS, ast.ClassDef)):
+            out[node.name] = None
+        else:
+            for name in _target_names(node) or []:
+                out[name] = None
+    return out
+
+
+def _check_exports(
+    report: MoveReport,
+    old_tree: ast.Module,
+    now: ast.Module,
+    moved: Mapping[str, str],
+    modules: Mapping[str, str],
+    require_reexports: bool,
+) -> None:
+    bound = _runtime_bindings(now)
+    for node in old_tree.body:
+        names = _target_names(node)
+        exports = _literal_strings(getattr(node, "value", None)) if names == ["__all__"] else None
+        for name in exports or []:
+            if name not in bound:
+                report.problems.append(
+                    f"export: {name!r} is in __all__ but not bound at module scope"
+                )
+    if not require_reexports:
+        return
+    for key, module in sorted(moved.items()):
+        for name in key.split(","):
+            if "." in key or name.startswith("_"):
+                continue
+            want = (modules.get(module, module), name)
+            got = bound.get(name)
+            if got is None or got != want:
+                detail = (
+                    "relative import; use an absolute one"
+                    if got and got[0].startswith(".")
+                    else (
+                        "not imported at module scope"
+                        if name not in bound
+                        else "imported from elsewhere"
+                    )
+                )
+                report.problems.append(
+                    f"re-export: public name {name} moved to {want[0]}; old module: {detail}"
+                )
+
+
+def check_move(
+    old_source: str,
+    after: Mapping[str, str],
+    *,
+    old_key: str = "old",
+    allow_new: Collection[str] = (),
+    allow_effects: Collection[str] = (),
+    require_reexports: bool = False,
+    modules: Mapping[str, str] | None = None,
+    move_manifest: Mapping[str, Any] | None = None,
+) -> MoveReport:
+    """Compare the base source of one module with its pieces now (module key -> source).
+
+    ``old_key`` names the entry of ``after`` that is the old module itself (it may be absent).
+    ``modules`` maps a key to its dotted module name (default: the key).
+
+    This is an in-memory comparison API, not a supported proof gate: it trusts
+    supplied provider snapshots. Only this module's CLI and ``move_ci`` are
+    supported gates; both call ``verify_provider_sources`` before comparison.
+    """
+    report = MoveReport()
+    if move_manifest is not None:
+        return _manifest_move(
+            old_source,
+            after,
+            old_key=old_key,
+            manifest=move_manifest,
+            modules=modules or {key: key for key in after},
+        )
+    old_tree = ast.parse(old_source)
+    trees = {name: ast.parse(src) for name, src in after.items()}
+    old_items = _module_items(old_tree, is_old=True, allow_effects=allow_effects)
+    new_items = {
+        name: _module_items(tree, is_old=name == old_key, allow_effects=allow_effects)
+        for name, tree in trees.items()
+    }
+    for name, tree in trees.items():
+        if _future(tree) != _future(old_tree):
+            report.problems.append(f"changed: `from __future__` imports differ in {name}")
+    old_keys = {it.key for it in old_items}
+    hosts = _find_hosts(old_keys, new_items, allow_new, report)
+    where = _place("", old_items, new_items, old_key, report, {*allow_new, *hosts})
+    for key, name in where.items():
+        if name != old_key:
+            report.moved[key] = name
+    used: dict[str, str] = {}
+    for key in dict.fromkeys(it.key for it in old_items if isinstance(it.node, ast.ClassDef)):
+        if key not in where:
+            continue
+        olds = [it.node for it in old_items if it.key == key]
+        news = [it.node for it in new_items[where[key]] if it.key == key]
+        for old_node, new_node in zip(olds, news, strict=False):
+            if isinstance(old_node, ast.ClassDef) and isinstance(new_node, ast.ClassDef):
+                _compare_class(old_node, new_node, where[key], hosts, used, report)
+    if old_key in trees or require_reexports:  # a deleted old module has no facade at all
+        now = trees.get(old_key) or ast.Module(body=[], type_ignores=[])
+        _check_exports(report, old_tree, now, report.moved, modules or {}, require_reexports)
+    report.problems.extend(
+        check_imports(
+            old_tree,
+            trees,
+            old_key=old_key,
+            modules=modules or {key: key for key in [old_key, *after]},
+            owners=where,
+            hosts={name: host.module for name, host in hosts.items()},
+        )
+    )
+    return report
+
+
+def _manifest_inventory(
+    old_items: Sequence[_Item],
+    new_items: Mapping[str, list[_Item]],
+    hosts: Mapping[str, _Host],
+    where: Mapping[str, str],
+    report: MoveReport,
+    old_key: str,
+) -> dict[str, str]:
+    used: dict[str, str] = {}
+    for item in old_items:
+        if isinstance(item.node, ast.ClassDef) and item.key in where:
+            news = [
+                it.node
+                for it in new_items[where[item.key]]
+                if it.key == item.key and isinstance(it.node, ast.ClassDef)
+            ]
+            if len(news) == 1:
+                _compare_class(
+                    item.node, news[0], where[item.key], hosts, used, report, provider_hosts=True
+                )
+    if set(hosts) != set(used):
+        report.problems.append("provider: unused operation host")
+    actual_owners = dict(where) | report.moved
+    # Retained members also need explicit destinations in the reviewed map.
+    for item in old_items:
+        if isinstance(item.node, ast.ClassDef):
+            for member in _class_items(item.node):
+                if isinstance(member.node, _FUNCTIONS):
+                    actual_owners.setdefault(
+                        f"{item.key}.{member.key}", where.get(item.key, old_key)
+                    )
+    return actual_owners
+
+
+def _manifest_move(
+    old_source: str,
+    after: Mapping[str, str],
+    *,
+    old_key: str,
+    manifest: Mapping[str, Any],
+    modules: Mapping[str, str],
+) -> MoveReport:
+    report = MoveReport()
+    try:
+        before, normalized = m.normalize(old_source, after, manifest, old_key, modules)
+        old_tree = ast.parse(before)
+        trees = {key: ast.parse(source) for key, source in normalized.items()}
+        old_items = _module_items(old_tree, is_old=True, allow_effects=manifest["effects"])
+        new_items = {
+            key: _module_items(tree, is_old=key == old_key, allow_effects=manifest["effects"])
+            for key, tree in trees.items()
+        }
+        for key, tree in trees.items():
+            if _future(tree) != _future(old_tree):
+                report.problems.append(f"changed: `from __future__` imports differ in {key}")
+        external = {
+            b.id
+            for n in old_tree.body
+            if isinstance(n, ast.ClassDef)
+            for b in n.bases
+            if isinstance(b, ast.Name)
+        }
+        hosts = _find_hosts(
+            {it.key for it in old_items},
+            new_items,
+            manifest["scaffolding"],
+            report,
+            provider_bases=external,
+        )
+        where = _place(
+            "", old_items, new_items, old_key, report, {*hosts, *manifest["scaffolding"]}
+        )
+        report.moved.update({key: module for key, module in where.items() if module != old_key})
+        actual_owners = _manifest_inventory(old_items, new_items, hosts, where, report, old_key)
+        report.problems.extend(
+            validate_providers(
+                old_tree,
+                trees,
+                modules,
+                {key: (host.module, host.node) for key, host in hosts.items()},
+                manifest["providers"],
+                old_key,
+            )
+        )
+        if manifest["owners"] != actual_owners:
+            report.problems.append("manifest owner inventory missing/unused/mismatched entries")
+        _manifest_aliases(
+            ast.parse(old_source),
+            ast.parse(after.get(old_key, "")),
+            where,
+            old_key,
+            modules,
+            report,
+        )
+        targets = {
+            key: f"{modules[manifest['owners'][key]]}.{key}"
+            for key in manifest["owners"]
+            if "." not in key
+            and any(isinstance(n, _FUNCTIONS) and n.name == key for n in ast.parse(old_source).body)
+        }
+        targets.update(manifest["seams"])
+        for key, source in after.items():
+            report.problems.extend(check_bindings(source, modules[key], targets))
+        report.problems.extend(
+            check_globals(old_source, after, modules[old_key], modules, manifest["owners"])
+        )
+        report.problems.extend(m.check_spans(old_source, after, manifest["owners"]))
+        report.problems.extend(
+            check_imports(
+                ast.parse(old_source),
+                {key: ast.parse(source) for key, source in after.items()},
+                old_key=old_key,
+                modules=modules,
+                owners=where,
+                hosts={name: host.module for name, host in hosts.items()},
+                manifest=manifest,
+            )
+        )
+        if any(name not in report.moved for name in manifest["effects"]):
+            report.problems.append("manifest named effect is unused")
+    except (ValueError, TypeError, KeyError, SyntaxError, AttributeError) as exc:
+        report.problems.append(f"manifest: {exc}")
+    return report
+
+
+def _manifest_aliases(
+    old: ast.Module,
+    facade: ast.Module,
+    owners: Mapping[str, str],
+    old_key: str,
+    modules: Mapping[str, str],
+    report: MoveReport,
+) -> None:
+    bound = _runtime_bindings(facade)
+    _check_exports(report, old, facade, owners, modules, False)
+    for key, owner in owners.items():
+        if owner == old_key:
+            continue
+        for name in key.split(","):
+            if bound.get(name) != (modules[owner], name) or _bindings_of(facade, name) != 1:
+                report.problems.append(
+                    f"re-export: exact public/private alias {name} -> {modules[owner]} required"
+                )
+    if modules[old_key] == "dendrux.runtime.runner" and len(owners) != 281:
+        report.problems.append("re-export: runner must conserve all 281 original roots")
+    if modules[old_key] == "dendrux.runtime.runner":
+        original = _runtime_bindings(old)
+        for name, identity in original.items():
+            if identity is not None and bound.get(name) != identity:
+                report.problems.append(
+                    f"re-export: original imported compatibility binding {name} changed"
+                )
+
+
+def _git_show(base: str, path: str) -> str:
+    proc = subprocess.run(  # noqa: S603 - argument list, fixed git subcommand
+        ["git", "show", f"{base}:./{path}"],  # noqa: S607
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode:
+        raise SystemExit(f"move_check: cannot read {path} at {base}: {proc.stderr.strip()}")
+    return proc.stdout
+
+
+def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--base", required=True, help="git ref holding the original module")
+    parser.add_argument("--old", required=True, type=Path, help="old module path (relative to cwd)")
+    parser.add_argument("--new", nargs="+", default=[], type=Path, help="new module paths")
+    parser.add_argument("--allow-new", nargs="*", default=[], metavar="NAME")
+    parser.add_argument(
+        "--allow-effects",
+        nargs="*",
+        default=[],
+        metavar="NAME",
+        help="assignments whose value calls something may move only if their target is listed",
+    )
+    parser.add_argument("--require-reexports", action="store_true")
+    parser.add_argument("--move-manifest", type=Path, help="reviewed cumulative move evidence")
+    parser.add_argument("--emit-map", type=Path, help="write {old_module: {name: new_module}} JSON")
+    return parser.parse_args(argv)
+
+
+def _patch_map(old: Path, moved: Mapping[str, str]) -> dict[str, dict[str, str]]:
+    """Top-level moved names only, keyed by module (methods are not patch targets)."""
+    names = {k: r.module_name(Path(v)) for k, v in moved.items() if "." not in k}
+    return {r.module_name(old): dict(sorted(names.items()))} if names else {}
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _parse_args(argv)
+    old_key = str(args.old)
+    after: dict[str, str] = {str(p): p.read_text(encoding="utf-8") for p in args.new}
+    if args.old.is_file():
+        after[old_key] = args.old.read_text(encoding="utf-8")
+    manifest = None
+    if args.move_manifest:
+        try:
+            manifest = json.loads(args.move_manifest.read_text(encoding="utf-8"))
+            if manifest["base"] != args.base:
+                raise ValueError("manifest base differs from --base (use the immutable SHA)")
+            m.verify_provider_sources(
+                manifest,
+                lambda path: _git_show(args.base, path),
+                lambda path: Path(path).read_text(),
+            )
+            if args.allow_effects and set(args.allow_effects) != set(manifest["effects"]):
+                raise ValueError("--allow-effects differs from manifest")
+            if args.allow_new and set(args.allow_new) != set(manifest["scaffolding"]):
+                raise ValueError("--allow-new differs from reviewed contracts")
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            print(f"move_check: manifest refused: {exc}")
+            return 1
+    report = check_move(
+        _git_show(args.base, old_key),
+        after,
+        old_key=old_key,
+        allow_new=args.allow_new,
+        allow_effects=args.allow_effects,
+        require_reexports=args.require_reexports,
+        modules={str(p): r.module_name(p) for p in [args.old, *args.new]},
+        move_manifest=manifest,
+    )
+    for key, module in sorted(report.moved.items()):
+        print(f"moved: {key} -> {module}")
+    for problem in report.problems:
+        print(problem)
+    if report.problems:
+        print(f"move_check: FAILED, {len(report.problems)} problem(s); this is not a pure move")
+        return 1
+    if args.emit_map:
+        args.emit_map.write_text(json.dumps(_patch_map(args.old, report.moved), indent=1) + "\n")
+    print(f"move_check: ok, {len(report.moved)} definition(s) moved, nothing else changed")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

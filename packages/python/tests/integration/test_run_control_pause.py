@@ -28,6 +28,7 @@ from dendrux.types import (
     RunStatus,
     ToolResult,
 )
+from tests._helpers.gates import wait_for_gate
 from tests._helpers.scripted_provider import ScriptedLLM, tool_call, tool_calls
 
 pytestmark = pytest.mark.asyncio
@@ -250,7 +251,7 @@ class TestRequestedPause:
             strict_tenancy=False, provider=llm, prompt="Test.", tools=[step], state_store=store
         )
         task = asyncio.create_task(agent.run("go"))
-        await asyncio.wait_for(llm.entered.wait(), 5)
+        await wait_for_gate(llm.entered, task=task)
         run_id = (await store.list_runs())[0].id
 
         outcome = await agent.request_pause(run_id)

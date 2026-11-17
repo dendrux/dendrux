@@ -9,10 +9,12 @@ from dendrux import Agent
 from dendrux.db.models import Base
 from dendrux.guardrails import SecretDetection
 from dendrux.llm.mock import MockLLM
+from dendrux.runtime import _run_events
 from dendrux.runtime._blocked_content import _blocked_write
 from dendrux.tool import tool
 from dendrux.types import ApprovalDecision, LLMResponse, RunStatus, ToolCall, ToolResult
 from tests._fixtures.storage import pin_storage_format
+from tests._helpers.gates import wait_for_gate
 
 SECRET = "AKIAIOSFODNN7EXAMPLE"
 
@@ -120,7 +122,7 @@ async def test_submitted_text_is_projected_before_first_write(
         snapshots.append(True)
         return await finalize(*args, **kwargs)
 
-    monkeypatch.setattr(runner, "_finalize_running_event", clean_before_terminal_commit)
+    monkeypatch.setattr(_run_events, "_finalize_running_event", clean_before_terminal_commit)
     try:
         kwargs = {"tenant_id": "t", "expected_pause_id": raw["pause_id"]}
         call_id = raw["pending_tool_calls"][0]["id"]
@@ -249,7 +251,7 @@ async def test_note_block_during_provider_stops_subsequent_tool(store, engine, f
     )
     task = asyncio.create_task(agent.run("go", tenant_id="t"))
     try:
-        await asyncio.wait_for(entered.wait(), 5)
+        await wait_for_gate(entered, task=task)
         from dendrux.db.models import AgentRun
 
         async with engine.connect() as connection:

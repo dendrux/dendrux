@@ -78,7 +78,7 @@ def bounded_step(
         # Log fields are a closed set: values the registry does not know are left out.
         for name, value in (("step", step), ("revision", revision)):
             if _codes._valid_field(name, value):
-                fields[name] = value
+                fields[name] = value  # noqa: PERF403 - the short allow-list loop is clearer
         _codes.log_code(logger, _codes.MIGRATION_LOCK_TIMEOUT, **fields)
         raise RuntimeError(
             f"Timed out acquiring the Dendrux migration lock after {LOCK_TIMEOUT_SECONDS} "

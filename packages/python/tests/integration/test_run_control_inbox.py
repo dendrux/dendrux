@@ -18,6 +18,7 @@ from dendrux.runtime.context import get_delegation_context
 from dendrux.store import RunStore
 from dendrux.tool import tool
 from dendrux.types import LLMResponse, RunStatus, ToolResult
+from tests._helpers.gates import wait_for_gate
 from tests._helpers.scripted_provider import ScriptedLLM, tool_call
 
 pytestmark = pytest.mark.asyncio
@@ -46,7 +47,7 @@ class TestDelivery:
             strict_tenancy=False, provider=llm, prompt="Test.", tools=[step], state_store=store
         )
         task = asyncio.create_task(agent.run("go"))
-        await asyncio.wait_for(llm.entered.wait(), 5)
+        await wait_for_gate(llm.entered, task=task)
         run_id = (await store.list_runs())[0].id
 
         note_id = await agent.submit_note(run_id, "use the EU region", metadata={"by": "ops"})
@@ -163,7 +164,7 @@ class TestDelivery:
         llm = ScriptedLLM([LLMResponse(text="done")], gate_at=0)
         agent = Agent(strict_tenancy=False, provider=llm, prompt="Test.", state_store=store)
         task = asyncio.create_task(agent.run("go"))
-        await asyncio.wait_for(llm.entered.wait(), 5)
+        await wait_for_gate(llm.entered, task=task)
         run_id = (await store.list_runs())[0].id
         note_id = await agent.submit_note(run_id, "too late")
         llm.gate.set()
@@ -189,7 +190,7 @@ class TestDelivery:
             guardrails=[PII(action="redact")],
         )
         task = asyncio.create_task(agent.run("go"))
-        await asyncio.wait_for(llm.entered.wait(), 5)
+        await wait_for_gate(llm.entered, task=task)
         run_id = (await store.list_runs())[0].id
         await agent.submit_note(run_id, "email me at jane.doe@example.com")
         llm.gate.set()

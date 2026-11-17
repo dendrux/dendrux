@@ -162,6 +162,56 @@ def reset_delegation_context(token: Token[DelegationContext | None]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Managed subagents (0.7): the invocation a driver hands to one child run
+# ---------------------------------------------------------------------------
+
+_managed_invocation: ContextVar[Any] = ContextVar("dendrux_managed_invocation", default=None)
+
+
+@contextlib.contextmanager
+def managed_invocation_scope(invocation: Any) -> Any:
+    """Bind ``invocation`` for exactly the next run entry in this task (internal).
+
+    The driver sets it around one child run; that run takes it at entry, so
+    nested runs (for example inside a tool) never see it. Not a public bypass:
+    nothing outside the managed driver sets it.
+    """
+    token = _managed_invocation.set(invocation)
+    try:
+        yield
+    finally:
+        _managed_invocation.reset(token)
+
+
+_managed_root_reclaim: ContextVar[str | None] = ContextVar(
+    "dendrux_managed_root_reclaim", default=None
+)
+
+
+@contextlib.contextmanager
+def managed_root_reclaim_scope(run_id: str) -> Any:
+    """Mark the reclaim of managed child ``run_id`` as driven by its root (internal)."""
+    token = _managed_root_reclaim.set(run_id)
+    try:
+        yield
+    finally:
+        _managed_root_reclaim.reset(token)
+
+
+def managed_root_reclaim(run_id: str) -> bool:
+    """True only inside the root's reclaim of this exact managed child."""
+    return _managed_root_reclaim.get() == run_id
+
+
+def take_managed_invocation() -> Any:
+    """Return the bound invocation once, clearing it for the rest of this run."""
+    invocation = _managed_invocation.get()
+    if invocation is not None:
+        _managed_invocation.set(None)
+    return invocation
+
+
+# ---------------------------------------------------------------------------
 # Store identity — extract comparable identity from any StateStore
 # ---------------------------------------------------------------------------
 

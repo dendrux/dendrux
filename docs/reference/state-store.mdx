@@ -1,6 +1,6 @@
 ---
 title: StateStore capabilities
-description: Explicit capability declarations for custom state stores, format-2 requirements, legacy compatibility and validation at Agent construction.
+description: Explicit capability declarations for custom state stores, format-2 and managed-subagent requirements, legacy compatibility and validation timing.
 ---
 
 # StateStore capabilities
@@ -30,7 +30,7 @@ Construct a store once per worker event loop and pass it as `Agent(state_store=s
 
 ## Capability matrix
 
-A custom store declares a class attribute `capabilities: StoreCapabilities`. This frozen dataclass has `version=1`, five flags that default to `False`, and a `deployment` field that defaults to `None`. Method names alone never enable a capability.
+A custom store declares a class attribute `capabilities: StoreCapabilities`. This frozen dataclass has `version=1`, six flags that default to `False`, and a `deployment` field that defaults to `None`. Method names alone never enable a capability.
 
 | Capability | Promise | Required methods and keyword parameters |
 | --- | --- | --- |
@@ -38,7 +38,8 @@ A custom store declares a class attribute `capabilities: StoreCapabilities`. Thi
 | `retry_ids` | Retrying the same row id and persisted content reuses the row; conflicting content raises `write_conflict` | `save_trace(trace_id=)`, `save_tool_call(row_id=)`, `save_run_event(event_id=)`, `save_usage(usage_id=)`, `save_llm_interaction(interaction_id=)` |
 | `checkpointing` | Durable execution state and kind-aware conversation reconstruction | `create_run(seed_traces=, pii_mapping=)`, `save_trace(trace_kind=)`, `save_tool_call(outcome=)`, `complete_tool_call(pii_mapping=)`, `consume_submission(pii_mapping=)`, `checkpoint_step`, `get_traces_after`, `conversation_traces`, `claim_paused_run`, `submit_and_claim` |
 | `atomic_completion` | Tool intent and completion are durable; completion includes observation and event; finalization includes the final trace | `start_tool_call`, `complete_tool_call`, `finalize_with_event(trace=)` |
-| `recovery` | Bounded lease marking and atomic reclaim | `mark_lease_expired(finalise_unrecoverable=)`, `get_lease_expired`, `reclaim_run`, `get_replayed_tool_calls` |
+| `recovery` | Bounded lease marking and atomic reclaim | `mark_lease_expired(finalise_unrecoverable=)`, `get_lease_expired`, `reclaim_run`, `get_replayed_tool_calls`; see [Recovery contract](#recovery-contract) |
+| `managed_subagents` | Bind one child atomically while parking its parent, and read the cancel frontier; requires all five durability flags above | `bind_managed_child(request)`, `get_managed_cancel_children_page`, `is_managed_root_stopped`, `get_managed_run_control`; see [Managed subagent stores](#managed-subagent-stores) |
 
 `deployment` is descriptive, not a feature switch: it says how many processes may share the store's data. It is one of:
 
@@ -52,7 +53,25 @@ A store with an explicit capability declaration but no `deployment` still runs, 
 
 The table lists the added requirements, not full method signatures. Implement the protocol in `dendrux.runtime.state`; do not copy a shortened table entry as a method definition. Signature validation requires the named keyword-only parameters. A forwarding subclass override should preserve those named parameters and pass them through; do not rely on a bare `**kwargs` declaration satisfying validation.
 
-The built-in SQL stores declare all five capabilities. Live updates are not a capability; see below.
+The built-in `SQLiteStateStore`, `PostgresStateStore` and `MySQLStateStore` declare all six capabilities through `SQLStateStore`. Live updates are not a capability; see below.
+
+### Recovery contract
+
+- `mark_lease_expired(finalise_unrecoverable=False)` spares only format-2 rows whose loop marker is missing or unknown. It finalizes every other stale row it cannot reclaim, under a new claim epoch, and returns each once in `finalised`: a started `single_call` row as `error` with `stale_running`, a format-1 row with `stale_running_legacy`, a row out of attempts with `reclaim_limit`, and a row with a pending cancel as `cancelled`. With `True` it also finalizes the spared rows, and a `single_call` row that never started ends `never_started`. `sweep(on_stale="reclaim")` passes `True`.
+- `reclaim_run` never claims a running run whose saved loop is `single_call`, and changes nothing when it refuses.
+- A custom `sweep_abandoned_runs` never sweeps a managed wait.
+- Sweeps are store-wide, not tenant-scoped. A waiting run with a pending cancel that passes the abandoned window is swept as `error` (`run.abandoned`).
+- Age cutoffs come from the clock of the process that runs `sweep()`, compared with stored timestamps. Keep sweepers and workers on synchronized time.
+
+### Managed subagent stores
+
+A custom store must declare `managed_subagents=True` together with `fenced_writes`, `retry_ids`, `checkpointing`, `atomic_completion` and `recovery`. It must implement the `ManagedStateStore` extension in `dendrux.runtime.state`, including `bind_managed_child(request)`.
+
+The bind must validate the parent's tenant, current claim epoch, cancellation state and outstanding child binding. In one transaction, it parks and fences the parent, records the tool intent and wait, creates the child with its initial state, and records the delegation event. Retrying a bound invocation must return its existing child without granting execution ownership again. It stores the child's loop state unchanged, including the `loop` marker, and enforces `Limits.max_managed_runs` inside the same transaction, after replay detection and before any write; The cap is the root's saved `loop_state["managed_limits"]["max_managed_runs"]` (128 when absent). An exhausted or inconclusive count raises `ManagedStateError` with `code` `managed_run_limit` and writes nothing.
+
+Cancellation reads three more public methods. `get_managed_cancel_children_page(parent_ids, *, after, limit, tenant_id)` returns one tenant-scoped page, in id order, of at most `min(limit, 500)` children, each as child id, parent id and raw managed header, without loading history. Return a malformed header as it is stored; Dendrux skips it and reports it in `meta["cascade"]`. `is_managed_root_stopped(run_id)` says whether that run's workflow root has stopped; a missing run counts as stopped. `get_managed_run_control(run_id)` returns the run's own control state, with `cancel_requested` also set when its root has stopped, in one read. Follow the full extension contract and the [store test kit](/docs/guides/build-your-own-store); a method with the right name alone is not enough.
+
+At Agent construction, a declared capability with a missing or invalid required method raises `StoreCapabilityError`. A missing `managed_subagents` flag, or a missing prerequisite flag, is checked when managed execution begins, before managed writes. It raises `StoreCapabilityError` then, even if construction and ordinary runs succeeded. Managed runs also require format-2 storage; the capability flags do not activate an existing database by themselves. See [Format and recovery requirements](#format-and-recovery-requirements).
 
 ## Live updates
 

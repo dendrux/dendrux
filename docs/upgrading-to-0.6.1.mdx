@@ -189,7 +189,7 @@ The query is incomplete. Raw text committed before a verdict, and copies made by
 
 ### Limits of this release
 
-- Model reasoning text is not scanned in 0.6.1. A secret that appears only in reasoning is stored as the model produced it. Scanning reasoning is planned for 0.7.
+- Model reasoning text is not scanned in 0.6.1. A secret that appears only in reasoning is stored as the model produced it. Scanning reasoning is planned for a later release.
 - Histories copied before 0.6.1 are not cleaned. That includes retry copies made from a blocked run: only the retried run and its `runs=` sources are checked, so retrying such a copy is not refused.
 - Skill body digests (a sha256 of each skill body) stay in run metadata, events and spans. They identify the skill definition and are not removed.
 - A custom store that cannot keep the blocked mark fails closed with `PersistenceError`, as described above. It cannot offer the retry refusal or the replay omission for that run.

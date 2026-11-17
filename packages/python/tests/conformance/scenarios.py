@@ -1120,9 +1120,11 @@ async def _sweep(ctx: Ctx) -> None:
     orphan = await ctx.orphan_running_run()
     fresh = await ctx.run(ctx.agent(ctx.provider(text("fresh"))), "stays untouched")
     await ctx.age_runs(paused.run_id, approval.run_id, orphan)
+    # The recorded finalising policy; the 0.7 default ("reclaim") is an edge cell.
     await ctx.sweep(
         stale_running=timedelta(minutes=20),
         abandoned_waiting=timedelta(minutes=30),
+        on_stale="error",
     )
     await ctx.cancel_run(agent, paused.run_id, "after sweep")
     await ctx.submit_approval(
@@ -1138,7 +1140,11 @@ async def _sweep(ctx: Ctx) -> None:
 @cell("sweep__nothing_due", "sweep", "run", "sweep")
 async def _sweep_nothing(ctx: Ctx) -> None:
     await ctx.run(ctx.agent(ctx.provider(text("done"))), "hi")
-    await ctx.sweep(stale_running=timedelta(minutes=20), abandoned_waiting=timedelta(minutes=30))
+    await ctx.sweep(
+        stale_running=timedelta(minutes=20),
+        abandoned_waiting=timedelta(minutes=30),
+        on_stale="error",
+    )
 
 
 # ---------------------------------------------------------------------------

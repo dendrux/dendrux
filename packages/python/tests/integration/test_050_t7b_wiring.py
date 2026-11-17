@@ -19,6 +19,7 @@ from dendrux.runtime.runner import _build_cached_result
 from dendrux.store import RunStore
 from dendrux.types import Budget, LLMResponse, RunStatus, ToolCall, ToolResult, UsageStats
 from tests._helpers.db_errors import locked_error
+from tests._helpers.gates import wait_for_gate
 from tests._helpers.scripted_provider import ScriptedLLM, tool_call
 from tests.integration.test_050_t7_integrity import agent, consume, result_for
 
@@ -441,7 +442,7 @@ async def test_resumed_in_process_cancel_returns_result(store, entry):
         else a.submit_tool_results(pause.run_id, [result_for(pause)])
     )
     task = asyncio.create_task(action)
-    await asyncio.wait_for(llm.entered.wait(), 5)
+    await wait_for_gate(llm.entered, task=task)
     await a.cancel_run(pause.run_id)
     # A direct resume was not tracked in 7a: release its provider gate as well.
     llm.gate.set()
@@ -517,7 +518,7 @@ async def test_postgres_concurrent_sweeps_cannot_revoke_refreshed_run(
     method = store.sweep_abandoned_runs if waiting else store.sweep_stale_runs
     tasks = [asyncio.create_task(method(dt.timedelta(hours=1))) for _ in range(8)]
     try:
-        await asyncio.wait_for(selected.wait(), 10)
+        await wait_for_gate(selected)
         if waiting:
             epoch = (await store.claim_paused_run("live", expected_status="paused")).claim_epoch
             assert await store.release_run_claim("live", status="paused", claim_epoch=epoch)

@@ -391,7 +391,7 @@ A custom store must keep the mark together with the placeholder through its exis
 
 ### Limits
 
-- Model reasoning text is not scanned in 0.6.1. A secret that appears only in reasoning is stored as the model produced it. Scanning it is planned for 0.7.
+- Model reasoning text is not scanned in 0.6.1. A secret that appears only in reasoning is stored as the model produced it. Scanning it is planned for a later release.
 - Histories copied before 0.6.1 are not cleaned, and old raw rows and the hashes derived from them stay until you review or scrub them. That includes retry copies made from a blocked run: only the retried run and its `runs=` sources are checked, so retrying such a copy is not refused. Absence of the mark does not show that old history is safe.
 - Skill body digests (a sha256 of each skill body) remain in run metadata, events and spans; they identify the skill definition.
 - A custom store that cannot keep the blocked mark fails closed, as above, and cannot offer the retry refusal or replay omission for that run.

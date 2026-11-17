@@ -62,15 +62,17 @@ async def test_ten_times_realistic_paging(engine, method, model, count, index):
             )
         assert seen == list(range(count))
         assert await read(ROOT, tenant_id="other", limit=10) == []
-    with pytest.warns(FutureWarning):
-        assert len(await read(ROOT, tenant_id="mine")) == count
-    with pytest.warns(FutureWarning):
-        assert len(await read(ROOT, tenant_id="mine", limit=2000)) == 1000
+        # Since 0.7.0 an omitted limit reads one page of 1,000; above 1,000 raises.
+        assert len(await read(ROOT, tenant_id="mine")) == 1000
+        assert len(await read(ROOT, tenant_id="mine", limit=None)) == 1000
+        with pytest.raises(ValueError, match="at most 1000"):
+            await read(ROOT, tenant_id="mine", limit=1001)
 
 
+@pytest.mark.parametrize("bound", [{"max_nodes": 10000}, {}], ids=["explicit", "default"])
 @pytest.mark.parametrize("descendants,refuses", [(9999, False), (10000, True)])
 async def test_subtree_ten_times_realistic_and_hostile_boundary(
-    engine, caplog, descendants, refuses
+    engine, caplog, descendants, refuses, bound
 ):
     state = store_for_engine(engine)
     await state.create_run(ROOT, "root", tenant_id="mine")
@@ -101,7 +103,7 @@ async def test_subtree_ten_times_realistic_and_hostile_boundary(
             warnings.simplefilter("error", FutureWarning)
             if refuses:
                 with pytest.raises(errors.SubtreeTooLargeError) as caught:
-                    await RunStore(state).get_subtree(ROOT, tenant_id="mine", max_nodes=10000)
+                    await RunStore(state).get_subtree(ROOT, tenant_id="mine", **bound)
                 assert isinstance(caught.value, ValueError)
                 assert (caught.value.run_id, caught.value.max_nodes) == (ROOT, 10000)
                 assert len(materialized) == 10001  # root plus capped rows; this is a node bound
@@ -113,7 +115,7 @@ async def test_subtree_ten_times_realistic_and_hostile_boundary(
                 assert len(records) == 1
                 assert records[0].run_id == ROOT and records[0].limit == 10000
             else:
-                tree = await RunStore(state).get_subtree(ROOT, tenant_id="mine", max_nodes=10000)
+                tree = await RunStore(state).get_subtree(ROOT, tenant_id="mine", **bound)
                 assert len(tree.nodes) == 10000
                 assert tree.root.run.run_id == ROOT
                 assert tree.usage.llm_calls == 0
@@ -146,7 +148,7 @@ async def test_event_feed_oversize_batch_drains_all_pages_without_warning(engine
     await reader.close()
 
 
-async def test_format_two_clamp_keeps_shared_reconstruction_unclamped(engine):
+async def test_format_two_page_keeps_shared_reconstruction_unbounded(engine):
     from dendrux.runtime.replay import conversation_records
 
     state = store_for_engine(engine)
@@ -160,11 +162,10 @@ async def test_format_two_clamp_keeps_shared_reconstruction_unclamped(engine):
         ],
     )
     reader = RunStore(state)
-    with pytest.warns(FutureWarning):
-        page = await reader.get_traces(ROOT, tenant_id="mine", limit=2000, offset=17)
+    with pytest.raises(ValueError, match="at most 1000"):
+        await reader.get_traces(ROOT, tenant_id="mine", limit=2000, offset=17)
+    page = await reader.get_traces(ROOT, tenant_id="mine", offset=17)
     assert [r.content for r in page] == [str(i) for i in range(17, 1017)]
-    with pytest.warns(FutureWarning):
-        assert len(await reader.get_traces(ROOT, tenant_id="mine")) == 5000
     for limit in (0, -1, 1, 1000):
         with warnings.catch_warnings():
             warnings.simplefilter("error", FutureWarning)
@@ -193,8 +194,7 @@ async def test_subtree_bound_excludes_root_in_a_cycle(engine):
         )
     tree = await RunStore(state).get_subtree(ROOT, tenant_id="mine", max_nodes=2)
     assert len(tree.nodes) == 2
-    with pytest.warns(FutureWarning):
-        assert len((await RunStore(state).get_subtree(ROOT, tenant_id="mine")).nodes) == 2
+    assert len((await RunStore(state).get_subtree(ROOT, tenant_id="mine")).nodes) == 2
 
 
 async def test_live_audit_helpers_keep_full_history(engine, tmp_path, monkeypatch):
@@ -277,7 +277,7 @@ async def test_descendant_batch_orders_by_created_at_then_id(engine):
     assert [node.run.agent_name for node in tree.nodes] == ["root", "early-a", "early-b", "late"]
 
 
-async def test_unbounded_subtree_keeps_tenant_scope_on_every_branch(engine):
+async def test_default_subtree_bound_keeps_tenant_scope_on_every_branch(engine):
     state = store_for_engine(engine)
     await state.create_run(ROOT, "root", tenant_id="mine")
     await state.create_run(
@@ -293,10 +293,9 @@ async def test_unbounded_subtree_keeps_tenant_scope_on_every_branch(engine):
         parent_run_id="00000000000000000000000702",
     )
     reader = RunStore(state)
-    with pytest.warns(FutureWarning):
-        tree = await reader.get_subtree(ROOT, tenant_id="mine")
+    tree = await reader.get_subtree(ROOT, tenant_id="mine")
     assert {node.run.agent_name for node in tree.nodes} == {"root", "mine"}
-    with pytest.warns(FutureWarning), pytest.raises(errors.RunNotFoundError):
+    with pytest.raises(errors.RunNotFoundError):
         await reader.get_subtree(ROOT, tenant_id="other")
 
 

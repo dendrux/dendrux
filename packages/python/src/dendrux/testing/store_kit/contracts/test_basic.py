@@ -150,6 +150,24 @@ async def test_event_sequence_starts_at_zero_without_gaps(dendrux_kit: Kit) -> N
 
 
 @basic()
+async def test_event_sequence_is_read_and_allocated_per_run(dendrux_kit: Kit) -> None:
+    """A run's next sequence is its own maximum plus one, whatever other runs hold."""
+    store = dendrux_kit.store
+    quiet, busy, fresh = [await dendrux_kit.new_run() for _ in range(3)]
+    for _ in range(2):
+        await store.save_run_event(quiet, event_type=EVENT)
+    for _ in range(6):
+        await store.save_run_event(busy, event_type=EVENT)
+    assert await store.get_next_event_sequence(quiet) == 2, "next sequence must be per run"
+    assert await store.get_next_event_sequence(busy) == 6
+    assert await store.get_next_event_sequence(fresh) == 0
+    assert await store.save_run_event(quiet, event_type=EVENT) == 2, "allocation must be per run"
+    assert await store.save_run_event(fresh, event_type=EVENT) == 0
+    assert await store.get_next_event_sequence(quiet) == 3
+    assert [e.sequence_index for e in await store.get_run_events(quiet)] == [0, 1, 2]
+
+
+@basic()
 async def test_event_reads_page_and_filter(dendrux_kit: Kit) -> None:
     store = dendrux_kit.store
     run_id = await dendrux_kit.new_run()
@@ -509,7 +527,7 @@ async def test_time_filters_need_aware_datetimes(dendrux_kit: Kit) -> None:
     assert [r.id for r in await store.list_runs(started_before=future)] == [run_id]
     assert await store.list_runs(started_before=past) == []
     with pytest.raises(ValueError):
-        await store.list_runs(started_after=datetime.now())  # noqa: DTZ005 - naive on purpose
+        await store.list_runs(started_after=datetime.now())  # naive on purpose
 
 
 @basic()

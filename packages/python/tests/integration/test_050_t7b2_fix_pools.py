@@ -14,6 +14,7 @@ from sqlalchemy import text
 from dendrux import Agent
 from dendrux.llm.mock import MockLLM
 from dendrux.types import LLMResponse
+from tests._helpers.gates import wait_for_gate
 
 
 async def test_repeated_asyncio_jobs_with_unclosed_agents_are_bounded_after_gc(
@@ -178,7 +179,7 @@ async def test_loop_shutdown_drains_cancelled_run_before_retiring_pool(engine, t
             holder.append(a)
             task = asyncio.create_task(a.run("go", tenant_id=None))
             task_holder.append(task)
-            await asyncio.wait_for(llm.entered.wait(), 20)
+            await wait_for_gate(llm.entered, task=task)
 
         asyncio.run(start())  # cancellation finishes its durable write before the loop closes
 

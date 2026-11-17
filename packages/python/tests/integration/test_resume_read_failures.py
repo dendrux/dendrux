@@ -6,9 +6,10 @@ from unittest.mock import AsyncMock
 import pytest
 
 from dendrux.errors import PersistenceError, StoreOutcomeUnknown
-from dendrux.runtime import runner
+from dendrux.runtime import _run_approval, _run_events, _run_resume_replay, runner
 from dendrux.types import RunStatus
 from tests._fixtures.storage import pin_storage_format
+from tests._helpers.gates import wait_for_gate
 from tests._helpers.recovery_checkpoint import expire
 from tests._helpers.runtime_paths import ProbeProvider, path_case
 from tests._helpers.scripted_provider import tool_call
@@ -75,7 +76,7 @@ async def test_stale_setup_release_cannot_change_new_claim(
         patcher.setattr(store, "get_next_trace_index", fail_read)
         task = asyncio.create_task(invoke_failure(case, entry))
         try:
-            await asyncio.wait_for(entered.wait(), 10)
+            await wait_for_gate(entered, task=task)
             old = await store.get_run(case.run_id)
             if entry == "recovery":
                 item = await expire(store, engine, case.run_id)
@@ -166,7 +167,7 @@ async def test_cancel_request_wins_setup_release(store, engine, monkeypatch, ent
     monkeypatch.setattr(store, "get_next_trace_index", fail_read)
     task = asyncio.create_task(invoke_failure(case, entry))
     try:
-        await asyncio.wait_for(entered.wait(), 10)
+        await wait_for_gate(entered, task=task)
         await store.request_cancel(case.run_id)
         proceed.set()
         await asyncio.wait_for(task, 10)
@@ -195,7 +196,7 @@ async def test_consumed_history_is_never_released(
 
     release = AsyncMock(wraps=store.release_run_claim)
     monkeypatch.setattr(store, "release_run_claim", release)
-    monkeypatch.setattr(runner, "_replay_resume_injected_history", consumed_then_fail)
+    monkeypatch.setattr(_run_resume_replay, "_replay_resume_injected_history", consumed_then_fail)
     await invoke_failure(case, entry)
     release.assert_not_awaited()
     assert (await store.get_run(case.run_id)).status == "error"
@@ -214,7 +215,7 @@ async def test_stream_approval_work_is_never_released(store, engine, monkeypatch
 
     release = AsyncMock(wraps=store.release_run_claim)
     monkeypatch.setattr(store, "release_run_claim", release)
-    monkeypatch.setattr(runner, "_resume_approval_batch", executed_then_fail)
+    monkeypatch.setattr(_run_approval, "_resume_approval_batch", executed_then_fail)
     async with case.agent.resume_stream(
         case.run_id, tenant_id="tenant", expected_pause_id=raw["pause_id"]
     ) as stream:
@@ -257,7 +258,7 @@ async def test_committed_pause_survives_projection_failure(
         return await get_run(*args, **kwargs)
 
     with monkeypatch.context() as patcher:
-        patcher.setattr(runner, "_pause_with_event", commit_pause)
+        patcher.setattr(_run_events, "_pause_with_event", commit_pause)
         if read == "pending":
             patcher.setattr(
                 "dendrux.runtime._pending._PendingReader.get_pending",

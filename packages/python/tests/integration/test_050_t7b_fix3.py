@@ -15,6 +15,7 @@ from sqlalchemy.sql.selectable import Select
 from dendrux import sweep
 from dendrux.db.models import AgentRun, RunEvent
 from dendrux.runtime.stores._factory import store_for_engine
+from tests._helpers.gates import wait_for_gate
 from tests.integration._migration_schema import create_pre_activation_schema, migration_schema
 from tests.integration._migration_schema import test_database_url as _pg_url
 from tests.integration.test_migration_run_control import _alembic
@@ -258,7 +259,7 @@ async def test_online_clock_migration_writer_block(engine, record_property, rows
         event.listen(target.sync_engine.__class__, "before_cursor_execute", capture)
         worker = asyncio.create_task(writer())
         try:
-            await asyncio.wait_for(ready.wait(), 20)
+            await wait_for_gate(ready, task=worker)
             started = time.perf_counter()
             await asyncio.wait_for(asyncio.to_thread(migrate), 120)
             elapsed = time.perf_counter() - started
@@ -326,7 +327,7 @@ async def test_online_backfill_commits_batches_and_preserves_concurrent_runtime_
         task = asyncio.create_task(asyncio.to_thread(migrate))
         clocks = {}
         try:
-            await asyncio.wait_for(batch_done.wait(), 20)
+            await wait_for_gate(batch_done, task=task)
             async with target.connect() as conn:
                 count = (
                     await conn.execute(

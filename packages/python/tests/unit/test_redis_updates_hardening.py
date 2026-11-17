@@ -15,6 +15,7 @@ from typing import Any
 import pytest
 
 from dendrux.db import _redis_updates as ru
+from tests._helpers.gates import wait_for_gate
 from tests._helpers.log_records import without_addresses
 from tests.unit.test_redis_updates_fakes import FakeWorld
 
@@ -115,7 +116,7 @@ async def test_a_cancelled_close_aborts_the_sender_socket_and_a_retry_finishes(
     await updates.send(['["a"]'])
     entered, _ = stall_cleanup(world)
     task = asyncio.ensure_future(updates.close())
-    await asyncio.wait_for(entered.wait(), 5)
+    await wait_for_gate(entered, task=task)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
@@ -130,7 +131,7 @@ async def test_a_cancelled_aclose_sender_aborts_the_socket_itself(world: FakeWor
     await updates.send(['["a"]'])
     entered, _ = stall_cleanup(world)
     task = asyncio.ensure_future(updates.aclose_sender())
-    await asyncio.wait_for(entered.wait(), 5)
+    await wait_for_gate(entered, task=task)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task

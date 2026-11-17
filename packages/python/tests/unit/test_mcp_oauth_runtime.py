@@ -8,6 +8,8 @@ from typing import Any
 
 import pytest
 
+from tests._helpers.gates import wait_for_gate
+
 pytest.importorskip("uvicorn")
 
 from dendrux.mcp import (
@@ -667,7 +669,7 @@ async def test_concurrent_revokes_write_own_tombstones_and_share_one_eviction() 
             )
             second = None
             try:
-                await asyncio.wait_for(harness.revocation_entered.wait(), 10)
+                await wait_for_gate(harness.revocation_entered, task=first)
                 flow_url = await oauth.begin_authorization(
                     KEY, source(harness), redirect_uri=CALLBACK
                 )
@@ -710,7 +712,7 @@ async def test_revoke_fences_new_leases_while_pending() -> None:
                 runtime.revoke_authorization(connection_key=CONNECTION, tenant_key=TENANT)
             )
             try:
-                await asyncio.wait_for(harness.revocation_entered.wait(), 10)
+                await wait_for_gate(harness.revocation_entered, task=task)
                 assert (await required(connection.discover())).reason == "revoked"
                 assert (await required(echo(text="x"))).reason == "revoked"
             finally:
@@ -937,7 +939,7 @@ async def test_callback_timeout_on_an_oauth_binding_is_transient(monkeypatch) ->
             deadlines = ManualTimeouts(monkeypatch, _runtime)
             call = asyncio.create_task(echo(text="slow"))
             try:
-                await asyncio.wait_for(entered.wait(), 10)
+                await wait_for_gate(entered, task=call)
                 deadlines.expire()
                 with pytest.raises(MCPOAuthRefreshError):
                     await asyncio.wait_for(call, 10)
@@ -977,7 +979,7 @@ async def test_get_auth_timeout_on_an_oauth_binding_is_transient(monkeypatch) ->
             deadlines = ManualTimeouts(monkeypatch, _runtime)
             discovery = asyncio.create_task(connection.discover())
             try:
-                await asyncio.wait_for(entered.wait(), 10)
+                await wait_for_gate(entered, task=discovery)
                 deadlines.expire()
                 with pytest.raises(MCPOAuthRefreshError) as caught:
                     await asyncio.wait_for(discovery, 10)

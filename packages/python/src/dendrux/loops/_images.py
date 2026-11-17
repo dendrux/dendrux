@@ -1075,4 +1075,4 @@ def rejection_candidates(exc: ImageRejectedError, prepared: PreparedRequest) -> 
 
 async def no_control() -> None:
     """Control reader for loops without a state store."""
-    return None
+    return

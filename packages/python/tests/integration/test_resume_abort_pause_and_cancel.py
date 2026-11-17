@@ -9,13 +9,14 @@ import pytest
 
 from dendrux import tool
 from dendrux.errors import RunFencedError
-from dendrux.runtime import runner
+from dendrux.runtime import _run_observers, runner, state
 from dendrux.runtime._pending import _PendingReader
 from dendrux.runtime.persistence import PersistenceRecorder
 from dendrux.runtime.state import EventWrite, claimed_store
 from dendrux.store import RunStore
 from dendrux.types import LLMResponse, RunStatus, ToolCall, generate_ulid
 from tests._fixtures.storage import pin_storage_format
+from tests._helpers.gates import wait_for_gate
 from tests.integration.test_060_reclaim_agent import checkpoint
 from tests.integration.test_cross_path_invariants import make_agent, submission_case
 
@@ -30,7 +31,7 @@ async def test_aborted_resume_keeps_approval_pause_active(store, engine, monkeyp
         # Repeated attempts must still pair the real resume with the original pause.
         for _ in range(2):
             with monkeypatch.context() as patcher:
-                patcher.setattr(runner, "_start_trace", AsyncMock(side_effect=failure))
+                patcher.setattr(_run_observers, "_start_trace", AsyncMock(side_effect=failure))
                 with pytest.raises(RuntimeError) as caught:
                     await invoke()
                 assert caught.value is failure
@@ -88,7 +89,7 @@ async def test_cancel_during_claimed_setup_wins_release(
     monkeypatch.setattr(store, "get_pii_mapping", fail_setup)
     task = asyncio.create_task(invoke())
     try:
-        await asyncio.wait_for(entered.wait(), 10)
+        await wait_for_gate(entered, task=task)
         # A separate Agent has no local task to interrupt. Its cancel commits
         # through another DB session while the claimed submit is suspended.
         remote = make_agent(store, [])
@@ -314,27 +315,28 @@ async def test_active_pause_plan_is_indexed(store, engine, record_property):
 
 
 async def test_cancel_release_event_failure_rolls_back_terminal_transition(store, monkeypatch):
-    from dendrux.runtime.stores.sql import base
-
     _, run_id, _ = await submission_case(store, "input")
     claim = await store.claim_paused_run(run_id, expected_status="waiting_human_input")
     await store.request_cancel(run_id)
     event = EventWrite(
         generate_ulid(), "run.resume_aborted", 0, {"failure_kind": "setup_error"}, None, None
     )
-    original = base._insert_event_locked
+    original = state._insert_event_locked
+    fired = []
 
     async def fail_cancel(session, target, event_type, data):
         if event_type == "run.cancelled":
+            fired.append(target)
             raise RuntimeError("cancel_event_write_failure")
         return await original(session, target, event_type, data)
 
     with monkeypatch.context() as patcher:
-        patcher.setattr(base, "_insert_event_locked", fail_cancel)
+        patcher.setattr(state, "_insert_event_locked", fail_cancel)
         with pytest.raises(RuntimeError, match="cancel_event_write_failure"):
             await store.release_run_claim(
                 run_id, status="waiting_human_input", claim_epoch=claim.claim_epoch, event=event
             )
+    assert fired == [run_id]
     assert (await store.get_run(run_id)).status == "running"
     assert (await store.get_run_control(run_id)).cancel_requested
     assert not any(

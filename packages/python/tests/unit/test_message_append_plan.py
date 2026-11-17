@@ -22,6 +22,7 @@ from dendrux.types import (
     _step_to_dict,
     generate_ulid,
 )
+from tests._helpers.gates import wait_for_gate
 from tests._helpers.lost_cancel import LostCancel
 
 RUN_ID = generate_ulid()
@@ -280,7 +281,7 @@ async def test_append_lost_cancel_is_delivered_at_next_dispatch(monkeypatch, hoo
                 await r.on_tool_started(RUN_ID, ToolCall("client", id="client"), 2)
 
     task = asyncio.create_task(run())
-    await asyncio.wait_for(loss.entered.wait(), 5)
+    await wait_for_gate(loss.entered, task=task)
     task.cancel()
     await task
 

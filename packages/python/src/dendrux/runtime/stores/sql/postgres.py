@@ -119,6 +119,10 @@ class PostgresStateStore(SQLStateStore):
             )
         )
 
+    def _managed_root_key(self, column: Any) -> Any:
+        # Validated ULIDs use the primary key's collation, not JSON text's C collation.
+        return super()._managed_root_key(column).collate("default")
+
     def json_get(self, col: Any, path: Any, as_type: Any) -> Any:
         from sqlalchemy import Boolean, Integer, case, cast, func
         from sqlalchemy.dialects.postgresql import JSONB
@@ -363,13 +367,12 @@ class PostgresStateStore(SQLStateStore):
         if after is not None:
             per_parent = per_parent.where(scoped.c.id > after)
         children = per_parent.order_by(scoped.c.id).limit(size).lateral("children")
-        statement = (
+        return (
             select(children.c.id)
             .select_from(parents.join(children, true()))
             .order_by(children.c.id)
             .limit(size)
         )
-        return statement
 
 
 def _jsonb_or_null(column: Any) -> Any:

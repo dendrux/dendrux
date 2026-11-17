@@ -58,7 +58,24 @@ _REQUIREMENTS: dict[str, dict[str, tuple[str, ...]]] = {
         "reclaim_run": (),
         "get_replayed_tool_calls": (),
     },
+    "managed_subagents": {
+        "bind_managed_child": (),
+        "get_managed_cancel_children_page": ("after", "limit", "tenant_id"),
+        "is_managed_root_stopped": (),
+        "get_managed_run_control": (),
+        "get_run_control": (),
+        "mark_cancel_requested": (),
+        "get_children_page": (),
+    },
 }
+# Managed subagents need every durability promise the bind and adoption rely on.
+_MANAGED_PREREQUISITES = (
+    "fenced_writes",
+    "retry_ids",
+    "checkpointing",
+    "atomic_completion",
+    "recovery",
+)
 _CACHE: dict[int, tuple[weakref.ReferenceType[Any], StoreCapabilities]] = {}
 logger = logging.getLogger(__name__)
 
@@ -83,29 +100,50 @@ def validate_capabilities(store: Any) -> StoreCapabilities:
     elif caps.deployment not in ("single_process", "single_host", "multi_server"):
         _refuse(store, "deployment", "capabilities", ("deployment",))
     for capability, methods in _REQUIREMENTS.items():
-        if not getattr(caps, capability):
-            continue
-        for method, keywords in methods.items():
-            # Signature inspection must not invoke application descriptors or spies.
-            target = inspect.getattr_static(store, method, None)
-            if not callable(target):
-                _refuse(store, capability, method, keywords or (method,))
-            try:
-                params = inspect.signature(target).parameters
-            except (TypeError, ValueError):
-                _refuse(store, capability, method, keywords or (method,))
-            missing = tuple(
-                k
-                for k in keywords
-                if k not in params or params[k].kind is not inspect.Parameter.KEYWORD_ONLY
-            )
-            if missing:
-                _refuse(store, capability, method, missing)
+        if getattr(caps, capability):
+            for method, keywords in methods.items():
+                _check_method(store, capability, method, keywords)
     try:
         ref = weakref.ref(store, lambda _ref: _CACHE.pop(key, None))
     except TypeError:
         return caps
     _CACHE[key] = (ref, caps)
+    return caps
+
+
+def _check_method(store: Any, capability: str, method: str, keywords: tuple[str, ...]) -> None:
+    # Signature inspection must not invoke application descriptors or spies.
+    target = inspect.getattr_static(store, method, None)
+    if not callable(target):
+        _refuse(store, capability, method, keywords or (method,))
+    try:
+        params = inspect.signature(target).parameters
+    except (TypeError, ValueError):
+        _refuse(store, capability, method, keywords or (method,))
+    missing = tuple(
+        k
+        for k in keywords
+        if k not in params or params[k].kind is not inspect.Parameter.KEYWORD_ONLY
+    )
+    if missing:
+        _refuse(store, capability, method, missing)
+
+
+def require_managed_subagents(store: Any) -> StoreCapabilities:
+    """Refuse before any managed write unless the store can bind managed children.
+
+    The store must declare ``managed_subagents`` and every durability capability
+    the bind and adoption rely on. Narrowing one of those (for example
+    ``recovery=False``) keeps the store valid for ordinary runs and turns
+    managed use off; it is not a construction error.
+    """
+    validate_capabilities(store)
+    caps = capabilities(store)
+    if not caps.managed_subagents:
+        _refuse(store, "managed_subagents", "bind_managed_child", ("bind_managed_child",))
+    absent = tuple(name for name in _MANAGED_PREREQUISITES if not getattr(caps, name))
+    if absent:
+        _refuse(store, "managed_subagents", "capabilities", absent)
     return caps
 
 

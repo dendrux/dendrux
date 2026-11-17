@@ -1,6 +1,6 @@
 [project]
 name = "dendrux"
-version = "0.6.1"
+version = "0.7.0"
 description = "The runtime for agents that act in the real world."
 readme = "README.md"
 license = {text = "Apache-2.0"}
@@ -82,6 +82,8 @@ dev = [
     # Fast loop (make test-fast) and the flaky quarantine. See tools/QUALITY.md, "Test tiers".
     "pytest-testmon==2.2.0",
     "pytest-rerunfailures==16.7",
+    # Per-test time limit (timeout = 300 below); see tools/QUALITY.md, "Test timeout".
+    "pytest-timeout==2.4.0",
     # Quality gates (see tools/ and .importlinter).
     "radon==6.0.1",
     # Quality ratchets compare against committed baselines. Tool upgrades are deliberate;
@@ -159,6 +161,7 @@ target-version = "py311"
 extend-exclude = ["src/dendrux/db/migrations", ".semgrep"]
 
 [tool.ruff.lint]
+logger-objects = ["dendrux.runtime._run_errors.logger"]
 select = [
     "E",    # pycodestyle errors
     "F",    # pyflakes
@@ -168,7 +171,31 @@ select = [
     "B",    # flake8-bugbear
     "SIM",  # flake8-simplify
     "TCH",  # flake8-type-checking
+    "RUF100", # unused noqa directives
+    "RET",  # flake8-return
+    "ERA",  # eradicate (commented-out code)
+    "PTH",  # flake8-use-pathlib
+    "PERF", # perflint
+    "PLW",  # pylint warnings
+    "TRY201", # verbose exception re-raise
+    "TRY400", # logging an exception without exception info
+    "S",    # flake8-bandit
+    "PLE",  # pylint errors
 ]
+ignore = [
+    "PERF203", # try/except inside loops can be clearer
+    "PLW2901", # rebinding a loop variable can be clearer
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Apply the new hard rules only to the library; retain the existing rules elsewhere.
+# This also covers tests, examples, tools, scripts and the test-kit bootstrap module.
+"!src/dendrux/**" = ["RUF100", "RET", "ERA", "PTH", "PERF", "PLW", "TRY201", "TRY400", "S", "PLE"]
+"src/dendrux/**" = ["S101"] # R4 converts these
+# Pytest contracts and test/example assertions remain allowed after R4.
+"src/dendrux/testing/store_kit/contracts/**" = ["S101"]
+"tests/**" = ["S101"]
+"examples/**" = ["S101"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["dendrux"]
@@ -226,6 +253,9 @@ disallow_untyped_defs = false
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# faulthandler dumps all thread stacks at 240 s; pytest-timeout fails the test at 300 s.
+faulthandler_timeout = 240
+timeout = 300
 testpaths = ["tests"]
 markers = [
     "benchmark: environment-dependent Postgres measurements (HOT statistics, writer stall during a 300k-row migration); excluded from make test, make ci and CI, run with make bench on a quiet machine",

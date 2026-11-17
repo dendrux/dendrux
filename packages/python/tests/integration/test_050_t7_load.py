@@ -9,6 +9,7 @@ from sqlalchemy import event, text
 
 from dendrux.db.models import AgentRun
 from dendrux.types import LLMResponse, RunStatus
+from tests._helpers.gates import wait_for_gate
 from tests._helpers.scripted_provider import ScriptedLLM, tool_call
 from tests.integration.test_050_t7_integrity import agent, consume, result_for
 
@@ -61,7 +62,7 @@ async def test_fifty_resume_submit_races_on_ten_runs(store, engine, record_prope
 
     tasks = [asyncio.create_task(race(i, variant)) for i in range(10) for variant in range(5)]
     try:
-        await asyncio.wait_for(asyncio.gather(*(p.entered.wait() for p in providers)), 15)
+        await asyncio.gather(*(wait_for_gate(p.entered) for p in providers))
         records = await asyncio.gather(*(store.get_run(pause.run_id) for pause in paused))
         assert all(record.status == "running" for record in records)
     finally:

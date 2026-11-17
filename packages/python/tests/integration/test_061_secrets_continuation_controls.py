@@ -12,9 +12,11 @@ from dendrux.errors import PersistenceError, RunFencedError
 from dendrux.guardrails import PII, SecretDetection
 from dendrux.guardrails._engine import _entry_engine
 from dendrux.llm.mock import MockLLM
+from dendrux.runtime import _run_events
 from dendrux.runtime._blocked_content import _blocked_write
 from dendrux.types import LLMResponse, RunStatus, ToolCall, ToolResult
 from tests._fixtures.storage import pin_storage_format
+from tests._helpers.gates import wait_for_gate
 from tests.integration.test_061_secrets_continuation import (
     SECRET,
     client_read,
@@ -216,7 +218,7 @@ async def test_blocked_note_between_serial_tools_stops_remaining_effect(store, e
     )
     task = asyncio.create_task(agent.run("go", tenant_id="t"))
     try:
-        await asyncio.wait_for(entered.wait(), 5)
+        await wait_for_gate(entered, task=task)
         from sqlalchemy import select
 
         async with engine.connect() as connection:
@@ -308,7 +310,7 @@ async def test_marked_continuation_preserves_terminal_winner(store, engine, fmt,
         )
         return await original(claimed, target, *args, **kwargs)
 
-    monkeypatch.setattr(runner, "_finalize_running_event", win_before_finalize)
+    monkeypatch.setattr(_run_events, "_finalize_running_event", win_before_finalize)
     try:
         result = await agent.submit_tool_results(
             run_id,
@@ -409,7 +411,7 @@ async def test_marked_stream_reports_terminal_winner(store, engine, fmt, monkeyp
         await asyncio.create_task(store.finalize_run(run_id, status="cancelled"), context=Context())
         return await original(claimed, target, *args, **kwargs)
 
-    monkeypatch.setattr(runner, "_finalize_running_event", win_before_finalize)
+    monkeypatch.setattr(_run_events, "_finalize_running_event", win_before_finalize)
     try:
         with _blocked_write(store, run_id):
             await store.save_run_event(run_id, event_type="guardrail.detected", data={})
@@ -678,7 +680,7 @@ async def test_guardrail_free_stream_marked_mid_turn_ends_as_guardrail_block(sto
 
     task = asyncio.create_task(consume())
     try:
-        await asyncio.wait_for(entered.wait(), 5)
+        await wait_for_gate(entered, task=task)
         async with engine.connect() as connection:
             run_id = (await connection.execute(select(AgentRun.id))).scalar_one()
         await guarded.submit_note(run_id, SECRET, tenant_id="t")
@@ -789,7 +791,7 @@ async def test_blocked_note_before_client_step_stops_instead_of_pausing(store, e
     )
     task = asyncio.create_task(agent.run("go", tenant_id="t"))
     try:
-        await asyncio.wait_for(entered.wait(), 5)
+        await wait_for_gate(entered, task=task)
         async with engine.connect() as connection:
             run_id = (await connection.execute(select(AgentRun.id))).scalar_one()
         await agent.submit_note(run_id, SECRET, tenant_id="t")
@@ -850,7 +852,7 @@ async def test_custom_store_dispatch_after_blocked_note_stops(store, engine):
     )
     task = asyncio.create_task(agent.run("go", tenant_id="t"))
     try:
-        await asyncio.wait_for(entered.wait(), 5)
+        await wait_for_gate(entered, task=task)
         async with engine.connect() as connection:
             run_id = (await connection.execute(select(AgentRun.id))).scalar_one()
         await agent.submit_note(run_id, SECRET, tenant_id="t")

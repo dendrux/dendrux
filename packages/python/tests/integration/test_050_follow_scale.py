@@ -31,6 +31,7 @@ from dendrux.store import (
 )
 from dendrux.tool import tool
 from dendrux.types import LLMResponse, ToolResult
+from tests._helpers.gates import wait_for_gate
 from tests._helpers.scripted_provider import ScriptedLLM, tool_call
 
 if TYPE_CHECKING:
@@ -473,13 +474,13 @@ async def test_reader_close_drains_read_after_last_follower_closes(
         # All starts precede the gated read, including on single-connection SQLite.
         await asyncio.gather(*(follow.start() for follow in follows))
         ready.set()
-        await asyncio.wait_for(entered.wait(), 10)
+        await wait_for_gate(entered)
         coordinator = run_store._follow_coordinator()._task
         assert coordinator is not None
         await asyncio.gather(*(follow.aclose() for follow in follows))
         assert feed.followers == 0
         closing = asyncio.create_task(run_store.close())
-        await asyncio.wait_for(cancelling.wait(), 10)
+        await wait_for_gate(cancelling, task=closing)
         assert not closing.done() and not finished.is_set()
         release.set()
         await asyncio.wait_for(closing, 10)

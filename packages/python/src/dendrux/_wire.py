@@ -159,6 +159,18 @@ def _pending_wire(pending: Any, mapping: Any) -> Any:
         "reason": None,
         "message": None,
         "exceeded": None,
+        **_pending_origin(pending),
+    }
+
+
+def _pending_origin(pending: Any) -> dict[str, Any]:
+    """A managed subagent pause's bounded identity (agent name, path, origin run)."""
+    if getattr(pending, "origin_run_id", None) is None:
+        return {}
+    return {
+        "agent_name": pending.agent_name,
+        "agent_path": list(pending.agent_path or ()),
+        "origin_run_id": pending.origin_run_id,
     }
 
 

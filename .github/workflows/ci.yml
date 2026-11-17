@@ -355,7 +355,7 @@ jobs:
       - name: Benchmarks
         shell: bash
         run: |
-          pytest tests/ -v -rs -n 0 -m benchmark --no-cov --reruns 1 | tee pytest.log
+          pytest tests/ -v -rs -n 0 -m benchmark --no-cov --reruns 1 --timeout=600 | tee pytest.log
           if grep -Eq '^SKIPPED \[[0-9]+\].*DENDRUX_TEST_PG_URL not set' pytest.log; then
             echo "::error::Postgres benchmarks were skipped (DENDRUX_TEST_PG_URL not set)."
             exit 1
@@ -454,11 +454,20 @@ jobs:
       - name: Cognitive complexity
         run: python tools/cognitive_ratchet.py check
 
+      - name: Physical file and function size
+        run: python tools/size_ratchet.py check
+
+      - name: Ruff per-file rule counts
+        run: python tools/ruff_ratchet.py check
+
       - name: Duplicate code
         run: python tools/duplicate_ratchet.py check
 
       - name: Dead code
         run: python tools/vulture_ratchet.py check
+
+      - name: Stale test patches
+        run: python tools/stale_patch_lint.py check
 
       - name: Import cycles
         run: python tools/import_cycles.py check
@@ -526,6 +535,7 @@ jobs:
             tests/unit/test_sql_store_contract.py \
             tests/unit/test_sql_store_rx_errors.py \
             tests/integration/test_mysql_store_errors.py \
+            tests/integration/test_managed_sweep.py \
             -v -rs -n 4 -m "not benchmark" --cov=src/dendrux --cov-report= | tee pytest.log
           if grep -q '${{ matrix.env_name }} not set' pytest.log; then
             echo "::error::${{ matrix.server }} tests were skipped (${{ matrix.env_name }} not set)."

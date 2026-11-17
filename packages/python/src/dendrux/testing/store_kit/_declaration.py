@@ -16,6 +16,7 @@ CAPABILITIES = (
     "checkpointing",
     "atomic_completion",
     "recovery",
+    "managed_subagents",
 )
 #: Flags that together make a store create format-2 runs (``state.py`` creation rule).
 FORMAT_2_FLAGS = ("fenced_writes", "retry_ids", "checkpointing", "atomic_completion")
@@ -72,10 +73,14 @@ class Declaration:
 
     @property
     def declared(self) -> tuple[str, ...]:
-        return tuple(name for name in CAPABILITIES if getattr(self.capabilities, name))
+        return tuple(name for name in CAPABILITIES if self.has(name))
 
     def has(self, capability: str) -> bool:
-        return bool(getattr(self.capabilities, capability))
+        enabled = bool(getattr(self.capabilities, capability))
+        if capability == "managed_subagents":
+            # Match require_managed_subagents: narrowing a prerequisite disables managed use.
+            return enabled and all(self.has(flag) for flag in (*FORMAT_2_FLAGS, "recovery"))
+        return enabled
 
     @property
     def creates_format_2(self) -> bool:

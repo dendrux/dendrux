@@ -54,11 +54,119 @@ unchanged.
 | Target | Script | Fails when |
 |---|---|---|
 | `make cognitive` | `tools/cognitive_ratchet.py` | A new function scores above 15 (complexipy cognitive complexity), or a function already above 15 scores higher. Baseline: `cognitive_baseline.json` (only functions above 15 are recorded; overloads and setters of one name count at their worst). |
+| `make size` | `tools/size_ratchet.py` | A new module exceeds 1,000 physical lines, a new function exceeds 80, or an existing offender grows. Baseline: `size_baseline.json`, measured lengths keyed by `module` and `module:qualname`. |
+| `make ruff-ratchet` | `tools/ruff_ratchet.py` | A file gains a finding for a new rule, a new file has findings, or a file/rule count increases. Rules: PLC0415, PLR0911, PLR0912, PLR0915, BLE001. Baseline: `ruff_baseline.json`, counts keyed by `module:RULE`. |
 | `make duplicates` | `tools/duplicate_ratchet.py` | A new block of 10 or more near-identical lines appears across two files (pylint's similarity engine; imports, signatures, comments and docstrings ignored), or a known block grows. Baseline: `duplicate_baseline.json`, block sizes per file pair; a block matches within 15 percent (at least 2 lines). |
 | `make deadcode` | `tools/vulture_ratchet.py` | vulture (confidence 80 or more) finds a new unused name. Intentional public API and hooks go in `vulture_whitelist.py` with a comment. Baseline: `vulture_baseline.json`. |
 | `make cycles` | `tools/import_cycles.py` | A module import cycle appears, a module joins a baselined cycle, or two cycles merge. Only top-level runtime imports count: `if TYPE_CHECKING:` blocks and imports inside functions are ignored. `python tools/import_cycles.py report` also lists the cycles that function-level imports hide (information only). Baseline: `import_cycles_baseline.json`. |
 | `make semgrep` | `tools/semgrep_ratchet.py` | A rule in `.semgrep/dendrux.yml` has a new match, or more matches in a function that already had some; or a rule stops passing its fixture. Baseline: `semgrep_baseline.json` (rule, module, function). |
 | `make crap` | `tools/crap_ratchet.py` | A new function scores above 30; complexity rises and the function scores above 30; or edited code exceeds its own recorded CRAP baseline. An edited function may remain above 30 when neither complexity nor CRAP rises. Unchanged code retains the 0.5-point noise band and the warning allowance for rises up to 25 percent. Backend-only local coverage is handled explicitly below. Needs `coverage.json` from `make test`. Baseline: `crap_baseline.json`. |
+| `make stale-patches` | `tools/stale_patch_lint.py` | A test patches a name its module only re-exports and never reads at call time, so the patch silently does nothing. Zero allowed; a missing `stale_patch_baseline.json` means none allowed. Part of `make lint`. |
+
+### Size and Ruff counts
+
+Both gates scan only `src/dendrux` (including `testing`) and exclude migration
+directories. Run from `packages/python`:
+
+```sh
+python tools/size_ratchet.py report
+python tools/ruff_ratchet.py report
+```
+
+Each script accepts `check`, `stamp`, `report`, and `move`, plus `--src` and `--baseline`.
+`report` prints measurements without reading or writing a baseline. `check` exits 0
+on success, 1 on regressions, and 2 when its baseline is missing. Tool/configuration
+errors also fail. Each invocation prints measured totals; reports also list individual
+offenders. No coverage file is needed.
+
+Size counts every physical file line, including comments and blank lines. A function
+spans its first decorator (or `def` / `async def`) through its last AST line, inclusive;
+comments and blank lines within that span count. Nested functions are included in the
+outer span and measured independently as `outer.<locals>.inner`. Classes qualify
+methods as `Class.method`. Overload definitions from `typing` or `typing_extensions`
+(including import aliases) are excluded; implementations count. Repeated qualified
+names, such as property getters/setters, keep the longest implementation. The exact
+data-module allow list is `dendrux._codes`, `dendrux.types`; those modules are exempt
+from size measurement. Other modules with those basenames are still checked.
+
+Only sizes above the hard limits are recorded. Below-limit code can grow up to its
+limit. Existing offenders may stay the same or shrink. Keys use names, not line
+numbers. An implicit rename of an over-limit file/function fails as a new offender,
+even if unchanged. For a reviewed pure move, the coordinator can explicitly transfer
+its allowance with `move`, as described below. Do not delete or increase a baseline
+entry to make the rename pass.
+
+Ruff uses the pinned interpreter's `python -m ruff`, the project's `pyproject.toml`
+and `--extend-select` for the five rules. Existing selections, ignores, per-file
+ignores, thresholds and `noqa` remain in effect. Other diagnostics are left to
+`make lint`. Only the five rules enter the baseline. Counts cannot move between
+files or rules to offset a regression. Ruff's defaults are 6 returns, 12 branches
+and 50 statements unless the project config overrides them.
+
+Suppressions of those five rules must include a reason after the code list on the
+same line, or in a standalone comment immediately above. For example,
+`# noqa: BLE001 - notifier fan-out isolation` or an immediately preceding
+`# Optional extra stays lazy to keep the base install importable.` Blank/punctuation-only
+comments, another noqa directive, and code names alone are not reasons. The check
+examines Python comment tokens, including blanket and file-level noqa, and ignores
+string literals and migrations. Reviewers still judge whether the reason is valid
+under AGENTS §6.2/§6.3; the tool checks its presence.
+
+`check` reports unreasoned suppressions as `file:line: CODE noqa lacks reason`.
+Reason debt is a separate shrink-only count per module/rule in `ruff_baseline.json`,
+under `noqa-reason|module|RULE` keys. Counts cannot be offset across modules/rules;
+new/increased debt fails, and `stamp` refuses it. Initial coordinator stamping may
+record existing debt; subsequent fixes remove/lower those entries. Report prints the
+exact locations even for existing debt. Today's source has zero unreasoned suppressions,
+so no reason-debt entries are needed. Reason debt cannot be transferred with `move`.
+
+The coordinator initializes the missing baselines with `stamp` (R5 of the rollout)
+and stamps decreases once per merge (AGENTS §0 item 7). Builders leave generated
+worktree baselines uncommitted. After initialization these two scripts refuse every
+new/increased offender, including during `stamp`; there is no `--allow-regress`
+override. `make quality-stamp` includes both scripts. Never commit baseline values
+from a builder task.
+
+#### Explicit allowance transfers (coordinator only)
+
+`move` is for pure code moves and file splits. Reviewers check both the code move and
+the explicit move list in the PR; the tools validate allowances and current tree
+presence, not semantic equivalence. Ordinary `check` and `stamp` still fail on implicit
+renames. Run with an existing baseline, using one or more `OLD_KEY NEW_KEY` pairs:
+
+```sh
+python tools/size_ratchet.py move dendrux.old:Box.run dendrux.new:Box.run
+python tools/size_ratchet.py move dendrux.old dendrux.new_a dendrux.old dendrux.new_b
+python tools/ruff_ratchet.py move dendrux.old:PLC0415 dendrux.new_a:PLC0415 dendrux.old:PLC0415 dendrux.new_b:PLC0415
+```
+
+Size keys are exactly the baseline's module or `module:qualname`; Ruff keys are
+`module:RULE`, with a separate pair for each rule being transferred. Supply any
+`--src` / `--baseline` options after the pairs. The operation:
+
+- Requires the old key's allowance to exist. Function sources must be absent from
+  the tree, including overload stubs. A moved function can leave its old module in
+  place. File sources may be deleted or retained with a smaller measured value.
+- Requires every destination to be a current offender of the same kind (file or
+  function for size; the same ratcheted rule for Ruff). Destinations already in the
+  baseline, duplicate destinations and source/destination cycles are refused.
+- Allows functions to move one-to-one. A file's allowance may split across several
+  destination files by repeating its old key. Every destination gets its measured
+  value. Their sum plus the retained old file's current size must not exceed the
+  recorded allowance. A retained old file records its measured size, even if now
+  below the limit. Ruff applies the same budget to finding counts separately for
+  each rule (including a zero retained count), without pooling rules or source files.
+  An unchanged/grown source or insufficient remaining allowance refuses the batch.
+- Validates the entire batch before writing. Any invalid pair refuses the whole
+  batch without changing the baseline. Missing baselines and malformed command
+  arguments exit 2; invalid transfers exit 1; successful transfers exit 0 and print
+  each transferred key/value.
+
+On success deleted sources' entries are removed; retained sources and destinations
+record current measurements. Unrelated entries stay unchanged. `move` does not stamp other improvements
+or waive unrelated regressions. Finish all reviewed transfers, then run both checks;
+unlisted offenders still fail. Final baseline diffs and the move list belong to the
+coordinator's PR. Builders do not run transfers against the rollout baselines.
 
 ### Semgrep rules that stop a shared definition being copied
 
@@ -247,6 +355,47 @@ balanced by the per-file seconds in `tests/_helpers/tier_lists/file_weights.json
 CRAP ratchet on the whole. Lint, types and architecture run once per leg, on shard 1.
 `make test-shard-proof` checks the shards are a disjoint cover of the test files.
 
+## Split tooling (moving code between modules)
+
+Three tools prove a split changed nothing but where code lives. All are pure AST work and
+need no database.
+
+| Tool | Use |
+|---|---|
+| `tools/move_check.py` | Fails closed. Compares the old module at a git ref with the old and new modules now. Every top-level statement must be present exactly once, in one module, with an identical `ast.dump`, in the same relative order, with the same count of repeated names. Only function, class and constant definitions may move; any other statement (calls, `if`/`try`/`for`/`with`, `__all__`) must stay unchanged in the old module (an assignment whose value calls something needs `--allow-effects NAME`). `from __future__` imports must match in every module. Ignored: import statements, `if TYPE_CHECKING:` blocks that only import, the module docstring, a literal `__all__` in a *new* module. A statement may not change kind (a class may not become a function or an assignment). A movable constant without `--allow-effects` is a literal, a name, a dotted name, or a tuple, list, set or dict of those; anything else (subscripts, operators, calls, comprehensions) needs the allowance. A method may move to a new mixin class that has no decorator, keyword or base (other than an `--allow-new` name) and is listed before the original bases; it fails (manual review) if it uses zero-argument `super()`, `__class__`, a name Python mangles (`__x`), or a decorator, default or annotation that reads a name bound in the class body. Only `TYPE_CHECKING` imported from `typing` (and not rebound) is a type-only guard; any other `if` is executable and compared. Anything missing, duplicated, extra, reordered or changed fails with a diff of the first mismatch. |
+| `tools/patch_codemod.py` | Rewrites `unittest.mock.patch`, `patch.object`, `mocker.patch` and `monkeypatch.setattr/delattr` targets in `tests/` from the old module to the module that now defines the name (string targets, positional or keyword, and module aliases). Calls are recognised by what they resolve to through the file's imports and scopes, never by spelling; MonkeyPatch objects are recognised only when their factory resolves to `pytest.MonkeyPatch`. Relative imports are resolved against the file's package. A shadowed alias is left alone with a note; an alias bound more than one way, or a patch helper imported relatively, is left alone and reported as unresolved. An existing import is reused only if it is an unconditional module-level import before the use; otherwise a fresh import goes into the leading import block. Dry run prints a diff; `--write` applies it. |
+| `tools/stale_patch_lint.py` | `make stale-patches`, part of `make lint` (so `make ci`) and the CI quality job: fails when a test patches a name its module only re-exports. A module reads an import only when code inside a function resolves to that module-level binding; a parameter of the same name, an import-time copy (`Y = X`), a decorator or a default argument is not a read. Patching below a re-export (`mod.X.attr`) mutates the shared object and is allowed. Relative imports count as imports. A patch site it cannot resolve (ambiguous binding, relative patch helper) is printed as `unresolved` and fails the lint: a human must read it. |
+
+To prove a move PR (run from `packages/python`; `BASE` is the ref before the move):
+
+```sh
+make move-check BASE=<ref> OLD=src/dendrux/runtime/runner.py \
+  NEW="src/dendrux/runtime/a.py src/dendrux/runtime/b.py" \
+  MOVE_ARGS="--require-reexports --emit-map /abs/path/map.json"
+python tools/patch_codemod.py --map /abs/path/map.json tests          # read the diff
+python tools/patch_codemod.py --map /abs/path/map.json --write tests
+ruff check --select F401 --fix tests && ruff format tests
+make stale-patches
+```
+
+`--allow-new NAME...` admits a named new definition (for example a shared attribute base) and
+the output lists it, so a reviewer reads it by hand. `--require-reexports` also fails unless each
+moved public name has an unconditional, absolute, module-level `from <new module> import name` in
+the old module (a deleted old module fails too) (a type-checking-only, function-local, conditional, relative or wrong-source import
+does not count); names listed in the old `__all__` must always stay bound. Not proved: import
+order and cycles (`make arch`, `make cycles`), registration decorators, and the body of any
+`--allow-new` definition.
+
+## Test timeout
+
+`pytest-timeout` (dev extra, exact pin) stops any test that runs longer than `timeout = 300`
+seconds and fails it with the stack. It sits above `faulthandler_timeout = 240`, which dumps
+every thread's stack at 240 s, so a hang shows where it is stuck before the test is failed.
+Both are in `pyproject.toml`. The benchmarks (`make bench` and the CI `benchmarks` job) run with
+the same explicit `--timeout=600`, because the migration benchmark legitimately runs longer than a
+unit test; a wiring test keeps the two flags equal and inside the job's time limit. To give one test
+more time, mark it `@pytest.mark.timeout(<seconds>)` and say why.
+
 ## Notes
 
 - CRAP scores depend on coverage. Run `make test` with `DENDRUX_TEST_PG_URL` set (a private
@@ -260,3 +409,91 @@ CRAP ratchet on the whole. Lint, types and architecture run once per leg, on sha
   package `__init__` execution, but not conditional or `importlib` imports); the Semgrep
   `str-exc-in-log` rule looks for `str(exc)` and f-strings inside log calls and `error_info`,
   not for `%s` with the exception.
+
+### Reviewed split manifests and conserved keys
+
+`make move-check ... MOVE_ARGS="--move-manifest tools/moves/pr1.json ..."` enables
+only the reviewed lexical, import-hoist, annotation and metadata normalizations, plus the named shared logger's original
+module-name literal.
+Without a manifest the ordinary checker retains its previous strict behavior.
+The schema and how to start a future split are in
+[`moves/README.md`](moves/README.md). `make move-proof` verifies tracked cumulative
+sources and maps from their immutable original bases. Private owner-docs files are
+never CI inputs.
+
+Use the reviewed v4 `baseline-key-map.json` as input to `tools/move_keys.py`. This
+command prints a proposed baseline to stdout and never stamps a file:
+
+```sh
+python -m tools.move_keys size --map /reviewed/baseline-key-map.json \
+  --baseline tools/size_baseline.json --scores /fresh/size-scores.json \
+  --present /fresh/present-keys.json
+```
+
+Run independently for `size`, `cognitive`, `crap`, `ruff`, `vulture` and `semgrep`.
+Scores use each existing collector's native JSON key/value format. `present` is a
+JSON list of measured lexical identities (Ruff also accepts present module names).
+Supply fresh measurements from the same checkout; CRAP still needs ordinary fresh
+CI coverage and its source-hash validation. Do not feed metadata-pinned names into
+metric keys: SQL methods use their real lexical `_SqlWrites` and peer class names.
+
+Future destinations are inactive while their old identity remains. Activated
+function transfers require the old identity to disappear, one destination, exact
+reviewed source allowance and a current measurement no larger than that allowance.
+Size transfers never create file allowances and drop functions at or below 80.
+Cognitive debt at or below 15 is removed. CRAP caps both complexity and CRAP while
+recording the fresh lexical digest. Ruff conserves each source/rule independently
+across the residual module and its created owners, including small functions found
+in the CRAP map. Empty vulture/semgrep mappings grant no new allowance.
+
+`move_keys.exemption_transfers(map, allow_in_keys)` resolves semgrep exemptions
+through the same exact lexical owner map. The SQL write task moves the exemption to
+`dendrux.runtime.stores.sql._sql_writes:_SqlWrites._write_tx` atomically; entry,
+start, images, events and outcome exemptions follow their individual function
+owners. No committed baseline or rule exemption changes as part of tooling setup.
+The coordinator reviews/stamps the proposed changes and runs ordinary shrink-only
+checks. The existing size-ratchet move-pair interface remains available unchanged.
+
+Limits: manifests are reviewed evidence, not a proof of the completeness of a manual
+imported-seam inventory or of custom/dynamic patch interception. The existing patch
+codemod's supported static subset is unchanged; the 13 dynamic cases need their
+listed runtime fault assertions in the relevant move task. Hoists are deliberately
+restricted to leading unconditional imports with conserved comments. Beyond the
+small inert stdlib set, an import must already load through original unconditional
+imports; intermediate eager-dependency snapshots are hash-verified. Other imports
+require a separately reviewed prerequisite. Provider snapshots support the
+base-free ManagedReads/SQLBlobCatalog shape; unknown bases and ambiguous/C3-invalid
+composition fail closed. No new decorators, wrappers, runtime contract methods or
+arbitrary executable edits are normalized. Original physical spans are measured
+before AST normalization, so whitespace cannot grow an inherited >80-line function,
+including one remaining in the facade.
+
+Review hardening: both comparison modes reject star imports anywhere in the residual
+or destination modules. Each unconditional top-level import must recreate an exact
+original runtime binding or be explained by a reviewed hoist, named lexical owner or
+seam, exact facade/member-owner re-export, provider base, or required scaffold typing
+binding. New annotation-only imports stay under a real `typing.TYPE_CHECKING` guard.
+An unexplained binding is reported as `extra-import` with its module, line and import.
+Seams require both an original import and a lexical consumer; metadata pins follow
+their definitions. Ruff proposals require explicit measurements, including zero for
+retained or removed source keys and zero-finding destination keys; omitted scores
+fail instead of removing an allowance.
+
+The only supported proof entry points are `tools/move_check.py` (CLI) and
+`tools/move_ci.py`. Both verify provider snapshots against immutable/current source
+before calling `check_move`. The in-memory `check_move` API trusts its supplied
+snapshots and is for comparison/fixtures; do not invoke it directly as a proof gate.
+Regression tests assert forged snapshots are refused before either gate reaches
+comparison.
+
+TYPE_CHECKING guards do not exempt imports from explanation. Guarded imports must
+preserve original runtime/type-only bindings or match the same reviewed owner,
+hoist and scaffold sources; unknown guarded imports fail as `extra-import`.
+Original type-only bindings explain guarded copies only, not new runtime imports.
+A guarded import read outside an annotation must have a real binding in the same
+lexical scope at runtime. Otherwise the checker reports `type-only-runtime` with
+the name and location. Defaults, decorators and nested functions count as runtime
+reads; annotations do not. A parameter can legitimately shadow a module type import,
+and an outer import cannot satisfy a function's unbound local import. Annotation-only
+variable declarations do not create runtime bindings. These checks apply to both
+checker modes and to residual modules as well as destinations.

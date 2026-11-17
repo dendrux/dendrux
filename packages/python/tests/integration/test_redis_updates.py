@@ -111,6 +111,20 @@ async def listening(updates: ru.RedisUpdates, consumer: Consumer) -> object:
     return lease
 
 
+async def warm_up_delivery(writer: ru.RedisUpdates, consumer: Consumer, run_id: str) -> None:
+    # Pub/Sub may drop a slow first send. Establish delivery before the scenario starts.
+    async with asyncio.timeout(10):
+        while run_id not in consumer.ids:
+            writer.enqueue([run_id])
+            await writer.flush()
+            try:
+                async with asyncio.timeout(0.5):
+                    while run_id not in consumer.ids:
+                        await asyncio.sleep(0.01)
+            except TimeoutError:
+                continue  # A dropped setup hint is safe to retry; scenario sends are not retried.
+
+
 # -- a TCP proxy to see and stall the wire ----------------------------------------------------
 
 
@@ -449,32 +463,64 @@ async def test_a_reconnect_gap_resyncs_events_whose_hint_was_lost(
         await state.close()
 
 
+async def test_first_delivery_warmup_retries_a_slow_first_accept(
+    proxy: Proxy, channel: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    serve = proxy._serve
+    accepts = 0
+
+    async def slow_first_accept(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        nonlocal accepts
+        accepts += 1
+        if accepts == 1:
+            await asyncio.sleep(0.5)
+        await serve(reader, writer)
+
+    monkeypatch.setattr(proxy, "_serve", slow_first_accept)
+    reader = make(channel=channel, health_check_s=30.0)
+    writer = make(proxied(proxy), channel=channel, health_check_s=30.0)
+    consumer = Consumer()
+    lease = await listening(reader, consumer)
+    try:
+        await warm_up_delivery(writer, consumer, "R0")
+        assert consumer.ids == ["R0"]
+        assert writer.stats().dropped_failed >= 1
+        writer.enqueue(["R1"])
+        await writer.flush()
+        await eventually(lambda: consumer.ids == ["R0", "R1"])
+    finally:
+        await reader._release_listener(lease)
+        await reader.close()
+        await writer.close()
+
+
 async def test_a_stalled_publish_is_aborted_and_the_next_send_uses_a_fresh_connection(
     proxy: Proxy, channel: str
 ) -> None:
-    reader = make(channel=channel)
+    reader = make(channel=channel, health_check_s=30.0)
     consumer = Consumer()
     lease = await listening(reader, consumer)
-    writer = make(proxied(proxy), channel=channel)
-    writer.enqueue(["R0"])
-    await writer.flush()
-    await eventually(lambda: consumer.ids == ["R0"])
-    assert len(proxy.links) == 1
+    writer = make(proxied(proxy), channel=channel, health_check_s=30.0)
+    await warm_up_delivery(writer, consumer, "R0")
+    assert consumer.ids == ["R0"]
+    links_before = len(proxy.links)
+    connection = proxy.links[-1]
+    failed_before = writer.stats().dropped_failed
 
     proxy.stall_up = True
     writer.enqueue(["R1"])
     async with asyncio.timeout(10):
         await writer.flush()  # returns by the deadline, not when the server answers
-    assert writer.stats().dropped_failed == 1
+    assert writer.stats().dropped_failed == failed_before + 1
     async with asyncio.timeout(5):
-        await proxy.links[0].client_closed.wait()  # the socket was aborted, not left open
+        await connection.client_closed.wait()  # the socket was aborted, not left open
 
     proxy.stall_up = False
     await asyncio.sleep(0.3)  # leave the sender's backoff
     writer.enqueue(["R2"])
     await writer.flush()
     await eventually(lambda: consumer.ids == ["R0", "R2"])
-    assert len(proxy.links) == 2  # a fresh connection
+    assert len(proxy.links) == links_before + 1  # a fresh connection
     await reader._release_listener(lease)
     await reader.close()
     await writer.close()
@@ -483,20 +529,29 @@ async def test_a_stalled_publish_is_aborted_and_the_next_send_uses_a_fresh_conne
 async def test_abort_sender_drops_the_real_socket_that_is_in_use_right_now(
     proxy: Proxy, channel: str
 ) -> None:
-    writer = make(proxied(proxy), channel=channel, send_timeout_s=30.0, flush_deadline_s=60.0)
-    await writer.send(['["R0"]'])  # connected through the proxy
+    writer = make(
+        proxied(proxy),
+        channel=channel,
+        send_timeout_s=30.0,
+        flush_deadline_s=60.0,
+        health_check_s=30.0,
+    )
+    async with asyncio.timeout(10):
+        await writer.send(['["R0"]'])  # connected through the proxy
+    links_before = len(proxy.links)
+    connection = proxy.links[-1]
     proxy.stall_up = True
     pending = asyncio.ensure_future(writer.send(['["R1"]']))
-    await eventually(lambda: b"R1" in bytes(proxy.links[0].up))  # the publish is on the wire
-    assert not proxy.links[0].client_closed.is_set() and not pending.done()
+    await eventually(lambda: b"R1" in bytes(connection.up))  # the publish is on the wire
+    assert not connection.client_closed.is_set() and not pending.done()
     writer.abort_sender()  # synchronous: no await, no timeout
     async with asyncio.timeout(5):
-        await proxy.links[0].client_closed.wait()
+        await connection.client_closed.wait()
     with pytest.raises(ConnectionError):
         await pending
     proxy.stall_up = False
     await writer.send(['["R2"]'])  # the next send starts from a fresh connection
-    assert len(proxy.links) == 2
+    assert len(proxy.links) == links_before + 1
     await writer.close()
 
 
@@ -506,12 +561,14 @@ async def test_abort_listener_drops_the_real_listen_socket_and_the_base_reconnec
     reader = make(proxied(proxy), channel=channel, health_check_s=30.0)
     consumer = Consumer()
     lease = await listening(reader, consumer)
+    links_before = len(proxy.links)
+    connection = proxy.links[-1]
     reader.abort_listener()  # synchronous
     async with asyncio.timeout(5):
-        await proxy.links[0].client_closed.wait()
+        await connection.client_closed.wait()
     # one connection aborted, one new one made by the base: redis-py did not reconnect by itself
     await eventually(lambda: reader.healthy and consumer.gaps == 3)
-    assert len(proxy.links) == 2
+    assert len(proxy.links) == links_before + 1
     await reader._release_listener(lease)
     await reader.close()
 
@@ -534,12 +591,11 @@ async def test_a_stalled_connect_is_bounded_by_the_flush_deadline(
 async def test_every_connection_is_closed_with_its_lease_and_with_the_instance(
     admin: Any, channel: str, name: str
 ) -> None:
-    updates = make(channel=channel, client_options={"client_name": name})
+    updates = make(channel=channel, client_options={"client_name": name}, health_check_s=30.0)
     consumer = Consumer()
     lease = await listening(updates, consumer)
-    updates.enqueue(["R1"])
-    await updates.flush()
-    await eventually(lambda: consumer.ids == ["R1"])
+    await warm_up_delivery(updates, consumer, "R1")
+    assert consumer.ids == ["R1"]
     assert len(await clients(admin, name)) == 2  # the sender and the listener
 
     await updates._release_listener(lease)

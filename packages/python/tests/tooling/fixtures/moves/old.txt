@@ -1,0 +1,3 @@
+from new import helper
+import new as owner
+def use(callback=owner.helper): return owner.helper, callback

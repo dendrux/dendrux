@@ -14,6 +14,7 @@ Suggested HTTP mappings:
     RunAlreadyClaimedError      -> 409
     RunAlreadyTerminalError     -> 409
     InvalidToolResultError      -> 400
+    ManagedResultRefusedError   -> 400 (an InvalidToolResultError)
     ReplayRunError              -> 400 (404 when reason == "not_found")
     PersistenceNotConfiguredError -> 500
     SchemaNotInitializedError   -> 500
@@ -38,6 +39,7 @@ Suggested HTTP mappings:
     ContentFilteredError        -> 422
     BudgetConfigurationError    -> 500 (configuration)
     TenantScopeRequiredError    -> 500 (configuration: pass tenant_id)
+    SubagentConfigurationError  -> 500 (configuration: raised when an Agent is built)
     NoteLimitExceededError      -> 429 or 409 (too many notes on this run)
     GovernanceMismatchError     -> 409
     BlobNotFoundError           -> 404
@@ -124,7 +126,14 @@ def _capability_advice(capability: str) -> str:
             'replace; self.capabilities = replace(self.capabilities, deployment="single_process").'
         ),
     }
-    optional = {"fenced_writes", "retry_ids", "checkpointing", "atomic_completion", "recovery"}
+    optional = {
+        "fenced_writes",
+        "retry_ids",
+        "checkpointing",
+        "atomic_completion",
+        "recovery",
+        "managed_subagents",
+    }
     if capability in specific:
         return specific[capability]
     advice = "Copy the base store method signature, including explicit keyword-only parameters."
@@ -174,7 +183,7 @@ class RunNotReclaimableError(_KwargsReduceMixin, RunControlError):
     ``skill_mismatch``, ``loop_unsupported``, ``history_too_large``, ``cancelled``
     (cancellation won), ``loop_unknown`` (missing or unrecognized checkpoint loop),
     ``recovery_call_missing``, ``recovery_state_missing``, ``recovery_state_invalid``,
-    or ``governance_changed`` (the recovery governance fingerprint differs).
+    ``pause_format_unsupported``, or ``governance_changed`` (governance differs).
     """
 
     _init_fields = ("run_id", "reason")
@@ -204,6 +213,44 @@ class RunCancelledError(_KwargsReduceMixin, RunControlError):
         self.parent_run_id = parent_run_id
         _codes.log_code(logging.getLogger(__name__), _codes.RUN_CANCELLED, run_id=run_id)
         super().__init__(f"Run '{run_id}' cannot start under parent '{parent_run_id}'.")
+
+
+class ManagedChildControlError(_KwargsReduceMixin, RunControlError):
+    """A managed subagent run was controlled directly (0.7).
+
+    Resume, submit, reclaim, cancel and retry of a managed child go through the
+    workflow's root run id. Reading the child is allowed. ``code`` is
+    ``managed_root_required``; the message carries the run id only.
+    """
+
+    code = "managed_root_required"
+    _init_fields = ("run_id",)
+
+    def __reduce__(self) -> Any:
+        return _restore_logged_control_error, (type(self), self.args, self.__dict__)
+
+    def __init__(self, run_id: str) -> None:
+        self.run_id = run_id
+        _codes.log_code(logging.getLogger(__name__), _codes.MANAGED_ROOT_REQUIRED, run_id=run_id)
+        super().__init__(f"Run '{run_id}' is a managed subagent; control its root run instead.")
+
+
+class ManagedUnsupportedError(_KwargsReduceMixin, NotImplementedError):
+    """Internal (0.7, unreleased): a managed workflow entry this build does not route yet.
+
+    ``operation`` names the entry (for example ``stream`` or ``submit_approval``).
+    ``code`` is ``managed_unsupported``. Streaming and continuation routing land in
+    a later step; until then they refuse before any write instead of guessing.
+    """
+
+    code = "managed_unsupported"
+    _init_fields = ("operation", "run_id")
+
+    def __init__(self, operation: str, run_id: str | None = None) -> None:
+        self.operation = operation
+        self.run_id = run_id
+        _codes.log_code(logging.getLogger(__name__), _codes.MANAGED_UNSUPPORTED, run_id=run_id)
+        super().__init__(f"Managed subagent workflows do not support {operation} yet.")
 
 
 class FollowCapacityError(RuntimeError):
@@ -356,6 +403,22 @@ class InvalidToolResultError(ValueError):
         super().__init__(f"Invalid tool results for run '{run_id}': {detail}")
 
 
+class ManagedResultRefusedError(InvalidToolResultError):
+    """A tool result was submitted for a generated subagent call (0.7).
+
+    Only the bound child run reports a subagent call; the parent adopts its
+    saved outcome. ``code`` is ``managed_result_refused``; the message carries
+    the run id only. Subclasses :class:`InvalidToolResultError`, so existing
+    handlers keep working.
+    """
+
+    code = "managed_result_refused"
+
+    def __init__(self, run_id: str) -> None:
+        _codes.log_code(logging.getLogger(__name__), _codes.MANAGED_RESULT_REFUSED, run_id=run_id)
+        super().__init__(run_id, "a subagent call is reported by its child run")
+
+
 class PersistenceError(RuntimeError):
     """A database operation failed; SQL, parameters and driver text are omitted."""
 
@@ -422,6 +485,48 @@ class StatementTooLargeError(PersistenceError):
         self.safe_message = (
             f"{sized} is larger than the server's max_allowed_packet{limit} (statement_too_large)."
         )
+        self.args = (self.safe_message,)
+
+
+class ManagedStateError(_KwargsReduceMixin, PersistenceError):
+    """Internal (0.7): persisted managed-subagent state cannot support a transition.
+
+    Raised for a malformed managed wait, a parent without its managed header,
+    a missing or conflicting binding, or a bound child run that is missing or
+    inconsistent. It never recreates or guesses state: the workflow needs
+    resolution. ``reason`` is a stable sub-code; the message carries run ids and
+    codes only, never stored text.
+    """
+
+    code = "managed_state_invalid"
+    _init_fields = ("reason", "run_id")
+    REASONS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "wait_invalid",
+            "wait_too_large",
+            "storage_format",
+            "header_invalid",
+            "pending_missing",
+            "binding_outstanding",
+            "binding_conflict",
+            "binding_missing",
+            "child_missing",
+            "child_mismatch",
+            "path_missing",
+        }
+    )
+
+    def __init__(self, *, reason: str, run_id: str | None = None) -> None:
+        self.reason = reason if reason in self.REASONS else "wait_invalid"
+        self.run_id = run_id
+        _codes.log_code(
+            logging.getLogger(__name__),
+            _codes.MANAGED_STATE_INVALID,
+            run_id=run_id,
+            managed_reason=self.reason,
+        )
+        super().__init__(code=self.code)
+        self.safe_message = f"Managed subagent state is invalid ({self.reason})."
         self.args = (self.safe_message,)
 
 
@@ -815,7 +920,6 @@ ProviderErrorCategory: TypeAlias = Literal[
     "unknown",
 ]
 PROVIDER_ERROR_CATEGORIES: tuple[str, ...] = get_args(ProviderErrorCategory)
-
 TimeoutReason: TypeAlias = Literal[
     "connect",
     "call_deadline",
@@ -824,7 +928,6 @@ TimeoutReason: TypeAlias = Literal[
     "deadline_during_backoff",
 ]
 TIMEOUT_REASONS: tuple[str, ...] = get_args(TimeoutReason)
-
 # A provider code is echoed into ``safe_message`` only when it looks like a code.
 _SAFE_PROVIDER_CODE = re.compile(r"^[A-Za-z0-9_.:\-]{1,64}$")
 
@@ -1322,6 +1425,168 @@ class GovernanceMismatchError(_KwargsReduceMixin, RuntimeError):
         )
 
 
+# ---------------------------------------------------------------------------
+# Subagent errors introduced in 0.7.
+# ---------------------------------------------------------------------------
+
+
+class SubagentConfigurationError(_KwargsReduceMixin, ValueError):
+    """An ``Agent(subagents=...)`` configuration was refused when the Agent was built.
+
+    Base of the subagent configuration errors. Subclasses ``ValueError`` like the
+    other Agent configuration errors, so existing ``except ValueError`` keeps
+    working. ``code`` is a stable diagnostic code, also logged when raised.
+    ``agent_name`` names the agent whose ``subagents`` list was refused,
+    ``reason`` is a stable sub-code, ``subagent_name`` the offending subagent
+    when its name is valid, and ``index`` its position in the list when known.
+    Messages carry agent names only, never prompts or descriptions.
+    """
+
+    code: ClassVar[str] = "subagent_invalid"
+    _init_fields: tuple[str, ...] = ("agent_name", "reason", "subagent_name", "index")
+    _messages: ClassVar[dict[str, str]] = {}
+
+    def __init__(
+        self,
+        agent_name: str,
+        *,
+        reason: str,
+        subagent_name: str | None = None,
+        index: int | None = None,
+    ) -> None:
+        self.agent_name = agent_name
+        self.reason = reason
+        self.subagent_name = subagent_name
+        self.index = index
+        super().__init__(self._message())
+
+    def _message(self) -> str:
+        template = self._messages.get(
+            self.reason, "Agent '{agent}' has an invalid subagents configuration ({reason})."
+        )
+        return template.format(
+            agent=self.agent_name, name=self.subagent_name, index=self.index, reason=self.reason
+        )
+
+
+class SubagentDefinitionError(SubagentConfigurationError):
+    """A ``subagents`` entry is not a usable subagent definition.
+
+    ``reason``: ``"not_a_list"``, ``"not_agent"``, ``"invalid_name"`` (a subagent
+    name is 1 to 64 ASCII letters, digits or underscores and does not start with a
+    digit), ``"missing_description"``, ``"single_call_parent"`` (a SingleCall
+    agent cannot call tools, so it cannot have subagents) or ``"loop_unsupported"``
+    (a managed subagent runs on ReActLoop, or SingleCall for a fresh child that never pauses).
+    """
+
+    code: ClassVar[str] = "subagent_invalid"
+    _messages: ClassVar[dict[str, str]] = {
+        "not_a_list": "Agent '{agent}' subagents must be a list of Agent instances.",
+        "not_agent": "Agent '{agent}' subagents[{index}] is not an Agent instance.",
+        "invalid_name": (
+            "Agent '{agent}' subagents[{index}] has an invalid name. A subagent name is "
+            "1 to 64 ASCII letters, digits or underscores and does not start with a digit."
+        ),
+        "missing_description": (
+            "Agent '{agent}' subagent '{name}' needs a non-empty description: "
+            "it tells the model when to call it."
+        ),
+        "single_call_parent": (
+            "Agent '{agent}' uses SingleCall loop but has subagents. SingleCall agents "
+            "cannot call tools; use ReActLoop."
+        ),
+        "loop_unsupported": (
+            "Agent '{agent}' subagent '{name}' cannot run here on its loop: a managed subagent "
+            "uses ReActLoop, or SingleCall for a fresh one-call child (it never pauses)."
+        ),
+    }
+
+
+class SubagentNameConflictError(SubagentConfigurationError):
+    """Two of an agent's direct subagents share a name, or one shares a tool's name.
+
+    ``reason``: ``"duplicate_name"`` or ``"tool_name_clash"``. Names are unique per
+    parent only; the same name may appear under different parents.
+    """
+
+    code: ClassVar[str] = "subagent_name_conflict"
+    _messages: ClassVar[dict[str, str]] = {
+        "duplicate_name": "Agent '{agent}' has two subagents named '{name}'.",
+        "tool_name_clash": (
+            "Agent '{agent}' subagent '{name}' has the same name as one of the agent's tools."
+        ),
+    }
+
+
+class SubagentCycleError(SubagentConfigurationError):
+    """A subagent is its own ancestor on some path of the tree (object identity).
+
+    The same Agent may appear at several different paths; only a cycle is refused.
+    """
+
+    code: ClassVar[str] = "subagent_cycle"
+    _init_fields = ("agent_name", "subagent_name")
+    _messages: ClassVar[dict[str, str]] = {
+        "cycle": "Agent '{agent}' subagent '{name}' is already its own ancestor (a cycle).",
+    }
+
+    def __init__(self, agent_name: str, *, subagent_name: str | None) -> None:
+        super().__init__(agent_name, reason="cycle", subagent_name=subagent_name)
+
+
+class SubagentDepthError(SubagentConfigurationError):
+    """A subagent sits deeper than the effective ``max_delegation_depth`` (root = 0).
+
+    ``depth`` is the subagent's depth below the root and ``max_depth`` the
+    ceiling that applies there (a child's own limit can only tighten it).
+    """
+
+    code: ClassVar[str] = "subagent_too_deep"
+    _init_fields = ("agent_name", "subagent_name", "depth", "max_depth")
+    _messages: ClassVar[dict[str, str]] = {
+        "too_deep": (
+            "Agent '{agent}' subagent '{name}' is at delegation depth {depth}, above "
+            "max_delegation_depth={max_depth}."
+        ),
+    }
+
+    def __init__(
+        self, agent_name: str, *, subagent_name: str | None, depth: int, max_depth: int
+    ) -> None:
+        self.depth = depth
+        self.max_depth = max_depth
+        super().__init__(agent_name, reason="too_deep", subagent_name=subagent_name)
+
+    def _message(self) -> str:
+        return self._messages["too_deep"].format(
+            agent=self.agent_name,
+            name=self.subagent_name,
+            depth=self.depth,
+            max_depth=self.max_depth,
+        )
+
+
+class SubagentTreeTooLargeError(SubagentConfigurationError):
+    """The subagent tree has more nodes than ``max_nodes`` (counted per path).
+
+    The same Agent reused at several paths counts once per path, so a small set
+    of objects that fans out exponentially is refused instead of walked.
+    """
+
+    code: ClassVar[str] = "subagent_tree_too_large"
+    _init_fields = ("agent_name", "max_nodes")
+    _messages: ClassVar[dict[str, str]] = {
+        "too_large": "Agent '{agent}' subagent tree has more than {max_nodes} nodes.",
+    }
+
+    def __init__(self, agent_name: str, *, max_nodes: int) -> None:
+        self.max_nodes = max_nodes
+        super().__init__(agent_name, reason="too_large")
+
+    def _message(self) -> str:
+        return self._messages["too_large"].format(agent=self.agent_name, max_nodes=self.max_nodes)
+
+
 class RunFencedError(_KwargsReduceMixin, RuntimeError):
     """Internal: this worker lost its claim on the run (a newer claim epoch exists).
 
@@ -1346,6 +1611,7 @@ __all__ = [
     "RunCancelledError",
     "RunNotReclaimableError",
     "RunControlError",
+    "ManagedChildControlError",
     "BlobContentionError",
     "BlobIntegrityError",
     "BlobNotFoundError",
@@ -1360,6 +1626,7 @@ __all__ = [
     "ImageRejectedError",
     "InvalidImageError",
     "InvalidToolResultError",
+    "ManagedResultRefusedError",
     "ModelRefusalError",
     "NoteLimitExceededError",
     "PROVIDER_ERROR_CATEGORIES",
@@ -1386,6 +1653,12 @@ __all__ = [
     "SkillMissingError",
     "SkillValidationError",
     "SqliteSchemaSyncError",
+    "SubagentConfigurationError",
+    "SubagentCycleError",
+    "SubagentDefinitionError",
+    "SubagentDepthError",
+    "SubagentNameConflictError",
+    "SubagentTreeTooLargeError",
     "SubtreeTooLargeError",
     "TIMEOUT_REASONS",
     "TenantScopeRequiredError",

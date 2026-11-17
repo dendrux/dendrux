@@ -7,7 +7,7 @@ import pytest
 
 from dendrux import tool
 from dendrux.errors import PersistenceError
-from dendrux.runtime import _reclaim, runner
+from dendrux.runtime import _reclaim, _run_resume_prep, runner
 from dendrux.runtime.persistence import PersistenceRecorder
 from dendrux.types import RunStatus, ToolCall
 from tests._helpers.runtime_paths import ProbeProvider, path_case
@@ -95,7 +95,7 @@ async def test_stream_recovery_marks_work_independently_of_submission(store, eng
 
     release = AsyncMock(wraps=store.release_run_claim)
     monkeypatch.setattr(store, "release_run_claim", release)
-    monkeypatch.setattr(runner, "_prepare_resume", no_submission)
+    monkeypatch.setattr(_run_resume_prep, "_prepare_resume", no_submission)
     monkeypatch.setattr(_reclaim, "resolve", dispatched_then_fail)
     async with agent.resume_stream(
         paused.run_id, tenant_id="tenant", expected_pause_id=paused.pause_id

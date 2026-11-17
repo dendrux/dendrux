@@ -10,6 +10,7 @@ from dendrux.db.models import AgentRun, Base
 from dendrux.guardrails import SecretDetection
 from dendrux.llm.mock import MockLLM
 from dendrux.loops.single import SingleCall
+from dendrux.runtime import _run_entry
 from dendrux.types import LLMResponse, RunStatus, compute_idempotency_fingerprint
 from tests._fixtures.storage import pin_storage_format
 
@@ -406,7 +407,7 @@ async def test_blocked_evidence_survives_crash_before_terminal(
     if outgoing:
         monkeypatch.setattr(store, "save_llm_interaction", crash)
     else:
-        monkeypatch.setattr(runner, "_create_runtime_run", crash)
+        monkeypatch.setattr(_run_entry, "_create_runtime_run", crash)
     provider = MockLLM([LLMResponse(text=SECRET)])
     agent = Agent(
         prompt="Answer briefly.",

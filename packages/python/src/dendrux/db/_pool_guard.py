@@ -26,17 +26,26 @@ Limits, by design:
   a warning naming the holder.
 - An in-memory engine is single-event-loop. Locks are per event loop; two
   loops in two threads on one in-memory engine are not serialised.
+
+:func:`close_fully` runs a close to completion even when its caller is
+cancelled, but once the caller is cancelled it waits at most
+``CLOSE_AFTER_CANCEL_S`` seconds. A close still running then is abandoned: it
+keeps running in the background, and the single-connection lock (if the caller
+holds one) stays held until that close finishes.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 import weakref
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any
 
 from sqlalchemy.pool import SingletonThreadPool, StaticPool
+
+from dendrux import _codes
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable
@@ -47,6 +56,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "CLOSE_AFTER_CANCEL_S",
     "WAIT_WARNING_S",
     "close_fully",
     "serialized",
@@ -57,18 +67,29 @@ __all__ = [
 WAIT_WARNING_S = 10.0
 """Seconds a task may wait for a single-connection lock before a warning is logged."""
 
+CLOSE_AFTER_CANCEL_S = 5.0
+"""Seconds :func:`close_fully` keeps waiting for a close once its caller is cancelled."""
+
+_CONTEXT_DEPTH = 8  # exception __context__ links searched for an unwinding cancellation
+
 
 class _Guard:
-    __slots__ = ("lock", "owner", "users")
+    __slots__ = ("abandoned", "lock", "owner", "users")
 
     def __init__(self) -> None:
         self.lock = asyncio.Lock()
         self.owner: asyncio.Task[Any] | None = None
         self.users = 0  # holder + waiters; the entry is dropped when this reaches 0
+        # Closes the holder abandoned on cancellation; the lock waits for them.
+        self.abandoned: list[asyncio.Future[None]] = []
 
 
-# (pool, loop) -> guard. An entry exists only while a task holds or waits for the
-# lock, so an idle pool or a closed event loop is never kept alive by this map.
+# (pool, loop) -> guard. An entry exists while a task holds or waits for the lock, or
+# while a close its holder abandoned is still running. Otherwise an idle pool or a
+# closed event loop is never kept alive by this map. Limit: an abandoned close that
+# never finishes (aiosqlite 0.22.1 close() after stop()) never runs its callbacks, so
+# that pool's lock stays held and its entry (pool and loop) stays here for the life
+# of the process; other sessions on that engine wait (with the WAIT_WARNING_S warning).
 _GUARDS: dict[tuple[Pool, asyncio.AbstractEventLoop], _Guard] = {}
 _WARNED: weakref.WeakSet[Pool] = weakref.WeakSet()
 
@@ -190,16 +211,50 @@ async def serialized(engine: AsyncEngine) -> AsyncIterator[None]:
     guard.users += 1
     try:
         await _acquire(guard)
-        guard.owner = task
-        try:
-            yield
-        finally:
-            guard.owner = None
-            guard.lock.release()
+    except BaseException:
+        _leave(guard, key)
+        raise
+    guard.owner = task
+    try:
+        yield
     finally:
-        guard.users -= 1
-        if guard.users == 0 and _GUARDS.get(key) is guard:
-            del _GUARDS[key]
+        _unlock_when_closed(guard, key)
+
+
+def _leave(guard: _Guard, key: tuple[Pool, asyncio.AbstractEventLoop]) -> None:
+    guard.users -= 1
+    if guard.users == 0 and _GUARDS.get(key) is guard:
+        del _GUARDS[key]
+
+
+def _unlock(guard: _Guard, key: tuple[Pool, asyncio.AbstractEventLoop]) -> None:
+    guard.owner = None
+    guard.lock.release()
+    _leave(guard, key)
+
+
+def _unlock_when_closed(guard: _Guard, key: tuple[Pool, asyncio.AbstractEventLoop]) -> None:
+    """Release the lock now, or once every close its holder abandoned has finished.
+
+    An abandoned close may still run its ROLLBACK and pool reset on the shared
+    connection; releasing earlier would let another session's transaction overlap it.
+    """
+    pending = [close for close in guard.abandoned if not close.done()]
+    guard.abandoned = []
+    if not pending:
+        _unlock(guard, key)
+        return
+    guard.owner = None  # the cancelled holder must not re-enter without waiting
+    remaining = len(pending)
+
+    def _closed(_close: asyncio.Future[None]) -> None:
+        nonlocal remaining
+        remaining -= 1
+        if remaining == 0:
+            _unlock(guard, key)
+
+    for close in pending:
+        close.add_done_callback(_closed)
 
 
 async def close_fully(close: Callable[[], Awaitable[None]]) -> None:
@@ -208,17 +263,93 @@ async def close_fully(close: Callable[[], Awaitable[None]]) -> None:
     A cancellation received while waiting is re-raised once ``close()`` has
     finished, so a lock held around the close is released only after the
     session's ROLLBACK and pool reset have run.
+
+    Once the caller is cancelled, the wait is bounded by ``CLOSE_AFTER_CANCEL_S``.
+    The bound starts at the first cancellation received during the wait, or on
+    entry when a cancellation is already unwinding (a ``finally`` or ``__aexit__``
+    reached by a ``CancelledError``, possibly converted to another exception).
+    Later cancellations neither restart nor shorten it. A close still running at
+    expiry is abandoned: it is not cancelled and keeps running in the background,
+    ``db_close_abandoned`` is logged, and a single-connection lock held by the
+    caller is released only when that close finishes.
+
+    The cancellation always wins over a close error: a cancellation received here
+    is re-raised, and on entry during an unwinding cancellation this returns so
+    the in-flight exception carries on. The close error is then dropped unlogged.
+    This also holds inside a handler that caught a converted cancellation and
+    carries on without ``uncancel()``: store calls there still count as unwinding
+    (the 5 s bound applies and close errors are dropped).
     """
-    task = asyncio.ensure_future(close())
-    cancelled: BaseException | None = None
-    while True:
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError as exc:
-            if task.done():
-                raise
-            cancelled = exc
-        else:
-            break
+    caller = asyncio.current_task()
+    unwinding = _cancellation_unwinding(caller)
+    task: asyncio.Future[None] = asyncio.ensure_future(close())
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + CLOSE_AFTER_CANCEL_S if unwinding else None
+    cancelled = await _await_close(task, caller, deadline)
+    if cancelled is None and not unwinding:
+        task.result()  # never abandoned without a cancellation, so the close is done
+        return
+    if task.done():
+        _retrieve(task)  # the cancellation wins over a close error
     if cancelled is not None:
         raise cancelled
+
+
+def _cancellation_unwinding(caller: asyncio.Task[Any] | None) -> bool:
+    """True when ``caller`` runs cleanup for a cancellation that is in flight now.
+
+    ``cancelling()`` alone is not proof: it stays raised after a cancellation was
+    handled without ``uncancel()`` (a swallowed ``CancelledError``, a TaskGroup on
+    Python 3.11 and 3.12). So a ``CancelledError`` must also be the exception being
+    handled, or on its ``__context__`` chain when the store converted it.
+    """
+    if caller is None or not caller.cancelling():
+        return False
+    handled = sys.exception()
+    for _ in range(_CONTEXT_DEPTH):
+        if handled is None:
+            return False
+        if isinstance(handled, asyncio.CancelledError):
+            return True
+        handled = handled.__context__
+    return False
+
+
+async def _await_close(
+    task: asyncio.Future[None], caller: asyncio.Task[Any] | None, deadline: float | None
+) -> asyncio.CancelledError | None:
+    """Wait for ``task`` without cancelling it; return the caller's first cancellation.
+
+    Unbounded while ``deadline`` is None; the first cancellation received sets it.
+    At the deadline the close is abandoned, still running.
+    """
+    loop = asyncio.get_running_loop()
+    cancelled: asyncio.CancelledError | None = None
+    while not task.done():
+        timeout = None if deadline is None else deadline - loop.time()
+        if timeout is not None and timeout <= 0:
+            _abandon(task, caller)
+            break
+        try:
+            await asyncio.wait((task,), timeout=timeout)
+        except asyncio.CancelledError as exc:
+            cancelled = cancelled or exc
+            if deadline is None:
+                deadline = loop.time() + CLOSE_AFTER_CANCEL_S
+    return cancelled
+
+
+def _abandon(task: asyncio.Future[None], caller: asyncio.Task[Any] | None) -> None:
+    # Retrieve a late failure so asyncio never logs its text ("exception was never
+    # retrieved"): no exception text in logs.
+    task.add_done_callback(_retrieve)
+    if caller is not None:
+        for guard in _GUARDS.values():
+            if guard.owner is caller:
+                guard.abandoned.append(task)
+    _codes.log_code(logger, _codes.DB_CLOSE_ABANDONED, timeout_s=CLOSE_AFTER_CANCEL_S)
+
+
+def _retrieve(task: asyncio.Future[None]) -> None:
+    if not task.cancelled():
+        task.exception()

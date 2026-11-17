@@ -38,7 +38,7 @@ class CompositeNotifier(BaseNotifier):
             try:
                 if getattr(notifier, "_dendrux_otel", False) is True:
                     return True
-            except Exception:
+            except Exception:  # noqa: S112 - Optional capability probe isolates child property errors and keeps scanning.
                 continue
         return False
 

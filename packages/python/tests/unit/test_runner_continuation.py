@@ -6,10 +6,22 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from dendrux import Agent
+from dendrux import Agent, chat
 from dendrux.llm.mock import MockLLM
+from dendrux.loops import _helpers
 from dendrux.loops.react import ReActLoop
-from dendrux.runtime import _reclaim, runner
+from dendrux.runtime import (
+    _reclaim,
+    _run_approval,
+    _run_events,
+    _run_images,
+    _run_outcome,
+    _run_resume_prep,
+    _run_resume_replay,
+    _run_resume_stream,
+    runner,
+    submit,
+)
 from dendrux.types import (
     ImagePart,
     ImageRef,
@@ -47,13 +59,13 @@ async def test_resumed_payload_on_both_entries(store, monkeypatch, entry, kind):
     paused = await agent.run("go", tenant_id=None)
     # Isolate caller arguments and the real builder from claim/media/replay machinery.
     monkeypatch.setattr(
-        runner,
+        _run_resume_prep,
         "_claim_resume",
         AsyncMock(
             side_effect=lambda store, run, raw, agent, expected, **kw: (store, expected, raw)
         ),
     )
-    monkeypatch.setattr(runner, "_replay_resume_injected_history", AsyncMock())
+    monkeypatch.setattr(_run_resume_replay, "_replay_resume_injected_history", AsyncMock())
     monkeypatch.setattr(_reclaim, "needs_resolution", AsyncMock(return_value=kind == "recovering"))
     monkeypatch.setattr(_reclaim, "resolve", AsyncMock(return_value=None))
     image = ImageRef("a" * 64, "image/png", 1, 1, 1)
@@ -84,9 +96,9 @@ async def test_resumed_payload_on_both_entries(store, monkeypatch, entry, kind):
     ):
         return store, expected, raw, trs, parts if text is not None else None
 
-    monkeypatch.setattr(runner, "_resume_submission", submission)
+    monkeypatch.setattr(_run_resume_prep, "_resume_submission", submission)
     monkeypatch.setattr(
-        runner,
+        _run_resume_stream,
         "_stream_resume_images",
         AsyncMock(
             return_value=(store, None, parts, False)
@@ -95,10 +107,10 @@ async def test_resumed_payload_on_both_entries(store, monkeypatch, entry, kind):
         ),
     )
     if kind == "input":
-        monkeypatch.setattr(runner, "split_user_content", lambda value: ("answer", (object(),)))
-    monkeypatch.setattr(runner, "validate_result_names", Mock())
+        monkeypatch.setattr(chat, "split_user_content", lambda value: ("answer", (object(),)))
+    monkeypatch.setattr(submit, "validate_result_names", Mock())
     monkeypatch.setattr(
-        runner, "prepare_resume_results", AsyncMock(side_effect=lambda a, s, r, p, trs: trs)
+        submit, "prepare_resume_results", AsyncMock(side_effect=lambda a, s, r, p, trs: trs)
     )
     # Text input's image count is pinned directly below; public input media still uses its own seam.
     captured = []
@@ -109,7 +121,7 @@ async def test_resumed_payload_on_both_entries(store, monkeypatch, entry, kind):
             captured.append(data)
         return await original(store, run, event, data, **kwargs)
 
-    monkeypatch.setattr(runner, "_emit_event", emit)
+    monkeypatch.setattr(_run_events, "_emit_event", emit)
 
     async def run(**kwargs):
         return RunResult(status=RunStatus.SUCCESS, answer="done", run_id=kwargs["run_id"])
@@ -186,7 +198,7 @@ async def test_resume_loop_kwargs_match_stream(store, monkeypatch):
         contexts[current] = ctx
         return ctx
 
-    monkeypatch.setattr(runner, "_prepare_resume", prepare)
+    monkeypatch.setattr(_run_resume_prep, "_prepare_resume", prepare)
     for current in ("resume", "resume_stream"):
         provider = MockLLM([LLMResponse(tool_calls=[ToolCall("client_read", id="call")])])
         agent = Agent(
@@ -198,9 +210,9 @@ async def test_resume_loop_kwargs_match_stream(store, monkeypatch):
             strict_tenancy=False,
             loop=ReActLoop(),
         )
-        monkeypatch.setattr(runner, "_image_runtime", original_images)
+        monkeypatch.setattr(_run_images, "_image_runtime", original_images)
         paused = await agent.run("go", tenant_id=None)
-        monkeypatch.setattr(runner, "_image_runtime", lambda *args: image_runtime)
+        monkeypatch.setattr(_run_images, "_image_runtime", lambda *args: image_runtime)
 
         async def run(*, budget_carry=None, _entry=current, **kwargs):
             captured[_entry] = dict(kwargs, budget_carry=budget_carry)
@@ -277,9 +289,9 @@ async def test_recovering_stream_stop_matches_helpers(store, monkeypatch, status
     async def notifier(*args):
         calls.append(("notifier", args[-1]))
 
-    monkeypatch.setattr(runner, "_persist_loop_outcome", persist)
-    monkeypatch.setattr(runner, "record_run_finished", recorder)
-    monkeypatch.setattr(runner, "notify_run_finished", notifier)
+    monkeypatch.setattr(_run_outcome, "_persist_loop_outcome", persist)
+    monkeypatch.setattr(_helpers, "record_run_finished", recorder)
+    monkeypatch.setattr(_helpers, "notify_run_finished", notifier)
     events = [
         e
         async for e in agent.resume_stream(
@@ -335,7 +347,7 @@ async def test_approval_batch_order_and_decisions(monkeypatch, entry, mode):
         calls.append("validate")
         return decision_map
 
-    monkeypatch.setattr(runner, "_validated_decisions", validate)
+    monkeypatch.setattr(_run_approval, "_validated_decisions", validate)
     tool_result = ToolResult("tool", "call", '"ok"')
     approval = runner._ApprovalResume(
         [(pause.pending_tool_calls[0], tool_result)], [], {"decision": "approved"}, None
@@ -351,18 +363,18 @@ async def test_approval_batch_order_and_decisions(monkeypatch, entry, mode):
             kwargs["on_work"]()
         return approval
 
-    monkeypatch.setattr(runner, "_execute_approved_tools", execute)
+    monkeypatch.setattr(_run_approval, "_execute_approved_tools", execute)
 
     async def record(*args):
         calls.append("decided")
 
-    monkeypatch.setattr(runner, "_record_approval_decided", record)
+    monkeypatch.setattr(_run_approval, "_record_approval_decided", record)
 
     def stop(*args):
         calls.append("stop")
         return None
 
-    monkeypatch.setattr(runner, "_approval_stop_result", stop)
+    monkeypatch.setattr(_run_approval, "_approval_stop_result", stop)
     expected = "paused" if mode == "paused" else "waiting_approval"
     results = [tool_result] if mode == "reject" else None
     text = "input" if mode == "irrelevant" else None
@@ -408,9 +420,9 @@ async def test_closing_approval_results_does_not_record_decision(monkeypatch):
         resolved_strategy=Mock(),
     )
     approval = runner._ApprovalResume([(tc, ToolResult("tool", "call", '"ok"'))], [], {}, None)
-    monkeypatch.setattr(runner, "_execute_approved_tools", AsyncMock(return_value=approval))
+    monkeypatch.setattr(_run_approval, "_execute_approved_tools", AsyncMock(return_value=approval))
     decided = AsyncMock()
-    monkeypatch.setattr(runner, "_record_approval_decided", decided)
+    monkeypatch.setattr(_run_approval, "_record_approval_decided", decided)
     events = runner._stream_approval_events(
         Mock(), Mock(), "run", ctx, "waiting_approval", None, None, None, {}
     )

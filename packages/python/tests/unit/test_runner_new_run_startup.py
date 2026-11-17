@@ -9,7 +9,7 @@ from dendrux import Agent
 from dendrux.db._sqlite_sync import create_sqlite_schema
 from dendrux.llm.mock import MockLLM
 from dendrux.loops.base import BaseNotifier
-from dendrux.runtime import runner
+from dendrux.runtime import _run_events, runner
 from dendrux.runtime.persistence import PersistenceRecorder
 from dendrux.store import SQLiteStateStore
 from dendrux.types import LLMResponse, RunEventType, RunStatus
@@ -236,7 +236,7 @@ async def test_startup_order_and_delegation_context(store, monkeypatch, entry):
 
     monkeypatch.setattr(PersistenceRecorder, "__init__", construct)
     monkeypatch.setattr(PersistenceRecorder, "on_run_started", recorded)
-    monkeypatch.setattr(runner, "_emit_event", event)
+    monkeypatch.setattr(_run_events, "_emit_event", event)
     notifier = observer()
     notifier.on_run_started.side_effect = notified
     token = set_delegation_context(

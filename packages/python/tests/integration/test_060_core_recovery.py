@@ -9,6 +9,7 @@ from sqlalchemy import update
 from dendrux.db.models import AgentRun
 from dendrux.errors import RunNotFoundError
 from dendrux.types import generate_ulid
+from tests._helpers.gates import wait_for_gate
 
 
 async def stale(store, engine, *, tenant="tenant", count=1):
@@ -422,7 +423,7 @@ async def test_parallel_creation_retains_loop_class_metadata(store, engine, fmt)
         entrants += 1
         if entrants == 8:
             ready.set()
-        await asyncio.wait_for(ready.wait(), 10)
+        await wait_for_gate(ready)
         result = await create(*args, **kwargs)
         initial[result.run_id] = await store.get_loop_state(result.run_id)
         return result

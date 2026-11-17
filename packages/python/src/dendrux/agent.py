@@ -43,8 +43,8 @@ from dendrux._lifecycle import TERMINAL_STATUSES as _TERMINAL_STATUSES
 from dendrux._lifecycle import WAITING_STATUSES as _WAITING_STATUS_VALUES
 from dendrux._sentinel import _OMITTED, _OmittedType, _UnsetType
 from dendrux.media._store import DEFAULT_GC_AGE, DEFAULT_GC_LIMIT
+from dendrux.runtime import _managed, _managed_budget, _managed_cancel
 from dendrux.runtime._blob_catalog import MIN_GC_AGE
-from dendrux.runtime._bounds import MAX_SMALL_PAGE
 from dendrux.runtime._continuation_guardrails import _continuation_projection
 from dendrux.runtime._entry_checks import entry_checks, require_boolean
 from dendrux.runtime._limit_checks import (
@@ -59,8 +59,6 @@ from dendrux.skills._internal import is_script, validate_executor
 from dendrux.skills._session import NAMES, SkillSession, continuation, current
 from dendrux.tool import get_tool_def, is_tool
 from dendrux.types import ULID_CHARS, RunStatus
-
-_CANCEL_OUTCOME_LIMIT = 999
 
 DEFAULT_MAX_ITERATIONS = 10
 DEFAULT_TOOL_THREADS_PER_AGENT = 8
@@ -111,7 +109,7 @@ _env_url_lock = threading.Lock()
 
 
 def _log_env_url_ignored() -> None:
-    global _env_url_ignored
+    global _env_url_ignored  # noqa: PLW0603 - preserve the locked once-per-process notice
     with _env_url_lock:
         if not _env_url_ignored:
             _codes.log_code(_agent_logger, _codes.DATABASE_URL_ENV_IGNORED)
@@ -177,6 +175,34 @@ async def _require_run_in_scope(store: StateStore, run_id: str, tenant_id: Tenan
     record = await store.get_run(run_id)
     if record is None or not _in_tenant_scope(record, tenant_id):
         raise RunNotFoundError(run_id)
+    await _refuse_managed_child(store, record)
+
+
+async def _refuse_managed_child(store: StateStore, record: Any) -> None:
+    """Direct control of a managed subagent run is refused, after the tenant check (0.7)."""
+    from dendrux.errors import ManagedChildControlError
+
+    if await _managed_cancel.managed_child_header(store, record):
+        raise ManagedChildControlError(record.id)
+
+
+async def _check_retry_source(store: StateStore, run_id: str, tenant_id: TenantScope) -> None:
+    source = await store.get_run(run_id)
+    if source is not None and _in_tenant_scope(source, tenant_id):
+        await _refuse_managed_child(store, source)
+
+
+def _check_reclaim_arguments(
+    run_id: str, item: ReclaimableRun | None, tenant_id: TenantScope | _OmittedType
+) -> TenantScope:
+    from dendrux.errors import TenantScopeRequiredError
+
+    if item is not None and item.run_id != run_id:
+        raise ValueError("run_id must equal item.run_id")
+    if isinstance(tenant_id, _OmittedType):
+        _codes.log_code(_agent_logger, _codes.TENANT_SCOPE_REQUIRED, run_id=run_id)
+        raise TenantScopeRequiredError("reclaim")
+    return tenant_id
 
 
 def _cascade_order(subtree: Any) -> list[str]:
@@ -372,12 +398,15 @@ class Agent:
 
     Attributes:
         name: Agent identifier. Auto-derived from class name if subclassed.
+        description: What the agent does. Required when it is used as a
+            subagent: the parent's model reads it to decide when to call it.
         prompt: System prompt for the agent.
         tools: List of @tool-decorated functions this agent can use.
         max_iterations: Maximum ReAct loop iterations before stopping.
     """
 
     name: str = ""
+    description: str = ""
     prompt: str = ""
     tools: list[Callable[..., Any]] = []
     max_iterations: int = DEFAULT_MAX_ITERATIONS
@@ -402,7 +431,9 @@ class Agent:
         provider: LLMProvider | str,
         prompt: str,
         name: str = ...,
+        description: str = ...,
         tools: list[Callable[..., Any]] = ...,
+        subagents: Sequence[Agent] | None = ...,
         tool_sources: list[MCPServer | MCPSource | MCPHost | MCPToolView] | None = ...,
         max_iterations: int = ...,
         max_delegation_depth: int | None = ...,
@@ -437,8 +468,10 @@ class Agent:
         *,
         provider: LLMProvider | str | None = ...,
         name: str = ...,
+        description: str = ...,
         prompt: str = ...,
         tools: list[Callable[..., Any]] = ...,
+        subagents: Sequence[Agent] | None = ...,
         tool_sources: list[MCPServer | MCPSource | MCPHost | MCPToolView] | None = ...,
         max_iterations: int = ...,
         max_delegation_depth: int | None = ...,
@@ -471,8 +504,10 @@ class Agent:
         self,
         *,
         name: str | _UnsetType = _UNSET,
+        description: str | _UnsetType = _UNSET,
         prompt: str | _UnsetType = _UNSET,
         tools: list[Callable[..., Any]] | _UnsetType = _UNSET,
+        subagents: Sequence[Agent] | None = None,
         tool_sources: list[MCPServer | MCPSource | MCPHost | MCPToolView] | None = None,
         max_iterations: int | _UnsetType = _UNSET,
         max_delegation_depth: int | None | _UnsetType = _UNSET,
@@ -518,23 +553,9 @@ class Agent:
             raise ValueError("lease_interval must be a timedelta of at least 5 seconds")
         self.lease_interval = lease_interval
 
-        # --- Identity ---
-        if not isinstance(name, _UnsetType):
-            self.name = name
-        elif not self.name:
-            self.name = type(self).__name__
-
-        if not isinstance(prompt, _UnsetType):
-            self.prompt = prompt
-        if not isinstance(tools, _UnsetType):
-            self.tools = list(tools)
-        else:
-            self.tools = list(self.__class__.tools)
-        if not isinstance(max_iterations, _UnsetType):
-            self.max_iterations = max_iterations
-        if not isinstance(max_delegation_depth, _UnsetType):
-            _validate_max_delegation_depth(max_delegation_depth)
-            self.max_delegation_depth = max_delegation_depth
+        self._configure_identity(
+            name, description, prompt, tools, max_iterations, max_delegation_depth
+        )
 
         # --- Loop ---
         self._loop: Loop | None = loop
@@ -608,10 +629,52 @@ class Agent:
         self._validate_skill_contents(self._explicit_skills or [])
 
         self._validate()
+        self._configure_subagents(subagents)
 
         from dendrux import pricing as _pricing
 
         _pricing.check_budget_config(self)
+
+    def _configure_identity(
+        self,
+        name: str | _UnsetType,
+        description: str | _UnsetType,
+        prompt: str | _UnsetType,
+        tools: list[Callable[..., Any]] | _UnsetType,
+        max_iterations: int | _UnsetType,
+        max_delegation_depth: int | None | _UnsetType,
+    ) -> None:
+        """Set identity fields; an unset argument keeps the class attribute."""
+        if not isinstance(name, _UnsetType):
+            self.name = name
+        elif not self.name:
+            self.name = type(self).__name__
+        if not isinstance(description, _UnsetType):
+            self.description = description
+        if not isinstance(prompt, _UnsetType):
+            self.prompt = prompt
+        self.tools = list(self.__class__.tools if isinstance(tools, _UnsetType) else tools)
+        if not isinstance(max_iterations, _UnsetType):
+            self.max_iterations = max_iterations
+        if not isinstance(max_delegation_depth, _UnsetType):
+            _validate_max_delegation_depth(max_delegation_depth)
+            self.max_delegation_depth = max_delegation_depth
+
+    def _configure_subagents(self, subagents: Sequence[Agent] | None) -> None:
+        """Store ``subagents`` (never mutating them) after the tree checks pass."""
+        from dendrux.runtime import _subagents
+
+        self._subagents: tuple[Agent, ...] = _subagents.normalize_subagents(self.name, subagents)
+        if not self._subagents:
+            return
+        from dendrux.loops.single import SingleCall
+
+        if isinstance(self._loop, SingleCall):
+            _subagents.refuse(
+                _subagents.SubagentDefinitionError(self.name, reason="single_call_parent")
+            )
+        _managed_budget.validate_definitions(self, agent_type=Agent)
+        _subagents.warn_fanout(self)
 
     def _configure_persistence(
         self,
@@ -778,6 +841,11 @@ class Agent:
         if self._provider is None:
             return ""
         return self._provider.model
+
+    @property
+    def subagents(self) -> tuple[Agent, ...]:
+        """Direct subagents, in registration order (empty when there are none)."""
+        return self._subagents
 
     @property
     def loop(self) -> Loop | None:
@@ -956,6 +1024,13 @@ class Agent:
             raise ValueError("Agent requires a provider. Pass provider= to the constructor.")
         return self._provider
 
+    def _refuse_managed_entry(self, operation: str, run_id: str | None) -> None:
+        """Entries a managed workflow does not route yet refuse before any I/O (0.7)."""
+        if self._subagents:
+            from dendrux.errors import ManagedUnsupportedError
+
+            raise ManagedUnsupportedError(operation, run_id)
+
     def _resolve_run_max_delegation_depth(
         self, requested: int | None | _UnsetType
     ) -> int | None | _UnsetType:
@@ -985,6 +1060,7 @@ class Agent:
 
         Stages run in a fixed order and the first failure wins.
         """
+        self._validate_description()
         self._validate_basics()
 
         from dendrux.loops.single import SingleCall
@@ -1006,6 +1082,10 @@ class Agent:
             self._validate_deny(single_call, has_mcp, has_skills, known_tools)
         if self._require_approval:
             self._validate_require_approval(single_call, has_mcp, has_skills, known_tools)
+
+    def _validate_description(self) -> None:
+        if not isinstance(self.description, str):
+            raise ValueError(f"Agent '{self.name}' description must be a string.")
 
     def _validate_basics(self) -> None:
         if not self.prompt:
@@ -1221,6 +1301,14 @@ class Agent:
 
         store = await self._open_state_store()
         await ensure_agent_limits_fit(self, store)
+        return store
+
+    async def _require_state_store(self) -> StateStore:
+        from dendrux.errors import PersistenceNotConfiguredError
+
+        store = await self._resolve_state_store()
+        if store is None:
+            raise PersistenceNotConfiguredError()
         return store
 
     async def _open_state_store(self) -> StateStore | None:
@@ -1558,6 +1646,7 @@ class Agent:
             context=kwargs.get("context"),
             provider_kwargs=kwargs,
         )
+        self._refuse_managed_entry("retry", run_id)
         provider = self._require_provider()
         store = await self._resolve_state_store()
 
@@ -1566,6 +1655,7 @@ class Agent:
                 "retry() requires persistence (database_url or state_store). "
                 "Retry reads traces from the original run."
             )
+        await _check_retry_source(store, run_id, tenant_id)
 
         from dendrux.runtime.runner import retry as runner_retry
 
@@ -1590,25 +1680,26 @@ class Agent:
     ) -> RunResult:
         """Continue a marked ReAct run from its last committed checkpoint.
 
-        Call ``sweep(on_stale="reclaim")`` first. Passing its ``item`` fences
-        this attempt to that exact mark. Omitting tenant scope raises
-        TenantScopeRequiredError. A missing or foreign run raises
-        RunNotFoundError without changing the run.
-        Interrupted non-idempotent tools pause for approval before replay.
+        Call ``sweep(on_stale="reclaim")`` first; its ``item`` fences this attempt. No tenant
+        scope raises TenantScopeRequiredError; a missing or foreign run raises RunNotFoundError
+        unchanged, but a non-ReAct (e.g. SingleCall) agent raises ``loop_unsupported`` before
+        looking the run up. Uncertain non-idempotent tools pause for approval. A running
+        SingleCall subagent also gives ``loop_unsupported``: sweep, then reclaim the root.
         """
-        from dendrux.errors import PersistenceNotConfiguredError, TenantScopeRequiredError
         from dendrux.runtime._reclaim import reclaim
 
-        if item is not None and item.run_id != run_id:
-            raise ValueError("run_id must equal item.run_id")
-        if isinstance(tenant_id, _OmittedType):
-            _codes.log_code(_agent_logger, _codes.TENANT_SCOPE_REQUIRED, run_id=run_id)
-            raise TenantScopeRequiredError("reclaim")
+        tenant_id = _check_reclaim_arguments(run_id, item, tenant_id)
         tenant_id = entry_checks(self, "resume", tenant_id, default_tenant=UNSCOPED, run_id=run_id)
         self._require_provider()
-        store = await self._resolve_state_store()
-        if store is None:
-            raise PersistenceNotConfiguredError()
+        store = await self._require_state_store()
+        if self._subagents:
+            from dendrux.runtime import _managed
+
+            # A managed root reconnects through its persisted bindings (0.7).
+            await _require_run_in_scope(store, run_id, tenant_id)
+            return await _managed.reconnect(
+                self, store, run_id, tenant_id=tenant_id, item=item, notifier=notifier
+            )
         return await reclaim(self, store, run_id, tenant_id=tenant_id, item=item, notifier=notifier)
 
     async def resume(
@@ -1662,7 +1753,7 @@ class Agent:
             user_input=user_input,
         )
         # Validate args before any I/O
-        provider = self._require_provider()
+        self._require_provider()
         if tool_results is not None and user_input is not None:
             raise ValueError("Cannot provide both tool_results and user_input to resume().")
 
@@ -1673,11 +1764,49 @@ class Agent:
                 "Pass database_url or state_store to the constructor."
             )
 
+        def submit(agent: Agent, target: str) -> Awaitable[RunResult]:
+            return agent._resume_on(
+                store,
+                target,
+                tool_results=tool_results,
+                user_input=user_input,
+                notifier=notifier,
+                expected_pause_id=expected_pause_id,
+                tenant_explicit=tenant_explicit,
+            )
+
+        if self._subagents:
+            return await self._routed(
+                "resume",
+                store,
+                run_id,
+                tenant_id,
+                expected_pause_id,
+                notifier,
+                submit,
+                adopt_terminal=tool_results is None and user_input is None,
+                tool_results=tool_results,
+                user_input=user_input,
+            )
+        await _require_run_in_scope(store, run_id, tenant_id)
+        return await submit(self, run_id)
+
+    async def _resume_on(
+        self,
+        store: StateStore,
+        run_id: str,
+        *,
+        tool_results: list[ToolResult] | None,
+        user_input: UserContent | None,
+        notifier: LoopNotifier | None,
+        expected_pause_id: str | None,
+        tenant_explicit: bool,
+    ) -> RunResult:
+        """Resume ``run_id`` with this Agent's definition (the three ``resume`` modes)."""
         from dendrux.runtime.runner import resume as runner_resume
         from dendrux.runtime.runner import resume_with_input
 
-        await _require_run_in_scope(store, run_id, tenant_id)
-
+        provider = self._require_provider()
         if tool_results is not None:
             return await runner_resume(
                 run_id,
@@ -1731,6 +1860,51 @@ class Agent:
                     continue
             cleanup.result()
             raise
+
+    async def _routed(
+        self,
+        operation: Any,
+        store: StateStore,
+        run_id: str,
+        tenant_id: TenantScope,
+        expected_pause_id: str | None,
+        notifier: LoopNotifier | None,
+        submit: Callable[[Agent, str], Awaitable[RunResult]],
+        *,
+        adopt_terminal: bool = False,
+        **fields: Any,
+    ) -> RunResult:
+        """Route a root-id continuation of a managed workflow to its active leaf (0.7).
+
+        With ``adopt_terminal`` (a payload-free ``resume``), a finished subagent's
+        saved outcome is adopted without a token instead.
+
+        Tenant scope is checked at the root; the leaf is reached through the
+        persisted bindings and validated, claimed and continued with the
+        leaf's own registered definition. Finished outcomes then unwind
+        through adoption to the root, which returns its result or the next
+        external pause.
+        """
+
+        found = await _managed.route(self, store, run_id, tenant_id=tenant_id)
+        if adopt_terminal:
+            adopted = await _managed.adopt_terminal_leaf(found, store, notifier=notifier)
+            if adopted is not None:
+                return adopted
+        _managed.require_leaf_pause(found, expected_pause_id)
+        leaf = found.leaf_agent
+        if found.routed:
+            # The payload meets the leaf's own entry rules and limits too.
+            entry_checks(
+                leaf,
+                operation,
+                found.tenant_id,
+                default_tenant=UNSCOPED,
+                run_id=found.leaf.id,
+                **fields,
+            )
+        result = await submit(leaf, found.leaf.id)
+        return await _managed.unwind(found, store, result, notifier=notifier)
 
     async def submit_tool_results(
         self,
@@ -1788,6 +1962,49 @@ class Agent:
             tool_results=results,
         )
         from dendrux.errors import PersistenceNotConfiguredError
+
+        self._require_provider()
+        store = await self._resolve_state_store()
+        if store is None:
+            raise PersistenceNotConfiguredError()
+
+        def submit(agent: Agent, target: str) -> Awaitable[RunResult]:
+            return agent._submit_tool_results_to(
+                store,
+                target,
+                results,
+                notifier=notifier,
+                expected_pause_id=expected_pause_id,
+                tenant_explicit=tenant_explicit,
+                manager=self._task_manager,
+            )
+
+        if self._subagents:
+            return await self._routed(
+                "submit_tool_results",
+                store,
+                run_id,
+                tenant_id,
+                expected_pause_id,
+                notifier,
+                submit,
+                tool_results=results,
+            )
+        await _require_run_in_scope(store, run_id, tenant_id)
+        return await submit(self, run_id)
+
+    async def _submit_tool_results_to(
+        self,
+        store: StateStore,
+        run_id: str,
+        results: list[ToolResult],
+        *,
+        notifier: LoopNotifier | None,
+        expected_pause_id: str | None,
+        tenant_explicit: bool,
+        manager: Any,
+    ) -> RunResult:
+        """Validate with this Agent's definition, claim ``run_id`` and continue it."""
         from dendrux.runtime.runner import resume_claimed
         from dendrux.runtime.submit import (
             claim_or_raise,
@@ -1798,11 +2015,6 @@ class Agent:
         from dendrux.types import RunStatus
 
         provider = self._require_provider()
-        store = await self._resolve_state_store()
-        if store is None:
-            raise PersistenceNotConfiguredError()
-
-        await _require_run_in_scope(store, run_id, tenant_id)
         skill_session = await continuation(self, store, run_id)
         with skill_session.bind(), await _continuation_projection(self, store, run_id):
             pause = await validate_tool_results(store, run_id, results)
@@ -1826,6 +2038,7 @@ class Agent:
                 expected_pause_id=(
                     expected_pause_id if expected_pause_id is not None else pause.pause_id
                 ),
+                caller_token=expected_pause_id is not None,
                 call_results=results,
                 **claim_kwargs,
             )
@@ -1833,7 +2046,7 @@ class Agent:
 
             store = claimed_store(store, run_id, epoch)
 
-            task = self._task_manager.spawn(
+            task = manager.spawn(
                 run_id,
                 resume_claimed(
                     run_id,
@@ -1890,19 +2103,56 @@ class Agent:
             user_input=text,
         )
         from dendrux.errors import PersistenceNotConfiguredError
+
+        self._require_provider()
+        store = await self._resolve_state_store()
+        if store is None:
+            raise PersistenceNotConfiguredError()
+
+        def submit(agent: Agent, target: str) -> Awaitable[RunResult]:
+            return agent._submit_input_to(
+                store,
+                target,
+                text,
+                notifier=notifier,
+                expected_pause_id=expected_pause_id,
+                tenant_explicit=tenant_explicit,
+                manager=self._task_manager,
+            )
+
+        if self._subagents:
+            return await self._routed(
+                "submit_input",
+                store,
+                run_id,
+                tenant_id,
+                expected_pause_id,
+                notifier,
+                submit,
+                user_input=text,
+            )
+        await _require_run_in_scope(store, run_id, tenant_id)
+        return await submit(self, run_id)
+
+    async def _submit_input_to(
+        self,
+        store: StateStore,
+        run_id: str,
+        text: UserContent,
+        *,
+        notifier: LoopNotifier | None,
+        expected_pause_id: str | None,
+        tenant_explicit: bool,
+        manager: Any,
+    ) -> RunResult:
+        """Validate with this Agent's definition, claim ``run_id`` and continue it."""
+        from dendrux.chat import split_user_content
         from dendrux.runtime.runner import resume_claimed
         from dendrux.runtime.submit import claim_or_raise
         from dendrux.types import RunStatus
 
         provider = self._require_provider()
-        store = await self._resolve_state_store()
-        if store is None:
-            raise PersistenceNotConfiguredError()
-
-        from dendrux.chat import split_user_content
-
         projection, items = split_user_content(text, owner="text")
-        await _require_run_in_scope(store, run_id, tenant_id)
         skill_session = await continuation(self, store, run_id)
         with skill_session.bind(), await _continuation_projection(self, store, run_id):
             from dendrux.runtime.submit import require_pause_id
@@ -1937,7 +2187,7 @@ class Agent:
 
             store = claimed_store(store, run_id, epoch)
 
-            task = self._task_manager.spawn(
+            task = manager.spawn(
                 run_id,
                 resume_claimed(
                     run_id,
@@ -2024,21 +2274,7 @@ class Agent:
             decisions=decisions,
         )
         from dendrux.errors import PersistenceNotConfiguredError
-        from dendrux.runtime.runner import resume_approval_approved_claim, resume_claimed
-        from dendrux.runtime.submit import (
-            build_rejection_results,
-            claim_or_raise,
-            decision_denial_results,
-            normalize_decisions,
-            preflight_status,
-            raise_for_non_paused_status,
-            require_pause_id,
-            serialize_decisions,
-            serialize_tool_results,
-            validate_approval_decisions,
-            validate_denial_results,
-        )
-        from dendrux.types import PauseState, RunStatus
+        from dendrux.runtime.submit import normalize_decisions
 
         if (approved is None) == (decisions is None):
             raise ValueError("submit_approval() takes exactly one of approved= or decisions=.")
@@ -2049,12 +2285,69 @@ class Agent:
             )
         pairs = normalize_decisions(decisions) if decisions is not None else None
 
-        provider = self._require_provider()
+        self._require_provider()
         store = await self._resolve_state_store()
         if store is None:
             raise PersistenceNotConfiguredError()
 
+        def submit(agent: Agent, target: str) -> Awaitable[RunResult]:
+            return agent._submit_approval_to(
+                store,
+                target,
+                approved=approved,
+                pairs=pairs,
+                rejection_reason=rejection_reason,
+                notifier=notifier,
+                expected_pause_id=expected_pause_id,
+                tenant_explicit=tenant_explicit,
+                manager=self._task_manager,
+            )
+
+        if self._subagents:
+            return await self._routed(
+                "submit_approval",
+                store,
+                run_id,
+                tenant_id,
+                expected_pause_id,
+                notifier,
+                submit,
+                rejection_reason=rejection_reason,
+                decisions=decisions,
+            )
         await _require_run_in_scope(store, run_id, tenant_id)
+        return await submit(self, run_id)
+
+    async def _submit_approval_to(
+        self,
+        store: StateStore,
+        run_id: str,
+        *,
+        approved: bool | None,
+        pairs: list[tuple[str, ApprovalDecision]] | None,
+        rejection_reason: str | None,
+        notifier: LoopNotifier | None,
+        expected_pause_id: str | None,
+        tenant_explicit: bool,
+        manager: Any,
+    ) -> RunResult:
+        """Validate the decision with this Agent's tools, claim ``run_id`` and continue it."""
+        from dendrux.runtime.runner import resume_approval_approved_claim, resume_claimed
+        from dendrux.runtime.submit import (
+            build_rejection_results,
+            claim_or_raise,
+            decision_denial_results,
+            preflight_status,
+            raise_for_non_paused_status,
+            require_pause_id,
+            serialize_decisions,
+            serialize_tool_results,
+            validate_approval_decisions,
+            validate_denial_results,
+        )
+        from dendrux.types import PauseState, RunStatus
+
+        provider = self._require_provider()
         skill_session = await continuation(self, store, run_id)
         with skill_session.bind(), await _continuation_projection(self, store, run_id):
             if pairs is not None:
@@ -2101,11 +2394,12 @@ class Agent:
                     expected_pause_id=(
                         expected_pause_id if expected_pause_id is not None else pause_state.pause_id
                     ),
+                    caller_token=expected_pause_id is not None,
                 )
                 from dendrux.runtime.state import claimed_store
 
                 store = claimed_store(store, run_id, epoch)
-                task = self._task_manager.spawn(
+                task = manager.spawn(
                     run_id,
                     resume_claimed(
                         run_id,
@@ -2131,7 +2425,7 @@ class Agent:
                 from dendrux.runtime.state import claimed_store
 
                 store = claimed_store(store, run_id, epoch)
-                task = self._task_manager.spawn(
+                task = manager.spawn(
                     run_id,
                     resume_approval_approved_claim(
                         run_id,
@@ -2164,11 +2458,12 @@ class Agent:
                 expected_pause_id=(
                     expected_pause_id if expected_pause_id is not None else pause_state.pause_id
                 ),
+                caller_token=expected_pause_id is not None,
             )
             from dendrux.runtime.state import claimed_store
 
             store = claimed_store(store, run_id, epoch)
-            task = self._task_manager.spawn(
+            task = manager.spawn(
                 run_id,
                 resume_claimed(
                     run_id,
@@ -2191,16 +2486,29 @@ class Agent:
         access to this run. Pending arguments use RunStore.get_pending's view.
         Recovery and pending projection failures propagate from this read.
         """
-        from dendrux.errors import PersistenceNotConfiguredError, RunNotFoundError
-        from dendrux.guardrails._engine import deanonymize_text
-        from dendrux.runtime._pending import _PendingReader
-        from dendrux.runtime.runner import _cached_output, _public_meta, _recovery_info
+        from dendrux.errors import PersistenceNotConfiguredError
 
         _check_result_read_arguments(run_id, tenant_id)
         require_boolean(include_pii, "include_pii")
         store = await self._resolve_state_store()
         if store is None:
             raise PersistenceNotConfiguredError()
+        result, moved = await self._read_result(store, run_id, tenant_id, include_pii)
+        if moved:
+            # The run changed between the record and pending reads: read once more so
+            # the result is one coherent view, never a stale status with fresh pending.
+            result, _ = await self._read_result(store, run_id, tenant_id, include_pii)
+        return result
+
+    async def _read_result(
+        self, store: StateStore, run_id: str, tenant_id: str | None, include_pii: bool
+    ) -> tuple[RunResult, bool]:
+        """One result read; ``moved`` when the pending read saw another public status."""
+        from dendrux.errors import RunNotFoundError
+        from dendrux.guardrails._engine import deanonymize_text
+        from dendrux.runtime._pending import _PendingReader, facing_status
+        from dendrux.runtime.runner import _cached_output, _public_meta, _recovery_info
+
         facade = _PendingReader(store)
         projected = getattr(store, "_get_result_record", None)
         record = (
@@ -2220,8 +2528,12 @@ class Agent:
         if result.status.value == RunStatus.SUCCESS.value:
             result.output = _cached_output(record.answer, self._output_type, run_id)
         result.pending = await facade.get_pending(run_id, tenant_id=tenant_id)
+        view = facade.last_view
+        # A root waiting on a subagent reports its active branch (0.7).
+        result.status = RunStatus(facing_status(result.status.value, view))
         result.pause_id = result.pending.pause_id if result.pending else None
-        return result
+        moved = view is not None and not view.managed and view.status != record.status
+        return result, moved
 
     async def cancel_run(
         self,
@@ -2246,13 +2558,13 @@ class Agent:
           returned a final answer) completes normally — its work and side
           effects happened — and the request is cleared. A stale RUNNING
           row swept with the request pending is finalized ``CANCELLED``.
-        - **Batch** :meth:`run` **executing in this process on this Agent
-          instance:** additionally cancels the task awaiting it, so an
-          in-flight provider call or tool is interrupted. That ``run()``
-          call returns ``RunResult(status=CANCELLED)`` with
-          ``meta["interrupted"] = True`` and ``meta["partial_output"] =
-          False`` (a batch call has no partial text). A caller cancelling
-          its own task still gets ``CancelledError``.
+        - **Batch** :meth:`run` **executing in this process on this Agent instance:** additionally
+          cancels the task awaiting it, so an in-flight provider call or tool is interrupted. That
+          ``run()`` call returns ``RunResult(status=CANCELLED)`` with ``meta["interrupted"] = True``
+          and ``meta["partial_output"] = False`` (a batch call has no partial text). A caller
+          cancelling its own task still gets ``CancelledError``. While a managed subagent is
+          running, cancellation is cooperative even here: the child's in-flight call finishes, its
+          report is not adopted, and the root ends ``CANCELLED``.
         - **Streamed run owned by this Agent instance** (``stream()`` /
           ``resume_stream()``): additionally sets an in-process interrupt
           signal. The loop races every provider pull against it, so an
@@ -2273,8 +2585,10 @@ class Agent:
         - **Non-persisted runs:** unsupported. ``cancel_run`` requires a
           configured DB. Raises ``PersistenceNotConfiguredError``.
 
-        ``cascade=True`` also cancels every non-terminal descendant run
-        (delegated child runs), deepest first and ``run_id`` last. Each frontier
+        Managed roots always include managed descendants, regardless of ``cascade``.
+        ``cascade=True`` additionally includes legacy descendants; legacy roots keep
+        the False default. A cascade rewalks descendants even when the root is terminal.
+        Descendants settle deepest first and ``run_id`` last. Each frontier
         is durably marked before its children are scanned in pages of 500. A
         child already being created commits before the mark and is included;
         later child admission is refused. Traversal uses the shared subtree accounting
@@ -2283,8 +2597,9 @@ class Agent:
         ``cascade_truncated``. Legacy custom stores without frontier methods
         retain snapshot semantics. Per-run outcomes are listed in
         ``meta["cascade"]`` as ``{"run_id", "outcome"}`` with outcome
-        ``cancelled`` (finalized now), ``cancel_requested`` (running;
-        stops at its next checkpoint) or ``terminal``.
+        ``cancelled`` (finalized now), ``cancel_requested`` (running; stops at its
+        next checkpoint), ``terminal``, or ``skipped`` (corrupt header, also setting
+        ``meta["cascade_truncated"]``).
 
         ``tenant_id``: when given, ``run_id`` must belong to exactly that
         tenant (``None`` = untenanted) or ``RunNotFoundError`` is raised,
@@ -2324,38 +2639,36 @@ class Agent:
         record = await store.get_run(run_id)
         if record is None or not _in_tenant_scope(record, tenant_id):
             raise RunNotFoundError(run_id)
-
+        cascade, pages = await _managed_cancel.cancel_scope(store, record, cascade=cascade)
         outcomes: list[dict[str, str]] = []
         cascade_count = 0
         to_signal: list[str] = []
-        frontier_signals = (
-            cascade
-            and callable(getattr(store, "mark_cancel_requested", None))
-            and callable(getattr(store, "get_children_page", None))
-        )
+        frontier_signals = cascade and _managed_cancel.can_mark_cancel(store)
         try:
             traversal_truncated = False
             if cascade:
                 cascade_count, traversal_truncated = await self._cancel_descendant_outcomes(
-                    store, run_id, record.tenant_id, frontier_signals, outcomes, to_signal
+                    store,
+                    run_id,
+                    record.tenant_id,
+                    frontier_signals,
+                    outcomes,
+                    to_signal,
+                    pages,
                 )
 
             if record.status in _TERMINAL_STATUSES:
-                if cascade:
-                    record = await store.get_run(run_id)
-                    if record is None:  # pragma: no cover — concurrent deletion
-                        raise RunNotFoundError(run_id)
-                result = _record_to_run_result(record)
                 outcomes.append({"run_id": run_id, "outcome": "terminal"})
             else:
                 outcome = await self._cancel_one(store, run_id, signal=False)
                 if outcome != "terminal" and not frontier_signals:
                     to_signal.append(run_id)
                 outcomes.append({"run_id": run_id, "outcome": outcome})
+            if cascade or record.status not in _TERMINAL_STATUSES:
                 record = await store.get_run(run_id)
-                if record is None:  # pragma: no cover — we just preflight-checked
+                if record is None:  # pragma: no cover — concurrent deletion
                     raise RunNotFoundError(run_id)
-                result = _record_to_run_result(record)
+            result = _record_to_run_result(record)
             from dendrux.runtime.runner import _recovery_info
 
             result.recovery = await _recovery_info(store, record)
@@ -2382,86 +2695,23 @@ class Agent:
         frontier_signals: bool,
         outcomes: list[dict[str, str]],
         to_signal: list[str],
+        pages: _managed_cancel.CancelPageReader | None = None,
     ) -> tuple[int, bool]:
-        levels, truncated = await self._mark_cancel_subtree(store, run_id, tenant_id=tenant_id)
-        count = 0
-        descendants = (rid for level in reversed(levels) for rid in level if rid != run_id)
-        for rid in descendants:
-            outcome = await self._cancel_one(store, rid, signal=False)
-            if outcome != "terminal" and not frontier_signals:
-                to_signal.append(rid)
-            count += 1
-            if len(outcomes) < _CANCEL_OUTCOME_LIMIT:
-                outcomes.append({"run_id": rid, "outcome": outcome})
-        return count, truncated
+        return await _managed_cancel.cancel_descendants(
+            self, store, run_id, tenant_id, frontier_signals, outcomes, to_signal, pages
+        )
 
     async def _mark_cancel_subtree(
-        self, store: StateStore, run_id: str, *, tenant_id: str | None
+        self,
+        store: StateStore,
+        run_id: str,
+        *,
+        tenant_id: str | None,
+        pages: _managed_cancel.CancelPageReader | None = None,
     ) -> tuple[list[list[str]], bool]:
-        from dendrux.types import Budget
-
-        limit = self._budget.max_subtree_nodes if self._budget else Budget.max_subtree_nodes
-        mark = getattr(store, "mark_cancel_requested", None)
-        children = getattr(store, "get_children_page", None)
-        if not callable(mark) or not callable(children):
-            # Legacy custom stores retain their snapshot API and admission semantics.
-            subtree = await require_store_method(store, "get_subtree")(run_id, tenant_id=tenant_id)
-            levels: list[list[str]] = [[run_id]]
-            nodes = (
-                sorted(
-                    (node for node in subtree.nodes if node.run.id != run_id),
-                    key=lambda node: node.depth,
-                )
-                if subtree is not None
-                else []
-            )
-            by_depth = {0: [run_id]}
-            for node in nodes[: limit - 1]:
-                by_depth.setdefault(node.depth, []).append(node.run.id)
-            levels = [by_depth[depth] for depth in sorted(by_depth)]
-            truncated = len(nodes) + 1 > limit
-        else:
-            levels = [[run_id]]
-            visited = {run_id}
-            frontier = levels[0]
-            truncated = False
-            while frontier:
-                # Wait for creators holding parent FOR SHARE before scanning committed children.
-                marked = await mark(frontier, tenant_id=tenant_id)
-                if marked:
-                    for rid in frontier:
-                        self._task_manager.cancel(rid)
-                if truncated:
-                    break
-                following: list[str] = []
-                after = None
-                while True:
-                    page = await children(
-                        frontier, after=after, limit=MAX_SMALL_PAGE, tenant_id=tenant_id
-                    )
-                    for child in page:
-                        if child in visited:
-                            continue
-                        if len(visited) >= limit:
-                            truncated = True
-                            break
-                        visited.add(child)
-                        following.append(child)
-                    if truncated or len(page) < MAX_SMALL_PAGE:
-                        break
-                    after = page[-1]
-                if following:
-                    levels.append(following)
-                frontier = following
-        if truncated:
-            _codes.log_code(
-                _agent_logger,
-                _codes.CASCADE_TRUNCATED,
-                run_id=run_id,
-                limit=limit,
-                count=sum(len(level) for level in levels),
-            )
-        return levels, truncated
+        return await _managed_cancel.mark_subtree(
+            self, store, run_id, tenant_id=tenant_id, pages=pages
+        )
 
     async def _cancel_one(self, store: StateStore, run_id: str, *, signal: bool = True) -> str:
         """Cancel one run: set the flag, CAS-finalize it if paused, signal in-process."""
@@ -2575,13 +2825,10 @@ class Agent:
         record = await store.get_run(run_id)
         if record is None or not _in_tenant_scope(record, tenant_id):
             raise RunNotFoundError(run_id)
+        await _refuse_managed_child(store, record)
 
         store_request_pause = require_store_method(store, "request_pause")
-        order = [run_id]
-        if cascade:
-            subtree = await require_store_method(store, "get_subtree")(run_id, tenant_id=tenant_id)
-            if subtree is not None:
-                order = _cascade_order(subtree)
+        order = await self._pause_order(store, record, cascade, tenant_id)
 
         affected: list[tuple[str, Any]] = []
         for rid in order:
@@ -2604,6 +2851,21 @@ class Agent:
             status_after=RunStatus(after.status if after is not None else record.status),
             affected=affected,
         )
+
+    async def _pause_order(
+        self, store: StateStore, record: Any, cascade: bool, tenant_id: TenantScope
+    ) -> list[str]:
+        """Runs a pause request flags, deepest first and ``record`` last."""
+        if self._subagents:
+            # A managed root's request reaches its active branch, leaf first (0.7).
+            from dendrux.runtime._pending import managed_branch
+
+            hops, _, _ = await managed_branch(store, record.id, record.tenant_id)
+            return [hop.run_id for hop in reversed(hops)]
+        if not cascade:
+            return [record.id]
+        subtree = await require_store_method(store, "get_subtree")(record.id, tenant_id=tenant_id)
+        return _cascade_order(subtree) if subtree is not None else [record.id]
 
     async def submit_resume(
         self,
@@ -2644,17 +2906,43 @@ class Agent:
         tenant_id = entry_checks(
             self, "submit_resume", tenant_id, default_tenant=UNSCOPED, run_id=run_id
         )
-        from dendrux.errors import PersistenceNotConfiguredError
+
+        self._require_provider()
+        store = await self._require_state_store()
+
+        def submit(agent: Agent, target: str) -> Awaitable[RunResult]:
+            return agent._submit_resume_to(
+                store,
+                target,
+                notifier=notifier,
+                expected_pause_id=expected_pause_id,
+                tenant_explicit=tenant_explicit,
+                manager=self._task_manager,
+            )
+
+        if self._subagents:
+            return await self._routed(
+                "submit_resume", store, run_id, tenant_id, expected_pause_id, notifier, submit
+            )
+        await _require_run_in_scope(store, run_id, tenant_id)
+        return await submit(self, run_id)
+
+    async def _submit_resume_to(
+        self,
+        store: StateStore,
+        run_id: str,
+        *,
+        notifier: LoopNotifier | None,
+        expected_pause_id: str | None,
+        tenant_explicit: bool,
+        manager: Any,
+    ) -> RunResult:
+        """Claim this Agent's PAUSED ``run_id`` and continue it."""
         from dendrux.runtime.runner import resume_paused_claim
         from dendrux.runtime.submit import claim_or_raise
         from dendrux.types import RunStatus
 
         provider = self._require_provider()
-        store = await self._resolve_state_store()
-        if store is None:
-            raise PersistenceNotConfiguredError()
-
-        await _require_run_in_scope(store, run_id, tenant_id)
         skill_session = await continuation(self, store, run_id)
         with skill_session.bind(), await _continuation_projection(self, store, run_id):
             epoch = await claim_or_raise(
@@ -2667,7 +2955,7 @@ class Agent:
             from dendrux.runtime.state import claimed_store
 
             store = claimed_store(store, run_id, epoch)
-            task = self._task_manager.spawn(
+            task = manager.spawn(
                 run_id,
                 resume_paused_claim(
                     run_id,
@@ -2941,21 +3229,7 @@ class Agent:
         )
         _validate_max_delegation_depth(max_delegation_depth)
 
-        if self._guardrails:
-            raise ValueError(
-                "guardrails are not supported with stream() in this version. "
-                "Guardrails require the full response before scanning. "
-                "Use agent.run() instead."
-            )
-
-        provider = self._require_provider()
-
-        if self._output_type is not None:
-            raise NotImplementedError(
-                "Structured output streaming is not supported in this version. "
-                "Use agent.run() for structured output, or create a separate "
-                "Agent without output_type for streaming."
-            )
+        provider = self._stream_provider()
 
         from dendrux.runtime.runner import run_stream as runner_run_stream
 
@@ -2964,7 +3238,7 @@ class Agent:
         if not isinstance(resolved_depth, _UnsetType):
             stream_kwargs["max_delegation_depth"] = resolved_depth
 
-        return runner_run_stream(
+        stream = runner_run_stream(
             self,
             provider=provider,
             user_input=user_input,
@@ -2982,6 +3256,35 @@ class Agent:
             **stream_kwargs,
             **kwargs,
         )
+        if self._subagents:
+            from dendrux.runtime import _managed
+
+            # Subagents run in this task as the root's stream reaches them (0.7).
+            return _managed.start_stream(self, stream, notifier=notifier)
+        return stream
+
+    def _stream_provider(self) -> LLMProvider:
+        if self._guardrails:
+            raise ValueError(
+                "guardrails are not supported with stream() in this version. "
+                "Guardrails require the full response before scanning. "
+                "Use agent.run() instead."
+            )
+        if self._subagents:
+            from dendrux.runtime import _managed
+
+            _managed.require_streamable(self, "stream")
+
+        provider = self._require_provider()
+
+        if self._output_type is not None:
+            raise NotImplementedError(
+                "Structured output streaming is not supported in this version. "
+                "Use agent.run() for structured output, or create a separate "
+                "Agent without output_type for streaming."
+            )
+
+        return provider
 
     def resume_stream(
         self,
@@ -3040,14 +3343,22 @@ class Agent:
             tool_results=tool_results,
             user_input=user_input,
         )
-        if self._guardrails:
-            raise ValueError(
-                "guardrails are not supported with resume_stream() in this version. "
-                "Use agent.resume() instead."
+        provider = self._resume_stream_provider(tool_results, user_input)
+        if self._subagents:
+            from dendrux.runtime import _managed
+
+            _managed.require_streamable(self, "resume_stream")
+            # Routed to the active leaf on first iteration (0.7).
+            return _managed.routed_stream(
+                self,
+                run_id,
+                tenant_id=tenant_id,
+                tool_results=tool_results,
+                user_input=user_input,
+                expected_pause_id=expected_pause_id,
+                notifier=notifier,
+                tenant_explicit=tenant_explicit,
             )
-        provider = self._require_provider()
-        if tool_results is not None and user_input is not None:
-            raise ValueError("Cannot provide both tool_results and user_input to resume_stream().")
 
         from dendrux.runtime.runner import resume_stream as runner_resume_stream
 
@@ -3063,6 +3374,19 @@ class Agent:
             _tenant_explicit=tenant_explicit,
         )
         return self._tenant_checked_stream(stream, run_id, tenant_id)
+
+    def _resume_stream_provider(
+        self, tool_results: list[ToolResult] | None, user_input: UserContent | None
+    ) -> LLMProvider:
+        if self._guardrails:
+            raise ValueError(
+                "guardrails are not supported with resume_stream() in this version. "
+                "Use agent.resume() instead."
+            )
+        provider = self._require_provider()
+        if tool_results is not None and user_input is not None:
+            raise ValueError("Cannot provide both tool_results and user_input to resume_stream().")
+        return provider
 
     def _tenant_checked_stream(
         self, inner: RunStream, run_id: str, tenant_id: TenantScope
@@ -3241,7 +3565,24 @@ class Agent:
             lookups.meta[td.name] = td.meta
             lookups.defs[td.name] = td
 
+        self._add_subagent_lookups(lookups)
         return lookups
+
+    def _add_subagent_lookups(self, lookups: ToolLookups) -> None:
+        """Offer each registered subagent as a generated ``agent``-target call (0.7)."""
+        from dendrux.loops.react import SubagentTool
+        from dendrux.runtime._subagents import subagent_tool_def
+
+        for child in self._subagents:
+            td = subagent_tool_def(child)
+            lookups.fn[td.name] = SubagentTool(child)
+            lookups.target[td.name] = td.target
+            lookups.timeout[td.name] = td.timeout_seconds
+            lookups.explicit_timeout[td.name] = False
+            lookups.max_calls[td.name] = None
+            lookups.parallel[td.name] = False
+            lookups.meta[td.name] = td.meta
+            lookups.defs[td.name] = td
 
     def get_all_tool_defs(self, loop: Loop | None = None) -> list[ToolDef]:
         """Local + discovered MCP + use_skill tool defs, sorted by name.
@@ -3321,10 +3662,7 @@ class Agent:
             seen.add(s.name)
 
         # Apply deny_skills filter
-        loaded: list[Skill] = []
-        for s in all_skills:
-            if s.name not in self._deny_skills:
-                loaded.append(s)
+        loaded = [s for s in all_skills if s.name not in self._deny_skills]
 
         self._loaded_skills = loaded
 
@@ -3365,8 +3703,7 @@ class Agent:
         if session.delivery == "inlined":
             # Inlined skill mode: render bodies verbatim into the prompt.
             parts = [self.prompt, "\n\n## Skills"]
-            for skill in sorted_skills:
-                parts.append(f"\n### Skill: {skill.name}\n\n{skill.body}")
+            parts.extend(f"\n### Skill: {skill.name}\n\n{skill.body}" for skill in sorted_skills)
             rendered = "\n".join(parts)
             self._maybe_warn_inlined_skill_size(rendered)
             return rendered
@@ -3378,8 +3715,7 @@ class Agent:
             "call the `use_skill` tool with the skill name. The skill's "
             "detailed instructions will be returned to you.\n",
         ]
-        for skill in sorted_skills:
-            parts.append(f"- **{skill.name}**: {skill.description}")
+        parts.extend(f"- **{skill.name}**: {skill.description}" for skill in sorted_skills)
 
         return "\n".join(parts)
 

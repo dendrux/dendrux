@@ -20,6 +20,7 @@ from sqlalchemy import event, inspect, text
 from sqlalchemy.exc import DBAPIError
 
 from dendrux.db._schema_check import ensure_schema_current
+from tests._helpers.gates import wait_for_gate
 from tests.integration._migration_schema import migration_schema
 from tests.integration.test_050_t1_r1_migration import PRIOR, _alembic, _indexes, _seed
 
@@ -156,7 +157,7 @@ async def test_writers_proceed_while_r1_builds_its_indexes(pg: Any) -> None:
     event.listen(engine.sync_engine.__class__, "before_cursor_execute", before)
     task = asyncio.create_task(asyncio.to_thread(migrate))
     try:
-        await asyncio.wait_for(reached.wait(), 20)
+        await wait_for_gate(reached, task=task)
         async with engine.connect() as writer:
             writer = await writer.execution_options(isolation_level="AUTOCOMMIT")
             await writer.execute(text("SET lock_timeout = '2s'"))
@@ -426,7 +427,7 @@ async def test_downgrade_race_with_a_shared_key_refuses_without_an_invalid_index
     event.listen(engine.sync_engine.__class__, "before_cursor_execute", before)
     task = asyncio.create_task(asyncio.to_thread(migrate))
     try:
-        await asyncio.wait_for(reached.wait(), 20)
+        await wait_for_gate(reached, task=task)
         async with engine.begin() as conn:  # a 0.5 writer, after the shared-key check
             await conn.execute(
                 text(

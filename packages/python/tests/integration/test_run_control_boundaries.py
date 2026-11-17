@@ -12,6 +12,7 @@ from dendrux import Agent, ApprovalDecision, tool
 from dendrux.loops.base import BaseNotifier
 from dendrux.runtime.persistence import PersistenceRecorder
 from dendrux.types import LLMResponse, RunStatus, ToolCall
+from tests._helpers.gates import wait_for_gate
 from tests._helpers.scripted_provider import ScriptedLLM, tool_call
 from tests._helpers.warnings import warnings_of
 from tests.integration.test_050_t7_integrity import (
@@ -44,7 +45,7 @@ async def test_runner_finalize_cannot_overwrite_running_newer_claim(store, entry
         action = a.run("go") if entry == "run" else consume(a.stream("go"))
     old = asyncio.create_task(action)
     try:
-        await asyncio.wait_for(llm.entered.wait(), 5)
+        await wait_for_gate(llm.entered, task=old)
         if not resumed:
             rid = (await store.list_runs())[0].id
         epoch = await epoch_of(store, rid)
@@ -171,7 +172,7 @@ async def test_fenced_batch_lifecycle_closes_both_sinks(store, monkeypatch, entr
     )
     task = asyncio.create_task(action)
     try:
-        await asyncio.wait_for(provider.entered.wait(), 5)
+        await wait_for_gate(provider.entered, task=task)
         assert await store.sweep_stale_runs(dt.timedelta(0))
     finally:
         provider.gate.set()

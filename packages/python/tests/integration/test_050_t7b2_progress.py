@@ -9,6 +9,7 @@ from sqlalchemy import select, update
 
 from dendrux.db.models import AgentRun
 from dendrux.runtime import context
+from tests._helpers.gates import wait_for_gate
 
 
 @pytest.mark.parametrize(
@@ -71,6 +72,6 @@ async def test_zombie_thread_heartbeat_does_not_keep_pause_alive(store, engine, 
     finally:
         context.reset_delegation_context(token)
     await asyncio.to_thread(captured.run, context.heartbeat)
-    await asyncio.wait_for(done.wait(), 20)
+    await wait_for_gate(done)
     swept = await store.sweep_abandoned_runs(dt.timedelta(days=1))
     assert [r.run_id for r in swept] == ["zombie"], "a zombie tool heartbeat must not renew a pause"

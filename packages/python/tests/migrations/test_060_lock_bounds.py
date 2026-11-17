@@ -9,6 +9,7 @@ from sqlalchemy import event, text
 
 from dendrux.db._schema_check import ensure_schema_current
 from dendrux.db._storage_schema import ADDITIONS
+from tests._helpers.gates import wait_for_gate
 from tests.integration._migration_schema import migration_schema
 from tests.migrations.test_060_activate import HEAD, PRIOR, alembic
 
@@ -64,7 +65,7 @@ async def test_060_each_step_is_lock_bounded(pg_test_url, action, table, column)
         event.listen(engine.sync_engine.__class__, "before_cursor_execute", capture)
         task = asyncio.create_task(asyncio.to_thread(migrate))
         try:
-            await asyncio.wait_for(ready.wait(), 20)
+            await wait_for_gate(ready, task=task)
             async with engine.connect() as blocker:
                 if column == "create":
                     await blocker.execute(

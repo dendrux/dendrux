@@ -15,10 +15,12 @@ from dendrux import Agent, tool
 from dendrux.chat import ChatMessage
 from dendrux.context_blocks import ContextBlock
 from dendrux.llm.mock import MockLLM
+from dendrux.runtime import _run_pending
 from dendrux.runtime.context import get_delegation_context
 from dendrux.store import RunStore
 from dendrux.types import LLMResponse, RunEventType, RunStatus, ToolCall
 from tests._helpers.gated_provider import GatedStreamLLM
+from tests._helpers.gates import wait_for_gate
 
 
 @tool()
@@ -39,7 +41,7 @@ async def test_run_timeout_finalizes_and_reraises(store, monkeypatch):
     notifier = AsyncMock(on_run_started=AsyncMock(), on_run_finished=AsyncMock())
     agent = Agent(strict_tenancy=False, provider=provider, prompt="test", state_store=store)
     task = asyncio.create_task(agent.run("hello", notifier=notifier))
-    await asyncio.wait_for(entered.wait(), 5)
+    await wait_for_gate(entered, task=task)
     run_id = notifier.on_run_started.call_args.args[0]
     with pytest.raises(TimeoutError):
         await asyncio.wait_for(task, 0.01)
@@ -68,7 +70,7 @@ async def test_cancellation_during_startup_preserves_existing_outcomes(store, ex
     provider = MockLLM([])
     agent = Agent(strict_tenancy=False, provider=provider, prompt="test", state_store=store)
     task = asyncio.create_task(agent.run("hello", notifier=notifier))
-    await asyncio.wait_for(entered.wait(), 5)
+    await wait_for_gate(entered, task=task)
     run_id = run_ids[0]
     if existing_status == "success":
         await store.finalize_run(run_id, status="success", answer="winner")
@@ -140,7 +142,7 @@ async def test_timeout_during_error_finalization_cancels_run(store, monkeypatch)
     notifier = AsyncMock()
     agent = Agent(strict_tenancy=False, provider=MockLLM([]), prompt="test", state_store=store)
     task = asyncio.create_task(agent.run("hello", notifier=notifier))
-    await asyncio.wait_for(entered.wait(), 5)
+    await wait_for_gate(entered, task=task)
     with pytest.raises(TimeoutError):
         await asyncio.wait_for(task, 0.01)
     assert (await store.get_run(run_ids[0])).status == "cancelled"
@@ -190,9 +192,9 @@ async def test_repeated_cancellation_waits_for_durable_cleanup(store, monkeypatc
     monkeypatch.setattr(store, "save_run_event", gated_event)
     notifier = AsyncMock()
     task = asyncio.create_task(agent.run("hello", notifier=notifier))
-    await asyncio.wait_for(model_entered.wait(), 5)
+    await wait_for_gate(model_entered, task=task)
     task.cancel("initial cancellation")
-    await asyncio.wait_for(cleanup_entered.wait(), 5)
+    await wait_for_gate(cleanup_entered, task=task)
     for _ in range(2):
         task.cancel("later cancellation")
         await asyncio.sleep(0)
@@ -235,7 +237,7 @@ async def test_cancel_during_finish_hook_does_not_repeat_it(store, monkeypatch, 
         state_store=store,
     )
     task = asyncio.create_task(agent.run("hello", notifier=notifier))
-    await asyncio.wait_for(entered.wait(), 5)
+    await wait_for_gate(entered, task=task)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
@@ -260,7 +262,7 @@ async def test_cancel_during_failure_hook_does_not_finish_lifecycle_again(store)
     notifier = AsyncMock(on_run_failed=failed)
     agent = Agent(strict_tenancy=False, provider=MockLLM([]), prompt="test", state_store=store)
     task = asyncio.create_task(agent.run("hello", notifier=notifier))
-    await asyncio.wait_for(entered.wait(), 5)
+    await wait_for_gate(entered, task=task)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
@@ -295,7 +297,7 @@ async def test_cancellation_keeps_lifecycle_hooks_in_run_task(store, monkeypatch
     notifier = AsyncMock(on_run_started=started, on_run_finished=finish)
     agent = Agent(strict_tenancy=False, provider=provider, prompt="test", state_store=store)
     task = asyncio.create_task(agent.run("hello", notifier=notifier))
-    await asyncio.wait_for(entered.wait(), 5)
+    await wait_for_gate(entered, task=task)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
@@ -431,7 +433,7 @@ async def test_duplicate_stream_preserves_owners_interrupt(store):
 
     task = asyncio.create_task(consume())
     try:
-        await asyncio.wait_for(provider.first_sent.wait(), 5)
+        await wait_for_gate(provider.first_sent, task=task)
         duplicate = agent.stream("hello", idempotency_key="request")
         events = [event async for event in duplicate]
         assert events[-1].type == RunEventType.RUN_ERROR
@@ -448,7 +450,6 @@ async def test_duplicate_stream_preserves_owners_interrupt(store):
 
 
 async def test_cancelled_cached_lookup_never_finalizes_existing_run(store, monkeypatch):
-    from dendrux.runtime import runner
 
     agent = Agent(
         strict_tenancy=False,
@@ -463,7 +464,7 @@ async def test_cancelled_cached_lookup_never_finalizes_existing_run(store, monke
         entered.set()
         await asyncio.Event().wait()
 
-    monkeypatch.setattr(runner, "_build_cached_result", blocked)
+    monkeypatch.setattr(_run_pending, "_build_cached_result", blocked)
     finalize = AsyncMock(wraps=store.finalize_with_event)
     monkeypatch.setattr(store, "finalize_run", finalize)
     monkeypatch.setattr(store, "finalize_with_event", finalize)
@@ -474,7 +475,7 @@ async def test_cancelled_cached_lookup_never_finalizes_existing_run(store, monke
             return [event async for event in stream]
 
     task = asyncio.create_task(consume())
-    await asyncio.wait_for(entered.wait(), 5)
+    await wait_for_gate(entered, task=task)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task

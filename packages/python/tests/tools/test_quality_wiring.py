@@ -30,6 +30,8 @@ def test_make_quality_runs_every_gate_including_crap() -> None:
         "cycles",
         "semgrep",
         "crap",
+        "size",
+        "ruff-ratchet",
     }
 
 
@@ -51,6 +53,8 @@ def test_quality_stamp_rewrites_every_baseline() -> None:
         "import_cycles.py",
         "semgrep_ratchet.py",
         "crap_ratchet.py update",
+        "size_ratchet.py",
+        "ruff_ratchet.py",
     ):
         assert script in recipe
 
@@ -75,6 +79,8 @@ def test_ci_has_a_quality_job_and_an_enforcing_crap_step() -> None:
     quality_runs = "\n".join(s.get("run", "") for s in jobs["quality"]["steps"])
     for script in (
         "cognitive_ratchet.py check",
+        "size_ratchet.py check",
+        "ruff_ratchet.py check",
         "duplicate_ratchet.py check",
         "vulture_ratchet.py check",
         "import_cycles.py check",

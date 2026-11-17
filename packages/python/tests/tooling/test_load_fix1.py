@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 from sqlalchemy.pool import NullPool
 
+from tests._helpers.gates import wait_for_gate
 from tools import load
 from tools import load_monitor as monitor
 
@@ -215,7 +216,7 @@ async def test_loop_survives_unexpected_probe_exception(monkeypatch):
     monkeypatch.setattr(sampler, "sample", sample)
     task = asyncio.create_task(sampler._loop())
     try:
-        await asyncio.wait_for(reached.wait(), 10)
+        await wait_for_gate(reached, task=task)
         assert "sampling" in sampler.unavailable
     finally:
         task.cancel()

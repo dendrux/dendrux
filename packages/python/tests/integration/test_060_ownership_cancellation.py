@@ -1,6 +1,7 @@
 """Ownership survives cancellation between COMMIT and runner setup."""
 
 import asyncio
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import select, update
@@ -12,6 +13,7 @@ from dendrux.llm.mock import MockLLM
 from dendrux.runtime.submit import governance_snapshot
 from dendrux.store import LiveUpdates
 from dendrux.types import ApprovalDecision, LLMResponse, ToolResult
+from tests._helpers.gates import wait_for_gate
 from tests._helpers.paused_runs import _pause
 from tests._helpers.recovery_checkpoint import checkpoint, expire
 from tests.integration.test_060_reclaim_agent import make_agent
@@ -198,7 +200,7 @@ async def test_cancel_ownership_handoff(store, engine, monkeypatch, entry, bound
         monkeypatch.setattr(store, method, returned)
     task = asyncio.create_task(call)
     try:
-        await asyncio.wait_for(entered.wait(), 5)
+        await wait_for_gate(entered, task=task)
         task.cancel()
         await asyncio.sleep(0)
         task.cancel()  # A second cancellation must not discard the committed token.
@@ -235,7 +237,7 @@ async def test_cancel_ownership_handoff(store, engine, monkeypatch, entry, bound
 async def test_reclaim_setup_cancel_is_fenced_and_drained(
     store, engine, monkeypatch, stage, superseded
 ):
-    import dendrux.runtime.runner as runner
+    import dendrux.runtime._run_resume_prep as resume_prep
 
     agent = make_agent(store)
     item = await checkpoint(agent, store, engine)
@@ -243,7 +245,10 @@ async def test_reclaim_setup_cancel_is_fenced_and_drained(
     if stage == "history":
         target, name = store, "conversation_traces"
     else:
-        target, name = runner, "_resume_session" if stage == "session" else "_read_resume_state"
+        target, name = (
+            resume_prep,
+            "_resume_session" if stage == "session" else "_read_resume_state",
+        )
     original = getattr(target, name)
 
     async def gate(*args, **kwargs):
@@ -254,7 +259,7 @@ async def test_reclaim_setup_cancel_is_fenced_and_drained(
     monkeypatch.setattr(target, name, gate)
     task = asyncio.create_task(agent.reclaim(item.run_id, tenant_id="tenant", item=item))
     try:
-        await asyncio.wait_for(entered.wait(), 5)
+        await wait_for_gate(entered, task=task)
         claimed_epoch = (await store.get_run(item.run_id)).claim_epoch
         if superseded:
             next_item = await expire(store, engine, item.run_id)
@@ -300,7 +305,7 @@ async def test_parallel_cancel_at_handoff_has_one_finalize(store, engine, monkey
     bus.enabled = True
     task = asyncio.create_task(call)
     try:
-        await asyncio.wait_for(bus.entered.wait(), 5)
+        await wait_for_gate(bus.entered, task=task)
         start = asyncio.Event()
 
         from dendrux.runtime.runner import _persist_task_cancellation
@@ -316,7 +321,7 @@ async def test_parallel_cancel_at_handoff_has_one_finalize(store, engine, monkey
             entered += 1
             if entered == 9:
                 ready.set()
-            await asyncio.wait_for(ready.wait(), 5)
+            await wait_for_gate(ready)
             result = await original(rid, claim_epoch=claim_epoch, **kwargs)
             outcomes.append(result)
             return result
@@ -367,7 +372,7 @@ async def test_repeated_cancel_during_exact_epoch_cleanup(store, engine, monkeyp
     task = asyncio.create_task(call)
     observer = asyncio.create_task(cleanup_entered.wait())
     try:
-        await asyncio.wait_for(bus.entered.wait(), 5)
+        await wait_for_gate(bus.entered, task=task)
         task.cancel()
         done, _ = await asyncio.wait(
             {observer, task}, timeout=5, return_when=asyncio.FIRST_COMPLETED
@@ -431,7 +436,7 @@ async def test_ownership_handoff_query_count(
             "submit_tool_results": 45,
             "submit_input": 41,
             "submit_approval": 51 if engine.dialect.name == "postgresql" else 53,
-            "reclaim": 30,  # +1: scoped blocked-content lookup (R1.10, task 7 ruling)
+            "reclaim": 33,  # +3: pre-claim format check primary-key reads.
         }[entry]
     )
     record_property("statements", len(statements))
@@ -459,7 +464,7 @@ async def test_cancelled_idempotent_create_does_not_own_existing_run(store, monk
         _create_runtime_run(store, ReActLoop(), generate_ulid(), "handoff", **kwargs)
     )
     try:
-        await asyncio.wait_for(entered.wait(), 5)
+        await wait_for_gate(entered, task=task)
         task.cancel()
         release.set()
         with pytest.raises(asyncio.CancelledError):
@@ -480,7 +485,7 @@ async def test_handoff_cancellation_cannot_finalize_newer_epoch(store, engine, m
     bus.enabled = True
     task = asyncio.create_task(call)
     try:
-        await asyncio.wait_for(bus.entered.wait(), 5)
+        await wait_for_gate(bus.entered, task=task)
         if run_id is None:
             async with engine.connect() as conn:
                 run_id = (
@@ -517,7 +522,6 @@ async def test_handoff_cancellation_cannot_finalize_newer_epoch(store, engine, m
 
 @pytest.mark.parametrize("entry", ENTRIES[2:7])
 async def test_cancel_during_postclaim_governance_is_terminal(store, engine, monkeypatch, entry):
-    import dendrux.runtime.runner as runner
     import dendrux.runtime.submit as submit
 
     agent, call, run_id, epoch, calls = await invocation(entry, store, engine)
@@ -528,12 +532,10 @@ async def test_cancel_during_postclaim_governance_is_terminal(store, engine, mon
         entered.set()
         await asyncio.Event().wait()
 
-    monkeypatch.setattr(
-        runner if entry.startswith("resume") else submit, "report_governance_change", report
-    )
+    monkeypatch.setattr(submit, "report_governance_change", report)
     task = asyncio.create_task(call)
     try:
-        await asyncio.wait_for(entered.wait(), 5)
+        await wait_for_gate(entered, task=task)
         task.cancel()
         await asyncio.sleep(0)
         task.cancel()
@@ -555,13 +557,13 @@ async def test_cancel_during_reclaim_error_cleanup_never_loses_epoch(
     store, engine, monkeypatch, stage
 ):
     import dendrux.runtime._reclaim as reclaim
-    import dendrux.runtime.runner as runner
+    import dendrux.runtime._run_resume_prep as resume_prep
     from dendrux.errors import RunNotReclaimableError
 
     agent = make_agent(store)
     item = await checkpoint(agent, store, engine)
     target, name = (
-        (reclaim, "rebuild_pause") if stage == "rebuild_error" else (runner, "_resume_session")
+        (reclaim, "rebuild_pause") if stage == "rebuild_error" else (resume_prep, "_resume_session")
     )
 
     async def failed(*args, **kwargs):
@@ -569,6 +571,7 @@ async def test_cancel_during_reclaim_error_cleanup_never_loses_epoch(
             raise RunNotReclaimableError(item.run_id, "history_too_large")
         raise ValueError("invalid setup")
 
+    failed = AsyncMock(wraps=failed)
     monkeypatch.setattr(target, name, failed)
     entered, release = asyncio.Event(), asyncio.Event()
     method = "finalize_with_event" if stage == "rebuild_error" else "release_run_claim"
@@ -586,7 +589,7 @@ async def test_cancel_during_reclaim_error_cleanup_never_loses_epoch(
     monkeypatch.setattr(store, method, cleanup)
     task = asyncio.create_task(agent.reclaim(item.run_id, tenant_id="tenant", item=item))
     try:
-        await asyncio.wait_for(entered.wait(), 5)
+        await wait_for_gate(entered, task=task)
         task.cancel()
         await asyncio.sleep(0)
         task.cancel()
@@ -594,6 +597,7 @@ async def test_cancel_during_reclaim_error_cleanup_never_loses_epoch(
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(task, 10)
         row = await store.get_run(item.run_id)
+        failed.assert_awaited_once()
         assert row.status in ("error", "cancelled")
         assert row.claim_epoch == item.claim_epoch + 1
         assert agent.provider._call_count == 0

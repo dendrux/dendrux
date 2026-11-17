@@ -25,10 +25,26 @@ PRIVATE = "CHAIN-PRIVATE-SENTINEL-765"
 
 
 def test_status_writer_inventory():
-    tree = ast.parse(inspect.getsource(sql_base))
+    modules = dict.fromkeys(
+        (
+            sql_base,
+            inspect.getmodule(sql_base._status_values),
+            inspect.getmodule(sql_base._SweepScan.collect),
+            inspect.getmodule(sql_base.SQLStateStore._write_tx),
+            inspect.getmodule(sql_base.SQLStateStore._insert_trace),
+            inspect.getmodule(sql_base.SQLStateStore.create_run),
+            inspect.getmodule(sql_base.SQLStateStore._bind_admit),
+            inspect.getmodule(sql_base.SQLStateStore._cas_finalize),
+            inspect.getmodule(sql_base.SQLStateStore.try_pause_run),
+            inspect.getmodule(sql_base.SQLStateStore._cancel_claim_release),
+            inspect.getmodule(sql_base.SQLStateStore.get_lease_expired),
+            inspect.getmodule(sql_base.SQLStateStore._scan_abandoned_runs),
+        )
+    )
+    trees = [ast.parse(inspect.getsource(module)) for module in modules]
     writers = {}
     direct = []
-    for function in ast.walk(tree):
+    for function in (node for tree in trees for node in ast.walk(tree)):
         if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
         # Nested retry closures belong to the surrounding public operation.
@@ -36,7 +52,14 @@ def test_status_writer_inventory():
             continue
         for node in ast.walk(function):
             if isinstance(node, ast.Call):
-                if isinstance(node.func, ast.Name) and node.func.id == "_status_values":
+                if (
+                    isinstance(node.func, ast.Name)
+                    and node.func.id == "_status_values"
+                    or isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "_sql_support"
+                    and node.func.attr == "_status_values"
+                ):
                     writers[function.name] = writers.get(function.name, 0) + 1
                 if (
                     isinstance(node.func, ast.Attribute)
@@ -59,6 +82,9 @@ def test_status_writer_inventory():
     assert not direct, f"status writes must use the transition helper: {direct}"
     assert writers == {
         "create_run": 1,
+        # Managed subagents (0.7): the atomic bind parks the parent and creates the child.
+        "_bind_park_parent": 1,
+        "_bind_child": 1,
         "finalize_run": 1,
         "_cas_finalize": 1,
         "try_pause_run": 1,
@@ -67,7 +93,8 @@ def test_status_writer_inventory():
         "claim_paused_run": 2,
         "submit_and_claim": 1,
         "release_run_claim": 1,
-        "_sweep_runs": 1,
+        # Sweep CAS per row (0.7: split out of _sweep_runs with the managed-wait recheck).
+        "sweep_row": 1,
         "_scan_expired_runs": 1,
         "reclaim_run": 1,
     }, f"audit every status writer: {writers}"

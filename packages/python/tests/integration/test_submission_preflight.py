@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from dendrux.errors import InvalidToolResultError
+from dendrux.runtime import _run_images
 from dendrux.types import ToolResult
 from tests.integration.test_tenant_run_control import _pause
 
@@ -53,13 +54,12 @@ async def test_preclaim_name_validation_precedes_transaction(store, monkeypatch)
 
 @pytest.mark.parametrize("stream", [False, True])
 async def test_invalid_results_precede_media_ingestion(store, monkeypatch, stream):
-    from dendrux.runtime import runner
 
     paused = await _pause("client", store, "A")
     raw = await store.get_pause_state(paused.run_id)
     call = raw["pending_tool_calls"][0]
     ingest = AsyncMock(side_effect=AssertionError("media stored before validating results"))
-    monkeypatch.setattr(runner, "_ingest_resume_images", ingest)
+    monkeypatch.setattr(_run_images, "_ingest_resume_images", ingest)
     result = ToolResult(name="wrong", call_id=call["id"], payload='"ok"', images=(object(),))
     try:
         with pytest.raises(InvalidToolResultError):

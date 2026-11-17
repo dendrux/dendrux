@@ -342,7 +342,9 @@ MUTANTS = {
             "test_a_reclaim_is_refused_for_the_wrong_tenant_agent_or_epoch",
             "test_a_reopened_store_reclaims_what_the_old_one_marked",
             "test_a_run_past_its_reclaim_limit_is_finalised",
+            "test_a_running_single_call_run_is_never_reclaimed",
             "test_a_stale_epoch_cannot_checkpoint_or_link",
+            "test_a_stale_single_call_run_is_finalised_never_marked_reclaimable",
             "test_a_stale_epoch_cannot_consume_a_submission",
             "test_a_submission_is_consumed_exactly_once",
             "test_a_trace_clash_after_reclaim_is_still_a_conflict",
@@ -350,10 +352,46 @@ MUTANTS = {
             "test_an_oversized_checkpoint_is_refused_and_writes_nothing",
             "test_an_unpersistable_checkpoint_is_refused_before_any_write",
             "test_marking_is_repeatable_until_the_run_is_reclaimed",
+            "test_managed_child_reclaim_refuses_before_any_mutation",
             "test_progress_resets_recovery_streak_in_its_checkpoint",
             "test_reused_observation_and_duplicate_checkpoint_preserve_streak",
             "test_seeds_rewrites_and_conversation_pages",
         },
+        PLAIN_INJECTOR,
+    ),
+    "a running SingleCall run is claimed": (
+        mutant("""
+        async def reclaim_run(self, run_id, **kw):
+            record = await self.get_run(run_id)
+            state = await self.get_loop_state(run_id) or {}
+            if record.status == "running" and state.get("loop") == "single_call":
+                return ClaimResult(record.claim_epoch + 1, 2, state, None)
+            return await super().reclaim_run(run_id, **kw)
+        """),
+        "single_call",
+        {"test_a_running_single_call_run_is_never_reclaimed"},
+        PLAIN_INJECTOR,
+    ),
+    "a SingleCall checkpoint is saved as ReAct": (
+        mutant("""
+        async def checkpoint_step(self, run_id, *, loop_state, **kw):
+            if loop_state.get("loop") == "single_call":
+                loop_state = {**loop_state, "loop": "react"}
+            return await super().checkpoint_step(run_id, loop_state=loop_state, **kw)
+        """),
+        "single_call",
+        {"test_a_stale_single_call_run_is_finalised_never_marked_reclaimable"},
+        PLAIN_INJECTOR,
+    ),
+    "a bound child's loop marker is defaulted to ReAct": (
+        mutant("""
+        async def bind_managed_child(self, request):
+            from dataclasses import replace
+            state = {**request.child_loop_state, "loop": "react"}
+            return await super().bind_managed_child(replace(request, child_loop_state=state))
+        """),
+        "loop_marker",
+        {"test_managed_bind_keeps_the_child_loop_marker"},
         PLAIN_INJECTOR,
     ),
     "a classifier that knows connection loss only by the invalidated flag": (
@@ -445,6 +483,7 @@ class Injector(SqlFaultInjector):
         super().arm(store, point, kind=kind, **kw)
 """
 CRASH_FUNCTIONS = {
+    "test_managed_bind_is_all_or_nothing",
     "test_a_failed_write_is_repeated_safely_with_the_same_identity",
     "test_a_one_shot_failure_is_absorbed_or_retried_into_exactly_one_write",
     "test_finalize_that_fails_around_commit_leaves_one_final_state",

@@ -171,7 +171,7 @@ class FollowEnd:
     cursor: int | None
 
 
-FollowItem: TypeAlias = Union["StoredEvent", FollowHeartbeat, FollowEnd]  # noqa: UP007
+FollowItem: TypeAlias = Union["StoredEvent", FollowHeartbeat, FollowEnd]
 
 
 @dataclass(frozen=True, slots=True)
@@ -474,7 +474,7 @@ class _Coordinator:
     def on_gap(self) -> None:
         now = self._now()
         for run in self.runs.values():
-            self.request(run, "gap", now + random.uniform(0, run.params.poll_interval_s))
+            self.request(run, "gap", now + random.uniform(0, run.params.poll_interval_s))  # noqa: S311 - Non-security gap recovery polling jitter.
 
     def _healthy(self) -> bool:
         live = self._listening_live()
@@ -925,8 +925,8 @@ class _Coordinator:
     async def _read_events(
         self, runs: list[_WatchedRun], snapshots: dict[_WatchedRun, _Snapshot]
     ) -> None:
-        limit = max(1, min(min(r.params.batch for r in runs), MAX_LIMIT_PER_RUN))
-        limit = max(1, min(limit, MAX_ROWS_PER_READ // len(runs)))
+        limit = min(r.params.batch for r in runs)
+        limit = max(1, min(limit, MAX_LIMIT_PER_RUN, MAX_ROWS_PER_READ // len(runs)))
         rows, failed = await self._fetch_events(runs, limit)
         self._suspects.note_read(bool(rows), self._now())
         self._read_failure(failed, status=False)
@@ -1136,7 +1136,7 @@ class _Coordinator:
         earliest = now + interval * (1 - HEALTHY_JITTER)
         latest = now + interval * (1 + HEALTHY_JITTER)
         if not earliest <= deadline <= latest:
-            deadline = random.uniform(earliest, latest)
+            deadline = random.uniform(earliest, latest)  # noqa: S311 - Non-security healthy polling jitter.
             self._remember_window(interval, deadline)
         return deadline
 

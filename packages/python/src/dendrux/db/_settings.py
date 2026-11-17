@@ -27,7 +27,7 @@ def put_setting(conn: Connection, key: str, value: str, *, overwrite: bool = Tru
     )
     conn.execute(
         text(
-            "INSERT INTO dendrux_settings (key, value, updated_at) "
+            "INSERT INTO dendrux_settings (key, value, updated_at) "  # noqa: S608 - Allow-list: action's two fixed ON CONFLICT clauses; values are bound.
             f"VALUES (:key, :value, CURRENT_TIMESTAMP) ON CONFLICT (key) {action}"
         ),
         {"key": key, "value": value},

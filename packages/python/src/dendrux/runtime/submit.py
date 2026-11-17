@@ -44,6 +44,7 @@ from dendrux.types import (
     ImagePart,
     ImageRef,
     InputValidationError,
+    Limits,
     PauseState,
     RunStatus,
     TextPart,
@@ -156,7 +157,23 @@ async def validate_tool_results(
     if parts:
         raise _invalid_tool_result(run_id, "; ".join(parts))
     validate_result_names(run_id, pause_state, results)
+    refuse_managed_results(run_id, pause_state.pending_targets, results)
     return pause_state
+
+
+def refuse_managed_results(
+    run_id: str, pending_targets: Mapping[str, Any] | None, results: list[ToolResult]
+) -> None:
+    """Refuse an external result for a generated subagent call (0.7).
+
+    Only the bound child run reports a subagent call. This holds even for a
+    client pause older code persisted for it (its target stays ``agent``).
+    """
+    from dendrux.errors import ManagedResultRefusedError
+
+    targets = pending_targets or {}
+    if any(targets.get(result.call_id) == ToolTarget.AGENT.value for result in results):
+        raise ManagedResultRefusedError(run_id)
 
 
 def validate_result_names(run_id: str, pause: PauseState, results: list[ToolResult]) -> None:
@@ -183,8 +200,13 @@ def pause_validator(
     *,
     agent_name: str | None = None,
     call_results: list[ToolResult] | None = None,
+    client_results: bool = False,
 ) -> Callable[[dict[str, Any]], None]:
-    """Validation performed while the claim transaction holds the run row."""
+    """Validation performed while the claim transaction holds the run row.
+
+    ``client_results``: ``call_results`` were supplied by the caller (not runtime
+    denials), so none may answer a generated subagent call.
+    """
 
     from dendrux.types import _validate_identifier
 
@@ -208,15 +230,24 @@ def pause_validator(
         if agent_name is not None and current.get("agent_name") not in (None, agent_name):
             raise ValueError("Agent name mismatch on resume")
         if call_results is not None:
-            pending = {call["id"]: call["name"] for call in current.get("pending_tool_calls", [])}
-            if (
-                len(pending) != len(call_results)
-                or len({r.call_id for r in call_results}) != len(call_results)
-                or any(pending.get(result.call_id) != result.name for result in call_results)
-            ):
-                raise _invalid_tool_result(run_id, "tool results do not match pending calls")
+            _check_call_results(run_id, current, call_results, client_results=client_results)
 
     return validate
+
+
+def _check_call_results(
+    run_id: str, current: dict[str, Any], call_results: list[ToolResult], *, client_results: bool
+) -> None:
+    """Results answer exactly the pending calls; caller results never a subagent call."""
+    pending = {call["id"]: call["name"] for call in current.get("pending_tool_calls", [])}
+    if (
+        len(pending) != len(call_results)
+        or len({r.call_id for r in call_results}) != len(call_results)
+        or any(pending.get(result.call_id) != result.name for result in call_results)
+    ):
+        raise _invalid_tool_result(run_id, "tool results do not match pending calls")
+    if client_results:
+        refuse_managed_results(run_id, current.get("pending_targets"), call_results)
 
 
 _RESUME_CLAIM_MESSAGE = (
@@ -251,9 +282,7 @@ _CLAIM_FAILURES: dict[str | tuple[str, str], _ClaimFailureMapping] = {
     "claimed": _ClaimFailureMapping(
         lambda run_id, current, expected: RunAlreadyClaimedError(run_id)
     ),
-    "pause": _ClaimFailureMapping(
-        lambda run_id, current, expected: PauseStatusMismatchError(run_id, current, expected)
-    ),
+    "pause": _ClaimFailureMapping(PauseStatusMismatchError),
     "not_paused": _ClaimFailureMapping(
         lambda run_id, current, expected: RunNotPausedError(run_id, current)
     ),
@@ -369,6 +398,8 @@ class _ClaimRequest:
     raw: dict[str, Any]
     statuses: tuple[str, ...]
     generation: str | None
+    explicit: bool = True
+    """The caller named the generation; False when it was taken from the read pause."""
 
 
 def _pause_generation(raw: dict[str, Any], expected_pause_id: str | None) -> str | None:
@@ -381,10 +412,22 @@ def _claim_request(
     expected_pause_id: str | None,
     *,
     fallbacks: tuple[str, ...] = (),
+    caller_token: bool | None = None,
 ) -> _ClaimRequest:
+    """``caller_token``: whether the caller supplied the token (default: it was given
+    when one is passed). A token the runtime pinned from the validated pause is not
+    the caller's."""
     return _ClaimRequest(
-        raw, (expected_status, *fallbacks), _pause_generation(raw, expected_pause_id)
+        raw,
+        (expected_status, *fallbacks),
+        _pause_generation(raw, expected_pause_id),
+        explicit=_caller_supplied(expected_pause_id, caller_token),
     )
+
+
+def _caller_supplied(expected_pause_id: str | None, caller_token: bool | None) -> bool:
+    """Whether the caller gave the token (default: one was passed)."""
+    return expected_pause_id is not None if caller_token is None else caller_token
 
 
 async def _claim_submission(
@@ -409,19 +452,17 @@ async def _claim_submission(
 
     payload, block = await _project_submission(run_id, payload)
     blocked = block is not None
-    descriptor = None
-    if (
-        request.raw.get("schema_version") == 2
-        and checkpointing
-        and (payload is not None or submit_empty)
-    ):
-        payload = dict(payload or {})
-        if approval is not None:
-            payload["approved"] = approval
-        checkpoint = (
-            checkpoint if checkpoint is not None else await store.get_loop_state(run_id) or {}
-        )
-        descriptor = submission_descriptor(request.raw, checkpoint, payload, status)
+    descriptor, payload = await _described_submission(
+        store,
+        run_id,
+        request,
+        status,
+        payload,
+        checkpointing=checkpointing,
+        submit_empty=submit_empty,
+        approval=approval,
+        checkpoint=checkpoint,
+    )
     operation = _claim_operation(
         store, run_id, status, validate, payload, descriptor, blob_refs, blob_refs_scope
     )
@@ -434,6 +475,35 @@ async def _claim_submission(
 
         _remember_claim(store, run_id, block)
     return won, descriptor, payload
+
+
+async def _described_submission(
+    store: StateStore,
+    run_id: str,
+    request: _ClaimRequest,
+    status: str,
+    payload: dict[str, Any] | None,
+    *,
+    checkpointing: bool,
+    submit_empty: bool,
+    approval: bool | None,
+    checkpoint: dict[str, Any] | None,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """A format-2 claim's submission descriptor and payload; refuses a tokenless
+    continuation of a managed run (0.7)."""
+    format_two = request.raw.get("schema_version") == 2 and checkpointing
+    described = format_two and (payload is not None or submit_empty)
+    tokenless = format_two and not request.explicit and request.raw.get("pause_id") is not None
+    if (described or tokenless) and checkpoint is None:
+        checkpoint = await store.get_loop_state(run_id) or {}
+    if tokenless:
+        _refuse_tokenless_managed(run_id, checkpoint)
+    if not described:
+        return None, payload
+    payload = dict(payload or {})
+    if approval is not None:
+        payload["approved"] = approval
+    return submission_descriptor(request.raw, checkpoint or {}, payload, status), payload
 
 
 def _claim_operation(
@@ -544,6 +614,132 @@ def _submission_payload(raw: dict[str, Any]) -> dict[str, Any]:
     return envelope["payload"]
 
 
+def managed_submission_descriptor(wait: PauseState, call_id: str) -> dict[str, Any]:
+    """The format-2 submission descriptor of a managed adoption (0.7).
+
+    A v3 managed wait still uses the closed format-2 envelope: kind
+    ``tool_results`` for exactly the bound call, at the wait's private generation.
+    """
+    from dendrux.types import generate_ulid
+
+    return {
+        "submission_id": generate_ulid(),
+        "kind": "tool_results",
+        "pause_id": wait.pause_id,
+        "payload_ref": {"pause_data_key": "submission"},
+        "call_ids": [call_id],
+        "reserved_order_index": wait.trace_order_offset,
+    }
+
+
+def _managed_adoption_validator(
+    run_id: str, pause_id: str, call_id: str, child_run_id: str
+) -> Callable[[dict[str, Any]], None]:
+    """Inside the claim: the same v3 generation, still bound to this call and child."""
+    from dendrux.errors import ManagedStateError
+
+    def validate(current: dict[str, Any]) -> None:
+        wait = PauseState.from_managed_dict(current, run_id=run_id)
+        binding = wait.managed_wait
+        if (
+            wait.pause_id != pause_id
+            or binding is None
+            or binding.tool_call_id != call_id
+            or binding.child_run_id != child_run_id
+        ):
+            raise ManagedStateError(reason="binding_conflict", run_id=run_id)
+
+    return validate
+
+
+async def _admit_managed_parent(agent: Agent, store: StateStore, run_id: str) -> dict[str, Any]:
+    """The parent's current definition may accept the report: name, governance, skills.
+
+    The same admission an ordinary reclaim or submission applies, before any
+    claim or write. The saved evidence (run governance snapshot, checkpoint
+    skill pins) changes only under a claim, and the claim below is a CAS on the
+    wait generation read here, so no other claim can slip between check and use.
+    Returns the saved governance view for the ``warn`` report.
+    """
+    from dendrux.errors import GovernanceMismatchError, RunNotFoundError, RunNotReclaimableError
+    from dendrux.skills._session import SkillSession
+
+    record = await store.get_run(run_id)
+    if record is None:
+        raise RunNotFoundError(run_id)
+    if record.agent_name != agent.name:
+        raise RunNotReclaimableError(run_id, "agent_mismatch")
+    saved = {GOVERNANCE_KEY: (record.meta or {}).get(GOVERNANCE_KEY)}
+    if saved[GOVERNANCE_KEY] is None:
+        saved.pop(GOVERNANCE_KEY)
+    change = _governance_change(agent, saved)
+    if change is not None and agent._on_governance_change == "raise":
+        import logging
+
+        _codes.log_code(logging.getLogger(__name__), _codes.GOVERNANCE_MISMATCH, run_id=run_id)
+        raise GovernanceMismatchError(run_id, **change)
+    state = await store.get_loop_state(run_id) or {}
+    pins = {s.name: s.digest for s in SkillSession.prepare(agent).available.values()}
+    if ((state.get("skills") or {}).get("pins", {})) != pins:
+        raise RunNotReclaimableError(run_id, "skill_mismatch")
+    return saved
+
+
+async def claim_managed_adoption(
+    store: StateStore,
+    run_id: str,
+    *,
+    agent: Agent,
+    call_id: str,
+    child_run_id: str,
+    result: ToolResult,
+    blocked: str | None = None,
+) -> ClaimResult | bool:
+    """Durably accept a child's report into its waiting parent and claim the parent.
+
+    ``submit_and_claim`` on the parent's private managed-wait generation: the
+    report and the parent's new epoch commit together. Returns False when the
+    parent is no longer at that wait (another caller adopted, or it moved on).
+    The report is consumed only by the managed adoption, never by
+    ``consume_submission``.
+    """
+    from functools import partial
+
+    from dendrux.runtime.durability import _ownership_handoff
+
+    raw = await store.get_pause_state(run_id)
+    if raw is None or raw.get("schema_version") != 3:
+        return False
+    governance = await _admit_managed_parent(agent, store, run_id)
+    wait = PauseState.from_managed_dict(raw, run_id=run_id)
+    assert wait.pause_id is not None
+    descriptor = managed_submission_descriptor(wait, call_id)
+    submitted: dict[str, Any] = {"submitted_tool_results": serialize_tool_results([result])}
+    if blocked is not None:
+        # Safe guardrail text only; recovery reapplies the stop, never the policy.
+        submitted["managed_blocked"] = True
+    operation = partial(
+        store.submit_and_claim,
+        run_id,
+        expected_status=RunStatus.PAUSED.value,
+        submitted_data=submitted,
+        submission=descriptor,
+        validate=_managed_adoption_validator(run_id, wait.pause_id, call_id, child_run_id),
+    )
+    from dendrux.runtime._continuation_guardrails import _submission_evidence
+
+    # A blocked report marks the parent in its claim transaction, as a blocked submission does.
+    async with _submission_evidence(store, run_id, blocked is not None):
+        won: ClaimResult | bool = await _ownership_handoff(
+            store, operation, partial(_cancel_claim, store, run_id), run_id=run_id
+        )
+    if won and not isinstance(won, bool):
+        from dendrux.runtime.state import claimed_store
+
+        await report_governance_change(agent, claimed_store(store, run_id, won), run_id, governance)
+    return won
+
+
 def submitted_view(raw: dict[str, Any]) -> dict[str, Any]:
     """Project a validated v2 envelope for legacy parsers without mutating storage."""
     return {**raw, **_submission_payload(raw)} if raw.get("schema_version") == 2 else raw
@@ -562,8 +758,13 @@ async def claim_or_raise(
     validate: Callable[[dict[str, Any]], None] | None = None,
     blob_refs: Sequence[BlobEdge] | None = None,
     blob_refs_scope: str | None = None,
+    caller_token: bool | None = None,
 ) -> ClaimResult | int:
     """Perform a status preflight, then persist-first handoff + CAS claim.
+
+    ``caller_token=False`` marks an ``expected_pause_id`` the runtime pinned from
+    the pause it validated (not supplied by the caller): the claim still compares
+    it, and a managed run then refuses the claim for its missing token.
 
     The preflight reads the current status before attempting the CAS so
     that a never-paused running row does not get misclassified as a
@@ -602,7 +803,9 @@ async def claim_or_raise(
             store=store,
             run_id=run_id,
         )
-    request = _claim_request(raw, expected_status.value, expected_pause_id)
+    request = _claim_request(
+        raw, expected_status.value, expected_pause_id, caller_token=caller_token
+    )
     validate = submission_validator(
         run_id,
         raw,
@@ -610,6 +813,7 @@ async def claim_or_raise(
         expected_pause_id=request.generation,
         call_results=call_results,
         extra=validate,
+        client_results=expected_status == RunStatus.WAITING_CLIENT_TOOL,
     )
 
     from dendrux.runtime._capabilities import capabilities
@@ -749,7 +953,7 @@ async def release_claim(
         try:
             if await _release_with_event(store, release, run_id, status, epoch, event):
                 return True
-        except (Exception, asyncio.CancelledError):
+        except (Exception, asyncio.CancelledError):  # noqa: S110 - Claim-release failure logs PERSISTENCE_ERROR immediately below.
             pass
         _codes.log_code(logging.getLogger(__name__), _codes.PERSISTENCE_ERROR, run_id=run_id)
         return False
@@ -1204,20 +1408,16 @@ def _invalid_json_constant(value: str) -> NoReturn:
 
 
 def _governed_limits(limits: Any) -> dict[str, Any]:
-    from dendrux.types import Limits
-
+    # Default recovery and managed bounds preserve older governance snapshots;
+    # overrides remain governed.
     defaults = Limits()
-    recovery_bounds = {
-        "max_pending_calls",
-        "max_rebuild_bytes",
-        "max_rebuild_rows",
-    }
-    # Default recovery bounds preserve older governance snapshots; overrides remain governed.
+    defaulted_bounds = {"max_pending_calls", "max_rebuild_bytes", "max_rebuild_rows"}
+    defaulted_bounds.update({"max_managed_runs", "max_subagent_definitions"})
     return {
         key: value
         for key, value in asdict(limits).items()
         if key != "max_pause_summary_bytes"
-        and (key not in recovery_bounds or value != getattr(defaults, key))
+        and (key not in defaulted_bounds or value != getattr(defaults, key))
     }
 
 
@@ -1311,6 +1511,7 @@ def submission_validator(
     expected_pause_id: str | None = None,
     call_results: list[ToolResult] | None = None,
     extra: Callable[[dict[str, Any]], None] | None = None,
+    client_results: bool = False,
 ) -> Callable[[dict[str, Any]], None]:
     """Validate before claiming, then repeat under the claim transaction's lock."""
     from dendrux.errors import GovernanceMismatchError
@@ -1318,7 +1519,11 @@ def submission_validator(
     # Even an optional-token client is bound to the generation we observed.
     generation = _pause_generation(raw, expected_pause_id)
     base = pause_validator(
-        run_id, generation, agent_name=agent.name if agent else None, call_results=call_results
+        run_id,
+        generation,
+        agent_name=agent.name if agent else None,
+        call_results=call_results,
+        client_results=client_results,
     )
 
     def validate(current: dict[str, Any]) -> None:
@@ -1398,6 +1603,24 @@ def require_pause_id(
         raise _pause_id_required()
     if run_id is not None:
         pause_validator(run_id, expected)({"pause_id": pause_id})
+
+
+def _refuse_tokenless_managed(run_id: str, checkpoint: dict[str, Any] | None) -> None:
+    """A managed run's pause is claimed only with its explicit token (0.7).
+
+    Decided at claim admission from the run's persisted managed identity, not
+    the caller's Agent: an Agent rebuilt without registrations cannot apply
+    the ordinary token rule to a managed root or child.
+    """
+    from dendrux.runtime.state import MANAGED_HEADER_KEY
+
+    if (checkpoint or {}).get(MANAGED_HEADER_KEY) is not None:
+        import logging
+
+        _codes.log_code(
+            logging.getLogger(__name__), _codes.MANAGED_PAUSE_ID_REQUIRED, run_id=run_id
+        )
+        raise _pause_id_required()
 
 
 def _client_json_payload(payload: str) -> str:

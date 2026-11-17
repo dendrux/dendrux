@@ -11,6 +11,7 @@ from dendrux.errors import ProviderTimeoutError
 from dendrux.runtime.persistence import PersistenceRecorder
 from dendrux.runtime.runner import _persist_task_cancellation
 from dendrux.types import LLMResponse, UsageStats
+from tests._helpers.gates import wait_for_gate
 from tests._helpers.scripted_provider import tool_call
 from tests.integration.test_050_t7_integrity import agent, consume, result_for
 from tests.integration.test_050_t7b_wiring import FailingProvider
@@ -168,7 +169,7 @@ async def test_postgres_concurrent_meta_patches_preserve_error_info(store, engin
 
     monkeypatch.setattr(AsyncSession, "execute", execute)
     patch = asyncio.create_task(store.update_run_meta("meta-race", {"dendrux.patch": 1}))
-    await asyncio.wait_for(entered.wait(), 5)
+    await wait_for_gate(entered, task=patch)
     finish = asyncio.create_task(
         store.finalize_run(
             "meta-race",
@@ -278,7 +279,7 @@ async def test_public_cancel_reports_failed_durable_write(store, monkeypatch, en
         else a.submit_tool_results(pause.run_id, [result_for(pause)])
     )
     task = asyncio.create_task(action)
-    await asyncio.wait_for(llm.entered.wait(), 5)
+    await wait_for_gate(llm.entered, task=task)
     rid = pause.run_id if pause else next(iter(a._task_manager._owned))
     original = store.finalize_with_event
 

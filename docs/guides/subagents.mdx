@@ -1,0 +1,241 @@
+---
+title: Managed subagents
+description: Register child agents as tools, answer their pauses through the root run, and read workflow usage and events.
+---
+
+# Managed subagents
+
+A subagent is a tool backed by a fresh child run. The parent's model calls it by name with one required string argument, `task`. The child uses its own provider, prompt, tools and conversation. It sees the task brief, not the parent's conversation. Its answer becomes a tool result for the parent.
+
+The call is blocking. The parent run pauses in the database while the child works. Your `run()` call returns when the workflow finishes or needs an external answer. The parent takes its next model turn after the child finishes. Each call starts a new child run. There are no parallel or background subagent branches.
+
+## Register and run
+
+Pass child Agents in `subagents=[...]`. Each child needs a provider, a valid tool name and a non-empty `description`. A name must start with an ASCII letter or underscore. Use only ASCII letters, digits and underscores, with at most 64 characters. The description tells the parent's model when to use that child. Sibling names must be unique and must not clash with the parent's tools. Registration cycles are refused.
+
+This example asks a reviewer to check a draft. Its word-count tool needs approval. Your application supplies `decide(pending)`: an async function that authorizes the actor, displays the pending action, and returns their decision. A web service can return the pause to the client and submit the decision in a later request instead.
+
+[//]: # "docs-test: skip - exercised by test_guide_subagents.py with SQLite, mock providers and an application decision callback"
+
+```python
+from dendrux import Agent, tool
+from dendrux.store import RunStore
+
+
+@tool()
+async def count_words(text: str) -> int:
+    """Count the words in a draft."""
+    return len(text.split())
+
+
+async def review_report(
+    database_url,
+    tenant_id,
+    decide,
+    *,
+    lead_provider="anthropic:claude-haiku-4-5",
+    reviewer_provider="anthropic:claude-haiku-4-5",
+):
+    async with Agent(
+        name="reviewer",
+        description="Review one draft and return a short assessment.",
+        provider=reviewer_provider,
+        prompt="Check the draft. Use count_words before reporting.",
+        tools=[count_words],
+        require_approval=["count_words"],
+    ) as reviewer, Agent(
+        name="lead",
+        provider=lead_provider,
+        prompt="Ask reviewer to check the draft, then summarize its assessment.",
+        subagents=[reviewer],
+        database_url=database_url,
+    ) as lead:
+        result = await lead.run("Review this draft: Sales rose.", tenant_id=tenant_id)
+        pending = result.pending
+        if pending is not None and pending.kind == "approval":
+            approved = await decide(pending)
+            result = await lead.submit_approval(
+                result.run_id,
+                approved=approved,
+                expected_pause_id=pending.pause_id,
+                tenant_id=tenant_id,
+            )
+
+        async with RunStore.from_database_url(database_url) as store:
+            tree = await store.get_subtree(
+                result.run_id, tenant_id=tenant_id, max_nodes=1000,
+            )
+        # Return other pause kinds and any later approval for the application to handle.
+        return result, tree
+```
+
+Call `review_report` with your database URL, the authenticated tenant and your decision function. It returns the root result and a subtree usage snapshot. A model can ask for more work or another approval; if `result.pending` is set again, handle that next pause through the same root id.
+
+Managed runs need persistence with format-2 checkpoints and the `managed_subagents` store capability. SQLite supports this example. See [Managed subagent stores](/docs/reference/state-store#managed-subagent-stores) for built-in declarations and custom-store requirements. A missing capability or required durability flag raises `StoreCapabilityError` before managed execution begins.
+
+## One subagent call per turn
+
+A model response may contain one subagent call and ordinary server-tool calls. After the usual approval checks, all server calls finish before the child starts, even if the model listed the child first. The parent then waits for the child.
+
+Two subagent calls in one response are refused before effects. A subagent call beside a client-tool or human-input target is also refused before effects. These batches produce error observations with code `managed_batch_unsupported`. The model can try a supported batch in a later turn.
+
+The parent's deny rules, approval rules and tool hook apply to the delegation call. The child's own rules govern its work. Registering a child does not copy the parent's prompt, tools or guardrails. Configure each child's data policies explicitly. Treat its report as tool data.
+
+### Approvals beside a subagent call
+
+A response can hold a subagent call and a server call that needs approval. The root then pauses for approval of the batch. Approving runs the server call first and then binds the child. Denying only the server call records the denial and still runs the child. Rejecting the whole batch with `approved=False` denies the subagent call too, and no child run is created.
+
+A subagent call is never a client-tool call. Only its child run reports it. `submit_tool_results` (or `resume` with `tool_results=`) that carries a result for a subagent call raises `ManagedResultRefusedError`, code `managed_result_refused`, and changes nothing.
+
+## Store, tenant and depth
+
+A child without a store borrows the root's resolved store for that invocation. The Agent template is not changed. If a child has an explicit `state_store=`, it must be the same store object as the root's. Matching database URLs are not enough. Leave `database_url=` off registered children, as in the example, or build one shared store and pass it to every Agent.
+
+Every child inherits the root run's actual tenant. Pass `tenant_id=` on every run, continuation and read. Rebuild the same named registrations and shared store configuration after a restart so the root Agent can resolve the saved child path.
+
+The root is depth zero. The default `max_delegation_depth` is 10. Set it on the root Agent to change the ceiling; zero allows no child calls and explicit `None` removes the depth ceiling. A child's own numeric limit can tighten the ceiling for its subtree. Definitions and runtime calls are both checked. A runtime depth overrun raises [DelegationDepthExceededError](/docs/reference/errors#also-exported-from-dendrux).
+
+More than 10 direct children logs a warning. `Limits.max_subagent_definitions` (default 256) caps the expanded definition tree and counts the root itself, so the default allows 255 subagent definitions below one root. An Agent used in two places counts twice. Set the limit on the root Agent's `limits=`.
+
+## SingleCall subagents
+
+A child can use `loop=SingleCall()`. It runs one model step and never pauses, so it has no tools and no subagents of its own. Normally that step is one provider call; an image retry may make a second provider attempt. Its answer is the report the parent sees. A parent must use ReAct; a `SingleCall` agent with subagents raises `SubagentDefinitionError(reason="single_call_parent")`.
+
+With `output_type=`, the report is the validated value as compact JSON. Use `run()` for such a workflow; streaming refuses a child with `output_type`. A value that fails validation fails the child, and the parent sees `managed_child_failed`. A child that sets both `guardrails` and `output_type` is refused with `ValueError` when the root run starts, before anything is written. If the definition changes after the root started, for example by a redeploy while the root was paused, the next delegation is refused the same way before its bind: no child run is created and the root run ends `error`. Fix the definition and start a new run.
+
+### An interrupted SingleCall child fails
+
+Dendrux never runs an interrupted `SingleCall` child again. If the process dies during its model step, the child stays `running` until you call `sweep()`. The sweep finalizes it as `error` with `failure_reason="stale_running"`, or `"never_started"` if it died before it started. This happens with every `on_stale` setting, and the child is never listed in `reclaimable`. A provider error fails the child too.
+
+The parent sees an ordinary failed tool result with code `managed_child_failed`, the same code as a model or provider error. Read the child run's `failure_reason` to tell a crash from a model error. The parent's model may choose to delegate again; that starts a new child run.
+
+`SweptRun` names the child, not the root. Walk `parent_run_id` up to the root and reclaim the root, which adopts the failure and continues the parent:
+
+[//]: # "docs-test: skip - exercised by test_guide_subagents.py with a crashed SingleCall child on SQLite"
+
+```python
+from datetime import timedelta
+
+from dendrux import sweep
+
+swept = await sweep(
+    database_url=database_url, stale_running=timedelta(minutes=5), on_stale="reclaim"
+)
+async with RunStore.from_database_url(database_url) as runs:
+    for item in swept.stale_running:
+        run = await runs.get_run(item.run_id)
+        while run is not None and run.parent_run_id is not None:
+            run = await runs.get_run(run.parent_run_id)  # bounded by the delegation depth
+        if run is not None and run.run_id != item.run_id and run.agent_name == lead.name:
+            await lead.reclaim(run.run_id, tenant_id=run.tenant_id)
+```
+
+A token-less `resume` on the root adopts the failure the same way. Before the sweep, `reclaim` on the root raises `RunNotReclaimableError(reason="loop_unsupported")` with the child's run id: it means "run `sweep()` first, then reclaim the root again", not that the workflow is lost. Submit and token-bearing resume calls raise `RunNotPausedError` while the child is running.
+
+### Known limits
+
+- A sweep cannot tell a dead process from a live one that lost its database connection. If a child's call is cut off from the database, the sweep fails the child and its writes are fenced. The call itself can still complete and be billed by the provider, but its usage is never recorded, so the root budget can undercount by that one call. The same applies to a ReAct child's in-flight call. Keep `stale_running` well above the lease interval.
+- A root `request_pause` sent while a `SingleCall` child's call is in flight has no effect: the child finishes and clears the request, and the parent continues. `PauseOutcome.affected` still lists the child as `requested`. Cancel instead, or request the pause again. A ReAct child's final model call has the same gap.
+- The child's call counts toward the root budget. The child's own `budget.*` events are advisory (`action="warn"`); the parent enforces the root budget at its next checkpoint, after it adopts the report. The overshoot is at most the child's one run, which can be two provider attempts when an image retry fires.
+- Cancelling the root while the child's call is in flight is cooperative, even in the process that owns the run: the call finishes, its report is not adopted, and the root ends cancelled. Cancelling the task that awaits `run()` interrupts the call instead; the child ends `cancelled`, and the root later adopts `managed_child_cancelled`.
+
+## Answer a child pause through the root
+
+Approval, client-tool, human-input and requested pauses inside a child surface on the root. The result keeps the root's `run_id` and reports the child's waiting status. For example, an approval returns `waiting_approval`, not the parent's internal managed wait.
+
+The root-facing `pending` includes:
+
+| Field | Meaning |
+| --- | --- |
+| `run_id` | The root id to use for continuation |
+| `pause_id` | The active child's pause token |
+| `agent_name` | The child that needs an answer |
+| `agent_path` | Names from the root to that child, such as `["lead", "reviewer"]` |
+| `origin_run_id` | The child's run id, for reads and diagnostics |
+
+After a restart, reload the pause before displaying the action:
+
+[//]: # "docs-test: skip - exercised by test_guide_subagents.py with store, root_run_id and tenant_id"
+
+```python
+pending = await store.get_pending(root_run_id, tenant_id=tenant_id)
+```
+
+Authorize the actor for the displayed action in your own route. Submit to the root id with `expected_pause_id=pending.pause_id`. Managed continuations always require the token, including when strict tenancy is disabled. A stale token is refused; do not silently replace it with a newer token and retry the old decision.
+
+| Pending kind | Root Agent method |
+| --- | --- |
+| `approval` | `submit_approval` |
+| `client_tool` | `submit_tool_results` with the child's displayed call ids |
+| `input` | `submit_input` |
+| `paused` | `submit_resume` or an allowed `resume` / `resume_stream` |
+
+The child validates the submission using its own tools and limits. When it finishes, the saved answer returns to its parent and execution continues up to the root. The call returns the root's result or the next pause. A failed child becomes a failed tool result with code `managed_child_failed`; it does not count as root success. `resume` can adopt an already terminal child without a pause token when no external answer is needed.
+
+The parent's `Limits.max_tool_result_bytes` caps the report's serialized UTF-8 payload, including after a result transform. The default is 1 MiB. An oversized report becomes a failed tool result with code `managed_report_too_large`, without partial report text.
+
+Direct child control is refused with `managed_root_required`. Child reads are allowed. `request_pause` on the root reaches the active branch. A note submitted to the root waits until the root next executes; it is not forwarded to the child.
+
+## Streaming and events
+
+Use `stream` to drive the same workflow while reading the root's text:
+
+[//]: # "docs-test: skip - exercised by test_guide_subagents.py with a configured lead Agent and tenant_id"
+
+```python
+async with lead.stream("Review this draft: Sales rose.", tenant_id=tenant_id) as stream:
+    async for text in stream.text():
+        print(text, end="")
+    result = stream.result
+```
+
+Only root text appears in answer deltas. When you iterate the full stream instead of `stream.text()`, child tools yield `tool_use_start`, `tool_use_end` and `tool_result` events. They carry the child's `run_id`, tool name, call id and outcome information, without arguments or output. The root's subagent-call events also omit the task brief and report. The final `result.steps` contains the root's own steps, including its subagent calls. `resume_stream` accepts the root id and current `expected_pause_id`. Closing a workflow stream early requests cancellation with cascade.
+
+Each run keeps its own durable event log. The parent's `tool.started` event records the delegation's `child_run_id` and `agent_path`. At adoption, `tool.completed` includes `managed_outcome="succeeded"`, `"failed"` or `"cancelled"`. Completion alone does not mean success. These delegation lifecycle payloads contain ids, paths and outcome information, without task or report text.
+
+Use `RunStore.follow(root_run_id, tenant_id=tenant_id)` for a client event feed. Follow the `child_run_id` separately for child detail. There is no combined subtree feed. See [read routes](/docs/recipes/build-your-own-read-routes) for cursors and feed handling.
+
+A call-level `notifier=` also receives child callbacks with each child's `run_id`, on initial and continuation calls. Delivery is best effort. Supply the notifier again after a restart. Durable integrations consume saved events and deduplicate them; callbacks have no exactly-once guarantee.
+
+## Usage and release work
+
+`result.usage` is local to the root run. In the example, `tree.usage` totals the root and its descendants. Each `tree.nodes` entry has that run's own `usage`. Reading the tree while paused gives usage recorded so far. Pass a finite `max_nodes=` bound when calling `RunStore.get_subtree`; reaching that descendant bound raises `SubtreeTooLargeError`.
+
+## Cancellation
+
+Cancelling a managed root always reaches its managed descendants, whatever `cascade=` says; `cascade=True` also includes legacy descendants. Descendants settle deepest first and the root last. A paused descendant is finalized `cancelled` at once. A running one gets a cancellation request and stops at its next checkpoint. Cancellation is cooperative: it cannot undo effects that already happened.
+
+`result.meta["cascade"]` lists each reached run with its `run_id` and an `outcome`: `cancelled`, `cancel_requested` (running; stops at its next checkpoint), `terminal` or `skipped`. A child whose saved managed header is corrupt is skipped, logged with code `cascade_child_skipped`, and marks the walk truncated. The walk is also bounded by `Budget.max_subtree_nodes` (default 10,000). When `result.meta["cascade_truncated"]` is true, call `cancel_run(root_id)` again after fixing the cause; a repeat call walks the descendants again even when the root is already terminal.
+
+A cancelled child becomes a failed tool result with code `managed_child_cancelled`, and the parent's `tool.completed` event carries `managed_outcome="cancelled"`.
+
+## Root budget
+
+A root `budget=` counts the root and every descendant together; children never get a fresh allowance. Usage is checked before each bind and at the parent's next checkpoint after a child finishes, so the overshoot is at most one child run. A registered child's own `budget=` is refused with `ManagedBudgetConfigurationError` (code `managed_budget_invalid`) when the Agent is built. A root budget with `include_children=False` is refused the same way.
+
+With a cost limit and `on_exceed="pause"` or `"cancel"`, an unpriced call anywhere in the tree stops the workflow with reason `unpriced_call`; resume through the root to accept it. If a descendant's usage cannot be established at all (the provider reported no usage, a usage write failed, or the rollup read failed), the root stops with `managed_usage_unknown` according to `on_exceed`. Raise the budget and resume through the root to continue. With `on_exceed="warn"`, or without a cost limit, neither case stops the workflow.
+
+## Run and definition limits
+
+`Limits.max_managed_runs` (default 128) bounds the runs one workflow may create, counting the root and finished children. The cap is saved in the root's first checkpoint, so changing `limits=` later does not change a running workflow. A bind past the cap is refused before any write: the call raises an error with code `managed_run_limit` (on a stream, the result ends `error`), and no child run is created. Each bind counts the existing runs up to the cap, so a higher cap makes each bind cost more.
+
+`Limits.max_subagent_definitions` (default 256, root included) bounds the registered definition tree; see [Store, tenant and depth](#store-tenant-and-depth).
+
+## Recovery through the root
+
+Control a managed workflow only through its root id. `resume`, `submit_*`, `reclaim`, `cancel_run` and `retry` on a child id raise `ManagedChildControlError` (code `managed_root_required`). Reading a child is allowed.
+
+After a crash, call `sweep(on_stale="reclaim")` and then `reclaim` on the root id. The root walks its saved bindings: a finished child is adopted without running again, and a running ReAct child is reclaimed under the usual lease rules once the sweep has marked it. A healthy child that is still running in another process is never taken over. `SweptRun` and `ReclaimableRun` name the child; walk `parent_run_id` up to the root, as in the SingleCall example above.
+
+A parent waiting on a subagent is exempt from `abandoned_waiting`; a corrupt managed wait is reported and left unchanged. Both count toward `max_runs`. Pass the previous `result.cursor` (an opaque token starting with `sweep:v1:`) to continue both the running and the waiting scans past them.
+
+## Current limits
+
+- Managed parents must use ReAct. Children use ReAct or `SingleCall`; any other loop is refused with `SubagentDefinitionError(reason="loop_unsupported")` before execution. A paused child continues only on ReAct, so re-registering it as `SingleCall` while it waits is refused the same way.
+- Cancelling the root while a subagent's call is in flight is cooperative, even in the process that owns the run: the call finishes, its report is not adopted, and the root ends cancelled. A real interrupt is planned for 0.7.1.
+- A root `request_pause` sent while a `SingleCall` child's call is in flight has no effect.
+- A live child that lost its database connection can be swept while its call completes; the call is billed but not recorded, so the root budget can undercount by that one call.
+- A `SingleCall` child's own budget events are advisory; the parent enforces the root budget.
+- Streaming refuses registered subagents with guardrails or `output_type`. Use `run()` for a workflow with child guardrails or a structured `SingleCall` child.
+- `retry` on an Agent with managed subagents is refused. Continue paused work through the root's resume or submit methods.
+- Parallel branches, background children and follow-up conversations with an existing child are not supported.

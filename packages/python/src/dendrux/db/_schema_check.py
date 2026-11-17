@@ -202,7 +202,7 @@ def read_actual_indexes(sync_conn: Connection) -> set[str]:
         for table in Base.metadata.sorted_tables
         for index in table.indexes
     }
-    for _, (owner, column, old) in ACTIVATION_INDEXES.items():
+    for owner, column, old in ACTIVATION_INDEXES.values():
         if old:
             expected[old] = (owner, f"CREATE INDEX {old} ON {owner} (agent_run_id, {column})")
     for name, (owner, ddl) in expected.items():

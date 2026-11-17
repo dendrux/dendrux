@@ -1,11 +1,13 @@
 """Cancellation races at lifecycle awaits, with a second Postgres caller."""
 
 import asyncio
+from unittest.mock import AsyncMock
 
 import pytest
 
 from dendrux import tool
-from dendrux.runtime import runner
+from dendrux.loops import _helpers
+from dendrux.runtime import _run_outcome
 from dendrux.runtime.persistence import PersistenceRecorder
 from dendrux.types import LLMResponse, RunStatus
 from tests._fixtures.storage import pin_storage_format
@@ -41,7 +43,7 @@ async def test_cancel_committed_before_pause_wins(
     case.agent.tools.append(wait_on_client)
     gate = Gate()
     owner, method = {
-        "outcome": (runner, "_persist_loop_outcome"),
+        "outcome": (_run_outcome, "_persist_loop_outcome"),
         "checkpoint": (PersistenceRecorder, "checkpoint_outcome"),
         "pause_cas": (store, "pause_with_event"),
     }[cut]
@@ -50,6 +52,7 @@ async def test_cancel_committed_before_pause_wins(
     try:
         async with running(case.invoke(), gate) as task:
             await gate.entered.wait()
+            assert gate.args is not None
             run_id = provider.run_id
             before = await event_counts(other, run_id)
             assert await other.request_cancel(run_id)
@@ -80,7 +83,9 @@ async def test_completion_beats_late_durable_cancel(
     case = await path_case(store, engine, path, provider)
     gate = Gate()
     if cut == "finish":
-        gate.install(monkeypatch, runner, "record_run_finished")
+        gate.install(monkeypatch, _helpers, "record_run_finished")
+        finish_hook = AsyncMock(wraps=_helpers.record_run_finished)
+        monkeypatch.setattr(_helpers, "record_run_finished", finish_hook)
     else:
         gate.install(
             monkeypatch,
@@ -92,6 +97,7 @@ async def test_completion_beats_late_durable_cancel(
     try:
         async with running(case.invoke(), gate) as task:
             await gate.entered.wait()
+            assert gate.args is not None
             run_id = provider.run_id
             requested = await other.request_cancel(run_id)
             assert requested is (cut == "before_commit")
@@ -141,10 +147,14 @@ async def test_repeated_caller_cancel_drains_cleanup_once(
             await provider.entered.wait()
             run_id = provider.run_id
             before = await event_counts(other, run_id)
-            owner = runner if method in {"record_run_finished", "notify_run_finished"} else store
+            owner = _helpers if method in {"record_run_finished", "notify_run_finished"} else store
             gate.install(monkeypatch, owner, method, after=after)
+            if owner is _helpers:
+                finish_hook = AsyncMock(wraps=getattr(_helpers, method))
+                monkeypatch.setattr(_helpers, method, finish_hook)
             task.cancel("first cancellation")
             await gate.entered.wait()
+            assert gate.args is not None
             # A separate caller also requests cancellation while cleanup is suspended.
             await other.request_cancel(run_id)
             task.cancel("cancellation during cleanup")
@@ -160,6 +170,8 @@ async def test_repeated_caller_cancel_drains_cleanup_once(
             assert counts["run.completed"] == before["run.completed"]
             assert counts["run.error"] == before["run.error"]
             assert provider.calls == 1
+            if owner is _helpers:
+                finish_hook.assert_awaited_once()
     finally:
         gate.release.set()
         provider.gate.set()

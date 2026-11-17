@@ -525,15 +525,15 @@ class LiveUpdates(ABC):
 
     def abort_sender(self) -> None:
         """Synchronously drop the sender connection, including after cancellation."""
-        return None
+        return
 
     def abort_listener(self) -> None:
         """Synchronously drop the listener connection on forced shutdown."""
-        return None
+        return
 
     async def aclose_sender(self) -> None:
         """Close the sender connection at instance shutdown."""
-        return None
+        return
 
     def _init_listener(self) -> None:
         self._healthy = False
@@ -726,7 +726,7 @@ class LiveUpdates(ABC):
         try:
             while self._state == "open":
                 await self._listen_attempt()
-                delay = random.uniform(0, self._listener_backoff)
+                delay = random.uniform(0, self._listener_backoff)  # noqa: S311 - Non-security listener reconnect jitter.
                 self._listener_backoff = min(self._listener_backoff * 2, self.backoff_max_s)
                 await asyncio.sleep(delay)
         finally:

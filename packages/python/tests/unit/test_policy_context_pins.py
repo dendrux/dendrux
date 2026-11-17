@@ -11,6 +11,7 @@ from dendrux._meta_keys import NOT_EXECUTED_META_KEY
 from dendrux.llm.mock import MockLLM
 from dendrux.loops.base import BaseRecorder
 from dendrux.loops.react import _hook_tenant_id, _init_loop_state, _process_tool_calls
+from dendrux.runtime import _run_approval
 from dendrux.runtime._reclaim import _dispatch_recovery_call, _recovery_denial
 from dendrux.runtime.runner import _approval_call_counts, _execute_approved_tools
 from dendrux.strategies.native import NativeToolCalling
@@ -257,13 +258,12 @@ async def test_approved_decision_denial_keeps_wrapped_reason(storage_format):
 
 @pytest.mark.parametrize("barrier", [RunStatus.CANCELLED, RunStatus.PAUSED])
 async def test_approved_barrier_keeps_remaining_calls(monkeypatch, barrier):
-    from dendrux.runtime import runner
 
     @tool()
     async def work():
         pytest.fail("the barrier must run before execution")
 
-    monkeypatch.setattr(runner, "_resume_barrier", AsyncMock(return_value=barrier))
+    monkeypatch.setattr(_run_approval, "_resume_barrier", AsyncMock(return_value=barrier))
     calls = [ToolCall("work", id="first"), ToolCall("work", id="second")]
     result = await _execute_approved_tools(
         Agent(prompt="p", tools=[work]),

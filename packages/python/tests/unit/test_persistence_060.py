@@ -11,6 +11,7 @@ from dendrux.errors import PersistenceError, RunFencedError
 from dendrux.runtime.persistence import PersistenceRecorder
 from dendrux.runtime.stores._factory import store_for_engine
 from dendrux.types import LLMResponse, Message, Role, ToolCall, ToolResult, generate_ulid
+from tests._helpers.gates import wait_for_gate
 from tests._helpers.v030_oracle import create_sqlite_engine
 
 
@@ -110,10 +111,57 @@ async def test_format1_tool_start_cancels_the_progress_write(store, monkeypatch)
     task.cancel()
     try:
         # The write must observe cancellation without waiting for release.
-        await asyncio.wait_for(cancelled.wait(), timeout=1)
+        await wait_for_gate(cancelled, task=task)
         with pytest.raises(asyncio.CancelledError):
             await task
         assert not completed
     finally:
         released.set()
         await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_recorder_checkpoint_never_rewrites_a_managed_wait_as_v2(store):
+    """The recorder stamps schema_version=2 on pauses it checkpoints; a binding stays v3."""
+    from types import SimpleNamespace
+
+    from dendrux.runtime.state import ClaimResult, claimed_store
+    from dendrux.types import ManagedWait, PauseState, RunStatus, UsageStats
+
+    run_id = generate_ulid()
+    created = await store.create_run(run_id, "lead")
+    assert created.storage_format == 2
+    call = ToolCall(name="reviewer", params={"task": "brief"})
+    loop_state = {
+        "v": 1,
+        "loop": "react",
+        "pending": [
+            {"call_id": call.id, "order_index": 1, "phase": "dispatchable", "tool": "reviewer"}
+        ],
+    }
+    view = claimed_store(store, run_id, ClaimResult(0, 2, loop_state, None))
+    recorder = PersistenceRecorder(view, run_id)
+    assert recorder._format2
+    binding = ManagedWait(tool_call_id=call.id, child_run_id=generate_ulid())
+    pause = PauseState(
+        agent_name="lead",
+        pending_tool_calls=[call],
+        history=[],
+        steps=[],
+        iteration=1,
+        trace_order_offset=0,
+        usage=UsageStats(),
+        pending_targets={call.id: "agent"},
+        pause_reason="managed_wait",
+        pause_id=generate_ulid(),
+        schema_version=3,
+        loop_state_ref=True,
+        managed_wait=binding,
+    )
+    result = SimpleNamespace(
+        iteration_count=1, status=RunStatus.PAUSED, answer=None, meta={"pause_state": pause}
+    )
+    await recorder.checkpoint_outcome(result, {"model": "m"})
+    stored = pause.to_dict()
+    assert stored["schema_version"] == 3
+    assert stored["managed_wait"] == binding.to_dict()
+    assert PauseState.from_managed_dict(stored).managed_wait == binding

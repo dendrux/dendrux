@@ -10,7 +10,7 @@ __all__ = ["LLMProvider", "MockLLM"]
 # Usage: from dendrux.llm import AnthropicProvider  (requires pip install dendrux[anthropic])
 
 
-def __getattr__(name: str) -> type:  # noqa: N807
+def __getattr__(name: str) -> type:
     if name == "AnthropicProvider":
         from dendrux.llm.anthropic import AnthropicProvider
 

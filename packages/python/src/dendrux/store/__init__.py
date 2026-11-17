@@ -65,7 +65,12 @@ from dendrux.errors import BlobNotFoundError, LiveUpdatesUnavailableError, RunNo
 from dendrux.media._ids import image_id
 from dendrux.media._runtime import tenant_scope_for
 from dendrux.runtime._blob_catalog import BlobServices, CatalogBlobAccessor
-from dendrux.runtime._bounds import DEFAULT_EVENT_LIMIT, DEFAULT_LIST_LIMIT, MAX_PAGE
+from dendrux.runtime._bounds import (
+    DEFAULT_EVENT_LIMIT,
+    DEFAULT_LIST_LIMIT,
+    MAX_PAGE,
+    SUBTREE_MAX_NODES_DEFAULT,
+)
 from dendrux.runtime._pending import (
     _KIND_BY_STATUS as _KIND_BY_STATUS,
 )
@@ -127,12 +132,7 @@ from dendrux.runtime.stores.sql.base import SQLStateStore
 from dendrux.runtime.stores.sql.mysql import MySQLStateStore
 from dendrux.runtime.stores.sql.postgres import PostgresStateStore
 from dendrux.runtime.stores.sql.sqlite import SQLiteStateStore
-from dendrux.store._bounded import (
-    _check_subtree_bound,
-    _read_subtree,
-    _trace_page_limit,
-    _warn_page,
-)
+from dendrux.store._bounded import _page_limit, _read_subtree, _subtree_bound
 from dendrux.store._follow import (
     DEFAULT_MAX_DURATION_S,
     DEFAULT_POLL_INTERVAL_S,
@@ -949,7 +949,7 @@ class RunStore:
         run_id: str,
         *,
         after_sequence_index: int | None = None,
-        limit: int | None = None,
+        limit: int | None = MAX_PAGE,
         event_types: list[str] | None = None,
         before: datetime | None = None,
         tenant_id: TenantScope = UNSCOPED,
@@ -961,9 +961,8 @@ class RunStore:
         event. ``event_types`` keeps only those
         types (an empty list matches nothing). ``before`` is an exclusive,
         timezone-aware upper bound on ``created_at``. Empty when the run is
-        outside ``tenant_id``. SQL stores clamp pages to 1,000; custom stores
-        receive ``limit`` unchanged. Omitting it or exceeding 1,000 warns.
-        In 0.7 the default becomes 1,000 and larger limits raise.
+        outside ``tenant_id``. Since 0.7.0 ``limit`` defaults to 1,000 (``None``
+        too) and a ``limit`` above 1,000 raises ``ValueError`` before any read.
         """
         check_read_int("after_sequence_index", after_sequence_index)
         check_read_int("limit", limit, wide=True)
@@ -971,7 +970,7 @@ class RunStore:
         check_read_datetime("before", before)
         check_run_id(run_id)
         check_read_scope(tenant_id)
-        _warn_page("get_events", limit, "after_sequence_index")
+        limit = _page_limit("get_events", limit, "after_sequence_index")
         rows = await self._scoped_read(
             self._state.get_run_events,
             run_id,
@@ -984,7 +983,11 @@ class RunStore:
         return [_event_to_stored(r) for r in rows or []]
 
     async def get_subtree(
-        self, run_id: str, *, tenant_id: TenantScope = UNSCOPED, max_nodes: int | None = None
+        self,
+        run_id: str,
+        *,
+        tenant_id: TenantScope = UNSCOPED,
+        max_nodes: int | None = SUBTREE_MAX_NODES_DEFAULT,
     ) -> RunSubtree:
         """Return a run, all its descendants, and live rolled-up usage.
 
@@ -1003,19 +1006,17 @@ class RunStore:
         (otherwise it reads as missing) and so must every descendant; runs
         outside the scope are excluded together with everything below them.
 
-        ``max_nodes`` refuses when descendants (root excluded) reach the bound.
-        This is a node bound, not a memory bound. Custom stores without a named
-        ``max_nodes`` keyword are checked after loading. ``None`` warns and
-        keeps the unbounded read; 0.7 defaults to 10,000.
-
-        Raises :class:`RunNotFoundError` for a missing root and
+        ``max_nodes`` (since 0.7.0 10,000 by default, ``None`` too) refuses when
+        descendants (root excluded) reach it: a node bound, not a memory bound.
+        Custom stores without a named ``max_nodes`` keyword are checked after
+        loading. Raises :class:`RunNotFoundError` for a missing root and
         :class:`~dendrux.errors.SubtreeTooLargeError` at the bound.
         """
         from dendrux.runtime.state import require_store_method
 
         check_run_id(run_id)
         check_read_scope(tenant_id)
-        _check_subtree_bound(max_nodes)
+        max_nodes = _subtree_bound(max_nodes)
         record = await _read_subtree(
             require_store_method(self._state, "get_subtree"), run_id, tenant_id, max_nodes
         )
@@ -1124,19 +1125,19 @@ class RunStore:
         run_id: str,
         *,
         iteration: int | None = None,
-        limit: int | None = None,
+        limit: int | None = MAX_PAGE,
         offset: int = 0,
         before: datetime | None = None,
         tenant_id: TenantScope = UNSCOPED,
     ) -> list[LLMCall]:
         """Return LLM interactions for a run. ``limit``/``offset`` push
-        pagination into SQL. ``before`` is an exclusive, timezone-aware
-        upper bound on ``created_at``. Empty when the run is outside
-        ``tenant_id``."""
+        pagination into SQL; ``limit`` defaults to 1,000 and above 1,000
+        raises ``ValueError``. ``before`` is an exclusive, timezone-aware upper
+        bound on ``created_at``. Empty when the run is outside ``tenant_id``."""
         _check_page(iteration, limit, offset, before)
         check_run_id(run_id)
         check_read_scope(tenant_id)
-        _warn_page("get_llm_calls", limit, "offset")
+        limit = _page_limit("get_llm_calls", limit, "offset")
         rows = await self._scoped_read(
             self._state.get_llm_interactions,
             run_id,
@@ -1153,19 +1154,19 @@ class RunStore:
         run_id: str,
         *,
         iteration: int | None = None,
-        limit: int | None = None,
+        limit: int | None = MAX_PAGE,
         offset: int = 0,
         before: datetime | None = None,
         tenant_id: TenantScope = UNSCOPED,
     ) -> list[ToolInvocation]:
         """Return tool invocations for a run. ``limit``/``offset`` push
-        pagination into SQL. ``before`` is an exclusive, timezone-aware
-        upper bound on ``created_at``. Empty when the run is outside
-        ``tenant_id``."""
+        pagination into SQL; ``limit`` defaults to 1,000 and above 1,000
+        raises ``ValueError``. ``before`` is an exclusive, timezone-aware upper
+        bound on ``created_at``. Empty when the run is outside ``tenant_id``."""
         _check_page(iteration, limit, offset, before)
         check_run_id(run_id)
         check_read_scope(tenant_id)
-        _warn_page("get_tool_invocations", limit, "offset")
+        limit = _page_limit("get_tool_invocations", limit, "offset")
         rows = await self._scoped_read(
             self._state.get_tool_calls,
             run_id,
@@ -1181,7 +1182,7 @@ class RunStore:
         self,
         run_id: str,
         *,
-        limit: int | None = None,
+        limit: int | None = MAX_PAGE,
         offset: int = 0,
         tenant_id: TenantScope = UNSCOPED,
     ) -> list[TraceEntry]:
@@ -1192,14 +1193,13 @@ class RunStore:
         reaches a terminal status.
         System prompts and seeded history are excluded before counting rows,
         positions and pagination. Recovery metadata is not exposed.
-        SQL stores and the format-2 branch clamp pages
-        to 1,000; custom format-1 stores receive ``limit`` unchanged. Omitting
-        it or exceeding 1,000 warns. In 0.7 the default becomes 1,000 and
-        larger limits raise. Empty when the run is outside ``tenant_id``."""
+        Since 0.7.0 ``limit`` defaults to 1,000 (``None`` too) and a ``limit``
+        above 1,000 raises ``ValueError`` before any read. Empty when the run
+        is outside ``tenant_id``."""
         _check_page(None, limit, offset)
         check_run_id(run_id)
         check_read_scope(tenant_id)
-        _warn_page("get_traces", limit, "offset")
+        limit = _page_limit("get_traces", limit, "offset")
         from dendrux.runtime._capabilities import capabilities
         from dendrux.runtime._public_traces import public_traces
 
@@ -1210,7 +1210,7 @@ class RunStore:
                     self._state,
                     run_id,
                     tenant_id=tenant_id,
-                    limit=_trace_page_limit(limit),
+                    limit=max(1, limit),
                     offset=offset,
                     retry=record.retry_of_run_id is not None,
                 )
