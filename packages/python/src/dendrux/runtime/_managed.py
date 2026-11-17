@@ -23,6 +23,9 @@ Root routing (T3): a root-id continuation (``submit_*``, ``resume``,
 :func:`unwind` adopts finished outcomes back up to the root.
 :func:`workflow_stream` drives the same transitions for ``stream`` and
 ``resume_stream``, advancing each run's generator in the caller's task.
+
+This module is the driver core. Routing and the root view live in
+:mod:`~dendrux.runtime._managed_route`; the names stay importable from here.
 """
 
 from __future__ import annotations
@@ -35,7 +38,12 @@ from typing import TYPE_CHECKING, Any
 from dendrux import _codes
 from dendrux._lifecycle import TERMINAL_STATUSES, StoredEventType
 from dendrux.errors import ManagedStateError, RunNotFoundError
-from dendrux.runtime import _managed_budget, _managed_cancel, _managed_definitions
+from dendrux.runtime import (
+    _managed_budget,
+    _managed_cancel,
+    _managed_definitions,
+    _managed_route,
+)
 from dendrux.runtime._managed_budget import UNPRICED_ACCEPTED, accepted_count
 from dendrux.runtime._managed_definitions import (
     _check_definitions,
@@ -50,6 +58,15 @@ from dendrux.runtime._managed_limits import (
 from dendrux.runtime._managed_limits import (
     stamp_root_header as stamp_root_header,
 )
+from dendrux.runtime._managed_route import MANAGED_WAIT_REASON, Route, _Waiting
+from dendrux.runtime._managed_route import _bound_child as _bound_child
+from dendrux.runtime._managed_route import _intent_call as _intent_call
+from dendrux.runtime._managed_route import _outgoing as _outgoing
+from dendrux.runtime._managed_route import _projected_pause as _projected_pause
+from dendrux.runtime._managed_route import _registered as _registered
+from dendrux.runtime._managed_route import _root_result as _root_result
+from dendrux.runtime._managed_route import root_view as root_view
+from dendrux.runtime._managed_route import walk as walk
 from dendrux.runtime.state import MANAGED_HEADER_KEY, ManagedHeader
 from dendrux.types import (
     Limits,
@@ -77,7 +94,6 @@ DESCEND_KEY = "managed_descend"
 NOT_OWNER_KEY = "managed_not_owner"
 """``RunResult.meta`` key: this caller does not own the next managed step."""
 
-MANAGED_WAIT_REASON = "managed_wait"
 ADMITTED_KEY = "managed_admitted"
 """Checkpoint key: the pending managed call the live batch admitted before its handoff."""
 
@@ -116,23 +132,6 @@ class ManagedInvocation:
     max_depth: int | None
     child_run_id: str
     unpriced_accepted: int = 0
-
-
-@dataclass(frozen=True)
-class _Waiting:
-    """A parent waiting on one bound child (rebuilt from storage after a restart)."""
-
-    parent_agent: Agent
-    parent_run_id: str
-    child: Agent
-    child_path: tuple[str, ...]
-    call: ToolCall
-    child_run_id: str
-    child_loop: str | None = None  # the bound child's saved loop marker (restart only)
-
-    @property
-    def call_id(self) -> str:
-        return self.call.id
 
 
 def is_descend(result: RunResult | None) -> bool:
@@ -409,7 +408,7 @@ async def _trampoline(
 ) -> RunResult:
     for _ in range(_MAX_STEPS):
         if (result.meta or {}).get(NOT_OWNER_KEY):
-            return await root_view(store, root_run_id)
+            return await _managed_route.root_view(store, root_run_id)
         if is_descend(result):
             invocation: ManagedInvocation = result.meta[DESCEND_KEY]
             result, bound = await _run_child(invocation, notifier)
@@ -419,7 +418,7 @@ async def _trampoline(
         if not waiting:
             return result
         if result.status not in TERMINAL_STATUSES:
-            return await _projected_pause(store, root_run_id, waiting, result)
+            return await _managed_route._projected_pause(store, root_run_id, waiting, result)
         result = await adopt(waiting.pop(), store=store, notifier=notifier)
     raise ManagedStateError(reason="binding_conflict", run_id=root_run_id)
 
@@ -545,57 +544,6 @@ async def _fail_parent(invocation: ManagedInvocation, exc: Exception) -> None:
     from dendrux.runtime.runner import _persist_run_failure
 
     await _persist_run_failure(_parent_store(invocation), invocation.parent_run_id, exc)
-
-
-async def root_view(store: Any, root_run_id: str) -> RunResult:
-    """The root's persisted, root-facing state, for a caller that does not own the next step.
-
-    A root waiting on a subagent reports its active branch: the leaf's external
-    pause, or RUNNING while a subagent runs or awaits adoption.
-    """
-    from dendrux.runtime.runner import _build_cached_result
-
-    return await _build_cached_result(store, root_run_id)
-
-
-def _root_result(record: RunRecord, *, status: RunStatus, **fields: Any) -> RunResult:
-    return RunResult(
-        run_id=record.id,
-        status=status,
-        iteration_count=record.iteration_count,
-        usage=UsageStats(
-            input_tokens=record.total_input_tokens,
-            output_tokens=record.total_output_tokens,
-            total_tokens=record.total_input_tokens + record.total_output_tokens,
-            cost_usd=record.total_cost_usd,
-            reasoning_tokens=record.total_reasoning_tokens,
-        ),
-        **fields,
-    )
-
-
-async def _projected_pause(
-    store: Any, root_run_id: str, waiting: list[_Waiting], leaf: RunResult
-) -> RunResult:
-    """A computed root view of a leaf's external pause; the parents keep waiting."""
-    record = await store.get_run(root_run_id)
-    if record is None:
-        raise ManagedStateError(reason="child_missing", run_id=root_run_id)
-    pending = leaf.pending
-    if pending is not None:
-        pending = replace(
-            pending,
-            run_id=root_run_id,
-            agent_name=waiting[-1].child.name,
-            agent_path=[record.agent_name, *waiting[-1].child_path],
-            origin_run_id=leaf.run_id,
-        )
-    return _root_result(
-        record,
-        status=leaf.status,
-        pause_id=pending.pause_id if pending is not None else None,
-        pending=pending,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -820,27 +768,6 @@ async def complete_adoption(
 # ---------------------------------------------------------------------------
 
 
-@dataclass(frozen=True)
-class Route:
-    """A root-id control resolved to the workflow's active leaf (in memory).
-
-    ``tenant_id`` is the root's actual tenant; every hop carries it. ``waiting``
-    lists the parents from the root down to the leaf's parent; the leaf is the
-    root itself when nothing is waiting.
-    """
-
-    root_run_id: str
-    tenant_id: str | None
-    waiting: tuple[_Waiting, ...]
-    leaf: RunRecord
-    leaf_agent: Agent
-
-    @property
-    def routed(self) -> bool:
-        """The leaf is a subagent, not the root itself."""
-        return bool(self.waiting)
-
-
 async def route(root_agent: Agent, store: Any, run_id: str, *, tenant_id: Any) -> Route:
     """Resolve a control on ``run_id`` to its active leaf; tenant and root checked first.
 
@@ -858,7 +785,7 @@ async def route(root_agent: Agent, store: Any, run_id: str, *, tenant_id: Any) -
     if await _managed_cancel.managed_child_header(store, record):
         raise ManagedChildControlError(run_id)
     await _managed_budget.route_checkpoint(root_agent, store, record)
-    waiting, leaf = await walk(root_agent, store, run_id)
+    waiting, leaf = await _managed_route.walk(root_agent, store, run_id)
     leaf_agent = waiting[-1].child if waiting else root_agent
     return Route(run_id, record.tenant_id, tuple(waiting), leaf, leaf_agent)
 
@@ -1145,7 +1072,7 @@ async def _next_leg(leg: _Leg, state: _StreamState, notifier: Any) -> Any:
     """The next run to stream, or the workflow stream's final event."""
     result, waiting = leg.result, state.waiting or []
     if (result.meta or {}).get(NOT_OWNER_KEY):
-        return _event(await root_view(state.store, str(state.root_run_id)))
+        return _event(await _managed_route.root_view(state.store, str(state.root_run_id)))
     if is_descend(result):
         invocation = result.meta[DESCEND_KEY]
         state.tenant_id = invocation.tenant_id
@@ -1156,7 +1083,7 @@ async def _next_leg(leg: _Leg, state: _StreamState, notifier: Any) -> Any:
         return _event(await _paused_or_failed(state, waiting, result, leg.terminal))
     claim = await claim_adoption(waiting[-1], state.store)
     if claim is None:
-        return _event(await root_view(state.store, str(state.root_run_id)))
+        return _event(await _managed_route.root_view(state.store, str(state.root_run_id)))
     parent = waiting.pop()
     state.unstarted = (parent.parent_run_id, claim)
     return _Leg(_continuation_stream(parent, state.store, claim, notifier))
@@ -1172,11 +1099,11 @@ async def _paused_or_failed(
     """
     root_run_id = str(state.root_run_id)
     if getattr(getattr(terminal, "type", None), "value", None) == "run_error":
-        view = await root_view(state.store, root_run_id)
+        view = await _managed_route.root_view(state.store, root_run_id)
         view.error = result.error
         view.error_info = result.error_info
         return view
-    return await _projected_pause(state.store, root_run_id, waiting, result)
+    return await _managed_route._projected_pause(state.store, root_run_id, waiting, result)
 
 
 def workflow_stream(
@@ -1230,7 +1157,7 @@ async def _stream_failure(state: _StreamState, exc: Exception, run_id: str) -> A
     if state.root_run_id is None or state.store is None:
         result = RunResult(run_id=run_id, status=RunStatus.ERROR, error=error)
     else:
-        result = await root_view(state.store, state.root_run_id)
+        result = await _managed_route.root_view(state.store, state.root_run_id)
         result.error = error
     result.meta["error_type"] = type(exc).__name__
     state.root_active = True  # nothing to cancel: the failure is reported, not abandoned
@@ -1252,7 +1179,7 @@ async def _close_workflow(state: _StreamState) -> RunResult | None:
         await state.root_agent.cancel_run(
             state.root_run_id, cascade=True, tenant_id=state.tenant_id
         )
-        result = await root_view(state.store, state.root_run_id)
+        result = await _managed_route.root_view(state.store, state.root_run_id)
     return result
 
 
@@ -1320,7 +1247,7 @@ def routed_stream(
             claim = await claim_adoption(waiting[-1], store)
             if claim is None:
                 state.waiting = []
-                return _Single(_event(await root_view(store, run_id))), None
+                return _Single(_event(await _managed_route.root_view(store, run_id))), None
             parent = waiting.pop()
             first = _continuation_stream(parent, store, claim, notifier)
             # Cleanup ownership is in place before any event or the claim escapes.
@@ -1376,7 +1303,7 @@ async def _owned_leaf_stream(state: _StreamState, found: Route, first: Any, resu
     if head is None or getattr(head.type, "value", head.type) in _TERMINAL_EVENTS:
         await events.aclose()
         state.waiting = []
-        view = await root_view(state.store, found.root_run_id)
+        view = await _managed_route.root_view(state.store, found.root_run_id)
         error = getattr(head, "error", None) if head is not None else None
         view.error = error
         return _Single(_event_with_error(view, error)), None
@@ -1483,97 +1410,3 @@ async def reconnect(
     return await _trampoline(
         result, waiting, root_run_id=root_run_id, store=store, notifier=notifier
     )
-
-
-async def walk(root_agent: Agent, store: Any, root_run_id: str) -> tuple[list[_Waiting], RunRecord]:
-    """Follow each v3 wait's exact child id, validating every hop; bounded."""
-    record = await store.get_run(root_run_id)
-    if record is None:
-        raise RunNotFoundError(root_run_id)
-    waiting: list[_Waiting] = []
-    agent: Agent = root_agent
-    path: tuple[str, ...] = ()
-    limit = await _saved_walk_limit(store, record)
-    for index in range(limit):
-        wait = await _outgoing(store, record)
-        if wait is None or wait.managed_wait is None:
-            return waiting, record
-        if index + 1 == limit:
-            break
-        binding = wait.managed_wait
-        child, path, loop = await _bound_child(store, record, binding, root_run_id, path)
-        child_agent = _managed_budget.inherit(_registered(agent, path[-1], record.id), root_agent)
-        intent = await _intent_call(store, record.id, binding.tool_call_id, wait.iteration)
-        waiting.append(_Waiting(agent, record.id, child_agent, path, intent, child.id, loop))
-        agent, record = child_agent, child
-    raise ManagedStateError(reason="binding_conflict", run_id=root_run_id)
-
-
-async def _outgoing(store: Any, record: RunRecord) -> PauseState | None:
-    """The v3 managed wait of a parked parent, else None.
-
-    A pause carrying either managed-wait mark is decoded strictly, so a corrupt
-    wait is invalid state, never read as the root's own ordinary pause.
-    """
-    if record.status != RunStatus.PAUSED.value:
-        return None
-    raw = await store.get_pause_state(record.id)
-    if not raw or (
-        raw.get("schema_version") != 3 and raw.get("pause_reason") != MANAGED_WAIT_REASON
-    ):
-        return None
-    return PauseState.from_managed_dict(raw, run_id=record.id)
-
-
-async def _bound_child(
-    store: Any, parent: RunRecord, binding: Any, root_run_id: str, path: tuple[str, ...]
-) -> tuple[RunRecord, tuple[str, ...], Any]:
-    child = await store.get_run(binding.child_run_id)
-    if child is None:
-        raise ManagedStateError(reason="child_missing", run_id=parent.id)
-    if child.parent_run_id != parent.id or child.tenant_id != parent.tenant_id:
-        raise ManagedStateError(reason="child_mismatch", run_id=parent.id)
-    state = await store.get_loop_state(child.id) or {}
-    header = ManagedHeader.from_dict(state.get(MANAGED_HEADER_KEY), run_id=child.id)
-    if (
-        header.root_run_id != root_run_id
-        or header.parent_run_id != parent.id
-        or header.tool_call_id != binding.tool_call_id
-        or header.path[:-1] != path
-    ):
-        raise ManagedStateError(reason="child_mismatch", run_id=parent.id)
-    return child, header.path, state.get("loop")
-
-
-async def _intent_call(store: Any, parent_run_id: str, call_id: str, iteration: int) -> ToolCall:
-    """The bound call as the parent's model made it (its brief lives on the intent row).
-
-    Read only the wait's own iteration: its rows are one model batch, bounded by
-    ``Limits.max_pending_calls``, so the paged read ends; earlier history is never read.
-    """
-    from dendrux.runtime._bounds import MAX_PAGE
-
-    offset = 0
-    while True:
-        page = await store.get_tool_calls(
-            parent_run_id, iteration_index=iteration, limit=MAX_PAGE, offset=offset
-        )
-        for row in page:
-            if row.tool_call_id == call_id and row.target == "agent":
-                return ToolCall(
-                    name=row.tool_name,
-                    params=dict(row.params or {}),
-                    id=row.tool_call_id,
-                    provider_tool_call_id=row.provider_tool_call_id,
-                )
-        if len(page) < MAX_PAGE:
-            raise ManagedStateError(reason="binding_missing", run_id=parent_run_id)
-        offset += MAX_PAGE
-
-
-def _registered(parent: Agent, name: str, parent_run_id: str) -> Agent:
-    """The parent's registered child by name; a missing path refuses before any claim."""
-    for child in parent.subagents:
-        if child.name == name:
-            return child
-    raise ManagedStateError(reason="path_missing", run_id=parent_run_id)

@@ -1,0 +1,15 @@
+{
+ "dendrux.runtime._managed": {
+  "MANAGED_WAIT_REASON": "dendrux.runtime._managed_route",
+  "Route": "dendrux.runtime._managed_route",
+  "_Waiting": "dendrux.runtime._managed_route",
+  "_bound_child": "dendrux.runtime._managed_route",
+  "_intent_call": "dendrux.runtime._managed_route",
+  "_outgoing": "dendrux.runtime._managed_route",
+  "_projected_pause": "dendrux.runtime._managed_route",
+  "_registered": "dendrux.runtime._managed_route",
+  "_root_result": "dendrux.runtime._managed_route",
+  "root_view": "dendrux.runtime._managed_route",
+  "walk": "dendrux.runtime._managed_route"
+ }
+}
