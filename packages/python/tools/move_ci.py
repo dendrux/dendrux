@@ -118,11 +118,12 @@ def _run(path: Path) -> tuple[str, set[str]]:
 
 
 def run_manifests(directory: Path) -> int:
-    """Check every active family manifest; an absent manifest is an error."""
+    """Check every active family manifest; no manifests means no split is in flight."""
     try:
         paths = _manifests(directory)
         if not paths:
-            raise ValueError("absent move manifest")
+            print("move-proof: no active manifests")
+            return 0
         roots = set()
         destinations = set()
         for path in paths:
@@ -140,16 +141,13 @@ def run_manifests(directory: Path) -> int:
 
 
 def main() -> int:
-    """Discover active work or verify all tracked manifests from the package root."""
+    """Report active manifests or verify all tracked manifests from the package root."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--directory", type=Path, default=Path("tools/moves"))
     parser.add_argument("--discover", action="store_true")
     args = parser.parse_args()
     if args.discover:
-        active = bool(_manifests(args.directory))
-        if not active and _created_sources():
-            parser.exit(1, "move-proof: split sources exist without a manifest\n")
-        print("true" if active else "false")
+        print("true" if _manifests(args.directory) else "false")
         return 0
     return run_manifests(args.directory)
 

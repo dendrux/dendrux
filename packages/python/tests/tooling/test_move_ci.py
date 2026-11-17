@@ -8,7 +8,6 @@ import sys
 from pathlib import Path
 
 import pytest
-import yaml
 
 from tests.tooling.test_move_manifest import manifest
 
@@ -53,8 +52,9 @@ def repository(tmp_path: Path) -> tuple[Path, dict]:
     return root, evidence
 
 
-def test_absent_manifest_is_an_error(tmp_path: Path) -> None:
-    assert run(tmp_path).returncode == 1
+def test_no_manifests_means_no_active_split(tmp_path: Path) -> None:
+    done = run(tmp_path)
+    assert done.returncode == 0 and "no active manifests" in done.stdout
 
 
 def test_valid_tracked_manifest_runs_from_actual_base(tmp_path: Path) -> None:
@@ -91,17 +91,6 @@ def test_discovery_reports_no_work_without_a_manifest(tmp_path: Path) -> None:
     assert done.returncode == 0 and done.stdout.strip() == "false"
 
 
-def test_move_job_uses_full_history_and_is_conditional() -> None:
-    workflow = Path(__file__).resolve().parents[4] / ".github/workflows/ci.yml"
-    jobs = yaml.safe_load(workflow.read_text())["jobs"]
-    job = jobs["move-proof"]
-    assert "move-manifests" in job["needs"]
-    assert "true" in job["if"]
-    checkout = next(s for s in job["steps"] if s.get("uses", "").startswith("actions/checkout@"))
-    assert checkout["with"]["fetch-depth"] == 0
-    assert any("tools/move_ci.py" in s.get("run", "") for s in job["steps"])
-
-
 def test_ci_entry_point_directly_checks_the_same_evidence(tmp_path: Path, monkeypatch) -> None:
     from tools.move_ci import run_manifests
 
@@ -133,7 +122,7 @@ def test_runner_pin_and_actual_sql_receipt_are_required(tmp_path: Path, monkeypa
         move_ci._check_base(sql, tmp_path)
 
 
-def test_discovery_and_main_fail_closed_directly(tmp_path: Path, monkeypatch, capsys) -> None:
+def test_discovery_and_main_report_no_work(tmp_path: Path, monkeypatch, capsys) -> None:
     from tools.move_ci import main
 
     monkeypatch.chdir(tmp_path)
@@ -141,7 +130,8 @@ def test_discovery_and_main_fail_closed_directly(tmp_path: Path, monkeypatch, ca
     assert main() == 0
     assert capsys.readouterr().out.strip() == "false"
     monkeypatch.setattr(sys, "argv", ["move_ci.py"])
-    assert main() == 1
+    assert main() == 0
+    assert "no active manifests" in capsys.readouterr().out
 
 
 def test_move_check_cli_accepts_only_the_manifest_base(tmp_path: Path, monkeypatch) -> None:

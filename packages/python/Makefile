@@ -143,7 +143,7 @@ move-check:
 	@test -n "$(BASE)" -a -n "$(OLD)" -a -n "$(NEW)" || { echo "usage: make move-check BASE=<ref> OLD=<path> NEW=\"<paths>\""; exit 2; }
 	python tools/move_check.py --base "$(BASE)" --old "$(OLD)" --new $(NEW) $(MOVE_ARGS)
 
-# All tracked cumulative move evidence (full history required; absent manifests fail).
+# All tracked cumulative move evidence (full history required; no manifests means nothing to check).
 move-proof:
 	python tools/move_ci.py
 
