@@ -19,7 +19,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from functools import wraps
 from time import monotonic
@@ -46,7 +46,7 @@ from dendrux.runtime.stores._errors import classify_error, error_chain
 _EXCEPTION_WALK_LIMIT = 1024
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
+    from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterator
 
     from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -59,6 +59,9 @@ T = TypeVar("T")
 
 _database_operation: ContextVar[tuple[object, str, dict[str, Any]] | None] = ContextVar(
     "dendrux_database_operation", default=None
+)
+_database_cancellation: ContextVar[tuple[object, int, str | None] | None] = ContextVar(
+    "dendrux_database_cancellation", default=None
 )
 
 
@@ -324,7 +327,28 @@ def _transient_wrapper(exc: BaseException) -> bool:
     )
 
 
-def _raise_if_cancelled(error: BaseException | None = None) -> None:
+@contextmanager
+def _cancellation_boundary(*, run_id: str | None = None) -> Iterator[None]:
+    task = asyncio.current_task()
+    scope = _database_cancellation.get()
+    if task is None:
+        yield
+        return
+    before = scope[1] if scope is not None and scope[0] is task else task.cancelling()
+    operation = _database_operation.get()
+    if run_id is None and operation is not None:
+        run_id = operation[2].get("run_id")
+    if run_id is None and scope is not None and scope[0] is task:
+        run_id = scope[2]
+    run_id = run_id if isinstance(run_id, str) and _codes._valid_field("run_id", run_id) else None
+    token = _database_cancellation.set((task, before, run_id))
+    try:
+        yield
+    finally:
+        _database_cancellation.reset(token)
+
+
+def _cancelled_in_chain(error: BaseException | None) -> asyncio.CancelledError | None:
     pending = [error] if error is not None else []
     seen: set[int] = set()
     for _ in range(_EXCEPTION_WALK_LIMIT):
@@ -335,17 +359,34 @@ def _raise_if_cancelled(error: BaseException | None = None) -> None:
             continue
         seen.add(id(current))
         if isinstance(current, asyncio.CancelledError):
-            current.__context__ = None
-            current.__cause__ = None
-            raise current from None
+            return current
         pending.extend(
             nested
             for nested in (getattr(current, "orig", None), current.__cause__, current.__context__)
             if isinstance(nested, BaseException) and id(nested) not in seen
         )
-    task = asyncio.current_task()
-    if task is not None and task.cancelling():
-        raise asyncio.CancelledError() from None
+    return None
+
+
+def _raise_if_cancelled(error: BaseException | None = None) -> None:
+    if isinstance(error, asyncio.CancelledError):
+        cancellation = error
+    else:
+        task = asyncio.current_task()
+        scope = _database_cancellation.get()
+        # Like _CancelGuard.watch, only count requests made during this operation.
+        # A handled cancel leaves a stale count; a timeout removes its own request.
+        if task is None or scope is None or scope[0] is not task or task.cancelling() <= scope[1]:
+            return
+        cancellation = _cancelled_in_chain(error) or asyncio.CancelledError()
+        _codes.log_code(logger, _codes.DB_CANCEL_CONVERTED, run_id=scope[2])
+    try:
+        raise cancellation from None
+    finally:
+        # Python attaches the handled driver error at raise time, even with
+        # "from None". Clear it after that attachment and before propagation.
+        cancellation.__context__ = None
+        cancellation.__cause__ = None
 
 
 async def _rollback_unless_cancelled(
@@ -385,25 +426,26 @@ async def retry_transient_db(
         if not allowed:
             raise error
 
-    failure: BaseException | None = None
-    last_classified = None
-    for attempt_num in range(MAX_RETRIES + 1):
-        try:
-            return await attempt()
-        except Exception as exc:
-            check_retry_error(exc)
-            last_classified = classify(exc)
-            if not is_transient_db_error(exc, classify=classify):
-                failure = _database_failure(exc, classify=classify)
-                break
-            if attempt_num < MAX_RETRIES:
-                await _backoff(attempt_num, label, run_id, exc)
-    if failure is None:
-        failure = PersistenceError(retryable=True)
-        _log_database_failure(last_classified, run_id)
-    failure.__context__ = None
-    failure.__cause__ = None
-    raise failure from None
+    with _cancellation_boundary(run_id=run_id):
+        failure: BaseException | None = None
+        last_classified = None
+        for attempt_num in range(MAX_RETRIES + 1):
+            try:
+                return await attempt()
+            except Exception as exc:
+                check_retry_error(exc)
+                last_classified = classify(exc)
+                if not is_transient_db_error(exc, classify=classify):
+                    failure = _database_failure(exc, classify=classify)
+                    break
+                if attempt_num < MAX_RETRIES:
+                    await _backoff(attempt_num, label, run_id, exc)
+        if failure is None:
+            failure = PersistenceError(retryable=True)
+            _log_database_failure(last_classified, run_id)
+        failure.__context__ = None
+        failure.__cause__ = None
+        raise failure from None
 
 
 def _require_database_error(error: Exception) -> None:
@@ -467,7 +509,8 @@ def _safe_database_call(method: Any) -> Any:
             bound.apply_defaults()
             token = _database_operation.set((args[0], method.__name__, dict(bound.arguments)))
         try:
-            return await method(*args, **kwargs)
+            with _cancellation_boundary():
+                return await method(*args, **kwargs)
         except PersistenceError as error:
             facts = getattr(args[0], "_dialect_facts", None) if args else None
             if isinstance(error, StatementTooLargeError):

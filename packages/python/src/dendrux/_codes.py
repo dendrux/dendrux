@@ -702,6 +702,14 @@ SHARED_ENGINE_LOOP_CLOSED = Code(
     "A pooled engine belongs to a closed event loop.",
     "Use an engine owned by the current loop.",
 )
+DB_CANCEL_CONVERTED = Code(
+    "db_cancel_converted",
+    logging.WARNING,
+    "store",
+    _BASE_FIELDS,
+    "A database driver replaces a cancellation requested during the current operation.",
+    "Cancellation continues; session cleanup owns rollback and close.",
+)
 DB_CLOSE_ABANDONED = Code(
     "db_close_abandoned",
     logging.WARNING,
@@ -2181,6 +2189,7 @@ REGISTRY = MappingProxyType(
             MIGRATION_VERSION_TABLE_CONFLICT,
             SHARED_ENGINE_LOOP_CLOSED,
             DB_CLOSE_ABANDONED,
+            DB_CANCEL_CONVERTED,
             TOOL_ROW_MAY_BE_MISSING,
             OUTCOME_UNKNOWN,
             CANCELLED,

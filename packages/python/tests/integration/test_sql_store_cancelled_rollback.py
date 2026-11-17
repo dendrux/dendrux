@@ -30,7 +30,14 @@ async def test_converted_cancellation_skips_error_handler_rollback(
         if site == "create"
         else OperationalError(None, None, Exception("PRIVATE_DRIVER_SENTINEL"))
     )
-    rollback = AsyncMock(side_effect=AssertionError("unsafe explicit rollback was entered"))
+    original_rollback = AsyncSession.rollback
+
+    async def checked_rollback(session):
+        if cancelling:
+            raise AssertionError("unsafe explicit rollback was entered")
+        await original_rollback(session)
+
+    rollback = AsyncMock(side_effect=checked_rollback)
     close = AsyncSession.close
     closed = []
 
@@ -42,24 +49,42 @@ async def test_converted_cancellation_skips_error_handler_rollback(
         fault.__context__ = cancellation
         raise fault
 
-    monkeypatch.setattr(AsyncSession, "rollback", rollback)
-    monkeypatch.setattr(AsyncSession, "close", track_close)
-    if site == "create":
-        monkeypatch.setattr(store, "_write_tx", AsyncMock(side_effect=fail))
-    elif site == "commit":
-        monkeypatch.setattr(AsyncSession, "commit", AsyncMock(side_effect=fail))
+    execute = AsyncSession.execute
 
-    async def operation():
+    async def cancel_current():
         nonlocal cancellation
-        if cancelling:
-            task = asyncio.current_task()
+        task = asyncio.current_task()
+        if cancelling and task.cancelling() == 0:
             task.cancel()
             task.cancel()
             try:
                 await asyncio.sleep(0)
             except asyncio.CancelledError as delivered:
                 cancellation = delivered
-            assert task.cancelling() == 2
+
+    async def deliver_cancel(session, *args, **kwargs):
+        result = await execute(session, *args, **kwargs)
+        await cancel_current()
+        return result
+
+    monkeypatch.setattr(AsyncSession, "execute", deliver_cancel)
+
+    async def rollback_session(session):
+        await rollback(session)
+
+    monkeypatch.setattr(AsyncSession, "rollback", rollback_session)
+    monkeypatch.setattr(AsyncSession, "close", track_close)
+    if site == "create":
+
+        async def fail_write(session):
+            await cancel_current()
+            fail()
+
+        monkeypatch.setattr(store, "_write_tx", fail_write)
+    elif site == "commit":
+        monkeypatch.setattr(AsyncSession, "commit", AsyncMock(side_effect=fail))
+
+    async def operation():
         if site == "create":
             await store.create_run(run_id, "cancel-test")
         elif site == "commit":
@@ -74,9 +99,12 @@ async def test_converted_cancellation_skips_error_handler_rollback(
             )
 
     task = asyncio.create_task(operation())
-    with pytest.raises(asyncio.CancelledError):
+    with pytest.raises(asyncio.CancelledError if cancelling else PersistenceError):
         await task
-    rollback.assert_not_called()
+    if cancelling:
+        rollback.assert_not_called()
+    else:
+        assert rollback.await_count >= 1
     assert closed
 
     # A failed claim must be undone by close on the real database, too.
