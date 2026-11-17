@@ -22,6 +22,15 @@ from dendrux._lifecycle import (
 from dendrux.errors import PersistenceError, RunNotFoundError, RunNotReclaimableError
 from dendrux.loops._helpers import order_observations, project_message, record_message, record_tool
 from dendrux.runtime._bounds import MAX_PAGE
+from dendrux.runtime._reclaim_managed import (
+    _finish_saved_adoption,
+    _handed_off,
+    _managed_handoff,
+    _ManagedPending,
+    _pending_adoption,
+    _refuse_bound_pending,
+    _refuse_recovered_managed_results,
+)
 from dendrux.runtime.context import managed_root_reclaim_scope
 from dendrux.runtime.persistence import PersistenceRecorder, resolve_pending
 from dendrux.runtime.state import MANAGED_BINDING_KEY, UNSCOPED, claimed_store
@@ -247,52 +256,6 @@ def _refuse_direct_child(run_id: str, state: dict[str, Any] | None) -> None:
     header = (state or {}).get("managed")
     if isinstance(header, dict) and "invocation" in header:
         raise ManagedChildControlError(run_id)
-
-
-def _pending_adoption(state: dict[str, Any] | None) -> bool:
-    """A running parent whose checkpoint still holds a claimed managed adoption."""
-    state = state or {}
-    return state.get(MANAGED_BINDING_KEY) is not None and bool(state.get("submission"))
-
-
-async def _finish_saved_adoption(
-    agent: Agent, owned: StateStore, run_id: str, claim: ClaimResult
-) -> ClaimResult:
-    """Complete the managed tool intent from the durably accepted report, once."""
-    from dendrux.errors import ManagedStateError
-    from dendrux.runtime._managed import complete_adoption, project_report
-    from dendrux.runtime.state import ClaimResult, ManagedHeader
-    from dendrux.runtime.submit import _submission_payload, deserialize_tool_results
-
-    state = claim.loop_state or {}
-    binding = state[MANAGED_BINDING_KEY]
-    raw = await owned.get_pause_state(run_id) or {}
-    try:
-        payload = _submission_payload(raw)
-        results = deserialize_tool_results(payload["submitted_tool_results"])
-    except (KeyError, TypeError, ValueError):
-        raise ManagedStateError(reason="binding_conflict", run_id=run_id) from None
-    if len(results) != 1 or results[0].call_id != binding.get("tool_call_id"):
-        raise ManagedStateError(reason="binding_conflict", run_id=run_id)
-    header = ManagedHeader.from_dict(state.get("managed"), run_id=run_id)
-    tool = next(
-        (p.get("tool") for p in state.get("pending", []) if p.get("call_id") == results[0].call_id),
-        results[0].name,
-    )
-    # The saved report is already transformed and admitted; only its projection
-    # into the conversation is redone, from the saved mapping.
-    accepted = await project_report(agent, owned, run_id, results[0])
-    if payload.get("managed_blocked"):
-        accepted = replace(accepted, blocked=accepted.blocked or "blocked")
-    after = await complete_adoption(
-        owned,
-        run_id,
-        claim,
-        accepted,
-        child_run_id=binding.get("child_run_id"),
-        path=(*header.path, str(tool)),
-    )
-    return ClaimResult(claim.claim_epoch, claim.storage_format, after, None)
 
 
 class _PauseReadMemo:
@@ -658,36 +621,6 @@ async def _consume_recovery_submission(
         await recorder.consume_resume(injected)
         ctx.history.extend(injected)
     return recorder._loop_state, descriptor
-
-
-def _refuse_recovered_managed_results(
-    run_id: str,
-    descriptor: dict[str, Any],
-    raw: dict[str, Any],
-    state: dict[str, Any],
-    payload: dict[str, Any],
-    lookups: Any,
-) -> None:
-    """A saved caller result never answers a generated subagent call (0.7).
-
-    Earlier unreleased builds could pause a subagent call for a client and claim
-    a submitted result for it. Recovery checks the saved results against the
-    durable pending targets (pause and checkpoint) and the generated calls before
-    projecting or consuming anything. Approval submissions are runtime denials
-    and are not checked here.
-    """
-    from dendrux.loops.react import SubagentTool
-    from dendrux.runtime.submit import deserialize_tool_results, refuse_managed_results
-
-    if descriptor["kind"] != "tool_results":
-        return
-    results = deserialize_tool_results(payload.get("submitted_tool_results") or [])
-    targets = {
-        **(raw.get("pending_targets") or {}),
-        **{p["call_id"]: p.get("target") for p in state.get("pending", [])},
-        **{r.call_id: "agent" for r in results if isinstance(lookups.fn.get(r.name), SubagentTool)},
-    }
-    refuse_managed_results(run_id, targets, results)
 
 
 class _RecoveryBlockedError(Exception):
@@ -1059,14 +992,6 @@ async def _resolve_saved_call(
 _ORDINARY = object()
 
 
-@dataclass(frozen=True)
-class _ManagedPending:
-    """The one generated subagent call pending in a supported recovered batch (0.7)."""
-
-    call: ToolCall
-    admitted: bool
-
-
 async def _recover_managed_calls(
     agent: Agent, ctx: _ResumeContext, run_id: str, lookups: Any
 ) -> object:
@@ -1100,17 +1025,6 @@ async def _recover_managed_calls(
     return _ManagedPending(managed[0], admitted=state.get(ADMITTED_KEY) == managed[0].id)
 
 
-def _refuse_bound_pending(found: _ManagedPending | None, run_id: str, rows: dict[str, Any]) -> None:
-    """A pending managed call that already has a tool row is invalid state (0.7).
-
-    A bound call's parent is parked, never reclaimed with it pending.
-    """
-    from dendrux.errors import ManagedStateError
-
-    if found is not None and found.call.id in rows:
-        raise ManagedStateError(reason="binding_outstanding", run_id=run_id)
-
-
 async def _admitted_arguments(
     ctx: _ResumeContext, run_id: str, tc: ToolCall, lookups: Any
 ) -> list[ToolCall]:
@@ -1140,35 +1054,6 @@ async def _admit_recovered_call(
     if not ready or outcome.approval_gates:
         return list(outcome.pending_calls)
     return await _admit_managed_briefs(ready, lookups, _recovery_batch(ctx, run_id))
-
-
-def _managed_handoff(
-    agent: Agent, ctx: _ResumeContext, run_id: str, call: ToolCall, lookups: Any
-) -> RunResult:
-    """Hand the admitted managed call to the durable bind, after the server calls."""
-    from dendrux.loops.react import MANAGED_HANDOFF_KEY, ManagedHandoff
-
-    pause = replace(
-        ctx.pause_state,
-        history=ctx.history,
-        pending_tool_calls=[call],
-        pending_targets={call.id: "agent"},
-        approval_gates=None,
-        pending_decisions=None,
-    )
-    return RunResult(
-        run_id=run_id,
-        status=RunStatus.RUNNING,
-        steps=pause.steps,
-        iteration_count=pause.iteration,
-        usage=pause.usage,
-        meta={
-            "pause_state": pause,
-            MANAGED_HANDOFF_KEY: ManagedHandoff(
-                call=call, child=lookups.fn[call.name].agent, parent=agent
-            ),
-        },
-    )
 
 
 async def _refuse_recovered_batch(ctx: _ResumeContext, run_id: str, calls: list[ToolCall]) -> None:
@@ -1347,8 +1232,3 @@ async def _pending_rows(
     if not pending:
         return []
     return list(await store.get_tool_calls(run_id, iteration_index=iteration, limit=MAX_PAGE))
-
-
-def _handed_off(found: _ManagedPending | None, held: list[ToolCall]) -> bool:
-    """Only the admitted managed call is left: it goes to the bind (0.7)."""
-    return found is not None and [tc.id for tc in held] == [found.call.id]
