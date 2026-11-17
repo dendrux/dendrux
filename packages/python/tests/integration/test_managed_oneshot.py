@@ -289,6 +289,8 @@ async def test_guardrails_with_output_type_child_is_refused_on_a_continuation(
             )
     assert root_llm.calls == 1 and child_llm.calls == 0
     assert await rows(engine, AgentRun, AgentRun.parent_run_id == paused.run_id) == []
+    [root] = await rows(engine, AgentRun, AgentRun.id == paused.run_id)
+    assert root.status == "error"  # fix the definition and start a new run
 
 
 def test_single_call_parent_and_child_budget_stay_refused() -> None:
