@@ -22,7 +22,7 @@ from dendrux.runtime._fanout_adoption_state import (
     resolved_prefix,
 )
 
-PARENT = "01JCPARENT0000000000000000"
+PARENT = "01JC0000000000000000000001"
 BINDINGS = tuple(FanoutBinding(f"c{i}", f"child{i}") for i in range(1, 5))
 
 
