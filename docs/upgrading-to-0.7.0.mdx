@@ -1,0 +1,80 @@
+---
+title: Upgrading to 0.7.0
+description: What changes when you move from 0.6.x to 0.7.0 (managed subagents, store-kit contracts, sweep cursors, limits) and what custom-store authors must do.
+---
+
+# Upgrading to 0.7.0
+
+0.7.0 adds managed subagents, SingleCall children, an aggregate budget for agent trees, structural limits, and a bounded close after cancellation. It needs **no schema migration**: the migration head is unchanged from 0.6.1. Ordinary agents (no `subagents=`) keep working as before. See the [CHANGELOG](https://github.com/dendrux/dendrux/blob/main/packages/python/CHANGELOG.md) for the full list.
+
+## Do I need to do anything?
+
+| Your setup | Action |
+| --- | --- |
+| Built-in SQLite, PostgreSQL, MySQL or MariaDB store, no subagents | Upgrade and run. Read [Behaviour changes](#behaviour-changes) once. |
+| Using or planning `Agent(subagents=...)` | Read the [Managed subagents](/docs/guides/subagents) guide. Set one `Budget` on the root only. |
+| A custom `StateStore` or `SQLStateStore` subclass | Run the store kit again and fix what fails. See [Custom stores](#custom-stores). |
+| A maintenance job that calls `sweep()` | Read [Sweep changes](#sweep-changes). |
+| Imports from `dendrux.runtime.runner` or `dendrux.runtime.stores.sql.base` | Still work in 0.7.0. Move to public imports before the next release. See [Internal module split](#internal-module-split). |
+
+## Behaviour changes
+
+| Area | 0.6.x | 0.7.0 | What to do |
+| --- | --- | --- | --- |
+| Subagent definition cap | A private limit of 256 descendants (257 nodes counting the root) | `Limits.max_subagent_definitions` defaults to 256 nodes **including the root** (255 descendants) | If a tree has 256 descendants, raise the limit on the root Agent: `Limits(max_subagent_definitions=300)` |
+| Managed run cap | None | `Limits.max_managed_runs` defaults to 128, counting the root and completed children | Raise it for larger workflows. Hitting it refuses admission with `managed_run_limit` |
+| Child `budget=` | Not applicable | A registered child's own `budget=` is refused, and so is a root `include_children=False` | Remove the child budget. Put one `Budget` on the root; it counts the whole tree |
+| Unpriced calls in a managed tree | Not applicable | With `max_cost_usd` and `on_exceed` of `pause` or `cancel`, a new unpriced call anywhere in the tree stops it with `unpriced_call` | Add prices to your `PriceTable`, or resume through the root to accept the calls so far |
+| Cancelling a managed root | Not applicable | Always cancels managed descendants, with or without `cascade=` | Cancel with the root run id. Pass `cascade=True` to include legacy descendants as well |
+| `@tool(...)` typing | The decorated function was typed as `Any` | It keeps its signature for type checkers | Fix new mypy or pyright reports. Use `get_tool_def(my_tool)` from `dendrux.tool` instead of reading `__tool_def__` |
+| Guardrails with `output_type` on a subagent | Not applicable | Refused with `ValueError` at root entry | Use one or the other on a subagent |
+| `reclaim()` on a non-ReAct Agent | Looked up the run first | Raises `RunNotReclaimableError(reason="loop_unsupported")` before the lookup | Use a ReAct Agent to reclaim. A missing or foreign run now reports `loop_unsupported`, not `RunNotFoundError` |
+| Tool result for a subagent call | Not applicable | Refused with `ManagedResultRefusedError` (code `managed_result_refused`), a subclass of `InvalidToolResultError` | None. Existing `except InvalidToolResultError` handlers still catch it |
+| Cancel during a database close | A stalled close could hold a cancelled task forever on some paths | The wait is bounded by `CLOSE_AFTER_CANCEL_S` (5 seconds); the close then finishes in the background and `db_close_abandoned` is logged | Watch for that log code. It is rare |
+
+The 0.6 `FutureWarning`s are unchanged in 0.7.0. `sweep()` without `on_stale=` and `RunStore` list reads without `limit=` still warn instead of switching defaults. Keep following [Upgrading to 0.6.0](/docs/upgrading-to-0.6.0).
+
+## Sweep changes
+
+- **Cursor.** On native SQL stores a waiting-only `sweep()` call can now return a non-`None` cursor. It is an opaque `sweep:v1:` token. Pass it back unchanged as `cursor=result.cursor` with the same thresholds until it is `None`. Do not hand a saved 0.7 cursor to a 0.6.x process after a downgrade; discard it and start with `cursor=None`.
+- **Subagent waits are exempt.** `abandoned_waiting=` never abandons a parent that waits on a subagent. A malformed managed wait is reported (`managed_state_invalid`) and left unchanged. Both count toward `max_runs`.
+- **Stall bound.** A scan without a cursor restarts at the oldest waiting row. It can stall once `max_runs` exempt or corrupt waits sit in front of the ordinary pauses. Pass the cursor.
+- **Single call rows.** `mark_lease_expired(finalise_unrecoverable=False)` spares only stale rows without a loop marker. Every other stale row that cannot be reclaimed, including `single_call`, is finalised as `error` with `stale_running`.
+- **Scope.** A sweep is store-wide, not tenant-scoped. See [Recovery](/docs/guides/recovery#what-a-sweep-covers).
+- **A subagent run in `reclaimable`.** Reclaim its workflow root, not the subagent id. Calling `reclaim` on a subagent id raises `ManagedChildControlError`.
+
+## Custom stores
+
+A store that declares `recovery` or `managed_subagents`, or that subclasses `SQLStateStore`, must pass the 0.7 store kit. Run it again:
+
+```bash
+pytest -p dendrux.testing.store_kit
+```
+
+New contracts you will meet:
+
+- **`recovery`:** `reclaim_run` never claims a running run whose saved loop is `single_call`, fresh or stale, and changes nothing when it refuses.
+- **`recovery`:** `mark_lease_expired` finalises a stale `single_call` run as `error` with `stale_running` in both modes, bumps its claim epoch so an old writer is fenced, returns it once in `finalised`, and never in `reclaimable` or `get_lease_expired`.
+- **`recovery`:** a custom `sweep_abandoned_runs` must never sweep a managed wait. It gets no waiting continuation, so it bounds its own exempt-wait handling.
+- **`managed_subagents`:** `bind_managed_child` stores the child's loop state unchanged, including its `loop` marker, and enforces `Limits.max_managed_runs` inside its atomic bind, after replay detection and before any write.
+- **`managed_subagents`:** three more public reads, `get_managed_cancel_children_page`, `is_managed_root_stopped` and `get_managed_run_control`. See [State store](/docs/reference/state-store#managed-subagent-stores).
+
+A custom store that does not declare `managed_subagents` is unaffected by the managed methods. Using `subagents=` on it raises `StoreCapabilityError` when managed execution begins, before any write.
+
+## Internal module split
+
+`dendrux.runtime.runner` and `dendrux.runtime.stores.sql.base` were split into smaller modules. Their old import paths and names keep working in 0.7.0 through plain re-exports. They are internal modules and will lose the re-exports in a later release, with a migration note. If you imported from them, switch to `dendrux`, `dendrux.errors`, `dendrux.runtime.state` or `dendrux.testing`.
+
+If your tests patch a name inside one of those modules, patch the module that now owns it. A patch on the old path may no longer reach the code you meant to replace.
+
+## Known limits in 0.7.0
+
+- In-process `cancel_run` on a managed root is cooperative while a subagent's provider call is in flight: the call finishes, its report is not adopted, and the root ends cancelled.
+- A root `request_pause` during a SingleCall child's call has no effect.
+- A live child cut off from the database can be swept while its call completes. The call is billed but not recorded, so the root budget can undercount by one call.
+- A SingleCall child's budget events are advisory.
+- Model reasoning text is not scanned by guardrails.
+
+## Rolling back
+
+0.7.0 adds no schema revision, so the tables stay the same. Do not run a 0.6.x worker against runs that contain managed subagents: it refuses the managed pause format (`pause_format_unsupported`). Discard any saved composite sweep cursor before using 0.6.x.
