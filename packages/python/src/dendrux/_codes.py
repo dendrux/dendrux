@@ -1902,8 +1902,8 @@ LOOP_UNSUPPORTED = Code(
     logging.WARNING,
     "recovery",
     _BASE_FIELDS,
-    "The saved loop does not support recovery.",
-    "Use a supported loop for new recoverable runs.",
+    "The saved or current loop cannot continue the run (SingleCall never resumes).",
+    "For a SingleCall subagent, run sweep() and reclaim the root; else use ReActLoop.",
 )
 RECOVERY_CALL_MISSING = Code(
     "recovery_call_missing",

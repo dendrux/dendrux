@@ -28,7 +28,7 @@ from dendrux.loops._budget import BudgetTracker, breach_payload
 from dendrux.loops.react import MANAGED_HANDOFF_KEY
 from dendrux.runtime import _managed_cancel, _subagents
 from dendrux.runtime.durability import retry_transient_db
-from dendrux.runtime.state import LoopStatePatch, _initial_loop_state
+from dendrux.runtime.state import LoopStatePatch
 from dendrux.runtime.submit import _governance_change
 from dendrux.types import RunResult, RunStatus
 
@@ -136,8 +136,14 @@ def accepted_count(value: Any) -> int:
 
 
 def child_state(state: dict[str, Any] | None, accepted: int) -> dict[str, Any]:
-    """Seed a detached child checkpoint for atomic bind, retaining any higher count."""
-    seeded = dict(state or _initial_loop_state("ReActLoop") or {})
+    """Seed a detached child checkpoint for atomic bind, retaining any higher count.
+
+    The saved loop marker is never defaulted: sweep and reclaim key on it, and a
+    non-ReAct child saved as ``react`` would be reclaimable (definitions refuse first).
+    """
+    if (state or {}).get("loop") not in ("react", "single_call"):
+        raise RuntimeError("internal: a managed child needs a built-in loop marker")
+    seeded = dict(state or {})
     seeded[UNPRICED_ACCEPTED] = max(
         accepted_count(seeded.get(UNPRICED_ACCEPTED)), accepted_count(accepted)
     )

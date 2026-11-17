@@ -159,3 +159,73 @@ async def test_stream_example_yields_root_text_and_root_result(
             assert all(node.run.status == "success" for node in tree.nodes)
     assert child_model.calls_made == 1
     assert lead_model.calls_made == 2
+
+
+class _ProcessDeathError(BaseException):
+    """Ends the caller like a killed process: the child run stays ``running``."""
+
+
+class _DyingModel(MockLLM):
+    async def complete(self, *args: Any, **kwargs: Any) -> LLMResponse:
+        raise _ProcessDeathError
+
+
+async def test_recovery_example_adopts_an_interrupted_single_call_child(tmp_path: Path) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    from sqlalchemy import update
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from dendrux.db.models import AgentRun
+    from dendrux.loops.single import SingleCall
+
+    code = _fragment_code("for item in swept.stale_running:")
+    url = f"sqlite+aiosqlite:///{tmp_path / 'subagents-recovery.sqlite'}"
+
+    def workflow(lead_model: Any, child_model: Any) -> tuple[Agent, Agent]:
+        scorer = Agent(
+            name="scorer",
+            description="Score one draft.",
+            provider=child_model,
+            prompt="Score.",
+            loop=SingleCall(),
+        )
+        lead = Agent(
+            name="lead",
+            provider=lead_model,
+            prompt="Delegate the scoring, then summarize it.",
+            subagents=[scorer],
+            database_url=url,
+        )
+        return scorer, lead
+
+    first = MockLLM([_response(calls=[ToolCall("scorer", {"task": "Score: Sales rose."})])])
+    scorer, lead = workflow(first, _DyingModel([]))
+    async with scorer, lead:
+        with pytest.raises(_ProcessDeathError):
+            await lead.run("Score this draft.", tenant_id="acme")
+    engine = create_async_engine(url)
+    try:
+        async with engine.begin() as conn:  # the dead child's lease has long expired
+            await conn.execute(
+                update(AgentRun)
+                .where(AgentRun.parent_run_id.is_not(None))
+                .values(last_progress_at=datetime.now(UTC) - timedelta(hours=1))
+            )
+    finally:
+        await engine.dispose()
+
+    lead_model = MockLLM([_response(text="The scorer failed; no score.")])
+    child_model = MockLLM([_response(text="never called")])
+    scorer, lead = workflow(lead_model, child_model)
+    async with scorer, lead:
+        namespace: dict[str, Any] = {"lead": lead, "database_url": url, "RunStore": RunStore}
+        await eval(code, namespace)
+    assert [s.failure_reason for s in namespace["swept"].stale_running] == ["stale_running"]
+    assert child_model.calls_made == 0 and lead_model.calls_made == 1
+    async with RunStore.from_database_url(url) as store:
+        [root] = await store.list_runs(tenant_id="acme", agent_name="lead")
+        tree = await store.get_subtree(root.run_id, tenant_id="acme", max_nodes=10)
+    assert [n.run.status for n in tree.nodes] == ["success", "error"]
+    observation = lead_model.call_history[0]["messages"][-1]
+    assert json.loads(observation.content)["code"] == "managed_child_failed"

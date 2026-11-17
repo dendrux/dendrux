@@ -15,18 +15,23 @@ import json
 from typing import Any
 
 import pytest
-from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from dendrux import Agent, tool
 from dendrux.db.models import AgentRun, RunEvent, ToolCallRecord
-from dendrux.loops.base import BaseNotifier
-from dendrux.loops.single import SingleCall
+from dendrux.loops.base import BaseNotifier, Loop
 from dendrux.runtime.context import get_delegation_context
 from dendrux.runtime.state import MANAGED_HEADER_KEY
 from dendrux.store import RunStore
-from dendrux.types import LLMResponse, ProviderCapabilities, ToolCall, UsageStats
+from dendrux.types import (
+    LLMResponse,
+    ProviderCapabilities,
+    RunResult,
+    RunStatus,
+    ToolCall,
+    UsageStats,
+)
 from tests._helpers.scripted_provider import ScriptedLLM
 
 BRIEF = "SENTINEL-managed-brief-5c1d"
@@ -175,19 +180,22 @@ async def test_two_calls_in_separate_turns_get_two_children(store: Any, engine: 
     assert sorted(i.outcome for i in intents) == ["completed", "completed"]
 
 
-class Summary(BaseModel):
-    verdict: str
-    score: int
-
-
 class StructuredLLM(ContextLLM):
     capabilities = ProviderCapabilities(
         supports_native_tools=True, supports_tool_call_ids=True, supports_structured_output=True
     )
 
 
-async def test_non_react_child_is_refused_at_entry(store: Any, engine: Any) -> None:
-    """Managed participants are ReAct only (owner 2026-11-12): refused before any write."""
+class CustomLoop(Loop):
+    """Neither ReAct nor SingleCall: managed participants refuse it."""
+
+    async def run(self, *args: Any, run_id: str | None = None, **kwargs: Any) -> RunResult:
+        return RunResult(run_id=run_id or "", status=RunStatus.SUCCESS, answer="done")
+
+
+async def test_custom_loop_child_is_refused_at_entry(store: Any, engine: Any) -> None:
+    """Managed participants are ReAct or SingleCall only: any other loop is refused before
+    any write."""
     from dendrux.errors import SubagentDefinitionError
 
     child_llm = StructuredLLM([LLMResponse(text='{"verdict": "ok", "score": 3}')])
@@ -196,8 +204,7 @@ async def test_non_react_child_is_refused_at_entry(store: Any, engine: Any) -> N
         description="Scores a draft.",
         prompt="Score.",
         provider=child_llm,
-        loop=SingleCall(),
-        output_type=Summary,
+        loop=CustomLoop(),
     )
     root_llm = ContextLLM([call("scorer", {"task": BRIEF}, "r1"), LLMResponse(text="ok")])
     root = root_agent(store, root_llm, child)

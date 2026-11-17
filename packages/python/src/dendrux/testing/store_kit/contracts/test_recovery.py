@@ -6,7 +6,7 @@ under a higher epoch; the old owner is fenced out. Marking is bounded and pages 
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
@@ -286,3 +286,64 @@ async def test_replayed_tool_calls_are_listed_bounded_and_scoped(dendrux_kit: Ki
         False,
     )
     assert await store.get_replayed_tool_calls(run_id, tenant_id="other") == ([], False)
+
+
+async def _recovery_marks(store: Any, run_id: str) -> tuple[Any, ...]:
+    record = await store.get_run(run_id)
+    assert record is not None
+    return (record.status, record.claim_epoch, record.reclaim_attempts, record.lease_expired_at)
+
+
+@recovery
+async def test_a_running_single_call_run_is_never_reclaimed(dendrux_kit: Kit) -> None:
+    """A SingleCall run cannot continue from a checkpoint, so no reclaim may claim it.
+
+    Fresh or stale, with either ``loop_type``, ``reclaim_run`` refuses and changes nothing
+    (status, epoch, attempts, lease mark). The reason is not pinned: the reference store
+    checks the lease before the loop marker.
+    """
+    store = dendrux_kit.store
+    run_id = await started_run(dendrux_kit, loop="single_call")
+    before = await _recovery_marks(store, run_id)
+    for stale in (False, True):
+        if stale:
+            await lease_cutoff(dendrux_kit)
+        for loop_type in ("react", "single_call"):
+            with pytest.raises(RunNotReclaimableError):
+                await store.reclaim_run(
+                    run_id,
+                    tenant_id="t",
+                    agent_name="KitAgent",
+                    expected_claim_epoch=None,
+                    **{**RECLAIM, "loop_type": loop_type},
+                )
+            assert await _recovery_marks(store, run_id) == before, "a refusal changes nothing"
+
+
+@recovery
+@pytest.mark.parametrize("finalise_unrecoverable", [False, True])
+async def test_a_stale_single_call_run_is_finalised_never_marked_reclaimable(
+    dendrux_kit: Kit, finalise_unrecoverable: bool
+) -> None:
+    """Marking never returns a stale SingleCall run as reclaimable, in either mode: it ends
+    ``error``/``stale_running`` under a new epoch, so a surviving writer is fenced."""
+    store = dendrux_kit.store
+    run_id = await started_run(dendrux_kit, loop="single_call")
+    cutoff = await lease_cutoff(dendrux_kit)
+    marked = await mark(dendrux_kit, cutoff, finalise_unrecoverable=finalise_unrecoverable)
+    assert marked.reclaimable == []
+    assert [(s.run_id, s.status, s.failure_reason) for s in marked.finalised] == [
+        (run_id, RunStatus.ERROR.value, FailureReason.STALE_RUNNING.value)
+    ]
+    assert await store.get_lease_expired(limit=10, cursor=None) == []
+    record = await store.get_run(run_id)
+    assert record is not None and record.status == RunStatus.ERROR.value
+    assert record.failure_reason == FailureReason.STALE_RUNNING.value
+    with pytest.raises(RunFencedError):
+        await store.save_run_event(run_id, event_type=EVENT, claim_epoch=0)
+    with pytest.raises(RunNotReclaimableError):
+        await store.reclaim_run(
+            run_id, tenant_id="t", agent_name="KitAgent", expected_claim_epoch=None, **RECLAIM
+        )
+    again = await mark(dendrux_kit, cutoff, finalise_unrecoverable=finalise_unrecoverable)
+    assert (again.reclaimable, again.finalised) == ([], []), "finalised once"

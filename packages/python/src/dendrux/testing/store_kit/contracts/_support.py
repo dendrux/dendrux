@@ -108,14 +108,14 @@ RECLAIM: dict[str, Any] = {
 }
 
 
-async def started_run(kit: Kit, tenant: str | None = "t") -> str:
-    """A running format-2 run that has started and checkpointed, so it can be reclaimed."""
+async def started_run(kit: Kit, tenant: str | None = "t", *, loop: str = "react") -> str:
+    """A running format-2 run that has started and checkpointed (reclaimable when ``react``)."""
     run_id = await kit.new_run(tenant_id=tenant)
     await kit.store.save_run_event(run_id, event_type=StoredEventType.RUN_STARTED.value)
     await kit.store.checkpoint_step(
         run_id,
         claim_epoch=0,
-        loop_state={"v": 1, "loop": "react", "phase": "dispatch"},
+        loop_state={"v": 1, "loop": loop, "phase": "dispatch"},
         pii_mapping=None,
         trace=None,
     )

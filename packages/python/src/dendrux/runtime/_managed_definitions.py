@@ -1,11 +1,18 @@
-"""Check a root's registered subagent definitions before managed execution."""
+"""Which subagent definitions and loops a managed workflow supports, checked before effects."""
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any
 
-from dendrux.errors import SubagentDefinitionError, SubagentTreeTooLargeError
+from dendrux import _codes
+from dendrux.errors import (
+    RunNotReclaimableError,
+    SubagentDefinitionError,
+    SubagentTreeTooLargeError,
+)
 from dendrux.loops.react import ReActLoop
+from dendrux.loops.single import SingleCall
 from dendrux.runtime import _subagents
 
 if TYPE_CHECKING:
@@ -13,11 +20,13 @@ if TYPE_CHECKING:
 
     from dendrux.agent import Agent
 
+logger = logging.getLogger(__name__)
+
 
 def _check_definitions(root: Agent, store: Any) -> None:
-    """Every registered child has a provider and shares the root's store object."""
+    """Every registered child has a supported loop, a provider and the root's store object."""
     for parent, child in _definition_edges(root):
-        _require_react(parent, child)
+        require_bindable(parent, child)
         if child.provider is None:
             raise ValueError(f"Subagent '{child.name}' needs a provider.")
         own = getattr(child, "_state_store", None)
@@ -59,12 +68,49 @@ def _definition_edges(root: Agent) -> Iterator[tuple[Agent, Agent]]:
         stack.extend((child, grandchild) for grandchild in child.subagents)
 
 
-def _require_react(parent: Agent, child: Agent) -> None:
-    """Managed participants are durable ReAct runs only (owner 2026-11-12)."""
+def require_bindable(parent: Agent, child: Agent) -> None:
+    """A child may be bound: a supported loop, and not guardrails with output_type.
+
+    Checked at root entry and again at every bind, live or recovered (resume, submit,
+    reclaim), before any write. SingleCall refuses the pair only inside its run, after
+    the bind, so the parent's model could otherwise retry a call that can never work.
+    """
+    _require_supported_loop(parent, child)
+    if child.guardrails and getattr(child, "_output_type", None) is not None:
+        raise ValueError(f"Subagent '{child.name}' cannot combine guardrails with output_type.")
+
+
+def _require_supported_loop(parent: Agent, child: Agent, *, paused: bool = False) -> None:
+    """A managed child runs as ReAct or SingleCall; any other loop is refused.
+
+    ``paused``: the child continues a paused run, which only ReAct can do.
+    """
     loop = child._effective_loop(None)
-    if loop is not None and not isinstance(loop, ReActLoop):
+    allowed = ReActLoop if paused else (ReActLoop, SingleCall)
+    if loop is not None and not isinstance(loop, allowed):
         _subagents.refuse(
             SubagentDefinitionError(
                 parent.name, reason="loop_unsupported", subagent_name=child.name
             )
         )
+
+
+def require_resumable_leaf(found: Any) -> None:
+    """A paused subagent is continued by ReAct only: a SingleCall agent never pauses.
+
+    Refuses a definition that changed loop since the leaf paused, before its claim.
+    """
+    if found.routed and not isinstance(found.leaf_agent._effective_loop(None), ReActLoop):
+        _require_supported_loop(found.waiting[-1].parent_agent, found.leaf_agent, paused=True)
+
+
+def require_claimable(leaf_id: str, saved_loop: str | None) -> None:
+    """A running SingleCall leaf is never claimed, on any store.
+
+    It cannot continue from a checkpoint: ``sweep()`` fails it, then the root's reclaim
+    adopts that failure. Refused before the store is asked, so nothing changes; for
+    the caller ``loop_unsupported`` here means "run sweep(), then reclaim the root".
+    """
+    if saved_loop == "single_call":
+        _codes.log_code(logger, _codes.LOOP_UNSUPPORTED, run_id=leaf_id)
+        raise RunNotReclaimableError(leaf_id, "loop_unsupported")
