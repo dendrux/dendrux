@@ -102,6 +102,9 @@ class _ManagedPending:
     admitted: bool
 
 
+_ManagedPending.__module__ = "dendrux.runtime._reclaim"
+
+
 def _refuse_bound_pending(found: _ManagedPending | None, run_id: str, rows: dict[str, Any]) -> None:
     """A pending managed call that already has a tool row is invalid state (0.7).
 

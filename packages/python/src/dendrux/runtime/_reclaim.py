@@ -21,15 +21,16 @@ from dendrux._lifecycle import (
 )
 from dendrux.errors import PersistenceError, RunNotFoundError, RunNotReclaimableError
 from dendrux.loops._helpers import order_observations, project_message, record_message, record_tool
+from dendrux.runtime import _reclaim_managed
 from dendrux.runtime._bounds import MAX_PAGE
+from dendrux.runtime._reclaim_managed import _finish_saved_adoption as _finish_saved_adoption
+from dendrux.runtime._reclaim_managed import _handed_off as _handed_off
+from dendrux.runtime._reclaim_managed import _managed_handoff as _managed_handoff
+from dendrux.runtime._reclaim_managed import _ManagedPending as _ManagedPending
+from dendrux.runtime._reclaim_managed import _pending_adoption as _pending_adoption
+from dendrux.runtime._reclaim_managed import _refuse_bound_pending as _refuse_bound_pending
 from dendrux.runtime._reclaim_managed import (
-    _finish_saved_adoption,
-    _handed_off,
-    _managed_handoff,
-    _ManagedPending,
-    _pending_adoption,
-    _refuse_bound_pending,
-    _refuse_recovered_managed_results,
+    _refuse_recovered_managed_results as _refuse_recovered_managed_results,
 )
 from dendrux.runtime.context import managed_root_reclaim_scope
 from dendrux.runtime.persistence import PersistenceRecorder, resolve_pending
@@ -82,10 +83,10 @@ async def reclaim(
         # Last resort: unreachable when the store and its reads agree. The claim
         # cost one recovery attempt; nothing runs and the root reclaims later.
         _refuse_direct_child(run_id, claim.loop_state)
-    if _pending_adoption(claim.loop_state):
+    if _reclaim_managed._pending_adoption(claim.loop_state):
         # A managed parent claimed for adoption before its tool row completed:
         # finish that adoption from the saved report, then continue (0.7).
-        claim = await _finish_saved_adoption(agent, owned, run_id, claim)
+        claim = await _reclaim_managed._finish_saved_adoption(agent, owned, run_id, claim)
     return await _continue_session(agent, store, run_id, claim, notifier, session)
 
 
@@ -608,7 +609,7 @@ async def _consume_recovery_submission(
     if descriptor:
         raw = await store.get_pause_state(run_id) or {}
         payload = _submission_payload(raw)
-        _refuse_recovered_managed_results(
+        _reclaim_managed._refuse_recovered_managed_results(
             run_id, descriptor, raw, recorder._loop_state, payload, lookups
         )
         injected = _recovery_input(payload, descriptor["kind"])
@@ -1200,7 +1201,7 @@ async def resolve(
         phases={p["call_id"]: p["phase"] for p in pending},
         reserved=counts.copy(),
     )
-    _refuse_bound_pending(found, run_id, by_id)
+    _reclaim_managed._refuse_bound_pending(found, run_id, by_id)
     barrier = await prep.prepare_all(store, actions, by_id)
     if barrier is not None:
         return barrier
@@ -1220,8 +1221,8 @@ async def resolve(
     if barrier is not None:
         return barrier
     order_observations(recorder, ctx.history)
-    if _handed_off(found, held):
-        return _managed_handoff(agent, ctx, run_id, held[0], lookups)
+    if _reclaim_managed._handed_off(found, held):
+        return _reclaim_managed._managed_handoff(agent, ctx, run_id, held[0], lookups)
     return await _recovery_pause_result(store, run_id, ctx, state, descriptor, held, prep.gates)
 
 
