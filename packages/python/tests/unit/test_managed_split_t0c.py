@@ -42,6 +42,20 @@ MOVED = {
         "_intent_call",
         "_registered",
     ),
+    "dendrux.runtime._managed_stream": (
+        "_StreamState",
+        "_structural",
+        "_continuation_stream",
+        "_event",
+        "_Terminal",
+        "_paused_or_failed",
+        "_stream_failure",
+        "_close_workflow",
+        "_cancel_unstarted",
+        "_event_with_error",
+        "_Started",
+        "_Single",
+    ),
 }
 # Tests patch these on the facade; the driver must keep reading them there.
 PATCH_SEAMS = ("route", "claim_adoption", "adopt", "complete_adoption", "_run_child", "bind_child")
@@ -58,7 +72,7 @@ def test_moved_name_is_the_same_object_through_the_facade(module: str, name: str
 
 @pytest.mark.parametrize(
     "name",
-    ["_Waiting", "Route", "AcceptedReport"],
+    ["_Waiting", "Route", "AcceptedReport", "_StreamState", "_Terminal", "_Started", "_Single"],
 )
 def test_moved_class_keeps_its_original_identity(name: str) -> None:
     cls = getattr(_managed, name)
