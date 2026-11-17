@@ -10,6 +10,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
     from datetime import datetime
 
+    from sqlalchemy import Select
     from sqlalchemy.ext.asyncio import AsyncSession
 
     from dendrux.db._live_updates import LiveUpdates
@@ -42,6 +43,9 @@ class _StoreHost:
 
         @abstractmethod
         async def _prepare_commit_readback(self, session: AsyncSession) -> None: ...
+
+        @abstractmethod
+        def _parent_run_query(self, statement: Select[Any]) -> Select[Any]: ...
 
         @abstractmethod
         def child_page_query(

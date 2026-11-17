@@ -8,13 +8,14 @@ from contextvars import ContextVar
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Literal
 
-from sqlalchemy import String
+from sqlalchemy import Select, String
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.sql.functions import FunctionElement
 
 from dendrux._meta_keys import (
     STORE_SESSION_KEY,
 )
+from dendrux.db.models import AgentRun
 from dendrux.runtime.durability import _safe_database_call
 from dendrux.runtime.state import _TERMINAL_STATUS_VALUES
 from dendrux.runtime.stores.sql.base import SQLStateStore
@@ -138,6 +139,13 @@ class MySQLStateStore(SQLStateStore):
     ) -> None:
         super().__init__(engine, live_updates=live_updates)
         self.capabilities = replace(self.capabilities, deployment="multi_server")
+
+    def _parent_run_query(self, statement: Select[Any]) -> Select[Any]:
+        # ORDER BY + LIMIT can prefer a history-wide ordering-index scan over
+        # the parent lookup. Sort only the matching parents' children instead.
+        return statement.with_hint(
+            AgentRun.__table__, "FORCE INDEX (ix_agent_runs_parent_run_id)", dialect_name="mysql"
+        )
 
     def _waiting_sweep_page(
         self, statement: Any, after: tuple[datetime, str] | None, limit: int
