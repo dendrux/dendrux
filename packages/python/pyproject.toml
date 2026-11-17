@@ -73,14 +73,14 @@ dev = [
     "uvicorn[standard]==0.54.0",
     "build==1.6.1",
     "pytest==9.2.0",
-    "pytest-asyncio==1.4.1.post1",
+    "pytest-asyncio==1.5.0",
     "pytest-cov==7.1.0",
     "coverage==7.17.0",
     # Random order and parallel runs: both are on for every test run.
-    "pytest-randomly==5.0.0",
+    "pytest-randomly==5.1.0",
     "pytest-xdist==3.8.0",
     # Fast loop (make test-fast) and the flaky quarantine. See tools/QUALITY.md, "Test tiers".
-    "pytest-testmon==2.2.0",
+    "pytest-testmon==2.3.0",
     "pytest-rerunfailures==16.7",
     # Per-test time limit (timeout = 300 below); see tools/QUALITY.md, "Test timeout".
     "pytest-timeout==2.4.0",
@@ -95,11 +95,11 @@ dev = [
     "griffe==2.4.1",
     "import-linter==2.15",
     # Keep in step with .pre-commit-config.yaml (rev: v0.15.17).
-    "ruff==0.15.17",
-    "mypy==1.20.2",
-    "types-PyYAML==6.0.12.20261030",
+    "ruff==0.17.5",
+    "mypy==2.4.1",
+    "types-PyYAML==6.0.12.20261113",
     "python-dotenv==1.2.4",
-    "twine==6.2.0",
+    "twine==7.0.0",
     "dendrux[otel]",
     "opentelemetry-sdk==1.45.2",
     # Real-Redis tests of RedisUpdates (DENDRUX_TEST_REDIS_URL); the extra stays out of `all`.
