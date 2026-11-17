@@ -165,3 +165,70 @@ def test_move_check_cli_accepts_only_the_manifest_base(tmp_path: Path, monkeypat
     assert json.loads((root / "result.json").read_text()) == {"old": {"f": "new"}}
     args[1] = "HEAD"
     assert main(args) == 1
+
+
+def _receipt(root: Path, commit: str | None = None, manifests: list[str] | None = None) -> None:
+    body = {
+        "final_split_commit": commit or git(root, "rev-parse", "HEAD"),
+        "manifests": ["fixture.json"] if manifests is None else manifests,
+    }
+    (root / "tools/moves/retirement.json").write_text(json.dumps(body))
+    git(root, "add", ".")
+    git(root, "commit", "-qm", "Retire")
+
+
+def _importlinter(root: Path) -> None:
+    (root / ".importlinter").write_text(
+        "[importlinter:contract:split-no-facade-backedge]\nsource_modules = new\n"
+    )
+    (root / "src").mkdir(exist_ok=True)
+
+
+def test_retirement_receipt_turns_discovery_off(tmp_path: Path) -> None:
+    root, _ = repository(tmp_path)
+    assert run(root, "--discover").stdout.strip() == "true"
+    _receipt(root)
+    done = run(root, "--discover")
+    assert done.returncode == 0 and done.stdout.strip() == "false"
+
+
+@pytest.mark.parametrize(
+    "receipt",
+    [
+        "not json",
+        '{"final_split_commit": "%s", "manifests": ["fixture.json"], "x": 1}',
+        '{"final_split_commit": "z", "manifests": ["fixture.json"]}',
+        '{"final_split_commit": "%s", "manifests": []}',
+        '{"final_split_commit": "%s", "manifests": ["other.json"]}',
+        '{"final_split_commit": "%s", "manifests": ["fixture.json"]}',
+    ],
+)
+def test_bad_receipt_fails_closed(tmp_path: Path, receipt: str) -> None:
+    root, _ = repository(tmp_path)
+    head = git(root, "rev-parse", "HEAD")
+    text = receipt % head if "%s" in receipt else receipt
+    if receipt.endswith('["fixture.json"]}') and "x" not in receipt and "z" not in receipt:
+        text = receipt % ("f" * 40)  # not an ancestor of HEAD
+    (root / "tools/moves/retirement.json").write_text(text)
+    assert run(root, "--discover").returncode == 1
+
+
+def test_manifest_added_after_receipt_reactivates_discovery(tmp_path: Path) -> None:
+    root, _ = repository(tmp_path)
+    _receipt(root)
+    (root / "tools/moves/pr99.json").write_text("{}")
+    done = run(root, "--discover")
+    assert done.returncode == 0 and done.stdout.strip() == "true"
+
+
+def test_receipt_without_covered_manifest_fails_closed(tmp_path: Path) -> None:
+    root, _ = repository(tmp_path)
+    _receipt(root)
+    (root / "tools/moves/fixture.json").unlink()
+    assert run(root, "--discover").returncode == 1
+
+
+def test_split_sources_without_manifest_or_receipt_still_fail(tmp_path: Path) -> None:
+    _importlinter(tmp_path)
+    (tmp_path / "src/new.py").write_text("x = 1\n")
+    assert run(tmp_path, "--discover").returncode == 1

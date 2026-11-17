@@ -17,6 +17,7 @@ from tools._move_manifest import verify_provider_sources
 from tools._ratchet import module_name
 from tools.move_check import _git_show, _patch_map, check_move
 
+RETIREMENT = "retirement.json"
 RUNNER_BASE = "c2e3169700c14341f85599b23066a43886234123"
 
 
@@ -37,8 +38,46 @@ def _manifests(directory: Path) -> list[Path]:
     return sorted(
         p
         for p in directory.glob("*.json")
-        if not p.name.endswith(("-emitted.json", "-expanded.json")) and p.name != "sql-base.json"
+        if not p.name.endswith(("-emitted.json", "-expanded.json"))
+        and p.name not in {"sql-base.json", RETIREMENT}
     )
+
+
+def _retired(directory: Path) -> tuple[set[str], set[str]] | None:
+    """Return (covered manifest names, their destinations) from a valid receipt, else None.
+
+    Absent receipt returns None. A malformed or unprovable receipt raises (fail closed).
+    """
+    path = directory / RETIREMENT
+    if not path.exists():
+        return None
+    _tracked(path)
+    receipt = json.loads(path.read_text())
+    if not isinstance(receipt, dict) or set(receipt) != {"final_split_commit", "manifests"}:
+        raise ValueError("retirement receipt has unexpected fields")
+    commit, names = receipt["final_split_commit"], receipt["manifests"]
+    if (
+        not isinstance(commit, str)
+        or len(commit) != 40
+        or any(c not in "0123456789abcdef" for c in commit)
+    ):
+        raise ValueError("retirement receipt needs the full final split commit SHA")
+    if (
+        not isinstance(names, list)
+        or not names
+        or names != sorted(set(names))
+        or not all(isinstance(n, str) for n in names)
+    ):
+        raise ValueError("retirement receipt manifest set is malformed")
+    _git("merge-base", "--is-ancestor", commit, "HEAD")
+    present = {p.name for p in _manifests(directory)}
+    if not set(names) <= present:
+        raise ValueError("retirement receipt covers a manifest that is not tracked")
+    destinations: set[str] = set()
+    for name in names:
+        _tracked(directory / name)
+        destinations.update(json.loads((directory / name).read_text())["sources"])
+    return set(names), destinations
 
 
 def _created_sources() -> set[str]:
@@ -120,8 +159,10 @@ def _run(path: Path) -> tuple[str, set[str]]:
 def run_manifests(directory: Path) -> int:
     """Check every active family manifest; an absent manifest is an error."""
     try:
-        paths = _manifests(directory)
-        if not paths:
+        retired = _retired(directory)
+        covered, retired_destinations = retired or (set(), set())
+        paths = [p for p in _manifests(directory) if p.name not in covered]
+        if not paths and retired is None:
             raise ValueError("absent move manifest")
         roots = set()
         destinations = set()
@@ -131,7 +172,9 @@ def run_manifests(directory: Path) -> int:
                 raise ValueError("keep one active cumulative manifest per original module")
             roots.add(old)
             destinations.update(sources)
-        if _created_sources() - destinations:
+        if not paths:
+            return 0
+        if _created_sources() - destinations - retired_destinations:
             raise ValueError("cumulative manifest omits created split destinations")
     except (OSError, ValueError, KeyError, TypeError, SystemExit) as exc:
         print(f"move-proof: refused: {exc}")
@@ -146,8 +189,12 @@ def main() -> int:
     parser.add_argument("--discover", action="store_true")
     args = parser.parse_args()
     if args.discover:
-        active = bool(_manifests(args.directory))
-        if not active and _created_sources():
+        try:
+            covered = (_retired(args.directory) or (set(), set()))[0]
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            parser.exit(1, f"move-proof: refused: {exc}\n")
+        active = any(p.name not in covered for p in _manifests(args.directory))
+        if not active and not covered and _created_sources():
             parser.exit(1, "move-proof: split sources exist without a manifest\n")
         print("true" if active else "false")
         return 0
