@@ -6,7 +6,6 @@ import json
 from pathlib import Path
 
 import pytest
-import yaml
 
 from tests.tooling.test_move_manifest import manifest, proof
 from tools.move_check import check_move
@@ -106,14 +105,6 @@ def test_unknown_lexical_references_name_the_bad_entry(field: str, value: str) -
     report = proof(old, after, {"f": "new"}, lexical=[entry])
     assert not report.ok
     assert any("lexical" in p and value in p for p in report.problems), report.problems
-
-
-def test_detect_job_pins_the_python_interpreter() -> None:
-    path = Path(__file__).resolve().parents[4] / ".github/workflows/ci.yml"
-    steps = yaml.safe_load(path.read_text())["jobs"]["move-manifests"]["steps"]
-    setup = next((s for s in steps if s.get("uses", "").startswith("actions/setup-python@")), None)
-    assert setup is not None
-    assert setup["with"]["python-version"] == "3.11"
 
 
 @pytest.mark.parametrize("missing", ["a:PLC0415", "b:PLC0415"])

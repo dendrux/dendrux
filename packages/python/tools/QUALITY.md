@@ -416,7 +416,7 @@ more time, mark it `@pytest.mark.timeout(<seconds>)` and say why.
 only the reviewed lexical, import-hoist, annotation and metadata normalizations, plus the named shared logger's original
 module-name literal.
 Without a manifest the ordinary checker retains its previous strict behavior.
-The schema, exact PR1 command and temporary CI lifecycle are in
+The schema and how to start a future split are in
 [`moves/README.md`](moves/README.md). `make move-proof` verifies tracked cumulative
 sources and maps from their immutable original bases. Private owner-docs files are
 never CI inputs.
