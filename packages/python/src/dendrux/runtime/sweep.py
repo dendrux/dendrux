@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import json
 import logging
-import warnings
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -130,7 +129,7 @@ async def sweep(
     batch_size: int = SWEEP_BATCH_DEFAULT,
     max_runs: int = SWEEP_MAX_RUNS_DEFAULT,
     database_options: dict[str, Any] | None = None,
-    on_stale: Literal["error", "reclaim"] | None = None,
+    on_stale: Literal["error", "reclaim"] | None = "reclaim",
     max_reclaims: int = SWEEP_MAX_RECLAIMS_DEFAULT,
     max_returned: int = SWEEP_MAX_RETURNED_DEFAULT,
     cursor: str | None = None,
@@ -168,9 +167,10 @@ async def sweep(
             or continue with the returned cursor to reach later running IDs and
             waiting index windows, including past exempt or corrupt waits. Running
             population is bounded operationally by live concurrency plus orphan backlog.
-        on_stale: ``"error"`` finalises stale runs; ``"reclaim"`` marks recoverable
-            ReAct runs for explicit ``Agent.reclaim()``. Omission warns when stale
-            rows are found and retains ``"error"`` behavior through 0.6.
+        on_stale: ``"reclaim"`` (the default since 0.7.0; ``None`` selects it
+            too) marks recoverable ReAct runs for explicit ``Agent.reclaim()``,
+            finalises the rest and needs a store with the ``recovery`` capability.
+            ``"error"`` finalises every stale run, the behaviour before 0.7.0.
         max_reclaims: Attempt limit stored by each new mark (default 3).
             Rediscovering an existing mark preserves its stored limit.
         max_returned: Maximum reclaimable runs returned (default 1,000).
@@ -178,7 +178,7 @@ async def sweep(
             wraps; None in the result means both scans reached their end. Continue
             with the same thresholds; omit the cursor to start a new scan. Native
             SQL stores continue waiting scans. Repeats without a cursor restart
-            at the oldest waiting row and can stall behind more than max_runs
+            at the oldest waiting row and can stall behind at least max_runs
             exempt or corrupt waits; pass result.cursor to reach later rows.
             Custom stores and SQLStateStore subclasses overriding
             sweep_abandoned_runs get no waiting continuation and must bound
@@ -192,10 +192,12 @@ async def sweep(
     """
     _validate_source(database_url, state_store, database_options)
     _validate_thresholds(stale_running, abandoned_waiting)
+    if on_stale is None:
+        on_stale = "reclaim"
     if stale_running is None and abandoned_waiting is None and on_stale != "reclaim":
         return SweepResult(stale_running=[])
 
-    if on_stale not in (None, "error", "reclaim"):
+    if on_stale not in ("error", "reclaim"):
         raise ValueError("on_stale must be error or reclaim")
     if cursor is not None and not isinstance(cursor, str):
         raise ValueError("cursor must be a string or None")
@@ -245,7 +247,7 @@ async def sweep(
                         max_returned=max_returned,
                         reclaim_limit=max_reclaims,
                         cursor=progress.running,
-                        on_stale=on_stale or "error",
+                        on_stale=on_stale,
                     )
                     stale, reclaimable, next_cursor = page.finalised, page.reclaimable, page.cursor
                 elif on_stale == "reclaim":
@@ -261,13 +263,6 @@ async def sweep(
                     stale, reclaimable, next_cursor = page.finalised, page.reclaimable, page.cursor
                 else:
                     stale = await store.sweep_stale_runs(older_than=stale_running, **limits)
-                if on_stale is None and stale:
-                    warnings.warn(
-                        'sweep() will default to on_stale="reclaim" in 0.7; '
-                        'pass on_stale="error" to keep finalising stale runs.',
-                        FutureWarning,
-                        stacklevel=2,
-                    )
             progress.running = next_cursor
             progress.running_done = next_cursor is None
             abandoned = await _sweep_waiting(store, abandoned_waiting, limits, progress)

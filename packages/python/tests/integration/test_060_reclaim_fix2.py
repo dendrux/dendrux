@@ -49,7 +49,7 @@ async def test_n1_sweep_validates_recovery_before_calling_store(
 
     store = OldMarker(engine) if native else OldMarker()
     kwargs = {"stale_running": timedelta(minutes=1)} if has_threshold else {}
-    if policy == "reclaim":
+    if policy != "error":  # an omitted policy (None) is "reclaim" since 0.7.0
         with pytest.raises(StoreCapabilityError) as exc:
             await sweep(state_store=store, on_stale=policy, **kwargs)
         assert exc.value.capability == "recovery"

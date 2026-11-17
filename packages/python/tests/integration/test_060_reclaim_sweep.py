@@ -42,37 +42,36 @@ async def scan(store, **kwargs):
     "fmt,marker", [(1, None), (2, "react"), (2, "single_call"), (2, None), (2, "invalid")]
 )
 async def test_outcome_table(store, engine, caplog, policy, fmt, marker):
+    """Since 0.7.0 an omitted policy is ``"reclaim"``; ``"error"`` keeps finalising."""
     run_id = await candidate(store, engine, fmt=fmt, marker=marker)
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         result = await scan(store, **({"on_stale": policy} if policy else {}))
-    if policy == "reclaim" and fmt == 2 and marker == "react":
+    reclaims = policy != "error"
+    if reclaims and fmt == 2 and marker == "react":
         assert [r.run_id for r in result.reclaimable] == [run_id]
         assert (await store.get_run(run_id)).status == "running"
     else:
         assert [r.run_id for r in result.stale_running] == [run_id]
-        expected = "stale_running_legacy" if policy == "reclaim" and fmt == 1 else "stale_running"
+        expected = "stale_running_legacy" if reclaims and fmt == 1 else "stale_running"
         assert result.stale_running[0].failure_reason == expected
         assert (await store.get_run(run_id)).status == "error"
         assert any(
             getattr(r, "run_id", None) == run_id and getattr(r, "code", None)
             for r in caplog.records
         )
-    matching = warnings_of(caught, FutureWarning, r"sweep\(\) will default")
-    assert len(matching) == (policy is None)
-    if policy is None:
-        assert matching[0].filename == __file__
+    assert not warnings_of(caught, FutureWarning)
 
 
-async def test_warning_only_with_stale_rows_and_no_once_flag(store, engine):
+async def test_omitted_policy_never_warns(store, engine):
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         await scan(store)
-        assert not warnings_of(caught, FutureWarning, r"sweep\(\) will default")
-        for _ in range(2):
+        for count in (1, 2):
             await candidate(store, engine)
-            await scan(store)
-        assert len(warnings_of(caught, FutureWarning, r"sweep\(\) will default")) == 2
+            # A marked run is rediscovered, so each pass returns every mark so far.
+            assert len((await scan(store)).reclaimable) == count
+    assert not warnings_of(caught, FutureWarning)
 
 
 @pytest.mark.parametrize("policy", ["error", "reclaim"])
