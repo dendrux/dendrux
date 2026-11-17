@@ -34,7 +34,6 @@ from dendrux.db._pool_guard import (
     _bind_to_current_loop,
     close_fully,
     serialized,
-    shares_one_connection,
 )
 from dendrux.db._schema_check import ensure_schema_current
 from dendrux.db._sqlite_sync import create_sqlite_schema
@@ -171,23 +170,14 @@ async def get_session(engine: AsyncEngine | None = None) -> AsyncGenerator[Async
         factory = sessionmaker(  # type: ignore[call-overload]
             resolved_engine, class_=AsyncSession, expire_on_commit=False
         )
-    if not shares_one_connection(resolved_engine):
-        async with factory() as session:
-            try:
-                yield session
-                await session.commit()
-            except Exception:
-                await session.rollback()
-                raise
-        return
+    # serialized() takes no lock on multi-connection pools. On error the close rolls
+    # back: an explicit rollback() there could wait forever on a connection the driver
+    # stopped after a cancellation, while close_fully bounds that wait.
     async with serialized(resolved_engine):
         session = factory()
         try:
             yield session
             await session.commit()
-        except Exception:
-            await session.rollback()
-            raise
         finally:
             await close_fully(session.close)
 

@@ -20,7 +20,6 @@ from typing import TYPE_CHECKING
 import pytest
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
-from sqlalchemy.orm import sessionmaker
 
 from dendrux import Agent, tool
 from dendrux.db import _pool_guard
@@ -29,6 +28,7 @@ from dendrux.db._sqlite_sync import create_sqlite_schema
 from dendrux.db.models import AgentRun, RunEvent, ToolCallRecord
 from dendrux.llm.mock import MockLLM
 from dendrux.runtime.stores._factory import store_for_engine
+from dendrux.runtime.stores.sql._sql_sessions import _ClosingSessionFactory
 from dendrux.types import LLMResponse, ToolCall
 
 if TYPE_CHECKING:
@@ -221,7 +221,7 @@ async def test_independent_connection_pools_take_no_lock(engine, caplog) -> None
     with caplog.at_level(logging.WARNING, logger=_GUARD_LOGGER):
         store = store_for_engine(engine)
     assert not [r for r in caplog.records if r.name == _GUARD_LOGGER]
-    assert isinstance(store._session_factory._factory, sessionmaker)
+    assert isinstance(store._session_factory._factory, _ClosingSessionFactory)
 
     async with serialized(engine):
         assert not _guards_for(engine)
