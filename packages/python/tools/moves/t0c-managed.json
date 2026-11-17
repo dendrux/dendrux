@@ -4,25 +4,26 @@
  "old": "src/dendrux/runtime/_managed.py",
  "source_sha256": "1d2bc47e57cabb49d08def5342e2d8ae2bcac2091943d34f1aea57fb5bb04472",
  "sources": {
-  "src/dendrux/runtime/_managed.py": "f808dbeffda0b3468ebf5eefffd21f88794b2f901b7d13e2a39c81b027c21cba",
-  "src/dendrux/runtime/_managed_route.py": "b3199a1e922d1fccf10a1a44cf4046c37da11f5a87c74f9e7d12d6ee92bdedd6"
+  "src/dendrux/runtime/_managed.py": "29dba70822653ec0a23dd032a1c125e07d991c401f7620d0511f021931262d86",
+  "src/dendrux/runtime/_managed_route.py": "b3199a1e922d1fccf10a1a44cf4046c37da11f5a87c74f9e7d12d6ee92bdedd6",
+  "src/dendrux/runtime/_managed_adoption.py": "f428620e679c675bafa4729b81bb70cfdce49d28834c4ada79b827b1eb788c94"
  },
  "owners": {
   "<Expr>": "src/dendrux/runtime/_managed.py",
   "ADMITTED_KEY": "src/dendrux/runtime/_managed.py",
-  "AcceptedReport": "src/dendrux/runtime/_managed.py",
-  "CHILD_CANCELLED": "src/dendrux/runtime/_managed.py",
-  "CHILD_FAILED": "src/dendrux/runtime/_managed.py",
+  "AcceptedReport": "src/dendrux/runtime/_managed_adoption.py",
+  "CHILD_CANCELLED": "src/dendrux/runtime/_managed_adoption.py",
+  "CHILD_FAILED": "src/dendrux/runtime/_managed_adoption.py",
   "DESCEND_KEY": "src/dendrux/runtime/_managed.py",
   "MANAGED_WAIT_REASON": "src/dendrux/runtime/_managed_route.py",
   "ManagedInvocation": "src/dendrux/runtime/_managed.py",
   "NOT_OWNER_KEY": "src/dendrux/runtime/_managed.py",
-  "REPORT_INVALID": "src/dendrux/runtime/_managed.py",
-  "REPORT_TOO_LARGE": "src/dendrux/runtime/_managed.py",
+  "REPORT_INVALID": "src/dendrux/runtime/_managed_adoption.py",
+  "REPORT_TOO_LARGE": "src/dendrux/runtime/_managed_adoption.py",
   "Route": "src/dendrux/runtime/_managed_route.py",
   "Route.routed": "src/dendrux/runtime/_managed_route.py",
-  "_FAILURE_CODES": "src/dendrux/runtime/_managed.py",
-  "_FAILURE_TEXT": "src/dendrux/runtime/_managed.py",
+  "_FAILURE_CODES": "src/dendrux/runtime/_managed_adoption.py",
+  "_FAILURE_TEXT": "src/dendrux/runtime/_managed_adoption.py",
   "_LIFECYCLE_STARTS": "src/dendrux/runtime/_managed.py",
   "_Leg": "src/dendrux/runtime/_managed.py",
   "_MAX_STEPS": "src/dendrux/runtime/_managed.py",
@@ -54,7 +55,7 @@
   "_event": "src/dendrux/runtime/_managed.py",
   "_event_with_error": "src/dendrux/runtime/_managed.py",
   "_fail_parent": "src/dendrux/runtime/_managed.py",
-  "_failed_report": "src/dendrux/runtime/_managed.py",
+  "_failed_report": "src/dendrux/runtime/_managed_adoption.py",
   "_forwarded": "src/dendrux/runtime/_managed.py",
   "_intent_call": "src/dendrux/runtime/_managed_route.py",
   "_next_leg": "src/dendrux/runtime/_managed.py",
@@ -64,7 +65,7 @@
   "_paused_or_failed": "src/dendrux/runtime/_managed.py",
   "_projected_pause": "src/dendrux/runtime/_managed_route.py",
   "_registered": "src/dendrux/runtime/_managed_route.py",
-  "_report_payload": "src/dendrux/runtime/_managed.py",
+  "_report_payload": "src/dendrux/runtime/_managed_adoption.py",
   "_root_result": "src/dendrux/runtime/_managed_route.py",
   "_run_child": "src/dendrux/runtime/_managed.py",
   "_run_leg": "src/dendrux/runtime/_managed.py",
@@ -74,13 +75,13 @@
   "_task": "src/dendrux/runtime/_managed.py",
   "_terminal_child": "src/dendrux/runtime/_managed.py",
   "_trampoline": "src/dendrux/runtime/_managed.py",
-  "_transformed": "src/dendrux/runtime/_managed.py",
+  "_transformed": "src/dendrux/runtime/_managed_adoption.py",
   "_waiting_from": "src/dendrux/runtime/_managed.py",
-  "accept_report": "src/dendrux/runtime/_managed.py",
+  "accept_report": "src/dendrux/runtime/_managed_adoption.py",
   "adopt": "src/dendrux/runtime/_managed.py",
   "adopt_terminal_leaf": "src/dendrux/runtime/_managed.py",
   "bind_child": "src/dendrux/runtime/_managed.py",
-  "child_report": "src/dendrux/runtime/_managed.py",
+  "child_report": "src/dendrux/runtime/_managed_adoption.py",
   "claim_adoption": "src/dendrux/runtime/_managed.py",
   "complete_adoption": "src/dendrux/runtime/_managed.py",
   "drive": "src/dendrux/runtime/_managed.py",
@@ -88,13 +89,13 @@
   "intent_event": "src/dendrux/runtime/_managed.py",
   "is_descend": "src/dendrux/runtime/_managed.py",
   "is_managed_root": "src/dendrux/runtime/_managed.py",
-  "logger": "src/dendrux/runtime/_managed.py",
+  "logger": "src/dendrux/runtime/_managed_adoption.py",
   "new_run_id": "src/dendrux/runtime/_managed.py",
   "not_owner_result": "src/dendrux/runtime/_managed.py",
   "parent_context": "src/dendrux/runtime/_managed.py",
   "parent_link": "src/dendrux/runtime/_managed.py",
   "prepare_handoff": "src/dendrux/runtime/_managed.py",
-  "project_report": "src/dendrux/runtime/_managed.py",
+  "project_report": "src/dendrux/runtime/_managed_adoption.py",
   "raise_unbound": "src/dendrux/runtime/_managed.py",
   "reconnect": "src/dendrux/runtime/_managed.py",
   "require_checkpointed_creation": "src/dendrux/runtime/_managed.py",
@@ -121,6 +122,13 @@
    "module": "src/dendrux/runtime/_managed.py",
    "name": "root_view",
    "target": "dendrux.runtime._managed_route.root_view",
+   "count": 1
+  },
+  {
+   "root": "claim_adoption",
+   "module": "src/dendrux/runtime/_managed.py",
+   "name": "accept_report",
+   "target": "dendrux.runtime._managed_adoption.accept_report",
    "count": 1
   },
   {
@@ -190,6 +198,12 @@
    "value": "dendrux.runtime._managed"
   },
   {
+   "root": "AcceptedReport",
+   "module": "src/dendrux/runtime/_managed_adoption.py",
+   "attribute": "__module__",
+   "value": "dendrux.runtime._managed"
+  },
+  {
    "root": "Route",
    "module": "src/dendrux/runtime/_managed_route.py",
    "attribute": "__module__",
@@ -197,7 +211,9 @@
   }
  ],
  "scaffolding": {},
- "effects": [],
+ "effects": [
+  "logger"
+ ],
  "seams": {},
  "providers": {}
 }

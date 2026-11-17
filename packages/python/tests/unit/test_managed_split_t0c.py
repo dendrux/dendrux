@@ -13,6 +13,22 @@ from dendrux.types import RunResult, RunStatus
 
 FACADE = "dendrux.runtime._managed"
 MOVED = {
+    "dendrux.runtime._managed_adoption": (
+        "logger",
+        "REPORT_TOO_LARGE",
+        "CHILD_FAILED",
+        "CHILD_CANCELLED",
+        "REPORT_INVALID",
+        "child_report",
+        "_report_payload",
+        "_FAILURE_TEXT",
+        "_FAILURE_CODES",
+        "_failed_report",
+        "AcceptedReport",
+        "accept_report",
+        "_transformed",
+        "project_report",
+    ),
     "dendrux.runtime._managed_route": (
         "MANAGED_WAIT_REASON",
         "_Waiting",
@@ -42,11 +58,17 @@ def test_moved_name_is_the_same_object_through_the_facade(module: str, name: str
 
 @pytest.mark.parametrize(
     "name",
-    ["_Waiting", "Route"],
+    ["_Waiting", "Route", "AcceptedReport"],
 )
 def test_moved_class_keeps_its_original_identity(name: str) -> None:
     cls = getattr(_managed, name)
     assert (cls.__module__, cls.__qualname__) == (FACADE, name)
+
+
+def test_logger_keeps_the_original_name() -> None:
+    adoption = importlib.import_module("dendrux.runtime._managed_adoption")
+    assert _managed.logger is adoption.logger
+    assert _managed.logger.name == FACADE
 
 
 @pytest.mark.parametrize("name", PATCH_SEAMS)
