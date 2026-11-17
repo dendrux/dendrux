@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import tomllib
+from fnmatch import fnmatchcase
 from pathlib import Path
 
 import pytest
@@ -54,6 +55,20 @@ def test_dev_dependencies_pin_the_tools_exactly() -> None:
             f"{name} needs an exact dev pin: {requirement}"
         )
     assert str(requirements["griffe"]) in _steps("api-compat")["Install griffe"]["run"]
+
+
+def test_a_feature_branch_push_does_not_repeat_its_integration_run() -> None:
+    triggers = yaml.safe_load(WORKFLOW.read_text())[True]  # YAML reads the key `on` as true
+    patterns = triggers["push"]["branches"]
+
+    def runs_on_push(branch: str) -> bool:
+        return any(fnmatchcase(branch, pattern) for pattern in patterns)
+
+    assert runs_on_push("main")
+    assert runs_on_push("feat/0.7.0-rfint")
+    assert runs_on_push("feat/0.7.0-rf1")
+    assert not runs_on_push("feat/0.7.0")
+    assert triggers["pull_request"]["branches"] == ["main"]
 
 
 def test_the_python_job_runs_tests_in_parallel_and_measures_coverage() -> None:
