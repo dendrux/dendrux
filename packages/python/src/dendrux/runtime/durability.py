@@ -48,6 +48,8 @@ _EXCEPTION_WALK_LIMIT = 1024
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
 
+    from sqlalchemy.ext.asyncio import AsyncSession
+
 logger = logging.getLogger(__name__)
 
 MAX_RETRIES = 3
@@ -322,6 +324,39 @@ def _transient_wrapper(exc: BaseException) -> bool:
     )
 
 
+def _raise_if_cancelled(error: BaseException | None = None) -> None:
+    pending = [error] if error is not None else []
+    seen: set[int] = set()
+    for _ in range(_EXCEPTION_WALK_LIMIT):
+        if not pending:
+            break
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, asyncio.CancelledError):
+            current.__context__ = None
+            current.__cause__ = None
+            raise current from None
+        pending.extend(
+            nested
+            for nested in (getattr(current, "orig", None), current.__cause__, current.__context__)
+            if isinstance(nested, BaseException) and id(nested) not in seen
+        )
+    task = asyncio.current_task()
+    if task is not None and task.cancelling():
+        raise asyncio.CancelledError() from None
+
+
+async def _rollback_unless_cancelled(
+    session: AsyncSession, error: BaseException | None = None
+) -> None:
+    # Session close owns rollback during cancellation; do not enter driver
+    # checkin/termination here before the protected close can run.
+    _raise_if_cancelled(error)
+    await session.rollback()
+
+
 async def retry_transient_db(
     attempt: Callable[[], Coroutine[Any, Any, T]],
     *,
@@ -343,6 +378,7 @@ async def retry_transient_db(
 
     def check_retry_error(error: Exception) -> None:
         _require_database_error(error)
+        _raise_if_cancelled(error)
         allowed = isinstance(error, (SQLAlchemyError, PersistenceError)) or (
             _raw_driver_errors and is_transient_db_error(error, classify=classify)
         )
