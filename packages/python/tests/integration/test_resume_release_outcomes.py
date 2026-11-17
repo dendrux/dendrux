@@ -264,7 +264,12 @@ async def test_reclaim_without_release_can_retry_setup_failure(store, engine, mo
         with pytest.raises(PersistenceError):
             await case.invoke()
     row = await store.get_run(case.run_id)
-    assert row.status == "running" and row.claim_epoch == before.claim_epoch + 1
+    assert row.status == "running"
+    # The pre-claim format check must fail closed if its pause read fails.
+    if read == "get_pause_state":
+        assert row == before
+    else:
+        assert row.claim_epoch == before.claim_epoch + 1
     assert provider.calls == 0
     assert not any(e.event_type == "run.error" for e in await store.get_run_events(case.run_id))
     item = await expire(store, engine, case.run_id)

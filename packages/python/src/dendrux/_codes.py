@@ -145,6 +145,7 @@ _ENUMS = {
             "loop_unknown",
             "loop_unsupported",
             "not_running",
+            "pause_format_unsupported",
             "reclaim_limit",
             "recovery_call_missing",
             "recovery_state_missing",

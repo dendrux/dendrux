@@ -129,6 +129,7 @@ async def test_resume_setup_transaction_bytes(store, monkeypatch, entry, storage
         + "\n"
     )
     expected = Path(__file__).with_name("fixtures") / f"resume_setup_{entry}_{storage_format}.json"
+    # Reclaim goldens include the pre-claim format check's three primary-key reads.
     expected_wire = expected.read_text()
     if entry == "reclaim" and storage_format == 2:
         expected_wire = _admission_before_rebuild(expected_wire)
@@ -146,14 +147,14 @@ def _admission_before_rebuild(recorded):
         assert blocks, "Statement outside a transaction"
         blocks[-1].append(statement)
     assert all(block[-1] in ("COMMIT", "ROLLBACK") for block in blocks)
-    row = _transaction_with(blocks, "SELECT agent_runs.id, agent_runs.tenant_id")
-    verdict = _transaction_with(blocks, "SELECT agent_runs.id, coalesce(")
     claim = _transaction_with(blocks, "UPDATE agent_runs SET claim_epoch=")
+    after_claim = blocks[blocks.index(claim) + 1 :]
+    row = _transaction_with(after_claim, "SELECT agent_runs.id, agent_runs.tenant_id")
+    verdict = _transaction_with(after_claim, "SELECT agent_runs.id, coalesce(")
     for block in (row, verdict):
         assert len(block) == 3 and block[-1] == "ROLLBACK"
-        blocks.remove(block)
-    after_claim = blocks.index(claim) + 1
-    blocks[after_claim:after_claim] = [row, verdict]
+        after_claim.remove(block)
+    blocks = blocks[: blocks.index(claim) + 1] + [row, verdict] + after_claim
     expected["transactions"] = [statement for block in blocks for statement in block]
     return json.dumps(expected, indent=2) + "\n"
 

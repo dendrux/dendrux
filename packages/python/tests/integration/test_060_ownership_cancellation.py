@@ -436,7 +436,7 @@ async def test_ownership_handoff_query_count(
             "submit_tool_results": 45,
             "submit_input": 41,
             "submit_approval": 51 if engine.dialect.name == "postgresql" else 53,
-            "reclaim": 30,  # +1: scoped blocked-content lookup (R1.10, task 7 ruling)
+            "reclaim": 33,  # +3: pre-claim format check primary-key reads.
         }[entry]
     )
     record_property("statements", len(statements))
