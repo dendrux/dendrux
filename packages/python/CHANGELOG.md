@@ -76,9 +76,15 @@ authors and sweep callers must take. No schema migration is needed.
   marker is missing or unknown, and finalizes every other stale row it cannot reclaim. A started
   `single_call` row ends `error`/`stale_running`. The store kit now checks this, and that
   `reclaim_run` never claims a `single_call` run.
-- DEFAULT_FLIP_PLACEHOLDER: sweep
-- DEFAULT_FLIP_PLACEHOLDER: runstore
-- DEFAULT_FLIP_PLACEHOLDER: reasoning
+- **`sweep()` defaults to `on_stale="reclaim"`.** Omitting `on_stale` (or passing `None`) marks
+  recoverable format-2 ReAct runs for `agent.reclaim()` and finalises the rest. It needs a store
+  with the recovery capability. The 0.6 `FutureWarning` is gone. Pass `on_stale="error"` to keep
+  finalising every stale run.
+- **Bounded `RunStore` reads.** `get_events`, `get_traces`, `get_llm_calls` and
+  `get_tool_invocations` default to `limit=1000` (`None` means the same). A `limit` above 1,000
+  raises `ValueError` before any read (log code `read_argument_invalid`). The 0.6
+  `FutureWarning` and the silent clamp are gone. `get_subtree` defaults to `max_nodes=10_000`
+  (`None` the same); a tree with 10,000 or more descendants raises `SubtreeTooLargeError`.
 - Internal: `runtime/runner.py` and `runtime/stores/sql/base.py` were split into smaller
   modules. Old import paths and names keep working through re-exports for this release; they
   will be removed later with a migration note. Import from `dendrux`, `dendrux.errors` and
@@ -139,6 +145,7 @@ authors and sweep callers must take. No schema migration is needed.
 - A live child cut off from the database can be swept while its call completes. The call is
   billed but not recorded, so the root budget can undercount by one call (ReAct children too).
 - A SingleCall child's budget events are advisory.
+- Guardrails do not scan model reasoning text.
 
 ## 0.6.1 - 2026-11-10
 

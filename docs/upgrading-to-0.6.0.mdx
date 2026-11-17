@@ -56,7 +56,7 @@ Format-2 runs store conversation history in traces and execution state in a boun
 | `Agent(on_governance_change=)` | Defaults to `"warn"` | Defaults to `"raise"` | Resume with the original governance configuration, or explicitly select `"warn"` when intentionally changing it. The only values remain `"warn"` and `"raise"`. |
 | `Budget(count_cache_tokens=)` | Counts fresh input and output by default; warns if a token budget leaves the choice unset | Defaults to `True`, counting cache reads and writes too | Review token caps and [paused token budgets](#paused-runs-with-a-token-budget). Explicit `False` or `None` keeps the old count without a warning. |
 | Implicit `DENDRUX_DATABASE_URL` engine on `Agent` | Uses the environment variable and emits `DeprecationWarning` | Agent ignores the variable; no error is raised just because it is set | Pass `state_store=` or `database_url=`. With no effective store, runs have no persistence and the unused variable logs `database_url_env_ignored` once per process. The CLI still reads it. |
-| `sweep(on_stale=)` | Finalizes stale running rows as errors | Omission still finalizes them and now emits `FutureWarning` when stale rows are found; the default changes to `"reclaim"` in 0.7 | Pass `on_stale="error"` to retain finalization, or explicitly opt into `"reclaim"` after activation. |
+| `sweep(on_stale=)` | Finalizes stale running rows as errors | Omission still finalizes them and now emits `FutureWarning` when stale rows are found; 0.7.0 made `"reclaim"` the default | Pass `on_stale="error"` to retain finalization, or explicitly opt into `"reclaim"` after activation. |
 
 The store used for the call decides whether strict tenancy applies, even if the Agent itself has no store. A delegated child can inherit scope when its outer caller deliberately chose a tenant, including explicit `tenant_id=None`, or the parent already resolved scope under strict rules. A stored child under a parent whose tenant was merely omitted raises `TenantScopeRequiredError`; pass `tenant_id` on the outer run.
 
@@ -193,9 +193,9 @@ Drain those runs before upgrading, or explicitly keep `Budget(..., count_cache_t
 
 ## Bounded reads
 
-Four `RunStore` list reads and `get_subtree` can return as much as a run holds. 0.6.0 keeps them working and warns, so you can fix your calls before 0.7 changes the defaults.
+Four `RunStore` list reads and `get_subtree` can return as much as a run holds. 0.6.0 keeps them working and warns. 0.7.0 made the bounded defaults real; see [Upgrading to 0.7.0](/docs/upgrading-to-0.7.0).
 
-| Call | 0.6.0 | 0.7 |
+| Call | 0.6.0 | 0.7.0 |
 | --- | --- | --- |
 | `get_events`, `get_traces`, `get_llm_calls`, `get_tool_invocations` without `limit` | Reads every row and emits a `FutureWarning` | `limit` defaults to 1,000 |
 | The same with `limit` above 1,000 | `FutureWarning`; SQL stores and the format-2 `get_traces` (any backend) clamp to 1,000; a custom store receives the limit unchanged on its format-1 reads | Raises |

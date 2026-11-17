@@ -21,7 +21,7 @@ Call `sweep` from your own startup or maintenance job. Select `on_stale` explici
 
 - `"error"` finalizes stale running rows, retaining the previous behavior.
 - `"reclaim"` marks eligible rows and returns them for your application to dispatch. Marking fences the old claim; it does not execute the run.
-- Omission retains `"error"` in 0.6 and warns when stale rows are found. The default changes in 0.7.
+- Omission (or `None`) means `"reclaim"` since 0.7.0 and needs a store with the recovery capability. In 0.6 it finalized stale runs and warned.
 
 [//]: # "docs-test: skip - application supplies an active format-2 state store and matching Agent"
 

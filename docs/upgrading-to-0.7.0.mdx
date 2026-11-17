@@ -31,9 +31,9 @@ description: What changes when you move from 0.6.x to 0.7.0 (managed subagents, 
 | Guardrails with `output_type` on a subagent | Not applicable | Refused with `ValueError` at root entry | Use one or the other on a subagent |
 | `reclaim()` on a non-ReAct Agent | Looked up the run first | Raises `RunNotReclaimableError(reason="loop_unsupported")` before the lookup | Use a ReAct Agent to reclaim. A missing or foreign run now reports `loop_unsupported`, not `RunNotFoundError` |
 | Tool result for a subagent call | Not applicable | Refused with `ManagedResultRefusedError` (code `managed_result_refused`), a subclass of `InvalidToolResultError` | None. Existing `except InvalidToolResultError` handlers still catch it |
-| DEFAULT_FLIP_PLACEHOLDER: sweep | | | |
-| DEFAULT_FLIP_PLACEHOLDER: runstore | | | |
-| DEFAULT_FLIP_PLACEHOLDER: reasoning | | | |
+| `sweep()` default | `sweep(stale_running=...)` without `on_stale` finalised stale runs and warned | Omission means `on_stale="reclaim"`: eligible runs are marked, not finalised. A bare `sweep()` with no thresholds now checks store capabilities instead of returning at once | Dispatch `result.reclaimable` to `agent.reclaim()`, or pass `on_stale="error"` for the 0.6 behaviour. A custom store without the recovery capability now raises `NotImplementedError` from a bare `sweep()`; pass `on_stale="error"` for such stores |
+| `RunStore` list reads | Without `limit`, every row, with a `FutureWarning`; a `limit` above 1,000 warned and was clamped | Without `limit`, one page of at most 1,000 rows. A `limit` above 1,000 raises `ValueError` | Loop with `after_sequence_index=` (events) or `offset=` (the other three) until a page is empty, and replace any `limit` above 1,000 with a paging loop. On 0.6, `python -W error::FutureWarning` flags the calls to check |
+| `get_subtree` bound | Without `max_nodes`, the whole tree, with a `FutureWarning` | `max_nodes` defaults to 10,000; 10,000 or more descendants raise `SubtreeTooLargeError` | Catch it, or pass a larger `max_nodes` deliberately |
 | Cancel during a database close | A stalled close could hold a cancelled task forever on some paths | The wait is bounded by 5 seconds; the close then finishes in the background and `db_close_abandoned` is logged | Watch for that log code. It is rare |
 
 
