@@ -108,7 +108,18 @@ authors and sweep callers must take. No schema migration is needed.
   cancelled is never cut short. If the close fails while a cancellation is in flight, the
   cancellation wins. If a close never finishes (a driver deadlock), that in-memory engine
   stays blocked for other sessions.
-- FILE_SQLITE_CLOSE_FIX_PLACEHOLDER: coordinator fills in the file-SQLite close fix here.
+- Sessions on file SQLite and other multi-connection pools now close within a bounded wait
+  after a cancellation, like the single-connection paths above. `get_session` still rolls
+  back on an error (ORM state restored, rollback events fired); the rollback and the close
+  now share the same bounded post-cancel wait.
+- A task cancellation during a database retry or rollback stays a cancellation; database
+  timeouts and earlier handled cancellations are not mistaken for one. Converted
+  cancellations log the stable code `db_cancel_converted`.
+- Refuse unsupported managed-wait checkpoints and pause schemas above v3 before reclaiming,
+  preserving workflow state and recovery attempts with `pause_format_unsupported`. A 0.7
+  worker cannot recover a workflow written by a newer release's multi-child wait. See
+  [Upgrading to 0.7.0](../../docs/upgrading-to-0.7.0.mdx#forward-compatibility).
+- On MySQL, delegation descendant reads use the parent index (no schema change).
 
 ### Deprecated
 
@@ -145,7 +156,10 @@ authors and sweep callers must take. No schema migration is needed.
 - A live child cut off from the database can be swept while its call completes. The call is
   billed but not recorded, so the root budget can undercount by one call (ReAct children too).
 - A SingleCall child's budget events are advisory.
-- Guardrails do not scan model reasoning text.
+- Guardrails do not scan model reasoning text. This is planned for a later release.
+- aiosqlite 0.22.1: a close abandoned after a cancellation keeps its pool slot until it
+  finishes; the database file can stay locked briefly after a burst of cancellations; and
+  shutdown or dispose can wait on a stuck close.
 
 ## 0.6.1 - 2026-11-10
 

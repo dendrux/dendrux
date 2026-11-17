@@ -20,6 +20,8 @@ description: What changes when you move from 0.6.x to 0.7.0 (managed subagents, 
 
 ## Behaviour changes
 
+Until 1.0, a new default may change behaviour in a minor release. The three flips below (sweep reclaims, bounded reads, and the subtree bound) take effect on upgrade; the 0.6 warnings that announced them are gone.
+
 | Area | 0.6.x | 0.7.0 | What to do |
 | --- | --- | --- | --- |
 | Subagent definition cap | Not applicable | `Limits.max_subagent_definitions` defaults to 256 nodes **including the root** (255 subagents) | Raise it on the root Agent for bigger trees: `Limits(max_subagent_definitions=300)` |
@@ -34,7 +36,9 @@ description: What changes when you move from 0.6.x to 0.7.0 (managed subagents, 
 | `sweep()` default | `sweep(stale_running=...)` without `on_stale` finalised stale runs and warned | Omission means `on_stale="reclaim"`: eligible runs are marked, not finalised. A bare `sweep()` with no thresholds now checks store capabilities instead of returning at once | Dispatch `result.reclaimable` to `agent.reclaim()`, or pass `on_stale="error"` for the 0.6 behaviour. A custom store without the recovery capability now raises `NotImplementedError` from a bare `sweep()`; pass `on_stale="error"` for such stores |
 | `RunStore` list reads | Without `limit`, every row, with a `FutureWarning`; a `limit` above 1,000 warned and was clamped | Without `limit`, one page of at most 1,000 rows. A `limit` above 1,000 raises `ValueError` | Loop with `after_sequence_index=` (events) or `offset=` (the other three) until a page is empty, and replace any `limit` above 1,000 with a paging loop. On 0.6, `python -W error::FutureWarning` flags the calls to check |
 | `get_subtree` bound | Without `max_nodes`, the whole tree, with a `FutureWarning` | `max_nodes` defaults to 10,000; 10,000 or more descendants raise `SubtreeTooLargeError` | Catch it, or pass a larger `max_nodes` deliberately |
-| Cancel during a database close | A stalled close could hold a cancelled task forever on some paths | The wait is bounded by 5 seconds; the close then finishes in the background and `db_close_abandoned` is logged | Watch for that log code. It is rare |
+| Cancel during a database close | A stalled close could hold a cancelled task forever on some paths | Sessions on file SQLite and other pools close within a bounded wait (5 seconds) after a cancellation; the close then finishes in the background and `db_close_abandoned` is logged. `get_session` still rolls back on an error (ORM state restored, rollback events fired); the rollback and the close share the same bounded post-cancel wait | Watch for that log code. It is rare |
+| Cancel during a database retry or rollback | A cancellation could be mistaken for, or hidden by, a database error | It stays a cancellation. Database timeouts and earlier handled cancellations are not mistaken for one. A converted cancellation logs `db_cancel_converted` | None |
+| Reasoning text and guardrails | Not scanned | Not scanned. No default changed; scanning is planned for a later release | None |
 
 
 ## Sweep changes
@@ -46,6 +50,10 @@ description: What changes when you move from 0.6.x to 0.7.0 (managed subagents, 
 - **A SingleCall subagent still running.** Reclaiming the root raises `loop_unsupported`; run `sweep()` first, then reclaim the root.
 - **Scope.** A sweep is store-wide, not tenant-scoped. See [Recovery](/docs/guides/recovery#what-a-sweep-covers).
 - **A subagent run in `reclaimable`.** Reclaim its workflow root, not the subagent id. Calling `reclaim` on a subagent id raises `ManagedChildControlError`.
+
+## Forward compatibility
+
+A 0.7 worker cannot recover a workflow written by a newer release's multi-child wait. `reclaim`, resume and submit refuse it with `RunNotReclaimableError(reason="pause_format_unsupported")` before changing any state, so the workflow state and its recovery attempts are preserved. The stale-running `sweep()` is not covered by this guard. During a future rolling upgrade, keep the newer release's parallel limit at 1 and run `sweep()` only from upgraded processes.
 
 ## Custom stores
 
@@ -78,7 +86,9 @@ If your tests patch a name inside one of those modules, patch the module that no
 - A root `request_pause` during a SingleCall child's call has no effect.
 - A live child cut off from the database can be swept while its call completes. The call is billed but not recorded, so the root budget can undercount by one call.
 - A SingleCall child's budget events are advisory.
-- Model reasoning text is not scanned by guardrails.
+- Model reasoning text is not scanned by guardrails. This is planned for a later release.
+- With aiosqlite 0.22.1, a close abandoned after a cancellation keeps its pool slot until it finishes. The database file can stay locked briefly after a burst of cancellations. Shutdown or dispose can wait on a stuck close.
+- If a close never finishes (a driver deadlock), that in-memory engine stays blocked for other sessions.
 
 ## Rolling back
 
