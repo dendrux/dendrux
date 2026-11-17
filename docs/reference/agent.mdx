@@ -491,7 +491,7 @@ async def reclaim(
 ) -> RunResult
 ```
 
-Continue a marked format-2 ReAct run from its committed checkpoint. Call `sweep(on_stale="reclaim")` first. `item=` checks the epoch on that exact mark; `item.run_id` must match `run_id`. The Agent name, loop, skills and governance must match the stored run, subject to the explicit governance policy. A missing or foreign run raises `RunNotFoundError`; other precondition failures raise `RunNotReclaimableError` with a stable `reason` such as `legacy_run`, `lease_fresh` or `already_reclaimed`.
+Continue a marked format-2 ReAct run from its committed checkpoint. Call `sweep(on_stale="reclaim")` first. `item=` checks the epoch on that exact mark; `item.run_id` must match `run_id`. The Agent name, loop, skills and governance must match the stored run, subject to the explicit governance policy. A missing or foreign run raises `RunNotFoundError`; other precondition failures raise `RunNotReclaimableError` with a stable `reason` such as `legacy_run`, `lease_fresh`, `already_reclaimed` or `pause_format_unsupported`.
 
 Explicit tenant scope is mandatory even with `strict_tenancy=False`. `None` selects untenanted runs; `UNSCOPED` is for trusted cross-tenant use. A store without recovery capability raises `NotImplementedError`. An interrupted non-idempotent tool pauses for approval before another attempt. The result can be paused or terminal, just like `run`. See [Recovery](/docs/guides/recovery).
 

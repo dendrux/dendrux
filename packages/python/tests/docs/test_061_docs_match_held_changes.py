@@ -107,7 +107,7 @@ def test_limits_are_stated():
     for page in ("architecture/guardrails.mdx", "upgrading-to-0.6.1.mdx"):
         text = _doc(page)
         assert "Model reasoning text is not scanned" in text, page
-        assert "0.7" in text, page
+        assert "planned for a later release" in text, page
         assert "retry copies" in text, page
         assert "skill body digests" in text.lower(), page
         assert "cannot keep the blocked mark" in text, page

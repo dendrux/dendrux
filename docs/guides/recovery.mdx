@@ -21,7 +21,7 @@ Call `sweep` from your own startup or maintenance job. Select `on_stale` explici
 
 - `"error"` finalizes stale running rows, retaining the previous behavior.
 - `"reclaim"` marks eligible rows and returns them for your application to dispatch. Marking fences the old claim; it does not execute the run.
-- Omission retains `"error"` in 0.6 and warns when stale rows are found. The default changes in 0.7.
+- Omission (or `None`) means `"reclaim"` since 0.7.0 and needs a store with the recovery capability. In 0.6 it finalized stale runs and warned.
 
 [//]: # "docs-test: skip - application supplies an active format-2 state store and matching Agent"
 
@@ -70,11 +70,17 @@ This example dispatches serially and handles `RunNotReclaimableError` per item s
 
 Rediscovering an existing mark preserves its stored limit. Each successful claim increments `reclaim_attempts`. Since 0.6.1, it counts recovery attempts since the last newly committed progress, rather than lifetime attempts. A new advancing model step, server-tool observation, consumed client-tool observation or final answer resets it to zero in the same atomic write. Heartbeats, tool intents, reused observations, unchanged checkpoints and pause/approval cycling do not reset it. Once the limit is exhausted without progress, a later sweep finalizes the stale run as `error` with `failure_reason="reclaim_limit"`; a direct reclaim refuses with `RunNotReclaimableError(reason="reclaim_limit")`.
 
-In reclaim mode, stale format-1 runs are finalized with `stale_running_legacy`. Stale `SingleCall` runs or format-2 runs without a supported loop marker are finalized through the stale error path. They are not returned for reclaim. A stale `SingleCall` subagent is finalized the same way; reclaim its root to adopt the failure (see [Managed subagents](/docs/guides/subagents#an-interrupted-singlecall-child-fails)). A pending cancellation wins and finalizes the run as cancelled. `abandoned_waiting=` independently reaps waiting or paused runs only when both `status_changed_at` and `updated_at` exceed the window. Managed parents waiting on a subagent are exempt; corrupt managed waits are reported and left unchanged. Both count toward `max_runs`.
+In reclaim mode, stale format-1 runs are finalized with `stale_running_legacy`. Stale `SingleCall` runs or format-2 runs without a supported loop marker are finalized through the stale error path. They are not returned for reclaim. A stale `SingleCall` subagent is finalized the same way; reclaim its root to adopt the failure (see [Managed subagents](/docs/guides/subagents#an-interrupted-singlecall-child-fails)). A pending cancellation wins and finalizes the run as cancelled. `mark_lease_expired(finalise_unrecoverable=False)` spares only format-2 rows whose loop marker is missing or unknown. It finalizes every other stale row it cannot reclaim, under a new claim epoch, and returns each once in `finalised`: a started `single_call` row as `error` with `stale_running`, a format-1 row with `stale_running_legacy`, a row out of attempts with `reclaim_limit`, and a row with a pending cancel as `cancelled`. With `True` it also finalizes the spared rows, and a `single_call` row that never started ends `never_started`. `sweep(on_stale="reclaim")` passes `True`. `abandoned_waiting=` independently reaps waiting or paused runs only when both `status_changed_at` and `updated_at` exceed the window. Managed parents waiting on a subagent are exempt; corrupt managed waits are reported and left unchanged. Both count toward `max_runs`.
 
-Calls without a cursor restart at the oldest waiting row. With more than `max_runs` exempt or corrupt waits, repeated cursorless calls can stall before later ordinary pauses. Pass `result.cursor` to continue the scan.
+Calls without a cursor restart at the oldest waiting row. Once `max_runs` exempt or corrupt waits sit in front of the ordinary pauses (the stall starts at exactly `max_runs`), repeated cursorless calls cannot reach those pauses. Pass `result.cursor` to continue the scan.
 
 Custom stores and `SQLStateStore` subclasses overriding `sweep_abandoned_runs` get no waiting continuation and must bound their own exempt-wait handling.
+
+## What a sweep covers
+
+- **A sweep is store-wide.** It is not scoped to a tenant. One call can see, mark and finalize rows of every tenant in the store. Run it from a trusted maintenance job, not from a tenant request. `reclaim` is tenant-scoped; `sweep` is not.
+- **A waiting run with a pending cancel is abandoned.** If a paused or waiting run has `cancel_requested` set and is older than `abandoned_waiting`, the sweep finalizes it as `error` with the event `run.abandoned`, not as `cancelled`. Cancel a waiting run through `cancel_run` before the window passes if you want the `cancelled` status.
+- **Clocks.** The sweeper and the workers should agree on the time. Age checks (`stale_running`, `abandoned_waiting`) compare stored timestamps with a cutoff taken from the clock of the process that runs `sweep()`. A sweeper clock that runs ahead can mark a live run stale, and one that runs behind delays recovery. Keep hosts on NTP and leave room for skew in `stale_running` (at least three lease intervals).
 
 ## What happens to an interrupted tool
 

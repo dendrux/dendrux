@@ -13,11 +13,14 @@ docs/
 ├── quickstart.mdx          → /docs/quickstart
 ├── upgrading-to-0.5.0.mdx  → /docs/upgrading-to-0.5.0
 ├── upgrading-to-0.6.0.mdx  → /docs/upgrading-to-0.6.0
+├── upgrading-to-0.6.1.mdx  → /docs/upgrading-to-0.6.1
+├── upgrading-to-0.7.0.mdx  → /docs/upgrading-to-0.7.0
 ├── guides/                 → /docs/guides/*
 │   ├── scaling.mdx         (pools, live updates, migrations, leases, bounds, load testing)
 │   ├── mysql.mdx           (MySQL and MariaDB: driver, URL, schema, collations, packet size)
 │   ├── build-your-own-store.mdx (subclass SQLStateStore and certify it with the test kit)
-│   └── recovery.mdx        (sweep, reclaim, replay and crash approval)
+│   ├── recovery.mdx        (sweep, reclaim, replay and crash approval)
+│   └── subagents.mdx       (managed subagents)
 ├── architecture/           → /docs/architecture/*
 │   ├── runs.mdx, state-persistence.mdx, event-ordering.mdx
 │   ├── pause-resume.mdx, cancellation.mdx, inbox.mdx
