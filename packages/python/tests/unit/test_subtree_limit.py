@@ -67,9 +67,10 @@ async def test_only_named_keyword_is_forwarded(shape, max_nodes):
             "00000000000000000000000700", tenant_id="mine", max_nodes=max_nodes
         )
     assert result.root.run.run_id == "0"
-    assert bool(caught) == (max_nodes is None)
+    assert not [w for w in caught if issubclass(w.category, FutureWarning)]
     if supported:
-        assert received == [{"tenant_id": "mine", "max_nodes": max_nodes}]
+        # An omitted or None bound is 10,000 since 0.7.0.
+        assert received == [{"tenant_id": "mine", "max_nodes": max_nodes or 10_000}]
     else:
         assert received == [{"tenant_id": "mine"}]
 

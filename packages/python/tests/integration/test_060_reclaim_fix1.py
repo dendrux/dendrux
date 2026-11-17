@@ -207,8 +207,9 @@ async def test_p2_sweep_cancel_payload_and_unknown_log(store, engine, caplog, po
     await sweep(state_store=store, stale_running=timedelta(minutes=1), on_stale=policy)
     event = next(e for e in await store.get_run_events(run) if e.event_type == "run.cancelled")
     assert event.data["failure_reason"] == "stale_running"
+    # An omitted policy (None) is "reclaim" since 0.7.0.
     assert any(getattr(r, "code", None) == "loop_unknown" for r in caplog.records) == (
-        policy == "reclaim"
+        policy != "error"
     )
 
 
@@ -402,8 +403,7 @@ async def test_p2_reclaim_does_not_reread_pause_or_rewrite_meta(store, engine, m
     assert sum(s.startswith("SELECT agent_runs.meta ") for s in statements) <= 1
 
 
-@pytest.mark.parametrize("policy", [None, "error"])
-async def test_p2_compatibility_scan_has_no_unknown_loop_warning(store, engine, caplog, policy):
+async def test_p2_compatibility_scan_has_no_unknown_loop_warning(store, engine, caplog):
     await candidate(store, engine, marker=None)
-    await sweep(state_store=store, stale_running=timedelta(minutes=1), on_stale=policy)
+    await sweep(state_store=store, stale_running=timedelta(minutes=1), on_stale="error")
     assert not any(getattr(r, "code", None) == "loop_unknown" for r in caplog.records)

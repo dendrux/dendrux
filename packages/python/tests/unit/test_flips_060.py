@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import warnings
-from datetime import timedelta
 from unittest.mock import AsyncMock
 
 import pytest
@@ -15,7 +14,6 @@ from dendrux.llm.mock import MockLLM
 from dendrux.loops._budget import BudgetTracker
 from dendrux.runtime._tenant_checks import resolve_tenant
 from dendrux.runtime.submit import GOVERNANCE_KEY, require_pause_id, submission_validator
-from dendrux.runtime.sweep import sweep
 from dendrux.types import InputValidationError, UsageStats
 from tests._helpers.warnings import warnings_of
 
@@ -139,22 +137,6 @@ async def test_explicit_store_overrides_env_without_warning(monkeypatch):
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         assert await agent(state_store=explicit)._resolve_state_store() is explicit
-
-
-@pytest.mark.parametrize("policy", [None, "error"])
-@pytest.mark.parametrize("stale", [[], ["old-run"]])
-async def test_sweep_keeps_07_warning_only_for_omitted_policy_with_stale_rows(policy, stale):
-    store = AsyncMock()
-    store.sweep_stale_runs.return_value = stale
-    # A legacy store keeps this test on the public fallback path.
-    store.__class__ = object
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        result = await sweep(state_store=store, stale_running=timedelta(seconds=1), on_stale=policy)
-    assert result.stale_running == stale
-    assert len(warnings_of(caught, FutureWarning, r"sweep\(\) will default")) == int(
-        policy is None and bool(stale)
-    )
 
 
 async def test_explicit_database_url_overrides_env_silently(monkeypatch):

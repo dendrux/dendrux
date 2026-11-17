@@ -791,9 +791,10 @@ async def test_sweep_continues_waiting_progress_in_the_composite_cursor(
     await _seed(store, engine, clock, rows)
     before = await _rows(engine)
     arguments = {"state_store": store, "stale_running": AGE, "abandoned_waiting": AGE}
-    with pytest.warns(FutureWarning) if on_stale is None else _no_warning():
+    reclaims = on_stale != "error"  # an omitted policy (None) is "reclaim" since 0.7.0
+    with _no_warning():
         first = await sweep(**arguments, max_runs=2, on_stale=on_stale)
-    if on_stale == "reclaim":
+    if reclaims:
         assert ([r.run_id for r in first.reclaimable], first.stale_running) == ([running], [])
     else:
         assert ([r.run_id for r in first.stale_running], first.reclaimable) == ([running], [])
@@ -818,7 +819,7 @@ async def test_sweep_continues_waiting_progress_in_the_composite_cursor(
     await _seed(store, engine, clock, {later: {}, last: {}})
     only_running = await sweep(state_store=store, stale_running=AGE, on_stale="error", max_runs=1)
     # A run marked by the reclaim sweep is still running and sorts first.
-    first_running = running if on_stale == "reclaim" else later
+    first_running = running if reclaims else later
     assert ([r.run_id for r in only_running.stale_running], only_running.cursor) == (
         [first_running],
         first_running,

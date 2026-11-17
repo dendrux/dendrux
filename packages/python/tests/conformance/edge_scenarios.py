@@ -1,10 +1,16 @@
 """Additional format parity cells, separate from the immutable release corpus."""
 
+from datetime import timedelta
+
+from sqlalchemy import update
+
+from dendrux.db.models import AgentRun
 from dendrux.guardrails import PII
 from dendrux.types import Clarification
 from tests.conformance.harness import Cell, calls, text
 from tests.conformance.scenarios import (
     QuestionStrategy,
+    _paused_client,
     add,
     call_ids,
     client_result,
@@ -102,3 +108,38 @@ def shared(actual):
         for r in actual["runs"]
     ]
     return result
+
+
+async def _default_sweep(ctx):
+    """Since 0.7.0 an omitted ``on_stale`` is ``"reclaim"`` (the 0.6 cells pin ``"error"``).
+
+    A crashed format-2 ReAct run is marked for ``agent.reclaim()`` and stays running; on a
+    format-1 database the same row is finalised as ``stale_running_legacy``. Abandoned
+    waiting runs are reaped exactly as before.
+    """
+    agent, paused = await _paused_client(ctx, "run")
+    orphan = await ctx.orphan_running_run()
+    async with ctx.engine.begin() as conn:
+        await conn.execute(
+            update(AgentRun).where(AgentRun.id == orphan).values(loop_state={"loop": "react"})
+        )
+    await ctx.run(ctx.agent(ctx.provider(text("fresh"))), "stays untouched")
+    await ctx.age_runs(paused.run_id, orphan)
+    result = await ctx.sweep(
+        stale_running=timedelta(minutes=20), abandoned_waiting=timedelta(minutes=30)
+    )
+    marked = [r.run_id for r in result.reclaimable]
+    finalised = [r.run_id for r in result.stale_running]
+    assert marked + finalised == [orphan], (marked, finalised)
+    await ctx.cancel_run(agent, paused.run_id, "after sweep")
+
+
+#: Default-policy cells: format 1 and format 2 differ by design, so there is no parity check.
+DEFAULT_CELLS = [
+    Cell(
+        id="sweep_default__reclaims",
+        scenario="sweep_default",
+        flow=_default_sweep,
+        paths=("run", "sweep", "cancel_run"),
+    )
+]

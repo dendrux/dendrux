@@ -271,7 +271,7 @@ You can add your own indexes if your queries need them. These are the structural
 
 ## Long-running tools and the stale sweep
 
-`sweep()` is the maintenance call you schedule yourself. Choose `on_stale="error"` to finalize stale running rows, or `"reclaim"` to mark eligible format-2 ReAct runs for explicit `agent.reclaim()`. Omission retains error finalization in 0.6 and warns when stale rows are found. A pending cancel wins. `abandoned_waiting=` independently reaps old `waiting_*` and `paused` rows. See [Recovery](/docs/guides/recovery) for bounded scans, attempt limits and dispatch.
+`sweep()` is the maintenance call you schedule yourself. `on_stale="reclaim"`, the default since 0.7.0, marks eligible format-2 ReAct runs for explicit `agent.reclaim()` and finalizes the rest; it needs a store with the recovery capability. Pass `on_stale="error"` to finalize every stale running row, the behavior before 0.7.0. A pending cancel wins. `abandoned_waiting=` independently reaps old `waiting_*` and `paused` rows. See [Recovery](/docs/guides/recovery) for bounded scans, attempt limits and dispatch.
 
 `last_progress_at` advances at model and tool boundaries and through call-scoped lease renewal on fenced stores. `Agent.lease_interval` defaults to 30 seconds with a five-second minimum. Tools can also report progress explicitly:
 
