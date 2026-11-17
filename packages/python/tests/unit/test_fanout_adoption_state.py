@@ -175,6 +175,43 @@ def test_a_marked_adoption_with_a_non_string_child_id_is_a_conflict() -> None:
     assert raised.value.reason == "binding_conflict"
 
 
+def _marked(children: list[str]) -> dict[str, Any]:
+    """A marked checkpoint binding call ``c<i>`` to ``children[i]``."""
+    ids = [f"c{i}" for i in range(len(children))]
+    state = _claimed(ids)
+    state["managed_wait"]["bindings"] = dict(zip(ids, children, strict=True))
+    return state
+
+
+@pytest.mark.parametrize("count", [2, 32])
+def test_a_marked_adoption_within_the_fanout_bounds_is_recognized(count: int) -> None:
+    state = _marked([f"child{i}" for i in range(count)])
+    assert fanout_adoption(state) == tuple(f"c{i}" for i in range(count))
+
+
+MALFORMED_MAPS = {
+    "one binding (a v4 wait has at least two)": ["child0"],
+    "33 bindings (above the cap)": [f"child{i}" for i in range(33)],
+    "two calls bound to one child": ["child0", "child0"],
+    "a repeated child among three": ["child0", "child1", "child0"],
+}
+
+
+@pytest.mark.parametrize("children", MALFORMED_MAPS.values(), ids=MALFORMED_MAPS.keys())
+def test_a_marked_adoption_whose_binding_map_cannot_be_a_v4_wait_is_a_conflict(
+    children: list[str],
+) -> None:
+    with pytest.raises(ManagedStateError) as raised:
+        fanout_adoption(_marked(children), run_id=PARENT)
+    assert raised.value.reason == "binding_conflict"
+
+
+def test_an_unmarked_singleton_map_is_still_just_not_an_adoption() -> None:
+    state = _marked(["child0"])
+    del state["submission"]["managed_fanout_adoption"]
+    assert fanout_adoption(state) is None
+
+
 def test_recognition_never_mutates_the_checkpoint() -> None:
     state = _claimed()
     before = copy.deepcopy(state)

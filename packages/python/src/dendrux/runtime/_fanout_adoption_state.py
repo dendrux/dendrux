@@ -28,6 +28,9 @@ if TYPE_CHECKING:
 FANOUT_ADOPTION_KEY = "managed_fanout_adoption"
 """Key of the adoption marker in a claim descriptor and of the ids-only claim payload."""
 FANOUT_ADOPTION_VERSION = 1
+MIN_FANOUT = 2
+MAX_FANOUT = 32
+"""Bounds on the calls of one v4 fan-out wait (the wait format's own limits)."""
 
 ROW_STARTED = "started"
 """Intent-row outcome: the call is admitted and has no observation yet."""
@@ -81,7 +84,8 @@ def fanout_adoption(state: object, *, run_id: str | None = None) -> tuple[str, .
 
     Raises:
         ManagedStateError: ``binding_conflict`` when the marked submission's
-            call ids are not exactly the binding map's calls, each once.
+            call ids are not exactly the binding map's calls, each once, or the
+            map is not a fan-out's: 2..32 calls, each bound to its own child.
     """
     bindings = _v4_bindings(state)
     submission = _mapping(state).get(_SUBMISSION_KEY)
@@ -90,10 +94,7 @@ def fanout_adoption(state: object, *, run_id: str | None = None) -> tuple[str, .
     ids = _mapping(submission).get("call_ids")
     if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids):
         raise ManagedStateError(reason=_CONFLICT, run_id=run_id)
-    children = [bindings[i] for i in ids if i in bindings]
-    if len(set(ids)) != len(ids) or len(children) != len(bindings) or len(ids) != len(bindings):
-        raise ManagedStateError(reason=_CONFLICT, run_id=run_id)
-    if not all(isinstance(child, str) for child in children):
+    if set(ids) != set(bindings) or len(ids) != len(bindings) or not _is_fanout_map(bindings):
         raise ManagedStateError(reason=_CONFLICT, run_id=run_id)
     return tuple(ids)
 
@@ -152,6 +153,16 @@ def _rows_by_call(
             raise ManagedStateError(reason=_CONFLICT, run_id=run_id)
         by_call[row.tool_call_id] = row
     return by_call
+
+
+def _is_fanout_map(bindings: Mapping[object, object]) -> bool:
+    """A v4 wait binds 2..32 calls, each to a different child run id."""
+    children = list(bindings.values())
+    return (
+        MIN_FANOUT <= len(children) <= MAX_FANOUT
+        and all(isinstance(child, str) for child in children)
+        and len(set(children)) == len(children)
+    )
 
 
 def _mapping(value: object) -> Mapping[object, object]:
