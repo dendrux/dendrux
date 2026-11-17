@@ -104,3 +104,42 @@ async def test_moved_claim_flow_honours_submit_patch_seams(
     )
     assert result is won
     assert calls == ["change", "serialize", "report_governance_change"]
+
+
+async def test_moved_warnings_keep_the_submit_logger(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A handler on ``dendrux.runtime.submit`` still receives both moved warnings."""
+    import logging
+    from types import SimpleNamespace
+    from typing import Any
+
+    from dendrux import _codes
+    from dendrux.errors import GovernanceMismatchError
+    from dendrux.runtime.state import MANAGED_HEADER_KEY
+    from dendrux.skills import _session
+    from dendrux.types import generate_ulid
+
+    class Store:
+        async def get_run(self, run_id: str) -> Any:
+            return SimpleNamespace(agent_name="a", meta={})
+
+        async def get_loop_state(self, run_id: str) -> dict[str, Any]:
+            return {}
+
+    monkeypatch.setattr(submit, "_governance_change", lambda agent, saved: {"changed": ["x"]})
+    monkeypatch.setattr(
+        _session.SkillSession, "prepare", lambda agent: SimpleNamespace(available={})
+    )
+    agent = SimpleNamespace(name="a", _on_governance_change="raise")
+    run_id = generate_ulid()
+    with caplog.at_level(logging.WARNING, logger="dendrux.runtime.submit"):
+        with pytest.raises(GovernanceMismatchError):
+            await _managed_claim._admit_managed_parent(agent, Store(), run_id)  # type: ignore[arg-type]
+        with pytest.raises(ValueError):
+            submit._refuse_tokenless_managed(run_id, {MANAGED_HEADER_KEY: {"x": 1}})
+    names = {r.name for r in caplog.records}
+    codes = " ".join(r.getMessage() for r in caplog.records)
+    assert names == {"dendrux.runtime.submit"}
+    assert _codes.GOVERNANCE_MISMATCH.name in codes
+    assert _codes.MANAGED_PAUSE_ID_REQUIRED.name in codes

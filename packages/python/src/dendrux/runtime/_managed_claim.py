@@ -6,11 +6,14 @@ existing callers and patch seams are unchanged.
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any
 
 from dendrux import _codes
 from dendrux._meta_keys import GOVERNANCE_KEY
 from dendrux.types import PauseState, RunStatus, ToolResult, ToolTarget
+
+logger = logging.getLogger("dendrux.runtime.submit")  # the original module's logger name
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
@@ -97,9 +100,7 @@ async def _admit_managed_parent(agent: Agent, store: StateStore, run_id: str) ->
         saved.pop(GOVERNANCE_KEY)
     change = _submit._governance_change(agent, saved)
     if change is not None and agent._on_governance_change == "raise":
-        import logging
-
-        _codes.log_code(logging.getLogger(__name__), _codes.GOVERNANCE_MISMATCH, run_id=run_id)
+        _codes.log_code(logger, _codes.GOVERNANCE_MISMATCH, run_id=run_id)
         raise GovernanceMismatchError(run_id, **change)
     state = await store.get_loop_state(run_id) or {}
     pins = {s.name: s.digest for s in SkillSession.prepare(agent).available.values()}
@@ -181,9 +182,5 @@ def _refuse_tokenless_managed(run_id: str, checkpoint: dict[str, Any] | None) ->
     from dendrux.runtime.state import MANAGED_HEADER_KEY
 
     if (checkpoint or {}).get(MANAGED_HEADER_KEY) is not None:
-        import logging
-
-        _codes.log_code(
-            logging.getLogger(__name__), _codes.MANAGED_PAUSE_ID_REQUIRED, run_id=run_id
-        )
+        _codes.log_code(logger, _codes.MANAGED_PAUSE_ID_REQUIRED, run_id=run_id)
         raise _submit._pause_id_required()
