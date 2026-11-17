@@ -215,10 +215,9 @@ async def _age(engine: Any, run_id: str) -> None:
 
 
 async def _sweep(store: Any, on_stale: Any) -> Any:
-    kwargs = {"state_store": store, "stale_running": timedelta(minutes=1), "on_stale": on_stale}
-    if on_stale is None:
-        with pytest.warns(FutureWarning):
-            return await sweep(**kwargs)
+    kwargs: dict[str, Any] = {"state_store": store, "stale_running": timedelta(minutes=1)}
+    if on_stale is not None:  # None: the 0.7 default (reclaim), with no warning
+        kwargs["on_stale"] = on_stale
     return await sweep(**kwargs)
 
 
