@@ -183,7 +183,7 @@ class RunNotReclaimableError(_KwargsReduceMixin, RunControlError):
     ``skill_mismatch``, ``loop_unsupported``, ``history_too_large``, ``cancelled``
     (cancellation won), ``loop_unknown`` (missing or unrecognized checkpoint loop),
     ``recovery_call_missing``, ``recovery_state_missing``, ``recovery_state_invalid``,
-    or ``governance_changed`` (the recovery governance fingerprint differs).
+    ``pause_format_unsupported``, or ``governance_changed`` (governance differs).
     """
 
     _init_fields = ("run_id", "reason")

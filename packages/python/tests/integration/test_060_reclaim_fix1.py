@@ -397,7 +397,8 @@ async def test_p2_reclaim_does_not_reread_pause_or_rewrite_meta(store, engine, m
         await agent.reclaim(item.run_id, tenant_id="tenant", item=item)
     finally:
         event.remove(engine.sync_engine, "before_cursor_execute", capture)
-    assert sum(s.startswith("SELECT agent_runs.pause_data") for s in statements) == 1
+    # The pre-claim format check reads once; the post-claim rebuild reads fresh data.
+    assert sum(s.startswith("SELECT agent_runs.pause_data") for s in statements) == 2
     assert sum(s.startswith("SELECT agent_runs.meta ") for s in statements) <= 1
 
 

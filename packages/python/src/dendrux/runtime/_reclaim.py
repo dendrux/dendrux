@@ -24,7 +24,7 @@ from dendrux.loops._helpers import order_observations, project_message, record_m
 from dendrux.runtime._bounds import MAX_PAGE
 from dendrux.runtime.context import managed_root_reclaim_scope
 from dendrux.runtime.persistence import PersistenceRecorder, resolve_pending
-from dendrux.runtime.state import MANAGED_BINDING_KEY, claimed_store
+from dendrux.runtime.state import MANAGED_BINDING_KEY, UNSCOPED, claimed_store
 from dendrux.types import (
     Message,
     PauseState,
@@ -62,8 +62,7 @@ async def reclaim(
     _require_recovery(store, run_id)
     session = SkillSession.prepare(agent)
     session.run_id = run_id
-    if not via_root:
-        await _refuse_child_before_claim(store, run_id, tenant_id)
+    await _check_before_claim(store, run_id, tenant_id, via_root=via_root)
     claim = await _recovery_claim(
         agent, store, run_id, tenant_id=tenant_id, item=item, session=session, via_root=via_root
     )
@@ -216,32 +215,33 @@ async def _continue_session(
         return _reclaimed_result(run_id, result) if reclaimed else result
 
 
-async def _refuse_child_before_claim(store: StateStore, run_id: str, tenant_id: Any) -> None:
-    """Refuse a direct managed-child reclaim before a custom store's claim (0.7).
-
-    The built-in SQL store refuses inside its claim without an extra read. A
-    custom store may not (the store kit requires it), so the runtime reads the
-    run and, for a child, its header first: a refusal then changes nothing. A
-    run outside ``tenant_id`` is left to the store's own not-found answer.
-    """
-    from dendrux.runtime.state import UNSCOPED, unclaimed_store
-
-    if getattr(unclaimed_store(store), "_refuses_managed_child_reclaim", False) is True:
-        return
+async def _check_before_claim(
+    store: StateStore, run_id: str, tenant_id: TenantScope, *, via_root: bool
+) -> None:
+    """Refuse future waits and direct child control without consuming a claim."""
     record = await store.get_run(run_id)
-    if record is None or record.parent_run_id is None:
+    if record is None or (tenant_id is not UNSCOPED and record.tenant_id != tenant_id):
         return
-    if tenant_id is not UNSCOPED and record.tenant_id != tenant_id:
-        return
-    _refuse_direct_child(run_id, await store.get_loop_state(run_id))
+    state = await store.get_loop_state(run_id) or {}
+    raw = await store.get_pause_state(run_id) or {}
+    binding = state.get(MANAGED_BINDING_KEY)
+    version = raw.get("schema_version", 1)
+    if (isinstance(version, int) and version > 3) or (
+        binding is not None
+        and not (
+            isinstance(binding, dict)
+            and binding.get("v", 1) == 1
+            and set(binding) - {"v"} == {"tool_call_id", "child_run_id", "pause_id"}
+            and all(isinstance(v, str) and v for k, v in binding.items() if k != "v")
+        )
+    ):
+        _codes.log_code(logger, _codes.PAUSE_FORMAT_UNSUPPORTED, run_id=run_id)
+        raise RunNotReclaimableError(run_id, "pause_format_unsupported")
+    if not via_root and record.parent_run_id is not None:
+        _refuse_direct_child(run_id, state)
 
 
 def _refuse_direct_child(run_id: str, state: dict[str, Any] | None) -> None:
-    """A managed child is reclaimed only through its root (0.7).
-
-    Checked on the claimed checkpoint so ordinary reclaims add no read; the
-    refused claim runs nothing and the root's reconnect reclaims it later.
-    """
     from dendrux.errors import ManagedChildControlError
 
     header = (state or {}).get("managed")
