@@ -18,6 +18,7 @@ import logging
 import os
 import threading
 from contextlib import asynccontextmanager
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -34,7 +35,6 @@ from dendrux.db._pool_guard import (
     _bind_to_current_loop,
     close_fully,
     serialized,
-    shares_one_connection,
 )
 from dendrux.db._schema_check import ensure_schema_current
 from dendrux.db._sqlite_sync import create_sqlite_schema
@@ -171,25 +171,28 @@ async def get_session(engine: AsyncEngine | None = None) -> AsyncGenerator[Async
         factory = sessionmaker(  # type: ignore[call-overload]
             resolved_engine, class_=AsyncSession, expire_on_commit=False
         )
-    if not shares_one_connection(resolved_engine):
-        async with factory() as session:
-            try:
-                yield session
-                await session.commit()
-            except Exception:
-                await session.rollback()
-                raise
-        return
+    # serialized() takes no lock on multi-connection pools. On an error, the ORM
+    # rollback and the close run as one cleanup through close_fully, so a rollback
+    # stuck in the driver shares the close's bounded wait once the caller is cancelled.
     async with serialized(resolved_engine):
         session = factory()
+        cleanup = session.close
         try:
             yield session
             await session.commit()
         except Exception:
-            await session.rollback()
+            cleanup = partial(_rollback_then_close, session)
             raise
         finally:
-            await close_fully(session.close)
+            await close_fully(cleanup)
+
+
+async def _rollback_then_close(session: AsyncSession) -> None:
+    """Restore ORM state (and fire the rollback events), then close the session once."""
+    try:
+        await session.rollback()
+    finally:
+        await session.close()
 
 
 def _resolve_database_url(url: str | None) -> str:

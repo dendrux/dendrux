@@ -507,6 +507,8 @@ class SQLStateStore(
             self._session_factory = _sql_sessions._SerializedSessionFactory(
                 engine, self._session_factory
             )
+        else:
+            self._session_factory = _sql_sessions._ClosingSessionFactory(self._session_factory)
         self._session_factory = _sql_sessions._CheckedSessionFactory(self, self._session_factory)
         self._live_updates = self._bind_live_updates(live_updates)
 
