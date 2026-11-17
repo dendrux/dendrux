@@ -3,21 +3,28 @@
 Detects stale RUNNING and abandoned WAITING runs. Stale runs can be
 marked for explicit recovery or finalised with structured failure reasons.
 
-Usage::
+Usage (``on_stale="reclaim"`` is the default since 0.7.0)::
 
     from dendrux import sweep
 
     results = await sweep(
-        database_url="sqlite+aiosqlite:///runs.db",
+        state_store=store,
         stale_running=timedelta(minutes=20),
         abandoned_waiting=timedelta(hours=2),
     )
 
-    for run in results.stale_running:
+    for item in results.reclaimable:  # marked, still running: dispatch them yourself
+        await agent.reclaim(item.run_id, tenant_id=item.tenant_id, item=item)
+
+    for run in results.stale_running:  # stale runs that cannot be reclaimed, finalised
         logger.warning("Swept stale: %s (%s)", run.run_id, run.failure_reason)
 
     for run in results.abandoned_waiting:
         logger.warning("Swept abandoned: %s (%s)", run.run_id, run.previous_status)
+
+Continue with ``cursor=results.cursor`` until it is None. Pass ``on_stale="error"`` to
+finalise every stale run instead, as before 0.7.0; a store without the ``recovery``
+capability needs it.
 """
 
 from __future__ import annotations
@@ -230,7 +237,8 @@ async def sweep(
             if on_stale == "reclaim" and not capabilities(store).recovery:
                 _codes.log_code(logging.getLogger(__name__), _codes.STORE_CAPABILITY, run_id=None)
                 raise NotImplementedError(
-                    f"StateStore {type(store).__name__} does not declare the 'recovery' capability"
+                    f"StateStore {type(store).__name__} does not declare the 'recovery' "
+                    'capability; pass on_stale="error" to finalise stale runs without it'
                 )
             reclaimable = []
             next_cursor = None

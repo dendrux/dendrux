@@ -30,7 +30,7 @@ async def test_omitted_policy_reclaims_and_needs_recovery(kwargs):
     store = legacy_store(["old-run"])
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        with pytest.raises(NotImplementedError, match="recovery"):
+        with pytest.raises(NotImplementedError, match=r'recovery.*on_stale="error"'):
             await sweep(state_store=store, stale_running=timedelta(seconds=1), **kwargs)
     store.sweep_stale_runs.assert_not_awaited()
     assert not warnings_of(caught, FutureWarning)
