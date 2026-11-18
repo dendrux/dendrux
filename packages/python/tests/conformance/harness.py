@@ -199,8 +199,8 @@ ADDITIVE_060_RECORD_FIELDS = {
         "trace_link",
     },
 }
-# contracts §7 / §12.15: additive sweep result shape only.
-ADDITIVE_060_RESULT_FIELDS = {"SweepResult": {"reclaimable", "cursor"}}
+# contracts §7 / §12.15: additive sweep result shape only (adoptable since 0.8).
+ADDITIVE_060_RESULT_FIELDS = {"SweepResult": {"reclaimable", "cursor", "adoptable"}}
 # contracts §12.7 / §12.15: preserve every other base and its order.
 ADDITIVE_060_EXCEPTION_BASES = {"RunControlError"}
 
