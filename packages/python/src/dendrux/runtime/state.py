@@ -700,11 +700,9 @@ class SubtreeSummary:
 
 @dataclass
 class DelegationInfo:
-    """Bounded delegation context for a single run.
+    """Bounded delegation context of one run, from ``StateStore.get_delegation_info()``.
 
-    Returned by ``StateStore.get_delegation_info()``. When truncated, subtree
-    totals cover only visited rows and are lower bounds on the full tree.
-    """
+    When truncated, subtree totals cover only visited rows and are lower bounds."""
 
     parent: ParentRef | None
     children: list[RunBrief]
@@ -747,6 +745,8 @@ class ToolCallReadRecord:
     idempotent: bool = False
     replayed_at: datetime | None = None
     observation: dict[str, Any] | None = None
+    content_digest: str | None = None  # started: the intent digest; resolved: the outcome digest
+    managed_child_run_id: str | None = None  # the child a managed intent was bound to
 
 
 @dataclass

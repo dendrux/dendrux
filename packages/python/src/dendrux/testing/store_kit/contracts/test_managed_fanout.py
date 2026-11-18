@@ -31,6 +31,14 @@ from dendrux.errors import (
 from dendrux.runtime._capabilities import (  # In-package on purpose; covered by kit tests.
     fanout_support,
 )
+from dendrux.runtime._fanout_adoption_state import (  # In-package on purpose; see above.
+    adoption_payload,
+    fanout_adoption,
+)
+from dendrux.runtime._managed_claim import (  # In-package on purpose; see above.
+    fanout_adoption_validator,
+    fanout_submission_descriptor,
+)
 from dendrux.runtime._managed_fanout_store import (  # In-package on purpose; see above.
     BindManagedChildrenRequest,
     ManagedChildSpec,
@@ -291,24 +299,26 @@ async def _child_published(
     )
 
 
+def _adoption(request: BindManagedChildrenRequest, **wrong: Any) -> dict[str, Any]:
+    """The ``submit_and_claim`` arguments the runtime sends to adopt ``request`` (spec §7.3)."""
+    wait, calls = request.parent_wait.to_dict(), [c.tool_call_id for c in request.children]
+    bound = [(c.tool_call_id, c.child_run_id) for c in request.children]
+    pause_id = wait["pause_id"]
+    return {
+        "expected_status": RunStatus.PAUSED.value,
+        "submitted_data": adoption_payload(calls),
+        "submission": fanout_submission_descriptor(
+            pause_id, calls, reserved_order_index=wait["trace_order_offset"]
+        ),
+        "validate": fanout_adoption_validator(
+            request.parent_run_id, wrong.get("pause_id", pause_id), wrong.get("bindings", bound)
+        ),
+    }
+
+
 async def _claim_adoption(store: Any, request: BindManagedChildrenRequest) -> int:
     """Claim the parked parent as a v4 adoption (spec §7.3 descriptor and ids-only payload)."""
-    calls = [c.tool_call_id for c in request.children]
-    pause_id = request.parent_wait.to_dict()["pause_id"]
-    claim = await store.submit_and_claim(
-        request.parent_run_id,
-        expected_status=RunStatus.PAUSED.value,
-        submitted_data={"managed_fanout_adoption": {"v": 1, "calls": calls}},
-        submission={
-            "submission_id": ulid(),
-            "kind": "tool_results",
-            "pause_id": pause_id,
-            "payload_ref": {"pause_data_key": "submission"},
-            "call_ids": calls,
-            "reserved_order_index": 1,
-            "managed_fanout_adoption": {"v": 1},
-        },
-    )
+    claim = await store.submit_and_claim(request.parent_run_id, **_adoption(request))
     assert claim is not False
     return int(claim.claim_epoch)
 
@@ -849,6 +859,81 @@ async def test_managed_children_simultaneous_finishers_see_each_other(dendrux_ki
 
     seen = await asyncio.gather(finish(store, ids[0]), finish(second, ids[1]))
     assert set(ids) in seen, "the last finisher's fresh read must see every sibling terminal"
+
+
+# ---------------------------------------------------------------------------------------------
+# K9, the v4 adoption claim: the runtime's descriptor, payload and in-lock validator
+# ---------------------------------------------------------------------------------------------
+
+
+@fanout
+async def test_fanout_adoption_claim_and_completions(dendrux_kit: Kit) -> None:
+    """The stored descriptor and payload are exact; completions are idempotent by digest."""
+    store = dendrux_kit.store
+    parent, calls = await _parent(dendrux_kit, 2)
+    request = _request(parent, calls)
+    await store.bind_managed_children(request)
+    wait, arguments = request.parent_wait.to_dict(), _adoption(request)
+    claim = await store.submit_and_claim(parent, **arguments)
+    assert claim is not False and claim.claim_epoch == 2
+    key = {"submission_id": arguments["submission"]["submission_id"], "kind": "tool_results"}
+    key.update(pause_id=wait["pause_id"], call_ids=calls)
+    descriptor = {**key, "payload_ref": {"pause_data_key": "submission"}}
+    descriptor.update(reserved_order_index=wait["trace_order_offset"])
+    descriptor["managed_fanout_adoption"] = {"v": 1}
+    state, pause = await store.get_loop_state(parent), await store.get_pause_state(parent)
+    assert state["submission"] == claim.submission == descriptor
+    assert fanout_adoption(state) == tuple(calls)
+    payload = {"managed_fanout_adoption": {"v": 1, "calls": calls}}
+    assert pause.pop("submission") == {**key, "payload": payload}
+    assert pause == wait
+    await _complete(store, parent, claim.claim_epoch, calls[0], 10)
+    before = await _snapshot(store, parent)
+    await _complete(store, parent, claim.claim_epoch, calls[0], 10)  # replay: new ids, same digest
+    assert await _snapshot(store, parent) == before
+    with pytest.raises(PersistenceError):
+        await _complete(store, parent, claim.claim_epoch, calls[0], 10, result_payload='"other"')
+    with pytest.raises(RunFencedError):
+        await _complete(store, parent, claim.claim_epoch - 1, calls[1], 11)
+    assert await _snapshot(store, parent) == before
+
+
+@fanout
+@pytest.mark.parametrize("case", ["generation", "order", "child"])
+async def test_fanout_adoption_refusal_rolls_back(dendrux_kit: Kit, case: str) -> None:
+    """The in-lock validator's refusal leaves the wait exactly as it was, still claimable."""
+    store = dendrux_kit.store
+    parent, calls = await _parent(dendrux_kit, 3)
+    request = _request(parent, calls)
+    await store.bind_managed_children(request)
+    one, two, three = [(c.tool_call_id, c.child_run_id) for c in request.children]
+    wrong: Any = {
+        "generation": {"pause_id": ulid()},
+        "order": {"bindings": [two, one, three]},
+        "child": {"bindings": [(one[0], ulid()), two, three]},
+    }[case]
+    before = await _snapshot(store, parent)
+    with pytest.raises(ManagedStateError) as refused:
+        await store.submit_and_claim(parent, **_adoption(request, **wrong))
+    assert refused.value.reason == "binding_conflict"
+    assert await _snapshot(store, parent) == before
+    assert await store.submit_and_claim(parent, **_adoption(request)) is not False
+
+
+@fanout_second
+async def test_fanout_adoption_claim_has_one_winner(dendrux_kit: Kit) -> None:
+    store = dendrux_kit.store
+    parent, calls = await _parent(dendrux_kit, 2)
+    request = _request(parent, calls)
+    await store.bind_managed_children(request)
+    tries, second = [_adoption(request), _adoption(request)], await dendrux_kit.second()
+    claims = await asyncio.gather(
+        store.submit_and_claim(parent, **tries[0]), second.submit_and_claim(parent, **tries[1])
+    )
+    [won] = [i for i, claim in enumerate(claims) if claim is not False]
+    assert claims[won].claim_epoch == 2 and claims[1 - won] is False
+    state = await store.get_loop_state(parent)
+    assert state["submission"]["submission_id"] == tries[won]["submission"]["submission_id"]
 
 
 # ---------------------------------------------------------------------------------------------
