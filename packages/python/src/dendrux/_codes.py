@@ -924,7 +924,7 @@ MANAGED_FANOUT_BRANCH_ERROR = Code(
     "subagent",
     _BASE_FIELDS | frozenset({"error_type"}),
     "A managed fan-out branch raised an error collected by its owner.",
-    "Inspect safe exception diagnostics for the child run.",
+    "Inspect the child error type; traceback diagnostics use separate log lines.",
 )
 MANAGED_CHILD_FAILED = Code(
     "managed_child_failed",

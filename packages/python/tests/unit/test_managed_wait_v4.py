@@ -2,6 +2,7 @@
 
 import copy
 import json
+import sys
 
 import pytest
 
@@ -289,7 +290,7 @@ def test_managed_decode_refuses_non_object(value):
     assert exc.value.reason == "wait_invalid"
 
 
-def test_v4_checkpoint_record_preserves_binding_order_and_generation():
+def test_v4_checkpoint_record_preserves_binding_identities_and_generation():
     pause = PauseState.from_managed_dict(v4_data())
     checkpoint = pause.managed_fanout.to_checkpoint(pause_id=PAUSE_ID)
     assert checkpoint == {
@@ -297,7 +298,6 @@ def test_v4_checkpoint_record_preserves_binding_order_and_generation():
         "pause_id": PAUSE_ID,
         "bindings": {"c0": "0" * 26, "c1": "0" * 25 + "1"},
     }
-    assert list(checkpoint["bindings"]) == ["c0", "c1"]
     checkpoint["bindings"]["c0"] = CHILD_ID
     assert pause.managed_fanout.bindings[0].child_run_id == "0" * 26
 
@@ -307,3 +307,86 @@ def test_v4_checkpoint_refuses_invalid_generation(pause_id):
     pause = PauseState.from_managed_dict(v4_data())
     with pytest.raises(ValueError):
         pause.managed_fanout.to_checkpoint(pause_id=pause_id)
+
+
+def test_v3_deep_json_refuses_with_typed_state_error():
+    data = json.loads(V3_GOLDEN)
+    nested = None
+    for _ in range(max(10_000, sys.getrecursionlimit() + 100)):
+        nested = [nested]
+    data["provider_kwargs"] = {"nested": nested}
+    with pytest.raises(ManagedStateError) as exc:
+        PauseState.from_managed_dict(data, run_id=PAUSE_ID)
+    assert exc.value.reason == "wait_invalid"
+
+
+@pytest.mark.parametrize("fanout", [None, {}, v4_data()["managed_fanout"]])
+def test_v3_forged_fanout_hybrid_refuses(fanout):
+    data = json.loads(V3_GOLDEN)
+    data["managed_fanout"] = fanout
+    with pytest.raises(ManagedStateError) as exc:
+        PauseState.from_managed_dict(data, run_id=PAUSE_ID)
+    assert exc.value.reason == "wait_invalid"
+
+
+@pytest.mark.parametrize("length", [26, 27])
+def test_managed_binding_call_id_length_matches_ulid_cap(length):
+    call_id = "c" * length
+    if length == types.ULID_CHARS:
+        assert ManagedWait(call_id, CHILD_ID).tool_call_id == call_id
+    else:
+        with pytest.raises(ValueError):
+            ManagedWait(call_id, CHILD_ID)
+
+
+def _full_width_wait(*, name="researcher", provider_chars=None):
+    data = v4_data(32)
+    bindings = []
+    for i, call in enumerate(data["pending_tool_calls"]):
+        call_id = f"{i:026d}"
+        call.update(id=call_id, name=name, provider_tool_call_id=f"toolu_01{i:022d}")
+        if provider_chars is not None:
+            call["provider_tool_call_id"] = call["provider_tool_call_id"].ljust(provider_chars, "x")
+        bindings.append({"tool_call_id": call_id, "child_run_id": f"{i + 32:026d}"})
+    data["pending_targets"] = {call["id"]: "agent" for call in data["pending_tool_calls"]}
+    data["managed_fanout"]["bindings"] = bindings
+    pause = PauseState.from_managed_dict(data)
+    pause.usage = UsageStats(
+        input_tokens=12_000,
+        output_tokens=4_096,
+        total_tokens=16_096,
+        cost_usd=0.13842,
+        cache_read_input_tokens=8_000,
+        cache_creation_input_tokens=1_024,
+        reasoning_tokens=1_024,
+        cost_source="catalog",
+        usage_reported=True,
+        cost_unknown=False,
+    )
+    return pause
+
+
+def test_v4_32_calls_with_ulid_and_provider_ids_fit_wait_bound():
+    pause = _full_width_wait()
+    stored = pause.to_dict()
+    # Measured compact UTF-8 size: 8,643 bytes for these 32 realistic calls.
+    assert len(stored["managed_fanout"]["bindings"]) == 32
+    assert all(len(call["id"]) == types.ULID_CHARS for call in stored["pending_tool_calls"])
+    assert all(
+        call["provider_tool_call_id"].startswith("toolu_01")
+        for call in stored["pending_tool_calls"]
+    )
+    assert len(encoded(stored)) < 32 * 1024
+    assert PauseState.from_managed_dict(stored).to_dict() == stored
+
+
+def test_v4_32_calls_with_maximum_names_and_provider_ids_fit_wait_bound():
+    pause = _full_width_wait(name="w" * 64, provider_chars=255)
+    stored = pause.to_dict()
+    # Measured compact UTF-8 size: 17,571 bytes at these maximum identifier widths.
+    assert all(
+        len(call["name"]) == 64 and len(call["provider_tool_call_id"]) == 255
+        for call in stored["pending_tool_calls"]
+    )
+    assert len(encoded(stored)) < 32 * 1024
+    assert PauseState.from_managed_dict(stored).to_dict() == stored

@@ -7,6 +7,7 @@ Old-worker v4 behavior is covered by the coordinator's pinned 0.7.0 harness
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from dataclasses import fields, make_dataclass
 from datetime import UTC, datetime, timedelta
@@ -225,7 +226,6 @@ async def _snapshot(engine: Any) -> dict[str, list[Any]]:
         for registered in (False, True)
         for version in (4, 5, 6)
         for cut in ("parked", "claimed", "partial")
-        if (registered, version, cut) != (True, 4, "parked")
     ],
 )
 async def test_reclaim_refuses_future_wait_before_claim(
@@ -239,6 +239,14 @@ async def test_reclaim_refuses_future_wait_before_claim(
     agent = _agent(store, registered)
     root, _, _ = await _seed(store, engine, agent, cut, version)
     before = await _snapshot(engine)
+    if (registered, version, cut) == (True, 4, "parked"):
+        # T5 owns the outcome; this boundary checks only durable and provider effects.
+        with contextlib.suppress(Exception):
+            await agent.reclaim(root, tenant_id=TENANT)
+        assert await _snapshot(engine) == before
+        assert agent.provider.calls == 0
+        assert all(child.provider.calls == 0 for child in agent.subagents)
+        return
     with (
         caplog.at_level(logging.WARNING),
         pytest.raises((RunControlError, PersistenceError)) as exc,
@@ -309,11 +317,6 @@ async def test_reclaim_checks_both_saved_formats(store: Any, engine: Any, marker
         )
         for registered in (False, True)
         for cut in ("parked", "claimed", "partial")
-        if not (
-            registered
-            and cut == "parked"
-            and operation in {"resume", "resume_stream", "input", "approval", "results"}
-        )
     ],
 )
 async def test_other_entries_leave_future_workflow_untouched(
@@ -327,7 +330,11 @@ async def test_other_entries_leave_future_workflow_untouched(
     agent = _agent(store, registered)
     root, call, child = await _seed(store, engine, agent, cut)
     before = await _snapshot(engine)
-    try:
+    # Valid parked v4 outcomes belong to T5; this test observes only side effects.
+    refusals = (
+        (Exception,) if registered and cut == "parked" else (RunControlError, PersistenceError)
+    )
+    with contextlib.suppress(*refusals):
         if operation == "pending":
             await run_store.get_pending(root, tenant_id=TENANT)
         elif operation == "resume":
@@ -358,9 +365,9 @@ async def test_other_entries_leave_future_workflow_untouched(
                 )
                 is False
             )
-    except (RunControlError, PersistenceError):
-        pass  # Existing strict codecs and status checks are valid refusals.
     assert await _snapshot(engine) == before
+    assert agent.provider.calls == 0
+    assert all(child.provider.calls == 0 for child in agent.subagents)
 
 
 @pytest.mark.parametrize("mode", ["error", "reclaim"])

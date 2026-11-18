@@ -489,9 +489,9 @@ class StatementTooLargeError(PersistenceError):
 
 
 class ManagedStateError(_KwargsReduceMixin, PersistenceError):
-    """Persisted managed-subagent state cannot support a transition.
+    """Internal: persisted managed-subagent state cannot support a transition.
 
-    Refuses malformed waits, inconsistent children and fan-out mismatches.
+    It never recreates or guesses state; malformed waits or mismatches are refused.
     ``reason`` is a stable sub-code; messages carry codes, never stored text.
     """
 

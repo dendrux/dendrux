@@ -13,7 +13,6 @@ from dendrux.errors import ManagedStateError
 if TYPE_CHECKING:
     from dendrux.types import PauseState
 
-# Persisted JSON is a dynamic boundary; validate before constructing typed records.
 MAX_PARALLEL_SUBAGENTS = 32
 MANAGED_FANOUT_SCHEMA_VERSION = 4
 
@@ -21,15 +20,16 @@ _ULID_PATTERN = re.compile(r"[0-7][0-9A-HJKMNP-TV-Z]{25}")
 MANAGED_PROTOCOL_VERSION = 1
 MANAGED_WAIT_REASON = "managed_wait"
 MANAGED_WAIT_SCHEMA_VERSION = 3
+# Matches types.ULID_CHARS without importing the higher-level types module.
+_MANAGED_CALL_ID_MAX_CHARS = 26
 
 
 @dataclass(frozen=True)
 class ManagedWait:
-    """Internal (0.7): a parent's one outgoing managed-subagent binding.
+    """Internal: one immutable managed tool-call binding, used by v3 and v4 waits.
 
-    Saved inside a pause ``schema_version=3`` managed wait: the parent's
-    pending ``tool_call_id`` is bound to the fresh ``child_run_id``. Immutable;
-    never derived from model arguments.
+    A v3 wait saves this envelope directly. A v4 wait saves the two ids as an
+    entry in its ordered bindings list. Never derived from model arguments.
     """
 
     tool_call_id: str
@@ -40,7 +40,7 @@ class ManagedWait:
         if (
             not isinstance(self.tool_call_id, str)
             or not self.tool_call_id
-            or len(self.tool_call_id) > 26
+            or len(self.tool_call_id) > _MANAGED_CALL_ID_MAX_CHARS
         ):
             raise ValueError("ManagedWait.tool_call_id must be a stable call id")
         if not isinstance(self.child_run_id, str) or not _ULID_PATTERN.fullmatch(self.child_run_id):
@@ -77,11 +77,11 @@ def _managed_wait_binding(data: Any, run_id: str | None) -> ManagedWait:
 
 def _managed_wait_check(data: Any) -> tuple[str | None, ManagedWait | None]:
     """Shared by the v3 encoder and decoder: ``(refusal reason, binding)``."""
-    if not isinstance(data, dict):
+    if not isinstance(data, dict) or "managed_fanout" in data:
         return "wait_invalid", None
     try:
         size = _compact_json_bytes(data)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, RecursionError):
         return "wait_invalid", None
     if size > MANAGED_WAIT_MAX_BYTES:
         return "wait_too_large", None
@@ -278,7 +278,11 @@ class ManagedFanout:
         }
 
     def to_checkpoint(self, *, pause_id: str) -> dict[str, Any]:
-        """The matching loop-state wait record, with a fresh bindings mapping."""
+        """The matching loop-state wait record, with a fresh bindings mapping.
+
+        Call order comes from the pause envelope's ``bindings`` list or
+        ``managed_admitted``, never this mapping: JSONB may reorder its keys.
+        """
         if not isinstance(pause_id, str) or not _ULID_PATTERN.fullmatch(pause_id):
             raise ValueError("A managed fan-out checkpoint needs a pause ULID")
         return {
@@ -348,6 +352,7 @@ def _managed_fanout_check(data: Any) -> ManagedFanout | None:
 
 def decode_managed_binding(data: Any, *, run_id: str | None) -> ManagedWait | ManagedFanout:
     """Validate persisted managed JSON before the PauseState decoder reads it."""
+    # Persisted JSON is a dynamic boundary; validate before constructing typed records.
     if isinstance(data, dict) and data.get("schema_version") == MANAGED_FANOUT_SCHEMA_VERSION:
         fanout = _managed_fanout_check(data)
         if fanout is None:
