@@ -201,6 +201,8 @@ ADDITIVE_060_RECORD_FIELDS = {
 }
 # contracts §7 / §12.15: additive sweep result shape only.
 ADDITIVE_060_RESULT_FIELDS = {"SweepResult": {"reclaimable", "cursor"}}
+# 0.8: additive v1 browser DTO keys; the goldens were recorded without them.
+ADDITIVE_080_WIRE_KEYS = frozenset({"pendings"})
 # contracts §12.7 / §12.15: preserve every other base and its order.
 ADDITIVE_060_EXCEPTION_BASES = {"RunControlError"}
 
@@ -327,7 +329,7 @@ def result_view(result: Any) -> dict[str, Any]:
         "meta": raw(result.meta),
         "pending": raw(result.pending),
         "steps": [type(s.action).__name__ for s in result.steps],
-        "wire": raw(result.to_dict()),
+        "wire": raw({k: v for k, v in result.to_dict().items() if k not in ADDITIVE_080_WIRE_KEYS}),
     }
 
 
