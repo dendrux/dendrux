@@ -1,7 +1,20 @@
-"""Decide and execute approval batches through policy, pause and managed-handoff barriers."""
+"""Decide approval batches through policy, pause and managed-handoff barriers.
+
+Approval dispatch is shared by batch and streaming resume. Pending calls retain
+emission order: clients return to the caller, denied gates get failed results,
+and approved gates and held server calls execute without repeating before_tool.
+A cancel-then-pause barrier precedes each server effect and retains remaining
+calls on a stop. decisions=None means legacy batch approval. Tool observations
+append to the live history, not the pause snapshot. The resolved loop controls
+lookups; the caller emits approval.decided and re-enters that loop.
+
+Streaming frames retain the single-child policy until the stream fan-out driver
+lands. Refuse a held multi-child batch before any approved server effect.
+"""
 
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
@@ -14,6 +27,8 @@ from dendrux._lifecycle import (
 from dendrux._meta_keys import (
     NOT_EXECUTED_META_KEY,
 )
+from dendrux.errors import ManagedStateError
+from dendrux.loops import _managed_batch
 from dendrux.loops._helpers import (
     order_observations,
     record_message,
@@ -27,6 +42,7 @@ from dendrux.loops._policy_context import (
 from dendrux.runtime import (
     _run_contracts,
     _run_entry,
+    _run_execute,
     _run_images,
     _run_resume_replay,
 )
@@ -281,30 +297,10 @@ async def _execute_approved_tools(
     image_runtime: ImageRuntime | None = None,
     on_work: Callable[[], None] | None = None,
 ) -> _run_contracts._ApprovalResume:
-    """Resolve an approval batch on resume, routing each call by target.
+    """Execute approved/held server calls and return pending client or managed calls.
 
-    Shared by _resume_core (batch) and resume_stream (streaming). Walks
-    ``pending_tool_calls`` in order:
-
-    - client-target calls are never executed; they are returned in
-      ``client_pending`` and the caller pauses the run for client results;
-    - denied gated calls get a failed result ``{"denied": reason}``;
-    - approved gated calls and held non-gated server calls execute through
-      the approved path (no ``before_tool`` re-run: the human decision wins
-      and held calls were already evaluated before the pause).
-
-    ``decisions=None`` is the legacy batch approve. Before every server
-    execution a resume barrier checks cancel (then pause); on a hit the
-    remaining calls are skipped and ``barrier`` is set.
-
-    Tool messages are appended to ``history`` (the live ctx.history list,
-    not pause_state.history which is a snapshot). ``resolved_loop`` is
-    forwarded to ``agent.get_tool_lookups()`` so a runtime loop override
-    stays consistent across resume. Caller emits ``approval.decided`` and
-    handles loop re-entry.
+    Decisions are durable; hooks are not repeated. Barriers precede each effect.
     """
-    import json
-
     from dendrux.loops._helpers import notify_message as _ntfy_msg
     from dendrux.loops._helpers import notify_tool as _ntfy_tool
     from dendrux.loops._helpers import notify_tool_started as _ntfy_tool_started
@@ -404,6 +400,10 @@ async def _execute_approved_tools(
                 deny=agent._deny,
                 tool_result_transform=agent.tool_result_transform,
                 tenant_id=None,
+                batch_policy=_managed_batch.batch_policy(
+                    agent,
+                    fanout_capable=_managed_batch.loop_fanout_capable(recorder),
+                ),
                 **dispatch_policy(name=tc.name, phase="approved"),
                 **_run_images._tool_image_kwargs(_process_tool_calls, image_runtime),
             )
@@ -533,12 +533,12 @@ def _approved_handoff(
     from dendrux.loops.react import MANAGED_HANDOFF_KEY
     from dendrux.types import RunResult
 
-    call = handoff.call
+    calls = handoff.calls
     pause = _replace(
         pause_state,
         history=list(history),
-        pending_tool_calls=[call],
-        pending_targets={call.id: "agent"},
+        pending_tool_calls=list(calls),
+        pending_targets={call.id: "agent" for call in calls},
         approval_gates=None,
         pending_decisions=None,
         pause_reason=None,
@@ -640,12 +640,18 @@ async def _resume_approval_batch(
     streaming: bool = False,
 ) -> tuple[_run_contracts._ApprovalResume | None, bool]:
     pause = ctx.pause_state
+    if streaming and ctx.recorder is not None:
+        _run_execute._configure_fanout(ctx.recorder, None)
     approving = (
         results is None and user_input is None and expected == RunStatus.WAITING_APPROVAL.value
     )
     paused_batch = expected == RunStatus.PAUSED.value and bool(pause.pending_tool_calls)
     if not (approving or paused_batch):
         return None, approving
+    if streaming:
+        refused = await _refuse_stream_approval(agent, ctx, run_id)
+        if refused is not None:
+            return refused, approving
     decision_map = None
     if not approving:
         decision_map = _pending_decision_map(pause)
@@ -669,6 +675,27 @@ async def _resume_approval_batch(
     return await _hand_off_approved_subagent(agent, ctx, run_id, approval), approving
 
 
+async def _refuse_stream_approval(
+    agent: Agent, ctx: _run_contracts._ResumeContext, run_id: str
+) -> _run_contracts._ApprovalResume | None:
+    """Refuse a held unsupported batch before approval dispatch creates any effect."""
+    # cycle: _reclaim imports _run_approval via runner; removed when T6 extracts recovery dispatch.
+    from dendrux.runtime._reclaim import _refuse_recovered_batch
+
+    calls = ctx.pause_state.pending_tool_calls
+    if len(calls) < 2:
+        return None
+    lookups = await agent.get_tool_lookups(loop=ctx.resolved_loop)
+    policy = _managed_batch.batch_policy(agent, fanout_capable=False)
+    if _managed_batch.classify_batch(calls, lookups, policy).action != "refuse":
+        return None
+    await _refuse_recovered_batch(ctx, run_id, calls)
+    decided = _decided_payload(
+        run_id, [(tc, "denied", _managed_batch.MANAGED_BATCH_UNSUPPORTED) for tc in calls]
+    )
+    return _run_contracts._ApprovalResume([], [], decided, None)
+
+
 async def _hand_off_approved_subagent(
     agent: Agent,
     ctx: _run_contracts._ResumeContext,
@@ -681,7 +708,7 @@ async def _hand_off_approved_subagent(
     call (never gated: an approval decision on it is a denial) passes the
     child's brief limit, as in a live batch, and is handed off.
     """
-    from dendrux.loops.react import ManagedHandoff, SubagentTool, _admit_managed_briefs
+    from dendrux.loops._managed_batch import ManagedHandoff, SubagentTool
 
     if approval.barrier is not None or not approval.client_pending:
         return approval
@@ -691,18 +718,19 @@ async def _hand_off_approved_subagent(
     ]
     if not managed:
         return approval
-    if len(approval.client_pending) != 1:
+    if len(approval.client_pending) != len(managed):
         from dendrux.errors import ManagedUnsupportedError
 
         raise ManagedUnsupportedError("approval_mixed_batch", run_id)
     from dendrux.runtime._reclaim import _recovery_batch
 
-    admitted = await _admit_managed_briefs(managed, lookups, _recovery_batch(ctx, run_id))
-    entry = lookups.fn[managed[0].name]
-    assert isinstance(entry, SubagentTool)
-    handoff = (
-        ManagedHandoff(call=admitted[0], child=entry.agent, parent=agent) if admitted else None
+    admitted = await _managed_batch._admit_managed_briefs(
+        managed, lookups, _recovery_batch(ctx, run_id)
     )
+    entry = lookups.fn[(admitted or managed)[0].name]
+    if not isinstance(entry, SubagentTool):
+        raise ManagedStateError(reason="path_missing", run_id=run_id)
+    handoff = ManagedHandoff(calls=admitted, child=entry.agent, parent=agent) if admitted else None
     return approval._replace(client_pending=[], handoff=handoff)
 
 
@@ -743,6 +771,7 @@ async def _resume_approval_work(
 ) -> RunResult | None:
     from dendrux.loops._helpers import _BlockedObservationError
 
+    _run_execute._configure_fanout(ctx.recorder, store)
     try:
         approval, approving = await _resume_approval_batch(
             agent,
