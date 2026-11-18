@@ -71,21 +71,11 @@ from dendrux.runtime._bounds import (
     MAX_PAGE,
     SUBTREE_MAX_NODES_DEFAULT,
 )
-from dendrux.runtime._pending import (
-    _KIND_BY_STATUS as _KIND_BY_STATUS,
-)
-from dendrux.runtime._pending import (
-    PendingKind as PendingKind,
-)
-from dendrux.runtime._pending import (
-    PendingPause as PendingPause,
-)
-from dendrux.runtime._pending import (
-    PendingToolCall as PendingToolCall,
-)
-from dendrux.runtime._pending import (
-    _pending_from as _pending_from,
-)
+from dendrux.runtime._pending import _KIND_BY_STATUS as _KIND_BY_STATUS
+from dendrux.runtime._pending import PendingKind as PendingKind
+from dendrux.runtime._pending import PendingPause as PendingPause
+from dendrux.runtime._pending import PendingToolCall as PendingToolCall
+from dendrux.runtime._pending import _pending_from as _pending_from
 from dendrux.runtime._pending import (
     _PendingReader,
     check_metadata_filter,
@@ -1382,19 +1372,27 @@ class RunStore:
         return items, truncated
 
     async def get_pending(self, run_id: str, *, tenant_id: TenantScope) -> PendingPause | None:
-        """What the run is waiting for now, or None when it is not paused.
+        """What the run is waiting for now (the first of :meth:`get_pendings`), or None.
 
-        ``tenant_id`` is required (keyword-only): a string or ``None`` scopes
-        the read, ``UNSCOPED`` reads any tenant and must be passed explicitly.
-        Bounded reads on the built-in store: the pause history is never
-        loaded. Use it after a reload, a reconnect, a timed-out request or a
-        retried idempotent call to rebuild the client's form or tool call.
-        Arguments are in the form described on :class:`PendingToolCall`.
+        ``tenant_id`` is required (keyword-only): a string or ``None`` scopes the read,
+        ``UNSCOPED`` reads any tenant and must be passed explicitly. Bounded reads on the
+        built-in store: the pause history is never loaded. Use it after a reload, a
+        reconnect, a timed-out request or a retried idempotent call to rebuild the client's
+        form or tool call. Arguments are in the form described on :class:`PendingToolCall`.
 
         Raises:
             RunNotFoundError: the run does not exist or is outside ``tenant_id``.
         """
         return await _PendingReader(self._state).get_pending(run_id, tenant_id=tenant_id)
+
+    async def get_pendings(self, run_id: str, *, tenant_id: TenantScope) -> list[PendingPause]:
+        """Every external pause the run or its managed workflow waits on, in stable order (0.8).
+
+        Depth-first, siblings in their parent batch's call order: a run's own pause is a
+        one-item list, a run waiting on nothing an empty one. Read-only (no claim, no epoch
+        change); the same scope rules and errors as :meth:`get_pending`.
+        """
+        return await _PendingReader(self._state).get_pendings(run_id, tenant_id=tenant_id)
 
     def follow(
         self,

@@ -43,7 +43,7 @@ from dendrux._lifecycle import TERMINAL_STATUSES as _TERMINAL_STATUSES
 from dendrux._lifecycle import WAITING_STATUSES as _WAITING_STATUS_VALUES
 from dendrux._sentinel import _OMITTED, _OmittedType, _UnsetType
 from dendrux.media._store import DEFAULT_GC_AGE, DEFAULT_GC_LIMIT
-from dendrux.runtime import _managed, _managed_budget, _managed_cancel
+from dendrux.runtime import _managed, _managed_budget, _managed_cancel, _managed_route
 from dendrux.runtime._blob_catalog import MIN_GC_AGE
 from dendrux.runtime._continuation_guardrails import _continuation_projection
 from dendrux.runtime._entry_checks import entry_checks, require_boolean
@@ -1764,7 +1764,7 @@ class Agent:
                 "Pass database_url or state_store to the constructor."
             )
 
-        def submit(agent: Agent, target: str) -> Awaitable[RunResult]:
+        def submit(agent: Agent, target: str, manager: Any = None) -> Awaitable[RunResult]:
             return agent._resume_on(
                 store,
                 target,
@@ -1869,24 +1869,25 @@ class Agent:
         tenant_id: TenantScope,
         expected_pause_id: str | None,
         notifier: LoopNotifier | None,
-        submit: Callable[[Agent, str], Awaitable[RunResult]],
+        submit: Callable[..., Awaitable[RunResult]],
         *,
         adopt_terminal: bool = False,
         **fields: Any,
     ) -> RunResult:
-        """Route a root-id continuation of a managed workflow to its active leaf (0.7).
+        """Route a root-id continuation of a managed workflow to the leaf it answers.
 
-        With ``adopt_terminal`` (a payload-free ``resume``), a finished subagent's
+        Tenant scope is checked at the root; the leaf is reached through the persisted
+        bindings (a fan-out leaf by its token) and validated, claimed and continued with
+        its own registered definition. Finished outcomes then unwind through adoption
+        toward the root, which returns its result or the workflow's next pauses. With
+        ``adopt_terminal`` (a payload-free ``resume`` of a chain), a finished subagent's
         saved outcome is adopted without a token instead.
-
-        Tenant scope is checked at the root; the leaf is reached through the
-        persisted bindings and validated, claimed and continued with the
-        leaf's own registered definition. Finished outcomes then unwind
-        through adoption to the root, which returns its result or the next
-        external pause.
         """
-
         found = await _managed.route(self, store, run_id, tenant_id=tenant_id)
+        if await _managed_route.reaches_fanout(store, found):  # a fan-out below (0.8)
+            return await _managed_route.submit_routed(
+                self, store, found, operation, expected_pause_id, submit, notifier, **fields
+            )
         if adopt_terminal:
             adopted = await _managed.adopt_terminal_leaf(found, store, notifier=notifier)
             if adopted is not None:
@@ -1968,7 +1969,7 @@ class Agent:
         if store is None:
             raise PersistenceNotConfiguredError()
 
-        def submit(agent: Agent, target: str) -> Awaitable[RunResult]:
+        def submit(agent: Agent, target: str, manager: Any = None) -> Awaitable[RunResult]:
             return agent._submit_tool_results_to(
                 store,
                 target,
@@ -1976,7 +1977,7 @@ class Agent:
                 notifier=notifier,
                 expected_pause_id=expected_pause_id,
                 tenant_explicit=tenant_explicit,
-                manager=self._task_manager,
+                manager=manager or self._task_manager,
             )
 
         if self._subagents:
@@ -2005,21 +2006,20 @@ class Agent:
         manager: Any,
     ) -> RunResult:
         """Validate with this Agent's definition, claim ``run_id`` and continue it."""
+        from dendrux.runtime._run_resume_prep import results_for_generation
         from dendrux.runtime.runner import resume_claimed
         from dendrux.runtime.submit import (
             claim_or_raise,
             prepare_client_results,
+            require_pause_id,
             serialize_tool_results,
-            validate_tool_results,
         )
         from dendrux.types import RunStatus
 
         provider = self._require_provider()
         skill_session = await continuation(self, store, run_id)
         with skill_session.bind(), await _continuation_projection(self, store, run_id):
-            pause = await validate_tool_results(store, run_id, results)
-            from dendrux.runtime.submit import require_pause_id
-
+            pause = await results_for_generation(store, run_id, results, expected_pause_id)
             require_pause_id(self, expected_pause_id, pause_id=pause.pause_id, run_id=run_id)
             results = await prepare_client_results(self, run_id, pause, results)
             claim_kwargs: dict[str, Any] = {}
@@ -2109,7 +2109,7 @@ class Agent:
         if store is None:
             raise PersistenceNotConfiguredError()
 
-        def submit(agent: Agent, target: str) -> Awaitable[RunResult]:
+        def submit(agent: Agent, target: str, manager: Any = None) -> Awaitable[RunResult]:
             return agent._submit_input_to(
                 store,
                 target,
@@ -2117,7 +2117,7 @@ class Agent:
                 notifier=notifier,
                 expected_pause_id=expected_pause_id,
                 tenant_explicit=tenant_explicit,
-                manager=self._task_manager,
+                manager=manager or self._task_manager,
             )
 
         if self._subagents:
@@ -2290,7 +2290,7 @@ class Agent:
         if store is None:
             raise PersistenceNotConfiguredError()
 
-        def submit(agent: Agent, target: str) -> Awaitable[RunResult]:
+        def submit(agent: Agent, target: str, manager: Any = None) -> Awaitable[RunResult]:
             return agent._submit_approval_to(
                 store,
                 target,
@@ -2300,7 +2300,7 @@ class Agent:
                 notifier=notifier,
                 expected_pause_id=expected_pause_id,
                 tenant_explicit=tenant_explicit,
-                manager=self._task_manager,
+                manager=manager or self._task_manager,
             )
 
         if self._subagents:
@@ -2506,7 +2506,7 @@ class Agent:
         """One result read; ``moved`` when the pending read saw another public status."""
         from dendrux.errors import RunNotFoundError
         from dendrux.guardrails._engine import deanonymize_text
-        from dendrux.runtime._pending import _PendingReader, facing_status
+        from dendrux.runtime._run_pending import _PendingReader, attach_facing
         from dendrux.runtime.runner import _cached_output, _public_meta, _recovery_info
 
         facade = _PendingReader(store)
@@ -2527,11 +2527,7 @@ class Agent:
             result.meta.update(_public_meta({"pii_mapping": mapping}))
         if result.status.value == RunStatus.SUCCESS.value:
             result.output = _cached_output(record.answer, self._output_type, run_id)
-        result.pending = await facade.get_pending(run_id, tenant_id=tenant_id)
-        view = facade.last_view
-        # A root waiting on a subagent reports its active branch (0.7).
-        result.status = RunStatus(facing_status(result.status.value, view))
-        result.pause_id = result.pending.pause_id if result.pending else None
+        view = await attach_facing(result, facade, run_id, tenant_id)
         moved = view is not None and not view.managed and view.status != record.status
         return result, moved
 
@@ -2910,14 +2906,14 @@ class Agent:
         self._require_provider()
         store = await self._require_state_store()
 
-        def submit(agent: Agent, target: str) -> Awaitable[RunResult]:
+        def submit(agent: Agent, target: str, manager: Any = None) -> Awaitable[RunResult]:
             return agent._submit_resume_to(
                 store,
                 target,
                 notifier=notifier,
                 expected_pause_id=expected_pause_id,
                 tenant_explicit=tenant_explicit,
-                manager=self._task_manager,
+                manager=manager or self._task_manager,
             )
 
         if self._subagents:

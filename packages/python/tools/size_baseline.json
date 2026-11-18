@@ -1,5 +1,5 @@
 {
- "dendrux.agent": 3856,
+ "dendrux.agent": 3852,
  "dendrux.agent:Agent.__init__": 132,
  "dendrux.agent:Agent._ensure_discovered": 106,
  "dendrux.agent:Agent._submit_approval_to": 158,
@@ -114,7 +114,7 @@
  "dendrux.runtime.submit:claim_or_raise": 99,
  "dendrux.runtime.sweep:sweep": 156,
  "dendrux.skills._session:SkillSession.execute": 106,
- "dendrux.store": 1864,
+ "dendrux.store": 1862,
  "dendrux.store._follow": 1855,
  "dendrux.store._redact": 1128,
  "dendrux.store:RunStore.get_pause_page": 85,
