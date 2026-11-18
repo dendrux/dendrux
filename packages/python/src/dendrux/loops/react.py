@@ -1,20 +1,6 @@
-"""ReAct loop — think, act, observe, repeat.
+"""ReAct orchestration: provider turns, tool dispatch, checkpoints and observations.
 
-The core agent execution loop. Orchestrates the cycle of:
-  1. Strategy builds messages
-  2. Provider calls the LLM
-  3. Strategy parses the response into an AgentStep
-  4. If ToolCall → execute → format result → append → repeat
-  5. If Finish → return RunResult
-  6. If max_iterations → return RunResult with MAX_ITERATIONS
-
-The loop never touches provider-specific APIs or prompt formatting.
-It operates entirely on Dendrux's universal types.
-
-Notifier hooks fire at three kinds of points:
-  - After each history.append() → on_message_appended
-  - After provider.complete() → on_llm_call_completed
-  - After _execute_tool() → on_tool_completed
+Persistence and capability discovery stay in runtime; each run owns its context.
 """
 
 from __future__ import annotations
@@ -1686,6 +1672,7 @@ class _RunContext:
     hook_tenant_id: str | None
     calls: ProviderCallSite
     g_engine: GuardrailEngine | None = None
+    fanout_capable: bool = False
 
     def meta(self) -> dict[str, Any]:
         """Terminal result meta: the PII mapping (batch only) and notifier warnings."""
@@ -1729,7 +1716,6 @@ async def _start_run(
     image_view_state: ImageViewState | None,
     interrupt: asyncio.Event | None,
 ) -> _RunContext:
-    """Shared setup of ``run`` and ``run_stream``: ids, tools, loop state, images, budget, hook."""
     resolved_run_id = run_id or generate_ulid()
     pkw = provider_kwargs or {}
     cache_key_prefix = build_cache_key_prefix(agent)
@@ -1792,6 +1778,7 @@ async def _start_run(
         budget=budget,
         before_tool=before_tool,
         hook_tenant_id=hook_tenant_id,
+        fanout_capable=_managed_batch.loop_fanout_capable(recorder),
         calls=ProviderCallSite(
             images,
             agent=agent,
@@ -2193,8 +2180,7 @@ async def _run_tool_step(
         before_tool=ctx.before_tool,
         tenant_id=ctx.hook_tenant_id,
         image_runtime=ctx.image_runtime,
-        # T4b wires the store capability together with the driver.
-        batch_policy=_managed_batch.batch_policy(ctx.agent, fanout_capable=False),
+        batch_policy=_managed_batch.batch_policy(ctx.agent, fanout_capable=ctx.fanout_capable),
     )
     return outcome, tool_history_start
 
