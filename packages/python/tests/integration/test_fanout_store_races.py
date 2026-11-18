@@ -256,11 +256,11 @@ async def test_bind_failure_at_child_k_leaves_no_rows(engine, monkeypatch, k):
     request = batch(root, calls)
     original, seen = store._bind_child, []
 
-    async def failing(session: Any, call: Any, parent: Any, state: Any) -> None:
+    async def failing(session: Any, call: Any, parent: Any, state: Any, **kw: Any) -> None:
         seen.append(call.child_run_id)
         if len(seen) == k + 1:
             raise RuntimeError("cut at child k")
-        await original(session, call, parent, state)
+        await original(session, call, parent, state, **kw)
 
     monkeypatch.setattr(store, "_bind_child", failing)
     with pytest.raises(RuntimeError):
@@ -378,18 +378,40 @@ async def test_pg_same_root_binders_admit_exactly_one_batch(engine, monkeypatch,
 # ---------------------------------------------------------------------------------------------
 
 
-async def test_pg_two_tenants_fan_out_at_once_without_crossing(engine):
+R8_POOL_SIZE = 2
+
+
+async def test_pg_two_tenants_fan_out_at_once_without_crossing(engine, monkeypatch):
+    """Both tenants' binds are inside their transactions, past their own root locks, at once."""
     _postgres_only(engine)
-    async with AsyncExitStack() as stack:
-        [shared] = await _pools(stack, engine, ["t3-r8-shared"])
+    pool = create_async_engine(engine.url, pool_size=R8_POOL_SIZE, max_overflow=0)
+    try:
+        shared = store_for_engine(pool)
         roots = [await fanout_parent(shared, 8, tenant=t, cap=9) for t in ("t1", "t2")]
         requests = [
             batch(root, calls, tenant=t)
             for (root, calls), t in zip(roots, ("t1", "t2"), strict=True)
         ]
+        original, arrived, both = shared._lock_managed_root, [], asyncio.Event()
+
+        async def barrier(session: Any, request: Any) -> None:
+            await original(session, request)
+            arrived.append(request.root_run_id)
+            if len(arrived) == len(requests):
+                both.set()
+            await asyncio.wait_for(both.wait(), timeout=10)
+
+        monkeypatch.setattr(shared, "_lock_managed_root", barrier)
         async with asyncio.timeout(60):
             results = await asyncio.gather(*(shared.bind_managed_children(r) for r in requests))
+        monkeypatch.undo()
+        assert sorted(arrived) == sorted(r.root_run_id for r in requests)
         assert [r.outcome for r in results] == ["created", "created"]
+        for request, result in zip(requests, results, strict=True):
+            assert [b.child_run_id for b in result.children] == [
+                c.child_run_id for c in request.children
+            ]
+            assert (await counts(engine, request.parent_run_id))["children"] == 8
         for request, other in ((requests[0], "t2"), (requests[1], "t1")):
             ids = [c.child_run_id for c in request.children]
             own = await shared.get_managed_children(
@@ -404,6 +426,8 @@ async def test_pg_two_tenants_fan_out_at_once_without_crossing(engine):
             with pytest.raises(Exception) as hidden:
                 await shared.bind_managed_children(replay)
             assert type(hidden.value).__name__ == "RunNotFoundError"
+    finally:
+        await pool.dispose()
 
 
 # ---------------------------------------------------------------------------------------------
