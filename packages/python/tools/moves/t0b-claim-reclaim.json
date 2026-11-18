@@ -1,0 +1,132 @@
+{
+  "annotations": [],
+  "base": "f60cb1f879dd4d9bb03c4ab4bfc0eef54f8f957c",
+  "effects": [],
+  "hoists": [],
+  "lexical": [
+    {
+      "count": 1,
+      "module": "src/dendrux/runtime/_reclaim.py",
+      "name": "_pending_adoption",
+      "root": "reclaim",
+      "target": "dendrux.runtime._reclaim_managed._pending_adoption"
+    },
+    {
+      "count": 1,
+      "module": "src/dendrux/runtime/_reclaim.py",
+      "name": "_finish_saved_adoption",
+      "root": "reclaim",
+      "target": "dendrux.runtime._reclaim_managed._finish_saved_adoption"
+    },
+    {
+      "count": 1,
+      "module": "src/dendrux/runtime/_reclaim.py",
+      "name": "_refuse_recovered_managed_results",
+      "root": "_consume_recovery_submission",
+      "target": "dendrux.runtime._reclaim_managed._refuse_recovered_managed_results"
+    },
+    {
+      "count": 1,
+      "module": "src/dendrux/runtime/_reclaim.py",
+      "name": "_refuse_bound_pending",
+      "root": "resolve",
+      "target": "dendrux.runtime._reclaim_managed._refuse_bound_pending"
+    },
+    {
+      "count": 1,
+      "module": "src/dendrux/runtime/_reclaim.py",
+      "name": "_handed_off",
+      "root": "resolve",
+      "target": "dendrux.runtime._reclaim_managed._handed_off"
+    },
+    {
+      "count": 1,
+      "module": "src/dendrux/runtime/_reclaim.py",
+      "name": "_managed_handoff",
+      "root": "resolve",
+      "target": "dendrux.runtime._reclaim_managed._managed_handoff"
+    }
+  ],
+  "metadata": [
+    {
+      "attribute": "__module__",
+      "module": "src/dendrux/runtime/_reclaim_managed.py",
+      "root": "_ManagedPending",
+      "value": "dendrux.runtime._reclaim"
+    }
+  ],
+  "old": "src/dendrux/runtime/_reclaim.py",
+  "owners": {
+    "_ManagedPending": "src/dendrux/runtime/_reclaim_managed.py",
+    "_ORDINARY": "src/dendrux/runtime/_reclaim.py",
+    "_PauseReadMemo": "src/dendrux/runtime/_reclaim.py",
+    "_PauseReadMemo.__getattr__": "src/dendrux/runtime/_reclaim.py",
+    "_PauseReadMemo.__init__": "src/dendrux/runtime/_reclaim.py",
+    "_PauseReadMemo.get_pause_state": "src/dendrux/runtime/_reclaim.py",
+    "_Prepared": "src/dendrux/runtime/_reclaim.py",
+    "_Prepared.prepare": "src/dendrux/runtime/_reclaim.py",
+    "_Prepared.prepare_all": "src/dendrux/runtime/_reclaim.py",
+    "_RecoveryBlockedError": "src/dendrux/runtime/_reclaim.py",
+    "_RecoveryBlockedError.__init__": "src/dendrux/runtime/_reclaim.py",
+    "_RecoveryCall": "src/dendrux/runtime/_reclaim.py",
+    "_admit_recovered_call": "src/dendrux/runtime/_reclaim.py",
+    "_admit_recovery_block": "src/dendrux/runtime/_reclaim.py",
+    "_admitted_arguments": "src/dendrux/runtime/_reclaim.py",
+    "_check_before_claim": "src/dendrux/runtime/_reclaim.py",
+    "_checkpoint_resolution": "src/dendrux/runtime/_reclaim.py",
+    "_consume_recovery_submission": "src/dendrux/runtime/_reclaim.py",
+    "_continuation_base": "src/dendrux/runtime/_reclaim.py",
+    "_continue_session": "src/dendrux/runtime/_reclaim.py",
+    "_dispatch_prepared_batch": "src/dendrux/runtime/_reclaim.py",
+    "_dispatch_recovery_call": "src/dendrux/runtime/_reclaim.py",
+    "_execute_recovery_calls": "src/dendrux/runtime/_reclaim.py",
+    "_finish_saved_adoption": "src/dendrux/runtime/_reclaim_managed.py",
+    "_handed_off": "src/dendrux/runtime/_reclaim_managed.py",
+    "_handle_rebuild_failure": "src/dendrux/runtime/_reclaim.py",
+    "_hold_recovery_call": "src/dendrux/runtime/_reclaim.py",
+    "_hold_started_outcome": "src/dendrux/runtime/_reclaim.py",
+    "_managed_handoff": "src/dendrux/runtime/_reclaim_managed.py",
+    "_observe_recovery_call": "src/dendrux/runtime/_reclaim.py",
+    "_pending_adoption": "src/dendrux/runtime/_reclaim_managed.py",
+    "_pending_rows": "src/dendrux/runtime/_reclaim.py",
+    "_rebuild_failure_reason": "src/dendrux/runtime/_reclaim.py",
+    "_reclaim_arguments": "src/dendrux/runtime/_reclaim.py",
+    "_reclaim_setup": "src/dendrux/runtime/_reclaim.py",
+    "_reclaimed_result": "src/dendrux/runtime/_reclaim.py",
+    "_recover_managed_calls": "src/dendrux/runtime/_reclaim.py",
+    "_recovery_approval": "src/dendrux/runtime/_reclaim.py",
+    "_recovery_barrier": "src/dendrux/runtime/_reclaim.py",
+    "_recovery_batch": "src/dendrux/runtime/_reclaim.py",
+    "_recovery_claim": "src/dendrux/runtime/_reclaim.py",
+    "_recovery_decisions": "src/dendrux/runtime/_reclaim.py",
+    "_recovery_denial": "src/dendrux/runtime/_reclaim.py",
+    "_recovery_denied_calls": "src/dendrux/runtime/_reclaim.py",
+    "_recovery_input": "src/dendrux/runtime/_reclaim.py",
+    "_recovery_pause_result": "src/dendrux/runtime/_reclaim.py",
+    "_recovery_tool_result": "src/dendrux/runtime/_reclaim.py",
+    "_refuse_bound_pending": "src/dendrux/runtime/_reclaim_managed.py",
+    "_refuse_direct_child": "src/dendrux/runtime/_reclaim.py",
+    "_refuse_recovered_batch": "src/dendrux/runtime/_reclaim.py",
+    "_refuse_recovered_managed_results": "src/dendrux/runtime/_reclaim_managed.py",
+    "_require_recovery": "src/dendrux/runtime/_reclaim.py",
+    "_resolve_saved_call": "src/dendrux/runtime/_reclaim.py",
+    "_saved_recovery_payload": "src/dendrux/runtime/_reclaim.py",
+    "_unconsumed_submission": "src/dendrux/runtime/_reclaim.py",
+    "continue_claimed": "src/dendrux/runtime/_reclaim.py",
+    "logger": "src/dendrux/runtime/_reclaim.py",
+    "needs_resolution": "src/dendrux/runtime/_reclaim.py",
+    "rebuild_pause": "src/dendrux/runtime/_reclaim.py",
+    "reclaim": "src/dendrux/runtime/_reclaim.py",
+    "recovery_gate": "src/dendrux/runtime/_reclaim.py",
+    "resolve": "src/dendrux/runtime/_reclaim.py"
+  },
+  "providers": {},
+  "scaffolding": {},
+  "seams": {},
+  "source_sha256": "f6954c6183711854d93fc36dce43431b69a011017d00382f3180b9d0b291dd07",
+  "sources": {
+    "src/dendrux/runtime/_reclaim.py": "e4df45b8f30ae5c6f23f1fca39d7ef72b6346019fbbd35e20ee52ff9a3d86f02",
+    "src/dendrux/runtime/_reclaim_managed.py": "e7da9750a5a4945f03ab6c168f5cfd80fe65314f1407bee597fb90ec073b398a"
+  },
+  "version": 1
+}

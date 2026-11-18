@@ -67,7 +67,7 @@
  "dendrux.notifiers.console:ConsoleNotifier.on_governance_event": 116,
  "dendrux.runtime._blob_catalog": 2034,
  "dendrux.runtime._blob_catalog:write_blob_refs": 178,
- "dendrux.runtime._managed": 1579,
+ "dendrux.runtime._managed": 1109,
  "dendrux.runtime._managed:prepare_handoff": 82,
  "dendrux.runtime._reclaim": 1354,
  "dendrux.runtime._run_approval:_execute_approved_tools": 175,
