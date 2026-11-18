@@ -65,7 +65,8 @@ from dendrux.runtime._managed_stream import _paused_or_failed as _paused_or_fail
 from dendrux.runtime._managed_stream import _Single, _Started, _StreamState, _Terminal
 from dendrux.runtime._managed_stream import _stream_failure as _stream_failure
 from dendrux.runtime._managed_stream import _structural as _structural
-from dendrux.runtime.state import MANAGED_HEADER_KEY, ManagedHeader
+from dendrux.runtime._managed_tree import FanoutInvocation
+from dendrux.runtime.state import MANAGED_HEADER_KEY, EventWrite, ManagedHeader, unclaimed_store
 from dendrux.types import (
     Limits,
     PauseState,
@@ -81,7 +82,7 @@ if TYPE_CHECKING:
 
     from dendrux.agent import Agent
     from dendrux.loops.base import LoopNotifier, LoopRecorder
-    from dendrux.runtime.state import EventWrite, StateStore
+    from dendrux.runtime.state import StateStore
     from dendrux.types import RunStream
 
 
@@ -215,18 +216,19 @@ async def prepare_handoff(
     recorder: LoopRecorder | None,
     provider_kwargs: dict[str, Any] | None,
 ) -> RunResult | None:
-    """Make the parent's checkpoint durable and return the descend marker.
-
-    Returns None when cancellation was requested: the caller finalizes as for
-    any pause. The parent stays RUNNING at its epoch until the child's atomic
-    bind parks it.
-    """
+    """Checkpoint a handoff, or return None when cancellation takes priority."""
     from dendrux.loops._helpers import project_message
     from dendrux.loops.react import MANAGED_HANDOFF_KEY
     from dendrux.runtime.context import DelegationDepthExceededError, get_delegation_context
 
     handoff = result.meta[MANAGED_HANDOFF_KEY]
-    # Every bind, live or recovered, checks the child's definition before any effect.
+    if len(handoff.calls) > 1:
+        # Cycle: fan-out delegates N=1 descendants back to this inline driver.
+        from dendrux.runtime import _managed_fanout
+
+        return await _managed_fanout.prepare_handoff(
+            store, run_id, result, recorder, provider_kwargs
+        )
     require_bindable(handoff.parent, handoff.child)
     if await _managed_cancel.cancellation_requested(store, run_id):
         return None
@@ -243,8 +245,7 @@ async def prepare_handoff(
     pause.history[:] = [await project_message(recorder, m) for m in pause.history]
     state = getattr(recorder, "_loop_state", None)
     if isinstance(state, dict):
-        # Durable admission evidence: this call passed validation, policy and
-        # approval in a live batch; recovery binds a pending call only with it.
+        # Recovery binds only the call durably admitted by this batch.
         state[ADMITTED_KEY] = handoff.call.id
     checkpoint = getattr(recorder, "checkpoint_outcome", None)
     if checkpoint is not None:
@@ -293,8 +294,6 @@ async def prepare_handoff(
 
 
 def _shared(store: Any) -> Any:
-    from dendrux.runtime.state import unclaimed_store
-
     return unclaimed_store(store)
 
 
@@ -305,8 +304,6 @@ def _shared(store: Any) -> Any:
 
 def intent_event(invocation: ManagedInvocation, child_run_id: str) -> EventWrite:
     """The parent's delegation-start event: ids, path and kind only, never the task."""
-    from dendrux.runtime.state import EventWrite
-
     call = invocation.call
     return EventWrite(
         generate_ulid(),
@@ -380,7 +377,7 @@ def not_owner_result(run_id: str) -> RunResult:
 
 
 async def drive(result: RunResult, *, notifier: LoopNotifier | None) -> RunResult:
-    """Run descended children inline and unwind their outcomes to the root."""
+    """Drive admitted children and unwind their settled outcomes to the root."""
     if not is_descend(result):
         return result
     invocation: ManagedInvocation = result.meta[DESCEND_KEY]
@@ -401,7 +398,13 @@ async def _trampoline(
         if (result.meta or {}).get(NOT_OWNER_KEY):
             return await _managed_route.root_view(store, root_run_id)
         if is_descend(result):
-            invocation: ManagedInvocation = result.meta[DESCEND_KEY]
+            invocation: ManagedInvocation | FanoutInvocation = result.meta[DESCEND_KEY]
+            if isinstance(invocation, FanoutInvocation):
+                # Cycle: fan-out delegates N=1 descendants back to this driver.
+                from dendrux.runtime import _managed_fanout
+
+                result = await _managed_fanout.drive_fanout(invocation, notifier=notifier)
+                continue
             result, bound = await _run_child(invocation, notifier)
             if bound:
                 waiting.append(_waiting_from(invocation))
@@ -432,13 +435,7 @@ def _waiting_from(invocation: ManagedInvocation) -> _Waiting:
 async def _run_child(
     invocation: ManagedInvocation, notifier: LoopNotifier | None
 ) -> tuple[RunResult, bool]:
-    """Run the bound child in this task: ``(result, bound)``.
-
-    A child that fails after its bind is adopted as a failed tool result (its
-    error stays on the child run). A bind that never happened leaves the
-    parent as the result: cancelled when the parent's cancel won, else the
-    parent records the failure and the error propagates.
-    """
+    """Run one child inline, preserving the existing pre-/post-bind error policy."""
     from dendrux.runtime._subagents import _tighten
     from dendrux.runtime.context import managed_invocation_scope
     from dendrux.runtime.runner import _run_once
@@ -547,12 +544,13 @@ async def _fail_parent(invocation: ManagedInvocation, exc: Exception) -> None:
 
 async def adopt(waiting: _Waiting, *, store: Any, notifier: LoopNotifier | None) -> RunResult:
     """Accept a terminal child's saved outcome into its parent, then continue the parent."""
-    from dendrux.runtime import _reclaim
+    # Cycle: fan-out delegates inline descendants to this driver.
+    from dendrux.runtime import _managed_fanout
 
     claimed = await claim_adoption(waiting, store)
     if claimed is None:
         return not_owner_result(waiting.parent_run_id)
-    return await _reclaim.continue_claimed(
+    return await _managed_fanout.continue_parent(
         waiting.parent_agent, store, waiting.parent_run_id, claimed, notifier=notifier
     )
 
@@ -633,13 +631,7 @@ async def complete_adoption(
 
 
 async def route(root_agent: Agent, store: Any, run_id: str, *, tenant_id: Any) -> Route:
-    """Resolve a control on ``run_id`` to its active leaf; tenant and root checked first.
-
-    A missing or foreign run is not found before anything is disclosed; a
-    managed child id is refused (``managed_root_required``). The leaf's Agent
-    is resolved from the registered path in ``root_agent``; a missing path
-    refuses before any claim.
-    """
+    """Resolve the active leaf after validating tenant, root and registered path."""
     from dendrux.errors import ManagedChildControlError
     from dendrux.runtime.state import UNSCOPED
 

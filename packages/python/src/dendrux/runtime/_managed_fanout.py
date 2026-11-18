@@ -10,31 +10,28 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 
 from dendrux import _codes
 from dendrux._lifecycle import STORAGE_FORMAT_CHECKPOINTED, TERMINAL_STATUSES
-from dendrux.errors import ManagedStateError, PersistenceError, ProviderError, RunFencedError
+from dendrux._managed_wait import MANAGED_FANOUT_SCHEMA_VERSION, MANAGED_WAIT_REASON
+from dendrux.errors import ManagedStateError, RunCancelledError, RunFencedError
 from dendrux.loops import _helpers as _hooks
+from dendrux.loops import _managed_batch
+from dendrux.loops._managed_batch import MANAGED_HANDOFF_KEY, ManagedHandoff
 from dendrux.loops.base import BaseNotifier, LoopNotifier
 from dendrux.runtime import (
     _managed,
     _managed_budget,
     _managed_cancel,
     _reclaim,
-    _run_entry,
     _run_events,
-    _run_outcome,
-    _run_start,
-    _run_tools,
+    _run_execute,
 )
 from dendrux.runtime import context as _context
 from dendrux.runtime._capabilities import capabilities, fanout_support
 from dendrux.runtime._fanout_ledger import FanoutLedger
 from dendrux.runtime._managed import ManagedInvocation
+from dendrux.runtime._managed_definitions import require_bindable
 from dendrux.runtime._managed_fanout_store import BindManagedChildrenRequest, ManagedFanoutStore
-from dendrux.runtime._managed_tree import LeafNode, WaitNode
+from dendrux.runtime._managed_tree import BranchSpec, FanoutInvocation, LeafNode, WaitNode
 from dendrux.runtime._run_entry import PreparedChild, prepare_child_creation
-from dendrux.runtime._subagents import _tighten
-from dendrux.runtime.context import (
-    DelegationContext,
-)
 from dendrux.runtime.durability import _fanout_ownership_handoff
 from dendrux.runtime.state import (
     ClaimResult,
@@ -44,28 +41,29 @@ from dendrux.runtime.state import (
     claimed_store,
 )
 from dendrux.runtime.tasks import _drain_cleanup
-from dendrux.skills._session import SkillSession
-from dendrux.strategies.native import NativeToolCalling
 from dendrux.types import (
+    ManagedFanout,
+    ManagedWait,
     PauseState,
     RunAlreadyActiveError,
     RunEvent,
     RunEventType,
     RunResult,
     RunStatus,
+    generate_ulid,
 )
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Sequence
 
     from dendrux.agent import Agent
+    from dendrux.loops.base import LoopRecorder
     from dendrux.runtime._managed_fanout_store import BindManagedChildrenResult
-    from dendrux.runtime._managed_tree import AdoptFanout, FanoutInvocation
     from dendrux.runtime.state import StateStore
     from dendrux.types import ToolCall, ToolResult
 
     EventSink = Callable[[RunEvent], Awaitable[None]]
-    ClaimParent = Callable[[StateStore, WaitNode], Awaitable[ClaimResult | None]]
+    AdoptSettled = Callable[[StateStore, WaitNode], Awaitable[ClaimResult | None]]
 
 logger = logging.getLogger(__name__)
 _TERMINAL = frozenset(s.value for s in TERMINAL_STATUSES)
@@ -117,6 +115,8 @@ async def start_fanout(
 
     The returned handle must be closed with ``aexit`` even if never waited on.
     No provider or execution context is created until a branch accepts its claim.
+    Typed cancel/fence startup refusals leave the 0.7 policy to the driver; a
+    post-bind startup error has already drained custody and must still propagate.
     """
     if not fanout_support(invocation.store).capable:
         raise ManagedStateError(reason="fanout_capability", run_id=invocation.parent_run_id)
@@ -143,10 +143,12 @@ async def start_fanout(
             run_id=invocation.parent_run_id,
         )
     except Exception as error:  # noqa: BLE001, RUF100 - pre-bind isolation preserves the single-child refusal policy.
+        if isinstance(error, (RunCancelledError, RunFencedError)):
+            raise
         await _managed._after_child_error(
             branches[0],
             error,
-            failure_for_storage=_storage_error(error, invocation.parent_run_id),
+            failure_for_storage=_run_execute._storage_error(error, invocation.parent_run_id),
         )
         raise
     run = FanoutRun(
@@ -327,8 +329,14 @@ async def run_branch(
     try:
         try:
             try:
-                result = await _run_prepared(
-                    branch, prepared, claim, notifier=notifier, event_sink=event_sink
+                result = await _run_execute._run_once(
+                    branch.child,
+                    provider=branch.child._require_provider(),
+                    user_input=str((prepared.spec.child_input_data or {}).get("input", "")),
+                    state_store=branch.store,
+                    tenant_id=branch.tenant_id,
+                    extra_notifier=_BranchEvents(notifier, event_sink) if event_sink else notifier,
+                    _preclaimed=_run_execute._PreclaimedChild(branch, prepared, claim),
                 )
             except asyncio.CancelledError:
                 cancelled_in_runner = True
@@ -404,13 +412,12 @@ async def settle_parent(
     store: StateStore,
     node: WaitNode,
     *,
-    claim_parent: ClaimParent,
-    adopt_fanout: AdoptFanout,
+    adopt_settled: AdoptSettled | None = None,
 ) -> ClaimResult | None:
     """Read siblings first in a fresh writer transaction, then claim and adopt once.
 
-    ``claim_parent`` supplies T4c's generation CAS. ``adopt_fanout`` is only the
-    T0b Protocol; this driver never transforms or writes a report itself.
+    The injected T4c entry owns cancellation admission, claim and completions.
+    This driver never transforms or writes a report itself.
     """
     # fanout_support validates this optional protocol before the driver binds.
     rows = await cast("ManagedFanoutStore", store).get_managed_children(
@@ -436,134 +443,7 @@ async def settle_parent(
     if any(r.status not in _TERMINAL for r in rows):
         return None
 
-    if await _managed_cancel.cancellation_requested(store, node.run_id):
-        return None
-    claim = await claim_parent(store, node)
-    return None if claim is None else await adopt_fanout(store, node, claim)
-
-
-async def _run_prepared(
-    branch: ManagedInvocation,
-    prepared: PreparedChild,
-    claim: ClaimResult,
-    *,
-    notifier: LoopNotifier | None,
-    event_sink: EventSink | None = None,
-) -> RunResult:
-
-    lifecycle = _run_start._RunLifecycle(
-        branch.child_run_id,
-        claimed_store(branch.store, branch.child_run_id, claim),
-        getattr(branch.child, "_task_manager", None),
-        owned=True,
-    )
-    if event_sink is not None:
-        notifier = _BranchEvents(notifier, event_sink)
-    if lifecycle.manager is not None:
-        lifecycle.manager.register_current(branch.child_run_id)
-        lifecycle.registered = True
-    try:
-        try:
-            return await _execute_prepared(lifecycle, branch, prepared, notifier, event_sink)
-        except (_managed_cancel.ManagedRootStoppedError, RunFencedError) as stop:
-            result = await lifecycle._stopped(stop, lifecycle.recorder, notifier)
-            if isinstance(stop, RunFencedError):
-                result.meta[_managed.NOT_OWNER_KEY] = True
-            return result
-        except Exception as error:  # noqa: BLE001, RUF100 - the owned run lifecycle persists failure before branch isolation.
-            await lifecycle._failed(
-                _storage_error(error, branch.child_run_id), {}, lifecycle.recorder, notifier
-            )
-            raise
-    except asyncio.CancelledError:
-        cancelled, swallow = await lifecycle._cancelled(None, {}, lifecycle.recorder, notifier)
-        if swallow:
-            return cancelled
-        raise
-    finally:
-        lifecycle._release()
-
-
-async def _execute_prepared(
-    lifecycle: _run_start._RunLifecycle,
-    branch: ManagedInvocation,
-    prepared: PreparedChild,
-    notifier: LoopNotifier | None,
-    event_sink: EventSink | None,
-) -> RunResult:
-
-    child, run_id = branch.child, branch.child_run_id
-    provider = child._require_provider()
-    loop = _run_entry._new_run_loop(child, None)
-    session = SkillSession.prepare(child, loop=loop)
-    if lifecycle.store is None:
-        raise ManagedStateError(reason="binding_conflict", run_id=run_id)
-    with session.bind():
-        await _run_entry._verify_projected_creation(
-            prepared.projection.error is not None, lifecycle.store, run_id
-        )
-        link, notifier = await _run_start._start_new_run(
-            lifecycle,
-            child,
-            provider,
-            branch.tenant_id,
-            {"seed_traces": prepared.spec.child_seed_traces},
-            prepared.projection.engine,
-            notifier,
-            None,
-            {"agent_name": child.name},
-        )
-        token = _context.set_delegation_context(_owner_context(branch, lifecycle.store, link))
-        try:
-            mcp_meta: dict[str, object] = {}
-            await _run_tools._discover_runtime_tools(
-                child, lifecycle.recorder, notifier, run_id, loop, mcp_meta
-            )
-            result = await _run_entry._run_projected_loop(
-                prepared.projection,
-                loop,
-                None,
-                agent=child,
-                provider=provider,
-                strategy=NativeToolCalling(),
-                user_input=str((prepared.spec.child_input_data or {}).get("input", "")),
-                run_id=run_id,
-                recorder=lifecycle.recorder,
-                notifier=notifier,
-                initial_history=None,
-                provider_kwargs=None,
-                output_type=child.output_type,
-                state_store=lifecycle.store,
-            )
-            result = await _run_outcome._persist_loop_outcome(
-                state_store=lifecycle.store,
-                run_id=run_id,
-                result=result,
-                recorder=lifecycle.recorder,
-            )
-            await lifecycle._finish(lifecycle.recorder, notifier, result)
-            return result
-        finally:
-            _context.reset_delegation_context(token)
-
-
-def _owner_context(
-    branch: ManagedInvocation, store: StateStore, link: str | None
-) -> DelegationContext:
-
-    return DelegationContext(
-        run_id=branch.child_run_id,
-        trace_link=link,
-        delegation_level=branch.parent_level + 1,
-        persisted=True,
-        store_identity=_context.get_store_identity(store),
-        max_delegation_depth=_tighten(branch.max_depth, branch.child.max_delegation_depth),
-        tenant_id=branch.tenant_id,
-        tenant_explicit=True,
-        state_store=store,
-        lease_interval_s=branch.child.lease_interval.total_seconds(),
-        loop=asyncio.get_running_loop(),
-    )
+    return await (adopt_settled or _adopt_settled)(store, node)
 
 
 class _PreparationStore:
@@ -652,8 +532,7 @@ class _BranchEvents:
 async def drive_fanout(
     invocation: FanoutInvocation,
     *,
-    claim_parent: ClaimParent,
-    adopt_fanout: AdoptFanout,
+    adopt_settled: AdoptSettled | None = None,
     notifier: LoopNotifier | None = None,
     event_sink: EventSink | None = None,
 ) -> RunResult:
@@ -662,19 +541,23 @@ async def drive_fanout(
     Claim and completion are injected until T4c merges. A not-owner marker lets
     the enclosing trampoline return its fresh root view without executing a child.
     """
-    run = await start_fanout(invocation, notifier=notifier, event_sink=event_sink)
+    try:
+        run = await start_fanout(invocation, notifier=notifier, event_sink=event_sink)
+    except (RunCancelledError, RunFencedError) as stop:
+        # The policy re-raises if a bind occurred; task-creation failures stay original.
+        result, _ = await _managed._after_child_error(branch_invocations(invocation)[0], stop)
+        return result
     await run.wait()
     if run.bound.outcome != "created":
         return _managed.not_owner_result(invocation.parent_run_id)
     claim = await settle_parent(
         invocation.store,
         wait_node(invocation),
-        claim_parent=claim_parent,
-        adopt_fanout=adopt_fanout,
+        adopt_settled=adopt_settled,
     )
     if claim is None:
         return _managed.not_owner_result(invocation.parent_run_id)
-    return await _reclaim.continue_claimed(
+    return await continue_parent(
         invocation.parent_agent,
         invocation.store,
         invocation.parent_run_id,
@@ -689,9 +572,125 @@ def _execution_child(child: Agent, parent: Agent) -> Agent:
     return execution
 
 
-def _storage_error(error: Exception, run_id: str) -> Exception:
-    if isinstance(error, (ProviderError, PersistenceError, ManagedStateError)):
-        return error
-    safe = ManagedStateError(reason="fanout_invalid", run_id=run_id)
-    safe.__cause__ = error
-    return safe
+async def prepare_handoff(
+    store: StateStore,
+    run_id: str,
+    result: RunResult,
+    recorder: LoopRecorder | None,
+    provider_kwargs: dict[str, Any] | None,
+) -> RunResult | None:
+    """Checkpoint all admitted calls and build the v4 invocation in the parent task."""
+    handoff: ManagedHandoff = result.meta[MANAGED_HANDOFF_KEY]
+    branches = _handoff_branches(handoff, run_id)
+    if await _managed_cancel.cancellation_requested(store, run_id):
+        return None
+    header = ManagedHeader.from_dict(
+        (getattr(store, "loop_state", None) or {}).get("managed"), run_id=run_id
+    )
+    ctx = _context.get_delegation_context()
+    if ctx is None or ctx.run_id != run_id:
+        raise ManagedStateError(reason="header_invalid", run_id=run_id)
+    if ctx.max_delegation_depth is not None and ctx.delegation_level + 1 > ctx.max_delegation_depth:
+        raise _context.DelegationDepthExceededError(
+            ctx.delegation_level + 1, ctx.max_delegation_depth
+        )
+    pause: PauseState = result.meta["pause_state"]
+    pause.history[:] = [await _hooks.project_message(recorder, m) for m in pause.history]
+    state = getattr(recorder, "_loop_state", None)
+    if not isinstance(state, dict):
+        raise ManagedStateError(reason="binding_conflict", run_id=run_id)
+    state[_managed.ADMITTED_KEY] = [c.id for c in handoff.calls]
+    checkpoint = getattr(recorder, "checkpoint_outcome", None)
+    if checkpoint is not None:
+        await checkpoint(result, provider_kwargs)
+    branches = tuple(replace(b, child_path=(*header.path, b.child.name)) for b in branches)
+    wait = _fanout_wait(pause, handoff.calls, branches, state, provider_kwargs)
+    invocation = FanoutInvocation(
+        store=_managed._shared(store),
+        tenant_id=ctx.tenant_id,
+        root_run_id=header.root_run_id,
+        parent_run_id=run_id,
+        parent_epoch=int(getattr(store, "claim_epoch", 0)),
+        parent_level=ctx.delegation_level,
+        parent_agent=handoff.parent,
+        wait=wait,
+        iteration=result.iteration_count,
+        parent_usage=result.usage,
+        max_depth=ctx.max_delegation_depth,
+        branches=branches,
+        unpriced_accepted=_managed_budget.accepted_count(
+            state.get(_managed_budget.UNPRICED_ACCEPTED)
+        ),
+    )
+    return RunResult(
+        run_id=run_id,
+        status=RunStatus.RUNNING,
+        iteration_count=result.iteration_count,
+        usage=result.usage,
+        meta={_managed.DESCEND_KEY: invocation},
+    )
+
+
+def _handoff_branches(
+    handoff: ManagedHandoff,
+    run_id: str,
+) -> tuple[BranchSpec, ...]:
+    branches = []
+    for call in handoff.calls:
+        child = _managed._registered(handoff.parent, call.name, run_id)
+        require_bindable(handoff.parent, child)
+        branches.append(
+            BranchSpec(
+                call,
+                _managed_budget.inherit(child, handoff.parent),
+                (),
+                generate_ulid(),
+            )
+        )
+    return tuple(branches)
+
+
+async def _adopt_settled(store: StateStore, node: WaitNode) -> ClaimResult | None:
+    # TODO(T4c merge): replace this line with _managed_adoption.adopt_settled(store, node).
+    raise ManagedStateError(reason="fanout_invalid", run_id=node.run_id)
+
+
+async def continue_parent(
+    agent: Agent,
+    store: StateStore,
+    run_id: str,
+    claim: ClaimResult,
+    *,
+    notifier: LoopNotifier | None,
+) -> RunResult:
+    """Continue the claimed parent in this task with its runtime-computed loop policy."""
+    with _managed_batch.fanout_scope(fanout_support(store).capable):
+        return await _reclaim.continue_claimed(agent, store, run_id, claim, notifier=notifier)
+
+
+def _fanout_wait(
+    pause: PauseState,
+    calls: Sequence[ToolCall],
+    branches: Sequence[BranchSpec],
+    state: dict[str, Any],
+    provider_kwargs: dict[str, Any] | None,
+) -> PauseState:
+    return replace(
+        pause,
+        pending_tool_calls=list(calls),
+        pending_targets={c.id: "agent" for c in calls},
+        pause_reason=MANAGED_WAIT_REASON,
+        pause_id=generate_ulid(),
+        schema_version=MANAGED_FANOUT_SCHEMA_VERSION,
+        loop_state_ref=True,
+        managed_wait=None,
+        managed_fanout=ManagedFanout(
+            tuple(ManagedWait(b.call.id, b.child_run_id) for b in branches)
+        ),
+        approval_gates=None,
+        pending_decisions=None,
+        clarification=None,
+        image_view=None,
+        image_view_ref=state.get("image_view_ref"),
+        provider_kwargs=dict(provider_kwargs or pause.provider_kwargs or {}),
+    )

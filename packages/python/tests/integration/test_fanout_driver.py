@@ -197,18 +197,19 @@ async def test_p17_errors_are_collected_in_call_order_after_siblings_settle(
 ):
     module = driver()
     invocation, _, effects = await plan(store, 3)
-    real = module._run_prepared
+    real = module._run_execute._run_once
     errors = [ValueError("SENTINEL-error-one"), TypeError("SENTINEL-error-two")]
 
-    async def execute(branch, prepared, claim, **kwargs):
+    async def execute(*args, **kwargs):
+        branch = kwargs["_preclaimed"].branch
         i = [b.call.id for b in invocation.branches].index(branch.call.id)
         if i < 2:
             if i == 0:
                 await asyncio.sleep(0)
             raise errors[i]
-        return await real(branch, prepared, claim, **kwargs)
+        return await real(*args, **kwargs)
 
-    monkeypatch.setattr(module, "_run_prepared", execute)
+    monkeypatch.setattr(module._run_execute, "_run_once", execute)
     original_read = store.get_run
 
     async def read(run_id):
@@ -260,23 +261,19 @@ async def test_fan_in_uses_fresh_children_read_and_adopt_protocol(store):
         seen.append(("claim", node.bindings))
         return ClaimResult(2, 2, {}, None)
 
-    # Minimal AdoptFanout implementation: no report writes, transforms or continuation.
-    async def adopter(store, node, claim):
+    # Minimal adopt_settled seam: claim/order only, no durable reports.
+    async def adopter(store, node):
+        claim = await claim_parent(store, node)
         seen.append(("adopt", node.bindings))
         return claim
 
     try:
         run = await module.start_fanout(invocation)
         node = module.wait_node(replace(invocation, branches=tuple(reversed(invocation.branches))))
-        assert (
-            await module.settle_parent(store, node, claim_parent=claim_parent, adopt_fanout=adopter)
-            is None
-        )
+        assert await module.settle_parent(store, node, adopt_settled=adopter) is None
         assert seen == []
         await run.wait()
-        result = await module.settle_parent(
-            store, node, claim_parent=claim_parent, adopt_fanout=adopter
-        )
+        result = await module.settle_parent(store, node, adopt_settled=adopter)
         assert result.claim_epoch == 2
         assert [kind for kind, _ in seen] == ["claim", "adopt"]
         assert seen[0][1] == invocation.bindings == seen[1][1]
@@ -477,9 +474,9 @@ async def test_settle_refuses_mismatched_child_identity(store, monkeypatch, dama
         touched.append("claim")
         return None
 
-    async def adopter(store, node, claim):
+    async def adopter(store, node):
         touched.append("adopt")
-        return claim
+        return await claim_parent(store, node)
 
     try:
         run = await module.start_fanout(invocation)
@@ -487,9 +484,7 @@ async def test_settle_refuses_mismatched_child_identity(store, monkeypatch, dama
         before = effects.counts()
         monkeypatch.setattr(store, "get_managed_children", read)
         with pytest.raises(ManagedStateError):
-            await module.settle_parent(
-                store, module.wait_node(invocation), claim_parent=claim_parent, adopt_fanout=adopter
-            )
+            await module.settle_parent(store, module.wait_node(invocation), adopt_settled=adopter)
         assert touched == []
         assert effects.counts() == before
     finally:
@@ -512,8 +507,9 @@ async def test_p1_p3_parent_continues_in_caller_after_call_order_adoption(store,
         assert all(r.status == "success" for r in records)
         return claimed
 
-    # This minimal AdoptFanout supplies ordering only, not T4c's durable completions.
-    async def adopter(store, node, claim):
+    # This minimal adopt_settled supplies ordering only, not T4c's durable completions.
+    async def adopter(store, node):
+        claim = await claim_parent(store, node)
         observed.extend(binding.tool_call_id for binding in node.bindings)
         assert asyncio.current_task() is caller_task
         return claim
@@ -527,9 +523,7 @@ async def test_p1_p3_parent_continues_in_caller_after_call_order_adoption(store,
     async def drive():
         nonlocal caller_task
         caller_task = asyncio.current_task()
-        return await module.drive_fanout(
-            invocation, claim_parent=claim_parent, adopt_fanout=adopter
-        )
+        return await module.drive_fanout(invocation, adopt_settled=adopter)
 
     monkeypatch.setattr(_reclaim, "continue_claimed", continuation)
     runner = asyncio.create_task(drive())
@@ -809,15 +803,10 @@ async def test_p13_subtree_usage_counts_children_without_adoption_spend(store):
         assert (usage.input_tokens, usage.output_tokens, usage.llm_calls) == (5, 2, 2)
         before = effects.counts()
 
-        async def claim_parent(store, node):
+        async def adopter(store, node):
             return ClaimResult(2, 2, {}, None)
 
-        async def adopter(store, node, claim):
-            return claim
-
-        await module.settle_parent(
-            store, module.wait_node(invocation), claim_parent=claim_parent, adopt_fanout=adopter
-        )
+        await module.settle_parent(store, module.wait_node(invocation), adopt_settled=adopter)
         assert await store.subtree_usage(invocation.root_run_id) == usage
         assert effects.counts() == before
     finally:
@@ -964,13 +953,14 @@ async def test_cancel_during_error_read_finalizes_the_accepted_claim(store, monk
     module = driver()
     invocation, _, effects = await plan(store)
     entered = asyncio.Event()
-    real_runner, real_read = module._run_prepared, store.get_run
+    real_runner, real_read = module._run_execute._run_once, store.get_run
     armed = True
 
-    async def execute(branch, prepared, claim, **kwargs):
+    async def execute(*args, **kwargs):
+        branch = kwargs["_preclaimed"].branch
         if branch.call.id == invocation.call_ids[0]:
             raise PersistenceError()
-        return await real_runner(branch, prepared, claim, **kwargs)
+        return await real_runner(*args, **kwargs)
 
     async def read(run_id):
         nonlocal armed
@@ -980,7 +970,7 @@ async def test_cancel_during_error_read_finalizes_the_accepted_claim(store, monk
             await asyncio.Event().wait()
         return await real_read(run_id)
 
-    monkeypatch.setattr(module, "_run_prepared", execute)
+    monkeypatch.setattr(module._run_execute, "_run_once", execute)
     run = await module.start_fanout(invocation)
     monkeypatch.setattr(store, "get_run", read)
     waiter = asyncio.create_task(run.wait())
@@ -997,4 +987,621 @@ async def test_cancel_during_error_read_finalizes_the_accepted_claim(store, monk
     finally:
         await asyncio.gather(waiter, return_exceptions=True)
         await run.aexit()
+        await close_plan(invocation)
+
+
+async def test_round2_run_emits_v4_handoff_and_list_checkpoint(store, monkeypatch):
+    from dendrux.runtime import _managed
+
+    effects = FanoutEffects()
+    children = [
+        Agent(
+            name=name,
+            description="Review",
+            prompt="p",
+            loop=SingleCall(),
+            provider=effects.provider(name, MockLLM([LLMResponse(text="child")])),
+        )
+        for name in ("alpha", "beta")
+    ]
+    calls = [ToolCall(c.name, {"task": "go"}) for c in children]
+    parent = Agent(
+        name="lead",
+        prompt="p",
+        state_store=store,
+        subagents=children,
+        provider=effects.provider(
+            "root", MockLLM([LLMResponse(tool_calls=calls), LLMResponse(text="unexpected")])
+        ),
+    )
+
+    async def capture(result, *, notifier):
+        assert _managed.is_descend(result), "accepted fan-out must leave a durable handoff"
+        return result
+
+    monkeypatch.setattr(_managed, "drive", capture)
+    try:
+        result = await parent.run("go", tenant_id="t1")
+        invocation = result.meta[_managed.DESCEND_KEY]
+        assert isinstance(invocation, FanoutInvocation)
+        assert invocation.call_ids == tuple(c.id for c in calls)
+        assert invocation.wait.to_dict()["schema_version"] == 4
+        state = await store.get_loop_state(result.run_id)
+        assert state["managed_admitted"] == list(invocation.call_ids)
+        assert effects.counts().provider_calls("root") == 1
+        assert sum(effects.counts().provider_calls(c.name) for c in children) == 0
+    finally:
+        await parent.close()
+        for child in children:
+            await child.close()
+
+
+async def test_round2_preclaimed_owners_enter_the_canonical_runner(store, monkeypatch):
+    from dendrux.runtime import _run_execute
+
+    invocation, _, effects = await plan(store)
+    called = []
+    original = _run_execute._run_once
+
+    async def execute(*args, **kwargs):
+        called.append((asyncio.current_task(), kwargs.get("_preclaimed")))
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(_run_execute, "_run_once", execute)
+    try:
+        run = await driver().start_fanout(invocation)
+        await run.wait()
+        assert len(called) == 2, "each owner must enter _run_once"
+        assert {task for task, _ in called} == set(run.owners)
+        assert all(frame is not None for _, frame in called)
+        assert sum(effects.counts().provider.values()) == 2
+    finally:
+        await close_plan(invocation)
+
+
+async def _test_fanout_claim(store, node):
+    return await store.submit_and_claim(
+        node.run_id,
+        expected_status="paused",
+        submitted_data={
+            "managed_fanout_adoption": {
+                "v": 1,
+                "calls": [b.tool_call_id for b in node.bindings],
+            }
+        },
+        submission={
+            "submission_id": generate_ulid(),
+            "kind": "tool_results",
+            "pause_id": node.pause_id,
+            "call_ids": [b.tool_call_id for b in node.bindings],
+            "payload_ref": {"pause_data_key": "submission"},
+            "reserved_order_index": 0,
+            "managed_fanout_adoption": {"v": 1},
+        },
+    )
+
+
+async def _test_adopt_settled(store, node):
+    from dendrux.runtime import _managed_adoption, _trace_shared
+    from dendrux.runtime.state import EventWrite, LoopStatePatch, _apply_loop_patch
+    from dendrux.types import tool_result_message
+
+    claim = await _test_fanout_claim(store, node)
+    if not isinstance(claim, ClaimResult):
+        return None
+    state = claim.loop_state
+    for i, child in enumerate(node.children):
+        call = child.call
+        record = await store.get_run(child.run_id)
+        assert record.status == "success"
+        report = replace(
+            _managed_adoption.child_report(
+                record, child.agent, limit=node.agent._limits.max_tool_result_bytes
+            ),
+            call_id=call.id,
+        )
+        pending = next(p for p in state["pending"] if p["call_id"] == call.id)
+        trace = _trace_shared.message_trace(tool_result_message(report), pending["order_index"])
+        trace.meta["iteration"] = node.iteration
+        last = i == len(node.children) - 1
+        patch = LoopStatePatch(
+            remove_pending=(call.id,),
+            set_phase="model_next" if last else None,
+            set_fields={"managed_wait": None, "managed_admitted": None, "submission": None}
+            if last
+            else {},
+        )
+        await store.complete_tool_call(
+            node.run_id,
+            claim_epoch=claim.claim_epoch,
+            tool_call_id=call.id,
+            outcome="completed",
+            result_payload=report.payload,
+            success=True,
+            duration_ms=0,
+            error_message=None,
+            replayed=False,
+            observation=trace,
+            event=EventWrite(
+                generate_ulid(),
+                "tool.completed",
+                node.iteration,
+                {"tool_name": call.name},
+                call.id,
+                None,
+            ),
+            loop_state_patch=patch,
+        )
+        state = _apply_loop_patch(state, patch)
+    return ClaimResult(claim.claim_epoch, claim.storage_format, state, None)
+
+
+@pytest.fixture
+def fanout_adopter(monkeypatch):
+    """Driver-only reports; T4c replaces this and T6 replaces the v4 reader stand-in.
+
+    Assertions about provider/task counts, fan-in ordering and continuation use
+    these simple completions. Transforms, budgets and recovery are not proven here.
+    """
+    from dendrux.runtime import _reclaim
+    from dendrux.types import PauseState
+
+    seen = []
+
+    async def adopt_settled(store, node):
+        claim = await _test_adopt_settled(store, node)
+        if claim is not None:
+            seen.append(
+                (node.run_id, tuple(c.call.id for c in node.children), asyncio.current_task())
+            )
+        return claim
+
+    original = _reclaim._continuation_base
+
+    def v4_base(raw, run_id):
+        if raw.get("schema_version") != 4:
+            return original(raw, run_id)
+        wait = PauseState.from_managed_dict(raw, run_id=run_id)
+        return replace(
+            wait,
+            managed_wait=None,
+            managed_fanout=None,
+            schema_version=2,
+            pause_reason=None,
+            pending_tool_calls=[],
+            pending_targets={},
+        )
+
+    monkeypatch.setattr(driver(), "_adopt_settled", adopt_settled, raising=False)
+    monkeypatch.setattr(_reclaim, "_continuation_base", v4_base)
+    return seen
+
+
+def round2_children(effects):
+    return [
+        Agent(
+            name=name,
+            description="Review",
+            prompt="p",
+            loop=SingleCall(),
+            provider=effects.provider(name, MockLLM([LLMResponse(text=name)])),
+        )
+        for name in ("alpha", "beta")
+    ]
+
+
+@pytest.mark.parametrize(
+    "entry",
+    ["run", "resume", "submit_tool_results", "submit_input", "submit_approval", "submit_resume"],
+)
+async def test_round2_public_entry_paths_fanout(store, monkeypatch, fanout_adopter, entry):
+    from dendrux.runtime.context import get_delegation_context
+    from dendrux.types import ToolResult
+
+    effects = FanoutEffects()
+    children = round2_children(effects)
+    calls = [ToolCall(c.name, {"task": "go"}) for c in children]
+    holder = {}
+
+    @tool(target="client")
+    async def read() -> str:
+        return ""
+
+    @tool()
+    async def approve() -> str:
+        return "approved"
+
+    @tool()
+    async def pause() -> str:
+        await holder["parent"].request_pause(get_delegation_context().run_id)
+        return "paused"
+
+    first_name = {"submit_approval": "approve", "submit_resume": "pause"}.get(entry, "read")
+    first = [] if entry == "run" else [LLMResponse(tool_calls=[ToolCall(first_name, {})])]
+    if entry == "submit_input":
+        from tests.integration.test_managed_routing import patch_questions
+
+        patch_questions(monkeypatch)
+        first = [LLMResponse(text="Which?")]
+    parent = Agent(
+        name="lead",
+        prompt="p",
+        state_store=store,
+        subagents=children,
+        tools=[read, approve, pause],
+        require_approval=["approve"],
+        provider=effects.provider(
+            "root", MockLLM([*first, LLMResponse(tool_calls=calls), LLMResponse(text="done")])
+        ),
+    )
+    holder["parent"] = parent
+    caller = asyncio.current_task()
+    try:
+        result = await parent.run("go", tenant_id="t1")
+        if entry != "run":
+            raw = await store.get_pause_state(result.run_id)
+            kwargs = {"tenant_id": "t1", "expected_pause_id": raw["pause_id"]}
+            if entry == "submit_input":
+                assert result.status == RunStatus.WAITING_HUMAN_INPUT
+                result = await parent.submit_input(result.run_id, "answer", **kwargs)
+            elif entry == "submit_approval":
+                result = await parent.submit_approval(result.run_id, approved=True, **kwargs)
+            elif entry == "submit_resume":
+                result = await parent.submit_resume(result.run_id, **kwargs)
+            else:
+                replies = [ToolResult("read", raw["pending_tool_calls"][0]["id"], '"answer"')]
+                if entry == "resume":
+                    result = await parent.resume(result.run_id, tool_results=replies, **kwargs)
+                else:
+                    result = await parent.submit_tool_results(result.run_id, replies, **kwargs)
+        assert result.status == RunStatus.SUCCESS and result.answer == "done"
+        assert effects.counts().provider_calls("alpha") == 1
+        assert effects.counts().provider_calls("beta") == 1
+        assert fanout_adopter == [(result.run_id, tuple(c.id for c in calls), caller)]
+        assert effects.counts().provider_calls("root") == (2 if entry == "run" else 3)
+        state = await store.get_loop_state(result.run_id)
+        assert not state.get("managed_admitted") and not state.get("pending")
+    finally:
+        await parent.close()
+        for child in children:
+            await child.close()
+
+
+async def test_round2_approved_batch_holds_two_children_until_server_finishes(
+    store, fanout_adopter
+):
+    effects = FanoutEffects()
+    children = round2_children(effects)
+    observed = []
+
+    @tool()
+    async def authorize() -> str:
+        assert sum(effects.counts().provider_calls(c.name) for c in children) == 0
+        observed.append("server")
+        return "approved"
+
+    calls = [ToolCall(c.name, {"task": "go"}) for c in children]
+    parent = Agent(
+        name="lead",
+        prompt="p",
+        state_store=store,
+        subagents=children,
+        tools=[authorize],
+        require_approval=["authorize"],
+        provider=effects.provider(
+            "root",
+            MockLLM(
+                [
+                    LLMResponse(tool_calls=[calls[0], ToolCall("authorize", {}), calls[1]]),
+                    LLMResponse(text="done"),
+                ]
+            ),
+        ),
+    )
+    try:
+        paused = await parent.run("go", tenant_id="t1")
+        assert paused.status == RunStatus.WAITING_APPROVAL
+        assert sum(effects.counts().provider_calls(c.name) for c in children) == 0
+        result = await parent.submit_approval(
+            paused.run_id, approved=True, tenant_id="t1", expected_pause_id=paused.pause_id
+        )
+        assert result.status == RunStatus.SUCCESS and result.answer == "done"
+        assert observed == ["server"]
+        assert [effects.counts().provider_calls(c.name) for c in children] == [1, 1]
+        assert fanout_adopter[0][1] == tuple(c.id for c in calls)
+    finally:
+        await parent.close()
+        for child in children:
+            await child.close()
+
+
+def _assert_nested_provider_owners(providers, adoptions, caller, branch_tasks):
+    for label, provider in providers.items():
+        [ctx] = provider.complete_contexts
+        if label in ("alpha", "beta"):
+            owner = next(task for run_id, _, task in adoptions if run_id == ctx.run_id)
+        else:
+            owner = provider.complete_tasks[0]
+            assert owner.get_name() == f"fanout:{ctx.run_id}"
+            assert owner not in branch_tasks and owner is not caller
+        assert provider.complete_tasks == [owner] * 3
+        assert provider.complete_closed
+
+
+async def test_p18_round2_nested_two_by_two_keeps_each_execution_in_its_owner(
+    store, fanout_adopter
+):
+    effects = FanoutEffects()
+    leaves, children = [], []
+    providers = {}
+    calls_by_name = {}
+    for name in ("alpha", "beta"):
+        for i in range(2):
+            providers[f"{name}_{i}"] = GatedStreamLLM()
+        own = [
+            Agent(
+                name=f"{name}_{i}",
+                description="Leaf",
+                prompt="p",
+                loop=SingleCall(),
+                provider=effects.provider(f"{name}_{i}", providers[f"{name}_{i}"]),
+            )
+            for i in range(2)
+        ]
+        leaves.extend(own)
+        calls_by_name[name] = [ToolCall(c.name, {"task": "go"}) for c in own]
+        providers[name] = GatedStreamLLM(
+            before=[LLMResponse(tool_calls=calls_by_name[name])], first=name, second=""
+        )
+        children.append(
+            Agent(
+                name=name,
+                description="Branch",
+                prompt="p",
+                subagents=own,
+                provider=effects.provider(name, providers[name]),
+            )
+        )
+    calls = [ToolCall(c.name, {"task": "go"}) for c in children]
+    parent = Agent(
+        name="lead",
+        prompt="p",
+        state_store=store,
+        subagents=children,
+        provider=effects.provider(
+            "root", MockLLM([LLMResponse(tool_calls=calls), LLMResponse(text="done")])
+        ),
+    )
+    caller = asyncio.current_task()
+    try:
+        result = await parent.run("go", tenant_id="t1")
+        assert result.status == RunStatus.SUCCESS and result.answer == "done"
+        assert [effects.counts().provider_calls(c.name) for c in children] == [2, 2]
+        assert [effects.counts().provider_calls(c.name) for c in leaves] == [1] * 4
+        assert len(fanout_adopter) == 3
+        assert fanout_adopter[-1] == (result.run_id, tuple(c.id for c in calls), caller)
+        branch_tasks = [task for _, _, task in fanout_adopter[:-1]]
+        assert len(set(branch_tasks)) == 2 and caller not in branch_tasks
+        assert all(task.get_name().startswith("fanout:") for task in branch_tasks)
+        _assert_nested_provider_owners(providers, fanout_adopter, caller, branch_tasks)
+        counts = effects.counts()
+        assert sum(counts.provider.values()) == 10
+    finally:
+        await parent.close()
+        for child in [*children, *leaves]:
+            await child.close()
+
+
+@pytest.mark.parametrize("persistent", [False, True])
+async def test_round2_approved_skill_dispatch_receives_effective_batch_policy(
+    store, monkeypatch, persistent
+):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from dendrux.loops import react
+    from dendrux.loops.base import BaseRecorder
+    from dendrux.runtime import _run_approval
+    from dendrux.skills._session import SkillTool
+    from dendrux.types import PauseState
+
+    @tool()
+    async def work() -> str:
+        pytest.fail("the dispatcher spy must intercept skill execution")
+
+    root_id, _ = await fanout_parent(store, 2)
+    agent = Agent(prompt="p", tools=[work], limits=Limits(max_parallel_subagents=4))
+    lookups = await agent.get_tool_lookups()
+    lookups.fn["work"] = SkillTool(SimpleNamespace(), "work")
+    monkeypatch.setattr(agent, "get_tool_lookups", AsyncMock(return_value=lookups))
+    process = AsyncMock(return_value=SimpleNamespace(all_results=[]))
+    monkeypatch.setattr(react, "_process_tool_calls", process)
+    pause = PauseState(
+        agent_name=agent.name,
+        pending_tool_calls=[ToolCall("work", {})],
+        history=[],
+        steps=[],
+        iteration=1,
+        trace_order_offset=0,
+        usage=UsageStats(),
+    )
+    try:
+        await _run_approval._execute_approved_tools(
+            agent, pause, BaseRecorder(), None, root_id, state_store=store if persistent else None
+        )
+        process.assert_awaited_once()
+        policy = process.call_args.kwargs.get("batch_policy")
+        assert policy is not None, "approved dispatch needs the runtime batch policy"
+        assert policy.fanout_capable is persistent
+        assert policy.limit == (4 if persistent else 1)
+    finally:
+        await agent.close()
+
+
+async def test_round2_continuation_scope_cannot_enable_a_run_without_a_store(store):
+    from dendrux.loops import _managed_batch
+
+    with _managed_batch.fanout_scope(True):
+        assert not _managed_batch.loop_fanout_capable(None)
+    assert not _managed_batch.loop_fanout_capable(None)
+
+
+async def test_round2_approval_filtered_to_one_call_keeps_that_calls_child(store, monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from dendrux.loops import _managed_batch
+    from dendrux.runtime import _reclaim, _run_approval, _run_contracts
+
+    effects = FanoutEffects()
+    children = round2_children(effects)
+    parent = Agent(prompt="p", subagents=children)
+    calls = [ToolCall(c.name, {"task": "go"}) for c in children]
+    monkeypatch.setattr(_managed_batch, "_admit_managed_briefs", AsyncMock(return_value=[calls[1]]))
+    monkeypatch.setattr(_reclaim, "_recovery_batch", lambda *args: None)
+    approval = _run_contracts._ApprovalResume([], calls, {}, None)
+    try:
+        outcome = await _run_approval._hand_off_approved_subagent(
+            parent, SimpleNamespace(resolved_loop=None), "parent", approval
+        )
+        assert outcome.handoff.call is calls[1]
+        assert outcome.handoff.child is children[1]
+        assert not effects.counts().provider
+    finally:
+        await parent.close()
+        for child in children:
+            await child.close()
+
+
+@pytest.mark.parametrize("n", [1, 2])
+async def test_x6_round2_public_caller_cancel_keeps_the_07_parent_outcome(store, n):
+    providers = [GatedStreamLLM() for _ in range(n)]
+    children = [
+        Agent(name=f"worker_{i}", description="Review", prompt="p", loop=SingleCall(), provider=p)
+        for i, p in enumerate(providers)
+    ]
+    for provider in providers:
+        provider.gate_complete = True
+    parent = Agent(
+        name="lead",
+        prompt="p",
+        state_store=store,
+        subagents=children,
+        provider=MockLLM(
+            [LLMResponse(tool_calls=[ToolCall(c.name, {"task": "go"}) for c in children])]
+        ),
+    )
+    caller = asyncio.create_task(parent.run("go", tenant_id="t1"))
+    try:
+        for provider in providers:
+            await wait_for_gate(provider.first_sent, task=caller)
+        records = [await store.get_run(p.complete_contexts[0].run_id) for p in providers]
+        root_id = records[0].parent_run_id
+        caller.cancel("first")
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await caller
+        assert caught.value.args == ("first",)
+        root = await store.get_run(root_id)
+        assert (
+            root.status,
+            root.claim_epoch,
+            root.cancel_requested,
+            root.pause_requested,
+            root.failure_reason,
+        ) == ("paused", 1, False, False, None)
+        state = await store.get_loop_state(root_id)
+        assert state["phase"] == "dispatch"
+        assert (await store.get_pause_state(root_id))["schema_version"] == (3 if n == 1 else 4)
+        admitted = state["managed_admitted"]
+        assert isinstance(admitted, str if n == 1 else list)
+        for record, provider in zip(records, providers, strict=True):
+            row = await store.get_run(record.id)
+            assert (row.status, row.claim_epoch) == ("cancelled", 0)
+            assert provider.complete_closed
+            assert provider.complete_tasks == [provider.complete_tasks[0]] * 2
+            assert not parent._task_manager.is_running(record.id)
+    finally:
+        for provider in providers:
+            provider.gate.set()
+        await asyncio.gather(caller, return_exceptions=True)
+        await parent.close()
+        for child in children:
+            await child.close()
+
+
+@pytest.mark.parametrize("stop", ["cancel", "fence"])
+async def test_round2_prebind_control_refusal_returns_the_07_root_view_once(
+    store, engine, monkeypatch, stop
+):
+    from dendrux.db.models import AgentRun
+
+    module = driver()
+    invocation, _, effects = await plan(store)
+    entered, release = asyncio.Event(), asyncio.Event()
+    original_prepare = module._prepare_batch
+    original_policy = module._managed._after_child_error
+    handled = []
+
+    async def prepare(*args):
+        prepared = await original_prepare(*args)
+        entered.set()
+        await release.wait()
+        return prepared
+
+    @wraps(original_policy)
+    async def policy(*args, **kwargs):
+        handled.append(type(args[1]).__name__)
+        return await original_policy(*args, **kwargs)
+
+    monkeypatch.setattr(module, "_prepare_batch", prepare)
+    monkeypatch.setattr(module._managed, "_after_child_error", policy)
+    caller = asyncio.create_task(module.drive_fanout(invocation))
+    try:
+        await wait_for_gate(entered, task=caller)
+        if stop == "cancel":
+            assert await store.request_cancel(invocation.parent_run_id)
+        else:
+            async with AsyncSession(engine) as session:
+                await session.execute(
+                    update(AgentRun)
+                    .where(AgentRun.id == invocation.parent_run_id)
+                    .values(claim_epoch=1)
+                )
+                await session.commit()
+        release.set()
+        result = await caller
+        assert result.run_id == invocation.root_run_id
+        assert result.status == (RunStatus.CANCELLED if stop == "cancel" else RunStatus.RUNNING)
+        assert handled == ["RunCancelledError" if stop == "cancel" else "RunFencedError"]
+        assert not effects.counts().provider
+        for branch in invocation.branches:
+            assert await store.get_run(branch.child_run_id) is None
+    finally:
+        release.set()
+        await asyncio.gather(caller, return_exceptions=True)
+        await close_plan(invocation)
+
+
+async def test_round2_drive_preserves_a_task_factory_fence_error_after_bind(store, monkeypatch):
+    from dendrux.errors import RunFencedError
+
+    module = driver()
+    invocation, _, effects = await plan(store)
+    original = asyncio.create_task
+    failure = RunFencedError(invocation.parent_run_id, claim_epoch=0)
+
+    def create(coro, *args, **kwargs):
+        if getattr(coro, "cr_code", None).co_name == "run_branch":
+            raise failure
+        return original(coro, *args, **kwargs)
+
+    monkeypatch.setattr(module.asyncio, "create_task", create)
+    try:
+        with pytest.raises(RunFencedError) as caught:
+            await module.drive_fanout(invocation)
+        assert caught.value is failure
+        assert not effects.counts().provider
+        for branch in invocation.branches:
+            assert (await store.get_run(branch.child_run_id)).status == "cancelled"
+    finally:
         await close_plan(invocation)
