@@ -110,8 +110,8 @@ def attach_pendings(result: RunResult, pendings: Sequence[PendingPause]) -> RunR
 
 def _own_pendings(result: RunResult) -> tuple[PendingPause, ...]:
     """A result's own pause as its pendings (nothing read: the in-memory view)."""
-    in_pause = result.status in _PAUSE_STATUSES and result.pending is not None
-    return (result.pending,) if in_pause and result.pending is not None else ()
+    pending = result.pending
+    return (pending,) if pending is not None and result.status in _PAUSE_STATUSES else ()
 
 
 async def attach_facing(

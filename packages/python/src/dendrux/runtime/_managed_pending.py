@@ -6,7 +6,7 @@ that shape without history and without locks:
 
 - a v3 wait (one child): one projected primary-key read of the bound child (0.7);
 - a v4 wait (2..32 children): its pause envelope, decoded strictly and checked against the
-  checkpoint binding, then one ``get_managed_children`` read for every binding.
+  checkpoint binding, then one ``get_managed_children`` read covering all its bindings.
 
 Every hop is validated (parent link, tenant, root, invocation, path) before anything below it
 is read, and the walk is bounded. The per-leaf pending projection belongs to the caller
