@@ -219,7 +219,7 @@ async def prepare_handoff(
 
     handoff = result.meta[MANAGED_HANDOFF_KEY]
     if len(handoff.calls) > 1:
-        # Cycle: fan-out delegates N=1 descendants back to this inline driver.
+        # cycle: _managed_fanout imports _managed; removed when dispatch is extracted.
         from dendrux.runtime import _managed_fanout
 
         return await _managed_fanout.prepare_handoff(
@@ -396,7 +396,7 @@ async def _trampoline(
         if is_descend(result):
             invocation: ManagedInvocation | FanoutInvocation = result.meta[DESCEND_KEY]
             if isinstance(invocation, FanoutInvocation):
-                # Cycle: fan-out delegates N=1 descendants back to this driver.
+                # cycle: _managed_fanout imports _managed; removed when dispatch is extracted.
                 from dendrux.runtime import _managed_fanout
 
                 result = await _managed_fanout.drive_fanout(
@@ -542,7 +542,7 @@ async def _fail_parent(invocation: ManagedInvocation, exc: Exception) -> None:
 
 async def adopt(waiting: _Waiting, *, store: Any, notifier: LoopNotifier | None) -> RunResult:
     """Accept a terminal child's saved outcome into its parent, then continue the parent."""
-    # Cycle: fan-out delegates inline descendants to this driver.
+    # cycle: _managed_fanout imports _managed; removed when dispatch is extracted.
     from dendrux.runtime import _managed_fanout
 
     claimed = await claim_adoption(waiting, store)

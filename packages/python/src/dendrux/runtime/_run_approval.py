@@ -1,7 +1,20 @@
-"""Decide and execute approval batches through policy, pause and managed-handoff barriers."""
+"""Decide approval batches through policy, pause and managed-handoff barriers.
+
+Approval dispatch is shared by batch and streaming resume. Pending calls retain
+emission order: clients return to the caller, denied gates get failed results,
+and approved gates and held server calls execute without repeating before_tool.
+A cancel-then-pause barrier precedes each server effect and retains remaining
+calls on a stop. decisions=None means legacy batch approval. Tool observations
+append to the live history, not the pause snapshot. The resolved loop controls
+lookups; the caller emits approval.decided and re-enters that loop.
+
+Streaming frames retain the single-child policy until the stream fan-out driver
+lands. Refuse a held multi-child batch before any approved server effect.
+"""
 
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
@@ -33,8 +46,6 @@ from dendrux.runtime import (
     _run_images,
     _run_resume_replay,
 )
-from dendrux.runtime._capabilities import fanout_support
-from dendrux.runtime.state import unclaimed_store
 from dendrux.skills._session import current
 from dendrux.types import (
     ApprovalDecision,
@@ -290,8 +301,6 @@ async def _execute_approved_tools(
 
     Decisions are durable; hooks are not repeated. Barriers precede each effect.
     """
-    import json
-
     from dendrux.loops._helpers import notify_message as _ntfy_msg
     from dendrux.loops._helpers import notify_tool as _ntfy_tool
     from dendrux.loops._helpers import notify_tool_started as _ntfy_tool_started
@@ -393,8 +402,7 @@ async def _execute_approved_tools(
                 tenant_id=None,
                 batch_policy=_managed_batch.batch_policy(
                     agent,
-                    fanout_capable=state_store is not None
-                    and fanout_support(unclaimed_store(state_store)).capable,
+                    fanout_capable=_managed_batch.loop_fanout_capable(recorder),
                 ),
                 **dispatch_policy(name=tc.name, phase="approved"),
                 **_run_images._tool_image_kwargs(_process_tool_calls, image_runtime),
@@ -632,12 +640,18 @@ async def _resume_approval_batch(
     streaming: bool = False,
 ) -> tuple[_run_contracts._ApprovalResume | None, bool]:
     pause = ctx.pause_state
+    if streaming and ctx.recorder is not None:
+        _run_execute._configure_fanout(ctx.recorder, None)
     approving = (
         results is None and user_input is None and expected == RunStatus.WAITING_APPROVAL.value
     )
     paused_batch = expected == RunStatus.PAUSED.value and bool(pause.pending_tool_calls)
     if not (approving or paused_batch):
         return None, approving
+    if streaming:
+        refused = await _refuse_stream_approval(agent, ctx, run_id)
+        if refused is not None:
+            return refused, approving
     decision_map = None
     if not approving:
         decision_map = _pending_decision_map(pause)
@@ -659,6 +673,27 @@ async def _resume_approval_batch(
         on_work=on_work,
     )
     return await _hand_off_approved_subagent(agent, ctx, run_id, approval), approving
+
+
+async def _refuse_stream_approval(
+    agent: Agent, ctx: _run_contracts._ResumeContext, run_id: str
+) -> _run_contracts._ApprovalResume | None:
+    """Refuse a held unsupported batch before approval dispatch creates any effect."""
+    # cycle: _reclaim imports _run_approval via runner; removed when T6 extracts recovery dispatch.
+    from dendrux.runtime._reclaim import _refuse_recovered_batch
+
+    calls = ctx.pause_state.pending_tool_calls
+    if len(calls) < 2:
+        return None
+    lookups = await agent.get_tool_lookups(loop=ctx.resolved_loop)
+    policy = _managed_batch.batch_policy(agent, fanout_capable=False)
+    if _managed_batch.classify_batch(calls, lookups, policy).action != "refuse":
+        return None
+    await _refuse_recovered_batch(ctx, run_id, calls)
+    decided = _decided_payload(
+        run_id, [(tc, "denied", _managed_batch.MANAGED_BATCH_UNSUPPORTED) for tc in calls]
+    )
+    return _run_contracts._ApprovalResume([], [], decided, None)
 
 
 async def _hand_off_approved_subagent(

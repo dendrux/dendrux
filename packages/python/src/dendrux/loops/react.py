@@ -2831,8 +2831,7 @@ class ReActLoop(Loop):
     ) -> AsyncGenerator[RunEvent, None]:
         """Stream the ReAct loop as RunEvents.
 
-        Same iteration logic as run() — shared helpers ensure consistency.
-        Swaps provider.complete() for complete_stream(), forwarding text
+        Shared helpers drive complete_stream(), forwarding text
         deltas live and yielding TOOL_RESULT events after execution.
         Terminal event is RUN_COMPLETED or RUN_PAUSED.
         """
@@ -2857,6 +2856,7 @@ class ReActLoop(Loop):
             image_view_state=image_view_state,
             interrupt=interrupt,
         )
+        ctx.fanout_capable = False
         _bind_run_checkpoint(ctx)
         start_iteration = iteration_offset + 1
         end_iteration = agent.max_iterations + 1

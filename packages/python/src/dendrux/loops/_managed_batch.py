@@ -4,17 +4,15 @@ from __future__ import annotations
 
 import json
 import logging
-from contextlib import contextmanager
-from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from dendrux import _codes
 from dendrux.loops import _pause_shared
 from dendrux.types import RunResult, RunStatus, ToolCall, ToolResult, ToolTarget
 
 if TYPE_CHECKING:
-    from collections.abc import Collection, Iterator, Sequence
+    from collections.abc import Collection, Sequence
 
     from dendrux.agent import Agent
     from dendrux.loops.react import _RunContext, _ToolBatch, _ToolCallOutcome
@@ -70,7 +68,10 @@ SubagentTool.__module__ = "dendrux.loops.react"
 
 @dataclass(frozen=True, init=False)
 class ManagedHandoff:
-    """Admitted managed calls in order; ``call``/``child`` retain the N=1 interface."""
+    """Admitted managed calls in order; ``call`` is the first call.
+
+    ``child`` is that first call's child, also when two or more calls are admitted.
+    """
 
     call: ToolCall
     child: Agent
@@ -289,7 +290,7 @@ def _brief_too_large(tc: ToolCall, size: int, limit: int) -> ToolResult:
 def _managed_handoff(
     ctx: _RunContext, outcome: _ToolCallOutcome, iteration: int
 ) -> RunResult | None:
-    """The single admitted managed call, handed to the runner instead of a client pause.
+    """Admitted managed calls, handed to the runner instead of a client pause.
 
     Server calls of the batch have already finished and are durable. The result
     stays RUNNING: only the runner's atomic bind parks this run.
@@ -300,9 +301,7 @@ def _managed_handoff(
     entries = [ctx.lookups.fn.get(call.name) for call in pending]
     if not all(isinstance(entry, SubagentTool) for entry in entries):
         return None
-    entry = entries[0]
-    if not isinstance(entry, SubagentTool):
-        return None
+    entry = cast("SubagentTool", entries[0])  # Every entry was narrowed by the batch check.
     result = _pause_shared._pause_result(ctx, RunStatus.RUNNING, iteration, pending_calls=pending)
     result.meta[MANAGED_HANDOFF_KEY] = ManagedHandoff(
         calls=pending, child=entry.agent, parent=ctx.agent
@@ -310,22 +309,6 @@ def _managed_handoff(
     return result
 
 
-_fanout_capable: ContextVar[bool] = ContextVar("dendrux_loop_fanout_capable", default=False)
-
-
 def loop_fanout_capable(recorder: object) -> bool:
-    """Read the runtime-supplied per-frame boolean, never discover a store capability."""
-    return (
-        recorder is not None
-        and getattr(recorder, "_managed_fanout_capable", _fanout_capable.get()) is True
-    )
-
-
-@contextmanager
-def fanout_scope(capable: bool) -> Iterator[None]:
-    """Supply a plain capability flag to a continuation in this task only."""
-    token = _fanout_capable.set(capable)
-    try:
-        yield
-    finally:
-        _fanout_capable.reset(token)
+    """Read only this frame's explicit flag; absent flags always disable fan-out."""
+    return getattr(recorder, "_managed_fanout_capable", False) is True

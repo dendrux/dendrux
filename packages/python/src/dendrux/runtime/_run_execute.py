@@ -11,8 +11,6 @@ import dendrux.strategies.native as _native
 from dendrux._sentinel import _OMITTED, _OmittedType, _UnsetType
 from dendrux.errors import (
     ManagedStateError,
-    PersistenceError,
-    ProviderError,
     RunFencedError,
 )
 from dendrux.runtime import (
@@ -612,9 +610,7 @@ async def _run_preclaimed(frame: _PreclaimedChild, notifier: LoopNotifier | None
                 result.meta[_managed.NOT_OWNER_KEY] = True
             return result
         except Exception as error:  # noqa: BLE001, RUF100 - the owned run lifecycle persists failure before branch isolation.
-            await lifecycle._failed(
-                _storage_error(error, branch.child_run_id), {}, lifecycle.recorder, notifier
-            )
+            await lifecycle._failed(error, {}, lifecycle.recorder, notifier)
             raise
     except asyncio.CancelledError:
         cancelled, swallow = await lifecycle._cancelled(None, {}, lifecycle.recorder, notifier)
@@ -707,14 +703,6 @@ def _bound_context(
         lease_interval_s=branch.child.lease_interval.total_seconds(),
         loop=asyncio.get_running_loop(),
     )
-
-
-def _storage_error(error: Exception, run_id: str) -> Exception:
-    if isinstance(error, (ProviderError, PersistenceError, ManagedStateError)):
-        return error
-    safe = ManagedStateError(reason="fanout_invalid", run_id=run_id)
-    safe.__cause__ = error
-    return safe
 
 
 def _attach_run_metadata(

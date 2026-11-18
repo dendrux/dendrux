@@ -1,10 +1,15 @@
-"""Prepare a fan-out, transfer claims to branch owners, and join before fan-in."""
+"""Prepare a fan-out, transfer claims to branch owners, and join before fan-in.
+
+Single-child workflows stay inline in ``_managed`` through durable bind,
+adoption and continuation. Routing, reports and stream cleanup remain in the
+managed helper modules; this driver owns only multi-child claim custody.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from contextvars import Context
+from contextvars import Context, copy_context
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Literal, cast
 
@@ -13,7 +18,6 @@ from dendrux._lifecycle import STORAGE_FORMAT_CHECKPOINTED, TERMINAL_STATUSES
 from dendrux._managed_wait import MANAGED_FANOUT_SCHEMA_VERSION, MANAGED_WAIT_REASON
 from dendrux.errors import ManagedStateError, RunCancelledError, RunFencedError
 from dendrux.loops import _helpers as _hooks
-from dendrux.loops import _managed_batch
 from dendrux.loops._managed_batch import MANAGED_HANDOFF_KEY, ManagedHandoff
 from dendrux.loops.base import BaseNotifier, LoopNotifier
 from dendrux.runtime import (
@@ -70,6 +74,54 @@ logger = logging.getLogger(__name__)
 _TERMINAL = frozenset(s.value for s in TERMINAL_STATUSES)
 
 
+# Exact library-owned names include optional transports without loading their extras.
+_INTERNAL_CONTEXT_NAMES = frozenset(
+    {
+        "entry_guardrail_engine",
+        "dendrux_provider_call",
+        "dendrux_retry_run_id",
+        "dendrux_retry_iteration",
+        "dendrux_retry_sinks",
+        "dendrux_retry_attempts",
+        "dendrux_sdk_request",
+        "mcp_tool_http_attempt",
+        "mcp_discovery_read",
+        "dendrux_blocked_target",
+        "dendrux_claim_call",
+        "dendrux_blocked_dispatch",
+        "dendrux_delegation",
+        "dendrux_managed_invocation",
+        "dendrux_managed_root_reclaim",
+        "dendrux_database_operation",
+        "dendrux_database_cancellation",
+        "dendrux_live_update_scope",
+        "dendrux_sweep_deadlines",
+        "dendrux_failed_page_marks",
+        "dendrux_handoff_commit",
+        "dendrux_creation_loop",
+        "dendrux_finalized_run_read",
+        "mysql_increment_site",
+        "skill_session",
+        "dendrux_tool_result_cap",
+        "dendrux_tool_image_allowance",
+    }
+)
+
+
+def owner_context() -> Context:
+    """Copy developer context while clearing every library-owned execution scope.
+
+    Read defaults in an empty context, then set them synchronously in the copy.
+    Neither the caller's values nor its tokens move to an owner task. Unset
+    variables already have their defaults and require no reset.
+    """
+    copied, defaults = copy_context(), Context()
+    for variable in copied:
+        if variable.name in _INTERNAL_CONTEXT_NAMES:
+            copied.run(variable.set, defaults.run(variable.get))
+    return copied
+
+
 @dataclass(frozen=True)
 class BranchOutcome:
     """One branch's settled state; errors are retained only until its caller joins."""
@@ -115,14 +167,14 @@ async def start_fanout(
     """Prepare and bind in the caller, then synchronously create every branch owner.
 
     The returned handle must be closed with ``aexit`` even if never waited on.
-    No provider or execution context is created until a branch accepts its claim.
+    No provider generator or child session opens before a branch accepts its claim.
     Typed cancel/fence startup refusals leave the 0.7 policy to the driver; a
     post-bind startup error has already drained custody and must still propagate.
     """
-    if not fanout_support(invocation.store).capable:
-        raise ManagedStateError(reason="fanout_capability", run_id=invocation.parent_run_id)
     branches = branch_invocations(invocation)
     try:
+        if not fanout_support(invocation.store).capable:
+            raise ManagedStateError(reason="fanout_capability", run_id=invocation.parent_run_id)
         prepared = await _prepare_batch(invocation.store, branches)
         request = _managed_fanout_store.BindManagedChildrenRequest(
             tenant_id=invocation.tenant_id,
@@ -151,7 +203,6 @@ async def start_fanout(
         await _managed._after_child_error(
             branches[0],
             error,
-            failure_for_storage=_run_execute._storage_error(error, invocation.parent_run_id),
         )
         raise
     run = FanoutRun(
@@ -224,7 +275,7 @@ class FanoutRun:
             )
             try:
                 task = asyncio.create_task(
-                    coro, name=f"fanout:{branch.child_run_id}", context=Context()
+                    coro, name=f"fanout:{branch.child_run_id}", context=owner_context()
                 )
             except BaseException:
                 coro.close()
@@ -583,6 +634,8 @@ async def prepare_handoff(
     provider_kwargs: dict[str, Any] | None,
 ) -> RunResult | None:
     """Checkpoint all admitted calls and build the v4 invocation in the parent task."""
+    if not fanout_support(_managed._shared(store)).capable:
+        raise ManagedStateError(reason="fanout_capability", run_id=run_id)
     handoff: ManagedHandoff = result.meta[MANAGED_HANDOFF_KEY]
     branches = _handoff_branches(handoff, run_id)
     if await _managed_cancel.cancellation_requested(store, run_id):
@@ -662,8 +715,7 @@ async def continue_parent(
     notifier: LoopNotifier | None,
 ) -> RunResult:
     """Continue the claimed parent in this task with its runtime-computed loop policy."""
-    with _managed_batch.fanout_scope(fanout_support(store).capable):
-        return await _reclaim.continue_claimed(agent, store, run_id, claim, notifier=notifier)
+    return await _reclaim.continue_claimed(agent, store, run_id, claim, notifier=notifier)
 
 
 def _fanout_wait(

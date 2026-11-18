@@ -452,7 +452,9 @@ async def test_n32_bind_ack_join_and_finalize_deadline(store, engine, monkeypatc
         await asyncio.gather(caller, return_exceptions=True)
 
 
-@pytest.mark.parametrize("damage", ["header_parent", "header_path", "duplicate_row"])
+@pytest.mark.parametrize(
+    "damage", ["header_parent", "header_path", "duplicate_row", "call_id_swap"]
+)
 async def test_settle_refuses_mismatched_child_identity(store, monkeypatch, damage):
     module = driver()
     invocation, _, effects = await plan(store)
@@ -466,6 +468,13 @@ async def test_settle_refuses_mismatched_child_identity(store, monkeypatch, dama
             header["invocation"]["parent_run_id"] = generate_ulid()
         elif damage == "header_path":
             header["path"] = ["other"]
+        elif damage == "call_id_swap":
+            other = deepcopy(rows[1].header)
+            header["invocation"]["tool_call_id"], other["invocation"]["tool_call_id"] = (
+                other["invocation"]["tool_call_id"],
+                header["invocation"]["tool_call_id"],
+            )
+            return [replace(rows[0], header=header), replace(rows[1], header=other)]
         else:
             return [*rows, rows[0]]
         return [replace(rows[0], header=header), *rows[1:]]
@@ -491,7 +500,9 @@ async def test_settle_refuses_mismatched_child_identity(store, monkeypatch, dama
         await close_plan(invocation)
 
 
-async def test_p1_p3_parent_continues_in_caller_after_call_order_adoption(store, live_adoption):
+async def test_p1_p3_parent_continues_in_caller_after_call_order_adoption(
+    store, live_adoption, monkeypatch
+):
     effects = FanoutEffects()
     transformed = []
 
@@ -526,18 +537,24 @@ async def test_p1_p3_parent_continues_in_caller_after_call_order_adoption(store,
         provider=effects.provider("root", llm),
         tool_result_transform=effects.transform(transform),
     )
+    committed = asyncio.Event()
+    second_id = None
+    finalize = store.finalize_with_event
+
+    async def commit(run_id, *args, **kwargs):
+        result = await finalize(run_id, *args, **kwargs)
+        if run_id == second_id:
+            committed.set()
+        return result
+
+    monkeypatch.setattr(store, "finalize_with_event", commit)
     runner = asyncio.create_task(parent.run("go", tenant_id="t1"))
     try:
         for provider in providers:
             await wait_for_gate(provider.first_sent, task=runner)
-        providers[1].gate.set()
         second_id = providers[1].complete_contexts[0].run_id
-        for _ in range(500):
-            if (await store.get_run(second_id)).status == "success":
-                break
-            await asyncio.sleep(0.01)
-        else:
-            pytest.fail("second child did not commit")
+        providers[1].gate.set()
+        await wait_for_gate(committed, task=runner)
         assert not runner.done() and live_adoption == [] and llm.calls == 1
         providers[0].gate.set()
         result = await asyncio.wait_for(runner, 5)
@@ -887,7 +904,7 @@ async def test_p15_eight_children_release_two_connection_pool_before_provider(en
 
 
 @pytest.mark.parametrize("where", ["preparation", "provider"])
-async def test_callback_exception_payload_is_not_persisted(store, monkeypatch, caplog, where):
+async def test_callback_error_storage_matches_single_child(store, monkeypatch, caplog, where):
     module = driver()
     invocation, providers, effects = await plan(store)
     error = ValueError("SENTINEL-private-callback-payload")
@@ -912,8 +929,8 @@ async def test_callback_exception_payload_is_not_persisted(store, monkeypatch, c
             assert sum(effects.counts().provider.values()) == 2
         assert record.status == "error"
         events = await store.get_run_events(record.id)
-        assert "SENTINEL" not in record.error
-        assert "SENTINEL" not in repr(events)
+        assert record.error == str(error)
+        assert events
         assert "SENTINEL" not in caplog.text
     finally:
         await close_plan(invocation)
@@ -1429,7 +1446,7 @@ async def test_round2_approved_skill_dispatch_receives_effective_batch_policy(
 
     from dendrux.loops import react
     from dendrux.loops.base import BaseRecorder
-    from dendrux.runtime import _run_approval
+    from dendrux.runtime import _run_approval, _run_execute
     from dendrux.skills._session import SkillTool
     from dendrux.types import PauseState
 
@@ -1454,8 +1471,10 @@ async def test_round2_approved_skill_dispatch_receives_effective_batch_policy(
         usage=UsageStats(),
     )
     try:
+        recorder = BaseRecorder()
+        _run_execute._configure_fanout(recorder, store if persistent else None)
         await _run_approval._execute_approved_tools(
-            agent, pause, BaseRecorder(), None, root_id, state_store=store if persistent else None
+            agent, pause, recorder, None, root_id, state_store=store if persistent else None
         )
         process.assert_awaited_once()
         policy = process.call_args.kwargs.get("batch_policy")
@@ -1466,11 +1485,21 @@ async def test_round2_approved_skill_dispatch_receives_effective_batch_policy(
         await agent.close()
 
 
-async def test_round2_continuation_scope_cannot_enable_a_run_without_a_store(store):
+async def test_unconfigured_frame_cannot_inherit_fanout_capability(store, monkeypatch):
+    from contextvars import ContextVar
+    from types import SimpleNamespace
+
     from dendrux.loops import _managed_batch
 
-    with _managed_batch.fanout_scope(True):
-        assert not _managed_batch.loop_fanout_capable(None)
+    monkeypatch.setattr(
+        _managed_batch,
+        "_fanout_capable",
+        ContextVar("ambient_capability", default=True),
+        raising=False,
+    )
+    assert not _managed_batch.loop_fanout_capable(SimpleNamespace())
+    assert _managed_batch.loop_fanout_capable(SimpleNamespace(_managed_fanout_capable=True))
+    assert not _managed_batch.loop_fanout_capable(SimpleNamespace(_managed_fanout_capable=False))
     assert not _managed_batch.loop_fanout_capable(None)
 
 
@@ -1669,6 +1698,180 @@ async def test_real_adoption_loser_runs_no_transform_or_parent_turn(
         assert len(live_adoption) == 1
         await assert_durable_reports(store, result.run_id, calls, ["alpha", "beta"])
         assert_parent_turn(llm, calls, ["alpha", "beta"])
+    finally:
+        await parent.close()
+        for child in children:
+            await child.close()
+
+
+async def test_capability_refusal_precedes_admitted_checkpoint(store, monkeypatch):
+    from types import SimpleNamespace
+
+    from dendrux.runtime import _managed, _managed_fanout
+
+    effects = FanoutEffects()
+    children = round2_children(effects)
+    calls = [ToolCall(c.name, {"task": "go"}) for c in children]
+    parent = Agent(
+        name="lead",
+        prompt="p",
+        state_store=store,
+        subagents=children,
+        provider=ScriptedLLM([LLMResponse(tool_calls=calls)]),
+    )
+    seen = []
+    prepare = _managed_fanout.prepare_handoff
+
+    async def capture(store, run_id, *args):
+        seen.append(run_id)
+        return await prepare(store, run_id, *args)
+
+    monkeypatch.setattr(_managed_fanout, "prepare_handoff", capture)
+    monkeypatch.setattr(
+        _managed_fanout, "fanout_support", lambda store: SimpleNamespace(capable=False)
+    )
+    try:
+        with pytest.raises(ManagedStateError) as caught:
+            await parent.run("go", tenant_id="t1")
+        assert caught.value.reason == "fanout_capability"
+        assert (await store.get_run(seen[0])).status == "error"
+        state = await store.get_loop_state(seen[0])
+        assert not state.get(_managed.ADMITTED_KEY) and not state.get("managed_wait")
+        assert sum(effects.counts().provider.values()) == 0
+    finally:
+        await parent.close()
+        for child in children:
+            await child.close()
+
+
+async def test_owner_context_copies_developer_values_and_resets_internal_defaults(
+    store, monkeypatch
+):
+    from contextvars import Context, ContextVar
+
+    from dendrux.guardrails import _engine
+    from dendrux.llm import _resilience, _retry_telemetry, _transport
+    from dendrux.mcp import _client
+    from dendrux.runtime import _blocked_content, context, durability, state
+    from dendrux.runtime.stores.sql import mysql
+    from dendrux.skills import _session
+    from dendrux.tools import _limits
+
+    developer = ContextVar("developer_request", default="missing")
+    modules = [
+        context,
+        durability,
+        state,
+        _session,
+        _blocked_content,
+        _engine,
+        _limits,
+        _retry_telemetry,
+        _resilience,
+        _transport,
+        _client,
+        mysql,
+    ]
+    variables = [
+        value
+        for module in modules
+        for value in vars(module).values()
+        if isinstance(value, ContextVar)
+    ]
+    invocation, _, _ = await plan(store)
+    original = driver().run_branch
+    seen = []
+
+    async def branch(*args, **kwargs):
+        seen.append((developer.get(), [var.get() for var in variables]))
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(driver(), "run_branch", branch)
+    start = driver().FanoutRun.start
+
+    def poisoned_start(run):
+        tokens = [var.set(object()) for var in variables]
+        token = developer.set("req-42")
+        try:
+            start(run)
+        finally:
+            developer.reset(token)
+            for var, saved in zip(variables, tokens, strict=True):
+                var.reset(saved)
+
+    monkeypatch.setattr(driver().FanoutRun, "start", poisoned_start)
+    try:
+        run = await driver().start_fanout(invocation)
+        await run.wait()
+        defaults = [Context().run(var.get) for var in variables]
+        assert seen == [("req-42", defaults)] * 2
+    finally:
+        await close_plan(invocation)
+
+
+async def test_close_transfers_custody_before_cancel_or_cleanup(store, monkeypatch):
+    invocation, _, effects = await plan(store)
+    run = await driver().start_fanout(invocation)
+    events = []
+    close, accept, finalize = run.ledger.close, run.ledger.accept, run.ledger.finalize
+
+    def closing():
+        assert all(owner.cancelling() == 0 for owner in run.owners)
+        events.append("close")
+        return close()
+
+    def accepting(i):
+        events.append("accept")
+        return accept(i)
+
+    async def cleanup(store, indices):
+        events.append("finalize")
+        # Force pending owners to take a scheduling turn before cancellation finalizes.
+        await asyncio.sleep(0)
+        await finalize(store, indices)
+
+    monkeypatch.setattr(run.ledger, "close", closing)
+    monkeypatch.setattr(run.ledger, "accept", accepting)
+    monkeypatch.setattr(run.ledger, "finalize", cleanup)
+    try:
+        await run.aexit()
+        assert events[0] == "close" and events[-1] == "finalize"
+        assert run.ledger.states == ("finalized", "finalized")
+        assert all(owner.done() for owner in run.owners)
+        assert sum(effects.counts().provider.values()) == 0
+    finally:
+        await close_plan(invocation)
+
+
+@pytest.mark.parametrize("width", [1, 2])
+async def test_child_failure_uses_the_same_durable_error_at_each_width(
+    store, v4_continuation, width
+):
+    providers = [GatedStreamLLM(first="unused", second="") for _ in range(width)]
+    for provider in providers:
+        provider.complete_error = ValueError("child execution failed")
+    children = [
+        Agent(name=f"c{i}", prompt="p", description="d", loop=SingleCall(), provider=p)
+        for i, p in enumerate(providers)
+    ]
+    parent = Agent(
+        name="lead",
+        prompt="p",
+        state_store=store,
+        subagents=children,
+        provider=ScriptedLLM(
+            [
+                LLMResponse(tool_calls=[ToolCall(c.name, {"task": "go"}) for c in children]),
+                LLMResponse(text="done"),
+            ]
+        ),
+    )
+    try:
+        result = await parent.run("go", tenant_id="t1")
+        assert result.status == RunStatus.SUCCESS
+        for provider in providers:
+            child = await store.get_run(provider.complete_contexts[0].run_id)
+            assert child.status == "error" and child.error == "child execution failed"
     finally:
         await parent.close()
         for child in children:
