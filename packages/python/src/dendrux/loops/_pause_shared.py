@@ -1,14 +1,8 @@
-"""Shared pause construction and retained ReAct compatibility bindings.
-
-Look up patches only on an already-loaded facade; defaults work without it.
-No facade is imported by this module.
-"""
+"""Shared ReAct pause construction."""
 
 from __future__ import annotations
 
-import logging
-import sys
-from typing import TYPE_CHECKING, TypeVar, cast
+from typing import TYPE_CHECKING
 
 from dendrux.types import PauseState, RunResult, ToolCall, ToolTarget, UsageStats
 
@@ -16,16 +10,6 @@ if TYPE_CHECKING:
     from dendrux.loops._budget import BudgetTracker
     from dendrux.loops.react import _RunContext
     from dendrux.types import AgentStep, ImageViewState, Message, RunStatus
-
-_T = TypeVar("_T")
-
-
-def _facade_binding(name: str, default: _T) -> _T:
-    # The dynamically replaced facade attribute retains this hook's original type.
-    return cast("_T", getattr(sys.modules.get(f"{__package__}.react"), name, default))
-
-
-logger = logging.getLogger("dendrux.loops.react")
 
 
 def _commentary(steps: list[AgentStep]) -> list[str]:
@@ -81,7 +65,7 @@ def _build_pause(
         steps=list(steps),
         iteration=iteration,
         trace_order_offset=len(history),
-        usage=_facade_binding("_snapshot_usage", _snapshot_usage)(usage),
+        usage=_snapshot_usage(usage),
         approval_gates=approval_gates,
         image_view=image_view,
         **(budget.pause_fields() if budget is not None else {}),
@@ -97,7 +81,7 @@ def _pause_result(
     approval_gates: dict[str, dict[str, str | None]] | None = None,
     answer: str | None = None,
 ) -> RunResult:
-    pause = _facade_binding("_build_pause", _build_pause)(
+    pause = _build_pause(
         agent_name=ctx.agent.name,
         pending_calls=pending_calls,
         target_lookup=ctx.lookups.target,
@@ -114,7 +98,7 @@ def _pause_result(
         status=status,
         answer=answer,
         steps=ctx.state.steps,
-        commentary=_facade_binding("_commentary", _commentary)(ctx.state.steps),
+        commentary=_commentary(ctx.state.steps),
         iteration_count=iteration,
         usage=ctx.state.usage,
         meta={"pause_state": pause, **ctx.meta()},

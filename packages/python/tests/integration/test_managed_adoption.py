@@ -166,7 +166,7 @@ async def test_crash_after_adoption_claim_is_consumed_through_tool_completion_on
     store: Any, engine: Any, monkeypatch: Any
 ) -> None:
     """Cut 2: the report is durably accepted, the tool row is not yet completed."""
-    from dendrux.runtime import persistence
+    from dendrux.runtime import _managed_persistence
 
     root_id, child_id = await crash_before_adoption(store, engine, monkeypatch)
     root, _, _ = fresh_root(store)
@@ -175,7 +175,7 @@ async def test_crash_after_adoption_claim_is_consumed_through_tool_completion_on
         raise CrashError
 
     with monkeypatch.context() as patch:
-        patch.setattr(persistence, "adopt_managed_result", die)
+        patch.setattr(_managed_persistence, "adopt_managed_result", die)
         with pytest.raises(CrashError):
             await root.reclaim(root_id, tenant_id=TENANT)
     row = (await rows(engine, AgentRun, AgentRun.id == root_id))[0]
@@ -1007,7 +1007,7 @@ def _drop_confidential(ctx: Any) -> Any:
 async def test_parent_transform_shapes_the_accepted_report_once(
     store: Any, engine: Any, monkeypatch: Any, cut: str
 ) -> None:
-    from dendrux.runtime import persistence
+    from dendrux.runtime import _managed_persistence
 
     transform_calls.clear()
     child_llm = ContextLLM([LLMResponse(text=f"report {CONFIDENTIAL}")])
@@ -1020,7 +1020,7 @@ async def test_parent_transform_shapes_the_accepted_report_once(
         final_llm = root_llm
     else:
         target, name = (
-            (persistence, "adopt_managed_result")
+            (_managed_persistence, "adopt_managed_result")
             if cut == "after_claim"
             else (_reclaim, "continue_claimed")
         )
@@ -1082,7 +1082,7 @@ async def test_parent_block_policy_stops_the_parent_and_keeps_no_blocked_text(
 ) -> None:
     from dendrux._meta_keys import BLOCKED_META_KEY
     from dendrux.guardrails import SecretDetection
-    from dendrux.runtime import persistence
+    from dendrux.runtime import _managed_persistence
 
     child_llm = ContextLLM([LLMResponse(text=f"key {AWS_KEY}")])
     root_llm = ContextLLM([call("reviewer", {"task": BRIEF}, "r1"), LLMResponse(text="never")])
@@ -1096,7 +1096,7 @@ async def test_parent_block_policy_stops_the_parent_and_keeps_no_blocked_text(
         root_id = result.run_id
     else:
         target, name = (
-            (persistence, "adopt_managed_result")
+            (_managed_persistence, "adopt_managed_result")
             if cut == "after_claim"
             else (_reclaim, "continue_claimed")
         )

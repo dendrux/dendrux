@@ -52,7 +52,7 @@ async def adopt_managed_result(
     if pending is None:
         raise ManagedStateError(reason="pending_missing", run_id=run_id)
     iteration = int(state.get("iteration", 0))
-    trace = _trace_shared._facade_binding("message_trace", _trace_shared.message_trace)(
+    trace = _trace_shared.message_trace(
         observation or tool_result_message(report), pending["order_index"]
     )
     trace.meta["iteration"] = iteration

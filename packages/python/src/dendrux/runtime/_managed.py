@@ -633,12 +633,12 @@ async def complete_adoption(
     """The one completion transaction, under blocked provenance when the parent blocked it."""
     from contextlib import nullcontext
 
-    from dendrux.runtime import persistence
+    from dendrux.runtime import _managed_persistence
     from dendrux.runtime._blocked_content import _blocked_evidence
 
     scope = _blocked_evidence(owned, run_id) if accepted.blocked is not None else nullcontext()
     async with scope:
-        return await persistence.adopt_managed_result(
+        return await _managed_persistence.adopt_managed_result(
             owned,
             run_id,
             claim=claim,

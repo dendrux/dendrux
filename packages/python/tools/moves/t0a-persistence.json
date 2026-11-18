@@ -5,8 +5,8 @@
   "source_sha256": "f55c966edad500cf97ac79ec523edf1c9c7745ea2afdf2d0558e412e8dfde65a",
   "sources": {
     "src/dendrux/runtime/persistence.py": "db5de91b04cdaf613617b9f265d773b9bf17bd9f38f86546d9ca8eae6b6a99db",
-    "src/dendrux/runtime/_managed_persistence.py": "57a6e3342a4657e6a4801c5a587a909aa52531bc45ee50bbb22699e6361a9a7c",
-    "src/dendrux/runtime/_trace_shared.py": "56750382bf218828ca778d674a1434b5884a0175e9e6573fec95c28f60a968ef"
+    "src/dendrux/runtime/_managed_persistence.py": "056c2917c175df0fc82665d922e4718cae8d0e4454c739baefe97faf0abf1f35",
+    "src/dendrux/runtime/_trace_shared.py": "573a1ba941011218bdcf23bb1d5bcfb5e34020af724f16a9d7bf9011bcaefb74"
   },
   "owners": {
     "logger": "src/dendrux/runtime/persistence.py",

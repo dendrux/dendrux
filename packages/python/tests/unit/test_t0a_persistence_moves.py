@@ -1,4 +1,4 @@
-"""Compatibility checks for the managed adoption extraction."""
+"""T0 move evidence; later owners may delete location checks when reshaping code."""
 
 from inspect import unwrap
 from pathlib import Path
@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from dendrux.errors import ManagedStateError
-from dendrux.runtime import persistence
+from dendrux.runtime import _trace_shared, persistence
 from dendrux.types import ToolResult
 
 
@@ -32,14 +32,14 @@ async def test_managed_adoption_keeps_the_trace_patch_seam_and_v3_write(monkeypa
     claim = SimpleNamespace(loop_state=state, claim_epoch=7)
     report = ToolResult(name="reviewer", call_id="call", payload="accepted", success=success)
     store = SimpleNamespace(complete_tool_call=AsyncMock())
-    trace = persistence.message_trace
+    trace = _trace_shared.message_trace
     seen = []
 
     def message_trace(*args):
         seen.append(args)
         return trace(*args)
 
-    monkeypatch.setattr(persistence, "message_trace", message_trace)
+    monkeypatch.setattr(_trace_shared, "message_trace", message_trace)
     result = await unwrap(persistence.adopt_managed_result)(
         store,
         "01ARZ3NDEKTSV4RRFFQ69G5FAV",

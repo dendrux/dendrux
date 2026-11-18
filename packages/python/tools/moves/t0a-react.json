@@ -4,15 +4,15 @@
   "old": "src/dendrux/loops/react.py",
   "source_sha256": "1e60e76a44baa29584f179821450885c016e26152ae1d553ea959f8fcba4b783",
   "sources": {
-    "src/dendrux/loops/react.py": "d28cfff72d3bdaa53b67d70adb53c59c7ea3059d459bd628b168c20c7a004e66",
-    "src/dendrux/loops/_managed_batch.py": "ac50d186d03a077e4b7afbe478ed64957fda4eed72a59185004b82f45685dcfb",
-    "src/dendrux/loops/_pause_shared.py": "b72bb44f627e650bfa88b528936b9a329eec4d339df99677d95a2e1d88e234de"
+    "src/dendrux/loops/react.py": "39ad92de9c6edc536e588979ddc3903fd2305c23e4bc003f572451fd27da0442",
+    "src/dendrux/loops/_managed_batch.py": "40d411f98c44338d8518655c60a9ca0d0c5503cf70c9df2a345dfe40a23ea3d0",
+    "src/dendrux/loops/_pause_shared.py": "65b470cb3614c6735d74c7896fdc01477d44e566c9a107a110091e3d2cd704af"
   },
   "owners": {
     "_IMAGE_REFERENCE_MAX_DEPTH": "src/dendrux/loops/react.py",
     "_IMAGE_SEARCH_MAX_DEPTH": "src/dendrux/loops/react.py",
     "_IMAGE_WIRE_OVERHEAD_BYTES": "src/dendrux/loops/react.py",
-    "logger": "src/dendrux/loops/_pause_shared.py",
+    "logger": "src/dendrux/loops/react.py",
     "_record_message": "src/dendrux/loops/react.py",
     "_record_llm": "src/dendrux/loops/react.py",
     "_record_llm_started": "src/dendrux/loops/react.py",
@@ -30,7 +30,7 @@
     "_incoming_location": "src/dendrux/loops/react.py",
     "_ToolCallOutcome": "src/dendrux/loops/react.py",
     "MANAGED_HANDOFF_KEY": "src/dendrux/loops/_managed_batch.py",
-    "<Expr>": "src/dendrux/loops/react.py",
+    "<Expr>": "src/dendrux/loops/_managed_batch.py",
     "MANAGED_BATCH_UNSUPPORTED": "src/dendrux/loops/_managed_batch.py",
     "_MANAGED_BATCH_MESSAGE": "src/dendrux/loops/_managed_batch.py",
     "SubagentTool": "src/dendrux/loops/_managed_batch.py",
@@ -222,13 +222,6 @@
       "count": 1
     },
     {
-      "root": "_admit_managed_briefs",
-      "module": "src/dendrux/loops/_managed_batch.py",
-      "name": "logger",
-      "target": "dendrux.loops._pause_shared.logger",
-      "count": 1
-    },
-    {
       "root": "_managed_handoff",
       "module": "src/dendrux/loops/_managed_batch.py",
       "name": "_pause_result",
@@ -253,9 +246,7 @@
     }
   ],
   "scaffolding": {},
-  "effects": [
-    "logger"
-  ],
+  "effects": [],
   "seams": {},
   "providers": {}
 }

@@ -1,13 +1,8 @@
-"""Shared conversation-trace serialization and retained persistence patch bindings.
-
-Look up patches only on an already-loaded facade; defaults work without it.
-No facade is imported by this module.
-"""
+"""Shared conversation-trace serialization."""
 
 from __future__ import annotations
 
-import sys
-from typing import TYPE_CHECKING, Any, TypeVar, cast
+from typing import TYPE_CHECKING, Any
 
 from dendrux._meta_keys import MESSAGE_META_KEY, PARTS_META_KEY
 from dendrux.runtime._blob_catalog import edges_for_parts
@@ -19,13 +14,6 @@ from dendrux.types import _message_to_dict
 
 if TYPE_CHECKING:
     from dendrux.types import Message, ToolCall
-
-_T = TypeVar("_T")
-
-
-def _facade_binding(name: str, default: _T) -> _T:
-    # The dynamically replaced facade attribute retains this hook's original type.
-    return cast("_T", getattr(sys.modules.get(f"{__package__}.persistence"), name, default))
 
 
 def _tool_call_evidence(tc: ToolCall) -> dict[str, Any]:
@@ -47,9 +35,7 @@ def message_trace(
     tenant_scope: str | None = None,
 ) -> Any:
     """A lossless conversation envelope, with content stored only once."""
-    return _facade_binding("_message_trace", _message_trace)(
-        message, order, generate_ulid(), kind=kind, tenant_scope=tenant_scope
-    )
+    return _message_trace(message, order, generate_ulid(), kind=kind, tenant_scope=tenant_scope)
 
 
 def _message_trace(
@@ -65,10 +51,7 @@ def _message_trace(
     meta = dict(message.meta)
     meta[MESSAGE_META_KEY] = envelope
     if message.tool_calls:
-        meta["tool_calls"] = [
-            _facade_binding("_tool_call_evidence", _tool_call_evidence)(tc)
-            for tc in message.tool_calls
-        ]
+        meta["tool_calls"] = [_tool_call_evidence(tc) for tc in message.tool_calls]
     if message.reasoning_blocks:
         meta["reasoning_blocks"] = message.reasoning_blocks
     if message.call_id:

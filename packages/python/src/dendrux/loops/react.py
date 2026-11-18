@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import logging
 import time
 from contextlib import aclosing, nullcontext
 from dataclasses import dataclass, replace
@@ -82,47 +83,22 @@ from dendrux.loops._images import (
     tool_result_images_dropped,
 )
 from dendrux.loops._llm_call import EventRelay, ProviderCallSite, StreamCall, stream_call_events
-from dendrux.loops._managed_batch import (
-    _MANAGED_BATCH_MESSAGE as _MANAGED_BATCH_MESSAGE,
-)
-from dendrux.loops._managed_batch import (
-    MANAGED_BATCH_UNSUPPORTED as MANAGED_BATCH_UNSUPPORTED,
-)
-from dendrux.loops._managed_batch import (
-    MANAGED_BRIEF_TOO_LARGE as MANAGED_BRIEF_TOO_LARGE,
-)
-from dendrux.loops._managed_batch import (
-    MANAGED_HANDOFF_KEY as MANAGED_HANDOFF_KEY,
-)
-from dendrux.loops._managed_batch import (
-    ManagedHandoff as ManagedHandoff,
-)
-from dendrux.loops._managed_batch import (
-    SubagentTool as SubagentTool,
-)
-from dendrux.loops._managed_batch import (
-    _admit_managed_briefs as _admit_managed_briefs,
-)
-from dendrux.loops._managed_batch import (
-    _brief_too_large as _brief_too_large,
-)
-from dendrux.loops._managed_batch import (
-    _is_managed as _is_managed,
-)
-from dendrux.loops._managed_batch import (
-    _managed_batch_result as _managed_batch_result,
-)
-from dendrux.loops._managed_batch import (
-    _managed_batch_unsupported as _managed_batch_unsupported,
-)
-from dendrux.loops._managed_batch import (
-    _managed_handoff as _managed_handoff,
-)
+from dendrux.loops._managed_batch import _MANAGED_BATCH_MESSAGE as _MANAGED_BATCH_MESSAGE
+from dendrux.loops._managed_batch import MANAGED_BATCH_UNSUPPORTED as MANAGED_BATCH_UNSUPPORTED
+from dendrux.loops._managed_batch import MANAGED_BRIEF_TOO_LARGE as MANAGED_BRIEF_TOO_LARGE
+from dendrux.loops._managed_batch import MANAGED_HANDOFF_KEY as MANAGED_HANDOFF_KEY
+from dendrux.loops._managed_batch import ManagedHandoff as ManagedHandoff
+from dendrux.loops._managed_batch import SubagentTool as SubagentTool
+from dendrux.loops._managed_batch import _admit_managed_briefs as _admit_managed_briefs
+from dendrux.loops._managed_batch import _brief_too_large as _brief_too_large
+from dendrux.loops._managed_batch import _is_managed as _is_managed
+from dendrux.loops._managed_batch import _managed_batch_result as _managed_batch_result
+from dendrux.loops._managed_batch import _managed_batch_unsupported as _managed_batch_unsupported
+from dendrux.loops._managed_batch import _managed_handoff as _managed_handoff
 from dendrux.loops._pause_shared import _build_pause as _build_pause
 from dendrux.loops._pause_shared import _commentary as _commentary
 from dendrux.loops._pause_shared import _pause_result as _pause_result
 from dendrux.loops._pause_shared import _snapshot_usage as _snapshot_usage
-from dendrux.loops._pause_shared import logger as logger
 from dendrux.loops._policy_context import initial_call_counts, static_denial, tool_call_context
 from dendrux.loops.base import Loop
 from dendrux.media._ids import IMAGE_ID_RE
@@ -201,6 +177,9 @@ if TYPE_CHECKING:
     from dendrux.types import BeforeToolHook, StreamEvent, ToolDef, ToolResultTransform
 
 
+logger = logging.getLogger(__name__)
+
+
 _record_message = record_message
 _record_llm = record_llm
 _record_llm_started = record_llm_started
@@ -268,8 +247,6 @@ class _ToolCallOutcome(NamedTuple):
 
 
 # --- Managed subagents (0.7) -------------------------------------------------
-
-"""``RunResult.meta`` key of an in-memory managed handoff (never persisted)."""
 
 
 async def _refuse_managed_batch(calls: Sequence[ToolCall], batch: _ToolBatch) -> None:

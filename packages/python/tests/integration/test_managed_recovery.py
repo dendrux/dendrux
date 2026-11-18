@@ -379,7 +379,7 @@ async def _crash_async(*args: Any, **kwargs: Any) -> Any:
 def _install_cut(cut: str) -> None:
     """Make the phase-one process die exactly at ``cut``."""
     global _CRASH_IN_TOOL
-    from dendrux.runtime import _reclaim, persistence
+    from dendrux.runtime import _managed_persistence, _reclaim
 
     if cut == "pre_bind":
         _managed.bind_child = _crash_async
@@ -394,7 +394,7 @@ def _install_cut(cut: str) -> None:
     elif cut == "child_terminal":
         _managed.adopt = _crash_async
     elif cut == "adoption_claimed":
-        persistence.adopt_managed_result = _crash_async
+        _managed_persistence.adopt_managed_result = _crash_async
     elif cut == "adoption_complete":
         _reclaim.continue_claimed = _crash_async
     elif cut == "unknown_effect":

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -18,7 +19,11 @@ if TYPE_CHECKING:
     from dendrux.tools._lookups import ToolLookups
 
 
+logger = logging.getLogger("dendrux.loops.react")
+
+
 MANAGED_HANDOFF_KEY = "managed_handoff"
+"""``RunResult.meta`` key of an in-memory managed handoff (never persisted)."""
 
 
 MANAGED_BATCH_UNSUPPORTED = "managed_batch_unsupported"
@@ -46,6 +51,7 @@ class SubagentTool:
         raise RuntimeError("A subagent call is never executed as a tool")
 
 
+# Preserve the class identity required by the cumulative move manifest.
 SubagentTool.__module__ = "dendrux.loops.react"
 
 
@@ -58,6 +64,7 @@ class ManagedHandoff:
     parent: Agent
 
 
+# Preserve the class identity required by the cumulative move manifest.
 ManagedHandoff.__module__ = "dendrux.loops.react"
 
 
@@ -103,7 +110,7 @@ async def _admit_managed_briefs(
             limit = entry.agent._limits.max_input_bytes
             if size > limit:
                 _codes.log_code(
-                    _pause_shared._facade_binding("logger", _pause_shared.logger),
+                    logger,
                     _codes.INPUT_SIZE_LIMIT,
                     run_id=batch.run_id,
                     bytes=size,
@@ -141,9 +148,7 @@ def _managed_handoff(
     entry = ctx.lookups.fn.get(pending[0].name)
     if not isinstance(entry, SubagentTool):
         return None
-    result = _pause_shared._facade_binding("_pause_result", _pause_shared._pause_result)(
-        ctx, RunStatus.RUNNING, iteration, pending_calls=pending
-    )
+    result = _pause_shared._pause_result(ctx, RunStatus.RUNNING, iteration, pending_calls=pending)
     result.meta[MANAGED_HANDOFF_KEY] = ManagedHandoff(
         call=pending[0], child=entry.agent, parent=ctx.agent
     )

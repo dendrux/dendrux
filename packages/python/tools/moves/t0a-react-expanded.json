@@ -15,7 +15,6 @@
   "_managed_batch_unsupported": "dendrux.loops._managed_batch",
   "_managed_handoff": "dendrux.loops._managed_batch",
   "_pause_result": "dendrux.loops._pause_shared",
-  "_snapshot_usage": "dendrux.loops._pause_shared",
-  "logger": "dendrux.loops._pause_shared"
+  "_snapshot_usage": "dendrux.loops._pause_shared"
  }
 }
