@@ -796,13 +796,7 @@ async def _crash_at(monkeypatch: Any, module: Any, name: str, run: Any) -> None:
     "parallel_limit",
     [
         1,
-        pytest.param(
-            4,
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason="T5 must configure the batch recovery frame before classification",
-            ),
-        ),
+        4,
     ],
 )
 async def test_recovered_unsupported_batch_is_refused_with_zero_effects(

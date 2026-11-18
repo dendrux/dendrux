@@ -17,7 +17,7 @@ from dendrux import Agent
 from dendrux.db.models import AgentRun
 from dendrux.errors import ManagedStateError, RunNotReclaimableError
 from dendrux.loops import react
-from dendrux.runtime import _managed_fanout, _reclaim, _reclaim_managed
+from dendrux.runtime import _managed_fanout, _reclaim_managed
 from dendrux.runtime.stores._factory import store_for_engine
 from dendrux.types import Limits, LLMResponse, RunStatus, ToolCall, ToolDecision, generate_ulid
 from tests._helpers.fanout_effects import FanoutEffects
@@ -156,13 +156,6 @@ async def drop_phase(mode, kind, survivors):
     saved = {"version": None, "bound": []}
     install_binding_capture(store, saved)
     if mode == "recover":
-        original = _reclaim._recover_managed_calls
-
-        async def configured(agent, ctx, *args):
-            ctx.recorder._managed_fanout_capable = True
-            return await original(agent, ctx, *args)
-
-        _reclaim._recover_managed_calls = configured
         run_id = plan["root"]
         result = await root.reclaim(
             run_id, tenant_id=TENANT, item=await expire(store, engine, run_id)

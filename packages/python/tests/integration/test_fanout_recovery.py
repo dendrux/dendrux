@@ -113,7 +113,6 @@ async def test_claimed_adoption_reclaims_only_uncommitted_rows(store, engine, mo
         await root.close()
 
 
-@pytest.mark.xfail(strict=True, reason="T5 frame setup must call _reclaim.configure_recovery_frame")
 @pytest.mark.parametrize("first_width", [1, 2])
 async def test_adopted_parent_can_fan_out_again(store, first_width):
     children = [
@@ -276,13 +275,7 @@ async def test_reconnect_leaves_only_not_owners(store, monkeypatch, kind):
 @pytest.mark.parametrize(
     "cut",
     [
-        pytest.param(
-            "unbound",
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason="T5 must configure the batch recovery frame before classification",
-            ),
-        ),
+        "unbound",
         "claim",
         "row-1",
         "row-2",
@@ -693,13 +686,7 @@ async def test_adoption_age_never_shortens_abandonment(store, engine):
     "frame_enabled",
     [
         False,
-        pytest.param(
-            True,
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason="T5 must configure the batch recovery frame before classification",
-            ),
-        ),
+        True,
     ],
 )
 async def test_unbound_fanout_reclaims_all_admitted_calls(

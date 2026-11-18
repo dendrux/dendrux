@@ -270,20 +270,12 @@ async def _prepare_resume(
     history_records: Any = None,
     pause_data: dict[str, Any] | None = None,
     submission_projection: _SubmissionProjection | None = None,
-    recovering: bool = False,
+    recovering: bool | None = None,
 ) -> _run_contracts._ResumeContext:
-    """Build everything needed to re-enter the loop after a resume.
+    """Prepare a claimed continuation's history, recorder and frame capability.
 
-    Receives an already-loaded PauseState — does NOT load pause data or
-    claim the run. Those steps are owned by the caller (_resume_core for
-    direct resume, resume_stream for streaming, resume_claimed for
-    post-submit_and_claim resume).
-
-    Steps performed:
-      1. Record durable run.resumed event (the store allocates its index)
-      2. Build resume history (inject tool results or user input)
-      3. Create recorder with correct trace offset
-      4. Notify recorder of injected messages
+    The caller owns loading and claiming, injected-history replay and lifecycle
+    notifications, including their failure cleanup.
     """
     from dendrux.runtime.persistence import PersistenceRecorder
     from dendrux.tool import get_tool_def
@@ -354,7 +346,7 @@ async def _prepare_resume(
         **_run_images._recorder_image_kwargs(tenant_id, provider),
     )
 
-    await _managed_budget.restore_recorder(recorder, agent, history_records, recovering)
+    await _managed_budget.restore_recorder(recorder, agent, history_records, bool(recovering))
     recorder._resume_pause_data = pause_data
 
     # NOTE: lifecycle hooks (record_run_started/notify_run_started) and
@@ -363,7 +355,7 @@ async def _prepare_resume(
     # pairs with on_run_failed. See _replay_resume_injected_history below.
 
     await _run_tools._emit_declared_tools(agent, recorder, extra_notifier, run_id)
-    return _run_contracts._ResumeContext(
+    ctx = _run_contracts._ResumeContext(
         history=history,
         recorder=recorder,
         notifier=extra_notifier,
@@ -371,6 +363,10 @@ async def _prepare_resume(
         resolved_loop=resolved_loop,
         resolved_strategy=resolved_strategy,
     )
+    # Batch callers explicitly pass the recovery flag; stream preparation omits
+    # it and keeps the frame capability disabled.
+    _reclaim.configure_recovery_frame(ctx, state_store, streaming=recovering is None)
+    return ctx
 
 
 def _canonicalize_legacy_denials(

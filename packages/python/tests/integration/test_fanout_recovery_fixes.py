@@ -479,13 +479,6 @@ async def approval_phase(mode, survivors):
         )
         raise RuntimeError("approval claim cut was not reached")
     saved = json.loads(phase.read_text())
-    original_recovery = _reclaim._recover_managed_calls
-
-    async def configured(agent, ctx, *args):
-        ctx.recorder._managed_fanout_capable = True
-        return await original_recovery(agent, ctx, *args)
-
-    _reclaim._recover_managed_calls = configured
     if mode == "decisions":
         original_decision = runner._record_approval_decided
 
@@ -561,3 +554,53 @@ def install_binding_capture(store, saved):
 
 if __name__ == "__main__":
     asyncio.run(approval_phase(sys.argv[1], int(sys.argv[2])))
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_public_continuation_frame_is_configured_before_preparation_returns(
+    store, monkeypatch, streaming
+):
+    from dendrux.runtime import _run_resume_prep
+    from dendrux.types import ToolResult
+
+    @tool(target="client")
+    async def lookup() -> str:
+        """Read a value on the client."""
+        return ""
+
+    root = Agent(
+        name="root",
+        prompt="Review",
+        state_store=store,
+        tools=[lookup],
+        provider=ScriptedLLM(
+            [LLMResponse(tool_calls=[ToolCall("lookup", {})]), LLMResponse(text="done")]
+        ),
+    )
+    paused = await root.run("go", tenant_id=TENANT)
+    observed = []
+    original = _run_resume_prep._prepare_resume
+
+    async def prepare(*args, **kwargs):
+        ctx = await original(*args, **kwargs)
+        observed.append(ctx.recorder._managed_fanout_capable)
+        return ctx
+
+    monkeypatch.setattr(_run_resume_prep, "_prepare_resume", prepare)
+    call = paused.pending.tool_calls[0]
+    kwargs = dict(
+        tenant_id=TENANT,
+        expected_pause_id=paused.pause_id,
+        tool_results=[ToolResult(call_id=call.id, name=call.name, payload="value")],
+    )
+    try:
+        if streaming:
+            async with root.resume_stream(paused.run_id, **kwargs) as stream:
+                events = [event async for event in stream]
+            result = events[-1].run_result
+        else:
+            result = await root.resume(paused.run_id, **kwargs)
+        assert result.status == RunStatus.SUCCESS
+        assert observed == [not streaming]
+    finally:
+        await root.close()
