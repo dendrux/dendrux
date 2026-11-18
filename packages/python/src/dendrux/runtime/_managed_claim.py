@@ -15,7 +15,13 @@ from typing import TYPE_CHECKING, Any
 from dendrux import _codes
 from dendrux._managed_wait import MANAGED_FANOUT_SCHEMA_VERSION
 from dendrux._meta_keys import GOVERNANCE_KEY
-from dendrux.errors import ManagedStateError
+from dendrux.errors import (
+    GovernanceMismatchError,
+    ManagedResultRefusedError,
+    ManagedStateError,
+    RunNotFoundError,
+    RunNotReclaimableError,
+)
 from dendrux.runtime._fanout_adoption_state import (
     FANOUT_ADOPTION_KEY,
     adoption_marker,
@@ -42,8 +48,6 @@ def refuse_managed_results(
     Only the bound child run reports a subagent call. This holds even for a
     client pause older code persisted for it (its target stays ``agent``).
     """
-    from dendrux.errors import ManagedResultRefusedError
-
     targets = pending_targets or {}
     if any(targets.get(result.call_id) == ToolTarget.AGENT.value for result in results):
         raise ManagedResultRefusedError(run_id)
@@ -55,8 +59,6 @@ def managed_submission_descriptor(wait: PauseState, call_id: str) -> dict[str, A
     A v3 managed wait still uses the closed format-2 envelope: kind
     ``tool_results`` for exactly the bound call, at the wait's private generation.
     """
-    from dendrux.types import generate_ulid
-
     return {
         "submission_id": generate_ulid(),
         "kind": "tool_results",
@@ -71,7 +73,6 @@ def _managed_adoption_validator(
     run_id: str, pause_id: str, call_id: str, child_run_id: str
 ) -> Callable[[dict[str, Any]], None]:
     """Inside the claim: the same v3 generation, still bound to this call and child."""
-    from dendrux.errors import ManagedStateError
 
     def validate(current: dict[str, Any]) -> None:
         wait = PauseState.from_managed_dict(current, run_id=run_id)
@@ -96,7 +97,6 @@ async def _admit_managed_parent(agent: Agent, store: StateStore, run_id: str) ->
     wait generation read here, so no other claim can slip between check and use.
     Returns the saved governance view for the ``warn`` report.
     """
-    from dendrux.errors import GovernanceMismatchError, RunNotFoundError, RunNotReclaimableError
     from dendrux.runtime import (
         submit as _submit,  # cycle: submit re-exports this module (AGENTS 6.2)
     )
