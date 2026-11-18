@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from dendrux import _codes
 from dendrux.loops import _pause_shared
@@ -66,13 +66,33 @@ class SubagentTool:
 SubagentTool.__module__ = "dendrux.loops.react"
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class ManagedHandoff:
-    """In-memory loop outcome: one admitted subagent call for the runner to bind."""
+    """Admitted managed calls in order; ``call`` is the first call.
+
+    ``child`` is that first call's child, also when two or more calls are admitted.
+    """
 
     call: ToolCall
     child: Agent
     parent: Agent
+    calls: tuple[ToolCall, ...]
+
+    def __init__(
+        self,
+        call: ToolCall | None = None,
+        child: Agent | None = None,
+        parent: Agent | None = None,
+        *,
+        calls: Sequence[ToolCall] = (),
+    ) -> None:
+        ordered = tuple(calls) or ((call,) if call is not None else ())
+        if not ordered or child is None or parent is None:
+            raise ValueError("A managed handoff needs calls, a child and a parent")
+        object.__setattr__(self, "call", ordered[0])
+        object.__setattr__(self, "child", child)
+        object.__setattr__(self, "parent", parent)
+        object.__setattr__(self, "calls", ordered)
 
 
 # Preserve the class identity required by the cumulative move manifest.
@@ -270,19 +290,25 @@ def _brief_too_large(tc: ToolCall, size: int, limit: int) -> ToolResult:
 def _managed_handoff(
     ctx: _RunContext, outcome: _ToolCallOutcome, iteration: int
 ) -> RunResult | None:
-    """The single admitted managed call, handed to the runner instead of a client pause.
+    """Admitted managed calls, handed to the runner instead of a client pause.
 
     Server calls of the batch have already finished and are durable. The result
     stays RUNNING: only the runner's atomic bind parks this run.
     """
     pending = outcome.pending_calls
-    if outcome.pending_approval or len(pending) != 1:
+    if outcome.pending_approval or not pending:
         return None
-    entry = ctx.lookups.fn.get(pending[0].name)
-    if not isinstance(entry, SubagentTool):
+    entries = [ctx.lookups.fn.get(call.name) for call in pending]
+    if not all(isinstance(entry, SubagentTool) for entry in entries):
         return None
+    entry = cast("SubagentTool", entries[0])  # Every entry was narrowed by the batch check.
     result = _pause_shared._pause_result(ctx, RunStatus.RUNNING, iteration, pending_calls=pending)
     result.meta[MANAGED_HANDOFF_KEY] = ManagedHandoff(
-        call=pending[0], child=entry.agent, parent=ctx.agent
+        calls=pending, child=entry.agent, parent=ctx.agent
     )
     return result
+
+
+def loop_fanout_capable(recorder: object) -> bool:
+    """Read only this frame's explicit flag; absent flags always disable fan-out."""
+    return getattr(recorder, "_managed_fanout_capable", False) is True

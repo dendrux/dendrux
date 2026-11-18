@@ -805,11 +805,13 @@ async def test_recovered_unsupported_batch_is_refused_with_zero_effects(
             ToolCall(name="fetch", params={"x": 1}, provider_tool_call_id="p3"),
         ]
     )
+    # Pin the single-child refusal path.
     first = _recovery_root(
         store,
         ContextLLM([batch]),
         _named("reviewer", ContextLLM([])),
         _named("auditor", ContextLLM([])),
+        limits=Limits(max_parallel_subagents=1),
     )
     await _crash_at(
         monkeypatch, react, "_refuse_managed_batch", lambda: first.run("go", tenant_id=TENANT)
@@ -820,7 +822,11 @@ async def test_recovered_unsupported_batch_is_refused_with_zero_effects(
     reviewer_llm, auditor_llm = ContextLLM([]), ContextLLM([])
     root_llm = ContextLLM([LLMResponse(text="regrouped")])
     fresh = _recovery_root(
-        store, root_llm, _named("reviewer", reviewer_llm), _named("auditor", auditor_llm)
+        store,
+        root_llm,
+        _named("reviewer", reviewer_llm),
+        _named("auditor", auditor_llm),
+        limits=Limits(max_parallel_subagents=1),
     )
     result = await fresh.reclaim(root_id, tenant_id=TENANT, item=item)
 
@@ -1258,11 +1264,13 @@ async def test_r4b_partial_batch_refusal_refuses_the_rest_on_recovery(
             ToolCall(name="fetch", params={"x": 1}, provider_tool_call_id="p3"),
         ]
     )
+    # Pin the single-child refusal path.
     first = _recovery_root(
         store,
         ContextLLM([batch]),
         _named("reviewer", ContextLLM([])),
         _named("auditor", ContextLLM([])),
+        limits=Limits(max_parallel_subagents=1),
     )
     original = react._ToolBatch.reject
     done = {"n": 0}
@@ -1282,7 +1290,11 @@ async def test_r4b_partial_batch_refusal_refuses_the_rest_on_recovery(
     item = await expire(store, engine, root_id)
     root_llm = ContextLLM([LLMResponse(text="regrouped")])
     fresh = _recovery_root(
-        store, root_llm, _named("reviewer", ContextLLM([])), _named("auditor", ContextLLM([]))
+        store,
+        root_llm,
+        _named("reviewer", ContextLLM([])),
+        _named("auditor", ContextLLM([])),
+        limits=Limits(max_parallel_subagents=1),
     )
     result = await fresh.reclaim(root_id, tenant_id=TENANT, item=item)
     assert result.status == RunStatus.SUCCESS and effects == []

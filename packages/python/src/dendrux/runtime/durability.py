@@ -41,7 +41,9 @@ from dendrux.errors import (
     StatementTooLargeError,
 )
 from dendrux.errors import StoreOutcomeUnknown as StoreOutcomeUnknown
+from dendrux.runtime.state import unclaimed_store
 from dendrux.runtime.stores._errors import classify_error, error_chain
+from dendrux.runtime.tasks import _drain_cleanup
 
 _EXCEPTION_WALK_LIMIT = 1024
 
@@ -49,6 +51,9 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterator
 
     from sqlalchemy.ext.asyncio import AsyncSession
+
+    from dendrux.runtime._managed_fanout_store import BindManagedChildrenResult
+    from dendrux.runtime.state import StateStore
 
 logger = logging.getLogger(__name__)
 
@@ -172,9 +177,6 @@ async def _ownership_handoff(
     *,
     run_id: str,
 ) -> T:
-    from dendrux.runtime.state import unclaimed_store
-    from dendrux.runtime.tasks import _drain_cleanup
-
     native = unclaimed_store(store)
     marker: dict[str, Any] = {}
     token = _handoff_commit.set(marker)
@@ -204,6 +206,67 @@ async def _ownership_handoff(
                     operation.close()  # The child may have been cancelled before its first step.
             finally:
                 raise cancellation  # noqa: TRY201 - cleanup failures must not replace cancellation
+
+
+async def _fanout_ownership_handoff(
+    store: StateStore,
+    operation_factory: Callable[[], Awaitable[BindManagedChildrenResult]],
+    *,
+    run_id: str,
+) -> BindManagedChildrenResult:
+    """Retain the one bind invocation and cancel every confirmed creator claim.
+
+    The store resolves commit acknowledgement loss with its private nonce before
+    returning claims. Replaying the public request cannot recover authority.
+    A surfaced unknown outcome remains for sweep/reclaim, never a new bind.
+    """
+    native = unclaimed_store(store) or store
+    marker: dict[str, Any] = {}
+    token = _handoff_commit.set(marker)
+    try:
+        operation = operation_factory()
+    finally:
+        _handoff_commit.reset(token)
+    task = asyncio.create_task(_without_live_flush(native, operation, marker))
+    try:
+        result = await asyncio.shield(task)
+        await _flush_live_updates(native)
+        return result
+    except asyncio.CancelledError as cancellation:
+        if not marker.get("issued"):
+            task.cancel()
+        try:
+            # Any cancellation returned by the drain is later than this caller's first one.
+            await _drain_cleanup(
+                _cancel_fanout_handoff(native, task, marker, run_id=run_id), run_id=run_id
+            )
+        except asyncio.CancelledError:
+            raise cancellation from None
+        except Exception:  # noqa: BLE001, RUF100 - cleanup isolation logs failure and preserves cancellation.
+            _log_handoff_failure(marker, run_id)
+        finally:
+            try:
+                if inspect.iscoroutine(operation):
+                    operation.close()
+            finally:
+                raise cancellation  # noqa: TRY201 - preserve the first caller cancellation
+
+
+async def _cancel_fanout_handoff(
+    store: StateStore,
+    task: asyncio.Task[BindManagedChildrenResult],
+    marker: dict[str, Any],
+    *,
+    run_id: str,
+) -> None:
+    # Cycle: ledger -> run_events -> durability; defer until cancellation persistence runs.
+    from dendrux.runtime._fanout_ledger import FanoutLedger
+
+    async def cancel_bound(result: BindManagedChildrenResult) -> None:
+        ledger = FanoutLedger(result)
+        await ledger.finalize(store, ledger.close())
+
+    await _cancel_handoff(store, task, cancel_bound, marker, run_id)
 
 
 @asynccontextmanager
