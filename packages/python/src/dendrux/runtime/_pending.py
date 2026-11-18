@@ -758,8 +758,9 @@ class _PendingReader:
         Raises:
             RunNotFoundError: the run does not exist or is outside ``tenant_id``.
         """
-        pendings = await self.get_pendings(run_id, tenant_id=tenant_id)
-        return pendings[0] if pendings else None
+        self.last_view = None
+        self.last_view = view = await self.facing(run_id, tenant_id=tenant_id)
+        return view.pending
 
     async def get_pendings(self, run_id: str, *, tenant_id: TenantScope) -> list[PendingPause]:
         """Every external pause the run or its workflow waits on, in stable order (0.8).
@@ -767,9 +768,8 @@ class _PendingReader:
         Depth-first, siblings in their parent batch's call order; the first is what
         :meth:`get_pending` returns. Same scope rules and errors as :meth:`get_pending`.
         """
-        self.last_view = None
-        self.last_view = view = await self.facing(run_id, tenant_id=tenant_id)
-        return list(view.pendings)
+        await self.get_pending(run_id, tenant_id=tenant_id)  # one read; it keeps the view
+        return list(self.last_view.pendings) if self.last_view is not None else []
 
     async def _pending_of(
         self,
