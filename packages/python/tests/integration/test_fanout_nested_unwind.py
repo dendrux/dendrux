@@ -15,14 +15,22 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 from dendrux import Agent, sweep, tool
 from dendrux.db.models import AgentRun
-from dendrux.errors import RunFencedError
+from dendrux.errors import PauseStatusMismatchError, RunFencedError, RunNotPausedError
 from dendrux.loops.single import SingleCall
 from dendrux.runtime import _managed_fanout
 from dendrux.runtime.stores._factory import store_for_engine
-from dendrux.types import LLMResponse, RunStatus, ToolCall, ToolResult
+from dendrux.types import LLMResponse, RunStatus, ToolCall, ToolResult, generate_ulid
 from tests._helpers.fanout_effects import FanoutEffects
 from tests._helpers.scripted_provider import ScriptedLLM
-from tests.integration.test_fanout_adoption import observations
+from tests.integration.test_fanout_adoption import (
+    TENANT as ADOPTION_TENANT,
+)
+from tests.integration.test_fanout_adoption import (
+    Child,
+    lead,
+    observations,
+    parked,
+)
 
 TENANT = "nested-recovery"
 pytestmark = pytest.mark.parametrize("engine", ["sqlite_file", "postgres"], indirect=True)
@@ -478,6 +486,172 @@ async def test_reconnect_adopts_a_single_child_ancestor_after_nested_fanout(
     assert all(row.status == "success" for row in await records(engine))
     assert_crash_effects(effects.counts(), "chain")
     await root.close()
+
+
+@pytest.mark.parametrize("entry", ["resume", "reclaim"])
+@pytest.mark.parametrize("live", [False, True])
+async def test_tokenless_resume_matches_public_reclaim(store, engine, entry, live):
+    effects = FanoutEffects()
+    root = lead(
+        state_store=store,
+        llm=effects.provider("root", ScriptedLLM([LLMResponse(text="done")])),
+        tool_result_transform=effects.transform(),
+    )
+    fanout = await parked(store, root, [Child(status="running") if live else Child(), Child()])
+    parent = await store.get_run(fanout.run_id)
+    before = [await store.get_run(child) for child in fanout.child_ids]
+    try:
+        result = await getattr(root, entry)(fanout.run_id, tenant_id=ADOPTION_TENANT)
+        assert result.run_id == fanout.run_id
+        assert result.status == (RunStatus.RUNNING if live else RunStatus.SUCCESS)
+        assert result.pending is None and result.pendings == () and result.pause_id is None
+        assert [await store.get_run(child) for child in fanout.child_ids] == before
+        after = await store.get_run(fanout.run_id)
+        assert after.claim_epoch == parent.claim_epoch + int(not live)
+        assert after.reclaim_attempts == parent.reclaim_attempts
+        assert effects.counts().provider_calls("root") == int(not live)
+        assert effects.counts().transform_calls() == (0 if live else 2)
+        assert root.subagents[0].provider.calls == 0
+        rows = await store.get_tool_calls(fanout.run_id)
+        assert len(rows) == 2
+        assert all(row.outcome == ("started" if live else "completed") for row in rows)
+        assert len(await observations(engine, fanout.run_id)) == (0 if live else 2)
+    finally:
+        await root.close()
+
+
+@pytest.mark.parametrize(
+    "entry", ["approval", "client", "input", "submit_resume", "resume_client", "resume_input"]
+)
+async def test_tokenless_submissions_do_not_reconnect_an_all_terminal_wait(store, entry):
+    root = lead(state_store=store)
+    fanout = await parked(store, root, [Child(), Child()])
+    ids = [fanout.run_id, *fanout.child_ids]
+    before = [await store.get_run(run_id) for run_id in ids]
+    common = dict(tenant_id=ADOPTION_TENANT)
+    entries = {
+        "approval": lambda: root.submit_approval(fanout.run_id, approved=True, **common),
+        "client": lambda: root.submit_tool_results(fanout.run_id, [], **common),
+        "input": lambda: root.submit_input(fanout.run_id, "", **common),
+        "submit_resume": lambda: root.submit_resume(fanout.run_id, **common),
+        "resume_client": lambda: root.resume(fanout.run_id, tool_results=[], **common),
+        "resume_input": lambda: root.resume(fanout.run_id, user_input="", **common),
+    }
+    try:
+        with pytest.raises(RunNotPausedError):
+            await entries[entry]()
+        assert [await store.get_run(run_id) for run_id in ids] == before
+        assert root.provider.calls == 0 and root.subagents[0].provider.calls == 0
+        assert all(row.outcome == "started" for row in await store.get_tool_calls(fanout.run_id))
+    finally:
+        await root.close()
+
+
+async def test_tokenless_resume_keeps_mixed_paused_and_terminal_leaves_unchanged(store, engine):
+    effects = FanoutEffects()
+    root = workflow(store, effects)
+    paused = await root.run("go", tenant_id=TENANT)
+    rows = await records(engine)
+    assert any(row.status == "success" for row in rows)
+    assert [p.agent_path for p in paused.pendings] == [["root", "a", "a2"]]
+    before = [(await store.get_run(row.id), await store.get_tool_calls(row.id)) for row in rows]
+    counts = effects.counts()
+    try:
+        with pytest.raises(ValueError, match="pause_id"):
+            await root.resume(paused.run_id, tenant_id=TENANT)
+        assert [
+            (await store.get_run(row.id), await store.get_tool_calls(row.id)) for row in rows
+        ] == before
+        assert effects.counts() == counts
+    finally:
+        await root.close()
+
+
+async def test_tokenless_resume_preserves_a_generationless_pause_refusal(store, engine):
+    effects = FanoutEffects()
+    root = workflow(store, effects)
+    paused = await root.run("go", tenant_id=TENANT)
+    leaf_id = paused.pending.origin_run_id
+    raw = await store.get_pause_state(leaf_id)
+    raw.pop("pause_id")
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(AgentRun).where(AgentRun.id == leaf_id).values(pause_data=raw)
+        )
+    rows = await records(engine)
+    before = [await store.get_run(row.id) for row in rows]
+    counts = effects.counts()
+    try:
+        with pytest.raises(RunNotPausedError):
+            await root.resume(paused.run_id, tenant_id=TENANT)
+        assert [await store.get_run(row.id) for row in rows] == before
+        assert effects.counts() == counts
+    finally:
+        await root.close()
+
+
+@pytest.mark.parametrize("token", ["wait", "other"])
+async def test_unheld_resume_token_does_not_adopt_an_all_terminal_wait(store, token):
+    root = lead(state_store=store)
+    fanout = await parked(store, root, [Child(), Child()])
+    pause_id = fanout.pause_id if token == "wait" else generate_ulid()
+    ids = [fanout.run_id, *fanout.child_ids]
+    before = [await store.get_run(run_id) for run_id in ids]
+    try:
+        with pytest.raises(PauseStatusMismatchError) as caught:
+            await root.resume(fanout.run_id, tenant_id=ADOPTION_TENANT, expected_pause_id=pause_id)
+        assert caught.value.reason == "pause_id"
+        assert caught.value.current_pause_id is None
+        assert [await store.get_run(run_id) for run_id in ids] == before
+        assert root.provider.calls == 0 and root.subagents[0].provider.calls == 0
+    finally:
+        await root.close()
+
+
+async def test_tokenless_resume_race_adopts_once(store, engine, monkeypatch):
+    if engine.dialect.name != "postgresql":
+        pytest.skip("Independent concurrent claims require Postgres")
+    effects = FanoutEffects()
+    root = lead(
+        state_store=store,
+        llm=effects.provider("root", ScriptedLLM([LLMResponse(text="done")])),
+        tool_result_transform=effects.transform(),
+    )
+    fanout = await parked(store, root, [Child(), Child()])
+    parent = await store.get_run(fanout.run_id)
+    before = [await store.get_run(child) for child in fanout.child_ids]
+    ready, arrivals = asyncio.Event(), 0
+    original = _managed_fanout.settle_parent
+
+    async def settle(*args, **kwargs):
+        nonlocal arrivals
+        arrivals += 1
+        if arrivals == 2:
+            ready.set()
+        await asyncio.wait_for(ready.wait(), 10)
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(_managed_fanout, "settle_parent", settle)
+    try:
+        results = await asyncio.gather(
+            root.resume(fanout.run_id, tenant_id=ADOPTION_TENANT),
+            root.resume(fanout.run_id, tenant_id=ADOPTION_TENANT),
+        )
+        assert arrivals == 2 and any(result.status == RunStatus.SUCCESS for result in results)
+        assert {result.run_id for result in results} == {fanout.run_id}
+        assert effects.counts().provider_calls("root") == 1
+        assert effects.counts().transform_calls() == 2
+        assert root.subagents[0].provider.calls == 0
+        assert [await store.get_run(child) for child in fanout.child_ids] == before
+        after = await store.get_run(fanout.run_id)
+        assert after.status == "success" and after.claim_epoch == parent.claim_epoch + 1
+        rows = await store.get_tool_calls(fanout.run_id)
+        assert len(rows) == 2 and all(row.outcome == "completed" for row in rows)
+        assert len(await observations(engine, fanout.run_id)) == 2
+        events = await store.get_run_events(fanout.run_id)
+        assert sum(event.event_type == "run.completed" for event in events) == 1
+    finally:
+        await root.close()
 
 
 if __name__ == "__main__":
