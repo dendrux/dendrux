@@ -64,7 +64,7 @@ async def _seed(
     engine: Any,
     agent: Agent,
     cut: str = "claimed",
-    version: int = 4,
+    version: int = 5,
     *,
     marked: bool = True,
 ) -> tuple[str, str, str]:
@@ -224,7 +224,7 @@ async def _snapshot(engine: Any) -> dict[str, list[Any]]:
     [
         (registered, version, cut)
         for registered in (False, True)
-        for version in (4, 5, 6)
+        for version in (5, 6)
         for cut in ("parked", "claimed", "partial")
     ],
 )
@@ -239,14 +239,6 @@ async def test_reclaim_refuses_future_wait_before_claim(
     agent = _agent(store, registered)
     root, _, _ = await _seed(store, engine, agent, cut, version)
     before = await _snapshot(engine)
-    if (registered, version, cut) == (True, 4, "parked"):
-        # T5 owns the outcome; this boundary checks only durable and provider effects.
-        with contextlib.suppress(Exception):
-            await agent.reclaim(root, tenant_id=TENANT)
-        assert await _snapshot(engine) == before
-        assert agent.provider.calls == 0
-        assert all(child.provider.calls == 0 for child in agent.subagents)
-        return
     with (
         caplog.at_level(logging.WARNING),
         pytest.raises((RunControlError, PersistenceError)) as exc,
@@ -272,7 +264,7 @@ async def test_reclaim_refuses_future_wait_before_claim(
 )
 async def test_reclaim_checks_both_saved_formats(store: Any, engine: Any, marker: str) -> None:
     agent = _agent(store, False)
-    root, call, child = await _seed(store, engine, agent)
+    root, call, child = await _seed(store, engine, agent, version=4)
     state = await store.get_loop_state(root)
     raw = await store.get_pause_state(root)
     valid = {"tool_call_id": call, "child_run_id": child, "pause_id": raw["pause_id"]}
@@ -298,8 +290,14 @@ async def test_reclaim_checks_both_saved_formats(store: Any, engine: Any, marker
     with pytest.raises((RunControlError, PersistenceError)) as exc:
         await agent.reclaim(root, tenant_id=TENANT)
     assert await _snapshot(engine) == before
-    assert isinstance(exc.value, RunNotReclaimableError)
-    assert exc.value.reason == "pause_format_unsupported"
+    record = await store.get_run(root)
+    assert (record.claim_epoch, record.reclaim_attempts) == (7, 1)
+    if marker == "pause_only":
+        assert isinstance(exc.value, ManagedStateError)
+        assert exc.value.reason == "binding_conflict"
+    else:
+        assert isinstance(exc.value, RunNotReclaimableError)
+        assert exc.value.reason == "pause_format_unsupported"
 
 
 @pytest.mark.parametrize(
@@ -342,12 +340,7 @@ async def test_other_entries_leave_future_workflow_untouched(
         )
         assert adopted is False
     else:
-        # A parked v4 root with registered subagents is routed as a fan-out (0.8);
-        # this test observes only that nothing changes.
-        refusals = (
-            (Exception,) if registered and cut == "parked" else (RunControlError, PersistenceError)
-        )
-        with contextlib.suppress(*refusals):
+        with contextlib.suppress(RunControlError, PersistenceError):
             await _enter(operation, agent, run_store, root, call, None)
     assert await _snapshot(engine) == before
     assert agent.provider.calls == 0
@@ -401,7 +394,7 @@ async def test_token_bearing_entries_leave_future_workflow_untouched(
 ) -> None:
     """A token never claims a fan-out wait: neither the wait's own generation nor any other."""
     agent = _agent(store, registered)
-    root, call, _ = await _seed(store, engine, agent, cut)
+    root, call, _ = await _seed(store, engine, agent, cut, version=4)
     pause_id = (await store.get_pause_state(root))["pause_id"] if token == "wait" else None
     before = await _snapshot(engine)
     with pytest.raises((RunControlError, PersistenceError, ValueError)):
@@ -566,7 +559,7 @@ async def test_malformed_v4_wait_refuses_before_claim(
     store: Any, engine: Any, shape: str, entry: str
 ) -> None:
     agent = _agent(store)
-    root, _, _ = await _seed(store, engine, agent, "parked")
+    root, _, _ = await _seed(store, engine, agent, "parked", version=4)
     raw = await store.get_pause_state(root)
     envelope = raw["managed_fanout"]
     if shape == "single_binding":
