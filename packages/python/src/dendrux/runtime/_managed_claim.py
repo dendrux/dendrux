@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 from functools import partial
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from dendrux import _codes
 from dendrux._managed_wait import MANAGED_FANOUT_SCHEMA_VERSION
@@ -27,8 +27,9 @@ from dendrux.runtime._fanout_adoption_state import (
     adoption_marker,
     adoption_payload,
 )
+from dendrux.runtime._pending import _accepts_tenant
 from dendrux.runtime.durability import _ownership_handoff
-from dendrux.runtime.state import ClaimResult, claimed_store
+from dendrux.runtime.state import UNSCOPED, ClaimResult, _Unscoped, claimed_store
 from dendrux.types import PauseState, RunStatus, ToolResult, ToolTarget, generate_ulid
 
 logger = logging.getLogger("dendrux.runtime.submit")  # the original module's logger name
@@ -37,7 +38,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
 
     from dendrux.agent import Agent
-    from dendrux.runtime.state import StateStore
+    from dendrux.runtime.state import RunRecord, StateStore, TenantScope
 
 
 def refuse_managed_results(
@@ -88,21 +89,24 @@ def _managed_adoption_validator(
     return validate
 
 
-async def _admit_managed_parent(agent: Agent, store: StateStore, run_id: str) -> dict[str, Any]:
+async def _admit_managed_parent(
+    agent: Agent, store: StateStore, run_id: str, *, tenant_id: TenantScope = UNSCOPED
+) -> dict[str, Any]:
     """The parent's current definition may accept the report: name, governance, skills.
 
     The same admission an ordinary reclaim or submission applies, before any
     claim or write. The saved evidence (run governance snapshot, checkpoint
     skill pins) changes only under a claim, and the claim below is a CAS on the
     wait generation read here, so no other claim can slip between check and use.
-    Returns the saved governance view for the ``warn`` report.
+    Returns the saved governance view for the ``warn`` report. With a
+    ``tenant_id`` (0.8 fan-out), a parent outside that tenant reads as missing.
     """
     from dendrux.runtime import (
         submit as _submit,  # cycle: submit re-exports this module (AGENTS 6.2)
     )
     from dendrux.skills._session import SkillSession
 
-    record = await store.get_run(run_id)
+    record = await scoped_run(store, run_id, tenant_id)
     if record is None:
         raise RunNotFoundError(run_id)
     if record.agent_name != agent.name:
@@ -257,14 +261,18 @@ async def claim_fanout_adoption(
     agent: Agent,
     pause_id: str,
     bindings: Sequence[tuple[str, str]],
+    tenant_id: str | None,
 ) -> ClaimResult | bool:
     """Claim a parent parked at fan-out wait ``pause_id`` for the adoption of its children.
 
     Nothing is built, transformed or projected here: the claim records only the
-    call ids. Returns False when the parent is no longer at that wait or another
-    caller won the claim (a loser writes nothing).
+    call ids. ``tenant_id`` is the workflow's validated tenant: the parent is
+    admitted only within it, before its pause is read. Returns False when the
+    parent is no longer at that wait or another caller won the claim (a loser
+    writes nothing).
 
     Raises:
+        RunNotFoundError: the parent does not exist within ``tenant_id``.
         ManagedStateError: ``binding_conflict`` when the wait at ``pause_id``
             binds other children or another call order (refused in the claim).
     """
@@ -272,6 +280,7 @@ async def claim_fanout_adoption(
         submit as _submit,  # cycle: submit re-exports this module (AGENTS 6.2)
     )
 
+    governance = await _admit_managed_parent(agent, store, run_id, tenant_id=tenant_id)
     raw = await store.get_pause_state(run_id)
     if (
         raw is None
@@ -279,7 +288,6 @@ async def claim_fanout_adoption(
         or raw.get("pause_id") != pause_id
     ):
         return False
-    governance = await _admit_managed_parent(agent, store, run_id)
     wait = PauseState.from_managed_dict(raw, run_id=run_id)
     call_ids = [call_id for call_id, _ in bindings]
     operation = partial(
@@ -300,3 +308,18 @@ async def claim_fanout_adoption(
             agent, claimed_store(store, run_id, won), run_id, governance
         )
     return won
+
+
+async def scoped_run(store: Any, run_id: str, tenant_id: TenantScope) -> RunRecord | None:
+    """The run within ``tenant_id``, or None (missing and foreign alike); unscoped reads as 0.7.
+
+    The built-in store applies the scope in the query; a store whose ``get_run``
+    takes no scope gets the same answer from the record's own tenant.
+    """
+    if isinstance(tenant_id, _Unscoped):
+        return cast("RunRecord | None", await store.get_run(run_id))
+    getter = store.get_run
+    record = await (
+        getter(run_id, tenant_id=tenant_id) if _accepts_tenant(getter) else getter(run_id)
+    )
+    return record if record is not None and record.tenant_id == tenant_id else None

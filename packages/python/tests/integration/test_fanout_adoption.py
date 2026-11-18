@@ -301,8 +301,8 @@ async def adopt_with_cut(
     return await recover(store, engine, fanout.run_id, root)
 
 
-async def recover(store: Any, engine: Any, run_id: str, agent: Agent) -> ClaimResult:
-    """A new recovery claim (new epoch) and the internal completion-resume entry."""
+async def recovery_claim(store: Any, engine: Any, run_id: str, agent: Agent) -> ClaimResult:
+    """A new recovery claim (new epoch) of a parent left running in its adoption."""
     item = await expire(store, engine, run_id)
     claim = await store.reclaim_run(
         run_id,
@@ -315,7 +315,16 @@ async def recover(store: Any, engine: Any, run_id: str, agent: Agent) -> ClaimRe
         loop_type="react",
     )
     assert isinstance(claim, ClaimResult)
-    return await finish_fanout_adoption(agent, claimed_store(store, run_id, claim), run_id, claim)
+    return claim
+
+
+async def recover(
+    store: Any, engine: Any, run_id: str, agent: Agent, *, tenant_id: str | None = TENANT
+) -> ClaimResult:
+    """A recovery claim, then the internal completion-resume entry under ``tenant_id``."""
+    claim = await recovery_claim(store, engine, run_id, agent)
+    owned = claimed_store(store, run_id, claim)
+    return await finish_fanout_adoption(agent, owned, run_id, claim, tenant_id=tenant_id)
 
 
 @pytest.fixture(autouse=True)
@@ -764,3 +773,186 @@ async def test_adoption_statements_are_a_constant_per_call(store: Any, engine: A
     # claim transaction; one intent read; per call two child reads, one mapping read and
     # one completion transaction).
     assert per_call <= 9 and totals[2] - 2 * per_call <= 9, totals
+
+
+# ---------------------------------------------------------------------------
+# Review fix P1-1: only truthful evidence makes a row resolved
+# ---------------------------------------------------------------------------
+
+
+async def _tamper_row(engine: Any, fanout: Fanout, index: int, **values: Any) -> None:
+    from sqlalchemy import update
+
+    async with engine.begin() as conn:
+        await conn.execute(
+            update(ToolCallRecord)
+            .where(
+                ToolCallRecord.agent_run_id == fanout.run_id,
+                ToolCallRecord.tool_call_id == fanout.calls[index].id,
+            )
+            .values(**values)
+        )
+
+
+async def _drop_pending(store: Any, engine: Any, fanout: Fanout, index: int) -> None:
+    from sqlalchemy import update
+
+    state = await store.get_loop_state(fanout.run_id)
+    state["pending"] = [p for p in state["pending"] if p["call_id"] != fanout.calls[index].id]
+    async with engine.begin() as conn:
+        await conn.execute(
+            update(AgentRun).where(AgentRun.id == fanout.run_id).values(loop_state=state)
+        )
+
+
+async def _assert_no_completion(engine: Any, fanout: Fanout, effects: FanoutEffects) -> None:
+    assert effects.counts().transform_calls() == 0
+    assert await observations(engine, fanout.run_id) == []
+    assert await completed_events(engine, fanout.run_id) == []
+    rows = await intents(engine, fanout.run_id, fanout)
+    assert [r.outcome for r in rows[1:]] == ["started"] * (len(rows) - 1)
+
+
+@pytest.mark.parametrize("pending", ["kept", "removed"])
+@pytest.mark.parametrize("outcome", ["completed", "failed"])
+async def test_a_resolved_row_without_a_digest_is_refused(
+    store: Any, engine: Any, outcome: str, pending: str
+) -> None:
+    effects = FanoutEffects()
+    root = lead(tool_result_transform=effects.transform())
+    fanout = await parked(store, root, [Child("a"), Child("b")])
+    await _tamper_row(engine, fanout, 0, outcome=outcome, content_digest=None)
+    if pending == "removed":
+        await _drop_pending(store, engine, fanout, 0)
+    with pytest.raises(ManagedStateError) as refused:
+        await adopt_settled(store, node_of(fanout, root))
+    assert refused.value.reason == "binding_conflict"
+    await _assert_no_completion(engine, fanout, effects)
+
+
+async def test_a_resolved_row_bound_to_another_child_is_refused(store: Any, engine: Any) -> None:
+    effects = FanoutEffects()
+    root = lead(tool_result_transform=effects.transform())
+    fanout = await parked(store, root, [Child("a"), Child("b")])
+    managed = {"v": 1, "child_run_id": generate_ulid(), "bind": "x"}
+    await _tamper_row(
+        engine, fanout, 0, outcome="completed", content_digest="d" * 64, meta={"managed": managed}
+    )
+    await _drop_pending(store, engine, fanout, 0)
+    with pytest.raises(ManagedStateError) as refused:
+        await adopt_settled(store, node_of(fanout, root))
+    assert refused.value.reason == "binding_conflict"
+    await _assert_no_completion(engine, fanout, effects)
+
+
+@pytest.mark.parametrize("case", ["resolved_still_pending", "started_not_pending"])
+async def test_rows_and_pending_membership_must_agree(store: Any, engine: Any, case: str) -> None:
+    effects = FanoutEffects()
+    root = lead(tool_result_transform=effects.transform())
+    fanout = await parked(store, root, [Child("a"), Child("b")])
+    if case == "resolved_still_pending":
+        await _tamper_row(engine, fanout, 0, outcome="completed", content_digest="d" * 64)
+    else:
+        await _drop_pending(store, engine, fanout, 1)
+    with pytest.raises(ManagedStateError) as refused:
+        await adopt_settled(store, node_of(fanout, root))
+    assert refused.value.reason == "binding_conflict"
+    await _assert_no_completion(engine, fanout, effects)
+
+
+async def test_recovery_refuses_a_digestless_row(store: Any, engine: Any, monkeypatch: Any) -> None:
+    effects = FanoutEffects()
+    root = lead(tool_result_transform=effects.transform())
+    fanout = await parked(store, root, [Child("a"), Child("b")])
+    with monkeypatch.context() as patch:
+        crash_on_completion(patch, store, 1)
+        with pytest.raises(CrashError):
+            await adopt_settled(store, node_of(fanout, root))
+    await _tamper_row(engine, fanout, 0, outcome="completed", content_digest=None)
+    await _drop_pending(store, engine, fanout, 0)
+    before = effects.counts().transform_calls()
+    with pytest.raises(ManagedStateError) as refused:
+        await recover(store, engine, fanout.run_id, root)
+    assert refused.value.reason == "binding_conflict"
+    assert effects.counts().transform_calls() == before
+    assert await observations(engine, fanout.run_id) == []
+
+
+# ---------------------------------------------------------------------------
+# Review fix P1-2: the validated tenant scopes the parent and every child
+# ---------------------------------------------------------------------------
+
+
+def _spy_child_state_reads(monkeypatch: Any, store: Any) -> list[str]:
+    reads: list[str] = []
+    real = store.get_loop_state
+
+    async def get_loop_state(run_id: str) -> Any:
+        reads.append(run_id)
+        return await real(run_id)
+
+    monkeypatch.setattr(store, "get_loop_state", get_loop_state)
+    return reads
+
+
+async def _move_to_tenant(engine: Any, run_id: str, tenant: str) -> None:
+    from sqlalchemy import update
+
+    async with engine.begin() as conn:
+        await conn.execute(update(AgentRun).where(AgentRun.id == run_id).values(tenant_id=tenant))
+
+
+async def test_a_node_with_a_foreign_tenant_is_refused_before_the_claim(
+    store: Any, engine: Any
+) -> None:
+    from dendrux.errors import RunNotFoundError
+
+    effects = FanoutEffects()
+    root = lead(tool_result_transform=effects.transform())
+    fanout = await parked(store, root, [Child("a"), Child("b")])
+    with pytest.raises(RunNotFoundError):
+        await adopt_settled(store, replace(node_of(fanout, root), tenant_id="t2"))
+    row = await parent_row(engine, fanout.run_id)
+    assert (row.status, row.claim_epoch) == (RunStatus.PAUSED.value, 1)
+    await _assert_no_completion(engine, fanout, effects)
+
+
+async def test_a_foreign_tenant_child_is_refused_before_its_checkpoint(
+    store: Any, engine: Any, monkeypatch: Any
+) -> None:
+    effects = FanoutEffects()
+    root = lead(tool_result_transform=effects.transform())
+    fanout = await parked(store, root, [Child("a"), Child("b")])
+    await _move_to_tenant(engine, fanout.child_ids[1], "t2")
+    reads = _spy_child_state_reads(monkeypatch, store)
+    with pytest.raises(ManagedStateError) as refused:
+        await adopt_settled(store, node_of(fanout, root))
+    assert refused.value.reason == "child_mismatch"
+    assert fanout.child_ids[1] not in reads
+    assert transform_counts(effects, fanout) == [1, 0]
+    rows = await intents(engine, fanout.run_id, fanout)
+    assert [r.outcome for r in rows] == ["completed", "started"]
+
+
+async def test_recovery_refuses_a_foreign_tenant(store: Any, engine: Any, monkeypatch: Any) -> None:
+    from dendrux.errors import RunNotFoundError
+
+    effects = FanoutEffects()
+    root = lead(tool_result_transform=effects.transform())
+    fanout = await parked(store, root, [Child("a"), Child("b")])
+    with monkeypatch.context() as patch:
+        crash_on_completion(patch, store, 1)
+        with pytest.raises(CrashError):
+            await adopt_settled(store, node_of(fanout, root))
+    claim = await recovery_claim(store, engine, fanout.run_id, root)
+    owned = claimed_store(store, fanout.run_id, claim)
+    with pytest.raises(RunNotFoundError):
+        await finish_fanout_adoption(root, owned, fanout.run_id, claim, tenant_id="t2")
+    await _move_to_tenant(engine, fanout.child_ids[0], "t2")
+    reads = _spy_child_state_reads(monkeypatch, store)
+    with pytest.raises(ManagedStateError) as refused:
+        await finish_fanout_adoption(root, owned, fanout.run_id, claim, tenant_id=TENANT)
+    assert refused.value.reason == "child_mismatch"
+    assert fanout.child_ids[0] not in reads
+    assert effects.counts().transform_calls() == 1  # only the first, pre-cut attempt
+    assert await observations(engine, fanout.run_id) == []

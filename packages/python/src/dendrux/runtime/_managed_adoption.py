@@ -19,22 +19,22 @@ from typing import TYPE_CHECKING, Any
 from dendrux import _codes
 from dendrux._lifecycle import TERMINAL_STATUSES
 from dendrux._managed_wait import MANAGED_FANOUT_SCHEMA_VERSION
-from dendrux.errors import ManagedStateError
+from dendrux.errors import ManagedStateError, RunNotFoundError
 from dendrux.runtime import _managed_budget, _managed_cancel, _managed_persistence
 from dendrux.runtime._blocked_content import _blocked_evidence
 from dendrux.runtime._bounds import MAX_PAGE
 from dendrux.runtime._fanout_adoption_state import (
-    RESOLVED_OUTCOMES,
     IntentRow,
     adoption_payload,
     fanout_adoption,
     resolved_prefix,
 )
-from dendrux.runtime._managed_claim import claim_fanout_adoption
+from dendrux.runtime._managed_claim import claim_fanout_adoption, scoped_run
 from dendrux.runtime._managed_route import (
     _registered,
     _Waiting,
 )
+from dendrux.runtime._pending import _accepts_tenant
 from dendrux.runtime.state import MANAGED_HEADER_KEY, ClaimResult, ManagedHeader, claimed_store
 from dendrux.types import PauseState, RunStatus, ToolCall, ToolResult, ToolTarget
 
@@ -215,16 +215,8 @@ class _FanoutParent:
     agent: Agent
     run_id: str
     root_run_id: str
+    tenant_id: str | None
     calls: tuple[FanoutCall, ...]
-
-
-_RESOLVED_BY_CONTRACT = "complete_tool_call"
-"""Stands in for a resolved row's content digest, which the tool-call read model omits.
-
-A row leaves ``started`` only through ``complete_tool_call``, which always writes the
-digest (store contract K9). The row's ``meta.managed`` binding is not in the read model
-either; each child's own header is checked against its call before its completion.
-"""
 
 
 async def adopt_settled(store: Any, node: WaitNode) -> ClaimResult | None:
@@ -240,7 +232,12 @@ async def adopt_settled(store: Any, node: WaitNode) -> ClaimResult | None:
     if await _managed_cancel.cancellation_requested(store, node.run_id):
         return None
     claim = await claim_fanout_adoption(
-        store, node.run_id, agent=node.agent, pause_id=node.pause_id, bindings=node.bindings
+        store,
+        node.run_id,
+        agent=node.agent,
+        pause_id=node.pause_id,
+        bindings=node.bindings,
+        tenant_id=node.tenant_id,
     )
     if not isinstance(claim, ClaimResult):
         return None
@@ -258,11 +255,13 @@ async def adopt_fanout(store: Any, node: WaitNode, claim: ClaimResult) -> ClaimR
             v4 adoption or its rows are not a resolved prefix; ``child_mismatch``
             when a child is not terminal or is bound elsewhere.
     """
-    return await _adopt(store, _parent_of(node), claim, node.iteration)
+    parent = _parent_of(node)
+    await _require_parent(store, parent.run_id, parent.tenant_id)
+    return await _adopt(store, parent, claim, node.iteration)
 
 
 async def finish_fanout_adoption(
-    agent: Agent, owned: Any, run_id: str, claim: ClaimResult
+    agent: Agent, owned: Any, run_id: str, claim: ClaimResult, *, tenant_id: str | None
 ) -> ClaimResult:
     """Recovery: complete a claimed v4 adoption from its persisted state, rows still started only.
 
@@ -270,17 +269,19 @@ async def finish_fanout_adoption(
     holds the v4 adoption marker (``fanout_adoption``). Call order comes from the
     claimed pause's ``bindings`` list, which must equal the marker's calls and the
     claim payload's; each call is rebuilt from its intent row and the parent's
-    registered subagents. Resolved rows are never recomputed.
+    registered subagents. Resolved rows are never recomputed. ``tenant_id`` is
+    the workflow's validated tenant: the parent and every child are read within it.
     """
+    await _require_parent(owned, run_id, tenant_id)
     state = claim.loop_state or {}
     ids = fanout_adoption(state, run_id=run_id)
     if ids is None:
         raise ManagedStateError(reason=_CONFLICT, run_id=run_id)
     wait = await _claimed_wait(owned, run_id, ids)
     header = ManagedHeader.from_dict(state.get(MANAGED_HEADER_KEY), run_id=run_id)
-    rows = await _iteration_rows(owned, run_id, wait.iteration)
+    rows = await _iteration_rows(owned, run_id, wait.iteration, tenant_id)
     calls = _recovered_calls(agent, header.path, wait, rows, run_id)
-    parent = _FanoutParent(agent, run_id, header.root_run_id, calls)
+    parent = _FanoutParent(agent, run_id, header.root_run_id, tenant_id, calls)
     return await _complete_calls(claimed_store(owned, run_id, claim), parent, claim, rows)
 
 
@@ -295,14 +296,20 @@ def _parent_of(node: WaitNode) -> _FanoutParent:
         for child in node.children
         if child.call is not None
     )
-    return _FanoutParent(node.agent, node.run_id, node.root_run_id, calls)
+    return _FanoutParent(node.agent, node.run_id, node.root_run_id, node.tenant_id, calls)
+
+
+async def _require_parent(store: Any, run_id: str, tenant_id: str | None) -> None:
+    """The adopting parent exists within the workflow's validated tenant."""
+    if await scoped_run(store, run_id, tenant_id) is None:
+        raise RunNotFoundError(run_id)
 
 
 async def _adopt(
     store: Any, parent: _FanoutParent, claim: ClaimResult, iteration: int
 ) -> ClaimResult:
     owned = claimed_store(store, parent.run_id, claim)
-    rows = await _iteration_rows(owned, parent.run_id, iteration)
+    rows = await _iteration_rows(owned, parent.run_id, iteration, parent.tenant_id)
     return await _complete_calls(owned, parent, claim, rows)
 
 
@@ -314,10 +321,15 @@ async def _complete_calls(
     bindings = [(item.call.id, item.child_run_id) for item in parent.calls]
     if fanout_adoption(claim.loop_state, run_id=run_id) != tuple(c for c, _ in bindings):
         raise ManagedStateError(reason=_CONFLICT, run_id=run_id)
-    done = resolved_prefix(_intent_rows(rows, parent.calls), bindings, run_id=run_id)
-    if done == len(bindings):  # the last completion clears the marker in its own transaction
-        raise ManagedStateError(reason=_CONFLICT, run_id=run_id)
+    done = resolved_prefix(_intent_rows(rows), bindings, run_id=run_id)
     state = dict(claim.loop_state or {})
+    pending = {p.get("call_id") for p in state.get("pending", []) if isinstance(p, dict)}
+    # The last completion clears the marker in its own transaction, so at least one call
+    # is unresolved; exactly the unresolved calls are still pending in the checkpoint.
+    if done == len(bindings) or [c in pending for c, _ in bindings] != [
+        position >= done for position in range(len(bindings))
+    ]:
+        raise ManagedStateError(reason=_CONFLICT, run_id=run_id)
     for item in parent.calls[done:]:
         state = await _complete_call(owned, parent, item, claim.claim_epoch, state)
     return ClaimResult(claim.claim_epoch, claim.storage_format, state, None)
@@ -355,18 +367,23 @@ async def _complete_call(
 async def _terminal_child(
     owned: Any, parent: _FanoutParent, item: FanoutCall
 ) -> tuple[RunRecord, dict[str, Any]]:
-    """The child's terminal record and checkpoint; it must answer this call of this parent."""
-    record = await owned.get_run(item.child_run_id)
+    """The child's terminal record and checkpoint; it must answer this call of this parent.
+
+    The child is read within the parent's tenant, and its checkpoint only after its
+    run proves the parent link: a child outside the tenant is refused unread.
+    """
+    record = await scoped_run(owned, item.child_run_id, parent.tenant_id)
+    if record is None or record.parent_run_id != parent.run_id:
+        raise ManagedStateError(reason="child_mismatch", run_id=parent.run_id)
     state = await owned.get_loop_state(item.child_run_id)
-    if record is None or state is None:
+    if state is None:
         raise ManagedStateError(reason="child_missing", run_id=parent.run_id)
     header = ManagedHeader.from_dict(state.get(MANAGED_HEADER_KEY), run_id=item.child_run_id)
-    if (
-        record.status not in _TERMINAL
-        or record.parent_run_id != parent.run_id
-        or (header.root_run_id, header.parent_run_id, header.tool_call_id)
-        != (parent.root_run_id, parent.run_id, item.call.id)
-    ):
+    if record.status not in _TERMINAL or (
+        header.root_run_id,
+        header.parent_run_id,
+        header.tool_call_id,
+    ) != (parent.root_run_id, parent.run_id, item.call.id):
         raise ManagedStateError(reason="child_mismatch", run_id=parent.run_id)
     return record, state
 
@@ -412,28 +429,31 @@ def _recovered_calls(
     return tuple(calls)
 
 
-def _intent_rows(
-    records: list[ToolCallReadRecord], calls: tuple[FanoutCall, ...]
-) -> list[IntentRow]:
-    """The prefix check's view of the iteration's rows, from the public read model."""
-    bound = {item.call.id: item.child_run_id for item in calls}
+def _intent_rows(records: list[ToolCallReadRecord]) -> list[IntentRow]:
+    """The prefix check's view of the iteration's rows: only what the store read back.
+
+    A row counts as resolved only with its persisted digest and its persisted
+    binding; a store that does not return them makes every such row refuse.
+    """
     return [
-        IntentRow(
-            record.tool_call_id,
-            record.outcome,
-            _RESOLVED_BY_CONTRACT if record.outcome in RESOLVED_OUTCOMES else None,
-            bound.get(record.tool_call_id) if record.target == ToolTarget.AGENT.value else None,
-        )
-        for record in records
+        IntentRow(r.tool_call_id, r.outcome, r.content_digest, r.managed_child_run_id)
+        for r in records
     ]
 
 
-async def _iteration_rows(store: Any, run_id: str, iteration: int) -> list[ToolCallReadRecord]:
-    """The wait's own iteration rows (one model batch, bounded by ``max_pending_calls``)."""
+async def _iteration_rows(
+    store: Any, run_id: str, iteration: int, tenant_id: str | None
+) -> list[ToolCallReadRecord]:
+    """The wait's own iteration rows (one model batch, bounded by ``max_pending_calls``).
+
+    Scoped to ``tenant_id`` when the store's read takes a scope; the parent's own
+    scoped read has already established its identity either way.
+    """
+    scope = {"tenant_id": tenant_id} if _accepts_tenant(store.get_tool_calls) else {}
     rows: list[ToolCallReadRecord] = []
     while True:
         page = await store.get_tool_calls(
-            run_id, iteration_index=iteration, limit=MAX_PAGE, offset=len(rows)
+            run_id, iteration_index=iteration, limit=MAX_PAGE, offset=len(rows), **scope
         )
         rows.extend(page)
         if len(page) < MAX_PAGE:
