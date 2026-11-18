@@ -1,25 +1,37 @@
-"""Managed-subagent submission helpers for the submit methods (0.7).
+"""Managed-subagent claims: accepting children's outcomes into a waiting parent.
 
-Moved out of ``dendrux.runtime.submit``, which imports every name back so
-existing callers and patch seams are unchanged.
+The 0.7 helpers for one child (moved out of ``dendrux.runtime.submit``, which
+imports every name back so existing callers and patch seams are unchanged), and
+the 0.8 claim of a fan-out wait: one ``submit_and_claim`` that records the
+ids-only adoption marker before any report is built (spec §7.3).
 """
 
 from __future__ import annotations
 
 import logging
+from functools import partial
 from typing import TYPE_CHECKING, Any
 
 from dendrux import _codes
+from dendrux._managed_wait import MANAGED_FANOUT_SCHEMA_VERSION
 from dendrux._meta_keys import GOVERNANCE_KEY
-from dendrux.types import PauseState, RunStatus, ToolResult, ToolTarget
+from dendrux.errors import ManagedStateError
+from dendrux.runtime._fanout_adoption_state import (
+    FANOUT_ADOPTION_KEY,
+    adoption_marker,
+    adoption_payload,
+)
+from dendrux.runtime.durability import _ownership_handoff
+from dendrux.runtime.state import ClaimResult, claimed_store
+from dendrux.types import PauseState, RunStatus, ToolResult, ToolTarget, generate_ulid
 
 logger = logging.getLogger("dendrux.runtime.submit")  # the original module's logger name
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping
+    from collections.abc import Callable, Mapping, Sequence
 
     from dendrux.agent import Agent
-    from dendrux.runtime.state import ClaimResult, StateStore
+    from dendrux.runtime.state import StateStore
 
 
 def refuse_managed_results(
@@ -184,3 +196,107 @@ def _refuse_tokenless_managed(run_id: str, checkpoint: dict[str, Any] | None) ->
     if (checkpoint or {}).get(MANAGED_HEADER_KEY) is not None:
         _codes.log_code(logger, _codes.MANAGED_PAUSE_ID_REQUIRED, run_id=run_id)
         raise _submit._pause_id_required()
+
+
+# ---------------------------------------------------------------------------
+# 0.8: the claim of a fan-out wait (spec §7.3)
+# ---------------------------------------------------------------------------
+
+
+def fanout_submission_descriptor(
+    pause_id: str, call_ids: Sequence[str], *, reserved_order_index: int
+) -> dict[str, Any]:
+    """The format-2 descriptor of a v4 adoption claim: every call, in call order, and the marker.
+
+    The 0.7 managed descriptor's fields with all N call ids and
+    ``managed_fanout_adoption={"v": 1}``. The store copies it (without
+    ``payload``) into the claimed checkpoint, where recovery recognizes it.
+    """
+    return {
+        "submission_id": generate_ulid(),
+        "kind": "tool_results",
+        "pause_id": pause_id,
+        "payload_ref": {"pause_data_key": "submission"},
+        "call_ids": list(call_ids),
+        "reserved_order_index": reserved_order_index,
+        FANOUT_ADOPTION_KEY: adoption_marker(),
+    }
+
+
+def fanout_adoption_validator(
+    run_id: str, pause_id: str, bindings: Sequence[tuple[str, str]]
+) -> Callable[[dict[str, Any]], None]:
+    """Inside the claim, under the row lock: still this v4 generation, these bindings, in order.
+
+    ``bindings`` are the ``(tool_call_id, child_run_id)`` pairs the caller read
+    terminal. Any other current pause refuses ``binding_conflict``, which rolls
+    the claim back.
+    """
+    expected = tuple((call_id, child_run_id) for call_id, child_run_id in bindings)
+
+    def validate(current: dict[str, Any]) -> None:
+        try:
+            fanout = PauseState.from_managed_dict(current, run_id=run_id).managed_fanout
+        except ManagedStateError:
+            fanout = None  # not a valid managed wait: refused below like any other wait
+        bound = (
+            ()
+            if fanout is None
+            else tuple((b.tool_call_id, b.child_run_id) for b in fanout.bindings)
+        )
+        if current.get("pause_id") != pause_id or bound != expected:
+            raise ManagedStateError(reason="binding_conflict", run_id=run_id)
+
+    return validate
+
+
+async def claim_fanout_adoption(
+    store: StateStore,
+    run_id: str,
+    *,
+    agent: Agent,
+    pause_id: str,
+    bindings: Sequence[tuple[str, str]],
+) -> ClaimResult | bool:
+    """Claim a parent parked at fan-out wait ``pause_id`` for the adoption of its children.
+
+    Nothing is built, transformed or projected here: the claim records only the
+    call ids. Returns False when the parent is no longer at that wait or another
+    caller won the claim (a loser writes nothing).
+
+    Raises:
+        ManagedStateError: ``binding_conflict`` when the wait at ``pause_id``
+            binds other children or another call order (refused in the claim).
+    """
+    from dendrux.runtime import (
+        submit as _submit,  # cycle: submit re-exports this module (AGENTS 6.2)
+    )
+
+    raw = await store.get_pause_state(run_id)
+    if (
+        raw is None
+        or raw.get("schema_version") != MANAGED_FANOUT_SCHEMA_VERSION
+        or raw.get("pause_id") != pause_id
+    ):
+        return False
+    governance = await _admit_managed_parent(agent, store, run_id)
+    wait = PauseState.from_managed_dict(raw, run_id=run_id)
+    call_ids = [call_id for call_id, _ in bindings]
+    operation = partial(
+        store.submit_and_claim,
+        run_id,
+        expected_status=RunStatus.PAUSED.value,
+        submitted_data=adoption_payload(call_ids),
+        submission=fanout_submission_descriptor(
+            pause_id, call_ids, reserved_order_index=wait.trace_order_offset
+        ),
+        validate=fanout_adoption_validator(run_id, pause_id, bindings),
+    )
+    won: ClaimResult | bool = await _ownership_handoff(
+        store, operation, partial(_submit._cancel_claim, store, run_id), run_id=run_id
+    )
+    if isinstance(won, ClaimResult):
+        await _submit.report_governance_change(
+            agent, claimed_store(store, run_id, won), run_id, governance
+        )
+    return won
