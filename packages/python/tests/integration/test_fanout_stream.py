@@ -320,13 +320,21 @@ async def test_q1_zero_event_children_end_the_loop_and_fan_in(
         await close_all(root, *children)
 
 
-def _full_gate(monkeypatch: Any) -> asyncio.Event:
+class _FullGate(asyncio.Event):
+    """Set once a producer finds the stream queue full; ``blocked`` names its run."""
+
+    blocked: set[str | None]
+
+
+def _full_gate(monkeypatch: Any) -> _FullGate:
     """Set once a producer finds the stream queue full (it is about to block)."""
-    full = asyncio.Event()
+    full = _FullGate()
+    full.blocked = set()
     original = _managed_stream.FanoutStream._put
 
     async def put(self: Any, event: Any) -> None:
         if self.queue.full():
+            full.blocked.add(event.run_id)
             full.set()
         await original(self, event)
 
@@ -541,8 +549,22 @@ async def test_q5_q6_close_runs_the_exit_path_without_awaiting_the_queue(
         assert runs[0].owners_done() and not owner_tasks_left()
         assert all(owner.cancelling() <= 1 for owner in runs[0].owners)
         statuses = await _rows(store, root_id)
-        assert statuses == {"root": "cancelled", "alpha": "cancelled", "beta": "cancelled"}
-        for child_id in await child_ids(store, root_id, ["alpha", "beta"]):
+        ids = await child_ids(store, root_id, ["alpha", "beta"])
+        # A child that finished before the close keeps its success; a producer that
+        # was blocked on the full queue, or any still-running child, is cancelled.
+        blocked = {
+            name
+            for name, child_id in zip(["alpha", "beta"], ids, strict=True)
+            if child_id in full.blocked
+        }
+        assert statuses["root"] == "cancelled"
+        assert {statuses[name] for name in blocked} <= {"cancelled"}
+        if how == "abandoned":
+            assert statuses == {"root": "cancelled", "alpha": "cancelled", "beta": "cancelled"}
+        else:
+            assert blocked and "cancelled" in {statuses["alpha"], statuses["beta"]}
+            assert {statuses["alpha"], statuses["beta"]} <= {"success", "cancelled"}
+        for child_id in ids:
             assert not root._task_manager.is_running(child_id)
         for provider in providers:
             assert closed_in_its_task(provider)
