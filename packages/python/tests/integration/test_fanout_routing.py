@@ -1473,3 +1473,81 @@ async def test_the_route_walk_counts_runs_before_reading_a_batch(
 
     assert caught.value.reason == "binding_conflict"
     assert 1 + store.fetched <= 128
+
+
+# ---------------------------------------------------------------------------
+# Root cancellation reaches a routed leaf running in the caller's task
+# ---------------------------------------------------------------------------
+
+
+def _held_after_approval(name: str) -> tuple[Agent, ScriptedLLM]:
+    """A child that asks approval, then blocks in its next model call until released."""
+    llm = ScriptedLLM(
+        [call("publish", {"text": name}, f"{name}-p"), LLMResponse(text="done")], gate_at=1
+    )
+    agent = Agent(
+        name=name,
+        description=f"{name} reviews.",
+        prompt="You review.",
+        provider=llm,
+        tools=[publish],
+        require_approval=["publish"],
+    )
+    return agent, llm
+
+
+@pytest.mark.parametrize("shape", ["fanout", "nested_fanout", "chain"])
+async def test_cancelling_the_root_interrupts_a_routed_leaf(store: Any, shape: str) -> None:
+    """The routed leaf's blocked provider call is interrupted; the submit returns and the
+    leaf ends CANCELLED, never SUCCESS. ``chain`` checks the 0.7 single-child route."""
+    import asyncio
+
+    leaf, llm = _held_after_approval("leaf")
+    other = approver("other")
+    if shape == "fanout":
+        root = root_agent(store, leaf, other)
+        root_id = await start_root(store, root)
+        fan = await fan_out(store, root, root_id, [leaf, other])
+        leaf_id, token = fan.child(0), pause_of(fan, 0)
+    elif shape == "nested_fanout":
+        middle = Agent(
+            name="middle",
+            description="Delegates.",
+            prompt="m",
+            provider=ScriptedLLM([]),
+            subagents=[leaf, other],
+        )
+        root = root_agent(store, middle, approver("side"))
+        root_id = await start_root(store, root)
+        top = await fan_out(store, root, root_id, [middle, root.subagents[1]], run=(1,))
+        inner = await fan_out(
+            store, root, top.child(0), [leaf, other], root_id=root_id, path=("middle",)
+        )
+        leaf_id, token = inner.child(0), pause_of(inner, 0)
+    else:
+        root = root_agent(store, leaf)
+        root_id = await start_root(store, root)
+        leaf_id, claim = await bind_one(store, root, root_id, leaf)
+        paused = await continue_claimed(
+            _managed_budget.inherit(leaf, root), store, leaf_id, claim, notifier=None
+        )
+        token = str(paused.pause_id)
+
+    submit = asyncio.create_task(
+        root.submit_approval(root_id, approved=True, tenant_id=TENANT, expected_pause_id=token)
+    )
+    await asyncio.wait_for(llm.entered.wait(), 5)
+    await root.cancel_run(root_id, tenant_id=TENANT)
+    try:
+        await asyncio.wait_for(asyncio.shield(submit), 5)
+    except TimeoutError:
+        llm.gate.set()
+        await asyncio.gather(submit, return_exceptions=True)
+        pytest.fail("the routed leaf kept running after the root was cancelled")
+    except Exception:  # noqa: BLE001 - a cancelled continuation may raise; the state decides
+        pass
+    finally:
+        llm.gate.set()
+
+    assert llm.cancelled
+    assert (await store.get_run(leaf_id)).status == RunStatus.CANCELLED.value

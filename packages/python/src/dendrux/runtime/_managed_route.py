@@ -186,7 +186,7 @@ async def walk(root_agent: Agent, store: Any, root_run_id: str) -> tuple[list[_W
             break
         binding = wait.managed_wait
         child, path, loop = await _bound_child(store, record, binding, root_run_id, path)
-        child_agent = _managed_budget.inherit(_registered(agent, path[-1], record.id), root_agent)
+        child_agent = _execution(_registered(agent, path[-1], record.id), root_agent)
         intent = await _intent_call(store, record.id, binding.tool_call_id, wait.iteration)
         waiting.append(_Waiting(agent, record.id, child_agent, path, intent, child.id, loop))
         agent, record = child_agent, child
@@ -277,6 +277,17 @@ async def _intent_calls(
         if len(page) < MAX_PAGE:
             raise ManagedStateError(reason="binding_missing", run_id=parent_run_id)
         offset += MAX_PAGE
+
+
+def _execution(child: Agent, root_agent: Agent) -> Agent:
+    """The registered child as one routed control runs it.
+
+    It borrows the root's budget policy and the root's task manager, so the task that
+    runs it is registered where ``cancel_run`` on the root signals (as fan-out owners do).
+    """
+    execution = _managed_budget.inherit(child, root_agent)
+    execution._task_manager = root_agent._task_manager
+    return execution
 
 
 def _registered(parent: Agent, name: str, parent_run_id: str) -> Agent:
@@ -451,8 +462,7 @@ class _TreeWalk:
         self.fetched += batch
 
     def _agent(self, parent: Agent, path: tuple[str, ...], parent_run_id: str) -> Agent:
-        child = _registered(parent, path[-1], parent_run_id)
-        return _managed_budget.inherit(child, self.root_agent)
+        return _execution(_registered(parent, path[-1], parent_run_id), self.root_agent)
 
 
 def _managed_wait_of(seen: _Seen, raw: dict[str, Any] | None) -> PauseState | None:
