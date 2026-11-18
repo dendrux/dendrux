@@ -25,7 +25,7 @@ from dendrux import Agent, tool
 from dendrux._lifecycle import TERMINAL_STATUS_VALUES, StoredEventType
 from dendrux._managed_wait import ManagedFanout, ManagedWait
 from dendrux.errors import PauseStatusMismatchError, RunNotFoundError, RunNotPausedError
-from dendrux.runtime import _managed_budget, _managed_fanout, _managed_route, _reclaim
+from dendrux.runtime import _managed_budget, _managed_fanout, _managed_route
 from dendrux.runtime._managed_fanout_store import BindManagedChildrenRequest, ManagedChildSpec
 from dendrux.runtime._reclaim import continue_claimed
 from dendrux.runtime._trace_shared import message_trace
@@ -403,30 +403,9 @@ def settle(monkeypatch: pytest.MonkeyPatch) -> SettleSpy:
 
 
 def spy_settle(monkeypatch: pytest.MonkeyPatch, *, gate: Any = None) -> SettleSpy:
-    """Spy on the real ``settle_parent``; let a v4-adopted parent continue.
-
-    A parent continued after a v4 adoption still holds its old v4 envelope in its pause
-    data. Reading it is the recovery task's change to ``_reclaim._continuation_base``
-    (not merged yet); this test-only stand-in mirrors it.
-    """
+    """Observe the real fan-in settlement without replacing continuation decoding."""
     spy = SettleSpy(_managed_fanout.settle_parent, gate=gate)
     monkeypatch.setattr(_managed_fanout, "settle_parent", spy)
-    base = _reclaim._continuation_base
-
-    def continuation_base(raw: dict[str, Any], run_id: str) -> PauseState:
-        if raw.get("schema_version") != 4:
-            return base(raw, run_id)
-        wait = PauseState.from_managed_dict(raw, run_id=run_id)
-        return replace(
-            wait,
-            managed_fanout=None,
-            schema_version=2,
-            pause_reason=None,
-            pending_tool_calls=[],
-            pending_targets={},
-        )
-
-    monkeypatch.setattr(_reclaim, "_continuation_base", continuation_base)
     return spy
 
 

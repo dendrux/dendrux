@@ -857,6 +857,14 @@ async def test_public_reconnect_retains_the_owned_root_result(store):
     await root.close()
 
 
+async def test_routing_settle_spy_keeps_real_continuation_reader(engine, monkeypatch):
+    from tests.integration.test_fanout_routing import spy_settle
+
+    reader = _reclaim._continuation_base
+    spy_settle(monkeypatch)
+    assert _reclaim._continuation_base is reader
+
+
 async def test_public_reconnect_rereads_not_owner_results_after_join(store, engine, monkeypatch):
     from contextvars import ContextVar
 
