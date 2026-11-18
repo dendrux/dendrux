@@ -165,7 +165,7 @@
  "dendrux.runtime.durability:BLE001": 3,
  "dendrux.runtime.durability:PLC0415": 5,
  "dendrux.runtime.persistence:BLE001": 7,
- "dendrux.runtime.persistence:PLC0415": 41,
+ "dendrux.runtime.persistence:PLC0415": 36,
  "dendrux.runtime.persistence:PLR0912": 1,
  "dendrux.runtime.persistence:PLR0915": 1,
  "dendrux.runtime.replay:BLE001": 1,
