@@ -484,6 +484,7 @@ class Injector(SqlFaultInjector):
 """
 CRASH_FUNCTIONS = {
     "test_managed_bind_is_all_or_nothing",
+    "test_fanout_bind_is_all_or_nothing",
     "test_a_failed_write_is_repeated_safely_with_the_same_identity",
     "test_a_one_shot_failure_is_absorbed_or_retried_into_exactly_one_write",
     "test_finalize_that_fails_around_commit_leaves_one_final_state",
