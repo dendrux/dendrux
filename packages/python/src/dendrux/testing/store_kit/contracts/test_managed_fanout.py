@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 from dendrux._lifecycle import CancelReason, PauseReason, StoredEventType
+from dendrux._meta_keys import BLOCKED_META_KEY
 from dendrux.errors import (
     ManagedStateError,
     PersistenceError,
@@ -683,6 +684,24 @@ async def test_fanout_bind_holds_a_maximum_size_batch(dendrux_kit: Kit) -> None:
     assert 16 * 1024 < _compact_bytes(request.parent_wait.to_dict()) <= 32 * 1024
     assert (await store.bind_managed_children(request)).outcome == "created"
     await _published(store, request)
+
+
+@fanout
+async def test_fanout_bind_marks_blocked_evidence_per_child(dendrux_kit: Kit) -> None:
+    """Only the runtime's per-child ``child_blocked`` marks a child; caller metadata cannot."""
+    store = dendrux_kit.store
+    parent, calls = await _parent(dendrux_kit, 3)
+
+    def child(i: int) -> dict[str, Any]:
+        forged = {BLOCKED_META_KEY: True} if i == 1 else {}
+        return {"child_blocked": i != 1, "child_meta": {"kit": i, **forged}}
+
+    request = _request(parent, calls, child=child)
+    await store.bind_managed_children(request)
+    for i, spec in enumerate(request.children):
+        meta = (await store.get_run(spec.child_run_id)).meta or {}
+        assert meta.get("kit") == i
+        assert meta.get(BLOCKED_META_KEY) is (None if i == 1 else True), i
 
 
 # ---------------------------------------------------------------------------------------------

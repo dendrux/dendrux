@@ -367,7 +367,7 @@ class _SqlFanout(_SqlManaged):
         calls = [_BatchCall.of(plan, child) for child in plan.children]
         for call, state in zip(calls, states, strict=True):
             await self._bind_intent(session, call, nonce)
-            await self._bind_child(session, call, parent, state)
+            await self._bind_child(session, call, parent, state, blocked=call.child_blocked)
         for call in calls:
             await self._bind_seeds(session, call)
             await self._bind_event(session, call)

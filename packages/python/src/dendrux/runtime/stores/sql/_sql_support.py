@@ -190,8 +190,18 @@ def _refuse_direct_managed_child(run_id: str, loop_state: Any) -> None:
 
 
 def _creation_metadata(
-    session: AsyncSession, store: _StoreHost, run_id: str, meta: dict[str, Any] | None
+    session: AsyncSession,
+    store: _StoreHost,
+    run_id: str,
+    meta: dict[str, Any] | None,
+    *,
+    blocked: bool = False,
 ) -> dict[str, Any] | None:
+    """Creation metadata: caller blocked markers are dropped; trusted evidence re-adds one.
+
+    Trusted evidence is the private blocked-write scope naming this run, or ``blocked``
+    passed by a store from a batch child's runtime-set ``child_blocked`` (0.8).
+    """
     from dendrux.runtime._blocked_content import _blocked_target
 
     cleaned = (
@@ -199,6 +209,8 @@ def _creation_metadata(
     )
     if _blocked_target.get() == (store, run_id):
         session.info[BLOCKED_INSERT_SESSION_KEY] = run_id
+        return {**(cleaned or {}), BLOCKED_META_KEY: True}
+    if blocked:
         return {**(cleaned or {}), BLOCKED_META_KEY: True}
     return cleaned
 
