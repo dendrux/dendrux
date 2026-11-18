@@ -2856,7 +2856,6 @@ class ReActLoop(Loop):
             image_view_state=image_view_state,
             interrupt=interrupt,
         )
-        ctx.fanout_capable = False
         _bind_run_checkpoint(ctx)
         start_iteration = iteration_offset + 1
         end_iteration = agent.max_iterations + 1
