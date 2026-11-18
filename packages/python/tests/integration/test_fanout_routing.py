@@ -156,6 +156,8 @@ class Fan:
     calls: list[str]
     children: list[str]
     results: dict[str, RunResult] = field(default_factory=dict)
+    claims: dict[str, ClaimResult] = field(default_factory=dict)
+    """The unused execution tokens of children left unrun (an owner task's to use)."""
 
     def child(self, index: int) -> str:
         return self.children[index]
@@ -235,9 +237,13 @@ async def fan_out(
     )
     assert bound.outcome == "created"
     fan = Fan(parent_id, str(wait.pause_id), [c.id for c in calls], [s.child_run_id for s in specs])
-    for index in run if run is not None else range(len(children)):
-        claim = bound.children[index].child_claim
+    ran = run if run is not None else range(len(children))
+    for index, bound_child in enumerate(bound.children):
+        claim = bound_child.child_claim
         assert claim is not None
+        if index not in ran:
+            fan.claims[fan.child(index)] = claim
+            continue
         execution = _managed_budget.inherit(children[index], root)
         fan.results[fan.child(index)] = await continue_claimed(
             execution, store, fan.child(index), claim, notifier=None
@@ -371,12 +377,15 @@ class FakeSettle:
     ``(parent run id, all children terminal)``; ``adoptions`` counts claims won.
     """
 
-    def __init__(self, *, adopt: bool = True) -> None:
+    def __init__(self, *, adopt: bool = True, gate: Any = None) -> None:
         self.adopt = adopt
+        self.gate = gate  # awaited before the read: a race schedule's hook
         self.calls: list[tuple[str, bool]] = []
         self.adoptions = 0
 
     async def __call__(self, store: StateStore, node: WaitNode) -> ClaimResult | None:
+        if self.gate is not None:
+            await self.gate()
         ids = [child.run_id for child in node.children]
         rows = await store.get_managed_children(node.run_id, ids, tenant_id=node.tenant_id)  # type: ignore[attr-defined]
         settled = len(rows) == len(ids) and all(r.status in TERMINAL_STATUS_VALUES for r in rows)
@@ -455,13 +464,20 @@ class FakeSettle:
 
 @pytest.fixture
 def settle(monkeypatch: pytest.MonkeyPatch) -> FakeSettle:
+    """Route every v4 settle through a fake adoption (see :func:`install_fake_settle`)."""
+    return install_fake_settle(monkeypatch)
+
+
+def install_fake_settle(
+    monkeypatch: pytest.MonkeyPatch, fake: FakeSettle | None = None
+) -> FakeSettle:
     """Route every v4 settle through a fake adoption (the real one is the fan-in task).
 
     A parent continued after a v4 adoption still holds its old v4 envelope in its pause
     data. The 0.7 continuation reads only a stale v3 wait there; the fan-in task extends
     ``_reclaim._continuation_base`` to v4 (contract gap), mirrored here for the test.
     """
-    fake = FakeSettle()
+    fake = fake or FakeSettle()
     protocol: SettleParent = fake
     monkeypatch.setattr(_managed_route, "settle_fanout", protocol)
     base = _reclaim._continuation_base
