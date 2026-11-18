@@ -330,41 +330,83 @@ async def test_other_entries_leave_future_workflow_untouched(
     agent = _agent(store, registered)
     root, call, child = await _seed(store, engine, agent, cut)
     before = await _snapshot(engine)
-    # Valid parked v4 outcomes belong to T5; this test observes only side effects.
-    refusals = (
-        (Exception,) if registered and cut == "parked" else (RunControlError, PersistenceError)
-    )
-    with contextlib.suppress(*refusals):
-        if operation == "pending":
-            await run_store.get_pending(root, tenant_id=TENANT)
-        elif operation == "resume":
-            await agent.resume(root, tenant_id=TENANT)
-        elif operation == "resume_stream":
-            stream = agent.resume_stream(root, tenant_id=TENANT)
-            async for _ in stream:
-                pass
-        elif operation == "input":
-            await agent.submit_input(root, "answer", tenant_id=TENANT)
-        elif operation == "approval":
-            await agent.submit_approval(root, approved=True, tenant_id=TENANT)
-        elif operation == "results":
-            await agent.submit_tool_results(
-                root,
-                [ToolResult(call_id=call, name="reviewer", payload="report")],
-                tenant_id=TENANT,
-            )
-        else:
-            assert (
-                await claim_managed_adoption(
-                    store,
-                    root,
-                    agent=agent,
-                    call_id=call,
-                    child_run_id=child,
-                    result=ToolResult(call_id=call, name="reviewer", payload="report"),
-                )
-                is False
-            )
+    if operation == "adoption":
+        # The 0.7 single-child adoption never claims a fan-out wait, in any state.
+        adopted = await claim_managed_adoption(
+            store,
+            root,
+            agent=agent,
+            call_id=call,
+            child_run_id=child,
+            result=ToolResult(call_id=call, name="reviewer", payload="report"),
+        )
+        assert adopted is False
+    else:
+        # A parked v4 root with registered subagents is routed as a fan-out (0.8);
+        # this test observes only that nothing changes.
+        refusals = (
+            (Exception,) if registered and cut == "parked" else (RunControlError, PersistenceError)
+        )
+        with contextlib.suppress(*refusals):
+            await _enter(operation, agent, run_store, root, call, None)
+    assert await _snapshot(engine) == before
+    assert agent.provider.calls == 0
+    assert all(child.provider.calls == 0 for child in agent.subagents)
+
+
+async def _enter(
+    operation: str, agent: Agent, run_store: Any, root: str, call: str, token: str | None
+) -> None:
+    if operation == "pending":
+        await run_store.get_pending(root, tenant_id=TENANT)
+    elif operation == "resume":
+        await agent.resume(root, tenant_id=TENANT, expected_pause_id=token)
+    elif operation == "resume_stream":
+        stream = agent.resume_stream(root, tenant_id=TENANT, expected_pause_id=token)
+        last = None
+        async for last in stream:
+            pass
+        if last is not None and getattr(last.type, "value", last.type) == "run_error":
+            raise RunControlError("the stream ended with run_error")
+    elif operation == "input":
+        await agent.submit_input(root, "answer", tenant_id=TENANT, expected_pause_id=token)
+    elif operation == "approval":
+        await agent.submit_approval(root, approved=True, tenant_id=TENANT, expected_pause_id=token)
+    else:
+        await agent.submit_tool_results(
+            root,
+            [ToolResult(call_id=call, name="reviewer", payload="report")],
+            tenant_id=TENANT,
+            expected_pause_id=token,
+        )
+
+
+@pytest.mark.parametrize(
+    ("operation", "registered", "cut", "token"),
+    [
+        (operation, registered, cut, token)
+        for operation in ("resume", "resume_stream", "input", "approval", "results")
+        for registered in (False, True)
+        for cut in ("parked", "claimed", "partial")
+        for token in ("wait", "foreign")
+    ],
+)
+async def test_token_bearing_entries_leave_future_workflow_untouched(
+    store: Any,
+    engine: Any,
+    run_store: Any,
+    cut: str,
+    operation: str,
+    registered: bool,
+    token: str,
+) -> None:
+    """A token never claims a fan-out wait: neither the wait's own generation nor any other."""
+    agent = _agent(store, registered)
+    root, call, _ = await _seed(store, engine, agent, cut)
+    pause_id = (await store.get_pause_state(root))["pause_id"] if token == "wait" else None
+    before = await _snapshot(engine)
+    with pytest.raises((RunControlError, PersistenceError, ValueError)):
+        await _enter(operation, agent, run_store, root, call, pause_id or generate_ulid())
     assert await _snapshot(engine) == before
     assert agent.provider.calls == 0
     assert all(child.provider.calls == 0 for child in agent.subagents)
