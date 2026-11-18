@@ -20,10 +20,12 @@ from dendrux import _codes
 from dendrux._lifecycle import TERMINAL_STATUSES
 from dendrux._managed_wait import MANAGED_FANOUT_SCHEMA_VERSION
 from dendrux.errors import ManagedStateError, RunNotFoundError
-from dendrux.runtime import _managed_budget, _managed_cancel, _managed_persistence
+from dendrux.runtime import _managed_budget, _managed_persistence
 from dendrux.runtime._blocked_content import _blocked_evidence
 from dendrux.runtime._bounds import MAX_PAGE
+from dendrux.runtime._digest import content_digest
 from dendrux.runtime._fanout_adoption_state import (
+    RESOLVED_OUTCOMES,
     IntentRow,
     adoption_payload,
     fanout_adoption,
@@ -225,12 +227,11 @@ async def adopt_settled(store: Any, node: WaitNode) -> ClaimResult | None:
     The caller has read every child of ``node`` terminal in a transaction that
     began after its own terminal commit (spec §7.2). Claim first: no report is
     built, transformed or projected before the claim, and a caller that does not
-    win it (the parent is cancelled, moved on, or another caller adopted) runs
-    nothing and returns None. The returned claim owns the parent's continuation.
+    win it (the parent is outside the node's tenant: ``RunNotFoundError``; or it
+    is cancelled, moved on, or another caller adopted: None) runs nothing. The
+    returned claim owns the parent's continuation.
     """
     parent = _parent_of(node)
-    if await _managed_cancel.cancellation_requested(store, node.run_id):
-        return None
     claim = await claim_fanout_adoption(
         store,
         node.run_id,
@@ -321,15 +322,10 @@ async def _complete_calls(
     bindings = [(item.call.id, item.child_run_id) for item in parent.calls]
     if fanout_adoption(claim.loop_state, run_id=run_id) != tuple(c for c, _ in bindings):
         raise ManagedStateError(reason=_CONFLICT, run_id=run_id)
+    _check_bound_rows(rows, {c for c, _ in bindings}, run_id)
     done = resolved_prefix(_intent_rows(rows), bindings, run_id=run_id)
     state = dict(claim.loop_state or {})
-    pending = {p.get("call_id") for p in state.get("pending", []) if isinstance(p, dict)}
-    # The last completion clears the marker in its own transaction, so at least one call
-    # is unresolved; exactly the unresolved calls are still pending in the checkpoint.
-    if done == len(bindings) or [c in pending for c, _ in bindings] != [
-        position >= done for position in range(len(bindings))
-    ]:
-        raise ManagedStateError(reason=_CONFLICT, run_id=run_id)
+    _check_pending(state, [c for c, _ in bindings[done:]], run_id)
     for item in parent.calls[done:]:
         state = await _complete_call(owned, parent, item, claim.claim_epoch, state)
     return ClaimResult(claim.claim_epoch, claim.storage_format, state, None)
@@ -412,12 +408,14 @@ def _recovered_calls(
     run_id: str,
 ) -> tuple[FanoutCall, ...]:
     """Each binding's call as its intent row recorded it, with the registered child."""
-    by_call = {row.tool_call_id: row for row in rows if row.target == ToolTarget.AGENT.value}
+    by_call = {row.tool_call_id: row for row in rows}
     calls: list[FanoutCall] = []
     for binding in wait.managed_fanout.bindings if wait.managed_fanout else ():
         row = by_call.get(binding.tool_call_id)
         if row is None:
             raise ManagedStateError(reason="binding_missing", run_id=run_id)
+        if row.target != ToolTarget.AGENT.value:
+            raise ManagedStateError(reason=_CONFLICT, run_id=run_id)
         call = ToolCall(
             name=row.tool_name,
             params=dict(row.params or {}),
@@ -427,6 +425,47 @@ def _recovered_calls(
         child = _registered(agent, row.tool_name, run_id)
         calls.append(FanoutCall(call, child, (*parent_path, row.tool_name), binding.child_run_id))
     return tuple(calls)
+
+
+def _check_bound_rows(records: list[ToolCallReadRecord], calls: set[str], run_id: str) -> None:
+    """Every bound call's row is a managed (``agent``) intent, and a resolved one carries
+    its completion's digest, not the digest its intent was written with."""
+    for record in records:
+        if record.tool_call_id not in calls:
+            continue
+        if record.target != ToolTarget.AGENT.value or (
+            record.outcome in RESOLVED_OUTCOMES and record.content_digest == _intent_digest(record)
+        ):
+            raise ManagedStateError(reason=_CONFLICT, run_id=run_id)
+
+
+def _intent_digest(record: ToolCallReadRecord) -> str:
+    """The digest a started intent row is written with (``start_tool_call`` and the bind)."""
+    return content_digest(
+        dict(
+            tool_call_id=record.tool_call_id,
+            tool_name=record.tool_name,
+            target=record.target,
+            params=record.params,
+        )
+    )
+
+
+def _check_pending(state: dict[str, Any], unresolved: list[str], run_id: str) -> None:
+    """The checkpoint's pending calls are exactly the unresolved calls, in call order.
+
+    The last completion clears the marker in its own transaction, so a claimed
+    adoption always has at least one unresolved call. Extra, repeated or
+    malformed entries refuse.
+    """
+    entries = state.get("pending")
+    ids = (
+        [entry.get("call_id") if isinstance(entry, dict) else None for entry in entries]
+        if isinstance(entries, list)
+        else None
+    )
+    if not unresolved or ids != unresolved:
+        raise ManagedStateError(reason=_CONFLICT, run_id=run_id)
 
 
 def _intent_rows(records: list[ToolCallReadRecord]) -> list[IntentRow]:

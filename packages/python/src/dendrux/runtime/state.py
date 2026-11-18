@@ -745,7 +745,7 @@ class ToolCallReadRecord:
     idempotent: bool = False
     replayed_at: datetime | None = None
     observation: dict[str, Any] | None = None
-    content_digest: str | None = None  # written with a resolved outcome (complete_tool_call)
+    content_digest: str | None = None  # started: the intent digest; resolved: the outcome digest
     managed_child_run_id: str | None = None  # the child a managed intent was bound to
 
 

@@ -956,3 +956,120 @@ async def test_recovery_refuses_a_foreign_tenant(store: Any, engine: Any, monkey
     assert fanout.child_ids[0] not in reads
     assert effects.counts().transform_calls() == 1  # only the first, pre-cut attempt
     assert await observations(engine, fanout.run_id) == []
+
+
+# ---------------------------------------------------------------------------
+# Review fix round 2: retained intent digest, target, exact pending, scope order
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("entry", ["live", "recovery"])
+@pytest.mark.parametrize("outcome", ["completed", "failed"])
+async def test_a_resolved_row_keeping_its_intent_digest_is_refused(
+    store: Any, engine: Any, monkeypatch: Any, outcome: str, entry: str
+) -> None:
+    """Only the outcome flipped: the digest is still the one the intent was written with."""
+    effects = FanoutEffects()
+    root = lead(tool_result_transform=effects.transform())
+    fanout = await parked(store, root, [Child("a"), Child("b")])
+    if entry == "recovery":
+        with monkeypatch.context() as patch:
+            crash_on_completion(patch, store, 1)
+            with pytest.raises(CrashError):
+                await adopt_settled(store, node_of(fanout, root))
+    await _tamper_row(engine, fanout, 0, outcome=outcome)
+    await _drop_pending(store, engine, fanout, 0)
+    before = effects.counts().transform_calls()
+    with pytest.raises(ManagedStateError) as refused:
+        if entry == "live":
+            await adopt_settled(store, node_of(fanout, root))
+        else:
+            await recover(store, engine, fanout.run_id, root)
+    assert refused.value.reason == "binding_conflict"
+    assert effects.counts().transform_calls() == before
+    assert await observations(engine, fanout.run_id) == []
+    assert await completed_events(engine, fanout.run_id) == []
+
+
+@pytest.mark.parametrize("entry", ["live", "recovery"])
+async def test_a_bound_row_with_another_target_is_refused(
+    store: Any, engine: Any, monkeypatch: Any, entry: str
+) -> None:
+    effects = FanoutEffects()
+    root = lead(tool_result_transform=effects.transform())
+    fanout = await parked(store, root, [Child("a"), Child("b")])
+    if entry == "recovery":
+        with monkeypatch.context() as patch:
+            crash_on_completion(patch, store, 1)
+            with pytest.raises(CrashError):
+                await adopt_settled(store, node_of(fanout, root))
+    await _tamper_row(engine, fanout, 0, target="server")
+    before = effects.counts().transform_calls()
+    with pytest.raises(ManagedStateError) as refused:
+        if entry == "live":
+            await adopt_settled(store, node_of(fanout, root))
+        else:
+            await recover(store, engine, fanout.run_id, root)
+    assert refused.value.reason == "binding_conflict"
+    assert effects.counts().transform_calls() == before
+    assert await observations(engine, fanout.run_id) == []
+
+
+@pytest.mark.parametrize("case", ["extra_id", "duplicate", "no_call_id", "not_an_object"])
+async def test_pending_must_be_exactly_the_unresolved_calls(
+    store: Any, engine: Any, case: str
+) -> None:
+    from sqlalchemy import update
+
+    effects = FanoutEffects()
+    root = lead(tool_result_transform=effects.transform())
+    fanout = await parked(store, root, [Child("a"), Child("b")])
+    state = await store.get_loop_state(fanout.run_id)
+    first = dict(state["pending"][0])
+    state["pending"].append(
+        {
+            "extra_id": {**first, "call_id": generate_ulid()},
+            "duplicate": first,
+            "no_call_id": {k: v for k, v in first.items() if k != "call_id"},
+            "not_an_object": "x",
+        }[case]
+    )
+    async with engine.begin() as conn:
+        await conn.execute(
+            update(AgentRun).where(AgentRun.id == fanout.run_id).values(loop_state=state)
+        )
+    with pytest.raises(ManagedStateError) as refused:
+        await adopt_settled(store, node_of(fanout, root))
+    assert refused.value.reason == "binding_conflict"
+    await _assert_no_completion(engine, fanout, effects)
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+async def test_a_foreign_node_is_refused_whether_or_not_its_parent_is_cancelled(
+    store: Any, engine: Any, monkeypatch: Any, cancelled: bool
+) -> None:
+    from sqlalchemy import update
+
+    from dendrux.errors import RunNotFoundError
+
+    effects = FanoutEffects()
+    root = lead(tool_result_transform=effects.transform())
+    fanout = await parked(store, root, [Child("a"), Child("b")])
+    if cancelled:
+        async with engine.begin() as conn:
+            await conn.execute(
+                update(AgentRun).where(AgentRun.id == fanout.run_id).values(cancel_requested=True)
+            )
+    order: list[str] = []
+    for name in ("get_run", "get_managed_run_control"):
+        real = getattr(store, name)
+
+        async def spy(*args: Any, _real: Any = real, _name: str = name, **kwargs: Any) -> Any:
+            order.append(_name)
+            return await _real(*args, **kwargs)
+
+        monkeypatch.setattr(store, name, spy)
+    with pytest.raises(RunNotFoundError):
+        await adopt_settled(store, replace(node_of(fanout, root), tenant_id="t2"))
+    assert order[:1] == ["get_run"] and "get_managed_run_control" not in order
+    await _assert_no_completion(engine, fanout, effects)
