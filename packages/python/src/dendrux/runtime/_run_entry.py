@@ -34,11 +34,15 @@ from dendrux.context_blocks import (
     validate_context,
 )
 from dendrux.loops.react import ReActLoop
+from dendrux.loops.single import SingleCall
 from dendrux.runtime import (
     _run_events,
     _run_images,
 )
+from dendrux.runtime._entry_guardrails import _entry_projection
+from dendrux.runtime._managed_fanout_store import ManagedChildSpec
 from dendrux.runtime._run_errors import logger
+from dendrux.runtime._subagents import _tighten
 from dendrux.runtime.replay import (
     LoadedReplay,
     ReplayLast,
@@ -61,6 +65,7 @@ from dendrux.runtime.submit import (
 )
 from dendrux.skills._session import META_KEY, SkillSession
 from dendrux.skills._session import current as current_skill_session
+from dendrux.strategies.native import NativeToolCalling
 from dendrux.types import (
     GovernanceEventType,
     ImageViewState,
@@ -68,6 +73,7 @@ from dendrux.types import (
     Role,
     RunStatus,
     compute_idempotency_fingerprint,
+    generate_ulid,
 )
 
 if TYPE_CHECKING:
@@ -81,6 +87,7 @@ if TYPE_CHECKING:
     from dendrux.loops.base import Loop, LoopNotifier, LoopRecorder
     from dendrux.media._image import UserContent
     from dendrux.media._runtime import ImageRuntime
+    from dendrux.runtime._managed import ManagedInvocation
     from dendrux.runtime.context import DelegationContext
     from dendrux.runtime.state import StateStore
     from dendrux.strategies.base import Strategy
@@ -331,14 +338,99 @@ async def _entry_replay(
 
 
 def _recovery_loop_name(loop: Loop) -> str | None:
-    from dendrux.loops.react import ReActLoop
-    from dendrux.loops.single import SingleCall
-
     if isinstance(loop, ReActLoop):
         return "ReActLoop"
     if isinstance(loop, SingleCall):
         return "SingleCall"
     return None
+
+
+def _projected_creation_fields(blocked: bool, create: dict[str, Any]) -> dict[str, Any]:
+    fields = dict(create)
+    if blocked:
+        fields["meta"] = {**(fields.get("meta") or {}), BLOCKED_META_KEY: True}
+    return fields
+
+
+async def prepare_child_creation(child: Agent, branch: ManagedInvocation) -> ManagedChildSpec:
+    """Prepare a detached child creation in the caller task without durable writes.
+
+    ``branch`` supplies the same inherited fields as a single-child invocation.
+    Detectors and skill rendering run here, before bind takes any database lock.
+    Blocked projection remains a creation, with safe seeds and block evidence.
+    """
+    loop = _new_run_loop(child, None)
+    provider = child._require_provider()
+    session = SkillSession.prepare(child, loop=loop)
+    projection = _entry_projection(child, branch.child_run_id)
+    with session.bind():
+        system = await projection.project(Message(Role.SYSTEM, child.get_system_prompt(loop)), 0)
+        text = str((branch.call.params or {}).get("task", ""))
+        history, _, context, text, parts = await projection.prepare([], None, text, None, session)
+        seeds, _ = await _runtime_seeds(
+            branch.store,
+            child,
+            provider,
+            loop,
+            NativeToolCalling(),
+            {},
+            history,
+            user_input=text,
+            run_id=branch.child_run_id,
+            tenant_id=branch.tenant_id,
+            context=context,
+            user_parts=parts,
+            engine=projection.engine,
+            system_prompt=system.content,
+        )
+        metadata, _ = _new_run_metadata(
+            child,
+            loop,
+            session,
+            None,
+            _tighten(branch.max_depth, child.max_delegation_depth),
+            user_input=text,
+            output_type=child.output_type,
+        )
+        create = _projected_creation_fields(
+            projection.error is not None,
+            {
+                "input_data": _run_images._input_data(text, parts),
+                "model": provider.model,
+                "strategy": "NativeToolCalling",
+                "meta": metadata,
+                **seeds,
+            },
+        )
+    return _prepared_child_spec(branch, loop, create)
+
+
+def _prepared_child_spec(
+    branch: ManagedInvocation, loop: Loop, create: dict[str, Any]
+) -> ManagedChildSpec:
+    # Cycle: _managed imports runner, which re-exports this entry module.
+    from dendrux.runtime import _managed, _managed_budget
+
+    return ManagedChildSpec(
+        tool_call_id=branch.call.id,
+        row_id=generate_ulid(),
+        provider_tool_call_id=branch.call.provider_tool_call_id,
+        tool_name=branch.call.name,
+        params=branch.call.params or None,
+        child_run_id=branch.child_run_id,
+        child_agent_name=branch.child.name,
+        child_path=branch.child_path,
+        child_input_data=create.get("input_data"),
+        child_loop_state=_managed_budget.child_state(
+            _state._initial_loop_state(_recovery_loop_name(loop)), branch.unpriced_accepted
+        ),
+        intent_event=_managed.intent_event(branch, branch.child_run_id),
+        child_seed_traces=tuple(create.get("seed_traces") or ()),
+        child_model=create.get("model"),
+        child_strategy=create.get("strategy"),
+        child_meta=create.get("meta"),
+        child_pii_mapping=create.get("pii_mapping"),
+    ).detached()
 
 
 async def _create_projected_run(
@@ -351,12 +443,10 @@ async def _create_projected_run(
     invocation: Any = None,
     **kwargs: Any,
 ) -> Any:
-    from dendrux._meta_keys import BLOCKED_META_KEY
     from dendrux.runtime._blocked_content import _blocked_write, _native_blocked_store
 
     native = _native_blocked_store(store) is not None
-    if blocked and not native:
-        kwargs["meta"] = {**(kwargs.get("meta") or {}), BLOCKED_META_KEY: True}
+    kwargs = _projected_creation_fields(blocked and not native, kwargs)
     scope = _blocked_write(store, run_id) if blocked and native else nullcontext()
     with scope:
         if invocation is not None:
